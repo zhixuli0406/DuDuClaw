@@ -30,6 +30,8 @@ pub(crate) fn sections(agents: &[AgentDraft]) -> Value {
             "persona": {"soul": text(&draft.soul), "identity": text(&draft.identity)},
             "user": text(&draft.user_profile), "rules": text(&draft.instructions),
             "contract": text(&draft.contract), "settings": draft.settings,
+            "model": draft.model, "tools": draft.tools,
+            "disallowed_tools": draft.disallowed_tools, "reports_to": draft.reports_to,
             "metadata": {"description": draft.description},
             "unmapped_fields": draft.ignored_fields,
             "input_guard": scans})
@@ -40,18 +42,94 @@ pub(crate) fn digest(preview: &Value) -> String {
     crate::expert::registry::sha256_hex(preview.to_string().as_bytes())
 }
 
+#[cfg(test)]
 pub(crate) fn require_confirmation(
     bundle: &ImportBundle, dry_run: bool, confirmation: Option<&str>, report: &mut Report,
 ) -> Result<()> {
+    require_plan_confirmation(bundle, Value::Null, dry_run, confirmation, report)
+}
+
+/// Bind the destination and all pre-existing content a replace will retire.
+/// Runtime-generated audit ids/timestamps are not installer-controlled payloads.
+pub(crate) fn bind_context(ctx: &crate::expert::install::InstallCtx, mut effects: Value) -> Result<Value> {
+    use std::path::{Component, Path};
+    fn fingerprint(path: &Path, total: &mut u64) -> Result<Value> {
+        use std::io::Read;
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+            Err(e) => return Err(cfg_err(e.to_string())),
+        };
+        if meta.is_dir() {
+            let mut children = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(path).map_err(|e| cfg_err(e.to_string()))? {
+                let entry = entry.map_err(|e| cfg_err(e.to_string()))?;
+                let name = entry.file_name().into_string().map_err(|_| cfg_err("安裝落點不是 UTF-8".into()))?;
+                children.insert(name, fingerprint(&entry.path(), total)?);
+            }
+            return Ok(json!({"directory": children}));
+        }
+        if !meta.is_file() { return Err(cfg_err("安裝落點含連結或特殊檔案，無法確認".into())); }
+        let remaining = crate::expert::safe_zip::MAX_UNPACK_BYTES.saturating_sub(*total);
+        if meta.len() > remaining { return Err(cfg_err("取代計畫超過大小限制".into())); }
+        let mut bytes = Vec::new();
+        std::fs::File::open(path).map_err(|e| cfg_err(e.to_string()))?.take(remaining + 1)
+            .read_to_end(&mut bytes).map_err(|e| cfg_err(e.to_string()))?;
+        if bytes.len() as u64 > remaining { return Err(cfg_err("取代計畫超過大小限制".into())); }
+        *total += bytes.len() as u64;
+        Ok(json!({"sha256": crate::expert::registry::sha256_hex(&bytes)}))
+    }
+    let mut retired = std::collections::BTreeMap::new();
+    let mut total = 0;
+    if let Some(target) = &ctx.replace {
+        let mut paths = vec![format!("experts/{}", target.slug), format!("imported/{}", target.slug)];
+        paths.extend(target.agents.iter().map(|id| format!("agents/{id}")));
+        paths.extend(target.record.global_skills.iter().map(|id| format!("skills/{id}")));
+        paths.extend(target.record.wiki_files.iter().map(|rel| format!("shared/wiki/{rel}")));
+        for rel in paths {
+            if !Path::new(&rel).components().all(|part| matches!(part, Component::Normal(_))) {
+                return Err(cfg_err("取代計畫路徑無效".into()));
+            }
+            retired.insert(rel.clone(), fingerprint(&ctx.home.join(rel), &mut total)?);
+        }
+    }
+    effects["context"] = json!({
+        "destination": crate::expert::registry::sha256_hex(ctx.home.as_os_str().as_encoded_bytes()),
+        "product_policy": duduclaw_core::product_profile::load(&ctx.home).map_err(cfg_err)?,
+        "rename": ctx.rename, "attach_under": ctx.attach_under,
+        "trust_hooks": ctx.trust_hooks, "reimport": format!("{:?}", ctx.reimport),
+        "replace": ctx.replace.as_ref().map(|target| json!({"slug": target.slug,
+            "record": target.record, "agents": target.agents, "kept": target.kept,
+            "accept_edits": target.accept_edits})),
+        "retired": retired,
+        "org": fingerprint(&ctx.home.join("org.toml"), &mut total)?,
+    });
+    Ok(effects)
+}
+
+/// Both preview and confirmation derive this from the exact resolved write plan.
+pub(crate) fn require_plan_confirmation(
+    bundle: &ImportBundle, effects: Value, dry_run: bool, confirmation: Option<&str>, report: &mut Report,
+) -> Result<()> {
     crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::markers())?;
-    let preview = sections(&bundle.agents);
-    let digest = digest(&preview);
+    let mut preview = sections(&bundle.agents);
+    if let (Some(profiles), Some(agents)) = (preview.as_array_mut(), effects["agents"].as_array()) {
+        for profile in profiles {
+            if let Some(agent) = agents.iter().find(|agent| agent["id"] == profile["id"]) {
+                profile["files"] = agent["files"].clone();
+            }
+        }
+    }
+    let digest = if effects.is_null() { digest(&preview) }
+        else { digest(&json!({"version": 2, "profiles": preview, "effects": effects})) };
     report.detail("profile_preview", preview.clone());
+    report.detail("profile_install_plan", effects.clone());
     report.detail("profile_confirmation", json!(digest));
-    eprintln!("{}", serde_json::to_string_pretty(&preview).unwrap_or_default());
-    eprintln!("確認上述四個區段與安全掃描結果後，使用 --confirm-profile {digest}");
+    eprintln!("{}", serde_json::to_string_pretty(&preview).map_err(|e| cfg_err(e.to_string()))?);
+    eprintln!("{}", serde_json::to_string_pretty(&effects).map_err(|e| cfg_err(e.to_string()))?);
+    eprintln!("確認上述安裝計畫與安全掃描結果後，使用 --confirm-profile {digest}");
     if !dry_run && confirmation != Some(digest.as_str()) {
-        return Err(cfg_err("請先預覽匯入內容，再以預覽提供的 --confirm-profile 確認；內容變更後必須重新預覽".into()));
+        return Err(cfg_err("請先預覽匯入內容，再以預覽提供的 --confirm-profile 確認；內容或安裝落點變更後必須重新預覽".into()));
     }
     for draft in &bundle.agents {
         if bundle.format_code == "duduclaw" {
@@ -94,6 +172,21 @@ mod tests {
         assert!(require_confirmation(&bundle, false, Some(&hash), &mut report).is_err());
         assert!(require_confirmation(&bundle, true, None, &mut report).is_ok());
     }
+
+    #[test]
+    fn confirmation_rejects_changed_effects_even_when_profile_text_is_identical() {
+        let bundle = ImportBundle { agents: vec![AgentDraft { id_hint: "worker".into(),
+            display_name: "Worker".into(), ..Default::default() }], ..Default::default() };
+        let original = json!({"agents": [{"id": "worker", "files": [
+            {"path": "agents/worker/agent.toml", "sha256": "restricted"}]}]});
+        let mut report = Report::default();
+        require_plan_confirmation(&bundle, original.clone(), true, None, &mut report).unwrap();
+        let token = report.to_json(true)["details"]["profile_confirmation"].as_str().unwrap().to_string();
+        let mut changed = original;
+        changed["agents"][0]["files"][0]["sha256"] = json!("unrestricted");
+        assert!(require_plan_confirmation(&bundle, changed, false, Some(&token), &mut Report::default()).is_err());
+    }
+
 }
 
 /// Existing integration fixtures explicitly exercise the same preview/confirm sequence.
@@ -121,6 +214,10 @@ pub(crate) async fn confirmed_install(
 
 fn metadata_text(draft: &AgentDraft) -> String {
     let mut values = vec![draft.id_hint.as_str(), draft.display_name.as_str(), draft.description.as_str()];
+    values.extend(draft.model.as_deref());
+    values.extend(draft.reports_to.as_deref());
+    if let Some(tools) = &draft.tools { values.extend(tools.iter().map(String::as_str)); }
+    values.extend(draft.disallowed_tools.iter().map(String::as_str));
     for (field, value) in &draft.ignored_fields {
         values.push(field);
         values.push(value);

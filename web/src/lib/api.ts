@@ -3406,6 +3406,11 @@ export interface RuntimeInstallStatus {
 export interface AgentProfilePreview {
   id: string;
   name?: string;
+  model?: string | null;
+  tools?: string[] | null;
+  disallowed_tools?: string[];
+  reports_to?: string | null;
+  files?: Array<{ path: string; sha256: string }>;
   metadata?: { description?: string };
   unmapped_fields?: Array<[string, string]>;
   persona: { soul: string; identity: string };
@@ -3476,6 +3481,7 @@ export interface ExpertImportReport {
     replaced?: { agents: string[] };
     profile_confirmation?: string;
     profile_preview?: AgentProfilePreview[];
+    profile_install_plan?: Record<string, unknown>;
   } | null;
   /** Set when the run failed. */
   error?: { code: string; params?: Record<string, unknown> | null; message?: string } | null;

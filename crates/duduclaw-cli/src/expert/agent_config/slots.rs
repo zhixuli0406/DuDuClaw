@@ -151,6 +151,47 @@ pub async fn write_slots(ctx: &SlotCtx<'_>, draft: &AgentDraft) -> Vec<Outcome> 
     out
 }
 
+/// Exact imported page payloads for confirmation. Import timestamps belong to
+/// the wiki audit log; source documents do not assert a creation/update date.
+pub(super) fn plan_wiki_files(draft: &AgentDraft, format: &str) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    use duduclaw_memory::WikiLayer;
+    let mut pages = Vec::new();
+    for (doc, kind, title, banner) in [
+        (&draft.tools_notes, "tools-notes", "工具備註", "> 這頁只是工具使用說明，不會開放任何工具權限。\n\n"),
+        (&draft.heartbeat, "heartbeat", "定期檢查清單", "> 原平台的定期檢查清單。DuDuClaw 不會自動照表執行；需要時請在儀表板建立排程。\n\n"),
+    ] {
+        if let Some(doc) = doc {
+            pages.push((doc, format!("imported/{format}/{kind}.md"), title.to_string(), WikiLayer::Context, banner));
+        }
+    }
+    for (i, doc) in draft.knowledge.iter().enumerate() {
+        let path = format!("imported/{format}/knowledge/{}.md", knowledge_slug(&doc.source, i));
+        let title = doc.text.lines().find(|line| line.starts_with("# "))
+            .map(|line| line.trim_start_matches("# ").trim().to_string()).unwrap_or_else(|| doc.source.clone());
+        pages.push((doc, path, title, WikiLayer::Deep, ""));
+    }
+    let mut files = std::collections::BTreeMap::new();
+    for (doc, path, title, layer, banner) in pages {
+        let scan = duduclaw_security::input_guard::scan_input(&doc.text, duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD);
+        if scan.blocked { return Err("匯入知識頁未通過安全掃描".into()); }
+        let page = duduclaw_memory::WikiPage {
+            path: path.clone(), title, created: chrono::DateTime::UNIX_EPOCH, updated: chrono::DateTime::UNIX_EPOCH,
+            tags: vec![format!("imported-from-{format}")], related: Vec::new(), sources: vec![doc.source.clone()],
+            author: Some("import".into()), layer, trust: 0.5, source_type: duduclaw_memory::SourceType::Unknown,
+            last_verified: None, citation_count: 0, error_signal_count: 0, success_signal_count: 0,
+            do_not_inject: false, body: format!("{banner}{}", doc.text.trim_end()),
+        };
+        let serialized = duduclaw_memory::serialize_page(&page);
+        let (header, body) = serialized.split_once("\n---\n")
+            .ok_or_else(|| "無法產生知識頁".to_string())?;
+        let header = header.lines().filter(|line| !line.starts_with("created:") && !line.starts_with("updated:"))
+            .collect::<Vec<_>>().join("\n");
+        let content = format!("{header}\n---\n{body}");
+        if files.insert(path, content.into_bytes()).is_some() { return Err("匯入知識頁路徑重複".into()); }
+    }
+    Ok(files)
+}
+
 /// One persona file that becomes a wiki page.
 struct WikiSlot<'a> {
     doc: &'a Option<Doc>,

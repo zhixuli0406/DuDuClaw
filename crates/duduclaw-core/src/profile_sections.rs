@@ -50,7 +50,8 @@ pub struct ProfileRenderOptions {
 
 impl ProfileSections {
     /// Read fresh disk state. Only genuinely absent optional files are skipped;
-    /// unreadable, oversized or invalid files refuse the profile.
+    /// unreadable or oversized files refuse the profile. Legacy contract parse
+    /// errors warn and use the empty contract, matching the runtime loader.
     pub fn load(agent_dir: &Path) -> io::Result<Self> {
         let settings = read_optional(agent_dir, "agent.toml")?;
         let config: toml::Table = match settings {
@@ -78,7 +79,14 @@ impl ProfileSections {
                     return Err(invalid_data("USER.md exceeds 4,000 characters"));
                 }
                 if kind == ProfileSectionKind::Contract {
-                    content = render_contract_file(&content)?;
+                    content = match render_contract_file(&content) {
+                        Ok(rendered) => rendered,
+                        Err(error) => {
+                            tracing::warn!(path = %agent_dir.join(file).display(),
+                                "Failed to parse CONTRACT.toml: {error}");
+                            String::new()
+                        }
+                    };
                 }
                 if !content.trim().is_empty() {
                     result.sections.push(ProfileSection { kind, content });
@@ -169,14 +177,12 @@ pub fn user_data_block(body: &str) -> String {
 }
 
 #[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 struct ProfileContract {
     #[serde(default)]
     boundaries: ProfileBoundaries,
 }
 
 #[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 struct ProfileBoundaries {
     #[serde(default)]
     must_not: Vec<String>,
@@ -319,10 +325,38 @@ mod tests {
         std::fs::create_dir(dir.path().join("USER.md")).unwrap();
         assert!(ProfileSections::load(dir.path()).is_err());
         std::fs::remove_dir(dir.path().join("USER.md")).unwrap();
-        std::fs::write(dir.path().join("CONTRACT.toml"), "[invalid").unwrap();
+        std::fs::create_dir(dir.path().join("CONTRACT.toml")).unwrap();
         assert!(ProfileSections::load(dir.path()).is_err());
-        std::fs::write(dir.path().join("CONTRACT.toml"), "must_not = ['No refunds']").unwrap();
-        assert!(ProfileSections::load(dir.path()).is_err(), "misplaced boundaries must not vanish");
+    }
+
+    #[test]
+    fn legacy_unknown_contract_fields_load_at_runtime_but_are_rejected_on_import() {
+        let dir = tempfile::tempdir().unwrap();
+        for contract in [
+            "legacy = true\n[boundaries]\nmust_not = ['KEEP-BOUNDARY']\n",
+            "[boundaries]\nmust_not = ['KEEP-BOUNDARY']\nlegacy = true\n",
+        ] {
+            std::fs::write(dir.path().join("CONTRACT.toml"), contract).unwrap();
+            let profile = ProfileSections::load(dir.path()).unwrap();
+            assert!(profile.sections.iter().any(|s|
+                s.kind == ProfileSectionKind::Contract && s.content.contains("KEEP-BOUNDARY")));
+            let imported = format!("---\nschema: duduclaw.agent/v1\nid: helper\n---\n\n# Contract\n```duduclaw-contract\n{contract}\n```\n");
+            assert!(crate::agent_profile::parse(&imported).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_contract_uses_empty_runtime_fallback_but_import_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "PERSONA").unwrap();
+        for contract in ["[invalid", "[boundaries]\nmust_not = 42"] {
+            std::fs::write(dir.path().join("CONTRACT.toml"), contract).unwrap();
+            let profile = ProfileSections::load(dir.path()).unwrap();
+            assert!(profile.sections.iter().any(|s| s.kind == ProfileSectionKind::Soul));
+            assert!(!profile.sections.iter().any(|s| s.kind == ProfileSectionKind::Contract));
+            let imported = format!("---\nschema: duduclaw.agent/v1\nid: helper\n---\n\n# Contract\n```duduclaw-contract\n{contract}\n```\n");
+            assert!(crate::agent_profile::parse(&imported).is_err());
+        }
     }
 
     #[test]

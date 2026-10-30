@@ -121,6 +121,8 @@ export function ImportReportDialog({
     failure ?? (error ? { code: report?.error?.code ?? 'import.unknown', params: report?.error?.params, text: error } : null);
   const failed = shownFailure !== null;
   const replaceInfo = report?.details?.replace ?? null;
+  const profilePreview = report?.details?.profile_preview;
+  const profilePlan = report?.details?.profile_install_plan;
   const needsEditConsent = phase === 'plan' && !failed && reimport?.mode === 'replace' && Boolean(replaceInfo?.edited);
   const [confirmingEdits, setConfirmingEdits] = useState(false);
   useEffect(() => {
@@ -155,8 +157,11 @@ export function ImportReportDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {phase === 'plan' && !failed && report?.details?.profile_preview && (
-          <AgentProfilePreview profiles={report.details.profile_preview} />
+        {phase === 'plan' && !failed && (profilePreview || profilePlan) && (
+          <AgentProfilePreview
+            profiles={profilePreview ?? []}
+            plan={profilePlan}
+          />
         )}
 
         {shownFailure && (
@@ -264,7 +269,7 @@ export function ImportReportDialog({
                 variant="brand"
                 size="sm"
                 onClick={() => (needsEditConsent ? setConfirmingEdits(true) : onConfirm())}
-                disabled={busy || report === null || (!!report.details?.profile_preview && !report.details.profile_confirmation)}
+                disabled={busy || report === null || (!!(profilePreview || profilePlan) && !report.details?.profile_confirmation)}
               >
                 {busy && <Spinner className="size-3.5" />}
                 {reimport?.mode === 'replace' ? t('experts.reimport.confirmReplace') : t('experts.report.confirm')}

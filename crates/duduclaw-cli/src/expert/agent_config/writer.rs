@@ -20,7 +20,7 @@ use super::slots::{SlotCtx, clean_display_name, write_slots};
 use crate::expert::install::InstallCtx;
 use crate::expert::import_error::import_err;
 use crate::expert::{
-    InstallRecord, PackKind, Report, ScanVerdict, cfg_err, now_iso, scan_external,
+    InstallRecord, PackKind, Report, cfg_err, now_iso,
 };
 use duduclaw_gateway::expert_skills::QuarantinedSkill;
 
@@ -71,7 +71,6 @@ pub async fn install(
     root: &Path,
     report: &mut Report,
 ) -> Result<InstallRecord> {
-    super::preview::require_confirmation(&bundle, ctx.dry_run, ctx.confirm_profile.as_deref(), report)?;
     report.imported("format", &bundle.format_label);
     report.tag("format.detected", json!({ "format": bundle.format_code }));
     for w in &bundle.warnings {
@@ -79,6 +78,10 @@ pub async fn install(
         report.tag("import.note", json!({}));
     }
 
+    let refs: BTreeSet<_> = bundle.agents.iter().map(|draft| &draft.ref_id).collect();
+    if refs.len() != bundle.agents.len() {
+        return Err(cfg_err("來源含重複員工識別，無法建立安裝計畫".into()));
+    }
     let order = topo_order(&bundle.agents);
     // The import name first: a re-import is recognised before any employee
     // is reported as clashing with its own earlier version.
@@ -94,6 +97,44 @@ pub async fn install(
             id_map.insert(draft.ref_id.clone(), id);
         }
     }
+    let stage = tempfile::tempdir().map_err(|e| cfg_err(format!("建立暫存目錄失敗：{e}")))?;
+    let mut plans = Vec::new();
+    for draft in &order {
+        let Some(id) = id_map.get(&draft.ref_id) else { continue };
+        let parent = draft.reports_to.as_ref().and_then(|r| id_map.get(r))
+            .cloned().or_else(|| ctx.attach_under.clone()).unwrap_or_default();
+        plans.push(plan_agent(draft, id, &parent, bundle.format_code, &slug, stage.path(), &mut book, report)?);
+    }
+    if plans.is_empty() {
+        return Err(import_err("import.nothing_imported", json!({"agents": report.agent_problems()}),
+            "沒有任何 AI 員工可匯入"));
+    }
+    let archive = plan_archive(root, &bundle)?;
+    let archive_root = ctx.home.join("imported").join(&slug);
+    if !archive.is_empty() && ctx.replace.as_ref().is_none_or(|target| target.slug != slug)
+        && archive_root.symlink_metadata().is_ok() {
+        return Err(cfg_err("原始檔備份目的地已存在，請重新預覽".into()));
+    }
+    let effects = json!({
+        "slug": slug, "format": bundle.format_code, "display_name": bundle.display_name,
+        "description": bundle.description, "version": bundle.version,
+        "source": bundle, "attach_under": ctx.attach_under,
+        "replace": ctx.replace.as_ref().map(|target| &target.slug),
+        "archive": file_hashes(&format!("imported/{slug}/source"), &archive),
+        "agents": plans.iter().map(|plan| json!({"id": plan.draft.id_hint,
+            "files": file_hashes(&format!("agents/{}", plan.draft.id_hint), &plan.files),
+            "skills": plan.skill_effects,
+            "wiki": file_hashes(&format!("agents/{}/wiki", plan.draft.id_hint), &plan.wiki),
+            "profile": plan.draft,
+        })).collect::<Vec<_>>()
+    });
+    let preview_bundle = ImportBundle {
+        // Source-native settings have already been allowlist-validated; these
+        // are the fully merged settings, including host-owned scaffolding.
+        format_code: "resolved", agents: plans.iter().map(|plan| plan.draft.clone()).collect(),
+        ..Default::default()
+    };
+    super::preview::require_plan_confirmation(&preview_bundle, super::preview::bind_context(ctx, effects)?, ctx.dry_run, ctx.confirm_profile.as_deref(), report)?;
     // The cap counts every employee this import would add, before anything
     // (even the archived original) is written.
     ctx.ensure_quota(id_map.len()).await?;
@@ -101,9 +142,15 @@ pub async fn install(
     report.meta("slug", &slug);
     report.meta("format", bundle.format_code);
 
-    let archive_base = ctx.home.join("imported").join(&slug).join("source");
-    if !ctx.dry_run {
-        placement::archive_source(root, &bundle, &archive_base, report);
+    if !ctx.dry_run && !archive.is_empty() {
+        if archive_root.symlink_metadata().is_ok() {
+            return Err(cfg_err("原始檔備份目的地已變更，請重新預覽".into()));
+        }
+        for (rel, bytes) in &archive {
+            crate::expert::install::write_planned_file(&ctx.home, &format!("imported/{slug}/source/{rel}"), bytes)?;
+        }
+        report.imported("archive", &format!("原始檔 {} 個已保存", archive.len()));
+        report.tag("archive.saved", json!({"count": archive.len()}));
     }
     let lineage_prefix = format!("agent-import:{slug}/");
 
@@ -125,61 +172,181 @@ pub async fn install(
         installed_at: now_iso(),
         source_format: bundle.format_code.to_string(),
     };
-    let stage = tempfile::tempdir().map_err(|e| cfg_err(format!("建立暫存目錄失敗：{e}")))?;
     let mut quarantined: Vec<QuarantinedSkill> = Vec::new();
-    for draft in &order {
-        if ctx.stopping() {
-            break;
-        }
-        let Some(id) = id_map.get(&draft.ref_id).cloned() else {
-            continue;
-        };
-        let parent = draft
-            .reports_to
-            .as_ref()
-            .and_then(|r| id_map.get(r).cloned())
-            .or_else(|| ctx.attach_under.clone())
-            .unwrap_or_default();
-        let job = AgentJob {
-            draft,
-            id: &id,
-            parent: &parent,
-            slug: &slug,
-            format: bundle.format_code,
-            lineage_prefix: &lineage_prefix,
-        };
-        if install_agent(ctx, &job, stage.path(), &mut book, report, &mut quarantined).await? {
-            record.agents.push(id);
-        } else {
-            id_map.remove(&draft.ref_id);
-        }
+    for plan in &plans {
+        if ctx.stopping() { return Err(crate::expert::install::interrupted()); }
+        install_agent(ctx, plan, &slug, bundle.format_code, &lineage_prefix, report, &mut quarantined).await?;
+        record.agents.push(plan.draft.id_hint.clone());
     }
     for u in &bundle.unmapped {
         report.ignored("archive", &u.rel, u.reason.clone());
         report.tag("archive.unmapped", json!({ "file": u.rel }));
     }
     placement::file_quarantine(ctx, &slug, quarantined, report).await;
-    if record.agents.is_empty() {
-        if !ctx.dry_run {
-            let _ = std::fs::remove_dir_all(ctx.home.join("imported").join(&slug));
-        }
-        let problems = report.agent_problems();
-        return Err(import_err(
-            "import.nothing_imported",
-            json!({ "agents": problems }),
-            "沒有任何 AI 員工匯入成功（原因見匯入報告裡每位員工的說明）",
-        ));
-    }
     Ok(record)
 }
 
-struct AgentJob<'a> {
-    draft: &'a AgentDraft,
-    id: &'a str,
-    parent: &'a str,
-    slug: &'a str,
-    format: &'static str,
-    lineage_prefix: &'a str,
+struct AgentPlan {
+    draft: AgentDraft,
+    scaffold: crate::AgentScaffold,
+    files: BTreeMap<String, Vec<u8>>,
+    skills: Vec<(super::skills::PreparedSkill, BTreeMap<String, Vec<u8>>)>,
+    wiki: BTreeMap<String, Vec<u8>>,
+    skill_effects: Vec<serde_json::Value>,
+}
+
+fn file_hashes(prefix: &str, files: &BTreeMap<String, Vec<u8>>) -> Vec<serde_json::Value> {
+    files.iter().map(|(rel, bytes)| json!({"path": format!("{prefix}/{rel}"),
+        "sha256": crate::expert::registry::sha256_hex(bytes)})).collect()
+}
+
+/// Resolve all names and bytes before presenting anything for confirmation.
+fn plan_agent(
+    source: &AgentDraft, id: &str, parent: &str, format: &str, slug: &str, stage: &Path,
+    book: &mut NameBook, report: &mut Report,
+) -> Result<AgentPlan> {
+    if format == "duduclaw" {
+        duduclaw_core::agent_profile::validate_settings(&source.settings).map_err(|e| cfg_err(e.to_string()))?;
+    }
+    super::preview::validate_section_limits(source)?;
+    let mut draft = source.clone();
+    let wanted = clean_display_name(&draft.display_name);
+    let wanted = if wanted.is_empty() { id } else { &wanted };
+    let display = [wanted.to_string(), format!("{wanted}（{id}）"), format!("{wanted}-{id}")]
+        .into_iter().find(|name| duduclaw_core::agent_names::norm(name) == duduclaw_core::agent_names::norm(id) || !book.is_taken(name))
+        .ok_or_else(|| cfg_err("員工名稱衝突，未產生安裝計畫".into()))?;
+    book.reserve(&display);
+    if display != wanted {
+        report.warning("agent", id, format!("「{wanted}」已被使用，改用「{display}」"));
+        report.tag("agent.display_changed", json!({"from": wanted, "to": display}));
+    }
+    let scaffold = crate::AgentScaffold {
+        name: id.into(), display_name: display.clone(), role: "worker".into(),
+        reports_to: parent.into(), icon: draft.emoji.clone().unwrap_or_else(|| "🐾".into()),
+        trigger: format!("@{display}"), provider: duduclaw_core::types::RuntimeType::Claude,
+        model_preferred: map_model(draft.model.as_deref(), id, report),
+        soul_body: draft.soul.as_ref().map(|doc| doc.text.clone()),
+    };
+    let mut files = crate::scaffold_agent_files(&scaffold)?;
+    let mut settings: toml::Table = std::str::from_utf8(&files["agent.toml"])
+        .map_err(|e| cfg_err(e.to_string()))?.parse().map_err(|e| cfg_err(format!("員工設定無效：{e}")))?;
+    crate::expert::merge_toml(&mut settings, &draft.settings);
+    let (allowed, denied) = plan_tools(&draft, id, report);
+    if !allowed.is_empty() || !denied.is_empty() {
+        crate::expert::set_capabilities(&mut settings, &allowed, &denied);
+    }
+    let _: duduclaw_core::types::AgentConfig = toml::Value::Table(settings.clone()).try_into()
+        .map_err(|e| cfg_err(format!("員工設定型別不正確：{e}")))?;
+    files.insert("agent.toml".into(), toml::to_string_pretty(&settings).map_err(|e| cfg_err(e.to_string()))?.into_bytes());
+    for (file, doc) in [("IDENTITY.md", &draft.identity), ("USER.md", &draft.user_profile),
+        ("INSTRUCTIONS.md", &draft.instructions), ("CONTRACT.toml", &draft.contract)] {
+        if let Some(doc) = doc { files.insert(file.into(), doc.text.as_bytes().to_vec()); }
+    }
+    draft.id_hint = id.into();
+    draft.display_name = display;
+    draft.reports_to = Some(parent.into());
+    draft.model = settings.get("model").and_then(|v| v.get("preferred")).and_then(|v| v.as_str()).map(str::to_string);
+    let tool_list = |key| settings.get("capabilities").and_then(|v| v.get(key)).and_then(|v| v.as_array())
+        .map(|values| values.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+    draft.tools = Some(tool_list("allowed_tools"));
+    draft.disallowed_tools = tool_list("denied_tools");
+    draft.settings = settings;
+    let mut skills = Vec::new();
+    let mut skill_effects = Vec::new();
+    let mut taken = BTreeSet::new();
+    for skill in &draft.skills {
+        let mut prepared = super::skills::prepare(skill, &stage.join(id), format, &mut taken);
+        if matches!(prepared.verdict, super::skills::Verdict::Enable)
+            && files.keys().any(|file| file.starts_with(&format!("SKILLS/{}/", prepared.name))) {
+            prepared.verdict = super::skills::Verdict::Blocked("與內建技能同名，未覆蓋".into());
+        }
+        let (disposition, prefix) = match &prepared.verdict {
+            super::skills::Verdict::Enable => ("enabled", format!("agents/{id}/SKILLS/{}", prepared.name)),
+            super::skills::Verdict::Quarantine(_) => ("quarantined", format!("experts/{slug}/skills-disabled/{id}/{}", prepared.name)),
+            super::skills::Verdict::Blocked(_) => ("blocked", String::new()),
+        };
+        let skill_files = if disposition == "blocked" { BTreeMap::new() }
+            else { snapshot_tree(&prepared.staged_dir)? };
+        skill_effects.push(json!({"name": prepared.name, "disposition": disposition,
+            "verdict": format!("{:?}", prepared.verdict), "files": file_hashes(&prefix, &skill_files)}));
+        skills.push((prepared, skill_files));
+    }
+    let wiki = super::slots::plan_wiki_files(&draft, format).map_err(cfg_err)?;
+    Ok(AgentPlan { draft, scaffold, files, skills, skill_effects, wiki })
+}
+
+fn read_plan_file(path: &Path, expected: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|e| cfg_err(e.to_string()))?;
+    if !file.metadata().map_err(|e| cfg_err(e.to_string()))?.is_file() {
+        return Err(cfg_err("來源不是一般檔案".into()));
+    }
+    let mut bytes = Vec::new();
+    file.take(expected.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| cfg_err(e.to_string()))?;
+    if bytes.len() as u64 != expected { return Err(cfg_err("來源檔案讀取期間變更".into())); }
+    Ok(bytes)
+}
+
+fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut u64) -> Result<()> {
+        for entry in std::fs::read_dir(dir).map_err(|e| cfg_err(e.to_string()))? {
+            let entry = entry.map_err(|e| cfg_err(e.to_string()))?;
+            let name = entry.file_name();
+            if name.to_str().map(|name| name.contains('\\')).unwrap_or(true) {
+                return Err(cfg_err("安裝計畫檔名無效".into()));
+            }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| cfg_err(e.to_string()))?;
+            if meta.is_dir() { walk(root, &path, files, total)?; }
+            else if meta.is_file() {
+                *total = total.saturating_add(meta.len());
+                if *total > crate::expert::safe_zip::MAX_UNPACK_BYTES || files.len() >= 10_000 { return Err(cfg_err("安裝計畫超過大小限制".into())); }
+                let rel = path.strip_prefix(root).map_err(|e| cfg_err(e.to_string()))?.to_str()
+                    .ok_or_else(|| cfg_err("安裝計畫路徑不是 UTF-8".into()))?.replace('\\', "/");
+                files.insert(rel, read_plan_file(&path, meta.len())?);
+            } else { return Err(cfg_err("安裝計畫不接受連結或特殊檔案".into())); }
+        }
+        Ok(())
+    }
+    let mut files = BTreeMap::new();
+    walk(root, root, &mut files, &mut 0)?;
+    Ok(files)
+}
+
+fn plan_archive(root: &Path, bundle: &ImportBundle) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    let mut total = 0u64;
+    for rel in placement::archive_list(bundle) {
+        if rel.contains('\\') { return Err(cfg_err("原始檔路徑無效".into())); }
+        let mut path = root.to_path_buf();
+        for part in Path::new(&rel).components() {
+            if !matches!(part, std::path::Component::Normal(_)) { return Err(cfg_err("原始檔路徑無效".into())); }
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => return Err(cfg_err("原始檔不能是連結".into())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(cfg_err(e.to_string())),
+                _ => {}
+            }
+        }
+        let meta = match std::fs::symlink_metadata(root.join(&rel)) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(cfg_err(e.to_string())),
+        };
+        if !meta.is_file() { return Err(cfg_err("原始檔不是一般檔案".into())); }
+        total = total.saturating_add(meta.len());
+        if total > crate::expert::safe_zip::MAX_UNPACK_BYTES { return Err(cfg_err("原始檔超過備份上限".into())); }
+        files.insert(rel.clone(), read_plan_file(&root.join(rel), meta.len())?);
+    }
+    Ok(files)
 }
 
 /// Supervisors before reports (refs pointing outside the bundle are roots).
@@ -282,109 +449,53 @@ fn choose_slug(ctx: &InstallCtx, bundle: &ImportBundle, order: &[AgentDraft]) ->
 }
 
 async fn install_agent(
-    ctx: &InstallCtx,
-    job: &AgentJob<'_>,
-    stage: &Path,
-    book: &mut NameBook,
-    report: &mut Report,
-    quarantined: &mut Vec<QuarantinedSkill>,
-) -> Result<bool> {
-    let d = job.draft;
-    let id = job.id;
-    if !crate::is_valid_agent_id(id) || duduclaw_core::is_reserved_agent_id(id) {
-        return Err(cfg_err("無效的員工代號，未寫入".into()));
-    }
-    // SOUL is the one review point (employees cannot edit it later).
-    let soul = match &d.soul {
-        Some(doc) => match scan_external(&doc.text) {
-            ScanVerdict::Ok => Some(doc.text.clone()),
-            ScanVerdict::Blocked(reason) => {
-                report.skipped(
-                    "agent",
-                    id,
-                    format!("人格設定（{}）未通過內容安全檢查，整位不匯入：{reason}", doc.source),
-                );
-                report.tag("agent.soul_blocked", json!({ "id": id }));
-                return Ok(false);
-            }
-        },
-        None => None,
-    };
-    let wanted = {
-        let n = clean_display_name(&d.display_name);
-        if n.is_empty() { id.to_string() } else { n }
-    };
-    // `@<display name>` calls an employee in every channel: never hand a new
-    // employee a name someone on the team already answers to.
-    let (display, renamed) = book.unique_display(&wanted, id);
-    report.imported("agent", &format!("{display}（{id}）"));
-    report.tag("agent.created", json!({ "display": display, "id": id }));
-    if renamed {
-        report.warning(
-            "agent",
-            id,
-            format!("「{wanted}」已是其他 AI 員工的名稱或呼叫詞，改用「{display}」，呼叫詞為 @{display}"),
-        );
-        report.tag("agent.display_changed", json!({ "from": wanted, "to": display }));
-    }
-    match &d.soul {
-        Some(doc) => {
-            report.imported("soul", &format!("{} → 人格設定（SOUL.md，AI 員工只能讀）", doc.source));
-            report.tag("slot.written", json!({ "slot": "soul" }));
-        }
-        None => {
-            report.ignored("soul", id, "來源沒有人格設定，使用預設人格");
-            report.tag("slot.soul_default", json!({}));
-        }
-    }
-    let model = map_model(d.model.as_deref(), id, report);
-
+    ctx: &InstallCtx, plan: &AgentPlan, slug: &str, format: &'static str,
+    lineage_prefix: &str, report: &mut Report, quarantined: &mut Vec<QuarantinedSkill>,
+) -> Result<()> {
+    let d = &plan.draft;
+    let id = &d.id_hint;
     if !ctx.dry_run {
-        let scaffold = crate::AgentScaffold {
-            name: id.to_string(),
-            display_name: display.clone(),
-            role: "worker".into(),
-            reports_to: job.parent.to_string(),
-            icon: d.emoji.clone().unwrap_or_else(|| "🐾".into()),
-            trigger: format!("@{display}"),
-            provider: duduclaw_core::types::RuntimeType::Claude,
-            model_preferred: model,
-            soul_body: soul,
-        };
         ctx.note_agent(id);
-        if let Err(e) = crate::scaffold_agent_dir(&ctx.home, &scaffold).await {
-            report.skipped("agent", id, format!("建立失敗：{e}"));
-            report.tag("agent.failed", json!({ "id": id }));
-            return Ok(false);
+        crate::scaffold_planned_agent_dir(&ctx.home, &plan.scaffold, &plan.files).await?;
+    }
+    if let Some(doc) = &d.soul {
+        report.imported("soul", &format!("{} → 人格設定（SOUL.md）", doc.source));
+        report.tag("slot.written", json!({"slot": "soul"}));
+    }
+    for (slot, doc) in [("identity", &d.identity), ("user-profile", &d.user_profile),
+        ("instructions", &d.instructions), ("contract", &d.contract)] {
+        if let Some(doc) = doc {
+            report.imported(slot, &doc.source);
+            report.tag("slot.written", json!({"slot": slot}));
         }
     }
-
-    let slot_ctx = SlotCtx {
-        home: &ctx.home,
-        agent_id: id,
-        dry_run: ctx.dry_run,
-        lineage_prefix: job.lineage_prefix,
-        format_code: job.format,
-        apply_identity_fields: false,
-    };
-    for o in write_slots(&slot_ctx, d).await {
-        report.add_outcome(&o);
-        if job.format == "duduclaw" && o.status == Status::Skipped {
-            return Err(cfg_err(format!("Agent File 區段未能完整寫入：{}", o.detail)));
+    report.imported("agent", &format!("{}（{id}）", d.display_name));
+    report.tag("agent.created", json!({"display": d.display_name, "id": id}));
+    // These slots are already exact files in the plan. Only the data imports
+    // remain; their source text is owned by the plan, never re-read from disk.
+    let mut data = d.clone();
+    data.identity = None;
+    data.user_profile = None;
+    data.instructions = None;
+    data.contract = None;
+    data.tools_notes = None;
+    data.heartbeat = None;
+    data.knowledge.clear();
+    if !ctx.dry_run && !plan.wiki.is_empty() {
+        let store = duduclaw_memory::WikiStore::new(ctx.home.join("agents").join(id).join("wiki"));
+        store.ensure_scaffold()?;
+        for (path, bytes) in &plan.wiki {
+            let content = std::str::from_utf8(bytes).map_err(|e| cfg_err(e.to_string()))?;
+            store.write_page_with_author(path, content, "import")?;
         }
     }
-    if !ctx.dry_run && !d.settings.is_empty() {
-        duduclaw_gateway::agent_files::external::edit_agent_toml(
-            &ctx.home, id, "import", "本機匯入（身分未驗證）", |table| {
-            crate::expert::merge_toml(table, &d.settings);
-            let _: duduclaw_core::types::AgentConfig = toml::Value::Table(table.clone()).try_into()
-                .map_err(|e| format!("員工設定型別不正確：{e}"))?;
-            Ok(())
-        }).map_err(cfg_err)?;
-    }
-    if let Err(e) = apply_tools(ctx, d, id, report) {
-        report.warning("agent-tools", id, format!("工具限制未套用：{e}"));
-        report.tag("tools.failed", json!({}));
+    let slot_ctx = SlotCtx { home: &ctx.home, agent_id: id, dry_run: ctx.dry_run,
+        lineage_prefix, format_code: format, apply_identity_fields: false };
+    for outcome in write_slots(&slot_ctx, &data).await {
+        report.add_outcome(&outcome);
+        if outcome.status == Status::Skipped {
+            return Err(cfg_err(format!("安裝計畫資料未能完整寫入：{}", outcome.detail)));
+        }
     }
     report_mcp(d, id, report);
     for (field, why) in &d.ignored_fields {
@@ -399,14 +510,9 @@ async fn install_agent(
         report.ignored("archive", &u.rel, u.reason.clone());
         report.tag("archive.unmapped", json!({ "file": u.rel }));
     }
-    let skill_job = SkillJob {
-        draft: d,
-        id,
-        slug: job.slug,
-        format: job.format,
-    };
-    placement::install_skills(ctx, &skill_job, stage, report, quarantined);
-    Ok(true)
+    let job = SkillJob { id, slug };
+    placement::install_skills(ctx, &job, &plan.skills, report, quarantined)?;
+    Ok(())
 }
 
 /// Claude ids are kept; anything else (doubao-*, gpt-*, …) falls back to the
@@ -436,7 +542,7 @@ fn map_model(raw: Option<&str>, id: &str, report: &mut Report) -> Option<String>
 }
 
 /// Imported tool lists only narrow, and always keep DuDuClaw's own tools.
-fn apply_tools(ctx: &InstallCtx, d: &AgentDraft, id: &str, report: &mut Report) -> Result<()> {
+fn plan_tools(d: &AgentDraft, id: &str, report: &mut Report) -> (Vec<String>, Vec<String>) {
     let mut allowed: Vec<String> = Vec::new();
     let mut denied: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
@@ -473,7 +579,7 @@ fn apply_tools(ctx: &InstallCtx, d: &AgentDraft, id: &str, report: &mut Report) 
         report.tag("tools.dropped", json!({ "names": dropped.join(", ") }));
     }
     if allowed.is_empty() && denied.is_empty() {
-        return Ok(());
+        return (allowed, denied);
     }
     let list = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.join(", ") };
     report.imported(
@@ -481,12 +587,7 @@ fn apply_tools(ctx: &InstallCtx, d: &AgentDraft, id: &str, report: &mut Report) 
         &format!("{id}：只允許 {}；禁用 {}", list(&allowed), list(&denied)),
     );
     report.tag("tools.narrowed", json!({ "allowed": list(&allowed), "denied": list(&denied) }));
-    if ctx.dry_run {
-        return Ok(());
-    }
-    crate::expert::patch_agent_toml(&ctx.home, id, |t| {
-        crate::expert::set_capabilities(t, &allowed, &denied)
-    })
+    (allowed, denied)
 }
 
 /// MCP servers declared in a foreign agent file are **not** imported: a
@@ -537,4 +638,70 @@ mod tests {
         assert!(!is_known_tool("search"));
         assert!(!is_known_tool("mcp__"));
     }
+
+    fn planned_effects(source: &AgentDraft, id: &str, parent: &str, home: &Path) -> serde_json::Value {
+        let stage = tempfile::tempdir().unwrap();
+        let plan = plan_agent(source, id, parent, "claude-subagent", "team", stage.path(),
+            &mut NameBook::load(home), &mut Report::default()).unwrap();
+        json!({"profile": plan.draft, "files": file_hashes(id, &plan.files),
+            "skills": plan.skill_effects, "wiki": file_hashes("wiki", &plan.wiki)})
+    }
+
+    #[test]
+    fn resolved_plan_binds_model_tools_parent_names_settings_and_all_file_bodies() {
+        let home = tempfile::tempdir().unwrap();
+        let source = AgentDraft { id_hint: "worker".into(), display_name: "Worker".into(),
+            soul: Some(super::super::ir::Doc::new("SOUL.md", "Help carefully.")),
+            model: Some("sonnet".into()), tools: Some(vec!["Read".into()]),
+            disallowed_tools: vec!["Bash".into()], ..Default::default() };
+        let baseline = planned_effects(&source, "worker", "boss", home.path());
+        for field in ["model", "tools", "denied", "name", "settings", "soul", "contract", "user", "identity", "rules", "wiki"] {
+            let mut changed = source.clone();
+            match field {
+                "model" => changed.model = Some("haiku".into()),
+                "tools" => changed.tools = None,
+                "denied" => changed.disallowed_tools.clear(),
+                "name" => changed.display_name = "Another worker".into(),
+                "settings" => changed.settings = toml::from_str("[heartbeat]\nenabled = true").unwrap(),
+                "soul" => changed.soul = Some(super::super::ir::Doc::new("SOUL.md", "Different persona")),
+                "contract" => changed.contract = Some(super::super::ir::Doc::new("CONTRACT.toml", "[boundaries]\nmust_not = ['refund']")),
+                "user" => changed.user_profile = Some(super::super::ir::Doc::new("USER.md", "Concise replies")),
+                "identity" => changed.identity = Some(super::super::ir::Doc::new("IDENTITY.md", "Support")),
+                "rules" => changed.instructions = Some(super::super::ir::Doc::new("INSTRUCTIONS.md", "Ask first")),
+                _ => changed.knowledge.push(super::super::ir::Doc::new("guide.md", "# Guide\nKnowledge")),
+            }
+            assert_ne!(super::super::preview::digest(&baseline),
+                super::super::preview::digest(&planned_effects(&changed, "worker", "boss", home.path())), "{field}");
+        }
+        assert_ne!(baseline, planned_effects(&source, "worker-imported", "boss", home.path()));
+        assert_ne!(baseline, planned_effects(&source, "worker", "other-boss", home.path()));
+        let existing = home.path().join("agents/existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("agent.toml"), "[agent]\nname = 'existing'\ndisplay_name = 'Worker'").unwrap();
+        let collision = planned_effects(&source, "worker", "boss", home.path());
+        assert_ne!(baseline, collision);
+        assert_eq!(collision["profile"]["display_name"], "Worker（worker）");
+    }
+
+    #[test]
+    fn skill_body_changes_plan_and_confirmed_bytes_survive_source_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let skill = src.path().join("helper");
+        std::fs::create_dir(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: helper\ndescription: Help\n---\nOriginal body").unwrap();
+        let source = AgentDraft { id_hint: "worker".into(), display_name: "Worker".into(),
+            skills: vec![super::super::ir::SkillDraft { dir: skill.clone(), name_hint: "helper".into(),
+                label: None, version: None, source: "helper".into() }], ..Default::default() };
+        let stage = tempfile::tempdir().unwrap();
+        let plan = plan_agent(&source, "worker", "", "claude-subagent", "team", stage.path(),
+            &mut NameBook::load(home.path()), &mut Report::default()).unwrap();
+        let before = planned_effects(&source, "worker", "", home.path());
+        std::fs::write(skill.join("SKILL.md"), "---\nname: helper\ndescription: Help\n---\nChanged body").unwrap();
+        assert_ne!(before, planned_effects(&source, "worker", "", home.path()));
+        assert!(std::str::from_utf8(&plan.skills[0].1["SKILL.md"]).unwrap().contains("Original body"));
+        assert!(plan.files.contains_key(".mcp.json"));
+        assert!(plan.files.contains_key("SKILLS/code-review/SKILL.md"));
+    }
+
 }

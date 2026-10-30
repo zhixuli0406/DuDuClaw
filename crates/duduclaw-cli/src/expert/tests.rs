@@ -386,6 +386,13 @@ reports_to = "shop-front"
     assert!(cmd_install(home.path(), dir.to_str().unwrap(), false, false, false, None).await.is_err());
     assert!(!home.path().join("agents").exists());
     std::fs::remove_file(dir.join("agents/shop-billing/CONTRACT.toml")).unwrap();
+    // New imports reject unknown contract fields instead of silently dropping them.
+    assert!(cmd_install(home.path(), dir.to_str().unwrap(), false, false, false, None).await.is_err());
+    assert!(!home.path().join("agents").exists());
+    write(
+        &dir.join("agents/shop-returns/CONTRACT.toml"),
+        "[boundaries]\nmust_not = [\"替客戶決定要不要退費或承諾退費金額\"]\nmust_always = [\"涉及金額一律轉交真人確認\"]\n",
+    );
     cmd_install(home.path(), dir.to_str().unwrap(), false, false, false, None)
         .await
         .expect("reviewed clean content should install");

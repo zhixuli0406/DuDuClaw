@@ -81,6 +81,11 @@ Hand-written Contract accepts YAML `must_not` and `must_always` string lists and
 contain valid TOML with correctly typed boundary fields; invalid contracts are
 refused before import writes. Native TOML accepts only `[boundaries]`; misplaced
 top-level `must_not`/`must_always` keys are rejected rather than silently ignored.
+This strict validation applies to new writes and imports. Runtime loading retains
+legacy compatibility: unknown contract fields are ignored, known boundaries are
+kept, and malformed TOML or invalid boundary types produce a warning and the same
+empty-contract fallback as the earlier runtime loader. Unreadable or oversized
+files still refuse the profile.
 
 For hand-written Persona text, all content goes to `SOUL.md`. Native exports use
 tagged fenced blocks to preserve the two persona files separately and to preserve
@@ -136,8 +141,35 @@ import adapter. They are not emitted by the Agent File exporter.
 
 ## Human review and export controls
 
-Every import first previews Persona, User, Rules and Contract and the input-guard
-results. A human must confirm that preview before any employee files are written.
+Every employee import (Agent File/adapters, Claude plugins and native expert
+packs, through CLI or dashboard upload) first builds one resolved install plan.
+The preview shows Persona, User, Rules, Contract, input-guard results, final employee
+names and IDs, supervisors, effective models, tool allow/deny lists, merged settings,
+and destination paths with SHA-256 hashes. An empty tool allowlist means no extra
+allowlist restriction; the deny list still applies.
+
+The versioned confirmation digest binds this plan, including collision resolutions,
+all rendered employee files (including built-in skills and host-generated MCP
+configuration), every imported skill body and attachment, archive/wiki/hook payloads,
+hook disposition, destination identity, product policy and replacement scope/content.
+MCP credentials are represented by file hashes, never shown as plaintext. A separate
+confirmation invocation rebuilds the plan against the current source and destination;
+a changed plan requires another preview. After confirmation, application consumes
+only the resolved names and owned payloads; it does not re-read the source or
+re-decide tool restrictions. Write failures refuse the operation instead of silently
+leaving an employee without its planned tool restrictions. Protected files still use
+the locked writer with accepted baselines, version history and audit records.
+
+Runtime-generated bookkeeping (audit/history/approval IDs and timestamps, database
+row IDs, wiki indexes/logs, and replacement backup timestamps) is not payload
+content and is allocated when the plan is applied. Memory imports bind their source
+text and lineage; the existing memory trust/tombstone gates may still refuse a fact.
+Imported wiki payloads do not assert source creation/update dates; application time
+is recorded by the wiki audit log. This confirmation is not an OS sandbox or a
+transaction across every database and file; an I/O failure may leave a partial fresh
+install. Existing replacement rollback behavior is retained.
+
+A human must confirm the plan before destination employee files are written.
 AI sessions cannot import. `USER.md` enters prompts inside a `<user_profile>`
 data block that explicitly says it contains data, not instructions. Its text is
 scanned by the same input guard as persona text.
@@ -160,3 +192,20 @@ shared credential-shape detector. A rejection names the section without echoing
 the suspected secret. A successful export records an audit event. Credential
 shape detection does not prove that arbitrary prose contains no sensitive data;
 the human choosing what to export remains responsible for its content.
+
+## Runtime prompt order
+
+The shared profile loader supplies sections; each builder preserves its existing
+contract precedence relative to contextual material:
+
+| Builder | Contract position |
+| --- | --- |
+| `duduclaw-agent::runner` | After skills, legacy memory and wiki; before the dynamic suffix |
+| `gateway::claude_runner` | After skills, legacy memory and wiki |
+| `gateway::channel_reply` | Existing order preserved: profile contract before skills/wiki |
+| `gateway::prompt_minimal` | Existing order preserved: end of profile, before sender/tool index |
+
+Security regression tests cover plan changes (including tool restrictions, skill
+bodies and collision resolution), the two restored contract positions, and runtime
+versus import handling of legacy contracts. **These tests are not run for this
+change; compilation, build and runtime acceptance are also not performed.**
