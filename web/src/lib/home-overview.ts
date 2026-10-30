@@ -96,9 +96,9 @@ export function resolveFailureAgentId(value: string, agents: ReadonlyArray<{ nam
 }
 
 /** Unified-log summaries share the same plain words as the Inbox. */
-export function auditEventSummary(event: ChannelFailureAuditEvent & { source: string }, formatMessage: IntlShape['formatMessage']): string {
+export function auditEventSummary(event: ChannelFailureAuditEvent & { source: string }, formatMessage: IntlShape['formatMessage'], agentName = event.agent_id): string {
   return event.source === 'channel_failure' && /^[\s]*[\[{]/.test(event.summary) && !isChannelRecoveredEvent(event.event_type)
-    ? failedRunTitle(event, formatMessage)
+    ? failedRunTitle(event, formatMessage, agentName)
     : event.summary;
 }
 

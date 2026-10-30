@@ -391,7 +391,10 @@ describe('Inbox browser regressions', () => {
       return Promise.resolve({});
     });
     renderAt(`/inbox?item=${encodeURIComponent(`failed_run:${agent}:2026-10-31T00:00:00Z`)}`);
-    fireEvent.click(await screen.findByRole('button', { name: 'View work record' }));
+    const link = await screen.findByRole('button', { name: 'View work record' });
+    const label = agents.find((a) => a.name === agent)?.display_name || agent;
+    expect(screen.getAllByText(`${label}'s work did not finish`).length).toBeGreaterThan(0);
+    fireEvent.click(link);
     expect(await screen.findByText(destination)).toBeInTheDocument();
   });
 });

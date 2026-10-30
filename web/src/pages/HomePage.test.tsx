@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { HomePage, greetingName } from './HomePage';
@@ -28,11 +29,12 @@ beforeEach(() => {
     users: [],
     available: false,
   });
-  useAgentsStore.setState({ agents: [], loading: false, error: null });
+  useAgentsStore.setState({ agents: [], loading: false, error: null, fetchAgents: vi.fn() });
   useConnectionStore.setState({ state: 'authenticated' });
   useSystemStore.setState({ status: null } as never);
   useAuthStore.setState({
-    user: { user_id: 'u1', display_name: 'Alice', role: 'employee' } as never,
+    user: { id: 'u1', display_name: 'Alice', role: 'employee' } as never,
+    bindings: [],
   });
   try {
     localStorage.clear();
@@ -42,10 +44,11 @@ beforeEach(() => {
 });
 
 describe('HomePage (WP1.5)', () => {
-  it('renders the greeting line and the usage KPI strip', async () => {
+  it('renders the greeting line and the usage KPI strip for an admin', async () => {
+    useAuthStore.setState({ user: { id: 'u1', display_name: 'Alice', role: 'admin' } as never });
     renderWithProviders(<HomePage />);
 
-    // The four fixed KPI tiles (§5.5) render regardless of telemetry state.
+    // Admin-only KPI tiles remain visible even without telemetry.
     expect(await screen.findByText('Cost (24h)')).toBeInTheDocument();
     expect(screen.getByText('Tokens (24h)')).toBeInTheDocument();
     expect(screen.getByText('Runs (24h)')).toBeInTheDocument();
@@ -56,9 +59,25 @@ describe('HomePage (WP1.5)', () => {
     expect(heading.textContent).toContain('Alice');
   });
 
+  it.each(['employee', 'manager'] as const)('loads the %s home without cost tiles or restricted RPCs', async (role) => {
+    useAuthStore.setState({ user: { id: 'u1', display_name: 'Alice', role } as never });
+    renderWithProviders(<HomePage />);
+    expect(await screen.findByRole('heading', { level: 1 })).toHaveTextContent('Alice');
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('dashboard.layout.get'));
+    expect(screen.getByText('Edit layout')).toBeInTheDocument();
+    for (const label of ['Cost (24h)', 'Tokens (24h)', 'Runs (24h)', 'Cache efficiency']) {
+      expect(screen.queryByText(label)).not.toBeInTheDocument();
+    }
+    const methods = mockWsClient.call.mock.calls.map(([method]) => method);
+    expect(methods).not.toContain('cost.summary');
+    expect(methods).not.toContain('billing.usage');
+    if (role === 'employee') expect(methods).not.toContain('growth.daily_report');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('does not mount the world stage on the home canvas', async () => {
     renderWithProviders(<HomePage />);
-    await screen.findByText('Cost (24h)');
+    await screen.findByRole('heading', { level: 1 });
 
     // The world stage moved to its own `/world` page — no office scene here.
     expect(screen.queryByLabelText('Office scene')).toBeNull();
@@ -66,9 +85,11 @@ describe('HomePage (WP1.5)', () => {
   });
 
   it('offers the layout edit affordance', async () => {
+    const user = userEvent.setup();
     renderWithProviders(<HomePage />);
-    await screen.findByText('Cost (24h)');
-    expect(screen.getByText('Edit layout')).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: 'Edit layout' }));
+    expect(screen.getByRole('button', { name: 'Done' })).toBeInTheDocument();
+    expect(screen.queryByText('Cost (24h)')).not.toBeInTheDocument();
   });
 });
 

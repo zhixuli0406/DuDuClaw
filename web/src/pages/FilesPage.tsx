@@ -103,6 +103,7 @@ export function FilesPage() {
   const intl = useIntl();
   const jwt = useAuthStore((s) => s.jwt);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
+  const agentsLoaded = useAgentsStore((s) => s.loaded);
   const scope = useDataScope();
   const visibleAgents = useVisibleAgents(false);
 
@@ -192,7 +193,12 @@ export function FilesPage() {
   }, [effective, q, sinceMs, untilMs]);
 
   const fetchFiles = useCallback(async () => {
-    if (!effective) return; // nothing selectable yet
+    if (!effective) {
+      // An already-loaded roster with no direct binding is an empty view.
+      setError(null);
+      setLoaded(agentsLoaded);
+      return;
+    }
     if (scope !== 'all' && effective === SHARED) return;
     try {
       const res = await fetch(buildListUrl(), {
@@ -207,7 +213,7 @@ export function FilesPage() {
     } finally {
       setLoaded(true);
     }
-  }, [effective, scope, buildListUrl, jwt]);
+  }, [effective, scope, buildListUrl, jwt, agentsLoaded]);
 
   useEffect(() => {
     setLoaded(false);

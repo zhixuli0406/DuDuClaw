@@ -68,19 +68,18 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.getByRole('button', { name: /Command palette/i })).toBeInTheDocument();
   });
 
-  it('hides role-gated items below the required role (fail-closed UX)', () => {
-    useAuthStore.setState({ user: { display_name: 'E', role: 'employee' } as never });
+  it.each(['employee', 'manager'])('hides admin-gated items for %s (fail-closed UX)', (role) => {
+    useAuthStore.setState({ user: { display_name: 'U', role } as never });
     renderSidebar();
-    // manager+ surfaces are hidden for an employee…
-    expect(screen.queryByRole('link', { name: /Reports/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /Manage/i })).not.toBeInTheDocument();
+    if (role === 'employee') {
+      expect(screen.queryByRole('link', { name: /Reports/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: /Manage/i })).not.toBeInTheDocument();
+    }
     // …while open surfaces stay.
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /About/i })).toBeInTheDocument();
-    // D7 (09-edition-split-features.md §4): 例行工作 dropped its manager+ gate
-    // — an employee's own agent's cron schedule is the same "own scope" as
-    // 共同計畫, which was already open.
-    expect(screen.getByRole('link', { name: /Routines/i })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Routines/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Gallery/i })).not.toBeInTheDocument();
   });
 
   // D6 (09-edition-split-features.md §4): the org chart is a progressive-

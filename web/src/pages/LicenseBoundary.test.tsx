@@ -7,6 +7,7 @@ import {renderWithProviders} from '@/test/render';
 import {useConnectionStore} from '@/stores/connection-store';
 import {useAgentsStore} from '@/stores/agents-store';
 import {useSystemStore} from '@/stores/system-store';
+import {useAuthStore} from '@/stores/auth-store';
 import {LicenseShell} from './LicenseShell';
 import {api} from '@/lib/api';
 import {SoftLimitBanner} from '@/components/SoftLimitBanner';
@@ -17,6 +18,7 @@ beforeEach(() => {
   useConnectionStore.setState({state: 'authenticated'});
   useAgentsStore.setState({agents: []});
   useSystemStore.setState({status: null});
+  useAuthStore.setState({user: {id: 'admin', display_name: 'Admin', role: 'admin'} as never, bindings: []});
   mockWsClient.call.mockImplementation(async (method: string) => {
     if (method === 'license.status') return {tier: 'open_source', mode: 'opensource', installed: false};
     if (method === 'license.fingerprint') return {fingerprint: 'machine-123'};

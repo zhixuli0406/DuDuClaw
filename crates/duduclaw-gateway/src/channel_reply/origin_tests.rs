@@ -200,7 +200,7 @@ async fn actual_shared_channel_pipeline_uses_effective_agent_and_never_implicit_
             assert!(!crate::auth_outage::state_path(home.path()).exists());
             let raw = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
             let row: serde_json::Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
-            assert_eq!(row["agent"], "Actual Worker");
+            assert_eq!(row["agent"], "worker");
             assert_eq!(
                 row["runtime_failure"]["steps"][0]["runtime"],
                 provider.as_str()
