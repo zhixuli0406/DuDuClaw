@@ -10,6 +10,8 @@ pub struct ScheduledRun {
     pub agent: TerminalText,
     pub next_run: TerminalText,
     pub source: ScheduleSource,
+    #[serde(default)]
+    pub detail: Value,
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub enum ScheduleSource {
@@ -49,43 +51,34 @@ pub(crate) fn activity_event(map: &mut HashMap<String, Activity>, name: &str, pa
         _ => {}
     }
 }
-pub(crate) async fn schedules(client: &Client, budget: &mut crate::budget::SnapshotBudget) -> Result<Vec<ScheduledRun>> {
+pub(crate) async fn schedules(client: &Client, role: crate::auth::Role, budget: &mut crate::budget::SnapshotBudget) -> Result<Vec<ScheduledRun>> {
     let mut result = Vec::new();
-    // These are existing Admin-only RPCs. No prediction from a cron expression:
+    // Cron is Admin-only; heartbeat is Manager+. No prediction from a cron expression:
     // timezones, disabled jobs and the scheduler's clock belong to the gateway.
     for (method, field, source) in [
         ("heartbeat.status", "heartbeats", ScheduleSource::Heartbeat),
         ("cron.list", "tasks", ScheduleSource::Cron),
     ] {
+        if method == "cron.list" && role != crate::auth::Role::Admin { continue; }
         let response = client
             .call(method, json!({}), Duration::from_secs(5))
             .await?;
         budget.charge(&response, field)?;
-        let rows = response
-            .get(field)
-            .and_then(Value::as_array)
-            .ok_or(Error::Protocol)?;
-        for row in rows {
-            if row.get("enabled").and_then(Value::as_bool) != Some(true) {
-                continue;
-            }
-            let Some(next) = row.get("next_run").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(agent) = row.get("agent_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let id = row.get("id").and_then(Value::as_str).unwrap_or(agent);
-            result.push(ScheduledRun {
-                id: format!("{method}:{id}"),
-                agent: TerminalText::new(agent.into()),
-                next_run: TerminalText::new(next.into()),
-                source,
-            });
-        }
+        result.extend(schedule_rows(&response, method, field, source)?);
     }
     result.sort_by_key(|r| r.next_run.plain());
     Ok(result)
+}
+
+fn schedule_rows(response: &Value, method: &str, field: &str, source: ScheduleSource) -> Result<Vec<ScheduledRun>> {
+    let rows = response.get(field).and_then(Value::as_array).ok_or(Error::Protocol)?;
+    rows.iter().map(|row| {
+        let agent = row["agent_id"].as_str().ok_or(Error::Protocol)?;
+        let id = match source { ScheduleSource::Cron => row["id"].as_str().ok_or(Error::Protocol)?, ScheduleSource::Heartbeat => agent };
+        let next = row["next_run"].as_str().unwrap_or(crate::strings::NOT_PROVIDED);
+        Ok(ScheduledRun { id: format!("{method}:{id}"), agent: TerminalText::new(agent.into()),
+            next_run: TerminalText::new(next.into()), source, detail: row.clone() })
+    }).collect()
 }
 
 /// Completion receipts survive a client restart via the existing runs.list RPC.
@@ -136,6 +129,17 @@ fn activity_from_runs(agent: &str, response: &Value) -> Result<Activity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn real_schedule_shapes_keep_paused_jobs_and_missing_fields_explicit() {
+        let cron = json!({"tasks":[{"id":"c1","name":"weekly","agent_id":"adu","cron":"0 9 * * 1","cron_timezone":"Asia/Taipei","enabled":false,"last_run_at":"2026-10-30","last_status":"success"}]});
+        let rows = schedule_rows(&cron,"cron.list","tasks",ScheduleSource::Cron).unwrap();
+        assert_eq!(rows.len(),1); assert!(rows[0].next_run.is(crate::strings::NOT_PROVIDED));
+        assert_eq!(rows[0].detail["enabled"],false); assert_eq!(rows[0].detail["last_status"],"success");
+        let heartbeat=json!({"heartbeats":[{"agent_id":"adu","enabled":true,"interval_seconds":3600,"cron":"0 * * * *","cron_timezone":"UTC","last_run":"09:00","next_run":"10:00","total_runs":4,"active_runs":0,"max_concurrent":1}]});
+        let rows=schedule_rows(&heartbeat,"heartbeat.status","heartbeats",ScheduleSource::Heartbeat).unwrap();
+        assert!(rows[0].next_run.is("10:00")); assert!(rows[0].detail.get("last_status").is_none());
+        assert!(schedule_rows(&json!({"tasks":[{"agent_id":"adu"}]}),"cron.list","tasks",ScheduleSource::Cron).is_err());
+    }
     #[test]
     fn recent_completed_id_is_stable_and_running_history_is_not_live_work() {
         let response = json!({"runs":[{"id":"r2","agent_id":"adu","status":"running"},{"id":"r1","agent_id":"adu","status":"completed"}]});

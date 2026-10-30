@@ -74,26 +74,7 @@ pub enum Focus {
     List,
     Input,
 }
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Block {
-    #[default]
-    Detail,
-    Chat,
-}
-/// M1 has two alternatives in one slot. M2 can expand the slots without
-/// teaching the input state machine about a particular pane layout.
-#[derive(Default, Clone)]
-pub struct Blocks {
-    pub active: Block,
-}
-impl Blocks {
-    pub fn select(&mut self, index: usize) {
-        const BLOCKS: [Block; 2] = [Block::Detail, Block::Chat];
-        if let Some(block) = BLOCKS.get(index) {
-            self.active = *block;
-        }
-    }
-}
+pub use crate::blocks::{Block, Blocks};
 #[derive(Clone, Serialize)]
 pub(crate) struct SendFrame {
     #[serde(rename = "type")]

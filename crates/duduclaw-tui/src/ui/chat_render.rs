@@ -43,8 +43,8 @@ impl TranscriptCache {
     }
 }
 
-pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings) {
-    let inside = panel(frame, area, strings::CHAT_TITLE, settings, app.chat.stale);
+pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str) {
+    let inside = panel(frame, area, title, settings, app.chat.stale);
     if inside.is_empty() {
         return;
     }

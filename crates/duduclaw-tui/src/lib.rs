@@ -1,4 +1,6 @@
 //! Control room and line-oriented inbox. The host CLI owns login and guards.
+pub mod blocks;
+pub mod controls;
 pub mod decide;
 pub mod snooze;
 pub mod auth;

@@ -134,7 +134,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
             stale_employees,
         );
     }
-    let admin = model.role == Some(Role::Admin);
+    let admin = super::m2::manager(model);
     let stale_schedules = admin && model.schedules.count().is_none();
     let inside = panel(
         frame,
@@ -166,6 +166,10 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
             true,
         );
     } else {
+        let inside = if model.role != Some(Role::Admin) {
+            text(frame, ratatui::layout::Rect::new(inside.x, inside.y, inside.width, 1), TerminalText::new(strings::CRON_ADMIN_ONLY.into()), settings, false, false);
+            ratatui::layout::Rect::new(inside.x, inside.y + 1, inside.width, inside.height.saturating_sub(1))
+        } else { inside };
         rows(
             frame,
             inside,
@@ -176,13 +180,14 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 .map(|s| Row {
                     selection: Selection::Schedule(s.id.clone()),
                     text: TerminalText::new(format!(
-                        "{} {} {}",
+                        "{} {} {} / {}: {}",
                         match s.source {
                             ScheduleSource::Heartbeat => strings::HEARTBEAT,
                             ScheduleSource::Cron => strings::CRON,
                         },
                         s.agent.plain(),
-                        s.next_run.plain()
+                        s.next_run.plain(), strings::LAST_RESULT,
+                        crate::blocks::field(&s.detail, "last_status")
                     )),
                 })
                 .collect(),

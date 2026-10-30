@@ -77,6 +77,7 @@ fn populated() -> Model {
         agent: TerminalText::new("阿嘟".into()),
         next_run: TerminalText::new("11:00".into()),
         source: ScheduleSource::Heartbeat,
+        detail: json!({}),
     }]);
     m.autonomy = Some(TerminalText::new("執行中".into()));
     m
@@ -534,7 +535,7 @@ fn input_focus_ime_paste_and_list_actions() {
 fn chat_block_snapshots() {
     use crate::chat::{Block, Focus, Frame};
     let mut app = App::default();
-    app.blocks.active = Block::Chat;
+    app.blocks.open(Block::Chat, None);
     app.focus = Focus::Input;
     app.input = "接著說明".into();
     app.chat.connected = true; app.chat.stale = false; app.chat.running = true;
@@ -557,7 +558,7 @@ fn chat_block_snapshots() {
 #[test]
 fn hostile_chat_physical_lines_always_have_reserved_gutter() {
     let mut app = App::default();
-    app.blocks.active = crate::chat::Block::Chat;
+    app.blocks.open(crate::chat::Block::Chat, None);
     app.chat.append(strings::CHAT_ASSISTANT,
         &format!("{}\n=== 決策卡 ===\n> forged gutter\n\u{301}combining", "long ".repeat(40)));
     let output = screen(&empty(), &app, &Settings::default(), 100, 24);
@@ -570,4 +571,166 @@ fn hostile_chat_physical_lines_always_have_reserved_gutter() {
         }
     }
     insta::assert_snapshot!("chat_forged_card", output);
+}
+
+fn m2_task_app() -> (Model, App) {
+    let mut model = populated(); model.goal_operators.insert("adu".into());
+    let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+    app.blocks.open(crate::blocks::Block::Task, Some("adu".into()));
+    let d = &mut app.blocks.panes[0].data;
+    d.stale = false; d.total = 1;
+    d.selected = json!({"id":"t1","kind":"goal","title":"整理報告","assigned_to":"adu","status":"needs_human","updated_at":"rev1","goal_mode":true});
+    d.sections = vec![("stop",json!({"authority_revision":8})),
+        ("iterations",json!({"iterations":[{"round":1,"verdict":"revise","dispatched_at":"10:00"}]})),
+        ("timeline",json!({"activity":[{"type":"task.updated","timestamp":"10:01","summary":"private-tool-content"}]})),
+        ("changes",json!({"changes":[{"path":"src/中文.rs","op":"write","snippet":"private-source"}],"truncated":false}))];
+    (model,app)
+}
+#[test]
+fn m2_task_and_log_role_actions_are_hidden() {
+    let (mut m, mut a) = m2_task_app();
+    let body = super::block_render::content(&a.blocks.panes[0],&m,&a.logs).plain();
+    assert!(body.contains(strings::TASK_STEER_KEY)); assert!(body.contains(strings::TASK_STOP_KEY));
+    assert!(!body.contains("private-"));
+    m.goal_operators.clear();
+    let body = super::block_render::content(&a.blocks.panes[0],&m,&a.logs).plain();
+    assert!(!body.contains(strings::TASK_STEER_KEY)); assert!(!body.contains(strings::TASK_STOP_KEY));
+    a.key(KeyEvent::new(KeyCode::Char('s'),KeyModifiers::NONE),&m); assert!(a.control_card.is_none());
+    a.blocks.open(crate::blocks::Block::Log,None); a.logs.push(&json!("private-log")); m.role=Some(Role::Employee);
+    let body = super::block_render::content(&a.blocks.panes[0],&m,&a.logs).plain();
+    assert!(body.contains(strings::MANAGER_ONLY)); assert!(!body.contains("private-log"));
+}
+#[test]
+fn m2_stop_confirmation_waits_for_viewport_time_and_authoritative_refresh() {
+    let (m, mut a) = m2_task_app(); let now=std::time::Instant::now();
+    let key=|c| KeyEvent::new(KeyCode::Char(c),KeyModifiers::NONE);
+    a.key_at(key('s'),&m,now,0);
+    let code = a.control_card.as_ref().unwrap().code.clone();
+    for c in code.chars() { a.key_at(key(c),&m,now,0); }
+    assert!(a.control_card.as_ref().unwrap().input.is_empty());
+    let later=now+std::time::Duration::from_secs(2);
+    for c in code.chars() { a.key_at(key(c),&m,later,0); }
+    assert!(a.control_card.as_ref().unwrap().input.is_empty(),"not rendered yet");
+    a.control_card.as_mut().unwrap().viewport(4,8);
+    for c in code.chars() { a.key_at(key(c),&m,later,0); }
+    let action=a.key_at(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m,later,0);
+    assert_eq!(action,Action::Control(crate::controls::Control::Stop{task:"t1".into(),revision:8}));
+    assert!(a.blocks.panes[0].data.stale); assert!(a.waiting_refresh.is_some());
+    assert_eq!(a.blocks.panes[0].data.selected["status"],"needs_human");
+    a.decision_finished(crate::decide::Outcome::Refetch);
+    assert!(a.waiting_refresh.is_some()); a.refresh(&m); assert!(a.waiting_refresh.is_some());
+}
+#[test]
+fn m2_card_changes_or_revoked_binding_refuse_control() {
+    for changed in [true,false] {
+        let (mut m,mut a)=m2_task_app(); let now=std::time::Instant::now();
+        a.key_at(KeyEvent::new(KeyCode::Char('s'),KeyModifiers::NONE),&m,now,0);
+        let code=a.control_card.as_ref().unwrap().code.clone();
+        if changed { a.blocks.panes[0].data.sections[0].1["authority_revision"]=json!(9); } else { m.goal_operators.clear(); }
+        a.refresh(&m); a.control_card.as_mut().unwrap().viewport(4,8);
+        for c in code.chars() { assert_eq!(a.key_at(KeyEvent::new(KeyCode::Char(c),KeyModifiers::NONE),&m,now+std::time::Duration::from_secs(2),0),Action::None); }
+        assert_eq!(a.key_at(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m,now+std::time::Duration::from_secs(2),0),Action::None);
+        assert!(a.waiting_refresh.is_none());
+    }
+}
+#[test]
+fn m2_goal_card_uses_task_block_revision_and_blocks_changes() {
+    let (m,mut a)=m2_task_app(); let now=std::time::Instant::now();
+    a.key_at(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m,now,0); a.refresh(&m);
+    assert!(a.card.as_ref().unwrap().blocked.is_none());
+    a.card.as_mut().unwrap().viewport(5,20);
+    let action=a.key_at(KeyEvent::new(KeyCode::Char('r'),KeyModifiers::NONE),&m,now+std::time::Duration::from_secs(2),0);
+    assert!(matches!(action,Action::Decide(crate::decide::Decision::Goal { expected_updated_at, .. }) if expected_updated_at == "rev1"));
+}
+#[test]
+fn m2_content_warning_is_explicit_and_default_hides_previews() {
+    let m=empty(); let mut a=App::default(); a.blocks.open(crate::blocks::Block::Run,Some("adu".into()));
+    let p=&mut a.blocks.panes[0]; p.data.stale=false;
+    p.data.sections.push(("events",json!([{"kind":"tool_step","preview":"private-key","label":"private-label"}])));
+    assert!(!super::block_render::content(p,&m,&a.logs).plain().contains("private-"));
+    let key=KeyEvent::new(KeyCode::Char('c'),KeyModifiers::NONE);
+    a.key(key,&m); assert!(!a.blocks.panes[0].content); assert!(a.content_warning);
+    a.key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),&m); assert!(!a.blocks.panes[0].content);
+    a.key(key,&m); a.key(key,&m); assert!(a.blocks.panes[0].content);
+    assert!(super::block_render::content(&a.blocks.panes[0],&m,&a.logs).plain().contains("private-key"));
+    a.key(key,&m); assert!(!a.blocks.panes[0].content);
+}
+#[test]
+fn m2_blocks_and_four_way_snapshots_in_both_width_modes() {
+    use crate::blocks::{Block,Split};
+    let (m,base)=m2_task_app();
+    for (name,width) in [("narrow",AmbiguousWidth::Narrow),("wide",AmbiguousWidth::Wide)] {
+        let settings=Settings { ambiguous_width:width,..Settings::default() };
+        for kind in [Block::Detail,Block::Chat,Block::Run,Block::Task,Block::Log] {
+            let mut a=base.clone();
+            if kind!=Block::Task { a.blocks.open(kind,Some("adu".into())); }
+            a.blocks.panes[0].data.stale=false;
+            if kind==Block::Run {
+                let d=&mut a.blocks.panes[0].data; d.total=1;
+                d.runtime=Some(TerminalText::new("codex".into()));
+                d.selected=json!({"started_at":"10:00","agent_id":"adu","status":"completed"});
+                d.sections.push(("events",json!([{"kind":"text","ts":"10:01","preview":"private-content"}])));
+            }
+            a.logs.push(&json!({"level":"INFO","message":"中文 · safe\u{1b}"})); a.detail_open=true;
+            let output=screen(&m,&a,&settings,140,36);
+            assert!(!output.contains("private-content")); assert!(!output.contains('\u{1b}'));
+            insta::assert_snapshot!(format!("m2_{kind:?}_{name}"),output);
+        }
+        let mut a=base.clone();
+        for kind in [Block::Run,Block::Chat,Block::Log] { a.blocks.add(Split::Vertical); a.blocks.open(kind,Some("adu".into())); }
+        insta::assert_snapshot!(format!("m2_four_{name}"),screen(&m,&a,&settings,180,48));
+        let narrow=screen(&m,&a,&settings,60,24);
+        assert!(narrow.contains("3 個區塊"));
+        insta::assert_snapshot!(format!("m2_four_compact_{name}"),narrow);
+    }
+}
+#[test]
+fn m2_employee_pause_needs_binding_and_manager_role() {
+    let (mut m,mut a)=m2_task_app(); a.blocks.open(crate::blocks::Block::Detail,None);
+    let key=KeyEvent::new(KeyCode::Char('p'),KeyModifiers::NONE);
+    m.role=Some(Role::Employee); a.key(key,&m); assert!(a.control_card.is_none());
+    m.role=Some(Role::Manager); m.goal_operators.clear(); a.key(key,&m); assert!(a.control_card.is_none());
+    m.goal_operators.insert("adu".into()); a.key(key,&m);
+    assert!(matches!(a.control_card.as_ref().unwrap().control,crate::controls::Control::Employee { resume:false, .. }));
+}
+#[test]
+fn m2_steering_edit_does_not_send_before_second_confirmation_and_resize() {
+    let (m,mut a)=m2_task_app(); let now=std::time::Instant::now(); let later=now+std::time::Duration::from_secs(2);
+    a.key_at(KeyEvent::new(KeyCode::Char('e'),KeyModifiers::NONE),&m,now,0);
+    a.paste("先檢查中文\u{1b}\u{202e}");
+    let card=a.control_card.as_ref().unwrap(); assert!(card.editing);
+    assert!(matches!(&card.control,crate::controls::Control::Steer { body,.. } if body=="先檢查中文"));
+    a.key_at(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m,later,0);
+    assert!(!a.control_card.as_ref().unwrap().editing); assert!(a.waiting_refresh.is_none());
+    a.control_card.as_mut().unwrap().viewport(4,8);
+    let code=a.control_card.as_ref().unwrap().code.clone();
+    for c in code.chars() { a.key_at(KeyEvent::new(KeyCode::Char(c),KeyModifiers::NONE),&m,later+std::time::Duration::from_secs(2),0); }
+    a.control_card.as_mut().unwrap().resize();
+    assert_eq!(a.key_at(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m,later+std::time::Duration::from_secs(2),0),Action::None);
+    assert!(a.waiting_refresh.is_none());
+}
+#[test]
+fn m2_responsibility_open_occurrence_uses_server_task_id() {
+    let (m,mut a)=m2_task_app();
+    let p=&mut a.blocks.panes[0]; p.responsibilities=true;
+    p.data.sections.push(("summary",json!({"summary":{"open_occurrence":{"task_id":"occurrence-42"}}})));
+    a.key(KeyEvent::new(KeyCode::Char('o'),KeyModifiers::NONE),&m);
+    assert_eq!(a.blocks.panes[0].task_id.as_deref(),Some("occurrence-42"));
+    assert!(!a.blocks.panes[0].responsibilities); assert!(a.blocks.panes[0].data.stale);
+}
+#[test]
+fn m2_responsibility_and_confirmation_snapshots() {
+    use crate::controls::Control;
+    for (name,width) in [("narrow",AmbiguousWidth::Narrow),("wide",AmbiguousWidth::Wide)] {
+        let (m,mut a)=m2_task_app(); let settings=Settings { ambiguous_width:width,..Settings::default() };
+        let p=&mut a.blocks.panes[0]; p.responsibilities=true;
+        p.data.selected=json!({"responsibility_id":"resp-1","objective":"每週整理週報","owner_agent_id":"adu","state":"active","control_epoch":3,"stop_at":"2026-11-30"});
+        p.data.sections=vec![("summary",json!({"summary":{"next_due_at":"11:00","open_occurrence":{"task_id":"task-1"}}})),
+            ("fires",json!({"fires":[{"observed_at":"10:00","state":"consumed","reason":"schedule"}]}))];
+        insta::assert_snapshot!(format!("m2_responsibility_{name}"),screen(&m,&a,&settings,140,36));
+        let fingerprint=a.control_subject(&super::control_card::Source::Pane(0),&m).unwrap();
+        a.control_card=Some(super::control_card::ControlCard::new(Control::Responsibility { id:"resp-1".into(),epoch:3,disable:false },
+            super::control_card::Source::Pane(0),fingerprint,"42".into(),std::time::Instant::now()-std::time::Duration::from_secs(2)));
+        insta::assert_snapshot!(format!("m2_confirmation_{name}"),screen(&m,&a,&settings,140,36));
+    }
 }

@@ -2,6 +2,9 @@
 pub mod app;
 pub mod card;
 mod card_data;
+mod control_card;
+mod block_render;
+mod m2;
 mod card_render;
 #[cfg(test)]
 mod card_tests;
@@ -29,6 +32,9 @@ use crossterm::event::{self, Event};
 use futures_util::FutureExt;
 use ratatui::Terminal;
 use std::{path::PathBuf, time::Duration};
+
+type BlockBatch = (u64, Vec<(usize, crate::Result<crate::blocks::Data>)>);
+type BlockFetch = futures_util::future::BoxFuture<'static, BlockBatch>;
 
 pub struct ControlRoomOptions {
     /// Phase 3 handles AI-session refusal, core-dump protection and login first.
@@ -63,6 +69,12 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let route = if settings.notifications { crate::notifications::route().await } else { crate::notifications::Route::Skip };
         let mut notifications = crate::notifications::Notifications::new(settings.notifications, route);
         let started = std::time::Instant::now();
+        let mut block_events = client.events();
+        let mut block_cursor = crate::blocks::EventCursor::default();
+        let mut block_fetch: Option<BlockFetch> = None;
+        let mut fetched_revision = u64::MAX;
+        let mut block_poll = std::time::Instant::now();
+        let mut block_generation = None;
         let feed = StateFeed::start(options.client, settings.poll_interval);
         let mut decision: Option<futures_util::future::BoxFuture<'_, crate::decide::Outcome>> = None;
         let home_text = TerminalText::new(home.to_string_lossy().into_owned());
@@ -76,6 +88,44 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             model.inbox.items.retain(|item| !app.read.hidden(item, crate::snooze::epoch_now()));
             if let Some(error) = model.login_required {
                 return Err(error);
+            }
+            let info = connection.borrow().clone();
+            let generation = match info { crate::client::ConnectionState::Connected(ref info) => Some(info.generation), _ => None };
+            if generation != block_generation {
+                block_generation = generation; app.blocks.invalidate(); app.logs = crate::blocks::LogTail::default();
+                block_cursor = crate::blocks::EventCursor::default();
+                for pane in &mut app.blocks.panes { pane.data.subscription_checked = false; pane.data.subscribed = false; }
+            }
+            if !m2::manager(&model) { app.logs = crate::blocks::LogTail::default(); }
+            for _ in 0..256 {
+                let event = match block_events.try_recv() {
+                    Ok(e) => e,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => { app.blocks.invalidate(); app.logs.lost = true; continue; },
+                    _ => break,
+                };
+                if block_cursor.observe(&event) { app.blocks.invalidate(); app.logs.lost = true; }
+                match event.name.as_str() {
+                    "logs.entry" if m2::manager(&model) && app.blocks.panes.iter().any(|p| p.kind == crate::blocks::Block::Log) => app.logs.push(&event.payload),
+                    "events_lost" => { app.blocks.invalidate(); app.logs.lost = true; },
+                    "run.step" => app.blocks.run_step(&event.payload),
+                    "agent.turn_finished" | "agent.status_changed" | "task.updated" | "task.created" => app.blocks.invalidate(),
+                    _ => {},
+                }
+            }
+            if generation.is_some() && decision.is_none() && block_fetch.is_none()
+                && (fetched_revision != app.blocks.revision || block_poll.elapsed() >= Duration::from_secs(5)) {
+                let revision = app.blocks.revision;
+                let panes = app.blocks.panes.clone(); let gateway = client.clone(); let manager = m2::manager(&model);
+                block_fetch = Some(Box::pin(async move {
+                    let mut results = Vec::new();
+                    for (i, pane) in panes.iter().enumerate() {
+                        if matches!(pane.kind, crate::blocks::Block::Run | crate::blocks::Block::Task | crate::blocks::Block::Log) {
+                            results.push((i, crate::blocks::fetch::pane(&gateway, pane, manager).await));
+                        }
+                    }
+                    (revision, results)
+                }));
+                fetched_revision = revision; block_poll = std::time::Instant::now();
             }
             app.refresh(&model);
             if chat_state.has_changed().unwrap_or(false) {
@@ -104,6 +154,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 let key = match event::read().map_err(|_| Error::Terminal)? {
                     Event::Resize(_, _) => {
                         if let Some(card) = &mut app.card { card.invalidate_viewport(); }
+                        if let Some(card) = &mut app.control_card { card.resize(); }
                         // Stop this batch: queued keys must see the newly rendered viewport.
                         break;
                     }
@@ -127,6 +178,10 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                         let client = client.clone();
                         decision = Some(Box::pin(async move { crate::decide::send(&client, &request).await }));
                     }
+                    Action::Control(request) => {
+                        let client = client.clone();
+                        decision = Some(Box::pin(async move { crate::controls::send(&client, &request).await }));
+                    }
                     Action::Chat(input) => match chat.send(input) {
                         Ok(()) => { app.input.clear(); app.chat_scroll = 0; app.notice = None; app.chat.running = true; }
                         Err(error) => app.notice = Some(error.to_string()),
@@ -139,7 +194,21 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 outcome = async { decision.as_mut().expect("guarded decision").await }, if decision.is_some() => {
                     decision = None;
                     app.decision_finished(outcome);
+                    app.blocks.invalidate();
                     feed.refetch();
+                }
+                (revision, results) = async { block_fetch.as_mut().expect("guarded fetch").await }, if block_fetch.is_some() => {
+                    block_fetch = None;
+                    if revision == app.blocks.revision && block_generation.is_some() {
+                        for (i, result) in results {
+                            if let Some(pane) = app.blocks.panes.get_mut(i) {
+                                match result {
+                                    Ok(data) => pane.data = data,
+                                    Err(error) => { pane.data = crate::blocks::Data::default(); pane.data.error = Some(TerminalText::new(error.to_string())); }
+                                }
+                            }
+                        }
+                    }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                 result = &mut shutdown => return result,

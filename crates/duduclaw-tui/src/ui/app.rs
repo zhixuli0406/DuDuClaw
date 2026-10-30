@@ -123,7 +123,7 @@ impl Selection {
                     .schedules
                     .items
                     .iter()
-                    .filter(|_| model.role == Some(crate::auth::Role::Admin))
+                    .filter(|_| super::m2::manager(model))
                     .map(|s| Self::Schedule(s.id.clone())),
             )
             .collect()
@@ -148,7 +148,12 @@ pub struct App {
     pub card: Option<super::card::Card>,
     pub waiting_refresh: Option<u64>,
     selected_position: usize,
-    codes: super::card::Codes,
+    pub(super) codes: super::card::Codes,
+    pub(super) control_card: Option<super::control_card::ControlCard>,
+    pub(super) task_card: bool,
+    pub logs: crate::blocks::LogTail,
+    pub content_warned: bool,
+    pub content_warning: bool,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -159,16 +164,19 @@ pub enum Action {
     Decide(crate::decide::Decision),
     Chat(crate::chat::Submission),
     CancelChat,
+    Control(crate::controls::Control),
 }
 impl App {
     pub fn focus_label(&self) -> &'static str {
-        if self.card.is_some() { strings::CARD_FOCUS }
+        if self.card.is_some() || self.control_card.is_some() { strings::CARD_FOCUS }
         else if self.help { strings::HELP_FOCUS }
         else if self.focus == crate::chat::Focus::Input { strings::INPUT_FOCUS }
         else { strings::LIST_FOCUS }
     }
     pub fn decision_finished(&mut self, outcome: crate::decide::Outcome) {
         self.card = None;
+        self.control_card = None;
+        self.task_card = false;
         self.notice = Some(outcome.notice());
         // waiting_refresh is cleared only by an authoritative StateFeed result.
     }
@@ -176,8 +184,15 @@ impl App {
         if self.waiting_refresh.is_some_and(|n| model.local_refresh > n) {
             self.waiting_refresh = None;
         }
+        if let Some(card) = &self.control_card {
+            let current = self.control_subject(&card.source, model);
+            if current.as_ref().is_some_and(|v| *v != card.fingerprint) {
+                self.control_card.as_mut().expect("present").blocked = true;
+            }
+        }
+        let task_item = self.task_card.then(|| self.blocks.panes[self.blocks.focused].data.task()).flatten();
         if model.inbox.count().is_some() && let Some(card) = &mut self.card {
-            match model.inbox.items.iter().find(|i| i.key() == card.item.key()) {
+            match if self.task_card { task_item.as_ref() } else { model.inbox.items.iter().find(|i| i.key() == card.item.key()) } {
                 None => card.blocked = Some(TerminalText::new(strings::REMOVED.into())),
                 Some(current) if current.data() != card.item.data() => {
                     card.blocked = Some(TerminalText::new(strings::CARD_REOPEN.into()));
@@ -207,12 +222,34 @@ impl App {
         self.key_at(key, model, std::time::Instant::now(), crate::snooze::epoch_now())
     }
     pub fn key_at(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant, epoch: i64) -> Action {
+        if self.content_warning {
+            if key.kind == KeyEventKind::Press {
+                if key.code == KeyCode::Char('c') && key.modifiers.is_empty() {
+                    self.content_warned = true; self.blocks.panes[self.blocks.focused].content = true;
+                }
+                self.content_warning = false;
+            }
+            return Action::None;
+        }
+        if self.control_card.is_some() {
+            if !self.control_card.as_ref().expect("present").ready(now) { return Action::None; }
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc { self.control_card = None; return Action::None; }
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { return Action::Quit; }
+            let valid = self.control_card.as_ref().is_some_and(|c| self.control_subject(&c.source, model).as_ref() == Some(&c.fingerprint)) && self.waiting_refresh.is_none();
+            if let Some(control) = self.control_card.as_mut().expect("present").key(key, now, valid) {
+                self.control_card = None; self.waiting_refresh = Some(model.local_refresh);
+                self.blocks.invalidate(); self.notice = Some(strings::DECISION_SENDING.into());
+                return Action::Control(control);
+            }
+            return Action::None;
+        }
         if let Some(card) = &mut self.card {
-            let fresh = model.inbox.count().is_some() && self.waiting_refresh.is_none();
+            let fresh = model.inbox.count().is_some() && self.waiting_refresh.is_none()
+                && (!self.task_card || !self.blocks.panes[self.blocks.focused].data.stale);
             return match card.key(key, now, epoch, fresh) {
                 super::card::Effect::None => Action::None,
                 super::card::Effect::Quit => Action::Quit,
-                super::card::Effect::Close => { self.card = None; Action::None },
+                super::card::Effect::Close => { self.card = None; self.task_card = false; Action::None },
                 super::card::Effect::Snooze => {
                     if self.read.snooze(&card.item, epoch) { self.card = None; Action::Snooze }
                     else { self.notice = Some(strings::SNOOZE_UNAVAILABLE.into()); Action::None }
@@ -221,6 +258,7 @@ impl App {
                     self.card = None;
                     self.waiting_refresh = Some(model.local_refresh);
                     self.notice = Some(strings::DECISION_SENDING.into());
+                    self.blocks.invalidate();
                     Action::Decide(decision)
                 }
             };
@@ -253,25 +291,28 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w') {
+            self.blocks.close(); return Action::None;
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             return Action::None;
         }
+        if !self.help && let KeyCode::Char(c) = key.code && let Some(action) = self.m2_key(c, model, now) { return action; }
         match key.code {
             KeyCode::Char('i' | '/') if !self.help => {
                 self.focus = crate::chat::Focus::Input;
-                self.blocks.select(1);
+                self.blocks.chat();
                 self.input_agent = match &self.selected {
                     Some(Selection::Employee(id)) => Some(id.clone()),
                     _ => None,
                 };
                 if key.code == KeyCode::Char('/') && self.input.is_empty() { self.input.push('/'); }
             }
-            KeyCode::Char('1') if !self.help => self.blocks.select(0),
-            KeyCode::Char('2') if !self.help => self.blocks.select(1),
-            KeyCode::Char('x') if !self.help && self.blocks.active == crate::chat::Block::Chat => {
+            KeyCode::Char(c @ '1'..='4') if !self.help => self.blocks.select((c as u8 - b'1') as usize),
+            KeyCode::Char('X') if !self.help && self.blocks.active == crate::chat::Block::Chat => {
                 if self.chat.can_cancel() { return Action::CancelChat; }
                 self.notice = Some(strings::CHAT_CANCEL_UNAVAILABLE.into());
             }
@@ -282,6 +323,12 @@ impl App {
                 self.detail_open = false;
             }
             KeyCode::Enter => {
+                if self.blocks.active == crate::blocks::Block::Task && !self.blocks.panes[self.blocks.focused].responsibilities {
+                    if let Some(item) = self.blocks.panes[self.blocks.focused].data.task() {
+                        self.card = Some(super::card::Card::open(item, model, now, &mut self.codes)); self.task_card = true;
+                    }
+                    return Action::None;
+                }
                 if let Some(Selection::Inbox(id)) = &self.selected
                     && let Some(item) = model.inbox.items.iter().find(|i| i.key() == *id)
                 {
@@ -298,6 +345,12 @@ impl App {
             }
             KeyCode::PageDown if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_sub(5),
             KeyCode::PageUp if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_add(5),
+            KeyCode::PageDown if matches!(self.blocks.active, crate::blocks::Block::Run | crate::blocks::Block::Task | crate::blocks::Block::Log) => {
+                let p = &mut self.blocks.panes[self.blocks.focused]; p.scroll = p.scroll.saturating_add(5);
+            }
+            KeyCode::PageUp if matches!(self.blocks.active, crate::blocks::Block::Run | crate::blocks::Block::Task | crate::blocks::Block::Log) => {
+                let p = &mut self.blocks.panes[self.blocks.focused]; p.scroll = p.scroll.saturating_sub(5);
+            }
             KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
             KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
             KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => self.move_by(model, true),
@@ -333,6 +386,7 @@ impl App {
         Action::None
     }
     pub fn paste(&mut self, text: &str) {
+        if let Some(card) = &mut self.control_card { card.paste(text); return; }
         if self.focus != crate::chat::Focus::Input || self.card.is_some() { return; }
         let remaining = crate::chat::MAX_INPUT_CHARS.saturating_sub(self.input.chars().count());
         self.input.extend(text.chars().filter(|c| !crate::sanitize::forbidden(*c))
@@ -372,20 +426,22 @@ impl App {
             Some(Selection::Employee(id)) => {
                 if let Some(e) = model.employees.items.iter().find(|e| e.id() == id) {
                     return TerminalText::new(format!(
-                        "{}\n{}\n{}",
+                        "{}\n{}\n{}\n{}",
                         e.display_name.visible(),
                         e.name_text().visible(),
-                        employee_status(e, model, &self.read).label()
+                        employee_status(e, model, &self.read).label(),
+                        if super::m2::manager(model) && super::m2::operator(model, Some(id)) { strings::EMPLOYEE_KEYS } else { strings::CARD_NO_PERMISSION }
                     ));
                 }
             }
-            Some(Selection::Schedule(id)) if model.role == Some(crate::auth::Role::Admin) => {
+            Some(Selection::Schedule(id)) if super::m2::manager(model) => {
                 if let Some(s) = model.schedules.items.iter().find(|s| &s.id == id) {
-                    return TerminalText::new(format!(
-                        "{}\n{}",
-                        s.agent.visible(),
-                        s.next_run.visible()
-                    ));
+                    let fields: Vec<_> = ["cron", "cron_timezone", "enabled", "last_run", "last_run_at", "last_status"]
+                        .iter().filter(|key| s.detail.get(**key).is_some())
+                        .map(|key| format!("{}: {}", strings::field_label(key), crate::blocks::field(&s.detail, key))).collect();
+                    return TerminalText::new(format!("{}\n{}: {}\n{}\n{}", s.agent.visible(), strings::NEXT_RUNS,
+                        s.next_run.visible(), fields.join("\n"),
+                        if matches!(s.source, crate::state_extra::ScheduleSource::Heartbeat) { strings::HEARTBEAT_KEYS } else { strings::CRON_KEYS }));
                 }
             }
             _ => {}
