@@ -25,6 +25,8 @@ pub const INSTRUCTIONS_FILE: &str = "INSTRUCTIONS.md";
 pub const AGENT_STRUCTURE_FILES: &[&str] = &[
     "agent.toml",
     "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
     "CLAUDE.md",
     "MEMORY.md",
     ".mcp.json",
@@ -360,7 +362,7 @@ impl GuardDecision {
                 caller
             )),
             Self::BlockedOwnInstructionsWrite { caller, attempted_path } => Some(format!(
-                "已封鎖：INSTRUCTIONS.md 是管理者為 AI 員工設定的工作規則，AI 員工不可直接改寫（即使是自己的）。\n\
+                "已封鎖：這份身分、服務對象或工作規則設定由管理者維護，AI 員工不可直接改寫（即使是自己的）。\n\
                  檔案：{}\n\
                  你的身分：{}\n\
                  如果需要調整工作規則，請告知管理者，由管理者處理。",

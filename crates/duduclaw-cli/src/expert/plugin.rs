@@ -13,11 +13,11 @@
 //! | └ body                        | `SOUL.md` draft (scanned)                 |
 //! | `skills/<name>/SKILL.md`      | global skill (verbatim, scanned)          |
 //! | `commands/*.md`               | single skill each                         |
-//! | `.mcp.json`                   | merged into each agent's per-agent config |
+//! | `.mcp.json`                   | reported only; never imported             |
 //! | `hooks/`                      | copied **disabled**, listed for approval  |
 //! | lsp/themes/monitors/…         | ignored + reported                        |
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::install::{InstallCtx, install_skill_global};
 use super::{
@@ -48,8 +48,34 @@ pub(super) async fn install(
         .filter(|s| crate::is_valid_agent_id(s))
         .ok_or_else(|| super::import_error::bad_content("plugin.json 缺少合法 name".into()))?;
 
+    let mut agent_sources = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir.join("agents")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("md") {
+                let raw = super::agent_config::md::read_text(&path)
+                    .ok_or_else(|| super::cfg_err("無法讀取外掛員工定義".into()))?;
+                agent_sources.push((path, raw));
+            }
+        }
+    }
+    agent_sources.sort_by(|left, right| left.0.cmp(&right.0));
+    let profiles = agent_sources.iter().map(|(path, raw)| {
+        let (fm, body) = parse_md_frontmatter(raw);
+        let id = fm.as_ref().and_then(|value| value.get("name")).and_then(|value| value.as_str())
+            .unwrap_or_else(|| path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("agent"));
+        super::agent_config::ir::AgentDraft {
+            id_hint: crate::sanitize_agent_id(id), display_name: id.into(),
+            description: fm.as_ref().and_then(|value| value.get("description"))
+                .and_then(|value| value.as_str()).unwrap_or_default().to_string(),
+            soul: Some(super::agent_config::ir::Doc::new("plugin-agent", body)),
+            ..Default::default()
+        }
+    }).collect();
+    let bundle = super::agent_config::ir::ImportBundle { format_code: "claude-plugin", agents: profiles, ..Default::default() };
+    super::agent_config::preview::require_confirmation(&bundle, ctx.dry_run, ctx.confirm_profile.as_deref(), report)?;
     let name = ctx.claim_slug(&name)?;
-    ctx.ensure_quota(count_agent_files(dir)).await?;
+    ctx.ensure_quota(agent_sources.len()).await?;
     ctx.begin_writes()?;
 
     let description = val
@@ -86,7 +112,7 @@ pub(super) async fn install(
     let plugin_mcp = super::read_mcp_servers(&dir.join(".mcp.json"));
 
     // ── agents/*.md ──
-    let created_agents = import_agents(ctx, dir, report, &mut record, &plugin_mcp).await;
+    let created_agents = import_agents(ctx, agent_sources, report, &mut record, &plugin_mcp).await;
 
     // ── skills/<name>/ ──
     let skills_dir = dir.join("skills");
@@ -128,44 +154,16 @@ pub(super) async fn install(
     Ok(record)
 }
 
-/// `agents/*.md` files: the employees this plugin would add (upper bound).
-fn count_agent_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir.join("agents"))
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
-                .count()
-        })
-        .unwrap_or(0)
-}
-
 async fn import_agents(
     ctx: &InstallCtx,
-    dir: &Path,
+    entries: Vec<(PathBuf, String)>,
     report: &mut Report,
     record: &mut InstallRecord,
     plugin_mcp: &Option<serde_json::Map<String, serde_json::Value>>,
 ) -> usize {
-    let agents_dir = dir.join("agents");
-    let Ok(rd) = std::fs::read_dir(&agents_dir) else {
-        return 0;
-    };
-    let mut entries: Vec<_> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
-        .collect();
-    entries.sort();
-
     let mut count = 0;
-    for path in entries {
-        if ctx.stopping() {
-            break;
-        }
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    for (path, raw) in entries {
+        if ctx.stopping() { break; }
         let (fm, body) = parse_md_frontmatter(&raw);
         let stem = path
             .file_stem()
@@ -277,14 +275,10 @@ async fn import_agents(
             report.imported("agent-tools", &final_id);
         }
 
-        // Merge plugin MCP servers into this agent's per-agent .mcp.json
-        // (shared helper; duduclaw entry is never overwritten).
-        if let Some(servers) = plugin_mcp
-            && !servers.is_empty()
-            && let Ok(written) = super::merge_agent_mcp(&ctx.home, &final_id, servers)
-            && written > 0
-        {
-            report.imported("mcp-servers", &format!("{written} → {final_id}"));
+        if let Some(servers) = plugin_mcp {
+            for name in servers.keys() {
+                report.skipped("mcp-servers", name, "匯入不新增 MCP 伺服器，請由管理者另行設定");
+            }
         }
     }
     count

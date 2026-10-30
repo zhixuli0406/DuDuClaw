@@ -92,6 +92,7 @@ mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (opera
 mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
+mod agent_export_cmd;
 mod agent_control_cmd; // Operator-only pause/resume/freeze/unfreeze
 mod mcp_init_cmd; // standalone MCP profile: `duduclaw mcp init`
 mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
@@ -2776,6 +2777,17 @@ enum AgentCommands {
         preset: Option<String>,
     },
 
+    /// Export a portable profile (operator terminal only).
+    Export {
+        agent: String,
+        #[arg(long, default_value = "duduclaw")]
+        format: String,
+        #[arg(long)]
+        out: std::path::PathBuf,
+        #[arg(long)]
+        include_user: bool,
+    },
+
     /// Inspect agent details
     Inspect {
         /// Agent name or ID
@@ -3563,6 +3575,9 @@ enum MigrateCommands {
         /// Actually write the imported data (default is a dry-run plan).
         #[arg(long)]
         apply: bool,
+        /// Confirmation digest from the profile preview.
+        #[arg(long)]
+        confirm_profile: Option<String>,
         /// On a name clash with an existing agent, import under a
         /// `-imported` suffix instead of skipping.
         #[arg(long)]
@@ -4165,6 +4180,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                     preset,
                 )
                 .await
+            }
+            Some(AgentCommands::Export { agent, format, out, include_user }) => {
+                agent_export_cmd::run(&duduclaw_home(), &agent, &format, &out, include_user)
             }
             Some(AgentCommands::Inspect { agent }) => cmd_agent_inspect(&agent).await,
             Some(AgentCommands::Pause { agent }) => cmd_agent_set_status(&agent, "paused").await,
@@ -5335,7 +5353,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 json,
                 agent,
                 no_redact,
-            }) => migrate_from::run(&platform, source, apply, rename, json, agent, no_redact).await,
+                confirm_profile,
+            }) => migrate_from::run(&platform, source, apply, rename, json, agent, no_redact, confirm_profile).await,
             Some(MigrateCommands::Data {
                 pending,
                 check,
@@ -10561,72 +10580,15 @@ pub(crate) async fn scaffold_agent_dir(
         display_name,
         role,
         reports_to,
-        icon,
-        trigger,
+        icon: _,
+        trigger: _,
         provider,
-        model_preferred,
+        model_preferred: _,
         soul_body,
     } = s;
     let role_str = role.as_str();
 
-    // `[runtime]` section: only written when the operator chose a non-default
-    // provider — default (Claude) scaffolds stay byte-identical to before.
-    let runtime_section = if *provider == duduclaw_core::types::RuntimeType::Claude {
-        String::new()
-    } else {
-        format!("\n[runtime]\nprovider = \"{}\"\n", provider.as_str())
-    };
-
-    let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
-
-    // agent.toml
-    let agent_toml = format!(
-        r#"[agent]
-name = "{agent_name}"
-display_name = "{display_name}"
-role = "{role_str}"
-status = "active"
-trigger = "{trigger}"
-reports_to = "{reports_to}"
-icon = "{icon}"
-{runtime_section}
-[model]
-preferred = "{preferred}"
-fallback = "claude-haiku-4-5"
-account_pool = []
-api_mode = "auto"
-
-[container]
-timeout_ms = 1800000
-max_concurrent = 1
-readonly_project = true
-additional_mounts = []
-
-[heartbeat]
-enabled = false
-interval_seconds = 3600
-max_concurrent_runs = 1
-cron = ""
-
-[budget]
-monthly_limit_cents = 5000
-warn_threshold_percent = 80
-hard_stop = true
-
-[permissions]
-can_create_agents = true
-can_send_cross_agent = true
-can_modify_own_skills = true
-can_modify_own_soul = false
-can_schedule_tasks = true
-allowed_channels = ["*"]
-permissions_enforced_since = "1.68.0"
-
-[evolution]
-skill_auto_activate = false
-skill_security_scan = true
-"#
-    );
+    let agent_toml = scaffold_agent_toml(s);
     tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml)
         .await
         .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
@@ -14495,4 +14457,68 @@ mod removed_name_hook_tests {
         .unwrap();
         assert!(d.is_allowed(), "{d:?}");
     }
+}
+
+fn scaffold_agent_toml(s: &AgentScaffold) -> String {
+    let AgentScaffold { name: agent_name, display_name, role, reports_to, icon, trigger,
+        provider, model_preferred, .. } = s;
+    let role_str = role.as_str();
+    // `[runtime]` section: only written when the operator chose a non-default
+    // provider — default (Claude) scaffolds stay byte-identical to before.
+    let runtime_section = if *provider == duduclaw_core::types::RuntimeType::Claude {
+        String::new()
+    } else {
+        format!("\n[runtime]\nprovider = \"{}\"\n", provider.as_str())
+    };
+
+    let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
+
+    // agent.toml
+    format!(
+        r#"[agent]
+name = "{agent_name}"
+display_name = "{display_name}"
+role = "{role_str}"
+status = "active"
+trigger = "{trigger}"
+reports_to = "{reports_to}"
+icon = "{icon}"
+{runtime_section}
+[model]
+preferred = "{preferred}"
+fallback = "claude-haiku-4-5"
+account_pool = []
+api_mode = "auto"
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = true
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = ["*"]
+permissions_enforced_since = "1.68.0"
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+"#
+    )
 }

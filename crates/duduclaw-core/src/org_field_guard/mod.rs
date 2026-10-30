@@ -746,7 +746,7 @@ fn own_contract_at(file_path: &Path, home: &Path, caller_id: &String) -> GuardDe
 }
 
 /// Instructions lock — block an agent-identified caller from writing its OWN
-/// `INSTRUCTIONS.md` via Write/Edit/MultiEdit. Same shape and reasoning as
+/// `INSTRUCTIONS.md`, `IDENTITY.md` or `USER.md` via Write/Edit/MultiEdit. Same shape and reasoning as
 /// [`check_own_contract_write`]: the file is operator-managed instructions
 /// that every prompt loads, so there is no opt-in flag.
 pub fn check_own_instructions_write(
@@ -762,7 +762,8 @@ pub fn check_own_instructions_write(
 
 fn own_instructions_at(file_path: &Path, home: &Path, caller_id: &str) -> GuardDecision {
     match file_path.file_name().and_then(|n| n.to_str()) {
-        Some(n) if n.eq_ignore_ascii_case("INSTRUCTIONS.md") => {}
+        Some(n) if ["INSTRUCTIONS.md", "IDENTITY.md", "USER.md"]
+            .iter().any(|file| n.eq_ignore_ascii_case(file)) => {}
         _ => return GuardDecision::NotAgentFile,
     }
     let normalized = lexical_normalize(file_path);

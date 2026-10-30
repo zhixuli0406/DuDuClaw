@@ -12,17 +12,22 @@
 
 ```bash
 duduclaw pack install ./報告顧問.zip --dry-run   # 計画だけ表示、書き込みなし
-duduclaw pack install ./報告顧問.zip             # 取り込み
-duduclaw pack install ./reviewer.agent.md            # 単体ファイルも可
-duduclaw pack install ~/.openclaw                     # フォルダも可
+duduclaw pack install ./報告顧問.zip --confirm-profile <preview-digest>
+duduclaw pack install ./reviewer.agent.md --dry-run
+duduclaw pack install ~/.openclaw --dry-run
 ```
 
 同じ ID のスタッフがすでにいる場合、`--rename` を付けると末尾に `-imported` を付けて取り込みます。付けない場合は競合としてレポートに載り、そのスタッフはスキップされます。同じ内容を以前取り込んでいる場合は、`--replace <ID>` で以前のバージョンを置き換えるか（その後スタッフが編集されていれば `--accept-edits` も必要）、`--as-copy` で両方を残します。下の「同じものをもう一度取り込む」を参照してください。`duduclaw pack install` はエキスパートパックと同じコマンドで、取り込み専用のコマンドはありません。チャネルのトークンやスケジュールも含めてプラットフォームごと移すときは、引き続き `duduclaw migrate from openclaw|hermes` を使います（[migrate-from.md](migrate-from.md) を参照）。こちらも下の表と同じ配置になりました。
+
+プレビューには四つの節の全文と入力検査結果が表示されます。ターミナルで適用するには、プレビューが出力したダイジェストを `--confirm-profile` に指定します。元の内容が変われば再確認が必要です。AI セッションでは取り込めません。ネイティブの `duduclaw:` は編集可能な設定だけを受け入れ、固定フィールドを列挙して拒否します。MCP サーバーは取り込みません。OpenClaw で廃止された `TOOLS.md` と `HEARTBEAT.md` も旧データの取り込みには対応します。
+
+スタッフページからエクスポートするか、`duduclaw agent export <id> --format duduclaw --out <path>` を使います。ほかの形式は `openclaw`、`hermes`、`agents-md`、`claude-subagent`。利用者情報は既定では含まれず、`--include-user` の指定が必要です。秘密らしい内容がある場合は拒否し、AI セッションからは実行できません。[Agent File リファレンス](../../spec/agent-file-spec.md)を参照。
 
 ## 対応フォーマット
 
 | フォーマット | 判定方法 | スタッフ 1 人に対応する単位 |
 |---|---|---|
+| DuDuClaw Agent File | YAML frontmatter の `schema: duduclaw.agent/v1`。ファイル名に依存しない（最大 256 KiB） | ファイル |
 | Doubao パートナーパッケージ（詳細ページ「…」› パートナーパッケージを書き出す） | `units` を持つ `manifest.json`、または `agents/<ref>/agent.yml` と `persona/` | `agents/<ref>/` |
 | OpenClaw フォルダ | `openclaw.json`（`moltbot.json`、`clawdbot.json` も可） | `agents.list[]` または `agents.entries` の 1 項目 |
 | OpenClaw／SoulSpec のペルソナワークスペース | 最上位に `SOUL.md` | フォルダ |
@@ -40,7 +45,7 @@ duduclaw pack install ~/.openclaw                     # フォルダも可
 | `SOUL.md`、Doubao の `persona/SOUL.md` | `SOUL.md` | スタッフは読むだけ。 |
 | `IDENTITY.md` | `IDENTITY.md`、名前と絵文字は `agent.toml` にも | OpenClaw の `- Name:`／`- Emoji:` 行と Doubao の「## 簽名」節の両方を読みます。 |
 | `AGENTS.md`、`CLAUDE.md`、`GEMINI.md`、サブエージェント本文、Dify の `pre_prompt` | `INSTRUCTIONS.md`（新規） | 毎回のプロンプトで SOUL、IDENTITY の後に入ります。スタッフは読むだけ。 |
-| `USER.md`（Hermes：`memories/USER.md`） | ナレッジページ「服務對象」 | コア層なので毎回のプロンプトに入ります。 |
+| `USER.md`（Hermes：`memories/USER.md`） | `USER.md` | 最大 4,000 文字。指示ではなくデータとして挿入。既存のナレッジページは移動しません。 |
 | `TOOLS.md` | ナレッジページ「工具備註」 | メモだけで、ツール権限は付与しません。 |
 | `HEARTBEAT.md` | ナレッジページ「定期檢查清單」 | 自動ではスケジュールされません。必要ならダッシュボードで作成します。 |
 | `BOOT.md`、Dify の開始メッセージ | ナレッジページ | 必要なときに検索されます。 |
@@ -71,7 +76,7 @@ SKILL.md が内容検査に通らない、またはテキストの添付ファ�
 
 ## 安全面
 
-- スタッフは後から SOUL と INSTRUCTIONS を編集できないため、取り込み時が唯一の確認の機会です。この二つを含む取り込んだテキストはすべてプロンプトインジェクション検査を通り、SOUL と INSTRUCTIONS はスキルのセキュリティ検査も通ります。SOUL が通らなければそのスタッフは取り込まず、指示ファイルが通らなければ書き込まずにレポートに載せます。
+- Persona、User、Rules、Contract の全文と入力検査結果を人が確認します。検査でブロックされた節があると、スタッフを作成する前に取り込みを拒否します。
 - 認証情報は取り込みません。`.env`、`auth.json`、`auth-profiles.json` などは読まず保存もしません。`openclaw.json` のチャネルトークンはここでは扱わず、Dify の秘密変数は捨てます。
 - アップロードしたフォルダの外を指す OpenClaw のワークスペースパスはたどりません。
 - 圧縮ファイル：`__MACOSX/`、`._*`、`.DS_Store`、`Thumbs.db`、`desktop.ini` はスキップします。ファイル名はまず UTF-8 として読み（フラグ付き、または macOS のようにフラグなし）、中国語版 Windows で作られたものは GBK か Big5 を試します。どれも合わないとき、または GBK と Big5 が同じくらいありそうなときは、文字化けした名前で書き込まず、元のバイト列をメッセージに出して拒否します。シンボリックリンクは展開しません。ファイル名はどのシステムでも同じ意味になる必要があるため、`:` を含む名前、末尾のドットや空白、Windows のデバイス名（`CON`、`NUL`、`COM1` など）、大文字小文字だけが違う二つの項目は拒否します。エキスパートパックと同じサイズ、項目数、圧縮率の上限が適用されます。

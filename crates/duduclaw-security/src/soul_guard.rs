@@ -12,7 +12,7 @@ use tracing::{info, warn};
 const MAX_HISTORY_VERSIONS: usize = 10;
 
 // The same baseline protection for every prompt-bearing profile file
-// (SOUL.md and INSTRUCTIONS.md): `ProtectedDoc` and its helpers.
+// (SOUL.md, IDENTITY.md, USER.md and INSTRUCTIONS.md): `ProtectedDoc` and its helpers.
 #[path = "soul_guard_docs.rs"]
 mod docs;
 pub use docs::*;

@@ -252,7 +252,7 @@ fn archive_list(bundle: &ImportBundle) -> Vec<String> {
         add(&u.rel);
     }
     for a in &bundle.agents {
-        let docs = [&a.soul, &a.identity, &a.instructions, &a.user_profile, &a.tools_notes, &a.heartbeat];
+        let docs = [&a.soul, &a.identity, &a.instructions, &a.user_profile, &a.contract, &a.tools_notes, &a.heartbeat];
         for d in docs.into_iter().flatten() {
             add(&d.source);
         }

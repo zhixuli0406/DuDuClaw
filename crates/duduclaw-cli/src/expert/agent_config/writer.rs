@@ -71,6 +71,7 @@ pub async fn install(
     root: &Path,
     report: &mut Report,
 ) -> Result<InstallRecord> {
+    super::preview::require_confirmation(&bundle, ctx.dry_run, ctx.confirm_profile.as_deref(), report)?;
     report.imported("format", &bundle.format_label);
     report.tag("format.detected", json!({ "format": bundle.format_code }));
     for w in &bundle.warnings {
@@ -290,6 +291,9 @@ async fn install_agent(
 ) -> Result<bool> {
     let d = job.draft;
     let id = job.id;
+    if !crate::is_valid_agent_id(id) || duduclaw_core::is_reserved_agent_id(id) {
+        return Err(cfg_err("無效的員工代號，未寫入".into()));
+    }
     // SOUL is the one review point (employees cannot edit it later).
     let soul = match &d.soul {
         Some(doc) => match scan_external(&doc.text) {
@@ -365,6 +369,18 @@ async fn install_agent(
     };
     for o in write_slots(&slot_ctx, d).await {
         report.add_outcome(&o);
+        if job.format == "duduclaw" && o.status == Status::Skipped {
+            return Err(cfg_err(format!("Agent File 區段未能完整寫入：{}", o.detail)));
+        }
+    }
+    if !ctx.dry_run && !d.settings.is_empty() {
+        duduclaw_gateway::agent_files::external::edit_agent_toml(
+            &ctx.home, id, "import", "本機匯入（身分未驗證）", |table| {
+            crate::expert::merge_toml(table, &d.settings);
+            let _: duduclaw_core::types::AgentConfig = toml::Value::Table(table.clone()).try_into()
+                .map_err(|e| format!("員工設定型別不正確：{e}"))?;
+            Ok(())
+        }).map_err(cfg_err)?;
     }
     if let Err(e) = apply_tools(ctx, d, id, report) {
         report.warning("agent-tools", id, format!("工具限制未套用：{e}"));

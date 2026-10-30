@@ -59,13 +59,15 @@ pub struct AgentDraft {
     pub identity: Option<Doc>,
     pub instructions: Option<Doc>,
     pub user_profile: Option<Doc>,
+    pub contract: Option<Doc>,
+    /// Product-native settings, validated against the editable allowlist.
+    pub settings: toml::Table,
     pub tools_notes: Option<Doc>,
     pub heartbeat: Option<Doc>,
     pub memory: Vec<Doc>,
     pub knowledge: Vec<Doc>,
     pub skills: Vec<SkillDraft>,
-    /// MCP servers in the portable `mcpServers` shape (secrets stripped by
-    /// the writer before anything lands).
+    /// MCP servers are only named in the report; never installed.
     pub mcp_servers: serde_json::Map<String, serde_json::Value>,
     pub model: Option<String>,
     /// Source tool allowlist (`None` = the source did not restrict tools).

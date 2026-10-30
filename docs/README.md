@@ -90,6 +90,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description | Status |
 |----------|-------------|--------|
+| [spec/agent-file-spec.md](spec/agent-file-spec.md) | DuDuClaw Agent File v1: schema, portability, preview, export and privacy | Draft |
 | [spec/soul-md-spec.md](spec/soul-md-spec.md) | SOUL.md agent identity format v1.0 | Draft |
 | [spec/contract-toml-spec.md](spec/contract-toml-spec.md) | CONTRACT.toml behavioral boundary format v1.0 | Draft |
 | [spec/contract-toml-schema.json](spec/contract-toml-schema.json) | CONTRACT.toml JSON Schema | Draft |
@@ -251,6 +252,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── feature-inventory.md
 │   └── 01-…-57-…                      #   57 feature deep-dives
 ├── spec/                              # Open format specifications
+│   ├── agent-file-spec.md             #   Agent File interchange v1
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0
 │   ├── contract-toml-schema.json

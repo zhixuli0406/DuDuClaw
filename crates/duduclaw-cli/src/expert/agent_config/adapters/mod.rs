@@ -9,6 +9,7 @@ use super::detect::ConfigKind;
 use super::ir::{ImportBundle, SkillDraft, Unmapped};
 use super::md;
 
+mod native;
 mod dify;
 mod doubao;
 mod hermes;
@@ -21,6 +22,7 @@ pub use workspace::read_workspace;
 /// Read `root` as `kind`. Errors are human-readable zh-TW.
 pub fn read(kind: ConfigKind, root: &Path) -> Result<ImportBundle, String> {
     match kind {
+        ConfigKind::DuDuClaw => native::read(root),
         ConfigKind::Doubao => doubao::read(root),
         ConfigKind::OpenClawState => workspace::read_state_dir(root),
         ConfigKind::Workspace => workspace::read_single(root),

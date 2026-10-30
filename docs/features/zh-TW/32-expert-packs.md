@@ -45,7 +45,7 @@ duduclaw pack install <src>        # 依 kind 分流;付費內容只在一處檢
 2. **先驗證掛載位置。** `--attach-under <agent>`(把包的根 agent 掛在既有主管之下,例如你的 CEO)在寫入任何東西之前先檢查;打錯字會直接中止,什麼都沒裝。
 3. **掃描每一個外來物。** 每份匯入的 SOUL/SKILL 文字都降格為 DATA,並同時通過 prompt-injection input guard 與 skill 安全掃描器。任何 block 級發現都會擋下該資產落地;報告會說明原因。
 4. **父先子後 scaffold。** Agent 依拓撲順序安裝,`reports_to` 永遠指向真實存在的對象。名稱衝突回報為 conflict,除非以 `--rename` 同意加上 `-imported` 後綴。未知的 role 字串退回 `worker`(壞 role 會讓 agent 在 registry 載入時報廢);非 Claude 的 model id 原樣保留但標記待審,平台永不靜默強制改成單一模型。
-5. **合併,不覆蓋。** `agent.partial.toml` 深度合併到 scaffold 出的 `agent.toml`;包宣告的 MCP server 合併進 agent 的 `.mcp.json`,但已接線的 `duduclaw` server 項目永不被覆寫:惡意的包無法劫持工具面。
+5. **先確認設定。** 人先預覽四個區段、設定與輸入安全掃描結果，再以 `--confirm-profile` 確認同一份內容。`agent.partial.toml` 合併到員工設定；MCP 伺服器只列報告，不匯入，partial 裡的 MCP 宣告會被拒絕。
 6. **隔離 hooks。** 見下文。
 
 `--dry-run` 完整渲染安裝計畫,一個位元組都不寫。每個項目都會出現在誠實的報告裡(imported / skipped / conflict / warning)。沒有東西被靜默丟掉。`expert remove <slug>` 只刪安裝紀錄記載為該包建立的東西;先前就存在的資產保留。

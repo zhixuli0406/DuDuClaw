@@ -510,6 +510,13 @@ pub(super) async fn build_reply_with_session_inner(
             )
         }
     };
+    let system_prompt = match system_prompt {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            tracing::warn!(agent = %agent_id, %error, "Agent profile could not be loaded");
+            return "⚠️ 無法讀取這位員工的設定，已暫停本次執行。請管理者檢查設定後重試。".to_string();
+        }
+    };
     drop(reg);
 
     let session_mgr = &ctx.session_manager;

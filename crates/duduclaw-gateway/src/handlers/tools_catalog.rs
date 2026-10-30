@@ -24,6 +24,7 @@ impl MethodHandler {
                     { "name": "agents.handoff", "description": "Hand off memory/wiki/tasks to another agent" },
                     { "name": "agents.set_avatar", "description": "Upload an agent avatar image (data URI)" },
                     { "name": "agents.clear_avatar", "description": "Remove an agent's uploaded avatar" },
+                    { "name": "agents.export_profile", "description": "Export an AI employee profile (Manager and visible employee; user introduction excluded unless requested)" },
                     { "name": "agents.inspect", "description": "Inspect agent details" },
                     { "name": "agents.avatar", "description": "Fetch an agent's uploaded avatar as a data URI (lightweight)" },
                     { "name": "agent_files.list", "description": "List an AI employee's profile files (persona, introduction, work rules, boundaries, basic settings)" },

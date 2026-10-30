@@ -196,6 +196,7 @@ fn malicious_skill_blocked_fail_closed() {
         rename: false,
         agent: None,
         redact: true,
+        confirm_profile: None,
     };
     let mut report = Report::new("hermes", "/x", false);
     install_skills(&ctx, &mut report, "agent", &[good.clone(), bad.clone()]);
@@ -269,7 +270,13 @@ async fn end_to_end_openclaw_apply_writes_real_artifacts() {
         rename: false,
         agent: None,
         redact: true,
+        confirm_profile: None,
     };
+    let mut preview_ctx = ctx.clone();
+    preview_ctx.apply = false;
+    let preview = super::openclaw::migrate_with_home(&preview_ctx, Some(src.clone()), &user_home).await.unwrap();
+    let mut ctx = ctx;
+    ctx.confirm_profile = preview.profile_confirmation;
     let report = super::openclaw::migrate_with_home(&ctx, Some(src), &user_home)
         .await
         .unwrap();
@@ -334,6 +341,7 @@ async fn json_output_matches_locked_contract() {
         rename: false,
         agent: None,
         redact: true,
+        confirm_profile: None,
     };
     let report = super::openclaw::migrate_with_home(
         &ctx,
@@ -430,6 +438,7 @@ async fn paperclip_package_teams_projects_sidecar_covered() {
         rename: false,
         agent: None,
         redact: true,
+        confirm_profile: None,
     };
     let report = super::paperclip::migrate(&ctx, Some(src)).await.unwrap();
 
@@ -478,6 +487,7 @@ async fn paperclip_rejects_non_package_dir_fail_closed() {
         rename: false,
         agent: None,
         redact: true,
+        confirm_profile: None,
     };
     let err = super::paperclip::migrate(&ctx, Some(junk))
         .await
@@ -498,6 +508,7 @@ fn channel_conflict_not_overwritten() {
         rename: false,
         agent: None,
         redact: true,
+        confirm_profile: None,
     };
     let mut report = Report::new("openclaw", "/x", false);
     let mut channels = toml::value::Table::new();
@@ -552,8 +563,14 @@ async fn openclaw_persona_files_land_in_read_slots_not_memory_dir() {
         rename: false,
         agent: None,
         redact: true,
+        confirm_profile: None,
     };
     let user_home = tmp.path().join("user-home");
+    let mut preview_ctx = ctx.clone();
+    preview_ctx.apply = false;
+    let preview = super::openclaw::migrate_with_home(&preview_ctx, Some(src.clone()), &user_home).await.unwrap();
+    let mut ctx = ctx;
+    ctx.confirm_profile = preview.profile_confirmation;
     let report = super::openclaw::migrate_with_home(&ctx, Some(src), &user_home)
         .await
         .unwrap();
@@ -562,7 +579,7 @@ async fn openclaw_persona_files_land_in_read_slots_not_memory_dir() {
     assert!(agent.join("IDENTITY.md").is_file());
     let toml = std::fs::read_to_string(agent.join("agent.toml")).unwrap();
     assert!(toml.contains("Molty") && toml.contains("🦞"), "{toml}");
-    let user = std::fs::read_to_string(agent.join("wiki/imported/openclaw/user-profile.md")).unwrap();
+    let user = std::fs::read_to_string(agent.join("USER.md")).unwrap();
     assert!(user.contains("Sam 是老闆"));
     assert!(agent.join("wiki/imported/openclaw/tools-notes.md").is_file());
     for f in ["USER.md", "AGENTS.md", "TOOLS.md", "IDENTITY.md", "MEMORY.md"] {

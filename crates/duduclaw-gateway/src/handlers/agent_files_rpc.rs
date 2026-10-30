@@ -51,6 +51,33 @@ impl MethodHandler {
         require_live_agent_access(&self.home_dir, ctx, agent_id, min)
     }
 
+    /// `agents.export_profile {agent_id, format, include_user?}`.
+    pub(crate) async fn handle_agents_export_profile(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        frame((|| {
+            let agent_id = str_param(&params, "agent_id")?;
+            let live = self.live(ctx, agent_id, AccessLevel::Viewer)?;
+            acl::require_role(&live, UserRole::Manager)?;
+            let format_name = str_param(&params, "format")?;
+            let format = format_name.parse::<duduclaw_core::agent_profile::ExportFormat>()
+                .map_err(|e| e.to_string())?;
+            let include_user = match params.get("include_user") {
+                None => false,
+                Some(v) => v.as_bool().ok_or("`include_user` must be a boolean")?,
+            };
+            let dir = crate::agent_files::agent_dir(&self.home_dir, agent_id)?;
+            let profile = duduclaw_core::agent_profile::load(&dir, agent_id).map_err(|e| e.to_string())?;
+            let files = duduclaw_core::agent_profile::export(&profile, format, include_user).map_err(|e| e.to_string())?;
+            crate::security_autopilot::audit_and_emit(
+                &self.home_dir,
+                &duduclaw_security::audit::AuditEvent::new(
+                    "agent_profile_exported", agent_id, duduclaw_security::audit::Severity::Info,
+                    json!({ "user_id": live.user_id, "format": format_name, "include_user": include_user, "source": "dashboard" }),
+                ),
+            );
+            Ok(json!({ "agent_id": agent_id, "format": format_name, "include_user": include_user, "files": files }))
+        })())
+    }
+
     /// `agent_files.list {agent_id}`.
     pub(crate) async fn handle_agent_files_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         frame(self.agent_files_list(&params, ctx).await)

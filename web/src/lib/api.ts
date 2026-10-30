@@ -3403,6 +3403,27 @@ export interface RuntimeInstallStatus {
   docs_url: string;
 }
 
+export interface AgentProfilePreview {
+  id: string;
+  name?: string;
+  metadata?: { description?: string };
+  unmapped_fields?: Array<[string, string]>;
+  persona: { soul: string; identity: string };
+  user: string;
+  rules: string;
+  contract: string;
+  settings?: Record<string, unknown>;
+  input_guard: Array<{ section: string; blocked: boolean; matched_rules: string[]; score: number }>;
+}
+
+export type AgentProfileFormat = 'duduclaw' | 'openclaw' | 'hermes' | 'agents-md' | 'claude-subagent';
+export interface AgentProfileExport {
+  agent_id: string;
+  format: AgentProfileFormat;
+  include_user: boolean;
+  files: Array<{ name: string; content: string }>;
+}
+
 // ── Expert packs (專家包) ─────────────────────────
 
 /** One installed expert pack row from `experts.list` (admin-only). */
@@ -3450,7 +3471,12 @@ export interface ExpertImportReport {
   dry_run: boolean;
   meta: Record<string, string>;
   /** Structured extras: `replace` (what a replace moves away), `replaced`. */
-  details?: { replace?: ExpertReplaceInfo; replaced?: { agents: string[] } } | null;
+  details?: {
+    replace?: ExpertReplaceInfo;
+    replaced?: { agents: string[] };
+    profile_confirmation?: string;
+    profile_preview?: AgentProfilePreview[];
+  } | null;
   /** Set when the run failed. */
   error?: { code: string; params?: Record<string, unknown> | null; message?: string } | null;
   counts: Record<ExpertImportItem['status'], number>;
@@ -5535,6 +5561,8 @@ export interface MigrateSummary {
 /** Result shape shared by `migrate.scan` (dry_run:true) and `migrate.apply`
  *  (dry_run:false, report_path populated). */
 export interface MigrateResult {
+  profile_preview?: AgentProfilePreview[];
+  profile_confirmation?: string;
   platform: MigratePlatform;
   source: string;
   dry_run: boolean;
@@ -6090,6 +6118,8 @@ export const api = {
       }) as Promise<ChatSessionHistory>,
   },
   agents: {
+    exportProfile: (agentId: string, format: AgentProfileFormat, includeUser = false) =>
+      client.call('agents.export_profile', { agent_id: agentId, format, include_user: includeUser }) as Promise<AgentProfileExport>,
     /** WP4 — pass `include_archived: true` to also list archived AI staff
      *  (hidden by default). */
     list: (params?: { include_archived?: boolean }) =>
@@ -6312,13 +6342,14 @@ export const api = {
     /** Install from a server-local path (use `POST /api/experts/upload` to
      *  stage a .zip first — see ExpertsPage). Long-running: security scans run
      *  inside the install pipeline. */
-    install: (path: string, attachUnder?: string, dryRun?: boolean, reimport?: ExpertReimport) =>
+    install: (path: string, attachUnder?: string, dryRun?: boolean, reimport?: ExpertReimport, profileConfirmation?: string) =>
       client.call(
         'experts.install',
         {
           path,
           ...(attachUnder ? { attach_under: attachUnder } : {}),
           ...(dryRun ? { dry_run: true } : {}),
+          ...(profileConfirmation ? { confirm_profile: profileConfirmation } : {}),
           ...(reimport?.mode === 'copy' ? { reimport: 'copy' } : {}),
           ...(reimport?.mode === 'replace'
             ? { reimport: 'replace', replace_slug: reimport.slug, ...(reimport.acceptEdits ? { accept_edits: true } : {}) }
@@ -8593,10 +8624,10 @@ export const api = {
     /** Execute the migration — writes agents/tokens/skills/etc. and returns the
      *  same shape with `dry_run:false` + a `report_path`. May run up to 300s
      *  server-side, so a 300s response timeout is used. manager-gated. */
-    apply: (platform: MigratePlatform, source?: string, rename?: boolean) =>
+    apply: (platform: MigratePlatform, source?: string, rename?: boolean, profileConfirmation?: string) =>
       client.call(
         'migrate.apply',
-        migrateApplyArgs(platform, source, rename),
+        migrateApplyArgs(platform, source, rename, profileConfirmation),
         false,
         300000,
       ) as Promise<MigrateResult>,

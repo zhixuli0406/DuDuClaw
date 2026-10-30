@@ -20,6 +20,7 @@ use super::{
 pub(super) struct InstallCtx {
     pub home: PathBuf,
     pub dry_run: bool,
+    pub confirm_profile: Option<String>,
     pub rename: bool,
     /// Explicit operator grant for pack hooks (`--trust-hooks`). Without it
     /// hooks land disabled behind an ApprovalBroker request (fail-closed).
@@ -44,6 +45,7 @@ pub(super) struct InstallCtx {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PipelineOpts {
     pub dry_run: bool,
+    pub confirm_profile: Option<String>,
     pub rename: bool,
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
@@ -89,7 +91,7 @@ pub async fn cmd_install(
         attach_under,
         ..Default::default()
     };
-    cmd_install_with(home, source, opts).await
+    super::agent_config::preview::confirmed_install(home, source, opts).await
 }
 
 /// Set once the gateway asked this run to stop (see [`listen_for_stop`]).
@@ -139,6 +141,7 @@ async fn terminated() {
 /// dashboard can always show what happened. The file must be a new `.json`
 /// path: an existing file is never overwritten.
 pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOpts) -> Result<()> {
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::markers())?;
     let mut report_file = match &opts.report_json {
         Some(p) => Some(super::report::open_report_file(p)?),
         None => None,
@@ -253,6 +256,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     let ctx = InstallCtx {
         home: home.to_path_buf(),
         dry_run,
+        confirm_profile: opts.confirm_profile.clone(),
         rename: opts.rename || opts.reimport == super::reimport::ReimportMode::Copy,
         trust_hooks: opts.trust_hooks,
         attach_under,
@@ -386,6 +390,36 @@ async fn install_native(
             e.name.escape_debug()
         )));
     }
+    let mut profiles = BTreeMap::new();
+    for agent in &e.agents {
+        if !crate::is_valid_agent_id(&agent.name) || duduclaw_core::is_reserved_agent_id(&agent.name) {
+            return Err(cfg_err("專家包員工代號無效，不能用於路徑".into()));
+        }
+        let root = dir.join("agents").join(&agent.name);
+        let read_doc = |file: &str| -> Result<Option<super::agent_config::ir::Doc>> {
+            let path = root.join(file);
+            if !path.exists() { return Ok(None); }
+            let text = super::agent_config::md::read_text(&path)
+                .ok_or_else(|| cfg_err(format!("無法讀取專家包區段 {file}")))?;
+            Ok(Some(super::agent_config::ir::Doc::new(file, text)))
+        };
+        let settings = match read_doc("agent.partial.toml")? {
+            Some(doc) => toml::from_str(&doc.text).map_err(|e| cfg_err(format!("專家包設定格式不正確：{e}")))?,
+            None => toml::Table::new(),
+        };
+        super::agent_config::preview::reject_mcp_settings(&settings)?;
+        profiles.insert(agent.name.clone(), super::agent_config::ir::AgentDraft {
+            id_hint: agent.name.clone(), display_name: if agent.display_name.is_empty() { agent.name.clone() } else { agent.display_name.clone() },
+            description: format!("role: {}\nreports_to: {}\ndepartment: {}\nrank: {}\ntrigger: {}\nskills: {}",
+                agent.role, agent.reports_to, agent.department, agent.rank, agent.trigger, agent.skills.join("\n")),
+            soul: read_doc("soul.md")?, contract: read_doc("CONTRACT.toml")?,
+            settings, ..Default::default()
+        });
+    }
+    let bundle = super::agent_config::ir::ImportBundle {
+        format_code: "native-pack", agents: profiles.values().cloned().collect(), ..Default::default()
+    };
+    super::agent_config::preview::require_confirmation(&bundle, ctx.dry_run, ctx.confirm_profile.as_deref(), report)?;
     let slug = ctx.claim_slug(&e.name)?;
     let adding = e
         .agents
@@ -495,7 +529,7 @@ async fn install_native(
             suffix: &suffix,
         };
         if let Some(final_id) =
-            install_one_agent(ctx, dir, agent, &placement, &mut book, report, &mut record).await?
+            install_one_agent(ctx, dir, agent, &profiles[&agent.name], &placement, &mut book, report, &mut record).await?
         {
             id_map.insert(name.clone(), final_id);
         } else if e.agents.iter().any(|a| a.reports_to.trim() == name.as_str()) {
@@ -569,6 +603,7 @@ async fn install_one_agent(
     ctx: &InstallCtx,
     pack_dir: &Path,
     agent: &manifest::ExpertAgent,
+    profile: &super::agent_config::ir::AgentDraft,
     placement: &Placement<'_>,
     book: &mut duduclaw_core::agent_names::NameBook,
     report: &mut Report,
@@ -586,18 +621,7 @@ async fn install_one_agent(
         return Ok(None);
     }
 
-    // Persona (DATA) → scan.
-    let soul_path = pack_dir.join("agents").join(&agent.name).join("soul.md");
-    let soul_body = match std::fs::read_to_string(&soul_path) {
-        Ok(s) => {
-            if let ScanVerdict::Blocked(reason) = scan_external(&s) {
-                report.skipped("agent", &base, format!("security: {reason}"));
-                return Ok(None);
-            }
-            Some(s)
-        }
-        Err(_) => None, // no soul → scaffold default persona
-    };
+    let soul_body = profile.soul.as_ref().map(|doc| doc.text.clone());
 
     let wanted_display = if agent.display_name.trim().is_empty() {
         agent.name.clone()
@@ -726,25 +750,9 @@ async fn install_one_agent(
         }
     }
 
-    // Merge agent.partial.toml onto the scaffolded agent.toml.
-    let partial_path = pack_dir
-        .join("agents")
-        .join(&agent.name)
-        .join("agent.partial.toml");
-    if let Ok(partial_src) = std::fs::read_to_string(&partial_path) {
-        match partial_src.parse::<toml::Table>() {
-            Ok(overlay) => {
-                super::patch_agent_toml(&ctx.home, &final_id, |t| merge_toml(t, &overlay))?;
-                report.imported("agent-settings", &final_id);
-            }
-            Err(err) => {
-                report.warning(
-                    "agent-settings",
-                    &final_id,
-                    format!("partial 解析失敗: {err}"),
-                );
-            }
-        }
+    if !profile.settings.is_empty() {
+        super::patch_agent_toml(&ctx.home, &final_id, |table| merge_toml(table, &profile.settings))?;
+        report.imported("agent-settings", &final_id);
     }
 
     // WP22 T1 — re-record the authoritative org placement from the finished
@@ -767,21 +775,10 @@ async fn install_one_agent(
         }
     }
 
-    // Merge the pack's per-agent .mcp.json servers into the scaffolded file.
-    // The scaffold already wrote `.mcp.json` with the wired `duduclaw` server;
-    // pack-declared servers (e.g. a Photoshop MCP) are folded in alongside it
-    // (duduclaw entry is never overwritten). Without this the pack's servers
-    // would be silently dropped.
     let pack_mcp = pack_dir.join("agents").join(&agent.name).join(".mcp.json");
-    if let Some(servers) = super::read_mcp_servers(&pack_mcp)
-        && !servers.is_empty()
-    {
-        match super::merge_agent_mcp(&ctx.home, &final_id, &servers) {
-            Ok(written) if written > 0 => {
-                report.imported("mcp-servers", &format!("{written} → {final_id}"));
-            }
-            Ok(_) => {}
-            Err(err) => report.warning("mcp-servers", &final_id, format!("併入失敗: {err}")),
+    if let Some(servers) = super::read_mcp_servers(&pack_mcp) {
+        for name in servers.keys() {
+            report.skipped("mcp-servers", name, "匯入不新增 MCP 伺服器，請由管理者另行設定");
         }
     }
 
@@ -789,7 +786,7 @@ async fn install_one_agent(
     install_agent_skills(ctx, pack_dir, agent, &final_id, report, record).await;
 
     // CONTRACT.toml (behavioural red lines).
-    install_agent_contract(ctx, pack_dir, agent, &final_id, report);
+    install_agent_contract(ctx, profile, &final_id, report);
 
     Ok(Some(final_id))
 }
@@ -801,18 +798,14 @@ async fn install_one_agent(
 /// overwritten.
 fn install_agent_contract(
     ctx: &InstallCtx,
-    pack_dir: &Path,
-    agent: &manifest::ExpertAgent,
+    profile: &super::agent_config::ir::AgentDraft,
     final_id: &str,
     report: &mut Report,
 ) {
-    let src = pack_dir
-        .join("agents")
-        .join(&agent.name)
-        .join("CONTRACT.toml");
-    let Ok(raw) = std::fs::read_to_string(&src) else {
+    let Some(doc) = &profile.contract else {
         return; // no contract in the pack — nothing to do
     };
+    let raw = &doc.text;
     if let ScanVerdict::Blocked(reason) = scan_external(&raw) {
         report.skipped("contract", final_id, format!("security: {reason}"));
         return;
@@ -827,9 +820,9 @@ fn install_agent_contract(
     // Same sanitizer as AI-generated teams: `must_not` also blocks channel
     // replies verbatim, so wildcard / keyword rules and rules that repeat the
     // employee's own handoff wording are dropped — and reported, not silent.
-    let soul = std::fs::read_to_string(pack_dir.join("agents").join(&agent.name).join("soul.md")).ok();
+    let soul = profile.soul.as_ref().map(|doc| doc.text.as_str());
     let sanitized =
-        duduclaw_agent::contract_sanitize::sanitize_boundaries(&parsed.boundaries, soul.as_deref());
+        duduclaw_agent::contract_sanitize::sanitize_boundaries(&parsed.boundaries, soul);
     if !sanitized.dropped.is_empty() {
         let list: Vec<String> = sanitized
             .dropped

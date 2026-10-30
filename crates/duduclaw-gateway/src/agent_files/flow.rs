@@ -259,7 +259,7 @@ pub(crate) async fn save(c: &Caller<'_>, input: SaveInput) -> Result<Value, Stri
     }
 }
 
-/// The last approved version of a SOUL / INSTRUCTIONS file that is
+/// The last approved version of a SOUL / IDENTITY / USER / INSTRUCTIONS file that is
 /// currently drifted, or `None` when the file is intact (or has no baseline
 /// concept). An approved version no longer kept reads as empty, so the
 /// reviewer sees the whole file as new.

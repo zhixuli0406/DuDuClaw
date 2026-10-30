@@ -9,7 +9,7 @@
 //!                                                                     │
 //!   writer: ids/conflicts → archive original → scaffold (SOUL) → slots ┤
 //!           (IDENTITY / INSTRUCTIONS / wiki / memory) → tools (narrow)  │
-//!           → MCP (no secrets) → skills (enable | quarantine | block)  ▼
+//!           → MCP (report only) → skills (enable | quarantine | block)  ▼
 //!                                                               install record + report
 //! ```
 //!
@@ -30,6 +30,7 @@ pub mod skills;
 pub mod slots;
 pub mod vendor;
 mod writer;
+pub(crate) mod preview;
 
 use std::path::Path;
 

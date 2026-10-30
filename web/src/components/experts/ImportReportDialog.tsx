@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import type { ExpertImportItem, ExpertImportReport, ExpertReimport } from '@/lib/api';
+import { AgentProfilePreview } from './AgentProfilePreview';
 import { EditsList } from './EditsList';
 import { ImportErrorPanel, type ImportFailure } from './ImportErrorPanel';
 import { ReimportChoice } from './ReimportChoice';
@@ -26,7 +27,7 @@ const SECTIONS: { id: string; kinds: string[] }[] = [
   { id: 'skills', kinds: ['skill', 'skill-disabled', 'skill-needs', 'skill-name', 'skill-files'] },
 ];
 
-const KNOWN_FORMATS = ['doubao', 'openclaw', 'hermes', 'dify', 'workspace', 'subagent', 'instructions'];
+const KNOWN_FORMATS = ['doubao', 'openclaw', 'hermes', 'dify', 'workspace', 'subagent', 'instructions', 'duduclaw'];
 
 function sectionOf(item: ExpertImportItem): string {
   return SECTIONS.find((s) => s.kinds.includes(item.kind))?.id ?? 'notes';
@@ -154,6 +155,10 @@ export function ImportReportDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {phase === 'plan' && !failed && report?.details?.profile_preview && (
+          <AgentProfilePreview profiles={report.details.profile_preview} />
+        )}
+
         {shownFailure && (
           <ImportErrorPanel failure={shownFailure}>
             {failureCode === 'import.already_imported' && onReimport && (
@@ -259,7 +264,7 @@ export function ImportReportDialog({
                 variant="brand"
                 size="sm"
                 onClick={() => (needsEditConsent ? setConfirmingEdits(true) : onConfirm())}
-                disabled={busy || report === null}
+                disabled={busy || report === null || (!!report.details?.profile_preview && !report.details.profile_confirmation)}
               >
                 {busy && <Spinner className="size-3.5" />}
                 {reimport?.mode === 'replace' ? t('experts.reimport.confirmReplace') : t('experts.report.confirm')}

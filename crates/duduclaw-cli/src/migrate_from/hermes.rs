@@ -88,6 +88,11 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
         }
     }
 
+    let profile_bundle = crate::expert::agent_config::adapters::read(
+        crate::expert::agent_config::ConfigKind::Hermes, &profile_root)
+        .map_err(DuDuClawError::Config)?;
+    review_profiles(ctx, &mut report, &profile_bundle.agents)?;
+
     // ── config.yaml → model ──
     let model_default = match std::fs::read_to_string(profile_root.join("config.yaml")) {
         Ok(y) => match parse_hermes_config(&y) {
@@ -169,7 +174,7 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
     let soul_body = scanned_soul(
         &mut report,
         "hermes",
-        std::fs::read_to_string(profile_root.join("SOUL.md")).ok(),
+        profile_bundle.agents.first().and_then(|draft| draft.soul.as_ref()).map(|doc| doc.text.clone()),
     );
     let (preferred, needs_review) = match &model_default {
         Some(m) => {
@@ -200,20 +205,9 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
         }
 
         // Persona files → their slots: memories/MEMORY.md → facts (entries
-        // split on `§`), memories/USER.md → the「服務對象」wiki page.
-        match crate::expert::agent_config::adapters::read(
-            crate::expert::agent_config::ConfigKind::Hermes,
-            &profile_root,
-        ) {
-            Ok(bundle) => {
-                if let Some(draft) = bundle.agents.first() {
-                    let mut draft = draft.clone();
-                    // SOUL.md is already written by the scaffold above.
-                    draft.soul = None;
-                    write_persona_slots(ctx, &mut report, &agent_id, &draft, &profile_root).await;
-                }
-            }
-            Err(e) => report.skipped("persona", "hermes", e),
+        // split on `§`), memories/USER.md → the native USER.md data slot.
+        if let Some(draft) = profile_bundle.agents.first() {
+            write_persona_slots(ctx, &mut report, &agent_id, draft, &profile_root).await;
         }
 
         // Skills.

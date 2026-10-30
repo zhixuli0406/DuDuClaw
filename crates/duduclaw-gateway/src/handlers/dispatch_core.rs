@@ -72,6 +72,11 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_presets_status(params).await
             }
+            "agents.export_profile" => {
+                require_manager!();
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_agents_export_profile(params, ctx).await
+            }
             "agents.create" => {
                 require_admin!();
                 self.handle_agents_create_as(params, Some(ctx)).await

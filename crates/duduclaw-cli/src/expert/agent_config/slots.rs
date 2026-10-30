@@ -7,7 +7,7 @@
 //! |--------------------|-------------------------------------------------------|
 //! | `identity`         | `IDENTITY.md` (+ `agent.toml` display name / icon)    |
 //! | `instructions`     | `INSTRUCTIONS.md` (prompt slot, employee read-only)   |
-//! | `user_profile`     | wiki L1 page「服務對象」(always in the prompt)         |
+//! | `user_profile`     | `USER.md` (data-only prompt slot, 4,000 characters)         |
 //! | `tools_notes`      | wiki page「工具備註」(notes only, grants nothing)      |
 //! | `heartbeat`        | wiki page「定期檢查清單」(not scheduled automatically) |
 //! | `knowledge`        | wiki pages (searched on demand)                       |
@@ -43,6 +43,20 @@ pub struct SlotCtx<'a> {
 
 pub async fn write_slots(ctx: &SlotCtx<'_>, draft: &AgentDraft) -> Vec<Outcome> {
     let mut out = Vec::new();
+    if !crate::is_valid_agent_id(ctx.agent_id) {
+        out.push(Outcome::skipped("agent", ctx.agent_id, "無效的員工代號"));
+        return out;
+    }
+    if let Some(doc) = &draft.user_profile {
+        if doc.text.chars().count() > 4_000 {
+            out.push(Outcome::skipped("user-profile", &doc.source, "服務對象資料超過 4,000 字，未寫入"));
+        } else {
+            write_file_slot(ctx, doc, "USER.md", "user-profile", "服務對象資料（USER.md）", &mut out);
+        }
+    }
+    if let Some(doc) = &draft.contract {
+        write_file_slot(ctx, doc, "CONTRACT.toml", "contract", "工作契約（CONTRACT.toml）", &mut out);
+    }
     if let Some(doc) = &draft.identity {
         write_file_slot(
             ctx,
@@ -78,13 +92,6 @@ pub async fn write_slots(ctx: &SlotCtx<'_>, draft: &AgentDraft) -> Vec<Outcome> 
         }
     }
     let pages = [
-        WikiSlot {
-            doc: &draft.user_profile,
-            kind: "user-profile",
-            title: "服務對象",
-            layer: duduclaw_memory::WikiLayer::Core,
-            banner: "",
-        },
         WikiSlot {
             doc: &draft.tools_notes,
             kind: "tools-notes",
@@ -174,9 +181,20 @@ fn write_file_slot(
         out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}"))));
         return;
     }
-    let path = ctx.home.join("agents").join(ctx.agent_id).join(file);
-    match std::fs::write(&path, &doc.text) {
-        Ok(()) => out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}")))),
+    use duduclaw_gateway::agent_files::external::{self, ExternalFile, ExternalBaseline};
+    let key = match file {
+        "IDENTITY.md" => ExternalFile::Identity,
+        "USER.md" => ExternalFile::User,
+        "INSTRUCTIONS.md" => ExternalFile::Instructions,
+        "CONTRACT.toml" => ExternalFile::Contract,
+        _ => {
+            out.push(Outcome::skipped(kind, &doc.source, "不支援的設定檔區段"));
+            return;
+        }
+    };
+    match external::write_file(ctx.home, ctx.agent_id, key, "import", "本機匯入（身分未驗證）",
+        ExternalBaseline::Accept, |_| Ok(doc.text.clone())) {
+        Ok(_) => out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}")))),
         Err(e) => out.push(
             Outcome::skipped(kind, &doc.source, format!("寫入失敗：{e}"))
                 .with("slot.failed", serde_json::json!({ "slot": kind })),

@@ -1,5 +1,6 @@
 pub mod agent_guard;
 pub mod agent_names;
+pub mod agent_profile;
 pub mod agent_rename;
 pub mod agent_trash;
 pub mod agent_toml;
@@ -42,6 +43,7 @@ pub mod org_store;
 pub mod pack;
 pub mod platform;
 pub mod preset;
+pub mod profile_sections;
 pub mod protected_section;
 pub mod provider_env;
 pub mod product_profile;

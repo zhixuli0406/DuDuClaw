@@ -213,6 +213,13 @@ pub(super) async fn migrate_with_home(
         }
     };
 
+    let profile_drafts: Vec<_> = cfg.agents.iter().map(|spec| {
+        let ws = workspace_dir(&src, spec, cfg.agents.len() == 1);
+        crate::expert::agent_config::adapters::read_workspace(
+            &ws, &src, &spec.id, &mut Vec::new(), &mut Vec::new())
+    }).collect();
+    review_profiles(ctx, &mut report, &profile_drafts)?;
+
     // ── API keys: ANTHROPIC from env section + .env; others → SKIPPED hint ──
     let mut env = cfg.env.clone();
     let dotenv = src.join(".env");
@@ -276,10 +283,10 @@ pub(super) async fn migrate_with_home(
 
     // ── Agents + workspace persona / memory / skills ──
     let single = cfg.agents.len() == 1;
-    for spec in &cfg.agents {
+    for (spec, draft) in cfg.agents.iter().zip(&profile_drafts) {
         let ws = workspace_dir(&src, spec, single);
         let soul_body =
-            scanned_soul(&mut report, &spec.id, std::fs::read_to_string(ws.join("SOUL.md")).ok());
+            scanned_soul(&mut report, &spec.id, draft.soul.as_ref().map(|doc| doc.text.clone()));
         let model_raw = spec.model.clone().or_else(|| cfg.default_model.clone());
         let (preferred, needs_review) = match &model_raw {
             Some(m) => {
@@ -313,17 +320,8 @@ pub(super) async fn migrate_with_home(
         }
 
         // Persona files → their DuDuClaw slots (IDENTITY.md, INSTRUCTIONS.md,
-        // USER/TOOLS/HEARTBEAT wiki pages, MEMORY + memory/*.md → facts).
-        let mut secrets = Vec::new();
-        let mut hidden = Vec::new();
-        let draft = crate::expert::agent_config::adapters::read_workspace(
-            &ws,
-            &src,
-            &spec.id,
-            &mut secrets,
-            &mut hidden,
-        );
-        write_persona_slots(ctx, &mut report, &agent_id, &draft, &src).await;
+        // USER.md data, TOOLS/HEARTBEAT wiki pages, MEMORY + memory/*.md → facts).
+        write_persona_slots(ctx, &mut report, &agent_id, draft, &src).await;
 
         // Skills (scanned + installed).
         let skills = skill_dirs(&src, &ws, home);

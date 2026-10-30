@@ -383,7 +383,8 @@ pub(super) fn mentions_own_contract_toml(normalized_command: &str, caller_id: &s
 /// `normalized_command` (already lowercased) targets `caller_id`'s OWN
 /// `INSTRUCTIONS.md` via Bash. Same per-token rules, same caveats.
 pub(super) fn mentions_own_instructions_md(normalized_command: &str, caller_id: &str) -> bool {
-    mentions_own_agent_file(normalized_command, caller_id, "instructions.md")
+    ["instructions.md", "user.md", "identity.md"].iter()
+        .any(|file| mentions_own_agent_file(normalized_command, caller_id, file))
 }
 
 /// Shared body of the "own file" Bash matchers. `basename_lower` must be
@@ -484,5 +485,17 @@ pub(super) fn classify_home_rest(rest: Vec<String>, caller: &str) -> Option<Home
             Some(owner) => Some(HomeTarget::ForeignAgentDir(owner.to_string())),
         },
         _ => Some(HomeTarget::State(rest)),
+    }
+}
+
+#[cfg(test)]
+mod profile_match_tests {
+    use super::*;
+    #[test]
+    fn user_and_identity_share_own_instructions_bash_guard() {
+        for file in ["user.md", "identity.md", "instructions.md"] {
+            assert!(mentions_own_instructions_md(&format!("echo changed > {file}"), "worker"));
+            assert!(mentions_own_instructions_md(&format!("cat > /home/.duduclaw/agents/worker/{file}"), "worker"));
+        }
     }
 }
