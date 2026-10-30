@@ -172,6 +172,15 @@ pub(crate) fn commit_locked(
         {
             return Ok(Locked::Err(CommitError::Refused(e)));
         }
+        if c.key == FileKey::AgentToml {
+            let table = match new.parse::<toml::Table>() {
+                Ok(table) => table,
+                Err(_) => return Ok(Locked::Err(CommitError::Refused("invalid agent.toml; connection ownership cannot be verified".into()))),
+            };
+            if let Err(e) = crate::disconnect_forget::connections::mark_config_connecting(c.home, &table, Some(c.agent_id)) {
+                return Ok(Locked::Err(CommitError::Refused(e)));
+            }
+        }
         // The version first: a change that cannot be undone is not written.
         let meta = VersionMeta {
             user_id: c.meta.user_id.clone(),

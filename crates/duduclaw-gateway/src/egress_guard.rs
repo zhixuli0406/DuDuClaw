@@ -3,6 +3,7 @@
 mod lease_store;
 pub mod recovery;
 mod hook;
+mod connectors;
 
 pub const HOOK_CHECK_ROUTE: &str = "/api/internal/egress-guard/hook-check";
 
@@ -58,20 +59,59 @@ type Key = (String, String);
 pub struct Taint {
     pub tainted: bool,
     pub sources: Vec<String>,
+    #[serde(default = "unknown_connectors")]
+    pub connector_refs: Vec<String>,
+    #[serde(default)]
+    pub dropped_connector_refs: u64,
+    #[serde(default)]
+    pub turn_started_at: Option<String>,
 }
+
+fn unknown_connectors() -> Vec<String> { vec!["unknown".into()] }
 
 impl Taint {
     pub fn unknown() -> Self {
         Self {
             tainted: true,
             sources: vec!["turn_state_unavailable".into()],
+            connector_refs: vec!["unknown".into()],
+            dropped_connector_refs: 0,
+            turn_started_at: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectorSnapshot {
+    pub refs: Vec<String>,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ConnectorSnapshot {
+    pub fn unknown() -> Self {
+        Self { refs: vec!["unknown".into()], observed_at: chrono::DateTime::UNIX_EPOCH }
+    }
+
+    pub fn stamp(&self, provenance: duduclaw_memory::lineage::Provenance) -> duduclaw_memory::lineage::Provenance {
+        provenance.with_connector_refs_at(self.refs.clone(), self.observed_at)
+    }
+}
+
+impl Taint {
+    pub(crate) fn connector_snapshot(&self) -> ConnectorSnapshot {
+        match self.turn_started_at.as_deref().and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()) {
+            Some(at) => ConnectorSnapshot { refs: self.connector_refs.clone(), observed_at: at.with_timezone(&chrono::Utc) },
+            None => ConnectorSnapshot::unknown(),
         }
     }
 }
 
 struct Turn {
     created: Instant,
+    started_at: String,
     sources: BTreeSet<String>,
+    connector_refs: BTreeSet<String>,
+    dropped_connector_refs: u64,
     pending: HashMap<String, String>,
 }
 
@@ -230,7 +270,10 @@ impl Ledger {
         if self.make_turn_room(&key) {
             self.turns.entry(key).or_insert(Turn {
                 created: now,
+                started_at: duduclaw_memory::format_ts(chrono::Utc::now()),
                 pending: HashMap::new(),
+                connector_refs: if seen { BTreeSet::from(["unknown".into()]) } else { BTreeSet::new() },
+                dropped_connector_refs: 0,
                 sources: if seen {
                     BTreeSet::from(["turn_state_unavailable".into()])
                 } else {
@@ -244,6 +287,9 @@ impl Ledger {
         self.prune(now);
         match self.turns.get(key) {
             Some(turn) => Taint {
+                connector_refs: turn.connector_refs.iter().cloned().collect(),
+                dropped_connector_refs: turn.dropped_connector_refs,
+                turn_started_at: Some(turn.started_at.clone()),
                 tainted: !turn.sources.is_empty() || !turn.pending.is_empty(),
                 sources: turn.sources.iter().cloned()
                     .chain((!turn.pending.is_empty()).then(|| "pending_private_read".into()))
@@ -323,6 +369,9 @@ impl Ledger {
             Some(turn) => {
                 let pending = turn.pending.keys().any(|read| Some(read.as_str()) != own_read);
                 Taint {
+                    connector_refs: turn.connector_refs.iter().cloned().collect(),
+                    dropped_connector_refs: turn.dropped_connector_refs,
+                    turn_started_at: Some(turn.started_at.clone()),
                     tainted: !turn.sources.is_empty() || pending,
                     sources: turn.sources.iter().cloned()
                         .chain(pending.then(|| "pending_private_read".into())).collect(),
@@ -380,6 +429,23 @@ impl Ledger {
         }
     }
 
+    fn stamp(&mut self, key: &Key, connector: Option<&str>, rejected: bool, now: Instant) {
+        self.prune(now);
+        if let Some(turn) = self.turns.get_mut(key) {
+            if rejected {
+                turn.dropped_connector_refs = turn.dropped_connector_refs.saturating_add(1);
+                turn.connector_refs.insert("unknown".into());
+            }
+            if let Some(reference) = connector {
+                if turn.connector_refs.len() < MAX_SOURCES - 1 {
+                    turn.connector_refs.insert(reference.into());
+                } else {
+                    turn.connector_refs.insert("unknown".into());
+                }
+            }
+        }
+    }
+
     fn mark(&mut self, key: &Key, source: &str, now: Instant) -> Taint {
         self.prune(now);
         self.note_registration(key, now);
@@ -388,7 +454,10 @@ impl Ledger {
                 key.clone(),
                 Turn {
                     created: now,
+                    started_at: duduclaw_memory::format_ts(chrono::Utc::now()),
                     pending: HashMap::new(),
+                    connector_refs: BTreeSet::from(["unknown".into()]),
+                    dropped_connector_refs: 0,
                     sources: BTreeSet::from(["turn_state_unavailable".into()]),
                 },
             );
@@ -413,7 +482,13 @@ fn ledger() -> &'static Mutex<Ledger> {
 /// Re-registration cannot clear previously recorded sources.
 pub(crate) fn register_turn(agent: &str, turn: &str) {
     if let Ok(mut ledger) = ledger().lock() {
-        ledger.register((agent.into(), turn.into()), Instant::now());
+        let key = (agent.into(), turn.into());
+        ledger.register(key.clone(), Instant::now());
+        if let Ok(Some(session)) = duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone) {
+            if let Some(reference) = channel_connector(&session) {
+                ledger.stamp(&key, Some(&reference), false, Instant::now());
+            }
+        }
     }
 }
 
@@ -434,6 +509,9 @@ pub(crate) fn mark_turn(agent: &str, turn: Option<&str>, tool: &str) -> Taint {
         return Taint {
             tainted: true,
             sources: vec!["turn_state_unavailable".into(), tool.into()],
+            connector_refs: vec!["unknown".into()],
+            dropped_connector_refs: 0,
+            turn_started_at: None,
         };
     };
     if !valid_source(tool) {
@@ -443,6 +521,16 @@ pub(crate) fn mark_turn(agent: &str, turn: Option<&str>, tool: &str) -> Taint {
         .lock()
         .map(|mut ledger| ledger.mark(&(agent.into(), turn.into()), tool, Instant::now()))
         .unwrap_or_else(|_| Taint::unknown())
+}
+
+pub(crate) fn channel_connector(session: &str) -> Option<String> {
+    let (kind, _) = session.split_once(':')?;
+    if !matches!(kind, "line" | "telegram" | "discord" | "slack" | "googlechat") { return None; }
+    match session.split_once("#agent:") {
+        Some((_, agent)) if duduclaw_core::is_valid_agent_id(agent) => Some(format!("channel:{kind}:{agent}")),
+        Some(_) => None,
+        None => Some(format!("channel:{kind}")),
+    }
 }
 
 /// A reservation survives cancellation; only an explicit payload-less completion releases it.
@@ -516,6 +604,12 @@ struct Request {
     payload: Option<bool>,
     #[serde(default)]
     own_read: Option<String>,
+    #[serde(default)]
+    connector_ref: Option<String>,
+    #[serde(default)]
+    remote_server: Option<String>,
+    #[serde(default)]
+    stamp_only: bool,
 }
 
 pub fn router(state: Arc<RouteState>) -> Router {
@@ -653,7 +747,8 @@ fn handle(
         "acquire_sink" | "release_sink" => request.source.is_none() && request.payload.is_none(),
         _ => false,
     };
-    if !valid || (request.own_read.is_some() && (op != "acquire_sink" || !request.own_read.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())))
+    if !valid || ((request.stamp_only || request.connector_ref.is_some() || request.remote_server.is_some()) && op != "mark")
+        || (request.connector_ref.is_some() && request.remote_server.is_some()) || (request.own_read.is_some() && (op != "acquire_sink" || !request.own_read.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())))
         || (matches!(op, "reserve" | "finish" | "acquire_sink" | "release_sink") && !request.reservation.as_deref()
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -694,7 +789,12 @@ fn handle(
             Err(error) => serde_json::json!({"error": error}),
         }
     } else {
-        let turn_key = (caller.agent_id.clone(), request.turn_id);
+        let remote_connector = request.remote_server.as_deref().filter(|_| op == "mark")
+            .and_then(|server| connectors::remote_reference(&state.home, &caller.agent_id, server));
+        let connector = request.connector_ref.as_deref().filter(|reference|
+            op == "mark" && connectors::declared_allowed(&state.home, &caller.agent_id, reference)).or(remote_connector.as_deref());
+        let rejected_connector = (request.connector_ref.is_some() || request.remote_server.is_some()) && connector.is_none();
+        let turn_key = (caller.agent_id.clone(), request.turn_id.clone());
         let result = match ledger().lock() {
             Ok(mut ledger) => {
                 let now = Instant::now();
@@ -703,18 +803,21 @@ fn handle(
                     "acquire_sink" => ledger.acquire_persisted_sink(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.own_read.as_deref(), now, chrono::Utc::now().timestamp_millis()),
                     "release_sink" => Ok(ledger.release_sink(&turn_key, request.reservation.as_deref().unwrap(), now)),
                     "finish" => Ok(ledger.finish(&turn_key, request.reservation.as_deref().unwrap(), request.payload.unwrap(), now)),
-                    "mark" => Ok(ledger.mark(&turn_key, request.source.as_deref().unwrap(), now)),
+                    "mark" => {
+                        if !request.stamp_only { ledger.mark(&turn_key, request.source.as_deref().unwrap(), now); }
+                        ledger.stamp(&turn_key, connector, rejected_connector, now);
+                        Ok(ledger.query(&turn_key, now))
+                    },
                     _ => Ok(ledger.query(&turn_key, now)),
                 }
             },
             Err(_) => Err("ledger unavailable".into()),
         };
         // Refusals are authenticated too: never trust an unsigned error message.
-        let value = match result {
+        match result {
             Ok(taint) => serde_json::json!(taint),
             Err(error) => serde_json::json!({"error": error}),
-        };
-        value
+        }
     };
     let bytes = serde_json::to_vec(&value).expect("egress response serialization");
     let response_sig = duduclaw_core::internal_request_signature(
@@ -745,6 +848,37 @@ fn valid_source(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_stamps_do_not_change_taint_or_cross_employees() {
+        let now = Instant::now();
+        let mut ledger = Ledger::default();
+        let alice = ("alice".into(), "turn".into());
+        let bob = ("bob".into(), "turn".into());
+        ledger.register(alice.clone(), now);
+        ledger.register(bob.clone(), now);
+        ledger.stamp(&alice, Some("google:person:owner"), false, now);
+        let state = ledger.query(&alice, now);
+        assert!(!state.tainted);
+        assert!(state.sources.is_empty());
+        assert_eq!(state.connector_refs, ["google:person:owner"]);
+        assert!(ledger.query(&bob, now).connector_refs.is_empty());
+        ledger.stamp(&alice, None, true, now);
+        let state = ledger.query(&alice, now);
+        assert_eq!(state.dropped_connector_refs, 1);
+        assert!(state.connector_refs.iter().any(|r| r == "unknown"));
+        assert!(!state.tainted);
+        assert_eq!(ledger.query(&alice, now + TTL).connector_refs, ["unknown"]);
+    }
+
+    #[test]
+    fn channel_stamps_keep_global_and_employee_bots_distinct() {
+        assert_eq!(channel_connector("telegram:123:0"), Some("channel:telegram".into()));
+        assert_eq!(channel_connector("telegram:123:0#agent:alice"), Some("channel:telegram:alice".into()));
+        assert_eq!(channel_connector("googlechat:spaces/xyz#agent:alice"), Some("channel:googlechat:alice".into()));
+        assert_eq!(channel_connector("telegram:123#agent:../bob"), None);
+        assert_eq!(channel_connector("runtime:alice:turn"), None);
+    }
 
     fn policy_home(mode: &str) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
@@ -1005,7 +1139,7 @@ mod tests {
         for i in 0..MAX_AGENT_TURNS {
             let key = ("bot".into(), i.to_string());
             ledger.note_registration(&key, now);
-            ledger.turns.insert(key, Turn { created: now, sources: BTreeSet::from(["private".into()]), pending: HashMap::new() });
+            ledger.turns.insert(key, Turn { created: now, started_at: duduclaw_memory::format_ts(chrono::Utc::now()), connector_refs: BTreeSet::new(), dropped_connector_refs: 0, sources: BTreeSet::from(["private".into()]), pending: HashMap::new() });
         }
         let refused = ("bot".into(), "over-quota".into());
         ledger.register(refused.clone(), now);
@@ -1241,7 +1375,10 @@ mod tests {
         // Fill directly so the test does not repeatedly prune a growing ledger.
         for i in 1..MAX_TURNS {
             ledger.turns.insert(("filler".into(), i.to_string()), Turn {
-                created: now, sources: BTreeSet::from(["memory_read".into()]), pending: HashMap::new(),
+                created: now,
+                started_at: duduclaw_memory::format_ts(chrono::Utc::now()),
+                connector_refs: BTreeSet::new(), dropped_connector_refs: 0,
+                sources: BTreeSet::from(["memory_read".into()]), pending: HashMap::new(),
             });
         }
         let overflow = ("bot".into(), "overflow".into());

@@ -545,7 +545,11 @@ impl MethodHandler {
                     &agent_id,
                     json!({ "agent_id": agent_id, "server": server, "forget": forget, "existed": existed, "actor": ctx.email }),
                 );
-                WsFrame::ok_response("", json!({ "success": true, "existed": existed, "forget": forget }))
+                let forget_memories = crate::disconnect_forget::after_disconnect(&self.home_dir,
+                    &format!("remote_mcp:{agent_id}/{server}"), &server,
+                    params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await;
+                WsFrame::ok_response("", json!({ "success": true, "existed": existed, "forget": forget,
+                    "forget_memories":forget_memories }))
             }
             Ok(Err(e)) => WsFrame::error_response("", &e),
             Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),

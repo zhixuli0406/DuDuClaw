@@ -1151,6 +1151,10 @@ fn atomic_write(
             }
         }
     }
+    let rows: Vec<Value> = serde_json::from_slice(&prepared.0).map_err(before)?;
+    if rows.iter().any(|row| row["provider_id"] == "google" && row.get("access_token").is_some()) {
+        crate::disconnect_forget::connections::mark_connecting(home, "google:home").map_err(before)?;
+    }
     let path = home.join(format!(".mcp-oauth-{}.tmp", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);

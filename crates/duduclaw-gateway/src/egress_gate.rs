@@ -185,7 +185,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent.toml"), "").unwrap();
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='typo'").unwrap();
-        assert!(evaluate(tmp.path(), "bot", "send_message", true, crate::egress_guard::Taint { tainted: false, sources: vec![] }).is_err());
+        assert!(evaluate(tmp.path(), "bot", "send_message", true, crate::egress_guard::Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: vec![] }).is_err());
         assert!(check_external(tmp.path(), "external", "send_message", true).is_err());
     }
 

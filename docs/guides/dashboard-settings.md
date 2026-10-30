@@ -339,3 +339,22 @@ In **Outgoing data guard**, **Recipient guard** controls `config.toml [security]
 An Admin edits **Tools & permissions → Allowed recipients** on the employee page. Add exact entries such as `line:U123`, `telegram:456` and `mail:ops@example.com`; these write `[capabilities] recipients`. The employee-level mode can only tighten the global mode; **Use global minimum** adds no restriction of its own. Both fields are Admin-only and protected from employee edits.
 
 The gateway adds the current source conversation and verified `users.db` Owner bindings automatically. Proactive notification settings never count as ownership or as an allowlist. Scheduled notifications have no source conversation and are checked again when firing, so add required schedule targets explicitly. Outside recipients are recorded in Observe only; Ask requires a single-use dashboard Admin approval. When outgoing-data protection also asks, one card shows both reasons. See [Server-bound recipients](../features/69-egress-guard.md#server-bound-recipients-unreleased-e2). E2 tests are written but not run; compilation and live acceptance are pending.
+
+## Security → Data deletion receipts (unreleased F1)
+
+Disconnecting a channel, Google account, database source or Remote MCP automatically prepares a memory-deletion request. A disconnect success and a completed deletion are separate results.
+
+1. Disconnect the service in its settings. The response offers **View approval** when a batch is ready. If `[memory] forget_source` is off or its setting cannot be read, no plan is created; planning failures are also reported separately.
+2. An Admin opens the inbox card and reviews the counts for each AI employee. A batch expires after seven days. A deletion scope that grows before execution needs another approval; a smaller scope can proceed.
+3. After approval is saved, the gateway queues durable background work. It retries unfinished work and resumes after a restart. There is no receipt while deletion or its required follow-up is incomplete.
+4. Open **System → Security → Data deletion receipts**, expand a connection and choose **Download JSON**. Refresh the list to see newly completed work. Counts distinguish deleted memories, key facts and archive copies from unattributed and retained system rows.
+
+Google personal connections are attributed to the user whose credential was used, while the receipt groups deletions by AI employee. Old memories without a connection stamp cannot be assigned retrospectively. Conversation text, `tool_calls.jsonl`, wiki and backups are outside this deletion. Remote MCP's existing `forget` option removes the saved connection entry; the independent `forget_memories` option controls the memory request and defaults to enabled.
+
+Non-Google OAuth revocations currently have no connection attribution and report that forgetting was skipped. Clearing the configured Google credential path does not itself revoke a separately stored OAuth authorization; disconnect that authorization through its own control.
+
+Connection stamps keep their origin and role. Corroboration alone never grants deletion ownership. A memory stays if another connected source also supplied it; plans, the Admin card and receipts report this per employee as `retained_shared`. Deletion requires every owning connector to have been disconnected and no independent live origin. The second disconnect can therefore select a previously shared memory. Unknown ownership (including old stamps whose role cannot be recovered) is retained and counted as unattributed. Derived memories undergo the same ownership check. Connection state is checked again before planning and applying, and reconnecting through the platform invalidates old disconnect evidence before publishing the connection.
+
+Approval binds the sorted identifiers of orphan entity embeddings, not just their count; swapping one entity for another requires a new approval. Unfinished jobs use a durable attempt count and due time, with 60/120/240/480-second backoff. Due jobs are selected fairly. After five consecutive failures or interrupted attempts, a job is quarantined. The Admin can see a content-free failure reason under **Data deletion receipts** and choose **Retry**; retry retains the existing approval and rechecks scope, requiring a new approval if it grows.
+
+Regression tests for these changes were added but **not run**; no build was performed.

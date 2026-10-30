@@ -213,6 +213,21 @@ The card (`knowledge_add_source`) is decided only in the dashboard, only by an A
 
 `knowledge.sources.delete` with `also_forget_memories: true` looks up the conversations whose replies **cited** the source and files one forget-by-source plan per employee and conversation (at most 20 per deletion; the rest are reported as skipped), covering those turns' messages. The plans are filed only after the deletion succeeded. Each plan waits for the existing Admin-only dashboard approval and is applied afterwards with `duduclaw memory forget-source apply`. This is coarse on purpose: it forgets everything those turns taught the employee, not only what came from the document. Passages that were offered but not cited are not included.
 
+## Forgetting after disconnecting a connection (unreleased F1)
+
+Disconnecting a channel, Google account, database source or Remote MCP connection files one batch for Admin approval, covering every affected AI employee. The disconnect finishes first. Its response reports whether the request is waiting for approval, forgetting is disabled, or planning failed. A planning failure does not undo the disconnect and does not mean memories were deleted. The existing document-source deletion plans above still use the CLI apply step; the new connection batches run in the background after approval.
+
+The batch lasts seven days. Before applying it, the gateway plans again: a smaller deletion set may proceed, but a larger set needs a new approval. The approval card shows counts per employee. Successful deletion removes the attributable memories, key facts and archive copies, so they no longer appear in memory search or automatic recall. Memories from before connection stamps were introduced, and rows whose turn ledger could not be read, are counted as unattributed rather than guessed or deleted. System-provenance rows stay and are counted separately.
+
+An Admin can inspect **System → Security → Data deletion receipts** and download JSON after the work has finished. The receipt records the connection name captured at disconnect, the batch, time, approver, actual counts per employee and store, unattributed counts and the exclusions. Conversation text, `tool_calls.jsonl`, wiki and backups are out of scope. See [Security defense](05-security-defense.md) for the attribution and approval boundaries.
+
+
+Connection stamps keep their origin and role. Corroboration alone never grants deletion ownership. A memory stays if another connected source also supplied it; plans, the Admin card and receipts report this per employee as `retained_shared`. Deletion requires every owning connector to have been disconnected and no independent live origin. The second disconnect can therefore select a previously shared memory. Unknown ownership (including old stamps whose role cannot be recovered) is retained and counted as unattributed. Derived memories undergo the same ownership check. Connection state is checked again before planning and applying, and reconnecting through the platform invalidates old disconnect evidence before publishing the connection.
+
+Approval binds the sorted identifiers of orphan entity embeddings, not just their count; swapping one entity for another requires a new approval. Unfinished jobs use a durable attempt count and due time, with 60/120/240/480-second backoff. Due jobs are selected fairly. After five consecutive failures or interrupted attempts, a job is quarantined. The Admin can see a content-free failure reason under **Data deletion receipts** and choose **Retry**; retry retains the existing approval and rechecks scope, requiring a new approval if it grows.
+
+Regression tests for these changes were added but **not run**; no build was performed.
+
 ## Audit
 
 - Every search, passage read, listing and download writes a row to `knowledge.db`'s access log: who (dashboard user, employee, channel), the query (first 500 characters), the allowed collections and the result ids, never the passage text. Rows older than `access_log_retention_days` are deleted every ten minutes.

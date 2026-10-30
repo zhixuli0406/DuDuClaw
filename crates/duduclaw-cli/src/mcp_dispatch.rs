@@ -1845,6 +1845,15 @@ impl McpDispatcher {
             if let Some(lease) = &sink_lease { lease.terminal_response(); }
         }
         let payload = crate::mcp::egress_gate::model_visible_payload(&result);
+        if !principal.is_external && payload && matches!(tool_name, "db_tables" | "db_select" | "db_query") {
+            if let Some(source) = params_owned.get("arguments").and_then(|v| v.get("source")).and_then(Value::as_str) {
+                if let Err(reason) = duduclaw_gateway::egress_client::mark_connector(
+                    &self.home_dir, gate_agent, tool_name, &format!("db:{source}"),
+                ).await {
+                    tracing::warn!(%reason, "DB connection attribution unavailable");
+                }
+            }
+        }
         let completion = if let Some(read) = private_read {
             read.finish(payload).await
         } else if !principal.is_external && payload
