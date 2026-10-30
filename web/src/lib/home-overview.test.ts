@@ -71,9 +71,9 @@ describe('buildAttentionItems', () => {
     expect(byType.failed_run).toMatchObject({ id: 'failed_run:f1', actionable: false });
   });
 
-  it('sorts by urgency (budget > failed_run > blocked > approval > decision)', () => {
+  it('sorts by urgency (budget > blocked > failed_run > approval > decision)', () => {
     const items = buildAttentionItems(approvals, needsHuman, undelivered);
-    expect(items.map((i) => i.type)).toEqual(['failed_run', 'blocked', 'approval']);
+    expect(items.map((i) => i.type)).toEqual(['blocked', 'failed_run', 'approval']);
   });
 
   it('empty sources → empty list, not a placeholder row', () => {
