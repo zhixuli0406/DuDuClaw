@@ -1,5 +1,7 @@
 # Google Chat 與 Microsoft Teams 通道
 
+Google Chat 頻道憑證授權 Chat 應用程式（`chat.bot`），不會連接 Gmail、Drive 或 Calendar。資料工具請依[連接 Google](google-setup.md)另行設定。儀表板儲存頻道後即時套用；手動修改頻道設定檔後才需重啟。
+
 DuDuClaw 將 Google Chat 與 Microsoft Teams 列為一級通道（與 Telegram／LINE／
 Discord／Slack／WhatsApp／Feishu／WebChat 並列）。兩者都是 webhook-based：
 你的 gateway 必須能透過公開 HTTPS 被連到。
@@ -38,7 +40,7 @@ googlechat_project_number = "123456789012"
 googlechat_service_account_json = '{ "type": "service_account", ... }'
 ```
 
-6. 重啟 gateway。看到 log 印出
+6. 手動改設定檔後重啟 gateway；儀表板變更即時套用。看到 log 印出
    `✅ Google Chat webhook ready at /webhook/googlechat` 即代表成功。
 
 ### 備註

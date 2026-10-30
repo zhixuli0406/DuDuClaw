@@ -86,7 +86,7 @@
 | 錄製 → skill | 瀏覽器（Playwright trace+HAR，憑證就地遮罩）與桌面錄製器，蒸餾成須核准的 SKILL.md 草稿（[36-recording-to-skill.md](36-recording-to-skill.md)） |
 | 照片 → 桌面寵物 | 本地照片 → 去背 → 像素量化 → Codex-Pets 8×9 spritesheet；自主遊蕩引擎移動真正的置頂視窗（[35-photo-desktop-pet.md](35-photo-desktop-pet.md)） |
 | 能力功能開關 | 16 組白話功能群組疊在原始 allow/deny 工具清單之上，背後是有完整性防護的工具目錄 |
-| Google Workspace / Notion / GitHub 原生工具 | Gmail/Calendar/Drive/Sheets、Notion、GitHub 的第一方 MCP 工具（v1.45；設定前預設隱藏） |
+| Google Workspace / Notion / GitHub 原生工具 | Google 原生八服務、19 工具，整合總開關預設關閉；Apps Script 三服務、含狀態共八動作。管理員精靈見[連接 Google](../../guides/zh-TW/google-setup.md)。Notion、GitHub 各自設定。 |
 | 桌面殼層（Tauri 2） | 原生視窗包裝 gateway + 儀表板、tray、gateway 選擇器、透明桌面寵物 overlay 視窗 |
 | 互動節奏防護 | 對話歷史框架 + 常駐節奏規則，打招呼永不重新觸發先前的重工具任務 |
 
@@ -169,7 +169,7 @@
 | Slack | Socket Mode、mention-only、thread 回覆 |
 | WhatsApp | Cloud API webhook，簽章驗證 fail-closed |
 | 飛書 | Open Platform v2 |
-| Google Chat | Webhook（JWT 驗證）、service account 送信 |
+| Google Chat | JWT 驗證 webhook、`chat.bot` 服務帳號傳送；儀表板即時套用，與 Workspace 資料憑證分開（[設定](../../guides/zh-TW/channels-googlechat-teams.md)） |
 | Microsoft Teams | Azure Bot / Connector v3（JWT 驗證） |
 | 企業微信（WeCom） | HMAC-SHA1 簽章 + AES-256-CBC 訊息加密 |
 | 釘釘（DingTalk） | HMAC-SHA256 簽章 + 時間窗 |

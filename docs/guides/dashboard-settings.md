@@ -368,3 +368,8 @@ Regression tests for these changes were added but **not run**; no build was perf
 ## Conversation credentials (unreleased)
 
 Admin: **System → Security → Credential audit** shows metadata, filters, service edits, false-positive marking and an audited CSV export of the current page. The adjacent inventory lists system-configured credentials read-only. Set `[security] chat_credentials = "audit" | "mask"` through `system.update_config` (`security.chat_credentials`) or the configuration editor. The default is `audit`; unknown values are handled as `mask`. Audit mode leaves the original conversation text intact. Mask mode changes newly detected inbound values, not old history. Both mask detected values in derived stores. See [Credential audit](../features/70-credential-audit.md) for detection limits and registration quotas. Never put real credentials into a service name or note.
+
+## Manage → Integrations → Google setup
+
+Administrators can open the resumable setup wizard at `/manage/integrations?tab=google`. Choose company delegation, Internal OAuth, Apps Script or personal External OAuth. The advanced credential form remains reachable. Confirm a path replacement before saving; stored OAuth tokens remain until an explicit disconnect. The connection test reports each service separately, and scope-only Sheets/Docs checks remain unverified. Follow [Connect Google](google-setup.md) for Console steps, remote-host tunnels and Testing expiry.
+

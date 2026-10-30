@@ -5731,11 +5731,19 @@ export interface GoogleCredentialSection {
   error: string;
 }
 
+export interface GoogleServiceProbe {
+  service: string;
+  ok: boolean;
+  verified: boolean;
+  reason: string;
+  enable_url?: string | null;
+}
+
 export interface GoogleCredentialsStatus {
   /** `config.toml [integrations] google_workspace` — the master gate. */
   integration_enabled: boolean;
   /** Which path a real tool call would take right now. */
-  effective: 'direct' | 'apps_script' | 'none';
+  effective: 'direct' | 'oauth' | 'service_account' | 'apps_script' | 'none';
   service_account: GoogleCredentialSection;
   apps_script: GoogleCredentialSection;
   /** Scope list to hand a Workspace admin for delegation. */
@@ -5811,11 +5819,12 @@ export interface PersonalGoogleStatus {
   recent_usage: { timestamp: string; agent_id: string; tool_name: string; success: boolean }[];
 }
 
-export type GoogleCredentialsInput =
+export type GoogleCredentialsInput = (
   | { mode: 'service_account'; key_file: string; subject: string }
   /** Omit `secret` to keep the stored one while editing the URL. */
   | { mode: 'apps_script'; url: string; secret?: string }
-  | { mode: 'none' };
+  | { mode: 'none' | 'oauth'; testing?: boolean }
+) & { replace_confirmed?: boolean };
 
 /** One past WebChat session, as returned by `chat.sessions.list`
  *  (newest first, archived excluded). */
@@ -6673,6 +6682,7 @@ export const api = {
         sent: boolean;
         mode: 'live' | 'credential_only';
         detail: string;
+        services?: GoogleServiceProbe[];
       }>,
     remove: (type: string) =>
       client.call('channels.remove', { type }).then(notifyDisconnectForget),
@@ -7862,13 +7872,15 @@ export const api = {
   googleCredentials: {
     get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
     set: (params: GoogleCredentialsInput) =>
-      client.call('google.credentials.set', params).then(notifyDisconnectForget) as Promise<{ ok: boolean; mode: string }>,
+      client.call('google.credentials.set', params).then(notifyDisconnectForget) as Promise<{ ok: boolean; mode: string; staged?: boolean }>,
     test: () =>
-      client.call('google.credentials.test') as Promise<{
+      client.call('google.credentials.test', {}, false, 90000) as Promise<{
         ok: boolean;
+        result?: 'complete' | 'partial' | 'failed';
         path: string;
-        account?: string;
+        account?: string | null;
         detail: string;
+        services?: GoogleServiceProbe[];
       }>,
     /**
      * Flip `config.toml [integrations] google_workspace` — the master gate
@@ -7941,6 +7953,11 @@ export const api = {
         /** Whether the access token itself is still fresh (it lasts ~1h on Google). */
         access_token_valid?: boolean;
         can_refresh?: boolean;
+        error_code?: 'access_denied' | 'admin_policy_enforced' | 'invalid_scope' | 'other' | null;
+        needs_reconnect?: boolean;
+        testing_warning?: boolean;
+        testing?: boolean;
+        connected_at?: string | null;
         expires_at: string | null;
         scopes?: string[];
       }>,

@@ -347,3 +347,8 @@ Google 個人連線依實際使用憑證的使用者歸屬，收據則按 AI 員
 ## 對話憑證（尚未發版）
 
 Admin 可在「系統 → 安全 → 憑證稽核」查看中繼資料、篩選、編輯服務、標記誤判，以及匯出有稽核紀錄的本頁 CSV。旁邊的清冊以唯讀方式列出系統設定憑證。透過 `system.update_config` 的 `security.chat_credentials` 或設定編輯器設定 `[security] chat_credentials = "audit" | "mask"`。預設 `audit`；未知值視為 `mask`。稽核模式保留對話原文；遮罩模式只改新進站訊息中偵測到的值，不改舊紀錄。兩種模式都遮罩衍生儲存中偵測到的值。偵測限制與登錄配額見[憑證稽核](../../features/zh-TW/70-credential-audit.md)。服務名稱與備註不可填入真正的憑證。
+
+## 管理 → 整合 → Google 設定
+
+管理員可在 `/manage/integrations?tab=google` 開啟可續接的設定精靈，依情況選公司委派、Internal OAuth、Apps Script 或個人 External OAuth。進階表單仍可使用。替換生效路徑前須確認；OAuth 權杖保留到明確中斷連線。測試逐項回報服務結果，Sheets、Docs 僅檢查權限時標記未驗證。主控台步驟、遠端轉送與 Testing 到期見[連接 Google](google-setup.md)。
+

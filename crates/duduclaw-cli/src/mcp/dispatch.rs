@@ -707,11 +707,11 @@ pub(crate) async fn handle_tools_call(
                 }
             }
         }
-        // Google Workspace native tools (Gmail + Calendar). Scope gates
+        // Native tools cover eight Google Workspace services. Scope gates
         // (google:read / google:write) are enforced upstream in mcp_dispatch;
-        // these handlers consume the OAuth vault token directly.
+        // the identity route selects the authorized credential source.
         // Whole group sits behind the integration gate (hidden from tools/list
-        // too) until Dudu Technology Ltd.'s OAuth app clears Google verification.
+        // too); saving the user's chosen credentials enables it.
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name)
             && !duduclaw_gateway::google_workspace::integration_enabled(home_dir) =>
         {

@@ -937,7 +937,7 @@ impl Rows {
         let before = self.google().cloned();
         self.validate_claim(claim, source, now)?;
         if write.is_some_and(|w| w.proof().kind != SourceFileKind::Config)
-            || (source.binding() != source.enabled_binding() && write.is_none())
+            || (source.binding() != source.oauth_binding() && write.is_none())
         {
             return Err(Error::Invalid);
         }
@@ -951,7 +951,7 @@ impl Rows {
             mutation_id: mutation_id.clone(),
             kind: MutationKind::ConnectFinish,
             expected_before: source.binding().clone(),
-            expected_after: source.enabled_binding().clone(),
+            expected_after: source.oauth_binding().clone(),
             payload: Some(PayloadExpectation {
                 digest: digest(&payload.0)?,
                 credential_id: id(),

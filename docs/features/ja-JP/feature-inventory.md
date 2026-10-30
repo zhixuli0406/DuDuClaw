@@ -84,7 +84,7 @@
 | レコーディング → スキル | ブラウザ(Playwright trace+HAR、シークレットはその場で秘匿処理)とデスクトップのレコーダーを、承認ゲート付き SKILL.md ドラフトへ蒸留([36-recording-to-skill.md](36-recording-to-skill.md)) |
 | 写真 → デスクトップペット | ローカルで写真 → 背景除去 → ピクセル量子化 → Codex-Pets 8×9 スプライトシート。本物の常時最前面ウィンドウを動かす自律徘徊エンジン([35-photo-desktop-pet.md](35-photo-desktop-pet.md)) |
 | ケイパビリティ機能トグル | 生の allow/deny ツールリストの上に置かれた 16 の平易な機能グループ。完全性ガード付きツールカタログが裏付け |
-| Google Workspace / Notion / GitHub ネイティブツール | Gmail/Calendar/Drive/Sheets、Notion、GitHub のファーストパーティ MCP ツール(v1.45。設定されるまでデフォルト非表示) |
+| Google Workspace / Notion / GitHub ネイティブツール | Google は八サービス・19 ツール、全体スイッチ既定オフ。Apps Script は三サービス・状態込み八アクション。[接続ウィザード](../../guides/ja-JP/google-setup.md)。Notion と GitHub は個別設定。 |
 | デスクトップシェル(Tauri 2) | ゲートウェイ + ダッシュボードを包むネイティブウィンドウ、トレイ、ゲートウェイピッカー、透明なデスクトップペットオーバーレイウィンドウ |
 | インタラクションペーシングガード | 会話履歴フレーミング + 常時有効なペーシングルールにより、挨拶が直前のツール多用タスクを再トリガーしないようにする |
 
@@ -167,7 +167,7 @@
 | Slack | Socket Mode、mention-only、thread 返信 |
 | WhatsApp | Cloud API webhook、署名検証は fail-closed |
 | Feishu | Open Platform v2 |
-| Google Chat | Webhook（JWT 検証）、サービスアカウントで送信 |
+| Google Chat | JWT 検証 webhook、`chat.bot` サービスアカウント送信。ダッシュボード即時反映、Workspace データ認証と別（[設定](../../guides/ja-JP/channels-googlechat-teams.md)） |
 | Microsoft Teams | Azure Bot / Connector v3（JWT 検証） |
 | WeCom | HMAC-SHA1 署名 + AES-256-CBC メッセージ暗号化 |
 | DingTalk | HMAC-SHA256 署名 + 時間ウィンドウ |

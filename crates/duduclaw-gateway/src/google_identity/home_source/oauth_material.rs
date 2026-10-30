@@ -416,6 +416,9 @@ fn service_account_config(
 pub async fn get_valid_google_token(
     home_dir: &Path,
 ) -> std::result::Result<String, GoogleAuthError> {
+    if matches!(crate::google_workspace::selected_path(home_dir)?.as_str(), "apps_script" | "none") {
+        return Err(GoogleAuthError::NotConnected { vault: home_dir.join(crate::mcp_oauth::TOKEN_FILE) });
+    }
     match service_account_config(home_dir) {
         Ok(Some(cfg)) => {
             return google_service_account::get_token(&cfg, REQUIRED_SCOPES)

@@ -88,7 +88,7 @@
 | Recording → skill | Browser (Playwright trace+HAR, secrets redacted in place) and desktop recorders distilled into approval-gated SKILL.md drafts ([36-recording-to-skill.md](36-recording-to-skill.md)) |
 | Photo → desktop pet | Local photo → background removal → pixel quantization → Codex-Pets 8×9 spritesheet; autonomous wander engine moving a real always-on-top window ([35-photo-desktop-pet.md](35-photo-desktop-pet.md)) |
 | Capability feature toggles | 16 plain-language feature groups over the raw allow/deny tool lists, backed by a completeness-guarded tool catalog |
-| Google Workspace / Notion / GitHub native tools | First-party MCP tools for Gmail/Calendar/Drive/Sheets, Notion, GitHub (v1.45; hidden by default until configured) |
+| Google Workspace / Notion / GitHub native tools | Google: eight services, 19 native tools, separate integration gate default off; Apps Script: three services, eight actions including status. Admin setup wizard: [Connect Google](../guides/google-setup.md). Notion and GitHub retain their own configuration. |
 | Desktop shell (Tauri 2) | Native window wrapping gateway + dashboard, tray, gateway picker, transparent desktop-pet overlay window |
 | Interaction pacing guard | Conversation-history framing + always-on pacing rule so greetings never re-trigger prior tool-heavy tasks |
 
@@ -171,7 +171,7 @@
 | Slack | Socket Mode, mention-only, thread replies |
 | WhatsApp | Cloud API webhook, signature verification fail-closed |
 | Feishu | Open Platform v2 |
-| Google Chat | Webhook (JWT-verified), service-account send |
+| Google Chat | JWT-verified webhook, `chat.bot` service-account send; dashboard hot apply, separate from Workspace data credentials ([setup](../guides/channels-googlechat-teams.md)) |
 | Microsoft Teams | Azure Bot / Connector v3 (JWT-verified) |
 | WeCom | HMAC-SHA1 signature + AES-256-CBC message encryption |
 | DingTalk | HMAC-SHA256 signature + time window |

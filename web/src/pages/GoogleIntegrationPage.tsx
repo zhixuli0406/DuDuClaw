@@ -12,13 +12,15 @@ import {
   AlertTriangle,
   Loader2,
 } from 'lucide-react';
+import { GoogleSetupWizard } from '@/components/google/GoogleSetupWizard';
+import { useAuthStore } from '@/stores/auth-store';
 import { IntegrationConnectPanel } from '@/components/IntegrationConnectPanel';
 import { GoogleCredentialPaths } from '@/components/GoogleCredentialPaths';
 import { GoogleDelegationPanel } from '@/components/GoogleDelegationPanel';
 import { GooglePersonalAdminPanel } from '@/components/GooglePersonalAdminPanel';
 import { Card, CardContent, Button, Badge } from '@/components/mds';
 import { api } from '@/lib/api';
-import { toast } from '@/lib/toast';
+import { toast, formatError } from '@/lib/toast';
 
 const GOOGLE_CREDENTIALS_URL = 'https://console.cloud.google.com/apis/credentials';
 
@@ -73,6 +75,9 @@ export function GoogleIntegrationPage() {
   // off when it is on.
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
+  const admin = useAuthStore(s => s.user?.role === 'admin');
 
   const load = useCallback(async () => {
     try {
@@ -98,7 +103,7 @@ export function GoogleIntegrationPage() {
           : t('google.gate.disabled', 'Google 整合已關閉，AI 員工不再看得到這些工具。'),
       );
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(formatError(e));
     } finally {
       setBusy(false);
     }
@@ -106,6 +111,8 @@ export function GoogleIntegrationPage() {
 
   return (
     <div className="space-y-4">
+      {admin && <><Button onClick={() => setWizardOpen(true)}>{t('google.wizard.open', '設定 Google 連線')}</Button><GoogleSetupWizard open={wizardOpen} onOpenChange={open => { setWizardOpen(open); if (!open) void load(); }} /></>}
+      <Button variant="outline" onClick={() => setAdvanced(value => !value)}>{t('google.wizard.advanced', '進階設定')}</Button>
       {enabled === false && (
         <Card data-testid="google-gate-off">
           <CardContent className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
@@ -150,6 +157,7 @@ export function GoogleIntegrationPage() {
         </Card>
       )}
 
+      {advanced && <>
       <IntegrationConnectPanel
         providerId="google"
         prefix="google"
@@ -165,6 +173,7 @@ export function GoogleIntegrationPage() {
       <GoogleCredentialPaths />
       <GoogleDelegationPanel />
       <GooglePersonalAdminPanel />
+      </>}
     </div>
   );
 }

@@ -355,3 +355,8 @@ Google 以外の OAuth 取り消しには現在接続の帰属情報がなく、
 ## 会話の認証情報（未リリース）
 
 Admin は「システム → セキュリティ → 認証情報の監査」でメタデータの確認、絞り込み、サービス編集、誤検出指定、監査付きの現在ページの CSV 出力を行えます。隣の一覧はシステム設定を読み取り専用で表示します。`system.update_config` の `security.chat_credentials` または設定エディターで `[security] chat_credentials = "audit" | "mask"` を指定します。既定は `audit`、不明な値は `mask` です。監査モードは会話原文を残し、マスクモードは新規メッセージで検出した値のみを変更します。過去の履歴は変更しません。両モードで派生ストアの検出値をマスクします。[認証情報監査](../../features/ja-JP/70-credential-audit.md)に検出限界と登録上限を記載しています。サービス名やメモに実際の認証情報を入力しないでください。
+
+## 管理 → 連携 → Google 設定
+
+管理者は `/manage/integrations?tab=google` の再開可能なウィザードで、会社委任、Internal OAuth、Apps Script、個人 External OAuth を選べます。詳細フォームも利用できます。有効経路の切り替えは保存前に確認し、OAuth トークンは明示的な切断まで保持します。テストはサービス別で、スコープのみの Sheets/Docs は未検証です。Console、SSH 転送、Testing 期限は [Google 接続](google-setup.md)を参照してください。
+

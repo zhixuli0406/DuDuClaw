@@ -303,7 +303,7 @@ What it does not stop: an employee with a shell can still replace the key (detec
 
 ## Acting as a colleague's Google account (v1.76.0)
 
-Company delegation (B2a) lets an AI employee use Google as one named colleague. The gates, all failing closed:
+Company delegation lets an AI employee use Google as one named colleague. The gates, all failing closed:
 
 - **Only the proven employee.** The identity is chosen from the employee proven by `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN`, never from a tool argument. A process claiming an employee it cannot prove gets only the home default, and nothing when the claimed employee is set to anything else.
 - **Only the gateway mints.** The MCP server asks `POST /api/internal/google-token` (loopback, signed identity, nonce, rate limit, the same authentication as the knowledge route). The gateway reads the employee's `[google]` itself, looks up who the turn is for in its own registry, and unseals the delegation key only after `person_identity_gate()` passes (credential protection at or above the minimum level; Linux and Docker are refused). The token stays in the MCP server's memory for that turn.
@@ -312,7 +312,7 @@ Company delegation (B2a) lets an AI employee use Google as one named colleague. 
 - **People are re-read.** A colleague whose DuDuClaw account is suspended or offboarded is refused on the next call.
 - **Settings are admin-only.** `[google]` is frozen for the employee's own Write/Edit (agent-file guard) and is an authority key: a non-admin Owner may only narrow it.
 
-Limits: `gmail.compose` lets the token holder send mail; an employee with an unrestricted shell can use the token issued for its own colleague directly against Google, and runs as the same OS user as the gateway. External Google MCP servers (`oauth://google`) are skipped for a delegated employee in this release. See [Per-employee Google accounts](../guides/google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
+Limits: `gmail.compose` lets the token holder send mail; an employee with an unrestricted shell can use the token issued for its own colleague directly against Google, and runs as the same OS user as the gateway. HTTP Google MCP mounts (`oauth://google`) use the selected employee account and recheck live requester permissions per call. Person-account stdio mounts are refused. Setup: [Connect Google](../guides/google-setup.md). See [Per-employee Google accounts](../guides/google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
 
 ## What these guards do not cover
 

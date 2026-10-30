@@ -1,5 +1,7 @@
 # Give an AI employee its own Telegram bot and Google Chat app
 
+Google Chat channel credentials authorize the Chat application (`chat.bot`). They do not connect Gmail, Drive or Calendar. Workspace data tools have their own [Google setup](google-setup.md). Saving a channel in the dashboard applies live; restart after editing channel configuration by hand.
+
 By default every AI employee is reached through the company's shared channels
 (one Telegram bot, one Google Chat app). This guide sets up a channel identity
 for one employee: people then talk to *that* employee through its own bot or
