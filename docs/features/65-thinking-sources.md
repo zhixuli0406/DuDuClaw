@@ -10,7 +10,6 @@ A runtime only changes its request when the person reading the turn may see thin
 | Codex CLI | Reasoning summaries (`reasoning` items) and reasoning tokens, after the run | `-c model_reasoning_summary=auto` only for a viewer who may read the text |
 | OpenAI-compatible APIs (DeepSeek, Qwen, vLLM, OpenRouter, …) | Raw reasoning (`reasoning_content`, `reasoning`, or a leading `<think>…</think>` block); shown only with redaction on | Never for the plain and tool-loop calls without a text viewer; with one, the tool loop streams so reasoning appears as it is written |
 | Anthropic Direct API | Thinking summaries, omitted and redacted blocks, after the call | A summarized `thinking` display is requested only for a text viewer and only on models that think on every request anyway (Opus 5 / 5.5, Sonnet 5 / 5.5, Haiku 5.5, Fable, Mythos), so the cost does not change |
-| Antigravity (`agy`) | Nothing yet (timer only) | Never |
 | Grok CLI | Nothing (timer only) | Never |
 
 ## Details
@@ -19,6 +18,5 @@ A runtime only changes its request when the person reading the turn may see thin
 - **Codex CLI.** Reasoning items are read after the run finishes (the CLI output is not streamed line by line yet), so the summary appears when the answer does.
 - **OpenAI-compatible APIs.** Open models return their own reasoning, so the text is only shown when redaction is enabled; otherwise the viewer sees seconds and tokens with a hint. A `<think>` tag is recognised only at the very start of the answer (after whitespace); a block without a closing tag counts as reasoning to the end. The answer the employee sends is unchanged: the leading `<think>` block is removed from it as before. The tool loop's messages, including reasoning parts, are passed back to the model exactly as the provider returned them. A provider that refuses streaming gets a plain call instead, so the turn still completes; a streamed answer without a usage chunk is billed from a token estimate and marked `usage_estimated = 1` in `cost_telemetry.db`.
 - **Anthropic Direct API and the operator tool loop.** Summaries are reported after each call. Signatures and `redacted_thinking` data are passed back to the model unchanged and are never shown.
-- **Antigravity.** Step types other than `tool` are only written to the debug log by name, so they can be mapped once their vocabulary is known.
 
-Not verified with real quota yet: whether `claude -p` returns non-empty thinking text on current models, how `codex exec` emits reasoning items on a real account, and agy's step vocabulary. The parsers were tested against fixtures and a stub CLI.
+Not verified with real quota yet: whether `claude -p` returns non-empty thinking text on current models, how `codex exec` emits reasoning items on a real account. The parsers were tested against fixtures and a stub CLI.

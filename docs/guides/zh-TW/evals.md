@@ -44,7 +44,7 @@ duduclaw eval evals/support --report eval-report.json
 | `--baseline <report.json>` | 與先前寫出的 `--report` 檔案做成對統計比較。見[誠實統計](#誠實統計)。 |
 | `--mde <fraction>` | 解析度檢查所宣告的最小可偵測效應，以通過率的小數表示（預設 `0.10` = 10 個百分點）。見[誠實統計](#誠實統計)。 |
 | `--cluster-by <key>` | cluster-robust 標準誤的分群鍵。目前只實作 `dir`（預設，以每個 case 所在目錄分群），其他值一律拒絕。見[誠實統計](#誠實統計)。 |
-| `--runtime <id>` | 由哪個後端執行每個 case（`claude` 為預設，也是 P2 之前的路徑；另有 `codex`、`antigravity`、`grok`、`openai_compat`，或任何其他 catalog 內的 runtime id）。未知的 id 會被拒絕，不會當成 `claude`。**省略時採用各 case 自己的 `[case] runtime`，沒有則用 `claude`。** 見[能力矩陣](#能力矩陣--matrix)。 |
+| `--runtime <id>` | 由哪個後端執行每個 case（`claude` 為預設，也是 P2 之前的路徑；另有 `codex`、`grok`、`openai_compat`，或任何其他 catalog 內的 runtime id）。未知的 id 會被拒絕，不會當成 `claude`。**省略時採用各 case 自己的 `[case] runtime`，沒有則用 `claude`。** 見[能力矩陣](#能力矩陣--matrix)。 |
 | `--model <id>` | 在 `--runtime` 範圍內，對每個 case 覆寫 model id。省略時採用各 case 自己的 `[case] model`。報告標頭的 `model` 一律寫明實際跑的是哪個。 |
 | `--paired-seeds` | 為每組 `(case id, repeat)` 推導出確定性的 seed，讓同一批抽樣能跨 model 對齊（Miller 的成對設計）。**只記錄，不套用**：本版本沒有任何 runtime 能吃 seed，每次執行都會以 `seed_applied: false` 註明這點。 |
 | `--agent <id>` | 改用**這個**已佈署的 agent 執行每個 case，而不是各 case 自己的 `[case] agent`。報告標頭會記為 `agent_override`，每次執行也會記錄 `agent`。見[借用單一 agent](#借用單一-agent--agent)。 |
@@ -383,7 +383,6 @@ verifier cell 的分數，是與已錄製 transcript 上確定性 gold 的一致
 
 保真度警告：合成的 transcript 只帶有該 runtime 的事件 stream 實際帶有的東西，也就是一個文字區塊（所以 `min_text_blocks` 永遠只能觀察到 `1`）、沒有 thinking 區塊，而工具輸入是收集器記錄下來經過遮罩並截斷的文字，不是原始的 JSON。這些訊號在兩條路徑之間**不能比較**，所以同一個 cell 絕不混用它們。
 
-Antigravity `agy` 1.2.10 現在會向它的 runtime 提供 `stream-json` 的終端工具事件與實測的 token 用量。已驗證過一次即時的 sandbox 拒絕工具事件，以及一個不使用工具的 PING eval；成功的原生工具執行仍需另外做一次即時檢查。verifier cell 的金額估算仍然粗略，因為那個 utility 呼叫沒有把用量回傳給矩陣報告器。
 
 ### 輸出
 
@@ -417,7 +416,7 @@ duduclaw eval <eval-suite-dir> --matrix --team-2x2 \
   --planner-strong codex:gpt-5.6-sol \
   --executor-weak codex:gpt-5.6-terra \
   --executor-strong codex:gpt-5.6-sol \
-  --verifier-model antigravity:gemini-3.7-flash \
+  --verifier-model codex:gpt-5.4 \
   --team-effort low \
   --repeats 1 --max-cases 4 --report reports/team-2x2.json
 ```

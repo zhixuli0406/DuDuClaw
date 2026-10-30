@@ -94,7 +94,7 @@ fn unsupported_runtime_refused() {
         operator_identity: true, budget: None, account_rotator: None, extra_read_paths: vec![], max_concurrency: 2,
     };
     // The operator-only host experiment stays Claude-only (design §9.1).
-    for runtime in ["codex","antigravity","agy","grok","openai-compat"] {
+    for runtime in ["codex","grok","openai-compat"] {
         assert!(matches!(f.for_runtime(runtime),
             Err(AttemptInfraError::CapabilityUnsupported{capability,..}) if capability=="unconfined operator experiment"),"{runtime}");
     }
@@ -613,7 +613,7 @@ printf '%s\n' '{"type":"result","result":"done","total_cost_usd":0.01}'
 #[test]
 fn every_family_runs_in_a_container_under_the_host_contract() {
     let mut attempt=AttemptSettings::default();
-    for name in ["claude","codex","antigravity","grok","openai-compat"] {
+    for name in ["claude","codex","grok","openai-compat"] {
         attempt.runtimes.insert(name.into(),super::super::config::AttemptRuntimeConfig {
             image:format!("test@sha256:{}","a".repeat(64)),executable:format!("/opt/{name}").into(),base_url:None,provider:None,
         });
@@ -621,7 +621,7 @@ fn every_family_runs_in_a_container_under_the_host_contract() {
     let factory=AttemptRunnerFactory {home_dir:"/private/host".into(),attempt:attempt.clone(),
         quota:crate::discovery::attempt_container::QuotaLimits::default(),allow_unconfined:false,operator_identity:false,
         budget:None,account_rotator:None,extra_read_paths:vec![],max_concurrency:1};
-    for runtime in ["claude","codex","antigravity","agy","grok","openai-compat","openai_compat"] {
+    for runtime in ["claude","codex","grok","openai-compat","openai_compat"] {
         assert!(factory.for_runtime(runtime).is_ok(),"{runtime} must be accepted under the host-side contract");
     }
     assert!(matches!(factory.for_runtime("gemini"), Err(AttemptInfraError::RuntimeUnsupported(_))));
@@ -629,7 +629,7 @@ fn every_family_runs_in_a_container_under_the_host_contract() {
     attempt.runtimes.remove("grok");
     assert_eq!(AttemptRunnerFactory::check_runtime_capability(&attempt,"grok").err(),Some(AttemptInfraError::IsolationUnavailable));
     attempt.strict_usd=true;
-    for runtime in ["claude","codex","antigravity"] {
+    for runtime in ["claude","codex"] {
         assert!(matches!(AttemptRunnerFactory::check_runtime_capability(&attempt,runtime),Err(AttemptInfraError::StrictUsdUnsupported(_))));
     }
 }
@@ -641,7 +641,7 @@ fn unpriced_models_are_unknown_outside_claude() {
     assert!(summary.complete);
     let claude=call_cost_for(RuntimeFamily::Claude,"unpriced-model-x",&summary);
     assert_eq!(claude.source,CostSource::Estimated);assert!(claude.usd>0.0);
-    for family in [RuntimeFamily::Codex,RuntimeFamily::Antigravity,RuntimeFamily::Grok,RuntimeFamily::OpenAiCompat] {
+    for family in [RuntimeFamily::Codex,RuntimeFamily::Grok,RuntimeFamily::OpenAiCompat] {
         let cost=call_cost_for(family,"unpriced-model-x",&summary);
         assert_eq!(cost.source,CostSource::Unknown,"{family:?}");assert!(cost.usd.is_nan());
     }
@@ -737,27 +737,6 @@ async fn tool_surface_violation_stops_without_retry_and_names_a_sanitised_tool()
     assert!(audit.contains("discovery_tool_surface_violation"),"violation must be audited");
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn antigravity_host_step_limit_bills_every_seen_generation() {
-    use serde_json::json;
-    let step=|index:u64,state:&str,kind:&str,extra:serde_json::Value| {
-        let mut step=json!({"step_index":index,"state":state,"step_type":kind});
-        for (k,v) in extra.as_object().unwrap() { step[k]=v.clone(); }
-        json!({"event":"step_update","step_update":step})
-    };
-    let usage=|i:u64,o:u64|json!({"usage":{"input_tokens":i,"output_tokens":o,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":i+o}});
-    let events=[json!({"event":"init","init":{"cwd":"/w","tools":["run_command"],"model":"gemini-3.8-flash-high"}}),
-        step(1,"DONE","agent_response",usage(100,10)),
-        step(2,"ACTIVE","tool",json!({"tool_name":"write_to_file"})),step(2,"DONE","tool",json!({"tool_name":"write_to_file"})),
-        step(3,"ACTIVE","agent_response",json!({"text_delta":"more"})),step(3,"DONE","agent_response",usage(50,5))];
-    let (_dir,runner,request,_budget)=scripted_container("antigravity","gemini","fake-key",&events,1).await;
-    let outcome=runner.run_attempt(&request).await.unwrap();
-    assert_eq!(outcome.runtime,"antigravity");assert_eq!(outcome.model,"gemini-3.8-flash-high");
-    assert_eq!((outcome.cost.input_tokens,outcome.cost.output_tokens),(150,15),"the stopping generation is billed too");
-    assert_eq!(outcome.final_text,"more");
-    assert_eq!(outcome.cost.usd_source,CostSource::Unknown,"an unpriced non-Claude model is not estimated with Claude prices");
-}
 
 #[cfg(unix)]
 #[tokio::test]
@@ -903,26 +882,29 @@ async fn supervisor_setup_failure_is_a_spawn_error_without_retry() {
     assert_eq!(read_lines(&dir,"starts").len(),1);assert_eq!(budget.snapshot().agent_calls,1);
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn antigravity_forbidden_tool_still_active_at_stream_end_is_a_violation() {
-    use serde_json::json;
-    let stream=[json!({"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"search_web","tool_info":{"name":"search_web"}}})]
-        .iter().map(|e|e.to_string()+"\n").collect::<String>();
-    let (_dir,runner,request,_budget)=scripted("antigravity","gemini",&[("test",false,"k")],&stream,"exit 0",3).await;
-    assert_eq!(runner.run_attempt(&request).await.err(),Some(AttemptInfraError::ToolSurfaceViolation {runtime:"antigravity".into(),tool:"search_web".into()}));
-}
 
-/// A configured legacy Gemini CLI attempt cannot run after runtime removal.
+/// Removed runtime selections and stale image entries fail before spawning.
 #[test]
-fn discovery_gemini_attempt_runtime_is_refused() {
+fn discovery_removed_attempt_runtimes_are_refused() {
+    let image = super::super::config::AttemptRuntimeConfig {
+        image:format!("test@sha256:{}","a".repeat(64)),
+        executable:"/opt/runtime".into(),base_url:None,provider:None,
+    };
     let mut attempt=AttemptSettings {sandbox:AttemptSandbox::Container,..Default::default()};
-    for name in ["gemini","codex"] {
-        attempt.runtimes.insert(name.into(),super::super::config::AttemptRuntimeConfig {
-            image:format!("test@sha256:{}","a".repeat(64)),executable:format!("/opt/{name}").into(),base_url:None,provider:None,
-        });
-    }
+    attempt.runtimes.insert("codex".into(), image.clone());
     assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").is_ok());
-    assert!(matches!(AttemptRunnerFactory::check_runtime_capability(&attempt,"gemini"),
-        Err(AttemptInfraError::RuntimeUnsupported(_))));
+    for id in ["gemini", "antigravity", "agy"] {
+        let error = AttemptRunnerFactory::check_runtime_capability(&attempt,id).unwrap_err().to_string();
+        assert!(error.contains("removed") && error.contains("choose a supported runtime"), "{error}");
+        attempt.runtimes.insert(id.into(), image.clone());
+        let error = AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").unwrap_err().to_string();
+        assert!(error.contains("config.toml") && error.contains("removed"), "{error}");
+        attempt.runtimes.remove(id);
+    }
+    for id in ["antigravity", "agy"] {
+        attempt.runtimes.get_mut("codex").unwrap().provider = Some(id.into());
+        assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").unwrap_err().to_string().contains("removed"));
+    }
+    attempt.runtimes.get_mut("codex").unwrap().provider = Some("gemini".into());
+    assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").is_ok());
 }

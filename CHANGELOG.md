@@ -2,9 +2,20 @@
 
 ## [Unreleased]
 
+### Removed
+
+- Antigravity（`agy`）runtime 已從 runtime 目錄、執行路徑、Dashboard 選項與 Docker 安裝中移除，沒有預告期。仍設定 `antigravity` 的員工、judge、團隊角色或全域輔助後端（`config.toml [runtime] utility_provider`）會被拒絕執行，需改選其他 runtime 與模型；系統不會自動改用其他廠商。`gemini-*` 模型不再對應任何 CLI runtime。Gemini API provider 與 `GEMINI_API_KEY` 繼續支援。先前留在本機的 `~/.gemini/antigravity-cli/` 設定與寫入 agy 設定檔的權限規則不會自動刪除，可自行清理。
+- `docker-compose.yml` 與 `Dockerfile.server` 不再掛載 `.gemini` volume；既有部署留下的舊 volume 不會自動刪除，確認不再需要後可自行移除。
+
 ### Fixed
 
 - 既有工作流程授權含購買或刪除工具，或授權內容無效、損毀、已撤銷或遺失時，gateway 開機對帳只把該工作流程標為失敗、停用它的排程並記下原因，其餘工作流程照常處理。授權帳本讀取失敗（資料庫忙碌、鎖定、讀寫錯誤、資料表不存在）不再把每一個工作流程標成失敗，而是停止該階段並讓這次開機對帳失敗；其他階段仍會執行。停用排程寫入失敗時，該工作流程仍標為失敗，後面的項目繼續處理。對帳日誌只記固定原因代碼與最多 120 字的工具名稱，錯誤最多保留 200 筆並記下省略的筆數。
+
+### Security
+
+- Codex 員工在預設沙箱下不能再改寫自己的 `agent.toml`、`SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、`.mcp.json` 與 CLI 設定目錄及設定檔；Team-as-Agent 成員的暫存身分目錄與實際工作目錄也同樣受保護。需要 Codex CLI 0.164.0 以上，較舊版本或無法確認版本時會拒絕執行，儀表板會向 Admin 顯示一鍵更新，更新後不必重啟閘道。設定仍可透過 `agent_update` 與儀表板修改。Grok 與其他 CLI runtime、Windows 尚未涵蓋。
+
+- `agent.toml` 或 `config.toml` 無法讀取或解析時，現在會拒絕執行並顯示檔案名稱與原因，避免設定損壞後改用預設值、讓工作轉到其他廠商。只有受影響的目標會暫停等待決定，其他目標繼續執行。檔案確實不存在時維持原有行為。
 
 ## [1.77.0] - 2026-10-30 — 資料外送防護、目標費用上限、單次執行時限與權限收緊
 

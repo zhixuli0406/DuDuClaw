@@ -1,31 +1,31 @@
 //! Discovery-specific runtime contracts, separate from interactive runtimes.
-//! Evidence: local `claude --help`, `codex exec --help`, `agy --help`, `grok --help`;
+//! Evidence: local `claude --help`, `codex exec --help`, `grok --help`;
 //! real event captures in commercial/research/release-live-validation-2026-10-01-evidence/runtime-parity;
 //! https://code.claude.com/docs/en/cli-reference
 //! https://developers.openai.com/codex/config-reference
 //! Design: commercial/docs/specs/DESIGN-discovery-runtime-parity-2026-10.md (§2, §5, §6, §7).
-use std::{collections::{BTreeMap, BTreeSet}, path::Path};
+use std::{collections::BTreeMap, path::Path};
 use serde_json::{Value, json};
 use super::contracts::AttemptInfraError;
-use super::attempt_guard::{ANTIGRAVITY_TOOLS, GROK_DISALLOWED_TOOLS, GROK_TOOLS};
+use super::attempt_guard::{GROK_DISALLOWED_TOOLS, GROK_TOOLS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeFamily {
     Claude,
     Codex,
-    Antigravity,
     Grok,
     OpenAiCompat,
 }
 impl RuntimeFamily {
     pub fn parse(name: &str) -> Result<Self, AttemptInfraError> {
+        if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(name) {
+            return Err(AttemptInfraError::RuntimeUnsupported(removed.refusal("discovery attempt runtime")));
+        }
         match name {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "openai-compat" | "openai_compat" => Ok(Self::OpenAiCompat),
-            // Tool surface and step ceiling are enforced on the host
-            // (attempt_guard); agy's hook is the second line.
-            "antigravity" | "agy" => Ok(Self::Antigravity), "grok" => Ok(Self::Grok),
+            "grok" => Ok(Self::Grok),
             _ => Err(AttemptInfraError::RuntimeUnsupported(name.into())),
         }
     }
@@ -33,7 +33,6 @@ impl RuntimeFamily {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Antigravity => "antigravity",
             Self::Grok => "grok",
             Self::OpenAiCompat => "openai-compat",
         }
@@ -42,12 +41,11 @@ impl RuntimeFamily {
         match self {
             Self::Claude => "anthropic",
             Self::Codex | Self::OpenAiCompat => "openai",
-            Self::Antigravity => "gemini",
             Self::Grok => "xai",
         }
     }
     /// True when no native step ceiling exists and the host counts steps.
-    pub fn host_counted_steps(self) -> bool { matches!(self, Self::Codex|Self::Antigravity) }
+    pub fn host_counted_steps(self) -> bool { matches!(self, Self::Codex) }
     pub fn argv(self, model: &str, turns: u32, node: &Path) -> Vec<String> {
         match self {
             Self::Claude => {
@@ -76,10 +74,6 @@ impl RuntimeFamily {
                 "--permission-mode".into(),"bypassPermissions".into(),"--tools".into(),GROK_TOOLS.join(","),
                 "--disallowed-tools".into(),GROK_DISALLOWED_TOOLS.join(","),
                 "--disable-web-search".into(),"--no-subagents".into(),"--no-plan".into(),"--no-auto-update".into()],
-            // No cwd flag: the container --workdir is the node. Prompt arrives on stdin.
-            Self::Antigravity => vec!["--print".into(),String::new(),"--input-format".into(),"stream-json".into(),
-                "--output-format".into(),"stream-json".into(),"--dangerously-skip-permissions".into(),
-                "--disable-slash-commands".into(),"--model".into(),model.into()],
             Self::OpenAiCompat => vec!["-I".into(),"-S".into(),"-B".into(),"-c".into(),
                 include_str!("python/attempt_openai_compat.py").into(), model.into(),turns.to_string()],
         }
@@ -88,39 +82,21 @@ impl RuntimeFamily {
 
 /// Fixed in-container paths. HOME is a private tmpfs directory.
 pub const PRIVATE_HOME: &str = "/tmp/dudu-private/home";
-const AGY_GUARD_TEMPLATE: &str = include_str!("python/agy_tool_guard.py");
-const AGY_ALLOWLIST_SLOT: &str = "__DUDU_ALLOWED_TOOLS_JSON__";
 
 /// Host-written files for the read-only `/dudu-runtime` directory, beyond
 /// `empty-mcp.json`. Paths are relative to that directory.
-pub fn runtime_files(family: RuntimeFamily, node: &Path, _turns: u32, prompt: &str) -> Vec<(String, Vec<u8>)> {
+pub fn runtime_files(family: RuntimeFamily, prompt: &str) -> Vec<(String, Vec<u8>)> {
     match family {
         RuntimeFamily::Grok => vec![("prompt.txt".into(), prompt.as_bytes().to_vec())],
-        RuntimeFamily::Antigravity => {
-            let hook = "python3 -I -S -B /dudu-runtime/agy_tool_guard.py";
-            let hooks = json!({"dudu-tool-surface":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":hook,"timeout":10}]}]}});
-            let settings = json!({"modelProvider":"gemini","trustedWorkspaces":[node.to_string_lossy()]});
-            vec![("agy_tool_guard.py".into(), agy_guard_script().into_bytes()),
-                ("home-seed/.gemini/antigravity-cli/settings.json".into(), settings.to_string().into_bytes()),
-                ("home-seed/.gemini/config/hooks.json".into(), hooks.to_string().into_bytes())]
-        }
         _ => vec![],
     }
 }
 
-/// The hook script with [`ANTIGRAVITY_TOOLS`] rendered in: one source of truth.
-pub fn agy_guard_script() -> String {
-    AGY_GUARD_TEMPLATE.replacen(AGY_ALLOWLIST_SLOT, &json!(ANTIGRAVITY_TOOLS).to_string(), 1)
-}
 
 /// Bytes written to the CLI's stdin. Grok reads `--prompt-file` instead.
 pub fn stdin_payload(family: RuntimeFamily, prompt: &str) -> Vec<u8> {
     match family {
         RuntimeFamily::Grok => Vec::new(),
-        RuntimeFamily::Antigravity => {
-            let mut line = json!({"event":"user","message":{"content":prompt}}).to_string().into_bytes();
-            line.push(b'\n'); line
-        }
         _ => prompt.as_bytes().to_vec(),
     }
 }
@@ -129,7 +105,6 @@ fn credential_keys(family: RuntimeFamily) -> &'static [&'static str] {
     match family {
         RuntimeFamily::Claude => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
         RuntimeFamily::Codex | RuntimeFamily::OpenAiCompat => &["OPENAI_API_KEY"],
-        RuntimeFamily::Antigravity => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         RuntimeFamily::Grok => &["XAI_API_KEY"],
     }
 }
@@ -177,7 +152,6 @@ pub fn is_secret_env(key: &str) -> bool {
         || [
             RuntimeFamily::Claude,
             RuntimeFamily::Codex,
-            RuntimeFamily::Antigravity,
             RuntimeFamily::Grok,
             RuntimeFamily::OpenAiCompat,
         ]
@@ -225,28 +199,13 @@ pub fn observed_model_id(value: &str) -> Option<&str> {
 pub struct StreamAdapter {
     text: String,
     model: Option<String>,
-    steps: BTreeMap<u64, String>,
-    settled: BTreeSet<u64>,
-    usage_input: u64,
-    usage_output: u64,
-    usage_cache: u64,
-    usage_complete: bool,
-    last_text: String,
 }
 impl StreamAdapter {
-    /// The model the provider stream reported (Grok, Antigravity), filtered.
+    /// The model the provider stream reported (Grok), filtered.
     pub fn observed_model(&self) -> Option<&str> { self.model.as_deref() }
-    fn observe_model(&mut self, value: &Value) {
-        if let Some(model) = value.as_str().and_then(observed_model_id) { self.model = Some(model.to_owned()); }
-    }
-    /// The run was stopped at the host step ceiling. agy: every generation's
-    /// usage is in the stream, so the sum is complete. Codex reports usage only
-    /// per turn, so it stays unknown (null); its text is the last agent message.
+    /// Codex reports usage only per turn, so a host step limit has unknown usage.
     pub fn synthetic_result(&self) -> Value {
-        let usage = (self.usage_complete && !self.settled.is_empty()).then(||json!({"input_tokens":self.usage_input,
-            "output_tokens":self.usage_output,"cache_read_input_tokens":self.usage_cache}));
-        let text = if self.last_text.is_empty() { &self.text } else { &self.last_text };
-        json!({"type":"result","subtype":"step_limit","result":text,"usage":usage,"is_error":false})
+        json!({"type":"result","subtype":"step_limit","result":self.text,"usage":null,"is_error":false})
     }
     pub fn normalize(&mut self, family:RuntimeFamily, event:Value) -> Value {
         match family {
@@ -264,7 +223,6 @@ impl StreamAdapter {
                 }
                 event
             }
-            RuntimeFamily::Antigravity=>self.antigravity(event),
             RuntimeFamily::Codex=>match event["type"].as_str() {
                 Some("item.completed") if event["item"]["type"].as_str()==Some("agent_message") => {
                     self.text=event["item"]["text"].as_str().unwrap_or("").into();
@@ -282,62 +240,6 @@ impl StreamAdapter {
                 Some("turn.failed")|Some("error")=>json!({"type":"result","is_error":true,"error":event["error"],"errors":event["message"]}),
                 _=>json!({"type":"system"}),
             },
-        }
-    }
-    /// agy 1.2.14: `input_tokens` excludes cache reads, `thinking_tokens` is
-    /// already inside `output_tokens`.
-    fn agy_usage(usage: &Value) -> Option<(u64, u64, u64)> {
-        Some((usage["input_tokens"].as_u64()?, usage["output_tokens"].as_u64()?, usage["cache_read_tokens"].as_u64().unwrap_or(0)))
-    }
-    fn antigravity(&mut self, event: Value) -> Value {
-        match event["event"].as_str() {
-            Some("init") => { self.observe_model(&event["init"]["model"]); json!({"type":"system","subtype":"init"}) }
-            Some("step_update") => {
-                let step = &event["step_update"];
-                let state = step["state"].as_str();
-                match step["step_type"].as_str() {
-                    Some("tool") if state==Some("ACTIVE") => {
-                        let name = step["tool_name"].as_str().or_else(||step["tool_info"]["name"].as_str()).unwrap_or("");
-                        json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":name}]}})
-                    }
-                    Some("agent_response") => {
-                        let Some(index) = step["step_index"].as_u64() else { return json!({"type":"system"}) };
-                        if self.settled.contains(&index) { return json!({"type":"system"}); }
-                        let text = self.steps.entry(index).or_default();
-                        text.push_str(step["text_delta"].as_str().unwrap_or(""));
-                        let text = text.clone();
-                        if state != Some("DONE") { return json!({"type":"system"}); }
-                        self.settled.insert(index);
-                        if !text.trim().is_empty() { self.last_text = text.clone(); }
-                        let Some((input, output, cache)) = Self::agy_usage(&step["usage"]) else {
-                            self.usage_complete = false;
-                            return json!({"type":"system"});
-                        };
-                        if self.settled.len() == 1 { self.usage_complete = true; }
-                        self.usage_input = self.usage_input.saturating_add(input);
-                        self.usage_output = self.usage_output.saturating_add(output);
-                        self.usage_cache = self.usage_cache.saturating_add(cache);
-                        let mut message = json!({"id":format!("step-{index}"),"content":[{"type":"text","text":text}],
-                            "usage":{"input_tokens":input,"output_tokens":output,"cache_read_input_tokens":cache}});
-                        if let Some(model) = &self.model { message["model"] = json!(model); }
-                        json!({"type":"assistant","message":message})
-                    }
-                    Some("error_message") => {
-                        let mut detail = step.clone();
-                        if let Some(fields) = detail.as_object_mut() { fields.remove("conversation_id"); }
-                        json!({"type":"error","message":detail})
-                    }
-                    _ => json!({"type":"system"}),
-                }
-            }
-            Some("result") => {
-                let result = &event["result"];
-                let usage = Self::agy_usage(&result["usage"]).map(|(input, output, cache)|
-                    json!({"input_tokens":input,"output_tokens":output,"cache_read_input_tokens":cache}));
-                json!({"type":"result","result":result["response"],"usage":usage,
-                    "is_error":result["status"].as_str()!=Some("SUCCESS"),"error":result["error"]})
-            }
-            _ => json!({"type":"system"}),
         }
     }
 }

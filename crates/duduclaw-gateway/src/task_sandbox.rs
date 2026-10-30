@@ -100,7 +100,7 @@ impl Unavailable {
         let text = match self {
             Self::InvalidConfig(why) => format!("the sandbox configuration is invalid: {why}"),
             Self::UnsupportedRuntime(runtime) => format!(
-                "runtime `{runtime}` cannot run in the task sandbox (supported: claude, codex, antigravity, grok, openai_compat)"
+                "runtime `{runtime}` cannot run in the task sandbox (supported: claude, codex, grok, openai_compat)"
             ),
             Self::NetworkDisabled => {
                 "the AI inside the sandbox must reach its model provider, but this agent has \
@@ -279,7 +279,6 @@ pub fn family_for(runtime: RuntimeType) -> Option<RuntimeFamily> {
     match runtime {
         RuntimeType::Claude => Some(RuntimeFamily::Claude),
         RuntimeType::Codex => Some(RuntimeFamily::Codex),
-        RuntimeType::Antigravity => Some(RuntimeFamily::Antigravity),
         RuntimeType::Grok => Some(RuntimeFamily::Grok),
         RuntimeType::OpenAiCompat => Some(RuntimeFamily::OpenAiCompat),
         _ => None,
@@ -297,7 +296,6 @@ pub fn accepted_credentials(family: RuntimeFamily, provider: &str) -> String {
         RuntimeFamily::Codex => {
             "an OpenAI API key, or an OAuth account whose secret is a Codex auth.json".into()
         }
-        RuntimeFamily::Antigravity => "a Gemini API key".into(),
         RuntimeFamily::Grok => {
             "an xAI API key, or an OAuth account whose secret is a Grok auth.json".into()
         }
@@ -366,7 +364,7 @@ fn collect_strings(value: &Value, out: &mut Vec<String>) {
 }
 
 /// Replace every secret value with `<redacted>`, longest first, then anything
-/// shaped like a Google API key (generalises the Antigravity setup rule).
+/// shaped like a Google API key.
 /// Apply BEFORE truncating, so a cut never leaves a recognisable prefix.
 pub fn redact(text: &str, secrets: &[String]) -> String {
     static GOOGLE_KEY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -449,10 +447,10 @@ pub async fn dispatch(
             account_pool: agent.config.model.account_pool.clone(),
         }
     };
-    if crate::runtime_config::ensure_active_agent_provider(&spec.agent_dir).is_err() {
+    if let Err(error) = crate::runtime_config::ensure_active_agent_provider(&spec.agent_dir) {
         return SandboxDispatch::Completed(Err(SandboxFailure::failed(
             failure_code::REMOVED_RUNTIME,
-            "agent.toml selects the removed Gemini CLI runtime; choose a supported runtime and model",
+            error,
         )));
     }
     let runtime_settings = crate::runtime_config::load_runtime_settings(&spec.agent_dir);
@@ -776,7 +774,7 @@ async fn execute(
     {
         argv.extend(["--disallowedTools".into(), denied]);
     }
-    let files = adapter::runtime_files(family, workspace, settings.max_turns, &prompt);
+    let files = adapter::runtime_files(family, &prompt);
     container::write_config(&dir.config, settings.max_turns, &files).map_err(|e| {
         failed_with(
             failure_code::WORKSPACE_FAILED,
@@ -894,14 +892,6 @@ async fn execute(
         true
     })
     .await;
-    // Every exit path consults the guard's final verdict: a forbidden tool
-    // still pending when the step limit, a rate limit, an overflow or a
-    // transport failure ended the stream is still a violation.
-    if !matches!(stop, Some(StopCause::ToolViolation(_)))
-        && let GuardVerdict::ToolViolation { tool } = guard.finish()
-    {
-        stop = Some(StopCause::ToolViolation(tool));
-    }
     let summary = parse_stream(&transcript);
     record_usage(spec, family, model, &summary).await;
     if let Some(StopCause::ToolViolation(tool)) = &stop {
@@ -1202,6 +1192,40 @@ fn sandbox_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
 
 #[cfg(test)]
 mod instructions_slot_tests {
+    #[tokio::test]
+    async fn removed_runtime_refusal_never_falls_back_to_unsandboxed_execution() {
+        use super::*;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[container.sandbox]\nwhen_unavailable = \"run_unsandboxed\"\n").unwrap();
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            for field in ["provider", "fallback"] {
+                let mut config: duduclaw_core::types::AgentConfig = toml::from_str(
+                    include_str!("../../../templates/evaluator/agent.toml")
+                ).unwrap();
+                config.agent.name = "worker".into();
+                if field == "provider" {
+                    config.runtime.provider = Some(removed.id.into());
+                } else {
+                    config.runtime.fallback = Some(removed.id.into());
+                }
+                std::fs::write(dir.join("agent.toml"), toml::to_string(&config).unwrap()).unwrap();
+                let mut registry = AgentRegistry::new(home.path().join("agents"));
+                registry.scan().await.unwrap();
+                let registry = Arc::new(RwLock::new(registry));
+                let result = dispatch(home.path(), &registry, "worker", "must not execute").await;
+                let SandboxDispatch::Completed(Err(failure)) = result else {
+                    panic!("a removed runtime must terminate dispatch");
+                };
+                assert_eq!(failure.code, failure_code::REMOVED_RUNTIME);
+                assert!(failure.message.contains(removed.removed_in), "{failure:?}");
+                assert!(!failure.message.contains(&home.path().display().to_string()), "{failure:?}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn sandbox_prompt_carries_instructions_after_identity() {
         let tmp = tempfile::tempdir().unwrap();

@@ -2,20 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { extractAuthUrl } from './cli-auth-url';
 
 /**
- * One realistic (ANSI-stripped) login transcript per runtime the dashboard can
- * drive, asserting the link the user is offered.
+ * ANSI-stripped login transcripts and synthetic OAuth fixtures, asserting
+ * the link the user is offered.
  *
  * Provenance of the samples:
  *  - claude / grok: the shapes documented in `cli_auth.rs` `spec_for()` (grok's
  *    device-code wording was captured live there against grok 0.2.111).
  *  - codex / gemini: localhost-callback flows — the point of the sample is the
  *    "listening on …" line that precedes the real URL.
- *  - antigravity: reconstructed from the URL constants inside the shipped `agy`
- *    1.1.10 binary (`accounts.google.com/o/oauth2/auth`,
- *    `antigravity.google/oauth-callback`, `antigravity.google/auth-success`,
- *    `antigravity.google/docs`). The interactive TUI could not be captured
- *    headlessly, so the ORDER of the lines is representative rather than
- *    verbatim — which is precisely why the extractor must not depend on order.
+ *  - generic OAuth: synthetic callback, consent and documentation URLs.
  */
 
 describe('extractAuthUrl', () => {
@@ -66,32 +61,32 @@ describe('extractAuthUrl', () => {
     expect(extractAuthUrl(out)).toBe(url);
   });
 
-  it('antigravity (agy): takes the Google consent URL, not the oauth-callback endpoint', () => {
+  it('generic OAuth: takes the Google consent URL, not the oauth-callback endpoint', () => {
     // The regression: `oauth-callback` is printed FIRST and contains "oauth",
     // so first-match-wins handed the user a dead link.
     const consent =
-      'https://accounts.google.com/o/oauth2/auth?client_id=974169037036.apps.googleusercontent.com&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Faicode&state=8f21';
+      'https://accounts.google.com/o/oauth2/auth?client_id=example-client&redirect_uri=https%3A%2F%2Flogin.example.com%2Foauth-callback&response_type=code&scope=openid&state=8f21';
     const out = [
-      'Sign in to Antigravity',
+      'Sign in to Example CLI',
       '',
-      'Listening for the callback at https://antigravity.google/oauth-callback',
+      'Listening for the callback at https://login.example.com/oauth-callback',
       'Opening your browser…',
       'If it did not open, visit:',
       consent,
       '',
-      'After approving you will land on https://antigravity.google/auth-success',
-      'Docs: https://antigravity.google/docs',
+      'After approving you will land on https://login.example.com/auth-success',
+      'Docs: https://login.example.com/docs',
     ].join('\n');
     expect(extractAuthUrl(out)).toBe(consent);
   });
 
-  it('antigravity (agy): order-independent — consent URL first still wins', () => {
+  it('generic OAuth: order-independent — consent URL first still wins', () => {
     const consent =
-      'https://accounts.google.com/o/oauth2/auth?client_id=974169037036.apps.googleusercontent.com&response_type=code&state=8f21';
+      'https://accounts.google.com/o/oauth2/auth?client_id=example-client&response_type=code&state=8f21';
     const out = [
       consent,
-      'Waiting for https://antigravity.google/oauth-callback …',
-      'Terms: https://antigravity.google/terms',
+      'Waiting for https://login.example.com/oauth-callback …',
+      'Terms: https://login.example.com/terms',
     ].join('\n');
     expect(extractAuthUrl(out)).toBe(consent);
   });
@@ -104,17 +99,17 @@ describe('extractAuthUrl', () => {
 
   it('ignores a docs link even when it carries tracking parameters', () => {
     const consent =
-      'https://accounts.google.com/o/oauth2/auth?client_id=974169037036.apps.googleusercontent.com&response_type=code&state=8f21';
-    const out = [consent, 'Learn more: https://antigravity.google/docs/auth?utm_source=cli&scope=all'].join('\n');
+      'https://accounts.google.com/o/oauth2/auth?client_id=example-client&response_type=code&state=8f21';
+    const out = [consent, 'Learn more: https://login.example.com/docs/auth?utm_source=cli&scope=all'].join('\n');
     expect(extractAuthUrl(out)).toBe(consent);
   });
 
   it('ignores the callback echo the CLI prints after the browser redirects back', () => {
     const consent =
-      'https://accounts.google.com/o/oauth2/auth?client_id=974169037036.apps.googleusercontent.com&response_type=code&state=8f21';
+      'https://accounts.google.com/o/oauth2/auth?client_id=example-client&response_type=code&state=8f21';
     const out = [
       consent,
-      'Received https://antigravity.google/oauth-callback?code=4/0AbCd&scope=openid&state=8f21',
+      'Received https://login.example.com/oauth-callback?code=4/0AbCd&scope=openid&state=8f21',
     ].join('\n');
     expect(extractAuthUrl(out)).toBe(consent);
   });
@@ -140,7 +135,7 @@ describe('extractAuthUrl', () => {
   });
 
   it('falls back to a shape match when no URL carries parameters', () => {
-    const out = ['See https://antigravity.google/docs', 'Authorize at https://auth.example.com/authorize'].join('\n');
+    const out = ['See https://login.example.com/docs', 'Authorize at https://auth.example.com/authorize'].join('\n');
     expect(extractAuthUrl(out)).toBe('https://auth.example.com/authorize');
   });
 
@@ -151,8 +146,8 @@ describe('extractAuthUrl', () => {
   it('never returns a docs link when that is all there is to choose from', () => {
     // Only non-destinations present: still returns something rather than
     // pretending, but the caller only renders it while a login is running.
-    expect(extractAuthUrl('Docs: https://antigravity.google/docs')).toBe(
-      'https://antigravity.google/docs',
+    expect(extractAuthUrl('Docs: https://login.example.com/docs')).toBe(
+      'https://login.example.com/docs',
     );
   });
 });

@@ -984,10 +984,28 @@ impl GoalLoopDriver {
                 continue;
             }
             // P2-A: a durable round always runs Solo on the fixed-id rail.
-            let (team_dispatch, gate_inputs_json) = if durable.is_some() {
-                (None, None)
+            let team_result = if durable.is_some() {
+                crate::team_composer::check_team_dispatchable(&self.home_dir, &task.assigned_to)
+                    .map_err(enqueue::TeamDispatchError::ConfigRefused)
+                    .and_then(|()| enqueue::check_frozen_team_runtime(task))
+                    .map(|()| (None, None))
             } else {
                 self.try_team_dispatch(task, next_iter, &state_text).await
+            };
+            let (team_dispatch, gate_inputs_json) = match team_result {
+                Ok(dispatch) => dispatch,
+                Err(enqueue::TeamDispatchError::ConfigRefused(detail)) => {
+                    self.escalate(
+                        &mut inflight,
+                        task,
+                        &detail,
+                        crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                    )
+                    .await?;
+                    active = inflight.len();
+                    continue;
+                }
+                Err(enqueue::TeamDispatchError::Infrastructure(error)) => return Err(error),
             };
             // Freeze the same title/description/criteria classifier the
             // difficulty-scaled guard used for this actual dispatch.

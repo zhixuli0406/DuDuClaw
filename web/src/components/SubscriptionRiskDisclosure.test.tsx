@@ -31,7 +31,6 @@ describe('SubscriptionRiskDisclosure', () => {
   it.each([
     ['openai', /Sign in with ChatGPT terms/, 'https://openai.com/policies/sign-in-with-chatgpt-terms/', /official Sign in with ChatGPT program/],
     ['gemini', /Gemini CLI terms of service/, 'https://geminicli.com/docs/resources/tos-privacy/', /no longer accepts Login with Google/],
-    ['antigravity', /Google Antigravity terms/, 'https://antigravity.google/terms', /breach of the agreement/],
     ['xai', /xAI Terms of Service/, 'https://x.ai/legal/terms-of-service', /SuperGrok or X Premium\+ subscription is unclear/],
   ] as const)('shows %s its own vendor terms, not Anthropic text', (vendor, linkName, href, policy) => {
     renderWithProviders(<SubscriptionRiskDisclosure checked={false} onCheckedChange={vi.fn()} vendor={vendor} />);
@@ -69,7 +68,6 @@ describe('subscription risk copy', () => {
     'subscriptionRisk.others',
     'subscriptionRisk.vendor.openai.policy',
     'subscriptionRisk.vendor.gemini.policy',
-    'subscriptionRisk.vendor.antigravity.policy',
     'subscriptionRisk.vendor.xai.policy',
     'subscriptionRisk.vendor.other.policy',
     'subscriptionRisk.generic.conflicts',

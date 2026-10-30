@@ -9,6 +9,12 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 ゴール費用と連続呼び出しのガードは現在「設定ファイルの詳細編集」で設定し、自動化の専用コントロールはありません。`config.toml [goal_loop]` の `default_cost_cap_cents = 0` は個別上限のないゴールの既定上限（米セント、`0`＝上限なし）、`tool_streak_pause = 8` は終了した1ラウンド内の同一ツール・同一引数の連続呼び出しによる停止回数（`0`＝無効）です。詳細編集で保存するとゴールループが再読み込みされます。`config.toml` を直接編集した場合は gateway を再起動してください。`tool_streak_advisory` は既存ヒントを独立して制御します。個別上限はゴールの依頼時に指定できます。`/goals` は費用を表示し、権限のある操作者が一時停止ゴールの上限を引き上げて再試行できます。
 
 
+## Codex CLI の更新
+
+macOS と Linux で、通常の従業員を WorkspaceWrite 権限で実行するには Codex CLI 0.164.0 以降が必要です。インストール済みのバージョンが古い、または確認できない場合、Admin には各ページ上部に現在のバージョンと「**Codex CLI を更新**」ボタンが表示されます。押すとゲートウェイのパソコンで `npm install -g @openai/codex` を実行し、進行状況を表示します。更新を確認すると通知は消え、ゲートウェイの再起動は不要です。
+
+npm がない場合やインストールに失敗した場合は、手動コマンドとコピーボタンを表示します。Homebrew などの古い実行ファイルが優先される場合はそのパスを表示します。そのバージョンを更新または削除してから、再検出してください。バージョンを確認できない場合も成功とは区別して表示します。Windows はこの要件の対象外です。
+
 ## 保存の共通ルール
 
 - システム設定（`config.toml`）は `system.update_config` で書き込まれ、管理者だけが使えます。ページは変更した項目だけを送ります。変更がなければ何も送りません。
@@ -50,7 +56,7 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | ローカルファイルのフォルダ | `[files] allowed_roots`（完全パス、ファイルシステムのルートは不可、最大 64） | 即時 |
 | シークレット管理 → 詳細設定：シークレットバックエンド | 1Password：`onepassword_host`、`onepassword_vault`、アクセストークン。Infisical：`infisical_addr`、`infisical_project_id`、`infisical_environment`、アクセストークン。トークンは `*_enc` として暗号化保存 | 再起動の報告なし |
 
-担当エージェントのないグローバル処理（担当者の選択、マスキングルールの作成など）の既定は Claude / `claude-haiku-4-5` です。対応するプロバイダーと互換モデルを指定してください。削除済みの `gemini` や不明な値はサーバーが拒否します。モデルを空にするとキーを削除します。Claude は `claude-haiku-4-5` を使い、OpenAI 互換エンドポイントはモデルの指定が必要です。Codex も制限モードで実行でき、モデルが空白なら CLI の既定値を使います。Grok、Antigravity、汎用 CLI は設定を保存できても実行時に拒否します。Claude 以外のプロバイダーで既知の別ベンダーのモデルを入力すると、画面に警告を表示します。保存は管理者専用で既存の設定保存経路を使います。選択したプロバイダーが Claude で、Claude のエージェントがいない場合は警告を表示します。Claude のログイン状態を確認する機能ではありません。
+担当エージェントのないグローバル処理（担当者の選択、マスキングルールの作成など）の既定は Claude / `claude-haiku-4-5` です。対応するプロバイダーと互換モデルを指定してください。削除済みの `gemini` や不明な値はサーバーが拒否します。モデルを空にするとキーを削除します。Claude は `claude-haiku-4-5` を使い、OpenAI 互換エンドポイントはモデルの指定が必要です。Codex も制限モードで実行でき、モデルが空白なら CLI の既定値を使います。Grok、汎用 CLI は設定を保存できても実行時に拒否します。Claude 以外のプロバイダーで既知の別ベンダーのモデルを入力すると、画面に警告を表示します。保存は管理者専用で既存の設定保存経路を使います。選択したプロバイダーが Claude で、Claude のエージェントがいない場合は警告を表示します。Claude のログイン状態を確認する機能ではありません。
 
 `[general] log_level`（日常 → 一般設定 → ログレベル）は保存するとすぐ反映されます。環境変数 `RUST_LOG` が設定されている場合だけ反映できず、再起動が必要と報告されます。アカウントのローテーション戦略とレート制限のクールダウンを保存するとローテーションのキャッシュが消え、次の呼び出しから新しい値が使われます（以前は最大 30 分遅れることがありました）。
 
@@ -106,8 +112,8 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | 頭脳とエンジン → 推論の強さ | `[model] effort` |
 | 頭脳とエンジン → プロバイダー／フォールバック | `[runtime] provider`／`fallback`。qwen、kimi、copilot、kiro、cursor、vibe、opencode を追加 |
 | 頭脳とエンジン → 起動内容の簡素化 | `[runtime] minimal_context` |
-| 頭脳とエンジン → 1 回の実行時間の上限 | `[runtime] timeout_secs`：整数秒、既定 300、範囲 30〜3600。Codex／Grok／Antigravity／その他の CLI／OpenAI 互換 API に適用。Claude は別の固定 30 分上限 |
-| 頭脳とエンジン → ユーティリティモデル | `[model] utility`：Codex と OpenAI 互換 API は空白なら主モデルに従う。Claude の既定は `claude-haiku-4-5`。Grok、Antigravity、汎用 CLI はグローバルのバックグラウンド設定 |
+| 頭脳とエンジン → 1 回の実行時間の上限 | `[runtime] timeout_secs`：整数秒、既定 300、範囲 30〜3600。Codex／Grok／その他の CLI／OpenAI 互換 API に適用。Claude は別の固定 30 分上限 |
+| 頭脳とエンジン → ユーティリティモデル | `[model] utility`：Codex と OpenAI 互換 API は空白なら主モデルに従う。Claude の既定は `claude-haiku-4-5`。Grok、汎用 CLI はグローバルのバックグラウンド設定 |
 | 頭脳とエンジン → 1人の社員に4つの役割 | `[team] enabled`、`[team.roles.<役割>]` |
 | 自動化 → 夜間の整理 | `[night_engine] enabled` |
 | 連携 → 専用チャンネル（v1.76.0） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`。`agents.channels.*` で設定（管理者が設定、担当者は状態を確認可。[専用チャンネル](per-employee-channels.md)） |
@@ -115,13 +121,13 @@ v1.68.0 からダッシュボードで設定できる項目について、どの
 | 自動化 → 記憶 → 決定の継続、決定の保持日数 | `[memory] decision_continuity`、`decision_ttl_days`（1〜3650） |
 | 詳細設定 → モデル詳細設定 → 詳細キー／値 | 任意の `[セクション] キー`。各行に型（文字列、整数、小数、真偽値、文字列配列）を指定。書き込み前に `AgentConfig` 全体として解析し、失敗すると全体を拒否。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` セクションはここでは編集できません（v1.76.0：`prompt`、`os_watch`、`budget` を追加。`prompt.cli_bare_mode` など管理者専用のキーを含むため、管理者は設定ファイルの詳細編集で変更します） |
 
-1 回の実行時間の上限は、コンテナのタスクタイムアウトと別に保存します。サーバーは整数以外、または 30〜3600 秒の範囲外の値を拒否します。手動編集したファイルでは、範囲外の整数を境界に補正し、型が違う値には既定値を使い、どちらも警告を記録します。Antigravity の外側の最終上限には 30 秒を追加します。OpenAI 互換 API の社員は `utility` または `preferred` にモデルの指定が必要です。Codex は CLI の既定モデルも使えます。Grok、Antigravity、汎用 CLI はグローバルのバックグラウンド設定を使います。ユーティリティモデルとランタイムのベンダー系統が異なる場合、会話圧縮や事実抽出などのバックグラウンド処理が失敗する旨を画面に表示します。
+1 回の実行時間の上限は、コンテナのタスクタイムアウトと別に保存します。サーバーは整数以外、または 30〜3600 秒の範囲外の値を拒否します。手動編集したファイルでは、範囲外の整数を境界に補正し、型が違う値には既定値を使い、どちらも警告を記録します。OpenAI 互換 API の社員は `utility` または `preferred` にモデルの指定が必要です。Codex は CLI の既定モデルも使えます。Grok、汎用 CLI はグローバルのバックグラウンド設定を使います。ユーティリティモデルとランタイムのベンダー系統が異なる場合、会話圧縮や事実抽出などのバックグラウンド処理が失敗する旨を画面に表示します。
 
 `timeout_secs` の実効上限を増やすには管理者権限が必要です。Owner は上限を下げられます。設定を空にすると 300 秒に戻り、現在の実効上限より増える場合は管理者が必要です。
 
 Claude の補助呼び出しは CLI が使える認証情報で軽量パスを実行し、アカウントローテーションには入りません。通常の会話は既存のローテーションを維持します。
 
-分類と評価を含む補助呼び出しは、専用の実行モードを使います。Claude はツールなしの単一ターンの軽量パス、OpenAI 互換 API はツールなしの単一 completion を使い、ツールループには入りません。Codex は制限モードで実行します：読み取り専用サンドボックス、プラットフォームの MCP 設定を追加しない、毎回新規作成する所有者だけがアクセスできる空の一時作業ディレクトリ、ユーザー設定の無視、セッション保存なし。一時ディレクトリはエラーやタイムアウトを含め呼び出し終了後に削除します。システムプロンプトは prompt 内で渡し、`AGENTS.md` は書きません。Codex を明示した judge とチーム verifier も同じモードです。Grok、Antigravity、汎用 CLI は補助実行に非対応のため、社員のバックグラウンド処理はグローバルの補助プロバイダー／モデル（既定 Claude／`claude-haiku-4-5`）を使い、社員とランタイムの組み合わせごとに一度警告します。グローバルでは Claude、Codex、OpenAI 互換 API が使えます。非対応のグローバルプロバイダーや明示指定は拒否します。上位の評価処理が非対応の指定なしで再試行する場合も同じモードを適用します。Codex には内蔵の読み取りツールが残る可能性があります。残るリスクは[セキュリティ防御](../../features/ja-JP/05-security-defense.md)を参照してください。
+分類と評価を含む補助呼び出しは、専用の実行モードを使います。Claude はツールなしの単一ターンの軽量パス、OpenAI 互換 API はツールなしの単一 completion を使い、ツールループには入りません。Codex は制限モードで実行します：読み取り専用サンドボックス、プラットフォームの MCP 設定を追加しない、毎回新規作成する所有者だけがアクセスできる空の一時作業ディレクトリ、ユーザー設定の無視、セッション保存なし。一時ディレクトリはエラーやタイムアウトを含め呼び出し終了後に削除します。システムプロンプトは prompt 内で渡し、`AGENTS.md` は書きません。Codex を明示した judge とチーム verifier も同じモードです。Grok、汎用 CLI は補助実行に非対応のため、社員のバックグラウンド処理はグローバルの補助プロバイダー／モデル（既定 Claude／`claude-haiku-4-5`）を使い、社員とランタイムの組み合わせごとに一度警告します。グローバルでは Claude、Codex、OpenAI 互換 API が使えます。非対応のグローバルプロバイダーや明示指定は拒否します。上位の評価処理が非対応の指定なしで再試行する場合も同じモードを適用します。Codex には内蔵の読み取りツールが残る可能性があります。残るリスクは[セキュリティ防御](../../features/ja-JP/05-security-defense.md)を参照してください。
 
 **管理者だけが変更できる項目。** `[agent] reports_to`、`department`、`name`、`[capabilities]` 全体、`[container] sandbox_enabled`、`network_access`、`readonly_project`、`[permissions]` の 5 つのフラグ（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）と（v1.76.0）`[permissions] allowed_channels`、`[guardrails] enabled` と `block_secrets`、（v1.76）`[channels] public_trigger`、そして（v1.76.0）社員ごとの bot トークン `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、`[odoo]` 全体、`[runtime] provider` と `fallback`、`[prompt] cli_bare_mode`、`[os_watch]` 全体、`[model] account_pool`、`role = "main"` への変更とその解除、予算の緩和（`monthly_limit_cents` や `daily_cap_cents` の引き上げ、上限の撤廃（0 は上限なし）、`hard_stop` のオフ）。社員のオーナーは上限の追加や引き下げ、`hard_stop` のオンは引き続き行えます。管理者以外からの変更は拒否され、管理者による変更が成功すると監査イベント `agent_authority_changed` が、拒否された試みには `agent_authority_refused` が記録されます。モデルの変更で実行環境が自動的に切り替わる場合、管理者以外にはその旨が表示されます。`org.toml` は `reports_to` か `department` が実際に変わったときだけ更新されます。`agents.inspect` は対応するフォーム項目を `admin_only_fields` として返し、編集ページは管理者以外に対してそれらを無効にします。
 

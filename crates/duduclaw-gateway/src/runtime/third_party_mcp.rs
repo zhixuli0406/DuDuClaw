@@ -1,6 +1,6 @@
 //! An employee's third-party `.mcp.json` servers for runtimes that register
 //! MCP servers themselves instead of reading `.mcp.json` (2026-10-19 Codex,
-//! 2026-10-20 Grok, Antigravity, and the openai-compat / Direct-API / local
+//! 2026-10-20 Grok and the openai-compat / Direct-API / local
 //! tool loop).
 //!
 //! The runtime-agnostic half lives here; each runtime turns [`GatedServer`]s
@@ -8,8 +8,6 @@
 //!
 //! - Codex: `-c` overrides + `.codex/config.toml` (`codex/third_party.rs`);
 //! - Grok: `<cwd>/.grok/config.toml` (`grok/third_party.rs`);
-//! - Antigravity: `<cwd>/.agents/mcp_config.json`
-//!   (`antigravity/third_party.rs`);
 //! - the in-process tool loop: one `McpClient` per server
 //!   ([`tool_loop`]).
 //!
@@ -20,7 +18,7 @@
 //! and audited, and anything else is dropped, never handed to a CLI
 //! unproxied.
 //!
-//! Grok and Antigravity keep their registration in a persistent file that
+//! Grok keeps its registration in a persistent file that
 //! every spawn of the employee (and anyone running the CLI in that directory)
 //! shares. For them each server is wrapped once more as a *spawn-scoped*
 //! proxy ([`spawn_scoped`]): the file names no credential and nothing per
@@ -186,7 +184,7 @@ async fn run_spawn_gate(agent_dir: &Path) -> Result<(), String> {
 /// Pick the gated third-party entries out of a rewritten config. An entry is
 /// kept only when it launches `self_exe` as `mcp-proxy` or as DuDuClaw's
 /// remote bridge, and only under a name that is safe as a bare TOML key, a
-/// JSON key, an Antigravity permission rule and a file name
+/// JSON key and a file name
 /// ([`is_portable_server_name`]).
 ///
 /// A bridge entry carries only `DUDUCLAW_HOME`; under the Claude CLI it
@@ -261,7 +259,7 @@ pub(crate) fn string_env(def: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// One server as a persistent CLI config registers it (Grok, Antigravity).
+/// One server as a persistent CLI config registers it (Grok).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedServer {
     /// The DuDuClaw binary.

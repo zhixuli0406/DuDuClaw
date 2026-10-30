@@ -61,7 +61,7 @@ trust: 0.1   — Speculative, draft
 
 ## 自動注入流程
 
-注入發生在組裝 system prompt 時，分布在三個地方，因此每一種 runtime（Claude、Codex、Antigravity、Grok、OpenAI 相容，以及 catalog 裡的其他 runtime）都能得到相同的知識：
+注入發生在組裝 system prompt 時，分布在三個地方，因此每一種 runtime（Claude、Codex、Grok、OpenAI 相容，以及 catalog 裡的其他 runtime）都能得到相同的知識：
 
 ```
 User sends message

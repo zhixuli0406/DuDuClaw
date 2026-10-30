@@ -203,7 +203,7 @@ docker compose up -d
 
 ## 6. CLI 認證設定
 
-image 包含 Claude、Codex、Antigravity 與 Grok，登入方法各有不同。Codex 使用裝置碼，瀏覽器不必連到容器內的 callback listener。建議備妥 API key 作為計費與備援方式。
+image 包含 Claude、Codex 與 Grok，登入方法各有不同。Codex 使用裝置碼，瀏覽器不必連到容器內的 callback listener。建議備妥 API key 作為計費與備援方式。
 
 標準 Compose 檔掛載下列憑證與設定目錄：
 
@@ -211,7 +211,6 @@ image 包含 Claude、Codex、Antigravity 與 Grok，登入方法各有不同。
 |------|--------|-----|
 | `/home/duduclaw/.claude` | `duduclaw-claude` | Claude Code |
 | `/home/duduclaw/.codex`  | `duduclaw-codex`  | Codex |
-| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Antigravity 設定 |
 | `/home/duduclaw/.grok` | `duduclaw-grok` | Grok |
 | `/home/duduclaw/.kimi-code` | `duduclaw-kimi` | Kimi Code |
 | `/home/duduclaw/.copilot` | `duduclaw-copilot` | GitHub Copilot CLI |
@@ -223,7 +222,7 @@ image 包含 Claude、Codex、Antigravity 與 Grok，登入方法各有不同。
 
 新增的五個 volume 只負責保留憑證；這些 CLI 不隨此 image 安裝，須另行安裝後 Dashboard 才能啟動登入。Cursor 的瀏覽器登入仍需要 CLI 可收到本機 callback；遠端主機若無法接收，請改用 API key。
 
-> **訂閱登入有帳號風險。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token；Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。讓一份訂閱回覆頻道上的客戶、輪替多個訂閱帳號來避開用量上限、把 token 存在 DuDuClaw，都和這份規範衝突。Google 的 [Antigravity 條款](https://antigravity.google/terms)寫明，用第三方軟體透過 Antigravity 的 OAuth 存取其服務屬於違規，可能導致帳號被停權或終止；OpenAI 有官方的 [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) 計畫：在第三方應用程式使用 ChatGPT 方案，開放給開源合作夥伴與選定的商業合作夥伴，商業產品要先取得 OpenAI 同意，驗證 token 也必須留在使用者自己掌控的本機，不能放在遠端或託管環境。下面的 setup token、容器內互動登入與 ChatGPT 登入都屬於訂閱登入，功能照常可用，但建議使用 API key；dashboard 的登入流程會先要求你勾選同意這段說明。詳見 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
+> **訂閱登入有帳號風險。** Anthropic 的[法律與合規說明](https://code.claude.com/docs/en/legal-and-compliance)寫明：第三方開發者不得在自己的產品裡提供 Claude.ai 登入，也不得用 Free、Pro、Max 方案的憑證替使用者轉送請求，更不得收集、儲存或中介 Claude.ai 的憑證或 session token；Anthropic 可以不事先通知就執行，也有使用者回報帳號被停權。讓一份訂閱回覆頻道上的客戶、輪替多個訂閱帳號來避開用量上限、把 token 存在 DuDuClaw，都和這份規範衝突。下面的 setup token、容器內互動登入與 ChatGPT 登入都屬於訂閱登入，功能照常可用，但建議使用 API key；dashboard 的登入流程會先要求你勾選同意這段說明。詳見 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
 
 ### 6.1 Claude Code CLI
 
@@ -314,14 +313,6 @@ OPENAI_API_KEY=sk-proj-...
 
 按量計費（OpenAI API 定價）。
 
-### 6.3 Antigravity（Google）API key 模式
-
-Docker image 不再安裝 Gemini CLI。Antigravity（`agy`）與 Gemini API provider
-仍受支援。`agy` 訂閱登入需要 OS keyring，容器請使用 API key 模式：設定
-`config.toml [antigravity] auth = "api_key"`，並提供 `gemini` provider 帳號
-或 `.env` 的 `GEMINI_API_KEY`。Antigravity 設定存在
-`~/.gemini/antigravity-cli/`，所以 `duduclaw-gemini` volume 仍需保留。
-
 ### 6.4 Per-Agent 指定 Runtime
 
 每個 agent 可以在自己的 `agent.toml` 指定要用哪個 runtime：
@@ -330,8 +321,8 @@ Docker image 不再安裝 Gemini CLI。Antigravity（`agy`）與 Gemini API prov
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-provider = "claude"       # 主 runtime：claude / codex / antigravity / openai-compat …
-fallback = "antigravity"  # Claude 不可用時自動切換
+provider = "claude"       # 主 runtime：claude / codex / openai-compat …
+fallback = "codex"  # Claude 不可用時自動切換
 ```
 
 完整範例與 failover 策略請見
@@ -363,7 +354,6 @@ claude auth status
 | `duduclaw-data` | 主程式資料：config、agents、memory SQLite、logs、bus_queue.jsonl | **最重要**，建議每日備份 |
 | `duduclaw-claude` | Claude CLI OAuth state | 中等，遺失需重新 `claude auth login` |
 | `duduclaw-codex`  | Codex OAuth state | 中等 |
-| `duduclaw-gemini` | Antigravity 的 `~/.gemini` 設定 | 中等 |
 | `duduclaw-grok` | Grok CLI 憑證 | 中等 |
 | `duduclaw-kimi` | Kimi Code 憑證 | 中等 |
 | `duduclaw-copilot` | Copilot CLI 憑證 | 中等 |

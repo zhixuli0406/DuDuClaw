@@ -21,7 +21,6 @@ describe('<CliLoginModal> risk disclosure', () => {
   it.each([
     ['claude', ANTHROPIC],
     ['codex', 'https://openai.com/policies/sign-in-with-chatgpt-terms/'],
-    ['antigravity', 'https://antigravity.google/terms'],
     ['grok', 'https://x.ai/legal/terms-of-service'],
   ] as const)('%s links %s', (runtime, href) => {
     renderWithProviders(<CliLoginModal open runtime={runtime as LoginRuntime} onClose={vi.fn()} />);

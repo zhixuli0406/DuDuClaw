@@ -77,7 +77,7 @@ async fn regression_an_already_frozen_spec_is_backfilled_onto_the_local_row() {
     );
 
     let d = driver(store.clone(), queue, small_cfg()).with_home_dir(home.to_path_buf());
-    d.ensure_frozen_team_spec(&mut row).await;
+    d.ensure_frozen_team_spec(&mut row).await.unwrap();
 
     let stored = store.get_task(&row.id).await.unwrap().unwrap();
     assert_eq!(
@@ -103,12 +103,12 @@ async fn the_freeze_backfill_never_touches_a_later_round_or_an_existing_spec() {
     let mut later = goal_task("g-later", "alice");
     later.revision_round = 2;
     store.insert_task(&later).await.unwrap();
-    d.ensure_frozen_team_spec(&mut later).await;
+    d.ensure_frozen_team_spec(&mut later).await.unwrap();
     assert!(later.team_spec_json.is_none(), "round 2 never freezes");
 
     let mut already = goal_task("g-has", "alice");
     already.team_spec_json = Some("{\"already\":true}".into());
-    d.ensure_frozen_team_spec(&mut already).await;
+    d.ensure_frozen_team_spec(&mut already).await.unwrap();
     assert_eq!(already.team_spec_json.as_deref(), Some("{\"already\":true}"));
 }
 
@@ -169,8 +169,8 @@ async fn an_invalid_enabled_team_runs_solo_and_freezes_nothing() {
     std::fs::write(
         dir.path().join("config.toml"),
         "[team]\nenabled = true\n\
-             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.executor]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n\
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
     )
     .unwrap();
     let (store, queue) = open_stores(dir.path()).await;
@@ -186,6 +186,95 @@ async fn an_invalid_enabled_team_runs_solo_and_freezes_nothing() {
         t.team_spec_json.is_none(),
         "a refused team must leave no spec behind"
     );
+}
+
+#[tokio::test]
+async fn fatal_team_refusal_parks_only_that_goal_and_is_not_audited_again() {
+    for body in [
+        "[team]\nbroken = [",
+        "[team.roles.verifier]\nruntime = \"antigravity\"\n",
+        "[team.roles.verifier]\nmodel = 42\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), body).unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut bad = goal_task("bad", "alice");
+        bad.created_at = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        store.insert_task(&bad).await.unwrap();
+        store.insert_task(&goal_task("healthy", "bob")).await.unwrap();
+        assert_eq!(store.tasks_in_status("todo").await.unwrap()[0].id, "bad");
+        let d = driver(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+
+        d.tick_once().await.unwrap();
+
+        let parked = store.get_task("bad").await.unwrap().unwrap();
+        assert_eq!(parked.status, "needs_human");
+        assert_eq!(parked.pause_reason.as_deref(), Some("blocked_needs_decision"));
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target, "bob");
+        assert!(pending[0].payload.contains("task_id=healthy"));
+        let audit = || std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
+        let first = audit();
+        assert_eq!(first.lines().filter(|line| line.contains("team_refused")).count(), 1);
+        assert!(!first.contains(&dir.path().display().to_string()));
+        assert!(!first.contains("broken"));
+
+        d.tick_once().await.unwrap();
+
+        assert_eq!(audit().lines().filter(|line| line.contains("team_refused")).count(), 1);
+        assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
+        assert_eq!(store.get_task("bad").await.unwrap().unwrap().status, "needs_human");
+    }
+}
+
+#[tokio::test]
+async fn removed_frozen_runtime_is_refused_before_solo_and_durable_dispatch() {
+    for durable in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        write_enabled_team(dir.path());
+        let resolved = crate::team_composer::resolve_team(dir.path(), "alice").result.unwrap();
+        let mut spec = crate::team_composer::FrozenTeamSpec::from_resolved(&resolved);
+        spec.verifier.runtime = "agy".into();
+        spec.gate = duduclaw_core::types::TeamGateMode::AlwaysSolo;
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut task = goal_task("frozen", "alice");
+        task.team_spec_json = Some(serde_json::to_string(&spec).unwrap());
+        store.insert_task(&task).await.unwrap();
+        if durable {
+            store.submit_steering(&crate::task_store::NewSteering {
+                task_id: "frozen", body: "check the result", body_hash: "hash",
+                guard_flags_json: "[]", submitted_by: "test", client_request_id: "request",
+            }, Utc::now()).await.unwrap();
+            assert!(store.durable_info("frozen").await.unwrap().is_durable());
+        }
+        let d = driver(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+
+        d.tick_once().await.unwrap();
+
+        let parked = store.get_task("frozen").await.unwrap().unwrap();
+        assert_eq!(parked.status, "needs_human");
+        assert_eq!(parked.pause_reason.as_deref(), Some("blocked_needs_decision"));
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn team_freeze_store_error_stays_an_infrastructure_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_enabled_team(dir.path());
+    let (store, queue) = open_stores(dir.path()).await;
+    let mut task = goal_task("g1", "alice");
+    store.insert_task(&task).await.unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    conn.execute_batch("ALTER TABLE tasks RENAME COLUMN team_spec_json TO unavailable_spec").unwrap();
+    let d = driver(store, queue, small_cfg()).with_home_dir(dir.path().to_path_buf());
+    assert!(matches!(d.ensure_frozen_team_spec(&mut task).await,
+        Err(super::super::enqueue::TeamDispatchError::Infrastructure(_))));
 }
 
 #[tokio::test]

@@ -1,8 +1,7 @@
 //! Interactive CLI authentication — **"Dashboard 一鍵登入" for every AI CLI**.
 //!
 //! Supported AI CLIs (Claude / Codex / Grok and others) ship their own native
-//! login command (Antigravity does not — `agy` signs in through its interactive
-//! TUI, so its catalog login method is `None`). This module drives that
+//! login command. This module drives that
 //! command inside a PTY, streams its output to the dashboard, and relays the
 //! user's input (e.g. a pasted
 //! verification code) back. On success the CLI persists credentials to its own
@@ -413,13 +412,13 @@ pub struct CliCredentialStatus {
 
 /// Status of every non-Claude CLI credential store. Claude is excluded on
 /// purpose: its login already surfaces as a rotator account (keychain /
-/// setup-token). Runtimes without a `success_file` (antigravity) are skipped.
+/// setup-token). Runtimes without a `success_file` are skipped.
 pub fn cli_credential_statuses() -> Vec<CliCredentialStatus> {
     // WP-B: derived from the catalog rather than a hand-written trio, so a new
     // runtime's login shows up on the 帳號 page the moment its entry lands —
     // the exact failure mode this list had before ("grok cli oAuth 不會出現在
     // 帳號輪替卡片" was a missing row here). Claude stays excluded on purpose;
-    // runtimes without a credential path (antigravity) are skipped by the
+    // runtimes without a credential path are skipped by the
     // `?` below.
     RuntimeType::ALL
         .iter()
@@ -820,8 +819,6 @@ mod tests {
 
     #[test]
     fn every_cli_has_a_login_spec_except_openai_compat() {
-        // Antigravity is NOT in this list: agy has no login subcommand (1.2.14,
-        // `unexpected argument "login"`); sign-in is the bare-`agy` TUI.
         for rt in [
             RuntimeType::Claude,
             RuntimeType::Codex,
@@ -841,7 +838,6 @@ mod tests {
             assert!(!spec.hint.is_empty());
         }
         assert!(spec_for(RuntimeType::OpenAiCompat).is_none());
-        assert!(spec_for(RuntimeType::Antigravity).is_none());
     }
 
     #[test]
@@ -1075,13 +1071,11 @@ mod tests {
         );
         // Excluded, each for a structural reason:
         //   claude       — already surfaces as a rotator account
-        //   antigravity  — no documented single credential file
         //   kiro         — settings file is not proof of login; whoami verifies it
         //   qwen / vibe  — API-key only, no login flow to report on
         //   openai_compat— not a CLI
         for excluded in [
             RuntimeType::Claude,
-            RuntimeType::Antigravity,
             RuntimeType::Kiro,
             RuntimeType::Qwen,
             RuntimeType::Vibe,
@@ -1138,11 +1132,8 @@ mod tests {
         ] {
             assert!(spec_for(rt).is_some(), "{rt:?} must be loginable");
         }
-        // API-key-only runtimes must NOT pretend to have a login. Antigravity
-        // signs in through its interactive TUI (bare `agy`), which the
-        // dashboard cannot drive, so it has no scripted login either.
+        // API-key-only runtimes must not pretend to have a login.
         for rt in [
-            RuntimeType::Antigravity,
             RuntimeType::Qwen,
             RuntimeType::Vibe,
             RuntimeType::OpenAiCompat,

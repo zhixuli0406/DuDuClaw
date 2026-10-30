@@ -176,8 +176,8 @@ grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證�
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
 strict_reply_parsing = "shadow"  # 判官回覆的嚴格 JSON 契約：off / shadow / enforce（見「判官回覆嚴格契約」）。預設 shadow
 judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / external（evaluator_only / human_only 已在 v1.69.0 移除）。預設 mav
-judge_provider = "antigravity"      # 選填：讓判官跑在另一個 runtime 上（見「讓判官跑在另一個模型上」）。未設 ⇒ 預設的工具用 runtime
-judge_model = "gemini-3-pro-preview" # 選填：該 runtime 內的判官模型 id。未設 ⇒ 預設的工具用模型
+judge_provider = "codex"      # 選填：讓判官跑在另一個 runtime 上（見「讓判官跑在另一個模型上」）。未設 ⇒ 預設的工具用 runtime
+judge_model = "gpt-5.4" # 選填：該 runtime 內的判官模型 id。未設 ⇒ 預設的工具用模型
 admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
 
 [task_forward_model]    # 任務層前瞻模型（見同名章節）。v1.54 起預設開啟
@@ -266,7 +266,7 @@ max_hop_depth = 5       # 委派鏈跨行程 re-spawn 的深度上限。預設 5
 
 ### 規格依任務凍結
 
-任務所用的團隊在建立時決定一次，存在任務上。之後對 `[team]` 的修改只影響下一個任務。規格驗證失敗（最常見的是審核者與執行者同一個模型家族）時完全不會成團：任務走 Solo，不會出現局部團隊。
+任務所用的團隊在建立時決定一次，存在任務上。之後對 `[team]` 的修改只影響下一個任務。審核者與執行者同模型家族等非致命驗證失敗時不會成團，任務仍走 Solo。設定無法讀取或解析、選擇 runtime 的欄位型別錯誤，以及使用已移除的 runtime，則一律拒絕派工。建立時先檢查再寫入任務；之後遇到這類拒絕，只將該目標暫停為 `needs_human`，原因為 `blocked_needs_decision`，其他目標繼續執行。已暫停的目標不會每個 tick 重試或重複寫入拒絕稽核。
 
 這個拒絕是否有聲音，取決於是誰要求組團隊。明寫了 `enabled = true` 的操作者，或設了角色但驗證失敗的操作者，會拿到以 `team_refused` 記錄的稽核列，附上角色與原因。完全沒動過 `[team]` 的部署只會得到一行 `debug!`，稽核日誌裡什麼都沒有：這個拒絕是 v1.66 翻轉預設值之後每個安裝的預設狀態，若在每個目標任務上都蓋一列，真正的拒絕反而會找不到。
 
@@ -315,7 +315,7 @@ spawn 預算縮水時，能力依下列順序放棄：先放棄合成，再放�
 | 事件 | 意義 |
 |---|---|
 | `team_gate_decision` | Solo / Team / 灰帶，附觸發的訊號 |
-| `team_refused` | 已啟用的規格驗證失敗，任務走 Solo |
+| `team_refused` | 團隊規格被拒絕；非致命驗證失敗走 Solo，設定讀取／解析／型別錯誤或已移除的 runtime 則暫停該目標等待決定 |
 | `team_round_started` | 三階段回合開始，附角色與任何降級步驟 |
 | `team_member_spawned` | 建立了一個角色成員（角色、runtime、模型） |
 | `team_stage_failed` | 某個階段沒有產出下一階段需要的東西，或根本無法執行，附 `role`、`runtime`、`model` 與錯誤 |
@@ -413,7 +413,7 @@ AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會�
 開啟後，goal loop 在每次派工前會依過往同類任務的統計先「預測」這次執行
 大概會如何（會不會失敗、大概動用哪些工具類別），執行結束後把預測與實際
 觀察比對並記錄成轉移，讓系統對「做這類事會發生什麼」累積出任務層的世界
-模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex、Antigravity 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
+模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
 
 - **預測分層退化**：有同類統計用統計、沒有就用整體邊際、再沒有用先驗
   預設值，冷啟動不花任何 LLM 費用。
@@ -467,10 +467,12 @@ AI 員工回報完成、任務進入 `review` 之後，不是每次都直接燒�
 
 與工作者同一個模型家族的判官，往往會原諒該家族自己才會犯的錯。它和工作者有相同的盲點，所以同一家廠商給的第二意見，價值比看起來低（arXiv:2607.13918）。兩個選填的鍵可以把驗收判官，連同便宜的第一階段評估器，一起移到另一個 runtime 與模型上：
 
+已移除的 runtime 設定會在執行前被拒絕，操作者必須自行改選其他 runtime 與相容模型，不會套用下列備援行為。
+
 ```toml
 [dispatch]
-judge_provider = "antigravity"        # runtime id：claude, codex, antigravity, grok, openai_compat, …
-judge_model = "gemini-3-pro-preview"   # 該 runtime 內的模型 id
+judge_provider = "codex"        # runtime id：claude, codex, grok, openai_compat, …
+judge_model = "gpt-5.4"   # 該 runtime 內的模型 id
 ```
 
 兩個鍵都是選填，彼此獨立。沒設時，判官沿用一般的工具用模型（`[runtime] utility_provider` / `utility_model`），這正是每個既有部署目前的行為，所以省略它們不會改變任何事。

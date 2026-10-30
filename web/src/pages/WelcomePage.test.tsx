@@ -58,7 +58,6 @@ import { WelcomePage } from './WelcomePage';
 const DETECT_ABSENT: RuntimeDetect = {
   claude_cli: false,
   codex: false,
-  antigravity: false,
   grok: false,
   claude_oauth: false,
   claude_subscription: null,
@@ -209,15 +208,14 @@ describe('<WelcomePage> runtime setup (WP2 / D16)', () => {
     expect(await screen.findByRole('button', { name: /sign in now/i })).toBeInTheDocument();
   });
 
-  it("'antigravity' is the wizard's default other-CLI pick and Gemini is not offered", async () => {
+  it("'codex' is the wizard's default other-CLI pick and Gemini is not offered", async () => {
     const user = userEvent.setup();
     mockDetect();
     renderWithProviders(<WelcomePage />);
     await gotoBackendStep(user);
 
     await user.click(await screen.findByRole('button', { name: /i use a different ai tool/i }));
-    expect(await screen.findByRole('button', { name: /^antigravity/i })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: /^codex/i })).toHaveAttribute('aria-pressed', 'false');
+    expect(await screen.findByRole('button', { name: /^codex/i })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByRole('button', { name: /gemini/i })).not.toBeInTheDocument();
   });
 

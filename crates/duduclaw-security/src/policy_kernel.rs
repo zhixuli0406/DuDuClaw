@@ -2,7 +2,7 @@
 //!
 //! This is the L3 choke point of the runtime-agnostic security redesign
 //! (`commercial/docs/plans/TODO-security-runtime-agnostic-redesign.md`). Every
-//! runtime's tool call — Claude / codex / gemini / antigravity via MCP dispatch,
+//! runtime's tool call — Claude / codex / grok via MCP dispatch,
 //! plus the direct-API / local-inference tool loop — is evaluated here BEFORE
 //! the tool executes.
 //!

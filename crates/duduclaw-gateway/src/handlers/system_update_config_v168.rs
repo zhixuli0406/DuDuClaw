@@ -207,6 +207,9 @@ fn apply_global_utility(table: &mut toml::Table, params: &Value, out: &mut V168O
         }
     }
     if let Some(v) = str_param(params, "runtime.utility_provider")? {
+        if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(v) {
+            return Err(removed.refusal("config.toml runtime.utility_provider"));
+        }
         let provider = duduclaw_core::types::RuntimeType::parse(v.trim())
             .ok_or_else(|| format!("runtime.utility_provider must be one of: {}", duduclaw_core::types::RuntimeType::valid_values()))?;
         set_or_clear_str(table, &["runtime"], "utility_provider", provider.as_str(), out)?;
@@ -409,6 +412,9 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
 
 fn apply_judge_model(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
     if let Some(v) = str_param(params, "dispatch.judge_provider")? {
+        if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(v) {
+            return Err(removed.refusal("config.toml [dispatch] judge_provider"));
+        }
         let v = v.trim();
         let canonical = if v.is_empty() {
             String::new()
@@ -561,6 +567,9 @@ pub(crate) fn apply_team_roles(
         let mut path: Vec<&str> = table_path.to_vec();
         path.push(key);
         if let Some(v) = str_param(params, &format!("{base}.runtime"))? {
+            if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(v) {
+                return Err(removed.refusal(&format!("{base}.runtime")));
+            }
             let v = v.trim();
             let canonical = if v.is_empty() {
                 String::new()
@@ -712,8 +721,10 @@ mod tests {
 
     #[test]
     fn judge_provider_is_canonicalised_or_refused() {
-        let (t, _) = apply(json!({"dispatch": {"judge_provider": "agy", "judge_model": "x"}})).unwrap();
-        assert_eq!(toml_at(&t, "dispatch.judge_provider").unwrap().as_str(), Some("antigravity"));
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            let err = apply(json!({"dispatch": {"judge_provider": removed.id, "judge_model": "x"}})).unwrap_err();
+            assert!(err.contains(removed.removed_in), "{err}");
+        }
         assert!(apply(json!({"dispatch": {"judge_provider": "not-a-runtime"}})).is_err());
     }
 

@@ -114,8 +114,8 @@ model   = "gpt-5.5"
 effort  = "medium"
 
 [team.roles.verifier]
-runtime = "antigravity"
-model   = "gemini-3.7-flash"
+runtime = "claude"
+model   = "claude-sonnet-4-6"
 effort  = "low"
 
 [team.roles.utility]
@@ -141,7 +141,7 @@ cascade 是**逐欄**的，分三層：
 
 可用值：`low`、`medium`、`high`、`xhigh`、`max`（不分大小寫）。列舉本身、各 runtime 的上限，以及各廠商拼法不同的 CLI 旗標，全都集中在一處（`duduclaw-core::effort`）。`[team]` 只把這個鍵當作原始字串，交給那裡解析，因此 crate 不會對同一個旋鈕留有兩種拼法。無法解析的值會拒絕成團（`invalid_effort`）。
 
-第一批仍支援的四個 runtime 都支援逐次呼叫指定 effort（2026-09-24 以真實 binary 探測）：Claude Code `--effort`、Codex `-c model_reasoning_effort=`、Antigravity `--effort`、Grok `--reasoning-effort`。
+第一批仍支援的三個 runtime 都支援逐次呼叫指定 effort（2026-09-24 以真實 binary 探測）：Claude Code `--effort`、Codex `-c model_reasoning_effort=`、Grok `--reasoning-effort`。
 
 宣告在既不綁 runtime 也不綁 model 的角色上的 effort 是無效的（該角色會 cascade 到員工的模型，而員工的模型帶的是員工的 effort）。這種情況會被回報，而不是靜默丟棄。
 
@@ -155,7 +155,7 @@ cascade 是**逐欄**的，分三層：
 
 ## 驗證器強制執行的三條規則
 
-違反任何一條的規格都不會成團。任務改走 Solo，儀表板會說明原因，絕不會形成殘缺的團隊。
+違反任何一條的規格都不會成團。同模型家族等非致命驗證失敗仍改走 Solo，儀表板會說明原因；使用已移除的 runtime 則拒絕派工，不會改走 Solo 或其他廠商。
 
 ### 1. 角色是 `(role, runtime, model)` 三元組
 
@@ -167,9 +167,9 @@ Goose 的 Lead/Worker 功能儲存的角色設定只有模型名稱，結果 `qw
 
 ### 2. 只限第一批 runtime
 
-`claude`、`codex`、`antigravity`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
+`claude`、`codex`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
 
-原因在工具，與能力無關：這四個 runtime 原生註冊 DuDuClaw 的 MCP server，所以跑在上面的角色拿得到完整的工具面。角色若靜默失去工具，會產生自信滿滿、沒有任何工具呼叫的敘述，審核者分不出它與真正做完的工作。
+原因在工具，與能力無關：這三個 runtime 原生註冊 DuDuClaw 的 MCP server，所以跑在上面的角色拿得到完整的工具面。角色若靜默失去工具，會產生自信滿滿、沒有任何工具呼叫的敘述，審核者分不出它與真正做完的工作。
 
 ### 3. 審核者不得與執行者同模型家族
 
@@ -183,7 +183,7 @@ Goose 的 Lead/Worker 功能儲存的角色設定只有模型名稱，結果 `qw
 
 驗證只在規格凍結時跑一次。但凍結後的規格是以 JSON 存放在可變的任務列中，而記錄每個角色模型家族的欄位，直到這次修正之前**完全沒有讀取者**。規則出現之前的備份還原，或手動修補過的列，會產生不再滿足不變量的規格，下游卻沒有任何東西察覺。
 
-現在每一輪在花掉一次 spawn 之前，都會重新檢查儲存的規格：每個角色的 runtime 仍須是那五個之一（規則 2，以前執行者路徑會過濾這一項，審核者路徑沒有），且審核者儲存的家族仍須與執行者不同（規則 3）。不通過的規格會以 `Failed` 結束，稽核列帶 `frozen_spec_family_violation` / `frozen_spec_runtime_not_allowed`，並附上給操作者的訊息，說明是哪個角色、該怎麼修。檢查讀的是**儲存的**家族字串，而不是重新解析目錄：重新解析回答的是「這份設定今天會代表什麼」，而這裡要問的是這個任務實際在跑的規格是否仍然成立。
+現在每一輪在花掉一次 spawn 之前，都會重新檢查儲存的規格：每個角色的 runtime 仍須是那三個之一（規則 2，以前執行者路徑會過濾這一項，審核者路徑沒有），且審核者儲存的家族仍須與執行者不同（規則 3）。不通過的規格會以 `Failed` 結束，稽核列帶 `frozen_spec_family_violation` / `frozen_spec_runtime_not_allowed`，並附上給操作者的訊息，說明是哪個角色、該怎麼修。檢查讀的是**儲存的**家族字串，而不是重新解析目錄：重新解析回答的是「這份設定今天會代表什麼」，而這裡要問的是這個任務實際在跑的規格是否仍然成立。
 
 ---
 
@@ -215,7 +215,7 @@ composer 以數字順序讀回相同的槽位，先是規範檔，再是 `.01`�
 
 - **約束與受眾永遠不壓縮。** composer 把這兩個欄位渲染在固定標題（`## 約束`、`## 受眾`）之下，而 prompt 壓縮管線拒絕裁剪這些標題。實測的失敗模式是預算會先對邊界課稅，把明確的約束靜默地變回隱含的約束。封包中其他一切仍可壓縮，受保護的區段到封包結束處為止。
 
-  **豁免依據的是來源，不是文字。** 這四個標題只是普通的 markdown，而壓縮管線的 `history` 是十一個通道的對話歷史，*包括使用者自己打的訊息*。所以光有標題無法保護任何東西。composer 在每個標題正下方寫一行無法猜測的標記（`<!-- ddc-protected:… -->`，32 個 CSPRNG 位元組，每個 gateway 行程產生一次），只有緊跟著那一行完全相同標記的標題才會開啟受保護區段。使用者無法產生這個值：它從不出現在通道回覆中，而輔助摘要器拿到的逐字稿已先移除受保護區段。三個失敗方向是刻意的：沒有 sentinel 的讀取者（`duduclaw-llm` 的 CCR 預覽，除非其嵌入者傳入 sentinel，以及任何非 gateway 行程）什麼都不保護；gateway 重啟前產生的標記不再相符，所以舊摘要會衰退為一般可壓縮的歷史；而若 OS 的 CSPRNG 不可用，sentinel 為空，豁免就直接關閉。過度裁剪真正的約束代價高但可補救，把豁免交給不受信任的文字則否。
+  **豁免依據的是來源，不是文字。** 這三個標題只是普通的 markdown，而壓縮管線的 `history` 是十一個通道的對話歷史，*包括使用者自己打的訊息*。所以光有標題無法保護任何東西。composer 在每個標題正下方寫一行無法猜測的標記（`<!-- ddc-protected:… -->`，32 個 CSPRNG 位元組，每個 gateway 行程產生一次），只有緊跟著那一行完全相同標記的標題才會開啟受保護區段。使用者無法產生這個值：它從不出現在通道回覆中，而輔助摘要器拿到的逐字稿已先移除受保護區段。三個失敗方向是刻意的：沒有 sentinel 的讀取者（`duduclaw-llm` 的 CCR 預覽，除非其嵌入者傳入 sentinel，以及任何非 gateway 行程）什麼都不保護；gateway 重啟前產生的標記不再相符，所以舊摘要會衰退為一般可壓縮的歷史；而若 OS 的 CSPRNG 不可用，sentinel 為空，豁免就直接關閉。過度裁剪真正的約束代價高但可補救，把豁免交給不受信任的文字則否。
 
   兩個上限作為縱深防禦保留，防止*合法*的輸出者渲染出超過封包欄位上限的內容：預算下限在整個歷史中最多尊重約 6k token 的受保護內容，而 session 摘要器最多逐字釘住 4 KiB 的受保護文字，裁掉時會在摘要中說明。這個標記會在 composer 的 settle 摘要中再次被移除（渲染後的封包文字到達人類眼前的唯一路線），所以它不會出現在 `/goals` 或通道推播中。一個值得知道的後果：由 `DelegationEnvelope::to_prompt` 組出、由 agent 提供的 `## Constraints` 區塊不帶標記，也不受保護（它本來就不屬於 `history`，所以對它實際上沒有任何改變）。
 - **角色成員永遠持有 `team_handoff`。** `[capabilities] allowed_tools` 早於團隊功能的員工，無法列名一個當時還不存在的工具，所以不論該白名單為何，交接通道都會對角色成員放行。這是團隊自己的機制，觸及範圍與 `working_state_*` 相同：`team_packets/` 底下推導出的一條路徑，沒有別的。角色要求的其他*每一個*工具仍會對照員工的包絡檢查，明確的 `denied_tools` 條目仍然勝出，而面向 agent 的 `spawn_ephemeral` 路徑完全不享有這種豁免。
@@ -230,7 +230,7 @@ composer 以數字順序讀回相同的槽位，先是規範檔，再是 `.01`�
 
 | 鍵 | 值 |
 |---|---|
-| `[runtime] provider` | 角色的 runtime，已規範化（`agy` 寫成 `antigravity`） |
+| `[runtime] provider` | 角色的標準 runtime id |
 | `[model] preferred` | 角色的 model id |
 | `[model] effort` | 角色的 effort，**只有角色有宣告時才寫入** |
 | `[team_member] role` / `task_id` / `round` / `parent` | 這個成員填的是哪個槽位 |
@@ -259,7 +259,7 @@ composer 以數字順序讀回相同的槽位，先是規範檔，再是 `.01`�
 
 角色路徑是唯一接受原始 model id 的地方，且**只有 gateway 的 composer 能觸及**。面向 agent 的 `spawn_ephemeral` 工具沒有改變：它仍只接受三個層級關鍵字之一（`cheap` / `standard` / `preferred`），仍拒絕原始 id。無論有沒有團隊，AI 員工都不能指名自己要跑在哪個模型上。
 
-在建立任何東西之前，這組配對會對照 runtime 目錄檢查：runtime 必須是第一批五個之一，且模型的家族必須是該 runtime 實際服務的。目錄不認得的家族是錯誤，不是最佳猜測，`gpt-5.4` 不會送到 Claude binary 再於別人的 API 失敗。
+在建立任何東西之前，這組配對會對照 runtime 目錄檢查：runtime 必須是第一批三個之一，且模型的家族必須是該 runtime 實際服務的。目錄不認得的家族是錯誤，不是最佳猜測，`gpt-5.4` 不會送到 Claude binary 再於別人的 API 失敗。
 
 ### 成員在員工的工作區運作，而非自己的骨架目錄
 
@@ -269,7 +269,7 @@ composer 以數字順序讀回相同的槽位，先是規範檔，再是 `.01`�
 
 移動工作目錄帶來第二個問題：Claude CLI 從 `<cwd>/.mcp.json` 探索它的 MCP server，所以待在員工目錄中的成員會以**員工的**身分啟動 duduclaw MCP server，每個工具呼叫、每次交接、每一列稽核都會被歸到父層。所以身分改為明確指名，而非探索：Claude 成員以 `--mcp-config <member_dir>/.mcp.json --strict-mcp-config` 啟動（第二個旗標用來阻止 CLI 同時合併環境中的設定）。Codex 成員拿到 `--cd <employee_dir>`，而它的 `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID=…` 覆寫帶著成員 id，兩者在結構上互相獨立。若成員的 `.mcp.json` 不存在，該階段會被拒絕（`member_mcp_config_missing`），而不是帶著父層身分派工。
 
-**成員目前尚不支援：antigravity、grok，以及一般的 print-mode CLI。** 這些 runtime 從工作目錄*裡面*的檔案讀取它們的 MCP 註冊（`.agents/mcp_config.json`、`.grok/config.toml`……），所以移動 cwd 會讓身分跟著移動。在這些 runtime 上的成員仍以自己的骨架為工作目錄，它的檔案同樣不會活過該輪。在這個缺口補上之前，需要寫檔的角色請用 claude 或 codex。
+**成員目前尚不支援：grok，以及一般的 print-mode CLI。** 這些 runtime 從工作目錄*裡面*的檔案讀取它們的 MCP 註冊（`.grok/config.toml`……），所以移動 cwd 會讓身分跟著移動。在這些 runtime 上的成員仍以自己的骨架為工作目錄，它的檔案同樣不會活過該輪。在這個缺口補上之前，需要寫檔的角色請用 claude 或 codex。
 
 **另一個後果必須補上，而不是只寫進文件。** 共用員工的工作目錄，也代表共用其中的 `.claude/settings.json`，而註冊在那裡的檔案保護 hook 把*員工*當作呼叫者，所以 hook 把角色成員的寫檔讀成員工在寫自己的檔案，直接放行。成員因此可以編輯員工 `agent.toml [capabilities]`：翻轉 `os_native` / `computer_use`、放寬 `allowed_tools`、清空 `denied_tools`、替自己授予 `db_sources` 條目，而下一輪的子集檢查會承認被放寬的包絡。平台對「角色成員永遠不能持有員工沒有的工具」的承諾，正是從那個檔案讀出來的，而一個可能是第三方的模型可以改寫它。
 
@@ -313,7 +313,6 @@ notes/c.md 44B sha256=aa11… mismatch (declared bb22…)
 
 成員的每個原生工具事件現在都會以該成員的 id 寫成一列 `tool_calls.jsonl`，帶著工具名稱、結果、遮罩後的呼叫輸入與遮罩後的結果文字，加上 `source = "native"`、`evidence_source = "native_tool_event"`，以及產生它的 `runtime` / `model`。失敗的事件帶 `error_class = "native_tool_error"`：被擋下或失敗的呼叫必須留下痕跡，與 MCP 分派閘遵守的規則相同。
 
-Antigravity `agy` 1.2.10 現在透過它的 `stream-json` 輸出提供終端工具事件。解析器忽略進行中的事件，並使用最後的 usage 區塊取得實測 token 數。實機探測中觀察到過被沙箱拒絕的指令；Antigravity 工具成功執行的情況仍需另行實機驗證。
 
 與 MCP 列有兩處刻意的差異，都是收緊而非放寬：
 
@@ -357,7 +356,7 @@ Antigravity `agy` 1.2.10 現在透過它的 `stream-json` 輸出提供終端工�
 
 goal 任務建立時，合併後的 `config.toml [team]` + `agent.toml [team]` 會驗證一次，結果存在任務本身。從此再也不變：明天重新排序模型的角色→模型矩陣或 bandit，影響的是*下一個*任務，不是已在跑的任務。紀律與凍結的驗收標準相同：光看任務列，你永遠答得出「這個任務實際是由哪個團隊工作與評判的」。
 
-驗證失敗的規格**完全不成團**。拒絕會被記錄，不存任何東西，任務以單一員工執行。不存在殘缺的團隊。
+同模型家族等非致命驗證失敗仍**完全不成團**：記錄拒絕、不儲存規格，任務以單一員工執行。設定無法讀取或解析、選擇 runtime 的欄位型別錯誤，以及使用已移除的 runtime，則一律拒絕派工。建立目標時會在寫入任務前檢查；若檢查後設定才改變，或既有目標遇到這類拒絕，只有該目標暫停為 `needs_human`，原因為 `blocked_needs_decision`，其他目標繼續執行。拒絕訊息只顯示檔案名稱與原因，不含檔案內容或絕對路徑。
 
 凍結在資料庫層是只能設定一次的（`WHERE team_spec_json IS NULL`），所以兩條建立路徑在同一任務上競爭是正常且安全的。以前不安全的是*輸家*對此的視角：goal loop 只處理「我凍結了」這個答案，所以輸掉競爭的那一輪持續讀自己過期的任務副本，找不到規格，悄悄跑成 Solo，而之後每一輪讀的是新的列，跑成 Team。同一個任務，兩種執行形態，任何地方都沒有痕跡。輸家現在會重讀該列，採用實際勝出的規格。
 
@@ -523,7 +522,7 @@ runtime 沒有回報用量時，用量欄位會整個省略。寫 `0` 等於宣�
 誠實的清單，讓這裡沒有任何東西讀起來比實際更完整：
 
 - **被接受的一輪只是單一煙霧結果。** 第 14 輪通過了既有的驗收判官，但這不能證明它在正式環境勝過 Solo。角色×模型矩陣的四案例煙霧測試無法解析宣告的 MDE。
-- **會寫檔的角色只限 claude 與 codex。** antigravity / grok / 一般 CLI 的成員以自己的骨架為工作目錄，所以它們的檔案活不過該輪。
+- **會寫檔的角色只限 claude 與 codex。** grok / 一般 CLI 的成員以自己的骨架為工作目錄，所以它們的檔案活不過該輪。
 - 角色×模型能力矩陣現在由 composer 當作先驗讀取（見上），但**只在角色沒設定模型時**，且只來自沒有 `unresolved` 的格。自 2026-09-29 起，同一個檔案也回答閘的能力差距訊號：矩陣中該執行者 `(role, runtime)` 的勝出模型，與該角色今天實際運行的模型之間，以 `n` 加權的距離（百分點），並與矩陣標頭自己宣告的 MDE 配對，所以低於雜訊底線的差距不會觸發。這項比較的兩邊都需要 resolved 的格，所以**在每一份出貨的矩陣上，這個訊號仍然是暗的**：四個格全是 `unresolved`，使閘維持原狀（四個訊號中兩個可量測，而成團需要三個）。它會在操作者第一次量出能 resolve 的矩陣時啟用，在那之前不會。會讓檔案保持新鮮的線上 bandit 仍是 P5。P2b 全團隊產生器完成了一次三案例、12 臂的實機管線探測，有真實的審核判定與交接。四個模型格全是 `unresolved`；來自單一 domain 的三個合成案例不滿足正式矩陣的驗收門檻，這在實務上代表今天出貨的矩陣完全選不出任何東西。
 - **預設開啟的翻轉尚未以預設值實機測試。** 它在未設定安裝上產生的行為由單元測試涵蓋（安靜的 Solo、無稽核列、派工逐位元組相同）；尚未執行的是這樣一個機群：已設定 `[team.roles]` *並且*依賴 `enabled` 關閉來維持 Solo。這樣的部署現在會成團，`enabled = false` 是一行的還原。
 - **審核格只有在重新錄製的 suite 上才量得到東西。** 出貨的 premium suite 的逐字稿給出單一類別的 gold，所以其上的格誠實地是 `degenerate_gold`；煙霧測試 3 顯示，用混合 gold 重新錄製四個案例能產生真實分數，所以修法已知，只是還沒套用到 18 個出貨的 suite。
@@ -538,7 +537,7 @@ runtime 沒有回報用量時，用量欄位會整個省略。寫 `0` 等於宣�
 - **`role_turns.jsonl` 把審核者的一列算進 `plan_round` 沒有規劃到的 spawn 預算。** 審核者是輔助呼叫，但它的帳本列帶 `member_id = "team-verifier"`，而 `spawns_used_for_task` 計入每一列有成員 id 的列，所以每一輪都比計畫預估的多花一個 spawn。
 - `cost.by_role` 現在回報依角色與模型的實測團隊階段花費，可選擇以任務 id（`episode_id`）收窄。沒有角色的舊列仍未歸屬。v1.68.0 起團隊設定已能在儀表板修改（見「設定角色」），封包／工具下鑽仍待接上。
 - 審核者的 token 用量在其 runtime 提供 usage 區塊時擷取；否則它的 `usage_*` 欄位缺席，而不是零。同一規則適用於規劃者與執行者的用量。實機探測的角色成本帳本不完整，不能當作 provider 帳單。
-- **結構化判官輸出只限 codex。** `--output-schema` 是唯一接上的結構化輸出旗標；antigravity 或 openai-compat 判官仍得靠 prompt 說服。團隊審核者現在共用離線審核者的 schema，接受嚴格 JSON 與首 token 散文；以 codex 做團隊審核仍需要一次實機一輪。
+- **結構化判官輸出只限 codex。** `--output-schema` 是唯一接上的結構化輸出旗標；openai-compat 判官仍得靠 prompt 說服。團隊審核者現在共用離線審核者的 schema，接受嚴格 JSON 與首 token 散文；以 codex 做團隊審核仍需要一次實機一輪。
 - **產物收據只涵蓋封包宣告的路徑。** 成員寫了卻沒列在 `artifacts[]` 的檔案，有它的原生工具列作為證據，但沒有雜湊。掃描工作區找出未宣告的變更是未來的工作。
 - 脫離的 composer 現在在存活骨架上限達到時，會等待一張 FIFO 准入票券。過期、遺失或無法讀取的票券會讓該階段明確失敗；被取消的等待會移除自己的票券。佇列狀態與骨架釋放的測試通過；仍需要一次有負載的實機一輪測試。
 

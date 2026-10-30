@@ -38,7 +38,7 @@ import {
 // ---------------------------------------------------------------------------
 
 type Backend = 'claudeSub' | 'claudeApi' | 'genericApi' | 'local' | 'otherCli';
-type OtherCli = 'codex' | 'antigravity';
+type OtherCli = 'codex';
 
 interface BackendDef {
   readonly id: Backend;
@@ -54,7 +54,7 @@ const BACKENDS: ReadonlyArray<BackendDef> = [
   { id: 'otherCli', icon: Terminal },
 ] as const;
 
-const OTHER_CLIS: ReadonlyArray<OtherCli> = ['codex', 'antigravity'] as const;
+const OTHER_CLIS: ReadonlyArray<OtherCli> = ['codex'] as const;
 
 const DEFAULT_LOCAL_MODEL = 'qwen3-8b-q4_k_m';
 const TOTAL_STEPS = 4;
@@ -122,7 +122,7 @@ interface WizardState {
 
 const INITIAL: WizardState = {
   backend: null,
-  otherCli: 'antigravity',
+  otherCli: 'codex',
   apiKey: '',
   apiBudget: '50',
   baseUrl: '',
@@ -446,7 +446,7 @@ export function WelcomePage() {
       case 'local':
         return undefined;
       case 'otherCli':
-        return detect.codex || detect.antigravity;
+        return detect.codex;
     }
   };
 
@@ -883,11 +883,7 @@ export function WelcomePage() {
                   </p>
                   <div className="flex flex-wrap gap-2">
                     {OTHER_CLIS.filter(cli => policy.allows('runtimes', cli)).map((cli) => {
-                      const installed = detect
-                        ? cli === 'codex'
-                          ? detect.codex
-                          : detect.antigravity
-                        : undefined;
+                      const installed = detect?.codex;
                       const selected = state.otherCli === cli;
                       return (
                         <button
@@ -916,11 +912,7 @@ export function WelcomePage() {
               {state.backend === 'otherCli' && detect && (
                 <RuntimeSetupCard
                   provider={state.otherCli}
-                  installed={
-                    state.otherCli === 'codex' ? detect.codex : detect.antigravity
-                  }
-                  // Antigravity keeps no observable credential file, so its
-                  // sign-in state stays unknown and the login row is hidden.
+                  installed={detect.codex}
                   loggedIn={cliCreds ? cliCreds[state.otherCli] : undefined}
                   onDetect={refreshDetect}
                   detecting={detecting}

@@ -118,6 +118,9 @@ impl ModelRef {
                  `claude:claude-haiku-4-5`, `codex:gpt-5.6-sol`)"
             ));
         };
+        if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(rt) {
+            return Err(removed.refusal("eval runtime:model"));
+        }
         let runtime = RuntimeType::from_id(rt.trim()).ok_or_else(|| {
             format!(
                 "model reference {s:?}: {:?} is not a runtime on this build",
@@ -1985,6 +1988,14 @@ mod tests {
         let r = parse_roles(&["verifier".into(), "executor".into(), "verifier".into()]).unwrap();
         assert_eq!(r, vec![MatrixRole::Verifier, MatrixRole::Executor]);
         assert!(parse_roles(&[]).unwrap_err().contains("--roles"));
+    }
+
+    #[test]
+    fn removed_model_ref_runtimes_are_refused() {
+        for id in ["gemini", "antigravity", "agy"] {
+            let err = ModelRef::parse(&format!("{id}:gemini-3.7-flash")).unwrap_err();
+            assert!(err.contains("removed") && err.contains("choose"), "{err}");
+        }
     }
 
     #[test]

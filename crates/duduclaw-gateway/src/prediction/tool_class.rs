@@ -650,7 +650,7 @@ mod tests {
             ToolClass::Exec
         );
         assert_eq!(
-            ToolClass::classify(RuntimeType::Antigravity, "run_shell_command"),
+            ToolClass::classify(RuntimeType::Grok, "run_shell_command"),
             ToolClass::Exec
         );
     }

@@ -9,6 +9,12 @@
 目標費用與重複呼叫防護目前在「設定檔進階編輯」設定，沒有獨立的自動化控制項。`config.toml [goal_loop]` 的 `default_cost_cap_cents = 0` 是未設定個別上限的目標所使用的美分上限（`0`＝不限額）；`tool_streak_pause = 8` 表示一輪結束後，相同工具與參數連續呼叫達此次數就暫停（`0`＝關閉）。透過進階編輯器儲存會重新載入目標迴圈；直接修改 `config.toml` 則需重新啟動 gateway。`tool_streak_advisory` 另行控制既有提醒。個別上限可在交辦目標時填寫；`/goals` 顯示費用，並讓有權限的操作者提高暫停目標的上限後重試。
 
 
+## Codex CLI 更新
+
+在 macOS 與 Linux，一般員工以 WorkspaceWrite 權限執行時需要 Codex CLI 0.164.0 以上。已安裝版本過舊或無法確認時，Admin 會在儀表板各頁上方看到目前版本與「**更新 Codex CLI**」按鈕。按下後會在閘道主機執行 `npm install -g @openai/codex` 並顯示進度。確認更新成功後，提示會消失，不必重啟閘道。
+
+npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製按鈕。如果優先找到的仍是 Homebrew 或獨立安裝的舊版，提示會顯示該執行檔路徑；請更新或移除那份舊版，再按「重新偵測」。無法確認版本時也會另行說明，不會顯示成功。Windows 不適用這項版本要求。
+
 ## 存檔的共通規則
 
 - 系統設定（`config.toml`）透過 `system.update_config` 寫入，只有管理員能用。頁面只送出有改動的欄位；沒有改動時不送出，顯示「沒有變更，不需要儲存。」
@@ -50,7 +56,7 @@
 | 地端檔案根目錄 | `[files] allowed_roots`（完整路徑，不接受檔案系統根目錄，最多 64 個） | 立即 |
 | 密鑰管理 → 進階：密鑰後端 | 1Password：`onepassword_host`、`onepassword_vault`、存取權杖；Infisical：`infisical_addr`、`infisical_project_id`、`infisical_environment`、存取權杖。權杖加密存成 `*_enc` | 不回報需要重啟 |
 
-沒有指定員工的全域背景工作（例如選擇執行員工、建立遮罩規則）預設使用 Claude／`claude-haiku-4-5`。選擇支援的後端並填入相容模型；伺服器拒絕已移除的 `gemini` 與未知後端。清空模型會移除設定鍵：Claude 使用 `claude-haiku-4-5`，OpenAI 相容端點必須指定模型。Codex 也可用受限輔助模式執行，模型留白時使用 CLI 預設值。Grok、Antigravity 與通用 CLI 即使可儲存設定，執行時仍拒絕。非 Claude 後端填入已知其他廠商的模型時，頁面會顯示警告。儲存需要管理員權限，沿用既有設定寫入流程。所選全域後端為 Claude、且沒有員工使用 Claude 執行環境時，頁面會顯示警告；這不代表系統已檢查 Claude 登入狀態。
+沒有指定員工的全域背景工作（例如選擇執行員工、建立遮罩規則）預設使用 Claude／`claude-haiku-4-5`。選擇支援的後端並填入相容模型；伺服器拒絕已移除的 `gemini` 與未知後端。清空模型會移除設定鍵：Claude 使用 `claude-haiku-4-5`，OpenAI 相容端點必須指定模型。Codex 也可用受限輔助模式執行，模型留白時使用 CLI 預設值。Grok 與通用 CLI 即使可儲存設定，執行時仍拒絕。非 Claude 後端填入已知其他廠商的模型時，頁面會顯示警告。儲存需要管理員權限，沿用既有設定寫入流程。所選全域後端為 Claude、且沒有員工使用 Claude 執行環境時，頁面會顯示警告；這不代表系統已檢查 Claude 登入狀態。
 
 `[general] log_level`（常用 → 一般設定 → 日誌等級）存檔後立即套用；只有在環境變數 `RUST_LOG` 已設定時無法套用，這時回報需要重啟。帳號輪替策略與限流冷卻時間存檔後會清掉輪替快取，下一次呼叫就用新設定（之前最多延遲 30 分鐘）。
 
@@ -106,8 +112,8 @@
 | 腦袋與引擎 → 推理力度 | `[model] effort` |
 | 腦袋與引擎 → AI 後端／備援後端 | `[runtime] provider`／`fallback`，新增 qwen、kimi、copilot、kiro、cursor、vibe、opencode |
 | 腦袋與引擎 → 精簡啟動內容 | `[runtime] minimal_context` |
-| 腦袋與引擎 → 單次執行時間上限 | `[runtime] timeout_secs`：整數秒，預設 300，範圍 30～3600；適用 Codex／Grok／Antigravity／其他 CLI／OpenAI 相容 API；Claude 另有固定 30 分鐘上限 |
-| 腦袋與引擎 → 輔助模型 | `[model] utility`：Codex 與 OpenAI 相容 API 留白時沿用主要模型；Claude 預設 `claude-haiku-4-5`；Grok、Antigravity 與通用 CLI 改用全域背景設定 |
+| 腦袋與引擎 → 單次執行時間上限 | `[runtime] timeout_secs`：整數秒，預設 300，範圍 30～3600；適用 Codex／Grok／其他 CLI／OpenAI 相容 API；Claude 另有固定 30 分鐘上限 |
+| 腦袋與引擎 → 輔助模型 | `[model] utility`：Codex 與 OpenAI 相容 API 留白時沿用主要模型；Claude 預設 `claude-haiku-4-5`；Grok 與通用 CLI 改用全域背景設定 |
 | 腦袋與引擎 → 一員工四角色 | `[team] enabled`、`[team.roles.<角色>]` |
 | 自動化 → 夜間整理 | `[night_engine] enabled` |
 | 整合 → 專屬通道（v1.76.0） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`，經 `agents.channels.*` 設定（管理員設定，負責人看得到狀態；見[專屬通道](per-employee-channels.md)） |
@@ -115,13 +121,13 @@
 | 自動化 → 記憶 → 決策延續、決定保留天數 | `[memory] decision_continuity`、`decision_ttl_days`（1 到 3650） |
 | 進階 → 模型進階 → 進階鍵值 | 任意 `[區段] 鍵`，每列帶型別（字串、整數、小數、布林、字串陣列）；寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` 區段不能在這裡改（v1.76.0：新增 `prompt`、`os_watch`、`budget`，裡面有只限管理員的設定，例如 `prompt.cli_bare_mode`，管理員改用設定檔進階編輯修改） |
 
-單次執行時間上限與容器任務的逾時設定分開儲存。伺服器會拒絕非整數或超出 30～3600 秒的值；手動編輯檔案時，超出範圍的整數會調整到界線，型別錯誤則用預設值，兩者都會記錄警告。Antigravity 的外層最後上限另加 30 秒。OpenAI 相容 API 員工需要在 `utility` 或 `preferred` 指定模型；Codex 可使用 CLI 預設模型；Grok、Antigravity 與通用 CLI 員工改用全域背景設定。輔助模型與 runtime 的廠商家族不符時，畫面會提醒對話壓縮、事實擷取等背景工作將失敗。
+單次執行時間上限與容器任務的逾時設定分開儲存。伺服器會拒絕非整數或超出 30～3600 秒的值；手動編輯檔案時，超出範圍的整數會調整到界線，型別錯誤則用預設值，兩者都會記錄警告。OpenAI 相容 API 員工需要在 `utility` 或 `preferred` 指定模型；Codex 可使用 CLI 預設模型；Grok 與通用 CLI 員工改用全域背景設定。輔助模型與 runtime 的廠商家族不符時，畫面會提醒對話壓縮、事實擷取等背景工作將失敗。
 
 提高 `timeout_secs` 的實際上限需要管理員。員工擁有者可降低上限；清空設定會還原為 300 秒，若因此高於目前上限，同樣需要管理員。
 
 Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
 
-輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok、Antigravity 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。既有評審上層可依降級策略，不帶不支援的指定重試，仍須遵守相同模式。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](../../features/zh-TW/05-security-defense.md)。
+輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。既有評審上層可依降級策略，不帶不支援的指定重試，仍須遵守相同模式。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](../../features/zh-TW/05-security-defense.md)。
 
 **只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）與（v1.76.0）`[permissions] allowed_channels`，`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（v1.76.0）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
 

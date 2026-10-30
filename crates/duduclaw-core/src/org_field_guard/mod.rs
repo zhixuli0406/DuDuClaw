@@ -83,7 +83,7 @@ pub use operator_cmd::{
 };
 pub use real_path::resolve_real_path;
 use real_path::with_real_path;
-mod rules;
+pub(crate) mod rules;
 
 pub use rules::{
     AGENT_CAPABILITY_SECTION, AGENT_EDITABLE_SECTIONS, AGENT_ORG_FIELDS, AGENT_SECURITY_KEYS,

@@ -115,9 +115,6 @@ executable = "/opt/runtime/claude"
 image = "registry.example/discovery-codex@sha256:<64-lowercase-hex-digest>"
 executable = "/usr/local/bin/codex"
 
-[discovery.attempt.runtimes.antigravity]
-image = "registry.example/discovery-agy@sha256:<64-lowercase-hex-digest>"
-executable = "/usr/local/bin/agy"
 
 [discovery.attempt.runtimes.grok]
 image = "registry.example/discovery-grok@sha256:<64-lowercase-hex-digest>"
@@ -149,13 +146,12 @@ timing_sensitive = false
 
 ## Runtime と隔離の境界
 
-Discovery は 6 つの runtime ファミリーを同じ保証のもとで実行します。attempt は自分のノードディレクトリ内でのみ作業し、ファイルの読み取り・書き込み・編集・検索と shell コマンドの実行だけができ（MCP、Web アクセス、subagent、ブラウザー、画像生成は使えません）、ステップ上限（`max_turns`）で止まります。
+Discovery は 4 つの runtime ファミリーを同じ保証のもとで実行します。attempt は自分のノードディレクトリ内でのみ作業し、ファイルの読み取り・書き込み・編集・検索と shell コマンドの実行だけができ（MCP、Web アクセス、subagent、ブラウザー、画像生成は使えません）、ステップ上限（`max_turns`）で止まります。
 
 | Runtime | 設定キー（`[discovery.attempt.runtimes.<キー>]`） | ステップ上限 | ツール制限 | 受け付ける認証情報 |
 |---|---|---|---|---|
 | Claude | `claude` | ネイティブの `--max-turns` | `--tools` と `--allowedTools` | `ANTHROPIC_API_KEY` または `CLAUDE_CODE_OAUTH_TOKEN` |
 | Codex | `codex` | gateway がカウント | `-c` の上書きで MCP、web、マルチエージェント、hook、プラグイン、メモリーを無効化 | `OPENAI_API_KEY`（同じ値を `CODEX_API_KEY` にも設定）、または認証情報ドキュメント |
-| Antigravity（`antigravity`、別名 `agy`） | `antigravity` | gateway がカウント | `PreToolUse` hook がファイル／shell 以外のツールをすべて拒否 | `GEMINI_API_KEY` または `GOOGLE_API_KEY` のみ |
 | Grok | `grok` | ネイティブの `--max-turns` | `--tools`、`--disallowed-tools`、`--disable-web-search`、`--no-subagents`、`--no-plan` | `XAI_API_KEY`、または認証情報ドキュメント |
 | OpenAI 互換（`openai-compat`、別名 `openai_compat`） | `openai-compat` | adapter 自身のループ | adapter はファイルと shell のツールのみ提供 | 設定された provider の key。`base_url` の設定も必要 |
 
@@ -165,7 +161,7 @@ Discovery は 6 つの runtime ファミリーを同じ保証のもとで実行�
 
 gateway は各 attempt のイベントストリームを 1 行ずつ読み、自分で検査します。表の CLI フラグは第二の防御線です。そのため、ネイティブのステップフラグを持たない runtime も、持つ runtime と同じ上限になります。
 
-- **ステップ上限。** attempt が `max_turns` を超えると、gateway がそのコンテナーを停止します。これはエラーではなく、Claude と同様に workspace にあるものがそのまま採点されます。Codex の 1 ステップはファイルまたは shell ツールの 1 回の呼び出し、Antigravity の 1 ステップはモデルの 1 回の生成です。Codex は 1 回の生成で複数のツールを並列に呼ぶことがあるため、その上限が Claude より緩くなることはありません。
+- **ステップ上限。** attempt が `max_turns` を超えると、gateway がそのコンテナーを停止します。これはエラーではなく、Claude と同様に workspace にあるものがそのまま採点されます。Codex の 1 ステップはファイルまたは shell ツールの 1 回の呼び出し の 1 ステップはモデルの 1 回の生成です。Codex は 1 回の生成で複数のツールを並列に呼ぶことがあるため、その上限が Claude より緩くなることはありません。
 - **ツール制限。** attempt がファイルと shell 以外のツールを 1 つでも使うと、gateway はそれを停止して attempt を破棄し、探索全体を停止コード `tool_violation` で終了します。再試行はしません。監査ログには `discovery_tool_surface_violation` イベントが記録されます。
 
 ### 認証情報
@@ -174,19 +170,16 @@ gateway は各 attempt のイベントストリームを 1 行ずつ読み、自
 
 CLI がコンテナー内で更新した token は書き戻されません。コンテナー終了時に home が削除されるためです。Discovery には専用のログインを使ってください（別の `CODEX_HOME` または `GROK_HOME` で一度ログインし、そのファイルをプールに入れます）。期限が切れたら入れ直します。日常使いのログインと同じ `auth.json` を共有すると、provider が refresh token を回転させる場合に片方がログアウトされる可能性があります。実際の挙動を示す一次情報は現時点でありません。API key にはこの問題がありません。
 
-Antigravity は Gemini API key のみで動作します。Google アカウントのログインは OS のキーチェーンに保存され、コンテナー内で使える経路がありません。
 
 アカウントプール内で、選択した runtime に使える認証情報を持たないアカウントはスキップされます。CLI が認証失敗を報告した場合、そのアカウントは同じ attempt 内では再使用されません。プールに他の使えるアカウントがなければ、同じ無効な認証情報で再試行を繰り返さず `no_account` で終了します。キーと認証情報ドキュメントは環境変数名でコンテナーに渡され、値がホストのプロセスのコマンドラインに現れることはありません。
 
 ### 既知の制限
 
 1. `sandbox = "none"`（運用者専用の unconfined 実験モード）は引き続き Claude のみ対応です。このモードの他の runtime は、未対応の能力として拒否されます。
-2. Antigravity のサブスクリプションログインはコンテナー内で使えません。Gemini API key のみ使えます。
 3. Codex と Grok の認証情報ドキュメントは、token 更新後に書き戻されません（上記参照）。
 4. Codex の attempt がステップ上限で停止された場合、費用は不明です。Codex は token 使用量をターン終了時にしか報告しないためです。
-5. Codex のストリームはモデルを報告しないため、node のモデル欄は空のままです。Antigravity は開始イベントにモデルが含まれる場合のみ記録します。
+5. Codex のストリームはモデルを報告しないため、node のモデル欄は空のままです。
 6. gateway の検査が読むのは、コンテナー内の CLI 自身が出力するイベントストリームです。AI が通常の方法で許可されていないツールを呼び出した場合は検出できます。コンテナー内のプロセスが意図的にストリームを偽造または攪乱した場合、それを囲い込むのはコンテナー境界と予算上限（呼び出し回数、時間）です。ストリームに解析できない行が 3 行を超えて現れると、attempt は `tool_violation` で停止します。
-7. Antigravity の `PreToolUse` hook 設定は attempt が書き込める home 内にあるため、第二の防御線にとどまります。attempt を破棄するのは gateway の検査です。
 
 正式な run は attempt と evaluator に Container を要求します。Attempt に渡すのは自分の書き込み可能 workspace、明示的に公開された完了 workspace の不変 snapshot、信頼する読み取り専用設定のみです。非 root、読み取り専用 root filesystem、メモリー／プロセス／CPU 制限、上限付き tmpfs、信頼する deadline supervisor を使用します。結果を受け入れる前に cleanup を確認し、未確認の cleanup があれば実行を止めます。
 

@@ -13,8 +13,8 @@
 # the gateway with HOME pointing at it (the printed command does): the gateway
 # and the AI CLI it spawns look for logins and settings under HOME, so a
 # gateway started with only DUDUCLAW_HOME changed would use the operator's own
-# CLI login and quota, and an Antigravity API-key setting would rewrite the
-# operator's own settings file.
+# CLI login and quota, and runtime setup could rewrite the operator's own
+# settings files.
 set -euo pipefail
 
 PORT=18977

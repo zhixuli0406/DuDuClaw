@@ -25,7 +25,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/10-cognitive-memory.md](features/10-cognitive-memory.md) | Cognitive memory — human-inspired memory with forgetting |
 | [features/11-token-compression.md](features/11-token-compression.md) | Prompt budget enforcement — estimate, three stages, or refuse |
 | [features/12-industry-templates.md](features/12-industry-templates.md) | Industry templates & Odoo ERP bridge |
-| [features/13-multi-runtime.md](features/13-multi-runtime.md) | Multi-runtime agent execution — Claude / Codex / Antigravity / Grok / OpenAI-compatible (Gemini CLI removed) |
+| [features/13-multi-runtime.md](features/13-multi-runtime.md) | Multi-runtime agent execution — Claude / Codex / Grok / OpenAI-compatible (Gemini CLI removed) |
 | [features/14-voice-pipeline.md](features/14-voice-pipeline.md) | Voice pipeline — STT/TTS over two separately-wired paths |
 | [features/15-skill-lifecycle.md](features/15-skill-lifecycle.md) | Skill lifecycle engine — 6-stage automated extraction |
 | [features/16-session-memory-stack.md](features/16-session-memory-stack.md) | Session memory stack — pinned instructions + snowball recap + key facts |
@@ -144,7 +144,6 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [todo/TODO-channel-quote-context-remaining.md](todo/TODO-channel-quote-context-remaining.md) | 其餘通道引用/回覆上下文缺口（全通道掃描結果）追蹤 |
 | [todo/TODO-gateway-store-reopen-per-rpc.md](todo/TODO-gateway-store-reopen-per-rpc.md) | gateway 三個 SQLite store 每次 dashboard RPC 都重開（日誌噪音；已排除洩漏嫌疑） |
 | [todo/TODO-ai-runtimes-2026-09.md](todo/TODO-ai-runtimes-2026-09.md) | 全 runtime 開箱即用、本地模型、微調介面（2026-09）：決策紀錄與 WP-A～WP-F 工作單元規格／完成狀態 |
-| [todo/TODO-antigravity-cli-migration.md](todo/TODO-antigravity-cli-migration.md) | Gemini CLI → Antigravity CLI (`agy`) migration tracking |
 | [todo/TODO-genspark-workspace-shell.md](todo/TODO-genspark-workspace-shell.md) | 「工作空間」雙層體驗（消費級外殼＋進階儀表板）與桌面 app 的實作追蹤 |
 
 ## User & Developer Guides

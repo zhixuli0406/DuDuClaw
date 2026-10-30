@@ -80,7 +80,7 @@ steering_enabled = false           # 任務中送指示的開關
 - 上限在每一輪之前檢查，用的是上一輪已記錄的花費。所以進行中的那一輪，以及同時在跑的子任務，可能在下一次檢查之前就讓一次執行超過上限，超過多少不受這個設定限制。AI 員工自己的月預算（`agent.toml [budget]`）也在每一輪之前檢查，用完就把這次執行轉人工處理。
 - 系統在把某次執行的一輪交給 AI 執行環境之前，會先記錄這一輪已開始。沒有這筆紀錄的一輪不花錢：被派工閘取消的一輪、在開始前就被拒絕的一輪（例如被委派檢查拒絕），以及還在佇列中等待的一輪（閘道重啟之後也一樣）。所以暫停再恢復一次執行，不會用掉它的上限。有這筆紀錄的一輪算作跑過，即使執行環境之後失敗、在員工認領任務之前失敗，或閘道在這一輪中途當機而訊息回到佇列。
 - 跑過但花費沒有量到的一輪，以單次上限全額計，不當成 0。完全沒有 token 數的用量紀錄（有些執行環境不回報，見下）視為沒量到。讀不到成本資料時寧可不醒，並在動態牆記一筆。
-- 每種執行環境都會記錄每次執行的花費：Claude、Codex、Antigravity、Grok 與 OpenAI 相容。Grok 不回報 token 用量，所以數字是依送出與收到文字的長度估計。沒有回報用量的 Antigravity 執行、沒有用量事件的 Codex 執行，以及從別的執行環境容錯切換過來的 Claude 一輪（它回報的是 0），都算沒量到。使用這類執行環境時，不論它是員工的還是驗收判官的（`[dispatch] judge_provider`），一輪沒量到就會用掉整個單次上限，所以一次執行通常只有一輪，那一輪被駁回時就轉人工處理。建立持續任務（命令列與 RPC）時會把這一點以警告印出，`duduclaw doctor` 會列出這類持續任務。
+- 每種執行環境都會記錄每次執行的花費：Claude、Codex、Grok 與 OpenAI 相容。Grok 不回報 token 用量，所以數字是依送出與收到文字的長度估計。沒有用量事件的 Codex 執行，以及從別的執行環境容錯切換過來的 Claude 一輪（它回報的是 0），都算沒量到。使用這類執行環境時，不論它是員工的還是驗收判官的（`[dispatch] judge_provider`），一輪沒量到就會用掉整個單次上限，所以一次執行通常只有一輪，那一輪被駁回時就轉人工處理。建立持續任務（命令列與 RPC）時會把這一點以警告印出，`duduclaw doctor` 會列出這類持續任務。
 - 預算期額度用完，持續任務進入「預算暫停」，等下一期自動恢復，期間累積的喚醒合併成一次。
 - 期限、迭代次數與花費在重試、重啟之間都不會歸零；睡一天醒來不會多出一天的額度。
 
@@ -223,7 +223,7 @@ v1.70.0 之後的版本起，等待中的請求如果是在已經改變的狀態
 | OpenAI 相容執行環境 | 沒有內建工具；DuDuClaw MCP 子程序拿到 `DUDUCLAW_LANE=explore`；lane 內不掛載 `agent.toml [mcp.external]` 伺服器（沒有東西管制它們）；2026-10-20 起，員工 `.mcp.json` 裡的其他伺服器經過管制的 proxy 掛載並帶 `DUDUCLAW_LANE=explore`，只列出 `read` 工具 |
 | MoA 模型、`inference_mode = "local"` | 拒絕（`explore_lane_unsupported`）；lane 內略過混合模式的本機分流 |
 | Codex | 以 `-s read-only` 與 `approval_policy=never` 執行，不論員工自己的權限等級（作業系統層沙箱，擋寫入與網路，不理會設定檔的允許清單），DuDuClaw MCP server 帶 `DUDUCLAW_LANE=explore` 登記，2026-10-19 起員工的第三方伺服器也經過管制的 proxy 帶同一個變數登記；Codex 0.156.1 在 `-s read-only` 下拒絕所有 MCP 呼叫，所以沒有工具可呼叫（2026-09-24 在 0.156.1 驗證過，這次沒有重跑） |
-| Antigravity、Grok、通用 CLI | 拒絕：這一輪在派工前失敗（`explore_lane_unsupported`），而且這些執行環境的 `execute` 裡也有同樣的拒絕，以防備援切換到它們。Antigravity 沒有唯讀模式（`agy --sandbox` 只限制終端機，且它使用者層級的 `permissions.allow` 由同一系統使用者的所有員工共用）；Grok 與通用 CLI 沒有可證明唯讀的機制 |
+| Grok、通用 CLI | 拒絕：這一輪在派工前失敗（`explore_lane_unsupported`），而且這些執行環境的 `execute` 裡也有同樣的拒絕，以防備援切換到它們。Grok 與通用 CLI 沒有可證明唯讀的機制 |
 | 任務沙箱（`[container] sandbox_enabled`） | 派工前拒絕（沙箱給員工一個 shell） |
 
 被拒絕的一輪算一次不成功的執行，所以連續失敗最後會讓持續任務暫停。lane 讀不出來也會讓這一輪失敗（`explore_lane_unreadable`）；所屬執行的 lane 讀不出來時，heartbeat 叫醒的子任務也一樣失敗。尚未在真實 gateway 上跑過。

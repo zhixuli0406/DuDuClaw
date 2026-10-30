@@ -32,6 +32,36 @@
 //! must confirm. `verified: false` is surfaced to the dashboard so the UI can
 //! say "尚未實機驗證" rather than pretending.
 
+/// Runtime identifiers retained only to refuse stale configuration explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedRuntime {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub removed_in: &'static str,
+}
+
+/// Removed runtimes and their former aliases. Never used for runtime selection.
+pub const REMOVED_RUNTIMES: &[RemovedRuntime] = &[
+    RemovedRuntime { id: "gemini", display_name: "Gemini CLI", removed_in: "v1.75.0" },
+    RemovedRuntime { id: "antigravity", display_name: "Antigravity (agy)", removed_in: "v1.77.1" },
+    RemovedRuntime { id: "agy", display_name: "Antigravity (agy)", removed_in: "v1.77.1" },
+];
+
+/// Match the normalization accepted by runtime configuration parsers.
+pub fn removed_runtime(id: &str) -> Option<&'static RemovedRuntime> {
+    REMOVED_RUNTIMES.iter().find(|removed| removed.id.eq_ignore_ascii_case(id.trim()))
+}
+
+impl RemovedRuntime {
+    /// Explain the refusal without selecting a replacement vendor or model.
+    pub fn refusal(&self, location: &str) -> String {
+        format!(
+            "{location} still selects the removed {} runtime (removed in {}); choose a supported runtime and model",
+            self.display_name, self.removed_in
+        )
+    }
+}
+
 /// A short human-facing string in the three locales DuDuClaw ships.
 ///
 /// Any localized string in this table is either absent entirely or present in
@@ -323,7 +353,7 @@ pub struct RuntimeSpec {
     /// Primary binary name on PATH.
     pub binary: &'static str,
     /// Accepted alternative identifiers for [`spec_for`] / `RuntimeType::parse`
-    /// (e.g. `agy` → antigravity). NOT binary names — see
+    /// (e.g. `grok-cli` → grok). NOT binary names — see
     /// [`Self::binary_aliases`].
     pub aliases: &'static [&'static str],
     /// Additional binary names probed after [`Self::binary`], for CLIs shipped
@@ -504,68 +534,6 @@ pub const CATALOG: &[RuntimeSpec] = &[
             ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
         ],
         vendor_url: "https://github.com/openai/codex",
-        verified: true,
-        deprecation: None,
-    },
-    // ── Google Antigravity (`agy`) ───────────────────────────────────────
-    RuntimeSpec {
-        id: "antigravity",
-        display_name: "Google Antigravity",
-        binary: "agy",
-        aliases: &["agy"],
-        binary_aliases: &[],
-        // The official installer drops `agy` in `$HOME/.local/bin`, the FIRST
-        // candidate `which_cli_in_home` probes — so post-install re-detect
-        // turns green with no PATH surgery.
-        install: InstallChannel::PosixScript {
-            url: "https://antigravity.google/cli/install.sh",
-        },
-        headless: HeadlessSpec {
-            // Re-verified on agy 1.2.10–1.2.14 (`runtime/antigravity.rs`):
-            // `agy -p <prompt>` (the prompt is `-p`'s value and must be last),
-            // model via `--model` taking the DISPLAY name. The runtime module
-            // adds `--output-format stream-json` itself.
-            args_template: &["-p", "{prompt}"],
-            output: OutputFormat::Text,
-            model_flag: Some("--model"),
-            model_env: None,
-            extra_env: &[],
-        },
-        auth: AuthSpec {
-            // agy 1.1.13+ reads `GEMINI_API_KEY`, but ONLY together with
-            // `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`;
-            // the runtime writes that when `config.toml [antigravity] auth =
-            // "api_key"`. (`ANTIGRAVITY_API_KEY`, used here until 2026-10, never
-            // existed — the binary does not contain the string.)
-            api_key_env: Some("GEMINI_API_KEY"),
-            // There is no `agy login` subcommand (1.2.14: `unexpected argument
-            // "login"`, exit 2). Sign-in happens inside the interactive TUI
-            // started by bare `agy`, which cannot be driven headlessly.
-            login: LoginMethod::None,
-            // `agy` has no documented single credential file; presence is
-            // inferred from the CLI itself, so the credential-store card is
-            // skipped for this runtime.
-            credential_paths: &[],
-            tos_note: Some(LocaleText {
-                // Cited terms only (antigravity.google/terms §6, fetched
-                // 2026-10-16); see `crate::subscription_risk`.
-                en: "Google's Antigravity terms (antigravity.google/terms, section 6) say using third-party software, tools or services to access the service is a breach that may lead to suspension or termination of the Antigravity and/or Gemini CLI accounts; the same section also lists using the service in connection with products not provided by Google as abuse. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
-                zh_tw: "Google 的 Antigravity 條款（antigravity.google/terms 第 6 節）寫明：用第三方軟體、工具或服務存取該服務屬於違約，可能導致 Antigravity 和／或 Gemini CLI 帳號被停權或終止；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
-                ja_jp: "Google の Antigravity 規約（antigravity.google/terms 第 6 条）では、サードパーティのソフトウェア・ツール・サービスでサービスにアクセスすることは契約違反とされ、Antigravity や Gemini CLI のアカウントの停止または終了の理由になり得ます。同じ条では、Google が提供していない製品と組み合わせてサービスを使うことも不正利用に含めています。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
-            }),
-            login_hint: Some(LocaleText {
-                en: "Sign in by running `agy` in a terminal on this machine and following the prompts. For remote or container deployments use API-key mode: config.toml [antigravity] auth = \"api_key\" plus a Gemini API key.",
-                zh_tw: "請在這台主機的終端機執行 `agy`，依畫面提示完成登入。遠端或容器部署請改用 API key 模式：config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key。",
-                ja_jp: "このマシンのターミナルで `agy` を実行し、画面の案内に従ってサインインしてください。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
-            }),
-        },
-        mcp: true,
-        model_prefixes: &["gemini"],
-        fallback_models: &[
-            ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
-            ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
-        ],
-        vendor_url: "https://antigravity.google/docs/cli",
         verified: true,
         deprecation: None,
     },
@@ -1162,7 +1130,7 @@ pub fn all_ids() -> impl Iterator<Item = &'static str> {
     CATALOG.iter().map(|s| s.id)
 }
 
-/// `"claude|codex|gemini|…"` — the vendor list embedded in error strings, so
+/// `"claude|codex|grok|…"` — the vendor list embedded in error strings, so
 /// a new runtime never has to be remembered in a message somewhere.
 pub fn id_list_pipe() -> String {
     CATALOG
@@ -1459,16 +1427,10 @@ mod tests {
     }
 
     #[test]
-    fn equal_length_prefix_ties_go_to_the_earlier_catalog_entry() {
-        // Gemini model ids now resolve to Antigravity after Gemini CLI removal.
-        assert_eq!(
-            runtime_for_model("gemini-3-pro-preview").unwrap().id,
-            "antigravity"
-        );
-        assert_eq!(
-            runtime_for_model("gemini-2.5-flash").unwrap().id,
-            "antigravity"
-        );
+    fn gemini_models_have_no_cli_runtime() {
+        for model in ["gemini-3-pro-preview", "gemini-2.5-flash", "google/gemini-3.1-pro"] {
+            assert!(runtime_for_model(model).is_none(), "{model}");
+        }
     }
 
     #[test]
@@ -1523,25 +1485,6 @@ mod tests {
         }
     }
 
-    /// 2026-10 (agy 1.2.14, measured): `ANTIGRAVITY_API_KEY` does not exist and
-    /// there is no `agy login`. The key route is `GEMINI_API_KEY` + the
-    /// `[antigravity] auth = "api_key"` setting; sign-in is the bare `agy` TUI.
-    #[test]
-    fn antigravity_names_the_real_key_and_has_no_scripted_login() {
-        let spec = spec_for("antigravity").unwrap();
-        assert_eq!(spec.auth.api_key_env, Some("GEMINI_API_KEY"));
-        assert_eq!(spec.auth.login, LoginMethod::None);
-        assert!(spec.auth.login.args().is_empty());
-        for text in [spec.auth.tos_note, spec.auth.login_hint].into_iter().flatten() {
-            for t in [text.en, text.zh_tw, text.ja_jp] {
-                assert!(!t.contains("ANTIGRAVITY_API_KEY"), "stale variable in {t:?}");
-                assert!(t.contains("[antigravity] auth"), "API-key mode not named in {t:?}");
-            }
-        }
-        let hint = spec.auth.login_hint.unwrap();
-        assert!(hint.zh_tw.contains("`agy`"), "{}", hint.zh_tw);
-    }
-
     /// OpenAI publishes a Sign in with ChatGPT program.
     #[test]
     fn codex_tos_note_cites_current_vendor_page() {
@@ -1571,15 +1514,21 @@ mod tests {
     }
 
     #[test]
-    fn removed_gemini_runtime_is_not_selectable() {
-        assert!(spec_for("gemini").is_none());
-        assert!(crate::types::RuntimeType::parse("gemini").is_none());
-        assert!(!all_ids().any(|id| id == "gemini"));
-        assert_eq!(
-            runtime_for_model("gemini-3-pro-preview").unwrap().id,
-            "antigravity"
-        );
+    fn removed_runtimes_are_not_selectable() {
+        for removed in REMOVED_RUNTIMES {
+            assert!(spec_for(removed.id).is_none());
+            assert!(crate::types::RuntimeType::parse(removed.id).is_none());
+            assert!(!all_ids().any(|id| id == removed.id));
+            assert_eq!(removed_runtime(&format!(" {} ", removed.id.to_uppercase())), Some(removed));
+            let message = removed.refusal("agent.toml [runtime] provider");
+            assert!(message.contains(removed.display_name));
+            assert!(message.contains(removed.removed_in));
+            assert!(message.contains("choose a supported runtime and model"));
+        }
+        assert!(removed_runtime("codex").is_none());
+        assert!(runtime_for_model("gemini-3-pro-preview").is_none());
     }
+
 }
 
 /// The installation-aware view of the same immutable CLI catalog.

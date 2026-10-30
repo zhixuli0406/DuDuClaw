@@ -16,7 +16,7 @@
 
   `<版本>` 換成你的 gateway 版本（標籤前面有 `v`，例如 `v1.67.0`），或改用自己的 image（見下方設定表）。
 - 容器內的 AI 能用的帳號（見[各 runtime 的憑證](#各-runtime-的憑證)）。
-- 支援的 runtime：Claude、Codex、Antigravity、Grok、OpenAI 相容。
+- 支援的 runtime：Claude、Codex、Grok、OpenAI 相容。
 
 ## 為單一員工開啟
 
@@ -69,7 +69,7 @@ timeout_ms = 600000     # 單一任務的時間上限（選填）
 | 鍵 | 預設 | 說明 |
 |---|---|---|
 | `image` | `ghcr.io/zhixuli0406/duduclaw:v<目前版本>` | 要執行的 image，必須已在本機。 |
-| `[container.sandbox.executables]` | `claude`、`codex`：`/usr/bin/<名稱>`；`antigravity`：`/usr/local/bin/agy`；`grok`：`/usr/local/bin/grok`；`openai-compat`：`/usr/local/bin/python3` | 各 runtime 在 image 內的執行檔絕對路徑，鍵名為 `claude`、`codex`、`antigravity`、`grok`、`openai-compat`。只有自訂 image 才需要改。 |
+| `[container.sandbox.executables]` | `claude`、`codex`：`/usr/bin/<名稱>`；`grok`：`/usr/local/bin/grok`；`openai-compat`：`/usr/local/bin/python3` | 各 runtime 在 image 內的執行檔絕對路徑，鍵名為 `claude`、`codex`、`grok`、`openai-compat`。只有自訂 image 才需要改。 |
 | `memory_bytes` | `4294967296`（4 GiB） | 記憶體上限（swap 與記憶體相同）。最多 64 GiB。 |
 | `pids` | `128` | 行程數上限。 |
 | `cpu_millis` | `1000` | CPU 上限，單位是千分之一核。 |
@@ -100,7 +100,6 @@ when_unavailable = "fail"
 | Claude | API key，或帶 token 的 OAuth 帳號（用 `claude setup-token` 建立）。只存在於主機鑰匙圈的登入狀態進不了容器。 |
 | Codex | API key，或憑證文件：OAuth 帳號所存的密鑰內容是 CLI 的 `auth.json`。 |
 | Grok | API key，或憑證文件（CLI 的 `auth.json`）。 |
-| Antigravity | Gemini API key。 |
 | OpenAI 相容 | 該 provider 的 API key。 |
 
 沒有合適的帳號時任務會失敗，錯誤訊息會指出這個 runtime 需要哪一種憑證。
@@ -185,4 +184,4 @@ duduclaw doctor
 - 腳本沙箱沒有啟動時的清理。執行腳本的行程（服務該員工的 `duduclaw mcp-server`，或 `duduclaw secaudit`）若在中途結束，腳本的容器會一直跑到腳本自己結束為止。
 - 在 Windows 上，腳本沙箱先試 WSL2，再試 Docker。WSL2 這條路（包括把 Windows 路徑轉成 WSL 路徑）只做過交叉編譯，還沒在真正的 Windows 主機上執行過。
 - gateway 本身跑在容器裡時再啟用任務沙箱，本指南沒有涵蓋，也沒有驗證過。
-- 實際跑過的範圍：用已發布的平台 image（`v1.66.1`），Codex、Antigravity、Grok 的 CLI 能在沙箱內啟動並連到各自的供應商（以無效金鑰驗證，供應商回拒絕）；另以 Codex 跑過一次完整的委派任務（那次用的是本機自建、內含相同 CLI 的 image，不是已發布的那一個）。Claude、Gemini CLI 與 OpenAI 相容 runtime 還沒有在沙箱內對真實供應商跑過。
+- 實際跑過的範圍：用已發布的平台 image（`v1.66.1`），Codex、Grok 的 CLI 能在沙箱內啟動並連到各自的供應商（以無效金鑰驗證，供應商回拒絕）；另以 Codex 跑過一次完整的委派任務（那次用的是本機自建、內含相同 CLI 的 image，不是已發布的那一個）。Claude 與 OpenAI 相容 runtime 還沒有在沙箱內對真實供應商跑過。

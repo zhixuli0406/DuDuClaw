@@ -10,7 +10,6 @@
 | Codex CLI | 推理摘要（`reasoning` 項目）與推理 token，執行完才出現 | 只有讀者能看文字時才加 `-c model_reasoning_summary=auto` |
 | OpenAI 相容 API（DeepSeek、Qwen、vLLM、OpenRouter 等） | 模型原文推理（`reasoning_content`、`reasoning`，或答案開頭的 `<think>…</think>`）；去識別化開啟時才顯示文字 | 沒有文字讀者時一律不改；有的話工具迴圈改用串流，推理邊寫邊出現 |
 | Anthropic Direct API | 思考摘要、未提供摘要與被加密的區塊，呼叫結束後出現 | 只有讀者能看文字、而且模型本來每次都會思考（Opus 5／5.5、Sonnet 5／5.5、Haiku 5.5、Fable、Mythos）時，才要求摘要顯示，費用不變 |
-| Antigravity（`agy`） | 目前沒有（只有計時） | 不改 |
 | Grok CLI | 沒有（只有計時） | 不改 |
 
 ## 細節
@@ -19,6 +18,5 @@
 - **Codex CLI。** 推理項目在執行結束後才讀（CLI 輸出目前還沒有逐行串流），所以摘要和答案同時出現。
 - **OpenAI 相容 API。** 開源模型回的是它自己的推理原文，所以只有開啟去識別化時才顯示文字，沒開時只顯示秒數、token 與提示。`<think>` 只在答案最開頭（去掉空白後）才算數；沒有收尾標籤時，後面全部當作推理。員工送出的答案不變：開頭的 `<think>` 區塊照舊會拿掉。工具迴圈的訊息（含推理段落）照供應商回傳的原樣送回模型。供應商不接受串流時改回一般呼叫，對話照常完成；串流答案沒有附用量時，用估計值記帳，並在 `cost_telemetry.db` 標 `usage_estimated = 1`。
 - **Anthropic Direct API 與操作員工具迴圈。** 每次呼叫後回報摘要。簽章與 `redacted_thinking` 資料原樣送回模型，從不顯示。
-- **Antigravity。** `tool` 以外的步驟類型只把名稱寫進 debug 紀錄，等知道詞彙後再對應。
 
-尚未用真額度驗證：目前的模型在 `claude -p` 下會不會回非空的思考文字、`codex exec` 在真帳號上何時送出推理項目、agy 的步驟詞彙。解析器是用固定測資與假 CLI 測過的。
+尚未用真額度驗證：目前的模型在 `claude -p` 下會不會回非空的思考文字、`codex exec` 在真帳號上何時送出推理項目。解析器是用固定測資與假 CLI 測過的。

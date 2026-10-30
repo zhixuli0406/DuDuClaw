@@ -3,7 +3,7 @@
 //! Only what the telemetry measured counts (`token_usage.episode_id = task
 //! id`); an occurrence with no measured row is charged its full reservation
 //! (`reserved_unknown`). A usage row with no token counts (a runtime that
-//! reported no usage, e.g. Antigravity without a `usage` block, or the Claude
+//! reported no usage, e.g. a response without a `usage` block, or the Claude
 //! runtime reached through the multi-runtime path, which reports zeros) is
 //! not a measurement: an occurrence with such a row is charged at least its
 //! reservation. A source that cannot be read is an error, and every

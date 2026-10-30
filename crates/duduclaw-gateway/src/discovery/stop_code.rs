@@ -110,7 +110,7 @@ mod tests {
             (AttemptInfraError::StrictUsdUnsupported("gemini".into()), "runtime_unsupported"),
             (AttemptInfraError::CleanupFailed("docker rm /var/tmp/secret-path failed".into()), "cleanup_failed"),
             (AttemptInfraError::IsolationUnavailable, "isolation_unavailable"),
-            (AttemptInfraError::RuntimeUnsupported("antigravity".into()), "runtime_unsupported"),
+            (AttemptInfraError::RuntimeUnsupported("unsupported".into()), "runtime_unsupported"),
             (AttemptInfraError::NoAccount, "no_account"),
             (AttemptInfraError::BudgetExhausted, "budget_exhausted"),
             (AttemptInfraError::RateLimited, "rate_limited"),

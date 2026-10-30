@@ -311,7 +311,8 @@ impl duduclaw_fork::judge::LlmCaller for GoalAcceptanceCaller {
                     ..Default::default()
                 })
         };
-        let hint = crate::judge_mode::judge_model_hint_from_home(Some(&self.home_dir));
+        let hint = crate::judge_mode::judge_model_hint_from_home(Some(&self.home_dir))
+            .map_err(duduclaw_fork::ForkError::Executor)?;
         let effective = if hint.is_some() {
             let (_, degraded) = crate::runtime_dispatch::resolve_hinted_utility(
                 &self.home_dir,
@@ -1221,3 +1222,22 @@ pub fn parse_verdict(raw: &str) -> AcceptanceVerdict {
     }
 }
 
+
+#[cfg(test)]
+mod removed_runtime_tests {
+    use super::GoalAcceptanceCaller;
+    use duduclaw_fork::judge::LlmCaller;
+
+    #[tokio::test]
+    async fn removed_judge_runtime_is_refused_before_default_utility_can_run() {
+        let home = tempfile::tempdir().unwrap();
+        let caller = GoalAcceptanceCaller { home_dir: home.path().to_path_buf() };
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            std::fs::write(home.path().join("config.toml"),
+                format!("[dispatch]\njudge_provider = {:?}\n", removed.id)).unwrap();
+            let error = caller.complete("must not call a model").await.unwrap_err().to_string();
+            assert!(error.contains(removed.removed_in), "{error}");
+            assert!(error.contains("choose a supported runtime and model"), "{error}");
+        }
+    }
+}

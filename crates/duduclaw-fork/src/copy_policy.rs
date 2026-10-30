@@ -70,8 +70,8 @@ const STRICT_EXTRA_PATTERNS: &[&str] = &[
 /// The parent's own copies stay untouched; branches still read them, because
 /// materializing a branch uses [`CopyPolicy::fork_default`].
 ///
-/// The other runtimes' configuration directories (`.agents/` holds the
-/// Antigravity MCP file, `.codex/`, `.gemini/`, `.grok/`) and `.claude.json`
+/// The runtime and shared configuration directories (`.agents/`,
+/// `.codex/`, `.gemini/`, `.grok/`) and `.claude.json`
 /// are excluded at the root for the same reason (N3): the CLI loads them at
 /// the next spawn. `.cursor/` too (2026-10-20): Grok loads its `mcp.json`.
 const AGENT_DIR_EXTRA_ROOT_ENTRIES: &[&str] =

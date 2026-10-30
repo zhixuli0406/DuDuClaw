@@ -67,7 +67,7 @@ category = "DB_FIELD"
 
 - **HTTP/SSE 型 MCP server。**這種 server 沒有子行程可以包,所以改寫邏輯直接放過它們,只留一行警告日誌,它們的工具結果照樣未遮蔽地送進模型。
 - *(已不再是缺口:PTY session pool 已於 2026-09 移除,現在每次 Claude spawn 都是改寫機制本來就掛得上的單次 spawn。)*
-- **codex／antigravity。**這幾個 runtime 自己的 MCP 註冊完全還沒接上 proxy。
+- **codex。**這幾個 runtime 自己的 MCP 註冊完全還沒接上 proxy。
 
 ---
 
@@ -505,7 +505,7 @@ priority = 30
 
 ## 邊界
 
-- **還有三個缺口,誠實列出。**HTTP/SSE 型 MCP server(沒有子行程可包,留警告日誌)。codex／antigravity 這幾個 runtime,自己的 MCP 註冊完全沒接上 proxy。以及本機推論的工具迴圈(`local_llm.rs`),本機模型的工具呼叫,proxy 與 `ToolInterceptor` 都碰不到。通道回覆(一般 spawn 與 one-shot PTY)與派工／cron／心跳／goal-loop 輪次都已涵蓋;以上三項還沒有。(第四個缺口 PTY session pool 隨著該連線池於 2026-09 移除而消失。)
+- **還有三個缺口,誠實列出。**HTTP/SSE 型 MCP server(沒有子行程可包,留警告日誌)。codex 這幾個 runtime,自己的 MCP 註冊完全沒接上 proxy。以及本機推論的工具迴圈(`local_llm.rs`),本機模型的工具呼叫,proxy 與 `ToolInterceptor` 都碰不到。通道回覆(一般 spawn 與 one-shot PTY)與派工／cron／心跳／goal-loop 輪次都已涵蓋;以上三項還沒有。(第四個缺口 PTY session pool 隨著該連線池於 2026-09 移除而消失。)
 - **登錄表描述的是形狀,不是語意。**`record_paths` 或 `table_arg` 打錯字不會讓某個欄位悄悄少一層保護,寫錯的項目要嘛直接載入失敗(fail-closed),要嘛什麼都命不中,而後者「試跑」會如實顯示零命中。
 - **`db_query` 只在 operator 明確寫下 `allowed_tables = ["*"]` 的來源上才存在。**沒有針對自由 SQL 的半調子或盡力而為的白名單檢查,設計上是整支工具直接拒用,不會假裝有在過濾。
 - **連線池是每次呼叫現開,不快取。**對一個 agent 一輪只會呼叫幾次的工具來說,這是對的取捨,而且代表憑證輪替或改設定會立刻生效,不用重啟 gateway。

@@ -3,7 +3,7 @@
 //! host-login adoption WARN and the gateway's refusal message).
 //!
 //! [`vendor_policy`] picks the notice and the terms URL for the vendor of a
-//! login (Anthropic, OpenAI, Google Gemini CLI / Antigravity, xAI, GitHub),
+//! login (Anthropic, OpenAI, Google Gemini CLI, xAI, GitHub),
 //! so a Codex or Gemini refusal never quotes Anthropic's policy. Every
 //! sentence is backed by the vendor page named next to its URL constant; where
 //! DuDuClaw found no published position, the notice says so.
@@ -31,14 +31,6 @@ pub const ANTHROPIC_LEGAL_URL: &str = "https://code.claude.com/docs/en/legal-and
 /// tools or services through Gemini CLI OAuth violates the applicable terms
 /// and may be grounds for suspension or termination of the account.
 pub const GEMINI_CLI_TERMS_URL: &str = "https://geminicli.com/docs/resources/tos-privacy/";
-
-/// Google Antigravity terms (fetched 2026-10-16). Section 6: using third
-/// party software, tools or services to access the Service (e.g. through
-/// Antigravity OAuth) is a breach, and may be grounds for suspension or
-/// termination of the Antigravity and/or Gemini CLI accounts. The same
-/// section lists using the Service in connection with products not provided
-/// by Google as abuse.
-pub const ANTIGRAVITY_TERMS_URL: &str = "https://antigravity.google/terms";
 
 /// Google's "Gemini Code Assist for individuals" deprecation notice (last
 /// updated 2026-10-09, read 2026-10-16). It says that starting 2026-06-18 the
@@ -94,7 +86,7 @@ pub fn subscription_risk_line_zh() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VendorPolicy {
     /// Stable vendor key (`anthropic`, `openai`, `google-gemini-cli`,
-    /// `google-antigravity`, `xai`, `github`, `other`).
+    /// `xai`, `github`, `other`).
     pub vendor: &'static str,
     pub notice_zh: &'static str,
     pub url: Option<&'static str>,
@@ -116,7 +108,7 @@ const ANTHROPIC_POLICY: VendorPolicy = VendorPolicy {
     url: Some(ANTHROPIC_LEGAL_URL),
 };
 
-/// Vendor terms for a runtime id (`claude`, `codex`, `antigravity`,
+/// Vendor terms for a runtime id (`claude`, `codex`,
 /// `grok`) or an `[[accounts]] provider` value (`anthropic`, `openai`,
 /// `gemini`/`google`, `xai`, `github`). An empty id means Anthropic (the
 /// default provider of an `[[accounts]]` entry). Anything else gets a
@@ -141,13 +133,6 @@ pub fn vendor_policy(id: &str) -> VendorPolicy {
                  Gemini Code Assist 個人版、Google AI Pro 與 Google AI Ultra 帳號已不能在 Gemini CLI 使用 Login with Google，\
                  付費 API 金鑰（Gemini API 或企業方案）仍可使用。要長期穩定使用，請改用 Gemini API 金鑰。",
             url: Some(GEMINI_CLI_TERMS_URL),
-        },
-        "antigravity" | "agy" => VendorPolicy {
-            vendor: "google-antigravity",
-            notice_zh: "Google 的 Antigravity 條款寫明：用第三方軟體、工具或服務存取該服務（例如透過 Antigravity OAuth）\
-                 屬於違約，可能導致 Antigravity 和 Gemini CLI 帳號被停權或終止；同一節也把搭配非 Google 提供的產品使用該服務列為濫用。DuDuClaw 執行的是原版 agy，\
-                 但是否落在這條範圍內由 Google 判斷。遠端或容器部署請改用 API 金鑰模式。",
-            url: Some(ANTIGRAVITY_TERMS_URL),
         },
         "grok" | "xai" => VendorPolicy {
             vendor: "xai",
@@ -189,7 +174,6 @@ mod tests {
         assert_eq!(vendor_policy("codex").url, Some(OPENAI_SIWC_TERMS_URL));
         assert_eq!(vendor_policy("openai").vendor, "openai");
         assert_eq!(vendor_policy("gemini").url, Some(GEMINI_CLI_TERMS_URL));
-        assert_eq!(vendor_policy("antigravity").url, Some(ANTIGRAVITY_TERMS_URL));
         assert_eq!(vendor_policy("grok").url, Some(XAI_TERMS_URL));
         assert_eq!(vendor_policy("xai").vendor, "xai");
         assert_eq!(vendor_policy("github").url, Some(GITHUB_COPILOT_TERMS_URL));
@@ -198,7 +182,7 @@ mod tests {
         assert_eq!(other.url, None);
         assert_eq!(other.line_zh(), other.notice_zh);
         // Non-Anthropic notices never borrow Anthropic's wording or link.
-        for id in ["codex", "gemini", "antigravity", "grok", "github", "deepseek"] {
+        for id in ["codex", "gemini", "grok", "github", "deepseek"] {
             let p = vendor_policy(id);
             assert!(!p.notice_zh.contains("Anthropic"), "{id}: {}", p.notice_zh);
             assert!(!p.line_zh().contains(ANTHROPIC_LEGAL_URL), "{id}");
@@ -208,13 +192,12 @@ mod tests {
     /// Only claims with a cited vendor page: no dated "blocked since" story.
     #[test]
     fn google_notices_cite_terms_not_an_unsourced_block() {
-        for id in ["gemini", "antigravity"] {
-            let n = vendor_policy(id).notice_zh;
-            for banned in ["封鎖", "2026-03", "伺服器端"] {
-                assert!(!n.contains(banned), "{id} notice must not say {banned:?}");
-            }
-            assert!(n.contains("條款"), "{id}: {n}");
+        let id = "gemini";
+        let n = vendor_policy(id).notice_zh;
+        for banned in ["封鎖", "2026-03", "伺服器端"] {
+            assert!(!n.contains(banned), "{id} notice must not say {banned:?}");
         }
+        assert!(n.contains("條款"), "{id}: {n}");
     }
 
     /// The notice states policy, not a technical block (owner decision

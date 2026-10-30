@@ -115,9 +115,6 @@ executable = "/opt/runtime/claude"
 image = "registry.example/discovery-codex@sha256:<64-lowercase-hex-digest>"
 executable = "/usr/local/bin/codex"
 
-[discovery.attempt.runtimes.antigravity]
-image = "registry.example/discovery-agy@sha256:<64-lowercase-hex-digest>"
-executable = "/usr/local/bin/agy"
 
 [discovery.attempt.runtimes.grok]
 image = "registry.example/discovery-grok@sha256:<64-lowercase-hex-digest>"
@@ -149,13 +146,12 @@ A rejected solution uses `valid:false`, `score:null` and a non-`ok` failure clas
 
 ## Runtime and isolation boundaries
 
-Discovery runs on six runtime families under the same guarantees: the attempt works inside its own node directory, can only read, write, edit, search and run shell commands (no MCP, web access, subagents, browser or image generation), and stops at the step ceiling (`max_turns`).
+Discovery runs on four runtime families under the same guarantees: the attempt works inside its own node directory, can only read, write, edit, search and run shell commands (no MCP, web access, subagents, browser or image generation), and stops at the step ceiling (`max_turns`).
 
 | Runtime | Config key (`[discovery.attempt.runtimes.<key>]`) | Step ceiling | Tool surface | Credentials |
 |---|---|---|---|---|
 | Claude | `claude` | Native `--max-turns` | `--tools` and `--allowedTools` | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` |
 | Codex | `codex` | Counted by the gateway | MCP, web, multi-agent, hooks, plugins and memory switched off through `-c` overrides | `OPENAI_API_KEY` (also passed as `CODEX_API_KEY`), or a credential document |
-| Antigravity (`antigravity`, alias `agy`) | `antigravity` | Counted by the gateway | A `PreToolUse` hook denies every tool outside the file/shell set | `GEMINI_API_KEY` or `GOOGLE_API_KEY` only |
 | Grok | `grok` | Native `--max-turns` | `--tools`, `--disallowed-tools`, `--disable-web-search`, `--no-subagents`, `--no-plan` | `XAI_API_KEY`, or a credential document |
 | OpenAI-compatible (`openai-compat`, alias `openai_compat`) | `openai-compat` | The adapter's own loop | The adapter exposes file and shell tools only | The configured provider's key; also needs configured `base_url` |
 
@@ -165,7 +161,7 @@ This table concerns Discovery. Platform-wide interactive runtime support is unch
 
 The gateway reads each attempt's event stream line by line and checks it itself; the CLI flags in the table are a second line of defence. A runtime without a native step flag therefore gets the same ceiling as one with it.
 
-- **Step ceiling.** When an attempt exceeds `max_turns`, the gateway stops its container. This is not an error: whatever the workspace contains is still scored, as it is for Claude. For Codex a step is one file or shell tool call; for Antigravity a step is one model generation. Codex can emit several parallel tool calls in one generation, so its ceiling is never looser than Claude's.
+- **Step ceiling.** When an attempt exceeds `max_turns`, the gateway stops its container. This is not an error: whatever the workspace contains is still scored, as it is for Claude. For Codex a step is one file or shell tool call. Codex can emit several parallel tool calls in one generation, so its ceiling is never looser than Claude's.
 - **Tool surface.** If an attempt uses any tool outside the file and shell surface, the gateway stops it, discards the attempt and ends the whole exploration with stop code `tool_violation`. The attempt is not retried. The audit log records a `discovery_tool_surface_violation` event.
 
 ### Credentials
@@ -174,19 +170,16 @@ Provide credentials only through the dedicated discovery account pool. Each runt
 
 A token the CLI refreshes inside the container is not written back, because the container's home is deleted when it exits. Use a dedicated login for Discovery (log in once with a separate `CODEX_HOME` or `GROK_HOME` and put that file in the pool), and add it again when it expires. Sharing the `auth.json` of your everyday login can sign one side out if the provider rotates refresh tokens; the design has no first-hand evidence either way. API keys do not have this problem.
 
-Antigravity works with a Gemini API key only. Its Google account login is stored in the operating-system keychain, and there is no path for it inside a container.
 
 An account in the pool that has no usable credential for the chosen runtime is skipped. When the CLI reports an authentication failure, that account is not used again within the attempt; if the pool has no other usable account the run ends with `no_account` instead of retrying the same dead credential. Keys and credential documents are passed to the container by environment-variable name, so their values never appear on the host's process command line.
 
 ### Known limits
 
 1. `sandbox = "none"` (the operator-only unconfined experiment) still supports Claude only. Other runtimes in that mode are refused as an unsupported capability.
-2. Antigravity subscription logins cannot be used in the container; only a Gemini API key works.
 3. Codex and Grok credential documents are not written back after a refresh (see above).
 4. A Codex attempt stopped at the step ceiling has unknown cost, because Codex reports token usage only at the end of a turn.
-5. The Codex stream does not report the model, so the node's model field stays empty. Antigravity is recorded only when its start event carries a model.
+5. The Codex stream does not report the model, so the node's model field stays empty.
 6. The gateway check reads the event stream that the CLI inside the container writes. It catches an AI that calls a disallowed tool in the normal way; a process inside the container that deliberately forges or garbles that stream is contained by the container boundary and the budget caps (call count, time). More than 3 unparsable lines in the stream stop the attempt with `tool_violation`.
-7. Antigravity's `PreToolUse` hook configuration lives in the attempt's writable home, so it is only a second line of defence; the gateway check is what discards an attempt.
 
 Formal runs require Container for attempts and evaluators. Each attempt receives only its own writable workspace, immutable snapshots of explicitly disclosed completed workspaces, and trusted read-only settings. Containers use a non-root user, read-only root filesystem, memory/process/CPU limits, bounded tmpfs and a trusted deadline supervisor. Cleanup must be confirmed before a result can be accepted; unresolved cleanup blocks execution.
 

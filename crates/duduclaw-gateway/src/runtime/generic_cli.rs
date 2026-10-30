@@ -1,7 +1,7 @@
 //! Generic print-mode runtime — drives ANY catalog CLI that answers one
 //! non-interactive turn on stdout (WP-B, `docs/todo/TODO-ai-runtimes-2026-09.md` §3).
 //!
-//! `claude` / `codex` / `gemini` / `antigravity` / `grok` keep their bespoke
+//! `claude` / `codex` / `grok` keep their bespoke
 //! modules: each of those has real per-vendor wiring (account rotation, MCP
 //! config injection, capability→sandbox-flag translation, PTY recovery) that
 //! is not shared. Everything else — Qwen Code, Kimi Code, GitHub Copilot CLI,
@@ -23,9 +23,8 @@
 //! `--permission-mode bypassPermissions` with a capability-derived profile.
 //! Unlike grok, this module has no per-CLI `--tools` translation, so when an
 //! agent declares tool restrictions it CANNOT honour them: it emits a
-//! structured `warn!` per spawn, which is exactly the contract the project
-//! already applies to Antigravity ("has no equivalent flag and warns per
-//! spawn"). Do not silently drop the restriction; do not pretend it applied.
+//! structured `warn!` per spawn. Do not silently drop the restriction;
+//! do not pretend it applied.
 
 use std::path::Path;
 use std::process::Stdio;

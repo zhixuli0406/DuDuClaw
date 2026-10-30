@@ -115,9 +115,6 @@ executable = "/opt/runtime/claude"
 image = "registry.example/discovery-codex@sha256:<64-lowercase-hex-digest>"
 executable = "/usr/local/bin/codex"
 
-[discovery.attempt.runtimes.antigravity]
-image = "registry.example/discovery-agy@sha256:<64-lowercase-hex-digest>"
-executable = "/usr/local/bin/agy"
 
 [discovery.attempt.runtimes.grok]
 image = "registry.example/discovery-grok@sha256:<64-lowercase-hex-digest>"
@@ -149,13 +146,12 @@ timing_sensitive = false
 
 ## Runtime 與隔離界線
 
-Discovery 支援六個 runtime 系列，提供相同的保證：attempt 只在自己的節點目錄內工作，只能讀、寫、改、搜尋檔案與執行 shell 指令（沒有 MCP、上網、subagent、瀏覽器或產圖），並受步數上限（`max_turns`）限制。
+Discovery 支援四個 runtime 系列，提供相同的保證：attempt 只在自己的節點目錄內工作，只能讀、寫、改、搜尋檔案與執行 shell 指令（沒有 MCP、上網、subagent、瀏覽器或產圖），並受步數上限（`max_turns`）限制。
 
 | Runtime | 設定鍵（`[discovery.attempt.runtimes.<鍵>]`） | 步數上限 | 工具限制 | 接受的憑證 |
 |---|---|---|---|---|
 | Claude | `claude` | 原生 `--max-turns` | `--tools` 與 `--allowedTools` | `ANTHROPIC_API_KEY` 或 `CLAUDE_CODE_OAUTH_TOKEN` |
 | Codex | `codex` | 由 gateway 計數 | 以 `-c` 覆寫關閉 MCP、web、多代理、hook、外掛與記憶 | `OPENAI_API_KEY`（同值也會設為 `CODEX_API_KEY`），或憑證文件 |
-| Antigravity（`antigravity`，別名 `agy`） | `antigravity` | 由 gateway 計數 | `PreToolUse` hook 拒絕檔案／shell 以外的所有工具 | 只接受 `GEMINI_API_KEY` 或 `GOOGLE_API_KEY` |
 | Grok | `grok` | 原生 `--max-turns` | `--tools`、`--disallowed-tools`、`--disable-web-search`、`--no-subagents`、`--no-plan` | `XAI_API_KEY`，或憑證文件 |
 | OpenAI 相容（`openai-compat`，別名 `openai_compat`） | `openai-compat` | adapter 自己的迴圈 | adapter 只提供檔案與 shell 工具 | 設定檔所指 provider 的 key；另須設定 `base_url` |
 
@@ -165,7 +161,7 @@ Discovery 支援六個 runtime 系列，提供相同的保證：attempt 只在�
 
 gateway 會逐行讀取每個 attempt 的事件串流並自行檢查；表中的 CLI 旗標只是第二道防線。所以沒有原生步數旗標的 runtime，得到的上限與有旗標的相同。
 
-- **步數上限。** attempt 超過 `max_turns` 時，gateway 會停掉它的容器。這不算錯誤：工作區裡有什麼就評什麼，和 Claude 的行為一致。Codex 的一步是一次檔案或 shell 工具呼叫，Antigravity 的一步是一次模型生成。Codex 一次生成可能帶多個平行工具呼叫，所以它的上限不會比 Claude 寬鬆。
+- **步數上限。** attempt 超過 `max_turns` 時，gateway 會停掉它的容器。這不算錯誤：工作區裡有什麼就評什麼，和 Claude 的行為一致。Codex 的一步是一次檔案或 shell 工具呼叫。Codex 一次生成可能帶多個平行工具呼叫，所以它的上限不會比 Claude 寬鬆。
 - **工具限制。** attempt 只要用了檔案與 shell 以外的任何工具，gateway 就停掉它、捨棄這個 attempt，並以停止代碼 `tool_violation` 結束整個探索，不會重試。稽核紀錄會寫入 `discovery_tool_surface_violation` 事件。
 
 ### 憑證
@@ -174,19 +170,16 @@ gateway 會逐行讀取每個 attempt 的事件串流並自行檢查；表中的
 
 CLI 在容器內更新的 token 不會寫回，因為容器結束時 home 就被刪除。請為 Discovery 準備專用登入（用另一個 `CODEX_HOME` 或 `GROK_HOME` 登入一次，把那份檔案放進帳號池），失效時重新放入。與日常登入共用同一份 `auth.json`，若供應商會輪替 refresh token，可能讓其中一邊被登出；目前沒有第一手證據說明實際情況。API key 沒有這個問題。
 
-Antigravity 只能用 Gemini API key。它的 Google 帳號登入存放在作業系統鑰匙圈，容器內沒有可用的路徑。
 
 帳號池裡對該 runtime 沒有可用憑證的帳號會被跳過。CLI 回報認證失敗時，該帳號在這次 attempt 內不再使用；池裡沒有其他可用帳號就以 `no_account` 結束，不會拿同一份失效憑證反覆重試。密鑰與憑證文件以環境變數名稱傳給容器，值不會出現在主機的行程命令列。
 
 ### 已知限制
 
 1. `sandbox = "none"`（操作者專用的 unconfined 實驗模式）仍只支援 Claude，其他 runtime 在此模式會以不支援的能力被拒絕。
-2. Antigravity 的訂閱登入無法在容器內使用，只能用 Gemini API key。
 3. Codex 與 Grok 的憑證文件在 token 更新後不會寫回（見上）。
 4. Codex attempt 在步數上限被停止時費用未知，因為 Codex 只在回合結束時回報 token 用量。
-5. Codex 的串流不回報模型，節點的模型欄位維持空白。Antigravity 只在啟動事件帶有模型時才記錄。
+5. Codex 的串流不回報模型，節點的模型欄位維持空白。
 6. gateway 的檢查讀的是容器內 CLI 自己輸出的事件串流。它能抓到 AI 以正常方式呼叫了不允許的工具；容器內的行程若刻意偽造或攪亂這條串流，圍住它的是容器隔離與預算上限（呼叫次數、時間）。串流出現超過 3 行無法解析的內容時，attempt 會以 `tool_violation` 停止。
-7. Antigravity 的 `PreToolUse` hook 設定檔位於 attempt 可寫的 home 內，只當第二道防線；真正讓 attempt 作廢的是 gateway 的檢查。
 
 正式探索的 attempt 與 evaluator 都要求 Container。每個 attempt 只取得自己的可寫工作區、明確揭露的已完成工作區之不可變快照，以及唯讀可信設定。容器使用非 root 身分、唯讀根檔案系統、記憶體／行程／CPU 限制、有限 tmpfs 及可信截止時間 supervisor。成果要能採用，必須先確認清理完成；清理仍未確認時會阻擋執行。
 

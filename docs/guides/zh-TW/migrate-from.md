@@ -135,4 +135,4 @@ config.toml 裡的舊值再重跑，或改用 `--rename` 匯入成獨立 agent�
 
 **Q：非 Claude 模型會怎樣？**
 會原樣保留成 `[model] preferred` 並標 `PARTIAL`，提示你人工確認要對映到哪個 runtime
-（codex / antigravity / openai_compat）。DuDuClaw 不會替你猜。
+（codex / openai_compat）。DuDuClaw 不會替你猜。

@@ -38,7 +38,7 @@ function PolicyLink({ labelId, url = ANTHROPIC_LEGAL_URL }: { labelId: string; u
  *
  * `vendor` picks whose terms are shown: Anthropic's (the default, Claude
  * logins and Claude accounts) or the runtime's own vendor for Codex, Gemini
- * CLI, Antigravity and Grok, each with a link to that vendor's terms page.
+ * API accounts and Grok, each with a link to that vendor's terms page.
  * Every sentence cites a vendor page; where a vendor has published nothing
  * DuDuClaw could find, the copy says the position is unclear instead of
  * guessing. It states policy, never a technical block (`claude -p` with an

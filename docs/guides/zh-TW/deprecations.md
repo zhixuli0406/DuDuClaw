@@ -142,26 +142,22 @@ DuDuClaw OS 的首次設定（OOBE）也會呼叫 `auth.cli_login.start`。v0.4.
 
 ---
 
-## Gemini CLI runtime 已移除（v1.75.0）
+## 已移除的 CLI runtime
 
-`gemini` 員工 runtime 從 v1.67.0 開始棄用，已在本次變更移除。先前公告曾把移除
-時間從 v1.69.0 延到 v1.75.0；歷史紀錄保留在 CHANGELOG。升級前應先修改仍使用
-`gemini` 的設定；Docker image 不再安裝 `@google/gemini-cli`，Dashboard 也不再
-提供它的 runtime 與登入入口。
+| Runtime | 移除版本 | 棄用預告期 | 操作者需採取的動作 |
+|---|---|---|---|
+| Gemini CLI（`gemini`） | v1.75.0 | 自 v1.67.0 棄用 | 自行選擇支援的 runtime 與相容模型 |
+| Antigravity（`antigravity`、`agy`） | v1.77.1 | 無 | 自行選擇支援的 runtime 與相容模型 |
 
-| 舊設定 | 改成 |
-|---|---|
-| `agent.toml [runtime] provider = "gemini"` 或 `fallback = "gemini"` | `"antigravity"` |
-| `config.toml [runtime] utility_provider = "gemini"` | `"antigravity"` |
-| `config.toml [dispatch] judge_provider = "gemini"` | `"antigravity"` |
-| `[team.roles.*] runtime = "gemini"` | `"antigravity"` |
-| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+員工 `[runtime] provider` 與 fallback、judge、`[team.roles]`、
+`config.toml [runtime] utility_provider` 若仍指定已移除的 runtime，系統會拒絕執行，
+並要求操作者改選其他 runtime 與模型，不會自動改用其他廠商。
+`gemini-*` 模型 id 不再對應任何 CLI runtime。Runtime 目錄、執行路徑、
+Dashboard 選項與 Docker image 都已移除這些 CLI。
 
-Google 登入請在主機終端機執行 `agy`。API key 模式設定
-`config.toml [antigravity] auth = "api_key"`，繼續使用 Gemini API key（`gemini`
-provider 帳號或 `GEMINI_API_KEY`）。模型名稱以 `agy models` 為準。
-Antigravity 的 Docker 設定仍使用 `~/.gemini/antigravity-cli/`，因此 `.gemini`
-volume 仍有用途。Gemini API provider（`gemini`、`generateContent`）仍受支援。
+Gemini API provider（`generateContent`）、`GEMINI_API_KEY` 與 OpenAI 相容的
+Gemini 預設值繼續支援。先前留在本機的 CLI 設定檔，以及寫入作業系統使用者
+CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 
 ## 仍在棄用期
 

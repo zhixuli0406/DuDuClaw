@@ -1,6 +1,6 @@
 # Multi-Runtime Agent Execution
 
-> One platform, twelve runtime ids: eleven CLI backends (Claude, Codex, Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus `openai_compat`, which talks HTTP to any OpenAI-compatible endpoint.
+> One platform, eleven runtime ids: ten CLI backends (Claude, Codex, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus `openai_compat`, which talks HTTP to any OpenAI-compatible endpoint.
 
 ## Failure provenance and explicit fallback
 
@@ -45,7 +45,7 @@ AgentRuntime trait:
   fn health_check() → Status
 ```
 
-Every backend — Claude, Codex, Antigravity, or any OpenAI-compatible endpoint — implements this same interface. The rest of the system doesn't know or care which backend is handling a particular request.
+Every backend — Claude, Codex, or any OpenAI-compatible endpoint — implements this same interface. The rest of the system doesn't know or care which backend is handling a particular request.
 
 ### The Runtime Catalog
 
@@ -59,7 +59,6 @@ unloggable-into.
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token` (paste-back) | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login --device-auth` (device code; Docker/remote safe) | `~/.codex/auth.json` |
-| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json (v1.2.10) | Google sign-in via `agy` in a terminal (no `login` subcommand), or API-key mode | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh` (manual) | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | none (API key only) | `~/.qwen/.env` |
 | Kimi Code | `kimi` | npm `@moonshot-ai/kimi-code` | `-p <prompt> --output-format stream-json` | jsonl | `kimi login` (device code) | `~/.kimi-code/credentials/` |
@@ -70,9 +69,9 @@ unloggable-into.
 | OpenCode | `opencode` | `opencode.ai/install` | `run <prompt> --auto --format json` | jsonl | `opencode auth login` | `~/.local/share/opencode/auth.json` |
 | OpenAI-compatible | *(HTTP)* | — | — | json | none (API key only) | — |
 
-**Dashboard one-click login** supports Claude, Codex, Grok, Kimi, Copilot, Kiro and OpenCode. Codex uses device authorization: open the verification page shown by the CLI, enter its code, and wait for the CLI to finish. Pasting the OAuth callback URL `code` into the dashboard does not complete login. Cursor remains a runtime, but its browser callback cannot reliably finish from a remote dashboard, so it is not in the one-click picker. Antigravity has no scripted login subcommand; Qwen and Mistral Vibe use API keys. The Accounts page API Token card can now delete a saved account after confirming its account id; this does not revoke the key at its provider.
+**Dashboard one-click login** supports Claude, Codex, Grok, Kimi, Copilot, Kiro and OpenCode. Codex uses device authorization: open the verification page shown by the CLI, enter its code, and wait for the CLI to finish. Pasting the OAuth callback URL `code` into the dashboard does not complete login. Cursor remains a runtime, but its browser callback cannot reliably finish from a remote dashboard, so it is not in the one-click picker. Qwen and Mistral Vibe use API keys. The Accounts page API Token card can now delete a saved account after confirming its account id; this does not revoke the key at its provider.
 
-Gemini CLI is no longer a DuDuClaw runtime or Docker package. Existing `runtime = "gemini"` settings need migration to Antigravity; the separate Gemini API provider remains supported. See [removal and migration](../guides/deprecations.md).
+Gemini CLI is no longer a DuDuClaw runtime or Docker package. Existing `runtime = "gemini"` settings require another runtime and compatible model; the separate Gemini API provider remains supported. See [removal and migration](../guides/deprecations.md).
 
 Model selection differs per vendor and the catalog records which form each one
 takes: a separate flag (`--model <id>`), the joined form Copilot documents
@@ -95,21 +94,7 @@ Vibe's `VIBE_ACTIVE_MODEL`), or nothing (Kiro selects its model through
   subscription is allowed; Pro and Max limits assume ordinary usage. Anthropic may enforce this without prior notice, and users have
   reported suspended accounts. An API key (Claude Console) is the documented
   path for products.
-- **Google** — the [Gemini CLI terms](https://geminicli.com/docs/resources/tos-privacy/)
-  say that directly accessing the services behind Gemini CLI with third-party
-  software, tools or services through Gemini CLI OAuth violates its terms and
-  may be grounds for suspension or termination of the account. The
-  [Antigravity terms](https://antigravity.google/terms) (section 6) say the
-  same of third-party software accessing Antigravity, and may suspend or
-  terminate the Antigravity and/or Gemini CLI accounts; the same section also
-  lists using the service in connection with products not provided by Google
-  as abuse. DuDuClaw runs the
-  unmodified Antigravity CLI; whether that falls under these clauses is Google's call.
-  Google's [Gemini Code Assist for individuals deprecation notice](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)
-  (last updated 2026-10-09) adds that since 2026-06-18 Gemini CLI no longer
-  accepts Login with Google for Gemini Code Assist for individuals, Google AI
-  Pro and Google AI Ultra accounts; a paid API key (Gemini API or enterprise)
-  still works. Use an API key.
+
 - **Qwen** — the free OAuth tier was discontinued 2026-04-15. API key
   (ModelStudio / DashScope) only.
 - **OpenCode** — MIT with no restriction of its own, but it removed its
@@ -147,7 +132,7 @@ call without it (see [Subscription-Login Risk Disclosure](#subscription-login-ri
 
 ### How Backends Are Driven
 
-Four CLI backends (`claude`, `codex`, `antigravity`, `grok`;
+Three CLI backends (`claude`, `codex`, `grok`;
 `BESPOKE_RUNTIME_IDS` in `runtime/mod.rs`) have bespoke runtime modules, because each has real per-vendor
 wiring that is not shareable — account rotation (Claude), MCP config injection
 in the CLI's own format, capability→sandbox-flag translation. Everything else is driven by **one** generic print-mode
@@ -158,12 +143,11 @@ non-zero exit or an auth-required marker to a typed failure the failover chain
 understands. The seven other CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI,
 Kiro, Cursor, Mistral Vibe, OpenCode) go through that generic runtime.
 `openai_compat` is not a CLI: it has its own HTTP module
-(`runtime/openai_compat.rs`). That makes five hand-written modules in total.
+(`runtime/openai_compat.rs`). That makes four hand-written modules in total.
 
 ### Main Backends
 
-Claude, Codex and OpenAI-compatible endpoints are described here. Antigravity and
-Grok are covered in their own sections further down.
+Claude, Codex and OpenAI-compatible endpoints are described here. Grok is covered in its own section further down.
 
 **Claude Runtime** — Calls the Claude Code CLI (`claude`) with JSONL streaming output. This is the most feature-rich backend, with native MCP tool support, bash execution, web search, and file operations built in.
 
@@ -240,28 +224,28 @@ Agents choose their runtime in `agent.toml`:
 ```toml
 [runtime]
 provider = "claude"          # Primary backend
-fallback = "antigravity"     # If primary is unavailable
+fallback = "codex"     # If primary is unavailable
 ```
 
 If `provider` is absent, the agent runs on Claude. An unrecognised value logs a warning and also falls back to Claude.
 
 ### Execution time limit and background models
 
-`agent.toml [runtime] timeout_secs` sets the per-run limit for Codex, Grok, Antigravity and other CLI runtimes, and the per-request limit for OpenAI-compatible APIs (plain, streaming and tool-loop requests). It defaults to **300 seconds** and accepts integers from **30 to 3600**. Claude keeps its separate fixed **30-minute safety limit**; this setting does not change it. A manually edited integer outside that range is clamped with a warning; a wrong-typed value is ignored with a warning and uses 300 seconds. The dashboard rejects invalid values when saving. This is separate from the container task timeout. Antigravity passes this limit to `--print-timeout` and keeps a wrapper backstop 30 seconds longer.
+`agent.toml [runtime] timeout_secs` sets the per-run limit for Codex, Grok and other CLI runtimes, and the per-request limit for OpenAI-compatible APIs (plain, streaming and tool-loop requests). It defaults to **300 seconds** and accepts integers from **30 to 3600**. Claude keeps its separate fixed **30-minute safety limit**; this setting does not change it. A manually edited integer outside that range is clamped with a warning; a wrong-typed value is ignored with a warning and uses 300 seconds. The dashboard rejects invalid values when saving. This is separate from the container task timeout.
 
 Increasing the effective `timeout_secs` requires an administrator. An Owner may lower it; clearing the setting restores 300 seconds and needs an administrator only when that increases the current effective limit.
 
-Codex previously stopped at 120 seconds. Only the user-facing channel reply path returns retained completed assistant messages on timeout. Utility calls (including judges and verifiers) and all internal text-only calls discard partial output and fail with a hard-timeout error. Internal conversations also receive a time-limit notice; Odoo public visitors receive only the completed text. Incomplete JSONL items are not returned as an answer. With no completed message, the run fails as a timeout. Grok and Antigravity timeouts are also identified as timeouts rather than unknown errors.
+Codex previously stopped at 120 seconds. Only the user-facing channel reply path returns retained completed assistant messages on timeout. Utility calls (including judges and verifiers) and all internal text-only calls discard partial output and fail with a hard-timeout error. Internal conversations also receive a time-limit notice; Odoo public visitors receive only the completed text. Incomplete JSONL items are not returned as an answer. With no completed message, the run fails as a timeout. Grok timeouts are also identified as timeouts rather than unknown errors.
 
 On Windows, managed CLI children start suspended, join a kill-on-close Job Object, and resume only after assignment succeeds. Cleanup terminates the job even if the leader already exited; assignment failure kills the child and returns an error. Native Windows execution remains unverified in this round.
 
 Grok no longer retries an empty pipe-mode response under a PTY: that path cannot guarantee whole-process-tree cleanup after timeout. An empty response is returned as an error.
 
-Background decision checks, instruction pinning, fact extraction and conversation compression use the employee's runtime for Claude, Codex and OpenAI-compatible APIs. A non-blank `[model] utility` wins; otherwise Claude uses `claude-haiku-4-5`, while Codex and OpenAI-compatible APIs use `[model] preferred`. If both are blank, Codex omits `-m` and uses its CLI default; OpenAI-compatible APIs refuse the call. Grok, Antigravity and generic CLI employees use the global background settings. The dashboard warns when an explicit utility model belongs to a different vendor family.
+Background decision checks, instruction pinning, fact extraction and conversation compression use the employee's runtime for Claude, Codex and OpenAI-compatible APIs. A non-blank `[model] utility` wins; otherwise Claude uses `claude-haiku-4-5`, while Codex and OpenAI-compatible APIs use `[model] preferred`. If both are blank, Codex omits `-m` and uses its CLI default; OpenAI-compatible APIs refuse the call. Grok and generic CLI employees use the global background settings. The dashboard warns when an explicit utility model belongs to a different vendor family.
 
 Claude utility calls clear the inherited environment, apply the shared spawn allowlist, then inject only the Anthropic API key from the same credential source as the normal no-rotation Claude spawn (OAuth keeps its usual HOME/keychain/config directory). They use the lightweight lane and do not enter account rotation. Normal chat retains its existing account rotation.
 
-Utility calls, including classifiers and judges, use a dedicated execution profile. Claude uses the tool-free, single-turn lightweight lane; OpenAI-compatible APIs send one completion without tools and never enter the tool loop. Codex uses a restricted profile: a read-only sandbox, no DuDuClaw MCP overrides, a fresh owner-only empty temporary working directory, ignored user config, and no persisted session. The temporary directory is removed after the call, including errors and timeouts; the system prompt travels in the prompt without writing `AGENTS.md`. This also applies to explicit Codex judge and team-verifier hints. Grok, Antigravity and generic CLIs remain unsupported for utility execution, so employee background work resolves to the global utility provider/model (default Claude / `claude-haiku-4-5`), with one warning per employee/runtime. The global provider must be Claude, Codex or OpenAI-compatible; an unsupported global provider or explicit hint is refused. Existing higher-level judge degradation may retry without an unsupported hint, subject to these same profiles. Codex may retain built-in reading tools; see [Security defense](05-security-defense.md) for the residual risk.
+Utility calls, including classifiers and judges, use a dedicated execution profile. Claude uses the tool-free, single-turn lightweight lane; OpenAI-compatible APIs send one completion without tools and never enter the tool loop. Codex uses a restricted profile: a read-only sandbox, no DuDuClaw MCP overrides, a fresh owner-only empty temporary working directory, ignored user config, and no persisted session. The temporary directory is removed after the call, including errors and timeouts; the system prompt travels in the prompt without writing `AGENTS.md`. This also applies to explicit Codex judge and team-verifier hints. Grok and generic CLIs remain unsupported for utility execution, so employee background work resolves to the global utility provider/model (default Claude / `claude-haiku-4-5`), with one warning per employee/runtime. The global provider must be Claude, Codex or OpenAI-compatible; an unsupported global provider or explicit hint is refused. Existing higher-level judge degradation may retry without an unsupported hint, subject to these same profiles. Codex may retain built-in reading tools; see [Security defense](05-security-defense.md) for the residual risk.
 
 The scheduled session summarizer and auto-titler apply the same utility provider selection and global fallback to the session owner. The stored owner must not begin with `_` or `.` and must name a non-reserved, existing employee with a matching `agent.toml`, in a non-symlink direct child of the canonical `<home>/agents` directory. A nonempty invalid owner skips the utility call with an error; only an empty owner uses the global utility settings. Protected summary sections remain excluded from the model prompt and are preserved verbatim with the existing cap. Explicit utility-model mismatches keep the saved value and emit one warning per agent/model. Agent-less work uses `[runtime] utility_provider` / `utility_model`, now editable in Settings → Advanced → System.
 
@@ -272,7 +256,7 @@ Different agents can use different backends simultaneously:
 ```
 Agent "dudu" (customer support)  → Claude (best reasoning)
 Agent "coder" (code generation)  → Codex (optimized for code)
-Agent "analyst" (data analysis)  → Antigravity
+Agent "analyst" (data analysis)  → Codex
 Agent "local" (privacy-sensitive) → OpenAI-compat (local endpoint)
 ```
 
@@ -303,7 +287,6 @@ Probed against the installed binaries on 2026-09-24 (recorded in internal probe 
 |---|---|---|---|
 | `claude` | 2.1.258 | `--effort <v>` | `low` `medium` `high` `xhigh` `max` |
 | `codex` | 0.156.1 | `-c model_reasoning_effort=<v>` (config override, no dedicated flag) | `low` `medium` `high` `xhigh` |
-| `antigravity` (`agy`) | 1.2.10 | `--effort <v>` | `low` `medium` `high` |
 | `grok` | 1.0.41 | `--reasoning-effort <v>` (alias `--effort`) | *not enumerated by `--help`* |
 | `openai_compat` | — | `reasoning_effort` in the request body | `low` `medium` `high` |
 
@@ -311,13 +294,13 @@ Probed against the installed binaries on 2026-09-24 (recorded in internal probe 
 
 Because the accepted sets differ, your setting is clamped **down** to what the target runtime will take. It is never dropped silently, and never sent as a value the CLI would reject:
 
-| You set | claude | codex | antigravity | grok | openai_compat |
-|---|---|---|---|---|---|---|
-| `low` | `low` | `low` | `low` | `low` | `low` |
-| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` |
-| `high` | `high` | `high` | `high` | `high` | `high` |
-| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** |
-| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** |
+| You set | claude | codex | grok | openai_compat |
+|---|---|---|---|---|
+| `low` | `low` | `low` | `low` | `low` |
+| `medium` | `medium` | `medium` | `medium` | `medium` |
+| `high` | `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** |
+| `max` | `max` | **`xhigh`** | **`high`** | **`high`** |
 
 Grok is capped at `high` deliberately: its `--help` names the flag but does not list the values, so forwarding `xhigh`/`max` risks an "unexpected value" that takes the whole spawn down. `openai_compat` is capped for the same reason across its eight heterogeneous presets. Both ceilings live in one place (`duduclaw-core/src/effort.rs`) and can be raised once the values are confirmed against a live run.
 
@@ -358,10 +341,10 @@ Claude runtime: rate-limited (cooldown: 2min)
      |
      v
 FailoverManager checks agent config:
-  fallback = "antigravity"
+  fallback = "codex"
      |
      v
-Route to Antigravity runtime
+Route to the compatible runtime
      |
      v
 When Claude cools down → restore primary routing
@@ -520,7 +503,7 @@ registered duduclaw alone, and a server such as a broker connection listed in
 - Codex clears an MCP child's environment, so the explore lane is passed to
   each third-party server as `env.DUDUCLAW_LANE`.
 
-### Grok, Antigravity and the tool loop: the employee's other MCP servers (2026-10-20)
+### Grok and the tool loop: the employee's other MCP servers (2026-10-20)
 
 The other runtimes that register MCP servers themselves had the same gap, and
 on Grok it was worse than a missing server. All of them now take the
@@ -551,38 +534,27 @@ no longer lists is removed; entries an operator added by hand are left alone
 and logged on every spawn. `.cursor/` in an employee directory is now frozen
 for the employee like `.grok/`.
 
-**Antigravity.** agy reads `.agents/mcp_config.json` only (on 1.4.2 a
-`.mcp.json` server is never started), so these servers were simply missing.
-Each gated server is now registered there with `command` and `args` only,
-and gets an `mcp(<server>/*)` rule plus a read rule on its schema directory
-in `~/.gemini/antigravity-cli/settings.json`. Without those rules agy's
-print mode refuses the calls. The proxy decides, as with Codex's
-`default_tools_approval_mode = "auto"`.
 
-**Spawn-scoped proxies (Grok and Antigravity).** Both files are persistent,
-every spawn in the directory shares them, and neither CLI takes a per-run MCP
+**Spawn-scoped proxies (Grok).** The file is persistent,
+every spawn in the directory shares them, and the CLI takes no a per-run MCP
 override, so the file holds nothing per spawn and no upstream credential.
 Each server is registered as `duduclaw mcp-proxy --spawn-scoped --server
 <name> -- …`. The spawn writes the upstream servers' env into a new
 owner-only directory under `<home>/tmp/mcp-proxy-env/` and names it in
-`DUDUCLAW_MCP_PROXY_ENV_DIR`: agy hands its environment to the MCP children
-it starts, and Grok expands `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}` in the entry's
+`DUDUCLAW_MCP_PROXY_ENV_DIR`: Grok expands `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}` in the entry's
 `env`. The directory is deleted when the CLI exits; the gateway removes
 leftovers older than 15 minutes when it starts. A spawn-scoped proxy that
 finds no directory, or no file for its server, starts nothing. An operator
-running `grok` or `agy` by hand in the directory therefore gets none of
-these proxied servers. Utility execution on both runtimes is refused before
+running `grok` by hand in the directory therefore gets none of
+these proxied servers. Utility execution on Grok is refused before
 spawning; employee background calls use the supported global utility provider. Two spawns of the same employee write the same file content and each
 get their own directory. The Grok entry also holds the proxy's own identity
 (agent id, home, and the MCP credential the `duduclaw` entry of the same file
 already holds), never the agent token. The upstream server starts from the
 agent-CLI allowlisted environment plus its declared env, so the CLI's own
-vendor key (`XAI_API_KEY`, `GEMINI_API_KEY`) does not reach it.
+vendor key (`XAI_API_KEY`) does not reach it.
 
-Known limits: the agy permission rules are added to the OS user's settings and
-never removed (a later server of the same name in a workspace an operator
-uses by hand is auto-approved there too); any entry in `.grok/config.toml` or
-`.agents/mcp_config.json` that DuDuClaw did not write (other than `duduclaw`)
+Known limits: any entry in `.grok/config.toml` that DuDuClaw did not write (other than `duduclaw`)
 is kept as written and logged as a warning on every spawn, and the CLI starts
 it without the proxy; in a borrowed work root two employees with a server of
 the same name share one entry, and the spawn that runs uses its own env file
@@ -640,9 +612,8 @@ refuses the reply; the Direct-API and local-inference loops answer without
 tools. On Grok a config that cannot be written also refuses the spawn (a
 missing shadow would let Grok start a server ungated). Grok utility calls
 are refused before config inspection or spawning, regardless of whether
-`.mcp.json` is valid. On Antigravity a failed registration refuses the spawn when
-third-party servers are listed. With no third-party server listed every one
-of these spawns is the old one. Grok and Antigravity refuse the read-only
+`.mcp.json` is valid. With no third-party server listed every one
+of these spawns is the old one. Grok refuses the read-only
 lane before any of this runs.
 
 **Not verified.** A real `grok -p` turn (it needs a signed-in Grok; the
@@ -658,24 +629,14 @@ directory. The only caller today is the team composer, which puts a role member
 in the employee's workspace so the files the member writes survive the
 throwaway scaffold being garbage-collected the moment the member finishes.
 
-Until 2026-09-28 only the Codex backend honoured that request. Gemini,
-Antigravity and Grok spawned in the agent directory regardless, so a role member
-on any of those three did its work in a directory that was deleted seconds
-later. All four now resolve the working root through one shared helper, which
-also checks the requested path is a real directory and otherwise warns and falls
-back to the agent directory rather than spawning into nowhere. The native OS
-sandbox is scoped to the same root, so an overridden root is the one that gets
-write access.
+Supported CLI backends resolve the working root through a shared helper. It checks that the requested path is a real directory, otherwise warns and falls back to the employee directory. The native OS sandbox uses the same working root.
 
 The override moves the **working directory only**. Agent identity — the MCP
 server registration, the agent id the tools authenticate with, the agent's own
 configuration — stays with the agent directory.
 
-Two backend-specific consequences, stated rather than left to be discovered:
+One backend-specific consequence, stated rather than left to be discovered:
 
-- **Antigravity** pre-trusts the working root (`agy` shows an interactive
-  "trust this workspace?" prompt that would hang a headless run) and passes it
-  as `--add-dir`.
 - **Grok** resolves both its MCP registration (`.grok/config.toml`) and its
   sandbox profile names (`.grok/sandbox.toml`) from the working directory, not
   from the agent directory. An overridden root therefore gets its own copy of
@@ -685,61 +646,6 @@ Two backend-specific consequences, stated rather than left to be discovered:
   The command/args halves are identical between members and the per-process
   identity is what the MCP child actually authenticates with, so the blast
   radius is the declared block only.
-
-### Antigravity authentication and MCP tools (2026-10-01)
-
-`agy` has no `login` subcommand, so the dashboard offers no one-click sign-in for it. Two ways to authenticate:
-
-- **Google sign-in**: run `agy` in a terminal on the host running DuDuClaw and follow the prompts. The credentials live in the OS keyring, so this does not work in a container or on a remote host with no keyring or browser.
-- **API-key mode**: set `[antigravity] auth = "api_key"` in `config.toml` and supply a Gemini API key, either as a `gemini` provider account or in the `GEMINI_API_KEY` environment variable. The gateway then writes `modelProvider` into agy's settings itself. `auth = "login"` switches back to Google sign-in and removes that `modelProvider` entry. If `auth` has never been set, the gateway leaves `modelProvider` alone and passes no Gemini key, so agy keeps whatever route it was already on.
-
-There is no `ANTIGRAVITY_API_KEY` variable. The platform's MCP tools are registered per agent workspace in `<agent workspace>/.agents/mcp_config.json`.
-
-Three things to know before switching to API-key mode:
-
-- The setting applies to the whole OS user. agy keeps `modelProvider` in its user-level settings file, so your own interactive `agy` under the same account moves to the API-key route too.
-- Two gateways running under one OS user with different `auth` values overwrite each other's value.
-- To go back to Google sign-in after using `api_key`, set `auth = "login"` explicitly. Removing the `auth` line is not enough: with no setting the gateway does not touch `modelProvider`, so the `"gemini"` value written earlier stays in agy's settings, and the gateway only logs a reminder. In `login` mode the gateway does not pass `GEMINI_API_KEY` / `GOOGLE_API_KEY` to agy or the commands it runs; in `api_key` mode the agent's shell can read the key (agy has to receive it through the environment).
-
-### Antigravity tool permissions (v1.69.1)
-
-In print mode, `agy` 1.2.16 refuses every confirmation it cannot ask a human about, and calling an MCP tool needs one. Until this fix an Antigravity employee at the default capability level (which runs with `--sandbox`) could not use any platform tool; only the full-access level, which passes `--dangerously-skip-permissions`, could. The defect dates from v1.67.0 and was found on 2026-10-04 with a real Gemini API key.
-
-Each time it runs an Antigravity turn, the gateway already adds the working root to `trustedWorkspaces` in agy's user-level `~/.gemini/antigravity-cli/settings.json`. The same locked write now also adds two rules to `permissions.allow`:
-
-- `mcp(duduclaw/*)` allows every tool of the MCP server registered under the name `duduclaw`.
-- `read_file(<HOME>/.gemini/antigravity-cli/mcp/duduclaw)` allows reading that server's tool description files. agy loads MCP tools lazily, and the model reads the description file before each call; in print mode that read is refused too. When `HOME` resolves to a different path (for example `/var` and `/private/var` on macOS), both spellings are written.
-
-The gateway adds no rule for shell commands, file writes or URLs, and the command-line flags are unchanged, so the default level still runs with `--sandbox`. In a test with agy 1.2.16 and a real Gemini API key, an employee at the default level could call DuDuClaw tools, while a shell command and a write outside the workspace in the same turn were still refused, and so were a path-traversal read and a read through a symbolic link that points outside the directory. Combining `--sandbox` with an auto-approve-everything flag was not adopted, because it let the file-write tool write outside the workspace.
-
-Operator rules are kept: existing `allow`, `deny` and `ask` entries stay as they are. If `permissions` is not an object, or `allow` is not an array, the gateway leaves it untouched and logs a warning; the workspace trust and `modelProvider` are still written, and a failed run says in its error that the rules could not be added. If the home path contains `(`, `)`, `,`, `*` or a line break, or is not valid UTF-8, the `read_file` rule is skipped with a warning and only `mcp(duduclaw/*)` is written.
-
-**Read-only level.** Because the rules live in a user-level file, they cannot depend on an employee's capability level. A read-only Antigravity employee therefore gets the same two rules and can call platform tools too; the MCP server's own `allowed_tools`, `denied_tools` and approval lists decide what it may do. This matches the Claude runtime. It differs from Codex, where every MCP tool call is rejected at the read-only level (see the table above).
-
-**Side effects to know about.**
-
-- The rules sit in the settings file that every `agy` of the OS user shares. When you use `agy` interactively in a terminal, calls to tools of an MCP server named `duduclaw` and reads of that schema directory are also approved without asking.
-- The rules are only ever added. After you remove an employee, uninstall DuDuClaw or stop using Antigravity, they stay in the file, as `trustedWorkspaces` entries already do. To remove them, edit `~/.gemini/antigravity-cli/settings.json` and delete the two entries from `permissions.allow`.
-- Two gateways under one OS user write the same rules, so they do not overwrite each other with different content.
-
-**Errors.** When agy refuses a tool, the gateway's error now names the refused tool and includes agy's own error text, with the key redacted before the text is truncated. If agy reports success but the reply is empty and a tool was refused, the run is an error; before, the raw result JSON became the employee's answer. A normal reply with a refused tool is kept and logged as a warning.
-
-**Not yet verified.** The end-to-end test with a real key has not been rerun since the last change to this code. It has not been run on Linux, inside a Docker container or on Windows. Two Antigravity problems are known and not addressed: agy can report a failure after it retried a 503 successfully, and the gateway then treats a complete reply as failed; and after an Antigravity failure, cross-vendor failover may switch to Claude.
-
-### Antigravity stream parsing degrades instead of failing (2026-09-28)
-
-The `agy --output-format stream-json` decoder used to be strict in six
-independent places: one unparseable line, a missing `result` event, a missing
-`response` field, or a `usage` block short one integer turned the whole run into
-an error — and an `agy` that had *already answered* was reported as a failed
-spawn, losing the role member with it.
-
-Shape mismatches now degrade; facts do not. An unparseable line is skipped. A
-missing result falls back to the last non-empty stream line as the answer. A
-missing or partial usage block yields unknown tokens rather than an invented
-zero. Each degrade logs one `warn!` naming what was missing. The one case that
-still fails hard is an explicit non-`SUCCESS` status — that is `agy` telling us
-the run failed, not a shape we failed to recognise.
 
 ### Which model the fallback runtime receives (2026-09)
 
@@ -792,7 +698,7 @@ Owner decision 2026-10-16: the subscription-login features stay as they are (set
 
 **What the notice says.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens. Signing in to the unmodified Claude Code binary with your own subscription is allowed, and Pro/Max usage limits assume ordinary usage. The Consumer Terms add that you may not make your account available to anyone else. Anthropic may enforce this without prior notice; account suspensions have been reported by press and users (reports, not an Anthropic statement). The notice names the DuDuClaw uses that conflict with the policy: one subscription serving other people (channel customers), rotating several subscriptions past the limits, and DuDuClaw storing the token. The notice never says the token is "blocked": `claude -p` with an OAuth token still works technically (v1.66.0).
 
-**Per vendor.** The full notice above is what Claude logins and Claude accounts show. Codex, Antigravity and Grok logins (and Add account's OAuth path with a non-Anthropic provider) show that vendor's own text and terms link instead, with the same checkbox: Google's Antigravity clause quoted above; for OpenAI, the Sign in with ChatGPT program summarised above (open-source and approved commercial partners, tokens kept local) with a link to its terms; for xAI, that its position is unclear and its terms apply. An unknown provider gets a vendor-neutral notice with no link. Every sentence points at a vendor page; the earlier "Google has blocked server-side since 2026-03" sentence had no primary source and was removed. The vendor table lives in `duduclaw_core::subscription_risk::vendor_policy` (gateway, CLI) and `web/src/lib/subscription-risk.ts` (dashboard).
+**Per vendor.** The full notice above is what Claude logins and Claude accounts show. Codex, Grok logins (and Add account's OAuth path with a non-Anthropic provider) show that vendor's own text and terms link instead, with the same checkbox: for OpenAI, the Sign in with ChatGPT program summarised above (open-source and approved commercial partners, tokens kept local) with a link to its terms; for xAI, that its position is unclear and its terms apply. An unknown provider gets a vendor-neutral notice with no link. Every sentence points at a vendor page; the earlier "Google has blocked server-side since 2026-03" sentence had no primary source and was removed. The vendor table lives in `duduclaw_core::subscription_risk::vendor_policy` (gateway, CLI) and `web/src/lib/subscription-risk.ts` (dashboard).
 
 **Where it shows.** The full disclosure with a checkbox opens before any credential step in the CLI login modal, the guided QR-code setup wizard, and the OAuth Token path of Add account. A one-line note with a link to the policy sits on the Welcome page's Claude subscription card (and on its "already signed in" card, the host-login adoption case), the runtime setup card's sign-in row, the Accounts page's subscription hero card, the one-click CLI picker, the CLI credentials list, the agent editor's API mode row when it is set to the subscription CLI, and the account pool picker when a subscription account is in the pool.
 
@@ -804,4 +710,4 @@ Owner decision 2026-10-16: the subscription-login features stay as they are (set
 
 ## The Takeaway
 
-The AI market is multi-provider. Building on a single CLI is like writing software for a single operating system — it works until it doesn't. The `AgentRuntime` trait abstracts away the differences, letting DuDuClaw treat Claude, Codex, Antigravity, and any OpenAI-compatible endpoint as interchangeable backends. Your agents get the best available brain, every time.
+The AI market is multi-provider. Building on a single CLI is like writing software for a single operating system — it works until it doesn't. The `AgentRuntime` trait abstracts away the differences, letting DuDuClaw treat Claude, Codex, any OpenAI-compatible endpoint as interchangeable backends. Your agents get the best available brain, every time.

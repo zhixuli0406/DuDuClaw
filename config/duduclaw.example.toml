@@ -268,14 +268,12 @@ port = 18889
 #
 #   claude 2.1.258   --effort <v>                        low medium high xhigh max
 #   codex 0.156.1    -c model_reasoning_effort=<v>       low medium high xhigh
-#   antigravity 1.2.10  --effort <v>                     low medium high
 #   grok 1.0.41      --reasoning-effort <v>              low medium high  (values
 #                                                        undocumented — capped
 #                                                        conservatively)
-#   gemini           (deprecated; no flag exists — logged and ignored)
 #
-# So `effort = "max"` on a codex agent runs at `xhigh`, and on an antigravity or
-# grok agent at `high`. It is never dropped silently and never sent as a value
+# So `effort = "max"` on a codex agent runs at `xhigh`, and on a grok
+# agent at `high`. It is never dropped silently and never sent as a value
 # the CLI would reject.
 #
 # COST + CACHE: raising effort raises token spend, and changing it
@@ -402,8 +400,8 @@ port = 18889
 # override. Both are optional; unset ⇒ the judge uses the ordinary utility
 # model ([runtime] utility_provider / utility_model), exactly as before.
 #
-# judge_provider = "antigravity"        # A runtime id: claude | codex | antigravity | … (gemini is deprecated in v1.67.0, removed in v1.70.0)
-# judge_model = "gemini-3-pro-preview"   # Model id within that runtime
+# judge_provider = "codex"             # A runtime id: claude | codex | grok | openai_compat | …
+# judge_model = "gpt-5.4"               # Model id within that runtime
 #
 # Rules:
 #   * Set judge_provider whenever judge_model comes from another vendor
@@ -457,8 +455,8 @@ port = 18889
 # model = "claude-sonnet-4-6"
 #
 # [team.roles.verifier]
-# runtime = "antigravity"     # Must not share the executor's model family (hard rule)
-# model = "gemini-3-pro-preview"
+# runtime = "codex"           # Must not share the executor's model family (hard rule)
+# model = "gpt-5.4"
 #
 # [team.roles.utility]
 # runtime = "claude"
@@ -556,8 +554,6 @@ port = 18889
 # [container.sandbox.executables]   # In-image path per runtime; only for a custom image
 # claude = "/usr/bin/claude"
 # codex = "/usr/bin/codex"
-# gemini = "/usr/bin/gemini"
-# antigravity = "/usr/local/bin/agy"
 # grok = "/usr/local/bin/grok"
 # openai-compat = "/usr/local/bin/python3"
 

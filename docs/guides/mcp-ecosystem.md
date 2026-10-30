@@ -339,9 +339,9 @@ third-party stdio server in `.mcp.json` is registered for the spawn behind
 `duduclaw mcp-proxy`, always, because Codex auto-approves the servers it is
 given; remote bridges are registered as they are, since they gate
 themselves; the proxy's own credentials stay in a per-spawn owner-only file
-rather than on the command line), and since 2026-10-20 Grok, Antigravity
+rather than on the command line), and since 2026-10-20 Grok
 and the in-process tool loop of the openai-compat runtime, the Direct-API
-reply and local inference, all with the gate always on. Grok and Antigravity
+reply and local inference, all with the gate always on. Grok
 keep their MCP registration in a persistent file, so their entries are
 `duduclaw mcp-proxy --spawn-scoped …`: the upstream credentials sit in a
 per-spawn owner-only directory, and outside the spawn that registered the
@@ -466,7 +466,7 @@ the same way and no `agent.toml [mcp.external]` server mounted; an employee on
 a Codex employee runs it with `-s read-only` and `approval_policy=never`
 (an operating-system read-only sandbox whatever the employee's own level; Codex
 rejects every MCP call in that mode, so no tool is callable); an employee on
-another runtime (Antigravity, Grok) or in the task sandbox is refused before the task starts
+another runtime (Grok) or in the task sandbox is refused before the task starts
 (`explore_lane_unsupported`), and a MoA model or local-only inference is
 refused (the hybrid local offload is skipped). Turn on **Allow normal mode** when subscribing to let events start
 work with the employee's usual permissions; only such subscriptions wake a
