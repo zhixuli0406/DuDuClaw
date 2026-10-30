@@ -472,17 +472,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discovery_probe_allowlist_drops_messaging_token_for_sync_and_async_commands() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let _g = ENV_LOCK.lock().unwrap();
         let key = "CLAUDE_CODE_MESSAGING_TOKEN";
         let previous = std::env::var_os(key);
         unsafe { std::env::set_var(key, "discovery-fixture-value") };
-        let mut sync = std::process::Command::new("/usr/bin/env");
-        apply_agent_cli_env_allowlist_std(&mut sync);
-        let sync_output = sync.output();
-        let mut asynchronous = tokio::process::Command::new("/usr/bin/env");
-        apply_agent_cli_env_allowlist(&mut asynchronous);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let async_output = runtime.block_on(asynchronous.output());
+        let (sync_output, async_output) = runtime.block_on(async {
+            let mut sync = std::process::Command::new("/usr/bin/env");
+            apply_agent_cli_env_allowlist_std(&mut sync);
+            let sync_output = sync.output();
+
+            let mut asynchronous = tokio::process::Command::new("/usr/bin/env");
+            apply_agent_cli_env_allowlist(&mut asynchronous);
+            let async_output = asynchronous.output().await;
+
+            (sync_output, async_output)
+        });
         unsafe {
             match previous {
                 Some(value) => std::env::set_var(key, value),
