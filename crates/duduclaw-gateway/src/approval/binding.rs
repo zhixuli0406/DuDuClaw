@@ -389,6 +389,9 @@ impl ApprovalBroker {
                 .map_err(|e| e.to_string())?;
             Self::check_task(&tx, binding)?;
             let current = super::store::record_in_connection(&tx, id)?.ok_or("request missing")?;
+            if current.status != ApprovalStatus::Pending || current.is_stale(Utc::now()) {
+                return Err("request expired or decided concurrently".into());
+            }
             check_expected_digest(&current)?;
             let n = tx
                 .execute(

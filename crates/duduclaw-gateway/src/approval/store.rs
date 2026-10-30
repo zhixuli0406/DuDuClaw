@@ -324,6 +324,9 @@ impl ApprovalStore {
             // concurrent privacy scrub cannot change the reviewed payload.
             if let Some(rec) = &rec {
                 if status != ApprovalStatus::Expired {
+                    if rec.status != ApprovalStatus::Pending || rec.is_stale(Utc::now()) {
+                        return Ok(0);
+                    }
                     check_expected_digest(rec)?;
                 }
             }

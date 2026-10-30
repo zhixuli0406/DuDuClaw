@@ -3,8 +3,8 @@
 use super::*;
 use serde_json::json;
 
-/// Canonical digest input: these fields are identical to the corresponding
-/// `approvals.list` / `approvals.get` card fields for an authorized decider.
+/// Canonical digest input for `approvals.list` / `approvals.get` cards.
+/// A digest is only given to a viewer who sees every hashed field.
 /// Objects are recursively sorted by key, arrays retain order, and compact
 /// UTF-8 JSON is hashed with SHA-256 (lowercase hexadecimal). Transport-only
 /// fields (channel links, permissions and the digest itself) are excluded.
@@ -22,6 +22,10 @@ pub fn decision_digest_at(home: &Path, rec: &ApprovalRecord) -> String {
 
 /// List/get passes the same computed facts to this hash and to the response:
 /// a pricing change between two file reads cannot create an inconsistent card.
+/// Only viewers who see every hashed field receive this digest. Unbound cards
+/// hash the full payload, so a viewer receiving a redacted payload gets no digest.
+/// Bound cards hash the redacted payload hash and disclose binding and answer
+/// only to deciders.
 pub(crate) fn decision_digest_with_activation(rec: &ApprovalRecord, facts: &Value) -> String {
     payload_hash(&serde_json::json!({
         "id": rec.id.as_str(),

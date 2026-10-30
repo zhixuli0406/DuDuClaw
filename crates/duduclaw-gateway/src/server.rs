@@ -16076,7 +16076,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     let run_state = state.clone();
     let run_ctx = user_ctx.clone();
     let (run_subscriptions, queued_rx) = crate::live_events::RunSubscriptions::new_authorized(
-        &state.home_dir, Arc::new(move |step| {
+        &state.home_dir, &user_ctx.user_id, Arc::new(move |step| {
             let state = run_state.clone();
             let ctx = run_ctx.clone();
             Box::pin(async move { state.handler.may_push_run_step(&step, &ctx).await })
@@ -16089,9 +16089,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
         let subscriptions = run_subscriptions.clone();
         let deliver_state = state.clone();
         let deliver_ctx = user_ctx.clone();
-        tokio::spawn(async move {
-            crate::live_events::forward_authorized(
-                &subscriptions,
+        crate::live_events::spawn_forwarder(
+                subscriptions,
                 queued_rx,
                 ready_tx,
                 Arc::new(move |step| {
@@ -16099,9 +16098,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                     let ctx = deliver_ctx.clone();
                     Box::pin(async move { state.handler.may_push_run_step(&step, &ctx).await })
                 }),
-            )
-            .await;
-        });
+            );
     }
     let mut run_commands = crate::live_events::RateWindow::default();
     let mut run_rate = crate::live_events::RateWindow::default();
@@ -16295,6 +16292,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 if sink.send(Message::Text(resp_text.into())).await.is_err() { break; }
             }
 
+            // Loss is signalled only after a successful authorization; saturated
+            // admission keeps one silent marker until a later authorized step.
+            _ = run_subscriptions.loss_notified() => {
+                if run_subscriptions.take_lost() {
+                    let Some(text) = sequence.lost() else { break; };
+                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                }
+            }
+
             // Dedicated per-connection step queue: no dashboard broadcast.
             // The step was authorized on the forwarder immediately before it
             // entered this one-slot channel. A failed re-check is dropped
@@ -16435,6 +16441,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
         }
     }
 
+    run_subscriptions.clear();
     info!("WebSocket connection terminated");
 }
 

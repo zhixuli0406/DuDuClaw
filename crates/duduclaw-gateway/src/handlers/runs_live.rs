@@ -240,7 +240,7 @@ mod tests {
         let gate = handler.clone();
         let ctx = f.bob.clone();
         let (subscriptions, mut rx) = crate::live_events::RunSubscriptions::new_authorized(
-            &f.home, Arc::new(move |step| {
+            &f.home, &f.bob.user_id, Arc::new(move |step| {
                 let handler = gate.clone();
                 let ctx = ctx.clone();
                 Box::pin(async move { handler.may_push_run_step(&step, &ctx).await })
@@ -337,6 +337,7 @@ mod tests {
         let ctx = f.alice.clone();
         let (subscriptions, mut inbound) = crate::live_events::RunSubscriptions::new_authorized(
             &f.home,
+            &f.alice.user_id,
             Arc::new(move |step| {
                 let handler = gate.clone();
                 let ctx = ctx.clone();

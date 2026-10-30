@@ -377,3 +377,28 @@ Daybreak Blue 這輪沒有上場，Codex 額度用完。第三輪由 Grok 唯讀
 | 任務閘（`task_privacy.rs`）仍在 tokio worker 上同步讀 users.db 與受眾檔，不在共用 blocking pool 內 | LOW（不在 select 迴圈上） | 未改，列後續 |
 
 後續待辦（累計）：WebSocket 同時連線數上限；晚到的隔離卡競爭（base 既有）；`runs.get` dispatch 分支的 permission denied 區分（base 既有）；`runs.unsubscribe` 對已不可見 run 的移除；任務閘移入 blocking pool。
+
+
+## 第四輪：Daybreak Blue 安全審查修補（2026-10-30）
+
+- A：列表與決策共用 `digest_hidden_by_redaction`；決策入口在外送授權後立即重讀角色，對看不到完整未綁定內容的讀者，以固定錯誤拒絕 `expected_digest`，讀取身分失敗也拒絕。各決策分支保留授權優先，將狀態／到期處理放在摘要比對之前；交易內仍重檢可決策紀錄的摘要。
+- B：每連線 16 個選擇器之外，新增程序全域 256、每帳號跨連線 32 個有效訂閱上限；重複訂閱不占新名額，取消及斷線釋放。步驟授權在建立工作前，以全域 32 個名額非阻塞准入（每連線仍最多 4 個候選授權），送出前重檢也使用全域准入；飽和時捨棄並保留單一待確認標記，後續步驟取得准入並重新授權成功後才通知 `events_lost`。
+- C：`PushRule::Agent` 與任務／核准事件相同，每幀重讀身分及員工綁定，保留共用 blocking pool；撤權或停權後下一幀即拒絕。
+- 回歸測試涵蓋隱藏購買內容的正確／錯誤摘要同樣遭拒、未附摘要的正常決策、Admin 摘要不符、跨連線帳號／全域配額、斷線釋放、全域授權飽和不排隊，以及員工事件降權／停權／解除綁定後立即停止。
+
+- LOW 1：全域授權准入飽和時，每個 listener 只保留一個待確認遺失標記；後續成功授權才合併通知一次，撤權後持續靜默，不送步驟或遺失通知。
+- 待確認標記綁定被捨棄步驟所屬的 run selector；其他 run 的成功步驟不會清除或送出該標記。
+- LOW 2：轉送器以 drop guard 保證正常退出、取消與 panic 都會清空選擇器並釋放全域／帳號訂閱名額；WebSocket 保持開啟，該連線後續訂閱以固定錯誤拒絕，需重新連線。
+- 新增回歸測試涵蓋候選及送出前准入飽和、恢復後通知合併、恢復前撤權，以及授權器 panic 後連線仍持有控制代碼時的配額釋放。
+- LOW 修補驗證：指定參數串行執行，`live_events` 13 通過、1 項 socket 綁定遭 `PermissionDenied` 未完成驗證；`runs_live` 8 通過、`push_filter` 8 通過，`git diff --check` 通過。panic 測試保留連線持有的訂閱與接收端控制代碼，未做真實 WebSocket panic 活驗；已做獨立唯讀程式審查，未重新呼叫 Daybreak Blue。
+
+本輪不處理的既有後續（origin/main 已存在）：
+
+- `approvals.decide` 的不存在、無權限、外送及董事會拒絕文字不同，已知 UUID 仍可透露存在性與種類。
+- 一般未綁定卡及 `knowledge_quarantine` 決策路徑，尚缺少列表／推播使用的即時員工存取閘。
+- discovery 最後的 `manager_for` 仍使用握手時的 `ctx`。
+
+本輪限制的是有效 run 訂閱，不是所有 WebSocket 連線數；前輪所列的其他後續仍保留。
+
+
+驗證：所有 cargo 串行執行，使用 `CARGO_INCREMENTAL=0 cargo test -j 4 -p duduclaw-gateway --lib <filter>`。最終結果：`approvals_` 20 通過、`approval::` 178 通過／1 項 socket 受限、`push_filter` 8 通過、`live_events` 10 通過／1 項 socket 受限、`runs_live` 8 通過。新增回歸測試均通過；兩項受限測試在 `TcpListener::bind` 遭沙箱 `PermissionDenied`，未完成驗證，不計為通過。`git diff --check` 通過。已做獨立唯讀程式審查，未重新呼叫 Daybreak Blue。

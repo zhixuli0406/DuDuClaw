@@ -22,7 +22,6 @@ pub(crate) fn submitter_is_decider(rec: &ApprovalRecord, decider: &UserContext) 
         })
 }
 
-
 impl MethodHandler {
     pub(crate) fn authorize_egress_decider(&self, rec: &ApprovalRecord, ctx: &UserContext) -> Result<(), String> {
         if rec.payload.get("egress_guard").is_some() {

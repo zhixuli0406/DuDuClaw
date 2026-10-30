@@ -15,15 +15,15 @@
 //!
 //! Task/approval metadata is snapshotted once per broadcast frame. Reader
 //! identity is read fresh in bounded blocking work for each delivery.
-//! Other identity lookups are cached per connection for
-//! [`PUSH_CACHE_SECS`], reducing `users.db` reads for agent/global broadcasts.
+//! Agent identity is also re-read per frame. Other lookups are cached for
+//! [`PUSH_CACHE_SECS`], reducing `users.db` reads for global broadcasts.
 //! Revocation for those events reaches live updates within that many seconds;
-//! task/approval events and RPC reads re-check on every call.
+//! task/approval/agent events and RPC reads re-check on every call.
 use super::*;
 use crate::review_evidence::audience::{TaskAudience, dashboard_may_read_task, task_audience};
 use std::time::{Duration, Instant};
 
-/// Identity cache lifetime for events other than task/approval updates.
+/// Identity cache lifetime for events other than task/approval/agent updates.
 pub const PUSH_CACHE_SECS: u64 = 2;
 
 /// What a kind of event needs before it may be sent.
@@ -240,7 +240,7 @@ impl PushGate {
                     &self.ctx.user_id,
                 ).ok()
             }
-        } else if matches!(rule, PushRule::Task | PushRule::Approval) {
+        } else if matches!(rule, PushRule::Task | PushRule::Approval | PushRule::Agent) {
             live_reader_context(&self.home, &self.ctx).ok()
         } else {
             self.live()
@@ -385,6 +385,28 @@ pub fn filter_push_event(home: &Path, ctx: &UserContext, line: &str) -> Option<S
 #[cfg(test)]
 mod live_event_tests {
     use super::*;
+    #[tokio::test]
+    async fn next_agent_frame_rechecks_demotion_suspension_and_binding() {
+        use crate::handlers::task_privacy_tests::{admin, fixture};
+        let f = fixture().await;
+        let root = admin(&f);
+        let mut gate = PushGate::new(&f.home, &root, false);
+        let frame = serde_json::to_string(&WsFrame::event("agent.turn_started", json!({"agent_id": "sales"}))).unwrap();
+        // Warm even the old identity cache through an admin-only event.
+        assert!(gate.filter(&serde_json::to_string(&WsFrame::event("unknown.admin", json!({}))).unwrap()).is_some());
+        assert!(gate.filter_live(&frame, &f.handler).await.is_some());
+        f.db.update_user(&root.user_id, None, Some(UserRole::Employee), None).unwrap();
+        assert!(gate.filter_live(&frame, &f.handler).await.is_none());
+        f.db.update_user(&root.user_id, None, Some(UserRole::Admin), None).unwrap();
+        assert!(gate.filter_live(&frame, &f.handler).await.is_some());
+        f.db.set_user_status(&root.user_id, duduclaw_auth::UserStatus::Suspended).unwrap();
+        assert!(gate.filter_live(&frame, &f.handler).await.is_none());
+        let mut alice = PushGate::new(&f.home, &f.alice, false);
+        assert!(alice.filter_live(&frame, &f.handler).await.is_some());
+        f.db.unbind_agent(&f.alice.user_id, "sales").unwrap();
+        assert!(alice.filter_live(&frame, &f.handler).await.is_none());
+    }
+
     #[tokio::test]
     async fn task_audience_filters_before_sequence_assignment() {
         let f = crate::handlers::task_privacy_tests::fixture().await;

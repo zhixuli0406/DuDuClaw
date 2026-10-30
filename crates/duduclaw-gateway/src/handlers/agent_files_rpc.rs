@@ -350,9 +350,6 @@ impl MethodHandler {
             Ok(_) => return WsFrame::error_response("", "找不到這筆審核"),
             Err(e) => return WsFrame::error_response("", &format!("讀取審核失敗：{e}")),
         };
-        if let Err(error) = crate::approval::check_expected_digest(&rec) {
-            return WsFrame::error_response("", &error);
-        }
         if rec.status != crate::approval::ApprovalStatus::Pending {
             return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
         }
@@ -360,6 +357,9 @@ impl MethodHandler {
             let _ = broker.poll(approval_id).await;
             fa::remove_sidecar(&self.home_dir, approval_id.as_str());
             return WsFrame::error_response("", crate::approval_notify::dashboard_only_expired_text(fa::ACTION_KIND));
+        }
+        if let Err(error) = crate::approval::check_expected_digest(&rec) {
+            return WsFrame::error_response("", &error);
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
         if !approve {

@@ -62,10 +62,15 @@ impl MethodHandler {
             if let Err(error) = self.authorize_egress_decider(r, ctx) {
                 return WsFrame::error_response("", &error);
             }
-            // Reject stale cards before any domain-specific preparatory work.
-            // The broker rechecks under its write transaction before deciding.
-            if let Err(error) = crate::approval::check_expected_digest(r) {
-                return WsFrame::error_response("", &error);
+            // Reject hidden-payload guesses before any digest-dependent outcome,
+            // including expired cards and specialized decision paths.
+            if params.get("expected_digest").is_some() {
+                let fresh = crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx);
+                if fresh.as_ref().map_or(true, |fresh| {
+                    super::approvals_topology_rpc::digest_hidden_by_redaction(r, fresh.is_admin())
+                }) {
+                    return WsFrame::error_response("", "expected_digest is not accepted for this approval");
+                }
             }
             if self
                 .authorize_workflow_activation_record(&r.payload, ctx)
@@ -103,21 +108,25 @@ impl MethodHandler {
             }
         }
         if let Some(rec) = record.as_ref().filter(|r| r.binding.is_some()) {
-            if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind)
-                && rec.is_stale(chrono::Utc::now())
-            {
-                let _ = broker.poll(&approval_id).await;
-                return WsFrame::error_response(
-                    "",
-                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind),
-                );
-            }
             // A-M-3 / U3: who may decide is re-derived from a fresh identity
             // read (employee access, run audience, Admin for activations).
             let decider = match Box::pin(self.authorize_bound_decider(rec, ctx)).await {
                 Ok(c) => c,
                 Err(e) => return WsFrame::error_response("", &e),
             };
+            if rec.is_stale(chrono::Utc::now()) {
+                let _ = broker.poll(&approval_id).await;
+                let error = if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind)
+                } else { "approval expired" };
+                return WsFrame::error_response("", error);
+            }
+            if rec.status != crate::approval::ApprovalStatus::Pending {
+                return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
+            }
+            if let Err(error) = crate::approval::check_expected_digest(rec) {
+                return WsFrame::error_response("", &error);
+            }
             if let Err(e) = Box::pin(broker.decide_bound_dashboard(&approval_id, &decider, approve))
                 .await
             {
@@ -133,20 +142,6 @@ impl MethodHandler {
                     "submitter_is_decider": super::approval_decider::submitter_is_decider(rec, &decider),
                 }),
             );
-        }
-        // L1: a knowledge review past its deadline is a denial (TTL = DENY),
-        // even before the expiry sweep has flipped its status — approving it
-        // would write knowledge on a card the reviewer could no longer rely on.
-        if let Some(rec) = &record {
-            if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind)
-                && rec.is_stale(chrono::Utc::now())
-            {
-                let _ = broker.poll(&approval_id).await;
-                return WsFrame::error_response(
-                    "",
-                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind),
-                );
-            }
         }
         // A proposal to add a source to a knowledge collection: decided only
         // by an Admin or the collection's editor / owner (re-read now), side
@@ -230,6 +225,30 @@ impl MethodHandler {
                     "",
                     "this approval kind requires board (admin) rights to decide",
                 );
+            }
+        }
+        // L1: a knowledge review past its deadline is a denial (TTL = DENY),
+        // even before the expiry sweep has flipped its status — approving it
+        // would write knowledge on a card the reviewer could no longer rely on.
+        if let Some(rec) = record.as_ref().filter(|r| r.action_kind != "discovery") {
+            if rec.is_stale(chrono::Utc::now()) {
+                let _ = broker.poll(&approval_id).await;
+                let error = if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind)
+                } else { "approval expired" };
+                return WsFrame::error_response("", error);
+            }
+        }
+        if let Some(rec) = record.as_ref().filter(|r| r.action_kind != "discovery") {
+            if rec.status != crate::approval::ApprovalStatus::Pending {
+                return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
+            }
+        }
+        // Specialized paths check after their own authorization, before writes.
+        // The broker also rechecks inside its decision transaction.
+        if let Some(rec) = record.as_ref().filter(|r| r.action_kind != "discovery") {
+            if let Err(error) = crate::approval::check_expected_digest(rec) {
+                return WsFrame::error_response("", &error);
             }
         }
         if record
@@ -452,9 +471,6 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("讀取審核失敗：{e}")),
         };
         let rec = &fresh;
-        if let Err(error) = crate::approval::check_expected_digest(rec) {
-            return WsFrame::error_response("", &error);
-        }
         if rec.status != crate::approval::ApprovalStatus::Pending {
             return WsFrame::error_response(
                 "",
@@ -464,6 +480,9 @@ impl MethodHandler {
         if rec.is_stale(chrono::Utc::now()) {
             let _ = broker.poll(approval_id).await;
             return WsFrame::error_response("", "這則知識審核已逾期，已自動捨棄，無法再核准。");
+        }
+        if let Err(error) = crate::approval::check_expected_digest(rec) {
+            return WsFrame::error_response("", &error);
         }
         let memory_db = rec
             .payload
@@ -858,7 +877,7 @@ mod tests {
 
         db.update_user(&user.id, None, Some(UserRole::Manager), None).unwrap();
         let board_frame = handler
-            .handle_approvals_decide(json!({"id": board.as_str(), "approve": true}), &ctx)
+            .handle_approvals_decide(json!({"id": board.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &ctx)
             .await;
         let pilot_frame = handler
             .handle_approvals_decide(json!({"id": pilot.as_str(), "approve": true}), &ctx)
@@ -880,12 +899,12 @@ mod tests {
         db.update_user(&user.id, None, Some(UserRole::Admin), None).unwrap();
         db.set_user_status(&user.id, duduclaw_auth::UserStatus::Suspended).unwrap();
         let board_frame = handler
-            .handle_approvals_decide(json!({"id": board.as_str(), "approve": true}), &ctx)
+            .handle_approvals_decide(json!({"id": board.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &ctx)
             .await;
         let pilot_frame = handler
             .handle_approvals_decide(json!({"id": pilot.as_str(), "approve": true}), &ctx)
             .await;
-        assert_eq!(refusal(&board_frame), "this approval kind requires board (admin) rights to decide");
+        assert_eq!(refusal(&board_frame), "expected_digest is not accepted for this approval");
         assert_eq!(
             refusal(&pilot_frame),
             "synthetic pilot review requires an admin who can inspect Decision Lab"

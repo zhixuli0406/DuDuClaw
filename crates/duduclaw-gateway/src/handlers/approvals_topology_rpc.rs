@@ -128,7 +128,7 @@ impl MethodHandler {
                     };
                     items.push(json!({
                         "id": r.id.as_str(),
-                        "digest": if may_decide { json!(crate::approval::decision_digest_with_activation(r, &activation_facts)) } else { Value::Null },
+                        "digest": viewer_digest(r, &activation_facts, fresh.is_admin(), may_decide),
                         "agent_id": r.agent_id,
                         "kind": kind.as_str(),
                         "summary": r.summary,
@@ -318,6 +318,114 @@ mod live_event_tests {
     }
 
     #[tokio::test]
+    async fn hidden_purchase_digest_guesses_are_identically_refused() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "mcp_call", "purchase", json!({
+            "action_grant": {"effect": "purchase"}, "args": {"amount": 123}
+        }), 300).await.unwrap();
+        let listed = payload(f.handler.handle_approvals_list(json!({"id": id.as_str()}), &root).await);
+        let correct = listed["approvals"][0]["digest"].as_str().unwrap();
+        for digest in [correct.to_owned(), "0".repeat(64)] {
+            let result = f.handler.handle_approvals_decide(
+                json!({"id": id.as_str(), "approve": false, "expected_digest": digest}), &f.alice,
+            ).await;
+            assert!(matches!(result, WsFrame::Response { ok: false, error: Some(error), .. }
+                if error == json!("expected_digest is not accepted for this approval")));
+            assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        }
+        let bad_admin = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": false, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(bad_admin, WsFrame::Response { error: Some(error), .. }
+            if error.as_str().is_some_and(|s| s.contains("digest mismatch"))));
+        assert!(ok(&f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": false}), &f.alice,
+        ).await));
+    }
+
+    #[tokio::test]
+    async fn expired_hidden_purchase_never_compares_guesses() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "mcp_call", "purchase", json!({
+            "action_grant": {"effect": "purchase"}, "args": {"amount": 123}
+        }), 300).await.unwrap();
+        rusqlite::Connection::open(f.home.join("approvals.db")).unwrap().execute(
+            "UPDATE approvals SET created_at='2000-01-01T00:00:00Z' WHERE id=?1", [id.as_str()],
+        ).unwrap();
+        let rec = broker.get(&id).await.unwrap().unwrap();
+        for digest in [crate::approval::decision_digest(&rec), "f".repeat(64)] {
+            let result = f.handler.handle_approvals_decide(
+                json!({"id": id.as_str(), "approve": true, "expected_digest": digest}), &f.alice,
+            ).await;
+            assert!(matches!(result, WsFrame::Response { error: Some(error), .. }
+                if error == json!("expected_digest is not accepted for this approval")));
+            assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        }
+        let expired_admin = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(expired_admin, WsFrame::Response { error: Some(error), .. }
+            if error == json!("approval expired")));
+        // Fresh-context failure also refuses without comparing a candidate.
+        f.db.set_user_status(&root.user_id, duduclaw_auth::UserStatus::Suspended).unwrap();
+        let result = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(result, WsFrame::Response { error: Some(error), .. }
+            if error == json!("expected_digest is not accepted for this approval")));
+    }
+
+    #[tokio::test]
+    async fn dashboard_expiry_precedes_digest_mismatch() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "responsibility_operator_change", "operator", json!({}), 300).await.unwrap();
+        rusqlite::Connection::open(f.home.join("approvals.db")).unwrap().execute(
+            "UPDATE approvals SET created_at='2000-01-01T00:00:00Z' WHERE id=?1", [id.as_str()],
+        ).unwrap();
+        let result = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(result, WsFrame::Response { error: Some(error), .. }
+            if error == json!(crate::approval_notify::dashboard_only_expired_text("responsibility_operator_change"))));
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn redacted_unbound_purchase_has_no_digest_for_manager() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let full_payload = json!({
+            "action_grant": {"effect": "purchase"},
+            "args": {"recipient": "private@example.com", "amount": 123}
+        });
+        let id = broker.request("sales", "mcp_call", "purchase", full_payload.clone(), 300)
+            .await.unwrap();
+        for method in ["approvals.list", "approvals.get"] {
+            let manager = payload(f.handler.dispatch_org(
+                method, json!({"id": id.as_str()}), &f.alice,
+                crate::power_local::RpcConnInfo::internal(),
+            ).await);
+            assert_eq!(manager["count"], 1);
+            assert_eq!(manager["approvals"][0]["may_decide"], true);
+            assert_eq!(manager["approvals"][0]["payload"], json!({"redacted": true}));
+            assert_eq!(manager["approvals"][0]["digest"], Value::Null);
+            let admin = payload(f.handler.dispatch_org(
+                method, json!({"id": id.as_str()}), &root,
+                crate::power_local::RpcConnInfo::internal(),
+            ).await);
+            assert_eq!(admin["approvals"][0]["payload"], full_payload);
+            assert!(admin["approvals"][0]["digest"].is_string());
+        }
+    }
+
+    #[tokio::test]
     async fn dashboard_only_approval_cards_are_admin_only() {
         let f = fixture().await;
         let root = admin(&f);
@@ -335,6 +443,27 @@ mod live_event_tests {
 /// Full outbound content is only delivered to the dashboard administrator.
 fn may_show_bound_egress(payload: &Value, admin: bool, may_decide: bool) -> bool {
     admin && may_decide && payload.get("egress_guard").is_some()
+}
+
+/// An unbound digest must never become an oracle for redacted payload fields.
+pub(super) fn digest_hidden_by_redaction(rec: &crate::approval::ApprovalRecord, admin: bool) -> bool {
+    rec.binding.is_none() && dashboard_action_payload(&rec.payload, admin) != rec.payload
+}
+
+/// Only disclose a digest when the viewer can see every field it hashes.
+fn viewer_digest(
+    rec: &crate::approval::ApprovalRecord,
+    activation_facts: &Value,
+    admin: bool,
+    may_decide: bool,
+) -> Value {
+    if !may_decide
+        || digest_hidden_by_redaction(rec, admin)
+    {
+        Value::Null
+    } else {
+        json!(crate::approval::decision_digest_with_activation(rec, activation_facts))
+    }
 }
 
 fn dashboard_action_payload(payload: &Value, admin: bool) -> Value {
