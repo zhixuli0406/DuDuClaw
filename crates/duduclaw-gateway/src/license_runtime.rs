@@ -1505,33 +1505,49 @@ mod tests {
                 logo_dark: None,
             },
         };
-        let grace = runtime.gate.grace_period_days(LicenseTier::Oem);
-        assert!(grace > 0);
-
-        // Keep the same installed license and accepted brand. Only advance
-        // the stored times to model a long-running gateway with failed polls.
-        for (expires_in_days, offline_days, expected) in [
-            (30, 0, "Distributor"),
-            (30, grace - 1, "Distributor"),
-            (-1, 0, ORIGINAL_PRODUCT_NAME),
-            (-1, grace + 1, ORIGINAL_PRODUCT_NAME),
-            (30, grace + 1, ORIGINAL_PRODUCT_NAME),
-            (30, 0, "Distributor"),
-        ] {
+        for tier in [LicenseTier::Hobby, LicenseTier::Solo, LicenseTier::Studio,
+            LicenseTier::Business, LicenseTier::Partner, LicenseTier::PersonalProSelfHost,
+            LicenseTier::SelfHostPro, LicenseTier::Oem] {
             {
                 let mut inner = runtime.state.write().await;
-                let license = inner.license.as_mut().unwrap();
-                license.expires_at = Utc::now() + ChronoDuration::days(expires_in_days);
-                license.last_phone_home = Utc::now() - ChronoDuration::days(offline_days);
+                inner.license = Some(fake_license(tier, "fp_brand"));
             }
-            // Synchronous brand renderers use this same nonblocking read.
-            let snapshot = runtime.snapshot().now_or_never().unwrap();
-            assert_eq!(runtime.current_tier().await, snapshot.tier);
-            let name = effective_for(snapshot.tier, snapshot.subscription_id.as_deref(), &accepted)
-                .map(|brand| brand.product_name)
-                .unwrap_or_else(|| ORIGINAL_PRODUCT_NAME.into());
-            assert_eq!(name, expected, "expiry={expires_in_days}, offline={offline_days}");
+            // Both brand poll entry points use notice_identity, independently
+            // of the customer's tier issued through the distributor console.
+            assert_eq!(runtime.notice_identity().await,
+                Some(("sub_test".into(), "fp_brand".into())), "{tier:?}");
+            let grace = runtime.gate.grace_period_days(tier);
+            assert!(grace > 0);
+
+            // Keep the same installed license and accepted brand. Only advance
+            // stored times to model a long-running gateway with failed polls.
+            for (expires_in_days, offline_days, expected) in [
+                (30, 0, "Distributor"),
+                (30, grace - 1, "Distributor"),
+                (-1, 0, ORIGINAL_PRODUCT_NAME),
+                (-1, grace + 1, ORIGINAL_PRODUCT_NAME),
+                (30, grace + 1, ORIGINAL_PRODUCT_NAME),
+                (30, 0, "Distributor"),
+            ] {
+                {
+                    let mut inner = runtime.state.write().await;
+                    let license = inner.license.as_mut().unwrap();
+                    license.expires_at = Utc::now() + ChronoDuration::days(expires_in_days);
+                    license.last_phone_home = Utc::now() - ChronoDuration::days(offline_days);
+                }
+                // Synchronous brand renderers use this same nonblocking read.
+                let snapshot = runtime.snapshot().now_or_never().unwrap();
+                assert_eq!(runtime.current_tier().await, snapshot.tier);
+                let name = effective_for(snapshot.tier, snapshot.subscription_id.as_deref(), &accepted)
+                    .map(|brand| brand.product_name)
+                    .unwrap_or_else(|| ORIGINAL_PRODUCT_NAME.into());
+                assert_eq!(name, expected, "{tier:?}: expiry={expires_in_days}, offline={offline_days}");
+            }
         }
+        runtime.state.write().await.license = None;
+        assert_eq!(runtime.notice_identity().await, None);
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(effective_for(snapshot.tier, snapshot.subscription_id.as_deref(), &accepted), None);
     }
 
     /// Helper that exercises the env-var parser without touching the

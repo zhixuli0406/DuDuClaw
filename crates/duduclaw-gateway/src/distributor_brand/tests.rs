@@ -27,15 +27,20 @@ pub(super) fn doc(key: &SigningKey, version: i64) -> SignedDistributorBrand {
 }
 
 #[test]
-fn only_oem_and_bound_subscription_can_use_a_verified_brand() {
+fn every_licensed_tier_with_the_bound_subscription_can_use_a_verified_brand() {
     let (key, registry) = setup();
     let accepted = accept(&registry, "sub_1", &doc(&key, 2), None).unwrap();
-    assert!(effective_for(LicenseTier::Oem, Some("sub_1"), &accepted).is_some());
-    for tier in [LicenseTier::OpenSource, LicenseTier::Studio, LicenseTier::Business] {
-        assert_eq!(effective_for(tier, Some("sub_1"), &accepted), None);
+    for tier in [LicenseTier::Hobby, LicenseTier::Solo, LicenseTier::Studio,
+        LicenseTier::Business, LicenseTier::Partner, LicenseTier::PersonalProSelfHost,
+        LicenseTier::SelfHostPro, LicenseTier::Oem] {
+        assert!(effective_for(tier, Some("sub_1"), &accepted).is_some(), "{tier:?}");
+        assert_eq!(effective_for(tier, Some("sub_2"), &accepted), None);
+        assert_eq!(effective_for(tier, None, &accepted), None);
     }
-    assert_eq!(effective_for(LicenseTier::Oem, Some("sub_2"), &accepted), None);
-    assert_eq!(effective_for(LicenseTier::Oem, None, &accepted), None);
+    // OpenSource also represents expired, revoked or out-of-grace licenses,
+    // whose informational snapshot may still carry a subscription id.
+    assert_eq!(effective_for(LicenseTier::OpenSource, Some("sub_1"), &accepted), None);
+    assert_eq!(effective_for(LicenseTier::OpenSource, None, &accepted), None);
 }
 
 #[test]

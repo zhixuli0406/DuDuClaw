@@ -41,7 +41,7 @@ pub const AGENT_STRUCTURE_FILES: &[&str] = &[
 /// CLI sandboxes freeze authority and runtime configuration to prevent self-escalation.
 /// MEMORY.md and CLAUDE.md remain writable employee working files.
 pub fn employee_control_paths() -> impl Iterator<Item = &'static str> {
-    ["agent.toml", "SOUL.md", "CONTRACT.toml", "INSTRUCTIONS.md", ".mcp.json"]
+    ["agent.toml", "SOUL.md", "IDENTITY.md", "USER.md", "CONTRACT.toml", "INSTRUCTIONS.md", ".mcp.json"]
         .into_iter()
         .chain(crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_DIRS)
         .chain(crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_FILES)
@@ -629,6 +629,9 @@ mod tests {
     #[test]
     fn employee_control_paths_include_every_runtime_config_path() {
         let paths: Vec<_> = employee_control_paths().collect();
+        for path in ["IDENTITY.md", "USER.md"] {
+            assert!(paths.contains(&path), "missing control path: {path}");
+        }
         for path in crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_DIRS
             .into_iter().chain(crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_FILES) {
             assert!(paths.contains(&path), "missing control path: {path}");

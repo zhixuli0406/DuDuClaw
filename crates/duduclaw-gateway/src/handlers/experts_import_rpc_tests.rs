@@ -199,3 +199,102 @@ async fn profile_confirmation_is_validated_and_forwarded() {
     let args = std::fs::read_to_string(fx.home.path().join("argv.txt")).unwrap();
     assert!(args.contains(&format!("--confirm-profile\n{digest}\n")));
 }
+
+/// The one-click routes use the installer's supported preview report, then
+/// confirm the same source and placement flags rather than bypassing the gate.
+#[tokio::test]
+async fn one_click_pack_install_confirms_the_exact_preview() {
+    let fx = fixture().await;
+    let digest = "b".repeat(64);
+    let body = format!(r#"
+printf '%s\n' "$@" >> "$DUDUCLAW_HOME/calls.txt"
+preview=0; next=0; for a in "$@"; do
+  if [ "$next" = 1 ]; then out="$a"; next=0; fi
+  [ "$a" = "--report-json" ] && next=1
+  [ "$a" = "--dry-run" ] && preview=1
+done
+if [ "$preview" = 1 ]; then
+  printf '%s' '{{"details":{{"profile_confirmation":"{digest}"}}}}' > "$out"
+else
+  next=0; confirmed=''; for a in "$@"; do
+    if [ "$next" = 1 ]; then confirmed="$a"; next=0; fi
+    [ "$a" = "--confirm-profile" ] && next=1
+  done
+  [ "$confirmed" = '{digest}' ] || exit 1
+fi
+exit 0"#);
+    let bin = fake_bin(fx.home.path(), &body);
+    let args = vec!["install".into(), fx.staged.as_os_str().to_os_string(),
+        "--attach-under".into(), "manager".into(), "--agent-cap".into(), "5".into()];
+    fx.handler.spawn_confirmed_pack_cli_with_bin(&bin, &args, 30).await.unwrap();
+    let calls = std::fs::read_to_string(fx.home.path().join("calls.txt")).unwrap();
+    assert_eq!(calls.matches(fx.staged.to_str().unwrap()).count(), 2);
+    assert_eq!(calls.matches("--attach-under\nmanager\n--agent-cap\n5\n").count(), 2);
+    assert!(calls.contains(&format!("--confirm-profile\n{digest}\n")));
+}
+
+#[tokio::test]
+async fn one_click_pack_install_refuses_a_missing_or_invalid_preview_digest() {
+    for digest in [Value::Null, json!("invalid")] {
+        let fx = fixture().await;
+        let report = json!({"details":{"profile_confirmation":digest}}).to_string();
+        let body = format!(r#"
+next=0; for a in "$@"; do
+  if [ "$next" = 1 ]; then out="$a"; next=0; fi
+  [ "$a" = "--report-json" ] && next=1
+done
+printf '%s' '{report}' > "$out"
+exit 0"#);
+        let bin = fake_bin(fx.home.path(), &body);
+        let args = vec!["install".into(), fx.staged.as_os_str().to_os_string()];
+        assert!(fx.handler.spawn_confirmed_pack_cli_with_bin(&bin, &args, 30).await.is_err());
+        let argv = std::fs::read_to_string(fx.home.path().join("argv.txt")).unwrap();
+        assert!(argv.contains("--dry-run"));
+        assert!(!argv.contains("--confirm-profile"));
+    }
+}
+
+#[tokio::test]
+async fn one_click_pack_install_stops_when_preview_fails() {
+    let fx = fixture().await;
+    let bin = fake_bin(fx.home.path(), "echo 'preview denied' >&2\nexit 1");
+    let args = vec!["install".into(), fx.staged.as_os_str().to_os_string()];
+    let error = fx.handler.spawn_confirmed_pack_cli_with_bin(&bin, &args, 30).await.unwrap_err();
+    assert!(error.contains("preview denied"));
+    let argv = std::fs::read_to_string(fx.home.path().join("argv.txt")).unwrap();
+    assert!(argv.contains("--dry-run"));
+    assert!(!argv.contains("--confirm-profile"));
+}
+
+#[tokio::test]
+async fn one_click_draft_handler_previews_and_confirms_its_reserved_draft() {
+    let fx = fixture().await;
+    let pack = crate::expert_generate::draft_pack_dir(fx.home.path(), "abc-confirm").unwrap();
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(pack.join("expert.toml"), "[expert]\nname='confirmed'\n").unwrap();
+    let digest = "c".repeat(64);
+    let body = format!(r#"
+printf '%s\n' "$@" >> "$DUDUCLAW_HOME/calls.txt"
+preview=0; next=0; for a in "$@"; do
+  if [ "$next" = 1 ]; then out="$a"; next=0; fi
+  [ "$a" = "--report-json" ] && next=1
+  [ "$a" = "--dry-run" ] && preview=1
+done
+if [ "$preview" = 1 ]; then
+  printf '%s' '{{"details":{{"profile_confirmation":"{digest}"}}}}' > "$out"
+else
+  next=0; confirmed=''; for a in "$@"; do
+    if [ "$next" = 1 ]; then confirmed="$a"; next=0; fi
+    [ "$a" = "--confirm-profile" ] && next=1
+  done
+  [ "$confirmed" = '{digest}' ] || exit 1
+fi
+exit 0"#);
+    let bin = fake_bin(fx.home.path(), &body);
+    let frame = fx.handler.experts_install_draft_with_bin(json!({"draft_id":"abc-confirm"}), &bin).await;
+    assert_eq!(payload(&frame)["success"], true);
+    let calls = std::fs::read_to_string(fx.home.path().join("calls.txt")).unwrap();
+    assert_eq!(calls.matches(pack.to_str().unwrap()).count(), 2);
+    assert!(calls.contains(&format!("--confirm-profile\n{digest}\n")));
+    assert!(!pack.exists(), "successful handler installs clean up their draft");
+}

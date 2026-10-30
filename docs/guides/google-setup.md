@@ -4,10 +4,10 @@ Use this guide with the setup wizard to connect your Google account.
 
 | Your situation | Choose | Main limit |
 |---|---|---|
-| Company Google Workspace, with a super administrator | Service account with domain-wide delegation | Personal Gmail accounts cannot use delegation |
-| Company Workspace, using your own OAuth application | OAuth, Internal | Organization members only; no seven-day Testing (test mode) expiry |
-| Personal @gmail.com, needing mail, calendar and spreadsheets | Apps Script bridge | Three services, eight actions including status |
-| Personal @gmail.com, needing the full tool set | OAuth, External + Testing | Reauthorize every seven days while Testing |
+| Company Workspace with a super administrator | Service account with domain-wide delegation | Personal Gmail accounts cannot use delegation |
+| Company Workspace with my own OAuth client | OAuth, Internal | Organization members only; no seven-day Testing (test mode) expiry |
+| Personal Gmail: mail, calendar and spreadsheets | Apps Script bridge | Three services, eight actions including status |
+| Personal Gmail: full Google tools | OAuth, External + Testing | Reauthorize every seven days while Testing |
 
 ## Start in DuDuClaw
 
@@ -48,7 +48,7 @@ The unverified-app screen permits 100 new users over the project's lifetime; thi
 1. Ask your Workspace super administrator to approve delegation. It lets the authorized service account act as domain users within the approved scopes. Personal @gmail.com accounts are ineligible.
 2. Have the person who manages the Google Cloud project enable the eight APIs listed under OAuth in that project. Open **IAM & Admin → Service Accounts**, create an account, then open it and select **Keys → Add key → Create new key → JSON** to download the key. Its numeric client ID is the `client_id` field in the JSON.
 3. Give the super administrator the client ID and the dashboard's complete scope list. They open **Admin console → Security → Access and data control → API controls → Manage Domain Wide Delegation → Add new**, paste both and authorize. Google allows up to 24 hours for propagation.
-4. For one shared company account, choose **Service account** in the wizard. Store the JSON on the DuDuClaw host with owner-only permissions. Enter an absolute path, such as `/Users/alex/.duduclaw/keys/google-sa.json` under the DuDuClaw home, replacing it with the actual host path. Do not use `~`; it is not expanded. Enter the Workspace user’s email and save. Use a real user account.
+4. For one shared company account, choose **Company Workspace with a super administrator** in the wizard. Store the JSON on the DuDuClaw host with owner-only permissions. Enter an absolute path, such as `/Users/alex/.duduclaw/keys/google-sa.json` under the DuDuClaw home, replacing it with the actual host path. Do not use `~`; it is not expanded. Enter the Workspace user’s email and save. Use a real user account.
 5. To act as a different colleague per employee, use **Security → Credential protection → Move to system keychain**, then **Integrations → Google → Advanced settings → Company delegation → Import key file**. This separate flow protects the key and needs a supported macOS or Windows keychain. Linux and Docker cannot use this protected colleague flow. Set allowed domains and choose the colleague in the employee’s Connections tab. See [account security and settings](google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
 6. Run service checks and inspect the selected account and each service result. Receiving authorization does not prove data was read successfully.
 
@@ -60,7 +60,7 @@ Company delegation settings limit which colleague domains can be used. Enterpris
 2. Replace the script with the repository’s [bridge template](../../templates/apps-script/duduclaw-bridge.gs). Use a password manager to generate a random password of 30 or more characters, or run `openssl rand -base64 32`, and replace `CHANGE_ME_TO_A_LONG_RANDOM_STRING`.
 3. Select **Deploy → New deployment → Web app**. Set **Execute as: Me** and **Who has access: Anyone**. If Google shows “Google hasn't verified this app”, confirm it is your own project, select Advanced, then Go to (project name). Tick every permission on the consent screen and continue.
 4. Copy the deployment's `/exec` URL. `/dev` is for the owner's browser session and will not work here.
-5. In the wizard, choose Apps Script, paste the URL and secret and save. Confirm replacement if another path is active. Continue to service checks, select **Run service checks** and check the returned account.
+5. In the wizard, choose **Personal Gmail: mail, calendar and spreadsheets**, paste the URL and secret and save. Confirm replacement if another path is active. Continue to service checks, select **Run service checks** and check the returned account.
 6. Keep the URL and secret private. To rotate, change the script secret, select **Deploy → Manage deployments**, edit the existing deployment, select **New version** and deploy, then update the dashboard secret. This keeps the URL; New deployment creates a new URL. Already deployed scripts must also be redeployed this way to use the updated template’s account identification, which reports the executing Me account. Apps Script daily quotas apply, especially on personal accounts.
 
 The bridge supports Gmail search, read and draft; Calendar list and create; Sheets read and append. Including `status`, the template dispatches eight actions across three services. Drive, Docs, Slides, Forms and Tasks are unavailable. It has no mail-send action. The URL is publicly reachable; the secret protects access. The dashboard stores the secret encrypted.

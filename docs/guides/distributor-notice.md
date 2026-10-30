@@ -28,7 +28,7 @@ overrides the compiled copy. No setting or RPC on an installed system can
 change the block, so an end customer cannot replace it.
 
 A separate signed [distributor brand](white-label.md) can change the product
-name and logo only for the `Oem` tier. The notice itself does not change them.
+name and logo for the distributor's customers on any tier, when its signature verifies, its subscription exactly matches the active license, and that license passes expiry and offline-grace checks. Open-source and unlicensed installs have no subscription and receive no brand. The notice itself does not change the name or logo.
 When branded, About shows the brand card, then this notice, then the fixed
 Software development block. Vendor credit, vendor website, version and license
 type remain visible; the distributor cannot hide or overwrite that block.

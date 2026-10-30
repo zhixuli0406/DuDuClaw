@@ -458,7 +458,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| ライセンスティア | `crates/duduclaw-license/src/tier.rs` に 9 ティア（opensource、hobby、solo、studio、business、partner、personal_pro_self_host、self_host_pro、oem）。能力フラグは `premium_templates` と `industry_evolution_params`。総代理店の名前とロゴには有効な `Oem` ティアと独立した署名済みブランド文書の検証が必要で、削除済みの `white_label` フラグは使いません。[LICENSING.md](../../../LICENSING.md) を参照 |
+| ライセンスティア | `crates/duduclaw-license/src/tier.rs` に 9 ティア（opensource、hobby、solo、studio、business、partner、personal_pro_self_host、self_host_pro、oem）。能力フラグは `premium_templates` と `industry_evolution_params`。総代理店の顧客には、有効なライセンスと完全に一致するサブスクリプションの署名済み文書を検証し、有効期限とオフライン猶予の確認を通過した場合、ティアに関係なく名前とロゴを適用します。オープンソース版とライセンス未設定の環境にはサブスクリプションがなく、ブランドは適用されません。削除済みの `white_label` フラグは使いません。[LICENSING.md](../../../LICENSING.md) を参照 |
 | ハードウェアフィンガープリント | ライセンスバインディング |
 | 業種テンプレート | 製造業 / 飲食業 / 貿易業（無料）。premium 産業パックには `premium_templates` が必要 |
 | CLI ツール | 12+ サブコマンド |

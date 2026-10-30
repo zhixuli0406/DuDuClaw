@@ -64,6 +64,58 @@ mod tests {
     }
 
     #[test]
+    fn native_export_lists_flat_and_nested_skill_names_without_reading_bodies() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/worker");
+        let skills = agent.join("SKILLS");
+        std::fs::create_dir_all(skills.join("quote/references")).unwrap();
+        std::fs::create_dir_all(skills.join(".hidden")).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname = 'worker'\n").unwrap();
+        // Invalid UTF-8 and credential-shaped bodies must never be read or
+        // bundled merely to discover the names of the installed skills.
+        std::fs::write(skills.join("flat.md"), [0xff, 0xfe]).unwrap();
+        std::fs::write(skills.join("quote/SKILL.md"), "db password: hunter2xyz").unwrap();
+        std::fs::write(skills.join("quote/references/api.md"), "reference sentinel").unwrap();
+        std::fs::write(skills.join(".hidden/SKILL.md"), "hidden sentinel").unwrap();
+        std::fs::write(skills.join("flat.txt"), "not a skill").unwrap();
+        let out = root.path().join("worker.agent.md");
+        run_with_markers(root.path(), "worker", "duduclaw", &out, false, &[]).unwrap();
+        let exported = std::fs::read_to_string(out).unwrap();
+        let profile = agent_profile::parse(&exported).unwrap();
+        assert_eq!(profile.skills, vec!["flat", "quote"]);
+        for private in ["hunter2xyz", "reference sentinel", "hidden sentinel"] {
+            assert!(!exported.contains(private));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_export_never_follows_skill_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/worker");
+        let skills = agent.join("SKILLS");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::create_dir_all(outside.join("private-skill")).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname = 'worker'\n").unwrap();
+        std::fs::write(outside.join("private-skill/SKILL.md"), "private body").unwrap();
+        symlink(outside.join("private-skill"), skills.join("linked")).unwrap();
+        symlink(outside.join("private-skill/SKILL.md"), skills.join("linked.md")).unwrap();
+        let out = root.path().join("worker.agent.md");
+        run_with_markers(root.path(), "worker", "duduclaw", &out, false, &[]).unwrap();
+        assert!(agent_profile::parse(&std::fs::read_to_string(out).unwrap()).unwrap().skills.is_empty());
+
+        let other = root.path().join("agents/other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent.toml"), "[agent]\nname = 'other'\n").unwrap();
+        symlink(outside, other.join("SKILLS")).unwrap();
+        let out = root.path().join("other.agent.md");
+        assert!(run_with_markers(root.path(), "other", "duduclaw", &out, false, &[]).is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
     fn context_password_refuses_every_format_before_output_creation() {
         let root = tempfile::tempdir().unwrap();
         let agent = root.path().join("agents/worker");

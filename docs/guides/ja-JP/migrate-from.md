@@ -18,7 +18,7 @@ duduclaw migrate from openclaw --apply --confirm-profile <preview-digest>
 ## コマンド
 
 ```
-duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename] [--agent <id>] [--no-redact] [--json]
 ```
 
 | フラグ | 動作 |
@@ -27,6 +27,10 @@ duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] 
 | `--source <path>` | 移行元ディレクトリを指定。openclaw/hermes にはデフォルト値あり。**paperclip では必須**。 |
 | `--apply` | 実際に書き込みを実行する。 |
 | `--rename` | 同名の agent がある場合、スキップせず `-imported` サフィックス付きでインポートする。 |
+| `--confirm-profile <digest>` | OpenClaw、Hermes、paperclip の `--apply` に必須。プレビューの確認ダイジェストを使用。`claude-code` には不要。 |
+| `--agent <id>` | 既存の移行先スタッフを指定。`claude-code` では必須。 |
+| `--no-redact` | `claude-code` の会話記録で既定の個人情報マスキングを無効にする。 |
+| `--json` | 通常の表示の代わりに、機械可読な単一の JSON 結果を出力。 |
 
 各項目には以下のいずれかのステータスが付きます。
 
@@ -156,6 +160,6 @@ runtime（codex / openai_compat）にマッピングするかは人手での確�
 
 ## プロファイルの確認と Claude Code
 
-OpenClaw、Hermes、paperclip の移行は Persona、User、Rules、Contract と入力検査結果をプレビューに表示します。適用には対応する `--confirm-profile <digest>` が必要で、内容が変われば再確認します。AI セッションからは実行できません。`USER.md` は最大 4,000 文字で、指示ではなくデータとして挿入します。
+OpenClaw、Hermes、paperclip の移行は Persona、User、Rules、Contract と入力検査結果をプレビューに表示します。適用には対応する `--confirm-profile <digest>` が必要で、セクションの内容が変われば再確認します。この移行ダイジェストは Persona、User、Rules、Contract の四つのセクションだけを対象とし、移行で出力する全ファイルを対象にはしません。`pack install` にもプレビューの `--confirm-profile <digest>` が必要で、こちらは書き込む全ファイルを対象にします。AI セッションからは実行できません。`USER.md` は最大 4,000 文字で、指示ではなくデータとして挿入します。
 
-Claude Code も対応します：`duduclaw migrate from claude-code --source ~/.claude --agent <既存ID>`。プレビューの確認後に `--apply` を付けます。整理済みの記憶、低信頼度のナレッジページ、フィルタ済みの会話記録を既存スタッフに取り込み、新しいスタッフは作りません。逐語録の個人情報マスキングは既定で有効で、`--no-redact` で無効にできます。
+Claude Code も対応します：`duduclaw migrate from claude-code --source ~/.claude --agent <既存ID>`。プレビューの確認後に `--apply` を付けます。この経路に `--confirm-profile` は不要です。整理済みの記憶、低信頼度のナレッジページ、フィルタ済みの会話記録を既存スタッフに取り込み、新しいスタッフは作りません。逐語録の個人情報マスキングは既定で有効で、`--no-redact` で無効にできます。

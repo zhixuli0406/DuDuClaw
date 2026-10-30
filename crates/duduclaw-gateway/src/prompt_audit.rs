@@ -125,7 +125,12 @@ pub fn budgeted_legacy_skills(
     let mut truncated_count: usize = 0;
     let mut truncated_names: Vec<&str> = Vec::new();
 
-    for (name, content) in skills {
+    // Setup guidance must not displace any skill selected before it shipped.
+    // Preserve the supplied order for every existing skill, then spend only
+    // the remaining bytes on connect-google. The total cap stays hard.
+    let ordered = skills.iter().filter(|(name, _)| name != "connect-google")
+        .chain(skills.iter().filter(|(name, _)| name == "connect-google"));
+    for (name, content) in ordered {
         let rendered = format!("## Skill: {name}\n{content}");
         let len = rendered.len();
         if used + len <= max_bytes {
@@ -182,13 +187,16 @@ mod tests {
         after.sort_by(|a, b| a.0.cmp(&b.0));
         let (old, _) = budgeted_legacy_skills(&before, DEFAULT_LEGACY_SKILL_BYTE_CAP);
         let (new, _) = budgeted_legacy_skills(&after, DEFAULT_LEGACY_SKILL_BYTE_CAP);
-        for (name, _) in BUILTIN_SKILL_FILES {
+        let retained: Vec<_> = new.iter()
+            .filter(|s| !s.starts_with("## Skill: connect-google\n"))
+            .cloned().collect();
+        assert_eq!(old, retained, "new skill must preserve the exact prior selection");
+        for name in ["refactor", "test-writer"] {
             let heading = format!("## Skill: {name}\n");
-            if old.iter().any(|s| s.starts_with(&heading)) {
-                assert!(new.iter().any(|s| s.starts_with(&heading)), "new skill displaced {name}");
-            }
+            assert!(old.iter().any(|s| s.starts_with(&heading)), "fixture must include {name}");
+            assert!(new.iter().any(|s| s.starts_with(&heading)), "new skill displaced {name}");
         }
-        assert!(new.iter().any(|s| s.starts_with("## Skill: connect-google\n")));
+        assert!(new.iter().map(String::len).sum::<usize>() <= DEFAULT_LEGACY_SKILL_BYTE_CAP);
     }
 
     fn s(label: &'static str, n: usize) -> PromptSection {

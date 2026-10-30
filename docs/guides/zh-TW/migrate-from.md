@@ -17,7 +17,7 @@ duduclaw migrate from openclaw --apply --confirm-profile <preview-digest>
 ## 指令
 
 ```
-duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename] [--agent <id>] [--no-redact] [--json]
 ```
 
 | 旗標 | 作用 |
@@ -26,6 +26,10 @@ duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] 
 | `--source <path>` | 指定來源目錄。openclaw/hermes 有預設值；**paperclip 必填**。 |
 | `--apply` | 實際執行寫入。 |
 | `--rename` | 遇到同名 agent 時，以 `-imported` 後綴匯入，不再跳過。 |
+| `--confirm-profile <digest>` | OpenClaw、Hermes、paperclip 搭配 `--apply` 時必填，使用預覽提供的確認碼；`claude-code` 不需要。 |
+| `--agent <id>` | 指定既有的目標員工；`claude-code` 必填。 |
+| `--no-redact` | 關閉 `claude-code` 對話逐字稿預設的個資遮罩。 |
+| `--json` | 輸出單一機器可讀的 JSON 結果，取代一般文字計畫。 |
 
 每一項都會標示狀態：
 
@@ -139,6 +143,6 @@ config.toml 裡的舊值再重跑，或改用 `--rename` 匯入成獨立 agent�
 
 ## 設定檔確認與 Claude Code
 
-OpenClaw、Hermes 與 paperclip 移轉會先預覽人格、服務對象、工作規則、契約及輸入安全掃描結果；套用時必須加對應的 `--confirm-profile <摘要>`，內容變動就要重新預覽。AI 工作階段不能執行移轉。`USER.md` 上限 4,000 字，以資料帶入，不當作指令。
+OpenClaw、Hermes 與 paperclip 移轉會先預覽人格、服務對象、工作規則、契約及輸入安全掃描結果；套用時必須加對應的 `--confirm-profile <摘要>`，區段內容變動就要重新預覽。這個移轉確認碼只涵蓋人格、服務對象、工作規則與契約四段，不涵蓋所有移轉輸出檔；`pack install` 也要帶預覽提供的 `--confirm-profile <摘要>`，其確認碼涵蓋全部將寫入的檔案。AI 工作階段不能執行移轉。`USER.md` 上限 4,000 字，以資料帶入，不當作指令。
 
-也支援 Claude Code：`duduclaw migrate from claude-code --source ~/.claude --agent <既有員工代號>`。檢視預覽後加 `--apply`。此路徑把整理過的記憶、低可信知識頁與過濾後的對話紀錄匯入指定員工，不建立新員工；預設遮蔽逐字稿個資，`--no-redact` 可關閉。
+也支援 Claude Code：`duduclaw migrate from claude-code --source ~/.claude --agent <既有員工代號>`。檢視預覽後加 `--apply`，此路徑不需要 `--confirm-profile`。此路徑把整理過的記憶、低可信知識頁與過濾後的對話紀錄匯入指定員工，不建立新員工；預設遮蔽逐字稿個資，`--no-redact` 可關閉。

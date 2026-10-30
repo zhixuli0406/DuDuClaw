@@ -459,7 +459,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| 授權分層 | `crates/duduclaw-license/src/tier.rs` 中有九個層級（opensource、hobby、solo、studio、business、partner、personal_pro_self_host、self_host_pro、oem）。能力旗標是 `premium_templates` 與 `industry_evolution_params`；總經銷名稱與 Logo 另以有效 `Oem` 方案和獨立簽章品牌文件驗證，不使用舊 `white_label` 旗標；見 [LICENSING.md](../../../LICENSING.md) |
+| 授權分層 | `crates/duduclaw-license/src/tier.rs` 中有九個層級（opensource、hobby、solo、studio、business、partner、personal_pro_self_host、self_host_pro、oem）。能力旗標是 `premium_templates` 與 `industry_evolution_params`；總經銷的客戶不限方案，只要獨立品牌文件驗簽通過、訂閱與目前有效授權完全一致，且授權通過期限與離線寬限檢查，就套用名稱與 Logo；開源版與未啟用授權的安裝沒有訂閱，不套用品牌，不使用舊 `white_label` 旗標；見 [LICENSING.md](../../../LICENSING.md) |
 | 硬體指紋 | 授權綁定 |
 | 產業模板 | 製造業／餐飲業／貿易業（免費）；付費產業包需要 `premium_templates` |
 | CLI 工具 | 12+ 子命令 |

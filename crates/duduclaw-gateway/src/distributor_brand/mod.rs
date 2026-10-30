@@ -23,7 +23,10 @@ pub fn effective() -> Option<Brand> {
 }
 
 pub(crate) fn effective_for(tier: duduclaw_license::LicenseTier, subscription: Option<&str>, accepted: &runtime::Accepted) -> Option<Brand> {
-    (tier == duduclaw_license::LicenseTier::Oem && subscription == Some(accepted.subscription_id.as_str()))
+    // The signed subscription binding grants the brand, independently of tier.
+    // OpenSource is also the runtime's fail-closed expired/grace fallback.
+    (tier != duduclaw_license::LicenseTier::OpenSource
+        && subscription == Some(accepted.subscription_id.as_str()))
         .then(|| accepted.brand.clone())
 }
 

@@ -24,7 +24,8 @@ impl FromStr for ExportFormat {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportArtifact { pub name: String, pub content: String }
 
-/// Read only known files. Never discover MCP, memory, credential or channel files.
+/// Read only known profile files and skill names. Never discover MCP, memory,
+/// credential or channel files, and never read skill bodies.
 pub fn load(agent_dir: &Path, id: &str) -> Result<AgentProfile, ProfileError> {
     validate_id(id)?;
     let metadata = std::fs::symlink_metadata(agent_dir).map_err(|_| ProfileError::Read("employee directory".into()))?;
@@ -43,6 +44,7 @@ pub fn load(agent_dir: &Path, id: &str) -> Result<AgentProfile, ProfileError> {
         user: read_file(agent_dir, "USER.md", false)?,
         rules: read_file(agent_dir, "INSTRUCTIONS.md", false)?,
         contract: read_file(agent_dir, "CONTRACT.toml", false)?,
+        skills: skill_names(agent_dir)?,
         ..Default::default()
     };
     if result.name.is_empty() { result.name = id.into(); }
@@ -52,6 +54,58 @@ pub fn load(agent_dir: &Path, id: &str) -> Result<AgentProfile, ProfileError> {
         }
     }
     Ok(result)
+}
+
+/// Names follow the runtime's legacy flat *.md / nested SKILL.md convention.
+/// Metadata only: content and attachments stay outside the export boundary.
+fn skill_names(agent_dir: &Path) -> Result<Vec<String>, ProfileError> {
+    let root = agent_dir.join("SKILLS");
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(ProfileError::Read("skill directory".into())),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ProfileError::Read("skill directory".into()));
+    }
+    let mut queue = std::collections::VecDeque::from([(root, 0usize)]);
+    let mut names = std::collections::BTreeMap::new();
+    while let Some((dir, depth)) = queue.pop_front() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|_| ProfileError::Read("skill directory".into()))?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ProfileError::Read("skill directory".into()))?;
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else { continue; };
+            if file_name.starts_with('.') { continue; }
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| ProfileError::Read("skill entry".into()))?;
+            if metadata.file_type().is_symlink() { continue; }
+            if metadata.is_dir() {
+                if depth < 8 { queue.push_back((path, depth + 1)); }
+                continue;
+            }
+            if !metadata.is_file() || !path.extension().and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md")) { continue; }
+            let is_skill = file_name.eq_ignore_ascii_case("SKILL.md");
+            let name = if is_skill {
+                path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str())
+            } else if depth == 0 {
+                path.file_stem().and_then(|name| name.to_str())
+            } else { None };
+            if let Some(name) = name {
+                // Keep deterministic names when both legacy and nested forms
+                // declare the same skill, including case-only duplicates.
+                names.entry(name.to_ascii_lowercase())
+                    .and_modify(|old: &mut String| {
+                        if name < old.as_str() { *old = name.to_owned(); }
+                    }).or_insert_with(|| name.to_owned());
+            }
+        }
+    }
+    let mut names: Vec<_> = names.into_values().collect();
+    names.sort();
+    Ok(names)
 }
 
 fn portable_value(value: toml::Value, section: &str) -> toml::Value {

@@ -4,10 +4,10 @@
 
 | 利用状況 | 接続方法 | 主な制限 |
 |---|---|---|
-| 会社の Google Workspace、特権管理者がいる | サービスアカウントとドメイン全体の委任 | 個人 Gmail は対象外 |
-| 会社 Workspace、自分の OAuth を使う | OAuth、Internal | 組織のメンバー限定、Testing（テストモード）の七日期限なし |
-| 個人 @gmail.com、メール・予定・表だけ必要 | Apps Script ブリッジ | 三サービス、状態確認を含む八アクション |
-| 個人 @gmail.com、全ツールが必要 | OAuth、External + Testing | Testing 中は七日ごとに再認可 |
+| 会社の Workspace、特権管理者あり | サービスアカウントとドメイン全体の委任 | 個人 Gmail は対象外 |
+| 会社の Workspace、自分の OAuth を使用 | OAuth、Internal | 組織のメンバー限定、Testing（テストモード）の七日期限なし |
+| 個人 Gmail：メール、カレンダー、スプレッドシート | Apps Script ブリッジ | 三サービス、状態確認を含む八アクション |
+| 個人 Gmail：すべての Google ツール | OAuth、External + Testing | Testing 中は七日ごとに再認可 |
 
 ## DuDuClaw で開始
 
@@ -48,7 +48,7 @@ DuDuClaw が要求するスコープのうち、`gmail.readonly`、`gmail.compos
 1. Workspace の特権管理者に委任を承認してもらいます。許可スコープ内でドメインのユーザーとして動作できます。個人 @gmail.com は対象外です。
 2. Google Cloud プロジェクトを管理する人が、そのプロジェクトで OAuth 手順の八 API を有効にします。**IAM & Admin → Service Accounts** でアカウントを作成し、そのアカウントを開いて **Keys → Add key → Create new key → JSON** から鍵をダウンロードします。数値 Client ID は JSON の `client_id` フィールドです。
 3. 管理者に Client ID とダッシュボードの全スコープを渡します。管理者は **Admin console → Security → Access and data control → API controls → Manage Domain Wide Delegation → Add new** で両方を登録します。反映に最大 24 時間かかる場合があります。
-4. 共用アカウントはウィザードで **サービスアカウント** を選びます。JSON を DuDuClaw ホストに所有者限定の権限で保存し、絶対パスを入力します。例は DuDuClaw ホーム配下の `/Users/alex/.duduclaw/keys/google-sa.json` です。実際のパスに置き換えてください。`~` は展開されないので使わないでください。代理する Workspace ユーザーのメールを入力して保存します。実在するユーザーを指定してください。
+4. 共用アカウントはウィザードで **会社の Workspace、特権管理者あり** を選びます。JSON を DuDuClaw ホストに所有者限定の権限で保存し、絶対パスを入力します。例は DuDuClaw ホーム配下の `/Users/alex/.duduclaw/keys/google-sa.json` です。実際のパスに置き換えてください。`~` は展開されないので使わないでください。代理する Workspace ユーザーのメールを入力して保存します。実在するユーザーを指定してください。
 5. 社員ごとに別の同僚を代理する場合は **セキュリティ → 認証情報保護 → システムのキーチェーンへ移す**、続いて **連携 → Google → 詳細設定 → 会社の委任 → 鍵ファイルを取り込む** を使います。この別経路は鍵を保護し、対応 macOS または Windows キーチェーンが必要です。Linux と Docker は対象外です。許可ドメインと社員の接続タブで同僚を設定します。[設定と安全モデル](google-workspace.md#ai-社員ごとに別の-google-アカウントを使う会社の委任v1760)も参照してください。
 6. サービスチェックで選択アカウントと各サービスの結果を確認します。認可を取得してもデータの読み取り成功は保証されません。
 
@@ -60,7 +60,7 @@ DuDuClaw が要求するスコープのうち、`gmail.readonly`、`gmail.compos
 2. [ブリッジテンプレート](../../../templates/apps-script/duduclaw-bridge.gs)を貼り付けます。パスワード管理ツールで 30 文字以上のランダムなパスワードを生成するか、`openssl rand -base64 32` を実行し、`CHANGE_ME_TO_A_LONG_RANDOM_STRING` を置き換えます。
 3. **Deploy → New deployment → Web app** で **Execute as: Me**、**Who has access: Anyone** を選びます。「Google hasn't verified this app」が出たら、自分のプロジェクトであることを確認し、Advanced、Go to（プロジェクト名）の順に選びます。同意画面の権限をすべて選択して続行します。
 4. `/exec` URL をコピーします。`/dev` は所有者のブラウザー用です。
-5. ウィザードで Apps Script を選び、URL とシークレットを保存します。他の経路が有効なら切り替えを確認します。サービスチェックへ進み、**サービスチェックを実行** を押してアカウントを確認します。
+5. ウィザードで **個人 Gmail：メール、カレンダー、スプレッドシート** を選び、URL とシークレットを保存します。他の経路が有効なら切り替えを確認します。サービスチェックへ進み、**サービスチェックを実行** を押してアカウントを確認します。
 6. URL とシークレットは秘密にします。更新時はスクリプトのシークレットを変え、**Deploy → Manage deployments** で既存のデプロイを編集し、**New version** を選んでデプロイしてから、ダッシュボードのシークレットを更新します。この方法では URL が変わりません。New deployment は新しい URL を作ります。既存のスクリプトもこの方法で再デプロイすると、新テンプレートのアカウント確認が適用され、実行者 Me のアカウントを返します。Apps Script の日次割当量は特に個人アカウントで制限されます。
 
 Gmail 検索・読取・下書き、Calendar 一覧・作成、Sheets 読取・追記に対応します。`status` を含め八アクション、三サービスです。Drive、Docs、Slides、Forms、Tasks とメール送信には対応しません。公開 URL へのアクセスをシークレットで制限し、ダッシュボードはシークレットを暗号化保存します。

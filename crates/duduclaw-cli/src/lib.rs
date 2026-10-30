@@ -8923,8 +8923,16 @@ fn verify_argon2_admin_default(hash_phc: &str) -> bool {
 async fn cmd_agent_interactive(agent_name: Option<&str>) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
-    let runner = AgentRunner::new(home).await?;
-    runner.run_interactive(agent_name).await
+    let runner = AgentRunner::new(home.clone()).await?;
+    runner.run_interactive_with_gate(agent_name, |agent| {
+        let home = home.clone();
+        let dir = agent.dir.clone();
+        let id = agent.config.agent.name.clone();
+        async move {
+            duduclaw_gateway::budget::gate_before_spawn(&home, Some(&dir), &id, "agent_run")
+                .await.map_err(|e| duduclaw_core::error::DuDuClawError::Agent(e.to_string()))
+        }
+    }).await
 }
 
 /// `duduclaw agent list [--json]`

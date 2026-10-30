@@ -223,6 +223,17 @@ impl MethodHandler {
     /// CONTRACT.toml, and every wiki page (installed / same-name page kept /
     /// blocked by the content scan). The draft dir is cleaned up on success.
     pub(crate) async fn handle_experts_install_draft(&self, params: Value) -> WsFrame {
+        let bin = duduclaw_core::resolve_duduclaw_bin();
+        self.experts_install_draft_with_bin(params, &bin).await
+    }
+
+    /// Same handler path with an explicit binary, avoiding process-global
+    /// executable overrides in integration tests.
+    pub(crate) async fn experts_install_draft_with_bin(
+        &self,
+        params: Value,
+        bin: &std::path::Path,
+    ) -> WsFrame {
         let draft_id = params.get("draft_id").and_then(|v| v.as_str()).unwrap_or("");
         let pack_dir = match eg::draft_pack_dir(&self.home_dir, draft_id) {
             Ok(d) => d,
@@ -234,7 +245,7 @@ impl MethodHandler {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", e.message()),
         };
-        self.install_reserved_draft(draft_id, &pack_dir, &params).await
+        self.install_reserved_draft(draft_id, &pack_dir, &params, bin).await
     }
 
     async fn install_reserved_draft(
@@ -242,6 +253,7 @@ impl MethodHandler {
         draft_id: &str,
         pack_dir: &std::path::Path,
         params: &Value,
+        bin: &std::path::Path,
     ) -> WsFrame {
         if !pack_dir.join("expert.toml").is_file() {
             return WsFrame::error_response("", "找不到這份草稿（可能已過期清除，請重新生成）");
@@ -278,7 +290,7 @@ impl MethodHandler {
                     .and_then(|n| n.as_str())
                     .map(str::to_string)
             });
-        match self.spawn_pack_cli(&args, 300).await {
+        match self.spawn_confirmed_pack_cli_with_bin(bin, &args, 300).await {
             Ok(output) => {
                 let record = slug.and_then(|s| crate::expert_admin::read_record(&self.home_dir, &s));
                 let placement = staged::report::placement_report(

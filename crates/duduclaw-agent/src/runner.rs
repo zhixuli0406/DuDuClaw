@@ -49,6 +49,36 @@ impl AgentRunner {
 
     /// Run an interactive CLI session with the specified agent (or the main agent).
     pub async fn run_interactive(&self, agent_name: Option<&str>) -> Result<()> {
+        self.run_interactive_with_gate(agent_name, |_| std::future::ready(Ok(()))).await
+    }
+
+    /// The application supplies its live budget gate without introducing a
+    /// dependency from the agent crate back to the gateway. Re-evaluated
+    /// before every model attempt, including account retries.
+    pub async fn run_interactive_with_gate<F, Fut>(
+        &self,
+        agent_name: Option<&str>,
+        before_spawn: F,
+    ) -> Result<()>
+    where
+        F: Fn(&LoadedAgent) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let reader = tokio::io::BufReader::new(tokio::io::stdin());
+        self.run_interactive_with_reader(agent_name, before_spawn, reader).await
+    }
+
+    async fn run_interactive_with_reader<F, Fut, R>(
+        &self,
+        agent_name: Option<&str>,
+        before_spawn: F,
+        reader: R,
+    ) -> Result<()>
+    where
+        F: Fn(&LoadedAgent) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
         let agent = match agent_name {
             Some(name) => self
                 .registry
@@ -88,8 +118,6 @@ impl AgentRunner {
         print_banner(&display_name, &model_id, &rotator).await;
 
         // Interactive loop
-        let stdin = tokio::io::stdin();
-        let reader = tokio::io::BufReader::new(stdin);
         use tokio::io::AsyncBufReadExt;
         let mut lines = reader.lines();
 
@@ -116,6 +144,7 @@ impl AgentRunner {
                 &model_id,
                 &rotator,
                 &capabilities,
+                &|| before_spawn(agent),
             )
             .await;
 
@@ -346,17 +375,23 @@ async fn print_account_status(rotator: &AccountRotator) {
 // ── Claude CLI streaming caller ─────────────────────────────
 
 /// Call Claude CLI with AccountRotator, streaming progress to terminal.
-async fn call_with_streaming(
+async fn call_with_streaming<F, Fut>(
     system_prompt: &str,
     prompt: &str,
     model: &str,
     rotator: &AccountRotator,
     capabilities: &duduclaw_core::types::CapabilitiesConfig,
-) -> std::result::Result<String, String> {
+    before_spawn: &F,
+) -> std::result::Result<String, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let max_attempts = rotator.count().await.max(1);
     let mut last_error = String::new();
 
     for attempt in 0..max_attempts {
+        before_spawn().await.map_err(|e| e.to_string())?;
         let selected = match rotator.select().await {
             Some(s) => s,
             None => {
@@ -720,6 +755,49 @@ fn is_rate_limit_error(error: &str) -> bool {
         || lower.contains("usage limit")
         || lower.contains("overloaded")
         || lower.contains("capacity limit")
+}
+
+#[cfg(test)]
+mod interactive_budget_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn interactive_budget_gate_uses_selected_employee_on_every_turn() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[account_loading]\ninherit_host_credentials = false\n").unwrap();
+        for (name, role) in [("boss", "main"), ("helper", "worker")] {
+            let dir = home.path().join("agents").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut config: toml::Value = toml::from_str(include_str!("../../../templates/evaluator/agent.toml")).unwrap();
+            config["agent"]["name"] = toml::Value::String(name.into());
+            config["agent"]["role"] = toml::Value::String(role.into());
+            std::fs::write(dir.join("agent.toml"), toml::to_string(&config).unwrap()).unwrap();
+        }
+        let runner = AgentRunner::new(home.path().to_path_buf()).await.unwrap();
+        for (selection, expected) in [(None, "boss"), (Some("helper"), "helper")] {
+            let checked = Mutex::new(Vec::new());
+            runner.run_interactive_with_reader(selection, |agent| {
+                checked.lock().unwrap().push((agent.config.agent.name.clone(), agent.dir.clone()));
+                std::future::ready(Err(DuDuClawError::Agent("budget denied before spawn".into())))
+            }, &b"first\nsecond\n/quit\n"[..]).await.unwrap();
+            assert_eq!(*checked.lock().unwrap(), vec![
+                (expected.to_string(), home.path().join("agents").join(expected)),
+                (expected.to_string(), home.path().join("agents").join(expected)),
+            ]);
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_budget_refusal_never_reaches_account_selection_or_spawn() {
+        let rotator = AccountRotator::new(crate::account_rotator::RotationStrategy::RoundRobin, 1);
+        let error = call_with_streaming("", "hello", "unused", &rotator,
+            &Default::default(), &|| std::future::ready(Err(DuDuClawError::Agent("budget denied".into()))))
+            .await.unwrap_err();
+        assert!(error.contains("budget denied"), "{error}");
+        assert!(!error.contains("accounts exhausted"), "gate must run before account selection: {error}");
+    }
 }
 
 /// Agent-config import: the runner's IDENTITY module carries INSTRUCTIONS.md

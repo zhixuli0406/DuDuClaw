@@ -3395,6 +3395,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn employee_permissions_protect_missing_identity_and_user_files() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("employee");
+        std::fs::create_dir(&dir).unwrap();
+        for path in ["IDENTITY.md", "USER.md"] { assert!(!dir.join(path).exists()); }
+        let args = employee_permission_args(&dir, None).unwrap();
+        let (_, value) = args.last().unwrap().split_once('=').unwrap();
+        let parsed: toml::Value = format!("value={value}").parse().unwrap();
+        for path in ["IDENTITY.md", "USER.md"] {
+            assert_eq!(parsed["value"][dir.join(path).to_str().unwrap()].as_str(), Some("read"));
+            assert!(!dir.join(path).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn employee_permissions_protect_the_member_and_parent_work_root() {
         let agent = std::path::Path::new("/agents/member");
         let root = std::path::Path::new("/agents/parent");

@@ -4,10 +4,10 @@
 
 | 你的情況 | 走哪條 | 主要限制 |
 |---|---|---|
-| 公司用 Google Workspace，有超級管理員 | 服務帳號＋網域委派 | 個人 Gmail 不適用 |
-| 公司 Workspace，想用自己的 OAuth | OAuth，Internal | 只限組織成員，沒有 Testing（測試模式）的七天到期限制 |
-| 個人 @gmail.com，只要信件、行事曆、試算表 | Apps Script 橋接 | 三項服務，含狀態查詢共八個動作 |
-| 個人 @gmail.com，要完整工具 | OAuth，External＋Testing | Testing 期間每七天重新授權 |
+| 公司 Workspace，有超級管理員 | 服務帳號＋網域委派 | 個人 Gmail 不適用 |
+| 公司 Workspace，使用自己的 OAuth | OAuth，Internal | 只限組織成員，沒有 Testing（測試模式）的七天到期限制 |
+| 個人 Gmail，只需信件、行事曆、試算表 | Apps Script 橋接 | 三項服務，含狀態查詢共八個動作 |
+| 個人 Gmail，需要完整 Google 工具 | OAuth，External＋Testing | Testing 期間每七天重新授權 |
 
 ## 從 DuDuClaw 開始
 
@@ -48,7 +48,7 @@ DuDuClaw 要求的權限範圍中，`gmail.readonly`、`gmail.compose` 和 `driv
 1. 請 Workspace 超級管理員同意委派。核准的服務帳號可在允許的權限內代表網域使用者。個人 @gmail.com 帳號不能使用。
 2. 請持有 Google Cloud 專案的人在該專案啟用 OAuth 步驟列出的八項 API。進入「IAM & Admin → Service Accounts」建立服務帳號，再開啟該帳號，選「Keys → Add key → Create new key → JSON」並下載。數字 Client ID 就是 JSON 裡的 `client_id` 欄位。
 3. 把 Client ID 和儀表板完整權限範圍清單交給超級管理員。管理員進入「Admin console → Security → Access and data control → API controls → Manage Domain Wide Delegation → Add new」，貼上兩者並授權。Google 最多需要 24 小時傳播設定。
-4. 全公司共用一個帳號時，在精靈選「服務帳號委派」。將 JSON 放在 DuDuClaw 主機，只開放檔案擁有者讀取，填入絕對路徑，例如 DuDuClaw 家目錄下的 `/Users/alex/.duduclaw/keys/google-sa.json`，請換成主機上的實際路徑。不要用 `~`，程式不會展開它。填入要代表的 Workspace 使用者信箱後儲存，請填真人帳號。
+4. 全公司共用一個帳號時，在精靈選「公司 Workspace，有超級管理員」。將 JSON 放在 DuDuClaw 主機，只開放檔案擁有者讀取，填入絕對路徑，例如 DuDuClaw 家目錄下的 `/Users/alex/.duduclaw/keys/google-sa.json`，請換成主機上的實際路徑。不要用 `~`，程式不會展開它。填入要代表的 Workspace 使用者信箱後儲存，請填真人帳號。
 5. 每位 AI 員工要代表不同同事時，先到「安全 → 憑證保護 → 改放系統金鑰圈」，再到「整合 → Google → 進階設定 → 公司授權代表 → 匯入金鑰檔」。這條獨立流程會保護金鑰，需要支援的 macOS 或 Windows 鑰匙圈；Linux 和 Docker 尚不能使用。設定允許網域，再於員工的連線分頁選同事。詳見[帳號安全與設定](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 6. 執行服務檢查，確認選定帳號及各服務的結果。取得授權不代表已成功讀取資料。
 
@@ -60,7 +60,7 @@ DuDuClaw 要求的權限範圍中，`gmail.readonly`、`gmail.compose` 和 `driv
 2. 貼上專案的[橋接範本](../../../templates/apps-script/duduclaw-bridge.gs)。用密碼管理器產生至少 30 個字元的隨機密碼，或執行 `openssl rand -base64 32`，取代 `CHANGE_ME_TO_A_LONG_RANDOM_STRING`。
 3. 選「Deploy → New deployment → Web app」，Execute as 選 Me，Who has access 選 Anyone。Google 若顯示「Google hasn't verified this app」，確認是自己的專案，選 Advanced，再選 Go to（專案名稱）。在同意畫面勾選每一項權限並繼續。
 4. 複製部署的 `/exec` 網址。`/dev` 只供擁有者的瀏覽器工作階段使用。
-5. 在精靈選 Apps Script，填入網址與密鑰並儲存。已有其他生效路徑時先確認替換。繼續到服務檢查，按「執行服務檢查」，核對回傳帳號。
+5. 在精靈選「個人 Gmail，只需信件、行事曆、試算表」，填入網址與密鑰並儲存。已有其他生效路徑時先確認替換。繼續到服務檢查，按「執行服務檢查」，核對回傳帳號。
 6. 保密保存網址和密鑰。輪替時修改腳本密鑰，選「Deploy → Manage deployments」，編輯現有部署，選「New version」並部署，再更新儀表板密鑰。這樣網址會保持不變；選 New deployment 會產生新網址。已部署的腳本也要用此方式重新部署，才會套用新版範本的帳號辨識方式，以執行者 Me 的帳號回報。Apps Script 有每日配額，個人帳號尤其有限。
 
 橋接涵蓋 Gmail 搜尋、讀信、草稿；Calendar 列表、建立；Sheets 讀取、附加。加上 `status`，範本共八個動作、三項服務。Drive、Docs、Slides、Forms、Tasks 不支援，也沒有寄信動作。端點可公開連線，靠密鑰限制存取；儀表板會加密保存密鑰。

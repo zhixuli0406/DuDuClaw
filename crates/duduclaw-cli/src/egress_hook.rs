@@ -45,23 +45,9 @@ pub(crate) async fn run(home: &Path, agent: &str) -> i32 {
     // Default is strict even when policy lookup itself panics or fails.
     let mode = Cell::new(Mode::Block);
     let result = caught(async {
-        if !home.is_absolute() || !duduclaw_core::is_valid_agent_id(agent) {
-            return Err("invalid hook identity".into());
-        }
-        std::fs::read_to_string(home.join("config.toml")).map_err(|_| "policy unavailable")?;
-        let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(home, agent)
-            .unwrap_or_else(|| home.join("agents").join(agent));
-        mode.set(duduclaw_core::egress_guard::effective_mode_checked(home, Some(&dir))?);
-        if mode.get() == Mode::Off { return Ok(Decision { allow: true, message: String::new() }); }
         let mut input = Vec::new();
         std::io::stdin().take(MAX_BYTES as u64 + 1).read_to_end(&mut input).map_err(|_| "stdin unavailable")?;
-        let Some((tool, args)) = classify(&input)? else {
-            return Ok(Decision { allow: true, message: String::new() });
-        };
-        let turn = std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
-            .or_else(|| std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID))
-            .and_then(|turn| turn.into_string().ok()).ok_or("turn unavailable")?;
-        exchange(home, agent, &turn, &tool, args).await
+        evaluate(home, agent, &input, &mode).await
     }).await;
     let (code, message, failed) = finish(mode.get(), result);
     // Logging is best effort, and must never turn a block into exit 101.
@@ -75,6 +61,29 @@ pub(crate) async fn run(home: &Path, agent: &str) -> i32 {
         if !message.is_empty() { eprintln!("{message}"); }
     }));
     code
+}
+
+async fn evaluate(home: &Path, agent: &str, input: &[u8], mode: &Cell<Mode>) -> Result<Decision, String> {
+    if !home.is_absolute() || !duduclaw_core::is_valid_agent_id(agent) {
+        return Err("invalid hook identity".into());
+    }
+    // Local commands never need policy files or a live gateway. Defer
+    // classification errors until mode is known so shadow stays shadow.
+    let classified = classify(input);
+    if matches!(classified, Ok(None)) {
+        return Ok(Decision { allow: true, message: String::new() });
+    }
+    let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(home, agent)
+        .unwrap_or_else(|| home.join("agents").join(agent));
+    mode.set(duduclaw_core::egress_guard::effective_mode_checked(home, Some(&dir))?);
+    if mode.get() == Mode::Off { return Ok(Decision { allow: true, message: String::new() }); }
+    let Some((tool, args)) = classified? else {
+        return Ok(Decision { allow: true, message: String::new() });
+    };
+    let turn = std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
+        .or_else(|| std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID))
+        .and_then(|turn| turn.into_string().ok()).ok_or("turn unavailable")?;
+    exchange(home, agent, &turn, &tool, args).await
 }
 
 fn classify(input: &[u8]) -> Result<Option<(String, Value)>, String> {
@@ -154,6 +163,33 @@ fn interpret(key: &str, agent: &str, token: &str, nonce: &str, signature: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn run_input(home: &Path, command: &str) -> i32 {
+        let mode = Cell::new(Mode::Block);
+        let input = serde_json::to_vec(&json!({"tool_name":"Bash", "tool_input":{"command":command}})).unwrap();
+        let result = caught(evaluate(home, "bot", &input, &mode)).await;
+        finish(mode.get(), result).0
+    }
+
+    #[tokio::test]
+    async fn hook_missing_config_is_shadow_but_unreadable_network_policy_denies() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(run_input(home.path(), "ls -la").await, 0);
+        assert_eq!(run_input(home.path(), "curl https://example.test").await, 0);
+        std::fs::create_dir(home.path().join("config.toml")).unwrap();
+        assert_eq!(run_input(home.path(), "ls -la").await, 0);
+        assert_eq!(run_input(home.path(), "curl https://example.test").await, 2);
+        std::fs::remove_dir(home.path().join("config.toml")).unwrap();
+        for policy in ["[", "[security]\negress_guard='ask'", "[security]\negress_guard='block'"] {
+            std::fs::write(home.path().join("config.toml"), policy).unwrap();
+            assert_eq!(run_input(home.path(), "ls -la").await, 0, "{policy}");
+            assert_eq!(run_input(home.path(), "curl https://example.test").await, 2, "{policy}");
+        }
+        for policy in ["[security]\negress_guard='shadow'", "[security]\negress_guard='off'"] {
+            std::fs::write(home.path().join("config.toml"), policy).unwrap();
+            assert_eq!(run_input(home.path(), "curl https://example.test").await, 0, "{policy}");
+        }
+    }
 
     #[test]
     fn hook_non_network_bash_returns_before_gateway_work() {

@@ -1,20 +1,10 @@
 # Distributor name and logo
 
-A failed refresh keeps the current verified brand. Only an explicit `distributor_brand: null` from the control plane, a license that is no longer `Oem`, or a cached document that fails verification removes it. A missing response field is an error, not a request to clear the brand.
+A failed refresh keeps the current verified brand while the active license remains valid and its subscription matches the signed document. An explicit `distributor_brand: null` from the control plane, a license that fails expiry or offline-grace checks, a subscription change, or a cached document that fails verification removes it. A missing response field is an error, not a request to clear the brand.
 
-In v1.78.0, a distributor can set a product name and logo in the license
-console. Only a gateway whose effective license tier is `Oem` uses them, and
-only after verifying the signed document for its subscription. Without a
-valid document it shows the original DuDuClaw brand. A failed fetch or invalid
-document never prevents startup. The name and logo are the entire scope:
-subtitle, accent colour, company fields, custom About HTML and `branding.*`
-RPCs remain removed. Old `branding.json` and `branding.bundle.json` are ignored.
-Customers have no setter in config, HTTP or RPC.
+In v1.78.0, a distributor can set a product name and logo in the license console. The distributor's customers receive that brand on any license tier when the signature verifies, the document's subscription exactly matches the active license, and the license passes expiry and offline-grace checks. The console binds the brand to the customer's subscription through its distributor assignment (`licenses.distributor_id`). Open-source and unlicensed installs have no subscription and never receive a brand. Without an effective document the gateway shows the original DuDuClaw brand. A failed fetch or invalid document never prevents startup. The name and logo are the entire scope: subtitle, accent colour, company fields, custom About HTML and `branding.*` RPCs remain removed. Old `branding.json` and `branding.bundle.json` are ignored. Customers have no setter in config, HTTP or RPC.
 
-The distributor edits the name and logos alongside its notice in the license
-console, previews them and publishes. A signed runtime copy reaches the gateway
-through the same feed cadence and pinned Ed25519 keys as the distributor notice.
-This public repo provides the reader; console editing is maintained separately.
+The distributor edits the name and logos alongside its notice in the license console. Preview runs in the browser and is optional; publishing does not require preview. The clear-brand button removes the published name and logos so customers return to DuDuClaw after the next successful update. Gateways with a subscription fetch the signed runtime copy on any tier, using the same feed cadence and pinned Ed25519 keys as the distributor notice. This public repo provides the reader; console editing is maintained separately.
 
 ## Signed brand contract
 
@@ -212,7 +202,7 @@ same as today). A refresh preserves the original `control_url`.
 
 | Method | Access |
 |---|---|
-| `about.get` | any logged-in user (fixed vendor fields, version, tier; `brand` only for verified Oem branding; `distributor_notice` only from a distributor build or a signed runtime copy for a distributor-issued license) |
+| `about.get` | any logged-in user (fixed vendor fields, version, tier; `brand` only for a verified brand bound to the active valid subscription; `distributor_notice` only from a distributor build or a signed runtime copy for a distributor-issued license) |
 | `distributor.status/list/add/update/remove/issue/revoke/upgrade` | admin |
 
 ## HTTP control-plane surface (owner gateway, issuer-key-gated)

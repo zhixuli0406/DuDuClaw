@@ -18,7 +18,7 @@ duduclaw migrate from openclaw --apply --confirm-profile <preview-digest>
 ## Command
 
 ```
-duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename] [--agent <id>] [--no-redact] [--json]
 ```
 
 | Flag | Effect |
@@ -27,6 +27,10 @@ duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] 
 | `--source <path>` | Source directory. openclaw/hermes have defaults; **paperclip requires it**. |
 | `--apply` | Actually perform the write. |
 | `--rename` | On an agent-id collision, import under an `-imported` suffix instead of skipping. |
+| `--confirm-profile <digest>` | Required with `--apply` for OpenClaw, Hermes and paperclip; use the digest from the profile preview. Not required for `claude-code`. |
+| `--agent <id>` | Existing target employee; required for `claude-code`. |
+| `--no-redact` | Disable the default PII redaction of `claude-code` session transcripts. |
+| `--json` | Emit one machine-readable JSON result instead of the human-readable plan. |
 
 Every item is tagged with a status:
 
@@ -156,6 +160,6 @@ guess on your behalf.
 
 ## Profile review and Claude Code
 
-OpenClaw, Hermes and paperclip migrations show Persona, User, Rules and Contract with input-guard results in preview mode. Apply requires the corresponding `--confirm-profile <digest>`; changed profile content requires another review. AI sessions cannot run migration. `USER.md` is limited to 4,000 characters and injected as data, not instructions.
+OpenClaw, Hermes and paperclip migrations show Persona, User, Rules and Contract with input-guard results in preview mode. Apply requires the corresponding `--confirm-profile <digest>`; changed section content requires another review. This migration digest covers the Persona, User, Rules and Contract sections only; it does not bind every migration output file. In contrast, `pack install` requires `--confirm-profile <digest>` from its preview and binds all files it will write. AI sessions cannot run migration. `USER.md` is limited to 4,000 characters and injected as data, not instructions.
 
-Claude Code migration is also supported: `duduclaw migrate from claude-code --source ~/.claude --agent <existing-id>`. Add `--apply` after inspecting the preview. It imports curated memory, low-trust knowledge pages and filtered session transcripts into that existing employee; it does not create a new employee. Redaction is enabled by default; `--no-redact` disables the transcript redaction pass.
+Claude Code migration is also supported: `duduclaw migrate from claude-code --source ~/.claude --agent <existing-id>`. Add `--apply` after inspecting the preview; `--confirm-profile` is not required for this path. It imports curated memory, low-trust knowledge pages and filtered session transcripts into that existing employee; it does not create a new employee. Redaction is enabled by default; `--no-redact` disables the transcript redaction pass.
