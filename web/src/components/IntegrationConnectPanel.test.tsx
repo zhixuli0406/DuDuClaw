@@ -257,14 +257,14 @@ describe('Google OAuth actionable failures', () => {
     mockUnconfigured();
     vi.mocked(api.mcp.oauthStatus).mockResolvedValue({ authenticated: false, expires_at: null, error_code: code });
     renderPanel();
-    const messages = { access_denied: /authorization was declined/i, admin_policy_enforced: /organization blocked authorization/i, invalid_scope: /rejected the requested permissions/i, other: /authorization failed/i };
+    const messages = { access_denied: /Google denied access/i, admin_policy_enforced: /organization blocked authorization/i, invalid_scope: /rejected the requested permissions/i, other: /authorization failed/i };
     expect(await screen.findByText(messages[code])).toBeInTheDocument();
   });
   it('shows reconnect and six-day Testing warnings from persisted connection state', async () => {
     mockUnconfigured();
     vi.mocked(api.mcp.oauthStatus).mockResolvedValue({ authenticated: false, expires_at: null, needs_reconnect: true });
     const view = renderPanel();
-    expect(await screen.findByText(/authorization has expired or was revoked/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Google authorization expired or was revoked/i)).toBeInTheDocument();
     view.unmount();
     vi.mocked(api.mcp.oauthStatus).mockResolvedValue({ authenticated: true, expires_at: null, testing_warning: true });
     renderPanel();
