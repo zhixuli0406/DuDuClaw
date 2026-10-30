@@ -134,7 +134,7 @@ fn overwritten_key_is_detected_and_refused() {
     assert_eq!(cp.status().state, ProtectionState::KeyChanged);
 
     // And a record sealed under the old key reports key_changed, not garbage.
-    let forged_key = ProtectedKey { key: Zeroizing::new(forged), key_id: m.key_id.clone() };
+    let forged_key = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new(forged), key_id: m.key_id.clone() };
     assert_eq!(forged_key.unseal(&sealed).unwrap_err().code, "key_changed");
 }
 

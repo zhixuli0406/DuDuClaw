@@ -552,6 +552,9 @@ impl WikiStore {
     /// Write a page to disk with atomic write (temp + rename).
     /// Automatically updates `_index.md` and appends to `_log.md`.
     pub fn write_page(&self, path: &str, content: &str) -> Result<()> {
+        if duduclaw_security::credential_detect::mask(path) != path {
+            return Err(DuDuClawError::Memory("credentials are not accepted in wiki paths".into()));
+        }
         self.validate_page_path(path)?;
         if content.len() > MAX_PAGE_SIZE {
             return Err(DuDuClawError::Memory(format!(
@@ -565,6 +568,9 @@ impl WikiStore {
     }
 
     fn write_page_under_fence(&self, path: &str, content: &str) -> Result<()> {
+        if duduclaw_security::credential_detect::mask(path) != path {
+            return Err(DuDuClawError::Memory("credentials are not accepted in wiki paths".into()));
+        }
         self.validate_page_path(path)?;
 
         if content.len() > MAX_PAGE_SIZE {
@@ -574,6 +580,14 @@ impl WikiStore {
                 MAX_PAGE_SIZE
             )));
         }
+
+        // Mask at the shared sink before deriving the title or FTS index.
+        // Refuse unscannable pages instead of replacing an entire large page.
+        if content.len() > duduclaw_security::credential_detect::MAX_SCAN_BYTES {
+            return Err(DuDuClawError::Memory("wiki credential scan limit exceeded".into()));
+        }
+        let masked_content = duduclaw_security::credential_detect::mask(content);
+        let content = masked_content.as_str();
 
         // Validate and confine before creating any directory, then write
         // through an O_EXCL temp file (never through a planted link).
@@ -1742,12 +1756,15 @@ impl WikiStore {
         let mut f = options
             .open(&log_path)
             .map_err(|e| format!("open log: {e}"))?;
-        f.write_all(entry.as_bytes())
+        f.write_all(duduclaw_security::credential_detect::mask(&entry).as_bytes())
             .map_err(|e| format!("write log: {e}"))
     }
 
     /// Write a page with author attribution (used by shared wiki).
     pub fn write_page_with_author(&self, path: &str, content: &str, author: &str) -> Result<()> {
+        if duduclaw_security::credential_detect::mask(path) != path {
+            return Err(DuDuClawError::Memory("credentials are not accepted in wiki paths".into()));
+        }
         self.validate_page_path(path)?;
 
         if content.len() > MAX_PAGE_SIZE {
@@ -1759,6 +1776,14 @@ impl WikiStore {
         }
 
         let _fence = self.delivery_fence().exclusive_for_write()?;
+
+        // Mask at the shared sink before deriving the title or FTS index.
+        // Refuse unscannable pages instead of replacing an entire large page.
+        if content.len() > duduclaw_security::credential_detect::MAX_SCAN_BYTES {
+            return Err(DuDuClawError::Memory("wiki credential scan limit exceeded".into()));
+        }
+        let masked_content = duduclaw_security::credential_detect::mask(content);
+        let content = masked_content.as_str();
 
         // Validate and confine before creating any directory, then write
         // through an O_EXCL temp file (never through a planted link).
@@ -2768,6 +2793,28 @@ impl WikiStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // F1 sink regression; written but not run (owner forbids builds).
+    #[test]
+    fn local_and_shared_wiki_writes_mask_before_indexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WikiStore::new(tmp.path().join("wiki"));
+        store.ensure_scaffold().unwrap();
+        let content = "---\ntitle: password: fixture-title\n---\ntoken: fixture-body\n";
+        store.write_page("concepts/local.md", content).unwrap();
+        store.write_page_with_author("concepts/shared.md", content, "test").unwrap();
+        for path in ["concepts/local.md", "concepts/shared.md", "_index.md"] {
+            assert!(!store.read_raw(path).unwrap().contains("fixture-"));
+        }
+        let large = "x".repeat(duduclaw_security::credential_detect::MAX_SCAN_BYTES + 1);
+        assert!(store.write_page("concepts/large.md", &large).is_err());
+        assert!(!store.wiki_dir().join("concepts/large.md").exists());
+        let secret_path = format!("concepts/ghp_{}.md", "a".repeat(36));
+        assert!(store.write_page(&secret_path, "safe").is_err());
+        assert!(store.write_page_with_author(&secret_path, "safe", "test").is_err());
+        assert!(!store.wiki_dir().join(&secret_path).exists());
+        assert!(!store.read_raw("_index.md").unwrap().contains("ghp_"));
+    }
     use tempfile::TempDir;
 
     fn sample_page(title: &str) -> String {

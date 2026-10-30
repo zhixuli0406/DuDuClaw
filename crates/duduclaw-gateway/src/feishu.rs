@@ -672,7 +672,7 @@ async fn send_feishu_payload(
             let text = resp.text().await.unwrap_or_default();
             warn!(
                 "Feishu card send failed ({status}): {}",
-                truncate_bytes(&text, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 200)
             );
             false
         }
@@ -730,7 +730,7 @@ async fn send_message(state: &FeishuState, chat_id: &str, text: &str) {
             let text = resp.text().await.unwrap_or_default();
             error!(
                 "Feishu send failed ({status}): {}",
-                truncate_bytes(&text, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 200)
             );
         }
         Err(e) => error!("Feishu send error: {e}"),
@@ -767,7 +767,7 @@ async fn reply_message(state: &FeishuState, message_id: &str, text: &str) {
             let text = resp.text().await.unwrap_or_default();
             error!(
                 "Feishu reply failed ({status}): {}",
-                truncate_bytes(&text, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 200)
             );
         }
         Err(e) => error!("Feishu reply error: {e}"),

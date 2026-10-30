@@ -13,6 +13,8 @@ pub struct Finding {
     pub span: Range<usize>,
     pub service_hint: Option<String>,
     pub account_hint: Option<String>,
+    /// Only a complete provider or PEM structure may be fingerprinted.
+    pub fingerprint_eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,37 +24,103 @@ struct Rule {
     kind: &'static str,
     service: Option<&'static str>,
     pattern: Regex,
+    structural: bool,
 }
 
 fn rules() -> Result<&'static Vec<Rule>, DetectError> {
     static RULES: OnceLock<Result<Vec<Rule>, DetectError>> = OnceLock::new();
     RULES.get_or_init(|| {
         let mut specs = [
-            ("ssh_key", None, r"(?s)(?P<value>-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----.*?(?:-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----|\z))"),
-            ("certificate", None, r"(?s)(?P<value>-----BEGIN CERTIFICATE-----.*?(?:-----END CERTIFICATE-----|\z))"),
-            ("connection_string", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?P<value>(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql)://[^\s/:@]+:[^\s@]+@[^\s<>"']+)"#),
-            ("api_key", Some("Google"), r"(?:^|[^A-Za-z0-9_])(?P<value>(?:AIza[A-Za-z0-9_-]{20,}|GOCSPX-[A-Za-z0-9_-]{16,}))"),
-            ("api_key", Some("AWS"), r"(?:^|[^A-Za-z0-9_])(?P<value>(?:AKIA|ASIA)[A-Z0-9]{16})"),
-            ("oauth_token", Some("Google"), r"(?:^|[^A-Za-z0-9_])(?P<value>ya29\.[A-Za-z0-9_.-]{16,})"),
-            ("api_key", None, r"(?:^|[^A-Za-z0-9_])(?P<value>(?:sk-|xox[bpaes]-|xapp-|gh[pousr]_|github_pat_|ddc_|glpat-|EAA)[A-Za-z0-9_-]{12,})"),
-            ("oauth_token", None, r"(?:^|[^A-Za-z0-9_])(?P<value>[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,})"),
-            ("oauth_token", Some("Telegram"), r"(?:^|[^A-Za-z0-9_])(?P<value>[0-9]{5,16}[:-][A-Za-z0-9_-]{20,})"),
-            ("password", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:password|passwd|pwd)\s*(?P<assignment>:|=|\bis\b)\s*["'](?P<value>[^"'\r\n]+)["']"#),
-            ("password", None, r#"密碼\s*(?:是|為|：|:|=)\s*[「『"'](?P<value>[^」』"'\r\n]+)[」』"']"#),
-            ("password", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:password|passwd|pwd)\s*(?P<assignment>:|=|\bis\b)\s*["']?(?P<value>[^\s"'<>，。；、\[\]]+)"#),
-            ("password", None, r#"密碼\s*(?:是|為|：|:|=)\s*[「『"']?(?P<value>[^\s「」『』"'<>，。；、\[\]]+)"#),
-            ("api_key", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:api[ _-]?key)\s*(?:是|為|：|:|=|\bis\b)\s*["']?(?P<value>[^\s"'<>，。；、\[\]]+)"#),
-            ("api_key", None, r#"金鑰\s*(?:是|為|：|:|=)\s*[「『"']?(?P<value>[^\s「」『』"'<>，。；、\[\]]+)"#),
-            ("oauth_token", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:token)\s*(?:是|為|：|:|=|\bis\b)\s*["']?(?P<value>[^\s"'<>，。；、\[\]]+)"#),
-            ("oauth_token", None, r"(?i)(?:^|[^A-Za-z0-9_])Bearer\s+(?P<value>[A-Za-z0-9_./+=-]{20,})"),
+            ("ssh_key", None, r"(?s)(?P<value>-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----.*?(?:-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----|\z))", true),
+            ("certificate", None, r"(?s)(?P<value>-----BEGIN CERTIFICATE-----.*?(?:-----END CERTIFICATE-----|\z))", true),
+            ("connection_string", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?P<value>(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql)://[^\s/:@]+:[^\s@]+@[^\s<>"']+)"#, false),
+            ("api_key", Some("Google"), r"(?:^|[^A-Za-z0-9_])(?P<value>(?:AIza[A-Za-z0-9_-]{20,}|GOCSPX-[A-Za-z0-9_-]{16,}))", true),
+            ("api_key", Some("AWS"), r"(?:^|[^A-Za-z0-9_])(?P<value>(?:AKIA|ASIA)[A-Z0-9]{16})", true),
+            ("oauth_token", Some("Google"), r"(?:^|[^A-Za-z0-9_])(?P<value>ya29\.[A-Za-z0-9_.-]{16,})", true),
+            ("api_key", None, r"(?:^|[^A-Za-z0-9_])(?P<value>(?:sk-|xox[bpaes]-|xapp-|gh[pousr]_|github_pat_|ddc_|glpat-|EAA)[A-Za-z0-9_-]{12,})", true),
+            ("oauth_token", None, r"(?:^|[^A-Za-z0-9_])(?P<value>[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,})", false),
+            ("oauth_token", Some("Telegram"), r"(?:^|[^A-Za-z0-9_])(?P<value>[0-9]{5,16}[:-][A-Za-z0-9_-]{20,})", true),
+            ("password", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:password|passwd|pwd)["']?\s*(?P<assignment>:|=|\bis\b)\s*["'](?P<value>[^"'\r\n]+)["']"#, false),
+            ("password", None, r#"密碼\s*(?:是|為|：|:|=)\s*[「『"'](?P<value>[^」』"'\r\n]+)[」』"']"#, false),
+            ("password", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:password|passwd|pwd)["']?\s*(?P<assignment>:|=|\bis\b)\s*["']?(?P<value>[^\s"'<>，。；、\[\]]+)"#, false),
+            ("password", None, r#"密碼\s*(?:是|為|：|:|=)\s*[「『"']?(?P<value>[^\s「」『』"'<>，。；、\[\]]+)"#, false),
+            ("api_key", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:api[ _-]?key)["']?\s*(?:是|為|：|:|=|\bis\b)\s*["']?(?P<value>[^\s"'<>，。；、\[\]]+)"#, false),
+            ("api_key", None, r#"金鑰\s*(?:是|為|：|:|=)\s*[「『"']?(?P<value>[^\s「」『』"'<>，。；、\[\]]+)"#, false),
+            ("oauth_token", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:token)["']?\s*(?:是|為|：|:|=|\bis\b)\s*["']?(?P<value>[^\s"'<>，。；、\[\]]+)"#, false),
+            ("oauth_token", None, r"(?i)(?:^|[^A-Za-z0-9_])Bearer\s+(?P<value>[A-Za-z0-9_./+=-]{20,})", false),
         ];
-        specs.sort_by_key(|(kind, _, _)| match *kind {
+        specs.sort_by_key(|(kind, _, _, _)| match *kind {
             "connection_string" => 0, "password" => 1, "ssh_key" | "certificate" => 2, _ => 3,
         });
-        specs.into_iter().map(|(kind, service, pattern)| {
-            Ok(Rule { kind, service, pattern: Regex::new(pattern).map_err(|_| DetectError)? })
+        specs.into_iter().map(|(kind, service, pattern, structural)| {
+            Ok(Rule { kind, service, pattern: Regex::new(pattern).map_err(|_| DetectError)?, structural })
         }).collect()
     }).as_ref().map_err(|_| DetectError)
+}
+
+/// Deliberately narrower than masking: incomplete PEM, JWTs, bearer strings
+/// and arbitrary labelled values must never become offline guessing oracles.
+pub(crate) fn strict_structure(kind: &str, value: &str) -> bool {
+    static PROVIDERS: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    if matches!(kind, "ssh_key" | "certificate") {
+        let mut lines = value.lines();
+        let Some(begin) = lines.next() else { return false };
+        let labels: &[&str] = if kind == "certificate" {
+            &["CERTIFICATE"]
+        } else {
+            &["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY", "DSA PRIVATE KEY", "ENCRYPTED PRIVATE KEY"]
+        };
+        let Some(label) = labels.iter().find(|label| begin == format!("-----BEGIN {label}-----")) else { return false };
+        let end = format!("-----END {label}-----");
+        let mut body = String::new();
+        let mut ended = false;
+        for line in lines {
+            if ended { return false; }
+            if line == end { ended = true; continue; }
+            if line.is_empty() || !line.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
+                return false;
+            }
+            body.push_str(line);
+        }
+        if !ended || body.len() < 64 { return false; }
+        use base64::Engine as _;
+        return base64::engine::general_purpose::STANDARD.decode(&body).is_ok();
+    }
+    if !matches!(kind, "api_key" | "oauth_token") { return false; }
+    let Ok(pattern) = PROVIDERS.get_or_init(|| Regex::new(
+        r"\A(?:AIza[A-Za-z0-9_-]{35}|GOCSPX-[A-Za-z0-9_-]{28}|(?:AKIA|ASIA)[A-Z0-9]{16}|ya29\.[A-Za-z0-9_.-]{32,}|(?:sk-(?:proj-|ant-api03-)?|xox[bpaes]-|xapp-|gh[pousr]_|github_pat_|ddc_|glpat-|EAA)[A-Za-z0-9_-]{32,}|[0-9]{5,16}:[A-Za-z0-9_-]{35})\z",
+    )) else { return false };
+    pattern.is_match(value)
+}
+
+/// Mask JSON at persistence boundaries, including dynamic object keys and
+/// values whose credential context is supplied by their field name.
+pub fn mask_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = mask(text),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(mask_json),
+        serde_json::Value::Object(values) => {
+            let original = std::mem::take(values);
+            for (key, mut child) in original {
+                let normalized: String = key.chars().filter(|c| c.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase).collect();
+                if matches!(normalized.as_str(), "password" | "passwd" | "pwd" | "token" | "apikey"
+                    | "secret" | "clientsecret" | "accesstoken" | "refreshtoken" | "authorization"
+                    | "connectionstring" | "privatekey") && child.is_string()
+                {
+                    child = serde_json::Value::String("[已遮罩的密碼]".into());
+                } else {
+                    mask_json(&mut child);
+                }
+                let key = mask(&key);
+                if values.insert(key, child).is_some() {
+                    values.clear();
+                    return;
+                }
+            }
+        }
+        _ => (),
+    }
 }
 
 /// Only the first character and a syntactically valid domain survive.
@@ -110,6 +178,7 @@ fn detect_inner(text: &str) -> Result<Vec<Finding>, DetectError> {
             findings.push(Finding {
                 kind: rule.kind.into(), span,
                 service_hint: rule.service.map(str::to_string), account_hint: account.clone(),
+                fingerprint_eligible: rule.structural && strict_structure(rule.kind, value.as_str()),
             });
         }
     }
@@ -128,6 +197,7 @@ fn detect_inner(text: &str) -> Result<Vec<Finding>, DetectError> {
             offset += 1;
         }
         let mut finding = findings[index].clone();
+        finding.fingerprint_eligible &= finding.span == (start..offset);
         finding.span = start..offset;
         result.push(finding);
     }
@@ -301,5 +371,68 @@ mod adjacent_shape_tests {
         assert!(!mask(&text).contains(&first));
         assert!(!mask(&text).contains(&second));
         assert!(detect(&format!("{first}EXTRA")).unwrap().is_empty());
+    }
+}
+
+// Security review regressions: written but not run (owner prohibits builds).
+#[cfg(test)]
+mod fingerprint_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn context_and_incomplete_structures_are_never_fingerprint_eligible() {
+        for text in [
+            format!("api key: {}", "guessable".repeat(8)),
+            format!("token: {}", "guessable".repeat(8)),
+            format!("Bearer {}", "guessable".repeat(8)),
+            format!("password: sk-{}", "x".repeat(40)),
+            "-----BEGIN PRIVATE KEY-----\nfixture".into(),
+            "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----".into(),
+            format!("api key: sk-{}!suffix", "x".repeat(40)),
+        ] {
+            let findings = detect(&text).unwrap();
+            assert!(!findings.is_empty());
+            assert!(findings.iter().all(|finding| !finding.fingerprint_eligible), "{text}");
+        }
+    }
+
+    #[test]
+    fn only_complete_provider_or_pem_structures_are_eligible() {
+        use base64::Engine as _;
+        let body = base64::engine::general_purpose::STANDARD.encode([42; 64]);
+        for text in [format!("api key: sk-{}", "x".repeat(40)),
+            format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"),
+            format!("AIza{}", "x".repeat(35))] {
+            let findings = detect(&text).unwrap();
+            assert_eq!(findings.len(), 1);
+            assert!(findings[0].fingerprint_eligible);
+        }
+    }
+
+    #[test]
+    fn json_sensitive_names_preserve_typed_containers_and_numbers() {
+        let mut data = serde_json::json!({"token":{"value":"password: fixture","at":1},"nested":{"token":17}});
+        mask_json(&mut data);
+        assert!(data["token"].is_object());
+        assert_eq!(data["token"]["at"], 1);
+        assert_eq!(data["nested"]["token"], 17);
+        assert!(!data.to_string().contains("fixture"));
+    }
+
+    #[test]
+    fn serialized_json_credential_labels_keep_their_context() {
+        for raw in [r#"{"password":"fixture secret"}"#, r#"{"api_key":"fixture"}"#, r#"{"token":"fixture"}"#] {
+            assert!(!mask(raw).contains("fixture"));
+        }
+    }
+
+    #[test]
+    fn json_masks_context_fields_dynamic_keys_and_nested_values() {
+        let mut data = serde_json::json!({"password":"fixture", "nested":[{"api_key":"fixture"}], "password: fixture":"ordinary"});
+        mask_json(&mut data);
+        assert!(!data.to_string().contains("fixture"));
+        let mut collision = serde_json::json!({"password: one":1,"password: two":2});
+        mask_json(&mut collision);
+        assert_eq!(collision, serde_json::json!({}));
     }
 }

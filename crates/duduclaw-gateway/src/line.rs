@@ -28,7 +28,7 @@ use crate::channel_settings::keys;
 mod assign;
 mod ingress;
 mod trigger;
-pub(crate) use ingress::durable_line_enabled;
+pub(crate) use ingress::{attach_credential_holder, durable_line_enabled};
 use ingress::{drain_line_ingress, line_conversation, record_reply_failure};
 
 const LINE_API_ORIGIN: &str = "https://api.line.me";
@@ -529,6 +529,14 @@ pub(crate) async fn handle_line_webhook(
             return StatusCode::BAD_REQUEST;
         };
         let conversation = line_conversation(event);
+        // Register metadata before the durable sink discards the original.
+        // No employee holder exists until the worker validates its route.
+        if let Some(text) = event.message.as_ref().and_then(|message| message.text.as_deref()) {
+            let ingress_id = crate::channel_ingress::digest(&["line", &account, event_id]);
+            let source = format!("line-ingress:{ingress_id}");
+            let principal = crate::credential_ledger::chat_principal(&format!("line:{conversation}"), "");
+            let _ = crate::credential_ledger::process_message(&state.home_dir, text, &source, &principal, "", "chat").await;
+        }
         accepted.push(crate::channel_ingress::AcceptedEvent {
             decision_fastlane: line_decision_fastlane(event),
             decision_binding: line_decision_request_id(event).map(|request_id| serde_json::json!({

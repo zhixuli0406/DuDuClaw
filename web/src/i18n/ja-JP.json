@@ -9113,5 +9113,10 @@
   "security.credentialAudit.source.config": "システム設定",
   "security.credentialAudit.source.oauth": "認可接続",
   "security.credentialAudit.source.dispatch": "委任プロンプト",
-  "security.credentialAudit.source.tool": "ツール呼び出し"
+  "security.credentialAudit.source.tool": "ツール呼び出し",
+  "security.credentialAudit.verify": "現在の監査区間を検証",
+  "security.credentialAudit.verifyScope": "ローテーション後は現在の区間のみを検証します。保存済み区間、末尾の完全性、記録の真正性は検証しません。",
+  "security.credentialAudit.verifyConsistent": "現在の区間は内部的に整合しています",
+  "security.credentialAudit.verifyBroken": "現在の区間にリンク不一致または不正な形式の監査記録があります",
+  "security.credentialAudit.verifyUnverified": "現在の区間の整合性を確認できません"
 }

@@ -226,3 +226,11 @@ fn contract_and_guardrail_refusals_are_returned_not_applied() {
         "guardrail PII redaction applies: {out}"
     );
 }
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[test]
+fn display_sink_masks_context_passwords_without_operator_redaction() {
+    let masked = mask_text("密碼：fixture-thinking", None);
+    assert!(!masked.contains("fixture-thinking"));
+    assert!(!mask_text("password: fixture-thinking", None).contains("fixture-thinking"));
+}

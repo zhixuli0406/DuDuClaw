@@ -909,7 +909,7 @@ pub fn verify_security_audit(home: &Path) -> Result<serde_json::Value, String> {
     use duduclaw_security::audit_chain::{verify_chain, ChainVerifyResult};
     let path = home.join("security_audit.jsonl");
     if !path.exists() {
-        return Ok(serde_json::json!({"status":"missing", "intact":false, "lines_checked":0}));
+        return Ok(serde_json::json!({"status":"missing", "intact":false, "lines_checked":0, "scope":"current_segment"}));
     }
     duduclaw_core::with_file_lock(&path, || {
         let file = std::fs::File::open(&path)?;
@@ -917,8 +917,8 @@ pub fn verify_security_audit(home: &Path) -> Result<serde_json::Value, String> {
         duduclaw_core::platform::flock_exclusive(&file)?;
         let _ = &file;
         match verify_chain(&path)? {
-            ChainVerifyResult::Intact { lines_checked } => Ok(serde_json::json!({"status":if lines_checked == 0 { "unverified" } else { "intact" }, "intact":lines_checked > 0, "lines_checked":lines_checked})),
-            ChainVerifyResult::Broken { line_number } => Ok(serde_json::json!({"status":"broken", "intact":false, "line_number":line_number})),
+            ChainVerifyResult::Intact { lines_checked } => Ok(serde_json::json!({"status":if lines_checked == 0 { "unverified" } else { "current_segment_consistent" }, "label":if lines_checked == 0 { "no chained rows verified" } else { "current segment internally consistent" }, "intact":lines_checked > 0, "lines_checked":lines_checked, "scope":"current_segment", "rotation_notice":"rotation verifies only the current segment; archived segments and tail completeness are not verified"})),
+            ChainVerifyResult::Broken { line_number } => Ok(serde_json::json!({"status":"broken", "intact":false, "line_number":line_number, "scope":"current_segment"})),
         }
     }).map_err(|_: std::io::Error| "security audit verification unavailable".into())
 }
@@ -969,6 +969,25 @@ mod credential_projection_tests {
         std::fs::write(&path, original.replacen("credential_detected", "credential_modified", 1)).unwrap();
         assert_eq!(verify_security_audit(home.path()).unwrap()["status"], "broken");
     }
+    // F6 regression test; not run (owner forbids builds).
+    #[test]
+    fn audit_verify_labels_current_segment_and_refuses_unchained_tail() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_security::audit::append_audit_event(home.path(), &duduclaw_security::audit::AuditEvent::new("credential_detected", "test", duduclaw_security::audit::Severity::Info, serde_json::json!({})));
+        let result = verify_security_audit(home.path()).unwrap();
+        assert_eq!(result["status"], "current_segment_consistent");
+        assert_eq!(result["label"], "current segment internally consistent");
+        assert_eq!(result["scope"], "current_segment");
+        let path = home.path().join("security_audit.jsonl");
+        let original = std::fs::read_to_string(&path).unwrap();
+        for tail in ["{}", "{malformed", "{\"_prev_hash\":null}"] {
+            std::fs::write(&path, format!("{original}{tail}\n")).unwrap();
+            let result = verify_security_audit(home.path()).unwrap();
+            assert_eq!(result["status"], "broken");
+            assert_eq!(result["line_number"], 2);
+        }
+    }
+
     #[test]
     fn audit_verify_does_not_call_legacy_only_history_intact() {
         let home = tempfile::tempdir().unwrap();

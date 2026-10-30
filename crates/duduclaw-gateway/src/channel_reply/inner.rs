@@ -751,9 +751,11 @@ pub(super) async fn build_reply_with_session_inner(
         return format!("⚠️ {}", scan.summary);
     }
 
+    crate::line::attach_credential_holder(&ctx.home_dir, &agent_id).await;
     let credential_source = format!("{session_id}:pending:{}", uuid::Uuid::new_v4().simple());
+    let credential_sender = crate::credential_ledger::chat_principal(session_id, user_id);
     let credential_text = crate::credential_ledger::process_message(
-        &ctx.home_dir, text, &credential_source, user_id, &agent_id, "chat",
+        &ctx.home_dir, text, &credential_source, &credential_sender, &agent_id, "chat",
     ).await;
     let text = credential_text.as_str();
 
@@ -827,7 +829,7 @@ pub(super) async fn build_reply_with_session_inner(
                         }
 
                         // Log extraction event to audit log
-                        let audit_entry = serde_json::json!({
+                        let mut audit_entry = serde_json::json!({
                             "event": "skill_extracted",
                             "trigger": "user_feedback",
                             "skill_id": skill.id,
@@ -838,6 +840,7 @@ pub(super) async fn build_reply_with_session_inner(
                             "source_session": session_key,
                             "timestamp": chrono::Utc::now().to_rfc3339(),
                         });
+                        duduclaw_security::credential_detect::mask_json(&mut audit_entry);
                         if let Ok(audit_line) = serde_json::to_string(&audit_entry) {
                             let audit_path = ctx.home_dir.join("skill_extraction_audit.jsonl");
                             if let Ok(mut f) = tokio::fs::OpenOptions::new()
@@ -1009,7 +1012,8 @@ pub(super) async fn build_reply_with_session_inner(
             .find(|t| t.role == "assistant")
         {
             if last_assistant.content.contains('？') || last_assistant.content.contains('?') {
-                let answer_snippet = duduclaw_core::truncate_bytes(&sanitized_text, 200);
+                let masked_answer = duduclaw_security::credential_detect::mask(&sanitized_text);
+                let answer_snippet = duduclaw_core::truncate_bytes(&masked_answer, 200);
                 // Cap pinned at ~1000 chars to prevent bloat
                 if pinned.len() < 1000 {
                     pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
@@ -1822,7 +1826,7 @@ pub(super) async fn build_reply_with_session_inner(
             let _ = tokio::fs::OpenOptions::new().create(true).append(true)
                 .open(ctx.home_dir.join("debug.log")).await.map(|mut file| {
                     use tokio::io::AsyncWriteExt;
-                    tokio::spawn(async move { let _=file.write_all(log_line.as_bytes()).await; });
+                    tokio::spawn(async move { let _=file.write_all(duduclaw_security::credential_detect::mask(&log_line).as_bytes()).await; });
                 });
             warn!(diagnostic=%diagnostic,"Reply runtime unavailable");
             last_cli_error=Some(error);
@@ -1940,7 +1944,7 @@ pub(super) async fn build_reply_with_session_inner(
                             .map(|mut f| {
                                 use tokio::io::AsyncWriteExt;
                                 tokio::spawn(async move {
-                                    let _ = f.write_all(log_line.as_bytes()).await;
+                                    let _ = f.write_all(duduclaw_security::credential_detect::mask(&log_line).as_bytes()).await;
                                 });
                             });
                         warn!(diagnostic=%diagnostic,"Direct API unavailable");
@@ -2947,7 +2951,7 @@ pub(super) async fn build_reply_with_session_inner(
                                 );
                                 // Log synthesis trigger event to feedback.jsonl
                                 // Use structured fields to prevent second-order injection via topic
-                                let signal = serde_json::json!({
+                                let mut signal = serde_json::json!({
                                     "signal_type": "synthesis_trigger",
                                     "agent_id": &agent_id_for_pred,
                                     "topic": &trigger.topic,
@@ -2958,6 +2962,7 @@ pub(super) async fn build_reply_with_session_inner(
                                 });
                                 let feedback_path = home_for_pred.join("feedback.jsonl");
                                 let feedback_clone = feedback_path.clone();
+                                duduclaw_security::credential_detect::mask_json(&mut signal);
                                 let signal_str = signal.to_string();
                                 // Non-blocking write to avoid stalling async runtime
                                 tokio::task::spawn_blocking(move || {

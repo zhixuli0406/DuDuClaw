@@ -165,8 +165,12 @@ impl ApprovalStore {
     }
 
     async fn insert_row(&self, rec: &ApprovalRecord, if_absent: bool) -> Result<bool, String> {
+        require_credential_free_payload(&rec.payload)?;
+        if let Some(answer) = &rec.answer {
+            require_credential_free_payload(answer)?;
+        }
         let payload_text = rec.payload.to_string();
-        let simulation_text = rec.simulation.as_ref().map(|v| v.to_string());
+        let simulation_text = rec.simulation.as_ref().map(|v| masked_approval_value(v).to_string());
         let conn = self.conn.lock().await;
         let sql = format!(
             "INSERT INTO approvals
@@ -183,7 +187,7 @@ impl ApprovalStore {
                 rec.id.as_str(),
                 rec.agent_id,
                 rec.action_kind,
-                rec.summary,
+                duduclaw_security::credential_detect::mask(&rec.summary),
                 payload_text,
                 rec.status.as_str(),
                 rec.created_at,
@@ -197,7 +201,7 @@ impl ApprovalStore {
                 rec.request_kind.as_str(),
                 rec.binding.as_ref().map(|v| serde_json::to_string(v).unwrap()),
                 rec.answer.as_ref().map(Value::to_string),
-                rec.invalidated_reason,
+                rec.invalidated_reason.as_deref().map(duduclaw_security::credential_detect::mask),
                 rec.on_behalf_of,
             ],
         )
@@ -305,13 +309,14 @@ impl ApprovalStore {
         summary: &str,
         payload: &Value,
     ) -> Result<usize, String> {
+        require_credential_free_payload(payload)?;
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
              status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
              invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
                 END WHERE id = ?3",
-            params![summary, payload.to_string(), id.as_str()],
+            params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
         )
         .map_err(|e| format!("scrub approval: {e}"))
     }

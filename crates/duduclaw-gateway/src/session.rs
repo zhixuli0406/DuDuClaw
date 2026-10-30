@@ -872,7 +872,7 @@ impl SessionManager {
         let conn = self.acquire().await;
         conn.execute(
             "UPDATE sessions SET pinned_instructions = ?1 WHERE id = ?2",
-            params![instructions, session_id],
+            params![duduclaw_security::credential_detect::mask(instructions), session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(format!("set_pinned: {e}")))?;
         Ok(())
@@ -1092,7 +1092,8 @@ impl SessionManager {
     /// Persist an auto-generated session title (CJK-safe cap) together with
     /// the turn count it was generated at.
     pub async fn set_title(&self, session_id: &str, title: &str, through_turn: u32) -> Result<()> {
-        let clean = duduclaw_core::truncate_chars(title.trim(), SESSION_TITLE_MAX_CHARS);
+        let masked = duduclaw_security::credential_detect::mask(title);
+        let clean = duduclaw_core::truncate_chars(masked.trim(), SESSION_TITLE_MAX_CHARS);
         let conn = self.acquire().await;
         conn.execute(
             "UPDATE sessions SET title = ?1, titled_through_turn = ?2 WHERE id = ?3",
@@ -1864,6 +1865,21 @@ mod tests {
 #[cfg(test)]
 mod credential_summary_tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[tokio::test]
+    async fn pinned_and_title_sinks_mask_before_truncation() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let manager = SessionManager::new(file.path()).unwrap();
+        manager.get_or_create("test:s1", "test").await.unwrap();
+        manager.set_pinned("test:s1", "password: fixture-pinned").await.unwrap();
+        assert!(!manager.get_pinned("test:s1").await.unwrap().contains("fixture-pinned"));
+        let title = format!("{} sk-{}", "a".repeat(SESSION_TITLE_MAX_CHARS - 5), "Z".repeat(48));
+        manager.set_title("test:s1", &title, 1).await.unwrap();
+        let (title, _) = manager.get_title("test:s1").await.unwrap();
+        assert!(!title.contains("sk-"));
+    }
+
 
     #[tokio::test]
     async fn summary_and_compression_mask_contextual_credentials() {

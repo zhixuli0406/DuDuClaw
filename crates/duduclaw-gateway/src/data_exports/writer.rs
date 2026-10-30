@@ -55,7 +55,10 @@ pub fn physical_rows(row: &LogicalRow) -> Vec<PhysicalRow> {
         .cells
         .iter()
         .map(|cell| match cell {
-            Cell::Text(s) => chunks(s).into_iter().map(Cell::Text).collect(),
+            // Mask the complete cell before splitting, so a credential spanning
+            // two physical rows cannot evade detection at the output boundary.
+            Cell::Text(s) => chunks(&duduclaw_security::credential_detect::mask(s))
+                .into_iter().map(Cell::Text).collect(),
             Cell::Number(n) => vec![Cell::Number(*n)],
         })
         .collect();
@@ -226,4 +229,29 @@ pub fn encode(
         }
     }
     Ok(physical_count)
+}
+
+#[cfg(test)]
+mod credential_sink_tests {
+    use super::*;
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[test]
+    fn export_masks_before_chunking_and_csv_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = LogicalRow {
+            id: "message:1".into(),
+            cells: vec![Cell::Text(format!("{}password: fixture-export", "a ".repeat(15_997)))],
+        };
+        let parts = physical_rows(&row);
+        assert!(parts.iter().all(|part| part.cells.iter().all(|cell| match cell {
+            Cell::Text(value) => !value.contains("fixture-export"),
+            Cell::Number(_) => true,
+        })));
+        let path = dir.path().join("export.csv");
+        encode(&path, ExportFormat::Csv, &["content"], &[row], || Ok(())).unwrap();
+        let stored = std::fs::read_to_string(path).unwrap();
+        assert!(!stored.contains("fixture-export"));
+        assert!(stored.contains("message:1"));
+    }
 }

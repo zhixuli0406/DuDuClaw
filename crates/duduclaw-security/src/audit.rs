@@ -384,9 +384,15 @@ pub fn append_tool_call_with_extras(
     map.insert("timestamp".into(), Utc::now().to_rfc3339().into());
     map.insert("agent_id".into(), agent_id.into());
     map.insert("tool_name".into(), tool_name.into());
-    map.insert("params_summary".into(), mask_sensitive_text(params_summary).into());
+    let declaration = tool_name == "credential_declare";
+    let summary = if declaration { "credential declaration (arguments redacted)" } else { params_summary };
+    map.insert("params_summary".into(), mask_sensitive_text(summary).into());
     map.insert("success".into(), success.into());
+    if declaration { map.insert("arguments_redacted".into(), true.into()); }
     for (key, value) in extras {
+        // Rejected declarations may smuggle arbitrary text into any argument
+        // or error detail. Do not preserve any caller-derived declaration data.
+        if declaration { continue; }
         if RESERVED.contains(key) {
             warn!(
                 "tool_call extra field '{key}' collides with canonical name; ignored"
@@ -1849,5 +1855,27 @@ mod credential_json_key_tests {
     fn tool_json_dynamic_keys_do_not_preserve_detected_credentials() {
         let input = serde_json::json!({"password: private-fixture":"ordinary value"});
         assert!(!super::mask_sensitive_json(&input).to_string().contains("private-fixture"));
+    }
+}
+
+#[cfg(test)]
+mod credential_declaration_sink_tests {
+    use super::*;
+
+    // F5 regression test; not run (owner forbids builds).
+    #[test]
+    fn declarations_never_persist_arguments_results_or_denial_details() {
+        let home = super::tests::fresh_home();
+        let args = serde_json::json!({"service":"smuggled-service", "note":"smuggled-note"});
+        append_tool_call_with_input(&home, "bot", "credential_declare", "smuggled-summary", true, Some(&args), Some("smuggled-result"));
+        append_tool_call_denied(&home, "bot", "credential_declare", "denied_tools", "smuggled-denial", Some(&args));
+        let raw = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
+        assert!(!raw.contains("smuggled"));
+        let rows: Vec<serde_json::Value> = raw.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["arguments_redacted"] == true));
+        assert_eq!(rows[0]["success"], true);
+        assert_eq!(rows[1]["success"], false);
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

@@ -15,9 +15,9 @@ chat_credentials = "audit" # audit（預設）或 mask
 
 ## 身分與去重
 
-密碼與連線字串**不計算指紋**，以來源參照與類型去重；持有者只依實際路由登記，不能因兩個密碼相同推定持有關係。API 金鑰、權杖與 PEM 可透過憑證保護機制計算帶金鑰的指紋；保護機制不可用時不計算，也不退回無金鑰雜湊。帳號提示只保留首字元與網域，例如 `a***@example.com`。
+密碼與連線字串**不計算指紋**，以來源參照與類型去重；持有者只依實際路由登記，不能因兩個密碼相同推定持有關係。語境命中（包括任意 `api key:`、`token:` 值）一律沒有指紋。只有嚴格供應商 key／token 格式或完整 PEM 結構，且金鑰保護達到加固的 **AppBound** 等級時才計算帶金鑰指紋。Windows 與未加固 macOS 的 **UserStore**、File／保護不可用、只有 JWT／Bearer 形狀的值均不計算，也不退回無金鑰雜湊。升級清除先前未符合限制的指紋。帳號提示只保留首字元與網域，例如 `a***@example.com`。
 
-每則訊息最多登錄 5 筆、每位寄件者每小時 50 筆、總計 100,000 筆憑證。超額以彙總的 `credential_detection_throttled` 事件記錄。這些配額只限制登錄，不限制已偵測值的遮罩。
+每則訊息最多登錄 5 筆、每個穩定配額身分每小時 50 筆、總計 100,000 筆憑證。已登入 WebChat 使用已驗證使用者；通道使用通道加對話；匿名 widget 重連共用配額桶，不建立臨時使用者持有者。每項憑證最多 32 個持有者，帳本最多 200,000 個持有者，包含既有憑證的新增持有者，皆在同一交易檢查。配額列一小時後到期。超額以彙總的 `credential_detection_throttled` 事件記錄。這些配額只限制登錄，不限制已偵測值的遮罩。
 
 系統設定的憑證在旁邊的清冊以唯讀資料顯示。Remote MCP、Google 個人連線、MCP 環境變數名稱、瀏覽器設定檔與 MCP 用戶端識別碼都不回傳原值。
 
@@ -27,10 +27,18 @@ chat_credentials = "audit" # audit（預設）或 mask
 
 可依類型、狀態、服務篩選。Admin 可編輯服務或標記誤判；誤判標記只註記登錄資料，不會還原已遮罩文字。「匯出本頁 CSV」只匯出目前篩選頁面，最多 100 筆，並記錄 `credential_exported`、處理試算表公式字首。稽核寫入失敗時拒絕匯出。
 
-Admin RPC：`credentials.audit_list`、`credentials.audit_get`、`credentials.audit_update`、`security.audit_verify`。doctor 也有稽核鏈檢查。事件涵蓋偵測、增加持有者、服務設定、工具出現、狀態變更與匯出，不含值或帳號明文。稽核鏈驗證只驗證現有紀錄，不保證外部副本或已刪除紀錄的完整性。
+Admin RPC：`credentials.audit_list`、`credentials.audit_get`、`credentials.audit_update`、`security.audit_verify`。doctor 也有稽核鏈檢查。事件涵蓋偵測、增加持有者、服務設定、工具出現、狀態變更與匯出，不含值或帳號明文。成功只表示「目前區段內部一致」（current segment internally consistent）。輪替後僅驗證目前區段，不驗證封存區段、外部副本或尾端完整性。合法舊格式列只能位於第一筆鏈結列之前；格式錯誤或鏈結開始後出現未鏈結列都會失敗。
 
-員工工具 `credential_declare` 只接受 `credential_id`、`service`、`note`，不收憑證值。員工經過簽章的 gateway 路由，只能宣告自己持有的憑證，不能覆蓋 Admin 設定的服務。服務名稱與備註都不應填入憑證值。
+員工工具 `credential_declare` 只接受 `credential_id` 與 `service`。服務必須符合 `^[a-z0-9][a-z0-9._-]{0,63}$` 並通過憑證偵測；員工備註一律拒絕。員工經過簽章的 gateway 路由，只能宣告自己持有的憑證。服務與備註分別記錄設定權限：Admin 只改備註也不會被員工覆蓋，Admin 服務設定保持優先。稽核寫入端不保留宣告參數、結果或拒絕細節。
 
 登錄資料由 gateway 管理，位於 `<home>/credentials/ledger.db`（Unix 權限 0600）。檔案守門的 Read 路徑拒絕讀取 `credentials/`；它是產品內守門，不是對擁有不受限主機存取權行程的 OS 隔離。
 
-LINE 持久佇列儲存遮罩文字，另外加密封存與訊息 ID 綁定的傳輸原文，只有交付工作者解開。傳輸金鑰無法使用時，訊息仍以遮罩文字送達，後續無原值可登錄；既有佇列資料不回溯改寫。帳本／金鑰庫作業最多同時四件、等待 250 毫秒，飽和或逾時時即使是 audit 模式也送達遮罩文字。來源使用已存對話訊息 ID、佇列訊息或任務參照。
+LINE 持久佇列在兩種模式都只存遮罩文字，包含 postback、檔名及擴充欄位；不保存原文或其密文。升級時移除既有 ingress 密文欄位，保留交付 token 與事件身分，重試直接使用遮罩文字。落地前先登錄 metadata，工作者通過路由檢查後再登錄員工持有關係；登錄仍是盡力而為，逾時或失敗可能缺少憑證列或持有關係。帳本／金鑰庫最多等待 250 毫秒，逾時即釋放交付許可，另以最多四件背景工作限制不可中斷的 OS 呼叫。飽和或逾時時即使是 audit 模式也交付遮罩文字。來源使用已存對話訊息 ID、LINE ingress 或佇列／任務參照。
+
+## 衍生儲存範圍
+
+兩種模式皆在各寫入端遮罩：pinned instructions、標題、摘要與壓縮；語意／episodic 記憶、三元組、key facts、metadata 與 FTS；自動、員工與共用 Wiki（含索引／FTS）；skill recorder／cache 與擷取稽核；全域與各員工 RL JSONL；prediction metrics、學習的主題／bigrams 與演化內容；工作狀態與歷史；派工佇列 payload／結果／錯誤；任務、活動、留言、計畫、目標與審查紀錄；trajectory anomaly、因果證據及診斷日誌；SFT／偏好訓練與 CSV／XLSX 匯出。已凍結的執行或授權資料若含憑證則拒寫，避免遮罩改變原核准內容。十一個通道的訊息日誌先遮罩再截斷，格式化檔案／stderr 與廣播日誌也在輸出端遮罩。
+
+audit 模式只有 `sessions.db` 的對話訊息及當前 prompt 保留偵測到的明文；LINE 持久交付一律遮罩。這是固定規則的偵測範圍，不保證辨識未知或轉換過的秘密。既有衍生紀錄與外部 runtime transcript 不回溯清洗。LINE ingress 關聯只含 metadata，最多 100,000 列、七天到期。已新增安全回歸測試，但**未執行**；編譯與原生驗收皆未驗證。
+
+Wiki 寫入超過 64 KiB 憑證掃描上限時拒寫，不保存未掃描文字。

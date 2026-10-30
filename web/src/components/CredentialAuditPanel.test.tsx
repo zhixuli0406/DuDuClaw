@@ -98,6 +98,31 @@ describe('CredentialAuditPanel', () => {
     expect(await screen.findByText('Could not complete the credential audit request')).toBeInTheDocument();
   });
 
+  // F6 regression tests; not run (owner forbids builds and npm).
+  it('labels only the current segment as internally consistent', async () => {
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'security.audit_verify'
+      ? { status: 'current_segment_consistent', scope: 'current_segment', intact: true, lines_checked: 2 }
+      : { credentials: [credential], mode: 'audit' }));
+    renderWithProviders(<CredentialAuditPanel />);
+    await userEvent.click(screen.getByRole('button', { name: 'Verify current audit segment' }));
+    expect(await screen.findByText('Current segment internally consistent')).toBeInTheDocument();
+    expect(screen.getByText(/Rotation verifies only the current segment/)).toBeInTheDocument();
+    expect(mockWsClient.call).toHaveBeenCalledWith('security.audit_verify');
+  });
+
+  it('does not display a consistency claim for broken or incomplete verification', async () => {
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'security.audit_verify'
+      ? { status: 'broken', scope: 'current_segment', intact: false, line_number: 2 }
+      : { credentials: [credential], mode: 'audit' }));
+    renderWithProviders(<CredentialAuditPanel />);
+    await userEvent.click(screen.getByRole('button', { name: 'Verify current audit segment' }));
+    expect(await screen.findByText('Current segment contains a broken or malformed audit row')).toBeInTheDocument();
+    expect(screen.queryByText('Current segment internally consistent')).not.toBeInTheDocument();
+    mockWsClient.call.mockResolvedValue({ status: 'current_segment_consistent', scope: 'current_segment', intact: true });
+    await userEvent.click(screen.getByRole('button', { name: 'Verify current audit segment' }));
+    expect(await screen.findByText('No current segment consistency result is available')).toBeInTheDocument();
+  });
+
   it('paginates without exporting unseen rows', async () => {
     mockWsClient.call.mockResolvedValue({
       mode: 'audit', credentials: Array.from({ length: 100 }, (_, i) => ({ ...credential, id: `cred_${i}` })),

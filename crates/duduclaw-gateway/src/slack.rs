@@ -1361,8 +1361,8 @@ async fn handle_interactive_envelope(
             };
             respond_via_response_url(http, response_url, "ephemeral", &msg).await;
         }
-        other => {
-            warn!("Slack: unknown block action: {other}");
+        _ => {
+            warn!("Slack: unknown block action");
         }
     }
 }

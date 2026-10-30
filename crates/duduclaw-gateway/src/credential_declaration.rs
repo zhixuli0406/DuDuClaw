@@ -14,7 +14,6 @@ struct Declaration {
     op: String,
     credential_id: String,
     service: String,
-    note: Option<String>,
 }
 
 struct RouteState {
@@ -54,7 +53,7 @@ fn handle_sync(state: &RouteState, peer: SocketAddr, headers: &HeaderMap, body: 
     let Some(key) = crate::mcp_internal_key::valid_internal_keys(&state.home).into_iter().find(|key|
         duduclaw_core::verify_internal_request_signature(key.as_bytes(), &caller.agent_id, &token, timestamp, &caller.nonce, body, signature)
     ) else { return StatusCode::UNAUTHORIZED.into_response(); };
-    let result = crate::credential_ledger::declare(&state.home, &caller.agent_id, &request.credential_id, &request.service, request.note.as_deref());
+    let result = crate::credential_ledger::declare(&state.home, &caller.agent_id, &request.credential_id, &request.service);
     let value = match result {
         Ok(()) => serde_json::json!({"ok":true}),
         Err(_) => serde_json::json!({"error":"憑證宣告遭拒；請確認持有權限及管理員設定。"}),
@@ -64,11 +63,11 @@ fn handle_sync(state: &RouteState, peer: SocketAddr, headers: &HeaderMap, body: 
     ([("content-type", "application/json"), (RESPONSE_HEADER, signature.as_str())], bytes).into_response()
 }
 
-pub async fn declare(home: &Path, agent: &str, credential_id: &str, service: &str, note: Option<&str>) -> Result<(), String> {
+pub async fn declare(home: &Path, agent: &str, credential_id: &str, service: &str) -> Result<(), String> {
     let key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).map_err(|_| "missing gateway identity")?;
     let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).map_err(|_| "missing employee identity")?;
     if key.is_empty() || token.is_empty() || !duduclaw_core::is_valid_agent_id(agent) { return Err("invalid employee identity".into()); }
-    let body = serde_json::to_vec(&Declaration { op: "credential_declare".into(), credential_id: credential_id.into(), service: service.into(), note: note.map(str::to_owned) }).map_err(|_| "invalid declaration")?;
+    let body = serde_json::to_vec(&Declaration { op: "credential_declare".into(), credential_id: credential_id.into(), service: service.into() }).map_err(|_| "invalid declaration")?;
     if body.len() > 8192 { return Err("declaration too large".into()); }
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0).to_string();
     let nonce = hex::encode(rand::random::<[u8; 16]>());
@@ -97,10 +96,11 @@ pub async fn declare(home: &Path, agent: &str, credential_id: &str, service: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    // F5 regression coverage includes removed employee notes; not run.
     #[test]
     fn declaration_rejects_value_and_identity_fields() {
-        for extra in ["value", "agent_id", "password", "token"] {
-            let mut value = serde_json::json!({"op":"credential_declare","credential_id":"cred_test","service":"CRM","note":null});
+        for extra in ["value", "agent_id", "password", "token", "note"] {
+            let mut value = serde_json::json!({"op":"credential_declare","credential_id":"cred_test","service":"crm"});
             value[extra] = serde_json::json!("must-not-be-accepted");
             assert!(serde_json::from_value::<Declaration>(value).is_err());
         }
@@ -115,7 +115,7 @@ mod tests {
         let state = RouteState { home: home.path().into(), rate: RateLimiter::default(), replay: ReplayGuard::default(), capacity: Arc::new(tokio::sync::Semaphore::new(1)) };
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
-        let body = br#"{"op":"wrong_operation","credential_id":"cred_test","service":"CRM","note":null}"#;
+        let body = br#"{"op":"wrong_operation","credential_id":"cred_test","service":"crm"}"#;
         let signature = duduclaw_core::internal_request_signature(key.as_bytes(), "bot", &token, &timestamp, &nonce, body);
         let mut headers = HeaderMap::new();
         for (name, value) in [(AGENT_ID_HEADER, "bot"), (TIMESTAMP_HEADER, timestamp.as_str()), (NONCE_HEADER, nonce.as_str()), (SIGNATURE_HEADER, signature.as_str())] {

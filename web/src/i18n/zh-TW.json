@@ -9113,5 +9113,10 @@
   "security.credentialAudit.source.config": "系統設定",
   "security.credentialAudit.source.oauth": "授權連線",
   "security.credentialAudit.source.dispatch": "派工提示",
-  "security.credentialAudit.source.tool": "工具呼叫"
+  "security.credentialAudit.source.tool": "工具呼叫",
+  "security.credentialAudit.verify": "驗證目前稽核區段",
+  "security.credentialAudit.verifyScope": "輪替後僅驗證目前區段；不涵蓋封存區段、尾端完整性或紀錄真實性。",
+  "security.credentialAudit.verifyConsistent": "目前區段內部一致",
+  "security.credentialAudit.verifyBroken": "目前區段含有鏈結不一致或格式損壞的稽核紀錄",
+  "security.credentialAudit.verifyUnverified": "目前沒有可用的區段一致性結果"
 }

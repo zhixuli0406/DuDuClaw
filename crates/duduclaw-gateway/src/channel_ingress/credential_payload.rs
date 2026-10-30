@@ -1,90 +1,107 @@
-//! Durable transport keeps detected message values encrypted, never in its text projection.
+//! Durable transport stores only masked message text in both credential modes.
+//! Retrying an event must never require decrypting a conversation credential.
 use serde_json::Value;
-use std::path::Path;
 
-const CIPHER: &str = "_credential_text_enc";
-
-pub(super) fn protect(payload: &str, home: Option<&Path>) -> String {
+pub(super) fn protect(payload: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
-        return duduclaw_security::credential_detect::mask(payload);
+        return duduclaw_security::credential_detect::UNAVAILABLE_MASK.into();
     };
     if let Some(message) = value.pointer_mut("/event/message").and_then(Value::as_object_mut) {
-        // Never trust a provider-supplied ciphertext marker.
-        message.remove(CIPHER);
-        if let Some(text) = message.get("text").and_then(Value::as_str).map(str::to_owned) {
-            let masked = duduclaw_security::credential_detect::mask(&text);
-            if masked != text {
-                let bound = serde_json::json!({"purpose":"credential-ingress/v1", "id":message.get("id"), "text":text}).to_string();
-                if let Some(cipher) = home.and_then(|home| crate::config_crypto::encrypt_value(&bound, home)) {
-                    message.insert(CIPHER.into(), Value::String(cipher));
-                }
-                message.insert("text".into(), Value::String(masked));
-            }
-        }
+        // Drop both legacy and provider-supplied markers without decrypting.
+        message.remove("_credential_text_enc");
+        mask_native_mentions(message);
+    }
+    // Routing token is provider-owned. All user-controlled fields (including
+    // postbacks, filenames and unknown extension fields) use the same sink.
+    let reply_token = value.pointer_mut("/event/replyToken").map(Value::take);
+    duduclaw_security::credential_detect::mask_json(&mut value);
+    if let (Some(token), Some(slot)) = (reply_token, value.pointer_mut("/event/replyToken")) {
+        *slot = token;
     }
     value.to_string()
 }
 
-/// Call only on the claimed worker's private copy. Admin views remain masked.
-pub(crate) fn restore_event(event: &mut Value, home: &Path) {
-    let Some(message) = event.get_mut("message").and_then(Value::as_object_mut) else { return; };
-    let Some(cipher) = message.remove(CIPHER) else { return; };
-    let original = cipher.as_str()
-        .and_then(|cipher| crate::config_crypto::decrypt_value(cipher, home))
-        .and_then(|plain| serde_json::from_str::<Value>(&plain).ok())
-        .filter(|plain| plain["purpose"] == "credential-ingress/v1" && plain.get("id") == message.get("id"))
-        .and_then(|plain| plain["text"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| duduclaw_security::credential_detect::UNAVAILABLE_MASK.into());
-    message.insert("text".into(), Value::String(original));
-}
-
-/// Merging uses persisted text for route decisions. Keep encrypted events as
-/// individual turns so mentions/commands and source ids cannot change on decrypt.
-pub(crate) fn is_encrypted(event: &Value) -> bool {
-    event.pointer("/message/_credential_text_enc").is_some()
+// Native mention offsets refer to the original UTF-16 text. Resolve them
+// before credential replacement changes its length; human mentions must not
+// become employee-routing instructions. Bot presence is a boolean gate only.
+fn mask_native_mentions(message: &mut serde_json::Map<String, Value>) {
+    let Some(text) = message.get("text").and_then(Value::as_str) else { return };
+    if duduclaw_security::credential_detect::mask(text) == text { return; }
+    let Some(mentionees) = message.get("mention").and_then(|m| m.get("mentionees")).and_then(Value::as_array) else { return };
+    let people: Vec<_> = mentionees.iter().filter(|m| m["isSelf"].as_bool() != Some(true))
+        .filter_map(|m| {
+            let start = usize::try_from(m["index"].as_u64()?).ok()?;
+            let length = usize::try_from(m["length"].as_u64()?).ok()?;
+            crate::trigger_route::spans::utf16_span_to_bytes(text, start, length)
+        }).collect();
+    let bot_mentioned = mentionees.iter().any(|m| m["isSelf"].as_bool() == Some(true));
+    let masked = match duduclaw_security::credential_detect::detect(text) {
+        Ok(findings) if text.len() <= duduclaw_security::credential_detect::MAX_SCAN_BYTES => {
+            let mut rendered = String::new();
+            for (index, ch) in text.char_indices() {
+                if let Some(finding) = findings.iter().find(|f| f.span.contains(&index)) {
+                    if index == finding.span.start { rendered.push_str("[已遮罩的密碼]"); }
+                } else if people.iter().any(|(start, end)| index >= *start && index < *end) {
+                    rendered.push(' ');
+                } else {
+                    rendered.push(ch);
+                }
+            }
+            duduclaw_security::credential_detect::mask(&rendered)
+        }
+        _ => duduclaw_security::credential_detect::UNAVAILABLE_MASK.into(),
+    };
+    message.insert("text".into(), Value::String(masked));
+    let mentions = if bot_mentioned { serde_json::json!([{"index":0,"length":0,"isSelf":true}]) } else { serde_json::json!([]) };
+    message.insert("mention".into(), serde_json::json!({"mentionees":mentions}));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Security regressions written for F3; not run (owner forbids builds).
     #[test]
     fn ingress_masks_text_without_touching_delivery_token() {
         let payload = serde_json::json!({"event":{"replyToken":"routing-token", "message":{"id":"m1", "text":"密碼：fixture"}}});
-        let stored = protect(&payload.to_string(), None);
+        let stored = protect(&payload.to_string());
         assert!(!stored.contains("fixture"));
+        assert!(!stored.contains("_credential_text_enc"));
         let stored: Value = serde_json::from_str(&stored).unwrap();
         assert_eq!(stored["event"]["replyToken"], "routing-token");
+        assert_eq!(stored["event"]["message"]["id"], "m1");
     }
 
     #[test]
-    fn invalid_ciphertext_cannot_restore_plaintext() {
-        let mut event = serde_json::json!({"message":{"id":"m1", "text":"masked", "_credential_text_enc":"invalid"}});
-        restore_event(&mut event, Path::new("/nonexistent-credential-test"));
-        assert_eq!(event["message"]["text"], duduclaw_security::credential_detect::UNAVAILABLE_MASK);
+    fn legacy_and_provider_ciphertext_is_discarded_without_a_key() {
+        let payload = serde_json::json!({"event":{"message":{"id":"m1", "text":"hello", "_credential_text_enc":"legacy-or-forged"}}});
+        let stored = protect(&payload.to_string());
+        assert!(!stored.contains("legacy-or-forged"));
+        assert!(!stored.contains("_credential_text_enc"));
+        assert_eq!(protect(&stored), stored);
     }
 
     #[test]
-    fn provider_cannot_supply_ciphertext_marker() {
-        let payload = serde_json::json!({"event":{"message":{"id":"m1", "text":"hello", "_credential_text_enc":"fake"}}});
-        let stored: Value = serde_json::from_str(&protect(&payload.to_string(), None)).unwrap();
-        assert!(!is_encrypted(&stored["event"]));
-    }
-    #[test]
-    fn encrypted_ingress_round_trip_is_bound_to_message_id() {
-        let home = tempfile::tempdir().unwrap();
-        let payload = serde_json::json!({"event":{"message":{"id":"m1", "text":"password: fixture-roundtrip"}}});
-        let stored = protect(&payload.to_string(), Some(home.path()));
-        assert!(!stored.contains("fixture-roundtrip"));
-        let stored: Value = serde_json::from_str(&stored).unwrap();
-        assert!(is_encrypted(&stored["event"]));
-        let mut restored = stored["event"].clone();
-        restore_event(&mut restored, home.path());
-        assert_eq!(restored["message"]["text"], "password: fixture-roundtrip");
-        let mut swapped = stored["event"].clone();
-        swapped["message"]["id"] = Value::String("m2".into());
-        restore_event(&mut swapped, home.path());
-        assert_eq!(swapped["message"]["text"], duduclaw_security::credential_detect::UNAVAILABLE_MASK);
+    fn ingress_masks_postbacks_filenames_and_unknown_fields() {
+        let payload = serde_json::json!({"event":{"replyToken":"provider-token", "postback":{"data":"password: fixture-postback"},
+            "message":{"fileName":"密碼：fixture-name", "text":"safe", "extension":{"password":"fixture-extension"}},
+            "unknown":"token: fixture-unknown"}});
+        let stored = protect(&payload.to_string());
+        assert!(!stored.contains("fixture-"));
+        assert!(stored.contains("provider-token"));
     }
 
+    #[test]
+    fn credential_before_native_human_mention_cannot_route_an_employee() {
+        let payload = serde_json::json!({"event":{"message":{"type":"text", "text":"password: p @sales", "mention":{"mentionees":[{"index":12,"length":6,"isSelf":false}]}}}});
+        let stored: Value = serde_json::from_str(&protect(&payload.to_string())).unwrap();
+        assert!(!stored["event"]["message"]["text"].as_str().unwrap().contains("@sales"));
+        assert_eq!(stored["event"]["message"]["mention"]["mentionees"], serde_json::json!([]));
+        assert!(!stored.to_string().contains("password: p"));
+    }
+
+    #[test]
+    fn malformed_payload_fails_closed() {
+        assert_eq!(protect("broken password: fixture"), duduclaw_security::credential_detect::UNAVAILABLE_MASK);
+    }
 }

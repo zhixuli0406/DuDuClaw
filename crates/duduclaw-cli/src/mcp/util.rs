@@ -277,6 +277,7 @@ pub(crate) fn extract_tool_result_text(result: &Value) -> Option<String> {
 /// name, which is fine).
 pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
     match tool_name {
+        "credential_declare" => serde_json::json!({"redacted":true}),
         "computer_type" => {
             let chars = args.get("text").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
             serde_json::json!({ "chars": chars })
@@ -321,6 +322,7 @@ fn workspace_args_summary(args: &Value) -> (String, String, usize) {
 
 pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
     match tool_name {
+        "credential_declare" => "credential declaration (arguments redacted)".into(),
         "computer_workspace_write" | "computer_workspace_read" => {
             let (ws, path_hash, chars) = workspace_args_summary(args);
             format!("workspace={ws} path_sha256={path_hash} chars={chars}")
@@ -437,5 +439,18 @@ mod computer_navigate_audit_tests {
         let bad = serde_json::json!({"url": "not a url"});
         assert_eq!(audit_safe_arguments("computer_navigate", &bad), serde_json::json!({"host": null, "path_len": 0}));
         assert_eq!(build_params_summary("computer_navigate", &bad), "host=? path_len=0");
+    }
+}
+
+#[cfg(test)]
+mod credential_declaration_audit_tests {
+    use super::*;
+
+    // F5 regression test; not run (owner forbids builds).
+    #[test]
+    fn declaration_audit_redacts_even_rejected_arguments() {
+        let args = serde_json::json!({"credential_id":"smuggled-id", "service":"smuggled-service", "note":"smuggled-note", "unexpected":"smuggled-extra"});
+        assert_eq!(audit_safe_arguments("credential_declare", &args), serde_json::json!({"redacted":true}));
+        assert_eq!(build_params_summary("credential_declare", &args), "credential declaration (arguments redacted)");
     }
 }

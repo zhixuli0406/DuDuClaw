@@ -9420,7 +9420,7 @@ fn gateway_instance_check(home: &std::path::Path) -> (String, CheckStatus, Strin
 fn credential_audit_chain_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let (status, detail) = match duduclaw_gateway::security_posture::verify_security_audit(home) {
         Ok(value) => match value["status"].as_str() {
-            Some("intact") => (CheckStatus::Pass, format!("已驗證 {} 筆鏈結；無法據此證明尾端未遭刪除。", value["lines_checked"])),
+            Some("current_segment_consistent") => (CheckStatus::Pass, format!("目前區段內部一致（{} 筆鏈結）；輪替後僅驗證目前區段，不涵蓋封存區段，也無法證明尾端未遭刪除。", value["lines_checked"])),
             Some("broken") => (CheckStatus::Fail, format!("第 {} 行的稽核鏈結不一致。", value["line_number"])),
             _ => (CheckStatus::Warn, "尚無可驗證的稽核鏈結。".into()),
         },

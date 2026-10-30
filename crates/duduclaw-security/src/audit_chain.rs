@@ -56,7 +56,9 @@
 //! ## Backward compatibility with pre-chaining rows
 //!
 //! Rows written before this module shipped have no `_prev_hash` field at
-//! all. [`verify_chain`] treats such a row as unchecked (nothing to verify
+//! all. Only a prefix of valid legacy objects is allowed. A legacy or malformed
+//! row after chaining starts fails verification. [`verify_chain`] treats a
+//! legacy prefix row as unchecked (nothing to verify
 //! about IT), but its raw on-disk bytes still participate as the "previous
 //! line" that the NEXT chained row's `_prev_hash` is verified against — so a
 //! file that mixes legacy rows followed by newly-chained rows verifies
@@ -265,14 +267,12 @@ impl ChainVerifyResult {
 
 /// Verify the hash-chain integrity of a JSONL audit file.
 ///
-/// Missing file ⇒ trivially `Intact { lines_checked: 0 }`. A line without a
-/// `_prev_hash` field (legacy row, or a line that isn't even valid JSON) is
-/// not itself checked, but its raw bytes still participate as the "previous
-/// line" a later chained row's `_prev_hash` is verified against — see module
-/// docs. This is what makes a corruption that breaks a line's own JSON
-/// syntax still detectable: the corruption changes that line's raw bytes,
-/// so the NEXT chained line's `_prev_hash` claim (computed against the
-/// pre-corruption bytes) no longer matches.
+/// Missing file ⇒ trivially `Intact { lines_checked: 0 }`. Valid JSON objects
+/// without `_prev_hash` are permitted only as a legacy prefix. Once chaining
+/// starts, every row must carry a matching string hash. Malformed
+/// JSON, non-object rows and malformed hash fields always fail closed.
+/// Rotation starts a new segment; this verifies only the current file, not
+/// archived segments, tail completeness, or authenticity against an anchor.
 pub fn verify_chain(path: &Path) -> io::Result<ChainVerifyResult> {
     if !path.exists() {
         return Ok(ChainVerifyResult::Intact { lines_checked: 0 });
@@ -285,20 +285,27 @@ pub fn verify_chain(path: &Path) -> io::Result<ChainVerifyResult> {
     for (line_index, line) in content.lines().enumerate() {
         let line_number = line_index + 1;
         if line.trim().is_empty() {
+            if checked > 0 { return Ok(ChainVerifyResult::Broken { line_number }); }
             continue;
         }
 
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(claimed) = v.get("_prev_hash").and_then(|x| x.as_str()) {
+        let value = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(serde_json::Value::Object(value)) => value,
+            _ => return Ok(ChainVerifyResult::Broken { line_number }),
+        };
+        match value.get("_prev_hash") {
+            Some(serde_json::Value::String(claimed)) => {
                 let expected = match &prev_raw {
                     None => genesis_hash(),
                     Some(p) => sha256_hex(p.as_bytes()),
                 };
-                if claimed != expected {
+                if claimed != &expected {
                     return Ok(ChainVerifyResult::Broken { line_number });
                 }
                 checked += 1;
             }
+            None if checked == 0 => (),
+            _ => return Ok(ChainVerifyResult::Broken { line_number }),
         }
 
         prev_raw = Some(line.to_string());
@@ -486,6 +493,38 @@ mod tests {
         let lines: Vec<&str> = body.lines().collect();
         let first_chained: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(first_chained["_prev_hash"], sha256_hex(lines[1].as_bytes()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // F6 regression tests; not run (owner forbids builds).
+    #[test]
+    fn chained_tail_rejects_legacy_malformed_and_non_string_hash_rows() {
+        let home = fresh_home();
+        let path = home.join("test.jsonl");
+        append_chained_line(&path, obj(&[("event", "chained")]), None).unwrap();
+        let prefix = std::fs::read_to_string(&path).unwrap();
+        for tail in ["", " ", r#"{"event":"unchained"}"#, "{broken", "null", "[]", r#"{"_prev_hash":null}"#, r#"{"_prev_hash":1}"#, r#"{"_prev_hash":"short"}"#] {
+            std::fs::write(&path, format!("{prefix}{tail}\n")).unwrap();
+            assert_eq!(verify_chain(&path).unwrap(), ChainVerifyResult::Broken { line_number: 2 });
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_prefix_must_be_valid_objects_and_cannot_recur() {
+        let home = fresh_home();
+        let path = home.join("test.jsonl");
+        for legacy in ["{broken", "null", "[]", r#"{"_prev_hash":false}"#] {
+            std::fs::write(&path, format!("{legacy}\n")).unwrap();
+            assert_eq!(verify_chain(&path).unwrap(), ChainVerifyResult::Broken { line_number: 1 });
+        }
+        std::fs::write(&path, "{\"event\":\"legacy\"}\n").unwrap();
+        append_chained_line(&path, obj(&[("event", "chained")]), None).unwrap();
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("{\"event\":\"late legacy\"}\n");
+        std::fs::write(&path, content).unwrap();
+        append_chained_line(&path, obj(&[("event", "later chained")]), None).unwrap();
+        assert_eq!(verify_chain(&path).unwrap(), ChainVerifyResult::Broken { line_number: 3 });
         let _ = std::fs::remove_dir_all(&home);
     }
 

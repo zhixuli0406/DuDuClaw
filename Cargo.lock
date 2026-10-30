@@ -2130,6 +2130,7 @@ dependencies = [
  "chrono",
  "csv",
  "duduclaw-core",
+ "duduclaw-security",
  "duduclaw-memory",
  "fs2",
  "ignore",

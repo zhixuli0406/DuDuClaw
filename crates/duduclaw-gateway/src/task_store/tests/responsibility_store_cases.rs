@@ -167,3 +167,75 @@ async fn one_open_occurrence_is_enforced_by_the_index() {
     ins("k1", "t1").unwrap();
     assert!(ins("k2", "t2").is_err(), "second open occurrence refused");
 }
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn responsibility_contracts_and_wakeup_filters_refuse_credentials() {
+    let (store, _dir) = temp_store();
+    let mut row = resp_row("credential-responsibility");
+    row.objective = "password: fixture-objective".into();
+    assert!(store.insert_responsibility(&row, &[], None).await.is_err());
+    assert!(store.get_responsibility(&row.responsibility_id).await.unwrap().is_none());
+    row.objective = "Safe objective".into();
+    store.insert_responsibility(&row, &[], None).await.unwrap();
+    let mut wakeup = time_wakeup(&row.responsibility_id, "2026-10-05T01:00:00Z");
+    wakeup.event_filter_json = Some(r#"{"password":"fixture-filter"}"#.into());
+    assert!(store.arm_wakeup(&wakeup, None).await.is_err());
+    assert!(store.list_wakeups(&row.responsibility_id).await.unwrap().is_empty());
+    let contract = crate::task_store::ResponsibilityContract {
+        objective: row.objective.clone(), acceptance_template: row.acceptance_template.clone(),
+        scope_json: r#"{"password":"fixture-contract"}"#.into(),
+        source_refs_json: row.source_refs_json.clone(),
+        notification_policy_json: row.notification_policy_json.clone(), schedule_json: None,
+        occurrence_hours: row.occurrence_hours, occurrence_cost_cap_cents: row.occurrence_cost_cap_cents,
+        budget_period: row.budget_period.clone(), budget_timezone: row.budget_timezone.clone(),
+        period_cost_limit_cents: row.period_cost_limit_cents,
+        period_occurrence_limit: row.period_occurrence_limit,
+        min_wake_interval_secs: row.min_wake_interval_secs,
+        max_consecutive_failures: row.max_consecutive_failures, stop_at: row.stop_at.clone(),
+        contract_hash: "unchanged-authority".into(),
+    };
+    assert!(store.update_responsibility_contract(&row.responsibility_id, 1, &contract, None,
+        chrono::Utc::now()).await.is_err());
+    let stored = store.get_responsibility(&row.responsibility_id).await.unwrap().unwrap();
+    assert_eq!(stored.contract_hash, row.contract_hash);
+    assert_eq!(stored.contract_revision, 1);
+}
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn wake_facts_mask_nested_data_and_reasons() {
+    let (store, _dir) = temp_store();
+    let row = resp_row("credential-facts");
+    let wakeup = time_wakeup(&row.responsibility_id, "2026-10-05T01:00:00Z");
+    store.insert_responsibility(&row, &[wakeup.clone()], None).await.unwrap();
+    let fire = crate::task_store::NewFire {
+        wakeup_id: wakeup.wakeup_id, fire_key: "fixture-fact".into(),
+        reason: "password: fixture-reason".into(),
+        data_json: Some(r#"{"nested":{"password":"fixture-data"}}"#.into()),
+        guard_flags_json: Some(r#"{"note":"token: fixture-flags"}"#.into()),
+        dropped: Some("password: fixture-drop".into()),
+    };
+    assert!(store.record_fire(&fire, None, chrono::Utc::now()).await.unwrap());
+    let facts = store.list_fires(&row.responsibility_id, 10).await.unwrap();
+    let stored = &facts[0];
+    assert!(!stored.reason.contains("fixture-reason"));
+    assert!(!stored.data_json.as_deref().unwrap().contains("fixture-data"));
+    assert!(!stored.guard_flags_json.as_deref().unwrap().contains("fixture-flags"));
+    assert!(!stored.drop_reason.as_deref().unwrap().contains("fixture-drop"));
+}
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn steering_refuses_credentials_without_rewriting_body_hash() {
+    let (store, _dir) = temp_store();
+    let task = goal_review_task("credential-steering");
+    store.insert_task(&task).await.unwrap();
+    let steering = crate::task_store::NewSteering {
+        task_id: &task.id, body: "password: fixture-steering", body_hash: "bound-hash",
+        guard_flags_json: "[]", submitted_by: "operator", client_request_id: "request-1",
+    };
+    assert!(store.submit_steering(&steering, chrono::Utc::now()).await.is_err());
+    assert!(store.list_steering(&task.id).await.unwrap().is_empty());
+    assert_eq!(steering.body_hash, "bound-hash");
+}

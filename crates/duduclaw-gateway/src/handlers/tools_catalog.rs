@@ -163,7 +163,7 @@ impl MethodHandler {
                     { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
                     { "name": "security.status", "description": "Security system status" },
                     { "name": "security.credential_hygiene", "description": "Scan config.toml for plaintext credentials (paths only, never values)" },
-                    { "name": "security.audit_verify", "description": "Verify current audit-chain links (Admin); missing history is reported explicitly" },
+                    { "name": "security.audit_verify", "description": "Check current audit segment internal consistency (Admin); rotation excludes archived segments" },
                     { "name": "credentials.audit_list", "description": "List conversation credential audit metadata (Admin), never values" },
                     { "name": "credentials.audit_get", "description": "Read one conversation credential audit record (Admin)" },
                     { "name": "credentials.audit_update", "description": "Update a credential service, note or status (Admin)" },

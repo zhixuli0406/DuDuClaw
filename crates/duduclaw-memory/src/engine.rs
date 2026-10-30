@@ -1578,7 +1578,7 @@ impl SqliteMemoryEngine {
         let n = conn
             .execute(
                 "UPDATE memories SET content = ?1 WHERE id = ?2 AND agent_id = ?3",
-                params![content, memory_id, agent_id],
+                params![duduclaw_security::credential_detect::mask(content), memory_id, agent_id],
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         Ok(n > 0)
@@ -1594,6 +1594,8 @@ impl SqliteMemoryEngine {
         memory_id: &str,
         metadata: &serde_json::Value,
     ) -> Result<bool> {
+        let mut metadata = metadata.clone();
+        duduclaw_security::credential_detect::mask_json(&mut metadata);
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
@@ -2081,6 +2083,8 @@ impl SqliteMemoryEngine {
         provenance: &crate::lineage::Provenance,
     ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
         use crate::supersession_guard::TemporalWriteOutcome;
+        let entry = mask_memory_entry(entry);
+        let meta = mask_temporal_meta(meta);
         // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
         // unlimited (quota 0). Runs before any write so a rejection loses nothing.
         self.enforce_quota(conn)?;
@@ -2856,6 +2860,8 @@ impl SqliteMemoryEngine {
         provenance: &crate::lineage::Provenance,
         admit: &mut (dyn FnMut() -> bool + Send),
     ) -> Result<Option<crate::supersession_guard::HeldClaim>> {
+        let entry = mask_memory_entry(entry);
+        let meta = mask_temporal_meta(meta);
         let mut conflicts_with: Option<String> = None;
         if let (Some(subject), Some(predicate)) = (meta.subject.as_deref(), meta.predicate.as_deref()) {
             if let Some(id) = Self::find_pending_held_claim_locked(
@@ -4366,6 +4372,7 @@ impl SqliteMemoryEngine {
 #[async_trait]
 impl MemoryEngine for SqliteMemoryEngine {
     async fn store(&self, agent_id: &str, entry: MemoryEntry) -> Result<()> {
+        let entry = mask_memory_entry(entry);
         let conn = self.conn.lock().await;
         // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
         // unlimited (quota 0). Runs before any write so a rejection loses nothing.
@@ -4751,6 +4758,25 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
 }
 
 
+// Credentials never enter memory, its FTS index, or embeddings, even when
+// a caller bypasses conversation distillation. Mask before deriving features.
+fn mask_memory_entry(mut entry: MemoryEntry) -> MemoryEntry {
+    let masked = duduclaw_security::credential_detect::mask(&entry.content);
+    if masked != entry.content { entry.embedding = None; }
+    entry.content = masked;
+    entry.tags = entry.tags.into_iter().map(|s| duduclaw_security::credential_detect::mask(&s)).collect();
+    entry.source_event = duduclaw_security::credential_detect::mask(&entry.source_event);
+    entry
+}
+
+fn mask_temporal_meta(mut meta: TemporalMeta) -> TemporalMeta {
+    for value in [&mut meta.subject, &mut meta.predicate, &mut meta.object, &mut meta.source_event] {
+        if let Some(text) = value { *text = duduclaw_security::credential_detect::mask(text); }
+    }
+    if let Some(value) = &mut meta.metadata { duduclaw_security::credential_detect::mask_json(value); }
+    meta
+}
+
 // ── Key-Fact Accumulator (P2) ──────────────────────────────────
 
 impl SqliteMemoryEngine {
@@ -4791,6 +4817,7 @@ impl SqliteMemoryEngine {
         source_session: &str,
         provenance: crate::lineage::Provenance,
     ) -> Result<crate::lineage::FactWriteOutcome> {
+        let fact = duduclaw_security::credential_detect::mask(fact);
         self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
         let id = uuid::Uuid::new_v4().to_string();
@@ -4981,6 +5008,25 @@ pub mod forget_source;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[tokio::test]
+    async fn memory_sinks_mask_content_triples_metadata_and_facts() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let entry = make_entry("a", "password: fixture-content", vec!["token: fixture-tag".into()]);
+        let meta = TemporalMeta { subject: Some("account".into()), predicate: Some("setting".into()),
+            object: Some("密碼：fixture-object".into()), metadata: Some(serde_json::json!({"detail":"password: fixture-meta"})), ..Default::default() };
+        engine.store_temporal("a", entry, meta, crate::lineage::Provenance::test_only()).await.unwrap();
+        engine.store_fact("a", "password: fixture-fact", "test", "chat", "session", crate::lineage::Provenance::test_only()).await.unwrap();
+        let conn = engine.conn.lock().await;
+        let stored: String = conn.query_row("SELECT content || tags || object || metadata FROM memories LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert!(!stored.contains("fixture-"));
+        let fact: String = conn.query_row("SELECT fact FROM key_facts LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert!(!fact.contains("fixture-fact"));
+        let fts: String = conn.query_row("SELECT content FROM memories_fts LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert!(!fts.contains("fixture-content"));
+    }
+
     use chrono::{Duration, Utc};
     use uuid::Uuid;
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type ChatCredential, type CredentialAuditReport } from '@/lib/api';
+import { api, type ChatCredential, type CredentialAuditReport, type SecurityAuditVerification } from '@/lib/api';
 import {
   Button, Card, CardContent, CardDescription, CardHeader, CardTitle,
   ErrorState, Input, Skeleton, Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
@@ -24,6 +24,7 @@ export function CredentialAuditPanel() {
   const [error, setError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [verification, setVerification] = useState<SecurityAuditVerification | null>(null);
   const [kind, setKind] = useState('');
   const [status, setStatus] = useState('');
   const [service, setService] = useState('');
@@ -63,6 +64,15 @@ export function CredentialAuditPanel() {
       setEditing(null);
       await load();
     } catch (e) { setError(e); }
+    finally { setBusy(false); }
+  }
+
+  async function verifyAudit() {
+    setBusy(true);
+    setError(null);
+    setVerification(null);
+    try { setVerification(await api.security.auditVerify()); }
+    catch (e) { setError(e); }
     finally { setBusy(false); }
   }
 
@@ -130,9 +140,16 @@ export function CredentialAuditPanel() {
               onChange={(e) => { setService(e.target.value); setOffset(0); }} />
           </label>
           <Button variant="outline" disabled={loading || busy} onClick={() => void load()}>{t('refresh')}</Button>
+          <Button variant="outline" disabled={busy} onClick={() => void verifyAudit()}>{t('verify')}</Button>
           <Button variant="outline" disabled={loading || busy || !report?.credentials.length}
             onClick={() => void exportPage()}>{t('export')}</Button>
         </div>
+        <p className="text-xs text-muted-foreground">{t('verifyScope')}</p>
+        {verification && <p role="status" className="text-sm">
+          {t(verification.scope === 'current_segment' && verification.status === 'current_segment_consistent'
+            && verification.intact && (verification.lines_checked ?? 0) > 0 ? 'verifyConsistent'
+            : verification.status === 'broken' ? 'verifyBroken' : 'verifyUnverified')}
+        </p>}
         {error != null && <ErrorState variant="inline" error={error} title={t('error')} onRetry={() => void load()} />}
         {loading ? <Skeleton className="h-32 w-full" /> : report && (
           <>

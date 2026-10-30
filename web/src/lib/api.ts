@@ -759,6 +759,7 @@ export interface ChatCredential {
   last_seen_at: string;
   last_used_at: string | null;
   note: string | null;
+  note_source?: string;
   holders: Array<{ holder_kind: string; holder_id: string; revoked_at?: string | null }>;
 }
 export interface CredentialAuditQuery {
@@ -769,6 +770,14 @@ export interface CredentialAuditQuery {
   offset?: number;
   export?: boolean;
 }
+export interface SecurityAuditVerification {
+  status: 'missing' | 'unverified' | 'current_segment_consistent' | 'broken';
+  scope: 'current_segment';
+  intact: boolean;
+  lines_checked?: number;
+  line_number?: number;
+}
+
 export interface CredentialAuditReport {
   credentials: ChatCredential[];
   mode: 'audit' | 'mask';
@@ -7427,6 +7436,8 @@ export const api = {
       client.call('credentials.audit_update', params) as Promise<ChatCredential>,
   },
   security: {
+    auditVerify: () =>
+      client.call('security.audit_verify') as Promise<SecurityAuditVerification>,
     auditLog: (limit = 50) =>
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
     status: () =>

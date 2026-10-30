@@ -824,7 +824,7 @@ async fn send_wecom_msg(
                     40014 | 42001 if attempt == 0 => continue,
                     code => {
                         let errmsg = v.get("errmsg").and_then(|m| m.as_str()).unwrap_or("");
-                        warn!("WeCom send errcode {code}: {}", truncate_bytes(errmsg, 200));
+                        warn!("WeCom send errcode {code}: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(errmsg), 200));
                         return false;
                     }
                 }

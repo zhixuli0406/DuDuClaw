@@ -164,14 +164,16 @@ fn extra_args_only_when_text_is_read_live() {
 }
 
 #[test]
-fn debug_log_elides_thinking_deltas_only() {
+fn debug_log_elides_partial_messages_and_thinking() {
     for line in PARTIAL_FIXTURE {
         let parsed: Value = serde_json::from_str(line).unwrap();
         let out = debug_log_line(line, Some(&parsed));
         if line.contains("thinking_delta") {
             assert_eq!(out, r#"{"type":"stream_event","elided":"thinking_delta"}"#);
+        } else if is_stream_event(&parsed) {
+            assert_eq!(out, r#"{"type":"stream_event","elided":"partial_message"}"#);
         } else {
-            assert_eq!(out, *line);
+            assert_eq!(out, diagnostic_line(line, Some(&parsed)).unwrap());
         }
     }
     assert_eq!(debug_log_line("not json", None), "not json");
@@ -292,4 +294,19 @@ fn diagnostics_never_keep_thinking_text() {
     let parsed: Value = serde_json::from_str(result).unwrap();
     assert_eq!(diagnostic_line(result, Some(&parsed)).as_deref(), Some(*result));
     assert_eq!(diagnostic_line("not json", None).as_deref(), Some("not json"));
+}
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[test]
+fn debug_and_diagnostic_sinks_mask_credentials_and_omit_fragments() {
+    let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"password: fixture-reply"},{"type":"tool_use","input":{"password":"fixture-argument"}}]}}"#;
+    let value: Value = serde_json::from_str(line).unwrap();
+    for stored in [debug_log_line(line, Some(&value)).into_owned(), diagnostic_line(line, Some(&value)).unwrap()] {
+        assert!(!stored.contains("fixture-"));
+        assert!(serde_json::from_str::<Value>(&stored).is_ok());
+    }
+    let delta = r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"fixture-fragment"}}}"#;
+    let value: Value = serde_json::from_str(delta).unwrap();
+    assert!(!debug_log_line(delta, Some(&value)).contains("fixture-fragment"));
+    assert_eq!(diagnostic_line(delta, Some(&value)), None);
 }

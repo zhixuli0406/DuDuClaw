@@ -16,10 +16,10 @@ fn row_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "status":row.get::<_,String>(8)?, "first_seen_at":row.get::<_,String>(9)?,
         "last_seen_at":row.get::<_,String>(10)?, "last_used_at":row.get::<_,Option<String>>(11)?,
         "expires_at":row.get::<_,Option<String>>(12)?, "rotation_due_at":row.get::<_,Option<String>>(13)?,
-        "note":row.get::<_,Option<String>>(14)?,
+        "note":row.get::<_,Option<String>>(14)?, "note_source":row.get::<_,String>(15)?,
     }))
 }
-const COLUMNS: &str = "id,kind,account_hint,service,service_source,source_kind,source_ref,provided_by,status,first_seen_at,last_seen_at,last_used_at,expires_at,rotation_due_at,note";
+const COLUMNS: &str = "id,kind,account_hint,service,service_source,source_kind,source_ref,provided_by,status,first_seen_at,last_seen_at,last_used_at,expires_at,rotation_due_at,note,note_source";
 
 fn add_holders(db: &Connection, row: &mut Value) -> Result<(), String> {
     let mut stmt = db.prepare("SELECT holder_kind,holder_id,granted_at,revoked_at FROM credential_holders WHERE credential_id=?1 ORDER BY holder_kind,holder_id").map_err(|_| UNAVAILABLE)?;
@@ -70,10 +70,20 @@ pub fn update(home: &Path, id: &str, params: &Value) -> Result<(), String> {
     mutate(home, id, params, None)
 }
 
-pub fn declare(home: &Path, agent: &str, credential_id: &str, service: &str, note: Option<&str>) -> Result<(), String> {
-    let mut params = json!({"service":service});
-    if let Some(note) = note { params["note"] = json!(note); }
-    mutate(home, credential_id, &params, Some(agent))
+pub fn declare(home: &Path, agent: &str, credential_id: &str, service: &str) -> Result<(), String> {
+    mutate(home, credential_id, &json!({"service":service}), Some(agent))
+}
+
+fn employee_service(value: &str) -> Result<String, String> {
+    let mut chars = value.chars();
+    let starts_with_identifier = chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if !starts_with_identifier || value.len() > 64
+        || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        || !matches!(credential_detect::detect(value), Ok(findings) if findings.is_empty())
+    {
+        return Err("service must be a non-secret identifier of 1 to 64 characters".into());
+    }
+    Ok(value.to_owned())
 }
 
 fn mutate(home: &Path, id: &str, input: &Value, employee: Option<&str>) -> Result<(), String> {
@@ -88,7 +98,14 @@ fn mutate(home: &Path, id: &str, input: &Value, employee: Option<&str>) -> Resul
             _ => Err("invalid credential metadata".into()),
         }
     };
-    let service = string_field("service", 160)?;
+    if employee.is_some() && object.keys().any(|key| key != "service") {
+        return Err("employees may declare only a service identifier".into());
+    }
+    let service = if employee.is_some() {
+        Some(employee_service(input.get("service").and_then(Value::as_str).ok_or("invalid credential service")?)?)
+    } else {
+        string_field("service", 160)?
+    };
     let note = string_field("note", 1000)?;
     let status = string_field("status", 32)?;
     if let Some(status) = status.as_deref() {
@@ -109,7 +126,7 @@ fn mutate(home: &Path, id: &str, input: &Value, employee: Option<&str>) -> Resul
         tx.execute("UPDATE credentials SET service=?2,service_source=?3 WHERE id=?1", params![id,service,if employee.is_some() {"employee"} else {"admin"}]).map_err(|_| UNAVAILABLE)?;
     }
     if let Some(note) = note {
-        tx.execute("UPDATE credentials SET note=?2 WHERE id=?1", params![id,note]).map_err(|_| UNAVAILABLE)?;
+        tx.execute("UPDATE credentials SET note=?2,note_source='admin' WHERE id=?1", params![id,note]).map_err(|_| UNAVAILABLE)?;
     }
     if let Some(status) = &status {
         tx.execute("UPDATE credentials SET status=?2 WHERE id=?1", params![id,status]).map_err(|_| UNAVAILABLE)?;
@@ -118,4 +135,45 @@ fn mutate(home: &Path, id: &str, input: &Value, employee: Option<&str>) -> Resul
     if service.is_some() { event(home,"credential_service_set",json!({"credential_id":id,"authority":if employee.is_some() {"employee"} else {"admin"}})); }
     if let Some(status) = status { event(home,"credential_status_changed",json!({"credential_id":id,"status":status})); }
     Ok(())
+}
+
+#[cfg(test)]
+mod metadata_security_tests {
+    use super::*;
+
+    // Security regression tests added for F5; not run (owner forbids builds).
+    #[test]
+    fn employee_service_rejects_free_text_and_detected_credentials() {
+        for value in ["", "CRM", "two words", "password: fixture", "mail/box", "ümlaut", "-mail", "mail\n"] {
+            assert!(employee_service(value).is_err(), "accepted {value:?}");
+        }
+        assert!(employee_service(&"a".repeat(65)).is_err());
+        let key = format!("sk-{}", "a".repeat(40));
+        assert!(employee_service(&key).is_err());
+        for value in ["mail", "a-b.c_d", "0", &"a".repeat(64)] {
+            assert_eq!(employee_service(value).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn admin_note_and_service_authority_are_independent_and_final() {
+        let home = tempfile::tempdir().unwrap();
+        let db = open(home.path()).unwrap();
+        db.execute("INSERT INTO credentials(id,kind,service_source,source_kind,source_ref,provided_by,status,first_seen_at,last_seen_at) VALUES('cred_test','password','detected','chat','source','sender','active','0','0')", []).unwrap();
+        db.execute("INSERT INTO credential_holders(credential_id,holder_kind,holder_id,granted_at,granted_by) VALUES('cred_test','agent','bot','0','routing')", []).unwrap();
+        update(home.path(), "cred_test", &json!({"note":"administrator note"})).unwrap();
+        declare(home.path(), "bot", "cred_test", "mail").unwrap();
+        assert!(mutate(home.path(), "cred_test", &json!({"note":"employee replacement"}), Some("bot")).is_err());
+        let row = get(home.path(), "cred_test").unwrap();
+        assert_eq!(row["note"], "administrator note");
+        assert_eq!(row["note_source"], "admin");
+        assert_eq!(row["service_source"], "employee");
+        update(home.path(), "cred_test", &json!({"service":"Approved service"})).unwrap();
+        assert!(declare(home.path(), "bot", "cred_test", "changed").is_err());
+        update(home.path(), "cred_test", &json!({"note":"updated administrator note"})).unwrap();
+        let row = get(home.path(), "cred_test").unwrap();
+        assert_eq!(row["service"], "Approved service");
+        assert_eq!(row["service_source"], "admin");
+        assert_eq!(row["note_source"], "admin");
+    }
 }

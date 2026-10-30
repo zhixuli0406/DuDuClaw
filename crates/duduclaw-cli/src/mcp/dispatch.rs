@@ -51,7 +51,8 @@ pub(crate) async fn handle_tools_call(
     // `wiki_write` with `scope="shared"` (authorship-extras record).
     let is_state_changing = matches!(
         tool_name,
-        "create_agent"
+        "credential_declare"
+            | "create_agent"
             | "agent_remove"
             | "agent_update"
             | "agent_update_soul"
@@ -840,6 +841,7 @@ pub(crate) async fn handle_tools_call(
         // P2-C: workspace answers carry file paths and file content; the
         // audit row keeps only the argument summary (no result text).
         let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name)
+            || tool_name == "credential_declare"
             || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
         {
             None

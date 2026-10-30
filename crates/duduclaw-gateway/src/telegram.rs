@@ -1811,7 +1811,7 @@ async fn handle_callback_query(
     let chat_id = msg.chat.id;
     let thread_id = msg.message_thread_id;
 
-    info!("🔘 Telegram [{sender}] pressed: {data}");
+    info!("🔘 Telegram [{sender}] pressed a callback button");
 
     // Decision buttons — every "a human must decide this" card, whichever
     // store backs it. `None` ⇒ not a decision button, fall through to this
@@ -3188,7 +3188,7 @@ async fn send_message_once(
         error!(
             "Telegram send failed ({}): {}",
             status,
-            data.description.as_deref().unwrap_or("(no description)")
+            duduclaw_security::credential_detect::mask(data.description.as_deref().unwrap_or("(no description)"))
         );
         // Prefer Telegram's own `error_code` from the JSON body (the documented
         // API contract) and fall back to the transport-level HTTP status —
@@ -3483,7 +3483,7 @@ async fn send_reply_with_guard(
                     && !data.ok
                 {
                     let desc = data.description.unwrap_or_default();
-                    error!("Telegram send failed: {desc}");
+                    error!("Telegram send failed: {}", duduclaw_security::credential_detect::mask(&desc));
 
                     // Retry without reply_parameters if the referenced message
                     // is invalid (deleted, wrong chat, etc.)
@@ -3524,7 +3524,7 @@ async fn send_reply_with_guard(
                                 {
                                     error!(
                                         "Telegram retry also failed: {}",
-                                        d2.description.unwrap_or_default()
+                                        duduclaw_security::credential_detect::mask(&d2.description.unwrap_or_default())
                                     );
                                 }
                             }

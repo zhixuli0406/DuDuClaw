@@ -9113,5 +9113,10 @@
   "security.credentialAudit.source.config": "System settings",
   "security.credentialAudit.source.oauth": "Authorization",
   "security.credentialAudit.source.dispatch": "Dispatched prompt",
-  "security.credentialAudit.source.tool": "Tool call"
+  "security.credentialAudit.source.tool": "Tool call",
+  "security.credentialAudit.verify": "Verify current audit segment",
+  "security.credentialAudit.verifyScope": "Rotation verifies only the current segment. Archived segments, tail completeness and authenticity are not verified.",
+  "security.credentialAudit.verifyConsistent": "Current segment internally consistent",
+  "security.credentialAudit.verifyBroken": "Current segment contains a broken or malformed audit row",
+  "security.credentialAudit.verifyUnverified": "No current segment consistency result is available"
 }

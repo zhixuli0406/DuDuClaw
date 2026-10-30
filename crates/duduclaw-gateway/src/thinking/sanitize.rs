@@ -72,7 +72,8 @@ pub fn mask_text(text: &str, engine: Option<&RuleEngine>) -> String {
         None => step1,
     };
     let step3 = mask_secret_words(&step2);
-    clean_text(&step3)
+    let credentials_masked = duduclaw_security::credential_detect::mask(&step3);
+    clean_text(&credentials_masked)
 }
 
 fn truncate(text: String, cap_chars: usize) -> Sanitized {
