@@ -1399,7 +1399,7 @@ mod budget_preflight_tests {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("agents/a");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), "not valid [[[").unwrap();
+        std::fs::write(dir.join("agent.toml"), "budget = 1").unwrap();
         let error = run_agent_prompt_detailed(AgentPrompt {
             agent_dir: Some(&dir), home_dir: home.path(), agent_id: "a",
             prompt: "never execute", system_prompt: "", model: "claude-sonnet-4-6",
@@ -1410,6 +1410,23 @@ mod budget_preflight_tests {
         assert_eq!(error.preflight.as_ref().unwrap().kind, RuntimePreflightKind::Budget);
         assert!(error.steps.is_empty());
         assert!(crate::budget::budget_refusal_message(&error.legacy_message()).is_some());
+    }
+
+    #[tokio::test]
+    async fn malformed_agent_config_refuses_before_runtime_or_rotation() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "not valid [[[").unwrap();
+        let error = run_agent_prompt_detailed(AgentPrompt {
+            agent_dir: Some(&dir), home_dir: home.path(), agent_id: "a",
+            prompt: "never execute", system_prompt: "", model: "claude-sonnet-4-6",
+            max_tokens: 16, provider_override: Some(RuntimeType::Claude),
+            conversation_history: &[], request_type: RequestType::Chat,
+            runtime_settings: None, effort: None, allow_cross_family_failover: true,
+        }).await.unwrap_err();
+        assert_eq!(error.preflight.as_ref().unwrap().kind, RuntimePreflightKind::Config);
+        assert!(error.steps.is_empty());
     }
 
     #[test]
