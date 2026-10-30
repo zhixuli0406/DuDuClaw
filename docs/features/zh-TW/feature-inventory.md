@@ -41,10 +41,10 @@
 | 目標契約凍結（v1.60） | 建立時把驗收標準凍結成不可變 `acceptance_criteria_baseline`，判官與評估器一律讀這份基準；agent 身分以 `tasks_update` 改 goal 任務的驗收標準、`title` 或 `description` 一律拒絕並留稽核；`/goal` 未帶標準時附四要素引導與 outcome 式標準建議 |
 | 目標迴圈人為信號 + 准入排隊（v1.60） | needs_human 帶封閉六類 `pause_reason`（觸發現場靜態標記，絕不從 LLM 敘述反解）；逾時進度通報（`progress_report_minutes`）；零 LLM 工具連擊 advisory（3/5/8 逐級）；ephemeral spawn 超限改有界 FIFO 排隊（預設 `queue`）；預算耗盡改交「最佳輪成品」（確定性挑選 + 差距清單，不再空手升級） |
 | Agent Mail（v1.60） | 每 agent 信箱（`/mail` 頁）：Gmail API／drop folder 入站，外發一律先建草稿等 ApprovalBroker 確認（背景 worker 是唯一寄信者），信件內容 DATA 圍欄，獨立不可外部授予的 scope，跨 agent 讀信過 delegation policy 判定（[47-agent-mail.md](47-agent-mail.md)） |
-| Agent 組態 preset P1（v1.60） | `duduclaw preset` 指令族 + `agent create --preset`，可具名複用的組態組合；綁定權威存 `preset_bindings.toml`，解析結果物化到 agent 目錄之外（防自改繞過），org 欄位拒絕、敏感段剝除；內建 9 個部門 preset |
+| Agent 組態 preset（v1.60） | `duduclaw preset` 指令族 + `agent create --preset`，可具名複用的組態組合；綁定權威存 `preset_bindings.toml`，解析結果物化到 agent 目錄之外（防自改繞過），org 欄位拒絕、敏感段剝除；內建 9 個部門 preset |
 | 統一交辦面板 + 計畫模式 + 靈感畫廊（v1.60） | 所有入口共用同一個交辦面板（個人版終於有主要動作按鈕），問一問／交辦／「想一想」三模式。計畫模式先產 3-8 步計畫停在 needs_human 等核准，核准後以 `<execution_plan>` 一次性注入；已結束的目標可接「接著做」指示；靈感畫廊 `/gallery` 把 22 組產業團隊範例扇出成一鍵做同款卡片；任務詳情改四分頁（產物／檔案／變更／過程） |
 | 產物 provenance + 交付安全（v1.60） | `artifacts.jsonl` 五種 origin 的 provenance ledger（declared / swept / uploaded / produced / unknown，exact／inferred 歸屬標示，絕不用時間窗猜測）；goal 驗收通過時封存產物進 `attachments/`（canonicalize 圈定、20MB/100MB 上限）；📎DELIVER 前的零 LLM 交付閘（零位元組／magic 不符／zip 損壞硬失敗）；`[limits]` DocumentLimits 守三個下游 office/zip 解析器；修補專家包 zip「header 謊報」繞過 |
-| 憑證 P1 + secret 參照收斂（v1.60） | `secret://keychain` 與 `secret://file` 本機 backend、tick 來源 headers 支援 `secret://`、憑證來源總表卡 + `doctor --fix-residue`；`SecretRef`/`Secret` 型別收斂七套手刻解密方言（它們可能把 `secret://` 參照字面值當真憑證送給 vendor API）；WhatsApp webhook 驗簽改 fail-closed；ActionGuard 判官改吃 21 項封閉列舉 findings（攻擊者可控文字結構上進不了判官 prompt）；MCP key 輪替即時重載、`denied_tools`/`allowed_tools` 在 MCP 分派總門強制 |
+| 憑證與 secret 參照整併（v1.60） | `secret://keychain` 與 `secret://file` 本機 backend、tick 來源 headers 支援 `secret://`、憑證來源總表卡 + `doctor --fix-residue`；`SecretRef`/`Secret` 型別收斂七套手刻解密方言（它們可能把 `secret://` 參照字面值當真憑證送給 vendor API）；WhatsApp webhook 驗簽改 fail-closed；ActionGuard 判官改吃 21 項封閉列舉 findings（攻擊者可控文字結構上進不了判官 prompt）；MCP key 輪替即時重載、`denied_tools`/`allowed_tools` 在 MCP 分派總門強制 |
 | 十通道通知統一（v1.60） | autopilot `notify`、MCP `send_message`、提醒全部改走共用 `create_sender` 工廠，涵蓋十個通道（WebChat 誠實拒絕）；修復 autopilot Slack 通知從未送出的問題與 Google Chat / Teams 靜默跳過缺陷 |
 | 進化量測硬化（v1.60） | AEE 提交閘拆 visible／held-out 兩個評測維度（fence-only：只否決不晉升）；冠軍 bootstrap 改同形量測；`duduclaw evolution clear-holdout-rotation` 操作者出口；每輪 14 個 harness 旋鈕快照進 `aee_round` 事件 |
 | cron 星期慣例修正（v1.61，**BREAKING**） | 數字星期欄在解析時從 Unix crontab 慣例（0/7=週日、1-5=週一到五）轉譯成 `cron` crate 的 Quartz 序數，排程器／heartbeat／MCP 驗證／儀表板共用同一份 normaliser：先前 `* * 1-5` 實際排的是週日到週四（週日幽靈觸發 + 週五靜默跳過）；刻意照 Quartz 寫的排程升級後會位移一天 |
@@ -59,7 +59,7 @@
 | 功能 | 說明 |
 |------|------|
 | 進化系統 v3：AEE + playbook | 預設進化標的從「整份改寫 SOUL.md」改為基因形 playbook 規則：Gate/Measure 閘門分離、champion + matches-or-improves 提交閘、條目級觀察窗；SOUL.md 對 agent 唯讀（[38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)） |
-| E1 條目斷言 + 反 reward-hacking 稽核 | 每條新規則必附可機器檢查的斷言，對錄製 transcript 做零 LLM 重放（`G-Assertions`）；提交前確定性篩查候選規則的題庫題面洩漏／恆真空話／失敗抑制 |
+| 條目斷言 + 反 reward-hacking 稽核 | 每條新規則必附可機器檢查的斷言，對錄製 transcript 做零 LLM 重放（`G-Assertions`）；提交前確定性篩查候選規則的題庫題面洩漏／恆真空話／失敗抑制 |
 | 任務層前瞻模型 | goal loop 上的 predict-act-verify 世界模型：四階統計預測（冷啟動零 LLM）、觀察保真度分級（原生工具事件／只有稽核日誌／無）、`<state>` 狀態區塊 + `(state, action)` 訪問圖震盪偵測、確定性任務規則歸納；`[task_forward_model]`，v1.54 起預設開 |
 | 派工證據落地預檢 | 驗收判官之前的零 LLM 證據檢查：最終回覆必須與真實的非錯誤工具結果重疊；自我回音排除名單 + 輸入重疊扣除，防自我證明；`[dispatch] grounding_precheck_enabled`，預設開 |
 | 記憶新穎度閘門 | 語意層近重複寫入被擋下並記遙測（0.92 字元 n-gram cosine），防假驚訝；時間取代／再確認路徑豁免；`[memory] novelty_gate`，預設開 |
@@ -227,7 +227,7 @@
 | GitHub 即時索引 | Search API + 24h 本地快取 + 加權搜尋 |
 | 技能市集 | Web Dashboard 瀏覽、安裝、安全掃描 |
 | 技能自動合成 | 差距累積器 → 從情境記憶合成（Voyager 啟發）→ 沙箱試用（TTL）→ 跨 Agent 畢業；預設關（`agent.toml [evolution] skill_synthesis_enabled`） |
-| 技能合成排程器（W19-P1，v1.22.0） | 讓「對話 → skill」萃取依間隔自主執行：`config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + dashboard `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` 為 `u32` 計數（修好 registry 掃描拒絕 `0.7` 的問題） |
+| 技能合成排程器（v1.22.0） | 讓「對話 → skill」萃取依間隔自主執行：`config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + dashboard `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` 為 `u32` 計數（修好 registry 掃描拒絕 `0.7` 的問題） |
 | Skill 安全掃描器（Rust-native） | `skill_lifecycle::security_scanner` 掃描候選技能，無 Python 依賴 |
 
 ## 本地推論引擎
@@ -265,7 +265,7 @@
 |------|------|
 | `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash`，由 `agent_hook_installer` 逐 agent 安裝，指令帶 `--agent` 與 `--home`）：擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md 與 CONTRACT.toml、擋跨 agent 寫入、擋員工寫 DuDuClaw 資料目錄裡自己 agent 目錄與 `attachments/` 以外的位置（以解析符號連結後的實際路徑判斷）、擋改自己 `agent.toml` 可編輯區段以外的內容；Bash 通道是啟發式，`Read` 不在涵蓋範圍；規則與限制見 [05-security-defense.md](05-security-defense.md) |
 | `org_field_guard` | 同一個 hook 內的欄位級凍結：`[agent] reports_to`／`department`／`name`、整張 `[capabilities]` 表，以及 `config.toml [delegation]`／`[acp]`；內容無法解析或寫入意圖無法重建一律 fail-closed |
-| `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard`（RFC-23 §14.4，H10 2026-09 起為 Rust 子命令，matcher `Read\|Bash`），只有去識別化生效時才武裝；本質是 `Bash` 檔名啟發式，並非沙箱 |
+| `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard`（RFC-23 §14.4，2026-09 起為 Rust 子命令，matcher `Read\|Bash`），只有去識別化生效時才武裝；本質是 `Bash` 檔名啟發式，並非沙箱 |
 | Dashboard 認證 | JWT 帳號登入（Argon2id 密碼，`users.db`）或 gateway 管理員 token。早期的 Ed25519 挑戰回應路徑已移除，從來沒有任何設定能啟用它 |
 | AES-256-GCM | API 金鑰靜態加密、per-agent 金鑰隔離 |
 | Prompt Injection 掃描 | `input_guard`：11 類規則、阻擋門檻 60、先 NFKC 正規化、英文＋zh-TW 樣式、XML 分隔標籤保護 |
@@ -291,14 +291,14 @@
 | 記憶衰減排程 | 每日背景執行：低重要度 + 30 天以上歸檔，歸檔 + 90 天以上永久刪除 |
 | 認知記憶 MCP 工具 | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
 | Key-Fact Accumulator | `key_facts` + FTS5：跨 session 輕量記憶（見 Session 記憶堆疊） |
-| Temporal Memory（F1，v1.19.0） | `memories` 經冪等遷移新增時序／知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain（v1.67.1 起，寫入可信度不低於目前事實時才取代）；`search()` 預設只回傳現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
+| Temporal Memory（v1.19.0） | `memories` 經冪等遷移新增時序／知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain（v1.67.1 起，寫入可信度不低於目前事實時才取代）；`search()` 預設只回傳現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
 | Reflexion Loop（F2，v1.19.0） | 橋接既有 `MistakeNotebook`：F2a 將近期未解決錯誤注入作答 prompt（`## Past Mistakes to Avoid`，CJK-safe 比對 + recency fallback）；F2b 將 ≥3 則同 `MistakeCategory` 錯誤整併為一條語意記憶規則（`reflexion.rs`）後標記來源已解決。觸發訊號 = `ErrorCategory` Significant/Critical（MetaCognition 自適應） |
 | `memory_fetch_batch`（F3，v1.19.0） | MCP 工具 + `get_by_ids` 一次以 ID 取回 ≤100 筆（命名空間／擁有權強制，部分命中 → `missing_ids`） |
 | Bi-temporal + build-time provenance（D1） | `memories` 經冪等遷移新增 `ingested_at`（transaction-time 軸，有別於 world-time 的 `valid_from`）＋ `invalidated_by_event`/`invalidated_at`（哪個 source_event 於何時關閉一列）。`store_temporal()` 的取代由 world-time 的 `valid_from` 決定（可容忍亂序：較早的事實會以有界歷史區段插入而不擾動現行事實；無 `valid_from` 的寫入維持既有的攝入順序行為）；再次觀察到相同事實會**再確認**（metadata `reaffirmed_by`，≤20，並累加 `access_count`），不新增一列 |
 | `memory_get_history` / `memory_get_at`（D1） | 時序讀取 API 的 MCP 揭露：完整取代鏈（含 provenance 欄位）與某 `(subject, predicate)` 三元組的時間點查詢（scope `memory:read`） |
 | 取代時的可信度檢查（v1.67.1） | 寫入的有效 `origin_trust` 嚴格低於目前事實（儲存值以其類別上限封頂）時不能取代它；相同或更高照舊取代。對話事實與使用者輪廓特徵萃取被拒時會暫存，送到只能在儀表板決定的 `knowledge_quarantine` 審核（24 小時，每位 AI 員工每 UTC 日最多新增 20 筆，超過只寫稽核）；其他路徑略過或回傳錯誤。`user_profile` 來源上限 1.0 → 0.6。`config.toml [memory] supersession_trust_guard`（預設開）（[20-memory-intelligence.md](20-memory-intelligence.md#取代時的可信度檢查v1671)） |
 | `memory_invalidate_by_origin`（D1） | 來源回溯原語：讓某**精確** `origin` 的所有現行有效事實過期（只過期、不刪除；可選限定某截止時間之後），並將 `origin_trust ≤ 0.1` 級聯至 `derived_from` 的後代；歷史保留（`invalidated_by_event = "origin_purge"`）。scope `admin`；v1.67.1 起以 AI 員工身分呼叫時只能處理 `channel` / `mcp_external` / `tool_echo`（其他拒絕並稽核 `memory_invalidate_refused`） |
-| 依來源忘記記憶（v1.70.0、尚未在真實 gateway 活體驗證） | 每筆記憶寫入都記下來源（通道訊息、排程或派工執行、MCP 回合、匯入檔案）。`duduclaw memory forget-source {list,plan,show,apply,resume}`（只能在操作者終端機執行）硬刪由該來源直接或間接產生的記憶，寫下封鎖紀錄使同一來源不會再被學進去，並執行 `memory.db` 以外的後續步驟。`apply` 需要管理員在儀表板核准。不會刪除對話原文、已送出的訊息或備份。見[忘記對話、排程執行或匯入檔案](../../guides/zh-TW/memory-and-knowledge.md#45-忘記對話排程執行或匯入檔案) |
+| 依來源忘記記憶（v1.70.0） | 每筆記憶寫入都記下來源（通道訊息、排程或派工執行、MCP 回合、匯入檔案）。`duduclaw memory forget-source {list,plan,show,apply,resume}`（只能在操作者終端機執行）硬刪由該來源直接或間接產生的記憶，寫下封鎖紀錄使同一來源不會再被學進去，並執行 `memory.db` 以外的後續步驟。`apply` 需要管理員在儀表板核准。不會刪除對話原文、已送出的訊息或備份。見[忘記對話、排程執行或匯入檔案](../../guides/zh-TW/memory-and-knowledge.md#45-忘記對話排程執行或匯入檔案) |
 | 圖檢索演進（D3） | HippoRAG-lite graph 獲得四項 fail-safe 改良（未啟用時逐位元組相同）：**(1)** per-agent 持久化圖快取（`RwLock`），由每筆更動三元組寫入遞增的 per-agent 世代計數器失效，僅在超過 `GRAPH_CACHE_MIN_TRIPLES = 500` 時啟用；**(2)** 透過 `entity_alias(agent_id, canonical, alias)` 的實體別名合併：在建圖＋seeding 前把表面形式收斂到同一節點，正規化＋鏈攤平；**(3)** 附掛到邊上的述詞邊標籤（PPR 不變），餵給 `engine.export_graph(agent, limit)` → 可序列化 `{nodes, edges}` 快照（隔離事實加註旗標）供 D6 策展 UI；**(4)** 可選的 embedding seeding（`graph_embed_seed`）：PPR seed ＝ whole-word FTS ∪ query embedding 最鄰近實體向量（同模型 cosine，top-k，惰性 `entity_embedding` 快取），預設關閉 |
 | `memory_alias_add` / `memory_alias_list`（D3） | 管理實體別名的 MCP 工具：add 把 `alias` 收斂到某 `canonical` 實體（scope `memory:write`），list 回傳 `(canonical, alias)` 配對（scope `memory:read`）；命名空間隔離 |
 | Decision Continuity（RFC-24，v1.23.0） | 當 agent 提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 **semantic** 層（獨立於對話壓縮），待決事項每回合重新注入；稍後「用方案 C」（跨回合／session／程序）從持久狀態解析，不靠猜測。偵測確定性、零 LLM；`decision_resolve` / `decision_list` MCP 工具 + Dashboard 面板 + Prometheus 計數器；per-agent opt-in `[memory] decision_continuity = true`（TTL `decision_ttl_days`，預設 7） |

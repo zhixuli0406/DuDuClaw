@@ -39,6 +39,6 @@ LINE 持久佇列在兩種模式都只存遮罩文字，包含 postback、檔名
 
 兩種模式皆在各寫入端遮罩：pinned instructions、標題、摘要與壓縮；語意／episodic 記憶、三元組、key facts、metadata 與 FTS；自動、員工與共用 Wiki（含索引／FTS）；skill recorder／cache 與擷取稽核；全域與各員工 RL JSONL；prediction metrics、學習的主題／bigrams 與演化內容；工作狀態與歷史；派工佇列 payload／結果／錯誤；任務、活動、留言、計畫、目標與審查紀錄；trajectory anomaly、因果證據及診斷日誌；SFT／偏好訓練與 CSV／XLSX 匯出。已凍結的執行或授權資料若含憑證則拒寫，避免遮罩改變原核准內容。十一個通道的訊息日誌先遮罩再截斷，格式化檔案／stderr 與廣播日誌也在輸出端遮罩。
 
-audit 模式只有 `sessions.db` 的對話訊息及當前 prompt 保留偵測到的明文；LINE 持久交付一律遮罩。這是固定規則的偵測範圍，不保證辨識未知或轉換過的秘密。既有衍生紀錄與外部 runtime transcript 不回溯清洗。LINE ingress 關聯只含 metadata，最多 100,000 列、七天到期。已新增安全回歸測試，但**未執行**；編譯與原生驗收皆未驗證。
+audit 模式只有 `sessions.db` 的對話訊息及當前 prompt 保留偵測到的明文；LINE 持久交付一律遮罩。這是固定規則的偵測範圍，不保證辨識未知或轉換過的秘密。既有衍生紀錄與外部 runtime transcript 不回溯清洗。LINE ingress 關聯只含 metadata，最多 100,000 列、七天到期。
 
 512 KiB 頁面上限內的 Wiki 頁面會完整掃描並在儲存前遮罩；掃描失敗時拒絕寫入。64 KiB 掃描上限仍用於重視延遲的聊天與日誌。

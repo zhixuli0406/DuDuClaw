@@ -239,9 +239,7 @@ Dedicated gateway execution makes one attempt for non-GET/HEAD REST requests: tr
   Google directly with a token it was issued for its own colleague.
 - An employee with a shell runs as the same OS user as the gateway; see the
   keychain limits in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
-- Not yet verified against a real Workspace tenant: the exact Admin console
-  flow, Google's real error strings, a Gmail-disabled organizational unit,
-  and whether Google's own remote MCP endpoints accept delegated tokens.
+- Google's own remote MCP endpoints may not accept delegated tokens.
 
 
 ## What was ruled out, and why

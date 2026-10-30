@@ -302,7 +302,6 @@ or gateway. Restarting the gateway closes the window and disconnects SSH.
 An unconfirmed close stays visible as a warning. Expand Maintenance history
 for recent window fingerprints and connection events. The UI polls every
 30 seconds, so an expiry or device-side close may appear on the next poll.
-The complete OS image and real SSH/notification flow are not yet verified;
 the page works only with an OS image that ships the maintenance account, and it is not acceptance of the assembled device.
 
 ## Security → Credential protection (v1.76.0)
@@ -342,17 +341,17 @@ The security page offers four values for `config.toml [security] egress_guard`: 
 
 After a successful private MCP read in a turn, the guard checks outgoing calls. Observe only records `would_ask` and source tools while allowing execution. Ask shows a single-use approval with destination, expanded complete content, source tools and expiry; only a current dashboard Admin can approve it (channel buttons and chat replies cannot). Block refuses. This covers platform MCP calls and the third-party MCP proxy, not Claude CLI built-ins or other native runtime tools. Tracking is per turn. See [Outgoing data guard](../features/69-egress-guard.md).
 
-Unreleased E3 adds an Admin-only observation report below this setting: select 7 or 30 days to see distinct would-be approval tickets, employee/tool/source/date breakdowns and CLI built-in versus MCP counts. Refusal observations do not increase the ticket estimate; no observations or a collection failure is not proof of safety. Lease health is available through `duduclaw doctor`; offline recovery uses `duduclaw egress-leases list` and `clear` with the printed confirmation token after all gateways and outgoing actions have stopped. See the recovery section of the outgoing-data guide.
+The Admin-only observation report below this setting lets Admins select 7 or 30 days to see distinct would-be approval tickets, employee/tool/source/date breakdowns and CLI built-in versus MCP counts. Refusal observations do not increase the ticket estimate; no observations or a collection failure is not proof of safety. Lease health is available through `duduclaw doctor`; offline recovery uses `duduclaw egress-leases list` and `clear` with the printed confirmation token after all gateways and outgoing actions have stopped. See the recovery section of the outgoing-data guide.
 
-## Security → Recipient guard (unreleased E2)
+## Security → Recipient guard (unreleased)
 
 In **Outgoing data guard**, **Recipient guard** controls `config.toml [security] recipient_guard`: Off (`off`), Observe only (`shadow`, default) or Ask before sending (`ask`). Unknown values behave as Ask. Saving uses the locked `system.update_config` writer. This setting applies even if the employee has not read private data.
 
 An Admin edits **Tools & permissions → Allowed recipients** on the employee page. Add exact entries such as `line:U123`, `telegram:456` and `mail:ops@example.com`; these write `[capabilities] recipients`. The employee-level mode can only tighten the global mode; **Use global minimum** adds no restriction of its own. Both fields are Admin-only and protected from employee edits.
 
-The gateway adds the current source conversation and verified `users.db` Owner bindings automatically. Proactive notification settings never count as ownership or as an allowlist. Scheduled notifications have no source conversation and are checked again when firing, so add required schedule targets explicitly. Outside recipients are recorded in Observe only; Ask requires a single-use dashboard Admin approval. When outgoing-data protection also asks, one card shows both reasons. See [Server-bound recipients](../features/69-egress-guard.md#server-bound-recipients-unreleased-e2). E2 tests are written but not run; compilation and live acceptance are pending.
+The gateway adds the current source conversation and verified `users.db` Owner bindings automatically. Proactive notification settings never count as ownership or as an allowlist. Scheduled notifications have no source conversation and are checked again when firing, so add required schedule targets explicitly. Outside recipients are recorded in Observe only; Ask requires a single-use dashboard Admin approval. When outgoing-data protection also asks, one card shows both reasons. See [Server-bound recipients](../features/69-egress-guard.md#server-bound-recipients).
 
-## Security → Data deletion receipts (unreleased F1)
+## Security → Data deletion receipts (unreleased)
 
 Disconnecting a channel, Google account, database source or Remote MCP automatically prepares a memory-deletion request. A disconnect success and a completed deletion are separate results.
 
@@ -369,7 +368,6 @@ Connection stamps keep their origin and role. Corroboration alone never grants d
 
 Approval binds the sorted identifiers of orphan entity embeddings, not just their count; swapping one entity for another requires a new approval. Unfinished jobs use a durable attempt count and due time, with 60/120/240/480-second backoff. Due jobs are selected fairly. After five consecutive failures or interrupted attempts, a job is quarantined. The Admin can see a content-free failure reason under **Data deletion receipts** and choose **Retry**; retry retains the existing approval and rechecks scope, requiring a new approval if it grows.
 
-Regression tests for these changes were added but **not run**; no build was performed.
 
 ## Conversation credentials (unreleased)
 

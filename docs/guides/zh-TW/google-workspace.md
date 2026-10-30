@@ -33,7 +33,7 @@
 > 輸出品質也更好。
 
 > **命名慣例**：Google Tasks 的工具全部叫 `gtasks_*`。DuDuClaw 自己的任務板
-> 則維持 `tasks_*`（`tasks_list` / `tasks_create` / `tasks_complete` / …）——
+> 則維持 `tasks_*`（`tasks_list` / `tasks_create` / `tasks_complete` / …），
 > 這是兩套完全獨立的系統，刻意用不同的前綴，讓 agent 永遠不會把「我自己的
 > 工作佇列」跟「使用者的 Google Tasks」搞混。
 

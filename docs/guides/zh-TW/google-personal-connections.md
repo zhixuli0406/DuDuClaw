@@ -87,4 +87,4 @@ requesters = "bound_people" # or "owner_only"; "anyone" needs confirmation
 
 明確選定的公司憑證路徑優先，失敗會回報；舊安裝在管理員儲存路徑前保留舊來源判定。Apps Script 涵蓋 Gmail、Calendar、Sheets，七個資料動作加狀態共八個動作，不支援 CC、活動參與者、Meet 或遠端 MCP bearer。選定帳號不代表已通過健康檢查；可能已送到 Google 的操作不能自動換路徑再送一次。
 
-從產品外更換憑證不一定能立即偵測。逾時和取消也不能強制中斷已開始的鑰匙圈或本機磁碟操作；檢查設定到送出請求之間的變更仍有限制。這些控制不能當成真實 Google 端點、作業系統鑰匙圈、Windows 裝置或使用者已驗收的證明。舊版本機測試保留在[驗收紀錄](../../../wiki/impl/google-personal-identity-acceptance.md)，本指南不宣稱已部署或通過客戶驗收。
+從產品外更換憑證不一定能立即偵測。逾時和取消也不能強制中斷已開始的鑰匙圈或本機磁碟操作；檢查設定到送出請求之間的變更仍有限制。

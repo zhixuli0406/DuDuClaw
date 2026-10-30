@@ -40,7 +40,7 @@ The store holds an exclusive `<home>/egress_leases.lock` file lock for its lifet
 
 Registration history uses a separate bounded Bloom filter per employee and is never cleared during that gateway process, so re-registering an evicted or expired turn cannot make it clean. Hash collisions or a saturated filter can conservatively taint a new turn for that employee. History holds at most 1,024 employees (32 KiB each, 32 MiB total); turns for additional employees are always treated as tainted. History is not persisted across restart.
 
-## Observation report (unreleased E3)
+## Observation report (unreleased)
 
 The Admin-only Security report compares the last 7 or 30 UTC days. The approval estimate counts distinct calls that would ask; pre-check and dispatch confirmation share a call ID. Refusal observations appear in the breakdowns but are not approval tickets. Breakdowns show employee, tool, closed private-source class, date and CLI built-in versus MCP entry point. An empty result means no recorded observations, not proof of safe sending. Collection failures do not change gate decisions and can leave the report incomplete.
 
@@ -75,7 +75,7 @@ Only a current Admin may decide an outgoing-data approval, including requests wi
 
 Action-rule approvals show the matching tool or effect rule, including for read and draft calls. Purchase and Delete actions cannot receive new standing capability or workflow grants; grants saved before this feature are ignored without changing the stored records. Other gates and explicit approvals still apply.
 
-## CLI built-in tools (unreleased E1)
+## CLI built-in tools (unreleased)
 
 Claude and Grok receive a `PreToolUse` hook for `WebFetch`, `WebSearch` and literal Bash network commands. Grok aliases include `Fetch`, `Shell`, `web_fetch`, `web_search` and `run_terminal_command`; their actual matcher and environment behavior still need live acceptance. Ordinary non-network Bash returns locally without contacting the gateway. Detection recognizes `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`, and `git push/fetch/clone/pull/ls-remote`. Shell `-c`, `eval` and echo/printf arguments use bounded reparsing (two levels, 64 KiB per payload). Echo/printf command-shaped data can conservatively match even when not executed.
 
@@ -98,9 +98,9 @@ Cron, dispatch, reminder, mail, heartbeat and ephemeral execution entry points n
 
 **Bash hooks are a speed bump and telemetry, not a containment boundary.** Native `Read` and Bash file reads do not mark taint. Interpreters, scripts, aliases, renamed binaries, `/dev/tcp` and dynamic command assembly can bypass lexical detection. A missing/killed/timed-out hook may be ignored by the upstream CLI. Same-OS-user access to hook files, keys or process environment is not isolated by request signatures. Native preflight does not hold the MCP sink lease through execution or prevent concurrent reads after the check. Deny Bash or use the task sandbox for containment; the task sandbox covers delegated tasks, not every channel/CLI run. The Security page lists enforcing-mode employees with Bash and no enabled task sandbox.
 
-E1 validation status: tests were written but not run, and no compilation or live CLI probes were performed in this work package. Pending: Claude/Grok hook matching, inherited turn/principal context, approval/retry/single use, gateway-outage modes, Claude borrowed cwd, and Codex 0.164.0 network/search restrictions with MCP still working.
+DuDuClaw does not guarantee that Grok alias matching or environment propagation matches the real CLI. Generic CLI native tools remain outside this guard.
 
-## Server-bound recipients (unreleased E2)
+## Server-bound recipients (unreleased)
 
 Recipient protection is independent of whether private data was read. Set `config.toml [security] recipient_guard` to `off`, `shadow` (default), or `ask`. An unknown value warns and behaves as `ask`. An employee's `[capabilities] recipient_guard` can only tighten the global setting (`off < shadow < ask`). In the dashboard, use Security → Outgoing data guard → Recipient guard; an Admin edits additional recipients under the employee's Tools & permissions → Allowed recipients.
 
@@ -133,17 +133,15 @@ Covered targets: `send_message`, `send_photo`, `send_sticker`, `create_reminder`
 
 Raw send targets cannot use conversation suffixes to impersonate a permitted recipient. Discord notification threads are checked as actual destinations in addition to the parent channel. When changing `update_cron_task` routing, supply `notify_channel` and `notify_chat_id` together; an empty pair clears routing. Changes to the task and routing are saved atomically. The guard rechecks permission after other approval waits. Ephemeral helpers inherit the parent's recipient mode and configured list; verified owner bindings remain employee-specific.
 
-E2 validation: tests were written but **not run**. Compilation, independent security review and live Claude/Codex acceptance remain pending. This is a product-path guard; it does not isolate a process with unrestricted same-user filesystem or network access.
+This guard protects product paths; it does not isolate a process with unrestricted same-user filesystem or network access.
 
 ## Known limitations
 
 Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard. Their tool registry does not retain MCP annotations, so these calls are conservatively classified as **Modify**, even when the server describes them as read-only; exact per-tool action rules still apply. The MCP proxy and remote bridge retain their annotation-based decisions with `trusted_read_hint_servers`. A tainted direct-mounted read can therefore require outgoing approval.
 
-Taint is tracked per turn; active sink fences apply per employee. This MCP guard does not provide a network sandbox. Unreleased E1 adds the native-tool checks described above; they do not provide a runtime-wide network boundary. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
+Taint is tracked per turn; active sink fences apply per employee. This guard does not provide a network sandbox or a runtime-wide network boundary. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
 
 See [Security defense](05-security-defense.md) and [Dashboard settings](../guides/dashboard-settings.md).
-
-Verification scope: automated tests cover classification, gate and approval behavior. End-to-end behavior on a live employee and real outgoing service has not yet been verified.
 
 For direct external scoped/closed connections, the existing operation deadline can expire before the approval card. A later approval does not restart the expired call; submit a new call. The old card may remain pending until its displayed expiry.
 

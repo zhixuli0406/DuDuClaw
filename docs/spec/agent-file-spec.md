@@ -62,10 +62,9 @@ refused. The error lists the frozen field paths. In particular `runtime`,
 
 ## Body sections and disk mapping
 
-H1 headings are case-insensitive. The recognized names are `Persona`, `User`,
-`Rules` and `Contract`. Duplicate recognized sections are refused. Unknown H1
-headings, including translated headings, are retained under Rules with a warning.
-H1 text inside a fenced code block is content, not a section boundary.
+Level-one headings are case-insensitive. The recognized names are `Persona`, `User`,
+`Rules` and `Contract`. Duplicate recognized sections are refused. Unknown level-one headings, including translated headings, are retained under Rules with a warning.
+Level-one heading text inside a fenced code block is content, not a section boundary.
 
 | Section | Native destination | Interpretation |
 | --- | --- | --- |
@@ -226,7 +225,4 @@ contract precedence relative to contextual material:
 | `gateway::channel_reply` | Existing order preserved: profile contract before skills/wiki |
 | `gateway::prompt_minimal` | Existing order preserved: end of profile, before sender/tool index |
 
-Security regression tests cover plan changes (including tool restrictions, skill
-bodies and collision resolution), the two restored contract positions, and runtime
-versus import handling of legacy contracts. **These tests are not run for this
-change; compilation, build and runtime acceptance are also not performed.**
+Security checks cover plan changes (including tool restrictions, skill bodies and collision resolution), the two restored contract positions, and runtime versus import handling of legacy contracts.

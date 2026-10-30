@@ -31,11 +31,11 @@ duduclaw pack inspect <src>        # 正規化後的樣子,並說明這份檔案
 duduclaw pack install <src>        # 依 kind 分流;付費內容只在一處檢查授權
 ```
 
-`[pack] kind` 決定路線:`preset`(一份職務設定,不帶身分)、`team`(名冊,也就是專家包一直以來的樣子)、`template`(單人產業板模)。`[pack] tier` 是唯一的付費判定——以前有四段程式各自從目錄路徑猜「這是不是付費內容」,現在包自己帶著 tier,只有一個判斷式讀它。讀不出來的 tier 一律當成付費:一個看不懂的欄位絕不該解鎖付費內容。
+`[pack] kind` 決定路線:`preset`(一份職務設定,不帶身分)、`team`(名冊,也就是專家包一直以來的樣子)、`template`(單人產業板模)。`[pack] tier` 是唯一的付費判定，以前有四段程式各自從目錄路徑猜「這是不是付費內容」,現在包自己帶著 tier,只有一個判斷式讀它。讀不出來的 tier 一律當成付費:一個看不懂的欄位絕不該解鎖付費內容。
 
 `duduclaw expert install` 已在 v1.69.0 移除:執行時會印出 `duduclaw pack install` 並以結束碼 2 離開。製作端動詞(`pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`)與 `expert list`(列出已安裝的紀錄)仍留在 `duduclaw expert` 之下。儀表板的一鍵安裝與 `experts.install` 走到的是同一段程式,因為它們本來就是驅動 CLI。
 
-**`expert.toml`、`team.toml`、`preset.toml` 仍然讀取。** 磁碟上一個字都不改。`expert.toml`、`team.toml` 與產業包目錄結構已棄用，會跟改寫後的付費板模一起在之後的版本移除，目前沒有訂版號。原因是 `pack.toml` 的團隊包與產業包目前還不能安裝：安裝程式只接受 `pack.toml` 的職務 preset。`preset.toml` 是職務 preset 的儲存格式，不在棄用範圍。`duduclaw pack inspect <dir> --emit-canonical` 會印出舊包對應的 `pack.toml`,讓你自己審過再遷移——而不是讓機器去改寫由你負責的內容。
+**`expert.toml`、`team.toml`、`preset.toml` 仍然讀取。** 磁碟上一個字都不改。`expert.toml`、`team.toml` 與產業包目錄結構已棄用，會跟改寫後的付費板模一起在之後的版本移除，目前沒有訂版號。原因是 `pack.toml` 的團隊包與產業包目前還不能安裝：安裝程式只接受 `pack.toml` 的職務 preset。`preset.toml` 是職務 preset 的儲存格式，不在棄用範圍。`duduclaw pack inspect <dir> --emit-canonical` 會印出舊包對應的 `pack.toml`,讓你自己審過再遷移，而不是讓機器去改寫由你負責的內容。
 
 ## 安裝管線
 
@@ -84,7 +84,7 @@ duduclaw pack install <src>        # 依 kind 分流;付費內容只在一處檢
 
 ## Hooks:隔離,直到有人點頭
 
-匯入的 hooks 是接進 agent runtime 的任意指令——供應鏈風險。所以它們以**停用**狀態複製進隔離目錄,永不隱式接線。啟用需要明確授權:安裝時給 `--trust-hooks`,或事後在儀表板審批中心經 ApprovalBroker 裁決、再以 `duduclaw expert hooks <slug>` 套用。沒有授權、被拒絕、或 TTL 過期的審批,都讓 hooks 維持停用(fail-closed)。狀態機(`disabled → pending_approval → enabled | disabled`)按包持久化,CLI 與儀表板共用。
+匯入的 hooks 是接進 agent runtime 的任意指令，供應鏈風險。所以它們以**停用**狀態複製進隔離目錄,永不隱式接線。啟用需要明確授權:安裝時給 `--trust-hooks`,或事後在儀表板審批中心經 ApprovalBroker 裁決、再以 `duduclaw expert hooks <slug>` 套用。沒有授權、被拒絕、或 TTL 過期的審批,都讓 hooks 維持停用(fail-closed)。狀態機(`disabled → pending_approval → enabled | disabled`)按包持久化,CLI 與儀表板共用。
 
 ## 匯出
 

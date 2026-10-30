@@ -40,7 +40,7 @@ Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0
 
 每位員工有獨立且容量固定的 Bloom filter 記錄回合登記；同一 gateway 程序存續期間不清除，因此被淘汰或到期的回合重新登記也不能變回乾淨。雜湊碰撞或 filter 飽和時，可能保守地將該員工的新回合視為已污染。最多保留 1,024 位員工的歷史，每位 32 KiB、合計 32 MiB；超過此上限的其他員工，其回合一律視為已污染。這份歷史不跨重啟保存。
 
-## 外送觀察報表（未發布 E3）
+## 外送觀察報表（未發布）
 
 管理員可在安全頁查看最近 7 或 30 個 UTC 日期的觀察紀錄。預估開單數按原本會詢問的呼叫計算，事前檢查與送出前確認共用呼叫 ID，不會重複開算。原本會拒絕的紀錄列入分類，但不算核准單。分類涵蓋員工、工具、固定的私人資料來源類別、日期，以及 CLI 內建工具／MCP 入口。空白表示沒有保存的觀察資料，不代表沒有風險；寫入失敗不改變閘門決策，因此報表可能不完整。
 
@@ -75,9 +75,9 @@ duduclaw egress-leases clear --lease <id> --confirm <該筆-token>
 
 動作規則要求核准時，卡片會列出命中的工具或動作類別規則，讀取與草稿工具也會顯示。購買與刪除不能新增常設能力授權或工作流程授權；舊授權會被忽略，原紀錄保留。其他檢查與逐次核准仍然適用。
 
-## CLI 內建工具（未發布 E1）
+## CLI 內建工具（未發布）
 
-Claude 與 Grok 安裝 `PreToolUse` hook，涵蓋 `WebFetch`、`WebSearch` 與 Bash 字面網路指令。Grok 別名包含 `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command`；實際 matcher 與環境繼承仍待真 CLI 驗收。一般非網路 Bash 在本機直接放行，不聯絡 gateway。偵測清單為 `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`，以及 `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 參數最多重解析兩層，每段最多 64 KiB；echo/printf 中長得像指令的資料，即使沒有實際執行，也可能被保守列入。
+Claude 與 Grok 安裝 `PreToolUse` hook，涵蓋 `WebFetch`、`WebSearch` 與 Bash 字面網路指令。Grok 別名包含 `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command`；DuDuClaw 不保證 Grok 別名 matcher 與環境變數傳遞符合真實 CLI 行為。一般非網路 Bash 在本機直接放行，不聯絡 gateway。偵測清單為 `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`，以及 `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 參數最多重解析兩層，每段最多 64 KiB；echo/printf 中長得像指令的資料，即使沒有實際執行，也可能被保守列入。
 
 | 模式 | 未污染 | 已讀私人資料 | 帳本無法讀取或未知回合 |
 |---|---|---|---|
@@ -98,17 +98,15 @@ Cron、派工、提醒、信件、heartbeat、ephemeral 執行入口改為獨立
 
 **Bash hook 是減速帶與遙測，不是隔離邊界。** 內建 `Read` 與 Bash 讀檔不會標記污染。解釋器、腳本、別名、改名執行檔、`/dev/tcp`、動態組裝指令都可能繞過字面偵測。Hook 程式不存在、被殺或逾時，可能被上游 CLI 忽略。同一 OS 使用者可存取的 hook、金鑰與環境變數，不受簽章機制隔離。原生工具的事前檢查也不會持有 MCP sink lease 到執行結束，無法阻止檢查後的並行讀取。需要隔離時不授予 Bash，或使用任務沙箱；任務沙箱只涵蓋派工任務，不涵蓋所有通道／CLI 執行。安全頁會列出強制模式下有 Bash 且未開任務沙箱的員工。
 
-E1 驗證狀態：已撰寫測試但未執行，本工作包未編譯、未做真 CLI 探測。待驗收：Claude/Grok matcher、回合與委託脈絡繼承、開單／核准／重試／單次使用、gateway 失聯的模式行為、Claude 借用工作目錄，以及 Codex 0.164.0 的網路／搜尋限制與 MCP 仍可用。
 
 ## 已知限制
 
 直接由 `[[mcp.external]]` 掛入 API 工具迴圈的工具（stdio、HTTP 與 Google 封閉橋接）也會經過檢查。這條路徑的工具登錄不保留 MCP annotations，因此全部保守視為 **Modify**；即使伺服器自述唯讀，讀過私人資料後仍可能要求外送核准，精確工具名稱的動作規則仍適用。MCP 代理與遠端橋接則保留原有 annotations 與 `trusted_read_hint_servers` 判定。
 
-這是每一輪的 MCP 邊界，不是網路沙箱。未發布的 E1 增加上述 CLI 內建工具檢查，並未提供整個 runtime 的網路隔離。提示中已有的私人資料、從範圍外工具取得的資料不會自動分類。新一輪使用新紀錄，不追蹤跨輪複製的資訊；gateway 重啟後不保留回合污點來源，但會恢復已持久化的外送 lease。「僅記錄」仍會允許外送。
+這是每一輪的 MCP 邊界，不是網路沙箱。CLI 內建工具檢查也涵蓋上述路徑，並未提供整個 runtime 的網路隔離。提示中已有的私人資料、從範圍外工具取得的資料不會自動分類。新一輪使用新紀錄，不追蹤跨輪複製的資訊；gateway 重啟後不保留回合污點來源，但會恢復已持久化的外送 lease。「僅記錄」仍會允許外送。
 
 另見[安全防護](05-security-defense.md)與[儀表板設定](../../guides/dashboard-settings.md)。
 
-驗證範圍：自動化測試涵蓋分類、閘門與核准行為。尚未使用實際員工與外部服務完成端到端驗證。
 
 直接外部連線的 scoped／closed 操作可能比核准卡更早逾時。逾時後再核准不會重新執行，必須重新提出工具呼叫；舊卡片可能持續顯示待核准，直到卡片上的期限。
 
@@ -122,7 +120,7 @@ E1 驗證狀態：已撰寫測試但未執行，本工作包未編譯、未做�
 
 Remote bridge 使用每次呼叫獨有的 generation wire ID，丟棄過期回覆，避免重用原始 ID 時，舊回覆提早結束新的外送 lease。呼叫端若使用保留的 `duduclaw-egress:` ID 命名空間，會收到明確拒絕。
 
-## 由伺服器綁定收件對象（未發行 E2）
+## 由伺服器綁定收件對象（未發行）
 
 收件對象防護不以「讀過私人資料」為前提。`config.toml [security] recipient_guard` 支援 `off`、`shadow`（預設）與 `ask`；未知值會警告並採用 `ask`。員工層 `[capabilities] recipient_guard` 只能收緊全域設定（`off < shadow < ask`）。安全頁「資料外送防護」可調整全域設定；Admin 可在員工編輯頁「工具與權限 → 允許的收件對象」設定額外清單。
 
@@ -155,6 +153,6 @@ recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
 
 實際傳送地址不能用對話後綴冒充清單中的收件人；Discord 通知 thread 會連同父頻道一起檢查。`update_cron_task` 修改通知目的地時，必須同時提供 `notify_channel` 與 `notify_chat_id`，空值配對可清除通知；任務與路由欄位一併原子寫入。等待其他核准後會再檢查收件權限。臨時助手繼承父員工的收件防護模式與設定清單，已驗證 owner 綁定仍以各員工為準。
 
-E2 驗證狀態：已撰寫測試，但 **not run**。未編譯，獨立安全審查與 Claude／Codex 真實驗收仍待完成。這是產品路徑的防護，不隔離具有同一使用者無限制檔案或網路權限的程序。
+這項防護只涵蓋產品路徑，無法隔離具有同一使用者無限制檔案或網路權限的程序。
 
 具有無限制 Bash 權限的員工與系統以同一個 OS 使用者執行，可以修改本機政策或繞過 MCP 傳送路徑；收件對象防護無法阻止。即使 `egress_guard` 為 off 或 shadow，只要員工有效的 `recipient_guard` 為 `ask`，安全頁也會列出可用 Bash 且未開啟任務沙箱的員工。

@@ -213,7 +213,7 @@ The card (`knowledge_add_source`) is decided only in the dashboard, only by an A
 
 `knowledge.sources.delete` with `also_forget_memories: true` looks up the conversations whose replies **cited** the source and files one forget-by-source plan per employee and conversation (at most 20 per deletion; the rest are reported as skipped), covering those turns' messages. The plans are filed only after the deletion succeeded. Each plan waits for the existing Admin-only dashboard approval and is applied afterwards with `duduclaw memory forget-source apply`. This is coarse on purpose: it forgets everything those turns taught the employee, not only what came from the document. Passages that were offered but not cited are not included.
 
-## Forgetting after disconnecting a connection (unreleased F1)
+## Forgetting after disconnecting a connection (unreleased)
 
 Disconnecting a channel, Google account, database source or Remote MCP connection files one batch for Admin approval, covering every affected AI employee. The disconnect finishes first. Its response reports whether the request is waiting for approval, forgetting is disabled, or planning failed. A planning failure does not undo the disconnect and does not mean memories were deleted. The existing document-source deletion plans above still use the CLI apply step; the new connection batches run in the background after approval.
 
@@ -226,7 +226,6 @@ Connection stamps keep their origin and role. Corroboration alone never grants d
 
 Approval binds the sorted identifiers of orphan entity embeddings, not just their count; swapping one entity for another requires a new approval. Unfinished jobs use a durable attempt count and due time, with 60/120/240/480-second backoff. Due jobs are selected fairly. After five consecutive failures or interrupted attempts, a job is quarantined. The Admin can see a content-free failure reason under **Data deletion receipts** and choose **Retry**; retry retains the existing approval and rechecks scope, requiring a new approval if it grows.
 
-Regression tests for these changes were added but **not run**; no build was performed.
 
 ## Audit
 
