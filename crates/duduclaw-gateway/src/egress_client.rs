@@ -307,7 +307,24 @@ async fn exchange(
     exchange_with_read(home, agent, turn, op, source, reservation, payload, None).await
 }
 
+pub use crate::recipient_guard::RecipientContext;
+
+/// The opaque turn id is the only caller-supplied recipient context.
+pub async fn recipients(home: &Path, agent: &str) -> Result<RecipientContext, String> {
+    let turn = read_turn_id(checked_turn_id())?;
+    let value = exchange_value(home, agent, &turn, "recipients", None, None, None, None).await?;
+    serde_json::from_value(value).map_err(|_| "invalid recipient context".into())
+}
+
 async fn exchange_with_read(
+    home: &Path, agent: &str, turn: &str, op: &str,
+    source: Option<&str>, reservation: Option<&str>, payload: Option<bool>, own_read: Option<&str>,
+) -> Result<Taint, String> {
+    let value = exchange_value(home, agent, turn, op, source, reservation, payload, own_read).await?;
+    parse_taint(value)
+}
+
+async fn exchange_value(
     home: &Path,
     agent: &str,
     turn: &str,
@@ -316,7 +333,7 @@ async fn exchange_with_read(
     reservation: Option<&str>,
     payload: Option<bool>,
     own_read: Option<&str>,
-) -> Result<Taint, String> {
+) -> Result<serde_json::Value, String> {
     let key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).map_err(|_| "missing gateway key")?;
     let token =
         std::env::var(duduclaw_core::ENV_AGENT_TOKEN).map_err(|_| "missing employee token")?;
@@ -324,6 +341,7 @@ async fn exchange_with_read(
         return Err("missing or invalid identity".into());
     }
     let route = match op {
+        "recipients" => crate::egress_guard::RECIPIENTS_ROUTE,
         "mark" => crate::egress_guard::MARK_ROUTE,
         "reserve" => crate::egress_guard::RESERVE_ROUTE,
         "finish" => crate::egress_guard::FINISH_ROUTE,
@@ -382,9 +400,10 @@ async fn exchange_with_read(
         }
         bytes.extend_from_slice(&chunk);
     }
-    interpret(&key, agent, &token, &nonce, &signature, &bytes)
+    interpret_value(&key, agent, &token, &nonce, &signature, &bytes)
 }
 
+#[cfg(test)]
 fn interpret(
     key: &str,
     agent: &str,
@@ -393,6 +412,12 @@ fn interpret(
     signature: &str,
     bytes: &[u8],
 ) -> Result<Taint, String> {
+    parse_taint(interpret_value(key, agent, token, nonce, signature, bytes)?)
+}
+
+fn interpret_value(
+    key: &str, agent: &str, token: &str, nonce: &str, signature: &str, bytes: &[u8],
+) -> Result<serde_json::Value, String> {
     if !duduclaw_core::verify_internal_request_signature(
         key.as_bytes(),
         agent,
@@ -408,7 +433,11 @@ fn interpret(
     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
         return Err(duduclaw_core::truncate_bytes(error, 1024).into());
     }
-    let state: Taint = serde_json::from_slice(bytes).map_err(|_| "invalid gateway response")?;
+    Ok(value)
+}
+
+fn parse_taint(value: serde_json::Value) -> Result<Taint, String> {
+    let state: Taint = serde_json::from_value(value).map_err(|_| "invalid gateway response")?;
     if state.tainted == state.sources.is_empty()
         || state.sources.len() > 514
         || state

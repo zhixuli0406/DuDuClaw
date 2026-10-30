@@ -135,6 +135,25 @@ describe('SecurityPage', () => {
 });
 
 
+describe('Recipient guard setting', () => {
+  it('defaults to shadow and writes only the recipient setting', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\n', success: true });
+    renderWithProviders(<SecurityPage />);
+    const select = await screen.findByLabelText('Recipient guard');
+    await waitFor(() => expect(select).toHaveValue('shadow'));
+    fireEvent.change(select, { target: { value: 'ask' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save outgoing data guard' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('system.update_config', { security: { recipient_guard: 'ask' } }));
+  });
+
+  it('shows an unknown configured recipient mode as ask', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\nrecipient_guard="unknown"' });
+    renderWithProviders(<SecurityPage />);
+    const select = await screen.findByLabelText('Recipient guard');
+    await waitFor(() => expect(select).toHaveValue('ask'));
+  });
+});
+
 describe('Egress guard setting', () => {
   it('defaults to shadow and writes only the chosen security setting', async () => {
     mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\n', success: true });
@@ -160,6 +179,27 @@ describe('Egress Bash exposure notice', () => {
     expect(screen.getByText('restricted-worker · Block sending')).toBeInTheDocument();
     expect(screen.getByText(/Bash hooks are a speed bump and telemetry/)).toBeInTheDocument();
     expect(screen.getByText(/task sandbox covers delegated tasks only/)).toBeInTheDocument();
+  });
+
+  // Not run: builds and tests are prohibited on the memory-constrained host.
+  it('shows recipient-only ask exposure when outgoing data guard is off', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...SECURITY_RESPONSE,
+      config: '[security]\negress_guard="off"\nrecipient_guard="ask"',
+      egress_bash_exposure: [{ agent_id: 'recipient-worker', mode: 'ask' }],
+    });
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByText('recipient-worker · Ask before sending')).toBeInTheDocument();
+    expect(screen.getByText(/Bash hooks are a speed bump and telemetry/)).toBeInTheDocument();
+  });
+
+  // Not run: builds and tests are prohibited on the memory-constrained host.
+  it('reports unavailable exposure data when only recipient guard enforces', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...SECURITY_RESPONSE, config: '[security]\negress_guard="off"\nrecipient_guard="ask"',
+    });
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByText(/Could not verify which employees/)).toBeInTheDocument();
   });
 
   it('does not show a warning when the server reports no exposed employees', async () => {

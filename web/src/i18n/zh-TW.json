@@ -9092,7 +9092,16 @@
   "security.egress.limits": "涵蓋平台與代理 MCP 工具，以及 Claude、Grok 的 WebFetch、WebSearch 和可辨識的 Bash 網路指令。Codex 在詢問／阻擋模式啟動時限制網路。內建讀檔不會標記私人資料；通用 CLI 仍未涵蓋。僅記錄模式仍允許執行。",
   "security.egress.loadFailed": "無法載入設定，請重新整理後再修改。",
   "security.egress.save": "儲存外送防護設定",
-  "security.egress.bashWarning": "下列員工使用詢問或阻擋模式，但仍可使用 Bash 且未開啟任務沙箱。Bash hook 是減速帶與遙測；需要隔離時，請移除 Bash 權限或使用任務沙箱。",
+  "security.egress.bashWarning": "下列員工的資料外送防護為詢問或阻擋，或收件對象防護為詢問，但仍可使用 Bash 且未開啟任務沙箱。Bash hook 是減速帶與遙測；需要隔離時，請移除 Bash 權限或使用任務沙箱。",
   "security.egress.sandboxScope": "任務沙箱僅涵蓋派工任務；通道回覆、排程及其他主機執行路徑仍在沙箱外。",
-  "security.egress.exposureUnavailable": "無法確認哪些員工可使用 Bash 且未開啟任務沙箱，請重新整理後檢查員工權限。"
+  "security.egress.exposureUnavailable": "無法確認哪些員工可使用 Bash 且未開啟任務沙箱，請重新整理後檢查員工權限。",
+  "security.recipient.mode": "收件對象防護",
+  "security.recipient.description": "允許傳送到本回合來源對話、已驗證的擁有者與員工的允許清單。其他對象在「僅記錄」模式留下紀錄，在「先詢問」模式需要 Admin 核准。排程通知沒有來源對話。",
+  "agents.recipients.title": "允許的收件對象",
+  "agents.recipients.description": "本回合來源對話與已驗證的擁有者會自動納入。主動通知設定的對象不會因此取得傳送許可。",
+  "agents.recipients.modeHelp": "此設定只能比全域收件對象防護更嚴格。",
+  "agents.recipients.inherit": "沿用全域最低要求",
+  "agents.recipients.list": "額外允許的對象",
+  "agents.recipients.listHelp": "逐一加入完整的通道與對象，例如 line:U123、telegram:456 或 mail:ops@example.com。只有 Admin 可以修改。",
+  "approval.grant.reasonRecipient": "目標不是來源對話，也不在允許清單中"
 }

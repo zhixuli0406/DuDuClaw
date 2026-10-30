@@ -735,6 +735,18 @@ async fn execute_cron_task(
     trigger_message: Option<&str>,
     invoker: &dyn AgentInvoker,
 ) {
+    let mut resolved_task = task.clone();
+    resolved_task.agent_id = match crate::recipient_guard::scheduled_agent(registry, &task.agent_id).await {
+        Ok(agent) => agent,
+        Err(error) => {
+            warn!(id = %task.id, %error, "cron recipient identity unavailable");
+            if let Err(record_error) = store.record_run(&task.id, false, Some(&error)).await {
+                warn!(id = %task.id, %record_error, "failed to record cron identity failure");
+            }
+            return;
+        }
+    };
+    let task = &resolved_task;
     // RFC-23 `[redaction.sources] cron_context` (v1.68.0): the trigger
     // context a condition script produced is data, like a tool result, and
     // is redacted before it reaches the model (default mode `on`). The task
@@ -1002,6 +1014,16 @@ async fn deliver_cron_result(
     // Prefix a one-line header so the user can tell scheduled messages
     // apart from interactive replies at a glance.
     let body = format!("⏰ [{}] {}", task.name, message);
+
+    let mut recipients = vec![duduclaw_core::recipient_policy::channel_recipient(channel, chat_id)
+        .unwrap_or_default()];
+    if channel == "discord" && effective_chat_id != chat_id {
+        recipients.push(duduclaw_core::recipient_policy::channel_recipient("discord", &effective_chat_id)
+            .unwrap_or_default());
+    }
+    crate::recipient_guard::admit_scheduled(home_dir, &task.agent_id, &recipients,
+        serde_json::json!({"task_id": task.id, "channel": channel, "chat_id": chat_id,
+            "thread_id": task.notify_thread_id, "text": body})).await?;
 
     let target = crate::channel_sender::ChannelTarget {
         channel_type: channel.to_string(),

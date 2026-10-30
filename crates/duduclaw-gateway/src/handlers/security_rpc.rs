@@ -48,6 +48,8 @@ impl MethodHandler {
             let cfg = &a.config;
             let agent_dir = self.home_dir.join("agents").join(&cfg.agent.name);
             let mode = duduclaw_core::egress_guard::effective_mode(&self.home_dir, Some(&agent_dir));
+            let recipient = duduclaw_core::recipient_policy::load(&self.home_dir, Some(&agent_dir));
+            let mode = bash_notice_mode(mode, recipient.mode);
             egress_bash_exposed(mode, &cfg.capabilities, cfg.container.sandbox_enabled).then(|| json!({
                 "agent_id": cfg.agent.name,
                 "mode": if mode == duduclaw_core::egress_guard::Mode::Ask { "ask" } else { "block" },
@@ -469,6 +471,16 @@ impl MethodHandler {
     }
 }
 
+fn bash_notice_mode(
+    mode: duduclaw_core::egress_guard::Mode,
+    recipient_mode: duduclaw_core::recipient_policy::Mode,
+) -> duduclaw_core::egress_guard::Mode {
+    use duduclaw_core::egress_guard::Mode;
+    if recipient_mode == duduclaw_core::recipient_policy::Mode::Ask && !matches!(mode, Mode::Ask | Mode::Block) {
+        Mode::Ask
+    } else { mode }
+}
+
 fn egress_bash_exposed(
     mode: duduclaw_core::egress_guard::Mode,
     capabilities: &duduclaw_core::types::CapabilitiesConfig,
@@ -495,6 +507,23 @@ mod egress_tests {
     use super::*;
     use duduclaw_core::egress_guard::Mode;
     use duduclaw_core::types::CapabilitiesConfig;
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[test]
+    fn recipient_ask_also_lists_bash_exposure() {
+        use duduclaw_core::recipient_policy::Mode as RecipientMode;
+        let mut caps = CapabilitiesConfig::default();
+        for mode in [Mode::Off, Mode::Shadow, Mode::Ask, Mode::Block] {
+            let notice = bash_notice_mode(mode, RecipientMode::Ask);
+            assert!(egress_bash_exposed(notice, &caps, false));
+            assert!(!egress_bash_exposed(notice, &caps, true));
+            for recipient in [RecipientMode::Off, RecipientMode::Shadow] {
+                assert_eq!(bash_notice_mode(mode, recipient), mode);
+            }
+        }
+        caps.denied_tools = vec!["Bash".into()];
+        assert!(!egress_bash_exposed(bash_notice_mode(Mode::Off, RecipientMode::Ask), &caps, false));
+    }
 
     #[test]
     fn egress_notice_uses_effective_mode_sandbox_and_capabilities() {

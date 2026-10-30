@@ -684,6 +684,36 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(screen.queryByTestId('approval-full-content')).not.toBeInTheDocument();
   });
 
+  it.each([false, true])('shows recipient and egress reasons on one card (egress=%s)', (hasPrivateRead) => {
+    const approval = genericApproval({
+      payload: {
+        name: 'send_message', arguments: { channel: 'line', chat_id: 'third-party', text: 'message' },
+        recipient_guard: { reason: 'outside_allowed_recipients' },
+        egress_guard: { reason: hasPrivateRead ? 'egress_guard' : 'recipient_guard', sources: hasPrivateRead ? ['mail_read'] : [] },
+        action_grant: { tool: 'send_message', effect: 'send', args_digest: 'abc123', args_summary: [] },
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getAllByTestId('action-grant')).toHaveLength(1);
+    const box = screen.getByTestId('action-grant');
+    expect(box).toHaveTextContent('The target is neither the source conversation nor on the allowed list');
+    if (hasPrivateRead) expect(box).toHaveTextContent('Private data was read during this turn');
+    else expect(box).not.toHaveTextContent('Private data was read during this turn');
+    expect(within(box).getByTestId('approval-full-content')).toHaveTextContent('third-party');
+  });
+
+  it('shows the nested recipient reason carried by workflow approvals', () => {
+    const approval = genericApproval({ payload: {
+      name: 'update_cron_task', arguments: { notify_channel: 'line', notify_chat_id: 'third-party' },
+      egress_guard: { reason: 'recipient_guard', sources: [], recipient_guard: { reason: 'outside_allowed_recipients' } },
+      action_grant: { tool: 'update_cron_task', effect: 'modify', args_digest: 'abc123', args_summary: [] },
+    } });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const box = screen.getByTestId('action-grant');
+    expect(box).toHaveTextContent('neither the source conversation nor on the allowed list');
+    expect(box).not.toHaveTextContent('Private data was read during this turn');
+  });
+
   it('shows both egress and matching action-rule reasons on one approval', () => {
     const approval = genericApproval({
       payload: {

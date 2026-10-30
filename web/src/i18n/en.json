@@ -9092,7 +9092,16 @@
   "security.egress.limits": "Covers platform and proxied MCP tools, plus Claude and Grok WebFetch, WebSearch and recognized Bash network commands. Codex network access is restricted at launch in ask/block mode. Native file reads do not mark a turn as private; generic CLIs remain uncovered. Observation still allows calls.",
   "security.egress.loadFailed": "Could not load the setting. Reload before making changes.",
   "security.egress.save": "Save outgoing data guard",
-  "security.egress.bashWarning": "These employees can use Bash without the task sandbox while outgoing data guard is set to ask or block. Bash hooks are a speed bump and telemetry; remove Bash access or use the task sandbox for containment.",
+  "security.egress.bashWarning": "These employees can use Bash without the task sandbox while outgoing data guard is set to ask or block, or recipient guard is set to ask. Bash hooks are a speed bump and telemetry; remove Bash access or use the task sandbox for containment.",
   "security.egress.sandboxScope": "The task sandbox covers delegated tasks only. Channel replies, schedules and other host execution paths remain outside it.",
-  "security.egress.exposureUnavailable": "Could not verify which employees have Bash without the task sandbox. Reload to check their permissions."
+  "security.egress.exposureUnavailable": "Could not verify which employees have Bash without the task sandbox. Reload to check their permissions.",
+  "security.recipient.mode": "Recipient guard",
+  "security.recipient.description": "Allow the current conversation, verified owners and this employee’s allowed recipients. Other destinations are recorded in observe-only mode or require an Admin’s approval in ask mode. Scheduled notifications have no source conversation.",
+  "agents.recipients.title": "Allowed recipients",
+  "agents.recipients.description": "The current conversation and verified owners are included automatically. Proactive notification targets do not grant permission to send.",
+  "agents.recipients.modeHelp": "This setting can only make the global recipient guard stricter.",
+  "agents.recipients.inherit": "Use global minimum",
+  "agents.recipients.list": "Additional recipients",
+  "agents.recipients.listHelp": "Add exact channel and recipient pairs, such as line:U123, telegram:456 or mail:ops@example.com. Only an Admin can change this list.",
+  "approval.grant.reasonRecipient": "The target is neither the source conversation nor on the allowed list"
 }

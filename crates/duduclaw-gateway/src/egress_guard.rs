@@ -27,6 +27,7 @@ use crate::computer_use_sessions::auth::{
 };
 
 pub const MARK_ROUTE: &str = "/api/internal/egress-guard/mark";
+pub const RECIPIENTS_ROUTE: &str = "/api/internal/recipient-guard/query";
 pub const QUERY_ROUTE: &str = "/api/internal/egress-guard/query";
 pub const RESERVE_ROUTE: &str = "/api/internal/egress-guard/reserve";
 pub const FINISH_ROUTE: &str = "/api/internal/egress-guard/finish";
@@ -542,6 +543,7 @@ pub fn router(state: Arc<RouteState>) -> Router {
     Router::new()
         .route(MARK_ROUTE, post(mark))
         .route(QUERY_ROUTE, post(query))
+        .route(RECIPIENTS_ROUTE, post(recipients))
         .route(RESERVE_ROUTE, post(reserve))
         .route(FINISH_ROUTE, post(finish))
         .route(ACQUIRE_SINK_ROUTE, post(acquire_sink))
@@ -567,6 +569,10 @@ async fn query(
     body: Bytes,
 ) -> Response {
     handle_async(state, peer, headers, body, "query").await
+}
+
+async fn recipients(State(state): State<Arc<RouteState>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes) -> Response {
+    handle_async(state, peer, headers, body, "recipients").await
 }
 
 async fn reserve(State(state): State<Arc<RouteState>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes) -> Response {
@@ -636,11 +642,11 @@ fn handle(
         return StatusCode::BAD_REQUEST.into_response();
     };
     if request.op != op || !(crate::computer_use_sessions::turns::valid_turn_id(&request.turn_id)
-        || (matches!(op, "reserve" | "acquire_sink" | "release_sink") && request.turn_id.is_empty())) {
+        || (matches!(op, "recipients" | "reserve" | "acquire_sink" | "release_sink") && request.turn_id.is_empty())) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let valid = match op {
-        "query" => request.source.is_none() && request.reservation.is_none() && request.payload.is_none(),
+        "query" | "recipients" => request.source.is_none() && request.reservation.is_none() && request.payload.is_none(),
         "mark" => request.source.as_deref().is_some_and(valid_source) && request.reservation.is_none() && request.payload.is_none(),
         "reserve" => request.source.as_deref().is_some_and(valid_source) && request.payload.is_none(),
         "finish" => request.source.is_none() && request.payload.is_some(),
@@ -682,25 +688,33 @@ fn handle(
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let turn_key = (caller.agent_id.clone(), request.turn_id);
-    let result = match ledger().lock() {
-        Ok(mut ledger) => {
-            let now = Instant::now();
-            match op {
-                "reserve" => ledger.reserve_with_policy(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.source.as_deref().unwrap(), now),
-                "acquire_sink" => ledger.acquire_persisted_sink(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.own_read.as_deref(), now, chrono::Utc::now().timestamp_millis()),
-                "release_sink" => Ok(ledger.release_sink(&turn_key, request.reservation.as_deref().unwrap(), now)),
-                "finish" => Ok(ledger.finish(&turn_key, request.reservation.as_deref().unwrap(), request.payload.unwrap(), now)),
-                "mark" => Ok(ledger.mark(&turn_key, request.source.as_deref().unwrap(), now)),
-                _ => Ok(ledger.query(&turn_key, now)),
-            }
-        },
-        Err(_) => Err("ledger unavailable".into()),
-    };
-    // Refusals are authenticated too: never trust an unsigned error message.
-    let value = match result {
-        Ok(taint) => serde_json::json!(taint),
-        Err(error) => serde_json::json!({"error": error}),
+    let value = if op == "recipients" {
+        match crate::recipient_guard::context(&state.home, &caller.agent_id, &request.turn_id) {
+            Ok(context) => serde_json::json!(context),
+            Err(error) => serde_json::json!({"error": error}),
+        }
+    } else {
+        let turn_key = (caller.agent_id.clone(), request.turn_id);
+        let result = match ledger().lock() {
+            Ok(mut ledger) => {
+                let now = Instant::now();
+                match op {
+                    "reserve" => ledger.reserve_with_policy(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.source.as_deref().unwrap(), now),
+                    "acquire_sink" => ledger.acquire_persisted_sink(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.own_read.as_deref(), now, chrono::Utc::now().timestamp_millis()),
+                    "release_sink" => Ok(ledger.release_sink(&turn_key, request.reservation.as_deref().unwrap(), now)),
+                    "finish" => Ok(ledger.finish(&turn_key, request.reservation.as_deref().unwrap(), request.payload.unwrap(), now)),
+                    "mark" => Ok(ledger.mark(&turn_key, request.source.as_deref().unwrap(), now)),
+                    _ => Ok(ledger.query(&turn_key, now)),
+                }
+            },
+            Err(_) => Err("ledger unavailable".into()),
+        };
+        // Refusals are authenticated too: never trust an unsigned error message.
+        let value = match result {
+            Ok(taint) => serde_json::json!(taint),
+            Err(error) => serde_json::json!({"error": error}),
+        };
+        value
     };
     let bytes = serde_json::to_vec(&value).expect("egress response serialization");
     let response_sig = duduclaw_core::internal_request_signature(
@@ -1745,4 +1759,46 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn recipient_route_authenticates_context_and_rejects_caller_source_fields() {
+        use crate::computer_use_sessions::auth::{AGENT_ID_HEADER, NONCE_HEADER};
+        use duduclaw_knowledge::requester::RequesterIdentity;
+        let home = policy_home("shadow");
+        let identity = duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key(home.path()).unwrap();
+        let state = RouteState::new(home.path().into());
+        let agent = "recipient-route-bot";
+        let token = duduclaw_core::mint_identity_token(&identity, agent);
+        let _turn = crate::turn_context::register(agent, "live", "line:source#agent:recipient-route-bot").unwrap();
+        let _requester = crate::knowledge::turn_requesters::register(agent, "live",
+            RequesterIdentity::ChannelUser {channel:"line".into(),chat:"source".into(),sender:"person".into(),user_id:None}).unwrap();
+        for (turn, forged_source, expected) in [("live", false, Some("line:source")), ("unknown", false, None), ("", false, None), ("live", true, None)] {
+            let mut request = serde_json::json!({"op":"recipients", "turn_id":turn});
+            if forged_source { request["source"] = serde_json::json!("line:forged"); }
+            let body = serde_json::to_vec(&request).unwrap();
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let signature = duduclaw_core::internal_request_signature(api_key.as_bytes(), agent, &token, &timestamp, &nonce, &body);
+            let mut headers = HeaderMap::new();
+            for (name, value) in [(AGENT_ID_HEADER, agent), (TIMESTAMP_HEADER, timestamp.as_str()),
+                (NONCE_HEADER, nonce.as_str()), (SIGNATURE_HEADER, signature.as_str())] {
+                headers.insert(name, value.parse().unwrap());
+            }
+            let response = handle(&state, "127.0.0.1:50001".parse().unwrap(), &headers, &body, "recipients");
+            if forged_source {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::OK);
+            let signature = response.headers()[duduclaw_core::egress_guard::RESPONSE_SIGNATURE_HEADER].to_str().unwrap().to_string();
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            assert!(duduclaw_core::verify_internal_request_signature(api_key.as_bytes(), agent, &token,
+                duduclaw_core::egress_guard::RESPONSE_DOMAIN, &nonce, &bytes, &signature));
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["source"].as_str(), expected);
+            assert_eq!(value["owners"], serde_json::json!([]));
+            assert_eq!(handle(&state, "127.0.0.1:50001".parse().unwrap(), &headers, &body, "recipients").status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
 }

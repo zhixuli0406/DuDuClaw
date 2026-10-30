@@ -441,6 +441,12 @@ impl ThirdPartyGate {
                 }
             }
         }
+        if let Err(reason) = crate::recipient_guard::confirm_unadapted_effect(
+            &self.home, &self.agent_id, &label, self.decide(tool).0, approved.as_ref(),
+        ) {
+            call.finish_empty().await;
+            return Err(reason);
+        }
         if Instant::now() >= call.deadline {
             call.finish_empty().await;
             return Err("Private read expired before dispatch".into());
@@ -513,7 +519,8 @@ impl ThirdPartyGate {
                 .unwrap_or_else(|| "Tool policy changed; retry the call.".into()));
         }
         let label = format!("{}.{tool}", self.server);
-        let egress = crate::egress_gate::check(&self.home, &self.agent_id, &label, effect != ToolEffect::Read).await?;
+        let mut egress = crate::egress_gate::check(&self.home, &self.agent_id, &label, effect != ToolEffect::Read).await?;
+        crate::recipient_guard::merge_unadapted_effect(&self.home, &self.agent_id, &label, effect, &mut egress);
         if decision == ThirdPartyDecision::Ask || egress.is_some() {
             self.ask_bound(tool, effect, args, egress).await
         } else { Ok(()) }
@@ -534,7 +541,8 @@ impl ThirdPartyGate {
                 .unwrap_or_else(|| "Tool policy changed; retry the call.".into()));
         }
         let label = format!("{}.{tool}", self.server);
-        let egress = crate::egress_gate::evaluate_with_call(&self.home, &self.agent_id, &label, effect != ToolEffect::Read, taint, call_id)?;
+        let mut egress = crate::egress_gate::evaluate_with_call(&self.home, &self.agent_id, &label, effect != ToolEffect::Read, taint, call_id)?;
+        crate::recipient_guard::merge_unadapted_effect(&self.home, &self.agent_id, &label, effect, &mut egress);
         if decision == ThirdPartyDecision::Ask || egress.is_some() {
             self.ask_bound(tool, effect, args, egress.clone()).await?;
         }
@@ -551,7 +559,7 @@ impl ThirdPartyGate {
             "third_party": true, "arguments": args,
             "reason": if egress.is_some() { "egress_guard" } else { "action_rule" }
         }), duduclaw_core::host_task_id().as_deref());
-        if let Some(reason) = egress { payload["egress_guard"] = reason; }
+        if let Some(reason) = egress.as_ref() { payload["egress_guard"] = reason.clone(); }
         payload["action_rule_matches"] = json!(self.policy().rules.approval_matches_for_call(
             &duduclaw_core::tool_effect::third_party_tool_ref(&self.server, tool), effect, args,
         ));
@@ -561,8 +569,13 @@ impl ThirdPartyGate {
         let summary = format!("工具「{label}」需要管理員確認完整內容與目的地（{}）。", payload["reason"].as_str().unwrap_or("action_rule"));
         let id = broker.request(&self.agent_id, "mcp_call", &summary, payload, APPROVAL_TTL_SECONDS).await?;
         match broker.await_decision(&id, APPROVAL_POLL).await {
-            Ok(ApprovalStatus::Approved) => verify_and_consume(&broker, &id, &grant).await
-                .map_err(|e| format!("Approval binding refused: {e:?}")),
+            Ok(ApprovalStatus::Approved) => {
+                crate::recipient_guard::confirm_unadapted_effect(
+                    &self.home, &self.agent_id, &label, self.decide(tool).0, egress.as_ref(),
+                )?;
+                verify_and_consume(&broker, &id, &grant).await
+                    .map_err(|e| format!("Approval binding refused: {e:?}"))
+            }
             _ => Err(format!("工具「{label}」未獲核准，已拒絕。")),
         }
     }
@@ -799,6 +812,53 @@ mod tests {
 
     fn names(v: &Value) -> Vec<&str> {
         v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect()
+    }
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[tokio::test]
+    async fn third_party_recipient_shadow_records_and_off_adds_no_approval() {
+        let home = home_with_rules("[capabilities]\n");
+        let gate = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "bridge", ProcessLane::Normal);
+        for mode in ["off", "shadow"] {
+            std::fs::write(home.path().join("config.toml"), format!("[security]\negress_guard='off'\nrecipient_guard='{mode}'\n")).unwrap();
+            assert!(gate.check_call_with_taint("unknown_send", &json!({"to":"line:visitor"}),
+                crate::egress_guard::Taint { tainted: false, sources: vec![] }).await.unwrap().is_none());
+            assert!(!home.path().join("approvals.db").exists());
+            assert_eq!(home.path().join("tool_calls.jsonl").exists(), mode == "shadow");
+        }
+        let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(row["recipient_guard"], "would_ask");
+    }
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[tokio::test]
+    async fn recipient_guard_requires_admin_for_clean_third_party_effects() {
+        use crate::approval::ApprovalBroker;
+        let home = home_with_rules("[capabilities]\ntrusted_read_hint_servers=['crm']\n");
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\nrecipient_guard='ask'\n").unwrap();
+        let gate = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "proxy", ProcessLane::Normal);
+        gate.filter_list_result(&mut listing());
+        assert!(gate.check_call_with_taint("get", &json!({}), crate::egress_guard::Taint { tainted: false, sources: vec![] }).await.unwrap().is_none());
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let args = json!({"to":"line:visitor", "body":"hello"});
+        let call = gate.check_call_with_taint("put", &args, crate::egress_guard::Taint { tainted: false, sources: vec![] });
+        let decision = async {
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(request) = broker.list_pending(Some("a1")).await.unwrap().into_iter().next() {
+                        break request;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            assert_eq!(request.payload["arguments"], args);
+            assert!(request.payload["egress_guard"]["recipient_guard"].is_object());
+            assert!(broker.decide(&request.id, true, "channel:admin").await.is_err());
+            broker.decide_egress_dashboard(&request.id, &duduclaw_auth::UserContext::admin_fallback(), true).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(call, decision);
+        assert!(result.unwrap().unwrap()["recipient_guard"].is_object());
     }
 
     #[tokio::test]

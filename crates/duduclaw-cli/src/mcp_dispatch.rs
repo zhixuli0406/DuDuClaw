@@ -936,6 +936,7 @@ impl McpDispatcher {
         let mut params_owned = params.clone();
         if let Some(obj) = params_owned.as_object_mut() {
             obj.remove("egress_guard");
+            obj.remove("recipient_guard");
             obj.remove("reason");
             obj.remove("action_grant");
             obj.remove("action_rule_matches");
@@ -1615,6 +1616,7 @@ impl McpDispatcher {
         // policy/redaction rewrites to the existing single-use approval.
         if let Some(obj) = params_owned.as_object_mut() {
             obj.remove("egress_guard");
+            obj.remove("recipient_guard");
         }
         let sink = matches!(
                 duduclaw_core::tool_effect::effect_of_call(tool_name, params_owned.get("arguments").unwrap_or(&Value::Null)),
@@ -1642,6 +1644,14 @@ impl McpDispatcher {
                     return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                 }
             }
+        }
+
+        if let Some(reason) = crate::mcp::recipient_gate::check(
+            &self.home_dir, gate_agent, tool_name,
+            params_owned.get("arguments").unwrap_or(&Value::Null),
+            employee_policy_applies, !principal.is_external,
+        ).await {
+            crate::mcp::recipient_gate::merge_reason(&mut params_owned, reason);
         }
 
         // ── 3.7 Install / operator-required approval (WP5 elevation, I3) ─────
@@ -1746,6 +1756,12 @@ impl McpDispatcher {
             {
                 return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
             }
+        }
+        if let Err(message) = crate::mcp::recipient_gate::confirm_dispatch(
+            &self.home_dir, gate_agent, tool_name, &params_owned,
+            employee_policy_applies, !principal.is_external,
+        ).await {
+            return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
         }
         let effect_observation = Arc::new(std::sync::Mutex::new(
             crate::mcp::workflow_operation::HandlerObservation::RejectedBeforeEffect,
@@ -2181,6 +2197,37 @@ mod tests {
         assert_eq!(record.payload["egress_guard"]["sources"], serde_json::json!(["turn_state_unavailable"]));
         assert!(record.payload.get("action_grant").is_some());
         assert_eq!(response["error"]["code"], -32003);
+    }
+
+    #[tokio::test]
+    async fn recipient_and_egress_share_one_admin_bound_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='ask'\nrecipient_guard='ask'\n").unwrap();
+        write_acting_agent_toml(&tmp, "[capabilities]\n");
+        let args = serde_json::json!({"channel":"line","chat_id":"unlisted","text":"完整內容"});
+        let (record, response) = dispatch_held_then_decide(&tmp, internal_principal(), "send_message", args.clone(), false).await;
+        assert_eq!(record.payload["recipient_guard"]["reason"], "outside_allowed_recipients");
+        assert_eq!(record.payload["egress_guard"]["recipient_guard"], record.payload["recipient_guard"]);
+        assert_eq!(record.payload["egress_guard"]["sources"], serde_json::json!(["turn_state_unavailable"]));
+        assert_eq!(record.payload["action_grant"]["args_digest"],
+            duduclaw_gateway::approval::action_grant::args_digest("dudu", "send_message", &args));
+        assert_eq!(response["error"]["code"], -32003);
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        assert_eq!(broker.list_by_kind("mcp_call").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recipient_shadow_ignores_model_markers_and_does_not_ask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\nrecipient_guard='shadow'\n").unwrap();
+        let mut params = make_params("send_message", serde_json::json!({"channel":"invalid","chat_id":"third-party","text":"hi"}));
+        params["recipient_guard"] = serde_json::json!({"reason":"forged"});
+        params["egress_guard"] = serde_json::json!({"recipient_guard":{"reason":"forged"}});
+        let _ = dispatcher.dispatch_tool_call(&internal_principal(), &make_ns_ctx(false), &params, &serde_json::json!(92)).await;
+        assert_eq!(read_tool_call_rows(&tmp).iter().filter(|row| row["recipient_guard"] == "would_ask").count(), 1);
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        assert!(broker.list_pending(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]

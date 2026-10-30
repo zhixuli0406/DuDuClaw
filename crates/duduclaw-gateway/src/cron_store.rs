@@ -506,6 +506,22 @@ impl CronStore {
         Ok(changed > 0)
     }
 
+    /// Atomically update editable fields and an explicitly supplied notification route.
+    pub async fn update_fields_with_notify(
+        &self, id: &str, name: &str, agent_id: &str, cron: &str, task: &str, enabled: bool,
+        notify_channel: Option<&str>, notify_chat_id: Option<&str>, notify_thread_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE cron_tasks SET name=?2, agent_id=?3, cron=?4, task=?5, enabled=?6,
+             notify_channel=?7, notify_chat_id=?8, notify_thread_id=?9, updated_at=?10 WHERE id=?1",
+            params![id, name, agent_id, cron, task, if enabled { 1 } else { 0 },
+                notify_channel, notify_chat_id, notify_thread_id, now],
+        ).map_err(|e| format!("update cron task and notification: {e}"))?;
+        Ok(changed > 0)
+    }
+
     /// Update just the `cron_timezone` column. Pass `None` to clear it
     /// (which reverts the row to UTC / legacy semantics).
     pub async fn update_cron_timezone(
@@ -1135,4 +1151,23 @@ mod tests {
         let again = store.migrate_from_jsonl(dir.path()).await.unwrap();
         assert_eq!(again, 0);
     }
+    #[tokio::test]
+    async fn fields_and_notification_update_together_and_can_clear() {
+        let dir = tempdir().unwrap();
+        let store = CronStore::open(dir.path()).unwrap();
+        let row = CronTaskRow::new("notify-atomic".into(), "Before".into(), "bot".into(), "0 9 * * *".into(), "before".into());
+        store.insert(&row).await.unwrap();
+        assert!(store.update_fields_with_notify(&row.id, "After", "bot", "0 10 * * *", "after", true,
+            Some("discord"), Some("chat"), Some("thread")).await.unwrap());
+        let updated = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(updated.name, "After");
+        assert_eq!(updated.task, "after");
+        assert_eq!(updated.notify_channel.as_deref(), Some("discord"));
+        assert_eq!(updated.notify_chat_id.as_deref(), Some("chat"));
+        assert_eq!(updated.notify_thread_id.as_deref(), Some("thread"));
+        store.update_fields_with_notify(&row.id, "Cleared", "bot", "0 10 * * *", "after", true,
+            None, None, None).await.unwrap();
+        assert!(!store.get(&row.id).await.unwrap().unwrap().has_notify_target());
+    }
+
 }

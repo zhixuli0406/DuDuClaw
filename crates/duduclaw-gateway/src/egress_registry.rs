@@ -59,6 +59,12 @@ impl ClientCallBoundary for RegistryBoundary {
                 return Err(reason);
             }
         };
+        if let Err(reason) = crate::recipient_guard::confirm_unadapted_effect(
+            &self.home, &self.agent, &label, duduclaw_core::ToolEffect::Modify, approved.as_ref(),
+        ) {
+            if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
+            return Err(reason);
+        }
         // Registry schemas do not retain annotations: every call is both a
         // private read and a conservative sink. Recheck after any approval wait.
         let (lease, taint) = match crate::egress_client::SinkLease::direct(

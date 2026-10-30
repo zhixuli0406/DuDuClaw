@@ -25,6 +25,29 @@ pub(crate) fn apply_capabilities_to_table(
         .as_table_mut()
         .ok_or_else(|| "Invalid [capabilities] section".to_string())?;
 
+    if let Some(value) = cap.get("recipient_guard") {
+        if value.is_null() || value.as_str() == Some("") {
+            section.remove("recipient_guard");
+            changes.push("capabilities.recipient_guard = inherit".into());
+        } else {
+            let mode = value.as_str().filter(|mode| matches!(*mode, "off" | "shadow" | "ask"))
+                .ok_or("recipient_guard must be one of: off, shadow, ask")?;
+            section.insert("recipient_guard".into(), toml::Value::String(mode.into()));
+            changes.push(format!("capabilities.recipient_guard = {mode}"));
+        }
+    }
+    if let Some(value) = cap.get("recipients") {
+        let entries = value.as_array().ok_or("recipients must be an array")?;
+        let mut recipients = Vec::new();
+        for entry in entries {
+            let recipient = entry.as_str().and_then(duduclaw_core::recipient_policy::normalize_recipient)
+                .ok_or("invalid recipient: use channel:identity")?;
+            recipients.push(toml::Value::String(recipient));
+        }
+        changes.push(format!("capabilities.recipients = [{} entries]", recipients.len()));
+        section.insert("recipients".into(), toml::Value::Array(recipients));
+    }
+
     // ── Scalars ──
     if let Some(v) = cap.get("computer_use").and_then(|v| v.as_bool()) {
         section.insert("computer_use".into(), toml::Value::Boolean(v));
@@ -480,4 +503,27 @@ pub(crate) fn apply_capabilities_to_table(
     }
 
     Ok(changes)
+}
+
+#[cfg(test)]
+mod recipient_tests {
+    use super::*;
+
+    #[test]
+    fn recipient_fields_are_validated_and_can_inherit_again() {
+        let mut table = toml::Table::new();
+        apply_capabilities_to_table(&mut table, &json!({"capabilities":{
+            "recipient_guard":"ask", "recipients":["line:U123", "mail:ops@example.com"]
+        }})).unwrap();
+        assert_eq!(table["capabilities"]["recipient_guard"].as_str(), Some("ask"));
+        assert_eq!(table["capabilities"]["recipients"].as_array().unwrap().len(), 2);
+        for value in [json!("block"), json!(true), json!([])] {
+            assert!(apply_capabilities_to_table(&mut table, &json!({"capabilities":{"recipient_guard":value}})).is_err());
+        }
+        for value in [json!("line:U123"), json!(["unknown:123"]), json!([true])] {
+            assert!(apply_capabilities_to_table(&mut table, &json!({"capabilities":{"recipients":value}})).is_err());
+        }
+        apply_capabilities_to_table(&mut table, &json!({"capabilities":{"recipient_guard":null}})).unwrap();
+        assert!(table["capabilities"].get("recipient_guard").is_none());
+    }
 }

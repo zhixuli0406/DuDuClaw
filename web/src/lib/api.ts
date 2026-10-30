@@ -4270,6 +4270,8 @@ export type AutonomyLevel = 'operator' | 'collaborator' | 'consultant' | 'approv
 /** The `capabilities` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present (partial update). */
 export interface AgentCapabilities {
+  recipient_guard?: 'off' | 'shadow' | 'ask';
+  recipients?: string[];
   computer_use?: boolean;
   computer_use_mode?: ComputerUseMode;
   browser_via_bash?: boolean;

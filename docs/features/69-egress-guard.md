@@ -100,6 +100,41 @@ Cron, dispatch, reminder, mail, heartbeat and ephemeral execution entry points n
 
 E1 validation status: tests were written but not run, and no compilation or live CLI probes were performed in this work package. Pending: Claude/Grok hook matching, inherited turn/principal context, approval/retry/single use, gateway-outage modes, Claude borrowed cwd, and Codex 0.164.0 network/search restrictions with MCP still working.
 
+## Server-bound recipients (unreleased E2)
+
+Recipient protection is independent of whether private data was read. Set `config.toml [security] recipient_guard` to `off`, `shadow` (default), or `ask`. An unknown value warns and behaves as `ask`. An employee's `[capabilities] recipient_guard` can only tighten the global setting (`off < shadow < ask`). In the dashboard, use Security → Outgoing data guard → Recipient guard; an Admin edits additional recipients under the employee's Tools & permissions → Allowed recipients.
+
+```toml
+# config.toml
+[security]
+recipient_guard = "shadow"
+
+# agents/<id>/agent.toml
+[capabilities]
+recipient_guard = "ask"
+recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+```
+
+The allowed set is the current turn's source conversation, verified owners and the employee's configured recipients. A channel turn contributes a source recipient only when its server-registered `ChannelUser` has a verified binding (`user_id: Some(_)`). Unbound LINE, Telegram and public web visitors contribute no source recipient for side-effect tools. In `ask` mode, a public employee's `send_message` to an unbound visitor requires Admin approval unless the recipient is independently allowed as a verified owner or configured recipient. The normal reply path is unaffected. The gateway resolves the source from its own turn table; MCP supplies only the opaque turn ID over a signed internal route. An unknown turn has no source conversation. `DUDUCLAW_REPLY_CHANNEL` does not grant recipient permission. Channel identities are normalized using the same conversation rules as `parse_origin` (employee suffixes and threads removed) and compared exactly.
+
+Owners come **only** from `users.db` bindings with `AccessLevel::Owner`, resolved to gateway-verified channel identities. `[proactive]` notification targets are employee-editable and never count as owners. An Admin who wants to allow one adds it to `[capabilities] recipients`. The entire capabilities table is already frozen against employee edits; that protection includes both new keys.
+
+| Mode | Target in the allowed set | Target outside the allowed set |
+|---|---|---|
+| `off` | Allow | Allow |
+| `shadow` | Allow | Allow and record `recipient_guard: "would_ask"` in `tool_calls.jsonl` |
+| `ask` | Allow | Require an Admin's single-use approval |
+
+The approval says that the target is neither the source conversation nor on the allowed list. When the outgoing-data guard also asks, one card lists both reasons. Its ActionGrant binds the employee, tool and complete arguments; changing the destination or content requires a new approval. Shadow mode never blocks a call because of its recipient.
+
+Covered targets: `send_message`, `send_photo`, `send_sticker`, `create_reminder`, `mail_send`, and `tasks_create` / `update_cron_task` notification fields (`notify_channel`, `notify_chat_id`, `notify_thread_id`). `calendar_create_event` attendees are checked as mail recipients. Scheduled notifications are checked at creation and again when firing against current settings; a scheduled fire has an empty source set, so only verified owners and the configured list qualify without approval.
+
+`responsibility_ask` addresses a server-routed approval, not a model-selected recipient. `os_notify` displays locally. `github_issue_comment` selects an issue resource rather than a channel recipient and remains subject to outgoing-data and action policies. `send_to_agent`, `spawn_agent` and `team_handoff` retain delegation policy. Third-party MCP tools without a recipient adapter require Admin approval in `ask` mode for Send, Publish and other effects that can send data out, independently of private reads. The third-party gate conservatively includes Modify, Delete, Purchase and Admin; trusted Read and Draft are exempt. Unknown tools have no trusted recipient extraction and fail closed. `shadow` records `recipient_would_ask` (`recipient_guard: "would_ask"`); `off` does not add a recipient approval. A parameter named `to` is not a trusted adapter.
+
+Raw send targets cannot use conversation suffixes to impersonate a permitted recipient. Discord notification threads are checked as actual destinations in addition to the parent channel. When changing `update_cron_task` routing, supply `notify_channel` and `notify_chat_id` together; an empty pair clears routing. Changes to the task and routing are saved atomically. The guard rechecks permission after other approval waits. Ephemeral helpers inherit the parent's recipient mode and configured list; verified owner bindings remain employee-specific.
+
+E2 validation: tests were written but **not run**. Compilation, independent security review and live Claude/Codex acceptance remain pending. This is a product-path guard; it does not isolate a process with unrestricted same-user filesystem or network access.
+
 ## Known limitations
 
 Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard. Their tool registry does not retain MCP annotations, so these calls are conservatively classified as **Modify**, even when the server describes them as read-only; exact per-tool action rules still apply. The MCP proxy and remote bridge retain their annotation-based decisions with `trusted_read_hint_servers`. A tainted direct-mounted read can therefore require outgoing approval.
@@ -121,3 +156,5 @@ The remote bridge uses generation-specific wire IDs and discards expired respons
 The proxy also bounds response-redaction contexts to 512 entries for five minutes, refuses duplicate IDs without replacing their context, and removes locally refused calls. Forwarded calls use unique wire IDs so late responses cannot use a newer call's redaction rules; expired responses are withheld. Completed call tasks are reaped continuously, with at most 512 active tasks.
 
 Built-in completion uses an exact list of checked handler contracts. Local mail drafts, task/agent queues and proposals complete when their durable admission finishes. Errors retain the fence conservatively. `model_search`, `model_download`, `skill_search`, `codrive_run`, `browser_record_start` and `os_open` also retain it until the lease TTL even after an apparent success: their reports, fallback attempts or background work do not confirm every outgoing action has ended.
+
+An employee with unrestricted Bash runs as the same OS user and can alter local policy or bypass the MCP send path. Recipient guard does not prevent this. The Security page also lists employees with Bash and no task sandbox when their effective `recipient_guard` is `ask`, even if `egress_guard` is off or shadow.

@@ -9092,7 +9092,16 @@
   "security.egress.limits": "プラットフォームとプロキシの MCP ツール、および Claude・Grok の WebFetch、WebSearch と識別できる Bash ネットワークコマンドが対象です。Codex は確認／拒否モードで起動時にネットワークを制限します。標準のファイル読み取りは非公開データの読取として記録されず、汎用 CLI も対象外です。記録のみでは実行を許可します。",
   "security.egress.loadFailed": "設定を読み込めませんでした。再読み込みしてから変更してください。",
   "security.egress.save": "送信の保護設定を保存",
-  "security.egress.bashWarning": "次のスタッフは確認または拒否モードでも、タスクサンドボックスなしで Bash を使用できます。Bash フックは抑止と記録のための仕組みです。隔離が必要な場合は Bash 権限を外すか、タスクサンドボックスを使用してください。",
+  "security.egress.bashWarning": "次のスタッフはデータ外送の保護が確認・拒否、または送信先の保護が確認モードでも、タスクサンドボックスなしで Bash を使用できます。Bash フックは抑止と記録のための仕組みです。隔離が必要な場合は Bash 権限を外すか、タスクサンドボックスを使用してください。",
   "security.egress.sandboxScope": "タスクサンドボックスは委任されたタスクだけが対象です。チャネル返信、スケジュールなど、ホストでの実行経路には適用されません。",
-  "security.egress.exposureUnavailable": "タスクサンドボックスなしで Bash を使えるスタッフを確認できませんでした。再読み込みして権限を確認してください。"
+  "security.egress.exposureUnavailable": "タスクサンドボックスなしで Bash を使えるスタッフを確認できませんでした。再読み込みして権限を確認してください。",
+  "security.recipient.mode": "送信先の保護",
+  "security.recipient.description": "現在の会話、確認済みの所有者、従業員の許可リストへの送信を許可します。それ以外は観察モードで記録し、確認モードでは Admin の承認が必要です。スケジュール通知には送信元の会話がありません。",
+  "agents.recipients.title": "許可する送信先",
+  "agents.recipients.description": "現在の会話と確認済みの所有者は自動で含まれます。自主通知の送信先を設定しても、送信は許可されません。",
+  "agents.recipients.modeHelp": "全体設定より厳しい保護のみ適用できます。",
+  "agents.recipients.inherit": "全体設定の最低条件を使用",
+  "agents.recipients.list": "追加の送信先",
+  "agents.recipients.listHelp": "line:U123、telegram:456、mail:ops@example.com のように、チャネルと宛先を正確に追加してください。変更できるのは Admin のみです。",
+  "approval.grant.reasonRecipient": "宛先は現在の会話でも許可リストの送信先でもありません"
 }

@@ -557,6 +557,8 @@ export function EditAgentPage() {
     setCaps({
       ...DEFAULT_CAPABILITIES,
       ...(c ?? {}),
+      recipient_guard: c?.recipient_guard ?? DEFAULT_CAPABILITIES.recipient_guard,
+      recipients: Array.isArray(c?.recipients) ? c.recipients.filter((value) => typeof value === 'string') : [],
       computer_use_config: {
         ...DEFAULT_CAPABILITIES.computer_use_config,
         ...(c?.computer_use_config ?? {}),
@@ -1390,6 +1392,25 @@ export function EditAgentPage() {
                 </FieldBlock>
               </>
             )}
+          </SettingsSection>
+
+          <SettingsSection title={t('agents.recipients.title')} description={t('agents.recipients.description')}>
+            <SettingsCard>
+              <RowSelect
+                disabled={!isAdmin}
+                label={t('security.recipient.mode')}
+                description={t('agents.recipients.modeHelp')}
+                value={['off', 'shadow', 'ask'].includes(caps.recipient_guard) ? caps.recipient_guard : 'ask'}
+                onChange={(value) => updateCap('recipient_guard', value as 'off' | 'shadow' | 'ask')}
+                options={['off', 'shadow', 'ask'].map((value) => ({
+                  value,
+                  label: t(value === 'off' ? 'agents.recipients.inherit' : `security.egress.${value}`),
+                }))}
+              />
+            </SettingsCard>
+            <FieldBlock label={t('agents.recipients.list')} description={t('agents.recipients.listHelp')}>
+              <ChipEditor values={caps.recipients} onChange={(value) => updateCap('recipients', value)} placeholder="mail:ops@example.com" addLabel={t('common.add')} />
+            </FieldBlock>
           </SettingsSection>
 
           {/* 2026-10 — [capabilities] action_rules: allow / ask / block per

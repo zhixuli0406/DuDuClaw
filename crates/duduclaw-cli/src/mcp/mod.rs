@@ -348,3 +348,4 @@ mod round_parent_tests;
 mod task_audience_mcp_tests;
 
 pub(crate) mod egress_gate;
+pub(crate) mod recipient_gate;
