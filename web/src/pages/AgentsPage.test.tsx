@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -9,6 +10,7 @@ import { AgentsPage } from './AgentsPage';
 import { useAgentsStore } from '@/stores/agents-store';
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [] });
   vi.clearAllMocks();
   // Default: the API returns empty agents list
   mockWsClient.call.mockResolvedValue({ agents: [] });

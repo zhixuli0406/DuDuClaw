@@ -15,7 +15,7 @@ export type RunStatus = 'completed' | 'running' | 'no_reply';
 
 export interface RunSummary {
   id: string;
-  session_id: string;
+  session_id?: string;
   agent_id: string;
   /** Session channel prefix ("telegram", "discord", …) or "other". */
   channel: string;
@@ -27,7 +27,8 @@ export interface RunSummary {
   /** MCP tool receipts correlated to this run's window. */
   step_count: number;
   /** First chars of the user turn. */
-  preview: string;
+  preview: string | null;
+  read_only?: boolean;
 }
 
 /** One raw event from `runs.get` (kinds beyond these may appear in future

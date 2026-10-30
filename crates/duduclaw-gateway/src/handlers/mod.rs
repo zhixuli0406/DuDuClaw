@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 mod team_history_rpc;
+mod team_visibility;
 mod my_history_views_rpc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,6 +91,7 @@ mod memory_rpc;
 mod memory_history_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
+pub(crate) use shared_wiki_rpc::SharedWikiReader;
 mod search_rpc;
 mod skills_rpc;
 mod skills_list_rpc;

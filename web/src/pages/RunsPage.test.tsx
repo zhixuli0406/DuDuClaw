@@ -201,3 +201,13 @@ describe('RunsPage restricted history',()=>{
     expect(screen.queryByText('PREVIOUS ACCOUNT PRIVATE RUN')).not.toBeInTheDocument();
   });
 });
+
+it('explains a metadata-only team run without requiring a session id', async () => {
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'runs.get' ? {
+    run: { id: 'team:opaque', agent_id: 'team-agent', channel: 'other', started_at: '2026-10-24T00:00:00Z', ended_at: '2026-10-24T00:01:00Z', status: 'completed' },
+    events: [], read_only: true, omitted: ['conversation_content', 'tool_steps'],
+  } : { runs: [], agents: AGENTS }));
+  renderAt('/runs?run=team:opaque');
+  expect(await screen.findByText(/Conversation content and tool steps are not shared/)).toBeInTheDocument();
+  expect(screen.queryByText('No transcript events recorded')).not.toBeInTheDocument();
+});

@@ -113,7 +113,7 @@ export function HomePage() {
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   // Data-scoped: an employee sees only their own AI staff (§3.4 WP11-T11.3).
-  const agents = useVisibleAgents();
+  const agents = useVisibleAgents(false);
   const connectionState = useConnectionStore((s) => s.state);
   const authed = connectionState === 'authenticated';
 
@@ -406,7 +406,7 @@ export function HomePage() {
       )}
 
       {/* Fixed 用量摘要 KPI strip (§5.5) — details-on-demand, below the fold. */}
-      <UsageSummary enabled={authed} />
+      {user?.role === 'admin' && <UsageSummary enabled={authed} />}
 
       {/* Read-only view-as banner (§view-as: look, never touch). */}
       {viewing && viewTarget && (

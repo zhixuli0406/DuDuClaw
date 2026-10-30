@@ -66,6 +66,7 @@ export function WidgetComposerPage() {
   const [searchParams] = useSearchParams();
   const user = useAuthStore((s) => s.user);
   const isAdmin = hasMinRole(user?.role, 'admin');
+  const canGenerate = hasMinRole(user?.role, 'manager');
 
   const [htmlMode, setHtmlMode] = useState(searchParams.get('mode') === 'html');
   const [title, setTitle] = useState('');
@@ -104,6 +105,7 @@ export function WidgetComposerPage() {
     setSources((cur) => (cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s]));
 
   const generate = async (revise: boolean) => {
+    if (!canGenerate) return;
     if (!revise && sources.length === 0 && freeform.trim() === '') {
       toast.error(intl.formatMessage({ id: 'widgets.compose.needInput' }));
       return;
@@ -204,6 +206,7 @@ export function WidgetComposerPage() {
       />
 
       <div className="mx-auto w-full max-w-6xl p-4 md:p-6">
+        {!canGenerate && <p role="note" className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'widgets.compose.managerOnly' })}</p>}
         <div className="grid gap-6 lg:grid-cols-2">
           {/* ── Left: authoring ── */}
           <div className="space-y-4">
@@ -303,7 +306,7 @@ export function WidgetComposerPage() {
                         />
                         <SubmitButton
                           state={generating ? 'submitting' : 'idle'}
-                          disabled={generating}
+                          disabled={generating || !canGenerate}
                           onClick={() => void generate(false)}
                           aria-label={intl.formatMessage({ id: 'widgets.compose.generate' })}
                           className="absolute bottom-2 right-2"
@@ -327,7 +330,7 @@ export function WidgetComposerPage() {
                       />
                       <Button
                         variant="outline"
-                        disabled={generating || feedback.trim() === ''}
+                        disabled={generating || !canGenerate || feedback.trim() === ''}
                         onClick={() => void generate(true)}
                       >
                         <RefreshCw />

@@ -747,3 +747,34 @@ fn bounded_export_masks_credentials_past_the_message_scan_cap_without_losing_cjk
     }).collect();
     assert_eq!(&joined, masked);
 }
+
+#[test]
+fn shared_wiki_export_filters_department_pages_and_revokes_existing_downloads() {
+    let dir = fixture();
+    let (db, ctx) = user(dir.path(), "wiki-reader@test.invalid", UserRole::Employee);
+    db.set_department(&ctx.user_id, Some("sales")).unwrap();
+    let store = duduclaw_memory::WikiStore::new_shared(dir.path());
+    store.ensure_scaffold().unwrap();
+    for path in ["company.md", "departments/sales/own.md", "departments/hr/secret.md", "restricted/secret.md"] {
+        store.write_page(path, "# Export knowledge\nDepartment content").unwrap();
+    }
+    std::fs::write(dir.path().join("shared/wiki/.scope.toml"), "[namespaces.restricted]\nvisible_to_departments = [\"hr\"]\n").unwrap();
+    let mut req = request(Dataset::Wiki, ExportFormat::Csv);
+    req.agent_id = None;
+    req.scope = Some("shared".into());
+    let table = source::collect(dir.path(), &ctx, &req, || Ok(())).unwrap();
+    assert_eq!(table.rows.len(), 2);
+    assert!(table.rows.iter().all(|row| {
+        row.id.ends_with(":company.md") || row.id.ends_with(":departments/sales/own.md")
+    }));
+    let id = build_now(dir.path(), &ctx, &req);
+    assert!(download(dir.path(), &ctx, &id).is_ok());
+    db.set_department(&ctx.user_id, None).unwrap();
+    assert_eq!(download(dir.path(), &ctx, &id).err().unwrap(), "EXPORT_SOURCE_CHANGED");
+    let table = source::collect(dir.path(), &ctx, &req, || Ok(())).unwrap();
+    assert_eq!(table.rows.len(), 1);
+    assert!(table.rows[0].id.ends_with(":company.md"));
+    std::fs::write(dir.path().join("shared/wiki/.scope.toml"), "[broken").unwrap();
+    assert_eq!(authorize(dir.path(), &ctx, &req).err().unwrap(), "EXPORT_PERMISSION_DENIED");
+    assert!(source::collect(dir.path(), &ctx, &req, || Ok(())).is_err());
+}

@@ -9395,5 +9395,10 @@
   "security.credentialAudit.provider.webchatGuest": "網頁對話訪客",
   "timeline.waitingSinceUpdate.minutes": "已等 {count} 分鐘（距上次更新）",
   "timeline.waitingSinceUpdate.hours": "已等 {count} 小時（距上次更新）",
-  "timeline.waitingSinceUpdate.days": "已等 {count} 天（距上次更新）"
+  "timeline.waitingSinceUpdate.days": "已等 {count} 天（距上次更新）",
+  "agents.teamMember": "{name} 的 AI 員工（僅供查看）",
+  "agents.teamReadOnly": "這是團隊成員的 AI 員工。你可以查看工作時間軸與執行紀錄；記憶與設定僅開放給直接獲授權的帳號。",
+  "users.bind.chooseAgent": "請選擇 AI 員工",
+  "widgets.compose.managerOnly": "請主管或管理員產生卡片。",
+  "runs.teamReadOnly": "這是團隊成員的執行紀錄，僅供查看進度。對話內容與工具步驟未開放。"
 }

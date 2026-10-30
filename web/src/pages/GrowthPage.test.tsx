@@ -1,3 +1,6 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { useConnectionStore } from '@/stores/connection-store';
+import { DailyReportCard } from '@/components/growth/DailyReportCard';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
@@ -54,4 +57,11 @@ describe('GrowthPage', () => {
     // Inline banner (not the full-page card) so the page body still renders.
     expect(screen.getByRole('alert')).toHaveAttribute('data-variant', 'inline');
   });
+});
+
+it('does not load the company daily report for employees in the page or popup', () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useConnectionStore.setState({ state: 'authenticated' as never });
+  renderWithProviders(<><GrowthPage /><DailyReportCard /></>);
+  expect(mockWsClient.call.mock.calls.some(([m]) => m === 'growth.daily_report')).toBe(false);
 });

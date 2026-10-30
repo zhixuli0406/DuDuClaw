@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   navGroups,
   personalPrimaryItems,
+  manageAdvancedNav,
   personalAdvancedGroup,
   navGroupsForEdition,
   primaryItemsForEdition,
@@ -228,5 +229,18 @@ describe('nav-model — page titles for the people pages', () => {
     expect(crumbsFor('/team').at(-1)?.labelId).toBe('nav.myTeam');
     expect(crumbsFor('/manage/users').at(-1)?.labelId).toBe('manage.users');
     expect(crumbsFor('/users').at(-1)?.labelId).toBe('manage.users');
+  });
+});
+
+
+describe('nav RPC role alignment', () => {
+  it('cron and unified audit pages require admin in both editions', () => {
+    const routines = navGroups.flatMap(g => g.items).find(i => i.to === '/routines')!;
+    expect(routines.minRole).toBe('admin');
+    expect(manageAdvancedNav.find(i => i.to === '/manage/logs')?.minRole).toBe('admin');
+    expect(navGroups.flatMap(g => g.items).find(i => i.to === '/gallery')?.minRole).toBe('admin');
+    expect(isVisible(routines, 'employee', false)).toBe(false);
+    expect(isVisible(routines, 'manager', false)).toBe(false);
+    expect(isVisible(routines, 'admin', false)).toBe(true);
   });
 });

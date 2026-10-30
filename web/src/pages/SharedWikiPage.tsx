@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useIntl } from 'react-intl';
@@ -86,13 +87,14 @@ function namespaceOf(path: string): string {
  */
 export function SharedWikiPage({ embedded = false }: { embedded?: boolean }) {
   const intl = useIntl();
+  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const [view, setView] = useState<ViewId>('browse');
 
   const viewOptions: SegmentedOption<ViewId>[] = [
     { value: 'browse', label: intl.formatMessage({ id: 'sharedWiki.tab.browse' }) },
     { value: 'search', label: intl.formatMessage({ id: 'sharedWiki.tab.search' }) },
     { value: 'stats', label: intl.formatMessage({ id: 'sharedWiki.tab.stats' }) },
-    { value: 'policy', label: intl.formatMessage({ id: 'sharedWiki.tab.policy' }) },
+    ...(isAdmin ? [{ value: 'policy' as const, label: intl.formatMessage({ id: 'sharedWiki.tab.policy' }) }] : []),
   ];
 
   const inner = (
@@ -116,7 +118,7 @@ export function SharedWikiPage({ embedded = false }: { embedded?: boolean }) {
       {view === 'browse' && <BrowseView />}
       {view === 'search' && <SearchView />}
       {view === 'stats' && <StatsView />}
-      {view === 'policy' && <PolicyView />}
+      {view === 'policy' && isAdmin && <PolicyView />}
     </div>
   );
 

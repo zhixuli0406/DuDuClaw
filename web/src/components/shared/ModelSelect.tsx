@@ -1,3 +1,5 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -60,6 +62,7 @@ export function ModelSelect({
   refreshing,
   onRefresh,
 }: ModelSelectProps) {
+  const canRefresh = hasMinRole(useAuthStore(s => s.user?.role), 'manager');
   const policy = useProductPolicy();
   const intl = useIntl();
   const [custom, setCustom] = useState(false);
@@ -92,7 +95,7 @@ export function ModelSelect({
 
   // Header row: "updated N ago" + optional refresh button. Shown whenever a
   // refresh handler is wired, regardless of list/manual mode.
-  const header = onRefresh ? (
+  const header = onRefresh && canRefresh ? (
     <div className="flex items-center justify-between gap-2">
       <span className="text-xs text-muted-foreground">{updatedText}</span>
       <button

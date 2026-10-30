@@ -104,7 +104,7 @@ export function FilesPage() {
   const jwt = useAuthStore((s) => s.jwt);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const scope = useDataScope();
-  const visibleAgents = useVisibleAgents();
+  const visibleAgents = useVisibleAgents(false);
 
   // Admins may browse the shared bucket; scoped users start on their first
   // visible AI staff member (the gateway fails closed without an agent).

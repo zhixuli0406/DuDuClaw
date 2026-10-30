@@ -1,3 +1,5 @@
+import { useVisibleAgents, type VisibleAgent } from '@/lib/data-scope';
+import { useAuthStore } from '@/stores/auth-store';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link, useNavigate } from 'react-router';
@@ -87,7 +89,7 @@ export function AgentsPage() {
   const navigate = useNavigate();
   const errorText = useErrorMessage();
   const {
-    agents,
+    agents: directAgents,
     fetchAgents,
     pauseAgent,
     resumeAgent,
@@ -99,6 +101,8 @@ export function AgentsPage() {
     error,
     clearError,
   } = useAgentsStore();
+  const agents = useVisibleAgents();
+  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const { tasks, fetchTasks } = useTasksStore();
 
   const [scope, setScope] = useState<Scope>('active');
@@ -134,7 +138,7 @@ export function AgentsPage() {
    * Confirm the success, and say so plainly when it didn't happen.
    */
   const runLifecycle = useCallback(
-    async (fn: () => Promise<void>, successId: string, agent: AgentDetail) => {
+    async (fn: () => Promise<void>, successId: string, agent: VisibleAgent) => {
       clearError();
       try {
         await fn();
@@ -175,7 +179,7 @@ export function AgentsPage() {
         title={intl.formatMessage({ id: 'agents.title' })}
         count={visible.length}
         description={intl.formatMessage({ id: 'nav.agents.desc' })}
-        action={hireButton}
+        action={isAdmin ? hireButton : undefined}
       />
 
       {/* Scope control row. */}
@@ -208,7 +212,7 @@ export function AgentsPage() {
             id: scope === 'archived' ? 'agents.scope.archived' : 'agents.empty',
           })}
           action={
-            scope === 'active' ? (
+            scope === 'active' && isAdmin ? (
               <Button variant="brand" size="sm" onClick={openCreate}>
                 <Plus />
                 {intl.formatMessage({ id: 'agents.empty.cta' })}
@@ -245,7 +249,7 @@ export function AgentsPage() {
               onUnarchive={() =>
                 void runLifecycle(() => unarchiveAgent(agent.name), 'agents.unarchive.done', agent)
               }
-              onOffboard={() => setOffboardTarget(agent)}
+              onOffboard={() => setOffboardTarget(directAgents.find(a => a.name === agent.name) ?? null)}
             />
           ))}
         </ListGridContainer>
@@ -278,7 +282,7 @@ function AgentRow({
   onUnarchive,
   onOffboard,
 }: {
-  agent: AgentDetail;
+  agent: VisibleAgent;
   taskCount: number;
   onPause: () => void;
   onResume: () => void;
@@ -316,7 +320,7 @@ function AgentRow({
             {agent.display_name}
           </Link>
           <span className="truncate text-xs text-muted-foreground">
-            {agent.trigger || intl.formatMessage({ id: `agents.role.${agent.role}` })}
+            {agent.readOnly ? intl.formatMessage({ id: 'agents.teamMember' }, { name: agent.teamMember }) : agent.trigger || intl.formatMessage({ id: `agents.role.${agent.role}` })}
           </span>
         </div>
       </ListGridCell>
@@ -364,7 +368,7 @@ function AgentRow({
 
       {/* Kebab. */}
       <ListGridCell className="justify-end">
-        <DropdownMenu>
+        {!agent.readOnly && <DropdownMenu>
           <DropdownMenuTrigger
             render={
               <Button
@@ -418,7 +422,7 @@ function AgentRow({
               )
             )}
           </DropdownMenuContent>
-        </DropdownMenu>
+        </DropdownMenu>}
       </ListGridCell>
     </ListGridRow>
   );

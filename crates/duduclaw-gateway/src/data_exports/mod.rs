@@ -152,6 +152,10 @@ pub(super) fn authorize(
     {
         return Err("EXPORT_INVALID_REQUEST".into());
     }
+    if shared {
+        crate::handlers::SharedWikiReader::new(home, &live)
+            .map_err(|_| "EXPORT_PERMISSION_DENIED".to_string())?;
+    }
     if !shared
         && request.agent_id.is_none()
         && (!live.is_admin() || matches!(request.dataset, Dataset::Memories | Dataset::Wiki))

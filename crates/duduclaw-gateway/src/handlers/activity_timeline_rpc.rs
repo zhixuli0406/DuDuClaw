@@ -95,7 +95,7 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
 
-        let reader = match self.task_list_reader(ctx, agent_id) {
+        let reader = match self.monitoring_reader(ctx, agent_id) {
             Ok(r) => r,
             Err(f) => return f,
         };
@@ -121,6 +121,10 @@ impl MethodHandler {
         let activities: Vec<ActivityRow> = activities
             .into_iter()
             .map(|mut a| {
+                if !reader.live().has_agent_access(&a.agent_id, AccessLevel::Viewer) {
+                    a.summary.clear();
+                    a.metadata = None;
+                }
                 if let Some(t) = a.task_id.as_deref().filter(|t| !t.is_empty()) {
                     let readable = reader.can_read_owned(t, owners.get(t).map(String::as_str));
                     if !readable {

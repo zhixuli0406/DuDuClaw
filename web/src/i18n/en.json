@@ -9395,5 +9395,10 @@
   "security.credentialAudit.provider.webchatGuest": "Web chat guest",
   "timeline.waitingSinceUpdate.minutes": "Waiting {count} minutes (since last update)",
   "timeline.waitingSinceUpdate.hours": "Waiting {count} hours (since last update)",
-  "timeline.waitingSinceUpdate.days": "Waiting {count} days (since last update)"
+  "timeline.waitingSinceUpdate.days": "Waiting {count} days (since last update)",
+  "agents.teamMember": "{name}’s AI employee (read only)",
+  "agents.teamReadOnly": "This AI employee belongs to a team member. You can view its timeline and runs. Memory and settings require direct access.",
+  "users.bind.chooseAgent": "Choose an AI employee",
+  "widgets.compose.managerOnly": "Ask a manager or administrator to generate a card.",
+  "runs.teamReadOnly": "This team member’s run shows progress only. Conversation content and tool steps are not shared."
 }
