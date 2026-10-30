@@ -5,13 +5,13 @@
 ### Added
 
 - 斷開連結就刪掉衍生的記憶：斷開通道、Google、資料庫來源或 Remote MCP 時，gateway 會為受影響的 AI 員工建立一份遺忘計畫，合併成一張由 Admin 在儀表板核准的卡片，七天內有效。核准後在背景執行，失敗會重試，重啟後會繼續，連續失敗五次會隔離並顯示原因。完成後，安全頁提供一張可下載 JSON 的「資料刪除收據」，列出實際刪除、無法歸屬、因其他連線仍在而保留、系統紀錄保留，以及不在範圍內的項目。只有升級後寫入的記憶能歸屬到連線，舊記憶會計入「無法歸屬」，不會被刪除。對話原文、`tool_calls.jsonl`、Wiki 與備份不在刪除範圍。詳見 `docs/features/63-knowledge-base.md`。
-- 憑證稽核：使用者在對話中貼出的密碼、API key、token、私鑰、連線字串會由確定性規則偵測並登錄，Admin 可在「系統 → 安全 → 憑證稽核」查到類型、遮罩後的帳號、供哪個服務使用、來源、提供者與持有者，可修改服務、標記誤判、匯出 CSV，所有動作都留下稽核事件。登錄檔不保存憑證值。既有的憑證清冊也納入 Remote MCP、Google 個人連線、MCP 環境變數名稱、瀏覽器設定檔與 MCP 用戶端識別碼。AI 員工可用新工具 `credential_declare` 標記自己持有的憑證用於哪個服務，不能覆蓋 Admin 的設定。沒有上下文的單獨密碼偵測不到。詳見 `docs/features/70-credential-audit.md`。
-- `[security] chat_credentials` 可設 `audit`（預設）或 `mask`。兩種模式都會在摘要、記憶、Wiki、skill 紀錄、任務與派工紀錄、訓練資料與日誌寫入前遮罩；`audit` 仍保留對話紀錄原文與當下的 prompt，`mask` 會在員工看到訊息前就遮罩，員工拿不到值。
-- 新增產品自己的 Agent 設定檔格式 `duduclaw.agent/v1`：單一 Markdown 檔，包含 Persona、User、Rules、Contract 四段與可攜的設定欄位。`duduclaw agent export <id> --format duduclaw|openclaw|hermes|agents-md|claude-subagent` 與員工頁的「匯出設定檔」可匯出；匯入一律先預覽，確認碼涵蓋模型、工具限制、主管、名稱與所有寫入檔案，內容變更就要重新預覽。匯出不含秘密、權限、通道、MCP 與記憶，使用者介紹預設不匯出。規格見 `docs/spec/agent-file-spec.md`。
+- 憑證稽核：使用者在對話中貼出的密碼、API key、token、私鑰、連線字串會由確定性規則偵測並登錄，Admin 可在「系統 → 安全 → 憑證稽核」查到類型、遮罩後的帳號、供哪個服務使用、來源、提供者與持有者，可修改服務、標記誤判、匯出 CSV，所有動作都留下稽核事件。登錄檔不保存憑證值。憑證指紋只用於嚴格符合供應商格式或完整 PEM 的高熵值，而且金鑰要有加固的保護，目前只有加固的 macOS 符合；密碼、連線字串與僅靠上下文判斷的值一律不算指紋。登錄有數量上限，訊息灌爆時只留彙總事件。既有的憑證清冊也納入 Remote MCP、Google 個人連線、MCP 環境變數名稱、瀏覽器設定檔與 MCP 用戶端識別碼。AI 員工可用新工具 `credential_declare` 標記自己持有的憑證用於哪個服務，不能覆蓋 Admin 的設定。沒有上下文的單獨密碼偵測不到。詳見 `docs/features/70-credential-audit.md`。
+- `[security] chat_credentials` 可設 `audit`（預設）或 `mask`。兩種模式都會在摘要、記憶、Wiki、skill 紀錄、任務與派工紀錄、訓練資料與日誌寫入前遮罩；`audit` 仍保留對話紀錄原文與當下的 prompt，`mask` 會在員工看到訊息前就遮罩，員工拿不到值。LINE 例外，兩種模式都只交付遮罩後的文字。
+- 新增產品自己的 Agent 設定檔格式 `duduclaw.agent/v1`：單一 Markdown 檔，包含 Persona、User、Rules、Contract 四段與可攜的設定欄位。`duduclaw agent export <id> --format duduclaw|openclaw|hermes|agents-md|claude-subagent --out <路徑>` 與員工頁的「匯出設定檔」可匯出，這個指令不能在 AI 工作階段執行。匯入一律先預覽，確認碼涵蓋模型、工具限制、主管、名稱與所有寫入檔案，內容變更就要重新預覽；匯入內容裡的憑證會先遮罩，結構化設定含憑證則拒絕。匯出不含秘密、權限、通道、MCP 與記憶，使用者介紹預設不匯出。規格見 `docs/spec/agent-file-spec.md`。
 - AI 員工新增原生的使用者介紹 `USER.md`，上限 4,000 字，可在員工檔案編輯頁修改，以資料區塊注入 prompt。匯入其他產品的使用者資料時改寫進 `USER.md`，不再建立「服務對象」Wiki 頁，既有頁面不受影響。
 - Google 連線精靈：「管理 → 整合 → Google」依公司或個人帳號引導 OAuth、服務帳號網域委派或 Apps Script 橋接，可離開頁面去 Google Cloud Console 後回來接續。Google 文件整併成一份 SOP `docs/guides/google-setup.md`。新增內建技能 `connect-google`：員工在對話中被問到如何連接 Google 時會引導使用者，提醒密鑰只填儀表板，也不會讀取信件或文件來測試連線。
-- 收件對象防護：`[security] recipient_guard` 可設 `off`、`shadow`（預設）或 `ask`。允許的對象是本回合已驗證的來源對話、已驗證的 Owner，以及管理者在 `[capabilities] recipients` 設定的清單，由 gateway 判斷，模型不能指定。`ask` 模式下其他對象要 Admin 單次核准，排程通知在建立與觸發時各查一次。未綁定的訪客與 `[proactive]` 目標都不算允許對象。
-- 外送閘門涵蓋 CLI 內建工具：Claude 與 Grok 的 `WebFetch`、`WebSearch`、Bash 網路指令（curl、wget、ssh 等）接入同一套閘門，由 gateway 依完整參數產生審批卡；`ask` 模式要等核准後用相同參數重試，核准只能用一次。Codex 在 `ask`／`block` 模式下關閉原生網路與網頁搜尋。對有 Bash 的員工這層是減速帶，解釋器、`/dev/tcp` 與同一 OS 帳號下的改寫都能繞過，真正的隔離要靠不授予 Bash 或任務沙箱；安全頁會列出有 Bash 且沒開任務沙箱的員工。詳見 `docs/features/69-egress-guard.md`。
+- 收件對象防護：`[security] recipient_guard` 可設 `off`、`shadow`（預設）或 `ask`。允許的對象是本回合已驗證的來源對話、已驗證的 Owner，以及管理者在 `[capabilities] recipients` 設定的清單，由 gateway 判斷，模型不能指定。`ask` 模式下其他對象要 Admin 單次核准，無法確認收件對象的第三方工具同樣要核准，排程通知在建立與觸發時各查一次。未綁定的訪客與 `[proactive]` 目標都不算允許對象。
+- 外送閘門涵蓋 CLI 內建工具：Claude 與 Grok 的 `WebFetch`、`WebSearch`、Bash 網路指令（curl、wget、ssh 等）接入同一套閘門，由 gateway 依完整參數產生審批卡；`ask` 模式要等核准後用相同參數重試，核准只能用一次。Codex 在 `ask`／`block` 模式下關閉原生網路與網頁搜尋，Grok 關閉原生搜尋。對有 Bash 的員工這層是減速帶，解釋器、`/dev/tcp` 與同一 OS 帳號下的改寫都能繞過，真正的隔離要靠不授予 Bash 或任務沙箱；安全頁會列出防護設為 `ask`／`block`、有 Bash 且沒開任務沙箱的員工。詳見 `docs/features/69-egress-guard.md`。
 - 外送觀察報表：安全頁顯示「如果開成先詢問，這 7 天會開幾張單」，可看員工、工具、來源類別與每日趨勢，也支援 30 天。數字來自員工自己的活動，只是估計值。資料存在獨立的 `egress_shadow.db`，保留 35 天，不含內容與收件對象。
 - `duduclaw egress-leases list` 與 `clear`：在 gateway 停止時檢視與清除卡住的外送租約，清除前會備份並要求確認碼；`duduclaw doctor` 會顯示租約狀態。這是操作者工具，AI 工作階段不能執行。
 - 員工預算新增 `[budget] when_unavailable`：費用資料讀不到時的處理方式，預設 `allow`，可設 `deny`。從 `deny` 改成 `allow` 需要管理權限。
@@ -19,15 +19,19 @@
 
 ### Changed
 
-- `ask`／`block` 模式下，Codex 的 `FullAccess` 會降為 `WorkspaceWrite`，Claude 的 bare mode 與 Grok 的共用工作目錄會被拒絕，hook 安裝失敗時不啟動員工。`shadow` 模式維持原行為，只記錄警告。
-- 匯入 `USER.md` 的目的地從 Wiki 頁改為原生檔案。`MEMORY.md` 標為舊格式，只有互動式 runner 讀取。
-- `IDENTITY.md` 納入與 `SOUL.md` 相同的檔案守門與基準檢查。升級時自動建立基準，不會觸發竄改警告。
-- 四條 prompt 組裝路徑改用同一個來源讀取 persona、使用者介紹與工作規則，契約的相對位置與舊版相同。
+- **Breaking:** `duduclaw migrate from … --apply` 現在必須帶 `--confirm-profile <確認碼>`，確認碼來自預覽結果。
+- `ask`／`block` 模式下，Codex 的 `FullAccess` 會降為 `WorkspaceWrite`；Claude 會忽略專案、本機與使用者設定，只載入這位員工的設定，bare mode 會被拒絕；Grok 的共用工作目錄或混有其他員工守門檔時會被拒絕；hook 安裝失敗時不啟動員工。`shadow` 模式維持原行為，Claude 的 bare mode 與 hook 失敗只記警告。
+- `IDENTITY.md` 與 `USER.md` 納入檔案守門與基準檢查，員工不能自行修改。升級後第一次 heartbeat 會把現有內容設為基準，不會觸發竄改警告。員工也不能用 Read 讀取 `<home>/credentials/`。
+- 五條 prompt 組裝路徑改用同一個來源讀取 persona、使用者介紹與工作規則。任務沙箱新增使用者介紹與契約，其餘四條的契約相對位置不變。
+
+### Deprecated
+
+- `MEMORY.md` 標為舊格式：互動式 runner 與 `claude_runner` 路徑仍會讀取，通道、精簡模式與任務沙箱不讀。
 
 ### Fixed
 
-- 員工的每日與每月費用上限現在涵蓋所有模型呼叫：Claude 派工、排程、提醒、郵件、心跳、輔助工作、分支與評測等路徑先前都沒有檢查。短期員工的花費也會計入父員工。預算拒絕在呼叫模型前回傳，不會觸發帳號輪替或備援。
-- 費用資料讀不到時不再靜默當成 0 元；會留下紀錄並顯示專用訊息，不會誤報「花費達上限」。預算設定本身無法讀取時一律拒絕。
+- 員工的每日與每月費用上限現在涵蓋所有模型呼叫：Claude 執行環境的派工、排程、提醒、郵件、心跳、輔助工作、分支與評測等路徑先前都沒有檢查。短期員工的花費也會計入父員工。預算拒絕在呼叫模型前回傳，不會觸發帳號輪替或備援。
+- 費用資料讀不到時不再靜默當成 0 元：會留下紀錄，設成 `deny` 時停止並顯示專用訊息，不會誤報「花費達上限」。預算設定本身無法讀取時一律拒絕。
 - 排程、派工、提醒、郵件、心跳與短期員工的回合先前都被當成已讀過私人資料，`ask` 模式下會無人核准而失敗；現在每次背景執行都有自己的回合，由乾淨狀態開始。
 - 同一次呼叫的 `would_ask` 紀錄不再重複計數。
 - Google「測試連線」先前只確認拿得到 token 就回報全部可用，現在實際讀取 Gmail、Calendar、Drive；Sheets 與 Docs 只能依權限判定，會標示為部分驗證，並顯示已驗證的帳號。
@@ -38,9 +42,7 @@
 ### Security
 
 - 匯入 Agent File 的提示文件與 UTF-8 來源副本改為先遮罩憑證，再建立預覽、報告、確認摘要與安裝計畫；各區段顯示遮罩數量，結構化設定含憑證時指出欄位並拒絕。USER.md 的儀表板與外部／MCP 寫入共用遮罩，掃描失敗時拒絕寫入；既有檔案與備份不回溯清除。
-- 使用者貼在對話裡的憑證先前會以明文進入摘要、記憶、Wiki、skill 紀錄與部分通道日誌，現在在這些寫入點遮罩。LINE 持久佇列不再保存密文原文，升級時移除既有的密文，已經寫入舊紀錄、備份或外部 CLI 工作階段的內容不會回溯清除。
-- 憑證指紋只用於嚴格符合供應商格式或完整 PEM 的高熵值，而且金鑰要有加固的 AppBound 保護；密碼、連線字串與僅靠上下文判斷的值一律不算指紋。Windows 與未加固的 macOS 不計算指紋。登錄有數量上限，訊息灌爆時只留彙總事件。
-- 匯入設定檔時，確認碼先前沒有涵蓋模型與工具清單，換掉這些欄位就能裝進權限不同的員工；現在確認碼綁定完整的安裝計畫。
+- 使用者貼在對話裡的憑證先前會以明文進入摘要、記憶、Wiki、skill 紀錄與部分通道日誌，現在在這些寫入點遮罩。LINE 持久佇列改為只保存遮罩後的內容，升級時改寫佇列既有內容。已經寫入舊紀錄、備份或外部 CLI 工作階段的內容不會回溯清除。
 
 ## [1.77.0] - 2026-10-30 — 資料外送防護、目標費用上限、單次執行時限與權限收緊
 
