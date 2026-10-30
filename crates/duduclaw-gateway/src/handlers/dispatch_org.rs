@@ -84,7 +84,7 @@ impl MethodHandler {
             | "mfa.recovery_regenerate" | "mfa.disable" => {
                 self.handle_mfa_rpc(method, params, ctx).await
             }
-            "mfa.overview" | "users.mfa_reset" => {
+            "mfa.overview" | "users.mfa_reset" | "users.mfa_enrollment_code" => {
                 require_admin!();
                 self.handle_mfa_rpc(method, params, ctx).await
             }

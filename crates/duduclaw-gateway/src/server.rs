@@ -75,7 +75,7 @@ fn login_throttle_ip(ip: IpAddr) -> IpAddr {
 
 /// Returns `true` if the attempt from `(ip, email)` is within the rate budget.
 /// Loopback peers share one key per email ([`login_throttle_ip`]).
-fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
+pub(crate) fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
     let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
@@ -2292,6 +2292,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::otp_delivery::ConfigOtpDeliverer::new(home_dir.clone(), reqwest::Client::new()),
     );
 
+    let policy_home = home_dir.clone();
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            timer.tick().await;
+            let home = policy_home.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::mfa::reload_policy(&home)).await;
+        }
+    });
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
         handler,
@@ -3446,6 +3455,9 @@ async fn handle_channel_bind(
                 .into_response();
         }
     };
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -3538,6 +3550,9 @@ async fn handle_channel_identity_list(
                 .into_response();
         }
     };
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -3711,7 +3726,7 @@ async fn handle_refresh(
 
     // Fetch fresh user data and bindings
     let user = match state.user_db.get_user(&claims.sub) {
-        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active => u,
+        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && claims.credential_epoch >= u.credential_epoch => u,
         _ => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
@@ -3769,6 +3784,9 @@ async fn handle_me(
         }
     };
 
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -3827,6 +3845,9 @@ async fn handle_change_password(
         }
     };
 
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -15794,6 +15815,7 @@ fn pre_auth_handshake_allowed(
 /// rows never claim a person did this.
 fn pre_auth_context() -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: "lockscreen".to_string(),
         email: "lockscreen@local".to_string(),
         role: duduclaw_auth::UserRole::Employee,
@@ -15963,6 +15985,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 Ok(pre_auth_context())
                             }
                             // ── Legacy token authentication ────────────────────
+                            else if !server_mfa::legacy_token_allowed(&state).await {
+                                let err = WsFrame::error_response(&id, "已要求雙因素驗證；請使用帳號與雙因素驗證登入，不能使用舊版共用 token。");
+                                let _ = socket.send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into())).await;
+                                Err(())
+                            }
                             else if state.auth.is_auth_required() {
                                 let token =
                                     params.get("token").and_then(|v| v.as_str()).unwrap_or("");
@@ -16506,7 +16533,10 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
 
     // Single DB lookup — fail-closed: DB error = reject.
     let must_change_password = match state.user_db.get_user(&claims.sub) {
-        Ok(Some(user)) => jwt_account_gate(user.status, user.must_change_password)?,
+        Ok(Some(user)) => {
+            if claims.credential_epoch < user.credential_epoch { return Err("登入憑證已失效，請重新登入。".into()); }
+            jwt_account_gate(user.status, user.must_change_password)?
+        },
         Ok(None) => return Err("user not found".to_string()),
         Err(_) => return Err("authentication service unavailable".to_string()),
     };
@@ -16662,7 +16692,7 @@ async fn handle_reliability_summary_http(
                 .into_response();
         }
     };
-    if state.jwt_config.verify_access_token(token).is_err() {
+    if authenticate_jwt(&state, token).is_err() {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid or expired token"})),

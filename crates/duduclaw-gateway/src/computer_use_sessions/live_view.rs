@@ -429,6 +429,7 @@ mod tests {
 
     fn ctx(role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
         UserContext {
+            credential_epoch: 0,
             user_id: "u1".into(),
             email: "u1@example.com".into(),
             role,

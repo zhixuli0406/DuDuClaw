@@ -102,6 +102,7 @@ pub(crate) fn resolve_live_context(
     let generation = db.acl_generation();
     if let Ok(g) = generation {
         if let Some(hit) = cache.get(&jwt_ctx.user_id, g) {
+            if jwt_ctx.credential_epoch < hit.credential_epoch { return Err("登入憑證已失效，請重新登入。".into()); }
             return Ok(hit);
         }
     }
@@ -113,6 +114,7 @@ pub(crate) fn resolve_live_context(
             if generation.as_ref().is_ok_and(|g| *g == live.acl_generation) {
                 cache.put(&live);
             }
+            if jwt_ctx.credential_epoch < live.credential_epoch { return Err("登入憑證已失效，請重新登入。".into()); }
             Ok(live)
         }
         Ok(None) => Err(INACTIVE_ACCOUNT_ERROR.to_string()),

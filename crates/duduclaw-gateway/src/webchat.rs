@@ -638,7 +638,7 @@ fn authenticate_with(
         .verify_access_token(token)
         .map_err(|e| format!("invalid token: {e}"))?;
     match user_db.get_user(&claims.sub) {
-        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active => {
+        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && claims.credential_epoch >= u.credential_epoch => {
             Ok((claims.sub, u.must_change_password))
         }
         Ok(Some(_)) => Err("account suspended".to_string()),

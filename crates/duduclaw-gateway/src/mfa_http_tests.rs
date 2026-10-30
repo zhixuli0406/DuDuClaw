@@ -103,13 +103,15 @@ fn totp(secret: &str) -> String {
 fn enroll(state: &AppState, user: &duduclaw_auth::User) -> Vec<String> {
     let now = chrono::Utc::now().timestamp();
     let cipher = Cipher(&state.home_dir);
+    let token=state.user_db.mfa_password_challenge(&user.id,"correct horse battery","test-session",now).unwrap();
+    state.user_db.mfa_prepare_enrollment(&token,false,now).unwrap();
     let secret = state
         .user_db
-        .mfa_begin(&user.id, None, &cipher, now)
+        .mfa_begin(&user.id, Some(&token), &cipher, now)
         .unwrap();
     state
         .user_db
-        .mfa_confirm(&user.id, None, &totp(&secret), &cipher, now)
+        .mfa_confirm(&user.id, Some(&token), &totp(&secret), &cipher, now)
         .unwrap()
 }
 #[tokio::test]
@@ -200,6 +202,9 @@ async fn mfa_enforcement_off_preserves_login_response_and_personal_ignores_on() 
         assert!(response["access_token"].is_string());
         assert!(response["refresh_token"].is_string());
         assert_eq!(response["user"]["email"], "mfa@example.test");
+        assert!(response["user"].get("credential_epoch").is_none());
+        let claims=state.jwt_config.verify_access_token(response["access_token"].as_str().unwrap()).unwrap();
+        assert!(serde_json::to_value(claims).unwrap().get("credential_epoch").is_none());
     }
 }
 #[tokio::test]
@@ -246,11 +251,17 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
         .status(),
         StatusCode::UNAUTHORIZED
     );
+    assert_eq!(enroll_begin(State(state.clone()),ConnectInfo(peer(184)),Json(EnrollBody {
+        enrollment_token:token.clone(),code:None,proof_code:None,password:None,
+    })).await.status(),StatusCode::UNAUTHORIZED);
+    let proof=state.user_db.mfa_issue_enrollment_code(None,&user.id,chrono::Utc::now().timestamp()).unwrap();
     let (_, start) = body(
         enroll_begin(
             State(state.clone()),
             ConnectInfo(peer(184)),
             Json(EnrollBody {
+                password: None,
+                proof_code: Some(proof),
                 enrollment_token: token.clone(),
                 code: None,
             }),
@@ -265,6 +276,8 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
             State(state.clone()),
             ConnectInfo(peer(184)),
             Json(EnrollBody {
+                password: None,
+                proof_code: None,
                 enrollment_token: token.clone(),
                 code: Some(code.clone()),
             }),
@@ -281,6 +294,8 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
             State(state.clone()),
             ConnectInfo(peer(184)),
             Json(EnrollBody {
+                password: None,
+                proof_code: None,
                 enrollment_token: token,
                 code: Some(code)
             })
@@ -294,7 +309,8 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
 async fn mfa_unreadable_config_and_secret_deny() {
     let (_dir, state, user) = fixture(false, false).await;
     std::fs::remove_file(state.home_dir.join("config.toml")).unwrap();
-    assert_eq!(login(&state, 185).await.0, StatusCode::UNAUTHORIZED);
+    crate::mfa::reload_policy(&state.home_dir);
+    assert_eq!(login(&state, 185).await.0, StatusCode::OK);
     std::fs::write(
         state.home_dir.join("config.toml"),
         "[auth]\nmfa_enforced=false",
@@ -313,7 +329,7 @@ async fn mfa_unreadable_config_and_secret_deny() {
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
     assert!(state.user_db.mfa_active(&user.id).unwrap());
 }
 #[tokio::test]
@@ -366,14 +382,15 @@ async fn mfa_rpc_permissions_fresh_admin_and_unknown_method_denied() {
     assert!(!enforced(&state.home_dir, false).unwrap());
     let mut admin = UserContext::admin_fallback();
     admin.user_id = user.id.clone();
+    admin.credential_epoch = state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch;
     assert!(matches!(
         state
             .handler
             .handle("users.mfa_reset", json!({"user_id":user.id}), &admin)
             .await,
-        crate::protocol::WsFrame::Response { ok: true, .. }
+        crate::protocol::WsFrame::Response { ok: false, .. }
     ));
-    assert!(!state.user_db.mfa_active(&user.id).unwrap());
+    assert!(state.user_db.mfa_active(&user.id).unwrap());
     assert!(matches!(
         state
             .handler
@@ -386,4 +403,40 @@ async fn mfa_rpc_permissions_fresh_admin_and_unknown_method_denied() {
         crate::protocol::WsFrame::Response { ok: true, .. }
     ));
     assert!(enforced(&state.home_dir, false).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_old_access_refresh_revoked_but_epoch_zero_compatible() {
+    let (_dir,state,user)=fixture(false,false).await;
+    let (_,old)=login(&state,186).await;
+    let refresh=old["refresh_token"].as_str().unwrap().to_string();
+    assert_eq!(state.jwt_config.verify_refresh_token(&refresh).unwrap().credential_epoch,0);
+    assert!(authenticate_jwt(&state,old["access_token"].as_str().unwrap()).is_ok());
+    assert_eq!(handle_refresh(State(state.clone()),ConnectInfo(peer(186)),Json(RefreshRequest{refresh_token:refresh.clone()})).await.into_response().status(),StatusCode::OK);
+    enroll(&state,&user);
+    assert!(authenticate_jwt(&state,old["access_token"].as_str().unwrap()).is_err());
+    assert_eq!(handle_refresh(State(state.clone()),ConnectInfo(peer(186)),Json(RefreshRequest{refresh_token:refresh})).await.into_response().status(),StatusCode::UNAUTHORIZED);
+    state.user_db.mfa_operator_reset(&user.email).unwrap();
+    assert!(session(&state,&user.id,1,None).is_err(),"a reset after factor verification cannot mint the new epoch");
+}
+#[tokio::test]
+async fn mfa_legacy_token_only_refused_when_enforced() {
+    for (personal,required,allowed) in [(false,false,true),(false,true,false),(true,true,true)] {
+        let (_dir,state,_)=fixture(personal,required).await;
+        assert_eq!(legacy_token_allowed(&state).await,allowed);
+    }
+}
+#[tokio::test]
+async fn mfa_stolen_jwt_cannot_begin_without_password_or_confirm_other_session() {
+    let (_dir,state,user)=fixture(false,false).await;
+    let ctx=state.user_db.live_user_context(&user.id).unwrap().unwrap();
+    let session=uuid::Uuid::new_v4().to_string();
+    let call=|method,params|crate::google_personal::DASHBOARD_SESSION.scope(Some((user.id.clone(),session.clone())),state.handler.handle(method,params,&ctx));
+    assert!(matches!(call("mfa.enroll_begin",json!({})).await,crate::protocol::WsFrame::Response{ok:false,..}));
+    assert!(matches!(call("mfa.enroll_begin",json!({"password":"wrong"})).await,crate::protocol::WsFrame::Response{ok:false,..}));
+    let response=call("mfa.enroll_begin",json!({"password":"correct horse battery"})).await;
+    let crate::protocol::WsFrame::Response{ok:true,payload:Some(payload),..}=response else { panic!("begin failed: {response:?}") };
+    let params=json!({"enrollment_token":payload["enrollment_token"],"code":totp(payload["secret"].as_str().unwrap())});
+    assert!(matches!(crate::google_personal::DASHBOARD_SESSION.scope(Some((user.id.clone(),uuid::Uuid::new_v4().to_string())),state.handler.handle("mfa.enroll_confirm",params.clone(),&ctx)).await,crate::protocol::WsFrame::Response{ok:false,..}));
+    assert!(matches!(call("mfa.enroll_confirm",params).await,crate::protocol::WsFrame::Response{ok:true,..}));
 }

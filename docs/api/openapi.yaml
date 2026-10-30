@@ -105,7 +105,7 @@ paths:
         未註冊且未強制時維持 access_token、refresh_token、user。
         已註冊帳號只回 mfa_required=true、challenge_id，沒有任何 token。
         Enterprise 強制期間未註冊者只回 mfa_enrollment_required=true、enrollment_token。
-        Personal 忽略強制開關；設定無法讀取時拒絕。MFA 畫面屬下一階段。
+        Personal 忽略強制開關；設定重載失敗保留最後有效快照，Enterprise 從未取得有效快照才拒絕。MFA 畫面屬下一階段。
       security: []
       requestBody:
         required: true
@@ -169,7 +169,7 @@ paths:
     post:
       summary: 更新 access token
       description: |
-        Enterprise 強制 MFA 時，未註冊者的 refresh 立即拒絕。
+        Enterprise 強制 MFA 時，未註冊者的 refresh 立即拒絕。憑證 epoch 小於目前帳號版本時亦拒絕。
         原 access token 不立即撤銷，依原期限到期（預設30分鐘）。
         已註冊帳號的既有 refresh token 維持原到期日；不追溯要求舊 session 提交第二因素。
         設定無法讀取或解析時拒絕。Personal 忽略強制開關。
@@ -193,7 +193,7 @@ paths:
                 required: [access_token]
                 properties:
                   access_token: {type: string}
-        '401': {description: refresh 無效、帳號無效、需註冊 MFA 或設定不可讀}
+        '401': {description: refresh 無效或 epoch 過舊、帳號無效、需註冊 MFA 或沒有有效設定快照}
         '429': {description: 更新嘗試過多}
   /api/mfa/verify:
     post:
@@ -234,7 +234,10 @@ paths:
   /api/mfa/enroll/begin:
     post:
       summary: 使用專用註冊憑證開始註冊
-      description: 憑證只能用於兩條 enroll 路由，不能用於 /ws、refresh 或其他認證路由；開始不啟用 MFA。
+      description: |
+        憑證只用於兩條 enroll 路由；開始不啟用 MFA。必須先提出 proof_code，
+        有已驗證通道時為該次獨立 OTP，否則為另一位 Admin 或主機操作員核發的一次性註冊碼。
+        通道 OTP 第一因素登入者還要提供 password，confirm 也一樣。
       security: []
       requestBody:
         required: true
@@ -246,6 +249,8 @@ paths:
               required: [enrollment_token]
               properties:
                 enrollment_token: {type: string, writeOnly: true}
+                proof_code: {type: string, writeOnly: true, description: 獨立證明，begin 必填；驗證後綁定該次 challenge}
+                password: {type: string, writeOnly: true, description: 通道 OTP 第一因素時必填}
       responses:
         '200':
           description: 將秘密鍵匯入驗證器，接著確認
@@ -273,6 +278,8 @@ paths:
               required: [enrollment_token, code]
               properties:
                 enrollment_token: {type: string, writeOnly: true}
+                proof_code: {type: string, writeOnly: true, description: 獨立證明，begin 必填；驗證後綁定該次 challenge}
+                password: {type: string, writeOnly: true, description: 通道 OTP 第一因素時必填}
                 code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
       responses:
         '200':
@@ -303,10 +310,24 @@ paths:
   /rpc/mfa.enroll_begin:
     post:
       tags: [auth]
-      summary: 本人開始註冊，回傳 secret 與 otpauth_uri；尚未啟用
-      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      summary: 驗證目前密碼後開始本人註冊，綁定 JWT jti 與5分鐘期限
+      description: |
+        強制時先回 enrollment_token、proof_required；再帶 password、該 token 與 proof_code
+        呼叫 begin，取得 secret、otpauth_uri、enrollment_token。未強制則首次即回密鑰。
+        已啟用者須先以新的因素停用後才能重新註冊，不能直接覆寫。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: {type: string, writeOnly: true}
+                enrollment_token: {type: string, writeOnly: true}
+                proof_code: {type: string, writeOnly: true}
       responses:
-        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+        '200': {description: RPC 結果（成功或拒絕）}
   /rpc/mfa.enroll_confirm:
     post:
       tags: [auth]
@@ -318,8 +339,9 @@ paths:
           application/json:
             schema:
               type: object
-              required: [code]
+              required: [enrollment_token, code]
               properties:
+                enrollment_token: {type: string, writeOnly: true}
                 code: {type: string}
       responses:
         '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
@@ -365,8 +387,25 @@ paths:
   /rpc/users.mfa_reset:
     post:
       tags: [auth]
-      summary: 目前有效 Admin 重設目標 MFA；交易內重新讀取角色並稽核
+      summary: 目前有效 Admin 以自身新 TOTP 或備援碼重設別人 MFA；拒絕自我重設
       description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, code]
+              properties:
+                user_id: {type: string}
+                code: {type: string, writeOnly: true}
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/users.mfa_enrollment_code:
+    post:
+      tags: [auth]
+      summary: 目前有效 Admin 核發別人的一次性註冊碼，禁止自行核發
+      description: 綁定目標帳號、5分鐘有效、雜湊保存、只顯示一次並稽核。
       requestBody:
         required: true
         content:
@@ -377,7 +416,7 @@ paths:
               properties:
                 user_id: {type: string}
       responses:
-        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+        '200': {description: enrollment_code 與 expires_in（秒），或 RPC 拒絕}
   /ws:
     get:
       summary: WebSocket JSON-RPC 2.0 endpoint

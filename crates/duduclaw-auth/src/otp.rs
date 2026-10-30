@@ -88,7 +88,7 @@ pub fn mask_target(id: &str) -> String {
 }
 
 /// Cryptographically-random 6-digit numeric code.
-fn generate_numeric_code() -> String {
+pub(crate) fn generate_numeric_code() -> String {
     use argon2::password_hash::rand_core::RngCore;
     let mut rng = argon2::password_hash::rand_core::OsRng;
     // Rejection-sample a uniform 0..=999999 to avoid modulo bias.

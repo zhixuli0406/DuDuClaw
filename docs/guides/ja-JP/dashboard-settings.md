@@ -338,4 +338,6 @@ AI スタッフが同じターンで非公開データの読み取りに成功�
 mfa_enforced = false
 ```
 
-既定は無効、Enterprise のみ有効です。現在のAdminが `mfa.overview` を確認後、`system.update_config {"auth.mfa_enforced":true}` または設定ファイルエディターで有効にします。両方の経路で現在の有効なAdminを確認します。未登録ユーザーはrefreshできず、既存access tokenの自然な期限切れ後に登録します。Enterprise WebSocketは期限後の次の心拍（最大30秒）で終了します。設定の読み取り／解析失敗はログインを拒否します。Personalでは強制設定を無視し、ローカル自動ログインは変わりません。MFA画面は未提供のため、対応クライアントを用意してから強制してください。詳細は[セキュリティ](../../features/ja-JP/05-security-defense.md)を参照してください。
+無効のまま現在のパスワードによる任意登録を進めます。Adminが `mfa.overview` を確認し、チャネル配信または別Adminの一度限りの登録コード、ホスト復旧と対応クライアントを用意してから強制を有効にします。両Dashboard書込経路は現在有効なAdminが必要です。登録と以後の認証情報変更はepochで古いJWTを無効にします。強制の切替だけではaccess tokenの自然な期限切れを待ち、未登録者のrefreshを拒否します。強制中の旧共有token WebSocketログインは拒否します。
+
+設定は起動時のメモリスナップショットを使い、Dashboard保存後と外部ファイルの30秒ごとの確認で更新します。失敗は警告して最後の有効値を保持し、有効値を一度も得ていないEnterpriseだけが拒否します。`[auth]` なしはfalseです。Personalは強制を無視しローカル自動ログインは変わりません。画面はフェーズ2です。証明フィールド、セッション限定、`duduclaw ops users mfa-reset` / `mfa-enrollment-code` によるホスト復旧は[セキュリティ](../../features/ja-JP/05-security-defense.md)を参照してください。鍵ローテーションは対象外です。

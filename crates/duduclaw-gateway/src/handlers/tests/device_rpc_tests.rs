@@ -8,6 +8,7 @@ fn admin_ctx() -> UserContext {
 
 fn employee_ctx() -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: "u1".to_string(),
         email: "u1@test.local".to_string(),
         role: UserRole::Employee,

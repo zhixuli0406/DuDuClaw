@@ -545,6 +545,7 @@ pub fn trusted_dashboard_principal(
         Default::default()
     };
     Ok(duduclaw_auth::UserContext {
+        credential_epoch: 0,
         user_id: principal.into(),
         email,
         role,

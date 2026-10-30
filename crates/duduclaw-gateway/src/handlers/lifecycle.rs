@@ -35,6 +35,7 @@ impl MethodHandler {
         }).await.cloned()
     }
     pub async fn new(home_dir: PathBuf) -> Self {
+        crate::mfa::reload_policy(&home_dir);
         Self::with_extension(home_dir, Arc::new(crate::extension::NullExtension)).await
     }
 

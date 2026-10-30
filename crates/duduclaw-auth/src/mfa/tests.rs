@@ -28,9 +28,12 @@ fn setup() -> (tempfile::TempDir, UserDb, String) {
     (dir, db, user.id)
 }
 fn enroll(db: &UserDb, id: &str) -> (String, Vec<String>) {
-    let secret = db.mfa_begin(id, None, &Cipher, 3000).unwrap();
+    assert!(db.mfa_begin(id,None,&Cipher,3000).is_err());
+    let token=db.mfa_password_challenge(id,"password-test","test-session",3000).unwrap();
+    db.mfa_prepare_enrollment(&token,false,3000).unwrap();
+    let secret = db.mfa_begin(id, Some(&token), &Cipher, 3000).unwrap();
     let code = hotp(&decode_secret(&secret).unwrap(), 100, 6);
-    let codes = db.mfa_confirm(id, None, &code, &Cipher, 3000).unwrap();
+    let codes = db.mfa_confirm(id, Some(&token), &code, &Cipher, 3000).unwrap();
     (secret, codes)
 }
 #[test]
@@ -72,7 +75,7 @@ fn mfa_challenge_single_use_replay_restart_and_recovery() {
     let code = hotp(&decode_secret(&secret).unwrap(), 101, 6);
     assert_eq!(
         db2.mfa_verify(&challenge, &code, false, &Cipher, 3030)
-            .unwrap(),
+            .unwrap().0,
         id
     );
     assert!(
@@ -85,7 +88,7 @@ fn mfa_challenge_single_use_replay_restart_and_recovery() {
     assert!(db.mfa_verify(&other, &code, false, &Cipher, 3030).is_err());
     assert_eq!(
         db.mfa_verify(&other, &codes[0], true, &Cipher, 3030)
-            .unwrap(),
+            .unwrap().0,
         id
     );
     let third = db
@@ -141,12 +144,12 @@ fn mfa_ttl_attempt_cap_and_decrypt_failure() {
         .mfa_challenge(&id, FirstFactor::Password, false, 4000)
         .unwrap();
     assert!(
-        db.mfa_verify(&broken, &codes[0], true, &Broken, 4000)
+        db.mfa_verify(&broken, "000000", false, &Broken, 4000)
             .is_err()
     );
     assert!(db.mfa_active(&id).unwrap());
     assert!(
-        db.mfa_verify(&broken, &codes[0], true, &Cipher, 4000)
+        db.mfa_verify(&broken, &codes[0], true, &Broken, 4000)
             .is_ok()
     );
 }
@@ -168,6 +171,10 @@ fn mfa_enrollment_bound_to_user_and_purpose() {
         db.mfa_begin(&other.id, Some(&token), &Cipher, 3000)
             .is_err()
     );
+    assert!(db.mfa_begin(&id,Some(&token),&Cipher,3000).is_err());
+    db.mfa_prepare_enrollment(&token,true,3000).unwrap();
+    let proof=db.mfa_issue_enrollment_code(None,&id,3000).unwrap();
+    db.mfa_prove_enrollment(&token,&proof,3000).unwrap();
     let secret = db.mfa_begin(&id, Some(&token), &Cipher, 3000).unwrap();
     assert!(!db.mfa_active(&id).unwrap());
     let code = hotp(&decode_secret(&secret).unwrap(), 100, 6);
@@ -195,11 +202,15 @@ fn mfa_reset_reads_fresh_admin_and_invalidates_challenges() {
             UserRole::Employee,
         )
         .unwrap();
-    assert!(db.mfa_admin_reset(&employee.id, &id).is_err());
+    assert!(db.mfa_admin_reset(&employee.id, &id, &codes[0], &Cipher, 3000).is_err());
     let challenge = db
         .mfa_challenge(&id, FirstFactor::Password, false, 3000)
         .unwrap();
-    db.mfa_admin_reset(&id, &id).unwrap();
+    assert!(db.mfa_admin_reset(&id,&id,&codes[0],&Cipher,3000).is_err());
+    let admin=db.create_user("second@example.com","Second","password-test",UserRole::Admin).unwrap();
+    let (_,admin_codes)=enroll(&db,&admin.id);
+    assert!(db.mfa_admin_reset(&admin.id,&id,"wrong",&Cipher,3000).is_err());
+    db.mfa_admin_reset(&admin.id,&id,&admin_codes[0],&Cipher,3000).unwrap();
     assert!(!db.mfa_active(&id).unwrap());
     assert!(
         db.mfa_verify(&challenge, &codes[0], true, &Cipher, 3000)
@@ -208,7 +219,7 @@ fn mfa_reset_reads_fresh_admin_and_invalidates_challenges() {
     db.conn()
         .execute("UPDATE users SET role='employee' WHERE id=?1", [&id])
         .unwrap();
-    assert!(db.mfa_admin_reset(&id, &employee.id).is_err());
+    assert!(db.mfa_admin_reset(&id, &employee.id, &codes[0], &Cipher, 3000).is_err());
 }
 
 #[test]
@@ -274,4 +285,71 @@ fn mfa_legacy_token_issuer_is_not_called_after_activation() {
         .is_err()
     );
     assert!(!called.get());
+}
+
+#[test]
+fn mfa_password_step_up_session_binding_and_epoch_revocation() {
+    let (_dir,db,id)=setup();
+    assert!(db.mfa_password_challenge(&id,"wrong","session-a",3000).is_err());
+    let token=db.mfa_password_challenge(&id,"password-test","session-a",3000).unwrap();
+    db.mfa_prepare_enrollment(&token,false,3000).unwrap();
+    assert!(db.mfa_check_session(&token,&id,"session-b",3000).is_err());
+    assert!(db.mfa_check_session(&token,"other","session-a",3000).is_err());
+    assert!(db.mfa_check_session(&token,&id,"session-a",3300).is_err());
+    assert!(db.mfa_http_enrollment(&token,None,3000).is_err());
+    db.mfa_check_session(&token,&id,"session-a",3000).unwrap();
+    assert!(db.mfa_require_independent_proof(&token,3000).is_err());
+    let secret=db.mfa_begin(&id,Some(&token),&Cipher,3000).unwrap();
+    let codes=db.mfa_confirm(&id,Some(&token),&hotp(&decode_secret(&secret).unwrap(),100,6),&Cipher,3000).unwrap();
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch,1);
+    db.update_user(&id,None,None,Some("new-password")).unwrap();
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch,2);
+    db.mfa_change(&id,&codes[0],true,&Broken,3030).unwrap();
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch,3);
+    db.mfa_operator_reset("mfa@example.com").unwrap();
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch,4);
+}
+#[test]
+fn mfa_proof_is_single_use_user_bound_attempt_capped_and_hashed() {
+    let (_dir,db,id)=setup();
+    let other=db.create_user("other@example.com","Other","password-test",UserRole::Admin).unwrap();
+    assert!(db.mfa_issue_enrollment_code(Some(&id),&id,3000).is_err());
+    let code=db.mfa_issue_enrollment_code(Some(&other.id),&id,3000).unwrap();
+    let token=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    db.mfa_prepare_enrollment(&token,true,3000).unwrap();
+    assert!(db.mfa_begin(&id,Some(&token),&Cipher,3000).is_err());
+    assert!(db.mfa_prove_enrollment(&token,"wrong",3000).is_err());
+    db.mfa_prove_enrollment(&token,&code,3000).unwrap();
+    let second=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    db.mfa_prepare_enrollment(&second,true,3000).unwrap();
+    assert!(db.mfa_prove_enrollment(&second,&code,3000).is_err());
+    let code2=db.mfa_issue_enrollment_code(Some(&other.id),&id,3000).unwrap();
+    let hash:String=db.conn().query_row("SELECT code_hash FROM mfa_enrollment_codes WHERE user_id=?1",[&id],|r|r.get(0)).unwrap();
+    assert_ne!(hash,code2);
+    for _ in 0..4 { assert!(db.mfa_prove_enrollment(&second,"wrong",3000).is_err()); }
+    assert!(db.mfa_prove_enrollment(&second,&code2,3000).is_err());
+    assert!(db.mfa_prove_enrollment(&token,&code,3300).is_err());
+}
+#[test]
+fn mfa_channel_proof_cannot_be_used_as_login_otp_or_on_another_challenge() {
+    let (_dir,db,id)=setup();
+    db.bind_channel_identity(&id,"telegram","12345",true).unwrap();
+    let token=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    let otp=db.mfa_prepare_enrollment(&token,true,3000).unwrap().unwrap();
+    assert!(db.verify_otp(&token,&otp.code).is_err());
+    assert!(db.mfa_prepare_enrollment(&token,true,3000).is_err());
+    let second=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    db.mfa_prepare_enrollment(&second,true,3000).unwrap();
+    db.mfa_prove_enrollment(&token,&otp.code,3000).unwrap();
+    assert!(db.mfa_begin(&id,Some(&second),&Cipher,3000).is_err());
+}
+
+#[test]
+fn mfa_never_enrolled_password_change_preserves_epoch_zero_but_cancels_pending() {
+    let (_dir,db,id)=setup();
+    let token=db.mfa_password_challenge(&id,"password-test","session",3000).unwrap();
+    db.mfa_prepare_enrollment(&token,false,3000).unwrap();
+    db.update_user(&id,None,None,Some("new-password")).unwrap();
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch,0);
+    assert!(db.mfa_enrollment_user(&token,3000).is_err());
 }

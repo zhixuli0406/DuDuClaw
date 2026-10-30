@@ -32,6 +32,7 @@ async fn fixture(auto_login_off: bool) -> Fixture {
     let jwt = Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"));
     handler.set_user_db(db.clone(), jwt).await;
     let ctx = UserContext {
+        credential_epoch: 0,
         user_id: owner.id.clone(),
         email: owner.email.clone(),
         role: UserRole::Admin,
@@ -146,6 +147,7 @@ async fn other_accounts_always_need_password() {
         )
         .unwrap();
     let ctx = UserContext {
+        credential_epoch: 0,
         user_id: other.id.clone(),
         email: other.email.clone(),
         role: UserRole::Admin,

@@ -34,29 +34,41 @@ pub(super) async fn after_first_factor(
     first: FirstFactor,
 ) -> Option<axum::response::Response> {
     let personal = state.handler.resolve_edition_profile().await.is_personal();
-    let result: Result<Option<serde_json::Value>, String> = (|| {
-        let required = enforced(&state.home_dir, personal)?;
-        let active = state.user_db.mfa_active(&user.id)?;
-        if !active && !required {
-            return Ok(None);
+    let work = state.user_db.clone();
+    let user_id = user.id.clone();
+    let required = match enforced(&state.home_dir, personal) { Ok(v)=>v, Err(_)=>return Some(denied()) };
+    let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let active = work.mfa_active(&user_id)?;
+        if !active && !required { return Ok(None); }
+        let now = chrono::Utc::now().timestamp();
+        let challenge = work.mfa_challenge(&user_id, first, !active, now)?;
+        let delivery = if !active { work.mfa_prepare_enrollment(&challenge, true, now)? } else { None };
+        Ok(Some((active, challenge, delivery)))
+    }).await;
+    let result = match result {
+        Ok(Ok(Some((active, challenge, delivery)))) => {
+            if let Some(otp) = delivery {
+                if state.otp_delivery.deliver(&otp.channel, &otp.channel_user_id,
+                    &format!("DuDuClaw 雙因素註冊驗證碼：{}（5 分鐘內有效）", otp.code)).await.is_err() {
+                    return Some(denied());
+                }
+            }
+            Ok(Some(if active { serde_json::json!({"mfa_required":true,"challenge_id":challenge}) }
+                else { serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge}) }))
         }
-        let challenge = state.user_db.mfa_challenge(
-            &user.id,
-            first,
-            !active,
-            chrono::Utc::now().timestamp(),
-        )?;
-        Ok(Some(if active {
-            serde_json::json!({"mfa_required":true,"challenge_id":challenge})
-        } else {
-            serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge})
-        }))
-    })();
+        Ok(Ok(None)) => Ok(None),
+        _ => Err(()),
+    };
     match result {
         Ok(Some(body)) => Some(json_response(body)),
         Ok(None) => None,
         Err(_) => Some(denied()),
     }
+}
+
+pub(super) async fn legacy_token_allowed(state: &AppState) -> bool {
+    let personal = state.handler.resolve_edition_profile().await.is_personal();
+    matches!(enforced(&state.home_dir, personal), Ok(false))
 }
 
 pub(super) async fn refresh_allowed(state: &AppState, user: &str) -> bool {
@@ -91,12 +103,13 @@ pub(super) async fn socket_expired(state: &AppState, user: &str, expires: Option
 fn session(
     state: &AppState,
     user_id: &str,
+    verified_epoch: u64,
     recovery_codes: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     let user = state
         .user_db
         .get_user(user_id)?
-        .filter(|u| u.status == duduclaw_auth::UserStatus::Active)
+        .filter(|u| u.status == duduclaw_auth::UserStatus::Active && u.credential_epoch == verified_epoch)
         .ok_or("無法登入此帳號。")?;
     let bindings = state.user_db.get_user_agents(user_id)?;
     let access = bindings
@@ -138,14 +151,14 @@ pub(super) async fn verify(
     }
     let work = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let id = work.user_db.mfa_verify(
+        let (id, epoch) = work.user_db.mfa_verify(
             &body.challenge_id,
             &code.0,
             code.1,
             &Cipher(&work.home_dir),
             chrono::Utc::now().timestamp(),
         )?;
-        session(&work, &id, None)
+        session(&work, &id, epoch, None)
     })
     .await;
     match result {
@@ -177,6 +190,8 @@ pub(super) async fn verify(
 pub(super) struct EnrollBody {
     enrollment_token: String,
     code: Option<String>,
+    proof_code: Option<String>,
+    password: Option<String>,
 }
 
 pub(super) async fn enroll_begin(
@@ -212,8 +227,12 @@ async fn enroll(
         let id = work
             .user_db
             .mfa_enrollment_user(&body.enrollment_token, now)?;
+        work.user_db.mfa_http_enrollment(&body.enrollment_token, body.password.as_deref(), now)?;
+        work.user_db.mfa_prove_enrollment(&body.enrollment_token, body.proof_code.as_deref().unwrap_or(""), now)?;
+        work.user_db.mfa_require_independent_proof(&body.enrollment_token,now)?;
         let cipher = Cipher(&work.home_dir);
         if confirm {
+            let epoch = work.user_db.get_user(&id)?.ok_or("無法登入此帳號。")?.credential_epoch;
             let codes = work.user_db.mfa_confirm(
                 &id,
                 Some(&body.enrollment_token),
@@ -221,7 +240,7 @@ async fn enroll(
                 &cipher,
                 now,
             )?;
-            session(&work, &id, Some(codes))
+            session(&work, &id, epoch + 1, Some(codes))
         } else {
             let user = work.user_db.get_user(&id)?.ok_or("無法登入此帳號。")?;
             let secret = work

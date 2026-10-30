@@ -325,7 +325,12 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
         Ok(Ok(()))
     });
     match outcome {
-        Ok(inner) => inner,
+        Ok(inner) => {
+            if inner.is_ok() && path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
+                if let Some(home)=path.parent() { crate::mfa::reload_policy(home); }
+            }
+            inner
+        },
         Err(e) => Err(format!("failed to write {}: {e}", path.display())),
     }
 }

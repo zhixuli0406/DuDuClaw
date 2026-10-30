@@ -466,6 +466,13 @@ impl MethodHandler {
             return WsFrame::error_response("", "請使用 Dashboard 帳號登入後再連接 CLI。");
         }
 
+        if ctx.user_id == "system" && conn.peer.is_some() && !conn.pre_auth {
+            let personal=self.resolve_edition_profile().await.is_personal();
+            if !matches!(crate::mfa::enforced(&self.home_dir,personal),Ok(false)) {
+                return WsFrame::error_response("", "已要求雙因素驗證，請使用帳號重新登入。");
+            }
+        }
+
         // ── Live identity ───────────────────────────────────────────────
         // The JWT proves who the caller is; what they may do is read from
         // users.db now (`live_context.rs`), so an unbinding, a demotion or a
@@ -510,7 +517,7 @@ impl MethodHandler {
 
         // MFA is a gateway-owned authentication namespace, never delegated to
         // plugins. Every allowed method has an explicit authorization entry.
-        if method.split('.').next() == Some("mfa") || method == "users.mfa_reset" {
+        if method.split('.').next() == Some("mfa") || matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") {
             let Some(role) = mfa_rpc::minimum_role(method) else {
                 return WsFrame::error_response("", "不允許此操作。");
             };

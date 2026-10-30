@@ -91,6 +91,7 @@ fn admin_ctx() -> UserContext {
 
 fn manager_ctx() -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: "m1".to_string(),
         email: "m1@test.local".to_string(),
         role: UserRole::Manager,
