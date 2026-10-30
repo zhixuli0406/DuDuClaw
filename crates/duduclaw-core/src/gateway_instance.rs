@@ -203,7 +203,16 @@ mod tests {
         assert!(!held(c.path()));
         assert!(status(c.path()).1.unwrap().contains("another gateway"));
         drop(first);
-        acquire(c.path()).unwrap();
+        // A forked test child can briefly retain an inherited copy of the flock until exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            let result = acquire(c.path());
+            if result.is_ok() || std::time::Instant::now() >= deadline {
+                break result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        result.unwrap();
         assert!(
             status(c.path()).1.is_none(),
             "a later successful start clears the marker"
