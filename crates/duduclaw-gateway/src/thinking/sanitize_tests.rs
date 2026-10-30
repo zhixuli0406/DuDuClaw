@@ -120,6 +120,27 @@ fn anthropic_keys_are_replaced_whole_even_next_to_cjk() {
 }
 
 #[test]
+fn layered_masking_preserves_placeholders_in_both_orders() {
+    for marker in ["[REDACTED]", "[已遮罩的 API key cred_test]", "[已遮罩的密碼]", SECRET_PLACEHOLDER] {
+        let text = format!("金鑰是{marker}，然後呼叫");
+        assert_eq!(mask_text(&text, None), text);
+        assert_eq!(mask_secret_words(&text), text);
+    }
+    let home = tempfile::tempdir().unwrap();
+    let m = manager(home.path(), "[rules.marker_word]\ntype = \"regex\"\npattern = 'cred_test'\ncategory = \"TEST\"\npriority = 60\n");
+    let marker = "[已遮罩的 API key cred_test]";
+    assert_eq!(mask_text(marker, Some(m.engine())), marker);
+    let forged = format!("〔已遮蔽·AKIA{}〕", "A".repeat(16));
+    assert!(!mask_text(&forged, None).contains(&"A".repeat(16)));
+    let raw = format!("金鑰是{KEY}，然後呼叫");
+    let once = mask_text(&raw, None);
+    assert_eq!(once, format!("金鑰是{SECRET_PLACEHOLDER}，然後呼叫"));
+    assert_eq!(mask_text(&once, None), once);
+    let first = duduclaw_security::credential_detect::mask(&raw);
+    assert_eq!(mask_text(&first, None), first);
+}
+
+#[test]
 fn control_chars_and_think_tags_are_cleaned() {
     let out = mask_text("<think>想一下\u{7}\r\n\n\n\n下一步</think>\t好", None);
     assert_eq!(out, "想一下\n\n下一步\t好");

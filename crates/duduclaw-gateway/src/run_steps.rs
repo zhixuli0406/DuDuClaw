@@ -628,8 +628,35 @@ const SECRETISH_KEYS: &[&str] = &[
 /// `curl -H "Authorization: Bearer sk-…"`). Values end at whitespace or a
 /// closing quote. Pure, allocation-light, no regex dependency.
 pub(crate) fn mask_secretish(s: &str) -> String {
-    let masked = duduclaw_security::credential_detect::mask(s);
+    if s.len() > duduclaw_security::credential_detect::MAX_SCAN_BYTES {
+        return duduclaw_security::credential_detect::UNAVAILABLE_MASK.into();
+    }
+    let Ok(findings) = duduclaw_security::credential_detect::detect(s) else {
+        return duduclaw_security::credential_detect::UNAVAILABLE_MASK.into();
+    };
+    // Mask complete structures before the key scanner can split their values.
+    // Existing display markers are excluded by detect and stay byte-identical.
+    let mut masked = String::with_capacity(s.len());
+    let mut cursor = 0;
+    for finding in findings {
+        masked.push_str(&s[cursor..finding.span.start]);
+        masked.push_str("[REDACTED]");
+        cursor = finding.span.end;
+    }
+    masked.push_str(&s[cursor..]);
     let s = masked.as_str();
+    let mut out = String::with_capacity(s.len());
+    let mut end = 0;
+    for span in duduclaw_core::secret_redact::redaction_placeholder_ranges(s) {
+        out.push_str(&mask_secretish_values(&s[end..span.start]));
+        out.push_str(&s[span.clone()]);
+        end = span.end;
+    }
+    out.push_str(&mask_secretish_values(&s[end..]));
+    duduclaw_security::credential_detect::mask(&out)
+}
+
+fn mask_secretish_values(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while !rest.is_empty() {
@@ -975,6 +1002,24 @@ mod tests {
         let only_a = store.recent_tool_step_meta("a", 100).unwrap();
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].0, "s:1");
+    }
+
+    #[test]
+    fn mask_secretish_preserves_layered_placeholders() {
+        for marker in ["[REDACTED]", "[已遮罩的 API key cred_test]", "[已遮罩的密碼]", "〔已遮蔽·secret〕"] {
+            let text = format!("api_key={marker} --verbose");
+            assert_eq!(mask_secretish(&text), text);
+            assert_eq!(mask_secretish(&duduclaw_security::credential_detect::mask(&text)), text);
+        }
+        let connection = "postgres://alice:prefixsecretTAIL@localhost/db";
+        assert_eq!(mask_secretish(connection), "[REDACTED]");
+        let forged = format!("〔已遮蔽·AKIA{}〕", "A".repeat(16));
+        assert!(!mask_secretish(&forged).contains(&"A".repeat(16)));
+        let text = "api_key=sk-live-99 --verbose";
+        let once = mask_secretish(text);
+        assert_eq!(once, "api_key=[REDACTED] --verbose");
+        assert_eq!(mask_secretish(&once), once);
+        assert_eq!(duduclaw_security::credential_detect::mask(&once), once);
     }
 
     #[test]

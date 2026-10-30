@@ -72,8 +72,7 @@ pub fn mask_text(text: &str, engine: Option<&RuleEngine>) -> String {
         None => step1,
     };
     let step3 = mask_secret_words(&step2);
-    let credentials_masked = duduclaw_security::credential_detect::mask(&step3)
-        .replace("[已遮罩的密碼]", SECRET_PLACEHOLDER);
+    let credentials_masked = duduclaw_security::credential_detect::mask(&step3);
     clean_text(&credentials_masked)
 }
 
@@ -98,6 +97,9 @@ fn mask_rule_spans(text: &str, engine: &RuleEngine) -> String {
         tool_name: "thinking".to_string(),
     };
     let spans = engine.apply(text, &source);
+    let placeholders = duduclaw_core::secret_redact::redaction_placeholder_ranges(text);
+    let spans: Vec<_> = spans.iter().filter(|m| !placeholders.iter().any(|span|
+        span.start <= m.span.start && m.span.end <= span.end)).collect();
     if spans.is_empty() {
         return text.to_string();
     }
@@ -184,6 +186,18 @@ fn mask_secret_run(run: &str) -> String {
 /// Step 3: scan each maximal ASCII run separately so a key written right
 /// after CJK text (`金鑰是sk-ant-…`) is still seen as its own word.
 pub fn mask_secret_words(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut end = 0;
+    for span in duduclaw_core::secret_redact::redaction_placeholder_ranges(text) {
+        out.push_str(&mask_secret_words_unmasked(&text[end..span.start]));
+        out.push_str(&text[span.clone()]);
+        end = span.end;
+    }
+    out.push_str(&mask_secret_words_unmasked(&text[end..]));
+    out
+}
+
+fn mask_secret_words_unmasked(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut start = 0usize;
     let mut ascii: Option<bool> = None;

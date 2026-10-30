@@ -10149,8 +10149,15 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     match duduclaw_core::which_claude() {
         Some(path) => {
             // Try `claude auth status --json` to verify auth
-            match duduclaw_core::platform::async_command_for(&path)
-                .args(["auth", "status", "--json"])
+            let mut cmd = duduclaw_core::platform::async_command_for(&path);
+            duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+            if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+            }
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                cmd.env("ANTHROPIC_API_KEY", key);
+            }
+            match cmd.args(["auth", "status", "--json"])
                 .env_remove("CLAUDECODE")
                 .stdin(std::process::Stdio::null())
                 .output()
@@ -10375,6 +10382,10 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
     println!("  活體試跑：grok -p \"ping\"（15s 上限）");
     let args = ["-p".to_string(), "ping".to_string()];
     let mut cmd = duduclaw_core::platform::async_command_for(&path);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+    if let Ok(key) = std::env::var("XAI_API_KEY") {
+        cmd.env("XAI_API_KEY", key);
+    }
     cmd.args(&args).stdin(Stdio::null());
     for (k, v) in &home_env {
         cmd.env(k, v);
@@ -10427,7 +10438,10 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
     if empty_exit0 && !is_auth {
         println!();
         println!("  PTY 一次性重試（真 TTY 下重跑 grok -p \"ping\"，30s 上限）");
-        let mut env: std::collections::HashMap<String, String> = home_env.iter().cloned().collect();
+        let mut env: std::collections::HashMap<String, String> =
+            duduclaw_core::spawn_env::agent_cli_spawn_env_pairs().into_iter()
+                .map(|(key, value)| (key.to_string(), value)).collect();
+        env.extend(home_env.iter().cloned());
         if api_key_set {
             if let Ok(k) = std::env::var("XAI_API_KEY") {
                 env.insert("XAI_API_KEY".to_string(), k);
@@ -10439,11 +10453,8 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
             env,
             None,
             Duration::from_secs(30),
-            // WP-8B added the `clear_env` param to `invoke_oneshot`; this
-            // call site is an operator-run `duduclaw doctor`-style
-            // diagnostic (not the gateway's automated dispatch path), so it
-            // keeps `false` — byte-identical prior behavior.
-            false,
+            // Keep the retry on the same allowlisted base as the pipe probe.
+            true,
         )
         .await
         {
@@ -14828,4 +14839,40 @@ skill_auto_activate = false
 skill_security_scan = true
 "#
     )
+}
+
+#[cfg(all(test, unix))]
+mod doctor_probe_env_tests {
+    #[tokio::test]
+    async fn grok_pipe_and_pty_probes_drop_ambient_secrets() {
+        if let Ok(home) = std::env::var("DUDUCLAW_TEST_GROK_DIAGNOSTIC_HOME") {
+            super::grok_cli_diagnostic(std::path::Path::new(&home)).await;
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("grok");
+        std::fs::write(&script, r#"#!/bin/sh
+if [ "${CLAUDE_CODE_MESSAGING_TOKEN+x}" = x ] || [ "${ANTHROPIC_API_KEY+x}" = x ]; then printf 'ambient-secret-leaked' >&2; exit 71; fi
+if [ "$1" = --version ]; then printf 'fixture-version'; exit 0; fi
+if [ "$XAI_API_KEY" != fixture-xai ] || [ "$GROK_HOME" != "$HOME/grok-config" ] || [ "$USERPROFILE" != "$HOME" ]; then printf 'explicit-env-missing' >&2; exit 72; fi
+if [ -t 1 ]; then printf 'pty-probe-ok'; fi
+"#).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "doctor_probe_env_tests::grok_pipe_and_pty_probes_drop_ambient_secrets", "--nocapture"])
+            .env("DUDUCLAW_TEST_GROK_DIAGNOSTIC_HOME", root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).env("HOME", root.path())
+            .env("GROK_HOME", root.path().join("grok-config"))
+            .env("XAI_API_KEY", "fixture-xai")
+            .env("CLAUDE_CODE_MESSAGING_TOKEN", "fixture-messaging")
+            .env("ANTHROPIC_API_KEY", "fixture-anthropic")
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("fixture-version"), "{stdout}");
+        assert!(stdout.contains("PTY 重試回傳"), "{stdout}");
+        assert!(!stdout.contains("ambient-secret-leaked"), "{stdout}");
+        assert!(!stdout.contains("explicit-env-missing"), "{stdout}");
+    }
 }

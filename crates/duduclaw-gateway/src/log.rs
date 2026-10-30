@@ -498,6 +498,18 @@ mod format_and_reload_tests {
 
 #[cfg(test)]
 mod credential_log_tests {
+    #[test]
+    fn layered_placeholders_survive_plain_and_json_logs() {
+        for marker in ["[REDACTED]", "[已遮罩的 API key cred_test]", "〔已遮蔽·secret〕"] {
+            let text = format!("金鑰是{marker}，然後呼叫");
+            assert_eq!(super::masked_log_event(text.as_bytes(), false), text);
+            let json = serde_json::json!({"message": text, "api_key": marker}).to_string();
+            let masked = super::masked_log_event(json.as_bytes(), false);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&masked).unwrap()["message"], text);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&masked).unwrap()["api_key"], marker);
+            assert_eq!(super::masked_log_event(masked.as_bytes(), false), masked);
+        }
+    }
     use super::*;
 
     // Security regression; not run (owner forbids builds).

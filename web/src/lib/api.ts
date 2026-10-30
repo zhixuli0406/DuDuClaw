@@ -5226,8 +5226,7 @@ export interface CostPriceCliff {
 }
 
 /** Response of `cost.summary`. `available:false` = telemetry not initialized;
- *  all numeric fields are then absent. Costs are in millicents (1 cent =
- *  1000 millicents). */
+ *  all numeric fields are then absent. Cost fields are in cents. */
 export interface CostSummary {
   available: boolean;
   period?: string;

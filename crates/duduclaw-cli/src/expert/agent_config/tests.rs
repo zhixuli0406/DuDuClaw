@@ -503,7 +503,8 @@ async fn imported_memory_is_revoked_by_forget_source_and_report_has_no_home_path
 
 #[tokio::test]
 async fn native_profile_requires_preview_and_round_trips_exact_bytes() {
-    use duduclaw_core::agent_profile::{AgentProfile, ExportFormat, export};
+    use duduclaw_core::agent_profile::{AgentProfile, ExportFormat};
+    use duduclaw_security::agent_profile::export;
     let home = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();
     let profile = AgentProfile {

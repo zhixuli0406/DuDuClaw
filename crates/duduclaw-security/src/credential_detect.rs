@@ -141,7 +141,11 @@ pub fn mask_json(value: &mut serde_json::Value) {
                         "connectionstring" => "connection_string",
                         _ => "other",
                     };
-                    child = serde_json::Value::String(masked_placeholder(kind));
+                    let text = child.as_str().unwrap_or_default();
+                    let placeholders = duduclaw_core::secret_redact::redaction_placeholder_ranges(text);
+                    if placeholders.as_slice() != [0..text.len()] {
+                        child = serde_json::Value::String(masked_placeholder(kind));
+                    }
                 } else {
                     mask_json(&mut child);
                 }
@@ -182,6 +186,7 @@ fn account_hint(text: &str) -> Result<Option<String>, DetectError> {
 fn detect_inner(text: &str, limit: usize) -> Result<Vec<Finding>, DetectError> {
     let text = duduclaw_core::truncate_bytes(text, limit);
     let account = account_hint(text)?;
+    let placeholders = duduclaw_core::secret_redact::redaction_placeholder_ranges(text);
     let mut findings: Vec<Finding> = Vec::new();
     let mut occupied = vec![None; text.len()];
     for rule in rules()? {
@@ -191,6 +196,11 @@ fn detect_inner(text: &str, limit: usize) -> Result<Vec<Finding>, DetectError> {
                 .and_then(|tail| tail.chars().next())
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
             {
+                continue;
+            }
+            // Do not classify a complete marker, or a word inside it, as a
+            // credential. A larger quoted value containing a marker still masks.
+            if placeholders.iter().any(|span| span.start <= value.start() && value.end() <= span.end) {
                 continue;
             }
             // Placeholders and routine status statements are not credentials.
@@ -333,6 +343,25 @@ fn mask_detected(text: &str, detected: Result<Vec<Finding>, DetectError>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layered_placeholders_are_not_credentials() {
+        for marker in ["[REDACTED]", "[已遮罩的 API key cred_test]", "[已遮罩的密碼]", "〔已遮蔽·secret〕"] {
+            for text in [format!("金鑰是{marker}，然後呼叫"), format!("password: \"{marker}\""),
+                format!("api_key={marker} --verbose"), format!("token: {marker}")] {
+                assert_eq!(mask(&text), text);
+                assert_eq!(mask_document(&text).unwrap(), text);
+            }
+        }
+        let mut json = serde_json::json!({"api_key":"[已遮罩的 API key cred_test]", "password":"[REDACTED] suffix-secret"});
+        mask_json(&mut json);
+        assert_eq!(json["api_key"], "[已遮罩的 API key cred_test]");
+        assert!(!json.to_string().contains("suffix-secret"));
+        let forged = format!("〔已遮蔽·AKIA{}〕", "A".repeat(16));
+        assert!(!mask(&forged).contains(&"A".repeat(16)));
+        let text = "password: \"[REDACTED] still-secret\"";
+        assert!(!mask(text).contains("still-secret"));
+    }
 
     #[test]
     fn numeric_uuid_criteria_ids_are_not_telegram_tokens() {

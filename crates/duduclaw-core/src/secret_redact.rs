@@ -28,6 +28,46 @@
 //! refused`, host names, CJK text) survive byte-identical.
 
 use std::borrow::Cow;
+use std::ops::Range;
+
+/// Complete, value-free display markers shared by the masking layers.
+/// Match the marker grammar, never arbitrary bracketed text containing secrets.
+pub fn redaction_placeholder_ranges(input: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    for (start, c) in input.char_indices() {
+        if start < cursor || !matches!(c, '[' | '〔') { continue; }
+        let tail = &input[start..];
+        let len = if tail.starts_with("[REDACTED]") {
+            Some("[REDACTED]".len())
+        } else if tail.starts_with("[憑證偵測不可用，已遮罩此訊息]") {
+            Some("[憑證偵測不可用，已遮罩此訊息]".len())
+        } else if let Some(body) = tail.strip_prefix("[已遮罩的") {
+            body.find(']').and_then(|end| {
+                let body = &body[..end];
+                let valid = ["密碼", " API key", "權杖", "私密金鑰", "憑證", "連線字串", "Cookie"].iter().any(|label| {
+                    body.strip_prefix(label).is_some_and(|suffix| suffix.is_empty()
+                        || suffix.strip_prefix(" cred_").is_some_and(|id| !id.is_empty()
+                            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')))
+                });
+                valid.then_some("[已遮罩的".len() + end + 1)
+            })
+        } else if let Some(body) = tail.strip_prefix("〔已遮蔽·") {
+            body.find('〕').and_then(|end| {
+                let category = &body[..end];
+                (matches!(category, "secret" | "text") || (!category.is_empty() && category.len() <= 32
+                    && category.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+                    && !has_secret_prefix(category) && !category.starts_with("AKIA") && !category.starts_with("ASIA")))
+                    .then_some("〔已遮蔽·".len() + end + '〕'.len_utf8())
+            })
+        } else { None };
+        if let Some(len) = len {
+            cursor = start + len;
+            ranges.push(start..cursor);
+        }
+    }
+    ranges
+}
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -64,10 +104,23 @@ pub fn redact_secrets_with_count(input: &str) -> (Cow<'_, str>, usize) {
     let mut word_start: Option<usize> = None;
     let mut prev_word: Option<&str> = None;
 
+    let mut placeholders = redaction_placeholder_ranges(input).into_iter().peekable();
+
     // Walk the string word-by-word, keeping the delimiters verbatim. A "word"
     // is any run of non-delimiter characters; URLs, bare tokens and
     // `Bearer <tok>` pairs are all recognised at that granularity.
     for (i, c) in input.char_indices() {
+        if placeholders.peek().is_some_and(|span| i >= span.end) { placeholders.next(); }
+        if let Some(span) = placeholders.peek().filter(|span| span.contains(&i)) {
+            if i == span.start {
+                if let Some(s) = word_start.take() {
+                    push_word(&mut out, input, s, &input[s..i], prev_word, &mut changed, &mut count);
+                }
+                if changed { out.push_str(&input[span.clone()]); }
+                prev_word = None;
+            }
+            continue;
+        }
         if is_delim(c) {
             if let Some(s) = word_start.take() {
                 let w = &input[s..i];
@@ -429,6 +482,25 @@ fn last_chars(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layered_placeholders_are_preserved_and_neighboring_secrets_are_masked() {
+        for marker in ["[REDACTED]", "[已遮罩的 API key cred_test]", "[已遮罩的密碼]", "〔已遮蔽·secret〕"] {
+            let text = format!("Bearer {marker} https://example.test/?api_key={marker}&offset=1");
+            assert_eq!(redact_secrets(&text), text);
+            let text = format!("{marker} {}", anthropic_key());
+            let once = redact_secrets(&text);
+            assert!(once.starts_with(marker));
+            assert!(!once.contains("abcdefghijklmnopqrstuvwx"));
+            assert_eq!(redact_secrets(&once), once);
+        }
+    }
+
+    #[test]
+    fn credential_shaped_categories_are_not_safe_placeholders() {
+        let marker = format!("〔已遮蔽·AKIA{}〕", "A".repeat(16));
+        assert!(redaction_placeholder_ranges(&marker).is_empty());
+    }
 
     // ── Synthetic fixtures, assembled at run time ────────────────────────────
     //
