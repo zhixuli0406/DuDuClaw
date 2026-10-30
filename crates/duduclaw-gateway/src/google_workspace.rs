@@ -17,7 +17,9 @@
 //!   `agent.toml [capabilities] approval_required_tools`.
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::path::Path;
 use std::time::Duration;
 

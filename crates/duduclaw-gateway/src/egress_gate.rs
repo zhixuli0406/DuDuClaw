@@ -145,7 +145,7 @@ mod tests {
     fn precheck_and_confirm_share_one_shadow_row_and_tool_log() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
-        let taint = crate::egress_guard::Taint { tainted: true, sources: vec!["memory_search".into()] };
+        let taint = crate::egress_guard::Taint { tainted: true, sources: vec!["memory_search".into()], ..crate::egress_guard::Taint::unknown() };
         let call_id = uuid::Uuid::new_v4().to_string();
         evaluate_with_call(home.path(), "bot", "send_message", true, taint.clone(), &call_id).unwrap();
         confirm_dispatch_with_call(home.path(), "bot", "send_message", true, taint, None, &call_id).unwrap();

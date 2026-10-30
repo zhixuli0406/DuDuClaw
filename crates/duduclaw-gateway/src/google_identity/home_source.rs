@@ -252,8 +252,10 @@ pub(crate) struct RawClientSnapshot {
 
 pub(crate) struct ObservedSource {
     binding: SourceBinding,
+    #[cfg(test)]
     enabled_binding: SourceBinding,
     oauth_binding: SourceBinding,
+    #[cfg(test)]
     disabled_binding: SourceBinding,
     stamp: SourceStamp,
     master: bool,
@@ -366,6 +368,7 @@ impl ObservedSource {
         };
         let mut enabled_projection = projection.clone();
         enabled_projection["google_workspace"] = json!(true);
+        #[cfg(test)]
         let enabled_stamp = SourceStamp {
             configuration: RawDigest::of(
                 &serde_json::to_vec(&enabled_projection).map_err(|_| Error::Invalid)?,
@@ -383,11 +386,14 @@ impl ObservedSource {
             resolver: stamp.resolver.clone(),
             sa_key: None,
         };
-        let mut disabled_projection = projection;
-        disabled_projection["google_workspace"] = json!(false);
+        #[cfg(test)]
         let disabled_stamp = SourceStamp {
             configuration: RawDigest::of(
-                &serde_json::to_vec(&disabled_projection).map_err(|_| Error::Invalid)?,
+                &serde_json::to_vec(&{
+                    let mut disabled_projection = projection;
+                    disabled_projection["google_workspace"] = json!(false);
+                    disabled_projection
+                }).map_err(|_| Error::Invalid)?,
             ),
             ..stamp.clone()
         };
@@ -428,10 +434,12 @@ impl ObservedSource {
             source: RawDigest::of(&serde_json::to_vec(&oauth_stamp).map_err(|_| Error::Invalid)?),
             ..binding.clone()
         };
+        #[cfg(test)]
         let enabled_binding = SourceBinding {
             source: RawDigest::of(&serde_json::to_vec(&enabled_stamp).map_err(|_| Error::Invalid)?),
             ..binding.clone()
         };
+        #[cfg(test)]
         let disabled_binding = SourceBinding {
             source: RawDigest::of(
                 &serde_json::to_vec(&disabled_stamp).map_err(|_| Error::Invalid)?,
@@ -440,8 +448,10 @@ impl ObservedSource {
         };
         Ok(Self {
             binding,
+            #[cfg(test)]
             enabled_binding,
             oauth_binding,
+            #[cfg(test)]
             disabled_binding,
             stamp,
             master,
@@ -474,6 +484,7 @@ impl ObservedSource {
     pub(crate) fn oauth_binding(&self) -> &SourceBinding {
         &self.oauth_binding
     }
+    #[cfg(test)]
     pub(crate) fn binding_with_master(&self, enabled: bool) -> &SourceBinding {
         if enabled {
             &self.enabled_binding

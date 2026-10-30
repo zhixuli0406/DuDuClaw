@@ -1729,14 +1729,14 @@ mod tests {
         let agent_dir = make_test_agent_dir(home, "ins", None);
         std::fs::write(agent_dir.join("INSTRUCTIONS.md"), "v1").unwrap();
         // First check establishes the baseline: no row.
-        check_instructions_integrity_with_audit(home, "ins").await;
+        check_profile_integrity_with_audit(home, "ins", duduclaw_security::soul_guard::ProtectedDoc::Instructions).await;
         assert!(read_audit_rows(home, "_instructions_integrity_drift").is_empty());
         std::fs::write(agent_dir.join("INSTRUCTIONS.md"), "edited outside").unwrap();
-        check_instructions_integrity_with_audit(home, "ins").await;
-        check_instructions_integrity_with_audit(home, "ins").await;
+        check_profile_integrity_with_audit(home, "ins", duduclaw_security::soul_guard::ProtectedDoc::Instructions).await;
+        check_profile_integrity_with_audit(home, "ins", duduclaw_security::soul_guard::ProtectedDoc::Instructions).await;
         assert_eq!(read_audit_rows(home, "_instructions_integrity_drift").len(), 1);
         std::fs::write(agent_dir.join("INSTRUCTIONS.md"), "edited again").unwrap();
-        check_instructions_integrity_with_audit(home, "ins").await;
+        check_profile_integrity_with_audit(home, "ins", duduclaw_security::soul_guard::ProtectedDoc::Instructions).await;
         assert_eq!(read_audit_rows(home, "_instructions_integrity_drift").len(), 2);
     }
 

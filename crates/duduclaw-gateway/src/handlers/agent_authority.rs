@@ -308,7 +308,7 @@ mod tests {
         let deny = policy("'deny'");
         let allow = policy("'allow'");
         assert!(authority_diff(&allow, &deny).is_empty());
-        assert_eq!(authority_diff(&deny, &allow).iter().map(|c| c.key).collect::<Vec<_>>(), vec!["budget.when_unavailable"]);
+        assert_eq!(authority_diff(&deny, &allow).into_iter().map(|c| c.key).collect::<Vec<_>>(), vec!["budget.when_unavailable"]);
         assert_eq!(authority_diff(&deny, &t("")).len(), 1, "removing deny restores allow");
         assert_eq!(authority_diff(&policy("'typo'"), &allow).len(), 1, "unknown is effectively deny");
         assert!(authority_diff(&deny, &policy("42")).is_empty());

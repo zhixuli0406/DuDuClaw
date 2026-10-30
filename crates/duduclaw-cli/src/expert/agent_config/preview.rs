@@ -43,7 +43,7 @@ pub(crate) fn digest(preview: &Value) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn require_confirmation(
+pub(in crate::expert) fn require_confirmation(
     bundle: &ImportBundle, dry_run: bool, confirmation: Option<&str>, report: &mut Report,
 ) -> Result<()> {
     require_plan_confirmation(bundle, Value::Null, dry_run, confirmation, report)
@@ -51,7 +51,7 @@ pub(crate) fn require_confirmation(
 
 /// Bind the destination and all pre-existing content a replace will retire.
 /// Runtime-generated audit ids/timestamps are not installer-controlled payloads.
-pub(crate) fn bind_context(ctx: &crate::expert::install::InstallCtx, mut effects: Value) -> Result<Value> {
+pub(in crate::expert) fn bind_context(ctx: &crate::expert::install::InstallCtx, mut effects: Value) -> Result<Value> {
     use std::path::{Component, Path};
     fn fingerprint(path: &Path, total: &mut u64) -> Result<Value> {
         use std::io::Read;
@@ -108,7 +108,7 @@ pub(crate) fn bind_context(ctx: &crate::expert::install::InstallCtx, mut effects
 }
 
 /// Both preview and confirmation derive this from the exact resolved write plan.
-pub(crate) fn require_plan_confirmation(
+pub(in crate::expert) fn require_plan_confirmation(
     bundle: &ImportBundle, effects: Value, dry_run: bool, confirmation: Option<&str>, report: &mut Report,
 ) -> Result<()> {
     crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::markers())?;

@@ -802,7 +802,7 @@ mod tests {
         std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
         let gate = ThirdPartyGate::new(home.path(), "a1", "crm", "proxy");
         let call = uuid::Uuid::new_v4().to_string();
-        let taint = crate::egress_guard::Taint { tainted: true, sources: vec!["memory_search".into()] };
+        let taint = crate::egress_guard::Taint { tainted: true, sources: vec!["memory_search".into()], ..crate::egress_guard::Taint::unknown() };
         let approved = gate.check_call_with_taint_and_id("put", &json!({}), taint.clone(), &call).await.unwrap();
         crate::egress_gate::confirm_dispatch_with_call(home.path(), "a1", "crm.put", true, taint, approved.as_ref(), &call).unwrap();
         let report = crate::egress_shadow::report(home.path(),7).unwrap();
@@ -829,7 +829,7 @@ mod tests {
         for mode in ["off", "shadow"] {
             std::fs::write(home.path().join("config.toml"), format!("[security]\negress_guard='off'\nrecipient_guard='{mode}'\n")).unwrap();
             assert!(gate.check_call_with_taint("unknown_send", &json!({"to":"line:visitor"}),
-                crate::egress_guard::Taint { tainted: false, sources: vec![] }).await.unwrap().is_none());
+                crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None }).await.unwrap().is_none());
             assert!(!home.path().join("approvals.db").exists());
             assert_eq!(home.path().join("tool_calls.jsonl").exists(), mode == "shadow");
         }
@@ -846,10 +846,10 @@ mod tests {
         std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\nrecipient_guard='ask'\n").unwrap();
         let gate = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "proxy", ProcessLane::Normal);
         gate.filter_list_result(&mut listing());
-        assert!(gate.check_call_with_taint("get", &json!({}), crate::egress_guard::Taint { tainted: false, sources: vec![] }).await.unwrap().is_none());
+        assert!(gate.check_call_with_taint("get", &json!({}), crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None }).await.unwrap().is_none());
         let broker = ApprovalBroker::open(home.path()).unwrap();
         let args = json!({"to":"line:visitor", "body":"hello"});
-        let call = gate.check_call_with_taint("put", &args, crate::egress_guard::Taint { tainted: false, sources: vec![] });
+        let call = gate.check_call_with_taint("put", &args, crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None });
         let decision = async {
             let request = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {

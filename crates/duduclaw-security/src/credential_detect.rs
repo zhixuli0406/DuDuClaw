@@ -209,8 +209,8 @@ pub fn detect(text: &str) -> Result<Vec<Finding>, DetectError> {
     guarded_detect(|| detect_inner(text, MAX_SCAN_BYTES))
 }
 
-fn guarded_detect(scan: impl FnOnce() -> Result<Vec<Finding>, DetectError> + std::panic::UnwindSafe)
-    -> Result<Vec<Finding>, DetectError>
+fn guarded_detect<T>(scan: impl FnOnce() -> Result<T, DetectError> + std::panic::UnwindSafe)
+    -> Result<T, DetectError>
 {
     std::panic::catch_unwind(scan).unwrap_or(Err(DetectError))
 }

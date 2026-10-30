@@ -3,6 +3,7 @@
 use serde_json::json;
 use serde_json::Value;
 
+#[cfg(test)]
 pub(crate) use duduclaw_gateway::egress_gate::check;
 
 pub(crate) fn model_visible_payload(response: &Value) -> bool {

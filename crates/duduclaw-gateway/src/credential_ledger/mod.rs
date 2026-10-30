@@ -209,8 +209,14 @@ static BLOCKING_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 impl BlockingJob {
     fn acquire() -> Option<Self> {
         use std::sync::atomic::Ordering;
-        BLOCKING_JOBS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < 4).then_some(n + 1))
-            .ok().map(|_| Self)
+        let mut current = BLOCKING_JOBS.load(Ordering::Acquire);
+        while current < 4 {
+            match BLOCKING_JOBS.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+        None
     }
 }
 impl Drop for BlockingJob {
