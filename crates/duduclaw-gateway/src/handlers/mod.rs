@@ -508,6 +508,18 @@ impl MethodHandler {
             return enterprise_only_reject_frame();
         }
 
+        // MFA is a gateway-owned authentication namespace, never delegated to
+        // plugins. Every allowed method has an explicit authorization entry.
+        if method.split('.').next() == Some("mfa") || method == "users.mfa_reset" {
+            let Some(role) = mfa_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不允許此操作。");
+            };
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return self.dispatch_org(method, params, ctx, conn).await;
+        }
+
         // ── Plugin extension dispatch ──────
         // Try extension first; if it returns Some, the method is handled.
         if let Some(frame) = self
@@ -527,3 +539,5 @@ impl MethodHandler {
         Box::pin(self.dispatch_core(method, params, ctx, conn)).await
     }
 }
+
+mod mfa_rpc;

@@ -2362,6 +2362,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/login", post(handle_login))
         .route("/api/otp/request", post(handle_otp_request))
         .route("/api/otp/verify", post(handle_otp_verify))
+        .route("/api/mfa/verify", post(server_mfa::verify))
+        .route("/api/mfa/enroll/begin", post(server_mfa::enroll_begin))
+        .route("/api/mfa/enroll/confirm", post(server_mfa::enroll_confirm))
         .route("/api/channel-identity/bind", post(handle_channel_bind))
         .route(
             "/api/channel-identity/list",
@@ -3206,6 +3209,10 @@ async fn handle_login(
     };
 
     // Get agent bindings for this user
+    if let Some(response) = server_mfa::after_first_factor(&state, &user, duduclaw_auth::mfa::FirstFactor::Password).await {
+        return response;
+    }
+
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
     let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
         .iter()
@@ -3214,7 +3221,7 @@ async fn handle_login(
 
     // Issue tokens
     let (access_token, refresh_token) =
-        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -3363,6 +3370,10 @@ async fn handle_otp_verify(
         }
     };
 
+    if let Some(response) = server_mfa::after_first_factor(&state, &user, duduclaw_auth::mfa::FirstFactor::ChannelOtp).await {
+        return response;
+    }
+
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
     let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
         .iter()
@@ -3370,7 +3381,7 @@ async fn handle_otp_verify(
         .collect();
 
     let (access_token, refresh_token) =
-        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -3709,6 +3720,13 @@ async fn handle_refresh(
                 .into_response();
         }
     };
+
+    // Existing access tokens and open connections are not revoked. Stop renewal;
+    // the caller enrolls when its current access token naturally expires.
+    if !server_mfa::refresh_allowed(&state, &user.id).await {
+        return (axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "請重新登入並完成雙因素驗證註冊。"}))).into_response();
+    }
 
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
     let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
@@ -15802,6 +15820,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     let mut pre_auth = false;
     let mut legacy_admin_authenticated = false;
     let mut dashboard_session: Option<(String, String)> = None;
+    let mut access_expires: Option<u64> = None;
 
     // --- Authentication gate ---
     // Resolve a UserContext from the first "connect" message.
@@ -15863,11 +15882,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     Ok(ctx) => {
                                         // Session provenance comes only from this
                                         // verified JWT, never connect parameters.
+                                        access_expires = Some(0);
                                         dashboard_session = state
                                             .jwt_config
                                             .verify_access_token(jwt_str)
                                             .ok()
                                             .and_then(|claims| {
+                                                access_expires = Some(claims.exp);
                                                 claims.jti.map(|jti| (claims.sub, jti))
                                             });
                                         // `must_change_password` is surfaced here so a
@@ -16148,6 +16169,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
         tokio::select! {
             // ── Heartbeat ping ─────────────────────────────
             _ = heartbeat_interval.tick() => {
+                if server_mfa::socket_expired(&state, &user_ctx.user_id, access_expires).await {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
                 if last_pong.elapsed().as_secs() > 60 {
                     warn!("Dashboard WebSocket heartbeat timeout");
                     break;
@@ -18041,3 +18066,6 @@ mod live_events_socket_tests {
         server.abort();
     }
 }
+
+#[path = "server_mfa.rs"]
+mod server_mfa;

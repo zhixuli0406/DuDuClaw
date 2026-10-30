@@ -196,3 +196,7 @@ CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 `preset_bindings.toml`（哪個員工套用哪個職務 preset）是狀態，不是包格式，從沒被棄用。
 製作端指令 `expert pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`
 維持在 `duduclaw expert` 底下。
+
+## MFA (Unreleased)
+
+MFA 第一階段為 `/api/login` 與 `/api/otp/verify` 新增條件式回應。未註冊且未強制時仍維持 `access_token`、`refresh_token`、`user` 原格式；已註冊者只回 `mfa_required`、`challenge_id`；強制期間未註冊者只回 `mfa_enrollment_required`、`enrollment_token`。客戶端必須先完成 `/api/mfa/verify` 或 `/api/mfa/enroll/*`，才能視為登入成功。沒有移除原端點，Dashboard 支援留待下一階段。

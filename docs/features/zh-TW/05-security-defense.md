@@ -354,3 +354,19 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 回合污點只存在記憶體；外送 lease 則先存入 `<home>/egress_leases.db`（SQLite WAL，Unix 0600）才授予呼叫端。Gateway 開放 loopback 路由前會復原，並在每次重啟後以單調時鐘重新保護同一員工所有回合的私人讀取完整六小時，不依 UTC 年齡或時鐘跳動縮短。舊回覆不能釋放復原的 lease。資料庫無法讀取時，`ask`／`block` 暫停所有員工的私人讀取與新外送，`shadow` 允許並稽核；每五秒重試、每分鐘最多記錄一次錯誤。新增失敗拒絕強制模式外送，刪除失敗保留保護。CLI 原生工具與跨輪資訊複製仍不在防護範圍，詳見[資料外送防護](69-egress-guard.md)。
 
 Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0600）。使用同一 home 的第二個 gateway 會拒絕讀取與新外送並重試，取得鎖後先恢復所有 lease 才接受讀取；`shadow` 仍允許並稽核。Gateway 執行中不可刪除鎖檔。重複的有效 lease ID 會在寫入前拒絕，不會連帶阻擋其他員工。
+
+## 雙因素登入（第一階段，尚未發版）
+
+Gateway 支援 [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238) SHA-1 TOTP：160 位元隨機密鑰、6 位數、30 秒週期，接受前後各一個週期。已接受的週期不可重用；密鑰以通道憑證相同的 AES-256-GCM 加密機制保存，金鑰位於閘道主機的 `.keyfile`，不放入 `users.db`。密鑰無法解密時拒絕登入，備援碼也不例外。備份與復原必須一起保存資料庫與機器金鑰。
+
+已登入的個別帳號透過 dashboard RPC `mfa.enroll_begin` 取得 secret 與 `otpauth_uri`，再以 `mfa.enroll_confirm {code}` 啟用；開始註冊不會改變登入方式。確認時顯示一次 10 組備援碼，資料庫只存 Argon2 雜湊。`mfa.status` 查詢自己的狀態；`mfa.recovery_regenerate {code}` 與 `mfa.disable {code}` 需要新的 TOTP 或尚未使用的備援碼，重新產生會取代全部舊碼。強制驗證期間不能自行停用。每帳號驗證錯誤最多 5 次／15 分鐘；另有登入 IP 限流。RPC 與 HTTP 不接受指定別人的帳號來註冊。
+
+啟用後，密碼與通道 OTP 的第一因素成功都只回傳 `mfa_required` 與 `challenge_id`，沒有任何 session token。呼叫 `POST /api/mfa/verify`，帶 `challenge_id` 與 `code` 或 `recovery_code`（二擇一）。Challenge 綁定帳號及第一因素種類，5 分鐘有效、只能成功一次、最多 5 次嘗試，重啟仍保留；驗證、TOTP 防重播與備援碼消耗在同一筆 SQLite 交易中。
+
+Enterprise 的 `[auth] mfa_enforced = false` 預設不強制既有帳號。Admin 先以 `mfa.overview` 查看註冊情況，再透過 `system.update_config {"auth.mfa_enforced":true}` 或設定檔編輯器開啟。兩條寫入路徑都要求資料庫中目前仍為有效 Admin。開啟後，未註冊者只取得 `mfa_enrollment_required` 與 `enrollment_token`；該憑證僅能放在 `POST /api/mfa/enroll/begin` 及 `/api/mfa/enroll/confirm` 的 JSON body，不能用於 `/ws`、一般 HTTP 認證或 refresh。Confirm 成功才回傳 session token 與一次性的備援碼。設定檔無法讀取或解析時拒絕登入與 refresh。
+
+強制開關不立即撤銷既有 access token。未註冊者的 refresh 立即拒絕，讓目前 access token 自然到期（預設 30 分鐘）；Enterprise 已註冊或強制驗證的 WebSocket 在原 token 到期後的下一次心跳結束，最多延後 30 秒。已執行的工作不取消。已註冊帳號的既有 refresh token 保留原本到期日，這一階段不追溯要求舊 session 提交第二因素。Personal 忽略強制開關；自願註冊者的密碼／通道 OTP 登入仍需要第二因素，但 `/api/session/local` 仍維持免密碼。
+
+目前 Admin 可呼叫 `users.mfa_reset {user_id}`，交易內重讀角色，清除密鑰、備援碼、待註冊資料與 challenge，並寫稽核紀錄。最後一位有效 Admin 若失去兩種驗證方式，可在閘道主機自己的終端機執行 `duduclaw users mfa-reset <email>`。這是無法經 dashboard 核准的救援例外，限只有一位有效 Admin 且 email 相符；AI 工作階段與員工 Bash 通道會拒絕，稽核標示「本機指令列（身分未驗證）」。有其他有效 Admin 時必須走 dashboard RPC。環境變數與 Bash 規則不是 OS 隔離；擁有任意主機檔案寫入能力者仍可直接修改資料庫。
+
+註冊、停用、重產備援碼、使用備援碼、重設與驗證失敗都會寫入既有 `auth_audit_log`，不記錄驗證碼或密鑰。第一階段只有 gateway，Dashboard 設定與登入畫面留待下一階段；正式開啟強制前，必須先備妥支援新回應的客戶端。

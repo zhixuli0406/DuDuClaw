@@ -80,6 +80,14 @@ impl MethodHandler {
         }
 
         match method {
+            "mfa.status" | "mfa.enroll_begin" | "mfa.enroll_confirm"
+            | "mfa.recovery_regenerate" | "mfa.disable" => {
+                self.handle_mfa_rpc(method, params, ctx).await
+            }
+            "mfa.overview" | "users.mfa_reset" => {
+                require_admin!();
+                self.handle_mfa_rpc(method, params, ctx).await
+            }
             "me.google.status"
             | "me.google.connect_start"
             | "me.google.connect_finish"

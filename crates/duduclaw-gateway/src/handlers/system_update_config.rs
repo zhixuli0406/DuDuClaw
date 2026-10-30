@@ -38,6 +38,19 @@ impl MethodHandler {
             }
         };
         let mut changes: Vec<String> = Vec::new();
+        if let Some(value) = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))) {
+            if let Err(e) = self.mfa_require_current_admin(ctx).await {
+                return WsFrame::error_response("", &e);
+            }
+            let Some(value) = value.as_bool() else {
+                return WsFrame::error_response("", "雙因素驗證設定必須是布林值。");
+            };
+            let Some(auth) = table.entry("auth").or_insert_with(||toml::Value::Table(toml::Table::new())).as_table_mut() else {
+                return WsFrame::error_response("", "登入設定格式不正確。");
+            };
+            auth.insert("mfa_enforced".into(), toml::Value::Boolean(value));
+            changes.push(format!("auth.mfa_enforced = {value}"));
+        }
         let mut restart_required: Vec<String> = Vec::new();
         // Cleaned remote-access allowlist to hot-apply AFTER a successful write
         // (Some(..) iff the payload carried `allowed_origins`).

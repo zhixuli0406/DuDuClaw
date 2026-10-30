@@ -98,6 +98,286 @@ info:
     name: Proprietary
 
 paths:
+  /api/login:
+    post:
+      summary: 密碼登入（MFA 第一階段）
+      description: |
+        未註冊且未強制時維持 access_token、refresh_token、user。
+        已註冊帳號只回 mfa_required=true、challenge_id，沒有任何 token。
+        Enterprise 強制期間未註冊者只回 mfa_enrollment_required=true、enrollment_token。
+        Personal 忽略強制開關；設定無法讀取時拒絕。MFA 畫面屬下一階段。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: {type: string}
+                password: {type: string, writeOnly: true}
+      responses:
+        '200':
+          description: 一般 session、第二因素 challenge，或專用註冊憑證（三者互斥）
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    additionalProperties: false
+                    required: [access_token, refresh_token, user]
+                    properties:
+                      access_token: {type: string}
+                      refresh_token: {type: string}
+                      user: {type: object}
+                  - type: object
+                    additionalProperties: false
+                    required: [mfa_required, challenge_id]
+                    properties:
+                      mfa_required: {const: true}
+                      challenge_id: {type: string}
+                  - type: object
+                    additionalProperties: false
+                    required: [mfa_enrollment_required, enrollment_token]
+                    properties:
+                      mfa_enrollment_required: {const: true}
+                      enrollment_token: {type: string}
+        '401': {description: 登入失敗或設定不可讀}
+        '429': {description: 登入嘗試過多}
+  /api/otp/verify:
+    post:
+      summary: 通道 OTP 第一因素驗證
+      description: 成功後與密碼登入共用 MFA 關卡；已註冊帳號不會取得 session token。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge_id, code]
+              properties:
+                challenge_id: {type: string}
+                code: {type: string, writeOnly: true}
+      responses:
+        '200':
+          $ref: '#/paths/~1api~1login/post/responses/200'
+        '401': {description: 驗證失敗或設定不可讀}
+        '429': {description: 嘗試過多}
+  /api/refresh:
+    post:
+      summary: 更新 access token
+      description: |
+        Enterprise 強制 MFA 時，未註冊者的 refresh 立即拒絕。
+        原 access token 不立即撤銷，依原期限到期（預設30分鐘）。
+        已註冊帳號的既有 refresh token 維持原到期日；不追溯要求舊 session 提交第二因素。
+        設定無法讀取或解析時拒絕。Personal 忽略強制開關。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: {type: string, writeOnly: true}
+      responses:
+        '200':
+          description: 新的 access token，保持原 session 身分
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token]
+                properties:
+                  access_token: {type: string}
+        '401': {description: refresh 無效、帳號無效、需註冊 MFA 或設定不可讀}
+        '429': {description: 更新嘗試過多}
+  /api/mfa/verify:
+    post:
+      summary: 完成第二因素並取得 session
+      description: Challenge 有效5分鐘、單次成功、最多5次嘗試；跨程序與重啟保留。驗證失敗會寫稽核，不記錄碼值。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [challenge_id]
+              properties:
+                challenge_id: {type: string}
+                code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
+                recovery_code: {type: string, writeOnly: true}
+              oneOf:
+                - required: [code]
+                  not: {required: [recovery_code]}
+                - required: [recovery_code]
+                  not: {required: [code]}
+      responses:
+        '200':
+          description: 驗證成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, refresh_token, user]
+                properties:
+                  access_token: {type: string}
+                  refresh_token: {type: string}
+                  user: {type: object}
+        '401': {description: 驗證失敗、過期、已消耗或資料不可讀}
+        '429': {description: 嘗試過多}
+  /api/mfa/enroll/begin:
+    post:
+      summary: 使用專用註冊憑證開始註冊
+      description: 憑證只能用於兩條 enroll 路由，不能用於 /ws、refresh 或其他認證路由；開始不啟用 MFA。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enrollment_token]
+              properties:
+                enrollment_token: {type: string, writeOnly: true}
+      responses:
+        '200':
+          description: 將秘密鍵匯入驗證器，接著確認
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [secret, otpauth_uri]
+                properties:
+                  secret: {type: string}
+                  otpauth_uri: {type: string}
+        '401': {description: 註冊憑證無效或資料不可讀}
+        '429': {description: 嘗試過多}
+  /api/mfa/enroll/confirm:
+    post:
+      summary: 確認註冊並簽發 session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enrollment_token, code]
+              properties:
+                enrollment_token: {type: string, writeOnly: true}
+                code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
+      responses:
+        '200':
+          description: 註冊已啟用，備援碼只回傳一次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, refresh_token, user, recovery_codes]
+                properties:
+                  access_token: {type: string}
+                  refresh_token: {type: string}
+                  user: {type: object}
+                  recovery_codes:
+                    type: array
+                    minItems: 10
+                    maxItems: 10
+                    items: {type: string}
+        '401': {description: 憑證或驗證碼無效、已消耗、過期或資料不可讀}
+        '429': {description: 嘗試過多}
+  /rpc/mfa.status:
+    post:
+      tags: [auth]
+      summary: 本人 MFA 啟用與強制狀態
+      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/mfa.enroll_begin:
+    post:
+      tags: [auth]
+      summary: 本人開始註冊，回傳 secret 與 otpauth_uri；尚未啟用
+      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/mfa.enroll_confirm:
+    post:
+      tags: [auth]
+      summary: 本人以目前 TOTP 啟用，回傳10組一次性 recovery_codes
+      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: {type: string}
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/mfa.recovery_regenerate:
+    post:
+      tags: [auth]
+      summary: 以新的 TOTP 或未使用備援碼取代所有 recovery_codes
+      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: {type: string}
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/mfa.disable:
+    post:
+      tags: [auth]
+      summary: 以新的 TOTP 或未使用備援碼停用；強制期間拒絕
+      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: {type: string}
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/mfa.overview:
+    post:
+      tags: [auth]
+      summary: 目前有效 Admin 查看每位使用者的 user_id、email、enabled；無秘密鍵
+      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
+  /rpc/users.mfa_reset:
+    post:
+      tags: [auth]
+      summary: 目前有效 Admin 重設目標 MFA；交易內重新讀取角色並稽核
+      description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: {type: string}
+      responses:
+        '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
   /ws:
     get:
       summary: WebSocket JSON-RPC 2.0 endpoint

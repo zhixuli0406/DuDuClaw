@@ -216,3 +216,7 @@ OS ユーザーの CLI 設定に追加された許可ルールは自動削除し
 ではないため、非推奨になったことはありません。作成側のコマンド `expert pack`、
 `publish`、`export`、`convert-teams`、`hooks`、`remove` は `duduclaw expert` の下に
 残ります。
+
+## MFA (Unreleased)
+
+MFAフェーズ1では `/api/login` と `/api/otp/verify` に条件付き応答を追加します。未登録かつ非強制の場合は従来の `access_token`、`refresh_token`、`user` を維持します。登録済みなら `mfa_required`、`challenge_id` のみ、強制中の未登録なら `mfa_enrollment_required`、`enrollment_token` のみです。クライアントは `/api/mfa/verify` または `/api/mfa/enroll/*` を完了してからログイン成功と判断してください。既存端点は削除せず、Dashboardは次フェーズで対応します。

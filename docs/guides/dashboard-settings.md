@@ -335,3 +335,12 @@ Direct-binding history privacy: `[people] bound_history_privacy = true` is enabl
 The security page offers four values for `config.toml [security] egress_guard`: **Off** (`off`), **Observe only** (`shadow`, default), **Ask before sending** (`ask`) and **Block sending** (`block`). Saving uses the existing locked `system.update_config` writer; calls read the setting at the guard. The per-employee `agent.toml [capabilities] egress_guard` can only raise the restriction (`off < shadow < ask < block`). A missing `config.toml` means the default (Observe only); invalid or unreadable configuration blocks the affected call.
 
 After a successful private MCP read in a turn, the guard checks outgoing calls. Observe only records `would_ask` and source tools while allowing execution. Ask shows a single-use approval with destination, expanded complete content, source tools and expiry; only a current dashboard Admin can approve it (channel buttons and chat replies cannot). Block refuses. This covers platform MCP calls and the third-party MCP proxy, not Claude CLI built-ins or other native runtime tools. Tracking is per turn. See [Outgoing data guard](../features/69-egress-guard.md).
+
+## MFA enforcement (phase 1)
+
+```toml
+[auth]
+mfa_enforced = false
+```
+
+Default off; effective only on Enterprise. A current Admin first checks `mfa.overview`, then enables `system.update_config {"auth.mfa_enforced":true}` or changes the raw configuration. Both paths require a fresh active Admin. Unenrolled users cannot refresh; existing access tokens expire naturally, and Enterprise sockets close at the next heartbeat, at most 30 seconds later. Unreadable/malformed configuration denies login. Personal ignores the switch and local auto-login is unchanged. MFA screens are not included yet: prepare a client that supports MFA responses and the dedicated enrollment routes before enabling enforcement. See [Security defense](../features/05-security-defense.md) for the API and last-Admin recovery.

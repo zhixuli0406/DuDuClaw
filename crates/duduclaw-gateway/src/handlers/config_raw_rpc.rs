@@ -847,6 +847,10 @@ impl MethodHandler {
         // Every validation message is scrubbed of restored secrets.
         let after = validate_raw(&kind, &new_text).map_err(|e| rctx.scrub(&e))?;
         let before: toml::Table = stored.parse().unwrap_or_default();
+        if matches!(kind, RawFile::Config)
+            && super::config_commit::toml_at(&before, "auth.mfa_enforced") != super::config_commit::toml_at(&after, "auth.mfa_enforced") {
+            self.mfa_require_current_admin(ctx).await?;
+        }
         crate::product_policy::validate_write(&self.home_dir, &path, &stored, &new_text)?;
         let sensitive = sensitive_key_changes(&kind, &before, &after)?;
         if let RawFile::Agent(id) = &kind {

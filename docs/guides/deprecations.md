@@ -236,3 +236,7 @@ behaviour.
 a pack format, and was never deprecated. The authoring commands `expert pack`,
 `publish`, `export`, `convert-teams`, `hooks` and `remove` stay under
 `duduclaw expert`.
+
+## MFA (Unreleased)
+
+MFA phase 1 adds conditional response shapes to `/api/login` and `/api/otp/verify`. Unenrolled accounts with enforcement off retain the exact `access_token`, `refresh_token`, `user` shape. Enrolled accounts receive only `mfa_required`, `challenge_id`; enforced unenrolled accounts receive only `mfa_enrollment_required`, `enrollment_token`. Clients must complete `/api/mfa/verify` or `/api/mfa/enroll/*` before treating login as successful. No legacy endpoint is removed. Dashboard support follows in phase 2.

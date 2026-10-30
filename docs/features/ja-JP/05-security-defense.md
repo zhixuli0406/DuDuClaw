@@ -355,3 +355,19 @@ AI 社員が特定の人（例：同僚の Google アカウント）として動
 ターンの情報源はメモリ内だけですが、送信 lease は `<home>/egress_leases.db`（SQLite WAL、Unix 0600）に保存してから許可します。Gateway は loopback ルート公開前に復元し、再起動のたびに単調時計で新たに六時間、そのスタッフの全ターンの非公開読み取りを保護します。UTC 時刻や時計の変動で短縮しません。古い応答では復元された lease を解放できません。ストアを読めない間は `ask`／`block` で全スタッフの非公開読み取りと新規送信を拒否し、`shadow` は許可して監査します。五秒ごとに再試行し、エラーログは一分に一回までです。追加失敗は強制モードの送信を拒否し、削除失敗は fence を保持します。CLI ネイティブツールとターンをまたぐコピーは対象外です。[送信ガード](69-egress-guard.md)を参照してください。
 
 Store は存続中に `<home>/egress_leases.lock` の排他ファイルロック（Unix 0600）を保持します。同じ home を使う二つ目の gateway は強制モードで読み取りと新規送信を拒否して再試行し、取得後に全 lease を復元してから読み取りを許可します。`shadow` は許可して監査します。Gateway の実行中はロックファイルを削除しないでください。有効な lease ID の重複は挿入前に拒否し、他のスタッフを停止しません。
+
+## 二要素ログイン（フェーズ1、未リリース）
+
+Gateway は [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238) SHA-1 TOTP（ランダムな160ビット秘密鍵、6桁、30秒周期、前後1周期）に対応します。受理済み周期は再利用できません。秘密鍵はチャネル認証情報と同じ AES-256-GCM で暗号化し、機器の `.keyfile` を使用します。暗号鍵は `users.db` に保存しません。復号失敗時はリカバリーコードも含めて拒否します。バックアップにはデータベースと機器の鍵の両方が必要です。
+
+ログイン済みユーザーは `mfa.enroll_begin` で `secret` と `otpauth_uri` を取得し、`mfa.enroll_confirm {code}` で有効化します。開始のみではログイン動作は変わりません。確認時に10個の使い捨てリカバリーコードを一度だけ表示し、保存するのは Argon2 ハッシュのみです。`mfa.status` は本人の状態を返します。`mfa.recovery_regenerate {code}` は全コードを置き換え、`mfa.disable {code}` は無効化します。どちらも新しい TOTP または未使用コードが必要です。強制中は無効化できません。検証失敗は各アカウント15分あたり5回までで、ログインIP制限も適用します。
+
+登録済みアカウントのパスワード／チャネルOTP認証は `mfa_required` と `challenge_id` のみを返し、session token を発行しません。`POST /api/mfa/verify` に challenge と `code` または `recovery_code` の片方を送信します。Challenge はユーザーと第一要素に結び付き、5分間有効、成功は1回、試行は5回までで再起動後も保持します。検証、再利用防止、リカバリーコード消費は同じSQLiteトランザクションです。
+
+Enterprise の `[auth] mfa_enforced` は既定で `false` です。現在の Admin が `mfa.overview` で登録状況を確認し、`system.update_config {"auth.mfa_enforced":true}` または設定ファイルエディターで有効にします。両方の更新経路で現在の有効な Admin を確認します。強制中の未登録ユーザーには `mfa_enrollment_required` と `enrollment_token` のみを返します。このトークンは `POST /api/mfa/enroll/begin` と `/api/mfa/enroll/confirm` のJSON本文専用で、`/ws`、通常の認証ルート、refresh には使えません。Confirm 成功後にsession token とリカバリーコードを発行します。設定の読み取り／解析失敗はログインとrefreshを拒否します。
+
+強制を有効にしても既存access tokenは即時失効しません。未登録ユーザーのrefreshを拒否し、現在のtokenが自然に期限切れになるまで待ちます（既定30分）。Enterprise の登録済みユーザーまたは強制中のWebSocketは元のtoken期限後、次の心拍（最大30秒後）で終了します。実行中の仕事は取り消しません。登録済みユーザーの既存refresh tokenは元の期限まで有効で、過去のsessionに第二要素を遡及要求しません。Personal は強制設定を無視します。任意登録した場合のパスワード／チャネルOTPは保護されますが、`/api/session/local` は引き続きパスワード不要です。
+
+`users.mfa_reset {user_id}` はトランザクション内で現在のAdmin権限を確認し、秘密鍵、リカバリーコード、登録待ち情報、challengeを削除して監査記録を残します。唯一の有効なAdminが両方の要素を失った場合、人間がgatewayホストで `duduclaw users mfa-reset <email>` を実行できます。Dashboard承認が不可能な場合の限定救援で、唯一の有効なAdminのemailにのみ対応します。AIセッション／従業員Bashからは拒否し、監査上の操作者は未検証と明記します。他のAdminがいる場合はRPCを使用します。この制限は任意のホストファイル書き込みに対するOS隔離ではありません。
+
+登録、無効化、リカバリーコード再生成／使用、リセット、検証失敗は既存 `auth_audit_log` に記録し、コードや秘密鍵は記録しません。フェーズ1はgatewayのみです。Dashboardの設定／ログイン画面は次フェーズで提供するため、強制を有効にする前に対応クライアントを用意してください。

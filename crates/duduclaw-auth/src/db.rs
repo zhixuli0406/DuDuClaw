@@ -128,6 +128,7 @@ impl UserDb {
         .map_err(|e| format!("failed to create auth tables: {e}"))?;
 
         crate::google_identity::migrate(&conn)?;
+        crate::mfa::migrate(&conn)?;
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.

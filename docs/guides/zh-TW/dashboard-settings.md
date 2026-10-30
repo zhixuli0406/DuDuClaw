@@ -322,3 +322,12 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 安全頁可把 `config.toml [security] egress_guard` 設成四種值：**關閉**（`off`）、**僅記錄**（`shadow`，預設）、**先詢問**（`ask`）、**直接阻擋**（`block`）。存檔沿用既有加鎖的 `system.update_config` 寫入；每次呼叫時由防護讀取設定。員工的 `agent.toml [capabilities] egress_guard` 只能更嚴格（`off < shadow < ask < block`）。沒有 `config.toml` 時採用預設的僅記錄；設定無效或讀不到時，該次呼叫會被阻擋。
 
 AI 員工在同一回合成功讀過私人資料後，之後的外送呼叫會先經過防護。僅記錄會在稽核寫下 `would_ask` 與讀過的工具，照常執行；先詢問會開出一次性的核准單，列出目的地、完整內容、讀過的工具與到期時間，只有目前具 Admin 權限的儀表板帳號能核准（通道按鈕與聊天回覆都不行）；直接阻擋則拒絕。涵蓋平台 MCP 呼叫與第三方 MCP 代理，不涵蓋 Claude CLI 內建工具與其他 runtime 的原生工具；以回合為單位追蹤。詳見[資料外送防護](../../features/zh-TW/69-egress-guard.md)。
+
+## 雙因素登入強制設定（第一階段）
+
+```toml
+[auth]
+mfa_enforced = false
+```
+
+預設關閉，只有 Enterprise 生效。先以 Admin RPC `mfa.overview` 查看未註冊名單，再用 `system.update_config {"auth.mfa_enforced":true}` 或進階設定檔編輯器開啟；兩者都需要目前有效的 Admin。未註冊者停止 refresh，既有 access token 到期後才需重新登入註冊，Enterprise WebSocket 最多延至下一次30秒心跳。設定無法讀取／解析則拒絕登入。Personal 忽略此開關，本機自動登入不變。MFA 畫面尚未提供，請先備妥支援 MFA 回應及專用註冊路由的客戶端；完整流程與最後管理員救援見 [安全防禦](../../features/zh-TW/05-security-defense.md)。
