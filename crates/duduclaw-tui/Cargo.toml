@@ -33,6 +33,7 @@ vt100 = "0.16"
 libc = "0.2"
 
 [dev-dependencies]
+vte = "0.15"
 insta.workspace = true
 axum.workspace = true
 tracing-subscriber.workspace = true

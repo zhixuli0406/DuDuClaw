@@ -2441,6 +2441,7 @@ dependencies = [
  "unicode-width",
  "url",
  "vt100",
+ "vte",
  "zeroize",
 ]
 

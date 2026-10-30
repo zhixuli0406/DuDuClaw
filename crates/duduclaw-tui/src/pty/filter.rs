@@ -7,7 +7,8 @@ enum State {
     #[default]
     Ground,
     Escape,
-    String { osc: bool, escape: bool },
+    Charset(u8),
+    String { osc: bool, dcs: bool },
     Csi,
     DiscardCsi,
 }
@@ -17,6 +18,8 @@ pub(super) struct Filter {
     csi: [u8; MAX_CSI],
     len: usize,
     params: usize,
+    utf8: [u8; 4],
+    utf8_len: usize,
     utf8_left: u8,
     utf8_min: u8,
     utf8_max: u8,
@@ -24,22 +27,35 @@ pub(super) struct Filter {
 impl Default for Filter {
     fn default() -> Self {
         Self { state: State::Ground, csi: [0; MAX_CSI], len: 0, params: 1,
-            utf8_left: 0, utf8_min: 0x80, utf8_max: 0xbf }
+            utf8: [0; 4], utf8_len: 0, utf8_left: 0, utf8_min: 0x80, utf8_max: 0xbf }
     }
 }
 impl Filter {
-    // C1 bytes inside valid UTF-8 are text, not control introducers/terminators.
-    fn continuation(&mut self, byte: u8) -> bool {
-        if self.utf8_left > 0 && (self.utf8_min..=self.utf8_max).contains(&byte) {
-            self.utf8_left -= 1;
-            self.utf8_min = 0x80;
-            self.utf8_max = 0xbf;
-            return true;
+    // Buffer a whole scalar before emitting it. Overlong encodings, surrogates,
+    // out-of-range scalars and stray continuation/C1 bytes never reach vte.
+    fn ground(&mut self, byte: u8, push: &mut impl FnMut(u8)) {
+        if self.utf8_left > 0 {
+            if (self.utf8_min..=self.utf8_max).contains(&byte) {
+                self.utf8[self.utf8_len] = byte;
+                self.utf8_len += 1;
+                self.utf8_left -= 1;
+                self.utf8_min = 0x80;
+                self.utf8_max = 0xbf;
+                if self.utf8_left == 0 {
+                    for &byte in &self.utf8[..self.utf8_len] { push(byte); }
+                    self.utf8_len = 0;
+                }
+                return;
+            }
+            // Drop the incomplete scalar; reconsider this byte as fresh input.
+            self.utf8_left = 0;
+            self.utf8_len = 0;
         }
-        self.utf8_left = 0;
         self.utf8_min = 0x80;
         self.utf8_max = 0xbf;
         match byte {
+            0x1b => self.state = State::Escape,
+            0x00..=0x7f => push(byte),
             0xc2..=0xdf => self.utf8_left = 1,
             0xe0..=0xef => {
                 self.utf8_left = 2;
@@ -53,7 +69,10 @@ impl Filter {
             }
             _ => {},
         }
-        false
+        if self.utf8_left > 0 {
+            self.utf8[0] = byte;
+            self.utf8_len = 1;
+        }
     }
     fn start_csi(&mut self) {
         self.state = State::Csi;
@@ -61,7 +80,8 @@ impl Filter {
         self.params = 1;
     }
     /// Output is delivered in fixed-size batches; neither input size nor an
-    /// unfinished sequence can grow this filter's storage.
+    /// unfinished sequence can grow this filter's storage. ESC is emitted only
+    /// after an entire whitelisted sequence has been validated.
     pub fn process(&mut self, bytes: &[u8], rows: u16, cols: u16, mut emit: impl FnMut(&[u8])) {
         let mut output = [0; 4096];
         let mut used = 0;
@@ -71,37 +91,48 @@ impl Filter {
             if used == output.len() { emit(&output); used = 0; }
         };
         for &byte in bytes {
-            let continuation = self.continuation(byte);
-            if let State::String { osc, escape } = self.state {
-                if !continuation && (byte == 0x9c || (osc && byte == 7) || (escape && byte == b'\\')) {
-                    self.state = State::Ground;
-                } else {
-                    self.state = State::String { osc, escape: byte == 0x1b };
-                }
-                continue;
-            }
-            if !continuation {
+            // vte cancels every non-ground state on CAN/SUB and enters Escape
+            // on ESC (including inside OSC, DCS, SOS, PM and APC). No partial
+            // sequence has been emitted, so the downstream parser stays Ground.
+            if !matches!(self.state, State::Ground) {
                 match byte {
-                    0x90 | 0x98 | 0x9d..=0x9f => {
-                        self.state = State::String { osc: byte == 0x9d, escape: false };
-                        continue;
-                    }
-                    0x9b => { self.start_csi(); continue; }
-                    0x9c => { self.state = State::Ground; continue; }
-                    0x1b => { self.state = State::Escape; continue; }
                     0x18 | 0x1a => { self.state = State::Ground; push(byte); continue; }
+                    0x1b => { self.state = State::Escape; continue; }
                     _ => {},
                 }
             }
             match self.state {
-                State::Ground => push(byte),
+                State::Ground => self.ground(byte, &mut push),
                 State::Escape => match byte {
                     b']' | b'P' | b'_' | b'^' | b'X' => {
-                        self.state = State::String { osc: byte == b']', escape: false };
+                        self.state = State::String { osc: byte == b']', dcs: byte == b'P' };
                     }
                     b'[' => self.start_csi(),
-                    _ => { push(0x1b); push(byte); self.state = State::Ground; }
+                    b'(' | b')' | b'*' | b'+' => self.state = State::Charset(byte),
+                    // vt100 handles 7, 8, =, >, M, c and visual bell g;
+                    // the remaining listed VT escapes also finish vte's Escape.
+                    b'7' | b'8' | b'=' | b'>' | b'c' | b'D' | b'E' | b'H' |
+                    b'M' | b'Z' | b'\\' | b'g' => {
+                        push(0x1b); push(byte); self.state = State::Ground;
+                    }
+                    _ => {
+                        self.state = State::Ground;
+                        self.ground(byte, &mut push);
+                    }
                 },
+                State::Charset(designator) => {
+                    self.state = State::Ground;
+                    if (0x30..=0x7e).contains(&byte) {
+                        push(0x1b); push(designator); push(byte);
+                    } else {
+                        self.ground(byte, &mut push);
+                    }
+                }
+                State::String { osc, dcs } => {
+                    if (osc && byte == 7) || (dcs && byte == 0x9c) {
+                        self.state = State::Ground;
+                    }
+                }
                 State::Csi => {
                     if matches!(byte, b';' | b':') { self.params += 1; }
                     if self.len == MAX_CSI || self.params > MAX_PARAMS {
@@ -114,7 +145,8 @@ impl Filter {
                             self.state = State::Ground;
                         }
                     } else {
-                        // Do not let invalid or embedded controls reach a partial CSI.
+                        // Invalid bytes taint the entire CSI; keep dropping to
+                        // a final or the cancellation/restart handled above.
                         self.state = State::DiscardCsi;
                     }
                     if matches!(self.state, State::DiscardCsi) && (0x40..=0x7e).contains(&byte) {
@@ -124,7 +156,6 @@ impl Filter {
                 State::DiscardCsi => {
                     if (0x40..=0x7e).contains(&byte) { self.state = State::Ground; }
                 }
-                State::String { .. } => unreachable!(),
             }
         }
         if used > 0 { emit(&output[..used]); }
@@ -183,9 +214,63 @@ mod tests {
         for chunk in chunks { filter.process(chunk, rows, cols, |bytes| output.extend_from_slice(bytes)); }
         output
     }
+    #[derive(Default)]
+    struct StringCalls { osc: usize, hook: usize, put: usize }
+    impl vte::Perform for StringCalls {
+        fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) { self.osc += 1; }
+        fn hook(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) { self.hook += 1; }
+        fn put(&mut self, _: u8) { self.put += 1; }
+    }
+    fn assert_no_strings(output: &[u8], parser: &mut vte::Parser, calls: &mut StringCalls) {
+        assert!(!output.windows(2).any(|pair| pair[0] == 0x1b && b"]PX^_".contains(&pair[1])));
+        parser.advance(calls, output);
+        // Terminate a potential unfinished OSC/DCS too, exposing hidden state.
+        parser.advance(calls, b"qpayload\x07\x1b\\");
+        assert_eq!((calls.osc, calls.hook, calls.put), (0, 0, 0));
+    }
+    #[test]
+    fn escape_desync_regressions_at_every_boundary() {
+        for middle in [b"\xc2\x9d".as_slice(), b"\x00", b"\x07", b"\x1f", b"\x7f", b"\xff", b"\x1b"] {
+            for &intro in b"]PX^_" {
+                let input = [b"\x1b".as_slice(), middle, &[intro], b"payload\x07\x1b\\ok"].concat();
+                for split in 0..=input.len() {
+                    let output = filtered(&[&input[..split], &input[split..]], 24, 80);
+                    assert_no_strings(&output, &mut vte::Parser::new(), &mut StringCalls::default());
+                }
+            }
+        }
+    }
+    #[test]
+    fn seeded_random_streams_never_reach_vte_string_handlers() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x4553_435f_5554_4638);
+        let biased = b"\x1b\x1b]P^_X\x18\x1a\x7f\x90\x98\x9b\x9c\x9d\x9e\x9f\x80\xbf\xc0\xc2\xe0\xed\xf0\xf4\xff[();012m\x07\\";
+        for _ in 0..128 {
+            let input: Vec<u8> = (0..4096).map(|_| {
+                if rng.gen_ratio(4, 5) { biased[rng.gen_range(0..biased.len())] } else { rng.r#gen() }
+            }).collect();
+            let mut filter = Filter::default();
+            let mut parser = vte::Parser::new();
+            let mut calls = StringCalls::default();
+            let mut output = Vec::new();
+            let mut offset = 0;
+            while offset < input.len() {
+                let end = (offset + rng.gen_range(1..=97)).min(input.len());
+                filter.process(&input[offset..end], 24, 80, |safe| {
+                    parser.advance(&mut calls, safe);
+                    output.extend_from_slice(safe);
+                });
+                assert_eq!((calls.osc, calls.hook, calls.put), (0, 0, 0));
+                offset = end;
+            }
+            assert_no_strings(&output, &mut vte::Parser::new(), &mut StringCalls::default());
+            parser.advance(&mut calls, b"qpayload\x07\x1b\\");
+            assert_eq!((calls.osc, calls.hook, calls.put), (0, 0, 0));
+        }
+    }
     #[test]
     fn every_chunk_boundary_clamps_count_and_position_parameters() {
-        let input = b"before\x1b[65535;99999:12345;00002Hafter\x9b99999L";
+        let input = b"before\x1b[65535;99999:12345;00002Hafter\x1b[99999L";
         let expected = b"before\x1b[80;80:80;00002Hafter\x1b[80L";
         for split in 0..=input.len() {
             assert_eq!(filtered(&[&input[..split], &input[split..]], 24, 80), expected, "split {split}");
@@ -231,17 +316,58 @@ mod tests {
     }
     #[test]
     fn all_string_controls_drop_without_buffering_across_every_boundary() {
-        for intro in [b"\x1b]".as_slice(), b"\x1bP", b"\x1b_", b"\x1b^", b"\x1bX", b"\x9d", b"\x90", b"\x9f", b"\x9e", b"\x98"] {
-            for end in [b"\x1b\\".as_slice(), b"\x9c"] {
-                let input = [b"ok", intro, b"hidden\x1b[65535L\x1b]nested", end, b"done"].concat();
+        for intro in [b"\x1b]".as_slice(), b"\x1bP", b"\x1b_", b"\x1b^", b"\x1bX"] {
+            let input = [b"ok", intro, b"hidden", b"\x1b\\done"].concat();
+            for split in 0..=input.len() {
+                assert_eq!(filtered(&[&input[..split], &input[split..]], 24, 80), b"ok\x1b\\done");
+            }
+            assert_eq!(filtered(&input.chunks(1).collect::<Vec<_>>(), 24, 80), b"ok\x1b\\done");
+        }
+        assert_eq!(filtered(&[b"\x1b]hidden\x07ok"], 24, 80), b"ok");
+        assert_eq!(filtered(&[b"\x1bPhidden\x07still hidden\x1b\\ok"], 24, 80), b"\x1b\\ok");
+        assert_eq!(filtered(&[b"\x1bPhidden\x9cok"], 24, 80), b"ok");
+        // OSC ignores C1 ST, and SOS/PM/APC only leave on CAN/SUB/ESC in vte.
+        for intro in [b"\x1b]".as_slice(), b"\x1bX", b"\x1b^", b"\x1b_"] {
+            assert_eq!(filtered(&[intro, b"hidden\x9cstill hidden\x18ok"], 24, 80), b"\x18ok");
+        }
+    }
+    #[test]
+    fn cancellation_and_escape_restart_follow_vte_in_all_pending_states() {
+        let long_csi = [b"\x1b[".as_slice(), &[b'1'; MAX_CSI + 1]].concat();
+        for pending in [b"\x1b".as_slice(), b"\x1b(", b"\x1b[12", &long_csi, b"\x1b]hidden", b"\x1bPqhidden", b"\x1bXhidden", b"\x1b^hidden", b"\x1b_hidden"] {
+            for cancel in [0x18, 0x1a] {
+                let input = [pending, &[cancel], b"ok"].concat();
                 for split in 0..=input.len() {
-                    assert_eq!(filtered(&[&input[..split], &input[split..]], 24, 80), b"okdone");
+                    assert_eq!(filtered(&[&input[..split], &input[split..]], 24, 80), [vec![cancel], b"ok".to_vec()].concat());
                 }
-                assert_eq!(filtered(&input.chunks(1).collect::<Vec<_>>(), 24, 80), b"okdone");
+            }
+            let input = [pending, b"\x1b[31mok"].concat();
+            assert_eq!(filtered(&input.chunks(1).collect::<Vec<_>>(), 24, 80), b"\x1b[31mok");
+        }
+    }
+    #[test]
+    fn only_complete_whitelisted_escapes_and_valid_utf8_are_emitted() {
+        for &final_byte in b"78=>cDEHMZ\\g" {
+            let input = [0x1b, final_byte];
+            assert_eq!(filtered(&[&input[..1]], 24, 80), b"");
+            assert_eq!(filtered(&[&input[..1], &input[1..]], 24, 80), input);
+        }
+        for &designator in b"()*+" {
+            let input = [0x1b, designator, b'B'];
+            assert_eq!(filtered(&[&input[..2]], 24, 80), b"");
+            for split in 0..=input.len() {
+                assert_eq!(filtered(&[&input[..split], &input[split..]], 24, 80), input);
             }
         }
-        assert_eq!(filtered(&[b"\x9dhidden\x07ok"], 24, 80), b"ok");
-        assert_eq!(filtered(&[b"\x1bPhidden\x07still hidden\x1b\\ok"], 24, 80), b"ok");
+        for input in [b"\xc0\x80".as_slice(), b"\xed\xa0\x80", b"\xe0\x80\x80", b"\xf4\x90\x80\x80", b"\xf5\x80\x80\x80", b"\xc2", b"\xe0\xa0", b"\xf0\x90\x80"] {
+            for split in 0..=input.len() {
+                assert_eq!(filtered(&[&input[..split], &input[split..]], 24, 80), b"");
+            }
+        }
+        let c1: Vec<_> = (0x80..=0x9f).collect();
+        assert_eq!(filtered(&[&c1], 24, 80), b"");
+        assert_eq!(filtered(&[b"\xc2\x1b[31mok"], 24, 80), b"\x1b[31mok");
+        assert_eq!(filtered(&[b"\x1b\xc2\x9d]text"], 24, 80), b"\xc2\x9d]text");
     }
     #[test]
     fn multi_mib_unterminated_osc_has_constant_storage_and_zero_parser_input() {
