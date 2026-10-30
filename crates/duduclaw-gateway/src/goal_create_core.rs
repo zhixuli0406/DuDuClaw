@@ -316,6 +316,8 @@ async fn create_goal_task_inner(
             .flatten();
     }
 
+    crate::team_composer::check_team_dispatchable(home_dir, &req.agent_id)?;
+
     // I-1c "想一想": generate the plan and park the task `needs_human` instead
     // of `todo` — runs synchronously, so no dispatch-engine round (not even a
     // restricted one) ever starts before a human approves. Fail-closed: a
@@ -342,17 +344,11 @@ async fn create_goal_task_inner(
         None => store.insert_task(&task).await,
     }.map_err(|e| format!("create goal task: {e}"))?;
 
-    // Team-as-Agent P1/WP-4: freeze the role→{runtime, model, effort} team for
-    // this task, once, right after creation — same frozen-contract moment as
-    // `acceptance_criteria_baseline` above. `[team] enabled` defaults to false,
-    // in which case this stores nothing, audits nothing, and the task runs
-    // exactly as it does today. A spec that fails validation (notably a
-    // verifier sharing the executor's model family) forms no team at all and
-    // the task runs Solo — never a partial team.
+    // Freeze the team once, at the same contract boundary as the baseline.
+    // Non-fatal validation failures (e.g. same-family verifier) run Solo.
+    // A fatal refusal after the precheck means config changed during creation;
+    // keep the successful insert and let the goal loop park this task.
     let freeze = crate::team_composer::freeze_for_task(home_dir, store, &task_id, &req.agent_id).await;
-    if let crate::team_composer::FreezeOutcome::DispatchRefused { detail, .. } = &freeze {
-        return Err(detail.clone());
-    }
     if let crate::team_composer::FreezeOutcome::Frozen(spec) = &freeze {
         task.team_spec_json = serde_json::to_string(spec).ok();
     }
@@ -417,6 +413,36 @@ mod tests {
 
     async fn store_in(home: &Path) -> TaskStore {
         TaskStore::open(home).expect("open task store")
+    }
+
+    #[tokio::test]
+    async fn refused_goal_creation_inserts_no_task() {
+        for global in [false, true] {
+            for body in [
+                "[team]\nbroken = [",
+                "[team.roles.verifier]\nruntime = \"antigravity\"\n",
+                "[team.roles.verifier]\nmodel = 42\n",
+            ] {
+                let home = tempfile::tempdir().unwrap();
+                let agent_dir = home.path().join("agents/a");
+                std::fs::create_dir_all(&agent_dir).unwrap();
+                let path = if global { home.path().join("config.toml") } else { agent_dir.join("agent.toml") };
+                std::fs::write(path, body).unwrap();
+                let store = store_in(home.path()).await;
+                let error = create_goal_task(home.path(), &store, req("a")).await.unwrap_err();
+                assert!(!error.contains(&home.path().display().to_string()));
+                assert!(!error.contains("broken"));
+                let slot = crate::task_store::AssignScheduleSlot {
+                    id: "schedule", slot: "slot", next: None, now: Utc::now(),
+                };
+                let scheduled = create_scheduled_goal_task(home.path(), &store, req("a"), &slot)
+                    .await.unwrap_err();
+                assert_eq!(scheduled, error, "the schedule path must refuse before its insert fence");
+                let conn = rusqlite::Connection::open(home.path().join("tasks.db")).unwrap();
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+                assert_eq!(count, 0);
+            }
+        }
     }
 
     /// The contract freeze is the whole point of routing both callers here:

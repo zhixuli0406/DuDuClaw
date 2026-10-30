@@ -173,7 +173,7 @@ An effort declared on a role that binds neither runtime nor model is inert (the 
 
 ## Three rules the validator enforces
 
-A spec that breaks any of these does not form a team. The task runs Solo and the dashboard says why — a partial team is never formed.
+A spec that breaks any of these does not form a team. Non-fatal validation failures, such as a shared model family, run Solo and the dashboard says why. A removed runtime refuses dispatch entirely; it never falls back to Solo or another vendor.
 
 ### 1. A role is a `(role, runtime, model)` triple
 
@@ -374,7 +374,7 @@ With a frozen spec and a Team verdict, one goal round stops being a single wake-
 
 When a goal task is created, the merged `config.toml [team]` + `agent.toml [team]` is validated once and the result stored on the task itself. From then on it never changes — a role→model matrix or a bandit that re-ranks models tomorrow affects the *next* task, not one already running. Same discipline as the frozen acceptance criteria: you can always answer "what team was this task actually judged and worked by" from the task row alone.
 
-A spec that fails validation forms **no team at all**. The refusal is recorded, nothing is stored, and the task runs as a single employee. There is no such thing as a partial team.
+Non-fatal validation failures, such as a shared model family, form **no team at all**: the refusal is recorded, no spec is stored, and the task runs as a single employee. Unreadable or malformed config, wrong types in runtime-selection fields, and removed runtimes refuse dispatch entirely. Goal creation checks these before inserting the task. If the config changes after that check, or an existing goal encounters such a refusal, only that goal pauses as `needs_human` with `blocked_needs_decision`; other goals continue. The refusal shows the file name and reason, without file contents or absolute paths.
 
 The freeze is set-once at the database level (`WHERE team_spec_json IS NULL`), so two creation paths racing on the same task is normal and safe. What used to be unsafe was the *loser's* view of it: the goal loop only handled the "I froze it" answer, so the round that lost the race kept reading its own stale copy of the task, found no spec, and quietly ran Solo — while every later round, reading a fresh row, ran as a Team. Same task, two execution shapes, no trace anywhere. The loser now re-reads the row and picks up the spec that actually won.
 

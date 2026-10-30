@@ -625,7 +625,20 @@ pub fn resolve_team(home_dir: &Path, agent_id: &str) -> TeamResolution {
         sections.runtime.provider.as_deref(),
         sections.model.preferred.as_deref(),
     );
-    let result = validate_team(&merged);
+    // A non-fatal error in an earlier role must not mask a removed runtime.
+    // Source/resolved agent choices were checked before merging; these are
+    // inherited global roles after any explicit per-agent override.
+    let removed_role = Role::ALL.iter().find_map(|role| {
+        merged.roles.get(*role).runtime.as_deref()
+            .and_then(duduclaw_core::runtime_catalog::removed_runtime)
+            .map(|removed| TeamConfigError::ConfigUnreadable {
+                detail: removed.refusal(&format!("config.toml [team.roles.{}] runtime", role.as_str())),
+            })
+    });
+    let result = match removed_role {
+        Some(error) => Err(error),
+        None => validate_team(&merged),
+    };
     TeamResolution {
         merged,
         enabled_written,
@@ -641,6 +654,21 @@ pub fn read_global_team_config(home_dir: &Path) -> Result<TeamConfig, String> {
     crate::runtime_config::read_config_for_gate(&path)?
         .as_ref().map(|doc| crate::runtime_config::strict_team_config(doc, &path))
         .transpose().map(Option::unwrap_or_default)
+}
+
+/// Fatal configuration refusals must never fall back to Solo.
+fn fatal_dispatch_refusal(error: &TeamConfigError) -> bool {
+    matches!(error, TeamConfigError::ConfigUnreadable { .. })
+        || matches!(error, TeamConfigError::RuntimeNotAllowed { runtime, .. }
+            if duduclaw_core::runtime_catalog::removed_runtime(runtime).is_some())
+}
+
+/// Check before inserting a goal so a refusal cannot leave an orphan task.
+pub(crate) fn check_team_dispatchable(home_dir: &Path, agent_id: &str) -> Result<(), String> {
+    match resolve_team(home_dir, agent_id).result {
+        Err(error) if fatal_dispatch_refusal(&error) => Err(error.to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// What [`freeze_for_task`] did.
@@ -737,14 +765,15 @@ pub async fn freeze_for_task(
             }
         }
         Err(err) => {
-            if !merged.is_enabled() {
+            let fatal = fatal_dispatch_refusal(&err);
+            if !fatal && !merged.is_enabled() {
                 // An operator editing a disabled team gets the validation
                 // message in the log, but no team was being formed, so this is
                 // not a refusal of anything.
                 debug!(agent = %agent_id, code = err.code(), "disabled [team] spec is invalid: {err}");
                 return FreezeOutcome::Disabled;
             }
-            if default_state {
+            if !fatal && default_state {
                 // Teams are on by default; this deployment simply never named
                 // a second vendor, so executor and verifier cascaded onto the
                 // same employee model. That is the designed Solo answer, not a
@@ -771,9 +800,7 @@ pub async fn freeze_for_task(
                 task = %task_id, agent = %agent_id, code = err.code(),
                 "team refused: {err}"
             );
-            if matches!(err, TeamConfigError::ConfigUnreadable { .. })
-                || matches!(&err, TeamConfigError::RuntimeNotAllowed { runtime, .. }
-                    if duduclaw_core::runtime_catalog::removed_runtime(runtime).is_some()) {
+            if fatal {
                 return FreezeOutcome::DispatchRefused { code: err.code(), detail: err.to_string() };
             }
             FreezeOutcome::Refused {
@@ -5207,7 +5234,10 @@ skill_security_scan = false
         assert!(read_global_team_config(dir.path()).is_ok());
         for bytes in [b"[team]\nbroken = [".as_slice(), &[0xff]] {
             std::fs::write(&path, bytes).unwrap();
-            assert!(read_global_team_config(dir.path()).unwrap_err().contains(&path.display().to_string()));
+            let error = read_global_team_config(dir.path()).unwrap_err();
+            assert!(error.contains("config.toml"));
+            assert!(!error.contains(&dir.path().display().to_string()));
+            assert!(!error.contains("broken"));
         }
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -5244,6 +5274,22 @@ skill_security_scan = false
                 assert!(audit_lines(home).contains(AUDIT_TEAM_REFUSED));
                 assert!(crate::runtime_config::ensure_active_agent_provider(&home.join("agents/agnes")).is_err());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_global_role_wins_over_nonfatal_errors_and_disabled_team() {
+        for enabled in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), format!(
+                "[team]\nenabled = {enabled}\n[team.roles.planner]\neffort = \"bogus\"\n\
+                 [team.roles.verifier]\nruntime = \"antigravity\"\n",
+            )).unwrap();
+            let store = TaskStore::open(home.path()).unwrap();
+            let error = check_team_dispatchable(home.path(), "agnes").unwrap_err();
+            assert!(error.starts_with("config.toml [team.roles.verifier] runtime"));
+            assert!(matches!(freeze_for_task(home.path(), &store, "task-1", "agnes").await,
+                FreezeOutcome::DispatchRefused { .. }));
         }
     }
 

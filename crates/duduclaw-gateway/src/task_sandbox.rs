@@ -448,10 +448,6 @@ pub async fn dispatch(
         }
     };
     if let Err(error) = crate::runtime_config::ensure_active_agent_provider(&spec.agent_dir) {
-        // This message can leave the host; retain the field and removal
-        // guidance without exposing the local agent-directory path.
-        let prefix = format!("{} ", spec.agent_dir.display());
-        let error = error.strip_prefix(&prefix).unwrap_or(&error);
         return SandboxDispatch::Completed(Err(SandboxFailure::failed(
             failure_code::REMOVED_RUNTIME,
             error,
@@ -1225,6 +1221,7 @@ mod instructions_slot_tests {
                 };
                 assert_eq!(failure.code, failure_code::REMOVED_RUNTIME);
                 assert!(failure.message.contains(removed.removed_in), "{failure:?}");
+                assert!(!failure.message.contains(&home.path().display().to_string()), "{failure:?}");
             }
         }
     }

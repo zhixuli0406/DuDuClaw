@@ -52,76 +52,136 @@ fn read_sections(agent_dir: &Path) -> AgentTomlSections {
     agent_toml::load(agent_dir)
 }
 
+fn config_file_name(path: &Path) -> &str {
+    duduclaw_core::truncate_bytes(path.file_name().and_then(|name| name.to_str()).unwrap_or("config.toml"), 200)
+}
+
+fn config_refusal(path: &Path, reason: &str, diagnostic: &str) -> String {
+    tracing::warn!(
+        path = %duduclaw_core::truncate_bytes(&path.display().to_string(), 200),
+        detail = %duduclaw_core::truncate_bytes(diagnostic, 200),
+        "runtime config refused"
+    );
+    format!("{}: {reason}", config_file_name(path))
+}
+
+fn wrong_config_type(path: &Path, field: &str) -> String {
+    let reason = format!("wrong type for {field}");
+    config_refusal(path, &reason, &reason)
+}
+
+/// Validate only runtime selectors before the deliberately lenient typed read.
+fn check_runtime_field_types(doc: &toml::Value, path: &Path) -> Result<(), String> {
+    if let Some(runtime) = doc.get("runtime") {
+        let runtime = runtime.as_table().ok_or_else(|| wrong_config_type(path, "[runtime]"))?;
+        for field in ["provider", "fallback"] {
+            if runtime.get(field).is_some_and(|value| !value.is_str()) {
+                return Err(wrong_config_type(path, &format!("[runtime] {field}")));
+            }
+        }
+    }
+    if let Some(team) = doc.get("team") {
+        let team = team.as_table().ok_or_else(|| wrong_config_type(path, "[team]"))?;
+        if let Some(roles) = team.get("roles") {
+            let roles = roles.as_table().ok_or_else(|| wrong_config_type(path, "[team.roles]"))?;
+            for role in duduclaw_core::types::Role::ALL {
+                if let Some(spec) = roles.get(role.as_str()) {
+                    let field = format!("[team.roles.{}]", role.as_str());
+                    let spec = spec.as_table().ok_or_else(|| wrong_config_type(path, &field))?;
+                    for key in ["runtime", "model"] {
+                        if spec.get(key).is_some_and(|value| !value.is_str()) {
+                            return Err(wrong_config_type(path, &format!("{field} {key}")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_removed_agent_runtimes(doc: &toml::Value, path: &Path) -> Result<(), String> {
+    for field in ["provider", "fallback"] {
+        if let Some(removed) = doc.get("runtime").and_then(|runtime| runtime.get(field))
+            .and_then(toml::Value::as_str)
+            .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+            return Err(removed.refusal(&format!("{} [runtime] {field}", config_file_name(path))));
+        }
+    }
+    for role in duduclaw_core::types::Role::ALL {
+        if let Some(removed) = doc.get("team").and_then(|team| team.get("roles"))
+            .and_then(|roles| roles.get(role.as_str())).and_then(|spec| spec.get("runtime"))
+            .and_then(toml::Value::as_str)
+            .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+            return Err(removed.refusal(&format!("{} [team.roles.{}] runtime", config_file_name(path), role.as_str())));
+        }
+    }
+    Ok(())
+}
+
 /// Authority checks must not hide a configured runtime behind parse defaults.
 pub(crate) fn read_config_for_gate(path: &Path) -> Result<Option<toml::Value>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+                return Ok(None);
+            }
+            let reason = if error.kind() == std::io::ErrorKind::InvalidData { "invalid UTF-8" } else { "unreadable" };
+            return Err(config_refusal(path, reason, &error.to_string()));
+        }
     };
-    text.parse::<toml::Value>().map(Some)
-        .map_err(|error| format!("cannot parse config {}: {}", path.display(), error.message()))
+    let doc = text.parse::<toml::Value>()
+        .map_err(|error| config_refusal(path, "invalid TOML", error.message()))?;
+    check_runtime_field_types(&doc, path)?;
+    Ok(Some(doc))
 }
 
 pub(crate) fn read_agent_sections_for_gate(agent_dir: &Path) -> Result<AgentTomlSections, String> {
     let source_path = agent_dir.join("agent.toml");
     let source = read_config_for_gate(&source_path)?;
     if let Some(doc) = &source {
+        check_removed_agent_runtimes(doc, &source_path)?;
         strict_team_config(doc, &source_path)?;
     }
     let mut effective = source;
+    let mut effective_path = source_path;
     if let Some(home) = duduclaw_core::preset::agent_home_dir(agent_dir) {
         if let Some(id) = agent_dir.file_name().and_then(|id| id.to_str()) {
             let path = duduclaw_core::preset::agent_resolved_path(&home, id);
             if let Some(doc) = read_config_for_gate(&path)? {
+                check_removed_agent_runtimes(&doc, &path)?;
                 strict_team_config(&doc, &path)?;
                 effective = Some(doc);
+                effective_path = path;
             }
         }
     }
     effective.map(|doc| doc.try_into::<AgentTomlSections>()
-        .map_err(|error| format!("cannot parse config {}: {}", source_path.display(), error.message())))
+        .map_err(|error| config_refusal(&effective_path, "invalid TOML", error.message())))
         .transpose().map(Option::unwrap_or_default)
 }
 
 pub(crate) fn strict_team_config(doc: &toml::Value, path: &Path) -> Result<duduclaw_core::types::TeamConfig, String> {
     doc.get("team").map(|team| team.clone().try_into::<duduclaw_core::types::TeamConfig>()
-        .map_err(|error| format!("cannot parse config {} [team]: {}", path.display(), error.message())))
+        .map_err(|error| config_refusal(path, "invalid TOML", error.message())))
         .transpose().map(Option::unwrap_or_default)
 }
 
 /// Removed runtime choices must be fixed explicitly before dispatch.
-/// Both provider and fallback are checked before any default can be resolved.
+/// Source and resolved selectors are checked before any default can be resolved.
 pub fn ensure_active_agent_provider(agent_dir: &Path) -> Result<(), String> {
-    // A materialized preset must not hide an operator's removed source choice.
-    if let Some(doc) = read_config_for_gate(&agent_dir.join("agent.toml"))? {
-        for field in ["provider", "fallback"] {
-            if let Some(removed) = doc.get("runtime").and_then(|rt| rt.get(field))
-                .and_then(toml::Value::as_str)
-                .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
-                return Err(removed.refusal(&format!("{} agent.toml [runtime] {field}", agent_dir.display())));
-            }
-        }
-    }
     let sections = read_agent_sections_for_gate(agent_dir)?;
-    for (field, value) in [("provider", sections.runtime.provider), ("fallback", sections.runtime.fallback)] {
-        if let Some(removed) = value.as_deref().and_then(duduclaw_core::runtime_catalog::removed_runtime) {
-            return Err(removed.refusal(&format!("{} agent.toml [runtime] {field}", agent_dir.display())));
-        }
-    }
-    // An invalid team normally falls back to Solo. A removed role must not
-    // use that path to execute work with another vendor instead.
     let global_team = duduclaw_core::preset::agent_home_dir(agent_dir)
         .map(|home| crate::team_composer::read_global_team_config(&home))
         .transpose()?
         .unwrap_or_default();
     let team = duduclaw_core::types::TeamConfig::merge(&global_team, &sections.team);
-    if team.is_enabled() {
-        for role in duduclaw_core::types::Role::ALL {
-            if let Some(removed) = team.roles.get(*role).runtime.as_deref()
-                .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
-                return Err(removed.refusal(&format!("[team.roles.{}] runtime", role.as_str())));
-            }
+    for role in duduclaw_core::types::Role::ALL {
+        if let Some(removed) = team.roles.get(*role).runtime.as_deref()
+            .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+            return Err(removed.refusal(&format!("config.toml [team.roles.{}] runtime", role.as_str())));
         }
     }
     Ok(())
@@ -943,27 +1003,17 @@ pub fn resolve_utility(home_dir: &Path, agent_dir: Option<&Path>) -> UtilitySpec
 /// Utility selection is an authority gate: unreadable/malformed configured
 /// files and unknown provider names cannot silently select another provider.
 fn validate_utility_config(path: &Path, key: &str, optional: bool) -> Result<(), String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => {
-            if matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
-                return Ok(());
-            }
-            return Err(format!("cannot read utility config {}: {e}", path.display()));
-        }
-        Err(e) => return Err(format!("cannot read utility config {}: {e}", path.display())),
+    let Some(cfg) = read_config_for_gate(path)? else {
+        return if optional { Ok(()) } else { Err(config_refusal(path, "unreadable", "required config is absent")) };
     };
-    let cfg: toml::Value = text.parse::<toml::Value>()
-        .map_err(|e| format!("invalid utility config {}: {}", path.display(), e.message()))?;
     if let Some(runtime) = cfg.get("runtime") {
-        let table = runtime.as_table().ok_or("utility runtime config must be a table")?;
-        if let Some(value) = table.get(key) {
-            let id = value.as_str().ok_or("utility provider must be a string")?;
+        if let Some(value) = runtime.get(key) {
+            let id = value.as_str().ok_or_else(|| wrong_config_type(path, &format!("[runtime] {key}")))?;
             if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(id) {
-                return Err(removed.refusal(&format!("{} [runtime] {key}", path.display())));
+                return Err(removed.refusal(&format!("{} [runtime] {key}", config_file_name(path))));
             }
             if RuntimeType::parse(id).is_none() {
-                return Err(format!("unknown utility runtime {id}"));
+                return Err(format!("{}: unknown utility runtime", config_file_name(path)));
             }
         }
     }
@@ -1358,16 +1408,92 @@ mod tests {
             for bytes in [b"[runtime]\nprovider = \"private-content\"\nbroken = [".as_slice(), &[0xff]] {
                 std::fs::write(&path, bytes).unwrap();
                 let error = check().unwrap_err();
-                assert!(error.contains(&path.display().to_string()), "{error}");
+                assert!(error.starts_with(&format!("{}: ", config_file_name(&path))), "{error}");
+                assert!(!error.contains(&dir.path().display().to_string()), "{error}");
                 assert!(!error.contains("private-content"), "{error}");
             }
             std::fs::remove_file(&path).unwrap();
             std::fs::create_dir(&path).unwrap();
-            assert!(check().unwrap_err().contains(&path.display().to_string()));
+            assert_eq!(check().unwrap_err(), format!("{}: unreadable", config_file_name(&path)));
             std::fs::remove_dir(&path).unwrap();
             std::fs::write(&path, "[runtime]\nprovider = \"codex\"\nutility_provider = \"codex\"\n").unwrap();
             assert!(check().is_ok());
         }
+    }
+
+    #[test]
+    fn provider_gates_strictly_check_only_runtime_selectors() {
+        let invalid = [
+            ("runtime = 42", "[runtime]"),
+            ("[runtime]\nprovider = 42", "[runtime] provider"),
+            ("[runtime]\nfallback = false", "[runtime] fallback"),
+            ("team = 42", "[team]"),
+            ("[team]\nroles = false", "[team.roles]"),
+            ("[team.roles]\nverifier = 42", "[team.roles.verifier]"),
+            ("[team.roles.verifier]\nruntime = 42", "[team.roles.verifier] runtime"),
+            ("[team.roles.verifier]\nmodel = false", "[team.roles.verifier] model"),
+        ];
+        for name in ["agent.toml", "config.toml"] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(name);
+            for (text, field) in invalid {
+                std::fs::write(&path, text).unwrap();
+                assert_eq!(read_config_for_gate(&path).unwrap_err(), format!("{name}: wrong type for {field}"));
+            }
+            std::fs::write(&path, "[runtime]\ntimeout_secs = false\n[team]\nenabled = 42\n[team.roles.verifier]\neffort = false\n").unwrap();
+            assert!(read_config_for_gate(&path).is_ok(), "unrelated fields keep lenient semantics");
+        }
+    }
+
+    #[test]
+    fn source_and_resolved_team_selectors_are_checked_independently() {
+        let home = TempDir::new().unwrap();
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+        std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+        let source = agent.join("agent.toml");
+        for invalid_path in [&source, &resolved] {
+            let other = if invalid_path == &source { &resolved } else { &source };
+            for invalid in [
+                "[team]\nenabled = false\n[team.roles.verifier]\nruntime = \"antigravity\"\n",
+                "[team.roles.verifier]\nmodel = 42\n",
+                "[runtime]\nprovider = \"agy\"\n",
+                "[runtime]\nfallback = \"gemini\"\n",
+            ] {
+                std::fs::write(other, "[runtime]\nprovider = \"codex\"\n").unwrap();
+                std::fs::write(invalid_path, invalid).unwrap();
+                for error in [read_agent_sections_for_gate(&agent).unwrap_err(), ensure_active_agent_provider(&agent).unwrap_err()] {
+                    assert!(error.starts_with(config_file_name(invalid_path)), "{error}");
+                    assert!(!error.contains(&home.path().display().to_string()), "{error}");
+                }
+            }
+        }
+        std::fs::remove_file(source).unwrap();
+        assert!(ensure_active_agent_provider(&agent).is_err(), "resolved content is checked without a source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_config_symlinks_are_not_absent() {
+        let dir = TempDir::new().unwrap();
+        for name in ["agent.toml", "config.toml", "worker.toml"] {
+            let path = dir.path().join(name);
+            assert!(read_config_for_gate(&path).unwrap().is_none());
+            std::os::unix::fs::symlink(dir.path().join("missing"), &path).unwrap();
+            assert_eq!(read_config_for_gate(&path).unwrap_err(), format!("{name}: unreadable"));
+        }
+    }
+
+    #[test]
+    fn config_refusals_do_not_echo_parser_keys_or_paths() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agent.toml");
+        let key = "私密內容".repeat(100);
+        std::fs::write(&path, format!("{key:?} = 1\n{key:?} = 2\n")).unwrap();
+        assert_eq!(read_config_for_gate(&path).unwrap_err(), "agent.toml: invalid TOML");
+        std::fs::write(&path, [0xff]).unwrap();
+        assert_eq!(read_config_for_gate(&path).unwrap_err(), "agent.toml: invalid UTF-8");
     }
 
     #[test]

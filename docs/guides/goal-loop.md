@@ -266,7 +266,7 @@ Every verdict is written to the audit log as `team_gate_decision` with the signa
 
 ### The spec is frozen per task
 
-The team a task runs with is decided once, at creation, and stored on the task. Later changes to `[team]` affect the *next* task. A spec that fails validation — most often a verifier sharing the executor's model family — forms no team at all: the task runs Solo and there is no partial team.
+The team a task runs with is decided once, at creation, and stored on the task. Later changes to `[team]` affect the *next* task. A non-fatal validation failure, such as a verifier sharing the executor's model family, forms no team and runs Solo. Unreadable or malformed config, wrong types in runtime-selection fields, and removed runtimes refuse dispatch entirely. Creation checks before inserting the task; a refusal encountered afterwards parks only that goal as `needs_human` with `blocked_needs_decision`, while other goals continue. A parked goal is not retried or audited again on every tick.
 
 Whether that refusal is loud depends on who asked for the team. An operator who wrote `enabled = true`, or who configured roles that then fail validation, gets the refusal audited as `team_refused` with the role and the reason. A deployment that never touched `[team]` at all gets a `debug!` line and nothing in the audit log — that refusal is the default state of every install since the v1.66 flip, and stamping a row on every goal task everywhere is how a real refusal stops being findable.
 
@@ -315,7 +315,7 @@ A task that declares no artefacts adds no block, and a Solo round with no native
 | Event | Meaning |
 |---|---|
 | `team_gate_decision` | Solo / Team / grey band, with the signals that fired |
-| `team_refused` | An enabled spec failed validation; the task runs Solo |
+| `team_refused` | A team spec was refused; non-fatal validation failures run Solo, while config-read/parse/type failures and removed runtimes pause the affected goal for a decision |
 | `team_round_started` | A three-stage round began, with the roles and any degrade steps |
 | `team_member_spawned` | One role member was created (role, runtime, model) |
 | `team_stage_failed` | A stage did not produce what the next one needs, or could not run at all — carries `role`, `runtime`, `model` and the error |
