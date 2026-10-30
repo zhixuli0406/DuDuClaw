@@ -16,7 +16,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
-import { useApprovalsStore } from '@/stores/approvals-store';
+import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useOpenAssign } from '@/hooks/useOpenAssign';
@@ -482,7 +482,7 @@ export function AppSidebar() {
   );
 
   const connectionState = useConnectionStore((s) => s.state);
-  const inboxCount = useApprovalsStore((s) => s.pendingCount);
+  const inboxCount = useApprovalsStore(selectInboxCount);
   const fetchInboxCount = useApprovalsStore((s) => s.fetchCount);
   const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);

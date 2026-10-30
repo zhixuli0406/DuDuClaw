@@ -435,6 +435,8 @@
 
 | 機能 | 説明 |
 |------|------|
+| 受信トレイ `/inbox` | 共通の要対応件数、期限順の整理、安全な保管、対応結果とモバイルの判断操作。[ガイド](../../guides/ja-JP/dashboard-settings.md#受信トレイと作業タイムライン)。 |
+| 作業タイムライン `/timeline` | 4 状態の件数と従業員カードで成果、停止中、判断待ちを確認。タスクへのリンクと任意の期間図。 |
 | ルート | `web/src/App.tsx` に約 74 のリダイレクトでないルート（加えて旧ブックマーク維持用のレガシーリダイレクト別名が約 30）。4 つのシェル：ワークスペース（`/`、`/chat`、`/tasks`、`/goals`、`/inbox`、`/files`、`/mail`、`/timeline`、`/foresight`、`/gallery`、`/canvas` …）、エージェント（`/agents`、`/agents/:id/:tab`、`/agents/new`、`/experts`、`/org`、`/presets`）、`/manage/*`（チャネル、ログ、請求、メンバー、部門、ディストリビューター、推論、ローカルモデル、ファインチューン、信頼性、セキュリティ監査、Wiki 信頼 …）、`/app/system/*`（設定、セキュリティ、アカウント、ライセンス、因果、Decision Lab、CCR …）、加えて単独ページ（`/login`、`/welcome`、`/webchat`、`/console`、`/mascot-overlay`、`/pet-studio`、`/world`、`/launcher`）。サイドバーに何が出るかは `web/src/components/layout/nav-model.ts` が真実の源 |
 | 技術スタック | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
 | DuDuClaw デザインシステム（mds）| 共有 `web/src/components/mds/` コンポーネントライブラリ（OKLCH トークン、4 層サーフェス、3 段シャドウ、Inter／Geist Mono）+ `nav-model.ts` のグループ化サイドバー（個人／作業／会社／設定）+ `web/DESIGN.md` 仕様；全ページを共有プリミティブで構築、en/ja/zh i18n 同期 |

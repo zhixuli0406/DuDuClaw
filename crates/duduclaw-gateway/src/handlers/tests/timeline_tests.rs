@@ -47,6 +47,8 @@ fn done_task_becomes_closed_bar_with_real_end() {
     );
     assert_eq!(row.kind, "task");
     assert_eq!(row.status, "done");
+    assert_eq!(row.task_id.as_deref(), Some("t1"));
+    assert_eq!(row.updated_at.as_deref(), Some(t.updated_at.as_str()));
 }
 
 #[test]
@@ -58,6 +60,92 @@ fn in_progress_task_is_open_ended_running_bar() {
         row.ended_at, None,
         "running bar must stay open (null = extends to now)"
     );
+}
+
+#[test]
+fn unresolved_store_statuses_remain_visible_in_later_windows() {
+    for status in [
+        "review", "revising", "in_review", "pending", "pending_approval",
+        "needs_human", "blocked",
+    ] {
+        // Neither a claim nor a recent state change is needed for an old
+        // waiting task to remain actionable in the current window.
+        let t = task(status, status);
+        let row = timeline_row_from_task(&t, ts(10, 0), ts(23, 0), ts(23, 0))
+            .unwrap_or_else(|| panic!("unresolved {status} must overlap the window"));
+        assert_eq!(row.ended_at, None, "{status} remains open");
+    }
+}
+
+#[test]
+fn unassigned_task_keeps_an_empty_lane_id_for_localized_label() {
+    let mut t = task("unassigned", "pending");
+    t.assigned_to.clear();
+    let row = timeline_row_from_task(&t, ts(0, 0), ts(23, 0), ts(23, 0)).unwrap();
+    assert!(row.agent_id.is_empty());
+}
+
+#[test]
+fn failures_are_problems_before_source_classification() {
+    for event in [
+        "error", "channel_send_failure_alert", "cost_anomaly_detected",
+        "heartbeat_error", "delegation_failed", "skill_install_failure",
+    ] {
+        assert_eq!(timeline_kind_for_event(event), "problem", "{event}");
+    }
+    assert_eq!(timeline_kind_for_event("terror_notice"), "activity");
+    assert_eq!(timeline_kind_for_event("heartbeat_fired"), "heartbeat");
+}
+
+#[test]
+fn activity_links_use_task_id_without_replacing_activity_reference() {
+    let mut a = activity("event-id", "error", ts(6, 0));
+    a.task_id = Some("task-id".into());
+    let row = timeline_row_from_activity(&a, ts(0, 0), ts(23, 0)).unwrap();
+    assert_eq!(row.ref_id, "event-id");
+    assert_eq!(row.task_id.as_deref(), Some("task-id"));
+    assert_eq!(row.updated_at, None);
+    assert_eq!(row.kind, "problem");
+}
+
+#[test]
+fn pseudo_channel_alert_lane_is_excluded_from_all_sources() {
+    let mut t = task("pseudo-task", "needs_human");
+    t.assigned_to = "channel_alert".into();
+    let mut a = activity("alert", "channel_send_failure_alert", ts(6, 0));
+    a.agent_id = "channel_alert".into();
+    let hb = vec![("channel_alert".into(), Some(ts(6, 0).to_rfc3339()))];
+    let (rows, _) = derive_timeline_rows(
+        &[t], &[a], &hb, ts(0, 0), ts(23, 0), ts(23, 0),
+    );
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn linked_activity_preserves_private_task_redaction_and_live_access() {
+    use super::super::task_privacy_tests as privacy;
+
+    let f = privacy::fixture().await;
+    let window = json!({
+        "agent_id": "sales",
+        "from": (Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        "to": (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+    });
+    let data = privacy::payload(
+        f.handler.handle_timeline_list(window.clone(), &f.bob).await,
+    );
+    let row = data["rows"].as_array().unwrap().iter()
+        .find(|r| r["ref_id"] == format!("act-{}", privacy::PRIVATE))
+        .unwrap();
+    assert_eq!(row["task_id"], privacy::PRIVATE);
+    assert_eq!(row["label"], "");
+    assert!(!data.to_string().contains("secret activity private-task"));
+    assert!(data.to_string().contains("secret activity open-task"));
+
+    f.db.unbind_agent(&f.bob.user_id, "sales").unwrap();
+    assert!(privacy::denied(
+        &f.handler.handle_timeline_list(window, &f.bob).await,
+    ));
 }
 
 #[test]

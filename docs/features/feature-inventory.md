@@ -440,6 +440,8 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
+| Inbox `/inbox` | One actionable count, expiry-first triage, safe local archive, readable outcomes, and mobile decision controls. See [dashboard guide](../guides/dashboard-settings.md#inbox-and-work-timeline). |
+| Work timeline `/timeline` | Four status counts and employee cards show results, stuck work, and pending decisions; task links and an optional task-lifetime chart. |
 | Routes | ~74 non-redirect route paths in `web/src/App.tsx` (plus ~30 legacy redirect aliases that keep old bookmarks working). Four shells: workspace (`/`, `/chat`, `/tasks`, `/goals`, `/inbox`, `/files`, `/mail`, `/timeline`, `/foresight`, `/gallery`, `/canvas`, …), agents (`/agents`, `/agents/:id/:tab`, `/agents/new`, `/experts`, `/org`, `/presets`), `/manage/*` (channels, logs, billing, users, departments, distributors, inference, local-models, finetune, reliability, secaudit, wiki-trust, …), `/app/system/*` (settings, security, accounts, license, causal, decision-lab, ccr, …), plus standalone pages (`/login`, `/welcome`, `/webchat`, `/console`, `/mascot-overlay`, `/pet-studio`, `/world`, `/launcher`). `web/src/components/layout/nav-model.ts` is the source of truth for what appears in the sidebar |
 | Tech Stack | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
 | DuDuClaw Design System (mds) | Shared `web/src/components/mds/` component library (OKLCH tokens, four-layer surfaces, three-tier shadows, Inter / Geist Mono) + `nav-model.ts` grouped sidebar (personal / work / company / settings) + `web/DESIGN.md` spec; every page built on the shared primitives with synchronized en/ja/zh i18n |

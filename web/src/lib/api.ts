@@ -1269,6 +1269,7 @@ export type TimelineKind =
   | 'skill'
   | 'autopilot'
   | 'governance'
+  | 'problem'
   | 'activity';
 
 /** One Gantt row of the company work timeline — derived server-side from real
@@ -1283,6 +1284,10 @@ export interface TimelineRow {
   ended_at: string | null;
   status: string;
   ref_id: string;
+  /** Linked task; activity ref_id identifies the activity rather than the task. */
+  task_id?: string | null;
+  /** Last task update, not necessarily the moment its status changed. */
+  updated_at?: string;
 }
 
 export interface TimelineListResult {
