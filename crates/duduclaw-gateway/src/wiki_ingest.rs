@@ -1587,6 +1587,10 @@ async fn run_ingest_inner(
     sources: &[duduclaw_memory::SourceRef],
     utility_override: Option<UtilityResponse>,
 ) {
+    let masked_user = duduclaw_security::credential_detect::mask(user_text);
+    let masked_reply = duduclaw_security::credential_detect::mask(assistant_reply);
+    let user_text = masked_user.as_str();
+    let assistant_reply = masked_reply.as_str();
     // WP-2 role members never distil. A team role member is scaffolded per
     // round and torn down the moment that round settles, so whatever it
     // "learns" is dead on arrival — and it would land in the memory store
@@ -2363,6 +2367,12 @@ async fn store_facts_protected(
     provenance: &duduclaw_memory::lineage::Provenance,
 ) -> Result<ProtectedStoreReport, String> {
     let mut report = ProtectedStoreReport::default();
+    let facts: Vec<DistilledFact> = facts.iter().filter(|fact| {
+        let joined = format!("{} {} {} {}", fact.content, fact.subject.as_deref().unwrap_or(""),
+            fact.predicate.as_deref().unwrap_or(""), fact.object.as_deref().unwrap_or(""));
+        matches!(duduclaw_security::credential_detect::detect(&joined), Ok(found) if found.is_empty())
+            && joined.len() <= duduclaw_security::credential_detect::MAX_SCAN_BYTES
+    }).cloned().collect();
 
     // Dedup guard: currently-valid distilled contents (quarantined rows are
     // already excluded by `list_valid_by_source_event`).

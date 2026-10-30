@@ -621,5 +621,7 @@ pub mod egress_guard;
 pub mod egress_client;
 
 pub mod egress_gate;
+pub mod credential_ledger;
+pub mod credential_declaration;
 
 mod egress_registry;

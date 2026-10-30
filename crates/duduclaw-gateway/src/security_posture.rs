@@ -309,6 +309,10 @@ pub struct CredentialEntry {
     pub writable: bool,
     /// A plaintext twin sits next to a `_enc` twin (design §1.5).
     pub residue: bool,
+    pub source_kind: String,
+    pub holder: Option<String>,
+    pub service: Option<String>,
+    pub kind: Option<String>,
 }
 
 /// Walk a parsed `config.toml` and describe every credential field it holds.
@@ -335,6 +339,10 @@ pub fn credential_inventory(table: &toml::Table) -> Vec<CredentialEntry> {
             source_label: st.source_label,
             writable: st.writable,
             residue: st.residue,
+            source_kind: "config".into(),
+            holder: None,
+            service: None,
+            kind: None,
         });
     }
 
@@ -396,6 +404,46 @@ pub fn credential_inventory(table: &toml::Table) -> Vec<CredentialEntry> {
     let mut out = Vec::new();
     walk(table, "", &mut out);
     out
+}
+
+/// Read-only projections: enumerate metadata without resolving or unsealing values.
+pub fn additional_credential_inventory(home: &Path, table: &toml::Table, agents: &[String]) -> Result<Vec<CredentialEntry>, String> {
+    use duduclaw_security::secret_ref::SourceKind;
+    fn entry(path: String, holder: Option<String>, service: Option<String>, kind: &str, source: SourceKind) -> CredentialEntry {
+        CredentialEntry { path, configured: true, source, source_label: "system configuration".into(), writable: false, residue: false,
+            source_kind: "config".into(), holder, service, kind: Some(kind.into()) }
+    }
+    let mut out = Vec::new();
+    for record in crate::remote_mcp::store::load_all(home).map_err(|_| "Remote MCP inventory unavailable")? {
+        if record.auth == crate::remote_mcp::store::AuthKind::None && record.header_names.is_empty() { continue; }
+        out.push(entry(format!("remote_mcp.{}.{}", record.agent_id, record.server), Some(format!("agent:{}", record.agent_id)), Some(record.server), "remote_mcp", SourceKind::Inline));
+    }
+    for record in crate::person_credentials::all_metadata(home).map_err(|_| "Personal credential inventory unavailable")? {
+        out.push(entry(format!("google_personal.{}", record.credential_id), Some(format!("user:{}", record.owner_id)), Some("Google".into()), "oauth_token", SourceKind::Keychain));
+    }
+    for profile in crate::computer_profiles::list(home).map_err(|_| "Browser profile inventory unavailable")? {
+        out.push(entry(format!("browser_profile.{}", profile.profile_id), Some(format!("agent:{}", profile.agent_id)), None, "cookie", SourceKind::Inline));
+    }
+    for agent in agents {
+        if !duduclaw_core::is_valid_agent_id(agent) { continue; }
+        let dir = home.join("agents").join(agent);
+        if !dir.join(".mcp.json").exists() { continue; }
+        let config = duduclaw_agent::mcp_template::read_mcp_config(&dir).map_err(|_| "MCP environment inventory unavailable")?;
+        for (server, definition) in config.mcp_servers {
+            for name in definition.env.keys() {
+                out.push(entry(format!("mcp_env.{agent}.{server}.{name}"), Some(format!("agent:{agent}")), Some(server.clone()), "environment", SourceKind::Env));
+            }
+        }
+    }
+    if let Some(keys) = table.get("mcp_keys").and_then(toml::Value::as_table) {
+        // The map keys ARE credentials. Only the client-id projection may leave this function.
+        for record in keys.values().filter_map(toml::Value::as_table) {
+            if let Some(client) = record.get("client_id").and_then(toml::Value::as_str) {
+                out.push(entry(format!("mcp_client.{client}"), Some(format!("client:{client}")), Some("MCP".into()), "api_key", SourceKind::Legacy));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Compute the security posture from the live home directory.
@@ -852,5 +900,79 @@ mod tests {
                 f.path
             );
         }
+    }
+}
+
+/// Verify the current audit segment under the same cross-process lock as writers.
+/// An internally intact chain cannot prove that its tail was not deleted.
+pub fn verify_security_audit(home: &Path) -> Result<serde_json::Value, String> {
+    use duduclaw_security::audit_chain::{verify_chain, ChainVerifyResult};
+    let path = home.join("security_audit.jsonl");
+    if !path.exists() {
+        return Ok(serde_json::json!({"status":"missing", "intact":false, "lines_checked":0}));
+    }
+    duduclaw_core::with_file_lock(&path, || {
+        let file = std::fs::File::open(&path)?;
+        #[cfg(unix)]
+        duduclaw_core::platform::flock_exclusive(&file)?;
+        let _ = &file;
+        match verify_chain(&path)? {
+            ChainVerifyResult::Intact { lines_checked } => Ok(serde_json::json!({"status":if lines_checked == 0 { "unverified" } else { "intact" }, "intact":lines_checked > 0, "lines_checked":lines_checked})),
+            ChainVerifyResult::Broken { line_number } => Ok(serde_json::json!({"status":"broken", "intact":false, "line_number":line_number})),
+        }
+    }).map_err(|_: std::io::Error| "security audit verification unavailable".into())
+}
+
+#[cfg(test)]
+mod credential_projection_tests {
+    use super::*;
+    #[test]
+    fn inventory_projects_client_ids_and_env_names_without_values() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/bot");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"crm":{"command":"example","env":{"API_KEY":"NEVER-EXPOSE-ENV-VALUE"}}}}"#).unwrap();
+        let table: toml::Table = "[mcp_keys.NEVER-EXPOSE-MAP-KEY]\nclient_id='customer'\n".parse().unwrap();
+        let entries = additional_credential_inventory(home.path(), &table, &["bot".into()]).unwrap();
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains("customer"));
+        assert!(json.contains("API_KEY"));
+        assert!(!json.contains("NEVER-EXPOSE"));
+        assert!(entries.iter().all(|e| !e.writable));
+    }
+    #[test]
+    fn browser_profile_projection_does_not_claim_os_keychain_storage() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("computer_profiles/bot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = crate::computer_profiles::ProfileState {
+            version: 1, profile_id: "profile-test".into(), agent_id: "bot".into(),
+            hosts: vec!["example.test".into()], generation: 1, sealed_bytes: 10,
+            updated_at: 1, last_used_at: 1,
+        };
+        std::fs::write(dir.join("state.json"), serde_json::to_vec(&profile).unwrap()).unwrap();
+        let entries = additional_credential_inventory(home.path(), &toml::Table::new(), &[]).unwrap();
+        let browser = entries.iter().find(|entry| entry.kind.as_deref() == Some("cookie")).unwrap();
+        assert_eq!(browser.source, duduclaw_security::secret_ref::SourceKind::Inline);
+        assert!(!browser.writable);
+    }
+    #[test]
+    fn audit_verify_reports_missing_intact_and_broken() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(verify_security_audit(home.path()).unwrap()["status"], "missing");
+        for index in 0..2 {
+            duduclaw_security::audit::append_audit_event(home.path(), &duduclaw_security::audit::AuditEvent::new("credential_detected", "test", duduclaw_security::audit::Severity::Info, serde_json::json!({"index":index})));
+        }
+        assert_eq!(verify_security_audit(home.path()).unwrap()["lines_checked"], 2);
+        let path = home.path().join("security_audit.jsonl");
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, original.replacen("credential_detected", "credential_modified", 1)).unwrap();
+        assert_eq!(verify_security_audit(home.path()).unwrap()["status"], "broken");
+    }
+    #[test]
+    fn audit_verify_does_not_call_legacy_only_history_intact() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("security_audit.jsonl"), "{\"event\":\"legacy\"}\n").unwrap();
+        assert_eq!(verify_security_audit(home.path()).unwrap()["status"], "unverified");
     }
 }

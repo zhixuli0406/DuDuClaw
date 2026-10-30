@@ -384,7 +384,7 @@ pub fn append_tool_call_with_extras(
     map.insert("timestamp".into(), Utc::now().to_rfc3339().into());
     map.insert("agent_id".into(), agent_id.into());
     map.insert("tool_name".into(), tool_name.into());
-    map.insert("params_summary".into(), params_summary.into());
+    map.insert("params_summary".into(), mask_sensitive_text(params_summary).into());
     map.insert("success".into(), success.into());
     for (key, value) in extras {
         if RESERVED.contains(key) {
@@ -393,7 +393,7 @@ pub fn append_tool_call_with_extras(
             );
             continue;
         }
-        map.insert((*key).to_string(), value.clone());
+        map.insert((*key).to_string(), mask_sensitive_json(value));
     }
     // F5-D: a call made inside a goal round names the round's task (the
     // gateway sets it at spawn), so readers can tell it apart from a
@@ -508,10 +508,11 @@ fn mask_at_depth(v: &serde_json::Value, depth: usize) -> serde_json::Value {
         serde_json::Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, val) in map {
+                let safe_key = crate::credential_detect::mask(k);
                 if is_sensitive_key(k) {
-                    out.insert(k.clone(), serde_json::Value::String("***".into()));
+                    out.insert(safe_key, serde_json::Value::String("***".into()));
                 } else {
-                    out.insert(k.clone(), mask_at_depth(val, depth + 1));
+                    out.insert(safe_key, mask_at_depth(val, depth + 1));
                 }
             }
             serde_json::Value::Object(out)
@@ -520,10 +521,9 @@ fn mask_at_depth(v: &serde_json::Value, depth: usize) -> serde_json::Value {
             items.iter().map(|i| mask_at_depth(i, depth + 1)).collect(),
         ),
         serde_json::Value::String(s) if is_sensitive_value(s) => {
-            // Keep a short, CJK-safe prefix for correlation, mask the rest.
-            let head = duduclaw_core::truncate_chars(s, 8);
-            serde_json::Value::String(format!("{head}***"))
+            serde_json::Value::String("***".into())
         }
+        serde_json::Value::String(s) => serde_json::Value::String(mask_sensitive_text(s)),
         other => other.clone(),
     }
 }
@@ -638,6 +638,8 @@ static SENSITIVE_TEXT_SLACK_WEBHOOK_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// guarantee — it shares the same key/prefix allowlists as
 /// [`mask_sensitive_json`] (now `-`/`_`-tolerant, see [`sensitive_keys_pattern`]).
 pub fn mask_sensitive_text(text: &str) -> String {
+    let credential_masked = crate::credential_detect::mask(text);
+    let text = credential_masked.as_str();
     let masked = SENSITIVE_TEXT_JSON_KV_RE.replace_all(text, |caps: &regex::Captures| {
         format!("\"{}\":\"***\"", &caps[1])
     });
@@ -785,7 +787,7 @@ pub fn append_tool_call_denied(
         extras.push(("input", serde_json::Value::String(rendered)));
         extras.push(("input_truncated", serde_json::Value::Bool(truncated)));
     }
-    let params_summary = format!("denied ({error_class}): {}", duduclaw_core::truncate_chars(detail, 200));
+    let params_summary = format!("denied ({error_class}): {}", duduclaw_core::truncate_chars(&mask_sensitive_text(detail), 200));
     append_tool_call_with_extras(home_dir, agent_id, tool_name, &params_summary, false, &extras);
 }
 
@@ -1226,8 +1228,7 @@ mod tests {
 
     #[test]
     fn mask_is_cjk_safe_on_prefixed_values() {
-        // Multi-byte content behind a secret prefix must not panic on the
-        // 8-char correlation head.
+        // Multi-byte content behind a secret prefix is fully masked.
         let v = serde_json::json!({ "content": "Bearer 憑證繁體中文金鑰內容" });
         let m = mask_sensitive_json(&v);
         assert!(m["content"].as_str().unwrap().ends_with("***"));
@@ -1807,5 +1808,46 @@ mod tests {
         assert_eq!(events[0].details["file"], "tool_calls.jsonl");
         assert_eq!(events[0].details["old_tail_hash"], "deadbeef");
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod credential_sink_tests {
+    use super::*;
+
+    #[test]
+    fn tool_json_and_text_mask_contextual_credentials() {
+        let input = serde_json::json!({"prompt":"帳號 alice@example.com 密碼：fixture-value"});
+        assert!(!mask_sensitive_json(&input).to_string().contains("fixture-value"));
+        assert!(!mask_sensitive_text("password: fixture-value").contains("fixture-value"));
+    }
+
+    #[test]
+    fn tool_text_over_scan_limit_is_not_stored_unscanned() {
+        let text = format!("{} password: fixture-value", "x".repeat(crate::credential_detect::MAX_SCAN_BYTES));
+        assert!(!mask_sensitive_text(&text).contains("fixture-value"));
+    }
+    #[test]
+    fn tool_append_boundary_masks_summary_extras_and_denied_detail() {
+        let home = super::tests::fresh_home();
+        append_tool_call_with_extras(&home, "tester", "tasks_create", "密碼：fixture-summary", true,
+            &[("note", serde_json::json!("password: fixture-extra"))]);
+        let detail = format!("{}password: fixture-denial", "字".repeat(190));
+        append_tool_call_denied(&home, "tester", "tasks_create", "denied", &detail, None);
+        let raw = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
+        for secret in ["fixture-summary", "fixture-extra", "fixture-denial", "fixture-"] {
+            assert!(!raw.contains(secret));
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+}
+
+#[cfg(test)]
+mod credential_json_key_tests {
+    #[test]
+    fn tool_json_dynamic_keys_do_not_preserve_detected_credentials() {
+        let input = serde_json::json!({"password: private-fixture":"ordinary value"});
+        assert!(!super::mask_sensitive_json(&input).to_string().contains("private-fixture"));
     }
 }

@@ -837,7 +837,7 @@ async fn process_line_events(
                                     Ok(t) if !t.trim().is_empty() => {
                                         info!(
                                             "🎙 LINE [{sender}] transcribed: {}",
-                                            duduclaw_core::truncate_bytes(&t, 80)
+                                            duduclaw_core::truncate_bytes(&duduclaw_security::credential_detect::mask(&t), 80)
                                         );
                                         voice_text = t;
                                     }
@@ -895,7 +895,7 @@ async fn process_line_events(
                     continue;
                 }
 
-                info!("📩 LINE [{sender}]: {}", truncate_bytes(&input_text, 80));
+                info!("📩 LINE [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&input_text), 80));
 
                 // ── Chat commands (/status, /new, /handoff, /undo, /rollback, …) ──
                 // Intercepted before the AI pipeline — zero LLM cost. Mirrors slack.rs.

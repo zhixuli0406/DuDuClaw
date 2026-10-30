@@ -994,3 +994,9 @@ port = 18889
 #   [router]        inference.toml — local-inference cascade routing
 #   [voice] TTS     inference.toml — text-to-speech; only STT lives in this file
 #   [branding]      ~/.duduclaw/branding.json, written by the dashboard only
+
+[security]
+# audit keeps the original conversation; mask hides detected credentials from
+# the current prompt and conversation history. Derived stores are always masked.
+# Unknown values fail closed to mask. Bare passwords without context are not detected.
+chat_credentials = "audit"

@@ -35,7 +35,8 @@ pub(crate) fn mergeable(event: &LineEvent) -> bool {
 
 /// [`mergeable`] on a stored event (`payload.event`).
 pub(crate) fn mergeable_json(event: &serde_json::Value) -> bool {
-    serde_json::from_value::<LineEvent>(event.clone()).is_ok_and(|e| mergeable(&e))
+    !crate::channel_ingress::credential_payload::is_encrypted(event)
+        && serde_json::from_value::<LineEvent>(event.clone()).is_ok_and(|e| mergeable(&e))
 }
 
 fn is_redelivery(event: &LineEvent) -> bool {

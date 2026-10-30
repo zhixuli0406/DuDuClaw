@@ -458,7 +458,7 @@ async fn receive_webhook(
 
                     info!(
                         "📩 WhatsApp [{sender}]: {}",
-                        truncate_bytes(&input_text, 80)
+                        truncate_bytes(&duduclaw_security::credential_detect::mask(&input_text), 80)
                     );
 
                     // Chat commands

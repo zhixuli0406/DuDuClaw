@@ -73,6 +73,7 @@
 | 66 | [通訊軟體的思考顯示](66-thinking-in-messaging-apps.md) | Telegram、Discord、Slack、Teams、LINE 等平台上的計時與遮蔽後摘要；`[thinking] channel_audience`／`channel_group_display` |
 | 67 | [在聊天裡交辦任務](67-assigning-tasks.md) | `/交辦 @員工 任務`（`/assign`）以發話者名義建立目標任務，只能交辦給有權限的員工；進度回到原對話；`/交辦 狀態`；「目標」頁的「我交辦的」；dashboard 交辦任務頁（`/assign`：交辦技能或完整表單，可附檔） |
 | 69 | [資料外送防護](69-egress-guard.md) | v1.77.0：每回合 MCP 私人讀取紀錄、外送核准與常設授權限制 |
+| 70 | [對話憑證稽核](70-credential-audit.md) | 尚未發版：憑證中繼資料、依路由登錄持有者、遮罩與 Admin 查閱 |
 
 ---
 

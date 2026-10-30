@@ -191,6 +191,21 @@ impl fmt::Debug for ProtectedKey {
 }
 
 impl ProtectedKey {
+    /// Domain-separated HMAC for high-entropy chat credentials. The protected
+    /// root key and the derived ledger key never leave this type.
+    pub fn credential_fingerprint(&self, kind: &str, value: &[u8]) -> Option<String> {
+        if !matches!(kind, "api_key" | "oauth_token" | "ssh_key" | "certificate") || value.len() < 20 {
+            return None;
+        }
+        use ring::hmac;
+        let root = hmac::Key::new(hmac::HMAC_SHA256, self.key.as_ref());
+        let derived = hmac::sign(&root, b"duduclaw/chat-credential-ledger/v1");
+        let ledger = hmac::Key::new(hmac::HMAC_SHA256, derived.as_ref());
+        let digest = hmac::sign(&ledger, value);
+        let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        Some(format!("{}:{hex}", self.key_id))
+    }
+
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
@@ -530,4 +545,30 @@ pub fn credential_protection_level(home: &Path) -> ProtectionStatus {
 /// The single gate for person identities (B2a/B2b), on this platform's store.
 pub fn person_identity_gate(home: &Path) -> Result<ProtectedKey, ProtectionError> {
     CredentialProtection::platform(home).person_identity_gate()
+}
+
+#[cfg(test)]
+mod ledger_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn low_entropy_kinds_refuse_even_with_a_protected_key() {
+        let key = ProtectedKey { key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+        for kind in ["password", "connection_string", "other", "cookie"] {
+            assert!(key.credential_fingerprint(kind, &[b'x'; 80]).is_none());
+        }
+    }
+
+    #[test]
+    fn high_entropy_fingerprints_are_keyed_stable_and_domain_separated() {
+        let first = ProtectedKey { key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+        let second = ProtectedKey { key: Zeroizing::new([8; KEY_LEN]), key_id: "fixture".into() };
+        let value = [b'x'; 40];
+        let digest = first.credential_fingerprint("api_key", &value).unwrap();
+        assert_eq!(Some(digest.clone()), first.credential_fingerprint("api_key", &value));
+        assert_ne!(Some(digest.clone()), second.credential_fingerprint("api_key", &value));
+        let raw = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; KEY_LEN]), &value);
+        let raw: String = raw.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(digest, format!("fixture:{raw}"));
+    }
 }

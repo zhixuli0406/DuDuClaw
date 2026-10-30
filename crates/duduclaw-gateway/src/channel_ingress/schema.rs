@@ -306,7 +306,8 @@ impl IngressStore {
             migrate(&conn)?;
         }
         let held = hold_restored(&conn, home)?;
-        let store = Self::from_connection(conn);
+        let mut store = Self::from_connection(conn);
+        store.home = Some(home.to_path_buf());
         if !held.is_empty() {
             if let Ok(mut r) = store.restored.lock() {
                 *r = held;

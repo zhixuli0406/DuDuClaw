@@ -80,6 +80,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/68-manager-team-history.md](features/68-manager-team-history.md) | Read-only team conversations — Enterprise backend API (v1.76.0), live reporting-line checks, masked external conversations, activation window, mandatory audit and limits; [繁體中文](features/zh-TW/68-manager-team-history.md) / [日本語](features/ja-JP/68-manager-team-history.md) |
 | [features/69-egress-guard.md](features/69-egress-guard.md) | Unreleased: per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
+| [features/70-credential-audit.md](features/70-credential-audit.md) | Unreleased: conversation credential metadata and masking; [繁體中文](features/zh-TW/70-credential-audit.md) / [日本語](features/ja-JP/70-credential-audit.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---

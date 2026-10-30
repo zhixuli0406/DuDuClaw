@@ -532,6 +532,8 @@ impl SessionManager {
     /// therefore retained for audit only *until the next compression*, not
     /// indefinitely (see `session_portability.rs` module docs).
     pub async fn compress(&self, session_id: &str, summary: &str) -> Result<()> {
+        let masked_summary = duduclaw_security::credential_detect::mask(summary);
+        let summary = masked_summary.as_str();
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -917,7 +919,7 @@ impl SessionManager {
                  summarized_through_turn = ?2,
                  last_summarized_at = ?3
              WHERE id = ?4",
-            params![summary, through_turn as i64, now, session_id],
+            params![duduclaw_security::credential_detect::mask(summary), through_turn as i64, now, session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(format!("set_summary: {e}")))?;
         Ok(())
@@ -1856,5 +1858,23 @@ mod tests {
         assert_eq!(old_msgs.len(), 2);
         assert_eq!(old_msgs[1].content, "resumed turn");
         assert_eq!(mgr.get_messages("webchat:new").await.unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod credential_summary_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn summary_and_compression_mask_contextual_credentials() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let manager = SessionManager::new(file.path()).unwrap();
+        manager.get_or_create("test:s1", "test").await.unwrap();
+        manager.set_summary("test:s1", "密碼：fixture-value", 1).await.unwrap();
+        let (summary, _) = manager.get_summary("test:s1").await.unwrap();
+        assert!(!summary.contains("fixture-value"));
+        manager.compress("test:s1", "password: fixture-value").await.unwrap();
+        let messages = manager.get_messages("test:s1").await.unwrap();
+        assert!(messages.iter().all(|m| !m.content.contains("fixture-value")));
     }
 }

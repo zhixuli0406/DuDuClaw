@@ -199,6 +199,7 @@ mod os_tools;
 mod record_authz;
 mod reminders;
 mod responsibilities;
+mod credential_declare;
 mod server;
 mod skills;
 mod skills_lifecycle;

@@ -1162,6 +1162,7 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ),
     ("tasks_complete", "Mark a board task done", "admin", "task"),
     ("tasks_block", "Mark a board task blocked", "admin", "task"),
+    ("credential_declare", "Declare a held credential service without its value", "admin", "task"),
     ("responsibility_get", "Read your own continuous responsibilities", "admin", "task"),
     ("responsibility_followup", "Schedule one follow-up wake-up of your responsibility", "admin", "task"),
     ("responsibility_ask", "Ask the operator a question for your responsibility", "admin", "task"),

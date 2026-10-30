@@ -618,7 +618,7 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
         return;
     }
 
-    info!("📩 WeCom [{from_user}]: {}", truncate_bytes(&text, 80));
+    info!("📩 WeCom [{from_user}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     let session_id = format!("wecom:{from_user}");
 

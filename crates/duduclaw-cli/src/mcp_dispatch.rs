@@ -4660,6 +4660,7 @@ effect = "forbid"
         "responsibility_ask",
         "responsibility_followup",
         "responsibility_get",
+        "credential_declare",
         "route_query",
         "send_message",
         "send_photo",

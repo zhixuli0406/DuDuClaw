@@ -258,3 +258,7 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 - [remote-mcp.md](../remote-mcp.md) — HTTP/OAuth トランスポート
 - [../../spec/task-packet.md](../../spec/task-packet.md) — TaskPacket 仕様
 - [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md) — `duduclaw_ccr_*` ツール。MCP サーバーではなく直接 API のツールループが注入します
+
+## 認証情報の用途を宣言する（未リリース）
+
+`credential_declare` は `credential_id`、`service`、任意の `note` を受け取り、秘密の値は受け取りません。認証済みでその認証情報を保持する社員だけが、署名付き gateway loopback ルート経由で宣言できます。Admin が設定したサービスを社員が上書きすることはできません。このツールは既存の監査メタデータへの注記であり、秘密の取得、新たな保持者への権限付与、ツール呼び出しへの実値代入は行いません。Admin は「セキュリティ → 認証情報の監査」で確認・修正できます。[認証情報監査](../../features/ja-JP/70-credential-audit.md)を参照してください。

@@ -364,7 +364,7 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         );
     }
 
-    info!("📩 DingTalk [{sender}]: {}", truncate_bytes(&text, 80));
+    info!("📩 DingTalk [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     let session_id = format!(
         "dingtalk:{}",

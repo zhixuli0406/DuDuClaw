@@ -410,7 +410,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         return;
     }
 
-    info!("📩 Feishu [{sender}]: {}", truncate_bytes(&input_text, 80));
+    info!("📩 Feishu [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&input_text), 80));
 
     // Chat commands
     if crate::chat_commands::is_command(&text) {

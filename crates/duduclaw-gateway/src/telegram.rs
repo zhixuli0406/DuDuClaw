@@ -1064,7 +1064,7 @@ async fn process_telegram_message(
             Ok(text) => {
                 info!(
                     "🎙 Telegram [{sender}] transcribed: {}",
-                    truncate_bytes(&text, 80)
+                    truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80)
                 );
                 text
             }
@@ -1229,7 +1229,7 @@ async fn process_telegram_message(
 
     info!(
         "📩 Telegram [{sender}]: {}",
-        truncate_bytes(&input_text, 80)
+        truncate_bytes(&duduclaw_security::credential_detect::mask(&input_text), 80)
     );
 
     // ── Build session ID (topic-aware) ──

@@ -133,6 +133,8 @@ async fn summarize_one(
         .read_first_n_turns(session_id, through_turn)
         .await
         .map_err(|e| format!("read_first_n_turns: {e}"))?;
+    let turns: Vec<_> = turns.into_iter().map(|(role, text)|
+        (role, duduclaw_security::credential_detect::mask(&text))).collect();
     let (transcript, protected, has_unprotected_text) = partition_turns_for_summary(&turns);
     if transcript.trim().is_empty() {
         return Err("transcript is empty — nothing to summarize".to_string());

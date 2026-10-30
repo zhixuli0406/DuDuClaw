@@ -479,6 +479,7 @@ pub(crate) async fn handle_tools_call(
         "tasks_complete" => handle_tasks_complete(&arguments, home_dir, record_actor).await,
         "tasks_block" => handle_tasks_block(&arguments, home_dir, record_actor).await,
         // P2-A continuous responsibilities (employee side)
+        "credential_declare" => credential_declare::handle_credential_declare(&arguments, home_dir, record_actor).await,
         "responsibility_get" => handle_responsibility_get(&arguments, home_dir, record_actor).await,
         "responsibility_followup" => {
             handle_responsibility_followup(&arguments, home_dir, record_actor).await

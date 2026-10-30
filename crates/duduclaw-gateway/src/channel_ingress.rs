@@ -25,6 +25,7 @@ pub(crate) mod alerts;
 pub mod cli_approval;
 pub mod cli_batch;
 pub(crate) mod config;
+pub(crate) mod credential_payload;
 mod maintenance;
 mod merge;
 mod resolve;
@@ -141,6 +142,7 @@ pub(crate) enum Deferred {
 }
 
 pub(crate) struct IngressStore {
+    home: Option<std::path::PathBuf>,
     conn: Mutex<Connection>,
     work: tokio::sync::Notify,
     /// Ids held at open because of a restore marker, not yet announced.
@@ -150,6 +152,7 @@ pub(crate) struct IngressStore {
 impl IngressStore {
     pub(crate) fn from_connection(conn: Connection) -> Self {
         Self {
+            home: None,
             conn: Mutex::new(conn),
             work: tokio::sync::Notify::new(),
             restored: std::sync::Mutex::new(Vec::new()),
@@ -201,7 +204,7 @@ impl IngressStore {
                 if inserted == 1 {
                     tx.execute(
                         "INSERT INTO ingress_payload VALUES (?1,?2,?3)",
-                        params![id, e.payload, now + PAYLOAD_SECONDS],
+                        params![id, credential_payload::protect(&e.payload, self.home.as_deref()), now + PAYLOAD_SECONDS],
                     )
                     .map_err(|e| e.to_string())?;
                 }

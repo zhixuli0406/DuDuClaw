@@ -7,6 +7,9 @@ import { useSystemStore } from '@/stores/system-store';
 import { AdvancedSection, ConfirmDialog, OptionSelect } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
+import { CredentialAuditPanel } from '@/components/CredentialAuditPanel';
+import { isNewFeature } from '@/apps/registry';
+import { useAuthStore } from '@/stores/auth-store';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
 import { toast, formatError } from '@/lib/toast';
@@ -19,6 +22,10 @@ import {
 } from '@/lib/killswitch-triggers';
 import type { KillswitchTriggers } from '@/lib/api';
 import {
+  Tabs,
+  TabsList,
+  TabsTab,
+  TabsPanel,
   Card,
   CardHeader,
   CardTitle,
@@ -73,6 +80,8 @@ interface SecurityStatus {
 export function SecurityPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin';
+  const version = useSystemStore((s) => s.status?.version ?? null);
   // D9 (09-edition-split-features.md §4): a single operator still needs an
   // emergency brake and a way to see what happened, so kill switch + audit
   // log stay — folded into a page-internal collapsed section rather than
@@ -140,7 +149,23 @@ export function SecurityPage() {
           the two answer adjacent questions: hygiene says what is wrong, the
           inventory says where every credential comes from. Same reasoning for
           showing it to every edition. */}
-      <CredentialInventoryPanel />
+      <Tabs defaultValue="inventory" variant="line">
+        <TabsList>
+          <TabsTab value="inventory">
+            {intl.formatMessage({ id: 'security.credentialInventory.title' })}
+          </TabsTab>
+          {isAdmin && (
+            <TabsTab value="credentialAudit">
+              {intl.formatMessage({ id: 'security.credentialAudit.title' })}
+              {isNewFeature('1.78.0', version) && (
+                <Badge variant="secondary">{intl.formatMessage({ id: 'nav.badge.new' })}</Badge>
+              )}
+            </TabsTab>
+          )}
+        </TabsList>
+        <TabsPanel value="inventory"><CredentialInventoryPanel /></TabsPanel>
+        {isAdmin && <TabsPanel value="credentialAudit"><CredentialAuditPanel /></TabsPanel>}
+      </Tabs>
 
       {/* Credential protection (B2c) — the one line "憑證保護：系統金鑰圈／檔案".
           Every edition: person identities by domain-wide delegation exist in

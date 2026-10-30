@@ -1674,7 +1674,7 @@ async fn handle_message_create(
 
     info!(
         "📩 Discord [{author_name}] (guild:{guild_id}): {}",
-        truncate_bytes(&clean_content, 80)
+        truncate_bytes(&duduclaw_security::credential_detect::mask(&clean_content), 80)
     );
 
     // ── Auto-thread ──

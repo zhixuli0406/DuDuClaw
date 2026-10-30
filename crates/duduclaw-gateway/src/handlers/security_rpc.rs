@@ -4,6 +4,14 @@
 use super::*;
 
 impl MethodHandler {
+    pub(crate) async fn handle_security_audit_verify(&self) -> WsFrame {
+        let home = self.home_dir.clone();
+        match tokio::task::spawn_blocking(move || crate::security_posture::verify_security_audit(&home)).await {
+            Ok(Ok(result)) => WsFrame::ok_response("", result),
+            _ => WsFrame::error_response("", "稽核鏈無法讀取，尚未驗證完整性。"),
+        }
+    }
+
     /// Live security system status — replaces static placeholder panels.
     pub(crate) async fn handle_security_status(&self) -> WsFrame {
         let reg = self.registry.read().await;
@@ -170,7 +178,7 @@ impl MethodHandler {
                 .map(|a| a.config.agent.name.clone())
                 .collect()
         };
-        for agent_id in agent_ids {
+        for agent_id in &agent_ids {
             for channel in crate::channel_settings::VALID_CHANNEL_TYPES {
                 let Some(status) = crate::config_crypto::agent_channel_token_ref(
                     &self.home_dir,
@@ -190,8 +198,17 @@ impl MethodHandler {
                     source_label: status.source_label,
                     writable: status.writable,
                     residue: status.residue,
+                    source_kind: "config".into(),
+                    holder: Some(format!("agent:{agent_id}")),
+                    service: Some((*channel).into()),
+                    kind: Some("token".into()),
                 });
             }
+        }
+
+        match crate::security_posture::additional_credential_inventory(&self.home_dir, &table, &agent_ids) {
+            Ok(extra) => entries.extend(extra),
+            Err(_) => return WsFrame::error_response("", "部分系統憑證清單無法讀取，請稍後重試。"),
         }
 
         let configured = entries.iter().filter(|e| e.configured).count();

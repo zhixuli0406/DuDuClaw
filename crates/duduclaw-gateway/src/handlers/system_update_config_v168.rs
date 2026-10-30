@@ -59,6 +59,7 @@ const PROTECTED_KEYS: &[&str] = &[
     // 2026-10: turning the action review off removes a gate.
     "action_review.mode",
     "security.egress_guard",
+    "security.chat_credentials",
 ];
 
 /// Team role slots. The dashboard contract says `synthesizer`; the config
@@ -380,6 +381,14 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
             set_bool(table, section, key, v, out)?;
             out.applied_immediate = true;
         }
+    }
+    if let Some(v) = str_param(params, "security.chat_credentials")? {
+        if !matches!(v, "audit" | "mask") {
+            return Err("security.chat_credentials must be audit or mask".into());
+        }
+        table_at_mut(table, &["security"])?.insert("chat_credentials".into(), toml::Value::String(v.into()));
+        out.changes.push(format!("security.chat_credentials = \"{v}\""));
+        out.applied_immediate = true;
     }
     if let Some(v) = str_param(params, "security.egress_guard")? {
         if duduclaw_core::egress_guard::Mode::parse(v).is_none() {
@@ -747,5 +756,23 @@ mod tests {
         assert_eq!(p["log_level"], "info");
         assert_eq!(p["rotation_strategy"], "priority", "flat name wins");
         assert_eq!(p["log_format"], "pretty");
+    }
+}
+
+#[cfg(test)]
+mod chat_credential_config_tests {
+    use super::*;
+
+    #[test]
+    fn chat_credential_mode_is_validated_and_hot_applied() {
+        for mode in ["audit", "mask"] {
+            let mut table = toml::Table::new();
+            let result = apply_v168_keys(&mut table, &json!({"security.chat_credentials":mode})).unwrap();
+            assert!(result.applied_immediate);
+            assert_eq!(toml_at(&table, "security.chat_credentials").and_then(|v| v.as_str()), Some(mode));
+        }
+        for value in [json!("off"), json!(true), json!(1)] {
+            assert!(apply_v168_keys(&mut toml::Table::new(), &json!({"security.chat_credentials":value})).is_err());
+        }
     }
 }

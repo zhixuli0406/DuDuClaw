@@ -37,6 +37,10 @@ impl MethodHandler {
         }
 
         match method {
+            "credentials.audit_list" | "credentials.audit_get" | "credentials.audit_update" => {
+                require_admin!();
+                self.handle_credentials_audit(method, params).await
+            }
             "data_exports.create" => self.handle_data_exports_create(params, ctx).await,
             "data_exports.get" => self.handle_data_exports_get(params, ctx).await,
             "data_exports.cancel" => self.handle_data_exports_cancel(params, ctx).await,
@@ -253,6 +257,10 @@ impl MethodHandler {
             "audit.reliability_summary" => {
                 require_admin!();
                 self.handle_audit_reliability_summary(params).await
+            }
+            "security.audit_verify" => {
+                require_admin!();
+                self.handle_security_audit_verify().await
             }
             "security.status" => {
                 require_admin!();

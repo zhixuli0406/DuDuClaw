@@ -333,7 +333,7 @@ fn scrub_sensitive(msg: &str) -> String {
     // WP12: prefix scanning misses credentials embedded in a URL *path* — a
     // Telegram error prints `…/bot<token>/getMe`, which none of the prefixes
     // above match. Run the shape-driven redactor first.
-    let mut result = crate::secret_redact::redact_secrets(msg).into_owned();
+    let mut result = duduclaw_security::credential_detect::mask(msg);
     for prefix in &sensitive_prefixes {
         // Loop to handle multiple occurrences of the same prefix
         let mut search_from = 0;
@@ -431,5 +431,16 @@ mod format_and_reload_tests {
             tracing::callsite::rebuild_interest_cache();
             assert!(tracing::enabled!(tracing::Level::INFO));
         });
+    }
+}
+
+#[cfg(test)]
+mod credential_log_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_masks_contextual_chinese_passwords_before_preview() {
+        let message = "收到訊息：密碼是測試憑證，請登入";
+        assert!(!scrub_sensitive(message).contains("測試憑證"));
     }
 }

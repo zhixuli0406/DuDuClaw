@@ -689,7 +689,7 @@ async fn handle_event(
         return;
     }
 
-    info!("📩 Slack [{user}]: {}", truncate_bytes(&text, 80));
+    info!("📩 Slack [{user}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     // Add thinking emoji reaction
     let _ = http
@@ -1078,7 +1078,7 @@ async fn handle_slash_command_envelope(
 
     info!(
         "📩 Slack slash {command} from [{user_id}]: {}",
-        truncate_bytes(&text, 80)
+        truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80)
     );
 
     // ── Channel whitelist applies to slash commands too ──

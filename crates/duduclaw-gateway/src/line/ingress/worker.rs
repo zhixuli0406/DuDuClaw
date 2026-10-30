@@ -235,7 +235,7 @@ async fn process_claimed(
         .payload
         .as_deref()
         .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok());
-    let Some(payload) = parsed else {
+    let Some(mut payload) = parsed else {
         quarantine(
             state,
             store,
@@ -246,6 +246,7 @@ async fn process_claimed(
         .await;
         return;
     };
+    crate::channel_ingress::credential_payload::restore_event(&mut payload["event"], &state.home_dir);
     let Ok(event) = serde_json::from_value::<LineEvent>(payload["event"].clone()) else {
         quarantine(state, store, &row, "payload_invalid", "payload_invalid").await;
         return;
