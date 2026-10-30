@@ -125,7 +125,7 @@ export function GoogleIntegrationPage() {
                 <p className="text-sm text-muted-foreground">
                   {t(
                     'google.gate.offHint',
-                    '先在下面完成一種連線方式，再按「啟用」，19 個 Google 工具才會出現在 AI 員工面前。在那之前工具呼叫都會被拒絕。',
+                    '按「設定 Google 連線」完成設定，整合會自動啟用。也可開啟「進階設定」管理現有連線。',
                   )}
                 </p>
               </div>

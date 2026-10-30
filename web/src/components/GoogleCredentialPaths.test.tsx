@@ -71,8 +71,8 @@ describe('GoogleCredentialPaths', () => {
     const setSpy = vi.spyOn(api.googleCredentials, 'set').mockResolvedValue({ ok: true, mode: 'oauth' });
     renderWithProviders(<GoogleCredentialPaths />);
 
-    await waitFor(() => expect(screen.getByText(/OAuth connect/i)).toBeInTheDocument());
-    await user.click(screen.getByText(/OAuth connect/i));
+    await waitFor(() => expect(screen.getByText(/OAuth authorization/i)).toBeInTheDocument());
+    await user.click(screen.getByText(/OAuth authorization/i));
     await user.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(setSpy).toHaveBeenCalledWith({ mode: 'oauth', replace_confirmed: true }));

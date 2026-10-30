@@ -95,8 +95,8 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
       const r = await api.googleCredentials.test();
       setProbes(r.services || []);
       setAccount(r.account || '');
-      if (r.result === 'partial') toast.info(t('google.wizard.partial', '部分驗證：Sheets 與 Docs 僅確認授權範圍。'));
-      else toast[r.ok ? 'success' : 'error'](t(`google.probe.${r.detail}`, r.ok ? '連線檢查完成' : '連線檢查失敗'));
+      if (r.result === 'partial') toast.success(t('google.wizard.partial', '服務檢查通過。Sheets 與 Docs 已授予權限，尚未實際讀取文件。'));
+      else toast[r.ok ? 'success' : 'error'](t(`google.probe.${r.detail}`, r.ok ? '服務檢查完成' : '服務檢查失敗'));
     } catch (e) {
       toast.error(formatError(e));
     } finally {
@@ -114,7 +114,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
   if (!status) return null;
 
   const effectiveLabel =
-    status.effective === 'oauth' ? t('google.cred.mode.oauth', 'OAuth 連線')
+    status.effective === 'oauth' ? t('google.cred.mode.oauth', 'OAuth 授權')
       : status.effective === 'service_account' ? t('google.cred.mode.sa', '服務帳號委派')
       : status.effective === 'direct'
       ? t('google.cred.effective.direct', '直接 Google API（逐服務檢查權限）')
@@ -158,7 +158,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
         </div>
 
         {/* The master gate is separate from the credential itself. Without this
-            warning an operator can configure a path, watch 測試連線 go green, and
+            warning an operator can configure a path, watch 服務檢查 go green, and
             still find no Google tools reach their agents — the test exercises the
             credential, not the gate. */}
         {!status.integration_enabled && (
@@ -189,7 +189,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
           onValueChange={setMode}
           aria-label={t('google.cred.title', '憑證方式')}
           options={[
-            { value: 'oauth', label: t('google.cred.mode.oauth', 'OAuth 連線') },
+            { value: 'oauth', label: t('google.cred.mode.oauth', 'OAuth 授權') },
             { value: 'service_account', label: t('google.cred.mode.sa', '服務帳號委派') },
             { value: 'apps_script', label: t('google.cred.mode.gas', 'Apps Script 橋接') },
           ]}
@@ -209,7 +209,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
             <p className="text-sm text-muted-foreground">
               {t(
                 'google.cred.sa.hint',
-                '客戶的 Workspace 超級管理員在 Admin console 授權一次即可，不需要 Google 應用程式驗證。僅支援 Workspace 網域，個人 @gmail.com 無法委派。',
+                'Workspace 超級管理員在 Admin console 授權一次即可，不需要 Google 應用程式驗證。僅支援 Workspace 網域，個人 @gmail.com 無法委派。',
               )}
             </p>
             <div className="space-y-1.5">
@@ -223,7 +223,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
                 placeholder="keys/google-sa.json"
               />
               <p className="text-xs text-muted-foreground">
-                {t('google.cred.sa.keyFileHint', '相對路徑以 ~/.duduclaw 為基準。建議 chmod 600。')}
+                {t('google.cred.sa.keyFileHint', '請填主機上的絕對路徑，例如 /Users/alex/.duduclaw/keys/google-sa.json。~ 不會展開。建議 chmod 600。')}
               </p>
             </div>
             <div className="space-y-1.5">
@@ -240,7 +240,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
             <div className="rounded-lg border border-border bg-muted/40 p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-medium">
-                  {t('google.cred.sa.scopes', '交給管理員的 scope 清單')}
+                  {t('google.cred.sa.scopes', '交給管理員的權限範圍清單')}
                 </span>
                 <Button variant="outline" size="sm" onClick={copyScopes}>
                   {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
@@ -314,7 +314,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
             ) : (
               <CheckCircle2 className="size-4" />
             )}
-            {t('google.cred.test', '測試連線')}
+            {t('google.cred.test', '執行服務檢查')}
           </Button>
         </div>
       </CardContent>

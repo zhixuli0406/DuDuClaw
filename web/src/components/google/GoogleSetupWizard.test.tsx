@@ -47,13 +47,14 @@ describe('Google setup wizard', () => {
     sessionStorage.setItem(GOOGLE_SETUP_STORAGE, JSON.stringify({ path: 'external', step: 4, testing: true }));
     vi.spyOn(api.googleCredentials, 'test').mockResolvedValue({ ok: false, result: 'partial', path: 'direct', account: 'owner@example.test', detail: 'services_checked', services: ['gmail','calendar','drive','sheets','docs'].map(service => ({ service, ok: true, verified: !['sheets','docs'].includes(service), reason: 'scope_granted', enable_url: 'https://console.cloud.google.com.evil.example/' })) });
     renderWizard(); await userEvent.click(screen.getByRole('button', { name: 'Run service checks' }));
-    expect(await screen.findAllByText('Scope check only. A live read has not been verified.')).toHaveLength(2);
+    expect(await screen.findAllByText('Document reads have not been checked.')).toHaveLength(2);
     expect(screen.queryByRole('link', { name: 'Enable this API' })).not.toBeInTheDocument();
     expect(await screen.findByText(/Authenticated account: owner@example.test/)).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Partially verified');
-    await userEvent.click(screen.getByRole('button', { name: 'Finish with partial verification' }));
-    expect(screen.getByText(/Partially verified/)).toBeInTheDocument();
-    expect(screen.getAllByText('Scope check only. A live read has not been verified.')).toHaveLength(2);
+    expect(screen.getByRole('status')).toHaveTextContent('Google connection setup is complete');
+    await userEvent.click(screen.getByRole('button', { name: 'Done' }));
+    expect(screen.getByText(/Google connection setup is complete/)).toBeInTheDocument();
+    expect(screen.getByText(/Sheets and Docs have permission granted; documents have not been read/)).toBeInTheDocument();
+    expect(screen.getAllByText('Document reads have not been checked.')).toHaveLength(2);
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     await userEvent.click(screen.getByRole('button', { name: 'Next' }));
@@ -103,4 +104,22 @@ it('does not accept a legacy success that only checked scopes', async () => {
   await userEvent.click(screen.getByRole('button', { name: 'Run service checks' }));
   expect(await screen.findByRole('alert')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Done' })).toBeDisabled();
+});
+
+it('does not offer a guessed redirect URI when provider loading fails', async () => {
+  sessionStorage.setItem(GOOGLE_SETUP_STORAGE, JSON.stringify({ path: 'external', step: 3, testing: true }));
+  vi.mocked(api.mcp.oauthProviders).mockRejectedValue(new Error('offline'));
+  renderWizard();
+  expect(await screen.findByText('The redirect URI is unavailable. Reopen setup to try loading it again.')).toBeInTheDocument();
+  expect(await screen.findByRole('alert')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Copy' })).toBeDisabled();
+  expect(screen.queryByText('http://localhost:3000/api/mcp/oauth/callback')).not.toBeInTheDocument();
+});
+
+it('labels the OAuth scope list with the Google field where it must be pasted', async () => {
+  sessionStorage.setItem(GOOGLE_SETUP_STORAGE, JSON.stringify({ path: 'external', step: 1, testing: true }));
+  vi.mocked(api.googleCredentials.get).mockResolvedValue({ integration_enabled: true, effective: 'none', required_scopes: ['scope-a', 'scope-b'], service_account: { configured: false, error: '' }, apps_script: { configured: false, error: '' } });
+  renderWizard();
+  expect(await screen.findByText('scope-a,scope-b')).toBeInTheDocument();
+  expect(screen.getByText(/^Paste this complete scope list into .*Manually add scopes/)).toBeInTheDocument();
 });

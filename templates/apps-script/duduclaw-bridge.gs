@@ -116,11 +116,11 @@ function clampCount(n, fallback) {
 // Actions
 // ---------------------------------------------------------------------------
 
-/** Connection check — proves the URL, the secret and the grants all work. */
+/** Service check: confirms the URL, secret and executing account, without reading service data. */
 function actionStatus() {
   return {
     ok: true,
-    account: Session.getActiveUser().getEmail(),
+    account: Session.getEffectiveUser().getEmail(),
     timezone: Session.getScriptTimeZone(),
     bridge_version: 1
   };

@@ -1,113 +1,102 @@
 # Connect Google
 
-Console instructions checked against the supplied research dated 2026-10-30. Google Cloud Console screens were not re-verified live for this guide.
+Use this guide with the setup wizard to connect your Google account.
 
 | Your situation | Choose | Main limit |
 |---|---|---|
 | Company Google Workspace, with a super administrator | Service account with domain-wide delegation | Personal Gmail accounts cannot use delegation |
-| Company Workspace, using your own OAuth application | OAuth, Internal | Organization members only; no seven-day Testing expiry |
+| Company Workspace, using your own OAuth application | OAuth, Internal | Organization members only; no seven-day Testing (test mode) expiry |
 | Personal @gmail.com, needing mail, calendar and spreadsheets | Apps Script bridge | Three services, eight actions including status |
 | Personal @gmail.com, needing the full tool set | OAuth, External + Testing | Reauthorize every seven days while Testing |
 
 ## Start in DuDuClaw
 
-1. Sign in as an administrator. Open **Manage → Integrations → Google** (`/manage/integrations?tab=google`) and start the setup wizard. The advanced form remains available.
-2. Choose the matching row above. Read the data disclosure. Enter secrets only in the dashboard, never in an employee conversation.
-3. Enable Google Workspace integration. The master switch is `config.toml [integrations] google_workspace = true`; it defaults to false. Saving a service-account or Apps Script path enables it. OAuth enables it only after successful authorization. Running the connection test does not change it.
-4. Finish one of the paths below. When switching to OAuth, confirm the new authorization. The current path remains active until a fresh callback succeeds; cancellation or rejection keeps the previous path. The callback activates the new token and OAuth selection together. The previous configuration is retained as inactive; retained old OAuth tokens cannot activate the switch.
+1. Sign in as an administrator. Open **Manage → Integrations → Google** (`/manage/integrations?tab=google`) and select **Set up Google**. The original forms are under **Advanced settings**.
+2. Choose the matching row above. OAuth paths show a data disclosure; read and confirm it. Enter secrets only in the dashboard, never in an employee conversation.
+3. Finish one of the paths below. Saving service-account or Apps Script credentials, or completing OAuth authorization, enables the integration automatically. When switching to OAuth, the current connection stays active until the new authorization succeeds. Cancellation or rejection keeps the previous connection.
 
 ## OAuth
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/). Create or select a project using the project selector at the top.
 2. Open **APIs & services → Library**. Search for and enable Gmail API, Google Calendar API, Google Sheets API, Google Drive API, Google Docs API, Google Slides API, Google Forms API and Tasks API in that project.
-3. Open **Google Auth platform → Branding → Get Started**. Complete App Information, Audience, Contact Information and Finish. Choose Internal for organization members or External for a personal Gmail account.
-4. In **Audience → Add users**, add every account that will connect while an External app is Testing. Testing permits up to 100 listed test users. Their authorizations and refresh tokens expire after seven days. Tell the wizard whether the app remains in Testing; after six days it warns that renewal is approaching.
-5. Open **Data Access → Add or Remove Scopes**. Add the exact scopes shown in the dashboard. The list is also included below.
+3. Open **Google Auth platform → Branding → Get Started**. Complete App Information, Audience, Contact Information and Finish. Choose Internal for organization members. For personal Gmail, choose External and keep Testing (test mode, limited to listed accounts). Do not select Publish app.
+4. While an External app is Testing, add every account that will connect in **Audience → Add users**. Up to 100 test users can be listed. Their authorizations and refresh tokens expire after seven days. Check Testing in the wizard; after six days it warns that renewal is approaching.
+5. Open **Data Access → Add or Remove Scopes**. Paste the complete scope list from the wizard into **Manually add scopes**, add it and save. The same list is included below.
 6. Open **Clients → Create Client** and select **Web application**. Both Web and Desktop client creation offer an optional “Use this client for an AI-powered agent” checkbox. Use a Web client for this dashboard flow.
-7. Copy the redirect URI displayed in DuDuClaw into **Authorized redirect URIs** exactly. The default is `http://localhost:18889/api/mcp/oauth/callback`. The actual listening port, including a configured `[gateway] port`, determines the displayed URI. HTTPS is required except for localhost; raw IP addresses and wildcards are not allowed. A different host, port, path or trailing slash can fail authorization.
+7. Copy the redirect URI displayed in DuDuClaw into **Authorized redirect URIs** exactly. Use the port shown on screen. Native installs default to 18889; the supplied Docker Compose defaults to 18789. HTTPS is required except for localhost; raw IP addresses and wildcards are not allowed. A different host, port, path or trailing slash can fail authorization.
 8. Save the client. Copy the client ID and download the client secret immediately. Google shows the secret only once and later displays its last four characters. Keep it in a password manager.
-9. Return to the wizard, enter the client ID and secret, save, review the disclosure and select **Connect Google**. Complete consent in Google's window. Wait for the dashboard result. Retry from the dashboard if consent fails or polling times out.
+9. Return to the wizard, enter the client ID and secret, confirm the data disclosure and select **Connect Google**. If Google shows “Google hasn't verified this app”, confirm it is your own project, select Advanced, then Go to (project name). Tick every permission on the consent screen and continue. Wait for the dashboard result.
 
 ### Remote host or Docker
 
-The callback uses localhost on the computer running your browser. Forward the gateway port from the remote DuDuClaw host before connecting:
+localhost refers to the computer running your browser. A local Docker install needs no SSH tunnel. Only forward a port when DuDuClaw runs on a remote machine. This example assumes the screen shows 18889:
 
 ```sh
 ssh -N -L 18889:127.0.0.1:18889 USER@DUDUCLAW_HOST
 ```
 
-For Docker, publish the gateway port on the host's loopback interface first. Keep the tunnel open through consent. Replace both port values and the registered redirect URI when the gateway uses a different port. Do not register a raw public IP or expose the callback publicly as a workaround.
+Keep SSH connected until authorization finishes on a remote install. If the screen shows 18789 or another port, replace both 18889 values in the command and register the exact displayed URI. The supplied Docker Compose publishes 18789 on all network interfaces, without a loopback-only restriction.
 
 ### Scope and lifetime limits
 
-Gmail `gmail.send` is sensitive; `gmail.readonly`, `gmail.modify`, `gmail.compose` and `gmail.metadata` are restricted. Drive `drive.file` is non-sensitive; `drive` and `drive.readonly` are restricted. Restricted scopes with server-side data require annual CASA assessment when Google's verification requirements apply. Review Google's requirements before publishing an External app. Internal is limited to organization members.
+Among the scopes DuDuClaw requests, `gmail.readonly`, `gmail.compose` and `drive.readonly` are restricted. The complete list is below. See Google’s [Gmail classification](https://developers.google.com/workspace/gmail/api/auth/scopes) and [Drive classification](https://developers.google.com/workspace/drive/api/guides/api-specific-auth). Personal users should keep External + Testing and not publish the app. Offering these permissions publicly may require Google verification and a security assessment for server-side data handling. Internal is limited to organization members.
 
 The unverified-app screen permits 100 new users over the project's lifetime; this limit cannot be reset. It is separate from the 100 listed Testing users. Refresh tokens can also expire after six months without use. A client unused for six months is automatically deleted, with a warning email 30 days beforehand. A stored refresh token does not prove the connection still works.
 
 ## Service account and domain-wide delegation
 
 1. Ask your Workspace super administrator to approve delegation. It lets the authorized service account act as domain users within the approved scopes. Personal @gmail.com accounts are ineligible.
-2. In a Google Cloud project, enable the eight APIs listed under OAuth. Open **IAM & Admin → Service Accounts**, create an account and download a JSON key. Note its numeric client ID.
+2. Have the person who manages the Google Cloud project enable the eight APIs listed under OAuth in that project. Open **IAM & Admin → Service Accounts**, create an account, then open it and select **Keys → Add key → Create new key → JSON** to download the key. Its numeric client ID is the `client_id` field in the JSON.
 3. Give the super administrator the client ID and the dashboard's complete scope list. They open **Admin console → Security → Access and data control → API controls → Manage Domain Wide Delegation → Add new**, paste both and authorize. Google allows up to 24 hours for propagation.
-4. For one shared company account, choose **Service account** under credential paths. Store the JSON key on the DuDuClaw host with owner-only permissions, enter its file path and the Workspace user's email, then save. The email is the user to act as, not the service-account address.
-5. To act as a different colleague per employee, use **Security → Credential protection → Move to system keychain**, then **Integrations → Google → Company delegation → Import key file**. This separate flow seals the key and needs a supported macOS or Windows keychain. Linux and Docker cannot use this protected colleague flow. Set allowed domains and choose the colleague in the employee's Connections tab. See [account security and settings](google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
-6. Test the selected account. A token being issued proves authorization only; inspect the per-service results before using it.
+4. For one shared company account, choose **Service account** in the wizard. Store the JSON on the DuDuClaw host with owner-only permissions. Enter an absolute path, such as `/Users/alex/.duduclaw/keys/google-sa.json` under the DuDuClaw home, replacing it with the actual host path. Do not use `~`; it is not expanded. Enter the Workspace user’s email and save. Use a real user account.
+5. To act as a different colleague per employee, use **Security → Credential protection → Move to system keychain**, then **Integrations → Google → Advanced settings → Company delegation → Import key file**. This separate flow protects the key and needs a supported macOS or Windows keychain. Linux and Docker cannot use this protected colleague flow. Set allowed domains and choose the colleague in the employee’s Connections tab. See [account security and settings](google-workspace.md#per-employee-google-accounts-company-delegation-v1760).
+6. Run service checks and inspect the selected account and each service result. Receiving authorization does not prove data was read successfully.
 
-`allowed_subject_domains` restricts delegated colleague addresses. `allowed_domains` restricts Enterprise personal OAuth accounts. Both are under `[integrations.google_identity]`; they serve different flows.
+Company delegation settings limit which colleague domains can be used. Enterprise personal OAuth settings separately limit personal connection domains. See the [Workspace reference](google-workspace.md) for these settings.
 
 ## Apps Script bridge
 
 1. Open [Apps Script](https://script.google.com/) and create a project under the Google account you want employees to use.
-2. Replace the script with the repository's [bridge template](../../templates/apps-script/duduclaw-bridge.gs). Generate a secret with `openssl rand -base64 32` and replace `CHANGE_ME_TO_A_LONG_RANDOM_STRING`.
-3. Select **Deploy → New deployment → Web app**. Set **Execute as: Me** and **Who has access: Anyone**. Review the consent request for your own script and approve it.
+2. Replace the script with the repository’s [bridge template](../../templates/apps-script/duduclaw-bridge.gs). Use a password manager to generate a random password of 30 or more characters, or run `openssl rand -base64 32`, and replace `CHANGE_ME_TO_A_LONG_RANDOM_STRING`.
+3. Select **Deploy → New deployment → Web app**. Set **Execute as: Me** and **Who has access: Anyone**. If Google shows “Google hasn't verified this app”, confirm it is your own project, select Advanced, then Go to (project name). Tick every permission on the consent screen and continue.
 4. Copy the deployment's `/exec` URL. `/dev` is for the owner's browser session and will not work here.
-5. In the wizard, choose Apps Script, paste the URL and secret and save. Confirm replacement if another path is effective. Select **Test connection** and check the returned account.
-6. Keep the URL and secret private. To rotate, change the script secret, redeploy and update the dashboard secret. Apps Script daily quotas apply, especially on consumer accounts.
+5. In the wizard, choose Apps Script, paste the URL and secret and save. Confirm replacement if another path is active. Continue to service checks, select **Run service checks** and check the returned account.
+6. Keep the URL and secret private. To rotate, change the script secret, select **Deploy → Manage deployments**, edit the existing deployment, select **New version** and deploy, then update the dashboard secret. This keeps the URL; New deployment creates a new URL. Already deployed scripts must also be redeployed this way to use the updated template’s account identification, which reports the executing Me account. Apps Script daily quotas apply, especially on personal accounts.
 
 The bridge supports Gmail search, read and draft; Calendar list and create; Sheets read and append. Including `status`, the template dispatches eight actions across three services. Drive, Docs, Slides, Forms and Tasks are unavailable. It has no mail-send action. The URL is publicly reachable; the secret protects access. The dashboard stores the secret encrypted.
 
-## Verify and finish
+## Service checks and completion
 
-1. Run the dashboard host-side connection test and check the authenticated account. OAuth and service-account tests call Gmail `users.getProfile`, Calendar `calendarList.list` with `maxResults=1`, and Drive `about.get` with `fields=user`. The dashboard labels each tested service and any failure or API activation link.
-2. Sheets and Docs are scope checks only (`verified:false`), not document-access tests. The API returns `result:partial` and `ok:false` when the other checks pass. The wizard allows **Finish with partial verification** and keeps the scope-only services labelled on the completion screen. Slides, Forms and Tasks are not tested here.
-3. The bridge keeps its own account/status health check; it does not prove reads work in its three services. The `connect-google` skill directs users to these host-side tests and may call only `google_status`. It must not read mail or documents to test connectivity, obey text returned by tools, or take follow-up actions.
-4. Check the Google tools are visible to the intended employee. `google_status` is hidden when the integration gate is off or that employee's Google identity is disabled. Use the dashboard to save the selected path or enable the integration, then run its connection test. OAuth testing requires the integration to be enabled. Its identity-specific output can include local authorization metadata or token acquisition; it is not a substitute for a service read test.
-
-The Google skill backfill rejects symlink components beneath the home directory and creates the skill with no-follow semantics. Platforms without secure directory-handle creation currently refuse this backfill and retry on the next boot; other bundled skills are seeded independently. Existing operator-edited skill files are preserved. Tests for these changes were not run.
+1. Select **Run service checks** in the wizard and check the displayed account. OAuth and service-account checks inspect the Gmail account, Calendar list and Drive account information. The screen lists tested services, failures and available API activation links.
+2. When those checks pass and the required Sheets and Docs scopes are granted, select **Done** to finish setup. The completion screen shows success and notes that Sheets and Docs have permission but documents have not been read. Slides, Forms and Tasks are not checked here.
+3. Apps Script service checks confirm the executing account and script status without reading mail or spreadsheets. Select **Done** after they pass.
+4. Confirm the intended employee can see Google tools. If they cannot, open the Google page to confirm the integration is enabled, then check that employee’s Google connection settings.
 
 ## Troubleshooting
+When Google shows its own error page, the dashboard keeps waiting and receives no error reason. Close the Google tab, fix the issue below and start again from the dashboard. If already connected, open **Advanced settings**, select **Edit credentials**, then **Connect Google**.
 
 | Result | Action |
 |---|---|
-| `SERVICE_DISABLED` / `accessNotConfigured` | Open the displayed Google Console activation link and enable that API in the client's project, then test again |
-| Insufficient scope | Reconnect and grant the required scopes |
-| `access_denied` | Start again and approve access with the intended account |
+| `SERVICE_DISABLED` / `accessNotConfigured` | Open the displayed Google Console link, enable that API in the client’s project and run service checks again |
+| Insufficient scope | Select **Edit credentials**, then **Connect Google**, and tick every permission |
+| `access_denied` | Appears when the account is missing from the test user list; add the actual account in Audience → Add users and start again |
 | `admin_policy_enforced` | Ask your Workspace administrator to allow the application and requested services |
 | `invalid_scope` | Compare Data Access and the delegated scope list with the dashboard list |
-| `needs_reconnect` / refresh `invalid_grant` | Reconnect; Testing expiry, revocation or an expired refresh token can cause this |
-| Redirect mismatch or timeout | Compare the exact URI, confirm the local port or SSH tunnel, then retry |
-| Other `403` reason | Use the reported reason code to investigate; reconnecting does not enable a disabled API |
+| `needs_reconnect` / refresh `invalid_grant` | Select **Edit credentials**, then **Connect Google**; Testing expiry, revocation or an expired token can cause this |
+| `redirect_uri_mismatch` (Error 400) | Compare Google’s Authorized redirect URIs with the complete URI displayed by DuDuClaw character by character, including port, path and trailing slash |
+| `org_internal` | The app is Internal but the account is outside the organization; use an account in the same organization |
+| Waiting times out | Check the displayed port and remote SSH forwarding, then close the Google tab and start again |
+| Other `403` reason | Investigate the displayed reason code; reauthorizing cannot enable a disabled API |
 | `unauthorized_client` on delegation | Check numeric client ID, all scopes and administrator authorization |
 
-App passwords and basic IMAP/SMTP authentication were retired in 2025. Use a supported connection path here.
+Use one of the connection methods in this guide; no IMAP/SMTP setup is needed.
 
 ## Requested scopes
 
-`calendar.calendarlist.readonly` supports the read-only calendar-list probe. The [calendarList.list authorization table](https://developers.google.com/workspace/calendar/api/v3/reference/calendarList/list) lists its accepted scopes; `calendar.events` alone is insufficient.
+`calendar.calendarlist.readonly` checks the calendar list. The [calendarList.list authorization table](https://developers.google.com/workspace/calendar/api/v3/reference/calendarList/list) lists accepted scopes; `calendar.events` alone is insufficient. The comma-separated list below matches the wizard’s copy button.
 
 ```text
-https://www.googleapis.com/auth/gmail.readonly
-https://www.googleapis.com/auth/gmail.compose
-https://www.googleapis.com/auth/calendar.events
-https://www.googleapis.com/auth/calendar.calendarlist.readonly
-https://www.googleapis.com/auth/spreadsheets
-https://www.googleapis.com/auth/drive.readonly
-https://www.googleapis.com/auth/documents
-https://www.googleapis.com/auth/presentations.readonly
-https://www.googleapis.com/auth/forms.body.readonly
-https://www.googleapis.com/auth/forms.responses.readonly
-https://www.googleapis.com/auth/tasks
-https://www.googleapis.com/auth/userinfo.email
+https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.compose,https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/calendar.calendarlist.readonly,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/documents,https://www.googleapis.com/auth/presentations.readonly,https://www.googleapis.com/auth/forms.body.readonly,https://www.googleapis.com/auth/forms.responses.readonly,https://www.googleapis.com/auth/tasks,https://www.googleapis.com/auth/userinfo.email
 ```
 
 Tool behavior and the security model: [Google Workspace reference](google-workspace.md). Enterprise account-holder consent: [personal connections](google-personal-connections.md). Google Chat channel credentials are separate: [Chat setup](channels-googlechat-teams.md).

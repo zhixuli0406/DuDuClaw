@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { Mail } from 'lucide-react';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
-import { IntegrationConnectPanel, OAUTH_REDIRECT_URI } from './IntegrationConnectPanel';
+import { IntegrationConnectPanel } from './IntegrationConnectPanel';
 import { api } from '@/lib/api';
 
 function renderPanel(extraSetupSteps?: readonly string[]) {
@@ -80,10 +80,13 @@ describe('IntegrationConnectPanel setup guidance', () => {
     );
   });
 
-  it('falls back to the built-in URI when an older gateway omits it', async () => {
+  it('shows a neutral message and disables copying when the gateway omits the URI', async () => {
     mockUnconfigured();
     renderPanel();
-    await waitFor(() => expect(screen.getByText(OAUTH_REDIRECT_URI)).toBeInTheDocument());
+    await screen.findByPlaceholderText('x.apps.googleusercontent.com');
+    await screen.findByText('The redirect URI is unavailable. Reopen setup to try loading it again.');
+    expect(screen.queryByText('http://localhost:3000/api/mcp/oauth/callback')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeDisabled();
   });
 
   it('renders provider-specific extra setup steps', async () => {
@@ -99,7 +102,10 @@ describe('IntegrationConnectPanel setup guidance', () => {
   it('omits the extra steps for providers that do not supply any', async () => {
     mockUnconfigured();
     renderPanel();
-    await waitFor(() => expect(screen.getByText(OAUTH_REDIRECT_URI)).toBeInTheDocument());
+    await screen.findByPlaceholderText('x.apps.googleusercontent.com');
+    await screen.findByText('The redirect URI is unavailable. Reopen setup to try loading it again.');
+    expect(screen.queryByText('http://localhost:3000/api/mcp/oauth/callback')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeDisabled();
     expect(screen.queryByText(/Enable these eight APIs/i)).not.toBeInTheDocument();
   });
 });
@@ -321,4 +327,14 @@ it('continues polling through an existing reconnect marker until the new token a
   vi.mocked(api.mcp.oauthStatus).mockResolvedValue({ authenticated: true, access_token_valid: true, needs_reconnect: false, connected_at: '2026-10-30T00:00:00Z', expires_at: '2026-10-30T00:00:00Z' });
   await act(async () => { await poll!(); });
   expect(connected).toHaveBeenCalledOnce();
+});
+
+it('does not invent a redirect URI when provider loading fails', async () => {
+  mockUnconfigured();
+  vi.mocked(api.mcp.oauthProviders).mockRejectedValue(new Error('offline'));
+  renderPanel();
+  expect(await screen.findByText('The redirect URI is unavailable. Reopen setup to try loading it again.')).toBeInTheDocument();
+  expect(await screen.findByText("Couldn't load the Google connection. Please try again.")).toBeInTheDocument();
+  expect(screen.queryByText('http://localhost:3000/api/mcp/oauth/callback')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Copy' })).toBeDisabled();
 });

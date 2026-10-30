@@ -5,7 +5,7 @@ import { api, type GoogleServiceProbe } from '@/lib/api';
 import { formatError } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import { Button, Dialog, DialogContent, DialogHeader, DialogTitle, Checkbox } from '@/components/mds';
-import { IntegrationConnectPanel, OAUTH_REDIRECT_URI } from '@/components/IntegrationConnectPanel';
+import { IntegrationConnectPanel } from '@/components/IntegrationConnectPanel';
 import { GoogleServiceResults } from './GoogleServiceResults';
 import { GoogleCredentialPaths } from '@/components/GoogleCredentialPaths';
 
@@ -37,11 +37,12 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
   const [account, setAccount] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [redirectUri, setRedirectUri] = useState(OAUTH_REDIRECT_URI);
+  const [redirectUri, setRedirectUri] = useState('');
   const [requiredScopes, setRequiredScopes] = useState<string[]>([]);
   useEffect(() => {
     if (!admin || !open) return;
     void api.googleCredentials.get().then(status => setRequiredScopes(status.required_scopes)).catch(() => setError(intl.formatMessage({ id: 'google.error.load' })));
+    setRedirectUri('');
     void api.mcp.oauthProviders().then(result => {
       const uri = result.providers.find(provider => provider.provider_id === 'google')?.redirect_uri;
       if (uri) setRedirectUri(uri);
@@ -106,7 +107,7 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
         {['situation', 'instructions', 'credentials', 'connect', 'verify', 'done'].map((key, index) => <li key={key} aria-current={progress.step === index ? 'step' : undefined}>{index + 1}. {t(key)}</li>)}
       </ol>
       <a className="text-sm text-brand underline" href={`https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/guides/${guideLocale}google-setup.md`} target="_blank" rel="noreferrer">{t('guide')}</a>
-      {oauth && <div className="space-y-2 rounded-lg border border-surface-border p-3 text-xs"><p>{t('redirect')}</p><code className="block select-all break-all">{redirectUri}</code><Button size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(redirectUri).catch(() => setError(t('copyFailed'))); }}>{intl.formatMessage({ id: 'common.copy' })}</Button></div>}
+      {oauth && <div className="space-y-2 rounded-lg border border-surface-border p-3 text-xs"><p>{t('redirect')}</p><code className="block select-all break-all">{redirectUri || t('redirectUnavailable')}</code><Button size="sm" variant="outline" disabled={!redirectUri} onClick={() => { void navigator.clipboard.writeText(redirectUri).catch(() => setError(t('copyFailed'))); }}>{intl.formatMessage({ id: 'common.copy' })}</Button></div>}
       {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
       {progress.step === 0 && <div className="grid gap-2">{PATHS.map(path => <Button key={path} variant={progress.path === path ? 'default' : 'outline'} onClick={() => { setPartial(false); setAccount(''); setProbes([]); setBridgeVerified(false); setDirectVerified(false); setProgress({ path, step: 1, testing: path === 'external' }); }}>{t(`path.${path}`)}</Button>)}</div>}
       {progress.step === 1 && progress.path && <div className="space-y-3 text-sm">
@@ -121,7 +122,7 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
           ]).map(([url, label]) => <a key={url} href={url} target="_blank" rel="noreferrer" className="text-brand underline">{t(label)}</a>)}
         </div>
         {progress.path === 'external' && <label className="flex items-start gap-2"><Checkbox checked={progress.testing} onCheckedChange={value => setProgress(p => ({ ...p, testing: value === true }))} />{t('testing')}</label>}
-        {oauth && <div className="space-y-2 rounded-lg border border-surface-border p-3"><p>{t('scopes')}</p><p className="break-all font-mono text-xs">{requiredScopes.join(',')}</p><Button size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(requiredScopes.join(',')).catch(() => setError(t('copyFailed'))); }}>{intl.formatMessage({ id: 'common.copy' })}</Button></div>}
+        {oauth && <div className="space-y-2 rounded-lg border border-surface-border p-3"><p>{t('scopeList')}</p><p className="break-all font-mono text-xs">{requiredScopes.join(',')}</p><Button size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(requiredScopes.join(',')).catch(() => setError(t('copyFailed'))); }}>{intl.formatMessage({ id: 'common.copy' })}</Button></div>}
         <p className="text-muted-foreground">{t('secrets')}</p>
       </div>}
       {progress.step === 2 && (oauth ? <IntegrationConnectPanel providerId="google" prefix="google" headerIcon={Mail} consoleUrl="https://console.cloud.google.com/auth/clients" consoleLabel="Google Cloud Console" clientIdPlaceholder="xxxxxxxx.apps.googleusercontent.com" clientSecretPlaceholder="GOCSPX-..." capabilities={[]} testing={progress.testing} hideRedirect onConnected={() => go(3)} /> : <GoogleCredentialPaths initialMode={progress.path === 'bridge' ? 'apps_script' : 'service_account'} onSaved={() => go(3)} />)}
@@ -130,16 +131,17 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
         <Button disabled={busy} onClick={() => void (progress.path === 'bridge' ? verifyBridge() : verify())}>{busy ? t('checking') : t('runVerification')}</Button>
         {bridgeVerified && <p className="text-sm">{t('bridgeVerified')}</p>}
         {account && <p className="text-sm">{t('account')}: {account}</p>}
-        {partial && <p role="status" className="text-sm text-warning">{t('partial')}</p>}
+        {verified && <p role="status" className="text-sm text-success">{t('finished')}</p>}
+        {partial && <p className="text-sm text-muted-foreground">{t('partial')}</p>}
         <GoogleServiceResults probes={probes} />
       </div>}
-      {progress.step === 5 && <div className="space-y-2 text-sm"><p>{t(partial ? 'partial' : 'finished')}</p>{account && <p>{t('account')}: {account}</p>}<GoogleServiceResults probes={probes} /></div>}
+      {progress.step === 5 && <div className="space-y-2 text-sm"><p>{t('finished')}</p>{partial && <p>{t('partial')}</p>}{account && <p>{t('account')}: {account}</p>}<GoogleServiceResults probes={probes} /></div>}
       <div className="flex flex-wrap justify-between gap-2">
         <Button variant="outline" disabled={busy || progress.step === 0} onClick={() => go(progress.step - 1)}>{t('back')}</Button>
         {progress.step === 1 && <Button onClick={() => go(2)}>{t('next')}</Button>}
         {progress.step === 2 && <Button variant="outline" disabled={busy} onClick={() => void alreadyConnected()}>{t('alreadyConnected')}</Button>}
         {progress.step === 3 && <Button onClick={() => go(4)}>{t('next')}</Button>}
-        {progress.step === 4 && <Button disabled={!verified || busy} onClick={() => go(5)}>{t(partial ? 'finishPartial' : 'done')}</Button>}
+        {progress.step === 4 && <Button disabled={!verified || busy} onClick={() => go(5)}>{t('done')}</Button>}
         {progress.step === 5 && <Button onClick={close}>{t('close')}</Button>}
       </div>
     </DialogContent>

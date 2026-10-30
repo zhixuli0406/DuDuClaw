@@ -15,22 +15,13 @@ import { openExternal } from '@/lib/external-link';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge, Input } from '@/components/mds';
 import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
 
-/** The OAuth redirect URI the gateway serves — users must register this exact
- *  value in each provider's OAuth app. Mirrors `handle_mcp_oauth_callback`. */
-export const OAUTH_REDIRECT_URI = 'http://localhost:3000/api/mcp/oauth/callback';
-
 type ConnState = 'loading' | 'unconfigured' | 'configured' | 'connected';
 
 interface PanelState {
   conn: ConnState;
   scopes: string[];
   expiresAt: string | null;
-  /**
-   * The redirect URI the user must register, as reported by the gateway. The
-   * module constant below is only a fallback for older gateways — it is wrong
-   * whenever `DUDUCLAW_PORT` differs, which is exactly the mistake that made
-   * every consent flow dead-end before this was derived server-side.
-   */
+  /** The exact redirect URI reported by the gateway; empty when unavailable. */
   redirectUri: string;
   /** The saved OAuth client id (public value, shown in full). */
   savedClientId: string;
@@ -100,7 +91,7 @@ export function IntegrationConnectPanel({
     conn: 'loading',
     scopes: [],
     expiresAt: null,
-    redirectUri: OAUTH_REDIRECT_URI,
+    redirectUri: '',
     savedClientId: '',
     hasSecret: false,
     secretMasked: '',
@@ -148,7 +139,7 @@ export function IntegrationConnectPanel({
         conn: status.authenticated && !status.needs_reconnect ? 'connected' : configured ? 'configured' : 'unconfigured',
         scopes,
         expiresAt: status.expires_at,
-        redirectUri: provider?.redirect_uri || OAUTH_REDIRECT_URI,
+        redirectUri: provider?.redirect_uri || '',
         savedClientId,
         hasSecret: provider?.has_client_secret ?? false,
         secretMasked: provider?.client_secret_masked ?? '',
@@ -159,6 +150,7 @@ export function IntegrationConnectPanel({
       // Google credentials had disappeared.
       if (!clientIdTouched.current && savedClientId) setClientId(savedClientId);
     } catch {
+      setState(current => ({ ...current, redirectUri: '' }));
       setNotice({ kind: 'error', text: t('error.load') });
     }
   }, [providerId, t, intl]);
@@ -350,8 +342,8 @@ export function IntegrationConnectPanel({
       {providerId === 'google' && !hideRedirect && (
         <div className="space-y-1 rounded-lg border border-surface-border p-3 text-xs">
           <p>{intl.formatMessage({ id: 'google.wizard.redirect' })}</p>
-          <code className="block select-all break-all">{state.redirectUri}</code>
-          <Button variant="outline" size="sm" onClick={() => { void navigator.clipboard.writeText(state.redirectUri).catch(() => setNotice({ kind: 'error', text: intl.formatMessage({ id: 'google.wizard.copyFailed' }) })); }}>
+          <code className="block select-all break-all">{state.redirectUri || intl.formatMessage({ id: 'google.wizard.redirectUnavailable' })}</code>
+          <Button variant="outline" size="sm" disabled={!state.redirectUri} onClick={() => { void navigator.clipboard.writeText(state.redirectUri).catch(() => setNotice({ kind: 'error', text: intl.formatMessage({ id: 'google.wizard.copyFailed' }) })); }}>
             {intl.formatMessage({ id: 'common.copy' })}
           </Button>
         </div>
@@ -474,10 +466,13 @@ export function IntegrationConnectPanel({
             </div>
 
             {providerId === 'google' && (
-              <GoogleDataDisclosure
-                confirmed={googleDataConfirmed}
-                onConfirmedChange={setGoogleDataConfirmed}
-              />
+              <div className="space-y-3">
+                <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'google.wizard.consentHint' })}</p>
+                <GoogleDataDisclosure
+                  confirmed={googleDataConfirmed}
+                  onConfirmedChange={setGoogleDataConfirmed}
+                />
+              </div>
             )}
 
             <div className="flex flex-wrap gap-2">
@@ -504,10 +499,13 @@ export function IntegrationConnectPanel({
             <p className="text-sm text-muted-foreground">{t('configured.hint')}</p>
             {savedSummary}
             {providerId === 'google' && (
-              <GoogleDataDisclosure
-                confirmed={googleDataConfirmed}
-                onConfirmedChange={setGoogleDataConfirmed}
-              />
+              <div className="space-y-3">
+                <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'google.wizard.consentHint' })}</p>
+                <GoogleDataDisclosure
+                  confirmed={googleDataConfirmed}
+                  onConfirmedChange={setGoogleDataConfirmed}
+                />
+              </div>
             )}
             <div className="flex gap-2">
               <Button variant="brand" onClick={() => openConsent()} disabled={busy || (providerId === 'google' && !googleDataConfirmed)}>
