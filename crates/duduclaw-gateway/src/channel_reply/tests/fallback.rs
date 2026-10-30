@@ -42,7 +42,7 @@ mod fallback_tests {
 
     #[test]
     fn classify_all_runtime_timeouts_and_keep_auth_precedence() {
-        for name in ["Codex", "Grok", "Antigravity"] {
+        for name in ["Codex", "Grok"] {
             for err in [format!("{name} CLI timed out"),
                 format!("{name} CLI hard timeout after 300s"),
                 format!("{name} CLI hard timeout after 300s (no completed output)")] {

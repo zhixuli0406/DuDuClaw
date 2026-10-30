@@ -314,7 +314,7 @@ pub const MIN_ROUND_SPAWNS: u32 = 3;
 /// operator never wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenRole {
-    /// Canonical catalog runtime id (an alias such as `agy` already resolved).
+    /// Canonical catalog runtime id (any accepted alias already resolved).
     pub runtime: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -463,6 +463,11 @@ impl FrozenSpecViolation {
                 "團隊規格失效:審查者與執行者屬於同一個模型家族({family}),\
                  交叉查核形同虛設。請在 [team.roles] 讓 verifier 換一個家族的模型後重開任務。"
             ),
+            Self::RuntimeNotAllowed { role, runtime }
+                if duduclaw_core::runtime_catalog::removed_runtime(runtime).is_some() => {
+                duduclaw_core::runtime_catalog::removed_runtime(runtime).unwrap()
+                    .refusal(&format!("frozen [team.roles.{role}] runtime"))
+            }
             Self::RuntimeNotAllowed { role, runtime } => format!(
                 "團隊規格失效:{} 角色的執行環境「{runtime}」不在允許清單內\
                  (可能是舊規格,或這個版本已不支援)。請重新設定 [team.roles] 後重開任務。",
@@ -3873,7 +3878,7 @@ fn runtime_credentials_available(runtime_id: &str) -> bool {
         return false;
     }
     if spec.auth.credential_paths.is_empty() {
-        // A runtime with no documented credential file (`antigravity`) can
+        // A runtime with no documented credential file can
         // only be judged by the CLI's presence — which is what the dashboard's
         // own credential card says about it.
         return true;
@@ -4732,15 +4737,16 @@ mod tests {
     use super::*;
     use duduclaw_core::task_packet::{Constraint, Finding, OutputFormat};
 
-    /// A removed Gemini CLI role is rejected before it can be frozen.
+    /// Removed CLI roles are rejected before a team can be frozen.
     #[test]
-    fn removed_gemini_cli_team_role_is_rejected() {
-        let cfg = TeamConfig::from_toml_value(
-            &"[roles.executor]\nruntime = \"codex\"\n[roles.verifier]\nruntime = \"gemini\"\n"
-                .parse::<toml::Value>()
-                .unwrap(),
-        );
-        assert!(matches!(validate_team(&cfg), Err(duduclaw_core::types::TeamConfigError::RuntimeNotAllowed { role: Role::Verifier, .. })));
+    fn removed_cli_team_roles_are_rejected() {
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            let cfg = TeamConfig::from_toml_value(
+                &format!("[roles.executor]\nruntime = \"codex\"\n[roles.verifier]\nruntime = {:?}\n", removed.id)
+                    .parse::<toml::Value>().unwrap(),
+            );
+            assert!(matches!(validate_team(&cfg), Err(duduclaw_core::types::TeamConfigError::RuntimeNotAllowed { role: Role::Verifier, .. })));
+        }
     }
 
     #[tokio::test]
@@ -4883,10 +4889,10 @@ skill_security_scan = false
                 family: "codex".into(),
             },
             verifier: FrozenRole {
-                runtime: "antigravity".into(),
-                model: Some("gemini-3.7-flash".into()),
+                runtime: "grok".into(),
+                model: Some("grok-4.3".into()),
                 effort: None,
-                family: "antigravity".into(),
+                family: "grok".into(),
             },
             utility: None,
         }
@@ -5452,8 +5458,8 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
-                "gemini-3-pro-preview",
+                "grok",
+                "grok-4.3",
                 10,
                 0.70,
                 MatrixVerdict::Pass,
@@ -5461,15 +5467,15 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
-                "gemini-3.7-flash",
+                "grok",
+                "grok-4.7",
                 10,
                 0.70,
                 MatrixVerdict::Pass,
             ),
         ]);
         assert_eq!(
-            matrix_prior_model(&tie, Role::Verifier, "antigravity"),
+            matrix_prior_model(&tie, Role::Verifier, "grok"),
             None,
             "a tie is a matrix saying the two are the same, not a preference"
         );
@@ -5553,13 +5559,13 @@ skill_security_scan = false
         let home = dir.path();
         write_agent(home, "agnes", None, "claude-sonnet-4-6");
         use duduclaw_core::role_model_matrix::{MatrixRole, MatrixVerdict};
-        // `antigravity` serves `gemini-*`, so a cell naming a claude model on
+        // `grok` serves `grok-*`, so a cell naming a claude model on
         // it resolves to the claude family — different from the role's frozen
-        // `antigravity` family.
+        // `grok` family.
         matrix_with(vec![cell(
             "hr",
             MatrixRole::Verifier,
-            "antigravity",
+            "grok",
             "claude-opus-5",
             30,
             0.9,
@@ -5568,10 +5574,10 @@ skill_security_scan = false
         .save(&duduclaw_core::role_model_matrix::matrix_path(home))
         .unwrap();
         let unbound = FrozenRole {
-            runtime: "antigravity".into(),
+            runtime: "grok".into(),
             model: None,
             effort: None,
-            family: "antigravity".into(),
+            family: "grok".into(),
         };
         assert_eq!(
             matrix_prior_for_role(home, Role::Verifier, &unbound),
@@ -5723,13 +5729,13 @@ skill_security_scan = false
     #[test]
     fn capability_gap_from_matrix_refuses_a_cross_family_winner() {
         use duduclaw_core::role_model_matrix::{MatrixRole, MatrixVerdict};
-        // `antigravity` serves `gemini-*`, so a claude model measured on it
+        // `grok` serves `grok-*`, so a claude model measured on it
         // resolves to the claude family.
         let m = matrix_with(vec![
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
+                "grok",
                 "claude-opus-5",
                 30,
                 0.90,
@@ -5738,8 +5744,8 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
-                "gemini-3.7-flash",
+                "grok",
+                "grok-4.3",
                 30,
                 0.60,
                 MatrixVerdict::Pass,
@@ -5749,9 +5755,9 @@ skill_security_scan = false
             capability_gap_from_matrix(
                 &m,
                 Role::Verifier,
-                "antigravity",
-                "gemini-3.7-flash",
-                "antigravity"
+                "grok",
+                "grok-4.3",
+                "grok"
             ),
             None,
             "a cross-family winner must not be reported as a gap"
@@ -5762,8 +5768,8 @@ skill_security_scan = false
         let gap = capability_gap_from_matrix(
             &m,
             Role::Verifier,
-            "antigravity",
-            "gemini-3.7-flash",
+            "grok",
+            "grok-4.3",
             "claude",
         )
         .expect("same file, claude family");
@@ -6648,7 +6654,7 @@ skill_security_scan = false
             "[team]\nenabled = true\nexecutor_fanout = 2\n\
              [team.roles.planner]\nruntime = \"claude\"\nmodel = \"claude-fable-5-1\"\n\
              [team.roles.executor]\nruntime = \"codex\"\nmodel = \"gpt-5.5\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();
@@ -6658,7 +6664,7 @@ skill_security_scan = false
             panic!("expected Frozen, got {first:?}");
         };
         assert_eq!(spec.executor.runtime, "codex");
-        assert_eq!(spec.verifier.runtime, "antigravity");
+        assert_eq!(spec.verifier.runtime, "grok");
         assert_eq!(spec.executor_fanout, 2);
 
         // Freeze-once: a second call never rewrites.
@@ -6677,8 +6683,8 @@ skill_security_scan = false
         write_team_config(
             home,
             "[team]\nenabled = true\n\
-             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.executor]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n\
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();
@@ -7132,8 +7138,8 @@ skill_security_scan = false
         write_team_config(
             home,
             "[team]\nenabled = false\n\
-             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.executor]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n\
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();

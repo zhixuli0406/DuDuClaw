@@ -99,7 +99,7 @@ impl MistakeCategory {
 ///
 /// All fields are free-form strings rather than closed enums: the set of
 /// tools / assertion kinds is open-ended across runtimes (Claude / Codex /
-/// Gemini / Antigravity / openai-compat) and evolves over time, and a closed
+/// Gemini / Grok / openai-compat) and evolves over time, and a closed
 /// enum would force call sites this module can't reach to import an
 /// ever-growing variant list. Conventional `error_kind` values in use today:
 /// `"tool_error"` (a tool_result came back with an error), `"assertion_failed"`

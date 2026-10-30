@@ -99,7 +99,7 @@ impl MethodHandler {
                     { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
                     { "name": "models.list", "description": "List available cloud and local models" },
                     { "name": "models.refresh", "description": "Re-probe installed CLIs/APIs for live model lists" },
-                    { "name": "runtime.detect", "description": "Detect installed AI runtimes (Claude, Codex, Antigravity and other supported CLIs) + Claude OAuth" },
+                    { "name": "runtime.detect", "description": "Detect installed AI runtimes (Claude, Codex, Grok and other supported CLIs) + Claude OAuth" },
                     { "name": "runtime.install", "description": "Install a missing AI runtime CLI from a hard-coded whitelist (admin)" },
                     { "name": "system.config", "description": "View system config" },
                     { "name": "system.update_config", "description": "Update system config keys by TOML path; returns changes[] and restart_required[] (admin)" },

@@ -353,22 +353,22 @@ async fn discovery_manager_decision_recovers_after_broker_commit_before_task_aut
 #[tokio::test]
 #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_catalog_and_create_share_the_production_runtime_capability_gate() {
-    for runtime in ["codex","antigravity","agy","grok"] {
+    for runtime in ["codex","grok"] {
         let (dir,mut spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
         let mut config=load_config(&home).unwrap();
         let configured=config.attempt.runtimes["claude"].clone();
-        for name in ["codex","antigravity","grok"] { config.attempt.runtimes.insert(name.into(),configured.clone()); }
+        for name in ["codex","grok"] { config.attempt.runtimes.insert(name.into(),configured.clone()); }
         std::fs::write(home.join("config.toml"),toml::to_string(&std::collections::BTreeMap::from([("discovery",config)])).unwrap()).unwrap();
         let caller=user("manager",UserRole::Manager);
         let offered=catalog(&home,&caller,"worker").unwrap();
-        assert_eq!(offered["runtimes"],json!(["antigravity","claude","codex","grok"]),"every configured family runs under the host-side contract");
+        assert_eq!(offered["runtimes"],json!(["claude","codex","grok"]),"every configured family runs under the host-side contract");
         let store=TaskStore::open(&home).unwrap();
         spec.runtime=runtime.into();
         assert!(create(&home,&store,&broker,&caller,"worker","Explore","Improve fixture",spec.clone()).await.is_ok(),"public create accepts {runtime}");
         assert_eq!(store.discovery_tasks().await.unwrap().len(),1);
-        let canonical=if runtime=="agy" {"antigravity"} else {runtime};
+        let canonical=runtime;
         let frozen:Value=serde_json::from_str(store.discovery_tasks().await.unwrap()[0].discovery_spec_json.as_deref().unwrap()).unwrap();
-        assert_eq!(frozen["spec"]["runtime"],canonical,"the alias is stored under the family name");
+        assert_eq!(frozen["spec"]["runtime"],canonical,"the runtime is stored under the family name");
         let listed=list(&home,&caller,Some("worker"),10).await.unwrap();
         assert_eq!(listed["runs"][0]["runtime"],canonical);
     }

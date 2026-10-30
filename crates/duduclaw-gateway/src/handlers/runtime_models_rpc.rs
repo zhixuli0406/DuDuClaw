@@ -48,7 +48,7 @@ impl MethodHandler {
         // Legacy key kept verbatim: the dashboard onboarding wizard and the
         // OOBE shell both read `claude_cli`, and renaming it would break both
         // for zero gain. Every other runtime is keyed by its catalog id
-        // (`codex`, `gemini`, `antigravity`, `grok`, … ) exactly as before.
+        // (`codex`, `grok`, … ) exactly as before.
         flags.insert("claude_cli".to_string(), Value::Bool(claude_bin.is_some()));
         flags.insert("claude_oauth".to_string(), Value::Bool(claude_oauth));
         flags.insert(
@@ -82,6 +82,9 @@ impl MethodHandler {
             .get("provider")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(provider) {
+            return WsFrame::error_response("", &removed.refusal("runtime.install provider"));
+        }
         if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, provider) {
             return WsFrame::error_response("", &e);
         }

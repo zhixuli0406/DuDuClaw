@@ -38,7 +38,7 @@ pub const PROXY_UPSTREAM_ENV_FILE_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_FILE";
 /// `<server>.json` per third-party server ([`spawn_env_file_name`]), each the
 /// same JSON map as [`PROXY_UPSTREAM_ENV_VAR`]. Used by runtimes whose MCP
 /// registration is a persistent file shared by every spawn of the employee
-/// (Grok `.grok/config.toml`, Antigravity `.agents/mcp_config.json`,
+/// (Grok `.grok/config.toml`,
 /// 2026-10-20): the file names only this variable (or nothing, when the CLI
 /// hands its own environment to MCP children), the spawn sets it. Read by a
 /// proxy started with [`PROXY_SPAWN_SCOPED_FLAG`]. Must match
@@ -58,7 +58,7 @@ pub const PROXY_SPAWN_SCOPED_FLAG: &str = "--spawn-scoped";
 pub const MAX_PORTABLE_SERVER_NAME_LEN: usize = 64;
 
 /// Is `name` usable as-is in every CLI config format DuDuClaw writes (a bare
-/// TOML key, a JSON key, an Antigravity permission rule) and as a file name?
+/// TOML key, a JSON key) and as a file name?
 /// ASCII letters, digits, `_` and `-`, 1–64 characters.
 pub fn is_portable_server_name(name: &str) -> bool {
     !name.is_empty()

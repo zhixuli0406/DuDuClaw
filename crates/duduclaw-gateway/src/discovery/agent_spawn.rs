@@ -708,6 +708,7 @@ impl AttemptRunnerFactory {
     pub fn check_runtime_capability(attempt:&AttemptSettings,runtime:&str)
         ->Result<super::attempt_adapter::RuntimeFamily,AttemptInfraError> {
         let family=super::attempt_adapter::RuntimeFamily::parse(runtime)?;
+        attempt.ensure_active_runtime_configuration().map_err(AttemptInfraError::RuntimeUnsupported)?;
         if attempt.strict_usd {return Err(AttemptInfraError::StrictUsdUnsupported(runtime.into()));}
         match attempt.sandbox {
             AttemptSandbox::Native=>return Err(AttemptInfraError::IsolationUnavailable),
@@ -821,8 +822,7 @@ impl AttemptRunner for ContainerAttemptRunner {
                 match verdict {
                     super::attempt_guard::GuardVerdict::ToolViolation{tool}=>{stop=Some(StopCause::ToolViolation(tool));return false;}
                     super::attempt_guard::GuardVerdict::StepLimit=>{
-                        // agy: every generation's usage is in the stream. Codex
-                        // reports usage only per turn, so its total stays unknown.
+                        // Codex reports usage only per turn, so its total stays unknown.
                         transcript.push_str(&adapter.synthetic_result().to_string());transcript.push('\n');
                         stop=Some(StopCause::StepLimit);return false;
                     }
@@ -837,11 +837,6 @@ impl AttemptRunner for ContainerAttemptRunner {
                 keep
             });
             let result=tokio::select! { result=execution=>result, _=budget.cancelled()=>Err(AttemptInfraError::BudgetExhausted) };
-            // A natural end (or the wall clock) with a forbidden tool whose
-            // hook denial was never confirmed is a violation.
-            if stop.is_none() && result.is_ok() {
-                if let super::attempt_guard::GuardVerdict::ToolViolation{tool}=stream_guard.finish() { stop=Some(StopCause::ToolViolation(tool)); }
-            }
             let summary=parse_stream(&transcript);let cost=call_cost_for(family,summary.model.as_deref().unwrap_or(model),&summary);
             budget.finish_accounted_call(call,cost.usd,cost.source);accumulate_cost(&mut incurred,cost);
             seed.guard.verify().map_err(|e|AttemptInfraError::Spawn(e.to_string()))?;

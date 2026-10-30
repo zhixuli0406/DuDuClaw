@@ -169,8 +169,8 @@ async fn an_invalid_enabled_team_runs_solo_and_freezes_nothing() {
     std::fs::write(
         dir.path().join("config.toml"),
         "[team]\nenabled = true\n\
-             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.executor]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n\
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
     )
     .unwrap();
     let (store, queue) = open_stores(dir.path()).await;

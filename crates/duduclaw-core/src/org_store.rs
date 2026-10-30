@@ -12,7 +12,7 @@
 //!
 //! - a *speed bump* for `Bash` (a shell redirect is matched heuristically, not
 //!   parsed), and
-//! - **absent entirely** for the codex / antigravity runtimes, which
+//! - **absent entirely** for the codex runtime, which
 //!   have no `PreToolUse` mechanism at all.
 //!
 //! The judged party still owned the evidence. This module moves the evidence

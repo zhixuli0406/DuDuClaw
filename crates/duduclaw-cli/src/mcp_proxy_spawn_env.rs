@@ -1,12 +1,12 @@
 //! Upstream env for a `duduclaw mcp-proxy --spawn-scoped` entry (2026-10-20).
 //!
-//! Grok and Antigravity register MCP servers in a persistent per-directory
-//! file (`.grok/config.toml`, `.agents/mcp_config.json`) that every spawn of
+//! Grok registers MCP servers in a persistent per-directory
+//! file (`.grok/config.toml`) that every spawn of
 //! the employee shares, so nothing per spawn (the upstream server's own
 //! credentials, the decision "this spawn may use this server") can live in
 //! it. The gateway writes those into a per-spawn, owner-only directory and
 //! hands its path to the CLI in [`PROXY_UPSTREAM_ENV_DIR_VAR`]; the CLI passes
-//! it on to the proxy (Antigravity by inheritance, Grok by `${…}` expansion
+//! it on to the proxy (by `${…}` expansion
 //! of the entry's `env`).
 //!
 //! A spawn-scoped proxy that finds no such directory, or no file for its

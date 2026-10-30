@@ -412,7 +412,7 @@ impl std::str::FromStr for TeamGateMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct RoleSpec {
-    /// Runtime id (or catalog alias, e.g. `agy`). Raw `String` — the
+    /// Runtime id (or catalog alias, e.g. `grok-cli`). Raw `String` — the
     /// allowlist and canonicalisation happen in [`validate_team`], which can
     /// report *which role* was wrong; a strict serde enum here would fail the
     /// whole `agent.toml` and take the employee out of the registry.
@@ -676,7 +676,7 @@ pub fn cascade_unbound_roles(
 /// `openai_compat`) are **not** allowed yet — not because they cannot answer,
 /// but because a role that silently loses its tools produces confident
 /// tool-free narration, which the verifier cannot distinguish from work.
-pub const TEAM_ROLE_RUNTIME_ALLOWLIST: &[&str] = &["claude", "codex", "antigravity", "grok"];
+pub const TEAM_ROLE_RUNTIME_ALLOWLIST: &[&str] = &["claude", "codex", "grok"];
 
 /// `"low, medium, high, xhigh, max"` — built from [`crate::effort::Effort::ALL`]
 /// so a new level never has to be remembered in an error message here.
@@ -817,11 +817,16 @@ impl TeamConfigError {
 impl std::fmt::Display for TeamConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TeamConfigError::RuntimeNotAllowed { role, runtime } => write!(
-                f,
-                "[team.roles.{role}] runtime `{runtime}` cannot back a team role (allowed: {})",
-                TEAM_ROLE_RUNTIME_ALLOWLIST.join(", ")
-            ),
+            TeamConfigError::RuntimeNotAllowed { role, runtime } => {
+                if let Some(removed) = crate::runtime_catalog::removed_runtime(runtime) {
+                    return f.write_str(&removed.refusal(&format!("agent.toml [team.roles.{role}] runtime")));
+                }
+                write!(
+                    f,
+                    "[team.roles.{role}] runtime `{runtime}` cannot back a team role (allowed: {})",
+                    TEAM_ROLE_RUNTIME_ALLOWLIST.join(", ")
+                )
+            },
             TeamConfigError::ModelRuntimeMismatch {
                 role,
                 runtime,
@@ -861,8 +866,7 @@ impl std::error::Error for TeamConfigError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRole {
     pub role: Role,
-    /// Canonical catalog id (an alias such as `agy` is resolved to
-    /// `antigravity`).
+    /// Canonical catalog id (an alias such as `grok-cli` resolves to `grok`).
     pub runtime: &'static str,
     /// `None` ⇒ the caller cascades to the employee's `[model] preferred`.
     pub model: Option<String>,
@@ -931,10 +935,8 @@ impl ResolvedTeam {
 /// * without a model, the family is whichever catalog entry claims the
 ///   runtime's *own* first declared prefix.
 ///
-/// Antigravity claims Gemini model ids; the Gemini CLI runtime is removed.
-///
 /// Falls back to the runtime id for a runtime that claims no family at all
-/// (none of the allowlisted five do today; this keeps the function total).
+/// (none of the allowlisted runtimes do today; this keeps the function total).
 pub fn team_model_family(
     runtime: &'static crate::runtime_catalog::RuntimeSpec,
     model: Option<&str>,
@@ -1140,13 +1142,23 @@ macro_rules! runtime_types {
         /// [runtime] provider`. Defaults to [`RuntimeType::Claude`].
         /// Per-runtime facts live in [`crate::runtime_catalog::CATALOG`];
         /// reach them with [`RuntimeType::spec`].
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
         pub enum RuntimeType {
             $(
                 $(#[$meta])*
                 #[serde(rename = $id)]
                 $variant,
             )+
+        }
+
+        impl<'de> Deserialize<'de> for RuntimeType {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let id = String::deserialize(deserializer)?;
+                if let Some(removed) = crate::runtime_catalog::removed_runtime(&id) {
+                    return Err(serde::de::Error::custom(removed.refusal("runtime")));
+                }
+                Self::from_id(&id).ok_or_else(|| serde::de::Error::unknown_variant(&id, &[$($id),+]))
+            }
         }
 
         impl RuntimeType {
@@ -1174,9 +1186,6 @@ runtime_types! {
     #[default]
     Claude => "claude",
     Codex => "codex",
-    /// Google Antigravity CLI (`agy`) — the 2026-06-18 successor to the
-    /// Gemini CLI. Same model lineage, distinct binary/flags.
-    Antigravity => "antigravity",
     /// xAI Grok CLI ("Grok Build", beta 2026-05) — terminal coding agent driving
     /// `grok-build-0.1` behind a SuperGrok / X Premium+ subscription. MCP-native,
     /// `-p` headless mode. R4 phase 1 wired CLI detection + headless spawn;
@@ -1217,7 +1226,7 @@ impl RuntimeType {
     }
 
     /// Parse a runtime identifier. Canonical ids and the catalog's documented
-    /// aliases (`agy`, `grok-cli`, `cursor-agent`, `openai`, …) both resolve —
+    /// aliases (`grok-cli`, `cursor-agent`, `openai`, …) both resolve —
     /// the alias list lives in [`crate::runtime_catalog`], so adding one no
     /// longer means editing this function.
     ///
@@ -1235,7 +1244,7 @@ impl RuntimeType {
         crate::runtime_catalog::spec_for(s).and_then(|spec| Self::from_id(spec.id))
     }
 
-    /// `claude|codex|antigravity|…` — the accepted-values list for an error
+    /// `claude|codex|grok|…` — the accepted-values list for an error
     /// message, built from the catalog so it can never go stale.
     pub fn valid_values() -> String {
         crate::runtime_catalog::id_list_pipe()
@@ -3328,10 +3337,10 @@ pub struct AgentInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct RuntimeSection {
-    /// Raw provider string. Kept as `String` (not [`RuntimeType`]) because
-    /// [`RuntimeType::parse`] is deliberately lenient — an unrecognised value
-    /// warns and falls back to Claude rather than erroring, and a strict serde
-    /// enum here would turn a provider typo into total agent loss.
+    /// Raw provider string. Kept as `String` (not [`RuntimeType`]) so stale
+    /// identifiers remain visible for diagnosis and explicit dispatch refusal.
+    /// [`RuntimeType::parse`] returns `None` for unsupported identifiers; a
+    /// strict serde enum here would hide the whole agent on a provider typo.
     #[serde(deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -4402,12 +4411,11 @@ mod tests {
         }
         // The pre-WP-B wire values must be byte-identical (persisted configs).
         assert_eq!(RuntimeType::OpenAiCompat.as_str(), "openai_compat");
-        assert_eq!(RuntimeType::Antigravity.as_str(), "antigravity");
     }
 
     #[test]
     fn runtime_type_parse_accepts_catalog_aliases() {
-        assert_eq!(RuntimeType::parse("agy"), Some(RuntimeType::Antigravity));
+        assert_eq!(RuntimeType::parse("grok-cli"), Some(RuntimeType::Grok));
         assert_eq!(RuntimeType::parse("openai"), Some(RuntimeType::OpenAiCompat));
         assert_eq!(
             RuntimeType::parse("openai-compat"),
@@ -4417,7 +4425,7 @@ mod tests {
         assert_eq!(RuntimeType::parse("cursor-agent"), Some(RuntimeType::Cursor));
         assert_eq!(RuntimeType::parse("  KIMI  "), Some(RuntimeType::Kimi));
         // `from_id` is strict about ALIASES too (canonical ids only).
-        assert!(RuntimeType::from_id("agy").is_none());
+        assert!(RuntimeType::from_id("grok-cli").is_none());
     }
 
     /// The hole this closes: `parse` used to map ANY unknown string to
@@ -4828,8 +4836,8 @@ model = "gpt-5.5"
 effort = "medium"
 
 [roles.verifier]
-runtime = "antigravity"
-model = "gemini-3.7-flash"
+runtime = "grok"
+model = "grok-4-fast"
 effort = "low"
 
 [roles.utility]
@@ -4907,7 +4915,7 @@ model = "claude-haiku-4-5"
         assert_eq!(c.roles.planner.model.as_deref(), Some("claude-fable-5-1"));
         assert_eq!(c.roles.planner.effort.as_deref(), Some("high"));
         assert_eq!(c.roles.executor.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(c.roles.verifier.runtime.as_deref(), Some("antigravity"));
+        assert_eq!(c.roles.verifier.runtime.as_deref(), Some("grok"));
         assert_eq!(c.roles.utility.model.as_deref(), Some("claude-haiku-4-5"));
         assert!(c.roles.utility.effort.is_none());
     }
@@ -5109,13 +5117,13 @@ model = "gpt-5.5"
 [roles.executor]
 effort = "high"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         let (cfg, cascaded) = cascade_unbound_roles(&c, Some("claude"), Some("claude-sonnet-4-6"));
         assert_eq!(cascaded, vec![Role::Executor]);
         assert_eq!(cfg.roles.executor.effort.as_deref(), Some("high"));
-        let r = validate_team(&cfg).expect("claude executor + Antigravity verifier decorrelates");
+        let r = validate_team(&cfg).expect("claude executor + Grok verifier decorrelates");
         assert_eq!(r.executor.effort, Some(crate::effort::Effort::High));
     }
 
@@ -5128,8 +5136,8 @@ runtime = "antigravity"
 runtime = "codex"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "antigravity"
-model = "gemini-3-pro-preview"
+runtime = "grok"
+model = "grok-4"
 "#,
         );
         let (cfg, cascaded) = cascade_unbound_roles(&c, Some("claude"), Some("claude-opus-5"));
@@ -5157,8 +5165,8 @@ model = "gemini-3-pro-preview"
         assert_eq!(resolved.executor.family, "codex");
         assert_eq!(resolved.executor.effort, Some(Effort::Medium));
 
-        assert_eq!(resolved.verifier.runtime, "antigravity");
-        assert_eq!(resolved.verifier.family, "antigravity");
+        assert_eq!(resolved.verifier.runtime, "grok");
+        assert_eq!(resolved.verifier.family, "grok");
 
         let utility = resolved.utility.as_ref().unwrap();
         assert_eq!(utility.model.as_deref(), Some("claude-haiku-4-5"));
@@ -5177,16 +5185,16 @@ model = "gemini-3-pro-preview"
 runtime = "codex"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         let r = validate_team(&c).unwrap();
         assert!(r.planner.is_none(), "planner cascades to [model] preferred");
         assert!(r.utility.is_none());
         // A verifier with only a runtime still resolves; its model cascades.
-        assert_eq!(r.verifier.runtime, "antigravity");
+        assert_eq!(r.verifier.runtime, "grok");
         assert!(r.verifier.model.is_none());
-        assert_eq!(r.verifier.family, "antigravity");
+        assert_eq!(r.verifier.family, "grok");
     }
 
     #[test]
@@ -5197,11 +5205,11 @@ runtime = "antigravity"
 runtime = "claude"
 model = "claude-sonnet-4-6"
 [roles.verifier]
-runtime = "agy"
+runtime = "grok-cli"
 "#,
         );
         let r = validate_team(&c).unwrap();
-        assert_eq!(r.verifier.runtime, "antigravity");
+        assert_eq!(r.verifier.runtime, "grok");
     }
 
     #[test]
@@ -5224,7 +5232,7 @@ model = "claude-sonnet-4-6"
 [roles.executor]
 model = "deepseek-v3.2"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         assert_eq!(
@@ -5237,26 +5245,6 @@ runtime = "antigravity"
         );
     }
 
-    #[test]
-    fn antigravity_may_declare_a_gemini_model() {
-        // Antigravity continues to claim Gemini model ids after the Gemini
-        // CLI runtime has been removed from the catalog.
-        let c = team(
-            r#"
-[roles.executor]
-runtime = "claude"
-model = "claude-sonnet-4-6"
-[roles.verifier]
-runtime = "antigravity"
-model = "gemini-3.1-pro"
-"#,
-        );
-        let r = validate_team(&c).unwrap();
-        assert_eq!(r.verifier.runtime, "antigravity");
-        // Its family follows the active Antigravity runtime.
-        assert_eq!(r.verifier.family, "antigravity");
-    }
-
     // ── validation: refusals ────────────────────────────────────────────
 
     #[test]
@@ -5267,7 +5255,7 @@ model = "gemini-3.1-pro"
 [roles.executor]
 runtime = "{runtime}"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#
             ));
             assert_eq!(
@@ -5282,7 +5270,7 @@ runtime = "antigravity"
         // The allowlist is exactly decision D.
         assert_eq!(
             TEAM_ROLE_RUNTIME_ALLOWLIST,
-            &["claude", "codex", "antigravity", "grok"]
+            &["claude", "codex", "grok"]
         );
     }
 
@@ -5296,7 +5284,7 @@ runtime = "antigravity"
 runtime = "claude"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         assert_eq!(
@@ -5322,13 +5310,13 @@ runtime = "antigravity"
                 "claude-haiku-4-5",
                 "claude",
             ),
-            // the same runtime serves multiple Gemini models
+            // the same runtime serves multiple Grok models
             (
-                "antigravity",
-                "gemini-3.7-flash",
-                "antigravity",
-                "gemini-3.1-pro",
-                "antigravity",
+                "grok",
+                "grok-4-fast",
+                "grok",
+                "grok-4",
+                "grok",
             ),
         ];
         for (e_rt, e_model, v_rt, v_model, family) in same_family {
@@ -5381,7 +5369,7 @@ runtime = "codex"
 runtime = "   "
 model = ""
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         assert_eq!(
@@ -5400,7 +5388,7 @@ runtime = "antigravity"
 runtime = "codex"
 model = "gpt-5.5"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         validate_team(&base).expect("the base spec is valid before the effort typo");
@@ -5436,7 +5424,7 @@ enabled = false
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5451,7 +5439,7 @@ runtime = "antigravity"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#;
         for (written, applied) in [(0i64, 1u8), (-4, 1), (1, 1), (3, 3), (9, 3), (999, 3)] {
             let c = team(&format!("executor_fanout = {written}\n{base}"));
@@ -5481,7 +5469,7 @@ gate = "always-team-ish"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5501,7 +5489,7 @@ gate = "always_solo"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5519,7 +5507,7 @@ effort = "high"
 [roles.executor]
 runtime = "codex"
 [roles.verifier]
-runtime = "antigravity"
+runtime = "grok"
 "#,
         );
         let r = validate_team(&c).unwrap();
@@ -5594,38 +5582,36 @@ runtime = "antigravity"
         assert_eq!(ncodes.len(), n);
     }
 
-    /// A removed runtime must be rejected, while Antigravity remains valid
-    /// for Gemini models.
+    /// Removed identifiers and aliases never select another runtime.
     #[test]
-    fn removed_gemini_runtime_is_refused_and_antigravity_stays_valid() {
-        let c = team(
-            r#"
-[roles.executor]
-runtime = "codex"
-[roles.verifier]
-runtime = "gemini"
-"#,
-        );
-        assert_eq!(
-            validate_team(&c).unwrap_err(),
-            TeamConfigError::RuntimeNotAllowed {
-                role: Role::Verifier,
-                runtime: "gemini".to_string(),
-            }
-        );
+    fn removed_runtimes_have_explicit_serde_refusals() {
+        for removed in crate::runtime_catalog::REMOVED_RUNTIMES {
+            let json = serde_json::to_string(removed.id).unwrap();
+            let error = serde_json::from_str::<RuntimeType>(&json).unwrap_err().to_string();
+            assert!(error.contains(removed.display_name), "{error}");
+            assert!(error.contains(removed.removed_in), "{error}");
+            assert!(error.contains("choose a supported runtime and model"), "{error}");
+        }
+        // Serde keeps its canonical-id contract for supported runtimes.
+        assert!(serde_json::from_str::<RuntimeType>(r#""grok-cli""#).is_err());
+        assert!(serde_json::from_str::<RuntimeType>(r#""GROK""#).is_err());
+    }
 
-        let c = team(
-            r#"
-[roles.executor]
-runtime = "codex"
-[roles.verifier]
-runtime = "antigravity"
-model = "gemini-3.1-pro"
-"#,
-        );
-        let resolved = validate_team(&c).unwrap();
-        assert_eq!(resolved.verifier.family, "antigravity");
-        assert!(resolved.deprecation_notes().is_empty());
+    #[test]
+    fn removed_runtimes_are_refused_in_team_roles() {
+        for removed in crate::runtime_catalog::REMOVED_RUNTIMES {
+            let c = team(&format!(
+                "[roles.executor]\nruntime = \"codex\"\n[roles.verifier]\nruntime = \"{}\"\n",
+                removed.id
+            ));
+            let error = validate_team(&c).unwrap_err();
+            assert_eq!(error, TeamConfigError::RuntimeNotAllowed {
+                role: Role::Verifier,
+                runtime: removed.id.to_string(),
+            });
+            assert!(error.to_string().contains(removed.display_name));
+            assert!(error.to_string().contains(removed.removed_in));
+        }
     }
 
     // ── agent.toml round-trip ───────────────────────────────────────────
@@ -5691,7 +5677,7 @@ max_active_skills = 2
         let with_team = format!(
             "{base}\n[team]\nenabled = true\nexecutor_fanout = 2\n\
              [team.roles.executor]\nruntime = \"codex\"\nmodel = \"gpt-5.5\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\n"
+             [team.roles.verifier]\nruntime = \"grok\"\n"
         );
         let cfg: AgentConfig = toml::from_str(&with_team).expect("parses with [team]");
         assert_eq!(cfg.team.enabled, Some(true));

@@ -419,6 +419,8 @@ async fn run_live(
         return Err(missing_agent_error(agent, &agent_dir, case));
     }
 
+    duduclaw_gateway::runtime_config::ensure_active_agent_provider(&agent_dir)?;
+
     let claude = duduclaw_core::which_claude()
         .or_else(|| duduclaw_core::which_claude_in_home(home))
         .ok_or_else(|| "claude CLI not found (PATH + known install locations)".to_string())?;
@@ -621,7 +623,7 @@ fn build_eval_cli_args(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// P2: the runtime-abstraction path (codex / antigravity / grok /
+// P2: the runtime-abstraction path (codex / grok /
 // openai_compat / every generic print-mode CLI)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1120,6 +1122,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_refuses_removed_agent_runtime_before_spawning() {
+        for id in ["gemini", "antigravity", "agy"] {
+            let home = tempfile::tempdir().unwrap();
+            let agent_dir = home.path().join("agents/support-bot");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::write(agent_dir.join("agent.toml"), format!(
+                "[runtime]\nprovider = \"{id}\"\n"
+            )).unwrap();
+            let err = run_live(&case(""), home.path(), "claude-haiku-4-5", "support-bot").await.unwrap_err();
+            assert!(err.contains("removed") && err.contains("choose"), "{err}");
+            assert!(!agent_dir.join(".mcp.json").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn live_without_agent_dir_is_actionable_error() {
         let dir = tempfile::tempdir().unwrap(); // empty home: no agents/
         let case_path = dir.path().join("t.toml");
@@ -1206,10 +1223,10 @@ mod tests {
     /// The report header must name what actually ran, not the default.
     #[test]
     fn run_facts_report_the_case_pinned_runtime() {
-        let c = case("runtime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n");
+        let c = case("runtime = \"grok\"\nmodel = \"grok-4.20\"\n");
         let facts = RunFacts::requested(&RunOverrides::default(), &c);
-        assert_eq!(facts.runtime, "antigravity");
-        assert_eq!(facts.model, "gemini-3.7-flash");
+        assert_eq!(facts.runtime, "grok");
+        assert_eq!(facts.model, "grok-4.20");
     }
 
     #[test]
@@ -1303,7 +1320,7 @@ mod tests {
 
     #[test]
     fn synthesized_transcript_with_no_tool_events_is_still_valid() {
-        let raw = synthesize_stream_json("antigravity", "gemini-2.5-flash", "hello", &[]);
+        let raw = synthesize_stream_json("grok", "grok-4.20", "hello", &[]);
         let t = parse_stream_json(&raw).expect("parses");
         assert_eq!(t.final_text, "hello");
         assert!(t.tool_uses.is_empty());

@@ -52,35 +52,55 @@ fn read_sections(agent_dir: &Path) -> AgentTomlSections {
     agent_toml::load(agent_dir)
 }
 
-/// Legacy Gemini CLI providers must be fixed by the operator before dispatch.
-/// Silently defaulting them to Claude would run a different vendor and model.
+/// Removed runtime choices must be fixed explicitly before dispatch.
+/// Both provider and fallback are checked before any default can be resolved.
 pub fn ensure_active_agent_provider(agent_dir: &Path) -> Result<(), String> {
-    if read_sections(agent_dir)
-        .runtime
-        .provider
-        .as_deref()
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("gemini"))
-    {
-        return Err(format!(
-            "{} still selects the removed Gemini CLI runtime; choose a supported runtime and model in agent.toml",
-            agent_dir.display()
-        ));
+    // A materialized preset must not hide an operator's removed source choice.
+    if let Ok(raw) = std::fs::read_to_string(agent_dir.join("agent.toml")) {
+        if let Ok(doc) = raw.parse::<toml::Value>() {
+            for field in ["provider", "fallback"] {
+                if let Some(removed) = doc.get("runtime").and_then(|rt| rt.get(field))
+                    .and_then(toml::Value::as_str)
+                    .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+                    return Err(removed.refusal(&format!("{} agent.toml [runtime] {field}", agent_dir.display())));
+                }
+            }
+        }
+    }
+    let sections = read_sections(agent_dir);
+    for (field, value) in [("provider", sections.runtime.provider), ("fallback", sections.runtime.fallback)] {
+        if let Some(removed) = value.as_deref().and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+            return Err(removed.refusal(&format!("{} agent.toml [runtime] {field}", agent_dir.display())));
+        }
+    }
+    // An invalid team normally falls back to Solo. A removed role must not
+    // use that path to execute work with another vendor instead.
+    let global_team = duduclaw_core::preset::agent_home_dir(agent_dir)
+        .map(|home| crate::team_composer::read_global_team_config(&home))
+        .unwrap_or_default();
+    let team = duduclaw_core::types::TeamConfig::merge(&global_team, &sections.team);
+    if team.is_enabled() {
+        for role in duduclaw_core::types::Role::ALL {
+            if let Some(removed) = team.roles.get(*role).runtime.as_deref()
+                .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+                return Err(removed.refusal(&format!("[team.roles.{}] runtime", role.as_str())));
+            }
+        }
     }
     Ok(())
 }
 
 pub fn ensure_active_utility_provider(home_dir: &Path) -> Result<(), String> {
-    let removed = read_global_config(home_dir)
-        .as_ref()
+    let config = read_global_config(home_dir);
+    if let Some(removed) = config.as_ref()
         .and_then(|v| v.get("runtime"))
         .and_then(|v| v.get("utility_provider"))
         .and_then(|v| v.as_str())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("gemini"));
-    if removed {
-        Err("config.toml [runtime] utility_provider still selects the removed Gemini CLI runtime; choose a supported runtime and model".into())
-    } else {
-        Ok(())
+        .and_then(duduclaw_core::runtime_catalog::removed_runtime)
+    {
+        return Err(removed.refusal("config.toml [runtime] utility_provider"));
     }
+    Ok(())
 }
 
 /// All per-agent runtime/model settings from a single `agent.toml` read (RFC-25 L7).
@@ -519,6 +539,11 @@ pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
 /// `is_claude` / `is_openai` / `is_gemini` / `is_grok` ladder that had to grow a
 /// term — in two places — for every new backend.
 pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
+    // Gemini remains an API model family, but no supported CLI owns it.
+    // Do not let removal turn a known foreign model into an unknown match.
+    if model_family(model) == Some("gemini") {
+        return provider.spec().model_prefixes.is_empty();
+    }
     // Which runtime does this model id CONFIDENTLY belong to? `None` ⇒ unknown
     // family ⇒ never a mismatch.
     let Some(owner) = duduclaw_core::runtime_catalog::runtime_for_model(model) else {
@@ -529,9 +554,7 @@ pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
     if spec.model_prefixes.is_empty() {
         return true;
     }
-    // Same runtime, obviously fine. Otherwise the two must share a family —
-    // which is how `antigravity` accepts `gemini-*` (both declare the `gemini`
-    // prefix) without needing a special case.
+    // Same runtime, or two catalog entries declaring the same model prefix.
     spec.id == owner.id
         || spec
             .model_prefixes
@@ -540,11 +563,14 @@ pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
 }
 
 /// The model-id family a model id **confidently** belongs to, expressed as the
-/// owning runtime catalog id (`"claude"`, `"gemini"`, `"codex"`, …).
+/// owning runtime catalog id, or `"gemini"` for the API-only Google family.
 ///
-/// `None` for an id whose naming prefix no catalog entry claims — never a
-/// guess.
+/// `None` for an unrecognised naming prefix; no vendor is guessed.
 pub fn model_family(model: &str) -> Option<&'static str> {
+    let bare = model.trim().rsplit('/').next().unwrap_or(model);
+    if bare.to_ascii_lowercase().starts_with("gemini-") {
+        return Some("gemini");
+    }
     duduclaw_core::runtime_catalog::runtime_for_model(model).map(|s| s.id)
 }
 
@@ -778,7 +804,7 @@ pub fn delegation_routing_enabled(home_dir: &Path, agent_dir: &Path) -> bool {
 // operator-level default from `<home>/config.toml [runtime]`:
 //
 //   [runtime]
-//   utility_provider = "claude"   # claude | codex | gemini | openai_compat
+//   utility_provider = "claude"   # claude | codex | openai_compat
 //   utility_model    = "claude-haiku-4-5"
 //
 // An absent/malformed file keeps Claude / DEFAULT_UTILITY_MODEL. With another
@@ -895,6 +921,9 @@ fn validate_utility_config(path: &Path, key: &str, optional: bool) -> Result<(),
         let table = runtime.as_table().ok_or("utility runtime config must be a table")?;
         if let Some(value) = table.get(key) {
             let id = value.as_str().ok_or("utility provider must be a string")?;
+            if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(id) {
+                return Err(removed.refusal(&format!("{} [runtime] {key}", path.display())));
+            }
             if RuntimeType::parse(id).is_none() {
                 return Err(format!("unknown utility runtime {id}"));
             }
@@ -1019,7 +1048,7 @@ mod tests {
         }
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='grok'\n").unwrap();
         assert!(resolve_utility_profile(home.path(), Some(agent.path()),
-            UtilitySpec { provider: RuntimeType::Antigravity, model: "gemini".into() }, false).is_err());
+            UtilitySpec { provider: RuntimeType::Grok, model: "gemini".into() }, false).is_err());
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='fixture-model'\n").unwrap();
         assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()),
             UtilitySpec { provider: RuntimeType::Grok, model: "grok".into() }, false).unwrap(),
@@ -1216,37 +1245,65 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_agent_toml(
             dir.path(),
-            "[runtime]\nprovider = \"antigravity\"\nfallback = \"claude\"\n",
+            "[runtime]\nprovider = \"grok\"\nfallback = \"claude\"\n",
         );
-        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Antigravity);
+        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Grok);
         assert_eq!(
             agent_runtime_fallback(dir.path()),
             Some(RuntimeType::Claude)
         );
     }
 
-    /// Legacy Gemini settings are rejected by the dispatch gates.
+    /// Removed provider and fallback settings are refused before dispatch.
     #[test]
-    fn removed_gemini_runtime_in_config_is_not_selected() {
+    fn removed_runtime_in_config_is_not_selected() {
         let dir = TempDir::new().unwrap();
-        write_agent_toml(
-            dir.path(),
-            "[runtime]\nprovider = \"gemini\"\nfallback = \"gemini\"\n",
-        );
-        let s = load_runtime_settings(dir.path());
-        assert!(ensure_active_agent_provider(dir.path()).is_err());
-        write_agent_toml(dir.path(), "[runtime]\nprovider = \" Gemini \"\n");
-        assert!(ensure_active_agent_provider(dir.path()).is_err());
-        assert_eq!(s.provider, RuntimeType::Claude);
-        assert_eq!(s.fallback, None);
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            for field in ["provider", "fallback"] {
+                for value in [removed.id.to_string(), format!(" {} ", removed.id.to_uppercase())] {
+                    write_agent_toml(dir.path(), &format!("[runtime]\n{field} = {value:?}\n"));
+                    let error = ensure_active_agent_provider(dir.path()).unwrap_err();
+                    assert!(error.contains(removed.removed_in), "{error}");
+                    assert!(error.contains(field), "{error}");
+                }
+            }
+            std::fs::write(dir.path().join("config.toml"),
+                format!("[runtime]\nutility_provider = {:?}\n", removed.id)).unwrap();
+            let error = ensure_active_utility_provider(dir.path()).unwrap_err();
+            assert!(error.contains(removed.removed_in), "{error}");
+        }
+    }
+
+    #[test]
+    fn resolved_config_cannot_hide_a_removed_source_provider() {
         let home = TempDir::new().unwrap();
-        std::fs::write(
-            home.path().join("config.toml"),
-            "[runtime]\nutility_provider = \"gemini\"\n",
-        )
-        .unwrap();
-        assert!(ensure_active_utility_provider(home.path()).is_err());
-        assert_eq!(global_utility_provider(home.path()), RuntimeType::Claude);
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+        std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+        std::fs::write(&resolved, "[runtime]\nprovider = \"codex\"\n").unwrap();
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            write_agent_toml(&agent, &format!("[runtime]\nprovider = {:?}\n", removed.id));
+            assert!(ensure_active_agent_provider(&agent).unwrap_err().contains(removed.removed_in));
+        }
+    }
+
+    #[test]
+    fn removed_team_runtime_cannot_degrade_to_a_solo_dispatch() {
+        let home = TempDir::new().unwrap();
+        let agent = home.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        write_agent_toml(&agent, "[runtime]\nprovider = \"codex\"\n");
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            write_global_config(home.path(), &format!(
+                "[team.roles.verifier]\nruntime = {:?}\n", removed.id));
+            let error = ensure_active_agent_provider(&agent).unwrap_err();
+            assert!(error.contains(removed.removed_in), "{error}");
+            assert!(error.contains("team.roles.verifier"), "{error}");
+        }
+        // A supported per-agent override repairs the inherited role.
+        write_agent_toml(&agent, "[runtime]\nprovider = \"codex\"\n[team.roles.verifier]\nruntime = \"grok\"\n");
+        assert!(ensure_active_agent_provider(&agent).is_ok());
     }
 
     #[test]
@@ -1369,10 +1426,10 @@ mod tests {
         // No config → Claude → None.
         assert_eq!(agent_uses_non_claude(dir.path()), None);
         // Explicit non-Claude → Some(provider).
-        write_agent_toml(dir.path(), "[runtime]\nprovider = \"antigravity\"\n");
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"grok\"\n");
         assert_eq!(
             agent_uses_non_claude(dir.path()),
-            Some(RuntimeType::Antigravity)
+            Some(RuntimeType::Grok)
         );
     }
 
@@ -1407,7 +1464,6 @@ mod tests {
         for (provider, expected_provider, expected_model) in [
             ("claude", RuntimeType::Claude, DEFAULT_UTILITY_MODEL),
             ("codex", RuntimeType::Codex, ""),
-            ("antigravity", RuntimeType::Antigravity, ""),
             ("grok", RuntimeType::Grok, ""),
             ("openai_compat", RuntimeType::OpenAiCompat, ""),
             ("nonsense", RuntimeType::Claude, DEFAULT_UTILITY_MODEL),
@@ -1431,13 +1487,13 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_global_config(
             home.path(),
-            "[runtime]\nutility_provider = \"antigravity\"\nutility_model = \"gemini-2.5-flash\"\n",
+            "[runtime]\nutility_provider = \"grok\"\nutility_model = \"grok-4.3\"\n",
         );
         assert_eq!(
             global_utility_provider(home.path()),
-            RuntimeType::Antigravity
+            RuntimeType::Grok
         );
-        assert_eq!(global_utility_model(home.path()), "gemini-2.5-flash");
+        assert_eq!(global_utility_model(home.path()), "grok-4.3");
     }
 
     #[test]
@@ -1451,10 +1507,10 @@ mod tests {
     fn resolve_utility_with_agent_dir_uses_agent_config() {
         let home = TempDir::new().unwrap();
         let agent = TempDir::new().unwrap();
-        // Global says Antigravity; agent says Codex — agent_dir present must win.
+        // Global says Grok; agent says Codex — agent_dir present must win.
         write_global_config(
             home.path(),
-            "[runtime]\nutility_provider = \"antigravity\"\n",
+            "[runtime]\nutility_provider = \"grok\"\n",
         );
         write_agent_toml(
             agent.path(),
@@ -1471,11 +1527,11 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_global_config(
             home.path(),
-            "[runtime]\nutility_provider = \"antigravity\"\nutility_model = \"gemini-2.5-flash\"\n",
+            "[runtime]\nutility_provider = \"grok\"\nutility_model = \"grok-4.3\"\n",
         );
         let spec = resolve_utility(home.path(), None);
-        assert_eq!(spec.provider, RuntimeType::Antigravity);
-        assert_eq!(spec.model, "gemini-2.5-flash");
+        assert_eq!(spec.provider, RuntimeType::Grok);
+        assert_eq!(spec.model, "grok-4.3");
     }
 
     #[test]
@@ -1560,7 +1616,6 @@ mod tests {
         // fallback, never a different family and never Claude.
         for (model, family) in [
             ("grok-4.5", Grok),
-            ("gemini-3.1-pro", Antigravity),
             ("gpt-5.4", Codex),
             ("xai/grok-4.5", Grok), // qualified provider/model form
         ] {
@@ -1669,7 +1724,6 @@ mod tests {
         assert!(!model_matches_provider("gpt-5", Claude));
         assert!(!model_matches_provider("gemini-3.1-pro", Claude));
         assert!(!model_matches_provider("claude-sonnet-4-6", Codex));
-        assert!(!model_matches_provider("gpt-5.4", Antigravity));
         // R4: grok models reject other providers; foreign models reject Grok.
         assert!(!model_matches_provider("grok-build-0.1", Claude));
         assert!(!model_matches_provider("claude-sonnet-4-6", Grok));
@@ -1678,7 +1732,6 @@ mod tests {
         // Correct pairings
         assert!(model_matches_provider("claude-haiku-4-5", Claude));
         assert!(model_matches_provider("gpt-5.4-mini", Codex));
-        assert!(model_matches_provider("gemini-3.5-flash", Antigravity));
         assert!(model_matches_provider("grok-build-0.1", Grok));
         assert!(model_matches_provider("grok-4", Grok));
         // Qualified form + unknown families + compat always pass
@@ -1864,28 +1917,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_agent_toml(dir.path(), "[runtime]\nprovider = \"codex\"\n");
         assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Codex);
-        write_agent_toml(dir.path(), "[runtime]\nprovider = \"antigravity\"\n");
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"grok\"\n");
         assert_eq!(
             agent_runtime_provider(dir.path()),
-            RuntimeType::Antigravity,
+            RuntimeType::Grok,
             "a live agent.toml edit must be visible on the next call"
         );
     }
 
-    /// Antigravity stays an active runtime for Gemini models.
+    /// A supported provider remains active without a deprecation notice.
     #[test]
-    fn antigravity_provider_is_not_deprecated() {
+    fn grok_provider_is_not_deprecated() {
         let root = TempDir::new().unwrap();
         let dir = root.path().join("sales-helper");
         std::fs::create_dir_all(&dir).unwrap();
         write_agent_toml(
             &dir,
-            "[runtime]\nprovider = \"antigravity\"\nfallback = \"antigravity\"\n",
+            "[runtime]\nprovider = \"grok\"\nfallback = \"grok\"\n",
         );
         CONSULTED_NOTICES.with(|n| n.borrow_mut().clear());
         let s = load_runtime_settings(&dir);
-        assert_eq!(s.provider, RuntimeType::Antigravity);
-        assert_eq!(s.fallback, Some(RuntimeType::Antigravity));
+        assert_eq!(s.provider, RuntimeType::Grok);
+        assert_eq!(s.fallback, Some(RuntimeType::Grok));
         let consulted = CONSULTED_NOTICES.with(|n| n.borrow().clone());
         assert!(consulted.is_empty());
     }

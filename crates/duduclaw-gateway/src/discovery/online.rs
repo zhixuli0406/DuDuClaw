@@ -680,7 +680,7 @@ pub async fn run_with_lease_and_identity(
         run_dir: run_dir.clone(), budget: budget.clone(), finished: false };
     store.attach_run_identity(&identity).map_err(|e| e.to_string())?;
     budget.bind_run(&home, &run_id)?;
-    // Aliases (`agy`) are recorded under the canonical family name.
+    // Aliases (`openai_compat`) are recorded under the canonical family name.
     let runtime = super::attempt_adapter::RuntimeFamily::parse(&spec.runtime).map(|family| family.name()).unwrap_or(spec.runtime.as_str());
     store.set_run_runtime(&run_id, runtime, &spec.model).map_err(|e| e.to_string())?;
     audit(

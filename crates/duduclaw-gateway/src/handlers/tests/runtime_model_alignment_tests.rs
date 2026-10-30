@@ -164,7 +164,7 @@ async fn same_value_update_repairs_runtime_but_nonadmin_alignment_is_atomic_refu
     );
 }
 #[test]
-fn final_alignment_never_guesses_unknown_family_or_invalid_provider_and_keeps_displayname_skip() {
+fn final_alignment_preserves_unknown_and_api_only_models_and_invalid_providers() {
     use crate::runtime_config::{align_model_runtime, testing::AvailabilityGuard};
     let _available = AvailabilityGuard::at("gemini-2.5-pro", true);
     for provider in [toml::Value::String("typo".into()), toml::Value::Integer(42)] {
@@ -182,13 +182,19 @@ fn final_alignment_never_guesses_unknown_family_or_invalid_provider_and_keeps_di
         );
         assert_eq!(t, before);
     }
-    let mut t = toml::toml! {[model] preferred="gemini-2.5-pro"};
-    let before = t.clone();
-    assert_eq!(
-        align_model_runtime(&mut t).unwrap().skipped_reason(),
-        Some("model_id_requires_display_name")
-    );
-    assert_eq!(t, before);
+    // Gemini remains an API model family, with no CLI to auto-select even
+    // when a test probe reports an installed binary. Unknown families also
+    // retain their explicit settings without guessing a runtime.
+    for model in ["gemini-2.5-pro", "custom-model"] {
+        let mut t = toml::toml! {[model] preferred="placeholder"};
+        t.get_mut("model").unwrap().as_table_mut().unwrap()
+            .insert("preferred".into(), toml::Value::String(model.into()));
+        let before = t.clone();
+        let alignment = align_model_runtime(&mut t).unwrap();
+        assert!(alignment.aligned_provider().is_none());
+        assert!(alignment.skipped_reason().is_none());
+        assert_eq!(t, before);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

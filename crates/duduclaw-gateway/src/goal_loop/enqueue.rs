@@ -357,7 +357,7 @@ pub(super) fn build_goal_payload(
     };
     // A1 (StateAct): the structured state block + the self-report
     // protocol instructions. Plain text, runtime-neutral — any CLI
-    // backend (Claude / Codex / Gemini / Antigravity / openai-compat)
+    // backend (Claude / Codex / Gemini / Grok / openai-compat)
     // reads this the same way, and the self-report marker is parsed by
     // `goal_state::parse_state_update` regardless of which runtime
     // produced it.

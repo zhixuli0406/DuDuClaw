@@ -34,9 +34,8 @@
 //!   `duduclaw-sandbox` native confinement, not this MAC.
 //! * **`.mcp.json` read surface** (WP22 T3): every write point that persists a
 //!   `DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN` pair to disk — per-agent
-//!   `.mcp.json`, and the codex/gemini/antigravity/grok equivalents under
-//!   `<agent_dir>/.codex/config.toml`, `.gemini/settings.json`,
-//!   `.gemini/antigravity-cli/settings.json`, `.grok/config.toml` — now sets
+//!   `.mcp.json`, and the codex/grok equivalents under
+//!   `<agent_dir>/.codex/config.toml`, `.grok/config.toml` — now sets
 //!   the file to 0600 (`duduclaw_core::platform::set_owner_only`), so a peer
 //!   agent's token pair is no longer world/group-readable off disk. That only
 //!   narrows the read surface to processes running as the same OS user — a
@@ -260,7 +259,7 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// matching `(DUDUCLAW_AGENT_TOKEN, tag)` pair.
 ///
 /// Single source of truth for every MCP env-assembly point (Claude `.mcp.json`,
-/// Codex `config.toml`, Gemini/Antigravity `settings.json`, Grok). Sibling of
+/// Codex `config.toml`, Grok). Sibling of
 /// [`crate::mcp_forward_env_vars`], which carries the *process-wide* forward set;
 /// this one is per-call because the identity is.
 ///

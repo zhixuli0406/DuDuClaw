@@ -270,7 +270,7 @@ pub(super) const IDENTITY_ENV_KEYS: [&str; 2] = [crate::ENV_AGENT_ID, crate::ide
 /// Top-level directories of an employee directory whose files a CLI loads
 /// as configuration at the next spawn — and can turn into executed commands
 /// (Claude Code: `.claude/` settings, hooks, slash commands, subagents and
-/// skills; the Codex, Gemini, Grok and Antigravity runtimes' own MCP and
+/// skills; the Codex and Grok runtimes' own MCP and
 /// settings files; `.cursor/`, whose `mcp.json` Grok loads by itself as a
 /// Cursor-compatibility MCP source, 2026-10-20). Frozen for agent and
 /// untrusted callers; DuDuClaw writes them itself, outside the hook.

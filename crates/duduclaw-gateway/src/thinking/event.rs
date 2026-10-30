@@ -80,7 +80,7 @@ pub struct ThinkingEvent {
     /// Set by the gate when raw reasoning was dropped because redaction is
     /// off (the viewer sees seconds and tokens and a hint to enable it).
     pub raw_needs_redaction: bool,
-    /// `claude_cli` | `anthropic_api` | `codex` | `agy` | `openai_compat` |
+    /// `claude_cli` | `anthropic_api` | `codex` | `openai_compat` |
     /// `direct_api`.
     pub source: &'static str,
 }

@@ -46,7 +46,7 @@
 //!   third-party, is callable in the lane; servers in the operator's own
 //!   `~/.codex/config.toml` may still be started by Codex but cannot be used.
 //! - **Refused inside the run** (fail closed, `explore_lane_unsupported`):
-//!   Gemini CLI, Antigravity, Grok and generic CLI `execute`
+//!   Grok and generic CLI `execute`
 //!   ([`refuse_unsupported_runtime`], reachable through failover); a MoA
 //!   model and `inference_mode = "local"` in `claude_runner`. The hybrid
 //!   local offload is skipped.
@@ -75,7 +75,7 @@ pub fn is_explore(raw: Option<&str>) -> bool {
 /// work in the explore lane.
 ///
 /// Claude (tool allowlist + gated MCP), Codex (`-s read-only` OS sandbox) and
-/// OpenAI-compatible (no built-in tools). Antigravity, Gemini CLI, Grok and
+/// OpenAI-compatible (no built-in tools). Grok and
 /// generic CLIs have no mechanism this gateway can show to be read-only and
 /// are refused.
 pub fn runtime_supported(provider: RuntimeType) -> bool {
@@ -211,7 +211,7 @@ mod tests {
         for r in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::OpenAiCompat] {
             assert!(runtime_supported(r), "{r:?}");
         }
-        for r in [RuntimeType::Antigravity, RuntimeType::Grok] {
+        for r in [RuntimeType::Grok] {
             assert!(!runtime_supported(r), "{r:?}");
         }
         let args = codex_sandbox_args();
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn sandboxed_or_antigravity_employee_is_refused() {
+    fn sandboxed_or_grok_employee_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("agents").join("a");
         std::fs::create_dir_all(&a).unwrap();
@@ -234,7 +234,7 @@ mod tests {
         assert!(dispatch_refusal(dir.path(), "a").is_some());
         std::fs::write(
             a.join("agent.toml"),
-            "[agent]\nname = \"a\"\n[runtime]\nprovider = \"antigravity\"\n",
+            "[agent]\nname = \"a\"\n[runtime]\nprovider = \"grok\"\n",
         )
         .unwrap();
         assert!(dispatch_refusal(dir.path(), "a")
@@ -253,7 +253,7 @@ mod tests {
         let caps = CapabilitiesConfig::default();
         assert!(claude_tools(&caps).is_none());
         assert!(lane_env().is_none());
-        assert!(refuse_unsupported_runtime("antigravity").is_ok());
+        assert!(refuse_unsupported_runtime("grok").is_ok());
         EXPLORE
             .scope(true, async {
                 let (tools, allowed) = claude_tools(&caps).unwrap();
@@ -267,7 +267,7 @@ mod tests {
                     lane_env(),
                     Some(("DUDUCLAW_LANE".to_string(), "explore".to_string()))
                 );
-                assert!(refuse_unsupported_runtime("antigravity").is_err());
+                assert!(refuse_unsupported_runtime("grok").is_err());
                 // An explicit allowlist only narrows: Bash and other servers drop out.
                 let mut narrow = CapabilitiesConfig::default();
                 narrow.allowed_tools = vec!["Bash".into(), "Read".into(), "mcp__notion__*".into()];

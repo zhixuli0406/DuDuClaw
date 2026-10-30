@@ -551,7 +551,7 @@ pub(super) fn scaffold_with(
 // ---------------------------------------------------------------------------
 
 /// Validate a role's `(runtime, model)` pair and return the **canonical**
-/// runtime id (so an alias like `agy` is written as `antigravity`).
+/// runtime id (so accepted aliases are written canonically).
 ///
 /// The same two rules [`duduclaw_core::types::validate_team`] applies, on the
 /// same catalog data, because the composer may build a spec from a source that
@@ -567,7 +567,7 @@ pub(super) fn scaffold_with(
 /// 2. `model`'s family must be one this runtime actually serves, checked
 ///    against the runtime's own `model_prefixes` (not
 ///    `runtime_for_model(model).id == runtime.id`: provider families can be
-///    served by more than one runtime, and Antigravity accepts Gemini models.
+///    served by more than one runtime.
 ///    An unknown family is an error, never a guess (goose#10731).
 pub(super) fn validate_role_runtime_model(
     role: Role,
@@ -575,6 +575,9 @@ pub(super) fn validate_role_runtime_model(
     model: &str,
 ) -> Result<&'static str, String> {
     let runtime_raw = runtime.trim();
+    if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(runtime_raw) {
+        return Err(removed.refusal(&format!("[team.roles.{role}] runtime")));
+    }
     let model_raw = model.trim();
     if model_raw.is_empty() {
         return Err(format!("role '{role}' must declare a model"));

@@ -176,10 +176,21 @@ pub(crate) fn parse_reply(raw: &str) -> Result<(Verdict, String, Vec<Reason>), S
     Ok((verdict, summary, reasons))
 }
 
+/// Removed review runtimes cannot degrade to the deployment's utility vendor.
+fn ensure_active_review_provider(cfg: &AgentFilesConfig) -> Result<(), String> {
+    if let Some(removed) = cfg.review_provider.as_deref()
+        .and_then(duduclaw_core::runtime_catalog::removed_runtime)
+    {
+        return Err(removed.refusal("config.toml [agent_files] review_provider"));
+    }
+    Ok(())
+}
+
 #[cfg_attr(test, allow(dead_code))]
 /// The utility hint: the review model override (degraded with a log line
 /// when it cannot be honoured) plus the reply schema.
-async fn hint(home: &Path, cfg: &AgentFilesConfig) -> crate::runtime_dispatch::UtilityModelHint {
+async fn hint(home: &Path, cfg: &AgentFilesConfig) -> Result<crate::runtime_dispatch::UtilityModelHint, String> {
+    ensure_active_review_provider(cfg)?;
     let mut h = crate::runtime_dispatch::UtilityModelHint {
         provider: cfg.review_provider.as_deref().and_then(duduclaw_core::types::RuntimeType::parse),
         model: cfg.review_model.clone(),
@@ -195,18 +206,18 @@ async fn hint(home: &Path, cfg: &AgentFilesConfig) -> crate::runtime_dispatch::U
         h.model = None;
     }
     h.output_schema = Some(review_output_schema());
-    h
+    Ok(h)
 }
 
 async fn call_model(home: &Path, prompt: &str, cfg: &AgentFilesConfig) -> Result<String, String> {
+    ensure_active_review_provider(cfg)?;
     #[cfg(test)]
     {
-        let _ = cfg;
         return test_seam::call(home, prompt);
     }
     #[cfg(not(test))]
     {
-        let h = hint(home, cfg).await;
+        let h = hint(home, cfg).await?;
         let fut = crate::runtime_dispatch::run_utility_prompt_with_hint(home, None, REVIEW_CALLER, SYSTEM_PROMPT, prompt, 1024, Some(&h));
         match tokio::time::timeout(TIMEOUT, fut).await {
             Ok(r) => r,
@@ -232,8 +243,11 @@ pub(crate) async fn review(input: &ReviewInput<'_>, cfg: &AgentFilesConfig) -> A
             ),
         );
         tracing::warn!(agent = input.agent_id, file = input.key.as_str(), kind, detail = %duduclaw_core::truncate_chars(detail, 300), "agent file review failed");
-        AiOutcome::Failed(kind.to_string())
+        AiOutcome::Failed(if kind == "removed_runtime" { detail.to_string() } else { kind.to_string() })
     };
+    if let Err(detail) = ensure_active_review_provider(cfg) {
+        return failed("removed_runtime", &detail);
+    }
     let key = super::quota::cache_key(input.home, input.agent_id, input.key.as_str(), input.old, input.new);
     if let Some(c) = super::quota::cached(&key) {
         return AiOutcome::Done { verdict: c.verdict, summary: c.summary, reasons: c.reasons, partial: c.partial };
@@ -298,6 +312,35 @@ pub(crate) mod test_seam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn removed_review_providers_never_probe_call_or_reuse_a_cached_pass() {
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            let home = tempfile::tempdir().unwrap();
+            test_seam::set(home.path(), |_| Ok(
+                r#"{"verdict":"pass","summary_zh":"ok","findings":[]}"#.into()));
+            let input = ReviewInput {
+                home: home.path(), user_id: "user", agent_id: "agent",
+                display_name: "Agent", role: "reviewer", department: "",
+                key: &FileKey::Soul, old: "before", new: "after",
+                must_not: &[], must_always: &[], flagged: &[],
+            };
+            let mut cfg = AgentFilesConfig::default();
+            assert!(matches!(review(&input, &cfg).await, AiOutcome::Done { verdict: Verdict::Pass, .. }));
+            assert_eq!(test_seam::calls(home.path()), 1);
+            cfg.review_provider = Some(format!(" {} ", removed.id.to_uppercase()));
+            // hint returns before probing runtime availability; the model call seam is also unreachable.
+            let error = hint(home.path(), &cfg).await.unwrap_err();
+            assert!(error.contains(removed.display_name) && error.contains(removed.removed_in), "{error}");
+            assert_eq!(call_model(home.path(), "never sent", &cfg).await.unwrap_err(), error);
+            let AiOutcome::Failed(detail) = review(&input, &cfg).await else {
+                panic!("a cached pass must not bypass removed runtime validation");
+            };
+            assert_eq!(detail, error);
+            assert!(detail.contains("choose a supported runtime and model"));
+            assert_eq!(test_seam::calls(home.path()), 1);
+        }
+    }
 
     #[test]
     fn strict_reply_parsing() {

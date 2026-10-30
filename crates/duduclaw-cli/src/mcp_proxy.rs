@@ -90,7 +90,7 @@ pub const PROXY_UPSTREAM_ENV_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV";
 pub const PROXY_UPSTREAM_ENV_FILE_VAR: &str = "DUDUCLAW_MCP_PROXY_ENV_FILE";
 
 /// Env var naming the per-spawn directory a `--spawn-scoped` proxy reads its
-/// upstream env from (Grok, Antigravity; 2026-10-20). See
+/// upstream env from (Grok; 2026-10-20). See
 /// [`crate::mcp_proxy_spawn_env`].
 pub use crate::mcp_proxy_spawn_env::PROXY_UPSTREAM_ENV_DIR_VAR;
 
@@ -829,7 +829,7 @@ pub fn scoped_inherited_env() -> Vec<(String, String)> {
 }
 
 /// [`run_mcp_proxy`] for an entry that may be `spawn_scoped` (written into a
-/// persistent CLI config by the Grok and Antigravity runtimes): its upstream
+/// persistent CLI config by the Grok runtime): its upstream
 /// env comes only from the per-spawn directory, and without one the proxy
 /// refuses before starting anything ([`crate::mcp_proxy_spawn_env`]).
 pub async fn run_mcp_proxy_scoped(
@@ -919,7 +919,7 @@ pub async fn run_mcp_proxy_scoped(
             server,
         ),
     };
-    // A spawn-scoped proxy runs under a CLI (Grok, Antigravity) that hands
+    // A spawn-scoped proxy runs under a CLI (Grok) that hands
     // its MCP children its own environment, vendor keys included
     // (`XAI_API_KEY`, `GEMINI_API_KEY`). Its upstream starts from the
     // agent-CLI allowlist instead (PATH, HOME, locale, proxy, temp dir; never

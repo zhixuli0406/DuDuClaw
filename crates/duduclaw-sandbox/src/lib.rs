@@ -3,7 +3,7 @@
 //! DuDuClaw already ships a *container*-based sandbox (`duduclaw-container`).
 //! This crate is the complementary **in-process OS floor**: it takes a
 //! [`std::process::Command`] that is about to spawn an agent CLI (codex / gemini
-//! / antigravity / claude) and confines the resulting child process with a
+//! / claude) and confines the resulting child process with a
 //! native OS primitive — **macOS Seatbelt** (`sandbox-exec` + SBPL profile) and
 //! **Linux Landlock** (`landlock` LSM, applied post-`fork` via `pre_exec`) — so
 //! the child cannot write outside its workspace *without needing any container

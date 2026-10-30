@@ -608,10 +608,6 @@ mod tests {
         let cases = [
             ("claude", "npm install -g @anthropic-ai/claude-code"),
             ("codex", "npm install -g @openai/codex"),
-            (
-                "antigravity",
-                "curl -fsSL https://antigravity.google/cli/install.sh | bash",
-            ),
             ("grok", "curl -fsSL https://x.ai/cli/install.sh | bash"),
             // WP-B additions (2026-09), sources cited in each catalog entry.
             ("qwen", "npm install -g @qwen-code/qwen-code"),
@@ -630,16 +626,11 @@ mod tests {
                 "{provider} docs url"
             );
         }
-        assert!(spec_for("gemini").is_none(), "removed Gemini CLI must not be installable");
+        for removed in ["gemini", "antigravity", "agy"] {
+            assert!(spec_for(removed).is_none(), "removed runtime must not be installable: {removed}");
+        }
     }
 
-    #[test]
-    fn agy_is_an_alias_for_antigravity() {
-        let a = spec_for("agy").expect("agy alias");
-        let b = spec_for("antigravity").expect("antigravity");
-        assert_eq!(a.id, b.id);
-        assert_eq!(a.binary, "agy");
-    }
 
     /// Every catalog runtime with a binary must be installable-or-explainable.
     /// The failure this prevents: a new runtime that `runtime.detect` reports
@@ -765,7 +756,7 @@ mod tests {
         let huge_padded = format!("   {huge}   ");
         assert!(spec_for(&huge_padded).is_none());
         // The longest legitimate name is comfortably inside the gate.
-        assert!(spec_for("antigravity").is_some());
+        assert!(spec_for("opencode").is_some());
     }
 
     #[test]
@@ -818,7 +809,7 @@ mod tests {
 
     #[test]
     fn posix_script_channels_decline_on_windows_only() {
-        let spec = spec_for("antigravity").unwrap();
+        let spec = spec_for("cursor").unwrap();
         assert!(auto_installable(spec, false));
         assert!(!auto_installable(spec, true));
         assert_eq!(decline_reason(spec, false), None);

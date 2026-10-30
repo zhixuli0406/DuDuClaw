@@ -274,7 +274,6 @@ mod tests {
         for (provider, url) in [
             ("codex", sr::OPENAI_SIWC_TERMS_URL),
             ("gemini", sr::GEMINI_CLI_TERMS_URL),
-            ("antigravity", sr::ANTIGRAVITY_TERMS_URL),
             ("grok", sr::XAI_TERMS_URL),
         ] {
             let WsFrame::Response { error: Some(err), .. } = refusal_frame(provider) else {

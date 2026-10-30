@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 
 fn selected(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
@@ -16,14 +16,16 @@ fn restricted_tools_and_selected_credentials_are_not_ambient() {
 #[test]
 fn every_family_parses_with_aliases_and_unknown_names_are_refused() {
     for (name, family, provider) in [("claude",RuntimeFamily::Claude,"anthropic"),("codex",RuntimeFamily::Codex,"openai"),
-("antigravity",RuntimeFamily::Antigravity,"gemini"),("agy",RuntimeFamily::Antigravity,"gemini"),
         ("grok",RuntimeFamily::Grok,"xai"),("openai-compat",RuntimeFamily::OpenAiCompat,"openai"),("openai_compat",RuntimeFamily::OpenAiCompat,"openai")] {
         let parsed=RuntimeFamily::parse(name).unwrap();
         assert_eq!(parsed,family);assert_eq!(parsed.provider(),provider);
         assert_eq!(RuntimeFamily::parse(parsed.name()).unwrap(),family,"canonical name round-trips");
     }
     assert!(matches!(RuntimeFamily::parse("Grok"),Err(AttemptInfraError::RuntimeUnsupported(_))));
-    assert!(matches!(RuntimeFamily::parse("gemini"),Err(AttemptInfraError::RuntimeUnsupported(_))));
+    for removed in ["gemini", "antigravity", "agy"] {
+        let error = RuntimeFamily::parse(removed).unwrap_err().to_string();
+        assert!(error.contains("removed") && error.contains("choose a supported runtime"), "{error}");
+    }
     assert!(matches!(RuntimeFamily::parse("cursor"),Err(AttemptInfraError::RuntimeUnsupported(_))));
 }
 
@@ -45,9 +47,6 @@ fn argv_is_pinned_per_family() {
         "--disallowed-tools","todo_write,monitor,search_tool,use_tool,workflow,enter_plan_mode,exit_plan_mode,ask_user_question,send_feedback,image_gen,image_edit,image_to_video,reference_to_video,spawn_subagent,scheduler_create,scheduler_delete,scheduler_list,kill_command_or_subagent,get_command_or_subagent_output",
         "--disable-web-search","--no-subagents","--no-plan","--no-auto-update"].map(String::from));
     assert!(!grok.iter().any(|a|a=="--trust"),"workspace hooks must not load");
-    let agy=RuntimeFamily::Antigravity.argv("gemini-3.8-flash",4,node);
-    assert_eq!(agy,["--print","","--input-format","stream-json","--output-format","stream-json",
-        "--dangerously-skip-permissions","--disable-slash-commands","--model","gemini-3.8-flash"].map(String::from));
     assert!(RuntimeFamily::Claude.argv("m",2,node).contains(&"--safe-mode".into()));
 }
 
@@ -55,56 +54,22 @@ fn argv_is_pinned_per_family() {
 fn stdin_and_runtime_files_per_family() {
     let prompt="讀 solution.py \"quoted\"\nnext";
     assert!(stdin_payload(RuntimeFamily::Grok,prompt).is_empty());
-    let line=stdin_payload(RuntimeFamily::Antigravity,prompt);
-    assert_eq!(line.last(),Some(&b'\n'));assert_eq!(line.iter().filter(|b|**b==b'\n').count(),1,"exactly one JSON line");
-    let parsed:Value=serde_json::from_slice(&line).unwrap();
-    assert_eq!(parsed,json!({"event":"user","message":{"content":prompt}}));
     for family in [RuntimeFamily::Claude,RuntimeFamily::Codex,RuntimeFamily::OpenAiCompat] {
         assert_eq!(stdin_payload(family,prompt),prompt.as_bytes());
         assert!(runtime_files(family,Path::new("/w"),1,prompt).is_empty());
     }
     assert_eq!(runtime_files(RuntimeFamily::Grok,Path::new("/w"),1,prompt),vec![("prompt.txt".to_string(),prompt.as_bytes().to_vec())]);
-    let files=runtime_files(RuntimeFamily::Antigravity,Path::new("/runs/r/ws"),1,prompt).into_iter().collect::<BTreeMap<_,_>>();
-    assert_eq!(files.keys().map(String::as_str).collect::<Vec<_>>(),["agy_tool_guard.py","home-seed/.gemini/antigravity-cli/settings.json","home-seed/.gemini/config/hooks.json"]);
-    let settings:Value=serde_json::from_slice(&files["home-seed/.gemini/antigravity-cli/settings.json"]).unwrap();
-    assert_eq!(settings,json!({"modelProvider":"gemini","trustedWorkspaces":["/runs/r/ws"]}));
-    let hooks:Value=serde_json::from_slice(&files["home-seed/.gemini/config/hooks.json"]).unwrap();
-    assert_eq!(hooks["dudu-tool-surface"]["PreToolUse"][0]["matcher"],"*");
-    assert_eq!(hooks["dudu-tool-surface"]["PreToolUse"][0]["hooks"][0]["command"],"python3 -I -S -B /dudu-runtime/agy_tool_guard.py");
-    let script=String::from_utf8(files["agy_tool_guard.py"].clone()).unwrap();
-    assert!(!script.contains("__DUDU_ALLOWED_TOOLS_JSON__"));
-    assert!(script.contains(&json!(super::super::attempt_guard::ANTIGRAVITY_TOOLS).to_string()),"allowlist rendered from the guard constant");
 }
 
-#[cfg(unix)]
-#[test]
-fn agy_hook_script_allows_only_the_allowlist_and_fails_closed() {
-    use std::io::Write;
-    let dir=tempfile::tempdir().unwrap();
-    let script=dir.path().join("guard.py");std::fs::write(&script,agy_guard_script()).unwrap();
-    let broken=dir.path().join("broken.py");std::fs::write(&broken,AGY_GUARD_TEMPLATE).unwrap();
-    let decide=|path:&Path,input:&str|->String {
-        let mut child=std::process::Command::new("python3").args(["-I","-S","-B"]).arg(path)
-            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
-        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
-        let out=child.wait_with_output().unwrap();
-        serde_json::from_slice::<Value>(&out.stdout).unwrap()["decision"].as_str().unwrap().to_owned()
-    };
-    assert_eq!(decide(&script,r#"{"toolCall":{"name":"run_command","args":{}},"modelName":"m"}"#),"allow");
-    for input in [r#"{"toolCall":{"name":"search_web"}}"#,r#"{"toolCall":{"name":["run_command"]}}"#,"not json","",r#"{"toolCall":null}"#] {
-        assert_eq!(decide(&script,input),"deny","{input}");
-    }
-    assert_eq!(decide(&broken,r#"{"toolCall":{"name":"run_command"}}"#),"deny","an unrendered allowlist denies");
-}
 
 #[test]
 fn credentials_do_not_cross_families_and_codex_gets_both_key_names() {
     let all=selected(&[("OPENAI_API_KEY","o"),("ANTHROPIC_API_KEY","a"),("CLAUDE_CODE_OAUTH_TOKEN","t"),("GEMINI_API_KEY","g"),
         ("GOOGLE_API_KEY","gg"),("XAI_API_KEY","x"),("CODEX_API_KEY","ambient"),("GROK_HOME","/host/.grok")]);
     let secrets=["OPENAI_API_KEY","CODEX_API_KEY","ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN","GEMINI_API_KEY","GOOGLE_API_KEY","XAI_API_KEY"];
-    let expect:[(RuntimeFamily,&[&str]);5]=[(RuntimeFamily::Claude,&["ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN"]),
+    let expect:[(RuntimeFamily,&[&str]);4]=[(RuntimeFamily::Claude,&["ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN"]),
         (RuntimeFamily::Codex,&["CODEX_API_KEY","OPENAI_API_KEY"]),
-        (RuntimeFamily::Antigravity,&["GEMINI_API_KEY","GOOGLE_API_KEY"]),(RuntimeFamily::Grok,&["XAI_API_KEY"]),(RuntimeFamily::OpenAiCompat,&["OPENAI_API_KEY"])];
+        (RuntimeFamily::Grok,&["XAI_API_KEY"]),(RuntimeFamily::OpenAiCompat,&["OPENAI_API_KEY"])];
     for (family,keys) in expect {
         let env=environment(family,&all);
         let present=secrets.iter().copied().filter(|k|env.contains_key(*k)).collect::<BTreeSet<_>>();
@@ -126,7 +91,7 @@ fn credential_document_is_validated_and_only_for_codex_and_grok() {
     let line=credential_document(RuntimeFamily::Codex,Some(doc)).unwrap().unwrap();
     assert!(!line.contains('\n'));assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["auth_mode"],"chatgpt");
     assert!(credential_document(RuntimeFamily::Grok,Some(doc)).unwrap().is_some());
-    for family in [RuntimeFamily::Claude,RuntimeFamily::Antigravity,RuntimeFamily::OpenAiCompat] {
+    for family in [RuntimeFamily::Claude,RuntimeFamily::OpenAiCompat] {
         assert_eq!(credential_document(family,Some(doc)),Ok(None));assert_eq!(credential_destination(family),None);
         assert!(!has_credentials(family,&BTreeMap::new(),Some(&line)),"a document is not a credential for {family:?}");
     }
@@ -162,71 +127,8 @@ fn contradictory_codex_cache_usage_is_unknown_instead_of_fabricated() {
     assert_eq!(super::super::agent_spawn::call_cost("gpt-5.4",&summary).source,super::super::tree::CostSource::Unknown);
 }
 
-fn agy_step(index:u64,state:&str,step_type:&str,extra:Value)->Value {
-    let mut step=json!({"conversation_id":"c","step_index":index,"state":state,"step_type":step_type});
-    for (k,v) in extra.as_object().unwrap() { step[k]=v.clone(); }
-    json!({"event":"step_update","step_update":step})
-}
-fn agy_usage(input:u64,output:u64,cache:u64)->Value { json!({"usage":{"input_tokens":input,"output_tokens":output,"thinking_tokens":1,"cache_read_tokens":cache,"total_tokens":input+output}}) }
-fn transcript(family:RuntimeFamily,adapter:&mut StreamAdapter,events:Vec<Value>)->String {
-    events.into_iter().map(|e|adapter.normalize(family,e).to_string()+"\n").collect()
-}
 
-#[test]
-fn antigravity_steps_sum_usage_and_the_result_event_is_authoritative() {
-    // Minimised from runtime-parity/spot/agy.ndjson (agy 1.2.14): the final
-    // result usage equals the per-step sum.
-    let events=vec![json!({"event":"init","conversation_id":"c","init":{"cwd":"/w","tools":["run_command"],"model":"gemini-3.8-flash-high","permission_mode":"always-proceed"}}),
-        agy_step(0,"DONE","user_input",json!({})),agy_step(1,"DONE","agent_response",agy_usage(12875,1166,0)),
-        agy_step(2,"ACTIVE","tool",json!({"tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls"}}})),
-        agy_step(2,"DONE","tool",json!({"tool_name":"run_command"})),
-        agy_step(3,"ACTIVE","agent_response",json!({"text_delta":"DONE"})),
-        agy_step(3,"DONE","agent_response",{let mut u=agy_usage(2472,137,20326);u["text_delta"]=json!("\n");u}),
-        agy_step(3,"DONE","agent_response",agy_usage(2472,137,20326)),
-        json!({"event":"result","result":{"status":"SUCCESS","response":"DONE\n","num_turns":1,"usage":{"input_tokens":15347,"output_tokens":1303,"thinking_tokens":2,"cache_read_tokens":20326,"total_tokens":16650}}})];
-    let mut adapter=StreamAdapter::default();
-    let text=transcript(RuntimeFamily::Antigravity,&mut adapter,events);
-    let lines=text.lines().map(|l|serde_json::from_str::<Value>(l).unwrap()).collect::<Vec<_>>();
-    assert_eq!(lines[2]["message"]["id"],"step-1");assert_eq!(lines[2]["message"]["usage"]["input_tokens"],12875);
-    assert_eq!(lines[2]["message"]["model"],"gemini-3.8-flash-high");
-    assert_eq!(lines[3]["message"]["content"][0],json!({"type":"tool_use","name":"run_command"}));
-    assert_eq!(lines[6]["message"]["content"][0]["text"],"DONE\n");assert_eq!(lines[6]["message"]["usage"]["cache_read_input_tokens"],20326);
-    assert_eq!(lines[7]["type"],"system","a repeated DONE is not counted twice");
-    let summary=super::super::agent_spawn::parse_stream(&text);
-    assert!(summary.complete);assert_eq!(summary.final_text.as_deref(),Some("DONE\n"));
-    let usage=summary.usage.unwrap();assert_eq!((usage.input_tokens,usage.output_tokens,usage.cache_read_tokens),(15347,1303,20326));
-    assert_eq!(summary.model.as_deref(),Some("gemini-3.8-flash-high"));
-    assert_eq!(adapter.observed_model(),Some("gemini-3.8-flash-high"));
-    let synthetic=adapter.synthetic_result();
-    assert_eq!(synthetic["usage"],json!({"input_tokens":15347,"output_tokens":1303,"cache_read_input_tokens":20326}));
-}
 
-#[test]
-fn antigravity_step_limit_synthetic_result_and_error_paths() {
-    let mut adapter=StreamAdapter::default();
-    let mut text=transcript(RuntimeFamily::Antigravity,&mut adapter,vec![
-        json!({"event":"init","init":{"cwd":"/w","tools":[]}}),
-        agy_step(1,"DONE","agent_response",agy_usage(100,10,5)),
-        agy_step(2,"ACTIVE","tool",json!({"tool_name":"view_file"})),
-        agy_step(3,"ACTIVE","agent_response",json!({"text_delta":"partial"})),
-        agy_step(3,"DONE","agent_response",agy_usage(200,20,0))]);
-    text.push_str(&adapter.synthetic_result().to_string());text.push('\n');
-    let summary=super::super::agent_spawn::parse_stream(&text);
-    assert!(summary.complete);assert_eq!(summary.final_text.as_deref(),Some("partial"));
-    let usage=summary.usage.unwrap();assert_eq!((usage.input_tokens,usage.output_tokens,usage.cache_read_tokens),(300,30,5));
-    assert!(summary.model.is_none(),"no init.model, no invented model");
-    // A generation without usage makes the synthetic total unknown.
-    let mut partial=StreamAdapter::default();
-    transcript(RuntimeFamily::Antigravity,&mut partial,vec![agy_step(1,"DONE","agent_response",agy_usage(1,1,0)),agy_step(3,"DONE","agent_response",json!({}))]);
-    assert!(partial.synthetic_result()["usage"].is_null());
-    assert!(StreamAdapter::default().synthetic_result()["usage"].is_null());
-    // Fake-key container probe: error_message step, then result status ERROR.
-    let mut failed=StreamAdapter::default();
-    let error=failed.normalize(RuntimeFamily::Antigravity,agy_step(1,"DONE","error_message",json!({"error":"API key not valid"})));
-    assert_eq!(error["type"],"error");assert!(error["message"].get("conversation_id").is_none());
-    let result=failed.normalize(RuntimeFamily::Antigravity,json!({"event":"result","result":{"status":"ERROR","response":"","error":"agent executor error: API key not valid."}}));
-    assert_eq!(result["is_error"],true);assert!(result["usage"].is_null());
-}
 
 #[test]
 fn grok_model_is_adopted_only_when_well_formed() {

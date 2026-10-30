@@ -111,12 +111,6 @@ async fn real_grok_fake_key_is_an_authentication_error() {
 
 #[tokio::test]
 #[ignore = "requires Docker and DUDU_TASK_SANDBOX_IMAGE"]
-async fn real_antigravity_fake_key_is_an_authentication_error() {
-    fake_key_run(RuntimeType::Antigravity, "gemini", concat!("AI", "zaFAKEdudutasksandbox00000000000000000"), "Gemini 3.8 Flash (Low)").await;
-}
-
-#[tokio::test]
-#[ignore = "requires Docker and DUDU_TASK_SANDBOX_IMAGE"]
 async fn real_agent_dir_is_read_only_and_nothing_is_left() {
     let agent = format!("rt-probe-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let h = home(&agent);
