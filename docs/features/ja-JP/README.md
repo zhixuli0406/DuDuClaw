@@ -14,13 +14,13 @@
 | 3 | [信頼度ルーターとローカル推論エンジン](03-confidence-router.md) | スマートなモデル選択でAPI費用80%以上削減 |
 | 4 | [ファイルベースIPCメッセージバス](04-file-based-ipc.md) | 構造化エージェント間委任 + TaskSpecワークフロー |
 | 5 | [セキュリティ防御](05-security-defense.md) | 稼働中の4つのガード、どこで動くか、どれもカバーしないもの |
-| 7 | [マルチアカウントローテーションとクロスプロバイダーフェイルオーバー](07-account-rotation.md) | Claude/Codex/Antigravity横断の認証情報スケジューリング |
+| 7 | [マルチアカウントローテーションとクロスプロバイダーフェイルオーバー](07-account-rotation.md) | Claude/Codex横断の認証情報スケジューリング |
 | 8 | [ブラウザ自動化と Computer Use](08-browser-automation.md) | エージェントが選ぶ取得ツール 2 つと任意のブラウザサーバー、8 つの `computer_*` MCP ツールで駆動する Computer Use セッション。自動ルーターなし |
 | 9 | [行動規約とレッドチームテスト](09-behavioral-contracts.md) | 機械的に強制可能なエージェント行動境界 |
 | 10 | [認知メモリシステム](10-cognitive-memory.md) | 忘却曲線を備えた人間型記憶 |
 | 11 | [プロンプト予算の強制](11-token-compression.md) | 見積もり、3段階、それでも駄目なら拒否 |
 | 12 | [業種テンプレートとOdoo ERP連携](12-industry-templates.md) | すぐに使えるビジネスインテリジェンス |
-| 13 | [マルチランタイムエージェント実行](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI互換など複数バックエンドを統一（Gemini CLI は削除済み） |
+| 13 | [マルチランタイムエージェント実行](13-multi-runtime.md) | Claude / Codex / Grok / OpenAI互換など複数バックエンドを統一（Gemini CLI は削除済み） |
 | 14 | [音声パイプライン](14-voice-pipeline.md) | 別々に配線された2つの STT/TTS 経路：fail-closed な HTTP と、ハードコードされた Telegram ハンドラ |
 | 15 | [スキルライフサイクルエンジン](15-skill-lifecycle.md) | 6段階の自動スキル抽出・管理 |
 | 16 | [セッションメモリスタック](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |

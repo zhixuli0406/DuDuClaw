@@ -35,7 +35,7 @@ use super::{is_safe_config_key_segment, is_secret_env_name, toml_string_literal}
 
 // The runtime-agnostic half (gated extraction, the spawn-time gate, the
 // env-file directory and its sweep) moved to `runtime/third_party_mcp.rs`
-// on 2026-10-20 so Grok, Antigravity and the tool loop share it; Codex
+// on 2026-10-20 so Grok and the tool loop share it; Codex
 // behaviour is unchanged.
 #[cfg(test)]
 use crate::runtime::third_party_mcp::env_files::{

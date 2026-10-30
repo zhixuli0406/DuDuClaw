@@ -50,7 +50,7 @@ body:
         - Standalone MCP server (duduclaw mcp init / mcp-server)
         - Gateway / dashboard
         - A chat channel (Telegram, LINE, Discord, Slack, ...)
-        - AI runtime (Claude Code, Codex, Antigravity, Grok, OpenAI-compatible)
+        - AI runtime (Claude Code, Codex, Grok, OpenAI-compatible)
         - Memory or wiki
         - Goals, tasks or approvals
         - Install or update

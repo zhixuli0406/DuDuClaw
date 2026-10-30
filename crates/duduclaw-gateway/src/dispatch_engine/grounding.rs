@@ -17,7 +17,7 @@ use super::*;
 // the MCP dispatch layer in `duduclaw-cli/src/mcp.rs`
 // (`append_tool_call_with_input`), which sits BELOW the runtime abstraction:
 // every runtime that calls a DuDuClaw MCP tool — Claude, Codex, Gemini,
-// Antigravity, or an openai-compat backend — produces an identical
+// Grok, or an openai-compat backend — produces an identical
 // `tool_calls.jsonl` row regardless of which CLI drove the call. No
 // per-runtime branching is needed here; a runtime is transparently exactly
 // as "seen" as its MCP tool usage.

@@ -279,7 +279,7 @@ pub fn prepare_with_files(home:&Path, request:&AttemptRequest, settings:&Attempt
         "--cap-drop","ALL","--security-opt","no-new-privileges:true","--tmpfs",
         // `exec`: Docker defaults --tmpfs to noexec, but HOME/TMPDIR live here
         // and CLIs extract helper binaries into them (grok tools, Bun native
-        // modules, agy). The node bind mount is already exec-capable, so this
+        // modules). The node bind mount is already exec-capable, so this
         // grants nothing new; nosuid,nodev stay.
         &format!("/tmp:rw,exec,nosuid,nodev,size={},mode=1777",settings.tmp_bytes),"--workdir",&safe_mount(&node)?]);
     for label in super::maintenance::scope_labels(&home,&request.run_id,role).map_err(failure)? { create.args(["--label",&label]); }

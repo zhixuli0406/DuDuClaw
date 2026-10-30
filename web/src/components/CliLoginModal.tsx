@@ -42,14 +42,13 @@ function stripAnsi(s: string): string {
 }
 /* eslint-enable no-control-regex */
 
-export type LoginRuntime = 'claude' | 'codex' | 'antigravity' | 'grok'
+export type LoginRuntime = 'claude' | 'codex' | 'grok'
   | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode';
 
 /** Product names — verbatim. Grok's subscription qualifier is appended from i18n. */
 const RUNTIME_LABELS: Record<LoginRuntime, string> = {
   claude: 'Claude',
   codex: 'Codex',
-  antigravity: 'Antigravity (agy)',
   grok: 'Grok',
   kimi: 'Kimi Code',
   copilot: 'GitHub Copilot',

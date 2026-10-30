@@ -92,7 +92,7 @@ Hook は元の引数を `/api/internal/egress-guard/hook-check` に送り、gate
 
 `ask`／`block` では捕捉できる hook エラーと panic は exit 2、インストール失敗はアカウント／runtime を切り替えず起動を停止します。`shadow` は警告して続行します。Claude の強制モードは `--setting-sources "" --settings <file>` で身分の `.claude/settings.json` だけを読み、他の project/local/user 設定を併合しません。cwd が別でも同じです。強制モードでは hook を省略する `cli_bare_mode` を拒否します。Grok は `--disable-web-search` を追加します。強制モードでは共有・借用 cwd や他スタッフの guard が残った hook ディレクトリを拒否します。独立したスタッフディレクトリ、または Claude/Codex を使用してください。
 
-Codex の強制モードは `-c sandbox_workspace_write.network_access=false -c web_search="disabled"` を追加し、FullAccess を WorkspaceWrite に制限します。ReadOnly と MCP 自動承認器は保持します。個別コマンドの承認ではなく起動時の制限です。汎用 CLI は対象外のまま `would_refuse_unsupported_runtime` を記録します。Antigravity は変更せず、OpenAI 互換のツールループは既存の MCP 検査を使います。
+Codex の強制モードは `-c sandbox_workspace_write.network_access=false -c web_search="disabled"` を追加し、FullAccess を WorkspaceWrite に制限します。ReadOnly と MCP 自動承認器は保持します。個別コマンドの承認ではなく起動時の制限です。汎用 CLI は対象外のまま `would_refuse_unsupported_runtime` を記録します。OpenAI 互換のツールループは既存の MCP 検査を使います。
 
 Cron、dispatch、reminder、mail、heartbeat、ephemeral はチャネル requester と独立して host ターンを登録し、`DUDUCLAW_TURN_ID` を渡します。`default` の実際のスタッフ名も登録します。既存の読み取り済み状態は消さず、不明なクライアントターンは読み取り済みのままです。
 

@@ -13,6 +13,9 @@ impl MethodHandler {
 
     pub(crate) async fn handle_cli_login_start(&self, params: Value, ctx: &UserContext, conn: crate::power_local::RpcConnInfo) -> WsFrame {
         let runtime_str = params.get("runtime").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(runtime_str) {
+            return WsFrame::error_response("", &removed.refusal("auth.cli_login.start runtime"));
+        }
         if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, runtime_str) {
             return WsFrame::error_response("", &e);
         }
@@ -43,7 +46,7 @@ impl MethodHandler {
             Some(s) => s,
             None => {
                 // Runtimes with no scriptable login (openai_compat, qwen, vibe,
-                // antigravity): naming the key variable AND the catalog's
+                // API-key-only): naming the key variable AND the catalog's
                 // login hint turns a dead end into an actionable answer.
                 return WsFrame::error_response("", &no_login_message(runtime_str, runtime.spec()));
             }
@@ -326,9 +329,7 @@ impl MethodHandler {
 }
 
 /// Error text for `auth.cli_login.start` on a runtime with no scriptable login:
-/// the API-key variable plus the catalog's zh-TW login hint, so the answer for
-/// e.g. Antigravity says what to actually do (run `agy` in a terminal, or use
-/// API-key mode) instead of only "no interactive login".
+/// the API-key variable plus the catalog's zh-TW login hint.
 fn no_login_message(
     runtime_str: &str,
     spec: &duduclaw_core::runtime_catalog::RuntimeSpec,
@@ -351,13 +352,27 @@ mod no_login_message_tests {
     use super::no_login_message;
     use duduclaw_core::types::RuntimeType;
 
-    #[test]
-    fn antigravity_answer_names_the_key_and_the_terminal_sign_in() {
-        let msg = no_login_message("antigravity", RuntimeType::Antigravity.spec());
-        assert!(msg.contains("GEMINI_API_KEY"), "{msg}");
-        assert!(msg.contains("`agy`"), "{msg}");
-        assert!(msg.contains("[antigravity] auth"), "{msg}");
-        assert!(!msg.contains("ANTIGRAVITY_API_KEY"), "{msg}");
+
+    #[tokio::test]
+    async fn removed_runtime_login_and_install_are_refused_before_side_effects() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = super::MethodHandler::new(home.path().to_path_buf()).await;
+        let caller = super::UserContext::admin_fallback();
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            let login = handler.handle_cli_login_start(
+                serde_json::json!({"runtime": removed.id}), &caller,
+                crate::power_local::RpcConnInfo::internal(),
+            ).await;
+            let install = handler.handle_runtime_install(
+                serde_json::json!({"provider": removed.id}), &caller,
+            ).await;
+            for frame in [login, install] {
+                assert!(matches!(frame, super::WsFrame::Response { ok: false, .. }), "{frame:?}");
+                let text = serde_json::to_string(&frame).unwrap();
+                assert!(text.contains(removed.display_name) && text.contains(removed.removed_in), "{text}");
+                assert!(text.contains("choose a supported runtime and model"), "{text}");
+            }
+        }
     }
 
     #[test]

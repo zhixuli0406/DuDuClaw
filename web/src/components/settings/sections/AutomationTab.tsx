@@ -1,3 +1,4 @@
+import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
@@ -27,7 +28,7 @@ const DISPATCH_POLICIES = ['fixed_hierarchy', 'round_robin', 'llm_select', 'role
 
 // `[dispatch] judge_provider` — a runtime id (`RuntimeType::parse`); empty =
 // no override, the judge runs on the default utility model.
-const JUDGE_PROVIDERS = ['', 'claude', 'codex', 'antigravity', 'grok', 'openai_compat'] as const;
+const JUDGE_PROVIDERS = ['', 'claude', 'codex', 'grok', 'openai_compat'] as const;
 
 // goal_loop.resume_on_restart enum accepted by the gateway's
 // system.update_config — kept in "recommended first" order (pause is the
@@ -346,7 +347,7 @@ export function AutomationTab() {
       raw: v as string,
     })),
     ...(judgeProvider && !(JUDGE_PROVIDERS as readonly string[]).includes(judgeProvider)
-      ? [{ value: judgeProvider, label: judgeProvider, raw: judgeProvider }]
+      ? [{ value: judgeProvider, label: isRemovedRuntime(judgeProvider) ? `${judgeProvider} (${t('common.removed')})` : judgeProvider, raw: judgeProvider }]
       : []),
   ];
 

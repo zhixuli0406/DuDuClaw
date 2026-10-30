@@ -202,7 +202,7 @@ docker compose up -d
 
 ## 6. CLI の認証設定
 
-イメージには Claude、Codex、Antigravity、Grok が含まれます。ログイン方法は CLI ごとに異なります。Codex はデバイスコードを使うため、ブラウザからコンテナ内のコールバックリスナーに接続する必要はありません。課金と予備のために API キーも用意してください。
+イメージには Claude、Codex、Grok が含まれます。ログイン方法は CLI ごとに異なります。Codex はデバイスコードを使うため、ブラウザからコンテナ内のコールバックリスナーに接続する必要はありません。課金と予備のために API キーも用意してください。
 
 標準の Compose ファイルは以下の認証情報・設定ディレクトリをマウントします。
 
@@ -210,7 +210,6 @@ docker compose up -d
 |------|--------|-----|
 | `/home/duduclaw/.claude` | `duduclaw-claude` | Claude Code |
 | `/home/duduclaw/.codex`  | `duduclaw-codex`  | Codex |
-| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Antigravity 設定 |
 | `/home/duduclaw/.grok` | `duduclaw-grok` | Grok |
 | `/home/duduclaw/.kimi-code` | `duduclaw-kimi` | Kimi Code |
 | `/home/duduclaw/.copilot` | `duduclaw-copilot` | GitHub Copilot CLI |
@@ -220,7 +219,7 @@ docker compose up -d
 
 つまり、**一度ログインすればコンテナを再構築してもログインし直す必要はありません**。
 
-> **サブスクリプションでのログインにはアカウントのリスクがあります。** Anthropic の[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。Anthropic は事前の通知なく執行できるとしており、アカウント停止の報告もあります。1 つのサブスクリプションでチャネルの顧客に返信すること、複数のサブスクリプションをローテーションして利用上限を避けること、トークンを DuDuClaw に保存することは、いずれもこの規約と衝突します。Google の [Antigravity 規約](https://antigravity.google/terms)には、サードパーティのソフトウェアから Antigravity の OAuth を使ってサービスにアクセスすることは規約違反で、アカウントの停止または終了の理由になり得ると書かれています。OpenAI には公式の [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) プログラムがあり、サードパーティのアプリで ChatGPT プランを使えるのはオープンソースのパートナーと選ばれた商用パートナーで、商用製品には OpenAI の承認が必要です。認証トークンはユーザーが管理するローカル環境に置き、リモートやマネージド環境には置かないこととされています。以下の setup token、コンテナ内の対話ログイン、ChatGPT ログインはいずれもサブスクリプションのログインで、引き続き使えますが、API キーの利用を推奨します。ダッシュボードのログインフローでは、先にこの説明への同意を求めます。[features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md) を参照してください。
+> **サブスクリプションでのログインにはアカウントのリスクがあります。** Anthropic の[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。Anthropic は事前の通知なく執行できるとしており、アカウント停止の報告もあります。1 つのサブスクリプションでチャネルの顧客に返信すること、複数のサブスクリプションをローテーションして利用上限を避けること、トークンを DuDuClaw に保存することは、いずれもこの規約と衝突します。OpenAI には公式の [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) プログラムがあり、サードパーティのアプリで ChatGPT プランを使えるのはオープンソースのパートナーと選ばれた商用パートナーで、商用製品には OpenAI の承認が必要です。認証トークンはユーザーが管理するローカル環境に置き、リモートやマネージド環境には置かないこととされています。以下の setup token、コンテナ内の対話ログイン、ChatGPT ログインはいずれもサブスクリプションのログインで、引き続き使えますが、API キーの利用を推奨します。ダッシュボードのログインフローでは、先にこの説明への同意を求めます。[features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md) を参照してください。
 
 ### 6.1 Claude Code CLI
 
@@ -310,16 +309,6 @@ OPENAI_API_KEY=sk-proj-...
 
 従量課金（OpenAI APIの料金体系）です。
 
-### 6.3 Antigravity（Google）の API キーモード
-
-Docker イメージに Gemini CLI は含まれなくなりました。Antigravity（`agy`）と
-Gemini API プロバイダーは引き続きサポートします。`agy` のサブスクリプション
-サインインには OS キーリングが必要です。コンテナでは
-`config.toml [antigravity] auth = "api_key"` を設定し、`gemini` プロバイダー
-アカウントまたは `.env` の `GEMINI_API_KEY` を使ってください。
-Antigravity の設定は `~/.gemini/antigravity-cli/` にあるため、
-`duduclaw-gemini` volume は残します。
-
 ### 6.4 Agent単位でのRuntime指定
 
 各agentは自身の `agent.toml` で使用するruntimeを指定できます。
@@ -328,8 +317,8 @@ Antigravity の設定は `~/.gemini/antigravity-cli/` にあるため、
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-provider = "claude"       # メインruntime：claude / codex / antigravity / openai-compat …
-fallback = "antigravity"  # Claudeが利用不可の際に自動切り替え
+provider = "claude"       # メインruntime：claude / codex / openai-compat …
+fallback = "codex"  # Claudeが利用不可の際に自動切り替え
 ```
 
 完全な例とfailover戦略については
@@ -361,7 +350,6 @@ claude auth status
 | `duduclaw-data` | メインデータ：config、agents、memory SQLite、logs、bus_queue.jsonl | **最重要**。毎日バックアップ推奨 |
 | `duduclaw-claude` | Claude CLI OAuth状態 | 中程度。失っても `claude auth login` をやり直せばよい |
 | `duduclaw-codex`  | Codex OAuth状態 | 中程度 |
-| `duduclaw-gemini` | Antigravity の `~/.gemini` 設定 | 中程度 |
 | `duduclaw-grok` | Grok CLI の認証情報 | 中程度 |
 | `duduclaw-kimi` | Kimi Code の認証情報 | 中程度 |
 | `duduclaw-copilot` | Copilot CLI の認証情報 | 中程度 |

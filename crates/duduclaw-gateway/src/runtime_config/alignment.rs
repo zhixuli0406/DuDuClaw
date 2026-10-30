@@ -51,12 +51,8 @@ impl ModelRuntimeAlignment {
 /// cannot silently replace a runtime. No substring family inference.
 pub(crate) fn auto_align_target(
     inferred: Option<RuntimeType>,
-    model: &str,
 ) -> (Option<RuntimeType>, Option<&'static str>) {
     match inferred {
-        Some(RuntimeType::Antigravity) if model.to_ascii_lowercase().starts_with("gemini-") => {
-            (None, Some("model_id_requires_display_name"))
-        }
         Some(rt) if rt.is_deprecated() => (None, Some("deprecated_runtime")),
         other => (other, None),
     }
@@ -88,7 +84,7 @@ pub(crate) fn align_model_runtime(
     if model_matches_provider(&model, provider.clone()) {
         return Ok(ModelRuntimeAlignment::Unchanged);
     }
-    let (inferred, skipped) = auto_align_target(infer_provider_for_model(&model), &model);
+    let (inferred, skipped) = auto_align_target(infer_provider_for_model(&model));
     if let Some(reason) = skipped {
         return Ok(ModelRuntimeAlignment::Skipped(reason));
     }

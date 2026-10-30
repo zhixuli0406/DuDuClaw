@@ -92,7 +92,7 @@ Hook 將原始工具參數送至 `/api/internal/egress-guard/hook-check`，由 g
 
 `ask`／`block` 的 hook 錯誤與可捕捉的 panic 一律 exit 2；安裝失敗停止啟動，不輪替帳號或 runtime。`shadow` 記錄警告並繼續。Claude 在強制模式使用 `--setting-sources "" --settings <file>`，只載入身分所屬的 `.claude/settings.json`，不併入工作目錄或使用者的其他設定，即使工作目錄不同也一樣；強制模式拒絕會略過 hook 的 `cli_bare_mode`。Grok 加上 `--disable-web-search`；目前強制模式拒絕借用／共用工作目錄，或 hook 目錄內留有其他員工 guard 的組合，請使用獨立員工目錄或 Claude/Codex。
 
-Codex 在 `ask`／`block` 加上 `-c sandbox_workspace_write.network_access=false -c web_search="disabled"`，FullAccess 降為 WorkspaceWrite，ReadOnly 保持更嚴，保留 MCP 的自動核准器。這是啟動時收緊網路，不是逐指令核准。通用 CLI 仍未涵蓋，強制模式記錄 `would_refuse_unsupported_runtime`。Antigravity 沒有擴充；OpenAI 相容工具迴圈維持 MCP 閘門。
+Codex 在 `ask`／`block` 加上 `-c sandbox_workspace_write.network_access=false -c web_search="disabled"`，FullAccess 降為 WorkspaceWrite，ReadOnly 保持更嚴，保留 MCP 的自動核准器。這是啟動時收緊網路，不是逐指令核准。通用 CLI 仍未涵蓋，強制模式記錄 `would_refuse_unsupported_runtime`。OpenAI 相容工具迴圈維持 MCP 閘門。
 
 Cron、派工、提醒、信件、heartbeat、ephemeral 執行入口改為獨立於通道 requester 登錄 host 回合並傳遞 `DUDUCLAW_TURN_ID`，也登錄 `default` 實際指向的員工。既有污染不會被清除；未知呼叫端回合仍視為污染。
 

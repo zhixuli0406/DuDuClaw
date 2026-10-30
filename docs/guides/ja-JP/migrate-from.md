@@ -151,7 +151,7 @@ CONFLICT は移行先にすでに値があり、既存の設定を守るため�
 
 **Q：Claude 以外のモデルはどうなりますか？**
 `[model] preferred` にそのまま保持され `PARTIAL` としてマークされます。どの
-runtime（codex / antigravity / openai_compat）にマッピングするかは人手での確認が
+runtime（codex / openai_compat）にマッピングするかは人手での確認が
 必要になります。DuDuClaw が代わりに推測することはありません。
 
 ## プロファイルの確認と Claude Code

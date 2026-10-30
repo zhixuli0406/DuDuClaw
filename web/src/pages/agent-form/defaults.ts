@@ -28,7 +28,7 @@ export type MainTab = 'general' | 'advanced';
 export type AdvGroup = 'run' | 'access' | 'integration' | 'evo';
 
 export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = [
-  'claude', 'codex', 'antigravity', 'grok', 'openai_compat',
+  'claude', 'codex', 'grok', 'openai_compat',
   // v1.68 W1 — generic command-line runtimes (`runtime_catalog.rs`).
   'qwen', 'kimi', 'copilot', 'kiro', 'cursor', 'vibe', 'opencode',
 ];

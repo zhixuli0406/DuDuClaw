@@ -41,14 +41,19 @@ impl MethodHandler {
                 .credential_paths
                 .first()
                 .map(|rel| Value::Bool(user_home.join(rel).exists()));
-            rows.push(runtime_detect_row(spec, found.as_deref(), cred_present));
+            let version = if spec.id == "codex" {
+                if let Some(bin) = found.as_deref() {
+                    crate::runtime::codex::probe_codex_version_output(bin).await
+                } else { None }
+            } else { None };
+            rows.push(runtime_detect_row(spec, found.as_deref(), cred_present, version.as_deref()));
         }
         let (claude_oauth, claude_subscription) = detect_claude_oauth(claude_bin.as_deref()).await;
 
         // Legacy key kept verbatim: the dashboard onboarding wizard and the
         // OOBE shell both read `claude_cli`, and renaming it would break both
         // for zero gain. Every other runtime is keyed by its catalog id
-        // (`codex`, `gemini`, `antigravity`, `grok`, … ) exactly as before.
+        // (`codex`, `grok`, … ) exactly as before.
         flags.insert("claude_cli".to_string(), Value::Bool(claude_bin.is_some()));
         flags.insert("claude_oauth".to_string(), Value::Bool(claude_oauth));
         flags.insert(
@@ -82,6 +87,9 @@ impl MethodHandler {
             .get("provider")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(provider) {
+            return WsFrame::error_response("", &removed.refusal("runtime.install provider"));
+        }
         if let Err(e) = crate::product_policy::require_runtime(&self.home_dir, provider) {
             return WsFrame::error_response("", &e);
         }
@@ -193,6 +201,7 @@ pub(crate) fn runtime_detect_row(
     spec: &duduclaw_core::runtime_catalog::RuntimeSpec,
     found: Option<&str>,
     cred_present: Option<Value>,
+    version_output: Option<&str>,
 ) -> Value {
     let dep = spec.deprecation;
     json!({
@@ -201,6 +210,9 @@ pub(crate) fn runtime_detect_row(
         "binary": spec.binary,
         "installed": found.is_some(),
         "path": found,
+        "version": if spec.id == "codex" { version_output.and_then(crate::runtime::codex::display_version) } else { None },
+        "minimum_version": if spec.id == "codex" { Some(crate::runtime::codex::EMPLOYEE_MINIMUM_VERSION) } else { None },
+        "update_required": crate::runtime::codex::required_update(spec.id, found.is_some(), version_output),
         "install_channel": spec.install.kind(),
         "install_command": spec.install.command_display(),
         "login_method": spec.auth.login.kind(),

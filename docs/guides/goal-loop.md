@@ -176,8 +176,8 @@ grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "
 two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
 strict_reply_parsing = "shadow"  # Judge replies under the strict JSON contract: off / shadow / enforce (see "Strict reply contract"). Default shadow
 judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only were removed in v1.69.0). Default mav
-judge_provider = "antigravity"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
-judge_model = "gemini-3-pro-preview" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
+judge_provider = "codex"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
+judge_model = "gpt-5.4" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
 admission = "queue"     # What happens when ephemeral spawns hit the concurrency cap, "queue" or "fail". Default queue (see "Ephemeral spawn admission queueing" below)
 
 [task_forward_model]    # Task-level forward model (see the section of the same name). On by default since v1.54
@@ -266,7 +266,7 @@ Every verdict is written to the audit log as `team_gate_decision` with the signa
 
 ### The spec is frozen per task
 
-The team a task runs with is decided once, at creation, and stored on the task. Later changes to `[team]` affect the *next* task. A spec that fails validation — most often a verifier sharing the executor's model family — forms no team at all: the task runs Solo and there is no partial team.
+The team a task runs with is decided once, at creation, and stored on the task. Later changes to `[team]` affect the *next* task. A non-fatal validation failure, such as a verifier sharing the executor's model family, forms no team and runs Solo. Unreadable or malformed config, wrong types in runtime-selection fields, and removed runtimes refuse dispatch entirely. Creation checks before inserting the task; a refusal encountered afterwards parks only that goal as `needs_human` with `blocked_needs_decision`, while other goals continue. A parked goal is not retried or audited again on every tick.
 
 Whether that refusal is loud depends on who asked for the team. An operator who wrote `enabled = true`, or who configured roles that then fail validation, gets the refusal audited as `team_refused` with the role and the reason. A deployment that never touched `[team]` at all gets a `debug!` line and nothing in the audit log — that refusal is the default state of every install since the v1.66 flip, and stamping a row on every goal task everywhere is how a real refusal stops being findable.
 
@@ -315,7 +315,7 @@ A task that declares no artefacts adds no block, and a Solo round with no native
 | Event | Meaning |
 |---|---|
 | `team_gate_decision` | Solo / Team / grey band, with the signals that fired |
-| `team_refused` | An enabled spec failed validation; the task runs Solo |
+| `team_refused` | A team spec was refused; non-fatal validation failures run Solo, while config-read/parse/type failures and removed runtimes pause the affected goal for a decision |
 | `team_round_started` | A three-stage round began, with the roles and any degrade steps |
 | `team_member_spawned` | One role member was created (role, runtime, model) |
 | `team_stage_failed` | A stage did not produce what the next one needs, or could not run at all — carries `role`, `runtime`, `model` and the error |
@@ -404,7 +404,7 @@ When the AI employee reports completion and a task enters review, before the acc
 
 ## Task forward model (v1.53; default on since v1.54)
 
-When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." It runs for every runtime, but how much it sees depends on whether the runtime feeds the native tool-event collector. Claude (the dispatch stream-json path), Codex, Antigravity and OpenAI-compatible agents record their native tool events, so their observations can reach `Full`. Grok and the seven generic print-mode CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) attach no collector, so their observations are `McpOnly` (built from `tool_calls.jsonl` alone), or `None` when that file holds nothing for the round. The pipeline:
+When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." It runs for every runtime, but how much it sees depends on whether the runtime feeds the native tool-event collector. Claude (the dispatch stream-json path), Codex, OpenAI-compatible agents record their native tool events, so their observations can reach `Full`. Grok and the seven generic print-mode CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) attach no collector, so their observations are `McpOnly` (built from `tool_calls.jsonl` alone), or `None` when that file holds nothing for the round. The pipeline:
 
 - **Layered prediction fallback**: uses matching statistics when available, falls back to overall marginal statistics, then a prior default. Cold start never spends an LLM call.
 - **Honest fidelity grading**: every observation is tagged with its evidence fidelity (native tool events / audit-log-only / no evidence), so "we didn't see it" is never conflated with "it didn't happen."
@@ -451,10 +451,12 @@ A bad value doesn't quietly take effect: the gateway warns and falls back to `ma
 
 A judge drawn from the same model family as the worker tends to forgive exactly the mistakes that family makes — it shares the worker's blind spots, so a second opinion from the same vendor is worth less than it looks (arXiv:2607.13918). Two optional keys move the acceptance judge, and the cheap first-stage evaluator with it, onto a different runtime and model:
 
+Removed runtime settings are refused before execution and require the operator to choose another runtime and compatible model. They do not use the fallback described below.
+
 ```toml
 [dispatch]
-judge_provider = "antigravity"        # A runtime id: claude, codex, antigravity, grok, openai_compat, …
-judge_model = "gemini-3-pro-preview"   # Model id within that runtime
+judge_provider = "codex"        # A runtime id: claude, codex, grok, openai_compat, …
+judge_model = "gpt-5.4"   # Model id within that runtime
 ```
 
 Both are optional and independent. Unset, the judge keeps using the ordinary utility model (`[runtime] utility_provider` / `utility_model`) — which is exactly the behavior every existing deployment already has, so leaving these out changes nothing.

@@ -9,8 +9,7 @@
 //! (and therefore every spawn) fail, and a planted symbolic link would make
 //! the lock open a file elsewhere. For an employee directory the lock lives
 //! under `<home>/locks/`, one per employee directory, keyed by a hash of the
-//! canonical directory path (the same convention as the Antigravity MCP
-//! lock). Directories that belong to no employee keep the old sidecar
+//! canonical directory path. Directories that belong to no employee keep the old sidecar
 //! location; nothing spawns an employee from them.
 
 use std::path::{Path, PathBuf};

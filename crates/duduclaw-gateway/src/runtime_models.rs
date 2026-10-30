@@ -92,7 +92,7 @@ pub struct ProviderModels {
 /// The full cache written to `~/.duduclaw/runtime_models.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeModelsCache {
-    /// Keyed by cache key (`claude` / `codex` / `gemini` / `agy`).
+    /// Keyed by cache key (`claude` / `codex` / `grok`).
     pub providers: BTreeMap<String, ProviderModels>,
     pub fetched_at: String,
 }
@@ -122,23 +122,18 @@ pub fn claude_fallback() -> Vec<RuntimeModel> {
 /// Static `(id, label)` list for a runtime, tagged with the provider label the
 /// UI groups under.
 ///
-/// `provider_label` differs from the catalog id for exactly one entry: `agy`
-/// runs Gemini models and has always been grouped under "gemini" in the UI, so
-/// the label is passed separately rather than assumed equal to the id.
-fn fallback_labelled(id: &str, provider_label: &str) -> Vec<RuntimeModel> {
+/// Static catalog models for one runtime.
+fn fallback_for(id: &str) -> Vec<RuntimeModel> {
     duduclaw_core::runtime_catalog::spec_for(id)
         .map(|spec| {
             spec.fallback_models
                 .iter()
-                .map(|(mid, label)| m(mid, label, provider_label))
+                .map(|(mid, label)| m(mid, label, id))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn fallback_for(id: &str) -> Vec<RuntimeModel> {
-    fallback_labelled(id, id)
-}
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -179,15 +174,6 @@ pub async fn discover_all(home_dir: &Path) -> RuntimeModelsCache {
         let Some(bin) = duduclaw_core::detect_runtime(spec.id, home_dir) else {
             continue;
         };
-        if spec.id == "antigravity" {
-            // `agy` runs Gemini models — group it under the "gemini" provider
-            // label (matching the UI) but keep a distinct cache key. It also
-            // has its own parser: `agy models` prints display names ("Gemini
-            // 3.5 Flash (Low)") and `--model` accepts exactly those strings, so
-            // lines pass verbatim.
-            providers.insert("agy".to_string(), discover_agy(&bin).await);
-            continue;
-        }
         // Everything else: best-effort `--help`-gated `models` probe, falling
         // back to the catalog's static list (marked `Fallback` in the cache, so
         // the UI can say the list is stale rather than pretending it is live).
@@ -207,7 +193,9 @@ pub async fn discover_all(home_dir: &Path) -> RuntimeModelsCache {
 pub async fn load_cache(home_dir: &Path) -> Option<RuntimeModelsCache> {
     let path = home_dir.join(CACHE_FILE);
     let content = tokio::fs::read_to_string(&path).await.ok()?;
-    serde_json::from_str(&content).ok()
+    let mut cache: RuntimeModelsCache = serde_json::from_str(&content).ok()?;
+    cache.providers.retain(|id, _| duduclaw_core::runtime_catalog::removed_runtime(id).is_none());
+    Some(cache)
 }
 
 /// Persist the cache atomically (temp + rename).
@@ -322,7 +310,7 @@ async fn discover_claude(home_dir: &Path) -> ProviderModels {
     }
 }
 
-/// Generic catalog CLI discovery (excluding Claude and Antigravity):
+/// Generic catalog CLI discovery (excluding Claude):
 /// best-effort CLI probe, else fallback.
 async fn discover_generic(
     provider: &str,
@@ -357,28 +345,6 @@ async fn discover_generic(
     }
 }
 
-/// agy discovery: `agy models` is an official subcommand (antigravity.google
-/// codelab) whose output lines are the exact strings `--model` accepts —
-/// display names with spaces/parens, e.g. `Claude Sonnet 4.6 (Thinking)`.
-/// The generic token parser would reject those as prose, hence this path.
-async fn discover_agy(bin: &str) -> ProviderModels {
-    let fetched_at = now_rfc3339();
-    if let Some(out) = run_probe(bin, &["models"], HELP_TIMEOUT).await {
-        let models = parse_agy_model_lines(&out);
-        if !models.is_empty() {
-            return ProviderModels {
-                models,
-                source: DiscoverySource::CliProbe,
-                fetched_at,
-            };
-        }
-    }
-    ProviderModels {
-        models: fallback_labelled("antigravity", "gemini"),
-        source: DiscoverySource::Fallback,
-        fetched_at,
-    }
-}
 
 // ── Probes ───────────────────────────────────────────────────────────────
 
@@ -580,35 +546,6 @@ pub fn parse_generic_model_lines(provider: &str, out: &str) -> Vec<RuntimeModel>
     models
 }
 
-/// Parse `agy models` output: one display name per line, taken verbatim as the
-/// model id (that IS what `--model` accepts). A line qualifies when it carries
-/// a digit, starts alphabetic, stays within display-name charset
-/// (`[A-Za-z0-9 .()-]`), and isn't over-long prose. NOTE: agy silently falls
-/// back to its default model on an unrecognized `--model` value (verified live
-/// 2026-07-11 — no error), so passing a stale name degrades quietly.
-pub fn parse_agy_model_lines(out: &str) -> Vec<RuntimeModel> {
-    let clean = strip_ansi_lossy(out);
-    let mut models: Vec<RuntimeModel> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for raw in clean.lines() {
-        let line = raw.trim();
-        if line.len() < 3 || line.len() > 60 {
-            continue;
-        }
-        let ok_chars = line
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '(' | ')' | '-'));
-        let has_digit = line.chars().any(|c| c.is_ascii_digit());
-        let starts_alpha = line.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
-        // Display names are short: "Claude Sonnet 4.6 (Thinking)" = 4 words.
-        let word_count = line.split_whitespace().count();
-        if ok_chars && has_digit && starts_alpha && word_count <= 6 && seen.insert(line.to_string())
-        {
-            models.push(m(line, line, "gemini"));
-        }
-    }
-    models
-}
 
 // ── Merge / dedup (pure — unit tested) ───────────────────────────────────
 
@@ -618,7 +555,11 @@ pub fn parse_agy_model_lines(out: &str) -> Vec<RuntimeModel> {
 pub fn merged_models(cache: &RuntimeModelsCache) -> Vec<serde_json::Value> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for pm in cache.providers.values() {
+    for (runtime, pm) in &cache.providers {
+        // Cache keys identify CLI runtimes; model.provider may still be a valid API provider.
+        if duduclaw_core::runtime_catalog::removed_runtime(runtime).is_some() {
+            continue;
+        }
         for model in &pm.models {
             if !seen.insert(model.id.clone()) {
                 continue;
@@ -977,35 +918,34 @@ mod tests {
         assert_eq!(ids.iter().filter(|i| **i == "gpt-5.5").count(), 1);
     }
 
-    #[test]
-    fn agy_model_lines_parse_verbatim() {
-        // Real `agy models` output captured live 2026-07-11. These display
-        // names are the exact `--model` values (official codelab example:
-        // `agy --model "Gemini 3.5 Flash (Low)"`), so lines pass verbatim.
-        let out = "Gemini 3.5 Flash (Medium)\nGemini 3.5 Flash (High)\nGemini 3.5 Flash (Low)\nGemini 3.1 Pro (Low)\nGemini 3.1 Pro (High)\nClaude Sonnet 4.6 (Thinking)\nClaude Opus 4.6 (Thinking)\nGPT-OSS 120B (Medium)\n";
-        let models = parse_agy_model_lines(out);
-        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids.len(), 8, "got {ids:?}");
-        assert!(ids.contains(&"Gemini 3.5 Flash (Low)"));
-        assert!(ids.contains(&"Claude Sonnet 4.6 (Thinking)"));
-        assert!(ids.contains(&"GPT-OSS 120B (Medium)"));
-        // id == label (display name IS the id for agy).
-        let flash = models
-            .iter()
-            .find(|m| m.id == "Gemini 3.5 Flash (Low)")
-            .unwrap();
-        assert_eq!(flash.label, flash.id);
-        assert_eq!(flash.provider, "gemini");
-    }
 
-    #[test]
-    fn agy_model_lines_reject_prose_and_noise() {
-        let out = "Available models for your account:\n\nGemini 3.1 Pro (High)\nRun agy --model <name> to pick one of the models listed above today\n2026-07-11\n";
-        let models = parse_agy_model_lines(out);
-        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        // Only the actual model line survives: prose is over 6 words or has
-        // disallowed chars (`<`, `:`), the date line starts with a digit.
-        assert_eq!(ids, vec!["Gemini 3.1 Pro (High)"], "got {ids:?}");
+
+    #[tokio::test]
+    async fn persisted_removed_runtime_cache_is_hidden_without_refresh_or_api_loss() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cache = RuntimeModelsCache::default();
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            cache.providers.insert(removed.id.into(), ProviderModels {
+                models: vec![m("Gemini 3.5 Flash (Medium)", "Old CLI display name", "gemini")],
+                source: DiscoverySource::CliProbe, fetched_at: "old".into(),
+            });
+        }
+        cache.providers.insert("openai_compat".into(), ProviderModels {
+            models: vec![m("gemini-3.5-flash", "Gemini API", "gemini")],
+            source: DiscoverySource::LiveApi, fetched_at: "current".into(),
+        });
+        save_cache(home.path(), &cache).await.unwrap();
+        let original = std::fs::read(home.path().join(CACHE_FILE)).unwrap();
+        let loaded = load_cache(home.path()).await.unwrap();
+        assert_eq!(loaded.providers.len(), 1);
+        for input in [&cache, &loaded] {
+            let models = merged_models(input);
+            assert_eq!(models.len(), 1, "{models:?}");
+            assert_eq!(models[0]["id"], "gemini-3.5-flash");
+            assert_eq!(models[0]["provider"], "gemini");
+        }
+        assert_eq!(std::fs::read(home.path().join(CACHE_FILE)).unwrap(), original,
+            "filtering stale discovery entries must not rewrite operator files");
     }
 
     #[test]

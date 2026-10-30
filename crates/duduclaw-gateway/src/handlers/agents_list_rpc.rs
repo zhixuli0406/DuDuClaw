@@ -73,9 +73,9 @@ impl MethodHandler {
                     "icon": cfg.agent.icon,
                     "reports_to": cfg.agent.reports_to,
                     "runtime": {
-                        "provider": if cfg.runtime.provider.as_deref()
-                            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gemini")) {
-                            "gemini"
+                        "provider": if let Some(removed) = cfg.runtime.provider.as_deref()
+                            .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+                            removed.id
                         } else {
                             cfg.runtime.provider.as_deref()
                                 .and_then(duduclaw_core::types::RuntimeType::parse)

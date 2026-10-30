@@ -4,7 +4,7 @@
 //!
 //! - Codex: one `duduclaw-mcp-env-*.json` file per proxy, named in the `-c`
 //!   overrides through `DUDUCLAW_MCP_PROXY_ENV_FILE` ([`write_env_file`]);
-//! - Grok and Antigravity: one `duduclaw-mcp-env-*` directory per spawn with a
+//! - Grok: one `duduclaw-mcp-env-*` directory per spawn with a
 //!   `<server>.json` per proxy, named through `DUDUCLAW_MCP_PROXY_ENV_DIR`
 //!   ([`write_spawn_env_dir`]). A directory per spawn means two spawns of the
 //!   same employee never share or overwrite each other's files.
@@ -23,7 +23,7 @@ pub(crate) const ENV_FILE_DIR: &str = "mcp-proxy-env";
 pub(crate) const ENV_FILE_PREFIX: &str = "duduclaw-mcp-env-";
 /// An entry older than this at gateway start belongs to no running spawn (a
 /// Codex run is cut off after two minutes, Grok after five plus a 90-second
-/// retry, Antigravity after 330 seconds).
+/// retry).
 pub(crate) const ENV_FILE_STALE_AFTER: std::time::Duration =
     std::time::Duration::from_secs(15 * 60);
 

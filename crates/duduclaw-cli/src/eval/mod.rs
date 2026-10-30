@@ -400,10 +400,13 @@ fn base_overrides(opts: &EvalOptions) -> Result<runner::RunOverrides, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(id) => Some(
-            duduclaw_core::types::RuntimeType::from_id(id)
-                .ok_or_else(|| format!("--runtime {id:?} is not a runtime on this build"))?,
-        ),
+        Some(id) => {
+            if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(id) {
+                return Err(removed.refusal("eval --runtime"));
+            }
+            Some(duduclaw_core::types::RuntimeType::from_id(id)
+                .ok_or_else(|| format!("--runtime {id:?} is not a runtime on this build"))?)
+        }
         None => None,
     };
     let agent = match opts
@@ -1741,7 +1744,7 @@ mod tests {
         o.planner_strong = Some("codex:gpt-5.6-sol".into());
         o.executor_weak = Some("codex:gpt-5.6-terra".into());
         o.executor_strong = Some("codex:gpt-5.6-sol".into());
-        o.verifier_model = Some("antigravity:gemini-3.7-flash".into());
+        o.verifier_model = Some("grok:grok-4.20".into());
         assert!(super::team_probe::ProbeSpec::parse(&o).is_ok());
         o.team_fanout = Some(4);
         assert!(

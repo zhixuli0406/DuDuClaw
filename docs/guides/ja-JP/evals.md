@@ -45,7 +45,7 @@ duduclaw eval evals/support --report eval-report.json
 | `--baseline <report.json>` | 以前に書き出した `--report` ファイルとの対応のある統計的比較を行います。[誠実な統計](#誠実な統計) を参照してください。 |
 | `--mde <fraction>` | 解像度チェックのために宣言する最小検出効果。合格率の割合で指定します（デフォルト `0.10` ＝ 10 パーセンテージポイント）。[誠実な統計](#誠実な統計) を参照してください。 |
 | `--cluster-by <key>` | クラスターロバスト標準誤差のためのクラスターキー。実装されているのは `dir`（デフォルト、各 case のディレクトリ）だけで、それ以外の値は拒否されます。[誠実な統計](#誠実な統計) を参照してください。 |
-| `--runtime <id>` | すべての case を実行するバックエンド（`claude` がデフォルトで P2 以前の経路、ほかに `codex`、`antigravity`、`grok`、`openai_compat`、またはカタログ内のその他の runtime id）。未知の id は拒否され、`claude` として扱われることはありません。**省略した場合は各 case 自身の `[case] runtime`、それもなければ `claude` です。** [能力マトリクス](#能力マトリクス--matrix) を参照してください。 |
+| `--runtime <id>` | すべての case を実行するバックエンド（`claude` がデフォルトで P2 以前の経路、ほかに `codex`、`grok`、`openai_compat`、またはカタログ内のその他の runtime id）。未知の id は拒否され、`claude` として扱われることはありません。**省略した場合は各 case 自身の `[case] runtime`、それもなければ `claude` です。** [能力マトリクス](#能力マトリクス--matrix) を参照してください。 |
 | `--model <id>` | `--runtime` の範囲内で、すべての case に対する model id の上書き。省略すると各 case 自身の `[case] model` を使います。レポートヘッダーの `model` には、常に実際に動いたものが書かれます。 |
 | `--paired-seeds` | `(case id, repeat)` ごとに決定的な seed を導出し、同じ抽選が model 間で揃うようにします（Miller の対応のある設計）。**記録するだけで適用はしません**。このビルドの runtime には seed を受け付けられるものがなく、各実行は `seed_applied: false` でそのことを示します。 |
 | `--agent <id>` | すべての case を、各 case 自身の `[case] agent` の代わりに**この**デプロイ済みエージェントで実行します。レポートヘッダーに `agent_override` として、各実行に `agent` として記録されます。[1 つのエージェントを借りる](#1-つのエージェントを借りる--agent) を参照してください。 |
@@ -384,7 +384,6 @@ verifier cell のスコアは、記録済み transcript 上の確定的な gold 
 
 忠実度についての注意：合成された transcript が持つのは、その runtime のイベント stream が実際に運んだものだけです。つまり 1 つのテキストブロック（そのため `min_text_blocks` が観測できるのは常に `1` だけ）、thinking ブロックなし、そしてツール入力は元の JSON ではなく、コレクターが記録したマスク済みで長さ制限のかかったテキストです。これらのシグナルは 2 つの経路の間で**比較できない**ので、1 つの cell がそれらを混ぜることは決してありません。
 
-Antigravity `agy` 1.2.10 は、その runtime に `stream-json` の終端ツールイベントと、実測の token 使用量を提供するようになりました。live のサンドボックスで拒否されたツールイベントと、ツールを使わない PING eval は検証済みです。ネイティブのツール実行が成功するケースは、別途 live での確認がまだ必要です。verifier cell のドル建て見積もりは、その utility 呼び出しが使用量をマトリクスレポーターに返さないため、依然として粗いものです。
 
 ### 出力
 
@@ -418,7 +417,7 @@ duduclaw eval <eval-suite-dir> --matrix --team-2x2 \
   --planner-strong codex:gpt-5.6-sol \
   --executor-weak codex:gpt-5.6-terra \
   --executor-strong codex:gpt-5.6-sol \
-  --verifier-model antigravity:gemini-3.7-flash \
+  --verifier-model codex:gpt-5.4 \
   --team-effort low \
   --repeats 1 --max-cases 4 --report reports/team-2x2.json
 ```

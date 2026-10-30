@@ -21,8 +21,7 @@ use super::*;
 /// mirror of the registry backends — the list and the registry can no longer
 /// disagree, and a new runtime is accepted the moment its catalog entry lands.
 /// Canonical ids only (no aliases): what gets written into `agent.toml` should
-/// be the canonical value, so `agy` is rejected here even though
-/// `RuntimeType::parse` accepts it when reading.
+/// be the canonical value; aliases are not written by this endpoint.
 pub(crate) fn is_valid_runtime_provider(v: &str) -> bool {
     duduclaw_core::types::RuntimeType::from_id(v).is_some()
 }
@@ -169,6 +168,13 @@ pub(crate) fn apply_runtime_to_table_reporting(
         Some(r) => r,
         None => return Ok(RuntimeApplyOutcome::default()),
     };
+
+    for field in ["provider", "fallback"] {
+        if let Some(removed) = rt.get(field).and_then(Value::as_str)
+            .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+            return Err(removed.refusal(&format!("agent.toml [runtime] {field}")));
+        }
+    }
 
     // Validate before touching the proposal. The config commit path preserves
     // formatting and publishes nothing if this closure returns an error.

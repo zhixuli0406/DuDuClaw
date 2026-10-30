@@ -14,7 +14,6 @@
 //! |---|---|---|---|
 //! | claude | 2.1.258 | `--effort <level>` | `low medium high xhigh max` |
 //! | codex | 0.156.1 | `-c model_reasoning_effort=<v>` | `low medium high xhigh` |
-//! | antigravity (`agy`) | 1.2.10 | `--effort <v>` | `low medium high` |
 //! | grok | 1.0.41 | `--reasoning-effort <v>` (alias `--effort`) | *not enumerated by `--help`* |
 //!
 //! ## Cache note
@@ -73,7 +72,6 @@ impl Effort {
         match runtime {
             RuntimeType::Claude => Some(Effort::Max),
             RuntimeType::Codex => Some(Effort::XHigh),
-            RuntimeType::Antigravity => Some(Effort::High),
             RuntimeType::Grok => Some(Effort::High),
             // API-level compat surface (`reasoning_effort` on
             // chat/completions), spanning 8 heterogeneous presets
@@ -188,12 +186,11 @@ mod tests {
         assert_eq!(Effort::Max.clamp_for(RuntimeType::Codex), Effort::XHigh);
         assert_eq!(Effort::XHigh.clamp_for(RuntimeType::Codex), Effort::XHigh);
         assert_eq!(Effort::Low.clamp_for(RuntimeType::Codex), Effort::Low);
-        // Antigravity and Grok top out at high.
-        for rt in [RuntimeType::Antigravity, RuntimeType::Grok] {
-            assert_eq!(Effort::Max.clamp_for(rt), Effort::High);
-            assert_eq!(Effort::XHigh.clamp_for(rt), Effort::High);
-            assert_eq!(Effort::Medium.clamp_for(rt), Effort::Medium);
-        }
+        // Grok tops out at high.
+        let rt = RuntimeType::Grok;
+        assert_eq!(Effort::Max.clamp_for(rt), Effort::High);
+        assert_eq!(Effort::XHigh.clamp_for(rt), Effort::High);
+        assert_eq!(Effort::Medium.clamp_for(rt), Effort::Medium);
     }
 
     #[test]
@@ -201,7 +198,6 @@ mod tests {
         for rt in [
             RuntimeType::Claude,
             RuntimeType::Codex,
-            RuntimeType::Antigravity,
             RuntimeType::Grok,
         ] {
             assert!(Effort::is_supported_by(rt), "{rt:?} should support effort");

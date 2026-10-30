@@ -1,10 +1,8 @@
-//! Multi-runtime agent execution — Claude CLI, Codex CLI, Antigravity CLI.
+//! Multi-runtime agent execution — Claude CLI, Codex CLI, Grok CLI.
 //!
 //! The `AgentRuntime` trait abstracts over different CLI-based AI agents.
 //! Each runtime translates its JSONL output format into a unified `RuntimeResponse`.
 
-pub mod antigravity;
-mod antigravity_setup;
 pub mod claude;
 pub mod codex;
 pub mod generic_cli;
@@ -91,7 +89,7 @@ pub struct RuntimeContext {
     /// DuDuClaw-managed accounts (today: the Claude CLI runtime). Empty for
     /// agent-less utility calls and for agents that declare no pool — rotation
     /// is then unchanged. Runtimes whose credentials do not come from the
-    /// rotator (codex / gemini / antigravity host logins) ignore it.
+    /// rotator (codex / grok host logins) ignore it.
     ///
     /// [`AccountRotator`]: duduclaw_agent::account_rotator::AccountRotator
     pub account_pool: Vec<String>,
@@ -156,8 +154,7 @@ pub enum RuntimeChunk {
 /// recorded, success = true (provisional — an attempted call is still
 /// evidence, same convention as every other producer in this module). This
 /// is what keeps `runtime/codex.rs` from having to duplicate
-/// `NativeToolEvent`-building logic. Antigravity collects its native events
-/// directly. The fold also keeps
+/// `NativeToolEvent`-building logic. The fold also keeps
 /// `prediction::task_observe` from needing any runtime-specific code (design
 /// §8.2's stated purpose for routing through `RuntimeChunk` here).
 ///
@@ -433,8 +430,7 @@ pub fn spawn_work_dir_override() -> Option<PathBuf> {
 /// Single resolution point for every runtime module, for two reasons found in
 /// the 2026-09-28 review:
 ///
-/// * only `runtime/codex.rs` read the override at all — the former Gemini
-///   runtime, `antigravity.rs` and `grok.rs` used `context.agent_dir`
+/// * only `runtime/codex.rs` read the override at all — `grok.rs` used `context.agent_dir`
 ///   unconditionally, so a team role member on any of them ran in its own throwaway
 ///   scaffold and its files were deleted by the immediate GC at
 ///   `finish_role_member` (design §4.3 E3, the exact defect the override was
@@ -529,7 +525,7 @@ pub use duduclaw_core::types::RuntimeType;
 /// stay in step: a new bespoke module that is not listed here would never be
 /// reached (the generic driver would shadow it), and a listed id with no module
 /// would silently drop that runtime from the registry entirely.
-pub(crate) const BESPOKE_RUNTIME_IDS: &[&str] = &["claude", "codex", "antigravity", "grok"];
+pub(crate) const BESPOKE_RUNTIME_IDS: &[&str] = &["claude", "codex", "grok"];
 
 /// Registry of available runtimes, auto-detected at startup.
 pub struct RuntimeRegistry {
@@ -561,12 +557,6 @@ impl RuntimeRegistry {
             runtimes.insert(RuntimeType::Codex, Box::new(codex));
         }
 
-        // Antigravity (`agy`): the 2026-06-18 successor to the personal Gemini CLI.
-        let antigravity = antigravity::AntigravityRuntime::new();
-        if antigravity.is_available().await {
-            info!("Antigravity CLI (agy) detected — registering AntigravityRuntime");
-            runtimes.insert(RuntimeType::Antigravity, Box::new(antigravity));
-        }
 
         // Grok (`grok` / third-party `grok-cli`): check if the CLI is installed.
         let grok = grok::GrokRuntime::new();
@@ -738,8 +728,7 @@ pub fn load_agent_account_pool(agent_dir: &Path) -> Vec<String> {
 }
 
 /// Build the `duduclaw` MCP server definition for a non-Claude CLI's native
-/// MCP config (Codex `config.toml [mcp_servers]`, Gemini/Antigravity
-/// `settings.json mcpServers`). Mirrors
+/// MCP config (Codex and Grok `config.toml [mcp_servers]`). Mirrors
 /// `duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path` for Claude:
 /// absolute `duduclaw` binary + `mcp-server` arg + `DUDUCLAW_AGENT_ID` env
 /// (the MCP subprocess self-identifies through it — without it every call
@@ -1217,7 +1206,7 @@ mod tests {
     /// registry (the generic loop skips it, and no bespoke module registers it).
     #[test]
     fn bespoke_ids_match_the_modules_that_exist() {
-        let mut expected: Vec<&str> = vec!["claude", "codex", "antigravity", "grok"];
+        let mut expected: Vec<&str> = vec!["claude", "codex", "grok"];
         expected.sort_unstable();
         let mut got: Vec<&str> = BESPOKE_RUNTIME_IDS.to_vec();
         got.sort_unstable();
@@ -1235,9 +1224,9 @@ mod tests {
         let json = serde_json::to_string(&RuntimeType::Codex).unwrap();
         assert_eq!(json, r#""codex""#);
 
-        let parsed: RuntimeType = serde_json::from_str::<RuntimeType>(r#""antigravity""#).unwrap();
-        assert_eq!(parsed, RuntimeType::Antigravity);
-        assert!(serde_json::from_str::<RuntimeType>(r#""gemini""#).is_err());
+        for removed in ["gemini", "antigravity", "agy"] {
+            assert!(serde_json::from_str::<RuntimeType>(&format!("\"{removed}\"")).is_err());
+        }
     }
 
     #[test]
@@ -1375,11 +1364,11 @@ mod tests {
     }
 
     /// Regression (2026-09-28 review): only `codex.rs` ever read
-    /// `SPAWN_OVERRIDE.work_dir`. `antigravity.rs` and `grok.rs`
+    /// `SPAWN_OVERRIDE.work_dir`. `grok.rs`
     /// spawned in `context.agent_dir` unconditionally, so a team role member on
-    /// either runtime wrote into its own throwaway scaffold and the
+    /// the runtime wrote into its own throwaway scaffold and the
     /// immediate GC at `finish_role_member` deleted the work — design §4.3 E3,
-    /// re-opened on three of the four CLI runtimes.
+    /// reproduced on the affected CLI runtime.
     ///
     /// The behavioral half of this lock is the `resolve_spawn_work_dir` tests
     /// above; this half checks the *wiring*, because the wiring lives inside
@@ -1391,7 +1380,6 @@ mod tests {
             "super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id)";
         for (name, src) in [
             ("codex.rs", include_str!("codex.rs")),
-            ("antigravity.rs", include_str!("antigravity.rs")),
             ("grok.rs", include_str!("grok.rs")),
         ] {
             assert!(

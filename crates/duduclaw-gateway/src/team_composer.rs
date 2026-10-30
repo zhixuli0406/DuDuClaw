@@ -314,7 +314,7 @@ pub const MIN_ROUND_SPAWNS: u32 = 3;
 /// operator never wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenRole {
-    /// Canonical catalog runtime id (an alias such as `agy` already resolved).
+    /// Canonical catalog runtime id (any accepted alias already resolved).
     pub runtime: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -463,6 +463,11 @@ impl FrozenSpecViolation {
                 "團隊規格失效:審查者與執行者屬於同一個模型家族({family}),\
                  交叉查核形同虛設。請在 [team.roles] 讓 verifier 換一個家族的模型後重開任務。"
             ),
+            Self::RuntimeNotAllowed { role, runtime }
+                if duduclaw_core::runtime_catalog::removed_runtime(runtime).is_some() => {
+                duduclaw_core::runtime_catalog::removed_runtime(runtime).unwrap()
+                    .refusal(&format!("frozen [team.roles.{role}] runtime"))
+            }
             Self::RuntimeNotAllowed { role, runtime } => format!(
                 "團隊規格失效:{} 角色的執行環境「{runtime}」不在允許清單內\
                  (可能是舊規格,或這個版本已不支援)。請重新設定 [team.roles] 後重開任務。",
@@ -586,8 +591,20 @@ impl TeamResolution {
 /// gates on `is_enabled()` first so a disabled team never costs a refusal
 /// audit row.
 pub fn resolve_team(home_dir: &Path, agent_id: &str) -> TeamResolution {
-    let global = read_global_team_config(home_dir);
-    let sections = duduclaw_core::agent_toml::load_for_agent(home_dir, agent_id);
+    let configs = read_global_team_config(home_dir).and_then(|global| {
+        crate::runtime_config::read_agent_sections_for_gate(&home_dir.join("agents").join(agent_id))
+            .map(|sections| (global, sections))
+    });
+    let (global, sections) = match configs {
+        Ok(configs) => configs,
+        Err(detail) => return TeamResolution {
+            merged: TeamConfig::default(),
+            enabled_written: None,
+            cascaded: Vec::new(),
+            operator_bound: Vec::new(),
+            result: Err(TeamConfigError::ConfigUnreadable { detail }),
+        },
+    };
     let merged = TeamConfig::merge(&global, &sections.team);
     let enabled_written = merged.enabled;
     // Taken BEFORE the cascade: afterwards every required role is bound and
@@ -608,7 +625,20 @@ pub fn resolve_team(home_dir: &Path, agent_id: &str) -> TeamResolution {
         sections.runtime.provider.as_deref(),
         sections.model.preferred.as_deref(),
     );
-    let result = validate_team(&merged);
+    // A non-fatal error in an earlier role must not mask a removed runtime.
+    // Source/resolved agent choices were checked before merging; these are
+    // inherited global roles after any explicit per-agent override.
+    let removed_role = Role::ALL.iter().find_map(|role| {
+        merged.roles.get(*role).runtime.as_deref()
+            .and_then(duduclaw_core::runtime_catalog::removed_runtime)
+            .map(|removed| TeamConfigError::ConfigUnreadable {
+                detail: removed.refusal(&format!("config.toml [team.roles.{}] runtime", role.as_str())),
+            })
+    });
+    let result = match removed_role {
+        Some(error) => Err(error),
+        None => validate_team(&merged),
+    };
     TeamResolution {
         merged,
         enabled_written,
@@ -618,15 +648,26 @@ pub fn resolve_team(home_dir: &Path, agent_id: &str) -> TeamResolution {
     }
 }
 
-/// `config.toml [team]`, tolerantly. Absent / malformed ⇒ all-defaults, which
-/// resolves to Solo.
-pub fn read_global_team_config(home_dir: &Path) -> TeamConfig {
-    let Ok(content) = std::fs::read_to_string(home_dir.join("config.toml")) else {
-        return TeamConfig::default();
-    };
-    match content.parse::<toml::Value>() {
-        Ok(doc) => TeamConfig::from_config_toml(&doc),
-        Err(_) => TeamConfig::default(),
+/// Read `config.toml [team]`; only a missing file uses defaults.
+pub fn read_global_team_config(home_dir: &Path) -> Result<TeamConfig, String> {
+    let path = home_dir.join("config.toml");
+    crate::runtime_config::read_config_for_gate(&path)?
+        .as_ref().map(|doc| crate::runtime_config::strict_team_config(doc, &path))
+        .transpose().map(Option::unwrap_or_default)
+}
+
+/// Fatal configuration refusals must never fall back to Solo.
+fn fatal_dispatch_refusal(error: &TeamConfigError) -> bool {
+    matches!(error, TeamConfigError::ConfigUnreadable { .. })
+        || matches!(error, TeamConfigError::RuntimeNotAllowed { runtime, .. }
+            if duduclaw_core::runtime_catalog::removed_runtime(runtime).is_some())
+}
+
+/// Check before inserting a goal so a refusal cannot leave an orphan task.
+pub(crate) fn check_team_dispatchable(home_dir: &Path, agent_id: &str) -> Result<(), String> {
+    match resolve_team(home_dir, agent_id).result {
+        Err(error) if fatal_dispatch_refusal(&error) => Err(error.to_string()),
+        _ => Ok(()),
     }
 }
 
@@ -636,6 +677,8 @@ pub enum FreezeOutcome {
     /// `[team] enabled` is false (or unset) — nothing was written and nothing
     /// was audited. This is the default state of every deployment.
     Disabled,
+    /// Configuration could not be read safely; no Solo dispatch is allowed.
+    DispatchRefused { code: &'static str, detail: String },
     /// A spec was validated and stored.
     Frozen(FrozenTeamSpec),
     /// A spec was already frozen for this task; the stored one wins.
@@ -722,14 +765,15 @@ pub async fn freeze_for_task(
             }
         }
         Err(err) => {
-            if !merged.is_enabled() {
+            let fatal = fatal_dispatch_refusal(&err);
+            if !fatal && !merged.is_enabled() {
                 // An operator editing a disabled team gets the validation
                 // message in the log, but no team was being formed, so this is
                 // not a refusal of anything.
                 debug!(agent = %agent_id, code = err.code(), "disabled [team] spec is invalid: {err}");
                 return FreezeOutcome::Disabled;
             }
-            if default_state {
+            if !fatal && default_state {
                 // Teams are on by default; this deployment simply never named
                 // a second vendor, so executor and verifier cascaded onto the
                 // same employee model. That is the designed Solo answer, not a
@@ -754,8 +798,11 @@ pub async fn freeze_for_task(
             );
             warn!(
                 task = %task_id, agent = %agent_id, code = err.code(),
-                "team refused — task runs Solo: {err}"
+                "team refused: {err}"
             );
+            if fatal {
+                return FreezeOutcome::DispatchRefused { code: err.code(), detail: err.to_string() };
+            }
             FreezeOutcome::Refused {
                 code: err.code(),
                 detail: err.to_string(),
@@ -808,7 +855,13 @@ pub fn warn_role_team_capacity_once(home_dir: &Path) {
 
 /// The body of [`warn_role_team_capacity_once`], callable directly by tests.
 pub fn warn_role_team_capacity(home_dir: &Path) {
-    let global = read_global_team_config(home_dir);
+    let global = match read_global_team_config(home_dir) {
+        Ok(global) => global,
+        Err(error) => {
+            warn!("team capacity check refused: {error}");
+            return;
+        }
+    };
     let roster = crate::dispatch_policy::list_roster(home_dir);
     // "Enabled" alone stopped being a useful filter when the switch started
     // defaulting to `true`: every deployment would pay the roster scan and
@@ -3873,7 +3926,7 @@ fn runtime_credentials_available(runtime_id: &str) -> bool {
         return false;
     }
     if spec.auth.credential_paths.is_empty() {
-        // A runtime with no documented credential file (`antigravity`) can
+        // A runtime with no documented credential file can
         // only be judged by the CLI's presence — which is what the dashboard's
         // own credential card says about it.
         return true;
@@ -4732,15 +4785,16 @@ mod tests {
     use super::*;
     use duduclaw_core::task_packet::{Constraint, Finding, OutputFormat};
 
-    /// A removed Gemini CLI role is rejected before it can be frozen.
+    /// Removed CLI roles are rejected before a team can be frozen.
     #[test]
-    fn removed_gemini_cli_team_role_is_rejected() {
-        let cfg = TeamConfig::from_toml_value(
-            &"[roles.executor]\nruntime = \"codex\"\n[roles.verifier]\nruntime = \"gemini\"\n"
-                .parse::<toml::Value>()
-                .unwrap(),
-        );
-        assert!(matches!(validate_team(&cfg), Err(duduclaw_core::types::TeamConfigError::RuntimeNotAllowed { role: Role::Verifier, .. })));
+    fn removed_cli_team_roles_are_rejected() {
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            let cfg = TeamConfig::from_toml_value(
+                &format!("[roles.executor]\nruntime = \"codex\"\n[roles.verifier]\nruntime = {:?}\n", removed.id)
+                    .parse::<toml::Value>().unwrap(),
+            );
+            assert!(matches!(validate_team(&cfg), Err(duduclaw_core::types::TeamConfigError::RuntimeNotAllowed { role: Role::Verifier, .. })));
+        }
     }
 
     #[tokio::test]
@@ -4883,10 +4937,10 @@ skill_security_scan = false
                 family: "codex".into(),
             },
             verifier: FrozenRole {
-                runtime: "antigravity".into(),
-                model: Some("gemini-3.7-flash".into()),
+                runtime: "grok".into(),
+                model: Some("grok-4.3".into()),
                 effort: None,
-                family: "antigravity".into(),
+                family: "grok".into(),
             },
             utility: None,
         }
@@ -5173,6 +5227,72 @@ skill_security_scan = false
         );
     }
 
+    #[test]
+    fn team_config_reads_only_default_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(read_global_team_config(dir.path()).is_ok());
+        for bytes in [b"[team]\nbroken = [".as_slice(), &[0xff]] {
+            std::fs::write(&path, bytes).unwrap();
+            let error = read_global_team_config(dir.path()).unwrap_err();
+            assert!(error.contains("config.toml"));
+            assert!(!error.contains(&dir.path().display().to_string()));
+            assert!(!error.contains("broken"));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_global_team_config(dir.path()).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "[team]\nenabled = false\n").unwrap();
+        assert_eq!(read_global_team_config(dir.path()).unwrap().enabled, Some(false));
+    }
+
+    #[tokio::test]
+    async fn broken_team_configs_are_audited_refusals_not_solo_defaults() {
+        for global in [false, true] {
+            for kind in ["toml", "directory", "utf8"] {
+                let dir = tempfile::tempdir().unwrap();
+                let home = dir.path();
+                write_agent(home, "agnes", Some("codex"), "gpt-5.6-sol");
+                let agent_path = home.join("agents/agnes/agent.toml");
+                std::fs::write(&agent_path,
+                    "[runtime]\nprovider = \"codex\"\n[team.roles.verifier]\nruntime = \"antigravity\"\n").unwrap();
+                let path = if global { home.join("config.toml") } else { agent_path };
+                if kind == "directory" {
+                    if path.is_file() { std::fs::remove_file(&path).unwrap(); }
+                    std::fs::create_dir(&path).unwrap();
+                } else {
+                    let bytes = if kind == "utf8" { &[0xff][..] } else { b"[team]\nbroken = [".as_slice() };
+                    std::fs::write(&path, bytes).unwrap();
+                }
+                let resolution = resolve_team(home, "agnes");
+                assert!(!resolution.failure_is_default_state());
+                assert!(matches!(resolution.result, Err(TeamConfigError::ConfigUnreadable { .. })));
+                let store = TaskStore::open(home).unwrap();
+                assert!(matches!(freeze_for_task(home, &store, "task-1", "agnes").await,
+                    FreezeOutcome::DispatchRefused { code: "team_config_unreadable", .. }));
+                assert!(audit_lines(home).contains(AUDIT_TEAM_REFUSED));
+                assert!(crate::runtime_config::ensure_active_agent_provider(&home.join("agents/agnes")).is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_global_role_wins_over_nonfatal_errors_and_disabled_team() {
+        for enabled in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), format!(
+                "[team]\nenabled = {enabled}\n[team.roles.planner]\neffort = \"bogus\"\n\
+                 [team.roles.verifier]\nruntime = \"antigravity\"\n",
+            )).unwrap();
+            let store = TaskStore::open(home.path()).unwrap();
+            let error = check_team_dispatchable(home.path(), "agnes").unwrap_err();
+            assert!(error.starts_with("config.toml [team.roles.verifier] runtime"));
+            assert!(matches!(freeze_for_task(home.path(), &store, "task-1", "agnes").await,
+                FreezeOutcome::DispatchRefused { .. }));
+        }
+    }
+
     /// …while an operator who asked for a team and got none still gets the
     /// audit row they need to fix it.
     #[tokio::test]
@@ -5452,8 +5572,8 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
-                "gemini-3-pro-preview",
+                "grok",
+                "grok-4.3",
                 10,
                 0.70,
                 MatrixVerdict::Pass,
@@ -5461,15 +5581,15 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
-                "gemini-3.7-flash",
+                "grok",
+                "grok-4.7",
                 10,
                 0.70,
                 MatrixVerdict::Pass,
             ),
         ]);
         assert_eq!(
-            matrix_prior_model(&tie, Role::Verifier, "antigravity"),
+            matrix_prior_model(&tie, Role::Verifier, "grok"),
             None,
             "a tie is a matrix saying the two are the same, not a preference"
         );
@@ -5553,13 +5673,13 @@ skill_security_scan = false
         let home = dir.path();
         write_agent(home, "agnes", None, "claude-sonnet-4-6");
         use duduclaw_core::role_model_matrix::{MatrixRole, MatrixVerdict};
-        // `antigravity` serves `gemini-*`, so a cell naming a claude model on
+        // `grok` serves `grok-*`, so a cell naming a claude model on
         // it resolves to the claude family — different from the role's frozen
-        // `antigravity` family.
+        // `grok` family.
         matrix_with(vec![cell(
             "hr",
             MatrixRole::Verifier,
-            "antigravity",
+            "grok",
             "claude-opus-5",
             30,
             0.9,
@@ -5568,10 +5688,10 @@ skill_security_scan = false
         .save(&duduclaw_core::role_model_matrix::matrix_path(home))
         .unwrap();
         let unbound = FrozenRole {
-            runtime: "antigravity".into(),
+            runtime: "grok".into(),
             model: None,
             effort: None,
-            family: "antigravity".into(),
+            family: "grok".into(),
         };
         assert_eq!(
             matrix_prior_for_role(home, Role::Verifier, &unbound),
@@ -5723,13 +5843,13 @@ skill_security_scan = false
     #[test]
     fn capability_gap_from_matrix_refuses_a_cross_family_winner() {
         use duduclaw_core::role_model_matrix::{MatrixRole, MatrixVerdict};
-        // `antigravity` serves `gemini-*`, so a claude model measured on it
+        // `grok` serves `grok-*`, so a claude model measured on it
         // resolves to the claude family.
         let m = matrix_with(vec![
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
+                "grok",
                 "claude-opus-5",
                 30,
                 0.90,
@@ -5738,8 +5858,8 @@ skill_security_scan = false
             cell(
                 "hr",
                 MatrixRole::Verifier,
-                "antigravity",
-                "gemini-3.7-flash",
+                "grok",
+                "grok-4.3",
                 30,
                 0.60,
                 MatrixVerdict::Pass,
@@ -5749,9 +5869,9 @@ skill_security_scan = false
             capability_gap_from_matrix(
                 &m,
                 Role::Verifier,
-                "antigravity",
-                "gemini-3.7-flash",
-                "antigravity"
+                "grok",
+                "grok-4.3",
+                "grok"
             ),
             None,
             "a cross-family winner must not be reported as a gap"
@@ -5762,8 +5882,8 @@ skill_security_scan = false
         let gap = capability_gap_from_matrix(
             &m,
             Role::Verifier,
-            "antigravity",
-            "gemini-3.7-flash",
+            "grok",
+            "grok-4.3",
             "claude",
         )
         .expect("same file, claude family");
@@ -6648,7 +6768,7 @@ skill_security_scan = false
             "[team]\nenabled = true\nexecutor_fanout = 2\n\
              [team.roles.planner]\nruntime = \"claude\"\nmodel = \"claude-fable-5-1\"\n\
              [team.roles.executor]\nruntime = \"codex\"\nmodel = \"gpt-5.5\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();
@@ -6658,7 +6778,7 @@ skill_security_scan = false
             panic!("expected Frozen, got {first:?}");
         };
         assert_eq!(spec.executor.runtime, "codex");
-        assert_eq!(spec.verifier.runtime, "antigravity");
+        assert_eq!(spec.verifier.runtime, "grok");
         assert_eq!(spec.executor_fanout, 2);
 
         // Freeze-once: a second call never rewrites.
@@ -6677,8 +6797,8 @@ skill_security_scan = false
         write_team_config(
             home,
             "[team]\nenabled = true\n\
-             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.executor]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n\
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();
@@ -7132,8 +7252,8 @@ skill_security_scan = false
         write_team_config(
             home,
             "[team]\nenabled = false\n\
-             [team.roles.executor]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-pro\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.executor]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n\
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
         );
         let store = store_in(home);
         store.insert_task(&task("t1")).await.unwrap();

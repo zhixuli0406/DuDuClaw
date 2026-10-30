@@ -61,7 +61,7 @@ Search results are ranked by **trust-weighted score** = `fts5_rank × trust`. A 
 
 ## Auto-Injection Flow
 
-The injection happens at system prompt assembly time — in three places, so every runtime (Claude, Codex, Antigravity, Grok, OpenAI-compatible and the rest of the catalog) gets the same knowledge:
+The injection happens at system prompt assembly time — in three places, so every runtime (Claude, Codex, Grok, OpenAI-compatible and the rest of the catalog) gets the same knowledge:
 
 ```
 User sends message

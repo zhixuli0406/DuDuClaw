@@ -1,6 +1,6 @@
 # マルチランタイムエージェント実行
 
-> 1つのプラットフォームに 12 のランタイム ID：11 の CLI バックエンド（Claude、Codex、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
+> 1つのプラットフォームに 11 のランタイム ID：11 の CLI バックエンド（Claude、Codex、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
 
 ## 失敗の発生元と明示的なフォールバック
 
@@ -45,7 +45,7 @@ AgentRuntime trait:
   fn health_check() → Status
 ```
 
-すべてのバックエンド——Claude、Codex、Antigravity、またはOpenAI互換エンドポイント——は同じインターフェースを実装します。システムの残りの部分は、どのバックエンドが特定のリクエストを処理しているか知る必要も、気にする必要もありません。
+すべてのバックエンド——Claude、Codex、またはOpenAI互換エンドポイント——は同じインターフェースを実装します。システムの残りの部分は、どのバックエンドが特定のリクエストを処理しているか知る必要も、気にする必要もありません。
 
 ### ランタイムカタログ
 
@@ -55,7 +55,6 @@ AgentRuntime trait:
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token`（コード貼り付け） | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login --device-auth`（デバイスコード。Docker／リモート対応） | `~/.codex/auth.json` |
-| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json（v1.2.10） | ターミナルで `agy` を実行して Google サインイン（`login` サブコマンドなし）、または API キーモード | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh`（手動） | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | なし（API キーのみ） | `~/.qwen/.env` |
 | Kimi Code | `kimi` | npm `@moonshot-ai/kimi-code` | `-p <prompt> --output-format stream-json` | jsonl | `kimi login`（デバイスコード） | `~/.kimi-code/credentials/` |
@@ -66,9 +65,9 @@ AgentRuntime trait:
 | OpenCode | `opencode` | `opencode.ai/install` | `run <prompt> --auto --format json` | jsonl | `opencode auth login` | `~/.local/share/opencode/auth.json` |
 | OpenAI 互換エンドポイント | *(HTTP)* | — | — | json | なし（API キーのみ） | — |
 
-**ダッシュボードのワンクリックログイン**は Claude、Codex、Grok、Kimi、Copilot、Kiro、OpenCode に対応します。Codex はデバイスコード方式です。CLI に表示される認証ページとコードをブラウザで使い、CLI の完了を待ってください。OAuth コールバック URL の `code` をダッシュボードに貼り付ける必要はありません。Cursor はランタイムとして残りますが、ブラウザコールバックをリモートのダッシュボードから確実に完了できないため、ワンクリックログインには表示しません。Antigravity にはスクリプト化されたログインコマンドがなく、Qwen と Mistral Vibe は API キーを使います。アカウントページの API Token カードから、アカウント id を確認して保存済みアカウントを削除できます。プロバイダー側のキーは失効しません。
+**ダッシュボードのワンクリックログイン**は Claude、Codex、Grok、Kimi、Copilot、Kiro、OpenCode に対応します。Codex はデバイスコード方式です。CLI に表示される認証ページとコードをブラウザで使い、CLI の完了を待ってください。OAuth コールバック URL の `code` をダッシュボードに貼り付ける必要はありません。Cursor はランタイムとして残りますが、ブラウザコールバックをリモートのダッシュボードから確実に完了できないため、ワンクリックログインには表示しません。Qwen と Mistral Vibe は API キーを使います。アカウントページの API Token カードから、アカウント id を確認して保存済みアカウントを削除できます。プロバイダー側のキーは失効しません。
 
-Gemini CLI は DuDuClaw のランタイムと Docker パッケージから削除されました。既存の `runtime = "gemini"` 設定は Antigravity に移行してください。別の Gemini API プロバイダーは引き続きサポートします。[削除と移行](../../guides/ja-JP/deprecations.md)を参照してください。
+Gemini CLI は DuDuClaw のランタイムと Docker パッケージから削除されました。既存の `runtime = "gemini"` 設定では別のランタイムと互換モデルを選んでください。別の Gemini API プロバイダーは引き続きサポートします。[削除と移行](../../guides/ja-JP/deprecations.md)を参照してください。
 
 モデル指定の書き方はベンダーごとに異なり、カタログはどの形式かも記録します：独立したフラグ（`--model <id>`）、Copilot が文書化している等号形式（`--model=<id>`）、フラグを持たない CLI 向けの環境変数（Mistral Vibe の `VIBE_ACTIVE_MODEL`）、あるいは無し（Kiro は呼び出しごとではなく `kiro-cli settings` でモデルを選びます）。
 
@@ -76,7 +75,7 @@ Gemini CLI は DuDuClaw のランタイムと Docker パッケージから削除
 
 - **Kiro**——AWS の FAQ には、Kiro のネイティブ インターフェース以外へリクエストを流すサードパーティ製自動化ハーネス経由の利用は許可されないと明記されています。DuDuClaw から Kiro を駆動することはこれに該当します。自身の CI から `kiro-cli` を直接呼び出すことは許可されています。Kiro のインストール経路が手動なのはこのためです——判断はあなたが明示的に行ってください。
 - **Anthropic**——[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。認められているのは、自分のサブスクリプションで改変されていない Claude Code にサインインすることで、Pro と Max の利用上限は通常の利用を前提としています。Anthropic は事前の通知なく執行できるとしており、アカウント停止の報告もあります。製品向けに案内されているのは Claude Console の API キーです。
-- **Google**——[Gemini CLI の規約](https://geminicli.com/docs/resources/tos-privacy/)には、サードパーティのソフトウェア・ツール・サービスから Gemini CLI の OAuth を使って背後のサービスに直接アクセスすることは規約違反で、アカウントの停止または終了の理由になり得ると書かれています。[Antigravity の規約](https://antigravity.google/terms)第 6 条も、サードパーティのソフトウェアによる Antigravity へのアクセスについて同じ趣旨で、Antigravity や Gemini CLI のアカウントが停止または終了される場合があるとしています。同じ条では、Google が提供していない製品と組み合わせてサービスを使うことも不正利用に含めています。DuDuClaw は改変されていない Antigravity CLI を実行しますが、これが該当するかどうかは Google が判断します。Google の [Gemini Code Assist for individuals 廃止のお知らせ](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals)（2026-10-09 更新）によると、2026-06-18 以降、Gemini Code Assist for individuals、Google AI Pro、Google AI Ultra のアカウントでは Gemini CLI の Login with Google を使えません。有料の API キー（Gemini API またはエンタープライズ）は引き続き使えます。API キーをご利用ください。
+
 - **Qwen**——無料 OAuth ティアは 2026-04-15 に終了しました。API キー（ModelStudio / DashScope）のみです。
 - **OpenCode**——MIT で独自の制限はありませんが、上記の理由により 1.3.0 で Anthropic サブスクリプション プラグインを削除しました。プロバイダーの API キーをご利用ください。
 - **OpenAI**——OpenAI には公式の Sign in with ChatGPT プログラムがあります（[規約](https://openai.com/policies/sign-in-with-chatgpt-terms/)、2026-09-29 版）。[クイックスタート](https://developers.openai.com/siwc/quickstart)には、Sign in with ChatGPT は現在、限定トライアルとして選ばれた商用パートナーに提供されていること、ChatGPT プランの利用はすべてのオープンソースのパートナーと選ばれたプライベートクライアントに提供されていることが書かれています。[ヘルプ記事](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)では、サポート対象のオープンソースツールは引き続き使え、商用パートナーは申請フォームから申し込むとしています。つまり商用製品には OpenAI の承認が必要です。規約ではさらに、ユーザーがパートナーへの支払いやプランのアップグレードなしに自分の ChatGPT プランを使えること、認証トークンを永続的に保存する場合はユーザーが管理するローカル環境に限り、リモートやマネージド環境には置かないこと、ほかのツールや無関係なリクエストのための汎用 API アクセスを提供しないことを求め、違反すると Sign in with ChatGPT の利用を停止される場合があるとしています。OpenAI の Codex 責任者は 2026-09-08 に、あるサードパーティのアプリについて「Sorry, but this is not an approved use of Sign in With ChatGPT. We support pure OSS clients and others we have partnerships with, but you need to reach out and talk to us for that.」と[投稿](https://x.com/thsottiaux/status/2097131394199896166)しています。DuDuClaw をリモートのホストやコンテナで動かす場合、Codex のトークン（`~/.codex/auth.json`）もそこに保存されます。[利用規約](https://openai.com/policies/terms-of-use/)は引き続き適用されます。安定して使うなら API キーです。
@@ -86,11 +85,11 @@ Gemini CLI は DuDuClaw のランタイムと Docker パッケージから削除
 
 ### バックエンドの駆動方法
 
-4 つの CLI バックエンド（`claude`、`codex`、`antigravity`、`grok`。`runtime/mod.rs` の `BESPOKE_RUNTIME_IDS`）は専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。残り 7 つの CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）はこの汎用ランタイムを通ります。`openai_compat` は CLI ではなく、独自の HTTP モジュール（`runtime/openai_compat.rs`）を持ちます。手書きのモジュールは合計 5 つです。
+3 つの CLI バックエンド（`claude`、`codex`、`grok`。`runtime/mod.rs` の `BESPOKE_RUNTIME_IDS`）は専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。残り 7 つの CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）はこの汎用ランタイムを通ります。`openai_compat` は CLI ではなく、独自の HTTP モジュール（`runtime/openai_compat.rs`）を持ちます。手書きのモジュールは合計 5 つです。
 
 ### 主なバックエンド
 
-以下では Claude、Codex、OpenAI 互換エンドポイントを説明します。Antigravity と Grok は後のセクションで説明します。
+以下では Claude、Codex、OpenAI 互換エンドポイントを説明します。Grok は後のセクションで説明します。
 
 **Claude Runtime** — Claude Code CLI（`claude`）をJSONLストリーミング出力で呼び出します。ネイティブMCPツールサポート、bash実行、Web検索、ファイル操作が組み込まれた最も機能豊富なバックエンドです。
 
@@ -165,28 +164,28 @@ Registryは利用可能なバックエンドを把握
 ```toml
 [runtime]
 provider = "claude"          # プライマリバックエンド
-fallback = "antigravity"     # プライマリが利用不可時のフォールバック
+fallback = "codex"     # プライマリが利用不可時のフォールバック
 ```
 
 `provider` がない場合、エージェントは Claude で動作します。認識できない値は警告を記録し、同じく Claude にフォールバックします。
 
 ### 実行時間の上限とバックグラウンドモデル
 
-`agent.toml [runtime] timeout_secs` は Codex、Grok、Antigravity、その他の CLI ランタイムの 1 回の実行、および OpenAI 互換 API の各リクエスト（通常、ストリーミング、ツールループ）の時間上限です。既定は **300 秒**、指定できる整数は **30〜3600** です。Claude には別の固定 **30 分の安全上限**があり、この設定では変更しません。手動編集した整数が範囲外なら最も近い境界に補正して警告を記録し、型が違う値は警告を記録して無視し、300 秒を使います。ダッシュボードでの保存は不正な値を拒否します。コンテナのタスクタイムアウトとは別の設定です。Antigravity はこの秒数を `--print-timeout` に渡し、外側の最終上限にはさらに 30 秒を確保します。
+`agent.toml [runtime] timeout_secs` は Codex、Grok、その他の CLI ランタイムの 1 回の実行、および OpenAI 互換 API の各リクエスト（通常、ストリーミング、ツールループ）の時間上限です。既定は **300 秒**、指定できる整数は **30〜3600** です。Claude には別の固定 **30 分の安全上限**があり、この設定では変更しません。手動編集した整数が範囲外なら最も近い境界に補正して警告を記録し、型が違う値は警告を記録して無視し、300 秒を使います。ダッシュボードでの保存は不正な値を拒否します。コンテナのタスクタイムアウトとは別の設定です。
 
 `timeout_secs` の実効上限を増やすには管理者権限が必要です。Owner は上限を下げられます。設定を空にすると 300 秒に戻り、現在の実効上限より増える場合は管理者が必要です。
 
-Codex の従来の上限は 120 秒でした。タイムアウト時に完了済みの本文を返すのは、ユーザー向けチャネル返信だけです。judge／verifier を含む補助呼び出しと内部のテキスト専用呼び出しは、部分出力を破棄してタイムアウトエラーを返します。内部の会話には時間の上限に達した旨を添えますが、Odoo の公開訪問者には完了済みの本文だけを返します。未完了の JSONL 項目は回答にしません。完了済みの応答がなければタイムアウトとして失敗します。Grok と Antigravity のタイムアウトも、不明なエラーではなくタイムアウトと表示します。
+Codex の従来の上限は 120 秒でした。タイムアウト時に完了済みの本文を返すのは、ユーザー向けチャネル返信だけです。judge／verifier を含む補助呼び出しと内部のテキスト専用呼び出しは、部分出力を破棄してタイムアウトエラーを返します。内部の会話には時間の上限に達した旨を添えますが、Odoo の公開訪問者には完了済みの本文だけを返します。未完了の JSONL 項目は回答にしません。完了済みの応答がなければタイムアウトとして失敗します。Grok のタイムアウトも、不明なエラーではなくタイムアウトと表示します。
 
 Windows の管理対象 CLI は停止状態で生成し、kill-on-close Job Object への割り当て成功後に再開します。親が先に終了しても Job 全体を終了でき、割り当てに失敗した子は終了させてエラーを返します。このラウンドでは Windows ネイティブ実行は未検証です。会話 owner が `_` または `.` で始まる場合は内部ディレクトリとしてバックグラウンド処理を拒否します。
 
 Grok のパイプモードで応答が空の場合、PTY で再実行しません。この経路ではタイムアウト後にプロセスツリー全体の終了を保証できないため、空応答のエラーを返します。
 
-バックグラウンドの決定確認、指示抽出、事実抽出、会話圧縮が社員自身のランタイムを使うのは Claude、Codex、OpenAI 互換 API の場合です。空白ではない `[model] utility` が優先し、未設定なら Claude は `claude-haiku-4-5`、Codex と OpenAI 互換 API は `[model] preferred` を使います。両方が空白なら Codex は CLI の既定モデルを使い、API は呼び出しを拒否します。Grok、Antigravity、汎用 CLI の社員はグローバルのバックグラウンド設定を使います。明示した補助モデルとランタイムのベンダー系統が異なる場合はダッシュボードに警告します。
+バックグラウンドの決定確認、指示抽出、事実抽出、会話圧縮が社員自身のランタイムを使うのは Claude、Codex、OpenAI 互換 API の場合です。空白ではない `[model] utility` が優先し、未設定なら Claude は `claude-haiku-4-5`、Codex と OpenAI 互換 API は `[model] preferred` を使います。両方が空白なら Codex は CLI の既定モデルを使い、API は呼び出しを拒否します。Grok、汎用 CLI の社員はグローバルのバックグラウンド設定を使います。明示した補助モデルとランタイムのベンダー系統が異なる場合はダッシュボードに警告します。
 
 Claude の補助呼び出しは継承した環境をクリアし、共通の spawn 許可リストを適用してから、通常のローテーションなし Claude 起動と同じ取得元の Anthropic API key だけを追加します（OAuth は従来の HOME／キーチェーン／設定ディレクトリを使用）。軽量パスを実行し、アカウントローテーションには入りません。通常の会話は既存のローテーションを維持します。
 
-分類と評価を含む補助呼び出しは、専用の実行モードを使います。Claude はツールなしの単一ターンの軽量パス、OpenAI 互換 API はツールなしの単一 completion を使い、ツールループには入りません。Codex は制限モードで実行します：読み取り専用サンドボックス、プラットフォームの MCP 設定を追加しない、毎回新規作成する所有者だけがアクセスできる空の一時作業ディレクトリ、ユーザー設定の無視、セッション保存なし。一時ディレクトリはエラーやタイムアウトを含め呼び出し終了後に削除します。システムプロンプトは prompt 内で渡し、`AGENTS.md` は書きません。Codex を明示した judge とチーム verifier も同じモードです。Grok、Antigravity、汎用 CLI は補助実行に非対応のため、社員のバックグラウンド処理はグローバルの補助プロバイダー／モデル（既定 Claude／`claude-haiku-4-5`）を使い、社員とランタイムの組み合わせごとに一度警告します。グローバルでは Claude、Codex、OpenAI 互換 API が使えます。非対応のグローバルプロバイダーや明示指定は拒否します。上位の評価処理が非対応の指定なしで再試行する場合も同じモードを適用します。Codex には内蔵の読み取りツールが残る可能性があります。残るリスクは[セキュリティ防御](05-security-defense.md)を参照してください。
+分類と評価を含む補助呼び出しは、専用の実行モードを使います。Claude はツールなしの単一ターンの軽量パス、OpenAI 互換 API はツールなしの単一 completion を使い、ツールループには入りません。Codex は制限モードで実行します：読み取り専用サンドボックス、プラットフォームの MCP 設定を追加しない、毎回新規作成する所有者だけがアクセスできる空の一時作業ディレクトリ、ユーザー設定の無視、セッション保存なし。一時ディレクトリはエラーやタイムアウトを含め呼び出し終了後に削除します。システムプロンプトは prompt 内で渡し、`AGENTS.md` は書きません。Codex を明示した judge とチーム verifier も同じモードです。Grok、汎用 CLI は補助実行に非対応のため、社員のバックグラウンド処理はグローバルの補助プロバイダー／モデル（既定 Claude／`claude-haiku-4-5`）を使い、社員とランタイムの組み合わせごとに一度警告します。グローバルでは Claude、Codex、OpenAI 互換 API が使えます。非対応のグローバルプロバイダーや明示指定は拒否します。上位の評価処理が非対応の指定なしで再試行する場合も同じモードを適用します。Codex には内蔵の読み取りツールが残る可能性があります。残るリスクは[セキュリティ防御](05-security-defense.md)を参照してください。
 
 定期的な会話要約と自動タイトルも、会話の所有者に同じ補助プロバイダー選択とグローバル設定への切り替えを適用します。保存された所有者はシステム予約名でない実在の社員で、ID が一致する `agent.toml` が必要です。ディレクトリはシンボリックリンクでなく、正規化した `<home>/agents` の直接の子である必要があります。空でない無効な所有者はエラーとして補助処理を中止します。所有者が空の場合だけグローバル設定を直接使います。要約の保護セクションはモデルに送らず、既存の上限内で原文を維持します。明示された補助モデルが非互換でも値は保持し、エージェントとモデルの組み合わせにつき一度警告します。担当者のない処理の `[runtime] utility_provider` / `utility_model` は「設定 → 詳細 → システム」で変更できます。
 
@@ -197,7 +196,7 @@ Claude の補助呼び出しは継承した環境をクリアし、共通の spa
 ```
 Agent "dudu"（カスタマーサポート）→ Claude（最高の推論能力）
 Agent "coder"（コード生成）    → Codex（コードに最適化）
-Agent "analyst"（データ分析）   → Antigravity
+Agent "analyst"（データ分析）   → Codex
 Agent "local"（プライバシー重視）→ OpenAI互換（ローカルエンドポイント）
 ```
 
@@ -228,7 +227,6 @@ effort    = "high"          # low | medium | high | xhigh | max
 |---|---|---|---|
 | `claude` | 2.1.258 | `--effort <v>` | `low` `medium` `high` `xhigh` `max` |
 | `codex` | 0.156.1 | `-c model_reasoning_effort=<v>`（設定オーバーライド、専用フラグなし） | `low` `medium` `high` `xhigh` |
-| `antigravity`（`agy`） | 1.2.10 | `--effort <v>` | `low` `medium` `high` |
 | `grok` | 1.0.41 | `--reasoning-effort <v>`（別名 `--effort`） | *`--help` では列挙されていません* |
 | `openai_compat` | — | リクエストボディの `reasoning_effort` | `low` `medium` `high` |
 
@@ -236,13 +234,13 @@ effort    = "high"          # low | medium | high | xhigh | max
 
 受け付ける値の集合が異なるため、設定値は対象ランタイムが受け付ける値まで**下方向に**クランプされます。黙って捨てられることも、CLI が拒否する値が送られることもありません。
 
-| 設定値 | claude | codex | antigravity | grok | openai_compat |
-|---|---|---|---|---|---|---|
-| `low` | `low` | `low` | `low` | `low` | `low` |
-| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` |
-| `high` | `high` | `high` | `high` | `high` | `high` |
-| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** |
-| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** |
+| 設定値 | claude | codex | grok | openai_compat |
+|---|---|---|---|---|
+| `low` | `low` | `low` | `low` | `low` |
+| `medium` | `medium` | `medium` | `medium` | `medium` |
+| `high` | `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** |
+| `max` | `max` | **`xhigh`** | **`high`** | **`high`** |
 
 Grok を意図的に `high` で頭打ちにしているのは、`--help` がフラグ名には触れていても値を列挙していないためです。`xhigh`/`max` を渡すと "unexpected value" で spawn 全体が落ちるおそれがあります。`openai_compat` も、8 つの異質なプリセットにまたがるため同じ理由で上限を設けています。どちらの上限も 1 か所（`duduclaw-core/src/effort.rs`）にあり、実機での動作確認が取れた時点で引き上げられます。
 
@@ -283,10 +281,10 @@ Claude runtime：レート制限中（クールダウン：2分）
      |
      v
 FailoverManagerがagent設定を確認：
-  fallback = "antigravity"
+  fallback = "codex"
      |
      v
-Antigravity runtimeにルーティング
+互換 runtime にルーティング
      |
      v
 Claudeクールダウン完了 → プライマリルーティングを復元
@@ -369,21 +367,17 @@ Codex は `.mcp.json` を読まないため、Codex の spawn は duduclaw と�
 - サードパーティサーバー自身の環境変数（認証情報）は `argv` にも `.codex/config.toml` にも書かず、`<home>/tmp/mcp-proxy-env/`（0700 のディレクトリ）内のその spawn 専用で所有者だけが読めるファイルに置き、`DUDUCLAW_MCP_PROXY_ENV_FILE` がそれを指します。gateway は起動時に 15 分より古いファイルを削除します。そのため `.codex/config.toml` だけで手動で `codex` を実行すると、これらのサーバーは宣言された環境変数なしで起動します。`.codex/config.toml` は作成時点から所有者だけが読める状態で書かれ（一時ファイル＋リネーム）、既存のファイルもその権限に戻されます。`DUDUCLAW_MCP_API_KEY` は上の表のとおりです（0.157 以上は `env_vars`）。
 - Codex は MCP 子プロセスの環境をクリアするため、読み取り専用レーンは `env.DUDUCLAW_LANE` として各サードパーティサーバーに渡されます。
 
-### Grok、Antigravity、ツールループ：従業員のその他の MCP サーバー（2026-10-20）
+### Grok とツールループ：従業員のその他の MCP サーバー（2026-10-20）
 
 MCP サーバーを自分で登録する他のランタイムにも同じ穴があり、Grok ではサーバーが欠けるだけでは済みませんでした。現在はどれも Codex と同じ制御付きの書き換えを通ります。stdio サーバーは `duduclaw mcp-proxy` 経由、リモートブリッジはそのまま、直接の `url`／`type` 項目は取り除かれて監査に記録され、DuDuClaw の名前を使う項目は gateway 自身のサーバーを置き換えられず、英数字・`_`・`-` 以外を含む（または 64 文字を超える）名前は登録されません。
 
 **Grok。** Grok 1.0.62 は作業ディレクトリの `.mcp.json` を自分で読みます（`grok inspect` が読み込み元として表示し、同梱のドキュメントにも書かれています）。従業員の場合それは `<agent_dir>/.mcp.json` なので、従業員のその他のサーバーはすでに Grok が proxy なしで起動していました。つまり `action_rules`、承認、読み取り専用レーンのどれも効かず、`url` 項目は直接接続されていました。Grok が読むのはそれだけではありません（`grok inspect` で確認、同梱の `07-mcp-servers.md`、`05-configuration.md` にも記載）。`<cwd>/.cursor/mcp.json`（Cursor 互換、既定で有効）、そしてディレクトリが git リポジトリ内にあるときは、リポジトリのルートまでの各階層の `.mcp.json` と `.grok/config.toml` も読みます。`<cwd>/.claude.json` や `.claude/settings*.json` の `mcpServers` は読みません。これらはどれも作業ディレクトリの `.grok/config.toml` より優先度が低いため、ランタイムはそこに現れるすべての名前をこのファイルに書くようになりました。従業員自身の `.mcp.json` で制御を通ったサーバーは spawn スコープの proxy（後述）として、それ以外（`duduclaw-pro` のような DuDuClaw 名の余分な項目を含む）は元の項目を隠す無効化された項目として書きます。存在するのに解析できない読み込み元があれば spawn を拒否します。従業員がもう載せていないサーバーのためにランタイムが書いた項目は削除し、管理者が手で追加した項目には触れず、spawn のたびに警告を記録します。従業員ディレクトリの `.cursor/` も `.grok/` と同様に従業員は変更できなくなりました。
 
-**Antigravity。** agy は `.agents/mcp_config.json` しか読みません（1.4.2 で確認：`.mcp.json` のサーバーは起動されない）。そのため、これらのサーバーは単に存在しませんでした。現在は制御を通った各サーバーを `command` と `args` だけでそこに登録し、`~/.gemini/antigravity-cli/settings.json` に `mcp(<サーバー>/*)` のルールとそのスキーマディレクトリの読み取りルールを追加します。これがないと agy の print モードは呼び出しを拒否します。判断するのは proxy で、Codex の `default_tools_approval_mode = "auto"` と同じです。
-
-**spawn スコープの proxy（Grok と Antigravity）。** どちらのファイルも永続的で、そのディレクトリのすべての spawn が共有し、どちらの CLI にも実行ごとの MCP オーバーライドがありません。そのためファイルには spawn ごとの値も上流の認証情報も書きません。各サーバーは `duduclaw mcp-proxy --spawn-scoped --server <名前> -- …` として登録されます。spawn は上流サーバーの環境変数を `<home>/tmp/mcp-proxy-env/` の下に新しく作る所有者専用のディレクトリに書き、`DUDUCLAW_MCP_PROXY_ENV_DIR` でそれを指します。agy は起動する MCP 子プロセスに自分の環境を渡し、Grok は読み込み時に項目の `env` にある `${DUDUCLAW_MCP_PROXY_ENV_DIR:-}` を展開します。ディレクトリは CLI の終了時に削除され、gateway も起動時に 15 分より古い残りを削除します。spawn スコープの proxy は、ディレクトリがない、または自分のサーバーのファイルがない場合は何も起動しません。そのため、これらのランタイムでの補助呼び出しは従業員のサーバーを受け取らず、管理者がそのディレクトリで `grok` や `agy` を手で実行しても同じです。同じ従業員の spawn が同時に 2 つ走っても、ファイルに書く内容は同じで、ディレクトリはそれぞれ別です。Grok の項目には proxy 自身の身元（エージェント ID、home、同じファイルの `duduclaw` 項目がもともと持っている MCP 認証情報）も入りますが、エージェントトークンは入りません。上流サーバーはエージェント CLI 用の許可リストの環境と宣言された環境変数から起動するため、CLI 自身のベンダーキー（`XAI_API_KEY`、`GEMINI_API_KEY`）は届きません。
-
-既知の制限：agy の権限ルールは OS ユーザーの設定に追加され、削除されません（管理者が手で使うワークスペースに同名のサーバーがあれば、そこでも自動承認されます）。`.grok/config.toml` や `.agents/mcp_config.json` にある DuDuClaw が書いていない項目（`duduclaw` を除く）はすべてそのまま残し、spawn のたびに警告を記録します。CLI はそれを proxy なしで起動します。借用した作業ルートで 2 人の従業員が同名のサーバーを持つ場合は 1 つの項目を共有し、実際に走った spawn が自分の環境ファイルを使います。spawn が読んだ後、Grok 自身が読む前に変更された `.mcp.json`（または `.cursor/mcp.json`）は対象外です。大文字小文字だけが違う 2 つのサーバー名は spawn を拒否します（大文字小文字を区別しないディスクでは同じ環境ファイルになるため）。Grok のユーザーレベルの `~/.grok/config.toml` は従業員ディレクトリの外にあり、上書きされません。Grok の Claude／Cursor 互換の MCP 読み込み（`~/.claude.json`、`~/.cursor/mcp.json`、`<cwd>/.cursor/mcp.json`）は、DuDuClaw が起動するすべての spawn で `GROK_CLAUDE_MCPS_ENABLED=false`、`GROK_CURSOR_MCPS_ENABLED=false` により無効化します（2026-10-20 のオーナー決定。`grok inspect` ではそれらのサーバーが `[disabled]` と表示されます）。Grok の Claude／Cursor 互換の hook 読み込みも同じ方法で無効化します（`GROK_CLAUDE_HOOKS_ENABLED=false`、`GROK_CURSOR_HOOKS_ENABLED=false`）。OS ユーザーの `~/.claude/settings.json` と `~/.cursor/hooks.json` の hook が従業員のターンで実行されることはありません。これにより Grok は従業員の `.claude/settings.json` も読まなくなるため、DuDuClaw の `agent-file-guard` と `data-file-guard` は spawn のたびに Grok のプロジェクト hook ファイル `<cwd>/.grok/hooks/duduclaw-guards-<社員>.json` として同じ matcher とコマンドで書き出します。書き込めない spawn は拒否します。管理者が従業員の `.claude/settings.json` に追加した他の hook は Grok では実行されなくなり、Grok 自身のグローバル hook（`~/.grok/hooks/`）は引き続き実行されます。Claude／Cursor 互換の rules・skills・agents の読み込みも無効にします（`GROK_CLAUDE_RULES_ENABLED`、`GROK_CLAUDE_SKILLS_ENABLED`、`GROK_CLAUDE_AGENTS_ENABLED` と対応する 3 つの `GROK_CURSOR_*`、すべて `false`）。OS ユーザーの `~/.claude/CLAUDE.md`、`~/.claude/rules/`、`~/.claude/skills/`、`~/.cursor/skills/` が社員のターンに入ることはありません。作業ディレクトリ自身の `AGENTS.md` と `CLAUDE.md` は Grok ネイティブの読み込みなので引き続き読み込まれます（社員ディレクトリより上に git リポジトリがなければ、Grok は親ディレクトリの `AGENTS.md` や `CLAUDE.md` を読みません）。管理者が社員の `.claude/rules/` や `.claude/skills/` に置いた rule と skill は Grok の社員では読み込まれなくなります（DuDuClaw 自身の skill は `SKILLS/` にあり影響しません）。Grok 1.0.62 の既知の制限：agents を無効にしても `grok inspect` は `~/.claude/agents/` のサブエージェント定義を表示し続けます。Cursor rules のスイッチはオンでもオフでも `grok inspect` に `.cursor/rules/` のファイルが表示されないため、設定はしていますが効果は未検証です。Grok ネイティブのユーザーレベルのソース（`~/.grok/`、`~/.agents/skills/`）は互換スイッチの対象外で、引き続き読み込まれます。
+**spawn 範囲の proxy（Grok）。** MCP 登録は永続ファイルに置き、上流の認証情報は spawn ごとの所有者専用ディレクトリに保存します。`duduclaw mcp-proxy --spawn-scoped` は `DUDUCLAW_MCP_PROXY_ENV_DIR` に対応するサーバーのファイルがなければ何も起動しません。CLI の終了時にディレクトリを削除し、起動時には 15 分を過ぎた残存ファイルを清掃します。Grok の補助実行は起動前に拒否され、社員の背景処理はサポートされたグローバル補助設定を使います。
 
 **openai-compat、Direct API、ローカル推論。** この 3 つは 1 つのツールループ構築関数（`claude_runner::build_mcp_tool_registry`）を共有しており、これまでは DuDuClaw のサーバーと `agent.toml [[mcp.external]]` だけをマウントしていました。現在は `.mcp.json` のサーバーもマウントします。どれも制御付きの書き換えの結果どおりに、gateway の環境ではなくエージェント CLI 用の許可リストの環境から起動するため、gateway の環境にある他ベンダーのキーがサードパーティサーバーに届くことはありません。この経路では何もディスクに書きません。読み取り専用レーンでも `DUDUCLAW_LANE=explore` 付きでマウントされ、proxy を通るのは読み取り専用のツールだけです（Claude のレーン内 spawn と同じ）。`agent.toml` の外部サーバーは、制御するものがないためレーン内では引き続きマウントしません。両方のファイルで宣言されたサーバー（同じ名前、または同じコマンドと引数）は、ツール許可リストと `secret://` 参照を持つ `agent.toml` 側から 1 回だけマウントされます。
 
-**失敗時は拒否。** サードパーティサーバーがあるとき、`.mcp.json` を読めない・解析できない、または spawn ゲートが拒否した場合、その実行は spawn ゲートのエラーで止まり、フェイルオーバーも止まります。openai-compat ランタイムは返信を拒否し、Direct API とローカル推論のツールループはツールなしで回答します。Grok では設定を書けない場合も spawn を拒否します（無効化項目が欠けると、Grok が制御なしのサーバーを自分で起動してしまうため）。Grok の補助呼び出しは `.mcp.json` の内容にかかわらず、設定確認や起動の前に拒否します。Antigravity では、サードパーティサーバーがあって登録に失敗した場合に spawn を拒否します。サードパーティサーバーがなければ、どの spawn も以前と同じです。Grok と Antigravity は、これらの処理の前に読み取り専用レーンを拒否します。
+**失敗時は拒否。** 第三者サーバーがある場合、設定を読めない、解析できない、または spawn ゲートが拒否した実行は停止し、フェイルオーバーもしません。Grok の設定を書き込めない場合も起動を拒否します。openai-compat は応答を拒否し、Direct API とローカル推論はツールなしで応答します。Grok は読み取り専用レーンを拒否します。
 
 **未検証。** 実際の `grok -p` の対話（サインイン済みの Grok が必要。設定は一時的な `HOME` で `grok mcp doctor` と `grok inspect` を使って確認）。いずれかのランタイムの実モデルがサードパーティツールを実際に呼ぶこと。承認が必要なサードパーティツールが CLI の制限時間内に承認を待てるか。
 
@@ -391,60 +385,13 @@ MCP サーバーを自分で登録する他のランタイムにも同じ穴が�
 
 呼び出し側は、ある spawn をエージェント自身のディレクトリ以外の場所で実行するよう求められます。現在の呼び出し側はチームコンポーザー（team composer）だけで、ロールメンバーを従業員のワークスペースに置きます。こうすると、使い捨ての scaffold がメンバーの終了と同時にガベージコレクトされても、メンバーが書いたファイルは残ります。
 
-2026-09-28 までは、このリクエストに応えるのは Codex バックエンドだけでした。Gemini、Antigravity、Grok は、依頼にかかわらずエージェントのディレクトリで spawn されたため、この 3 つのいずれかで動くロールメンバーは、数秒後に削除されるディレクトリで作業していました。現在は 4 つすべてが共通のヘルパーで作業ルートを解決し、要求されたパスが実在するディレクトリかどうかも確認します。そうでなければ警告を出し、どこでもない場所へ spawn せずにエージェントのディレクトリへフォールバックします。ネイティブな OS サンドボックスも同じルートを対象にするため、書き込み権限を得るのはオーバーライドされたルートです。
+対応する CLI バックエンドは共通のヘルパーで作業ルートを決定します。要求されたパスが実在しなければ警告して社員ディレクトリへ戻ります。OS のサンドボックスも同じルートを使います。
 
 オーバーライドが動かすのは**作業ディレクトリだけ**です。エージェントの ID（MCP サーバーの登録、ツールが認証に使うエージェント ID、エージェント自身の設定）はエージェントのディレクトリに残ります。
 
-バックエンド固有の影響が 2 つあります。見つけてもらうのではなく、先に書いておきます。
+バックエンド固有の影響があります。見つけてもらうのではなく、先に書いておきます。
 
-- **Antigravity** は作業ルートを事前に信頼済みにし（`agy` は対話的な「このワークスペースを信頼しますか？」のプロンプトを出し、ヘッドレス実行を止めてしまうため）、`--add-dir` として渡します。
 - **Grok** は、MCP 登録（`.grok/config.toml`）とサンドボックスプロファイル名（`.grok/sandbox.toml`）の両方を、エージェントのディレクトリではなく作業ディレクトリから解決します。そのためオーバーライドされたルートには両ファイルのコピーが置かれ、そうしなければメンバーはツールなし、解決できないサンドボックスプロファイルで spawn されます。既知の制限：この 2 つのファイルはディレクトリをキーにしているため、1 つのワークスペースを共有する 2 つの Grok ロールメンバーは、互いに宣言済みの env ブロックを上書きします。command/args の部分はメンバー間で同一で、MCP 子プロセスが実際に認証に使うのはプロセスごとの ID なので、影響範囲は宣言されたブロックだけです。
-
-### Antigravity の認証と MCP ツール（2026-10-01）
-
-`agy` には `login` サブコマンドがないため、ダッシュボードにはワンクリックのサインインがありません。認証方法は 2 つです。
-
-- **Google サインイン**：DuDuClaw が動いているホストのターミナルで `agy` を実行し、案内に従います。認証情報は OS の keyring に保存されるため、keyring やブラウザのないコンテナ・リモートホストでは使えません。
-- **API キーモード**：`config.toml` に `[antigravity] auth = "api_key"` を設定し、Gemini API キーを `gemini` プロバイダーのアカウント、または環境変数 `GEMINI_API_KEY` として用意します。Gateway が agy の設定に `modelProvider` を自動で書き込みます。`auth = "login"` で Google サインインに戻り、その `modelProvider` の項目も削除されます。`auth` を一度も設定していない場合、gateway は `modelProvider` に触れず、Gemini キーも渡さないため、agy はそれまでの認証方法のままです。
-
-`ANTIGRAVITY_API_KEY` という変数は存在しません。プラットフォームの MCP ツールは、各エージェントのワークスペースの `<agent workspace>/.agents/mcp_config.json` に登録されます。
-
-API key モードに切り替える前に知っておくこと：
-
-- この設定は OS ユーザー全体に効きます。agy は `modelProvider` をユーザーレベルの設定ファイルに保存するため、同じアカウントで対話的に使う `agy` も API key 経路に切り替わります。
-- 同じ OS ユーザーで 2 つの gateway を動かし、`auth` に異なる値を設定すると、互いにこの項目を上書きします。
-- `api_key` を使った後に Google サインインへ戻すには、`auth = "login"` を明示してください。`auth` の行を削除するだけでは戻りません。設定がない場合 gateway は `modelProvider` に触れないため、以前に書き込まれた `"gemini"` が agy の設定に残り、gateway はログで通知するだけです。`login` モードでは、gateway は `GEMINI_API_KEY`／`GOOGLE_API_KEY` を agy とその実行コマンドに渡しません。`api_key` モードでは、エージェントの shell からこのキーを読めます（agy は環境変数から受け取る必要があるため）。
-
-### Antigravity のツール権限（v1.69.1）
-
-`agy` 1.2.16 は print mode で、人間に尋ねられない確認をすべて自動で拒否します。MCP ツールの呼び出しにはその確認が 1 回必要です。この修正の前は、既定のケーパビリティレベル（`--sandbox` 付き）の Antigravity 従業員はプラットフォームのツールを一切使えず、`--dangerously-skip-permissions` を渡すフルアクセスのレベルだけが使えました。この不具合は v1.67.0 からあり、2026-10-04 に実際の Gemini API キーで検証して初めて見つかりました。
-
-Gateway は Antigravity のターンを実行するたびに、作業ルートを agy のユーザーレベル設定ファイル `~/.gemini/antigravity-cli/settings.json` の `trustedWorkspaces` へすでに追加しています。同じロック付き書き込みで、`permissions.allow` に次の 2 つのルールも追加するようになりました。
-
-- `mcp(duduclaw/*)` は、`duduclaw` という名前で登録された MCP サーバーのすべてのツールを許可します。
-- `read_file(<HOME>/.gemini/antigravity-cli/mcp/duduclaw)` は、そのサーバーのツール説明ファイルの読み取りを許可します。agy の MCP ツールは遅延ロードで、モデルは呼び出しの前に毎回説明ファイルを読みます。この読み取りも print mode では拒否されます。`HOME` の正規化後のパスが異なる場合（たとえば macOS の `/var` と `/private/var`）は、両方の表記を書き込みます。
-
-Gateway はシェルコマンド、ファイル書き込み、URL のルールを追加せず、コマンドラインのフラグも変えていないため、既定のレベルは引き続き `--sandbox` で動きます。agy 1.2.16 と実際の Gemini API キーでのテストでは、既定のレベルの従業員は DuDuClaw のツールを呼び出せました。同じターンのシェルコマンドと作業領域外へのファイル書き込みは引き続き拒否され、パストラバーサルによる読み取りと、ディレクトリ外を指すシンボリックリンク経由の読み取りも拒否されました。`--sandbox` と「すべて自動承認」のフラグを併用する方法は、ファイル書き込みツールが作業領域外に書き込めてしまうため採用していません。
-
-オペレーターのルールは保持されます。既存の `allow`、`deny`、`ask` の項目はそのままです。`permissions` がオブジェクトでない、または `allow` が配列でない場合、gateway はそれを書き換えず警告を記録します。ワークスペースの信頼と `modelProvider` は書き込まれ、実行が失敗したときのエラーにはルールを追加できなかったことが書かれます。HOME のパスに `(`、`)`、`,`、`*`、改行が含まれる場合、または有効な UTF-8 でない場合は、`read_file` ルールを省略して警告を記録し、`mcp(duduclaw/*)` だけを書き込みます。
-
-**読み取り専用レベル。** これらのルールはユーザーレベルのファイルにあるため、従業員のケーパビリティレベルで切り替えられません。そのため、読み取り専用の Antigravity 従業員にも同じ 2 つのルールが適用され、プラットフォームのツールを呼び出せます。何ができるかは、MCP サーバー側の `allowed_tools`、`denied_tools`、承認リストが決めます。これは Claude ランタイムと同じで、Codex とは異なります。Codex は読み取り専用レベルですべての MCP ツール呼び出しが拒否されます（上の表を参照）。
-
-**知っておくべき副作用。**
-
-- ルールは、その OS ユーザーのすべての `agy` が共有する設定ファイルに書かれます。ターミナルで自分で `agy` を対話的に使うときも、`duduclaw` という名前の MCP サーバーのツール呼び出しと、その説明ファイルのディレクトリの読み取りは、確認なしで自動的に許可されます。
-- ルールは追加されるだけで、削除はされません。従業員を削除した後、DuDuClaw をアンインストールした後、Antigravity を使わなくなった後も、ルールはファイルに残ります（`trustedWorkspaces` の項目も元からそうです）。削除するには `~/.gemini/antigravity-cli/settings.json` を編集し、`permissions.allow` からこの 2 つを消します。
-- 同じ OS ユーザーで gateway を 2 つ動かしても、両者は同じルールを書くため、異なる内容で上書きし合うことはありません。
-
-**エラーメッセージ。** agy がツールを拒否したとき、gateway が返すエラーは拒否されたツールを名指しし、agy 自身のエラーテキストを添えます。キーはテキストを切り詰める前にマスクされます。agy が成功を報告しても返信が空で、ツールが拒否されていた場合、その実行はエラーになります。以前は、結果の生の JSON が従業員の回答になっていました。通常の返信があってツールが拒否されただけの場合は、返信を保持し、警告を 1 件記録します。
-
-**未検証の項目。** このコードを最後に変更した後、実際のキーによるエンドツーエンドのテストはまだやり直していません。Linux、Docker コンテナ内、Windows でも試していません。Antigravity には既知で未対応の問題が 2 つあります。agy が 503 の再試行に成功した後でも失敗を報告することがあり、gateway は完全な返信を失敗として扱います。また、Antigravity の失敗後に、ベンダーをまたぐフェイルオーバーが Claude に切り替わることがあります。
-
-### Antigravity のストリーム解析は失敗ではなく縮退する（2026-09-28）
-
-`agy --output-format stream-json` のデコーダーは、以前は 6 か所で独立して厳格でした。解析できない行が 1 行ある、`result` イベントがない、`response` フィールドがない、`usage` ブロックの整数が 1 つ足りない、のどれかで実行全体がエラーになり、*すでに回答済み*の `agy` が spawn 失敗として報告され、ロールメンバーも失われました。
-
-形の不一致は縮退して扱い、事実は縮退させません。解析できない行はスキップします。result がなければ、ストリームの最後の空でない行を回答として使います。`usage` ブロックがない、または不完全な場合は、でっち上げた 0 ではなく不明なトークン数になります。縮退のたびに、何が欠けていたかを示す `warn!` を 1 件出します。いまも即座に失敗する唯一のケースは、明示的な `SUCCESS` 以外のステータスです。これは `agy` が実行の失敗を伝えているのであって、こちらが認識できなかった形ではありません。
 
 ### フォールバックのランタイムが受け取るモデル（2026-09）
 
@@ -489,7 +436,7 @@ api_key_enc = "..."          # anthropic は従来通り anthropic_api_key_enc �
 
 **通知の内容。** Anthropic の[法務・コンプライアンスページ](https://code.claude.com/docs/en/legal-and-compliance)には、サードパーティの開発者が自社アプリで Claude.ai ログインを提供すること、Free・Pro・Max プランの認証情報でユーザーの代わりにリクエストを中継すること、Claude.ai の認証情報やセッショントークンを収集・保存・仲介することは認められないと書かれています。認められているのは、自分のサブスクリプションで改変されていない Claude Code にサインインすることで、Pro/Max の利用上限は通常の利用を前提としています。消費者向け利用規約では、アカウントを他人に利用させることも禁止されています。Anthropic は事前の通知なく執行できるとしています。アカウント停止は報道やユーザーからの報告で、Anthropic の公式発表ではありません。通知は、規約と衝突する DuDuClaw での使い方を具体的に挙げます。1 つのサブスクリプションで他の人（チャネルの顧客）に対応すること、複数のサブスクリプションをローテーションして上限を避けること、DuDuClaw にトークンを保存させることです。OAuth トークンでの `claude -p` は技術的にはまだ動くため（v1.66.0）、通知は「ブロック」とは書きません。
 
-**ベンダーごとの表示。** 上の全文は Claude のログインと Claude のアカウントで表示します。Codex、Antigravity、Grok のログイン（およびアカウント追加で Anthropic 以外の provider を選んだ OAuth の経路）では、同じチェックボックスとともに、そのベンダー自身の説明と規約へのリンクを表示します。Google は上記の Antigravity の条項、OpenAI は上記の Sign in with ChatGPT プログラムの要点（オープンソースと承認を受けた商用パートナー、トークンはローカルに保存）とその規約へのリンク、xAI は立場が不明で規約が適用されることを示します。不明な provider には、ベンダー名もリンクもない注意を表示します。どの文もベンダーのページに対応しており、一次情報が見つからなかった以前の「Google は 2026-03 以降サーバー側でブロック」の文は削除しました。ベンダーの対応表は `duduclaw_core::subscription_risk::vendor_policy`（gateway、CLI）と `web/src/lib/subscription-risk.ts`（ダッシュボード）にあります。
+**ベンダーごとの表示。** 上の全文は Claude のログインと Claude のアカウントで表示します。Codex、Grok のログイン（およびアカウント追加で Anthropic 以外の provider を選んだ OAuth の経路）では、同じチェックボックスとともに、そのベンダー自身の説明と規約へのリンクを表示します。OpenAI は上記の Sign in with ChatGPT プログラムの要点（オープンソースと承認を受けた商用パートナー、トークンはローカルに保存）とその規約へのリンク、xAI は立場が不明で規約が適用されることを示します。不明な provider には、ベンダー名もリンクもない注意を表示します。どの文もベンダーのページに対応しており、一次情報が見つからなかった以前の「Google は 2026-03 以降サーバー側でブロック」の文は削除しました。ベンダーの対応表は `duduclaw_core::subscription_risk::vendor_policy`（gateway、CLI）と `web/src/lib/subscription-risk.ts`（ダッシュボード）にあります。
 
 **表示される場所。** CLI ログインモーダル、案内付き QR コード設定ウィザード、アカウント追加の OAuth Token の経路では、認証情報を扱う前にチェックボックス付きの全文を表示します。ようこそページの Claude サブスクリプションのカード（「サインイン済み」カード、つまりホストログインの自動採用の場合も含む）、runtime 設定カードのサインイン行、アカウントページのサブスクリプション用カード、ワンクリック CLI の選択画面、CLI 認証情報の一覧、エージェント編集の API モードがサブスクリプション CLI のとき、アカウントプールにサブスクリプションアカウントが入っているときには、規約へのリンク付きの 1 行の注意を表示します。
 
@@ -501,4 +448,4 @@ api_key_enc = "..."          # anthropic は従来通り anthropic_api_key_enc �
 
 ## まとめ
 
-AI領域はマルチプロバイダーです。単一CLIの上に構築するのは、単一OSのためだけにソフトウェアを書くようなもの——動くけど、いつか動かなくなります。`AgentRuntime` traitが差異を抽象化し、DuDuClawがClaude、Codex、Antigravity、そしてOpenAI互換エンドポイントを交換可能なバックエンドとして扱えるようにします。エージェントは常に、利用可能な最良の頭脳を得られます。
+AI領域はマルチプロバイダーです。単一CLIの上に構築するのは、単一OSのためだけにソフトウェアを書くようなもの——動くけど、いつか動かなくなります。`AgentRuntime` traitが差異を抽象化し、DuDuClawがClaude、Codex、そしてOpenAI互換エンドポイントを交換可能なバックエンドとして扱えるようにします。エージェントは常に、利用可能な最良の頭脳を得られます。

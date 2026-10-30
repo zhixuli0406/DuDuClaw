@@ -3,7 +3,7 @@
 //! detail), checks every tool name against the family's allowlist and counts
 //! steps for the families whose CLI has no native step ceiling. Pure: no IO.
 //! A CLI's own restriction flags stay on as a second line; this is authoritative.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use serde_json::Value;
 use super::attempt_adapter::RuntimeFamily;
 
@@ -11,10 +11,6 @@ use super::attempt_adapter::RuntimeFamily;
 pub const CODEX_TOOL_ITEMS: &[&str] = &["command_execution", "file_change"];
 /// Codex item types that are not tools. Anything else is a violation.
 pub const CODEX_NON_TOOL_ITEMS: &[&str] = &["agent_message", "reasoning", "todo_list", "error"];
-/// Antigravity (agy 1.2.14) file/shell tools; the hook script renders this list.
-pub const ANTIGRAVITY_TOOLS: &[&str] = &["run_command", "command_status", "send_command_input", "view_file",
-    "write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file", "list_dir",
-    "find_by_name", "grep_search", "finish", "wait", "wait_5_seconds"];
 /// Grok (1.0.41) file/shell tools, passed as `--tools`.
 pub const GROK_TOOLS: &[&str] = &["run_terminal_command", "read_file", "search_replace", "list_dir", "grep", "write"];
 /// Tools Grok keeps in `init.tools` even when `--tools` is given (measured), passed as `--disallowed-tools`.
@@ -35,8 +31,6 @@ pub fn sanitize_tool_name(name: &str) -> String {
     if kept.is_empty() { "unknown".into() } else { kept }
 }
 
-/// Exact prefix agy puts in `tool_info.error.message` for a hook-denied call.
-pub const AGY_HOOK_DENIED_PREFIX: &str = "tool call denied by pre-tool hook";
 /// Assistant content blocks that are not tool calls.
 const NON_TOOL_BLOCKS: &[&str] = &["text", "thinking", "redacted_thinking"];
 
@@ -45,23 +39,13 @@ pub struct StreamGuard {
     max_steps: u32,
     steps: u32,
     seen: BTreeSet<String>,
-    /// agy: forbidden tool steps seen ACTIVE whose outcome is not known yet.
-    pending: BTreeMap<u64, String>,
 }
 impl StreamGuard {
     pub fn new(family: RuntimeFamily, max_steps: u32) -> Self {
-        Self { family, max_steps, steps: 0, seen: BTreeSet::new(), pending: BTreeMap::new() }
+        Self { family, max_steps, steps: 0, seen: BTreeSet::new() }
     }
     /// Steps counted so far (host-counted families only).
     pub fn steps(&self) -> u32 { self.steps }
-    /// End of stream (or the agy `result`): a forbidden tool whose denial was
-    /// never confirmed is treated as executed.
-    pub fn finish(&mut self) -> GuardVerdict {
-        match std::mem::take(&mut self.pending).into_values().next() {
-            Some(tool) => violation(&tool),
-            None => GuardVerdict::Continue,
-        }
-    }
     pub fn observe(&mut self, native: &Value) -> GuardVerdict {
         match self.family {
             RuntimeFamily::Claude => assistant_blocks(native, &|name| claude_allowed(name)),
@@ -73,7 +57,6 @@ impl StreamGuard {
                 assistant_blocks(native, &|name| GROK_TOOLS.contains(&name))
             }
             RuntimeFamily::Codex => self.codex(native),
-            RuntimeFamily::Antigravity => self.antigravity(native),
             RuntimeFamily::OpenAiCompat => GuardVerdict::Continue,
         }
     }
@@ -87,37 +70,6 @@ impl StreamGuard {
         // An id-less item counts every time: stricter, never looser.
         let fresh = match native["item"]["id"].as_str() { Some(id) => self.seen.insert(id.to_owned()), None => true };
         if fresh { self.step() } else { GuardVerdict::Continue }
-    }
-    fn antigravity(&mut self, native: &Value) -> GuardVerdict {
-        match native["event"].as_str() {
-            Some("result") => return self.finish(),
-            Some("step_update") => {}
-            _ => return GuardVerdict::Continue,
-        }
-        let step = &native["step_update"];
-        let state = step["state"].as_str();
-        let index = step["step_index"].as_u64();
-        let name = step["tool_name"].as_str().filter(|n| !n.is_empty())
-            .or_else(|| step["tool_info"]["name"].as_str().filter(|n| !n.is_empty()));
-        if let Some(name) = name.filter(|name| !ANTIGRAVITY_TOOLS.contains(name)) {
-            match state {
-                Some("ACTIVE") => match index {
-                    Some(index) => { self.pending.insert(index, name.to_owned()); }
-                    None => return violation(name),
-                },
-                // Only the hook's own denial proves the call did not run.
-                Some("ERROR") if step["tool_info"]["error"]["message"].as_str()
-                    .is_some_and(|message| message.starts_with(AGY_HOOK_DENIED_PREFIX)) => {
-                    if let Some(index) = index { self.pending.remove(&index); }
-                }
-                _ => return violation(name),
-            }
-        }
-        if step["step_type"].as_str() == Some("agent_response") && state == Some("DONE") {
-            let fresh = match index { Some(index) => self.seen.insert(index.to_string()), None => true };
-            if fresh { return self.step(); }
-        }
-        GuardVerdict::Continue
     }
     fn step(&mut self) -> GuardVerdict {
         self.steps = self.steps.saturating_add(1);
@@ -161,17 +113,6 @@ mod tests {
         events.iter().map(|event| guard.observe(event)).collect()
     }
     fn codex_item(kind: &str, id: &str, item: &str) -> Value { json!({"type":kind,"item":{"id":id,"type":item,"status":"in_progress"}}) }
-    fn agy_step(index: u64, state: &str, step_type: &str, tool: Option<&str>) -> Value {
-        let mut step = json!({"step_index":index,"state":state,"step_type":step_type});
-        if let Some(tool) = tool { step["tool_name"] = json!(tool); step["tool_info"] = json!({"name":tool,"parameters":{}}); }
-        if state == "ERROR" {
-            step["tool_info"]["error"] = json!({"type":"TOOL_ERROR","message":"tool call denied by pre-tool hook: tool is outside the attempt tool surface"});
-        }
-        if step_type == "agent_response" && state == "DONE" {
-            step["usage"] = json!({"input_tokens":10,"output_tokens":2,"thinking_tokens":1,"cache_read_tokens":0,"total_tokens":12});
-        }
-        json!({"event":"step_update","step_update":step})
-    }
 
     #[test]
     fn claude_allows_attempt_tools_and_refuses_others() {
@@ -214,24 +155,6 @@ mod tests {
         assert_eq!(run(RuntimeFamily::Codex, 0, &[json!({"type":"future.event","item":{"type":"mcp_tool_call"}})]), vec![GuardVerdict::Continue]);
     }
 
-    #[test]
-    fn antigravity_counts_generations_and_hook_denied_tools_are_not_violations() {
-        // Shape of runtime-parity/spot/agy-v2-hook-stdin.ndjson (agy 1.2.14).
-        let events = [json!({"event":"init","init":{"cwd":"/w","tools":["run_command","search_web"],"permission_mode":"always-proceed"}}),
-            agy_step(0, "DONE", "user_input", None), agy_step(1, "DONE", "agent_response", None),
-            agy_step(2, "ACTIVE", "tool", Some("search_web")), agy_step(2, "ERROR", "tool", Some("search_web")),
-            agy_step(3, "DONE", "agent_response", None), agy_step(3, "DONE", "agent_response", None),
-            agy_step(4, "ACTIVE", "tool", Some("run_command")), agy_step(4, "DONE", "tool", Some("run_command")),
-            agy_step(5, "DONE", "agent_response", None),
-            json!({"event":"result","result":{"status":"SUCCESS","response":"DONE\n","num_turns":1}})];
-        assert!(run(RuntimeFamily::Antigravity, 3, &events).iter().all(|v| *v == GuardVerdict::Continue), "ERROR state was denied by the hook");
-        let verdicts = run(RuntimeFamily::Antigravity, 2, &events);
-        assert_eq!(verdicts[9], GuardVerdict::StepLimit, "third generation exceeds two, the duplicate step 3 is not counted");
-        let done = agy_step(7, "DONE", "tool", Some("search_web"));
-        assert_eq!(run(RuntimeFamily::Antigravity, 9, &[done]), vec![GuardVerdict::ToolViolation { tool: "search_web".into() }]);
-        let info_only = json!({"event":"step_update","step_update":{"step_index":8,"state":"DONE","step_type":"tool","tool_info":{"name":"browser_subagent"}}});
-        assert_eq!(run(RuntimeFamily::Antigravity, 9, &[info_only]), vec![GuardVerdict::ToolViolation { tool: "browser_subagent".into() }]);
-    }
 
     #[test]
     fn grok_refuses_forbidden_tools_and_configured_mcp_servers() {
@@ -261,35 +184,6 @@ mod tests {
         assert_eq!(run(RuntimeFamily::Codex, 1, &[id_less.clone(), id_less]), vec![GuardVerdict::Continue, GuardVerdict::StepLimit]);
     }
 
-    #[test]
-    fn antigravity_forbidden_tool_needs_the_hook_denial_to_be_harmless() {
-        let active = agy_step(2, "ACTIVE", "tool", Some("search_web"));
-        let result = json!({"event":"result","result":{"status":"SUCCESS","response":"ok"}});
-        // Hook-denied ⇒ fine.
-        let denied = agy_step(2, "ERROR", "tool", Some("search_web"));
-        assert!(run(RuntimeFamily::Antigravity, 9, &[active.clone(), denied, result.clone()]).iter().all(|v| *v == GuardVerdict::Continue));
-        // ERROR for any other reason may have run: violation.
-        let mut other = agy_step(2, "ERROR", "tool", Some("search_web"));
-        other["step_update"]["tool_info"]["error"]["message"] = json!("network unreachable");
-        assert_eq!(run(RuntimeFamily::Antigravity, 9, &[active.clone(), other])[1], GuardVerdict::ToolViolation { tool: "search_web".into() });
-        let mut unprefixed = agy_step(2, "ERROR", "tool", Some("search_web"));
-        unprefixed["step_update"]["tool_info"]["error"]["message"] = json!("x tool call denied by pre-tool hook");
-        assert!(matches!(run(RuntimeFamily::Antigravity, 9, &[active.clone(), unprefixed])[1], GuardVerdict::ToolViolation { .. }));
-        // Still ACTIVE when the result arrives ⇒ violation.
-        assert_eq!(run(RuntimeFamily::Antigravity, 9, &[active.clone(), result])[1], GuardVerdict::ToolViolation { tool: "search_web".into() });
-        // Unknown terminal state ⇒ violation.
-        let cancelled = agy_step(2, "CANCELLED", "tool", Some("search_web"));
-        assert!(matches!(run(RuntimeFamily::Antigravity, 9, &[active.clone(), cancelled])[1], GuardVerdict::ToolViolation { .. }));
-        // End of stream without result: finish() reports the pending tool once.
-        let mut guard = StreamGuard::new(RuntimeFamily::Antigravity, 9);
-        assert_eq!(guard.observe(&active), GuardVerdict::Continue);
-        assert_eq!(guard.finish(), GuardVerdict::ToolViolation { tool: "search_web".into() });
-        assert_eq!(guard.finish(), GuardVerdict::Continue);
-        // Allowed tools never become pending.
-        let mut guard = StreamGuard::new(RuntimeFamily::Antigravity, 9);
-        guard.observe(&agy_step(4, "ACTIVE", "tool", Some("run_command")));
-        assert_eq!(guard.finish(), GuardVerdict::Continue);
-    }
 
     #[test]
     fn claude_and_grok_refuse_unknown_block_types() {

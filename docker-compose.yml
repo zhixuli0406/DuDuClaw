@@ -11,7 +11,6 @@ services:
       - duduclaw-data:/home/duduclaw/.duduclaw
       - duduclaw-claude:/home/duduclaw/.claude
       - duduclaw-codex:/home/duduclaw/.codex
-      - duduclaw-gemini:/home/duduclaw/.gemini
       - duduclaw-grok:/home/duduclaw/.grok
       - duduclaw-kimi:/home/duduclaw/.kimi-code
       - duduclaw-copilot:/home/duduclaw/.copilot
@@ -28,7 +27,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       # Codex (OpenAI): API key fallback — ChatGPT Plus/Pro OAuth lives in duduclaw-codex volume
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      # Antigravity's Gemini API key mode uses this key. Its settings live in the shared .gemini volume.
+      # Gemini API provider (generateContent).
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       # Grok (xAI): API key — deployment-key/OIDC login lives in duduclaw-grok volume
       - XAI_API_KEY=${XAI_API_KEY:-}
@@ -75,7 +74,6 @@ volumes:
   duduclaw-data:
   duduclaw-claude:
   duduclaw-codex:
-  duduclaw-gemini:
   duduclaw-grok:
   duduclaw-kimi:
   duduclaw-copilot:

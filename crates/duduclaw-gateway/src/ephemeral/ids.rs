@@ -100,7 +100,7 @@ pub struct RoleMemberSpec {
     pub round: u32,
     /// Which of the four roles this member fills.
     pub role: Role,
-    /// Runtime id or catalog alias (e.g. `agy`). Must be in
+    /// Runtime id or catalog alias. Must be in
     /// [`TEAM_ROLE_RUNTIME_ALLOWLIST`]; canonicalised before it is written.
     pub runtime: String,
     /// Model id. Must belong to a family `runtime` serves.

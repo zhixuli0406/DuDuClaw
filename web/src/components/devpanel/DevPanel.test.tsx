@@ -36,7 +36,6 @@ function mockAllRpcCalls(overrides: Partial<Record<string, unknown>> = {}) {
           claude_cli: true,
           codex: false,
           gemini: false,
-          antigravity: false,
           claude_oauth: true,
           claude_subscription: 'max',
         });

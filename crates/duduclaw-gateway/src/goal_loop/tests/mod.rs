@@ -94,7 +94,7 @@ fn write_enabled_team(home: &Path) {
         "[team]\nenabled = true\n\
              [team.roles.planner]\nruntime = \"claude\"\nmodel = \"claude-fable-5-1\"\n\
              [team.roles.executor]\nruntime = \"codex\"\nmodel = \"gpt-5.5\"\n\
-             [team.roles.verifier]\nruntime = \"antigravity\"\nmodel = \"gemini-3.7-flash\"\n",
+             [team.roles.verifier]\nruntime = \"grok\"\nmodel = \"grok-4.3\"\n",
     )
     .unwrap();
 }

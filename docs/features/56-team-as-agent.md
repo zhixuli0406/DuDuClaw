@@ -132,8 +132,8 @@ model   = "gpt-5.5"
 effort  = "medium"
 
 [team.roles.verifier]
-runtime = "antigravity"
-model   = "gemini-3.7-flash"
+runtime = "claude"
+model   = "claude-sonnet-4-6"
 effort  = "low"
 
 [team.roles.utility]
@@ -159,7 +159,7 @@ So an employee overriding only `[team.roles.executor] effort` keeps the global r
 
 Values: `low`, `medium`, `high`, `xhigh`, `max` (case-insensitive). The enum itself, its per-runtime ceiling and the CLI flag each vendor spells differently all live in one place (`duduclaw-core::effort`) — `[team]` keeps the key as a raw string and hands it there to parse, so the crate never carries two spellings of the same knob. An unparseable value refuses the team (`invalid_effort`).
 
-The four supported first-batch runtimes accept effort per call (probed on real binaries, 2026-09-24): Claude Code `--effort`, Codex `-c model_reasoning_effort=`, Antigravity `--effort`, Grok `--reasoning-effort`.
+The three supported first-batch runtimes accept effort per call (probed on real binaries, 2026-09-24): Claude Code `--effort`, Codex `-c model_reasoning_effort=`, Grok `--reasoning-effort`.
 
 An effort declared on a role that binds neither runtime nor model is inert (the role cascades to the employee's model, which carries the employee's effort). That case is reported rather than silently dropped.
 
@@ -173,7 +173,7 @@ An effort declared on a role that binds neither runtime nor model is inert (the 
 
 ## Three rules the validator enforces
 
-A spec that breaks any of these does not form a team. The task runs Solo and the dashboard says why — a partial team is never formed.
+A spec that breaks any of these does not form a team. Non-fatal validation failures, such as a shared model family, run Solo and the dashboard says why. A removed runtime refuses dispatch entirely; it never falls back to Solo or another vendor.
 
 ### 1. A role is a `(role, runtime, model)` triple
 
@@ -185,9 +185,9 @@ Declaring only a `model` is fine — the catalog binds it to the runtime that se
 
 ### 2. First-batch runtimes only
 
-`claude`, `codex`, `antigravity`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
+`claude`, `codex`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
 
-The reason is tools, not capability: these four register DuDuClaw's MCP server natively, so a role running on one gets the full tool surface. A role that silently loses its tools produces confident tool-free narration, which the verifier cannot tell apart from actual work.
+The reason is tools, not capability: these three register DuDuClaw's MCP server natively, so a role running on one gets the full tool surface. A role that silently loses its tools produces confident tool-free narration, which the verifier cannot tell apart from actual work.
 
 ### 3. The verifier must not share the executor's model family
 
@@ -201,7 +201,7 @@ A related finding worth stating plainly: in VP-CONTROL (arXiv:2609.10969), cross
 
 Validation runs once, when the spec is frozen. But the frozen spec then lives as JSON in a mutable task row, and the field that records each role's model family had, until this pass, **no reader at all** — a restored backup from before the rule existed, or a hand-patched row, produced a spec that no longer held the invariant and nothing downstream noticed.
 
-Every round now re-checks the stored spec before it spends a spawn: each role's runtime must still be one of the five (rule 2 — previously the executor path filtered on this and the verifier path did not), and the verifier's stored family must still differ from the executor's (rule 3). A spec that fails lands as `Failed` with `frozen_spec_family_violation` / `frozen_spec_runtime_not_allowed` in the audit row, with an operator-facing message saying which role and what to fix. The check reads the **stored** family string rather than re-resolving the catalog: re-resolution answers "what would this config mean today", and the question here is whether the spec this task is actually running still holds.
+Every round now re-checks the stored spec before it spends a spawn: each role's runtime must still be one of the three (rule 2 — previously the executor path filtered on this and the verifier path did not), and the verifier's stored family must still differ from the executor's (rule 3). A spec that fails lands as `Failed` with `frozen_spec_family_violation` / `frozen_spec_runtime_not_allowed` in the audit row, with an operator-facing message saying which role and what to fix. The check reads the **stored** family string rather than re-resolving the catalog: re-resolution answers "what would this config mean today", and the question here is whether the spec this task is actually running still holds.
 
 ---
 
@@ -248,7 +248,7 @@ What makes a member different from the transient sub-agents DuDuClaw already had
 
 | Key | Value |
 |---|---|
-| `[runtime] provider` | the role's runtime, canonicalised (`agy` is written as `antigravity`) |
+| `[runtime] provider` | the role's canonical runtime id |
 | `[model] preferred` | the role's model id |
 | `[model] effort` | the role's effort — **written only if the role declares one** |
 | `[team_member] role` / `task_id` / `round` / `parent` | which slot this member fills |
@@ -277,7 +277,7 @@ Planner and verifier stay deliberately read-only: a planner that edits files is 
 
 The role path is the only place a raw model id is accepted, and it is reachable **only from the gateway's composer**. The agent-facing `spawn_ephemeral` tool is unchanged: it still takes one of three tier keywords (`cheap` / `standard` / `preferred`) and still rejects raw ids. An AI employee cannot name the model it wants to run on, with or without teams.
 
-Before anything is created, the pair is checked against the runtime catalog: the runtime must be one of the five first-batch runtimes, and the model's family must be one that runtime actually serves. A family the catalog does not recognise is an error, not a best guess — `gpt-5.4` never reaches the Claude binary to fail later at someone else's API.
+Before anything is created, the pair is checked against the runtime catalog: the runtime must be one of the three first-batch runtimes, and the model's family must be one that runtime actually serves. A family the catalog does not recognise is an error, not a best guess — `gpt-5.4` never reaches the Claude binary to fail later at someone else's API.
 
 ### A member runs in the employee's workspace, not in its own scaffold
 
@@ -287,7 +287,7 @@ This is not cosmetic. In the first live round that reached the executor stage, m
 
 Moving the working directory raises a second question: the Claude CLI discovers its MCP servers from `<cwd>/.mcp.json`, so a member sitting in the employee's directory would boot the duduclaw MCP server with the **employee's** identity and every tool call, every handoff and every audit row would be attributed to the parent. So identity is named explicitly instead of discovered: a Claude member is spawned with `--mcp-config <member_dir>/.mcp.json --strict-mcp-config` (the second flag is what stops the CLI from also merging the ambient config). A Codex member gets `--cd <employee_dir>` while its `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID=…` override carries the member id — the two are independent by construction there. If the member's `.mcp.json` is missing, the stage is refused (`member_mcp_config_missing`) rather than dispatched with the parent's identity.
 
-**Not yet supported for members: antigravity, grok, and the generic print-mode CLIs.** Those runtimes read their MCP registration from a file *inside* the working directory (`.agents/mcp_config.json`, `.grok/config.toml`, …), so moving the cwd would move the identity with it. A member on one of those runtimes keeps its scaffold as its working directory; its files still do not outlive the round. Use claude or codex for roles that write files until this is closed.
+**Not yet supported for members: grok, and the generic print-mode CLIs.** Those runtimes read their MCP registration from a file *inside* the working directory (`.grok/config.toml`, …), so moving the cwd would move the identity with it. A member on one of those runtimes keeps its scaffold as its working directory; its files still do not outlive the round. Use claude or codex for roles that write files until this is closed.
 
 **The other consequence had to be closed rather than documented.** Sharing the employee's working directory also means sharing the `.claude/settings.json` in it, and the file-protect hook registered there names the *employee* as its caller — so the hook read a role member's file writes as the employee writing its own files, and waved them through. The member could therefore edit the employee's `agent.toml [capabilities]`: flip `os_native` / `computer_use`, widen `allowed_tools`, empty `denied_tools`, grant itself a `db_sources` entry — and the next round's subset check would honour the widened envelope. The platform's promise that a role member "can never hold a tool its employee does not" is read out of that exact file, and a possibly-third-party model could rewrite it.
 
@@ -331,7 +331,6 @@ Everything downstream of a round — the verifier's digest, the zero-LLM groundi
 
 Each of a member's native tool events is now written as one `tool_calls.jsonl` row under that member's id, carrying the tool name, the outcome, the masked call input and the masked result text, plus `source = "native"`, `evidence_source = "native_tool_event"` and the `runtime` / `model` that produced it. A failed event carries `error_class = "native_tool_error"` — a blocked or failing call must leave a trace, same rule the MCP dispatch gate follows.
 
-Antigravity `agy` 1.2.10 now supplies terminal tool events through its `stream-json` output. The parser ignores in-progress events and uses the final usage block for measured token counts. A sandbox-denied command has been observed in a live probe; successful Antigravity tool execution still needs a separate live validation.
 
 Two deliberate differences from an MCP row, both tightening rather than loosening:
 
@@ -375,7 +374,7 @@ With a frozen spec and a Team verdict, one goal round stops being a single wake-
 
 When a goal task is created, the merged `config.toml [team]` + `agent.toml [team]` is validated once and the result stored on the task itself. From then on it never changes — a role→model matrix or a bandit that re-ranks models tomorrow affects the *next* task, not one already running. Same discipline as the frozen acceptance criteria: you can always answer "what team was this task actually judged and worked by" from the task row alone.
 
-A spec that fails validation forms **no team at all**. The refusal is recorded, nothing is stored, and the task runs as a single employee. There is no such thing as a partial team.
+Non-fatal validation failures, such as a shared model family, form **no team at all**: the refusal is recorded, no spec is stored, and the task runs as a single employee. Unreadable or malformed config, wrong types in runtime-selection fields, and removed runtimes refuse dispatch entirely. Goal creation checks these before inserting the task. If the config changes after that check, or an existing goal encounters such a refusal, only that goal pauses as `needs_human` with `blocked_needs_decision`; other goals continue. The refusal shows the file name and reason, without file contents or absolute paths.
 
 The freeze is set-once at the database level (`WHERE team_spec_json IS NULL`), so two creation paths racing on the same task is normal and safe. What used to be unsafe was the *loser's* view of it: the goal loop only handled the "I froze it" answer, so the round that lost the race kept reading its own stale copy of the task, found no spec, and quietly ran Solo — while every later round, reading a fresh row, ran as a Team. Same task, two execution shapes, no trace anywhere. The loser now re-reads the row and picks up the spec that actually won.
 
@@ -608,7 +607,7 @@ sample size cannot support (research 13 §4.2: 40 cases at K=3 resolves ~21pp;
 Honest list, so nothing here reads as more finished than it is:
 
 - **Accepted round is a single smoke result.** Round 14 passed the existing acceptance judge, but that does not establish a production win over Solo. The role×model matrix's four-case smoke cannot resolve the declared MDE.
-- **Roles that write files are limited to claude and codex.** antigravity / grok / generic-CLI members keep their scaffold as their working directory, so their files do not outlive the round.
+- **Roles that write files are limited to claude and codex.** grok / generic-CLI members keep their scaffold as their working directory, so their files do not outlive the round.
 - The role×model capability matrix is now read by the composer as a prior (above), but **only where a role left its model unset**, and only from `unresolved`-free cells. Since 2026-09-29 the same file also answers the gate's capability-gap signal — the `n`-weighted distance, in percentage points, between the matrix's winning model for the executor's `(role, runtime)` and the model that role runs today, paired with the matrix header's own declared MDE so a gap below the noise floor cannot fire. Both sides of that comparison need a resolved cell, so **on every shipped matrix the signal is still dark**: all four cells are `unresolved`, which leaves the gate exactly where it was (two measurable signals of four, and three are needed for Team). It becomes live the first time an operator measures a matrix that resolves, and not before. The online bandit that would keep the file fresh is still P5. The P2b full-team producer completed a three-case, 12-arm live pipeline probe with real verifier verdicts and handoffs. All four model cells remain `unresolved`; three synthetic cases from one domain do not satisfy the formal matrix acceptance threshold — which in practice means today's shipped matrices select nothing at all.
 - **The default-on flip has not been live-tested as a default.** The behaviour it produces on an unconfigured install is covered by unit tests (quiet Solo, no audit row, byte-identical dispatch); what has not been run is a fleet that had `[team.roles]` configured *and* was relying on `enabled` being off to stay Solo. Such a deployment now forms teams — `enabled = false` is the one-line revert.
 - **Verifier cells only measure anything on a re-recorded suite.** The shipped premium suites' transcripts give a single-class gold, so cells over them are honestly `degenerate_gold`; smoke 3 showed that re-recording four cases with a mixed gold produces real scores, so the fix is known — it just has not been applied to the 18 shipped suites.
@@ -623,7 +622,7 @@ Honest list, so nothing here reads as more finished than it is:
 - **`role_turns.jsonl` counts a verifier row against the spawn budget that `plan_round` did not plan for.** The verifier is a utility call, but its ledger row carries `member_id = "team-verifier"`, and `spawns_used_for_task` counts every row with one — so each round costs one spawn more than the plan projected.
 - `cost.by_role` now reports measured team-stage spend by role and model, optionally narrowed by task id (`episode_id`). Old rows without a role remain unattributed. Team configuration is on the dashboard since v1.68.0 (see "Configuring roles"); the packet/tool drill-down remains to be wired.
 - Verifier token usage is captured when its runtime supplies a usage block; otherwise its `usage_*` fields are absent rather than zero. The same rule applies to planner and executor usage. The live probe's role cost ledger is incomplete and cannot serve as a provider bill.
-- **Structured judge output is codex-only.** `--output-schema` is the one structured-output flag wired; an antigravity or openai-compat judge still has to be persuaded by the prompt. The team verifier now shares the offline verifier schema and accepts strict JSON as well as leading-token prose; codex team verification still needs a live round.
+- **Structured judge output is codex-only.** `--output-schema` is the one structured-output flag wired; an openai-compat judge still has to be persuaded by the prompt. The team verifier now shares the offline verifier schema and accepts strict JSON as well as leading-token prose; codex team verification still needs a live round.
 - **Artifact receipts only cover paths a packet declares.** A file a member wrote without listing it in `artifacts[]` is evidenced by its native tool row but gets no hash. Sweeping the workspace for undeclared changes is future work.
 - The detached composer now waits on a FIFO admission ticket when the live-scaffold ceiling is reached. Expired, missing, or unreadable tickets fail the stage explicitly; a cancelled wait removes its own ticket. Queue-state and scaffold-release tests pass; a loaded live-round test is still needed.
 

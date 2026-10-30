@@ -3259,7 +3259,7 @@ export interface AgentOdooOverride {
 // ── RT: per-agent [runtime] ─────────────────────────────────────
 
 export type RuntimeProvider =
-  | 'claude' | 'codex' | 'antigravity' | 'grok' | 'openai_compat'
+  | 'claude' | 'codex' | 'grok' | 'openai_compat'
   // v1.68 W1 — generic command-line runtimes from `runtime_catalog.rs`.
   | 'qwen' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'vibe' | 'opencode';
 
@@ -3402,7 +3402,6 @@ export interface AgentDetailV168 {
 export interface RuntimeDetect {
   claude_cli: boolean;
   codex: boolean;
-  antigravity: boolean;
   /** Present since the R4 Grok runtime; older gateways omit it. */
   grok?: boolean;
   claude_oauth: boolean;
@@ -3410,6 +3409,9 @@ export interface RuntimeDetect {
   /** Per-runtime rows; deprecation fields are absent on older gateways. */
   runtimes?: Array<{
     id?: string;
+    version?: string | null;
+    minimum_version?: string | null;
+    update_required?: boolean;
     deprecated?: boolean;
     replacement?: string | null;
     remove_in?: string | null;
@@ -3417,7 +3419,7 @@ export interface RuntimeDetect {
 }
 
 /** Providers `runtime.install` knows how to install (hard-coded gateway whitelist). */
-export type InstallableProvider = 'claude' | 'codex' | 'antigravity' | 'grok';
+export type InstallableProvider = 'claude' | 'codex' | 'grok';
 
 /**
  * Result of `runtime.install`. A decline is a normal answer, not an error: the
@@ -3455,7 +3457,11 @@ export interface RuntimeInstallOutput {
 export interface RuntimeInstallStatus {
   session_id: string;
   provider: InstallableProvider;
-  status: 'succeeded' | 'failed' | 'timeout';
+  status: 'succeeded' | 'failed' | 'timeout' | 'update_shadowed' | 'version_unverified';
+  reason?: string | null;
+  path?: string | null;
+  version?: string | null;
+  update_required?: boolean;
   exit_code: number | null;
   /** Authoritative: is the binary actually resolvable now? */
   detected: boolean;
@@ -6766,7 +6772,7 @@ export const api = {
      *  `SubscriptionRiskDisclosure`); the gateway refuses with
      *  `subscription_risk_not_accepted` otherwise. */
     cliLoginStart: (
-      runtime: 'claude' | 'codex' | 'antigravity' | 'grok' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode',
+      runtime: 'claude' | 'codex' | 'grok' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode',
       acceptSubscriptionRisk: boolean,
     ) =>
       client.call('auth.cli_login.start', {
@@ -7349,7 +7355,7 @@ export const api = {
     config: () =>
       client.call('system.config') as Promise<{
         config?: string;
-        /** Global utility provider, canonicalized; removed Gemini is retained for explicit repair. */
+        /** Global utility provider, canonicalized; removed providers are retained for explicit repair. */
         utility_provider?: string;
         voice?: Partial<VoiceSettings> | null;
         // Structured [gateway] allowed_origins for the remote-access allowlist UI.

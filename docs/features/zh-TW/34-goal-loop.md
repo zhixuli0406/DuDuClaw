@@ -91,7 +91,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 目標的單次執行時限
 
-每次 CLI 執行（Codex、Grok、Antigravity、其他 CLI）和每次 OpenAI 相容 API 請求，都受員工的「單次執行時間上限」限制（`agent.toml [runtime] timeout_secs`，預設 300 秒，範圍 30～3600 秒）。比較複雜的目標可以另外給時限，不必改員工設定：「交辦任務 → 複雜任務 → 更多設定 → 單次執行時限（分鐘）」（1～60），或在 `tasks_create`、`kind="goal"` 帶 `timeout_secs`（30～3600）。這個目標的每一輪都用它；開了任務沙箱的員工，沙箱逾時也改用它。Claude 員工維持固定的 30 分鐘上限，不套用。
+每次 CLI 執行（Codex、Grok、其他 CLI）和每次 OpenAI 相容 API 請求，都受員工的「單次執行時間上限」限制（`agent.toml [runtime] timeout_secs`，預設 300 秒，範圍 30～3600 秒）。比較複雜的目標可以另外給時限，不必改員工設定：「交辦任務 → 複雜任務 → 更多設定 → 單次執行時限（分鐘）」（1～60），或在 `tasks_create`、`kind="goal"` 帶 `timeout_secs`（30～3600）。這個目標的每一輪都用它；開了任務沙箱的員工，沙箱逾時也改用它。Claude 員工維持固定的 30 分鐘上限，不套用。
 
 只有管理員可以設得比員工本身的上限更長，跟在員工編輯頁調高上限的規則一樣。儀表板 Operator、所有 MCP 呼叫者，以及建立者已不是管理員的排程交辦，最多只能用員工本身的上限（排程每次觸發都重新套用）。時限在目標建立時就固定，`tasks_update` 會拒絕修改。目標改派給其他員工時（任何改派方式）會清除時限，新負責人改用自己的上限。任務詳情頁會以標籤顯示。
 

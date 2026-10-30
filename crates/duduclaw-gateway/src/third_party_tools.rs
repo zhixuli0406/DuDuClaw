@@ -10,10 +10,9 @@
 //!   put in the path by the spawn-time rewrite when redaction is active, when
 //!   the employee has `[capabilities] action_rules`, or in the explore lane;
 //!   for Codex always (2026-10-19, `runtime/codex/third_party.rs`), because
-//!   Codex auto-approves the servers it is given; for Grok, Antigravity and
+//!   Codex auto-approves the servers it is given; for Grok and
 //!   the in-process tool loop (openai-compat, Direct API, local inference)
-//!   always too (2026-10-20, `runtime/third_party_mcp.rs`), Grok and
-//!   Antigravity as `--spawn-scoped` proxies in their persistent configs;
+//!   always too (2026-10-20, `runtime/third_party_mcp.rs`), Grok as `--spawn-scoped` proxies in their persistent configs;
 //! - `duduclaw mcp-remote-bridge` (remote servers,
 //!   [`crate::remote_mcp::bridge`]), always in the path for them.
 //!
@@ -36,11 +35,11 @@
 //! remove them); `agent.toml [[mcp.external]]` servers of the tool loop
 //! (mounted directly, unmounted in the explore lane); servers an operator
 //! configured for a CLI outside DuDuClaw (Grok also reads the OS user's
-//! `~/.grok/config.toml`, Antigravity `~/.gemini/config/mcp_config.json`;
+//! `~/.grok/config.toml`;
 //! Grok's Claude/Cursor-compat sources `~/.claude.json` and
 //! `~/.cursor/mcp.json` are switched off per spawn, `runtime/grok.rs`
 //! `COMPAT_MCP_SOURCES_OFF`); entries in an employee's
-//! `.grok/config.toml` / `.agents/mcp_config.json` that DuDuClaw did not
+//! `.grok/config.toml` that DuDuClaw did not
 //! write (kept, warned on every spawn); a `.mcp.json` changed between the
 //! spawn's read and the CLI's own. Grok's project-level sources (`.mcp.json`
 //! and `.cursor/mcp.json` of the working directory, and `.mcp.json` /
@@ -48,8 +47,8 @@
 //! directory's `.grok/config.toml` (`runtime/grok/third_party/sources.rs`).
 //! Every runtime registers the
 //! employee's `.mcp.json` third-party servers through this gate: the Claude
-//! CLI through the spawn-time rewrite, Codex since 2026-10-19, Grok,
-//! Antigravity and the tool loop since 2026-10-20 (before that Grok started
+//! CLI through the spawn-time rewrite, Codex since 2026-10-19, Grok
+//! and the tool loop since 2026-10-20 (before that Grok started
 //! them itself from `.mcp.json`, ungated). The Gemini CLI runtime was removed
 //! in v1.75.0.
 

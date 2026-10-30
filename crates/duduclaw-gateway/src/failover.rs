@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_provider_health_cooldown_trigger() {
-        let mut health = ProviderHealth::new(RuntimeType::Antigravity);
+        let mut health = ProviderHealth::new(RuntimeType::Grok);
         health.record_failure(300);
         health.record_failure(300);
         health.record_failure(300); // 3rd failure → cooldown
@@ -656,11 +656,11 @@ mod tests {
 
     #[test]
     fn fallback_model_branch1_skips_entries_of_a_foreign_family() {
-        // Only the Gemini model belongs to the Antigravity runtime.
-        let chain = strings(&["claude-opus-4-6", "gpt-5.4", "gemini-3-pro"]);
-        let (model, source) = resolve_fallback_model(&RuntimeType::Antigravity, "gpt-5.4", &chain)
+        // Only the Gemini model belongs to the Grok runtime.
+        let chain = strings(&["claude-opus-4-6", "gpt-5.4", "grok-4.3"]);
+        let (model, source) = resolve_fallback_model(&RuntimeType::Grok, "gpt-5.4", &chain)
             .expect("gemini entry");
-        assert_eq!(model, "gemini-3-pro");
+        assert_eq!(model, "grok-4.3");
         assert_eq!(source, "agent_fallbacks");
     }
 

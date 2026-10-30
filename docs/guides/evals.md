@@ -52,7 +52,7 @@ recursively, run in sorted order). It defaults to `./evals`.
 | `--baseline <report.json>` | Paired statistical comparison against a previously written `--report` file. See [Honest statistics](#honest-statistics). |
 | `--mde <fraction>` | Declared minimum detectable effect for the resolution check, as a pass‑rate fraction (default `0.10` = 10 percentage points). See [Honest statistics](#honest-statistics). |
 | `--cluster-by <key>` | Cluster key for cluster‑robust standard errors. Only `dir` (default, each case's directory) is implemented — any other value is refused. See [Honest statistics](#honest-statistics). |
-| `--runtime <id>` | Which backend runs every case (`claude` — the default and the pre‑P2 path — `codex`, `antigravity`, `grok`, `openai_compat`, or any other catalog runtime id). An unknown id is refused, never treated as `claude`. **Omitted ⇒ each case's own `[case] runtime`, else `claude`.** See [Capability matrix](#capability-matrix---matrix). |
+| `--runtime <id>` | Which backend runs every case (`claude` — the default and the pre‑P2 path — `codex`, `grok`, `openai_compat`, or any other catalog runtime id). An unknown id is refused, never treated as `claude`. **Omitted ⇒ each case's own `[case] runtime`, else `claude`.** See [Capability matrix](#capability-matrix---matrix). |
 | `--model <id>` | Model id override for every case, within `--runtime`. Omit to use each case's own `[case] model`. The report's `model` header always names what actually ran. |
 | `--paired-seeds` | Derive a deterministic seed per `(case id, repeat)` so the same draws line up across models (Miller's paired design). **Recorded, not applied** — no runtime in this build can consume a seed; each run says so via `seed_applied: false`. |
 | `--agent <id>` | Run every case under **this** provisioned agent instead of each case's own `[case] agent`. Recorded as `agent_override` in the report header and as `agent` per run. See [Borrowing one agent](#borrowing-one-agent---agent). |
@@ -731,11 +731,6 @@ event stream carried — one text block (so `min_text_blocks` can only ever obse
 recorded rather than the original JSON. Those signals are **not comparable across
 the two paths**, which is why one cell never mixes them.
 
-Antigravity `agy` 1.2.10 now supplies `stream-json` terminal tool events and
-measured token usage to its runtime. A live sandbox-denied tool event and a
-no-tool PING eval have been verified; successful native tool execution still
-needs a separate live check. Verifier-cell dollar estimates remain coarse
-because that utility call does not return usage to the matrix reporter.
 
 ### Outputs
 
@@ -817,7 +812,7 @@ duduclaw eval <eval-suite-dir> --matrix --team-2x2 \
   --planner-strong codex:gpt-5.6-sol \
   --executor-weak codex:gpt-5.6-terra \
   --executor-strong codex:gpt-5.6-sol \
-  --verifier-model antigravity:gemini-3.7-flash \
+  --verifier-model codex:gpt-5.4 \
   --team-effort low \
   --repeats 1 --max-cases 4 --report reports/team-2x2.json
 ```

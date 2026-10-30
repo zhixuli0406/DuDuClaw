@@ -542,17 +542,12 @@ impl ExternalJudgeConfig {
 // Read timing matches `[dispatch] judge` itself: one small `config.toml` read
 // per adjudication, no cache, so the switch hot-reloads.
 
-/// Read `config.toml [dispatch] judge_provider` / `judge_model` into a hint.
-///
-/// `None` ⇒ no override (both keys absent/blank), **or** the configured
-/// provider id is not a runtime this build knows — an unusable hint is
-/// dropped whole rather than half-applied, so the judge simply runs on the
-/// default utility resolution.
-pub fn judge_model_hint_from_home(home_dir: Option<&Path>) -> Option<UtilityModelHint> {
-    let home_dir = home_dir?;
-    let content = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
-    let table = content.parse::<toml::Table>().ok()?;
-    let section = table.get("dispatch").and_then(|v| v.as_table())?;
+/// Read the judge override, refusing removed runtimes before utility fallback.
+pub fn judge_model_hint_from_home(home_dir: Option<&Path>) -> Result<Option<UtilityModelHint>, String> {
+    let Some(home_dir) = home_dir else { return Ok(None) };
+    let Ok(content) = std::fs::read_to_string(home_dir.join("config.toml")) else { return Ok(None) };
+    let Ok(table) = content.parse::<toml::Table>() else { return Ok(None) };
+    let Some(section) = table.get("dispatch").and_then(|v| v.as_table()) else { return Ok(None) };
     parse_judge_model_hint(section)
 }
 
@@ -562,7 +557,7 @@ pub fn judge_model_hint_from_home(home_dir: Option<&Path>) -> Option<UtilityMode
 /// A non-string value on either key reads as "unset" (fail-safe toward the
 /// default utility model, consistent with every other `[dispatch]` reader in
 /// this module).
-pub fn parse_judge_model_hint(section: &toml::Table) -> Option<UtilityModelHint> {
+pub fn parse_judge_model_hint(section: &toml::Table) -> Result<Option<UtilityModelHint>, String> {
     let raw_provider = section
         .get("judge_provider")
         .and_then(|v| v.as_str())
@@ -574,7 +569,10 @@ pub fn parse_judge_model_hint(section: &toml::Table) -> Option<UtilityModelHint>
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if raw_provider.is_none() && raw_model.is_none() {
-        return None;
+        return Ok(None);
+    }
+    if let Some(removed) = raw_provider.and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+        return Err(removed.refusal("config.toml [dispatch] judge_provider"));
     }
     let provider = match raw_provider {
         None => None,
@@ -595,11 +593,11 @@ pub fn parse_judge_model_hint(section: &toml::Table) -> Option<UtilityModelHint>
                     valid = %RuntimeType::valid_values(),
                     "unknown [dispatch] judge_provider — ignoring the judge model override entirely"
                 );
-                return None;
+                return Ok(None);
             }
         },
     };
-    Some(UtilityModelHint {
+    Ok(Some(UtilityModelHint {
         provider,
         model: raw_model.map(str::to_string),
         // P1/WP-3: the judge does not yet take an effort override from
@@ -613,7 +611,7 @@ pub fn parse_judge_model_hint(section: &toml::Table) -> Option<UtilityModelHint>
         // `GoalAcceptanceCaller::complete` folds it on per call. `[dispatch]`
         // only ever decides WHICH model judges.
         output_schema: None,
-    })
+    }))
 }
 
 /// Has this `(agent, judge model)` pair already produced a same-family
@@ -651,7 +649,7 @@ pub async fn audit_judge_model_routing(home_dir: Option<&Path>, worker_agent_id:
     let Some(home) = home_dir else {
         return;
     };
-    let hint = judge_model_hint_from_home(Some(home));
+    let Ok(hint) = judge_model_hint_from_home(Some(home)) else { return };
     let (spec, degraded) =
         crate::runtime_dispatch::resolve_hinted_utility(home, None, hint.as_ref()).await;
 
@@ -1523,20 +1521,20 @@ mod tests {
     fn judge_model_hint_absent_without_keys() {
         // No keys ⇒ no hint ⇒ the default utility resolution, unchanged.
         assert_eq!(
-            parse_judge_model_hint(&dispatch_table("enabled = true")),
+            parse_judge_model_hint(&dispatch_table("enabled = true")).unwrap(),
             None
         );
         // Blank values read as unset.
         assert_eq!(
             parse_judge_model_hint(&dispatch_table(
                 "judge_provider = \"  \"\njudge_model = \"\""
-            )),
+            )).unwrap(),
             None
         );
         // Wrong types read as unset (fail-safe, same as every other
         // `[dispatch]` reader here).
         assert_eq!(
-            parse_judge_model_hint(&dispatch_table("judge_provider = 7\njudge_model = false")),
+            parse_judge_model_hint(&dispatch_table("judge_provider = 7\njudge_model = false")).unwrap(),
             None
         );
     }
@@ -1544,28 +1542,28 @@ mod tests {
     #[test]
     fn judge_model_hint_reads_both_keys() {
         let h = parse_judge_model_hint(&dispatch_table(
-            "judge_provider = \"antigravity\"\njudge_model = \"gemini-3-pro-preview\"",
-        ))
+            "judge_provider = \"grok\"\njudge_model = \"grok-4.3\"",
+        )).unwrap()
         .unwrap();
-        assert_eq!(h.provider, Some(RuntimeType::Antigravity));
-        assert_eq!(h.model.as_deref(), Some("gemini-3-pro-preview"));
+        assert_eq!(h.provider, Some(RuntimeType::Grok));
+        assert_eq!(h.model.as_deref(), Some("grok-4.3"));
         assert!(!h.is_empty());
 
         // Model only — legal; the family check at apply time decides whether
         // it is runnable on the resolved provider.
         let h =
-            parse_judge_model_hint(&dispatch_table("judge_model = \"claude-opus-4-6\"")).unwrap();
+            parse_judge_model_hint(&dispatch_table("judge_model = \"claude-opus-4-6\"")).unwrap().unwrap();
         assert_eq!(h.provider, None);
         assert_eq!(h.model.as_deref(), Some("claude-opus-4-6"));
 
         // Provider only.
-        let h = parse_judge_model_hint(&dispatch_table("judge_provider = \"codex\"")).unwrap();
+        let h = parse_judge_model_hint(&dispatch_table("judge_provider = \"codex\"")).unwrap().unwrap();
         assert_eq!(h.provider, Some(RuntimeType::Codex));
         assert_eq!(h.model, None);
 
         // Catalog aliases resolve (the alias list lives in `runtime_catalog`).
         assert_eq!(
-            parse_judge_model_hint(&dispatch_table("judge_provider = \"openai\""))
+            parse_judge_model_hint(&dispatch_table("judge_provider = \"openai\"")).unwrap()
                 .unwrap()
                 .provider,
             RuntimeType::parse("openai")
@@ -1579,42 +1577,39 @@ mod tests {
         // riding on whatever the default provider happens to be.
         assert_eq!(
             parse_judge_model_hint(&dispatch_table(
-                "judge_provider = \"kimi-typo\"\njudge_model = \"gemini-3-pro-preview\""
-            )),
+                "judge_provider = \"kimi-typo\"\njudge_model = \"grok-4.3\""
+            )).unwrap(),
             None
         );
-        assert_eq!(
-            parse_judge_model_hint(&dispatch_table(
-                "judge_provider = \"gemini\"\njudge_model = \"gemini-3-pro-preview\""
-            )),
-            None
-        );
+        assert!(parse_judge_model_hint(&dispatch_table(
+            "judge_provider = \"gemini\"\njudge_model = \"gemini-3-pro\""
+        )).is_err());
     }
 
     #[test]
     fn judge_model_hint_is_read_from_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(judge_model_hint_from_home(None), None);
-        assert_eq!(judge_model_hint_from_home(Some(dir.path())), None);
+        assert_eq!(judge_model_hint_from_home(None).unwrap(), None);
+        assert_eq!(judge_model_hint_from_home(Some(dir.path())).unwrap(), None);
 
         std::fs::write(
             dir.path().join("config.toml"),
-            "[dispatch]\njudge = \"mav\"\njudge_provider = \"antigravity\"\njudge_model = \"gemini-3-pro-preview\"\n",
+            "[dispatch]\njudge = \"mav\"\njudge_provider = \"grok\"\njudge_model = \"grok-4.3\"\n",
         )
         .unwrap();
-        let h = judge_model_hint_from_home(Some(dir.path())).unwrap();
-        assert_eq!(h.provider, Some(RuntimeType::Antigravity));
-        assert_eq!(h.model.as_deref(), Some("gemini-3-pro-preview"));
+        let h = judge_model_hint_from_home(Some(dir.path())).unwrap().unwrap();
+        assert_eq!(h.provider, Some(RuntimeType::Grok));
+        assert_eq!(h.model.as_deref(), Some("grok-4.3"));
 
         // Malformed TOML / no [dispatch] table ⇒ no hint.
         std::fs::write(dir.path().join("config.toml"), "[dispatch\njudge_model = ").unwrap();
-        assert_eq!(judge_model_hint_from_home(Some(dir.path())), None);
+        assert_eq!(judge_model_hint_from_home(Some(dir.path())).unwrap(), None);
         std::fs::write(
             dir.path().join("config.toml"),
             "[runtime]\nprovider = \"claude\"\n",
         )
         .unwrap();
-        assert_eq!(judge_model_hint_from_home(Some(dir.path())), None);
+        assert_eq!(judge_model_hint_from_home(Some(dir.path())).unwrap(), None);
     }
 
     #[test]
@@ -1631,7 +1626,7 @@ mod tests {
         // Cross-family ⇒ silent (this is the configuration we want).
         assert!(!same_model_family(
             "claude-opus-4-6",
-            "gemini-3-pro-preview"
+            "grok-4.3"
         ));
         assert!(!same_model_family("claude-opus-4-6", "gpt-5.6-sol"));
         // Unknown vs known ⇒ never guessed into a warning.
@@ -2053,12 +2048,11 @@ mod tests {
     }
 
     #[test]
-    fn removed_gemini_judge_provider_is_ignored_without_deprecation_notice() {
-        use crate::runtime_config::CONSULTED_NOTICES;
-        CONSULTED_NOTICES.with(|n| n.borrow_mut().clear());
-        assert!(parse_judge_model_hint(&dispatch_table("judge_provider = \"gemini\"")).is_none());
-        assert!(CONSULTED_NOTICES.with(|n| n.borrow().is_empty()));
-        parse_judge_model_hint(&dispatch_table("judge_provider = \"codex\"")).unwrap();
-        assert!(CONSULTED_NOTICES.with(|n| n.borrow().is_empty()));
+    fn removed_judge_provider_is_refused_without_defaulting() {
+        for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
+            let section = dispatch_table(&format!("judge_provider = {:?}", removed.id));
+            let error = parse_judge_model_hint(&section).unwrap_err();
+            assert!(error.contains(removed.removed_in), "{error}");
+        }
     }
 }

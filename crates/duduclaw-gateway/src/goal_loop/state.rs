@@ -28,7 +28,7 @@ use crate::task_store::{TaskIterationRow, TaskRow};
 // programmatically every round; the middle two round-trip through the
 // agent's own reply via a fixed self-report marker
 // (`<state_update>{JSON}</state_update>`, see [`parse_state_update`]) so
-// ANY CLI runtime (Claude / Codex / Gemini / Antigravity / openai-compat)
+// ANY CLI runtime (Claude / Codex / Gemini / Grok / openai-compat)
 // can participate — the protocol is plain text embedded in the prompt and
 // the completion text, not a Claude-specific structured-output feature.
 //

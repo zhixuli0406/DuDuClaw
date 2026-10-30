@@ -190,7 +190,7 @@ Remember to also change `container_name` (default `duduclaw-server`) to avoid a 
 
 ## 6. CLI authentication
 
-The image includes Claude, Codex, Antigravity and Grok. Their login methods differ. Codex uses device authorization, so the browser never needs to reach a callback listener inside Docker. Keep an API key available for provider billing and fallback.
+The image includes Claude, Codex, Grok. Their login methods differ. Codex uses device authorization, so the browser never needs to reach a callback listener inside Docker. Keep an API key available for provider billing and fallback.
 
 The standard Compose file mounts these credential and settings directories:
 
@@ -198,7 +198,6 @@ The standard Compose file mounts these credential and settings directories:
 |------|--------|-----|
 | `/home/duduclaw/.claude` | `duduclaw-claude` | Claude Code |
 | `/home/duduclaw/.codex`  | `duduclaw-codex`  | Codex |
-| `/home/duduclaw/.gemini` | `duduclaw-gemini` | Antigravity settings |
 | `/home/duduclaw/.grok` | `duduclaw-grok` | Grok |
 | `/home/duduclaw/.kimi-code` | `duduclaw-kimi` | Kimi Code |
 | `/home/duduclaw/.copilot` | `duduclaw-copilot` | GitHub Copilot CLI |
@@ -210,7 +209,7 @@ Persistent volumes keep CLI state across container replacement. A custom Compose
 
 The five additional volumes preserve credentials if those CLIs are installed separately. They are not bundled in this image. An uninstalled CLI cannot be logged in from the Dashboard. Cursor browser login still needs a browser callback reachable by the CLI; use API-key authentication on a remote host if that callback cannot be reached.
 
-> **Subscription logins carry account risk.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens; Anthropic may enforce this without prior notice, and users have reported suspended accounts. Letting one subscription answer channel customers, rotating several subscriptions past the usage limits, and storing the token in DuDuClaw all conflict with it. Google's [Antigravity terms](https://antigravity.google/terms) say that accessing its service with third-party software through Antigravity OAuth violates those terms and may lead to suspension or termination of the account. OpenAI runs an official [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) program: ChatGPT plan use in third-party apps is offered to open-source partners and selected commercial partners, a commercial product needs OpenAI's approval, and auth tokens must stay local and user-controlled, not in remote or managed environments. The setup-token, interactive-login and ChatGPT methods below are subscription logins and stay available; an API key is the supported path. The dashboard's login flows ask you to accept this notice first. See [features/13-multi-runtime.md](../features/13-multi-runtime.md).
+> **Subscription logins carry account risk.** Anthropic's [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) says third-party developers may not offer Claude.ai login in their own applications or route requests through Free, Pro or Max plan credentials on behalf of their users, and may not collect, store or intermediate Claude.ai credentials or session tokens; Anthropic may enforce this without prior notice, and users have reported suspended accounts. Letting one subscription answer channel customers, rotating several subscriptions past the usage limits, and storing the token in DuDuClaw all conflict with it.  OpenAI runs an official [Sign in with ChatGPT](https://openai.com/policies/sign-in-with-chatgpt-terms/) program: ChatGPT plan use in third-party apps is offered to open-source partners and selected commercial partners, a commercial product needs OpenAI's approval, and auth tokens must stay local and user-controlled, not in remote or managed environments. The setup-token, interactive-login and ChatGPT methods below are subscription logins and stay available; an API key is the supported path. The dashboard's login flows ask you to accept this notice first. See [features/13-multi-runtime.md](../features/13-multi-runtime.md).
 
 ### 6.1 Claude Code CLI
 
@@ -297,15 +296,6 @@ OPENAI_API_KEY=sk-proj-...
 
 Billed by usage, at OpenAI API pricing.
 
-### 6.3 Antigravity (Google) API-key mode
-
-The Docker image no longer installs Gemini CLI. Antigravity (`agy`) remains
-supported, as does the Gemini API provider. `agy` subscription sign-in needs
-an OS keyring, so use its API-key mode in a container: set
-`config.toml [antigravity] auth = "api_key"` and supply a `gemini` provider
-account or `GEMINI_API_KEY` in `.env`. Antigravity settings are stored under
-`~/.gemini/antigravity-cli/`; keep the `duduclaw-gemini` volume for them.
-
 ### 6.4 Per-agent runtime selection
 
 Each agent can specify which runtime to use in its own `agent.toml`:
@@ -314,8 +304,8 @@ Each agent can specify which runtime to use in its own `agent.toml`:
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-provider = "claude"       # primary runtime: claude / codex / antigravity / openai-compat …
-fallback = "antigravity"  # automatically switches over when Claude is unavailable
+provider = "claude"       # primary runtime: claude / codex / openai-compat …
+fallback = "codex"  # automatically switches over when Claude is unavailable
 ```
 
 See [features/13-multi-runtime.md](../features/13-multi-runtime.md) for a full example and the failover strategy.
@@ -346,7 +336,6 @@ claude auth status
 | `duduclaw-data` | Main application data: config, agents, memory SQLite, logs, bus_queue.jsonl | **Most important**, back up daily |
 | `duduclaw-claude` | Claude CLI OAuth state | Moderate — losing it just means running `claude auth login` again |
 | `duduclaw-codex`  | Codex OAuth state | Moderate |
-| `duduclaw-gemini` | Antigravity settings under `~/.gemini` | Moderate |
 | `duduclaw-grok` | Grok CLI credentials | Moderate |
 | `duduclaw-kimi` | Kimi Code credentials | Moderate |
 | `duduclaw-copilot` | Copilot CLI credentials | Moderate |

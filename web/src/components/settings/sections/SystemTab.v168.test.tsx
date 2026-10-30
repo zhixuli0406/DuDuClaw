@@ -100,12 +100,14 @@ describe('<SystemTab> v1.68', () => {
     await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ runtime: { utility_model: '' } }));
   });
 
-  it('lets an operator replace the removed global Gemini provider with Claude', async () => {
+  it.each([['gemini', 'Gemini'], ['antigravity', 'Antigravity'], ['agy', 'Antigravity']])('keeps the removed global %s provider visible and allows replacement with Claude', async (provider, name) => {
     const user = userEvent.setup();
-    configMock.mockResolvedValue({ config: BASE + '\n[runtime]\nutility_provider = "gemini"\n', utility_provider: 'gemini' });
+    configMock.mockResolvedValue({ config: BASE + `\n[runtime]\nutility_provider = "${provider}"\n`, utility_provider: provider });
     await ready();
-    expect(screen.getByRole('alert')).toHaveTextContent('Gemini CLI provider has been removed');
+    expect(screen.getByRole('alert')).toHaveTextContent('The saved provider has been removed');
+    expect(screen.getByRole('combobox', { name: 'Global utility provider' })).toHaveTextContent(name);
     await user.click(screen.getByRole('combobox', { name: 'Global utility provider' }));
+    expect(await screen.findByRole('option', { name })).toBeInTheDocument();
     await user.click(await screen.findByRole('option', { name: 'Claude' }));
     await user.click(screen.getByRole('button', { name: /^Save$/i }));
     await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ runtime: { utility_provider: 'claude' } }));

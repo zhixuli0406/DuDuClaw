@@ -6,6 +6,12 @@
 //! being told to go open a terminal, which is exactly where first-time users
 //! give up.
 //!
+//! Installed Codex on Unix may use the same fixed install command when its
+//! required permission-profile version is missing or unprobeable. Other installed
+//! providers still decline. After installation we re-probe and replace Codex's
+//! support cache cell; a shadowing old binary reports `update_shadowed` with
+//! its path, and an unprobeable version reports `version_unverified`.
+//!
 //! ## Security model (READ THIS BEFORE ADDING A PROVIDER)
 //!
 //! Running installers on behalf of a web client is a remote-code-execution
@@ -128,9 +134,9 @@ pub fn decline_reason(spec: &InstallSpec, windows: bool) -> Option<&'static str>
 /// post-install check and in the wizard's badges. PATH first (the user's own
 /// environment), then the HOME-rooted candidate scan, matching
 /// `handle_runtime_detect`.
-pub fn detect_binary(spec: &InstallSpec) -> bool {
+fn detect_path(spec: &InstallSpec) -> Option<String> {
     let user_home = PathBuf::from(duduclaw_core::platform::home_dir());
-    duduclaw_core::detect_runtime(spec.id, &user_home).is_some()
+    duduclaw_core::detect_runtime(spec.id, &user_home)
 }
 
 // ── concurrency guard ────────────────────────────────────────────────────────
@@ -143,16 +149,22 @@ fn in_flight() -> &'static Mutex<HashSet<&'static str>> {
     IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn try_claim(provider: &'static str) -> bool {
-    in_flight()
-        .lock()
-        .map(|mut s| s.insert(provider))
-        .unwrap_or(false)
+struct InstallClaim {
+    provider: &'static str,
 }
 
-fn release(provider: &'static str) {
-    if let Ok(mut s) = in_flight().lock() {
-        s.remove(provider);
+impl InstallClaim {
+    fn try_claim(provider: &'static str) -> Option<Self> {
+        let claimed = in_flight().lock().map(|mut s| s.insert(provider)).unwrap_or(false);
+        claimed.then(|| Self { provider })
+    }
+}
+
+impl Drop for InstallClaim {
+    fn drop(&mut self) {
+        if let Ok(mut s) = in_flight().lock() {
+            s.remove(self.provider);
+        }
     }
 }
 
@@ -257,7 +269,7 @@ fn emit(tx: &Option<tokio::sync::broadcast::Sender<String>>, event: &str, payloa
 /// single `killpg` takes the whole tree.
 ///
 /// Awaiting the reap here is load-bearing: the caller releases the per-provider
-/// in-flight guard immediately afterwards.
+/// in-flight guard only after post-install verification.
 async fn terminate_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -313,8 +325,13 @@ pub async fn start_install(
         return StartOutcome::Declined { reason: "product_policy_blocked", command, prerequisite: None };
     }
 
-    // Already there → don't reinstall; the caller just needs to re-detect.
-    if detect_binary(spec) {
+    let before_path = detect_path(spec);
+    let version = if spec.id == "codex" {
+        if let Some(bin) = before_path.as_deref() {
+            crate::runtime::codex::probe_codex_version_output(bin).await
+        } else { None }
+    } else { None };
+    if before_path.is_some() && !crate::runtime::codex::required_update(spec.id, true, version.as_deref()) {
         return StartOutcome::Declined {
             reason: "already_installed",
             command,
@@ -378,13 +395,13 @@ pub async fn start_install(
         }
     };
 
-    if !try_claim(spec.id) {
+    let Some(claim) = InstallClaim::try_claim(spec.id) else {
         return StartOutcome::Declined {
             reason: "already_running",
             command,
             prerequisite: None,
         };
-    }
+    };
 
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
@@ -405,7 +422,6 @@ pub async fn start_install(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            release(spec.id);
             tracing::warn!(target: "runtime_install", provider = spec.id, error = %e, "spawn failed");
             return StartOutcome::Declined {
                 reason: "spawn_failed",
@@ -432,6 +448,7 @@ pub async fn start_install(
     let sid = session_id.clone();
     let cmd_display = command.clone();
     tokio::spawn(async move {
+        let claim = claim;
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         let stdout = child.stdout.take();
@@ -511,19 +528,23 @@ pub async fn start_install(
         // to let another install of this provider start. Releasing before the
         // reap would let a second `npm install -g` run against the same global
         // prefix while the first was still dying.
-        release(spec.id);
+        // Keep the single-flight claim through verification.
 
         // Authoritative answer for the UI: is the binary actually there now?
         // A zero exit that somehow didn't produce a usable binary must not turn
         // the wizard green.
-        let detected = tokio::task::spawn_blocking(|| detect_binary(spec))
-            .await
-            .unwrap_or(false);
-        let final_status = if status == "succeeded" && !detected {
-            "failed"
-        } else {
-            status
-        };
+        let found = tokio::task::spawn_blocking(move || detect_path(spec)).await.unwrap_or(None);
+        let detected = found.is_some();
+        let mut version = None;
+        if spec.id == "codex" {
+            crate::runtime::codex::clear_installed_codex_support(before_path.as_deref(), found.as_deref());
+            if let Some(bin) = found.as_deref() {
+                version = crate::runtime::codex::probe_codex_version_output(bin).await;
+            }
+        }
+        let update_required = crate::runtime::codex::required_update(spec.id, detected, version.as_deref());
+        let (final_status, reason) = terminal_outcome(status, detected, update_required, version.as_deref());
+        drop(claim);
 
         audit(
             &home_dir,
@@ -538,6 +559,10 @@ pub async fn start_install(
                 "provider": spec.id,
                 "session_id": sid,
                 "status": final_status,
+                "reason": reason,
+                "path": found,
+                "version": version.as_deref().and_then(crate::runtime::codex::display_version),
+                "update_required": update_required,
                 "exit_code": exit_code,
                 "detected": detected,
             }),
@@ -558,6 +583,10 @@ pub async fn start_install(
                 "session_id": sid,
                 "provider": spec.id,
                 "status": final_status,
+                "reason": reason,
+                "path": found,
+                "version": version.as_deref().and_then(crate::runtime::codex::display_version),
+                "update_required": update_required,
                 "exit_code": exit_code,
                 "detected": detected,
                 // Always hand back the manual command so a failure is a
@@ -572,6 +601,30 @@ pub async fn start_install(
         session_id,
         command,
     }
+}
+
+/// npm exiting zero is not proof that the required binary is on the probe path.
+fn terminal_outcome(
+    status: &'static str,
+    detected: bool,
+    update_required: bool,
+    version: Option<&str>,
+) -> (&'static str, Option<&'static str>) {
+    if status != "succeeded" {
+        return (status, None);
+    }
+    if !detected {
+        return ("failed", None);
+    }
+    if update_required {
+        let reason = if version.and_then(crate::runtime::codex::display_version).is_some() {
+            "update_shadowed"
+        } else {
+            "version_unverified"
+        };
+        return (reason, Some(reason));
+    }
+    ("succeeded", None)
 }
 
 /// Append one audit row attributed to the requesting admin. The email rides in
@@ -602,16 +655,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_outcomes_require_a_usable_current_binary() {
+        assert_eq!(terminal_outcome("succeeded", true, false, Some("codex-cli 0.164.0")), ("succeeded", None));
+        assert_eq!(terminal_outcome("succeeded", true, true, Some("codex-cli 0.163.0")), ("update_shadowed", Some("update_shadowed")));
+        for version in [None, Some("garbage")] {
+            assert_eq!(terminal_outcome("succeeded", true, true, version), ("version_unverified", Some("version_unverified")));
+        }
+        assert_eq!(terminal_outcome("succeeded", false, false, None), ("failed", None));
+        assert_eq!(terminal_outcome("failed", true, true, None), ("failed", None));
+        assert_eq!(terminal_outcome("timeout", true, true, None), ("timeout", None));
+    }
+
+    #[test]
+    fn only_codex_can_require_an_update() {
+        for spec in duduclaw_core::runtime_catalog::CATALOG {
+            for version in [None, Some("garbage"), Some("codex-cli 0.163.0")] {
+                assert_eq!(
+                    crate::runtime::codex::required_update(spec.id, true, version),
+                    cfg!(unix) && spec.id == "codex",
+                    "{}", spec.id,
+                );
+            }
+            assert!(!crate::runtime::codex::required_update(spec.id, true, Some("codex-cli 0.164.0")));
+            assert!(!crate::runtime::codex::required_update(spec.id, false, None));
+        }
+    }
+
+    #[test]
     fn maps_every_supported_provider_to_its_documented_command() {
         // Sources are recorded in the module doc table; these assertions are the
         // executable copy so a typo in a package name fails the build's tests.
         let cases = [
             ("claude", "npm install -g @anthropic-ai/claude-code"),
             ("codex", "npm install -g @openai/codex"),
-            (
-                "antigravity",
-                "curl -fsSL https://antigravity.google/cli/install.sh | bash",
-            ),
             ("grok", "curl -fsSL https://x.ai/cli/install.sh | bash"),
             // WP-B additions (2026-09), sources cited in each catalog entry.
             ("qwen", "npm install -g @qwen-code/qwen-code"),
@@ -630,16 +706,11 @@ mod tests {
                 "{provider} docs url"
             );
         }
-        assert!(spec_for("gemini").is_none(), "removed Gemini CLI must not be installable");
+        for removed in ["gemini", "antigravity", "agy"] {
+            assert!(spec_for(removed).is_none(), "removed runtime must not be installable: {removed}");
+        }
     }
 
-    #[test]
-    fn agy_is_an_alias_for_antigravity() {
-        let a = spec_for("agy").expect("agy alias");
-        let b = spec_for("antigravity").expect("antigravity");
-        assert_eq!(a.id, b.id);
-        assert_eq!(a.binary, "agy");
-    }
 
     /// Every catalog runtime with a binary must be installable-or-explainable.
     /// The failure this prevents: a new runtime that `runtime.detect` reports
@@ -765,7 +836,7 @@ mod tests {
         let huge_padded = format!("   {huge}   ");
         assert!(spec_for(&huge_padded).is_none());
         // The longest legitimate name is comfortably inside the gate.
-        assert!(spec_for("antigravity").is_some());
+        assert!(spec_for("opencode").is_some());
     }
 
     #[test]
@@ -818,7 +889,7 @@ mod tests {
 
     #[test]
     fn posix_script_channels_decline_on_windows_only() {
-        let spec = spec_for("antigravity").unwrap();
+        let spec = spec_for("cursor").unwrap();
         assert!(auto_installable(spec, false));
         assert!(!auto_installable(spec, true));
         assert_eq!(decline_reason(spec, false), None);
@@ -870,11 +941,23 @@ mod tests {
     fn in_flight_guard_admits_one_claim_at_a_time() {
         // Uses a provider no other test claims, so the global guard is safe here.
         let p = "codex";
-        assert!(try_claim(p), "first claim");
-        assert!(!try_claim(p), "second concurrent claim must be refused");
-        release(p);
-        assert!(try_claim(p), "claim again after release");
-        release(p);
+        let claim = InstallClaim::try_claim(p).expect("first claim");
+        assert!(InstallClaim::try_claim(p).is_none(), "second concurrent claim must be refused");
+        assert!(InstallClaim::try_claim(p).is_none(), "a refused claim must not release the owner");
+        drop(claim);
+        let claim = InstallClaim::try_claim(p).expect("claim again after drop");
+        drop(claim);
+    }
+
+    #[test]
+    fn in_flight_claim_is_released_on_panic() {
+        let provider = "panic-claim-test";
+        let result = std::panic::catch_unwind(|| {
+            let _claim = InstallClaim::try_claim(provider).expect("initial claim");
+            panic!("installer panicked");
+        });
+        assert!(result.is_err());
+        let _claim = InstallClaim::try_claim(provider).expect("claim after unwind");
     }
 
     #[test]

@@ -17,10 +17,9 @@ use std::path::{Path, PathBuf};
 use crate::discovery::attempt_adapter::RuntimeFamily;
 
 /// Every family the sandbox can run, in a fixed order.
-pub const FAMILIES: [RuntimeFamily; 5] = [
+pub const FAMILIES: [RuntimeFamily; 4] = [
     RuntimeFamily::Claude,
     RuntimeFamily::Codex,
-    RuntimeFamily::Antigravity,
     RuntimeFamily::Grok,
     RuntimeFamily::OpenAiCompat,
 ];
@@ -77,7 +76,6 @@ pub fn default_executable(family: RuntimeFamily) -> &'static str {
     match family {
         RuntimeFamily::Claude => "/usr/bin/claude",
         RuntimeFamily::Codex => "/usr/bin/codex",
-        RuntimeFamily::Antigravity => "/usr/local/bin/agy",
         RuntimeFamily::Grok => "/usr/local/bin/grok",
         RuntimeFamily::OpenAiCompat => "/usr/local/bin/python3",
     }

@@ -61,7 +61,7 @@ trust: 0.1   — Speculative, draft
 
 ## 自動注入フロー
 
-注入はsystem prompt組み立て時に発生します——3つの場所で行われるため、すべてのruntime（Claude、Codex、Antigravity、Grok、OpenAI互換、およびcatalogのその他のruntime）が同じ知識を得ます：
+注入はsystem prompt組み立て時に発生します——3つの場所で行われるため、すべてのruntime（Claude、Codex、Grok、OpenAI互換、およびcatalogのその他のruntime）が同じ知識を得ます：
 
 ```
 User sends message

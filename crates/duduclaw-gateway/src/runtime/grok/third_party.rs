@@ -344,8 +344,8 @@ pub(crate) fn merge_servers(
 }
 
 /// Read-merge-write `<dir>/.grok/config.toml` under a lock kept in the
-/// DuDuClaw home (not in the agent-writable directory). Symlink-safe like the
-/// Antigravity writer ([`crate::fs_safe::SafeDir`]): a symlinked `.grok` or
+/// DuDuClaw home (not in the agent-writable directory). Using
+/// [`crate::fs_safe::SafeDir`] prevents symlink traversal: a symlinked `.grok` or
 /// `config.toml` is refused, the file is replaced atomically, a new file is
 /// 0600 and an existing one is reset to owner-only. Other tables are kept.
 pub(crate) fn write_config(dir: &Path, home_dir: &Path, desired: &Desired) -> Result<bool, String> {
@@ -407,8 +407,7 @@ fn restrict(dir: &Path) {
 }
 
 /// Lock for one directory's `.grok/config.toml`, under the DuDuClaw home and
-/// keyed by a hash of the canonical directory (same reasoning as
-/// `antigravity_setup::mcp_lock_path`).
+/// keyed by a hash of the canonical directory.
 pub(crate) fn lock_path(home_dir: &Path, dir: &Path) -> PathBuf {
     use sha2::{Digest, Sha256};
     let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());

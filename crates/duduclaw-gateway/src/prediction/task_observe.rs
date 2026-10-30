@@ -498,7 +498,7 @@ mod tests {
         for runtime in [
             RuntimeType::Claude,
             RuntimeType::Codex,
-            RuntimeType::Antigravity,
+            RuntimeType::Grok,
             RuntimeType::OpenAiCompat,
         ] {
             let obs = observe_round(

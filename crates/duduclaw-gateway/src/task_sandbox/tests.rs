@@ -35,7 +35,6 @@ fn defaults_when_the_section_is_missing() {
     for (family, path) in [
         (RuntimeFamily::Claude, "/usr/bin/claude"),
         (RuntimeFamily::Codex, "/usr/bin/codex"),
-        (RuntimeFamily::Antigravity, "/usr/local/bin/agy"),
         (RuntimeFamily::Grok, "/usr/local/bin/grok"),
         (RuntimeFamily::OpenAiCompat, "/usr/local/bin/python3"),
     ] {
@@ -56,14 +55,14 @@ workspace_bytes = 2097152
 max_turns = 7
 when_unavailable = "run_unsandboxed"
 [container.sandbox.executables]
-agy = "/opt/agy/bin/agy"
+codex = "/opt/codex/bin/codex"
 openai_compat = "/usr/bin/python3"
 "#)).unwrap();
     assert_eq!(s.image, "registry.local/dudu@sha256:abc");
     assert_eq!((s.memory_bytes, s.pids, s.cpu_millis, s.tmp_bytes, s.max_turns), (1 << 30, 64, 500, 1 << 20, 7));
     assert_eq!(s.workspace_bytes, 2 << 20);
     assert_eq!(s.when_unavailable, WhenUnavailable::RunUnsandboxed);
-    assert_eq!(s.executable(RuntimeFamily::Antigravity), Path::new("/opt/agy/bin/agy"));
+    assert_eq!(s.executable(RuntimeFamily::Codex), Path::new("/opt/codex/bin/codex"));
     assert_eq!(s.executable(RuntimeFamily::OpenAiCompat), Path::new("/usr/bin/python3"));
     assert_eq!(s.executable(RuntimeFamily::Claude), Path::new("/usr/bin/claude"));
 }
@@ -211,7 +210,6 @@ fn generic_cli_runtimes_are_unsupported() {
     for runtime in [
         RuntimeType::Claude,
         RuntimeType::Codex,
-        RuntimeType::Antigravity,
         RuntimeType::Grok,
     ] {
         let result = preflight(&SandboxSettings::default(), &spec(runtime));
@@ -266,7 +264,6 @@ fn no_account_message_names_the_credential_kinds() {
     let m = Unavailable::NoAccount { runtime: "claude", accepted: accepted_credentials(RuntimeFamily::Claude, "anthropic") }.message();
     assert!(m.contains("setup-token") && m.contains("API key"), "{m}");
     assert!(accepted_credentials(RuntimeFamily::Codex, "openai").contains("auth.json"));
-    assert!(accepted_credentials(RuntimeFamily::Antigravity, "gemini").contains("Gemini API key"));
     assert!(accepted_credentials(RuntimeFamily::OpenAiCompat, "deepseek").contains("deepseek"));
 }
 

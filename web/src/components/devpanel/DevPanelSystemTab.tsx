@@ -10,17 +10,13 @@ import { useDevPanelIdJump } from './id-jump';
 
 const TAKEOVER_POLL_MS = 15000;
 
-/** `runtime.detect` boolean fields, in the display order the panel renders
- *  them. Provider names are proper nouns (kept as-is across locales, same
- *  convention as `agents.runtime.provider.*` for the four that overlap it —
- *  `antigravity` has no entry there yet, so it's a literal here too). */
+/** Runtime detection fields in display order; product names stay verbatim. */
 const RUNTIME_PROVIDERS: ReadonlyArray<{
-  readonly key: keyof Pick<RuntimeDetect, 'claude_cli' | 'codex' | 'antigravity' | 'grok'>;
+  readonly key: keyof Pick<RuntimeDetect, 'claude_cli' | 'codex' | 'grok'>;
   readonly label: string;
 }> = [
   { key: 'claude_cli', label: 'Claude' },
   { key: 'codex', label: 'Codex' },
-  { key: 'antigravity', label: 'Antigravity' },
   { key: 'grok', label: 'Grok' },
 ];
 

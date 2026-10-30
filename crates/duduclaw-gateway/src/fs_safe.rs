@@ -1,6 +1,6 @@
 //! Symlink-safe file operations inside a directory another party can write.
 //!
-//! Shared by the Antigravity runtime (`<work_root>/.agents/mcp_config.json`,
+//! Shared by the Grok runtime (`<work_root>/.grok/config.toml`,
 //! written into an agent-writable tree) and the computer-use workspaces
 //! (`<home>/computer_workspaces/<id>/data/`, mounted read-only into a
 //! container). In both a planted symlink must never redirect the gateway's
@@ -16,7 +16,6 @@
 //! canonical-containment check (no fd-relative API in std).
 
 use std::io;
-use std::path::Path;
 
 pub(crate) fn refused(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, msg.into())
@@ -680,13 +679,6 @@ impl SafeDir {
     }
 }
 
-/// Convenience: is `path` itself a symlink (without following it)?
-pub(crate) fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -713,7 +705,7 @@ mod tests {
         assert!(dir.read_file("f.json").is_err());
         assert!(dir.write_file_atomic("f.json", "{}").is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "SECRET");
-        assert!(is_symlink(&root.path().join("f.json")));
+        assert!(std::fs::symlink_metadata(root.path().join("f.json")).unwrap().file_type().is_symlink());
     }
 
     #[test]

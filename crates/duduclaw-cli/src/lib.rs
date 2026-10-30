@@ -59,7 +59,7 @@ pub mod mcp_oauth_server; // WP3.1-T2: OAuth 2.1 issuance for remote MCP clients
 pub(crate) mod mcp_os_ops; // O-0: device.*/system.* → agent-facing os_* MCP tool bridge
 pub mod mcp_planner; // RFC-26 P6.1: clarify-first Plan Mode
 pub mod mcp_proxy; // §13.6 WP-P: redacting stdio JSON-RPC proxy for external MCP servers
-pub mod mcp_proxy_spawn_env; // per-spawn upstream env for `mcp-proxy --spawn-scoped` (Grok, Antigravity)
+pub mod mcp_proxy_spawn_env; // per-spawn upstream env for `mcp-proxy --spawn-scoped` (Grok)
 pub mod mcp_rate_limit;
 pub mod mcp_recording; // WP3.3 R1/R3: browser + desktop recording capture
 pub(crate) mod mcp_recording_distill; // WP3.3 R2: HAR redaction/parsing + skill_from_recording
@@ -1948,7 +1948,7 @@ enum ToolingCommands {
         /// `<server>.<tool>` for rule matching.
         #[arg(long)]
         server: String,
-        /// The entry lives in a persistent CLI config (Grok, Antigravity):
+        /// The entry lives in a persistent CLI config (Grok):
         /// start the upstream only when `DUDUCLAW_MCP_PROXY_ENV_DIR` holds
         /// this server's file for the current spawn, otherwise start nothing.
         #[arg(long)]
@@ -2159,7 +2159,7 @@ enum ToolingCommands {
         cluster_by: String,
 
         /// P2 — which runtime backend runs every case (`claude` | `codex` |
-        /// `antigravity` | `grok` | `openai_compat` | any other
+        /// `grok` | `openai_compat` | any other
         /// catalog runtime id). Omit for `claude`, which takes the same direct
         /// CLI path every pre-P2 run took. Non-Claude runtimes go through the
         /// gateway's runtime abstraction and their transcript is synthesized
@@ -2774,7 +2774,7 @@ enum AgentCommands {
         trigger: Option<String>,
 
         /// AI runtime provider for this agent: `claude` (default), `codex`,
-        /// `antigravity`, or `openai_compat`. Written to
+        /// `grok`, or `openai_compat`. Written to
         /// `agent.toml [runtime] provider` and used to scaffold the
         /// provider's context file (AGENTS.md for codex; CLAUDE.md is always
         /// written for compatibility).
@@ -9214,12 +9214,13 @@ fn deprecated_runtime_findings(agents: &[(String, Option<String>, Option<String>
     let mut out = Vec::new();
     for (name, provider, fallback) in agents {
         for (field, value) in [("provider", provider), ("fallback", fallback)] {
-            if value
+            if let Some(removed) = value
                 .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case("gemini"))
+                .and_then(duduclaw_core::runtime_catalog::removed_runtime)
             {
                 out.push(format!(
-                    "{name}: [runtime] {field} = \"gemini\" 已移除；請改成 \"antigravity\" 並確認模型可用"
+                    "{name}: [runtime] {field} = \"{}\" 已移除（{}，{}）；請自行選擇支援的 runtime 與 model",
+                    value.as_deref().unwrap_or_default(), removed.display_name, removed.removed_in
                 ));
                 continue;
             }
@@ -9239,6 +9240,36 @@ fn deprecated_runtime_findings(agents: &[(String, Option<String>, Option<String>
     out
 }
 
+/// Scan runtime selectors without interpreting API provider names as CLI runtimes.
+fn removed_runtime_config_findings(value: &toml::Value, path: &str, out: &mut Vec<String>) {
+    let Some(table) = value.as_table() else { return };
+    for (key, value) in table {
+        let location = format!("{path}.{key}");
+        let selector = key == "runtime" || key.ends_with("_runtime")
+            || matches!(key.as_str(), "utility_provider" | "judge_provider" | "review_provider")
+            || (path.ends_with(".runtime") && matches!(key.as_str(), "provider" | "fallback"));
+        if selector {
+            if let Some(removed) = value.as_str().and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+                out.push(format!("已移除：{}", removed.refusal(&format!("{location} = {:?}", removed.id))));
+            }
+        }
+        if path.ends_with(".runtimes") {
+            if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(key) {
+                out.push(format!("已移除：{}", removed.refusal(&format!("{location} = {:?}", removed.id))));
+            }
+        }
+        removed_runtime_config_findings(value, &location, out);
+    }
+}
+
+fn removed_runtime_file_findings(path: &std::path::Path, out: &mut Vec<String>) {
+    if let Ok(raw) = std::fs::read_to_string(path) {
+        if let Ok(value) = raw.parse::<toml::Value>() {
+            removed_runtime_config_findings(&value, &path.display().to_string(), out);
+        }
+    }
+}
+
 /// `duduclaw doctor` row for removed or deprecated agent runtime values.
 async fn deprecated_runtime_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let name = "已移除或棄用的 runtime".to_string();
@@ -9249,15 +9280,27 @@ async fn deprecated_runtime_check(home: &std::path::Path) -> (String, CheckStatu
             "沒有員工使用已移除或棄用的 runtime".to_string(),
         )
     };
-    // No agents directory at all is an empty roster (nothing can be
-    // deprecated); any other problem reading it stays a warning.
+    let mut extra_findings = Vec::new();
+    removed_runtime_file_findings(&home.join("config.toml"), &mut extra_findings);
+    // An empty roster can still have a removed utility or judge runtime.
     match std::fs::symlink_metadata(home.join("agents")) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return pass(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if extra_findings.is_empty() { pass() } else {
+                (name, CheckStatus::Warn, extra_findings.join("\n         "))
+            };
+        }
         _ => {}
+    }
+    // Scan files independently: registry loading may omit an invalid agent.
+    if let Ok(dirs) = employee_dirs(home) {
+        for (_, dir) in dirs {
+            removed_runtime_file_findings(&dir.join("agent.toml"), &mut extra_findings);
+        }
     }
     let mut registry = duduclaw_agent::registry::AgentRegistry::new(home.join("agents"));
     if let Err(e) = registry.scan().await {
-        return (name, CheckStatus::Warn, format!("無法讀取 AI 員工清單：{e}"));
+        extra_findings.push(format!("無法讀取 AI 員工清單：{e}"));
+        return (name, CheckStatus::Warn, extra_findings.join("\n         "));
     }
     let mut rows: Vec<(String, Option<String>, Option<String>)> = registry
         .list()
@@ -9271,7 +9314,21 @@ async fn deprecated_runtime_check(home: &std::path::Path) -> (String, CheckStatu
         })
         .collect();
     rows.sort();
-    let findings = deprecated_runtime_findings(&rows);
+    // Preserve preset-resolved choices absent from the raw file; suppress only
+    // the same removed selector already reported at this agent's exact path.
+    for (agent, provider, fallback) in &mut rows {
+        for (field, value) in [("provider", provider), ("fallback", fallback)] {
+            if let Some(removed) = value.as_deref().and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+                let prefix = format!("已移除：{}.runtime.{field} = {:?} ",
+                    home.join("agents").join(agent.as_str()).join("agent.toml").display(), removed.id);
+                if extra_findings.iter().any(|finding| finding.starts_with(&prefix)) {
+                    *value = None;
+                }
+            }
+        }
+    }
+    let mut findings = deprecated_runtime_findings(&rows);
+    findings.extend(extra_findings);
     if findings.is_empty() {
         return pass();
     }
@@ -10487,6 +10544,9 @@ async fn mcp_server_diagnostic(home: &std::path::Path) {
 /// entry lands and the error message can never list a stale set.
 fn parse_runtime_provider_strict(s: &str) -> Result<duduclaw_core::types::RuntimeType, String> {
     use duduclaw_core::types::RuntimeType;
+    if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(s) {
+        return Err(removed.refusal("agent create --runtime"));
+    }
     RuntimeType::parse(s).ok_or_else(|| {
         format!(
             "unknown runtime provider '{}' — expected one of: {}",
@@ -10505,7 +10565,7 @@ fn runtime_deprecation_notice(provider: duduclaw_core::types::RuntimeType) -> Op
 /// Context-file names the provider's CLI reads for agent-directory context.
 ///
 /// CLAUDE.md is always scaffolded (Claude Code compatibility is a project
-/// invariant, and `agy` shares the Claude-context lineage); Codex reads the
+/// invariant); Codex reads the
 /// AGENTS.md convention, so it gets the same content under that filename.
 fn provider_context_filenames(
     provider: duduclaw_core::types::RuntimeType,
@@ -10518,7 +10578,7 @@ fn provider_context_filenames(
         // likely file the agent reads. GrokRuntime also embeds the system prompt
         // in the prompt payload, so context delivery does not depend on this.
         RuntimeType::Grok => &["CLAUDE.md", "AGENTS.md"],
-        RuntimeType::Claude | RuntimeType::Antigravity | RuntimeType::OpenAiCompat => {
+        RuntimeType::Claude | RuntimeType::OpenAiCompat => {
             &["CLAUDE.md"]
         }
         // WP-B runtimes. `AGENTS.md` is the cross-CLI convention every one of
@@ -10854,7 +10914,7 @@ pub(crate) async fn scaffold_agent_dir(
 
     // Provider context files — one template, rendered under each filename the
     // configured runtime's CLI reads (W3): CLAUDE.md always (Claude Code
-    // compatibility invariant; agy shares the lineage), plus AGENTS.md for
+    // compatibility invariant), plus AGENTS.md for
     // codex.
     let wiki_guide = include_str!("../../../templates/wiki/CLAUDE_WIKI.md");
     let context_md = format!(
@@ -12832,11 +12892,12 @@ mod deprecated_runtime_doctor_tests {
             ("a".to_string(), Some("gemini".to_string()), None),
             ("b".to_string(), Some("claude".to_string()), Some("gemini".to_string())),
             ("c".to_string(), Some("antigravity".to_string()), Some("codex".to_string())),
+            ("alias".to_string(), Some("agy".to_string()), None),
             ("d".to_string(), Some("nonsense".to_string()), None),
             ("e".to_string(), None, None),
         ];
         let f = deprecated_runtime_findings(&rows);
-        assert_eq!(f.len(), 2, "{f:?}");
+        assert_eq!(f.len(), 4, "{f:?}");
         assert!(
             f[0].starts_with("a: [runtime] provider = \"gemini\""),
             "{f:?}"
@@ -12847,7 +12908,7 @@ mod deprecated_runtime_doctor_tests {
         );
         assert!(
             f.iter()
-                .all(|l| l.contains("已移除") && l.contains("antigravity"))
+                .all(|l| l.contains("已移除") && l.contains("自行選擇"))
         );
     }
 
@@ -12860,27 +12921,42 @@ mod deprecated_runtime_doctor_tests {
     }
 
     #[tokio::test]
-    async fn doctor_deprecated_runtime_row_warns_on_a_gemini_agent() {
+    async fn doctor_deprecated_runtime_row_warns_on_removed_agents() {
+        for id in ["gemini", "antigravity", "agy"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("agents/evaluator");
+            std::fs::create_dir_all(&dir).unwrap();
+            let raw = format!(
+                "{}\n[runtime]\nprovider = \"{id}\"\n",
+                include_str!("../../../templates/evaluator/agent.toml")
+            );
+            std::fs::write(dir.join("agent.toml"), raw).unwrap();
+            let (_, status, detail) = deprecated_runtime_check(tmp.path()).await;
+            assert_eq!(status, CheckStatus::Warn, "{detail}");
+            assert!(detail.contains("evaluator") && detail.contains(id), "{detail}");
+            assert!(detail.contains("docs/guides/deprecations.md"), "{detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_global_removed_selectors_without_agents() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("agents/evaluator");
-        std::fs::create_dir_all(&dir).unwrap();
-        let raw = format!(
-            "{}\n[runtime]\nprovider = \"gemini\"\n",
-            include_str!("../../../templates/evaluator/agent.toml")
-        );
-        std::fs::write(dir.join("agent.toml"), raw).unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            "[runtime]\nutility_provider = \"agy\"\n[dispatch]\njudge_provider = \"antigravity\"\n[llm]\nprovider = \"gemini\"\n").unwrap();
         let (_, status, detail) = deprecated_runtime_check(tmp.path()).await;
         assert_eq!(status, CheckStatus::Warn, "{detail}");
-        assert!(detail.contains("evaluator") && detail.contains("gemini"), "{detail}");
-        assert!(detail.contains("docs/guides/deprecations.md"), "{detail}");
+        assert!(detail.contains("utility_provider") && detail.contains("judge_provider"), "{detail}");
+        assert!(!detail.contains(".llm.provider"), "{detail}");
     }
 
     #[test]
-    fn removed_gemini_runtime_is_rejected_by_agent_create() {
+    fn removed_runtimes_are_rejected_by_agent_create() {
         use duduclaw_core::types::RuntimeType;
-        assert!(runtime_deprecation_notice(RuntimeType::Antigravity).is_none());
         assert!(runtime_deprecation_notice(RuntimeType::Claude).is_none());
-        assert!(parse_runtime_provider_strict("gemini").is_err());
+        for id in ["gemini", "antigravity", "agy", " AGY "] {
+            let err = parse_runtime_provider_strict(id).unwrap_err();
+            assert!(err.contains("removed") && err.contains("choose"), "{err}");
+        }
     }
 }
 
@@ -13142,11 +13218,6 @@ mod agent_scaffold_tests {
             provider_context_filenames(RuntimeType::Codex),
             &["CLAUDE.md", "AGENTS.md"]
         );
-        // agy reads the Claude-context lineage — no extra file.
-        assert_eq!(
-            provider_context_filenames(RuntimeType::Antigravity),
-            &["CLAUDE.md"]
-        );
         assert_eq!(
             provider_context_filenames(RuntimeType::OpenAiCompat),
             &["CLAUDE.md"]
@@ -13165,10 +13236,7 @@ mod agent_scaffold_tests {
             RuntimeType::Codex
         );
         assert!(parse_runtime_provider_strict("Gemini").is_err());
-        assert_eq!(
-            parse_runtime_provider_strict("agy").unwrap(),
-            RuntimeType::Antigravity
-        );
+        assert!(parse_runtime_provider_strict("agy").is_err());
         assert_eq!(
             parse_runtime_provider_strict("grok").unwrap(),
             RuntimeType::Grok

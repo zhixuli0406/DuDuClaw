@@ -3,6 +3,32 @@
 
 use super::*;
 
+#[derive(Debug)]
+pub(super) enum TeamDispatchError {
+    ConfigRefused(String),
+    Infrastructure(String),
+}
+
+impl From<String> for TeamDispatchError {
+    fn from(error: String) -> Self {
+        Self::Infrastructure(error)
+    }
+}
+
+pub(super) fn check_frozen_team_runtime(task: &TaskRow) -> Result<(), TeamDispatchError> {
+    if let Some(spec) = crate::team_composer::frozen_spec(task) {
+        for role in duduclaw_core::types::Role::ALL {
+            if let Some(removed) = spec.role(*role)
+                .and_then(|spec| duduclaw_core::runtime_catalog::removed_runtime(&spec.runtime)) {
+                return Err(TeamDispatchError::ConfigRefused(
+                    removed.refusal(&format!("frozen [team.roles.{}] runtime", role.as_str())),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl GoalLoopDriver {
     /// Enqueue a work message for `task` onto `message_queue.db` — the same rail
     /// the heartbeat's task-board pull uses, so the existing dispatcher routes it
@@ -55,9 +81,11 @@ impl GoalLoopDriver {
     ///
     /// Split out of [`Self::try_team_dispatch`] so the backfill is testable
     /// without driving a whole round (which would spawn CLIs).
-    pub(super) async fn ensure_frozen_team_spec(&self, task: &mut TaskRow) {
+    pub(super) async fn ensure_frozen_team_spec(&self, task: &mut TaskRow) -> Result<(), TeamDispatchError> {
         if task.team_spec_json.is_some() || task.revision_round != 0 {
-            return;
+            crate::team_composer::check_team_dispatchable(&self.home_dir, &task.assigned_to)
+                .map_err(TeamDispatchError::ConfigRefused)?;
+            return check_frozen_team_runtime(task);
         }
         match crate::team_composer::freeze_for_task(
             &self.home_dir,
@@ -71,8 +99,8 @@ impl GoalLoopDriver {
                 task.team_spec_json = serde_json::to_string(&spec).ok();
             }
             crate::team_composer::FreezeOutcome::AlreadyFrozen => {
-                match self.store.get_task(&task.id).await {
-                    Ok(Some(fresh)) => {
+                match self.store.get_task(&task.id).await? {
+                    Some(fresh) => {
                         task.team_spec_json = fresh.team_spec_json;
                         info!(
                             task = %task.id,
@@ -81,25 +109,23 @@ impl GoalLoopDriver {
                              re-read the stored spec for this round"
                         );
                     }
-                    Ok(None) => warn!(
-                        task = %task.id,
-                        "goal loop: team spec already frozen but the task row vanished — \
-                         this round runs Solo"
-                    ),
-                    Err(e) => warn!(
-                        task = %task.id, error = %e,
-                        "goal loop: team spec already frozen but the row could not be \
-                         re-read — this round runs Solo"
-                    ),
+                    None => return Err(TeamDispatchError::Infrastructure(
+                        "team spec already frozen but the task row vanished".into(),
+                    )),
                 }
             }
-            // `Disabled` / `Refused` / `SoloByDefault` are already logged
-            // (and, for a refusal, audited) inside `freeze_for_task`; the task
-            // runs Solo.
+            crate::team_composer::FreezeOutcome::DispatchRefused { detail, .. } => {
+                return Err(TeamDispatchError::ConfigRefused(detail));
+            }
+            crate::team_composer::FreezeOutcome::Refused { code: "freeze_write_failed", detail } => {
+                return Err(detail.into());
+            }
+            // Only non-fatal refusals keep the existing Solo fallback.
             crate::team_composer::FreezeOutcome::Disabled
             | crate::team_composer::FreezeOutcome::Refused { .. }
             | crate::team_composer::FreezeOutcome::SoloByDefault { .. } => {}
         }
+        check_frozen_team_runtime(task)
     }
 
     /// Returns the team dispatch (tracking id, confirmed-team flag) when the
@@ -112,11 +138,11 @@ impl GoalLoopDriver {
         task: &TaskRow,
         iter: u32,
         state_text: &str,
-    ) -> (Option<(String, bool)>, Option<String>) {
+    ) -> Result<(Option<(String, bool)>, Option<String>), TeamDispatchError> {
         let mut task = task.clone();
-        self.ensure_frozen_team_spec(&mut task).await;
+        self.ensure_frozen_team_spec(&mut task).await?;
         let Some(spec) = crate::team_composer::frozen_spec(&task) else {
-            return (None, None);
+            return Ok((None, None));
         };
         // Said once per process, the first time a team is actually considered
         // (design §3.8 fix ③): whether `[dispatch] ephemeral_max_active` can
@@ -137,7 +163,7 @@ impl GoalLoopDriver {
             // The Solo branch is not "do nothing": the gate's effort
             // suggestion and the signal vector are already audited by
             // `decide_gate`. The round itself is unchanged.
-            return (None, Some(gate_record.to_string()));
+            return Ok((None, Some(gate_record.to_string())));
         }
 
         let home_dir = self.home_dir.clone();
@@ -167,7 +193,7 @@ impl GoalLoopDriver {
             // A1 ledger: the gate said Team/grey band but the budget forced
             // Solo — record that override next to the gate's own verdict.
             gate_record["budget_forces_solo"] = serde_json::Value::Bool(true);
-            return (None, Some(gate_record.to_string()));
+            return Ok((None, Some(gate_record.to_string())));
         }
         // A1-3 ledger: the team round's token usage carries the task id and
         // its `task_iterations.round` (same value the tick records).
@@ -243,7 +269,7 @@ impl GoalLoopDriver {
         });
         // The grey band can still resolve Solo after the planner runs. Until
         // then, do not tell the user the task has definitively formed a team.
-        (Some((tracking_id, !grey_band)), Some(gate_record.to_string()))
+        Ok((Some((tracking_id, !grey_band)), Some(gate_record.to_string())))
     }
 }
 
@@ -357,7 +383,7 @@ pub(super) fn build_goal_payload(
     };
     // A1 (StateAct): the structured state block + the self-report
     // protocol instructions. Plain text, runtime-neutral — any CLI
-    // backend (Claude / Codex / Gemini / Antigravity / openai-compat)
+    // backend (Claude / Codex / Gemini / Grok / openai-compat)
     // reads this the same way, and the self-report marker is parsed by
     // `goal_state::parse_state_update` regardless of which runtime
     // produced it.

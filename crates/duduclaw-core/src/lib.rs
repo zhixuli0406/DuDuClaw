@@ -252,7 +252,7 @@ pub fn set_internal_mcp_api_key(key: String) {
 /// The env vars every spawned `duduclaw mcp-server` child needs forwarded
 /// from the current process, as `(name, value)` pairs (present + non-empty
 /// only). Single source of truth for ALL MCP env assembly points — the
-/// per-runtime config writers (grok/codex/antigravity), the Claude
+/// per-runtime config writers (grok/codex), the Claude
 /// `.mcp.json` template, and the direct tool-loop client. `DUDUCLAW_AGENT_ID`
 /// is intentionally NOT included (it is per-call, not process-wide).
 ///
@@ -903,7 +903,7 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
     None
 }
 
-// ── Generic CLI discovery (Codex / Gemini / Antigravity) ──────────────
+// ── Generic CLI discovery (Codex / Grok) ──────────────
 //
 // `which_claude` carries Claude-specific baggage (native-installer paths,
 // Windows `.exe` > `.cmd` BatBadBut precedence). The other multi-runtime CLIs
@@ -913,7 +913,7 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
 // discovery so a Finder/launchd-launched gateway finds the binary without an
 // interactive `PATH`.
 
-/// Resolve a CLI `bin` (e.g. `"codex"`, `"gemini"`, `"agy"`) via PATH then a
+/// Resolve a CLI `bin` (e.g. `"codex"`, `"grok"`) via PATH then a
 /// HOME-rooted candidate scan. Returns the first match that exists on disk.
 pub fn which_cli(bin: &str) -> Option<String> {
     let lookup_cmd = if cfg!(windows) { "where" } else { "which" };
@@ -941,7 +941,7 @@ pub fn which_cli_in_home(home: &std::path::Path, bin: &str) -> Option<String> {
 
     #[cfg(not(windows))]
     let candidates = vec![
-        // Antigravity's official installer target (also a common user-local bin).
+        // Common user-local binary directory.
         format!("{home_str}/.local/bin/{bin}"),
         // Homebrew (Apple Silicon, then Intel / Linux).
         format!("/opt/homebrew/bin/{bin}"),
@@ -975,8 +975,6 @@ pub fn which_cli_in_home(home: &std::path::Path, bin: &str) -> Option<String> {
         let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
         let appdata = std::env::var("APPDATA").unwrap_or_default();
         vec![
-            // Antigravity Windows installer target.
-            format!("{localappdata}\\Antigravity\\{bin}.exe"),
             // User-local + package-manager .exe shims.
             format!("{home_str}\\.local\\bin\\{bin}.exe"),
             format!("{home_str}\\.bun\\bin\\{bin}.exe"),
@@ -1064,16 +1062,6 @@ pub fn which_codex_in_home(home: &std::path::Path) -> Option<String> {
     which_cli_in_home(home, "codex")
 }
 
-/// Resolve the Antigravity `agy` CLI binary. See [`which_cli`].
-pub fn which_agy() -> Option<String> {
-    which_cli("agy")
-}
-
-/// Resolve the `agy` CLI from a specific HOME. See [`which_cli_in_home`].
-pub fn which_agy_in_home(home: &std::path::Path) -> Option<String> {
-    which_cli_in_home(home, "agy")
-}
-
 /// Resolve the xAI Grok CLI binary (R4). Prefers the official `grok` ("Grok
 /// Build") binary — **verified** against docs.x.ai (2026-07-13): installed via
 /// `curl -fsSL https://x.ai/cli/install.sh | bash`, invoked as `grok`. Falls
@@ -1127,16 +1115,16 @@ mod which_cli_tests {
     use super::which_cli_in_home;
 
     #[test]
-    fn finds_agy_in_local_bin() {
+    fn finds_cli_in_local_bin() {
         let tmp = std::env::temp_dir().join("duduclaw-which-cli-test");
         let bin_dir = tmp.join(".local").join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let agy = bin_dir.join("agy");
-        std::fs::write(&agy, b"#!/bin/sh\n").unwrap();
-        let found = which_cli_in_home(&tmp, "agy");
+        let grok = bin_dir.join("grok");
+        std::fs::write(&grok, b"#!/bin/sh\n").unwrap();
+        let found = which_cli_in_home(&tmp, "grok");
         let _ = std::fs::remove_dir_all(&tmp);
         #[cfg(not(windows))]
-        assert_eq!(found.as_deref(), Some(agy.to_string_lossy().as_ref()));
+        assert_eq!(found.as_deref(), Some(grok.to_string_lossy().as_ref()));
         #[cfg(windows)]
         let _ = found; // Windows scans .exe, not the extensionless stub
     }

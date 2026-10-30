@@ -188,6 +188,9 @@ impl EvalCaseFile {
             return Err("[case] prompt must not be empty".into());
         }
         if let Some(runtime) = self.case.runtime.as_deref() {
+            if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(runtime) {
+                return Err(removed.refusal("[case] runtime"));
+            }
             let provider =
                 duduclaw_core::types::RuntimeType::from_id(runtime).ok_or_else(|| {
                     format!("[case] runtime {runtime:?} is not a runtime on this build")
@@ -384,6 +387,17 @@ mod tests {
         assert_eq!(case.case.timeout_secs, 180);
         assert_eq!(case.case.max_turns, 25);
         assert_eq!(case.model(), DEFAULT_EVAL_MODEL);
+    }
+
+    #[test]
+    fn removed_case_runtimes_are_refused() {
+        for id in ["gemini", "antigravity", "agy"] {
+            let c: EvalCaseFile = toml::from_str(&minimal(&format!(
+                "runtime = \"{id}\"\nmodel = \"gemini-3.7-flash\"\n"
+            ))).unwrap();
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("removed") && err.contains("choose"), "{err}");
+        }
     }
 
     #[test]

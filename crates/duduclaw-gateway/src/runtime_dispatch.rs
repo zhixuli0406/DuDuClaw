@@ -83,7 +83,7 @@ pub struct AgentPrompt<'a> {
     pub agent_id: &'a str,
     pub prompt: &'a str,
     pub system_prompt: &'a str,
-    /// Model id within the chosen provider (e.g. claude-sonnet-4-6, gemini-2.5-flash).
+    /// Model id within the chosen provider (e.g. claude-sonnet-4-6, grok-4.3).
     pub model: &'a str,
     pub max_tokens: u32,
     /// Force a specific provider, bypassing `agent_dir`-based resolution.
@@ -987,15 +987,15 @@ mod hint_tests {
         let got = apply_utility_hint(
             base(),
             Some(&UtilityModelHint {
-                provider: Some(RuntimeType::Antigravity),
-                model: Some("gemini-3-pro-preview".into()),
+                provider: Some(RuntimeType::Grok),
+                model: Some("grok-4.3".into()),
                 effort: None,
                 output_schema: None,
             }),
         )
         .unwrap();
-        assert_eq!(got.provider, RuntimeType::Antigravity);
-        assert_eq!(got.model, "gemini-3-pro-preview");
+        assert_eq!(got.provider, RuntimeType::Grok);
+        assert_eq!(got.model, "grok-4.3");
 
         // Provider-only: the resolved model rides along, and is validated
         // against the NEW provider (claude-* on Codex is a mismatch).
@@ -1021,14 +1021,14 @@ mod hint_tests {
             base(),
             Some(&UtilityModelHint {
                 provider: None,
-                model: Some("gemini-3-pro-preview".into()),
+                model: Some("grok-4.3".into()),
                 effort: None,
                 output_schema: None,
             }),
         )
         .unwrap_err();
         assert!(
-            err.starts_with("judge model gemini-3-pro-preview does not belong to runtime claude"),
+            err.starts_with("judge model grok-4.3 does not belong to runtime claude"),
             "{err}"
         );
 
@@ -1068,7 +1068,7 @@ mod hint_tests {
             apply_utility_hint(
                 base(),
                 Some(&UtilityModelHint {
-                    provider: Some(RuntimeType::Antigravity),
+                    provider: Some(RuntimeType::Grok),
                     model: Some("some-unreleased-id".into()),
                     effort: None,
                     output_schema: None,
@@ -1085,8 +1085,8 @@ mod hint_tests {
         // different family behind the operator's back (the live-test hole).
         assert!(has_explicit_utility_hint(Some(
             &UtilityModelHint {
-                provider: Some(RuntimeType::Antigravity),
-                model: Some("gemini-3-pro-preview".into()),
+                provider: Some(RuntimeType::Grok),
+                model: Some("grok-4.3".into()),
                 effort: None,
                 output_schema: None,
             }
@@ -1149,7 +1149,7 @@ mod hint_tests {
         );
         assert!(
             !UtilityModelHint {
-                provider: Some(RuntimeType::Antigravity),
+                provider: Some(RuntimeType::Grok),
                 model: None,
                 effort: None,
                 output_schema: None,

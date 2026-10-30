@@ -183,29 +183,24 @@ warning that the check could not be made.
 
 ---
 
-## Gemini CLI runtime removed (v1.75.0)
+## Removed CLI runtimes
 
-The `gemini` agent runtime was deprecated in v1.67.0 and is removed in this
-change. The announced removal moved through v1.69.0–v1.75.0; the older
-announcements remain in the changelog. Existing `gemini` runtime settings now
-need migration before the gateway starts those agents. The Docker image no
-longer installs `@google/gemini-cli`, and the dashboard no longer offers its
-runtime or login.
+| Runtime | Removed in | Deprecation window | Operator action |
+|---|---|---|---|
+| Gemini CLI (`gemini`) | v1.75.0 | Deprecated in v1.67.0 | Choose a supported runtime and compatible model explicitly |
+| Antigravity (`antigravity`, `agy`) | v1.77.1 | None | Choose a supported runtime and compatible model explicitly |
 
-| Old setting | Replace with |
-|---|---|
-| `agent.toml [runtime] provider = "gemini"` or `fallback = "gemini"` | `"antigravity"` |
-| `config.toml [runtime] utility_provider = "gemini"` | `"antigravity"` |
-| `config.toml [dispatch] judge_provider = "gemini"` | `"antigravity"` |
-| `[team.roles.*] runtime = "gemini"` | `"antigravity"` |
-| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+Saved employee `[runtime] provider` and fallback, judge, `[team.roles]` and
+`config.toml [runtime] utility_provider` values naming a removed runtime are
+refused with an error asking the operator to choose another runtime and model.
+The system never migrates these settings to another vendor automatically.
+`gemini-*` model ids no longer select any CLI runtime. The runtime catalog,
+execution paths, dashboard options and Docker image exclude the removed CLIs.
 
-For Google sign-in, run `agy` in a terminal on the host. For API-key mode, set
-`config.toml [antigravity] auth = "api_key"` and keep the same Gemini API key
-(`gemini` provider account or `GEMINI_API_KEY`). Use model names from
-`agy models`; Gemini CLI model ids may differ. Antigravity's Docker settings
-still use `~/.gemini/antigravity-cli/`, so the `.gemini` volume remains useful.
-The Gemini API provider (`gemini`, `generateContent`) remains supported.
+The Gemini API provider (`generateContent`), `GEMINI_API_KEY` and
+OpenAI-compatible Gemini presets remain supported. Leftover local CLI files
+and permission rules previously added to the OS user's CLI settings remain
+on disk; the operator may clean them up manually.
 
 ## Still deprecated
 

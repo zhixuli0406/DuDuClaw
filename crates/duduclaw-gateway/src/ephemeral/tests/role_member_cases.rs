@@ -173,15 +173,15 @@ fn role_member_scaffold_writes_the_three_overrides() {
         "[capabilities]\nallowed_tools = [\"Read\", \"Grep\"]\n",
     );
 
-    let mut spec = role_spec("boss", Role::Verifier, "antigravity", "gemini-3-pro-preview");
+    let mut spec = role_spec("boss", Role::Verifier, "grok", "grok-4.3");
     spec.effort = Some(Effort::High);
     let result = scaffold_role_member(home, &spec).unwrap();
 
     let t = member_toml(&result.dir);
-    assert_eq!(t["runtime"]["provider"].as_str(), Some("antigravity"));
+    assert_eq!(t["runtime"]["provider"].as_str(), Some("grok"));
     assert_eq!(
         t["model"]["preferred"].as_str(),
-        Some("gemini-3-pro-preview")
+        Some("grok-4.3")
     );
     assert_eq!(t["model"]["effort"].as_str(), Some("high"));
     // WP-3's reader sees exactly the key it looks for.
@@ -211,7 +211,7 @@ fn role_member_scaffold_writes_the_three_overrides() {
     let cfg: duduclaw_core::types::AgentConfig =
         toml::from_str(&std::fs::read_to_string(result.dir.join("agent.toml")).unwrap())
             .unwrap();
-    assert_eq!(cfg.model.preferred, "gemini-3-pro-preview");
+    assert_eq!(cfg.model.preferred, "grok-4.3");
     assert_eq!(cfg.capabilities.allowed_tools, vec!["Read".to_string()]);
 }
 
@@ -241,10 +241,10 @@ fn role_member_scaffold_drops_an_inherited_runtime_fallback() {
         "boss",
         "[runtime]\nprovider = \"claude\"\nfallback = \"codex\"\n",
     );
-    let spec = role_spec("boss", Role::Verifier, "antigravity", "gemini-3-pro-preview");
+    let spec = role_spec("boss", Role::Verifier, "grok", "grok-4.3");
     let result = scaffold_role_member(home, &spec).unwrap();
     let t = member_toml(&result.dir);
-    assert_eq!(t["runtime"]["provider"].as_str(), Some("antigravity"));
+    assert_eq!(t["runtime"]["provider"].as_str(), Some("grok"));
     assert!(
         t["runtime"].get("fallback").is_none(),
         "a fallback would silently move the verifier back onto another family"
@@ -291,18 +291,14 @@ fn role_member_scaffold_rejects_runtime_outside_the_allowlist() {
 }
 
 #[test]
-fn role_member_scaffold_canonicalises_a_runtime_alias() {
+fn role_member_scaffold_refuses_removed_runtime_alias() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
     write_parent(home, "boss", "");
-    // `agy` is antigravity's alias, and antigravity serves gemini-* models.
+    // Removed aliases must fail before any member files are created.
     let spec = role_spec("boss", Role::Planner, "agy", "gemini-3-flash");
-    let result = scaffold_role_member(home, &spec).unwrap();
-    assert_eq!(
-        member_toml(&result.dir)["runtime"]["provider"].as_str(),
-        Some("antigravity"),
-        "the alias must be resolved before it is written"
-    );
+    assert!(scaffold_role_member(home, &spec).is_err());
+    assert_no_scaffold(home);
 }
 
 #[test]

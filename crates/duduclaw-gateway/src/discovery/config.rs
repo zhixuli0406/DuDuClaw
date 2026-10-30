@@ -69,6 +69,24 @@ pub struct AttemptSettings {
     pub max_snapshot_bytes: u64,
     pub runtimes: BTreeMap<String, AttemptRuntimeConfig>,
 }
+impl AttemptSettings {
+    /// Stale runtime selections must remain visible instead of disappearing from the catalog.
+    pub fn ensure_active_runtime_configuration(&self) -> Result<(), String> {
+        for (id, config) in &self.runtimes {
+            if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(id) {
+                return Err(removed.refusal(&format!("config.toml [discovery.attempt.runtimes.{id}]")));
+            }
+            // This field is an API-account provider, so Gemini API remains valid.
+            if let Some(removed) = config.provider.as_deref()
+                .and_then(duduclaw_core::runtime_catalog::removed_runtime)
+                .filter(|removed| removed.id != "gemini")
+            {
+                return Err(removed.refusal(&format!("config.toml [discovery.attempt.runtimes.{id}] provider")));
+            }
+        }
+        Ok(())
+    }
+}
 impl Default for AttemptSettings {
     fn default() -> Self {
         Self {

@@ -97,8 +97,9 @@ impl MethodHandler {
                                 // A removed provider is refused at execution, not
                                 // an effective Claude fallback. Preserve it so
                                 // explicitly choosing Claude can repair the key.
-                                "utility_provider": if crate::runtime_config::ensure_active_utility_provider(&self.home_dir).is_err() {
-                                    "gemini"
+                                "utility_provider": if let Some(removed) = table.get("runtime").and_then(|r| r.get("utility_provider"))
+                                    .and_then(toml::Value::as_str).and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+                                    removed.id
                                 } else {
                                     crate::runtime_config::global_utility_provider(&self.home_dir).as_str()
                                 },

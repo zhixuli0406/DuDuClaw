@@ -16,7 +16,7 @@ This is not the script sandbox used by `duduclaw secaudit` (the PoC step) and PT
 
   Replace `<version>` with your gateway version (the tag carries a `v` prefix, for example `v1.67.0`), or set your own image (see the reference table below).
 - An account the AI inside the container can use (see [Credentials](#credentials-per-runtime)).
-- A supported runtime: Claude, Codex, Antigravity, Grok, or OpenAI-compatible.
+- A supported runtime: Claude, Codex, Grok, or OpenAI-compatible.
 
 ## Enable it for one agent
 
@@ -69,7 +69,7 @@ All keys are optional. The section is read on every sandboxed task, so a change 
 | Key | Default | Meaning |
 |---|---|---|
 | `image` | `ghcr.io/zhixuli0406/duduclaw:v<running version>` | Image to run. Must already be on the machine. |
-| `[container.sandbox.executables]` | `claude`, `codex`: `/usr/bin/<name>`; `antigravity`: `/usr/local/bin/agy`; `grok`: `/usr/local/bin/grok`; `openai-compat`: `/usr/local/bin/python3` | Absolute path of each runtime's executable inside the image, keyed by `claude`, `codex`, `antigravity`, `grok`, `openai-compat`. Needed only for a custom image. |
+| `[container.sandbox.executables]` | `claude`, `codex`: `/usr/bin/<name>`; `grok`: `/usr/local/bin/grok`; `openai-compat`: `/usr/local/bin/python3` | Absolute path of each runtime's executable inside the image, keyed by `claude`, `codex`, `grok`, `openai-compat`. Needed only for a custom image. |
 | `memory_bytes` | `4294967296` (4 GiB) | Memory limit (swap equals memory). At most 64 GiB. |
 | `pids` | `128` | Maximum processes. |
 | `cpu_millis` | `1000` | CPU limit in thousandths of a core. |
@@ -100,7 +100,6 @@ The sandbox takes an account from the account rotator for the agent's runtime, a
 | Claude | An API key, or an OAuth account that carries a token (created with `claude setup-token`). An account that only exists as a login in the host keychain cannot enter a container. |
 | Codex | An API key, or a credential document: an OAuth account whose stored secret is the CLI's `auth.json`. |
 | Grok | An API key, or a credential document (the CLI's `auth.json`). |
-| Antigravity | A Gemini API key. |
 | OpenAI-compatible | That provider's API key. |
 
 If no account fits, the task fails and the error says which kind of credential this runtime needs.
@@ -185,4 +184,4 @@ A failed sandbox task replies to whoever delegated it. When the sandbox refused 
 - The script sandbox has no cleanup at start. If the process running a script (the `duduclaw mcp-server` serving the agent, or `duduclaw secaudit`) dies mid-run, the script's container keeps running until the script exits on its own.
 - On Windows the script sandbox tries WSL2 first and then Docker. The WSL2 path, including the conversion of Windows paths to WSL paths, has only been cross-compiled; it has not been run on a real Windows host.
 - Running the task sandbox from a gateway that itself runs in a container is not covered by this guide and has not been verified.
-- What has been run for real: with the published platform image (`v1.66.1`), the Codex, Antigravity and Grok CLIs start inside the sandbox and reach their provider (checked with an invalid key, which the provider rejects), and one complete delegated task ran with Codex (that run used a locally built image with the same CLIs, not the published one). Claude, Gemini CLI and the OpenAI-compatible runtime have not been run inside the sandbox against a real provider.
+- What has been run for real: with the published platform image (`v1.66.1`), the Codex, Grok CLIs start inside the sandbox and reach their provider (checked with an invalid key, which the provider rejects), and one complete delegated task ran with Codex (that run used a locally built image with the same CLIs, not the published one). Claude and the OpenAI-compatible runtime have not been run inside the sandbox against a real provider.

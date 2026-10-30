@@ -103,7 +103,8 @@ mod operations;
 mod workflow_grants;
 mod workflow_resume;
 pub use workflow_grants::{
-    OperationAuthority, GrantRef, EffectTemplate, GrantSpec, AcceptedRevisionGrant, GrantRevocation
+    AcceptedRevisionGrant, EffectTemplate, GrantRef, GrantRevocation, GrantSpec, OperationAuthority,
+    RevisionGrantReadError,
 };
 pub use binding::{
     CURRENT_DECISION_CONTEXT, DecisionContext, ExecutionBinding, RequestKind, payload_hash,

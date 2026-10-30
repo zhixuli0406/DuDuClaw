@@ -1551,7 +1551,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 "Fixed/created .mcp.json for agent MCP server discovery"
             );
         }
-        // Third-party MCP servers (Codex, Grok, Antigravity): per-spawn
+        // Third-party MCP servers (Codex, Grok): per-spawn
         // upstream-env files and directories a stopped gateway may have left
         // behind (they hold credentials).
         let swept = crate::runtime::third_party_mcp::env_files::sweep_stale_env_files(&home_dir);

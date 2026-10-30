@@ -175,8 +175,10 @@ pub fn load_config(home: &Path) -> Result<DiscoveryConfig, String> {
     let content = std::fs::read_to_string(home.join("config.toml"))
         .map_err(|_| "discovery is not configured".to_string())?;
     let table: toml::Value = toml::from_str(&content).map_err(|_| "invalid discovery configuration")?;
-    table.get("discovery").cloned().ok_or("discovery is not configured")?
-        .try_into().map_err(|_| "invalid discovery configuration".into())
+    let config: DiscoveryConfig = table.get("discovery").cloned().ok_or("discovery is not configured")?
+        .try_into().map_err(|_| "invalid discovery configuration".to_string())?;
+    config.attempt.ensure_active_runtime_configuration()?;
+    Ok(config)
 }
 fn valid_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
@@ -200,7 +202,7 @@ fn validate_spec(home: &Path, config: &DiscoveryConfig, agent: &str,
     }
     valid_id(&spec.evaluator)?;
     super::agent_spawn::AttemptRunnerFactory::check_runtime_capability(&config.attempt,&spec.runtime)
-        .map_err(|_| "runtime does not support the discovery confinement and hard generation limits")?;
+        .map_err(|error| error.to_string())?;
     let evaluator = config.evaluators.get(&spec.evaluator).ok_or("unknown evaluator")?;
     if evaluator.sandbox != EvaluatorSandbox::Container {
         return Err("public discovery requires a confined evaluator".into());
@@ -236,7 +238,7 @@ pub async fn create(home: &Path, store: &TaskStore, broker: &ApprovalBroker,
         return Err("discovery description failed the input security scan".into());
     }
     let config = load_config(home)?;
-    // Store the canonical family name so an alias (`agy`) never reaches the
+    // Store the canonical family name so an alias (`openai_compat`) never reaches the
     // run row, nodes or catalog as a second spelling.
     let mut spec = spec;
     if let Ok(family) = super::attempt_adapter::RuntimeFamily::parse(&spec.runtime) { spec.runtime = family.name().into(); }

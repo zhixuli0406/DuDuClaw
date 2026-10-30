@@ -1,8 +1,9 @@
 import { client } from '@/lib/ws-client';
 import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 
+const RUNTIME_NAMES: Record<string, string> = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini CLI', antigravity: 'Antigravity', agy: 'Antigravity', grok: 'Grok', 'openai-compat': 'OpenAI-compatible' };
+
 // Brand names are not translated; only `openai-compat` takes a localized label when a formatter is supplied.
-const RUNTIME_NAMES: Record<string, string> = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini CLI', antigravity: 'Antigravity', grok: 'Grok', 'openai-compat': 'OpenAI-compatible' };
 export function runtimeLabel(id: string, intl?: { messages: Record<string, unknown>; formatMessage: (d: { id: string }) => string }): string {
   if (typeof id !== 'string' || id === '') return id ?? '';
   if (id === 'openai-compat' && intl && 'discovery.runtime.openaiCompat' in intl.messages) return intl.formatMessage({ id: 'discovery.runtime.openaiCompat' });

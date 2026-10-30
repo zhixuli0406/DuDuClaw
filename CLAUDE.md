@@ -26,7 +26,7 @@ When a change lands: write the detail into `CHANGELOG.md` and the wiki reference
 ## Current state (v1.72.2, 2026-10-11)
 
 - Workspace version 1.72.2. Nothing is under `[Unreleased]` in `CHANGELOG.md` as of 2026-10-12.
-- Gemini CLI runtime (`gemini`) is deprecated, removal scheduled for v1.75.0; it waits for a real-key re-verification of Antigravity after v1.69.1. Version lives in `runtime_catalog.rs` `RuntimeSpec.deprecation`. The Gemini API provider is not deprecated.
+- Gemini CLI runtime (`gemini`) was removed in v1.75.0; Antigravity runtime (`antigravity`) was removed in v1.77.1 without a deprecation window. The Gemini API provider remains supported.
 - Legacy pack manifests (`expert.toml`, `team.toml`, industry pack directories) are deprecated with no removal version (a `pack.toml` team/template pack cannot be installed yet).
 - Deprecation policy: a renamed or merged public name survives two minor versions. MCP tool: stays listed and callable with a `[deprecated → …]` description prefix; CLI: hidden clap alias; config value: still parses and warns once per process; dashboard: offers only the new name. Table: `docs/guides/deprecations.md`.
 
@@ -35,7 +35,7 @@ When a change lands: write the detail into `CHANGELOG.md` and the wiki reference
 DuDuClaw is a multi-runtime AI agent platform: it routes channel messages and dispatched work to AI CLIs or APIs and provides sessions, memory, evolution, approvals, account rotation, local inference and computer use around them. One Rust binary embeds the dashboard (`web/`).
 
 ### Runtimes and model calls
-- **Runtimes** (`AgentRuntime`, `RuntimeRegistry`, per-agent `agent.toml [runtime]`): Claude, Codex, Gemini CLI (deprecated), Antigravity (`agy`), Grok, OpenAI-compat. Sandbox flags come from `CapabilitiesConfig::sandbox_level()`; each non-Claude CLI gets the DuDuClaw MCP server through its own native config.
+- **Runtimes** (`AgentRuntime`, `RuntimeRegistry`, per-agent `agent.toml [runtime]`): Claude, Codex, Grok, OpenAI-compat. Sandbox flags come from `CapabilitiesConfig::sandbox_level()`; each non-Claude CLI gets the DuDuClaw MCP server through its own native config.
 - **Spawning**: every Claude call is a fresh `claude -p` (the PTY session pool was removed 2026-09; it had no conversation key). `duduclaw-cli-runtime` runs TTY-only CLIs (Grok) one-shot under a PTY. Spawn env is an allowlist (`duduclaw-core/src/spawn_env.rs`; vendor secrets injected explicitly; `[capabilities] git_credentials` opts into SSH/GPG). `[runtime] minimal_context` (default on) passes a curated `--tools` list and `--setting-sources project,local`.
 - **Accounts and failover**: account rotator (`duduclaw-agent/src/account_rotator/`): OAuth + API keys, Priority/LeastCost/Failover/RoundRobin, cooldowns, `auth_dead` from real probes; `[model] account_pool` narrows candidates and fails open. Three failover layers in `duduclaw-gateway/src/failover.rs` (account, model, runtime). `direct_api.rs` is the paid fallback with `CACHE_SPLIT_MARKER` cache breakpoints.
 - **`duduclaw-llm`**: one request/stream/usage shape over Anthropic Messages, OpenAI Responses, Gemini `generateContent` and OpenAI-compat presets; `ModelRegistry` prices; `run_tool_loop` + stdio MCP client give API and openai-compat agents the MCP tool surface; `ToolInterceptor` hook.

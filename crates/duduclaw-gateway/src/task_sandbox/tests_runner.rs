@@ -214,11 +214,11 @@ async fn missing_image_is_unavailable_and_creates_nothing() {
 #[tokio::test]
 async fn no_usable_account_is_unavailable() {
     let fx = fixture(&[], "exit 0", true);
-    // An Anthropic account exists but the agent runs Antigravity.
-    let err = go(&fx, RuntimeType::Antigravity, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
+    // An Anthropic account exists but the agent runs Grok.
+    let err = go(&fx, RuntimeType::Grok, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
     let SandboxError::Unavailable(Unavailable::NoAccount { runtime, accepted }) = err else { panic!("{err:?}") };
-    assert_eq!(runtime, "antigravity");
-    assert!(accepted.contains("Gemini API key"));
+    assert_eq!(runtime, "grok");
+    assert!(accepted.contains("xAI"));
     assert!(fx.read("create.args").is_empty());
 }
 
@@ -347,30 +347,6 @@ fn root_uid_and_unsafe_mount_paths_are_refused() {
 }
 
 // ── review fixes (2026-10-01) ───────────────────────────────────
-
-/// A5: a forbidden Antigravity tool still pending when the host step limit
-/// fires is a violation (audited), never `Ok(reply)`.
-#[tokio::test]
-async fn pending_forbidden_tool_at_the_step_limit_is_a_violation() {
-    let step = |index: u64, state: &str, kind: &str, tool: Option<&str>| {
-        let mut s = json!({"step_index":index,"state":state,"step_type":kind});
-        if let Some(tool) = tool {
-            s["tool_name"] = json!(tool);
-        }
-        if kind == "agent_response" {
-            s["agent_response"] = json!({"text":"partial"});
-        }
-        json!({"event":"step_update","step_update":s})
-    };
-    let events = [step(1, "DONE", "agent_response", None), step(2, "ACTIVE", "tool", Some("search_web")),
-        step(3, "DONE", "agent_response", None)];
-    let fx = fixture(&events, "/bin/sleep 20", true);
-    let err = go(&fx, RuntimeType::Antigravity, "gemini", concat!("AI", "zaFAKEdudutasksandbox00000000000000000"), 1).await.unwrap_err();
-    assert!(matches!(&err, SandboxError::Failed(f) if f.message.contains("search_web") && f.message.contains("outside")), "{err:?}");
-    let audit = std::fs::read_to_string(fx.home.join("security_audit.jsonl")).unwrap_or_default();
-    assert!(audit.contains("task_sandbox_tool_violation"), "{audit}");
-    assert_eq!(fx.runs_left(), 0);
-}
 
 /// A6: the auth-failure blame is decided from parsed events; a text or an
 /// error message that merely contains `"tool_use"` does not count as work.

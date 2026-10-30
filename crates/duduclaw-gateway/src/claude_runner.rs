@@ -713,7 +713,6 @@ fn gen_ai_system_for(provider: duduclaw_core::types::RuntimeType) -> &'static st
     match provider {
         R::Claude => "anthropic",
         R::Codex | R::OpenAiCompat => "openai",
-        R::Antigravity => "gcp.gemini",
         R::Grok => "xai",
         R::Qwen => "alibaba",
         R::Kimi => "moonshot",

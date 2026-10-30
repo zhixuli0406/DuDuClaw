@@ -151,7 +151,7 @@ value from config.toml first and rerun, or import as a separate agent with `--re
 
 **Q: What happens with a non-Claude model?**
 It is kept as-is in `[model] preferred` and marked `PARTIAL`, prompting you to manually
-confirm which runtime it maps to (codex / antigravity / openai_compat). DuDuClaw will not
+confirm which runtime it maps to (codex / openai_compat). DuDuClaw will not
 guess on your behalf.
 
 ## Profile review and Claude Code

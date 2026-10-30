@@ -35,7 +35,7 @@ them.
 - **First-run wizard** — language, network, administrator account, and a few
   preferences on first boot; the live installer ISO is a graphical wizard too.
 - **AI runtime authorization** — one step of that wizard lists every AI
-  provider the image ships a runtime for (Claude Code, Codex, Antigravity, Grok, Qwen, Kimi, Copilot, Cursor, Mistral Vibe, OpenCode, plus the
+  provider the image ships a runtime for (Claude Code, Codex, Grok, Qwen, Kimi, Copilot, Cursor, Mistral Vibe, OpenCode, plus the
   plain API-key providers — Kiro is a supported runtime but is deliberately
   not bundled in the image), each row showing whether it is unset, has a key
   stored, or is signed in. A row takes an API key — stored through the same
@@ -44,7 +44,7 @@ them.
   and shows you the device code and verification URL, with a button to open
   it in the appliance's browser. Signing in with a consumer subscription
   shows the risk up front and will not start until you accept it:
-  Anthropic's policy and Google's Antigravity terms restrict
+  Anthropic's policy restricts
   third-party products using subscription credentials, and say accounts may
   be restricted, suspended or terminated, so an API key is the recommended
   path (vendor sources: [multi-runtime](13-multi-runtime.md#subscription-login-risk-disclosure)). The whole step is skippable in one
