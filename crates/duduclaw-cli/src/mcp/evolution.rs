@@ -1,6 +1,16 @@
 use super::*;
 
-pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
+pub(crate) async fn handle_evolution_toggle(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    if let Err(reason) = check_actor_identity(home_dir, actor, "", "evolution_toggle") {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
+            "isError": true
+        });
+    }
     let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
         Some(id) if !id.is_empty() => id,
         _ => {
@@ -17,6 +27,25 @@ pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> 
             "content": [{"type": "text", "text": "Error: invalid agent_id (lowercase alphanumeric and '-' only, max 64 chars)"}],
             "isError": true
         });
+    }
+
+    // Gate before reading the target file. Self-toggle is allowed: these four
+    // fields grant no tool, data, org or spend authority, and the evolution
+    // master switch still applies.
+    if let Some(caller) = actor.agent() {
+        if let Err(reason) = check_org_subject_allowed(
+            home_dir,
+            caller,
+            agent_id,
+            "調整 AI 員工演化設定",
+        )
+        .await
+        {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: {reason}")}],
+                "isError": true
+            });
+        }
     }
     let field = match params.get("field").and_then(|v| v.as_str()) {
         Some(f) if !f.is_empty() => f,
@@ -152,16 +181,7 @@ pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> 
     // a version and the `agent_file_changed` audit row. The value validated
     // above is re-applied to the file as read under the lock.
     let value = doc["evolution"][field].clone();
-    let written = duduclaw_gateway::agent_files::external::edit_agent_toml(home_dir, agent_id, "mcp", "mcp", |t| {
-        let evo = t
-            .entry("evolution")
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-            .as_table_mut()
-            .ok_or("[evolution] is not a table")?;
-        evo.insert(field.to_string(), value);
-        Ok(())
-    });
-    if let Err(e) = written {
+    if let Err(e) = write_evolution_toggle(home_dir, agent_id, actor, field, value) {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
             "isError": true
@@ -174,6 +194,92 @@ pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> 
              A running gateway may only pick it up after its next reload of the employee list (any dashboard save) or a restart."
         )}]
     })
+}
+
+/// Kept separate so tests can revoke authority after the front gate and
+/// before this same production write path acquires the file lock.
+pub(super) fn write_evolution_toggle(
+    home_dir: &Path,
+    agent_id: &str,
+    actor: RecordActor<'_>,
+    field: &str,
+    value: toml::Value,
+) -> std::result::Result<(), String> {
+    duduclaw_gateway::agent_files::external::edit_agent_toml(
+        home_dir,
+        agent_id,
+        "mcp",
+        actor.id(),
+        |t| {
+            // This closure runs synchronously under the shared agent.toml
+            // lock. Re-read authority after waiting for it, before mutation.
+            check_evolution_subject_locked(home_dir, actor, agent_id)?;
+            let evo = t
+                .entry("evolution")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or("[evolution] is not a table")?;
+            evo.insert(field.to_string(), value);
+            Ok(())
+        },
+    )
+    .map(|_| ())
+}
+
+fn check_evolution_subject_locked(
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+    agent_id: &str,
+) -> std::result::Result<(), String> {
+    check_actor_identity(home_dir, actor, agent_id, "evolution_toggle")?;
+    let Some(caller) = actor.agent() else {
+        return Ok(());
+    };
+    let policy = duduclaw_core::delegation_policy_from_home(home_dir);
+    let caller = caller.trim();
+    if policy == duduclaw_core::DelegationPolicy::Open || caller == agent_id {
+        return Ok(());
+    }
+
+    // Synchronous equivalent of org_snapshot: authoritative store first,
+    // typed agent.toml fallback only for absent entries, bounded ancestor walk.
+    // Do not await while the writer holds the cross-process file lock.
+    let store = duduclaw_core::org_store::load(home_dir);
+    let mut org = duduclaw_core::MapOrgView::new();
+    let mut seen = std::collections::HashSet::new();
+    for start in [caller, agent_id] {
+        let mut current = start.to_string();
+        for _ in 0..=duduclaw_core::MAX_ANCESTOR_HOPS {
+            if current.is_empty() || !seen.insert(current.clone()) {
+                break;
+            }
+            let (parent, department) = match store.get(&current) {
+                Some(entry) => (entry.reports_to.clone(), entry.department.clone()),
+                None => {
+                    let path = home_dir.join("agents").join(&current).join("agent.toml");
+                    let config = std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|text| toml::from_str::<duduclaw_core::types::AgentConfig>(&text).ok());
+                    let Some(config) = config else { break };
+                    (
+                        normalize_reports_to(config.agent.reports_to.trim()).to_string(),
+                        config.agent.department.trim().to_string(),
+                    )
+                }
+            };
+            org.insert(&current, &parent, &department);
+            current = parent;
+        }
+    }
+    if duduclaw_core::is_org_ancestor(&org, caller, agent_id) {
+        return Ok(());
+    }
+    audit_org_placement_denied(home_dir, caller, agent_id, policy, "調整 AI 員工演化設定");
+    Err(format!(
+        "調整 AI 員工演化設定遭拒：「{}」不在你的團隊之內（委派政策：{}），未做任何變更。",
+        duduclaw_core::truncate_chars(agent_id, 64),
+        policy.label_zh()
+    ))
 }
 
 pub(crate) async fn handle_evolution_status_tool(

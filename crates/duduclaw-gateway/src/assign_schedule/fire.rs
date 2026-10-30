@@ -350,6 +350,15 @@ async fn create_run(
                 outcome: p.outcome,
                 duration_hours: p.duration_hours,
                 cost_cap_cents: p.cost_cap_cents,
+                // The creator's right is re-read at every fire: a creator who
+                // is no longer an Admin gets at most the employee's own limit.
+                timeout_secs: p.timeout_secs.map(|secs| {
+                    if via == "admin" {
+                        secs
+                    } else {
+                        secs.min(crate::runtime_config::employee_timeout_ceiling(home, &row.agent_id))
+                    }
+                }),
                 risk_boundary: p.risk_boundary,
                 require_beliefs: p.require_beliefs,
                 plan_first: p.plan_first,

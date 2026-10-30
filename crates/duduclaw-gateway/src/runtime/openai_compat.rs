@@ -112,9 +112,7 @@ fn http_client() -> &'static reqwest::Client {
 }
 
 fn request_timeout(context: &RuntimeContext) -> std::time::Duration {
-    std::time::Duration::from_secs(context.agent_dir.as_deref()
-        .map(crate::runtime_config::agent_timeout_secs)
-        .unwrap_or(crate::runtime_config::DEFAULT_TIMEOUT_SECS))
+    std::time::Duration::from_secs(crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()))
 }
 
 /// Override the shared 120s limit per request; retain its connect timeout.

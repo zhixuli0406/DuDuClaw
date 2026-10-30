@@ -60,6 +60,11 @@ pub struct GoalCreateRequest {
     pub duration_hours: Option<f64>,
     /// Optional positive measured task-tree spend ceiling in cents.
     pub cost_cap_cents: Option<u64>,
+    /// Optional run limit (30–3600 s) for each CLI run / API request of this
+    /// goal's rounds, replacing the employee's `[runtime] timeout_secs`.
+    /// Callers decide who may exceed the employee's own limit (see
+    /// [`check_timeout_widening`]); this only checks the range.
+    pub timeout_secs: Option<u64>,
     /// Per-goal risk boundary text. `None` ⇒ `[goal_defaults] baseline_boundary`.
     pub risk_boundary: Option<String>,
     /// Require structured belief declarations during execution.
@@ -104,6 +109,55 @@ pub fn parse_cost_cap_cents(args: &serde_json::Value) -> Result<Option<u64>, Str
                 "cost_cap_cents must be a positive integer <= 9223372036854775807".into()
             }),
     }
+}
+
+const TIMEOUT_RANGE_ERROR: &str = "timeout_secs must be an integer between 30 and 3600";
+
+/// Range check shared by every write of `tasks.timeout_secs`.
+pub fn check_timeout_secs(secs: Option<u64>) -> Result<(), String> {
+    match secs {
+        Some(s)
+            if !(crate::runtime_config::MIN_TIMEOUT_SECS..=crate::runtime_config::MAX_TIMEOUT_SECS)
+                .contains(&s) =>
+        {
+            Err(TIMEOUT_RANGE_ERROR.into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Parse the optional per-goal run limit without silently accepting
+/// malformed values (`null` counts as absent).
+pub fn parse_timeout_secs(args: &serde_json::Value) -> Result<Option<u64>, String> {
+    match args.get("timeout_secs") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let secs = value.as_u64().ok_or_else(|| TIMEOUT_RANGE_ERROR.to_string())?;
+            check_timeout_secs(Some(secs))?;
+            Ok(Some(secs))
+        }
+    }
+}
+
+/// Only an Admin may give a goal more time than its employee's own
+/// `[runtime] timeout_secs`; anyone else may only narrow it.
+pub fn check_timeout_widening(
+    home_dir: &Path,
+    agent_id: &str,
+    secs: Option<u64>,
+    may_widen: bool,
+) -> Result<(), String> {
+    let Some(secs) = secs else { return Ok(()) };
+    if may_widen {
+        return Ok(());
+    }
+    let ceiling = crate::runtime_config::employee_timeout_ceiling(home_dir, agent_id);
+    if secs > ceiling {
+        return Err(format!(
+            "only an admin can give a goal more than the employee's own run limit ({ceiling} s)"
+        ));
+    }
+    Ok(())
 }
 
 /// The created goal plus the flags a caller needs to render its own response.
@@ -173,6 +227,7 @@ async fn create_goal_task_inner(
     {
         return Err("cost_cap_cents must be a positive integer <= 9223372036854775807".into());
     }
+    check_timeout_secs(req.timeout_secs)?;
     let duration_hours = match req.duration_hours {
         None => None,
         Some(h) if (1.0..=720.0).contains(&h) => Some(h),
@@ -247,6 +302,7 @@ async fn create_goal_task_inner(
             Some((Utc::now() + ChronoDuration::minutes((hours * 60.0).round() as i64)).to_rfc3339());
     }
     task.cost_cap_cents = req.cost_cap_cents;
+    task.timeout_secs = req.timeout_secs;
     task.risk_boundary = risk_boundary;
     task.on_behalf_of = req.on_behalf_of.clone();
     task.created_via = req.on_behalf_of.as_ref().and(req.created_via.clone());
@@ -475,5 +531,44 @@ mod tests {
             create_goal_task(home.path(), &store, r).await.unwrap_err(),
             "description is required"
         );
+    }
+
+    #[test]
+    fn timeout_secs_parses_only_whole_seconds_in_range() {
+        use serde_json::json;
+        assert_eq!(parse_timeout_secs(&json!({})).unwrap(), None);
+        assert_eq!(parse_timeout_secs(&json!({"timeout_secs": null})).unwrap(), None);
+        assert_eq!(parse_timeout_secs(&json!({"timeout_secs": 1800})).unwrap(), Some(1800));
+        for bad in [json!(0), json!(29), json!(3601), json!(-60), json!(90.5), json!("600")] {
+            assert!(parse_timeout_secs(&json!({"timeout_secs": bad})).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_an_admin_may_exceed_the_employee_limit() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs = 300\n").unwrap();
+        assert!(check_timeout_widening(home.path(), "anna", Some(300), false).is_ok());
+        assert!(check_timeout_widening(home.path(), "anna", Some(120), false).is_ok());
+        assert!(check_timeout_widening(home.path(), "anna", Some(301), false).is_err());
+        assert!(check_timeout_widening(home.path(), "anna", Some(3600), true).is_ok());
+        assert!(check_timeout_widening(home.path(), "anna", None, false).is_ok());
+        // Unreadable employee config ⇒ the default limit, never more.
+        assert!(check_timeout_widening(home.path(), "ghost", Some(301), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_goal_keeps_its_run_limit_and_refuses_out_of_range() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let store = store_in(home.path()).await;
+        let mut r = req("a");
+        r.timeout_secs = Some(1800);
+        let created = create_goal_task(home.path(), &store, r).await.expect("create");
+        assert_eq!(created.task.timeout_secs, Some(1800));
+        let mut bad = req("a");
+        bad.timeout_secs = Some(4000);
+        assert!(create_goal_task(home.path(), &store, bad).await.is_err());
     }
 }

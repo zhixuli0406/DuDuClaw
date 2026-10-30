@@ -400,6 +400,16 @@ impl MethodHandler {
         if risk_boundary.is_some() && !ctx.is_admin() {
             return WsFrame::error_response("", "only an admin can set a risk boundary");
         }
+        // A per-goal run limit above the employee's own `[runtime]
+        // timeout_secs` is an Admin decision (same rule as raising the
+        // employee's limit on its edit page); anyone else may only narrow it.
+        let timeout_secs = match crate::goal_create_core::parse_timeout_secs(&params).and_then(|secs| {
+            crate::goal_create_core::check_timeout_widening(&self.home_dir, agent_id, secs, ctx.is_admin())
+                .map(|()| secs)
+        }) {
+            Ok(secs) => secs,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         // Files handed over with the goal (交辦任務 page). All of them are
         // decoded and size-checked before anything is written; then they are
         // saved into the assigned employee's attachment area and their paths
@@ -474,6 +484,7 @@ impl MethodHandler {
                 .map(str::to_string),
             duration_hours,
             cost_cap_cents,
+            timeout_secs,
             risk_boundary,
             require_beliefs: params
                 .get("require_beliefs")

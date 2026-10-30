@@ -83,11 +83,29 @@ impl MethodHandler {
             }
             "agents.pause" => {
                 require_manager!();
-                self.handle_agents_pause(params).await
+                let agent_id = check_agent!(AccessLevel::Operator);
+                match crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Operator) {
+                    Ok(live) => {
+                        if let Err(e) = acl::require_role(&live, UserRole::Manager) {
+                            return WsFrame::error_response("", &e);
+                        }
+                    }
+                    Err(e) => return WsFrame::error_response("", &e),
+                }
+                self.handle_agents_pause(params, ctx).await
             }
             "agents.resume" => {
                 require_manager!();
-                self.handle_agents_resume(params).await
+                let agent_id = check_agent!(AccessLevel::Operator);
+                match crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, &agent_id, AccessLevel::Operator) {
+                    Ok(live) => {
+                        if let Err(e) = acl::require_role(&live, UserRole::Manager) {
+                            return WsFrame::error_response("", &e);
+                        }
+                    }
+                    Err(e) => return WsFrame::error_response("", &e),
+                }
+                self.handle_agents_resume(params, ctx).await
             }
             "agents.update" => {
                 // First a quick check against the session; then (D7) the

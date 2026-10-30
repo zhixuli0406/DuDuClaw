@@ -114,6 +114,10 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 `tasks_update` 可為目標修改同一欄位。員工只能新增或收緊上限，不能提高或移除生效中的上限；提高上限須由操作者執行。儲存新上限不會自行恢復暫停目標；儀表板的「提高上限並重試」會先儲存，再走既有重試決策。目標與子任務的已量測費用達上限時以 `budget_exhausted` 暫停，費用讀不到時跳過派工。見[目標迴圈](../../features/zh-TW/34-goal-loop.md)。
 
+### `tasks_create` — 目標的單次執行時限
+
+`tasks_create` 搭配 `kind="goal"`（非排程）時接受 `timeout_secs`，30～3600 的整數秒：這個目標每一輪的每次 CLI 執行／API 請求都用它，取代被指派員工的單次執行時間上限。透過 MCP 只能設成小於或等於員工本身的上限；要給目標更多時間，由管理員在儀表板交辦。Claude 員工不套用（固定 30 分鐘）。`tasks_update` 會拒絕這個欄位。例如 `{"kind":"goal","title":"核對帳目","assigned_to":"anna","timeout_secs":180}`。
+
 ### `codrive_run` — 三段式執行階梯
 
 每個步驟依序嘗試三段，能用高的就用高的：
@@ -152,9 +156,11 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 - `hub` — 策展登錄庫（`anthropic-skills`、`github`、`clawhub`、`lobehub`、`skills-sh`）；用 `hub` 參數收斂到單一個。
 - `bank` — 只看這套部署自己學到的技能。此來源不接受 `hub` 參數。
 
-### `evolution_toggle` — 停滯偵測子欄位
+### `evolution_toggle` — 欄位與權限
 
-除標準旗標外，`field` 還接受 `stagnation_enabled`（bool）、`stagnation_window_seconds`（60–604800）、`stagnation_trigger_threshold`（1–1000）、`stagnation_action`（`log_only` | `suppress`）。見 [evolution-switches.md](../evolution-switches.md)。
+`field` 接受 `gvu_enabled`（布林值），以及 `max_silence_hours`、`skill_token_budget`、`max_active_skills`（數值）。舊的 `stagnation_*` 欄位已不能透過此工具修改。見 [evolution-switches.md](../evolution-switches.md)。
+
+AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同的身分與組織授權檢查；委派政策設為 `open` 時允許跨團隊調整，操作者不受此限制。未通過身分或組織授權檢查時，會在讀取目標設定檔前拒絕。這些欄位不會授予工具、資料或組織權限，也不會繞過演化主開關，因此保留自身調整。
 
 ### `execute_program`：腳本在哪裡執行
 

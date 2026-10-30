@@ -57,6 +57,7 @@ pub(crate) fn task_row_to_json(r: &TaskRow) -> Value {
         // ⇒ the global wall clock / deployment baseline boundary applies.
         "deadline_at": r.deadline_at,
         "cost_cap_cents": r.cost_cap_cents,
+        "timeout_secs": r.timeout_secs,
         "risk_boundary": r.risk_boundary,
         // H11 pause-reason classification. Always a RESOLVED token, never the
         // raw column: a legacy / unrecognised row must reach the dashboard as

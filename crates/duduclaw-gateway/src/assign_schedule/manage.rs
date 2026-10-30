@@ -89,6 +89,17 @@ pub async fn create(
             return Err(CreateError::Store("cost_cap_cents must be a positive integer for a goal".into()));
         }
     }
+    if req.payload.timeout_secs.is_some() && req.kind != AssignKind::Goal {
+        return Err(CreateError::Store("timeout_secs is only supported for goals".into()));
+    }
+    crate::goal_create_core::check_timeout_secs(req.payload.timeout_secs).map_err(CreateError::Store)?;
+    crate::goal_create_core::check_timeout_widening(
+        home,
+        &req.agent_id,
+        req.payload.timeout_secs,
+        creator.is_admin,
+    )
+    .map_err(CreateError::Store)?;
     let zone = Zone::parse(req.timezone.as_deref()).map_err(CreateError::Spec)?;
     let (max_active, min_interval) = caps(home).map_err(CreateError::Store)?;
     let first = req

@@ -477,3 +477,23 @@ fn slot_task_ids_are_stable_and_distinct() {
     assert_ne!(a, task_id_for_slot("s2", MONDAY));
     assert_eq!(uuid::Uuid::parse_str(&a).unwrap().get_version_num(), 5);
 }
+
+#[tokio::test]
+async fn a_non_admin_schedule_only_narrows_the_run_limit_and_it_reaches_the_goal() {
+    let (dir, reg) = home().await;
+    let o = org(dir.path());
+    let store = TaskStore::open(dir.path()).unwrap();
+    let manager = Creator::new(&o.mgr, false).unwrap();
+    // `sales-rep` has no `[runtime] timeout_secs`: its own limit is 300 s.
+    let mut wider = weekly_goal("寫週報");
+    wider.payload.timeout_secs = Some(600);
+    assert!(create(dir.path(), &store, &manager, wider, now()).await.is_err());
+
+    let mut narrower = weekly_goal("寫週報");
+    narrower.payload.timeout_secs = Some(120);
+    create(dir.path(), &store, &manager, narrower, now()).await.unwrap();
+    let report = tick(dir.path(), &reg, at("2026-10-26T01:00:20Z")).await.unwrap();
+    assert_eq!(report.created.len(), 1);
+    let task = store.get_task(&report.created[0]).await.unwrap().unwrap();
+    assert_eq!(task.timeout_secs, Some(120));
+}

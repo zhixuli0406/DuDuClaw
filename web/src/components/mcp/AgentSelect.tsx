@@ -10,16 +10,18 @@ export function AgentSelect({
   agents,
   placeholder,
   className,
+  disabled,
 }: {
   value: string;
   onChange: (v: string) => void;
   agents: ReadonlyArray<AgentLite>;
   placeholder?: string;
   className?: string;
+  disabled?: boolean;
 }) {
   const current = agents.find((a) => a.name === value);
   return (
-    <Select value={value} onValueChange={(v) => onChange(String(v))}>
+    <Select value={value} onValueChange={(v) => onChange(String(v))} disabled={disabled}>
       <SelectTrigger className={cn('w-full', className)}>
         <SelectValue placeholder={placeholder}>
           {current ? current.display_name || current.name : placeholder}

@@ -203,6 +203,10 @@ build the model's tool list from name, description and input schema only.
 
 `tasks_update` accepts the same field for a goal. Employees may add or narrow a ceiling, but cannot raise or remove an effective ceiling; raising is an operator action. Saving a new cap does not itself resume a paused goal. The dashboard's **Raise cap and retry** saves it, then uses the existing retry decision. At or above the measured task-tree cap, the goal pauses as `budget_exhausted`; unreadable cost skips dispatch. See [goal loop](../features/34-goal-loop.md).
 
+### `tasks_create` — per-goal run limit
+
+`tasks_create` with `kind="goal"` (not scheduled) accepts `timeout_secs`, an integer from 30 to 3600: the limit for each CLI run / API request of that goal's rounds, replacing the assignee's own run limit. Over MCP it can only be shorter than or equal to that limit; giving a goal more time is an Admin decision on the dashboard. Claude employees ignore it (fixed 30-minute limit). `tasks_update` refuses the field. Example: `{"kind":"goal","title":"Reconcile the ledger","assigned_to":"anna","timeout_secs":180}`.
+
 ### `codrive_run` — the three-rung execution ladder
 
 Each step is dispatched through three rungs, tried in this order; prefer the
@@ -272,12 +276,20 @@ Leave `source` alone unless you already know where the skill lives.
 - `bank` — only what this deployment learned on its own. `hub` is not accepted
   with this source.
 
-### `evolution_toggle` — the stagnation sub-fields
+### `evolution_toggle` — fields and permissions
 
-Beyond the standard flags, `field` accepts `stagnation_enabled` (bool),
-`stagnation_window_seconds` (60–604800), `stagnation_trigger_threshold`
-(1–1000) and `stagnation_action` (`log_only` | `suppress`). See
+`field` accepts `gvu_enabled` (bool), `max_silence_hours`,
+`skill_token_budget` and `max_active_skills` (numbers). The old
+`stagnation_*` fields are no longer writable. See
 [evolution-switches.md](evolution-switches.md).
+
+An AI employee may change its own settings or those of its subordinates,
+using the same identity check and organization gate as `agent_update`. The
+`open` delegation policy permits cross-team changes; human operators remain
+unrestricted. Callers rejected by either check are refused before reading
+the target configuration. Self-edits remain allowed because these fields
+do not grant tool, data or organization permissions and do not bypass the
+evolution master switch.
 
 ### `execute_program` — where the script runs
 

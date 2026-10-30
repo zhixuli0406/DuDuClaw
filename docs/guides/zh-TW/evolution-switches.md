@@ -150,6 +150,8 @@ Autopilot 規則（`autopilot.*`）是**使用者明確設定的自動化**，�
 
 ## 一次性凍結／解凍（企業版逃生艙）
 
+請從管理者自己的終端機執行 `agent pause`、`resume`、`freeze` 與 `unfreeze`。只要程序帶有任一 DuDuClaw AI 工作階段環境變數（即使為空）就會拒絕，Bash 通道也會擋下員工與未驗證身分使用這些指令，不需要儀表板核准。`pause`／`resume` 將 `[agent] status` 設為 `paused`／`active`；下面的凍結開關則另改演化與心跳。四個指令都透過共用鎖寫入，保留 `agent.toml` 註解與格式，並記錄檔案版本及安全稽核（包含拒絕）。這些檢查是減速帶，無法隔離有不受限 Bash 的員工。
+
 當狀況看起來不對勁，需要一個 agent *立刻*停止自我改變時：
 
 ```bash

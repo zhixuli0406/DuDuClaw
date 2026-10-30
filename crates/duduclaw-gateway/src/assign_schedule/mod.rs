@@ -105,6 +105,10 @@ pub struct AssignPayload {
     pub duration_hours: Option<f64>,
     #[serde(default)]
     pub cost_cap_cents: Option<u64>,
+    /// Per-goal run limit; above the employee's own limit only while the
+    /// creator is an Admin (re-applied at every fire).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// Admin-only (it replaces the deployment baseline).
     #[serde(default)]
     pub risk_boundary: Option<String>,

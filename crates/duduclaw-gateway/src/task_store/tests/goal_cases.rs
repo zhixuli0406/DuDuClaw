@@ -499,3 +499,50 @@ async fn goal_cost_cap_migration_leaves_old_rows_uncapped() {
     let store = TaskStore::open(dir.path()).unwrap();
     assert_eq!(store.get_task("old-goal").await.unwrap().unwrap().cost_cap_cents, None);
 }
+
+#[tokio::test]
+async fn goal_timeout_roundtrips_and_only_goals_in_range_are_stored() {
+    let (store, _dir) = temp_store();
+    let mut goal = pending_task("timeout-goal");
+    goal.goal_mode = true;
+    goal.timeout_secs = Some(1800);
+    store.insert_task(&goal).await.unwrap();
+    assert_eq!(store.get_task(&goal.id).await.unwrap().unwrap().timeout_secs, Some(1800));
+
+    let mut plain = pending_task("timeout-plain");
+    plain.timeout_secs = Some(600);
+    assert!(store.insert_task(&plain).await.is_err(), "only goals carry a run limit");
+
+    for secs in [0, 29, 3601] {
+        let mut bad = pending_task(&format!("timeout-bad-{secs}"));
+        bad.goal_mode = true;
+        bad.timeout_secs = Some(secs);
+        assert!(store.insert_task(&bad).await.is_err(), "{secs} is outside 30..=3600");
+    }
+
+    let mut old = pending_task("timeout-none");
+    old.goal_mode = true;
+    store.insert_task(&old).await.unwrap();
+    assert_eq!(store.get_task(&old.id).await.unwrap().unwrap().timeout_secs, None);
+}
+
+#[tokio::test]
+async fn handing_a_goal_to_another_employee_drops_its_run_limit() {
+    let (store, _dir) = temp_store();
+    let mut goal = pending_task("timeout-handoff");
+    goal.goal_mode = true;
+    goal.timeout_secs = Some(3600);
+    store.insert_task(&goal).await.unwrap();
+    store
+        .update_task(&goal.id, &serde_json::json!({"title": "renamed"}))
+        .await
+        .unwrap();
+    assert_eq!(store.get_task(&goal.id).await.unwrap().unwrap().timeout_secs, Some(3600));
+    let moved = store
+        .update_task(&goal.id, &serde_json::json!({"assigned_to": "someone-else"}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.assigned_to, "someone-else");
+    assert_eq!(moved.timeout_secs, None, "the new assignee runs under its own limit");
+}
