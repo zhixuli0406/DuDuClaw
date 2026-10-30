@@ -9,6 +9,7 @@ pub mod strings;
 pub mod transport;
 pub mod settings;
 pub mod read_state;
+mod local_file;
 pub mod inbox;
 pub mod ui;
 pub use inbox::{InboxOptions, run_inbox};

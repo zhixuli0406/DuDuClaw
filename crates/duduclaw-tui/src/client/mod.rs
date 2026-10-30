@@ -263,6 +263,15 @@ impl Actor {
     }
     async fn serve(&mut self, socket: &mut Socket) -> End {
         let mut pending: HashMap<String, Command> = HashMap::new();
+        // Optional metadata uses its own correlation ID and never gates other RPCs.
+        let version_request = WsFrame::Request {
+            id: "system-version".into(),
+            method: "system.version".into(),
+            params: Value::Object(Default::default()),
+        };
+        if let Ok(wire) = serde_json::to_string(&version_request) {
+            let _ = send(socket, Message::Text(wire.into()), self.options.request_timeout).await;
+        }
         // Short-lived tokens refresh halfway through their remaining lifetime,
         // avoiding an immediate-refresh loop when TTL is smaller than the margin.
         let remaining = self.session.refresh_in(Duration::ZERO);
@@ -306,6 +315,16 @@ impl Actor {
                             let frame: WsFrame = match serde_json::from_str(&text) { Ok(f) => f, Err(_) => break End::Reconnect };
                             match frame {
                                 WsFrame::Response { id, ok, payload, error } => {
+                                    if id == "system-version" {
+                                        if ok && let Some(version) = payload.as_ref().and_then(|p| p.get("version")).and_then(Value::as_str) {
+                                            self.status.send_modify(|state| {
+                                                if let ConnectionState::Connected(info) = state {
+                                                    info.version = Some(TerminalText::new(version.to_owned()));
+                                                }
+                                            });
+                                        }
+                                        continue;
+                                    }
                                     let code = error.as_ref().and_then(|e| e.get("code")).and_then(Value::as_str);
                                     if code == Some("must_change_password_required") { break End::Login(Error::PasswordChangeRequired); }
                                     if matches!(code, Some("token_expired" | "jwt_expired" | "unauthorized")) { break End::Refresh; }
@@ -438,7 +457,6 @@ fn handshake(payload: Value, expected_user: &str, generation: u64) -> Result<Con
         #[serde(default)]
         admin_fallback: bool,
         boot_id: Option<String>,
-        version: Option<TerminalText>,
         autonomy: Option<Value>,
     }
     let hello: Hello = serde_json::from_value(payload).map_err(|_| Error::Protocol)?;
@@ -460,7 +478,7 @@ fn handshake(payload: Value, expected_user: &str, generation: u64) -> Result<Con
         user_id: hello.user.id,
         role: hello.user.role,
         boot_id: hello.boot_id,
-        version: hello.version,
+        version: None,
         autonomy: hello.autonomy.map(|v| TerminalText::new(match v {
             Value::String(s) => s, value => value.to_string(),
         })),

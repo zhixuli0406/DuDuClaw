@@ -21,7 +21,7 @@ impl ReadState {
         self.ids.insert(id);
     }
     pub fn load(home: &Path) -> (Self, Option<&'static str>) {
-        let file = match std::fs::File::open(home.join("tui-state.json")) {
+        let file = match crate::local_file::open_regular(&home.join("tui-state.json")) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
             Err(_) => return (Self::default(), Some(strings::READ_STATE_NOTICE)),
@@ -60,6 +60,16 @@ impl ReadState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oversized_read_state_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let mut bytes = b"{\"ids\":[\"secret\"]}".to_vec();
+        bytes.resize(MAX_FILE_BYTES as usize + 1, b' ');
+        std::fs::write(home.path().join("tui-state.json"), bytes).unwrap();
+        let (state, notice) = ReadState::load(home.path());
+        assert!(!state.contains("secret"));
+        assert!(notice.is_some());
+    }
     #[test]
     fn corrupt_atomic_roundtrip_ids_only() {
         let home = tempfile::tempdir().unwrap();

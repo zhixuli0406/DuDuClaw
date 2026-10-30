@@ -46,6 +46,7 @@ struct Fixture {
     refreshed_connections: AtomicUsize,
     refreshes: AtomicUsize,
     fail_refresh: AtomicBool,
+    fail_version: AtomicBool,
     list_calls: AtomicUsize,
     list_delay_ms: AtomicU64,
     short_token: bool,
@@ -83,6 +84,7 @@ impl Gateway {
             refreshed_connections: AtomicUsize::new(0),
             refreshes: AtomicUsize::new(0),
             fail_refresh: AtomicBool::new(false),
+            fail_version: AtomicBool::new(false),
             list_calls: AtomicUsize::new(0),
             list_delay_ms: AtomicU64::new(0),
             short_token,
@@ -203,7 +205,7 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
         f.refreshed_connections.fetch_add(1, Ordering::SeqCst);
     }
     f.connections.fetch_add(1, Ordering::SeqCst);
-    if !send(&mut socket,WsFrame::ok_response(&id,json!({"status":"authenticated","user":{"id":"u1","email":"fixture@example.com","role":"employee"},"must_change_password":false,"boot_id":"boot-a","version":"fixture"}))).await { return; }
+    if !send(&mut socket,WsFrame::ok_response(&id,json!({"status":"authenticated","user":{"id":"u1","email":"fixture@example.com","role":"employee"},"must_change_password":false,"boot_id":"boot-a"}))).await { return; }
     let mut first = None;
     loop {
         tokio::select! {
@@ -218,6 +220,14 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                     Message::Text(text) => {
                         let WsFrame::Request { id,method,params } = serde_json::from_str(&text).unwrap() else { panic!("RPC must be a request"); };
                         let response = match method.as_str() {
+                            "system.version" => {
+                                if f.fail_version.load(Ordering::SeqCst) {
+                                    let response = WsFrame::Response { id, ok:false, payload:None, error:Some(json!({"code":"unauthorized"})) };
+                                    if !send(&mut socket, response).await { return; }
+                                    continue;
+                                }
+                                json!({"version":"fixture","edition":"community","auto_update":false})
+                            },
                             "agents.list" => {
                                 if f.flood.load(Ordering::SeqCst) == 0 {
                                     json!({"agents":[{"name":"adu","display_name":"阿嘟\u{202e}\u{1b}","status":"active","archived":false}]})
@@ -297,12 +307,30 @@ async fn model_until(receiver: &mut watch::Receiver<Model>, predicate: impl Fn(&
 }
 
 #[tokio::test]
+async fn version_failure_keeps_connection_and_other_rpcs_working() {
+    let Some(gateway) = Gateway::start(false).await else { return; };
+    gateway.fixture.fail_version.store(true, Ordering::SeqCst);
+    let client = gateway.client().await;
+    connected(&client, 1).await;
+    assert!(client.call("agents.list", json!({}), Duration::from_secs(2)).await.is_ok());
+    assert!(matches!(&*client.connection().borrow(), ConnectionState::Connected(info) if info.version.is_none()));
+    assert_eq!(gateway.fixture.refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn handshake_correlation_timeout_and_rejected_rpc() {
     let Some(gateway) = Gateway::start(false).await else {
         return;
     };
     let client = gateway.client().await;
     connected(&client, 1).await;
+    let mut connection = client.connection();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(&*connection.borrow_and_update(), ConnectionState::Connected(info) if info.version.as_ref().is_some_and(|v| v.is("fixture"))) { break; }
+            connection.changed().await.unwrap();
+        }
+    }).await.expect("system.version must populate connection metadata");
     let a = client.call("pair.first", json!({}), Duration::from_secs(2));
     let b = async {
         tokio::time::sleep(Duration::from_millis(20)).await;

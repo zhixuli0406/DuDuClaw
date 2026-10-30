@@ -1,6 +1,7 @@
 //! Local presentation settings, never authority or credentials.
 use crate::{Error, Result, state::POLL_INTERVAL, strings};
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -34,12 +35,21 @@ impl Default for Settings {
 }
 pub const MIN_POLL_SECONDS: u64 = 5;
 pub const MAX_POLL_SECONDS: u64 = 3600;
+const MAX_FILE_BYTES: u64 = 64 * 1024;
 impl Settings {
     pub fn load(home: &Path) -> (Self, Option<&'static str>) {
-        match std::fs::read_to_string(home.join("tui.toml")) {
-            Ok(text) => Self::parse(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
-            Err(_) => (Self::default(), Some(strings::SETTINGS_NOTICE)),
+        let file = match crate::local_file::open_regular(&home.join("tui.toml")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
+            Err(_) => return (Self::default(), Some(strings::SETTINGS_NOTICE)),
+        };
+        let mut text = String::new();
+        if file.take(MAX_FILE_BYTES + 1).read_to_string(&mut text).is_ok()
+            && text.len() as u64 <= MAX_FILE_BYTES
+        {
+            Self::parse(&text)
+        } else {
+            (Self::default(), Some(strings::SETTINGS_NOTICE))
         }
     }
     pub fn parse(text: &str) -> (Self, Option<&'static str>) {
@@ -90,6 +100,21 @@ pub fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oversized_settings_fall_back() {
+        let home = tempfile::tempdir().unwrap();
+        let mut text = String::from("glyphs = 'unicode'\n#");
+        text.extend(std::iter::repeat_n('x', MAX_FILE_BYTES as usize - text.len()));
+        std::fs::write(home.path().join("tui.toml"), &text).unwrap();
+        let (settings, notice) = Settings::load(home.path());
+        assert_eq!(settings.glyphs, Glyphs::Unicode);
+        assert!(notice.is_none());
+        text.push('x');
+        std::fs::write(home.path().join("tui.toml"), text).unwrap();
+        let (settings, notice) = Settings::load(home.path());
+        assert_eq!(settings.glyphs, Glyphs::Ascii);
+        assert!(notice.is_some());
+    }
     #[test]
     fn bad_fields_fall_back_individually() {
         let (s, n) = Settings::parse(

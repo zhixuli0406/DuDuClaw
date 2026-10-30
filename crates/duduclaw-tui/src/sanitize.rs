@@ -1,10 +1,10 @@
 //! Terminal safety at the presentation boundary, never for identity comparison.
 use std::fmt::Write;
 
-fn forbidden(c: char) -> bool {
+pub(crate) fn forbidden(c: char) -> bool {
     // Explicit default-ignorable/bidi-format ranges, including reserved tags.
-    // Preserve FE00..FE0F: removing them changes CJK glyphs and emoji
-    // presentation. The requested tag-plane range E0000..E0FFF is removed
+    // Intentionally keep variation selectors U+FE00..U+FE0F for emoji and CJK
+    // display. The requested tag-plane range E0000..E0FFF is removed
     // in full, including supplementary variation selectors.
     matches!(c,
         '\u{0000}'..='\u{0009}' | '\u{000b}'..='\u{001f}' |
