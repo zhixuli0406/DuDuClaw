@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use serde::Serialize;
 
+const MAX_AGENT_DAY_ROWS: u64 = 10_000;
+const MAX_TOTAL_ROWS: u64 = 1_000_000;
+
 #[derive(Clone, Copy)]
 pub enum Transport { Hook, Mcp }
 impl Transport {
@@ -73,6 +76,9 @@ impl Store {
                 kind TEXT NOT NULL, source_class TEXT NOT NULL,
                 call_id TEXT NOT NULL UNIQUE, at INTEGER NOT NULL,
                 transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')));
+            CREATE TABLE IF NOT EXISTS shadow_overflow (
+                day TEXT NOT NULL, agent_id TEXT NOT NULL, overflow_count INTEGER NOT NULL,
+                PRIMARY KEY(day,agent_id));
             CREATE INDEX IF NOT EXISTS shadow_events_at ON shadow_events(at);
             CREATE TABLE IF NOT EXISTS shadow_maintenance (id INTEGER PRIMARY KEY CHECK(id=1), pruned_at INTEGER NOT NULL);")
             .map_err(|e| e.to_string())?;
@@ -85,12 +91,30 @@ impl Store {
             return Err("invalid shadow event kind".into());
         }
         let tx = self.0.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        let inserted = tx.execute("INSERT OR IGNORE INTO shadow_events(day,agent_id,tool,kind,source_class,call_id,at,transport)
-            VALUES(date(?1,'unixepoch'),?2,?3,?4,?5,?6,?1,?7)", params![at,agent,tool,kind,class,call,transport.name()]).map_err(|e| e.to_string())?;
+        let day: String = tx.query_row("SELECT date(?1,'unixepoch')", [at], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let duplicate: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM shadow_events WHERE call_id=?1)", [call], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let mut inserted = 0;
+        if !duplicate {
+            let agent_rows: u64 = tx.query_row("SELECT COUNT(*) FROM shadow_events WHERE day=?1 AND agent_id=?2", params![day,agent], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if agent_rows >= MAX_AGENT_DAY_ROWS {
+                tx.execute("INSERT INTO shadow_overflow(day,agent_id,overflow_count) VALUES(?1,?2,1)
+                    ON CONFLICT(day,agent_id) DO UPDATE SET overflow_count=overflow_count+1", params![day,agent]).map_err(|e| e.to_string())?;
+            } else {
+                let total_rows: u64 = tx.query_row("SELECT COUNT(*) FROM shadow_events", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if total_rows >= MAX_TOTAL_ROWS {
+                    tx.execute("INSERT INTO shadow_overflow(day,agent_id,overflow_count) VALUES(?1,?2,1)
+                        ON CONFLICT(day,agent_id) DO UPDATE SET overflow_count=overflow_count+1", params![day,agent]).map_err(|e| e.to_string())?;
+                } else {
+                    inserted = tx.execute("INSERT INTO shadow_events(day,agent_id,tool,kind,source_class,call_id,at,transport)
+                        VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![day,agent,tool,kind,class,call,at,transport.name()]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
         let prune = tx.execute("INSERT INTO shadow_maintenance VALUES(1,?1)
             ON CONFLICT(id) DO UPDATE SET pruned_at=excluded.pruned_at WHERE pruned_at <= ?1-3600", [at]).map_err(|e| e.to_string())?;
         if prune != 0 {
             tx.execute("DELETE FROM shadow_events WHERE at < ?1-35*86400", [at]).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM shadow_overflow WHERE day < date(?1-35*86400,'unixepoch')", [at]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted != 0)
@@ -112,6 +136,7 @@ pub struct Count { pub key: String, pub count: u64 }
 #[derive(Serialize, Debug)]
 pub struct Report {
     pub days: u32, pub total: u64, pub ticket_total: u64,
+    pub capped: bool,
     pub by_employee: Vec<Count>, pub by_tool: Vec<Count>, pub by_source_class: Vec<Count>,
     pub by_transport: Vec<Count>, pub daily: Vec<Count>,
 }
@@ -121,7 +146,7 @@ pub fn report(home: &Path, days: u32) -> Result<Report, String> {
 }
 fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
     if !matches!(days, 7 | 30) { return Err("days must be 7 or 30".into()); }
-    let mut result = Report { days, total: 0, ticket_total: 0, by_employee: vec![], by_tool: vec![],
+    let mut result = Report { days, total: 0, ticket_total: 0, capped: false, by_employee: vec![], by_tool: vec![],
         by_source_class: vec![], by_transport: vec![], daily: vec![] };
     // Include today and the preceding UTC calendar days, zero-filled below.
     let today = now.div_euclid(86400) * 86400;
@@ -138,6 +163,7 @@ fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
     }
     let mut store = Store::open(home)?;
     let tx = store.0.transaction().map_err(|e| e.to_string())?;
+    result.capped = tx.query_row("SELECT EXISTS(SELECT 1 FROM shadow_overflow WHERE day>=date(?1,'unixepoch') AND day<=date(?2,'unixepoch'))", params![start,now], |r| r.get(0)).map_err(|e| e.to_string())?;
     (result.total, result.ticket_total) = tx.query_row("SELECT COUNT(*), COALESCE(SUM(kind IN ('would_ask','recipient_would_ask')),0)
         FROM shadow_events WHERE at>=?1 AND at<=?2", params![start,now], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
     for (column, output) in [("agent_id", &mut result.by_employee), ("tool", &mut result.by_tool),
@@ -152,6 +178,18 @@ fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
     for row in rows {
         let row = row.map_err(|e| e.to_string())?;
         if let Some(day) = result.daily.iter_mut().find(|d| d.key == row.key) { day.count = row.count; }
+    }
+    let overflow = {
+        let mut stmt = tx.prepare("SELECT day,agent_id,overflow_count FROM shadow_overflow WHERE day>=date(?1,'unixepoch') AND day<=date(?2,'unixepoch')")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(params![start,now], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?)))
+            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?
+    };
+    for (date, agent, count) in overflow {
+        result.total += count;
+        if let Some(day) = result.daily.iter_mut().find(|day| day.key == date) { day.count += count; }
+        if let Some(row) = result.by_employee.iter_mut().find(|row| row.key == agent) { row.count += count; }
+        else { result.by_employee.push(Count { key: agent, count }); }
     }
     Ok(result)
 }

@@ -43,6 +43,7 @@ export interface EgressShadowReport {
   days: 7 | 30;
   total: number;
   ticket_total: number;
+  capped: boolean;
   by_employee: Array<{ key: string; count: number }>;
   by_tool: Array<{ key: string; count: number }>;
   by_source_class: Array<{ key: string; count: number }>;

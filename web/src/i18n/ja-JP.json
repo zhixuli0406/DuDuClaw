@@ -9063,6 +9063,8 @@
   "security.egress.reportEmptyDescription": "利用できる記録がありません。送信にリスクがないことを示すものではありません。",
   "security.egress.ticketEstimate": "送信前に確認する設定なら、この {days} 日間に {count} 件の承認が必要でした",
   "security.egress.reportCountNote": "各呼び出しは一度だけ数えます。内訳には拒否の観測も含みますが、承認件数には加算しません。保存できた観測のみを表示します。",
+  "security.egress.reportTrust": "件数は各スタッフ自身の活動に基づく推定値です。呼び出しを繰り返すと水増しでき、Bash を使えるスタッフは shadow データベースファイルを変更できます。",
+  "security.egress.reportCapped": "保存上限に達しました。表示された合計は、その数以上として扱ってください。",
   "security.egress.byEmployee": "AI スタッフ別",
   "security.egress.byTool": "ツール別",
   "security.egress.bySource": "非公開データの種類別",

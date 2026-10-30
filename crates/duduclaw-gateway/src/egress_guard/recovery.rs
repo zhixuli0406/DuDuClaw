@@ -111,6 +111,10 @@ pub fn clear(home: &Path, lease: Option<&str>, confirm: &str) -> Result<ClearRes
     if rows(&backup_conn)?.confirm != current.confirm { return Err("egress lease backup does not match current leases".into()); }
     drop(backup_conn);
     if confirm != token(ids.clone()) { return Err(format!("stale confirmation token; backup: {}", backup.display())); }
+    let event = duduclaw_security::audit::AuditEvent::new("egress_leases_clear_intent", "", duduclaw_security::audit::Severity::Warning,
+        serde_json::json!({"actor": "本機指令列（身分未驗證）", "lease_ids": ids, "backup": backup, "requested": ids.len()}));
+    duduclaw_security::audit::try_append_audit_event(home, &event)
+        .map_err(|e| format!("security audit intent failed; no leases were deleted: {e}"))?;
     let tx = store.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
     if rows(&tx)?.confirm != current.confirm { return Err("egress leases changed after backup; nothing deleted".into()); }
     for id in &ids { tx.execute("DELETE FROM sink_leases WHERE lease_id=?1", [id]).map_err(|e| e.to_string())?; }
@@ -118,7 +122,7 @@ pub fn clear(home: &Path, lease: Option<&str>, confirm: &str) -> Result<ClearRes
     let event = duduclaw_security::audit::AuditEvent::new("egress_leases_cleared", "", duduclaw_security::audit::Severity::Warning,
         serde_json::json!({"actor": "本機指令列（身分未驗證）", "lease_ids": ids, "backup": backup, "deleted": ids.len()}));
     duduclaw_security::audit::try_append_audit_event(home, &event)
-        .map_err(|e| format!("leases cleared and backed up, but security audit failed: {e}"))?;
+        .map_err(|e| format!("leases were cleared and backed up, but completion security audit failed: {e}"))?;
     Ok(ClearResult { deleted: ids.len(), backup })
 }
 

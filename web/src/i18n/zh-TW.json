@@ -9063,6 +9063,8 @@
   "security.egress.reportEmptyDescription": "目前沒有可用的紀錄，不代表外送資料沒有風險。",
   "security.egress.ticketEstimate": "如果開成先詢問，這 {days} 天會開 {count} 張單",
   "security.egress.reportCountNote": "每次呼叫只計一次。分類包含原本會拒絕的紀錄，但這些紀錄不計入預估開單數；僅呈現成功保存的觀察資料。",
+  "security.egress.reportTrust": "計數來自員工自身活動，僅供估算。員工反覆呼叫可灌高數字，有 Bash 權限的員工也能修改 shadow 資料庫檔案。",
+  "security.egress.reportCapped": "資料已達儲存上限；顯示的總數請視為至少這麼多。",
   "security.egress.byEmployee": "依 AI 員工",
   "security.egress.byTool": "依工具",
   "security.egress.bySource": "依私人資料來源",

@@ -798,6 +798,8 @@ function EgressShadowReportPanel() {
         <>
           <p className="text-sm font-medium">{intl.formatMessage({ id: 'security.egress.ticketEstimate' }, { days, count: report.ticket_total })}</p>
           <p className="text-xs text-muted-foreground">{t('reportCountNote')}</p>
+          <p className="text-xs text-muted-foreground">{t('reportTrust')}</p>
+          {report.capped && <p className="text-xs font-medium text-amber-700">{t('reportCapped')}</p>}
           <div className="grid gap-4 sm:grid-cols-2">
             {breakdown('byEmployee', report.by_employee, true)}
             {breakdown('byTool', report.by_tool)}

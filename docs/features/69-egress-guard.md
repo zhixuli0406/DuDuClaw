@@ -44,6 +44,8 @@ Registration history uses a separate bounded Bloom filter per employee and is ne
 
 The Admin-only Security report compares the last 7 or 30 UTC days. The approval estimate counts distinct calls that would ask; pre-check and dispatch confirmation share a call ID. Refusal observations appear in the breakdowns but are not approval tickets. Breakdowns show employee, tool, closed private-source class, date and CLI built-in versus MCP entry point. An empty result means no recorded observations, not proof of safe sending. Collection failures do not change gate decisions and can leave the report incomplete.
 
+Counts are estimates based on each employee's own activity. Repeated calls can inflate them, and an employee with Bash can alter the shadow database file. Storage is capped at 10,000 detail rows per employee per day and 1,000,000 detail rows overall; overflow is counted per employee and day, so capped totals mean at least the displayed amount.
+
 `<home>/egress_shadow.db` uses SQLite WAL and Unix 0600 permissions, retains 35 days, and prunes on writes at most hourly. It stores no content, recipients or free-text source names. Existing tool-call audit rotation does not limit this report. `security.egress_shadow_report` accepts only `days: 7` or `days: 30` and requires Admin access.
 
 The report covers MCP outgoing gate evaluations, computer actions and gateway hook checks. Read-reservation conflicts, unsupported-runtime spawn warnings and local hook transport failures remain in the tool audit log and are not included in these call counts.
@@ -60,6 +62,8 @@ duduclaw egress-leases clear --all --confirm <token-from-list>
 # To clear one lease, use that lease's token from list:
 duduclaw egress-leases clear --lease <id> --confirm <lease-token>
 ```
+
+`egress-leases` is an operator tool. Its AI-session check relies on environment markers; a FullAccess shell running as the same OS account can get past that check. On Windows, the lease store's hard-link check is not applied.
 
 Run these commands from the operator's terminal; AI sessions are refused. Both commands require the gateway to be stopped and the lease lock to be available. An unreadable gateway lock is a refusal, not evidence of a stopped gateway. `clear` holds the exclusive lease lock, lists the current leases, creates a timestamped private database backup, checks the token against the sorted selected lease IDs, deletes in one transaction and writes a security audit event. A changed set invalidates the token. Keep the backup and never unlink `egress_leases.lock`.
 

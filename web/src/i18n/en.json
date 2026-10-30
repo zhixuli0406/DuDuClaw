@@ -9063,6 +9063,8 @@
   "security.egress.reportEmptyDescription": "No recorded observations are available. This does not prove that sending data is safe.",
   "security.egress.ticketEstimate": "Ask before sending would have created {count} approval requests over these {days} days",
   "security.egress.reportCountNote": "Each call is counted once. Refusal observations are included in the breakdowns, but do not increase the would-be approval count. Only successfully recorded observations are shown.",
+  "security.egress.reportTrust": "Counts come from each employee's own activity and are estimates. An employee can inflate them by looping calls, and an employee with Bash can alter the shadow database file.",
+  "security.egress.reportCapped": "Storage limits were reached. Treat displayed totals as at least these amounts.",
   "security.egress.byEmployee": "By AI employee",
   "security.egress.byTool": "By tool",
   "security.egress.bySource": "By private data source",
