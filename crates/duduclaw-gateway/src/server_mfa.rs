@@ -82,29 +82,41 @@ pub(super) async fn refresh_allowed(state: &AppState, user: &str) -> bool {
 
 /// Do not interrupt work at the policy toggle. Enterprise JWT sockets under
 /// MFA close only after their own access-token expiry (next 30-second tick).
+/// Identity read failures pause traffic and use the caller's recovery window.
 /// Unenrolled accounts with enforcement off and Personal keep their old behavior.
-pub(super) async fn socket_expired(state: &AppState, ctx: &UserContext, expires: Option<u64>, legacy: bool) -> bool {
+pub(super) async fn socket_validity(state: &AppState, ctx: &UserContext, expires: Option<u64>, legacy: bool, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
+    use crate::handlers::live_context::SocketValidity;
     if legacy {
-        return !legacy_token_allowed(state).await;
+        return if legacy_token_allowed(state).await { SocketValidity::Valid } else { SocketValidity::Revoked };
     }
-    if expires.is_some() && state.handler.live_context(ctx).await.is_err() {
-        return true;
+    if expires.is_some()
+        && let Err(status) = state.handler.socket_context(ctx, heartbeat).await {
+        return status;
     }
-    let user = &ctx.user_id;
-    let Some(expires) = expires else {
-        return false;
-    };
+    // Expiry policy remains a heartbeat check. Per-frame sends only consult
+    // the short identity cache, including for legacy sessions past expiry.
+    if !heartbeat { return SocketValidity::Valid; }
+    let Some(expires) = expires else { return SocketValidity::Valid; };
     if (chrono::Utc::now().timestamp().max(0) as u64) < expires {
-        return false;
+        return SocketValidity::Valid;
     }
-    let personal = state.handler.resolve_edition_profile().await.is_personal();
-    if personal {
-        return false;
+    if state.handler.resolve_edition_profile().await.is_personal() {
+        return SocketValidity::Valid;
     }
     match enforced(&state.home_dir, false) {
-        Ok(required) => required || state.user_db.mfa_active(user).unwrap_or(true),
-        Err(_) => true,
+        Ok(true) => SocketValidity::Revoked,
+        Ok(false) => match state.user_db.mfa_active(&ctx.user_id) {
+            Ok(true) => SocketValidity::Revoked,
+            Ok(false) => SocketValidity::Valid,
+            Err(_) => SocketValidity::Unavailable,
+        },
+        Err(_) => SocketValidity::Unavailable,
     }
+}
+
+#[cfg(test)]
+async fn socket_expired(state: &AppState, ctx: &UserContext, expires: Option<u64>, legacy: bool) -> bool {
+    socket_validity(state, ctx, expires, legacy, true).await != crate::handlers::live_context::SocketValidity::Valid
 }
 
 fn session(

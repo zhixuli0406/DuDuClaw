@@ -386,10 +386,9 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
-        if let Some(token) = enrollment {
-            if challenge_user(&tx, token, "enroll", now)? != user || !proof_verified(&tx, token)? {
-                return Err(DENIED.into());
-            }
+        if let Some(token) = enrollment
+            && (challenge_user(&tx, token, "enroll", now)? != user || !proof_verified(&tx, token)?) {
+            return Err(DENIED.into());
         }
         let active: bool = tx
             .query_row(

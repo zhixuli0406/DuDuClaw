@@ -501,3 +501,38 @@ async fn mfa_channel_bind_refuses_enforced_self_but_accepts_other_admin() {
     let challenge=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,now).unwrap();
     assert!(state.user_db.mfa_prepare_enrollment(&challenge,true,now).unwrap().is_none());
 }
+
+#[tokio::test]
+async fn mfa_live_socket_read_failure_pauses_recovers_and_retires_queued_output() {
+    use crate::handlers::live_context::{SocketRecovery, SocketValidity};
+    let (_dir, state, user) = fixture(false, false).await;
+    let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let ctx = authenticate_jwt(&state, &token).unwrap();
+    let check = |heartbeat| socket_validity(&state, &ctx, Some(u64::MAX), false, heartbeat);
+    let mut recovery = SocketRecovery::default();
+    assert!(recovery.observe(check(true).await, true));
+    let raw = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+    raw.execute("ALTER TABLE auth_meta RENAME TO saved_auth_meta", []).unwrap();
+    assert_eq!(check(true).await, SocketValidity::Unavailable);
+    assert!(!recovery.observe(check(true).await, true));
+    assert!(!recovery.closed());
+    // Admission and sensitive output use the same paused gate, without
+    // counting additional messages as failed heartbeats.
+    for _ in 0..4 { assert!(!recovery.observe(check(false).await, false)); }
+    raw.execute("ALTER TABLE users RENAME TO saved_users", []).unwrap();
+    assert!(authenticate_jwt(&state, &token).is_err());
+    raw.execute("ALTER TABLE saved_users RENAME TO users", []).unwrap();
+    raw.execute("ALTER TABLE saved_auth_meta RENAME TO auth_meta", []).unwrap();
+    assert!(recovery.observe(check(true).await, true));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    tx.send("queued RPC response").await.unwrap();
+    tx.send("queued OS event").await.unwrap();
+    state.user_db.mfa_operator_reset(&user.email).unwrap();
+    assert_eq!(check(true).await, SocketValidity::Revoked);
+    let mut sent = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        if recovery.observe(check(false).await, false) { sent.push(frame); }
+    }
+    assert!(sent.is_empty());
+    assert!(recovery.closed());
+}

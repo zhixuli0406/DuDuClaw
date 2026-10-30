@@ -510,15 +510,21 @@ impl WebChatState {
         authenticate_with(&self.jwt_config, &self.user_db, token)
     }
 
-    async fn credential_valid(&self, claims: Option<&duduclaw_auth::jwt::Claims>, heartbeat: bool) -> bool {
-        let Some(claims) = claims else { return true; }; // Public widget.
-        let Ok(ctx) = duduclaw_auth::UserContext::from_claims(claims, false) else { return false; };
+    async fn credential_validity(&self, claims: Option<&duduclaw_auth::jwt::Claims>, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
+        use crate::handlers::live_context::SocketValidity;
+        let Some(claims) = claims else { return SocketValidity::Valid; }; // Public widget.
+        let Ok(ctx) = duduclaw_auth::UserContext::from_claims(claims, false) else { return SocketValidity::Revoked; };
         let db = self.user_db.clone();
         let cache = self.live_ctx_cache.clone();
         let live = tokio::task::spawn_blocking(move ||
             crate::handlers::live_context::resolve_socket_context(&db, &cache, &ctx, heartbeat)).await;
-        let Ok(Ok(live)) = live else { return false; };
-        webchat_credential_valid(&self.ctx.home_dir, claims, &live, chrono::Utc::now().timestamp().max(0) as u64)
+        match live {
+            Ok(Ok(live)) => if webchat_credential_valid(&self.ctx.home_dir, claims, &live, chrono::Utc::now().timestamp().max(0) as u64) {
+                SocketValidity::Valid
+            } else { SocketValidity::Revoked },
+            Ok(Err(e)) => SocketValidity::from_error(&e),
+            Err(_) => SocketValidity::Unavailable,
+        }
     }
 
     /// C-ACL (P0-S1): may `user_id` address `agent_name` by name in a
@@ -847,11 +853,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     let live = liveness::Liveness::new();
 
     // Message processing loop
-    loop {
+    let mut recovery = crate::handlers::live_context::SocketRecovery::default();
+    'connection: loop {
         tokio::select! {
             // Heartbeat tick
             _ = heartbeat_interval.tick() => {
-                if !state.credential_valid(credential.as_ref(), true).await {
+                let validity = state.credential_validity(credential.as_ref(), true).await;
+                recovery.observe(validity, true);
+                if recovery.closed() {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
@@ -871,6 +880,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
             cfg_ev = cfg_rx.recv() => {
                 use tokio::sync::broadcast::error::RecvError;
                 if !matches!(cfg_ev, Err(RecvError::Closed)) {
+                    let validity = state.credential_validity(credential.as_ref(), false).await;
+                    if !recovery.observe(validity, false) {
+                        if recovery.closed() { let _ = sink.send(Message::Close(None)).await; break; }
+                        continue;
+                    }
                     let mut info = build_session_info_frame(
                         &state, &announced_sid, announced_agent.as_deref(),
                     ).await;
@@ -899,6 +913,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
+                        let validity = state.credential_validity(credential.as_ref(), false).await;
+                        if !recovery.observe(validity, false) {
+                            if recovery.closed() {
+                                let _ = sink.send(Message::Close(None)).await;
+                                break;
+                            }
+                            continue;
+                        }
                         let chat_msg: ChatMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(e) => {
@@ -912,10 +934,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                         match chat_msg {
                             ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv, msg_id } => {
-                                if !state.credential_valid(credential.as_ref(), false).await {
-                                    let _ = sink.send(Message::Close(None)).await;
-                                    break;
-                                }
+
                                 let assign_event = assign_event_id(msg_id.as_deref());
                                 // ── Forced password-change gate ──────────
                                 // Mirrors `handlers.rs::dispatch`'s gate on the
@@ -1405,8 +1424,24 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let mut thinking_meta = crate::thinking::DoneMetaBuilder::default();
                                 let (reply, deliberate_silence) = loop {
                                     tokio::select! {
+                                        _ = heartbeat_interval.tick() => {
+                                            let validity = state.credential_validity(credential.as_ref(), true).await;
+                                            recovery.observe(validity, true);
+                                            if recovery.closed() {
+                                                let _ = sink.send(Message::Close(None)).await;
+                                                break 'connection;
+                                            }
+                                        }
                                         r = &mut work => break r,
                                         Some(notice) = watch_rx.recv() => {
+                                            let validity = state.credential_validity(credential.as_ref(), false).await;
+                                            if !recovery.observe(validity, false) {
+                                                if recovery.closed() {
+                                                    let _ = sink.send(Message::Close(None)).await;
+                                                    break 'connection;
+                                                }
+                                                continue;
+                                            }
                                             let msg = ChatMessage::ComputerWatch {
                                                 agent_id: notice.agent_id, href: notice.href,
                                                 conv: conv_nonce.clone(),
@@ -1416,6 +1451,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             }
                                         }
                                         Some(ev) = prx.recv() => {
+                                            let validity = state.credential_validity(credential.as_ref(), false).await;
+                                            if !recovery.observe(validity, false) {
+                                                if recovery.closed() {
+                                                    let _ = sink.send(Message::Close(None)).await;
+                                                    break 'connection;
+                                                }
+                                                continue;
+                                            }
                                             use crate::channel_reply::ProgressEvent;
                                             let content = ev.to_display();
                                             let msg = match ev {
@@ -1468,6 +1511,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         }
                                     }
                                 };
+                                let validity = state.credential_validity(credential.as_ref(), false).await;
+                                if !recovery.observe(validity, false) {
+                                    if recovery.closed() {
+                                        let _ = sink.send(Message::Close(None)).await;
+                                        break 'connection;
+                                    }
+                                    continue 'connection;
+                                }
                                 for notice in crate::computer_watch_links::delivery::take_pending(&mut watch_rx) {
                                     let msg = ChatMessage::ComputerWatch {
                                         agent_id: notice.agent_id, href: notice.href, conv: conv_nonce.clone(),
@@ -1623,6 +1674,12 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     task: None,
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
+                                    let validity = state.credential_validity(credential.as_ref(), false).await;
+                                    if !recovery.observe(validity, false) {
+                                        if recovery.closed() { let _ = sink.send(Message::Close(None)).await; break 'connection; }
+                                        rollback_owned_webchat_archives(&owned_archives).await;
+                                        continue 'connection;
+                                    }
                                     if !guarded.still_valid().await {
                                         rollback_owned_webchat_archives(&owned_archives).await;
                                         continue;
@@ -1968,6 +2025,13 @@ fn assign_event_id(msg_id: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use duduclaw_auth::{AccessLevel, JwtConfig, UserDb, UserRole, UserStatus};
+
+    #[test]
+    fn revoked_credential_blocks_final_reply() {
+        let mut recovery = crate::handlers::live_context::SocketRecovery::default();
+        assert!(!recovery.observe(crate::handlers::live_context::SocketValidity::Revoked, false));
+        assert!(recovery.closed());
+    }
 
     #[tokio::test]
     async fn bound_outbound_archive_uses_socket_owner_and_preserves_delivery_fence() {

@@ -6457,7 +6457,7 @@ fn agent_file_guard_decision(
                             responsibility_cmd::bash_responsibility_decision(command, &caller)
                         })
                         .or_else(|| {
-                            users_mfa_cmd::bash_decision(command, &caller)
+                            users_mfa_cmd::bash_decision(command, caller)
                         })
                         .or_else(|| {
                             agent_control_cmd::bash_agent_control_decision(command, &caller)

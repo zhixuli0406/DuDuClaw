@@ -16200,11 +16200,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     let (rpc_tx, mut rpc_rx) =
         tokio::sync::mpsc::channel::<(WsFrame, Option<bool>, Option<bool>, Option<(bool, serde_json::Value)>)>(64);
 
+    let mut recovery = crate::handlers::live_context::SocketRecovery::default();
     loop {
         tokio::select! {
             // ── Heartbeat ping ─────────────────────────────
             _ = heartbeat_interval.tick() => {
-                if server_mfa::socket_expired(&state, &user_ctx, access_expires, legacy_admin_authenticated).await {
+                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, true).await;
+                recovery.observe(validity, true);
+                if recovery.closed() {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
@@ -16227,7 +16230,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
-                        let frame = match serde_json::from_str::<WsFrame>(&text) {
+                        let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
+                if !recovery.observe(validity, false) {
+                    if recovery.closed() {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    continue;
+                }
+                let frame = match serde_json::from_str::<WsFrame>(&text) {
                             Ok(f) => f,
                             Err(e) => {
                                 error!("Failed to parse WsFrame: {e}");
@@ -16336,6 +16347,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                         }
                     }
                 }
+                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
+                if !recovery.observe(validity, false) {
+                    if recovery.closed() {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(on) = logs_update {
                     logs_subscribed = on;
                 }
@@ -16386,6 +16405,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
 
             // ── Outbound log broadcast (only when subscribed) ─
             log_line = log_rx.recv(), if logs_subscribed => {
+                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
+                if !recovery.observe(validity, false) {
+                    if recovery.closed() {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    continue;
+                }
                 match log_line {
                     // The log tail is Manager+; a downgraded or suspended
                     // account stops receiving it within the push cache window.
@@ -16450,6 +16477,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                     None => std::future::pending().await,
                 }
             }, if os_events_subscribed => {
+                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
+                if !recovery.observe(validity, false) {
+                    if recovery.closed() {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    continue;
+                }
                 match os_ev {
                     Ok(ev) => {
                         if let Some(payload) = crate::os_events::os_event_push_payload(&ev) {
