@@ -85,7 +85,15 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 .map_err(|_| Error::Terminal)?;
             // Never block a Tokio worker waiting for user input; only read ready events.
             while event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? {
-                let Event::Key(key) = event::read().map_err(|_| Error::Terminal)? else { continue; };
+                let key = match event::read().map_err(|_| Error::Terminal)? {
+                    Event::Resize(_, _) => {
+                        if let Some(card) = &mut app.card { card.invalidate_viewport(); }
+                        // Stop this batch: queued keys must see the newly rendered viewport.
+                        break;
+                    }
+                    Event::Key(key) => key,
+                    _ => continue,
+                };
                 let before = app.read.clone();
                 match app.key(key, &model) {
                     Action::Quit => return Ok(()),

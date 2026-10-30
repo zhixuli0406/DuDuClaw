@@ -474,18 +474,24 @@ impl TaskStore {
         decision: &str,
         note: &str,
     ) -> Result<bool, String> {
-        self.resolve_needs_human_inner(id, decision, note, false).await
+        self.resolve_needs_human_inner(id, decision, note, false, None).await
     }
 
     /// Called only after the dashboard/channel authorization gate succeeds.
     pub(crate) async fn resolve_needs_human_with_survival_evidence(
         &self, id: &str, decision: &str, note: &str,
     ) -> Result<bool, String> {
-        self.resolve_needs_human_inner(id, decision, note, true).await
+        self.resolve_needs_human_inner(id, decision, note, true, None).await
+    }
+
+    pub(crate) async fn resolve_needs_human_checked(
+        &self, id: &str, decision: &str, note: &str, expected_updated_at: Option<&str>,
+    ) -> Result<bool, String> {
+        self.resolve_needs_human_inner(id, decision, note, true, expected_updated_at).await
     }
 
     async fn resolve_needs_human_inner(
-        &self, id: &str, decision: &str, note: &str, authenticated: bool,
+        &self, id: &str, decision: &str, note: &str, authenticated: bool, expected_updated_at: Option<&str>,
     ) -> Result<bool, String> {
         let note_opt: Option<&str> = if note.trim().is_empty() {
             None
@@ -495,6 +501,7 @@ impl TaskStore {
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("resolve needs_human: begin: {e}"))?;
+        check_goal_decide_revision(&tx, id, expected_updated_at)?;
         let now = Utc::now().to_rfc3339();
         // H11: the pause is over on every branch — clear the class so a task
         // sent back around the loop (or closed out) never renders a stale
@@ -569,17 +576,23 @@ impl TaskStore {
     /// `pending` task carrying a stale completion timestamp from a previous
     /// `done` round would misrepresent the row.
     pub async fn continue_from_terminal(&self, id: &str, message: &str) -> Result<bool, String> {
-        self.continue_from_terminal_inner(id, message, false).await
+        self.continue_from_terminal_inner(id, message, false, None).await
     }
 
     /// The verified dashboard decision path; agent-facing bare calls do not assert a human retry.
     pub(crate) async fn continue_from_terminal_with_survival_evidence(
         &self, id: &str, message: &str,
     ) -> Result<bool, String> {
-        self.continue_from_terminal_inner(id, message, true).await
+        self.continue_from_terminal_inner(id, message, true, None).await
     }
 
-    async fn continue_from_terminal_inner(&self, id: &str, message: &str, authenticated: bool) -> Result<bool, String> {
+    pub(crate) async fn continue_from_terminal_checked(
+        &self, id: &str, message: &str, expected_updated_at: Option<&str>,
+    ) -> Result<bool, String> {
+        self.continue_from_terminal_inner(id, message, true, expected_updated_at).await
+    }
+
+    async fn continue_from_terminal_inner(&self, id: &str, message: &str, authenticated: bool, expected_updated_at: Option<&str>) -> Result<bool, String> {
         let message = message.trim();
         if message.is_empty() {
             return Err("接著做需要附上訊息".into());
@@ -588,6 +601,7 @@ impl TaskStore {
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("continue from terminal: begin: {e}"))?;
+        check_goal_decide_revision(&tx, id, expected_updated_at)?;
         // P2-A C7: a run an operator stopped is not reopened by "接著做" —
         // the documented path is a successor task under a new contract.
         let stopped: bool = tx
@@ -642,15 +656,25 @@ impl TaskStore {
     /// the conversation's live goal tasks through
     /// [`Self::claim_conversation_tasks`] instead.
     pub async fn claim_needs_human(&self, id: &str, decider: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        self.claim_needs_human_checked(id, decider, None).await
+    }
+
+    pub(crate) async fn claim_needs_human_checked(
+        &self, id: &str, decider: &str, expected_updated_at: Option<&str>,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("claim needs_human: begin: {e}"))?;
+        check_goal_decide_revision(&tx, id, expected_updated_at)?;
         let now = Utc::now().to_rfc3339();
-        let n = conn
+        let n = tx
             .execute(
                 "UPDATE tasks SET claimed_by = ?2, updated_at = ?3
                   WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
                 params![id, decider, now],
             )
             .map_err(|e| format!("claim needs_human: {e}"))?;
+        tx.commit().map_err(|e| format!("claim needs_human: commit: {e}"))?;
         Ok(n == 1)
     }
 
@@ -748,5 +772,20 @@ fn survival_decision_receipt_conn(conn: &Connection, task_id: &str, decision: &s
          WHERE task_id=?1 AND evidence_version=1",
         params![task_id,decision],
     ).map_err(|e| format!("survival evidence: write decision receipt: {e}"))?;
+    Ok(())
+}
+
+/// Read under the same IMMEDIATE transaction that applies the decision.
+fn check_goal_decide_revision(
+    tx: &rusqlite::Transaction<'_>, id: &str, expected: Option<&str>,
+) -> Result<(), String> {
+    if let Some(expected) = expected {
+        let current: Option<String> = tx.query_row(
+            "SELECT updated_at FROM tasks WHERE id = ?1", params![id], |row| row.get(0),
+        ).optional().map_err(|e| format!("goal_decide revision: {e}"))?;
+        if current.as_deref() != Some(expected) {
+            return Err("goal_decide_revision_mismatch".into());
+        }
+    }
     Ok(())
 }

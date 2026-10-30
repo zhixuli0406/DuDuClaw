@@ -1,0 +1,36 @@
+---
+source: crates/duduclaw-tui/src/ui/card_tests.rs
+expression: "snapshot(json!({\"digest\":null}))"
+---
++-決策卡-------------------------------------------------------------------------------+
+|{                                                                                     |
+|  "agent_id": "adu",                                                                  |
+|  "decided_in_dashboard_only": false,                                                 |
+|  "digest": null,                                                                     |
+|  "effect_class": "modify",                                                           |
+|  "expires_at": 2000,                                                                 |
+|  "id": "a1",                                                                         |
+|  "kind": "tool",                                                                     |
+|  "may_decide": true,                                                                 |
+|  "payload": {                                                                        |
+|    "text": "完整內容"                                                                |
+|  },                                                                                  |
+|  "request_kind": "approval",                                                         |
+|  "status": "pending",                                                                |
+|  "summary": "確認操作"                                                               |
+|}                                                                                     |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|內容未綁定：這張卡無法確認你看到的就是實際內容，請到儀表板決定                        |
+|n 拒絕                                                                                |
+|                                                                                      |
+|↑↓ / PgUp PgDn 捲動；s 稍後；Esc 關卡                                                 |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
++--------------------------------------------------------------------------------------+

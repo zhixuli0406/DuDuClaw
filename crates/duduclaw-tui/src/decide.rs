@@ -17,7 +17,7 @@ impl GoalAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     Approval { id: String, approve: bool, digest: Option<String> },
-    Goal { task_id: String, action: GoalAction, message: String },
+    Goal { task_id: String, action: GoalAction, message: String, expected_updated_at: String },
 }
 impl Decision {
     pub fn request(&self) -> (&'static str, Value) {
@@ -27,11 +27,9 @@ impl Decision {
                 if let Some(digest) = digest { params["expected_digest"] = json!(digest); }
                 ("approvals.decide", params)
             }
-            Self::Goal { task_id, action, message } => {
-                let mut params = json!({"task_id":task_id, "action":action.wire()});
+            Self::Goal { task_id, action, message, expected_updated_at } => {
+                let mut params = json!({"task_id":task_id, "action":action.wire(), "expected_updated_at":expected_updated_at});
                 if *action == GoalAction::Continue { params["message"] = json!(message); }
-                // This checkout's goal_decide handler takes no revision parameter.
-                // Do not confuse revision_round or tasks.stop's authority revision with one.
                 ("tasks.goal_decide", params)
             }
         }
@@ -49,6 +47,9 @@ impl Outcome {
     }
 }
 pub async fn send(client: &Client, decision: &Decision) -> Outcome {
+    if matches!(decision, Decision::Approval { approve: true, digest, .. } if digest.as_deref().is_none_or(str::is_empty)) {
+        return Outcome::Error(TerminalText::new(strings::CARD_UNBOUND.into()));
+    }
     let (method, params) = decision.request();
     match client.call_detailed(method, params, Duration::from_secs(15)).await {
         Ok(RpcReply::Rejected { digest_mismatch: true, .. }) => Outcome::Changed,
@@ -79,9 +80,9 @@ mod tests {
             assert_eq!(params["approve"], true);
             assert_eq!(params.get("expected_digest"), digest.as_ref().map(|s| json!(s)).as_ref());
         }
-        let (_, p) = Decision::Goal { task_id:"t".into(), action:GoalAction::Retry, message:String::new() }.request();
-        assert_eq!(p, json!({"task_id":"t", "action":"retry"}));
-        let (_, p) = Decision::Goal { task_id:"t".into(), action:GoalAction::Continue, message:"next".into() }.request();
-        assert_eq!(p, json!({"task_id":"t", "action":"continue", "message":"next"}));
+        let (_, p) = Decision::Goal { task_id:"t".into(), action:GoalAction::Retry, message:String::new(), expected_updated_at:"revision".into() }.request();
+        assert_eq!(p, json!({"task_id":"t", "action":"retry", "expected_updated_at":"revision"}));
+        let (_, p) = Decision::Goal { task_id:"t".into(), action:GoalAction::Continue, message:"next".into(), expected_updated_at:"revision".into() }.request();
+        assert_eq!(p, json!({"task_id":"t", "action":"continue", "message":"next", "expected_updated_at":"revision"}));
     }
 }

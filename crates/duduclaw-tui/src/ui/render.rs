@@ -125,7 +125,7 @@ pub fn draw(
         Rect::new(footer.x, footer.y, footer.width, 1),
         TerminalText::new(format!(
             "[{}]{}",
-            if app.card.is_some() { strings::CARD_FOCUS } else { strings::LIST_FOCUS },
+            if app.card.is_some() { strings::CARD_FOCUS } else if app.help { strings::HELP_FOCUS } else { strings::LIST_FOCUS },
             if detail_stale {
                 format!(" {}", strings::STALE)
             } else {
@@ -139,7 +139,7 @@ pub fn draw(
     text(
         frame,
         Rect::new(footer.x, footer.y + 1, footer.width, 2),
-        TerminalText::new(strings::KEY_HINTS.into()),
+        TerminalText::new((if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else { strings::LIST_KEY_HINTS }).into()),
         settings,
         false,
         true,

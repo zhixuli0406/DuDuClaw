@@ -6,6 +6,7 @@ expression: "snapshot(json!({\"effect_class\":\"admin\",\"payload\":{\"command\"
 |{                                                                                     |
 |  "agent_id": "adu",                                                                  |
 |  "decided_in_dashboard_only": false,                                                 |
+|  "digest": "seen",                                                                   |
 |  "effect_class": "admin",                                                            |
 |  "expires_at": 2000,                                                                 |
 |  "id": "a1",                                                                         |
@@ -22,7 +23,6 @@ expression: "snapshot(json!({\"effect_class\":\"admin\",\"payload\":{\"command\"
 |  "status": "pending",                                                                |
 |  "summary": "確認操作"                                                               |
 |}                                                                                     |
-|                                                                                      |
 |                                                                                      |
 |                                                                                      |
 |核准確認碼： 42  []                                                                   |

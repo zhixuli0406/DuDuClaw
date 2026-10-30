@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 fn approval(extra: Value) -> InboxItem {
     let mut v = json!({"id":"a1","agent_id":"adu","kind":"tool","summary":"確認操作",
-        "request_kind":"approval","status":"pending","may_decide":true,"expires_at":2000,
+        "digest":"seen","request_kind":"approval","status":"pending","may_decide":true,"expires_at":2000,
         "decided_in_dashboard_only":false,"effect_class":"modify","payload":{"text":"完整內容"}});
     for (k, v2) in extra.as_object().unwrap() { v[k] = v2.clone(); }
     let mut a: Approval = serde_json::from_value(v.clone()).unwrap();
@@ -16,7 +16,7 @@ fn approval(extra: Value) -> InboxItem {
     InboxItem::Approval(a)
 }
 fn goal(status: &str) -> InboxItem {
-    let v = json!({"id":"t1","assigned_to":"adu","title":"目標","status":status,"goal_mode":true});
+    let v = json!({"id":"t1","assigned_to":"adu","title":"目標","status":status,"goal_mode":true,"updated_at":"revision"});
     let mut t: HumanTask = serde_json::from_value(v.clone()).unwrap();
     t.detail = TerminalText::new(v.to_string()); InboxItem::Task(t)
 }
@@ -27,7 +27,9 @@ fn model() -> Model {
     m.employees.stale = false; m.employees.refetch_pending = false; m
 }
 fn open(item: InboxItem, model: &Model, now: Instant) -> Card {
-    Card::open(item, model, now, &mut Codes::default())
+    let mut card = Card::open(item, model, now, &mut Codes::default());
+    card.viewport(1, 20);
+    card
 }
 fn key(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE) }
 fn press(card: &mut Card, k: KeyEvent, now: Instant) -> Effect {
@@ -85,7 +87,7 @@ fn terminal_actions_require_consecutive_distinct_presses_without_countdown() {
         assert_eq!(press(&mut c, repeat, now), Effect::None);
         press(&mut c, key('x'), now); assert_eq!(press(&mut c, key(k), now), Effect::None);
         assert_eq!(c.key(key(k),now+Duration::from_secs(3600),1000,true),
-            Effect::Send(Decision::Goal {task_id:"t1".into(),action,message:String::new()}));
+            Effect::Send(Decision::Goal {task_id:"t1".into(),action,message:String::new(),expected_updated_at:"revision".into()}));
     }
     let now = Instant::now(); let mut c = open(goal("needs_human"), &model(), now);
     assert!(matches!(press(&mut c,key('r'),now),Effect::Send(Decision::Goal{action:GoalAction::Retry,..})));
@@ -96,7 +98,7 @@ fn continue_requires_finished_goal_and_explicit_message_as_real_handler_does() {
     assert_eq!(press(&mut c,key('c'),now),Effect::None);
     press(&mut c,key('i'),now); for ch in "繼續下一項".chars() { press(&mut c,key(ch),now); }
     press(&mut c,KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),now);
-    assert_eq!(press(&mut c,key('c'),now),Effect::Send(Decision::Goal{task_id:"t1".into(),action:GoalAction::Continue,message:"繼續下一項".into()}));
+    assert_eq!(press(&mut c,key('c'),now),Effect::Send(Decision::Goal{task_id:"t1".into(),action:GoalAction::Continue,message:"繼續下一項".into(),expected_updated_at:"revision".into()}));
 }
 #[test]
 fn read_only_dashboard_expired_missing_ttl_and_stale_never_send() {
@@ -152,7 +154,7 @@ fn snooze_cap_resurface_expiry_and_local_roundtrip() {
     let home = tempfile::tempdir().unwrap(); let mut r = crate::read_state::ReadState::default();
     assert!(r.snooze(&item,1000)); r.save(home.path()).unwrap();
     let (r,notice) = crate::read_state::ReadState::load(home.path()); assert!(notice.is_none());
-    assert!(r.hidden(&item,1599)); assert!(r.resurfaced(&item,1600));
+    assert!(!r.hidden(&item,1599)); assert!(r.resurfaced(&item,1600));
 }
 #[test]
 fn arrival_never_opens_card_or_moves_selection_and_sending_waits_for_refetch() {
@@ -189,4 +191,72 @@ fn snapshot(extra: Value) -> String {
     let out = snapshot(json!({"effect_class":"shell","payload":{"\u{202e}command":"甲\u{1b}]52;c;secret\u{7}\u{200d}乙"}}));
     assert!(out.contains("␛")); assert!(out.contains("⟨U+202E⟩")); assert!(!out.contains('\u{1b}'));
     insta::assert_snapshot!(out);
+}
+
+#[test]
+fn missing_and_redacted_digests_refuse_approval_but_allow_denial() {
+    for missing in [true, false] {
+        let mut item = approval(json!({"digest":null,"payload":{"redacted":true}}));
+        if missing {
+            let mut data = item.data(); data.as_object_mut().unwrap().remove("digest");
+            if let InboxItem::Approval(a) = &mut item { a.detail = TerminalText::new(data.to_string()); }
+        }
+        let now = Instant::now(); let mut m = model(); m.inbox.items.push(item.clone());
+        let mut app = App::default(); app.card = Some(open(item, &m, now));
+        let code = app.card.as_ref().unwrap().code.clone();
+        for ch in code.chars() { assert_eq!(app.key_at(key(ch), &m, now+Duration::from_secs(1), 1000), Action::None); }
+        assert_eq!(app.key_at(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &m, now+Duration::from_secs(1), 1000), Action::None);
+        assert!(app.card.as_ref().unwrap().controls(now+Duration::from_secs(1),1000,true).plain().contains(strings::CARD_UNBOUND));
+        assert!(matches!(app.key_at(key('n'), &m, now+Duration::from_secs(1), 1000), Action::Decide(Decision::Approval { approve:false, .. })));
+    }
+}
+#[test]
+fn payload_cannot_lower_risk_and_long_summary_requires_scroll() {
+    for extra in [json!({}), json!({"effect_class":"read"}), json!({"effect_class":false}),
+        json!({"kind":"unknown","effect_class":"read","payload":{"effect":"delete"}}),
+        json!({"payload":{"effect":"read","tool_name":null,"tool":"Bash"}})] {
+        assert!(super::card_data::high_risk(&extra));
+    }
+    let now=Instant::now(); let mut c=open(approval(json!({"summary":"long summary ".repeat(200),"payload":{"effect":"read","tool_name":null,"tool":"Bash"}})),&model(),now);
+    c.viewport(super::text::wrapped_lines(&c.body,40,AmbiguousWidth::Wide),5);
+    type_code(&mut c,now); assert!(c.input.is_empty()); assert_eq!(enter(&mut c,now),Effect::None);
+}
+#[test]
+fn resize_invalidates_input_and_queued_scroll_cannot_unlock_old_viewport() {
+    let now=Instant::now(); let mut c=open(approval(json!({})),&model(),now);
+    type_code(&mut c,now); assert_eq!(c.input.len(),2);
+    c.invalidate_viewport(); assert!(c.input.is_empty());
+    press(&mut c,KeyEvent::new(KeyCode::PageDown,KeyModifiers::NONE),now);
+    type_code(&mut c,now); assert_eq!(enter(&mut c,now),Effect::None);
+    c.viewport(100,2); type_code(&mut c,now); assert!(c.input.is_empty());
+}
+#[test]
+fn snooze_rollback_is_permanent_and_monotonic_deadline_survives_slow_wall_clock() {
+    let item=approval(json!({})); let now=Instant::now();
+    let s=Snooze::new_at(&item,1000,600,now).unwrap();
+    assert!(s.hidden_at(&item,1001,now+Duration::from_secs(599)));
+    assert!(!s.hidden_at(&item,1002,now+Duration::from_secs(600)));
+    let s=Snooze::new_at(&item,1000,600,now).unwrap();
+    assert!(!s.hidden_at(&item,999,now)); assert!(!s.hidden_at(&item,1001,now));
+    let loaded: Snooze=serde_json::from_str(&serde_json::to_string(&Snooze::new_at(&item,1000,600,now).unwrap()).unwrap()).unwrap();
+    assert!(!loaded.hidden_at(&item,1001,now));
+}
+#[test] fn card_unbound() { insta::assert_snapshot!(snapshot(json!({"digest":null}))); }
+
+#[test]
+fn goal_without_updated_at_never_sends() {
+    let mut item=goal("needs_human"); let mut data=item.data(); data.as_object_mut().unwrap().remove("updated_at");
+    if let InboxItem::Task(t)=&mut item { t.detail=TerminalText::new(data.to_string()); }
+    let now=Instant::now(); let mut card=open(item,&model(),now);
+    assert_eq!(press(&mut card,key('r'),now),Effect::None);
+    assert_eq!(card.hint,Some(strings::CARD_NO_REVISION));
+}
+
+#[test]
+fn redacted_read_only_viewer_also_sees_unbound_notice() {
+    let now=Instant::now();
+    let card=open(approval(json!({"digest":null,"may_decide":false,"payload":{"redacted":true}})),&model(),now);
+    let controls=card.controls(now+Duration::from_secs(1),1000,true).plain();
+    assert!(controls.contains(strings::CARD_UNBOUND));
+    assert!(controls.contains(strings::CARD_READ_ONLY));
 }

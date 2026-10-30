@@ -32,12 +32,9 @@ pub(super) fn blocked(item: &InboxItem, model: &Model) -> Option<TerminalText> {
     }
     None
 }
-pub(super) fn high_risk(data: &Value) -> bool {
-    let payload = &data["payload"];
-    // Unknown classes/tools get full inspection, matching the core fail-closed classifier.
-    let class = data.get("effect_class").or_else(|| payload.get("effect_class"))
-        .or_else(|| payload.get("effect")).and_then(Value::as_str);
-    let tool = payload.get("tool_name").or_else(|| payload.get("tool")).and_then(Value::as_str);
-    let risky_tool = tool.is_some_and(|t| duduclaw_core::effect_of(t) == duduclaw_core::ToolEffect::Admin);
-    risky_tool || !matches!(class, Some("read" | "draft" | "send" | "publish" | "purchase" | "delete" | "modify"))
+pub(super) fn high_risk(_data: &Value) -> bool {
+    // approvals.list produces `kind`, but no trusted safety classification for
+    // any action kind. Neither kind alone nor caller-controlled payload fields
+    // establish low risk. Require full inspection for every approval.
+    true
 }

@@ -58,6 +58,17 @@ impl Card {
         self.bottom_seen = height > 0 && self.scroll >= self.max_scroll;
         if !self.bottom_seen { self.input.clear(); }
     }
+    pub fn invalidate_viewport(&mut self) {
+        self.input.clear();
+        self.message.clear();
+        self.armed = None;
+        self.bottom_seen = false;
+        self.viewport_ready = false;
+    }
+    fn digest(&self) -> Option<String> {
+        self.item.data().get("digest").and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty()).map(str::to_owned)
+    }
     pub fn expired(&self, epoch: i64) -> bool {
         matches!(&self.item, InboxItem::Approval(a) if a.expires_at.is_some_and(|e| epoch >= e))
     }
@@ -112,6 +123,10 @@ impl Card {
         if self.blocked.is_some() { return Effect::None; }
         let decision = match &self.item {
             InboxItem::Approval(a) if self.approval_live(epoch) => {
+                if self.digest().is_none() && key.code != KeyCode::Char('n') {
+                    self.input.clear(); self.hint = Some(strings::CARD_UNBOUND);
+                    return Effect::None;
+                }
                 let approve = match key.code {
                     KeyCode::Char('n') => Some(false),
                     KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -127,7 +142,7 @@ impl Card {
                     _ => { self.input.clear(); None },
                 };
                 approve.map(|approve| Decision::Approval { id: a.id().into(), approve,
-                    digest: self.item.data().get("digest").and_then(serde_json::Value::as_str).map(str::to_owned) })
+                    digest: self.digest() })
             }
             InboxItem::Task(t) => {
                 let action = match key.code {
@@ -143,7 +158,12 @@ impl Card {
                     if action.terminal() && self.armed != Some(action) {
                         self.armed = Some(action); self.hint = Some(strings::CARD_SECOND_PRESS); None
                     } else {
-                        Some(Decision::Goal { task_id: t.id().into(), action, message: self.message.trim().into() })
+                        let data = self.item.data();
+                        let Some(revision) = data.get("updated_at").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()) else {
+                            self.hint = Some(strings::CARD_NO_REVISION);
+                            return Effect::None;
+                        };
+                        Some(Decision::Goal { task_id: t.id().into(), action, message: self.message.trim().into(), expected_updated_at: revision.into() })
                     }
                 } else { self.armed = None; self.hint = None; None }
             }
@@ -159,13 +179,17 @@ impl Card {
             else if now.saturating_duration_since(self.opened) < Duration::from_secs(1) { strings::CARD_WAIT.into() }
             else { match &self.item {
                 InboxItem::Approval(_) if !self.approval_live(epoch) => strings::CARD_NO_DEADLINE.into(),
+                InboxItem::Approval(_) if self.digest().is_none() => strings::CARD_DENY_KEY.into(),
                 InboxItem::Approval(_) if self.high_risk && !self.bottom_seen => strings::CARD_SCROLL.into(),
                 InboxItem::Approval(_) => format!("{} {}  [{}]\n{}", strings::CARD_CODE, self.code, self.input, strings::CARD_APPROVAL_KEYS),
                 InboxItem::Task(_) if self.continuing() => format!("{}\n{}", strings::CARD_CONTINUE_KEYS, TerminalText::new(self.message.clone()).visible()),
                 InboxItem::Task(t) if t.status.is("needs_human") => strings::CARD_GOAL_KEYS.into(),
                 _ => strings::CARD_NOT_PENDING.into(),
             }};
-        TerminalText::new(format!("{controls}\n{}\n{}", self.hint.unwrap_or(""),
+        let unbound = matches!(&self.item, InboxItem::Approval(_)) && self.digest().is_none();
+        let controls = if unbound { format!("{}\n{controls}", strings::CARD_UNBOUND) } else { controls };
+        let hint = self.hint.filter(|hint| !unbound || *hint != strings::CARD_UNBOUND);
+        TerminalText::new(format!("{controls}\n{}\n{}", hint.unwrap_or(""),
             if self.expired(epoch) || matches!(&self.item, InboxItem::Approval(a) if a.expires_at.is_none()) {
                 strings::CARD_NAV_NO_SNOOZE
             } else { strings::CARD_NAV }))

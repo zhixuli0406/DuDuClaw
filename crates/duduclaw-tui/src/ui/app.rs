@@ -139,7 +139,7 @@ pub struct App {
     pub notice: Option<String>,
     pub card: Option<super::card::Card>,
     pub waiting_refresh: Option<u64>,
-    initialized: bool,
+    selected_position: usize,
     codes: super::card::Codes,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -170,13 +170,23 @@ impl App {
                 _ => {}
             }
         }
-        // Establish an initial selection once. Later insertions, removals and
-        // reordering never move it; a removed ID remains a visible tombstone.
-        if !self.initialized && model.inbox.count().is_some() && model.employees.count().is_some() {
-            self.selected = Selection::all(model).into_iter().next();
-            self.initialized = true;
+        // Keep a surviving ID through insertions/reordering. If it disappears,
+        // select the row now at its previous position, or the last row.
+        let all = Selection::all(model);
+        if let Some(index) = self.selected.as_ref().and_then(|id| all.iter().position(|row| row == id)) {
+            self.selected_position = index;
+        } else if match &self.selected {
+            Some(Selection::Inbox(_)) => model.inbox.count().is_some(),
+            Some(Selection::Employee(_)) => model.employees.count().is_some(),
+            Some(Selection::Schedule(_)) => model.schedules.count().is_some(),
+            None => model.inbox.count().is_some() && model.employees.count().is_some(),
+        } {
+            self.selected_position = self.selected_position.min(all.len().saturating_sub(1));
+            self.selected = all.get(self.selected_position).cloned();
+            self.detail_scroll = 0;
         }
     }
+
     pub fn key(&mut self, key: KeyEvent, model: &Model) -> Action {
         self.key_at(key, model, std::time::Instant::now(), crate::snooze::epoch_now())
     }
@@ -281,6 +291,7 @@ impl App {
             Some(i) => i.saturating_sub(1),
             None => 0,
         };
+        self.selected_position = next;
         self.selected = Some(all[next].clone());
         self.detail_scroll = 0;
     }

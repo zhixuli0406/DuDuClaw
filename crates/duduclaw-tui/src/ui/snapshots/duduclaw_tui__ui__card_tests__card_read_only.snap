@@ -6,6 +6,7 @@ expression: "snapshot(json!({\"may_decide\":false,\"reason\":\"此身分只有�
 |{                                                                                     |
 |  "agent_id": "adu",                                                                  |
 |  "decided_in_dashboard_only": false,                                                 |
+|  "digest": "seen",                                                                   |
 |  "effect_class": "modify",                                                           |
 |  "expires_at": 2000,                                                                 |
 |  "id": "a1",                                                                         |
@@ -19,7 +20,6 @@ expression: "snapshot(json!({\"may_decide\":false,\"reason\":\"此身分只有�
 |  "status": "pending",                                                                |
 |  "summary": "確認操作"                                                               |
 |}                                                                                     |
-|                                                                                      |
 |                                                                                      |
 |                                                                                      |
 |                                                                                      |

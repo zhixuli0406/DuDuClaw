@@ -270,12 +270,12 @@ fn selection_survives_refresh_and_removal_without_focus_theft() {
         .items
         .retain(|i| Some(Selection::Inbox(i.key())) != selected);
     a.refresh(&m);
-    assert_eq!(a.selected, selected);
-    assert_eq!(a.detail(&m).plain(), strings::REMOVED);
+    assert_eq!(a.selected, Some(Selection::Inbox("approval:a1".into())));
+    assert_ne!(a.detail(&m).plain(), strings::REMOVED);
     let mut a = App::default();
     a.refresh(&empty());
     a.refresh(&m);
-    assert_eq!(a.selected, None);
+    assert_eq!(a.selected, Selection::all(&m).into_iter().next());
 }
 #[test]
 fn badges_priority_done_receipts_and_identity_not_display_normalization() {
@@ -473,4 +473,23 @@ fn wide_glyph_refresh_preserves_visible_columns() {
             x += expected.cell_width().max(1);
         }
     }
+}
+
+#[test]
+fn focus_specific_footer_snapshots() {
+    let m=populated(); let mut app=App::default(); app.refresh(&m); app.help=true;
+    insta::assert_snapshot!("help_footer",screen(&m,&app,&Settings::default(),100,36));
+    app.help=false;
+    app.card=Some(super::card::Card::open(m.inbox.items[0].clone(),&m,std::time::Instant::now(),&mut super::card::Codes::default()));
+    insta::assert_snapshot!("card_footer",screen(&m,&app,&Settings::default(),100,36));
+}
+#[test]
+fn selected_last_row_falls_back_after_decision_and_empty_list_recovers() {
+    let mut m=empty(); m.inbox.items=vec![approval("a","adu","a","tool","approval"),approval("b","adu","b","tool","approval")];
+    let mut app=App::default(); app.refresh(&m); app.key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE),&m);
+    app.decision_finished(crate::decide::Outcome::Refetch); m.inbox.items.pop(); app.refresh(&m);
+    assert_eq!(app.selected,Some(Selection::Inbox("approval:a".into())));
+    m.inbox.items.clear(); app.refresh(&m); assert!(app.selected.is_none());
+    m.inbox.items.push(approval("c","adu","c","tool","approval")); app.refresh(&m);
+    assert_eq!(app.selected,Some(Selection::Inbox("approval:c".into())));
 }

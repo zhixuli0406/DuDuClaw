@@ -242,6 +242,12 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                             "users.me" => json!({"user":{"id":"u1","role":f.role()},"bindings":[{"agent_name":"adu","access_level":"operator"}]}),
                             "approvals.decide" | "tasks.goal_decide" => {
                                 f.decisions.lock().unwrap().push((method.clone(), params.clone()));
+                                if method == "tasks.goal_decide" && params.get("expected_updated_at").is_some_and(|v| v != "revision") {
+                                    let response = WsFrame::Response { id, ok:false, payload:None,
+                                        error:Some(json!({"message":"goal_decide_revision_mismatch"})) };
+                                    if !send(&mut socket,response).await { return; }
+                                    continue;
+                                }
                                 if f.digest_mismatch.load(Ordering::SeqCst) {
                                     let response = WsFrame::Response { id, ok:false, payload:None,
                                         error:Some(json!({"code":"digest_mismatch","message":"changed\u{1b}]52;bad\u{7}"})) };
@@ -262,7 +268,7 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                             "approvals.list" => {
                                 f.list_calls.fetch_add(1,Ordering::SeqCst);
                                 tokio::time::sleep(Duration::from_millis(f.list_delay_ms.load(Ordering::SeqCst))).await;
-                                json!({"approvals":[{"id":"a1","agent_id":"adu","kind":"tool","summary":"需要審核\u{1b}[2K\u{202e}","status":"pending","request_kind":"question","expires_at":null,"decided_in_dashboard_only":true}],"count":1})
+                                json!({"approvals":[{"id":"a1","digest":"shown-digest","agent_id":"adu","kind":"tool","summary":"需要審核\u{1b}[2K\u{202e}","status":"pending","request_kind":"question","expires_at":null,"decided_in_dashboard_only":true}],"count":1})
                             }
                             "tasks.list_page" => {
                                 f.task_calls.fetch_add(1, Ordering::SeqCst);
@@ -270,7 +276,7 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                 let flood = f.flood.load(Ordering::SeqCst);
                                 if flood == 0 {
                                     assert_eq!(params["agent_id"],"adu","non-admin requires agent scope");
-                                    json!({"tasks":[{"id":"t1","title":"請確認","assigned_to":"adu","status":"needs_human","pause_reason":"unknown","goal_mode":true}],"total":1,"limit":200,"offset":0})
+                                    json!({"tasks":[{"id":"t1","updated_at":"revision","title":"請確認","assigned_to":"adu","status":"needs_human","pause_reason":"unknown","goal_mode":true}],"total":1,"limit":200,"offset":0})
                                 } else {
                                     let agent = params["agent_id"].as_str().expect("agent scope");
                                     let count = if flood == 1 { 100 } else { 1 };
