@@ -250,7 +250,7 @@ The person check only narrows employee permissions. Record mode still trusts the
 
 ## Supporting layers
 
-**Employee budget (unreleased).** `[budget] daily_cap_cents` and `monthly_limit_cents` cap recorded spend over rolling 24-hour and 30-day windows when `hard_stop = true`; 0 means no cap. Calls already running can exceed the cap. Checks include Claude and other employee runtimes, delegated and scheduled work, reminders, mail, heartbeat, utility work and CLI forks/evals. Spend recorded under ephemeral children is included in the parent's budget, summed in millicents before conversion to cents. When the employee configuration can be read, `[budget] when_unavailable = "allow"` (the default when omitted) allows unavailable telemetry or failed cost queries with an explicit warning and audit record; `"deny"` refuses before the model runs. If the configuration cannot be read or parsed, the policy cannot be confirmed and the call is refused. Unknown policy values use `"deny"` and warn. An unavailable check has its own explanation and audit event; it does not announce a reached cap or a breaker transition. Budget refusals do not rotate accounts or trigger failover. Calls with no employee id are outside this policy. Employee-scoped utility calls use the effective `[agent].name` for budget checks and future cost rows, even when an operation label was supplied. Historical rows recorded only under operation labels cannot be assigned back to employees reliably.
+**Employee budget.** `[budget] daily_cap_cents` and `monthly_limit_cents` cap recorded spend over rolling 24-hour and 30-day windows when `hard_stop = true`; 0 means no cap. Calls already running can exceed the cap. Checks include Claude and other employee runtimes, delegated and scheduled work, reminders, mail, heartbeat, utility work and CLI forks/evals. Spend recorded under ephemeral children is included in the parent's budget, summed in millicents before conversion to cents. When the employee configuration can be read, `[budget] when_unavailable = "allow"` (the default when omitted) allows unavailable telemetry or failed cost queries with an explicit warning and audit record; `"deny"` refuses before the model runs. If the configuration cannot be read or parsed, the policy cannot be confirmed and the call is refused. Unknown policy values use `"deny"` and warn. An unavailable check has its own explanation and audit event; it does not announce a reached cap or a breaker transition. Budget refusals do not rotate accounts or trigger failover. Calls with no employee id are outside this policy. Employee-scoped utility calls use the effective `[agent].name` for budget checks and future cost rows, even when an operation label was supplied. Historical rows recorded only under operation labels cannot be assigned back to employees reliably.
 
 **MCP authorization gate** — every MCP tool is enumerated in a scope table; a tool that is not listed defaults to requiring Admin scope. Scope, per-agent capability grants and `denied_tools` are each enforced at the dispatcher front door, and every refusal is audited with an `error_class`.
 
@@ -367,17 +367,17 @@ The [outgoing data guard](69-egress-guard.md) tracks pending private reads and c
 Outgoing approvals bind the full canonical arguments to one use. Purchase and Delete tools cannot be authorized by standing capability or workflow grants, including old stored grants. Other permission and denial gates continue to narrow access.
 
 
-## CLI outgoing checks (unreleased)
+## CLI outgoing checks
 
 Claude/Grok web tools and literal Bash network commands use a gateway-backed approval hook; Codex enforcing modes restrict network access and disable web search at spawn. Background runs register host turn IDs. The Security page lists employees with Bash, ask/block mode and no enabled task sandbox. Bash is only a speed bump and telemetry: native file reads do not mark taint, same-user tampering is outside the boundary, and native preflight has no execution-long MCP lease. Claude bare mode and Grok shared work roots are refused in enforcing modes. Generic CLI native tools remain outside this extension. See [outgoing data guard](69-egress-guard.md) for the mode table, single-use retry flow and limitations.
 
-## Server-bound recipients (unreleased)
+## Server-bound recipients
 
 The separate recipient guard defaults to `shadow`: targets outside the current server-owned source conversation, verified owners and the employee's `[capabilities] recipients` list are audited without blocking. In `ask`, they need a dashboard Admin's single-use approval; if outgoing-data protection also asks, both reasons share one card and one argument-bound ActionGrant. Unknown modes use `ask`; employee overrides can only tighten the global setting. The whole capabilities table is frozen against employee edits, including `recipient_guard` and `recipients`.
 
 Owners come only from `users.db` `AccessLevel::Owner` bindings resolved to verified channel identities. Employee-editable `[proactive]` targets never confer permission. MCP sends an opaque turn ID to a signed gateway route; forged reply-channel environment values do not change the source, and an unknown turn has none. Scheduled notification recipients are checked at creation and at fire time; fires have no source conversation. Scope and tool decisions are documented in [Outgoing data guard](69-egress-guard.md#server-bound-recipients).
 
-## Connection deletion approvals and receipts (unreleased)
+## Connection deletion approvals and receipts
 
 Disconnecting a connection creates a seven-day batch of memory-forgetting plans, with one dashboard-only, Admin-only approval card for the batch. The card shows counts for each AI employee; it does not expose memory content. Disconnecting remains successful even if planning fails. `[memory] forget_source` off, an unreadable configuration or an invalid setting prevents new plans and applies.
 
@@ -398,6 +398,6 @@ Approval binds the sorted identifiers of orphan entity embeddings, not just thei
 Each disconnect record has a unique revision and starts unverified. A connection-state check can validate only the revision it read; a delayed disconnect notification cannot reuse an older check.
 
 
-## Conversation credential audit (unreleased)
+## Conversation credential audit
 
 [Credential audit](70-credential-audit.md) records detected credentials as metadata only. Passwords and connection strings have no fingerprint; high-entropy types use keyed fingerprints only when credential protection is available. Account hints keep only the first character and domain. Registration is capped at 5 findings per message, 50 per sender per hour and 100,000 rows; excess findings produce an aggregated throttling event. Detected values are masked in derived stores in both modes. The default `audit` mode still leaves plaintext in conversation history; `mask` replaces newly detected values before delivery. Bare passwords without context are not detected. Real-value substitution is planned without a release commitment. Admin-only audit RPCs and the doctor check expose audit-chain verification; the Read file guard also blocks the credential ledger directory.

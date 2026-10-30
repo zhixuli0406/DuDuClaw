@@ -40,7 +40,7 @@ Store は存続中に `<home>/egress_leases.lock` の排他ファイルロック
 
 登録履歴はスタッフごとの容量固定 Bloom filter に保持し、同じ gateway プロセスの存続中は消去しません。削除済み・期限切れのターンを再登録してもクリーンには戻りません。ハッシュ衝突や filter の飽和により、そのスタッフの新しいターンを保守的に読み取り済みと判定する場合があります。最大 1,024 スタッフ、各 32 KiB、合計 32 MiB です。上限を超えるスタッフのターンは常に読み取り済みとします。履歴は再起動後には保持されません。
 
-## 観測レポート（未リリース）
+## 観測レポート
 
 管理者はセキュリティページで過去 7 日または 30 日の UTC 日付の観測を確認できます。承認件数は確認が必要になる呼び出しを一度だけ数え、事前確認と送信直前の再確認は同じ呼び出し ID を共有します。拒否の観測は内訳に含めますが、承認件数には加算しません。スタッフ、ツール、固定の非公開情報源クラス、日付、CLI 組み込み／MCP 入口別に表示します。空の結果は保存された記録がないことを示し、安全の証明ではありません。記録の失敗はガードの判定に影響せず、レポートが不完全になる場合があります。
 
@@ -75,7 +75,7 @@ lease の削除は並行する非公開読み取りを防ぐ保護を解除し�
 
 アクションルールによる承認には、一致したツールまたは効果のルールを表示します。読み取り・下書きツールも対象です。Purchase と Delete に常設の機能付与やワークフロー付与を新規作成することはできません。既存の付与は記録を変更せず無視します。ほかの検査と個別承認は引き続き必要です。
 
-## CLI 組み込みツール（未リリース）
+## CLI 組み込みツール
 
 Claude と Grok に `PreToolUse` hook を追加し、`WebFetch`、`WebSearch`、Bash のリテラルなネットワークコマンドを検査します。Grok の別名は `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command` です。DuDuClaw は、Grok の matcher と環境変数の引き継ぎが実 CLI と一致することを保証しません。通常の非ネットワーク Bash は gateway に接続せず許可します。対象は `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp` と `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 引数は最大二段、各 64 KiB まで再解析します。echo/printf のコマンド風データも保守的に対象になる場合があります。
 
@@ -120,7 +120,7 @@ API ツールループへ `[[mcp.external]]` で直接登録したツール（st
 
 リモートブリッジは呼び出しごとの generation wire ID を使用し、期限切れ応答を破棄します。元の ID が再利用されても、古い応答が新しい送信 lease を終了させることはありません。呼び出し側が予約済みの `duduclaw-egress:` ID 名前空間を使うと、明示的に拒否します。
 
-## サーバーが管理する送信先（未リリース）
+## サーバーが管理する送信先
 
 送信先の保護は、個人情報を読んだかどうかとは独立しています。`config.toml [security] recipient_guard` は `off`、`shadow`（既定）、`ask` に対応し、不明な値は警告して `ask` として扱います。従業員の `[capabilities] recipient_guard` は全体設定を厳しくする場合だけ有効です（`off < shadow < ask`）。Security の Outgoing data guard から全体設定を変更し、Admin は従業員の編集画面で追加の送信先を管理します。
 

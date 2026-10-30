@@ -357,7 +357,7 @@ After a successful private MCP read in a turn, the guard checks outgoing calls. 
 
 The Admin-only observation report below this setting lets Admins select 7 or 30 days to see distinct would-be approval tickets, employee/tool/source/date breakdowns and CLI built-in versus MCP counts. Refusal observations do not increase the ticket estimate; no observations or a collection failure is not proof of safety. Lease health is available through `duduclaw doctor`; offline recovery uses `duduclaw egress-leases list` and `clear` with the printed confirmation token after all gateways and outgoing actions have stopped. See the recovery section of the outgoing-data guide.
 
-## Security → Recipient guard (unreleased)
+## Security → Recipient guard
 
 In **Outgoing data guard**, **Recipient guard** controls `config.toml [security] recipient_guard`: Off (`off`), Observe only (`shadow`, default) or Ask before sending (`ask`). Unknown values behave as Ask. Saving uses the locked `system.update_config` writer. This setting applies even if the employee has not read private data.
 
@@ -365,7 +365,7 @@ An Admin edits **Tools & permissions → Allowed recipients** on the employee pa
 
 The gateway adds the current source conversation and verified `users.db` Owner bindings automatically. Proactive notification settings never count as ownership or as an allowlist. Scheduled notifications have no source conversation and are checked again when firing, so add required schedule targets explicitly. Outside recipients are recorded in Observe only; Ask requires a single-use dashboard Admin approval. When outgoing-data protection also asks, one card shows both reasons. See [Server-bound recipients](../features/69-egress-guard.md#server-bound-recipients).
 
-## Security → Data deletion receipts (unreleased)
+## Security → Data deletion receipts
 
 Disconnecting a channel, Google account, database source or Remote MCP automatically prepares a memory-deletion request. A disconnect success and a completed deletion are separate results.
 
@@ -383,7 +383,7 @@ Connection stamps keep their origin and role. Corroboration alone never grants d
 Approval binds the sorted identifiers of orphan entity embeddings, not just their count; swapping one entity for another requires a new approval. Unfinished jobs use a durable attempt count and due time, with 60/120/240/480-second backoff. Due jobs are selected fairly. After five consecutive failures or interrupted attempts, a job is quarantined. The Admin can see a content-free failure reason under **Data deletion receipts** and choose **Retry**; retry retains the existing approval and rechecks scope, requiring a new approval if it grows.
 
 
-## Conversation credentials (unreleased)
+## Conversation credentials
 
 Admin: **System → Security → Credential audit** shows metadata, filters, service edits, false-positive marking and an audited CSV export of the current page. The adjacent inventory lists system-configured credentials read-only. Set `[security] chat_credentials = "audit" | "mask"` through `system.update_config` (`security.chat_credentials`) or the configuration editor. The default is `audit`; unknown values are handled as `mask`. Audit mode leaves the original conversation text intact. Mask mode changes newly detected inbound values, not old history. Both mask detected values in derived stores. See [Credential audit](../features/70-credential-audit.md) for detection limits and registration quotas. Never put real credentials into a service name or note.
 

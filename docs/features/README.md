@@ -74,7 +74,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 67 | [Assigning tasks from a chat](67-assigning-tasks.md) | `/交辦 @employee task` (`/assign`) creates a goal task on the sender's behalf, limited to employees they may assign to; progress back to the chat; `/交辦 狀態`; "Assigned by me" on the Goals page; the dashboard 交辦任務 page (`/assign`: hand over a skill, or the full form; attachments) |
 | 68 | [Read-only team conversations](68-manager-team-history.md) | Enterprise backend (v1.76.0): live reporting-line scope, full-text report WebChat, masked external transcripts, activation boundary, mandatory audit and limits; [繁體中文](zh-TW/68-manager-team-history.md) / [日本語](ja-JP/68-manager-team-history.md) |
 | 69 | [Outgoing data guard](69-egress-guard.md) | v1.77.0: per-turn MCP private-read tracking, outgoing approval and standing-grant limits; [繁體中文](zh-TW/69-egress-guard.md) / [日本語](ja-JP/69-egress-guard.md) |
-| 70 | [Conversation credential audit](70-credential-audit.md) | Unreleased: credential metadata, routing-based holders, masking and Admin review; [繁體中文](zh-TW/70-credential-audit.md) / [日本語](ja-JP/70-credential-audit.md) |
+| 70 | [Conversation credential audit](70-credential-audit.md) | credential metadata, routing-based holders, masking and Admin review; [繁體中文](zh-TW/70-credential-audit.md) / [日本語](ja-JP/70-credential-audit.md) |
 
 ---
 

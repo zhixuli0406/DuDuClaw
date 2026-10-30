@@ -331,7 +331,7 @@
 | 機能 | 説明 |
 |------|------|
 | タスクサンドボックス | エージェント単位で有効化（`agent.toml [container] sandbox_enabled = true`）。委任されたタスクは Docker コンテナ内でエージェントの AI CLI として実行されます。読み取り専用ルートファイルシステム、非 root、全 capability 破棄、メモリ／プロセス／CPU 制限、使い捨ての専用ワークスペース、エージェントのディレクトリを `/agent` に読み取り専用マウント。ファイルツールとシェルツールのみで、プラットフォームの MCP ツールはありません。`network_access = true` とローカルに取得済みのイメージが必要で、Docker のみ対応。使えないときはタスクが失敗し（監査 `task_sandbox_unavailable`）、`config.toml [container.sandbox]` の `when_unavailable = "run_unsandboxed"` で隔離なし実行に戻せます。サンドボックスを有効にした従業員はチームを組まず（goal ラウンドはサンドボックス内で Solo）、メールでも起動されません。チャネル返信、cron、リマインダーなどの会話系の経路はホスト上で実行され、監査イベント `task_sandbox_not_applied` が書かれます。[タスクサンドボックスガイド](../../guides/ja-JP/task-sandbox.md)を参照 |
-| スクリプトサンドボックス | PTC `execute_program` と `duduclaw secaudit` の PoC ステップが使用。`duduclaw-container` 経由で、macOS／Linux は Docker、Windows はまず WSL2、次に Docker（WSL2 は実際の Windows ホストでは未実行）。Apple Container バックエンドは選ばれません。タスクサンドボックスと同じイメージで、自動ダウンロードなし。`--network=none`、読み取り専用ルート、2 GiB／256 プロセス／1 CPU、`/tmp` tmpfs、600 秒の絶対上限、マウントは読み取り専用の専用スクリプトディレクトリのみ。使えないとき PTC は既定で失敗し（`[container.sandbox] script_when_unavailable`）、PoC はホスト上で実行されません（[ガイド](../../guides/ja-JP/task-sandbox.md)） |
+| スクリプトサンドボックス | PTC `execute_program` と `duduclaw secaudit` の PoC ステップが使用。`duduclaw-container` 経由で、macOS／Linux は Docker、Windows はまず WSL2、次に Docker。Apple Container バックエンドは選ばれません。タスクサンドボックスと同じイメージで、自動ダウンロードなし。`--network=none`、読み取り専用ルート、2 GiB／256 プロセス／1 CPU、`/tmp` tmpfs、600 秒の絶対上限、マウントは読み取り専用の専用スクリプトディレクトリのみ。使えないとき PTC は既定で失敗し（`[container.sandbox] script_when_unavailable`）、PoC はホスト上で実行されません（[ガイド](../../guides/ja-JP/task-sandbox.md)） |
 
 ## スケジューリング
 

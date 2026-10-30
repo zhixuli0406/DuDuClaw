@@ -40,7 +40,7 @@ The store holds an exclusive `<home>/egress_leases.lock` file lock for its lifet
 
 Registration history uses a separate bounded Bloom filter per employee and is never cleared during that gateway process, so re-registering an evicted or expired turn cannot make it clean. Hash collisions or a saturated filter can conservatively taint a new turn for that employee. History holds at most 1,024 employees (32 KiB each, 32 MiB total); turns for additional employees are always treated as tainted. History is not persisted across restart.
 
-## Observation report (unreleased)
+## Observation report
 
 The Admin-only Security report compares the last 7 or 30 UTC days. The approval estimate counts distinct calls that would ask; pre-check and dispatch confirmation share a call ID. Refusal observations appear in the breakdowns but are not approval tickets. Breakdowns show employee, tool, closed private-source class, date and CLI built-in versus MCP entry point. An empty result means no recorded observations, not proof of safe sending. Collection failures do not change gate decisions and can leave the report incomplete.
 
@@ -75,7 +75,7 @@ Only a current Admin may decide an outgoing-data approval, including requests wi
 
 Action-rule approvals show the matching tool or effect rule, including for read and draft calls. Purchase and Delete actions cannot receive new standing capability or workflow grants; grants saved before this feature are ignored without changing the stored records. Other gates and explicit approvals still apply.
 
-## CLI built-in tools (unreleased)
+## CLI built-in tools
 
 Claude and Grok receive a `PreToolUse` hook for `WebFetch`, `WebSearch` and literal Bash network commands. Grok aliases include `Fetch`, `Shell`, `web_fetch`, `web_search` and `run_terminal_command`; their actual matcher and environment behavior still need live acceptance. Ordinary non-network Bash returns locally without contacting the gateway. Detection recognizes `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`, and `git push/fetch/clone/pull/ls-remote`. Shell `-c`, `eval` and echo/printf arguments use bounded reparsing (two levels, 64 KiB per payload). Echo/printf command-shaped data can conservatively match even when not executed.
 
@@ -100,7 +100,7 @@ Cron, dispatch, reminder, mail, heartbeat and ephemeral execution entry points n
 
 DuDuClaw does not guarantee that Grok alias matching or environment propagation matches the real CLI. Generic CLI native tools remain outside this guard.
 
-## Server-bound recipients (unreleased)
+## Server-bound recipients
 
 Recipient protection is independent of whether private data was read. Set `config.toml [security] recipient_guard` to `off`, `shadow` (default), or `ask`. An unknown value warns and behaves as `ask`. An employee's `[capabilities] recipient_guard` can only tighten the global setting (`off < shadow < ask`). In the dashboard, use Security → Outgoing data guard → Recipient guard; an Admin edits additional recipients under the employee's Tools & permissions → Allowed recipients.
 

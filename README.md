@@ -58,7 +58,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
-| Tools shared across LLMs | Rewrite per vendor | 247 MCP tools written once, reachable from the Claude, Codex, Grok and OpenAI-compatible runtimes |
+| Tools shared across LLMs | Rewrite per vendor | 253 MCP tools written once, reachable from the Claude, Codex, Grok and OpenAI-compatible runtimes |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 | A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + read-only root, plug in and go; a desktop shared by a person and the AI without getting in each other's way |
 
@@ -78,7 +78,7 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 11 runtime ids (10 CLIs + OpenAI-compat), auto-detected, per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
-  ├─ MCP Server — 247 tools (channels, memory, agents, skills, tasks, wiki, ERP)
+  ├─ MCP Server — 253 tools (channels, memory, agents, skills, tasks, wiki, ERP)
   ├─ Evolution Engine — prediction-driven + AEE playbook rules + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS sandbox + redaction vault
   ├─ Inference Engine — OpenAI-compatible local server (llama-server / Ollama / vLLM) / llamafile
@@ -193,7 +193,7 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Channels | 11 channels (Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards; Telegram voice messages are transcribed through the OpenAI Whisper API. Discord voice channels are a non-default build feature and are not in the release binaries | [docs/features](docs/features/README.md) |
 | Multi-runtime | 11 runtime ids: Claude Code / Codex / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode plus OpenAI-compat; auto-detected, per-agent config, context survives backend switches | [docs/features/13](docs/features/13-multi-runtime.md) |
 | Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP server | 247 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports; an external client key gets a 7-tool baseline unless the operator grants it memory, wiki or messaging scopes, and connector, execution and admin tools are never exposed externally | [docs/api](docs/api/README.md) |
+| MCP server | 253 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports; an external client key gets a 7-tool baseline unless the operator grants it memory, wiki or messaging scopes, and connector, execution and admin tools are never exposed externally | [docs/api](docs/api/README.md) |
 | Memory | SQLite temporal memory (fact supersession chains), HippoRAG-lite knowledge-graph retrieval (Personalized PageRank), Ebbinghaus forgetting-curve archival, cross-agent shared wiki | [docs/features](docs/features/README.md) |
 | Self-evolution | Prediction-driven (by design most conversations end without an LLM call) + AEE playbook evolution: SOUL.md is read-only for agents, learned behavior is small rules that each link an eval case, a rule is committed only if it matches or beats the current playbook and is settled on its own after 24h; MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox (per agent, off by default), container sandboxes (task sandbox: Docker only, off by default; script sandbox: Docker, with WSL2 tried first on Windows), secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
@@ -272,7 +272,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 | Language | Rust | TypeScript | Rust | Python |
 | Channels | 11 | 25+ | 8 | 0 (API) |
 | Multi-runtime | 11 runtime ids (10 CLIs + OpenAI-compat) | single | single | multi-LLM |
-| MCP server | 247 tools | no | no | no |
+| MCP server | 253 tools | no | no | no |
 | Self-evolution engine | AEE playbook rules (prediction-driven) | no | no | no |
 | Local inference | OpenAI-compatible local server / llamafile + confidence routing | no | no | no |
 | Behavioral contracts | CONTRACT.toml + red team | no | WASM sandbox | no |

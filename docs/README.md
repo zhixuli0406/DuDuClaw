@@ -79,8 +79,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/67-assigning-tasks.md](features/67-assigning-tasks.md) | Assigning tasks from a chat — `/交辦 @employee task` (`/assign`, `／交辦`) creates a goal task with `on_behalf_of`, who may assign to whom, the one-message wait after `/交辦 @name`, `/交辦 狀態`, progress back to the chat, "Assigned by me" on the Goals page, scheduled and recurring assignments (`|| 時間:每週一 9:00`, `/交辦 排程`, re-checked at every run), the dashboard 交辦任務 page (`/assign`, `tasks.skill_assign`, attachments), audit events; [繁體中文](features/zh-TW/67-assigning-tasks.md) / [日本語](features/ja-JP/67-assigning-tasks.md) |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/68-manager-team-history.md](features/68-manager-team-history.md) | Read-only team conversations — Enterprise backend API (v1.76.0), live reporting-line checks, masked external conversations, activation window, mandatory audit and limits; [繁體中文](features/zh-TW/68-manager-team-history.md) / [日本語](features/ja-JP/68-manager-team-history.md) |
-| [features/69-egress-guard.md](features/69-egress-guard.md) | Unreleased: per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
-| [features/70-credential-audit.md](features/70-credential-audit.md) | Unreleased: conversation credential metadata and masking; [繁體中文](features/zh-TW/70-credential-audit.md) / [日本語](features/ja-JP/70-credential-audit.md) |
+| [features/69-egress-guard.md](features/69-egress-guard.md) | per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
+| [features/70-credential-audit.md](features/70-credential-audit.md) | conversation credential metadata and masking; [繁體中文](features/zh-TW/70-credential-audit.md) / [日本語](features/ja-JP/70-credential-audit.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---
@@ -203,7 +203,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
 | [guides/per-employee-channels.md](guides/per-employee-channels.md) | 讓 AI 員工有自己的 Telegram Bot 與 Google Chat 應用程式（設定步驟、權限、驗證方式；另有 [zh-TW](guides/zh-TW/per-employee-channels.md)、[ja-JP](guides/ja-JP/per-employee-channels.md)） | Current |
 | [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate from`，預設 dry-run） | Current |
-| [guides/white-label.md](guides/white-label.md) | Distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`); notes that white-label branding was removed in 1.72.2 (also in `zh-TW/` and `ja-JP/`) | Current |
+| [guides/white-label.md](guides/white-label.md) | v1.78.0 distributor branding: automatic name/logo updates, fixed vendor information, compile-time desktop installer assets and read-only integration (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/distributor-notice.md](guides/distributor-notice.md) | Distributor information on the About page — kept by the distributor in the license console, delivered as a signed runtime copy every 6 hours and compiled into the distributor build (`DUDUCLAW_DISTRIBUTOR_NOTICE_PATH`), the HTML allowlist, the sandboxed iframe, how to check `about.get` (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/recording-to-skill.md](guides/recording-to-skill.md) | 錄製 → 技能：瀏覽器/桌面示範錄製、HAR 脫敏、蒸餾成 SKILL.md 草稿＋審批安裝（`[capabilities] recording`） | Current |
 | [guides/feedback-page.md](guides/feedback-page.md) | 問題回報與建議網頁（GitHub Pages 表單 → issue 預填 → Actions + Haiku 自動分類/格式化/上標籤） | Current |

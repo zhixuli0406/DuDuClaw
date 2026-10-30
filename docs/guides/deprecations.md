@@ -1,6 +1,6 @@
 # Deprecations and removals
 
-## Legacy employee memory file (unreleased)
+## Legacy employee memory file
 
 `MEMORY.md` is a legacy employee file. The interactive agent runner and the
 `claude_runner` path still inject it; channel, minimal and task-sandbox prompts

@@ -213,7 +213,7 @@ The card (`knowledge_add_source`) is decided only in the dashboard, only by an A
 
 `knowledge.sources.delete` with `also_forget_memories: true` looks up the conversations whose replies **cited** the source and files one forget-by-source plan per employee and conversation (at most 20 per deletion; the rest are reported as skipped), covering those turns' messages. The plans are filed only after the deletion succeeded. Each plan waits for the existing Admin-only dashboard approval and is applied afterwards with `duduclaw memory forget-source apply`. This is coarse on purpose: it forgets everything those turns taught the employee, not only what came from the document. Passages that were offered but not cited are not included.
 
-## Forgetting after disconnecting a connection (unreleased)
+## Forgetting after disconnecting a connection
 
 Disconnecting a channel, Google account, database source or Remote MCP connection files one batch for Admin approval, covering every affected AI employee. The disconnect finishes first. Its response reports whether the request is waiting for approval, forgetting is disabled, or planning failed. A planning failure does not undo the disconnect and does not mean memories were deleted. The existing document-source deletion plans above still use the CLI apply step; the new connection batches run in the background after approval.
 

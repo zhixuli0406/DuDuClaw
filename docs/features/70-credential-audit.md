@@ -1,6 +1,6 @@
 # Conversation credential audit
 
-Unreleased. **System → Security → Credential audit** lets an Admin inspect a detected credential's type, masked account, service, source, provider, holders, last observed use and status. The ledger and exported CSV contain metadata, never credential values. Detection is deterministic and does not send messages to a model for classification.
+**System → Security → Credential audit** lets an Admin inspect a detected credential's type, masked account, service, source, provider, holders, last observed use and status. The ledger and exported CSV contain metadata, never credential values. Detection is deterministic and does not send messages to a model for classification.
 
 ## Modes and limits
 

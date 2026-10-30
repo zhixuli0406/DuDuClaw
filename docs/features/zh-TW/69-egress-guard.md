@@ -40,7 +40,7 @@ Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0
 
 每位員工有獨立且容量固定的 Bloom filter 記錄回合登記；同一 gateway 程序存續期間不清除，因此被淘汰或到期的回合重新登記也不能變回乾淨。雜湊碰撞或 filter 飽和時，可能保守地將該員工的新回合視為已污染。最多保留 1,024 位員工的歷史，每位 32 KiB、合計 32 MiB；超過此上限的其他員工，其回合一律視為已污染。這份歷史不跨重啟保存。
 
-## 外送觀察報表（未發布）
+## 外送觀察報表
 
 管理員可在安全頁查看最近 7 或 30 個 UTC 日期的觀察紀錄。預估開單數按原本會詢問的呼叫計算，事前檢查與送出前確認共用呼叫 ID，不會重複開算。原本會拒絕的紀錄列入分類，但不算核准單。分類涵蓋員工、工具、固定的私人資料來源類別、日期，以及 CLI 內建工具／MCP 入口。空白表示沒有保存的觀察資料，不代表沒有風險；寫入失敗不改變閘門決策，因此報表可能不完整。
 
@@ -75,7 +75,7 @@ duduclaw egress-leases clear --lease <id> --confirm <該筆-token>
 
 動作規則要求核准時，卡片會列出命中的工具或動作類別規則，讀取與草稿工具也會顯示。購買與刪除不能新增常設能力授權或工作流程授權；舊授權會被忽略，原紀錄保留。其他檢查與逐次核准仍然適用。
 
-## CLI 內建工具（未發布）
+## CLI 內建工具
 
 Claude 與 Grok 安裝 `PreToolUse` hook，涵蓋 `WebFetch`、`WebSearch` 與 Bash 字面網路指令。Grok 別名包含 `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command`；DuDuClaw 不保證 Grok 別名 matcher 與環境變數傳遞符合真實 CLI 行為。一般非網路 Bash 在本機直接放行，不聯絡 gateway。偵測清單為 `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`，以及 `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 參數最多重解析兩層，每段最多 64 KiB；echo/printf 中長得像指令的資料，即使沒有實際執行，也可能被保守列入。
 
