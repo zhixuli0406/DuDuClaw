@@ -52,6 +52,7 @@ pub const DISCONNECTED: &str = "已斷線";
 pub const GATEWAY: &str = "閘道";
 pub const AUTONOMY: &str = "自主狀態";
 pub const LIST_FOCUS: &str = "焦點：清單";
+pub const CONTROL_KEY_FOCUS: &str = "p / n 僅在詳情區塊或清單焦點可用";
 pub const LIST_KEY_HINTS: &str = "j/k 選取  1–4 焦點  v/x 分割  Ctrl-W 關閉  ? 說明";
 pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任；p：員工或排程暫停\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。";
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";

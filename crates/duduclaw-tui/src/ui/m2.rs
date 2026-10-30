@@ -99,6 +99,10 @@ impl App {
     }
     pub(super) fn m2_key(&mut self, c: char, model: &Model, now: Instant) -> Option<Action> {
         let i = self.blocks.focused;
+        if matches!(c, 'p' | 'n') && self.blocks.active != Block::Detail {
+            self.notice = Some(strings::CONTROL_KEY_FOCUS.into());
+            return Some(Action::None);
+        }
         match c {
             'v' | 'x' => {
                 self.blocks.add(if c == 'v' {

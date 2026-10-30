@@ -694,6 +694,22 @@ fn m2_employee_pause_needs_binding_and_manager_role() {
     assert!(matches!(a.control_card.as_ref().unwrap().control,crate::controls::Control::Employee { resume:false, .. }));
 }
 #[test]
+fn pause_and_next_keys_are_ignored_when_non_detail_block_has_focus() {
+    let (mut m, mut a) = m2_task_app();
+    m.role = Some(Role::Admin);
+    a.focus = crate::chat::Focus::List;
+    a.selected = Some(Selection::Employee("adu".into()));
+    for kind in [crate::blocks::Block::Run, crate::blocks::Block::Log] {
+        a.blocks.open(kind, Some("adu".into()));
+        a.focus = crate::chat::Focus::List;
+        for c in ['p', 'n'] {
+            a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &m);
+            assert!(a.control_card.is_none());
+            assert_eq!(a.notice.as_deref(), Some(strings::CONTROL_KEY_FOCUS));
+        }
+    }
+}
+#[test]
 fn m2_steering_edit_does_not_send_before_second_confirmation_and_resize() {
     let (m,mut a)=m2_task_app(); let now=std::time::Instant::now(); let later=now+std::time::Duration::from_secs(2);
     a.key_at(KeyEvent::new(KeyCode::Char('e'),KeyModifiers::NONE),&m,now,0);

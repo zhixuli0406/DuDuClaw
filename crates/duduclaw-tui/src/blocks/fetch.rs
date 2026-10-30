@@ -44,7 +44,10 @@ pub async fn pane(gateway: &impl Gateway, pane: &Pane, manager: bool) -> Result<
             {
                 let id = run["id"].as_str().ok_or(Error::Protocol)?;
                 let detail = gateway.read("runs.get", json!({"run_id":id})).await?;
-                if !detail["run"].is_object() {
+                if !detail["run"].is_object()
+                    || detail["run"]["id"] != id
+                    || detail["run"]["agent_id"] != agent
+                {
                     return Err(Error::Protocol);
                 }
                 data.selected = detail["run"].clone();

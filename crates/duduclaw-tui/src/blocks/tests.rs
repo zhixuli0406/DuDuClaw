@@ -56,6 +56,7 @@ fn layout_focus_close_and_resize_preserve_targets() {
 struct Fake {
     calls: Mutex<Vec<(String, Value)>>,
     subscribe: bool,
+    run_agent: &'static str,
 }
 #[async_trait]
 impl Gateway for Fake {
@@ -71,7 +72,7 @@ impl Gateway for Fake {
                 json!({"runs":[{"id":"dispatch:12","agent_id":"adu","status":"completed","preview":"private-input"}]})
             }
             "runs.get" => {
-                json!({"run":{"id":"dispatch:12","agent_id":"adu","status":"completed","started_at":"2026-10-31T00:00:00Z"},
+                json!({"run":{"id":"dispatch:12","agent_id":self.run_agent,"status":"completed","started_at":"2026-10-31T00:00:00Z"},
                 "events":[{"kind":"text","role":"user","ts":"09:00","preview":"private-input"},{"kind":"tool_step","label":"private-label","ts":"09:01","seq":1,"preview":"private-tool"}]})
             }
             "runs.subscribe" if !self.subscribe => {
@@ -154,6 +155,7 @@ async fn real_shapes_parse_history_tasks_responsibilities_and_subscription_fallb
         let g = Fake {
             calls: Mutex::new(vec![]),
             subscribe,
+            run_agent: "adu",
         };
         let mut p = Pane::new(Block::Run);
         p.agent = Some("adu".into());
@@ -179,10 +181,19 @@ async fn real_shapes_parse_history_tasks_responsibilities_and_subscription_fallb
     }
 }
 #[tokio::test]
+async fn run_detail_must_match_requested_id_and_agent() {
+    let g = Fake { calls: Mutex::new(vec![]), subscribe: true, run_agent: "other" };
+    let mut p = Pane::new(Block::Run);
+    p.agent = Some("adu".into());
+    let result = pane(&g, &p, true).await;
+    assert!(matches!(result, Err(Error::Protocol)));
+}
+#[tokio::test]
 async fn log_subscription_is_role_gated() {
     let g = Fake {
         calls: Mutex::new(vec![]),
         subscribe: true,
+        run_agent: "adu",
     };
     let p = Pane::new(Block::Log);
     assert!(!pane(&g, &p, false).await.unwrap().subscribed);
@@ -194,6 +205,7 @@ async fn fake_gateway_actions_echo_revisions_conflict_and_rejection_refetch_only
     let g = Fake {
         calls: Mutex::new(vec![]),
         subscribe: false,
+        run_agent: "adu",
     };
     let stop = Control::Stop {
         task: "t1".into(),
@@ -311,6 +323,7 @@ async fn remaining_controls_use_real_rpc_shapes_without_retries() {
     let g = Fake {
         calls: Mutex::new(vec![]),
         subscribe: false,
+        run_agent: "adu",
     };
     for control in [
         Control::Employee {

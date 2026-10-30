@@ -30,6 +30,8 @@ Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chi
 
 `F1` / `?` shows help only in the focused block; other blocks stay visible. Long home paths retain their right end with a leading ellipsis. At the minimum supported height (12 rows), inbox and employee panels each retain one content row; the schedule panel may be hidden. Borders remain ASCII in either glyph mode. All navigation works without a mouse. Windows key-release events never execute commands.
 
+The control room offers controls that stop work or move it one step forward. It never grants standing permission or changes global behaviour. `cron run now`, `heartbeat trigger`, and stop are one-way actions and always go through a confirmation card; controls are not necessarily reversible.
+
 After quitting and restoring the terminal, stdout shows the authoritative pending inbox count (including locally snoozed items), running employee names, and a command to return to the same home. Stale counts or employee data show `?`. Names are sanitized and bounded; no inbox, task, chat or tool content is printed. Unix resume commands use Bash/Zsh ANSI-C quoting; Windows commands use PowerShell. Closing the client leaves employees running. Windows crash-dump suppression remains unimplemented; compilation is not native terminal acceptance.
 
 ## Login
