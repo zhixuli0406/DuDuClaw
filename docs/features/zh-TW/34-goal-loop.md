@@ -89,6 +89,12 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 `[goal_loop] tool_streak_pause = 8` 會在一輪結束後，檢查同一工具、同一組遮罩後參數是否連續呼叫至少 8 次；達標就以 `no_progress` 暫停，原因帶有工具名稱與次數。設為 `0` 可獨立關閉這道暫停防護，不影響 `tool_streak_advisory`；未達暫停門檻時，仍保留原本 3／5／8 次的提醒（須啟用 advisory）。不會中途打斷工具呼叫。透過儀表板的設定檔進階編輯器儲存後，目標迴圈會重新載入；直接修改 `config.toml` 則需重新啟動 gateway。
 
+## 目標的單次執行時限
+
+每次 CLI 執行（Codex、Grok、Antigravity、其他 CLI）和每次 OpenAI 相容 API 請求，都受員工的「單次執行時間上限」限制（`agent.toml [runtime] timeout_secs`，預設 300 秒，範圍 30～3600 秒）。比較複雜的目標可以另外給時限，不必改員工設定：「交辦任務 → 複雜任務 → 更多設定 → 單次執行時限（分鐘）」（1～60），或在 `tasks_create`、`kind="goal"` 帶 `timeout_secs`（30～3600）。這個目標的每一輪都用它；開了任務沙箱的員工，沙箱逾時也改用它。Claude 員工維持固定的 30 分鐘上限，不套用。
+
+只有管理員可以設得比員工本身的上限更長，跟在員工編輯頁調高上限的規則一樣。儀表板 Operator、所有 MCP 呼叫者，以及建立者已不是管理員的排程交辦，最多只能用員工本身的上限（排程每次觸發都重新套用）。時限在目標建立時就固定，`tasks_update` 會拒絕修改。目標改派給其他員工時（任何改派方式）會清除時限，新負責人改用自己的上限。任務詳情頁會以標籤顯示。
+
 ## needs_human 升級
 
 任務停在 `needs_human` 時,除了既有的自由文字 `judge_feedback`,同時會蓋上一個六選一的封閉分類 `pause_reason`:`no_progress`／`budget_exhausted`／`blocked_needs_decision`／`infra`／`restart`／`unknown`,在觸發現場靜態標記(絕不從判官/評估器的敘述反解)。`/goals` 看板與任務詳情頁渲染成分類 chip,通道審批訊息多一行「類型」;未分類或既有舊任務一律讀成 `unknown`(安全預設)。`goal_notify.rs` 往來源對話推送一則帶四個動作的審批訊息(**重試 / 標記完成 / 中止 / 交給我**,fallback 到該 agent 的 `[proactive]` 控制通道)。一則訊息主要動作上限 3 個,因此重試/標記完成留在主要層,中止/交給我收進各平台自己的次要層:Telegram、Discord 各是第二排按鈕,Slack 是原生 `overflow` 選單;LINE 沒有對應的次要選單機制,這兩個動作不會出現在 LINE 的快速回覆裡,改以文字說明並附儀表板連結。其他無按鈕通道用文字 fallback,儀表板也有一欄 needs_human 看板。

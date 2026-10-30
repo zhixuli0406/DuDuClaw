@@ -60,6 +60,7 @@ fn task_evidence(row: &crate::task_store::TaskRow) -> Value {
         "depends_on": crate::task_store::parse_depends_on(&row.depends_on),
         "retry_count": row.retry_count, "max_retries": row.max_retries,
         "goal_mode": row.goal_mode, "cost_cap_cents": row.cost_cap_cents,
+        "timeout_secs": row.timeout_secs,
         "acceptance_criteria": row.acceptance_criteria,
         "acceptance_criteria_baseline": row.acceptance_criteria_baseline,
         "result_summary": crate::goal_loop::criteria_ledger::display_result_summary(

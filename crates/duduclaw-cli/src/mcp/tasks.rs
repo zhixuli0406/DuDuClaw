@@ -33,6 +33,7 @@ pub(crate) fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> V
         "max_retries": row.max_retries,
         "goal_mode": row.goal_mode,
         "cost_cap_cents": row.cost_cap_cents,
+        "timeout_secs": row.timeout_secs,
         "acceptance_criteria": row.acceptance_criteria,
         // H9-G goal contract freeze: the immutable snapshot taken at goal
         // creation, when one exists (see `TaskRow::acceptance_criteria_baseline`).
@@ -175,6 +176,16 @@ pub(crate) async fn handle_tasks_create(
     {
         return tool_error("cost_cap_cents is only supported for unscheduled goals");
     }
+    let timeout_secs = match duduclaw_gateway::goal_create_core::parse_timeout_secs(args) {
+        Ok(secs) => secs,
+        Err(e) => return tool_error(&e),
+    };
+    if timeout_secs.is_some()
+        && (kind != crate::mcp_alias::TaskKind::Goal
+            || args.get("schedule").is_some_and(|v| !v.is_null()))
+    {
+        return tool_error("timeout_secs is only supported for unscheduled goals");
+    }
     if let Some(cap) = cost_cap_cents {
         let default_cap = match duduclaw_gateway::goal_loop::GoalLoopConfig::cost_cap_default_from_home(home_dir) {
             Ok(cap) => cap,
@@ -247,6 +258,17 @@ pub(crate) async fn handle_tasks_create(
     }
     if !is_valid_agent_id(default_agent) {
         return tool_error("invalid caller agent id");
+    }
+    // Giving a goal more time than its employee's own `[runtime]
+    // timeout_secs` is an Admin decision made on the dashboard; no MCP
+    // caller (employee or external key) may widen it, only narrow.
+    if let Err(e) = duduclaw_gateway::goal_create_core::check_timeout_widening(
+        home_dir,
+        &assigned_to,
+        timeout_secs,
+        false,
+    ) {
+        return tool_error(&e);
     }
     // Reserved control tags (`outcome:` / `grant:` / `auto-research`) are
     // only ever written by the server itself — `goal_create_core` builds the
@@ -334,6 +356,7 @@ pub(crate) async fn handle_tasks_create(
                 .map(str::to_string),
             duration_hours: args.get("duration_hours").and_then(|v| v.as_f64()),
             cost_cap_cents,
+            timeout_secs,
             risk_boundary: args
                 .get("risk_boundary")
                 .and_then(|v| v.as_str())
@@ -653,6 +676,10 @@ pub(crate) async fn handle_tasks_update(
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if task_id.is_empty() {
         return tool_error("task_id is required");
+    }
+    // A goal's run limit is fixed when it is created.
+    if args.get("timeout_secs").is_some_and(|v| !v.is_null()) {
+        return tool_error("timeout_secs can only be set when a goal is created");
     }
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
@@ -1201,6 +1228,48 @@ mod cost_cap_tests {
         )
         .await;
         assert_eq!(plain["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn tasks_create_timeout_only_narrows_the_assignee_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/bot");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs = 900\n").unwrap();
+        for actor in [RecordActor::Agent("bot"), RecordActor::Operator("bot")] {
+            let wider = handle_tasks_create(
+                &serde_json::json!({"title":"goal","kind":"goal","timeout_secs":901}),
+                home.path(),
+                actor,
+            )
+            .await;
+            assert_eq!(wider["isError"], true, "no MCP caller widens: {wider}");
+        }
+        let out = handle_tasks_create(
+            &serde_json::json!({"title":"goal","kind":"goal","timeout_secs":900}),
+            home.path(),
+            RecordActor::Agent("bot"),
+        )
+        .await;
+        assert_eq!(parsed(&out)["task"]["timeout_secs"], 900, "{out}");
+        for args in [
+            serde_json::json!({"title":"task","timeout_secs":120}),
+            serde_json::json!({"title":"goal","kind":"goal","timeout_secs":120,"schedule":"0 9 * * *"}),
+            serde_json::json!({"title":"goal","kind":"goal","timeout_secs":10}),
+            serde_json::json!({"title":"goal","kind":"goal","timeout_secs":"120"}),
+        ] {
+            let refused = handle_tasks_create(&args, home.path(), RecordActor::Agent("bot")).await;
+            assert_eq!(refused["isError"], true, "{args}");
+        }
+        // Fixed at creation: an update cannot change it.
+        let task_id = parsed(&out)["task"]["id"].as_str().unwrap().to_string();
+        let update = handle_tasks_update(
+            &serde_json::json!({"task_id": task_id, "timeout_secs": 300}),
+            home.path(),
+            RecordActor::Agent("bot"),
+        )
+        .await;
+        assert_eq!(update["isError"], true);
     }
 
     #[tokio::test]

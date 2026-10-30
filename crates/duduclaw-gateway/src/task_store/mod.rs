@@ -23,7 +23,7 @@ pub(crate) const TASK_COLUMNS: &str = "id, title, description, status, priority,
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
      pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json,
      discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision, \
-     on_behalf_of, created_via, cost_cap_cents";
+     on_behalf_of, created_via, cost_cap_cents, timeout_secs";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -252,6 +252,11 @@ pub struct TaskRow {
     /// Optional measured task-tree spend ceiling in cents; None uses the deployment default.
     #[serde(default)]
     pub cost_cap_cents: Option<u64>,
+    /// Optional per-goal run limit in seconds (30–3600) for each CLI run /
+    /// API request of this goal's rounds; None uses the employee's own
+    /// `[runtime] timeout_secs`. Only an Admin may set more than that.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// Optional per-goal risk boundary text the user explicitly typed into
     /// the assign form (≤2000 chars, `duduclaw_core::truncate_chars`).
     /// `None` ⇒ the deployment's baseline boundary
@@ -436,6 +441,7 @@ impl TaskRow {
             source_discord_guild_id: None,
             deadline_at: None,
             cost_cap_cents: None,
+            timeout_secs: None,
             risk_boundary: None,
             acceptance_criteria_baseline: None,
             pause_reason: None,

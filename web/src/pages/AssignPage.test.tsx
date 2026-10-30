@@ -361,6 +361,37 @@ describe('複雜任務 tab', () => {
     expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.goal_create')).toBe(false);
   });
 
+  it('sends the run limit in seconds, only when filled', async () => {
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Sort the feedback');
+    await user.click(screen.getByRole('button', { name: /^More settings/ }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Run limit (minutes)' }), '20');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ timeout_secs: 1200 })));
+  });
+
+  it('leaves the run limit out when empty', async () => {
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Sort the feedback');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call.mock.calls.some(([m]) => m === 'tasks.goal_create')).toBe(true));
+    const params = mockWsClient.call.mock.calls.find(([m]) => m === 'tasks.goal_create')?.[1];
+    expect(params?.timeout_secs).toBeUndefined();
+  });
+
+  it('refuses a run limit outside 1-60 minutes before creating a goal', async () => {
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Sort the feedback');
+    await user.click(screen.getByRole('button', { name: /^More settings/ }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Run limit (minutes)' }), '61');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    expect(toastError).toHaveBeenCalledWith('Enter the run limit as a whole number of minutes from 1 to 60.');
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.goal_create')).toBe(false);
+  });
+
   it('carries the chosen output format into the acceptance criteria (no new backend field)', async () => {
     const user = userEvent.setup();
     openComplex();

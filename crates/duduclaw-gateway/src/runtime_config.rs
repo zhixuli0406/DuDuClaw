@@ -277,6 +277,78 @@ pub fn warn_once_if_deprecated_runtime_for(
 
 /// Default CLI run / OpenAI-compatible request limit, including agent-less calls.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Bounds of `[runtime] timeout_secs` and of a task's own `timeout_secs`.
+pub const MIN_TIMEOUT_SECS: u64 = 30;
+pub const MAX_TIMEOUT_SECS: u64 = 3600;
+
+tokio::task_local! {
+    /// `(agent id, limit)` of the task this call works on
+    /// (`tasks.timeout_secs`), scoped by the dispatcher around a goal round or
+    /// task wake-up for the task's assignee. It applies only to calls made as
+    /// that employee; `None`, no scope, or another employee ⇒ the employee's
+    /// own `[runtime] timeout_secs`. Who may set a value above the employee's
+    /// own limit is decided when the task is created (only an Admin); this
+    /// only applies the stored value.
+    pub static TASK_TIMEOUT_SECS: Option<(String, u64)>;
+}
+
+/// The scoped task limit when this call is made as `agent_id`.
+pub fn scoped_task_timeout_secs(agent_id: &str) -> Option<u64> {
+    TASK_TIMEOUT_SECS
+        .try_with(|scoped| {
+            scoped
+                .as_ref()
+                .filter(|(id, _)| id == agent_id)
+                .map(|(_, secs)| (*secs).clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS))
+        })
+        .ok()
+        .flatten()
+}
+
+/// The limit for this CLI run / OpenAI-compatible request: the current
+/// task's own limit when one is scoped for this employee, otherwise the
+/// employee's. An agent-less call never takes a task's limit.
+pub fn call_timeout_secs(agent_dir: Option<&Path>) -> u64 {
+    let Some(dir) = agent_dir else { return DEFAULT_TIMEOUT_SECS };
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(scoped_task_timeout_secs)
+        .unwrap_or_else(|| agent_timeout_secs(dir))
+}
+
+/// The highest per-task limit a non-Admin (a dashboard Operator, an AI
+/// employee) may set for work assigned to `agent_id`: that employee's own
+/// limit — for an employee with the task sandbox on, the shorter of that and
+/// its container timeout (a task's limit replaces both). An invalid id gives
+/// the default; a sandboxed employee whose container timeout cannot be read
+/// gives the minimum.
+pub fn employee_timeout_ceiling(home_dir: &Path, agent_id: &str) -> u64 {
+    if !duduclaw_core::is_valid_agent_id(agent_id) {
+        return DEFAULT_TIMEOUT_SECS;
+    }
+    let dir = home_dir.join("agents").join(agent_id);
+    let runtime = agent_timeout_secs(&dir);
+    let container = std::fs::read_to_string(dir.join("agent.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Value>().ok())
+        .and_then(|doc| doc.get("container").cloned());
+    let sandboxed = container
+        .as_ref()
+        .and_then(|c| c.get("sandbox_enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    if !sandboxed {
+        return runtime;
+    }
+    let sandbox_secs = container
+        .as_ref()
+        .and_then(|c| c.get("timeout_ms"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(|ms| (ms / 1000).clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS))
+        .unwrap_or(MIN_TIMEOUT_SECS);
+    runtime.min(sandbox_secs)
+}
 
 /// Only an absent or empty stored owner may use the global utility path.
 /// Reject filesystem aliases and require the employee's declared identity.
@@ -317,7 +389,7 @@ fn raw_agent_timeout_secs(agent_dir: &Path) -> Option<i64> {
 pub fn agent_timeout_secs(agent_dir: &Path) -> u64 {
     match raw_agent_timeout_secs(agent_dir) {
         Some(value) => {
-            let clamped = value.clamp(30, 3600);
+            let clamped = value.clamp(MIN_TIMEOUT_SECS as i64, MAX_TIMEOUT_SECS as i64);
             if clamped != value {
                 static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, i64>>> = std::sync::OnceLock::new();
                 let should_warn = WARNED.get_or_init(Default::default).lock()
@@ -1031,6 +1103,55 @@ mod tests {
         write_agent_toml(&dir, "[runtime]\n");
         assert_eq!(agent_timeout_secs(&dir), 300, "clearing must use the fixed default");
         assert!(read_runtime_json(&dir).get("timeout_secs").is_none(), "UI must not expose stale preset limits");
+    }
+
+    #[tokio::test]
+    async fn a_scoped_task_limit_replaces_only_its_own_employee_limit() {
+        let home = TempDir::new().unwrap();
+        let anna = home.path().join("agents/anna");
+        let bob = home.path().join("agents/bob");
+        std::fs::create_dir_all(&anna).unwrap();
+        std::fs::create_dir_all(&bob).unwrap();
+        write_agent_toml(&anna, "[runtime]\ntimeout_secs = 300\n");
+        write_agent_toml(&bob, "[runtime]\ntimeout_secs = 120\n");
+        assert_eq!(call_timeout_secs(Some(&anna)), 300, "no scope: the employee's own");
+        let scope = |secs| Some(("anna".to_string(), secs));
+        let (own, other, agentless) = TASK_TIMEOUT_SECS
+            .scope(scope(1800), async {
+                (call_timeout_secs(Some(&anna)), call_timeout_secs(Some(&bob)), call_timeout_secs(None))
+            })
+            .await;
+        assert_eq!(own, 1800);
+        assert_eq!(other, 120, "another employee inside the scope keeps its own");
+        assert_eq!(agentless, DEFAULT_TIMEOUT_SECS, "an agent-less call never takes it");
+        let none = TASK_TIMEOUT_SECS.scope(None, async { call_timeout_secs(Some(&anna)) }).await;
+        assert_eq!(none, 300, "a task without its own limit keeps the employee's");
+        for (stored, expected) in [(5, 30), (99_999, 3600)] {
+            let got = TASK_TIMEOUT_SECS
+                .scope(scope(stored), async { call_timeout_secs(Some(&anna)) })
+                .await;
+            assert_eq!(got, expected, "{stored} is clamped to the runtime bounds");
+        }
+    }
+
+    #[test]
+    fn the_non_admin_ceiling_is_the_employee_limit() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join("agents/anna");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_toml(&dir, "[runtime]\ntimeout_secs = 900\n");
+        assert_eq!(employee_timeout_ceiling(home.path(), "anna"), 900);
+        assert_eq!(employee_timeout_ceiling(home.path(), "missing"), DEFAULT_TIMEOUT_SECS);
+        assert_eq!(employee_timeout_ceiling(home.path(), "../anna"), DEFAULT_TIMEOUT_SECS);
+        // A sandboxed employee: the shorter of the runtime and container limits.
+        write_agent_toml(&dir, "[runtime]\ntimeout_secs = 900\n[container]\nsandbox_enabled = true\ntimeout_ms = 60000\n");
+        assert_eq!(employee_timeout_ceiling(home.path(), "anna"), 60);
+        write_agent_toml(&dir, "[runtime]\ntimeout_secs = 900\n[container]\nsandbox_enabled = true\ntimeout_ms = 1800000\n");
+        assert_eq!(employee_timeout_ceiling(home.path(), "anna"), 900);
+        write_agent_toml(&dir, "[runtime]\ntimeout_secs = 900\n[container]\nsandbox_enabled = true\n");
+        assert_eq!(employee_timeout_ceiling(home.path(), "anna"), MIN_TIMEOUT_SECS, "unreadable container limit");
+        write_agent_toml(&dir, "[runtime]\ntimeout_secs = 900\n[container]\nsandbox_enabled = false\ntimeout_ms = 60000\n");
+        assert_eq!(employee_timeout_ceiling(home.path(), "anna"), 900, "sandbox off: runtime only");
     }
 
     #[test]

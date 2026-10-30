@@ -114,6 +114,10 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 `tasks_update` 可為目標修改同一欄位。員工只能新增或收緊上限，不能提高或移除生效中的上限；提高上限須由操作者執行。儲存新上限不會自行恢復暫停目標；儀表板的「提高上限並重試」會先儲存，再走既有重試決策。目標與子任務的已量測費用達上限時以 `budget_exhausted` 暫停，費用讀不到時跳過派工。見[目標迴圈](../../features/zh-TW/34-goal-loop.md)。
 
+### `tasks_create` — 目標的單次執行時限
+
+`tasks_create` 搭配 `kind="goal"`（非排程）時接受 `timeout_secs`，30～3600 的整數秒：這個目標每一輪的每次 CLI 執行／API 請求都用它，取代被指派員工的單次執行時間上限。透過 MCP 只能設成小於或等於員工本身的上限；要給目標更多時間，由管理員在儀表板交辦。Claude 員工不套用（固定 30 分鐘）。`tasks_update` 會拒絕這個欄位。例如 `{"kind":"goal","title":"核對帳目","assigned_to":"anna","timeout_secs":180}`。
+
 ### `codrive_run` — 三段式執行階梯
 
 每個步驟依序嘗試三段，能用高的就用高的：

@@ -30,6 +30,7 @@ export {
   GoalRoundBadge,
   GoalDiminishingBadge,
   GoalDeadlineBadge,
+  GoalRunLimitBadge,
 } from './GoalLoopPanel';
 // I-3b: pin/rename/archive — not goal-specific, but currently only consumed
 // by `/goals`.

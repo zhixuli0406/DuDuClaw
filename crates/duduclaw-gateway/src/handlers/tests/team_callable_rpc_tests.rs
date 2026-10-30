@@ -564,3 +564,33 @@ async fn only_an_admin_sets_a_goal_risk_boundary_from_the_dashboard() {
     let ok = f.handler.handle("tasks.goal_create", params("不得寄信給客戶"), &admin).await;
     assert!(matches!(ok, WsFrame::Response { ok: true, .. }), "{ok:?}");
 }
+
+#[tokio::test]
+async fn only_an_admin_gives_a_goal_more_than_the_employee_run_limit() {
+    let f = fixture().await;
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    let params = |secs: u64| json!({ "agent_id": "sales", "description": "核對帳目", "timeout_secs": secs });
+    // `sales` has no `[runtime] timeout_secs`: its own limit is 300 s.
+    let refused = f.handler.handle("tasks.goal_create", params(1800), &mgr).await;
+    assert!(
+        matches!(&refused, WsFrame::Response { ok: false, error: Some(e), .. }
+            if e.to_string().contains("only an admin")),
+        "{refused:?}"
+    );
+    let narrower = ok_payload(&f.handler.handle("tasks.goal_create", params(120), &mgr).await);
+    assert_eq!(narrower["task"]["timeout_secs"], 120, "{narrower}");
+    let admin = jwt_ctx(&f.admin, UserRole::Admin);
+    let wider = ok_payload(&f.handler.handle("tasks.goal_create", params(1800), &admin).await);
+    assert_eq!(wider["task"]["timeout_secs"], 1800, "{wider}");
+    for bad in [json!(10), json!(3601), json!("600"), json!(90.5)] {
+        let frame = f
+            .handler
+            .handle("tasks.goal_create", json!({ "agent_id": "sales", "description": "x", "timeout_secs": bad }), &admin)
+            .await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{bad}");
+    }
+    // Fixed at creation: the dashboard update refuses it.
+    let id = wider["task"]["id"].as_str().unwrap();
+    let update = f.handler.handle("tasks.update", json!({ "task_id": id, "timeout_secs": 600 }), &admin).await;
+    assert!(matches!(update, WsFrame::Response { ok: false, .. }), "{update:?}");
+}

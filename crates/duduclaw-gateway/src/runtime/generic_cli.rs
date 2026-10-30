@@ -648,9 +648,7 @@ impl GenericCliRuntime {
             "generic print-mode runtime: spawning"
         );
 
-        let timeout_secs = context.agent_dir.as_deref()
-            .map(crate::runtime_config::agent_timeout_secs)
-            .unwrap_or(crate::runtime_config::DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         let output = crate::process_group::output(
             &mut cmd, stdin_prompt.then_some(payload.as_bytes()), Duration::from_secs(timeout_secs),
         ).await.map_err(|e| match e {

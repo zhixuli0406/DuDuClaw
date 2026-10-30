@@ -339,6 +339,11 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
+        // A goal's run limit is fixed when it is created (and cleared when the
+        // goal changes hands); say so instead of silently dropping it.
+        if params.get("timeout_secs").is_some_and(|v| !v.is_null()) {
+            return WsFrame::error_response("", "timeout_secs can only be set when a goal is created");
+        }
         // HS4: enforce the caller is bound (Operator) to the task's agent before
         // any mutation. Resolving the agent from the task prevents an Employee
         // bound only to agent A from mutating agent B's tasks.

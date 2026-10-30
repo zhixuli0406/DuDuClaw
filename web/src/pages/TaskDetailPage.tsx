@@ -42,6 +42,7 @@ import {
   GoalRoundBadge,
   GoalDiminishingBadge,
   GoalDeadlineBadge,
+  GoalRunLimitBadge,
   SteeringPanel,
   StopTaskButton,
 } from '@/components/task';
@@ -442,6 +443,7 @@ export function TaskDetailPage() {
             <GoalRoundBadge task={task} />
             <GoalDiminishingBadge task={task} />
             <GoalDeadlineBadge task={task} />
+            <GoalRunLimitBadge task={task} />
             {showLive && <LiveBadge />}
             {assigneeAgent && (
               <span className="ml-1 inline-flex items-center gap-1.5" title={assigneeAgent.display_name}>

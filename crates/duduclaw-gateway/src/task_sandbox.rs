@@ -439,7 +439,11 @@ pub async fn dispatch(
             system_prompt: sandbox_system_prompt(agent),
             prompt: prompt.to_string(),
             network_access: agent.config.container.network_access,
-            timeout: Duration::from_millis(agent.config.container.timeout_ms),
+            // A task's own limit (`tasks.timeout_secs`, scoped by the
+            // dispatcher for this employee) replaces its container timeout.
+            timeout: crate::runtime_config::scoped_task_timeout_secs(&agent.config.agent.name)
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| Duration::from_millis(agent.config.container.timeout_ms)),
             disallowed_tools: agent.config.capabilities.disallowed_tools(),
             explicit_denied_tools: agent.config.capabilities.denied_tools.clone(),
             account_pool: agent.config.model.account_pool.clone(),

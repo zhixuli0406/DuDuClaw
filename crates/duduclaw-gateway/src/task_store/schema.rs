@@ -339,6 +339,13 @@ impl TaskStore {
             // §6, G1, 2026-08-14): per-goal deadline + risk boundary.
             ("deadline_at", "deadline_at TEXT"),
             ("cost_cap_cents", "cost_cap_cents INTEGER CHECK (cost_cap_cents > 0)"),
+            // Per-goal run limit (2026-10-30): replaces the employee's
+            // `[runtime] timeout_secs` for this goal's rounds. Nullable — old
+            // rows read back as "the employee's own limit".
+            (
+                "timeout_secs",
+                "timeout_secs INTEGER CHECK (timeout_secs BETWEEN 30 AND 3600)",
+            ),
             ("risk_boundary", "risk_boundary TEXT"),
             // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D):
             // immutable snapshot of acceptance_criteria at goal-creation time.
@@ -395,6 +402,20 @@ impl TaskStore {
         }
         conn.execute("UPDATE tasks SET kind='goal' WHERE kind='task' AND goal_mode=1", [])
             .map_err(|e| format!("migrate goal kind: {e}"))?;
+        // A goal's run limit was approved for its assignee (only an Admin may
+        // exceed that employee's own limit). Whatever path hands the goal to
+        // someone else — dashboard or MCP update, archive reassignment, a
+        // claim — the limit is dropped, so the new assignee runs under its
+        // own limit and a non-Admin can never carry a wider one across.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS task_timeout_follows_assignee
+             AFTER UPDATE OF assigned_to ON tasks
+             WHEN OLD.assigned_to IS NOT NEW.assigned_to AND NEW.timeout_secs IS NOT NULL
+             BEGIN
+                 UPDATE tasks SET timeout_secs = NULL WHERE id = NEW.id;
+             END;",
+        )
+        .map_err(|e| format!("task timeout trigger: {e}"))?;
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_discovery_run ON tasks(discovery_run_id) WHERE discovery_run_id IS NOT NULL", [])
             .map_err(|e| format!("index discovery run: {e}"))?;
         // Index for the dispatcher's zombie scan (status + lease).

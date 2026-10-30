@@ -506,6 +506,14 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         } else {
             None
         };
+        // A task's own run limit applies to the round / wake-up working on
+        // it, and only for the employee it is assigned to.
+        let task_timeout = match goal_attr.as_ref().or(heartbeat_attr.as_ref()) {
+            Some(attr) => lookup_task_timeout_secs(home_dir, &attr.episode_id, &msg.target).await,
+            None => None,
+        };
+        let dispatch_fut = crate::runtime_config::TASK_TIMEOUT_SECS
+            .scope(task_timeout.map(|secs| (msg.target.clone(), secs)), dispatch_fut);
         // B11: a sub-agent working for an own-bot conversation keeps naming
         // that bot, so its own delegations answer through it too.
         let reply_sender = if msg.reply_channel.as_deref().is_some_and(|rc| !rc.is_empty()) {
@@ -3887,6 +3895,36 @@ async fn lookup_task_revision_round(home_dir: &Path, task_id: &str) -> Option<i6
     .flatten()
 }
 
+/// The task's own run limit (`tasks.timeout_secs`). Any read failure gives
+/// `None`, i.e. the employee's own limit — never a longer one.
+async fn lookup_task_timeout_secs(home_dir: &Path, task_id: &str, agent_id: &str) -> Option<u64> {
+    let db_path = home_dir.join("tasks.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let id = task_id.to_string();
+    let agent = agent_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).ok()?;
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        match conn.query_row(
+            "SELECT timeout_secs FROM tasks WHERE id = ?1 AND assigned_to = ?2",
+            rusqlite::params![id, agent],
+            |row| row.get::<_, Option<i64>>(0),
+        ) {
+            Ok(secs) => secs.and_then(|secs| u64::try_from(secs).ok()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                warn!(task = %id, error = %e, "task run limit unreadable; using the employee's own");
+                None
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Read + parse `config.toml`. Shared by the typing-guard resolvers below.
 async fn read_config_toml(home_dir: &Path) -> Option<toml::Value> {
     let config_str = tokio::fs::read_to_string(home_dir.join("config.toml"))
@@ -5237,6 +5275,34 @@ bot_token = "{token}"
         assert_eq!(goal_evidence_round(Some(0), 2), 1);
         assert_eq!(goal_evidence_round(Some(3), 1), 4);
         assert_eq!(goal_evidence_round(None, 2), 2);
+    }
+
+    /// A task's run limit reaches only the employee it is assigned to; a
+    /// missing column, row or value falls back to the employee's own limit.
+    #[tokio::test]
+    async fn task_run_limit_is_read_only_for_the_assignee() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(lookup_task_timeout_secs(dir.path(), "t", "anna").await, None, "no tasks.db");
+        {
+            let c = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+            c.execute_batch(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, assigned_to TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+        assert_eq!(lookup_task_timeout_secs(dir.path(), "t", "anna").await, None, "no column");
+        {
+            let c = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+            c.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN timeout_secs INTEGER;
+                 INSERT INTO tasks VALUES ('t', 'anna', 1800);
+                 INSERT INTO tasks VALUES ('u', 'anna', NULL);",
+            )
+            .unwrap();
+        }
+        assert_eq!(lookup_task_timeout_secs(dir.path(), "t", "anna").await, Some(1800));
+        assert_eq!(lookup_task_timeout_secs(dir.path(), "t", "bob").await, None, "not the assignee");
+        assert_eq!(lookup_task_timeout_secs(dir.path(), "u", "anna").await, None);
     }
 
     /// FX4: a stall re-dispatch sends marker `iter=2` while the task's

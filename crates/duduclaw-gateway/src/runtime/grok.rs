@@ -667,9 +667,7 @@ impl AgentRuntime for GrokRuntime {
         // gets write access — same rule as `runtime/codex.rs`.
         super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "grok")?;
 
-        let timeout_secs = context.agent_dir.as_deref()
-            .map(crate::runtime_config::agent_timeout_secs)
-            .unwrap_or(crate::runtime_config::DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let output = crate::process_group::output(
             &mut cmd, None, deadline.saturating_duration_since(tokio::time::Instant::now()),
