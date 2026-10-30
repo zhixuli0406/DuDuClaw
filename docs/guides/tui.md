@@ -4,7 +4,7 @@
 
 `duduclaw tui` opens a control room for pending approvals, goals needing a reply, and employee status. Select a row to inspect its details. Where the gateway provides it, administrators also see the next scheduled autonomous run. Closing the control room does not stop employees.
 
-Approval and goal decision cards are available in the full control room. Chat, notifications, employee pause controls, and `tui watch` are deferred. The terminal interface currently uses Traditional Chinese.
+Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee pause controls remain deferred. The terminal interface currently uses Traditional Chinese.
 
 ## Start
 
@@ -15,6 +15,7 @@ duduclaw tui
 duduclaw tui inbox
 duduclaw tui inbox --follow
 duduclaw tui inbox --follow --json
+duduclaw tui watch adu
 ```
 
 The full screen needs a terminal. `inbox` prints one snapshot and exits; `--follow` prints a new complete snapshot when it changes. `--json` produces one JSON object per line on stdout, with `type`, `stale`, `count`, `error`, and `items`. Output itself needs no TTY; if account login is needed, an interactive terminal is required. There is no token flag or credential file for unattended login.
@@ -52,6 +53,24 @@ New items never take selection. Read marks do not dismiss pending requests at th
 
 On disconnect, lost events, or an incomplete refetch, lists show `資料可能過期` (“data may be stale”) and counts become `?`; JSON uses `stale: true` and `count: null`. The last complete list remains visible. A refetch has a shared limit of 2,000 rows and 4 MiB of encoded response content across employees, inbox, recent runs, and schedules. Exceeding either limit stops that refetch and keeps it stale, never publishes a partial list as complete. Responses and events are limited to 256 KiB per WebSocket message/frame, with a 16-event queue. Large installations may need the dashboard.
 
+## Chat and input focus
+
+The status line always identifies the focus. In list focus, `1` selects details and `2` selects the chat block. Select an employee and press `i` to type; `/` starts input with a slash. `Esc` returns to list focus and keeps the draft. While typing, single-letter shortcuts are text. CJK characters, committed IME text, and bracketed paste are supported. `Enter` sends; `Ctrl-C` exits.
+
+A leading `@name ` selects the WebChat `agent` field and is removed from the message. Without it, the employee selected when input opened is the recipient. `/goal`, `/status`, and `/cost` pass unchanged to the gateway. `/pause`, `/stop`, and `/resume` show a Computer Use note: these commands do **not** pause an employee.
+
+The right pane contains details or one chat block; layouts with up to four blocks come in M2. This version permits one in-flight chat turn. Thinking and tool steps collapse to one status line; an ASCII spinner also works with `glyphs = "ascii"`. `PgUp` / `PgDn` in list focus scroll chat history, capped at 2,000 lines of at most 512 characters each. New output never changes focus. Employee output passes through `TerminalText`; the client emits no OSC 8 hyperlinks.
+
+One `/ws/chat` connection shares the `/ws` client's in-memory token refresh and reconnects with backoff. Interrupted messages are not automatically resent; their outcome is uncertain. Completed conversations can resume on reconnect; changing employee starts a new conversation. In list focus, `x` cancels a running reply only after the gateway has sent a frame carrying `msg_id`. Otherwise the block says cancellation is unavailable. `cancel_accepted` only means the request was accepted; the turn ends on `cancelled` or a final response. This requires the additive protocol from PR #264; ordinary chat works with the current gateway.
+
+## Watch one employee
+
+`duduclaw tui watch adu` prints sanitized lines suitable for a narrow split, without an alternate screen. It tries `runs.subscribe { agent_id }`; the current gateway reports an unknown method, so it explicitly announces polling and uses `runs.list` and `runs.get` every five seconds. Recent history is limited to four runs and the last 256 events per run, with bounded duplicate tracking. A supporting gateway also supplies `run.step` events; persisted history still reconciles periodically. `Ctrl-C` exits. The same AI-session refusal and account login rules apply.
+
+## Terminal notifications
+
+Notifications are off by default, including under `SSH_CONNECTION`. Explicit `notifications = true` in `tui.toml` opts in. An increased fresh inbox count while the terminal is unfocused emits OSC 9 with only `DuDuClaw：N 項需要你處理`; employee names, task titles, and tool content never enter it. Focus events are used when available; otherwise the terminal is treated as unfocused. At most one notification is emitted per minute; suppressed rises are not queued. Inside tmux, passthrough is used only if `tmux show-option -gv allow-passthrough` returns `on` or `all`; otherwise notifications are skipped. Actual display depends on the terminal.
+
 ## Decision cards
 
 Select an inbox row and press `Enter` to open its card. New arrivals only update the list and badges; they never open a card or move focus. All key presses during the first second are ignored. `Esc` closes a card; arrows and `PgUp` / `PgDn` scroll it.
@@ -77,6 +96,7 @@ Approval requires a nonempty string `digest`, sent as `expected_digest`. If it i
 # ~/.duduclaw/tui.toml
 glyphs = "ascii"                 # or "unicode"
 ambiguous_width = "narrow"        # or "wide", matching your terminal
+notifications = false
 poll_interval_seconds = 15        # 5..3600
 ```
 

@@ -1,0 +1,7 @@
+---
+source: crates/duduclaw-tui/src/watch.rs
+expression: text
+---
+輪詢模式：閘道未提供即時訂閱，每五秒更新
+09:00 [running] adu]9;evil 你好 世界
+09:01 [tool_step] Read ]8;;https://evilfile

@@ -25,7 +25,7 @@ pub fn draw(
         text(
             frame,
             area,
-            TerminalText::new(strings::TERMINAL_SMALL.into()),
+            TerminalText::new(format!("[{}] {}", app.focus_label(), strings::TERMINAL_SMALL)),
             settings,
             false,
             true,
@@ -106,6 +106,9 @@ pub fn draw(
             Some(Selection::Schedule(_)) => stale_schedules,
             None => false,
         };
+    if app.blocks.active == crate::chat::Block::Chat && !app.help {
+        super::chat_render::draw(frame, columns[1], app, settings);
+    } else {
     let inside = panel(frame, columns[1], strings::DETAIL, settings, detail_stale);
     let detail = app.detail(model);
     frame.render_widget(
@@ -119,13 +122,14 @@ pub fn draw(
         },
         inside,
     );
+    }
     let footer = parts[2];
     text(
         frame,
         Rect::new(footer.x, footer.y, footer.width, 1),
         TerminalText::new(format!(
             "[{}]{}",
-            if app.card.is_some() { strings::CARD_FOCUS } else if app.help { strings::HELP_FOCUS } else { strings::LIST_FOCUS },
+            app.focus_label(),
             if detail_stale {
                 format!(" {}", strings::STALE)
             } else {
@@ -136,6 +140,25 @@ pub fn draw(
         false,
         false,
     );
+    if app.focus == crate::chat::Focus::Input && app.card.is_none() {
+        // Keep the insertion end visible at grapheme boundaries, including CJK.
+        use unicode_segmentation::UnicodeSegmentation;
+        use unicode_width::UnicodeWidthStr;
+        let budget = usize::from(footer.width.saturating_sub(4));
+        let safe = TerminalText::new(app.input.clone()).plain();
+        let mut used = 0;
+        let tail: Vec<_> = safe.graphemes(true).rev().take_while(|g| {
+            used += match settings.ambiguous_width {
+                crate::settings::AmbiguousWidth::Narrow => g.width(),
+                crate::settings::AmbiguousWidth::Wide => g.width_cjk(),
+            };
+            used <= budget
+        }).collect();
+        text(frame, Rect::new(footer.x, footer.y + 1, footer.width, 1),
+            TerminalText::new(format!("> {}_", tail.into_iter().rev().collect::<String>())), settings, false, false);
+        text(frame, Rect::new(footer.x, footer.y + 2, footer.width, 1),
+            TerminalText::new(crate::chat::command_note(&app.input).unwrap_or(strings::INPUT_HINT).into()), settings, false, false);
+    } else {
     text(
         frame,
         Rect::new(footer.x, footer.y + 1, footer.width, 2),
@@ -144,6 +167,7 @@ pub fn draw(
         false,
         true,
     );
+    }
     if let Some(notice) = &app.notice {
         text(
             frame,

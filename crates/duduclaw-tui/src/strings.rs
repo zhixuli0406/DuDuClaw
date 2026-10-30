@@ -52,8 +52,8 @@ pub const DISCONNECTED: &str = "已斷線";
 pub const GATEWAY: &str = "閘道";
 pub const AUTONOMY: &str = "自主狀態";
 pub const LIST_FOCUS: &str = "焦點：清單";
-pub const LIST_KEY_HINTS: &str = "j/k 移動  Enter 開卡  r 已讀  s 稍後  ? 說明  q 離開";
-pub const HELP: &str = "操作說明\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。";
+pub const LIST_KEY_HINTS: &str = "j/k 移動  i 輸入  1/2 區塊  Enter 開卡  ? 說明  q 離開";
+pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1 / 2：詳情 / 對話；x 取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。";
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";
 pub const READ_STATE_NOTICE: &str = "已讀紀錄無法讀取，從空白紀錄開始";
 pub const SAVED: &str = "已標為已讀";
@@ -109,3 +109,32 @@ pub const CARD_NO_REVISION: &str = "缺少任務版本，請重新開卡或到�
 pub const CARD_KEY_HINTS: &str = "↑↓ / PgUp PgDn 捲動  s 稍後  Esc 關卡  Ctrl-C 離開；決策鍵見卡片";
 pub const HELP_KEY_HINTS: &str = "? / F1 關閉說明  Esc 返回清單  q / Ctrl-C 離開";
 pub const HELP_FOCUS: &str = "焦點：說明";
+
+
+pub const INPUT_FOCUS: &str = "焦點：輸入";
+pub const INPUT_HINT: &str = "Enter 傳送  Esc 返回清單";
+pub const INPUT_NEEDS_AGENT: &str = "請選取員工，或輸入 @員工名稱 加上訊息";
+pub const COMPUTER_COMMAND_NOTE: &str = "這是電腦操作指令，不會暫停員工";
+pub const CHAT_TITLE: &str = "對話 [2]";
+pub const CHAT_USER: &str = "你";
+pub const CHAT_ASSISTANT: &str = "員工";
+pub const CHAT_SYSTEM: &str = "系統";
+pub const CHAT_STEP: &str = "工具步驟";
+pub const CHAT_THINKING: &str = "思考中（已收合）";
+pub const CHAT_RESPONDING: &str = "正在回覆";
+pub const CHAT_ERROR: &str = "對話發生錯誤";
+pub const CHAT_TURN_LIMIT: &str = "同時進行的對話已達上限，請稍後再傳送";
+pub const CHAT_CANCEL_UNAVAILABLE: &str = "此閘道尚未確認支援取消，無法取消";
+pub const CHAT_CANCEL_HINT: &str = "x 取消這次回覆";
+pub const CHAT_CANCELLING: &str = "已接受取消，等待停止確認";
+pub const CHAT_CANCELLED: &str = "回覆已取消";
+pub const CHAT_INTERRUPTED: &str = "連線中斷，回覆結果未確認；不會自動重送訊息";
+pub const WATCH_POLLING: &str = "輪詢模式：閘道未提供即時訂閱，每五秒更新";
+pub const WATCH_SUBSCRIBED: &str = "已訂閱員工執行事件";
+pub const WATCH_GAP: &str = "事件可能遺失，正在重新取得執行紀錄";
+pub fn notification(count: usize) -> String { format!("DuDuClaw：{count} 項需要你處理") }
+
+pub const WATCH_HELP: &str = "持續查看一位員工的執行紀錄";
+
+pub const WATCH_TRUNCATED: &str = "較早事件已省略，每次執行僅顯示最近 256 筆";
+pub const CHAT_DONE: &str = "回覆完成";

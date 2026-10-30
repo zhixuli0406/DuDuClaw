@@ -23,6 +23,7 @@ pub struct Settings {
     pub glyphs: Glyphs,
     pub ambiguous_width: AmbiguousWidth,
     pub poll_interval: Duration,
+    pub notifications: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -30,6 +31,7 @@ impl Default for Settings {
             glyphs: Glyphs::Ascii,
             ambiguous_width: AmbiguousWidth::Narrow,
             poll_interval: POLL_INTERVAL,
+            notifications: false,
         }
     }
 }
@@ -60,6 +62,10 @@ impl Settings {
         let mut bad = false;
         for (key, value) in table {
             match key.as_str() {
+                "notifications" => match value.as_bool() {
+                    Some(enabled) => result.notifications = enabled,
+                    None => bad = true,
+                },
                 "glyphs" => match value.as_str() {
                     Some("ascii") => {}
                     Some("unicode") => result.glyphs = Glyphs::Unicode,
@@ -100,6 +106,16 @@ pub fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notifications_require_explicit_boolean_opt_in() {
+        // Default false also covers SSH_CONNECTION; no environment auto-enable.
+        assert!(!Settings::default().notifications);
+        assert!(!Settings::parse("").0.notifications);
+        assert!(Settings::parse("notifications = true").0.notifications);
+        let (settings, notice) = Settings::parse("notifications = 'true'");
+        assert!(!settings.notifications);
+        assert!(notice.is_some());
+    }
     #[test]
     fn oversized_settings_fall_back() {
         let home = tempfile::tempdir().unwrap();

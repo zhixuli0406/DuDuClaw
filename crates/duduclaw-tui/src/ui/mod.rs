@@ -7,8 +7,9 @@ mod card_render;
 mod card_tests;
 mod backend;
 mod panels;
+mod chat_render;
 pub mod render;
-mod terminal;
+pub(crate) mod terminal;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -56,6 +57,11 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         terminal.clear().map_err(|_| Error::Terminal)?;
         let connection = options.client.connection();
         let client = options.client.clone();
+        let chat = client.chat();
+        let chat_state = chat.state();
+        let route = if settings.notifications { crate::notifications::route().await } else { crate::notifications::Route::Skip };
+        let mut notifications = crate::notifications::Notifications::new(settings.notifications, route);
+        let started = std::time::Instant::now();
         let feed = StateFeed::start(options.client, settings.poll_interval);
         let mut decision: Option<futures_util::future::BoxFuture<'_, crate::decide::Outcome>> = None;
         let home_text = TerminalText::new(home.to_string_lossy().into_owned());
@@ -71,6 +77,13 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 return Err(error);
             }
             app.refresh(&model);
+            app.chat = chat_state.borrow().clone();
+            app.spinner = (started.elapsed().as_millis() / 150) as usize;
+            if let Some(sequence) = notifications.update(model.inbox.count(), std::time::Instant::now()) {
+                use std::io::Write;
+                std::io::stdout().write_all(sequence.as_bytes()).map_err(|_| Error::Output)?;
+                std::io::stdout().flush().map_err(|_| Error::Output)?;
+            }
             terminal
                 .draw(|frame| {
                     render::draw(
@@ -91,6 +104,9 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                         // Stop this batch: queued keys must see the newly rendered viewport.
                         break;
                     }
+                    Event::FocusGained => { notifications.focus(true); continue; }
+                    Event::FocusLost => { notifications.focus(false); continue; }
+                    Event::Paste(text) => { app.paste(&text); continue; }
                     Event::Key(key) => key,
                     _ => continue,
                 };
@@ -108,6 +124,11 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                         let client = client.clone();
                         decision = Some(Box::pin(async move { crate::decide::send(&client, &request).await }));
                     }
+                    Action::Chat(input) => match chat.send(input) {
+                        Ok(()) => { app.input.clear(); app.chat_scroll = 0; app.notice = None; app.chat.running = true; }
+                        Err(error) => app.notice = Some(error.to_string()),
+                    },
+                    Action::CancelChat => if let Err(error) = chat.cancel() { app.notice = Some(error.to_string()); },
                     Action::None => {}
                 }
             }

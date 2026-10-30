@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::{Arc, OnceLock}, time::Duration};
 use tokio::{
     net::TcpStream,
     sync::{broadcast, mpsc, oneshot, watch},
@@ -95,6 +95,11 @@ struct Inner {
     status: watch::Receiver<ConnectionState>,
     events: broadcast::Sender<ServerEvent>,
     abort: AbortHandle,
+    chat: OnceLock<crate::chat::ChatClient>,
+    credentials: watch::Receiver<Option<Arc<crate::chat::Credentials>>>,
+    chat_refresh: mpsc::Sender<bool>,
+    target: crate::transport::GatewayUrl,
+    options: ClientOptions,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -117,7 +122,13 @@ impl Client {
         let (tx, rx) = mpsc::channel(64);
         let (status_tx, status_rx) = watch::channel(ConnectionState::Connecting);
         let (events, _) = broadcast::channel(EVENT_QUEUE_CAPACITY);
+        let (credentials_tx, credentials_rx) = watch::channel(None);
+        let (chat_refresh_tx, chat_refresh_rx) = mpsc::channel(1);
+        let target = auth.target().clone();
+        let chat_options = options.clone();
         let actor = Actor {
+            credentials: credentials_tx,
+            chat_refresh: chat_refresh_rx,
             auth,
             session,
             options,
@@ -134,8 +145,16 @@ impl Client {
                 status: status_rx,
                 events,
                 abort: task.abort_handle(),
+                chat: OnceLock::new(), credentials: credentials_rx,
+                chat_refresh: chat_refresh_tx, target, options: chat_options,
             }),
         })
+    }
+    /// Lazily start exactly one chat actor, shared by every cloned handle.
+    pub fn chat(&self) -> crate::chat::ChatClient {
+        self.inner.chat.get_or_init(|| crate::chat::ChatClient::start(
+            self.inner.target.clone(), self.inner.credentials.clone(),
+            self.inner.chat_refresh.clone(), self.inner.options.clone())).clone()
     }
     pub fn connection(&self) -> watch::Receiver<ConnectionState> {
         self.inner.status.clone()
@@ -176,6 +195,8 @@ impl Client {
     }
 }
 struct Actor {
+    credentials: watch::Sender<Option<Arc<crate::chat::Credentials>>>,
+    chat_refresh: mpsc::Receiver<bool>,
     auth: AuthClient,
     session: Session,
     options: ClientOptions,
@@ -208,6 +229,9 @@ impl Actor {
             let end = match opened {
                 Ok(Ok((mut socket, info))) => {
                     self.generation = info.generation;
+                    self.credentials.send_replace(Some(Arc::new(crate::chat::Credentials {
+                        token: Zeroizing::new(self.session.access_token().to_owned()), generation: self.generation,
+                    })));
                     self.status.send_replace(ConnectionState::Connected(info));
                     refresh_attempted = false;
                     let connected_at = Instant::now();
@@ -232,6 +256,7 @@ impl Actor {
                 )) => End::Login(e),
                 _ => End::Reconnect,
             };
+            self.credentials.send_replace(None);
             self.status.send_replace(ConnectionState::Disconnected);
             while let Ok(command) = self.rx.try_recv() {
                 let _ = command.reply.send(Err(Error::Disconnected));
@@ -267,6 +292,7 @@ impl Actor {
         }
     }
     fn login_required(&self, error: Error) {
+        self.credentials.send_replace(None);
         self.status
             .send_replace(ConnectionState::LoginRequired(error));
     }
@@ -309,6 +335,9 @@ impl Actor {
         let end = loop {
             tokio::select! {
                 _ = &mut refresh => break End::Refresh,
+                request = self.chat_refresh.recv() => {
+                    break if request == Some(true) { End::Refresh } else { End::Login(Error::LoginRequired) };
+                }
                 _ = heartbeat.tick() => {
                     if last_received.elapsed() > Duration::from_secs(60) { break End::Reconnect; }
                     if !send(socket, Message::Ping(Vec::new().into()), self.options.request_timeout).await { break End::Reconnect; }
@@ -507,7 +536,7 @@ fn handshake(payload: Value, expected_user: &str, generation: u64) -> Result<Con
         })),
     })
 }
-fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
+pub(crate) fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
     let ceiling = options
         .backoff_base
         .saturating_mul(2u32.saturating_pow(attempt.min(20)))

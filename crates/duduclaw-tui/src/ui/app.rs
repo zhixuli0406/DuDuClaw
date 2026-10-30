@@ -132,6 +132,13 @@ impl Selection {
 #[derive(Default, Clone)]
 pub struct App {
     pub selected: Option<Selection>,
+    pub focus: crate::chat::Focus,
+    pub input: String,
+    pub input_agent: Option<String>,
+    pub blocks: crate::chat::Blocks,
+    pub chat: crate::chat::ChatState,
+    pub chat_scroll: usize,
+    pub spinner: usize,
     pub detail_open: bool,
     pub help: bool,
     pub detail_scroll: usize,
@@ -149,8 +156,16 @@ pub enum Action {
     Save,
     Snooze,
     Decide(crate::decide::Decision),
+    Chat(crate::chat::Submission),
+    CancelChat,
 }
 impl App {
+    pub fn focus_label(&self) -> &'static str {
+        if self.card.is_some() { strings::CARD_FOCUS }
+        else if self.help { strings::HELP_FOCUS }
+        else if self.focus == crate::chat::Focus::Input { strings::INPUT_FOCUS }
+        else { strings::LIST_FOCUS }
+    }
     pub fn decision_finished(&mut self, outcome: crate::decide::Outcome) {
         self.card = None;
         self.notice = Some(outcome.notice());
@@ -209,6 +224,28 @@ impl App {
                 }
             };
         }
+        if self.focus == crate::chat::Focus::Input {
+            if key.kind == KeyEventKind::Release { return Action::None; }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { return Action::Quit; }
+            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) { return Action::None; }
+            match key.code {
+                KeyCode::Esc => self.focus = crate::chat::Focus::List,
+                KeyCode::Char(c) => self.paste(&c.to_string()),
+                KeyCode::Backspace => {
+                    use unicode_segmentation::UnicodeSegmentation;
+                    if let Some((index, _)) = self.input.grapheme_indices(true).next_back() { self.input.truncate(index); }
+                }
+                KeyCode::Enter => {
+                    if self.chat.running || !self.chat.connected {
+                        self.notice = Some(if self.chat.running { crate::Error::Busy } else { crate::Error::Disconnected }.to_string());
+                    } else if let Some(input) = crate::chat::submission(&self.input, self.input_agent.as_deref()) {
+                        return Action::Chat(input);
+                    } else { self.notice = Some(strings::INPUT_NEEDS_AGENT.into()); }
+                }
+                _ => {},
+            }
+            return Action::None;
+        }
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
@@ -222,6 +259,21 @@ impl App {
             return Action::None;
         }
         match key.code {
+            KeyCode::Char('i' | '/') if !self.help => {
+                self.focus = crate::chat::Focus::Input;
+                self.blocks.select(1);
+                self.input_agent = match &self.selected {
+                    Some(Selection::Employee(id)) => Some(id.clone()),
+                    _ => None,
+                };
+                if key.code == KeyCode::Char('/') && self.input.is_empty() { self.input.push('/'); }
+            }
+            KeyCode::Char('1') if !self.help => self.blocks.select(0),
+            KeyCode::Char('2') if !self.help => self.blocks.select(1),
+            KeyCode::Char('x') if !self.help && self.blocks.active == crate::chat::Block::Chat => {
+                if self.chat.can_cancel() { return Action::CancelChat; }
+                self.notice = Some(strings::CHAT_CANCEL_UNAVAILABLE.into());
+            }
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') | KeyCode::F(1) => self.help = !self.help,
             KeyCode::Esc => {
@@ -243,6 +295,8 @@ impl App {
                 self.help = false;
                 self.detail_scroll = 0;
             }
+            KeyCode::PageDown if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_sub(5),
+            KeyCode::PageUp if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_add(5),
             KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
             KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
             KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => self.move_by(model, true),
@@ -276,6 +330,12 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+    pub fn paste(&mut self, text: &str) {
+        if self.focus != crate::chat::Focus::Input || self.card.is_some() { return; }
+        let remaining = crate::chat::MAX_INPUT_CHARS.saturating_sub(self.input.chars().count());
+        self.input.extend(text.chars().filter(|c| !crate::sanitize::forbidden(*c))
+            .map(|c| if c == '\n' { ' ' } else { c }).take(remaining));
     }
     fn move_by(&mut self, model: &Model, down: bool) {
         let all = Selection::all(model);

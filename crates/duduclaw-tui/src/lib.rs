@@ -57,3 +57,8 @@ pub async fn without_tracing<F: std::future::Future>(future: F) -> F::Output {
     use tracing::instrument::WithSubscriber;
     future.with_subscriber(tracing::subscriber::NoSubscriber::default()).await
 }
+
+pub mod chat;
+pub mod notifications;
+pub mod watch;
+pub use watch::{WatchOptions, run_watch};

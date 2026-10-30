@@ -1,6 +1,8 @@
 //! Socket tests deliberately fail on bind refusal unless explicitly opted out.
 #[path = "decisions/mod.rs"]
 mod decisions;
+#[path = "chat/mod.rs"]
+mod chat;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -45,6 +47,11 @@ enum Control {
 struct Fixture {
     events: broadcast::Sender<Control>,
     connections: AtomicUsize,
+    chat_connections: AtomicUsize,
+    chat_active: AtomicUsize,
+    chat_max_active: AtomicUsize,
+    chat_refreshed: AtomicUsize,
+    chat_sent: std::sync::Mutex<Vec<Value>>,
     refreshed_connections: AtomicUsize,
     refreshes: AtomicUsize,
     fail_refresh: AtomicBool,
@@ -89,6 +96,11 @@ impl Gateway {
         let fixture = Arc::new(Fixture {
             events,
             connections: AtomicUsize::new(0),
+            chat_connections: AtomicUsize::new(0),
+            chat_active: AtomicUsize::new(0),
+            chat_max_active: AtomicUsize::new(0),
+            chat_refreshed: AtomicUsize::new(0),
+            chat_sent: std::sync::Mutex::new(Vec::new()),
             refreshed_connections: AtomicUsize::new(0),
             refreshes: AtomicUsize::new(0),
             fail_refresh: AtomicBool::new(false),
@@ -106,6 +118,7 @@ impl Gateway {
             .route("/api/session/local", post(local_session))
             .route("/api/refresh", post(refresh))
             .route("/ws", get(upgrade))
+            .route("/ws/chat", get(chat::upgrade))
             .with_state(fixture.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -284,6 +297,11 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                     json!({"tasks":(0..count).map(|i| json!({"id":format!("{agent}-{i}"), "title":title, "assigned_to":agent,"status":"needs_human"})).collect::<Vec<_>>(),"total":count})
                                 }
                             }
+                            "runs.subscribe" => {
+                                if !send(&mut socket, WsFrame::error_response(&id, "Unknown method: runs.subscribe")).await { return; }
+                                continue;
+                            }
+                            "runs.get" => json!({"run":{"id":"r1","agent_id":"adu"},"events":[{"kind":"text","label":"assistant","ts":"09:00","preview":"done"}]}),
                             "runs.list" => {
                                 assert_eq!(params["agent_id"], "adu");
                                 json!({"runs":[{"id":"r1","agent_id":"adu","status":"completed"}]})

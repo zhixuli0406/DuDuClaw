@@ -493,3 +493,63 @@ fn selected_last_row_falls_back_after_decision_and_empty_list_recovers() {
     m.inbox.items.push(approval("c","adu","c","tool","approval")); app.refresh(&m);
     assert_eq!(app.selected,Some(Selection::Inbox("approval:c".into())));
 }
+
+#[test]
+fn input_focus_ime_paste_and_list_actions() {
+    use crate::chat::{Focus, Block};
+    let model = populated();
+    let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.chat.connected = true;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert_eq!(app.key(key(KeyCode::Char('i')), &model), Action::None);
+    assert_eq!(app.focus, Focus::Input);
+    assert_eq!(app.blocks.active, Block::Chat);
+    for c in "你好qrs12".chars() { assert_eq!(app.key(key(KeyCode::Char(c)), &model), Action::None); }
+    app.paste("注音提交🙂");
+    assert_eq!(app.input, "你好qrs12注音提交🙂");
+    app.key(key(KeyCode::Backspace), &model);
+    assert_eq!(app.input, "你好qrs12注音提交");
+    let Action::Chat(sent) = app.key(key(KeyCode::Enter), &model) else { panic!("expected send"); };
+    assert_eq!(sent.agent, "adu"); assert_eq!(sent.content, app.input);
+    app.key(key(KeyCode::Esc), &model);
+    assert_eq!(app.focus, Focus::List);
+    app.key(key(KeyCode::Char('1')), &model);
+    assert_eq!(app.blocks.active, Block::Detail);
+    app.input.clear();
+    app.key(key(KeyCode::Char('/')), &model);
+    app.paste("pause");
+    assert_eq!(crate::chat::command_note(&app.input), Some(strings::COMPUTER_COMMAND_NOTE));
+    app.refresh(&empty());
+    assert_eq!(app.focus, Focus::Input);
+    assert_eq!(app.input_agent.as_deref(), Some("adu"));
+    app.input = "@worker /goal 完成測試".into();
+    let Action::Chat(sent) = app.key(key(KeyCode::Enter), &model) else { panic!("expected send"); };
+    assert_eq!(sent.agent, "worker"); assert_eq!(sent.content, "/goal 完成測試");
+    app.paste(&"界".repeat(20_000));
+    assert_eq!(app.input.chars().count(), crate::chat::MAX_INPUT_CHARS);
+}
+
+#[test]
+fn chat_block_snapshots() {
+    use crate::chat::{Block, Focus, Frame};
+    let mut app = App::default();
+    app.blocks.active = Block::Chat;
+    app.focus = Focus::Input;
+    app.input = "接著說明".into();
+    app.chat.connected = true; app.chat.stale = false; app.chat.running = true;
+    app.chat.append(strings::CHAT_USER, "請幫我查看進度");
+    app.chat.status = TerminalText::new(strings::CHAT_THINKING.into());
+    let progress = screen(&empty(), &app, &Settings::default(), 100, 24);
+    assert!(progress.contains(strings::INPUT_FOCUS));
+    assert!(!progress.contains(strings::LIST_FOCUS));
+    insta::assert_snapshot!("chat_progress", progress);
+    app.chat.apply(Frame::parse(r#"{"type":"assistant_done","content":"已完成第一輪檢查。\n下一步：確認使用者回覆。","tokens_used":20}"#).unwrap());
+    insta::assert_snapshot!("chat_finished", screen(&empty(), &app, &Settings::default(), 100, 24));
+    app.chat.disconnected();
+    insta::assert_snapshot!("chat_stale", screen(&empty(), &app, &Settings::default(), 100, 24));
+    app.chat.append(strings::CHAT_ASSISTANT, "\x1b]52;c;YQ==\x07\u{202e}惡意\x1b]8;;https://evil\x07連結\x1b]8;;\x07");
+    let output = screen(&empty(), &app, &Settings::default(), 100, 24);
+    assert!(!output.chars().any(crate::sanitize::forbidden));
+    insta::assert_snapshot!("chat_hostile", output);
+}

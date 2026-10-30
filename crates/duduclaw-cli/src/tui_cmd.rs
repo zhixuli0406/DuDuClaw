@@ -1,10 +1,10 @@
 //! Read-only operator control room. The gateway remains the authority.
 use duduclaw_core::error::{DuDuClawError as Error, Result};
 use duduclaw_tui::{
-    ControlRoomOptions, InboxOptions,
+    ControlRoomOptions, InboxOptions, WatchOptions,
     auth::{AuthClient, LoginMethod, LoginMode, LoginPrompt, PromptField, disable_core_dumps},
     client::{Client, ClientOptions},
-    run_control_room, run_inbox,
+    run_control_room, run_inbox, run_watch,
     transport::GatewayUrl,
 };
 use std::path::Path;
@@ -12,6 +12,9 @@ use zeroize::Zeroizing;
 
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum TuiCommands {
+    /// Follow one employee without an alternate screen.
+    #[command(about = duduclaw_tui::strings::WATCH_HELP)]
+    Watch { agent: String },
     /// 列出待處理事項；--follow 持續更新，--json 輸出 JSON Lines
     Inbox {
         #[arg(long)]
@@ -53,7 +56,7 @@ async fn run_with_markers(
         let session = auth.login(mode, &mut prompt).await.map_err(tui_error)?;
         let client =
             Client::start(auth.clone(), session, ClientOptions::default()).map_err(tui_error)?;
-        let result = match command {
+        let result = match &command {
             None => {
                 run_control_room(ControlRoomOptions {
                     client,
@@ -61,12 +64,13 @@ async fn run_with_markers(
                 })
                 .await
             }
+            Some(TuiCommands::Watch { agent }) => run_watch(WatchOptions { client, agent: agent.clone() }).await,
             Some(TuiCommands::Inbox { follow, json }) => {
                 run_inbox(InboxOptions {
                     client,
                     home: Some(home.to_owned()),
-                    follow,
-                    json,
+                    follow: *follow,
+                    json: *json,
                 })
                 .await
             }
@@ -153,6 +157,7 @@ mod tests {
             let markers = crate::ai_session_guard::markers_with(&|key| key == *name);
             for command in [
                 None,
+                Some(TuiCommands::Watch { agent: "adu".into() }),
                 Some(TuiCommands::Inbox {
                     follow: false,
                     json: true,
