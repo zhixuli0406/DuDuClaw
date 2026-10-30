@@ -274,11 +274,11 @@ pub(super) const IDENTITY_ENV_KEYS: [&str; 2] = [crate::ENV_AGENT_ID, crate::ide
 /// settings files; `.cursor/`, whose `mcp.json` Grok loads by itself as a
 /// Cursor-compatibility MCP source, 2026-10-20). Frozen for agent and
 /// untrusted callers; DuDuClaw writes them itself, outside the hook.
-pub(super) const AGENT_RUNTIME_CONFIG_DIRS: [&str; 6] =
+pub(crate) const AGENT_RUNTIME_CONFIG_DIRS: [&str; 6] =
     [".claude", ".codex", ".gemini", ".grok", ".agents", ".cursor"];
 
 /// Top-level files of an employee directory frozen the same way.
-pub(super) const AGENT_RUNTIME_CONFIG_FILES: [&str; 1] = [".claude.json"];
+pub(crate) const AGENT_RUNTIME_CONFIG_FILES: [&str; 1] = [".claude.json"];
 
 /// Hook-configuration basenames under an agent's `.claude/` directory.
 pub(super) const HOOK_SETTINGS_FILES: [&str; 2] = ["settings.json", "settings.local.json"];

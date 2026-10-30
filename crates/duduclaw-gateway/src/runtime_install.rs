@@ -149,16 +149,22 @@ fn in_flight() -> &'static Mutex<HashSet<&'static str>> {
     IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn try_claim(provider: &'static str) -> bool {
-    in_flight()
-        .lock()
-        .map(|mut s| s.insert(provider))
-        .unwrap_or(false)
+struct InstallClaim {
+    provider: &'static str,
 }
 
-fn release(provider: &'static str) {
-    if let Ok(mut s) = in_flight().lock() {
-        s.remove(provider);
+impl InstallClaim {
+    fn try_claim(provider: &'static str) -> Option<Self> {
+        let claimed = in_flight().lock().map(|mut s| s.insert(provider)).unwrap_or(false);
+        claimed.then(|| Self { provider })
+    }
+}
+
+impl Drop for InstallClaim {
+    fn drop(&mut self) {
+        if let Ok(mut s) = in_flight().lock() {
+            s.remove(self.provider);
+        }
     }
 }
 
@@ -263,7 +269,7 @@ fn emit(tx: &Option<tokio::sync::broadcast::Sender<String>>, event: &str, payloa
 /// single `killpg` takes the whole tree.
 ///
 /// Awaiting the reap here is load-bearing: the caller releases the per-provider
-/// in-flight guard immediately afterwards.
+/// in-flight guard only after post-install verification.
 async fn terminate_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -389,13 +395,13 @@ pub async fn start_install(
         }
     };
 
-    if !try_claim(spec.id) {
+    let Some(claim) = InstallClaim::try_claim(spec.id) else {
         return StartOutcome::Declined {
             reason: "already_running",
             command,
             prerequisite: None,
         };
-    }
+    };
 
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
@@ -416,7 +422,6 @@ pub async fn start_install(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            release(spec.id);
             tracing::warn!(target: "runtime_install", provider = spec.id, error = %e, "spawn failed");
             return StartOutcome::Declined {
                 reason: "spawn_failed",
@@ -443,6 +448,7 @@ pub async fn start_install(
     let sid = session_id.clone();
     let cmd_display = command.clone();
     tokio::spawn(async move {
+        let claim = claim;
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         let stdout = child.stdout.take();
@@ -538,7 +544,7 @@ pub async fn start_install(
         }
         let update_required = crate::runtime::codex::required_update(spec.id, detected, version.as_deref());
         let (final_status, reason) = terminal_outcome(status, detected, update_required, version.as_deref());
-        release(spec.id);
+        drop(claim);
 
         audit(
             &home_dir,
@@ -935,11 +941,23 @@ mod tests {
     fn in_flight_guard_admits_one_claim_at_a_time() {
         // Uses a provider no other test claims, so the global guard is safe here.
         let p = "codex";
-        assert!(try_claim(p), "first claim");
-        assert!(!try_claim(p), "second concurrent claim must be refused");
-        release(p);
-        assert!(try_claim(p), "claim again after release");
-        release(p);
+        let claim = InstallClaim::try_claim(p).expect("first claim");
+        assert!(InstallClaim::try_claim(p).is_none(), "second concurrent claim must be refused");
+        assert!(InstallClaim::try_claim(p).is_none(), "a refused claim must not release the owner");
+        drop(claim);
+        let claim = InstallClaim::try_claim(p).expect("claim again after drop");
+        drop(claim);
+    }
+
+    #[test]
+    fn in_flight_claim_is_released_on_panic() {
+        let provider = "panic-claim-test";
+        let result = std::panic::catch_unwind(|| {
+            let _claim = InstallClaim::try_claim(provider).expect("initial claim");
+            panic!("installer panicked");
+        });
+        assert!(result.is_err());
+        let _claim = InstallClaim::try_claim(provider).expect("claim after unwind");
     }
 
     #[test]

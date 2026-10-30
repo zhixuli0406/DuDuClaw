@@ -127,10 +127,7 @@ const EMPLOYEE_PERMISSION_PROFILE: &str = "duduclaw-employee";
 
 /// Absolute exclusions keep protecting the employee when the spawn cwd is overridden.
 #[cfg(unix)]
-fn employee_permission_args(agent_dir: &std::path::Path) -> Result<Vec<String>, String> {
-    if !agent_dir.is_absolute() {
-        return Err("Codex employee permissions require an absolute agent directory — refusing to spawn".into());
-    }
+fn employee_permission_args(agent_dir: &std::path::Path, work_root: Option<&std::path::Path>) -> Result<Vec<String>, String> {
     let mut entries = vec![
         format!("{}={}", toml_string_literal(":root"), toml_string_literal("read")),
         format!("{}={}", toml_string_literal(":tmpdir"), toml_string_literal("write")),
@@ -138,12 +135,20 @@ fn employee_permission_args(agent_dir: &std::path::Path) -> Result<Vec<String>, 
         format!("{}={{{}={}}}", toml_string_literal(":project_roots"),
             toml_string_literal("."), toml_string_literal("write")),
     ];
-    for path in duduclaw_core::agent_guard::EMPLOYEE_CONTROL_PATHS {
-        let absolute = agent_dir.join(path);
-        let Some(absolute) = absolute.to_str() else {
-            return Err("Codex employee permissions require a UTF-8 agent directory — refusing to spawn".into());
-        };
-        entries.push(format!("{}={}", toml_string_literal(absolute), toml_string_literal("read")));
+    let mut protected = std::collections::HashSet::new();
+    for dir in std::iter::once(agent_dir).chain(work_root) {
+        if !dir.is_absolute() {
+            return Err("Codex employee permissions require absolute agent and working directories — refusing to spawn".into());
+        }
+        if dir.to_str().is_none() {
+            return Err("Codex employee permissions require UTF-8 agent and working directories — refusing to spawn".into());
+        }
+        for path in duduclaw_core::agent_guard::employee_control_paths() {
+            let absolute = dir.join(path);
+            if protected.insert(absolute.clone()) {
+                entries.push(format!("{}={}", toml_string_literal(absolute.to_str().unwrap()), toml_string_literal("read")));
+            }
+        }
     }
     let profile = EMPLOYEE_PERMISSION_PROFILE;
     Ok(vec![
@@ -157,6 +162,7 @@ fn employee_sandbox_args(
     caps: Option<&CapabilitiesConfig>,
     explore: bool,
     agent_dir: Option<&std::path::Path>,
+    work_root: Option<&std::path::Path>,
     supports_permissions: bool,
 ) -> Result<Vec<String>, String> {
     let mut args = sandbox_args_for(caps, explore);
@@ -167,7 +173,7 @@ fn employee_sandbox_args(
         if !supports_permissions {
             return Err("Codex 員工控制檔保護需要 Codex CLI 0.164.0 以上；版本過舊或無法確認。請到儀表板首頁按「更新 Codex CLI」，或在終端機執行 `npm install -g @openai/codex@latest`。".into());
         }
-        args.extend(employee_permission_args(dir)?);
+        args.extend(employee_permission_args(dir, work_root)?);
     }
     Ok(args)
 }
@@ -1401,6 +1407,21 @@ impl AgentRuntime for CodexRuntime {
             }
         }
 
+        // Working root. Normally the agent's own directory; a caller may
+        // override it via `super::SPAWN_OVERRIDE` (today: the team composer,
+        // putting a role member in the employee's workspace so its files
+        // outlive the throwaway scaffold — design §4.3 E3). Identity is NOT
+        // affected: the `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID`
+        // override carries the member id independently of cwd.
+        //
+        // Resolved ONCE (it used to be read twice, so a `work_dir` that failed
+        // validation could still have flipped `cwd_overridden`), through the
+        // shared [`super::resolve_spawn_work_dir`] which validates the override
+        // is a real directory and otherwise warns and falls back.
+        let work_root: Option<std::path::PathBuf> =
+            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
+        let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
+
         let mut cmd = tokio::process::Command::new(&self.codex_path);
         cmd.arg("exec").arg("--json");
         // Agent directories are not git repositories. Codex 0.156.x refuses to
@@ -1415,7 +1436,7 @@ impl AgentRuntime for CodexRuntime {
                 && sandbox_level_for(caps) == duduclaw_core::types::SandboxLevel::WorkspaceWrite;
             let supports_permissions = needs_permissions
                 && codex_supports_employee_permissions(&self.codex_path).await;
-            let args = employee_sandbox_args(caps, explore, context.agent_dir.as_deref(), supports_permissions)
+            let args = employee_sandbox_args(caps, explore, context.agent_dir.as_deref(), work_root.as_deref(), supports_permissions)
                 .map_err(|error| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&error))?;
             cmd.args(args);
         }
@@ -1491,21 +1512,6 @@ impl AgentRuntime for CodexRuntime {
         let mut source_pairs = crate::memory_provenance::turn_source_env_pairs();
         source_pairs.extend(crate::explore_lane::lane_env());
         cmd.args(turn_source_override_args(&source_pairs));
-
-        // Working root. Normally the agent's own directory; a caller may
-        // override it via `super::SPAWN_OVERRIDE` (today: the team composer,
-        // putting a role member in the employee's workspace so its files
-        // outlive the throwaway scaffold — design §4.3 E3). Identity is NOT
-        // affected: the `-c mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID`
-        // override above already carries the member id independently of cwd.
-        //
-        // Resolved ONCE (it used to be read twice, so a `work_dir` that failed
-        // validation could still have flipped `cwd_overridden`), through the
-        // shared [`super::resolve_spawn_work_dir`] which validates the override
-        // is a real directory and otherwise warns and falls back.
-        let work_root: Option<std::path::PathBuf> =
-            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
-        let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
 
         // Pass system prompt via AGENTS.md in the working root.
         // Codex exec has no --instructions/--system-prompt flag (verified on
@@ -3256,9 +3262,9 @@ mod tests {
     #[test]
     fn employee_permissions_lock_every_control_path_with_valid_toml() {
         let dir = std::path::Path::new("/agents/space and \"quote員工");
-        let args = employee_sandbox_args(None, false, Some(dir), true).unwrap();
+        let args = employee_sandbox_args(None, false, Some(dir), Some(dir), true).unwrap();
         let mut expected = sandbox_args(None);
-        expected.extend(employee_permission_args(dir).unwrap());
+        expected.extend(employee_permission_args(dir, Some(dir)).unwrap());
         assert_eq!(args, expected);
         assert_eq!(args.len(), sandbox_args(None).len() + 4);
         let overrides = &args[sandbox_args(None).len()..];
@@ -3277,13 +3283,38 @@ mod tests {
         assert_eq!(fs[":tmpdir"].as_str(), Some("write"));
         assert_eq!(fs["/tmp"].as_str(), Some("write"));
         assert_eq!(fs[":project_roots"]["."].as_str(), Some("write"));
-        assert_eq!(fs.len(), 4 + duduclaw_core::agent_guard::EMPLOYEE_CONTROL_PATHS.len());
-        for path in duduclaw_core::agent_guard::EMPLOYEE_CONTROL_PATHS {
+        assert_eq!(fs.len(), 4 + duduclaw_core::agent_guard::employee_control_paths().count());
+        for path in duduclaw_core::agent_guard::employee_control_paths() {
             assert_eq!(fs[dir.join(path).to_str().unwrap()].as_str(), Some("read"));
         }
-        for writable in ["MEMORY.md", "CLAUDE.md", "note.txt"] {
+        for writable in ["MEMORY.md", "CLAUDE.md", "AGENTS.md", "wiki/page.md", "note.txt"] {
             assert!(!fs.contains_key(dir.join(writable).to_str().unwrap()));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn employee_permissions_protect_the_member_and_parent_work_root() {
+        let agent = std::path::Path::new("/agents/member");
+        let root = std::path::Path::new("/agents/parent");
+        let args = employee_sandbox_args(None, false, Some(agent), Some(root), true).unwrap();
+        let (_, value) = args.last().unwrap().split_once('=').unwrap();
+        let parsed: toml::Value = format!("value={value}").parse().unwrap();
+        let fs = parsed["value"].as_table().unwrap();
+        assert_eq!(fs.len(), 4 + 2 * duduclaw_core::agent_guard::employee_control_paths().count());
+        for dir in [agent, root] {
+            for path in duduclaw_core::agent_guard::employee_control_paths() {
+                assert_eq!(fs[dir.join(path).to_str().unwrap()].as_str(), Some("read"));
+            }
+            for writable in ["MEMORY.md", "CLAUDE.md", "AGENTS.md", "wiki/page.md"] {
+                assert!(!fs.contains_key(dir.join(writable).to_str().unwrap()));
+            }
+        }
+        assert!(employee_sandbox_args(None, false, Some(agent), Some(std::path::Path::new("relative/root")), true).is_err());
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/agents/\xff"));
+        assert!(employee_permission_args(agent, Some(invalid)).is_err());
+        assert!(employee_permission_args(invalid, Some(root)).is_err());
     }
 
     #[cfg(unix)]
@@ -3295,10 +3326,10 @@ mod tests {
         let full_access = CapabilitiesConfig { computer_use: true, ..Default::default() };
         assert_eq!(sandbox_level_for(Some(&read_only)), duduclaw_core::types::SandboxLevel::ReadOnly);
         for caps in [Some(&read_only), Some(&full_access)] {
-            assert_eq!(employee_sandbox_args(caps, false, None, false).unwrap(), sandbox_args(caps));
+            assert_eq!(employee_sandbox_args(caps, false, None, None, false).unwrap(), sandbox_args(caps));
         }
         for caps in [None, Some(&read_only), Some(&full_access)] {
-            assert_eq!(employee_sandbox_args(caps, true, None, false).unwrap(), sandbox_args_for(caps, true));
+            assert_eq!(employee_sandbox_args(caps, true, None, None, false).unwrap(), sandbox_args_for(caps, true));
         }
     }
 
@@ -3310,17 +3341,17 @@ mod tests {
             ("unparseable", false)] {
             let supported = version_supports_employee_permissions(version);
             assert_eq!(supported, accepted);
-            let result = employee_sandbox_args(None, false, Some(std::path::Path::new("/private/agent")), supported);
+            let result = employee_sandbox_args(None, false, Some(std::path::Path::new("/private/agent")), None, supported);
             assert_eq!(result.is_ok(), accepted);
             if let Err(error) = result {
                 assert!(error.contains("Codex CLI 0.164.0"));
                 assert!(!error.contains("/private/agent"));
             }
         }
-        let error = employee_sandbox_args(None, false, None, true).unwrap_err();
+        let error = employee_sandbox_args(None, false, None, None, true).unwrap_err();
         assert!(error.contains("no agent directory"));
         assert!(error.contains("refusing to spawn"));
-        assert!(employee_permission_args(std::path::Path::new("relative/agent")).is_err());
+        assert!(employee_permission_args(std::path::Path::new("relative/agent"), None).is_err());
     }
 
     #[cfg(unix)]
