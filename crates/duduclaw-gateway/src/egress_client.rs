@@ -93,10 +93,10 @@ fn resolve_turn_id(
     primary: Option<std::ffi::OsString>,
     alias: Option<std::ffi::OsString>,
 ) -> Option<String> {
-    // A present malformed primary remains a refusal; the alias is only for
-    // runtimes that do not declare the original variable at all.
-    primary
-        .or(alias)?
+    // The host's execution identity is independent of inherited provenance.
+    // A malformed execution identity must not fall back to provenance.
+    alias
+        .or(primary)?
         .into_string()
         .ok()
         .filter(|turn| crate::computer_use_sessions::turns::valid_turn_id(turn))
@@ -497,24 +497,26 @@ mod tests {
     }
 
     #[test]
-    fn turn_alias_only_fills_an_absent_primary() {
+    fn execution_turn_overrides_provenance_without_malformed_fallback() {
         assert_eq!(
             resolve_turn_id(None, Some("turn-alias".into())),
             Some("turn-alias".into())
         );
         assert_eq!(
             resolve_turn_id(Some("turn-primary".into()), Some("turn-alias".into())),
-            Some("turn-primary".into())
+            Some("turn-alias".into())
         );
         assert_eq!(
             resolve_turn_id(Some("".into()), Some("turn-alias".into())),
-            None
+            Some("turn-alias".into())
         );
         assert_eq!(
             resolve_turn_id(Some("bad\nturn".into()), Some("turn-alias".into())),
-            None
+            Some("turn-alias".into())
         );
         assert_eq!(resolve_turn_id(None, Some("".into())), None);
+        assert_eq!(resolve_turn_id(Some("valid-provenance".into()), Some("".into())), None);
+        assert_eq!(resolve_turn_id(Some("valid-provenance".into()), Some("bad\nexecution".into())), None);
     }
 
     #[test]

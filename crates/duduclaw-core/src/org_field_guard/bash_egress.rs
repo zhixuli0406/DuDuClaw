@@ -13,6 +13,9 @@ const MAX_REPARSE_DEPTH: usize = 2;
 const MAX_REPARSE_BYTES: usize = 64 * 1024;
 
 fn network_verb(cmd: &str, args: &[String]) -> bool {
+    if matches!(cmd, "busybox" | "toybox") {
+        return args.first().is_some_and(|applet| NETWORK_COMMANDS.contains(&applet.as_str()));
+    }
     if NETWORK_COMMANDS.contains(&cmd) { return true; }
     if cmd != "git" { return false; }
     let mut args = args.iter();
@@ -21,7 +24,9 @@ fn network_verb(cmd: &str, args: &[String]) -> bool {
             args.next();
         } else if arg == "--" || !arg.starts_with('-') {
             let verb = if arg == "--" { args.next().map(String::as_str) } else { Some(arg.as_str()) };
-            return verb.is_some_and(|verb| GIT_NETWORK_COMMANDS.contains(&verb));
+            return verb.is_some_and(|verb| GIT_NETWORK_COMMANDS.contains(&verb)
+                || (verb == "remote" && args.find(|arg| !arg.starts_with('-'))
+                    .is_some_and(|arg| matches!(arg.as_str(), "update" | "prune"))));
         }
     }
     false
@@ -112,6 +117,18 @@ mod tests {
         for command in ["git status", "git log", "git remote -v", "git show HEAD:curl", "printf hello", "rg curl file", "grep curl file", "cat curl", "ls wget", "wc ssh"] {
             assert!(!bash_egress_command(command), "{command}");
         }
+    }
+
+    #[test]
+    fn egress_multicall_applets_and_remote_maintenance() {
+        for command in ["busybox wget https://example.test", "toybox wget https://example.test", "git remote update", "git remote prune origin"] {
+            assert!(bash_egress_command(command), "{command}");
+        }
+        for command in ["git remote -v", "git remote rename origin update", "git remote add prune https://example.test"] {
+            assert!(!bash_egress_command(command), "{command}");
+        }
+        assert!(!bash_egress_command("busybox echo wget"));
+        assert!(!bash_egress_command("toybox ls wget"));
     }
 
     #[test]

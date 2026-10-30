@@ -323,6 +323,10 @@ pub(super) async fn spawn_claude_cli_with_env(
     {
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
+    cmd.env_remove(duduclaw_core::egress_guard::ENV_TURN_ALIAS);
+    if let Some(turn) = crate::runtime_turn::current() {
+        cmd.env(duduclaw_core::egress_guard::ENV_TURN_ALIAS, turn);
+    }
     crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
     // The person this turn is for (never an inherited gateway value).
     crate::on_behalf_of::inject_env(&mut cmd);
