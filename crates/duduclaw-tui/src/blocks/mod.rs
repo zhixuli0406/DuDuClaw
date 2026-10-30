@@ -6,6 +6,14 @@ use crate::{Error, Result, sanitize::TerminalText, strings};
 use ratatui::layout::Rect;
 use serde_json::Value;
 
+/// Confirms a runs.list row and runs.get response refer to the same watched run.
+pub(crate) fn run_matches(list_row: &Value, detail: &Value, agent: &str, id: &str) -> bool {
+    list_row["agent_id"] == agent
+        && detail["run"].is_object()
+        && detail["run"]["id"] == id
+        && detail["run"]["agent_id"] == agent
+}
+
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Block {
     #[default]

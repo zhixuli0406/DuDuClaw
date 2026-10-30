@@ -61,13 +61,17 @@ impl Tail {
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or(Error::Protocol)?;
-            if self.new_item("run", run) {
-                write_line(output, &format_run(run, options.content))?;
-            }
             let detail = options
                 .client
                 .call("runs.get", json!({"run_id":id}), BUDGET)
                 .await?;
+            if !crate::blocks::run_matches(run, &detail, &options.agent, id) {
+                write_line(output, strings::WATCH_RUN_MISMATCH)?;
+                continue;
+            }
+            if self.new_item("run", run) {
+                write_line(output, &format_run(run, options.content))?;
+            }
             let events = detail
                 .get("events")
                 .and_then(Value::as_array)
@@ -271,5 +275,13 @@ mod tests {
         }
         assert_eq!(tail.order.len(), 2_048);
         assert_eq!(tail.seen.len(), 2_048);
+    }
+
+    #[test]
+    fn run_binding_rejects_id_and_agent_mismatches() {
+        let row = json!({"id":"r1","agent_id":"adu"});
+        assert!(!crate::blocks::run_matches(&row, &json!({"run":{"id":"r2","agent_id":"adu"}}), "adu", "r1"));
+        assert!(!crate::blocks::run_matches(&row, &json!({"run":{"id":"r1","agent_id":"other"}}), "adu", "r1"));
+        assert!(crate::blocks::run_matches(&row, &json!({"run":{"id":"r1","agent_id":"adu"}}), "adu", "r1"));
     }
 }

@@ -133,6 +133,7 @@ pub const CHAT_INTERRUPTED: &str = "連線中斷，回覆結果未確認；不�
 pub const WATCH_POLLING: &str = "輪詢模式：閘道未提供即時訂閱，每五秒更新";
 pub const WATCH_SUBSCRIBED: &str = "已訂閱員工執行事件";
 pub const WATCH_GAP: &str = "事件可能遺失，正在重新取得執行紀錄";
+pub const WATCH_RUN_MISMATCH: &str = "警告：執行紀錄與目標不符，已略過";
 pub fn notification(count: usize) -> String { format!("DuDuClaw：{count} 項需要你處理") }
 
 pub const WATCH_HELP: &str = "持續查看一位員工的執行紀錄";
