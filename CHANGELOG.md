@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.77.1] - 2026-10-31 — 移除 Antigravity、Codex 員工控制檔保護與設定讀取失敗時拒絕執行
+
 ### Removed
 
 - Antigravity（`agy`）runtime 已從 runtime 目錄、執行路徑、Dashboard 選項與 Docker 安裝中移除，沒有預告期。仍設定 `antigravity` 的員工、judge、團隊角色或全域輔助後端（`config.toml [runtime] utility_provider`）會被拒絕執行，需改選其他 runtime 與模型；系統不會自動改用其他廠商。`gemini-*` 模型不再對應任何 CLI runtime。Gemini API provider 與 `GEMINI_API_KEY` 繼續支援。先前留在本機的 `~/.gemini/antigravity-cli/` 設定與寫入 agy 設定檔的權限規則不會自動刪除，可自行清理。
