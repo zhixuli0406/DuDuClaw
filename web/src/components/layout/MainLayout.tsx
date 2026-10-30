@@ -1,3 +1,4 @@
+import { cn } from '@/lib/utils';
 import { ProductPolicyNotice } from '@/components/ProductPolicyNotice';
 import { Suspense, useEffect } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router';
@@ -127,6 +128,7 @@ function AppShell() {
   const { content } = usePanel();
   const navActive = useNavProgressStore((s) => s.active);
   const brandName = useEffectiveName();
+  const isInbox = location.pathname === '/inbox';
 
   return (
     <SidebarProvider>
@@ -148,7 +150,7 @@ function AppShell() {
           <MobileInboxBell />
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        <div className={cn('flex min-h-0 flex-1 flex-col', isInbox ? 'overflow-hidden' : 'overflow-y-auto')}>
           <div className="empty:hidden [&>*+*]:mt-2 [&:not(:empty)]:px-4 [&:not(:empty)]:pt-3 md:[&:not(:empty)]:px-6">
             <ProductPolicyNotice />
             <SoftLimitBanner />
@@ -157,7 +159,7 @@ function AppShell() {
             <UpdateBanner />
           </div>
           {/* Re-key on route change to replay the entrance reveal */}
-          <div key={location.pathname} className="page-enter flex flex-1 flex-col p-4 pb-20 md:p-6 md:pb-6">
+          <div key={location.pathname} className={cn('page-enter flex flex-1 flex-col', isInbox ? 'min-h-0 overflow-hidden pb-20 md:pb-0' : 'p-4 pb-20 md:p-6 md:pb-6')}>
             <RouteErrorBoundary resetKey={location.pathname}>
               <Suspense fallback={<RouteFallback />}>
                 <Outlet />

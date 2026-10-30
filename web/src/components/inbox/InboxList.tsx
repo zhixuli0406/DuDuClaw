@@ -146,12 +146,20 @@ export function InboxList(props: InboxListProps) {
       case 'j':
       case 'ArrowDown':
         e.preventDefault();
-        if (rows.length) props.onSelect(rows[Math.min(currentRowIdx + 1, rows.length - 1)].item);
+        if (rows.length) {
+          const next = rows[Math.min(currentRowIdx + 1, rows.length - 1)];
+          rowRefs.current.get(next.key)?.querySelector<HTMLElement>('[role="option"]')?.focus({ preventScroll: true });
+          props.onSelect(next.item);
+        }
         break;
       case 'k':
       case 'ArrowUp':
         e.preventDefault();
-        if (rows.length) props.onSelect(rows[Math.max(currentRowIdx - 1, 0)].item);
+        if (rows.length) {
+          const next = rows[Math.max(currentRowIdx - 1, 0)];
+          rowRefs.current.get(next.key)?.querySelector<HTMLElement>('[role="option"]')?.focus({ preventScroll: true });
+          props.onSelect(next.item);
+        }
         break;
       case 'ArrowLeft':
         e.preventDefault();

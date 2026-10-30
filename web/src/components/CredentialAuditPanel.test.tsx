@@ -43,6 +43,27 @@ describe('CredentialAuditPanel', () => {
     expect(screen.getByText(source)).toHaveAttribute('title', source);
   });
 
+  it.each(['webchat-anonymous', `webchat-user:${'d'.repeat(64)}`])('labels web chat guests: %s', async (provider) => {
+    mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, provided_by: provider }], mode: 'audit' });
+    renderWithProviders(<CredentialAuditPanel />);
+    expect(await screen.findByText('Web chat guest')).toHaveAttribute('title', provider);
+    expect(screen.queryByText(provider)).not.toBeInTheDocument();
+  });
+
+  it('shortens long holder ids while keeping each full value on hover', async () => {
+    const holder = 'a'.repeat(64);
+    mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, holders: [
+      { holder_kind: 'agent', holder_id: holder },
+      { holder_kind: 'agent', holder_id: 'support-fixture' },
+    ] }], mode: 'audit' });
+    renderWithProviders(<CredentialAuditPanel />);
+    const abbreviated = await screen.findByText(`AI employee: ${'a'.repeat(12)}…${'a'.repeat(6)}`);
+    expect(abbreviated).toHaveAttribute('title', `AI employee: ${holder}`);
+    expect(abbreviated).toHaveClass('truncate');
+    expect(screen.queryByText(`AI employee: ${holder}`)).not.toBeInTheDocument();
+    expect(screen.getByText('AI employee: support-fixture')).toBeInTheDocument();
+  });
+
   it('does not present revoked holders as current holders', async () => {
     mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, holders: [
       { holder_kind: 'agent', holder_id: 'former-holder', revoked_at: '2026-10-30T02:00:00Z' },
@@ -109,7 +130,6 @@ describe('CredentialAuditPanel', () => {
     expect(await screen.findByText('Could not complete the credential audit request')).toBeInTheDocument();
   });
 
-  // F6 regression tests; not run (owner forbids builds and npm).
   it('labels only the current segment as internally consistent', async () => {
     mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'security.audit_verify'
       ? { status: 'current_segment_consistent', scope: 'current_segment', intact: true, lines_checked: 2 }

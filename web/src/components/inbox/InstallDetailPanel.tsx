@@ -124,7 +124,7 @@ export function InstallDetailPanel({
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       <div className="flex items-start gap-3">
         <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-brand/10 text-brand">
@@ -210,7 +210,7 @@ export function InstallDetailPanel({
       <OpenInChannelButton channel={request.channel} link={request.channel_link} variant="outline" />
 
       </div>
-      <div data-testid="install-actions" className="sticky bottom-0 z-10 shrink-0 border-t border-surface-border bg-surface py-3">
+      <div data-testid="install-actions" className="z-10 shrink-0 border-t border-surface-border bg-surface py-3">
       {/* Decision */}
       {decided ? (
         <p

@@ -21,7 +21,7 @@ describe('<InstallDetailPanel>', () => {
   it('keeps decisions outside the scrolling details', () => {
     renderWithProviders(<InstallDetailPanel request={request()} onDecided={vi.fn()} />);
     const actions = screen.getByTestId('install-actions');
-    expect(actions).toHaveClass('sticky', 'bottom-0', 'shrink-0');
+    expect(actions).toHaveClass('shrink-0');
     expect(actions.previousElementSibling).toHaveClass('overflow-y-auto');
     expect(screen.getByText(en['approval.risk.low'])).toBeInTheDocument();
   });

@@ -574,6 +574,8 @@ impl AgentRuntime for GrokRuntime {
 
         let mut cmd = tokio::process::Command::new(&self.grok_path);
         cmd.args(&args);
+        // This token belongs to the Claude host session and must not reach Grok.
+        cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
 
         // Working directory (also the root Grok walks for AGENTS.md / project config).
         //

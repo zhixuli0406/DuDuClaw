@@ -618,7 +618,7 @@ function GenericApprovalView({
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       {/* ── Plan summary first (arXiv:2604.04918) ── */}
       <Section title={t('approval.plan.title')}>
@@ -774,7 +774,7 @@ function GenericApprovalView({
 
       </div>
       {/* Keep decisions visible while the evidence scrolls. */}
-      <div data-testid="approval-actions" className="sticky bottom-0 z-10 flex shrink-0 items-center gap-2 border-t border-surface-border bg-surface py-3">
+      <div data-testid="approval-actions" className="z-10 flex shrink-0 items-center gap-2 border-t border-surface-border bg-surface py-3">
         <Button variant="brand" onClick={requestApprove} className="flex-1">
           {t('inbox.approval.approve')}
         </Button>
@@ -906,7 +906,7 @@ function SkillCreateApprovalView({
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       <div className="flex items-start gap-2">
         <p className="min-w-0 flex-1 text-sm text-foreground">{approval.summary}</p>
@@ -977,7 +977,7 @@ function SkillCreateApprovalView({
       </Section>
 
       </div>
-      <div data-testid="approval-actions" className="sticky bottom-0 z-10 shrink-0 border-t border-surface-border bg-surface py-3">
+      <div data-testid="approval-actions" className="z-10 shrink-0 border-t border-surface-border bg-surface py-3">
       {/* Decision */}
       {decided ? (
         <div

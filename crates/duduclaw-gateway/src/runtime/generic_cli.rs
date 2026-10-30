@@ -549,6 +549,8 @@ impl GenericCliRuntime {
 
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&args);
+        // This token belongs to the Claude host session and must not reach another vendor's CLI.
+        cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
 
         if let Some(dir) = context.agent_dir.as_deref() {
             cmd.current_dir(dir);

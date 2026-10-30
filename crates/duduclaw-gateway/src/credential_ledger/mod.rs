@@ -137,6 +137,17 @@ fn migrate(db: &Connection) -> Result<(), String> {
             UPDATE credentials SET provided_by='webchat-anonymous' WHERE provided_by LIKE 'webchat:%' OR provided_by LIKE 'widget-visitor:%';
             PRAGMA user_version=1;").map_err(|_| UNAVAILABLE)?;
     }
+    if version < 2 {
+        let has_ordinal: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('credentials') WHERE name='source_ordinal')", [], |r| r.get(0),
+        ).map_err(|_| UNAVAILABLE)?;
+        if !has_ordinal {
+            tx.execute_batch("ALTER TABLE credentials ADD COLUMN source_ordinal INTEGER NOT NULL DEFAULT 0;").map_err(|_| UNAVAILABLE)?;
+        }
+        tx.execute_batch("DROP INDEX IF EXISTS credential_source_kind;
+            CREATE INDEX credential_source_kind ON credentials(source_ref,kind,source_ordinal) WHERE fingerprint IS NULL;
+            PRAGMA user_version=2;").map_err(|_| UNAVAILABLE)?;
+    }
     tx.commit().map_err(|_| UNAVAILABLE)?;
     Ok(())
 }
@@ -314,7 +325,7 @@ fn record_with_deadline(home: &Path, text: &str, findings: &[Finding], source_re
     let mut skipped = 0;
     let at = chrono::DateTime::from_timestamp(now, 0).ok_or(UNAVAILABLE)?.to_rfc3339();
     for (index, finding) in findings.iter().enumerate() {
-        if index >= MESSAGE_LIMIT || used >= SENDER_LIMIT {
+        if index >= MESSAGE_LIMIT {
             skipped += 1;
             ids.push("cred_throttled".into());
             continue;
@@ -324,9 +335,10 @@ fn record_with_deadline(home: &Path, text: &str, findings: &[Finding], source_re
         let existing: Option<String> = if let Some(fp) = &fp {
             tx.query_row("SELECT id FROM credentials WHERE fingerprint=?1", [fp], |r| r.get(0)).optional()
         } else {
-            tx.query_row("SELECT id FROM credentials WHERE source_ref=?1 AND kind=?2 AND fingerprint IS NULL", params![source_ref, finding.kind], |r| r.get(0)).optional()
+            tx.query_row("SELECT id FROM credentials WHERE source_ref=?1 AND kind=?2 AND source_ordinal=?3 AND fingerprint IS NULL ORDER BY first_seen_at,id LIMIT 1", params![source_ref, finding.kind, index as i64], |r| r.get(0)).optional()
         }.map_err(|_| UNAVAILABLE)?;
-        if existing.is_none() && rows >= ROW_LIMIT {
+        let retry = fp.is_none() && existing.is_some();
+        if (!retry && used >= SENDER_LIMIT) || (existing.is_none() && rows >= ROW_LIMIT) {
             skipped += 1;
             ids.push("cred_throttled".into());
             continue;
@@ -362,8 +374,8 @@ fn record_with_deadline(home: &Path, text: &str, findings: &[Finding], source_re
             }
         }
         if existing.is_none() {
-            tx.execute("INSERT INTO credentials(id,fingerprint,kind,account_hint,service,service_source,source_kind,source_ref,provided_by,status,first_seen_at,last_seen_at) VALUES(?1,?2,?3,?4,?5,'detected',?6,?7,?8,'active',?9,?9)",
-                params![id, fp, finding.kind, finding.account_hint, finding.service_hint, source_kind, source_ref, sender, at]).map_err(|_| UNAVAILABLE)?;
+            tx.execute("INSERT INTO credentials(id,fingerprint,kind,account_hint,service,service_source,source_kind,source_ref,provided_by,status,first_seen_at,last_seen_at,source_ordinal) VALUES(?1,?2,?3,?4,?5,'detected',?6,?7,?8,'active',?9,?9,?10)",
+                params![id, fp, finding.kind, finding.account_hint, finding.service_hint, source_kind, source_ref, sender, at, index as i64]).map_err(|_| UNAVAILABLE)?;
             rows += 1;
             events.push(("credential_detected", json!({"credential_id":id,"kind":finding.kind})));
         } else {
@@ -380,8 +392,10 @@ fn record_with_deadline(home: &Path, text: &str, findings: &[Finding], source_re
         if ingress {
             tx.execute("INSERT INTO credential_ingress_links(source_ref,credential_id,at) VALUES(?1,?2,?3) ON CONFLICT(source_ref,credential_id) DO UPDATE SET at=excluded.at", params![source_ref,id,now]).map_err(|_| UNAVAILABLE)?;
         }
-        used += 1;
-        tx.execute("INSERT INTO detection_quota(sender,at,count) VALUES(?1,?2,1) ON CONFLICT(sender,at) DO UPDATE SET count=count+1", params![sender,now]).map_err(|_| UNAVAILABLE)?;
+        if !retry {
+            used += 1;
+            tx.execute("INSERT INTO detection_quota(sender,at,count) VALUES(?1,?2,1) ON CONFLICT(sender,at) DO UPDATE SET count=count+1", params![sender,now]).map_err(|_| UNAVAILABLE)?;
+        }
         ids.push(id);
     }
     // An expired ingress job must not insert metadata after the worker has

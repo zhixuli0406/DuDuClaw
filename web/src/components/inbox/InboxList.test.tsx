@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { screen, fireEvent, within } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -181,4 +182,30 @@ describe('<InboxList>', () => {
     expect(within(farRow).queryByText('Expiring soon')).not.toBeInTheDocument();
     expect(within(nearRow).getByText('Expiring soon')).toBeInTheDocument();
   });
+});
+
+
+it('j/k moves actual keyboard focus with the selected row', () => {
+  function List() {
+    const [selectedId, onSelect] = useState('approval:1');
+    return <InboxList {...baseProps({ selectedId, onSelect: (item) => onSelect(item.id) })} />;
+  }
+  renderWithProviders(<List />);
+  const rows = screen.getAllByRole('option');
+  rows[0].focus();
+  fireEvent.keyDown(rows[0], { key: 'j' });
+  expect(rows[1]).toHaveFocus();
+  expect(rows[1]).toHaveAttribute('aria-selected', 'true');
+  fireEvent.keyDown(rows[1], { key: 'k' });
+  expect(rows[0]).toHaveFocus();
+});
+
+it('processed approvals have no pending countdown', () => {
+  renderWithProviders(<InboxList {...baseProps({
+    groups: [{ key: '', items: [{ ...items[0], expiresAt: Date.now() / 1000 + 60 }] }],
+    isProcessed: () => true,
+    labels: { ...labels, typeLabel: () => 'Approved' },
+  })} />);
+  expect(screen.getByText('Approved')).toBeInTheDocument();
+  expect(screen.queryByTitle(labels.nearExpiryTooltip)).toBeNull();
 });

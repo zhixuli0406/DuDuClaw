@@ -1465,6 +1465,8 @@ impl AgentRuntime for CodexRuntime {
         let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
 
         let mut cmd = tokio::process::Command::new(&self.codex_path);
+        // This token belongs to the Claude host session and must not reach Codex.
+        cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
         cmd.arg("exec").arg("--json");
         // Agent directories are not git repositories. Codex 0.156.x refuses to
         // run outside a trusted (git) directory unless told otherwise —

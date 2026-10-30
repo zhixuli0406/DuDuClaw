@@ -164,8 +164,12 @@ pub(crate) mod test_support {
 fn detect_claude_auth() -> (bool, Option<String>) {
     // Strategy 1: Try `claude auth status --json` command
     if let Some(claude) = duduclaw_core::which_claude() {
-        let output = duduclaw_core::platform::command_for(&claude)
-            .args(["auth", "status", "--json"])
+        let mut cmd = duduclaw_core::platform::command_for(&claude);
+        duduclaw_core::spawn_env::apply_agent_cli_env_allowlist_std(&mut cmd);
+        for key in ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"] {
+            if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
+        }
+        let output = cmd.args(["auth", "status", "--json"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output();

@@ -348,3 +348,74 @@ mod ingress_holder_tests {
         assert_eq!(overflow, 0);
     }
 }
+
+
+#[test]
+fn separate_values_without_fingerprints_keep_distinct_ids_in_both_modes() {
+    for mode in ["audit", "mask"] {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), format!("[security]\nchat_credentials='{mode}'\n")).unwrap();
+        let text = "password: fixture-first\npassword: fixture-second";
+        // Deterministically exercise the no-fingerprint path, independently
+        // of the platform key store's availability.
+        let findings = credential_detect::detect(text).unwrap();
+        let ids = record_with_key(home.path(), text, &findings, "message", "sender", "agent", "chat", None, 100).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(record_with_key(home.path(), text, &findings, "message", "sender", "agent", "chat", None, 101).unwrap(), ids);
+        assert_eq!(list(home.path(), &json!({})).unwrap()["total"], 2);
+        let output = process(home.path(), text, "message", "sender", "agent", "chat");
+        if mode == "audit" {
+            assert_eq!(output, text);
+        } else {
+            assert_eq!(output, format!("password: [已遮罩的密碼 {}]\npassword: [已遮罩的密碼 {}]", ids[0], ids[1]));
+        }
+    }
+}
+
+#[test]
+fn ordinal_mapping_and_five_per_message_cap_survive_retry_at_sender_limit() {
+    let home = tempfile::tempdir().unwrap();
+    let text = (0..7).map(|i| format!("password: fixture-{i}")).collect::<Vec<_>>().join("\n");
+    let ids = record_at(home.path(), &text, "message", 100);
+    assert_eq!(ids[..MESSAGE_LIMIT].iter().collect::<std::collections::HashSet<_>>().len(), MESSAGE_LIMIT);
+    assert_eq!(&ids[MESSAGE_LIMIT..], &["cred_throttled", "cred_throttled"]);
+    for i in 0..45 { record_at(home.path(), "password: fixture", &format!("other-{i}"), 100); }
+    assert_eq!(record_at(home.path(), &text, "message", 101), ids);
+    let masked = credential_detect::mask_with_ids(&text, &credential_detect::detect(&text).unwrap(), &ids);
+    for (line, id) in masked.lines().zip(&ids) { assert!(line.contains(id)); }
+    assert!(!masked.contains("fixture-"));
+    assert_eq!(list(home.path(), &json!({})).unwrap()["total"], 50);
+}
+
+#[test]
+fn ordinal_migration_preserves_legacy_metadata_and_first_position() {
+    let home = tempfile::tempdir().unwrap();
+    let old_id = record_at(home.path(), "password: fixture", "message", 100).remove(0);
+    let db = open(home.path()).unwrap();
+    db.execute_batch("DROP INDEX credential_source_kind; ALTER TABLE credentials DROP COLUMN source_ordinal; PRAGMA user_version=1;").unwrap();
+    drop(db);
+    let ids = record_at(home.path(), "password: fixture\npassword: second", "message", 101);
+    assert_eq!(ids[0], old_id);
+    assert_ne!(ids[1], old_id);
+    let db = open(home.path()).unwrap();
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(list(home.path(), &json!({})).unwrap()["total"], 2);
+}
+
+
+#[test]
+fn distinct_api_keys_without_protected_key_map_to_their_own_masks() {
+    let home = tempfile::tempdir().unwrap();
+    let text = format!("sk-{}\nsk-{}", "a".repeat(40), "b".repeat(40));
+    let findings = credential_detect::detect(&text).unwrap();
+    assert_eq!(findings.len(), 2);
+    let ids = record_with_key(home.path(), &text, &findings, "message", "sender", "agent", "chat", None, 100).unwrap();
+    assert_ne!(ids[0], ids[1]);
+    let masked = credential_detect::mask_with_ids(&text, &findings, &ids);
+    let lines: Vec<_> = masked.lines().collect();
+    assert!(lines[0].contains(&ids[0]));
+    assert!(lines[1].contains(&ids[1]));
+    assert_eq!(record_with_key(home.path(), &text, &findings, "message", "sender", "agent", "chat", None, 101).unwrap(), ids);
+}

@@ -34,6 +34,11 @@ function bucketFor(row: TimelineRow): Bucket | null {
   return 'active';
 }
 
+function lastUpdateMs(row: TimelineRow): number {
+  const parsed = Date.parse(row.updated_at || row.started_at);
+  return Number.isFinite(parsed) ? parsed : Date.parse(row.started_at) || 0;
+}
+
 function taskId(row: TimelineRow): string | null {
   return row.task_id || (row.kind === 'task' ? row.ref_id : null);
 }
@@ -41,6 +46,17 @@ function taskId(row: TimelineRow): string | null {
 function chartColor(row: TimelineRow): string {
   const bucket = bucketFor(row);
   return `var(--chart-${bucket === 'waiting' ? 1 : bucket === 'unfinished' ? 2 : bucket === 'active' ? 3 : bucket === 'done' ? 4 : 5})`;
+}
+
+/** Shapes repeat in the legend and bars so status does not rely on colour. */
+function BucketMarker({ bucket, x = 0, y = 0 }: { bucket: Bucket | 'other'; x?: number; y?: number }) {
+  return <g transform={`translate(${x} ${y})`} fill={`var(--chart-${bucket === 'waiting' ? 1 : bucket === 'unfinished' ? 2 : bucket === 'active' ? 3 : bucket === 'done' ? 4 : 5})`} className="stroke-foreground" strokeWidth={0.7} aria-hidden="true" data-status-marker={bucket}>
+    {bucket === 'done' ? <circle cx={5} cy={5} r={4} />
+      : bucket === 'active' ? <rect x={1} y={1} width={8} height={8} />
+        : bucket === 'waiting' ? <path d="M5 0 10 5 5 10 0 5Z" />
+          : bucket === 'unfinished' ? <path d="M5 0 10 10 0 10Z" />
+            : <circle cx={5} cy={5} r={4} fill="none" stroke="currentColor" strokeWidth={2} />}
+  </g>;
 }
 
 /** Count a task once; a linked failure is already represented by its task. */
@@ -120,10 +136,11 @@ export function TimelinePage() {
       const priority = all.some((row) => bucketFor(row) === 'waiting') ? 0
         : all.some((row) => bucketFor(row) === 'unfinished') ? 1
           : all.some((row) => bucketFor(row) === 'active') ? 2 : 3;
-      return { id, all, shown, priority };
+      const oldestWait = Math.min(...all.filter((row) => bucketFor(row) === 'waiting').map((row) => lastUpdateMs(row)));
+      return { id, all, shown, priority, oldestWait };
     });
     return groups.filter((group) => !filter || group.shown.length > 0)
-      .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
+      .sort((a, b) => a.priority - b.priority || (a.priority === 0 ? a.oldestWait - b.oldestWait : 0) || a.id.localeCompare(b.id));
   }, [rows, items, visibleAgents, effectiveAgent, filter]);
 
   const statusLabel = (row: TimelineRow) => intl.formatMessage({
@@ -134,11 +151,11 @@ export function TimelinePage() {
   const bucketLabel = (bucket: Bucket) => intl.formatMessage({ id: `timeline.summary.${bucket}`, defaultMessage: { done: 'Completed', active: 'In progress', waiting: 'Needs your decision', unfinished: 'Unfinished' }[bucket] });
   const waitLabel = (row: TimelineRow) => {
     const sinceUpdate = Boolean(row.updated_at);
-    const elapsed = Math.max(0, (Date.parse(result?.to ?? '') || Date.now()) - Date.parse(row.updated_at || row.started_at));
+    const elapsed = Math.max(0, (Date.parse(result?.to ?? '') || Date.now()) - lastUpdateMs(row));
     const minutes = Math.max(1, Math.floor(elapsed / 60_000));
     const unit = minutes >= 1440 ? 'days' : minutes >= 60 ? 'hours' : 'minutes';
     const count = unit === 'days' ? Math.floor(minutes / 1440) : unit === 'hours' ? Math.floor(minutes / 60) : minutes;
-    return intl.formatMessage({ id: `timeline.${sinceUpdate ? 'sinceUpdate' : 'elapsed'}.${unit}`, defaultMessage: `${sinceUpdate ? 'Last updated' : 'Open for'} {count} ${unit}${sinceUpdate ? ' ago' : ''}` }, { count });
+    return intl.formatMessage({ id: `timeline.${sinceUpdate ? bucketFor(row) === 'waiting' ? 'waitingSinceUpdate' : 'sinceUpdate' : 'elapsed'}.${unit}`, defaultMessage: `${sinceUpdate ? 'Last updated' : 'Open for'} {count} ${unit}${sinceUpdate ? ' ago' : ''}` }, { count });
   };
   const windowMs = result ? { fromMs: Date.parse(result.from), toMs: Date.parse(result.to) } : null;
   const validWindow = windowMs && Number.isFinite(windowMs.fromMs) && windowMs.toMs > windowMs.fromMs;
@@ -183,15 +200,15 @@ export function TimelinePage() {
                       const waiting = group.all.filter((row) => bucketFor(row) === 'waiting');
                       const unfinished = group.all.filter((row) => bucketFor(row) === 'unfinished').length;
                       const active = group.all.filter((row) => bucketFor(row) === 'active').length;
-                      const oldestWaiting = [...waiting].sort((a, b) => Date.parse(a.updated_at || a.started_at) - Date.parse(b.updated_at || b.started_at))[0];
+                      const oldestWaiting = [...waiting].sort((a, b) => lastUpdateMs(a) - lastUpdateMs(b))[0];
                       const attention = [...group.shown].sort((a, b) => {
                         const rank = (row: TimelineRow) => bucketFor(row) === 'waiting' ? 0 : bucketFor(row) === 'unfinished' ? 1 : 2;
-                        return rank(a) - rank(b) || Date.parse(a.started_at) - Date.parse(b.started_at);
+                        return rank(a) - rank(b) || lastUpdateMs(a) - lastUpdateMs(b);
                       });
                       return <Card key={group.id} data-testid="timeline-employee-card">
                         <CardHeader>
                           <CardTitle><span className="flex items-center gap-2"><ActorAvatar actorType={group.id && group.id !== 'unassigned' ? 'agent' : 'system'} size="md" name={nameFor(group.id)} /><span>{nameFor(group.id)}</span></span></CardTitle>
-                          <CardDescription>{intl.formatMessage({ id: 'timeline.staff.summary', defaultMessage: '{done} completed, {active} in progress, {waiting} need your decision, {unfinished} unfinished' }, { done, active, waiting: waiting.length, unfinished })}{oldestWaiting ? ` (${waitLabel(oldestWaiting)})` : ''}</CardDescription>
+                          <CardDescription>{intl.formatMessage({ id: 'timeline.staff.summary', defaultMessage: '{done} completed, {active} in progress, {waiting} need your decision, {unfinished} unfinished' }, { done, active, waiting: waiting.length, unfinished })}{oldestWaiting ? ` · ${waitLabel(oldestWaiting)}` : ''}</CardDescription>
                         </CardHeader>
                         <CardContent>{attention.length === 0 ? <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'timeline.staff.idle', defaultMessage: 'No tasks to follow up in this time range.' })}</p>
                           : <ul className="divide-y divide-surface-border">{attention.map((row) => <li key={`${row.kind}:${row.ref_id}`} className="flex flex-wrap items-center justify-between gap-2 py-3">
@@ -206,7 +223,7 @@ export function TimelinePage() {
                 <summary className="cursor-pointer rounded-md text-sm font-medium focus-visible:ring-3 focus-visible:ring-ring/50">{intl.formatMessage({ id: 'timeline.chart.toggle', defaultMessage: 'View time distribution' })}</summary>
                 {chartOpen && <div className="mt-4 space-y-4">
                   <p id="timeline-chart-note" className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'timeline.chart.note', defaultMessage: 'Each bar shows how long a task was open, not how long the employee worked. Open a task to see its details.' })}</p>
-                  <div className="flex flex-wrap gap-3">{[...BUCKETS, 'other' as const].map((bucket) => <span key={bucket} className="flex items-center gap-1.5 text-xs text-muted-foreground"><span aria-hidden="true" className="size-2.5 rounded-full" style={{ backgroundColor: `var(--chart-${bucket === 'waiting' ? 1 : bucket === 'unfinished' ? 2 : bucket === 'active' ? 3 : bucket === 'done' ? 4 : 5})` }} />{bucket === 'other' ? intl.formatMessage({ id: 'timeline.status.other', defaultMessage: 'Update recorded' }) : bucketLabel(bucket)}</span>)}</div>
+                  <div className="flex flex-wrap gap-3">{[...BUCKETS, 'other' as const].map((bucket) => <span key={bucket} className="flex items-center gap-1.5 text-xs text-muted-foreground"><svg viewBox="0 0 10 10" className="size-2.5" aria-hidden="true"><BucketMarker bucket={bucket} /></svg>{bucket === 'other' ? intl.formatMessage({ id: 'timeline.status.other', defaultMessage: 'Update recorded' }) : bucketLabel(bucket)}</span>)}</div>
                   <div className="overflow-x-auto"><svg viewBox={`0 0 960 ${40 + lanes.reduce((height, lane) => height + Math.max(lane.subRowCount * 32, 48), 0)}`} className="block min-w-3xl w-full" role="group" aria-label={intl.formatMessage({ id: 'timeline.chart.aria' })} aria-describedby="timeline-chart-note">
                     {timeTicks(windowMs.fromMs, windowMs.toMs, 6).map((tick) => <text key={tick.ms} x={180 + xForMs(tick.ms, windowMs.fromMs, windowMs.toMs, 760)} y={20} className="fill-muted-foreground text-xs" textAnchor="middle">{RANGE_HOURS[range] > 24 ? intl.formatDate(tick.ms, { month: 'numeric', day: 'numeric' }) : intl.formatTime(tick.ms, { hour: '2-digit', minute: '2-digit' })}</text>)}
                     {lanes.map((lane, index) => {
@@ -219,7 +236,7 @@ export function TimelinePage() {
                           const y = top + placed.subRow * 32;
                           const kind = intl.formatMessage({ id: `timeline.kind.${row.kind}`, defaultMessage: 'Update' });
                           const label = `${nameFor(row.agent_id)} · ${row.label || kind} · ${statusLabel(row)} · ${intl.formatDate(placed.startMs, { month: 'numeric', day: 'numeric' })} ${intl.formatTime(placed.startMs, { hour: '2-digit', minute: '2-digit' })}`;
-                          const shape = <><title>{label}</title><rect x={x} y={y} width={Math.max(width, 24)} height={28} fill="transparent" /><rect x={x} y={y + 8} width={width} height={12} rx={4} fill={chartColor(row)} /></>;
+                          const shape = <><title>{label}</title><rect x={x} y={y} width={Math.max(width, 24)} height={28} fill="transparent" /><rect x={x} y={y + 8} width={width} height={12} rx={4} fill={chartColor(row)} /><BucketMarker bucket={bucketFor(row) ?? 'other'} x={x} y={y + 1} /></>;
                           return taskId(row) ? <a key={`${row.kind}:${row.ref_id}`} href={`/tasks/${encodeURIComponent(taskId(row)!)}`} aria-label={label} className="focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring">{shape}</a> : <g key={`${row.kind}:${row.ref_id}`} aria-label={label}>{shape}</g>;
                         })}</g>;
                     })}

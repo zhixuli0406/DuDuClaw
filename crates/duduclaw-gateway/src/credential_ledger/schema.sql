@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS credentials(
  account_hint TEXT, service TEXT, service_source TEXT NOT NULL,
  source_kind TEXT NOT NULL, source_ref TEXT NOT NULL, provided_by TEXT NOT NULL,
  status TEXT NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
- last_used_at TEXT, expires_at TEXT, rotation_due_at TEXT, note TEXT, note_source TEXT NOT NULL DEFAULT 'detected'
+ last_used_at TEXT, expires_at TEXT, rotation_due_at TEXT, note TEXT, note_source TEXT NOT NULL DEFAULT 'detected', source_ordinal INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS credential_source_kind ON credentials(source_ref,kind) WHERE fingerprint IS NULL;
 CREATE TABLE IF NOT EXISTS credential_holders(

@@ -1,3 +1,6 @@
+import { createIntl, createIntlCache } from 'react-intl';
+import en from '@/i18n/en.json';
+import { auditEventSummary, resolveFailureAgentId } from './home-overview';
 import { describe, it, expect } from 'vitest';
 import {
   countStandbyAgents,
@@ -179,5 +182,29 @@ describe('overviewCounts + isAllClear', () => {
   it('is not "all clear" when only undelivered sends are outstanding', () => {
     const items = buildAttentionItems([], [], [{ id: 'f1', title: 'w' }]);
     expect(isAllClear(overviewCounts(0, items))).toBe(false);
+  });
+});
+
+
+describe('failed work summaries', () => {
+  const intl = createIntl({ locale: 'en', messages: en }, createIntlCache());
+  it('uses plain words on every unified-log summary surface', () => {
+    expect(auditEventSummary({ ...failureEvent(), source: 'channel_failure', summary: '{"origin":"Claude Code"}' }, intl.formatMessage)).toBe("nova's work did not finish");
+    expect(auditEventSummary({ ...failureEvent(), source: 'security', summary: 'Normal summary' }, intl.formatMessage)).toBe('Normal summary');
+    expect(auditEventSummary({ ...failureEvent(), source: 'channel_failure', summary: 'billing exhausted' }, intl.formatMessage)).toBe('billing exhausted');
+    expect(auditEventSummary({ ...failureEvent(), source: 'channel_failure', event_type: 'channel.recovered', summary: 'Recovered' }, intl.formatMessage)).toBe('Recovered');
+  });
+  it('avoids ambiguous or unknown display-name filters', () => {
+    expect(resolveFailureAgentId('Name', [{ name: 'id', display_name: 'Name' }])).toBe('id');
+    expect(resolveFailureAgentId('Name', [{ name: 'a', display_name: 'Name' }, { name: 'b', display_name: 'Name' }])).toBeUndefined();
+    expect(resolveFailureAgentId('unknown', [])).toBeUndefined();
+  });
+  it('preserves risk and expiry for the Inbox urgency sort', () => {
+    const items = buildAttentionItems([
+      { id: 'low', title: 'Low', risk: 'low' },
+      { id: 'high', title: 'High', risk: 'high' },
+      { id: 'expiring', title: 'Expiring', expiresAt: Date.now() / 1000 + 30 },
+    ], [], [{ id: 'failure', title: 'Failed' }]);
+    expect(items.map((item) => item.id)).toEqual(['approval:expiring', 'approval:high', 'failed_run:failure', 'approval:low']);
   });
 });

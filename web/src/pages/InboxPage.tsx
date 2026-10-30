@@ -15,7 +15,7 @@ import { approvalListTitle, parseKnowledgeQuarantine, quarantineResultMessage } 
 import { useConnectionStore } from '@/stores/connection-store';
 import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { useAuthStore } from '@/stores/auth-store';
-import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
+import { excludeRecoveredChannelFailures, channelFailureChannel, resolveFailureAgentId, failedRunTitle } from '@/lib/home-overview';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
@@ -129,6 +129,7 @@ export function InboxPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const deepLinkItemRef = useRef(searchParams.get('item'));
   const deepLinkAppliedRef = useRef(false);
+  const [selectionReady, setSelectionReady] = useState(false);
 
   const [entries, setEntries] = useState<RawEntry[]>([]);
   const [agentNames, setAgentNames] = useState<Record<string, string>>({});
@@ -302,8 +303,8 @@ export function InboxPage() {
         item: {
           id: `failed_run:${ev.agent_id}:${ev.timestamp}`,
           type: 'failed_run',
-          title: intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameMap[ev.agent_id] ?? ev.agent_id }),
-          agentId: ev.agent_id || undefined,
+          title: failedRunTitle(ev, intl.formatMessage, nameMap[ev.agent_id] ?? ev.agent_id),
+          agentId: resolveFailureAgentId(ev.agent_id, agentsRes?.agents ?? []),
           channel: channelFailureChannel(ev),
           timestamp: ev.timestamp,
           urgency: TYPE_URGENCY.failed_run,
@@ -428,6 +429,20 @@ export function InboxPage() {
     });
   }, []);
 
+  // Archive removes the focused row, so undo must also work from the page.
+  useEffect(() => {
+    if (undoStack.length === 0) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+      if (event.defaultPrevented || event.altKey || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'z' || event.shiftKey) return;
+      event.preventDefault();
+      undo();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [undoStack.length, undo]);
+
   // Mark a resolved item processed (§C6) and close its detail. Unlike
   // `archive`, this does NOT hide the row outright — it graduates out of the
   // action-required tabs (`ACTION_QUEUE_TABS`) but stays visible, sunk to the
@@ -504,15 +519,18 @@ export function InboxPage() {
     if (loading || deepLinkAppliedRef.current) return;
     deepLinkAppliedRef.current = true;
     const param = deepLinkItemRef.current;
-    if (!param) return;
-    const match = entries.find((e) => e.item.id === param || e.item.id.endsWith(`:${param}`));
-    if (match) select(match.item);
+    if (param) {
+      const match = entries.find((e) => e.item.id === param || e.item.id.endsWith(`:${param}`));
+      if (match) select(match.item);
+    }
+    setSelectionReady(true);
   }, [loading, entries, select]);
 
   // Mirror the open item back into the URL so the current view is
   // bookmarkable/shareable (H5). `replace: true` avoids stacking a history
   // entry per row click.
   useEffect(() => {
+    if (!selectionReady || searchParams.get('item') === selectedId) return;
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -522,7 +540,7 @@ export function InboxPage() {
       },
       { replace: true },
     );
-  }, [selectedId, setSearchParams]);
+  }, [selectedId, selectionReady, searchParams, setSearchParams]);
 
   const markAllRead = useCallback(() => {
     setRead((prev) => {
@@ -599,7 +617,7 @@ export function InboxPage() {
       // label, the single biggest vocabulary payoff of the object-model
       // convergence (04 doc §C.3).
       typeLabel: (item) =>
-        item.question ? t('inbox.type.question') : item.type === 'blocked' && item.status === 'needs_human'
+        processed.has(item.id) ? t(statusLabelKey(outcomes[item.id] ?? item.status ?? '') ?? 'inbox.processed.receipt') : item.question ? t('inbox.type.question') : item.type === 'blocked' && item.status === 'needs_human'
           ? t('inbox.status.pending')
           : t(TYPE_META[item.type].labelKey),
       riskLabel: (level: RiskLevel) => t(`approval.risk.${level}`),
@@ -609,7 +627,7 @@ export function InboxPage() {
       nearExpiryTooltip: t('inbox.approval.nearExpiryTooltip'),
       processedTooltip: t('inbox.processed.tooltip'),
     }),
-    [t],
+    [t, processed, outcomes],
   );
 
   // ── Fatigue signals (arXiv:2606.08919) ──────────────────────────────────────
@@ -796,7 +814,7 @@ export function InboxPage() {
             <Button variant="brand" onClick={() => {
               const event = raw as UnifiedAuditEvent;
               const runId = typeof event.details?.run_id === 'string' ? event.details.run_id : null;
-              navigate(runId ? `/runs?run=${encodeURIComponent(runId)}` : `/runs?agent=${encodeURIComponent(item.agentId ?? '')}`);
+              navigate(runId ? `/runs?run=${encodeURIComponent(runId)}` : item.agentId ? `/runs?agent=${encodeURIComponent(item.agentId)}` : '/runs');
             }}><ExternalLink />{t('inbox.detail.viewRun')}</Button>
           </DetailShell>
         );
@@ -805,7 +823,7 @@ export function InboxPage() {
 
   // ── Left column: header + tabs + list ────────────────────────────────────────
   const listColumn = (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden">
       <PageHeader hideTrigger>
         <InboxIcon className="size-4 shrink-0 text-muted-foreground" />
         <h1 className="truncate text-sm font-medium">{t('inbox.title')}</h1>
@@ -896,9 +914,9 @@ export function InboxPage() {
         </div>
       </PageHeader>
 
-      <Tabs value={prefs.tab} onValueChange={(value) => updatePrefs({ tab: value as InboxTab })} variant="line">
+      <Tabs className="min-w-0 shrink-0" value={prefs.tab} onValueChange={(value) => updatePrefs({ tab: value as InboxTab })} variant="line">
         <TabsList aria-label={t('inbox.title')} className="overflow-x-auto border-b border-surface-border px-2 py-2">
-          {INBOX_TABS.map((tab) => <TabsTab key={tab} value={tab}>
+          {INBOX_TABS.map((tab) => <TabsTab key={tab} value={tab} className="shrink-0 whitespace-nowrap">
             {t(`inbox.tab.${tab}`)}
             {tabItemsFor(tab).length > 0 && <span className="font-mono text-xs tabular-nums">{tabItemsFor(tab).length}</span>}
           </TabsTab>)}
@@ -971,7 +989,7 @@ export function InboxPage() {
 
   // ── Detail column ────────────────────────────────────────────────────────────
   const detailColumn = (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden">
       {isMobile && selectedEntry && (
         <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-2">
           <Button variant="ghost" size="icon-sm" onClick={() => setSelectedId(null)} aria-label={t('common.back')}>
@@ -982,7 +1000,7 @@ export function InboxPage() {
       )}
       {selectedEntry && !canArchiveInboxItem(selectedEntry.item, processed.has(selectedEntry.item.id)) && <p className="shrink-0 border-b border-surface-border px-4 py-2 text-xs text-muted-foreground">{t('inbox.archiveBlocked')}</p>}
       {selectedEntry ? (
-        <div className={cn('min-h-0 flex-1 p-4 md:p-6', !processed.has(selectedEntry.item.id) && !selectedEntry.item.question && (selectedEntry.item.type === 'approval' || selectedEntry.item.type === 'install') ? 'overflow-hidden' : 'overflow-y-auto')}>{detailBody}</div>
+        <div key={selectedEntry.item.id} data-testid="inbox-detail-content" className={cn('min-h-0 flex-1 p-4 md:p-6', !processed.has(selectedEntry.item.id) && !selectedEntry.item.question && (selectedEntry.item.type === 'approval' || selectedEntry.item.type === 'install') ? 'flex flex-col overflow-hidden' : 'overflow-y-auto')}>{detailBody}</div>
       ) : (
         <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
           <InboxIcon className="size-10 text-muted-foreground/30" />
@@ -996,7 +1014,7 @@ export function InboxPage() {
   const totallyEmpty = !loading && nonArchived.length === 0;
 
   return (
-    <div className="-mx-4 -mt-4 flex min-h-0 flex-1 md:-mx-6 md:-mt-6 md:-mb-6">
+    <div data-testid="inbox-page" className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
       {isMobile ? (
         selectedEntry ? (
           detailColumn
@@ -1005,7 +1023,7 @@ export function InboxPage() {
             {listColumn}
           </div>
         ) : (
-          <div className="w-full">{listColumn}</div>
+          <div className="h-full min-h-0 w-full">{listColumn}</div>
         )
       ) : (
         <ResizablePanelGroup orientation="horizontal" id="inbox-split" className="h-full w-full">

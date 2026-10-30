@@ -1,3 +1,4 @@
+import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Inbox } from 'lucide-react';
@@ -255,7 +256,7 @@ function EventRow({
         <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">{time}</span>
       </div>
       {event.summary && (
-        <p className="mt-1 whitespace-normal break-words text-foreground">{event.summary}</p>
+        <p className="mt-1 whitespace-normal break-words text-foreground">{auditEventSummary(event, intl.formatMessage)}</p>
       )}
       {expanded && event.details && Object.keys(event.details).length > 0 && (
         <pre className="mt-1.5 overflow-x-auto rounded-md bg-muted p-2 font-mono text-[10px] text-muted-foreground">

@@ -9375,7 +9375,7 @@
   "timeline.status.revising": "修正中",
   "timeline.status.needs_human": "あなたの判断待ち",
   "timeline.status.done": "完了",
-  "timeline.status.blocked": "作業が停止",
+  "timeline.status.blocked": "未完了",
   "timeline.status.failed": "未完了",
   "timeline.status.cancelled": "キャンセル済み",
   "timeline.status.problem": "確認が必要",
@@ -9391,5 +9391,9 @@
   "timeline.elapsed.hours": "開始から {count} 時間",
   "timeline.sinceUpdate.hours": "最終更新から {count} 時間",
   "timeline.elapsed.days": "開始から {count} 日",
-  "timeline.sinceUpdate.days": "最終更新から {count} 日"
+  "timeline.sinceUpdate.days": "最終更新から {count} 日",
+  "security.credentialAudit.provider.webchatGuest": "ウェブ会話のゲスト",
+  "timeline.waitingSinceUpdate.minutes": "{count} 分待機（最終更新から）",
+  "timeline.waitingSinceUpdate.hours": "{count} 時間待機（最終更新から）",
+  "timeline.waitingSinceUpdate.days": "{count} 日待機（最終更新から）"
 }

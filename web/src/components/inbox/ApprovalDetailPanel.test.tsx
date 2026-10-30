@@ -826,7 +826,7 @@ describe('<ApprovalDetailPanel> processed receipts', () => {
 
   it('keeps the action bar outside the scrolling evidence', () => {
     renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} onApprove={vi.fn()} onReject={vi.fn()} />);
-    expect(screen.getByTestId('approval-actions')).toHaveClass('sticky', 'bottom-0', 'shrink-0');
+    expect(screen.getByTestId('approval-actions')).toHaveClass('shrink-0');
     expect(screen.getByTestId('approval-actions').previousElementSibling).toHaveClass('overflow-y-auto');
   });
 

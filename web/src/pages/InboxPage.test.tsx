@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { IntlProvider } from 'react-intl';
-import { MemoryRouter, Routes, Route } from 'react-router';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -30,12 +30,18 @@ describe('InboxPage (Multica list+detail split)', () => {
 
 /** Renders InboxPage at an explicit path (`renderWithProviders`'s router has
  *  no way to seed a starting location/query string). */
+function RunDestination() {
+  const location = useLocation();
+  return <p>{location.pathname}{location.search}</p>;
+}
+
 function renderAt(path: string) {
   return render(
     <IntlProvider messages={en} locale="en" defaultLocale="en">
       <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route path="/inbox" element={<InboxPage />} />
+          <Route path="/runs" element={<RunDestination />} />
         </Routes>
       </MemoryRouter>
     </IntlProvider>,
@@ -280,13 +286,16 @@ describe('Inbox triage safety', () => {
 
   it('shows an outcome and removes decision buttons when a resolved approval is reopened', async () => {
     mockWsClient.call.mockImplementation((method: string) => method === 'approvals.list'
-      ? Promise.resolve({ approvals: [{ ...APPROVAL_FIXTURE, id: 'receipt', summary: 'A safe request' }] }) : Promise.resolve({}));
+      ? Promise.resolve({ approvals: [{ ...APPROVAL_FIXTURE, id: 'receipt', summary: 'A safe request', expires_at: Date.now() / 1000 + 600 }] }) : Promise.resolve({}));
     renderAt('/inbox?item=receipt');
     fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument());
     fireEvent.click(screen.getByRole('tab', { name: /^All/ }));
     fireEvent.click(screen.getByText('A safe request'));
     expect(screen.getByRole('status')).toHaveTextContent('Approved');
+    const row = screen.getByRole('option');
+    expect(within(row).getByText('Approved')).toBeInTheDocument();
+    expect(within(row).queryByTitle(en['inbox.approval.nearExpiryTooltip'])).toBeNull();
     expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
   });
@@ -298,5 +307,91 @@ describe('Inbox triage safety', () => {
     expect(await screen.findByText(/This work did not finish successfully/)).toBeInTheDocument();
     expect(screen.queryByText(/private-debug|INTERNAL RAW SUMMARY/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'View work record' })).toBeInTheDocument();
+  });
+});
+
+
+describe('Inbox browser regressions', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    signIn('admin');
+    useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  });
+
+  function loadApprovals() {
+    mockWsClient.call.mockImplementation((method: string) => method === 'approvals.list'
+      ? Promise.resolve({ approvals: ['first', 'second'].map((id) => ({ ...APPROVAL_FIXTURE, id, summary: `Request ${id}`, expires_at: Date.now() / 1000 + 600 })) })
+      : Promise.resolve({}));
+  }
+
+  it('constrains both scroll regions and replaces the detail scroll state on selection', async () => {
+    loadApprovals();
+    renderAt('/inbox?item=first');
+    await screen.findByRole('button', { name: 'Approve' });
+    expect(screen.getByTestId('inbox-page')).toHaveClass('min-h-0', 'flex-1', 'overflow-hidden');
+    expect(screen.getByRole('listbox').parentElement).toHaveClass('min-h-0', 'overflow-y-auto');
+    for (const tab of screen.getAllByRole('tab')) expect(tab).toHaveClass('whitespace-nowrap', 'shrink-0');
+    const previous = screen.getByTestId('inbox-detail-content');
+    expect(previous).toHaveClass('flex', 'flex-col', 'min-h-0', 'overflow-hidden');
+    const actions = screen.getByTestId('approval-actions');
+    expect(actions).toHaveClass('shrink-0');
+    expect(actions.previousElementSibling).toHaveClass('flex-1', 'min-h-0', 'overflow-y-auto');
+    actions.previousElementSibling!.scrollTop = 400;
+    fireEvent.click(screen.getByText('Request second'));
+    expect(screen.getByTestId('inbox-detail-content')).not.toBe(previous);
+    expect(screen.getByTestId('approval-actions').previousElementSibling!.scrollTop).toBe(0);
+  });
+
+  it('uses the same constrained detail and footer on mobile', async () => {
+    const original = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })) });
+    try {
+      loadApprovals();
+      renderAt('/inbox?item=first');
+      await screen.findByRole('button', { name: 'Approve' });
+      expect(screen.queryByTestId('inbox-split')).toBeNull();
+      expect(screen.getByTestId('inbox-page').firstElementChild).toHaveClass('h-full', 'min-h-0', 'overflow-hidden');
+      expect(screen.getByTestId('approval-actions')).toHaveClass('shrink-0');
+      expect(screen.getByTestId('approval-actions').previousElementSibling).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto');
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
+  it.each(['mouse', 'keyboard'])('undo works from BODY after archiving by %s, while typing keeps native undo', async (via) => {
+    mockWsClient.call.mockImplementation((method: string) => method === 'audit.unified_log'
+      ? Promise.resolve({ events: [{ timestamp: '2026-10-31T00:00:00Z', agent_id: 'staff', severity: 'critical', event_type: 'channel_send_failure_alert', summary: '{}' }] }) : Promise.resolve({}));
+    renderAt('/inbox');
+    fireEvent.click(await screen.findByRole('tab', { name: /^All/ }));
+    const row = await screen.findByRole('option');
+    fireEvent.click(row);
+    if (via === 'mouse') fireEvent.click(within(row).getByRole('button', { name: 'Archive' }));
+    else fireEvent.keyDown(row, { key: 'a' });
+    await waitFor(() => expect(screen.queryByRole('option')).toBeNull());
+    const input = document.createElement('input');
+    document.body.append(input);
+    input.focus();
+    expect(fireEvent.keyDown(input, { key: 'z', ctrlKey: true })).toBe(true);
+    expect(screen.queryByRole('option')).toBeNull();
+    input.remove();
+    document.body.focus();
+    fireEvent.keyDown(document.body, { key: 'z', [via === 'mouse' ? 'metaKey' : 'ctrlKey']: true });
+    expect(await screen.findByRole('option')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['Friendly employee', [{ name: 'staff-id', display_name: 'Friendly employee' }], '/runs?agent=staff-id'],
+    ['staff-id', [{ name: 'staff-id', display_name: 'Friendly employee' }], '/runs?agent=staff-id'],
+    ['Unknown employee', [], '/runs'],
+    ['Duplicate', [{ name: 'a', display_name: 'Duplicate' }, { name: 'b', display_name: 'Duplicate' }], '/runs'],
+  ])('opens a safe run link for %s', async (agent, agents, destination) => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'agents.list') return Promise.resolve({ agents });
+      if (method === 'audit.unified_log') return Promise.resolve({ events: [{ timestamp: '2026-10-31T00:00:00Z', agent_id: agent, severity: 'critical', event_type: 'channel_send_failure_alert', summary: '{}' }] });
+      return Promise.resolve({});
+    });
+    renderAt(`/inbox?item=${encodeURIComponent(`failed_run:${agent}:2026-10-31T00:00:00Z`)}`);
+    fireEvent.click(await screen.findByRole('button', { name: 'View work record' }));
+    expect(await screen.findByText(destination)).toBeInTheDocument();
   });
 });

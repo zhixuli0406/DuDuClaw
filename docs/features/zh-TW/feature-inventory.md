@@ -51,7 +51,7 @@
 | `duduclaw migrate from claude-code`（v1.61） | 單向匯入 Claude Code 的 memory shard（→ semantic + SPO 時間記憶）、CLAUDE.md（→ agent wiki context 層，不佔注入預算）與對話逐字稿（噪音濾除只留人類 prompt + assistant 最終回覆，實測有效訊號僅約 1.5%）；一律 `origin=import`（trust ≤ 0.7）、當 DATA、預設去識別化、過注入掃描、skill 過安全掃描 fail-closed；未加 `--apply` 不會寫入任何東西 |
 | 通道能力表（v1.61） | `channel_capabilities.rs` 單一權威表：11 通道 × 7 能力（檔案／照片上傳、互動按鈕、edit-in-place、typing、原生 markdown、引用回覆）+ 進度節流秒數；不支援的能力從靜默 no-op 改為留下結構化 log |
 | minimal_context spawn 瘦身（v1.61） | 每次 spawn 官方 CLI 帶策展 `--tools` 清單 + `--setting-sources project,local`（保留 agent-file-guard hook）：實測固定開銷 35,892 → 10,974 tokens/次（約 69%）；`estimate_tokens` CJK 校準（修正約 22% 低估）；MCP `tools/list` 依呼叫者 capability 過濾（discoverable ⊆ callable） |
-| 憑證 P2/P3（v1.61） | 零重啟輪換：帳號池寫入即失效 rotator 快取、Telegram 每輪重解析 token、六個 webhook 通道 inbound 驗簽 per-request、Odoo 下次呼叫即重連（Discord/Slack 長駐 WS 仍需重啟）；spawn env 改白名單擦洗（濾除所有 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`，vendor 金鑰改由呼叫端顯式注入）；per-agent `[capabilities] git_credentials`（預設關，opt-in）為 git push 類 agent 恢復 SSH/GPG，留稽核；`secret://` 收斂第二輪（account_rotator + mcp.rs） |
+| 憑證 P2/P3（v1.61） | 零重啟輪換：帳號池寫入即失效 rotator 快取、Telegram 每輪重解析 token、六個 webhook 通道 inbound 驗簽 per-request、Odoo 下次呼叫即重連（Discord/Slack 長駐 WS 仍需重啟）；Claude CLI spawn env 套用白名單（過濾憑證形狀名稱，必要的廠商金鑰由呼叫端明確注入）；per-agent `[capabilities] git_credentials`（預設關，opt-in）為 git push 類 agent 恢復 SSH/GPG，留稽核；`secret://` 收斂第二輪（account_rotator + mcp.rs） |
 | 管理台與任務打磨（v1.61） | ⌘K 跨來源內容搜尋（對話／產物／記憶／wiki）、`/files` 搜尋 + 任務篩選 + 日期範圍、`/goals` 任務置頂／歸檔／重新命名 + 分頁（解除 20 筆硬上限）、唯讀 `/presets` 頁、mail 拒絕備註、`/goals` 詳情併入四分頁 `/tasks/:id` 頁 |
 
 ## 2026-08 新增（v1.53）

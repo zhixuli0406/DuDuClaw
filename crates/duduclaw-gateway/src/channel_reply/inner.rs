@@ -3797,7 +3797,7 @@ pub(super) async fn build_reply_with_session_inner(
     let doc_url = failure.display_origin().is_claude_cli().then(||failure_doc_url(reason)).flatten();
     let audit = serde_json::json!({
         "event": "channel_reply_fallback",
-        "agent": name,
+        "agent": agent_id,
         "session_id": session_id,
         // W2-4: which platform the user got the fallback message on; `null`
         // for non-channel sessions.

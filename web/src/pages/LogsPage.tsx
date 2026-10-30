@@ -1,3 +1,4 @@
+import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useRef, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useUrlState } from '@/lib/use-url-state';
@@ -375,7 +376,7 @@ function AuditRow({
       </div>
 
       {event.summary && (
-        <p className="mt-2 whitespace-normal break-words text-sm text-foreground">{event.summary}</p>
+        <p className="mt-2 whitespace-normal break-words text-sm text-foreground">{auditEventSummary(event, intl.formatMessage)}</p>
       )}
 
       {expanded && event.details && Object.keys(event.details).length > 0 && (

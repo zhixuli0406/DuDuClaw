@@ -22,7 +22,7 @@
 
 Grok 員工的這兩個守門來自另一個檔案。DuDuClaw 啟動 Grok 時會關掉 Grok 的 Claude 相容 hook 讀取（作業系統使用者自己 `~/.claude/settings.json` 的 hook 因此不會在員工的回合裡執行），Grok 也就不再讀 `<agent_dir>/.claude/settings.json`。所以每次啟動 Grok 前，gateway 會把 `agent-file-guard` 與 `data-file-guard` 兩個條目原樣寫進 Grok 的專案 hook 目錄 `<cwd>/.grok/hooks/duduclaw-guards-<員工>.json`；Grok 會把 matcher 裡的 Claude 工具名稱對應到自己的工具，並以 Claude 的 `tool_name`／`tool_input` 欄位把輸入交給 hook。每位員工各一個檔，共用借用工作目錄的團隊成員不會互相蓋掉身分；每位成員都會載入那裡所有的檔，任何一個拒絕就擋下。有員工目錄而檔案寫不進去的那次啟動會被拒絕。在員工自己的目錄裡，`.grok/` 屬於凍結的 runtime 設定目錄，員工改不了；員工目錄之外借用的工作目錄沒有凍結，員工若在那裡有寫入權限，可以自己加 hook 檔。
 
-安裝的指令帶著 agent id（`--agent`），v1.68.1 之後的版本也帶著 DuDuClaw 資料目錄（`--home "<路徑>"`）。Gateway 啟動員工的 CLI 時會清空環境變數，白名單裡沒有 `DUDUCLAW_HOME`，所以先前 hook 一律退回 `$HOME/.duduclaw` 判斷；資料目錄不在預設位置的部署，真正資料目錄裡的每個路徑都被當成「資料目錄之外」。安裝器對每個 `<資料目錄>/agents/<id>`（或 `<資料目錄>/agents/.ephemeral/<id>`）形式的員工目錄都寫入 `--home`，路徑含 shell 特殊字元時改用單引號包起來。既有的安裝會在下一次啟動員工或 gateway 開機時就地改寫。
+安裝的指令帶著 agent id（`--agent`），v1.68.1 之後的版本也帶著 DuDuClaw 資料目錄（`--home "<路徑>"`）。Claude CLI 的環境變數沒有 `DUDUCLAW_HOME`，所以先前 hook 一律退回 `$HOME/.duduclaw` 判斷；資料目錄不在預設位置的部署，真正資料目錄裡的每個路徑都被當成「資料目錄之外」。安裝器對每個 `<資料目錄>/agents/<id>`（或 `<資料目錄>/agents/.ephemeral/<id>`）形式的員工目錄都寫入 `--home`，路徑含 shell 特殊字元時改用單引號包起來。既有的安裝會在下一次啟動員工或 gateway 開機時就地改寫。
 
 Hook 依序從這些地方取得資料目錄：`--home`（只認絕對路徑）；沒有員工身分的呼叫者（hook 指令沒帶 `--agent`、環境裡也沒有 `DUDUCLAW_AGENT_ID`）照舊用預設位置；hook 環境裡明確設定的絕對路徑 `DUDUCLAW_HOME`。不會從工作目錄推回資料目錄。全部都推不出來時，該員工的每一次 `Write`／`Edit`／`MultiEdit`／`NotebookEdit`／`Bash` 呼叫都拒絕，不會拿猜測的位置判斷。`NotebookEdit` 也在同一次加入 matcher，它的 `notebook_path` 比照 `Write` 的目標判斷。Hook 子命令只在 stderr 回覆，不再寫日誌檔。
 
@@ -222,7 +222,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 ## 工作替誰做（`on_behalf_of`，v1.76.0）
 
-由真人發起的工作（一輪對話、`/交辦`、dashboard 建的任務），gateway 現在會把「這是替誰做的」一路帶下去：員工的 runtime 會拿到 `DUDUCLAW_ON_BEHALF_OF`（所有 runtime，不只 Claude）；`send_to_agent`／`spawn_agent` 把它寫進佇列（`message_queue.on_behalf_of`、`bus_queue.jsonl` 欄位），派工器再套到接手的那一輪；目標任務的每一輪與 heartbeat 喚醒從任務列（`tasks.on_behalf_of`）抄過來；`tasks_create` 建的新任務會記上；這一輪提出的核可也會存（`approvals.on_behalf_of`）。值是 `user:<帳號 id>`（WebChat 帳號或已驗證的通道身分），或 `unmapped:<通道>:<摘要>`（沒有帳號的發話者，用的是 `@` 路由稽核同一把金鑰的 HMAC，不會出現平台原始 id）。來源只有 gateway 寫的東西：spawn 時設定的環境變數，以及 gateway 或 MCP server（依該環境變數）寫的資料列，絕不讀工具參數。系統發送者名稱（`dashboard`、`cron` 等）、保留 id、格式不對的值一律拒收，並記為 `on_behalf_of_rejected`；第一個寫入的值為準，下游不覆寫。gateway 自己的環境變數不會傳下去：spawn 白名單不含這個變數，各 runtime 在設定本次執行的值之前會先移除繼承來的值。
+由真人發起的工作（一輪對話、`/交辦`、dashboard 建的任務），gateway 現在會把「這是替誰做的」一路帶下去：員工的 runtime 會拿到 `DUDUCLAW_ON_BEHALF_OF`（所有 runtime，不只 Claude）；`send_to_agent`／`spawn_agent` 把它寫進佇列（`message_queue.on_behalf_of`、`bus_queue.jsonl` 欄位），派工器再套到接手的那一輪；目標任務的每一輪與 heartbeat 喚醒從任務列（`tasks.on_behalf_of`）抄過來；`tasks_create` 建的新任務會記上；這一輪提出的核可也會存（`approvals.on_behalf_of`）。值是 `user:<帳號 id>`（WebChat 帳號或已驗證的通道身分），或 `unmapped:<通道>:<摘要>`（沒有帳號的發話者，用的是 `@` 路由稽核同一把金鑰的 HMAC，不會出現平台原始 id）。來源只有 gateway 寫的東西：spawn 時設定的環境變數，以及 gateway 或 MCP server（依該環境變數）寫的資料列，絕不讀工具參數。系統發送者名稱（`dashboard`、`cron` 等）、保留 id、格式不對的值一律拒收，並記為 `on_behalf_of_rejected`；第一個寫入的值為準，下游不覆寫。各 runtime 設定本次執行的值之前，會先移除繼承來的值。
 
 這一版的作用：
 

@@ -9375,7 +9375,7 @@
   "timeline.status.revising": "修改中",
   "timeline.status.needs_human": "等你決定",
   "timeline.status.done": "完成",
-  "timeline.status.blocked": "卡住了",
+  "timeline.status.blocked": "沒做完",
   "timeline.status.failed": "沒做完",
   "timeline.status.cancelled": "已取消",
   "timeline.status.problem": "需要留意",
@@ -9391,5 +9391,9 @@
   "timeline.elapsed.hours": "已開啟 {count} 小時",
   "timeline.sinceUpdate.hours": "距上次更新 {count} 小時",
   "timeline.elapsed.days": "已開啟 {count} 天",
-  "timeline.sinceUpdate.days": "距上次更新 {count} 天"
+  "timeline.sinceUpdate.days": "距上次更新 {count} 天",
+  "security.credentialAudit.provider.webchatGuest": "網頁對話訪客",
+  "timeline.waitingSinceUpdate.minutes": "已等 {count} 分鐘（距上次更新）",
+  "timeline.waitingSinceUpdate.hours": "已等 {count} 小時（距上次更新）",
+  "timeline.waitingSinceUpdate.days": "已等 {count} 天（距上次更新）"
 }

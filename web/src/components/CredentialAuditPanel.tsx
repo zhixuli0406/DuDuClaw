@@ -110,7 +110,10 @@ export function CredentialAuditPanel() {
 
   function providerLabel(row: ChatCredential) {
     if (!row.provided_by) return '—';
-    if (/^[a-f0-9]{64}$/i.test(row.provided_by) || row.provided_by === 'webchat-anonymous') {
+    if (/^webchat-user:[a-f0-9]+$/i.test(row.provided_by) || row.provided_by === 'webchat-anonymous') {
+      return t('provider.webchatGuest');
+    }
+    if (/^[a-f0-9]{64}$/i.test(row.provided_by)) {
       return t('provider.chat');
     }
     return row.provided_by;
@@ -175,7 +178,11 @@ export function CredentialAuditPanel() {
                     <TableCell><span className="block truncate" title={row.service ?? undefined}>{row.service ?? t('unknown')}</span></TableCell>
                     <TableCell><span>{t(`source.${row.source_kind}`)}</span><small className="block break-all text-muted-foreground" title={row.source_ref}>{row.source_ref}</small></TableCell>
                     <TableCell><span className="block truncate" title={row.provided_by}>{providerLabel(row)}</span></TableCell>
-                    <TableCell><span className="block break-all">{row.holders.filter((h) => !h.revoked_at).map((h) => `${t(`holder.${h.holder_kind}`)}: ${h.holder_id}`).join(', ') || '—'}</span></TableCell>
+                    <TableCell>{row.holders.some((h) => !h.revoked_at) ? row.holders.filter((h) => !h.revoked_at).map((h) => (
+                      <span key={`${h.holder_kind}:${h.holder_id}`} className="block truncate" title={`${t(`holder.${h.holder_kind}`)}: ${h.holder_id}`}>
+                        {t(`holder.${h.holder_kind}`)}: {h.holder_id.length > 24 ? `${h.holder_id.slice(0, 12)}…${h.holder_id.slice(-6)}` : h.holder_id}
+                      </span>
+                    )) : '—'}</TableCell>
                     <TableCell>{row.last_used_at && Number.isFinite(Date.parse(row.last_used_at)) ? intl.formatDate(row.last_used_at, { dateStyle: 'medium', timeStyle: 'short' }) : t('notObserved')}</TableCell>
                     <TableCell>{t(`status.${row.status}`)}</TableCell>
                     <TableCell>

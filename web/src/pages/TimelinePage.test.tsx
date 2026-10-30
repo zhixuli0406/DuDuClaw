@@ -57,7 +57,24 @@ describe('TimelinePage', () => {
     const cards = screen.getAllByTestId('timeline-employee-card');
     expect(cards.map((card) => within(card).getByText(/^(waiting|stuck|active|idle)$/).textContent)).toEqual(['waiting', 'stuck', 'active', 'idle']);
     expect(within(cards[0]).getByRole('link', { name: 'Task b' })).toHaveAttribute('href', '/tasks/b');
-    expect(within(cards[0]).getAllByText(/2 hours since last update/)).toHaveLength(2);
+    expect(within(cards[0]).getAllByText(/Waiting 2 hours \(since last update\)/)).toHaveLength(2);
+  });
+
+  it('orders waiting employees by their oldest update and uses the same unfinished label for blocked work', async () => {
+    useAgentsStore.setState({ agents: ['a-recent', 'z-oldest', 'blocked'].map((name) => ({ name, display_name: name })) as AgentDetail[] });
+    respond([
+      { ...task('recent', 'a-recent', 'needs_human'), updated_at: '2026-10-30T22:00:00Z' },
+      { ...task('oldest', 'z-oldest', 'needs_human'), started_at: '2026-10-20T00:00:00Z', updated_at: '2026-10-22T00:00:00Z' },
+      task('blocked', 'blocked', 'blocked'),
+    ]);
+    renderWithProviders(<TimelinePage />);
+    await screen.findByRole('link', { name: 'Task oldest' });
+    const cards = screen.getAllByTestId('timeline-employee-card');
+    expect(cards.map((card) => within(card).getByText(/^(z-oldest|a-recent|blocked)$/).textContent)).toEqual(['z-oldest', 'a-recent', 'blocked']);
+    expect(within(cards[0]).getAllByText(/Waiting 9 days \(since last update\)/)).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'Unfinished 1' })).toBeInTheDocument();
+    expect(within(cards[2]).getByText('Unfinished')).toBeInTheDocument();
+    expect(screen.queryByText('Stuck')).not.toBeInTheDocument();
   });
 
   it('keeps the chart collapsed and opens task links with one status legend', async () => {
@@ -70,6 +87,9 @@ describe('TimelinePage', () => {
     expect(within(chart).getByRole('link')).toHaveAttribute('href', '/tasks/a');
     expect(screen.getByText(/not hours worked/)).toBeInTheDocument();
     expect(chart.querySelector('rect[fill="var(--chart-3)"]')).toBeTruthy();
+    expect(chart.querySelector('[data-status-marker="active"] rect')).toBeTruthy();
+    expect(document.querySelector('[data-status-marker="waiting"] path')).toHaveAttribute('d', 'M5 0 10 5 5 10 0 5Z');
+    expect(document.querySelector('[data-status-marker="unfinished"] path')).toHaveAttribute('d', 'M5 0 10 10 0 10Z');
     expect(screen.queryByText('review')).not.toBeInTheDocument();
   });
 

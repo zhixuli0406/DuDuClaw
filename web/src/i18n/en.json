@@ -9375,7 +9375,7 @@
   "timeline.status.revising": "Revising",
   "timeline.status.needs_human": "Waiting for you",
   "timeline.status.done": "Completed",
-  "timeline.status.blocked": "Stuck",
+  "timeline.status.blocked": "Unfinished",
   "timeline.status.failed": "Unfinished",
   "timeline.status.cancelled": "Cancelled",
   "timeline.status.problem": "Needs attention",
@@ -9391,5 +9391,9 @@
   "timeline.elapsed.hours": "Open for {count} hours",
   "timeline.sinceUpdate.hours": "{count} hours since last update",
   "timeline.elapsed.days": "Open for {count} days",
-  "timeline.sinceUpdate.days": "{count} days since last update"
+  "timeline.sinceUpdate.days": "{count} days since last update",
+  "security.credentialAudit.provider.webchatGuest": "Web chat guest",
+  "timeline.waitingSinceUpdate.minutes": "Waiting {count} minutes (since last update)",
+  "timeline.waitingSinceUpdate.hours": "Waiting {count} hours (since last update)",
+  "timeline.waitingSinceUpdate.days": "Waiting {count} days (since last update)"
 }
