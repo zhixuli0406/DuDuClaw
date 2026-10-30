@@ -6,8 +6,6 @@ use std::{
 };
 
 pub const MAX_PENDING: usize = 1024 * 1024;
-// Stop reading terminal events well before the hard cap, leaving room for a paste.
-pub const BACKPRESSURE_AT: usize = 64 * 1024;
 
 pub(super) struct InputWriter {
     tx: mpsc::Sender<Vec<u8>>,

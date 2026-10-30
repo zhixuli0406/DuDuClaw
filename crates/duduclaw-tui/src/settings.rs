@@ -44,8 +44,6 @@ pub struct Settings {
     pub poll_interval: Duration,
     pub notifications: bool,
     pub default_layout: DefaultLayout,
-    /// Owner-local argv. Never interpreted as shell text or supplied by gateway.
-    pub pty_command: Option<Vec<String>>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -55,7 +53,6 @@ impl Default for Settings {
             poll_interval: POLL_INTERVAL,
             notifications: false,
             default_layout: DefaultLayout::Single,
-            pty_command: None,
         }
     }
 }
@@ -82,20 +79,12 @@ impl Settings {
         let Ok(table) = text.parse::<toml::Table>() else {
             return (Self::default(), Some(strings::SETTINGS_NOTICE));
         };
+        let removed_command = table.get("pty").and_then(toml::Value::as_table)
+            .is_some_and(|pty| pty.contains_key("command"));
         let mut result = Self::default();
         let mut bad = false;
         for (key, value) in table {
             match key.as_str() {
-                "pty" => match value.as_table() {
-                    Some(table) if table.len() == 1 && table.contains_key("command") => {
-                        let args = table["command"].as_array().and_then(|values| values.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>());
-                        match args {
-                            Some(args) if !args.is_empty() && !args[0].is_empty() && args.len() <= 64 && args.iter().all(|a| !a.contains('\0') && a.len() <= 4096) => result.pty_command = Some(args),
-                            _ => bad = true,
-                        }
-                    }
-                    _ => bad = true,
-                },
                 "default_layout" => match value.as_str() {
                     Some("single") => {},
                     Some("vertical") => result.default_layout = DefaultLayout::Vertical,
@@ -125,7 +114,7 @@ impl Settings {
                 _ => bad = true,
             }
         }
-        (result, bad.then_some(strings::SETTINGS_NOTICE))
+        (result, if removed_command { Some(strings::PTY_COMMAND_IGNORED) } else { bad.then_some(strings::SETTINGS_NOTICE) })
     }
 }
 /// An explicit CLI home wins; otherwise honor DUDUCLAW_HOME before the OS home.

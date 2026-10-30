@@ -136,7 +136,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             for pane in &app.blocks.panes {
                 if let Some(pty) = &pane.pty {
                     let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
-                    pty.start(settings.pty_command.as_deref());
+                    pty.start();
                     pty.poll();
                 }
             }
@@ -163,18 +163,14 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 })
                 .map_err(|_| Error::Terminal)?;
             // Never block a Tokio worker waiting for user input; only read ready events.
-            // Bound each batch for redraw/shutdown fairness. A slow child stops
-            // terminal reads before the byte cap; ready events remain at the source.
+            // Bound each batch for redraw/shutdown fairness. Always read host events,
+            // including escape, quit and resize, even when child input is full.
             for _ in 0..256 {
-                if app.pty_focus {
-                    if let Some(pty) = &app.blocks.panes[app.blocks.focused].pty {
-                        let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
-                        if pty.input_backpressured() { break; }
-                        pty.begin_input_batch();
-                    }
-                }
-                if !event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? { break; }
-                let key = match event::read().map_err(|_| Error::Terminal)? {
+                let Some(event) = read_host_event(&mut app, || {
+                    if !event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? { return Ok(None); }
+                    event::read().map(Some).map_err(|_| Error::Terminal)
+                })? else { break; };
+                let key = match event {
                     Event::Resize(_, _) => {
                         if let Some(card) = &mut app.card { card.invalidate_viewport(); }
                         if let Some(card) = &mut app.control_card { card.resize(); }
@@ -278,4 +274,16 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         output.flush().map_err(|_| Error::Output)?;
     }
     result
+}
+
+/// Host events are independent of child writer capacity. Keep this path shared
+/// with the stalled-child regression test so control keys cannot be gated again.
+fn read_host_event(app: &mut App, read: impl FnOnce() -> Result<Option<Event>>) -> Result<Option<Event>> {
+    let event = read()?;
+    if event.is_some() && app.pty_focus
+        && let Some(pty) = &app.blocks.panes[app.blocks.focused].pty
+    {
+        pty.lock().unwrap_or_else(|e| e.into_inner()).begin_input_batch();
+    }
+    Ok(event)
 }

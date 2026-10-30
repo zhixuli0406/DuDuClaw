@@ -238,7 +238,7 @@ impl App {
             }
             if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty {
                 let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
-                let bytes = crate::pty::key_bytes(key, pty.parser.screen().application_cursor());
+                let bytes = crate::pty::key_bytes(key, pty.screen().application_cursor());
                 pty.send(bytes);
             }
             return Action::None;
@@ -358,7 +358,7 @@ impl App {
                 KeyCode::Char('i' | 'P') | KeyCode::Enter => {
                     if !crate::pty::SUPPORTED { self.notice = Some(strings::PTY_DISABLED.into()); return Action::None; }
                     self.pty_focus = true;
-                    if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty { pty.lock().unwrap_or_else(|e| e.into_inner()).parser.screen_mut().set_scrollback(0); }
+                    if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty { pty.lock().unwrap_or_else(|e| e.into_inner()).reset_scroll(); }
                     return Action::None;
                 }
                 KeyCode::PageUp | KeyCode::PageDown => {
@@ -462,7 +462,7 @@ impl App {
                 let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
                 pty.flush_input();
                 if text.len() > crate::pty::MAX_INPUT { pty.status = strings::PTY_INPUT_FULL.into(); }
-                else { let bytes = crate::pty::paste_bytes(text, pty.parser.screen().bracketed_paste()); pty.send(bytes); }
+                else { let bytes = crate::pty::paste_bytes(text, pty.screen().bracketed_paste()); pty.send(bytes); }
             }
             return;
         }

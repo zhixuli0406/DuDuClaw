@@ -247,19 +247,20 @@ pub fn exit_more(count: usize) -> String { format!("另 {count} 位") }
 
 
 pub const PTY_BLOCK: &str = "本機終端";
+pub const PTY_COMMAND_IGNORED: &str = "舊版本機終端命令設定已忽略，改用啟動控制室者的 shell；其他無效設定採預設值";
 pub const PTY_STARTING: &str = "本機終端準備中";
 pub const PTY_RUNNING: &str = "本機行程執行中";
 pub const PTY_EXITED: &str = "本機行程已結束，代碼：";
 pub const PTY_STOPPED: &str = "本機行程已停止";
 pub const PTY_STOP_FAILED: &str = "本機行程清理未完整確認";
 pub const PTY_DISABLED: &str = "此平台尚未驗證終端行程樹清理，本機終端已停用";
-pub const PTY_START_FAILED: &str = "無法啟動本機終端，請檢查 shell 與本機命令設定";
+pub const PTY_START_FAILED: &str = "無法啟動本機終端，請檢查啟動控制室時的 shell 環境";
 pub const PTY_RESIZE_FAILED: &str = "無法調整本機終端大小";
 pub const PTY_INPUT_FAILED: &str = "輸入寫入失敗：行程已結束或終端無法寫入，請檢查命令";
 pub const PTY_INPUT_FULL: &str = "整段輸入未送出：待寫入資料超過 1 MiB";
 pub const PTY_FOCUS: &str = "本機終端；Ctrl-\\ / F12 返回控制室";
 pub const PTY_KEYS: &str = "Ctrl-\\ / F12 返回控制室；其他按鍵送至本機行程";
 pub const PTY_LIST_KEYS: &str = "Enter / i 輸入；PgUp / PgDn 捲動；Ctrl-W 關閉";
-pub const PTY_CONFIRM: &str = "本機行程仍在執行，關閉會停止其子行程。y 確認；Esc 取消";
+pub const PTY_CONFIRM: &str = "本機行程仍在執行，關閉會停止同一終端的行程；刻意脫離的行程會繼續執行。y 確認；Esc 取消";
 pub const PTY_CONFIRM_FOCUS: &str = "確認關閉本機終端";
 pub const CMD_PTY: &str = "開啟本機終端";

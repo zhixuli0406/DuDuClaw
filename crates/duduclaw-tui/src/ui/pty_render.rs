@@ -15,7 +15,7 @@ fn color(color: vt100::Color) -> Color {
     }
 }
 pub(super) fn cells(
-    screen: &vt100::Screen,
+    screen: &crate::pty::Screen,
     area: Rect,
     buffer: &mut Buffer,
     settings: &Settings,
@@ -94,18 +94,18 @@ pub(super) fn draw(
     if !screen_area.is_empty() {
         pty.resize(screen_area.height, screen_area.width);
         cells(
-            pty.parser.screen(),
+            pty.screen(),
             screen_area,
             frame.buffer_mut(),
             settings,
             focused,
         );
     }
-    let status = if pty.parser.screen().scrollback() > 0 {
+    let status = if pty.screen().scrollback() > 0 {
         format!(
             "{} | PgUp/PgDn -{}",
             pty.status,
-            pty.parser.screen().scrollback()
+            pty.screen().scrollback()
         )
     } else {
         pty.status.clone()
@@ -131,7 +131,7 @@ mod tests {
         parser.process("\u{202e}\u{200b}e\u{301}".as_bytes());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 4));
         cells(
-            parser.screen(),
+            &crate::pty::Screen::capture(parser.screen()),
             buffer.area,
             &mut buffer,
             &Settings::default(),

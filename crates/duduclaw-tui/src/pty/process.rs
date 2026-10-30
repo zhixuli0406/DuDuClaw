@@ -15,9 +15,10 @@ pub(super) struct Process {
     child: Option<Box<dyn Child + Send + Sync>>,
     pid: u32,
     pub cleanup_complete: bool,
+    pub session_cleanup_complete: bool,
 }
 impl Process {
-    pub fn spawn(command: Option<&[String]>, size: PtySize) -> io::Result<Spawned> {
+    pub fn spawn(size: PtySize) -> io::Result<Spawned> {
         let pair = portable_pty::native_pty_system()
             .openpty(size)
             .map_err(io::Error::other)?;
@@ -25,7 +26,7 @@ impl Process {
         let writer = pair.master.take_writer().map_err(io::Error::other)?;
         let mut child = pair
             .slave
-            .spawn_command(command_with_env(command, std::env::vars_os()))
+            .spawn_command(command_with_env(std::env::vars_os()))
             .map_err(io::Error::other)?;
         let Some(pid) = child
             .process_id()
@@ -39,7 +40,8 @@ impl Process {
             master: pair.master,
             child: Some(child),
             pid,
-            cleanup_complete: true,
+            cleanup_complete: false,
+            session_cleanup_complete: false,
         };
         drop(pair.slave);
         // Bounded byte queues; neither worker writes to stdout/stderr or logs.
@@ -149,7 +151,10 @@ impl Process {
         }
         let _ = child.kill();
         let status = child.wait();
-        self.cleanup_complete = cleanup_error.is_none();
+        // Session inventory cannot discover deliberately detached descendants.
+        // Even successful signals/reaping cannot prove complete tree cleanup.
+        self.cleanup_complete = false;
+        self.session_cleanup_complete = cleanup_error.is_none();
         status
     }
 }

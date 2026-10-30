@@ -13,7 +13,7 @@ use crate::{
     state_extra::{Activity, ScheduleSource, ScheduledRun},
     strings,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend, buffer::CellWidth, style::Color};
 use serde_json::json;
 use unicode_width::UnicodeWidthStr;
@@ -921,7 +921,9 @@ fn m4_pty_cjk_and_combining_snapshots_in_both_width_modes() {
     let mut app=App::default(); app.blocks.open(crate::blocks::Block::Pty,None); app.pty_focus=true;
     {
         let mut pty=app.blocks.panes[0].pty.as_ref().unwrap().lock().unwrap();
-        pty.parser.process("繁體中文 cafe\u{301}\r\n\x1b[1;32m彩色粗體\x1b[0m\r\n·αΩ end".as_bytes());
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process("繁體中文 cafe\u{301}\r\n\x1b[1;32m彩色粗體\x1b[0m\r\n·αΩ end".as_bytes());
+        pty.set_screen_for_test(parser.screen());
         pty.status=crate::strings::PTY_RUNNING.into();
     }
     for width in [AmbiguousWidth::Narrow,AmbiguousWidth::Wide] {
@@ -938,7 +940,7 @@ fn m4_unsupported_platform_never_enters_child_input() {
     app.key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE), &empty());
     assert!(!app.pty_focus);
     let mut session = app.blocks.panes[0].pty.as_ref().unwrap().lock().unwrap();
-    session.start(None);
+    session.start();
     assert_eq!(session.status, strings::PTY_DISABLED);
     assert!(!session.pending_or_running());
 }
@@ -1031,4 +1033,56 @@ fn m4_escape_and_control_bindings_through_real_terminal_parser() {
     if result.is_err() { let _ = child.kill(); }
     let _ = child.wait();
     assert!(result.is_ok(), "{result:?}: {}", String::from_utf8_lossy(&output));
+}
+
+#[test]
+fn full_stalled_child_queue_still_reads_escape_resize_and_quit() {
+    use std::{io::{self, Write}, sync::mpsc, time::{Duration, Instant}};
+    struct Stalled { gate: mpsc::Receiver<()>, started: mpsc::Sender<()> }
+    impl Write for Stalled {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let _ = self.started.send(());
+            let _ = self.gate.recv_timeout(Duration::from_secs(5));
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    for escape in [KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)] {
+        let (release, gate) = mpsc::channel();
+        let (started, writing) = mpsc::channel();
+        let mut app = App::default();
+        app.blocks.open(crate::blocks::Block::Pty, None);
+        app.pty_focus = true;
+        let pty = app.blocks.panes[0].pty.as_ref().unwrap().clone();
+        {
+            let mut pty = pty.lock().unwrap();
+            pty.set_writer_for_test(Stalled { gate, started });
+            pty.send(vec![b'x'; crate::pty::MAX_INPUT]);
+        }
+        writing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        let events = [
+            Event::Paste("refuse this entire chunk".into()),
+            Event::Resize(100, 30),
+            Event::Key(escape),
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        ];
+        let mut resized = false;
+        let mut quit = false;
+        for event in events {
+            let event = super::read_host_event(&mut app, || Ok(Some(event))).unwrap().unwrap();
+            match event {
+                Event::Paste(text) => {
+                    app.paste(&text);
+                    assert_eq!(pty.lock().unwrap().status, strings::PTY_INPUT_FULL);
+                }
+                Event::Resize(_, _) => { resized = true; }
+                Event::Key(key) => { quit |= app.key(key, &empty()) == Action::Quit; }
+                _ => unreachable!(),
+            }
+        }
+        assert!(resized && quit && !app.pty_focus);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+    }
 }

@@ -25,36 +25,47 @@ fn input_escape_controls_application_cursor_and_paste() {
 }
 #[test]
 fn parser_hostile_streams_never_become_terminal_commands() {
-    let mut session = Session::default();
-    let bytes = b"safe\x1b]52;c;CLIPBOARD_CANARY\x07\x1b]0;TITLE_CANARY\x07\x1b]2;TITLE2_CANARY\x1b\\\x1b]8;;https://evil.invalid\x1b\\link\x1b]8;;\x1b\\\x1bPqSIXEL_CANARY\x1b\\\x1bP1;2|DCS_CANARY\x1b\\\x1b[?2004h\x1b[31;1mRED";
+    let mut parser = vt100::Parser::new(24, 80, SCROLLBACK);
+    let mut filter = filter::Filter::default();
+    let bytes = b"safe\x1b]52;c;CLIPBOARD_CANARY\x07\x1b]0;TITLE_CANARY\x07\x1b]2;TITLE2_CANARY\x1b\\\x1b]8;;https://evil.invalid\x1b\\link\x1b]8;;\x1b\\\x1bPqSIXEL_CANARY\x1b\\\x1bP1;2|DCS_CANARY\x1b\\\x1b[31;1mRED";
     for chunk in bytes.chunks(3) {
-        session.parser.process(chunk);
+        filter.process(chunk, 24, 80, |safe| parser.process(safe));
     }
-    assert_eq!(session.parser.screen().contents(), "safelinkRED");
-    assert!(session.parser.screen().bracketed_paste());
-    assert!(session.parser.screen().cell(0, 8).unwrap().bold());
+    assert_eq!(parser.screen().contents(), "safelinkRED");
+    assert!(parser.screen().cell(0, 8).unwrap().bold());
 }
 #[test]
 fn resize_and_scrollback_are_bounded() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(16);
     let mut session = Session::default();
+    session.parser = Some(parser::ParserWorker::spawn(rx, 24, 80).unwrap());
     session.resize(6, 20);
-    assert_eq!(session.parser.screen().size(), (6, 20));
-    for _ in 0..6000 {
-        session.parser.process(b"line\r\n");
+    for _ in 0..60 { tx.send(b"line\r\n".repeat(100)).unwrap(); }
+    drop(tx);
+    session.scroll_offset = SCROLLBACK;
+    session.parser.as_ref().unwrap().scroll(SCROLLBACK);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        session.poll();
+        if session.screen().size() == (6, 20) && session.screen().scrollback() == SCROLLBACK { break; }
+        // Reapply after all queued lines have entered scrollback.
+        session.parser.as_ref().unwrap().scroll(0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        session.parser.as_ref().unwrap().scroll(SCROLLBACK);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(std::time::Instant::now() < deadline);
     }
-    session.parser.screen_mut().set_scrollback(usize::MAX);
-    assert_eq!(session.parser.screen().scrollback(), SCROLLBACK);
     session.scroll(false);
-    assert_eq!(session.parser.screen().scrollback(), SCROLLBACK - 5);
+    assert_eq!(session.scroll_offset, SCROLLBACK - 5);
     session.resize(0, u16::MAX);
-    assert_eq!(session.parser.screen().size(), (1, 500));
+    assert_eq!((session.size().rows, session.size().cols), (1, 500));
 }
 #[test]
 fn owner_environment_strips_all_identity_markers_and_has_no_session_token() {
     let cmd = command_with_env(
-        Some(&["claude".into()]),
         [
             ("SHELL".into(), "/bin/sh".into()),
+            ("COMSPEC".into(), "/bin/sh".into()),
             ("PATH".into(), "/usr/bin".into()),
             ("OWNER_VALUE".into(), "preserved".into()),
             ("DUDUCLAW_AGENT_TOKEN".into(), "agent-canary".into()),
@@ -62,6 +73,7 @@ fn owner_environment_strips_all_identity_markers_and_has_no_session_token() {
             ("duduclaw_future_marker".into(), "unknown-canary".into()),
         ],
     );
+    assert_eq!(cmd.get_argv(), &[std::ffi::OsString::from("/bin/sh")]);
     let env: Vec<_> = cmd.iter_full_env_as_str().collect();
     assert!(env.contains(&("OWNER_VALUE", "preserved")));
     assert!(
@@ -71,12 +83,9 @@ fn owner_environment_strips_all_identity_markers_and_has_no_session_token() {
     assert!(!env.iter().any(|(_, v)| v.contains("canary")));
 }
 #[test]
-fn local_command_configuration_is_argv_only() {
-    let (settings, notice) =
-        crate::settings::Settings::parse("[pty]\ncommand = ['claude', '--help']");
-    assert!(notice.is_none());
-    assert_eq!(settings.pty_command.unwrap(), vec!["claude", "--help"]);
+fn old_local_command_configuration_is_ignored_with_notice() {
     for input in [
+        "[pty]\ncommand = ['claude', '--help']",
         "[pty]\ncommand = 'sh -c echo unsafe'",
         "[pty]\ncommand = []",
         "[pty]\ncommand = ['']",
@@ -84,9 +93,12 @@ fn local_command_configuration_is_argv_only() {
         "[pty]\ncommand = ['sh']\nenv = { TOKEN = 'x' }",
     ] {
         let (settings, notice) = crate::settings::Settings::parse(input);
-        assert!(notice.is_some());
-        assert!(settings.pty_command.is_none());
+        assert_eq!(notice, Some(strings::PTY_COMMAND_IGNORED));
+        assert_eq!(settings.glyphs, crate::settings::Glyphs::Ascii);
     }
+    let (settings, notice) = crate::settings::Settings::parse("glyphs = 'unicode'\n[pty]\ncommand = ['evil']");
+    assert_eq!(notice, Some(strings::PTY_COMMAND_IGNORED));
+    assert_eq!(settings.glyphs, crate::settings::Glyphs::Unicode);
 }
 
 #[cfg(unix)]
@@ -106,11 +118,7 @@ mod native {
     #[test]
     fn child_exit_and_kernel_resize() {
         let mut session = Session::default();
-        session.start(Some(&[
-            "/bin/sh".into(),
-            "-c".into(),
-            "read line; stty size; printf '繁體é'; exit 7".into(),
-        ]));
+        session.start_script_for_test("read line; stty size; printf '繁體é'; exit 7");
         assert!(session.running());
         session.resize(13, 41);
         session.send(b"go\n".to_vec());
@@ -120,14 +128,14 @@ mod native {
         });
         wait_until(|| {
             session.poll();
-            session.parser.screen().contents().contains("13 41")
+            session.screen().contents().contains("13 41")
         });
         assert!(
             session
                 .status
                 .contains(&format!("{} 7", strings::PTY_EXITED))
         );
-        assert!(session.parser.screen().contents().contains("繁體é"));
+        assert!(session.screen().contents().contains("繁體é"));
     }
     #[test]
     fn close_kills_child_and_grandchild_in_owned_process_group() {
@@ -135,7 +143,7 @@ mod native {
         let path = dir.path().join("pids");
         let script = format!("sleep 120 & echo $! > '{}' ; wait", path.display());
         let mut session = Session::default();
-        session.start(Some(&["/bin/sh".into(), "-c".into(), script]));
+        session.start_script_for_test(&script);
         assert!(session.running());
         let pid = session.process.as_ref().unwrap().pid_for_test();
         wait_until(|| {
@@ -149,6 +157,7 @@ mod native {
             .parse()
             .unwrap();
         session.stop();
+        assert!(!session.cleanup_complete, "group cleanup cannot prove detached descendants stopped");
         wait_until(|| !duduclaw_core::platform::process_alive(pid));
         wait_until(|| !duduclaw_core::platform::process_alive(grandchild));
     }
@@ -162,7 +171,7 @@ mod native {
             path.display()
         );
         let mut session = Session::default();
-        session.start(Some(&["/bin/sh".into(), "-c".into(), script]));
+        session.start_script_for_test(&script);
         assert!(session.running());
         let pid = session.process.as_ref().unwrap().pid_for_test();
         wait_until(|| {
@@ -177,7 +186,8 @@ mod native {
             .unwrap();
         session.stop();
         assert!(!session.running());
-        assert_eq!(session.status, strings::PTY_STOPPED);
+        assert!(!session.cleanup_complete);
+        assert!(session.status.contains(strings::PTY_STOP_FAILED));
         wait_until(|| !duduclaw_core::platform::process_alive(pid));
         wait_until(|| !duduclaw_core::platform::process_alive(grandchild));
     }
@@ -235,7 +245,7 @@ fn burst_of_5000_key_events_reaches_slow_child_in_order_as_one_batch() {
 }
 
 #[test]
-fn byte_cap_counts_inflight_rejects_whole_chunks_and_applies_backpressure() {
+fn byte_cap_counts_inflight_and_rejects_whole_chunks() {
     use std::{io::{self, Write}, sync::{Arc, Mutex, mpsc}, time::Duration};
     struct GatedChild { bytes: Arc<Mutex<Vec<u8>>>, gate: mpsc::Receiver<()>, started: mpsc::Sender<()> }
     impl Write for GatedChild {
@@ -252,12 +262,11 @@ fn byte_cap_counts_inflight_rejects_whole_chunks_and_applies_backpressure() {
     let (started, writing) = mpsc::channel();
     let mut session = Session::default();
     session.input = Some(writer::InputWriter::spawn(GatedChild { bytes: bytes.clone(), gate, started }).unwrap());
-    session.send(vec![b'a'; writer::BACKPRESSURE_AT]);
+    session.send(vec![b'a'; 64 * 1024]);
     writing.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(session.input_backpressured());
     // Also exercise the unbounded-by-count queue while the first write is stalled.
     for _ in 0..5000 { session.send(vec![b'b']); }
-    let pending = writer::BACKPRESSURE_AT + 5000;
+    let pending = (64 * 1024) + 5000;
     assert_eq!(session.input.as_ref().unwrap().pending(), pending);
     session.send(vec![b'X'; MAX_INPUT - pending + 1]);
     assert_eq!(session.status, strings::PTY_INPUT_FULL);
@@ -269,8 +278,7 @@ fn byte_cap_counts_inflight_rejects_whole_chunks_and_applies_backpressure() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
-    assert!(!session.input_backpressured());
-    let expected = [vec![b'a'; writer::BACKPRESSURE_AT], vec![b'b'; 5000]].concat();
+    let expected = [vec![b'a'; 64 * 1024], vec![b'b'; 5000]].concat();
     assert_eq!(*bytes.lock().unwrap(), expected);
     session.send(vec![b'X'; MAX_INPUT + 1]);
     assert_eq!(session.status, strings::PTY_INPUT_FULL);
