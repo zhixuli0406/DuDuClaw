@@ -20,6 +20,10 @@ base64.workspace = true
 zeroize.workspace = true
 url = "2"
 rand = "0.8"
+toml.workspace = true
+tempfile = "3"
+unicode-width = "0.2.2"
+unicode-segmentation = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

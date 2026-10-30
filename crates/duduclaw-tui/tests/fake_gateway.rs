@@ -218,12 +218,16 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                             "approvals.list" => {
                                 f.list_calls.fetch_add(1,Ordering::SeqCst);
                                 tokio::time::sleep(Duration::from_millis(f.list_delay_ms.load(Ordering::SeqCst))).await;
-                                json!({"approvals":[{"id":"a1","agent_id":"adu","kind":"tool","summary":"需要審核","status":"pending","request_kind":"question","expires_at":null,"decided_in_dashboard_only":true}],"count":1})
+                                json!({"approvals":[{"id":"a1","agent_id":"adu","kind":"tool","summary":"需要審核\u{1b}[2K\u{202e}","status":"pending","request_kind":"question","expires_at":null,"decided_in_dashboard_only":true}],"count":1})
                             }
                             "tasks.list_page" => {
                                 assert_eq!(params["agent_id"],"adu","non-admin requires agent scope");
                                 assert_eq!(params["status"],"needs_human");
                                 json!({"tasks":[{"id":"t1","title":"請確認","assigned_to":"adu","status":"needs_human","pause_reason":"unknown","goal_mode":true}],"total":1,"limit":200,"offset":0})
+                            }
+                            "runs.list" => {
+                                assert_eq!(params["agent_id"], "adu");
+                                json!({"runs":[{"id":"r1","agent_id":"adu","status":"completed"}]})
                             }
                             "pair.first" => { first = Some(id); continue; }
                             "pair.second" => {
@@ -399,4 +403,51 @@ async fn server_expiry_rejection_refreshes_before_reconnecting() {
         gateway.fixture.refreshed_connections.load(Ordering::SeqCst),
         1
     );
+}
+
+#[tokio::test]
+async fn json_inbox_entry_point_against_gateway() {
+    let Some(gateway) = Gateway::start(false).await else { return; };
+    let client = gateway.client().await;
+    let home = tempfile::tempdir().unwrap();
+    let mut output = Vec::new();
+    duduclaw_tui::inbox::run_inbox_to(duduclaw_tui::InboxOptions {
+        client, home: Some(home.path().into()), follow: false, json: true,
+    }, &mut output).await.unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    let value: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["type"], "inbox");
+    assert_eq!(value["stale"], false);
+    assert_eq!(value["count"], 2);
+    assert_eq!(value["items"][0]["data"]["summary"], "需要審核\u{1b}[2K\u{202e}");
+    assert_eq!(value["items"][0]["source"], "員工提問");
+    assert_eq!(value["items"][1]["data"]["id"], "t1");
+}
+
+#[tokio::test]
+async fn json_follow_reports_loss_and_recovery_without_duplicate_poll_output() {
+    use std::io::Write;
+    struct Lines(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+    impl Write for Lines {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.send(b.to_vec()).unwrap(); Ok(b.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let Some(gateway) = Gateway::start(false).await else { return; };
+    let client = gateway.client().await;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("tui.toml"), "poll_interval_seconds = 5").unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let options = duduclaw_tui::InboxOptions { client, home: Some(home.path().into()), follow:true, json:true };
+    let task = tokio::spawn(async move { duduclaw_tui::inbox::run_inbox_to(options, &mut Lines(tx)).await });
+    let first = timeout(Duration::from_secs(6),rx.recv()).await.unwrap().unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&first).unwrap()["stale"],false);
+    gateway.fixture.list_delay_ms.store(120,Ordering::SeqCst);
+    gateway.push("events_lost",1,"boot-a");
+    let stale = timeout(Duration::from_secs(6),rx.recv()).await.unwrap().unwrap();
+    let value:Value=serde_json::from_slice(&stale).unwrap();
+    assert_eq!(value["stale"],true);assert!(value["count"].is_null());assert_eq!(value["items"].as_array().unwrap().len(),2);
+    let recovered = timeout(Duration::from_secs(6),rx.recv()).await.unwrap().unwrap();assert_eq!(recovered,first);
+    assert!(timeout(Duration::from_millis(5200),rx.recv()).await.is_err());
+    task.abort(); let _=task.await;
 }

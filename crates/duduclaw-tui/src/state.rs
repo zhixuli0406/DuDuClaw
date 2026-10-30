@@ -6,7 +6,9 @@ use crate::{
     sanitize::TerminalText,
     strings,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use crate::state_extra::{Activity, ScheduledRun};
+use std::collections::HashMap;
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 use tokio::{
@@ -18,7 +20,7 @@ use tokio::{
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Employee {
     /// Opaque RPC key, never draw this directly; use name_text().
     name: String,
@@ -34,7 +36,7 @@ impl Employee {
         TerminalText::new(self.name.clone())
     }
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Approval {
     id: String,
     pub agent_id: TerminalText,
@@ -54,7 +56,7 @@ impl Approval {
         &self.id
     }
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HumanTask {
     id: String,
     pub title: TerminalText,
@@ -82,10 +84,11 @@ impl InboxItem {
             Self::Approval(a)
                 if a.request_kind
                     .as_ref()
-                    .is_some_and(|k| k.plain() == "question") =>
+                    .is_some_and(|k| k.is("question")) =>
             {
                 strings::SOURCE_QUESTION
             }
+            Self::Approval(a) if a.kind.is("budget_breaker") || a.kind.is("autopilot_breaker") => strings::SOURCE_BREAKER,
             Self::Approval(_) => strings::SOURCE_APPROVAL,
             Self::Task(_) => strings::SOURCE_GOAL,
         }
@@ -128,6 +131,10 @@ impl<T> Snapshot<T> {
 }
 #[derive(Clone, Debug, Default)]
 pub struct Model {
+    pub schedules: Snapshot<ScheduledRun>,
+    pub autonomy: Option<TerminalText>,
+    pub activity: HashMap<String, Activity>,
+    pub recent_activity: HashMap<String, Activity>,
     pub inbox: Snapshot<InboxItem>,
     pub employees: Snapshot<Employee>,
     pub role: Option<Role>,
@@ -141,9 +148,12 @@ impl Model {
     pub fn invalidate_all(&mut self) {
         self.inbox.invalidate();
         self.employees.invalidate();
+        self.schedules.invalidate();
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn connected(&mut self, info: &ConnectionInfo) {
+        self.activity.clear();
+        self.autonomy = info.autonomy.clone();
         self.generation = info.generation;
         self.role = Some(info.role);
         self.boot_id = info.boot_id.clone();
@@ -160,21 +170,32 @@ impl Model {
             self.boot_id = Some(boot.clone());
         }
         if boot_changed {
+            self.activity.clear();
             self.seq = None;
             self.invalidate_all();
         }
+        let regressed = event.seq.zip(self.seq).is_some_and(|(new, old)| new < old);
         if let Some(seq) = event.seq {
             // A gap or a regression invalidates; exact duplicates are harmless.
             if self
                 .seq
                 .is_some_and(|old| seq != old && old.checked_add(1) != Some(seq))
             {
+                self.activity.clear();
                 self.invalidate_all();
             }
             self.seq = Some(seq);
         }
+        if !regressed {
+            crate::state_extra::activity_event(&mut self.activity, &event.name, &event.payload);
+        }
+        if event.name == "autonomy.changed" {
+            self.autonomy = event.payload.get("state").or_else(|| event.payload.get("autonomy"))
+                .filter(|value| !value.is_null())
+                .map(|value| TerminalText::new(value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())));
+        }
         match event.name.as_str() {
-            "events_lost" => self.invalidate_all(),
+            "events_lost" => { self.activity.clear(); self.invalidate_all(); },
             "approval.created" | "approval.decided" | "approval.expired" => {
                 self.inbox.invalidate();
                 self.revision = self.revision.wrapping_add(1);
@@ -197,10 +218,19 @@ impl Model {
             Ok(lists) => {
                 self.employees.replace(lists.employees);
                 self.inbox.replace(lists.inbox);
+                match lists.recent_activity {
+                    Ok(activity) => self.recent_activity = activity,
+                    Err(error) => { self.employees.invalidate(); self.employees.error = Some(error); }
+                }
+                match lists.schedules {
+                    Ok(rows) => self.schedules.replace(rows),
+                    Err(error) => { self.schedules.invalidate(); self.schedules.error = Some(error); }
+                }
             }
             Err(error) => {
                 self.inbox.invalidate();
                 self.employees.invalidate();
+                self.schedules.invalidate();
                 self.inbox.error = Some(error);
                 self.employees.error = Some(error);
             }
@@ -209,6 +239,8 @@ impl Model {
     }
 }
 struct Lists {
+    recent_activity: Result<HashMap<String, Activity>>,
+    schedules: Result<Vec<ScheduledRun>>,
     employees: Vec<Employee>,
     inbox: Vec<InboxItem>,
 }
@@ -284,7 +316,11 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
             }
         }
     }
+    let recent_activity = crate::state_extra::recent_activity(client, &agents.agents).await;
+    let schedules = if role == Role::Admin { crate::state_extra::schedules(client).await } else { Ok(Vec::new()) };
     Ok(Lists {
+        recent_activity,
+        schedules,
         employees: agents.agents,
         inbox,
     })
@@ -375,6 +411,8 @@ mod tests {
         assert!(m.apply(
             0,
             Ok(Lists {
+                recent_activity: Ok(HashMap::new()),
+                schedules: Ok(vec![]),
                 employees: vec![],
                 inbox: vec![]
             })
@@ -420,6 +458,7 @@ mod tests {
             role: Role::Admin,
             boot_id: None,
             version: None,
+            autonomy: None,
         });
         assert_eq!(m.inbox.count(), None);
     }
@@ -439,6 +478,8 @@ mod tests {
         assert!(!m.apply(
             old_revision,
             Ok(Lists {
+                recent_activity: Ok(HashMap::new()),
+                schedules: Ok(vec![]),
                 employees: vec![],
                 inbox: vec![]
             })
@@ -449,10 +490,24 @@ mod tests {
         assert!(m.apply(
             m.revision,
             Ok(Lists {
+                recent_activity: Ok(HashMap::new()),
+                schedules: Ok(vec![]),
                 employees: vec![],
                 inbox: vec![]
             })
         ));
         assert_eq!(m.inbox.count(), Some(0));
     }
+    #[test]
+    fn unavailable_history_does_not_claim_fresh_employee_state() {
+        let mut model = fresh();
+        assert!(model.apply(model.revision, Ok(Lists {
+            recent_activity: Err(Error::RpcRejected),
+            schedules: Ok(vec![]), employees: vec![], inbox: vec![],
+        })));
+        assert_eq!(model.inbox.count(), Some(0));
+        assert_eq!(model.employees.count(), None);
+        assert_eq!(model.employees.error, Some(Error::RpcRejected));
+    }
+
 }

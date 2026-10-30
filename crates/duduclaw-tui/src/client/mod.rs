@@ -47,6 +47,7 @@ pub struct ConnectionInfo {
     pub role: Role,
     pub boot_id: Option<String>,
     pub version: Option<TerminalText>,
+    pub autonomy: Option<TerminalText>,
 }
 #[derive(Clone)]
 pub enum ConnectionState {
@@ -412,6 +413,7 @@ fn handshake(payload: Value, expected_user: &str, generation: u64) -> Result<Con
         admin_fallback: bool,
         boot_id: Option<String>,
         version: Option<TerminalText>,
+        autonomy: Option<Value>,
     }
     let hello: Hello = serde_json::from_value(payload).map_err(|_| Error::Protocol)?;
     if hello.admin_fallback {
@@ -433,6 +435,9 @@ fn handshake(payload: Value, expected_user: &str, generation: u64) -> Result<Con
         role: hello.user.role,
         boot_id: hello.boot_id,
         version: hello.version,
+        autonomy: hello.autonomy.map(|v| TerminalText::new(match v {
+            Value::String(s) => s, value => value.to_string(),
+        })),
     })
 }
 fn backoff(options: &ClientOptions, attempt: u32) -> Duration {

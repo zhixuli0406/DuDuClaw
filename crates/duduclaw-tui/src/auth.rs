@@ -12,6 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 /// Implementations must disable echo for Password and Otp, and never log input.
 /// Phase 3 supplies the terminal implementation; tests supply scripted answers.
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait annotates its already-must-use Future.
 pub trait LoginPrompt: Send {
     async fn read(&mut self, field: PromptField) -> Result<Zeroizing<String>>;
 }
@@ -163,6 +164,7 @@ struct HttpReply {
     body: Zeroizing<Vec<u8>>,
 }
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait annotates its already-must-use Future.
 trait AuthHttp: Send + Sync {
     async fn request(
         &self,

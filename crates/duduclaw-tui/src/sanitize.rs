@@ -37,6 +37,9 @@ impl TerminalText {
     pub fn new(text: String) -> Self {
         Self(text)
     }
+    /// Compare opaque identities without applying display normalization.
+    pub fn is(&self, value: &str) -> bool { self.0 == value }
+    pub(crate) fn json_value(&self) -> Option<serde_json::Value> { serde_json::from_str(&self.0).ok() }
     pub fn plain(&self) -> String {
         sanitize_for_terminal(&self.0)
     }
@@ -52,6 +55,13 @@ impl std::fmt::Debug for TerminalText {
 impl<'de> serde::Deserialize<'de> for TerminalText {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         <String as serde::Deserialize>::deserialize(d).map(Self)
+    }
+}
+
+// JSON preserves raw data; consumers must not write deserialized text raw to a terminal.
+impl serde::Serialize for TerminalText {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
     }
 }
 
