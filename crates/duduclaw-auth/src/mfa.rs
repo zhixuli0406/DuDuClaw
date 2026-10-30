@@ -10,6 +10,11 @@ use crate::{
     db::{hash_password, verify_password_hash},
 };
 
+/// A credential is valid only at the exact epoch that minted it.
+pub fn credential_epoch_matches(presented: u64, current: u64) -> bool {
+    presented == current
+}
+
 pub const TTL: i64 = 300;
 const DENIED: &str = "雙因素驗證失敗或已過期，請重新登入。";
 type Result<T> = std::result::Result<T, String>;
@@ -38,8 +43,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE users ADD COLUMN credential_epoch INTEGER NOT NULL DEFAULT 0;")
             .map_err(|e| e.to_string())?;
     }
+    if !crate::user_row::has_column(conn, "channel_identities", "verified_at")? {
+        conn.execute_batch("ALTER TABLE channel_identities ADD COLUMN verified_at INTEGER;")
+            .map_err(|e| e.to_string())?;
+    }
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS mfa_credentials (
+        "CREATE TABLE IF NOT EXISTS mfa_policy_state (
+        id INTEGER PRIMARY KEY CHECK(id=1), enforced INTEGER NOT NULL, enforced_at INTEGER);
+        CREATE TABLE IF NOT EXISTS mfa_credentials (
         user_id TEXT PRIMARY KEY, secret_enc TEXT NOT NULL, last_step INTEGER NOT NULL,
         failed_attempts INTEGER NOT NULL DEFAULT 0, failure_window INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS mfa_pending (
@@ -68,7 +79,26 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             UPDATE auth_meta SET value=value+1 WHERE key='acl_generation';
         END;",
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if !crate::user_row::has_column(conn, "mfa_enrollment_codes", "challenge")? {
+        conn.execute_batch("ALTER TABLE mfa_enrollment_codes ADD COLUMN challenge TEXT;
+            DELETE FROM mfa_enrollment_codes;") .map_err(|e|e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Persist the observed policy transition; timestamps are Unix microseconds.
+/// A restart/reload of true preserves the original boundary.
+pub fn record_enforcement(conn: &mut Connection, enforced: bool, now: i64) -> Result<Option<i64>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+    tx.execute("INSERT INTO mfa_policy_state(id,enforced,enforced_at) VALUES(1,?1,?2)
+        ON CONFLICT(id) DO UPDATE SET enforced=excluded.enforced,
+        enforced_at=CASE WHEN excluded.enforced=0 THEN NULL WHEN mfa_policy_state.enforced=1
+        THEN mfa_policy_state.enforced_at ELSE excluded.enforced_at END",
+        params![enforced, enforced.then_some(now)]).map_err(|e|e.to_string())?;
+    let since = tx.query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r|r.get(0)).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())?;
+    Ok(since)
 }
 
 fn random_hex(bytes: usize) -> Result<String> {
@@ -76,6 +106,9 @@ fn random_hex(bytes: usize) -> Result<String> {
     SystemRandom::new().fill(&mut data).map_err(|_| DENIED)?;
     Ok(data.iter().map(|b| format!("{b:02x}")).collect())
 }
+/// Short, non-secret reference to read to the administrator (not a bearer token).
+pub fn enrollment_challenge_ref(token: &str) -> String { token_hash(token)[..12].to_owned() }
+
 fn token_hash(token: &str) -> String {
     ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
         .as_ref()

@@ -813,6 +813,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "Failed to initialize user database: {e}"
         ))
     })?);
+    crate::mfa::reload_policy(&home_dir);
     // Establish the non-retroactive window before any channel accepts turns.
     handler.resolve_edition_profile().await;
     if let Err(e) = crate::team_oversight::observe_window(&home_dir, &user_db, "gateway_boot") {
@@ -3493,11 +3494,18 @@ async fn handle_channel_bind(
         )
             .into_response();
     }
-    match state.user_db.bind_channel_identity(
+    let personal = state.handler.resolve_edition_profile().await.is_personal();
+    match crate::mfa::enforced(&state.home_dir, personal) {
+        Ok(_) => (),
+        Err(_) => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"authentication service unavailable"}))).into_response(),
+    };
+    match state.user_db.bind_channel_identity_authorized(
         &body.user_id,
         &body.channel,
         &body.channel_user_id,
         true,
+        Some(&caller.id),
+        !personal,
     ) {
         Ok(()) => {
             let _ = state.user_db.log_action(
@@ -3726,7 +3734,7 @@ async fn handle_refresh(
 
     // Fetch fresh user data and bindings
     let user = match state.user_db.get_user(&claims.sub) {
-        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && claims.credential_epoch >= u.credential_epoch => u,
+        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, u.credential_epoch) => u,
         _ => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
@@ -16196,7 +16204,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
         tokio::select! {
             // ── Heartbeat ping ─────────────────────────────
             _ = heartbeat_interval.tick() => {
-                if server_mfa::socket_expired(&state, &user_ctx.user_id, access_expires).await {
+                if server_mfa::socket_expired(&state, &user_ctx, access_expires, legacy_admin_authenticated).await {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
@@ -16257,10 +16265,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 let task_tx = rpc_tx.clone();
                                 let task_session = dashboard_session.clone();
                                 tokio::spawn(async move {
-                                    let mut response = crate::google_personal::DASHBOARD_SESSION.scope(
+                                    let mut response = crate::mfa::ACCESS_EXPIRY.scope(access_expires, crate::google_personal::DASHBOARD_SESSION.scope(
                                         task_session,
                                         task_state.handler.handle_conn(&method, params, &task_ctx, conn_info),
-                                    ).await;
+                                    )).await;
 
                                     // P4-3+ OS live event tail: unlike `logs.subscribe` above
                                     // (which flips its flag on the method NAME alone, before
@@ -16534,7 +16542,7 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
     // Single DB lookup — fail-closed: DB error = reject.
     let must_change_password = match state.user_db.get_user(&claims.sub) {
         Ok(Some(user)) => {
-            if claims.credential_epoch < user.credential_epoch { return Err("登入憑證已失效，請重新登入。".into()); }
+            if !duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, user.credential_epoch) { return Err("登入憑證已失效，請重新登入。".into()); }
             jwt_account_gate(user.status, user.must_change_password)?
         },
         Ok(None) => return Err("user not found".to_string()),

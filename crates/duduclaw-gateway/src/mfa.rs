@@ -3,6 +3,10 @@ use duduclaw_auth::{UserDb, UserRole, UserStatus, mfa::MfaCipher};
 use serde_json::{Value, json};
 use std::path::Path;
 
+tokio::task_local! {
+    pub(crate) static ACCESS_EXPIRY: Option<u64>;
+}
+
 pub(crate) struct Cipher<'a>(pub &'a Path);
 impl MfaCipher for Cipher<'_> {
     fn encrypt(&self, plaintext: &str) -> Result<String, String> {
@@ -52,8 +56,21 @@ impl MfaCipher for Cipher<'_> {
     }
 }
 
-static POLICY: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<std::path::PathBuf, bool>>> =
+#[derive(Clone, Default)]
+struct PolicySnapshot {
+    value: Option<bool>,
+    enforced_at: Option<i64>,
+    degraded: bool,
+}
+static POLICY: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<std::path::PathBuf, PolicySnapshot>>> =
     std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn policy_status(home: &Path) -> Value {
+    let snapshots = POLICY.read().unwrap_or_else(|e|e.into_inner());
+    let s = snapshots.get(home).cloned().unwrap_or(PolicySnapshot { degraded:true, ..Default::default() });
+    json!({"degraded":s.degraded,"last_good_enforced":s.value,"enforced_at":s.enforced_at,
+        "warning":if s.degraded {Some("雙因素驗證設定無法重新載入，目前保留最後有效設定；請檢查 config.toml。")} else {None}})
+}
 
 fn parse_policy(text: &str) -> Result<bool, String> {
     let table: toml::Table = text.parse().map_err(|_| "登入設定格式不正確。")?;
@@ -66,16 +83,31 @@ fn parse_policy(text: &str) -> Result<bool, String> {
 }
 /// Boot and configuration reload only. A failed reload never discards a good snapshot.
 pub(crate) fn reload_policy(home: &Path) {
+    // Serialize reloads so an older disk read cannot overwrite a newer snapshot.
+    let mut snapshots = POLICY.write().unwrap_or_else(|e|e.into_inner());
     let result = std::fs::read_to_string(home.join("config.toml"))
-        .map_err(|e|e.to_string()).and_then(|s|parse_policy(&s));
+        .map_err(|e|e.to_string()).and_then(|s|parse_policy(&s))
+        .and_then(|value| {
+            let since = if home.join("users.db").exists() {
+                let mut db = rusqlite::Connection::open_with_flags(home.join("users.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|e|e.to_string())?;
+                duduclaw_auth::mfa::record_enforcement(&mut db,value,chrono::Utc::now().timestamp_micros())?
+            } else if value {
+                return Err("MFA identity store unavailable".into());
+            } else { None };
+            Ok((value,since))
+        });
+    let snapshot = snapshots.entry(home.to_path_buf()).or_default();
     match result {
-        Ok(value) => { POLICY.write().unwrap_or_else(|e|e.into_inner()).insert(home.to_path_buf(),value); }
-        Err(error) => tracing::warn!(%error,"MFA policy reload failed; retaining last valid snapshot"),
+        Ok((value,since)) => { snapshot.value=Some(value); snapshot.enforced_at=since; snapshot.degraded=false; }
+        Err(error) => {
+            snapshot.degraded=true;
+            tracing::warn!(%error,"MFA policy reload failed; retaining last valid snapshot (degraded)");
+        }
     }
 }
 pub(crate) fn enforced(home: &Path, personal: bool) -> Result<bool, String> {
     if personal { return Ok(false); }
-    POLICY.read().unwrap_or_else(|e|e.into_inner()).get(home).copied()
+    POLICY.read().unwrap_or_else(|e|e.into_inner()).get(home).and_then(|s|s.value)
         .ok_or_else(|| "尚無有效的登入設定；請檢查 config.toml。".into())
 }
 pub(crate) fn require_admin(db: &UserDb, id: &str) -> Result<(), String> {
@@ -96,6 +128,7 @@ mod tests {
     #[test]
     fn mfa_policy_snapshot_keeps_last_good_on_reload_failure() {
         let home=tempfile::tempdir().unwrap();
+        let _db=UserDb::new(&home.path().join("users.db")).unwrap();
         assert!(enforced(home.path(),false).is_err());
         assert!(!enforced(home.path(),true).unwrap());
         std::fs::write(home.path().join("config.toml"),"").unwrap();
@@ -105,10 +138,15 @@ mod tests {
             std::fs::write(home.path().join("config.toml"),text).unwrap();
             reload_policy(home.path());
             assert!(!enforced(home.path(),false).unwrap());
+            assert_eq!(policy_status(home.path())["degraded"],true);
         }
         std::fs::write(home.path().join("config.toml"),"[auth]\nmfa_enforced=true").unwrap();
         reload_policy(home.path());
         assert!(enforced(home.path(),false).unwrap());
+        assert_eq!(policy_status(home.path())["degraded"],false);
+        let since=policy_status(home.path())["enforced_at"].clone();
+        reload_policy(home.path());
+        assert_eq!(policy_status(home.path())["enforced_at"],since);
         assert!(!enforced(home.path(),true).unwrap());
         std::fs::remove_file(home.path().join("config.toml")).unwrap();
         reload_policy(home.path());

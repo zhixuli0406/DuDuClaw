@@ -27,7 +27,7 @@ use super::*;
 
 use toml_edit::{DocumentMut, Item, Table as EditTable, Value as EditValue};
 
-use super::config_commit::{RAW_SECRET_MASK, commit_text_locked, content_hash, read_text_or_empty, write_backup};
+use super::config_commit::{RAW_SECRET_MASK, commit_text_locked_with_guard, content_hash, read_text_or_empty, write_backup};
 
 /// Why a `config.raw.set` call failed: a plain message (validation, stale
 /// hash, write error) or a ready structured frame (the subscription-risk
@@ -847,8 +847,9 @@ impl MethodHandler {
         // Every validation message is scrubbed of restored secrets.
         let after = validate_raw(&kind, &new_text).map_err(|e| rctx.scrub(&e))?;
         let before: toml::Table = stored.parse().unwrap_or_default();
-        if matches!(kind, RawFile::Config)
-            && super::config_commit::toml_at(&before, "auth.mfa_enforced") != super::config_commit::toml_at(&after, "auth.mfa_enforced") {
+        let mfa_security_change = matches!(kind, RawFile::Config)
+            && super::config_commit::toml_at(&before, "auth.mfa_enforced") != super::config_commit::toml_at(&after, "auth.mfa_enforced");
+        if mfa_security_change {
             self.mfa_require_current_admin(ctx).await?;
         }
         crate::product_policy::validate_write(&self.home_dir, &path, &stored, &new_text)?;
@@ -952,7 +953,12 @@ impl MethodHandler {
             .map_err(|e| rctx.scrub(&e.message()))?;
         } else {
             let (p, h, t) = (path.clone(), stored_hash.clone(), new_text.clone());
-            tokio::task::spawn_blocking(move || commit_text_locked(&p, &h, &t))
+            let db = self.user_db.read().await.clone();
+            let actor = ctx.user_id.clone();
+            tokio::task::spawn_blocking(move || commit_text_locked_with_guard(&p, &h, &t, || {
+                if mfa_security_change { crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?; }
+                Ok(())
+            }))
                 .await
                 .map_err(|e| format!("write task failed: {e}"))??;
         }

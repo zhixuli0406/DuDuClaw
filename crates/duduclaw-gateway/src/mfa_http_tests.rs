@@ -212,7 +212,7 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     let (_dir, state, user) = fixture(false, true).await;
     let old = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
     let (_, response) = login(&state, 184).await;
-    assert_eq!(response.as_object().unwrap().len(), 2);
+    assert_eq!(response.as_object().unwrap().len(), 3);
     assert_eq!(response["mfa_enrollment_required"], true);
     assert!(response.get("access_token").is_none() && response.get("refresh_token").is_none());
     let token = response["enrollment_token"].as_str().unwrap().to_owned();
@@ -232,12 +232,12 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     assert!(
         !socket_expired(
             &state,
-            &user.id,
-            Some(chrono::Utc::now().timestamp() as u64 + 1800)
+            &authenticate_jwt(&state, &old.0).unwrap(),
+            Some(chrono::Utc::now().timestamp() as u64 + 1800), false
         )
         .await
     );
-    assert!(socket_expired(&state, &user.id, Some(1)).await);
+    assert!(socket_expired(&state, &authenticate_jwt(&state, &old.0).unwrap(), Some(1), false).await);
     assert_eq!(
         handle_refresh(
             State(state.clone()),
@@ -254,7 +254,7 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     assert_eq!(enroll_begin(State(state.clone()),ConnectInfo(peer(184)),Json(EnrollBody {
         enrollment_token:token.clone(),code:None,proof_code:None,password:None,
     })).await.status(),StatusCode::UNAUTHORIZED);
-    let proof=state.user_db.mfa_issue_enrollment_code(None,&user.id,chrono::Utc::now().timestamp()).unwrap();
+    let proof=state.user_db.mfa_issue_enrollment_code(None,&user.id,&duduclaw_auth::mfa::enrollment_challenge_ref(&token),chrono::Utc::now().timestamp()).unwrap();
     let (_, start) = body(
         enroll_begin(
             State(state.clone()),
@@ -439,4 +439,65 @@ async fn mfa_stolen_jwt_cannot_begin_without_password_or_confirm_other_session()
     let params=json!({"enrollment_token":payload["enrollment_token"],"code":totp(payload["secret"].as_str().unwrap())});
     assert!(matches!(crate::google_personal::DASHBOARD_SESSION.scope(Some((user.id.clone(),uuid::Uuid::new_v4().to_string())),state.handler.handle("mfa.enroll_confirm",params.clone(),&ctx)).await,crate::protocol::WsFrame::Response{ok:false,..}));
     assert!(matches!(call("mfa.enroll_confirm",params).await,crate::protocol::WsFrame::Response{ok:true,..}));
+}
+
+#[tokio::test]
+async fn mfa_heartbeat_retires_legacy_and_epoch_but_preserves_default_off() {
+    let (_dir,state,user)=fixture(false,false).await;
+    let token=state.jwt_config.issue_access_token(&user,&[]).unwrap();
+    let ctx=authenticate_jwt(&state,&token).unwrap();
+    assert!(!socket_expired(&state,&ctx,Some(1),false).await);
+    assert!(!socket_expired(&state,&UserContext::admin_fallback(),None,true).await);
+    std::fs::write(state.home_dir.join("config.toml"),"[auth]\nmfa_enforced=true").unwrap();
+    crate::mfa::reload_policy(&state.home_dir);
+    assert!(socket_expired(&state,&UserContext::admin_fallback(),None,true).await);
+    assert!(!socket_expired(&state,&ctx,Some(u64::MAX),false).await);
+    assert!(socket_expired(&state,&ctx,Some(1),false).await);
+    state.user_db.mfa_operator_reset(&user.email).unwrap();
+    assert!(socket_expired(&state,&ctx,Some(u64::MAX),false).await);
+    let fresh=state.user_db.get_user(&user.id).unwrap().unwrap();
+    let token=state.jwt_config.issue_access_token(&fresh,&[]).unwrap();
+    let mut ctx=authenticate_jwt(&state,&token).unwrap();
+    ctx.credential_epoch+=1;
+    assert!(socket_expired(&state,&ctx,Some(u64::MAX),false).await);
+    let db=rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+    db.execute("DROP TABLE users",[]).unwrap();
+    assert!(socket_expired(&state,&ctx,Some(u64::MAX),false).await);
+}
+
+#[tokio::test]
+async fn mfa_degraded_is_visible_in_overview_and_system_status() {
+    let (_dir,state,user)=fixture(false,false).await;
+    let ctx=authenticate_jwt(&state,&state.jwt_config.issue_access_token(&user,&[]).unwrap()).unwrap();
+    let normal=state.handler.system_status_payload().await;
+    assert!(normal.get("mfa_policy").is_none());
+    std::fs::write(state.home_dir.join("config.toml"),"[auth").unwrap();
+    crate::mfa::reload_policy(&state.home_dir);
+    assert!(!crate::mfa::enforced(&state.home_dir,false).unwrap());
+    let status=state.handler.system_status_payload().await;
+    assert_eq!(status["mfa_policy"]["degraded"],true);
+    let overview=state.handler.handle_mfa_rpc("mfa.overview",json!({}),&ctx).await;
+    let value=serde_json::to_value(overview).unwrap();
+    assert_eq!(value["payload"]["policy"]["degraded"],true);
+    assert!(value["payload"]["users"][0].get("channel_bindings").is_some());
+}
+
+#[tokio::test]
+async fn mfa_channel_bind_refuses_enforced_self_but_accepts_other_admin() {
+    let (_dir,state,user)=fixture(false,true).await;
+    let headers_for=|u:&duduclaw_auth::User| {
+        let mut headers=axum::http::HeaderMap::new();
+        let token=state.jwt_config.issue_access_token(u,&[]).unwrap();
+        headers.insert("authorization",format!("Bearer {token}").parse().unwrap());
+        headers
+    };
+    let binding=||ChannelBindBody {user_id:user.id.clone(),channel:"telegram".into(),channel_user_id:"12345".into()};
+    let response=handle_channel_bind(State(state.clone()),headers_for(&user),Json(binding())).await.into_response();
+    assert_eq!(response.status(),StatusCode::CONFLICT);
+    let other=state.user_db.create_user("other@example.test","Other","password-test",UserRole::Admin).unwrap();
+    let response=handle_channel_bind(State(state.clone()),headers_for(&other),Json(binding())).await.into_response();
+    assert_eq!(response.status(),StatusCode::OK);
+    let now=chrono::Utc::now().timestamp();
+    let challenge=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,now).unwrap();
+    assert!(state.user_db.mfa_prepare_enrollment(&challenge,true,now).unwrap().is_none());
 }

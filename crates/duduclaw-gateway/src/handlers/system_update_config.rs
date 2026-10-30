@@ -945,8 +945,14 @@ impl MethodHandler {
 
         // Atomic write (temp + rename) under the cross-process config lock,
         // refused when another writer changed the file since it was read.
+        let security_change = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))).is_some();
+        let db = self.user_db.read().await.clone();
+        let actor = ctx.user_id.clone();
         if let Err(e) =
-            super::config_commit::commit_table_locked(&config_path, original_hash, &table).await
+            super::config_commit::commit_table_locked_with_guard(&config_path, original_hash, &table, move || {
+                if security_change { crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?; }
+                Ok(())
+            }).await
         {
             return WsFrame::error_response("", &e);
         }

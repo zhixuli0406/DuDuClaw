@@ -341,3 +341,5 @@ mfa_enforced = false
 無効のまま現在のパスワードによる任意登録を進めます。Adminが `mfa.overview` を確認し、チャネル配信または別Adminの一度限りの登録コード、ホスト復旧と対応クライアントを用意してから強制を有効にします。両Dashboard書込経路は現在有効なAdminが必要です。登録と以後の認証情報変更はepochで古いJWTを無効にします。強制の切替だけではaccess tokenの自然な期限切れを待ち、未登録者のrefreshを拒否します。強制中の旧共有token WebSocketログインは拒否します。
 
 設定は起動時のメモリスナップショットを使い、Dashboard保存後と外部ファイルの30秒ごとの確認で更新します。失敗は警告して最後の有効値を保持し、有効値を一度も得ていないEnterpriseだけが拒否します。`[auth]` なしはfalseです。Personalは強制を無視しローカル自動ログインは変わりません。画面はフェーズ2です。証明フィールド、セッション限定、`duduclaw ops users mfa-reset` / `mfa-enrollment-code` によるホスト復旧は[セキュリティ](../../features/ja-JP/05-security-defense.md)を参照してください。鍵ローテーションは対象外です。
+
+有効化前に `mfa.overview` のチャネル時刻を確認します。強制開始前の検証済みバインドだけが証明になります。パスワード保有者が開始前に仕込んだバインドは検出できません。12文字の `challenge_ref` を別のAdminに伝え、`users.mfa_enrollment_code {user_id,challenge_ref}` またはホストの `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` で発行します。再読取失敗は `mfa.overview.policy` と `system.status.mfa_policy` に表示し、最後のfalseを保持します。設定ロック内でAdmin権限を再確認します。

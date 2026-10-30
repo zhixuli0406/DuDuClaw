@@ -234,6 +234,16 @@ pub(crate) fn commit_text_locked(path: &Path, expected_hash: &str, new_content: 
     commit_rendered_locked(path, expected_hash, |_| Ok(new_content.to_string()))
 }
 
+pub(crate) fn commit_text_locked_with_guard(
+    path: &Path, expected_hash: &str, new_content: &str,
+    guard: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    commit_rendered_locked(path, expected_hash, |_| {
+        guard()?;
+        Ok(new_content.to_owned())
+    })
+}
+
 /// Commit `table` with [`commit_text_locked`]. The bytes written are the
 /// file as it is on disk (verified against `expected_hash` under the lock)
 /// with only the keys that differ from `table` edited in place — see
@@ -901,5 +911,28 @@ name = "oa1"
                 "config.toml.bak-107-1",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod mfa_guard_tests {
+    use super::*;
+    #[tokio::test]
+    async fn mfa_config_writers_recheck_admin_inside_commit_guard() {
+        let home=tempfile::tempdir().unwrap();
+        let path=home.path().join("config.toml");
+        let original="[auth]\nmfa_enforced=false\n";
+        let replacement="[auth]\nmfa_enforced=true\n";
+        std::fs::write(&path,original).unwrap();
+        let db=std::sync::Arc::new(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
+        let user=db.create_user("admin@example.com","Admin","password-test",duduclaw_auth::UserRole::Admin).unwrap();
+        crate::mfa::require_admin(&db,&user.id).unwrap();
+        db.update_user(&user.id,None,Some(duduclaw_auth::UserRole::Employee),None).unwrap();
+        assert!(commit_text_locked_with_guard(&path,&content_hash(original),replacement,
+            ||crate::mfa::require_admin(&db,&user.id)).is_err());
+        let db2=db.clone(); let id=user.id.clone();
+        assert!(commit_table_locked_with_guard(&path,content_hash(original),&replacement.parse().unwrap(),
+            move ||crate::mfa::require_admin(&db2,&id)).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),original);
     }
 }

@@ -16,7 +16,7 @@ pub enum UsersCommands {
     /// 在閘道主機重設指定帳號的雙因素驗證
     MfaReset { email: String },
     /// 在閘道主機核發一次性雙因素註冊碼（5 分鐘有效）
-    MfaEnrollmentCode { email: String },
+    MfaEnrollmentCode { email: String, challenge_ref: String },
 }
 pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] =
     &[duduclaw_core::OperatorCommand {
@@ -41,13 +41,13 @@ pub fn run(home: &Path, command: UsersCommands) -> Result<()> {
     }
     match command {
         UsersCommands::MfaReset { email } => run_with_markers(home, &email, &markers),
-        UsersCommands::MfaEnrollmentCode { email } => run_action(home, &email, &markers, true),
+        UsersCommands::MfaEnrollmentCode { email, challenge_ref } => run_action(home, &email, &markers, Some(&challenge_ref)),
     }
 }
 fn run_with_markers(home: &Path, email: &str, markers: &[&str]) -> Result<()> {
-    run_action(home,email,markers,false)
+    run_action(home,email,markers,None)
 }
-fn run_action(home: &Path, email: &str, markers: &[&str], enrollment: bool) -> Result<()> {
+fn run_action(home: &Path, email: &str, markers: &[&str], enrollment: Option<&str>) -> Result<()> {
     if !markers.is_empty() {
         return Err(DuDuClawError::Config(
             "這個指令不能在 AI 工作階段中執行；請由管理者在閘道主機的終端機執行。".into(),
@@ -57,9 +57,9 @@ fn run_action(home: &Path, email: &str, markers: &[&str], enrollment: bool) -> R
         return Err(DuDuClawError::Config("找不到帳號資料庫。".into()));
     }
     let db = duduclaw_auth::UserDb::new(&home.join("users.db")).map_err(DuDuClawError::Config)?;
-    if enrollment {
+    if let Some(challenge_ref) = enrollment {
         let user=db.get_user_by_email(email).map_err(DuDuClawError::Config)?.ok_or_else(||DuDuClawError::Config("找不到帳號。".into()))?;
-        let code=db.mfa_issue_enrollment_code(None,&user.id,chrono::Utc::now().timestamp()).map_err(DuDuClawError::Config)?;
+        let code=db.mfa_issue_enrollment_code(None,&user.id,challenge_ref,chrono::Utc::now().timestamp()).map_err(DuDuClawError::Config)?;
         println!("一次性註冊碼（5 分鐘有效，僅顯示一次）：{code}");
         return Ok(());
     }
@@ -81,8 +81,9 @@ mod tests {
         for command in users.get_subcommands() {
             let path=[ops.get_name(),users.get_name(),command.get_name()];
             assert!(OPERATOR_COMMANDS.iter().any(|entry|entry.path==path));
-            let argv=["duduclaw",path[0],path[1],path[2],"a@example.com"];
-            assert!(crate::Cli::try_parse_from(argv).is_ok());
+            let mut argv=vec!["duduclaw",path[0],path[1],path[2],"a@example.com"];
+            if path[2]=="mfa-enrollment-code" { argv.push("0123456789ab"); }
+            assert!(crate::Cli::try_parse_from(&argv).is_ok());
             assert!(bash_decision(&argv.join(" "), &duduclaw_core::HookCaller::Agent("a".into())).is_some());
         }
     }

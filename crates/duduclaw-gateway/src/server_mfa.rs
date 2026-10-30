@@ -54,7 +54,7 @@ pub(super) async fn after_first_factor(
                 }
             }
             Ok(Some(if active { serde_json::json!({"mfa_required":true,"challenge_id":challenge}) }
-                else { serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge}) }))
+                else { serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge)}) }))
         }
         Ok(Ok(None)) => Ok(None),
         _ => Err(()),
@@ -83,11 +83,18 @@ pub(super) async fn refresh_allowed(state: &AppState, user: &str) -> bool {
 /// Do not interrupt work at the policy toggle. Enterprise JWT sockets under
 /// MFA close only after their own access-token expiry (next 30-second tick).
 /// Unenrolled accounts with enforcement off and Personal keep their old behavior.
-pub(super) async fn socket_expired(state: &AppState, user: &str, expires: Option<u64>) -> bool {
+pub(super) async fn socket_expired(state: &AppState, ctx: &UserContext, expires: Option<u64>, legacy: bool) -> bool {
+    if legacy {
+        return !legacy_token_allowed(state).await;
+    }
+    if expires.is_some() && state.handler.live_context(ctx).await.is_err() {
+        return true;
+    }
+    let user = &ctx.user_id;
     let Some(expires) = expires else {
         return false;
     };
-    if chrono::Utc::now().timestamp() < expires as i64 {
+    if (chrono::Utc::now().timestamp().max(0) as u64) < expires {
         return false;
     }
     let personal = state.handler.resolve_edition_profile().await.is_personal();
@@ -109,7 +116,7 @@ fn session(
     let user = state
         .user_db
         .get_user(user_id)?
-        .filter(|u| u.status == duduclaw_auth::UserStatus::Active && u.credential_epoch == verified_epoch)
+        .filter(|u| u.status == duduclaw_auth::UserStatus::Active && duduclaw_auth::mfa::credential_epoch_matches(verified_epoch, u.credential_epoch))
         .ok_or("無法登入此帳號。")?;
     let bindings = state.user_db.get_user_agents(user_id)?;
     let access = bindings

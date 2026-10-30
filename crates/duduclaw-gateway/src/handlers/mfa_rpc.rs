@@ -25,6 +25,7 @@ impl MethodHandler {
         let personal = self.resolve_edition_profile().await.is_personal();
         let required = match crate::mfa::enforced(&self.home_dir, personal) {
             Ok(v) => v,
+            Err(_) if method == "mfa.overview" => false,
             Err(e) => return WsFrame::error_response("", &e),
         };
         let session = if matches!(method, "mfa.enroll_begin" | "mfa.enroll_confirm") {
@@ -57,7 +58,7 @@ impl MethodHandler {
                         let delivery=db.mfa_prepare_enrollment(&token,required,now)?;
                         if required {
                             // The code travels only through the private blocking result, never the RPC response.
-                            return Ok(json!({"enrollment_token":token,"proof_required":true,"_delivery":delivery.map(|o|json!({"channel":o.channel,"target":o.channel_user_id,"code":o.code}))}));
+                            return Ok(json!({"enrollment_token":token,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&token),"proof_required":true,"_delivery":delivery.map(|o|json!({"channel":o.channel,"target":o.channel_user_id,"code":o.code}))}));
                         }
                         token
                     };
@@ -88,14 +89,14 @@ impl MethodHandler {
                 }
                 "users.mfa_enrollment_code"=> {
                     let target=params.get("user_id").and_then(Value::as_str).ok_or("請指定帳號。")?;
-                    Ok(json!({"enrollment_code":db.mfa_issue_enrollment_code(Some(&id),target,now)?,"expires_in":duduclaw_auth::mfa::TTL}))
+                    Ok(json!({"enrollment_code":db.mfa_issue_enrollment_code(Some(&id),target,params.get("challenge_ref").and_then(Value::as_str).ok_or("請提供註冊識別碼。")?,now)?,"expires_in":duduclaw_auth::mfa::TTL}))
                 }
                 "mfa.overview"=> {
                     crate::mfa::require_admin(&db,&id)?;
                     let rows=db.list_users()?.into_iter().map(|u| {
-                        Ok(json!({"user_id":u.id,"email":u.email,"enabled":db.mfa_active(&u.id)?}))
+                        Ok(json!({"user_id":u.id,"email":u.email,"enabled":db.mfa_active(&u.id)?,"channel_bindings":db.mfa_channel_binding_times(&u.id)?}))
                     }).collect::<Result<Vec<Value>,String>>()?;
-                    Ok(json!({"users":rows,"enforced":required}))
+                    Ok(json!({"users":rows,"enforced":crate::mfa::enforced(&home,personal).ok(),"policy":crate::mfa::policy_status(&home)}))
                 }
                 _=>Err("不允許此操作。".into()),
             }

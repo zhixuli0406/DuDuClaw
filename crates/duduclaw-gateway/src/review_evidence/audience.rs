@@ -437,7 +437,11 @@ pub(crate) fn fresh_dashboard_context(
             Err("identity permission denied".into())
         };
     }
-    trusted_dashboard_principal(home, &ctx.user_id)
+    let live = trusted_dashboard_principal(home, &ctx.user_id)?;
+    if !duduclaw_auth::mfa::credential_epoch_matches(ctx.credential_epoch, live.credential_epoch) {
+        return Err("登入憑證已失效，請重新登入。".into());
+    }
+    Ok(live)
 }
 /// Open an authority database read-only.
 ///
@@ -502,15 +506,15 @@ pub fn trusted_dashboard_principal(
             Err("identity permission denied".into())
         };
     }
-    let user: Option<(String, String, String, bool)> = db
+    let user: Option<(String, String, String, bool, u64)> = db
         .query_row(
-            "SELECT email,role,status,must_change_password FROM users WHERE id=?1",
+            "SELECT email,role,status,must_change_password,credential_epoch FROM users WHERE id=?1",
             [principal],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(|_| "identity unavailable")?;
-    let (email, role, status, password) = user.ok_or("identity unavailable")?;
+    let (email, role, status, password, credential_epoch) = user.ok_or("identity unavailable")?;
     if status != "active" || password {
         return Err("identity permission denied".into());
     }
@@ -545,7 +549,7 @@ pub fn trusted_dashboard_principal(
         Default::default()
     };
     Ok(duduclaw_auth::UserContext {
-        credential_epoch: 0,
+        credential_epoch,
         user_id: principal.into(),
         email,
         role,

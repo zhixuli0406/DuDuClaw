@@ -362,16 +362,20 @@ Gateway は [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238) SHA-1 TOTP（160�
 
 Dashboard の `mfa.enroll_begin {password}` は現在のパスワードをblocking poolで検証し、ログイン同様に試行を制限します。返す `enrollment_token` はユーザー、JWTの `jti`、今回のパスワード検証と5分間の期限に結び付きます。`mfa.enroll_confirm {enrollment_token,code}` は同じセッションでのみ使えます。盗まれたJWTだけでは開始できません。秘密鍵の置換は新しい要素で無効化した後、パスワードを再検証して登録します。有効な鍵をbeginで上書きできません。
 
-Enterprise の強制中は初回登録にも独立した証明が必要です。検証済みチャネルがあれば専用OTPを既存配信サービスで送り、`proof_code` として提出します。なければ別の現在有効なAdminが `users.mfa_enrollment_code {user_id}` で一度限りの登録コードを発行し本人に渡します。コードはユーザーに限定し、ハッシュ保存、5分間有効、一度だけ表示、監査対象です。自己発行は禁止です。最後のAdminはホスト上の `duduclaw ops users mfa-enrollment-code <email>` を使います。証明は第一要素challengeに限定され、同時に失効し、最大5回まで試行でき、他のchallengeに再利用できません。チャネルOTPを第一要素にした場合は現在の `password` も必要です。
+Enterprise の強制中は初回登録にも独立した証明が必要です。強制開始より前に検証・記録されたチャネルがあれば専用OTPを既存配信サービスで送り、`proof_code` として提出します。なければ別の現在有効なAdminが `users.mfa_enrollment_code {user_id,challenge_ref}` で一度限りの登録コードを発行し本人に渡します。コードはユーザーと指定の未完了challengeに限定し、ハッシュ保存、5分間有効、一度だけ表示、監査対象です。自己発行は禁止です。最後のAdminはホスト上の `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` を使います。証明は第一要素challengeに限定され、同時に失効し、最大5回まで試行でき、他のchallengeに再利用できません。チャネルOTPを第一要素にした場合は現在の `password` も必要です。
 
-強制中の未登録ログインは `mfa_enrollment_required` と `enrollment_token` のみを返します。`/api/mfa/enroll/begin {enrollment_token,proof_code}` の後、`/api/mfa/enroll/confirm {enrollment_token,code}` を呼びます。チャネル第一要素では両方に `password` が必要です。Dashboardでの強制登録は最初のbeginが `proof_required` とtokenを返すので、パスワード、token、`proof_code` を付けて再度beginを呼び、`secret` と `otpauth_uri` を取得します。Confirmだけが有効化します。登録tokenは `/ws`、refresh、通常HTTP認証には使えず、Dashboard登録tokenもHTTP登録ルートで交換できません。
+強制中の未登録ログインは `mfa_enrollment_required`、`enrollment_token`、12文字の `challenge_ref` のみを返します。`/api/mfa/enroll/begin {enrollment_token,proof_code}` の後、`/api/mfa/enroll/confirm {enrollment_token,code}` を呼びます。チャネル第一要素では両方に `password` が必要です。Dashboardでの強制登録は最初のbeginが `proof_required` とtokenを返すので、パスワード、token、`proof_code` を付けて再度beginを呼び、`secret` と `otpauth_uri` を取得します。Confirmだけが有効化します。登録tokenは `/ws`、refresh、通常HTTP認証には使えず、Dashboard登録tokenもHTTP登録ルートで交換できません。
 
 登録済みアカウントのパスワード／チャネルOTPログインは `mfa_required` と `challenge_id` のみを返します。`/api/mfa/verify` にchallengeと `code` または `recovery_code` を送ります。ユーザーと第一要素に限定し、永続化、成功1回、5分間有効、試行5回までです。`mfa.status` は本人の状態、`mfa.recovery_regenerate {code}` は全コードの置換、`mfa.disable {code}` は無効化です。後二者は新しいTOTPまたは未使用コードが必要で、強制中は無効化できません。要素の誤入力はアカウントごとに15分で5回までです。
 
 導入順序：`[auth] mfa_enforced=false` で任意登録を進め、対応クライアント、チャネル配信、ホスト復旧を確認します。現在のAdminが `mfa.overview` を確認してから `system.update_config` または設定エディターで強制を有効にします。強制なし・登録歴なしでは既存応答とepoch 0 JWT内容は変わりません。Dashboard画面はフェーズ2です。Personalは強制設定を無視し、`/api/session/local` はパスワード不要のままです。
 
-強制設定の変更だけでは既存access tokenを直ちに失効させません。未登録者のrefreshを拒否し、元のaccess tokenは自然に期限切れになります（既定30分）。Enterprise MFAソケットは期限後の次の心拍（最大30秒）で閉じ、実行中の作業は取り消しません。強制中は旧共有tokenの `/ws` 認証と既存共有token接続のRPCを拒否します。登録、無効化、リセットはユーザーのcredential epochを増やし、その後のパスワード変更／リセットも増やします。古いaccess／refresh tokenを拒否し、開いているDashboard接続も次の既存のライブ身分確認で拒否します。追加のフレームごとのDB読取はありません。claimなしはepoch 0、登録歴のないアカウントはパスワード変更でも0を維持します。どのパスワード変更も登録待ちchallengeを無効にします。
+強制設定の変更だけでは既存access tokenを直ちに失効させません。未登録者のrefreshを拒否し、元のaccess tokenは自然に期限切れになります（既定30分）。Enterprise MFAソケットは期限後の次の心拍（最大30秒）で閉じ、実行中の作業は取り消しません。強制中は旧共有tokenの `/ws` 認証とRPCを拒否し、既存接続も次の心拍で閉じてpush購読を終了します。登録、無効化、リセットはユーザーのcredential epochを増やし、その後のパスワード変更／リセットも増やします。古いaccess／refresh tokenを拒否し、開いているDashboard接続も次の既存のライブ身分確認で拒否します。追加のフレームごとのDB読取はありません。claimなしはepoch 0、登録歴のないアカウントはパスワード変更でも0を維持します。どのパスワード変更も登録待ちchallengeを無効にします。
 
-設定は起動時の検証済みメモリスナップショットを使い、Dashboard設定保存後と外部変更確認（30秒ごと）で更新します。読取／解析失敗は前の有効値を保持して警告します。有効値を一度も取得していないEnterpriseだけが拒否します。`[auth]` なしはfalseです。ログイン時のファイル読取／解析はありません。
+設定は起動時の検証済みメモリスナップショットを使い、Dashboard設定保存後と外部変更確認（30秒ごと）で更新します。読取／解析失敗は前の有効値を保持し、`mfa.overview.policy` と `system.status.mfa_policy` に degraded と警告を表示します。有効値を一度も取得していないEnterpriseだけが拒否します。`[auth]` なしはfalseです。ログイン時のファイル読取／解析はありません。
 
 `users.mfa_reset {user_id,code}` は自己リセットを拒否し、同じトランザクションで現在有効なAdmin権限と操作者自身の新しいTOTP／リカバリーコードを確認し、対象の要素とchallengeを削除、epochを増やし監査します。ホストの人間は `duduclaw ops users mfa-reset <email>` で任意のアカウントを復旧できます。鍵紛失時の複数Adminも対象です。両ホストコマンドはAIセッションと従業員／未検証Bashを拒否し、操作者は未検証として監査します。任意のホストファイル書込に対するOS隔離ではありません。登録、証明／登録コード発行、無効化、コード使用、検証失敗を秘密値なしで監査します。
+
+強制開始前に `mfa.overview` の各アカウントの `channel_bindings.verified_at` と `enforced_at`（Unixマイクロ秒）を確認します。不明な過去の時刻はnullで、登録証明には使えません。再バインドも新しい時刻を記録します。強制中の未登録アカウントの自己バインドは禁止し、別の有効なAdminまたはホスト担当者の承認が必要です。パスワード保有者が強制開始前に仕込んだバインドは検出できません。短い `challenge_ref` をAdminに読み伝え、登録bearer tokenは渡しません。コードは一致するユーザーとchallengeでのみ使用・削除します。
+
+JWT epochは完全一致が必要です。Dashboardは毎心拍、WebChatは心拍と各メッセージ前に確認します。共通の身分読取器と2秒のsocketキャッシュを使い、心拍はgenerationを再確認、期限はメッセージごとに確認します。画面表示・操作引継ぎticketは元JWTのepochと期限を保持し、入場と30秒ごとの再確認で失効を拒否し、JWT期限を延ばしません。設定保存はロック内でも現在のAdmin権限を確認します。最後の有効値がfalseなら読取失敗でもfalseを保ち警告します。通常の `system.status` フィールドは変わりません。

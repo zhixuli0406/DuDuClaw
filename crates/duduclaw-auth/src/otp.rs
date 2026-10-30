@@ -122,6 +122,14 @@ impl UserDb {
         channel_user_id: &str,
         verified: bool,
     ) -> Result<(), String> {
+        self.bind_channel_identity_authorized(user_id, channel, channel_user_id, verified, None, false)
+    }
+
+    /// Host callers pass None. Dashboard callers must supply the verified actor.
+    pub fn bind_channel_identity_authorized(
+        &self, user_id: &str, channel: &str, channel_user_id: &str, verified: bool,
+        actor: Option<&str>, enterprise: bool,
+    ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         // One write transaction: the takeover check, the upsert and the ACL
@@ -130,6 +138,15 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("bind lookup failed: {e}"))?;
 
+        if let Some(actor) = actor {
+            let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active')", [actor], |r|r.get(0)).map_err(|e|e.to_string())?;
+            if !admin { return Err("admin required".into()); }
+            let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=?1)", [user_id], |r|r.get(0)).map_err(|e|e.to_string())?;
+            let enforced = enterprise && tx.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r|r.get::<_,bool>(0)).map_err(|e|e.to_string())?;
+            if enforced && !active && actor == user_id {
+                return Err("強制雙因素驗證期間，請由另一位管理員或主機操作員核准通道綁定。".into());
+            }
+        }
         let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT user_id, verified FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
@@ -143,11 +160,11 @@ impl UserDb {
         }
 
         tx.execute(
-            "INSERT INTO channel_identities (user_id, channel, channel_user_id, verified, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO channel_identities (user_id, channel, channel_user_id, verified, created_at, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(channel, channel_user_id)
-             DO UPDATE SET user_id = ?1, verified = ?4",
-            params![user_id, channel, channel_user_id, verified as i64, now],
+             DO UPDATE SET user_id = ?1, verified = ?4, verified_at = ?6",
+            params![user_id, channel, channel_user_id, verified as i64, now, verified.then(|| Utc::now().timestamp_micros())],
         )
         .map_err(|e| format!("bind channel identity failed: {e}"))?;
         bump_acl_generation(&tx).map_err(|e| format!("bind channel identity failed: {e}"))?;

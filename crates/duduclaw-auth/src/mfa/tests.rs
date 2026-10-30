@@ -173,7 +173,7 @@ fn mfa_enrollment_bound_to_user_and_purpose() {
     );
     assert!(db.mfa_begin(&id,Some(&token),&Cipher,3000).is_err());
     db.mfa_prepare_enrollment(&token,true,3000).unwrap();
-    let proof=db.mfa_issue_enrollment_code(None,&id,3000).unwrap();
+    let proof=db.mfa_issue_enrollment_code(None,&id,&enrollment_challenge_ref(&token),3000).unwrap();
     db.mfa_prove_enrollment(&token,&proof,3000).unwrap();
     let secret = db.mfa_begin(&id, Some(&token), &Cipher, 3000).unwrap();
     assert!(!db.mfa_active(&id).unwrap());
@@ -313,17 +313,18 @@ fn mfa_password_step_up_session_binding_and_epoch_revocation() {
 fn mfa_proof_is_single_use_user_bound_attempt_capped_and_hashed() {
     let (_dir,db,id)=setup();
     let other=db.create_user("other@example.com","Other","password-test",UserRole::Admin).unwrap();
-    assert!(db.mfa_issue_enrollment_code(Some(&id),&id,3000).is_err());
-    let code=db.mfa_issue_enrollment_code(Some(&other.id),&id,3000).unwrap();
     let token=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
     db.mfa_prepare_enrollment(&token,true,3000).unwrap();
+    let reference=enrollment_challenge_ref(&token);
+    assert!(db.mfa_issue_enrollment_code(Some(&id),&id,&reference,3000).is_err());
+    let code=db.mfa_issue_enrollment_code(Some(&other.id),&id,&reference,3000).unwrap();
     assert!(db.mfa_begin(&id,Some(&token),&Cipher,3000).is_err());
     assert!(db.mfa_prove_enrollment(&token,"wrong",3000).is_err());
     db.mfa_prove_enrollment(&token,&code,3000).unwrap();
     let second=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
     db.mfa_prepare_enrollment(&second,true,3000).unwrap();
     assert!(db.mfa_prove_enrollment(&second,&code,3000).is_err());
-    let code2=db.mfa_issue_enrollment_code(Some(&other.id),&id,3000).unwrap();
+    let code2=db.mfa_issue_enrollment_code(Some(&other.id),&id,&enrollment_challenge_ref(&second),3000).unwrap();
     let hash:String=db.conn().query_row("SELECT code_hash FROM mfa_enrollment_codes WHERE user_id=?1",[&id],|r|r.get(0)).unwrap();
     assert_ne!(hash,code2);
     for _ in 0..4 { assert!(db.mfa_prove_enrollment(&second,"wrong",3000).is_err()); }
@@ -334,6 +335,7 @@ fn mfa_proof_is_single_use_user_bound_attempt_capped_and_hashed() {
 fn mfa_channel_proof_cannot_be_used_as_login_otp_or_on_another_challenge() {
     let (_dir,db,id)=setup();
     db.bind_channel_identity(&id,"telegram","12345",true).unwrap();
+    record_enforcement(&mut db.conn(),true,chrono::Utc::now().timestamp_micros()+1).unwrap();
     let token=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
     let otp=db.mfa_prepare_enrollment(&token,true,3000).unwrap().unwrap();
     assert!(db.verify_otp(&token,&otp.code).is_err());
@@ -352,4 +354,54 @@ fn mfa_never_enrolled_password_change_preserves_epoch_zero_but_cancels_pending()
     db.update_user(&id,None,None,Some("new-password")).unwrap();
     assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch,0);
     assert!(db.mfa_enrollment_user(&token,3000).is_err());
+}
+
+#[test]
+fn mfa_epoch_requires_exact_equality() {
+    assert!(credential_epoch_matches(0,0));
+    assert!(credential_epoch_matches(7,7));
+    assert!(!credential_epoch_matches(6,7));
+    assert!(!credential_epoch_matches(8,7));
+}
+
+#[test]
+fn mfa_admin_code_cannot_be_stolen_by_another_pending_challenge() {
+    let (_dir,db,id)=setup();
+    let a=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    let b=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    db.mfa_prepare_enrollment(&a,true,3000).unwrap();
+    db.mfa_prepare_enrollment(&b,true,3000).unwrap();
+    assert!(db.mfa_issue_enrollment_code(None,&id,"bad",3000).is_err());
+    let code=db.mfa_issue_enrollment_code(None,&id,&enrollment_challenge_ref(&a),3000).unwrap();
+    assert!(db.mfa_prove_enrollment(&b,&code,3000).is_err());
+    db.mfa_prove_enrollment(&a,&code,3000).unwrap();
+    let n:i64=db.conn().query_row("SELECT count(*) FROM mfa_enrollment_codes",[],|r|r.get(0)).unwrap();
+    assert_eq!(n,0);
+    assert!(db.mfa_issue_enrollment_code(None,&id,&enrollment_challenge_ref(&a),3000).is_err());
+}
+
+#[test]
+fn mfa_channel_binding_must_predate_enforcement_and_rebinding_resets_time() {
+    let (_dir,db,id)=setup();
+    db.bind_channel_identity(&id,"telegram","12345",true).unwrap();
+    let old=db.mfa_channel_binding_times(&id).unwrap()[0]["verified_at"].as_i64().unwrap();
+    let since=old+1;
+    assert_eq!(record_enforcement(&mut db.conn(),true,since).unwrap(),Some(since));
+    assert_eq!(record_enforcement(&mut db.conn(),true,since+100).unwrap(),Some(since));
+    let a=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    assert!(db.mfa_prepare_enrollment(&a,true,3000).unwrap().is_some());
+    assert!(db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&id),true).is_err());
+    let other=db.create_user("reviewer@example.com","Reviewer","password-test",UserRole::Admin).unwrap();
+    db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&other.id),true).unwrap();
+    let new=db.mfa_channel_binding_times(&id).unwrap()[0]["verified_at"].as_i64().unwrap();
+    assert!(new>since);
+    let b=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    assert!(db.mfa_prepare_enrollment(&b,true,3000).unwrap().is_none());
+    // Off remains self-bind compatible. An unknown historical time is not proof.
+    db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&id),false).unwrap();
+    db.conn().execute("UPDATE channel_identities SET verified_at=NULL",[]).unwrap();
+    let c=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
+    assert!(db.mfa_prepare_enrollment(&c,true,3000).unwrap().is_none());
+    record_enforcement(&mut db.conn(),false,since+200).unwrap();
+    assert_eq!(record_enforcement(&mut db.conn(),true,since+300).unwrap(),Some(since+300));
 }

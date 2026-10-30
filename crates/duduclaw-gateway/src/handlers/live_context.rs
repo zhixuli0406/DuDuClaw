@@ -58,11 +58,11 @@ const LIVE_CONTEXT_CACHE_CAP: usize = 4096;
 /// `user_id → (acl_generation, context)`.
 #[derive(Default)]
 pub(crate) struct LiveContextCache {
-    entries: Mutex<HashMap<String, (u64, UserContext)>>,
+    entries: Mutex<HashMap<String, (u64, UserContext, std::time::Instant)>>,
 }
 
 impl LiveContextCache {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, UserContext)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, UserContext, std::time::Instant)>> {
         // A panicked holder leaves plain data behind; keep serving.
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -70,20 +70,20 @@ impl LiveContextCache {
     fn get(&self, user_id: &str, generation: u64) -> Option<UserContext> {
         self.lock()
             .get(user_id)
-            .filter(|(g, _)| *g == generation)
-            .map(|(_, ctx)| ctx.clone())
+            .filter(|(g, _, _)| *g == generation)
+            .map(|(_, ctx, _)| ctx.clone())
     }
 
     fn put(&self, ctx: &UserContext) {
         let mut entries = self.lock();
         if entries.len() >= LIVE_CONTEXT_CACHE_CAP && !entries.contains_key(&ctx.user_id) {
             let current = ctx.acl_generation;
-            entries.retain(|_, (g, _)| *g == current);
+            entries.retain(|_, (g, _, _)| *g == current);
             if entries.len() >= LIVE_CONTEXT_CACHE_CAP {
                 entries.clear();
             }
         }
-        entries.insert(ctx.user_id.clone(), (ctx.acl_generation, ctx.clone()));
+        entries.insert(ctx.user_id.clone(), (ctx.acl_generation, ctx.clone(), std::time::Instant::now()));
     }
 
     #[cfg(test)]
@@ -102,7 +102,7 @@ pub(crate) fn resolve_live_context(
     let generation = db.acl_generation();
     if let Ok(g) = generation {
         if let Some(hit) = cache.get(&jwt_ctx.user_id, g) {
-            if jwt_ctx.credential_epoch < hit.credential_epoch { return Err("登入憑證已失效，請重新登入。".into()); }
+            if !duduclaw_auth::mfa::credential_epoch_matches(jwt_ctx.credential_epoch, hit.credential_epoch) { return Err("登入憑證已失效，請重新登入。".into()); }
             return Ok(hit);
         }
     }
@@ -114,7 +114,7 @@ pub(crate) fn resolve_live_context(
             if generation.as_ref().is_ok_and(|g| *g == live.acl_generation) {
                 cache.put(&live);
             }
-            if jwt_ctx.credential_epoch < live.credential_epoch { return Err("登入憑證已失效，請重新登入。".into()); }
+            if !duduclaw_auth::mfa::credential_epoch_matches(jwt_ctx.credential_epoch, live.credential_epoch) { return Err("登入憑證已失效，請重新登入。".into()); }
             Ok(live)
         }
         Ok(None) => Err(INACTIVE_ACCOUNT_ERROR.to_string()),
@@ -128,6 +128,26 @@ pub(crate) fn resolve_live_context(
             Err(READ_FAILURE_ERROR.to_string())
         }
     }
+}
+
+/// Socket messages reuse the same identity reader/cache as RPCs, with the
+/// existing push-cache window. Heartbeats always force a generation check.
+/// A message checks expiry independently and does not read SQLite on a cache hit.
+pub(crate) fn resolve_socket_context(db: &UserDb, cache: &LiveContextCache,
+    ctx: &UserContext, heartbeat: bool) -> Result<UserContext, String> {
+    if !heartbeat {
+        let entries = cache.lock();
+        if let Some((_, live, at)) = entries.get(&ctx.user_id) {
+            if at.elapsed() < std::time::Duration::from_secs(super::push_filter::PUSH_CACHE_SECS) {
+                return if duduclaw_auth::mfa::credential_epoch_matches(ctx.credential_epoch, live.credential_epoch) {
+                    Ok(live.clone())
+                } else { Err("登入憑證已失效，請重新登入。".into()) };
+            }
+        }
+    }
+    let live = resolve_live_context(db, cache, ctx)?;
+    cache.put(&live);
+    Ok(live)
 }
 
 /// Live ACL reads that failed (and so refused a call) since the gateway started.
@@ -224,5 +244,27 @@ mod tests {
         assert!(cache.get("newcomer", 2).is_some());
         // A hit needs the same generation.
         assert!(cache.get("newcomer", 3).is_none());
+    }
+}
+
+#[cfg(test)]
+mod mfa_socket_tests {
+    use super::*;
+    #[test]
+    fn mfa_socket_cache_skips_message_reads_and_heartbeat_fails_closed() {
+        let home=tempfile::tempdir().unwrap();
+        let path=home.path().join("users.db");
+        let db=UserDb::new(&path).unwrap();
+        let user=db.create_user("cache@example.com","Cache","password-test",duduclaw_auth::UserRole::Admin).unwrap();
+        let ctx=db.live_user_context(&user.id).unwrap().unwrap();
+        let cache=LiveContextCache::default();
+        resolve_socket_context(&db,&cache,&ctx,true).unwrap();
+        // No SQLite read on a message cache hit, even if the database breaks.
+        let raw=rusqlite::Connection::open(path).unwrap();
+        raw.execute("DROP TABLE auth_meta",[]).unwrap();
+        assert!(resolve_socket_context(&db,&cache,&ctx,false).is_ok());
+        assert!(resolve_socket_context(&db,&cache,&ctx,true).is_err());
+        cache.lock().get_mut(&ctx.user_id).unwrap().2 -= std::time::Duration::from_secs(3);
+        assert!(resolve_socket_context(&db,&cache,&ctx,false).is_err());
     }
 }
