@@ -734,3 +734,145 @@ fn m2_responsibility_and_confirmation_snapshots() {
         insta::assert_snapshot!(format!("m2_confirmation_{name}"),screen(&m,&a,&settings,140,36));
     }
 }
+
+#[test]
+fn m3_palette_filters_roles_focus_and_current_binding() {
+    use crate::{blocks::Block, chat::Focus};
+    let (mut model, mut app) = m2_task_app();
+    let has = |a: &App, m: &Model, code| a.commands(m).iter().any(|c| c.key.code == code && c.key.modifiers.is_empty());
+    assert!(has(&app, &model, KeyCode::Char('e')));
+    assert!(has(&app, &model, KeyCode::Char('s')));
+    assert!(has(&app, &model, KeyCode::Char('L')));
+    model.role = Some(Role::Employee); model.goal_operators.clear();
+    for c in ['e', 's', 'L', 'p', 'n', 'd'] { assert!(!has(&app, &model, KeyCode::Char(c)), "{c}"); }
+    app.blocks.open(Block::Run, Some("adu".into()));
+    assert!(has(&app, &model, KeyCode::Char('c')));
+    assert!(!has(&app, &model, KeyCode::Char('b')));
+    app.focus = Focus::Input;
+    app.chat.connected = true; app.input_agent = Some("adu".into()); app.input = "你好".into();
+    assert!(has(&app, &model, KeyCode::Enter));
+    assert!(!has(&app, &model, KeyCode::Char('c')));
+    assert!(!has(&app, &model, KeyCode::Char('s')));
+    app.chat.running = true;
+    assert!(!has(&app, &model, KeyCode::Enter));
+}
+
+#[test]
+fn m3_palette_dispatch_cannot_bypass_stop_confirmation_or_changed_role() {
+    let (mut model, mut app) = m2_task_app();
+    let now = std::time::Instant::now();
+    let open = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.key_at(open, &model, now, 0), Action::None);
+    app.paste("stop");
+    assert_eq!(app.palette_commands(&model).len(), 1);
+    assert_eq!(app.key_at(enter, &model, now, 0), Action::None);
+    assert!(app.palette.is_none()); assert!(app.control_card.is_some());
+    assert!(app.waiting_refresh.is_none());
+    assert_eq!(app.key_at(open, &model, now, 0), Action::None);
+    assert!(app.palette.is_none(), "card owns keyboard");
+    let later = now + std::time::Duration::from_secs(2);
+    assert_eq!(app.key_at(enter, &model, later, 0), Action::None);
+    assert!(app.waiting_refresh.is_none(), "no code or viewport");
+    app.control_card = None;
+    app.key_at(open, &model, now, 0); app.paste("stop");
+    model.goal_operators.clear();
+    assert_eq!(app.key_at(enter, &model, now, 0), Action::None);
+    assert!(app.control_card.is_none()); assert!(app.waiting_refresh.is_none());
+}
+
+#[test]
+fn m3_palette_fuzzy_search_ime_and_key_event_kinds() {
+    let (model, mut app) = m2_task_app();
+    let open = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+    app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL), &model);
+    assert!(app.palette.is_none(), "Ctrl-K is reserved");
+    app.key(open, &model); app.paste("STP");
+    assert_eq!(app.palette_commands(&model).len(), 1);
+    let mut enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    enter.kind = crossterm::event::KeyEventKind::Release;
+    assert_eq!(app.key(enter, &model), Action::None);
+    assert!(app.palette.is_some()); assert!(app.control_card.is_none());
+    app.palette.as_mut().unwrap().query.clear(); app.paste("調方向");
+    assert_eq!(app.palette_commands(&model)[0].label, strings::CMD_STEER);
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &model);
+    assert!(app.palette.is_none());
+    app.focus = crate::chat::Focus::Input; app.input = "草稿".into();
+    app.key(open, &model); app.paste("查詢");
+    assert_eq!(app.input, "草稿");
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &model);
+    assert_eq!(app.focus, crate::chat::Focus::Input);
+}
+
+#[test]
+fn m3_help_only_covers_focused_block_and_keeps_chat() {
+    use crate::blocks::{Block, Split};
+    let model = populated(); let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into())); app.detail_open = true;
+    app.blocks.add(Split::Vertical);
+    app.blocks.add(Split::Horizontal); app.blocks.open(Block::Chat, None);
+    app.chat.append(strings::CHAT_ASSISTANT, "chat-kept-visible");
+    app.blocks.select(0); app.help = true;
+    let output = screen(&model, &app, &Settings::default(), 180, 48);
+    assert_eq!(output.matches("操作說明").count(), 1);
+    assert!(output.contains("chat-kept-visible"));
+    assert!(output.contains("目前身分沒有此決策權限"));
+    insta::assert_snapshot!("m3_help_focused_only", output);
+    app.blocks.select(2);
+    let output = screen(&model, &app, &Settings::default(), 180, 48);
+    assert_eq!(output.matches("操作說明").count(), 1);
+    assert!(!output.contains("chat-kept-visible"));
+    insta::assert_snapshot!("m3_help_chat_focused", output);
+}
+
+#[test]
+fn m3_small_height_keeps_inbox_and_employee_rows() {
+    let model = populated(); let app = App::default();
+    for height in [12, 13, 14, 16] {
+        let mut app = app.clone();
+        app.notice = Some(strings::SETTINGS_NOTICE.into());
+        let output = screen(&model, &app, &Settings::default(), 100, height);
+        assert!(output.contains("確認資料匯出"), "inbox row missing at {height}");
+        assert!(output.contains("阿嘟"), "employee row missing at {height}");
+        insta::assert_snapshot!(format!("m3_small_height_{height}"), output);
+    }
+}
+
+#[test]
+fn m3_long_home_keeps_tail_in_both_width_modes() {
+    for width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
+        let settings = Settings { ambiguous_width: width, ..Default::default() };
+        let model = empty(); let mut app = App::default();
+        let home = TerminalText::new(format!("/Users/{}/最後目錄", "very-long-home-".repeat(20)));
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| render::draw(f, &model, &connection(), &home, &mut app, &settings)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let output = (0..24).map(|y| {
+            let mut row = String::new(); let mut x = 0;
+            while x < 60 { let cell = &buffer[(x,y)]; row.push_str(cell.symbol()); x += cell.cell_width().max(1); }
+            assert_eq!(super::text::columns(&row, width), 60);
+            row.trim_end().to_string()
+        }).collect::<Vec<_>>().join("\n");
+        assert!(output.lines().next().unwrap().contains("最後目錄"));
+        assert!(output.contains('…'));
+        insta::assert_snapshot!(format!("m3_long_home_{width:?}"), output);
+    }
+}
+
+#[test]
+fn m3_palette_snapshot() {
+    let (model, mut app) = m2_task_app();
+    app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &model);
+    app.paste("st");
+    let output = screen(&model, &app, &Settings::default(), 100, 30);
+    assert!(output.contains("[s]")); assert!(output.contains("停止任務"));
+    assert!(output.contains("[e]")); assert!(output.contains("調整任務方向"));
+    insta::assert_snapshot!("m3_palette", output);
+}
+
+#[test]
+fn m3_empty_task_palette_has_no_enter_command() {
+    let (model, mut app) = m2_task_app();
+    app.blocks.panes[0].data = crate::blocks::Data::default();
+    assert!(!app.commands(&model).iter().any(|c| c.key.code == KeyCode::Enter));
+}

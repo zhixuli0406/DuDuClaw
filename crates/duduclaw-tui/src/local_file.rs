@@ -16,7 +16,16 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
         options.custom_flags(0x00200000);
     }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Refuse reparse points even if the handle reports a regular file.
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "reparse point"));
+        }
+    }
+    if !metadata.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a regular file"));
     }
     Ok(file)

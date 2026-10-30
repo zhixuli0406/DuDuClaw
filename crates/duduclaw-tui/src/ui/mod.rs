@@ -5,6 +5,8 @@ mod card_data;
 mod control_card;
 mod block_render;
 mod m2;
+mod palette;
+mod exit_summary;
 mod card_render;
 #[cfg(test)]
 mod card_tests;
@@ -49,6 +51,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
     let (read, read_notice) = ReadState::load(&home);
     let mut app = App::default();
     app.read = read;
+    app.blocks = settings.default_layout.blocks();
     let notices: Vec<_> = [settings_notice, read_notice]
         .into_iter()
         .flatten()
@@ -57,6 +60,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         app.notice = Some(notices.join(" / "));
     }
     let guard = terminal::TerminalGuard::enter()?;
+    let mut exit_text = None;
     let result = std::panic::AssertUnwindSafe(async {
         let mut terminal = Terminal::new(backend::ScreenBackend(std::io::stdout()))
             .map_err(|_| Error::Terminal)?;
@@ -166,7 +170,14 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 };
                 let before = app.read.clone();
                 match app.key(key, &model) {
-                    Action::Quit => return Ok(()),
+                    Action::Quit => {
+                        let mut final_model = feed.receiver.borrow().clone();
+                        if !matches!(*connection.borrow(), crate::client::ConnectionState::Connected(_)) {
+                            final_model.inbox.stale = true; final_model.employees.stale = true;
+                        }
+                        exit_text = Some(exit_summary::summary(&final_model, &home));
+                        return Ok(());
+                    },
                     action @ (Action::Save | Action::Snooze) => match app.read.save(&home) {
                         Ok(()) => app.notice = Some(if action == Action::Snooze { strings::SNOOZED } else { strings::SAVED }.into()),
                         Err(error) => {
@@ -211,12 +222,26 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
-                result = &mut shutdown => return result,
+                result = &mut shutdown => {
+                    let mut final_model = feed.receiver.borrow().clone();
+                    if !matches!(*connection.borrow(), crate::client::ConnectionState::Connected(_)) {
+                        final_model.inbox.stale = true; final_model.employees.stale = true;
+                    }
+                    exit_text = Some(exit_summary::summary(&final_model, &home));
+                    return result;
+                },
             }
         }
     })
     .catch_unwind()
     .await;
     drop(guard);
-    result.unwrap_or(Err(Error::Terminal))
+    let result = result.unwrap_or(Err(Error::Terminal));
+    if result.is_ok() && let Some(text) = exit_text {
+        use std::io::Write;
+        let mut output = std::io::stdout().lock();
+        output.write_all(text.as_bytes()).map_err(|_| Error::Output)?;
+        output.flush().map_err(|_| Error::Output)?;
+    }
+    result
 }

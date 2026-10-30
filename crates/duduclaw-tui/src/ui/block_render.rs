@@ -253,19 +253,23 @@ pub(super) fn draw(
             index + 1,
             kind.label()
         );
-        if kind == Block::Chat && !app.help {
+        if kind == Block::Chat && !(app.help && index == app.blocks.focused) {
             super::chat_render::draw(frame, region, app, settings, &title);
             continue;
         }
         let pane = &app.blocks.panes[index];
-        let stale = if kind == Block::Detail {
+        let stale = if app.help && index == app.blocks.focused {
+            false
+        } else if kind == Block::Detail {
             detail_stale
         } else {
             pane.data.stale
         };
         let inner = panel(frame, region, &title, settings, stale);
-        let body = if (app.help && index == app.blocks.focused) || kind == Block::Detail {
-            app.detail(model)
+        let body = if app.help && index == app.blocks.focused {
+            TerminalText::new(strings::HELP.into())
+        } else if kind == Block::Detail {
+            app.selection_detail(model)
         } else {
             content(pane, model, &app.logs)
         };
@@ -275,7 +279,9 @@ pub(super) fn draw(
                 width: settings.ambiguous_width,
                 visible: true,
                 wrap: true,
-                scroll: if kind == Block::Detail {
+                scroll: if app.help && index == app.blocks.focused {
+                    app.help_scroll
+                } else if kind == Block::Detail {
                     app.detail_scroll
                 } else {
                     pane.scroll

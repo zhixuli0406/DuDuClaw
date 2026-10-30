@@ -82,8 +82,18 @@ pub async fn shutdown_signal() -> Result<()> {
             _ = hangup.recv() => Ok(()),
         }
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.map_err(|_| Error::Terminal)
+    #[cfg(windows)]
+    {
+        let mut interrupt = tokio::signal::windows::ctrl_break().map_err(|_| Error::Terminal)?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal.map_err(|_| Error::Terminal),
+            _ = interrupt.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        tokio::signal::ctrl_c().await.map_err(|_| Error::Terminal)
+    }
 }
 
 #[cfg(all(test, unix))]

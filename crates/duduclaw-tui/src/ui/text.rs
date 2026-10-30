@@ -10,6 +10,21 @@ use std::num::NonZeroU16;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+pub(super) fn columns(text: &str, width: AmbiguousWidth) -> usize {
+    match width { AmbiguousWidth::Narrow => text.width(), AmbiguousWidth::Wide => text.width_cjk() }
+}
+pub(super) fn left_ellipsis(text: &str, budget: usize, width: AmbiguousWidth) -> String {
+    if columns(text, width) <= budget { return text.into(); }
+    let marker = "…";
+    let mut used = columns(marker, width);
+    if used > budget { return String::new(); }
+    let tail: Vec<_> = text.graphemes(true).rev().take_while(|g| {
+        used += columns(g, width);
+        used <= budget
+    }).collect();
+    format!("{marker}{}", tail.into_iter().rev().collect::<String>())
+}
+
 /// Count using exactly the same grapheme/wrap rules as SafeText::render.
 pub(super) fn wrapped_lines(text: &TerminalText, columns: u16, width: AmbiguousWidth) -> usize {
     if columns == 0 { return 0; }

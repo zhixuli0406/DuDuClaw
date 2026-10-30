@@ -31,12 +31,13 @@ pub fn draw(
         );
         return;
     }
+    let footer_height = (if app.notice.is_some() { 5 } else { 4 }).min(area.height.saturating_sub(9));
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(if app.notice.is_some() { 5 } else { 4 }),
+            Constraint::Min(6),
+            Constraint::Length(footer_height),
         ])
         .split(area);
     let (status, version) = match connection {
@@ -57,7 +58,7 @@ pub fn draw(
         TerminalText::new(format!(
             "{} | {}",
             strings::TITLE,
-            home.plain().replace('\n', " ")
+            super::text::left_ellipsis(&home.plain().replace('\n', " "), usize::from(area.width).saturating_sub(super::text::columns(strings::TITLE, settings.ambiguous_width) + 3), settings.ambiguous_width)
         )),
         settings,
         false,
@@ -98,8 +99,7 @@ pub fn draw(
     let stale_inbox = model.inbox.count().is_none();
     let stale_employees = model.employees.count().is_none() || stale_inbox;
     let stale_schedules = model.schedules.count().is_none();
-    let detail_stale = !app.help
-        && match app.selected {
+    let detail_stale = match app.selected {
             Some(Selection::Inbox(_)) => stale_inbox,
             Some(Selection::Employee(_)) => stale_employees,
             Some(Selection::Schedule(_)) => stale_schedules,
@@ -123,7 +123,8 @@ pub fn draw(
         false,
         false,
     );
-    if app.focus == crate::chat::Focus::Input && app.card.is_none() && app.control_card.is_none() {
+    if app.focus == crate::chat::Focus::Input && app.card.is_none() && app.control_card.is_none()
+        && (app.notice.is_none() || footer.height >= 5) {
         // Keep the insertion end visible at grapheme boundaries, including CJK.
         use unicode_segmentation::UnicodeSegmentation;
         use unicode_width::UnicodeWidthStr;
@@ -144,8 +145,8 @@ pub fn draw(
     } else {
     text(
         frame,
-        Rect::new(footer.x, footer.y + 1, footer.width, 2),
-        TerminalText::new((if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else { strings::LIST_KEY_HINTS }).into()),
+        Rect::new(footer.x, footer.y + 1, footer.width, footer.height.saturating_sub(if app.notice.is_some() { 3 } else { 1 }).min(2)),
+        TerminalText::new((if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else { strings::LIST_KEY_HINTS }).into()),
         settings,
         false,
         true,
@@ -154,7 +155,7 @@ pub fn draw(
     if let Some(notice) = &app.notice {
         text(
             frame,
-            Rect::new(footer.x, footer.y + 3, footer.width, 2),
+            Rect::new(footer.x, footer.bottom().saturating_sub(2), footer.width, 2),
             TerminalText::new(notice.clone()),
             settings,
             false,
@@ -168,4 +169,5 @@ pub fn draw(
     let control_fresh = app.control_card.as_ref().is_some_and(|c| app.control_subject(&c.source, model).as_ref() == Some(&c.fingerprint)) && app.waiting_refresh.is_none();
     if let Some(card) = &mut app.control_card { super::control_card::draw(frame, columns[1], card, settings, control_fresh); }
 
+    super::palette::draw(frame, model, app, settings);
 }

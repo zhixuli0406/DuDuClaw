@@ -4,7 +4,7 @@
 
 `duduclaw tui` opens a control room for pending approvals, goals needing a reply, and employee status. Select a row to inspect its details. Where the gateway provides it, administrators also see the next scheduled autonomous run. Closing the control room does not stop employees.
 
-Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee pause controls remain deferred. The terminal interface currently uses Traditional Chinese.
+Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee status pause/resume uses the M2 permission checks and confirmation cards. The terminal interface currently uses Traditional Chinese.
 
 ## Start
 
@@ -23,6 +23,14 @@ The full screen needs a terminal. `inbox` prints one snapshot and exits; `--foll
 The CLI connects to `127.0.0.1`, using `DUDUCLAW_PORT`, then `<home>/config.toml [gateway] port`, then the default gateway port. Home is `DUDUCLAW_HOME` or `~/.duduclaw`. This version has no remote URL flag.
 
 **For remote use, SSH into the gateway host and run it there; do not port-forward the gateway.** Port forwarding would expose its loopback-only local login route to programs on the forwarding host.
+
+## Command palette and exit summary (M3)
+
+Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chinese labels or English aliases such as `stop`, `steer`, `log`); arrows select, `Enter` runs the displayed shortcut, and `Esc` returns to the previous focus with the chat draft intact. `Ctrl-K` remains reserved. The list is recalculated from the focused block, current role, employee binding and fresh data. A selected control opens the same confirmation card as its shortcut; it never approves or confirms for you. Cards and content warnings own their keyboard, so the palette cannot open over them.
+
+`F1` / `?` shows help only in the focused block; other blocks stay visible. Long home paths retain their right end with a leading ellipsis. At the minimum supported height (12 rows), inbox and employee panels each retain one content row; the schedule panel may be hidden. Borders remain ASCII in either glyph mode. All navigation works without a mouse. Windows key-release events never execute commands.
+
+After quitting and restoring the terminal, stdout shows the authoritative pending inbox count (including locally snoozed items), running employee names, and a command to return to the same home. Stale counts or employee data show `?`. Names are sanitized and bounded; no inbox, task, chat or tool content is printed. Unix resume commands use Bash/Zsh ANSI-C quoting; Windows commands use PowerShell. Closing the client leaves employees running. Windows crash-dump suppression remains unimplemented; compilation is not native terminal acceptance.
 
 ## Login
 
@@ -120,9 +128,20 @@ glyphs = "ascii"                 # or "unicode"
 ambiguous_width = "narrow"        # or "wide", matching your terminal
 notifications = false
 poll_interval_seconds = 15        # 5..3600
+default_layout = "single"         # "vertical" / "horizontal"
 ```
 
-Invalid settings fall back with a notice. Borders use ASCII. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
+Every supported top-level key is listed below. Each invalid value keeps only that key's default and displays a notice; valid sibling keys still apply. Unknown keys (including transport/auth/security settings) produce a notice and have no effect. Invalid TOML or an unreadable/oversized file uses all defaults. Settings are read once at startup.
+
+| Key | Accepted values | Default / effect |
+|---|---|---|
+| `glyphs` | `"ascii"`, `"unicode"` | `"ascii"`; employee status glyphs; borders stay ASCII |
+| `ambiguous_width` | `"narrow"`, `"wide"` | `"narrow"`; match the terminal's ambiguous-character width |
+| `poll_interval_seconds` | Integer, 5–3600 inclusive | `15`; authoritative list reconciliation; run/task/log blocks retain their five-second reconciliation |
+| `notifications` | Boolean | `false`, including SSH; explicit opt-in enables fixed-text background notifications |
+| `default_layout` | `"single"`, `"vertical"`, `"horizontal"` | `"single"`; one detail block, two side-by-side detail blocks, or two stacked detail blocks; starts with block 1 focused |
+
+Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Borders use ASCII. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
 
 ## Security limits
 

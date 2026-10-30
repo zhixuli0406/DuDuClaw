@@ -84,7 +84,7 @@ pub fn employee_status(employee: &Employee, model: &Model, read: &ReadState) -> 
     EmployeeStatus::Idle
 }
 
-fn completion_ids<'a>(model: &'a Model, id: &str) -> impl Iterator<Item = &'a String> {
+pub(super) fn completion_ids<'a>(model: &'a Model, id: &str) -> impl Iterator<Item = &'a String> {
     model
         .activity
         .get(id)
@@ -142,6 +142,8 @@ pub struct App {
     pub spinner: usize,
     pub detail_open: bool,
     pub help: bool,
+    pub help_scroll: usize,
+    pub(super) palette: Option<super::palette::Palette>,
     pub detail_scroll: usize,
     pub read: ReadState,
     pub notice: Option<String>,
@@ -168,7 +170,8 @@ pub enum Action {
 }
 impl App {
     pub fn focus_label(&self) -> &'static str {
-        if self.card.is_some() || self.control_card.is_some() { strings::CARD_FOCUS }
+        if self.palette.is_some() { strings::PALETTE_FOCUS }
+        else if self.card.is_some() || self.control_card.is_some() { strings::CARD_FOCUS }
         else if self.help { strings::HELP_FOCUS }
         else if self.focus == crate::chat::Focus::Input { strings::INPUT_FOCUS }
         else { strings::LIST_FOCUS }
@@ -222,6 +225,15 @@ impl App {
         self.key_at(key, model, std::time::Instant::now(), crate::snooze::epoch_now())
     }
     pub fn key_at(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant, epoch: i64) -> Action {
+        if self.palette.is_some() {
+            return self.palette_key(key, model, now, epoch);
+        }
+        if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('p') && self.card.is_none()
+            && self.control_card.is_none() && !self.content_warning {
+            self.palette = Some(super::palette::Palette::default());
+            return Action::None;
+        }
         if self.content_warning {
             if key.kind == KeyEventKind::Press {
                 if key.code == KeyCode::Char('c') && key.modifiers.is_empty() {
@@ -343,6 +355,8 @@ impl App {
                 self.help = false;
                 self.detail_scroll = 0;
             }
+            KeyCode::PageDown if self.help => self.help_scroll = self.help_scroll.saturating_add(5),
+            KeyCode::PageUp if self.help => self.help_scroll = self.help_scroll.saturating_sub(5),
             KeyCode::PageDown if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_sub(5),
             KeyCode::PageUp if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_add(5),
             KeyCode::PageDown if matches!(self.blocks.active, crate::blocks::Block::Run | crate::blocks::Block::Task | crate::blocks::Block::Log) => {
@@ -386,6 +400,7 @@ impl App {
         Action::None
     }
     pub fn paste(&mut self, text: &str) {
+        if let Some(palette) = &mut self.palette { palette.paste(text); return; }
         if let Some(card) = &mut self.control_card { card.paste(text); return; }
         if self.focus != crate::chat::Focus::Input || self.card.is_some() { return; }
         let remaining = crate::chat::MAX_INPUT_CHARS.saturating_sub(self.input.chars().count());
@@ -414,6 +429,9 @@ impl App {
         if self.help {
             return TerminalText::new(strings::HELP.into());
         }
+        self.selection_detail(model)
+    }
+    pub(super) fn selection_detail(&self, model: &Model) -> TerminalText {
         if !self.detail_open {
             return TerminalText::new(strings::DETAIL_HINT.into());
         }

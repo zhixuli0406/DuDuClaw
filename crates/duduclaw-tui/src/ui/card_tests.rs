@@ -260,3 +260,25 @@ fn redacted_read_only_viewer_also_sees_unbound_notice() {
     assert!(controls.contains(strings::CARD_UNBOUND));
     assert!(controls.contains(strings::CARD_READ_ONLY));
 }
+
+#[test]
+fn m3_palette_opens_approval_without_bypassing_code_viewport_or_delay() {
+    let mut m = model(); m.inbox.items = vec![approval(json!({}))];
+    let mut app = App::default(); app.selected = Some(Selection::Inbox("approval:a1".into()));
+    let now = Instant::now();
+    app.key_at(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &m, now, 1000);
+    app.paste("open");
+    assert_eq!(app.palette_commands(&m).len(), 1);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.key_at(enter, &m, now, 1000), Action::None);
+    let code = app.card.as_ref().unwrap().code.clone();
+    for c in code.chars() { app.key_at(key(c), &m, now, 1000); }
+    assert!(app.card.as_ref().unwrap().input.is_empty());
+    let later = now + Duration::from_secs(2);
+    for c in code.chars() { app.key_at(key(c), &m, later, 1000); }
+    assert_eq!(app.key_at(enter, &m, later, 1000), Action::None);
+    assert!(app.waiting_refresh.is_none());
+    app.card.as_mut().unwrap().viewport(1, 20);
+    for c in code.chars() { app.key_at(key(c), &m, later, 1000); }
+    assert!(matches!(app.key_at(enter, &m, later, 1000), Action::Decide(Decision::Approval { approve: true, .. })));
+}

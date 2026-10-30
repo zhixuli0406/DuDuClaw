@@ -11,12 +11,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
 };
 pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, settings: &Settings) {
+    let compact = area.height < 9;
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(35),
-            Constraint::Percentage(40),
-            Constraint::Percentage(25),
+            if compact { Constraint::Length(3) } else { Constraint::Percentage(35) },
+            if compact { Constraint::Length(3) } else { Constraint::Percentage(40) },
+            if compact { Constraint::Min(0) } else { Constraint::Percentage(25) },
         ])
         .split(area);
     let stale_inbox = model.inbox.count().is_none();
