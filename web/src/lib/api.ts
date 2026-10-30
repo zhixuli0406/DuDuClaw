@@ -7493,7 +7493,7 @@ export const api = {
   },
   credentials: {
     auditList: (params: CredentialAuditQuery = {}) =>
-      client.call('credentials.audit_list', params) as Promise<CredentialAuditReport>,
+      client.call('credentials.audit_list', { ...params }) as Promise<CredentialAuditReport>,
     auditGet: (id: string) =>
       client.call('credentials.audit_get', { id }) as Promise<ChatCredential>,
     auditUpdate: (params: { id: string; service?: string; note?: string; status?: ChatCredentialStatus }) =>
