@@ -671,7 +671,8 @@ impl MethodHandler {
             }
             "approvals.decide" => {
                 require_manager!();
-                self.handle_approvals_decide(params, ctx).await
+                // Keep the approval future out of every outer dispatch frame on Windows.
+                Box::pin(self.handle_approvals_decide(params, ctx)).await
             }
 
             // ── Agent Mail (P2-d) — 信箱 ────────────────────
@@ -755,7 +756,7 @@ impl MethodHandler {
                 self.handle_autopilot_list().await
             }
 
-            _ => self.dispatch_ops(method, params, ctx, conn).await,
+            _ => Box::pin(self.dispatch_ops(method, params, ctx, conn)).await,
         }
     }
 }

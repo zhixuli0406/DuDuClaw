@@ -520,6 +520,7 @@ impl MethodHandler {
         if let Some(frame) = self.dispatch_agent_channels(method, &params, ctx).await {
             return frame;
         }
-        self.dispatch_core(method, params, ctx, conn).await
+        // Box each dispatcher hop to avoid stacking whole dispatcher futures in unoptimized builds.
+        Box::pin(self.dispatch_core(method, params, ctx, conn)).await
     }
 }
