@@ -419,6 +419,9 @@ async fn run_live(
         return Err(missing_agent_error(agent, &agent_dir, case));
     }
 
+    duduclaw_gateway::budget::gate_before_spawn(home, Some(&agent_dir), agent, "eval")
+        .await.map_err(|e| e.to_string())?;
+
     let claude = duduclaw_core::which_claude()
         .or_else(|| duduclaw_core::which_claude_in_home(home))
         .ok_or_else(|| "claude CLI not found (PATH + known install locations)".to_string())?;
@@ -947,6 +950,16 @@ mod tests {
             "[case]\nname = \"t\"\nagent = \"support-bot\"\nprompt = \"hi there\"\n{extra}[judge]\nrubric = \"r\"\n"
         );
         toml::from_str(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn budget_refuses_eval_before_claude_or_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "not valid [[[").unwrap();
+        let error = run_live(&case(""), home.path(), "claude-sonnet-4-6", "a").await.unwrap_err();
+        assert!(error.contains("無法確認預算"), "{error}");
     }
 
     #[test]

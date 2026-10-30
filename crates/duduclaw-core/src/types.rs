@@ -1557,10 +1557,40 @@ pub struct HeartbeatConfig {
     pub cron_timezone: String,
 }
 
+/// Policy for a budget check whose configuration or spend cannot be read.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetWhenUnavailable {
+    #[default]
+    Allow,
+    Deny,
+}
+
+impl<'de> Deserialize<'de> for BudgetWhenUnavailable {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input { Text(String), Other(serde::de::IgnoredAny) }
+        match Input::deserialize(deserializer)? {
+            Input::Text(value) if value == "allow" => Ok(Self::Allow),
+            Input::Text(value) if value == "deny" => Ok(Self::Deny),
+            _ => {
+                static UNKNOWN_POLICY_WARNING: std::sync::Once = std::sync::Once::new();
+                UNKNOWN_POLICY_WARNING.call_once(|| {
+                    tracing::warn!("budget.when_unavailable must be allow or deny; using deny");
+                });
+                Ok(Self::Deny)
+            }
+        }
+    }
+}
+
 /// Budget limits and warnings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BudgetConfig {
+    #[serde(default)]
+    pub when_unavailable: BudgetWhenUnavailable,
     pub monthly_limit_cents: u64,
     pub warn_threshold_percent: u8,
     pub hard_stop: bool,

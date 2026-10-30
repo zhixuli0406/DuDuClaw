@@ -98,6 +98,7 @@
 | 分頁 → 區塊 | 設定鍵 |
 |---|---|
 | 預算 → 每日上限 | `[budget] daily_cap_cents` |
+| 預算 → 費用資料讀不到時 | `[budget] when_unavailable`（`allow` / `deny`） |
 | 技能 → 這位員工的技能（v1.76.0） | 不是設定鍵：開關存在 `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`），移除的技能搬到 `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）；需員工負責人或管理員。見[技能庫頁面](../../features/zh-TW/15-skill-lifecycle.md) |
 | 工具與權限 → 需要把關的工具（一律等人核可、視為不可逆、先由判官判斷、需任務授權） | `[capabilities] approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`scoped_tools` |
 | 工具與權限 → 平行分支 | `[fork] enabled` |
@@ -115,6 +116,8 @@
 | 自動化 → 記憶 → 決策延續、決定保留天數 | `[memory] decision_continuity`、`decision_ttl_days`（1 到 3650） |
 | 進階 → 模型進階 → 進階鍵值 | 任意 `[區段] 鍵`，每列帶型別（字串、整數、小數、布林、字串陣列）；寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` 區段不能在這裡改（v1.76.0：新增 `prompt`、`os_watch`、`budget`，裡面有只限管理員的設定，例如 `prompt.cli_bare_mode`，管理員改用設定檔進階編輯修改） |
 
+**員工預算。** `[budget] daily_cap_cents` 與 `monthly_limit_cents` 分別比對最近 24 小時與 30 天的已記錄花費，`hard_stop = true` 時達上限就拒絕下一次模型呼叫；0 代表不限額，執行中的呼叫仍可能超過上限。檢查涵蓋 Claude 與其他員工後端、派工與排程、提醒、郵件、心跳、輔助工作及 CLI 分支／評測。短期員工的已記錄花費也算進父員工，先以千分之一美分加總，再換算美分。員工設定檔可讀時，`[budget] when_unavailable = "allow"`（未填時的預設值）會在費用資料庫或查詢讀不到時留下明確警告與稽核紀錄並繼續；設成 `"deny"` 則在模型呼叫前拒絕。設定檔本身讀不到或無法解析時，無法確認這項政策，一律拒絕。未知政策值按 `"deny"` 處理並警告。無法檢查會顯示自己的原因與稽核事件，不會說成「花費達上限」，也不會發出斷路器開關通知。預算拒絕不觸發帳號輪替或備援。沒有員工 id 的呼叫不適用此政策。 指定員工目錄的輔助呼叫，以有效設定的 `[agent].name` 檢查預算並記錄後續花費，即使呼叫端原本使用作業名稱。舊有只記在作業名稱下的費用，無法可靠回填到各員工。
+
 單次執行時間上限與容器任務的逾時設定分開儲存。伺服器會拒絕非整數或超出 30～3600 秒的值；手動編輯檔案時，超出範圍的整數會調整到界線，型別錯誤則用預設值，兩者都會記錄警告。Antigravity 的外層最後上限另加 30 秒。OpenAI 相容 API 員工需要在 `utility` 或 `preferred` 指定模型；Codex 可使用 CLI 預設模型；Grok、Antigravity 與通用 CLI 員工改用全域背景設定。輔助模型與 runtime 的廠商家族不符時，畫面會提醒對話壓縮、事實擷取等背景工作將失敗。
 
 提高 `timeout_secs` 的實際上限需要管理員。員工擁有者可降低上限；清空設定會還原為 300 秒，若因此高於目前上限，同樣需要管理員。
@@ -123,7 +126,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok、Antigravity 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。既有評審上層可依降級策略，不帶不支援的指定重試，仍須遵守相同模式。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](../../features/zh-TW/05-security-defense.md)。
 
-**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）與（v1.76.0）`[permissions] allowed_channels`，`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（v1.76.0）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
+**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）與（v1.76.0）`[permissions] allowed_channels`，`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（v1.76.0）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`，或把 `when_unavailable` 從 `deny` 改成 `allow`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
 
 **誰能存檔（v1.76.0，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔v1760)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 

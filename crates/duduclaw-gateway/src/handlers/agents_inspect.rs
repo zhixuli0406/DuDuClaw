@@ -129,7 +129,7 @@ impl MethodHandler {
                                 "use_router": l.use_router,
                             })),
                         },
-                        "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop, "daily_cap_cents": cfg.budget.daily_cap_cents },
+                        "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop, "when_unavailable": cfg.budget.when_unavailable, "daily_cap_cents": cfg.budget.daily_cap_cents },
                         "heartbeat": {
                             "enabled": cfg.heartbeat.enabled,
                             "interval_seconds": cfg.heartbeat.interval_seconds,

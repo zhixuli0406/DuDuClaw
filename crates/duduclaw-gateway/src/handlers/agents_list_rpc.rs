@@ -100,7 +100,7 @@ impl MethodHandler {
                         "monthly_limit_cents": cfg.budget.monthly_limit_cents,
                         "spent_cents": agent_spent.get(&cfg.agent.name).copied().unwrap_or(0),
                         "warn_threshold_percent": cfg.budget.warn_threshold_percent,
-                        "hard_stop": cfg.budget.hard_stop,
+                        "hard_stop": cfg.budget.hard_stop, "when_unavailable": cfg.budget.when_unavailable,
                     },
                     "heartbeat": {
                         "enabled": cfg.heartbeat.enabled,

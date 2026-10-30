@@ -529,6 +529,7 @@ export function EditAgentPage() {
       monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
       warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
       hard_stop: agent.budget?.hard_stop ?? true,
+      when_unavailable: agent.budget?.when_unavailable ?? 'allow',
       heartbeat_enabled: agent.heartbeat?.enabled ?? false,
       heartbeat_interval: agent.heartbeat?.interval_seconds ?? 3600,
       // F1 — the saved cron (older gateways do not return it: the field then
@@ -1834,6 +1835,7 @@ export function EditAgentPage() {
                 <MoneyField cents={form.monthly_limit_cents ?? 5000} onChange={(c) => updateField('monthly_limit_cents', c)} />
               </SettingsRow>
               <RowNumber label={t('agents.edit.warnThreshold')} description={t('agents.edit.warnThreshold.help')} value={form.warn_threshold_percent ?? 80} min={0} max={100} onChange={(v) => updateField('warn_threshold_percent', v)} />
+              <RowSelect label={t('agents.edit.whenUnavailable')} description={t('agents.edit.whenUnavailable.help')} value={form.when_unavailable ?? 'allow'} onChange={(v) => updateField('when_unavailable', v as 'allow' | 'deny')} options={[{ value: 'allow', label: t('agents.edit.whenUnavailable.allow') }, { value: 'deny', label: t('agents.edit.whenUnavailable.deny') }]} />
               <RowSwitch label={t('agents.edit.hardStop')} description={t('agents.edit.hardStop.help')} checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} />
               <SettingsRow label={t('agents.v168.dailyCap')} description={t('agents.v168.dailyCap.help')} tier="select">
                 <MoneyField cents={v168.daily_cap_cents} onChange={(c) => updateV('daily_cap_cents', c)} />

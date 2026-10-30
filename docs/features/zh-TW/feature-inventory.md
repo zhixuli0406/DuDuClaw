@@ -99,7 +99,7 @@
 | 跨 session 使用者畫像 | 每使用者偏好 traits（temporal supersession）→ session-stable 的 `## About This User` 回覆注入（來自 gateway 萃取與核准的審核）；`user_profile_record` / `user_profile_get` MCP 工具讀寫的是所有 gateway 啟動的員工共用的另一個命名空間，不會進入這個區塊（已知限制，v1.67.1） |
 | GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 已在 v1.69.0 移除），涵蓋記憶（triple + 提及 + key_facts + 衰減／forget 歸檔副本，五表級聯，SHA-256 tombstone；歸檔副本只留文字，以提及比對：只靠 subject／object 連到這個人、文字沒提到他的歸檔列找不到；試跑與匯出的歸檔筆數只算文字比對到的列，實際刪除時另外刪掉與被刪記憶同 id 的歸檔列，所以刪除筆數可能較多）**與** session 儲存（`<channel>:<chat_id>` prefix）；聯絡人空白或去掉前後空白後少於 3 個字元時，在讀取任何資料前就拒絕 |
 | Custom Dashboard Widgets | 在沙盒 runtime 中執行的 AI 引導或原始 HTML 儀表板卡片；Widget Studio 分享／匯入／匯出（[30-custom-widgets.md](30-custom-widgets.md)） |
-| 預算斷路器 | 每 agent 滑動視窗硬上限（`[budget] daily_cap_cents`），到頂即於 choke-point 阻斷 LLM 呼叫；寫 `budget_events.jsonl` |
+| 預算斷路器 | 員工最近 24 小時／30 天費用上限，含短期子員工；所有員工模型呼叫路徑在啟動前檢查。`[budget] when_unavailable` 決定費用資料讀不到時繼續（預設 `allow`）或拒絕（`deny`）；設定檔讀不到／解析失敗一律拒絕，未知政策值按 `deny`；預算拒絕不觸發帳號輪替／備援；`budget_events.jsonl` |
 | 燒錢速率異常偵測 | 對每日花費做滾動平均＋標準差離群偵測（`cost_anomaly.rs`） |
 | 稽核匯出 + SIEM sink | `duduclaw export audit`（原 `duduclaw audit`）：正規化並串流 JSONL 稽核軌跡至 NDJSON／webhook |
 | 出站 guardrail hook | opt-in `[guardrails]`：送出前掃描憑證洩漏／injection echo／deny 詞／PII |

@@ -667,6 +667,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
 /// Why a dispatch failed, as the two delegation reply paths need it.
 #[derive(Debug)]
 enum DispatchError {
+    Budget(String),
     /// The task sandbox refused or failed the task. Its `message` is built
     /// by `task_sandbox` without CLI output or host paths, so it may be
     /// forwarded to the requester.
@@ -677,9 +678,18 @@ enum DispatchError {
 }
 
 impl DispatchError {
+    fn from_string(error: String) -> Self {
+        match crate::budget::budget_refusal_message(&error) {
+            Some(message) => Self::Budget(message.to_owned()),
+            None => Self::Other(error),
+        }
+    }
+
     /// Full text for host-local records (logs, the queue row).
     fn host_text(&self) -> String {
         match self {
+            Self::Budget(message) => format!("{}{message}", crate::budget::BUDGET_REFUSAL_PREFIX),
+            Self::Sandbox(failure) if failure.code == "budget_refused" => format!("{}{}", crate::budget::BUDGET_REFUSAL_PREFIX, failure.message),
             Self::Sandbox(failure) => failure.host_text(),
             Self::Other(e) => e.clone(),
         }
@@ -693,6 +703,7 @@ impl DispatchError {
 /// classified, non-leaking fallback: the raw text never leaves the host.
 fn dispatch_failure_reply(error: &DispatchError) -> String {
     match error {
+        DispatchError::Budget(message) => message.clone(),
         DispatchError::Sandbox(failure) if failure.unavailable => {
             format!("⚠️ 子任務未執行（任務沙箱）：{}", failure.message)
         }
@@ -1407,7 +1418,7 @@ async fn dispatch_to_agent_outcome(
                 crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt),
             )
             .await
-            .map_err(DispatchError::Other);
+            .map_err(DispatchError::from_string);
     }
     // Read isolation flags from agent config.
     let use_sandbox = {
@@ -1446,7 +1457,7 @@ async fn dispatch_to_agent_outcome(
                 crate::cost_telemetry::RequestType::Dispatch,
             )
             .await
-            .map_err(DispatchError::Other)
+            .map_err(DispatchError::from_string)
         })
         .await
 }
@@ -1743,6 +1754,13 @@ async fn handle_step_failure(
     agent_dir: &Path,
 ) -> Result<(), String> {
     use crate::task_spec::*;
+
+    if crate::budget::budget_refusal_message(error).is_some() {
+        spec.steps[step_index].status = StepStatus::Failed;
+        spec.status = TaskStatus::Failed;
+        spec.save(agent_dir).ok();
+        return Err(error.to_owned());
+    }
 
     let action = spec.mark_failed(step_index, error);
     spec.save(agent_dir).ok();
@@ -5835,5 +5853,20 @@ bot_token = "{token}"
                 .await;
             assert_eq!(seen, (true, true, true));
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_refusal_tests {
+    #[test]
+    fn budget_402_refusal_bypasses_cli_failure_classification() {
+        let text = crate::budget::BudgetRefusal(crate::budget::BudgetVerdict::Deny {
+            scope: "daily", spent_cents: 40200, cap_cents: 40200,
+        }).legacy_message();
+        let error = super::DispatchError::from_string(text);
+        assert!(matches!(error, super::DispatchError::Budget(_)));
+        let reply = super::dispatch_failure_reply(&error);
+        assert!(reply.contains("402.00") && reply.contains("花費達上限"));
+        assert!(!reply.contains("請稍後再試"));
     }
 }

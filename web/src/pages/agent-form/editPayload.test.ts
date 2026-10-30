@@ -65,6 +65,17 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(r.payload).toEqual({});
   });
 
+  it('sends the unavailable-budget policy only when edited', () => {
+    const s = state({ form: { when_unavailable: 'deny' } });
+    expect(buildUpdatePayload(s, new Set(), CTX).payload).toEqual({});
+    expect(buildUpdatePayload(s, new Set(['form.when_unavailable']), CTX).payload).toEqual({ when_unavailable: 'deny' });
+    for (const locale of [en, zhTW, jaJP]) {
+      for (const suffix of ['', '.help', '.allow', '.deny']) {
+        expect((locale as Record<string, string>)[`agents.edit.whenUnavailable${suffix}`]).toBeTruthy();
+      }
+    }
+  });
+
   it('a display-name edit sends only display_name (no cron, no org fields, no local table)', () => {
     const r = buildUpdatePayload(state(), new Set(['form.display_name']), CTX);
     expect(r.payload).toEqual({ display_name: 'Bot' });

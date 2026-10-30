@@ -178,6 +178,7 @@ pub struct AgentSectionView {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct BudgetSectionView {
+    pub when_unavailable: crate::types::BudgetWhenUnavailable,
     #[serde(deserialize_with = "crate::lenient::tri")]
     pub monthly_limit_cents: Tri<TomlNumber>,
     #[serde(deserialize_with = "crate::lenient::tri")]
@@ -1139,6 +1140,21 @@ max_branches = "many"
         let typo = parse("[agent]\nname = 42\ndisplay_name = \"A\"\n").agent.unwrap();
         assert_eq!(typo.name, None);
         assert_eq!(typo.display_name.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn budget_unavailable_policy_defaults_allow_and_unknown_denies() {
+        use crate::types::BudgetWhenUnavailable::{Allow, Deny};
+        assert_eq!(parse("").budget.when_unavailable, Allow);
+        for (raw, expected) in [("'allow'", Allow), ("'deny'", Deny), ("'typo'", Deny), ("42", Deny), ("true", Deny)] {
+            let body = format!("[budget]\nwhen_unavailable = {raw}\n");
+            assert_eq!(parse(&body).budget.when_unavailable, expected);
+            #[derive(serde::Deserialize)]
+            struct Config { budget: crate::types::BudgetConfig }
+            let typed: Config = toml::from_str(&format!("{body}monthly_limit_cents=0\nwarn_threshold_percent=80\nhard_stop=true\n")).unwrap();
+            assert_eq!(typed.budget.when_unavailable, expected);
+            assert_eq!(serde_json::to_value(typed.budget.when_unavailable).unwrap(), if expected == Allow { "allow" } else { "deny" });
+        }
     }
 
     /// `[budget]`'s view is three-state because the accessor warns only for

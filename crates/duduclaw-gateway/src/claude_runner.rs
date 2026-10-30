@@ -808,6 +808,7 @@ async fn call_claude_for_agent_impl(
     let default_language = crate::prompt_identity::read_default_language(home_dir).await;
     let system_prompt = build_system_prompt(agent, citation_ref, default_language.as_deref());
     let agent_name = agent.config.agent.name.clone();
+    let agent_id = if agent_id == "default" { agent_name.as_str() } else { agent_id };
     let claude_model = agent.config.model.preferred.clone();
     // OTel: record the resolved model on the `invoke_agent` span.
     tracing::Span::current().record(crate::otel::attrs::REQUEST_MODEL, claude_model.as_str());
@@ -830,6 +831,8 @@ async fn call_claude_for_agent_impl(
     // this, not a recomputed `agents/<id>` join.
     let agent_dir_owned = agent.dir.clone();
     drop(reg);
+    crate::budget::gate_before_spawn(home_dir, Some(&agent_dir_owned), agent_id, "claude_runner")
+        .await.map_err(|e| e.legacy_message())?;
 
     // Pending Task Queue is computed from the Task Board so the agent
     // opens each turn aware of its queue. Captured SEPARATELY rather than
@@ -1165,6 +1168,7 @@ async fn call_claude_for_agent_impl(
             .await;
             return match primary_result {
                 Ok(text) => Ok(text),
+                Err(e) if crate::budget::budget_refusal_message(&e).is_some() => Err(e),
                 Err(ref e)
                     if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e)
                         .is_some() =>
@@ -1177,6 +1181,8 @@ async fn call_claude_for_agent_impl(
                     );
                     emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e)
                         .await;
+                    crate::budget::gate_before_spawn(home_dir, Some(&agent_dir), agent_id, "claude_model_fallback")
+                        .await.map_err(|e| e.legacy_message())?;
                     call_with_rotation(
                         home_dir,
                         agent_id,
@@ -1193,7 +1199,9 @@ async fn call_claude_for_agent_impl(
                     )
                     .await
                     .map_err(|fe| {
-                        format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
+                        if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                            format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
+                        }
                     })
                 }
                 Err(e) => Err(e),
@@ -1304,6 +1312,7 @@ async fn call_claude_for_agent_impl(
         {
             Ok(text) => return Ok(text),
             Err(e) => {
+                if crate::budget::budget_refusal_message(&e).is_some() { return Err(e); }
                 let is_rate = is_rate_limit_error(&e);
                 let is_fallback_trigger = is_llm_fallback_error(&e);
                 let can_model_fallback =
@@ -1324,6 +1333,8 @@ async fn call_claude_for_agent_impl(
                     );
                     emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, &e)
                         .await;
+                    crate::budget::gate_before_spawn(home_dir, Some(&agent_dir), agent_id, "claude_model_fallback")
+                        .await.map_err(|e| e.legacy_message())?;
                     return call_with_rotation(
                         home_dir,
                         agent_id,
@@ -1340,7 +1351,9 @@ async fn call_claude_for_agent_impl(
                     )
                     .await
                     .map_err(|fe| {
-                        format_fallback_error_message(&claude_model, &e, &fallback_model, &fe)
+                        if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                            format_fallback_error_message(&claude_model, &e, &fallback_model, &fe)
+                        }
                     });
                 } else if api_mode == "auto" && is_rate {
                     // No model fallback available: all OAuth accounts rate-limited
@@ -1354,6 +1367,9 @@ async fn call_claude_for_agent_impl(
             }
         }
     }
+
+    crate::budget::gate_before_spawn(home_dir, Some(&agent_dir), agent_id, "claude_direct_api")
+        .await.map_err(|e| e.legacy_message())?;
 
     // ── ③ Direct API: fallback with API Key (cache-optimized) ────
     // Only reached when: api_mode="direct", or api_mode="auto" + all OAuth rate-limited.
@@ -1373,6 +1389,7 @@ async fn call_claude_for_agent_impl(
         );
         return try_direct_api_chain(
             home_dir,
+            &agent_dir,
             agent_id,
             prompt,
             &claude_model,
@@ -1392,6 +1409,7 @@ async fn call_claude_for_agent_impl(
     info!(agent = %agent_name, model = %claude_model, "Trying Direct API (API Key fallback)");
     match try_direct_api(
         home_dir,
+        &agent_dir,
         agent_id,
         prompt,
         &claude_model,
@@ -1404,6 +1422,7 @@ async fn call_claude_for_agent_impl(
     .await
     {
         Ok(text) => Ok(text),
+        Err(e) if crate::budget::budget_refusal_message(&e).is_some() => Err(e),
         Err(ref e)
             if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e).is_some() =>
         {
@@ -1416,6 +1435,7 @@ async fn call_claude_for_agent_impl(
             emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e).await;
             try_direct_api(
                 home_dir,
+                &agent_dir,
                 agent_id,
                 prompt,
                 &fallback_model,
@@ -1426,7 +1446,11 @@ async fn call_claude_for_agent_impl(
                 Some(&capabilities),
             )
             .await
-            .map_err(|fe| format_fallback_error_message(&claude_model, e, &fallback_model, &fe))
+            .map_err(|fe| {
+                if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                    format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
+                }
+            })
         }
         Err(e) => Err(e),
     }
@@ -1437,6 +1461,7 @@ async fn call_claude_for_agent_impl(
 /// These errors should NOT be retried with the same account — the account
 /// needs a long cooldown (topped up manually).
 pub(crate) fn is_billing_error(error: &str) -> bool {
+    if crate::budget::budget_refusal_message(error).is_some() { return false; }
     let lower = error.to_lowercase();
     lower.contains("credit")
         || lower.contains("balance")
@@ -2295,6 +2320,7 @@ async fn try_llm_provider_api(
 )]
 async fn try_direct_api(
     home_dir: &Path,
+    agent_dir: &Path,
     agent_id: &str,
     prompt: &str,
     model: &str,
@@ -2304,6 +2330,8 @@ async fn try_direct_api(
     rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    crate::budget::gate_before_spawn(home_dir, Some(agent_dir), agent_id, "direct_api_attempt")
+        .await.map_err(|e| e.legacy_message())?;
     crate::product_policy::require_model(crate::product_policy::load(home_dir)?, model)?;
     if let DirectApiRoute::LlmProvider(provider_id) = direct_api_route(model) {
         return try_llm_provider_api(
@@ -2402,6 +2430,7 @@ struct ChainError {
 /// failover-class (rate limit / billing / 5xx / timeout / overloaded) vs.
 /// terminal (auth / invalid). Terminal short-circuits the chain.
 fn is_chain_failover(err: &str) -> bool {
+    if crate::budget::budget_refusal_message(err).is_some() { return false; }
     is_rate_limit_error(err) || is_billing_error(err) || is_llm_fallback_error(err)
 }
 
@@ -2516,6 +2545,7 @@ async fn candidate_provider_has_key(
 #[allow(clippy::too_many_arguments)]
 async fn try_direct_api_chain(
     home_dir: &Path,
+    agent_dir: &Path,
     agent_id: &str,
     prompt: &str,
     preferred_model: &str,
@@ -2553,6 +2583,7 @@ async fn try_direct_api_chain(
         // attempt on the preferred model so its own "no key" error surfaces.
         return try_direct_api(
             home_dir,
+            agent_dir,
             agent_id,
             prompt,
             preferred_model,
@@ -2567,6 +2598,9 @@ async fn try_direct_api_chain(
 
     let rotator_ref = rotator.as_deref();
     drive_direct_api_chain(&candidates, |model| async move {
+        if let Err(refusal) = crate::budget::gate_before_spawn(home_dir, Some(agent_dir), agent_id, "direct_api_chain").await {
+            return Err(ChainError { message: refusal.legacy_message(), failover: false });
+        }
         let (provider, bare) = provider_and_bare(&model);
         if let Err(message) = crate::product_policy::require_provider(home_dir, &provider) {
             return Err(ChainError {
@@ -2577,6 +2611,7 @@ async fn try_direct_api_chain(
         if provider == "anthropic" {
             match try_direct_api(
                 home_dir,
+                agent_dir,
                 agent_id,
                 prompt,
                 &bare,
@@ -3181,6 +3216,10 @@ async fn call_with_rotation(
         );
     }
 
+    let budget_dir = identity.config_dir.or(work_dir).map(Path::to_path_buf).unwrap_or_else(||
+        crate::budget::agent_dir_for_id(home_dir, agent_id));
+    crate::budget::gate_before_spawn(home_dir, Some(&budget_dir), agent_id, "claude_rotation")
+        .await.map_err(|e| e.legacy_message())?;
     let rotator = get_rotator(home_dir).await?;
 
     // Fresh-install passthrough: no accounts configured → fall back to ambient
@@ -3249,6 +3288,10 @@ async fn call_with_rotation(
     let mut tried: Vec<String> = Vec::new();
 
     for attempt in 0..max_attempts {
+        let budget_dir = identity.config_dir.or(work_dir).map(Path::to_path_buf).unwrap_or_else(||
+            crate::budget::agent_dir_for_id(home_dir, agent_id));
+        crate::budget::gate_before_spawn(home_dir, Some(&budget_dir), agent_id, "claude_rotation_attempt")
+            .await.map_err(|e| e.legacy_message())?;
         let selected = match rotator
             .select_with_pool_excluding(account_pool, &tried)
             .await
@@ -3352,7 +3395,8 @@ async fn call_with_rotation(
                 // reaches here today. Should a later change move it into the
                 // per-account spawn, it still must not count against the
                 // account or try the next one.
-                if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
+                if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e)
+                    || crate::budget::budget_refusal_message(&e).is_some() {
                     return Err(e);
                 }
                 last_error = e.clone();
@@ -5114,6 +5158,16 @@ mod chain_tests {
     }
 
     // ── G1: failover classification ─────────────────────────────────────
+
+    #[test]
+    fn budget_402_refusal_is_terminal_for_direct_api_chain() {
+        let refusal = crate::budget::BudgetRefusal(crate::budget::BudgetVerdict::Deny {
+            scope: "daily", spent_cents: 40200, cap_cents: 40200,
+        });
+        assert!(refusal.to_string().contains("402.00"));
+        assert!(!is_chain_failover(&refusal.legacy_message()));
+        assert!(!is_billing_error(&refusal.legacy_message()));
+    }
 
     #[test]
     fn chain_failover_classification_strings() {

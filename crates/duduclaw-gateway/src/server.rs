@@ -1278,6 +1278,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler.registry().clone(),
         Some(silence_tx),
         Some(proactive_notice),
+        Some(Arc::new(|home, dir, agent| Box::pin(async move {
+            crate::budget::gate_before_spawn(&home, Some(&dir), &agent, "heartbeat_proactive")
+                .await.map_err(|e| e.to_string())
+        }))),
     );
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");

@@ -70,6 +70,7 @@ export interface AgentBudget {
   spent_cents: number;
   warn_threshold_percent: number;
   hard_stop: boolean;
+  when_unavailable?: 'allow' | 'deny';
 }
 
 export interface AgentModel {
@@ -3082,6 +3083,7 @@ export interface AgentUpdateParams {
   monthly_limit_cents?: number;
   warn_threshold_percent?: number;
   hard_stop?: boolean;
+  when_unavailable?: 'allow' | 'deny';
   // Heartbeat
   heartbeat_enabled?: boolean;
   heartbeat_interval?: number;

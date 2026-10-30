@@ -722,12 +722,12 @@ pub(super) async fn build_reply_with_session_inner(
     // If the agent has hit its hard spend cap, stop before any LLM call and tell
     // the user on their own channel — this reply IS the cross-channel budget
     // alert. Inert unless `agent.toml [budget]` sets a cap with `hard_stop`; the
-    // check fails open if telemetry is unavailable.
+    // unavailable-data behavior follows `[budget] when_unavailable`.
     {
-        let budget =
-            crate::budget::check_agent_budget(&ctx.home_dir, agent_dir.as_deref(), &agent_id).await;
-        if budget.is_denied() {
-            return budget.user_message();
+        if let Err(refusal) = crate::budget::gate_before_spawn(
+            &ctx.home_dir, agent_dir.as_deref(), &agent_id, "channel_reply",
+        ).await {
+            return refusal.to_string();
         }
     }
 
