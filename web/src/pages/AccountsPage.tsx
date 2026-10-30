@@ -98,12 +98,8 @@ function Field({
 }
 
 /**
- * The CLIs one-click sign-in can drive. Antigravity (`agy`) is deliberately
- * absent: it has no login subcommand (the gateway reports `login_method:
- * "none"`), so its Google sign-in is done by running `agy` in a terminal on
- * the host. Labels are product names, so they stay
- * verbatim; the one that needs a qualifier ("which subscription is this?")
- * carries an i18n key instead.
+ * The CLIs one-click sign-in can drive. Product names stay verbatim;
+ * subscription qualifiers carry an i18n key.
  */
 const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string, string?]> = [
   ['claude', 'Claude'],

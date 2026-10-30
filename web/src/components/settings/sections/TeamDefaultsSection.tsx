@@ -11,7 +11,7 @@ type TeamRole = (typeof TEAM_ROLES)[number];
 const TEAM_GATES = ['auto', 'always_solo', 'always_team'] as const;
 // duduclaw_core::types::TEAM_ROLE_RUNTIME_ALLOWLIST minus the deprecated
 // `gemini` (a saved value stays visible, labelled, below).
-const ROLE_RUNTIMES = ['', 'claude', 'codex', 'antigravity', 'grok'] as const;
+const ROLE_RUNTIMES = ['', 'claude', 'codex', 'grok'] as const;
 const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 function readRoles(tables: TomlTables): Record<string, string> {

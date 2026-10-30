@@ -6,12 +6,8 @@
  * Why this is not a one-line regex: a login transcript usually contains several
  * URLs, and only one of them is the page the user must open.
  *
- *   • Antigravity (`agy`) announces its callback endpoint
- *     (`https://antigravity.google/oauth-callback`) and its docs/terms links
- *     alongside the real consent URL on `accounts.google.com`. Picking the first
- *     URL that merely contains the word "oauth" hands back the callback — which
- *     is what the 2026-08-04 report ("HY 抓錯授權網址") was about.
- *   • Codex and Gemini print a plain "listening on http://localhost:PORT" line
+ *   • A CLI may print callback endpoints and documentation beside its consent URL.
+ *   • Codex print a plain "listening on http://localhost:PORT" line
  *     before the URL that actually carries the consent parameters.
  *
  * The reliable signal is not the host or the word "oauth" — it is the query

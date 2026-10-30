@@ -15,7 +15,7 @@ export const ANTHROPIC_LEGAL_URL = 'https://code.claude.com/docs/en/legal-and-co
 
 /** Vendor whose terms apply to a subscription login. Mirrors the `vendor`
  *  keys of `duduclaw_core::subscription_risk::vendor_policy`. */
-export type SubscriptionVendor = 'anthropic' | 'openai' | 'gemini' | 'antigravity' | 'xai' | 'other';
+export type SubscriptionVendor = 'anthropic' | 'openai' | 'gemini' | 'xai' | 'other';
 
 /** Each vendor's own terms page (`null`: no page DuDuClaw can point at).
  *  Mirrors the `*_URL` constants in `duduclaw_core::subscription_risk`. */
@@ -25,12 +25,11 @@ export const VENDOR_TERMS_URL: Record<SubscriptionVendor, string | null> = {
   // plan use in third-party apps. Mirrors `OPENAI_SIWC_TERMS_URL`.
   openai: 'https://openai.com/policies/sign-in-with-chatgpt-terms/',
   gemini: 'https://geminicli.com/docs/resources/tos-privacy/',
-  antigravity: 'https://antigravity.google/terms',
   xai: 'https://x.ai/legal/terms-of-service',
   other: null,
 };
 
-/** Vendor for a CLI runtime id (`claude`, `codex`, `gemini`, `antigravity`,
+/** Vendor for a CLI runtime id (`claude`, `codex`, `gemini`,
  *  `grok`) or an `[[accounts]]` provider id. Empty = Anthropic (the default
  *  provider of an account). */
 export function subscriptionVendorFor(id: string | null | undefined): SubscriptionVendor {
@@ -45,9 +44,6 @@ export function subscriptionVendorFor(id: string | null | undefined): Subscripti
     case 'gemini':
     case 'google':
       return 'gemini';
-    case 'antigravity':
-    case 'agy':
-      return 'antigravity';
     case 'grok':
     case 'xai':
       return 'xai';

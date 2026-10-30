@@ -40,15 +40,6 @@ describe('AccountsPage (MDS)', () => {
     ).toBeInTheDocument();
   });
 
-  it('does not offer Antigravity in the one-click-login CLI picker (agy has no login subcommand)', async () => {
-    const user = userEvent.setup();
-    renderWithProviders(<AccountsPage />);
-
-    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
-    expect(await screen.findByRole('button', { name: /Grok/ })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Antigravity/i })).not.toBeInTheDocument();
-  });
-
   it('does not offer the removed Gemini CLI in the one-click-login picker', async () => {
     const user = userEvent.setup();
     renderWithProviders(<AccountsPage />);

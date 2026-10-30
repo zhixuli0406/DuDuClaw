@@ -27,7 +27,7 @@ const DISPATCH_POLICIES = ['fixed_hierarchy', 'round_robin', 'llm_select', 'role
 
 // `[dispatch] judge_provider` — a runtime id (`RuntimeType::parse`); empty =
 // no override, the judge runs on the default utility model.
-const JUDGE_PROVIDERS = ['', 'claude', 'codex', 'antigravity', 'grok', 'openai_compat'] as const;
+const JUDGE_PROVIDERS = ['', 'claude', 'codex', 'grok', 'openai_compat'] as const;
 
 // goal_loop.resume_on_restart enum accepted by the gateway's
 // system.update_config — kept in "recommended first" order (pause is the

@@ -310,10 +310,10 @@ describe('utility model/runtime warning', () => {
   it.each([
     ['codex', 'claude-haiku-4-5', true],
     ['grok', 'gpt-5.4', true],
-    ['antigravity', 'claude-sonnet-4-6', true],
+    ['grok', 'claude-sonnet-4-6', true],
+    ['grok', 'grok-4', false],
+    ['grok', 'Grok 4', false],
     ['codex', 'openai/gpt-5.4', false],
-    ['antigravity', 'gemini-2.5-flash', false],
-    ['antigravity', 'Gemini 3 Pro', false],
     ['qwen', 'qwen3-coder-plus', false],
     ['qwen', 'claude-haiku-4-5', true],
     ['vibe', 'codestral-latest', false],

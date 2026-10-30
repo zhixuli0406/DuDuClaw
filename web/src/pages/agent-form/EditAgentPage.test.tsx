@@ -303,14 +303,14 @@ describe('EditAgentPage', () => {
   // dashboard switch must go through the same danger-confirm gate as
   // computer_use / browser_via_bash / recording, default unchecked.
   // Gemini CLI runtime removal: no longer offered, but a saved value stays
-  // visible and labelled; Antigravity is offered instead.
+  // visible and labelled; Codex is offered instead.
   describe('runtime pickers — Gemini CLI removal', () => {
-    it('offers Antigravity and not Gemini when the saved provider is claude', async () => {
+    it('offers Codex and not Gemini when the saved provider is claude', async () => {
       const user = userEvent.setup();
       renderAt('/agents/my-bot/edit?tab=brain');
 
       await user.click(await screen.findByRole('combobox', { name: 'AI Backend (Provider)' }));
-      expect(await screen.findByRole('option', { name: 'Antigravity (Google)' })).toBeInTheDocument();
+      expect(await screen.findByRole('option', { name: 'Codex' })).toBeInTheDocument();
       expect(screen.queryByRole('option', { name: /Gemini/ })).not.toBeInTheDocument();
     });
 
@@ -325,7 +325,7 @@ describe('EditAgentPage', () => {
       });
       await user.click(picker);
       expect(await screen.findByRole('option', { name: 'Gemini (removed)' })).toBeInTheDocument();
-      expect(screen.getByRole('option', { name: 'Antigravity (Google)' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Codex' })).toBeInTheDocument();
     });
 
     it('keeps a saved gemini fallback visible, labelled removed', async () => {
@@ -389,14 +389,14 @@ describe('EditAgentPage', () => {
       await waitFor(() => expect(provider).toHaveTextContent('Gemini (removed)'));
 
       await user.click(await screen.findByRole('combobox', { name: 'Fallback Backend' }));
-      await user.click(await screen.findByRole('option', { name: 'Antigravity (Google)' }));
+      await user.click(await screen.findByRole('option', { name: 'Codex' }));
 
       await waitFor(
         () => {
           expect(updateAgent).toHaveBeenCalledWith(
             'my-bot',
             expect.objectContaining({
-              runtime: { fallback: 'antigravity' },
+              runtime: { fallback: 'codex' },
             }),
           );
         },

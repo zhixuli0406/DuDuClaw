@@ -324,10 +324,9 @@ describe('RuntimeSetupCard — login + re-detect', () => {
   });
 
   it('hides the sign-in row when the provider has no observable login state', () => {
-    // Antigravity keeps no credential file we can probe — `loggedIn` is
-    // undefined and must NOT be read as "not signed in".
+    // Missing sign-in information must not be treated as signed out.
     renderWithProviders(
-      <RuntimeSetupCard provider="antigravity" installed onDetect={vi.fn()} />,
+      <RuntimeSetupCard provider="codex" installed onDetect={vi.fn()} />,
     );
     expect(screen.queryByRole('button', { name: /sign in now/i })).not.toBeInTheDocument();
     expect(screen.getByText(/is ready/i)).toBeInTheDocument();
@@ -345,9 +344,9 @@ describe('RuntimeSetupCard — login + re-detect', () => {
 
   it('always offers a self-install escape hatch when not installed', () => {
     renderWithProviders(
-      <RuntimeSetupCard provider="antigravity" installed={false} onDetect={vi.fn()} />,
+      <RuntimeSetupCard provider="codex" installed={false} onDetect={vi.fn()} />,
     );
     const link = screen.getByRole('link', { name: /install it myself/i });
-    expect(link).toHaveAttribute('href', 'https://antigravity.google/docs/cli');
+    expect(link).toHaveAttribute('href', 'https://github.com/openai/codex');
   });
 });

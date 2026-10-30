@@ -456,7 +456,6 @@ export function utilityModelMismatchesRuntime(provider: string, model: string): 
   const families: Record<string, RegExp> = {
     claude: /^claude/,
     codex: /^(gpt-|o1|o3|codex)/,
-    antigravity: /^gemini/,
     grok: /^grok/,
     qwen: /^qwen/,
     kimi: /^kimi/,

@@ -3199,7 +3199,7 @@ export interface AgentOdooOverride {
 // ── RT: per-agent [runtime] ─────────────────────────────────────
 
 export type RuntimeProvider =
-  | 'claude' | 'codex' | 'antigravity' | 'grok' | 'openai_compat'
+  | 'claude' | 'codex' | 'grok' | 'openai_compat'
   // v1.68 W1 — generic command-line runtimes from `runtime_catalog.rs`.
   | 'qwen' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'vibe' | 'opencode';
 
@@ -3342,7 +3342,6 @@ export interface AgentDetailV168 {
 export interface RuntimeDetect {
   claude_cli: boolean;
   codex: boolean;
-  antigravity: boolean;
   /** Present since the R4 Grok runtime; older gateways omit it. */
   grok?: boolean;
   claude_oauth: boolean;
@@ -3357,7 +3356,7 @@ export interface RuntimeDetect {
 }
 
 /** Providers `runtime.install` knows how to install (hard-coded gateway whitelist). */
-export type InstallableProvider = 'claude' | 'codex' | 'antigravity' | 'grok';
+export type InstallableProvider = 'claude' | 'codex' | 'grok';
 
 /**
  * Result of `runtime.install`. A decline is a normal answer, not an error: the
@@ -6657,7 +6656,7 @@ export const api = {
      *  `SubscriptionRiskDisclosure`); the gateway refuses with
      *  `subscription_risk_not_accepted` otherwise. */
     cliLoginStart: (
-      runtime: 'claude' | 'codex' | 'antigravity' | 'grok' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode',
+      runtime: 'claude' | 'codex' | 'grok' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'opencode',
       acceptSubscriptionRisk: boolean,
     ) =>
       client.call('auth.cli_login.start', {
