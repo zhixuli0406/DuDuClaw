@@ -53,6 +53,41 @@ pub struct GrantSpec {
     pub expires_at: String,
     pub policy_revision: String,
 }
+
+/// Failure of a ledger read used at boot.
+///
+/// Only the three authority variants are safe to treat as "this activation has
+/// no live grant". [`RevisionGrantReadError::Store`] is the default for
+/// anything the store layer reports; callers that do not recognize a variant
+/// must take that same non-rewriting path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionGrantReadError {
+    StandingToolRefused { tool: String },
+    InvalidCurrentGrant,
+    MaterialCorrupt,
+    Store(String),
+}
+
+impl std::fmt::Display for RevisionGrantReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StandingToolRefused { tool } => write!(
+                f,
+                "purchase/delete tool requires single-call approval: {tool}"
+            ),
+            Self::InvalidCurrentGrant => f.write_str("invalid current grant"),
+            Self::MaterialCorrupt => f.write_str("current grant material corrupt"),
+            Self::Store(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<RevisionGrantReadError> for String {
+    fn from(error: RevisionGrantReadError) -> Self {
+        error.to_string()
+    }
+}
+
 impl GrantSpec {
     pub fn hash(&self) -> String {
         payload_hash(&serde_json::to_value(self).expect("grant serializable"))
@@ -67,13 +102,12 @@ impl GrantSpec {
         }
         Ok(())
     }
-    fn validate_standing_tools(&self) -> Result<(), String> {
+    fn validate_standing_tools(&self) -> Result<(), RevisionGrantReadError> {
         for template in self.templates.values() {
             if !crate::capability_grants::standing_grant_allowed(&template.tool) {
-                return Err(format!(
-                    "purchase/delete tool requires single-call approval: {}",
-                    template.tool
-                ));
+                return Err(RevisionGrantReadError::StandingToolRefused {
+                    tool: template.tool.clone(),
+                });
             }
         }
         Ok(())
