@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { CheckCircle2, AlertTriangle, KeyRound, Copy, Check, Loader2 } from 'lucide-react';
-import { api, type GoogleCredentialsStatus } from '@/lib/api';
-import { toast } from '@/lib/toast';
+import { api, type GoogleCredentialsStatus, type GoogleServiceProbe } from '@/lib/api';
+import { GoogleServiceResults } from '@/components/google/GoogleServiceResults';
+import { toast, formatError } from '@/lib/toast';
 import {
   Card,
   CardHeader,
@@ -17,20 +18,8 @@ import {
 
 type Mode = 'oauth' | 'service_account' | 'apps_script';
 
-/**
- * GoogleCredentialPaths — configure the two Google credential paths that need
- * no per-customer OAuth client (see `docs/guides/google-no-oauth-client.md`).
- *
- * Sits under the OAuth connect panel on the Google integration tab. The three
- * paths authorize the SAME nineteen tools, so this is a "pick one" surface
- * rather than three independent switches: saving a mode clears the other's
- * config server-side, which keeps the configured path and the effective path
- * from disagreeing.
- *
- * The stored bridge secret is never sent back to the browser. Leaving the
- * secret field blank when editing a saved bridge keeps the existing one.
- */
-export function GoogleCredentialPaths() {
+/** Select one effective credential path; stored OAuth tokens remain in the vault. */
+export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: Mode; onSaved?: () => void } = {}) {
   const intl = useIntl();
   const t = (id: string, defaultMessage: string, values?: Record<string, string>) =>
     intl.formatMessage({ id, defaultMessage }, values);
@@ -43,6 +32,7 @@ export function GoogleCredentialPaths() {
   const [secret, setSecret] = useState('');
   const [busy, setBusy] = useState<'idle' | 'saving' | 'testing'>('idle');
   const [copied, setCopied] = useState(false);
+  const [probes, setProbes] = useState<GoogleServiceProbe[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -53,28 +43,34 @@ export function GoogleCredentialPaths() {
       setUrl(s.apps_script.url ?? '');
       // Reflect what is actually configured so the form opens on the path the
       // operator is already using.
-      if (s.service_account.configured) setMode('service_account');
-      else if (s.apps_script.configured) setMode('apps_script');
+      if (initialMode) setMode(initialMode);
+      else if (s.effective === 'service_account') setMode('service_account');
+      else if (s.effective === 'apps_script') setMode('apps_script');
       else setMode('oauth');
     } catch {
       setStatus(null);
     }
-  }, []);
+  }, [initialMode]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   const save = async () => {
+    const current = status?.effective;
+    const replacing = !!current && current !== 'none' && current !== mode && !(current === 'direct' && mode === 'oauth');
+    if (replacing && !confirm(t('google.cred.replaceConfirm', '切換連線方式？已儲存的 OAuth 權杖會保留。'))) return;
+    const confirmation = replacing ? { replace_confirmed: true } : {};
     setBusy('saving');
     try {
       if (mode === 'oauth') {
-        await api.googleCredentials.set({ mode: 'none' });
+        await api.googleCredentials.set({ mode: 'oauth', ...confirmation });
       } else if (mode === 'service_account') {
-        await api.googleCredentials.set({ mode: 'service_account', key_file: keyFile, subject });
+        await api.googleCredentials.set({ mode: 'service_account', key_file: keyFile, subject, ...confirmation });
       } else {
         await api.googleCredentials.set({
           mode: 'apps_script',
+          ...confirmation,
           url,
           // Blank means "keep the stored secret" — the server preserves it.
           ...(secret.trim() ? { secret: secret.trim() } : {}),
@@ -83,8 +79,9 @@ export function GoogleCredentialPaths() {
       setSecret('');
       toast.success(t('google.cred.saved', '已儲存'));
       await load();
+      onSaved?.();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(formatError(e));
     } finally {
       setBusy('idle');
     }
@@ -94,9 +91,10 @@ export function GoogleCredentialPaths() {
     setBusy('testing');
     try {
       const r = await api.googleCredentials.test();
-      toast.success(r.account ? `${r.detail}（${r.account}）` : r.detail);
+      setProbes(r.services || []);
+      toast[r.ok ? 'success' : 'error'](t(`google.probe.${r.detail}`, r.ok ? '連線檢查完成' : '連線檢查失敗'));
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(formatError(e));
     } finally {
       setBusy('idle');
     }
@@ -112,8 +110,10 @@ export function GoogleCredentialPaths() {
   if (!status) return null;
 
   const effectiveLabel =
-    status.effective === 'direct'
-      ? t('google.cred.effective.direct', '直接 API 權杖（OAuth 或服務帳號）· 19 個工具全通')
+    status.effective === 'oauth' ? t('google.cred.mode.oauth', 'OAuth 連線')
+      : status.effective === 'service_account' ? t('google.cred.mode.sa', '服務帳號委派')
+      : status.effective === 'direct'
+      ? t('google.cred.effective.direct', '直接 Google API（逐服務檢查權限）')
       : status.effective === 'apps_script'
         ? t('google.cred.effective.bridge', 'Apps Script 橋接 · Gmail／行事曆／Sheets')
         : t('google.cred.effective.none', '尚未設定任何憑證');
@@ -133,7 +133,7 @@ export function GoogleCredentialPaths() {
         <p className="text-sm text-muted-foreground">
           {t(
             'google.cred.intro',
-            '三種授權方式對應同一組 19 個工具。選一種即可 — 儲存時會清掉另一種的設定，避免實際生效的跟你以為的不一致。',
+            '選擇目前使用的連線方式。OAuth 與服務帳號可使用完整工具；Apps Script 支援三種服務、八個動作。切換前會請你確認。',
           )}
         </p>
 
@@ -163,7 +163,7 @@ export function GoogleCredentialPaths() {
             <span>
               {t(
                 'google.cred.gateOff',
-                'Google 整合的總開關還沒開，工具不會出現在 AI 員工面前（憑證測試仍會通過）。完成 Google 連線或儲存憑證時會自動開啟；也可手動在 config.toml 加上 [integrations] google_workspace = true。',
+                'Google 整合的總開關還沒開，AI 員工看不到工具。完成 Google 連線或儲存憑證時會自動開啟。',
               )}
             </span>
           </div>
@@ -180,7 +180,7 @@ export function GoogleCredentialPaths() {
 
         <Separator />
 
-        <Segmented<Mode>
+        {!initialMode && <Segmented<Mode>
           value={mode}
           onValueChange={setMode}
           aria-label={t('google.cred.title', '憑證方式')}
@@ -189,7 +189,7 @@ export function GoogleCredentialPaths() {
             { value: 'service_account', label: t('google.cred.mode.sa', '服務帳號委派') },
             { value: 'apps_script', label: t('google.cred.mode.gas', 'Apps Script 橋接') },
           ]}
-        />
+        />}
 
         {mode === 'oauth' && (
           <p className="text-sm text-muted-foreground">
@@ -297,6 +297,7 @@ export function GoogleCredentialPaths() {
           </div>
         )}
 
+        <GoogleServiceResults probes={probes} />
         <div className="flex items-center gap-2">
           <Button onClick={save} disabled={busy !== 'idle'}>
             {busy === 'saving' && <Loader2 className="size-4 animate-spin" />}

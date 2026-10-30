@@ -38,11 +38,11 @@ pub(crate) async fn handle_google_status(
     // delegation or the bridge reads "NOT connected" while their tools work.
     match resolve_backend(home_dir).await {
         Ok(GoogleBackend::Direct(_)) => {
-            out.push_str("Credential source: direct API token (OAuth vault or service-account delegation). All 19 tools available.\n\n");
+            out.push_str("Credential source: direct API token (OAuth vault or service-account delegation). Token obtained; service API access has not been verified. Run per-service verification in the dashboard.\n\n");
         }
         Ok(GoogleBackend::AppsScript(cfg)) => {
             out.push_str(&format!(
-                "Credential source: {}. Gmail / Calendar / Sheets are available; Drive, Docs, Slides, Forms and Tasks need OAuth or a service account.\n\n",
+                "Credential source: {}. The bridge supports eight actions across Gmail / Calendar / Sheets; this status has not tested them; Drive, Docs, Slides, Forms and Tasks need OAuth or a service account.\n\n",
                 cfg.describe()
             ));
         }
@@ -93,7 +93,7 @@ pub(crate) async fn handle_google_status(
                 .collect();
             if !missing.is_empty() {
                 out.push_str(
-                    "\nMissing scopes needed for full Gmail/Calendar functionality (reconnect from the dashboard to grant):\n",
+                    "\nMissing scopes needed for Google Workspace functionality (reconnect from the dashboard to grant):\n",
                 );
                 for m in missing {
                     out.push_str(&format!("  - {m}\n"));

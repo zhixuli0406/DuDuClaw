@@ -164,6 +164,33 @@ pub fn budgeted_legacy_skills(
 mod tests {
     use super::*;
 
+    #[test]
+    fn google_setup_preserves_office_skills_under_legacy_budget() {
+        use duduclaw_agent::builtin_skills::{BUILTIN_SKILLS, BUILTIN_SKILL_FILES};
+        let mut before: Vec<(String, String)> = BUILTIN_SKILLS.iter()
+            .filter(|(name, _)| *name != "connect-google")
+            .map(|(name, body)| (name.to_string(), body.trim_end().to_string()))
+            .collect();
+        for (name, files) in BUILTIN_SKILL_FILES {
+            let (_, body) = files.iter().find(|(path, _)| *path == "SKILL.md").unwrap();
+            before.push((name.to_string(), body.trim_end().to_string()));
+        }
+        before.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut after = before.clone();
+        let (_, body) = BUILTIN_SKILLS.iter().find(|(name, _)| *name == "connect-google").unwrap();
+        after.push(("connect-google".to_string(), body.trim_end().to_string()));
+        after.sort_by(|a, b| a.0.cmp(&b.0));
+        let (old, _) = budgeted_legacy_skills(&before, DEFAULT_LEGACY_SKILL_BYTE_CAP);
+        let (new, _) = budgeted_legacy_skills(&after, DEFAULT_LEGACY_SKILL_BYTE_CAP);
+        for (name, _) in BUILTIN_SKILL_FILES {
+            let heading = format!("## Skill: {name}\n");
+            if old.iter().any(|s| s.starts_with(&heading)) {
+                assert!(new.iter().any(|s| s.starts_with(&heading)), "new skill displaced {name}");
+            }
+        }
+        assert!(new.iter().any(|s| s.starts_with("## Skill: connect-google\n")));
+    }
+
     fn s(label: &'static str, n: usize) -> PromptSection {
         PromptSection { label, bytes: n }
     }

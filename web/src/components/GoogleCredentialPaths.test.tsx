@@ -61,20 +61,21 @@ describe('GoogleCredentialPaths', () => {
     );
   });
 
-  it('saving the OAuth mode clears the alternative credential sections', async () => {
+  it('saving OAuth requires confirmation before replacing a bridge and preserves stored tokens', async () => {
     const user = userEvent.setup();
     mockGet({
       effective: 'apps_script',
       apps_script: { configured: true, url: 'https://script.google.com/macros/s/AK/exec', error: '' },
     });
-    const setSpy = vi.spyOn(api.googleCredentials, 'set').mockResolvedValue({ ok: true, mode: 'none' });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const setSpy = vi.spyOn(api.googleCredentials, 'set').mockResolvedValue({ ok: true, mode: 'oauth' });
     renderWithProviders(<GoogleCredentialPaths />);
 
     await waitFor(() => expect(screen.getByText(/OAuth connect/i)).toBeInTheDocument());
     await user.click(screen.getByText(/OAuth connect/i));
     await user.click(screen.getByRole('button', { name: /save/i }));
 
-    await waitFor(() => expect(setSpy).toHaveBeenCalledWith({ mode: 'none' }));
+    await waitFor(() => expect(setSpy).toHaveBeenCalledWith({ mode: 'oauth', replace_confirmed: true }));
   });
 
   it('omits the secret when left blank so editing the URL keeps the stored one', async () => {
@@ -111,8 +112,8 @@ describe('GoogleCredentialPaths', () => {
       .mockResolvedValue({ ok: true, mode: 'service_account' });
     renderWithProviders(<GoogleCredentialPaths />);
 
-    await waitFor(() => expect(screen.getByText(/Service account/i)).toBeInTheDocument());
-    await user.click(screen.getByText(/Service account/i));
+    await waitFor(() => expect(screen.getByRole('radio', { name: 'Service account' })).toBeInTheDocument());
+    await user.click(screen.getByRole('radio', { name: 'Service account' }));
     await user.type(screen.getByLabelText(/Service account key file/i), 'keys/sa.json');
     await user.type(screen.getByLabelText(/User to impersonate/i), 'boss@customer.com');
     await user.click(screen.getByRole('button', { name: /save/i }));

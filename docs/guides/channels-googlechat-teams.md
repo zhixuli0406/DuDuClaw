@@ -1,5 +1,7 @@
 # Google Chat & Microsoft Teams channels
 
+Google Chat channel credentials authorize the Chat application (`chat.bot`). They do not connect Gmail, Drive or Calendar. Workspace data tools have their own [Google setup](google-setup.md). Saving a channel in the dashboard applies live; restart after editing channel configuration by hand.
+
 DuDuClaw supports Google Chat and Microsoft Teams as first-class channels
 (alongside Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat).
 Both are webhook-based: your gateway must be reachable over public HTTPS.
@@ -40,7 +42,7 @@ googlechat_project_number = "123456789012"
 googlechat_service_account_json = '{ "type": "service_account", ... }'
 ```
 
-6. Restart the gateway. The log prints
+6. After a manual config edit, restart the gateway. Dashboard changes apply live. The log prints
    `✅ Google Chat webhook ready at /webhook/googlechat`.
 
 ### Notes

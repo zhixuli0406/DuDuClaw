@@ -1,5 +1,5 @@
-//! WP19 one-time migration — backfill the bundled skills for installs that
-//! never got them.
+//! Versioned backfills for bundled skills: WP19 for older installs, then G1
+//! for the Google setup guide. Each step keeps its own completion marker.
 //!
 //! **Why this exists.** Every new AI staffer is supposed to start with the
 //! bundled document skills (docx / xlsx / pptx / pdf). Up to v1.51.0 the
@@ -52,7 +52,7 @@ fn marker_path(home_dir: &Path) -> PathBuf {
 ///
 /// Never returns an error: a wedged migration must not stop the gateway from
 /// booting. Callers get a [`SeedReport`] for logging/tests.
-pub fn run(home_dir: &Path) -> SeedReport {
+fn run_legacy(home_dir: &Path) -> SeedReport {
     let mut report = SeedReport::default();
     let marker = marker_path(home_dir);
     if marker.exists() {
@@ -97,6 +97,56 @@ pub fn run(home_dir: &Path) -> SeedReport {
     report
 }
 
+/// Run both independently versioned backfills; an old WP19 marker must not
+/// suppress newly bundled skills. Neither pass overwrites operator content.
+pub fn run(home_dir: &Path) -> SeedReport {
+    let mut report = run_legacy(home_dir);
+    let google = run_google_setup(home_dir);
+    report.seeded.extend(google.seeded);
+    report.already_done = report.already_done && google.already_done;
+    if report.error.is_none() {
+        report.error = google.error;
+    }
+    report
+}
+
+const GOOGLE_MARKER_NAME: &str = "g1-connect-google-seed-v1.done";
+
+fn run_google_setup(home_dir: &Path) -> SeedReport {
+    use std::io::Write;
+
+    let mut report = SeedReport::default();
+    let marker = home_dir.join("migrations").join(GOOGLE_MARKER_NAME);
+    if marker.exists() {
+        report.already_done = true;
+        return report;
+    }
+    let result = (|| -> std::io::Result<()> {
+        let (_, body) = duduclaw_agent::builtin_skills::BUILTIN_SKILLS.iter()
+            .find(|(name, _)| *name == "connect-google")
+            .expect("connect-google must be bundled");
+        let dir = home_dir.join("skills").join("connect-google");
+        std::fs::create_dir_all(&dir)?;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("SKILL.md")) {
+            Ok(mut file) => {
+                file.write_all(body.as_bytes())?;
+                file.sync_all()?;
+                report.seeded.push("connect-google".to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::create_dir_all(home_dir.join("migrations"))?;
+        std::fs::write(&marker, "g1-connect-google-seed-v1\n")?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        warn!(error = %e, "Google setup skill backfill failed; will retry next boot");
+        report.error = Some(e.to_string());
+    }
+    report
+}
+
 /// Best-effort marker write. The marker doubles as the audit record: it states
 /// what was written and why, in plain language, next to the timestamp.
 ///
@@ -130,6 +180,26 @@ fn write_marker(marker: &Path, report: &SeedReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_backfill_runs_after_legacy_marker_and_preserves_operator_changes() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("migrations")).unwrap();
+        std::fs::write(marker_path(home.path()), "legacy").unwrap();
+        assert_eq!(run(home.path()).seeded, ["connect-google"]);
+        assert_eq!(seeded_names(&home.path().join("skills")), ["connect-google"]);
+        let file = home.path().join("skills/connect-google/SKILL.md");
+        std::fs::remove_file(&file).unwrap();
+        assert!(run(home.path()).already_done);
+        assert!(!file.exists(), "deliberate deletion must survive restart");
+
+        let other = tempfile::tempdir().unwrap();
+        let dir = other.path().join("skills/connect-google");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "operator edition").unwrap();
+        assert!(run_google_setup(other.path()).seeded.is_empty());
+        assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), "operator edition");
+    }
 
     fn seeded_names(skills_dir: &Path) -> Vec<String> {
         let Ok(rd) = std::fs::read_dir(skills_dir) else {

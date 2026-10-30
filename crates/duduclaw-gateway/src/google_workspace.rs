@@ -28,9 +28,7 @@ pub(crate) mod native_legacy;
 /// Provider id in the `mcp_oauth` vault.
 pub const GOOGLE_PROVIDER: &str = "google";
 
-/// Feature gate for the whole Google Workspace integration (tools + dashboard
-/// tab + OAuth provider listing). Hidden by default until Dudu Technology Ltd.'s own
-/// OAuth app clears Google verification; operators can opt in early via
+/// Feature gate for the Google Workspace tools. Off by default; operators opt in by connecting their own client or via
 /// `config.toml [integrations] google_workspace = true`. Missing / unreadable
 /// config reads as disabled (fail closed).
 pub fn integration_enabled(home_dir: &Path) -> bool {
@@ -164,6 +162,7 @@ pub const REQUIRED_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     // Drive: read-only (search + export/download). No `drive.file` — no tool
     // here creates Drive files.
@@ -515,15 +514,14 @@ pub struct SlidesReadResult {
 /// Which credential path a Google call should take.
 ///
 /// Three sources exist because no single one covers every customer:
-/// `Direct` needs a Google-verified OAuth app (or the customer's own client),
-/// `Direct` via service account needs a Workspace domain and a super admin, and
-/// [`AppsScript`](GoogleBackend::AppsScript) is the only one a personal
-/// `@gmail.com` user can set up alone. Both `Direct` variants collapse into one
-/// here because downstream they are identical: a bearer token against the REST
-/// APIs.
+/// `Direct` accepts the customer's OAuth client, including External Testing
+/// for personal Gmail. Service-account delegation needs a Workspace domain
+/// and a super admin. [`AppsScript`](GoogleBackend::AppsScript) covers eight
+/// actions without a Cloud client. Both `Direct` variants use a bearer token
+/// against the REST APIs.
 pub enum GoogleBackend {
     /// A bearer access token — from the OAuth vault or a service-account
-    /// assertion. All nineteen tools work.
+    /// assertion. Each service still needs its API and scopes enabled.
     Direct(String),
     /// The user-deployed Apps Script web app. Gmail / Calendar / Sheets only.
     AppsScript(google_apps_script::BridgeConfig),
@@ -531,24 +529,142 @@ pub enum GoogleBackend {
 
 /// Resolve the credential path for this home.
 ///
-/// Precedence — most-deliberate configuration first: service account, then
-/// OAuth vault, then the Apps Script bridge. The bridge sits last because it
-/// covers the fewest tools; a home with both a working OAuth connection and a
-/// deployed bridge gets the fuller surface.
+/// Saved selection wins over retained OAuth tokens. Invalid configuration
+/// never falls back to a different identity.
 pub async fn resolve_backend(home_dir: &Path) -> Result<GoogleBackend, GoogleAuthError> {
-    match get_valid_google_token(home_dir).await {
-        Ok(token) => Ok(GoogleBackend::Direct(token)),
-        Err(direct_err) => {
-            match google_apps_script::config_for_home(home_dir).await {
-                Ok(Some(cfg)) => Ok(GoogleBackend::AppsScript(cfg)),
-                // A broken bridge config is reported as-is: the operator wrote
-                // that section on purpose, so its error is more useful than the
-                // "you never connected Google" one it would otherwise hide.
-                Err(bridge_err) => Err(GoogleAuthError::AppsScript(bridge_err.to_string())),
-                Ok(None) => Err(direct_err),
+    match selected_path(home_dir)?.as_str() {
+        "apps_script" => google_apps_script::config_for_home(home_dir).await
+            .map_err(|e| GoogleAuthError::AppsScript(e.to_string()))?
+            .map(GoogleBackend::AppsScript)
+            .ok_or_else(|| GoogleAuthError::AppsScript("bridge_not_configured".into())),
+        "none" => Err(GoogleAuthError::NotConnected { vault: home_dir.join(crate::mcp_oauth::TOKEN_FILE) }),
+        _ => get_valid_google_token(home_dir).await.map(GoogleBackend::Direct),
+    }
+}
+
+/// Metadata only: resolving the effective path must not mint a token.
+pub(crate) fn selected_path(home: &Path) -> Result<String, GoogleAuthError> {
+    let raw = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err(GoogleAuthError::RefreshFailed("config_unreadable".into())),
+    };
+    let table: toml::Table = raw.parse().map_err(|_| GoogleAuthError::RefreshFailed("config_invalid".into()))?;
+    let i = match table.get("integrations") {
+        Some(value) => Some(value.as_table().ok_or_else(|| GoogleAuthError::RefreshFailed("config_invalid".into()))?),
+        None => None,
+    };
+    if let Some(value) = i.and_then(|t| t.get("google_credential_path")) {
+        return match value.as_str() {
+            Some(mode @ ("oauth" | "service_account" | "apps_script" | "none")) => {
+                let sa = i.is_some_and(|t| t.contains_key("google_service_account"));
+                let bridge = i.is_some_and(|t| t.contains_key("google_apps_script"));
+                if (mode == "service_account" && (!sa || bridge))
+                    || (mode == "apps_script" && (!bridge || sa))
+                    || (matches!(mode, "oauth" | "none") && (sa || bridge)) {
+                    return Err(GoogleAuthError::RefreshFailed("credential_path_conflict".into()));
+                }
+                Ok(mode.into())
+            },
+            _ => Err(GoogleAuthError::RefreshFailed("credential_path_invalid".into())),
+        };
+    }
+    if i.is_some_and(|t| t.contains_key("google_service_account")) { return Ok("service_account".into()); }
+    if i.is_some_and(|t| t.contains_key("google_apps_script")) { return Ok("apps_script".into()); }
+    Ok(if !crate::mcp_oauth::google_token_stamp(home).is_empty() { "oauth" } else { "none" }.into())
+}
+
+/// Curated provider diagnostics. Raw messages may contain sensitive data and
+/// are never returned by connection probes.
+pub(crate) fn permission_failure(body: &str) -> (String, Option<String>) {
+    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let error = &value["error"];
+    let details = error["details"].as_array();
+    let reason = details.and_then(|d| d.iter().find_map(|d| d["reason"].as_str()))
+        .or_else(|| error["errors"].as_array().and_then(|d| d.iter().find_map(|d| d["reason"].as_str())))
+        .or_else(|| (error["message"].as_str() == Some("Request had insufficient authentication scopes.")).then_some("ACCESS_TOKEN_SCOPE_INSUFFICIENT"))
+        .unwrap_or("permission_denied");
+    let reason = if reason.len() <= 96 && reason.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') { reason } else { "permission_denied" };
+    let url = details.and_then(|d| d.iter().find_map(|d| d["metadata"]["activationUrl"].as_str()))
+        .filter(|u| u.len() <= 8192)
+        .and_then(|u| url::Url::parse(u).ok())
+        .filter(|u| u.scheme() == "https" && matches!(u.host_str(), Some("console.developers.google.com" | "console.cloud.google.com"))
+            && u.username().is_empty() && u.password().is_none() && u.fragment().is_none() && u.port().is_none_or(|p| p == 443))
+        .map(|u| u.to_string());
+    (reason.into(), url)
+}
+
+#[derive(Serialize)]
+pub(crate) struct ServiceProbe {
+    service: &'static str,
+    pub(crate) ok: bool,
+    verified: bool,
+    reason: String,
+    enable_url: Option<String>,
+}
+
+pub(crate) async fn probe_services(token: &str, scopes: &[String]) -> Vec<ServiceProbe> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none()).build();
+    let client = client.as_ref().ok();
+    let (gmail, calendar, drive) = tokio::join!(
+        probe_service(client, token, SERVICE_PROBE_URLS[0].0, SERVICE_PROBE_URLS[0].1),
+        probe_service(client, token, SERVICE_PROBE_URLS[1].0, SERVICE_PROBE_URLS[1].1),
+        probe_service(client, token, SERVICE_PROBE_URLS[2].0, SERVICE_PROBE_URLS[2].1),
+    );
+    let mut results = vec![gmail, calendar, drive];
+    results.extend(scope_probes(scopes));
+    results
+}
+const SERVICE_PROBE_URLS: [(&str, &str); 3] = [
+    ("gmail", "https://gmail.googleapis.com/gmail/v1/users/me/profile"),
+    ("calendar", "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1"),
+    ("drive", "https://www.googleapis.com/drive/v3/about?fields=user"),
+];
+async fn probe_service(client: Option<&reqwest::Client>, token: &str, service: &'static str, url: &str) -> ServiceProbe {
+    let mut probe = ServiceProbe { service, ok: false, verified: false, reason: "network_error".into(), enable_url: None };
+    if let Some(client) = client {
+        if let Ok(response) = client.get(effective_url(url).as_ref()).bearer_auth(token).send().await {
+            let status = response.status();
+            let mut response = response;
+            let mut bytes = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len()) <= 64 * 1024 => bytes.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    _ => { probe.reason = "invalid_response".into(); return probe; }
+                }
+            }
+            if status.is_success() {
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                if body.is_object() && body.get("error").is_none() {
+                    probe.ok = true;
+                    probe.verified = true;
+                    probe.reason = "verified".into();
+                } else { probe.reason = "invalid_response".into(); }
+            } else if status.as_u16() == 403 {
+                (probe.reason, probe.enable_url) = permission_failure(&String::from_utf8_lossy(&bytes));
+            } else {
+                probe.reason = match status.as_u16() { 401 => "needs_reconnect", 429 => "rate_limited", _ => "api_error" }.into();
             }
         }
     }
+    if !token.is_empty() {
+        if probe.reason.contains(token) { probe.reason = "permission_denied".into(); }
+        if probe.enable_url.as_ref().is_some_and(|url| url.contains(token)) { probe.enable_url = None; }
+    }
+    probe
+}
+fn scope_probes(scopes: &[String]) -> Vec<ServiceProbe> {
+    let mut results = Vec::new();
+    for (service, allowed) in [
+        ("sheets", &["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/spreadsheets.readonly", "https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/drive.file"][..]),
+        ("docs", &["https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/documents.readonly", "https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/drive.file"][..]),
+    ] {
+        let ok = scopes.iter().any(|s| allowed.contains(&s.as_str()));
+        results.push(ServiceProbe { service, ok, verified: false, reason: if ok { "scope_granted_unverified" } else { "scope_missing" }.into(), enable_url: None });
+    }
+    results
 }
 
 // ── Token acquisition ───────────────────────────────────────────────────────
@@ -1994,5 +2110,93 @@ mod legacy_bridge {
                 .await
                 .map_err(bridge_err)
         }
+    }
+}
+
+#[cfg(test)]
+mod google_setup_tests {
+    use super::*;
+
+    #[test]
+    fn google_api_disabled_guidance_accepts_only_console_origins() {
+        for host in ["console.developers.google.com", "console.cloud.google.com"] {
+            let body = json!({"error":{"details":[{"reason":"SERVICE_DISABLED","metadata":{"activationUrl":format!("https://{host}/apis/api/gmail.googleapis.com/overview")}}]}}).to_string();
+            let (reason, url) = permission_failure(&body);
+            assert_eq!(reason, "SERVICE_DISABLED");
+            assert!(url.unwrap().starts_with(&format!("https://{host}/")));
+            assert!(scope_guidance(&body).contains("Enable this API"));
+            assert!(!scope_guidance(&body).contains("Reconnect"));
+        }
+        for url in ["https://console.cloud.google.com.evil.test/", "https://console.cloud.google.com@evil.test/", "http://console.cloud.google.com/", "https://console.cloud.google.com:444/", "https://evil@console.cloud.google.com/"] {
+            let body = json!({"error":{"details":[{"reason":"SERVICE_DISABLED","metadata":{"activationUrl":url}}]}}).to_string();
+            assert!(permission_failure(&body).1.is_none(), "{url}");
+            assert!(!scope_guidance(&body).contains(url));
+        }
+    }
+
+    #[test]
+    fn google_invalid_selected_path_never_falls_back() {
+        let home = tempfile::tempdir().unwrap();
+        for config in [
+            "[integrations]\ngoogle_credential_path='service_account'\n",
+            "[integrations]\ngoogle_credential_path='apps_script'\n",
+            "[integrations]\ngoogle_credential_path='oauth'\n[integrations.google_apps_script]\nurl='x'\n",
+            "[integrations]\ngoogle_credential_path='none'\n[integrations.google_service_account]\nkey_file='x'\n",
+        ] {
+            std::fs::write(home.path().join("config.toml"), config).unwrap();
+            assert!(selected_path(home.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn google_403_reconnects_only_for_scope_failures() {
+        let disabled = r#"{"error":{"errors":[{"reason":"accessNotConfigured"}]}}"#;
+        assert!(scope_guidance(disabled).contains("Enable"));
+        let scopes = r#"{"error":{"details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#;
+        assert!(scope_guidance(scopes).contains("Reconnect"));
+        let denied = r#"{"error":{"message":"private-token-value","errors":[{"reason":"domainPolicy"}]}}"#;
+        assert!(scope_guidance(denied).contains("domainPolicy"));
+        assert!(!scope_guidance(denied).contains("Reconnect"));
+        assert!(!scope_guidance(denied).contains("private-token-value"));
+    }
+
+    #[test]
+    fn google_sheets_docs_scope_results_are_never_live_verified() {
+        for (scopes, expected) in [(vec![], false), (vec!["https://www.googleapis.com/auth/drive.file".into()], true)] {
+            let probes = scope_probes(&scopes);
+            assert_eq!(probes.len(), 2);
+            assert_eq!(probes[0].service, "sheets");
+            assert_eq!(probes[1].service, "docs");
+            for probe in probes {
+                assert_eq!(probe.ok, expected);
+                assert!(!probe.verified);
+            }
+        }
+        assert_eq!(SERVICE_PROBE_URLS[0].1, "https://gmail.googleapis.com/gmail/v1/users/me/profile");
+        assert!(SERVICE_PROBE_URLS[1].1.ends_with("calendarList?maxResults=1"));
+        assert!(SERVICE_PROBE_URLS[2].1.ends_with("about?fields=user"));
+    }
+
+    #[tokio::test]
+    async fn google_service_probe_uses_read_get_and_redacts_failures() {
+        use axum::{routing::get, Router};
+        let app = Router::new().route("/profile", get(|| async { axum::Json(json!({"emailAddress":"test@example.test"})) }))
+            .route("/disabled", get(|| async { (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({"error":{"message":"secret-bearer-token","details":[{"reason":"SERVICE_DISABLED","metadata":{"activationUrl":"https://console.cloud.google.com/apis/library/gmail.googleapis.com"}}]}}))) }))
+            .route("/invalid", get(|| async { "secret-bearer-token" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::new();
+        let ok = probe_service(Some(&client), "secret-bearer-token", "gmail", &format!("{base}/profile")).await;
+        assert!(ok.ok && ok.verified);
+        let denied = probe_service(Some(&client), "secret-bearer-token", "calendar", &format!("{base}/disabled")).await;
+        assert!(!denied.ok && !denied.verified);
+        assert_eq!(denied.reason, "SERVICE_DISABLED");
+        assert!(denied.enable_url.is_some());
+        assert!(!serde_json::to_string(&denied).unwrap().contains("secret-bearer-token"));
+        let invalid = probe_service(Some(&client), "secret-bearer-token", "drive", &format!("{base}/invalid")).await;
+        assert!(!invalid.ok);
+        assert_eq!(invalid.reason, "invalid_response");
+        server.abort();
     }
 }

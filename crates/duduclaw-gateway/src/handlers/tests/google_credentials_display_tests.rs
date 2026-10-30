@@ -120,3 +120,31 @@ fn google_provider_carries_a_display_name_for_the_card() {
     assert_eq!(entry["name"], json!("Google"));
     assert_eq!(MethodHandler::oauth_provider_name("github"), "GitHub");
 }
+
+#[tokio::test]
+async fn google_path_replacement_requires_confirmation_and_preserves_vault() {
+    let home = tempfile::tempdir().unwrap();
+    crate::mcp_oauth::google_home_test_fixture::connect(home.path(), "owned-setup-access", Some("owned-setup-refresh")).await;
+    let vault = std::fs::read(home.path().join(crate::mcp_oauth::TOKEN_FILE)).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let params = json!({"mode":"apps_script","url":"https://script.google.com/macros/s/test/exec","secret":"bridge-test-secret"});
+    let rejected = handler.handle_google_credentials_set(params.clone()).await;
+    assert!(matches!(rejected, WsFrame::Response { ok:false, .. }));
+    let mut confirmed = params;
+    confirmed["replace_confirmed"] = json!(true);
+    assert!(matches!(handler.handle_google_credentials_set(confirmed).await, WsFrame::Response { ok:true, .. }));
+    assert_eq!(crate::google_workspace::selected_path(home.path()).unwrap(), "apps_script");
+    assert!(matches!(crate::google_workspace::resolve_backend(home.path()).await.unwrap(), crate::google_workspace::GoogleBackend::AppsScript(_)));
+    // Config publication may rotate non-secret Home metadata; bearer material
+    // remains present and the ordinary OAuth source is no longer selected.
+    let stored: Value = serde_json::from_slice(&std::fs::read(home.path().join(crate::mcp_oauth::TOKEN_FILE)).unwrap()).unwrap();
+    let before: Value = serde_json::from_slice(&vault).unwrap();
+    assert_eq!(stored[0]["access_token"], before[0]["access_token"]);
+    assert_eq!(stored[0]["refresh_token"], before[0]["refresh_token"]);
+    assert!(crate::google_workspace::get_valid_google_token(home.path()).await.is_err());
+    assert!(matches!(handler.handle_google_credentials_set(json!({"mode":"oauth","replace_confirmed":true,"testing":true})).await, WsFrame::Response { ok:true, .. }));
+    assert_eq!(crate::google_workspace::selected_path(home.path()).unwrap(), "oauth");
+    assert_eq!(crate::mcp_oauth::google_setup_status(home.path())["testing"], true);
+    assert!(matches!(handler.handle_google_credentials_set(json!({"mode":"none","replace_confirmed":true})).await, WsFrame::Response { ok:true, .. }));
+    assert!(crate::google_workspace::resolve_backend(home.path()).await.is_err());
+}

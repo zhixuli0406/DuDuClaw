@@ -1,5 +1,7 @@
 # 讓 AI 員工有自己的 Telegram Bot 與 Google Chat 應用程式
 
+Google Chat 頻道憑證授權 Chat 應用程式（`chat.bot`），不會連接 Gmail、Drive 或 Calendar。資料工具請依[連接 Google](google-setup.md)另行設定。儀表板儲存頻道後即時套用；手動修改頻道設定檔後才需重啟。
+
 預設所有 AI 員工都透過公司共用的通道對外（一個 Telegram Bot、一個 Google Chat 應用程式）。照這份說明設定之後，大家可以直接找某一位員工專屬的 Bot 或應用程式說話，回答的就是那位員工。
 
 位置：**AI 員工 → 點進員工 → 整合 → 專屬通道**。

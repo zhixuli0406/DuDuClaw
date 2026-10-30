@@ -86,7 +86,7 @@ async fn actual_handler_only_inserts_after_durable_ready_and_replaces_latest_goo
             .unwrap()
             .scopes
             .len(),
-        11
+        12
     );
 }
 #[tokio::test(flavor = "current_thread")]

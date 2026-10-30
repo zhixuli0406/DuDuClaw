@@ -16571,13 +16571,23 @@ async fn handle_mcp_oauth_callback(
     }
     // Google master enable already belongs to its same-ticket three-point
     // publication. A generic enable here would rotate/invalidate its source.
-    mcp_oauth_callback_html(result.is_ok())
+    let error = result.as_ref().err().and_then(crate::mcp_oauth::CallbackFailure::google_code);
+    mcp_oauth_callback_html_with_error(result.is_ok(), error)
 }
+#[cfg(test)]
 fn mcp_oauth_callback_html(success: bool) -> axum::response::Response {
+    mcp_oauth_callback_html_with_error(success, None)
+}
+fn mcp_oauth_callback_html_with_error(success: bool, error: Option<&str>) -> axum::response::Response {
     let body = if success {
         "<!doctype html><html><body><h2>Authentication Successful</h2><p>You can close this window and return to the dashboard.</p></body></html>"
     } else {
-        "<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>"
+        match error.map(crate::mcp_oauth::google_callback_error) {
+            Some("access_denied") => "<!doctype html><html><body><h2>Authentication failed</h2><p>access_denied: Consent was declined. Return to the dashboard, retry, and allow the requested access.</p></body></html>",
+            Some("admin_policy_enforced") => "<!doctype html><html><body><h2>Authentication failed</h2><p>admin_policy_enforced: Ask your Workspace administrator to allow this app, then retry from the dashboard.</p></body></html>",
+            Some("invalid_scope") => "<!doctype html><html><body><h2>Authentication failed</h2><p>invalid_scope: Check Data Access scopes in Google Cloud Console, then retry from the dashboard.</p></body></html>",
+            _ => "<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>",
+        }
     };
     let mut response = axum::response::Html(body).into_response();
     let headers = response.headers_mut();
@@ -16601,6 +16611,17 @@ fn mcp_oauth_callback_html(success: bool) -> axum::response::Response {
 #[cfg(test)]
 mod home_callback_response_tests {
     use super::*;
+    #[tokio::test]
+    async fn google_callback_html_uses_closed_actionable_errors_only() {
+        for (code, expected) in [("access_denied", "Consent was declined"), ("admin_policy_enforced", "Workspace administrator"), ("invalid_scope", "Data Access"), ("<script>private-token</script>", "start a new connection")] {
+            let response = mcp_oauth_callback_html_with_error(false, Some(code));
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(text.contains(expected));
+            assert!(!text.contains("private-token"));
+            assert!(!text.contains("<script>"));
+        }
+    }
     #[tokio::test]
     async fn callback_html_is_fixed_redacted_and_has_no_store_or_referrer() {
         for success in [false, true] {

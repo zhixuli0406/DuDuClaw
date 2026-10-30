@@ -6,11 +6,9 @@ use super::*;
 impl MethodHandler {
     // ── Google credential paths (admin only) ────────────────────────────────
     //
-    // Three ways to authorize the same nineteen Google tools; see
-    // `docs/guides/google-no-oauth-client.md`. The OAuth path has its own
-    // connect flow (`mcp.oauth.*`); these three RPCs cover the two that are
-    // pure configuration — service-account delegation and the Apps Script
-    // bridge — so operators do not have to hand-edit `config.toml`.
+    // OAuth and domain delegation use the native REST tools. Apps Script
+    // supports eight actions across Gmail, Calendar and Sheets. The setup
+    // guide is docs/guides/google-setup.md.
     //
     // The stored secret is NEVER returned. `get` reports only whether one is
     // set; a UI that needs to change it collects a new one.
@@ -69,12 +67,8 @@ impl MethodHandler {
             Err(e) => (false, String::new(), e.to_string()),
         };
 
-        // The effective path, resolved the same way a real tool call would.
-        let effective = match crate::google_workspace::resolve_backend(&self.home_dir).await {
-            Ok(crate::google_workspace::GoogleBackend::Direct(_)) => "direct",
-            Ok(crate::google_workspace::GoogleBackend::AppsScript(_)) => "apps_script",
-            Err(_) => "none",
-        };
+        let effective = crate::google_workspace::selected_path(&self.home_dir)
+            .unwrap_or_else(|_| "none".into());
 
         WsFrame::ok_response(
             "",
@@ -98,25 +92,32 @@ impl MethodHandler {
         )
     }
 
-    /// Write (or clear) one Google credential section.
-    ///
-    /// `mode` selects exactly one path and REMOVES the other's section, so the
-    /// configured path and the effective path can never disagree — a silent
-    /// leftover section is the kind of thing an operator only discovers when a
-    /// tool call authorizes as the wrong identity. `mode: "none"` clears both.
+    /// Select one effective Google path. Alternative configuration sections
+    /// are removed after explicit replacement confirmation; OAuth tokens stay
+    /// stored until the separate revoke action.
     pub(crate) async fn handle_google_credentials_set(&self, params: Value) -> WsFrame {
         let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-        if !matches!(mode, "service_account" | "apps_script" | "none") {
+        if !matches!(mode, "oauth" | "service_account" | "apps_script" | "none") {
             return WsFrame::error_response(
                 "",
-                "mode must be 'service_account', 'apps_script' or 'none'",
+                "mode must be 'oauth', 'service_account', 'apps_script' or 'none'",
             );
         }
 
         let config_path = self.home_dir.join("config.toml");
         let original=match super::config_commit::read_text_or_empty(&config_path) {Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("Failed to write config.toml: {e}"))};
         let config_expected_hash=super::config_commit::content_hash(&original);
-        let mut table=original.parse::<toml::Table>().unwrap_or_default();
+        let mut table = match original.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(_) => return WsFrame::error_response("", "config_invalid"),
+        };
+        let previous = match crate::google_workspace::selected_path(&self.home_dir) {
+            Ok(path) => path,
+            Err(_) => return WsFrame::error_response("", "config_invalid"),
+        };
+        if previous != "none" && previous != mode && params.get("replace_confirmed").and_then(Value::as_bool) != Some(true) {
+            return WsFrame::error_response("", "credential_path_confirmation_required");
+        }
         let mut integrations = table
             .get("integrations")
             .and_then(|v| v.as_table())
@@ -127,6 +128,10 @@ impl MethodHandler {
         // a clean slate and re-add only the selected one.
         integrations.remove("google_service_account");
         integrations.remove("google_apps_script");
+        integrations.insert("google_credential_path".into(), toml::Value::String(mode.into()));
+        if let Some(testing) = params.get("testing").and_then(Value::as_bool) {
+            integrations.insert("google_oauth_testing".into(), toml::Value::Boolean(testing));
+        }
 
         match mode {
             "service_account" => {
@@ -222,8 +227,8 @@ impl MethodHandler {
         // the same write so the tools this credential unlocks actually reach
         // agents, instead of requiring a manual `google_workspace = true`
         // config.toml edit that nothing pointed to except a warning banner.
-        // Clearing credentials (mode "none") leaves the gate untouched: the
-        // OAuth-vault path may still be in use.
+        // Clearing the selected path leaves the gate untouched; retained OAuth
+        // credentials stay stored but cannot authorize tools until reselected.
         if mode != "none" {
             integrations.insert("google_workspace".into(), toml::Value::Boolean(true));
         }
@@ -240,14 +245,15 @@ impl MethodHandler {
     /// actually do, not merely that the fields parse.
     pub(crate) async fn handle_google_credentials_test(&self) -> WsFrame {
         match crate::google_workspace::resolve_backend(&self.home_dir).await {
-            Ok(crate::google_workspace::GoogleBackend::Direct(_)) => WsFrame::ok_response(
-                "",
-                json!({
-                    "ok": true,
-                    "path": "direct",
-                    "detail": "取得存取權杖成功，19 個工具皆可用。",
-                }),
-            ),
+            Ok(crate::google_workspace::GoogleBackend::Direct(token)) => {
+                let scopes = if matches!(crate::google_workspace::selected_path(&self.home_dir).as_deref(), Ok("service_account")) {
+                    crate::google_workspace::REQUIRED_SCOPES.iter().map(|s| s.to_string()).collect()
+                } else {
+                    crate::mcp_oauth::get_stored_token(&self.home_dir, "google").map(|t| t.scopes).unwrap_or_default()
+                };
+                let services = crate::google_workspace::probe_services(&token, &scopes).await;
+                WsFrame::ok_response("", json!({ "ok": services.iter().all(|p| p.ok), "path": "direct", "detail": "service_probe_results", "services": services }))
+            }
             Ok(crate::google_workspace::GoogleBackend::AppsScript(cfg)) => {
                 match crate::google_apps_script::call(
                     &cfg,
@@ -262,7 +268,7 @@ impl MethodHandler {
                             "ok": true,
                             "path": "apps_script",
                             "account": v.get("account").and_then(|a| a.as_str()).unwrap_or(""),
-                            "detail": "橋接連線成功，支援 Gmail／行事曆／Sheets。",
+                            "detail": "bridge_connected",
                         }),
                     ),
                     Err(e) => WsFrame::error_response("", &e.to_string()),
@@ -284,9 +290,9 @@ impl MethodHandler {
         // Connection state, not access-token freshness: a Google access token
         // expires every hour, and reporting that as "not connected" is what made
         // a working integration look like it had lost its credentials. A token
-        // with a refresh token attached is connected; the refresh happens on the
-        // next call. Only an expired token with nothing to refresh from needs
-        // the user to authorize again.
+        // with a refresh token attached stays connected until refresh reports
+        // invalid_grant. That token-bound diagnostic requires reconnection.
+        let diagnostics = if provider_id == "google" { mcp_oauth::google_setup_status(&self.home_dir) } else { json!({}) };
         let token = mcp_oauth::get_stored_token(&self.home_dir, provider_id);
         match token {
             Some(t) => {
@@ -295,7 +301,12 @@ impl MethodHandler {
                 WsFrame::ok_response(
                     "",
                     json!({
-                        "authenticated": !expired || can_refresh,
+                        "authenticated": (!expired || can_refresh) && diagnostics["needs_reconnect"] != true,
+                        "needs_reconnect": diagnostics["needs_reconnect"],
+                        "error_code": diagnostics["error_code"],
+                        "testing": diagnostics["testing"],
+                        "testing_warning": diagnostics["testing_warning"],
+                        "connected_at": diagnostics["connected_at"],
                         "access_token_valid": !expired,
                         "can_refresh": can_refresh,
                         "expires_at": t.expires_at,
@@ -307,6 +318,10 @@ impl MethodHandler {
                 "",
                 json!({
                     "authenticated": false,
+                    "needs_reconnect": diagnostics["needs_reconnect"],
+                    "error_code": diagnostics["error_code"],
+                    "testing": diagnostics["testing"],
+                    "testing_warning": diagnostics["testing_warning"],
                     "access_token_valid": false,
                     "can_refresh": false,
                 }),

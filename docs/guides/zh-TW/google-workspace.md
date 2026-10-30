@@ -1,22 +1,6 @@
-# Google Workspace 整合（八項服務全原生支援）
+# Google Workspace 工具與安全模型
 
-> **開放狀態（v1.49.0 更新）**：dashboard 的「整合 → Google」分頁預設**已開放**
-> 可見。先前版本為了等原廠 OAuth App 驗證而隱藏，後來確認驗證只擋「自建
-> OAuth client」這一條路，服務帳號網域委派與 Apps Script 橋接都不受影響，
-> 分頁就沒有理由繼續隱藏。但分頁看得到不代表工具會生效：後端仍有獨立總
-> 開關 `config.toml [integrations] google_workspace`，**預設 `false`**，
-> 沒開的話憑證能設定、測試連線也能通過，但工具不會出現在 AI 員工面前，
-> dashboard 上會有明顯的黃色提示。三條接法的選路徑導覽，見
-> [google-workspace-integration.md](./google-workspace-integration.md)。
-
-> **設計決策（D5，2026-08-04）**：DuDuClaw 不出貨共用的 Google OAuth 憑證。
-> 使用者自備自己的 OAuth client（或改走 DWD／Apps Script 這兩條路），
-> DuDuClaw 只負責儲存與刷新拿到的 token，從不內建自己的 client id／secret。
-> 決策脈絡見 [google-workspace-integration.md](./google-workspace-integration.md)（D5）。
-
-連上一個 Google 帳號，讓你的 AI 員工可以搜尋並閱讀郵件、準備草稿回覆、列出行事曆、建立活動（附 Google Meet 連結），並讀取／附加 Google 試算表的列資料、讀取 Google 表單回覆、管理 Google Tasks。DuDuClaw 直接原生對接 Google REST API，不需要安裝第三方 MCP server。存取權杖存放在 DuDuClaw 加密的 OAuth vault 中，並自動刷新。
-
-**八項 Workspace 服務全部原生涵蓋**：Gmail、Calendar、Sheets、Drive、Docs、Slides、Forms、Tasks，全部走 GA REST API，因此本頁的內容完全不依賴 Google 的 Developer Preview 計畫，任何客戶都能使用。（Google 自己的官方 remote MCP server 涵蓋了八項中的六項，但僅限 Preview 資格，且條款禁止把 Pre-GA API 開放給自家網域以外的使用者。這條路仍保留作為進階選項：[google-mcp.md](./google-mcp.md)。）
+設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋八項服務、十九個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
 
 ## 你會拿到什麼
 
@@ -24,7 +8,7 @@
 
 | 工具 | 類別 | 做什麼 |
 |------|-------|--------------|
-| `google_status` | read | 連線診斷：是否已連接？授予了哪些 scope？token 是否有效？只讀取本機狀態。 |
+| `google_status` | read | 依帳號路徑回報身分與憑證診斷，不能證明各服務可讀。整合或員工 Google 身分停用時隱藏。 |
 | `gmail_search` | read | 用 Gmail 查詢語法搜尋信箱（`from:… is:unread` 等）。回傳寄件者／主旨／日期／摘要。 |
 | `gmail_read` | read | 完整讀取一封信：標頭、純文字內文（過長會截斷）、附件清單（只列檔名與大小，絕不下載）。 |
 | `gmail_create_draft` | write | 建立一封 Gmail **草稿**。永不寄出，寄信永遠是人工動作。 |
@@ -78,24 +62,6 @@
   [capabilities]
   approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
   ```
-
-## 選擇一條憑證路徑
-
-同樣十九個工具，有三種授權方式可選。差別在於誰要負責設定，以及是否需要
-Google 事先驗證過應用程式。
-
-| | 個人 @gmail.com | Workspace 網域 | 誰來設定 | 工具涵蓋範圍 |
-|---|---|---|---|---|
-| **OAuth client**（下方） | ✅ | ✅ | 每個客戶自己建立 Google Cloud OAuth client | 全部 19 個 |
-| **服務帳號 + 網域委派** | ❌ | ✅ | 網域的超級管理員授權一個 client id | 全部 19 個 |
-| **Apps Script 橋接** | ✅ | ✅（除非管理員停用 Apps Script） | 終端使用者在自己帳號中部署一個 script | 僅 Gmail / Calendar / Sheets |
-
-若同時設定超過一種，優先順序是服務帳號 → OAuth vault → Apps Script 橋接；
-橋接排在最後，因為它涵蓋的工具最少。`google_status` 會回報目前實際生效的
-來源。
-
-兩條免憑證的路徑記錄在
-[google-no-oauth-client.md](../google-no-oauth-client.md)。要讓每位 AI 員工各自代表一位同事，見[每位 AI 員工用不同的 Google 帳號](#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
 ## 每位 AI 員工用不同的 Google 帳號（公司授權代表，v1.76.0）
 
@@ -180,97 +146,9 @@ Agent Mail 另記錄最近完成收信檢查的時間、該次檢查的帳號不
 - 有 shell 的員工和 gateway 是同一個作業系統帳號，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)中金鑰圈的限制。
 - 還沒在真的 Workspace 上驗證：管理控制台的實際流程、Google 真正的錯誤字串、關閉 Gmail 的組織單位，以及 Google 自家遠端 MCP 端點收不收委派權杖。
 
-## 前置準備：建立一個 Google OAuth client
 
-你需要自備 Google OAuth client（DuDuClaw 從不出貨共用憑證）。一次性設定：
+## What was ruled out, and why
 
-1. 打開 [Google Cloud Console → Credentials](https://console.cloud.google.com/apis/credentials)
-   頁面（先建立／選取一個專案）。
-2. 為專案啟用以下八個 API（APIs & Services → Library），或用一行指令：
-
-   ```bash
-   gcloud services enable gmail.googleapis.com calendar-json.googleapis.com \
-     sheets.googleapis.com drive.googleapis.com docs.googleapis.com \
-     slides.googleapis.com forms.googleapis.com tasks.googleapis.com \
-     --project=PROJECT_ID
-   ```
-3. 設定 OAuth 同意畫面（External 或 Internal）。若應用程式仍處於「Testing」
-   狀態，記得把自己的 Google 帳號加入測試使用者名單。
-4. 建立一個類型為 **Web application** 的 **OAuth client ID**。
-5. 在 **Authorized redirect URIs** 下，準確加入：
-
-   ```
-   http://localhost:18889/api/mcp/oauth/callback
-   ```
-
-   18889 是 gateway 的預設連接埠。如果你在別的連接埠上執行（`DUDUCLAW_PORT`），
-   請改註冊那個連接埠，dashboard 的設定步驟會顯示精確的 URI，並依 gateway
-   實際監聽的連接埠推導出來。這裡的不匹配是無聲的：Google 會把瀏覽器導向一個
-   什麼都沒有的連接埠，token 永遠不會抵達，頁面會一直停在「尚未連接」。
-
-6. 複製產生出來的 **Client ID** 和 **Client secret**。
-
-申請的 scope 是：
-
-```
-https://www.googleapis.com/auth/gmail.readonly
-https://www.googleapis.com/auth/gmail.compose
-https://www.googleapis.com/auth/calendar.events
-https://www.googleapis.com/auth/spreadsheets
-https://www.googleapis.com/auth/drive.readonly
-https://www.googleapis.com/auth/documents
-https://www.googleapis.com/auth/presentations.readonly
-https://www.googleapis.com/auth/forms.body.readonly
-https://www.googleapis.com/auth/forms.responses.readonly
-https://www.googleapis.com/auth/tasks
-https://www.googleapis.com/auth/userinfo.email
-```
-
-> **Scope 變更（v1.45）**：為了 Sheets 工具，新增了 `spreadsheets` 這個
-> scope。v1.45 之前連接的 Google 帳號，因為 token 是這個 scope 存在之前
-> 核發的，呼叫 Sheets API 會拿到 `403`，`google_status` 會標出缺少的
-> scope，從 dashboard 重新連接會用完整的 scope 集合重新走一次同意畫面。
->
-> **Scope 變更（v1.47）**：為了新增的原生工具，加入了 Drive
-> （`drive.readonly`）、Docs（`documents`）、Slides
-> （`presentations.readonly`）、Forms（`forms.body.readonly`、
-> `forms.responses.readonly`）與 Tasks（`tasks`）。規則跟上面一樣：
-> 舊的 token 會收到 `403` 並附上重新授權的指引；到「整合 → Google」
-> 重新連接即可重新同意。
-
-## 從 dashboard 連接
-
-1. 前往 **整合 → Google**（`/manage/integrations?tab=google`）。
-2. 貼上 Client ID 和 Client secret，然後點擊 **連接 Google**。
-3. 會跳出一個 Google 同意視窗。核准存取權限後，視窗會顯示成功，dashboard
-   會切換成 **Google 已連接**。
-
-client 憑證會被持久化保存（secret 加密儲存），這樣才能自動刷新存取權杖，
-之後要重新授權時也不需要再輸入一次 secret。
-
-要斷開連接，在已連接的畫面點擊 **斷開連接**。你儲存的 client 憑證會保留，
-方便一鍵重新連接，只有存取權杖會被移除。
-
-## 刷新機制怎麼運作
-
-Google 只有在授權請求要求 offline access 時才會核發 refresh token，所以連接
-流程會自動幫 Google 附上 `access_type=offline&prompt=consent`。當存取權杖過期
-時，`get_valid_google_token` 會用你儲存的 client 憑證跑一次 refresh grant，
-存下新的 token 後繼續。如果無法刷新（沒有 refresh token，或找不到儲存的
-憑證），這些工具會回傳明確的訊息，引導你回到「整合 → Google」頁面重新連接。
-
-## Scope 變更後重新授權
-
-在這項整合上線之前（舊 scope 集合）授權過的 token，呼叫新的寫入 API 會拿到
-`403`。工具會偵測到這個狀況，並回傳需要授予哪些 scope 的指引。到「整合 →
-Google」重新連接，即可用目前的 scope 集合重新同意。
-
-## 疑難排解
-
-- **「Google 尚未連接。」**：沒有儲存任何 token，請從 dashboard 連接。
-- **`401 Unauthorized`**：授權已被撤銷或已失效，請重新連接。
-- **`403` 並附上 scope 清單**：token 缺少必要的 scope，請重新連接以重新同意。
-- **同意過程中出現 Redirect URI 不符**：你 Google OAuth client 中的 redirect
-  URI 必須精確等於 `http://localhost:18889/api/mcp/oauth/callback`。
-
-隨時執行 `google_status` 即可取得即時診斷結果。
+**在本機用 AppleScript 讀 Mail.app／Calendar.app。** 行事曆這條路可行，也已經出貨（`os_calendar_today`），因為查一天的行程是個很小的查詢。信件不行：拿 macOS 15 上一個真實的 54,000 封信件的信箱來測，
+`Mail.inbox.messages.dateReceived()` 花了 17 秒，而
+`whose({dateReceived: …})` 和 `whose({readStatus: false})` 都沒能在 60～90 秒內回應。`inbox.messages` 回傳的順序也不是照時間排的，所以用便宜的索引存取拿到的可能是任意一封舊信。Spotlight 不會替信件建索引（`kMDItemKind == 'Mail Message'` 查不到任何東西），直接讀 `~/Library/Mail` 又需要完整磁碟取用權限（Full Disk Access）加上一套沒有文件、隨版本變動的 SQLite schema。Gmail 在這條路上就改走 Apps Script。
