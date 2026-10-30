@@ -8,6 +8,8 @@ import { PartialLoadNotice } from '@/components/PartialLoadNotice';
 import {
   buildAttentionItems,
   failedRunTitle,
+  failureRunId,
+  resolveFailureAgentId,
   countStandbyAgents,
   overviewCounts,
   isAllClear,
@@ -125,7 +127,8 @@ export function HealthOverview({ agents, enabled }: HealthOverviewProps) {
     const failureRows: AttentionSourceRow[] = recentFailures.map((ev) => ({
       id: `${ev.agent_id}:${ev.timestamp}`,
       title: failedRunTitle(ev, intl.formatMessage, nameOf.get(ev.agent_id) ?? ev.agent_id),
-      agentId: ev.agent_id || undefined,
+      agentId: resolveFailureAgentId(ev.agent_id, agents),
+      runId: failureRunId(ev),
       timestamp: ev.timestamp,
       channel: channelFailureChannel(ev),
     }));

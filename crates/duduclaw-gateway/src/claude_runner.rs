@@ -436,12 +436,15 @@ pub async fn call_claude_for_agent_with_type(
     prompt: &str,
     request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
+    // Box before the recording/context wrappers capture the runtime future.
+    // Their debug poll frames otherwise leave too little of a 2 MiB worker
+    // stack for the spawn budget gate's full agent.toml deserialization.
     invoke_recorded(
         home_dir,
         agent_id,
         prompt,
         request_type,
-        call_claude_for_agent_impl(
+        Box::pin(call_claude_for_agent_impl(
             home_dir,
             registry,
             agent_id,
@@ -449,7 +452,7 @@ pub async fn call_claude_for_agent_with_type(
             request_type,
             None,
             DispatchOverrides::default(),
-        ),
+        )),
     )
     .await
 }
@@ -686,7 +689,8 @@ pub async fn call_claude_for_agent_preloaded_with(
                 &agent_id,
                 prompt,
                 request_type,
-                call_claude_for_agent_impl(
+                // Same boundary for ephemeral agents and team role members.
+                Box::pin(call_claude_for_agent_impl(
                     home_dir,
                     registry,
                     &agent_id,
@@ -694,7 +698,7 @@ pub async fn call_claude_for_agent_preloaded_with(
                     request_type,
                     Some(agent),
                     overrides,
-                ),
+                )),
             ),
         )
         .await
@@ -5943,3 +5947,34 @@ pub fn reply_sender_for(channel: &str, chat_id: &str) -> Option<String> {
 #[cfg(test)]
 #[path = "claude_runner/attended_call_tests.rs"]
 mod attended_call_producer_tests;
+
+#[cfg(test)]
+mod dispatch_future_size_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_future_sizes() {
+        let home = Path::new("/unused-dispatch-size-test");
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(home.join("agents"))));
+        let rt = crate::cost_telemetry::RequestType::Dispatch;
+        // Before boxing (macOS arm64, debug, no default features): impl
+        // 11,248 B, recorded 11,696 B, rotation 8,936 B. The recorded limit
+        // catches a removed boundary; leaf limits also guard future growth.
+        let sizes = [
+            ("runner.impl", std::mem::size_of_val(&call_claude_for_agent_impl(
+                home, &registry, "prod-shaped", "wake", rt, None, DispatchOverrides::default(),
+            )), 16 * 1024),
+            ("runner.recorded", std::mem::size_of_val(&call_claude_for_agent_with_type(
+                home, &registry, "prod-shaped", "wake", rt,
+            )), 8 * 1024),
+            ("runner.rotation", std::mem::size_of_val(&call_with_rotation(
+                home, "prod-shaped", "wake", "model", "system", rt,
+                None, None, false, &[], None, SpawnIdentity::default(),
+            )), 12 * 1024),
+        ];
+        for (name, size, limit) in sizes {
+            eprintln!("{name}: {size} bytes");
+            assert!(size <= limit, "{name}: {size} > {limit}; keep runtime futures boxed");
+        }
+    }
+}

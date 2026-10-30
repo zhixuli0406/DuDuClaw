@@ -11,7 +11,7 @@ import { parseComputerWatch, type ComputerWatchRef } from '@/stores/chat-frames'
  * UI states that instead of faking events.
  */
 
-export type RunStatus = 'completed' | 'running' | 'no_reply';
+export type RunStatus = 'completed' | 'running' | 'failed' | 'no_reply';
 
 export interface RunSummary {
   id: string;
@@ -70,6 +70,11 @@ export type TranscriptCard =
   | { type: 'todo'; label: string; ts: string; preview: string }
   | { type: 'thinking'; seconds: number | null; tokens: number | null; ts: string; preview: string };
 
+/** Remove routing metadata from display text without changing stored records. */
+export function displayRunText(text: string): string {
+  return text.replace(/\[sender_id:\s*[^\]\r\n]*\]\s*/g, '').trim();
+}
+
 /**
  * Seconds and tokens from a `thinking` row's preview (`思考 8 秒 · 1,240
  * token`, written by the gateway). Pure — exported for tests. A preview in
@@ -92,7 +97,7 @@ export function cardsForEvents(events: readonly RunEvent[]): TranscriptCard[] {
   const cards: TranscriptCard[] = [];
   for (const e of events) {
     if (e.kind === 'text' && (e.role === 'user' || e.role === 'assistant')) {
-      cards.push({ type: 'prose', role: e.role, ts: e.ts, text: e.preview });
+      cards.push({ type: 'prose', role: e.role, ts: e.ts, text: displayRunText(e.preview) });
     } else if (e.kind === 'tool_use' && typeof e.tool === 'string' && e.tool.length > 0) {
       cards.push({
         type: 'tool',
@@ -137,6 +142,8 @@ export function runStatusMeta(status: RunStatus | string): {
   switch (status) {
     case 'running':
       return { labelId: 'runs.status.running', token: 'var(--status-agent-running)' };
+    case 'failed':
+      return { labelId: 'runs.status.failed', token: 'var(--status-error)' };
     case 'completed':
       return { labelId: 'runs.status.completed', token: 'var(--status-task-done)' };
     default:

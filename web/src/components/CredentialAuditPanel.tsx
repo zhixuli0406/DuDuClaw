@@ -85,8 +85,8 @@ export function CredentialAuditPanel() {
       const result = await api.credentials.auditList({ ...query(), export: true });
       const rows = result.credentials.map((row) => [
         t(`kind.${row.kind}`), row.account_hint ?? '', row.service ?? '',
-        `${t(`source.${row.source_kind}`)}: ${row.source_ref}`, row.provided_by,
-        row.holders.filter((h) => !h.revoked_at).map((h) => `${h.holder_kind}:${h.holder_id}`).join('; '),
+        sourceLabel(row), providerLabel(row),
+        row.holders.filter((h) => !h.revoked_at).map(holderLabel).join('; '),
         row.last_used_at ?? '', t(`status.${row.status}`),
       ]);
       const csv = [COLUMNS.map((c) => t(c)), ...rows]
@@ -108,15 +108,34 @@ export function CredentialAuditPanel() {
     setServiceDraft(row.service ?? '');
   }
 
-  function providerLabel(row: ChatCredential) {
-    if (!row.provided_by) return '—';
-    if (/^webchat-user:[a-f0-9]+$/i.test(row.provided_by) || row.provided_by === 'webchat-anonymous') {
+  function principalLabel(value: string) {
+    if (/^webchat-user:/i.test(value) || value === 'webchat-anonymous' || value.startsWith('webchat:')) {
       return t('provider.webchatGuest');
     }
-    if (/^[a-f0-9]{64}$/i.test(row.provided_by)) {
-      return t('provider.chat');
-    }
-    return row.provided_by;
+    if (/^[a-f0-9]{64}$/i.test(value)) return t('provider.chat');
+    return value;
+  }
+
+  function providerLabel(row: ChatCredential) {
+    return row.provided_by ? principalLabel(row.provided_by) : '—';
+  }
+
+  function holderLabel(holder: ChatCredential['holders'][number]) {
+    const label = principalLabel(holder.holder_id);
+    return holder.holder_kind === 'user' && label !== holder.holder_id
+      ? label : `${t(`holder.${holder.holder_kind}`)}: ${holder.holder_id}`;
+  }
+
+  function sourceLabel(row: ChatCredential) {
+    const channel = row.source_ref.split(':')[0].replace(/-ingress$/, '');
+    const knownChannels = ['telegram', 'line', 'discord', 'slack', 'whatsapp', 'feishu', 'googlechat', 'teams', 'wecom', 'dingtalk', 'webchat', 'widget', 'odoolivechat'];
+    const origin = knownChannels.includes(channel)
+      ? intl.formatMessage({ id: `kb.channel.${channel}` }) : t(`source.${row.source_kind}`);
+    const at = Number.isFinite(Date.parse(row.first_seen_at))
+      ? intl.formatDate(row.first_seen_at, { dateStyle: 'medium', timeStyle: 'short' }) : t('notObserved');
+    const ordinal = Number.isInteger(row.source_ordinal) && row.source_ordinal! >= 0
+      ? intl.formatMessage({ id: 'security.credentialAudit.source.ordinal' }, { number: row.source_ordinal! + 1 }) : '';
+    return [origin, at, ordinal].filter(Boolean).join(' · ');
   }
 
   return (
@@ -176,11 +195,11 @@ export function CredentialAuditPanel() {
                     <TableCell>{t(`kind.${row.kind}`)}</TableCell>
                     <TableCell><span className="block truncate" title={row.account_hint ?? undefined}>{row.account_hint ?? '—'}</span></TableCell>
                     <TableCell><span className="block truncate" title={row.service ?? undefined}>{row.service ?? t('unknown')}</span></TableCell>
-                    <TableCell><span>{t(`source.${row.source_kind}`)}</span><small className="block break-all text-muted-foreground" title={row.source_ref}>{row.source_ref}</small></TableCell>
-                    <TableCell><span className="block truncate" title={row.provided_by}>{providerLabel(row)}</span></TableCell>
+                    <TableCell><span className="block break-words">{sourceLabel(row)}</span></TableCell>
+                    <TableCell><span className="block break-words" title={providerLabel(row)}>{providerLabel(row)}</span></TableCell>
                     <TableCell>{row.holders.some((h) => !h.revoked_at) ? row.holders.filter((h) => !h.revoked_at).map((h) => (
-                      <span key={`${h.holder_kind}:${h.holder_id}`} className="block truncate" title={`${t(`holder.${h.holder_kind}`)}: ${h.holder_id}`}>
-                        {t(`holder.${h.holder_kind}`)}: {h.holder_id.length > 24 ? `${h.holder_id.slice(0, 12)}…${h.holder_id.slice(-6)}` : h.holder_id}
+                      <span key={`${h.holder_kind}:${h.holder_id}`} className="block break-words" title={holderLabel(h)}>
+                        {holderLabel(h)}
                       </span>
                     )) : '—'}</TableCell>
                     <TableCell>{row.last_used_at && Number.isFinite(Date.parse(row.last_used_at)) ? intl.formatDate(row.last_used_at, { dateStyle: 'medium', timeStyle: 'short' }) : t('notObserved')}</TableCell>

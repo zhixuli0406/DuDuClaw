@@ -24,6 +24,7 @@ export interface InboxItem {
   readonly agentId?: string;
   /** Channel of origin, when applicable (failed runs). Drives group-by channel. */
   readonly channel?: string;
+  readonly runId?: string;
   /** ISO timestamp for `timeAgo` + time/stuck sort. */
   readonly timestamp?: string;
   /** Higher = more urgent; drives the "urgency" sort. */

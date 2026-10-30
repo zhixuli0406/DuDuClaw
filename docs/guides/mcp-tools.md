@@ -48,6 +48,8 @@ still reaches the real gate and is still refused, with the gate's own message.
 | `[responsibilities] enabled` | `config.toml` | 3 `responsibility_*` tools hidden (see [responsibility tools](#responsibility_get--responsibility_followup--responsibility_ask--responsibility-tools) below) |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
 
+The machine-operation console (`/console`) is available only to administrators. Machine-operation tools used by a `system_operator` employee also verify on the server that the person requesting them is an active administrator; ordinary chat with other AI employees remains available according to existing access rules.
+
 A freshly created agent has none of these opted in, which is the point: the
 default deployment pays for the tools it can use and nothing else.
 

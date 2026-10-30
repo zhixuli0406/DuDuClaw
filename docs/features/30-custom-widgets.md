@@ -39,7 +39,7 @@ Distributor-authored HTML runs on the customer's dashboard. Without isolation, "
 
 - A widget joins your board as a `custom:<id>` entry in your personal layout, ordered and hidden like any built-in card. The server refuses layout entries referencing widgets you can't see (fail-closed).
 - Sharing is instance-wide and owner-controlled; admins can moderate (remove) any shared widget.
-- Managers using the read-only *view-as* mode see a subordinate's custom widgets rendered inline — covered by the same strict-rank grant as the rest of the board.
+- Managers can select only people in their reporting tree; admins can select any other active account. The dashboard currently shows a not-available message in *view-as* mode: widget data calls use the viewer's account, so they must not appear under another person's name.
 
 ## Limits
 

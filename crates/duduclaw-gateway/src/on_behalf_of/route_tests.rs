@@ -225,3 +225,41 @@ async fn route_rechecks_user_rights_and_ignores_process_edition_records() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn machine_tool_authority_checks_the_task_human_even_with_agent_admin_scope() {
+    use duduclaw_auth::{AccessLevel, UserDb, UserRole};
+    let home = home();
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", UserRole::Admin).unwrap();
+    let employee = db.create_user("employee@test.local", "Employee", "TeamPass-12345", UserRole::Employee).unwrap();
+    db.bind_agent(&employee.id, "bot", AccessLevel::Owner).unwrap();
+    let state = Arc::new(RouteState::new(home.path().into(), None));
+    // A task's propagated human identity, not its AI employee's Owner grant
+    // or the signed MCP key's Admin scope, decides machine rights.
+    for (user, expected) in [(&employee, 403), (&admin, 200)] {
+        super::super::scope_first(Some(format!("user:{}", user.id)), async {
+            let guard = super::super::context::register(home.path(), "bot").unwrap();
+            let body = json!({"context":guard.reference(),"target":"bot","operation":"system_operation"});
+            assert_eq!(request(state.clone(), "bot", body.clone()).await.0, expected);
+            assert_eq!(request(state.clone(), "other", body.clone()).await.0, 403);
+            let mut other_target = body.clone();
+            other_target["target"] = json!("other");
+            assert_eq!(request(state.clone(), "bot", other_target).await.0, 403);
+            if expected == 200 {
+                rusqlite::Connection::open(home.path().join("users.db")).unwrap()
+                    .execute("UPDATE users SET role='employee' WHERE id=?1", [&admin.id]).unwrap();
+                assert_eq!(request(state.clone(), "bot", body.clone()).await.0, 403, "role revocation is live");
+            }
+            drop(guard);
+            assert_eq!(request(state.clone(), "bot", body).await.0, 403);
+        }).await;
+    }
+    let guard = super::super::context::register(home.path(), "bot").unwrap();
+    let body = json!({"context":guard.reference(),"target":"bot","operation":"system_operation"});
+    assert_eq!(request(state.clone(), "bot", body.clone()).await.0, 200, "verified background remains allowed");
+    drop(guard);
+    assert_eq!(request(state.clone(), "bot", body).await.0, 403, "absence of a human is not proof of background work");
+    let fake = json!({"context":"f".repeat(64),"target":"bot","operation":"system_operation"});
+    assert_eq!(request(state, "bot", fake).await.0, 403);
+}

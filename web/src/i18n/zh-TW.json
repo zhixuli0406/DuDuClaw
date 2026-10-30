@@ -5323,6 +5323,7 @@
   "home.sinceVisit.wikiWritten": "歸檔了 {count} 篇知識",
   "home.sinceVisit.agentCreated": "加入了 {count} 位新 AI 員工",
   "home.viewAs.banner": "正在檢視 {name} 的個人儀表板（唯讀，不能代為修改）",
+  "home.viewAs.unavailable": "目前無法顯示這位成員的儀表板資料。",
   "home.viewAs.exit": "結束檢視",
   "home.console.cta": "跟系統說一句話，直接操作整台機器",
   "home.console.ctaHint": "進入主控台",
@@ -9396,9 +9397,12 @@
   "timeline.waitingSinceUpdate.minutes": "已等 {count} 分鐘（距上次更新）",
   "timeline.waitingSinceUpdate.hours": "已等 {count} 小時（距上次更新）",
   "timeline.waitingSinceUpdate.days": "已等 {count} 天（距上次更新）",
-  "agents.teamMember": "{name} 的 AI 員工（僅供查看）",
-  "agents.teamReadOnly": "這是團隊成員的 AI 員工。你可以查看工作時間軸與執行紀錄；記憶與設定僅開放給直接獲授權的帳號。",
+  "agents.teamMember": "{name} 的 AI 員工",
+  "agents.teamReadOnly": "這是團隊成員的 AI 員工。可交辦工作時，你可以交辦並查看工作狀態；記憶與設定需要直接授權。",
   "users.bind.chooseAgent": "請選擇 AI 員工",
   "widgets.compose.managerOnly": "請主管或管理員產生卡片。",
-  "runs.teamReadOnly": "這是團隊成員的執行紀錄，僅供查看進度。對話內容與工具步驟未開放。"
+  "runs.teamReadOnly": "這是團隊成員的執行紀錄，僅供查看進度。對話內容與工具步驟未開放。",
+  "agents.tasks.unavailable": "無法顯示",
+  "security.credentialAudit.source.ordinal": "同一則訊息第 {number} 筆",
+  "runs.status.failed": "失敗"
 }

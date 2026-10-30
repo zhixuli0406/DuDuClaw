@@ -31,7 +31,8 @@ function bucketFor(row: TimelineRow): Bucket | null {
   if (row.status === 'done') return 'done';
   if (['needs_human', 'pending_approval'].includes(row.status)) return 'waiting';
   if (['blocked', 'failed', 'cancelled'].includes(row.status)) return 'unfinished';
-  return 'active';
+  if (['in_progress', 'review', 'in_review', 'revising'].includes(row.status)) return 'active';
+  return 'unfinished';
 }
 
 function lastUpdateMs(row: TimelineRow): number {

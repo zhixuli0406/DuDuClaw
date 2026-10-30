@@ -17,9 +17,10 @@ fn row_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "last_seen_at":row.get::<_,String>(10)?, "last_used_at":row.get::<_,Option<String>>(11)?,
         "expires_at":row.get::<_,Option<String>>(12)?, "rotation_due_at":row.get::<_,Option<String>>(13)?,
         "note":row.get::<_,Option<String>>(14)?, "note_source":row.get::<_,String>(15)?,
+        "source_ordinal":row.get::<_,i64>(16)?,
     }))
 }
-const COLUMNS: &str = "id,kind,account_hint,service,service_source,source_kind,source_ref,provided_by,status,first_seen_at,last_seen_at,last_used_at,expires_at,rotation_due_at,note,note_source";
+const COLUMNS: &str = "id,kind,account_hint,service,service_source,source_kind,source_ref,provided_by,status,first_seen_at,last_seen_at,last_used_at,expires_at,rotation_due_at,note,note_source,source_ordinal";
 
 fn add_holders(db: &Connection, row: &mut Value) -> Result<(), String> {
     let mut stmt = db.prepare("SELECT holder_kind,holder_id,granted_at,revoked_at FROM credential_holders WHERE credential_id=?1 ORDER BY holder_kind,holder_id").map_err(|_| UNAVAILABLE)?;
@@ -175,5 +176,8 @@ mod metadata_security_tests {
         assert_eq!(row["service"], "Approved service");
         assert_eq!(row["service_source"], "admin");
         assert_eq!(row["note_source"], "admin");
+        db.execute("UPDATE credentials SET source_ordinal=1 WHERE id='cred_test'", []).unwrap();
+        assert_eq!(get(home.path(), "cred_test").unwrap()["source_ordinal"], 1);
+        assert_eq!(list(home.path(), &json!({})).unwrap()["credentials"][0]["source_ordinal"], 1);
     }
 }

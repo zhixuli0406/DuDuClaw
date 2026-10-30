@@ -211,3 +211,14 @@ it('explains a metadata-only team run without requiring a session id', async () 
   expect(await screen.findByText(/Conversation content and tool steps are not shared/)).toBeInTheDocument();
   expect(screen.queryByText('No transcript events recorded')).not.toBeInTheDocument();
 });
+
+
+it('hides sender ids in list previews and shows failed run status', async () => {
+  const run = { id: 'failed-run', agent_id: 'nova', channel: 'webchat', started_at: '2026-10-31T00:00:00Z', ended_at: '2026-10-31T00:00:01Z', status: 'failed', step_count: 0, preview: '[sender_id: webchat:private-session] Please help' };
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'runs.list'
+    ? { runs: [run] } : method === 'runs.get' ? { run, events: [] } : { agents: AGENTS }));
+  renderAt('/runs?run=failed-run');
+  expect(await screen.findByText('Please help')).toBeInTheDocument();
+  expect(await screen.findByText('Failed')).toBeInTheDocument();
+  expect(screen.queryByText(/sender_id|private-session/)).not.toBeInTheDocument();
+});

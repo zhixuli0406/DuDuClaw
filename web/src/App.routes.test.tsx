@@ -118,6 +118,15 @@ describe('App routes — legacy paths land somewhere real (WP-A §2-8/§2-13)', 
   });
 });
 
+describe('App routes — machine console access', () => {
+  it.each(['employee', 'manager'] as const)('blocks %s from a direct console URL', async role => {
+    setRole(role);
+    await expectLandsOn('/console', '/');
+    expect(screen.queryByPlaceholderText(en['console.placeholder'])).not.toBeInTheDocument();
+    expect(screen.queryByText(en['home.console.cta'])).not.toBeInTheDocument();
+  });
+});
+
 describe('App routes — the 交辦任務 page', () => {
   for (const edition of ['personal', 'enterprise'] as const) {
     it(`/assign renders on ${edition}`, async () => {

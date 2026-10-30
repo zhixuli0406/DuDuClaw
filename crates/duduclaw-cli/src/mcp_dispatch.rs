@@ -1407,6 +1407,23 @@ impl McpDispatcher {
             );
         }
 
+        // Agent Admin scope does not grant the human Employee machine rights.
+        // An opaque gateway-owned context distinguishes true background work
+        // from a human-created task; missing/stale proof always refuses.
+        if SYSTEM_OPERATOR_TOOLS.contains(&tool_name)
+            && !crate::mcp::check_system_operation_principal(&self.home_dir, gate_agent).await
+        {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            self.audit_dispatch_denial(tool_name, &params_owned, "system_operation_human_denied", "A live administrator or proven background context is required");
+            let language = duduclaw_gateway::prompt_identity::read_default_language(&self.home_dir).await;
+            let message = match language.as_deref() {
+                Some("en") => "Only an administrator can operate the machine.",
+                Some("ja" | "ja-JP") => "機器を操作できるのは管理者だけです。",
+                _ => "只有系統管理員可以操作機器。",
+            };
+            return jsonrpc_error(id, -32003, message);
+        }
+
         // ── 3.627 Co-drive capability gate (CD-1, deny-by-default, I5) ───────
         // `codrive_run` is already `Scope::Admin`-scoped, but scope alone is
         // an opt-out posture (design red line 1: "共駕能力預設關；開啟是
@@ -3279,11 +3296,10 @@ effect = "forbid"
         );
     }
 
-    /// `system_operator = true` lets `os_device_status` pass the capability
-    /// gate — it may still fail downstream (never an appliance in CI), but
-    /// NOT with the system_operator capability message.
+    /// Agent Admin scope and capability cannot substitute for a proven
+    /// human/background context at the machine-operation gate.
     #[tokio::test]
-    async fn system_operator_tool_passes_gate_when_capability_true() {
+    async fn system_operator_tool_refuses_without_verified_human_context() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
         write_scoped_toml(&tmp, "[capabilities]\nsystem_operator = true\n");
@@ -3297,14 +3313,9 @@ effect = "forbid"
             .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
             .await;
 
-        // Reaches the handler at the JSON-RPC level (no -32003 capability
-        // denial) — the tool itself still refuses fail-closed off-appliance,
-        // but that is a DIFFERENT, already-covered gate (`mcp_os_ops.rs`'s
-        // own `is_appliance()` check), not this one.
-        assert!(
-            result.get("error").is_none(),
-            "os_device_status with system_operator=true must pass the capability gate, got: {result}"
-        );
+        assert_eq!(result["error"]["code"], -32003);
+        let message = result["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!(message, "只有系統管理員可以操作機器。", "{result}");
     }
 
     /// Without `Scope::Admin` at all, the scope check itself still denies

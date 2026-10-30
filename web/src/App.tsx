@@ -131,23 +131,13 @@ function PageFallback() {
  * appliance (§6 O-5: nothing native is removed, only the default first door
  * changes).
  *
- * R2 (2026-08): every authenticated role gets this redirect, not just admin.
- * The original gate reused `useIsAppliance(hasMinRole(role, 'admin'))` — the
- * same pattern `AppSidebar`/`CommandPalette` use for their `/device` nav
- * probe — because that hook used to read the admin-only `device.status` RPC
- * (`require_admin!()` in `handlers.rs`), so a manager/employee viewer could
- * never learn whether the box was an appliance and silently stayed on
- * `HomePage`. `useIsAppliance` now reads the non-admin `is_appliance` field
- * on `system.status` instead, so this route no longer needs a role gate at
- * all — `HomeLanding` only renders once `AuthGuard` has already confirmed
- * the caller is signed in, and `/console` itself is open to every role
- * (see its route below). `AppSidebar`/`CommandPalette` keep their own
- * `hasMinRole(role, 'admin')` argument unchanged — that gate is about
- * showing the admin-only `/device` page, a separate concern from this one.
+ * The machine-operation console is for administrators. Other appliance users
+ * keep their dashboard and ordinary chat, without machine-operation wording.
  */
 function HomeLanding() {
   const isAppliance = useIsAppliance(true);
-  if (isAppliance) return <Navigate to="/console" replace />;
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  if (isAppliance && isAdmin) return <Navigate to="/console" replace />;
   return <HomePage />;
 }
 
@@ -246,10 +236,8 @@ export function App() {
               {/* v2 (T1.5): /webchat renamed to /chat; old path redirects. */}
               <Route path="chat" element={<WebChatPage />} />
               <Route path="webchat" element={<Navigate to="/chat" replace />} />
-              {/* O-2 (§6.3) — the operator console scaffold. Open to every
-                  authenticated role, like `/chat`: the capability gating that
-                  matters lives at the tool layer (O-0), not the nav entry. */}
-              <Route path="console" element={<OperatorConsolePage />} />
+              {/* Machine operation entry; the server also checks the live human role. */}
+              <Route element={<RoleGuard minRole="admin" />}><Route path="console" element={<OperatorConsolePage />} /></Route>
               {/* Full conversation history (2026-08-04, D17) — the sidebar zone
                   lists the newest five and links here for the rest. */}
               <Route path="conversations" element={<ConversationsPage />} />

@@ -15,7 +15,7 @@ export const messages: Record<string, Record<string, string>> = {
  * Google privacy links are defined outside the catalogues and remain untouched.
  */
 export const BRAND_EXCLUDED_PREFIXES = ['googleDataDisclosure.', 'subscriptionRisk.', 'license.nfr.', 'license.mode.', 'about.'];
-export const BRAND_EXCLUDED_IDS = ['license.distributorNotice'];
+export const BRAND_EXCLUDED_IDS: string[] = [];
 
 export function brandedMessages(locale: string, productName?: string): Record<string, string> {
   const catalogue = messages[locale] ?? messages[defaultLocale];

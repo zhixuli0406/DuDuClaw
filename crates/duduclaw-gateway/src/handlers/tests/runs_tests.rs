@@ -238,3 +238,23 @@ fn run_window_end_covers_reply_running_and_no_reply_shapes() {
         "unparseable end fails closed"
     );
 }
+
+#[test]
+fn failed_spawn_closes_list_run_without_inventing_an_assistant_reply() {
+    let home = tempfile::tempdir().unwrap();
+    let store = crate::run_steps::shared_store(home.path()).unwrap();
+    store.record_channel_failure("webchat:guest", 1).unwrap();
+    let rows = vec![msg(1, "webchat:guest", "user", Utc::now())];
+    let mut runs = fold_session_runs(&rows, Utc::now());
+    assert_eq!(runs[0].status, "running");
+    apply_channel_run_failures(home.path(), &mut runs);
+    assert_eq!(runs[0].status, "failed");
+    assert!(runs[0].ended_at.as_ref().is_some_and(|ts| parse_timeline_ts(ts).is_some()));
+    let wire = run_summary_to_json(&runs[0], 0);
+    assert_eq!(wire["status"], "failed");
+    assert!(wire["ended_at"].is_string());
+    let mut other = fold_session_runs(&[msg(2, "webchat:guest", "user", Utc::now())], Utc::now());
+    apply_channel_run_failures(home.path(), &mut other);
+    assert_eq!(other[0].status, "running");
+    assert!(other[0].ended_at.is_none());
+}

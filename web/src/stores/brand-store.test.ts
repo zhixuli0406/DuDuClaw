@@ -32,8 +32,9 @@ describe('verified distributor display data', () => {
   it.each(['zh-TW', 'en', 'ja-JP'])('substitutes %s once while preserving legal and privacy disclosures', (locale) => {
     const translated = brandedMessages(locale, brand.product_name);
     expect(translated['app.name']).toBe(brand.product_name);
-    for (const id of ['googleDataDisclosure.access', 'googleDataDisclosure.training', 'googleDataDisclosure.privacy', 'license.distributorNotice', 'subscriptionRisk.conflicts', 'subscriptionRisk.vendor.openai.policy'])
+    for (const id of ['googleDataDisclosure.access', 'googleDataDisclosure.training', 'googleDataDisclosure.privacy', 'subscriptionRisk.conflicts', 'subscriptionRisk.vendor.openai.policy'])
       expect(translated[id]).toBe(messages[locale][id]);
+    expect(translated['license.distributorNotice']).toBe(messages[locale]['license.distributorNotice'].replaceAll('DuDuClaw', brand.product_name));
     expect(messages[locale]['app.name']).toBe('DuDuClaw');
     expect(brandedMessages(locale)['app.name']).toBe('DuDuClaw');
   });
@@ -67,11 +68,25 @@ describe('verified distributor display data', () => {
     const intl = createIntl({ locale: 'en', messages: brandedMessages('en', name) });
     expect(intl.formatMessage({ id: 'app.name' })).toBe(name);
   });
+  it('keeps an existing page prefix and does not restore a stale route title', () => {
+    document.title = 'About · DuDuClaw';
+    const restore = applyDocumentBrand(brand, false);
+    expect(document.title).toBe(`About · ${brand.product_name}`);
+    document.title = `AI staff · ${brand.product_name}`;
+    restore();
+    expect(document.title).toBe(`AI staff · ${brand.product_name}`);
+  });
+  it.each(['DuDuClaw Partner', 'Partner · DuDuClaw'])('does not replace the original name inside the brand %s', (product_name) => {
+    document.title = `About · ${product_name}`;
+    const restore = applyDocumentBrand({ ...brand, product_name }, false);
+    expect(document.title).toBe(`About · ${product_name}`);
+    restore();
+  });
   it('sets and restores runtime title and favicon without changing defaults', () => {
     document.title = 'DuDuClaw Dashboard';
     document.head.innerHTML += '<link rel="icon" href="/default.svg" type="image/svg+xml">';
     const restore = applyDocumentBrand({ ...brand, logo_dark: 'data:image/webp;base64,UklGRgAAAABXRUJQ' }, true);
-    expect(document.title).toBe(brand.product_name);
+    expect(document.title).toBe(`${brand.product_name} Dashboard`);
     expect(document.querySelector('link[rel="icon"]')?.getAttribute('href')).toBe('data:image/webp;base64,UklGRgAAAABXRUJQ');
     restore();
     expect(document.title).toBe('DuDuClaw Dashboard');

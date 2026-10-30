@@ -1,5 +1,7 @@
 # Distributor name and logo
 
+A failed refresh keeps the current verified brand. Only an explicit `distributor_brand: null` from the control plane, a license that is no longer `Oem`, or a cached document that fails verification removes it. A missing response field is an error, not a request to clear the brand.
+
 In v1.78.0, a distributor can set a product name and logo in the license
 console. Only a gateway whose effective license tier is `Oem` uses them, and
 only after verifying the signed document for its subscription. Without a

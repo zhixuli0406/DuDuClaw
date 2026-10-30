@@ -103,7 +103,7 @@ export function AgentsPage() {
   } = useAgentsStore();
   const agents = useVisibleAgents();
   const isAdmin = useAuthStore(s => s.user?.role === 'admin');
-  const { tasks, fetchTasks } = useTasksStore();
+  const { tasks, fetchTasks, error: tasksError, tasksPartialError, loading: tasksLoading } = useTasksStore();
 
   const [scope, setScope] = useState<Scope>('active');
   // UX plan I-1a: "交辦任務" on an employee card opens the one shared panel with
@@ -241,7 +241,7 @@ export function AgentsPage() {
             <AgentRow
               key={agent.name}
               agent={agent}
-              taskCount={agentTaskStats(tasks, agent.name).total}
+              taskCount={agent.readOnly || tasksError || tasksPartialError || tasksLoading ? null : agentTaskStats(tasks, agent.name).total}
               onPause={() => void runLifecycle(() => pauseAgent(agent.name), 'agentDetail.rested', agent)}
               onResume={() => void runLifecycle(() => resumeAgent(agent.name), 'agentDetail.resumed', agent)}
               onDelegate={() => openAssign({ agentId: agent.name })}
@@ -283,7 +283,7 @@ function AgentRow({
   onOffboard,
 }: {
   agent: VisibleAgent;
-  taskCount: number;
+  taskCount: number | null;
   onPause: () => void;
   onResume: () => void;
   onDelegate: () => void;
@@ -319,7 +319,7 @@ function AgentRow({
           >
             {agent.display_name}
           </Link>
-          <span className="truncate text-xs text-muted-foreground">
+          <span className="truncate text-xs text-muted-foreground" title={agent.readOnly ? intl.formatMessage({ id: 'agents.teamReadOnly' }) : undefined}>
             {agent.readOnly ? intl.formatMessage({ id: 'agents.teamMember' }, { name: agent.teamMember }) : agent.trigger || intl.formatMessage({ id: `agents.role.${agent.role}` })}
           </span>
         </div>
@@ -330,7 +330,7 @@ function AgentRow({
         <span className={cn('mr-2 size-1.5 shrink-0 rounded-full', statusDotClass(agent.status, archived))} />
         <span className="flex min-w-0 flex-col leading-tight">
           <span className="truncate text-sm text-foreground">{statusLabel}</span>
-          {taskCount > 0 && (
+          {taskCount !== null && taskCount > 0 && (
             <span className="truncate text-xs text-muted-foreground">
               {intl.formatMessage({ id: 'agents.list.taskCount' }, { count: taskCount })}
             </span>
@@ -363,7 +363,7 @@ function AgentRow({
 
       {/* Task count. */}
       <ListGridCell hideBelow className="justify-end">
-        <span className="font-mono text-xs tabular-nums text-muted-foreground">{taskCount}</span>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{taskCount ?? intl.formatMessage({ id: 'agents.tasks.unavailable' })}</span>
       </ListGridCell>
 
       {/* Kebab. */}

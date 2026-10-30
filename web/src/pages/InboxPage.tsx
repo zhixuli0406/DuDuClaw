@@ -15,7 +15,7 @@ import { approvalListTitle, parseKnowledgeQuarantine, quarantineResultMessage } 
 import { useConnectionStore } from '@/stores/connection-store';
 import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { useAuthStore } from '@/stores/auth-store';
-import { excludeRecoveredChannelFailures, channelFailureChannel, resolveFailureAgentId, failedRunTitle } from '@/lib/home-overview';
+import { excludeRecoveredChannelFailures, channelFailureChannel, resolveFailureAgentId, failedRunTitle, failedRunHref, failureRunId } from '@/lib/home-overview';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
@@ -813,8 +813,7 @@ export function InboxPage() {
             <p className="text-sm">{t('inbox.failedRun.summary')}</p>
             <Button variant="brand" onClick={() => {
               const event = raw as UnifiedAuditEvent;
-              const runId = typeof event.details?.run_id === 'string' ? event.details.run_id : null;
-              navigate(runId ? `/runs?run=${encodeURIComponent(runId)}` : item.agentId ? `/runs?agent=${encodeURIComponent(item.agentId)}` : '/runs');
+              navigate(failedRunHref({ runId: failureRunId(event), agentId: item.agentId }));
             }}><ExternalLink />{t('inbox.detail.viewRun')}</Button>
           </DetailShell>
         );

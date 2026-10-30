@@ -75,6 +75,7 @@ impl MethodHandler {
         rows.sort_by(|a, b| (&a.session_id, a.rowid).cmp(&(&b.session_id, b.rowid)));
         let now = Utc::now();
         let mut runs = fold_session_runs(&rows, now);
+        apply_channel_run_failures(&self.home_dir, &mut runs);
         runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         runs.truncate(limit);
 
@@ -383,7 +384,7 @@ impl MethodHandler {
             .ok();
 
         let now = Utc::now();
-        let (status, ended_at) = match &assistant {
+        let (mut status, mut ended_at) = match &assistant {
             Some((_, ts)) => ("completed".to_string(), Some(ts.clone())),
             None => {
                 if next_user.is_some() {
@@ -393,6 +394,13 @@ impl MethodHandler {
                 }
             }
         };
+
+        if let Some(end) = crate::run_steps::shared_store(&self.home_dir)
+            .and_then(|s| s.channel_failure_end(session_id, rowid))
+        {
+            status = "failed".into();
+            ended_at = Some(end);
+        }
 
         // Tool events (MCP audit trail) inside the run window.
         let window_end: Option<chrono::DateTime<Utc>> = match &ended_at {

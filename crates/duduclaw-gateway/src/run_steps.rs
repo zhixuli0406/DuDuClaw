@@ -198,6 +198,13 @@ impl RunStepStore {
              CREATE INDEX IF NOT EXISTS idx_run_steps_agent   ON run_steps(agent_id, id);
              CREATE INDEX IF NOT EXISTS idx_run_steps_ts      ON run_steps(ts);
 
+             CREATE TABLE IF NOT EXISTS channel_run_failures (
+                 session_key TEXT NOT NULL,
+                 user_message_id INTEGER NOT NULL,
+                 ended_at TEXT NOT NULL,
+                 PRIMARY KEY(session_key, user_message_id)
+             );
+
              CREATE TABLE IF NOT EXISTS dispatch_runs (
                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
                  agent_id    TEXT NOT NULL,
@@ -337,6 +344,22 @@ impl RunStepStore {
         {
             debug!(error = %e, kind, "run_steps append failed (dropped, best-effort)");
         }
+    }
+
+    /// Record the terminal failure of one exact conversation turn. A failed
+    /// spawn has no assistant row, so session folding alone cannot close it.
+    pub(crate) fn record_channel_failure(&self, session: &str, message_id: i64) -> Result<(), String> {
+        self.lock().execute(
+            "INSERT OR IGNORE INTO channel_run_failures(session_key,user_message_id,ended_at) VALUES(?1,?2,?3)",
+            params![session, message_id, chrono::Utc::now().to_rfc3339()],
+        ).map(|_| ()).map_err(|e| format!("record channel run failure: {e}"))
+    }
+
+    pub(crate) fn channel_failure_end(&self, session: &str, message_id: i64) -> Option<String> {
+        self.lock().query_row(
+            "SELECT ended_at FROM channel_run_failures WHERE session_key=?1 AND user_message_id=?2",
+            params![session, message_id], |r| r.get(0),
+        ).ok()
     }
 
     /// Record one finished cron/dispatch invocation (LWM D4 observability
@@ -502,6 +525,7 @@ impl RunStepStore {
             "DELETE FROM dispatch_runs WHERE started_at < ?1",
             params![cutoff],
         );
+        let _ = conn.execute("DELETE FROM channel_run_failures WHERE ended_at < ?1", params![cutoff]);
         Ok(by_age + by_cap)
     }
 
@@ -720,6 +744,18 @@ fn mask_secretish_values(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_channel_turn_has_one_stable_end_and_does_not_close_another_turn() {
+        let store = RunStepStore::open_in_memory().unwrap();
+        store.record_channel_failure("webchat:visitor", 42).unwrap();
+        let end = store.channel_failure_end("webchat:visitor", 42).unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&end).is_ok());
+        store.record_channel_failure("webchat:visitor", 42).unwrap();
+        assert_eq!(store.channel_failure_end("webchat:visitor", 42), Some(end));
+        assert!(store.channel_failure_end("webchat:visitor", 43).is_none());
+        assert!(store.channel_failure_end("webchat:other", 42).is_none());
+    }
 
     #[test]
     fn host_browser_step_preserves_signed_context_and_joins_only_its_run() {

@@ -29,39 +29,54 @@ describe('CredentialAuditPanel', () => {
     expect(screen.getByText('user-fixture')).toBeInTheDocument();
     expect(screen.getByText('AI employee: support-fixture')).toBeInTheDocument();
     expect(screen.getByText('Not observed')).toBeInTheDocument();
-    expect(screen.getByText('webchat:session:42')).toBeInTheDocument();
+    expect(screen.queryByText('webchat:session:42')).not.toBeInTheDocument();
+    expect(screen.getByText(/Web chat · Oct 30, 2026/)).toBeInTheDocument();
   });
 
-  it('labels hashed providers and preserves the full identifier on hover', async () => {
+  it('labels hashed providers and hides source session internals', async () => {
     const provider = 'a'.repeat(64);
     const source = `webchat:${'b'.repeat(200)}:42`;
     mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, provided_by: provider, source_ref: source }], mode: 'audit' });
     renderWithProviders(<CredentialAuditPanel />);
     const label = await screen.findByText('Conversation participant');
-    expect(label).toHaveAttribute('title', provider);
+    expect(label).toHaveAttribute('title', 'Conversation participant');
     expect(screen.queryByText(provider)).not.toBeInTheDocument();
-    expect(screen.getByText(source)).toHaveAttribute('title', source);
+    expect(screen.queryByText(source)).not.toBeInTheDocument();
+    expect(document.querySelector(`[title="${source}"]`)).toBeNull();
   });
 
   it.each(['webchat-anonymous', `webchat-user:${'d'.repeat(64)}`])('labels web chat guests: %s', async (provider) => {
     mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, provided_by: provider }], mode: 'audit' });
     renderWithProviders(<CredentialAuditPanel />);
-    expect(await screen.findByText('Web chat guest')).toHaveAttribute('title', provider);
+    expect(await screen.findByText('Web chat guest')).toHaveAttribute('title', 'Web chat guest');
+    expect(screen.getByText('Web chat guest')).not.toHaveClass('truncate');
     expect(screen.queryByText(provider)).not.toBeInTheDocument();
   });
 
-  it('shortens long holder ids while keeping each full value on hover', async () => {
+  it('wraps holder labels without hiding their content', async () => {
     const holder = 'a'.repeat(64);
     mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, holders: [
       { holder_kind: 'agent', holder_id: holder },
       { holder_kind: 'agent', holder_id: 'support-fixture' },
     ] }], mode: 'audit' });
     renderWithProviders(<CredentialAuditPanel />);
-    const abbreviated = await screen.findByText(`AI employee: ${'a'.repeat(12)}…${'a'.repeat(6)}`);
+    const abbreviated = await screen.findByText(`AI employee: ${holder}`);
     expect(abbreviated).toHaveAttribute('title', `AI employee: ${holder}`);
-    expect(abbreviated).toHaveClass('truncate');
-    expect(screen.queryByText(`AI employee: ${holder}`)).not.toBeInTheDocument();
+    expect(abbreviated).not.toHaveClass('truncate');
     expect(screen.getByText('AI employee: support-fixture')).toBeInTheDocument();
+  });
+
+  it('distinguishes two credentials from one message and names guest holders plainly', async () => {
+    const holder = { holder_kind: 'user', holder_id: 'webchat-user:fixture' };
+    mockWsClient.call.mockResolvedValue({ credentials: [
+      { ...credential, id: 'first', source_ordinal: 0, holders: [holder] },
+      { ...credential, id: 'second', source_ordinal: 1, holders: [holder] },
+    ], mode: 'audit' });
+    renderWithProviders(<CredentialAuditPanel />);
+    expect(await screen.findByText(/Item 1 in the same message/)).toBeInTheDocument();
+    expect(screen.getByText(/Item 2 in the same message/)).toBeInTheDocument();
+    expect(screen.getAllByText('Web chat guest')).toHaveLength(2);
+    expect(screen.queryByText(/webchat-user:/)).not.toBeInTheDocument();
   });
 
   it('does not present revoked holders as current holders', async () => {

@@ -4,6 +4,8 @@ import { auditEventSummary, resolveFailureAgentId } from './home-overview';
 import { describe, it, expect } from 'vitest';
 import {
   countStandbyAgents,
+  failedRunHref,
+  failureRunId,
   withinRecentWindow,
   buildAttentionItems,
   overviewCounts,
@@ -207,4 +209,14 @@ describe('failed work summaries', () => {
     ], [], [{ id: 'failure', title: 'Failed' }]);
     expect(items.map((item) => item.id)).toEqual(['approval:expiring', 'approval:high', 'failed_run:failure', 'approval:low']);
   });
+});
+
+
+it('shares failed-run links across Home and Inbox, including nested audit records', () => {
+  const event = { agent_id: 'staff', timestamp: 'now', event_type: 'failure', summary: '', details: { channel_failure: { channel: 'webchat', run_id: 'run:42' } } };
+  expect(failedRunHref({ runId: failureRunId(event), agentId: 'staff' })).toBe('/runs?run=run%3A42');
+  expect(failedRunHref({ agentId: 'staff' })).toBe('/runs?agent=staff');
+  expect(failedRunHref({})).toBe('/runs');
+  const [item] = buildAttentionItems([], [], [{ id: 'failure', title: 'Failed', runId: 'run:42' }]);
+  expect(item.runId).toBe('run:42');
 });

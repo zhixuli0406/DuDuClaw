@@ -36,6 +36,8 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | `[responsibilities] enabled` | `config.toml` | `responsibility_*` 3 ツールを非表示（下の[継続タスクのツール](#responsibility_get--responsibility_followup--responsibility_ask--継続タスクのツール)を参照） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有効な付与 | タスクスコープの付与が有効になるまで非表示 |
 
+機器操作コンソール（`/console`）は管理者だけが利用できます。`system_operator` スタッフが機器操作ツールを実行するときも、サーバーで依頼者が有効な管理者かを確認します。他の AI スタッフとの通常の会話は、従来のアクセス規則で利用できます。
+
 新規作成したエージェントは上記のいずれも有効ではありません。それが狙いで、既定の構成は使えるツールの分だけを支払います。
 
 ### セッション途中の変更がどう届くか

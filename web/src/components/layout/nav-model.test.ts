@@ -10,6 +10,18 @@ import {
 import { isVisible } from '@/lib/nav-visibility';
 import { crumbsFor } from './nav-model';
 
+describe('machine console visibility', () => {
+  it('shows the machine entry only to administrators in both editions', () => {
+    const entry = primaryItemsForEdition(false).find(i => i.to === '/console')!;
+    expect(entry).toBeDefined();
+    for (const personal of [false, true]) {
+      expect(isVisible(entry, 'employee', personal)).toBe(false);
+      expect(isVisible(entry, 'manager', personal)).toBe(false);
+      expect(isVisible(entry, 'admin', personal)).toBe(true);
+    }
+  });
+});
+
 describe('own conversation-view receipts', () => {
   it('is reachable by an enterprise employee and hidden on Personal', () => {
     const entry = navGroups.flatMap(g => g.items).find(i => i.to === '/my/history-views')!;

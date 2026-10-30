@@ -126,7 +126,7 @@ describe('TimelinePage', () => {
     respond(['pending', 'pending_approval', 'review', 'revising'].map((status) => task(status, 'active', status)));
     renderWithProviders(<TimelinePage />);
     expect(await screen.findByRole('button', { name: 'Waiting for you 1' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'In progress 3' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'In progress 2' })).toBeInTheDocument();
     for (const status of ['pending', 'pending_approval', 'review', 'revising']) expect(screen.queryByText(status, { exact: true })).not.toBeInTheDocument();
   });
 });
@@ -135,4 +135,14 @@ it('keeps a readable task link when privacy removes an activity title', async ()
   respond([{ ...task('event', 'stuck', 'error'), kind: 'problem', task_id: 'private-task', label: '' }]);
   renderWithProviders(<TimelinePage />);
   expect(await screen.findByRole('link', { name: 'Needs attention' })).toHaveAttribute('href', '/tasks/private-task');
+});
+
+
+it('counts ready-to-start tasks as unfinished, never as in progress', async () => {
+  respond(['backlog', 'todo', 'pending', 'in_progress', 'done', 'needs_human'].map((status) => task(status, 'active', status)));
+  renderWithProviders(<TimelinePage />);
+  expect(await screen.findByRole('button', { name: 'Unfinished 3' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'In progress 1' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Completed 1' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Waiting for you 1' })).toBeInTheDocument();
 });

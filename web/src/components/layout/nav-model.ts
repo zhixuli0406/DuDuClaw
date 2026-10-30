@@ -213,7 +213,7 @@ export const dailyItems: NavItem[] = [
   // declaration — no separate Personal wiring to forget. On the appliance
   // image this is the default landing page (see `App.tsx`'s `HomeLanding`);
   // on every other install it's one click away, same as 新對話/首頁.
-  { to: '/console', icon: Bot, label: 'nav.console', desc: 'nav.console.desc', ownScope: true, newIn: '1.62.0' },
+  { to: '/console', icon: Bot, label: 'nav.console', desc: 'nav.console.desc', minRole: 'admin', ownScope: true, newIn: '1.62.0' },
   // 收件匣 left the standing navigation on 2026-08-04 (D17). The page and its
   // route stay — the entry point is now the footer notification bell, which
   // lights up only when something actually needs a decision. See

@@ -5323,6 +5323,7 @@
   "home.sinceVisit.wikiWritten": "{count}件のナレッジを保存",
   "home.sinceVisit.agentCreated": "{count}名の新しいAI社員が加入",
   "home.viewAs.banner": "{name} さんのダッシュボードを表示中（読み取り専用・代理編集不可）",
+  "home.viewAs.unavailable": "このメンバーのダッシュボードのデータは、ここでは表示できません。",
   "home.viewAs.exit": "表示を終了",
   "home.console.cta": "システムにひとこと話しかけて、マシン全体を操作",
   "home.console.ctaHint": "コンソールを開く",
@@ -9396,9 +9397,12 @@
   "timeline.waitingSinceUpdate.minutes": "{count} 分待機（最終更新から）",
   "timeline.waitingSinceUpdate.hours": "{count} 時間待機（最終更新から）",
   "timeline.waitingSinceUpdate.days": "{count} 日待機（最終更新から）",
-  "agents.teamMember": "{name} の AI スタッフ（閲覧のみ）",
-  "agents.teamReadOnly": "チームメンバーの AI スタッフです。タイムラインと実行記録を確認できます。記憶や設定の閲覧には直接のアクセス権が必要です。",
+  "agents.teamMember": "{name} の AI スタッフ",
+  "agents.teamReadOnly": "チームメンバーの AI スタッフです。依頼が許可されている場合、仕事の依頼と進捗の確認ができます。記憶と設定には直接のアクセス権が必要です。",
   "users.bind.chooseAgent": "AI スタッフを選択",
   "widgets.compose.managerOnly": "カードの生成はマネージャーまたは管理者に依頼してください。",
-  "runs.teamReadOnly": "チームメンバーの実行記録は進捗のみ確認できます。会話内容とツールの手順は共有されていません。"
+  "runs.teamReadOnly": "チームメンバーの実行記録は進捗のみ確認できます。会話内容とツールの手順は共有されていません。",
+  "agents.tasks.unavailable": "表示できません",
+  "security.credentialAudit.source.ordinal": "同じメッセージの {number} 件目",
+  "runs.status.failed": "失敗"
 }

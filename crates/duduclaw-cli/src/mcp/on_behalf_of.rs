@@ -90,6 +90,13 @@ pub(crate) async fn check_human_principal(
     }
 }
 
+/// Machine operations always require the gateway's live host-context check,
+/// even when delegation permission tracking is configured as record-only.
+pub(crate) async fn check_system_operation_principal(home: &Path, agent: &str) -> bool {
+    let Ok(principal) = duduclaw_core::host_principal_checked() else { return false; };
+    authority_check(home, agent, agent, "system_operation", principal.as_ref()).await
+}
+
 /// Async loopback bridge. Failure, absent context and identity disagreement
 /// all deny; there is no local database or edition-environment fallback.
 async fn authority_check(
@@ -172,8 +179,9 @@ async fn authority_check(
 }
 
 /// Preserve every existing path's semantics, including mail, record changes
-/// and schedule hand-overs. The wire vocabulary is closed to two rights.
+/// and schedule hand-overs. Machine operations use a separate Admin check.
 fn authority_operation(path: &str) -> &'static str {
+    if path == "system_operation" { return "system_operation"; }
     match duduclaw_core::human_right_for_path(path) {
         duduclaw_core::HumanRight::Call => "call",
         duduclaw_core::HumanRight::Assign => "assign",
@@ -183,6 +191,7 @@ fn authority_operation(path: &str) -> &'static str {
 mod tests {
     #[test]
     fn permission_wire_kind_covers_all_shared_delegation_paths() {
+        assert_eq!(super::authority_operation("system_operation"), "system_operation");
         for path in ["send_to_agent", "spawn_agent"] {
             assert_eq!(super::authority_operation(path), "call");
         }

@@ -130,11 +130,12 @@ export function HomePage() {
   const [customWidgets, setCustomWidgets] = useState<CustomWidgetSummary[]>([]);
 
   // ── Read-only subordinate view (view-as, manager+). `?view_as=<user_id>`
-  // renders THAT user's layout + data scope; editing is disabled and there is
-  // no write path for someone else's layout (structural, not just hidden UI).
+  // Widget APIs still use the viewer's identity, so show an unavailable state
+  // until those APIs can return target-scoped data. Never substitute viewer data.
   const [searchParams, setSearchParams] = useSearchParams();
   const viewAs = searchParams.get('view_as') ?? '';
   const [viewTarget, setViewTarget] = useState<{
+    userId: string;
     name: string;
     role: string;
     layout: DashboardLayoutWidget[];
@@ -165,6 +166,7 @@ export function HomePage() {
           ? [...savedWidgets, ...ids.filter((id) => !known.has(id)).map((id) => ({ id, hidden: false }))]
           : DEFAULT_ORDER.filter((id) => ids.includes(id)).map((id) => ({ id, hidden: false }));
         setViewTarget({
+          userId: viewAs,
           name: r.user.display_name,
           role: r.user.role,
           layout: ordered,
@@ -173,6 +175,7 @@ export function HomePage() {
         });
       })
       .catch((e) => {
+        if (!alive) return;
         toast.error(formatError(e));
         setSearchParams({}, { replace: true });
       });
@@ -195,7 +198,7 @@ export function HomePage() {
   }, [authed, isManagerUp]);
 
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || viewAs) return;
     let alive = true;
     Promise.all([
       api.dashboard.widgetsCatalog().catch(() => ({ widgets: [] as Array<{ id: string }> })),
@@ -224,14 +227,14 @@ export function HomePage() {
     return () => {
       alive = false;
     };
-  }, [authed]);
+  }, [authed, viewAs]);
 
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || viewAs) return;
     fetchAgents();
 
     void fetchInboxCount();
-  }, [authed, fetchAgents, fetchInboxCount]);
+  }, [authed, viewAs, fetchAgents, fetchInboxCount]);
 
 
   // ── edit actions ──
@@ -267,6 +270,30 @@ export function HomePage() {
     const bound = new Set(viewTarget.boundAgents);
     return agents.filter((a) => bound.has(a.name));
   }, [agents, viewing, viewTarget]);
+
+  if (viewAs) {
+    const target = viewTarget?.userId === viewAs ? viewTarget : null;
+    return (
+      <div className="mx-auto w-full max-w-6xl space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-warning/40 bg-warning/10 px-4 py-2.5">
+          <span className="flex items-center gap-2 text-sm text-foreground">
+            <Eye className="size-4 shrink-0 text-warning" />
+            {target
+              ? intl.formatMessage({ id: 'home.viewAs.banner' }, { name: target.name })
+              : intl.formatMessage({ id: 'common.loading' })}
+          </span>
+          <Button variant="secondary" size="sm" onClick={() => setSearchParams({}, { replace: true })}>
+            <X />{intl.formatMessage({ id: 'home.viewAs.exit' })}
+          </Button>
+        </div>
+        {target && (
+          <p role="status" className="text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'home.viewAs.unavailable' })}
+          </p>
+        )}
+      </div>
+    );
+  }
 
   const renderWidget = (id: string): ReactNode => {
     switch (id) {
@@ -376,7 +403,7 @@ export function HomePage() {
           進主控台的入口". Hidden in view-as mode, same rule as the two blocks
           below: this reads as the VIEWER's own action, not the impersonated
           user's. */}
-      {!viewing && (
+      {!viewing && user?.role === 'admin' && (
         <button
           type="button"
           onClick={() => navigate('/console')}

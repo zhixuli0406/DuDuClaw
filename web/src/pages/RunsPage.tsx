@@ -18,6 +18,7 @@ import { formatThinkingDuration, formatThinkingTokens } from '@/components/chat/
 import { useUrlState, useUrlStateNullable } from '@/lib/use-url-state';
 import {
   cardsForEvents,
+  displayRunText,
   isRunLive,
   relativeParts,
   runDurationSecs,
@@ -79,6 +80,7 @@ const CHANNEL_NAMES: Record<string, string> = {
 function statusDotClass(status: RunStatus | string): string {
   if (status === 'running') return 'bg-brand';
   if (status === 'completed') return 'bg-success';
+  if (status === 'failed') return 'bg-destructive';
   return 'bg-muted-foreground';
 }
 
@@ -350,7 +352,7 @@ export function RunsPage() {
                         <span className={cn('size-1.5 shrink-0 rounded-full', statusDotClass(r.status))} aria-hidden />
                       </span>
                       <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-                        {r.preview || intl.formatMessage({ id: 'runs.preview.empty' })}
+                        {displayRunText(r.preview ?? '') || intl.formatMessage({ id: 'runs.preview.empty' })}
                       </span>
                       <span className="mt-1 flex items-center gap-2 text-xs text-muted-foreground/70">
                         <span>{channelLabel(r.channel)}</span>

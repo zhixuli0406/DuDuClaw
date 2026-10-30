@@ -55,12 +55,14 @@ impl RouteState {
 enum Operation {
     Call,
     Assign,
+    SystemOperation,
 }
 impl Operation {
-    fn right(&self) -> duduclaw_core::HumanRight {
+    fn right(&self) -> Option<duduclaw_core::HumanRight> {
         match self {
-            Self::Call => duduclaw_core::HumanRight::Call,
-            Self::Assign => duduclaw_core::HumanRight::Assign,
+            Self::Call => Some(duduclaw_core::HumanRight::Call),
+            Self::Assign => Some(duduclaw_core::HumanRight::Assign),
+            Self::SystemOperation => None,
         }
     }
 }
@@ -123,18 +125,21 @@ async fn handle(
     };
     // The existing employee-tree check runs before this request in MCP;
     // this route only narrows human rights and does not dispatch anything.
-    let allowed = match principal.as_deref() {
-        None => true,
-        Some(raw) => match duduclaw_core::HumanPrincipal::parse(raw) {
-            Ok(p) => super::access::principal_permits_with_team(
-                &state.home,
-                &p,
-                &request.target,
-                request.operation.right(),
-                state.team_enabled().await,
-            )
-            .unwrap_or(false),
-            Err(_) => false,
+    let allowed = match request.operation.right() {
+        None => request.target == caller.agent_id
+            && super::access::system_operation_permitted(&state.home, principal.as_deref()),
+        Some(right) => match principal.as_deref() {
+            None => true,
+            Some(raw) => match duduclaw_core::HumanPrincipal::parse(raw) {
+                Ok(p) => super::access::principal_permits_with_team(
+                    &state.home,
+                    &p,
+                    &request.target,
+                    right,
+                    state.team_enabled().await,
+                ).unwrap_or(false),
+                Err(_) => false,
+            },
         },
     };
     if !allowed

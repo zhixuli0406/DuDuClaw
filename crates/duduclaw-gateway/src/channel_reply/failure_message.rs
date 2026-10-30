@@ -349,3 +349,92 @@ pub(super) fn classify_cli_error_hint(err: &str) -> &'static str {
     }
 }
 
+
+/// Operator details require a live Admin identity. Unknown/public origins
+/// fail closed; an internal job without a human keeps its existing tools.
+pub(super) fn operator_machine_access_allowed(home: &Path, session: &str) -> bool {
+    use crate::session_origin::OriginKind;
+    if crate::on_behalf_of::current().is_none()
+        && crate::session_origin::origin_for_current_turn(session).kind() == OriginKind::Internal
+    {
+        return true;
+    }
+    operator_diagnostics_allowed(home, session)
+}
+
+pub(super) fn operator_diagnostics_allowed(home: &Path, session: &str) -> bool {
+    use crate::session_origin::OriginKind;
+    let origin = crate::session_origin::origin_for_current_turn(session);
+    if matches!(origin.kind(), OriginKind::PublicVisitor | OriginKind::WebchatVisitor | OriginKind::Unknown) {
+        return false;
+    }
+    let Some(principal) = crate::on_behalf_of::current()
+        .and_then(|p| duduclaw_core::HumanPrincipal::parse(&p).ok()) else { return false; };
+    let duduclaw_core::HumanPrincipal::User(id) = principal else { return false; };
+    let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return false; };
+    db.get_user(&id).ok().flatten().is_some_and(|u| {
+        u.role == duduclaw_auth::models::UserRole::Admin
+            && matches!(u.status, duduclaw_auth::models::UserStatus::Active)
+            && !u.must_change_password
+    })
+}
+
+pub(super) fn operator_access_refusal(language: Option<&str>) -> &'static str {
+    match language.unwrap_or("zh-TW") {
+        "en" => "Only an administrator can use this AI employee to operate the machine. Please choose another AI employee for your work.",
+        "ja" | "ja-JP" => "この AI スタッフで機器を操作できるのは管理者だけです。業務には別の AI スタッフを選んでください。",
+        _ => "只有系統管理員可以透過這位 AI 員工操作機器。請改用其他 AI 員工處理工作。",
+    }
+}
+
+pub(super) fn end_user_failure_message(agent: &str, reason: FailureReason, language: Option<&str>) -> String {
+    match (language.unwrap_or("zh-TW"), reason) {
+        ("en", FailureReason::Timeout) => format!("{agent} took too long to respond. Please try again later or split the work into smaller steps."),
+        ("en", _) => format!("{agent} cannot respond right now. Please try again later; if this continues, contact an administrator."),
+        ("ja" | "ja-JP", FailureReason::Timeout) => format!("{agent} の応答が時間切れになりました。時間をおいて再試行するか、作業を小さな手順に分けてください。"),
+        ("ja" | "ja-JP", _) => format!("{agent} は現在応答できません。時間をおいて再試行し、問題が続く場合は管理者に連絡してください。"),
+        (_, FailureReason::Timeout) => format!("{agent} 這次處理逾時，請稍後重試，或將工作拆成較小的步驟。"),
+        _ => format!("{agent} 暫時無法回應，請稍後再試；若持續發生，請聯絡管理員。"),
+    }
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn machine_operations_require_live_active_admin_and_public_origins_never_get_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password", duduclaw_auth::models::UserRole::Admin).unwrap();
+        let employee = db.create_user("employee@example.invalid", "Employee", "isolated-test-password", duduclaw_auth::models::UserRole::Employee).unwrap();
+        assert!(!admin.must_change_password, "a newly enrolled test account is usable");
+        for (user, allowed) in [(&admin, true), (&employee, false)] {
+            crate::on_behalf_of::scope_first(Some(format!("user:{}", user.id)), async {
+                crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(user.id.clone(), async {
+                    assert_eq!(operator_machine_access_allowed(dir.path(), "webchat:account:connection"), allowed);
+                    assert_eq!(operator_diagnostics_allowed(dir.path(), "webchat:account:connection"), allowed);
+                    assert!(!operator_machine_access_allowed(dir.path(), "odoolivechat:1:42"));
+                    assert!(!operator_diagnostics_allowed(dir.path(), "odoolivechat:1:42"));
+                }).await;
+            }).await;
+        }
+        assert!(!operator_machine_access_allowed(dir.path(), "webchat:visitor"));
+        assert!(!operator_machine_access_allowed(dir.path(), "unknown:visitor"));
+        assert!(operator_machine_access_allowed(dir.path(), "cron:worker"));
+        for reason in [FailureReason::SpawnError, FailureReason::Unknown, FailureReason::AuthFailed] {
+            let text = end_user_failure_message("Worker", reason, None);
+            assert!(!text.contains("debug.log") && !text.contains("~/") && !text.contains("http"));
+        }
+        for language in ["en", "ja-JP", "zh-TW"] {
+            let text = end_user_failure_message("Worker", FailureReason::SpawnError, Some(language));
+            assert!(!text.contains("debug.log") && !text.contains("~/"));
+            assert!(!operator_access_refusal(Some(language)).is_empty());
+        }
+        rusqlite::Connection::open(dir.path().join("users.db")).unwrap()
+            .execute("UPDATE users SET status='suspended' WHERE id=?1", [&admin.id]).unwrap();
+        crate::on_behalf_of::scope_first(Some(format!("user:{}", admin.id)), async {
+            assert!(!operator_machine_access_allowed(dir.path(), "line:admin"));
+        }).await;
+    }
+}

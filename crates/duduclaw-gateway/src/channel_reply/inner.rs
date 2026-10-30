@@ -332,6 +332,13 @@ pub(super) async fn build_reply_with_session_inner(
         .map(|a| a.config.container.sandbox_enabled)
         .unwrap_or(false);
 
+    if capabilities.as_ref().is_some_and(|c| c.system_operator)
+        && !operator_machine_access_allowed(&ctx.home_dir, session_id)
+    {
+        let language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
+        return operator_access_refusal(language.as_deref()).to_string();
+    }
+
     // ── O-4: system-operator routing ────────────────────────────────────
     // ONLY for an agent explicitly opted in via `[capabilities]
     // system_operator = true` (the same capability O-0's MCP dispatch gate
@@ -3763,6 +3770,12 @@ pub(super) async fn build_reply_with_session_inner(
         "Channel reply fallback — all providers failed"
     );
 
+    if let (Some(message_id), Some(store)) = (user_message_id, crate::run_steps::shared_store(&ctx.home_dir)) {
+        if let Err(error) = store.record_channel_failure(session_id, message_id) {
+            warn!(error = %error, "Failed to close channel run after provider failure");
+        }
+    }
+
     // D7 (2026-09-08 incident): an auth-class total failure is an outage, not
     // a bad minute — schedules and replies stay dead until a human pastes a
     // new token. Alarm once per outage; `record_outage` debounces and
@@ -3833,6 +3846,9 @@ pub(super) async fn build_reply_with_session_inner(
     // reach them. The audit row above keeps the real reason.
     if crate::odoo_livechat::is_public_visitor_session(session_id) {
         return crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.to_string();
+    }
+    if !operator_diagnostics_allowed(&ctx.home_dir, session_id) {
+        return end_user_failure_message(&name, reason, default_language.as_deref());
     }
     // The spawn gate already wrote its own audit event; the person sees the
     // gate's sentence (which names the employee and asks the operator to

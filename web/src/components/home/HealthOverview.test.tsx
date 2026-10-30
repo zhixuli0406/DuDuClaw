@@ -97,3 +97,14 @@ it('never renders the raw spawn failure payload on Home', async () => {
   expect(await screen.findByText("staff's work did not finish")).toBeInTheDocument();
   expect(screen.queryByText(/preflight|Claude Code/)).toBeNull();
 });
+
+
+it('links webchat failures to the same run as Inbox', async () => {
+  useAuthStore.setState({ user: null, bindings: [], isAuthenticated: false });
+  mockWsClient.call.mockReset();
+  mockWsClient.call.mockImplementation((method: string) => method === 'audit.unified_log'
+    ? Promise.resolve({ events: [{ agent_id: 'staff', timestamp: new Date().toISOString(), event_type: 'channel_reply_fallback', summary: '{}', details: { channel_failure: { channel: 'webchat', run_id: 'run:42' } } }] })
+    : Promise.resolve({}));
+  renderWithProviders(<HealthOverview agents={[]} enabled />);
+  expect(await screen.findByRole('link', { name: /staff's work did not finish/ })).toHaveAttribute('href', '/runs?run=run%3A42');
+});

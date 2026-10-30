@@ -31,15 +31,12 @@ pub struct Accepted {
     pub brand: Brand,
 }
 
-static VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
 static FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 static ACCEPTED: RwLock<Option<Accepted>> = RwLock::new(None);
 
 /// The verified runtime identity, or original-brand fallback.
 pub fn current() -> Option<Accepted> {
-    if !VISIBLE.load(std::sync::atomic::Ordering::Acquire) { return None; }
     ACCEPTED
         .read()
         .ok()
@@ -47,7 +44,6 @@ pub fn current() -> Option<Accepted> {
 }
 
 fn set(value: Option<Accepted>) {
-    VISIBLE.store(true, std::sync::atomic::Ordering::Release);
     if let Ok(mut guard) = ACCEPTED.write() {
         *guard = value;
     }
@@ -243,7 +239,8 @@ pub fn interpret(
         return Err("distributor brand response nonce missing or mismatched".into());
     }
     match body.get("distributor_brand") {
-        None | Some(serde_json::Value::Null) => Ok((FeedOutcome::NoOpinion, None)),
+        None => Err("distributor brand response is missing distributor_brand".into()),
+        Some(serde_json::Value::Null) => Ok((FeedOutcome::NoOpinion, None)),
         Some(value) => {
             let doc: SignedDistributorBrand = serde_json::from_value(value.clone())
                 .map_err(|e| format!("distributor brand malformed: {e}"))?;
@@ -327,7 +324,8 @@ fn apply_feed(
             }
             set(Some(accepted));
         }
-        _ => reset(home),
+        (FeedOutcome::NoOpinion, None) => reset(home),
+        _ => return Err("distributor brand feed is inconsistent".into()),
     }
     Ok(())
 }
@@ -337,8 +335,56 @@ mod persistence_tests {
     use super::*;
     use super::super::tests::{doc, setup};
 
+    static RUNTIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn failed_poll_keeps_the_verified_brand_and_cache() {
+        let _guard = RUNTIME_TEST_LOCK.lock().unwrap();
+        let (key, registry) = setup();
+        let home = tempfile::tempdir().unwrap();
+        let signed = doc(&key, 5);
+        let accepted = accept(&registry, "sub_1", &signed, None).unwrap();
+        store(home.path(), &signed, &accepted).unwrap();
+        load_cached(home.path(), &registry, Some("sub_1"));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // An invalid endpoint fails deterministically without making a network request.
+        let result = runtime.block_on(fetch_once(
+            "invalid-url", home.path(), &registry, "sub_1", "machine_1",
+        ));
+        assert!(result.is_err());
+        assert_eq!(current(), Some(accepted.clone()));
+        assert_eq!(read_cached(home.path(), &registry, "sub_1").unwrap(), Some(accepted));
+        reset(home.path());
+    }
+
+    #[test]
+    fn missing_or_invalid_feed_does_not_clear_a_verified_brand() {
+        let _guard = RUNTIME_TEST_LOCK.lock().unwrap();
+        let (key, registry) = setup();
+        let home = tempfile::tempdir().unwrap();
+        let signed = doc(&key, 5);
+        let accepted = accept(&registry, "sub_1", &signed, None).unwrap();
+        apply_feed(home.path(), None, FeedOutcome::Accept(accepted.clone()), Some(signed.clone())).unwrap();
+        for body in [
+            serde_json::json!({"nonce": "n1"}),
+            serde_json::json!({"nonce": "wrong", "distributor_brand": null}),
+            serde_json::json!({"nonce": "n1", "distributor_brand": {"product_name": "forged"}}),
+        ] {
+            assert!(interpret(&registry, "sub_1", "n1", &body, Some(&accepted)).is_err());
+            assert_eq!(current(), Some(accepted.clone()));
+        }
+        // A cached document that no longer verifies is still refused on load.
+        let mut tampered = signed;
+        tampered.product_name = "Tampered".into();
+        std::fs::write(cache_path(home.path()), serde_json::to_vec(&tampered).unwrap()).unwrap();
+        load_cached(home.path(), &registry, Some("sub_1"));
+        assert_eq!(current(), None);
+        reset(home.path());
+    }
+
     #[test]
     fn null_feed_immediately_clears_runtime_and_cache_but_keeps_watermark() {
+        let _guard = RUNTIME_TEST_LOCK.lock().unwrap();
         let (key, registry) = setup();
         let home = tempfile::tempdir().unwrap();
         let signed = doc(&key, 5);
@@ -386,17 +432,13 @@ mod persistence_tests {
     }
 }
 
-/// Fail closed on any failed refresh, while retaining the rollback watermark.
+/// A failed refresh leaves the last verified brand and rollback watermark intact.
 pub async fn fetch_once(
     control_url: &str, home: &Path, registry: &PublicKeyRegistry,
     subscription_id: &str, machine_fingerprint: &str,
 ) -> Result<(), String> {
     let _fetch_guard = FETCH_LOCK.lock().await;
-    let result = fetch_inner(control_url, home, registry, subscription_id, machine_fingerprint).await;
-    if result.is_err() {
-        VISIBLE.store(false, std::sync::atomic::Ordering::Release);
-    }
-    result
+    fetch_inner(control_url, home, registry, subscription_id, machine_fingerprint).await
 }
 
 /// Fetch right away (after a new license is installed), in the background.
@@ -432,7 +474,7 @@ pub async fn poll_loop(runtime: crate::license_runtime::LicenseRuntime) {
             )
             .await
             {
-                warn!(%error, "distributor brand fetch failed; using the original brand");
+                warn!(%error, "distributor brand fetch failed; keeping the current verified brand");
             }
         } else {
             debug!("no license installed; distributor brand fetch skipped");

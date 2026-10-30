@@ -768,6 +768,7 @@ export interface ChatCredential {
   service_source: string | null;
   source_kind: string;
   source_ref: string;
+  source_ordinal?: number;
   provided_by: string;
   status: ChatCredentialStatus;
   first_seen_at: string;

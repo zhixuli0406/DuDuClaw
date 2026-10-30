@@ -118,3 +118,17 @@ pub fn check(
         }
     }
 }
+
+/// Machine tools require the live human administrator, independently of the
+/// delegation mode. `None` is allowed only after the caller proves a
+/// gateway-registered background context at the signed authority route.
+pub(crate) fn system_operation_permitted(home: &Path, principal: Option<&str>) -> bool {
+    let Some(raw) = principal else { return true; };
+    let Ok(HumanPrincipal::User(id)) = HumanPrincipal::parse(raw) else { return false; };
+    let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return false; };
+    db.get_user(&id).ok().flatten().is_some_and(|u| {
+        u.role == duduclaw_auth::UserRole::Admin
+            && matches!(u.status, duduclaw_auth::models::UserStatus::Active)
+            && !u.must_change_password
+    })
+}

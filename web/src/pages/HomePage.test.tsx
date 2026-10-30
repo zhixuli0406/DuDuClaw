@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router';
+import { IntlProvider } from 'react-intl';
+import en from '@/i18n/en.json';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -44,6 +47,35 @@ beforeEach(() => {
 });
 
 describe('HomePage (WP1.5)', () => {
+  it('never renders viewer widgets while another dashboard is loading or unavailable', async () => {
+    useAuthStore.setState({ user: { id: 'u1', display_name: 'Alice', role: 'admin' } as never });
+    let resolveView!: (value: unknown) => void;
+    const pendingView = new Promise((resolve) => { resolveView = resolve; });
+    mockWsClient.call.mockImplementation((method) => method === 'dashboard.layout.view'
+      ? pendingView
+      : Promise.resolve({ widgets: [{ id: 'needs_me' }, { id: 'my_tasks' }], layout: null, tasks: [], users: [], count: 99, available: false }));
+    render(
+      <IntlProvider messages={en} locale="en">
+        <MemoryRouter initialEntries={['/?view_as=bob']}><HomePage /></MemoryRouter>
+      </IntlProvider>,
+    );
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+    expect(screen.queryByText('Cost (24h)')).not.toBeInTheDocument();
+    expect(screen.queryByText('Edit layout')).not.toBeInTheDocument();
+    resolveView({
+      user: { display_name: 'Bob', role: 'employee' },
+      widgets: [{ id: 'needs_me' }, { id: 'my_tasks' }],
+      layout: { widgets: [{ id: 'needs_me', hidden: false }, { id: 'my_tasks', hidden: false }] },
+      bound_agents: [], custom_widgets: [],
+    });
+    expect(await screen.findByText("This member's dashboard data is not available here.")).toBeInTheDocument();
+    expect(screen.getByText(/Viewing Bob's personal dashboard/)).toBeInTheDocument();
+    for (const label of ['Alice', 'Cost (24h)', 'Edit layout', 'Recent tasks']) {
+      expect(screen.queryByText(label)).not.toBeInTheDocument();
+    }
+    expect(mockWsClient.call.mock.calls.map(([method]) => method)).not.toContain('dashboard.layout.get');
+  });
+
   it('renders the greeting line and the usage KPI strip for an admin', async () => {
     useAuthStore.setState({ user: { id: 'u1', display_name: 'Alice', role: 'admin' } as never });
     renderWithProviders(<HomePage />);

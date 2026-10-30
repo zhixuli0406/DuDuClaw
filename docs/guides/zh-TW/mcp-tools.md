@@ -36,6 +36,8 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `[responsibilities] enabled` | `config.toml` | 隱藏 3 個 `responsibility_*`（見下方[持續任務工具](#responsibility_get--responsibility_followup--responsibility_ask持續任務工具)） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有效授權 | 在階段性授權生效前一律隱藏 |
 
+機器操作主控台（`/console`）只開放給管理員。`system_operator` 員工執行機器操作工具時，伺服器也會確認交辦人仍是啟用中的管理員；其他 AI 員工的一般對話仍依原有授權使用。
+
 新建的 AI 員工以上全部都沒開，這正是重點：預設部署只為自己用得到的工具付費。
 
 ### 中途變更如何傳到 AI 員工

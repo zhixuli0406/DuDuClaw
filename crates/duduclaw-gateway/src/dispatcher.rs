@@ -430,8 +430,12 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                 missing,
             );
         }
-        let dispatch_fut =
-            dispatch_to_agent_outcome(home_dir, registry, &msg.target, &msg.payload, &delegation);
+        // Keep the runtime off the stack before moving it through the scopes
+        // below. In debug builds those moves inflate this poll frame enough
+        // to overflow a 2 MiB worker during the nested spawn budget check.
+        let dispatch_fut = Box::pin(
+            dispatch_to_agent_outcome(home_dir, registry, &msg.target, &msg.payload, &delegation),
+        );
         // v1.10: scope wiki RL trust feedback context so the sub-agent's
         // wiki RAG citations land in the same tracker bucket as the
         // originating turn. Pulled from `message_queue.{turn_id, session_id}`
@@ -1086,7 +1090,10 @@ async fn poll_and_dispatch(
             // "Stop blocks late spawns" analog). See the invalidation call
             // after this dispatch resolves.
             let turn_id_for_admission_invalidate = turn_id_for_scope.clone();
-            let dispatch_fut = dispatch_to_agent_outcome(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
+            // The legacy queue needs the same boundary as the SQLite queue.
+            let dispatch_fut = Box::pin(dispatch_to_agent_outcome(
+                &home, &reg, &msg.agent_id, &msg.payload, &delegation_env,
+            ));
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
@@ -5880,3 +5887,7 @@ mod budget_refusal_tests {
         assert!(!reply.contains("請稍後再試"));
     }
 }
+
+#[cfg(test)]
+#[path = "dispatcher_stack_tests.rs"]
+mod dispatch_stack_tests;
