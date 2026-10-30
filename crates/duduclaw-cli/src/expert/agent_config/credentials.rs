@@ -26,6 +26,20 @@ fn mask_doc_with(
 /// Settings retain their meaning or are refused, never silently rewritten.
 pub(crate) fn reject_settings(settings: &toml::Table) -> Result<()> {
     fn walk(value: &toml::Value, path: &str, field: &str) -> Result<()> {
+        let normalized: String = field.chars().filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase).collect();
+        let secret_field = matches!(normalized.as_str(), "password" | "passwd" | "pwd" | "token"
+            | "apikey" | "secret" | "clientsecret" | "accesstoken" | "refreshtoken"
+            | "authorization" | "connectionstring" | "privatekey");
+        let non_empty = match value {
+            toml::Value::String(text) => !text.is_empty(),
+            toml::Value::Array(values) => !values.is_empty(),
+            toml::Value::Table(table) => !table.is_empty(),
+            _ => true,
+        };
+        if secret_field && non_empty {
+            return Err(cfg_err(format!("設定欄位 {path} 含憑證，未匯入")));
+        }
         match value {
             toml::Value::Table(table) => for (key, value) in table {
                 let masked = duduclaw_security::credential_detect::mask_document(key).map_err(|_| scan_error())?;
@@ -39,12 +53,7 @@ pub(crate) fn reject_settings(settings: &toml::Table) -> Result<()> {
                 let key = field;
                 let probe = format!("{key}: {text}");
                 let masked = duduclaw_security::credential_detect::mask_document(&probe).map_err(|_| scan_error())?;
-                let normalized: String = key.chars().filter(|c| c.is_ascii_alphanumeric())
-                    .flat_map(char::to_lowercase).collect();
-                let secret_field = matches!(normalized.as_str(), "password" | "passwd" | "pwd" | "token"
-                    | "apikey" | "secret" | "clientsecret" | "accesstoken" | "refreshtoken"
-                    | "authorization" | "connectionstring" | "privatekey");
-                if masked != probe || (secret_field && !text.is_empty()) {
+                if masked != probe {
                     return Err(cfg_err(format!("設定欄位 {path} 含憑證，未匯入")));
                 }
             },
@@ -148,8 +157,33 @@ mod tests {
         assert!(!error.contains("hunter2") && !error.contains("synthetic-value"));
         let settings = toml::from_str("[environment]\npassword = ['hunter2']").unwrap();
         let error = reject_settings(&settings).unwrap_err().to_string();
-        assert!(error.contains("duduclaw.environment.password[0]"));
+        assert!(error.contains("duduclaw.environment.password"));
         assert!(!error.contains("hunter2"));
+    }
+
+    #[test]
+    fn secret_fields_refuse_all_non_empty_value_types() {
+        for value in ["12345678", "0.25", "false", "1979-05-27T07:32:00Z",
+            "[12345678]", "{ nested = 12345678 }", "['']"] {
+            let settings = toml::from_str(&format!("password = {value}")).unwrap();
+            let error = reject_settings(&settings).unwrap_err().to_string();
+            assert!(error.contains("duduclaw.password"));
+            assert!(!error.contains(value));
+        }
+        let settings = toml::from_str("token = [12345678]").unwrap();
+        assert!(reject_settings(&settings).is_err());
+        let settings = toml::from_str("password = ''\ntoken = []\nsecret = {}").unwrap();
+        assert!(reject_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn document_mask_keeps_ambiguous_navigation_queries() {
+        for query in ["session=overview", "key=value", "sign=up"] {
+            let url = format!("https://example.com/?{query}");
+            let mut doc = Doc::new("USER.md", &url);
+            mask_doc(&mut doc).unwrap();
+            assert_eq!(doc.text, url);
+        }
     }
 
     #[test]

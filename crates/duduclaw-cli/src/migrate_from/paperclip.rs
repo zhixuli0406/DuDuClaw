@@ -366,15 +366,17 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
             .join("wiki")
             .join("imported")
             .join("paperclip-company.md");
-        if ctx.apply {
-            let ok = std::fs::create_dir_all(dest.parent().unwrap())
-                .and_then(|_| std::fs::copy(&company, &dest).map(|_| ()));
-            match ok {
-                Ok(()) => report.imported("wiki", "paperclip-company.md"),
-                Err(e) => report.skipped("wiki", "COMPANY.md", format!("複製失敗: {e}")),
+        match read_masked_text(&company) {
+            Ok(content) if ctx.apply => {
+                let ok = std::fs::create_dir_all(dest.parent().unwrap())
+                    .and_then(|_| std::fs::write(&dest, content));
+                match ok {
+                    Ok(()) => report.imported("wiki", "paperclip-company.md"),
+                    Err(e) => report.skipped("wiki", "COMPANY.md", format!("複製失敗: {e}")),
+                }
             }
-        } else {
-            report.imported("wiki", "paperclip-company.md");
+            Ok(_) => report.imported("wiki", "paperclip-company.md"),
+            Err(_) => report.skipped("wiki", "COMPANY.md", "讀取或憑證遮罩失敗，未匯入"),
         }
     } else {
         report.skipped("wiki", "COMPANY.md", "匯出目錄內無 COMPANY.md");

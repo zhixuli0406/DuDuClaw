@@ -342,8 +342,8 @@ pub(super) async fn scaffold_agent(
     }
 }
 
-/// Copy + install skill directories after running each SKILL.md through the
-/// prompt-injection scanner. A flagged skill is NOT installed (SKIPPED-security).
+/// Preflight and mask every bounded UTF-8 file before installing a skill.
+/// A flagged SKILL.md or any read/masking failure refuses the whole skill.
 pub(super) fn install_skills(
     ctx: &Ctx,
     report: &mut Report,
@@ -355,10 +355,17 @@ pub(super) fn install_skills(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unknown-skill".to_string());
-        let skill_md = sd.join("SKILL.md");
-        let content = match std::fs::read_to_string(&skill_md) {
-            Ok(c) => c,
+        let files = match masked_skill_files(sd) {
+            Ok(files) => files,
             Err(_) => {
+                report.skipped("skill", &name, "讀取或憑證遮罩失敗，未匯入");
+                continue;
+            }
+        };
+        let content = match files.iter().find(|(path, _, _)| path == Path::new("SKILL.md"))
+            .and_then(|(_, bytes, _)| std::str::from_utf8(bytes).ok()) {
+            Some(content) => content,
+            None => {
                 report.skipped("skill", &name, "找不到或無法讀取 SKILL.md");
                 continue;
             }
@@ -366,7 +373,7 @@ pub(super) fn install_skills(
 
         // Fail-closed injection scan (duduclaw-security, 6 rule categories).
         let scan = duduclaw_security::input_guard::scan_input(
-            &content,
+            content,
             duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
         );
         if scan.blocked {
@@ -392,11 +399,71 @@ pub(super) fn install_skills(
             .join(agent_id)
             .join("SKILLS")
             .join(&name);
-        match copy_dir_recursive(sd, &dest) {
+        let copied = files.iter().try_for_each(|(path, bytes, permissions)| {
+            let target = dest.join(path);
+            std::fs::create_dir_all(target.parent().unwrap())?;
+            std::fs::write(&target, bytes)?;
+            std::fs::set_permissions(target, permissions.clone())
+        });
+        match copied {
             Ok(()) => report.imported("skill", &name),
             Err(e) => report.skipped("skill", &name, format!("複製失敗: {e}")),
         }
     }
+}
+
+/// Bound reads even if a source grows after its metadata was checked.
+fn read_bounded_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let limit = crate::expert::agent_config::md::MAX_TEXT_BYTES;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() > limit {
+        return Err(std::io::Error::other("來源不是一般檔案或超過大小限制"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other("來源超過大小限制"));
+    }
+    Ok(bytes)
+}
+
+pub(super) fn read_masked_text(path: &Path) -> std::io::Result<String> {
+    let text = String::from_utf8(read_bounded_file(path)?)
+        .map_err(|_| std::io::Error::other("來源不是 UTF-8 文字"))?;
+    duduclaw_security::credential_detect::mask_document(&text)
+        .map_err(|_| std::io::Error::other("憑證遮罩失敗，未匯入"))
+}
+
+fn masked_skill_files(root: &Path) -> std::io::Result<Vec<(PathBuf, Vec<u8>, std::fs::Permissions)>> {
+    fn collect(root: &Path, dir: &Path, files: &mut Vec<(PathBuf, Vec<u8>, std::fs::Permissions)>) -> std::io::Result<()> {
+        if !std::fs::symlink_metadata(dir)?.is_dir() {
+            return Err(std::io::Error::other("技能來源不是目錄"));
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let path = entry.path();
+            if kind.is_dir() {
+                collect(root, &path, files)?;
+            } else if kind.is_file() {
+                let bytes = read_bounded_file(&path)?;
+                let bytes = match std::str::from_utf8(&bytes) {
+                    Ok(text) => duduclaw_security::credential_detect::mask_document(text)
+                        .map_err(|_| std::io::Error::other("憑證遮罩失敗，未匯入"))?.into_bytes(),
+                    Err(_) => bytes,
+                };
+                let relative = path.strip_prefix(root)
+                    .map_err(|_| std::io::Error::other("技能來源路徑無效"))?;
+                files.push((relative.to_path_buf(), bytes, std::fs::metadata(&path)?.permissions()));
+            }
+            // Preserve the existing refusal to traverse links or special files.
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    collect(root, root, &mut files)?;
+    Ok(files)
 }
 
 /// Archive verbatim source files/dirs into `imported/<platform>/raw/<label>`.
@@ -580,7 +647,67 @@ pub(super) fn import_wiki_page(
 
 #[cfg(test)]
 mod copy_dir_tests {
-    use super::copy_dir_recursive;
+    use super::*;
+
+    #[test]
+    fn skill_files_are_masked_before_writing() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("references")).unwrap();
+        std::fs::write(src.path().join("SKILL.md"), "A simple skill.").unwrap();
+        std::fs::write(src.path().join("references/notes.md"), "password: hunter2").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(src.path().join("references/notes.md"),
+                std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let home = tempfile::tempdir().unwrap();
+        let ctx = Ctx { home: home.path().to_path_buf(), platform: Platform::OpenClaw,
+            apply: true, confirm_profile: None, rename: false, agent: None, redact: true };
+        let mut report = Report::new("openclaw", "source", true);
+        install_skills(&ctx, &mut report, "alice", &[src.path().to_path_buf()]);
+        assert!(matches!(report.items[0].status, super::super::report::Status::Imported));
+        let name = src.path().file_name().unwrap();
+        let installed = home.path().join("agents/alice/SKILLS").join(name);
+        let text = std::fs::read_to_string(installed.join("references/notes.md")).unwrap();
+        assert!(!text.contains("hunter2"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(installed.join("references/notes.md"))
+                .unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        assert_eq!(std::fs::read_to_string(src.path().join("references/notes.md")).unwrap(),
+            "password: hunter2");
+    }
+
+    #[test]
+    fn masking_failure_refuses_the_skill_before_any_copy() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("SKILL.md"), "A simple skill.").unwrap();
+        std::fs::write(src.path().join("notes.md"),
+            duduclaw_security::credential_detect::UNAVAILABLE_MASK).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ctx = Ctx { home: home.path().to_path_buf(), platform: Platform::OpenClaw,
+            apply: true, confirm_profile: None, rename: false, agent: None, redact: true };
+        let mut report = Report::new("openclaw", "source", true);
+        install_skills(&ctx, &mut report, "alice", &[src.path().to_path_buf()]);
+        assert!(matches!(report.items[0].status, super::super::report::Status::Skipped(_)));
+        assert!(!home.path().join("agents").exists());
+    }
+
+    #[test]
+    fn company_text_is_bounded_utf8_and_masked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("COMPANY.md");
+        std::fs::write(&path, "password: hunter2").unwrap();
+        assert!(!read_masked_text(&path).unwrap().contains("hunter2"));
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(read_masked_text(&path).is_err());
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::expert::agent_config::md::MAX_TEXT_BYTES + 1).unwrap();
+        assert!(read_masked_text(&path).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

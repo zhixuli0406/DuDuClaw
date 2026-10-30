@@ -197,7 +197,7 @@ fn redact_word<'a>(word: &'a str, prev_word: Option<&str>, count: &mut usize) ->
 /// Words that mark a query parameter as carrying a credential. Matched on
 /// **whole words** after splitting the name on `_`, `-` and `.` — a substring
 /// match would fire on `monkey` (key), `design` / `assign` (sign) and
-/// `authority` (auth).
+/// `authority` (auth). Ambiguous words also require a credential-shaped value.
 const SENSITIVE_PARAM_WORDS: &[&str] = &[
     "secret",
     "secrets",
@@ -230,14 +230,31 @@ const SENSITIVE_PARAM_EXACT: &[&str] = &[
     "authtoken",   //
 ];
 
-fn is_sensitive_param(name: &str) -> bool {
+fn is_sensitive_param(name: &str, value: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     if SENSITIVE_PARAM_EXACT.contains(&lower.as_str()) {
         return true;
     }
-    lower
-        .split(['_', '-', '.'])
-        .any(|w| SENSITIVE_PARAM_WORDS.contains(&w))
+    lower.split(['_', '-', '.']).any(|word| {
+        SENSITIVE_PARAM_WORDS.contains(&word)
+            && (!matches!(word, "key" | "keys" | "sign" | "signature" | "auth" | "session")
+                || looks_like_query_credential(value))
+    }) || matches!(lower.as_str(), "api_key" | "api-key" | "api.key")
+}
+
+/// Ambiguous navigation parameters need more evidence than their name.
+fn looks_like_query_credential(value: &str) -> bool {
+    if has_secret_prefix(value) || is_dotted_token_shape(value) {
+        return true;
+    }
+    let lower = value.chars().any(|c| c.is_ascii_lowercase());
+    let upper = value.chars().any(|c| c.is_ascii_uppercase());
+    let digit = value.chars().any(|c| c.is_ascii_digit());
+    let symbol = value.chars().any(|c| matches!(c, '_' | '-' | '+' | '/' | '=' | '%'));
+    value.len() >= 20
+        && value.chars().all(|c| c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '+' | '/' | '=' | '%' | '.'))
+        && [lower, upper, digit, symbol].into_iter().filter(|mixed| *mixed).count() >= 2
 }
 
 fn mask_url<'a>(url: &'a str, count: &mut usize) -> Cow<'a, str> {
@@ -270,7 +287,7 @@ fn mask_url<'a>(url: &'a str, count: &mut usize) -> Cow<'a, str> {
                 out.push('&');
             }
             match pair.split_once('=') {
-                Some((k, v)) if !v.is_empty() && is_sensitive_param(k) => {
+                Some((k, v)) if !v.is_empty() && is_sensitive_param(k, v) => {
                     out.push_str(k);
                     out.push('=');
                     let masked = mask_secret(v);
@@ -620,6 +637,22 @@ mod tests {
         let url = "https://example.com/api?monkey=curious&design=flat&assign=bob&authority=local&offset=42&keyboard=qwerty";
         let out = redact_secrets(url);
         assert_eq!(out, url, "no value should have been masked: {out}");
+    }
+
+    #[test]
+    fn ambiguous_query_params_preserve_navigation_values() {
+        for query in ["session=overview", "key=value", "sign=up"] {
+            let url = format!("https://example.com/?{query}");
+            assert_eq!(redact_secrets(&url), url);
+        }
+        for name in ["session", "key", "sign", "signature", "auth"] {
+            let url = format!("https://example.com/?{name}=AbCdEf0123456789abcdef");
+            assert!(!redact_secrets(&url).contains("AbCdEf0123456789abcdef"));
+        }
+        for name in ["password", "token", "api_key", "access_token", "client_secret"] {
+            let url = format!("https://example.com/?{name}=short");
+            assert!(!redact_secrets(&url).contains("short"));
+        }
     }
 
     #[test]
