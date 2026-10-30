@@ -12,6 +12,10 @@ v1.78.0 起，總經銷可以在授權主控台設定產品名稱與 Logo。只�
 - 名稱為 1～40 字元，不可有控制字元、換行、URL 或 `<`、`>`。Logo 只收 PNG、JPEG、WebP 的 base64 data URI，檔案 magic bytes 必須符合宣告的格式；每張解碼後上限 128 KiB。不收 SVG 或遠端圖片。任何欄位不符，整份文件都拒絕。
 - `about.get` 只在品牌有效時加上 `brand`；公開唯讀的 `GET /api/brand` 只提供 `product_name`、`logo_light`、`logo_dark`，不帶授權或客戶資訊；有效時直接回傳這三欄的物件，無效時回 `null` 並使用原廠識別。
 
+gateway 會依訂閱與經銷商，把已接受的最高版本獨立存到 `<home>/distributor_brand_versions.json`（Unix 權限 0600、原子替換）。開機先檢查高水位才顯示快取；較舊的快取會被忽略，等待有效取件替換。清除品牌或更換授權不刪除高水位。名稱與淺色 Logo 仍須為字串；沒有品牌時必須回傳整份文件 `null`，不能回傳含 `null` 必填欄位的文件。
+
+`about.get` 帶有 `brand_revision`；傳入 `{ "brand_revision_only": true }` 時只回傳這個小欄位。`/api/brand` 以 `X-Brand-Revision` 標頭提供相同版本，支援 ETag、`If-None-Match`／304 與 60 秒公開快取。每個 IP 每分鐘最多 30 次，條件式請求也計入；超限回 429 與 `Retry-After: 60`。儀表板在既有登入工作階段定期更新、重新連線與切回分頁時比對版本，桌面版每 30 分鐘重查；版本變更才重新載入品牌，回傳 `null` 時恢復 DuDuClaw。
+
 ## 顯示範圍與固定的原廠標示
 
 儀表板使用名稱與 Logo，涵蓋吉祥物位置、登入與歡迎頁、網頁標題、favicon 和 LINE QR 海報。通道頁尾、OTP 與 OAuth 頁面使用逸出後的名稱。繁體中文、英文、日文在載入翻譯時替換產品文案，法律聲明與隱私連結保留原文。CLI 與日誌維持原有名稱。

@@ -5,7 +5,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use duduclaw_license::{LicenseTier, PublicKeyRegistry};
 use ed25519_dalek::{Signer, SigningKey};
 
-fn setup() -> (SigningKey, PublicKeyRegistry) {
+pub(super) fn setup() -> (SigningKey, PublicKeyRegistry) {
     let key = SigningKey::from_bytes(&[7; 32]);
     let registry = PublicKeyRegistry::new().with_key("v1", key.verifying_key().to_bytes().to_vec());
     (key, registry)
@@ -16,7 +16,7 @@ fn sign(key: &SigningKey, mut doc: SignedDistributorBrand) -> SignedDistributorB
     doc
 }
 
-fn doc(key: &SigningKey, version: i64) -> SignedDistributorBrand {
+pub(super) fn doc(key: &SigningKey, version: i64) -> SignedDistributorBrand {
     sign(key, SignedDistributorBrand {
         kind: BRAND_KIND.into(), subscription_id: "sub_1".into(), distributor_id: "dist_1".into(),
         version, product_name: "範例 ** Brand".into(),
@@ -77,6 +77,21 @@ fn rollback_subscription_unknown_key_and_request_replay_are_refused() {
 }
 
 #[test]
+fn absent_brand_is_null_not_a_document_with_nullable_required_strings() {
+    let (key, registry) = setup();
+    for field in ["product_name", "logo_light"] {
+        let mut value = serde_json::to_value(doc(&key, 1)).unwrap();
+        value[field] = serde_json::Value::Null;
+        assert!(interpret(&registry, "sub_1", "n1", &serde_json::json!({
+            "nonce": "n1", "distributor_brand": value,
+        }), None).is_err());
+    }
+    assert_eq!(interpret(&registry, "sub_1", "n1", &serde_json::json!({
+        "nonce": "n1", "distributor_brand": null,
+    }), None).unwrap(), (FeedOutcome::NoOpinion, None));
+}
+
+#[test]
 fn invalid_cached_document_never_becomes_a_brand() {
     let (key, registry) = setup();
     let home = tempfile::tempdir().unwrap();
@@ -95,6 +110,22 @@ fn channel_escaping_preserves_default_output() {
     assert_eq!(escape_channel_name("A*_[]()!`~\\ &<>"), "A\\*\\_\\[\\]\\(\\)\\!\\`\\~\\\\ \\&\\<\\>");
     assert_eq!(escape_channel_name("@everyone"), "@\u{200b}everyone");
     assert_eq!(product_name(), "DuDuClaw");
+}
+
+#[test]
+fn brand_revision_tracks_names_logos_and_original_fallback() {
+    let (key, registry) = setup();
+    let mut brand = accept(&registry, "sub_1", &doc(&key, 1), None).unwrap().brand;
+    let original = revision(None);
+    let first = revision(Some(&brand));
+    assert_eq!(first, revision(Some(&brand.clone())));
+    assert_ne!(first, original);
+    brand.product_name = "Changed".into();
+    assert_ne!(first, revision(Some(&brand)));
+    let renamed = revision(Some(&brand));
+    brand.logo_dark = Some(brand.logo_light.clone());
+    assert_ne!(renamed, revision(Some(&brand)));
+    assert_eq!(original, revision(None));
 }
 
 #[test]

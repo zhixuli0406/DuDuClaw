@@ -229,7 +229,7 @@ impl MethodHandler {
             },
 
             // Fixed product and upstream attribution.
-            "about.get" => self.handle_about_get().await,
+            "about.get" => self.handle_about_get(params).await,
 
             // ── Distributor management (owner instance) ──────
             "distributor.status" => {

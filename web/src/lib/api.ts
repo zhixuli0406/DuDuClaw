@@ -5659,6 +5659,7 @@ export interface AboutResponse {
   vendor: SoftwareVendor;
   product_name: string;
   brand?: DistributorBrand | null;
+  brand_revision?: string;
   version: string;
   tier: string;
   /**
@@ -8838,7 +8839,7 @@ export const api = {
     get: async (): Promise<AboutResponse> => {
       const apply = beginBrandRequest();
       const about = await client.call('about.get') as AboutResponse;
-      apply(about.brand);
+      apply(about.brand, about.brand_revision);
       return about;
     },
   },

@@ -47,5 +47,12 @@ pub fn escape_channel_name(name: &str) -> String {
 
 pub fn channel_name() -> String { escape_channel_name(&product_name()) }
 
+/// Content revision shared by authenticated metadata and the public response.
+/// Includes the original-brand fallback, so clearing a brand changes revision.
+pub fn revision(brand: Option<&Brand>) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(serde_json::to_vec(&brand).expect("brand serializes")))
+}
+
 #[cfg(test)]
 mod tests;

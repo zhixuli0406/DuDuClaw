@@ -1,4 +1,4 @@
-import { loadPublicBrand, useBrandStore } from '@/stores/brand-store';
+import { loadPublicBrand, refreshBrandRevision, useBrandStore } from '@/stores/brand-store';
 import { create } from 'zustand';
 import { api, type DoctorCheck, type SystemStatus } from '@/lib/api';
 import { client } from '@/lib/ws-client';
@@ -65,5 +65,12 @@ useConnectionStore.subscribe((state, previous) => {
   if (state.state === previous.state || state.state !== 'authenticated') return;
   void useSystemStore.getState().fetchStatus();
   useBrandStore.getState().setBrand(null);
-  void loadPublicBrand();
+  void refreshBrandRevision();
 });
+
+// Returning to a long-lived tab must also notice gateway polling updates.
+if (typeof window !== 'undefined') {
+  window.addEventListener('focus', () => {
+    if (useConnectionStore.getState().state === 'authenticated') void refreshBrandRevision();
+  });
+}

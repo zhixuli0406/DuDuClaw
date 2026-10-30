@@ -1,7 +1,13 @@
 use super::*;
 
 impl MethodHandler {
-    pub(crate) async fn handle_about_get(&self) -> WsFrame {
+    pub(crate) async fn handle_about_get(&self, params: Value) -> WsFrame {
+        if params.get("brand_revision_only").and_then(Value::as_bool) == Some(true) {
+            let brand = crate::distributor_brand::effective();
+            return WsFrame::ok_response("", json!({
+                "brand_revision": crate::distributor_brand::revision(brand.as_ref()),
+            }));
+        }
         let tier = match crate::license_runtime::global() {
             Some(runtime) => runtime.snapshot().await.tier,
             None => duduclaw_license::LicenseTier::OpenSource,
@@ -34,7 +40,9 @@ pub(crate) fn about_payload(tier: &str, distributor_notice: Option<String>) -> V
         "version": env!("CARGO_PKG_VERSION"),
         "tier": tier,
     });
-    if let Some(brand) = crate::distributor_brand::effective() {
+    let brand = crate::distributor_brand::effective();
+    payload["brand_revision"] = json!(crate::distributor_brand::revision(brand.as_ref()));
+    if let Some(brand) = brand {
         payload["brand"] = json!(brand);
     }
     if let Some(html) = distributor_notice {

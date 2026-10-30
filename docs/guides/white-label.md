@@ -40,6 +40,22 @@ This public repo provides the reader; console editing is maintained separately.
   customer information. The response is a top-level object, or `null` when
   ineffective, which means the original identity.
 
+The gateway keeps the highest accepted version per subscription/distributor in
+`<home>/distributor_brand_versions.json` (0600 on Unix, atomic replacement).
+It checks this file before exposing a cached brand at boot; an older cache is
+ignored until a valid fetch replaces it. Clearing the brand or replacing the
+license does not delete this watermark. Required name/light-logo fields remain
+strings: an absent brand must be a `null` document, not nullable fields.
+
+`about.get` includes `brand_revision`; `{ "brand_revision_only": true }` returns
+only that small field. `/api/brand` exposes the same revision in
+`X-Brand-Revision`, with an ETag, `If-None-Match`/304 support and a 60-second
+public cache. Requests, including conditional requests, are limited to 30 per
+IP per minute (429 with `Retry-After: 60`). The dashboard checks revisions on
+its existing session refresh, reconnect and tab focus; desktop checks every
+30 minutes. A changed revision causes the brand to reload, including a return
+to DuDuClaw when the response is `null`.
+
 ## Where the brand appears
 
 The dashboard uses the name and logo, including product mascot positions,

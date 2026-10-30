@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { client } from '@/lib/ws-client';
+import { refreshBrandRevision } from '@/stores/brand-store';
 
 export type UserRole = 'admin' | 'manager' | 'employee';
 
@@ -133,7 +134,7 @@ function startRefreshTimer(refresh: () => Promise<void>) {
 
   const tick = () => {
     void refresh()
-      .then(() => { lastRefreshAt = Date.now(); })
+      .then(() => { lastRefreshAt = Date.now(); void refreshBrandRevision(); })
       .catch(() => { /* refresh handles its own logout */ });
   };
 
