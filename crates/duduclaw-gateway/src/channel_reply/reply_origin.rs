@@ -199,7 +199,12 @@ impl ReplyFailure {
                         "{agent} 無法回應：模型與執行環境設定不一致或無效，請管理員儲存修正後重試。"
                     ),
                     RuntimePreflightKind::Budget => {
-                        format!("{agent} 暫停回應：已達預算限制，請管理員檢查預算設定。")
+                        let unavailable = crate::budget::BudgetVerdict::Unavailable { reason: String::new() }.user_message();
+                        if preflight.error == unavailable {
+                            format!("{agent} 暫停回應：目前無法確認預算，請管理員檢查預算設定或花費紀錄後重試。")
+                        } else {
+                            format!("{agent} 暫停回應：已達預算限制，請管理員檢查預算設定。")
+                        }
                     }
                     RuntimePreflightKind::Policy => {
                         format!("{agent} 無法回應：目前產品政策不允許此執行環境或模型。")
@@ -410,5 +415,23 @@ mod timeout_tests {
                 assert!(message.contains("員工設定"), "{runtime:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_message_tests {
+    use super::*;
+
+    #[test]
+    fn budget_unavailable_never_claims_cap_reached_or_echoes_untrusted_error() {
+        let unavailable = crate::budget::BudgetVerdict::Unavailable { reason: "internal secret".into() };
+        let failure = ReplyFailure::runtime(RuntimeDispatchFailure::preflight(Some(RuntimeType::Claude),
+            "claude-sonnet-4-6", RuntimePreflightKind::Budget, unavailable.user_message()));
+        let message = failure.message("worker", Path::new("/nonexistent"));
+        assert!(message.contains("無法確認預算"));
+        assert!(!message.contains("已達") && !message.contains("secret"));
+        let failure = ReplyFailure::runtime(RuntimeDispatchFailure::preflight(Some(RuntimeType::Claude),
+            "claude-sonnet-4-6", RuntimePreflightKind::Budget, "provider secret".into()));
+        assert!(!failure.message("worker", Path::new("/nonexistent")).contains("secret"));
     }
 }

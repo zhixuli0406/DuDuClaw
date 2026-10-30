@@ -97,7 +97,7 @@
 | セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入（gateway の抽出と承認済みの審査から）。`user_profile_record` / `user_profile_get` MCP ツールは gateway が起動する全従業員で共有される別の名前空間を読み書きするため、このブロックには反映されない（既知の制限、v1.67.1） |
 | GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.69.0 で削除)が記憶(triple + 本文言及 + key_facts + 減衰/forget のアーカイブ複製、5 テーブルのカスケード、SHA-256 仮名 tombstone。アーカイブ複製は本文しか残らないため本文言及で照合。subject/object だけで本人と結び付き、本文が本人に触れていないアーカイブ行は見つからない。試行とエクスポートのアーカイブ件数は本文で一致した行だけを数え、実際の消去では削除した記憶と同じ id のアーカイブ行も消すため、消去件数のほうが多くなることがある)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象。連絡先が空、または前後の空白を除いて 3 文字未満の場合は、何も読む前に拒否 |
 | Custom Dashboard Widgets | サンドボックス化されたランタイムで動作する、AI ガイドまたは生 HTML のダッシュボードカード。Widget Studio での共有/インポート/エクスポート([30-custom-widgets.md](30-custom-widgets.md)) |
-| 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
+| 予算サーキットブレーカー | 一時子社員の費用を含む直近 24 時間／30 日間の上限。すべての社員モデル呼び出し経路で起動前に確認。`[budget] when_unavailable` は費用データを取得できない場合の続行（既定 `allow`）か拒否（`deny`）を選択し、設定の読み取り・解析の失敗や未知の方針は必ず拒否。予算拒否でアカウントを切り替えず、フェイルオーバーもしない。`budget_events.jsonl` |
 | バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |
 | 監査エクスポート + SIEM sink | `duduclaw export audit`(旧 `duduclaw audit`) — JSONL 監査ログを正規化し NDJSON / webhook へストリーム |
 | 送信 guardrail フック | opt-in `[guardrails]` — 送信前に秘密情報の漏洩 / インジェクション反響 / 禁止フレーズ / PII をスキャン |

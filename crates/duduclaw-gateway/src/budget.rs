@@ -17,13 +17,8 @@
 //! `monthly_limit_cents` (rolling 30d). Either being exceeded (with `hard_stop`)
 //! trips the breaker.
 //!
-//! ## Fail-open, deliberately
-//!
-//! If telemetry is unavailable/uninitialised the breaker **allows** the call
-//! (and logs). A hard kill switch that fails *closed* would block ALL work the
-//! moment its own datastore hiccups — worse than a small overspend. Budget is a
-//! cost control, not a security gate (contrast the fail-closed MCP auth). The
-//! choice is logged so it is never silent.
+//! Unavailable accounting is explicit and follows `[budget].when_unavailable`.
+//! Its default is `allow`; `deny` stops model calls until accounting recovers.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -64,6 +59,8 @@ impl BudgetLimits {
 pub enum BudgetVerdict {
     /// Under budget — proceed.
     Allow,
+    /// Accounting or effective configuration could not be read.
+    Unavailable { reason: String },
     /// Over a cap with `hard_stop` — block. Carries which window tripped and the
     /// numbers, for a user-facing message and the audit trail.
     Deny {
@@ -89,6 +86,7 @@ impl BudgetVerdict {
     pub fn user_message(&self) -> String {
         match self {
             BudgetVerdict::Allow => String::new(),
+            BudgetVerdict::Unavailable { .. } => "⚠️ 暫停工作：目前無法確認預算，請管理員檢查預算設定或花費紀錄後重試。".into(),
             BudgetVerdict::Deny {
                 scope,
                 spent_cents,
@@ -129,8 +127,6 @@ impl BudgetVerdict {
 /// scalar (`budget = 1`) both produce the all-zero inert result, exactly as
 /// before — `toml::Value::get` on a non-table returned `None` for every key.
 pub fn load_budget_limits(agent_dir: Option<&Path>) -> BudgetLimits {
-    use duduclaw_core::lenient::{TomlFlag, TomlNumber, Tri};
-
     let inert = BudgetLimits {
         daily_cap_cents: 0,
         monthly_limit_cents: 0,
@@ -140,8 +136,11 @@ pub fn load_budget_limits(agent_dir: Option<&Path>) -> BudgetLimits {
     let Some(dir) = agent_dir else {
         return inert;
     };
-    let b = duduclaw_core::agent_toml::load(dir).budget;
+    budget_limits_from_view(duduclaw_core::agent_toml::load(dir).budget)
+}
 
+fn budget_limits_from_view(b: duduclaw_core::agent_toml::BudgetSectionView) -> BudgetLimits {
+    use duduclaw_core::lenient::{TomlFlag, TomlNumber, Tri};
     // Coerce ints, and floats (a common `100.0` typo) → rounded u64. A key that
     // is present but a genuinely wrong type is logged LOUDLY rather than silently
     // treated as 0 — a config typo must not silently disable a cost control.
@@ -182,15 +181,119 @@ pub fn load_budget_limits(agent_dir: Option<&Path>) -> BudgetLimits {
     }
 }
 
-/// Cents spent by `agent_id` over the last `hours` (rolling window). Telemetry
-/// stores cost in millicents; 0 on any query error.
-async fn spent_cents(tel: &CostTelemetry, agent_id: &str, hours: u64) -> u64 {
-    match tel.summary_by_agent(agent_id, hours).await {
-        Ok(s) => s.summary.total_cost_millicents / 1000,
-        Err(e) => {
-            tracing::warn!(agent_id, "budget: cost query failed: {e}");
-            0
+/// Aggregate millicents before converting, including the ephemeral family.
+async fn spent_cents(tel: &CostTelemetry, agent_id: &str, hours: u64) -> Result<u64, String> {
+    tel.budget_spent_millicents(agent_id, hours).await.map(|cost| cost / 1000)
+}
+
+/// A supplied directory must have a readable, valid effective configuration.
+/// Only an absent budget section is an absent budget.
+fn read_budget_config(agent_dir: Option<&Path>) -> Result<duduclaw_core::agent_toml::AgentTomlSections, String> {
+    let Some(dir) = agent_dir else { return Ok(Default::default()); };
+    let metadata = std::fs::metadata(dir).map_err(|e| format!("agent directory: {e}"))?;
+    if !metadata.is_dir() { return Err("agent directory is not a directory".into()); }
+    match duduclaw_core::agent_toml::read_effective_text(dir) {
+        Ok(text) => {
+            let doc: toml::Value = toml::from_str(&text)
+                .map_err(|_| "agent budget configuration is malformed".to_string())?;
+            if doc.get("budget").is_some_and(|budget| !budget.is_table()) {
+                return Err("agent budget section is not a table".into());
+            }
+            toml::from_str(&text).map_err(|_| "agent budget configuration is malformed".to_string())
+        },
+        Err(e) => Err(format!("agent budget configuration: {e}")),
+    }
+}
+
+#[cfg(test)]
+fn validate_budget_config(agent_dir: Option<&Path>) -> Result<(), String> {
+    read_budget_config(agent_dir).map(|_| ())
+}
+
+/// Refusal is returned before runtime rotation or provider classification.
+#[derive(Debug, Clone)]
+pub struct BudgetRefusal(pub BudgetVerdict);
+
+impl std::fmt::Display for BudgetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.user_message())
+    }
+}
+impl std::error::Error for BudgetRefusal {}
+
+/// Match registry placement for ordinary and ephemeral employees.
+pub fn agent_dir_for_id(home: &Path, agent_id: &str) -> std::path::PathBuf {
+    let agents = home.join("agents");
+    if crate::ephemeral::is_ephemeral_id(agent_id) {
+        agents.join(crate::ephemeral::EPHEMERAL_DIR_NAME).join(agent_id)
+    } else {
+        agents.join(agent_id)
+    }
+}
+
+pub const BUDGET_REFUSAL_PREFIX: &str = "[budget_preflight] ";
+
+impl BudgetRefusal {
+    /// Preserve refusal provenance across legacy String return values.
+    pub fn legacy_message(&self) -> String {
+        format!("{BUDGET_REFUSAL_PREFIX}{self}")
+    }
+}
+
+pub fn budget_refusal_message(error: &str) -> Option<&str> {
+    error.strip_prefix(BUDGET_REFUSAL_PREFIX)
+}
+
+
+#[cfg(test)]
+fn unavailable_denied(agent_dir: Option<&Path>) -> bool {
+    // An unreadable policy cannot authorize a fail-open decision.
+    read_budget_config(agent_dir).map(|config| config.budget.when_unavailable
+        == duduclaw_core::types::BudgetWhenUnavailable::Deny).unwrap_or(true)
+}
+
+pub async fn gate_before_spawn(
+    home: &Path, agent_dir: Option<&Path>, agent_id: &str, lane: &str,
+) -> Result<(), BudgetRefusal> {
+    if agent_id.is_empty() {
+        tracing::debug!(lane, "budget: no employee identity; skipping employee budget");
+        return Ok(());
+    }
+    let (verdict, denied) = match read_budget_config(agent_dir) {
+        Ok(config) => {
+            let denied = config.budget.when_unavailable == duduclaw_core::types::BudgetWhenUnavailable::Deny;
+            (check_budget_with_config(home, agent_dir, agent_id, config).await, denied)
         }
+        Err(reason) => (BudgetVerdict::Unavailable { reason }, true),
+    };
+    finish_budget_gate(home, agent_id, lane, verdict, denied)
+}
+
+fn finish_budget_gate(
+    home: &Path, agent_id: &str, lane: &str, verdict: BudgetVerdict, denied: bool,
+) -> Result<(), BudgetRefusal> {
+    match &verdict {
+        BudgetVerdict::Allow => Ok(()),
+        BudgetVerdict::Unavailable { reason } => {
+            tracing::warn!(agent_id, lane, reason, denied, "budget unavailable");
+            append_unavailable_event(home, agent_id, lane, reason, denied);
+            if denied { Err(BudgetRefusal(verdict)) } else { Ok(()) }
+        }
+        BudgetVerdict::Deny { .. } => Err(BudgetRefusal(verdict)),
+    }
+}
+
+fn append_unavailable_event(home: &Path, agent_id: &str, lane: &str, reason: &str, denied: bool) {
+    let path = home.join("budget_events.jsonl");
+    let line = serde_json::json!({"ts": chrono::Utc::now().to_rfc3339(),
+        "agent_id": agent_id, "event": "budget_unavailable", "lane": lane,
+        "reason": reason, "denied": denied}).to_string();
+    if let Err(error) = duduclaw_core::with_file_lock(&path, || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")
+    }) {
+        tracing::warn!(agent_id, lane, %error, "budget unavailable audit write failed");
     }
 }
 
@@ -205,7 +308,10 @@ pub async fn evaluate_budget(
         return BudgetVerdict::Allow;
     }
     if limits.daily_cap_cents > 0 {
-        let spent = spent_cents(tel, agent_id, DAILY_WINDOW_HOURS).await;
+        let spent = match spent_cents(tel, agent_id, DAILY_WINDOW_HOURS).await {
+            Ok(spent) => spent,
+            Err(reason) => return BudgetVerdict::Unavailable { reason },
+        };
         if spent >= limits.daily_cap_cents {
             return BudgetVerdict::Deny {
                 scope: "daily",
@@ -222,7 +328,10 @@ pub async fn evaluate_budget(
         );
     }
     if limits.monthly_limit_cents > 0 {
-        let spent = spent_cents(tel, agent_id, MONTHLY_WINDOW_HOURS).await;
+        let spent = match spent_cents(tel, agent_id, MONTHLY_WINDOW_HOURS).await {
+            Ok(spent) => spent,
+            Err(reason) => return BudgetVerdict::Unavailable { reason },
+        };
         if spent >= limits.monthly_limit_cents {
             return BudgetVerdict::Deny {
                 scope: "monthly",
@@ -239,6 +348,15 @@ pub async fn evaluate_budget(
         );
     }
     BudgetVerdict::Allow
+}
+
+async fn evaluate_available_telemetry(
+    telemetry: Option<&CostTelemetry>, agent_id: &str, limits: &BudgetLimits,
+) -> BudgetVerdict {
+    match telemetry {
+        Some(tel) => evaluate_budget(tel, agent_id, limits).await,
+        None => BudgetVerdict::Unavailable { reason: "cost telemetry unavailable".into() },
+    }
 }
 
 /// Log a soft warning when spend crosses `warn_threshold_percent` of a cap
@@ -264,15 +382,27 @@ fn warn_if_approaching(agent_id: &str, scope: &str, spent: u64, cap: u64, pct: u
 /// Top-level gate for a dispatch choke-point: resolve the agent's limits, then
 /// evaluate against the global telemetry singleton (initialising it if needed).
 ///
-/// Fail-open: no agent id, inert limits, or telemetry unavailable ⇒ `Allow`.
+/// No identity or inert limits allow; configuration/accounting failures stay explicit.
 pub async fn check_agent_budget(
     home_dir: &Path,
     agent_dir: Option<&Path>,
     agent_id: &str,
 ) -> BudgetVerdict {
     if agent_id.is_empty() {
+        tracing::debug!("budget: no employee identity; skipping employee budget");
         return BudgetVerdict::Allow;
     }
+    let config = match read_budget_config(agent_dir) {
+        Ok(config) => config,
+        Err(reason) => return BudgetVerdict::Unavailable { reason },
+    };
+    check_budget_with_config(home_dir, agent_dir, agent_id, config).await
+}
+
+async fn check_budget_with_config(
+    home_dir: &Path, agent_dir: Option<&Path>, agent_id: &str,
+    config: duduclaw_core::agent_toml::AgentTomlSections,
+) -> BudgetVerdict {
     // D12 (2026-09 feature audit): relative burn-rate check, deliberately
     // BEFORE the `is_inert` short-circuit below. Fixed caps and burn-rate
     // anomalies answer different questions, and an agent with no cap
@@ -281,21 +411,18 @@ pub async fn check_agent_budget(
     // per agent per UTC day; warns, never blocks (see `cost_anomaly`).
     crate::cost_anomaly::maybe_scan(home_dir, agent_dir, agent_id).await;
 
-    let limits = load_budget_limits(agent_dir);
+    let limits = budget_limits_from_view(config.budget);
     if limits.is_inert() {
         return BudgetVerdict::Allow;
     }
-    // Ensure telemetry exists (lazy init mirrors record_usage). If it still
-    // isn't available, fail open.
+    // Ensure telemetry exists (lazy init mirrors record_usage). Keep failures
+    // explicit so the spawn gate can apply the employee policy.
     if get_telemetry().is_none() {
         let _ = init_telemetry(home_dir);
     }
-    let Some(tel) = get_telemetry() else {
-        tracing::warn!(agent_id, "budget: telemetry unavailable — failing open");
-        return BudgetVerdict::Allow;
-    };
-    let verdict = evaluate_budget(tel, agent_id, &limits).await;
+    let verdict = evaluate_available_telemetry(get_telemetry(), agent_id, &limits).await;
     match &verdict {
+        BudgetVerdict::Unavailable { .. } => {}
         BudgetVerdict::Deny {
             scope,
             spent_cents,
@@ -335,8 +462,7 @@ pub async fn check_agent_budget(
 ///
 /// Best-effort: any failure (state file unreadable/unwritable, no `[proactive]`
 /// destination, no bot token) degrades to a skipped push, never blocks or
-/// panics the budget gate — the gate's own fail-open posture (module docs)
-/// extends to this notification path too.
+/// panics the budget gate; notification failures never alter its verdict.
 async fn notify_breaker_transition(
     home_dir: &Path,
     agent_dir: Option<&Path>,
@@ -480,6 +606,89 @@ mod tests {
             monthly_limit_cents: monthly,
             warn_threshold_percent: 0,
             hard_stop: hard,
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_missing_telemetry_is_unavailable() {
+        assert!(matches!(evaluate_available_telemetry(None, "a", &limits(1, 0, true)).await,
+            BudgetVerdict::Unavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn budget_query_failure_is_unavailable_not_zero() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("cost.db");
+        let tel = CostTelemetry::new(&db).unwrap();
+        rusqlite::Connection::open(&db).unwrap().execute("DROP TABLE token_usage", []).unwrap();
+        assert!(matches!(evaluate_budget(&tel, "a", &limits(1, 0, true)).await,
+            BudgetVerdict::Unavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn budget_bad_config_and_unreadable_directory_are_unavailable() {
+        let dir = budget_dir("not toml [[[");
+        assert!(matches!(check_agent_budget(dir.path(), Some(dir.path()), "a").await,
+            BudgetVerdict::Unavailable { .. }));
+        assert!(matches!(check_agent_budget(dir.path(), Some(&dir.path().join("missing")), "a").await,
+            BudgetVerdict::Unavailable { .. }));
+        let file = budget_dir("");
+        std::fs::remove_file(file.path().join("agent.toml")).unwrap();
+        std::fs::create_dir(file.path().join("agent.toml")).unwrap();
+        assert!(validate_budget_config(Some(file.path())).is_err());
+        assert!(validate_budget_config(Some(tempdir().unwrap().path())).is_err());
+    }
+
+    #[tokio::test]
+    async fn budget_missing_file_and_malformed_section_refuse_before_accounting() {
+        let home = tempdir().unwrap();
+        for body in [None, Some("budget = 42"), Some("not valid [[[" )] {
+            let dir = tempdir().unwrap();
+            if let Some(body) = body {
+                std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+            }
+            assert!(matches!(check_agent_budget(home.path(), Some(dir.path()), "a").await,
+                BudgetVerdict::Unavailable { .. }));
+            assert!(gate_before_spawn(home.path(), Some(dir.path()), "a", "test").await.is_err());
+            assert!(gate_before_spawn(home.path(), Some(dir.path()), "", "test").await.is_ok());
+        }
+    }
+
+    #[test]
+    fn budget_unavailable_policy_and_text() {
+        for (value, denied) in [("allow", false), ("deny", true), ("invalid", true)] {
+            let dir = budget_dir(&format!("[budget]\nwhen_unavailable = \"{value}\"\n"));
+            assert_eq!(unavailable_denied(Some(dir.path())), denied);
+            let verdict = BudgetVerdict::Unavailable { reason: "test telemetry unavailable".into() };
+            assert_eq!(finish_budget_gate(dir.path(), "a", "test", verdict, unavailable_denied(Some(dir.path()))).is_err(), denied);
+            assert!(!breaker_state_path(dir.path()).exists());
+        }
+        let v = BudgetVerdict::Unavailable { reason: "database unavailable".into() };
+        assert!(!v.user_message().contains("花費達上限"));
+        let dir = tempdir().unwrap();
+        append_unavailable_event(dir.path(), "a", "test", "missing", true);
+        assert!(!breaker_state_path(dir.path()).exists());
+        assert!(std::fs::read_to_string(dir.path().join("budget_events.jsonl")).unwrap()
+            .contains("budget_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn budget_ephemeral_family_rolls_up_before_cent_conversion() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("cost.db");
+        let tel = CostTelemetry::new(&db).unwrap();
+        seed_cost(&tel, "parent", 10).await;
+        seed_cost(&tel, "child", 10).await;
+        seed_cost(&tel, "sibling", 10).await;
+        seed_cost(&tel, "unrelated", 10).await;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE token_usage SET cost_millicents = 400", []).unwrap();
+        for child in ["child", "sibling"] {
+            conn.execute("INSERT INTO ephemeral_parents VALUES (?1, 'parent', '')", [child]).unwrap();
+        }
+        for id in ["parent", "child", "sibling"] {
+            assert_eq!(tel.budget_spent_millicents(id, 24).await.unwrap(), 1200);
+            assert!(evaluate_budget(&tel, id, &limits(1, 0, true)).await.is_denied());
         }
     }
 

@@ -191,13 +191,10 @@ async fn run_agent_prompt_inner(req: AgentPrompt<'_>) -> Result<RuntimeResponse,
 
     // Budget circuit breaker (cost *enforcement*, not just observation). Blocks
     // a new LLM call when the agent's rolling spend has hit its hard cap. Inert
-    // when no `[budget]` cap is set or `hard_stop = false`; fail-open when
-    // telemetry is unavailable (a kill switch must not brick work if its own DB
-    // hiccups). Utility calls (empty agent_id) are exempt.
-    let budget = crate::budget::check_agent_budget(req.home_dir, req.agent_dir, req.agent_id).await;
-    if budget.is_denied() {
-        return Err(RuntimeDispatchFailure::preflight(Some(provider),req.model,RuntimePreflightKind::Budget,budget.user_message()));
-    }
+    // when no `[budget]` cap is set or `hard_stop = false`; unavailable data
+    // follows the employee policy. Calls without an employee are exempt.
+    crate::budget::gate_before_spawn(req.home_dir, req.agent_dir, req.agent_id, "runtime_dispatch")
+        .await.map_err(|e| RuntimeDispatchFailure::preflight(Some(provider), req.model, RuntimePreflightKind::Budget, e.to_string()))?;
 
     let reg = registry(req.home_dir).await;
 
@@ -683,6 +680,17 @@ pub fn output_schema_override() -> Option<serde_json::Value> {
     OUTPUT_SCHEMA.try_with(|schema| (**schema).clone()).ok()
 }
 
+// Utility callers historically used operation labels as telemetry ids. When
+// an employee directory is supplied, use its registry id for both charging and
+// enforcement so labels cannot give an employee a fresh budget.
+fn utility_employee_id(agent_dir: Option<&Path>, agent_id: &str) -> String {
+    if agent_id.is_empty() { return String::new(); }
+    agent_dir.and_then(|dir| duduclaw_core::agent_toml::load(dir).agent)
+        .and_then(|agent| agent.name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| agent_id.to_owned())
+}
+
 /// [`run_utility_prompt`] with an operator [`UtilityModelHint`].
 ///
 /// A hint that fails [`apply_utility_hint`]'s family check returns `Err`
@@ -700,6 +708,8 @@ pub async fn run_utility_prompt_with_hint(
 ) -> Result<String, String> {
     #[cfg(test)]
     crate::model_call_probe::record("run_utility_prompt");
+    let employee_id = utility_employee_id(agent_dir, agent_id);
+    let agent_id = employee_id.as_str();
     match agent_dir {
         Some(dir) => crate::runtime_config::ensure_active_agent_provider(dir)?,
         None => crate::runtime_config::ensure_active_utility_provider(home_dir)?,
@@ -730,6 +740,8 @@ pub async fn run_utility_prompt_with_hint(
         );
     }
     if spec.provider == RuntimeType::Claude {
+        crate::budget::gate_before_spawn(home_dir, agent_dir, agent_id, "claude_utility")
+            .await.map_err(|e| e.legacy_message())?;
         // Mechanical metadata calls deliberately retain the lightweight
         // lane's fixed medium effort; hints cannot widen it.
         if let Some(effort) = hint.and_then(|h| h.effort) {
@@ -1375,5 +1387,54 @@ mod utility_policy_tests {
             home.path(), Some(&agent), "worker", "", "Summarize this", 16,
         )).await.unwrap_err();
         assert_eq!(error, denied);
+    }
+}
+
+#[cfg(test)]
+mod budget_preflight_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn budget_unavailable_refuses_claude_before_runtime_or_rotation() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "not valid [[[").unwrap();
+        let error = run_agent_prompt_detailed(AgentPrompt {
+            agent_dir: Some(&dir), home_dir: home.path(), agent_id: "a",
+            prompt: "never execute", system_prompt: "", model: "claude-sonnet-4-6",
+            max_tokens: 16, provider_override: Some(RuntimeType::Claude),
+            conversation_history: &[], request_type: RequestType::Chat,
+            runtime_settings: None, effort: None, allow_cross_family_failover: true,
+        }).await.unwrap_err();
+        assert_eq!(error.preflight.as_ref().unwrap().kind, RuntimePreflightKind::Budget);
+        assert!(error.steps.is_empty());
+        assert!(crate::budget::budget_refusal_message(&error.legacy_message()).is_some());
+    }
+
+    #[test]
+    fn budget_utility_labels_use_employee_identity_for_spend_and_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        // Registry identity comes from the document, not the directory name.
+        std::fs::write(dir.path().join("agent.toml"), "[agent]\nname = 'worker'\n").unwrap();
+        for label in ["needs-human-trajectory", "kickoff-trajectory", "decide", "situation-classifier"] {
+            assert_eq!(utility_employee_id(Some(dir.path()), label), "worker");
+        }
+        std::fs::write(dir.path().join("agent.toml"), "[agent]\nname = 'eph-abc'\n").unwrap();
+        assert_eq!(utility_employee_id(Some(dir.path()), "utility"), "eph-abc");
+        assert_eq!(utility_employee_id(None, "system-utility"), "system-utility");
+        assert_eq!(utility_employee_id(Some(dir.path()), ""), "");
+    }
+
+    #[test]
+    fn budget_402_refusal_retains_preflight_without_classification_steps() {
+        let refusal = crate::budget::BudgetRefusal(crate::budget::BudgetVerdict::Deny {
+            scope: "daily", spent_cents: 40200, cap_cents: 40200,
+        });
+        let failure = RuntimeDispatchFailure::preflight(Some(RuntimeType::Claude),
+            "claude-sonnet-4-6", RuntimePreflightKind::Budget, refusal.to_string());
+        assert!(failure.to_string().contains("402.00"));
+        assert!(failure.steps.is_empty());
+        assert_eq!(crate::budget::budget_refusal_message(&failure.legacy_message()), Some(refusal.to_string().as_str()));
     }
 }

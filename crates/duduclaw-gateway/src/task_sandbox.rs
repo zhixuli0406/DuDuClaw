@@ -449,6 +449,9 @@ pub async fn dispatch(
             account_pool: agent.config.model.account_pool.clone(),
         }
     };
+    if let Err(refusal) = crate::budget::gate_before_spawn(home, Some(&spec.agent_dir), &spec.agent_id, "task_sandbox").await {
+        return SandboxDispatch::Completed(Err(SandboxFailure::failed("budget_refused", refusal.to_string())));
+    }
     if crate::runtime_config::ensure_active_agent_provider(&spec.agent_dir).is_err() {
         return SandboxDispatch::Completed(Err(SandboxFailure::failed(
             failure_code::REMOVED_RUNTIME,

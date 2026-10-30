@@ -630,6 +630,8 @@ impl CostTelemetry {
             );",
         )
         .map_err(|e| format!("ephemeral_parents table: {e}"))?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ephemeral_parent ON ephemeral_parents(parent_id)", [])
+            .map_err(|e| format!("ephemeral parent index: {e}"))?;
         Ok(())
     }
 
@@ -962,6 +964,26 @@ impl CostTelemetry {
             },
         )
         .map_err(|e| format!("summary_global: {e}"))
+    }
+
+    /// Spend for a budget owner and its ephemeral descendants. Starting at a
+    /// child also includes its parent and siblings, so cloning a budget cannot
+    /// reset the allowance. UNION makes malformed cyclic mappings terminate.
+    pub async fn budget_spent_millicents(&self, agent_id: &str, hours: u64) -> Result<u64, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "WITH RECURSIVE family(id) AS (
+                SELECT ?1
+                UNION
+                SELECT ep.parent_id FROM ephemeral_parents ep JOIN family f ON ep.eph_id = f.id
+                UNION
+                SELECT ep.eph_id FROM ephemeral_parents ep JOIN family f ON ep.parent_id = f.id
+             )
+             SELECT COALESCE(SUM(cost_millicents), 0) FROM token_usage
+             WHERE agent_id IN (SELECT id FROM family) AND created_at >= ?2",
+            params![agent_id, cutoff_time(hours)],
+            |row| row.get::<_, i64>(0),
+        ).map(safe_u64).map_err(|e| format!("budget spend: {e}"))
     }
 
     /// Per-agent cost summary for a time window.

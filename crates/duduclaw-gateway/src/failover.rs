@@ -209,6 +209,10 @@ impl FailoverManager {
                     crate::metrics::global_metrics().record_failover();
                 }
                 Err(error)=>{
+                    if let Some(message) = crate::budget::budget_refusal_message(&error) {
+                        return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                            RuntimePreflightKind::Budget, message.to_owned()));
+                    }
                     let stop=is_non_retryable(&error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error);
                     failure.push(Primary,*primary,Some(&context.model),Outcome::ExecutionError(error));
                     if stop {return Err(failure);}
@@ -241,6 +245,10 @@ impl FailoverManager {
         if !context.allow_cross_family_failover && (!family_known || !crate::runtime_config::same_model_family(&context.model,&fb_model)) {
             failure.push(Fallback,*fb,Some(&fb_model),Outcome::CrossFamilyRefused);return Err(failure);
         }
+        crate::budget::gate_before_spawn(&context.home_dir, context.agent_dir.as_deref(),
+            &context.agent_id, "runtime_fallback").await.map_err(|e|
+                RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                    RuntimePreflightKind::Budget, e.to_string()))?;
         warn!(agent=%context.agent_id,from_runtime=?primary,to_runtime=?fb,from_model=%context.model,to_model=%fb_model,model_source,"Explicit runtime fallback — substituting a compatible model");
         let mut fb_context=context.clone();fb_context.model=fb_model;
         match {
@@ -260,6 +268,10 @@ impl FailoverManager {
                 failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::Empty);Err(failure)
             }
             Err(error)=>{
+                if let Some(message) = crate::budget::budget_refusal_message(&error) {
+                    return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                        RuntimePreflightKind::Budget, message.to_owned()));
+                }
                 self.record_failure(fb).await;
                 failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::ExecutionError(error));Err(failure)
             }

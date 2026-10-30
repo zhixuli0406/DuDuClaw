@@ -210,6 +210,9 @@ const MAX_GLOBAL_CONCURRENT: usize = 8;
 /// silent; this crate cannot reach the gateway's task sandbox itself.
 pub type HostRunNotice = Arc<dyn Fn(&Path, &str, bool) + Send + Sync>;
 
+/// Gateway-supplied employee budget gate; runs before any proactive model spawn.
+pub type BudgetGate = Arc<dyn Fn(PathBuf, PathBuf, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send + Sync>;
+
 pub struct HeartbeatScheduler {
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
@@ -227,6 +230,8 @@ pub struct HeartbeatScheduler {
     timing_deferrals: Arc<crate::proactive_timing::DeferralLedger>,
     /// See [`HostRunNotice`]. `None` (tests, standalone use) ⇒ no notice.
     host_run_notice: Option<HostRunNotice>,
+    // Without a gateway callback, proactive model execution is refused.
+    budget_gate: Option<BudgetGate>,
 }
 
 impl HeartbeatScheduler {
@@ -241,7 +246,13 @@ impl HeartbeatScheduler {
             silence_tx: None,
             timing_deferrals: Arc::new(crate::proactive_timing::DeferralLedger::new()),
             host_run_notice: None,
+            budget_gate: None,
         }
+    }
+
+    pub fn with_budget_gate(mut self, gate: BudgetGate) -> Self {
+        self.budget_gate = Some(gate);
+        self
     }
 
     /// Builder: install the [`HostRunNotice`] the proactive check calls before
@@ -341,8 +352,9 @@ impl HeartbeatScheduler {
             let ps = self.proactive_states.clone();
             let timing = self.timing_deferrals.clone();
             let notice = self.host_run_notice.clone();
+            let budget_gate = self.budget_gate.clone();
             tokio::spawn(async move {
-                execute_heartbeat(&home, &aid, &sem, &ps, &timing, notice.as_ref()).await;
+                execute_heartbeat(&home, &aid, &sem, &ps, &timing, notice.as_ref(), budget_gate.as_ref()).await;
             });
             true
         } else {
@@ -526,12 +538,13 @@ impl HeartbeatScheduler {
                 let proactive_states = self.proactive_states.clone();
                 let timing = self.timing_deferrals.clone();
                 let notice = self.host_run_notice.clone();
+                let budget_gate = self.budget_gate.clone();
                 tokio::spawn(async move {
                     let _global_permit = match global_sem.acquire().await {
                         Ok(p) => p,
                         Err(_) => return,
                     };
-                    execute_heartbeat(&home, &aid, &sem, &proactive_states, &timing, notice.as_ref())
+                    execute_heartbeat(&home, &aid, &sem, &proactive_states, &timing, notice.as_ref(), budget_gate.as_ref())
                         .await;
                 });
             }
@@ -564,6 +577,7 @@ async fn execute_heartbeat(
     proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
     timing_deferrals: &crate::proactive_timing::DeferralLedger,
     host_run_notice: Option<&HostRunNotice>,
+    budget_gate: Option<&BudgetGate>,
 ) {
     let _permit = match semaphore.try_acquire() {
         Ok(p) => p,
@@ -604,7 +618,7 @@ async fn execute_heartbeat(
     check_instructions_integrity_with_audit(home_dir, agent_id).await;
 
     // ── Proactive check (new) ──
-    execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals, host_run_notice)
+    execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals, host_run_notice, budget_gate)
         .await;
 
     info!(agent = agent_id, "Heartbeat cycle complete");
@@ -1054,6 +1068,7 @@ async fn execute_proactive_check(
     proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
     timing_deferrals: &crate::proactive_timing::DeferralLedger,
     host_run_notice: Option<&HostRunNotice>,
+    budget_gate: Option<&BudgetGate>,
 ) {
     use crate::proactive;
 
@@ -1166,6 +1181,14 @@ async fn execute_proactive_check(
                 "\n<os_observations>\n{summary}\n</os_observations>\n"
             ));
         }
+    }
+    let Some(gate) = budget_gate else {
+        warn!(agent = agent_id, "Proactive check refused: employee budget callback unavailable");
+        return;
+    };
+    if let Err(reason) = gate(home_dir.to_path_buf(), agent_dir.clone(), agent_id.to_owned()).await {
+        warn!(agent = agent_id, "Proactive check refused: {reason}");
+        return;
     }
     let claude = duduclaw_core::which_claude();
 
@@ -1464,7 +1487,7 @@ pub fn start_heartbeat_scheduler(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> Arc<HeartbeatScheduler> {
-    start_heartbeat_scheduler_with(home_dir, registry, None, None)
+    start_heartbeat_scheduler_with(home_dir, registry, None, None, None)
 }
 
 /// Same as [`start_heartbeat_scheduler`] but allows the caller to install a
@@ -1475,6 +1498,7 @@ pub fn start_heartbeat_scheduler_with(
     registry: Arc<RwLock<AgentRegistry>>,
     silence_tx: Option<tokio::sync::mpsc::UnboundedSender<SilenceBreakerEvent>>,
     host_run_notice: Option<HostRunNotice>,
+    budget_gate: Option<BudgetGate>,
 ) -> Arc<HeartbeatScheduler> {
     let mut sched = HeartbeatScheduler::new(home_dir, registry);
     if let Some(tx) = silence_tx {
@@ -1482,6 +1506,9 @@ pub fn start_heartbeat_scheduler_with(
     }
     if let Some(notice) = host_run_notice {
         sched = sched.with_host_run_notice(notice);
+    }
+    if let Some(gate) = budget_gate {
+        sched = sched.with_budget_gate(gate);
     }
     let scheduler = Arc::new(sched);
     let s = scheduler.clone();
@@ -2228,4 +2255,39 @@ fn explore_lane_mcp_config(
     let path = file.into_temp_path();
     duduclaw_core::platform::set_owner_only(&path).ok();
     Ok(Some(path))
+}
+
+#[cfg(test)]
+mod budget_gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn budget_refusal_stops_proactive_check_before_host_spawn() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/evaluator");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config: duduclaw_core::types::AgentConfig = toml::from_str(
+            include_str!("../../../templates/evaluator/agent.toml"),
+        ).unwrap();
+        config.proactive.enabled = true;
+        config.proactive.quiet_hours_start = 0;
+        config.proactive.quiet_hours_end = 0;
+        std::fs::write(dir.join("agent.toml"), toml::to_string(&config).unwrap()).unwrap();
+        std::fs::write(dir.join("PROACTIVE.md"), "Never execute").unwrap();
+        std::fs::write(home.path().join("config.toml"), "[proactive]\nnatural_timing = false\n").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let gate: BudgetGate = Arc::new(move |_, _, agent| {
+            assert_eq!(agent, "evaluator");
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("budget refused".into()) })
+        });
+        let notice: HostRunNotice = Arc::new(|_, _, _| panic!("must not reach host spawn"));
+        execute_proactive_check(home.path(), "evaluator", &tokio::sync::Mutex::new(HashMap::new()),
+            &crate::proactive_timing::DeferralLedger::new(), Some(&notice), None).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        execute_proactive_check(home.path(), "evaluator", &tokio::sync::Mutex::new(HashMap::new()),
+            &crate::proactive_timing::DeferralLedger::new(), Some(&notice), Some(&gate)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

@@ -81,11 +81,17 @@ impl RuntimeDispatchFailure {
     /// Preserve the authorization marker for String callers that must refuse
     /// every secondary route. Typed callers retain all primary/fallback data.
     pub(crate) fn legacy_message(&self) -> String {
+        if let Some(preflight) = &self.preflight {
+            if preflight.kind == RuntimePreflightKind::Budget {
+                return format!("{}{}", crate::budget::BUDGET_REFUSAL_PREFIX, preflight.error);
+            }
+        }
         self.steps
             .iter()
             .find_map(|step| match &step.outcome {
                 RuntimeStepOutcome::ExecutionError(error)
-                    if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) =>
+                    if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
+                        || crate::budget::budget_refusal_message(error).is_some() =>
                 {
                     Some(error.clone())
                 }
@@ -160,3 +166,17 @@ impl std::fmt::Display for RuntimeDispatchFailure {
     }
 }
 impl std::error::Error for RuntimeDispatchFailure {}
+
+#[cfg(test)]
+mod budget_legacy_tests {
+    use super::*;
+
+    #[test]
+    fn budget_marker_survives_execution_error_legacy_conversion() {
+        let error = format!("{}US$402.00", crate::budget::BUDGET_REFUSAL_PREFIX);
+        let mut failure = RuntimeDispatchFailure::new(RuntimeType::Claude, "claude-sonnet-4-6");
+        failure.push(RuntimeStepRole::Primary, RuntimeType::Claude, Some("claude-sonnet-4-6"),
+            RuntimeStepOutcome::ExecutionError(error.clone()));
+        assert_eq!(failure.legacy_message(), error);
+    }
+}
