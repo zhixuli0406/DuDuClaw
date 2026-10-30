@@ -187,6 +187,8 @@ fn is_zero(value: &u64) -> bool { *value == 0 }
 pub struct PlanBody {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub system_rows: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retained_shared: u64,
     pub tombstones: Vec<TombstoneEntry>,
     pub targets: Vec<TargetEntry>,
     pub reaffirm_only: Vec<ReaffirmOnlyEntry>,
@@ -195,6 +197,8 @@ pub struct PlanBody {
     pub collateral: Vec<CollateralEntry>,
     pub supersession_cuts: Vec<CutEntry>,
     pub entity_embeddings_orphaned: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphan_entity_ids: Vec<String>,
     pub untracked_in_namespace: u64,
     pub other_namespaces_referencing: u64,
     /// The `turn:` keys tombstoned because the forgotten messages (or the
@@ -244,6 +248,7 @@ impl PlanDocument {
         let mut d = self.clone();
         d.body.untracked_in_namespace = 0;
         d.body.system_rows = 0;
+        d.body.retained_shared = 0;
         d.body.other_namespaces_referencing = 0;
         Ok(crate::lineage::sha256_hex(d.canonical_json()?.as_bytes()))
     }
@@ -348,6 +353,7 @@ pub const PLAN_PART_NAMES: &[&str] = &[
     "collateral",
     "supersession_cuts",
     "entity_embeddings_orphaned",
+    "orphan_entity_ids",
     "wiki_pages",
     "review_cards_matching",
     "session_messages",
@@ -363,6 +369,8 @@ pub struct ApplyReport {
     pub plan_hash: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub system_rows: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retained_shared: u64,
     pub memories_deleted: u64,
     pub key_facts_deleted: u64,
     pub archive_deleted: u64,

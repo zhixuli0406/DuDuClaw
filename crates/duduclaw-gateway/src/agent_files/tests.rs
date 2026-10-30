@@ -207,3 +207,22 @@ fn a_skill_folder_swapped_for_a_symlink_while_saving_is_not_followed() {
     assert_eq!(std::fs::read_to_string(elsewhere.join("SKILL.md")).unwrap(), "v0", "nothing written through the link");
     assert!(!elsewhere.join("SKILL.md.tmp").exists());
 }
+
+
+// Added regression test; not run in this change.
+#[tokio::test]
+async fn agent_channel_write_fences_disconnect_and_refuses_unreadable_memory() {
+    let (_dir, home) = home_with_agent();
+    let engine = duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    engine.record_connector_disconnect("channel:telegram:a1").await.unwrap();
+    let next = "[agent]\nname='a1'\n[channels.telegram]\nbot_token='test-token'\n";
+    commit_locked(&commit(&home, FileKey::AgentToml, None), |_| Ok(next.into()), || Ok(())).unwrap();
+    assert!(engine.disconnected_connector_refs().await.unwrap().is_empty());
+    let (_bad_dir, bad_home) = home_with_agent();
+    let path = bad_home.join("agents/a1/agent.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(bad_home.join("memory.db"), "not a database").unwrap();
+    let result = commit_locked(&commit(&bad_home, FileKey::AgentToml, None), |_| Ok(next.into()), || Ok(()));
+    assert!(matches!(result, Err(CommitError::Refused(_))));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+}

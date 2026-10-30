@@ -23,15 +23,90 @@ fn channel_matches(reference: &str, session: &str) -> bool {
     }
 }
 
-pub(super) fn matching_rows(conn: &Connection, agent: &str, reference: &str) -> Result<BTreeSet<(String, String)>> {
-    let mut result = BTreeSet::new();
+#[derive(Default)]
+pub(super) struct Selection {
+    pub rows: BTreeSet<(String, String)>,
+    pub retained_shared: u64,
+}
+
+fn disconnected(conn: &Connection, reference: &str, observed: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM disconnected_connectors
+            WHERE connector_ref=?1 AND disconnected_at>=?2 AND verified=1)",
+        params![reference,observed], |r| r.get(0),
+    ).map_err(err)
+}
+
+fn channel_ref(session: &str) -> Option<String> {
+    let kind = session.split_once(':')?.0;
+    if !matches!(kind, "line" | "telegram" | "discord" | "slack" | "googlechat") { return None; }
+    Some(match session.split_once("#agent:") {
+        Some((_, agent)) => format!("channel:{kind}:{agent}"),
+        None => format!("channel:{kind}"),
+    })
+}
+
+/// Every owning origin must be accounted for. Reaffirmation is evidence of
+/// corroboration, never permission to delete the surviving item.
+fn ownership(conn: &Connection, agent: &str, store: &str, id: &str, selected: &str) -> Result<(bool, bool)> {
+    let uncertain: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory_connector_stamps
+         WHERE memory_store=?1 AND memory_id=?2 AND role='unknown')",
+        params![store,id], |r| r.get(0),
+    ).map_err(err)?;
+    if uncertain { return Ok((false, true)); }
+    let mut stmt = conn.prepare(
+        "SELECT source_session,source_message,source_kind,source_observed_at,role FROM memory_origins
+         WHERE agent_id=?1 AND memory_store=?2 AND memory_id=?3 AND role!='reaffirm'"
+    ).map_err(err)?;
+    let origins = stmt.query_map(params![agent,store,id], |r| Ok((
+        r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
+        r.get::<_,String>(3)?,r.get::<_,String>(4)?
+    ))).map_err(err)?.collect::<std::result::Result<Vec<_>,_>>().map_err(err)?;
+    if origins.is_empty() { return Ok((false, true)); }
+    let mut live = false;
+    let mut unknown = false;
+    let mut selected_owner = false;
+    for (session,message,kind,observed,role) in origins {
+        unknown |= matches!(kind.as_str(), "upstream_unknown" | "untracked_parent");
+        let mut stmt = conn.prepare(
+            "SELECT connector_ref,connector_observed_at FROM memory_connector_stamps
+             WHERE memory_store=?1 AND memory_id=?2 AND source_session=?3 AND source_message=?4
+               AND role=?5"
+        ).map_err(err)?;
+        let stamps = stmt.query_map(params![store,id,session,message,role],
+            |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))
+            .map_err(err)?.collect::<std::result::Result<Vec<_>,_>>().map_err(err)?;
+        if stamps.is_empty() {
+            if let Some(reference) = channel_ref(&session) {
+                selected_owner |= reference == selected;
+                live |= !disconnected(conn, &reference, &observed)?;
+            } else if matches!(kind.as_str(), "upstream_unknown" | "untracked_parent") {
+                unknown = true;
+            } else {
+                // A direct import, system source or unstamped local write is
+                // an independent owner, not part of a connector disconnect.
+                live = true;
+            }
+        }
+        for (reference,at) in stamps {
+            selected_owner |= reference == selected;
+            if reference == "unknown" { unknown = true; }
+            else { live |= reference == "none" || !disconnected(conn, &reference, &at)?; }
+        }
+    }
+    Ok((selected_owner && !live && !unknown, unknown))
+}
+
+pub(super) fn matching_rows(conn: &Connection, agent: &str, reference: &str) -> Result<Selection> {
+    let mut candidates = BTreeSet::new();
     let mut stmt = conn.prepare(
         "SELECT DISTINCT o.memory_store,o.memory_id FROM memory_origins o
          JOIN memory_connector_stamps s ON s.memory_store=o.memory_store AND s.memory_id=o.memory_id
          WHERE o.agent_id=?1 AND s.connector_ref=?2"
     ).map_err(err)?;
     for row in stmt.query_map(params![agent,reference], |r| Ok((r.get(0)?,r.get(1)?))).map_err(err)? {
-        result.insert(row.map_err(err)?);
+        candidates.insert(row.map_err(err)?);
     }
     if reference.starts_with("channel:") {
         let mut stmt = conn.prepare(
@@ -40,18 +115,23 @@ pub(super) fn matching_rows(conn: &Connection, agent: &str, reference: &str) -> 
         ).map_err(err)?;
         for row in stmt.query_map(params![agent], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).map_err(err)? {
             let (store,id,session) = row.map_err(err)?;
-            if channel_matches(reference,&session) { result.insert((store,id)); }
-        }
-    }
-    if reference.starts_with("channel:") {
-        let mut stmt = conn.prepare("SELECT id,source_session FROM key_facts WHERE agent_id=?1").map_err(err)?;
-        for row in stmt.query_map(params![agent], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(err)? {
-            let (id,session) = row.map_err(err)?;
-            if channel_matches(reference,&session) { result.insert(("key_facts".into(),id)); }
+            if channel_matches(reference,&session) { candidates.insert((store,id)); }
         }
     }
     let system = system_ids(conn, agent)?;
-    result.retain(|key| !system.contains(key));
+    let mut result = Selection::default();
+    for (store,id) in candidates {
+        if system.contains(&(store.clone(),id.clone())) { continue; }
+        let (delete,unknown) = ownership(conn, agent, &store, &id, reference)?;
+        if delete { result.rows.insert((store,id)); }
+        else if !unknown {
+            let live = super::body::row_exists(conn, &store, &id, agent)?;
+            let archive = store == "memories"
+                && crate::lineage::db::table_exists(conn,"main","memories_archive")?
+                && super::body::archived(conn, &id, agent)?;
+            if live || archive { result.retained_shared += 1; }
+        }
+    }
     Ok(result)
 }
 
@@ -82,10 +162,15 @@ pub(super) fn unattributed_count(
     let sql = format!("{} SELECT l.store,l.id FROM items l
          WHERE NOT EXISTS(SELECT 1 FROM memory_origins o
              WHERE o.agent_id=?1 AND o.memory_store=l.store AND o.memory_id=l.id AND o.source_kind='system')
-           AND (NOT EXISTS(SELECT 1 FROM memory_connector_stamps s
-                WHERE s.memory_store=l.store AND s.memory_id=l.id)
+           AND (NOT EXISTS(SELECT 1 FROM memory_origins o
+                WHERE o.agent_id=?1 AND o.memory_store=l.store AND o.memory_id=l.id AND o.role!='reaffirm')
+             OR NOT EXISTS(SELECT 1 FROM memory_connector_stamps s
+                WHERE s.memory_store=l.store AND s.memory_id=l.id AND s.role IN ('direct','inherited'))
              OR EXISTS(SELECT 1 FROM memory_connector_stamps s
-                WHERE s.memory_store=l.store AND s.memory_id=l.id AND s.connector_ref='unknown'))",
+                WHERE s.memory_store=l.store AND s.memory_id=l.id AND (s.connector_ref='unknown' OR s.role='unknown'))
+             OR EXISTS(SELECT 1 FROM memory_origins o
+                WHERE o.agent_id=?1 AND o.memory_store=l.store AND o.memory_id=l.id
+                  AND o.role!='reaffirm' AND o.source_kind IN ('upstream_unknown','untracked_parent')))",
         stored_items_cte(conn)?);
     let mut stmt = conn.prepare(&sql).map_err(err)?;
     let mut count = 0;
@@ -108,6 +193,8 @@ pub fn connector_plan_is_subset(approved: &ForgetPlan, refreshed: &ForgetPlan) -
         || b.body.entity_embeddings_orphaned > a.body.entity_embeddings_orphaned {
         return false;
     }
+    let orphan_entities: BTreeSet<_> = a.body.orphan_entity_ids.iter().collect();
+    if !b.body.orphan_entity_ids.iter().all(|id| orphan_entities.contains(id)) { return false; }
     let targets: BTreeSet<_> = a.body.targets.iter()
         .map(|t| (t.store.as_str(),t.id.as_str(),t.content_sha256.as_str())).collect();
     let target_ids: BTreeSet<_> = a.body.targets.iter()
@@ -131,6 +218,51 @@ pub fn connector_plan_is_subset(approved: &ForgetPlan, refreshed: &ForgetPlan) -
 }
 
 impl SqliteMemoryEngine {
+    /// Record the completed disconnect even when forgetting was not requested.
+    pub async fn record_connector_disconnect(&self, reference: &str) -> Result<()> {
+        if !crate::lineage::connectors::valid_ref(reference) || matches!(reference, "unknown" | "none") {
+            return Err(err("invalid connector reference"));
+        }
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO disconnected_connectors(connector_ref,disconnected_at,revision,verified) VALUES(?1,?2,?3,0)
+             ON CONFLICT(connector_ref) DO UPDATE SET disconnected_at=MAX(disconnected_at,excluded.disconnected_at),
+                revision=excluded.revision,verified=0",
+            params![reference,crate::format_ts(chrono::Utc::now()),uuid::Uuid::new_v4().to_string()],
+        ).map_err(err)?;
+        Ok(())
+    }
+
+    pub async fn disconnected_connector_refs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare("SELECT connector_ref,revision FROM disconnected_connectors ORDER BY connector_ref").map_err(err)?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+        rows.collect::<std::result::Result<Vec<_>,_>>().map_err(err)
+    }
+
+    /// Confirm only the exact disconnect revisions whose authoritative state
+    /// the host read. A delayed old notification creates a new, unverified
+    /// revision and cannot inherit a previous refresh's permission to delete.
+    pub async fn retain_disconnected_connectors(&self, confirmed: &[(String, String)]) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute("UPDATE disconnected_connectors SET verified=0", []).map_err(err)?;
+        let refs = {
+            let mut stmt = conn.prepare("SELECT connector_ref,revision FROM disconnected_connectors").map_err(err)?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+            rows.collect::<std::result::Result<Vec<(String,String)>,_>>().map_err(err)?
+        };
+        for (reference,revision) in refs {
+            if confirmed.contains(&(reference.clone(),revision.clone())) {
+                conn.execute("UPDATE disconnected_connectors SET verified=1 WHERE connector_ref=?1 AND revision=?2",
+                    params![reference,revision]).map_err(err)?;
+            } else {
+                conn.execute("DELETE FROM disconnected_connectors WHERE connector_ref=?1 AND revision=?2",
+                    params![reference,revision]).map_err(err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Persisted in the deletion transaction, so a crashed worker can report exact counts.
     pub async fn get_forget_apply_report(&self, plan_id: &str) -> Result<Option<ApplyReport>> {
         let conn = self.conn.lock().await;
@@ -164,6 +296,9 @@ mod engine_tests {
     use duduclaw_core::traits::MemoryEngine;
 
     async fn connector_plan(engine: &SqliteMemoryEngine, reference: &str) -> ForgetPlan {
+        engine.record_connector_disconnect(reference).await.unwrap();
+        let observed = engine.disconnected_connector_refs().await.unwrap();
+        engine.retain_disconnected_connectors(&observed).await.unwrap();
         match engine.plan_forget_connector(AGENT, reference, PlanOptions::default()).await.unwrap() {
             PlanOutcome::Planned(plan) => *plan,
             other => panic!("expected plan, got {other:?}"),
@@ -199,6 +334,146 @@ mod engine_tests {
         assert_eq!(count(&engine, "SELECT COUNT(*) FROM key_facts").await, 0);
         assert!(exists(&engine,&legacy).await && exists(&engine,&unknown).await && exists(&engine,&system).await);
         assert!(matches!(engine.apply_forget_plan(&plan.plan_id, &ExternalInputs::default()).await.unwrap(), ApplyOutcome::AlreadyApplied));
+    }
+
+    // Regression tests added for F1/F2; not run in this change.
+    #[tokio::test]
+    async fn shared_connection_owners_are_retained_until_both_disconnect() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let shared = put(&engine, "joint google and database note", TemporalMeta::default(),
+            src(msg("telegram:joint", 1)).with_connector_refs(vec!["google:home".into(), "db:live".into()])).await;
+        engine.record_connector_disconnect("google:home").await.unwrap();
+        let first = connector_plan(&engine, "google:home").await;
+        assert!(first.document.body.targets.is_empty());
+        assert_eq!(first.document.body.retained_shared, 1);
+        let report = apply(&engine, &first.plan_id).await;
+        assert_eq!(report.retained_shared, 1);
+        assert!(exists(&engine, &shared).await);
+        engine.record_connector_disconnect("db:live").await.unwrap();
+        let second = connector_plan(&engine, "db:live").await;
+        assert_eq!(second.document.body.retained_shared, 0);
+        assert!(second.document.body.targets.iter().any(|row| row.id == shared));
+        apply(&engine, &second.plan_id).await;
+        assert!(!exists(&engine, &shared).await);
+    }
+
+    #[tokio::test]
+    async fn google_reaffirmation_does_not_own_a_database_memory_or_its_child() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let survivor = put(&engine, "database owns this stable fact", TemporalMeta::default(),
+            src(msg("cron:db", 1)).with_connector_refs(vec!["db:live".into()])).await;
+        {
+            let conn = engine.conn_for_maintenance().await;
+            let provenance = src(msg("telegram:google", 1)).with_connector_refs(vec!["google:home".into()]);
+            let rows = crate::lineage::db::resolve(&conn, AGENT, &provenance, &[]).unwrap().unwrap();
+            let skipped = std::sync::atomic::AtomicU64::new(0);
+            assert!(crate::lineage::db::add_reaffirm(&conn, &survivor, AGENT, &rows, &skipped).unwrap().is_none());
+        }
+        let child = put(&engine, "derived database fact", TemporalMeta::default(),
+            Provenance::derived(vec![survivor.clone()])).await;
+        let plan = connector_plan(&engine, "google:home").await;
+        assert!(plan.document.body.targets.is_empty());
+        assert_eq!(plan.document.body.retained_shared, 1);
+        apply(&engine, &plan.plan_id).await;
+        assert!(exists(&engine, &survivor).await && exists(&engine, &child).await);
+    }
+
+    #[tokio::test]
+    async fn independent_direct_origin_and_shared_descendant_stay() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let root = put(&engine, "google source root", TemporalMeta::default(),
+            src(msg("telegram:google", 1)).with_connector_refs(vec!["google:home".into()])).await;
+        let child = put(&engine, "child also independently supplied", TemporalMeta::default(),
+            Provenance::Derived { parents: vec![root.clone()], extra: vec![msg("telegram:live", 1)] }).await;
+        let plan = connector_plan(&engine, "google:home").await;
+        assert!(plan.document.body.targets.iter().any(|row| row.id == root));
+        assert!(!plan.document.body.targets.iter().any(|row| row.id == child));
+        assert_eq!(plan.document.body.retained_shared, 1);
+        apply(&engine, &plan.plan_id).await;
+        assert!(exists(&engine, &child).await);
+    }
+
+    #[tokio::test]
+    async fn unknown_origins_and_legacy_parent_stamps_never_become_google_ownership() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let unknown = put(&engine, "unknown upstream remains private", TemporalMeta::default(),
+            Provenance::Sources(vec![msg("telegram:google", 1),
+                crate::lineage::SourceRef::upstream_unknown("run:unknown", t0())])
+                .with_connector_refs(vec!["google:home".into()])).await;
+        let legacy = put(&engine, "legacy ambiguous owner", TemporalMeta::default(),
+            src(msg("telegram:legacy", 1)).with_connector_refs(vec!["db:legacy".into()])).await;
+        {
+            let conn = engine.conn_for_maintenance().await;
+            conn.execute("UPDATE memory_connector_stamps SET role='unknown',source_session='',source_message='' WHERE memory_id=?1",
+                params![legacy]).unwrap();
+        }
+        let child = put(&engine, "derived from ambiguous source", TemporalMeta::default(),
+            Provenance::derived(vec![legacy.clone()]).with_connector_refs(vec!["google:home".into()])).await;
+        let plan = connector_plan(&engine, "google:home").await;
+        assert!(plan.document.body.targets.is_empty());
+        assert_eq!(plan.document.body.untracked_in_namespace, 3);
+        apply(&engine, &plan.plan_id).await;
+        for id in [unknown, legacy, child] { assert!(exists(&engine, &id).await); }
+    }
+
+    #[tokio::test]
+    async fn reconnect_invalidates_pending_deletion_even_for_selected_owner() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let id = put(&engine, "google reconnect survivor", TemporalMeta::default(),
+            src(msg("telegram:google", 1)).with_connector_refs(vec!["google:home".into()])).await;
+        let plan = connector_plan(&engine, "google:home").await;
+        assert_eq!(plan.document.body.targets.len(), 1);
+        engine.retain_disconnected_connectors(&[]).await.unwrap();
+        assert!(matches!(engine.apply_forget_plan(&plan.plan_id, &ExternalInputs::default()).await.unwrap(), ApplyOutcome::Stale(_)));
+        assert!(exists(&engine, &id).await);
+    }
+
+    #[tokio::test]
+    async fn delayed_disconnect_cannot_reuse_an_older_verified_revision() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let id = put(&engine, "shared reconnect race survivor", TemporalMeta::default(),
+            src(msg("telegram:joint", 1)).with_connector_refs(vec!["google:home".into(), "db:live".into()])).await;
+        engine.record_connector_disconnect("db:live").await.unwrap();
+        let approved = connector_plan(&engine, "google:home").await;
+        assert_eq!(approved.document.body.targets.len(), 1);
+        let observed = engine.disconnected_connector_refs().await.unwrap();
+        // Reconnect fences the old revision, then an old disconnect callback
+        // arrives after publication. It must start unverified with a new id.
+        {
+            let conn = engine.conn_for_maintenance().await;
+            conn.execute("DELETE FROM disconnected_connectors WHERE connector_ref='db:live'", []).unwrap();
+        }
+        engine.record_connector_disconnect("db:live").await.unwrap();
+        engine.retain_disconnected_connectors(&observed).await.unwrap();
+        assert!(matches!(engine.apply_forget_plan(&approved.plan_id, &ExternalInputs::default()).await.unwrap(), ApplyOutcome::Stale(_)));
+        assert!(exists(&engine, &id).await);
+    }
+
+    #[tokio::test]
+    async fn same_count_orphan_embedding_swap_invalidates_hash_and_subset() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        put(&engine, "Google contains private material", triple("google", "contains", "private"),
+            src(msg("telegram:google", 1)).with_connector_refs(vec!["google:home".into()])).await;
+        {
+            let conn = engine.conn_for_maintenance().await;
+            conn.execute("INSERT INTO entity_embedding(agent_id,entity,model,vec)
+                VALUES(?1,'google','test',X'00000000')", params![AGENT]).unwrap();
+        }
+        let approved = connector_plan(&engine, "google:home").await;
+        assert_eq!(approved.document.body.orphan_entity_ids, vec!["google"]);
+        {
+            let conn = engine.conn_for_maintenance().await;
+            conn.execute("UPDATE entity_embedding SET entity='private' WHERE agent_id=?1 AND entity='google'", params![AGENT]).unwrap();
+        }
+        let refreshed = connector_plan(&engine, "google:home").await;
+        assert_eq!(approved.document.body.entity_embeddings_orphaned, refreshed.document.body.entity_embeddings_orphaned);
+        assert_eq!(refreshed.document.body.orphan_entity_ids, vec!["private"]);
+        assert!(!connector_plan_is_subset(&approved, &refreshed));
+        let mut swapped = approved.document.clone();
+        swapped.body.orphan_entity_ids = refreshed.document.body.orphan_entity_ids.clone();
+        assert_ne!(approved.plan_hash, swapped.plan_hash().unwrap());
+        assert!(matches!(engine.apply_forget_plan(&approved.plan_id, &ExternalInputs::default()).await.unwrap(), ApplyOutcome::Stale(_)));
+        assert_eq!(count(&engine, "SELECT COUNT(*) FROM entity_embedding").await, 1);
     }
 
     #[tokio::test]
@@ -387,7 +662,10 @@ mod engine_tests {
             assert_eq!(crate::lineage::connectors::load(&conn, "memories", &survivor).unwrap().len(), 1);
         }
         let plan = connector_plan(&engine, "google:home").await;
-        assert!(plan.document.body.targets.iter().any(|row| row.id == survivor));
+        assert!(!plan.document.body.targets.iter().any(|row| row.id == survivor));
+        assert_eq!(plan.document.body.retained_shared, 1);
+        apply(&engine, &plan.plan_id).await;
+        assert!(exists(&engine, &survivor).await);
     }
 
     #[tokio::test]

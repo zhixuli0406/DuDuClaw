@@ -207,6 +207,18 @@ impl MethodHandler {
             }
 
             // ── Memory (agent-scoped, H2 fix) ────────────────
+            "memory.forget_batch_retry" => {
+                if crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx).is_err() {
+                    return WsFrame::error_response("", "permission denied");
+                }
+                let Some(id) = params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+                    return WsFrame::error_response("", "id is required");
+                };
+                match crate::disconnect_forget::retry(&self.home_dir, id) {
+                    Ok(value) => WsFrame::ok_response("", value),
+                    Err(error) => WsFrame::error_response("", &error),
+                }
+            }
             "memory.forget_receipts_list" | "memory.forget_receipts_get" => {
                 if crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx).is_err() {
                     return WsFrame::error_response("", "permission denied");

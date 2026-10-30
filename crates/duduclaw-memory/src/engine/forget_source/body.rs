@@ -207,8 +207,11 @@ pub(super) fn compute(
         }
     }
 
+    let mut retained_shared = 0;
     if let Some(reference) = connector {
-        for (store, id) in super::connector::matching_rows(conn, agent_id, reference)? {
+        let selection = super::connector::matching_rows(conn, agent_id, reference)?;
+        retained_shared = selection.retained_shared;
+        for (store, id) in selection.rows {
             found.rows.insert((store, id), ("connector_stamp".into(), vec![LineageKey {
                 session: reference.into(), message: String::new(), role: Role::Direct,
             }]));
@@ -300,7 +303,10 @@ pub(super) fn compute(
             .filter(|(s, _)| s == STORE_MEMORIES)
             .map(|(_, i)| i.clone()),
     );
-    if let Some(reason) = legacy_closure(conn, agent_id, &roots, &mut memory_ids)? {
+    // Connector ownership is checked on each item, including derived rows.
+    // Legacy descendants without stamps stay unattributed.
+    if connector.is_none()
+        && let Some(reason) = legacy_closure(conn, agent_id, &roots, &mut memory_ids)? {
         return Ok(Computation::TooLarge(reason));
     }
     let total = memory_ids.len() + fact_ids.len() + archive_ids.len() + lineage_only.len();
@@ -430,6 +436,7 @@ pub(super) fn compute(
         steps.retain(|step| step.step == STEP_REVIEW_SCRUB);
     }
     let body = PlanBody {
+        retained_shared,
         system_rows: if connector.is_some() { super::connector::system_count(conn, agent_id)? } else { 0 },
         tombstones: specs
             .iter()
@@ -475,6 +482,7 @@ pub(super) fn compute(
             })
             .collect(),
         entity_embeddings_orphaned: orphan_entities.len() as u64,
+        orphan_entity_ids: orphan_entities.clone(),
         untracked_in_namespace: untracked,
         linked_turns,
         other_namespaces_referencing: other_ns,
@@ -524,7 +532,7 @@ pub(super) fn compute(
     })))
 }
 
-fn row_exists(conn: &Connection, store: &str, id: &str, agent_id: &str) -> Result<bool> {
+pub(super) fn row_exists(conn: &Connection, store: &str, id: &str, agent_id: &str) -> Result<bool> {
     let sql = if store == STORE_MEMORIES {
         "SELECT 1 FROM memories WHERE id = ?1 AND agent_id = ?2"
     } else {
@@ -536,7 +544,7 @@ fn row_exists(conn: &Connection, store: &str, id: &str, agent_id: &str) -> Resul
         .map_err(e)
 }
 
-fn archived(conn: &Connection, id: &str, agent_id: &str) -> Result<bool> {
+pub(super) fn archived(conn: &Connection, id: &str, agent_id: &str) -> Result<bool> {
     conn.prepare_cached("SELECT 1 FROM memories_archive WHERE id = ?1 AND agent_id = ?2")
         .and_then(|mut s| s.query_row(params![id, agent_id], |_| Ok(())).optional())
         .map(|o| o.is_some())

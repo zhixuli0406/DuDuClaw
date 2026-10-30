@@ -8,7 +8,7 @@ import { ForgetReceiptsPanel } from './ForgetReceiptsPanel';
 const receipt = {
   id: 'receipt-1', batch_id: 'batch-1', connector_ref: 'google:home',
   display_name: 'Company Google', completed_at: '2026-10-30T09:00:00Z', approved_by: 'admin-1',
-  counts: [{ agent_id: 'assistant', memories_deleted: 7, key_facts_deleted: 3, archive_deleted: 2, unattributed: 11, system_kept: 5 }],
+  counts: [{ agent_id: 'assistant', memories_deleted: 7, key_facts_deleted: 3, archive_deleted: 2, unattributed: 11, system_kept: 5, retained_shared: 13 }],
   not_covered: ['conversation text', 'tool_calls.jsonl', 'wiki', 'backups'],
 };
 
@@ -24,9 +24,11 @@ describe('ForgetReceiptsPanel', () => {
     expect(await screen.findByText(/Company Google/)).toBeInTheDocument();
     fireEvent.click(screen.getByText(/Company Google/));
     expect(screen.getByText('assistant')).toBeInTheDocument();
-    for (const count of ['7', '3', '2', '11', '5']) expect(screen.getByText(count)).toBeInTheDocument();
+    for (const count of ['7', '3', '2', '11', '5', '13']) expect(screen.getByText(count)).toBeInTheDocument();
     expect(screen.getByText('Cannot attribute')).toBeInTheDocument();
     expect(screen.getByText('System rows kept')).toBeInTheDocument();
+    expect(screen.getByText('Shared memories kept')).toBeInTheDocument();
+    expect(screen.getByText('These memories stay because another connected source also supplied them.')).toBeInTheDocument();
     expect(screen.getByText(/Out of scope: conversation text, tool_calls.jsonl, wiki and backups/)).toBeInTheDocument();
   });
 
@@ -74,4 +76,28 @@ describe('ForgetReceiptsPanel', () => {
     expect(mockWsClient.call).not.toHaveBeenCalled();
     expect(screen.getByText('Connect to the gateway to load receipts.')).toBeInTheDocument();
   });
+
+  // Added regression tests; not run in this change.
+  it('shows quarantined failures and queues an explicit retry', async () => {
+    const job = { id: 'batch-quarantined', display_name: 'Google retry', status: 'quarantined',
+      attempt_count: 5, next_attempt_at: 0, last_error: 'missing batch plan' };
+    mockWsClient.call.mockImplementation(async (method: string) => method === 'memory.forget_batch_retry'
+      ? { status: 'queued' } : { receipts: [], jobs: [job] });
+    renderWithProviders(<ForgetReceiptsPanel />);
+    expect(await screen.findByText(/Google retry/)).toBeInTheDocument();
+    expect(screen.getByText(/Failure reason: missing batch plan/)).toBeInTheDocument();
+    expect(screen.getByText(/Consecutive failed or interrupted attempts: 5/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry deletion' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('memory.forget_batch_retry', { id: 'batch-quarantined' }));
+    expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'memory.forget_receipts_list').length).toBeGreaterThan(1);
+  });
+
+  it('does not offer retry for a job waiting for approval', async () => {
+    mockWsClient.call.mockResolvedValue({ receipts: [], jobs: [{ id: 'batch-pending', display_name: 'Google waiting',
+      status: 'planned', attempt_count: 0, next_attempt_at: 0, last_error: null }] });
+    renderWithProviders(<ForgetReceiptsPanel />);
+    expect(await screen.findByText(/Google waiting/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry deletion' })).not.toBeInTheDocument();
+  });
+
 });

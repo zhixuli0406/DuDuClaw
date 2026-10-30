@@ -8,9 +8,14 @@ use serde_json::{Value, json};
 use crate::approval::operator_cli_gate::{self as gate, Binding, Filing, StatePolicy};
 use crate::approval::ApprovalBroker;
 
+#[path = "disconnect_forget_connections.rs"]
+pub(crate) mod connections;
+
 const TTL_MINUTES: i64 = 7 * 24 * 60;
 const ACTION: &str = "disconnect_forget";
 const LEASE_SECONDS: i64 = 300;
+const MAX_ATTEMPTS: i64 = 5;
+const POLL_SECONDS: i64 = 60;
 const NOT_COVERED: &[&str] = &["conversation text", "tool_calls.jsonl", "wiki", "backups"];
 
 fn connection(home: &Path) -> Result<Connection, String> {
@@ -57,7 +62,8 @@ fn namespaces(home: &Path) -> Result<Vec<String>, String> {
     Ok(agents)
 }
 
-async fn plan(engine: &SqliteMemoryEngine, agent: &str, connector: &str) -> Result<ForgetPlan, String> {
+async fn plan(home: &Path, engine: &SqliteMemoryEngine, agent: &str, connector: &str) -> Result<ForgetPlan, String> {
+    connections::refresh(home, engine, connector).await?;
     match engine.plan_forget_connector(agent, connector, PlanOptions {
         ttl_minutes: Some(TTL_MINUTES), max_rows: None,
     }).await.map_err(|e| e.to_string())? {
@@ -130,6 +136,7 @@ async fn file_card(home: &Path, b: &Batch, plans: &[ForgetPlan]) -> Result<Strin
         "archive": p.document.body.archive_ids.len(),
         "unattributed": p.document.body.untracked_in_namespace,
         "system_kept": p.document.body.system_rows,
+        "retained_shared": p.document.body.retained_shared,
     })).collect();
     let summary = format!("斷開「{}」後，刪除可歸屬此連線的記憶。請逐一確認下方 {} 個員工或工具命名空間的範圍。",
         duduclaw_core::truncate_chars(&b.name, 120), plans.len());
@@ -172,6 +179,15 @@ async fn file_card(home: &Path, b: &Batch, plans: &[ForgetPlan]) -> Result<Strin
 /// Called only after credentials/configuration have been removed successfully.
 /// Planning failures never undo or conceal the completed disconnect.
 pub async fn after_disconnect(home: &Path, connector: &str, display_name: &str, requested: bool) -> Value {
+    if home.join("memory.db").is_file() {
+        let recorded = match engine(home) {
+            Ok(engine) => engine.record_connector_disconnect(connector).await.map_err(|e| e.to_string()),
+            Err(error) => Err(error),
+        };
+        if recorded.is_err() {
+            return json!({"status":"failed","message":"連線已斷開，但無法記錄記憶來源狀態；未建立刪除計畫。"});
+        }
+    }
     if !requested { return json!({"status":"skipped"}); }
     if !crate::memory_forget_apply::enabled(home) {
         return json!({"status":"disabled","message":"記憶依來源刪除已關閉或設定無法讀取；連線已斷開，未建立刪除計畫。"});
@@ -186,7 +202,7 @@ pub async fn after_disconnect(home: &Path, connector: &str, display_name: &str, 
 async fn create_batch(home: &Path, connector: &str, name: &str) -> Result<(String, String), String> {
     let engine = engine(home)?;
     let mut plans = Vec::new();
-    for agent in namespaces(home)? { plans.push(plan(&engine, &agent, connector).await?); }
+    for agent in namespaces(home)? { plans.push(plan(home, &engine, &agent, connector).await?); }
     let b = Batch { id: uuid::Uuid::new_v4().to_string(), connector: connector.into(), name: name.into(),
         expires: (Utc::now() + Duration::minutes(TTL_MINUTES)).to_rfc3339(), digest: digest(&plans),
         status: "planned".into(), approved_by: None, approval_id: None };
@@ -216,7 +232,7 @@ pub async fn enqueue_approved(home: &Path, id: &str) -> Result<(), String> {
     if let gate::Verdict::Approved { id: approval } = verdict {
         let rec = broker.get(&approval).await?.ok_or("approval missing")?;
         let actor = rec.decided_by.filter(|s| s.starts_with("dashboard:")).ok_or("dashboard approval required")?;
-        connection(home)?.execute("UPDATE disconnect_forget_batches SET status='applying',approved_by=?2,lease_holder=NULL,lease_until=0 WHERE id=?1 AND status='planned' AND digest=?3",
+        connection(home)?.execute("UPDATE disconnect_forget_batches SET status='applying',approved_by=?2,lease_holder=NULL,lease_until=0,next_attempt_at=0 WHERE id=?1 AND status='planned' AND digest=?3",
             params![b.id,actor,b.digest]).map_err(|e| e.to_string())?;
     } else if matches!(verdict, gate::Verdict::Refused { .. } | gate::Verdict::Mismatch { .. }) {
         connection(home)?.execute("UPDATE disconnect_forget_batches SET status='refused' WHERE id=?1 AND status='planned' AND digest=?2",
@@ -249,10 +265,10 @@ async fn execute(home: &Path, engine: &SqliteMemoryEngine, b: &Batch, holder: &s
             replanned.push(p.clone());
             continue;
         }
-        let next = plan(engine, &agent, &b.connector).await?;
+        let next = plan(home, engine, &agent, &b.connector).await?;
         let old = approved.iter().find(|p| p.document.agent_id == agent);
         if old.is_some_and(|p| !duduclaw_memory::connector_plan_is_subset(p, &next))
-            || (old.is_none() && (!next.document.body.targets.is_empty() || !next.document.body.archive_ids.is_empty() || !next.document.body.lineage_only.is_empty())) {
+            || (old.is_none() && (!next.document.body.targets.is_empty() || !next.document.body.archive_ids.is_empty() || !next.document.body.lineage_only.is_empty() || !next.document.body.orphan_entity_ids.is_empty())) {
             expanded = true;
         }
         replanned.push(next);
@@ -284,16 +300,20 @@ async fn execute(home: &Path, engine: &SqliteMemoryEngine, b: &Batch, holder: &s
     let mut counts = Vec::new();
     for p in &replanned {
         renew(home, &b.id, holder)?;
+        if p.status != "applied" {
+            connections::refresh(home, engine, &b.connector).await?;
+        }
         let (outcome, steps) = crate::memory_forget_apply::apply(home, engine, p).await.map_err(|e| e.to_string())?;
         if !matches!(outcome, ApplyOutcome::Applied(_) | ApplyOutcome::AlreadyApplied) {
-            return Err(format!("forget apply refused: {outcome:?}"));
+            return Err("forget apply refused after scope validation".into());
         }
         if !steps.is_some_and(|s| s.complete()) { return Err("forget follow-up steps incomplete".into()); }
         let report = engine.get_forget_apply_report(&p.plan_id).await.map_err(|e| e.to_string())?
             .ok_or("durable apply report missing")?;
         counts.push(json!({"agent_id":report.agent_id,"memories_deleted":report.memories_deleted,
             "key_facts_deleted":report.key_facts_deleted,"archive_deleted":report.archive_deleted,
-            "unattributed":report.untracked_in_namespace_at_apply,"system_kept":report.system_rows}));
+            "unattributed":report.untracked_in_namespace_at_apply,"system_kept":report.system_rows,
+            "retained_shared":report.retained_shared}));
     }
     renew(home, &b.id, holder)?;
     let completed = Utc::now().to_rfc3339();
@@ -328,21 +348,88 @@ pub async fn sweep(home: &Path) -> Result<(), String> {
     // plan pointer to a second process after the durable lease expires.
     let _lock = lock;
     let engine = engine(home)?;
-    let ids = {
-        let conn = connection(home)?;
-        let mut stmt = conn.prepare("SELECT id FROM disconnect_forget_batches WHERE status IN ('planned','applying') ORDER BY created_at LIMIT 100")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<String>, _>>().map_err(|e| e.to_string())?
-    };
-    for id in ids {
-        if let Err(error) = sweep_one(home, &engine, &id).await {
-            connection(home)?.execute("UPDATE disconnect_forget_batches SET last_error=?2 WHERE id=?1 AND status!='complete'",
-                params![id,duduclaw_core::truncate_chars(&error,512)]).map_err(|e| e.to_string())?;
-            tracing::warn!(batch = %id, %error, "disconnect forget deferred");
+    for id in due_jobs(home)? {
+        // Rotate even approval polls to the back of the due queue. Otherwise
+        // the oldest 100 pending cards can starve newly approved batches.
+        connection(home)?.execute("UPDATE disconnect_forget_batches SET next_attempt_at=?2 WHERE id=?1 AND status IN ('planned','applying')",
+            params![id,Utc::now().timestamp()+POLL_SECONDS]).map_err(|e| e.to_string())?;
+        if !begin_attempt(home, &id)? { continue; }
+        match sweep_one(home, &engine, &id).await {
+            Ok(()) => {
+                connection(home)?.execute("UPDATE disconnect_forget_batches SET attempt_count=0,last_error=NULL,next_attempt_at=?2 WHERE id=?1 AND status IN ('planned','applying')",
+                    params![id,Utc::now().timestamp()+POLL_SECONDS]).map_err(|e| e.to_string())?;
+            }
+            Err(error) => {
+                record_failure(home, &id, &error)?;
+                tracing::warn!(batch = %id, reason = safe_failure(&error), "disconnect forget deferred");
+            }
         }
     }
     Ok(())
+}
+
+fn due_jobs(home: &Path) -> Result<Vec<String>, String> {
+    let conn = connection(home)?;
+    let mut stmt = conn.prepare("SELECT id FROM disconnect_forget_batches
+        WHERE status IN ('planned','applying') AND next_attempt_at<=?1 AND lease_until<=?1
+        ORDER BY next_attempt_at,created_at,id LIMIT 100").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([Utc::now().timestamp()], |r| r.get(0)).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<String>, _>>().map_err(|e| e.to_string())
+}
+
+fn safe_failure(error: &str) -> &'static str {
+    // Never persist or return arbitrary DB/engine errors: they may contain data.
+    match error {
+        "missing batch plan" => "missing batch plan",
+        "connection is active or its state cannot be verified" => "connection is active or its state cannot be verified",
+        "forget_source disabled or unreadable" => "forget_source disabled or unreadable",
+        "forget apply refused after scope validation" => "forget apply refused after scope validation",
+        "forget follow-up steps incomplete" => "forget follow-up steps incomplete",
+        "durable apply report missing" => "durable apply report missing",
+        "disconnect job lease lost" => "disconnect job lease lost",
+        "forget approval queue is full" => "forget approval queue is full",
+        "attempt limit reached after interrupted work" => "attempt limit reached after interrupted work",
+        _ => "disconnect job failed during storage or plan validation",
+    }
+}
+
+fn begin_attempt(home: &Path, id: &str) -> Result<bool, String> {
+    let conn = connection(home)?;
+    // Count before doing work so process crashes also consume an attempt.
+    let n = conn.execute("UPDATE disconnect_forget_batches SET attempt_count=attempt_count+1,
+        next_attempt_at=?2 WHERE id=?1 AND status IN ('planned','applying') AND attempt_count<?3",
+        params![id,Utc::now().timestamp()+LEASE_SECONDS,MAX_ATTEMPTS]).map_err(|e| e.to_string())?;
+    if n == 0 {
+        conn.execute("UPDATE disconnect_forget_batches SET retry_status=status,status='quarantined',
+            last_error='attempt limit reached after interrupted work',lease_holder=NULL,lease_until=0
+            WHERE id=?1 AND status IN ('planned','applying') AND attempt_count>=?2",
+            params![id,MAX_ATTEMPTS]).map_err(|e| e.to_string())?;
+    }
+    Ok(n == 1)
+}
+
+fn record_failure(home: &Path, id: &str, error: &str) -> Result<(), String> {
+    let conn = connection(home)?;
+    let attempts: i64 = conn.query_row("SELECT attempt_count FROM disconnect_forget_batches WHERE id=?1",
+        [id], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let delay = POLL_SECONDS * (1_i64 << (attempts - 1).clamp(0, 6));
+    conn.execute("UPDATE disconnect_forget_batches SET last_error=?2,next_attempt_at=?3,
+        retry_status=CASE WHEN attempt_count>=?4 THEN status ELSE retry_status END,
+        status=CASE WHEN attempt_count>=?4 THEN 'quarantined' ELSE status END
+        WHERE id=?1 AND status IN ('planned','applying')",
+        params![id,safe_failure(error),Utc::now().timestamp()+delay,MAX_ATTEMPTS]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Admin RPC only. Reuse the existing approval and revalidation paths;
+/// retrying a quarantined plan is not permission to delete a larger scope.
+pub fn retry(home: &Path, id: &str) -> Result<Value, String> {
+    let n = connection(home)?.execute("UPDATE disconnect_forget_batches SET status=retry_status,
+        retry_status=NULL,attempt_count=0,next_attempt_at=0,last_error=NULL,lease_holder=NULL,lease_until=0
+        WHERE id=?1 AND status='quarantined' AND retry_status IN ('planned','applying')",
+        [id]).map_err(|e| e.to_string())?;
+    if n != 1 { return Err("batch is not quarantined".into()); }
+    Ok(json!({"status":"queued","batch_id":id}))
 }
 
 async fn sweep_one(home: &Path, engine: &SqliteMemoryEngine, id: &str) -> Result<(), String> {
@@ -366,6 +453,10 @@ async fn sweep_one(home: &Path, engine: &SqliteMemoryEngine, id: &str) -> Result
         params![id,holder,Utc::now().timestamp()+LEASE_SECONDS,Utc::now().timestamp()]).map_err(|e| e.to_string())?;
     if claimed == 0 { return Ok(()); }
     let result = execute(home, engine, &b, &holder).await;
+    if result.is_ok() {
+        connection(home)?.execute("UPDATE disconnect_forget_batches SET attempt_count=0,last_error=NULL WHERE id=?1 AND lease_holder=?2",
+            params![id,holder]).map_err(|e| e.to_string())?;
+    }
     connection(home)?.execute("UPDATE disconnect_forget_batches SET lease_holder=NULL,lease_until=0 WHERE id=?1 AND lease_holder=?2",
         params![id,holder]).map_err(|e| e.to_string())?;
     result
@@ -386,7 +477,19 @@ pub fn receipts(home: &Path, id: Option<&str>) -> Result<Value, String> {
     let rows = stmt.query_map([], |r| r.get::<_,String>(0)).map_err(|e| e.to_string())?;
     let mut values = Vec::new();
     for row in rows { values.push(serde_json::from_str::<Value>(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?); }
-    Ok(json!({"receipts":values}))
+    let mut jobs = Vec::new();
+    let mut stmt = conn.prepare("SELECT id,display_name,status,attempt_count,next_attempt_at,last_error
+        FROM disconnect_forget_batches WHERE status IN ('planned','applying','quarantined')
+        ORDER BY CASE status WHEN 'quarantined' THEN 0 ELSE 1 END,created_at DESC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |r| {
+        let error: Option<String> = r.get(5)?;
+        Ok(json!({"id":r.get::<_,String>(0)?,"display_name":r.get::<_,String>(1)?,
+            "status":r.get::<_,String>(2)?,"attempt_count":r.get::<_,i64>(3)?,
+            "next_attempt_at":r.get::<_,i64>(4)?,"last_error":error.as_deref().map(safe_failure)}))
+    }).map_err(|e| e.to_string())?;
+    for row in rows { jobs.push(row.map_err(|e| e.to_string())?); }
+    Ok(json!({"receipts":values,"jobs":jobs}))
 }
 
 #[cfg(test)]

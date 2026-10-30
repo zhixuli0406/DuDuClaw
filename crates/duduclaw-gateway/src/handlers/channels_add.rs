@@ -82,6 +82,10 @@ impl MethodHandler {
             let channel_type_owned = channel_type.to_string();
             let home = self.home_dir.clone();
 
+            if let Err(e) = crate::disconnect_forget::connections::mark_connecting(&self.home_dir,
+                &format!("channel:{channel_type}:{agent_name}")) {
+                return WsFrame::error_response("", &e);
+            }
             if let Err(e) = self
                 .update_agent_toml(agent_name, move |table| {
                     let channels = table
@@ -349,6 +353,10 @@ impl MethodHandler {
         }
 
         // XC.2: atomic write (temp + rename), mirroring the per-agent path.
+        if let Err(e) = crate::disconnect_forget::connections::mark_connecting(&self.home_dir,
+            &format!("channel:{channel_type}")) {
+            return WsFrame::error_response("", &e);
+        }
         if let Err(e) = self.atomic_write_toml_snapshot(&config_path, &table, config_snapshot).await {
             return WsFrame::error_response("", &e);
         }

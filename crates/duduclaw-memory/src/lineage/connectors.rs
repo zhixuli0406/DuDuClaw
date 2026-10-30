@@ -17,13 +17,13 @@ pub(crate) fn valid_ref(value: &str) -> bool {
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     let current: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM memory_meta WHERE key='connector_schema_version' AND value='2')",
+        "SELECT EXISTS(SELECT 1 FROM memory_meta WHERE key='connector_schema_version' AND value='4')",
         [], |r| r.get(0),
     ).map_err(e)?;
     if current { return Ok(()); }
     let result = (|| -> Result<()> {
         conn.execute_batch(
-        "SAVEPOINT connector_schema_v2;
+        "SAVEPOINT connector_schema_v4;
          CREATE TABLE IF NOT EXISTS memory_connector_stamps (
             memory_store TEXT NOT NULL CHECK(memory_store IN ('memories','key_facts')),
             memory_id TEXT NOT NULL, connector_ref TEXT NOT NULL, stamped_at TEXT NOT NULL,
@@ -56,6 +56,64 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         if !has_time {
             conn.execute_batch("ALTER TABLE memory_connector_stamps ADD COLUMN connector_observed_at TEXT NOT NULL DEFAULT '';").map_err(e)?;
         }
+        let has_role: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('memory_connector_stamps') WHERE name='role')",
+            [], |r| r.get(0),
+        ).map_err(e)?;
+        if !has_role {
+            // Old stamps cannot distinguish ownership from corroboration.
+            // Keep them as unknown rather than guessing from unrelated origins.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS trg_connector_stamp_fence;
+                 DROP TRIGGER IF EXISTS trg_connector_stamp_update_fence;
+                 DROP INDEX IF EXISTS idx_memory_connector_ref;
+                 ALTER TABLE memory_connector_stamps RENAME TO memory_connector_stamps_legacy;
+                 CREATE TABLE memory_connector_stamps (
+                    memory_store TEXT NOT NULL CHECK(memory_store IN ('memories','key_facts')),
+                    memory_id TEXT NOT NULL, connector_ref TEXT NOT NULL, stamped_at TEXT NOT NULL,
+                    connector_observed_at TEXT NOT NULL DEFAULT '',
+                    source_session TEXT NOT NULL, source_message TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('direct','inherited','reaffirm','unknown')),
+                    PRIMARY KEY(memory_store,memory_id,connector_ref,source_session,source_message,role));
+                 INSERT INTO memory_connector_stamps SELECT memory_store,memory_id,connector_ref,
+                    stamped_at,connector_observed_at,'','','unknown' FROM memory_connector_stamps_legacy;
+                 DROP TABLE memory_connector_stamps_legacy;
+                 CREATE INDEX idx_memory_connector_ref
+                    ON memory_connector_stamps(connector_ref,memory_store,memory_id);"
+            ).map_err(e)?;
+        }
+        for (column, definition) in [
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("retry_status", "TEXT"),
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('disconnect_forget_batches') WHERE name=?1)",
+                [column], |r| r.get(0),
+            ).map_err(e)?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE disconnect_forget_batches ADD COLUMN {column} {definition};")).map_err(e)?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_disconnect_forget_due
+                ON disconnect_forget_batches(status,next_attempt_at,created_at);
+             CREATE TABLE IF NOT EXISTS disconnected_connectors (
+                connector_ref TEXT PRIMARY KEY, disconnected_at TEXT NOT NULL,
+                revision TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 0);"
+        ).map_err(e)?;
+        for (column, definition) in [
+            ("revision", "TEXT NOT NULL DEFAULT ''"),
+            ("verified", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('disconnected_connectors') WHERE name=?1)",
+                [column], |r| r.get(0),
+            ).map_err(e)?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE disconnected_connectors ADD COLUMN {column} {definition};")).map_err(e)?;
+            }
+        }
         conn.execute_batch(
             "UPDATE memory_connector_stamps SET connector_observed_at=COALESCE(
                 (SELECT MIN(o.source_observed_at) FROM memory_origins o
@@ -76,21 +134,39 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 WHERE o.memory_store=NEW.memory_store AND o.memory_id=NEW.memory_id
                   AND NEW.connector_observed_at <= f.upto_time)
              BEGIN SELECT RAISE(ABORT,'duduclaw:connector_forgotten'); END;
-             INSERT OR REPLACE INTO memory_meta(key,value) VALUES('connector_schema_version','2');
-             RELEASE connector_schema_v2;"
+             INSERT OR REPLACE INTO memory_meta(key,value) VALUES('connector_schema_version','4');
+             RELEASE connector_schema_v4;"
         ).map_err(e)
     })();
     if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK TO connector_schema_v2; RELEASE connector_schema_v2;");
+        let _ = conn.execute_batch("ROLLBACK TO connector_schema_v4; RELEASE connector_schema_v4;");
     }
     result
 }
 
+#[cfg(test)]
 pub(crate) fn load(conn: &Connection, store: &str, id: &str) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT connector_ref,connector_observed_at FROM memory_connector_stamps WHERE memory_store=?1 AND memory_id=?2"
+        "SELECT DISTINCT connector_ref,connector_observed_at FROM memory_connector_stamps WHERE memory_store=?1 AND memory_id=?2"
     ).map_err(e)?;
     let rows = stmt.query_map(params![store,id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e)?;
+    rows.collect::<std::result::Result<Vec<_>,_>>().map_err(e)
+}
+
+/// Load stamps only from this origin and role. A parent's reaffirmation must
+/// never become ownership on a derived child.
+pub(crate) fn load_origin(conn: &Connection, id: &str, row: &OriginRow) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT connector_ref,connector_observed_at FROM memory_connector_stamps
+         WHERE memory_store='memories' AND memory_id=?1 AND source_session=?2
+           AND source_message=?3 AND role=?4
+         UNION SELECT connector_ref,connector_observed_at FROM memory_connector_stamps
+         WHERE memory_store='memories' AND memory_id=?1 AND role='unknown'
+         UNION SELECT 'unknown',connector_observed_at FROM memory_connector_stamps
+         WHERE memory_store='memories' AND memory_id=?1 AND role='unknown'"
+    ).map_err(e)?;
+    let rows = stmt.query_map(params![id,row.session,row.message,row.role.as_str()],
+        |r| Ok((r.get(0)?,r.get(1)?))).map_err(e)?;
     rows.collect::<std::result::Result<Vec<_>,_>>().map_err(e)
 }
 
@@ -119,10 +195,11 @@ pub(crate) fn insert(conn: &Connection, store: &str, id: &str, rows: &[OriginRow
         for (reference, observed_at) in &row.connectors {
             conn.execute(
                 "INSERT INTO memory_connector_stamps
-                 (memory_store,memory_id,connector_ref,stamped_at,connector_observed_at) VALUES(?1,?2,?3,?4,?5)
-                 ON CONFLICT(memory_store,memory_id,connector_ref) DO UPDATE SET
+                 (memory_store,memory_id,connector_ref,stamped_at,connector_observed_at,source_session,source_message,role)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(memory_store,memory_id,connector_ref,source_session,source_message,role) DO UPDATE SET
                     connector_observed_at=MIN(memory_connector_stamps.connector_observed_at,excluded.connector_observed_at)",
-                params![store,id,reference,now,observed_at],
+                params![store,id,reference,now,observed_at,row.session,row.message,row.role.as_str()],
             ).map_err(e)?;
         }
     }
@@ -150,6 +227,8 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(load(&conn, "memories", "m").unwrap().len(), 1);
         let version: String = conn.query_row("SELECT value FROM memory_meta WHERE key='connector_schema_version'", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, "2");
+        assert_eq!(version, "4");
+        let role: String = conn.query_row("SELECT role FROM memory_connector_stamps", [], |r| r.get(0)).unwrap();
+        assert_eq!(role, "unknown");
     }
 }

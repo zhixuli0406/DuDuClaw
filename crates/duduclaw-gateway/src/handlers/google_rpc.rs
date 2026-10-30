@@ -229,6 +229,11 @@ impl MethodHandler {
         }
 
         table.insert("integrations".into(), toml::Value::Table(integrations));
+        if mode != "none" {
+            if let Err(e) = crate::disconnect_forget::connections::mark_connecting(&self.home_dir, "google:home") {
+                return WsFrame::error_response("", &e);
+            }
+        }
         if let Err(e) = self.write_config_table_snapshot(&config_path,config_expected_hash,&table).await {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
         }

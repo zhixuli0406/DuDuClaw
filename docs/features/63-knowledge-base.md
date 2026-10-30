@@ -221,6 +221,13 @@ The batch lasts seven days. Before applying it, the gateway plans again: a small
 
 An Admin can inspect **System → Security → Data deletion receipts** and download JSON after the work has finished. The receipt records the connection name captured at disconnect, the batch, time, approver, actual counts per employee and store, unattributed counts and the exclusions. Conversation text, `tool_calls.jsonl`, wiki and backups are out of scope. See [Security defense](05-security-defense.md) for the attribution and approval boundaries.
 
+
+Connection stamps keep their origin and role. Corroboration alone never grants deletion ownership. A memory stays if another connected source also supplied it; plans, the Admin card and receipts report this per employee as `retained_shared`. Deletion requires every owning connector to have been disconnected and no independent live origin. The second disconnect can therefore select a previously shared memory. Unknown ownership (including old stamps whose role cannot be recovered) is retained and counted as unattributed. Derived memories undergo the same ownership check. Connection state is checked again before planning and applying, and reconnecting through the platform invalidates old disconnect evidence before publishing the connection.
+
+Approval binds the sorted identifiers of orphan entity embeddings, not just their count; swapping one entity for another requires a new approval. Unfinished jobs use a durable attempt count and due time, with 60/120/240/480-second backoff. Due jobs are selected fairly. After five consecutive failures or interrupted attempts, a job is quarantined. The Admin can see a content-free failure reason under **Data deletion receipts** and choose **Retry**; retry retains the existing approval and rechecks scope, requiring a new approval if it grows.
+
+Regression tests for these changes were added but **not run**; no build was performed.
+
 ## Audit
 
 - Every search, passage read, listing and download writes a row to `knowledge.db`'s access log: who (dashboard user, employee, channel), the query (first 500 characters), the allowed collections and the result ids, never the passage text. Rows older than `access_log_retention_days` are deleted every ten minutes.

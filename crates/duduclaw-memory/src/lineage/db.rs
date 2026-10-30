@@ -313,6 +313,8 @@ pub(crate) fn resolve(
             Ok(mut rows) => {
                 let refs = if refs.is_empty() { vec!["none".into()] } else { refs.clone() };
                 for row in &mut rows {
+                    // A new turn cannot relabel the owners inherited from a parent.
+                    if row.role != Role::Direct { continue; }
                     let at = observed_at.map(format_ts).unwrap_or_else(|| row.observed_at.clone());
                     row.connectors.extend(refs.iter().cloned().map(|reference| (reference, at.clone())));
                 }
@@ -528,8 +530,9 @@ pub(crate) fn parent_origins(
         })
         .map_err(mem_err)?;
     let mut rows = rows.collect::<std::result::Result<Vec<_>, _>>().map_err(mem_err)?;
-    let connectors = super::connectors::load(conn, STORE_MEMORIES, memory_id)?;
-    for row in &mut rows { row.connectors = connectors.clone(); }
+    for row in &mut rows {
+        row.connectors = super::connectors::load_origin(conn, memory_id, row)?;
+    }
     Ok(rows)
 }
 

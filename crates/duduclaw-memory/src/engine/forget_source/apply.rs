@@ -69,6 +69,7 @@ fn diff(planned: &PlanBody, now: &PlanBody) -> StaleReason {
         "entity_embeddings_orphaned",
         planned.entity_embeddings_orphaned == now.entity_embeddings_orphaned,
     );
+    part("orphan_entity_ids", planned.orphan_entity_ids == now.orphan_entity_ids);
     part("wiki_pages", planned.wiki_pages == now.wiki_pages);
     part(
         "review_cards_matching",
@@ -266,6 +267,7 @@ fn write_apply(
         agent_id: agent.to_string(),
         plan_hash: plan.plan_hash.clone(),
         system_rows: c.body.system_rows,
+        retained_shared: c.body.retained_shared,
         untracked_in_namespace_planned: doc.body.untracked_in_namespace,
         untracked_in_namespace_at_apply: c.body.untracked_in_namespace,
         other_namespaces_referencing_planned: doc.body.other_namespaces_referencing,

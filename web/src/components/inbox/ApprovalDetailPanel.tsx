@@ -800,6 +800,7 @@ function DisconnectForgetFacts({ payload }: { payload: Record<string, unknown> |
               memories: count('memories'), facts: count('key_facts'), archives: count('archive'),
               unattributed: count('unattributed'), system: count('system_kept'),
             })}</p>
+            <p>{intl.formatMessage({ id: 'forget.approval.retainedShared' }, { count: count('retained_shared') })}</p>
           </div>
         );
       })}

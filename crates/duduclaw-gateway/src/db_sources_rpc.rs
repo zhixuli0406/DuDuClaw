@@ -191,6 +191,9 @@ async fn upsert(home_dir: &Path, params: Value) -> WsFrame {
     if let Err(msg) = write_block(&mut doc, &name, &block) {
         return WsFrame::error_response("", &msg);
     }
+    if let Err(msg) = crate::disconnect_forget::connections::mark_connecting(home_dir, &format!("db:{name}")) {
+        return WsFrame::error_response("", &msg);
+    }
     if let Err(msg) = commit(&config_path, &doc).await {
         return WsFrame::error_response("", &msg);
     }

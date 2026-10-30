@@ -29,12 +29,13 @@ describe('disconnect memory approval', () => {
       summary: 'Disconnected Company Google', created_at: new Date().toISOString(), ttl_seconds: 604800,
       payload: {
         origin: 'connector_disconnect',
-        counts_by_agent: [{ agent_id: 'assistant', memories: 7, key_facts: 3, archive: 2, unattributed: 11, system_kept: 5 }],
+        counts_by_agent: [{ agent_id: 'assistant', memories: 7, key_facts: 3, archive: 2, unattributed: 11, system_kept: 5, retained_shared: 13 }],
       },
     };
     renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
     const counts = screen.getByTestId('disconnect-forget-counts');
     expect(counts).toHaveTextContent('assistant');
+    expect(counts).toHaveTextContent('13 shared memories stay because another connected source also supplied them.');
     expect(counts).toHaveTextContent('Memories: 7; key facts: 3; archive copies: 2; cannot attribute: 11; system rows kept: 5.');
     expect(counts).toHaveTextContent('Out of scope: conversation text, tool_calls.jsonl, wiki and backups.');
     expect(screen.getByText(/the receipt is created only when deletion finishes/)).toBeInTheDocument();

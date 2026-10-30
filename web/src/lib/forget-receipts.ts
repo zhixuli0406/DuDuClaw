@@ -8,6 +8,7 @@ export interface ForgetReceiptCount {
   archive_deleted: number;
   unattributed: number;
   system_kept: number;
+  retained_shared: number;
 }
 
 export interface ForgetReceipt {
@@ -21,8 +22,18 @@ export interface ForgetReceipt {
   not_covered: string[];
 }
 
+export interface ForgetJob {
+  id: string;
+  display_name: string;
+  status: 'planned' | 'applying' | 'quarantined';
+  attempt_count: number;
+  next_attempt_at: number;
+  last_error: string | null;
+}
+
 export const forgetReceipts = {
-  list: () => client.call('memory.forget_receipts_list', {}) as Promise<{ receipts: ForgetReceipt[] }>,
+  list: () => client.call('memory.forget_receipts_list', {}) as Promise<{ receipts: ForgetReceipt[]; jobs?: ForgetJob[] }>,
+  retry: (id: string) => client.call('memory.forget_batch_retry', { id }),
   get: (id: string) => client.call('memory.forget_receipts_get', { id }) as Promise<{ receipt: ForgetReceipt }>,
 };
 

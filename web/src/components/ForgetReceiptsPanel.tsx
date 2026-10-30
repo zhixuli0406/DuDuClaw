@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Download, ReceiptText } from 'lucide-react';
-import { forgetReceipts, type ForgetReceipt } from '@/lib/forget-receipts';
+import { forgetReceipts, type ForgetReceipt, type ForgetJob } from '@/lib/forget-receipts';
 import { useConnectionStore } from '@/stores/connection-store';
 import { formatError, toast } from '@/lib/toast';
 import {
@@ -13,6 +13,8 @@ export function ForgetReceiptsPanel() {
   const intl = useIntl();
   const connection = useConnectionStore((s) => s.state);
   const [receipts, setReceipts] = useState<ForgetReceipt[]>([]);
+  const [jobs, setJobs] = useState<ForgetJob[]>([]);
+  const [retrying, setRetrying] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
@@ -26,10 +28,14 @@ export function ForgetReceiptsPanel() {
     try {
       const result = await forgetReceipts.list();
       if (!Array.isArray(result.receipts)) throw new Error('Invalid receipt list');
-      if (request === generation.current) setReceipts(result.receipts);
+      if (request === generation.current) {
+        setReceipts(result.receipts);
+        setJobs(Array.isArray(result.jobs) ? result.jobs : []);
+      }
     } catch (err) {
       if (request === generation.current) {
         setReceipts([]);
+        setJobs([]);
         setError(err);
       }
     } finally {
@@ -39,7 +45,7 @@ export function ForgetReceiptsPanel() {
 
   useEffect(() => {
     if (connection === 'authenticated') void load();
-    else setReceipts([]);
+    else { setReceipts([]); setJobs([]); }
     return () => { generation.current += 1; };
   }, [connection, load]);
 
@@ -61,6 +67,18 @@ export function ForgetReceiptsPanel() {
       toast.error(intl.formatMessage({ id: 'forget.receipts.downloadFailed' }, { message: formatError(err) }));
     } finally {
       setDownloading(null);
+    }
+  };
+
+  const retry = async (id: string) => {
+    setRetrying(id);
+    try {
+      await forgetReceipts.retry(id);
+      await load();
+    } catch (err) {
+      toast.error(intl.formatMessage({ id: 'forget.receipts.retryFailed' }, { message: formatError(err) }));
+    } finally {
+      setRetrying(null);
     }
   };
 
@@ -98,7 +116,7 @@ export function ForgetReceiptsPanel() {
                     <Table>
                       <TableHeader>
                         <TableRow>
-                          {['employee', 'memories', 'keyFacts', 'archives', 'unattributed', 'systemKept'].map((key) => (
+                          {['employee', 'memories', 'keyFacts', 'archives', 'unattributed', 'systemKept', 'retainedShared'].map((key) => (
                             <TableHead key={key}>{t(key)}</TableHead>
                           ))}
                         </TableRow>
@@ -112,18 +130,43 @@ export function ForgetReceiptsPanel() {
                             <TableCell>{count.archive_deleted}</TableCell>
                             <TableCell>{count.unattributed}</TableCell>
                             <TableCell>{count.system_kept}</TableCell>
+                            <TableCell>{count.retained_shared ?? '—'}</TableCell>
                           </TableRow>
                         ))}
                       </TableBody>
                     </Table>
                   </div>
                   <p className="text-xs text-muted-foreground">{t('unattributedHint')}</p>
+                  <p className="text-xs text-muted-foreground">{t('retainedSharedHint')}</p>
                   <Button size="sm" variant="outline" disabled={downloading != null} onClick={() => void download(receipt.id)}>
                     <Download className="mr-1 size-3" aria-hidden />
                     {t('download')}
                   </Button>
                 </div>
               </details>
+            ))}
+          </div>
+        )}
+        {connection === 'authenticated' && !loading && error == null && jobs.length > 0 && (
+          <div className="space-y-3">
+            <h3 className="text-sm font-medium">{t('jobsTitle')}</h3>
+            {jobs.map((job) => (
+              <div key={job.id} className="space-y-2 rounded-lg border border-surface-border p-3">
+                <p className="text-sm font-medium">{job.display_name} · {t(`job.${job.status}`)}</p>
+                <p className="break-all text-xs text-muted-foreground">{t('batch')}: {job.id}</p>
+                <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'forget.receipts.attempts' }, { count: job.attempt_count })}</p>
+                {job.last_error && <p className="text-sm">{t('failureReason')}: {job.last_error}</p>}
+                {job.status === 'quarantined' ? (
+                  <>
+                    <p className="text-xs text-muted-foreground">{t('quarantinedHint')}</p>
+                    <Button size="sm" variant="outline" disabled={retrying != null} onClick={() => void retry(job.id)}>
+                      {t('retry')}
+                    </Button>
+                  </>
+                ) : job.next_attempt_at > 0 && (
+                  <p className="text-xs text-muted-foreground">{t('nextAttempt')}: {new Date(job.next_attempt_at * 1000).toLocaleString()}</p>
+                )}
+              </div>
             ))}
           </div>
         )}
