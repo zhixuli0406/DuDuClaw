@@ -7,6 +7,12 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 Goal cost and loop guards currently use the **Advanced config editor**, without dedicated Automation controls. In `config.toml [goal_loop]`, `default_cost_cap_cents = 0` sets the fallback goal ceiling in US cents (`0` = no cap), and `tool_streak_pause = 8` pauses after that many identical consecutive tool calls within one finished round (`0` = disabled). Saving in the Advanced config editor reloads the goal loop; direct edits to `config.toml` require a gateway restart. `tool_streak_advisory` independently controls the existing hints. Per-goal ceilings are set when assigning a goal; `/goals` shows spend and lets an authorized operator raise a paused goal's ceiling and retry.
 
 
+## Codex CLI updates
+
+On macOS and Linux, Codex CLI 0.164.0 or newer is required for normal employee runs with workspace-write permissions. When an installed version is too old or cannot be confirmed, Admins see a banner across dashboard pages showing the current version and an **Update Codex CLI** button. The button runs `npm install -g @openai/codex` on the gateway computer and streams progress. After a verified update the banner disappears; no gateway restart is needed.
+
+If npm is missing or installation fails, the banner provides the exact manual command with a copy button. If an older Homebrew or standalone binary still takes precedence, the banner shows its path so you can update or remove that copy, then choose **Check again**. A version that cannot be confirmed is reported separately from success. This requirement does not apply to Windows.
+
 ## How saving works
 
 Enterprise setting (v1.76.0, User Management → Organisation settings): `users.org_settings.get/update` controls `[people] manager_team_history` (default on for valid config). Inform staff before enabling it. The switch takes effect immediately, advances the activation boundary when re-enabled, and is protected/audited in the raw editor too. See [Read-only team conversations](../features/68-manager-team-history.md).

@@ -9060,5 +9060,11 @@
   "security.egress.block": "送信を拒否",
   "security.egress.limits": "対象はプラットフォームの MCP ツールとサードパーティー MCP プロキシです。CLI ネイティブツールは対象外です。記録のみでは呼び出しは許可されます。",
   "security.egress.loadFailed": "設定を読み込めませんでした。再読み込みしてから変更してください。",
-  "security.egress.save": "送信の保護設定を保存"
+  "security.egress.save": "送信の保護設定を保存",
+  "runtimeUpdate.title": "Codex CLI を 0.164.0 以降に更新してください",
+  "runtimeUpdate.description": "現在のバージョン：{version}。更新ボタンを押すと、このゲートウェイのパソコンで npm による更新を実行し、進行状況を表示します。完了後、ゲートウェイを再起動せずに利用できます。",
+  "runtimeUpdate.action": "Codex CLI を更新",
+  "runtimeUpdate.unknownVersion": "確認できません",
+  "runtimeUpdate.shadowed": "更新コマンドは完了しましたが、古い Codex CLI が見つかりました：{path}。この古いバージョンを更新または削除してから、再検出してください。",
+  "runtimeUpdate.unverified": "更新コマンドは完了しましたが、Codex CLI のバージョンを確認できません。インストール状況を確認してから再検出してください。"
 }

@@ -9060,5 +9060,11 @@
   "security.egress.block": "Block sending",
   "security.egress.limits": "Covers platform MCP tools and the third-party MCP proxy. Native CLI tools are outside this guard. Observation records a warning but still allows the call.",
   "security.egress.loadFailed": "Could not load the setting. Reload before making changes.",
-  "security.egress.save": "Save outgoing data guard"
+  "security.egress.save": "Save outgoing data guard",
+  "runtimeUpdate.title": "Codex CLI needs version 0.164.0 or newer",
+  "runtimeUpdate.description": "Current version: {version}. Updating will run npm on this gateway computer and show its progress. You can continue afterward without restarting the gateway.",
+  "runtimeUpdate.action": "Update Codex CLI",
+  "runtimeUpdate.unknownVersion": "unknown",
+  "runtimeUpdate.shadowed": "The update command finished, but an older Codex CLI is still being found: {path}. Update or remove that copy, then choose Check again.",
+  "runtimeUpdate.unverified": "The update command finished, but the Codex CLI version could not be confirmed. Check the installation, then try Check again."
 }

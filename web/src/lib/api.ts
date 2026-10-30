@@ -3349,6 +3349,9 @@ export interface RuntimeDetect {
   /** Per-runtime rows; deprecation fields are absent on older gateways. */
   runtimes?: Array<{
     id?: string;
+    version?: string | null;
+    minimum_version?: string | null;
+    update_required?: boolean;
     deprecated?: boolean;
     replacement?: string | null;
     remove_in?: string | null;
@@ -3394,7 +3397,11 @@ export interface RuntimeInstallOutput {
 export interface RuntimeInstallStatus {
   session_id: string;
   provider: InstallableProvider;
-  status: 'succeeded' | 'failed' | 'timeout';
+  status: 'succeeded' | 'failed' | 'timeout' | 'update_shadowed' | 'version_unverified';
+  reason?: string | null;
+  path?: string | null;
+  version?: string | null;
+  update_required?: boolean;
   exit_code: number | null;
   /** Authoritative: is the binary actually resolvable now? */
   detected: boolean;

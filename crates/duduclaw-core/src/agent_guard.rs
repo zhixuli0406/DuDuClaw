@@ -36,6 +36,20 @@ pub const AGENT_STRUCTURE_FILES: &[&str] = &[
     "INSTRUCTIONS.md",
 ];
 
+/// CLI sandboxes freeze authority and runtime configuration to prevent self-escalation.
+/// MEMORY.md and CLAUDE.md remain writable employee working files.
+pub const EMPLOYEE_CONTROL_PATHS: &[&str] = &[
+    "agent.toml",
+    "SOUL.md",
+    "CONTRACT.toml",
+    "INSTRUCTIONS.md",
+    ".mcp.json",
+    ".codex",
+    ".grok",
+    ".claude",
+    ".agents",
+];
+
 /// Outcome of the guard check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardDecision {

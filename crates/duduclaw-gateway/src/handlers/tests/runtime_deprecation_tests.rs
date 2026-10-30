@@ -73,7 +73,7 @@ fn runtime_catalog_and_detect_rows_exclude_removed_clis() {
     }
     for spec in duduclaw_core::runtime_catalog::cli_specs() {
         assert!(duduclaw_core::runtime_catalog::removed_runtime(spec.id).is_none());
-        let row = runtime_detect_row(spec, None, None);
+        let row = runtime_detect_row(spec, None, None, None);
         assert_eq!(row["id"], spec.id);
         assert_eq!(row["installed"], false);
         assert_eq!(row["deprecated"], false);
@@ -96,4 +96,25 @@ async fn gemini_model_id_does_not_auto_align_to_a_cli() {
     ).await;
     assert!(ok(&frame), "{frame:?}");
     assert_eq!(provider_on_disk(home.path(), "claude-agent").as_deref(), Some("claude"));
+}
+
+
+#[test]
+fn runtime_update_row_shape_and_boundary() {
+    use super::super::runtime_models_rpc::runtime_detect_row;
+    for spec in duduclaw_core::runtime_catalog::cli_specs() {
+        let row = runtime_detect_row(spec, Some("/test/bin"), None, Some("codex-cli 0.163.0"));
+        assert_eq!(row["update_required"], cfg!(unix) && spec.id == "codex");
+        if spec.id == "codex" {
+            assert_eq!(row["version"], "0.163.0");
+            assert_eq!(row["minimum_version"], "0.164.0");
+            let boundary = runtime_detect_row(spec, Some("/test/bin"), None, Some("codex-cli 0.164.0"));
+            assert_eq!(boundary["update_required"], false);
+            assert_eq!(runtime_detect_row(spec, Some("/test/bin"), None, None)["update_required"], cfg!(unix));
+            assert_eq!(runtime_detect_row(spec, None, None, None)["update_required"], false);
+        } else {
+            assert!(row["version"].is_null());
+            assert!(row["minimum_version"].is_null());
+        }
+    }
 }

@@ -9060,5 +9060,11 @@
   "security.egress.block": "阻擋送出",
   "security.egress.limits": "涵蓋平台 MCP 工具與第三方 MCP 代理，不涵蓋 CLI 原生工具。僅記錄模式會留下紀錄，仍允許執行。",
   "security.egress.loadFailed": "無法載入設定，請重新整理後再修改。",
-  "security.egress.save": "儲存外送防護設定"
+  "security.egress.save": "儲存外送防護設定",
+  "runtimeUpdate.title": "Codex CLI 需要更新至 0.164.0 以上",
+  "runtimeUpdate.description": "目前版本：{version}。按下更新後，會在這台閘道主機透過 npm 更新 Codex CLI，並顯示進度。更新完成後即可繼續使用，不必重新啟動閘道。",
+  "runtimeUpdate.action": "更新 Codex CLI",
+  "runtimeUpdate.unknownVersion": "無法確認",
+  "runtimeUpdate.shadowed": "更新指令已完成，但目前仍找到舊版 Codex CLI：{path}。請更新或移除這個舊版本，再按「重新偵測」。",
+  "runtimeUpdate.unverified": "更新指令已完成，但仍無法確認 Codex CLI 版本。請確認安裝狀況後重新偵測。"
 }
