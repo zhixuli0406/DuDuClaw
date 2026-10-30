@@ -16,6 +16,7 @@ pub fn error(error: Error) -> &'static str {
         Error::TlsRequired => "遠端閘道必須使用 HTTPS 或 WSS，且憑證必須有效",
         Error::LocalOnly => "自動登入僅限本機閘道",
         Error::Network => "無法連線至閘道，請檢查連線與憑證",
+        Error::SnapshotBudget => "清單超過安全容量，資料可能過期；請改用儀表板查看",
         Error::Protocol => "閘道回應格式不符，請確認版本",
         Error::LoginRequired => {
             "登入失敗或登入已失效，請重新登入；若尚未設定密碼，請先在儀表板設定密碼或啟用本機自動登入"
@@ -70,3 +71,8 @@ pub const HEARTBEAT: &str = "心跳";
 pub const CRON: &str = "排程";
 pub const NO_ID: &str = "此項目沒有可保存的已讀識別碼";
 pub const TERMINAL_SMALL: &str = "終端太小，請放大至至少 24 欄、12 列；q 離開";
+
+pub const AI_SESSION_REFUSED: &str = "控制室只供操作者使用，不能在 AI 員工工作階段中啟動";
+pub const LOGIN_METHOD: &str = "選擇登入方式（擇一即可，驗證碼不是雙因素驗證）";
+pub const LOGIN_PASSWORD: &str = "帳號密碼";
+pub const LOGIN_EMAIL_CODE: &str = "電子郵件帳號驗證碼";

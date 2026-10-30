@@ -27,6 +27,8 @@ pub(crate) fn activity_event(map: &mut HashMap<String, Activity>, name: &str, pa
     let Some(agent) = payload.get("agent_id").and_then(Value::as_str) else {
         return;
     };
+    // Live hints never retain arbitrarily large identifiers from push events.
+    if agent.len() > 1024 || payload.get("run_id").and_then(Value::as_str).is_some_and(|id| id.len() > 1024) { return; }
     match name {
         "agent.turn_started" => {
             map.entry(agent.into()).or_default().working = true;
@@ -47,7 +49,7 @@ pub(crate) fn activity_event(map: &mut HashMap<String, Activity>, name: &str, pa
         _ => {}
     }
 }
-pub(crate) async fn schedules(client: &Client) -> Result<Vec<ScheduledRun>> {
+pub(crate) async fn schedules(client: &Client, budget: &mut crate::budget::SnapshotBudget) -> Result<Vec<ScheduledRun>> {
     let mut result = Vec::new();
     // These are existing Admin-only RPCs. No prediction from a cron expression:
     // timezones, disabled jobs and the scheduler's clock belong to the gateway.
@@ -58,6 +60,7 @@ pub(crate) async fn schedules(client: &Client) -> Result<Vec<ScheduledRun>> {
         let response = client
             .call(method, json!({}), Duration::from_secs(5))
             .await?;
+        budget.charge(&response, field)?;
         let rows = response
             .get(field)
             .and_then(Value::as_array)
@@ -91,27 +94,17 @@ pub(crate) async fn schedules(client: &Client) -> Result<Vec<ScheduledRun>> {
 pub(crate) async fn recent_activity(
     client: &Client,
     employees: &[crate::state::Employee],
+    budget: &mut crate::budget::SnapshotBudget,
 ) -> Result<HashMap<String, Activity>> {
-    use futures_util::{StreamExt, TryStreamExt, stream};
-    let ids: Vec<_> = employees.iter().map(|e| e.id().to_owned()).collect();
-    stream::iter(ids)
-        .map(|id| {
-            let client = client.clone();
-            async move {
-                let response = client
-                    .call(
-                        "runs.list",
-                        json!({"agent_id":id, "limit":50}),
-                        Duration::from_secs(5),
-                    )
-                    .await?;
-                let activity = activity_from_runs(&id, &response)?;
-                Ok((id, activity))
-            }
-        })
-        .buffer_unordered(4)
-        .try_collect()
-        .await
+    let mut result = HashMap::new();
+    // Sequential requests let an exceeded global budget stop immediately.
+    for employee in employees {
+        let id = employee.id();
+        let response = client.call("runs.list", json!({"agent_id":id, "limit":50}), Duration::from_secs(5)).await?;
+        budget.charge(&response, "runs")?;
+        result.insert(id.to_owned(), activity_from_runs(id, &response)?);
+    }
+    Ok(result)
 }
 fn activity_from_runs(agent: &str, response: &Value) -> Result<Activity> {
     let rows = response

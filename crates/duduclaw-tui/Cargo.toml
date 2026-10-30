@@ -10,6 +10,7 @@ duduclaw-gateway.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 serde.workspace = true
@@ -31,6 +32,8 @@ libc = "0.2"
 [dev-dependencies]
 insta.workspace = true
 axum.workspace = true
+tracing-subscriber.workspace = true
+log = "0.4"
 
 [lints]
 workspace = true

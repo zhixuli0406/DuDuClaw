@@ -43,6 +43,9 @@ const PROTECTED_HOME_PATHS: &[&str] = &[
     "cost_telemetry.db",
     "message_queue.db",
     "users.db",
+    // Operator control-room preferences and local read receipts
+    "tui-state.json",
+    "tui.toml",
     // breaker / guard state
     "budget_breaker_state.json",
     "dispatch_guard.json",

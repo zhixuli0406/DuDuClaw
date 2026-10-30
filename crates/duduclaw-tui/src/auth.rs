@@ -10,11 +10,14 @@ use std::{
 use zeroize::{Zeroize, Zeroizing};
 
 /// Implementations must disable echo for Password and Otp, and never log input.
-/// Phase 3 supplies the terminal implementation; tests supply scripted answers.
+/// The CLI supplies the terminal implementation; tests supply scripted answers.
 #[async_trait]
 #[allow(clippy::double_must_use)] // async_trait annotates its already-must-use Future.
 pub trait LoginPrompt: Send {
     async fn read(&mut self, field: PromptField) -> Result<Zeroizing<String>>;
+    async fn method(&mut self) -> Result<LoginMethod> {
+        Ok(LoginMethod::Password)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptField {
@@ -33,6 +36,12 @@ impl PromptField {
     pub fn secret(self) -> bool {
         self != Self::Email
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginMethod {
+    Password,
+    EmailCode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -184,12 +193,14 @@ impl RestHttp {
     ) -> Result<reqwest::RequestBuilder> {
         let url = self.target.endpoint(path);
         let request = match body {
-            Some(body) => self
+            Some(mut body) => self
                 .client
                 .post(url)
                 .header("content-type", "application/json")
-                // HTTP/TLS libraries own wire copies which cannot be zeroized by us.
-                .body(body.to_vec()),
+                // Transfer ownership without an extra application-side secret copy.
+                // reqwest/HTTP/TLS own this allocation and any wire copies;
+                // their eventual deallocation is not guaranteed to zeroize.
+                .body(std::mem::take(&mut *body)),
             None => self.client.get(url),
         };
         if path == "/api/session/local" {
@@ -284,33 +295,21 @@ impl AuthClient {
                 return Err(Error::SetupRequired);
             }
         }
+        let method = prompt.method().await?;
         let email = prompt.read(PromptField::Email).await?;
-        let password = prompt.read(PromptField::Password).await?;
-        #[derive(Serialize)]
-        struct PasswordBody<'a> {
-            email: &'a str,
-            password: &'a str,
+        // Both endpoints issue full sessions. OTP is an alternative login,
+        // never a second factor appended to a successful password login.
+        if method == LoginMethod::Password {
+            let password = prompt.read(PromptField::Password).await?;
+            #[derive(Serialize)]
+            struct PasswordBody<'a> {
+                email: &'a str,
+                password: &'a str,
+            }
+            return Self::decode::<TokenPair>(self.post("/api/login", &PasswordBody {
+                email: &email, password: &password,
+            }).await?)?.into_session();
         }
-        let pair: TokenPair = Self::decode(
-            self.post(
-                "/api/login",
-                &PasswordBody {
-                    email: &email,
-                    password: &password,
-                },
-            )
-            .await?,
-        )?;
-        drop(password);
-        let session = pair.into_session()?;
-        if matches!(mode, LoginMode::Personal) {
-            return Ok(session);
-        }
-        let expected_id = session.account.id.clone();
-        // Current gateway OTP endpoints are standalone passwordless login,
-        // not server-bound MFA. Require both locally, discard password tokens,
-        // and require OTP to resolve to the same account.
-        drop(session);
         #[derive(Serialize)]
         struct OtpRequest<'a> {
             email: &'a str,
@@ -343,11 +342,7 @@ impl AuthClient {
             )
             .await?,
         )?;
-        let session = pair.into_session()?;
-        if session.account.id != expected_id {
-            return Err(Error::IdentityChanged);
-        }
-        Ok(session)
+        pair.into_session()
     }
     pub async fn refresh(&self, session: &mut Session) -> Result<()> {
         #[derive(Serialize)]

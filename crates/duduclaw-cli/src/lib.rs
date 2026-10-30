@@ -91,6 +91,7 @@ mod computer_profiles_cmd;
 mod computer_workspaces_cmd; // P2-C: `duduclaw computer-workspaces` (operator-only)
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
+mod tui_cmd;
 mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
@@ -421,6 +422,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 開啟唯讀控制室，查看待處理事項與員工狀態
+    Tui {
+        #[command(subcommand)]
+        command: Option<tui_cmd::TuiCommands>,
+    },
     /// Initialize DuDuClaw environment and configuration
     Onboard {
         /// Skip interactive prompts and use defaults
@@ -3989,6 +3995,21 @@ pub async fn entry_point() {
         }
         return;
     }
+    if is_tui_command(&cli.command) {
+        // The TUI owns the terminal. Never initialize a subscriber, log file,
+        // log facade bridge or OTLP here, regardless of RUST_LOG. In particular
+        // tungstenite TRACE payloads include the connect-frame JWT.
+        if cli.force_disable_redaction {
+            eprintln!("控制室不支援 --force-disable-redaction");
+            std::process::exit(2);
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        if let Err(error) = duduclaw_tui::without_tracing(run(cli)).await {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Install ring as the default rustls CryptoProvider (required for TLS WebSocket connections).
     // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -4140,6 +4161,10 @@ pub async fn entry_point() {
     }
 }
 
+fn is_tui_command(command: &Commands) -> bool {
+    matches!(command, Commands::Tui { .. })
+}
+
 fn is_read_only_survival_command(command: &Commands) -> bool {
     matches!(command, Commands::Maintenance(MaintenanceCommands::Knobs {
         command: KnobsCommands::Survival { .. },
@@ -4148,6 +4173,7 @@ fn is_read_only_survival_command(command: &Commands) -> bool {
 
 async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
     match cli.command {
+        Commands::Tui { command } => tui_cmd::run(&duduclaw_home(), command).await,
         Commands::Onboard { yes } => cmd_onboard(yes).await,
         Commands::Run { yes } => cmd_run_server(yes).await,
         Commands::Agent { command } => match command {
@@ -6446,6 +6472,9 @@ fn agent_file_guard_decision(
                     protected
                 } else {
                     bash_reserved_agent_create(command, &home, &caller)
+                        .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, tui_cmd::OPERATOR_COMMANDS)
+                        })
                         .or_else(|| {
                             channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
                         })
@@ -13846,6 +13875,20 @@ mod cli_verb_consolidation_tests {
     /// an about string — the regression this fixes is invisible to any
     /// behavioural test.
     #[test]
+    fn tui_commands_parse_into_no_logging_entry() {
+        run_on_big_stack(|| {
+            for args in [vec!["tui"], vec!["tui", "inbox"], vec!["tui", "inbox", "--follow", "--json"]] {
+                assert!(is_tui_command(&parse(&args).command));
+            }
+            assert!(matches!(parse(&["tui", "inbox", "--follow", "--json"]).command,
+                Commands::Tui { command: Some(tui_cmd::TuiCommands::Inbox { follow: true, json: true }) }));
+            assert!(!is_tui_command(&parse(&["agent", "list"]).command));
+            rejects(&["tui", "--token", "secret"]);
+            rejects(&["tui", "watch"]);
+        });
+    }
+
+    #[test]
     fn wizard_has_a_help_description() {
         run_on_big_stack(wizard_has_a_help_description_body);
     }
@@ -14314,6 +14357,34 @@ mod removed_name_hook_tests {
     /// P2-A appendix D.1 (moved from core onto the shared operator-command
     /// matcher at the S9 rebase): `duduclaw responsibility …`, every
     /// subcommand, is refused for employees and unverified callers.
+    #[test]
+    fn tui_bash_and_operator_files_are_protected_through_hook() {
+        let h = home_with_trash();
+        for caller in [agent("ceo"), HookCaller::Untrusted("ceo".into())] {
+            for cmd in ["duduclaw tui", "duduclaw tui inbox --json", "duduclaw-pro tui inbox --follow", "env -u DUDUCLAW_AGENT_ID duduclaw tui"] {
+                let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &caller).unwrap();
+                assert!(!d.is_allowed(), "{d:?}");
+                if matches!(caller, HookCaller::Agent(_)) {
+                    assert!(matches!(d, GuardDecision::BlockedOperatorCommand { command: "duduclaw tui", .. }), "{d:?}");
+                }
+            }
+            // The existing home allowlist already denies operator-owned files;
+            // pin both TUI entries here rather than add a weaker basename rule.
+            for file in ["tui-state.json", "tui.toml"] {
+                let path = h.path().join(file);
+                for tool in ["Write", "Edit", "MultiEdit"] {
+                    let envelope = json!({"tool_name":tool,"tool_input":{"file_path":path,"content":"x","old_string":"a","new_string":"b","edits":[{"old_string":"a","new_string":"b"}]}});
+                    let d = agent_file_guard_decision(tool, &envelope, h.path(), &caller).unwrap();
+                    assert!(!d.is_allowed(), "{file} {tool}: {d:?}");
+                }
+                let cmd = format!("echo x > '{}'", path.display());
+                let d = agent_file_guard_decision("Bash", &bash(&cmd), h.path(), &caller).unwrap();
+                assert!(!d.is_allowed(), "{file}: {d:?}");
+            }
+        }
+        assert!(agent_file_guard_decision("Bash", &bash("duduclaw tui"), h.path(), &HookCaller::Absent).unwrap().is_allowed());
+    }
+
     #[test]
     fn bash_responsibility_is_blocked_through_the_hook() {
         let h = home_with_trash();

@@ -26,6 +26,13 @@ impl GatewayUrl {
             Some(_) => false,
             None => return Err(Error::InvalidUrl),
         };
+        // Never resolve the special local name via hosts/DNS before sending
+        // credentials. Pin both REST and WebSocket endpoints to literal IPv4.
+        // IPv6-only operators can explicitly use [::1]. TLS still validates
+        // the resulting IP identity; no certificate-verification exception.
+        if origin.host_str() == Some("localhost") {
+            origin.set_host(Some("127.0.0.1")).map_err(|_| Error::InvalidUrl)?;
+        }
         let scheme = match origin.scheme() {
             "http" | "ws" if loopback => "http",
             "http" | "ws" => return Err(Error::TlsRequired),
@@ -98,6 +105,16 @@ mod tests {
             "https://example.com/api",
         ] {
             assert!(GatewayUrl::parse(url).is_err());
+        }
+    }
+    #[test]
+    fn localhost_is_pinned_for_both_transports() {
+        for scheme in ["http", "https", "ws", "wss"] {
+            let url = GatewayUrl::parse(&format!("{scheme}://localhost:8443")).unwrap();
+            assert!(url.is_loopback());
+            assert_eq!(url.endpoint("/api/login").host_str(), Some("127.0.0.1"));
+            assert_eq!(url.websocket().host_str(), Some("127.0.0.1"));
+            assert_eq!(url.websocket().port(), Some(8443));
         }
     }
     #[test]

@@ -2,9 +2,19 @@
 use std::fmt::Write;
 
 fn forbidden(c: char) -> bool {
-    matches!(c, '\u{0000}'..='\u{0009}' | '\u{000b}'..='\u{001f}' |
-        '\u{007f}'..='\u{009f}' | '\u{202a}'..='\u{202e}' |
-        '\u{2066}'..='\u{2069}' | '\u{200b}'..='\u{200d}' | '\u{feff}')
+    // Explicit default-ignorable/bidi-format ranges, including reserved tags.
+    // Preserve FE00..FE0F: removing them changes CJK glyphs and emoji
+    // presentation. The requested tag-plane range E0000..E0FFF is removed
+    // in full, including supplementary variation selectors.
+    matches!(c,
+        '\u{0000}'..='\u{0009}' | '\u{000b}'..='\u{001f}' |
+        '\u{007f}'..='\u{009f}' | '\u{00ad}' | '\u{034f}' | '\u{061c}' |
+        '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}' |
+        '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' |
+        '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' |
+        '\u{3164}' | '\u{feff}' | '\u{ffa0}' | '\u{fff0}'..='\u{fff8}' |
+        '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
+        '\u{e0000}'..='\u{e0fff}')
 }
 
 pub fn sanitize_for_terminal(input: &str) -> String {
@@ -87,10 +97,27 @@ mod tests {
                 let input = c.to_string();
                 let plain = sanitize_for_terminal(&input);
                 assert_eq!(plain.is_empty(), forbidden(c));
-                assert!(!sanitize_for_terminal_visible(&input).chars().any(forbidden));
+                let visible = sanitize_for_terminal_visible(&input);
+                assert!(!visible.chars().any(forbidden));
+                assert_eq!(sanitize_for_terminal_visible(&visible), visible);
                 assert_eq!(sanitize_for_terminal(&plain), plain);
             }
         }
+    }
+    #[test]
+    fn explicit_ignorable_and_bidi_regressions() {
+        for n in [0xad, 0x34f, 0x61c, 0x115f, 0x1160, 0x17b4, 0x17b5,
+            0x180b, 0x180e, 0x180f, 0x200e, 0x200f, 0x2060, 0x206a,
+            0x206b, 0x206c, 0x206d, 0x206e, 0x206f, 0x3164, 0xffa0,
+            0xfff0, 0xfff8, 0x1bca0, 0x1bca3, 0x1d173, 0x1d17a,
+            0xe0000, 0xe0020, 0xe007f, 0xe0080, 0xe0100, 0xe01f0, 0xe0fff] {
+            let input = format!("甲{}乙", char::from_u32(n).unwrap());
+            assert_eq!(sanitize_for_terminal(&input), "甲乙", "U+{n:X}");
+            assert_eq!(sanitize_for_terminal_visible(&input), format!("甲⟨U+{n:04X}⟩乙"));
+        }
+        let variation = "❤️漢\u{fe00}";
+        assert_eq!(sanitize_for_terminal(variation), variation);
+        assert_eq!(sanitize_for_terminal_visible(variation), variation);
     }
     #[test]
     fn preserves_layout_newline_and_normal_unicode() {

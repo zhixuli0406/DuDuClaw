@@ -1,5 +1,6 @@
 //! Read-only control room and line-oriented inbox. The host CLI owns login and guards.
 pub mod auth;
+pub mod budget;
 pub mod client;
 pub mod sanitize;
 pub mod state;
@@ -23,6 +24,7 @@ pub enum Error {
     LocalOnly,
     Network,
     Protocol,
+    SnapshotBudget,
     LoginRequired,
     SetupRequired,
     PasswordChangeRequired,
@@ -45,3 +47,10 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// TUI entry never installs logging. Also silence an embedding host's subscriber
+/// for every poll; tasks that own secrets must use this wrapper when spawned.
+pub async fn without_tracing<F: std::future::Future>(future: F) -> F::Output {
+    use tracing::instrument::WithSubscriber;
+    future.with_subscriber(tracing::subscriber::NoSubscriber::default()).await
+}

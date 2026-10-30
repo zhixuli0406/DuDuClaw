@@ -45,6 +45,11 @@ impl AuthHttp for Script {
 struct Prompt(VecDeque<(PromptField, &'static str)>);
 #[async_trait]
 impl LoginPrompt for Prompt {
+    async fn method(&mut self) -> Result<LoginMethod> {
+        Ok(if self.0.iter().any(|(field, _)| *field == PromptField::Otp) {
+            LoginMethod::EmailCode
+        } else { LoginMethod::Password })
+    }
     async fn read(&mut self, field: PromptField) -> Result<Zeroizing<String>> {
         let (expected, value) = self.0.pop_front().expect("unexpected prompt");
         assert_eq!(field, expected);
@@ -57,6 +62,7 @@ fn prompt(otp: bool) -> Prompt {
         (PromptField::Password, "fixture-password"),
     ]);
     if otp {
+        p.pop_back();
         p.push_back((PromptField::Otp, "123456"));
     }
     Prompt(p)
@@ -148,12 +154,11 @@ async fn remote_never_attempts_local_login() {
     assert!(s.0.lock().unwrap().is_empty());
 }
 #[tokio::test]
-async fn team_password_then_otp_real_shapes_and_same_account() {
+async fn team_email_code_is_a_complete_login_without_password() {
     for otp_id in ["u1", "u2"] {
         let (c, s) = client(
             "http://localhost",
             vec![
-                password(pair("u1", false)),
                 Step {
                     path: "/api/otp/request",
                     body: Some(json!({"email":"test@example.com"})),
@@ -171,11 +176,7 @@ async fn team_password_then_otp_real_shapes_and_same_account() {
         let result = c
             .login(LoginMode::TeamOrEnterprise, &mut prompt(true))
             .await;
-        if otp_id == "u1" {
-            assert!(result.is_ok());
-        } else {
-            assert!(matches!(result, Err(Error::IdentityChanged)));
-        }
+        assert_eq!(result.unwrap().account.id, otp_id);
         assert!(s.0.lock().unwrap().is_empty());
     }
 }
@@ -279,4 +280,61 @@ fn real_http_local_marker_is_loopback_only() {
             .unwrap();
         assert!(request.headers().get("x-duduclaw-local").is_none());
     }
+}
+
+#[tokio::test]
+async fn team_password_is_a_complete_login_without_otp() {
+    let (c, s) = client("http://localhost", vec![password(pair("u1", false))]);
+    let mut p = prompt(false);
+    assert!(c.login(LoginMode::TeamOrEnterprise, &mut p).await.is_ok());
+    assert!(s.0.lock().unwrap().is_empty());
+    assert!(p.0.is_empty());
+}
+
+// The child owns the global log/tracing bridge, so parallel unit tests cannot
+// alter the subscriber under test. No socket bind or real credentials involved.
+#[test]
+fn trace_handshake_never_prints_jwt() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "auth::tests::trace_handshake_child", "--ignored", "--nocapture"])
+        .env("RUST_LOG", "trace")
+        .output().unwrap();
+    let captured = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "handshake child failed");
+    assert!(captured.contains("TRACE_CAPTURE_ACTIVE"));
+    assert!(!captured.contains(&token("jwt-log-canary")), "JWT leaked");
+    assert!(!captured.contains("QUIET_CONTEXT_CANARY"), "TUI tracing was enabled");
+    // Also catch byte/hex payload dumps that would not contain the literal JWT.
+    for line in captured.lines().filter(|line| line.contains("tungstenite")) {
+        assert!(line.contains("TRACE_CAPTURE_ACTIVE"), "network trace escaped suppression");
+    }
+}
+
+#[tokio::test]
+#[ignore = "run only by trace_handshake_never_prints_jwt with captured output"]
+async fn trace_handshake_child() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{WebSocketStream, tungstenite::{Message, protocol::Role as WsRole}};
+    // A trace-level host is deliberately installed first, including the log
+    // facade bridge used by tungstenite. Production CLI installs none.
+    tracing_subscriber::fmt().with_env_filter("trace").with_ansi(false).init();
+    log::trace!(target: "tungstenite", "TRACE_CAPTURE_ACTIVE");
+    let session = serde_json::from_value::<TokenPair>(pair("jwt-log-canary", false)).unwrap().into_session().unwrap();
+    crate::without_tracing(async {
+        log::trace!(target: "tungstenite", "QUIET_CONTEXT_CANARY");
+        let (a, b) = tokio::io::duplex(8192);
+        let mut client = WebSocketStream::from_raw_socket(a, WsRole::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(b, WsRole::Server, None).await;
+        let server = async {
+            let Message::Text(text) = server.next().await.unwrap().unwrap() else { panic!("expected connect") };
+            let frame: duduclaw_gateway::protocol::WsFrame = serde_json::from_str(&text).unwrap();
+            let duduclaw_gateway::protocol::WsFrame::Request { id, method, params } = frame else { panic!("expected request") };
+            assert_eq!(method, "connect");
+            assert!(params["jwt"].as_str() == Some(session.access_token()), "token mismatch");
+            let response = duduclaw_gateway::protocol::WsFrame::ok_response(&id, json!({"status":"authenticated", "user":{"id":"jwt-log-canary", "email":"test@example.com", "role":"employee"}}));
+            server.send(Message::Text(serde_json::to_string(&response).unwrap().into())).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(crate::client::authenticate(&mut client, &session, 1), server);
+        assert!(result.is_ok());
+    }).await;
 }

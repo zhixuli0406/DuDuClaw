@@ -49,6 +49,8 @@ struct Fixture {
     list_calls: AtomicUsize,
     list_delay_ms: AtomicU64,
     short_token: bool,
+    flood: AtomicUsize,
+    task_calls: AtomicUsize,
 }
 struct Gateway {
     target: GatewayUrl,
@@ -84,6 +86,8 @@ impl Gateway {
             list_calls: AtomicUsize::new(0),
             list_delay_ms: AtomicU64::new(0),
             short_token,
+            flood: AtomicUsize::new(0),
+            task_calls: AtomicUsize::new(0),
         });
         let app = Router::new()
             .route("/api/session/local", post(local_session))
@@ -214,16 +218,31 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                     Message::Text(text) => {
                         let WsFrame::Request { id,method,params } = serde_json::from_str(&text).unwrap() else { panic!("RPC must be a request"); };
                         let response = match method.as_str() {
-                            "agents.list" => json!({"agents":[{"name":"adu","display_name":"阿嘟\u{202e}\u{1b}","status":"active","archived":false}]}),
+                            "agents.list" => {
+                                if f.flood.load(Ordering::SeqCst) == 0 {
+                                    json!({"agents":[{"name":"adu","display_name":"阿嘟\u{202e}\u{1b}","status":"active","archived":false}]})
+                                } else {
+                                    json!({"agents":(0..30).map(|i| json!({"name":format!("agent-{i}"),"display_name":"flood","status":"active","archived":false})).collect::<Vec<_>>()})
+                                }
+                            },
                             "approvals.list" => {
                                 f.list_calls.fetch_add(1,Ordering::SeqCst);
                                 tokio::time::sleep(Duration::from_millis(f.list_delay_ms.load(Ordering::SeqCst))).await;
                                 json!({"approvals":[{"id":"a1","agent_id":"adu","kind":"tool","summary":"需要審核\u{1b}[2K\u{202e}","status":"pending","request_kind":"question","expires_at":null,"decided_in_dashboard_only":true}],"count":1})
                             }
                             "tasks.list_page" => {
-                                assert_eq!(params["agent_id"],"adu","non-admin requires agent scope");
+                                f.task_calls.fetch_add(1, Ordering::SeqCst);
                                 assert_eq!(params["status"],"needs_human");
-                                json!({"tasks":[{"id":"t1","title":"請確認","assigned_to":"adu","status":"needs_human","pause_reason":"unknown","goal_mode":true}],"total":1,"limit":200,"offset":0})
+                                let flood = f.flood.load(Ordering::SeqCst);
+                                if flood == 0 {
+                                    assert_eq!(params["agent_id"],"adu","non-admin requires agent scope");
+                                    json!({"tasks":[{"id":"t1","title":"請確認","assigned_to":"adu","status":"needs_human","pause_reason":"unknown","goal_mode":true}],"total":1,"limit":200,"offset":0})
+                                } else {
+                                    let agent = params["agent_id"].as_str().expect("agent scope");
+                                    let count = if flood == 1 { 100 } else { 1 };
+                                    let title = if flood == 1 { "small".into() } else { "x".repeat(210_000) };
+                                    json!({"tasks":(0..count).map(|i| json!({"id":format!("{agent}-{i}"), "title":title, "assigned_to":agent,"status":"needs_human"})).collect::<Vec<_>>(),"total":count})
+                                }
                             }
                             "runs.list" => {
                                 assert_eq!(params["agent_id"], "adu");
@@ -450,4 +469,48 @@ async fn json_follow_reports_loss_and_recovery_without_duplicate_poll_output() {
     let recovered = timeout(Duration::from_secs(6),rx.recv()).await.unwrap().unwrap();assert_eq!(recovered,first);
     assert!(timeout(Duration::from_millis(5200),rx.recv()).await.is_err());
     task.abort(); let _=task.await;
+}
+
+#[tokio::test]
+async fn cross_agent_item_and_byte_floods_abort_without_publishing_partial_lists() {
+    for flood in [1, 2] {
+        let Some(gateway) = Gateway::start(false).await else { return; };
+        let client = gateway.client().await;
+        let mut feed = StateFeed::start(client, Duration::from_secs(60));
+        model_until(&mut feed.receiver, |m| m.inbox.count() == Some(2)).await;
+        gateway.fixture.flood.store(flood, Ordering::SeqCst);
+        let before = gateway.fixture.task_calls.load(Ordering::SeqCst);
+        gateway.push("events_lost", 1, "boot-a");
+        model_until(&mut feed.receiver, |m| m.inbox.error == Some(Error::SnapshotBudget)).await;
+        {
+            let model = feed.receiver.borrow();
+            assert!(model.inbox.stale && model.employees.stale);
+            assert_eq!(model.inbox.count(), None);
+            assert_eq!(model.employees.count(), None);
+            assert_eq!(model.inbox.items.len(), 2, "keep the last complete list");
+            assert_eq!(model.employees.items.len(), 1);
+            assert_eq!(model.employees.items[0].id(), "adu");
+        }
+        let stopped = gateway.fixture.task_calls.load(Ordering::SeqCst);
+        assert!(stopped - before < 30, "refetch must stop before fetching every agent");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gateway.fixture.task_calls.load(Ordering::SeqCst), stopped, "no hot retry");
+    }
+}
+
+#[tokio::test]
+async fn event_flood_is_bounded_and_oversized_frame_reconnects() {
+    let Some(gateway) = Gateway::start(false).await else { return; };
+    let client = gateway.client().await;
+    connected(&client, 1).await;
+    let mut events = client.events();
+    for seq in 1..=48 { gateway.push("future.event", seq, "boot-a"); }
+    timeout(Duration::from_secs(2), async {
+        while events.len() <= duduclaw_tui::client::EVENT_QUEUE_CAPACITY {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(matches!(events.recv().await, Err(broadcast::error::RecvError::Lagged(_))));
+    gateway.fixture.events.send(Control::Push(json!({"type":"event", "event":"future.event", "payload":{"blob":"x".repeat(duduclaw_tui::client::MAX_FRAME_BYTES + 1)}}))).unwrap();
+    connected(&client, 2).await;
 }

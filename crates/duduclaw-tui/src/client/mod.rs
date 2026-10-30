@@ -8,7 +8,7 @@ use duduclaw_gateway::protocol::WsFrame;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
@@ -20,7 +20,11 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
+
+// Bound wire allocations and queued parsed events independently of list budgets.
+pub const MAX_FRAME_BYTES: usize = 256 * 1024;
+pub const EVENT_QUEUE_CAPACITY: usize = 16;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone, Debug)]
@@ -95,7 +99,7 @@ impl Client {
         }
         let (tx, rx) = mpsc::channel(64);
         let (status_tx, status_rx) = watch::channel(ConnectionState::Connecting);
-        let (events, _) = broadcast::channel(256);
+        let (events, _) = broadcast::channel(EVENT_QUEUE_CAPACITY);
         let actor = Actor {
             auth,
             session,
@@ -106,7 +110,7 @@ impl Client {
             next_id: 0,
             generation: 0,
         };
-        let task = tokio::spawn(actor.run());
+        let task = tokio::spawn(crate::without_tracing(actor.run()));
         Ok(Self {
             inner: Arc::new(Inner {
                 commands: tx,
@@ -245,8 +249,8 @@ impl Actor {
     }
     async fn open(&self) -> Result<(Socket, ConnectionInfo)> {
         let config = WebSocketConfig::default()
-            .max_message_size(Some(4 * 1024 * 1024))
-            .max_frame_size(Some(4 * 1024 * 1024));
+            .max_message_size(Some(MAX_FRAME_BYTES))
+            .max_frame_size(Some(MAX_FRAME_BYTES));
         let (mut socket, _) = tokio_tungstenite::connect_async_with_config(
             self.auth.target().websocket().as_str(),
             Some(config),
@@ -254,58 +258,8 @@ impl Actor {
         )
         .await
         .map_err(|_| Error::Network)?;
-        let mut params = json!({"jwt": self.session.access_token(), "client": "tui"});
-        let mut frame = WsFrame::Request {
-            id: "connect".into(),
-            method: "connect".into(),
-            params: params.take(),
-        };
-        let wire = Zeroizing::new(serde_json::to_string(&frame).map_err(|_| Error::Protocol)?);
-        if let WsFrame::Request { params, .. } = &mut frame
-            && let Some(Value::String(token)) = params.get_mut("jwt")
-        {
-            token.zeroize();
-        }
-        // tungstenite owns its wire copy; the application-owned buffers are wiped.
-        socket
-            .send(Message::Text(wire.to_string().into()))
-            .await
-            .map_err(|_| Error::Network)?;
-        while let Some(message) = socket.next().await {
-            match message.map_err(|_| Error::Network)? {
-                Message::Text(text) => {
-                    let frame: WsFrame =
-                        serde_json::from_str(&text).map_err(|_| Error::Protocol)?;
-                    match frame {
-                        WsFrame::Response {
-                            id, ok, payload, ..
-                        } if id == "connect" => {
-                            if !ok {
-                                return Err(Error::LoginRequired);
-                            }
-                            return Ok((
-                                socket,
-                                handshake(
-                                    payload.ok_or(Error::Protocol)?,
-                                    &self.session.account.id,
-                                    self.generation + 1,
-                                )?,
-                            ));
-                        }
-                        // Current server can send a challenge before connect.
-                        WsFrame::Event { .. } => {}
-                        _ => return Err(Error::Protocol),
-                    }
-                }
-                Message::Ping(bytes) => socket
-                    .send(Message::Pong(bytes))
-                    .await
-                    .map_err(|_| Error::Network)?,
-                Message::Close(_) => return Err(Error::Disconnected),
-                _ => {}
-            }
-        }
-        Err(Error::Disconnected)
+        let info = authenticate(&mut socket, &self.session, self.generation + 1).await?;
+        Ok((socket, info))
     }
     async fn serve(&mut self, socket: &mut Socket) -> End {
         let mut pending: HashMap<String, Command> = HashMap::new();
@@ -388,6 +342,78 @@ impl Actor {
         end
     }
 }
+pub(crate) async fn authenticate<S>(
+    socket: &mut WebSocketStream<S>,
+    session: &Session,
+    generation: u64,
+) -> Result<ConnectionInfo>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Borrow the token while serializing: no secret-bearing serde_json::Value.
+    #[derive(serde::Serialize)]
+    struct Connect<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        id: &'static str,
+        method: &'static str,
+        params: ConnectParams<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct ConnectParams<'a> {
+        jwt: &'a str,
+        client: &'static str,
+    }
+    let mut wire = Zeroizing::new(
+        serde_json::to_string(&Connect {
+            kind: "req",
+            id: "connect",
+            method: "connect",
+            params: ConnectParams {
+                jwt: session.access_token(),
+                client: "tui",
+            },
+        })
+        .map_err(|_| Error::Protocol)?,
+    );
+    // Ownership moves into tungstenite; it and TLS may retain unzeroized wire
+    // buffers. Avoid an additional explicit to_string() copy in our code.
+    socket
+        .send(Message::Text(std::mem::take(&mut *wire).into()))
+        .await
+        .map_err(|_| Error::Network)?;
+    while let Some(message) = socket.next().await {
+        match message.map_err(|_| Error::Network)? {
+            Message::Text(text) => {
+                let frame: WsFrame = serde_json::from_str(&text).map_err(|_| Error::Protocol)?;
+                match frame {
+                    WsFrame::Response {
+                        id, ok, payload, ..
+                    } if id == "connect" => {
+                        if !ok {
+                            return Err(Error::LoginRequired);
+                        }
+                        return handshake(
+                            payload.ok_or(Error::Protocol)?,
+                            &session.account.id,
+                            generation,
+                        );
+                    }
+                    // Current server can send a challenge before connect.
+                    WsFrame::Event { .. } => {}
+                    _ => return Err(Error::Protocol),
+                }
+            }
+            Message::Ping(bytes) => socket
+                .send(Message::Pong(bytes))
+                .await
+                .map_err(|_| Error::Network)?,
+            Message::Close(_) => return Err(Error::Disconnected),
+            _ => {}
+        }
+    }
+    Err(Error::Disconnected)
+}
 async fn send(socket: &mut Socket, message: Message, budget: Duration) -> bool {
     matches!(timeout(budget, socket.send(message)).await, Ok(Ok(())))
 }
@@ -451,6 +477,7 @@ fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn handshake_rejects_legacy_and_password_change() {
         let mut hello =

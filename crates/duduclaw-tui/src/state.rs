@@ -186,7 +186,10 @@ impl Model {
             }
             self.seq = Some(seq);
         }
-        if !regressed {
+        // Only visible employees can populate the persistent activity map;
+        // unknown-agent event floods must not allocate unbounded entries.
+        if !regressed && event.payload.get("agent_id").and_then(Value::as_str)
+            .is_some_and(|id| self.employees.items.iter().any(|e| e.id() == id)) {
             crate::state_extra::activity_event(&mut self.activity, &event.name, &event.payload);
         }
         if event.name == "autonomy.changed" {
@@ -217,6 +220,7 @@ impl Model {
         match result {
             Ok(lists) => {
                 self.employees.replace(lists.employees);
+                self.activity.retain(|id, _| self.employees.items.iter().any(|e| e.id() == id));
                 self.inbox.replace(lists.inbox);
                 match lists.recent_activity {
                     Ok(activity) => self.recent_activity = activity,
@@ -249,12 +253,14 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     struct Agents {
         agents: Vec<Employee>,
     }
-    let agents: Agents =
-        serde_json::from_value(client.call("agents.list", json!({}), RPC_TIMEOUT).await?)
-            .map_err(|_| Error::Protocol)?;
+    let mut budget = crate::budget::SnapshotBudget::default();
+    let response = client.call("agents.list", json!({}), RPC_TIMEOUT).await?;
+    budget.charge(&response, "agents")?;
+    let agents: Agents = serde_json::from_value(response).map_err(|_| Error::Protocol)?;
     let approvals = client
         .call("approvals.list", json!({}), RPC_TIMEOUT)
         .await?;
+    budget.charge(&approvals, "approvals")?;
     let values = approvals
         .get("approvals")
         .and_then(Value::as_array)
@@ -284,6 +290,7 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
                 params["agent_id"] = json!(agent);
             }
             let response = client.call("tasks.list_page", params, RPC_TIMEOUT).await?;
+            budget.charge(&response, "tasks")?;
             let rows = response
                 .get("tasks")
                 .and_then(Value::as_array)
@@ -294,9 +301,11 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
                 .ok_or(Error::Protocol)?;
             // Offset pagination is not a transaction. Detect observed movement
             // or truncation and keep counts unknown until a later poll succeeds.
-            if expected_total.is_some_and(|old| old != total) || total > 10_000 {
+            if expected_total.is_some_and(|old| old != total) {
                 return Err(Error::Protocol);
             }
+            // total is per agent; budget remains shared across every agent.
+            budget.ensure_items(total.saturating_sub(offset + rows.len() as u64))?;
             expected_total = Some(total);
             for row in rows {
                 let mut task: HumanTask =
@@ -316,8 +325,10 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
             }
         }
     }
-    let recent_activity = crate::state_extra::recent_activity(client, &agents.agents).await;
-    let schedules = if role == Role::Admin { crate::state_extra::schedules(client).await } else { Ok(Vec::new()) };
+    let recent_activity = crate::state_extra::recent_activity(client, &agents.agents, &mut budget).await;
+    if matches!(recent_activity, Err(Error::SnapshotBudget)) { return Err(Error::SnapshotBudget); }
+    let schedules = if role == Role::Admin { crate::state_extra::schedules(client, &mut budget).await } else { Ok(Vec::new()) };
+    if matches!(schedules, Err(Error::SnapshotBudget)) { return Err(Error::SnapshotBudget); }
     Ok(Lists {
         recent_activity,
         schedules,
@@ -344,10 +355,23 @@ impl StateFeed {
     }
 }
 async fn run(client: Client, tx: watch::Sender<Model>, interval: Duration) {
-    let mut connection = client.connection();
-    let mut events = client.events();
+    run_with_sources(client.connection(), client.events(), tx, interval, move |role| {
+        let client = client.clone();
+        Box::pin(async move { fetch(&client, role).await })
+    }).await;
+}
+
+async fn run_with_sources(
+    mut connection: watch::Receiver<ConnectionState>,
+    mut events: broadcast::Receiver<ServerEvent>,
+    tx: watch::Sender<Model>,
+    interval: Duration,
+    mut fetch_lists: impl FnMut(Role) -> futures_util::future::BoxFuture<'static, Result<Lists>>,
+) {
     let mut model = Model::default();
-    let mut poll = tokio::time::interval(interval);
+    // The connection already triggers the initial fetch. An immediate first
+    // interval tick would mark that fetch dirty and schedule a duplicate.
+    let mut poll = tokio::time::interval_at(Instant::now() + interval, interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut fetching: Option<futures_util::future::BoxFuture<'static, (u64, Result<Lists>)>> = None;
     let mut dirty = true;
@@ -360,10 +384,20 @@ async fn run(client: Client, tx: watch::Sender<Model>, interval: Duration) {
                     dirty = true;
                 }
                 if dirty && fetching.is_none() {
-                    let client = client.clone();
+                    // Cover all already queued invalidations with this fetch.
+                    // Events received after it starts still request one follow-up.
+                    loop {
+                        match events.try_recv() {
+                            Ok(event) => model.event(&event),
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => model.invalidate_all(),
+                            Err(broadcast::error::TryRecvError::Empty) => break,
+                            Err(broadcast::error::TryRecvError::Closed) => return,
+                        }
+                    }
                     let revision = model.revision;
+                    let fetch = fetch_lists(info.role);
                     fetching = Some(Box::pin(async move {
-                        (revision, fetch(&client, info.role).await)
+                        (revision, fetch.await)
                     }));
                     dirty = false;
                 }
@@ -389,14 +423,15 @@ async fn run(client: Client, tx: watch::Sender<Model>, interval: Duration) {
                 Err(broadcast::error::RecvError::Lagged(_)) => { model.invalidate_all(); dirty = true; }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
-            _ = poll.tick() => { dirty = true; }
+            _ = poll.tick() => { dirty |= fetching.is_none(); }
             completed = async { fetching.as_mut().expect("guarded fetch").await }, if fetching.is_some() => {
                 fetching = None;
                 let (revision, result) = completed;
-                {
-                        // A failure waits for the next modest poll, avoiding a hot retry loop.
-                        if !model.apply(revision, result) { dirty = true; }
-                }
+                let succeeded = result.is_ok();
+                let applied = model.apply(revision, result);
+                // A stale successful result needs one follow-up. A failure,
+                // including one raced by an event, waits for a new trigger.
+                dirty = succeeded && (dirty || !applied);
             }
             _ = tx.closed() => return,
         }
@@ -426,6 +461,86 @@ mod tests {
             seq,
             boot_id: boot_id.map(str::to_owned),
         }
+    }
+    #[tokio::test]
+    async fn refetch_coalesces_events_and_failure_waits_for_a_new_trigger() {
+        use tokio::sync::{mpsc, oneshot};
+        use tokio::time::timeout;
+
+        let (_connection, connection) = watch::channel(ConnectionState::Connected(ConnectionInfo {
+            generation: 1, user_id: "u1".into(), role: Role::Admin,
+            boot_id: Some("boot-a".into()), version: None, autonomy: None,
+        }));
+        let (events, event_rx) = broadcast::channel(32);
+        let (tx, mut models) = watch::channel(Model::default());
+        let (requests, mut calls) = mpsc::unbounded_channel::<oneshot::Sender<Result<Lists>>>();
+        let task = tokio::spawn(run_with_sources(connection, event_rx, tx, Duration::from_secs(60), move |_| {
+            let requests = requests.clone();
+            Box::pin(async move {
+                let (reply, result) = oneshot::channel();
+                requests.send(reply).unwrap();
+                result.await.unwrap()
+            })
+        }));
+        let complete = || Ok(Lists {
+            recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
+            employees: vec![], inbox: vec![],
+        });
+        let first = timeout(Duration::from_secs(2), calls.recv()).await.unwrap().unwrap();
+        first.send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
+        timeout(Duration::from_secs(2), async {
+            loop {
+                models.changed().await.unwrap();
+                if models.borrow().inbox.count() == Some(0) { break; }
+            }
+        }).await.unwrap();
+        assert!(timeout(Duration::from_millis(30), calls.recv()).await.is_err(), "startup must not schedule a second fetch");
+
+        // A queued burst is covered by the same snapshot, even with seq gaps.
+        for seq in [1, 3, 5] {
+            assert!(events.send(event("events_lost", Some(seq), Some("boot-a"))).is_ok());
+        }
+        let burst = timeout(Duration::from_secs(2), calls.recv()).await.unwrap().unwrap();
+        burst.send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
+        assert!(timeout(Duration::from_millis(30), calls.recv()).await.is_err(), "one burst must cause one fetch");
+
+        assert!(events.send(event("events_lost", Some(6), Some("boot-a"))).is_ok());
+        let running = timeout(Duration::from_secs(2), calls.recv()).await.unwrap().unwrap();
+        for seq in [7, 8, 9] {
+            assert!(events.send(event("task.updated", Some(seq), Some("boot-a"))).is_ok());
+        }
+        // Wait until all invalidations have been processed before completing the fetch.
+        timeout(Duration::from_secs(2), async {
+            while models.borrow_and_update().seq != Some(9) {
+                models.changed().await.unwrap();
+            }
+        }).await.unwrap();
+        running.send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
+        let followup = timeout(Duration::from_secs(2), calls.recv()).await.unwrap().unwrap();
+        assert_eq!(models.borrow().inbox.count(), None, "outdated success must stay stale");
+        // Even another invalidation during a failed follow-up must not hot retry.
+        assert!(events.send(event("events_lost", Some(10), Some("boot-a"))).is_ok());
+        timeout(Duration::from_secs(2), async {
+            while models.borrow_and_update().seq != Some(10) {
+                models.changed().await.unwrap();
+            }
+        }).await.unwrap();
+        followup.send(Err(Error::SnapshotBudget)).unwrap_or_else(|_| panic!("fetch dropped"));
+        assert!(timeout(Duration::from_millis(30), calls.recv()).await.is_err(), "failed fetch must wait for the next trigger");
+        assert_eq!(models.borrow().inbox.count(), None);
+        assert_eq!(models.borrow().employees.count(), None);
+
+        assert!(events.send(event("events_lost", Some(11), Some("boot-a"))).is_ok());
+        let recovery = timeout(Duration::from_secs(2), calls.recv()).await.unwrap().unwrap();
+        recovery.send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
+        timeout(Duration::from_secs(2), async {
+            loop {
+                models.changed().await.unwrap();
+                if models.borrow().inbox.count() == Some(0) { break; }
+            }
+        }).await.unwrap();
+        assert!(timeout(Duration::from_millis(30), calls.recv()).await.is_err());
+        task.abort();
     }
     #[test]
     fn loss_gap_regression_boot_and_reconnect_make_counts_unknown() {
@@ -498,6 +613,43 @@ mod tests {
         ));
         assert_eq!(m.inbox.count(), Some(0));
     }
+    #[test]
+    fn budget_failure_keeps_previous_complete_snapshot_stale() {
+        let mut model = fresh();
+        model.employees.items.push(Employee {
+            name: "old".into(), display_name: TerminalText::new("Old".into()),
+            status: TerminalText::new("active".into()), archived: false,
+        });
+        model.inbox.items.push(InboxItem::Task(HumanTask {
+            id: "previous".into(), title: TerminalText::new("Previous".into()),
+            assigned_to: TerminalText::new("old".into()), status: TerminalText::new("needs_human".into()),
+            pause_reason: None, goal_mode: true, detail: TerminalText::default(),
+        }));
+        model.invalidate_all();
+        assert!(model.apply(model.revision, Err(Error::SnapshotBudget)));
+        assert_eq!(model.employees.items[0].id(), "old");
+        assert_eq!(model.inbox.items.len(), 1);
+        assert_eq!(model.inbox.count(), None);
+        assert_eq!(model.employees.count(), None);
+        assert_eq!(model.inbox.error, Some(Error::SnapshotBudget));
+    }
+    #[test]
+    fn unknown_employee_event_flood_cannot_grow_live_activity() {
+        let mut model = fresh();
+        for id in 0..3_000 {
+            let mut e = event("agent.turn_started", None, None);
+            e.payload = json!({"agent_id":format!("unknown-{id}")});
+            model.event(&e);
+        }
+        assert!(model.activity.is_empty());
+        model.activity.insert("removed".into(), Activity::default());
+        assert!(model.apply(model.revision, Ok(Lists {
+            recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
+            employees: vec![], inbox: vec![],
+        })));
+        assert!(model.activity.is_empty(), "rotating employee IDs cannot accumulate across snapshots");
+    }
+
     #[test]
     fn unavailable_history_does_not_claim_fresh_employee_state() {
         let mut model = fresh();

@@ -1815,6 +1815,7 @@ dependencies = [
  "duduclaw-os",
  "duduclaw-redaction",
  "duduclaw-security",
+ "duduclaw-tui",
  "encoding_rs",
  "flate2",
  "futures-util",
@@ -1849,6 +1850,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "zeroize",
  "zip",
 ]
 
@@ -2422,6 +2424,7 @@ dependencies = [
  "futures-util",
  "insta",
  "libc",
+ "log",
  "rand 0.8.6",
  "ratatui",
  "reqwest",
@@ -2431,6 +2434,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "toml",
+ "tracing",
+ "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width",
  "url",
