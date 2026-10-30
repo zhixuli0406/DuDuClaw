@@ -1276,9 +1276,12 @@ mod cost_cap_tests {
     #[tokio::test]
     async fn tasks_create_timeout_only_narrows_the_assignee_limit() {
         let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join("agents/bot");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs = 900\n").unwrap();
+        // Employee writes are admitted only for a readable, active profile.
+        super::super::tests::create_test_agent(&home.path().join("agents"), "bot", "");
+        let agent_path = home.path().join("agents/bot/agent.toml");
+        let mut profile = std::fs::read_to_string(&agent_path).unwrap();
+        profile.push_str("\n[runtime]\ntimeout_secs = 900\n");
+        std::fs::write(agent_path, profile).unwrap();
         for actor in [RecordActor::Agent("bot"), RecordActor::Operator("bot")] {
             let wider = handle_tasks_create(
                 &serde_json::json!({"title":"goal","kind":"goal","timeout_secs":901}),
