@@ -114,7 +114,9 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("timeline activity: {e}")),
         };
         // Task titles are board-card fields; activity text tied to a task the
-        // reader may not read is dropped (task_privacy gate).
+        // reader may not read is dropped (task_privacy gate). The linked
+        // task id is board-card metadata, just as it is in activity.list;
+        // adding navigation must not restore a private summary or metadata.
         let owners = activity_task_owners(&store, &activities).await;
         let activities: Vec<ActivityRow> = activities
             .into_iter()

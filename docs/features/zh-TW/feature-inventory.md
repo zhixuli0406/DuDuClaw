@@ -436,6 +436,8 @@
 
 | 功能 | 說明 |
 |------|------|
+| 收件匣 `/inbox` | 統一待辦數、到期優先、封存保護、處理結果與手機決策列，詳見[儀表板指南](../../guides/zh-TW/dashboard-settings.md#收件匣與工作時間軸)。 |
+| 工作時間軸 `/timeline` | 四種狀態計數與員工卡片，查看成果、卡住與等待決定的事；可開啟任務，另有預設收合的時間分布。 |
 | 路由 | `web/src/App.tsx` 內約 74 條非轉址路由（另有約 30 條 legacy 轉址別名，讓舊書籤繼續可用）。四個殼：工作區（`/`、`/chat`、`/tasks`、`/goals`、`/inbox`、`/files`、`/mail`、`/timeline`、`/foresight`、`/gallery`、`/canvas`…）、AI 員工（`/agents`、`/agents/:id/:tab`、`/agents/new`、`/experts`、`/org`、`/presets`）、`/manage/*`（通道、日誌、帳務、成員、部門、經銷商、推理、本地模型、微調、可靠性、安全稽核、知識庫信任…）、`/app/system/*`（設定、安全、帳號、授權、因果、決策實驗室、CCR…），以及獨立頁（`/login`、`/welcome`、`/webchat`、`/console`、`/mascot-overlay`、`/pet-studio`、`/world`、`/launcher`）。側邊欄顯示什麼以 `web/src/components/layout/nav-model.ts` 為準 |
 | 技術棧 | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
 | DuDuClaw 設計系統（mds） | 共用 `web/src/components/mds/` 元件庫（OKLCH token、四層表面、三層陰影、Inter／Geist Mono）+ `nav-model.ts` 分組側邊欄（個人／工作／公司／設定）+ `web/DESIGN.md` 設計規範；全頁面以共用元件建構，en/ja/zh i18n 同步 |

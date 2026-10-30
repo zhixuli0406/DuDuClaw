@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
 import en from '@/i18n/en.json';
@@ -18,8 +18,8 @@ describe('InboxPage (Multica list+detail split)', () => {
     // Page title in the left list header.
     expect(screen.getByRole('heading', { name: 'Inbox' })).toBeInTheDocument();
     // The five scope tabs.
-    expect(screen.getByRole('button', { name: /Mine/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^All/ })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /To do/ })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /^All/ })).toBeInTheDocument();
   });
 
   it('shows the empty detail placeholder when nothing is selected', () => {
@@ -256,5 +256,47 @@ describe('InboxPage fan-out partial failure (L2 round 2)', () => {
     });
     expect(screen.getAllByText('Stuck blocked task').length).toBeGreaterThan(0);
     expect(screen.getByText("Some items couldn't be loaded")).toBeInTheDocument();
+  });
+});
+
+describe('Inbox triage safety', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    signIn('admin');
+    useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  });
+
+  it('reports the employee question cap and a failed question source', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'agents.list') return Promise.resolve({ agents: Array.from({ length: 13 }, (_, i) => ({ name: `staff-${i}` })) });
+      if (method === 'decisions.list') return Promise.reject(new Error('offline'));
+      return Promise.resolve({});
+    });
+    renderAt('/inbox');
+    expect(await screen.findByText(/first 12 of 13 employees/)).toBeInTheDocument();
+    expect(await screen.findByText("Some items couldn't be loaded")).toBeInTheDocument();
+    expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'decisions.list')).toHaveLength(12);
+  });
+
+  it('shows an outcome and removes decision buttons when a resolved approval is reopened', async () => {
+    mockWsClient.call.mockImplementation((method: string) => method === 'approvals.list'
+      ? Promise.resolve({ approvals: [{ ...APPROVAL_FIXTURE, id: 'receipt', summary: 'A safe request' }] }) : Promise.resolve({}));
+    renderAt('/inbox?item=receipt');
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole('tab', { name: /^All/ }));
+    fireEvent.click(screen.getByText('A safe request'));
+    expect(screen.getByRole('status')).toHaveTextContent('Approved');
+    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
+  });
+
+  it('shows a readable failed-work detail with its run link, without dumping data', async () => {
+    mockWsClient.call.mockImplementation((method: string) => method === 'audit.unified_log'
+      ? Promise.resolve({ events: [{ timestamp: '2026-10-31T00:00:00Z', agent_id: 'staff', severity: 'critical', event_type: 'channel_send_failure_alert', summary: 'INTERNAL RAW SUMMARY', details: { run_id: 'run-42', token: 'private-debug' } }] }) : Promise.resolve({}));
+    renderAt('/inbox?item=failed_run:staff:2026-10-31T00:00:00Z');
+    expect(await screen.findByText(/This work did not finish successfully/)).toBeInTheDocument();
+    expect(screen.queryByText(/private-debug|INTERNAL RAW SUMMARY/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'View work record' })).toBeInTheDocument();
   });
 });

@@ -20,8 +20,7 @@ import {
   DropdownMenuItem,
 } from '@/components/mds';
 import { ActivityFeed } from '@/components/ActivityFeed';
-import { type InboxItem, TYPE_URGENCY } from '@/lib/inbox-model';
-import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
+import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { NeedsMeRow } from '@/components/home/NeedsMeRow';
 import { LiveCards } from '@/components/home/LiveCards';
 import { RecentTasks } from '@/components/home/RecentTasks';
@@ -47,7 +46,6 @@ import {
   Bot,
 } from 'lucide-react';
 import { hasMinRole } from '@/lib/roles';
-import { approvalListTitle } from '@/components/inbox/knowledge-quarantine';
 
 /** Default widget order for a fresh user (server catalog order also matches). */
 const DEFAULT_ORDER = ['needs_me', 'my_agents', 'recent_activity', 'my_tasks', 'channel_health'];
@@ -119,7 +117,8 @@ export function HomePage() {
   const connectionState = useConnectionStore((s) => s.state);
   const authed = connectionState === 'authenticated';
 
-  const [needsMe, setNeedsMe] = useState<InboxItem[]>([]);
+  const inboxCount = useApprovalsStore(selectInboxCount);
+  const fetchInboxCount = useApprovalsStore((s) => s.fetchCount);
 
   // ── widget layout state ──
   const [catalog, setCatalog] = useState<string[]>([]);
@@ -231,50 +230,8 @@ export function HomePage() {
     if (!authed) return;
     fetchAgents();
 
-    const nameOf = (id: string) => {
-      const a = agents.find((x) => x.name === id);
-      return a?.display_name || id;
-    };
-
-    // "需要我" merged stream — five cheap sources (approvals / blocked /
-    // needs_human / budget / failed run). Each is best-effort: a
-    // manager-gated source that errors for this viewer contributes nothing
-    // (fail-safe, not fail-loud).
-    //
-    // W2-5: `blocked` and `needs_human` are two DISTINCT `TaskInfo.status`
-    // values (`task_store.rs`) — a goal-loop task escalated to `needs_human`
-    // never carries `status: 'blocked'`, so it was silently absent from this
-    // widget even though it is exactly the kind of "等你決定" item the strip
-    // exists for (the same gap `InboxPage`/`HealthOverview` already close via
-    // their own `needs_human` fetch).
-    Promise.all([
-      api.approvals.list().catch(() => null),
-      api.budget.incidents().catch(() => null),
-      api.tasks.list({ status: 'blocked' }).catch(() => null),
-      api.tasks.list({ status: 'needs_human' }).catch(() => null),
-      api.audit.unifiedLog({ sources: ['channel_failure'], limit: 20 }).catch(() => null),
-    ]).then(([approvals, budget, blocked, needsHuman, failed]) => {
-      const items: InboxItem[] = [];
-      for (const a of approvals?.approvals ?? []) {
-        items.push({ id: `approval:${a.id}`, type: 'approval', title: approvalListTitle(a, intl.formatMessage), agentId: a.agent_id, timestamp: a.created_at, urgency: TYPE_URGENCY.approval, actionable: true, status: 'pending' });
-      }
-      for (const t of [...(blocked?.tasks ?? []), ...(needsHuman?.tasks ?? [])]) {
-        items.push({ id: `blocked:${t.id}`, type: 'blocked', title: t.title, agentId: t.assigned_to || undefined, timestamp: t.updated_at, urgency: TYPE_URGENCY.blocked, actionable: true, status: t.status });
-      }
-      for (const inc of budget?.incidents ?? []) {
-        items.push({ id: `budget:${inc.agent_id}:${inc.ts}`, type: 'budget', title: intl.formatMessage({ id: 'inbox.budget.title' }, { agent: nameOf(inc.agent_id), scope: inc.scope }), agentId: inc.agent_id, timestamp: inc.ts, urgency: TYPE_URGENCY.budget, actionable: true, status: inc.event });
-      }
-      // W2-8: exclude `channel_recovered` rows and any failure a later
-      // recovery already resolved for the same channel (`lib/home-overview.ts`).
-      for (const ev of excludeRecoveredChannelFailures(failed?.events ?? [])) {
-        items.push({ id: `failed_run:${ev.agent_id}:${ev.timestamp}`, type: 'failed_run', title: ev.summary || intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameOf(ev.agent_id) }), agentId: ev.agent_id || undefined, channel: channelFailureChannel(ev), timestamp: ev.timestamp, urgency: TYPE_URGENCY.failed_run, actionable: false, status: ev.severity });
-      }
-      setNeedsMe(items);
-    }).catch(() => { /* silent — an empty strip is honest */ });
-    // agents intentionally excluded from deps: the name map is a display nicety
-    // resolved at fetch time; re-running on every agent tick would spam the RPCs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authed, fetchAgents, intl]);
+    void fetchInboxCount();
+  }, [authed, fetchAgents, fetchInboxCount]);
 
 
   // ── edit actions ──
@@ -314,7 +271,7 @@ export function HomePage() {
   const renderWidget = (id: string): ReactNode => {
     switch (id) {
       case 'needs_me':
-        return <NeedsMeRow total={needsMe.length} />;
+        return <NeedsMeRow total={inboxCount} />;
       case 'my_agents':
         return <LiveCards agents={scopedAgents} enabled={authed} />;
       case 'recent_activity':
@@ -387,7 +344,7 @@ export function HomePage() {
     .filter((w) => !w.hidden)
     // 拍板: the "需要我" strip is silent when empty (except in edit mode, where
     // every widget must stay reorderable/unhideable).
-    .filter((w) => !(w.id === 'needs_me' && !editing && needsMe.length === 0));
+    .filter((w) => !(w.id === 'needs_me' && !editing && inboxCount === 0));
   const hiddenWidgets = layout.filter((w) => w.hidden);
 
   const greeting = intl.formatMessage(

@@ -10,15 +10,16 @@ import {
   Check,
   ExternalLink,
 } from 'lucide-react';
-import { api, type ApprovalItem, type TaskInfo, type DecisionInfo, type InstallRequestInfo } from '@/lib/api';
+import { api, type ApprovalItem, type TaskInfo, type DecisionInfo, type InstallRequestInfo, type BudgetIncident, type UnifiedAuditEvent } from '@/lib/api';
 import { approvalListTitle, parseKnowledgeQuarantine, quarantineResultMessage } from '@/components/inbox/knowledge-quarantine';
 import { useConnectionStore } from '@/stores/connection-store';
-import { useApprovalsStore } from '@/stores/approvals-store';
+import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
+  Tabs, TabsList, TabsTab,
   PageHeader,
   Button,
   Empty,
@@ -52,6 +53,8 @@ import {
   type RiskLevel,
 } from '@/lib/approval-risk';
 import {
+  actionableInboxItems,
+  canArchiveInboxItem,
   type InboxItem,
   type InboxTab,
   type InboxGroupBy,
@@ -117,7 +120,8 @@ export function InboxPage() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const connectionState = useConnectionStore((s) => s.state);
-  const setPendingCount = useApprovalsStore((s) => s.setPendingCount);
+  const setInboxItems = useApprovalsStore((s) => s.setItems);
+  const inboxCount = useApprovalsStore(selectInboxCount);
 
   // H5 deep link: `?item=<id>` selects + scrolls to a specific row on load
   // (captured once at mount — the effect below resolves it against the
@@ -130,6 +134,17 @@ export function InboxPage() {
   const [agentNames, setAgentNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   /** First failure among the aggregate sources, if any (partial-load notice). */
+  const [decisionCoverage, setDecisionCoverage] = useState(0);
+  const [outcomes, setOutcomes] = useState<Record<string, 'approved' | 'denied'>>(() => {
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem('duduclaw:inbox:outcomes') ?? '{}');
+      return saved && typeof saved === 'object' ? Object.fromEntries(Object.entries(saved).filter(([, value]) => value === 'approved' || value === 'denied')) : {};
+    } catch { return {}; }
+  });
+  const [taskOutcomes, setTaskOutcomes] = useState<Record<string, string>>({});
+  useEffect(() => {
+    try { localStorage.setItem('duduclaw:inbox:outcomes', JSON.stringify(Object.fromEntries(Object.entries(outcomes).slice(-500)))); } catch { /* private mode */ }
+  }, [outcomes]);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [prefs, setPrefs] = useState<InboxPrefs>(loadPrefs);
   const [read, setRead] = useState<ReadonlySet<string>>(() => loadIdSet(READ_KEY));
@@ -211,6 +226,7 @@ export function InboxPage() {
         item: {
           id: `approval:${a.id}`,
           type: 'approval',
+          question: a.request_kind === 'question',
           // The server sentence for a held conflict carries internal detail;
           // the row says what it is in plain words instead.
           title: approvalListTitle(a, intl.formatMessage),
@@ -267,7 +283,7 @@ export function InboxPage() {
         item: {
           id: `budget:${inc.agent_id}:${inc.ts}`,
           type: 'budget',
-          title: intl.formatMessage({ id: 'inbox.budget.title' }, { agent: nameMap[inc.agent_id] ?? inc.agent_id, scope: inc.scope }),
+          title: intl.formatMessage({ id: 'inbox.budget.title' }, { agent: nameMap[inc.agent_id] ?? inc.agent_id, scope: intl.formatMessage({ id: inc.scope === 'daily' ? 'inbox.budget.daily' : inc.scope === 'monthly' ? 'inbox.budget.monthly' : 'inbox.budget.period' }) }),
           agentId: inc.agent_id,
           timestamp: inc.ts,
           urgency: TYPE_URGENCY.budget,
@@ -286,7 +302,7 @@ export function InboxPage() {
         item: {
           id: `failed_run:${ev.agent_id}:${ev.timestamp}`,
           type: 'failed_run',
-          title: ev.summary || intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameMap[ev.agent_id] ?? ev.agent_id }),
+          title: intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameMap[ev.agent_id] ?? ev.agent_id }),
           agentId: ev.agent_id || undefined,
           channel: channelFailureChannel(ev),
           timestamp: ev.timestamp,
@@ -305,6 +321,7 @@ export function InboxPage() {
     // Decisions require a per-agent call — poll a capped set of agents in
     // small concurrency-limited waves (rather than one N-wide burst) and fold
     // the results into the already-painted list.
+    setDecisionCoverage(agentsRes?.agents?.length ?? 0);
     const agentIds = (agentsRes?.agents ?? []).slice(0, DECISION_AGENT_CAP).map((a) => a.name);
     const decisionEntries: RawEntry[] = [];
     for (const wave of chunked(agentIds, DECISION_POLL_CONCURRENCY)) {
@@ -313,7 +330,7 @@ export function InboxPage() {
           api.decisions
             .list(name, 10)
             .then((r) => ({ name, decisions: r?.decisions ?? [] }))
-            .catch(() => ({ name, decisions: [] as DecisionInfo[] })),
+            .catch((error) => { setLoadError((previous: unknown) => previous ?? error); return { name, decisions: [] as DecisionInfo[] }; }),
         ),
       );
       for (const { name, decisions } of results) {
@@ -351,8 +368,13 @@ export function InboxPage() {
   // Pending badge = actionable, non-archived, not-yet-processed items — a
   // decided approval shouldn't keep inflating the "needs you" count (§C6).
   useEffect(() => {
-    setPendingCount(nonArchived.filter((i) => i.actionable && !processed.has(i.id)).length);
-  }, [nonArchived, processed, setPendingCount]);
+    if (!loading) {
+      const current = actionableInboxItems(items, processed, archived);
+      // A partial refresh cannot prove that previously seen work disappeared.
+      const missing = loadError == null ? [] : useApprovalsStore.getState().items.filter((old) => !items.some((item) => item.id === old.id));
+      setInboxItems(actionableInboxItems([...current, ...missing], processed, archived));
+    }
+  }, [items, archived, processed, loading, loadError, setInboxItems]);
 
   const findEntry = useCallback((id: string) => entries.find((e) => e.item.id === id), [entries]);
 
@@ -379,6 +401,7 @@ export function InboxPage() {
     (item: InboxItem) => {
       const entry = findEntry(item.id);
       if (!entry) return;
+      if (!canArchiveInboxItem(item, processed.has(item.id))) { toast.error(t('inbox.archiveBlocked')); return; }
       setArchived((prev) => {
         const next = withId(prev, item.id);
         persistIdSet(ARCHIVED_KEY, next);
@@ -387,13 +410,9 @@ export function InboxPage() {
       setUndoStack((s) => [entry, ...s].slice(0, 20));
       setSelectedId((cur) => (cur === item.id ? null : cur));
       toast.success(t('inbox.archivedToast'));
-      // Decisions have a server-side dismiss; other types are local-archive only.
-      if (item.type === 'decision') {
-        const raw = entry.raw as { agentId: string; decision: { id: string } };
-        api.decisions.dismiss(raw.agentId, raw.decision.id).catch((e) => console.warn('[api]', e));
-      }
+
     },
-    [findEntry, t],
+    [findEntry, processed, t],
   );
 
   const undo = useCallback(() => {
@@ -452,6 +471,7 @@ export function InboxPage() {
               ? intl.formatMessage({ id: 'approvals.approvedToast' }, { summary: a.summary })
               : t('inbox.approval.rejectedToast'),
         );
+        setOutcomes((previous) => ({ ...previous, [item.id]: approve ? 'approved' : 'denied' }));
         markProcessed(item.id);
       } catch (e) {
         setDecideErrors((prev) => ({ ...prev, [item.id]: e }));
@@ -530,15 +550,15 @@ export function InboxPage() {
   }, [tabItems, prefs.tab, prefs.categoryFilter, prefs.statusFilter]);
   const statuses = useMemo(() => distinctStatuses(tabItems), [tabItems]);
   const sorted = useMemo(
-    () => sinkProcessed(sortInbox(filtered, prefs.sortBy), processed),
-    [filtered, prefs.sortBy, processed],
+    () => sinkProcessed(sortInbox(filtered, prefs.tab === 'mine' ? 'urgency' : prefs.sortBy), processed),
+    [filtered, prefs.tab, prefs.sortBy, processed],
   );
 
   const groupLabel = useCallback(
     (key: string, by: InboxGroupBy, sample: InboxItem): string => {
       if (by === 'type') return t(TYPE_META[sample.type].labelKey);
-      if (by === 'agent') return key === '—' ? t('inbox.group.agent') : agentName(key);
-      if (by === 'channel') return key === '—' ? t('inbox.group.channel') : key;
+      if (by === 'agent') return key === '—' ? t('inbox.group.system') : agentName(key);
+      if (by === 'channel') return key.startsWith('type:') ? t(TYPE_META[sample.type].labelKey) : key;
       return key;
     },
     [t, agentName],
@@ -555,7 +575,7 @@ export function InboxPage() {
         items: buckets[b],
       }));
     }
-    if (prefs.groupBy === 'none') {
+    if (prefs.groupBy === 'none' || prefs.tab === 'mine') {
       return [{ key: '', items: sorted }];
     }
     const map = new Map<string, InboxItem[]>();
@@ -579,11 +599,12 @@ export function InboxPage() {
       // label, the single biggest vocabulary payoff of the object-model
       // convergence (04 doc §C.3).
       typeLabel: (item) =>
-        item.type === 'blocked' && item.status === 'needs_human'
+        item.question ? t('inbox.type.question') : item.type === 'blocked' && item.status === 'needs_human'
           ? t('inbox.status.pending')
           : t(TYPE_META[item.type].labelKey),
       riskLabel: (level: RiskLevel) => t(`approval.risk.${level}`),
       archive: t('inbox.action.archive'),
+      archiveBlocked: t('inbox.archiveBlocked'),
       nearExpiry: t('inbox.approval.nearExpiry'),
       nearExpiryTooltip: t('inbox.approval.nearExpiryTooltip'),
       processedTooltip: t('inbox.processed.tooltip'),
@@ -612,7 +633,7 @@ export function InboxPage() {
   const statusFilterLabel = useCallback(
     (status: string) => {
       const key = statusLabelKey(status);
-      return key ? t(key) : status;
+      return key ? t(key) : t('inbox.status.other');
     },
     [t],
   );
@@ -625,7 +646,7 @@ export function InboxPage() {
     [nonArchived, read, processed],
   );
 
-  const canArchive = prefs.tab === 'mine';
+  const canArchive = true;
 
   // Keep the selection valid as the loaded set changes. Checked against
   // `nonArchived` (tab-independent), not the current tab's filtered `sorted`
@@ -654,23 +675,31 @@ export function InboxPage() {
       item.type === 'blocked' && item.status === 'needs_human'
         ? t('inbox.status.pending')
         : t(TYPE_META[item.type].labelKey);
+    if (processed.has(item.id) && item.type !== 'approval' && item.type !== 'install') {
+      return <DetailShell icon={TYPE_META[item.type].icon} title={item.title} typeLabel={t('inbox.processed.receipt')}>
+        <p>{taskOutcomes[item.id] ? t(`inbox.needsHuman.${taskOutcomes[item.id]}Toast`) : t('inbox.processed.receipt')}</p>
+      </DetailShell>;
+    }
     switch (item.type) {
       case 'approval':
         return (
           <ApprovalDetailPanel
+            key={item.id}
+            processed={processed.has(item.id)}
+            outcome={outcomes[item.id]}
             approval={raw as ApprovalItem}
             agentName={agentName((raw as ApprovalItem).agent_id)}
             onApprove={() => decide(item, true)}
             onReject={() => decide(item, false)}
             decideError={decideErrors[item.id]}
-            onDecided={() => markProcessed(item.id)}
+            onDecided={(outcome) => { if (outcome) setOutcomes((previous) => ({ ...previous, [item.id]: outcome })); markProcessed(item.id); }}
           />
         );
       case 'install': {
         const req = raw as InstallRequestInfo;
         // W1-2 / 04 doc §E17: self-contained in the Inbox — no more bouncing
         // to `/approvals` just to see (or act on) an install request's detail.
-        return <InstallDetailPanel request={req} onDecided={() => markProcessed(item.id)} />;
+        return <InstallDetailPanel key={item.id} processed={processed.has(item.id)} outcome={outcomes[item.id]} request={req} onDecided={(outcome) => { if (outcome) setOutcomes((previous) => ({ ...previous, [item.id]: outcome })); markProcessed(item.id); }} />;
       }
       case 'blocked': {
         const task = raw as TaskInfo;
@@ -684,6 +713,7 @@ export function InboxPage() {
               task={task}
               typeLabel={typeLabel}
               agentName={item.agentId ? agentName(item.agentId) : undefined}
+              onOutcome={(action) => setTaskOutcomes((previous) => ({ ...previous, [item.id]: action }))}
               onResolved={() => markProcessed(item.id)}
             />
           );
@@ -710,7 +740,8 @@ export function InboxPage() {
           </DetailShell>
         );
       }
-      case 'budget':
+      case 'budget': {
+        const incident = raw as BudgetIncident;
         return (
           <DetailShell
             icon={TYPE_META.budget.icon}
@@ -719,12 +750,18 @@ export function InboxPage() {
             agentId={item.agentId}
             agentName={item.agentId ? agentName(item.agentId) : undefined}
           >
+            <p className="text-sm">{intl.formatMessage({ id: 'inbox.budget.detail' }, {
+              scope: t(incident.scope === 'daily' ? 'inbox.budget.daily' : incident.scope === 'monthly' ? 'inbox.budget.monthly' : 'inbox.budget.period'),
+              spent: intl.formatNumber(incident.spent_cents / 100, { style: 'currency', currency: 'USD' }),
+              cap: intl.formatNumber(incident.cap_cents / 100, { style: 'currency', currency: 'USD' }),
+            })}</p>
             <Button variant="brand" onClick={() => navigate('/manage/billing')}>
               <ExternalLink />
               {t('inbox.detail.viewBilling')}
             </Button>
           </DetailShell>
         );
+      }
       case 'decision':
         return (
           <DetailShell
@@ -735,7 +772,7 @@ export function InboxPage() {
             agentName={item.agentId ? agentName(item.agentId) : undefined}
           >
             <div className="flex flex-wrap items-center gap-2">
-              <Button variant="brand" onClick={() => navigate('/agents')}>
+              <Button variant="brand" onClick={() => navigate(`/agents/${encodeURIComponent(item.agentId ?? '')}`)}>
                 <ExternalLink />
                 {t('inbox.detail.viewAgent')}
               </Button>
@@ -755,13 +792,16 @@ export function InboxPage() {
             agentId={item.agentId}
             agentName={item.agentId ? agentName(item.agentId) : undefined}
           >
-            <pre className="max-h-96 overflow-auto rounded-lg bg-muted p-2 text-[11px] leading-relaxed text-muted-foreground">
-              {JSON.stringify(raw, null, 2)}
-            </pre>
+            <p className="text-sm">{t('inbox.failedRun.summary')}</p>
+            <Button variant="brand" onClick={() => {
+              const event = raw as UnifiedAuditEvent;
+              const runId = typeof event.details?.run_id === 'string' ? event.details.run_id : null;
+              navigate(runId ? `/runs?run=${encodeURIComponent(runId)}` : `/runs?agent=${encodeURIComponent(item.agentId ?? '')}`);
+            }}><ExternalLink />{t('inbox.detail.viewRun')}</Button>
           </DetailShell>
         );
     }
-  }, [selectedEntry, agentName, decide, decideErrors, markProcessed, navigate, archive, t]);
+  }, [selectedEntry, agentName, decide, decideErrors, markProcessed, navigate, archive, processed, outcomes, taskOutcomes, intl, t]);
 
   // ── Left column: header + tabs + list ────────────────────────────────────────
   const listColumn = (
@@ -769,7 +809,7 @@ export function InboxPage() {
       <PageHeader hideTrigger>
         <InboxIcon className="size-4 shrink-0 text-muted-foreground" />
         <h1 className="truncate text-sm font-medium">{t('inbox.title')}</h1>
-        <span className="font-mono text-xs tabular-nums text-muted-foreground">{nonArchived.length}</span>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{inboxCount}</span>
         <div className="ml-auto flex items-center gap-1">
           {undoStack.length > 0 && (
             <Button variant="ghost" size="icon-sm" onClick={undo} title={t('inbox.undo')} aria-label={t('inbox.undo')}>
@@ -792,7 +832,7 @@ export function InboxPage() {
               {GROUP_OPTIONS.map((g) => (
                 <DropdownMenuItem
                   key={g}
-                  disabled={prefs.tab === 'blocked'}
+                  disabled={prefs.tab === 'blocked' || prefs.tab === 'mine'}
                   onClick={() => updatePrefs({ groupBy: g })}
                   className={cn(prefs.groupBy === g && 'font-medium text-foreground')}
                 >
@@ -805,6 +845,7 @@ export function InboxPage() {
               {SORT_OPTIONS.map((s) => (
                 <DropdownMenuItem
                   key={s}
+                  disabled={prefs.tab === 'mine'}
                   onClick={() => updatePrefs({ sortBy: s })}
                   className={cn(prefs.sortBy === s && 'font-medium text-foreground')}
                 >
@@ -855,28 +896,15 @@ export function InboxPage() {
         </div>
       </PageHeader>
 
-      {/* Tabs — five scopes with counts. */}
-      <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-surface-border px-2 py-1.5">
-        {INBOX_TABS.map((tab) => {
-          const count = tabItemsFor(tab).length;
-          const active = prefs.tab === tab;
-          return (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => updatePrefs({ tab })}
-              aria-pressed={active}
-              className={cn(
-                'flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors',
-                active ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-surface-hover',
-              )}
-            >
-              {t(`inbox.tab.${tab}`)}
-              {count > 0 && <span className="font-mono tabular-nums text-muted-foreground/70">{count}</span>}
-            </button>
-          );
-        })}
-      </div>
+      <Tabs value={prefs.tab} onValueChange={(value) => updatePrefs({ tab: value as InboxTab })} variant="line">
+        <TabsList aria-label={t('inbox.title')} className="overflow-x-auto border-b border-surface-border px-2 py-2">
+          {INBOX_TABS.map((tab) => <TabsTab key={tab} value={tab}>
+            {t(`inbox.tab.${tab}`)}
+            {tabItemsFor(tab).length > 0 && <span className="font-mono text-xs tabular-nums">{tabItemsFor(tab).length}</span>}
+          </TabsTab>)}
+        </TabsList>
+      </Tabs>
+      {decisionCoverage > DECISION_AGENT_CAP && <p role="status" className="px-3 py-2 text-xs text-muted-foreground">{intl.formatMessage({ id: 'inbox.decisionCoverage' }, { cap: DECISION_AGENT_CAP, total: decisionCoverage })}</p>}
 
       {/* Fatigue hint (compact). */}
       {(approvedToday > 0 || batches.length > 0) && (
@@ -927,7 +955,7 @@ export function InboxPage() {
               onUnread={(item) => markUnread(item.id)}
               onUndo={undo}
               emptyState={
-                <Empty icon={InboxIcon} title={t('inbox.emptyTab')} variant="dashed" className="mt-6" />
+                <Empty icon={InboxIcon} title={t(inboxCount === 0 ? 'inbox.empty' : 'inbox.emptyTab')} variant="dashed" className="mt-6" />
               }
             />
           </>
@@ -952,8 +980,9 @@ export function InboxPage() {
           <span className="truncate text-sm font-medium">{selectedEntry.item.title}</span>
         </div>
       )}
+      {selectedEntry && !canArchiveInboxItem(selectedEntry.item, processed.has(selectedEntry.item.id)) && <p className="shrink-0 border-b border-surface-border px-4 py-2 text-xs text-muted-foreground">{t('inbox.archiveBlocked')}</p>}
       {selectedEntry ? (
-        <div className="min-h-0 flex-1 overflow-y-auto p-4 md:p-6">{detailBody}</div>
+        <div className={cn('min-h-0 flex-1 p-4 md:p-6', !processed.has(selectedEntry.item.id) && !selectedEntry.item.question && (selectedEntry.item.type === 'approval' || selectedEntry.item.type === 'install') ? 'overflow-hidden' : 'overflow-y-auto')}>{detailBody}</div>
       ) : (
         <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
           <InboxIcon className="size-10 text-muted-foreground/30" />

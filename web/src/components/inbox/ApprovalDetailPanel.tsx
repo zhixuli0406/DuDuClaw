@@ -186,7 +186,7 @@ function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; e
         </Row>
         {grant.effect && (
           <Row label={t('approval.grant.effect')}>
-            <Mono>{grant.effect}</Mono>
+            <span>{t(['read', 'draft', 'send', 'publish', 'purchase', 'delete', 'modify', 'admin'].includes(grant.effect) ? `agents.actionRules.effect.${grant.effect}` : 'approval.plan.kind.unknown')}</span>
           </Row>
         )}
         <div className="pt-1">
@@ -471,6 +471,23 @@ function QuestionRequestView({ approval }: { approval: ApprovalItem }) {
   );
 }
 
+function ProcessedApprovalView({ approval, outcome }: { approval: ApprovalItem; outcome?: 'approved' | 'denied' }) {
+  const intl = useIntl();
+  const status = outcome ?? approval.status;
+  const labelKey = status === 'approved' ? 'inbox.status.approved'
+    : status === 'denied' ? 'inbox.status.denied'
+    : status === 'expired' ? 'inbox.status.expired'
+    : status === 'answered' ? 'approval.question.answered' : 'inbox.processed.receipt';
+  return (
+    <div className="space-y-4">
+      <Badge variant="secondary">{intl.formatMessage({ id: labelKey })}</Badge>
+      <p className="whitespace-pre-wrap break-words text-sm">{approval.summary}</p>
+      {typeof approval.answer === 'string' && <p className="whitespace-pre-wrap text-sm">{approval.answer}</p>}
+      <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />
+    </div>
+  );
+}
+
 export function ApprovalDetailPanel({
   approval,
   agentName,
@@ -478,6 +495,8 @@ export function ApprovalDetailPanel({
   onReject,
   onDecided,
   decideError,
+  processed = false,
+  outcome,
 }: {
   approval: ApprovalItem;
   agentName?: string;
@@ -485,10 +504,15 @@ export function ApprovalDetailPanel({
   onReject: () => void;
   /** Called after a self-contained (skill_create) decision succeeds, so the
    *  parent can remove the decided row without issuing a second decide. */
-  onDecided?: () => void;
+  onDecided?: (outcome?: 'approved' | 'denied') => void;
   /** Set when the parent's last decide failed; the item is still pending. */
   decideError?: unknown;
+  processed?: boolean;
+  outcome?: 'approved' | 'denied';
 }) {
+  if (processed || (approval.status != null && approval.status !== 'pending')) {
+    return <ProcessedApprovalView approval={approval} outcome={outcome} />;
+  }
   if (approval.request_kind === 'question') {
     return <QuestionRequestView approval={approval} />;
   }
@@ -594,7 +618,8 @@ function GenericApprovalView({
   };
 
   return (
-    <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       {/* ── Plan summary first (arXiv:2604.04918) ── */}
       <Section title={t('approval.plan.title')}>
         <div className="space-y-2 rounded-lg bg-muted p-3">
@@ -612,7 +637,6 @@ function GenericApprovalView({
             <div className="flex items-center gap-1.5 pt-0.5 text-xs text-muted-foreground">
               <ActorAvatar actorType="agent" size="xs" name={agentName ?? approval.agent_id} />
               <span className="truncate">{agentName ?? approval.agent_id}</span>
-              {!described && <Mono className="text-[11px]">{approval.kind}</Mono>}
             </div>
           )}
         </div>
@@ -717,7 +741,7 @@ function GenericApprovalView({
           <div className="space-y-3 pl-1.5">
             <div className="grid grid-cols-1 gap-0.5">
               <Row label={t('inbox.approval.kind')}>
-                <Mono>{approval.kind}</Mono>
+                <span>{t(Object.hasOwn(intl.messages, `approvals.kind.${approval.kind}`) ? `approvals.kind.${approval.kind}` : 'approvals.kind.unknown')}</span>
               </Row>
               <Row label={t('inbox.approval.created')}>{timeAgo(approval.created_at)}</Row>
               {expiry && (
@@ -748,8 +772,9 @@ function GenericApprovalView({
         </div>
       )}
 
-      {/* ── Decision (after the summary is read) ── */}
-      <div className="flex items-center gap-2">
+      </div>
+      {/* Keep decisions visible while the evidence scrolls. */}
+      <div data-testid="approval-actions" className="sticky bottom-0 z-10 flex shrink-0 items-center gap-2 border-t border-surface-border bg-surface py-3">
         <Button variant="brand" onClick={requestApprove} className="flex-1">
           {t('inbox.approval.approve')}
         </Button>
@@ -828,7 +853,7 @@ function SkillCreateApprovalView({
   approval: ApprovalItem;
   agentName?: string;
   payload: SkillCreatePayload;
-  onDecided?: () => void;
+  onDecided?: (outcome?: 'approved' | 'denied') => void;
 }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
@@ -856,7 +881,7 @@ function SkillCreateApprovalView({
       const selfApproved = se.self_approved === true;
       setDecided({ kind: 'approved', installed, selfApproved });
       toast.success(intl.formatMessage({ id: 'inbox.skillCreate.installedToast' }, { name: installed }));
-      onDecided?.();
+      onDecided?.('approved');
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     } finally {
@@ -872,7 +897,7 @@ function SkillCreateApprovalView({
       const rejectedId = res.side_effect?.custom_skill_rejected ?? payload.custom_skill_id;
       setDecided({ kind: 'rejected' });
       toast.success(intl.formatMessage({ id: 'inbox.skillCreate.rejectedToast' }, { id: rejectedId }));
-      onDecided?.();
+      onDecided?.('denied');
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     } finally {
@@ -881,7 +906,8 @@ function SkillCreateApprovalView({
   };
 
   return (
-    <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       <div className="flex items-start gap-2">
         <p className="min-w-0 flex-1 text-sm text-foreground">{approval.summary}</p>
         <RiskBadge level={risk} label={t(`approval.risk.${risk}`)} />
@@ -921,16 +947,14 @@ function SkillCreateApprovalView({
             )}
             <span className="text-sm text-foreground">{t('inbox.skillCreate.risk')}</span>
             <Badge variant={sr?.passed ? 'secondary' : 'outline'} className="ml-auto">
-              {sr?.risk_level ?? '—'}
+              {sr?.risk_level ? t(`approval.risk.${['clean', 'low'].includes(sr.risk_level.toLowerCase()) ? 'low' : sr.risk_level.toLowerCase() === 'medium' ? 'medium' : 'high'}`) : '—'}
             </Badge>
           </div>
           {sr && sr.findings.length > 0 ? (
             <ul className="space-y-1 px-0.5">
               {sr.findings.map((f, i) => (
                 <li key={i} className="text-xs text-muted-foreground">
-                  <span className="font-medium uppercase text-foreground">{f.severity}</span>
-                  <span className="mx-1 text-muted-foreground/40">|</span>
-                  {f.category}
+                  <span className="font-medium text-foreground">{t(`skills.install.severity.${['critical', 'high', 'medium', 'low', 'warning', 'info'].includes(f.severity.toLowerCase()) ? f.severity.toLowerCase() : 'info'}`)}</span>
                   {f.line_number != null && <span className="text-muted-foreground/70"> (L{f.line_number})</span>}
                   <span className="block text-muted-foreground/80">{f.description}</span>
                 </li>
@@ -952,6 +976,8 @@ function SkillCreateApprovalView({
         </pre>
       </Section>
 
+      </div>
+      <div data-testid="approval-actions" className="sticky bottom-0 z-10 shrink-0 border-t border-surface-border bg-surface py-3">
       {/* Decision */}
       {decided ? (
         <div
@@ -1006,6 +1032,7 @@ function SkillCreateApprovalView({
         </div>
       )}
 
+      </div>
       <ConfirmDialog
         open={confirmOpen}
         onClose={() => setConfirmOpen(false)}
