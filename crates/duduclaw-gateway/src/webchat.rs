@@ -745,6 +745,15 @@ async fn rollback_owned_webchat_archives(paths: &[PathBuf]) {
     }
 }
 
+async fn rollback_before_final_reply(validity: crate::handlers::live_context::SocketValidity,
+    recovery: &mut crate::handlers::live_context::SocketRecovery, paths: &[PathBuf]) -> bool {
+    if recovery.observe(validity, false) {
+        return true;
+    }
+    rollback_owned_webchat_archives(paths).await;
+    false
+}
+
 /// Process a WebChat WebSocket connection.
 async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip: IpAddr) {
     let _permit = match WEBCHAT_SEMAPHORE.try_acquire() {
@@ -1675,9 +1684,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     let validity = state.credential_validity(credential.as_ref(), false).await;
-                                    if !recovery.observe(validity, false) {
+                                    if !rollback_before_final_reply(validity, &mut recovery, &owned_archives).await {
                                         if recovery.closed() { let _ = sink.send(Message::Close(None)).await; break 'connection; }
-                                        rollback_owned_webchat_archives(&owned_archives).await;
                                         continue 'connection;
                                     }
                                     if !guarded.still_valid().await {
@@ -2026,11 +2034,15 @@ mod tests {
     use super::*;
     use duduclaw_auth::{AccessLevel, JwtConfig, UserDb, UserRole, UserStatus};
 
-    #[test]
-    fn revoked_credential_blocks_final_reply() {
+    #[tokio::test]
+    async fn revoked_credential_rolls_back_archives_before_blocking_final_reply() {
         let mut recovery = crate::handlers::live_context::SocketRecovery::default();
-        assert!(!recovery.observe(crate::handlers::live_context::SocketValidity::Revoked, false));
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        let archive_path = archive.path().to_path_buf();
+        assert!(rollback_before_final_reply(crate::handlers::live_context::SocketValidity::Revoked,
+            &mut recovery, std::slice::from_ref(&archive_path)).await == false);
         assert!(recovery.closed());
+        assert!(!archive_path.exists());
     }
 
     #[tokio::test]
