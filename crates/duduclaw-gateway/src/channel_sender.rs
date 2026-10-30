@@ -838,6 +838,7 @@ pub async fn resolve_channel_target(
         // not hot enough to need caching, mirrors dispatcher.rs's identical
         // forward-path fetch).
         let http = reqwest::Client::new();
+        crate::egress_client::builtin_dispatch_started();
         let resp = http
             .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
             .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))

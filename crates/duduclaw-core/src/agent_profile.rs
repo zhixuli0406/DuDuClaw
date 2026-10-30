@@ -9,7 +9,7 @@ mod parser;
 #[cfg(test)]
 mod tests;
 
-pub use export::{export, load, ExportArtifact, ExportFormat};
+pub use export::{export_with_credential_scan, load, ExportArtifact, ExportFormat};
 pub use parser::{has_schema, parse};
 
 pub const SCHEMA: &str = "duduclaw.agent/v1";

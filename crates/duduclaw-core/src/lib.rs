@@ -667,8 +667,9 @@ fn parse_semver_triple(s: &str) -> Option<(u64, u64, u64)> {
 /// Run `<path> --version` with a 2s poll-timeout; a wedged binary is killed
 /// and treated as unversioned rather than hanging gateway startup.
 fn probe_binary_version(path: &str) -> Option<(u64, u64, u64)> {
-    let mut child = std::process::Command::new(path)
-        .arg("--version")
+    let mut cmd = std::process::Command::new(path);
+    spawn_env::apply_agent_cli_env_allowlist_std(&mut cmd);
+    let mut child = cmd.arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

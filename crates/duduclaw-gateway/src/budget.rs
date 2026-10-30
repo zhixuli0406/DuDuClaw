@@ -181,9 +181,10 @@ fn budget_limits_from_view(b: duduclaw_core::agent_toml::BudgetSectionView) -> B
     }
 }
 
-/// Aggregate millicents before converting, including the ephemeral family.
+/// Aggregate stored cents, including the ephemeral family. The historical
+/// telemetry name does not change the unit of the stored column.
 async fn spent_cents(tel: &CostTelemetry, agent_id: &str, hours: u64) -> Result<u64, String> {
-    tel.budget_spent_millicents(agent_id, hours).await.map(|cost| cost / 1000)
+    tel.budget_spent_millicents(agent_id, hours).await
 }
 
 /// Missing agent directories and configurations have no configured budget.
@@ -723,7 +724,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_ephemeral_family_rolls_up_before_cent_conversion() {
+    async fn budget_stored_cents_499_allows_500_refuses() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("cost.db");
+        let tel = CostTelemetry::new(&db).unwrap();
+        seed_cost(&tel, "employee", 10).await;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (stored, denied) in [(499, false), (500, true)] {
+            conn.execute("UPDATE token_usage SET cost_millicents = ?1", [stored]).unwrap();
+            assert_eq!(tel.budget_spent_millicents("employee", 24).await.unwrap(), stored as u64);
+            for caps in [limits(500, 0, true), limits(0, 500, true)] {
+                let verdict = evaluate_budget(&tel, "employee", &caps).await;
+                assert_eq!(verdict.is_denied(), denied, "stored cents = {stored}, {caps:?}");
+                if let BudgetVerdict::Deny { spent_cents, cap_cents, .. } = verdict {
+                    assert_eq!(spent_cents, 500);
+                    assert_eq!(cap_cents, 500);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_ephemeral_family_rolls_up_stored_cents() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("cost.db");
         let tel = CostTelemetry::new(&db).unwrap();

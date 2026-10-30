@@ -221,9 +221,10 @@ impl GoogleCaller {
                     fallback: false,
                     notice: None,
                 });
-                gw::resolve_backend(home).await.map_err(|e| e.to_string())
+                gw::resolve_backend(home).await.map_err(local_google_auth_error)
             }
             Plan::Refuse(m) => {
+                duduclaw_gateway::egress_client::builtin_not_dispatched();
                 self.record(CallRecord {
                     identity: "refused",
                     account: String::new(),
@@ -257,7 +258,7 @@ impl GoogleCaller {
                         fallback,
                         notice,
                     });
-                    gw::resolve_backend(home).await.map_err(|e| e.to_string())
+                    gw::resolve_backend(home).await.map_err(local_google_auth_error)
                 }
                 Err(m) => {
                     self.record(CallRecord {
@@ -289,13 +290,13 @@ impl GoogleCaller {
                 });
                 gw::get_valid_google_token(home)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(local_google_auth_error)
             }
             _ => match self.backend(home, tool).await? {
                 GoogleBackend::Direct(t) => Ok(t),
                 GoogleBackend::AppsScript(_) => gw::get_valid_google_token(home)
                     .await
-                    .map_err(|e| e.to_string()),
+                    .map_err(local_google_auth_error),
             },
         }
     }
@@ -475,6 +476,7 @@ async fn post(home: &Path, agent: &str, body: &Value) -> Result<Value, String> {
     {
         request = request.header(name, value);
     }
+    duduclaw_gateway::egress_client::builtin_dispatch_started();
     let mut resp = request
         .body(bytes)
         .send()
@@ -757,4 +759,12 @@ mod tests {
         assert!(e.contains("沒有權限"));
         assert!(interpret(502, b"<html>").is_err());
     }
+}
+
+fn local_google_auth_error(error: duduclaw_gateway::google_workspace::GoogleAuthError) -> String {
+    use duduclaw_gateway::google_workspace::GoogleAuthError;
+    if matches!(&error, GoogleAuthError::NotConnected { .. } | GoogleAuthError::NoRefreshToken | GoogleAuthError::ClientConfigMissing) {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
+    }
+    error.to_string()
 }

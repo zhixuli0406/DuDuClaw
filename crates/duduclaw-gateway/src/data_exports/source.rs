@@ -314,14 +314,14 @@ pub fn collect(
                             }
                         }));
                         values.push(cells[8].clone());
-                        // Raw millicents remain truthful; zero/default costs cannot prove a measured free request.
+                        // The raw column stores cents despite its name; zero/default costs cannot prove a measured free request.
                         values.push(if cost == 0 {
                             Cell::from("")
                         } else {
                             Cell::from(format!(
-                                "{}.{:05}",
-                                cost / 100_000,
-                                cost.unsigned_abs() % 100_000
+                                "{}.{:02}",
+                                cost / 100,
+                                cost.unsigned_abs() % 100
                             ))
                         });
                         values.extend([Cell::from("USD"), Cell::from("unknown")]);

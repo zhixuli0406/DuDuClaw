@@ -521,9 +521,9 @@ fn fmt_num(n: u64) -> String {
     out
 }
 
-/// Millicents → "$X.XX" string.
+/// Stored telemetry cents → "$X.XX" string; the field is historically misnamed.
 fn fmt_usd(millicents: u64) -> String {
-    let dollars = millicents as f64 / 100_000.0;
+    let dollars = millicents as f64 / 100.0;
     format!("${dollars:.2}")
 }
 
@@ -561,11 +561,11 @@ mod tests {
     }
 
     #[test]
-    fn fmt_usd_converts_millicents_to_dollars() {
+    fn fmt_usd_converts_stored_cents_to_dollars() {
         assert_eq!(fmt_usd(0), "$0.00");
-        assert_eq!(fmt_usd(100_000), "$1.00");
-        assert_eq!(fmt_usd(123_456), "$1.23");
-        assert_eq!(fmt_usd(50), "$0.00");
+        assert_eq!(fmt_usd(100), "$1.00");
+        assert_eq!(fmt_usd(123_456), "$1234.56");
+        assert_eq!(fmt_usd(50), "$0.50");
     }
 
     #[test]
@@ -654,7 +654,7 @@ mod tests {
         assert!(md.contains("## 各 Agent 詳細報告"));
         assert!(md.contains("### agnes (Agnes)"));
         assert!(md.contains("### bobby (Bobby)"));
-        assert!(md.contains("$1.85"));
+        assert!(md.contains("$1850.00"));
         assert!(md.contains("+12.2%")); // 1234 vs 1100 = +12.18%
         assert!(md.contains("task_completed=12"));
         assert!(md.contains("success=92.3%"));

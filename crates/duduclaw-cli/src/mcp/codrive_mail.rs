@@ -274,7 +274,7 @@ pub(crate) async fn handle_mail_read(args: &Value, home_dir: &Path, default_agen
 pub(crate) async fn handle_mail_send(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let cfg = match mail_enabled_or_error(home_dir) {
         Ok(c) => c,
-        Err(e) => return tool_error(&e),
+        Err(e) => return super::egress_gate::pre_dispatch_error(&e),
     };
     let to = args
         .get("to")
@@ -300,7 +300,7 @@ pub(crate) async fn handle_mail_send(args: &Value, home_dir: &Path, default_agen
 
     // 空內容保護 + recipient shape/allowlist, before anything is persisted.
     if let Err(e) = duduclaw_gateway::mail::validate_outbound(&cfg, &to, &subject, &body) {
-        return tool_error(&e);
+        return super::egress_gate::pre_dispatch_error(&e);
     }
 
     let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {

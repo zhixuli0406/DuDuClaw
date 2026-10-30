@@ -89,6 +89,18 @@ pub(super) async fn fixture() -> Fx {
     Fx { _dir: dir, home, h, admin, owner_a, owner_b, operator, viewer }
 }
 
+#[tokio::test]
+async fn profile_export_refuses_context_passwords_in_every_format() {
+    let f = fixture().await;
+    std::fs::write(f.home.join("agents/a1/INSTRUCTIONS.md"), "db password: hunter2xyz").unwrap();
+    for format in ["duduclaw", "openclaw", "hermes", "agents-md", "claude-subagent"] {
+        let response = f.call("agents.export_profile", json!({"agent_id": "a1", "format": format}), &f.admin).await;
+        let error = err(&response);
+        assert!(error.contains("Rules"), "{format}: {error}");
+        assert!(!format!("{response:?}").contains("hunter2xyz"));
+    }
+}
+
 impl Fx {
     /// Boxed: debug builds keep every awaited `handle` future's state, and a
     /// test with many of them overflows the test thread's stack otherwise.

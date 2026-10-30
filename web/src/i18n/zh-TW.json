@@ -3068,7 +3068,7 @@
   "security.credentialHygiene.desc": "掃描設定檔中殘留的明文憑證，找出可安全清理的項目",
   "security.credentialHygiene.refresh": "重新偵測",
   "security.credentialHygiene.cleanupButton": "一鍵清理",
-  "security.credentialHygiene.clean": "沒有發現明文憑證殘留",
+  "security.credentialHygiene.clean": "檢查範圍內沒有明文憑證或殘留",
   "security.credentialHygiene.foundSummary": "發現 {count} 筆明文憑證",
   "security.credentialHygiene.cleanableSummary": "{count} 筆已有加密版本，可安全清理",
   "security.credentialHygiene.manualSummary": "{count} 筆尚未加密，需手動處理",
@@ -3133,7 +3133,7 @@
   "security.credentialInventory.hideUnset": "隱藏未設定的 {count} 項",
   "security.credentialInventory.summary.total": "共 {count} 個欄位",
   "security.credentialInventory.summary.referenced": "{count} 個走外部來源",
-  "security.credentialInventory.summary.plaintext": "{count} 個仍是明文",
+  "security.credentialInventory.summary.plaintext": "{count} 個以明文儲存",
   "security.credentialInventory.summary.residue": "{count} 個明文殘留",
   "security.credentialInventory.badge.residue": "明文殘留",
   "security.credentialInventory.referenceHint": "想讓憑證不再存在設定檔裡？把欄位值改成參照即可，例如 secret://env/TELEGRAM_BOT_TOKEN、secret://keychain/duduclaw/telegram、secret://file//run/secrets/tg_token。之後輪替憑證只要改來源那一邊，設定檔一個字都不用動。",
@@ -9342,5 +9342,8 @@
   "runtimeUpdate.action": "更新 Codex CLI",
   "runtimeUpdate.unknownVersion": "無法確認",
   "runtimeUpdate.shadowed": "更新指令已完成，但目前仍找到舊版 Codex CLI：{path}。請更新或移除這個舊版本，再按「重新偵測」。",
-  "runtimeUpdate.unverified": "更新指令已完成，但仍無法確認 Codex CLI 版本。請確認安裝狀況後重新偵測。"
+  "runtimeUpdate.unverified": "更新指令已完成，但仍無法確認 Codex CLI 版本。請確認安裝狀況後重新偵測。",
+  "security.credentialAudit.provider.chat": "對話提供者",
+  "security.credentialHygiene.plaintextSummary": "憑證清單中有 {count} 個以明文儲存的項目，請改用加密儲存或外部參照。",
+  "google.setup.step3Above": "登記上方顯示的完整已授權重新導向 URI。"
 }

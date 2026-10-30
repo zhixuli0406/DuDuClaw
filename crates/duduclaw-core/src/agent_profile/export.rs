@@ -64,8 +64,9 @@ fn portable_value(value: toml::Value, section: &str) -> toml::Value {
     }
 }
 
-fn scan(section: &str, text: &str) -> Result<(), ProfileError> {
-    if text.contains("secret://") || text.contains("-----BEGIN PRIVATE KEY-----")
+fn scan(section: &str, text: &str, credential_scan: &impl Fn(&str) -> Result<bool, ()>) -> Result<(), ProfileError> {
+    let detected = credential_scan(text).map_err(|_| ProfileError::Invalid(format!("credential scan failed in section {section}; export refused")))?;
+    if detected || text.contains("secret://") || text.contains("-----BEGIN PRIVATE KEY-----")
         || text.contains("-----BEGIN RSA PRIVATE KEY-----")
         || text.contains("-----BEGIN EC PRIVATE KEY-----")
         || text.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
@@ -78,8 +79,9 @@ fn scan(section: &str, text: &str) -> Result<(), ProfileError> {
     Ok(())
 }
 
-/// Return already scanned output; callers own authorization, output writes and audit.
-pub fn export(profile: &AgentProfile, format: ExportFormat, include_user: bool) -> Result<Vec<ExportArtifact>, ProfileError> {
+/// Render only after the caller-provided credential detector accepts every section.
+/// The security crate owns the production wrapper; core cannot depend on it.
+pub fn export_with_credential_scan(profile: &AgentProfile, format: ExportFormat, include_user: bool, credential_scan: impl Fn(&str) -> Result<bool, ()>) -> Result<Vec<ExportArtifact>, ProfileError> {
     validate_id(&profile.id)?;
     validate_settings(&profile.settings)?;
     if format == ExportFormat::Duduclaw {
@@ -89,19 +91,19 @@ pub fn export(profile: &AgentProfile, format: ExportFormat, include_user: bool) 
         return Err(ProfileError::Invalid("invalid native Contract TOML".into()));
     }
     for (section, content) in [("Persona", &profile.soul), ("Identity", &profile.identity), ("Rules", &profile.rules), ("Contract", &profile.contract)] {
-        scan(section, content)?;
+        scan(section, content, &credential_scan)?;
     }
     if include_user && profile.user.chars().count() > super::MAX_USER_CHARS {
         return Err(ProfileError::Invalid("User exceeds 4,000 characters".into()));
     }
-    let user = if include_user { scan("User", &profile.user)?; profile.user.as_str() } else { "" };
+    let user = if include_user { scan("User", &profile.user, &credential_scan)?; profile.user.as_str() } else { "" };
     let header = Header {
         schema: SCHEMA.into(), id: profile.id.clone(), name: profile.name.clone(),
         description: profile.description.clone(), role: profile.role.clone(), language: profile.language.clone(),
         skills: profile.skills.clone(), duduclaw: profile.settings.clone(),
     };
     let yaml = serde_yaml::to_string(&header).map_err(|_| ProfileError::Invalid("cannot encode metadata".into()))?;
-    scan("Settings", &yaml)?;
+    scan("Settings", &yaml, &credential_scan)?;
     let artifact = |name: String, content: String| ExportArtifact { name, content };
     let flat = || {
         let mut content = format!("# Persona\n\n{}\n\n{}\n\n# Rules\n\n{}\n\n# Contract\n\n{}\n", profile.soul, profile.identity, profile.rules, profile.contract);
@@ -135,7 +137,7 @@ pub fn export(profile: &AgentProfile, format: ExportFormat, include_user: bool) 
     };
     for file in &files {
         if file.content.len() > MAX_BYTES { return Err(ProfileError::Oversize); }
-        scan(&file.name, &file.content)?;
+        scan(&file.name, &file.content, &credential_scan)?;
     }
     Ok(files)
 }

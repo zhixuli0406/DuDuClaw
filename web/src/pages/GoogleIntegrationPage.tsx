@@ -11,6 +11,8 @@ import {
   Plus,
   AlertTriangle,
   Loader2,
+  Settings2,
+  ChevronDown,
 } from 'lucide-react';
 import { GoogleSetupWizard } from '@/components/google/GoogleSetupWizard';
 import { useAuthStore } from '@/stores/auth-store';
@@ -111,8 +113,11 @@ export function GoogleIntegrationPage() {
 
   return (
     <div className="space-y-4">
-      {admin && <><Button onClick={() => setWizardOpen(true)}>{t('google.wizard.open', '設定 Google 連線')}</Button><GoogleSetupWizard open={wizardOpen} onOpenChange={open => { setWizardOpen(open); if (!open) void load(); }} /></>}
-      <Button variant="outline" onClick={() => setAdvanced(value => !value)}>{t('google.wizard.advanced', '進階設定')}</Button>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        {admin && <Button variant="brand" aria-haspopup="dialog" onClick={() => setWizardOpen(true)}><Settings2 />{t('google.wizard.open', '設定 Google 連線')}</Button>}
+        <Button variant="ghost" aria-expanded={advanced} aria-controls="google-advanced-settings" onClick={() => setAdvanced(value => !value)}>{t('google.wizard.advanced', '進階設定')}<ChevronDown /></Button>
+      </div>
+      {admin && <GoogleSetupWizard open={wizardOpen} onOpenChange={open => { setWizardOpen(open); if (!open) void load(); }} />}
       {enabled === false && (
         <Card data-testid="google-gate-off">
           <CardContent className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
@@ -157,7 +162,7 @@ export function GoogleIntegrationPage() {
         </Card>
       )}
 
-      {advanced && <>
+      {advanced && <div id="google-advanced-settings" className="space-y-4">
       <IntegrationConnectPanel
         providerId="google"
         prefix="google"
@@ -173,7 +178,7 @@ export function GoogleIntegrationPage() {
       <GoogleCredentialPaths />
       <GoogleDelegationPanel />
       <GooglePersonalAdminPanel />
-      </>}
+      </div>}
     </div>
   );
 }

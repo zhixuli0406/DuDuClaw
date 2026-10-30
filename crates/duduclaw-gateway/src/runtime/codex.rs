@@ -706,6 +706,7 @@ static CODEX_SUPPORT: std::sync::OnceLock<CodexSupportCache> =
 /// required employee permission profile refuses WorkspaceWrite spawns.
 pub(crate) async fn probe_codex_version_output(bin: &str) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
     cmd.arg("--version");
     let out = crate::process_group::output(
         &mut cmd, None, std::time::Duration::from_secs(5),

@@ -10324,11 +10324,12 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
     };
     println!("  binary : {path}");
 
+    let mut version_cmd = duduclaw_core::platform::async_command_for(&path);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut version_cmd);
     // Version (5s cap).
     match tokio::time::timeout(
         Duration::from_secs(5),
-        duduclaw_core::platform::async_command_for(&path)
-            .arg("--version")
+        version_cmd.arg("--version")
             .stdin(Stdio::null())
             .output(),
     )

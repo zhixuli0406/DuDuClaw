@@ -66,7 +66,7 @@ impl MethodHandler {
             };
             let dir = crate::agent_files::agent_dir(&self.home_dir, agent_id)?;
             let profile = duduclaw_core::agent_profile::load(&dir, agent_id).map_err(|e| e.to_string())?;
-            let files = duduclaw_core::agent_profile::export(&profile, format, include_user).map_err(|e| e.to_string())?;
+            let files = duduclaw_security::agent_profile::export(&profile, format, include_user).map_err(|e| e.to_string())?;
             crate::security_autopilot::audit_and_emit(
                 &self.home_dir,
                 &duduclaw_security::audit::AuditEvent::new(

@@ -310,6 +310,18 @@ fn binding_and_admin_role_are_refreshed_and_unknown_usage_stays_unknown() {
     );
 }
 #[test]
+fn usage_export_converts_stored_cents_to_usd() {
+    let dir = fixture();
+    let conn = rusqlite::Connection::open(dir.path().join("cost_telemetry.db")).unwrap();
+    conn.execute_batch("CREATE TABLE token_usage(id INTEGER PRIMARY KEY,agent_id TEXT,created_at TEXT,model TEXT,request_type TEXT,input_tokens INTEGER,cache_read_tokens INTEGER,cache_creation_tokens INTEGER,output_tokens INTEGER,cost_millicents INTEGER); INSERT INTO token_usage VALUES (1,'sales','2026-10-11T00:00:00Z','model','chat',1,0,0,0,500);").unwrap();
+    let ctx = UserContext::admin_fallback();
+    let req = request(Dataset::Usage, ExportFormat::Csv);
+    let table = source::collect(dir.path(), &ctx, &req, || Ok(())).unwrap();
+    assert_eq!(table.rows[0].cells[10], Cell::Number(500));
+    assert_eq!(table.rows[0].cells[11], Cell::from("5.00"));
+}
+
+#[test]
 fn memory_forget_and_wiki_change_invalidate_existing_files() {
     let dir = fixture();
     let ctx = UserContext::admin_fallback();

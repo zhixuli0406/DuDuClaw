@@ -35,6 +35,14 @@ describe('Google setup wizard', () => {
     expect(await screen.findByText('http://localhost:9999/api/mcp/oauth/callback')).toBeInTheDocument();
     expect(sessionStorage.getItem(GOOGLE_SETUP_STORAGE)).not.toContain('secret');
   });
+  it('shows OAuth capabilities and the actual URI in the credential setup instruction', async () => {
+    sessionStorage.setItem(GOOGLE_SETUP_STORAGE, JSON.stringify({ path: 'external', step: 2, testing: true }));
+    renderWizard();
+    expect(await screen.findByText('Search your inbox by sender, subject, or keyword')).toBeInTheDocument();
+    const instruction = screen.getByText('Add this authorized redirect URI:').closest('li');
+    expect(instruction).toHaveTextContent('http://localhost:9999/api/mcp/oauth/callback');
+  });
+
   it('shows a failed service and a safe enable link, without allowing completion', async () => {
     sessionStorage.setItem(GOOGLE_SETUP_STORAGE, JSON.stringify({ path: 'external', step: 4, testing: true }));
     vi.spyOn(api.googleCredentials, 'test').mockResolvedValue({ ok: false, path: 'direct', detail: 'services_checked', services: [{ service: 'Gmail', ok: false, verified: true, reason: 'service_disabled', enable_url: 'https://console.cloud.google.com/apis/library/gmail.googleapis.com' }] });

@@ -248,7 +248,13 @@ pub async fn send_channel_message(
     chat_id: &str,
     text: &str,
 ) -> Result<(), String> {
-    let target = resolve_channel_target(home_dir, channel, chat_id).await?;
+    let target = match resolve_channel_target(home_dir, channel, chat_id).await {
+        Ok(target) => target,
+        Err(error) => {
+            crate::egress_client::builtin_not_dispatched();
+            return Err(error);
+        }
+    };
     crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
         .send_text(text)
         .await
@@ -273,12 +279,18 @@ pub async fn send_channel_message_as(
     };
     match channel {
         "telegram" => {
-            crate::product_policy::require_channel(home_dir, channel)?;
+            crate::product_policy::require_channel(home_dir, channel).map_err(|error| {
+                crate::egress_client::builtin_not_dispatched();
+                error
+            })?;
             let sm_cfg = SecretManagerConfig::load_from_home(home_dir).await;
             let token = crate::config_crypto::read_agent_channel_token(home_dir, agent, "telegram", &sm_cfg)
                 .await
                 .map(|t| crate::config_crypto::repair_telegram_token(t.expose()).into_owned())
-                .ok_or_else(|| format!("AI employee {agent}'s own Telegram bot is no longer configured"))?;
+                .ok_or_else(|| {
+                    crate::egress_client::builtin_not_dispatched();
+                    format!("AI employee {agent}'s own Telegram bot is no longer configured")
+                })?;
             let target = crate::channel_sender::ChannelTarget {
                 channel_type: "telegram".into(),
                 chat_id: chat_id.to_string(),
@@ -291,7 +303,10 @@ pub async fn send_channel_message_as(
                 .map_err(|e| e.to_string())
         }
         "googlechat" => {
-            crate::product_policy::require_channel(home_dir, channel)?;
+            crate::product_policy::require_channel(home_dir, channel).map_err(|error| {
+                crate::egress_client::builtin_not_dispatched();
+                error
+            })?;
             crate::googlechat::send_text_to_space_as(home_dir, Some(agent), chat_id, text).await
         }
         _ => send_channel_message(home_dir, http, channel, chat_id, text).await,

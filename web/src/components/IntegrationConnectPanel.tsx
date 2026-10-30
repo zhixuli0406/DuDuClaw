@@ -367,8 +367,8 @@ export function IntegrationConnectPanel({
         </div>
       )}
 
-      {/* Capabilities — always shown so users know what they're enabling. */}
-      {state.conn !== 'loading' && (
+      {/* Explain the available capabilities without rendering an empty card. */}
+      {state.conn !== 'loading' && capabilities.length > 0 && (
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">{t('capabilities.title')}</CardTitle>
@@ -422,8 +422,10 @@ export function IntegrationConnectPanel({
               ))}
               <li>{t('setup.step2')}</li>
               <li>
-                {t('setup.step3')}
-
+                {providerId === 'google' && !hideRedirect ? t('setup.step3Above') : <>
+                  {t('setup.step3')}{' '}
+                  <code className="break-all select-all">{state.redirectUri || intl.formatMessage({ id: 'google.wizard.redirectUnavailable' })}</code>
+                </>}
               </li>
               <li>{t('setup.step4')}</li>
             </ol>

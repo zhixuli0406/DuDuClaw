@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { Mail } from 'lucide-react';
+import { Mail, Search, FileText, Calendar, Table2 } from 'lucide-react';
 import { api, type GoogleServiceProbe } from '@/lib/api';
 import { formatError } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
@@ -10,6 +10,13 @@ import { GoogleServiceResults } from './GoogleServiceResults';
 import { GoogleCredentialPaths } from '@/components/GoogleCredentialPaths';
 
 export const GOOGLE_SETUP_STORAGE = 'duduclaw.google-setup.v1';
+const CAPABILITIES = [
+  { icon: Search, id: 'google.cap.search' },
+  { icon: Mail, id: 'google.cap.read' },
+  { icon: FileText, id: 'google.cap.draft' },
+  { icon: Calendar, id: 'google.cap.calendar' },
+  { icon: Table2, id: 'google.cap.sheetsRead' },
+] as const;
 const PATHS = ['delegation', 'internal', 'bridge', 'external'] as const;
 type Path = typeof PATHS[number];
 type Progress = { step: number; path: Path | null; testing: boolean };
@@ -125,7 +132,7 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
         {oauth && <div className="space-y-2 rounded-lg border border-surface-border p-3"><p>{t('scopeList')}</p><p className="break-all font-mono text-xs">{requiredScopes.join(',')}</p><Button size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(requiredScopes.join(',')).catch(() => setError(t('copyFailed'))); }}>{intl.formatMessage({ id: 'common.copy' })}</Button></div>}
         <p className="text-muted-foreground">{t('secrets')}</p>
       </div>}
-      {progress.step === 2 && (oauth ? <IntegrationConnectPanel providerId="google" prefix="google" headerIcon={Mail} consoleUrl="https://console.cloud.google.com/auth/clients" consoleLabel="Google Cloud Console" clientIdPlaceholder="xxxxxxxx.apps.googleusercontent.com" clientSecretPlaceholder="GOCSPX-..." capabilities={[]} testing={progress.testing} hideRedirect onConnected={() => go(3)} /> : <GoogleCredentialPaths initialMode={progress.path === 'bridge' ? 'apps_script' : 'service_account'} onSaved={() => go(3)} />)}
+      {progress.step === 2 && (oauth ? <IntegrationConnectPanel providerId="google" prefix="google" headerIcon={Mail} consoleUrl="https://console.cloud.google.com/auth/clients" consoleLabel="Google Cloud Console" clientIdPlaceholder="xxxxxxxx.apps.googleusercontent.com" clientSecretPlaceholder="GOCSPX-..." capabilities={CAPABILITIES} testing={progress.testing} hideRedirect onConnected={() => go(3)} /> : <GoogleCredentialPaths initialMode={progress.path === 'bridge' ? 'apps_script' : 'service_account'} onSaved={() => go(3)} />)}
       {progress.step === 3 && <p className="text-sm">{t('connectedHint')}</p>}
       {progress.step === 4 && <div className="space-y-3">
         <Button disabled={busy} onClick={() => void (progress.path === 'bridge' ? verifyBridge() : verify())}>{busy ? t('checking') : t('runVerification')}</Button>

@@ -374,6 +374,7 @@ async fn pty_probe_enabled(home_dir: &Path) -> bool {
 async fn run_probe(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     use tokio::process::Command;
     let mut cmd = Command::new(program);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -742,6 +743,8 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
         })
         .ok()?;
     let mut cmd = CommandBuilder::new(program);
+    cmd.env_clear();
+    for (key, value) in duduclaw_core::spawn_env::agent_cli_spawn_env_pairs() { cmd.env(key, value); }
     cmd.env("NO_COLOR", "1");
     cmd.env("TERM", "xterm-256color");
 
@@ -816,6 +819,30 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn help_probe_does_not_inherit_messaging_token() {
+        // Run this test in a child with a deliberately secret-bearing ambient
+        // environment; avoid mutating the concurrent test process's environment.
+        const CHILD: &str = "DUDUCLAW_HELP_PROBE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime_models::tests::help_probe_does_not_inherit_messaging_token", "--nocapture"])
+                .env(CHILD, "1")
+                .env("CLAUDE_CODE_MESSAGING_TOKEN", "discovery-fixture-value")
+                .output().await.unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("claude-probe");
+        crate::test_exec::write_executable(&program,
+            "#!/bin/sh\n[ \"$1\" = --help ] || exit 2\n[ -z \"${CLAUDE_CODE_MESSAGING_TOKEN+x}\" ] || exit 3\nprintf 'safe-help-output'\n", 0o755);
+        let output = run_probe(program.to_str().unwrap(), &["--help"], Duration::from_secs(5)).await.unwrap();
+        assert_eq!(output, "safe-help-output");
+    }
 
     #[test]
     fn help_parse_extracts_aliases_and_full_names() {

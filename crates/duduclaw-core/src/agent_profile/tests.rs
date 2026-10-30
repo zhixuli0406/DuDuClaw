@@ -1,5 +1,11 @@
 use super::*;
 
+// Core tests cover rendering and its built-in shape guard. Production callers
+// use the security crate wrapper, whose tests exercise the context detector.
+fn export(profile: &AgentProfile, format: ExportFormat, include_user: bool) -> Result<Vec<ExportArtifact>, ProfileError> {
+    export_with_credential_scan(profile, format, include_user, |_| Ok(false))
+}
+
 fn profile() -> AgentProfile {
     AgentProfile {
         id: "support".into(), name: "小嘟".into(), description: "Customer support".into(),
@@ -132,6 +138,14 @@ fn secret_refusal_names_section_without_echoing_secret() {
     p.user.clear();
     p.name = "secret://private/account".into();
     assert!(matches!(export(&p, ExportFormat::Duduclaw, false), Err(ProfileError::Secret(section)) if section == "Settings"));
+}
+
+#[test]
+fn credential_scan_failure_refuses_without_echoing_content() {
+    let error = export_with_credential_scan(&profile(), ExportFormat::Duduclaw, false, |_| Err(()))
+        .unwrap_err().to_string();
+    assert!(error.contains("Persona"));
+    assert!(!error.contains("語氣"));
 }
 
 #[test]

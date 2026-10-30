@@ -286,6 +286,36 @@ pub fn reservation_failure(home: &Path, agent: &str, tool: &str, reason: &str) -
     } else { Ok(()) }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuiltinDispatchState { Unobserved, NotDispatched, Started }
+
+tokio::task_local! {
+    static BUILTIN_DISPATCH_STATE: std::cell::Cell<BuiltinDispatchState>;
+}
+
+/// Trusted built-in handlers may attest only an immediate local rejection,
+/// before any request or background effect starts. Never infer this from text.
+pub fn builtin_not_dispatched() {
+    let _ = BUILTIN_DISPATCH_STATE.try_with(|state| {
+        if state.get() != BuiltinDispatchState::Started { state.set(BuiltinDispatchState::NotDispatched); }
+    });
+}
+
+/// An ancillary request (including secret resolution) makes the call uncertain.
+/// Once started, no nested local failure may downgrade the observation.
+pub fn builtin_dispatch_started() {
+    let _ = BUILTIN_DISPATCH_STATE.try_with(|state| state.set(BuiltinDispatchState::Started));
+}
+
+/// Scope the attestation to one call; model/tool response fields cannot set it.
+pub async fn observe_builtin_dispatch<F: std::future::Future>(call: F) -> (F::Output, bool) {
+    BUILTIN_DISPATCH_STATE.scope(std::cell::Cell::new(BuiltinDispatchState::Unobserved), async {
+        let result = call.await;
+        let not_dispatched = BUILTIN_DISPATCH_STATE.with(|state| state.get() == BuiltinDispatchState::NotDispatched);
+        (result, not_dispatched)
+    }).await
+}
+
 /// Two-phase transport lease. Uncertain dispatched calls retain the gateway
 /// fence until lease expiry, even when every local owner is dropped.
 pub struct SinkLease {
@@ -336,6 +366,11 @@ impl SinkLease {
     /// permits release after dispatch. A local timeout/error is not a reply.
     pub fn terminal_response(&self) {
         self.phase.store(TERMINAL, Ordering::Release);
+    }
+
+    /// Host attestation that the handler returned before starting any effect.
+    pub fn not_dispatched(&self) {
+        self.phase.store(NOT_DISPATCHED, Ordering::Release);
     }
 
     pub async fn release(mut self) {

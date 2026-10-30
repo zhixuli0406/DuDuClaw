@@ -59,14 +59,14 @@ impl TokenUsage {
         self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
     }
 
-    /// Estimated cost savings from prompt caching (in millicents).
+    /// Estimated cost savings from prompt caching (stored cents; historical name).
     ///
     /// Without caching, all cache_read_tokens would be full-price input tokens.
     /// Savings = cache_read_tokens * (full_price - cached_price) per token.
     /// Sonnet 4.6: full=$3/M, cached=$0.30/M → savings = cache_read * $2.70/M
     pub fn cache_savings_millicents(&self) -> u64 {
-        // $2.70 per million tokens saved = 270 millicents per million
-        // = 0.00027 millicents per token
+        // $2.70 per million tokens saved = 270 cents per million
+        // = 0.00027 cents per token
         (self.cache_read_tokens as f64 * 0.27 / 1000.0) as u64
     }
 
@@ -101,7 +101,7 @@ impl TokenUsage {
     pub fn estimated_cost_millicents(&self) -> u64 {
         let above_200k = self.total_input() > 200_000;
 
-        let input_rate = if above_200k { 600 } else { 300 }; // per M tokens, in millicents
+        let input_rate = if above_200k { 600 } else { 300 }; // per M tokens, in cents
         let cache_read_rate = 30; // $0.30/M
         let cache_creation_rate = 375; // $3.75/M
         let output_rate = if above_200k { 2250 } else { 1500 }; // per M tokens
@@ -282,7 +282,7 @@ pub struct CostRecord {
     /// Redundant with `cache_efficiency` — kept for SQLite schema compatibility.
     /// Both are computed from `TokenUsage::cache_efficiency()`.
     pub cache_hit_rate: f64,
-    /// Estimated savings from prompt caching (millicents).
+    /// Estimated savings from prompt caching (stored cents; historical name).
     pub cache_savings_millicents: u64,
     pub created_at: String,
     /// WP5: whether the prompt-compression pipeline rewrote this request's
@@ -307,7 +307,7 @@ pub struct CostSummary {
     /// Redundant with `avg_cache_efficiency` — kept for SQLite schema compatibility.
     /// Both are computed from `TokenUsage::cache_efficiency()`.
     pub avg_cache_hit_rate: f64,
-    /// Total estimated savings from prompt caching (millicents).
+    /// Total estimated savings from prompt caching (stored cents; historical name).
     pub total_cache_savings_millicents: u64,
 }
 
@@ -969,6 +969,7 @@ impl CostTelemetry {
     /// Spend for a budget owner and its ephemeral descendants. Starting at a
     /// child also includes its parent and siblings, so cloning a budget cannot
     /// reset the allowance. UNION makes malformed cyclic mappings terminate.
+    /// Returns CENTS: `cost_millicents` is the historical column name, not its unit.
     pub async fn budget_spent_millicents(&self, agent_id: &str, hours: u64) -> Result<u64, String> {
         let conn = self.conn.lock().await;
         conn.query_row(

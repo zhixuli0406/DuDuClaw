@@ -324,7 +324,10 @@ pub(crate) async fn handle(
 ) -> Value {
     let template = match NativeCallTemplate::prepare(tool, args) {
         Ok(t) => t,
-        Err(e) => return super::native_call::tool_error(&e),
+        Err(e) => {
+            crate::egress_client::builtin_not_dispatched();
+            return super::native_call::tool_error(&e);
+        }
     };
     let result: Result<program::Outcome, GoogleApiError> = match template.parsed() {
         ParsedNativeArguments::GmailSearch { query, max } => {

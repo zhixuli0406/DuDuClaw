@@ -1646,10 +1646,10 @@ impl McpDispatcher {
             }
         }
 
-        if let Some(reason) = crate::mcp::recipient_gate::check(
+        if let Some(reason) = crate::mcp::recipient_gate::check_with_call(
             &self.home_dir, gate_agent, tool_name,
             params_owned.get("arguments").unwrap_or(&Value::Null),
-            employee_policy_applies, !principal.is_external,
+            employee_policy_applies, !principal.is_external, &egress_call_id,
         ).await {
             crate::mcp::recipient_gate::merge_reason(&mut params_owned, reason);
         }
@@ -1825,19 +1825,25 @@ impl McpDispatcher {
             ),
         );
         if let Some(lease) = &sink_lease { lease.dispatched(); }
-        let mut result = if let Some(call) = &workflow {
-            if call.is_read() {
-                crate::mcp::workflow_operation::READ_OBSERVATION
-                    .scope(read_observation.clone(), handler)
-                    .await
+        let execution = async {
+            if let Some(call) = &workflow {
+                if call.is_read() {
+                    crate::mcp::workflow_operation::READ_OBSERVATION
+                        .scope(read_observation.clone(), handler)
+                        .await
+                } else {
+                    crate::mcp::workflow_operation::EFFECT_OBSERVATION
+                        .scope(effect_observation.clone(), handler)
+                        .await
+                }
             } else {
-                crate::mcp::workflow_operation::EFFECT_OBSERVATION
-                    .scope(effect_observation.clone(), handler)
-                    .await
+                handler.await
             }
-        } else {
-            handler.await
         };
+        let (mut result, not_dispatched) = duduclaw_gateway::egress_client::observe_builtin_dispatch(execution).await;
+        if not_dispatched {
+            if let Some(lease) = &sink_lease { lease.not_dispatched(); }
+        }
         // Built-in handlers flatten transport errors into JSON-RPC errors. Only
         // successful completion proves the effect ended; local errors may hide
         // a timeout/partial write and must keep the fence.

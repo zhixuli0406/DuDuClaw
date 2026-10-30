@@ -3068,7 +3068,7 @@
   "security.credentialHygiene.desc": "config.toml に残る平文の認証情報をスキャンし、安全に削除できる項目を検出します",
   "security.credentialHygiene.refresh": "再スキャン",
   "security.credentialHygiene.cleanupButton": "一括クリーンアップ",
-  "security.credentialHygiene.clean": "平文の認証情報の残留は見つかりませんでした",
+  "security.credentialHygiene.clean": "確認範囲に平文の認証情報や残存データはありません",
   "security.credentialHygiene.foundSummary": "{count} 件の平文認証情報が見つかりました",
   "security.credentialHygiene.cleanableSummary": "{count} 件はすでに暗号化コピーがあり、安全に削除できます",
   "security.credentialHygiene.manualSummary": "{count} 件は未暗号化のため、手動対応が必要です",
@@ -3133,7 +3133,7 @@
   "security.credentialInventory.hideUnset": "未設定の {count} 件を隠す",
   "security.credentialInventory.summary.total": "全 {count} フィールド",
   "security.credentialInventory.summary.referenced": "{count} 件が外部ソース",
-  "security.credentialInventory.summary.plaintext": "{count} 件が平文",
+  "security.credentialInventory.summary.plaintext": "{count} 件が平文保存",
   "security.credentialInventory.summary.residue": "{count} 件の平文残留",
   "security.credentialInventory.badge.residue": "平文残留",
   "security.credentialInventory.referenceHint": "認証情報を設定ファイルから完全に外すには、フィールド値を参照に変更します：secret://env/TELEGRAM_BOT_TOKEN、secret://keychain/duduclaw/telegram、secret://file//run/secrets/tg_token。以降のローテーションはソース側だけで完結し、config.toml は一切変更不要です。",
@@ -9342,5 +9342,8 @@
   "runtimeUpdate.action": "Codex CLI を更新",
   "runtimeUpdate.unknownVersion": "確認できません",
   "runtimeUpdate.shadowed": "更新コマンドは完了しましたが、古い Codex CLI が見つかりました：{path}。この古いバージョンを更新または削除してから、再検出してください。",
-  "runtimeUpdate.unverified": "更新コマンドは完了しましたが、Codex CLI のバージョンを確認できません。インストール状況を確認してから再検出してください。"
+  "runtimeUpdate.unverified": "更新コマンドは完了しましたが、Codex CLI のバージョンを確認できません。インストール状況を確認してから再検出してください。",
+  "security.credentialAudit.provider.chat": "会話の提供者",
+  "security.credentialHygiene.plaintextSummary": "一覧に平文で保存された項目が {count} 件あります。暗号化保存または外部参照に変更してください。",
+  "google.setup.step3Above": "上に表示された正確な承認済みリダイレクト URI を登録します。"
 }

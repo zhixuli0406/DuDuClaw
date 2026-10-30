@@ -71,21 +71,37 @@ impl Store {
         let home = std::fs::canonicalize(home).map_err(|e| e.to_string())?;
         let path = home.join("egress_shadow.db");
         private_files(&path, true)?;
-        let conn = Connection::open_with_flags(&path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        let mut conn = Connection::open_with_flags(&path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
             .map_err(|e| e.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())?;
         conn.execute_batch("PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS shadow_events (
                 day TEXT NOT NULL, agent_id TEXT NOT NULL, tool TEXT NOT NULL,
                 kind TEXT NOT NULL, source_class TEXT NOT NULL,
-                call_id TEXT NOT NULL UNIQUE, at INTEGER NOT NULL,
-                transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')));
+                call_id TEXT NOT NULL, at INTEGER NOT NULL,
+                transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')), UNIQUE(call_id,kind));
             CREATE TABLE IF NOT EXISTS shadow_overflow (
                 day TEXT NOT NULL, agent_id TEXT NOT NULL, overflow_count INTEGER NOT NULL,
                 PRIMARY KEY(day,agent_id));
             CREATE INDEX IF NOT EXISTS shadow_events_at ON shadow_events(at);
             CREATE TABLE IF NOT EXISTS shadow_maintenance (id INTEGER PRIMARY KEY CHECK(id=1), pruned_at INTEGER NOT NULL);")
             .map_err(|e| e.to_string())?;
+        // Migrate the historical call-only uniqueness under one write lock.
+        // Both gates may observe one call; each kind is deduplicated separately.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let schema: String = tx.query_row("SELECT sql FROM sqlite_master WHERE name='shadow_events'", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if schema.contains("call_id TEXT NOT NULL UNIQUE") {
+            tx.execute_batch("ALTER TABLE shadow_events RENAME TO shadow_events_legacy;
+                CREATE TABLE shadow_events (
+                    day TEXT NOT NULL, agent_id TEXT NOT NULL, tool TEXT NOT NULL,
+                    kind TEXT NOT NULL, source_class TEXT NOT NULL,
+                    call_id TEXT NOT NULL, at INTEGER NOT NULL,
+                    transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')), UNIQUE(call_id,kind));
+                INSERT INTO shadow_events SELECT * FROM shadow_events_legacy;
+                DROP TABLE shadow_events_legacy;
+                CREATE INDEX shadow_events_at ON shadow_events(at);").map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         private_files(&path, false)?;
         Ok(Self(conn))
     }
@@ -96,7 +112,7 @@ impl Store {
         }
         let tx = self.0.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         let day: String = tx.query_row("SELECT date(?1,'unixepoch')", [at], |r| r.get(0)).map_err(|e| e.to_string())?;
-        let duplicate: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM shadow_events WHERE call_id=?1)", [call], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let duplicate: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM shadow_events WHERE call_id=?1 AND kind=?2)", params![call,kind], |r| r.get(0)).map_err(|e| e.to_string())?;
         let mut inserted = 0;
         if !duplicate {
             let agent_rows: u64 = tx.query_row("SELECT COUNT(*) FROM shadow_events WHERE day=?1 AND agent_id=?2", params![day,agent], |r| r.get(0)).map_err(|e| e.to_string())?;
@@ -142,7 +158,7 @@ pub struct Report {
     pub days: u32, pub total: u64, pub ticket_total: u64,
     pub capped: bool,
     pub by_employee: Vec<Count>, pub by_tool: Vec<Count>, pub by_source_class: Vec<Count>,
-    pub by_transport: Vec<Count>, pub daily: Vec<Count>,
+    pub by_transport: Vec<Count>, pub by_kind: Vec<Count>, pub daily: Vec<Count>,
 }
 
 pub fn report(home: &Path, days: u32) -> Result<Report, String> {
@@ -151,7 +167,7 @@ pub fn report(home: &Path, days: u32) -> Result<Report, String> {
 fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
     if !matches!(days, 7 | 30) { return Err("days must be 7 or 30".into()); }
     let mut result = Report { days, total: 0, ticket_total: 0, capped: false, by_employee: vec![], by_tool: vec![],
-        by_source_class: vec![], by_transport: vec![], daily: vec![] };
+        by_source_class: vec![], by_transport: vec![], by_kind: vec![], daily: vec![] };
     // Include today and the preceding UTC calendar days, zero-filled below.
     let today = now.div_euclid(86400) * 86400;
     let start = today - i64::from(days - 1) * 86400;
@@ -168,10 +184,10 @@ fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
     let mut store = Store::open(home)?;
     let tx = store.0.transaction().map_err(|e| e.to_string())?;
     result.capped = tx.query_row("SELECT EXISTS(SELECT 1 FROM shadow_overflow WHERE day>=date(?1,'unixepoch') AND day<=date(?2,'unixepoch'))", params![start,now], |r| r.get(0)).map_err(|e| e.to_string())?;
-    (result.total, result.ticket_total) = tx.query_row("SELECT COUNT(*), COALESCE(SUM(kind IN ('would_ask','recipient_would_ask')),0)
+    (result.total, result.ticket_total) = tx.query_row("SELECT COUNT(*), COUNT(DISTINCT CASE WHEN kind IN ('would_ask','recipient_would_ask') THEN call_id END)
         FROM shadow_events WHERE at>=?1 AND at<=?2", params![start,now], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
     for (column, output) in [("agent_id", &mut result.by_employee), ("tool", &mut result.by_tool),
-        ("source_class", &mut result.by_source_class), ("transport", &mut result.by_transport)] {
+        ("source_class", &mut result.by_source_class), ("transport", &mut result.by_transport), ("kind", &mut result.by_kind)] {
         // Columns are a fixed host-owned list, never an RPC input.
         let mut stmt = tx.prepare(&format!("SELECT {column},COUNT(*) FROM shadow_events WHERE at>=?1 AND at<=?2 GROUP BY {column} ORDER BY COUNT(*) DESC,{column}")).map_err(|e| e.to_string())?;
         *output = stmt.query_map(params![start,now], |r| Ok(Count { key:r.get(0)?, count:r.get(1)? })).map_err(|e| e.to_string())?
@@ -202,6 +218,34 @@ fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
 mod tests {
     use super::*;
     const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn egress_shadow_keeps_both_gates_for_one_call_and_migrates_legacy_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = Connection::open(home.path().join("egress_shadow.db")).unwrap();
+        conn.execute_batch("CREATE TABLE shadow_events (
+            day TEXT NOT NULL,agent_id TEXT NOT NULL,tool TEXT NOT NULL,kind TEXT NOT NULL,source_class TEXT NOT NULL,
+            call_id TEXT NOT NULL UNIQUE,at INTEGER NOT NULL,transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')));
+            INSERT INTO shadow_events VALUES ('2026-01-01','bot','send_message','would_ask','memory','old',1,'mcp');").unwrap();
+        drop(conn);
+        let migrated = Store::open(home.path()).unwrap();
+        let old: u64 = migrated.0.query_row("SELECT COUNT(*) FROM shadow_events WHERE call_id='old'", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 1);
+        drop(migrated);
+        assert!(record(home.path(), "bot", "send_message", "would_ask", &[], "shared", Transport::Mcp));
+        assert!(record(home.path(), "bot", "send_message", "recipient_would_ask", &[], "shared", Transport::Mcp));
+        assert!(!record(home.path(), "bot", "send_message", "recipient_would_ask", &[], "shared", Transport::Mcp));
+        let report = report(home.path(), 7).unwrap();
+        assert_eq!(report.total, 2);
+        assert_eq!(report.ticket_total, 1);
+        assert_eq!(report.by_kind.len(), 2);
+        assert!(report.by_kind.iter().all(|row| row.count == 1));
+        let conn = Connection::open(home.path().join("egress_shadow.db")).unwrap();
+        let count: u64 = conn.query_row("SELECT COUNT(*) FROM shadow_events WHERE call_id='old'", [], |r| r.get(0)).unwrap();
+        // Old rows may be removed by the normal retention sweep; migration
+        // itself is also checked below before recording triggers that sweep.
+        assert!(count <= 1);
+    }
 
     #[test]
     fn writes_create_missing_home_and_failures_remain_best_effort() {

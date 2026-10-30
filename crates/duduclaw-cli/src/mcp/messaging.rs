@@ -11,10 +11,7 @@ pub(crate) async fn handle_send_message(
     let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
     if channel.is_empty() || chat_id.is_empty() || text.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: channel, chat_id, and text are required"}],
-            "isError": true
-        });
+        return super::egress_gate::pre_dispatch_error("Error: channel, chat_id, and text are required");
     }
 
     // Delegate to the unified `channel_sender::resolve_channel_target` +
@@ -44,10 +41,7 @@ pub(crate) async fn handle_send_message(
 pub(crate) async fn handle_web_search(params: &Value, http: &reqwest::Client) -> Value {
     let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
     if query.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: query is required"}],
-            "isError": true
-        });
+        return super::egress_gate::pre_dispatch_error("Error: query is required");
     }
 
     let url = format!(
@@ -133,10 +127,7 @@ pub(crate) async fn handle_send_media(
         .unwrap_or("");
 
     if chat_id.is_empty() || url_or_id.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: chat_id and url/sticker_id are required for {media_type}")}],
-            "isError": true
-        });
+        return super::egress_gate::pre_dispatch_error(&format!("Error: chat_id and url/sticker_id are required for {media_type}"));
     }
 
     let config = read_config(home_dir).await;
@@ -148,7 +139,7 @@ pub(crate) async fn handle_send_media(
                 None => String::new(),
             };
             if token.is_empty() {
-                Err("Error: telegram_bot_token not configured".to_string())
+                return super::egress_gate::pre_dispatch_error("Error: telegram_bot_token not configured");
             } else {
                 let (method, key) = match media_type {
                     "photo" => ("sendPhoto", "photo"),
@@ -172,7 +163,7 @@ pub(crate) async fn handle_send_media(
                 None => String::new(),
             };
             if token.is_empty() {
-                Err("Error: discord_bot_token not configured".to_string())
+                return super::egress_gate::pre_dispatch_error("Error: discord_bot_token not configured");
             } else {
                 let api_url = format!("https://discord.com/api/v10/channels/{chat_id}/messages");
                 match http
@@ -187,7 +178,7 @@ pub(crate) async fn handle_send_media(
                 }
             }
         }
-        _ => Err(format!("Channel '{channel}' does not support {media_type} yet")),
+        _ => return super::egress_gate::pre_dispatch_error(&format!("Channel '{channel}' does not support {media_type} yet")),
     };
 
     sink_result(result)

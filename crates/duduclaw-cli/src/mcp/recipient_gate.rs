@@ -56,11 +56,17 @@ pub(crate) fn targets(tool: &str, args: &Value) -> Option<Vec<String>> {
 pub(crate) async fn check(
     home: &Path, agent: &str, tool: &str, args: &Value, employee: bool, use_turn: bool,
 ) -> Option<Value> {
-    check_inner(home, agent, tool, args, employee, use_turn, true).await
+    check_with_call(home, agent, tool, args, employee, use_turn, &uuid::Uuid::new_v4().to_string()).await
+}
+
+pub(crate) async fn check_with_call(
+    home: &Path, agent: &str, tool: &str, args: &Value, employee: bool, use_turn: bool, call_id: &str,
+) -> Option<Value> {
+    check_inner(home, agent, tool, args, employee, use_turn, Some(call_id)).await
 }
 
 async fn check_inner(
-    home: &Path, agent: &str, tool: &str, args: &Value, employee: bool, use_turn: bool, audit: bool,
+    home: &Path, agent: &str, tool: &str, args: &Value, employee: bool, use_turn: bool, call_id: Option<&str>,
 ) -> Option<Value> {
     let targets = targets(tool, args)?;
     let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(home, agent)
@@ -77,7 +83,7 @@ async fn check_inner(
             context.as_ref().and_then(|c| c.source.as_deref()),
             context.as_ref().map(|c| c.owners.as_slice()).unwrap_or(&[]), &policy.recipients)
     };
-    if audit { record_decision(home, agent, tool, decision) }
+    if let Some(call_id) = call_id { record_decision(home, agent, tool, decision, call_id) }
     else if decision == Decision::Ask { Some(json!({"reason":"outside_allowed_recipients"})) }
     else { None }
 }
@@ -85,7 +91,7 @@ async fn check_inner(
 pub(crate) async fn confirm_dispatch(
     home: &Path, agent: &str, tool: &str, payload: &Value, employee: bool, use_turn: bool,
 ) -> Result<(), String> {
-    if check_inner(home, agent, tool, payload.get("arguments").unwrap_or(&Value::Null), employee, use_turn, false).await.is_some()
+    if check_inner(home, agent, tool, payload.get("arguments").unwrap_or(&Value::Null), employee, use_turn, None).await.is_some()
         && payload["egress_guard"].get("recipient_guard").is_none()
     {
         return Err("等待核准期間收件對象的允許範圍已改變，請重試並取得收件人核准。".into());
@@ -93,13 +99,15 @@ pub(crate) async fn confirm_dispatch(
     Ok(())
 }
 
-fn record_decision(home: &Path, agent: &str, tool: &str, decision: Decision) -> Option<Value> {
+fn record_decision(home: &Path, agent: &str, tool: &str, decision: Decision, call_id: &str) -> Option<Value> {
     match decision {
         Decision::Allow => None,
         Decision::WouldAsk => {
+            duduclaw_gateway::egress_shadow::record(home, agent, tool, "recipient_would_ask", &[], call_id,
+                duduclaw_gateway::egress_shadow::Transport::Mcp);
             duduclaw_security::audit::append_tool_call_with_extras(
                 home, agent, tool, "recipient_guard: would ask before sending to an unlisted recipient",
-                true, &[("recipient_guard", json!("would_ask"))],
+                true, &[("recipient_guard", json!("would_ask")), ("call_id", json!(call_id))],
             );
             None
         }
@@ -141,6 +149,27 @@ mod tests {
             assert_eq!(reason.is_some(), mode == "ask");
         }
         assert_eq!(targets("mcp__third_party__send", &json!({"to":"line:allowed"})), Some(vec![String::new()]));
+    }
+
+    #[tokio::test]
+    async fn builtin_recipient_shadow_shares_call_id_with_egress() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\nrecipient_guard='shadow'\n").unwrap();
+        let taint = duduclaw_gateway::egress_guard::Taint {
+            tainted: true, sources: vec!["memory_search".into()],
+            ..duduclaw_gateway::egress_guard::Taint::unknown()
+        };
+        duduclaw_gateway::egress_gate::evaluate_with_call(home.path(), "alice", "send_message", true, taint, "shared-call").unwrap();
+        assert!(check_with_call(home.path(), "alice", "send_message",
+            &json!({"channel":"telegram","chat_id":"123","text":"hello"}), false, false, "shared-call").await.is_none());
+        let report = duduclaw_gateway::egress_shadow::report(home.path(), 7).unwrap();
+        assert_eq!(report.total, 2);
+        assert_eq!(report.ticket_total, 1);
+        assert_eq!(report.by_kind.len(), 2);
+        assert!(report.by_kind.iter().all(|row| row.count == 1));
+        let conn = rusqlite::Connection::open(home.path().join("egress_shadow.db")).unwrap();
+        let calls: u64 = conn.query_row("SELECT COUNT(*) FROM shadow_events WHERE call_id='shared-call'", [], |row| row.get(0)).unwrap();
+        assert_eq!(calls, 2);
     }
 
     #[test]
@@ -211,10 +240,13 @@ mod tests {
     #[test]
     fn shadow_records_without_creating_an_approval_reason() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(record_decision(home.path(), "alice", "send_message", Decision::WouldAsk), None);
+        assert_eq!(record_decision(home.path(), "alice", "send_message", Decision::WouldAsk, "builtin-call"), None);
         let row: Value = serde_json::from_str(std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(row["recipient_guard"], "would_ask");
         assert!(!home.path().join("approvals.db").exists());
+        let report = duduclaw_gateway::egress_shadow::report(home.path(), 7).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.by_kind[0].key, "recipient_would_ask");
     }
 
     #[test]

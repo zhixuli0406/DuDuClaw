@@ -1336,7 +1336,7 @@ mod tests {
         assert!(!masked.contains("Sup3rS3cret"));
         // C1 masks the complete credential-bearing connection string,
         // including its account and endpoint, before the legacy passes.
-        assert_eq!(masked, "[已遮罩的密碼]");
+        assert_eq!(masked, "[已遮罩的連線字串]");
     }
 
     #[test]

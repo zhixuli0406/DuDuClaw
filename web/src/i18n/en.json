@@ -3068,7 +3068,7 @@
   "security.credentialHygiene.desc": "Scans config.toml for leftover plaintext credentials and flags what's safe to clean up",
   "security.credentialHygiene.refresh": "Rescan",
   "security.credentialHygiene.cleanupButton": "Clean Up",
-  "security.credentialHygiene.clean": "No plaintext credential residue found",
+  "security.credentialHygiene.clean": "No plaintext credentials or residue in the checked scope",
   "security.credentialHygiene.foundSummary": "Found {count} plaintext credential(s)",
   "security.credentialHygiene.cleanableSummary": "{count} already have an encrypted copy — safe to clean up",
   "security.credentialHygiene.manualSummary": "{count} not yet encrypted — needs manual attention",
@@ -3133,7 +3133,7 @@
   "security.credentialInventory.hideUnset": "Hide {count} unset",
   "security.credentialInventory.summary.total": "{count} fields",
   "security.credentialInventory.summary.referenced": "{count} external",
-  "security.credentialInventory.summary.plaintext": "{count} plaintext",
+  "security.credentialInventory.summary.plaintext": "{count} stored as plaintext",
   "security.credentialInventory.summary.residue": "{count} residue",
   "security.credentialInventory.badge.residue": "Plaintext residue",
   "security.credentialInventory.referenceHint": "To keep a credential out of the config file entirely, set the field to a reference: secret://env/TELEGRAM_BOT_TOKEN, secret://keychain/duduclaw/telegram, or secret://file//run/secrets/tg_token. Rotating it then only touches the source — config.toml never changes.",
@@ -9342,5 +9342,8 @@
   "runtimeUpdate.action": "Update Codex CLI",
   "runtimeUpdate.unknownVersion": "unknown",
   "runtimeUpdate.shadowed": "The update command finished, but an older Codex CLI is still being found: {path}. Update or remove that copy, then choose Check again.",
-  "runtimeUpdate.unverified": "The update command finished, but the Codex CLI version could not be confirmed. Check the installation, then try Check again."
+  "runtimeUpdate.unverified": "The update command finished, but the Codex CLI version could not be confirmed. Check the installation, then try Check again.",
+  "security.credentialAudit.provider.chat": "Conversation participant",
+  "security.credentialHygiene.plaintextSummary": "The inventory has {count} plaintext item(s). Use encrypted storage or an external reference.",
+  "google.setup.step3Above": "Register the exact authorized redirect URI shown above."
 }

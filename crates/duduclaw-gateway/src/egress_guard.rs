@@ -1270,7 +1270,7 @@ mod tests {
         let home = policy_home("block");
         let agent = format!("phase-{}", uuid::Uuid::new_v4());
         for dispatched in [false, true] {
-            for outcome in ["terminal", "error", "timeout", "cancel", "panic"] {
+            for outcome in ["terminal", "not_dispatched", "error", "timeout", "cancel", "panic"] {
                 let turn = uuid::Uuid::new_v4().to_string();
                 register_turn(&agent, &turn);
                 let (lease, _) = crate::egress_client::SinkLease::direct(home.path(), &agent, Some(&turn), None).unwrap();
@@ -1290,11 +1290,12 @@ mod tests {
                         if outcome == "cancel" { task.abort(); }
                         assert!(task.await.is_err());
                     }
+                    "not_dispatched" => { lease.not_dispatched(); lease.release().await; }
                     "error" => { let _: Result<(), ()> = async move { let _held = lease; Err(()) }.await; }
                     _ => { lease.terminal_response(); lease.release().await; }
                 }
                 let refused = reserve_turn(home.path(), &agent, Some(&turn), "memory_search", "read").is_err();
-                assert_eq!(refused, dispatched && outcome != "terminal", "{dispatched}/{outcome}");
+                assert_eq!(refused, dispatched && !matches!(outcome, "terminal" | "not_dispatched"), "{dispatched}/{outcome}");
                 if refused {
                     let mut ledger = ledger().lock().unwrap();
                     let key = (agent.clone(), turn);

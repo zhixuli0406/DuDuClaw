@@ -544,10 +544,11 @@ pub struct GrokProbeReport {
 pub async fn grok_probe(home: &Path) -> Option<GrokProbeReport> {
     let path = duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home))?;
 
+    let mut version_cmd = duduclaw_core::platform::async_command_for(&path);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut version_cmd);
     let version = match tokio::time::timeout(
         Duration::from_secs(5),
-        duduclaw_core::platform::async_command_for(&path)
-            .arg("--version")
+        version_cmd.arg("--version")
             .stdin(Stdio::null())
             .output(),
     )

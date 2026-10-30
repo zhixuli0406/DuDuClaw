@@ -133,7 +133,15 @@ pub fn mask_json(value: &mut serde_json::Value) {
                     | "secret" | "clientsecret" | "accesstoken" | "refreshtoken" | "authorization"
                     | "connectionstring" | "privatekey") && child.is_string()
                 {
-                    child = serde_json::Value::String("[已遮罩的密碼]".into());
+                    let kind = match normalized.as_str() {
+                        "password" | "passwd" | "pwd" => "password",
+                        "apikey" | "clientsecret" => "api_key",
+                        "token" | "accesstoken" | "refreshtoken" | "authorization" => "oauth_token",
+                        "privatekey" => "ssh_key",
+                        "connectionstring" => "connection_string",
+                        _ => "other",
+                    };
+                    child = serde_json::Value::String(masked_placeholder(kind));
                 } else {
                     mask_json(&mut child);
                 }
@@ -240,6 +248,24 @@ fn guarded_detect<T>(scan: impl FnOnce() -> Result<T, DetectError> + std::panic:
     std::panic::catch_unwind(scan).unwrap_or(Err(DetectError))
 }
 
+fn masked_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "password" => "密碼",
+        "api_key" => " API key",
+        "oauth_token" => "權杖",
+        "ssh_key" => "私密金鑰",
+        "certificate" => "憑證",
+        "connection_string" => "連線字串",
+        "cookie" => "Cookie",
+        _ => "憑證",
+    }
+}
+
+/// A value-free placeholder that identifies the credential kind.
+pub fn masked_placeholder(kind: &str) -> String {
+    format!("[已遮罩的{}]", masked_kind_label(kind))
+}
+
 /// Quotas limit ledger rows, never masking. Missing ids use a generic marker.
 pub fn mask_with_ids(text: &str, findings: &[Finding], ids: &[String]) -> String {
     mask_with_ids_limit(text, findings, ids, MAX_SCAN_BYTES)
@@ -258,11 +284,12 @@ fn mask_with_ids_limit(text: &str, findings: &[Finding], ids: &[String], limit: 
         let Some(prefix) = text.get(end..finding.span.start) else { return UNAVAILABLE_MASK.into(); };
         if text.get(finding.span.clone()).is_none() { return UNAVAILABLE_MASK.into(); }
         out.push_str(prefix);
+        let label = masked_kind_label(&finding.kind);
         if let Some(id) = ids.get(index).filter(|id| id.starts_with("cred_")
             && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
-            out.push_str(&format!("[已遮罩的密碼 {id}]"));
+            out.push_str(&format!("[已遮罩的{label} {id}]"));
         } else {
-            out.push_str("[已遮罩的密碼]");
+            out.push_str(&masked_placeholder(&finding.kind));
         }
         end = finding.span.end;
     }
@@ -406,6 +433,27 @@ mod tests {
         let text = "password: fixture";
         assert_eq!(mask_with_ids(text, &detect(text).unwrap(), &["cred_test".into()]),
             "password: [已遮罩的密碼 cred_test]");
+    }
+
+    #[test]
+    fn mask_marker_names_the_detected_credential_kind() {
+        for (text, expected) in [
+            ("API key: fixture-value", "API key: [已遮罩的 API key cred_test]"),
+            ("token: fixture-value", "token: [已遮罩的權杖 cred_test]"),
+            ("postgres://alice:fixture@localhost/db", "[已遮罩的連線字串 cred_test]"),
+        ] {
+            assert_eq!(mask_with_ids(text, &detect(text).unwrap(), &["cred_test".into()]), expected);
+            assert!(!mask(text).contains("fixture"));
+        }
+    }
+
+    #[test]
+    fn json_mask_marker_names_the_contextual_kind() {
+        let mut data = serde_json::json!({"api_key":"fixture-api", "token":"fixture-token", "password":"fixture-password"});
+        mask_json(&mut data);
+        assert_eq!(data["api_key"], "[已遮罩的 API key]");
+        assert_eq!(data["token"], "[已遮罩的權杖]");
+        assert_eq!(data["password"], "[已遮罩的密碼]");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { Pencil, CircleOff } from 'lucide-react';
 import { api, type ChatCredential, type CredentialAuditReport, type SecurityAuditVerification } from '@/lib/api';
 import {
   Button, Card, CardContent, CardDescription, CardHeader, CardTitle,
@@ -107,6 +108,14 @@ export function CredentialAuditPanel() {
     setServiceDraft(row.service ?? '');
   }
 
+  function providerLabel(row: ChatCredential) {
+    if (!row.provided_by) return '—';
+    if (/^[a-f0-9]{64}$/i.test(row.provided_by) || row.provided_by === 'webchat-anonymous') {
+      return t('provider.chat');
+    }
+    return row.provided_by;
+  }
+
   return (
     <Card>
       <CardHeader>
@@ -153,27 +162,27 @@ export function CredentialAuditPanel() {
         {error != null && <ErrorState variant="inline" error={error} title={t('error')} onRetry={() => void load()} />}
         {loading ? <Skeleton className="h-32 w-full" /> : report && (
           <>
-            <div className="overflow-x-auto">
-              <Table>
+            <div className="min-w-0 max-w-full">
+              <Table className="min-w-2xl table-fixed [&_td]:whitespace-normal [&_td]:break-words [&_th]:whitespace-normal">
                 <TableHeader><TableRow>
-                  {COLUMNS.map((c) => <TableHead key={c}>{t(c)}</TableHead>)}
+                  {COLUMNS.map((c) => <TableHead key={c} className={c === 'source' ? 'w-1/6' : undefined}>{t(c)}</TableHead>)}
                   <TableHead>{t('actions')}</TableHead>
                 </TableRow></TableHeader>
                 <TableBody>
                   {report.credentials.map((row) => <TableRow key={row.id}>
                     <TableCell>{t(`kind.${row.kind}`)}</TableCell>
-                    <TableCell>{row.account_hint ?? '—'}</TableCell>
-                    <TableCell>{row.service ?? t('unknown')}</TableCell>
-                    <TableCell><span>{t(`source.${row.source_kind}`)}</span><small className="block max-w-48 break-all text-muted-foreground">{row.source_ref}</small></TableCell>
-                    <TableCell>{row.provided_by || '—'}</TableCell>
-                    <TableCell>{row.holders.filter((h) => !h.revoked_at).map((h) => `${t(`holder.${h.holder_kind}`)}: ${h.holder_id}`).join(', ') || '—'}</TableCell>
+                    <TableCell><span className="block truncate" title={row.account_hint ?? undefined}>{row.account_hint ?? '—'}</span></TableCell>
+                    <TableCell><span className="block truncate" title={row.service ?? undefined}>{row.service ?? t('unknown')}</span></TableCell>
+                    <TableCell><span>{t(`source.${row.source_kind}`)}</span><small className="block break-all text-muted-foreground" title={row.source_ref}>{row.source_ref}</small></TableCell>
+                    <TableCell><span className="block truncate" title={row.provided_by}>{providerLabel(row)}</span></TableCell>
+                    <TableCell><span className="block break-all">{row.holders.filter((h) => !h.revoked_at).map((h) => `${t(`holder.${h.holder_kind}`)}: ${h.holder_id}`).join(', ') || '—'}</span></TableCell>
                     <TableCell>{row.last_used_at && Number.isFinite(Date.parse(row.last_used_at)) ? intl.formatDate(row.last_used_at, { dateStyle: 'medium', timeStyle: 'short' }) : t('notObserved')}</TableCell>
                     <TableCell>{t(`status.${row.status}`)}</TableCell>
                     <TableCell>
-                      <div className="flex gap-2">
-                        <Button size="sm" variant="ghost" disabled={busy} onClick={() => startEdit(row)}>{t('editService')}</Button>
-                        <Button size="sm" variant="ghost" disabled={busy || row.status === 'false_positive'}
-                          onClick={() => void update({ id: row.id, status: 'false_positive' })}>{t('falsePositive')}</Button>
+                      <div className="flex gap-1">
+                        <Button size="icon-xs" variant="ghost" aria-label={t('editService')} title={t('editService')} disabled={busy} onClick={() => startEdit(row)}><Pencil /></Button>
+                        <Button size="icon-xs" variant="ghost" aria-label={t('falsePositive')} title={t('falsePositive')} disabled={busy || row.status === 'false_positive'}
+                          onClick={() => void update({ id: row.id, status: 'false_positive' })}><CircleOff /></Button>
                       </div>
                     </TableCell>
                   </TableRow>)}

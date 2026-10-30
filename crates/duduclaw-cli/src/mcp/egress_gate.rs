@@ -73,3 +73,108 @@ mod tests {
         }
     }
 }
+
+/// A host-owned immediate return before network or durable queue admission.
+pub(crate) fn pre_dispatch_error(message: &str) -> Value {
+    duduclaw_gateway::egress_client::builtin_not_dispatched();
+    super::tool_error(message)
+}
+
+#[cfg(test)]
+mod dispatch_observation_tests {
+    use super::*;
+    use duduclaw_gateway::egress_client::observe_builtin_dispatch;
+
+    #[tokio::test]
+    async fn egress_builtin_local_failures_attest_not_dispatched() {
+        let home = tempfile::tempdir().unwrap();
+        let http = reqwest::Client::new();
+        for channel in ["telegram", "unknown"] {
+            let args = json!({"channel":channel,"chat_id":"test","text":"hello"});
+            let (response, local) = observe_builtin_dispatch(
+                crate::mcp::messaging::handle_send_message(&args, home.path(), &http, "bot")
+            ).await;
+            assert_eq!(response["isError"], true, "{response}");
+            assert!(local, "{channel}: {response}");
+        }
+        for channel in ["telegram", "discord", "unknown"] {
+            let args = json!({"channel":channel,"chat_id":"test","url":"https://example.com/photo"});
+            let (response, local) = observe_builtin_dispatch(
+                crate::mcp::messaging::handle_send_media(&args, home.path(), &http, "photo")
+            ).await;
+            assert_eq!(response["isError"], true);
+            assert!(local, "{channel}: {response}");
+        }
+        let odoo = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::new(Default::default()));
+        let (response, local) = observe_builtin_dispatch(
+            crate::mcp::odoo::handle_odoo_tool("odoo_invoice_list", &json!({}), home.path(), &odoo, "bot")
+        ).await;
+        assert_eq!(response["isError"], true);
+        assert!(local, "{response}");
+        let (response, local) = observe_builtin_dispatch(
+            crate::mcp_db::handle_db_tables(&json!({"source":"unknown"}), home.path(), "bot")
+        ).await;
+        assert_eq!(response["isError"], true);
+        assert!(local);
+        let (response, local) = observe_builtin_dispatch(
+            crate::mcp::spawn::handle_spawn_agent(&json!({"agent_id":"unknown","task":"hello"}), home.path(), "bot")
+        ).await;
+        assert_eq!(response["isError"], true);
+        assert!(local, "unknown employee: {response}");
+        let (response, local) = observe_builtin_dispatch(
+            crate::mcp::delegation::handle_send_to_agent(&json!({}), home.path(), "bot")
+        ).await;
+        assert_eq!(response["isError"], true);
+        assert!(local);
+        for args in [json!({}), json!({"owner":"owner"}), json!({"owner":"owner","repo":"repo"})] {
+            let (response, local) = observe_builtin_dispatch(
+                crate::mcp::notion_github::handle_github_issue_comment(&args, home.path())
+            ).await;
+            assert_eq!(response["isError"], true);
+            assert!(local, "GitHub validation: {response}");
+        }
+        for provider in ["notion", "github"] {
+            let args = json!({"query":"test"});
+            let (response, local) = observe_builtin_dispatch(async {
+                if provider == "notion" {
+                    crate::mcp::notion_github::handle_notion_search(&args, home.path()).await
+                } else {
+                    crate::mcp::notion_github::handle_github_search_issues(&args, home.path()).await
+                }
+            }).await;
+            assert_eq!(response["isError"], true);
+            assert!(local, "missing connection: {response}");
+        }
+        let google = crate::mcp::google_identity_client::GoogleCaller::default();
+        let (response, local) = observe_builtin_dispatch(
+            crate::mcp::google::handle_calendar_create_event(&json!({}), home.path(), &google)
+        ).await;
+        assert_eq!(response["isError"], true);
+        assert!(local, "Google validation: {response}");
+        let (response, local) = observe_builtin_dispatch(
+            crate::mcp::google::handle_drive_search(&json!({"query":"test"}), home.path(), &google)
+        ).await;
+        assert_eq!(response["isError"], true);
+        assert!(local, "Google missing connection: {response}");
+        let (_, local) = observe_builtin_dispatch(async { json!({"isError":true,"not_dispatched":true}) }).await;
+        assert!(!local, "response fields cannot attest dispatch state");
+        let (_, local) = observe_builtin_dispatch(async {
+            duduclaw_gateway::egress_client::builtin_dispatch_started();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1), std::future::pending::<()>()).await;
+            json!({"isError":true,"content":[{"text":"request timed out"}]})
+        }).await;
+        assert!(!local, "post-dispatch timeout must stay uncertain");
+        let (_, local) = observe_builtin_dispatch(async {
+            duduclaw_gateway::egress_client::builtin_dispatch_started();
+            pre_dispatch_error("local resolution failed after a request started")
+        }).await;
+        assert!(!local, "nested local failure cannot downgrade a started request");
+    }
+
+    #[test]
+    fn egress_credential_declare_is_local_metadata() {
+        assert_eq!(duduclaw_core::tool_effect::effect_of_builtin("credential_declare"), Some(duduclaw_core::ToolEffect::Modify));
+        assert_eq!(duduclaw_core::tool_effect::egress_capable("credential_declare"), Some(false));
+        assert_eq!(duduclaw_core::tool_effect::reads_private("credential_declare"), Some(false));
+    }
+}

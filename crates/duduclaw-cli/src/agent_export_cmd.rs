@@ -21,7 +21,7 @@ fn run_with_markers(home: &Path, id: &str, format: &str, out: &Path, include_use
     let parsed: ExportFormat = format.parse().map_err(|e| DuDuClawError::Config(format!("{e}")))?;
     let profile = agent_profile::load(&home.join("agents").join(id), id)
         .map_err(|e| DuDuClawError::Config(e.to_string()))?;
-    let artifacts = agent_profile::export(&profile, parsed, include_user)
+    let artifacts = duduclaw_security::agent_profile::export(&profile, parsed, include_user)
         .map_err(|e| DuDuClawError::Config(e.to_string()))?;
     let directory = matches!(format, "openclaw" | "hermes");
     if directory {
@@ -61,5 +61,21 @@ mod tests {
     #[test]
     fn export_is_an_operator_bash_command() {
         assert!(crate::agent_control_cmd::bash_agent_control_decision("duduclaw agent export worker --out /tmp/profile.md", &duduclaw_core::HookCaller::Agent("worker".into())).is_some());
+    }
+
+    #[test]
+    fn context_password_refuses_every_format_before_output_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname = 'worker'\n").unwrap();
+        std::fs::write(agent.join("INSTRUCTIONS.md"), "db password: hunter2xyz").unwrap();
+        for format in ["duduclaw", "openclaw", "hermes", "agents-md", "claude-subagent"] {
+            let out = root.path().join(format);
+            let error = run_with_markers(root.path(), "worker", format, &out, false, &[]).unwrap_err().to_string();
+            assert!(error.contains("Rules"), "{format}: {error}");
+            assert!(!error.contains("hunter2xyz"));
+            assert!(!out.exists(), "{format} must refuse before creating output");
+        }
     }
 }

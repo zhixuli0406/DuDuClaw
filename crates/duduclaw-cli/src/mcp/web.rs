@@ -15,14 +15,14 @@ pub(crate) async fn fetch_for_tool(
     let url = args
         .get("url")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| tool_error("Missing required parameter: url"))?;
+        .ok_or_else(|| super::egress_gate::pre_dispatch_error("Missing required parameter: url"))?;
     let ttl = args
         .get("ttl_seconds")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
     if !WEB_FETCH_LIMITER.check("mcp-server") {
-        return Err(tool_error(
+        return Err(super::egress_gate::pre_dispatch_error(
             "Rate limit exceeded (10 requests/min) — try again shortly",
         ));
     }
@@ -95,7 +95,7 @@ pub(crate) async fn handle_web_fetch_cached(args: &Value, home_dir: &Path) -> Va
 pub(crate) async fn handle_web_extract(args: &Value, home_dir: &Path) -> Value {
     let selector = match args.get("selector").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return tool_error("Missing required parameter: selector"),
+        None => return super::egress_gate::pre_dispatch_error("Missing required parameter: selector"),
     };
     let format = match args
         .get("format")
@@ -105,7 +105,7 @@ pub(crate) async fn handle_web_extract(args: &Value, home_dir: &Path) -> Value {
         "html" => duduclaw_gateway::web_extract::OutputFormat::Html,
         "json" => duduclaw_gateway::web_extract::OutputFormat::Json,
         "text" => duduclaw_gateway::web_extract::OutputFormat::Text,
-        other => return tool_error(&format!("Invalid format: {other}. Valid: text, html, json")),
+        other => return super::egress_gate::pre_dispatch_error(&format!("Invalid format: {other}. Valid: text, html, json")),
     };
 
     let fetched = match fetch_for_tool(args, home_dir).await {

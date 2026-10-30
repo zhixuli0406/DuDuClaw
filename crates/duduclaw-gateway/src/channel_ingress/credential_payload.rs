@@ -40,7 +40,7 @@ fn mask_native_mentions(message: &mut serde_json::Map<String, Value>) {
             let mut rendered = String::new();
             for (index, ch) in text.char_indices() {
                 if let Some(finding) = findings.iter().find(|f| f.span.contains(&index)) {
-                    if index == finding.span.start { rendered.push_str("[已遮罩的密碼]"); }
+                    if index == finding.span.start { rendered.push_str(&duduclaw_security::credential_detect::masked_placeholder(&finding.kind)); }
                 } else if people.iter().any(|(start, end)| index >= *start && index < *end) {
                     rendered.push(' ');
                 } else {

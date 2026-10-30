@@ -32,6 +32,17 @@ describe('CredentialAuditPanel', () => {
     expect(screen.getByText('webchat:session:42')).toBeInTheDocument();
   });
 
+  it('labels hashed providers and preserves the full identifier on hover', async () => {
+    const provider = 'a'.repeat(64);
+    const source = `webchat:${'b'.repeat(200)}:42`;
+    mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, provided_by: provider, source_ref: source }], mode: 'audit' });
+    renderWithProviders(<CredentialAuditPanel />);
+    const label = await screen.findByText('Conversation participant');
+    expect(label).toHaveAttribute('title', provider);
+    expect(screen.queryByText(provider)).not.toBeInTheDocument();
+    expect(screen.getByText(source)).toHaveAttribute('title', source);
+  });
+
   it('does not present revoked holders as current holders', async () => {
     mockWsClient.call.mockResolvedValue({ credentials: [{ ...credential, holders: [
       { holder_kind: 'agent', holder_id: 'former-holder', revoked_at: '2026-10-30T02:00:00Z' },

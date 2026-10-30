@@ -833,6 +833,7 @@ impl AgentRuntime for GrokRuntime {
 
     async fn is_available(&self) -> bool {
         let mut cmd = tokio::process::Command::new(&self.grok_path);
+        duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
         cmd.arg("--version");
         crate::process_group::output(&mut cmd, None, std::time::Duration::from_secs(5))
             .await.map(|output| output.status.success()).unwrap_or(false)

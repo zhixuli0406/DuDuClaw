@@ -26,6 +26,7 @@ pub(crate) async fn send_to_agent_with_ctx(
         .unwrap_or("");
 
     if target.is_empty() || prompt.is_empty() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: agent_id and prompt are required"}],
             "isError": true
@@ -34,6 +35,7 @@ pub(crate) async fn send_to_agent_with_ctx(
 
     // Validate agent_id format
     if !is_valid_agent_id(target) {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: agent_id must be lowercase alphanumeric with hyphens"}],
             "isError": true
@@ -42,6 +44,7 @@ pub(crate) async fn send_to_agent_with_ctx(
 
     // ── WP21 C2: department × hierarchy delegation gate ────────
     if let Err(reason) = check_delegation_allowed(home_dir, caller, target, "send_to_agent").await {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: {reason}")}],
             "isError": true
@@ -53,6 +56,7 @@ pub(crate) async fn send_to_agent_with_ctx(
     let outgoing_depth = incoming_depth.saturating_add(1);
 
     if outgoing_depth >= duduclaw_core::MAX_DELEGATION_DEPTH {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Error: delegation depth limit ({}) would be exceeded. \
