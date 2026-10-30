@@ -95,6 +95,32 @@ const COMPAT_HOOK_SOURCES_OFF: [(&str, &str); 2] = [
     ("GROK_CLAUDE_HOOKS_ENABLED", "false"),
     ("GROK_CURSOR_HOOKS_ENABLED", "false"),
 ];
+
+fn egress_args(home: &Path, agent_dir: Option<&Path>, work_root: Option<&Path>) -> Result<Vec<String>, String> {
+    use duduclaw_core::egress_guard::{effective_mode, Mode};
+    if effective_mode(home, agent_dir) < Mode::Ask { return Ok(Vec::new()); }
+    let refuse = || duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        "此外送防護模式需要 Grok 使用員工自己的工作目錄與 hook；請改用獨立員工目錄或 Claude/Codex 執行。",
+    );
+    let (Some(agent), Some(root)) = (agent_dir, work_root) else { return Err(refuse()); };
+    if agent != root { return Err(refuse()); }
+    let expected = crate::agent_hook_installer::grok_guard_hooks_file_name(agent);
+    // A previous shared-workspace run may have left another employee's
+    // guard alongside ours. Never load both and consume the wrong ticket.
+    match std::fs::read_dir(root.join(".grok/hooks")) {
+        Ok(entries) => for entry in entries {
+            let entry = entry.map_err(|_| refuse())?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(refuse)?;
+            if name.starts_with("duduclaw-guards") && name.ends_with(".json") && name != expected {
+                return Err(refuse());
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return Err(refuse()),
+    }
+    Ok(vec!["--disable-web-search".into()])
+}
 /// Spawn env turning off Grok's Claude- and Cursor-compat rules, skills and
 /// agents scanning (same reference). Without them an employee's turn gets the
 /// OS user's `~/.claude/CLAUDE.md`, `~/.claude/rules/`, `~/.claude/skills/`
@@ -366,6 +392,7 @@ impl AgentRuntime for GrokRuntime {
         // reads both its MCP config and the directory's `.mcp.json` from it.
         let work_root: Option<std::path::PathBuf> =
             super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
+        let egress_args = egress_args(&context.home_dir, context.agent_dir.as_deref(), work_root.as_deref())?;
 
         // Third-party `.mcp.json` servers (2026-10-20, `third_party`): Grok
         // loads the working directory's `.mcp.json` by itself, so when it
@@ -395,18 +422,13 @@ impl AgentRuntime for GrokRuntime {
         // lose. A borrowed root keeps one file per employee.
         if let (Some(agent_dir), Some(root)) = (context.agent_dir.as_deref(), work_root.as_deref())
         {
-            crate::agent_hook_installer::write_grok_guard_hooks(
+            if let Err(error) = crate::agent_hook_installer::write_grok_guard_hooks(
                 root,
                 agent_dir,
                 &duduclaw_core::resolve_duduclaw_bin(),
-            )
-            .await
-            .map_err(|e| {
-                duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
-                    "could not write the Grok guard hooks under {}: {e}",
-                    root.display()
-                ))
-            })?;
+            ).await {
+                crate::agent_hook_installer::hook_install_result(&context.home_dir, agent_dir, error)?;
+            }
         }
 
         // MCP wiring: register the duduclaw MCP server before spawning. Grok is
@@ -444,7 +466,7 @@ impl AgentRuntime for GrokRuntime {
         // Build the argument vector ONCE so the tokio spawn and the PTY retry run
         // a byte-identical command.
         let caps = context.capabilities.as_ref();
-        let mut args: Vec<String> = Vec::new();
+        let mut args = egress_args;
 
         // Model — verified `-m, --model <MODEL>`.
         if !context.model.is_empty() {
@@ -1178,6 +1200,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn egress_grok_modes_and_shared_hook_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/bot");
+        let shared = home.path().join("shared");
+        std::fs::create_dir_all(dir.join(".grok/hooks")).unwrap();
+        for mode in ["off", "shadow", "ask", "block"] {
+            std::fs::write(home.path().join("config.toml"), format!("[security]\negress_guard='{mode}'")).unwrap();
+            let strict = matches!(mode, "ask" | "block");
+            let args = egress_args(home.path(), Some(&dir), Some(&dir)).unwrap();
+            assert_eq!(args.iter().any(|arg| arg == "--disable-web-search"), strict);
+            assert_eq!(egress_args(home.path(), Some(&dir), Some(&shared)).is_err(), strict);
+            assert_eq!(egress_args(home.path(), None, None).is_err(), strict);
+            let stale = dir.join(".grok/hooks/duduclaw-guards-other.json");
+            std::fs::write(&stale, "{}").unwrap();
+            assert_eq!(egress_args(home.path(), Some(&dir), Some(&dir)).is_err(), strict);
+            std::fs::remove_file(stale).unwrap();
+        }
+    }
 
     /// P2-A third review (必查): Grok's MCP registration is a persistent
     /// file. It must never carry this round's task id, or the next round

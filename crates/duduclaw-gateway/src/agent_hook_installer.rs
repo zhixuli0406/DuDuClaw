@@ -71,6 +71,7 @@ const AGENT_FILE_GUARD_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit|Bash";
 
 /// Sentinel for the RFC-23 §14.4 data-file guard entry.
 const DATA_FILE_HOOK_ID: &str = "data-file-guard";
+const EGRESS_HOOK_ID: &str = "egress-guard";
 
 /// The pre-H10 shell script's filename, kept only so an upgrade can delete
 /// the leftover file. Nothing writes it any more.
@@ -79,10 +80,8 @@ const LEGACY_DATA_FILE_HOOK_SCRIPT: &str = "data-file-guard.sh";
 /// Ensure `<agent_dir>/.claude/settings.json` contains the agent-file-guard
 /// PreToolUse hook pointing at `duduclaw_bin`.
 ///
-/// Best-effort: on any filesystem or JSON error, this logs a warning and
-/// returns `Ok(())` rather than blocking agent startup. Guard enforcement
-/// is a defense-in-depth layer — the primary contract is still "use
-/// `create_agent` MCP tool".
+/// Returns installation errors to the caller. Runtime spawns use
+/// [`ensure_spawn_hook_settings`] to apply the effective egress mode.
 ///
 /// # Idempotency
 ///
@@ -108,7 +107,7 @@ pub async fn ensure_agent_hook_settings(
                         path = %settings_path.display(),
                         "settings.json is not a JSON object — refusing to overwrite"
                     );
-                    return Ok(());
+                    return Err(std::io::Error::other("settings.json is not an object"));
                 }
                 Err(e) => {
                     warn!(
@@ -116,12 +115,19 @@ pub async fn ensure_agent_hook_settings(
                         error = %e,
                         "settings.json has invalid JSON — skipping hook install"
                     );
-                    return Ok(());
+                    return Err(std::io::Error::other(e));
                 }
             }
         }
-        _ => json!({}),
+        Ok(_) => json!({}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e),
     };
+    if root.get("disableAllHooks").is_some_and(|value| value != &json!(false)) {
+        return Err(std::io::Error::other("settings.json disables hooks"));
+    }
+    let hooks_enabled = root.get("disableAllHooks") != Some(&json!(false));
+    root["disableAllHooks"] = json!(false);
 
     // WP22 T2 fix — the hook subprocess does not inherit `DUDUCLAW_AGENT_ID`
     // (that env is only injected into the MCP server child process), so the
@@ -148,9 +154,10 @@ pub async fn ensure_agent_hook_settings(
     // no `DUDUCLAW_HOME`, so the hook would fall back to `$HOME/.duduclaw`.
     // The home is derived from the agent directory and baked in as `--home`.
     let home = home_of_agent_dir(agent_dir);
-    let mut updated =
-        merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id, home.as_deref());
+    let mut updated = hooks_enabled;
+    updated |= merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id, home.as_deref());
     updated |= merge_data_file_guard_hook(&mut root, duduclaw_bin);
+    updated |= merge_egress_guard_hook(&mut root, duduclaw_bin, agent_id, home.as_deref());
     if !updated {
         debug!(path = %settings_path.display(), "Hooks already up to date");
         return Ok(());
@@ -161,15 +168,82 @@ pub async fn ensure_agent_hook_settings(
         tokio::fs::create_dir_all(parent).await?;
     }
     let tmp = settings_path.with_extension("json.tmp");
-    let pretty = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
+    let pretty = serde_json::to_string_pretty(&root).map_err(std::io::Error::other)?;
     tokio::fs::write(&tmp, pretty).await?;
     tokio::fs::rename(&tmp, &settings_path).await?;
 
     debug!(
         path = %settings_path.display(),
         bin = %duduclaw_bin.display(),
-        "Installed agent-file-guard + data-file-guard PreToolUse hooks"
+        "Installed agent-file-guard + data-file-guard + egress-guard PreToolUse hooks"
     );
+    Ok(())
+}
+
+/// Installation is mandatory in ask/block; a failure must not rotate to a
+/// different account or runtime. Shadow retains its observe-only behavior.
+pub(crate) async fn ensure_spawn_hook_settings(
+    home: &Path,
+    agent_dir: &Path,
+    duduclaw_bin: &Path,
+) -> Result<(), String> {
+    if let Err(error) = validate_hook_identity(agent_dir) {
+        return hook_install_result(home, agent_dir, error);
+    }
+    if let Err(error) = ensure_agent_hook_settings(agent_dir, duduclaw_bin).await {
+        return hook_install_result(home, agent_dir, error);
+    }
+    Ok(())
+}
+
+fn validate_hook_identity(agent_dir: &Path) -> std::io::Result<()> {
+    let valid_agent = agent_dir.file_name().and_then(|s| s.to_str())
+        .is_some_and(duduclaw_core::is_valid_agent_id);
+    let valid_home = home_of_agent_dir(agent_dir)
+        .is_some_and(|home| home.is_absolute() && home.to_str().is_some());
+    if !valid_agent || !valid_home {
+        return Err(std::io::Error::other("hook requires a valid employee directory and absolute home"));
+    }
+    Ok(())
+}
+
+/// Bare mode skips hooks. Borrowed workspaces must load the identity owner's
+/// settings explicitly; cwd auto-discovery would guard the wrong employee.
+pub(crate) fn claude_hook_args(home: &Path, agent_dir: Option<&Path>, bare: bool) -> Result<Vec<String>, String> {
+    use duduclaw_core::egress_guard::{effective_mode, Mode};
+    let mode = effective_mode(home, agent_dir);
+    if bare {
+        if mode >= Mode::Ask {
+            return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                "外送防護需要啟用工具 hook；請關閉員工的 cli_bare_mode 後重試。",
+            ));
+        }
+        warn!("Claude bare mode skips egress hooks; shadow/off is not enforced");
+        return Ok(Vec::new());
+    }
+    let Some(dir) = agent_dir else {
+        if mode >= Mode::Ask {
+            return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                "外送防護找不到員工設定目錄，已停止啟動；請管理員檢查員工設定後重試。",
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let path = dir.join(".claude/settings.json");
+    if mode < Mode::Ask { return Ok(Vec::new()); }
+    // Explicit settings are the only source in enforcing modes. Otherwise
+    // cwd hooks can merge with these and consume the same ticket twice.
+    Ok(vec!["--setting-sources".into(), String::new(), "--settings".into(), path.to_string_lossy().into_owned()])
+}
+
+pub(crate) fn hook_install_result(home: &Path, agent_dir: &Path, error: std::io::Error) -> Result<(), String> {
+    use duduclaw_core::egress_guard::{effective_mode, Mode};
+    if effective_mode(home, Some(agent_dir)) >= Mode::Ask {
+        return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+            "外送防護無法安裝，已停止啟動員工；請修復員工的 hook 設定與檔案權限後重試：{error}"
+        )));
+    }
+    warn!(agent_dir = %agent_dir.display(), %error, "egress hook install failed; shadow/off spawn continues");
     Ok(())
 }
 
@@ -201,9 +275,10 @@ pub(crate) fn guard_hooks_document(agent_dir: &Path, duduclaw_bin: &Path) -> Val
         .and_then(|n| n.to_str())
         .unwrap_or_default();
     let home = home_of_agent_dir(agent_dir);
-    let mut root = json!({});
+    let mut root = json!({"disableAllHooks": false});
     merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id, home.as_deref());
     merge_data_file_guard_hook(&mut root, duduclaw_bin);
+    merge_egress_guard_hook(&mut root, duduclaw_bin, agent_id, home.as_deref());
     root
 }
 
@@ -224,6 +299,7 @@ pub(crate) async fn write_grok_guard_hooks(
     agent_dir: &Path,
     duduclaw_bin: &Path,
 ) -> std::io::Result<()> {
+    validate_hook_identity(agent_dir)?;
     let dir = work_root.join(".grok").join("hooks");
     let file_name = grok_guard_hooks_file_name(agent_dir);
     let path = dir.join(&file_name);
@@ -312,6 +388,25 @@ fn merge_data_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
         }
     }
     arr.push(desired_entry);
+    true
+}
+
+fn merge_egress_guard_hook(root: &mut Value, bin: &Path, agent: &str, home: Option<&Path>) -> bool {
+    let command = build_named_hook_command(bin, EGRESS_HOOK_ID, agent, home);
+    let desired = json!({
+        HOOK_TAG: EGRESS_HOOK_ID,
+        "matcher": "WebFetch|WebSearch|Bash|Fetch|Shell|web_fetch|web_search|run_terminal_command",
+        "hooks": [{"type": "command", "command": command}]
+    });
+    let Some(entries) = pre_tool_use_array(root) else { return false; };
+    for entry in entries.iter_mut() {
+        if entry.get(HOOK_TAG).and_then(Value::as_str) == Some(EGRESS_HOOK_ID) {
+            if entry == &desired { return false; }
+            *entry = desired;
+            return true;
+        }
+    }
+    entries.push(desired);
     true
 }
 
@@ -413,12 +508,16 @@ fn merge_agent_file_guard_hook(
 /// overwrite in place" branch rewrites an entry without it on the next
 /// `ensure_agent_hook_settings` call (every spawn and every boot).
 fn build_hook_command(duduclaw_bin: &Path, agent_id: &str, home: Option<&Path>) -> String {
+    build_named_hook_command(duduclaw_bin, HOOK_ID, agent_id, home)
+}
+
+fn build_named_hook_command(duduclaw_bin: &Path, hook: &str, agent_id: &str, home: Option<&Path>) -> String {
     // Claude Code hook commands are executed via the user's shell, so
     // quote both the binary path and the agent id defensively — the path
     // may contain spaces, and the id, while already validated, gets the
     // same treatment on general principle (defense in depth, not because
     // `is_valid_agent_id` currently allows anything shell-special).
-    let mut cmd = format!("\"{}\" hook agent-file-guard", duduclaw_bin.display());
+    let mut cmd = format!("\"{}\" hook {hook}", duduclaw_bin.display());
     if duduclaw_core::is_valid_agent_id(agent_id) {
         cmd.push_str(&format!(" --agent \"{agent_id}\""));
     }
@@ -476,6 +575,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn egress_install_failures_refuse_only_ask_and_block() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let dir = home.join("agents/egress-test");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        for mode in ["off", "shadow", "ask", "block"] {
+            std::fs::write(home.join("config.toml"), format!("[security]\negress_guard='{mode}'\n")).unwrap();
+            for invalid in ["[", "[]", "{\"disableAllHooks\":true}"] {
+                std::fs::write(dir.join(".claude/settings.json"), invalid).unwrap();
+                let result = ensure_spawn_hook_settings(home, &dir, &fake_bin()).await;
+                assert_eq!(result.is_err(), matches!(mode, "ask" | "block"));
+                if let Err(error) = result {
+                    assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+                }
+                assert_eq!(std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap(), invalid);
+            }
+        }
+    }
+
+    #[test]
+    fn egress_grok_document_names_native_web_and_shell_tools_and_bakes_identity() {
+        let doc = guard_hooks_document(Path::new("/srv/dudu/agents/tester"), &fake_bin());
+        let entries = doc["hooks"]["PreToolUse"].as_array().unwrap();
+        let entry = entries.iter().find(|entry| entry[HOOK_TAG] == EGRESS_HOOK_ID).unwrap();
+        let matcher: Vec<_> = entry["matcher"].as_str().unwrap().split('|').collect();
+        for name in ["WebFetch", "WebSearch", "Bash", "Fetch", "Shell", "web_fetch", "web_search", "run_terminal_command"] {
+            assert!(matcher.iter().any(|part| part == &name));
+        }
+        assert_eq!(entry["hooks"][0]["command"], "\"/usr/local/bin/duduclaw\" hook egress-guard --agent \"tester\" --home \"/srv/dudu\"");
+        assert!(entry["hooks"][0].get("timeout").is_none());
+    }
+
+    #[test]
+    fn claude_explicit_identity_settings_and_bare_mode_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("agents/.ephemeral/worker");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), "{}").unwrap();
+        for mode in ["off", "shadow", "ask", "block"] {
+            std::fs::write(temp.path().join("config.toml"), format!("[security]\negress_guard='{mode}'")).unwrap();
+            let args = claude_hook_args(temp.path(), Some(&dir), false).unwrap();
+            if matches!(mode, "ask" | "block") {
+                assert_eq!(args, vec!["--setting-sources".to_string(), String::new(), "--settings".to_string(), dir.join(".claude/settings.json").to_string_lossy().into_owned()]);
+            } else {
+                assert!(args.is_empty());
+            }
+            let bare = claude_hook_args(temp.path(), Some(&dir), true);
+            assert_eq!(bare.is_err(), matches!(mode, "ask" | "block"));
+            assert_eq!(claude_hook_args(temp.path(), None, false).is_err(), matches!(mode, "ask" | "block"));
+            if let Err(error) = bare {
+                assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn creates_settings_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("myagent");
@@ -494,7 +649,7 @@ mod tests {
             .expect("PreToolUse must be array");
         // Two tagged entries since RFC-23 §14.4: agent-file-guard first,
         // data-file-guard appended after it.
-        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.len(), 3);
         assert_eq!(arr[0][HOOK_TAG], HOOK_ID);
         assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash");
         assert_eq!(arr[1][HOOK_TAG], DATA_FILE_HOOK_ID);
@@ -544,7 +699,7 @@ mod tests {
 
         // Both hooks present.
         let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(arr.len(), 3, "user hook + our two");
+        assert_eq!(arr.len(), 4, "user hook + our three");
         assert_eq!(arr[0]["matcher"], "Bash", "user hook must come first");
         assert_eq!(arr[1][HOOK_TAG], HOOK_ID, "our hook must be appended");
         assert_eq!(arr[2][HOOK_TAG], DATA_FILE_HOOK_ID);
@@ -588,7 +743,7 @@ mod tests {
         .unwrap();
 
         let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(arr.len(), 2, "must not duplicate our tagged entries");
+        assert_eq!(arr.len(), 3, "must not duplicate our tagged entries");
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("/new/path/duduclaw"));
         assert!(!cmd.contains("/old/path/duduclaw"));
@@ -608,7 +763,7 @@ mod tests {
         // Must not panic, must not overwrite with `{}`.
         ensure_agent_hook_settings(&agent_dir, &fake_bin())
             .await
-            .unwrap();
+            .unwrap_err();
 
         let content = std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap();
         assert_eq!(content.trim(), "[1, 2, 3]", "corrupt file left untouched");
@@ -624,7 +779,7 @@ mod tests {
         // Must not panic.
         ensure_agent_hook_settings(&agent_dir, &fake_bin())
             .await
-            .unwrap();
+            .unwrap_err();
 
         let content = std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap();
         assert_eq!(content, "{ not valid json", "invalid file left untouched");
@@ -694,8 +849,8 @@ mod tests {
         let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
             arr.len(),
-            2,
-            "must upgrade in place (+ the §14.4 entry), not append a duplicate"
+            3,
+            "must upgrade in place with the data and egress guards"
         );
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("--agent \"myagent\""), "command: {cmd}");
@@ -753,7 +908,7 @@ mod tests {
         )
         .unwrap();
         let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(arr.len(), 2, "upgraded in place");
+        assert_eq!(arr.len(), 3, "upgraded in place");
         assert_eq!(arr[0]["matcher"], AGENT_FILE_GUARD_MATCHER);
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
         // A Windows temp dir (`C:\Users\…\Temp\…`) holds backslashes, which

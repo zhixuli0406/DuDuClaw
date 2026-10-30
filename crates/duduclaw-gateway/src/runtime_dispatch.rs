@@ -145,7 +145,8 @@ pub struct AgentPrompt<'a> {
 pub async fn run_agent_prompt_detailed(req: AgentPrompt<'_>) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
     crate::computer_use_sessions::attended_call::runtime_scope(
         req.request_type == RequestType::Chat,
-        crate::on_behalf_of::context::scope(req.home_dir, req.agent_id, run_agent_prompt_inner(req)),
+        crate::on_behalf_of::context::scope(req.home_dir, req.agent_id,
+            crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req))),
     ).await
 }
 

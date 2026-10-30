@@ -87,11 +87,12 @@ async fn live_grok_inspect_runs_only_the_duduclaw_guards() {
     println!("{}", serde_json::to_string_pretty(&v["hooks"]).unwrap());
     let hooks = v["hooks"].as_array().expect("hooks array");
     let active: Vec<_> = hooks.iter().filter(|h| h["disabled"] != true).collect();
-    assert_eq!(active.len(), 2, "{hooks:#?}");
+    assert_eq!(active.len(), 3, "{hooks:#?}");
     for h in &active {
         let target = h["target"].as_str().unwrap();
         assert!(
-            target.contains(" hook agent-file-guard ") || target.ends_with(" hook data-file-guard"),
+            target.split_whitespace().collect::<Vec<_>>().windows(2)
+                .any(|pair| pair[0] == "hook" && matches!(pair[1], "agent-file-guard" | "data-file-guard" | "egress-guard")),
             "{target}"
         );
         let source = h["source"]["path"].as_str().unwrap();

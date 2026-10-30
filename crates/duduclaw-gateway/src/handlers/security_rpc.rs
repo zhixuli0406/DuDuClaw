@@ -31,6 +31,16 @@ impl MethodHandler {
             })
         }).collect();
 
+        let egress_bash_exposure: Vec<Value> = agents.iter().filter_map(|a| {
+            let cfg = &a.config;
+            let agent_dir = self.home_dir.join("agents").join(&cfg.agent.name);
+            let mode = duduclaw_core::egress_guard::effective_mode(&self.home_dir, Some(&agent_dir));
+            egress_bash_exposed(mode, &cfg.capabilities, cfg.container.sandbox_enabled).then(|| json!({
+                "agent_id": cfg.agent.name,
+                "mode": if mode == duduclaw_core::egress_guard::Mode::Ask { "ask" } else { "block" },
+            }))
+        }).collect();
+
         // Rate limiter: read from config
         let config_path = self.home_dir.join("config").join("duduclaw.toml");
         let rate_limit = if config_path.exists() {
@@ -93,6 +103,7 @@ impl MethodHandler {
                 // — and "rules" was the first agent's container mount list
                 // rendered as if it were a global policy.
                 "rbac": rbac_entries,
+                "egress_bash_exposure": egress_bash_exposure,
                 "rate_limiter": rate_limit,
                 "soul_drift": soul_status,
             }),
@@ -442,5 +453,61 @@ impl MethodHandler {
             Ok(Err(e)) => WsFrame::error_response("", &e),
             Err(e) => WsFrame::error_response("", &format!("secaudit.finding_status: {e}")),
         }
+    }
+}
+
+fn egress_bash_exposed(
+    mode: duduclaw_core::egress_guard::Mode,
+    capabilities: &duduclaw_core::types::CapabilitiesConfig,
+    sandbox_enabled: bool,
+) -> bool {
+    use duduclaw_core::egress_guard::Mode;
+    use duduclaw_core::tool_catalog::tool_entry_matches;
+    let native_bash = |entry: &str| {
+        !entry.trim().starts_with("mcp__") && tool_entry_matches(entry, "Bash")
+    };
+    let denied = capabilities.disallowed_tools();
+    let allowed = capabilities.allowed_tools();
+    // A command-scoped denial still leaves other Bash commands available.
+    // MCP wildcards grant MCP tools, never the CLI's native Bash tool.
+    let bash_denied = denied.iter().any(|entry| {
+        entry.split_once('(').is_none() && native_bash(entry)
+    });
+    let bash_allowed = allowed.is_empty() || allowed.iter().any(|entry| native_bash(entry));
+    matches!(mode, Mode::Ask | Mode::Block) && !sandbox_enabled && bash_allowed && !bash_denied
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use duduclaw_core::egress_guard::Mode;
+    use duduclaw_core::types::CapabilitiesConfig;
+
+    #[test]
+    fn egress_notice_uses_effective_mode_sandbox_and_capabilities() {
+        let mut caps = CapabilitiesConfig::default();
+        for mode in [Mode::Off, Mode::Shadow, Mode::Ask, Mode::Block] {
+            assert_eq!(egress_bash_exposed(mode, &caps, false), matches!(mode, Mode::Ask | Mode::Block));
+            assert!(!egress_bash_exposed(mode, &caps, true));
+        }
+        caps.allowed_tools = vec!["Read".into()];
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.allowed_tools = vec!["B*".into()];
+        assert!(egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.denied_tools = vec!["Bash".into()];
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.denied_tools = vec!["NotBash".into()];
+        assert!(egress_bash_exposed(Mode::Block, &caps, false));
+        caps.denied_tools = vec!["Bash(curl:*)".into()];
+        assert!(egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.allowed_tools = vec!["mcp__duduclaw__*".into()];
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.allowed_tools = vec!["Bash(curl:*)".into()];
+        caps.denied_tools.clear();
+        assert!(egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.action_rules = serde_json::from_value(json!([
+            { "tool": "Bash", "verdict": "block" },
+        ])).unwrap();
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
     }
 }

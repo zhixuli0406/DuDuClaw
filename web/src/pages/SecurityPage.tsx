@@ -66,6 +66,7 @@ interface SecurityStatus {
     tool_use: boolean; web_access: boolean;
     file_write: boolean; shell_exec: boolean; delegate: boolean;
   }>;
+  egress_bash_exposure?: Array<{ agent_id: string; mode: 'ask' | 'block' }>;
   rate_limiter: { requests_per_minute: number; concurrent_requests: number };
   soul_drift: Array<{ agent_id: string; soul_exists: boolean; gvu_enabled: boolean }>;
 }
@@ -86,6 +87,8 @@ export function SecurityPage() {
   const [status, setStatus] = useState<SecurityStatus | null>(null);
   const connectionState = useConnectionStore((s) => s.state);
 
+  const refreshSecurityStatus = useCallback(() => api.security.status().then(setStatus).catch(() => setStatus(null)), []);
+
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
     setAuditLoading(true);
@@ -95,11 +98,8 @@ export function SecurityPage() {
       .catch(() => setAuditEvents([]))
       .finally(() => setAuditLoading(false));
 
-    api.security
-      .status()
-      .then(setStatus)
-      .catch(() => setStatus(null));
-  }, [connectionState]);
+    void refreshSecurityStatus();
+  }, [connectionState, refreshSecurityStatus]);
 
   return (
     <div className="mx-auto w-full max-w-[1200px] space-y-6">
@@ -147,7 +147,7 @@ export function SecurityPage() {
           both, so both need to see (and change) where they are protected. */}
       <CredentialProtectionPanel />
 
-      <EgressGuardSection />
+      <EgressGuardSection status={status} onSaved={refreshSecurityStatus} />
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an
@@ -693,7 +693,7 @@ function SecurityCard({
 // G2 (2026-09 feature audit): `StatusRow` and `RuleRow` were removed with the
 // Credential Proxy and Mount Guard cards — they had no other call site.
 
-function EgressGuardSection() {
+function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null; onSaved: () => Promise<void> }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const form = useConfigForm((tables) => ({
@@ -713,8 +713,22 @@ function EgressGuardSection() {
           disabled={!form.loaded || form.saving || form.loadError != null}
         />
         <p className="text-xs text-muted-foreground">{t('security.egress.limits')}</p>
+        {status?.egress_bash_exposure && status.egress_bash_exposure.length > 0 && (
+          <div role="alert" className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
+            <p>{t('security.egress.bashWarning')}</p>
+            <ul className="list-inside list-disc">
+              {status.egress_bash_exposure.map((agent) => (
+                <li key={agent.agent_id}>{agent.agent_id} · {t(`security.egress.${agent.mode}`)}</li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">{t('security.egress.sandboxScope')}</p>
+          </div>
+        )}
+        {!status?.egress_bash_exposure && (mode === 'ask' || mode === 'block') && (
+          <p role="alert" className="text-sm text-destructive">{t('security.egress.exposureUnavailable')}</p>
+        )}
         {form.loadError != null && <p role="alert" className="text-sm text-destructive">{t('security.egress.loadFailed')}</p>}
-        <Button size="sm" variant="brand" onClick={() => void form.save()} disabled={!form.loaded || form.saving || form.loadError != null || form.dirtyKeys.length === 0}>
+        <Button size="sm" variant="brand" onClick={() => void form.save().then((saved) => { if (saved !== null) return onSaved(); })} disabled={!form.loaded || form.saving || form.loadError != null || form.dirtyKeys.length === 0}>
           {t(form.saving ? 'common.saving' : 'security.egress.save')}
         </Button>
       </div>

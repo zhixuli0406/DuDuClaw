@@ -490,6 +490,7 @@ where
     F: std::future::Future<Output = Result<String, String>>,
 {
     use crate::cost_telemetry::RequestType as RT;
+    let fut = crate::runtime_turn::scope(agent_id, fut);
     let fut = crate::computer_use_sessions::attended_call::runtime_scope(
         request_type == RT::Chat,
         crate::on_behalf_of::context::scope(home_dir, agent_id, fut),
@@ -808,6 +809,9 @@ async fn call_claude_for_agent_impl(
     let default_language = crate::prompt_identity::read_default_language(home_dir).await;
     let system_prompt = build_system_prompt(agent, citation_ref, default_language.as_deref());
     let agent_name = agent.config.agent.name.clone();
+    // `default` may resolve to a named employee. Hooks and MCP authenticate
+    // that resolved name, so the alias alone must not be the ledger key.
+    crate::runtime_turn::register_current(&agent_name);
     let claude_model = agent.config.model.preferred.clone();
     // OTel: record the resolved model on the `invoke_agent` span.
     tracing::Span::current().record(crate::otel::attrs::REQUEST_MODEL, claude_model.as_str());
@@ -1045,7 +1049,7 @@ async fn call_claude_for_agent_impl(
             crate::runtime_dispatch::AgentPrompt {
                 agent_dir: Some(&agent_dir),
                 home_dir,
-                agent_id,
+                agent_id: &agent_name,
                 prompt,
                 system_prompt: &system_with_tasks,
                 model: &claude_model,
@@ -1094,15 +1098,7 @@ async fn call_claude_for_agent_impl(
             }
         }
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
-        if let Err(e) =
-            crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await
-        {
-            warn!(
-                agent = %agent_name,
-                error = %e,
-                "Failed to install agent-file-guard hook — continuing without enforcement"
-            );
-        }
+        crate::agent_hook_installer::ensure_spawn_hook_settings(home_dir, &agent_dir, &bin).await?;
     }
 
     // For CLI / local inference paths, tasks suffix is inlined into the
@@ -4130,6 +4126,8 @@ fn prepare_claude_cmd(
     // spike) at the cost of OAuth — caller is responsible for setting
     // `ANTHROPIC_API_KEY` in env_vars.
     let bare_mode = BARE_MODE.try_with(|b| *b).unwrap_or(false);
+    let hook_args = crate::agent_hook_installer::claude_hook_args(home_dir, config_dir, bare_mode)?;
+    cmd.args(&hook_args);
     if bare_mode {
         cmd.arg("--bare");
     }
@@ -4246,11 +4244,11 @@ fn prepare_claude_cmd(
         // Read-only explore lane: only the read built-ins exist, whatever
         // minimal_context says, and the DuDuClaw MCP server (inherited env)
         // lists and allows only read / draft tools.
-        cmd.args(["--setting-sources", "project,local"]);
+        if hook_args.is_empty() { cmd.args(["--setting-sources", "project,local"]); }
         cmd.args(["--tools", &lane_tools.join(",")]);
         cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
     } else if duduclaw_core::agent_toml::resolve_minimal_context(config_dir) {
-        cmd.args(["--setting-sources", "project,local"]);
+        if hook_args.is_empty() { cmd.args(["--setting-sources", "project,local"]); }
         let tools =
             caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
         cmd.args(["--tools", &tools.join(",")]);

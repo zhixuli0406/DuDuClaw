@@ -1,6 +1,9 @@
 //! Gateway-owned, monotonic turn taint. Unknown/expired turns are tainted.
 
 mod lease_store;
+mod hook;
+
+pub const HOOK_CHECK_ROUTE: &str = "/api/internal/egress-guard/hook-check";
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -476,6 +479,7 @@ pub struct RouteState {
     home: PathBuf,
     replay: ReplayGuard,
     rate: RateLimiter,
+    hook_rate: RateLimiter,
     blocking: Arc<Semaphore>,
 }
 
@@ -491,6 +495,7 @@ impl RouteState {
             home,
             replay: ReplayGuard::default(),
             rate: RateLimiter::default(),
+            hook_rate: RateLimiter::default(),
             blocking: Arc::new(Semaphore::new(MAX_BLOCKING_WORK)),
         }
     }
@@ -541,6 +546,7 @@ pub fn router(state: Arc<RouteState>) -> Router {
         .route(ACQUIRE_SINK_ROUTE, post(acquire_sink))
         .route(RELEASE_SINK_ROUTE, post(release_sink))
         .layer(DefaultBodyLimit::max(4096))
+        .route(HOOK_CHECK_ROUTE, post(hook::check).layer(DefaultBodyLimit::max(128 * 1024)))
         .with_state(state)
 }
 

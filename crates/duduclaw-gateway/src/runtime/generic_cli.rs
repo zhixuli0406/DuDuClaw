@@ -506,6 +506,15 @@ impl GenericCliRuntime {
                 error: "utility calls refused: no verified tool-free mode".into(),
             });
         }
+        if duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref())
+            >= duduclaw_core::egress_guard::Mode::Ask
+        {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                &context.home_dir, &context.agent_id, id,
+                "外送防護尚未涵蓋此通用 CLI；請使用已支援的 runtime 或任務沙箱。", true,
+                &[("egress_guard", serde_json::json!("would_refuse_unsupported_runtime"))],
+            );
+        }
         let payload = build_prompt(context, prompt, id);
         let args = build_args(self.spec, &payload, &context.model);
 

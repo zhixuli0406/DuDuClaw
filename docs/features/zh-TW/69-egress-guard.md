@@ -60,11 +60,36 @@ Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0
 
 動作規則要求核准時，卡片會列出命中的工具或動作類別規則，讀取與草稿工具也會顯示。購買與刪除不能新增常設能力授權或工作流程授權；舊授權會被忽略，原紀錄保留。其他檢查與逐次核准仍然適用。
 
+## CLI 內建工具（未發布 E1）
+
+Claude 與 Grok 安裝 `PreToolUse` hook，涵蓋 `WebFetch`、`WebSearch` 與 Bash 字面網路指令。Grok 別名包含 `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command`；實際 matcher 與環境繼承仍待真 CLI 驗收。一般非網路 Bash 在本機直接放行，不聯絡 gateway。偵測清單為 `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`，以及 `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 參數最多重解析兩層，每段最多 64 KiB；echo/printf 中長得像指令的資料，即使沒有實際執行，也可能被保守列入。
+
+| 模式 | 未污染 | 已讀私人資料 | 帳本無法讀取或未知回合 |
+|---|---|---|---|
+| `off` | 放行 | 放行 | 放行 |
+| `shadow` | 放行 | 放行，記錄 `would_ask` | 放行，記錄 `would_refuse_ledger_unavailable` |
+| `ask` | 放行 | 開審批，拒絕並等待重試 | 拒絕 |
+| `block` | 放行 | 拒絕 | 拒絕 |
+
+Hook 將原始工具參數送至 `/api/internal/egress-guard/hook-check`，由 gateway 正規化、雜湊並產生卡片；不接受呼叫端提供的 digest 或摘要。請求與回覆都有簽章，埠從 `config.toml` 讀取，不依賴環境中的埠變數。Hook 有獨立的每員工每分鐘 120 次額度。審批的委託者來自 gateway 登錄的執行脈絡；無法驗證時不開單，避免略過禁止自行核准的政策。
+
+`ask` 第一次先開單並拒絕；目前具 Admin 身分的人在儀表板核准後，於同一回合以完全相同參數重試。審批綁定員工、回合、工具、完整參數及私人資料來源；`WebFetch` 包含完整 URL 與查詢字串。相同待決請求重用同一張卡，新增來源使舊卡失效。核准只可消耗一次，再重試需要新核准。Bash 只有一個直接、簡單指令與一個網路動詞能開單，不接受展開、替換、管線、重導向、`@file`、包裝指令或解釋器；需要核准時，不支援的形狀直接拒絕並解釋原因。綁定的是文字，不是 DNS 結果、執行檔內容、設定檔或符號連結指向。
+
+`ask`／`block` 的 hook 錯誤與可捕捉的 panic 一律 exit 2；安裝失敗停止啟動，不輪替帳號或 runtime。`shadow` 記錄警告並繼續。Claude 在強制模式使用 `--setting-sources "" --settings <file>`，只載入身分所屬的 `.claude/settings.json`，不併入工作目錄或使用者的其他設定，即使工作目錄不同也一樣；強制模式拒絕會略過 hook 的 `cli_bare_mode`。Grok 加上 `--disable-web-search`；目前強制模式拒絕借用／共用工作目錄，或 hook 目錄內留有其他員工 guard 的組合，請使用獨立員工目錄或 Claude/Codex。
+
+Codex 在 `ask`／`block` 加上 `-c sandbox_workspace_write.network_access=false -c web_search="disabled"`，FullAccess 降為 WorkspaceWrite，ReadOnly 保持更嚴，保留 MCP 的自動核准器。這是啟動時收緊網路，不是逐指令核准。通用 CLI 仍未涵蓋，強制模式記錄 `would_refuse_unsupported_runtime`。Antigravity 沒有擴充；OpenAI 相容工具迴圈維持 MCP 閘門。
+
+Cron、派工、提醒、信件、heartbeat、ephemeral 執行入口改為獨立於通道 requester 登錄 host 回合並傳遞 `DUDUCLAW_TURN_ID`，也登錄 `default` 實際指向的員工。既有污染不會被清除；未知呼叫端回合仍視為污染。
+
+**Bash hook 是減速帶與遙測，不是隔離邊界。** 內建 `Read` 與 Bash 讀檔不會標記污染。解釋器、腳本、別名、改名執行檔、`/dev/tcp`、動態組裝指令都可能繞過字面偵測。Hook 程式不存在、被殺或逾時，可能被上游 CLI 忽略。同一 OS 使用者可存取的 hook、金鑰與環境變數，不受簽章機制隔離。原生工具的事前檢查也不會持有 MCP sink lease 到執行結束，無法阻止檢查後的並行讀取。需要隔離時不授予 Bash，或使用任務沙箱；任務沙箱只涵蓋派工任務，不涵蓋所有通道／CLI 執行。安全頁會列出強制模式下有 Bash 且未開任務沙箱的員工。
+
+E1 驗證狀態：已撰寫測試但未執行，本工作包未編譯、未做真 CLI 探測。待驗收：Claude/Grok matcher、回合與委託脈絡繼承、開單／核准／重試／單次使用、gateway 失聯的模式行為、Claude 借用工作目錄，以及 Codex 0.164.0 的網路／搜尋限制與 MCP 仍可用。
+
 ## 已知限制
 
 直接由 `[[mcp.external]]` 掛入 API 工具迴圈的工具（stdio、HTTP 與 Google 封閉橋接）也會經過檢查。這條路徑的工具登錄不保留 MCP annotations，因此全部保守視為 **Modify**；即使伺服器自述唯讀，讀過私人資料後仍可能要求外送核准，精確工具名稱的動作規則仍適用。MCP 代理與遠端橋接則保留原有 annotations 與 `trusted_read_hint_servers` 判定。
 
-這是每一輪的 MCP 邊界，不是網路沙箱。Claude CLI 原生工具（例如 `WebFetch`、透過 `Bash` 執行 `curl`）以及其他 runtime 的原生工具不在範圍內。提示中已有的私人資料、從範圍外工具取得的資料不會自動分類。新一輪使用新紀錄，不追蹤跨輪複製的資訊；gateway 重啟後不保留回合污點來源，但會恢復已持久化的外送 lease。「僅記錄」仍會允許外送。
+這是每一輪的 MCP 邊界，不是網路沙箱。未發布的 E1 增加上述 CLI 內建工具檢查，並未提供整個 runtime 的網路隔離。提示中已有的私人資料、從範圍外工具取得的資料不會自動分類。新一輪使用新紀錄，不追蹤跨輪複製的資訊；gateway 重啟後不保留回合污點來源，但會恢復已持久化的外送 lease。「僅記錄」仍會允許外送。
 
 另見[安全防護](05-security-defense.md)與[儀表板設定](../../guides/dashboard-settings.md)。
 

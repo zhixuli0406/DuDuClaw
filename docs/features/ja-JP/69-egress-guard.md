@@ -60,11 +60,36 @@ Gateway ログの `egress lease store unavailable; private reads fenced` と `er
 
 アクションルールによる承認には、一致したツールまたは効果のルールを表示します。読み取り・下書きツールも対象です。Purchase と Delete に常設の機能付与やワークフロー付与を新規作成することはできません。既存の付与は記録を変更せず無視します。ほかの検査と個別承認は引き続き必要です。
 
+## CLI 組み込みツール（未リリース E1）
+
+Claude と Grok に `PreToolUse` hook を追加し、`WebFetch`、`WebSearch`、Bash のリテラルなネットワークコマンドを検査します。Grok の別名は `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command`。実際の matcher と環境継承は実 CLI での検証待ちです。通常の非ネットワーク Bash は gateway に接続せず許可します。対象は `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp` と `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 引数は最大二段、各 64 KiB まで再解析します。echo/printf のコマンド風データも保守的に対象になる場合があります。
+
+| モード | 未読のターン | 非公開データを読み取り済み | 台帳を読めない／不明なターン |
+|---|---|---|---|
+| `off` | 許可 | 許可 | 許可 |
+| `shadow` | 許可 | 許可し `would_ask` | 許可し `would_refuse_ledger_unavailable` |
+| `ask` | 許可 | 承認カードを作成し再試行まで拒否 | 拒否 |
+| `block` | 許可 | 拒否 | 拒否 |
+
+Hook は元の引数を `/api/internal/egress-guard/hook-check` に送り、gateway が正規化、ハッシュ計算、カード生成を行います。クライアントの digest や要約は受け付けません。要求と応答に署名し、ポートは `config.toml` から読みます。Hook 専用のスタッフごと毎分 120 回の枠を使用します。依頼者は gateway に登録済みの実行コンテキストから復元し、確認できなければ承認を作成しません。
+
+`ask` は先にカードを作成して拒否します。現在の Admin がダッシュボードで承認した後、同じターンで完全に同じ引数を再試行してください。スタッフ、ターン、ツール、全引数、読み取り元を紐付け、`WebFetch` はクエリを含む完全な URL を対象とします。同じ保留要求はカードを再利用し、読み取り元が増えたら旧カードを失効させます。承認は一回限りです。Bash の承認は直接実行する単純な一コマンド、一ネットワーク動詞のみ。展開、置換、パイプ、リダイレクト、`@file`、ラッパー、インタープリターは承認対象外で、理由を示して拒否します。紐付くのは文字列で、DNS、実行ファイル、設定ファイル、symlink の実体ではありません。
+
+`ask`／`block` では捕捉できる hook エラーと panic は exit 2、インストール失敗はアカウント／runtime を切り替えず起動を停止します。`shadow` は警告して続行します。Claude の強制モードは `--setting-sources "" --settings <file>` で身分の `.claude/settings.json` だけを読み、他の project/local/user 設定を併合しません。cwd が別でも同じです。強制モードでは hook を省略する `cli_bare_mode` を拒否します。Grok は `--disable-web-search` を追加します。強制モードでは共有・借用 cwd や他スタッフの guard が残った hook ディレクトリを拒否します。独立したスタッフディレクトリ、または Claude/Codex を使用してください。
+
+Codex の強制モードは `-c sandbox_workspace_write.network_access=false -c web_search="disabled"` を追加し、FullAccess を WorkspaceWrite に制限します。ReadOnly と MCP 自動承認器は保持します。個別コマンドの承認ではなく起動時の制限です。汎用 CLI は対象外のまま `would_refuse_unsupported_runtime` を記録します。Antigravity は変更せず、OpenAI 互換のツールループは既存の MCP 検査を使います。
+
+Cron、dispatch、reminder、mail、heartbeat、ephemeral はチャネル requester と独立して host ターンを登録し、`DUDUCLAW_TURN_ID` を渡します。`default` の実際のスタッフ名も登録します。既存の読み取り済み状態は消さず、不明なクライアントターンは読み取り済みのままです。
+
+**Bash hook は減速帯とテレメトリであり、隔離境界ではありません。** 組み込み `Read` と Bash のファイル読み取りは情報源を記録しません。インタープリター、スクリプト、別名、改名バイナリ、`/dev/tcp`、動的コマンドは検出を回避できます。hook が存在しない、終了させられた、タイムアウトした場合、上流 CLI が無視する可能性があります。同一 OS ユーザーの hook・鍵・環境へのアクセスは署名では隔離できません。ネイティブ事前検査は実行完了まで MCP sink lease を保持せず、検査後の並行読み取りも止めません。隔離が必要なら Bash を許可しないか、委任タスクの sandbox を使ってください。sandbox は全チャネル／CLI を覆うものではありません。Security ページは強制モードで Bash がありタスク sandbox が無効なスタッフを表示します。
+
+E1 の検証状況：テストは作成済み、未実行です。この作業ではコンパイルも実 CLI プローブも行っていません。Claude/Grok の matcher、ターン／依頼者コンテキストの継承、承認と一回限りの再試行、gateway 障害、Claude の別 cwd、Codex 0.164.0 のネットワーク・検索制限と MCP 利用を後続で検証してください。
+
 ## 既知の制限
 
 API ツールループへ `[[mcp.external]]` で直接登録したツール（stdio、HTTP、Google の閉じたブリッジ）も検査します。この経路のツール登録には MCP annotations が保持されないため、すべて保守的に **Modify** として扱います。サーバーが読み取り専用と説明していても、非公開データを読んだ後は送信承認が必要になり得ます。完全一致のツール別アクションルールは引き続き適用されます。MCP プロキシとリモートブリッジは annotations と `trusted_read_hint_servers` による既存の判定を使います。
 
-情報源はターン単位で追跡し、実行中の送信 fence はスタッフ単位で適用します。この MCP 検査はネットワークサンドボックスを提供しません。Claude CLI のネイティブツール（`WebFetch`、`Bash` での `curl`）および他ランタイムのネイティブツールは対象外です。プロンプト内のデータや対象外の経路で読んだ情報は自動分類されません。新しいターンには新しいキーを使い、ターンをまたぐコピーは追跡しません。ターンの情報源は gateway 再起動後に保持されませんが、保存された送信 lease は復元します。記録のみのモードでは送信は許可されます。
+情報源はターン単位で追跡し、実行中の送信 fence はスタッフ単位で適用します。この MCP 検査はネットワークサンドボックスを提供しません。未リリース E1 は上記の CLI 検査を追加しますが、runtime 全体のネットワーク隔離は提供しません。プロンプト内のデータや対象外の経路で読んだ情報は自動分類されません。新しいターンには新しいキーを使い、ターンをまたぐコピーは追跡しません。ターンの情報源は gateway 再起動後に保持されませんが、保存された送信 lease は復元します。記録のみのモードでは送信は許可されます。
 
 [セキュリティ防御](05-security-defense.md)と[ダッシュボード設定](../../guides/dashboard-settings.md)も参照してください。
 

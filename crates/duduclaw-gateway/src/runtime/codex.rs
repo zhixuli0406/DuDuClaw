@@ -78,6 +78,23 @@ fn sandbox_args_for(caps: Option<&CapabilitiesConfig>, explore: bool) -> Vec<Str
     }
 }
 
+fn egress_sandbox_args(caps: Option<&CapabilitiesConfig>, explore: bool, mode: duduclaw_core::egress_guard::Mode) -> Vec<String> {
+    use duduclaw_core::egress_guard::Mode;
+    let mut args = if !explore && mode >= Mode::Ask
+        && sandbox_level_for(caps) == duduclaw_core::types::SandboxLevel::FullAccess
+    {
+        // Keep the supported automatic MCP approver; -s conflicts with it.
+        sandbox_args(None)
+    } else {
+        sandbox_args_for(caps, explore)
+    };
+    if mode >= Mode::Ask {
+        args.extend(["-c", "sandbox_workspace_write.network_access=false", "-c", "web_search=\"disabled\""]
+            .into_iter().map(str::to_string));
+    }
+    args
+}
+
 fn sandbox_args(caps: Option<&CapabilitiesConfig>) -> Vec<String> {
     let level = sandbox_level_for(caps);
     // Live-verified on Codex 0.156.1 (2026-09-24, eight variants):
@@ -1296,7 +1313,8 @@ impl AgentRuntime for CodexRuntime {
         // --skip-git-repo-check was not specified." (exit 1). Reproduced in a
         // plain temp dir; the same invocation succeeds with the flag.
         cmd.arg("--skip-git-repo-check");
-        cmd.args(sandbox_args_for(caps, explore));
+        let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
+        cmd.args(egress_sandbox_args(caps, explore, egress_mode));
         cmd.args(effort_args(context.effort));
         // Thinking display: ask for reasoning summaries only when this
         // reply turn's viewer reads thinking text; otherwise nothing is
@@ -2200,6 +2218,34 @@ mod tests {
             allowed_tools: allowed.iter().map(|s| s.to_string()).collect(),
             denied_tools: denied.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn egress_codex_args_only_narrow_and_preserve_mcp_approver() {
+        use duduclaw_core::egress_guard::Mode;
+        let full = caps(true, true, &[], &[]);
+        let read_only = caps(false, false, &["Read"], &[]);
+        for mode in [Mode::Off, Mode::Shadow, Mode::Ask, Mode::Block] {
+            for caps in [None, Some(&full), Some(&read_only)] {
+                let args = egress_sandbox_args(caps, false, mode);
+                if mode < Mode::Ask {
+                    assert_eq!(args, sandbox_args(caps));
+                } else {
+                    assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+                    assert!(args.iter().any(|a| a == "sandbox_workspace_write.network_access=false"));
+                    assert!(args.iter().any(|a| a == "web_search=\"disabled\""));
+                    if sandbox_level_for(caps) != duduclaw_core::types::SandboxLevel::ReadOnly {
+                        assert!(args.iter().any(|a| a == "--approve-for-me"));
+                        assert!(!args.iter().any(|a| a == "-s"));
+                        assert_eq!(declared_sandbox(&args).as_deref(), Some("workspace-write"));
+                    } else {
+                        assert_eq!(declared_sandbox(&args).as_deref(), Some("read-only"));
+                    }
+                }
+            }
+            let explore = egress_sandbox_args(Some(&full), true, mode);
+            assert_eq!(declared_sandbox(&explore).as_deref(), Some("read-only"));
         }
     }
 

@@ -146,3 +146,48 @@ describe('Egress guard setting', () => {
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('system.update_config', { security: { egress_guard: 'ask' } }));
   });
 });
+
+
+describe('Egress Bash exposure notice', () => {
+  it('lists server-resolved employee overrides even when the global mode is shadow', async () => {
+    mockWsClient.call.mockResolvedValue({
+      ...SECURITY_RESPONSE,
+      config: '[security]\negress_guard="shadow"',
+      egress_bash_exposure: [{ agent_id: 'shell-worker', mode: 'ask' }, { agent_id: 'restricted-worker', mode: 'block' }],
+    });
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByText('shell-worker · Ask before sending')).toBeInTheDocument();
+    expect(screen.getByText('restricted-worker · Block sending')).toBeInTheDocument();
+    expect(screen.getByText(/Bash hooks are a speed bump and telemetry/)).toBeInTheDocument();
+    expect(screen.getByText(/task sandbox covers delegated tasks only/)).toBeInTheDocument();
+  });
+
+  it('does not show a warning when the server reports no exposed employees', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\negress_guard="block"', egress_bash_exposure: [] });
+    renderWithProviders(<SecurityPage />);
+    await waitFor(() => expect(screen.getByLabelText('Mode')).toHaveValue('block'));
+    expect(screen.queryByText(/Bash hooks are a speed bump and telemetry/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Could not verify which employees/)).not.toBeInTheDocument();
+  });
+
+  it('reports unavailable exposure data in enforcing mode', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\negress_guard="ask"' });
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByText(/Could not verify which employees/)).toBeInTheDocument();
+  });
+
+  it('refreshes exposure after saving the guard mode', async () => {
+    mockWsClient.call.mockImplementation(async (method: string) => ({
+      ...SECURITY_RESPONSE,
+      config: '[security]\negress_guard="shadow"',
+      success: true,
+      egress_bash_exposure: method === 'security.status' ? [] : undefined,
+    }));
+    renderWithProviders(<SecurityPage />);
+    await waitFor(() => expect(screen.getByLabelText('Mode')).toHaveValue('shadow'));
+    const initialCalls = mockWsClient.call.mock.calls.filter(([method]) => method === 'security.status').length;
+    fireEvent.change(screen.getByLabelText('Mode'), { target: { value: 'ask' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save outgoing data guard' }));
+    await waitFor(() => expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'security.status')).toHaveLength(initialCalls + 1));
+  });
+});

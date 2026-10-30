@@ -349,6 +349,11 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 ## 資料外送防護的重啟保護（v1.77.0）
 
-回合污點只存在記憶體；外送 lease 則先存入 `<home>/egress_leases.db`（SQLite WAL，Unix 0600）才授予呼叫端。Gateway 開放 loopback 路由前會復原，並在每次重啟後以單調時鐘重新保護同一員工所有回合的私人讀取完整六小時，不依 UTC 年齡或時鐘跳動縮短。舊回覆不能釋放復原的 lease。資料庫無法讀取時，`ask`／`block` 暫停所有員工的私人讀取與新外送，`shadow` 允許並稽核；每五秒重試、每分鐘最多記錄一次錯誤。新增失敗拒絕強制模式外送，刪除失敗保留保護。CLI 原生工具與跨輪資訊複製仍不在防護範圍，詳見[資料外送防護](69-egress-guard.md)。
+回合污點只存在記憶體；外送 lease 則先存入 `<home>/egress_leases.db`（SQLite WAL，Unix 0600）才授予呼叫端。Gateway 開放 loopback 路由前會復原，並在每次重啟後以單調時鐘重新保護同一員工所有回合的私人讀取完整六小時，不依 UTC 年齡或時鐘跳動縮短。舊回覆不能釋放復原的 lease。資料庫無法讀取時，`ask`／`block` 暫停所有員工的私人讀取與新外送，`shadow` 允許並稽核；每五秒重試、每分鐘最多記錄一次錯誤。新增失敗拒絕強制模式外送，刪除失敗保留保護。此處持久 lease 仍只涵蓋 MCP 呼叫；CLI 事前檢查見下方 E1 說明，跨輪資訊複製不在範圍內，詳見[資料外送防護](69-egress-guard.md)。
 
 Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0600）。使用同一 home 的第二個 gateway 會拒絕讀取與新外送並重試，取得鎖後先恢復所有 lease 才接受讀取；`shadow` 仍允許並稽核。Gateway 執行中不可刪除鎖檔。重複的有效 lease ID 會在寫入前拒絕，不會連帶阻擋其他員工。
+
+
+## CLI 外送檢查（未發布 E1）
+
+Claude/Grok 網頁工具與 Bash 字面網路指令新增由 gateway 判定的審批 hook；Codex 強制模式在啟動時限制網路與搜尋。背景執行登錄 host 回合。安全頁列出有 Bash、使用 ask/block 且未啟用任務沙箱的員工。Bash 只提供減速帶與遙測：原生讀檔不標記污染、同 OS 使用者的改寫不受此機制隔離，事前檢查也不持有執行全程的 MCP lease。強制模式拒絕 Claude bare mode 與 Grok 共用工作目錄。通用 CLI、Antigravity 原生工具仍未涵蓋。本輪只撰寫測試，未執行、未編譯；真 CLI 驗收仍待完成。模式表、單次核准重試與限制見[資料外送防護](69-egress-guard.md)。

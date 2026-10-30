@@ -60,11 +60,36 @@ Only a current Admin may decide an outgoing-data approval, including requests wi
 
 Action-rule approvals show the matching tool or effect rule, including for read and draft calls. Purchase and Delete actions cannot receive new standing capability or workflow grants; grants saved before this feature are ignored without changing the stored records. Other gates and explicit approvals still apply.
 
+## CLI built-in tools (unreleased E1)
+
+Claude and Grok receive a `PreToolUse` hook for `WebFetch`, `WebSearch` and literal Bash network commands. Grok aliases include `Fetch`, `Shell`, `web_fetch`, `web_search` and `run_terminal_command`; their actual matcher and environment behavior still need live acceptance. Ordinary non-network Bash returns locally without contacting the gateway. Detection recognizes `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`, and `git push/fetch/clone/pull/ls-remote`. Shell `-c`, `eval` and echo/printf arguments use bounded reparsing (two levels, 64 KiB per payload). Echo/printf command-shaped data can conservatively match even when not executed.
+
+| Mode | Clean turn | Private data read | Ledger unavailable or unknown turn |
+|---|---|---|---|
+| `off` | Allow | Allow | Allow |
+| `shadow` | Allow | Allow, audit `would_ask` | Allow, audit `would_refuse_ledger_unavailable` |
+| `ask` | Allow | File approval, refuse until retry | Refuse |
+| `block` | Allow | Refuse | Refuse |
+
+The hook posts raw tool arguments to `/api/internal/egress-guard/hook-check`. The gateway canonicalizes and hashes them and builds the card; client digests and summaries are rejected. Requests and responses are signed; the port comes from `config.toml`, not an inherited port variable. Hook checks have their own per-employee 120/minute bucket. The live host principal context supplies the requester for self-approval checks; an unavailable context cannot create an ask ticket.
+
+In `ask`, retry the exact same arguments in the same turn after a current Admin approves in the dashboard. The ticket binds employee, turn, tool, complete arguments and covered sources; `WebFetch` includes the full URL and query. Identical pending requests reuse one ticket. New sources invalidate the previous ticket. Consumption is single-use, so a second retry needs another approval. Bash tickets require one direct simple command and one network verb: no expansion, substitution, pipes, redirects, `@file`, wrappers or interpreters. Unsupported shapes are refused with an explanation when approval would be required. This binds text, not DNS results, executable contents, configuration files or symlink targets.
+
+In `ask`/`block`, handled hook errors and panics exit 2, and hook installation failure stops the spawn without account/runtime rotation. `shadow` logs and continues. In enforcing modes Claude loads only the identity owner's `.claude/settings.json` via `--setting-sources "" --settings <file>`, even when cwd differs (ambient project/local/user settings are excluded); `cli_bare_mode` is refused in enforcing modes because it skips hooks. Grok adds `--disable-web-search`; enforcing modes currently refuse borrowed/shared work roots or another employee's guard file in the same hook directory. Use an independent employee directory or Claude/Codex for these runs.
+
+Codex `ask`/`block` spawns add `-c sandbox_workspace_write.network_access=false -c web_search="disabled"`; FullAccess is reduced to WorkspaceWrite, while ReadOnly stays narrower and the MCP approver is retained. This is a spawn restriction, not per-command approval. Generic CLI runtimes remain unsupported and audit `would_refuse_unsupported_runtime` in enforcing modes. Antigravity is unchanged; OpenAI-compatible tool loops retain their MCP gate.
+
+Cron, dispatch, reminder, mail, heartbeat and ephemeral execution entry points now register a host turn and propagate `DUDUCLAW_TURN_ID` independently of channel requester identity, including the resolved employee behind `default`. Existing taint is never cleared; unknown client turns remain tainted.
+
+**Bash hooks are a speed bump and telemetry, not a containment boundary.** Native `Read` and Bash file reads do not mark taint. Interpreters, scripts, aliases, renamed binaries, `/dev/tcp` and dynamic command assembly can bypass lexical detection. A missing/killed/timed-out hook may be ignored by the upstream CLI. Same-OS-user access to hook files, keys or process environment is not isolated by request signatures. Native preflight does not hold the MCP sink lease through execution or prevent concurrent reads after the check. Deny Bash or use the task sandbox for containment; the task sandbox covers delegated tasks, not every channel/CLI run. The Security page lists enforcing-mode employees with Bash and no enabled task sandbox.
+
+E1 validation status: tests were written but not run, and no compilation or live CLI probes were performed in this work package. Pending: Claude/Grok hook matching, inherited turn/principal context, approval/retry/single use, gateway-outage modes, Claude borrowed cwd, and Codex 0.164.0 network/search restrictions with MCP still working.
+
 ## Known limitations
 
 Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard. Their tool registry does not retain MCP annotations, so these calls are conservatively classified as **Modify**, even when the server describes them as read-only; exact per-tool action rules still apply. The MCP proxy and remote bridge retain their annotation-based decisions with `trusted_read_hint_servers`. A tainted direct-mounted read can therefore require outgoing approval.
 
-Taint is tracked per turn; active sink fences apply per employee. This MCP guard does not provide a network sandbox. Claude CLI built-in tools such as `WebFetch` and `Bash` running `curl`, and non-Claude native tools, are not covered. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
+Taint is tracked per turn; active sink fences apply per employee. This MCP guard does not provide a network sandbox. Unreleased E1 adds the native-tool checks described above; they do not provide a runtime-wide network boundary. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
 
 See [Security defense](05-security-defense.md) and [Dashboard settings](../guides/dashboard-settings.md).
 

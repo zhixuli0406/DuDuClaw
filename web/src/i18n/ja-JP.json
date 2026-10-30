@@ -9061,7 +9061,10 @@
   "security.egress.shadow": "記録のみ（既定）",
   "security.egress.ask": "送信前に確認",
   "security.egress.block": "送信を拒否",
-  "security.egress.limits": "対象はプラットフォームの MCP ツールとサードパーティー MCP プロキシです。CLI ネイティブツールは対象外です。記録のみでは呼び出しは許可されます。",
+  "security.egress.limits": "プラットフォームとプロキシの MCP ツール、および Claude・Grok の WebFetch、WebSearch と識別できる Bash ネットワークコマンドが対象です。Codex は確認／拒否モードで起動時にネットワークを制限します。標準のファイル読み取りは非公開データの読取として記録されず、汎用 CLI も対象外です。記録のみでは実行を許可します。",
   "security.egress.loadFailed": "設定を読み込めませんでした。再読み込みしてから変更してください。",
-  "security.egress.save": "送信の保護設定を保存"
+  "security.egress.save": "送信の保護設定を保存",
+  "security.egress.bashWarning": "次のスタッフは確認または拒否モードでも、タスクサンドボックスなしで Bash を使用できます。Bash フックは抑止と記録のための仕組みです。隔離が必要な場合は Bash 権限を外すか、タスクサンドボックスを使用してください。",
+  "security.egress.sandboxScope": "タスクサンドボックスは委任されたタスクだけが対象です。チャネル返信、スケジュールなど、ホストでの実行経路には適用されません。",
+  "security.egress.exposureUnavailable": "タスクサンドボックスなしで Bash を使えるスタッフを確認できませんでした。再読み込みして権限を確認してください。"
 }

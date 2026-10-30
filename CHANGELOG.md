@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- E1：Claude/Grok 內建 WebFetch、WebSearch 與 Bash 字面網路指令接入外送 hook，由 gateway 依原始參數產生完整審批卡與單次 ActionGrant；先開單拒絕，Admin 核准後以同回合、同參數重試。未知回合或帳本不可達時 ask/block 拒絕，shadow 放行並記錄。Bash 只接受單一簡單網路指令開單；安全頁列出有 Bash 且未開任務沙箱的強制模式員工。
+
+### Changed
+
+- E1：Codex 在 ask/block 關閉 workspace-write 網路與 web search，FullAccess 降為 WorkspaceWrite，保留 MCP 核准器。Grok 關閉內建 web search，通用 CLI 記錄未支援。Hook 安裝失敗在 ask/block 停止啟動且不輪替，shadow 記錄警告。Claude 明確載入身分所屬設定；強制模式拒絕略過 hook 的 bare mode，以及 Grok 共用工作目錄／混有其他員工 guard 的組合。
+
+### Fixed
+
+- E1：背景 cron、派工、提醒、信件、heartbeat 與 ephemeral 執行入口不再依賴通道 requester 才能登錄外送回合，傳遞 DUDUCLAW_TURN_ID 並登錄 default 別名所解析的員工；未知回合仍視為污染，不清除既有來源。
+
+### Security
+
+- E1 的 Bash hook 是減速帶與遙測，不是隔離邊界；原生 Read/Bash 讀檔不標記污染，腳本、解釋器、動態命令與同 OS 使用者的改寫仍有缺口。原生事前檢查不持有 MCP 外送 lease 到執行結束。Antigravity 未擴充；本輪未編譯、未執行測試或真 CLI 探測，安全審查與實際驗收仍待完成。詳見 `docs/features/69-egress-guard.md`。
+
 ## [1.77.0] - 2026-10-30 — 資料外送防護、目標費用上限、單次執行時限與權限收緊
 
 ### Added

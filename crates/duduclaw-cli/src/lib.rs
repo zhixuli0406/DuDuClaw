@@ -29,6 +29,7 @@ mod compat_windows_vm; // CP-2/B3: `duduclaw compat windows-vm` — self-package
 mod data_migrate; // H3g: `duduclaw migrate data` — /data forward-only settings migrator CLI front door
 mod decision_cmd; // Local, read-only support-decision replay
 mod docs_cmd; // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
+mod egress_hook;
 mod eval; // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
 mod eval_scaffold; // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
 mod knowledge_eval_cmd; // `duduclaw knowledge eval` — retrieval Recall@k on a throw-away knowledge.db
@@ -2666,6 +2667,13 @@ enum MaintenanceCommands {
 
 #[derive(Subcommand)]
 enum HookCommands {
+    /// Guard built-in web tools and literal Bash network commands.
+    EgressGuard {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        home: PathBuf,
+    },
     /// Guard Write/Edit/MultiEdit against creating agent-structure files
     /// outside the canonical `<home>/agents/<name>/` tree.
     ///
@@ -5675,6 +5683,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             key,
             default_provider,
         }) => proxy::run(&bind, key, default_provider).await,
+        Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::EgressGuard { agent, home })) => {
+            std::process::exit(egress_hook::run(&home, &agent).await);
+        }
         Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::AgentFileGuard { agent, home })) => {
             cmd_hook_agent_file_guard(agent.as_deref(), home.as_deref()).await
         }

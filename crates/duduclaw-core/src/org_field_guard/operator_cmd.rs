@@ -92,7 +92,7 @@ const MAX_PRINT_REPARSE_BYTES: usize = 64 * 1024;
 
 /// Only known shell command text is re-parsed, never Python/Node strings.
 /// `eval` joins its arguments with spaces before interpreting them.
-fn shell_payload(cmd: &str, args: &[String]) -> Option<String> {
+pub(super) fn shell_payload(cmd: &str, args: &[String]) -> Option<String> {
     if cmd == "eval" {
         return (!args.is_empty()).then(|| args.join(" "));
     }
