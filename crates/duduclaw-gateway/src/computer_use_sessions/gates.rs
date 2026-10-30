@@ -351,6 +351,26 @@ mod egress_tests {
         std::fs::write(home.join("config.toml"), "[security]\negress_guard='off'").unwrap();
         assert!(egress_check(home, agent, TOOL_TYPE, None).unwrap().is_none());
     }
+    #[tokio::test]
+    async fn execution_turn_keeps_computer_egress_separate_from_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let agent = "computer-egress-execution";
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "").unwrap();
+        std::fs::write(home.join("config.toml"), "[security]\negress_guard='block'").unwrap();
+        duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some("persisted-upstream".into()),
+            crate::runtime_turn::scope(agent, async {
+                let turn = crate::runtime_turn::current().unwrap();
+                assert!(egress_check(home, agent, TOOL_TYPE, Some(&turn)).unwrap().is_none());
+                assert!(egress_check(home, agent, TOOL_TYPE, Some("persisted-upstream")).is_err());
+                crate::egress_guard::mark_turn(agent, Some(&turn), "memory_search");
+                assert!(egress_check(home, agent, TOOL_TYPE, Some(&turn)).is_err());
+            }),
+        ).await;
+    }
+
 }
 
 #[cfg(test)]

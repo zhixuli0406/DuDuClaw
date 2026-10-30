@@ -58,7 +58,9 @@ pub(crate) async fn run(home: &Path, agent: &str) -> i32 {
         let Some((tool, args)) = classify(&input)? else {
             return Ok(Decision { allow: true, message: String::new() });
         };
-        let turn = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).map_err(|_| "turn unavailable")?;
+        let turn = std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
+            .or_else(|| std::env::var_os(duduclaw_core::ENV_TRUST_TURN_ID))
+            .and_then(|turn| turn.into_string().ok()).ok_or("turn unavailable")?;
         exchange(home, agent, &turn, &tool, args).await
     }).await;
     let (code, message, failed) = finish(mode.get(), result);

@@ -1072,7 +1072,7 @@ impl GrokRuntime {
         }
         env.insert(
             duduclaw_core::egress_guard::ENV_TURN_ALIAS.into(),
-            toml::Value::String(format!("${{{}:-}}", duduclaw_core::ENV_TRUST_TURN_ID)),
+            toml::Value::String(format!("${{{}:-}}", duduclaw_core::egress_guard::ENV_TURN_ALIAS)),
         );
         // Shared forward set (home/port/instance + MCP auth). Grok spawns MCP
         // children with ONLY this declared env block — omitting

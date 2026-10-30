@@ -150,6 +150,9 @@ pub fn turn_source_env_pairs() -> Vec<(String, String)> {
             ));
         }
     }
+    if let Some(turn) = crate::runtime_turn::current() {
+        out.push((duduclaw_core::egress_guard::ENV_TURN_ALIAS.to_string(), turn));
+    }
     // The person the turn or run is for (`crate::on_behalf_of`).
     out.extend(crate::on_behalf_of::env_pairs());
     out

@@ -1737,6 +1737,7 @@ pub(super) async fn build_reply_with_session_inner(
     // dispatchers via tokio task-locals. Any wiki RAG triggered by the
     // dispatcher inherits these so citations land in the right tracker
     // bucket AND respect the session-scoped per-conv cap.
+    let cli_future = crate::runtime_turn::scope(&agent_id, cli_future);
     let cli_future = duduclaw_memory::feedback::CURRENT_SESSION_ID
         .scope(Some(session_id.to_string()), cli_future);
     let cli_future =

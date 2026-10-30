@@ -17,10 +17,8 @@ impl RegistryBoundary {
             home: home.into(),
             agent: agent.into(),
             server: server.into(),
-            turn: duduclaw_memory::feedback::CURRENT_TURN_ID
-                .try_with(Clone::clone)
-                .ok()
-                .flatten(),
+            turn: crate::runtime_turn::current().or_else(||
+                duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten()),
             // This registry's public schemas do not retain MCP annotations.
             // The existing decision therefore uses the conservative Modify
             // class, while exact tool action rules remain effective.
