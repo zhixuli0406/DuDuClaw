@@ -34,6 +34,16 @@ fn fixture() -> tempfile::TempDir {
     .unwrap();
     d
 }
+// A callback needs no config publication only when OAuth is already selected.
+fn oauth_fixture() -> tempfile::TempDir {
+    let d = fixture();
+    std::fs::write(
+        d.path().join("config.toml"),
+        "[integrations]\ngoogle_workspace=true\ngoogle_credential_path=\"oauth\"\n",
+    )
+    .unwrap();
+    d
+}
 fn run<T>(
     home: &Path,
     f: impl FnOnce(&SourceGuard, &mut ObservedSource) -> Result<T>,
@@ -456,7 +466,7 @@ fn callback_finish_has_three_durable_points_and_only_expected_master_enable() {
     .unwrap();
     let p = payload(&["scope-a"]);
     let before = std::fs::read(d.path().join("config.toml")).unwrap();
-    let after = b"[integrations]\ngoogle_workspace=true\n".to_vec();
+    let after = b"[integrations]\ngoogle_workspace=true\ngoogle_credential_path=\"oauth\"\n".to_vec();
     let write = prepare_config_write(Some(&before), after).unwrap();
     let finish = run(d.path(), |g, s| {
         publication_transaction(g, |r| {
@@ -496,7 +506,7 @@ fn callback_finish_has_three_durable_points_and_only_expected_master_enable() {
 }
 #[test]
 fn revoke_during_claimed_finish_prevents_payload_and_master_publication() {
-    let d = fixture();
+    let d = oauth_fixture();
     let t = ticket(d.path());
     let claim = run(d.path(), |g, s| {
         publication_transaction(g, |r| r.claim(&t, s, NOW))
@@ -616,7 +626,7 @@ fn refresh_cas_checks_actual_id_epoch_revision_and_generation_not_a_modified_exp
 #[test]
 fn generic_noop_fence_cannot_publish_staged_callback_payload_before_or_after_expiry() {
     for attempted_at in [NOW + 100, NOW + 501] {
-        let d = fixture();
+        let d = oauth_fixture();
         let t = ticket(d.path());
         let claim = run(d.path(), |g, s| {
             publication_transaction(g, |r| r.claim(&t, s, NOW))

@@ -73,10 +73,16 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Approval payloads may later be executed against an exact authority hash.
 /// Refuse credentials instead of mutating the authorized action at rest.
 fn require_credential_free_payload(value: &Value) -> Result<(), String> {
-    if masked_approval_value(value) == *value {
-        Ok(())
-    } else {
-        Err("credentials are not accepted in approval payloads".into())
+    match value {
+        Value::String(text) => {
+            match duduclaw_security::credential_detect::contains_strict_credential(text) {
+                Ok(false) => Ok(()),
+                Ok(true) | Err(_) => Err("credentials are not accepted in approval payloads".into()),
+            }
+        }
+        Value::Array(values) => values.iter().try_for_each(require_credential_free_payload),
+        Value::Object(values) => values.values().try_for_each(require_credential_free_payload),
+        _ => Ok(()),
     }
 }
 

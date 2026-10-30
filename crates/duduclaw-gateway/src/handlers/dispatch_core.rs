@@ -513,7 +513,7 @@ impl MethodHandler {
                 self.handle_budget_summary().await
             }
 
-            _ => self.dispatch_knowledge(method, params, ctx, conn).await,
+            _ => Box::pin(self.dispatch_knowledge(method, params, ctx, conn)).await,
         }
     }
 }

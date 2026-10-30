@@ -65,6 +65,10 @@ fn private_files(path: &Path, create: bool) -> Result<(), String> {
 struct Store(Connection);
 impl Store {
     fn open(home: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+        // Resolve the trusted home, including macOS /var, while retaining
+        // NOFOLLOW and hard-link checks on the database and its sidecars.
+        let home = std::fs::canonicalize(home).map_err(|e| e.to_string())?;
         let path = home.join("egress_shadow.db");
         private_files(&path, true)?;
         let conn = Connection::open_with_flags(&path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
@@ -198,6 +202,20 @@ fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
 mod tests {
     use super::*;
     const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn writes_create_missing_home_and_failures_remain_best_effort() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("new/home");
+        assert_eq!(report(&home, 7).unwrap().total, 0);
+        assert!(!home.exists());
+        assert!(record(&home, "bot", "send", "would_ask", &["memory_read".into()], "call", Transport::Mcp));
+        assert_eq!(report(&home, 7).unwrap().total, 1);
+        let file = root.path().join("file");
+        std::fs::write(&file, "keep").unwrap();
+        assert!(!record(&file, "bot", "send", "would_ask", &[], "failure", Transport::Mcp));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep");
+    }
 
     #[test]
     fn aggregation_counts_calls_and_separates_tickets_from_unavailable() {

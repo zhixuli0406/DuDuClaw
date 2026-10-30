@@ -19,6 +19,9 @@ const ADDITIONAL_PRIVATE_SOURCES: &str = "additional_private_sources";
 struct CachedTaint {
     recorded_at: Instant,
     sources: BTreeSet<String>,
+    connector_refs: BTreeSet<String>,
+    dropped_connector_refs: u64,
+    turn_started_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -43,11 +46,29 @@ impl TaintCache {
             let entry = self.entries.entry(key.clone()).or_insert_with(|| CachedTaint {
                 recorded_at: now,
                 sources: BTreeSet::new(),
+                connector_refs: BTreeSet::new(),
+                dropped_connector_refs: 0,
+                turn_started_at: state.turn_started_at.clone(),
             });
-            for source in state.sources {
-                if entry.sources.contains(&source) { continue; }
+            if entry.turn_started_at != state.turn_started_at {
+                // An inconsistent or unavailable identity cannot establish lineage.
+                entry.turn_started_at = None;
+                entry.connector_refs.insert("unknown".into());
+            }
+            entry.dropped_connector_refs = entry.dropped_connector_refs.max(state.dropped_connector_refs);
+            for reference in &state.connector_refs {
+                if entry.connector_refs.contains(reference) { continue; }
+                if entry.connector_refs.len() < MAX_CACHED_SOURCES - 1 {
+                    entry.connector_refs.insert(reference.clone());
+                } else {
+                    entry.connector_refs.insert("unknown".into());
+                    entry.dropped_connector_refs = entry.dropped_connector_refs.saturating_add(1);
+                }
+            }
+            for source in &state.sources {
+                if entry.sources.contains(source) { continue; }
                 if entry.sources.len() < MAX_CACHED_SOURCES {
-                    entry.sources.insert(source);
+                    entry.sources.insert(source.clone());
                 } else if !entry.sources.contains(ADDITIONAL_PRIVATE_SOURCES) {
                     // The summary marker counts toward the same 512-entry cap.
                     entry.sources.pop_last();
@@ -56,11 +77,14 @@ impl TaintCache {
             }
         }
         match self.entries.get(&key) {
-            Some(entry) => Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None,
+            Some(entry) => Taint {
+                connector_refs: entry.connector_refs.iter().cloned().collect(),
+                dropped_connector_refs: entry.dropped_connector_refs,
+                turn_started_at: entry.turn_started_at.clone(),
                 tainted: true,
                 sources: entry.sources.iter().cloned().collect(),
             },
-            None => Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: Vec::new() },
+            None => state,
         }
     }
 }
@@ -680,6 +704,45 @@ mod tests {
         }
         let clean = Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: Vec::new() };
         assert!(cache.merge(key, clean, now).tainted);
+    }
+
+    #[test]
+    fn egress_local_cache_bounds_connector_lineage_without_losing_unknown_marker() {
+        let mut cache = TaintCache::default();
+        let key = (PathBuf::from("isolated-home"), "agent".into(), "turn".into());
+        let state = Taint {
+            tainted: true, sources: vec!["memory_read".into()],
+            connector_refs: (0..MAX_CACHED_SOURCES + 10).map(|n| format!("db:connection-{n}")).collect(),
+            dropped_connector_refs: 0, turn_started_at: None,
+        };
+        let result = cache.merge(key, state, Instant::now());
+        assert!(result.tainted);
+        assert_eq!(result.connector_refs.len(), MAX_CACHED_SOURCES);
+        assert!(result.connector_refs.contains(&"unknown".into()));
+        assert_eq!(result.dropped_connector_refs, 11);
+    }
+
+    #[test]
+    fn egress_local_cache_preserves_connector_lineage_and_closes_unknown_identity() {
+        let mut cache = TaintCache::default();
+        let key = (PathBuf::from("isolated-home"), "agent".into(), "turn".into());
+        let now = Instant::now();
+        let mut state = Taint {
+            tainted: false, sources: vec![], connector_refs: vec![],
+            dropped_connector_refs: 0, turn_started_at: Some("2026-10-30T00:00:00Z".into()),
+        };
+        assert_eq!(cache.merge(key.clone(), state.clone(), now), state);
+        state.tainted = true;
+        state.sources.push("memory_read".into());
+        state.connector_refs.push("google:person:owner".into());
+        state.dropped_connector_refs = 2;
+        assert_eq!(cache.merge(key.clone(), state.clone(), now), state);
+        let unknown = cache.merge(key, Taint::unknown(), now);
+        assert!(unknown.tainted);
+        assert!(unknown.connector_refs.contains(&"google:person:owner".into()));
+        assert!(unknown.connector_refs.contains(&"unknown".into()));
+        assert!(unknown.turn_started_at.is_none());
+        assert_eq!(unknown.dropped_connector_refs, 2);
     }
 
     #[test]

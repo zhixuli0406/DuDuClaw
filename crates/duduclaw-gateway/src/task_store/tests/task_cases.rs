@@ -517,3 +517,18 @@ async fn task_review_sinks_mask_feedback_and_structured_verdicts() {
     assert!(!verdict.contains("fixture-verdict"));
     assert!(serde_json::from_str::<serde_json::Value>(verdict).is_ok());
 }
+
+#[tokio::test]
+async fn numeric_uuid_criteria_ledger_is_preserved_without_weakening_secret_refusal() {
+    let (store, dir) = temp_store();
+    let mut task = pending_task("12345678-abcd-4abc-abcd-123456789abc");
+    task.acceptance_criteria_baseline = Some("Produce a summary".into());
+    task.criteria_ledger = crate::goal_loop::criteria_ledger::ledger_for_new_goal(
+        dir.path(), &task.id, task.acceptance_criteria_baseline.as_deref());
+    assert!(task.criteria_ledger.is_some());
+    store.insert_task(&task).await.unwrap();
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stored.criteria_ledger, task.criteria_ledger);
+    assert!(store.set_criteria_ledger(&task.id, r#"{"text":"password: fixture-secret"}"#).await.is_err());
+    assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().criteria_ledger, task.criteria_ledger);
+}

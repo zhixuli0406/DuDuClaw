@@ -183,17 +183,34 @@ fn read_optional(dir: &Path, name: &str, strict: bool) -> io::Result<Option<Stri
         tracing::warn!(path = %path.display(), "Optional profile file is not a regular file; omitting section");
         return Ok(None);
     }
-    let mut text = String::new();
-    if let Err(error) = file.take(MAX_FILE_BYTES + 1).read_to_string(&mut text) {
+    // Read up to one whole UTF-8 code point past the cap. read_to_string on
+    // take(MAX + 1) can cut a CJK character and wrongly omit the whole file.
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_FILE_BYTES + 4).read_to_end(&mut bytes) {
         if strict {
             return Err(error);
         }
         tracing::warn!(path = %path.display(), error = %error, "Failed to read optional profile file; omitting section");
         return Ok(None);
     }
-    if strict && text.len() as u64 > MAX_FILE_BYTES {
+    if strict && bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(invalid_data(format!("{name} exceeds 256 KiB")));
     }
+    let mut text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if !strict && error.utf8_error().error_len().is_none()
+            && error.utf8_error().valid_up_to() >= MAX_FILE_BYTES as usize => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).map_err(invalid_data)?
+        }
+        Err(error) => {
+            if strict { return Err(invalid_data(error)); }
+            tracing::warn!(path = %path.display(), error = %error, "Failed to decode optional profile file; omitting section");
+            return Ok(None);
+        }
+    };
     if text.len() as u64 > MAX_FILE_BYTES {
         let mut end = MAX_FILE_BYTES as usize;
         while !text.is_char_boundary(end) {
@@ -436,9 +453,24 @@ mod tests {
         let profile = ProfileSections::load(dir.path()).unwrap();
         let prompt = profile.rendered(Default::default()).into_iter()
             .find(|section| section.kind == ProfileSectionKind::Soul).unwrap();
-        assert_eq!(prompt.content.len(), MAX_FILE_BYTES as usize);
+        assert_eq!(prompt.content, crate::truncate_bytes(&soul, MAX_FILE_BYTES as usize));
         assert!(prompt.content.is_char_boundary(prompt.content.len()));
         assert!(prompt.content.ends_with('字'));
+    }
+
+    #[test]
+    fn long_utf8_profiles_keep_complete_characters_and_invalid_files_stay_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        for ch in ['字', '🦀'] {
+            let body = ch.to_string().repeat(MAX_FILE_BYTES as usize);
+            std::fs::write(dir.path().join("SOUL.md"), &body).unwrap();
+            let profile = ProfileSections::load(dir.path()).unwrap();
+            let soul = profile.sections.iter().find(|section| section.kind == ProfileSectionKind::Soul).unwrap();
+            assert_eq!(soul.content, crate::truncate_bytes(&body, MAX_FILE_BYTES as usize));
+        }
+        std::fs::write(dir.path().join("SOUL.md"), [0xff, b'a']).unwrap();
+        assert!(!ProfileSections::load(dir.path()).unwrap().sections.iter()
+            .any(|section| section.kind == ProfileSectionKind::Soul));
     }
 
     #[test]

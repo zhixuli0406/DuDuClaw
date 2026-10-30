@@ -505,10 +505,10 @@ async fn install_agent(
         report.imported("soul", &format!("{} → 人格設定（SOUL.md）", doc.source));
         report.tag("slot.written", json!({"slot": "soul"}));
     }
-    for (slot, doc) in [("identity", &d.identity), ("user-profile", &d.user_profile),
-        ("instructions", &d.instructions), ("contract", &d.contract)] {
+    for (slot, file, doc) in [("identity", "IDENTITY.md", &d.identity), ("user-profile", "USER.md", &d.user_profile),
+        ("instructions", "INSTRUCTIONS.md", &d.instructions), ("contract", "CONTRACT.toml", &d.contract)] {
         if let Some(doc) = doc {
-            report.imported(slot, &doc.source);
+            report.imported(slot, &format!("{} → {file}", doc.source));
             report.tag("slot.written", json!({"slot": slot}));
         }
     }
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn resolved_plan_binds_model_tools_parent_names_settings_and_all_file_bodies() {
         let home = tempfile::tempdir().unwrap();
-        let source = AgentDraft { id_hint: "worker".into(), display_name: "Worker".into(),
+        let source = AgentDraft { id_hint: "worker".into(), display_name: "Support worker".into(),
             soul: Some(super::super::ir::Doc::new("SOUL.md", "Help carefully.")),
             model: Some("sonnet".into()), tools: Some(vec!["Read".into()]),
             disallowed_tools: vec!["Bash".into()], ..Default::default() };
@@ -718,12 +718,14 @@ mod tests {
         }
         assert_ne!(baseline, planned_effects(&source, "worker-imported", "boss", home.path()));
         assert_ne!(baseline, planned_effects(&source, "worker", "other-boss", home.path()));
+        // The id is already resolved before plan_agent; exercise a display
+        // collision distinct from that id, which resolve_id would rename.
         let existing = home.path().join("agents/existing");
         std::fs::create_dir_all(&existing).unwrap();
-        std::fs::write(existing.join("agent.toml"), "[agent]\nname = 'existing'\ndisplay_name = 'Worker'").unwrap();
+        std::fs::write(existing.join("agent.toml"), "[agent]\nname = 'existing'\ndisplay_name = 'Support worker'").unwrap();
         let collision = planned_effects(&source, "worker", "boss", home.path());
         assert_ne!(baseline, collision);
-        assert_eq!(collision["profile"]["display_name"], "Worker（worker）");
+        assert_eq!(collision["profile"]["display_name"], "Support worker（worker）");
     }
 
     #[test]

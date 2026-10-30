@@ -337,7 +337,10 @@ pub(crate) fn split_telegram_token(s: &str) -> Option<(&str, char, &str)> {
     let sep = chars.next()?;
     let secret = chars.as_str();
     let id_ok = (5..=16).contains(&id.len()) && id.chars().all(|c| c.is_ascii_digit());
-    let secret_ok = secret.len() >= 20
+    // A hyphen is also a UUID separator. Require Telegram's complete
+    // secret length for this corrupted-token compatibility form.
+    let minimum_secret_len = if sep == '-' { 35 } else { 20 };
+    let secret_ok = secret.len() >= minimum_secret_len
         && secret
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
@@ -516,6 +519,22 @@ mod tests {
             out.contains("getUpdates?offset=0"),
             "non-secret query kept: {out}"
         );
+    }
+
+    #[test]
+    fn digit_led_uuid_is_preserved_but_complete_corrupted_telegram_tokens_are_masked() {
+        let uuid = "12345678-abcd-4abc-abcd-123456789abc";
+        assert!(split_telegram_token(uuid).is_none());
+        for text in [uuid.to_string(), format!("task id {uuid}"),
+            format!("https://example.test/tasks/{uuid}")] {
+            assert_eq!(redact_secrets(&text), text);
+        }
+        assert_eq!(tg_secret().len(), 35);
+        for separator in [':', '-'] {
+            let token = tg_token(separator);
+            assert!(split_telegram_token(&token).is_some());
+            assert!(!redact_secrets(&token).contains(&tg_secret()));
+        }
     }
 
     #[test]

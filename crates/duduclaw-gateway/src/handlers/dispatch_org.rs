@@ -755,7 +755,7 @@ impl MethodHandler {
                 self.handle_autopilot_list().await
             }
 
-            _ => self.dispatch_ops(method, params, ctx, conn).await,
+            _ => Box::pin(self.dispatch_ops(method, params, ctx, conn)).await,
         }
     }
 }

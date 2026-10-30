@@ -586,7 +586,7 @@ impl MethodHandler {
                 )
             }
 
-            _ => self.dispatch_system(method, params, ctx, conn).await,
+            _ => Box::pin(self.dispatch_system(method, params, ctx, conn)).await,
         }
     }
 }

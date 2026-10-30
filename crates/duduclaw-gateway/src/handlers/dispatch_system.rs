@@ -523,7 +523,7 @@ impl MethodHandler {
             "dashboard.layout.get" => self.handle_dashboard_layout_get(ctx).await,
             "dashboard.layout.set" => self.handle_dashboard_layout_set(params, ctx).await,
 
-            _ => self.dispatch_org(method, params, ctx, conn).await,
+            _ => Box::pin(self.dispatch_org(method, params, ctx, conn)).await,
         }
     }
 }

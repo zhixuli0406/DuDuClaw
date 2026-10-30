@@ -1334,7 +1334,9 @@ mod tests {
         let text = "postgres://admin:Sup3rS3cret@db.internal:5432/prod";
         let masked = mask_sensitive_text(text);
         assert!(!masked.contains("Sup3rS3cret"));
-        assert!(masked.contains("postgres://admin:***@db.internal:5432/prod"));
+        // C1 masks the complete credential-bearing connection string,
+        // including its account and endpoint, before the legacy passes.
+        assert_eq!(masked, "[已遮罩的密碼]");
     }
 
     #[test]

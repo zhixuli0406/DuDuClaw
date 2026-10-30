@@ -27,6 +27,10 @@ health_check_interval_seconds = 60
 cooldown_after_rate_limit_seconds = 120
 
 [security]
+# audit keeps the original conversation; mask hides detected credentials from
+# the current prompt and conversation history. Derived stores are always masked.
+# Unknown values fail closed to mask. Bare passwords without context are not detected.
+chat_credentials = "audit"
 # Recipient checks are independent of private-data reads.
 # Unknown values use ask; employee overrides can only tighten this setting.
 recipient_guard = "shadow" # off | shadow | ask
@@ -1001,9 +1005,3 @@ port = 18889
 #   [router]        inference.toml — local-inference cascade routing
 #   [voice] TTS     inference.toml — text-to-speech; only STT lives in this file
 #   [branding]      ~/.duduclaw/branding.json, written by the dashboard only
-
-[security]
-# audit keeps the original conversation; mask hides detected credentials from
-# the current prompt and conversation history. Derived stores are always masked.
-# Unknown values fail closed to mask. Bare passwords without context are not detected.
-chat_credentials = "audit"

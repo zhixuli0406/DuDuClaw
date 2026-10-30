@@ -676,6 +676,10 @@ fn team_history_rpc_future_sizes() {
             crate::power_local::RpcConnInfo::internal(),
         )
     });
+    let core = type_bytes(|| f.handler.dispatch_core("approvals.decide", json!({}), &f.manager, crate::power_local::RpcConnInfo::internal()));
+    let knowledge = type_bytes(|| f.handler.dispatch_knowledge("approvals.decide", json!({}), &f.manager, crate::power_local::RpcConnInfo::internal()));
+    let system = type_bytes(|| f.handler.dispatch_system("approvals.decide", json!({}), &f.manager, crate::power_local::RpcConnInfo::internal()));
+    let ops = type_bytes(|| f.handler.dispatch_ops("approvals.decide", json!({}), &f.manager, crate::power_local::RpcConnInfo::internal()));
     let get = constructed_bytes(|| {
         f.handler
             .handle_team_history_get(json!({"session_id":"report"}), &f.manager)
@@ -685,7 +689,7 @@ fn team_history_rpc_future_sizes() {
             .handle_team_history_list(json!({"agent_id":"sales"}), &f.manager)
     });
     let journey = type_bytes(manager_reads_body);
-    let sizes = json!({"handle":handle,"handle_conn":conn,"dispatch":dispatch,"dispatch_org":org,"team_get":get,"team_list":list,"long_test":journey});
+    let sizes = json!({"handle":handle,"handle_conn":conn,"dispatch":dispatch,"dispatch_core":core,"dispatch_knowledge":knowledge,"dispatch_system":system,"dispatch_org":org,"dispatch_ops":ops,"team_get":get,"team_list":list,"long_test":journey});
     eprintln!("RPC_FUTURE_SIZES {sizes}");
     assert!(
         handle <= 4096,
@@ -695,6 +699,38 @@ fn team_history_rpc_future_sizes() {
         conn <= 4096,
         "transport RPC future grew to {conn} bytes; keep dispatcher boxed"
     );
+    // Before boxing the dispatch fallthroughs this was 21,264 bytes. The
+    // public handle stayed small then, so its guard alone missed the growth.
+    assert!(
+        dispatch <= 8 * 1024,
+        "shared dispatcher future grew to {dispatch} bytes; keep the dispatch layers boxed"
+    );
+    // Bound each inner layer too: boxing only the public entry hides growth
+    // in its children. Measured after boxing: 12,280 / 20,744 / 17,960 /
+    // 11,728 / 5,256 bytes. In particular, unboxing core's fallthrough pulls
+    // the knowledge layer back above core's 16 KiB limit.
+    for (name, size, limit) in [
+        ("core", core, 16 * 1024),
+        ("knowledge", knowledge, 24 * 1024),
+        ("system", system, 20 * 1024),
+        ("org", org, 16 * 1024),
+        ("ops", ops, 8 * 1024),
+    ] {
+        assert!(size <= limit, "{name} dispatcher future grew to {size} bytes; box large handler boundaries");
+    }
+}
+
+#[tokio::test]
+async fn approval_dispatch_fits_default_worker_stack() {
+    let f = fixture().await;
+    // Exercise every RPC fallthrough used by workflow approval decisions on
+    // the default test stack, without a CLI subprocess or socket fixture.
+    let response = f.handler.handle(
+        "approvals.decide",
+        json!({"id":"missing-workflow-approval","approve":false}),
+        &f.admin,
+    ).await;
+    assert_eq!(denied(response), json!("approval not found"));
 }
 
 #[tokio::test]

@@ -594,7 +594,7 @@ async fn operation_sink_refuses_secret_payload_and_masks_receipt() {
     let id = b.request_bound(RequestKind::Approval, "alice", "send", payload, bound)
         .await.unwrap();
     b.store.conn.lock().await.execute("UPDATE approvals SET payload=?1 WHERE id=?2",
-        params![json!({"nested":{"password":"fixture-old-row"}}).to_string(), id.as_str()])
+        params![json!({"nested":{"password": format!("sk-{}", "x".repeat(40))}}).to_string(), id.as_str()])
         .unwrap();
     assert_eq!(b.prepare_operation(&id, "send", None).await.unwrap_err(),
         "credentials are not accepted in approval payloads");
@@ -609,7 +609,7 @@ async fn bound_question_refuses_credential_answer_without_consuming_request() {
     let b = ApprovalBroker::open(home.path()).unwrap();
     let id = b.request_bound(RequestKind::Question, "alice", "question", payload, bound)
         .await.unwrap();
-    assert_eq!(b.answer_question(&id, &context(), json!("password: fixture-answer"))
+    assert_eq!(b.answer_question(&id, &context(), json!(format!("password: sk-{}", "x".repeat(40))))
         .await.unwrap_err(), "credentials are not accepted in approval payloads");
     let rec = b.get(&id).await.unwrap().unwrap();
     assert_eq!(rec.status, ApprovalStatus::Pending);

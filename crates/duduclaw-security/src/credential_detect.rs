@@ -39,7 +39,9 @@ fn rules() -> Result<&'static Vec<Rule>, DetectError> {
             ("oauth_token", Some("Google"), r"(?:^|[^A-Za-z0-9_])(?P<value>ya29\.[A-Za-z0-9_.-]{16,})", true),
             ("api_key", None, r"(?:^|[^A-Za-z0-9_])(?P<value>(?:sk-|xox[bpaes]-|xapp-|gh[pousr]_|github_pat_|ddc_|glpat-|EAA)[A-Za-z0-9_-]{12,})", true),
             ("oauth_token", None, r"(?:^|[^A-Za-z0-9_])(?P<value>[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,})", false),
-            ("oauth_token", Some("Telegram"), r"(?:^|[^A-Za-z0-9_])(?P<value>[0-9]{5,16}[:-][A-Za-z0-9_-]{20,})", true),
+            // A corrupted hyphen separator is still masked, but needs a full
+            // Telegram secret so digit-led UUIDs are not mistaken for tokens.
+            ("oauth_token", Some("Telegram"), r"(?:^|[^A-Za-z0-9_])(?P<value>[0-9]{5,16}(?::[A-Za-z0-9_-]{20,}|-[A-Za-z0-9_-]{35,}))", true),
             ("password", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:password|passwd|pwd)["']?\s*(?P<assignment>:|=|\bis\b)\s*["'](?P<value>[^"'\r\n]+)["']"#, false),
             ("password", None, r#"密碼\s*(?:是|為|：|:|=)\s*[「『"'](?P<value>[^」』"'\r\n]+)[」』"']"#, false),
             ("password", None, r#"(?i)(?:^|[^A-Za-z0-9_])(?:password|passwd|pwd)["']?\s*(?P<assignment>:|=|\bis\b)\s*["']?(?P<value>[^\s"'<>，。；、\[\]]+)"#, false),
@@ -91,6 +93,29 @@ pub(crate) fn strict_structure(kind: &str, value: &str) -> bool {
         r"\A(?:AIza[A-Za-z0-9_-]{35}|GOCSPX-[A-Za-z0-9_-]{28}|(?:AKIA|ASIA)[A-Z0-9]{16}|ya29\.[A-Za-z0-9_.-]{32,}|(?:sk-(?:proj-|ant-api03-)?|xox[bpaes]-|xapp-|gh[pousr]_|github_pat_|ddc_|glpat-|EAA)[A-Za-z0-9_-]{32,}|[0-9]{5,16}:[A-Za-z0-9_-]{35})\z",
     )) else { return false };
     pattern.is_match(value)
+}
+
+/// Exact-action payloads must not be rewritten. Only provider-shaped values
+/// and complete PEM structures are evidence for refusing such a payload;
+/// field names and prose labels alone are not credentials in this context.
+/// Scan structural rules independently: password-context masking deliberately
+/// suppresses fingerprint eligibility, but must not hide a strict key here.
+pub fn contains_strict_credential(text: &str) -> Result<bool, DetectError> {
+    guarded_detect(|| {
+        for rule in rules()?.iter().filter(|rule| rule.structural) {
+            for captures in rule.pattern.captures_iter(text) {
+                let value = captures.name("value").ok_or(DetectError)?;
+                if rule.service == Some("AWS") && text.get(value.end()..)
+                    .and_then(|tail| tail.chars().next())
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                if strict_structure(rule.kind, value.as_str()) { return Ok(true); }
+            }
+        }
+        Ok(false)
+    })
 }
 
 /// Mask JSON at persistence boundaries, including dynamic object keys and
@@ -283,12 +308,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numeric_uuid_criteria_ids_are_not_telegram_tokens() {
+        let uuid = "12345678-abcd-4abc-abcd-123456789abc";
+        let id = format!("{uuid}::criterion::1::fp%401234abcd");
+        assert!(detect(uuid).unwrap().is_empty());
+        assert_eq!(mask(uuid), uuid);
+        assert_eq!(mask(&id), id);
+        let secret = "AAExampleExampleExampleExampleXYZ12";
+        assert_eq!(secret.len(), 35);
+        for separator in [':', '-'] {
+            let token = format!("12345678{separator}{secret}");
+            assert!(!detect(&token).unwrap().is_empty());
+            assert!(!mask(&token).contains(secret));
+        }
+    }
+
+    #[test]
+    fn strict_payload_detection_ignores_context_but_keeps_provider_and_pem_shapes() {
+        for text in ["token: authority-revision", "password: marker", "secret", "Bearer ordinary-authority-token",
+            "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----"] {
+            assert!(!contains_strict_credential(text).unwrap(), "{text}");
+        }
+        let key = format!("sk-{}", "x".repeat(40));
+        for text in [key.clone(), format!("password: {key}"), format!("密碼是{key}"),
+            format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----", "A".repeat(64))] {
+            assert!(contains_strict_credential(&text).unwrap(), "strict shape was missed");
+        }
+        let aws = format!("AKIA{}", "A".repeat(16));
+        assert!(contains_strict_credential(&aws).unwrap());
+        assert!(!contains_strict_credential(&format!("{aws}EXTRA")).unwrap());
+    }
+
+    #[test]
     fn document_count_includes_context_and_url_values_and_matches_document_mask() {
-        let raw = "password: hunter2\nhttps://example.test/?client_secret=synthetic-test-value&session=other-test-value";
+        let raw = "password: hunter2\nhttps://example.test/?client_secret=synthetic-test-value&session=AbCdEf0123456789abcdef";
         let (masked, count) = mask_document_with_count(raw).unwrap();
         assert_eq!(count, 3);
         assert_eq!(masked, mask_document(raw).unwrap());
-        for secret in ["hunter2", "synthetic-test-value", "other-test-value"] {
+        for secret in ["hunter2", "synthetic-test-value", "AbCdEf0123456789abcdef"] {
             assert!(!masked.contains(secret));
         }
     }

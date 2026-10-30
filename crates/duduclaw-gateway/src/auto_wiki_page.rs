@@ -88,6 +88,8 @@ pub const MAX_HELD_CLAIMS_PER_DAY: u32 = 20;
 /// Byte cap on the verbatim原文 block (P6 = A: keep the source text, but
 /// bounded). `WikiStore::write_page` itself caps the whole page at 512 KB.
 const MAX_ORIGINAL_BYTES: usize = 64 * 1024;
+/// Match the wiki store's page bound for complete-document credential scans.
+const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 
 /// Cap on the summary rendered into the page header.
 const MAX_SUMMARY_CHARS: usize = 400;
@@ -381,10 +383,15 @@ pub fn try_consume_quota_detail(home_dir: &Path, agent_id: &str, kind: QuotaKind
 fn render_content_part(req: &AutoPageRequest) -> String {
     let masked_summary = duduclaw_security::credential_detect::mask(&req.summary);
     let summary = truncate_chars(masked_summary.trim(), MAX_SUMMARY_CHARS);
-    let masked_original = duduclaw_security::credential_detect::mask(&req.original);
+    let masked_original = if req.original.len() <= MAX_DOCUMENT_BYTES {
+        duduclaw_security::credential_detect::mask_document(&req.original)
+            .unwrap_or_else(|_| duduclaw_security::credential_detect::UNAVAILABLE_MASK.into())
+    } else {
+        duduclaw_security::credential_detect::UNAVAILABLE_MASK.into()
+    };
     let original_raw = masked_original.trim();
     let original = truncate_bytes(original_raw, MAX_ORIGINAL_BYTES);
-    let truncated = original.len() < original_raw.len();
+    let truncated = original.len() < original_raw.len() || req.original.len() > MAX_DOCUMENT_BYTES;
 
     let mut body = String::with_capacity(original.len() + 512);
     body.push_str(DATA_BANNER);
@@ -578,8 +585,14 @@ pub fn write_auto_page(
         body,
     };
 
+    let serialized = serialize_page(&page);
+    if serialized.len() > MAX_DOCUMENT_BYTES {
+        return Err(AutoPageError::Write("auto page exceeds 512 KiB".into()));
+    }
+    let serialized = duduclaw_security::credential_detect::mask_document(&serialized)
+        .map_err(|_| AutoPageError::Write("credential detection unavailable".into()))?;
     store
-        .write_page(&path, &duduclaw_security::credential_detect::mask(&serialize_page(&page)))
+        .write_page(&path, &serialized)
         .map_err(|e| AutoPageError::Write(e.to_string()))?;
 
     Ok(if existing.is_some() {

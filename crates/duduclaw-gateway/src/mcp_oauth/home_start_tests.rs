@@ -25,7 +25,7 @@ fn optional(home: &Path, file: &str) -> Option<Vec<u8>> {
     }
 }
 #[tokio::test(flavor = "current_thread")]
-async fn private_req11_matches_url_client_ticket_pending_and_b2_public_builtin11() {
+async fn private_req12_matches_url_client_ticket_pending_and_b2_public_builtin12() {
     let d = b1_home();
     let _clock = publication::ClockGuard::fixed_if_unset(NOW);
     let probe = test_probe::Guard::install(d.path());
@@ -33,7 +33,7 @@ async fn private_req11_matches_url_client_ticket_pending_and_b2_public_builtin11
         .into_iter()
         .find(|p| p.provider_id == "google")
         .unwrap();
-    assert_eq!(public.scopes.len(), 11);
+    assert_eq!(public.scopes.len(), 12);
     let done = start::begin_google_home_authorization(d.path(), capture(d.path(), None))
         .await
         .unwrap();
@@ -49,7 +49,11 @@ async fn private_req11_matches_url_client_ticket_pending_and_b2_public_builtin11
         .collect();
     expected.sort();
     expected.dedup();
-    assert_eq!(expected.len(), 11);
+    assert_eq!(expected.len(), 12);
+    assert!(expected.iter().any(|scope| scope == "https://www.googleapis.com/auth/userinfo.email"));
+    let mut public_scopes = public.scopes;
+    public_scopes.sort();
+    assert_eq!(public_scopes, expected);
     assert_eq!(request, expected);
     assert_eq!(values["state"], state);
     assert_eq!(values["code_challenge_method"], "S256");
@@ -498,7 +502,7 @@ async fn changed_config_or_expiry_between_publications_returns_no_url_or_reselec
 #[test]
 fn unresolved_config_and_connect_finish_barriers_cannot_be_replaced_by_private_start() {
     for finish in [false, true] {
-        let d = fixture();
+        let d = oauth_fixture();
         let _clock = publication::ClockGuard::fixed_if_unset(NOW);
         if finish {
             let t = ticket(d.path());

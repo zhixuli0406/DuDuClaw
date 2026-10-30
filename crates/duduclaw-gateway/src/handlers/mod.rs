@@ -515,12 +515,15 @@ impl MethodHandler {
         {
             return frame;
         }
-        if let Some(frame) = self.dispatch_kb(method, &params, ctx).await {
+        if let Some(frame) = Box::pin(self.dispatch_kb(method, &params, ctx)).await {
             return frame;
         }
-        if let Some(frame) = self.dispatch_agent_channels(method, &params, ctx).await {
+        if let Some(frame) = Box::pin(self.dispatch_agent_channels(method, &params, ctx)).await {
             return frame;
         }
-        self.dispatch_core(method, params, ctx, conn).await
+        // Each dispatch layer must own only its handlers, not the futures of
+        // every later layer. Even an approvals call otherwise reserves the
+        // stack used by unrelated runtime/spawn handlers along the fallthrough.
+        Box::pin(self.dispatch_core(method, params, ctx, conn)).await
     }
 }

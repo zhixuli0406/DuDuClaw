@@ -719,3 +719,19 @@ fn bound_conversation_exports_scope_mask_and_recollect_on_privilege_downgrade() 
     std::fs::write(dir.path().join("config.toml"),"private_api_key = 'SYNTHETIC-CONFIG-SECRET").unwrap();
     assert_eq!(source::collect(dir.path(),&user,&req,||Ok(())).err().unwrap(),"EXPORT_MASKING_FAILED");
 }
+
+#[test]
+fn bounded_export_masks_credentials_past_the_message_scan_cap_without_losing_cjk() {
+    let prefix = "中".repeat(32_000);
+    let row = LogicalRow { id: "long-secret".into(), cells: vec![Cell::Text(format!("{prefix}password: fixture-export"))] };
+    let mut table = source::Table { headers: vec!["text"], rows: vec![] };
+    let mut bytes = 0;
+    source::push(&mut table, row.clone(), &mut bytes).unwrap();
+    let Cell::Text(masked) = &table.rows[0].cells[0] else { panic!("expected text") };
+    assert_eq!(masked, &format!("{prefix}password: [已遮罩的密碼]"));
+    let joined: String = writer::physical_rows(&row).iter().map(|part| {
+        let Cell::Text(text) = &part.cells[0] else { panic!("expected text") };
+        text.clone()
+    }).collect();
+    assert_eq!(&joined, masked);
+}

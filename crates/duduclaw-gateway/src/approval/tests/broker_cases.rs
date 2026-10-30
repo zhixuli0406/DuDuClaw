@@ -381,10 +381,22 @@ async fn approval_sinks_mask_display_and_refuse_nested_credentials() {
 
     let mut direct = rec.clone();
     direct.id = ApprovalId::new();
-    direct.payload = json!({"nested":{"password":"fixture-payload"}});
+    direct.payload = json!({"nested":{"password": format!("sk-{}", "x".repeat(40))}});
     assert_eq!(b.store.insert(&direct).await.unwrap_err(),
         "credentials are not accepted in approval payloads");
     assert!(b.get(&direct.id).await.unwrap().is_none());
     assert!(b.store.replace_text(&id, "safe", &direct.payload).await.is_err());
     assert_eq!(b.get(&id).await.unwrap().unwrap().payload, rec.payload);
+}
+
+#[tokio::test]
+async fn structural_payload_fields_and_context_only_values_keep_exact_authority() {
+    let b = broker();
+    let payload = json!({"token":"authority-revision", "secret":"marker",
+        "nested":{"password":"not-a-provider-key"}, "note":"token: workflow-revision"});
+    let id = b.request("alice", "send", "password: display-secret", payload.clone(), 300)
+        .await.unwrap();
+    let rec = b.get(&id).await.unwrap().unwrap();
+    assert_eq!(rec.payload, payload);
+    assert!(!rec.summary.contains("display-secret"));
 }

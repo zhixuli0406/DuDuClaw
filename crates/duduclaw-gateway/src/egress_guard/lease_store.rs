@@ -6,7 +6,24 @@ use super::{MAX_SINK_LEASES, MAX_TOTAL_SINK_LEASES};
 pub(super) struct Store {
     pub(super) conn: Connection,
     // Drop the connection before releasing exclusive ledger ownership.
-    _owner: std::fs::File,
+    _owner: OwnerLock,
+}
+
+struct OwnerLock {
+    file: std::fs::File,
+    pid: u32,
+}
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this descriptor until exec even with
+        // CLOEXEC. Closing only our copy would then leave an abandoned owner
+        // lock behind. Store drops its connection before reaching this guard.
+        // A forked child must never unlock its parent's still-active owner.
+        if self.pid == std::process::id() {
+            let _ = fs2::FileExt::unlock(&self.file);
+        }
+    }
 }
 
 pub(super) struct Row {
@@ -119,7 +136,7 @@ impl Store {
     }
 }
 
-fn owner_lock(path: &Path) -> Result<std::fs::File, String> {
+fn owner_lock(path: &Path) -> Result<OwnerLock, String> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file() || meta.file_type().is_symlink()) {
         return Err("egress lease lock is not a regular file".into());
     }
@@ -141,7 +158,7 @@ fn owner_lock(path: &Path) -> Result<std::fs::File, String> {
     }
     fs2::FileExt::try_lock_exclusive(&file).map_err(|e| format!("egress lease owner unavailable: {e}"))?;
     // Never unlink this file: another owner must lock the same inode.
-    Ok(file)
+    Ok(OwnerLock { file, pid: std::process::id() })
 }
 
 pub(super) fn private_files(path: &Path) -> Result<(), String> {
@@ -180,6 +197,53 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn egress_owner_drop_releases_lock_while_fork_child_keeps_descriptor() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Store::open(home.path()).unwrap();
+        store.insert("bot", "T", "lease", chrono::Utc::now().timestamp_millis()).unwrap();
+        assert!(Store::open(home.path()).is_err(), "a live owner must stay exclusive");
+        let mut pipe = [-1; 2];
+        // SAFETY: pipe receives two descriptors owned by this test.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: take ownership once; the child below only uses raw libc calls.
+        let reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut writer = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+        // The child models the fork-to-exec window of an unrelated CLI spawn.
+        // It keeps the inherited owner descriptor open without using SQLite.
+        // SAFETY: the child calls only async-signal-safe functions before _exit.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                libc::close(pipe[1]);
+                libc::alarm(10);
+                let mut signal = 0u8;
+                libc::read(pipe[0], std::ptr::addr_of_mut!(signal).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        assert!(pid > 0, "fork failed");
+        drop(reader);
+        drop(store);
+        let reopened = Store::open(home.path());
+        // Reap the child before asserting the result, including on regression.
+        let signalled = writer.write_all(&[1]);
+        drop(writer);
+        let mut status = 0;
+        // SAFETY: wait for the child created by this test.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        signalled.unwrap();
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        let mut reopened = reopened.expect("dropping the owner must release its lock before child exec");
+        let rows = reopened.restore().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "lease");
+    }
 
     #[test]
     fn egress_lease_files_are_private_under_non_utf8_home() {

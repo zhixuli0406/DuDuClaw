@@ -72,7 +72,8 @@ pub fn mask_text(text: &str, engine: Option<&RuleEngine>) -> String {
         None => step1,
     };
     let step3 = mask_secret_words(&step2);
-    let credentials_masked = duduclaw_security::credential_detect::mask(&step3);
+    let credentials_masked = duduclaw_security::credential_detect::mask(&step3)
+        .replace("[已遮罩的密碼]", SECRET_PLACEHOLDER);
     clean_text(&credentials_masked)
 }
 

@@ -214,7 +214,9 @@ async fn sqlite_full_rolls_back_whole_envelope() {
             .unwrap();
     }
     let mut large = event("large", "chat");
-    large.payload = "x".repeat(1024 * 1024);
+    // A valid envelope whose individual values remain below the masking cap
+    // still exercises SQLite exhaustion after credential sanitization.
+    large.payload = serde_json::json!({"extra": vec!["x".repeat(32 * 1024); 32]}).to_string();
     assert!(s.append(&[event("a", "chat"), large], 10).await.is_err());
     assert!(s.list().await.unwrap().is_empty());
 }

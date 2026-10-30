@@ -217,15 +217,22 @@ async fn fatal_team_refusal_parks_only_that_goal_and_is_not_audited_again() {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].target, "bob");
         assert!(pending[0].payload.contains("task_id=healthy"));
-        let audit = || std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
+        // Invalid TOML is refused by the budget preflight before team parsing.
+        // Valid TOML with invalid team fields still reaches the team gate.
+        let (audit_file, event) = if body.contains("broken = [") {
+            ("budget_events.jsonl", "budget_unavailable")
+        } else {
+            ("security_audit.jsonl", "team_refused")
+        };
+        let audit = || std::fs::read_to_string(dir.path().join(audit_file)).unwrap();
         let first = audit();
-        assert_eq!(first.lines().filter(|line| line.contains("team_refused")).count(), 1);
+        assert_eq!(first.lines().filter(|line| line.contains(event)).count(), 1);
         assert!(!first.contains(&dir.path().display().to_string()));
         assert!(!first.contains("broken"));
 
         d.tick_once().await.unwrap();
 
-        assert_eq!(audit().lines().filter(|line| line.contains("team_refused")).count(), 1);
+        assert_eq!(audit().lines().filter(|line| line.contains(event)).count(), 1);
         assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
         assert_eq!(store.get_task("bad").await.unwrap().unwrap().status, "needs_human");
     }

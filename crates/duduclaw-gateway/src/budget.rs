@@ -186,11 +186,20 @@ async fn spent_cents(tel: &CostTelemetry, agent_id: &str, hours: u64) -> Result<
     tel.budget_spent_millicents(agent_id, hours).await.map(|cost| cost / 1000)
 }
 
-/// A supplied directory must have a readable, valid effective configuration.
-/// Only an absent budget section is an absent budget.
+/// Missing agent directories and configurations have no configured budget.
+/// Existing unreadable or malformed configurations remain unavailable.
 fn read_budget_config(agent_dir: Option<&Path>) -> Result<duduclaw_core::agent_toml::AgentTomlSections, String> {
     let Some(dir) = agent_dir else { return Ok(Default::default()); };
-    let metadata = std::fs::metadata(dir).map_err(|e| format!("agent directory: {e}"))?;
+    let metadata = match std::fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(dir) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+                _ => Err(format!("agent directory: {e}")),
+            };
+        },
+        Err(e) => return Err(format!("agent directory: {e}")),
+    };
     if !metadata.is_dir() { return Err("agent directory is not a directory".into()); }
     match duduclaw_core::agent_toml::read_effective_text(dir) {
         Ok(text) => {
@@ -200,6 +209,12 @@ fn read_budget_config(agent_dir: Option<&Path>) -> Result<duduclaw_core::agent_t
                 return Err("agent budget section is not a table".into());
             }
             toml::from_str(&text).map_err(|_| "agent budget configuration is malformed".to_string())
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(dir.join("agent.toml")) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+                _ => Err(format!("agent budget configuration: {e}")),
+            }
         },
         Err(e) => Err(format!("agent budget configuration: {e}")),
     }
@@ -284,6 +299,7 @@ fn finish_budget_gate(
 }
 
 fn append_unavailable_event(home: &Path, agent_id: &str, lane: &str, reason: &str, denied: bool) {
+    if !home.is_absolute() { return; }
     let path = home.join("budget_events.jsonl");
     let line = serde_json::json!({"ts": chrono::Utc::now().to_rfc3339(),
         "agent_id": agent_id, "event": "budget_unavailable", "lane": lane,
@@ -510,6 +526,7 @@ async fn notify_breaker_transition(
 /// for any read/write failure (fail-open: an unwritable state file must
 /// never crash the gate, worst case is a missed or duplicated push).
 fn record_breaker_transition(home_dir: &Path, agent_id: &str, new_state: &'static str) -> bool {
+    if !home_dir.is_absolute() { return false; }
     let path = breaker_state_path(home_dir);
     duduclaw_core::with_file_lock(&path, || {
         let mut states = read_breaker_states(&path);
@@ -571,6 +588,7 @@ fn append_budget_event(
     spent_cents: u64,
     cap_cents: u64,
 ) {
+    if !home_dir.is_absolute() { return; }
     let line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "agent_id": agent_id,
@@ -631,27 +649,59 @@ mod tests {
         assert!(matches!(check_agent_budget(dir.path(), Some(dir.path()), "a").await,
             BudgetVerdict::Unavailable { .. }));
         assert!(matches!(check_agent_budget(dir.path(), Some(&dir.path().join("missing")), "a").await,
-            BudgetVerdict::Unavailable { .. }));
+            BudgetVerdict::Allow));
         let file = budget_dir("");
         std::fs::remove_file(file.path().join("agent.toml")).unwrap();
         std::fs::create_dir(file.path().join("agent.toml")).unwrap();
         assert!(validate_budget_config(Some(file.path())).is_err());
-        assert!(validate_budget_config(Some(tempdir().unwrap().path())).is_err());
+        assert!(validate_budget_config(Some(tempdir().unwrap().path())).is_ok());
     }
 
     #[tokio::test]
-    async fn budget_missing_file_and_malformed_section_refuse_before_accounting() {
+    async fn budget_malformed_section_refuses_before_accounting() {
         let home = tempdir().unwrap();
-        for body in [None, Some("budget = 42"), Some("not valid [[[" )] {
+        for body in ["budget = 42", "not valid [[["] {
             let dir = tempdir().unwrap();
-            if let Some(body) = body {
-                std::fs::write(dir.path().join("agent.toml"), body).unwrap();
-            }
+            std::fs::write(dir.path().join("agent.toml"), body).unwrap();
             assert!(matches!(check_agent_budget(home.path(), Some(dir.path()), "a").await,
                 BudgetVerdict::Unavailable { .. }));
             assert!(gate_before_spawn(home.path(), Some(dir.path()), "a", "test").await.is_err());
             assert!(gate_before_spawn(home.path(), Some(dir.path()), "", "test").await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn budget_missing_configuration_allows_before_accounting() {
+        let home = tempdir().unwrap();
+        for dir in [home.path().to_path_buf(), home.path().join("missing")] {
+            assert_eq!(check_agent_budget(home.path(), Some(&dir), "a").await, BudgetVerdict::Allow);
+            assert!(gate_before_spawn(home.path(), Some(&dir), "a", "test").await.is_ok());
+        }
+        assert!(!home.path().join("budget_events.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn budget_dangling_configuration_is_unavailable() {
+        let home = tempdir().unwrap();
+        let absent = home.path().join("absent");
+        std::os::unix::fs::symlink(&absent, home.path().join("agent.toml")).unwrap();
+        assert!(gate_before_spawn(home.path(), Some(home.path()), "a", "test").await.is_err());
+        let linked_dir = home.path().join("linked-agent");
+        std::os::unix::fs::symlink(&absent, &linked_dir).unwrap();
+        assert!(gate_before_spawn(home.path(), Some(&linked_dir), "a", "test").await.is_err());
+    }
+
+    #[test]
+    fn budget_relative_home_does_not_write_audit() {
+        let relative = std::path::PathBuf::from(format!("budget-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&relative).unwrap();
+        append_unavailable_event(&relative, "a", "test", "unavailable", true);
+        append_budget_event(&relative, "a", "daily", 2, 1);
+        assert!(!record_breaker_transition(&relative, "a", "open"));
+        let entries = std::fs::read_dir(&relative).unwrap().count();
+        std::fs::remove_dir(&relative).unwrap();
+        assert_eq!(entries, 0);
     }
 
     #[test]

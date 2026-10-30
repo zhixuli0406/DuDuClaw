@@ -209,17 +209,21 @@ async fn wake_facts_mask_nested_data_and_reasons() {
     let row = resp_row("credential-facts");
     let wakeup = time_wakeup(&row.responsibility_id, "2026-10-05T01:00:00Z");
     store.insert_responsibility(&row, &[wakeup.clone()], None).await.unwrap();
-    let fire = crate::task_store::NewFire {
+    let mut fire = crate::task_store::NewFire {
         wakeup_id: wakeup.wakeup_id, fire_key: "fixture-fact".into(),
         reason: "password: fixture-reason".into(),
         data_json: Some(r#"{"nested":{"password":"fixture-data"}}"#.into()),
         guard_flags_json: Some(r#"{"note":"token: fixture-flags"}"#.into()),
         dropped: Some("password: fixture-drop".into()),
     };
+    // The event reason is a closed enum, not a free-text masking sink.
+    assert!(store.record_fire(&fire, None, chrono::Utc::now()).await.is_err());
+    assert!(store.list_fires(&row.responsibility_id, 10).await.unwrap().is_empty());
+    fire.reason = "time".into();
     assert!(store.record_fire(&fire, None, chrono::Utc::now()).await.unwrap());
     let facts = store.list_fires(&row.responsibility_id, 10).await.unwrap();
     let stored = &facts[0];
-    assert!(!stored.reason.contains("fixture-reason"));
+    assert_eq!(stored.reason, "time");
     assert!(!stored.data_json.as_deref().unwrap().contains("fixture-data"));
     assert!(!stored.guard_flags_json.as_deref().unwrap().contains("fixture-flags"));
     assert!(!stored.drop_reason.as_deref().unwrap().contains("fixture-drop"));

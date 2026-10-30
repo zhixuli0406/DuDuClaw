@@ -35,9 +35,17 @@ fn normalize_time(cell: &mut Cell) -> ExportResult<()> {
     Ok(())
 }
 pub(super) fn push(table: &mut Table, mut row: LogicalRow, bytes: &mut usize) -> ExportResult<()> {
+    // Bound the unmasked input before using the complete-document scanner.
+    let raw_bytes = row.cells.iter().fold(row.id.len(), |total, cell| {
+        total.saturating_add(match cell { Cell::Text(text) => text.len(), Cell::Number(_) => 8 })
+    });
+    if bytes.saturating_add(raw_bytes) as u64 > MAX_BYTES {
+        return Err("EXPORT_TOO_LARGE".into());
+    }
     for cell in &mut row.cells {
         if let Cell::Text(text) = cell {
-            *text = duduclaw_security::credential_detect::mask(text);
+            *text = duduclaw_security::credential_detect::mask_document(text)
+                .map_err(|_| "EXPORT_ENCODE".to_string())?;
         }
     }
     *bytes += row.id.len()

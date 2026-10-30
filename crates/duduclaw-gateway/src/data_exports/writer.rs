@@ -57,8 +57,15 @@ pub fn physical_rows(row: &LogicalRow) -> Vec<PhysicalRow> {
         .map(|cell| match cell {
             // Mask the complete cell before splitting, so a credential spanning
             // two physical rows cannot evade detection at the output boundary.
-            Cell::Text(s) => chunks(&duduclaw_security::credential_detect::mask(s))
-                .into_iter().map(Cell::Text).collect(),
+            Cell::Text(s) => {
+                let masked = if s.len() as u64 <= MAX_BYTES {
+                    duduclaw_security::credential_detect::mask_document(s)
+                        .unwrap_or_else(|_| duduclaw_security::credential_detect::UNAVAILABLE_MASK.into())
+                } else {
+                    duduclaw_security::credential_detect::UNAVAILABLE_MASK.into()
+                };
+                chunks(&masked).into_iter().map(Cell::Text).collect()
+            },
             Cell::Number(n) => vec![Cell::Number(*n)],
         })
         .collect();
@@ -140,6 +147,10 @@ pub fn encode(
                 .map_err(|_| "EXPORT_IO".to_string())?;
             for row in rows {
                 checkpoint()?;
+                let input_bytes = row.cells.iter().fold(row.id.len(), |total, cell| {
+                    total.saturating_add(match cell { Cell::Text(text) => text.len(), Cell::Number(_) => 8 })
+                });
+                if input_bytes as u64 > MAX_BYTES { return Err("EXPORT_TOO_LARGE".into()); }
                 for part in physical_rows(row) {
                     let mut cells = vec![part.id, part.index.to_string(), part.count.to_string()];
                     cells.extend(part.cells.iter().map(|c| match c {
@@ -171,6 +182,10 @@ pub fn encode(
             }
             for row in rows {
                 checkpoint()?;
+                let input_bytes = row.cells.iter().fold(row.id.len(), |total, cell| {
+                    total.saturating_add(match cell { Cell::Text(text) => text.len(), Cell::Number(_) => 8 })
+                });
+                if input_bytes as u64 > MAX_BYTES { return Err("EXPORT_TOO_LARGE".into()); }
                 for part in physical_rows(row) {
                     if physical_count >= 1_048_575 {
                         return Err("EXPORT_TOO_LARGE".into());

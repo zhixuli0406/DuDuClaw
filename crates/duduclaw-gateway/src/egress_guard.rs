@@ -1364,6 +1364,15 @@ mod tests {
         assert_eq!(ledger.sink_count, 0);
     }
 
+    fn assert_unknown_turn(ledger: &mut Ledger, key: &Key, now: Instant) {
+        let actual = ledger.query(key, now);
+        let expected = Taint {
+            turn_started_at: ledger.turns.get(key).map(|turn| turn.started_at.clone()),
+            ..Taint::unknown()
+        };
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn egress_full_turn_ledger_preserves_fences_without_refusing_other_sinks() {
         let home = policy_home("ask");
@@ -1384,7 +1393,7 @@ mod tests {
         let overflow = ("bot".into(), "overflow".into());
         ledger.register(overflow.clone(), now);
         assert!(!ledger.turns.contains_key(&overflow));
-        assert_eq!(ledger.query(&overflow, now), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now);
         for sink_key in [&key, &overflow, &("bot".into(), "".into())] {
             assert!(ledger.acquire_sink(sink_key, "new-sink", None, now).is_ok());
             ledger.release_sink(sink_key, "new-sink", now);
@@ -1394,7 +1403,7 @@ mod tests {
         // If capacity returns, retrying the failed registration is still tainted.
         ledger.turns.remove(&("filler".into(), "1".into()));
         ledger.register(overflow.clone(), now);
-        assert_eq!(ledger.query(&overflow, now), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now);
         ledger.release_sink(&key, "sink", now);
         assert_eq!(ledger.sink_count, 0);
     }
@@ -1439,9 +1448,9 @@ mod tests {
         ledger.register(early.clone(), now);
         ledger.turns.remove(&early); // Simulate clean-turn capacity eviction.
         for at in [now, now + TTL * 2, now + TTL * 10] {
-            assert_eq!(ledger.query(&early, at), Taint::unknown());
+            assert_unknown_turn(&mut ledger, &early, at);
             ledger.register(early.clone(), at);
-            assert_eq!(ledger.query(&early, at), Taint::unknown());
+            assert_unknown_turn(&mut ledger, &early, at);
             ledger.turns.remove(&early);
         }
         let other = ("bob".into(), "early".into());
@@ -1459,7 +1468,7 @@ mod tests {
         ledger.seen.get_mut("alice").unwrap().fill(u64::MAX);
         let registered = now + TTL - Duration::from_secs(1);
         ledger.register(key.clone(), registered);
-        assert_eq!(ledger.query(&key, registered), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, registered);
         ledger.mark(&key, "memory_search", registered);
         ledger.register(key.clone(), now + TTL);
         assert_eq!(
@@ -1470,9 +1479,9 @@ mod tests {
         ledger.register(other.clone(), now + TTL);
         assert!(!ledger.query(&other, now + TTL).tainted);
         // Expiring and re-registering the entry still fails closed.
-        assert_eq!(ledger.query(&key, now + TTL * 3), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL * 3);
         ledger.register(key.clone(), now + TTL * 3);
-        assert_eq!(ledger.query(&key, now + TTL * 3), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL * 3);
     }
 
     #[test]
@@ -1484,9 +1493,9 @@ mod tests {
         }
         let overflow = ("overflow".into(), "T".into());
         ledger.register(overflow.clone(), now);
-        assert_eq!(ledger.query(&overflow, now), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now);
         ledger.register(overflow.clone(), now + TTL * 10);
-        assert_eq!(ledger.query(&overflow, now + TTL * 10), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now + TTL * 10);
         assert_eq!(ledger.seen.len(), MAX_REGISTRATION_AGENTS);
         let known = ("agent-0".into(), "fresh".into());
         ledger.register(known.clone(), now + TTL * 10);
@@ -1513,9 +1522,9 @@ mod tests {
             ledger.query(&("bob".into(), "turn-a".into()), now),
             Taint::unknown()
         );
-        assert_eq!(ledger.query(&key, now + TTL), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL);
         ledger.register(key.clone(), now + TTL);
-        assert_eq!(ledger.query(&key, now + TTL), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL);
     }
 
     #[test]
@@ -1908,8 +1917,12 @@ mod tests {
         let token = duduclaw_core::mint_identity_token(&identity, agent);
         let _turn = crate::turn_context::register(agent, "live", "line:source#agent:recipient-route-bot").unwrap();
         let _requester = crate::knowledge::turn_requesters::register(agent, "live",
-            RequesterIdentity::ChannelUser {channel:"line".into(),chat:"source".into(),sender:"person".into(),user_id:None}).unwrap();
-        for (turn, forged_source, expected) in [("live", false, Some("line:source")), ("unknown", false, None), ("", false, None), ("live", true, None)] {
+            RequesterIdentity::ChannelUser {channel:"line".into(),chat:"source".into(),sender:"person".into(),user_id:Some("verified-person".into())}).unwrap();
+        let _guest_turn = crate::turn_context::register(agent, "guest", "line:guest").unwrap();
+        let _guest = crate::knowledge::turn_requesters::register(agent, "guest",
+            RequesterIdentity::ChannelUser { channel: "line".into(), chat: "guest".into(),
+                sender: "guest".into(), user_id: None }).unwrap();
+        for (turn, forged_source, expected) in [("live", false, Some("line:source")), ("guest", false, None), ("unknown", false, None), ("", false, None), ("live", true, None)] {
             let mut request = serde_json::json!({"op":"recipients", "turn_id":turn});
             if forged_source { request["source"] = serde_json::json!("line:forged"); }
             let body = serde_json::to_vec(&request).unwrap();

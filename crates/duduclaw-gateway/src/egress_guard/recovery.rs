@@ -91,7 +91,7 @@ pub fn clear(home: &Path, lease: Option<&str>, confirm: &str) -> Result<ClearRes
     let (busy, _, _): (i64, i64, i64) = store.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(|e| e.to_string())?;
     if busy != 0 { return Err("cannot checkpoint egress lease backup".into()); }
-    let backup = home.join(format!("egress_leases.backup-{}-{}.db", chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"), uuid::Uuid::new_v4()));
+    let backup = std::fs::canonicalize(home).map_err(|e| e.to_string())?.join(format!("egress_leases.backup-{}-{}.db", chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"), uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -149,6 +149,7 @@ pub fn health(home: &Path) -> Result<(usize, Option<i64>), String> {
             }
         }
     }
+    let path = std::fs::canonicalize(home).map_err(|e| e.to_string())?.join("egress_leases.db");
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(|e| e.to_string())?;
     let (count, oldest): (usize, Option<i64>) = conn.query_row("SELECT COUNT(*), MIN(acquired_at) FROM sink_leases", [], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?;
     Ok((count, oldest.map(|at| chrono::Utc::now().timestamp_millis().saturating_sub(at).max(0) / 1000)))
@@ -183,7 +184,10 @@ mod tests {
         assert!(clear(home.path(), None, &first.confirm).unwrap_err().contains("stale"));
         assert_eq!(list(home.path()).unwrap().leases.len(), 2);
         let backups: Vec<_> = std::fs::read_dir(home.path()).unwrap().map(|entry| entry.unwrap().path())
-            .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("egress_leases.backup-")).collect();
+            // Read-only validation of a WAL database may create -wal/-shm files.
+            // Count backup databases, not their SQLite sidecars.
+            .filter(|path| path.extension().is_some_and(|ext| ext == "db")
+                && path.file_name().unwrap().to_string_lossy().starts_with("egress_leases.backup-")).collect();
         assert_eq!(backups.len(), 1);
         let backup = Connection::open(&backups[0]).unwrap();
         assert_eq!(rows(&backup).unwrap().leases.len(), 2);

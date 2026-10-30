@@ -551,8 +551,9 @@ async fn imported_password_is_masked_in_preview_report_plan_archive_and_disk() {
     let user_hash = crate::expert::registry::sha256_hex(masked.as_bytes());
     assert!(effects["agents"][0]["files"].as_array().unwrap().iter()
         .any(|file| file["path"] == "agents/masked/USER.md" && file["sha256"] == user_hash));
-    crate::expert::install::cmd_install_with(home.path(), file.to_str().unwrap(), opts(true, Some(preview_path.clone()))).await.unwrap();
-    assert_eq!(first["details"], report_json(&preview_path)["details"]);
+    let second_preview_path = reports.path().join("preview-again.json");
+    crate::expert::install::cmd_install_with(home.path(), file.to_str().unwrap(), opts(true, Some(second_preview_path.clone()))).await.unwrap();
+    assert_eq!(first["details"], report_json(&second_preview_path)["details"]);
     let mut install_opts = opts(false, Some(reports.path().join("installed.json")));
     install_opts.confirm_profile = Some(token.to_string());
     crate::expert::install::cmd_install_with(home.path(), file.to_str().unwrap(), install_opts).await.unwrap();
