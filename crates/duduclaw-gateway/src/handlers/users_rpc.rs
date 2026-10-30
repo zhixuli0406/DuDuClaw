@@ -310,6 +310,13 @@ impl MethodHandler {
         if reg.get(agent_name).is_none() {
             return WsFrame::error_response("", &format!("agent not found: {agent_name}"));
         }
+        if reg.get(agent_name).is_some_and(crate::machine_employee::requires_admin)
+            && !crate::on_behalf_of::access::system_operation_permitted(
+                &self.home_dir, Some(&format!("user:{user_id}")),
+            )
+        {
+            return WsFrame::error_response("", crate::machine_employee::REFUSAL);
+        }
         drop(reg);
 
         let was_owner = match db.check_agent_access(user_id, agent_name) {

@@ -224,6 +224,20 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
     };
+    if let Some(a) = agent {
+        let principal = crate::on_behalf_of::current();
+        // A failed requester lookup must not look like unattended work.
+        let unknown = matches!(
+            crate::knowledge::turn_requesters::current_requester(),
+            duduclaw_knowledge::requester::RequesterIdentity::Unknown
+        );
+        if let Err(refusal) = crate::machine_employee::check_loaded(
+            &ctx.home_dir, a,
+            if unknown && principal.is_none() { Some("unknown:requester") } else { principal.as_deref() },
+        ) {
+            return refusal;
+        }
+    }
     // A called employee answers in its own session bucket of this
     // conversation (history, redaction vault, pending goal state); the
     // access gate and takeover above ran on the conversation itself.

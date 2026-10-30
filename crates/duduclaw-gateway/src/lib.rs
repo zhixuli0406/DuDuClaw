@@ -260,6 +260,7 @@ pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
 pub mod on_behalf_of;
+pub(crate) mod machine_employee;
 pub mod wiki_host_sources;
 // G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +
 // background poller → autopilot bus. Both transports default OFF.

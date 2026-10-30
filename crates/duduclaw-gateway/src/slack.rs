@@ -1369,10 +1369,10 @@ async fn handle_interactive_envelope(
         }
     }
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` above (see
-    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
-    // it needs no pressing-user identity, only the single-use nonce.
+    // Goal-intent confirmation buttons (P1) use a separate codec from
+    // `decision_action` above. Ordinary employees keep
+    // nonce-based confirmation; machine employees also require the pressing
+    // sender's verified Admin account.
     // `handle_interactive_envelope` already runs detached (see the caller's
     // own comment: "an AI reply can take minutes… blocking here would delay
     // acks for subsequent envelopes"), so awaiting `handle_gintent_button`'s
@@ -1380,7 +1380,8 @@ async fn handle_interactive_envelope(
     // ephemeral) so the result — a created goal task, or a generated plan —
     // is visible the same way a plain-text `1`/`2`/`3` reply would have been.
     if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(action_data) {
-        let outcome = crate::goal_intent::handle_gintent_button(ctx, choice, &nonce).await;
+        let sender = payload["user"]["id"].as_str().unwrap_or("");
+        let outcome = crate::goal_intent::handle_gintent_button_for_sender(ctx, choice, &nonce, "slack", sender).await;
         respond_via_response_url(http, response_url, "in_channel", &outcome).await;
         return;
     }

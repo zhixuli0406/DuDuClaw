@@ -1319,11 +1319,10 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
         }
     }
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` above (see
-    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
-    // it needs no pressing-user identity, only the single-use nonce. This
-    // whole webhook handler already runs in a `tokio::spawn`ed detached task
+    // Goal-intent confirmation buttons (P1) use a separate codec from
+    // `decision_action` above. Ordinary employees keep
+    // nonce-based confirmation; machine employees require verified Admin.
+    // This whole webhook handler already runs in a detached task
     // (see the caller: "LINE times out a slow webhook response… blocking the
     // 200 on a multi-second model reply gets the handler future… cancelled"),
     // so awaiting `handle_gintent_button`'s possible plan-first LLM call here
@@ -1331,7 +1330,7 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
     if sender != "unknown" {
         if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(data) {
             let outcome =
-                crate::goal_intent::handle_gintent_button(&state.ctx, choice, &nonce).await;
+                crate::goal_intent::handle_gintent_button_for_sender(&state.ctx, choice, &nonce, "line", sender).await;
             let messages = vec![serde_json::json!({ "type": "text", "text": outcome })];
             let _ = send_reply_rich(&state.http, token, reply_token, messages.clone()).await;
             return;

@@ -1090,7 +1090,7 @@ fn commit_daily_cap(agent_id: &str) {
 // Button confirmation (P1) — `gintent:<choice>:<nonce>` wire format
 // ═══════════════════════════════════════════════════════════════════════
 //
-// A separate, deliberately UN-authorized codec from `decision_action`'s
+// A separate codec from `decision_action`'s
 // unified `duduclaw:decide:<source>:<verb>:<id>` family. That family gates
 // every action through `decision_notify::authorize_press` (Admin/Manager
 // dashboard role, or — for a solo operator with no linked identity — an
@@ -1099,11 +1099,10 @@ fn commit_daily_cap(agent_id: &str) {
 // rule, a goal loop stopped dead needing a human). A goal-intent suggestion
 // is not that kind of decision — it is a low-stakes clarification anyone in
 // the conversation may answer, and the TEXT path (`intercept_pending_
-// confirmation`, below) already applies zero authorization beyond
-// `is_system_sender`. Button and text paths must agree on that, so this
-// codec carries no authorization of its own either: the nonce itself IS the
-// authorization boundary (see `PendingSuggest::nonce`) — single-use, and
-// only reachable by whoever saw this turn's reply.
+// confirmation`, below) keeps that behavior for ordinary employees. The
+// codec itself carries only a single-use nonce (`PendingSuggest::nonce`).
+// Both text and button settlement separately require the live Admin account
+// for a machine employee, using the verified adapter's pressing sender.
 
 /// The three choices a channel button offers — mirrors the text menu's
 /// bare `1`/`2`/`3`.
@@ -1178,6 +1177,11 @@ async fn settle_pending(
     pending: &PendingSuggest,
     choice: GIntentChoice,
 ) -> String {
+    if choice != GIntentChoice::DismissChat {
+        if let Err(refusal) = crate::machine_employee::check_chat_goal(ctx, &pending.agent_id, session_id).await {
+            return refusal;
+        }
+    }
     match choice {
         GIntentChoice::AcceptGoal => accept_as_goal(ctx, session_id, pending).await,
         GIntentChoice::PlanFirst => accept_as_plan_first(ctx, session_id, pending).await,
@@ -1215,6 +1219,21 @@ pub async fn handle_gintent_button(
         return "⏰ 剛剛那個目標建議已經逾時作廢了，若還想立案請重新描述一次。".to_string();
     }
     settle_pending(ctx, &session_id, &pending, choice).await
+}
+
+/// Verified adapters supply the pressing sender so a machine employee's
+/// goal confirmation uses that person's live account, never nonce authority.
+pub async fn handle_gintent_button_for_sender(
+    ctx: &ReplyContext,
+    choice: GIntentChoice,
+    nonce: &str,
+    channel: &str,
+    sender: &str,
+) -> String {
+    let access = crate::trigger_route::access::for_channel_sender(&ctx.home_dir, channel, sender);
+    let principal = crate::trigger_route::assign::principal_of(&access)
+        .map(|who| (who, channel.to_string()));
+    crate::chat_commands::with_goal_principal(principal, Box::pin(handle_gintent_button(ctx, choice, nonce))).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1267,7 +1286,8 @@ pub async fn intercept_pending_confirmation(
 
     // A confirmed suggestion records the person it was created for, like a
     // typed `/goal` (the sender's verified dashboard account, if any).
-    let principal = crate::chat_commands::channel_principal(&ctx.home_dir, session_id, user_id);
+    let principal = crate::chat_commands::channel_principal(&ctx.home_dir, session_id, user_id)
+        .or_else(|| crate::chat_commands::goal_principal_for_session(session_id));
     Some(
         crate::chat_commands::with_goal_principal(
             principal,
@@ -1376,7 +1396,7 @@ fn build_plan_first_task(
     if !chat_id.is_empty() {
         task.source_chat_id = Some(chat_id);
     }
-    if let Some((who, via)) = crate::chat_commands::current_goal_principal() {
+    if let Some((who, via)) = crate::chat_commands::goal_principal_for_session(session_id) {
         task.on_behalf_of = Some(who);
         task.created_via = Some(via);
     }
@@ -2231,6 +2251,71 @@ mod tests {
     }
 
     // ── P1: button-path settle (`handle_gintent_button`) ────────────────
+
+    #[tokio::test]
+    async fn machine_goal_buttons_require_the_pressing_person_to_be_a_live_admin() {
+        use duduclaw_auth::{UserDb, UserRole};
+        let dir = tempfile::tempdir().unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
+        // An unresolved server binding must stay restricted too.
+        std::fs::write(dir.path().join("preset_bindings.toml"),
+            "schema = 1\n[agents.operator]\npreset_id = 'system-operator'\nversion = '1.0.0'\n").unwrap();
+        let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+        let admin = db.create_user("button-admin@test.invalid", "Admin", "Test-password-123!", UserRole::Admin).unwrap();
+        let employee = db.create_user("button-employee@test.invalid", "Employee", "Test-password-123!", UserRole::Employee).unwrap();
+        db.bind_channel_identity(&admin.id, "telegram", "123", true).unwrap();
+        db.bind_channel_identity(&employee.id, "telegram", "456", true).unwrap();
+        let ctx = test_ctx(dir.path());
+        let session = format!("telegram:machine-buttons-{}", uuid::Uuid::new_v4());
+        for sender in ["456", "unmapped"] {
+            for choice in [GIntentChoice::AcceptGoal, GIntentChoice::PlanFirst] {
+                store_pending(&session, "operator", "run Bash", 10);
+                let nonce = pending_store().lock().unwrap().get(&session).unwrap().nonce.clone();
+                let reply = handle_gintent_button_for_sender(&ctx, choice, &nonce, "telegram", sender).await;
+                assert_eq!(reply, crate::machine_employee::REFUSAL);
+            }
+        }
+        let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+        assert!(store.list_tasks_filtered(None, Some("operator"), None, None).await.unwrap().is_empty());
+        store_pending(&session, "operator", "Admin goal", 10);
+        let nonce = pending_store().lock().unwrap().get(&session).unwrap().nonce.clone();
+        let reply = handle_gintent_button_for_sender(&ctx, GIntentChoice::AcceptGoal, &nonce, "telegram", "123").await;
+        assert_ne!(reply, crate::machine_employee::REFUSAL);
+        let tasks = store.list_tasks_filtered(None, Some("operator"), None, None).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].on_behalf_of.as_deref(), Some(format!("user:{}", admin.id).as_str()));
+
+        // WebChat carries its dashboard identity in the host scope and has
+        // no channel_identities row. Authorization and storage must agree.
+        let web_session = format!("webchat:machine-text-{}", uuid::Uuid::new_v4());
+        let admin_wire = format!("user:{}", admin.id);
+        store_pending(&web_session, "operator", "WebChat Admin goal", 10);
+        let reply = crate::on_behalf_of::scope_first(Some(admin_wire.clone()),
+            intercept_pending_confirmation(&ctx, &web_session, &admin.id, "1"),
+        ).await.unwrap();
+        assert_ne!(reply, crate::machine_employee::REFUSAL);
+        let tasks = store.list_tasks_filtered(None, Some("operator"), None, None).await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        let web_task = tasks.iter().find(|task| task.description == "WebChat Admin goal").unwrap();
+        assert_eq!(web_task.on_behalf_of.as_deref(), Some(admin_wire.as_str()));
+        assert_eq!(web_task.created_via.as_deref(), Some("webchat"));
+
+        store_pending(&web_session, "operator", "WebChat plan", 10);
+        let pending = take_pending(&web_session).unwrap();
+        let planned = crate::on_behalf_of::scope_first(Some(admin_wire.clone()), async {
+            build_plan_first_task(dir.path(), &web_session, &pending, Ok("plan".into()))
+        }).await;
+        assert_eq!(planned.on_behalf_of.as_deref(), Some(admin_wire.as_str()));
+        assert_eq!(planned.created_via.as_deref(), Some("webchat"));
+
+        db.update_user(&admin.id, None, Some(UserRole::Employee), None).unwrap();
+        let gate = crate::delegation_gate::gate_bus_dispatch(
+            dir.path(), &ctx.registry, Some("goal-loop-driver"), None, "operator",
+            &web_task.id, "sqlite_queue", web_task.on_behalf_of.as_deref(),
+        ).await;
+        assert!(matches!(gate, crate::delegation_gate::GateOutcome::Deny(_)),
+            "a newly created human goal must not turn into background work after demotion");
+    }
 
     #[tokio::test]
     async fn handle_gintent_button_unknown_nonce_is_honest_not_silent() {

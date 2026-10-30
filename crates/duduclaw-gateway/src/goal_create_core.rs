@@ -192,6 +192,7 @@ async fn create_goal_task_inner(
     req: GoalCreateRequest,
     slot: Option<&crate::task_store::AssignScheduleSlot<'_>>,
 ) -> Result<GoalCreated, String> {
+    crate::machine_employee::check_target(home_dir, &req.agent_id, req.on_behalf_of.as_deref())?;
     let description = req.description.trim();
     if description.is_empty() {
         return Err("description is required".to_string());

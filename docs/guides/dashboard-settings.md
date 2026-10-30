@@ -9,6 +9,10 @@ Goal cost and loop guards currently use the **Advanced config editor**, without 
 
 ## Account roles and visible AI staff
 
+Giving an AI employee Bash or machine tools lets anyone bound to it direct those tools. Review the employee's capabilities before binding people to it; an Admin may still grant native tools to ordinary AI employees.
+
+Employees using the `system-operator` preset are Admin-only. The server checks the resolved preset binding. Non-Admins cannot bind to them, chat with them, create tasks or goals for them, or have work dispatched to them on their behalf; they are excluded from `agents.callable`. Existing bindings stay stored but are refused when used. Admin access, Personal edition and authorized unattended work are unchanged.
+
 Employee accounts see only the AI staff directly bound to them. Managers also see their reports' AI staff in the sidebar, AI staff list, Timeline and Runs, marked as a team member's AI employee. Team entries are read-only: Timeline shows work cards and timing; Runs shows status and timing without conversation text or tool steps. Team access does not open memory, staff settings or persona files. Direct bindings keep their existing access levels, and team grants never exceed Operator. The organization entry counts direct and team staff together.
 
 Under **Manage → Members**, each account lists its directly bound AI staff with the access level and a remove action. When adding a binding, choose an AI employee explicitly; none is selected for you. The default level is Operator, including `users.bind_agent` calls that omit `access_level`. Existing bindings stay as they are; review and remove any grants that should not be there. Removing a binding takes effect on the next RPC or file request, including download and preview links with an older token.

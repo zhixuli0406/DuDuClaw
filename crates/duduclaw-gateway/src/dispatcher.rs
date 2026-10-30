@@ -1403,6 +1403,15 @@ async fn dispatch_to_agent_outcome(
     prompt: &str,
     delegation: &DelegationEnv,
 ) -> Result<String, DispatchError> {
+    {
+        let reg = registry.read().await;
+        let agent = if agent_id == "default" { reg.main_agent() } else { reg.get(agent_id) };
+        if let Some(agent) = agent {
+            crate::machine_employee::check_loaded(
+                home_dir, agent, crate::on_behalf_of::current().as_deref(),
+            ).map_err(DispatchError::Other)?;
+        }
+    }
     let credential_source = &delegation.credential_source;
     let credential_prompt = crate::credential_ledger::process_message(
         home_dir, prompt, &credential_source, &delegation.sender, agent_id, "dispatch",

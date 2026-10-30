@@ -817,6 +817,9 @@ async fn call_claude_for_agent_impl(
         .as_deref()
         .map(|tid| (agent_id, tid, session_owned.as_deref()));
     let default_language = crate::prompt_identity::read_default_language(home_dir).await;
+    crate::machine_employee::check_loaded(
+        home_dir, agent, crate::on_behalf_of::current().as_deref(),
+    )?;
     let system_prompt = build_system_prompt(agent, citation_ref, default_language.as_deref())
         .map_err(|error| format!("Agent profile unavailable: {error}"))?;
     let agent_name = agent.config.agent.name.clone();

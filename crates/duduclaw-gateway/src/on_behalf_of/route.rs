@@ -128,18 +128,16 @@ async fn handle(
     let allowed = match request.operation.right() {
         None => request.target == caller.agent_id
             && super::access::system_operation_permitted(&state.home, principal.as_deref()),
-        Some(right) => match principal.as_deref() {
-            None => true,
-            Some(raw) => match duduclaw_core::HumanPrincipal::parse(raw) {
-                Ok(p) => super::access::principal_permits_with_team(
+        Some(right) => match super::PrincipalState::from_wire(principal.as_deref()) {
+            super::PrincipalState::Background => true,
+            super::PrincipalState::Human(p) => super::access::principal_permits_with_team(
                     &state.home,
                     &p,
                     &request.target,
                     right,
                     state.team_enabled().await,
                 ).unwrap_or(false),
-                Err(_) => false,
-            },
+            super::PrincipalState::Unknown => false,
         },
     };
     if !allowed

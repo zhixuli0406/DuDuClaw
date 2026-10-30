@@ -22,7 +22,7 @@ pub fn effective() -> Option<Brand> {
     effective_for(snapshot.tier, snapshot.subscription_id.as_deref(), &accepted)
 }
 
-fn effective_for(tier: duduclaw_license::LicenseTier, subscription: Option<&str>, accepted: &runtime::Accepted) -> Option<Brand> {
+pub(crate) fn effective_for(tier: duduclaw_license::LicenseTier, subscription: Option<&str>, accepted: &runtime::Accepted) -> Option<Brand> {
     (tier == duduclaw_license::LicenseTier::Oem && subscription == Some(accepted.subscription_id.as_str()))
         .then(|| accepted.brand.clone())
 }

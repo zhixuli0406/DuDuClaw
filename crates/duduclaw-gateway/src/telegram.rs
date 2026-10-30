@@ -1860,10 +1860,10 @@ async fn handle_callback_query(
         }
     }
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` above (see
-    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
-    // it needs no pressing-user identity, only the single-use nonce.
+    // Goal-intent confirmation buttons (P1) use a separate codec from
+    // `decision_action` above. Ordinary employees keep
+    // nonce-based confirmation; machine employees also require the pressing
+    // sender's verified Admin account.
     //
     // The outcome (`accept-as-goal`'s reply especially, and `plan-first`'s
     // narrative plan) can run well past Telegram's short callback-toast
@@ -1878,8 +1878,10 @@ async fn handle_callback_query(
         let ctx = ctx.clone();
         let client = client.clone();
         let api_base = api_base.to_string();
+        let sender = cb.from.as_ref().filter(|user| !user.is_bot)
+            .map(|user| user.id.to_string()).unwrap_or_default();
         tokio::spawn(async move {
-            let outcome = crate::goal_intent::handle_gintent_button(&ctx, choice, &nonce).await;
+            let outcome = crate::goal_intent::handle_gintent_button_for_sender(&ctx, choice, &nonce, "telegram", &sender).await;
             send_reply_markdown(
                 &client,
                 &api_base,

@@ -6,6 +6,16 @@ Enterprise [team-history API](68-manager-team-history.md) (v1.76.0): live report
 
 ---
 
+## Machine access and the person directing it
+
+Giving an AI employee Bash or machine tools lets anyone bound to that employee direct those tools. Bind it only to people who should have that authority. Admin-granted native tools remain available to ordinary AI employees.
+
+An employee using the `system-operator` preset is reserved for Admin accounts. The server identifies it from the resolved preset binding, never a client flag. Non-Admins cannot bind to it, chat with it, create tasks or goals for it, or have work dispatched to it on their behalf; `agents.callable` excludes it. Existing bindings are kept but refused when used. Admin access, Personal edition and authorized unattended work keep their existing behavior.
+
+The person behind a run has three states: Human, Background and Unknown. A stored principal that cannot be parsed is Unknown and cannot authorize machine tools. An absent principal on an old row remains Background, preserving existing cron and autonomous work.
+
+Distributor branding checks license expiry and offline grace whenever the effective brand is read. An expired license or exceeded offline grace shows the original DuDuClaw brand, even if control-plane polls keep failing and the gateway has not restarted.
+
 ## A note on history
 
 Until 2026-09 this page described a three-phase shell-script defense: a deterministic blacklist, an obfuscation/exfiltration scanner, and a Haiku AI judgment layer, all living in `.claude/hooks/` and orchestrated by a GREEN/YELLOW/RED threat-level state machine.

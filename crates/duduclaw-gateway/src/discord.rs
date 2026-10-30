@@ -2626,15 +2626,15 @@ async fn handle_component_interaction(
     let custom_id = cdata["custom_id"].as_str().unwrap_or("");
     let guild_id = data["guild_id"].as_str().unwrap_or("");
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` below (see
+    // Goal-intent confirmation buttons (P1) use a separate
+    // codec from `decision_action` below (see
     // `channel_format`'s "Goal-intent confirmation" module doc): wire format
     // `gintent:<choice>:<nonce>`, NOT `duduclaw:…`, so this must be checked
     // BEFORE the `ns != "duduclaw"` gate right below — that gate would
     // otherwise silently swallow every gintent press before it's ever
     // decoded (custom_id.splitn(3, ':').next() would be "gintent", not
-    // "duduclaw"). Consuming it needs no pressing-user identity, only the
-    // single-use nonce.
+    // "duduclaw"). Ordinary employees keep nonce-based confirmation;
+    // machine employees also require the pressing sender's verified Admin.
     //
     // Deferred response (type 5, "thinking…"): `handle_gintent_button`'s
     // plan-first branch calls a live LLM (`goal_plan::generate_plan_first`),
@@ -2645,7 +2645,9 @@ async fn handle_component_interaction(
     // `3` as plain text would have produced.
     if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(custom_id) {
         send_interaction_response(http, interaction_id, interaction_token, 5, None).await;
-        let outcome = crate::goal_intent::handle_gintent_button(ctx, choice, &nonce).await;
+        let sender = data["member"]["user"]["id"].as_str()
+            .or_else(|| data["user"]["id"].as_str()).unwrap_or("");
+        let outcome = crate::goal_intent::handle_gintent_button_for_sender(ctx, choice, &nonce, "discord", sender).await;
         let payload = channel_format::to_discord_message(&outcome, None, false);
         edit_interaction_response(http, app_id, interaction_token, &payload, &ctx.home_dir).await;
         return;

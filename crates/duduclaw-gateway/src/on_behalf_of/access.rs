@@ -40,6 +40,9 @@ pub(crate) fn principal_permits_with_team(
     right: HumanRight,
     team_enabled: bool,
 ) -> Result<bool, String> {
+    if crate::machine_employee::check_target(home, target, Some(&principal.to_string())).is_err() {
+        return Ok(false);
+    }
     match principal {
         HumanPrincipal::Unmapped { .. } => Ok(right == HumanRight::Call && is_public_trigger(home, target)),
         HumanPrincipal::User(user_id) => {
@@ -123,8 +126,11 @@ pub fn check(
 /// delegation mode. `None` is allowed only after the caller proves a
 /// gateway-registered background context at the signed authority route.
 pub(crate) fn system_operation_permitted(home: &Path, principal: Option<&str>) -> bool {
-    let Some(raw) = principal else { return true; };
-    let Ok(HumanPrincipal::User(id)) = HumanPrincipal::parse(raw) else { return false; };
+    let id = match super::PrincipalState::from_wire(principal) {
+        super::PrincipalState::Background => return true,
+        super::PrincipalState::Human(HumanPrincipal::User(id)) => id,
+        super::PrincipalState::Human(_) | super::PrincipalState::Unknown => return false,
+    };
     let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return false; };
     db.get_user(&id).ok().flatten().is_some_and(|u| {
         u.role == duduclaw_auth::UserRole::Admin
