@@ -59,6 +59,7 @@ const PROTECTED_KEYS: &[&str] = &[
     // 2026-10: turning the action review off removes a gate.
     "action_review.mode",
     "security.egress_guard",
+    "security.recipient_guard",
 ];
 
 /// Team role slots. The dashboard contract says `synthesizer`; the config
@@ -387,6 +388,14 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
         }
         table_at_mut(table, &["security"])?.insert("egress_guard".into(), toml::Value::String(v.into()));
         out.changes.push(format!("security.egress_guard = \"{v}\""));
+        out.applied_immediate = true;
+    }
+    if let Some(v) = str_param(params, "security.recipient_guard")? {
+        if !matches!(v, "off" | "shadow" | "ask") {
+            return Err("security.recipient_guard must be one of: off, shadow, ask".into());
+        }
+        table_at_mut(table, &["security"])?.insert("recipient_guard".into(), toml::Value::String(v.into()));
+        out.changes.push(format!("security.recipient_guard = \"{v}\""));
         out.applied_immediate = true;
     }
     // 2026-10: `[action_review] mode`, read on every tool call.
@@ -748,4 +757,16 @@ mod tests {
         assert_eq!(p["rotation_strategy"], "priority", "flat name wins");
         assert_eq!(p["log_format"], "pretty");
     }
+    #[test]
+    fn recipient_guard_setting_accepts_only_known_modes() {
+        for mode in ["off", "shadow", "ask"] {
+            let (table, outcome) = apply(json!({"security.recipient_guard": mode})).unwrap();
+            assert_eq!(table["security"]["recipient_guard"].as_str(), Some(mode));
+            assert!(outcome.applied_immediate);
+        }
+        for mode in [json!("block"), json!("typo"), json!(true)] {
+            assert!(apply(json!({"security.recipient_guard":mode})).is_err());
+        }
+    }
+
 }

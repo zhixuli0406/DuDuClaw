@@ -4362,7 +4362,7 @@ fn prepare_claude_cmd(
     let spawned = config_dir
         .and_then(|d| d.file_name())
         .and_then(|n| n.to_str());
-    let turn = spawned.and_then(crate::computer_use_sessions::turns::register_current_turn);
+    let turn = spawned.and_then(crate::turn_context::register_current_turn);
     let knowledge = spawned.and_then(crate::knowledge::turn_requesters::register_current_turn);
     let principal_context =
         spawned.and_then(|agent| crate::on_behalf_of::context::register(home_dir, agent));

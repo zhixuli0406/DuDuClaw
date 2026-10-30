@@ -75,7 +75,7 @@ impl MethodHandler {
                 if let Some(obj) = capabilities_json.as_object_mut() {
                     // Empty lists are skipped on serialize; the editors need
                     // a stable `string[]`.
-                    for k in ["approval_required_tools", "irreversible_tools", "maybe_irreversible_tools", "scoped_tools"] {
+                    for k in ["approval_required_tools", "irreversible_tools", "maybe_irreversible_tools", "scoped_tools", "recipients"] {
                         obj.entry(k).or_insert_with(|| json!([]));
                     }
                 }

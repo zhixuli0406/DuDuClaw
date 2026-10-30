@@ -453,6 +453,11 @@ pub(crate) async fn handle_update_cron_task(
             Err(refusal) => return refusal,
         };
 
+    let notify = match recipient_notify_update(params) {
+        Ok(notify) => notify,
+        Err(message) => return tool_error(message),
+    };
+
     // Merge provided fields over existing values.
     let new_name = params
         .get("new_name")
@@ -477,17 +482,17 @@ pub(crate) async fn handle_update_cron_task(
     }
 
     super::workflow_operation::effect_start();
-    match store
-        .update_fields(
-            &existing.id,
-            new_name,
-            &existing.agent_id,
-            new_cron,
-            new_task,
-            existing.enabled,
-        )
-        .await
-    {
+    let updated = if let Some((channel, chat, thread)) = notify {
+        store.update_fields_with_notify(
+            &existing.id, new_name, &existing.agent_id, new_cron, new_task,
+            existing.enabled, channel, chat, thread,
+        ).await
+    } else {
+        store.update_fields(
+            &existing.id, new_name, &existing.agent_id, new_cron, new_task, existing.enabled,
+        ).await
+    };
+    match updated {
         Ok(true) => {
             if let Ok(Some(row)) = store.get(&existing.id).await {
                 if row.name == new_name
@@ -495,6 +500,11 @@ pub(crate) async fn handle_update_cron_task(
                     && row.task == new_task
                     && row.agent_id == existing.agent_id
                     && row.enabled == existing.enabled
+                    && notify.is_none_or(|(channel, chat, thread)| {
+                        row.notify_channel.as_deref() == channel
+                            && row.notify_chat_id.as_deref() == chat
+                            && row.notify_thread_id.as_deref() == thread
+                    })
                 {
                     let observed = serde_json::to_value(&row).unwrap_or(Value::Null);
                     super::workflow_operation::effect_committed(
@@ -510,12 +520,52 @@ pub(crate) async fn handle_update_cron_task(
             }
             serde_json::json!({"content":[{
                 "type": "text",
-                "text": format!("Cron task '{}' updated (id: {}).", new_name, &existing.id[..8])
+                "text": format!("Cron task '{}' updated (id: {}).", new_name, duduclaw_core::truncate_chars(&existing.id, 8))
             }]})
         }
         Ok(false) => tool_error("update returned no rows changed"),
         Err(e) => tool_error(&format!("update cron task: {e}")),
     }
+}
+
+/// A routing edit supplies the whole pair so a partial patch cannot borrow
+/// an unchecked destination from the stored row. An empty pair clears routing.
+fn recipient_notify_update(params: &Value) -> std::result::Result<Option<(Option<&str>, Option<&str>, Option<&str>)>, &'static str> {
+    if !["notify_channel", "notify_chat_id", "notify_thread_id"].iter().any(|key| params.get(key).is_some()) {
+        return Ok(None);
+    }
+    if params.get("notify_channel").is_none() || params.get("notify_chat_id").is_none() {
+        return Err("notify_channel and notify_chat_id must be supplied together");
+    }
+    let field = |key: &str| -> std::result::Result<Option<&str>, &'static str> {
+        match params.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok((!value.is_empty()).then_some(value.as_str())),
+            _ => Err("notify fields must be strings or null"),
+        }
+    };
+    let channel = field("notify_channel")?;
+    let chat = field("notify_chat_id")?;
+    let thread = field("notify_thread_id")?;
+    if channel.is_some() != chat.is_some() || (thread.is_some() && channel != Some("discord")) {
+        return Err("notify target requires a channel/chat pair; threads require Discord");
+    }
+    Ok(Some((channel, chat, thread)))
+}
+
+#[cfg(test)]
+#[test]
+fn recipient_notify_updates_require_a_complete_target() {
+    assert_eq!(recipient_notify_update(&serde_json::json!({})).unwrap(), None);
+    for args in [serde_json::json!({"notify_thread_id":"999"}),
+        serde_json::json!({"notify_channel":"line"}),
+        serde_json::json!({"notify_channel":"line","notify_chat_id":"U123","notify_thread_id":"999"}),
+        serde_json::json!({"notify_channel":42,"notify_chat_id":"U123"})] {
+        assert!(recipient_notify_update(&args).is_err());
+    }
+    assert_eq!(recipient_notify_update(&serde_json::json!({"notify_channel":"discord","notify_chat_id":"123","notify_thread_id":"456"})).unwrap(),
+        Some((Some("discord"), Some("123"), Some("456"))));
+    assert_eq!(recipient_notify_update(&serde_json::json!({"notify_channel":null,"notify_chat_id":null})).unwrap(), Some((None, None, None)));
 }
 
 /// Delete a cron task by ID or name.

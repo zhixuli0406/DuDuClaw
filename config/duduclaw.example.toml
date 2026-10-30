@@ -26,6 +26,17 @@ strategy = "priority"  # round_robin | least_cost | failover | priority
 health_check_interval_seconds = 60
 cooldown_after_rate_limit_seconds = 120
 
+[security]
+# Recipient checks are independent of private-data reads.
+# Unknown values use ask; employee overrides can only tighten this setting.
+recipient_guard = "shadow" # off | shadow | ask
+# Owners come only from verified users.db Owner bindings, never [proactive].
+# Additional targets belong in agents/<id>/agent.toml (Admin-only):
+# [capabilities]
+# recipient_guard = "ask"
+# recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+# Scheduled fires have no source conversation and recheck this list.
+
 [gateway]
 bind = "127.0.0.1"
 port = 18889

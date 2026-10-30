@@ -698,9 +698,12 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
   const t = (id: string) => intl.formatMessage({ id });
   const form = useConfigForm((tables) => ({
     'security.egress_guard': tables.security?.egress_guard ?? 'shadow',
+    'security.recipient_guard': tables.security?.recipient_guard ?? 'shadow',
   }));
   const mode = vStr(form.values, 'security.egress_guard');
   const modes = ['off', 'shadow', 'ask', 'block'];
+  const recipientMode = vStr(form.values, 'security.recipient_guard');
+  const recipientModes = ['off', 'shadow', 'ask'];
   return (
     <SecurityCard icon={Shield} title={t('security.egress.title')} description={t('security.egress.description')}>
       <div className="space-y-3">
@@ -713,6 +716,15 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
           disabled={!form.loaded || form.saving || form.loadError != null}
         />
         <p className="text-xs text-muted-foreground">{t('security.egress.limits')}</p>
+        <label htmlFor="recipient-guard-mode" className="text-sm">{t('security.recipient.mode')}</label>
+        <OptionSelect
+          id="recipient-guard-mode"
+          value={recipientModes.includes(recipientMode) ? recipientMode : 'ask'}
+          onChange={(value) => form.set('security.recipient_guard', value)}
+          options={recipientModes.map((value) => ({ value, label: t(`security.egress.${value}`) }))}
+          disabled={!form.loaded || form.saving || form.loadError != null}
+        />
+        <p className="text-xs text-muted-foreground">{t('security.recipient.description')}</p>
         {status?.egress_bash_exposure && status.egress_bash_exposure.length > 0 && (
           <div role="alert" className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
             <p>{t('security.egress.bashWarning')}</p>

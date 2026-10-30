@@ -59,6 +59,15 @@ function state(over: Partial<EditFormState> = {}): EditFormState {
 }
 
 describe('buildUpdatePayload — only dirty fields are sent', () => {
+  it('writes recipient settings only when edited and treats both as admin-only', () => {
+    const caps = { ...DEFAULT_CAPABILITIES, recipient_guard: 'ask' as const, recipients: ['mail:ops@example.com'] };
+    expect(buildUpdatePayload(state({ caps }), new Set(), CTX).payload).toEqual({});
+    expect(buildUpdatePayload(state({ caps }), new Set(['caps.recipients', 'caps.recipient_guard']), CTX).payload)
+      .toEqual({ capabilities: { recipients: ['mail:ops@example.com'], recipient_guard: 'ask' } });
+    expect(isAdminOnlyPath('caps.recipients')).toBe(true);
+    expect(isAdminOnlyPath('caps.recipient_guard')).toBe(true);
+  });
+
   it('sends nothing when nothing is dirty', () => {
     const r = buildUpdatePayload(state(), new Set(), CTX);
     expect(r.hasChanges).toBe(false);

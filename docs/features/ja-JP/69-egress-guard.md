@@ -106,3 +106,38 @@ API ツールループへ `[[mcp.external]]` で直接登録したツール（st
 組み込みツールの完了は、確認済みのハンドラー契約を完全一致の名前一覧で判定します。ローカルのメール下書き、タスク・スタッフキュー、提案は永続化の完了を指し、後続作業の終了は意味しません。エラーでは保守的に fence を保持します。`model_search`、`model_download`、`skill_search`、`codrive_run`、`browser_record_start`、`os_open` は見かけ上成功してもlease の期限まで保持します。集約レポート、代替ダウンロード、バックグラウンド処理では、すべての送信の終了を確認できないためです。
 
 リモートブリッジは呼び出しごとの generation wire ID を使用し、期限切れ応答を破棄します。元の ID が再利用されても、古い応答が新しい送信 lease を終了させることはありません。呼び出し側が予約済みの `duduclaw-egress:` ID 名前空間を使うと、明示的に拒否します。
+
+## サーバーが管理する送信先（未リリース E2）
+
+送信先の保護は、個人情報を読んだかどうかとは独立しています。`config.toml [security] recipient_guard` は `off`、`shadow`（既定）、`ask` に対応し、不明な値は警告して `ask` として扱います。従業員の `[capabilities] recipient_guard` は全体設定を厳しくする場合だけ有効です（`off < shadow < ask`）。Security の Outgoing data guard から全体設定を変更し、Admin は従業員の編集画面で追加の送信先を管理します。
+
+```toml
+# config.toml
+[security]
+recipient_guard = "shadow"
+
+# agents/<id>/agent.toml
+[capabilities]
+recipient_guard = "ask"
+recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+```
+
+許可されるのは、このターンの会話、確認済みの所有者、従業員の許可リストです。gateway が自身のターン表から会話を解決し、MCP は署名付き内部ルートに不透明なターン ID だけを送ります。不明なターンには元の会話がありません。`DUDUCLAW_REPLY_CHANNEL` は送信許可を与えません。`parse_origin` と同じ規則で従業員の接尾辞とスレッドを除去し、正確に照合します。
+
+所有者は **`users.db` の `AccessLevel::Owner` バインディングのみ**から取得し、gateway が確認したチャネルの識別情報に解決します。従業員が編集できる `[proactive]` の通知先は所有者になりません。必要なら Admin が `[capabilities] recipients` に追加します。capabilities テーブル全体が従業員による編集から保護されており、新しい二つのキーも対象です。
+
+| モード | 許可リスト内の送信先 | 許可リスト外の送信先 |
+|---|---|---|
+| `off` | 許可 | 許可 |
+| `shadow` | 許可 | 許可し、`tool_calls.jsonl` に `recipient_guard: "would_ask"` を記録 |
+| `ask` | 許可 | Admin による一回限りの承認が必要 |
+
+承認カードには、宛先が現在の会話でも許可リストの送信先でもないことを表示します。データ外送の保護も承認を求める場合は、一枚のカードに両方の理由を表示します。ActionGrant は従業員、ツール、完全な引数を結び付けるため、宛先や内容を変えれば再承認が必要です。shadow は宛先を理由に実行を止めません。
+
+対象は `send_message`、`send_photo`、`send_sticker`、`create_reminder`、`mail_send`、および `tasks_create`／`update_cron_task` の `notify_channel`、`notify_chat_id`、`notify_thread_id` です。`calendar_create_event` の attendees はメール宛先として検査します。スケジュール通知は作成時と実行時に現在の設定で検査し、実行時は元の会話を持たないため、確認済みの所有者と設定済みリストだけが承認なしで許可されます。
+
+`responsibility_ask` の承認先はサーバーが決定し、`os_notify` はローカル通知です。`github_issue_comment` は会話の宛先ではなく issue を指定するため、データ外送とアクションポリシーが引き続き適用されます。`send_to_agent`、`spawn_agent`、`team_handoff` は委任ポリシーを維持します。第三者 MCP の宛先の意味は不明なため、データ外送の保護が担当します。
+
+実際の送信先で会話の接尾辞を使って許可済みの宛先を装うことはできません。Discord の通知スレッドは親チャンネルと併せて確認します。`update_cron_task` の通知先変更では `notify_channel` と `notify_chat_id` を同時に指定し、空の組で通知先を解除できます。タスクと通知先は原子的に保存します。他の承認待ちの後にも宛先権限を再確認します。一時アシスタントは親の宛先モードと設定リストを継承し、検証済み所有者の紐付けは従業員ごとに判定します。
+
+E2 の検証状態：テストを追加しましたが **not run** です。コンパイル、独立したセキュリティレビュー、Claude／Codex の実機検証は未実施です。同じ OS ユーザーの無制限なファイル・ネットワーク操作を隔離する機能ではありません。

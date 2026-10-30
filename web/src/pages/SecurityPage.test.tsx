@@ -135,6 +135,25 @@ describe('SecurityPage', () => {
 });
 
 
+describe('Recipient guard setting', () => {
+  it('defaults to shadow and writes only the recipient setting', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\n', success: true });
+    renderWithProviders(<SecurityPage />);
+    const select = await screen.findByLabelText('Recipient guard');
+    await waitFor(() => expect(select).toHaveValue('shadow'));
+    fireEvent.change(select, { target: { value: 'ask' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save outgoing data guard' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('system.update_config', { security: { recipient_guard: 'ask' } }));
+  });
+
+  it('shows an unknown configured recipient mode as ask', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\nrecipient_guard="unknown"' });
+    renderWithProviders(<SecurityPage />);
+    const select = await screen.findByLabelText('Recipient guard');
+    await waitFor(() => expect(select).toHaveValue('ask'));
+  });
+});
+
 describe('Egress guard setting', () => {
   it('defaults to shadow and writes only the chosen security setting', async () => {
     mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\n', success: true });

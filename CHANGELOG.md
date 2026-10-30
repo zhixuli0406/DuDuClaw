@@ -4,6 +4,8 @@
 
 ### Added
 
+- E2：新增收件對象防護（預設 shadow），允許集合由 gateway 的本回合來源對話、users.db 已驗證 Owner 綁定與管理者設定的員工收件清單組成；不採信 DUDUCLAW_REPLY_CHANNEL，也不把員工可編輯的 proactive 目標當擁有者。ask 模式要求 Admin 單次核准，與外送防護共用一張列出雙原因的卡；排程通知在建立與觸發時重新檢查。安全頁與員工編輯頁提供設定，員工層只能更嚴格。
+
 - E1：Claude/Grok 內建 WebFetch、WebSearch 與 Bash 字面網路指令接入外送 hook，由 gateway 依原始參數產生完整審批卡與單次 ActionGrant；先開單拒絕，Admin 核准後以同回合、同參數重試。未知回合或帳本不可達時 ask/block 拒絕，shadow 放行並記錄。Bash 只接受單一簡單網路指令開單；安全頁列出有 Bash 且未開任務沙箱的強制模式員工。
 
 ### Changed

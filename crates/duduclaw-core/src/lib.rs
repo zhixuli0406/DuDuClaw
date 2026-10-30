@@ -46,6 +46,7 @@ pub mod protected_section;
 pub mod provider_env;
 pub mod product_profile;
 pub mod relay_protocol;
+pub mod recipient_policy;
 pub mod runtime_catalog;
 pub mod sandbox_image;
 // Credential redaction shared by the gateway and duduclaw-maint-helper

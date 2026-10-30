@@ -119,6 +119,7 @@ export interface ActionGrantView {
   fullArgs?: Record<string, unknown>;
   sources?: string[];
   reason?: string;
+  recipientGuard: boolean;
   ruleMatches: ActionRuleMatch[];
 }
 
@@ -152,14 +153,18 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
   const record = p as Record<string, unknown>;
   const egress = record.egress_guard;
   const isEgress = !!egress && typeof egress === 'object';
-  const showFull = isEgress || ['send', 'publish', 'purchase'].includes(String(g.effect));
+  const recipientReason = record.recipient_guard ?? (isEgress ? (egress as Record<string, unknown>).recipient_guard : undefined);
+  const recipientGuard = !!recipientReason && typeof recipientReason === 'object' && !Array.isArray(recipientReason);
+  const showFull = isEgress || recipientGuard || ['send', 'publish', 'purchase'].includes(String(g.effect));
   const args = record.arguments;
   const sources = isEgress ? (egress as Record<string, unknown>).sources : undefined;
   return {
     fullArgs: showFull && args && typeof args === 'object' && !Array.isArray(args)
       ? args as Record<string, unknown> : undefined,
     sources: Array.isArray(sources) ? sources.filter((s): s is string => typeof s === 'string') : undefined,
-    reason: isEgress ? 'egress_guard' : typeof record.reason === 'string' ? record.reason : undefined,
+    reason: isEgress && Array.isArray(sources) && sources.length > 0 ? 'egress_guard'
+      : recipientGuard ? 'recipient_guard' : typeof record.reason === 'string' ? record.reason : undefined,
+    recipientGuard,
     ruleMatches: Array.isArray(record.action_rule_matches) ? record.action_rule_matches.filter(isActionRuleMatch) : [],
     tool,
     effect: typeof g.effect === 'string' ? g.effect : '',
@@ -170,7 +175,7 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
 
 function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; expiresAt: number | null; t: (id: string) => string }) {
   const destinations = Object.entries(grant.fullArgs ?? {}).filter(([key]) =>
-    ['channel', 'chat_id', 'recipient', 'recipients', 'to', 'cc', 'bcc', 'email', 'url', 'destination', 'agent', 'agent_id'].includes(key),
+    ['channel', 'chat_id', 'recipient', 'recipients', 'to', 'cc', 'bcc', 'email', 'url', 'destination', 'agent', 'agent_id', 'notify_channel', 'notify_chat_id', 'notify_thread_id', 'attendees'].includes(key),
   );
   return (
     <Section title={t('approval.grant.title')}>
@@ -213,7 +218,8 @@ function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; e
               </pre>
             </>
           )}
-          <p className="text-sm">{t('approval.grant.reason')}: {t(grant.reason === 'egress_guard' ? 'approval.grant.reasonEgress' : grant.reason === 'action_rule' ? 'approval.grant.reasonRule' : 'approval.grant.reasonRequired')}</p>
+          {grant.reason !== 'recipient_guard' && <p className="text-sm">{t('approval.grant.reason')}: {t(grant.reason === 'egress_guard' ? 'approval.grant.reasonEgress' : grant.reason === 'action_rule' ? 'approval.grant.reasonRule' : 'approval.grant.reasonRequired')}</p>}
+          {grant.recipientGuard && <p className="text-sm">{t('approval.grant.reasonRecipient')}</p>}
           {!!grant.sources?.length && <ul className="list-inside list-disc text-xs">{grant.sources.map((source, i) => <li key={i} className="break-all">{source}</li>)}</ul>}
           {grant.ruleMatches.length > 0 && (
             <div>

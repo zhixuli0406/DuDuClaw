@@ -800,6 +800,9 @@ async fn deliver_reminder(
     sem: &Arc<tokio::sync::Semaphore>,
     reminder: &Reminder,
 ) -> Result<(), String> {
+    let mut resolved_reminder = reminder.clone();
+    resolved_reminder.agent_id = crate::recipient_guard::scheduled_agent(registry, &reminder.agent_id).await?;
+    let reminder = &resolved_reminder;
     let text = match reminder.mode {
         ReminderMode::Direct => reminder
             .message
@@ -850,32 +853,25 @@ async fn deliver_reminder(
         }
     };
 
-    // M61: acquire the concurrency permit only for the bounded send step (and
-    // its single 2s retry). Held across the channel I/O, NOT across the LLM call
-    // above. The permit is dropped at the end of this scope.
-    {
-        let _permit = sem
-            .acquire()
-            .await
-            .map_err(|_| "Semaphore closed".to_string())?;
+    let recipients = vec![duduclaw_core::recipient_policy::channel_recipient(&reminder.channel, &reminder.chat_id)
+        .unwrap_or_default()];
+    let recipient_args = serde_json::json!({"reminder_id": reminder.id, "channel": reminder.channel,
+        "chat_id": reminder.chat_id, "text": text});
+    crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args.clone()).await?;
 
-        // Retry once on failure
-        let sender = reminder.sender_agent.as_deref();
-        let result = send_channel_message_as(
-            home_dir,
-            http,
-            &reminder.channel,
-            &reminder.chat_id,
-            &text,
-            sender,
-        )
-        .await;
-        if let Err(first_err) = result {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
-                .await
-                .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
-        }
+    // Keep the send permit out of approval waits and callback generation.
+    let sender = reminder.sender_agent.as_deref();
+    let result = {
+        let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender).await
+    };
+    if let Err(first_err) = result {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args).await?;
+        let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
+            .await
+            .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
     }
 
     info!(

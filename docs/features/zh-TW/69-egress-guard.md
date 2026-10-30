@@ -106,3 +106,38 @@ E1 驗證狀態：已撰寫測試但未執行，本工作包未編譯、未做�
 內建工具依逐一核對的精確名稱清單判定完成。本機信件草稿、任務／員工佇列與提案，以持久寫入完成為準，不代表下游工作結束。錯誤回覆保守保留 fence。`model_search`、`model_download`、`skill_search`、`codrive_run`、`browser_record_start`、`os_open` 即使表面成功，也保留到 lease 期限：彙整報告、替代下載或背景工作無法確認每個對外動作都已結束。
 
 Remote bridge 使用每次呼叫獨有的 generation wire ID，丟棄過期回覆，避免重用原始 ID 時，舊回覆提早結束新的外送 lease。呼叫端若使用保留的 `duduclaw-egress:` ID 命名空間，會收到明確拒絕。
+
+## 由伺服器綁定收件對象（未發行 E2）
+
+收件對象防護不以「讀過私人資料」為前提。`config.toml [security] recipient_guard` 支援 `off`、`shadow`（預設）與 `ask`；未知值會警告並採用 `ask`。員工層 `[capabilities] recipient_guard` 只能收緊全域設定（`off < shadow < ask`）。安全頁「資料外送防護」可調整全域設定；Admin 可在員工編輯頁「工具與權限 → 允許的收件對象」設定額外清單。
+
+```toml
+# config.toml
+[security]
+recipient_guard = "shadow"
+
+# agents/<id>/agent.toml
+[capabilities]
+recipient_guard = "ask"
+recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+```
+
+允許集合是「本回合來源對話、已驗證的擁有者、員工設定的清單」。來源由 gateway 的回合表解析；MCP 只透過簽章內部路由傳遞不透明的回合 ID。未知回合沒有來源對話，`DUDUCLAW_REPLY_CHANNEL` 不授予收件許可。通道識別採 `parse_origin` 同款正規化，移除員工後綴與討論串後精確比對。
+
+擁有者**只來自 `users.db` 中 `AccessLevel::Owner` 的綁定**，再解析為 gateway 驗證的通道身分。`[proactive]` 通知對象可由員工修改，因此不算擁有者；需要允許時，由 Admin 加進 `[capabilities] recipients`。整個 capabilities 區段原本就禁止員工改寫，兩個新鍵也受到保護。
+
+| 模式 | 對象在允許集合內 | 對象在集合外 |
+|---|---|---|
+| `off` | 放行 | 放行 |
+| `shadow` | 放行 | 放行，在 `tool_calls.jsonl` 記錄 `recipient_guard: "would_ask"` |
+| `ask` | 放行 | 需要 Admin 單次核准 |
+
+核准卡會寫明「目標不是來源對話，也不在允許清單中」。與外送防護同時要求核准時，只開一張卡並列出兩個原因。ActionGrant 綁定員工、工具及完整參數；修改對象或內容需要重新核准。shadow 不會因收件對象阻擋呼叫。
+
+涵蓋 `send_message`、`send_photo`、`send_sticker`、`create_reminder`、`mail_send`，以及 `tasks_create`／`update_cron_task` 的 `notify_channel`、`notify_chat_id`、`notify_thread_id`。`calendar_create_event` 的 attendees 以郵件收件人檢查。排程通知在建立時及實際觸發時依當下設定重新檢查；觸發時來源集合為空，只有已驗證擁有者與設定清單能直接放行。
+
+`responsibility_ask` 的核准對象由伺服器路由，不讓模型指定收件人；`os_notify` 只顯示本機通知。`github_issue_comment` 指定的是議題資源，仍受外送與動作政策約束。`send_to_agent`、`spawn_agent`、`team_handoff` 維持委派政策；第三方 MCP 的目標參數語意未知，維持外送防護。
+
+實際傳送地址不能用對話後綴冒充清單中的收件人；Discord 通知 thread 會連同父頻道一起檢查。`update_cron_task` 修改通知目的地時，必須同時提供 `notify_channel` 與 `notify_chat_id`，空值配對可清除通知；任務與路由欄位一併原子寫入。等待其他核准後會再檢查收件權限。臨時助手繼承父員工的收件防護模式與設定清單，已驗證 owner 綁定仍以各員工為準。
+
+E2 驗證狀態：已撰寫測試，但 **not run**。未編譯，獨立安全審查與 Claude／Codex 真實驗收仍待完成。這是產品路徑的防護，不隔離具有同一使用者無限制檔案或網路權限的程序。
