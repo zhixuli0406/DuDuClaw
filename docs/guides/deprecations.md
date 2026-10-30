@@ -2,9 +2,9 @@
 
 ## Legacy employee memory file (unreleased)
 
-`MEMORY.md` is a legacy employee file. Only the interactive agent runner still
-injects it; channel, minimal and task-sandbox prompts do not. It is never part of
-an Agent File export. Use the native `USER.md` slot for a human-maintained user
+`MEMORY.md` is a legacy employee file. The interactive agent runner and the
+`claude_runner` path still inject it; channel, minimal and task-sandbox prompts
+do not. It is never part of an Agent File export. Use the native `USER.md` slot for a human-maintained user
 introduction, and the existing memory tools for learned facts. Existing files
 are neither moved nor deleted, and no removal version is scheduled.
 

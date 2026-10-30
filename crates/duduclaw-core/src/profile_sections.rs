@@ -49,11 +49,11 @@ pub struct ProfileRenderOptions {
 }
 
 impl ProfileSections {
-    /// Read fresh disk state. Only genuinely absent optional files are skipped;
-    /// unreadable or oversized files refuse the profile. Legacy contract parse
-    /// errors warn and use the empty contract, matching the runtime loader.
+    /// Read fresh disk state. Optional files that cannot be read are omitted
+    /// with a warning; oversized text files are truncated for runtime prompts.
+    /// Writers and imports enforce their own strict size limits.
     pub fn load(agent_dir: &Path) -> io::Result<Self> {
-        let settings = read_optional(agent_dir, "agent.toml")?;
+        let settings = read_optional(agent_dir, "agent.toml", true)?;
         let config: toml::Table = match settings {
             Some(text) => toml::from_str(&text).map_err(invalid_data)?,
             None => toml::Table::new(),
@@ -74,10 +74,7 @@ impl ProfileSections {
             ("INSTRUCTIONS.md", ProfileSectionKind::Instructions),
             ("CONTRACT.toml", ProfileSectionKind::Contract),
         ] {
-            if let Some(mut content) = read_optional(agent_dir, file)? {
-                if kind == ProfileSectionKind::User && content.chars().count() > USER_MAX_CHARS {
-                    return Err(invalid_data("USER.md exceeds 4,000 characters"));
-                }
+            if let Some(mut content) = read_optional(agent_dir, file, false)? {
                 if kind == ProfileSectionKind::Contract {
                     content = match render_contract_file(&content) {
                         Ok(rendered) => rendered,
@@ -132,15 +129,25 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-fn read_optional(dir: &Path, name: &str) -> io::Result<Option<String>> {
+fn read_optional(dir: &Path, name: &str, strict: bool) -> io::Result<Option<String>> {
     let path = dir.join(name);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => {
+            if strict {
+                return Err(error);
+            }
+            tracing::warn!(path = %path.display(), error = %error, "Failed to read optional profile file; omitting section");
+            return Ok(None);
+        }
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(invalid_data(format!("{name} must be a regular file")));
+        if strict {
+            return Err(invalid_data(format!("{name} must be a regular file")));
+        }
+        tracing::warn!(path = %path.display(), "Optional profile file is not a regular file; omitting section");
+        return Ok(None);
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -149,14 +156,56 @@ fn read_optional(dir: &Path, name: &str) -> io::Result<Option<String>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(invalid_data(format!("{name} must be a regular file")));
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            if strict {
+                return Err(error);
+            }
+            tracing::warn!(path = %path.display(), error = %error, "Failed to read optional profile file; omitting section");
+            return Ok(None);
+        }
+    };
+    let file_metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if strict {
+                return Err(error);
+            }
+            tracing::warn!(path = %path.display(), error = %error, "Failed to read optional profile file; omitting section");
+            return Ok(None);
+        }
+    };
+    if !file_metadata.is_file() {
+        if strict {
+            return Err(invalid_data(format!("{name} must be a regular file")));
+        }
+        tracing::warn!(path = %path.display(), "Optional profile file is not a regular file; omitting section");
+        return Ok(None);
     }
     let mut text = String::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_FILE_BYTES {
+    if let Err(error) = file.take(MAX_FILE_BYTES + 1).read_to_string(&mut text) {
+        if strict {
+            return Err(error);
+        }
+        tracing::warn!(path = %path.display(), error = %error, "Failed to read optional profile file; omitting section");
+        return Ok(None);
+    }
+    if strict && text.len() as u64 > MAX_FILE_BYTES {
         return Err(invalid_data(format!("{name} exceeds 256 KiB")));
+    }
+    if text.len() as u64 > MAX_FILE_BYTES {
+        let mut end = MAX_FILE_BYTES as usize;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        tracing::warn!(path = %path.display(), max_bytes = MAX_FILE_BYTES, "Optional profile file exceeded runtime prompt limit; truncated section");
+    }
+    if name == "USER.md" && text.chars().count() > USER_MAX_CHARS {
+        let end = text.char_indices().nth(USER_MAX_CHARS).map(|(index, _)| index).unwrap_or(text.len());
+        text.truncate(end);
+        tracing::warn!(path = %path.display(), max_chars = USER_MAX_CHARS, "USER.md exceeded runtime prompt limit; truncated section");
     }
     Ok(Some(text))
 }
@@ -323,10 +372,12 @@ mod tests {
     fn unreadable_or_invalid_profile_is_not_silently_omitted() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("USER.md")).unwrap();
-        assert!(ProfileSections::load(dir.path()).is_err());
+        let profile = ProfileSections::load(dir.path()).unwrap();
+        assert!(!profile.sections.iter().any(|s| s.kind == ProfileSectionKind::User));
         std::fs::remove_dir(dir.path().join("USER.md")).unwrap();
         std::fs::create_dir(dir.path().join("CONTRACT.toml")).unwrap();
-        assert!(ProfileSections::load(dir.path()).is_err());
+        let profile = ProfileSections::load(dir.path()).unwrap();
+        assert!(!profile.sections.iter().any(|s| s.kind == ProfileSectionKind::Contract));
     }
 
     #[test]
@@ -371,6 +422,43 @@ mod tests {
         assert!(rendered[0].content.contains(&user));
         assert!(rendered[0].content.ends_with("</user_profile>"));
         std::fs::write(dir.path().join("USER.md"), format!("{user}字")).unwrap();
+        let profile = ProfileSections::load(dir.path()).unwrap();
+        let user_section = profile.sections.iter().find(|s| s.kind == ProfileSectionKind::User).unwrap();
+        assert_eq!(user_section.content.chars().count(), USER_MAX_CHARS);
+        assert!(user_section.content.ends_with(&"字".repeat(10)));
+    }
+
+    #[test]
+    fn oversized_soul_is_truncated_for_runtime_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let soul = format!("{}尾", "字".repeat(MAX_FILE_BYTES as usize / 3));
+        std::fs::write(dir.path().join("SOUL.md"), &soul).unwrap();
+        let profile = ProfileSections::load(dir.path()).unwrap();
+        let prompt = profile.rendered(Default::default()).into_iter()
+            .find(|section| section.kind == ProfileSectionKind::Soul).unwrap();
+        assert_eq!(prompt.content.len(), MAX_FILE_BYTES as usize);
+        assert!(prompt.content.is_char_boundary(prompt.content.len()));
+        assert!(prompt.content.ends_with('字'));
+    }
+
+    #[test]
+    fn unreadable_user_file_is_omitted_from_runtime_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("USER.md")).unwrap();
+        let profile = ProfileSections::load(dir.path()).unwrap();
+        assert!(!profile.sections.iter().any(|section| section.kind == ProfileSectionKind::User));
+    }
+
+    #[test]
+    fn strict_user_limit_still_applies_to_imports() {
+        let imported = format!("---\nschema: duduclaw.agent/v1\nid: helper\n---\n\n# User\n{}\n", "字".repeat(USER_MAX_CHARS + 1));
+        assert!(crate::agent_profile::parse(&imported).is_err());
+    }
+
+    #[test]
+    fn oversized_agent_settings_remain_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), " ".repeat(MAX_FILE_BYTES as usize + 1)).unwrap();
         assert!(ProfileSections::load(dir.path()).is_err());
     }
 }
