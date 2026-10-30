@@ -14,7 +14,7 @@
 
 ### Security
 
-- Codex 員工在預設沙箱下不能再改寫自己的 `agent.toml`、`SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、`.mcp.json` 與 CLI 設定目錄及設定檔；Team-as-Agent 成員的暫存身分目錄與實際工作目錄也同樣受保護。需要 Codex CLI 0.164.0 以上，較舊版本或無法確認版本時會拒絕執行，儀表板會向 Admin 顯示一鍵更新，更新後不必重啟閘道。設定仍可透過 `agent_update` 與儀表板修改。Grok 與其他 CLI runtime、Windows 尚未涵蓋。
+- Codex 員工在預設沙箱下不能再改寫自己的 `agent.toml`、`SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、`.mcp.json` 與 CLI 設定目錄及設定檔；Team-as-Agent 成員的暫存身分目錄與實際工作目錄也同樣受保護。需要 Codex CLI 0.164.0 以上，較舊版本或無法確認版本時會拒絕執行，儀表板會向 Admin 顯示一鍵更新，更新後不必重啟閘道。設定仍可透過 `agent_update` 與儀表板修改。Grok 與其他 CLI runtime、Windows 尚未涵蓋。Docker 預設 compose 部署也尚未生效：容器內 bwrap 無法建立 namespace，Codex 員工的 shell 指令本來就無法執行，這是先前就有的問題，這一版沒有修正。
 
 - `agent.toml` 或 `config.toml` 無法讀取或解析時，現在會拒絕執行並顯示檔案名稱與原因，避免設定損壞後改用預設值、讓工作轉到其他廠商。只有受影響的目標會暫停等待決定，其他目標繼續執行。檔案確實不存在時維持原有行為。
 
