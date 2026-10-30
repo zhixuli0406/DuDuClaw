@@ -14,7 +14,7 @@
 
 ## 2. 現況（2026-09-05 調研，為規格前提）
 
-- 平台已有 `RuntimeType {Claude, Codex, Gemini, Antigravity, Grok, OpenAiCompat}`、`runtime/*.rs`（`AgentRuntime` trait）、`cli_auth.rs`（各家 CLI 登入 PTY 流程）、`runtime_install.rs`（安裝白名單）、`runtime_models.rs`（模型探索）、`auth_device.rs`（Copilot 裝置碼登入代理；Qwen 分支已於 2026-09 移除）。偵測（`handle_runtime_detect`）、安裝、模型探索是三份手寫清單；`duduclaw-cli-runtime::CliKind` 少 `Grok`。
+- 平台已有 `RuntimeType {Claude, Codex, Grok, OpenAiCompat}`、`runtime/*.rs`（`AgentRuntime` trait）、`cli_auth.rs`（各家 CLI 登入 PTY 流程）、`runtime_install.rs`（安裝白名單）、`runtime_models.rs`（模型探索）、`auth_device.rs`（Copilot 裝置碼登入代理；Qwen 分支已於 2026-09 移除）。偵測（`handle_runtime_detect`）、安裝、模型探索是三份手寫清單；`duduclaw-cli-runtime::CliKind` 少 `Grok`。
 - `accounts.add` 不接受 `provider`，金鑰欄位寫死 `anthropic_api_key`；dashboard `AddAccountDialog` 沒有 provider 選單；OOBE「AI Runtime 授權」只收 Anthropic 金鑰。
 - 本地推理：`duduclaw-inference` 的 llama.cpp／mistral.rs 未編進出貨 binary（feature 關閉、llama.cpp 核心是 stub）；可用路徑只有 `openai_compat`（外部伺服器）與 `llamafile` 子行程；`LocalModelsPage.tsx` 已存在。
 - OS：meta-oe 有 `nodejs_22.23.2`（含 `nodejs-npm`）但映像沒裝；大型 vendor blob 走 `duduclaw-flatpak-offline-repo` 的 `file://*.tar.zst` 模式；gateway 以 root 執行、`ProtectHome=read-only`、真 `$HOME=/root`，各家 CLI 的 OAuth token 寫在真 `$HOME` → 需 `Environment=HOME=/data/duduclaw`；`which_cli` 候選路徑沒有 `/usr/bin`。

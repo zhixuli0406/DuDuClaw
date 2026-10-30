@@ -208,7 +208,7 @@ allow = [
 管不到（設計上的已知邊界，不是 bug）：
 
 - **舊格式任務**：1.52 版對完全沒有發送者欄位的隊列任務仍然放行，只記一筆 warning（避免升級時把還在排隊的工作全部打掉）。下一版改為拒絕。
-- **設定檔層級的改動**：從 v1.52 起，PreToolUse hook 凍結了敏感的組織資料欄位：agent 無法透過 Write/Edit/Bash 工具改寫 `agent.toml` 的 `name` / `reports_to` / `department`、整段 `[capabilities]` 權限範圍（Team-as-Agent 審查後加入）、`config.toml` 的 `[delegation]` / `[acp]` 段、`.claude/settings.json` 或 `identity.key`。2026-10 起，AI 員工完全不能寫自己目錄裡任何一個 `.mcp.json`（不只身分區塊），也不能寫那裡的 CLI 設定（任何一層的 `.claude/` 與 `.claude.json`，最上層的 `.codex/`、`.gemini/`、`.grok/`、`.agents/`）；管理者仍只檢查 `.mcp.json` 的身分欄位。更改這些設定必須走儀表板或 `agent_update` MCP 工具，由經過審驗的正式管道進行。同一個 hook 也讓 AI 員工改不了自己 `agent.toml` 的安全設定，也碰不到 DuDuClaw 資料目錄裡的狀態，規則與限制見[安全防護](05-security-defense.md)。跨員工檔案修改（例如改別人的 SOUL.md）亦被拒絕。非 Claude runtime（codex/antigravity 等）在 workspace-write 沙箱下無法寫入 `~/.duduclaw/` 目錄，提供沙箱層防線。只有 FullAccess 沙箱例外，屬操作者顯式選擇的極端權限。
+- **設定檔層級的改動**：從 v1.52 起，PreToolUse hook 凍結了敏感的組織資料欄位：agent 無法透過 Write/Edit/Bash 工具改寫 `agent.toml` 的 `name` / `reports_to` / `department`、整段 `[capabilities]` 權限範圍（Team-as-Agent 審查後加入）、`config.toml` 的 `[delegation]` / `[acp]` 段、`.claude/settings.json` 或 `identity.key`。2026-10 起，AI 員工完全不能寫自己目錄裡任何一個 `.mcp.json`（不只身分區塊），也不能寫那裡的 CLI 設定（任何一層的 `.claude/` 與 `.claude.json`，最上層的 `.codex/`、`.gemini/`、`.grok/`、`.agents/`）；管理者仍只檢查 `.mcp.json` 的身分欄位。更改這些設定必須走儀表板或 `agent_update` MCP 工具，由經過審驗的正式管道進行。同一個 hook 也讓 AI 員工改不了自己 `agent.toml` 的安全設定，也碰不到 DuDuClaw 資料目錄裡的狀態，規則與限制見[安全防護](05-security-defense.md)。跨員工檔案修改（例如改別人的 SOUL.md）亦被拒絕。非 Claude runtime（codex 等）在 workspace-write 沙箱下無法寫入 `~/.duduclaw/` 目錄，提供沙箱層防線。只有 FullAccess 沙箱例外，屬操作者顯式選擇的極端權限。
 - **系統與人類發起的操作**：儀表板、webhook、排程、自動化規則本來就是操作者的意志，一律放行。
 
 ### 可見範圍過濾
@@ -448,7 +448,7 @@ v1.52 之後，Write / Edit / Bash 工具對檔案路徑有邊界檢查：
 
 ### 沙箱層防線 — 非 Claude runtime
 
-Codex、Antigravity 等非 Claude runtime，在 `workspace-write` 沙箱下無法寫入 `~/.duduclaw/` 目錄。即使 PreToolUse 有漏洞，沙箱會在系統層阻止。只有 FullAccess 沙箱（操作者顯式選擇的極端權限）會開放，此時應視為授予該員工臨時全域存取。
+Codex 等非 Claude runtime，在 `workspace-write` 沙箱下無法寫入 `~/.duduclaw/` 目錄。即使 PreToolUse 有漏洞，沙箱會在系統層阻止。只有 FullAccess 沙箱（操作者顯式選擇的極端權限）會開放，此時應視為授予該員工臨時全域存取。
 
 ### 合法跨員工變更的管道
 

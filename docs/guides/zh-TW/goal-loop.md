@@ -176,8 +176,8 @@ grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證�
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
 strict_reply_parsing = "shadow"  # 判官回覆的嚴格 JSON 契約：off / shadow / enforce（見「判官回覆嚴格契約」）。預設 shadow
 judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / external（evaluator_only / human_only 已在 v1.69.0 移除）。預設 mav
-judge_provider = "antigravity"      # 選填：讓判官跑在另一個 runtime 上（見「讓判官跑在另一個模型上」）。未設 ⇒ 預設的工具用 runtime
-judge_model = "gemini-3-pro-preview" # 選填：該 runtime 內的判官模型 id。未設 ⇒ 預設的工具用模型
+judge_provider = "codex"      # 選填：讓判官跑在另一個 runtime 上（見「讓判官跑在另一個模型上」）。未設 ⇒ 預設的工具用 runtime
+judge_model = "gpt-5.4" # 選填：該 runtime 內的判官模型 id。未設 ⇒ 預設的工具用模型
 admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
 
 [task_forward_model]    # 任務層前瞻模型（見同名章節）。v1.54 起預設開啟
@@ -413,7 +413,7 @@ AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會�
 開啟後，goal loop 在每次派工前會依過往同類任務的統計先「預測」這次執行
 大概會如何（會不會失敗、大概動用哪些工具類別），執行結束後把預測與實際
 觀察比對並記錄成轉移，讓系統對「做這類事會發生什麼」累積出任務層的世界
-模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex、Antigravity 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
+模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
 
 - **預測分層退化**：有同類統計用統計、沒有就用整體邊際、再沒有用先驗
   預設值，冷啟動不花任何 LLM 費用。
@@ -467,10 +467,12 @@ AI 員工回報完成、任務進入 `review` 之後，不是每次都直接燒�
 
 與工作者同一個模型家族的判官，往往會原諒該家族自己才會犯的錯。它和工作者有相同的盲點，所以同一家廠商給的第二意見，價值比看起來低（arXiv:2607.13918）。兩個選填的鍵可以把驗收判官，連同便宜的第一階段評估器，一起移到另一個 runtime 與模型上：
 
+已移除的 runtime 設定會在執行前被拒絕，操作者必須自行改選其他 runtime 與相容模型，不會套用下列備援行為。
+
 ```toml
 [dispatch]
-judge_provider = "antigravity"        # runtime id：claude, codex, antigravity, grok, openai_compat, …
-judge_model = "gemini-3-pro-preview"   # 該 runtime 內的模型 id
+judge_provider = "codex"        # runtime id：claude, codex, grok, openai_compat, …
+judge_model = "gpt-5.4"   # 該 runtime 內的模型 id
 ```
 
 兩個鍵都是選填，彼此獨立。沒設時，判官沿用一般的工具用模型（`[runtime] utility_provider` / `utility_model`），這正是每個既有部署目前的行為，所以省略它們不會改變任何事。

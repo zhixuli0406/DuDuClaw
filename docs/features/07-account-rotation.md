@@ -1,6 +1,6 @@
 # Multi-Account Rotation & Cross-Provider Failover
 
-> Intelligent credential scheduling across Claude, Codex, Antigravity — never hit a rate limit again.
+> Intelligent credential scheduling across Claude, Codex — never hit a rate limit again.
 
 ---
 
@@ -254,7 +254,7 @@ The entire system is automatic. Once configured, operators don't need to manuall
 
 ## Cross-Provider Failover
 
-With DuDuClaw's Multi-Runtime architecture (Claude / Codex / Antigravity / OpenAI-compat), account rotation extends across providers. The **FailoverManager** coordinates cross-provider health:
+With DuDuClaw's Multi-Runtime architecture (Claude / Codex / OpenAI-compat), account rotation extends across providers. The **FailoverManager** coordinates cross-provider health:
 
 ```
 Primary provider (Claude) rate-limited
@@ -262,7 +262,7 @@ Primary provider (Claude) rate-limited
      v
 FailoverManager checks alternatives:
   - Codex CLI available? → Route there
-  - Antigravity CLI available? → Route there
+  - Grok CLI available? → Route there
   - Local inference available? → Route there
      |
      v
@@ -323,7 +323,7 @@ This ensures launchd/systemd-launched gateways discover the CLI binary without d
 
 ## Interaction with Other Systems
 
-- **Multi-Runtime**: Account rotation works across Claude, Codex, Antigravity, and OpenAI-compat providers.
+- **Multi-Runtime**: Account rotation works across Claude, Codex, OpenAI-compat providers.
 - **Confidence Router**: Queries routed to local inference don't consume any API account, extending quota lifetime.
 - **CostTelemetry**: Provides the data that informs budget enforcement and cache efficiency feedback.
 - **FailoverManager**: Coordinates cross-provider health tracking and failover decisions.

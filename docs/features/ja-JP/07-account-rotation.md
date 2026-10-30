@@ -1,6 +1,6 @@
 # マルチアカウントローテーション＆クロスプロバイダーフェイルオーバー
 
-> Claude、Codex、Antigravityをまたぐインテリジェントな認証情報スケジューリング——レート制限にもう遭わない。
+> Claude、Codexをまたぐインテリジェントな認証情報スケジューリング——レート制限にもう遭わない。
 
 ---
 
@@ -231,7 +231,7 @@ LeastCost戦略が無料クォータ（サブスクリプションから）を�
 
 ## クロスプロバイダーフェイルオーバー
 
-DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / Antigravity / OpenAI-compat）により、アカウントローテーションはプロバイダーをまたいで拡張されます。**FailoverManager** がクロスプロバイダーのヘルス状態を調整します：
+DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / OpenAI-compat）により、アカウントローテーションはプロバイダーをまたいで拡張されます。**FailoverManager** がクロスプロバイダーのヘルス状態を調整します：
 
 ```
 プライマリプロバイダー（Claude）がレート制限
@@ -239,7 +239,7 @@ DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / Antigravity / O
      v
 FailoverManagerが代替を確認：
   - Codex CLIは利用可能か？→ そちらにルーティング
-  - Antigravity CLIは利用可能か？→ そちらにルーティング
+  - Grok CLIは利用可能か？→ そちらにルーティング
   - ローカル推論は利用可能か？→ そちらにルーティング
      |
      v
@@ -300,7 +300,7 @@ DuDuClawはシステムサービスとして実行される（`duduclaw service 
 
 ## 他システムとの連携
 
-- **Multi-Runtime**：アカウントローテーションはClaude、Codex、Antigravity、OpenAI-compatの各プロバイダーをまたいで機能します。
+- **Multi-Runtime**：アカウントローテーションはClaude、Codex、OpenAI-compatの各プロバイダーをまたいで機能します。
 - **信頼度ルーター**：ローカル推論にルーティングされたクエリはAPIアカウントを消費せず、クォータの寿命が延長。
 - **CostTelemetry**：予算管理とキャッシュ効率フィードバックに必要なデータを提供。
 - **FailoverManager**：クロスプロバイダーのヘルストラッキングとフェイルオーバー判断を調整。

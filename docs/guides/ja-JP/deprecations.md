@@ -157,28 +157,23 @@ DuDuClaw OS の初回セットアップ（OOBE）も `auth.cli_login.start` を�
 
 ---
 
-## Gemini CLI ランタイムを削除（v1.75.0）
+## 削除された CLI ランタイム
 
-`gemini` エージェントランタイムは v1.67.0 で非推奨となり、この変更で削除されました。
-削除予定は v1.69.0 から v1.75.0 まで延期されていました。過去の発表は CHANGELOG
-に残します。更新前に `gemini` を使う設定を移行してください。Docker イメージから
-`@google/gemini-cli` のインストールを削除し、ダッシュボードからもランタイムと
-ログイン項目を削除しました。
+| ランタイム | 削除バージョン | 非推奨期間 | 運用者の対応 |
+|---|---|---|---|
+| Gemini CLI（`gemini`） | v1.75.0 | v1.67.0 から非推奨 | 対応するランタイムと互換モデルを明示的に選択 |
+| Antigravity（`antigravity`、`agy`） | v1.77.1 | なし | 対応するランタイムと互換モデルを明示的に選択 |
 
-| 旧設定 | 変更後 |
-|---|---|
-| `agent.toml [runtime] provider = "gemini"` または `fallback = "gemini"` | `"antigravity"` |
-| `config.toml [runtime] utility_provider = "gemini"` | `"antigravity"` |
-| `config.toml [dispatch] judge_provider = "gemini"` | `"antigravity"` |
-| `[team.roles.*] runtime = "gemini"` | `[team.roles.*] runtime = "antigravity"` |
-| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+社員の `[runtime] provider` と fallback、judge、`[team.roles]`、
+`config.toml [runtime] utility_provider` が削除済みのランタイムを指定している場合、
+実行を拒否し、別のランタイムとモデルの選択を求めます。他社への自動移行は行いません。
+`gemini-*` モデル id は CLI ランタイムに対応しなくなります。ランタイムカタログ、
+実行経路、ダッシュボードの選択肢、Docker イメージからも削除しました。
 
-Google サインインにはホストのターミナルで `agy` を実行します。API キー方式では
-`config.toml [antigravity] auth = "api_key"` を設定し、同じ Gemini API キー
-（`gemini` プロバイダーアカウントまたは `GEMINI_API_KEY`）を使います。
-モデル名は `agy models` で確認してください。Antigravity の Docker 設定は引き続き
-`~/.gemini/antigravity-cli/` にあるため `.gemini` volume には用途があります。
-Gemini API プロバイダー（`gemini`、`generateContent`）は引き続きサポートします。
+Gemini API プロバイダー（`generateContent`）、`GEMINI_API_KEY`、OpenAI 互換の
+Gemini プリセットは引き続き利用できます。ローカルに残った CLI 設定ファイルや、
+OS ユーザーの CLI 設定に追加された許可ルールは自動削除しません。必要に応じて
+運用者が手動で清掃してください。
 
 ## 引き続き非推奨
 

@@ -16,7 +16,7 @@
 
   `<バージョン>` は gateway のバージョンに置き換えるか（タグには `v` が付きます。例：`v1.67.0`）、独自のイメージを指定してください（下の設定表を参照）。
 - コンテナ内の AI が使えるアカウント（[runtime ごとの認証情報](#runtime-ごとの認証情報)を参照）。
-- 対応 runtime：Claude、Codex、Antigravity、Grok、OpenAI 互換。
+- 対応 runtime：Claude、Codex、Grok、OpenAI 互換。
 
 ## 1 つのエージェントで有効にする
 
@@ -69,7 +69,6 @@ timeout_ms = 600000     # タスク 1 件あたりの制限時間（任意）
 | キー | デフォルト | 意味 |
 |---|---|---|
 | `image` | `ghcr.io/zhixuli0406/duduclaw:v<実行中のバージョン>` | 実行するイメージ。ローカルに存在している必要があります。 |
-| `[container.sandbox.executables]` | `claude`、`codex`：`/usr/bin/<名前>`、`antigravity`：`/usr/local/bin/agy`、`grok`：`/usr/local/bin/grok`、`openai-compat`：`/usr/local/bin/python3` | イメージ内の各 runtime の実行ファイルの絶対パス。キー名は `claude`、`codex`、`antigravity`、`grok`、`openai-compat`。カスタムイメージのときだけ必要です。 |
 | `memory_bytes` | `4294967296`（4 GiB） | メモリ上限（swap はメモリと同じ）。最大 64 GiB。 |
 | `pids` | `128` | プロセス数の上限。 |
 | `cpu_millis` | `1000` | CPU 上限（1000 分の 1 コア単位）。 |
@@ -100,7 +99,6 @@ when_unavailable = "fail"
 | Claude | API キー、またはトークンを持つ OAuth アカウント（`claude setup-token` で作成）。ホストのキーチェーンにしかないログインはコンテナに入れられません。 |
 | Codex | API キー、または認証ドキュメント：保存されたシークレットが CLI の `auth.json` である OAuth アカウント。 |
 | Grok | API キー、または認証ドキュメント（CLI の `auth.json`）。 |
-| Antigravity | Gemini API キー。 |
 | OpenAI 互換 | そのプロバイダーの API キー。 |
 
 合うアカウントがないとタスクは失敗し、エラーにその runtime が必要とする認証情報の種類が示されます。
@@ -185,4 +183,4 @@ duduclaw doctor
 - スクリプトサンドボックスには起動時の掃除がありません。スクリプトを実行しているプロセス（エージェントに対応する `duduclaw mcp-server`、または `duduclaw secaudit`）が途中で終了すると、スクリプトのコンテナはスクリプトが自分で終了するまで動き続けます。
 - Windows では、スクリプトサンドボックスはまず WSL2、次に Docker を試します。WSL2 の経路（Windows パスから WSL パスへの変換を含む）はクロスコンパイルしただけで、実際の Windows ホストではまだ実行されていません。
 - gateway 自体がコンテナ内で動いている場合のタスクサンドボックスは、このガイドの対象外で、検証もされていません。
-- 実際に動かした範囲：公開済みのプラットフォームイメージ（`v1.66.1`）で、Codex、Antigravity、Grok の CLI がサンドボックス内で起動し、それぞれのプロバイダーに到達することを確認しました（無効なキーを使い、プロバイダーが拒否することで確認）。また、Codex で委任タスクを 1 回最後まで実行しました（このときは公開イメージではなく、同じ CLI を入れてローカルでビルドしたイメージを使いました）。Claude、Gemini CLI、OpenAI 互換 runtime は、サンドボックス内で実際のプロバイダーに対してはまだ実行していません。
+- 実際に動かした範囲：公開済みのプラットフォームイメージ（`v1.66.1`）で、Codex、Grok の CLI がサンドボックス内で起動し、それぞれのプロバイダーに到達することを確認しました（無効なキーを使い、プロバイダーが拒否することで確認）。また、Codex で委任タスクを 1 回最後まで実行しました（このときは公開イメージではなく、同じ CLI を入れてローカルでビルドしたイメージを使いました）。Claude、OpenAI 互換 runtime は、サンドボックス内で実際のプロバイダーに対してはまだ実行していません。

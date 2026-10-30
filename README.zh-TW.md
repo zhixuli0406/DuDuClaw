@@ -10,9 +10,9 @@
 
 </div>
 
-DuDuClaw 把 Claude Code、Codex、Antigravity 這類 AI 指令列工具，變成公司裡交得出東西的 AI 員工：常駐 Telegram、LINE、Discord 等 11 個通訊軟體，交件前有獨立判官驗收，花掉的每一塊錢都記在帳上。
+DuDuClaw 把 Claude Code、Codex 這類 AI 指令列工具，變成公司裡交得出東西的 AI 員工：常駐 Telegram、LINE、Discord 等 11 個通訊軟體，交件前有獨立判官驗收，花掉的每一塊錢都記在帳上。
 
-你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦可以在十一種 CLI 後端(Claude Code、Codex、Antigravity、Grok 等)與任何 OpenAI 相容 API 之間隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
+你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦可以在十種 CLI 後端(Claude Code、Codex、Grok 等)與任何 OpenAI 相容 API 之間隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
 
 <p align="center">
   <img src="docs/assets/screenshots/dashboard-task-board-zh-TW.png" width="100%" alt="DuDuClaw v1.74.0 網頁管理後台的任務看板清單檢視：七件示範任務依待處理、進行中、驗收中、完成、卡住了分組，每件都有編號、客服或行銷等標籤與優先度">
@@ -59,7 +59,7 @@ duduclaw run                  # 接著打開 http://localhost:18889
 | 多 LLM 容錯切換 | 手動重啟 | 4 種輪替策略 + 跨供應商 failover |
 | 換 LLM 時保留上下文 | 遺失 | 完整保留 |
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
-| 工具跨 LLM 共用 | 每家重寫 | 247 個 MCP 工具寫一次,Claude、Codex、Gemini、Antigravity、Grok 與 OpenAI 相容 runtime 都能呼叫 |
+| 工具跨 LLM 共用 | 每家重寫 | 247 個 MCP 工具寫一次,Claude、Codex、Gemini、Grok 與 OpenAI 相容 runtime 都能呼叫 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
 | 交給客戶的整台值班機 | 自己裝 Linux,更新與防竄改自己管 | DuDuClaw OS 映像:A/B 更新回滾 + 唯讀 root,插電即用;人機共用桌面,不影響日常使用 |
 
@@ -72,12 +72,12 @@ v1.76.0：[排程交辦](docs/features/zh-TW/67-assigning-tasks.md)可從聊天�
 AI 運行時是大腦,DuDuClaw 是水電管線,中間用 MCP(JSON-RPC 2.0)橋接。大腦可換,管線不動:
 
 ```
-AI Runtime (brain) — Claude Code / Codex / Antigravity / Grok / … (11 CLIs) / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Grok / … (10 CLIs) / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
-  ├─ Multi-Runtime — 12 個 runtime id(11 種 CLI + OpenAI-compat),自動偵測,per-agent 設定
+  ├─ Multi-Runtime — 11 個 runtime id(10 種 CLI + OpenAI-compat),自動偵測,per-agent 設定
   ├─ Session Memory — 原生 --resume + 時態記憶 + key-fact 累積 + 分層 wiki
   ├─ MCP Server — 247 個工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
   ├─ Evolution Engine — 預測驅動 + AEE playbook 進化(v3 預設) + MistakeNotebook
@@ -99,7 +99,7 @@ Rust workspace 由 24 個 crate 組成:核心地基 `duduclaw-core`、服務層 
 
 DuDuClaw 本身不含 LLM,需要一個 AI 大腦。三選一(之後也能在瀏覽器引導中設定):
 
-- 裝好一個支援的 AI CLI,例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex) 或 Antigravity(完整清單見 [multi-runtime](docs/features/zh-TW/13-multi-runtime.md);Gemini CLI 已不再是 DuDuClaw runtime),並給它一把 API key。Anthropic 的[規範](https://code.claude.com/docs/en/legal-and-compliance)不允許第三方產品提供 Claude.ai 登入、用 Free/Pro/Max 方案的憑證替使用者轉送請求,或保存這些憑證,而且可能不經通知就執行(有使用者回報帳號被停權)。Google 的 [Antigravity 條款](https://antigravity.google/terms)第 6 節寫明,用第三方軟體透過訂閱的 OAuth 登入存取服務,可能導致帳號被停權或終止。請用 API key;訂閱登入仍可使用,但要先勾選同意風險說明
+- 裝好一個支援的 AI CLI,例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)(完整清單見 [multi-runtime](docs/features/zh-TW/13-multi-runtime.md);Gemini CLI 已不再是 DuDuClaw runtime),並給它一把 API key。Anthropic 的[規範](https://code.claude.com/docs/en/legal-and-compliance)不允許第三方產品提供 Claude.ai 登入、用 Free/Pro/Max 方案的憑證替使用者轉送請求,或保存這些憑證,而且可能不經通知就執行(有使用者回報帳號被停權)。請用 API key;訂閱登入仍可使用,但要先勾選同意風險說明
 - 準備一把 API key,走任何 OpenAI 相容供應商
 - 或把本地模型掛在 OpenAI 相容伺服器後面(llama-server、Ollama、vLLM、llamafile),不需要任何雲端帳號
 
@@ -192,13 +192,13 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 領域 | 內建能力 | 深入閱讀 |
 |------|----------|----------|
 | 通訊通道 | 11 通道(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板;Telegram 語音訊息經 OpenAI Whisper API 轉文字。Discord 語音頻道是非預設的編譯選項,發行版 binary 不含 | [docs/features](docs/features/README.md) |
-| Multi-Runtime | 12 個 runtime id:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode 加上 OpenAI-compat;自動偵測、per-agent 設定、換後端保留上下文 | [docs/features/13](docs/features/zh-TW/13-multi-runtime.md) |
+| Multi-Runtime | 11 個 runtime id:Claude Code / Codex / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode 加上 OpenAI-compat;自動偵測、per-agent 設定、換後端保留上下文 | [docs/features/13](docs/features/zh-TW/13-multi-runtime.md) |
 | 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP Server | 247 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport;外部客戶端的 key 預設只能用 7 個基本工具,操作者可另外授與記憶、wiki 或訊息類 scope,連接器、執行類與管理類工具一律不對外 | [docs/api](docs/api/README.md) |
 | 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
 | 自我進化 | 預測驅動(設計上多數對話不需呼叫 LLM)、AEE playbook 進化(SOUL.md 對 agent 唯讀;學到的是一條條連結 eval 案例的小規則,不輸目前的 playbook 才提交,24 小時後逐條結算,退步只撤那一條)、MistakeNotebook 跨回合記憶 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱(逐 agent 開啟,預設關)、容器沙箱(任務沙箱只支援 Docker,預設關;腳本沙箱用 Docker,Windows 先試 WSL2)、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
-| 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析。每次呼叫都以新行程執行官方 CLI(PTY 連線池已於 2026-09 移除;需要終端機的 CLI,例如 Grok,改用一次性偽終端)。Anthropic 的[規範](https://code.claude.com/docs/en/legal-and-compliance)不允許第三方產品用 Claude 訂閱憑證轉送請求,Google 的 Antigravity 條款也寫明第三方軟體透過訂閱 OAuth 存取可能導致帳號停權或終止,請用 API key;訂閱登入仍可使用,但需明確同意風險說明([multi-runtime](docs/features/zh-TW/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
+| 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析。每次呼叫都以新行程執行官方 CLI(PTY 連線池已於 2026-09 移除;需要終端機的 CLI,例如 Grok,改用一次性偽終端)。Anthropic 的[規範](https://code.claude.com/docs/en/legal-and-compliance)不允許第三方產品用 Claude 訂閱憑證轉送請求,請用 API key;訂閱登入仍可使用,但需明確同意風險說明([multi-runtime](docs/features/zh-TW/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
 | 本地推論 | 指向任一 OpenAI 相容本地伺服器(llama-server / Ollama / vLLM / SGLang)或 llamafile,三層信心路由自動分流 | [docs/features](docs/features/README.md) |
 | 微調與後訓練 | 從本機對話、任務結果與審批決定建構 SFT / DPO 資料集(ShareGPT / Alpaca),送到自有 GPU 主機(SSH + LLaMA-Factory)或 Together 雲端訓練,GGUF / LoRA 匯回本地模型目錄;本機不做訓練(內顯跑不動),資料離機需明確確認 | [docs/features/54](docs/features/54-finetune.md) |
 | Live Forking | RFC-26:把進行中的任務分叉成 N 個競爭分支,各自 copy-on-write 隔離、AI judge 選勝者合併(預設關閉;v1.67.0 請勿在 Windows 開啟,見 CHANGELOG) | [docs/rfc](docs/rfc) |
@@ -272,7 +272,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 |---|---|---|---|---|
 | 語言 | Rust | TypeScript | Rust | Python |
 | 通道 | 11 | 25+ | 8 | 0(API)|
-| Multi-Runtime | 12 個 runtime id(11 種 CLI + OpenAI-compat) | 單一 | 單一 | 多 LLM |
+| Multi-Runtime | 11 個 runtime id(10 種 CLI + OpenAI-compat) | 單一 | 單一 | 多 LLM |
 | MCP Server | 247 個工具 | 無 | 無 | 無 |
 | 自我進化引擎 | AEE playbook 規則(預測驅動) | 無 | 無 | 無 |
 | 本地推論 | OpenAI 相容本地伺服器 / llamafile + 信心路由 | 無 | 無 | 無 |

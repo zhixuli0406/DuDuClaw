@@ -176,8 +176,8 @@ grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "
 two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
 strict_reply_parsing = "shadow"  # Judge replies under the strict JSON contract: off / shadow / enforce (see "Strict reply contract"). Default shadow
 judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only were removed in v1.69.0). Default mav
-judge_provider = "antigravity"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
-judge_model = "gemini-3-pro-preview" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
+judge_provider = "codex"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
+judge_model = "gpt-5.4" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
 admission = "queue"     # What happens when ephemeral spawns hit the concurrency cap, "queue" or "fail". Default queue (see "Ephemeral spawn admission queueing" below)
 
 [task_forward_model]    # Task-level forward model (see the section of the same name). On by default since v1.54
@@ -404,7 +404,7 @@ When the AI employee reports completion and a task enters review, before the acc
 
 ## Task forward model (v1.53; default on since v1.54)
 
-When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." It runs for every runtime, but how much it sees depends on whether the runtime feeds the native tool-event collector. Claude (the dispatch stream-json path), Codex, Antigravity and OpenAI-compatible agents record their native tool events, so their observations can reach `Full`. Grok and the seven generic print-mode CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) attach no collector, so their observations are `McpOnly` (built from `tool_calls.jsonl` alone), or `None` when that file holds nothing for the round. The pipeline:
+When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." It runs for every runtime, but how much it sees depends on whether the runtime feeds the native tool-event collector. Claude (the dispatch stream-json path), Codex, OpenAI-compatible agents record their native tool events, so their observations can reach `Full`. Grok and the seven generic print-mode CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) attach no collector, so their observations are `McpOnly` (built from `tool_calls.jsonl` alone), or `None` when that file holds nothing for the round. The pipeline:
 
 - **Layered prediction fallback**: uses matching statistics when available, falls back to overall marginal statistics, then a prior default. Cold start never spends an LLM call.
 - **Honest fidelity grading**: every observation is tagged with its evidence fidelity (native tool events / audit-log-only / no evidence), so "we didn't see it" is never conflated with "it didn't happen."
@@ -451,10 +451,12 @@ A bad value doesn't quietly take effect: the gateway warns and falls back to `ma
 
 A judge drawn from the same model family as the worker tends to forgive exactly the mistakes that family makes — it shares the worker's blind spots, so a second opinion from the same vendor is worth less than it looks (arXiv:2607.13918). Two optional keys move the acceptance judge, and the cheap first-stage evaluator with it, onto a different runtime and model:
 
+Removed runtime settings are refused before execution and require the operator to choose another runtime and compatible model. They do not use the fallback described below.
+
 ```toml
 [dispatch]
-judge_provider = "antigravity"        # A runtime id: claude, codex, antigravity, grok, openai_compat, …
-judge_model = "gemini-3-pro-preview"   # Model id within that runtime
+judge_provider = "codex"        # A runtime id: claude, codex, grok, openai_compat, …
+judge_model = "gpt-5.4"   # Model id within that runtime
 ```
 
 Both are optional and independent. Unset, the judge keeps using the ordinary utility model (`[runtime] utility_provider` / `utility_model`) — which is exactly the behavior every existing deployment already has, so leaving these out changes nothing.

@@ -64,7 +64,7 @@ decision_continuity = true
 
 ```toml
 [runtime]
-provider = "antigravity"   # claude | codex| antigravity | openai_compat
+provider = "codex"   # claude | codex| openai_compat
 fallback = "claude"        # 検出できない場合に使うバックエンド
 ```
 
@@ -72,23 +72,8 @@ fallback = "claude"        # 検出できない場合に使うバックエンド
 |----------|-----------|------|------|
 | `claude` | `claude`（常に利用可能、コア） | OAuth / API Key ローテーション | デフォルトバックエンド |
 | `codex` | `codex` | OpenAI | — |
-| `antigravity` | `agy`（`~/.local/bin/agy`） | Google サインイン（ターミナルで `agy` を実行）/ `GEMINI_API_KEY` | Gemini CLI の公式後継、マルチモデル（Gemini 3.x + Claude + GPT-OSS） |
 | `openai_compat` | HTTP（CLI なし） | プロバイダーごとのキー | Exo / llamafile / vLLM などの OpenAI 互換エンドポイント |
 
-**Antigravity（`agy`）固有の注意事項**（詳細は
-[TODO-antigravity-cli-migration.md](../../todo/TODO-antigravity-cli-migration.md) を参照）。
-
-- Agent ディレクトリは自動的に agy の `trustedWorkspaces` に追加され、headless 実
-  行時に「このワークスペースを信頼しますか？」というプロンプトで止まることを回
-  避します。
-- print モードには JSON 出力がないため、トークン使用量は CJK 対応のヒューリステ
-  ィック推定値であり、正確な値ではありません。
-- Gateway が呼び出せるようにするには、事前に認証を済ませる必要があります。ホストの
-  ターミナルで `agy` を実行して Google サインインの案内に従う（`agy login` サブコマンドは
-  ありません）か、API キーモードを使います。`config.toml` に `[antigravity] auth = "api_key"`
-  を設定し、Gemini API キー（`gemini` プロバイダーのアカウント、または環境変数
-  `GEMINI_API_KEY`）を用意してください。keyring やブラウザのないコンテナ・リモートホストでは
-  API キーモードを使います。
 
 ### 1.5 ライブ検証用ホーム（Live validation home）
 
@@ -101,7 +86,7 @@ scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
 scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
 ```
 
-gateway を起動するときは、必ず `HOME` を、`make-home.sh` が隔離ホームの中に作る `os-home` ディレクトリに向けてください。gateway と、それが起動する AI CLI は、`HOME` の下からログインと設定を探します。`DUDUCLAW_HOME` だけを変えると、起動された `claude` はオペレーター自身のログインを使い、オペレーター自身の利用枠を消費します。Antigravity の API キーモードでは、オペレーター自身の設定ファイルが書き換えられます。`mcp-probe.sh` も、MCP サーバーを起動するときに同じ `os-home` を使います。
+gateway を起動するときは、必ず `HOME` を、`make-home.sh` が隔離ホームの中に作る `os-home` ディレクトリに向けてください。gateway と、それが起動する AI CLI は、`HOME` の下からログインと設定を探します。`DUDUCLAW_HOME` だけを変えると、起動された `claude` はオペレーター自身のログインを使い、オペレーター自身の利用枠を消費します。`mcp-probe.sh` も、MCP サーバーを起動するときに同じ `os-home` を使います。
 
 このホームには従業員が 2 人います。`plain`（allowlist なし）と `prod-shaped`（`allowed_tools = ["mcp__duduclaw__*", ...]`、denied と承認リスト、明示的な権限フラグ、予算、契約付き）です。v1.67.0 以降のワイルドカード allowlist がすべてのプラットフォームツールを拒否していた不具合は、検証用従業員に allowlist がなかったため見逃されました。ルール: 本番ホームをアップグレードしたら、各従業員自身の MCP 登録を通して実際のツールを呼びます（`mcp-probe.sh ~/.duduclaw <agent-id>`）。隔離ホームはオペレーターの Claude コネクタ（Drive、Gmail）までは隔離しないため、テストタスクには外部サービスを照会しないよう明記してください。ビルドキャッシュでディスクが埋まったときは、まず `scripts/clean-build-cache.sh --dry-run` を実行します。サードパーティの成果物は残し、`cargo` や `rustc` が動いている間は実行を拒否します。詳細は `scripts/live-test/README.md`。
 

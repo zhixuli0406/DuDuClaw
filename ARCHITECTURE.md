@@ -32,7 +32,7 @@
 
 | 決策項目 | 選擇 | 理由 |
 |----------|------|------|
-| AI 對話 | **多 runtime CLI**（`AgentRuntime` trait）：Claude Code、Codex、Antigravity（`agy`）、Grok、OpenAI-compatible；Gemini CLI 於 v1.67.0 棄用、v1.75.0 移除（由 Antigravity 取代）；另有 `runtime_catalog.rs` 收錄的其他 CLI | 工具鏈、MCP 相容與 session 由各家 CLI 負責，per-agent 在 `agent.toml [runtime]` 選擇 |
+| AI 對話 | **多 runtime CLI**（`AgentRuntime` trait）：Claude Code、Codex、Grok、OpenAI-compatible；Gemini CLI 於 v1.67.0 棄用、v1.75.0 移除；另有 `runtime_catalog.rs` 收錄的其他 CLI | 工具鏈、MCP 相容與 session 由各家 CLI 負責，per-agent 在 `agent.toml [runtime]` 選擇 |
 | 核心語言 | **Rust** | 記憶體安全、高效能、單 binary 部署 |
 | Python | **獨立 companion 套件**（`pip install duduclaw`），無 PyO3 綁定 | Rust binary 不呼叫它，見第五節 |
 | Agent 隔離 | **資料夾 + SOUL.md**；選配 Docker 任務沙箱（預設關） | 預設無容器開銷；沙箱見 [docs/guides/task-sandbox.md](docs/guides/task-sandbox.md) |
@@ -53,8 +53,8 @@ DuDuClaw 本身不訓練、不提供模型。對話、工具使用與上下文�
 
 ```
 ┌─────────────────────────────────────────────┐
-│ AI Runtime（Claude Code / Codex / agy /     │
-│ Grok / OpenAI-compat / Gemini CLI 棄用中）   │
+│ AI Runtime（Claude Code / Codex / Grok /     │
+│ 其他 CLI / OpenAI-compat）                   │
 └────────────────┬────────────────────────────┘
                  │ MCP（JSON-RPC 2.0，stdio；另有 HTTP/SSE）
 ┌────────────────▼────────────────────────────┐
@@ -139,7 +139,7 @@ axum HTTP + WebSocket（/ws）
     ├── channel_reply/   — 通道回覆、session 管理、prompt 組裝、token 壓縮
     ├── server.rs        — 路由、WebSocket 連線處理（tokio::select! 並行驅動）
     ├── log.rs           — BroadcastLayer：tracing → WebSocket push
-    ├── runtime/         — claude / codex / gemini / antigravity / grok / openai_compat / generic_cli
+    ├── runtime/         — claude / codex / gemini / grok / openai_compat / generic_cli
     ├── dispatcher.rs    — bus_queue 消費與 sub-agent spawn
     └── telegram.rs / line.rs / discord.rs / slack.rs / whatsapp.rs / feishu.rs /
         googlechat.rs / msteams.rs / wecom.rs / dingtalk.rs / webchat.rs
@@ -463,7 +463,6 @@ status = "active"
 reports_to = ""
 
 # [runtime]
-# provider = "antigravity"   # claude（預設）| codex | antigravity | openai_compat | …
 # fallback = "claude"
 
 [model]

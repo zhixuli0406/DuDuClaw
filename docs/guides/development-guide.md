@@ -65,7 +65,7 @@ when the primary one is unavailable.
 
 ```toml
 [runtime]
-provider = "antigravity"   # claude | codex | antigravity | openai_compat
+provider = "codex"   # claude | codex | openai_compat
 fallback = "claude"        # backend to fall back to when detection fails
 ```
 
@@ -73,22 +73,8 @@ fallback = "claude"        # backend to fall back to when detection fails
 |----------|-----------|------|------|
 | `claude` | `claude` (always available, core) | OAuth / API key rotation | Default backend |
 | `codex` | `codex` | OpenAI | — |
-| `antigravity` | `agy` (`~/.local/bin/agy`) | Google sign-in (`agy` in a terminal) / `GEMINI_API_KEY` | Official successor to the Gemini CLI; multi-model (Gemini 3.x + Claude + GPT-OSS) |
 | `openai_compat` | HTTP (no CLI) | per-provider key | OpenAI-compatible endpoints such as Exo / llamafile / vLLM |
 
-**Antigravity (`agy`) specifics** (see
-[TODO-antigravity-cli-migration.md](../todo/TODO-antigravity-cli-migration.md)):
-
-- The agent directory is automatically added to agy's `trustedWorkspaces`, so a
-  headless run doesn't get stuck on the "trust this workspace?" prompt.
-- Print mode has no JSON output, so token usage is a CJK-aware heuristic estimate,
-  not an exact figure.
-- Authenticate once before the gateway can call it: either run `agy` in a
-  terminal on the host and follow the Google sign-in prompts (there is no
-  `agy login` subcommand), or use API-key mode: set `config.toml [antigravity]
-  auth = "api_key"` and supply a Gemini API key (a `gemini` provider account or
-  the `GEMINI_API_KEY` environment variable). Use API-key mode in a container
-  or remote host with no keyring or browser.
 
 ### 1.5 Live validation home
 
@@ -105,8 +91,7 @@ Always start the gateway with `HOME` pointing at the `os-home` directory that
 `make-home.sh` creates inside the isolated home. The gateway and the AI CLI it
 spawns look for logins and settings under `HOME`. If only `DUDUCLAW_HOME` is
 changed, the spawned `claude` uses the operator's own login and spends the
-operator's own quota, and Antigravity's API-key mode rewrites the operator's own
-settings file. `mcp-probe.sh` starts the MCP server with the same `os-home`.
+operator's own quota. `mcp-probe.sh` starts the MCP server with the same `os-home`.
 
 The home holds two employees: `plain` (no allowlist) and `prod-shaped`
 (`allowed_tools = ["mcp__duduclaw__*", ...]`, denied and approval lists, explicit
