@@ -516,3 +516,7 @@ new table is [deprecations.md](deprecations.md). No MCP tool is deprecated at th
 - [../spec/reversible-context-ccr.md](../spec/reversible-context-ccr.md) — the
   `duduclaw_ccr_*` tools, which are injected by the direct-API tool loop rather
   than dispatched by the MCP server
+
+## Declare a credential's service (unreleased)
+
+`credential_declare` accepts `credential_id` and `service` only. Employee notes are rejected; the service must match `^[a-z0-9][a-z0-9._-]{0,63}$` and pass credential detection. Only an authenticated employee holding that credential may declare it, through the signed gateway loopback route. An employee cannot override an Admin-set service. This tool annotates existing audit metadata; it does not retrieve a secret, grant another holder access or substitute a value into a tool call. Use **Security → Credential audit** as an Admin to review and correct records. See [Credential audit](../features/70-credential-audit.md).

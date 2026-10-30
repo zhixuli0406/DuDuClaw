@@ -558,7 +558,7 @@ where
         let agent = agent_id.to_string();
         let source = request_type.as_str().to_string();
         // Store masks + caps again; this pre-trim just bounds the move.
-        let preview_in = duduclaw_core::truncate_chars(prompt, 500);
+        let preview_in = duduclaw_core::truncate_chars(&duduclaw_security::credential_detect::mask(prompt), 500);
         let watch_run_key = run_key.clone();
         let _ = tokio::task::spawn_blocking(move || {
             match store.record_dispatch_run(
@@ -590,8 +590,8 @@ where
     // errors just skip this round's ingest.
     if let Ok(reply) = &result {
         if !reply.trim().is_empty() && ingest_throttle_acquire(home_dir, agent_id) {
-            let user_text = prompt.to_string();
-            let reply = reply.clone();
+            let user_text = duduclaw_security::credential_detect::mask(prompt);
+            let reply = duduclaw_security::credential_detect::mask(reply);
             let agent = agent_id.to_string();
             let home = home_dir.to_path_buf();
             let memory_db = home_dir.join("memory.db");
@@ -783,6 +783,18 @@ async fn call_claude_for_agent_impl(
 ) -> Result<String, String> {
     #[cfg(test)]
     crate::model_call_probe::record("claude_runner");
+    // Cron and direct task calls do not pass through the bus dispatcher.
+    let credential_prompt = if matches!(request_type, crate::cost_telemetry::RequestType::Cron | crate::cost_telemetry::RequestType::Dispatch)
+        && !crate::credential_ledger::DISPATCH_SCANNED.try_with(|v| *v).unwrap_or(false)
+    {
+        let source = crate::memory_provenance::DISPATCH_RUN.try_with(|r| r.clone()).ok().flatten()
+            .map(|(session, key)| format!("{session}:run:{key}"))
+            .unwrap_or_else(|| format!("dispatch:{}", uuid::Uuid::new_v4().simple()));
+        let sender = DELEGATION_ENV.try_with(|env| env.get(duduclaw_core::ENV_DELEGATION_SENDER).cloned()).ok().flatten()
+            .unwrap_or_else(|| "scheduler".to_string());
+        Some(crate::credential_ledger::process_message(home_dir, prompt, &source, &sender, agent_id, "dispatch").await)
+    } else { None };
+    let prompt = credential_prompt.as_deref().unwrap_or(prompt);
     let reg = registry.read().await;
 
     let agent = match preloaded {
@@ -1755,6 +1767,10 @@ fn finish_mcp_tool_registry(
     registry: Option<duduclaw_llm::ToolRegistry>,
 ) -> Option<duduclaw_llm::ToolRegistry> {
     let mut registry = registry?;
+    let observer = crate::credential_declaration::ToolObservation::new(home, agent_id);
+    if registry.register_client_boundary(0, std::sync::Arc::new(observer)).is_err() {
+        warn!("credential observation unavailable for internal MCP tools");
+    }
     crate::causal_mcp_source::fence_declared_verified_routes(home, &mut registry);
     if let Some(runtime) = crate::ccr_runtime::for_agent(home, agent_id) {
         if let Err(error) =
@@ -1886,6 +1902,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     let mut filters = vec![duduclaw_llm::ToolFilter::default()];
     let mut google_guards = Vec::new();
     let mut external_boundaries = Vec::new();
+    let mut credential_observers = Vec::new();
     for ext in externals {
         if let Some(mount) = ext.google_closed.clone() {
             external_boundaries.push((clients.len(), ext.name.clone()));
@@ -1949,6 +1966,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         {
             Ok(c) => {
                 info!(server = %server.name, "third-party .mcp.json server mounted behind duduclaw mcp-proxy");
+                credential_observers.push(clients.len());
                 clients.push((server.name, duduclaw_llm::RegistryClient::Persistent(c)));
                 filters.push(duduclaw_llm::ToolFilter::default());
             }
@@ -1961,6 +1979,12 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     let registry = match duduclaw_llm::ToolRegistry::from_client_slots_named(clients, filters).await
     {
         Ok(mut reg) => {
+            for client in credential_observers {
+                let observer = crate::credential_declaration::ToolObservation::new(&home_dir, agent_id);
+                if reg.register_client_boundary(client, std::sync::Arc::new(observer)).is_err() {
+                    warn!("credential observation unavailable for a proxied MCP client");
+                }
+            }
             for (client, server) in external_boundaries {
                 let boundary = crate::egress_registry::RegistryBoundary::new(&home_dir, agent_id, &server);
                 if reg.register_client_boundary(client, std::sync::Arc::new(boundary)).is_err() {

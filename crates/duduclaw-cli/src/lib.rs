@@ -6355,6 +6355,27 @@ fn agent_file_guard_decision(
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
     let decision = match tool_name {
+        "Read" => {
+            let Some(raw) = envelope.pointer("/tool_input/file_path").and_then(|v| v.as_str()) else {
+                return Some(duduclaw_core::GuardDecision::BlockedUnresolvablePath {
+                    attempted_path: PathBuf::new(), reason: "讀取路徑無法確認".into(),
+                });
+            };
+            let path = PathBuf::from(raw);
+            let path = if path.is_absolute() { path } else {
+                let base = cwd.clone().or_else(|| match caller {
+                    duduclaw_core::HookCaller::Agent(id) | duduclaw_core::HookCaller::Untrusted(id) => agent_dir_of(&home, id),
+                    duduclaw_core::HookCaller::Absent => None,
+                });
+                let Some(base) = base else {
+                    return Some(duduclaw_core::GuardDecision::BlockedUnresolvablePath {
+                        attempted_path: path, reason: "相對讀取路徑沒有工作目錄".into(),
+                    });
+                };
+                base.join(path)
+            };
+            duduclaw_core::agent_guard::check_credential_read(&path, &home)
+        }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             // NotebookEdit names its target `notebook_path`.
             let Some(file_path_str) = envelope
@@ -6484,7 +6505,7 @@ fn agent_file_guard_decision(
                 }
             }
         }
-        // Other tool calls (Read, Grep, WebSearch, etc.) are none of our business.
+        // Other tool calls (Grep, WebSearch, etc.) are none of our business.
         _ => return None,
     };
     Some(decision)
@@ -9418,6 +9439,18 @@ fn gateway_instance_check(home: &std::path::Path) -> (String, CheckStatus, Strin
 /// employee or acceptance judge runs on a runtime that may not report token
 /// usage. Such a run is charged its full per-run cap for every unmeasured
 /// round. Advisory: Warn, never Fail. Reads `tasks.db` only when it exists.
+fn credential_audit_chain_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let (status, detail) = match duduclaw_gateway::security_posture::verify_security_audit(home) {
+        Ok(value) => match value["status"].as_str() {
+            Some("current_segment_consistent") => (CheckStatus::Pass, format!("目前區段內部一致（{} 筆鏈結）；輪替後僅驗證目前區段，不涵蓋封存區段，也無法證明尾端未遭刪除。", value["lines_checked"])),
+            Some("broken") => (CheckStatus::Fail, format!("第 {} 行的稽核鏈結不一致。", value["line_number"])),
+            _ => (CheckStatus::Warn, "尚無可驗證的稽核鏈結。".into()),
+        },
+        Err(_) => (CheckStatus::Fail, "稽核鏈無法讀取，尚未驗證完整性。".into()),
+    };
+    ("憑證稽核鏈".into(), status, detail)
+}
+
 async fn responsibility_usage_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let name = "持續任務的用量回報".to_string();
     let db = home.join("tasks.db");
@@ -10153,6 +10186,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
 
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);
+    checks.push(credential_audit_chain_check(&home));
 
     // Print results
     let mut has_failure = false;
@@ -10682,6 +10716,7 @@ skill_security_scan = true
              - To create sub-agents, call the `create_agent` MCP tool. Never fabricate \
              agent creation in plain text.\n\
              - To delegate work, use `send_to_agent` or `spawn_agent`.\n\
+             - For a gateway-supplied credential id you hold, use `credential_declare` to label its service; never supply the value.\n\
              - When uncertain about state, call `list_agents` first.\n"
         )
     });
@@ -14517,5 +14552,19 @@ mod removed_name_hook_tests {
         )
         .unwrap();
         assert!(d.is_allowed(), "{d:?}");
+    }
+}
+
+#[cfg(test)]
+mod credential_read_lane_tests {
+    use super::*;
+
+    #[test]
+    fn native_read_cannot_read_credential_ledger() {
+        let home = std::path::Path::new("/tmp/credential-read-lane-test");
+        let envelope = serde_json::json!({"tool_input":{"file_path":home.join("credentials/ledger.db")}});
+        let decision = agent_file_guard_decision("Read", &envelope, home,
+            &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
+        assert!(!decision.is_allowed());
     }
 }

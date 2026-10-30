@@ -752,7 +752,52 @@ export interface CredentialEntry {
   writable: boolean;
   /** A plaintext twin sits next to an encrypted twin (design §1.5). */
   residue: boolean;
+  source_kind?: string;
+  holder?: string | null;
+  service?: string | null;
+  kind?: string | null;
 }
+export type ChatCredentialKind = 'password' | 'api_key' | 'oauth_token' | 'ssh_key' | 'certificate' | 'connection_string' | 'cookie' | 'other';
+export type ChatCredentialStatus = 'active' | 'revoked' | 'rotated' | 'expired' | 'false_positive';
+export interface ChatCredential {
+  id: string;
+  kind: ChatCredentialKind;
+  account_hint: string | null;
+  service: string | null;
+  service_source: string | null;
+  source_kind: string;
+  source_ref: string;
+  provided_by: string;
+  status: ChatCredentialStatus;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_used_at: string | null;
+  note: string | null;
+  note_source?: string;
+  holders: Array<{ holder_kind: string; holder_id: string; revoked_at?: string | null }>;
+}
+export interface CredentialAuditQuery {
+  kind?: string;
+  status?: string;
+  service?: string;
+  limit?: number;
+  offset?: number;
+  export?: boolean;
+}
+export interface SecurityAuditVerification {
+  status: 'missing' | 'unverified' | 'current_segment_consistent' | 'broken';
+  scope: 'current_segment';
+  intact: boolean;
+  lines_checked?: number;
+  line_number?: number;
+}
+
+export interface CredentialAuditReport {
+  credentials: ChatCredential[];
+  mode: 'audit' | 'mask';
+  total?: number;
+}
+
 export interface CredentialInventoryReport {
   entries: CredentialEntry[];
   total: number;
@@ -7399,9 +7444,19 @@ export const api = {
     trigger: (agentId: string) =>
       client.call('heartbeat.trigger', { agent_id: agentId }) as Promise<{ success: boolean }>,
   },
+  credentials: {
+    auditList: (params: CredentialAuditQuery = {}) =>
+      client.call('credentials.audit_list', params) as Promise<CredentialAuditReport>,
+    auditGet: (id: string) =>
+      client.call('credentials.audit_get', { id }) as Promise<ChatCredential>,
+    auditUpdate: (params: { id: string; service?: string; note?: string; status?: ChatCredentialStatus }) =>
+      client.call('credentials.audit_update', params) as Promise<ChatCredential>,
+  },
   security: {
     egressShadowReport: (days: 7 | 30 = 7) =>
       client.call('security.egress_shadow_report', { days }) as Promise<EgressShadowReport>,
+    auditVerify: () =>
+      client.call('security.audit_verify') as Promise<SecurityAuditVerification>,
     auditLog: (limit = 50) =>
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
     status: () =>

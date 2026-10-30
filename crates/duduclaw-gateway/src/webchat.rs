@@ -580,6 +580,17 @@ fn widget_authenticate(home_dir: &std::path::Path, presented: &str) -> Result<St
     Ok(format!("{WIDGET_VISITOR_PREFIX}{}", uuid::Uuid::new_v4()))
 }
 
+/// Credential quotas use the authenticated account, never the socket suffix.
+/// Widget identities deliberately rotate for session isolation, so all widget
+/// visitors share a bucket and never become durable user holders.
+pub(crate) fn credential_principal(auth_user: &str) -> String {
+    if is_widget_visitor(auth_user) || auth_user.is_empty() {
+        return "webchat-anonymous".into();
+    }
+    use sha2::{Digest, Sha256};
+    format!("webchat-user:{}", hex::encode(Sha256::digest(auth_user.as_bytes())))
+}
+
 /// Stable, id-safe owner tag for an authenticated user.
 ///
 /// A raw user id cannot go into a session id directly: ids are `:`-delimited

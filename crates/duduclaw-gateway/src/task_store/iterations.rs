@@ -90,7 +90,7 @@ impl TaskStore {
         if let Some(id) = row_id {
             conn.execute(
                 "UPDATE task_iterations SET evaluator_verdict = ?2 WHERE id = ?1",
-                params![id, evaluator_verdict],
+                params![id, mask_derived_text(evaluator_verdict)],
             )
             .map_err(|e| format!("iter evaluator update: {e}"))?;
         }
@@ -103,6 +103,7 @@ impl TaskStore {
     /// [`Self::record_iteration_evaluator_verdict`] uses). No open round ⇒
     /// only the task column is written.
     pub async fn set_criteria_ledger(&self, task_id: &str, ledger_json: &str) -> Result<(), String> {
+        require_safe_contract(ledger_json)?;
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -151,7 +152,7 @@ impl TaskStore {
             .execute(
                 "UPDATE tasks SET result_summary = ?3
                   WHERE id = ?1 AND result_summary = ?2",
-                params![task_id, expected, replacement],
+                params![task_id, expected, mask_derived_text(replacement)],
             )
             .map_err(|e| format!("rewrite result_summary: {e}"))?;
         Ok(n > 0)
@@ -187,7 +188,7 @@ impl TaskStore {
               WHERE id = (SELECT id FROM task_iterations WHERE task_id = ?1
                            ORDER BY round DESC, id DESC LIMIT 1)
                 AND pause_reason IS NULL",
-            params![task_id, pause],
+            params![task_id, mask_derived_text(pause)],
         )
         .map_err(|e| format!("iter pause stamp: {e}"))?;
         Ok(())
@@ -394,6 +395,9 @@ fn iter_dispatch_conn(
     repeat_streak: Option<i64>,
     ledger: &IterationDispatchLedger,
 ) -> Result<(), String> {
+    if let Some(state) = ledger.state_block_json.as_deref() {
+        require_safe_contract(state)?;
+    }
     let latest: Option<(i64, bool)> = conn
         .query_row(
             "SELECT id, judged_at IS NOT NULL OR verdict IS NOT NULL
@@ -421,7 +425,7 @@ fn iter_dispatch_conn(
                 repeat_streak,
                 ledger.iter_seq,
                 ledger.team_mode.as_deref(),
-                ledger.gate_inputs_json.as_deref(),
+                ledger.gate_inputs_json.as_deref().map(mask_derived_text),
                 ledger.state_block_json.as_deref()
             ],
         )
@@ -440,7 +444,7 @@ fn iter_dispatch_conn(
             repeat_streak,
             ledger.iter_seq,
             ledger.team_mode.as_deref(),
-            ledger.gate_inputs_json.as_deref(),
+            ledger.gate_inputs_json.as_deref().map(mask_derived_text),
             ledger.state_block_json.as_deref()
         ],
     )
@@ -532,11 +536,11 @@ pub(super) fn iter_verdict_conn(
                 id,
                 now,
                 verdict,
-                feedback,
-                verdict_json,
-                worker_excerpt,
-                knobs_json,
-                pause_reason
+                mask_derived_text(feedback),
+                verdict_json.map(mask_derived_text),
+                worker_excerpt.map(mask_derived_text),
+                knobs_json.map(mask_derived_text),
+                pause_reason.map(mask_derived_text)
             ],
         )
         .map_err(|e| format!("iter verdict update: {e}"))?;
@@ -580,7 +584,7 @@ pub(super) fn iter_escalate_seal_conn(
                 SET judged_at = ?2, verdict = 'escalated', worker_excerpt = ?3,
                     knobs_json = ?4, pause_reason = ?5
               WHERE id = ?1",
-            params![id, now, worker_excerpt, knobs_json, pause_reason],
+            params![id, now, worker_excerpt.map(mask_derived_text), knobs_json.map(mask_derived_text), mask_derived_text(pause_reason)],
         )
         .map_err(|e| format!("iter escalate update: {e}"))?;
     }

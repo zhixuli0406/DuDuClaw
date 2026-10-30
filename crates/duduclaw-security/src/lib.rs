@@ -2,6 +2,7 @@ pub mod action_claim_verifier;
 pub mod audit;
 pub mod audit_chain;
 pub mod circuit_breaker;
+pub mod credential_detect;
 pub mod credential_protection;
 pub mod crypto;
 pub mod failsafe;

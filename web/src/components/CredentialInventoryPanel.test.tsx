@@ -39,6 +39,18 @@ function mockInventory(entries: CredentialEntry[]) {
 }
 
 describe('<CredentialInventoryPanel>', () => {
+  it('shows system credential projections as metadata with their service and holder', async () => {
+    mockInventory([entry({
+      path: 'remote_mcp.support.crm', source: 'inline', source_kind: 'config',
+      service: 'CRM', holder: 'agent:support', kind: 'remote_mcp', writable: false,
+    })]);
+    renderWithProviders(<CredentialInventoryPanel />);
+    expect(await screen.findByText('System settings')).toBeInTheDocument();
+    expect(screen.getByText('CRM')).toBeInTheDocument();
+    expect(screen.getByText('agent:support')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /edit/i })).not.toBeInTheDocument();
+  });
+
   it('labels each field by where its value comes from', async () => {
     mockInventory([
       entry({ path: 'channels.telegram_bot_token', source: 'inline' }),

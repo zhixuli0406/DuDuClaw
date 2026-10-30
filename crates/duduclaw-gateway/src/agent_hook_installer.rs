@@ -67,7 +67,7 @@ const HOOK_ID: &str = "agent-file-guard";
 /// Tools the agent-file-guard hook sees. `NotebookEdit` joined in G1 round 2:
 /// it writes any `.ipynb` path (including through a link), and the hook judges
 /// its `notebook_path` like a Write.
-const AGENT_FILE_GUARD_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit|Bash";
+const AGENT_FILE_GUARD_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit|Read|Bash";
 
 /// Sentinel for the RFC-23 §14.4 data-file guard entry.
 const DATA_FILE_HOOK_ID: &str = "data-file-guard";
@@ -651,7 +651,7 @@ mod tests {
         // data-file-guard appended after it.
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0][HOOK_TAG], HOOK_ID);
-        assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash");
+        assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Read|Bash");
         assert_eq!(arr[1][HOOK_TAG], DATA_FILE_HOOK_ID);
         assert_eq!(arr[1]["matcher"], "Read|Bash");
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();

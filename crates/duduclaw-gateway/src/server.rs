@@ -2872,6 +2872,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::egress_guard::router(Arc::new(
         crate::egress_guard::RouteState::new(home_dir.clone()),
     )));
+    app = app.merge(crate::credential_declaration::router(home_dir.clone()));
     // ── Document knowledge base (internal) ────────────────────────
     // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
     // tools: same loopback + signed-identity authentication as the

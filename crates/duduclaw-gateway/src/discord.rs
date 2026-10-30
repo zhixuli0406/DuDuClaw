@@ -611,7 +611,7 @@ async fn register_slash_commands(http: &reqwest::Client, token: &str, app_id: &s
             let body = resp.text().await.unwrap_or_default();
             warn!(
                 "Discord: slash command registration failed ({status}): {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             );
         }
         Err(e) => {
@@ -952,7 +952,7 @@ async fn gateway_loop(
                     let payload: GatewayPayload = match serde_json::from_str(&msg) {
                         Ok(p) => p,
                         Err(e) => {
-                            warn!("Discord Gateway: failed to parse payload: {e} (first 200 chars: {})", truncate_bytes(&msg, 200));
+                            warn!("Discord Gateway: failed to parse payload: {e}");
                             continue;
                         }
                     };
@@ -1674,7 +1674,7 @@ async fn handle_message_create(
 
     info!(
         "📩 Discord [{author_name}] (guild:{guild_id}): {}",
-        truncate_bytes(&clean_content, 80)
+        truncate_bytes(&duduclaw_security::credential_detect::mask(&clean_content), 80)
     );
 
     // ── Auto-thread ──
@@ -2276,7 +2276,7 @@ async fn create_thread(
         let body = resp.text().await.unwrap_or_default();
         warn!(
             "Discord: failed to create thread ({status}): {}",
-            truncate_bytes(&body, 200)
+            truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
         );
         return None;
     }
@@ -2352,7 +2352,7 @@ async fn send_raw(
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            let detail = truncate_bytes(&body, 200).to_string();
+            let detail = truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200).to_string();
 
             // Retry without message_reference when Discord reports a cross-channel
             // reference error.  This can happen when gateway channel metadata is
@@ -2380,7 +2380,7 @@ async fn send_raw(
                     Ok(r2) => {
                         let s2 = r2.status();
                         let b2 = r2.text().await.unwrap_or_default();
-                        let d2 = truncate_bytes(&b2, 200).to_string();
+                        let d2 = truncate_bytes(&duduclaw_security::credential_detect::mask(&b2), 200).to_string();
                         error!("Discord send failed on retry ({s2}): {d2}");
                         return Err(DiscordSendError {
                             status: Some(s2.as_u16()),
@@ -3370,7 +3370,7 @@ async fn edit_interaction_response(
             let body = resp.text().await.unwrap_or_default();
             error!(
                 "Discord edit interaction failed ({status}): {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             );
         }
         Err(e) => error!("Discord edit interaction error: {e}"),

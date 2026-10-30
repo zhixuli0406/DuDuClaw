@@ -532,6 +532,8 @@ impl SessionManager {
     /// therefore retained for audit only *until the next compression*, not
     /// indefinitely (see `session_portability.rs` module docs).
     pub async fn compress(&self, session_id: &str, summary: &str) -> Result<()> {
+        let masked_summary = duduclaw_security::credential_detect::mask(summary);
+        let summary = masked_summary.as_str();
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -870,7 +872,7 @@ impl SessionManager {
         let conn = self.acquire().await;
         conn.execute(
             "UPDATE sessions SET pinned_instructions = ?1 WHERE id = ?2",
-            params![instructions, session_id],
+            params![duduclaw_security::credential_detect::mask(instructions), session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(format!("set_pinned: {e}")))?;
         Ok(())
@@ -917,7 +919,7 @@ impl SessionManager {
                  summarized_through_turn = ?2,
                  last_summarized_at = ?3
              WHERE id = ?4",
-            params![summary, through_turn as i64, now, session_id],
+            params![duduclaw_security::credential_detect::mask(summary), through_turn as i64, now, session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(format!("set_summary: {e}")))?;
         Ok(())
@@ -1090,7 +1092,8 @@ impl SessionManager {
     /// Persist an auto-generated session title (CJK-safe cap) together with
     /// the turn count it was generated at.
     pub async fn set_title(&self, session_id: &str, title: &str, through_turn: u32) -> Result<()> {
-        let clean = duduclaw_core::truncate_chars(title.trim(), SESSION_TITLE_MAX_CHARS);
+        let masked = duduclaw_security::credential_detect::mask(title);
+        let clean = duduclaw_core::truncate_chars(masked.trim(), SESSION_TITLE_MAX_CHARS);
         let conn = self.acquire().await;
         conn.execute(
             "UPDATE sessions SET title = ?1, titled_through_turn = ?2 WHERE id = ?3",
@@ -1856,5 +1859,38 @@ mod tests {
         assert_eq!(old_msgs.len(), 2);
         assert_eq!(old_msgs[1].content, "resumed turn");
         assert_eq!(mgr.get_messages("webchat:new").await.unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod credential_summary_tests {
+    use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[tokio::test]
+    async fn pinned_and_title_sinks_mask_before_truncation() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let manager = SessionManager::new(file.path()).unwrap();
+        manager.get_or_create("test:s1", "test").await.unwrap();
+        manager.set_pinned("test:s1", "password: fixture-pinned").await.unwrap();
+        assert!(!manager.get_pinned("test:s1").await.unwrap().contains("fixture-pinned"));
+        let title = format!("{} sk-{}", "a".repeat(SESSION_TITLE_MAX_CHARS - 5), "Z".repeat(48));
+        manager.set_title("test:s1", &title, 1).await.unwrap();
+        let (title, _) = manager.get_title("test:s1").await.unwrap();
+        assert!(!title.contains("sk-"));
+    }
+
+
+    #[tokio::test]
+    async fn summary_and_compression_mask_contextual_credentials() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let manager = SessionManager::new(file.path()).unwrap();
+        manager.get_or_create("test:s1", "test").await.unwrap();
+        manager.set_summary("test:s1", "密碼：fixture-value", 1).await.unwrap();
+        let (summary, _) = manager.get_summary("test:s1").await.unwrap();
+        assert!(!summary.contains("fixture-value"));
+        manager.compress("test:s1", "password: fixture-value").await.unwrap();
+        let messages = manager.get_messages("test:s1").await.unwrap();
+        assert!(messages.iter().all(|m| !m.content.contains("fixture-value")));
     }
 }

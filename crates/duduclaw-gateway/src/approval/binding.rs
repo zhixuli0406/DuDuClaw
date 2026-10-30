@@ -259,7 +259,7 @@ impl ApprovalBroker {
                 "bound_action"
             }
             .into(),
-            summary: summary.into(),
+            summary: duduclaw_security::credential_detect::mask(summary),
             payload,
             status: ApprovalStatus::Pending,
             created_at: now.to_rfc3339(),
@@ -352,6 +352,9 @@ impl ApprovalBroker {
         dashboard: Option<&duduclaw_auth::UserContext>,
     ) -> Result<(), String> {
         context.validate()?;
+        if let Some(value) = &answer {
+            require_credential_free_payload(value)?;
+        }
         let rec = self.get(id).await?.ok_or("request not found")?;
         if rec.payload.get("egress_guard").is_some() {
             let ctx = dashboard.ok_or("outgoing data approval requires a dashboard Admin")?;
@@ -473,7 +476,7 @@ impl ApprovalBroker {
         conn.execute(
             "UPDATE approvals SET status='invalidated',invalidated_reason=?1 WHERE id=?2 AND status IN ('pending',
                 'approved')",
-            params![reason, id.as_str()]
+            params![duduclaw_security::credential_detect::mask(reason), id.as_str()]
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -488,7 +491,7 @@ impl ApprovalBroker {
             .execute(
                 "UPDATE approvals SET status='invalidated',invalidated_reason=?1
                   WHERE id=?2 AND status='approved'",
-                params![reason, id.as_str()],
+                params![duduclaw_security::credential_detect::mask(reason), id.as_str()],
             )
             .map_err(|e| e.to_string())?;
         Ok(n == 1)

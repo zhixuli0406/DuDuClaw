@@ -362,3 +362,29 @@ async fn await_decision_returns_expired_past_ttl() {
         .unwrap();
     assert_eq!(status, ApprovalStatus::Expired);
 }
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test(flavor = "current_thread")]
+async fn approval_sinks_mask_display_and_refuse_nested_credentials() {
+    let b = broker();
+    let id = b.request_with_simulation(
+        "alice", "send", "password: fixture-summary", json!({"body":"hello"}), 300,
+        json!({"world_state_change":"password: fixture-simulation",
+            "risk_points":["token: fixture-risk"]}),
+    ).await.unwrap();
+    let rec = b.get(&id).await.unwrap().unwrap();
+    assert!(!rec.summary.contains("fixture-summary"));
+    let simulation = rec.simulation.as_ref().unwrap().to_string();
+    assert!(!simulation.contains("fixture-simulation"));
+    assert!(!simulation.contains("fixture-risk"));
+    assert_eq!(rec.payload, json!({"body":"hello"}));
+
+    let mut direct = rec.clone();
+    direct.id = ApprovalId::new();
+    direct.payload = json!({"nested":{"password":"fixture-payload"}});
+    assert_eq!(b.store.insert(&direct).await.unwrap_err(),
+        "credentials are not accepted in approval payloads");
+    assert!(b.get(&direct.id).await.unwrap().is_none());
+    assert!(b.store.replace_text(&id, "safe", &direct.payload).await.is_err());
+    assert_eq!(b.get(&id).await.unwrap().unwrap().payload, rec.payload);
+}

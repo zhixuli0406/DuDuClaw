@@ -34,7 +34,12 @@ fn normalize_time(cell: &mut Cell) -> ExportResult<()> {
     }
     Ok(())
 }
-pub(super) fn push(table: &mut Table, row: LogicalRow, bytes: &mut usize) -> ExportResult<()> {
+pub(super) fn push(table: &mut Table, mut row: LogicalRow, bytes: &mut usize) -> ExportResult<()> {
+    for cell in &mut row.cells {
+        if let Cell::Text(text) = cell {
+            *text = duduclaw_security::credential_detect::mask(text);
+        }
+    }
     *bytes += row.id.len()
         + row
             .cells

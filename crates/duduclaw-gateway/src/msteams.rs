@@ -165,7 +165,7 @@ impl TeamsCreds {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!(
                 "token status {status}: {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             ));
         }
         let body: serde_json::Value = resp.json().await.map_err(|e| format!("token parse: {e}"))?;
@@ -667,7 +667,7 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     let bot_account = activity.get("recipient").cloned().unwrap_or_default();
     let user_account = activity.get("from").cloned().unwrap_or_default();
 
-    info!("📩 Teams [{sender_name}]: {}", truncate_bytes(&text, 80));
+    info!("📩 Teams [{sender_name}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     // `personal` is a 1:1 chat; `groupChat` / `channel` (or anything else)
     // count as group conversations for thinking display.
@@ -1054,7 +1054,7 @@ async fn send_activity(
             let text = resp.text().await.unwrap_or_default();
             error!(
                 "Teams send failed ({status}): {}",
-                truncate_bytes(&text, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 200)
             );
             None
         }

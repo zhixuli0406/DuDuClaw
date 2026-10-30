@@ -85,7 +85,7 @@ pub async fn collect_trajectory(
 
 /// Append a single trajectory as one JSON line to a JSONL file.
 fn append_trajectory_jsonl(path: &Path, trajectory: &RLTrajectory) -> std::io::Result<()> {
-    let json = serde_json::to_string(trajectory)
+    let json = super::trajectory_export::masked_trajectory_json(trajectory)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let mut file = std::fs::OpenOptions::new()
@@ -191,4 +191,42 @@ pub fn compute_reward_for_file(path: &Path) -> std::io::Result<Vec<(String, f64)
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod credential_sink_tests {
+    use super::*;
+    use crate::rl::types::ToolCallRecord;
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[test]
+    fn both_trajectory_sinks_mask_turns_tools_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trajectory = TrajectoryExporter::build_trajectory(
+            "session", "worker", "model",
+            &[("user".into(), "password: fixture-user".into()),
+              ("assistant".into(), "password: fixture-reply".into())], 1.0,
+        );
+        trajectory.turns[1].tool_calls = Some(vec![ToolCallRecord {
+            name: "example".into(),
+            arguments: serde_json::json!({"password":"fixture-argument"}),
+            result: serde_json::json!({"nested":["password: fixture-result"]}),
+            success: true,
+        }]);
+        trajectory.metadata.insert("note".into(), serde_json::json!("password: fixture-metadata"));
+        let global = dir.path().join("global.jsonl");
+        append_trajectory_jsonl(&global, &trajectory).unwrap();
+        let agent = TrajectoryExporter::new(dir.path().join("exports"))
+            .write_trajectory(&trajectory).unwrap();
+        for path in [global, agent] {
+            let stored = std::fs::read_to_string(path).unwrap();
+            for secret in ["fixture-user", "fixture-reply", "fixture-argument", "fixture-result", "fixture-metadata"] {
+                assert!(!stored.contains(secret), "secret persisted: {secret}");
+            }
+            let restored: RLTrajectory = serde_json::from_str(stored.trim()).unwrap();
+            assert_eq!(restored.turns.len(), 2);
+            assert_eq!(restored.total_tool_calls(), 1);
+        }
+        assert!(trajectory.turns[0].content.contains("fixture-user"));
+    }
 }

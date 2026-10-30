@@ -256,7 +256,7 @@ impl MessageQueue {
                 msg.id,
                 msg.sender,
                 msg.target,
-                msg.payload,
+                duduclaw_security::credential_detect::mask(&msg.payload),
                 msg.status.as_str(),
                 msg.retry_count,
                 msg.delegation_depth,
@@ -294,7 +294,7 @@ impl MessageQueue {
         conn.execute(
             "UPDATE message_queue SET status = 'done', response = ?1, completed_at = ?2 \
              WHERE id = ?3",
-            params![response, now, message_id],
+            params![duduclaw_security::credential_detect::mask(response), now, message_id],
         )
         .map_err(|e| format!("complete: {e}"))?;
         Ok(())
@@ -307,7 +307,7 @@ impl MessageQueue {
         conn.execute(
             "UPDATE message_queue SET status = 'failed', error = ?1, completed_at = ?2 \
              WHERE id = ?3",
-            params![error, now, message_id],
+            params![duduclaw_security::credential_detect::mask(error), now, message_id],
         )
         .map_err(|e| format!("fail: {e}"))?;
         Ok(())
@@ -625,6 +625,22 @@ pub struct DelegationCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[tokio::test]
+    async fn queue_sink_masks_payload_response_and_error() {
+        let tmp = TempDir::new().unwrap();
+        let q = MessageQueue::open(tmp.path()).unwrap();
+        let mut msg = sample_msg("credential-message", None);
+        msg.payload = "password: fixture-payload".into();
+        q.enqueue(&msg).await.unwrap();
+        q.complete(&msg.id, "token: fixture-response").await.unwrap();
+        q.fail(&msg.id, "密碼：fixture-error").await.unwrap();
+        let conn = q.conn.lock().await;
+        let stored: String = conn.query_row("SELECT payload || response || error FROM message_queue WHERE id=?1", [&msg.id], |r| r.get(0)).unwrap();
+        assert!(!stored.contains("fixture-"));
+    }
+
     use tempfile::TempDir;
 
     /// Third review L3-9: the stop reconciliation's queue read uses the

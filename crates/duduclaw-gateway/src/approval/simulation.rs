@@ -36,6 +36,7 @@ impl SimulationNarrative {
     /// not a security decision; the verdict parse (`irreversible`) is handled
     /// separately by the judge's own fail-closed parser.
     pub fn from_json(value: &Value) -> Self {
+        let value = masked_approval_value(value);
         let world_state_change = value
             .get("world_state_change")
             .and_then(|v| v.as_str())

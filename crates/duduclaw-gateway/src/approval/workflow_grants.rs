@@ -330,6 +330,7 @@ impl ApprovalBroker {
         if step_key.is_empty() || step_key.len() > 256 {
             return Err("invalid granted operation step".into());
         }
+        require_credential_free_payload(payload)?;
         binding.validate(payload)?;
         binding.validate_host_files()?;
         let home = self

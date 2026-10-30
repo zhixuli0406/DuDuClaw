@@ -77,6 +77,7 @@ impl ClientCallBoundary for RegistryBoundary {
                 crate::egress_gate::confirm_dispatch_with_call(
                     &self.home, &self.agent, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(), &id,
                 )?;
+                crate::credential_declaration::observe_arguments(&self.home, &self.agent, args).await;
                 return Ok((None, None));
             }
         };
@@ -86,6 +87,7 @@ impl ClientCallBoundary for RegistryBoundary {
             if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
             return Err(reason);
         }
+        crate::credential_declaration::observe_arguments(&self.home, &self.agent, args).await;
         Ok((reserved.then_some(id), Some(Box::new(lease))))
     }
 

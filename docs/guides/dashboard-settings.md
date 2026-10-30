@@ -361,3 +361,7 @@ Connection stamps keep their origin and role. Corroboration alone never grants d
 Approval binds the sorted identifiers of orphan entity embeddings, not just their count; swapping one entity for another requires a new approval. Unfinished jobs use a durable attempt count and due time, with 60/120/240/480-second backoff. Due jobs are selected fairly. After five consecutive failures or interrupted attempts, a job is quarantined. The Admin can see a content-free failure reason under **Data deletion receipts** and choose **Retry**; retry retains the existing approval and rechecks scope, requiring a new approval if it grows.
 
 Regression tests for these changes were added but **not run**; no build was performed.
+
+## Conversation credentials (unreleased)
+
+Admin: **System → Security → Credential audit** shows metadata, filters, service edits, false-positive marking and an audited CSV export of the current page. The adjacent inventory lists system-configured credentials read-only. Set `[security] chat_credentials = "audit" | "mask"` through `system.update_config` (`security.chat_credentials`) or the configuration editor. The default is `audit`; unknown values are handled as `mask`. Audit mode leaves the original conversation text intact. Mask mode changes newly detected inbound values, not old history. Both mask detected values in derived stores. See [Credential audit](../features/70-credential-audit.md) for detection limits and registration quotas. Never put real credentials into a service name or note.

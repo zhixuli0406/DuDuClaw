@@ -437,6 +437,10 @@ impl MistakeNotebook {
 
     /// Record a new mistake entry.
     pub fn record(&self, entry: &MistakeEntry) -> Result<(), String> {
+        // Mask at persistence, including nested gradients and evidence.
+        let mut value = serde_json::to_value(entry).map_err(|_| "Serialize mistake".to_string())?;
+        duduclaw_security::credential_detect::mask_json(&mut value);
+        let entry: MistakeEntry = serde_json::from_value(value).map_err(|_| "Mask mistake".to_string())?;
         let conn = self.open_conn()?;
         let gradient_json = serde_json::to_string(&entry.gradient)
             .map_err(|e| format!("Serialize gradient: {e}"))?;
@@ -855,8 +859,8 @@ pub fn build_mistake_entry(
         timestamp: Utc::now(),
         category,
         session_id: session_id.to_string(),
-        input_summary: truncate_str(user_input, 200),
-        agent_response_summary: truncate_str(agent_response, 200),
+        input_summary: truncate_str(&duduclaw_security::credential_detect::mask(user_input), 200),
+        agent_response_summary: truncate_str(&duduclaw_security::credential_detect::mask(agent_response), 200),
         what_went_wrong: what_went_wrong.to_string(),
         ground_truth: ground_truth.map(|s| s.to_string()),
         gradient: TextGradient::blocking(
@@ -903,6 +907,22 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[test]
+    fn mistake_sink_masks_direct_entries_and_nested_evidence() {
+        let (_tmp, nb) = test_db();
+        let mut entry = sample_entry("agent-1", MistakeCategory::Capability);
+        entry.input_summary = "password: fixture-input".into();
+        entry.ground_truth = Some("密碼：fixture-truth".into());
+        entry.gradient = TextGradient::blocking("test", "test", "token: fixture-gradient", "safe");
+        nb.record(&entry).unwrap();
+        let stored = serde_json::to_string(&nb.query_by_agent("agent-1", 10)).unwrap();
+        for raw in ["fixture-input", "fixture-truth", "fixture-gradient"] {
+            assert!(!stored.contains(raw));
+        }
+    }
+
     use tempfile::NamedTempFile;
 
     fn test_db() -> (NamedTempFile, MistakeNotebook) {

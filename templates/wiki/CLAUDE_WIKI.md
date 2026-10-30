@@ -8,6 +8,7 @@ Read `wiki/_schema.md` for structure conventions.
 - `wiki_read` — Read a specific page (supports `_index.md`, `_schema.md`)
 - `wiki_write` — Create or update a page (auto-updates `_index.md` and `_log.md`)
 - `wiki_search` — Full-text search across all pages
+- `credential_declare` — Label the service for a gateway-supplied credential id you hold; submit only the id and a service identifier matching `[a-z0-9][a-z0-9._-]{0,63}`. Notes and credential values are rejected. Never copy credentials into the wiki.
 
 ### When to update the wiki
 - After learning new domain knowledge from conversations

@@ -36,7 +36,7 @@ pub fn push_log(level: &str, target: &str, message: &str) {
         let line = serde_json::json!({
             "level": level,
             "target": target,
-            "message": message,
+            "message": duduclaw_security::credential_detect::mask(message),
             "timestamp": chrono::Utc::now().to_rfc3339(),
         })
         .to_string();
@@ -143,6 +143,68 @@ pub fn read_log_format(home_dir: &std::path::Path) -> LogFormat {
 /// Boxed layer type used for the format-dependent fmt layers.
 pub type BoxedLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
 
+/// Buffer a whole formatted event before masking: fmt writes fields in chunks,
+/// so masking individual `write` calls would miss a split credential.
+#[derive(Clone)]
+struct CredentialLogWriter<W>(W);
+
+struct CredentialLogBuffer<W: std::io::Write> {
+    inner: W,
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+impl<'a, W> tracing_subscriber::fmt::MakeWriter<'a> for CredentialLogWriter<W>
+where
+    W: tracing_subscriber::fmt::MakeWriter<'a>,
+{
+    type Writer = CredentialLogBuffer<W::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CredentialLogBuffer { inner: self.0.make_writer(), bytes: Vec::new(), overflow: false }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CredentialLogBuffer<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > duduclaw_security::credential_detect::MAX_SCAN_BYTES {
+            self.overflow = true;
+            self.bytes.clear();
+        } else if !self.overflow {
+            self.bytes.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Never flush an incomplete event; Drop owns the complete boundary.
+        Ok(())
+    }
+}
+
+fn masked_log_event(bytes: &[u8], overflow: bool) -> String {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return format!("{}\n", duduclaw_security::credential_detect::UNAVAILABLE_MASK);
+    };
+    if overflow {
+        return format!("{}\n", duduclaw_security::credential_detect::UNAVAILABLE_MASK);
+    }
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) {
+        duduclaw_security::credential_detect::mask_json(&mut value);
+        format!("{value}\n")
+    } else {
+        duduclaw_security::credential_detect::mask(text)
+    }
+}
+
+impl<W: std::io::Write> Drop for CredentialLogBuffer<W> {
+    fn drop(&mut self) {
+        let masked = masked_log_event(&self.bytes, self.overflow);
+        let _ = self.inner.write_all(masked.as_bytes());
+        let _ = self.inner.flush();
+    }
+}
+
 /// Stderr fmt layer in the configured format (boxed so both formats share
 /// one subscriber type).
 pub fn stderr_layer<S>(json: bool) -> BoxedLayer<S>
@@ -153,10 +215,10 @@ where
         Box::new(
             tracing_subscriber::fmt::layer()
                 .json()
-                .with_writer(std::io::stderr),
+                .with_writer(CredentialLogWriter(std::io::stderr)),
         )
     } else {
-        Box::new(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        Box::new(tracing_subscriber::fmt::layer().with_writer(CredentialLogWriter(std::io::stderr)))
     }
 }
 
@@ -175,13 +237,13 @@ where
             tracing_subscriber::fmt::layer()
                 .json()
                 .with_ansi(false)
-                .with_writer(w),
+                .with_writer(CredentialLogWriter(w)),
         )
     } else {
         Box::new(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(w),
+                .with_writer(CredentialLogWriter(w)),
         )
     })
 }
@@ -333,7 +395,7 @@ fn scrub_sensitive(msg: &str) -> String {
     // WP12: prefix scanning misses credentials embedded in a URL *path* — a
     // Telegram error prints `…/bot<token>/getMe`, which none of the prefixes
     // above match. Run the shape-driven redactor first.
-    let mut result = crate::secret_redact::redact_secrets(msg).into_owned();
+    let mut result = duduclaw_security::credential_detect::mask(msg);
     for prefix in &sensitive_prefixes {
         // Loop to handle multiple occurrences of the same prefix
         let mut search_from = 0;
@@ -431,5 +493,37 @@ mod format_and_reload_tests {
             tracing::callsite::rebuild_interest_cache();
             assert!(tracing::enabled!(tracing::Level::INFO));
         });
+    }
+}
+
+#[cfg(test)]
+mod credential_log_tests {
+    use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[test]
+    fn log_sink_masks_across_chunks_and_preserves_json() {
+        use std::io::Write;
+        let mut output = Vec::new();
+        {
+            let mut writer = CredentialLogBuffer { inner: &mut output, bytes: Vec::new(), overflow: false };
+            writer.write_all(b"password:").unwrap();
+            writer.flush().unwrap();
+            writer.write_all(b" fixture-split\n").unwrap();
+        }
+        assert!(!String::from_utf8(output).unwrap().contains("fixture-split"));
+        let json = serde_json::json!({"fields":{"message":"密碼：fixture-json"}}).to_string();
+        let masked = masked_log_event(json.as_bytes(), false);
+        assert!(serde_json::from_str::<serde_json::Value>(&masked).is_ok());
+        assert!(!masked.contains("fixture-json"));
+        assert!(!masked_log_event(b"fixture-overflow", true).contains("fixture-overflow"));
+        assert!(!masked_log_event(&[255], false).is_empty());
+    }
+
+
+    #[test]
+    fn scrub_masks_contextual_chinese_passwords_before_preview() {
+        let message = "收到訊息：密碼是測試憑證，請登入";
+        assert!(!scrub_sensitive(message).contains("測試憑證"));
     }
 }

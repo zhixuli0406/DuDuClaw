@@ -423,3 +423,97 @@ fn direct_back_edge_is_cycle() {
     let e = edges(&[("b", Some("a")), ("a", None)]);
     assert!(introduces_parent_cycle(&e, "a", "b"));
 }
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn derived_task_sinks_mask_text_and_preserve_json() {
+    let (store, _dir) = temp_store();
+    let mut task = pending_task("credential-task");
+    task.title = "password: fixture-title".into();
+    task.description = "password: fixture-description".into();
+    task.acceptance_criteria = Some(r#"[{"text":"password: fixture-criteria"}]"#.into());
+    store.insert_task(&task).await.unwrap();
+    let row = store.get_task(&task.id).await.unwrap().unwrap();
+    assert!(!serde_json::to_string(&row).unwrap().contains("fixture-"));
+    assert!(serde_json::from_str::<serde_json::Value>(row.acceptance_criteria.as_deref().unwrap()).is_ok());
+    let changed = store.update_task(&task.id, &serde_json::json!({
+        "title":"password: fixture-updated", "description":"password: fixture-body",
+        "blocked_reason":"password: fixture-blocked", "tags":"password: fixture-tag",
+    })).await.unwrap().unwrap();
+    assert!(!serde_json::to_string(&changed).unwrap().contains("fixture-"));
+    store.set_goal_state_json(&task.id, Some(r#"{"password":"fixture-state"}"#)).await.unwrap();
+    store.merge_goal_state_json(&task.id, |v| v["note"] = serde_json::json!("password: fixture-merged")).await.unwrap();
+    let row = store.get_task(&task.id).await.unwrap().unwrap();
+    let state = row.goal_state_json.unwrap();
+    assert!(!state.contains("fixture-"));
+    assert!(serde_json::from_str::<serde_json::Value>(&state).is_ok());
+    store.complete_task(&task.id, "password: fixture-result", "worker").await.unwrap();
+    let row = store.get_task(&task.id).await.unwrap().unwrap();
+    assert!(!row.result_summary.unwrap().contains("fixture-result"));
+}
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn task_activity_comments_plans_and_goals_mask_at_write_boundary() {
+    let (store, _dir) = temp_store();
+    store.insert_task(&pending_task("credential-task")).await.unwrap();
+    store.append_activity(&ActivityRow {
+        id: "activity".into(), event_type: "test".into(), agent_id: "worker".into(),
+        task_id: Some("credential-task".into()), summary: "password: fixture-summary".into(),
+        timestamp: "2026-10-30T00:00:00Z".into(),
+        metadata: Some(r#"{"password":"fixture-metadata"}"#.into()),
+    }).await.unwrap();
+    let activity = store.list_activity_for_task("credential-task", 10).await.unwrap();
+    assert!(!activity[0].summary.contains("fixture-summary"));
+    assert!(!activity[0].metadata.as_deref().unwrap().contains("fixture-metadata"));
+    assert!(serde_json::from_str::<serde_json::Value>(activity[0].metadata.as_deref().unwrap()).is_ok());
+    store.insert_comment(&comment("comment", "credential-task", "2026-10-30T00:00:00Z", "password: fixture-comment")).await.unwrap();
+    assert!(!store.list_comments("credential-task").await.unwrap()[0].body.contains("fixture-comment"));
+    let mut p = plan("credential-plan", "worker");
+    p.title = "password: fixture-plan".into();
+    p.description = "password: fixture-planbody".into();
+    store.insert_plan(&p).await.unwrap();
+    assert!(!store.get_plan(&p.id).await.unwrap().unwrap().title.contains("fixture-plan"));
+    let step = store.add_plan_step(&p.id, "step", "password: fixture-step", "agent", "worker", None).await.unwrap();
+    assert!(!step.text.contains("fixture-step"));
+    let step = store.update_plan_step("step", &serde_json::json!({"text":"password: fixture-next"})).await.unwrap().unwrap();
+    assert!(!step.text.contains("fixture-next"));
+    let g = goal("credential-goal", "password: fixture-goal", None);
+    store.insert_goal(&g).await.unwrap();
+    assert!(!store.get_goal(&g.id).await.unwrap().unwrap().title.contains("fixture-goal"));
+    let g = store.update_goal(&g.id, &serde_json::json!({"description":"password: fixture-goalbody"})).await.unwrap().unwrap();
+    assert!(!g.description.contains("fixture-goalbody"));
+}
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn frozen_task_contract_with_credentials_is_refused_without_rewriting_authority() {
+    let (store, _dir) = temp_store();
+    let mut task = pending_task("credential-frozen");
+    task.acceptance_criteria_baseline = Some("password: fixture-baseline".into());
+    assert!(store.insert_task(&task).await.is_err());
+    assert!(store.get_task(&task.id).await.unwrap().is_none());
+    task.acceptance_criteria_baseline = Some("Safe baseline".into());
+    store.insert_task(&task).await.unwrap();
+    assert!(store.freeze_team_spec(&task.id, r#"{"prompt":"password: fixture-team"}"#).await.is_err());
+    assert!(store.set_criteria_ledger(&task.id, r#"{"password":"fixture-ledger"}"#).await.is_err());
+    assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().acceptance_criteria_baseline, task.acceptance_criteria_baseline);
+}
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn task_review_sinks_mask_feedback_and_structured_verdicts() {
+    let (store, _dir) = temp_store();
+    let task = goal_review_task("credential-review");
+    store.insert_task(&task).await.unwrap();
+    store.record_iteration_dispatch(&task.id, 1, "2026-10-30T00:00:00Z").await.unwrap();
+    store.reject_review_with_verdict(&task.id, "password: fixture-feedback", 3,
+        Some(r#"[{"name":"safety","pass":false,"reason":"password: fixture-verdict"}]"#)).await.unwrap();
+    let row = store.get_task(&task.id).await.unwrap().unwrap();
+    assert!(!row.judge_feedback.as_deref().unwrap().contains("fixture-feedback"));
+    let iterations = store.list_iterations(&task.id).await.unwrap();
+    assert!(!iterations[0].judge_feedback.as_deref().unwrap().contains("fixture-feedback"));
+    let verdict = iterations[0].verdict_json.as_deref().unwrap();
+    assert!(!verdict.contains("fixture-verdict"));
+    assert!(serde_json::from_str::<serde_json::Value>(verdict).is_ok());
+}

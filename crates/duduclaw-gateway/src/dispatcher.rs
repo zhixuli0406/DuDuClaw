@@ -318,6 +318,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         }
 
         let delegation = DelegationEnv {
+            credential_source: format!("message_queue:{}", msg.id),
             depth: msg.delegation_depth as u8,
             origin: msg.origin_agent.clone().unwrap_or_default(),
             sender: msg.sender_agent.clone().unwrap_or_default(),
@@ -1066,6 +1067,7 @@ async fn poll_and_dispatch(
         handles.push(tokio::spawn(async move {
             let dispatch_start = Utc::now().to_rfc3339();
             let delegation_env = DelegationEnv {
+                credential_source: format!("bus:{}", msg.message_id),
                 depth: msg.delegation_depth,
                 origin: msg.origin_agent.clone().unwrap_or_default(),
                 sender: msg.sender_agent.clone().unwrap_or_default(),
@@ -1349,6 +1351,7 @@ async fn poll_and_dispatch(
 /// The MCP server reads these to track depth without relying on spoofable tool params.
 #[derive(Debug, Clone)]
 struct DelegationEnv {
+    credential_source: String,
     depth: u8,
     origin: String,
     sender: String,
@@ -1393,6 +1396,11 @@ async fn dispatch_to_agent_outcome(
     prompt: &str,
     delegation: &DelegationEnv,
 ) -> Result<String, DispatchError> {
+    let credential_source = &delegation.credential_source;
+    let credential_prompt = crate::credential_ledger::process_message(
+        home_dir, prompt, &credential_source, &delegation.sender, agent_id, "dispatch",
+    ).await;
+    let prompt = credential_prompt.as_str();
     #[cfg(test)]
     {
         crate::model_call_probe::record("dispatch_to_agent_outcome");
@@ -1415,7 +1423,7 @@ async fn dispatch_to_agent_outcome(
         return crate::claude_runner::DELEGATION_ENV
             .scope(
                 env_map,
-                crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt),
+                crate::credential_ledger::DISPATCH_SCANNED.scope(true, crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt)),
             )
             .await
             .map_err(DispatchError::from_string);
@@ -1439,7 +1447,7 @@ async fn dispatch_to_agent_outcome(
     let env_map = delegation.to_env_map();
 
     crate::claude_runner::DELEGATION_ENV
-        .scope(env_map, async {
+        .scope(env_map, crate::credential_ledger::DISPATCH_SCANNED.scope(true, async {
             if use_sandbox {
                 info!(agent = agent_id, "Dispatching via task sandbox");
                 match dispatch_sandboxed(home_dir, registry, agent_id, prompt).await {
@@ -1458,7 +1466,7 @@ async fn dispatch_to_agent_outcome(
             )
             .await
             .map_err(DispatchError::from_string)
-        })
+        }))
         .await
 }
 
@@ -1681,6 +1689,7 @@ pub async fn dispatch_taskspec(
 
         // Dispatch to agent
         let delegation = DelegationEnv {
+            credential_source: format!("task:{}:step:{step_index}", spec.task_id),
             depth: 0,
             origin: spec.agent_id.clone(),
             sender: spec.agent_id.clone(),
@@ -1805,6 +1814,7 @@ async fn handle_step_failure(
             );
 
             let delegation = DelegationEnv {
+                credential_source: format!("task:{}:replan:{failed_step}", spec.task_id),
                 depth: 0,
                 origin: spec.agent_id.clone(),
                 sender: "__planner__".to_string(),

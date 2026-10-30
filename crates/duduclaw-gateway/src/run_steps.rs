@@ -628,6 +628,8 @@ const SECRETISH_KEYS: &[&str] = &[
 /// `curl -H "Authorization: Bearer sk-…"`). Values end at whitespace or a
 /// closing quote. Pure, allocation-light, no regex dependency.
 pub(crate) fn mask_secretish(s: &str) -> String {
+    let masked = duduclaw_security::credential_detect::mask(s);
+    let s = masked.as_str();
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while !rest.is_empty() {

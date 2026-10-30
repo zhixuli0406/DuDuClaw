@@ -751,6 +751,14 @@ pub(super) async fn build_reply_with_session_inner(
         return format!("⚠️ {}", scan.summary);
     }
 
+    crate::line::attach_credential_holder(&ctx.home_dir, &agent_id).await;
+    let credential_source = format!("{session_id}:pending:{}", uuid::Uuid::new_v4().simple());
+    let credential_sender = crate::credential_ledger::chat_principal(session_id, user_id);
+    let credential_text = crate::credential_ledger::process_message(
+        &ctx.home_dir, text, &credential_source, &credential_sender, &agent_id, "chat",
+    ).await;
+    let text = credential_text.as_str();
+
     // RFC-23 `[redaction.sources] user_input` (v1.68.0): the user's own words
     // go through the same pipeline as tool results, ONCE, right after the
     // injection scan — and `text` is rebound to the redacted form so every
@@ -797,7 +805,7 @@ pub(super) async fn build_reply_with_session_inner(
             let mut recorder = ctx.skill_recorder.lock().await;
             if recorder.is_recording(&session_key) {
                 // Record this feedback turn, then finalize with detected sentiment
-                recorder.record_turn(&session_key, "user", text, vec![]);
+                recorder.record_turn(&session_key, "user", &duduclaw_security::credential_detect::mask(text), vec![]);
                 let outcome = match sentiment {
                     Sentiment::Positive => TrajectoryOutcome::Success,
                     Sentiment::Negative => TrajectoryOutcome::Failure,
@@ -821,7 +829,7 @@ pub(super) async fn build_reply_with_session_inner(
                         }
 
                         // Log extraction event to audit log
-                        let audit_entry = serde_json::json!({
+                        let mut audit_entry = serde_json::json!({
                             "event": "skill_extracted",
                             "trigger": "user_feedback",
                             "skill_id": skill.id,
@@ -832,6 +840,7 @@ pub(super) async fn build_reply_with_session_inner(
                             "source_session": session_key,
                             "timestamp": chrono::Utc::now().to_rfc3339(),
                         });
+                        duduclaw_security::credential_detect::mask_json(&mut audit_entry);
                         if let Ok(audit_line) = serde_json::to_string(&audit_entry) {
                             let audit_path = ctx.home_dir.join("skill_extraction_audit.jsonl");
                             if let Ok(mut f) = tokio::fs::OpenOptions::new()
@@ -886,6 +895,9 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
     };
+    if let Some(id) = user_message_id {
+        crate::credential_ledger::bind_message(&ctx.home_dir, &credential_source, session_id, id);
+    }
     // P2-B: the turn's memory sources are the stored rows' ids (host-made,
     // never from the model). A message that could not be saved has none.
     let mut turn_sources = crate::memory_provenance::TurnSources {
@@ -1000,7 +1012,8 @@ pub(super) async fn build_reply_with_session_inner(
             .find(|t| t.role == "assistant")
         {
             if last_assistant.content.contains('？') || last_assistant.content.contains('?') {
-                let answer_snippet = duduclaw_core::truncate_bytes(&sanitized_text, 200);
+                let masked_answer = duduclaw_security::credential_detect::mask(&sanitized_text);
+                let answer_snippet = duduclaw_core::truncate_bytes(&masked_answer, 200);
                 // Cap pinned at ~1000 chars to prevent bloat
                 if pinned.len() < 1000 {
                     pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
@@ -1814,7 +1827,7 @@ pub(super) async fn build_reply_with_session_inner(
             let _ = tokio::fs::OpenOptions::new().create(true).append(true)
                 .open(ctx.home_dir.join("debug.log")).await.map(|mut file| {
                     use tokio::io::AsyncWriteExt;
-                    tokio::spawn(async move { let _=file.write_all(log_line.as_bytes()).await; });
+                    tokio::spawn(async move { let _=file.write_all(duduclaw_security::credential_detect::mask(&log_line).as_bytes()).await; });
                 });
             warn!(diagnostic=%diagnostic,"Reply runtime unavailable");
             last_cli_error=Some(error);
@@ -1932,7 +1945,7 @@ pub(super) async fn build_reply_with_session_inner(
                             .map(|mut f| {
                                 use tokio::io::AsyncWriteExt;
                                 tokio::spawn(async move {
-                                    let _ = f.write_all(log_line.as_bytes()).await;
+                                    let _ = f.write_all(duduclaw_security::credential_detect::mask(&log_line).as_bytes()).await;
                                 });
                             });
                         warn!(diagnostic=%diagnostic,"Direct API unavailable");
@@ -2281,7 +2294,7 @@ pub(super) async fn build_reply_with_session_inner(
             // consolidates an anti-guessing rule. Background, best-effort.
             if let Some(db_path) = ctx.memory_db_path.clone() {
                 let agent_for_res = agent_id.clone();
-                let user_text = sanitized_text.clone();
+                let user_text = duduclaw_security::credential_detect::mask(&sanitized_text);
                 let nb_for_res = ctx.mistake_notebook.clone();
                 let session_for_res = session_id.to_string();
                 let home_for_res = ctx.home_dir.clone();
@@ -2441,7 +2454,7 @@ pub(super) async fn build_reply_with_session_inner(
         if !has_history {
             let sm = ctx.session_manager.clone();
             let sid = session_id.to_string();
-            let user_text = sanitized_text.clone();
+            let user_text = duduclaw_security::credential_detect::mask(&sanitized_text);
             let home = ctx.home_dir.clone();
             let agent_dir_for_pin = agent_dir.clone();
             let agent_for_pin = agent_id.clone();
@@ -2477,8 +2490,8 @@ pub(super) async fn build_reply_with_session_inner(
         if reply.len() > 100 {
             if let Some(db_path) = cognitive_memory_db.clone() {
                 let agent_id_for_facts = agent_id.clone();
-                let user_text_for_facts = sanitized_text.clone();
-                let reply_snippet = duduclaw_core::truncate_bytes(&reply, 500).to_string();
+                let user_text_for_facts = duduclaw_security::credential_detect::mask(&sanitized_text);
+                let reply_snippet = duduclaw_core::truncate_bytes(&duduclaw_security::credential_detect::mask(&reply), 500).to_string();
                 let (ch, cid) = parse_session_id_parts(session_id);
                 let channel_for_facts = ch.to_string();
                 let chat_id_for_facts = cid.to_string();
@@ -2534,6 +2547,7 @@ pub(super) async fn build_reply_with_session_inner(
                         };
                         let rt = tokio::runtime::Handle::current();
                         let mut stored = 0usize;
+                        let facts_text = duduclaw_security::credential_detect::mask(&facts_text);
                         for line in facts_text.lines() {
                             let fact = line.trim_start_matches(&['-', '•', '*', ' '][..]).trim();
                             if fact.len() < 10 { continue; }
@@ -2602,8 +2616,8 @@ pub(super) async fn build_reply_with_session_inner(
             let episodic_provenance = turn_sources.provenance().map(|p| crate::egress_guard::query_turn(&agent_id, Some(&turn_id)).connector_snapshot().stamp(p));
             let session_id_for_pred = session_id.to_string();
             let turn_id_for_pred = turn_id.clone();
-            let text_clone = text.to_string();
-            let reply_clone_for_pred = reply.clone();
+            let text_clone = duduclaw_security::credential_detect::mask(text);
+            let reply_clone_for_pred = duduclaw_security::credential_detect::mask(&reply);
             let home_for_pred = ctx.home_dir.clone();
             let agent_dir_for_pred = agent_dir.clone();
             let sm_for_pred = ctx.session_manager.clone();
@@ -2938,7 +2952,7 @@ pub(super) async fn build_reply_with_session_inner(
                                 );
                                 // Log synthesis trigger event to feedback.jsonl
                                 // Use structured fields to prevent second-order injection via topic
-                                let signal = serde_json::json!({
+                                let mut signal = serde_json::json!({
                                     "signal_type": "synthesis_trigger",
                                     "agent_id": &agent_id_for_pred,
                                     "topic": &trigger.topic,
@@ -2949,6 +2963,7 @@ pub(super) async fn build_reply_with_session_inner(
                                 });
                                 let feedback_path = home_for_pred.join("feedback.jsonl");
                                 let feedback_clone = feedback_path.clone();
+                                duduclaw_security::credential_detect::mask_json(&mut signal);
                                 let signal_str = signal.to_string();
                                 // Non-blocking write to avoid stalling async runtime
                                 tokio::task::spawn_blocking(move || {
@@ -3194,6 +3209,7 @@ pub(super) async fn build_reply_with_session_inner(
                         content,
                         importance,
                     } => {
+                        let content = duduclaw_security::credential_detect::mask(&content);
                         let preview: String = content.chars().take(80).collect();
                         debug!(agent = %agent_id_for_pred, "Storing episodic observation: {preview}");
 
@@ -3588,8 +3604,8 @@ pub(super) async fn build_reply_with_session_inner(
         // a generic semantic entry. `session_id` supplies the WP5c source
         // chain shown in the curation station ("Telegram 對話 · 8/4 10:12").
         if let Some(memory_db_for_distill) = cognitive_memory_db.clone() {
-            let user_text_for_distill = sanitized_text.clone();
-            let reply_for_distill = reply.clone();
+            let user_text_for_distill = duduclaw_security::credential_detect::mask(&sanitized_text);
+            let reply_for_distill = duduclaw_security::credential_detect::mask(&reply);
             let agent_id_for_distill = agent_id.clone();
             let user_id_for_distill = user_id.to_string();
             let home_for_distill = ctx.home_dir.clone();
@@ -3635,12 +3651,12 @@ pub(super) async fn build_reply_with_session_inner(
             let mut recorder = ctx.skill_recorder.lock().await;
             if !recorder.is_recording(&session_key) {
                 recorder.start(&session_key, &agent_id);
-                recorder.record_turn(&session_key, "user", text, vec![]);
+                recorder.record_turn(&session_key, "user", &duduclaw_security::credential_detect::mask(text), vec![]);
             }
             // Record the assistant reply turn
             // Tool names are not available here (streamed via CLI), so empty for now.
             // Future: parse tool_use events from streaming and pass them through.
-            recorder.record_turn(&session_key, "assistant", &reply, vec![]);
+            recorder.record_turn(&session_key, "assistant", &duduclaw_security::credential_detect::mask(&reply), vec![]);
         }
 
         // Check if compression is needed; summarize on the agent's runtime in background
@@ -3667,7 +3683,7 @@ pub(super) async fn build_reply_with_session_inner(
                             buf,
                             "[{}] {}",
                             m.role,
-                            duduclaw_core::truncate_bytes(&m.content, 300)
+                            duduclaw_core::truncate_bytes(&duduclaw_security::credential_detect::mask(&m.content), 300)
                         );
                     }
                     buf

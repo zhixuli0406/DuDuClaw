@@ -15,8 +15,8 @@ impl TaskStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 row.id,
-                row.title,
-                row.description,
+                mask_derived_text(&row.title),
+                mask_derived_text(&row.description),
                 row.agent_id,
                 row.goal_id,
                 row.status,
@@ -91,7 +91,9 @@ impl TaskStore {
             let mut binds: Vec<String> = vec![Utc::now().to_rfc3339()];
             for key in ["title", "description", "status"] {
                 if let Some(v) = fields.get(key).and_then(|v| v.as_str()) {
-                    binds.push(v.to_string());
+                    binds.push(if matches!(key, "title" | "description") {
+                        mask_derived_text(v)
+                    } else { v.to_string() });
                     sets.push(format!("{key} = ?{}", binds.len()));
                 }
             }
@@ -197,7 +199,7 @@ impl TaskStore {
             let row = PlanStepRow {
                 id: step_id.to_string(),
                 plan_id: plan_id.to_string(),
-                text: text.trim().to_string(),
+                text: mask_derived_text(text.trim()),
                 assignee_kind: assignee_kind.to_string(),
                 assignee: assignee.to_string(),
                 status: "todo".into(),
@@ -263,7 +265,7 @@ impl TaskStore {
             for key in ["text", "status", "assignee_kind", "assignee"] {
                 if let Some(v) = fields.get(key).and_then(|v| v.as_str()) {
                     binds.push(if key == "text" {
-                        v.trim().to_string()
+                        mask_derived_text(v.trim())
                     } else {
                         v.to_string()
                     });

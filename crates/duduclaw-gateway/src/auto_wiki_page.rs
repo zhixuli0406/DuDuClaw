@@ -379,8 +379,10 @@ pub fn try_consume_quota_detail(home_dir: &Path, agent_id: &str, kind: QuotaKind
 /// log). Deterministic for identical inputs — no timestamps — so re-pasting
 /// the same document is a no-op (§5.3(b) idempotency).
 fn render_content_part(req: &AutoPageRequest) -> String {
-    let summary = truncate_chars(req.summary.trim(), MAX_SUMMARY_CHARS);
-    let original_raw = req.original.trim();
+    let masked_summary = duduclaw_security::credential_detect::mask(&req.summary);
+    let summary = truncate_chars(masked_summary.trim(), MAX_SUMMARY_CHARS);
+    let masked_original = duduclaw_security::credential_detect::mask(&req.original);
+    let original_raw = masked_original.trim();
     let original = truncate_bytes(original_raw, MAX_ORIGINAL_BYTES);
     let truncated = original.len() < original_raw.len();
 
@@ -405,7 +407,7 @@ fn render_content_part(req: &AutoPageRequest) -> String {
 
 /// Strip newlines / markdown blockquote breakers from a one-line field.
 fn sanitize_inline(s: &str) -> String {
-    truncate_chars(&s.replace(['\n', '\r'], " "), 120)
+    truncate_chars(&duduclaw_security::credential_detect::mask(s).replace(['\n', '\r'], " "), 120)
 }
 
 /// Compose one revision-log line.
@@ -550,7 +552,7 @@ pub fn write_auto_page(
 
     let page = WikiPage {
         path: path.clone(),
-        title: truncate_chars(req.title.trim(), 120),
+        title: truncate_chars(duduclaw_security::credential_detect::mask(&req.title).trim(), 120),
         created,
         updated: now,
         tags: vec![
@@ -577,7 +579,7 @@ pub fn write_auto_page(
     };
 
     store
-        .write_page(&path, &serialize_page(&page))
+        .write_page(&path, &duduclaw_security::credential_detect::mask(&serialize_page(&page)))
         .map_err(|e| AutoPageError::Write(e.to_string()))?;
 
     Ok(if existing.is_some() {
@@ -701,6 +703,18 @@ pub fn pointer_subject(page_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[test]
+    fn auto_page_sink_masks_direct_request() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        write_auto_page(&store, tmp.path(), "agnes", &req("password: fixture-title", "密碼：fixture-body")).unwrap();
+        let stored = std::fs::read_to_string(store.wiki_dir().join("auto/charter/company-charter.md")).unwrap();
+        assert!(!stored.contains("fixture-title"));
+        assert!(!stored.contains("fixture-body"));
+    }
+
     use tempfile::TempDir;
 
     fn store_in(tmp: &TempDir) -> WikiStore {

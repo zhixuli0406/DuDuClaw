@@ -387,3 +387,7 @@ Approval binds the sorted identifiers of orphan entity embeddings, not just thei
 Each disconnect record has a unique revision and starts unverified. A connection-state check can validate only the revision it read; a delayed disconnect notification cannot reuse an older check.
 
 Regression tests for these changes were added but **not run**; no build was performed.
+
+## Conversation credential audit (unreleased)
+
+[Credential audit](70-credential-audit.md) records detected credentials as metadata only. Passwords and connection strings have no fingerprint; high-entropy types use keyed fingerprints only when credential protection is available. Account hints keep only the first character and domain. Registration is capped at 5 findings per message, 50 per sender per hour and 100,000 rows; excess findings produce an aggregated throttling event. Detected values are masked in derived stores in both modes. The default `audit` mode still leaves plaintext in conversation history; `mask` replaces newly detected values before delivery. Bare passwords without context are not detected. Real-value substitution is planned without a release commitment. Admin-only audit RPCs and the doctor check expose audit-chain verification; the Read file guard also blocks the credential ledger directory.
