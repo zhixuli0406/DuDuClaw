@@ -778,7 +778,7 @@ async fn execute(
     {
         argv.extend(["--disallowedTools".into(), denied]);
     }
-    let files = adapter::runtime_files(family, workspace, settings.max_turns, &prompt);
+    let files = adapter::runtime_files(family, &prompt);
     container::write_config(&dir.config, settings.max_turns, &files).map_err(|e| {
         failed_with(
             failure_code::WORKSPACE_FAILED,

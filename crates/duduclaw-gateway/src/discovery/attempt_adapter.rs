@@ -85,7 +85,7 @@ pub const PRIVATE_HOME: &str = "/tmp/dudu-private/home";
 
 /// Host-written files for the read-only `/dudu-runtime` directory, beyond
 /// `empty-mcp.json`. Paths are relative to that directory.
-pub fn runtime_files(family: RuntimeFamily, _node: &Path, _turns: u32, prompt: &str) -> Vec<(String, Vec<u8>)> {
+pub fn runtime_files(family: RuntimeFamily, prompt: &str) -> Vec<(String, Vec<u8>)> {
     match family {
         RuntimeFamily::Grok => vec![("prompt.txt".into(), prompt.as_bytes().to_vec())],
         _ => vec![],

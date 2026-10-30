@@ -192,13 +192,12 @@ mod tests {
     /// Only claims with a cited vendor page: no dated "blocked since" story.
     #[test]
     fn google_notices_cite_terms_not_an_unsourced_block() {
-        for id in ["gemini"] {
-            let n = vendor_policy(id).notice_zh;
-            for banned in ["封鎖", "2026-03", "伺服器端"] {
-                assert!(!n.contains(banned), "{id} notice must not say {banned:?}");
-            }
-            assert!(n.contains("條款"), "{id}: {n}");
+        let id = "gemini";
+        let n = vendor_policy(id).notice_zh;
+        for banned in ["封鎖", "2026-03", "伺服器端"] {
+            assert!(!n.contains(banned), "{id} notice must not say {banned:?}");
         }
+        assert!(n.contains("條款"), "{id}: {n}");
     }
 
     /// The notice states policy, not a technical block (owner decision

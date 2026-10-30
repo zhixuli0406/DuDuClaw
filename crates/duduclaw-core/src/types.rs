@@ -766,6 +766,8 @@ impl std::fmt::Display for TeamNote {
 /// partial team.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TeamConfigError {
+    /// A configuration file could not be read or parsed. Dispatch must refuse.
+    ConfigUnreadable { detail: String },
     /// The role's runtime is not in [`TEAM_ROLE_RUNTIME_ALLOWLIST`] (or is
     /// not a runtime id at all).
     RuntimeNotAllowed { role: Role, runtime: String },
@@ -794,6 +796,7 @@ impl TeamConfigError {
     /// (`McpOnly` → `"mcponly"`).
     pub fn code(&self) -> &'static str {
         match self {
+            TeamConfigError::ConfigUnreadable { .. } => "team_config_unreadable",
             TeamConfigError::RuntimeNotAllowed { .. } => "runtime_not_allowed",
             TeamConfigError::ModelRuntimeMismatch { .. } => "model_runtime_mismatch",
             TeamConfigError::VerifierSameFamily { .. } => "verifier_same_family",
@@ -809,7 +812,7 @@ impl TeamConfigError {
             | TeamConfigError::ModelRuntimeMismatch { role, .. }
             | TeamConfigError::InvalidEffort { role, .. }
             | TeamConfigError::Incomplete { role } => Some(*role),
-            TeamConfigError::VerifierSameFamily { .. } => None,
+            TeamConfigError::ConfigUnreadable { .. } | TeamConfigError::VerifierSameFamily { .. } => None,
         }
     }
 }
@@ -817,6 +820,7 @@ impl TeamConfigError {
 impl std::fmt::Display for TeamConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TeamConfigError::ConfigUnreadable { detail } => f.write_str(detail),
             TeamConfigError::RuntimeNotAllowed { role, runtime } => {
                 if let Some(removed) = crate::runtime_catalog::removed_runtime(runtime) {
                     return f.write_str(&removed.refusal(&format!("agent.toml [team.roles.{role}] runtime")));

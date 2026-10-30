@@ -211,9 +211,8 @@ mod tests {
         for r in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::OpenAiCompat] {
             assert!(runtime_supported(r), "{r:?}");
         }
-        for r in [RuntimeType::Grok] {
-            assert!(!runtime_supported(r), "{r:?}");
-        }
+        let r = RuntimeType::Grok;
+        assert!(!runtime_supported(r), "{r:?}");
         let args = codex_sandbox_args();
         assert_eq!(args[..2], ["-s", "read-only"]);
         assert!(!args.iter().any(|a| a.contains("bypass") || a.contains("approve")));

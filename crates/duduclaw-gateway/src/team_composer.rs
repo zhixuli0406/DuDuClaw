@@ -591,8 +591,20 @@ impl TeamResolution {
 /// gates on `is_enabled()` first so a disabled team never costs a refusal
 /// audit row.
 pub fn resolve_team(home_dir: &Path, agent_id: &str) -> TeamResolution {
-    let global = read_global_team_config(home_dir);
-    let sections = duduclaw_core::agent_toml::load_for_agent(home_dir, agent_id);
+    let configs = read_global_team_config(home_dir).and_then(|global| {
+        crate::runtime_config::read_agent_sections_for_gate(&home_dir.join("agents").join(agent_id))
+            .map(|sections| (global, sections))
+    });
+    let (global, sections) = match configs {
+        Ok(configs) => configs,
+        Err(detail) => return TeamResolution {
+            merged: TeamConfig::default(),
+            enabled_written: None,
+            cascaded: Vec::new(),
+            operator_bound: Vec::new(),
+            result: Err(TeamConfigError::ConfigUnreadable { detail }),
+        },
+    };
     let merged = TeamConfig::merge(&global, &sections.team);
     let enabled_written = merged.enabled;
     // Taken BEFORE the cascade: afterwards every required role is bound and
@@ -623,16 +635,12 @@ pub fn resolve_team(home_dir: &Path, agent_id: &str) -> TeamResolution {
     }
 }
 
-/// `config.toml [team]`, tolerantly. Absent / malformed ⇒ all-defaults, which
-/// resolves to Solo.
-pub fn read_global_team_config(home_dir: &Path) -> TeamConfig {
-    let Ok(content) = std::fs::read_to_string(home_dir.join("config.toml")) else {
-        return TeamConfig::default();
-    };
-    match content.parse::<toml::Value>() {
-        Ok(doc) => TeamConfig::from_config_toml(&doc),
-        Err(_) => TeamConfig::default(),
-    }
+/// Read `config.toml [team]`; only a missing file uses defaults.
+pub fn read_global_team_config(home_dir: &Path) -> Result<TeamConfig, String> {
+    let path = home_dir.join("config.toml");
+    crate::runtime_config::read_config_for_gate(&path)?
+        .as_ref().map(|doc| crate::runtime_config::strict_team_config(doc, &path))
+        .transpose().map(Option::unwrap_or_default)
 }
 
 /// What [`freeze_for_task`] did.
@@ -641,6 +649,8 @@ pub enum FreezeOutcome {
     /// `[team] enabled` is false (or unset) — nothing was written and nothing
     /// was audited. This is the default state of every deployment.
     Disabled,
+    /// Configuration could not be read safely; no Solo dispatch is allowed.
+    DispatchRefused { code: &'static str, detail: String },
     /// A spec was validated and stored.
     Frozen(FrozenTeamSpec),
     /// A spec was already frozen for this task; the stored one wins.
@@ -759,8 +769,13 @@ pub async fn freeze_for_task(
             );
             warn!(
                 task = %task_id, agent = %agent_id, code = err.code(),
-                "team refused — task runs Solo: {err}"
+                "team refused: {err}"
             );
+            if matches!(err, TeamConfigError::ConfigUnreadable { .. })
+                || matches!(&err, TeamConfigError::RuntimeNotAllowed { runtime, .. }
+                    if duduclaw_core::runtime_catalog::removed_runtime(runtime).is_some()) {
+                return FreezeOutcome::DispatchRefused { code: err.code(), detail: err.to_string() };
+            }
             FreezeOutcome::Refused {
                 code: err.code(),
                 detail: err.to_string(),
@@ -813,7 +828,13 @@ pub fn warn_role_team_capacity_once(home_dir: &Path) {
 
 /// The body of [`warn_role_team_capacity_once`], callable directly by tests.
 pub fn warn_role_team_capacity(home_dir: &Path) {
-    let global = read_global_team_config(home_dir);
+    let global = match read_global_team_config(home_dir) {
+        Ok(global) => global,
+        Err(error) => {
+            warn!("team capacity check refused: {error}");
+            return;
+        }
+    };
     let roster = crate::dispatch_policy::list_roster(home_dir);
     // "Enabled" alone stopped being a useful filter when the switch started
     // defaulting to `true`: every deployment would pay the roster scan and
@@ -5177,6 +5198,53 @@ skill_security_scan = false
             !audit_lines(home).contains(AUDIT_TEAM_REFUSED),
             "an unconfigured deployment must not audit a refusal on every task"
         );
+    }
+
+    #[test]
+    fn team_config_reads_only_default_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(read_global_team_config(dir.path()).is_ok());
+        for bytes in [b"[team]\nbroken = [".as_slice(), &[0xff]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_global_team_config(dir.path()).unwrap_err().contains(&path.display().to_string()));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_global_team_config(dir.path()).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "[team]\nenabled = false\n").unwrap();
+        assert_eq!(read_global_team_config(dir.path()).unwrap().enabled, Some(false));
+    }
+
+    #[tokio::test]
+    async fn broken_team_configs_are_audited_refusals_not_solo_defaults() {
+        for global in [false, true] {
+            for kind in ["toml", "directory", "utf8"] {
+                let dir = tempfile::tempdir().unwrap();
+                let home = dir.path();
+                write_agent(home, "agnes", Some("codex"), "gpt-5.6-sol");
+                let agent_path = home.join("agents/agnes/agent.toml");
+                std::fs::write(&agent_path,
+                    "[runtime]\nprovider = \"codex\"\n[team.roles.verifier]\nruntime = \"antigravity\"\n").unwrap();
+                let path = if global { home.join("config.toml") } else { agent_path };
+                if kind == "directory" {
+                    if path.is_file() { std::fs::remove_file(&path).unwrap(); }
+                    std::fs::create_dir(&path).unwrap();
+                } else {
+                    let bytes = if kind == "utf8" { &[0xff][..] } else { b"[team]\nbroken = [".as_slice() };
+                    std::fs::write(&path, bytes).unwrap();
+                }
+                let resolution = resolve_team(home, "agnes");
+                assert!(!resolution.failure_is_default_state());
+                assert!(matches!(resolution.result, Err(TeamConfigError::ConfigUnreadable { .. })));
+                let store = TaskStore::open(home).unwrap();
+                assert!(matches!(freeze_for_task(home, &store, "task-1", "agnes").await,
+                    FreezeOutcome::DispatchRefused { code: "team_config_unreadable", .. }));
+                assert!(audit_lines(home).contains(AUDIT_TEAM_REFUSED));
+                assert!(crate::runtime_config::ensure_active_agent_provider(&home.join("agents/agnes")).is_err());
+            }
+        }
     }
 
     /// …while an operator who asked for a team and got none still gets the

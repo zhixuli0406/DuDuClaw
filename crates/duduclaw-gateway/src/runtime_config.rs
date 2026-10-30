@@ -52,22 +52,58 @@ fn read_sections(agent_dir: &Path) -> AgentTomlSections {
     agent_toml::load(agent_dir)
 }
 
+/// Authority checks must not hide a configured runtime behind parse defaults.
+pub(crate) fn read_config_for_gate(path: &Path) -> Result<Option<toml::Value>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
+    };
+    text.parse::<toml::Value>().map(Some)
+        .map_err(|error| format!("cannot parse config {}: {}", path.display(), error.message()))
+}
+
+pub(crate) fn read_agent_sections_for_gate(agent_dir: &Path) -> Result<AgentTomlSections, String> {
+    let source_path = agent_dir.join("agent.toml");
+    let source = read_config_for_gate(&source_path)?;
+    if let Some(doc) = &source {
+        strict_team_config(doc, &source_path)?;
+    }
+    let mut effective = source;
+    if let Some(home) = duduclaw_core::preset::agent_home_dir(agent_dir) {
+        if let Some(id) = agent_dir.file_name().and_then(|id| id.to_str()) {
+            let path = duduclaw_core::preset::agent_resolved_path(&home, id);
+            if let Some(doc) = read_config_for_gate(&path)? {
+                strict_team_config(&doc, &path)?;
+                effective = Some(doc);
+            }
+        }
+    }
+    effective.map(|doc| doc.try_into::<AgentTomlSections>()
+        .map_err(|error| format!("cannot parse config {}: {}", source_path.display(), error.message())))
+        .transpose().map(Option::unwrap_or_default)
+}
+
+pub(crate) fn strict_team_config(doc: &toml::Value, path: &Path) -> Result<duduclaw_core::types::TeamConfig, String> {
+    doc.get("team").map(|team| team.clone().try_into::<duduclaw_core::types::TeamConfig>()
+        .map_err(|error| format!("cannot parse config {} [team]: {}", path.display(), error.message())))
+        .transpose().map(Option::unwrap_or_default)
+}
+
 /// Removed runtime choices must be fixed explicitly before dispatch.
 /// Both provider and fallback are checked before any default can be resolved.
 pub fn ensure_active_agent_provider(agent_dir: &Path) -> Result<(), String> {
     // A materialized preset must not hide an operator's removed source choice.
-    if let Ok(raw) = std::fs::read_to_string(agent_dir.join("agent.toml")) {
-        if let Ok(doc) = raw.parse::<toml::Value>() {
-            for field in ["provider", "fallback"] {
-                if let Some(removed) = doc.get("runtime").and_then(|rt| rt.get(field))
-                    .and_then(toml::Value::as_str)
-                    .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
-                    return Err(removed.refusal(&format!("{} agent.toml [runtime] {field}", agent_dir.display())));
-                }
+    if let Some(doc) = read_config_for_gate(&agent_dir.join("agent.toml"))? {
+        for field in ["provider", "fallback"] {
+            if let Some(removed) = doc.get("runtime").and_then(|rt| rt.get(field))
+                .and_then(toml::Value::as_str)
+                .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
+                return Err(removed.refusal(&format!("{} agent.toml [runtime] {field}", agent_dir.display())));
             }
         }
     }
-    let sections = read_sections(agent_dir);
+    let sections = read_agent_sections_for_gate(agent_dir)?;
     for (field, value) in [("provider", sections.runtime.provider), ("fallback", sections.runtime.fallback)] {
         if let Some(removed) = value.as_deref().and_then(duduclaw_core::runtime_catalog::removed_runtime) {
             return Err(removed.refusal(&format!("{} agent.toml [runtime] {field}", agent_dir.display())));
@@ -77,6 +113,7 @@ pub fn ensure_active_agent_provider(agent_dir: &Path) -> Result<(), String> {
     // use that path to execute work with another vendor instead.
     let global_team = duduclaw_core::preset::agent_home_dir(agent_dir)
         .map(|home| crate::team_composer::read_global_team_config(&home))
+        .transpose()?
         .unwrap_or_default();
     let team = duduclaw_core::types::TeamConfig::merge(&global_team, &sections.team);
     if team.is_enabled() {
@@ -91,7 +128,7 @@ pub fn ensure_active_agent_provider(agent_dir: &Path) -> Result<(), String> {
 }
 
 pub fn ensure_active_utility_provider(home_dir: &Path) -> Result<(), String> {
-    let config = read_global_config(home_dir);
+    let config = read_config_for_gate(&home_dir.join("config.toml"))?;
     if let Some(removed) = config.as_ref()
         .and_then(|v| v.get("runtime"))
         .and_then(|v| v.get("utility_provider"))
@@ -916,7 +953,8 @@ fn validate_utility_config(path: &Path, key: &str, optional: bool) -> Result<(),
         }
         Err(e) => return Err(format!("cannot read utility config {}: {e}", path.display())),
     };
-    let cfg: toml::Value = text.parse().map_err(|e| format!("invalid utility config: {e}"))?;
+    let cfg: toml::Value = text.parse::<toml::Value>()
+        .map_err(|e| format!("invalid utility config {}: {}", path.display(), e.message()))?;
     if let Some(runtime) = cfg.get("runtime") {
         let table = runtime.as_table().ok_or("utility runtime config must be a table")?;
         if let Some(value) = table.get(key) {
@@ -1304,6 +1342,32 @@ mod tests {
         // A supported per-agent override repairs the inherited role.
         write_agent_toml(&agent, "[runtime]\nprovider = \"codex\"\n[team.roles.verifier]\nruntime = \"grok\"\n");
         assert!(ensure_active_agent_provider(&agent).is_ok());
+    }
+
+    #[test]
+    fn provider_gates_refuse_unreadable_or_malformed_configs() {
+        for global in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(if global { "config.toml" } else { "agent.toml" });
+            let check = || if global {
+                ensure_active_utility_provider(dir.path())
+            } else {
+                ensure_active_agent_provider(dir.path())
+            };
+            assert!(check().is_ok());
+            for bytes in [b"[runtime]\nprovider = \"private-content\"\nbroken = [".as_slice(), &[0xff]] {
+                std::fs::write(&path, bytes).unwrap();
+                let error = check().unwrap_err();
+                assert!(error.contains(&path.display().to_string()), "{error}");
+                assert!(!error.contains("private-content"), "{error}");
+            }
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert!(check().unwrap_err().contains(&path.display().to_string()));
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, "[runtime]\nprovider = \"codex\"\nutility_provider = \"codex\"\n").unwrap();
+            assert!(check().is_ok());
+        }
     }
 
     #[test]

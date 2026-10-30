@@ -7,6 +7,10 @@
 - Antigravity（`agy`）runtime 已從 runtime 目錄、執行路徑、Dashboard 選項與 Docker 安裝中移除，沒有預告期。仍設定 `antigravity` 的員工、judge、團隊角色或全域輔助後端（`config.toml [runtime] utility_provider`）會被拒絕執行，需改選其他 runtime 與模型；系統不會自動改用其他廠商。`gemini-*` 模型不再對應任何 CLI runtime。Gemini API provider 與 `GEMINI_API_KEY` 繼續支援。先前留在本機的 `~/.gemini/antigravity-cli/` 設定與寫入 agy 設定檔的權限規則不會自動刪除，可自行清理。
 - `docker-compose.yml` 與 `Dockerfile.server` 不再掛載 `.gemini` volume；既有部署留下的舊 volume 不會自動刪除，確認不再需要後可自行移除。
 
+### Security
+
+- `agent.toml` 或 `config.toml` 無法讀取或解析時，現在會拒絕執行並顯示檔案路徑與原因，避免設定損壞後改用預設值、讓工作轉到其他廠商。檔案不存在時維持原有行為。
+
 ## [1.77.0] - 2026-10-30 — 資料外送防護、目標費用上限、單次執行時限與權限收緊
 
 ### Added

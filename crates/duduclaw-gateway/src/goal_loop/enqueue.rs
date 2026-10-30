@@ -55,9 +55,9 @@ impl GoalLoopDriver {
     ///
     /// Split out of [`Self::try_team_dispatch`] so the backfill is testable
     /// without driving a whole round (which would spawn CLIs).
-    pub(super) async fn ensure_frozen_team_spec(&self, task: &mut TaskRow) {
+    pub(super) async fn ensure_frozen_team_spec(&self, task: &mut TaskRow) -> Result<(), String> {
         if task.team_spec_json.is_some() || task.revision_round != 0 {
-            return;
+            return Ok(());
         }
         match crate::team_composer::freeze_for_task(
             &self.home_dir,
@@ -96,10 +96,12 @@ impl GoalLoopDriver {
             // `Disabled` / `Refused` / `SoloByDefault` are already logged
             // (and, for a refusal, audited) inside `freeze_for_task`; the task
             // runs Solo.
+            crate::team_composer::FreezeOutcome::DispatchRefused { detail, .. } => return Err(detail),
             crate::team_composer::FreezeOutcome::Disabled
             | crate::team_composer::FreezeOutcome::Refused { .. }
             | crate::team_composer::FreezeOutcome::SoloByDefault { .. } => {}
         }
+        Ok(())
     }
 
     /// Returns the team dispatch (tracking id, confirmed-team flag) when the
@@ -112,11 +114,11 @@ impl GoalLoopDriver {
         task: &TaskRow,
         iter: u32,
         state_text: &str,
-    ) -> (Option<(String, bool)>, Option<String>) {
+    ) -> Result<(Option<(String, bool)>, Option<String>), String> {
         let mut task = task.clone();
-        self.ensure_frozen_team_spec(&mut task).await;
+        self.ensure_frozen_team_spec(&mut task).await?;
         let Some(spec) = crate::team_composer::frozen_spec(&task) else {
-            return (None, None);
+            return Ok((None, None));
         };
         // Said once per process, the first time a team is actually considered
         // (design §3.8 fix ③): whether `[dispatch] ephemeral_max_active` can
@@ -137,7 +139,7 @@ impl GoalLoopDriver {
             // The Solo branch is not "do nothing": the gate's effort
             // suggestion and the signal vector are already audited by
             // `decide_gate`. The round itself is unchanged.
-            return (None, Some(gate_record.to_string()));
+            return Ok((None, Some(gate_record.to_string())));
         }
 
         let home_dir = self.home_dir.clone();
@@ -167,7 +169,7 @@ impl GoalLoopDriver {
             // A1 ledger: the gate said Team/grey band but the budget forced
             // Solo — record that override next to the gate's own verdict.
             gate_record["budget_forces_solo"] = serde_json::Value::Bool(true);
-            return (None, Some(gate_record.to_string()));
+            return Ok((None, Some(gate_record.to_string())));
         }
         // A1-3 ledger: the team round's token usage carries the task id and
         // its `task_iterations.round` (same value the tick records).
@@ -243,7 +245,7 @@ impl GoalLoopDriver {
         });
         // The grey band can still resolve Solo after the planner runs. Until
         // then, do not tell the user the task has definitively formed a team.
-        (Some((tracking_id, !grey_band)), Some(gate_record.to_string()))
+        Ok((Some((tracking_id, !grey_band)), Some(gate_record.to_string())))
     }
 }
 

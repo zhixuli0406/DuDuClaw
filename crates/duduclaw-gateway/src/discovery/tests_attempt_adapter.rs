@@ -56,9 +56,9 @@ fn stdin_and_runtime_files_per_family() {
     assert!(stdin_payload(RuntimeFamily::Grok,prompt).is_empty());
     for family in [RuntimeFamily::Claude,RuntimeFamily::Codex,RuntimeFamily::OpenAiCompat] {
         assert_eq!(stdin_payload(family,prompt),prompt.as_bytes());
-        assert!(runtime_files(family,Path::new("/w"),1,prompt).is_empty());
+        assert!(runtime_files(family,prompt).is_empty());
     }
-    assert_eq!(runtime_files(RuntimeFamily::Grok,Path::new("/w"),1,prompt),vec![("prompt.txt".to_string(),prompt.as_bytes().to_vec())]);
+    assert_eq!(runtime_files(RuntimeFamily::Grok,prompt),vec![("prompt.txt".to_string(),prompt.as_bytes().to_vec())]);
 }
 
 

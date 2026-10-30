@@ -987,7 +987,7 @@ impl GoalLoopDriver {
             let (team_dispatch, gate_inputs_json) = if durable.is_some() {
                 (None, None)
             } else {
-                self.try_team_dispatch(task, next_iter, &state_text).await
+                self.try_team_dispatch(task, next_iter, &state_text).await?
             };
             // Freeze the same title/description/criteria classifier the
             // difficulty-scaled guard used for this actual dispatch.

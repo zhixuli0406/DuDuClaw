@@ -187,11 +187,10 @@ mod tests {
         assert_eq!(Effort::XHigh.clamp_for(RuntimeType::Codex), Effort::XHigh);
         assert_eq!(Effort::Low.clamp_for(RuntimeType::Codex), Effort::Low);
         // Grok tops out at high.
-        for rt in [RuntimeType::Grok] {
-            assert_eq!(Effort::Max.clamp_for(rt), Effort::High);
-            assert_eq!(Effort::XHigh.clamp_for(rt), Effort::High);
-            assert_eq!(Effort::Medium.clamp_for(rt), Effort::Medium);
-        }
+        let rt = RuntimeType::Grok;
+        assert_eq!(Effort::Max.clamp_for(rt), Effort::High);
+        assert_eq!(Effort::XHigh.clamp_for(rt), Effort::High);
+        assert_eq!(Effort::Medium.clamp_for(rt), Effort::Medium);
     }
 
     #[test]

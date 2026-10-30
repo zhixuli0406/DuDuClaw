@@ -77,7 +77,7 @@ async fn regression_an_already_frozen_spec_is_backfilled_onto_the_local_row() {
     );
 
     let d = driver(store.clone(), queue, small_cfg()).with_home_dir(home.to_path_buf());
-    d.ensure_frozen_team_spec(&mut row).await;
+    d.ensure_frozen_team_spec(&mut row).await.unwrap();
 
     let stored = store.get_task(&row.id).await.unwrap().unwrap();
     assert_eq!(
@@ -103,12 +103,12 @@ async fn the_freeze_backfill_never_touches_a_later_round_or_an_existing_spec() {
     let mut later = goal_task("g-later", "alice");
     later.revision_round = 2;
     store.insert_task(&later).await.unwrap();
-    d.ensure_frozen_team_spec(&mut later).await;
+    d.ensure_frozen_team_spec(&mut later).await.unwrap();
     assert!(later.team_spec_json.is_none(), "round 2 never freezes");
 
     let mut already = goal_task("g-has", "alice");
     already.team_spec_json = Some("{\"already\":true}".into());
-    d.ensure_frozen_team_spec(&mut already).await;
+    d.ensure_frozen_team_spec(&mut already).await.unwrap();
     assert_eq!(already.team_spec_json.as_deref(), Some("{\"already\":true}"));
 }
 

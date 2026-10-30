@@ -780,7 +780,7 @@ impl AttemptRunner for ContainerAttemptRunner {
             let timeout=req.timeout.min(budget.remaining_wall());
             let (account,env)=match next.take() { Some(found)=>found, None=>self.usable_account(rotator,req,&rejected).await? };
             let argv=self.family.argv(model,req.max_turns,&node);
-            let files=super::attempt_adapter::runtime_files(self.family,&node,req.max_turns,&req.prompt);
+            let files=super::attempt_adapter::runtime_files(self.family,&req.prompt);
             // The attempt runs model-driven code under --memory / --pids-limit:
             // on a rootless engine those must be shown to take effect first.
             if let Err(verdict)=crate::task_sandbox::container::resource_limits(&self.image.image).await {

@@ -350,6 +350,9 @@ async fn create_goal_task_inner(
     // verifier sharing the executor's model family) forms no team at all and
     // the task runs Solo — never a partial team.
     let freeze = crate::team_composer::freeze_for_task(home_dir, store, &task_id, &req.agent_id).await;
+    if let crate::team_composer::FreezeOutcome::DispatchRefused { detail, .. } = &freeze {
+        return Err(detail.clone());
+    }
     if let crate::team_composer::FreezeOutcome::Frozen(spec) = &freeze {
         task.team_spec_json = serde_json::to_string(spec).ok();
     }
