@@ -3630,18 +3630,17 @@ async fn call_claude_streaming(
     cmd.kill_on_drop(true);
 
     let admission = crate::autonomous_runtime::admit_current().await?;
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::process_group::ManagedChild::spawn(cmd)
         .map_err(|e| format!("claude CLI spawn error: {e}"))?;
     crate::autonomous_runtime::mark_handoff();
     drop(admission);
-    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
     // Drain stderr asynchronously to prevent pipe buffer deadlock.
     // Without this, if claude CLI writes >64KB to stderr (common in verbose
     // mode), the pipe fills up and the child blocks forever.
-    let stderr = child.stderr.take();
+    let stderr = child.child().stderr.take();
     tokio::spawn(async move {
         if let Some(e) = stderr {
             let mut lines = BufReader::new(e).lines();
@@ -3692,7 +3691,7 @@ async fn call_claude_streaming(
                 match line_result {
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = child.kill().await;
+                        child.kill_and_reap().await;
                         return Err(format!("claude CLI read error: {e}"));
                     }
                     Ok(Some(line)) => {
@@ -3720,7 +3719,7 @@ async fn call_claude_streaming(
                                             .and_then(|r| r.as_str())
                                             .or_else(|| event.get("error").and_then(|e| e.as_str()))
                                             .unwrap_or("Unknown stream-json error");
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         return Err(format!(
                                             "claude CLI stream error: {err_text}"
                                         ));
@@ -3737,7 +3736,7 @@ async fn call_claude_streaming(
                                 Some("assistant") => {
                                     // Envelope-level error field (newer claude-code)
                                     if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         return Err(format!(
                                             "claude CLI assistant error: {err}"
                                         ));
@@ -3840,7 +3839,7 @@ async fn call_claude_streaming(
 
             _ = &mut hard_deadline => {
                 warn!("claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process");
-                let _ = child.kill().await;
+                child.kill_and_reap().await;
                 return Err(format!(
                     "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, partial output: {} chars)",
                     result_text.len()
@@ -3850,7 +3849,10 @@ async fn call_claude_streaming(
     }
 
     thinking.finish();
-    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
+    let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
+    // Preserve successful completion semantics; cancellation before this point
+    // drops the managed owner and terminates all descendants.
+    child.disarm();
     // Any non-zero exit is now a hard failure. Previously we only errored
     // when result_text was empty, which would surface CLI error text as
     // the "reply" whenever the stream-json layer accidentally wrote it.
@@ -5936,5 +5938,34 @@ mod live_dispatch_step_tests {
         assert_eq!(step.tool, "Read");
         assert_eq!(step.phase, "finished");
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod process_tree_cancellation_tests {
+    #[tokio::test]
+    async fn webchat_claude_streaming_cancel_kills_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.current_dir(dir.path())
+            .args(["-c", "/bin/sleep 300 & echo $! > grandchild.pid; wait"]);
+        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None).await });
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(dir.path().join("grandchild.pid"))
+                    .ok().and_then(|text| text.trim().parse::<u32>().ok()) {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("fixture must start a grandchild");
+        assert!(duduclaw_core::platform::process_alive(pid));
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while duduclaw_core::platform::process_alive(pid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("cancel must kill the actual streaming spawn's grandchild");
     }
 }

@@ -8,3 +8,5 @@ mod operator_direct_api;
 mod progress;
 mod prompt_and_sender;
 mod rotation;
+
+pub(crate) mod compression_after_cancel;

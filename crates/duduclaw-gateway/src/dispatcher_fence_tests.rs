@@ -1018,3 +1018,47 @@ async fn sandbox_admission_refusal_defers_only_before_first_handoff() {
         assert!(matches!(DispatchError::from_sandbox(failure()), DispatchError::Sandbox(_)));
     }).await;
 }
+
+/// The full dispatcher runs with only the runtime call replaced by the probe.
+/// A row enqueued after the pending cleanup must still hit the durable fence.
+async fn cancelled_webchat_delegation_dispatch(racing_enqueue: bool) {
+    let rig = Rig::new().await;
+    let broker = crate::approval::ApprovalBroker::open(rig.dir.path()).unwrap();
+    let conn = rusqlite::Connection::open(rig.dir.path().join("message_queue.db")).unwrap();
+    // The source is a real employee so the autonomy source gate can admit
+    // the unaffected turn; an unknown sender is correctly deferred.
+    let insert = |id: &str, turn: &str| {
+        conn.execute(
+            "INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id)
+             VALUES (?1,'alice','alice','work',datetime('now'),'session',?2)",
+            rusqlite::params![id, turn],
+        ).unwrap();
+    };
+    if !racing_enqueue { insert("cancelled-delegation", "cancelled"); }
+    insert("other-delegation", "other");
+    broker.withdraw_turn("session", "cancelled").await.unwrap();
+    assert_eq!(rig.queue.cancel_pending_turn("session", "cancelled").await.unwrap(),
+        usize::from(!racing_enqueue));
+    if racing_enqueue { insert("cancelled-delegation", "cancelled"); }
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    rig.poll().await;
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls() - before, 1, "only the other turn dispatches");
+    let cancelled = rig.queue.get_by_id("cancelled-delegation").await.unwrap().unwrap();
+    assert_eq!(cancelled.status, MessageStatus::Failed);
+    assert_eq!(cancelled.error.as_deref(), Some("origin turn cancelled"));
+    assert_eq!(rig.queue.get_by_id("other-delegation").await.unwrap().unwrap().status, MessageStatus::Done);
+    rig.poll().await;
+    assert!(rig.queue.pending_messages(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_webchat_pending_delegation_never_dispatches_other_turn_does() {
+    cancelled_webchat_delegation_dispatch(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_webchat_racing_enqueue_is_dropped_before_dispatch() {
+    cancelled_webchat_delegation_dispatch(true).await;
+}
