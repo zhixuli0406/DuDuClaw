@@ -1,12 +1,12 @@
 //! People editing an AI employee's profile files — one writer for all of them.
 //!
-//! Every human write to `SOUL.md`, `IDENTITY.md`, `INSTRUCTIONS.md`,
+//! Every human write to `SOUL.md`, `IDENTITY.md`, `USER.md`, `INSTRUCTIONS.md`,
 //! `CONTRACT.toml`, `agent.toml` and the employee's own skill files
 //! (`SKILLS/**.md`, [`skills`]) goes through [`writer`]: a per-file
 //! in-process lock plus the cross-process advisory lock, an optimistic
 //! `base_hash` compare, an owner-only atomic replace, a version history kept
 //! outside the employee's directory ([`history`]), an audit row, a registry
-//! rescan, and the SOUL / INSTRUCTIONS baseline update (`soul_guard`).
+//! rescan, and the SOUL / IDENTITY / USER / INSTRUCTIONS baseline update (`soul_guard`).
 //!
 //! The dashboard's own saves (`agent_files.save`, `agent_files.rollback`,
 //! `contract.update`) additionally run the strict check ([`flow`]): fixed
@@ -43,9 +43,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Byte limit of SOUL / IDENTITY / INSTRUCTIONS and of one skill file.
-pub(crate) const MAX_MARKDOWN_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_MARKDOWN_BYTES: usize = duduclaw_core::agent_profile::MAX_MARKDOWN_BYTES;
+/// Unicode character limit of the user introduction.
+pub(crate) const MAX_USER_CHARS: usize = duduclaw_core::agent_profile::MAX_USER_CHARS;
 /// Byte limit of CONTRACT.toml.
-pub(crate) const MAX_CONTRACT_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_CONTRACT_BYTES: usize = duduclaw_core::agent_profile::MAX_CONTRACT_BYTES;
 /// Byte limit of agent.toml (same as the raw editor).
 pub(crate) const MAX_AGENT_TOML_BYTES: usize = 256 * 1024;
 /// At most this many `must_not` / `must_always` entries.
@@ -58,6 +60,7 @@ pub(crate) const MAX_CONTRACT_ENTRY_CHARS: usize = 500;
 pub(crate) enum FileKey {
     Soul,
     Identity,
+    User,
     Instructions,
     Contract,
     AgentToml,
@@ -67,19 +70,20 @@ pub(crate) enum FileKey {
 
 impl FileKey {
     /// The fixed files (skills are listed per employee, see [`skills::list`]).
-    pub(crate) const ALL: [FileKey; 5] =
-        [Self::Soul, Self::Identity, Self::Instructions, Self::Contract, Self::AgentToml];
+    pub(crate) const ALL: [FileKey; 6] =
+        [Self::Soul, Self::Identity, Self::User, Self::Instructions, Self::Contract, Self::AgentToml];
 
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         match s {
             "soul" => Ok(Self::Soul),
             "identity" => Ok(Self::Identity),
+            "user" => Ok(Self::User),
             "instructions" => Ok(Self::Instructions),
             "contract" => Ok(Self::Contract),
             "agent_toml" => Ok(Self::AgentToml),
             _ => match s.strip_prefix(skills::KEY_PREFIX) {
                 Some(rel) => skills::SkillPath::parse(rel).map(Self::Skill),
-                None => Err("file must be soul, identity, instructions, contract, agent_toml or skill:<path>".into()),
+                None => Err("file must be soul, identity, user, instructions, contract, agent_toml or skill:<path>".into()),
             },
         }
     }
@@ -88,6 +92,7 @@ impl FileKey {
         match self {
             Self::Soul => "soul",
             Self::Identity => "identity",
+            Self::User => "user",
             Self::Instructions => "instructions",
             Self::Contract => "contract",
             Self::AgentToml => "agent_toml",
@@ -100,6 +105,7 @@ impl FileKey {
         match self {
             Self::Soul => "SOUL.md",
             Self::Identity => "IDENTITY.md",
+            Self::User => "USER.md",
             Self::Instructions => "INSTRUCTIONS.md",
             Self::Contract => "CONTRACT.toml",
             Self::AgentToml => "agent.toml",
@@ -119,7 +125,7 @@ impl FileKey {
     }
 
     pub(crate) fn is_markdown(&self) -> bool {
-        matches!(self, Self::Soul | Self::Identity | Self::Instructions | Self::Skill(_))
+        matches!(self, Self::Soul | Self::Identity | Self::User | Self::Instructions | Self::Skill(_))
     }
 
     pub(crate) fn is_skill(&self) -> bool {
@@ -136,6 +142,7 @@ impl FileKey {
 
     pub(crate) fn max_bytes(&self) -> usize {
         match self {
+            Self::User => MAX_USER_CHARS * 4,
             Self::Contract => MAX_CONTRACT_BYTES,
             Self::AgentToml => MAX_AGENT_TOML_BYTES,
             _ => MAX_MARKDOWN_BYTES,
@@ -147,6 +154,8 @@ impl FileKey {
         use duduclaw_security::soul_guard::ProtectedDoc;
         match self {
             Self::Soul => Some(ProtectedDoc::Soul),
+            Self::Identity => Some(ProtectedDoc::Identity),
+            Self::User => Some(ProtectedDoc::User),
             Self::Instructions => Some(ProtectedDoc::Instructions),
             _ => None,
         }

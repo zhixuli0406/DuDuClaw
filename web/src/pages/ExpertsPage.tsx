@@ -250,7 +250,7 @@ export function ExpertsPage() {
         ? { ...importFlow.reimport, acceptEdits: Boolean(opts?.acceptEdits) }
         : importFlow.reimport ?? undefined;
     try {
-      const res = await api.experts.install(importFlow.path, undefined, false, reimport);
+      const res = await api.experts.install(importFlow.path, undefined, false, reimport, importFlow.report?.details?.profile_confirmation);
       setImportFlow({
         phase: 'done',
         path: importFlow.path,

@@ -73,8 +73,7 @@ bins = ["definitely-not-on-path-xyz"]
         &dir.join("agents/front/agent.partial.toml"),
         "[model]\npreferred = \"claude-haiku-4-5\"\n\n[capabilities]\ndenied_tools = [\"computer_use\"]\n",
     );
-    // Pack-declared per-agent MCP server: must be MERGED into the scaffolded
-    // .mcp.json (which already has the wired `duduclaw` server), not dropped.
+    // Pack-declared MCP servers must be reported without installation.
     write(
         &dir.join("agents/front/.mcp.json"),
         r#"{ "mcpServers": { "photoshop": { "command": "photoshop-mcp" } } }"#,
@@ -132,7 +131,7 @@ async fn native_install_list_remove_roundtrip() {
     assert!(nurse_toml.contains("reports_to = \"front\""));
     // referenced skill installed into the agent's SKILLS dir.
     assert!(agents.join("front/SKILLS/greet/SKILL.md").is_file());
-    // pack per-agent .mcp.json MERGED: both duduclaw (wired) and photoshop.
+    // Imported MCP servers are reported, never installed.
     let mcp: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(agents.join("front/.mcp.json")).unwrap())
             .unwrap();
@@ -141,10 +140,7 @@ async fn native_install_list_remove_roundtrip() {
         servers.contains_key("duduclaw"),
         "wired duduclaw server preserved"
     );
-    assert_eq!(
-        servers["photoshop"]["command"], "photoshop-mcp",
-        "pack MCP server landed"
-    );
+    assert!(!servers.contains_key("photoshop"), "pack MCP server is never imported");
     // wiki page merged into shared wiki.
     assert!(home.path().join("shared/wiki/policies/clinic.md").is_file());
 
@@ -184,18 +180,7 @@ async fn native_install_list_remove_roundtrip() {
     .await
     .expect("export should succeed");
     assert!(plugin_dir.join(".claude-plugin/plugin.json").is_file());
-    let exported_mcp: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(plugin_dir.join(".mcp.json")).unwrap())
-            .unwrap();
-    let exp_servers = exported_mcp["mcpServers"].as_object().unwrap();
-    assert!(
-        exp_servers.contains_key("photoshop"),
-        "pack server carried out"
-    );
-    assert!(
-        !exp_servers.contains_key("duduclaw"),
-        "wired duduclaw stripped on export"
-    );
+    assert!(!plugin_dir.join(".mcp.json").exists(), "no imported MCP servers to export");
 
     // ── remove ──
     super::cmd_remove(home.path(), "demo-clinic")
@@ -349,7 +334,7 @@ async fn injection_laden_persona_is_blocked() {
 /// Generated teams ship one or more skills per member and a CONTRACT.toml
 /// per member: each skill must land on its owner only, the contract must
 /// land re-rendered (only `[boundaries]`), and an injection-laden contract
-/// is skipped without blocking the rest of the agent.
+/// refuses the import before any employee is created.
 #[tokio::test]
 async fn per_member_skills_and_contracts_land_on_the_right_agent() {
     let home = TempTree::new("home");
@@ -398,9 +383,19 @@ reports_to = "shop-front"
         );
     }
 
+    assert!(cmd_install(home.path(), dir.to_str().unwrap(), false, false, false, None).await.is_err());
+    assert!(!home.path().join("agents").exists());
+    std::fs::remove_file(dir.join("agents/shop-billing/CONTRACT.toml")).unwrap();
+    // New imports reject unknown contract fields instead of silently dropping them.
+    assert!(cmd_install(home.path(), dir.to_str().unwrap(), false, false, false, None).await.is_err());
+    assert!(!home.path().join("agents").exists());
+    write(
+        &dir.join("agents/shop-returns/CONTRACT.toml"),
+        "[boundaries]\nmust_not = [\"替客戶決定要不要退費或承諾退費金額\"]\nmust_always = [\"涉及金額一律轉交真人確認\"]\n",
+    );
     cmd_install(home.path(), dir.to_str().unwrap(), false, false, false, None)
         .await
-        .expect("install should succeed");
+        .expect("reviewed clean content should install");
 
     let agents = home.path().join("agents");
     assert!(agents.join("shop-front/SKILLS/shop-dispatch/SKILL.md").is_file());
@@ -417,7 +412,7 @@ reports_to = "shop-front"
     );
     assert!(!contract.contains("[browser]"), "only [boundaries] is carried");
 
-    // The scan-blocked contract is skipped; the agent itself still installs.
+    // After removing the blocked source, the agent has no contract to install.
     assert!(agents.join("shop-billing/agent.toml").is_file());
     assert!(!agents.join("shop-billing/CONTRACT.toml").exists());
     // No contract in the pack → none written.
@@ -835,4 +830,20 @@ rank = "boss"
         problems.iter().any(|p| p.message.contains("rank")),
         "{problems:?}"
     );
+}
+
+#[tokio::test]
+async fn native_and_plugin_profiles_require_preview_before_writes() {
+    for plugin in [false, true] {
+        let home = TempTree::new("preview-home");
+        let source = TempTree::new("preview-source");
+        if plugin {
+            write(&source.path().join(".claude-plugin/plugin.json"), r#"{"name":"preview-plugin"}"#);
+            write(&source.path().join("agents/helper.md"), "---\nname: helper\n---\nHelpful.");
+        } else { build_native_pack(source.path()); }
+        let result = super::install::cmd_install_with(home.path(), source.path().to_str().unwrap(),
+            super::install::PipelineOpts::default()).await;
+        assert!(result.is_err());
+        assert!(!home.path().join("agents").exists());
+    }
 }

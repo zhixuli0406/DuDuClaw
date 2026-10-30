@@ -186,3 +186,16 @@ async fn reimport_choices_become_flags_and_bad_values_are_refused() {
         assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{bad}");
     }
 }
+
+#[tokio::test]
+async fn profile_confirmation_is_validated_and_forwarded() {
+    let fx = fixture().await;
+    let bin = fake_bin(fx.home.path(), "exit 0");
+    let invalid = fx.handler.experts_install_with(&json!({ "path": fx.staged, "confirm_profile": "invalid" }), &bin, 30).await;
+    assert!(matches!(invalid, WsFrame::Response { ok: false, .. }));
+    assert!(!fx.home.path().join("argv.txt").exists());
+    let digest = "a".repeat(64);
+    fx.handler.experts_install_with(&json!({ "path": fx.staged, "confirm_profile": digest }), &bin, 30).await;
+    let args = std::fs::read_to_string(fx.home.path().join("argv.txt")).unwrap();
+    assert!(args.contains(&format!("--confirm-profile\n{digest}\n")));
+}

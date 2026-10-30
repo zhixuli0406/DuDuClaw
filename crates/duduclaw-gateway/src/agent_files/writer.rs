@@ -5,7 +5,7 @@
 //! (the AI review may have taken seconds, and a binding can be revoked in
 //! between), render the new text from the bytes just read, validate the
 //! artifact that will take effect, keep the version, replace the file
-//! owner-only and atomically, and update the SOUL / INSTRUCTIONS baseline.
+//! owner-only and atomically, and update the SOUL / IDENTITY / USER / INSTRUCTIONS baseline.
 //! After the lock: audit, registry rescan, channel notice, config event.
 
 use std::path::Path;
@@ -22,7 +22,7 @@ use super::history::{self, VersionMeta};
 use super::verdict::Verdict;
 use super::{AgentFilesConfig, FileKey};
 
-/// What happens to the stored SOUL / INSTRUCTIONS baseline after the write.
+/// What happens to the stored SOUL / IDENTITY / USER / INSTRUCTIONS baseline after the write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Baseline {
     /// The person reviewed the whole content: it becomes the baseline.
@@ -133,9 +133,9 @@ pub(crate) fn commit_locked(
             Ok(_) => return Ok(Locked::Err(CommitError::Refused("skill file not found".into()))),
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
         };
-        let current = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !c.key.is_skill() => String::new(),
+        let (current, existed) = match std::fs::read_to_string(&path) {
+            Ok(s) => (s, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !c.key.is_skill() => (String::new(), false),
             Err(e) => return Ok(Locked::Err(CommitError::Failed(format!("cannot read {}: {e}", c.key.file_name())))),
         };
         let before_hash = super::hash_of(&current);
@@ -153,7 +153,7 @@ pub(crate) fn commit_locked(
         };
         let hash = super::hash_of(&new);
         let accept_current = new == current && c.baseline == Baseline::AcceptCurrent && c.key.protected_doc().is_some();
-        if new == current && !accept_current {
+        if existed && new == current && !accept_current {
             return Ok(Locked::Done(Outcome {
                 before: current,
                 after: new,
@@ -163,6 +163,9 @@ pub(crate) fn commit_locked(
                 unchanged: true,
                 registry_reloaded: true,
             }));
+        }
+        if c.key == FileKey::User && new.chars().count() > super::MAX_USER_CHARS {
+            return Ok(Locked::Err(CommitError::Refused("服務對象介紹最多 4,000 個字".into())));
         }
         if new.len() > c.key.max_bytes() {
             return Ok(Locked::Err(CommitError::Refused(format!("內容太長：最多 {} KB", c.key.max_bytes() / 1024))));

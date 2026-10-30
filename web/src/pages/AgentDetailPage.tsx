@@ -13,6 +13,7 @@ import {
   Settings,
   Shirt,
   Upload,
+  Download,
   Trash2,
   MoreHorizontal,
   Cpu,
@@ -65,6 +66,9 @@ import {
 import { StatusIcon } from '@/components/ui';
 import { agentTaskStats, isLiveState, type AgentTaskStats } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
+import { ExportProfileDialog } from '@/components/agent/ExportProfileDialog';
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
 import { ComputerSessionPanel } from '@/components/agent/ComputerSessionPanel';
 import { AgentFilesTab } from '@/pages/agent-files/AgentFilesTab';
@@ -150,6 +154,8 @@ export function AgentDetailPage() {
   const [busy, setBusy] = useState(false);
   const [showOffboard, setShowOffboard] = useState(false);
   const [showWardrobe, setShowWardrobe] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const canExport = hasMinRole(useAuthStore((s) => s.user?.role), 'manager');
   const [avatarBusy, setAvatarBusy] = useState(false);
   const avatarFileRef = useRef<HTMLInputElement>(null);
 
@@ -489,6 +495,12 @@ export function AgentDetailPage() {
                       {intl.formatMessage({ id: 'agents.avatar.remove' })}
                     </DropdownMenuItem>
                   )}
+                  {canExport && (
+                    <DropdownMenuItem onClick={() => setShowExport(true)}>
+                      <Download />
+                      {intl.formatMessage({ id: 'agentProfile.export.title' })}
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => navigate(`/agents/${encodeURIComponent(id)}/edit`)}>
                     <Settings />
@@ -625,6 +637,7 @@ export function AgentDetailPage() {
         }}
       />
 
+      {showExport && <ExportProfileDialog agentId={id} onClose={() => setShowExport(false)} />}
       {showWardrobe && (
         <WardrobeDialog
           agentId={detail.name}

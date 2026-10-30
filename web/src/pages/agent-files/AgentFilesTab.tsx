@@ -76,7 +76,8 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
   const limit = (isSkillKey(selected) ? list?.limits.skill : list?.limits[selected]) ?? DEFAULT_LIMIT;
   const dirty = mode === 'edit' && doc !== null && draft !== doc.content;
   const draftBytes = useMemo(() => byteLength(draft), [draft]);
-  const overLimit = draftBytes > limit;
+  const draftChars = Array.from(draft).length;
+  const overLimit = draftBytes > limit || (selected === 'user' && draftChars > 4_000);
 
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
@@ -275,6 +276,8 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
           )}
         </header>
 
+        {selected === 'user' && <p className="text-sm text-muted-foreground">{t('agentFiles.help.user')}</p>}
+
         {selected === 'instructions' && (
           <p className="text-sm text-muted-foreground" data-testid="instructions-help">
             {t('agentFiles.help.instructions')}
@@ -363,7 +366,7 @@ export function AgentFilesTab({ agentId, onDirtyChange }: AgentFilesTabProps) {
               className={cn('font-mono text-xs leading-relaxed', overLimit && 'border-destructive')}
             />
             <p id="agent-file-size" className={cn('text-xs', overLimit ? 'text-destructive' : 'text-muted-foreground')}>
-              {t(overLimit ? 'agentFiles.editor.overLimit' : 'agentFiles.editor.size', {
+              {selected === 'user' ? t('agentFiles.editor.userSize', { used: draftChars, limit: 4_000 }) : t(overLimit ? 'agentFiles.editor.overLimit' : 'agentFiles.editor.size', {
                 used: Math.ceil(draftBytes / 1024),
                 limit: Math.floor(limit / 1024),
               })}

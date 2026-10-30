@@ -38,6 +38,23 @@ function renderDialog(phase: 'plan' | 'done', onConfirm = vi.fn(), error?: strin
 }
 
 describe('ImportReportDialog', () => {
+  it('shows a plan without employee profiles and requires its confirmation digest', () => {
+    const plan: ExpertImportReport = {
+      ...report,
+      details: { profile_install_plan: {
+        files: [{ path: 'skills/global/SKILL.md', sha256: 'c'.repeat(64), disposition: 'enabled' }],
+      } },
+    };
+    render(
+      <IntlProvider messages={zhTW} locale="zh-TW" defaultLocale="zh-TW">
+        <ImportReportDialog open phase="plan" report={plan} busy={false} onConfirm={vi.fn()} onClose={vi.fn()} />
+      </IntlProvider>,
+    );
+    expect(screen.getByRole('heading', { name: '完整安裝計畫' })).toBeInTheDocument();
+    expect(screen.getByText(/"skills\/global\/SKILL.md"/)).toHaveTextContent('"disposition": "enabled"');
+    expect(screen.getByRole('button', { name: '確認匯入' })).toBeDisabled();
+  });
+
   it('groups the plan in plain language and confirms on request', async () => {
     const onConfirm = renderDialog('plan');
     expect(screen.getByText('匯入前確認')).toBeInTheDocument();

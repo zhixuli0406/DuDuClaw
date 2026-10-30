@@ -615,7 +615,13 @@ async fn execute_heartbeat(
     check_soul_integrity_with_audit(home_dir, agent_id).await;
     // INSTRUCTIONS.md reaches every prompt too: same baseline, same audit
     // shape (`_instructions_integrity_drift`); the first check establishes it.
-    check_instructions_integrity_with_audit(home_dir, agent_id).await;
+    for doc in [
+        duduclaw_security::soul_guard::ProtectedDoc::Instructions,
+        duduclaw_security::soul_guard::ProtectedDoc::Identity,
+        duduclaw_security::soul_guard::ProtectedDoc::User,
+    ] {
+        check_profile_integrity_with_audit(home_dir, agent_id, doc).await;
+    }
 
     // ── Proactive check (new) ──
     execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals, host_run_notice, budget_gate)
@@ -688,22 +694,26 @@ async fn check_soul_integrity_with_audit(home_dir: &Path, agent_id: &str) {
     );
 }
 
-/// [`check_soul_integrity_with_audit`] for `INSTRUCTIONS.md`.
-async fn check_instructions_integrity_with_audit(home_dir: &Path, agent_id: &str) {
-    use duduclaw_security::soul_guard::{ProtectedDoc, check_doc_integrity};
+/// Check every other operator-owned prompt file with its own baseline.
+async fn check_profile_integrity_with_audit(
+    home_dir: &Path,
+    agent_id: &str,
+    doc: duduclaw_security::soul_guard::ProtectedDoc,
+) {
+    use duduclaw_security::soul_guard::check_doc_integrity;
     let agent_dir = home_dir.join("agents").join(agent_id);
-    if !agent_dir.join(ProtectedDoc::Instructions.file_name()).exists() {
+    if !agent_dir.join(doc.file_name()).exists() {
         return;
     }
     let id = agent_id.to_string();
     let result = match tokio::task::spawn_blocking(move || {
-        check_doc_integrity(ProtectedDoc::Instructions, &id, &agent_dir)
+        check_doc_integrity(doc, &id, &agent_dir)
     })
     .await
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(agent = agent_id, "INSTRUCTIONS integrity check task panicked: {e}");
+            warn!(agent = agent_id, file = doc.file_name(), "Profile integrity check task panicked: {e}");
             return;
         }
     };
@@ -711,14 +721,14 @@ async fn check_instructions_integrity_with_audit(home_dir: &Path, agent_id: &str
         return;
     }
     let dir = home_dir.join("agents").join(agent_id);
-    if !duduclaw_security::soul_guard::should_report_drift(ProtectedDoc::Instructions, &dir, &result.current_hash) {
+    if !duduclaw_security::soul_guard::should_report_drift(doc, &dir, &result.current_hash) {
         return; // already reported for this content
     }
-    warn!(agent = agent_id, "INSTRUCTIONS.md integrity drift detected: {}", result.message);
+    warn!(agent = agent_id, file = doc.file_name(), "Profile integrity drift detected: {}", result.message);
     duduclaw_security::audit::append_tool_call(
         home_dir,
         agent_id,
-        "_instructions_integrity_drift",
+        &format!("_{}_integrity_drift", doc.file_name().trim_end_matches(".md").to_ascii_lowercase()),
         &format!(
             "drift: current={}, expected={}, msg={}",
             result.current_hash.chars().take(16).collect::<String>(),

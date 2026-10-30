@@ -209,34 +209,9 @@ fn extract_context(text: &str, needle: &str) -> String {
 /// This is injected into the agent's system prompt to reinforce the rules.
 pub fn contract_to_prompt(contract: &Contract) -> String {
     let b = &contract.boundaries;
-    if b.must_not.is_empty() && b.must_always.is_empty() {
-        return String::new();
-    }
-
-    let mut lines = vec!["## Behavioral Contract".to_string()];
-
-    if !b.must_not.is_empty() {
-        lines.push("You must NEVER:".to_string());
-        for rule in &b.must_not {
-            lines.push(format!("- {rule}"));
-        }
-    }
-
-    if !b.must_always.is_empty() {
-        lines.push("You must ALWAYS:".to_string());
-        for rule in &b.must_always {
-            lines.push(format!("- {rule}"));
-        }
-    }
-
-    if b.max_tool_calls_per_turn > 0 {
-        lines.push(format!(
-            "Maximum tool calls per turn: {}",
-            b.max_tool_calls_per_turn
-        ));
-    }
-
-    lines.join("\n")
+    duduclaw_core::profile_sections::contract_prompt(
+        &b.must_not, &b.must_always, b.max_tool_calls_per_turn,
+    )
 }
 
 #[cfg(test)]

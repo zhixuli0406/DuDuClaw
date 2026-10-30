@@ -107,20 +107,27 @@ Conditions that trigger handoff to a human operator.
 | `## Domain Knowledge` | Industry-specific facts the agent should know |
 | `## Greeting Templates` | Pre-defined greetings for different contexts (DM, group, returning user) |
 | `## Prohibited Topics` | Topics the agent must decline to discuss (supplements CONTRACT.toml) |
-| `## Evolution Notes` | Auto-generated section — GVU Updater appends observations here |
+| `## Evolution Notes` | Legacy notes, retained only if an operator keeps them |
 
-## Evolution Engine Integration
+## Human editing and integrity
 
-- **SHA-256 fingerprint**: SOUL Guard computes a hash after each write; drift triggers an alert
-- **Version history**: `VersionStore` maintains full history in `evolution.db`
-- **Observation period**: After any GVU-driven change, a 24-hour observation window begins
-- **Auto-rollback**: If prediction error increases during observation, the change reverts automatically
-- **Atomic write**: All updates use temp-file + rename to prevent corruption
+SOUL.md is operator-owned. The evolution engine does not read or rewrite it.
+The dashboard file editor uses the shared profile writer: a file lock, base-hash
+conflict detection, history, audit and review. Accepted changes update the
+SHA-256 baseline; heartbeat reports unaccepted drift. IDENTITY.md, USER.md and
+INSTRUCTIONS.md have separate baselines and the same own-write protection.
+
+The former evolution `VersionStore` history and 24-hour automatic rollback are
+removed. File-edit history and explicit human restore are separate facilities;
+there is no automatic observation-window rollback for a profile edit.
+
+See [Agent File](agent-file-spec.md) for interchange. Import/export does not
+replace the on-disk files with a canonical bundle or keep a second copy in sync.
 
 ## Constraints
 
 - **Encoding**: UTF-8
-- **Max size**: No hard limit, but keep under 4,000 tokens for optimal prompt injection
+- **Max size**: The shared prompt loader refuses a profile file over 256 KiB; keep SOUL.md under 4,000 tokens for practical prompt size
 - **No frontmatter**: Do not use YAML/TOML frontmatter — the file must be pure Markdown
 - **Heading levels**: Use `##` for all sections; `#` is reserved for the role title
 - **No executable code**: Fenced code blocks are for illustration only; the engine does not execute them

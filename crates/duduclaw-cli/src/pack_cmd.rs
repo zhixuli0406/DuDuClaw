@@ -71,6 +71,9 @@ pub enum PackCommands {
         /// Preview the plan without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Digest shown by the Agent File preview; confirms that exact content.
+        #[arg(long)]
+        confirm_profile: Option<String>,
         /// Team packs: import under a `-imported` suffix on agent-id clashes.
         #[arg(long)]
         rename: bool,
@@ -120,6 +123,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
         PackCommands::Install {
             source,
             dry_run,
+            confirm_profile,
             rename,
             trust_hooks,
             attach_under,
@@ -140,6 +144,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
                 &source,
                 InstallOptions {
                     dry_run,
+                    confirm_profile,
                     rename,
                     trust_hooks,
                     attach_under,
@@ -171,6 +176,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InstallOptions {
     pub dry_run: bool,
+    pub confirm_profile: Option<String>,
     pub rename: bool,
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
@@ -210,6 +216,7 @@ async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) ->
     let root = crate::expert::resolve_pack_root(&resolved.dir);
     let pipeline = crate::expert::PipelineOpts {
         dry_run: opts.dry_run,
+        confirm_profile: opts.confirm_profile.clone(),
         rename: opts.rename,
         trust_hooks: opts.trust_hooks,
         attach_under: opts.attach_under.clone(),

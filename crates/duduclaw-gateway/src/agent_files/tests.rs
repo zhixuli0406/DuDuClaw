@@ -208,7 +208,6 @@ fn a_skill_folder_swapped_for_a_symlink_while_saving_is_not_followed() {
     assert!(!elsewhere.join("SKILL.md.tmp").exists());
 }
 
-
 // Added regression test; not run in this change.
 #[tokio::test]
 async fn agent_channel_write_fences_disconnect_and_refuses_unreadable_memory() {
@@ -225,4 +224,20 @@ async fn agent_channel_write_fences_disconnect_and_refuses_unreadable_memory() {
     let result = commit_locked(&commit(&bad_home, FileKey::AgentToml, None), |_| Ok(next.into()), || Ok(()));
     assert!(matches!(result, Err(CommitError::Refused(_))));
     assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+}
+
+#[test]
+fn user_character_limit_and_profile_baselines() {
+    let (_d, home) = home_with_agent();
+    for key in [FileKey::User, FileKey::Identity] {
+        let content = "字".repeat(MAX_USER_CHARS);
+        let out = commit_locked(&commit(&home, key.clone(), None), |_| Ok(content.clone()), || Ok(())).unwrap();
+        assert!(!out.unchanged);
+        let doc = key.protected_doc().expect("profile files have baselines");
+        assert_eq!(duduclaw_security::soul_guard::doc_drift(doc, &home.join("agents/a1")), duduclaw_security::soul_guard::DocDrift::Intact);
+    }
+    let before = std::fs::read_to_string(home.join("agents/a1/USER.md")).unwrap();
+    let result = commit_locked(&commit(&home, FileKey::User, None), |_| Ok("字".repeat(MAX_USER_CHARS + 1)), || Ok(()));
+    assert!(matches!(result, Err(CommitError::Refused(_))));
+    assert_eq!(std::fs::read_to_string(home.join("agents/a1/USER.md")).unwrap(), before);
 }
