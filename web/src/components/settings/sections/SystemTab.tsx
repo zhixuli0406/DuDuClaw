@@ -1,3 +1,4 @@
+import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { Plus, X } from 'lucide-react';
@@ -371,6 +372,8 @@ export function SystemTab() {
 
   const saveErrorFields = saveError != null ? fieldsInError(saveError) : [];
 
+  const utilityProvider = String(extra['runtime.utility_provider'] ?? 'claude');
+
   const agentOptions: SelectOption[] = [
     { value: '', label: intl.formatMessage({ id: 'settings.system.none' }), raw: '' },
     ...agents.map((a) => ({ value: a.name, label: a.display_name || a.name, raw: a.name })),
@@ -580,9 +583,9 @@ export function SystemTab() {
           <RowSelect
             label={intl.formatMessage({ id: 'settings.utility.provider' })}
             description={intl.formatMessage({ id: 'settings.utility.provider.help' })}
-            value={String(extra['runtime.utility_provider'] ?? 'claude')}
+            value={utilityProvider}
             onChange={(v) => setExtraKey('runtime.utility_provider', v)}
-            options={[...RUNTIME_PROVIDERS, ...(extra['runtime.utility_provider'] === 'gemini' ? ['gemini'] : [])].map((value) => ({
+            options={[...RUNTIME_PROVIDERS, ...(isRemovedRuntime(utilityProvider) ? [utilityProvider] : [])].map((value) => ({
               value, label: intl.formatMessage({ id: `agents.runtime.provider.${value}` }), raw: value,
             }))}
           />
@@ -608,7 +611,7 @@ export function SystemTab() {
             {intl.formatMessage({ id: 'settings.utility.model.mismatchWarning' })}
           </p>
         )}
-        {extra['runtime.utility_provider'] === 'gemini' && (
+        {isRemovedRuntime(utilityProvider) && (
           <p role="alert" className="text-sm text-warning">
             {intl.formatMessage({ id: 'settings.utility.removedWarning' })}
           </p>

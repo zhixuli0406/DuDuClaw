@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { useProductPolicyStore } from '@/lib/product-policy';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -68,6 +70,35 @@ describe('<TakeoverMailSection>', () => {
 });
 
 describe('<TeamDefaultsSection>', () => {
+  it.each(['gemini', 'antigravity', 'agy'])('keeps saved removed %s visible even when policy blocks it', async (runtime) => {
+    const user = userEvent.setup();
+    useProductPolicyStore.setState({
+      policy: { profile: 'restricted', blocked_channels: [], blocked_runtimes: [runtime], blocked_providers: [] },
+    });
+    configMock.mockResolvedValue({ config: `[team.roles.planner]\nruntime = "${runtime}"\n` });
+    localStorage.setItem('dudu.settings.advanced.settings.automation.teamRoles', '1');
+    renderWithProviders(<TeamDefaultsSection />);
+    const picker = await screen.findByRole('combobox', { name: 'Planning: runtime' });
+    await waitFor(() => expect(picker).toHaveTextContent(`${runtime} (saved value)`));
+    await user.click(picker);
+    expect(await screen.findByRole('option', { name: `${runtime} (saved value)` })).toBeInTheDocument();
+  });
+
+  it.each([true, false])('keeps the policy gate for a non-removed saved runtime (blocked: %s)', async (blocked) => {
+    const user = userEvent.setup();
+    useProductPolicyStore.setState({
+      policy: { profile: 'restricted', blocked_channels: [], blocked_runtimes: blocked ? ['custom-runtime'] : [], blocked_providers: [] },
+    });
+    configMock.mockResolvedValue({ config: '[team.roles.planner]\nruntime = "custom-runtime"\nmodel = "loaded"\n' });
+    localStorage.setItem('dudu.settings.advanced.settings.automation.teamRoles', '1');
+    renderWithProviders(<TeamDefaultsSection />);
+    await screen.findByDisplayValue('loaded');
+    await user.click(screen.getByRole('combobox', { name: 'Planning: runtime' }));
+    const savedOption = screen.queryByRole('option', { name: 'custom-runtime (saved value)' });
+    if (blocked) expect(savedOption).not.toBeInTheDocument();
+    else expect(savedOption).toBeInTheDocument();
+  });
+
   it('reads the synthesizer slot from [team.roles.utility] and sends the gate change alone', async () => {
     configMock.mockResolvedValue({
       config: '[team]\ngate = "auto"\n\n[team.roles.utility]\nmodel = "gpt-5"\n',

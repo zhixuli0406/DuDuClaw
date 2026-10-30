@@ -7239,7 +7239,7 @@ export const api = {
     config: () =>
       client.call('system.config') as Promise<{
         config?: string;
-        /** Global utility provider, canonicalized; removed Gemini is retained for explicit repair. */
+        /** Global utility provider, canonicalized; removed providers are retained for explicit repair. */
         utility_provider?: string;
         voice?: Partial<VoiceSettings> | null;
         // Structured [gateway] allowed_origins for the remote-access allowlist UI.

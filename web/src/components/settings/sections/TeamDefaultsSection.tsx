@@ -1,3 +1,4 @@
+import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useIntl } from 'react-intl';
 import { Button, ErrorState, Input, SettingsCard, SettingsRow, SettingsSection } from '@/components/mds';
@@ -9,8 +10,8 @@ import { useConfigForm, vBool, vStr } from '../useConfigForm';
 const TEAM_ROLES = ['planner', 'executor', 'verifier', 'synthesizer'] as const;
 type TeamRole = (typeof TEAM_ROLES)[number];
 const TEAM_GATES = ['auto', 'always_solo', 'always_team'] as const;
-// duduclaw_core::types::TEAM_ROLE_RUNTIME_ALLOWLIST minus the deprecated
-// `gemini` (a saved value stays visible, labelled, below).
+// Supported team role runtimes; saved removed values stay visible below
+// so operators can explicitly replace them.
 const ROLE_RUNTIMES = ['', 'claude', 'codex', 'grok'] as const;
 const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
@@ -61,7 +62,7 @@ export function TeamDefaultsSection() {
       label: r === '' ? t('settings.team.runtime.default') : t(`settings.team.runtime.${r}`),
       raw: r as string,
     })),
-    ...(saved && policy.allows('runtimes', saved) && !(ROLE_RUNTIMES as readonly string[]).includes(saved)
+    ...(saved && (isRemovedRuntime(saved) || policy.allows('runtimes', saved)) && !(ROLE_RUNTIMES as readonly string[]).includes(saved)
       ? [{ value: saved, label: intl.formatMessage({ id: 'settings.team.runtime.other' }, { name: saved }), raw: saved }]
       : []),
   ];

@@ -1,3 +1,4 @@
+import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
@@ -346,7 +347,7 @@ export function AutomationTab() {
       raw: v as string,
     })),
     ...(judgeProvider && !(JUDGE_PROVIDERS as readonly string[]).includes(judgeProvider)
-      ? [{ value: judgeProvider, label: judgeProvider, raw: judgeProvider }]
+      ? [{ value: judgeProvider, label: isRemovedRuntime(judgeProvider) ? `${judgeProvider} (${t('common.removed')})` : judgeProvider, raw: judgeProvider }]
       : []),
   ];
 

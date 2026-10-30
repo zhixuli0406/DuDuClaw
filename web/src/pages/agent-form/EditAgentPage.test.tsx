@@ -314,17 +314,17 @@ describe('EditAgentPage', () => {
       expect(screen.queryByRole('option', { name: /Gemini/ })).not.toBeInTheDocument();
     });
 
-    it('keeps a saved gemini provider visible, labelled removed', async () => {
+    it.each([['gemini', 'Gemini'], ['antigravity', 'Antigravity'], ['agy', 'Antigravity']])('keeps a saved %s provider visible, labelled removed', async (provider, name) => {
       const user = userEvent.setup();
-      mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'gemini', fallback: '' } });
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider, fallback: '' } });
       renderAt('/agents/my-bot/edit?tab=brain');
 
       const picker = await screen.findByRole('combobox', { name: 'AI Backend (Provider)' });
       await waitFor(() => {
-        expect(picker).toHaveTextContent('Gemini (removed)');
+        expect(picker).toHaveTextContent(`${name} (removed)`);
       });
       await user.click(picker);
-      expect(await screen.findByRole('option', { name: 'Gemini (removed)' })).toBeInTheDocument();
+      expect(await screen.findByRole('option', { name: `${name} (removed)` })).toBeInTheDocument();
       expect(screen.getByRole('option', { name: 'Codex' })).toBeInTheDocument();
     });
 

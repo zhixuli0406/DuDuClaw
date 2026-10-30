@@ -41,6 +41,16 @@ function mainSave() {
 }
 
 describe('<AutomationTab> v1.68 rows', () => {
+  it.each(['gemini', 'antigravity', 'agy'])('labels a saved removed judge provider %s', async (provider) => {
+    const user = userEvent.setup();
+    configMock.mockResolvedValue({ config: `[dispatch]\njudge_provider = "${provider}"\n` });
+    renderWithProviders(<AutomationTab />);
+    const picker = screen.getByRole('combobox', { name: 'Runtime for the acceptance judge' });
+    await waitFor(() => expect(picker).toHaveTextContent(`${provider} (removed)`));
+    await user.click(picker);
+    expect(await screen.findByRole('option', { name: `${provider} (removed)` })).toBeInTheDocument();
+  });
+
   it('reads the judge runtime and sends only the night switch when that is all that changed', async () => {
     renderWithProviders(<AutomationTab />);
     await waitFor(() =>

@@ -22,10 +22,10 @@ describe('runtimeLabel',()=>{
   it('maps supported runtimes and an old saved id to product names',()=>{
     expect(['claude','codex','gemini','grok','openai-compat'].map(id=>runtimeLabel(id))).toEqual(['Claude','Codex','Gemini CLI','Grok','OpenAI-compatible']);
   });
-  it('marks a removed runtime (gemini) with the localized marker only when intl is given',()=>{
+  it.each([['gemini', 'Gemini CLI'], ['antigravity', 'Antigravity'], ['agy', 'Antigravity']])('marks removed %s only when intl is given',(id, name)=>{
     const intl={messages:{},formatMessage:({id}:{id:string})=>id==='common.removed'?'已移除':id};
-    expect(runtimeLabel('gemini',intl)).toBe('Gemini CLI (已移除)');
-    expect(runtimeLabel('gemini')).toBe('Gemini CLI');
+    expect(runtimeLabel(id,intl)).toBe(`${name} (已移除)`);
+    expect(runtimeLabel(id)).toBe(name);
   });
   it('passes unknown ids through and never returns empty for a non-empty id',()=>{
     expect(runtimeLabel('brand-new')).toBe('brand-new');
