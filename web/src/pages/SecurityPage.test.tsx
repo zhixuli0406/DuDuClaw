@@ -191,3 +191,56 @@ describe('Egress Bash exposure notice', () => {
     await waitFor(() => expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'security.status')).toHaveLength(initialCalls + 1));
   });
 });
+
+
+describe('Egress shadow report', () => {
+  const emptyReport = {
+    days: 7, total: 0, ticket_total: 0,
+    by_employee: [], by_tool: [], by_source_class: [], daily: [], by_transport: [],
+  };
+
+  it('shows an honest empty state without claiming zero future approvals', async () => {
+    mockWsClient.call.mockImplementation(async (method: string) => method === 'security.egress_shadow_report'
+      ? emptyReport : { ...SECURITY_RESPONSE, config: '[security]\n' });
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByText('No observations in this period')).toBeInTheDocument();
+    expect(screen.queryByText(/would have created 0 approval requests/)).not.toBeInTheDocument();
+    expect(mockWsClient.call).toHaveBeenCalledWith('security.egress_shadow_report', { days: 7 });
+  });
+
+  it('counts would-be tickets separately from refusal observations and shows breakdowns', async () => {
+    mockWsClient.call.mockImplementation(async (method: string) => method === 'security.egress_shadow_report'
+      ? { ...emptyReport, total: 5, ticket_total: 3,
+        by_employee: [{ key: 'analyst', count: 5 }],
+        by_tool: [{ key: 'send_message', count: 5 }],
+        by_source_class: [{ key: 'memory', count: 5 }],
+        daily: [{ key: '2026-10-30', count: 5 }],
+        by_transport: [{ key: 'hook', count: 2 }, { key: 'mcp', count: 3 }],
+      } : { ...SECURITY_RESPONSE, config: '[security]\n' });
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByText('Ask before sending would have created 3 approval requests over these 7 days')).toBeInTheDocument();
+    expect(screen.getByText('analyst')).toBeInTheDocument();
+    expect(screen.getByText('send_message')).toBeInTheDocument();
+    expect(screen.getByText('Built-in web and shell tools')).toBeInTheDocument();
+    expect(screen.getByText('Platform and connected tools')).toBeInTheDocument();
+  });
+
+  it('requests the selected 30-day window', async () => {
+    mockWsClient.call.mockImplementation(async (method: string, params?: { days?: number }) => method === 'security.egress_shadow_report'
+      ? { ...emptyReport, days: params?.days } : { ...SECURITY_RESPONSE, config: '[security]\n' });
+    renderWithProviders(<SecurityPage />);
+    await screen.findByText('No observations in this period');
+    fireEvent.change(screen.getByLabelText('Period'), { target: { value: '30' } });
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('security.egress_shadow_report', { days: 30 }));
+  });
+
+  it('shows a report error instead of an empty result when reading fails', async () => {
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'security.egress_shadow_report') throw new Error('unavailable');
+      return { ...SECURITY_RESPONSE, config: '[security]\n' };
+    });
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByText('Could not load observations. Try again later.')).toBeInTheDocument();
+    expect(screen.queryByText('No observations in this period')).not.toBeInTheDocument();
+  });
+});

@@ -1609,6 +1609,7 @@ impl McpDispatcher {
                 }
             }
         } else { (None, None) };
+        let egress_call_id = uuid::Uuid::new_v4().to_string();
         // ── 3.69 Per-turn private-data egress guard ──────────────────────────
         // Never accept a model-supplied reason; bind the final arguments after
         // policy/redaction rewrites to the existing single-use approval.
@@ -1624,9 +1625,9 @@ impl McpDispatcher {
         {
             let decision = if !principal.is_external {
                 if let Some(taint) = read_taint {
-                    duduclaw_gateway::egress_gate::evaluate(&self.home_dir, gate_agent, tool_name, sink, taint)
+                    duduclaw_gateway::egress_gate::evaluate_with_call(&self.home_dir, gate_agent, tool_name, sink, taint, &egress_call_id)
                 } else {
-                    crate::mcp::egress_gate::check(&self.home_dir, gate_agent, tool_name, sink).await
+                    duduclaw_gateway::egress_gate::check_with_call(&self.home_dir, gate_agent, tool_name, sink, &egress_call_id).await
                 }
             } else if dedicated_google {
                 duduclaw_gateway::egress_gate::check_unattributed_employee(&self.home_dir, gate_agent, tool_name, sink)
@@ -1770,8 +1771,8 @@ impl McpDispatcher {
         let sink_lease = if !principal.is_external && sink {
             match duduclaw_gateway::egress_client::SinkLease::acquire(&self.home_dir, gate_agent, private_read.as_ref()).await {
                 Ok((lease, taint)) => {
-                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch(
-                        &self.home_dir, gate_agent, tool_name, true, taint, params_owned.get("egress_guard"),
+                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch_with_call(
+                        &self.home_dir, gate_agent, tool_name, true, taint, params_owned.get("egress_guard"), &egress_call_id,
                     ) {
                         return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                     }
@@ -1781,9 +1782,9 @@ impl McpDispatcher {
                     if let Err(message) = crate::mcp::egress_client::reservation_failure(&self.home_dir, gate_agent, tool_name, &reason) {
                         return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                     }
-                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch(
+                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch_with_call(
                         &self.home_dir, gate_agent, tool_name, true,
-                        duduclaw_gateway::egress_guard::Taint::unknown(), params_owned.get("egress_guard"),
+                        duduclaw_gateway::egress_guard::Taint::unknown(), params_owned.get("egress_guard"), &egress_call_id,
                     ) {
                         return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                     }
@@ -2158,7 +2159,7 @@ mod tests {
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
         assert!(crate::mcp::egress_gate::check(tmp.path(), "dudu", "send_message", true).await.unwrap().is_none());
         let rows = read_tool_call_rows(&tmp);
-        let shadow = rows.iter().find(|r| r["egress_guard"] == "would_ask").unwrap();
+        let shadow = rows.iter().find(|r| r["egress_guard"] == "would_refuse_ledger_unavailable").unwrap();
         assert!(shadow["sources"].as_array().is_some_and(|s| !s.is_empty()));
     }
 
@@ -2173,7 +2174,7 @@ mod tests {
         assert!(response["error"]["message"].as_str().unwrap().contains("外送防護"), "{response}");
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
         let _ = dispatcher.dispatch_tool_call(&principal, &make_ns_ctx(true), &params, &serde_json::json!(91)).await;
-        assert!(read_tool_call_rows(&tmp).iter().any(|r| r["egress_guard"] == "would_ask"));
+        assert!(read_tool_call_rows(&tmp).iter().any(|r| r["egress_guard"] == "would_refuse_ledger_unavailable"));
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='ask'\n").unwrap();
         let (record, response) = dispatch_held_then_decide(&tmp, principal, "send_message", params["arguments"].clone(), false).await;
         assert_eq!(record.agent_id, "test-client");

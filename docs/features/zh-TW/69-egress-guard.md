@@ -40,19 +40,30 @@ Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0
 
 每位員工有獨立且容量固定的 Bloom filter 記錄回合登記；同一 gateway 程序存續期間不清除，因此被淘汰或到期的回合重新登記也不能變回乾淨。雜湊碰撞或 filter 飽和時，可能保守地將該員工的新回合視為已污染。最多保留 1,024 位員工的歷史，每位 32 KiB、合計 32 MiB；超過此上限的其他員工，其回合一律視為已污染。這份歷史不跨重啟保存。
 
+## 外送觀察報表（未發布 E3）
+
+管理員可在安全頁查看最近 7 或 30 個 UTC 日期的觀察紀錄。預估開單數按原本會詢問的呼叫計算，事前檢查與送出前確認共用呼叫 ID，不會重複開算。原本會拒絕的紀錄列入分類，但不算核准單。分類涵蓋員工、工具、固定的私人資料來源類別、日期，以及 CLI 內建工具／MCP 入口。空白表示沒有保存的觀察資料，不代表沒有風險；寫入失敗不改變閘門決策，因此報表可能不完整。
+
+`<home>/egress_shadow.db` 使用 SQLite WAL，Unix 權限 0600，保留 35 天；有新寫入時每小時最多清理一次。不存內容、收件對象或自由文字來源名稱，不受工具呼叫稽核輪替大小限制。RPC `security.egress_shadow_report` 只接受 `days: 7` 或 `days: 30`，限 Admin。
+
+報表涵蓋 MCP 外送閘門評估、電腦操作與 gateway hook 檢查。讀取預約衝突、不支援 runtime 的啟動警告及本機 hook 傳輸失敗，仍留在工具稽核紀錄，不納入這份呼叫計數。
+
 ## 復原
 
-檢查 gateway 日誌中的 `egress lease store unavailable; private reads fenced` 與 `error` 欄位。超限會顯示 `egress agent lease store over capacity` 或 `egress lease store over capacity`；格式異常列會顯示 `invalid egress lease row`，SQLite 檔案損壞則可能顯示資料庫錯誤。Gateway 每五秒重試，每分鐘最多記錄一次錯誤。`ask`／`block` 下，私人讀取與新外送會被拒絕。Gateway 回覆的拒絕原因為「外送防護紀錄無法讀取，暫停私人讀取及對外動作；請稍後重試。」，呼叫端也可能顯示一般的稍後重試提示。目前儀表板與 `doctor` 沒有專用的 lease store 健康狀態指標。
+`duduclaw doctor` 會顯示外送租約筆數、最舊租約年齡與是否可讀。健康檢查異常時，查看 gateway 日誌的 `egress lease store unavailable; private reads fenced` 與 `error` 欄位。紀錄無法讀取時，`ask`／`block` 拒絕私人讀取與新外送。
 
-外送動作（sink）可能仍在執行時，不可直接刪除資料庫：其中的列可能是唯一留下、能阻止平行私人讀取的 fence。若紀錄無法恢復，請依序離線處理：
+清除前先停止使用這個 home 的所有 gateway、暫停自動重啟，並確認員工 CLI 與 MCP／工具子程序的外送動作都已停止。若舊動作可能還在執行，保留其保護並先查明狀態。
 
-1. 停止使用這個 home 的所有 gateway，並暫停自動重啟。
-2. 將所有現存的 `<home>/egress_leases.db*` 檔案一起備份到私人位置，包含 WAL／SHM sidecar，保留原權限。
-3. 確認沒有員工 CLI 程序及其 MCP／工具子程序仍在執行，且它們的外送動作已停止。無法確認時，保持 gateway 停止，不要重設紀錄。
-4. 將資料庫與所有對應 sidecar 一起移到別處，保留備份；不要刪除 `egress_leases.lock`。
-5. 啟動 gateway，系統會建立空的 lease store。**所有先前的外送 fence 都會丟棄。** 若舊動作仍在執行，就會失去防止平行私人讀取的保護，因此只有完成第 3 步確認後才能重啟。確認日誌不再出現該錯誤，並檢查私人讀取與外送准入恢復正常。
+```sh
+duduclaw egress-leases list --json
+duduclaw egress-leases clear --all --confirm <list-顯示的-token>
+# 單筆清除改用 list 顯示的該筆 token：
+duduclaw egress-leases clear --lease <id> --confirm <該筆-token>
+```
 
-後續規劃提供受支援的離線復原指令；本版沒有復原 CLI。
+從操作者自己的終端機執行；AI 工作階段會被拒絕。兩個指令都要求 gateway 停止且租約鎖可用；gateway 鎖無法讀取時拒絕，不把未知狀態當成已停機。`clear` 持有租約獨占鎖，讀出目前租約，先建立帶時間戳、權限 0600 的資料庫備份，再比對排序後所選租約 ID 的確認 token，以單一交易刪除並寫入安全稽核。集合改變就會使 token 失效。保留備份，絕不刪除 `egress_leases.lock`。
+
+清除租約會移除其阻止平行私人讀取的保護。確認對應外送已停止才重新啟動，再檢查 doctor 與 gateway 行為。此指令不會修復損壞或無法讀取的資料庫；遇到拒絕應查明原因，不要藉刪除資料庫或鎖檔繞過。復原採離線本機確認，因為儀表板核准需要 gateway 執行，與停機要求衝突。
 
 ## 核准前看清楚
 

@@ -316,3 +316,5 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 安全頁可把 `config.toml [security] egress_guard` 設成四種值：**關閉**（`off`）、**僅記錄**（`shadow`，預設）、**先詢問**（`ask`）、**直接阻擋**（`block`）。存檔沿用既有加鎖的 `system.update_config` 寫入；每次呼叫時由防護讀取設定。員工的 `agent.toml [capabilities] egress_guard` 只能更嚴格（`off < shadow < ask < block`）。沒有 `config.toml` 時採用預設的僅記錄；設定無效或讀不到時，該次呼叫會被阻擋。
 
 AI 員工在同一回合成功讀過私人資料後，之後的外送呼叫會先經過防護。僅記錄會在稽核寫下 `would_ask` 與讀過的工具，照常執行；先詢問會開出一次性的核准單，列出目的地、完整內容、讀過的工具與到期時間，只有目前具 Admin 權限的儀表板帳號能核准（通道按鈕與聊天回覆都不行）；直接阻擋則拒絕。涵蓋平台 MCP 呼叫與第三方 MCP 代理，不涵蓋 Claude CLI 內建工具與其他 runtime 的原生工具；以回合為單位追蹤。詳見[資料外送防護](../../features/zh-TW/69-egress-guard.md)。
+
+未發布 E3 在設定下方新增僅 Admin 可讀的觀察報表，可選最近 7 或 30 天，查看去重後的預估核准單數、員工／工具／來源／日期分類，以及 CLI 內建工具與 MCP 入口的數量。原本會拒絕的紀錄不增加預估開單數；沒有觀察紀錄或收集失敗不代表安全。`duduclaw doctor` 可看租約健康；停止所有 gateway 與外送動作後，可用 `duduclaw egress-leases list` 取得確認 token，再用 `clear` 離線復原。完整步驟見資料外送防護的復原章節。

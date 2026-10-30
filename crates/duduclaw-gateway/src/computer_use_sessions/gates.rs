@@ -148,7 +148,12 @@ pub(super) fn approval_required(home: &Path, agent_id: &str, tool: &str) -> bool
 }
 
 /// Route callers share the gateway ledger, including calls that bypass MCP.
+#[cfg(test)]
 pub(super) fn egress_check(home: &Path, agent: &str, tool: &str, turn: Option<&str>) -> Result<Option<serde_json::Value>, OpError> {
+    egress_check_with_call(home, agent, tool, turn, &uuid::Uuid::new_v4().to_string())
+}
+
+pub(super) fn egress_check_with_call(home: &Path, agent: &str, tool: &str, turn: Option<&str>, call_id: &str) -> Result<Option<serde_json::Value>, OpError> {
     use duduclaw_core::egress_guard::{effective_mode_checked, Mode};
     if !matches!(tool, TOOL_NAVIGATE | TOOL_TYPE) { return Ok(None); }
     let mode = effective_mode_checked(home, Some(&agent_dir(home, agent))).map_err(forbidden)?;
@@ -158,9 +163,12 @@ pub(super) fn egress_check(home: &Path, agent: &str, tool: &str, turn: Option<&s
     match mode {
         Mode::Off => Ok(None),
         Mode::Shadow => {
-            duduclaw_security::audit::append_tool_call_with_extras(home, agent, tool,
-                "egress_guard: would ask before sending private data", true,
-                &[("egress_guard", json!("would_ask")), ("sources", json!(taint.sources))]);
+            let kind = if taint.sources.iter().any(|s| s == "turn_state_unavailable") { "would_refuse_ledger_unavailable" } else { "would_ask" };
+            if crate::egress_shadow::record(home, agent, tool, kind, &taint.sources, call_id, crate::egress_shadow::Transport::Mcp) {
+                duduclaw_security::audit::append_tool_call_with_extras(home, agent, tool,
+                    "egress_guard: would ask before sending private data", true,
+                    &[("egress_guard", json!(kind)), ("call_id", json!(call_id)), ("sources", json!(taint.sources))]);
+            }
             Ok(None)
         }
         Mode::Ask => Ok(Some(json!({"reason": "egress_guard", "sources": taint.sources}))),
@@ -342,5 +350,24 @@ mod egress_tests {
         assert!(egress_check(home, agent, TOOL_TYPE, None).unwrap_err().message.contains("turn_state_unavailable"));
         std::fs::write(home.join("config.toml"), "[security]\negress_guard='off'").unwrap();
         assert!(egress_check(home, agent, TOOL_TYPE, None).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+
+    #[test]
+    fn computer_precheck_and_recheck_count_one_call() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        let agent = format!("shadow-{}",uuid::Uuid::new_v4());
+        crate::egress_guard::register_turn(&agent,"turn");
+        crate::egress_guard::mark_turn(&agent,Some("turn"),"memory_search");
+        let call = uuid::Uuid::new_v4().to_string();
+        for _ in 0..2 { egress_check_with_call(home.path(),&agent,TOOL_NAVIGATE,Some("turn"),&call).unwrap(); }
+        let report = crate::egress_shadow::report(home.path(),7).unwrap();
+        assert_eq!((report.total,report.ticket_total),(1,1));
+        assert_eq!(std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap().lines().count(),1);
     }
 }

@@ -39,6 +39,17 @@ import type {
 } from './autopilot-rules';
 
 // Type definitions matching Rust types
+export interface EgressShadowReport {
+  days: 7 | 30;
+  total: number;
+  ticket_total: number;
+  by_employee: Array<{ key: string; count: number }>;
+  by_tool: Array<{ key: string; count: number }>;
+  by_source_class: Array<{ key: string; count: number }>;
+  daily: Array<{ key: string; count: number }>;
+  by_transport: Array<{ key: string; count: number }>;
+}
+
 export interface AgentInfo {
   name: string;
   display_name: string;
@@ -7383,6 +7394,8 @@ export const api = {
       client.call('heartbeat.trigger', { agent_id: agentId }) as Promise<{ success: boolean }>,
   },
   security: {
+    egressShadowReport: (days: 7 | 30 = 7) =>
+      client.call('security.egress_shadow_report', { days }) as Promise<EgressShadowReport>,
     auditLog: (limit = 50) =>
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
     status: () =>

@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use super::{MAX_SINK_LEASES, MAX_TOTAL_SINK_LEASES};
 
 pub(super) struct Store {
-    conn: Connection,
+    pub(super) conn: Connection,
     // Drop the connection before releasing exclusive ledger ownership.
     _owner: std::fs::File,
 }
@@ -144,7 +144,7 @@ fn owner_lock(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-fn private_files(path: &Path) -> Result<(), String> {
+pub(super) fn private_files(path: &Path) -> Result<(), String> {
     for suffix in ["", "-wal", "-shm"] {
         let mut name = path.as_os_str().to_os_string();
         name.push(suffix);

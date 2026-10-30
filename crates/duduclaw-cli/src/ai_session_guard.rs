@@ -1,5 +1,5 @@
 //! "Is this process running inside an AI employee's turn?" for operator-only
-//! commands: `memory forget-source`, `memory migrate-namespace`,
+//! commands: `egress-leases`, `memory forget-source`, `memory migrate-namespace`,
 //! `responsibility …` and `agent pause|resume|freeze|unfreeze` (present
 //! even when empty counts), and
 //! `channel-ingress` / `computer-workspaces` (same list, non-empty

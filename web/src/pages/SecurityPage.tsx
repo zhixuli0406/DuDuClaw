@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { api, type AuditEvent, type KillswitchConfig } from '@/lib/api';
+import { api, type AuditEvent, type KillswitchConfig, type EgressShadowReport } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { AdvancedSection, ConfirmDialog, OptionSelect } from '@/components/settings/controls';
@@ -713,6 +713,7 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
           disabled={!form.loaded || form.saving || form.loadError != null}
         />
         <p className="text-xs text-muted-foreground">{t('security.egress.limits')}</p>
+        <EgressShadowReportPanel />
         {status?.egress_bash_exposure && status.egress_bash_exposure.length > 0 && (
           <div role="alert" className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
             <p>{t('security.egress.bashWarning')}</p>
@@ -733,5 +734,79 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
         </Button>
       </div>
     </SecurityCard>
+  );
+}
+
+
+function EgressShadowReportPanel() {
+  const intl = useIntl();
+  const connectionState = useConnectionStore((s) => s.state);
+  const [days, setDays] = useState<7 | 30>(7);
+  const [report, setReport] = useState<EgressShadowReport | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+  const t = (id: string) => intl.formatMessage({ id: `security.egress.${id}` });
+
+  useEffect(() => {
+    let active = true;
+    setReport(null);
+    setFailed(false);
+    setLoading(true);
+    if (connectionState !== 'authenticated') return () => { active = false; };
+    api.security.egressShadowReport(days).then((value) => {
+      if (!active) return;
+      if (!value || typeof value.total !== 'number' || typeof value.ticket_total !== 'number'
+        || ![value.by_employee, value.by_tool, value.by_source_class, value.by_transport, value.daily].every(Array.isArray)) {
+        setFailed(true);
+        return;
+      }
+      setReport(value);
+    }).catch(() => { if (active) setFailed(true); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [connectionState, days]);
+
+  const breakdown = (title: string, rows: Array<{ key: string; count: number }>, employee = false, translate = false) => (
+    <div className="min-w-0 space-y-2">
+      <h4 className="text-sm font-medium">{t(title)}</h4>
+      <ul className="space-y-1 text-sm">
+        {rows.map((row) => (
+          <li key={row.key} className="flex min-w-0 items-center gap-2">
+            {employee && <ActorAvatar actorType="agent" size="xs" name={row.key} />}
+            <span className="min-w-0 flex-1 truncate" title={row.key}>{translate ? intl.formatMessage({ id: `security.egress.class.${row.key}`, defaultMessage: t('class.other') }) : row.key}</span>
+            <span className="font-mono tabular-nums">{intl.formatNumber(row.count)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+  return (
+    <section className="space-y-3 rounded-lg border border-border p-4" aria-label={t('reportTitle')}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-medium">{t('reportTitle')}</h3>
+        <label htmlFor="egress-shadow-days" className="sr-only">{t('period')}</label>
+        <OptionSelect id="egress-shadow-days" value={String(days)}
+          onChange={(value) => setDays(value === '30' ? 30 : 7)}
+          options={[7, 30].map((value) => ({ value: String(value), label: intl.formatMessage({ id: 'security.egress.periodDays' }, { days: value }) }))} />
+      </div>
+      {loading && <p role="status" className="text-sm text-muted-foreground">{t('reportLoading')}</p>}
+      {!loading && failed && <p role="alert" className="text-sm text-destructive">{t('reportFailed')}</p>}
+      {!loading && report && (report.total === 0 ? (
+        <Empty icon={History} title={t('reportEmpty')} description={t('reportEmptyDescription')} />
+      ) : (
+        <>
+          <p className="text-sm font-medium">{intl.formatMessage({ id: 'security.egress.ticketEstimate' }, { days, count: report.ticket_total })}</p>
+          <p className="text-xs text-muted-foreground">{t('reportCountNote')}</p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {breakdown('byEmployee', report.by_employee, true)}
+            {breakdown('byTool', report.by_tool)}
+            {breakdown('bySource', report.by_source_class, false, true)}
+            {breakdown('byTransport', report.by_transport, false, true)}
+            {breakdown('daily', report.daily)}
+          </div>
+        </>
+      ))}
+    </section>
   );
 }

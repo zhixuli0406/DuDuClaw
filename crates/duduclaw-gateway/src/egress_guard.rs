@@ -1,6 +1,7 @@
 //! Gateway-owned, monotonic turn taint. Unknown/expired turns are tainted.
 
 mod lease_store;
+pub mod recovery;
 mod hook;
 
 pub const HOOK_CHECK_ROUTE: &str = "/api/internal/egress-guard/hook-check";

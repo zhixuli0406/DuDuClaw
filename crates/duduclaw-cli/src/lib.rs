@@ -95,6 +95,8 @@ mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
 mod agent_control_cmd; // Operator-only pause/resume/freeze/unfreeze
 mod mcp_init_cmd; // standalone MCP profile: `duduclaw mcp init`
+mod egress_leases_cmd;
+mod doctor_egress_leases;
 mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
 #[cfg(test)]
 mod namespace_unification_tests;
@@ -420,6 +422,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect or recover egress leases while the gateway is stopped.
+    EgressLeases {
+        #[command(subcommand)]
+        command: egress_leases_cmd::EgressLeasesCommands,
+    },
     /// Initialize DuDuClaw environment and configuration
     Onboard {
         /// Skip interactive prompts and use defaults
@@ -5251,6 +5258,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             acl,
             artifact,
         }) => causal_cmd::clear_revocation_fence(&db, &tenant, &acl, &artifact),
+        Commands::EgressLeases { command } => egress_leases_cmd::run(&duduclaw_home(), command),
         Commands::Ops(OpsCommands::Doctor { fix_residue }) => cmd_doctor(fix_residue).await,
         Commands::Ops(OpsCommands::Responsibility { command }) => {
             responsibility_cmd::run(&duduclaw_home(), command).await
@@ -6461,6 +6469,9 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             agent_control_cmd::bash_agent_control_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, egress_leases_cmd::OPERATOR_COMMANDS)
                         })
                         .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(
@@ -10138,6 +10149,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4e: MCP servers in employees' .mcp.json that DuDuClaw did not
     // write (they run as the operator's OS user at every spawn).
     checks.push(doctor_mcp_servers::mcp_servers_check(&home));
+    checks.push(doctor_egress_leases::check(&home));
 
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);

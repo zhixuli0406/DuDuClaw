@@ -82,7 +82,7 @@ pub use bash_egress::{approvable_egress_command, bash_egress_command};
 
 pub use operator_cmd::{
     bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
-    MCP_KEY_COMMANDS,
+    MCP_KEY_COMMANDS, EGRESS_LEASE_COMMANDS,
 };
 pub use real_path::resolve_real_path;
 use real_path::with_real_path;

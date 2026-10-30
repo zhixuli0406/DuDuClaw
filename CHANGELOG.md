@@ -4,6 +4,7 @@
 
 ### Added
 
+- E3：安全頁新增 7／30 天外送觀察報表，按呼叫去重，分列預估核准單與拒絕紀錄，提供員工、工具、固定來源類別、每日與入口分類。獨立 SQLite 紀錄保留 35 天，不存內容或收件對象。新增離線 `egress-leases list/clear`，以停機檢查、獨占鎖、備份與集合確認 token 復原，doctor 顯示租約健康。測試已撰寫但本輪未執行，編譯與安全審查待排程。
 - E1：Claude/Grok 內建 WebFetch、WebSearch 與 Bash 字面網路指令接入外送 hook，由 gateway 依原始參數產生完整審批卡與單次 ActionGrant；先開單拒絕，Admin 核准後以同回合、同參數重試。未知回合或帳本不可達時 ask/block 拒絕，shadow 放行並記錄。Bash 只接受單一簡單網路指令開單；安全頁列出有 Bash 且未開任務沙箱的強制模式員工。
 
 ### Changed

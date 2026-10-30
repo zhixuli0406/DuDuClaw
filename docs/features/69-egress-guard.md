@@ -40,19 +40,30 @@ The store holds an exclusive `<home>/egress_leases.lock` file lock for its lifet
 
 Registration history uses a separate bounded Bloom filter per employee and is never cleared during that gateway process, so re-registering an evicted or expired turn cannot make it clean. Hash collisions or a saturated filter can conservatively taint a new turn for that employee. History holds at most 1,024 employees (32 KiB each, 32 MiB total); turns for additional employees are always treated as tainted. History is not persisted across restart.
 
+## Observation report (unreleased E3)
+
+The Admin-only Security report compares the last 7 or 30 UTC days. The approval estimate counts distinct calls that would ask; pre-check and dispatch confirmation share a call ID. Refusal observations appear in the breakdowns but are not approval tickets. Breakdowns show employee, tool, closed private-source class, date and CLI built-in versus MCP entry point. An empty result means no recorded observations, not proof of safe sending. Collection failures do not change gate decisions and can leave the report incomplete.
+
+`<home>/egress_shadow.db` uses SQLite WAL and Unix 0600 permissions, retains 35 days, and prunes on writes at most hourly. It stores no content, recipients or free-text source names. Existing tool-call audit rotation does not limit this report. `security.egress_shadow_report` accepts only `days: 7` or `days: 30` and requires Admin access.
+
+The report covers MCP outgoing gate evaluations, computer actions and gateway hook checks. Read-reservation conflicts, unsupported-runtime spawn warnings and local hook transport failures remain in the tool audit log and are not included in these call counts.
+
 ## Recovery
 
-Check gateway logs for `egress lease store unavailable; private reads fenced` and its `error` field. An over-cap store reports `egress agent lease store over capacity` or `egress lease store over capacity`; malformed rows report `invalid egress lease row`, and a corrupt SQLite file may report a database error. The gateway retries every five seconds and logs at most once per minute. In `ask`/`block`, private reads and new outgoing actions are refused. The gateway refusal reason is “外送防護紀錄無法讀取，暫停私人讀取及對外動作；請稍後重試。”; callers may instead show a general retry message. There is currently no dedicated lease-store health indicator in the dashboard or `doctor`.
+`duduclaw doctor` reports lease count, oldest age and whether the store is readable. Check gateway logs for `egress lease store unavailable; private reads fenced` and its `error` field when the store is unhealthy. In `ask`/`block`, an unreadable store refuses private reads and new outgoing actions.
 
-Do not delete the database while outgoing actions (sinks) may still be running: its rows may be the only surviving fences preventing concurrent private reads. If the store cannot recover, use this offline procedure:
+Before clearing leases, stop every gateway using this home, disable automatic restart, and confirm that employee CLI processes and their MCP/tool children have stopped their outgoing actions. If an old action may still be running, keep its fence and investigate first.
 
-1. Stop every gateway using this home and prevent automatic restart.
-2. Back up all existing `<home>/egress_leases.db*` files together, including WAL/SHM sidecars, to a private location; preserve their permissions.
-3. Confirm that no employee CLI processes or their MCP/tool child processes are still running and that their outgoing actions have stopped. If this cannot be confirmed, keep the gateway stopped and do not reset the store.
-4. Move the database and every matching sidecar aside together; keep the backup. Do not delete `egress_leases.lock`.
-5. Start the gateway. It creates an empty lease store. **All prior sink fences are dropped.** Any surviving old action would therefore lose its protection against concurrent private reads; only restart after step 3 is confirmed. Verify the log error no longer appears and private reads/outgoing admission work as expected.
+```sh
+duduclaw egress-leases list --json
+duduclaw egress-leases clear --all --confirm <token-from-list>
+# To clear one lease, use that lease's token from list:
+duduclaw egress-leases clear --lease <id> --confirm <lease-token>
+```
 
-A supported offline recovery command is planned; this release has no recovery CLI.
+Run these commands from the operator's terminal; AI sessions are refused. Both commands require the gateway to be stopped and the lease lock to be available. An unreadable gateway lock is a refusal, not evidence of a stopped gateway. `clear` holds the exclusive lease lock, lists the current leases, creates a timestamped private database backup, checks the token against the sorted selected lease IDs, deletes in one transaction and writes a security audit event. A changed set invalidates the token. Keep the backup and never unlink `egress_leases.lock`.
+
+Clearing a lease removes its protection against concurrent private reads. Restart only after confirming the associated outgoing actions have stopped, then check doctor and gateway behavior. The command does not repair a corrupt or unreadable database; a refusal must be investigated rather than bypassed by deleting database or lock files. Recovery uses local offline confirmation because dashboard approval requires a running gateway.
 
 ## Review before approving
 

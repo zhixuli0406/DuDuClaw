@@ -389,6 +389,7 @@ impl ThirdPartyGate {
     /// Atomic gateway query-and-reserve precedes approval and upstream execution.
     /// The snapshot excludes only this call's own reservation.
     pub async fn begin_call(&self, id: &Value, tool: &str, args: &Value) -> Result<PendingCall, String> {
+        let call_id = uuid::Uuid::new_v4().to_string();
         let mut call = self.claim_call(id)?;
         let label = format!("{}.{tool}", self.server);
         let source = duduclaw_core::truncate_bytes(&label, 256);
@@ -408,7 +409,7 @@ impl ThirdPartyGate {
                 crate::egress_guard::Taint::unknown()
             }
         };
-        let approved = match self.check_call_with_taint(tool, args, taint).await {
+        let approved = match self.check_call_with_taint_and_id(tool, args, taint, &call_id).await {
             Ok(approved) => approved,
             Err(reason) => {
                 call.finish_empty().await;
@@ -421,7 +422,7 @@ impl ThirdPartyGate {
             match crate::egress_client::SinkLease::acquire_id(&self.home, &self.agent_id, own_read.as_deref()).await {
                 Ok((lease, taint)) => {
                     call.sink = Some(Arc::new(lease));
-                    if let Err(reason) = crate::egress_gate::confirm_dispatch(&self.home, &self.agent_id, &label, true, taint, approved.as_ref()) {
+                    if let Err(reason) = crate::egress_gate::confirm_dispatch_with_call(&self.home, &self.agent_id, &label, true, taint, approved.as_ref(), &call_id) {
                         call.finish_empty().await;
                         return Err(reason);
                     }
@@ -431,8 +432,8 @@ impl ThirdPartyGate {
                         call.finish_empty().await;
                         return Err(message);
                     }
-                    if let Err(message) = crate::egress_gate::confirm_dispatch(
-                        &self.home, &self.agent_id, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(),
+                    if let Err(message) = crate::egress_gate::confirm_dispatch_with_call(
+                        &self.home, &self.agent_id, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(), &call_id,
                     ) {
                         call.finish_empty().await;
                         return Err(message);
@@ -521,13 +522,19 @@ impl ThirdPartyGate {
     pub(crate) async fn check_call_with_taint(
         &self, tool: &str, args: &Value, taint: crate::egress_guard::Taint,
     ) -> Result<Option<Value>, String> {
+        self.check_call_with_taint_and_id(tool, args, taint, &uuid::Uuid::new_v4().to_string()).await
+    }
+
+    pub(crate) async fn check_call_with_taint_and_id(
+        &self, tool: &str, args: &Value, taint: crate::egress_guard::Taint, call_id: &str,
+    ) -> Result<Option<Value>, String> {
         let (effect, decision) = self.decide(tool);
         if matches!(decision, ThirdPartyDecision::Block(_)) {
             return Err(self.check_call(tool).await.err()
                 .unwrap_or_else(|| "Tool policy changed; retry the call.".into()));
         }
         let label = format!("{}.{tool}", self.server);
-        let egress = crate::egress_gate::evaluate(&self.home, &self.agent_id, &label, effect != ToolEffect::Read, taint)?;
+        let egress = crate::egress_gate::evaluate_with_call(&self.home, &self.agent_id, &label, effect != ToolEffect::Read, taint, call_id)?;
         if decision == ThirdPartyDecision::Ask || egress.is_some() {
             self.ask_bound(tool, effect, args, egress.clone()).await?;
         }
@@ -767,6 +774,19 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         std::fs::write(a.join("agent.toml"), toml).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn third_party_precheck_and_confirm_share_one_shadow_call() {
+        let home = home_with_rules("");
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        let gate = ThirdPartyGate::new(home.path(), "a1", "crm", "proxy");
+        let call = uuid::Uuid::new_v4().to_string();
+        let taint = crate::egress_guard::Taint { tainted: true, sources: vec!["memory_search".into()] };
+        let approved = gate.check_call_with_taint_and_id("put", &json!({}), taint.clone(), &call).await.unwrap();
+        crate::egress_gate::confirm_dispatch_with_call(home.path(), "a1", "crm.put", true, taint, approved.as_ref(), &call).unwrap();
+        let report = crate::egress_shadow::report(home.path(),7).unwrap();
+        assert_eq!((report.total,report.ticket_total),(1,1));
     }
 
     fn listing() -> Value {

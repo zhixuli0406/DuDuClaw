@@ -4,6 +4,19 @@
 use super::*;
 
 impl MethodHandler {
+    pub(crate) async fn handle_security_egress_shadow_report(&self, params: Value) -> WsFrame {
+        let days = match params.get("days").and_then(Value::as_u64) {
+            Some(7) => 7,
+            Some(30) => 30,
+            _ => return WsFrame::error_response("", "days must be 7 or 30"),
+        };
+        let home = self.home_dir.clone();
+        match tokio::task::spawn_blocking(move || crate::egress_shadow::report(&home, days)).await {
+            Ok(Ok(report)) => WsFrame::ok_response("", json!(report)),
+            _ => WsFrame::error_response("", "外送防護統計目前無法讀取，請稍後重試。"),
+        }
+    }
+
     /// Live security system status — replaces static placeholder panels.
     pub(crate) async fn handle_security_status(&self) -> WsFrame {
         let reg = self.registry.read().await;

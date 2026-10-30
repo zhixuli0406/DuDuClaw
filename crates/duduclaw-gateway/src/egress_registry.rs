@@ -54,7 +54,7 @@ impl ClientCallBoundary for RegistryBoundary {
             }
         };
         let read_id = reserved.then_some(id.as_str());
-        let approved = match self.gate.check_call_with_taint(tool, args, taint).await {
+        let approved = match self.gate.check_call_with_taint_and_id(tool, args, taint, &id).await {
             Ok(approved) => approved,
             Err(reason) => {
                 if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
@@ -70,14 +70,14 @@ impl ClientCallBoundary for RegistryBoundary {
             Err(reason) => {
                 if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
                 crate::egress_client::reservation_failure(&self.home, &self.agent, tool, &reason)?;
-                crate::egress_gate::confirm_dispatch(
-                    &self.home, &self.agent, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(),
+                crate::egress_gate::confirm_dispatch_with_call(
+                    &self.home, &self.agent, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(), &id,
                 )?;
                 return Ok((None, None));
             }
         };
-        if let Err(reason) = crate::egress_gate::confirm_dispatch(
-            &self.home, &self.agent, &label, true, taint, approved.as_ref(),
+        if let Err(reason) = crate::egress_gate::confirm_dispatch_with_call(
+            &self.home, &self.agent, &label, true, taint, approved.as_ref(), &id,
         ) {
             if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
             return Err(reason);

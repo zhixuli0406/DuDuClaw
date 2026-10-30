@@ -161,6 +161,7 @@ impl MethodHandler {
                     { "name": "mcp.oauth.revoke", "description": "Revoke OAuth token for a provider" },
                     { "name": "logs.subscribe", "description": "Subscribe to logs" },
                     { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
+                    { "name": "security.egress_shadow_report", "description": "Content-free egress shadow counts for 7 or 30 days (Admin only)" },
                     { "name": "security.status", "description": "Security system status" },
                     { "name": "security.credential_hygiene", "description": "Scan config.toml for plaintext credentials (paths only, never values)" },
                     { "name": "security.credential_inventory", "description": "List every credential field with its source (secret:// reference / encrypted / plaintext), never a value" },

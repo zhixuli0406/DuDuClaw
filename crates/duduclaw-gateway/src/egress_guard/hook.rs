@@ -109,13 +109,15 @@ fn validate(request: &HookRequest) -> Result<bool, &'static str> {
     }
 }
 
-fn audit(home: &Path, agent: &str, tool: &str, verdict: &str, taint: &Taint) {
+fn audit(home: &Path, agent: &str, tool: &str, verdict: &str, taint: &Taint, call_id: &str) {
+    crate::egress_shadow::record(home, agent, tool, verdict, &taint.sources, call_id, crate::egress_shadow::Transport::Hook);
     duduclaw_security::audit::append_tool_call_with_extras(home, agent, tool,
         "CLI built-in egress preflight", true,
-        &[("egress_guard", json!(verdict)), ("sources", json!(taint.sources))]);
+        &[("egress_guard", json!(verdict)), ("call_id", json!(call_id)), ("sources", json!(taint.sources))]);
 }
 
 async fn evaluate(home: &Path, agent: &str, request: &HookRequest) -> Decision {
+    let call_id = uuid::Uuid::new_v4().to_string();
     let mode = match crate::egress_gate::mode(home, agent) {
         Ok(mode) => mode,
         Err(_) => return Decision::refuse("無法讀取外送防護設定；請管理員修正設定後再重試。"),
@@ -126,7 +128,7 @@ async fn evaluate(home: &Path, agent: &str, request: &HookRequest) -> Decision {
         Ok(true) => (),
         Err(reason) => {
             if mode == Mode::Shadow {
-                audit(home, agent, &request.tool, "would_refuse_ledger_unavailable", &Taint::unknown());
+                audit(home, agent, &request.tool, "would_refuse_ledger_unavailable", &Taint::unknown(), &call_id);
                 return Decision::allow();
             }
             return Decision::refuse(reason);
@@ -137,7 +139,7 @@ async fn evaluate(home: &Path, agent: &str, request: &HookRequest) -> Decision {
         Policy::Allow => Decision::allow(),
         Policy::WouldAsk | Policy::WouldRefuseUnavailable => {
             let verdict = if policy(mode, &taint) == Policy::WouldAsk { "would_ask" } else { "would_refuse_ledger_unavailable" };
-            audit(home, agent, &request.tool, verdict, &taint);
+            audit(home, agent, &request.tool, verdict, &taint, &call_id);
             Decision::allow()
         }
         Policy::Unavailable => Decision::refuse("無法確認本回合的私人資料紀錄，已暫停對外動作；請等待 gateway 恢復或開始新回合後重試。"),

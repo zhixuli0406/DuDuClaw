@@ -254,6 +254,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_audit_reliability_summary(params).await
             }
+            "security.egress_shadow_report" => {
+                require_admin!();
+                self.handle_security_egress_shadow_report(params).await
+            }
             "security.status" => {
                 require_admin!();
                 self.handle_security_status().await

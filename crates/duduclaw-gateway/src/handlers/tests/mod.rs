@@ -94,3 +94,5 @@ mod google_identity_rpc_tests;
 mod google_personal_rpc_tests;
 
 mod runtime_model_alignment_tests;
+
+mod egress_shadow_rpc_tests;
