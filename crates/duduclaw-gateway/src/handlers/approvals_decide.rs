@@ -24,7 +24,8 @@ impl MethodHandler {
             expected,
             crate::approval::EXPECTED_DECISION_HOME.scope(
                 self.home_dir.clone(),
-                self.handle_approvals_decide_inner(params, ctx),
+                // Keep the large decision future out of both task-local wrappers.
+                Box::pin(self.handle_approvals_decide_inner(params, ctx)),
             ),
         ).await
     }
@@ -839,6 +840,37 @@ fn take_forced_decide_failure(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approvals_decide_keeps_scoped_inner_future_on_heap() {
+        // Inspect future types without constructing a handler or polling a future.
+        fn future_size<F: std::future::Future>(
+            _: impl FnOnce(&'static MethodHandler, &'static UserContext) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+
+        let inner = future_size(|handler, ctx| {
+            handler.handle_approvals_decide_inner(Value::Null, ctx)
+        });
+        let inline_scopes = future_size(|handler, ctx| {
+            crate::approval::EXPECTED_DECISION_DIGEST.scope(
+                None,
+                crate::approval::EXPECTED_DECISION_HOME.scope(
+                    handler.home_dir.clone(),
+                    handler.handle_approvals_decide_inner(Value::Null, ctx),
+                ),
+            )
+        });
+        let wrapper = future_size(|handler, ctx| {
+            handler.handle_approvals_decide(Value::Null, ctx)
+        });
+        eprintln!("approvals.decide future bytes: inner={inner}, inline_scopes={inline_scopes}, wrapper={wrapper}");
+        assert!(
+            wrapper < inner,
+            "the task-local wrapper must not embed the decision future: wrapper={wrapper}, inner={inner}"
+        );
+    }
 
     fn refusal(frame: &WsFrame) -> String {
         match frame {
