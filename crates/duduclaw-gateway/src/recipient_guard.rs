@@ -43,6 +43,51 @@ pub fn context(home: &Path, agent: &str, turn: &str) -> Result<RecipientContext,
     })
 }
 
+/// Third-party effects have no recipient adapter. Never trust a guessed `to`
+/// argument or a server's name as proof that its destination is allowed.
+/// All side effects may egress; only trusted read-only tools are exempt.
+pub(crate) fn unadapted_effect(
+    home: &Path, agent: &str, tool: &str, effect: duduclaw_core::ToolEffect, audit: bool,
+) -> Option<Value> {
+    if !effect.is_side_effecting() { return None; }
+    let dir = crate::ephemeral::resolve_agent_dir(home, agent)
+        .unwrap_or_else(|| home.join("agents").join(agent));
+    let policy = duduclaw_core::recipient_policy::load(home, Some(&dir));
+    match policy.evaluate(&[String::new()], None, &[]) {
+        Decision::Allow => None,
+        Decision::WouldAsk => {
+            if audit {
+                duduclaw_security::audit::append_tool_call_with_extras(home, agent, tool,
+                    "recipient_would_ask: third-party effect has no recipient adapter", true,
+                    &[("recipient_guard", json!("would_ask"))]);
+            }
+            None
+        }
+        Decision::Ask => Some(json!({"reason":"unresolved_third_party_recipient"})),
+    }
+}
+
+/// Share the Admin-only egress envelope and its complete argument binding.
+pub(crate) fn merge_unadapted_effect(
+    home: &Path, agent: &str, tool: &str, effect: duduclaw_core::ToolEffect, egress: &mut Option<Value>,
+) {
+    if let Some(reason) = unadapted_effect(home, agent, tool, effect, true) {
+        let envelope = egress.get_or_insert_with(|| json!({"reason":"recipient_guard", "sources":[]}));
+        envelope["recipient_guard"] = reason;
+    }
+}
+
+pub(crate) fn confirm_unadapted_effect(
+    home: &Path, agent: &str, tool: &str, effect: duduclaw_core::ToolEffect, approved: Option<&Value>,
+) -> Result<(), String> {
+    if unadapted_effect(home, agent, tool, effect, false).is_some()
+        && approved.and_then(|value| value.get("recipient_guard")).is_none()
+    {
+        return Err("第三方工具的收件對象無法確認，請重試並取得管理員核准。".into());
+    }
+    Ok(())
+}
+
 /// Resolve legacy scheduled aliases against the same live registry as runtime dispatch.
 pub(crate) async fn scheduled_agent(
     registry: &std::sync::Arc<tokio::sync::RwLock<duduclaw_agent::registry::AgentRegistry>>,
@@ -109,6 +154,36 @@ fn scheduled_request(agent: &str, targets: &[String], args: Value) -> (Value, cr
 mod tests {
     use super::*;
     use duduclaw_auth::{UserDb, UserRole};
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[test]
+    fn unadapted_effects_ask_independently_of_private_reads_and_allowed_recipients() {
+        use duduclaw_core::ToolEffect;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/bot");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[capabilities]\nrecipients=['line:allowed']\n").unwrap();
+        for mode in ["off", "shadow", "ask"] {
+            std::fs::write(home.path().join("config.toml"), format!("[security]\nrecipient_guard='{mode}'\n")).unwrap();
+            for effect in ToolEffect::ALL {
+                let reason = unadapted_effect(home.path(), "bot", "crm.send", effect, false);
+                assert_eq!(reason.is_some(), mode == "ask" && effect.is_side_effecting());
+            }
+        }
+        let mut envelope = Some(json!({"reason":"egress_guard", "sources":["memory_read"]}));
+        merge_unadapted_effect(home.path(), "bot", "crm.send", ToolEffect::Send, &mut envelope);
+        assert_eq!(envelope.as_ref().unwrap()["sources"], json!(["memory_read"]));
+        assert!(confirm_unadapted_effect(home.path(), "bot", "crm.send", ToolEffect::Send, envelope.as_ref()).is_ok());
+        assert!(confirm_unadapted_effect(home.path(), "bot", "crm.send", ToolEffect::Send,
+            Some(&json!({"reason":"egress_guard", "sources":["memory_read"]}))).is_err());
+        std::fs::write(home.path().join("config.toml"), "[security]\nrecipient_guard='shadow'\n").unwrap();
+        assert!(unadapted_effect(home.path(), "bot", "crm.send", ToolEffect::Publish, true).is_none());
+        let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        assert!(audit.contains("recipient_would_ask"));
+        assert!(!home.path().join("approvals.db").exists());
+        std::fs::write(home.path().join("config.toml"), "[security]\nrecipient_guard=42\n").unwrap();
+        assert!(unadapted_effect(home.path(), "bot", "crm.send", ToolEffect::Send, false).is_some());
+    }
 
     #[test]
     fn owners_require_owner_binding_and_verified_identity_and_ignore_proactive() {

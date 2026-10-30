@@ -736,7 +736,7 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
             <p className="text-xs text-muted-foreground">{t('security.egress.sandboxScope')}</p>
           </div>
         )}
-        {!status?.egress_bash_exposure && (mode === 'ask' || mode === 'block') && (
+        {!status?.egress_bash_exposure && (mode === 'ask' || mode === 'block' || !recipientModes.includes(recipientMode) || recipientMode === 'ask') && (
           <p role="alert" className="text-sm text-destructive">{t('security.egress.exposureUnavailable')}</p>
         )}
         {form.loadError != null && <p role="alert" className="text-sm text-destructive">{t('security.egress.loadFailed')}</p>}

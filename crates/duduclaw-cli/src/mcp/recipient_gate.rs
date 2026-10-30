@@ -45,7 +45,10 @@ pub(crate) fn targets(tool: &str, args: &Value) -> Option<Vec<String>> {
         },
         // GitHub targets a publication resource, not a person. Responsibility
         // questions are server-routed; OS notifications have no remote address.
-        // Delegation and third-party MCP retain their own policy.
+        // Delegation retains its own policy. Unknown tools have no trusted
+        // recipient adapter, so egress effects carry an unresolvable target.
+        _ if duduclaw_core::tool_effect::effect_of_builtin(tool).is_none()
+            && duduclaw_core::tool_effect::egress_capable(tool).unwrap_or(true) => Some(vec![String::new()]),
         _ => None,
     }
 }
@@ -127,6 +130,19 @@ pub(crate) fn approval_summary(tool: &str, payload: &Value) -> String {
 mod tests {
     use super::*;
 
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[tokio::test]
+    async fn unknown_tools_require_recipient_approval_unless_off() {
+        let home = tempfile::tempdir().unwrap();
+        for mode in ["off", "shadow", "ask"] {
+            std::fs::write(home.path().join("config.toml"), format!("[security]\nrecipient_guard='{mode}'\n")).unwrap();
+            let reason = check(home.path(), "alice", "mcp__third_party__send",
+                &json!({"to":"line:allowed"}), false, false).await;
+            assert_eq!(reason.is_some(), mode == "ask");
+        }
+        assert_eq!(targets("mcp__third_party__send", &json!({"to":"line:allowed"})), Some(vec![String::new()]));
+    }
+
     #[test]
     fn covered_tools_extract_every_destination() {
         for tool in ["send_message", "send_photo", "send_sticker", "create_reminder"] {
@@ -143,7 +159,7 @@ mod tests {
             Some(vec!["mail:a@example.com".into(), "mail:b@example.com".into()]));
         assert_eq!(targets("calendar_create_event", &json!({})), None);
         assert_eq!(targets("calendar_create_event", &json!({"attendees":42})), Some(vec![String::new()]));
-        for tool in ["github_issue_comment", "responsibility_ask", "os_notify", "send_to_agent", "spawn_agent", "team_handoff", "mcp__third_party__send"] {
+        for tool in ["github_issue_comment", "responsibility_ask", "os_notify", "send_to_agent", "spawn_agent", "team_handoff"] {
             assert_eq!(targets(tool, &json!({"to":"other@example.com"})), None);
         }
     }

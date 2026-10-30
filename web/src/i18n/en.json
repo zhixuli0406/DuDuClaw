@@ -9064,7 +9064,7 @@
   "security.egress.limits": "Covers platform and proxied MCP tools, plus Claude and Grok WebFetch, WebSearch and recognized Bash network commands. Codex network access is restricted at launch in ask/block mode. Native file reads do not mark a turn as private; generic CLIs remain uncovered. Observation still allows calls.",
   "security.egress.loadFailed": "Could not load the setting. Reload before making changes.",
   "security.egress.save": "Save outgoing data guard",
-  "security.egress.bashWarning": "These employees can use Bash without the task sandbox while outgoing data guard is set to ask or block. Bash hooks are a speed bump and telemetry; remove Bash access or use the task sandbox for containment.",
+  "security.egress.bashWarning": "These employees can use Bash without the task sandbox while outgoing data guard is set to ask or block, or recipient guard is set to ask. Bash hooks are a speed bump and telemetry; remove Bash access or use the task sandbox for containment.",
   "security.egress.sandboxScope": "The task sandbox covers delegated tasks only. Channel replies, schedules and other host execution paths remain outside it.",
   "security.egress.exposureUnavailable": "Could not verify which employees have Bash without the task sandbox. Reload to check their permissions.",
   "security.recipient.mode": "Recipient guard",

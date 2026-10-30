@@ -267,16 +267,17 @@ pub(crate) fn attended_live_for(agent_id:&str,turn_id:&str)->bool {
         .is_some_and(|proof|proof.valid_for(agent_id,turn_id))
 }
 
-/// Only a server-registered human channel turn grants a source recipient.
+/// Only a server-registered, bound human turn grants a source recipient.
 /// Background executions may carry a reply destination but have no source.
 pub fn source_conversation_for(agent_id: &str, turn_id: &str) -> Option<String> {
     use duduclaw_knowledge::requester::RequesterIdentity;
     match crate::knowledge::turn_requesters::lookup(agent_id, turn_id)? {
-        RequesterIdentity::ChannelUser { .. } | RequesterIdentity::DashboardUser { .. } => {
+        RequesterIdentity::ChannelUser { user_id: Some(_), .. } | RequesterIdentity::DashboardUser { .. } => {
             reply_channel_for(agent_id, turn_id)
                 .and_then(|value| duduclaw_core::recipient_policy::normalize_recipient(&value))
         }
-        RequesterIdentity::System { .. } | RequesterIdentity::Unknown => None,
+        RequesterIdentity::ChannelUser { user_id: None, .. }
+        | RequesterIdentity::System { .. } | RequesterIdentity::Unknown => None,
     }
 }
 
@@ -290,13 +291,31 @@ mod recipient_tests {
         let _turn = register("source-bot", "source-turn", "telegram:42:topic#agent:source-bot").unwrap();
         assert_eq!(source_conversation_for("source-bot", "source-turn"), None);
         let _requester = crate::knowledge::turn_requesters::register("source-bot", "source-turn",
-            RequesterIdentity::ChannelUser {channel: "telegram".into(), chat: "42".into(), sender: "person".into(), user_id: None}).unwrap();
+            RequesterIdentity::ChannelUser {channel: "telegram".into(), chat: "42".into(), sender: "person".into(), user_id: Some("verified-user".into())}).unwrap();
         assert_eq!(source_conversation_for("source-bot", "source-turn").as_deref(), Some("telegram:42"));
         assert_eq!(source_conversation_for("other-bot", "source-turn"), None);
         assert_eq!(source_conversation_for("source-bot", "unknown"), None);
         let _background = crate::knowledge::turn_requesters::register("source-bot", "source-turn",
             RequesterIdentity::System {kind: "cron".into(), on_behalf_of: None}).unwrap();
         assert_eq!(source_conversation_for("source-bot", "source-turn"), None);
+    }
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[test]
+    fn unbound_visitors_have_no_source_recipient_but_keep_normal_replies() {
+        for channel in ["line", "telegram", "web"] {
+            let agent = format!("public-{channel}");
+            let reply = format!("{channel}:visitor");
+            let _turn = register(&agent, "visitor-turn", &reply).unwrap();
+            let _requester = crate::knowledge::turn_requesters::register(&agent, "visitor-turn",
+                RequesterIdentity::ChannelUser {channel: channel.into(), chat: "visitor".into(), sender: "visitor".into(), user_id: None}).unwrap();
+            assert_eq!(source_conversation_for(&agent, "visitor-turn"), None);
+            assert_eq!(reply_channel_for(&agent, "visitor-turn").as_deref(), Some(reply.as_str()));
+            assert_eq!(duduclaw_core::recipient_policy::evaluate(
+                duduclaw_core::recipient_policy::Mode::Ask, &[reply],
+                source_conversation_for(&agent, "visitor-turn").as_deref(), &[], &[]),
+                duduclaw_core::recipient_policy::Decision::Ask);
+        }
     }
 
     #[test]
@@ -312,7 +331,7 @@ mod recipient_tests {
         assert_eq!(source_conversation_for("forged-bot", "unknown"), None);
         let _turn = register("forged-bot", "real-turn", "line:real").unwrap();
         let _requester = crate::knowledge::turn_requesters::register("forged-bot", "real-turn",
-            RequesterIdentity::ChannelUser {channel: "line".into(), chat: "real".into(), sender: "person".into(), user_id: None}).unwrap();
+            RequesterIdentity::ChannelUser {channel: "line".into(), chat: "real".into(), sender: "person".into(), user_id: Some("verified-user".into())}).unwrap();
         assert_eq!(source_conversation_for("forged-bot", "real-turn").as_deref(), Some("line:real"));
     }
 }
