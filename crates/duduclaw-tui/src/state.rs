@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 use tokio::{
-    sync::{broadcast, watch},
+    sync::{broadcast, watch, Notify},
     task::JoinHandle,
     time::Instant,
 };
@@ -139,6 +139,8 @@ pub struct Model {
     pub employees: Snapshot<Employee>,
     pub role: Option<Role>,
     pub login_required: Option<Error>,
+    pub goal_operators: HashSet<String>,
+    pub local_refresh: u64,
     boot_id: Option<String>,
     seq: Option<u64>,
     generation: u64,
@@ -219,6 +221,7 @@ impl Model {
         }
         match result {
             Ok(lists) => {
+                self.goal_operators = lists.goal_operators;
                 self.employees.replace(lists.employees);
                 self.activity.retain(|id, _| self.employees.items.iter().any(|e| e.id() == id));
                 self.inbox.replace(lists.inbox);
@@ -243,6 +246,7 @@ impl Model {
     }
 }
 struct Lists {
+    goal_operators: HashSet<String>,
     recent_activity: Result<HashMap<String, Activity>>,
     schedules: Result<Vec<ScheduledRun>>,
     employees: Vec<Employee>,
@@ -257,9 +261,23 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     let response = client.call("agents.list", json!({}), RPC_TIMEOUT).await?;
     budget.charge(&response, "agents")?;
     let agents: Agents = serde_json::from_value(response).map_err(|_| Error::Protocol)?;
-    let approvals = client
-        .call("approvals.list", json!({}), RPC_TIMEOUT)
-        .await?;
+    // users.me supplies actual Operator/Owner bindings, not role heuristics.
+    // Missing capability data leaves goals read-only, while observation continues.
+    let mut goal_operators = HashSet::new();
+    if let Ok(me) = client.call("users.me", json!({}), RPC_TIMEOUT).await {
+        budget.charge(&me, "bindings")?;
+        let admin = me["user"]["role"] == "admin";
+        for agent in &agents.agents {
+            let operator = me["bindings"].as_array().is_some_and(|bindings| bindings.iter().any(|b|
+                b["agent_name"] == agent.id() && matches!(b["access_level"].as_str(), Some("operator" | "owner"))));
+            if admin || operator { goal_operators.insert(agent.id().to_owned()); }
+        }
+    }
+    // approvals.list requires Manager, whereas goal_decide accepts an
+    // employee's Operator binding. Do not fail the whole employee inbox by
+    // making an RPC that its role cannot call.
+    let approvals = if role == Role::Employee { json!({"approvals":[]}) }
+        else { client.call("approvals.list", json!({}), RPC_TIMEOUT).await? };
     budget.charge(&approvals, "approvals")?;
     let values = approvals
         .get("approvals")
@@ -330,6 +348,7 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     let schedules = if role == Role::Admin { crate::state_extra::schedules(client, &mut budget).await } else { Ok(Vec::new()) };
     if matches!(schedules, Err(Error::SnapshotBudget)) { return Err(Error::SnapshotBudget); }
     Ok(Lists {
+        goal_operators,
         recent_activity,
         schedules,
         employees: agents.agents,
@@ -341,6 +360,7 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
 pub struct StateFeed {
     pub receiver: watch::Receiver<Model>,
     task: JoinHandle<()>,
+    refresh: std::sync::Arc<Notify>,
 }
 impl Drop for StateFeed {
     fn drop(&mut self) {
@@ -348,14 +368,16 @@ impl Drop for StateFeed {
     }
 }
 impl StateFeed {
+    pub fn refetch(&self) { self.refresh.notify_one(); }
     pub fn start(client: Client, interval: Duration) -> Self {
         let (tx, receiver) = watch::channel(Model::default());
-        let task = tokio::spawn(run(client, tx, interval.max(Duration::from_secs(1))));
-        Self { receiver, task }
+        let refresh = std::sync::Arc::new(Notify::new());
+        let task = tokio::spawn(run(client, tx, interval.max(Duration::from_secs(1)), refresh.clone()));
+        Self { receiver, task, refresh }
     }
 }
-async fn run(client: Client, tx: watch::Sender<Model>, interval: Duration) {
-    run_with_sources(client.connection(), client.events(), tx, interval, move |role| {
+async fn run(client: Client, tx: watch::Sender<Model>, interval: Duration, refresh: std::sync::Arc<Notify>) {
+    run_with_sources(client.connection(), client.events(), tx, interval, refresh, move |role| {
         let client = client.clone();
         Box::pin(async move { fetch(&client, role).await })
     }).await;
@@ -366,6 +388,7 @@ async fn run_with_sources(
     mut events: broadcast::Receiver<ServerEvent>,
     tx: watch::Sender<Model>,
     interval: Duration,
+    refresh: std::sync::Arc<Notify>,
     mut fetch_lists: impl FnMut(Role) -> futures_util::future::BoxFuture<'static, Result<Lists>>,
 ) {
     let mut model = Model::default();
@@ -375,6 +398,7 @@ async fn run_with_sources(
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut fetching: Option<futures_util::future::BoxFuture<'static, (u64, Result<Lists>)>> = None;
     let mut dirty = true;
+    let mut requested_refresh = 0;
     loop {
         let status = connection.borrow_and_update().clone();
         match status {
@@ -417,6 +441,10 @@ async fn run_with_sources(
         }
         tx.send_replace(model.clone());
         tokio::select! {
+            _ = refresh.notified() => {
+                requested_refresh += 1;
+                model.invalidate_all(); dirty = true;
+            }
             changed = connection.changed() => { if changed.is_err() { return; } }
             event = events.recv() => match event {
                 Ok(event) => { let revision = model.revision; model.event(&event); dirty |= model.revision != revision; }
@@ -429,6 +457,7 @@ async fn run_with_sources(
                 let (revision, result) = completed;
                 let succeeded = result.is_ok();
                 let applied = model.apply(revision, result);
+                if succeeded && applied { model.local_refresh = requested_refresh; }
                 // A stale successful result needs one follow-up. A failure,
                 // including one raced by an event, waits for a new trigger.
                 dirty = succeeded && (dirty || !applied);
@@ -441,11 +470,43 @@ async fn run_with_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn explicit_decision_refetch_invalidates_and_waits_for_authoritative_lists() {
+        use tokio::sync::{mpsc, oneshot};
+        let (_conn_tx, connection) = watch::channel(ConnectionState::Connected(ConnectionInfo {
+            generation: 1, user_id: "u1".into(), role: Role::Admin,
+            boot_id: Some("boot".into()), version: None, autonomy: None,
+        }));
+        let (_events, event_rx) = broadcast::channel(16);
+        let refresh = std::sync::Arc::new(Notify::new());
+        let (tx, mut models) = watch::channel(Model::default());
+        let (requests, mut calls) = mpsc::unbounded_channel::<oneshot::Sender<Result<Lists>>>();
+        let task = tokio::spawn(run_with_sources(connection, event_rx, tx,
+            Duration::from_secs(3600), refresh.clone(), move |_| {
+                let requests = requests.clone();
+                Box::pin(async move { let (reply, rx) = oneshot::channel(); requests.send(reply).unwrap(); rx.await.unwrap() })
+            }));
+        let complete = || Ok(Lists { goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()),
+            schedules: Ok(vec![]), employees: vec![], inbox: vec![] });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            calls.recv().await.unwrap().send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
+            loop { models.changed().await.unwrap(); if models.borrow().inbox.count().is_some() { break; } }
+            refresh.notify_one();
+            let pending = calls.recv().await.unwrap();
+            assert!(models.borrow().inbox.count().is_none());
+            assert_eq!(models.borrow().local_refresh, 0);
+            pending.send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
+            loop { models.changed().await.unwrap(); if models.borrow().local_refresh == 1 { break; } }
+            assert_eq!(models.borrow().inbox.count(), Some(0));
+        }).await.unwrap();
+        task.abort();
+    }
     fn fresh() -> Model {
         let mut m = Model::default();
         assert!(m.apply(
             0,
             Ok(Lists {
+                goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
                 employees: vec![],
@@ -474,7 +535,7 @@ mod tests {
         let (events, event_rx) = broadcast::channel(32);
         let (tx, mut models) = watch::channel(Model::default());
         let (requests, mut calls) = mpsc::unbounded_channel::<oneshot::Sender<Result<Lists>>>();
-        let task = tokio::spawn(run_with_sources(connection, event_rx, tx, Duration::from_secs(60), move |_| {
+        let task = tokio::spawn(run_with_sources(connection, event_rx, tx, Duration::from_secs(60), std::sync::Arc::new(Notify::new()), move |_| {
             let requests = requests.clone();
             Box::pin(async move {
                 let (reply, result) = oneshot::channel();
@@ -483,6 +544,7 @@ mod tests {
             })
         }));
         let complete = || Ok(Lists {
+            goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
         });
@@ -593,6 +655,7 @@ mod tests {
         assert!(!m.apply(
             old_revision,
             Ok(Lists {
+                goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
                 employees: vec![],
@@ -605,6 +668,7 @@ mod tests {
         assert!(m.apply(
             m.revision,
             Ok(Lists {
+                goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
                 employees: vec![],
@@ -644,6 +708,7 @@ mod tests {
         assert!(model.activity.is_empty());
         model.activity.insert("removed".into(), Activity::default());
         assert!(model.apply(model.revision, Ok(Lists {
+            goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
         })));
@@ -654,6 +719,7 @@ mod tests {
     fn unavailable_history_does_not_claim_fresh_employee_state() {
         let mut model = fresh();
         assert!(model.apply(model.revision, Ok(Lists {
+            goal_operators: HashSet::new(),
             recent_activity: Err(Error::RpcRejected),
             schedules: Ok(vec![]), employees: vec![], inbox: vec![],
         })));

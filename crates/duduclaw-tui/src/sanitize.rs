@@ -75,9 +75,37 @@ impl serde::Serialize for TerminalText {
     }
 }
 
+/// Render each key in place: two keys with the same visible spelling must not
+/// overwrite one another in a rebuilt JSON map and hide part of a payload.
+pub(crate) fn visible_json(value: &serde_json::Value) -> TerminalText {
+    fn render(value: &serde_json::Value, depth: usize) -> String {
+        use serde_json::Value;
+        let indent = "  ".repeat(depth + 1);
+        let close_indent = "  ".repeat(depth);
+        match value {
+            Value::String(s) => serde_json::to_string(&sanitize_for_terminal_visible(s)).unwrap_or_default(),
+            Value::Object(o) if !o.is_empty() => format!("{{\n{}\n{close_indent}}}", o.iter().map(|(k,v)| {
+                let key = render(&Value::String(k.clone()), depth + 1);
+                format!("{indent}{key}: {}", render(v, depth + 1))
+            }).collect::<Vec<_>>().join(",\n")),
+            Value::Array(a) if !a.is_empty() => format!("[\n{}\n{close_indent}]", a.iter().map(|v|
+                format!("{indent}{}", render(v, depth + 1))).collect::<Vec<_>>().join(",\n")),
+            other => other.to_string(),
+        }
+    }
+    TerminalText::new(render(value, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn visible_json_preserves_colliding_display_keys_and_their_values() {
+        let value = serde_json::json!({"a\u{202e}": "first", "a⟨U+202E⟩": "second"});
+        let text = visible_json(&value).visible();
+        assert!(text.contains("first") && text.contains("second"));
+        assert_eq!(text.matches("a⟨U+202E⟩").count(), 2);
+    }
     #[test]
     fn controls_and_mixed_cjk() {
         let input = "繁體\x07\x1b]52;c;secret\x07\x1b[2K\u{202e}中文\u{200d}\n下一行";

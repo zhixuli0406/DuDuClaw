@@ -1,4 +1,6 @@
 //! Socket tests deliberately fail on bind refusal unless explicitly opted out.
+#[path = "decisions/mod.rs"]
+mod decisions;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -52,6 +54,12 @@ struct Fixture {
     short_token: bool,
     flood: AtomicUsize,
     task_calls: AtomicUsize,
+    decisions: std::sync::Mutex<Vec<(String, Value)>>,
+    digest_mismatch: AtomicBool,
+    employee_role: AtomicBool,
+}
+impl Fixture {
+    fn role(&self) -> &'static str { if self.employee_role.load(Ordering::SeqCst) { "employee" } else { "manager" } }
 }
 struct Gateway {
     target: GatewayUrl,
@@ -90,6 +98,9 @@ impl Gateway {
             short_token,
             flood: AtomicUsize::new(0),
             task_calls: AtomicUsize::new(0),
+            decisions: std::sync::Mutex::new(Vec::new()),
+            digest_mismatch: AtomicBool::new(false),
+            employee_role: AtomicBool::new(false),
         });
         let app = Router::new()
             .route("/api/session/local", post(local_session))
@@ -160,7 +171,7 @@ async fn local_session(State(f): State<Arc<Fixture>>, headers: HeaderMap) -> Jso
     );
     Json(
         json!({"access_token":token(if f.short_token { 3 } else { 3600 },false),"refresh_token":token(7200,false),
-        "user":{"id":"u1","email":"fixture@example.com","role":"employee","must_change_password":false}}),
+        "user":{"id":"u1","email":"fixture@example.com","role":f.role(),"must_change_password":false}}),
     )
 }
 async fn refresh(
@@ -205,7 +216,7 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
         f.refreshed_connections.fetch_add(1, Ordering::SeqCst);
     }
     f.connections.fetch_add(1, Ordering::SeqCst);
-    if !send(&mut socket,WsFrame::ok_response(&id,json!({"status":"authenticated","user":{"id":"u1","email":"fixture@example.com","role":"employee"},"must_change_password":false,"boot_id":"boot-a"}))).await { return; }
+    if !send(&mut socket,WsFrame::ok_response(&id,json!({"status":"authenticated","user":{"id":"u1","email":"fixture@example.com","role":f.role()},"must_change_password":false,"boot_id":"boot-a"}))).await { return; }
     let mut first = None;
     loop {
         tokio::select! {
@@ -227,6 +238,19 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                     continue;
                                 }
                                 json!({"version":"fixture","edition":"community","auto_update":false})
+                            },
+                            "users.me" => json!({"user":{"id":"u1","role":f.role()},"bindings":[{"agent_name":"adu","access_level":"operator"}]}),
+                            "approvals.decide" | "tasks.goal_decide" => {
+                                f.decisions.lock().unwrap().push((method.clone(), params.clone()));
+                                if f.digest_mismatch.load(Ordering::SeqCst) {
+                                    let response = WsFrame::Response { id, ok:false, payload:None,
+                                        error:Some(json!({"code":"digest_mismatch","message":"changed\u{1b}]52;bad\u{7}"})) };
+                                    if !send(&mut socket,response).await { return; }
+                                    continue;
+                                }
+                                if method == "approvals.decide" {
+                                    json!({"id":params["id"],"decided":if params["approve"] == true {"approved"} else {"denied"},"side_effect":null,"capability_handle":null})
+                                } else { json!({"ok":true,"message":"done","task":{"id":params["task_id"],"status":"pending"}}) }
                             },
                             "agents.list" => {
                                 if f.flood.load(Ordering::SeqCst) == 0 {

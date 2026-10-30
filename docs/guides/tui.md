@@ -2,9 +2,9 @@
 
 [繁體中文](zh-TW/tui.md) · [日本語](ja-JP/tui.md)
 
-`duduclaw tui` opens a read-only view of pending approvals, goals needing a reply, and employee status. Select a row to inspect its details. Where the gateway provides it, administrators also see the next scheduled autonomous run. Closing the control room does not stop employees.
+`duduclaw tui` opens a control room for pending approvals, goals needing a reply, and employee status. Select a row to inspect its details. Where the gateway provides it, administrators also see the next scheduled autonomous run. Closing the control room does not stop employees.
 
-This first version does not approve or reject requests, send chat messages, pause employees, or provide `tui watch`. Decisions and chat will come later; use the dashboard for those actions now. The terminal interface currently uses Traditional Chinese.
+Approval and goal decision cards are available in the full control room. Chat, notifications, employee pause controls, and `tui watch` are deferred. The terminal interface currently uses Traditional Chinese.
 
 ## Start
 
@@ -42,7 +42,7 @@ OTP is an alternative login method, **not two-factor authentication**. A correct
 | Key | Action |
 |---|---|
 | Arrows / `j` / `k` | Move selection |
-| `Enter` | Open read-only details |
+| `Enter` | Open details or a decision card |
 | `r` | Mark this item or identified completed run as read on this client |
 | `PgUp` / `PgDn` | Scroll details |
 | `?` / `F1` | Toggle help |
@@ -52,11 +52,25 @@ New items never take selection. Read marks do not dismiss pending requests at th
 
 On disconnect, lost events, or an incomplete refetch, lists show `資料可能過期` (“data may be stale”) and counts become `?`; JSON uses `stale: true` and `count: null`. The last complete list remains visible. A refetch has a shared limit of 2,000 rows and 4 MiB of encoded response content across employees, inbox, recent runs, and schedules. Exceeding either limit stops that refetch and keeps it stale, never publishes a partial list as complete. Responses and events are limited to 256 KiB per WebSocket message/frame, with a 16-event queue. Large installations may need the dashboard.
 
+## Decision cards
+
+Select an inbox row and press `Enter` to open its card. New arrivals only update the list and badges; they never open a card or move focus. All key presses during the first second are ignored. `Esc` closes a card; arrows and `PgUp` / `PgDn` scroll it.
+
+For an approval, type the two-digit confirmation code and press `Enter`; `n` denies immediately. Each opening generates a random code different from the previous opening. High-risk (`admin`, shell-type, or unclassified) operations show the full payload with control characters made visible; the code input stays locked until the bottom is visible. Resizing can lock it again. This only guards against mistyped or blind input: **a process running under the same UID that can read the screen can bypass it**. It is not a person-presence or authentication check.
+
+Goal cards use `r` for retry. `a` aborts, `d` marks done, and `t` takes over: press the same key twice, with no countdown; another key cancels confirmation. `c` continues a finished goal only after an explicit follow-up message (`i` to edit, `Esc` to finish editing). The current inbox lists only `needs_human` tasks, so it does not offer `continue`; use the dashboard for finished goals. The current `tasks.goal_decide` handler accepts `task_id`, `action`, optional `note`, and requires `message` for `continue`. It does **not** accept/check a revision, so this client does not claim revision protection or send an invented field.
+
+Cards with `may_decide=false` are read-only and explain why. Goal actions require a known Operator/Owner binding or Admin access from `users.me`. Dashboard-only approvals, questions requiring answers, and bound operations stay in the dashboard. The TUI displays a fixed instruction and never opens a link supplied by the server. Standing-authority and global configuration changes remain in the dashboard.
+
+The client sends `expected_digest` only when a card supplies a string `digest`, omitting it for null/missing values. A structured digest-mismatch rejection closes the card, refetches, and displays a fixed “card changed” message. **This checkout's gateway does not yet return or check that digest**, so payload-change protection is not available against this gateway. Every decision, including RPC errors and uncertain timeouts, triggers a refetch; the client never invents a successful result or automatically resends a decision. Server error text is displayed through `TerminalText`. Stale or expired approvals are never actionable; an absent expiry also disables decisions.
+
+`s` in the list or card snoozes the row locally for up to ten minutes. Approvals are capped at 80% of remaining TTL and resurface no later than when 20% of TTL or ten minutes (whichever is less) remains, with a reason; an earlier requested wake-up wins. A shortened deadline also resurfaces the row. Expiry means denial, and snooze cannot extend it. Only identifiers and timestamps are saved in `tui-state.json`; the line-oriented `inbox` command continues to show the authoritative pending list.
+
 ## Local files
 
 | File under home | Use |
 |---|---|
-| `tui-state.json` | Written when marking items read. Contains identifiers only; atomically replaced through a temporary file in the same directory. |
+| `tui-state.json` | Written when marking items read or snoozing. Contains read identifiers and snooze timestamps only; atomically replaced through a temporary file in the same directory. |
 | `tui.toml` | Optional, operator-created settings; the TUI reads it and does not create or rewrite it. |
 
 ```toml

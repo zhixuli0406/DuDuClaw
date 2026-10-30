@@ -92,6 +92,7 @@ fn connection() -> ConnectionState {
     })
 }
 fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16) -> String {
+    let mut app = app.clone();
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| {
@@ -100,7 +101,7 @@ fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16
                 model,
                 &connection(),
                 &TerminalText::new("/home/使用者/.duduclaw".into()),
-                app,
+                &mut app,
                 settings,
             )
         })
@@ -148,7 +149,7 @@ fn stale_screen() {
             &m,
             &connection(),
             &TerminalText::new("home".into()),
-            &a,
+            &mut a,
             &Settings::default(),
         )
     })
@@ -447,15 +448,15 @@ fn wide_glyph_refresh_preserves_visible_columns() {
     let home = TerminalText::new("home".into());
     let mut reused = Terminal::new(TestBackend::new(60, 25)).unwrap();
     reused
-        .draw(|f| render::draw(f, &model, &connection(), &home, &app, &settings))
+        .draw(|f| render::draw(f, &model, &connection(), &home, &mut app, &settings))
         .unwrap();
     model.employees.items[0] = employee("adu", "甲", "active");
     reused
-        .draw(|f| render::draw(f, &model, &connection(), &home, &app, &settings))
+        .draw(|f| render::draw(f, &model, &connection(), &home, &mut app, &settings))
         .unwrap();
     let mut fresh = Terminal::new(TestBackend::new(60, 25)).unwrap();
     fresh
-        .draw(|f| render::draw(f, &model, &connection(), &home, &app, &settings))
+        .draw(|f| render::draw(f, &model, &connection(), &home, &mut app, &settings))
         .unwrap();
     // TestBackend stores only emitted cells and does not emulate terminal
     // erasure underneath wide glyphs. Compare visible cells, skipping their

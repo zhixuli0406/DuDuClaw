@@ -1,0 +1,36 @@
+---
+source: crates/duduclaw-tui/src/ui/card_tests.rs
+expression: out
+---
++-決策卡-------------------------------------------------------------------------------+
+|{                                                                                     |
+|  "agent_id": "adu",                                                                  |
+|  "decided_in_dashboard_only": false,                                                 |
+|  "effect_class": "shell",                                                            |
+|  "expires_at": 2000,                                                                 |
+|  "id": "a1",                                                                         |
+|  "kind": "tool",                                                                     |
+|  "may_decide": true,                                                                 |
+|  "payload": {                                                                        |
+|    "⟨U+202E⟩command": "甲␛]52;c;secret␇⟨U+200D⟩乙"                                   |
+|  },                                                                                  |
+|  "request_kind": "approval",                                                         |
+|  "status": "pending",                                                                |
+|  "summary": "確認操作"                                                               |
+|}                                                                                     |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|核准確認碼： 42  []                                                                   |
+|輸入確認碼後按 Enter 核准；n 拒絕                                                     |
+|                                                                                      |
+|↑↓ / PgUp PgDn 捲動；s 稍後；Esc 關卡                                                 |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
+|                                                                                      |
++--------------------------------------------------------------------------------------+

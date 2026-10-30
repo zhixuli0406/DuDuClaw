@@ -71,7 +71,24 @@ struct Command {
     method: String,
     params: Value,
     deadline: Instant,
-    reply: oneshot::Sender<Result<Value>>,
+    reply: oneshot::Sender<Result<RpcReply>>,
+}
+/// Keep server errors safe without changing the fixed, credential-free Error type.
+#[derive(Debug)]
+pub enum RpcReply {
+    Accepted(Value),
+    Rejected { message: TerminalText, digest_mismatch: bool },
+}
+impl RpcReply {
+    fn rejected(error: Option<Value>) -> Self {
+        let error = error.unwrap_or(Value::Null);
+        let code = error.get("code").and_then(Value::as_str);
+        Self::Rejected {
+            message: TerminalText::new(error.as_str().or_else(|| error.get("message").and_then(Value::as_str))
+                .unwrap_or(crate::strings::error(Error::RpcRejected)).to_owned()),
+            digest_mismatch: matches!(code, Some("digest_mismatch" | "approval_digest_mismatch" | "expected_digest_mismatch")),
+        }
+    }
 }
 struct Inner {
     commands: mpsc::Sender<Command>,
@@ -128,6 +145,12 @@ impl Client {
         self.inner.events.subscribe()
     }
     pub async fn call(&self, method: &str, params: Value, duration: Duration) -> Result<Value> {
+        match self.call_detailed(method, params, duration).await? {
+            RpcReply::Accepted(value) => Ok(value),
+            RpcReply::Rejected { .. } => Err(Error::RpcRejected),
+        }
+    }
+    pub async fn call_detailed(&self, method: &str, params: Value, duration: Duration) -> Result<RpcReply> {
         // Credentials can only travel through the actor's private handshake.
         if matches!(method, "connect" | "connect.challenge") {
             return Err(Error::RpcRejected);
@@ -330,7 +353,7 @@ impl Actor {
                                     if matches!(code, Some("token_expired" | "jwt_expired" | "unauthorized")) { break End::Refresh; }
                                     if let Some(cmd) = pending.remove(&id) {
                                         let result = if cmd.deadline <= Instant::now() { Err(Error::Timeout) }
-                                            else if ok { payload.ok_or(Error::Protocol) } else { Err(Error::RpcRejected) };
+                                            else if ok { payload.map(RpcReply::Accepted).ok_or(Error::Protocol) } else { Ok(RpcReply::rejected(error)) };
                                         let _ = cmd.reply.send(result);
                                     }
                                 }
@@ -496,6 +519,16 @@ fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn rpc_rejection_preserves_real_string_and_structured_errors_safely() {
+        for error in [json!("拒絕\u{1b}\u{202e}"), json!({"message":"拒絕\u{1b}\u{202e}"})] {
+            let RpcReply::Rejected { message, digest_mismatch } = RpcReply::rejected(Some(error)) else { unreachable!() };
+            assert_eq!(message.visible(), "拒絕␛⟨U+202E⟩");
+            assert!(!digest_mismatch);
+        }
+        let RpcReply::Rejected { digest_mismatch, .. } = RpcReply::rejected(Some(json!({"code":"digest_mismatch"}))) else { unreachable!() };
+        assert!(digest_mismatch);
+    }
     #[test]
     fn handshake_rejects_legacy_and_password_change() {
         let mut hello =

@@ -45,23 +45,7 @@ impl InboxItem {
         }
     }
     pub fn detail_text(&self) -> TerminalText {
-        fn visible(value: &mut Value) {
-            match value {
-                Value::String(s) => *s = TerminalText::new(s.clone()).visible(),
-                Value::Array(a) => a.iter_mut().for_each(visible),
-                Value::Object(o) => {
-                    let old = std::mem::take(o);
-                    for (k, mut v) in old {
-                        visible(&mut v);
-                        o.insert(TerminalText::new(k).visible(), v);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut data = self.data();
-        visible(&mut data);
-        TerminalText::new(serde_json::to_string_pretty(&data).unwrap_or_default())
+        crate::sanitize::visible_json(&self.data())
     }
 }
 /// One snapshot envelope per line, including empty and stale snapshots.

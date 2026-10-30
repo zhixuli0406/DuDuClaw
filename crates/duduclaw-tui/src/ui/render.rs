@@ -16,11 +16,12 @@ pub fn draw(
     model: &Model,
     connection: &ConnectionState,
     home: &TerminalText,
-    app: &App,
+    app: &mut App,
     settings: &Settings,
 ) {
     let area = frame.area();
     if area.width < 24 || area.height < 12 {
+        if let Some(card) = &mut app.card { card.viewport(1, 0); }
         text(
             frame,
             area,
@@ -124,7 +125,7 @@ pub fn draw(
         Rect::new(footer.x, footer.y, footer.width, 1),
         TerminalText::new(format!(
             "[{}]{}",
-            strings::LIST_FOCUS,
+            if app.card.is_some() { strings::CARD_FOCUS } else { strings::LIST_FOCUS },
             if detail_stale {
                 format!(" {}", strings::STALE)
             } else {
@@ -152,5 +153,9 @@ pub fn draw(
             false,
             true,
         );
+    }
+    if let Some(card) = &mut app.card {
+        super::card_render::draw(frame, columns[1], card, settings,
+            !stale_inbox && app.waiting_refresh.is_none());
     }
 }

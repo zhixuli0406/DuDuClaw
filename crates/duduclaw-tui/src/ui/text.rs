@@ -10,6 +10,21 @@ use std::num::NonZeroU16;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Count using exactly the same grapheme/wrap rules as SafeText::render.
+pub(super) fn wrapped_lines(text: &TerminalText, columns: u16, width: AmbiguousWidth) -> usize {
+    if columns == 0 { return 0; }
+    let mut x = 0;
+    let mut lines = 1;
+    for g in text.visible().graphemes(true) {
+        if g == "\n" { x = 0; lines += 1; continue; }
+        let n = match width { AmbiguousWidth::Narrow => g.width(), AmbiguousWidth::Wide => g.width_cjk() };
+        if n == 0 || n > usize::from(columns) { continue; }
+        if x + n > usize::from(columns) { x = 0; lines += 1; }
+        x += n;
+    }
+    lines
+}
+
 pub struct SafeText<'a> {
     pub text: &'a TerminalText,
     pub width: AmbiguousWidth,

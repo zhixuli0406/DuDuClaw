@@ -129,7 +129,7 @@ impl Selection {
             .collect()
     }
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct App {
     pub selected: Option<Selection>,
     pub detail_open: bool,
@@ -137,16 +137,39 @@ pub struct App {
     pub detail_scroll: usize,
     pub read: ReadState,
     pub notice: Option<String>,
+    pub card: Option<super::card::Card>,
+    pub waiting_refresh: Option<u64>,
     initialized: bool,
+    codes: super::card::Codes,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     None,
     Quit,
     Save,
+    Snooze,
+    Decide(crate::decide::Decision),
 }
 impl App {
+    pub fn decision_finished(&mut self, outcome: crate::decide::Outcome) {
+        self.card = None;
+        self.notice = Some(outcome.notice());
+        // waiting_refresh is cleared only by an authoritative StateFeed result.
+    }
     pub fn refresh(&mut self, model: &Model) {
+        if self.waiting_refresh.is_some_and(|n| model.local_refresh > n) {
+            self.waiting_refresh = None;
+        }
+        if model.inbox.count().is_some() && let Some(card) = &mut self.card {
+            match model.inbox.items.iter().find(|i| i.key() == card.item.key()) {
+                None => card.blocked = Some(TerminalText::new(strings::REMOVED.into())),
+                Some(current) if current.data() != card.item.data() => {
+                    card.blocked = Some(TerminalText::new(strings::CARD_REOPEN.into()));
+                }
+                Some(current) if card.blocked.is_none() => card.blocked = super::card_data::blocked(current, model),
+                _ => {}
+            }
+        }
         // Establish an initial selection once. Later insertions, removals and
         // reordering never move it; a removed ID remains a visible tombstone.
         if !self.initialized && model.inbox.count().is_some() && model.employees.count().is_some() {
@@ -155,7 +178,28 @@ impl App {
         }
     }
     pub fn key(&mut self, key: KeyEvent, model: &Model) -> Action {
-        if key.kind == KeyEventKind::Release {
+        self.key_at(key, model, std::time::Instant::now(), crate::snooze::epoch_now())
+    }
+    pub fn key_at(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant, epoch: i64) -> Action {
+        if let Some(card) = &mut self.card {
+            let fresh = model.inbox.count().is_some() && self.waiting_refresh.is_none();
+            return match card.key(key, now, epoch, fresh) {
+                super::card::Effect::None => Action::None,
+                super::card::Effect::Quit => Action::Quit,
+                super::card::Effect::Close => { self.card = None; Action::None },
+                super::card::Effect::Snooze => {
+                    if self.read.snooze(&card.item, epoch) { self.card = None; Action::Snooze }
+                    else { self.notice = Some(strings::SNOOZE_UNAVAILABLE.into()); Action::None }
+                }
+                super::card::Effect::Send(decision) => {
+                    self.card = None;
+                    self.waiting_refresh = Some(model.local_refresh);
+                    self.notice = Some(strings::DECISION_SENDING.into());
+                    Action::Decide(decision)
+                }
+            };
+        }
+        if key.kind != KeyEventKind::Press {
             return Action::None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -175,6 +219,16 @@ impl App {
                 self.detail_open = false;
             }
             KeyCode::Enter => {
+                if let Some(Selection::Inbox(id)) = &self.selected
+                    && let Some(item) = model.inbox.items.iter().find(|i| i.key() == *id)
+                {
+                    self.card = Some(super::card::Card::open(item.clone(), model, now, &mut self.codes));
+                    if self.read.resurfaced(item, epoch) {
+                        self.card.as_mut().expect("just opened").hint = Some(strings::RESURFACED);
+                    }
+                    self.help = false;
+                    return Action::None;
+                }
                 self.detail_open = true;
                 self.help = false;
                 self.detail_scroll = 0;
@@ -200,6 +254,14 @@ impl App {
                     return Action::Save;
                 }
                 self.notice = Some(strings::NO_ID.into());
+            }
+            KeyCode::Char('s') => {
+                if let Some(Selection::Inbox(id)) = &self.selected
+                    && let Some(item) = model.inbox.items.iter().find(|i| i.key() == *id)
+                {
+                    if self.read.snooze(item, epoch) { return Action::Snooze; }
+                    self.notice = Some(strings::SNOOZE_UNAVAILABLE.into());
+                }
             }
             _ => {}
         }

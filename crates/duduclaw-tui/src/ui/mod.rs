@@ -1,5 +1,10 @@
-//! Read-only full screen. No CLI parsing, credentials, approvals or subprocesses.
+//! Full screen with explicit, locally guarded decisions. No subprocesses.
 pub mod app;
+pub mod card;
+mod card_data;
+mod card_render;
+#[cfg(test)]
+mod card_tests;
 mod backend;
 mod panels;
 pub mod render;
@@ -50,7 +55,9 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             .map_err(|_| Error::Terminal)?;
         terminal.clear().map_err(|_| Error::Terminal)?;
         let connection = options.client.connection();
+        let client = options.client.clone();
         let feed = StateFeed::start(options.client, settings.poll_interval);
+        let mut decision: Option<futures_util::future::BoxFuture<'_, crate::decide::Outcome>> = None;
         let home_text = TerminalText::new(home.to_string_lossy().into_owned());
         let shutdown = terminal::shutdown_signal();
         tokio::pin!(shutdown);
@@ -58,7 +65,8 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             if terminal::panicked() {
                 return Err(Error::Terminal);
             }
-            let model = feed.receiver.borrow().clone();
+            let mut model = feed.receiver.borrow().clone();
+            model.inbox.items.retain(|item| !app.read.hidden(item, crate::snooze::epoch_now()));
             if let Some(error) = model.login_required {
                 return Err(error);
             }
@@ -70,29 +78,37 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                         &model,
                         &connection.borrow(),
                         &home_text,
-                        &app,
+                        &mut app,
                         &settings,
                     )
                 })
                 .map_err(|_| Error::Terminal)?;
             // Never block a Tokio worker waiting for user input; only read ready events.
-            if event::poll(Duration::ZERO).map_err(|_| Error::Terminal)?
-                && let Event::Key(key) = event::read().map_err(|_| Error::Terminal)?
-            {
+            while event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? {
+                let Event::Key(key) = event::read().map_err(|_| Error::Terminal)? else { continue; };
                 let before = app.read.clone();
                 match app.key(key, &model) {
                     Action::Quit => return Ok(()),
-                    Action::Save => match app.read.save(&home) {
-                        Ok(()) => app.notice = Some(strings::SAVED.into()),
+                    action @ (Action::Save | Action::Snooze) => match app.read.save(&home) {
+                        Ok(()) => app.notice = Some(if action == Action::Snooze { strings::SNOOZED } else { strings::SAVED }.into()),
                         Err(error) => {
                             app.read = before;
                             app.notice = Some(error.to_string());
                         }
                     },
+                    Action::Decide(request) => {
+                        let client = client.clone();
+                        decision = Some(Box::pin(async move { crate::decide::send(&client, &request).await }));
+                    }
                     Action::None => {}
                 }
             }
             tokio::select! {
+                outcome = async { decision.as_mut().expect("guarded decision").await }, if decision.is_some() => {
+                    decision = None;
+                    app.decision_finished(outcome);
+                    feed.refetch();
+                }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                 result = &mut shutdown => return result,
             }

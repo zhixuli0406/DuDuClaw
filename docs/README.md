@@ -151,7 +151,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description | Status |
 |----------|-------------|--------|
-| [guides/tui.md](guides/tui.md) | Read-only terminal control room and streaming inbox; password or OTP login, SSH, security limits, settings and keys ([zh-TW](guides/zh-TW/tui.md), [ja-JP](guides/ja-JP/tui.md)) | Unreleased |
+| [guides/tui.md](guides/tui.md) | Terminal control room with decision cards and streaming inbox; password or OTP login, SSH, security limits, settings and keys ([zh-TW](guides/zh-TW/tui.md), [ja-JP](guides/ja-JP/tui.md)) | Unreleased |
 | [guides/memory-and-knowledge.md](guides/memory-and-knowledge.md) | 記憶與知識庫完整使用說明（兩者差異、知識庫寫入/分類/L0–L3 層級、自動帶入 vs 主動搜尋、記憶刪除、FAQ） | Current |
 | [guides/memory-vs-knowledge.html](guides/memory-vs-knowledge.html) | 記憶 vs 知識庫（終端使用者版，自包含 HTML，可直接寄給客戶；WP5c 全自動分流上線後改寫） | Current |
 | [guides/goal-loop.md](guides/goal-loop.md) | 自主目標迴圈（`/goal` 入口、AutonomyLevel 五級、`[goal_loop]`/`[dispatch]`/`[dispatch_guard]` 設定、needs_human 按鈕） | Current |
