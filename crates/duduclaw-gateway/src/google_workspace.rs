@@ -598,7 +598,8 @@ pub(crate) fn permission_failure(body: &str) -> (String, Option<String>) {
 pub(crate) struct ServiceProbe {
     service: &'static str,
     pub(crate) ok: bool,
-    verified: bool,
+    pub(crate) verified: bool,
+    pub(crate) account: Option<String>,
     reason: String,
     enable_url: Option<String>,
 }
@@ -622,7 +623,7 @@ const SERVICE_PROBE_URLS: [(&str, &str); 3] = [
     ("drive", "https://www.googleapis.com/drive/v3/about?fields=user"),
 ];
 async fn probe_service(client: Option<&reqwest::Client>, token: &str, service: &'static str, url: &str) -> ServiceProbe {
-    let mut probe = ServiceProbe { service, ok: false, verified: false, reason: "network_error".into(), enable_url: None };
+    let mut probe = ServiceProbe { service, ok: false, verified: false, account: None, reason: "network_error".into(), enable_url: None };
     if let Some(client) = client {
         if let Ok(response) = client.get(effective_url(url).as_ref()).bearer_auth(token).send().await {
             let status = response.status();
@@ -638,6 +639,11 @@ async fn probe_service(client: Option<&reqwest::Client>, token: &str, service: &
             if status.is_success() {
                 let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 if body.is_object() && body.get("error").is_none() {
+                    probe.account = match service {
+                        "gmail" => body["emailAddress"].as_str(),
+                        "drive" => body["user"]["emailAddress"].as_str(),
+                        _ => None,
+                    }.filter(|s| s.len() <= 320 && !s.chars().any(char::is_control)).map(str::to_owned);
                     probe.ok = true;
                     probe.verified = true;
                     probe.reason = "verified".into();
@@ -662,7 +668,7 @@ fn scope_probes(scopes: &[String]) -> Vec<ServiceProbe> {
         ("docs", &["https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/documents.readonly", "https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/drive.file"][..]),
     ] {
         let ok = scopes.iter().any(|s| allowed.contains(&s.as_str()));
-        results.push(ServiceProbe { service, ok, verified: false, reason: if ok { "scope_granted_unverified" } else { "scope_missing" }.into(), enable_url: None });
+        results.push(ServiceProbe { service, ok, verified: false, account: None, reason: if ok { "scope_granted_unverified" } else { "scope_missing" }.into(), enable_url: None });
     }
     results
 }
@@ -2189,6 +2195,7 @@ mod google_setup_tests {
         let client = reqwest::Client::new();
         let ok = probe_service(Some(&client), "secret-bearer-token", "gmail", &format!("{base}/profile")).await;
         assert!(ok.ok && ok.verified);
+        assert_eq!(ok.account.as_deref(), Some("test@example.test"));
         let denied = probe_service(Some(&client), "secret-bearer-token", "calendar", &format!("{base}/disabled")).await;
         assert!(!denied.ok && !denied.verified);
         assert_eq!(denied.reason, "SERVICE_DISABLED");

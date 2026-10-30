@@ -253,6 +253,7 @@ pub(crate) struct RawClientSnapshot {
 pub(crate) struct ObservedSource {
     binding: SourceBinding,
     enabled_binding: SourceBinding,
+    oauth_binding: SourceBinding,
     disabled_binding: SourceBinding,
     stamp: SourceStamp,
     master: bool,
@@ -363,7 +364,7 @@ impl ObservedSource {
             resolver,
             sa_key,
         };
-        let mut enabled_projection = projection;
+        let mut enabled_projection = projection.clone();
         enabled_projection["google_workspace"] = json!(true);
         let enabled_stamp = SourceStamp {
             configuration: RawDigest::of(
@@ -371,10 +372,22 @@ impl ObservedSource {
             ),
             ..stamp.clone()
         };
-        enabled_projection["google_workspace"] = json!(false);
-        let disabled_stamp = SourceStamp {
+        // Only callback activation selects OAuth and retires the alternative.
+        enabled_projection["google_credential_path"] = json!("oauth");
+        enabled_projection["google_service_account"] = Value::Null;
+        enabled_projection["google_apps_script"] = Value::Null;
+        let oauth_stamp = SourceStamp {
             configuration: RawDigest::of(
                 &serde_json::to_vec(&enabled_projection).map_err(|_| Error::Invalid)?,
+            ),
+            resolver: stamp.resolver.clone(),
+            sa_key: None,
+        };
+        let mut disabled_projection = projection;
+        disabled_projection["google_workspace"] = json!(false);
+        let disabled_stamp = SourceStamp {
+            configuration: RawDigest::of(
+                &serde_json::to_vec(&disabled_projection).map_err(|_| Error::Invalid)?,
             ),
             ..stamp.clone()
         };
@@ -411,6 +424,10 @@ impl ObservedSource {
             client,
             source: RawDigest::of(&serde_json::to_vec(&stamp).map_err(|_| Error::Invalid)?),
         };
+        let oauth_binding = SourceBinding {
+            source: RawDigest::of(&serde_json::to_vec(&oauth_stamp).map_err(|_| Error::Invalid)?),
+            ..binding.clone()
+        };
         let enabled_binding = SourceBinding {
             source: RawDigest::of(&serde_json::to_vec(&enabled_stamp).map_err(|_| Error::Invalid)?),
             ..binding.clone()
@@ -424,6 +441,7 @@ impl ObservedSource {
         Ok(Self {
             binding,
             enabled_binding,
+            oauth_binding,
             disabled_binding,
             stamp,
             master,
@@ -453,8 +471,8 @@ impl ObservedSource {
     pub(crate) fn binding(&self) -> &SourceBinding {
         &self.binding
     }
-    pub(crate) fn enabled_binding(&self) -> &SourceBinding {
-        &self.enabled_binding
+    pub(crate) fn oauth_binding(&self) -> &SourceBinding {
+        &self.oauth_binding
     }
     pub(crate) fn binding_with_master(&self, enabled: bool) -> &SourceBinding {
         if enabled {

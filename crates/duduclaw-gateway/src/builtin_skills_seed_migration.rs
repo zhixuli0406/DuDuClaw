@@ -61,7 +61,7 @@ fn run_legacy(home_dir: &Path) -> SeedReport {
     }
 
     let skills_dir = home_dir.join("skills");
-    match duduclaw_agent::builtin_skills::install_builtin_skills(&skills_dir) {
+    match duduclaw_agent::builtin_skills::install_legacy_builtin_skills(&skills_dir) {
         Ok(names) => {
             report.seeded = names.iter().map(|n| n.to_string()).collect();
             if report.seeded.is_empty() {
@@ -100,8 +100,13 @@ fn run_legacy(home_dir: &Path) -> SeedReport {
 /// Run both independently versioned backfills; an old WP19 marker must not
 /// suppress newly bundled skills. Neither pass overwrites operator content.
 pub fn run(home_dir: &Path) -> SeedReport {
-    let mut report = run_legacy(home_dir);
     let google = run_google_setup(home_dir);
+    // On Unix, reject unsafe skills paths before the legacy installer runs.
+    // Unsupported secure creation elsewhere must not suppress legacy skills.
+    if cfg!(unix) && google.error.is_some() {
+        return google;
+    }
+    let mut report = run_legacy(home_dir);
     report.seeded.extend(google.seeded);
     report.already_done = report.already_done && google.already_done;
     if report.error.is_none() {
@@ -113,8 +118,6 @@ pub fn run(home_dir: &Path) -> SeedReport {
 const GOOGLE_MARKER_NAME: &str = "g1-connect-google-seed-v1.done";
 
 fn run_google_setup(home_dir: &Path) -> SeedReport {
-    use std::io::Write;
-
     let mut report = SeedReport::default();
     let marker = home_dir.join("migrations").join(GOOGLE_MARKER_NAME);
     if marker.exists() {
@@ -125,16 +128,11 @@ fn run_google_setup(home_dir: &Path) -> SeedReport {
         let (_, body) = duduclaw_agent::builtin_skills::BUILTIN_SKILLS.iter()
             .find(|(name, _)| *name == "connect-google")
             .expect("connect-google must be bundled");
-        let dir = home_dir.join("skills").join("connect-google");
-        std::fs::create_dir_all(&dir)?;
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("SKILL.md")) {
-            Ok(mut file) => {
-                file.write_all(body.as_bytes())?;
-                file.sync_all()?;
-                report.seeded.push("connect-google".to_string());
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
+        let root = crate::fs_safe::SafeDir::open_root(home_dir)?;
+        let dir = root.open_path(&["skills", "connect-google"], true)?
+            .ok_or_else(|| crate::fs_safe::refused("missing skills directory"))?;
+        if dir.create_file_new("SKILL.md", body.as_bytes())? {
+            report.seeded.push("connect-google".to_string());
         }
         std::fs::create_dir_all(home_dir.join("migrations"))?;
         std::fs::write(&marker, "g1-connect-google-seed-v1\n")?;
@@ -181,6 +179,7 @@ fn write_marker(marker: &Path, report: &SeedReport) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn google_backfill_runs_after_legacy_marker_and_preserves_operator_changes() {
         let home = tempfile::tempdir().unwrap();
@@ -199,6 +198,50 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), "operator edition").unwrap();
         assert!(run_google_setup(other.path()).seeded.is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), "operator edition");
+    }
+
+    // Not run: reject both directory components and the final file.
+    #[cfg(unix)]
+    #[test]
+    fn google_backfill_refuses_symlinks_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+        for component in ["skills", "connect-google", "SKILL.md"] {
+            let home = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = match component {
+                "skills" => home.path().join("skills"),
+                "connect-google" => {
+                    std::fs::create_dir(home.path().join("skills")).unwrap();
+                    home.path().join("skills/connect-google")
+                }
+                _ => {
+                    std::fs::create_dir_all(home.path().join("skills/connect-google")).unwrap();
+                    home.path().join("skills/connect-google/SKILL.md")
+                }
+            };
+            let destination = if component == "SKILL.md" { outside.path().join("missing-file") } else { outside.path().to_path_buf() };
+            symlink(&destination, &target).unwrap();
+            let report = run_google_setup(home.path());
+            assert!(report.error.is_some(), "{component}");
+            assert!(report.seeded.is_empty());
+            assert!(!home.path().join("migrations").join(GOOGLE_MARKER_NAME).exists());
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_backfill_cannot_bypass_google_marker_with_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("migrations")).unwrap();
+        std::fs::write(home.path().join("migrations").join(GOOGLE_MARKER_NAME), "done").unwrap();
+        std::fs::create_dir(home.path().join("skills")).unwrap();
+        symlink(outside.path(), home.path().join("skills/connect-google")).unwrap();
+        let report = run(home.path());
+        assert!(!report.seeded.contains(&"connect-google".to_string()));
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     fn seeded_names(skills_dir: &Path) -> Vec<String> {
@@ -224,7 +267,10 @@ mod tests {
         let report = run(home.path());
 
         assert!(!report.already_done);
+        #[cfg(unix)]
         assert!(report.error.is_none());
+        #[cfg(not(unix))]
+        assert!(report.error.is_some(), "Google backfill must fail closed without secure creation");
         assert!(
             !report.seeded.is_empty(),
             "something must have been written"
@@ -234,6 +280,7 @@ mod tests {
         let skills_root = home.path().join("skills");
         let on_disk = seeded_names(&skills_root);
         for (name, _) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
+            if !cfg!(unix) && *name == "connect-google" { continue; }
             assert!(
                 on_disk.contains(&name.to_string()),
                 "bundled skill `{name}` must be backfilled, got {on_disk:?}"
@@ -283,7 +330,7 @@ mod tests {
         std::fs::remove_dir_all(&victim).unwrap();
 
         let second = run(home.path());
-        assert!(second.already_done);
+        assert_eq!(second.already_done, cfg!(unix));
         assert!(second.seeded.is_empty());
         assert!(
             !victim.exists(),

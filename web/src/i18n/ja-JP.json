@@ -9107,7 +9107,7 @@
   "google.wizard.verifyFailed": "サービスの確認に失敗しました。接続と API 権限を確認して再試行してください。",
   "google.wizard.notVerified": "スコープのみ確認しました。実際の読み取りは未検証です。",
   "google.wizard.enableApi": "この API を有効化",
-  "google.wizard.finished": "接続の確認が完了しました。Sheets と Docs はアクセス可能なファイルで読み取りを試してください。",
+  "google.wizard.finished": "接続の確認が完了しました。アカウントと各サービスの結果を確認してください。",
   "google.wizard.back": "戻る",
   "google.wizard.next": "次へ",
   "google.wizard.alreadyConnected": "接続済みです。サービスを確認",
@@ -9156,5 +9156,11 @@
   "google.probe.rate_limited": "Google のリクエスト上限に達しました。しばらく待って再試行してください。",
   "google.probe.api_error": "Google サービスの確認に失敗しました。再試行するか API 設定を確認してください。",
   "google.wizard.saveFirst": "この接続方式の認証情報を保存してから続行してください。",
-  "google.wizard.reasonCode": "理由コード"
+  "google.wizard.reasonCode": "理由コード",
+  "google.cred.oauthReplaceConfirm": "新しい OAuth 認証を開始しますか？認証に成功するまで現在の接続を維持します。キャンセルしても元の接続は変わりません。設定とトークンは保持され、古い OAuth トークンで切り替わることはありません。",
+  "google.wizard.partial": "部分検証：Gmail、Calendar、Drive は実際にテスト済みです。Sheets と Docs は権限のみ確認済みで、文書へのアクセスは未検証です。",
+  "google.wizard.finishPartial": "部分検証で終了",
+  "google.wizard.account": "認証済みアカウント",
+  "google.wizard.tested": "サービスのテスト済み",
+  "google.wizard.oauthStaged": "新しい OAuth 認証を完了してください。成功するまで以前の接続を維持します。"
 }

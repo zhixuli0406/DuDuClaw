@@ -33,6 +33,8 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
   const [progress, setProgress] = useState<Progress>(resume);
   const [probes, setProbes] = useState<GoogleServiceProbe[]>([]);
   const [directVerified, setDirectVerified] = useState(false);
+  const [partial, setPartial] = useState(false);
+  const [account, setAccount] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [redirectUri, setRedirectUri] = useState(OAUTH_REDIRECT_URI);
@@ -46,7 +48,7 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
     }).catch(() => setError(intl.formatMessage({ id: 'google.error.load' })));
   }, [admin, open, intl]);
   const oauth = progress.path === 'internal' || progress.path === 'external';
-  const go = (step: number) => { setError(''); if (step < 4) { setProbes([]); setBridgeVerified(false); setDirectVerified(false); } setProgress(p => ({ ...p, step })); };
+  const go = (step: number) => { setError(''); if (step < 4) { setPartial(false); setAccount(''); setProbes([]); setBridgeVerified(false); setDirectVerified(false); } setProgress(p => ({ ...p, step })); };
   useEffect(() => {
     if (!admin) return;
     try { sessionStorage.setItem(GOOGLE_SETUP_STORAGE, JSON.stringify(progress)); } catch { /* Storage may be unavailable; the active flow still works. */ }
@@ -57,9 +59,8 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
     try {
       const status = await api.googleCredentials.get();
       if (oauth) {
-        const replacing = ['service_account', 'apps_script'].includes(status.effective);
-        if (replacing && !confirm(intl.formatMessage({ id: 'google.cred.replaceConfirm' }))) return;
-        await api.googleCredentials.set({ mode: 'oauth', testing: progress.testing, ...(replacing ? { replace_confirmed: true } : {}) });
+        if (status.effective !== 'oauth') { setError(t('saveFirst')); return; }
+        await api.googleCredentials.set({ mode: 'oauth', testing: progress.testing });
       } else if (status.effective !== (progress.path === 'bridge' ? 'apps_script' : 'service_account')) {
         setError(t('saveFirst')); return;
       }
@@ -68,28 +69,34 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
     finally { setBusy(false); }
   };
   const verify = async () => {
-    setBusy(true); setError(''); setProbes([]); setDirectVerified(false);
+    setBusy(true); setError(''); setProbes([]); setDirectVerified(false); setPartial(false); setAccount('');
     try {
       const result = await api.googleCredentials.test();
       setProbes(result.services || []);
-      const complete = result.ok && result.path === 'direct' && result.services?.length === 5 && ['gmail', 'calendar', 'drive', 'sheets', 'docs'].every(service => result.services?.some(probe => probe.service === service && probe.ok));
-      setDirectVerified(!!complete);
-      if (!complete) setError(t('verifyFailed'));
+      setAccount(result.account || '');
+      const checks = result.services || [];
+      const allGranted = checks.length === 5 && ['gmail', 'calendar', 'drive', 'sheets', 'docs'].every(service => checks.some(probe => probe.service === service && probe.ok));
+      const complete = result.ok && result.result === 'complete' && allGranted && checks.every(probe => probe.verified);
+      const partiallyTested = result.result === 'partial' && !result.ok && allGranted && ['gmail', 'calendar', 'drive'].every(service => checks.some(probe => probe.service === service && probe.verified));
+      const accepted = result.path === 'direct' && !!result.account && (complete || partiallyTested);
+      setPartial(accepted && partiallyTested);
+      setDirectVerified(accepted);
+      if (!accepted) setError(t('verifyFailed'));
     } catch (e) { setError(formatError(e)); }
     finally { setBusy(false); }
   };
   const [bridgeVerified, setBridgeVerified] = useState(false);
   // Bridge has its own health check, rather than unsupported REST probes.
   const verifyBridge = async () => {
-    setBusy(true); setError(''); setBridgeVerified(false);
-    try { const result = await api.googleCredentials.test(); setBridgeVerified(result.ok && result.path === 'apps_script'); if (!result.ok || result.path !== 'apps_script') setError(t('verifyFailed')); }
+    setBusy(true); setError(''); setBridgeVerified(false); setPartial(false); setAccount(''); setProbes([]);
+    try { const result = await api.googleCredentials.test(); setAccount(result.account || ''); setBridgeVerified(result.ok && result.path === 'apps_script'); if (!result.ok || result.path !== 'apps_script') setError(t('verifyFailed')); }
     catch (e) { setError(formatError(e)); }
     finally { setBusy(false); }
   };
   if (!admin) return null;
   const verified = progress.path === 'bridge' ? bridgeVerified : directVerified;
   const close = () => {
-    if (progress.step === 5) { setProgress(EMPTY); setProbes([]); setBridgeVerified(false); setDirectVerified(false); }
+    if (progress.step === 5) { setPartial(false); setAccount(''); setProgress(EMPTY); setProbes([]); setBridgeVerified(false); setDirectVerified(false); }
     onOpenChange(false);
   };
   return <Dialog open={open} onOpenChange={next => next ? onOpenChange(true) : close()}>
@@ -101,7 +108,7 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
       <a className="text-sm text-brand underline" href={`https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/guides/${guideLocale}google-setup.md`} target="_blank" rel="noreferrer">{t('guide')}</a>
       {oauth && <div className="space-y-2 rounded-lg border border-surface-border p-3 text-xs"><p>{t('redirect')}</p><code className="block select-all break-all">{redirectUri}</code><Button size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(redirectUri).catch(() => setError(t('copyFailed'))); }}>{intl.formatMessage({ id: 'common.copy' })}</Button></div>}
       {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-      {progress.step === 0 && <div className="grid gap-2">{PATHS.map(path => <Button key={path} variant={progress.path === path ? 'default' : 'outline'} onClick={() => { setProbes([]); setBridgeVerified(false); setDirectVerified(false); setProgress({ path, step: 1, testing: path === 'external' }); }}>{t(`path.${path}`)}</Button>)}</div>}
+      {progress.step === 0 && <div className="grid gap-2">{PATHS.map(path => <Button key={path} variant={progress.path === path ? 'default' : 'outline'} onClick={() => { setPartial(false); setAccount(''); setProbes([]); setBridgeVerified(false); setDirectVerified(false); setProgress({ path, step: 1, testing: path === 'external' }); }}>{t(`path.${path}`)}</Button>)}</div>}
       {progress.step === 1 && progress.path && <div className="space-y-3 text-sm">
         <ol className="list-decimal space-y-2 pl-5">{[1, 2, 3, 4].map(n => <li key={n}>{t(`${progress.path}.${n}`)}</li>)}</ol>
         <div className="flex flex-wrap gap-3">
@@ -122,15 +129,17 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
       {progress.step === 4 && <div className="space-y-3">
         <Button disabled={busy} onClick={() => void (progress.path === 'bridge' ? verifyBridge() : verify())}>{busy ? t('checking') : t('runVerification')}</Button>
         {bridgeVerified && <p className="text-sm">{t('bridgeVerified')}</p>}
+        {account && <p className="text-sm">{t('account')}: {account}</p>}
+        {partial && <p role="status" className="text-sm text-warning">{t('partial')}</p>}
         <GoogleServiceResults probes={probes} />
       </div>}
-      {progress.step === 5 && <p className="text-sm">{t('finished')}</p>}
+      {progress.step === 5 && <div className="space-y-2 text-sm"><p>{t(partial ? 'partial' : 'finished')}</p>{account && <p>{t('account')}: {account}</p>}<GoogleServiceResults probes={probes} /></div>}
       <div className="flex flex-wrap justify-between gap-2">
         <Button variant="outline" disabled={busy || progress.step === 0} onClick={() => go(progress.step - 1)}>{t('back')}</Button>
         {progress.step === 1 && <Button onClick={() => go(2)}>{t('next')}</Button>}
         {progress.step === 2 && <Button variant="outline" disabled={busy} onClick={() => void alreadyConnected()}>{t('alreadyConnected')}</Button>}
         {progress.step === 3 && <Button onClick={() => go(4)}>{t('next')}</Button>}
-        {progress.step === 4 && <Button disabled={!verified || busy} onClick={() => go(5)}>{t('done')}</Button>}
+        {progress.step === 4 && <Button disabled={!verified || busy} onClick={() => go(5)}>{t(partial ? 'finishPartial' : 'done')}</Button>}
         {progress.step === 5 && <Button onClick={close}>{t('close')}</Button>}
       </div>
     </DialogContent>

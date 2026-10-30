@@ -9107,7 +9107,7 @@
   "google.wizard.verifyFailed": "Service check failed. Review the connection and API permissions, then retry.",
   "google.wizard.notVerified": "Scope check only. A live read has not been verified.",
   "google.wizard.enableApi": "Enable this API",
-  "google.wizard.finished": "Connection checks finished. Sheets and Docs scopes still need a read test with a file you can access.",
+  "google.wizard.finished": "Connection check completed. Review the authenticated account and service results.",
   "google.wizard.back": "Back",
   "google.wizard.next": "Next",
   "google.wizard.alreadyConnected": "I have connected; check the services",
@@ -9156,5 +9156,11 @@
   "google.probe.rate_limited": "Google request limit reached. Wait and retry.",
   "google.probe.api_error": "Google service check failed. Retry or review API configuration.",
   "google.wizard.saveFirst": "Save the credentials for this connection path before continuing.",
-  "google.wizard.reasonCode": "Reason code"
+  "google.wizard.reasonCode": "Reason code",
+  "google.cred.oauthReplaceConfirm": "Start a new OAuth authorization? The current connection stays active until authorization succeeds. Cancelling keeps it unchanged. Its configuration and stored tokens are retained; old OAuth tokens cannot activate this switch.",
+  "google.wizard.partial": "Partially verified: Gmail, Calendar and Drive were tested. Sheets and Docs have permission granted only; document access is unverified.",
+  "google.wizard.finishPartial": "Finish with partial verification",
+  "google.wizard.account": "Authenticated account",
+  "google.wizard.tested": "Service tested",
+  "google.wizard.oauthStaged": "Complete a new OAuth authorization. The previous connection stays active until it succeeds."
 }

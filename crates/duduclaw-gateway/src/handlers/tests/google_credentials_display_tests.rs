@@ -143,8 +143,35 @@ async fn google_path_replacement_requires_confirmation_and_preserves_vault() {
     assert_eq!(stored[0]["refresh_token"], before[0]["refresh_token"]);
     assert!(crate::google_workspace::get_valid_google_token(home.path()).await.is_err());
     assert!(matches!(handler.handle_google_credentials_set(json!({"mode":"oauth","replace_confirmed":true,"testing":true})).await, WsFrame::Response { ok:true, .. }));
-    assert_eq!(crate::google_workspace::selected_path(home.path()).unwrap(), "oauth");
+    assert_eq!(crate::google_workspace::selected_path(home.path()).unwrap(), "apps_script");
+    assert!(matches!(crate::google_workspace::resolve_backend(home.path()).await.unwrap(), crate::google_workspace::GoogleBackend::AppsScript(_)));
+    assert!(crate::google_workspace::get_valid_google_token(home.path()).await.is_err());
     assert_eq!(crate::mcp_oauth::google_setup_status(home.path())["testing"], true);
     assert!(matches!(handler.handle_google_credentials_set(json!({"mode":"none","replace_confirmed":true})).await, WsFrame::Response { ok:true, .. }));
     assert!(crate::google_workspace::resolve_backend(home.path()).await.is_err());
+}
+
+// Not run: source-only regression coverage for staged OAuth activation.
+#[tokio::test(flavor = "current_thread")]
+async fn google_callback_activates_oauth_and_retains_previous_bridge() {
+    use crate::mcp_oauth::home_lifecycle as flow;
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    assert!(matches!(handler.handle_google_credentials_set(json!({
+        "mode":"apps_script", "url":"https://script.google.com/macros/s/test/exec", "secret":"bridge-test-secret"
+    })).await, WsFrame::Response { ok:true, .. }));
+    let before = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let before: toml::Table = before.parse().unwrap();
+    assert!(matches!(handler.handle_google_credentials_set(json!({"mode":"oauth", "replace_confirmed":true})).await, WsFrame::Response { ok:true, .. }));
+    let input = flow::GoogleHomeStartInput::new(Some("owned-client"), Some("owned-secret"), "test-admin").unwrap();
+    let plan = flow::capture_google_home_start(home.path(), input).unwrap();
+    let (_, state, pending) = flow::begin_google_home_authorization(home.path(), plan).await.unwrap().into_response_parts();
+    assert_eq!(crate::google_workspace::selected_path(home.path()).unwrap(), "apps_script");
+    let _wire = crate::google_identity::home_source::callback_testing::Wire::json(home.path(), None);
+    flow::complete_google_home_authorization(home.path(), pending, &state, zeroize::Zeroizing::new("owned-code".into())).await.unwrap();
+    assert_eq!(crate::google_workspace::selected_path(home.path()).unwrap(), "oauth");
+    let after = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let after: toml::Table = after.parse().unwrap();
+    assert_eq!(after["integrations"]["google_inactive_credentials"]["google_apps_script"], before["integrations"]["google_apps_script"]);
+    assert!(after["integrations"].get("google_apps_script").is_none());
 }

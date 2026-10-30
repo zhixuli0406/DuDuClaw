@@ -170,15 +170,8 @@ export function IntegrationConnectPanel({
     };
   }, [refresh]);
 
-  /**
-   * Poll auth status after opening the consent window.
-   *
-   * `baseline` is the expiry recorded before consent opened — polling only
-   * declares success once the stored token moves past it (or a live access
-   * token appears), so re-authorizing an existing connection cannot report
-   * success off the old token that was already on file.
-   */
-  const startPolling = useCallback((baseline: string | null) => {
+  /** Google must observe a fresh callback; an old or refreshed token is insufficient. */
+  const startPolling = useCallback((baseline: string | null, connectedBaseline?: string | null) => {
     if (pollRef.current) clearInterval(pollRef.current);
     let attempts = 0;
     pollRef.current = setInterval(async () => {
@@ -196,13 +189,9 @@ export function IntegrationConnectPanel({
           setNotice({ kind: 'error', text: intl.formatMessage({ id: `google.oauth.${status.error_code}` }) });
           return;
         }
-        // `authenticated` is now true for a stale-but-refreshable token, so it
-        // would report success the instant polling starts when the user is
-        // re-authorizing an already-connected provider. Success means a token
-        // that is actually new: the first live access token, or an expiry that moved
-        // past where it stood when the consent window opened.
-        const fresh =
-          (!baseline && (status.access_token_valid === true || (status.access_token_valid === undefined && status.authenticated))) ||
+        const fresh = providerId === 'google'
+          ? status.authenticated && !!status.connected_at && status.connected_at !== connectedBaseline
+          : (!baseline && (status.access_token_valid === true || (status.access_token_valid === undefined && status.authenticated))) ||
           (!!status.expires_at && !!baseline && status.expires_at > baseline);
         if (fresh) {
           if (pollRef.current) clearInterval(pollRef.current);
@@ -225,7 +214,7 @@ export function IntegrationConnectPanel({
         try {
           const current = await api.googleCredentials.get();
           const replacing = ['service_account', 'apps_script'].includes(current.effective);
-          if (replacing && !confirm(intl.formatMessage({ id: 'google.cred.replaceConfirm' }))) return false;
+          if (replacing && !confirm(intl.formatMessage({ id: 'google.cred.oauthReplaceConfirm' }))) return false;
           await api.googleCredentials.set({ mode: 'oauth', ...(testing === undefined ? {} : { testing }), ...(replacing ? { replace_confirmed: true } : {}) });
         } catch (e) {
           setNotice({ kind: 'error', text: formatError(e) });
@@ -235,6 +224,7 @@ export function IntegrationConnectPanel({
       setBusy(true);
       setNotice(null);
       try {
+        const connectedBaseline = providerId === 'google' ? (await api.mcp.oauthStatus(providerId)).connected_at : undefined;
         const { auth_url } = await api.mcp.oauthStart(
           providerId,
           id,
@@ -246,7 +236,7 @@ export function IntegrationConnectPanel({
         openExternal(auth_url);
         setAuthUrl(auth_url);
         setNotice({ kind: 'info', text: t('waiting') });
-        startPolling(state.expiresAt);
+        startPolling(state.expiresAt, connectedBaseline);
         return true;
       } catch (e) {
         setNotice({ kind: 'error', text: formatError(e) });

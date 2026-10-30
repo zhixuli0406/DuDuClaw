@@ -124,11 +124,13 @@ impl MethodHandler {
             .cloned()
             .unwrap_or_default();
 
-        // Both alternatives are mutually exclusive with each other; start from
-        // a clean slate and re-add only the selected one.
-        integrations.remove("google_service_account");
-        integrations.remove("google_apps_script");
-        integrations.insert("google_credential_path".into(), toml::Value::String(mode.into()));
+        // OAuth selection is staged: only a successful callback may activate
+        // it. In particular, an old retained token must not become effective.
+        if mode != "oauth" {
+            integrations.remove("google_service_account");
+            integrations.remove("google_apps_script");
+            integrations.insert("google_credential_path".into(), toml::Value::String(mode.into()));
+        }
         if let Some(testing) = params.get("testing").and_then(Value::as_bool) {
             integrations.insert("google_oauth_testing".into(), toml::Value::Boolean(testing));
         }
@@ -229,7 +231,7 @@ impl MethodHandler {
         // config.toml edit that nothing pointed to except a warning banner.
         // Clearing the selected path leaves the gate untouched; retained OAuth
         // credentials stay stored but cannot authorize tools until reselected.
-        if mode != "none" {
+        if !matches!(mode, "none" | "oauth") {
             integrations.insert("google_workspace".into(), toml::Value::Boolean(true));
         }
 
@@ -237,7 +239,7 @@ impl MethodHandler {
         if let Err(e) = self.write_config_table_snapshot(&config_path,config_expected_hash,&table).await {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
         }
-        WsFrame::ok_response("", json!({ "ok": true, "mode": mode }))
+        WsFrame::ok_response("", json!({ "ok": true, "mode": mode, "staged": mode == "oauth" && previous != "oauth" }))
     }
 
     /// Live-test the configured credential path: mint a token (service account)
@@ -252,7 +254,10 @@ impl MethodHandler {
                     crate::mcp_oauth::get_stored_token(&self.home_dir, "google").map(|t| t.scopes).unwrap_or_default()
                 };
                 let services = crate::google_workspace::probe_services(&token, &scopes).await;
-                WsFrame::ok_response("", json!({ "ok": services.iter().all(|p| p.ok), "path": "direct", "detail": "service_probe_results", "services": services }))
+                let complete = services.iter().all(|p| p.ok && p.verified);
+                let partial = !complete && services.iter().all(|p| p.ok);
+                let account = services.iter().find_map(|p| p.account.as_deref());
+                WsFrame::ok_response("", json!({ "ok": complete, "result": if complete { "complete" } else if partial { "partial" } else { "failed" }, "path": "direct", "account": account, "detail": "service_probe_results", "services": services }))
             }
             Ok(crate::google_workspace::GoogleBackend::AppsScript(cfg)) => {
                 match crate::google_apps_script::call(

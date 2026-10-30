@@ -7761,12 +7761,13 @@ export const api = {
   googleCredentials: {
     get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
     set: (params: GoogleCredentialsInput) =>
-      client.call('google.credentials.set', params) as Promise<{ ok: boolean; mode: string }>,
+      client.call('google.credentials.set', params) as Promise<{ ok: boolean; mode: string; staged?: boolean }>,
     test: () =>
       client.call('google.credentials.test', {}, false, 90000) as Promise<{
         ok: boolean;
+        result?: 'complete' | 'partial' | 'failed';
         path: string;
-        account?: string;
+        account?: string | null;
         detail: string;
         services?: GoogleServiceProbe[];
       }>,

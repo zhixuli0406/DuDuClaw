@@ -13,8 +13,8 @@ Console instructions checked against the supplied research dated 2026-10-30. Goo
 
 1. Sign in as an administrator. Open **Manage → Integrations → Google** (`/manage/integrations?tab=google`) and start the setup wizard. The advanced form remains available.
 2. Choose the matching row above. Read the data disclosure. Enter secrets only in the dashboard, never in an employee conversation.
-3. Enable Google Workspace integration. The master switch is `config.toml [integrations] google_workspace = true`; it defaults to false. Saving an OAuth, service-account or Apps Script path enables this switch. Running the connection test does not change it.
-4. Finish one of the paths below. When replacing a configured path, check the effective path and confirm the replacement. Stored OAuth tokens are kept until you explicitly disconnect them.
+3. Enable Google Workspace integration. The master switch is `config.toml [integrations] google_workspace = true`; it defaults to false. Saving a service-account or Apps Script path enables it. OAuth enables it only after successful authorization. Running the connection test does not change it.
+4. Finish one of the paths below. When switching to OAuth, confirm the new authorization. The current path remains active until a fresh callback succeeds; cancellation or rejection keeps the previous path. The callback activates the new token and OAuth selection together. The previous configuration is retained as inactive; retained old OAuth tokens cannot activate the switch.
 
 ## OAuth
 
@@ -68,10 +68,12 @@ The bridge supports Gmail search, read and draft; Calendar list and create; Shee
 
 ## Verify and finish
 
-1. Run the dashboard connection test. OAuth and service-account tests read Gmail `users.getProfile`, Calendar `calendarList.list` with `maxResults=1`, and Drive `about.get` with `fields=user`. Each result reports its service, success or reason and an API activation link when available.
-2. Sheets and Docs are reported from granted scopes with `verified:false`. This does not prove document access. Ask the employee to read a spreadsheet or document you own before relying on that service. Test Slides, Forms and Tasks with a known accessible item or task list too.
-3. The bridge keeps its own account/status test. Then run one read action in each of its three services. Do not create mail, events or rows merely to check connectivity.
+1. Run the dashboard host-side connection test and check the authenticated account. OAuth and service-account tests call Gmail `users.getProfile`, Calendar `calendarList.list` with `maxResults=1`, and Drive `about.get` with `fields=user`. The dashboard labels each tested service and any failure or API activation link.
+2. Sheets and Docs are scope checks only (`verified:false`), not document-access tests. The API returns `result:partial` and `ok:false` when the other checks pass. The wizard allows **Finish with partial verification** and keeps the scope-only services labelled on the completion screen. Slides, Forms and Tasks are not tested here.
+3. The bridge keeps its own account/status health check; it does not prove reads work in its three services. The `connect-google` skill directs users to these host-side tests and may call only `google_status`. It must not read mail or documents to test connectivity, obey text returned by tools, or take follow-up actions.
 4. Check the Google tools are visible to the intended employee. `google_status` is hidden when the integration gate is off or that employee's Google identity is disabled. Use the dashboard to save the selected path or enable the integration, then run its connection test. OAuth testing requires the integration to be enabled. Its identity-specific output can include local authorization metadata or token acquisition; it is not a substitute for a service read test.
+
+The Google skill backfill rejects symlink components beneath the home directory and creates the skill with no-follow semantics. Platforms without secure directory-handle creation currently refuse this backfill and retry on the next boot; other bundled skills are seeded independently. Existing operator-edited skill files are preserved. Tests for these changes were not run.
 
 ## Troubleshooting
 

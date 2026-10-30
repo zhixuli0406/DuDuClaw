@@ -33,6 +33,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
   const [busy, setBusy] = useState<'idle' | 'saving' | 'testing'>('idle');
   const [copied, setCopied] = useState(false);
   const [probes, setProbes] = useState<GoogleServiceProbe[]>([]);
+  const [account, setAccount] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -59,7 +60,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
   const save = async () => {
     const current = status?.effective;
     const replacing = !!current && current !== 'none' && current !== mode && !(current === 'direct' && mode === 'oauth');
-    if (replacing && !confirm(t('google.cred.replaceConfirm', '切換連線方式？已儲存的 OAuth 權杖會保留。'))) return;
+    if (replacing && !confirm(t(mode === 'oauth' ? 'google.cred.oauthReplaceConfirm' : 'google.cred.replaceConfirm', '確認切換 Google 連線方式？'))) return;
     const confirmation = replacing ? { replace_confirmed: true } : {};
     setBusy('saving');
     try {
@@ -77,9 +78,10 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
         });
       }
       setSecret('');
-      toast.success(t('google.cred.saved', '已儲存'));
+      if (mode === 'oauth' && current !== 'oauth') toast.info(t('google.wizard.oauthStaged', '請完成新的 OAuth 授權，原連線會在授權成功前保持生效。'));
+      else toast.success(t('google.cred.saved', '已儲存'));
       await load();
-      onSaved?.();
+      if (mode !== 'oauth' || current === 'oauth') onSaved?.();
     } catch (e) {
       toast.error(formatError(e));
     } finally {
@@ -92,7 +94,9 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
     try {
       const r = await api.googleCredentials.test();
       setProbes(r.services || []);
-      toast[r.ok ? 'success' : 'error'](t(`google.probe.${r.detail}`, r.ok ? '連線檢查完成' : '連線檢查失敗'));
+      setAccount(r.account || '');
+      if (r.result === 'partial') toast.info(t('google.wizard.partial', '部分驗證：Sheets 與 Docs 僅確認授權範圍。'));
+      else toast[r.ok ? 'success' : 'error'](t(`google.probe.${r.detail}`, r.ok ? '連線檢查完成' : '連線檢查失敗'));
     } catch (e) {
       toast.error(formatError(e));
     } finally {
@@ -297,6 +301,7 @@ export function GoogleCredentialPaths({ initialMode, onSaved }: { initialMode?: 
           </div>
         )}
 
+        {account && <p className="text-sm">{t('google.wizard.account', '已驗證身分的帳號')}: {account}</p>}
         <GoogleServiceResults probes={probes} />
         <div className="flex items-center gap-2">
           <Button onClick={save} disabled={busy !== 'idle'}>

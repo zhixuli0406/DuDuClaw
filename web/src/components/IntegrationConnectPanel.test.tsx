@@ -314,7 +314,11 @@ it('continues polling through an existing reconnect marker until the new token a
   await act(async () => { await poll!(); });
   expect(stop).not.toHaveBeenCalled();
   expect(connected).not.toHaveBeenCalled();
-  vi.mocked(api.mcp.oauthStatus).mockResolvedValue({ authenticated: true, access_token_valid: true, needs_reconnect: false, expires_at: '2026-10-30T00:00:00Z' });
+  // A retained token (including a refreshed expiry) is not a callback.
+  vi.mocked(api.mcp.oauthStatus).mockResolvedValue({ authenticated: true, access_token_valid: true, expires_at: '2026-10-30T00:00:00Z' });
+  await act(async () => { await poll!(); });
+  expect(connected).not.toHaveBeenCalled();
+  vi.mocked(api.mcp.oauthStatus).mockResolvedValue({ authenticated: true, access_token_valid: true, needs_reconnect: false, connected_at: '2026-10-30T00:00:00Z', expires_at: '2026-10-30T00:00:00Z' });
   await act(async () => { await poll!(); });
   expect(connected).toHaveBeenCalledOnce();
 });

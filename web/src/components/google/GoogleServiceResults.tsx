@@ -13,7 +13,7 @@ export function GoogleServiceResults({ probes }: { probes: GoogleServiceProbe[] 
   const intl = useIntl();
   const t = (key: string) => intl.formatMessage({ id: `google.wizard.${key}` });
   return <ul className="space-y-2 text-sm">{probes.map(probe => <li key={probe.service} className="rounded-lg border border-surface-border p-3">
-    <span>{probe.service}: {t(probe.ok ? 'ok' : 'failed')}</span>
+    <span>{probe.service}: {t(probe.ok ? (probe.verified ? 'tested' : 'scopeGranted') : 'failed')}</span>
     <p className="text-muted-foreground">{intl.formatMessage({ id: `google.probe.${probe.reason}`, defaultMessage: t(probe.ok ? 'scopeGranted' : 'verifyFailed') })}</p>
     {!probe.ok && <p className="text-muted-foreground">{t('reasonCode')}: <code>{probe.reason}</code></p>}
     {!probe.verified && <p className="text-warning">{t('notVerified')}</p>}

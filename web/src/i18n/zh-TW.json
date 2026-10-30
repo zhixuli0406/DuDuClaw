@@ -9107,7 +9107,7 @@
   "google.wizard.verifyFailed": "服務檢查失敗，請確認連線與 API 權限後重試。",
   "google.wizard.notVerified": "僅確認授權範圍，尚未驗證實際讀取。",
   "google.wizard.enableApi": "啟用此 API",
-  "google.wizard.finished": "連線檢查完成。Sheets 與 Docs 仍需用你有權限的檔案測試讀取。",
+  "google.wizard.finished": "連線檢查完成，請確認帳號與各服務的結果。",
   "google.wizard.back": "上一步",
   "google.wizard.next": "下一步",
   "google.wizard.alreadyConnected": "我已連線，檢查服務",
@@ -9156,5 +9156,11 @@
   "google.probe.rate_limited": "已達 Google 請求上限，請稍後重試。",
   "google.probe.api_error": "Google 服務檢查失敗，請重試或檢查 API 設定。",
   "google.wizard.saveFirst": "請先儲存此連線方式的憑證，再繼續。",
-  "google.wizard.reasonCode": "原因代碼"
+  "google.wizard.reasonCode": "原因代碼",
+  "google.cred.oauthReplaceConfirm": "要開始新的 OAuth 授權嗎？授權成功後才會切換，目前的連線在此之前仍會生效。取消會保留原連線；原設定與權杖也會保留，舊 OAuth 權杖不會讓這次切換生效。",
+  "google.wizard.partial": "部分驗證：已實測 Gmail、Calendar 與 Drive。Sheets 與 Docs 僅確認已授予權限，尚未驗證文件存取。",
+  "google.wizard.finishPartial": "以部分驗證結束",
+  "google.wizard.account": "已驗證身分的帳號",
+  "google.wizard.tested": "已實測服務",
+  "google.wizard.oauthStaged": "請完成新的 OAuth 授權，原連線會在授權成功前保持生效。"
 }
