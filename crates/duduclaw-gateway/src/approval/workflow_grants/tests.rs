@@ -42,6 +42,7 @@ async fn legacy_purchase_delete_workflow_grants_cannot_authorize_calls() {
             .current_revision_grant(&spec.activation_id)
             .await
             .unwrap_err()
+            .to_string()
             .contains("single-call approval"));
         let payload = json!({"name": tool, "arguments": {"task_id": "owned", "status": "done"}});
         let mut changed = binding.clone();
