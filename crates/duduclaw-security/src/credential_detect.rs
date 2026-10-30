@@ -146,8 +146,8 @@ fn account_hint(text: &str) -> Result<Option<String>, DetectError> {
     Ok(regex.captures(text).and_then(|c| c.get(1)).map(|m| mask_account_hint(m.as_str())))
 }
 
-fn detect_inner(text: &str) -> Result<Vec<Finding>, DetectError> {
-    let text = duduclaw_core::truncate_bytes(text, MAX_SCAN_BYTES);
+fn detect_inner(text: &str, limit: usize) -> Result<Vec<Finding>, DetectError> {
+    let text = duduclaw_core::truncate_bytes(text, limit);
     let account = account_hint(text)?;
     let mut findings: Vec<Finding> = Vec::new();
     let mut occupied = vec![None; text.len()];
@@ -183,7 +183,7 @@ fn detect_inner(text: &str) -> Result<Vec<Finding>, DetectError> {
         }
     }
     // Union overlapping rules: a vendor-shaped prefix inside a longer password
-    // must not leave the remainder exposed. Every pass visits at most 64 KiB.
+    // must not leave the remainder exposed.
     let mut result = Vec::new();
     let mut offset = 0;
     while offset < occupied.len() {
@@ -206,7 +206,7 @@ fn detect_inner(text: &str) -> Result<Vec<Finding>, DetectError> {
 
 /// A panic or rule initialization failure is a value-free error.
 pub fn detect(text: &str) -> Result<Vec<Finding>, DetectError> {
-    guarded_detect(|| detect_inner(text))
+    guarded_detect(|| detect_inner(text, MAX_SCAN_BYTES))
 }
 
 fn guarded_detect(scan: impl FnOnce() -> Result<Vec<Finding>, DetectError> + std::panic::UnwindSafe)
@@ -217,7 +217,11 @@ fn guarded_detect(scan: impl FnOnce() -> Result<Vec<Finding>, DetectError> + std
 
 /// Quotas limit ledger rows, never masking. Missing ids use a generic marker.
 pub fn mask_with_ids(text: &str, findings: &[Finding], ids: &[String]) -> String {
-    if text.len() > MAX_SCAN_BYTES {
+    mask_with_ids_limit(text, findings, ids, MAX_SCAN_BYTES)
+}
+
+fn mask_with_ids_limit(text: &str, findings: &[Finding], ids: &[String], limit: usize) -> String {
+    if text.len() > limit {
         return UNAVAILABLE_MASK.into();
     }
     let mut out = String::with_capacity(text.len());
@@ -245,6 +249,16 @@ pub fn mask_with_ids(text: &str, findings: &[Finding], ids: &[String]) -> String
 /// All derived stores use this even when conversation mode is `audit`.
 pub fn mask(text: &str) -> String {
     mask_detected(text, detect(text))
+}
+
+/// Mask a complete document. The caller must enforce its own size bound.
+pub fn mask_document(text: &str) -> Result<String, DetectError> {
+    guarded_detect(|| {
+        let findings = detect_inner(text, text.len())?;
+        let masked = mask_with_ids_limit(text, &findings, &[], text.len());
+        if masked == UNAVAILABLE_MASK { return Err(DetectError); }
+        Ok(duduclaw_core::secret_redact::redact_secrets(&masked).into_owned())
+    })
 }
 
 fn mask_detected(text: &str, detected: Result<Vec<Finding>, DetectError>) -> String {

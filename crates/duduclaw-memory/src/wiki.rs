@@ -581,12 +581,9 @@ impl WikiStore {
             )));
         }
 
-        // Mask at the shared sink before deriving the title or FTS index.
-        // Refuse unscannable pages instead of replacing an entire large page.
-        if content.len() > duduclaw_security::credential_detect::MAX_SCAN_BYTES {
-            return Err(DuDuClawError::Memory("wiki credential scan limit exceeded".into()));
-        }
-        let masked_content = duduclaw_security::credential_detect::mask(content);
+        // Mask the complete bounded page before deriving the title or FTS index.
+        let masked_content = duduclaw_security::credential_detect::mask_document(content)
+            .map_err(|_| DuDuClawError::Memory("wiki credential scan failed".into()))?;
         let content = masked_content.as_str();
 
         // Validate and confine before creating any directory, then write
@@ -1777,12 +1774,9 @@ impl WikiStore {
 
         let _fence = self.delivery_fence().exclusive_for_write()?;
 
-        // Mask at the shared sink before deriving the title or FTS index.
-        // Refuse unscannable pages instead of replacing an entire large page.
-        if content.len() > duduclaw_security::credential_detect::MAX_SCAN_BYTES {
-            return Err(DuDuClawError::Memory("wiki credential scan limit exceeded".into()));
-        }
-        let masked_content = duduclaw_security::credential_detect::mask(content);
+        // Mask the complete bounded page before deriving the title or FTS index.
+        let masked_content = duduclaw_security::credential_detect::mask_document(content)
+            .map_err(|_| DuDuClawError::Memory("wiki credential scan failed".into()))?;
         let content = masked_content.as_str();
 
         // Validate and confine before creating any directory, then write
@@ -2806,9 +2800,15 @@ mod tests {
         for path in ["concepts/local.md", "concepts/shared.md", "_index.md"] {
             assert!(!store.read_raw(path).unwrap().contains("fixture-"));
         }
-        let large = "x".repeat(duduclaw_security::credential_detect::MAX_SCAN_BYTES + 1);
-        assert!(store.write_page("concepts/large.md", &large).is_err());
-        assert!(!store.wiki_dir().join("concepts/large.md").exists());
+        let mut large = "x".repeat(100 * 1024);
+        large.push_str("\npassword: tail-secret\n");
+        store.write_page("concepts/large.md", &large).unwrap();
+        let written = store.read_raw("concepts/large.md").unwrap();
+        assert!(!written.contains("tail-secret"));
+        assert!(written.contains("password: [已遮罩的密碼]"));
+        let boundary = "x".repeat(MAX_PAGE_SIZE);
+        store.write_page("concepts/boundary.md", &boundary).unwrap();
+        assert_eq!(store.read_raw("concepts/boundary.md").unwrap().len(), MAX_PAGE_SIZE);
         let secret_path = format!("concepts/ghp_{}.md", "a".repeat(36));
         assert!(store.write_page(&secret_path, "safe").is_err());
         assert!(store.write_page_with_author(&secret_path, "safe", "test").is_err());

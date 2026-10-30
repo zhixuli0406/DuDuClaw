@@ -2367,12 +2367,15 @@ async fn store_facts_protected(
     provenance: &duduclaw_memory::lineage::Provenance,
 ) -> Result<ProtectedStoreReport, String> {
     let mut report = ProtectedStoreReport::default();
-    let facts: Vec<DistilledFact> = facts.iter().filter(|fact| {
-        let joined = format!("{} {} {} {}", fact.content, fact.subject.as_deref().unwrap_or(""),
-            fact.predicate.as_deref().unwrap_or(""), fact.object.as_deref().unwrap_or(""));
-        matches!(duduclaw_security::credential_detect::detect(&joined), Ok(found) if found.is_empty())
-            && joined.len() <= duduclaw_security::credential_detect::MAX_SCAN_BYTES
-    }).cloned().collect();
+    let facts: Vec<DistilledFact> = facts.iter().filter_map(|fact| {
+        let mut masked = fact.clone();
+        let mask = |text: &str| duduclaw_security::credential_detect::mask_document(text).ok();
+        masked.content = mask(&fact.content)?;
+        masked.subject = match fact.subject.as_deref() { Some(value) => Some(mask(value)?), None => None };
+        masked.predicate = match fact.predicate.as_deref() { Some(value) => Some(mask(value)?), None => None };
+        masked.object = match fact.object.as_deref() { Some(value) => Some(mask(value)?), None => None };
+        Some(masked)
+    }).collect();
 
     // Dedup guard: currently-valid distilled contents (quarantined rows are
     // already excluded by `list_valid_by_source_event`).

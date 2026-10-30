@@ -11,7 +11,7 @@ chat_credentials = "audit" # audit (default) or mask
 
 In **audit** mode, the original text remains in conversation history and the current prompt. Detected values are masked before derived summaries, wiki distillation, episodic memory, skill recording and diagnostic/tool logs. In **mask** mode, new inbound messages replace detected values with a reference such as `[已遮罩的密碼 cred_xxx]` before delivery. Switching modes does not rewrite old conversation history, backups or transcripts held by external runtimes. Unknown mode values are treated as `mask`.
 
-A bare password with no context is not detected. English and Traditional Chinese context rules and known key/token/PEM/connection-string shapes improve coverage, but detection is not a guarantee that all secrets are found. Scanning is bounded at 64 KiB. Detector failures give derived stores a generic placeholder; a failed ledger write must not block a message or log its value. Automatic substitution of real credential values into tool calls is planned; no release version is promised.
+A bare password with no context is not detected. English and Traditional Chinese context rules and known key/token/PEM/connection-string shapes improve coverage, but detection is not a guarantee that all secrets are found. Latency-sensitive scanning is bounded at 64 KiB; Wiki documents are scanned in full up to their 512 KiB page limit. Detector failures give derived stores a generic placeholder; a failed ledger write must not block a message or log its value. Automatic substitution of real credential values into tool calls is planned; no release version is promised.
 
 ## Identity and deduplication
 
@@ -41,4 +41,4 @@ Masking is enforced at each sink, in both modes: pinned instructions and titles,
 
 In audit mode, only conversation messages in `sessions.db` and the current prompt retain detected plaintext; LINE durable delivery is always masked. These are deterministic detection boundaries, not a guarantee of detecting unknown or transformed secrets. Existing derived-store history and external runtime transcripts are not retroactively scrubbed. LINE ingress links contain only metadata, are capped at 100,000 rows and expire after seven days. Security regression tests were added but **not run**; compilation and native acceptance remain unverified.
 
-Wiki writes beyond the 64 KiB credential scan limit are refused rather than storing unscanned text.
+Wiki pages up to the 512 KiB page limit are scanned in full and masked before storage; a scan failure refuses the write. The 64 KiB scan bound remains for latency-sensitive chat and logs.
