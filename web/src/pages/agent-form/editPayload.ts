@@ -464,6 +464,7 @@ export function utilityModelMismatchesRuntime(provider: string, model: string): 
   const expected = families[provider];
   if (!expected) return false;
   const id = model.trim().toLowerCase().split('/').at(-1) ?? '';
-  const knownFamily = Object.values(families).some((pattern) => pattern.test(id));
+  // Gemini remains a known vendor family even without a selectable CLI runtime.
+  const knownFamily = /^gemini/.test(id) || Object.values(families).some((pattern) => pattern.test(id));
   return knownFamily && !expected.test(id);
 }

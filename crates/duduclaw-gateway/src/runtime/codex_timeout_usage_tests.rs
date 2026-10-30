@@ -116,6 +116,16 @@ fn codex_collected_timeout_books_discarded_and_displayed_usage_once() {
     let Some(home) = isolated_home("codex_collected_timeout_books_discarded_and_displayed_usage_once") else { return; };
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         crate::cost_telemetry::init_telemetry(&home).unwrap();
+        #[cfg(unix)]
+        let codex_path = {
+            use std::os::unix::fs::PermissionsExt;
+            let bin = home.join("codex");
+            std::fs::write(&bin, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.164.0'\n  exit 0\nfi\nexit 1\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            bin.to_string_lossy().into_owned()
+        };
+        #[cfg(not(unix))]
+        let codex_path = "/never-spawn-fixture".to_owned();
         for (agent, reply, completed, measured) in [
             ("discarded-text", false, true, true), ("discarded-no-text", false, false, true),
             ("reply-no-text", true, false, true), ("reply-text", true, true, true),
@@ -124,7 +134,7 @@ fn codex_collected_timeout_books_discarded_and_displayed_usage_once() {
             let call_home = home.join(agent);
             std::fs::create_dir(&call_home).unwrap();
             let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn AgentRuntime>> = std::collections::HashMap::new();
-            runtimes.insert(RuntimeType::Codex, Box::new(CodexRuntime { codex_path: "/never-spawn-fixture".into() }));
+            runtimes.insert(RuntimeType::Codex, Box::new(CodexRuntime { codex_path: codex_path.clone() }));
             let _registry = runtime_dispatch::testing::RegistryGuard::install(&call_home, RuntimeRegistry::with_runtimes(runtimes)).await;
             let probe: Box<dyn Fn(&tokio::process::Command) -> Result<CodexOutput, String> + Send + Sync> = Box::new(move |_| {
                 let mut output = CodexOutput::default();
@@ -138,9 +148,10 @@ fn codex_collected_timeout_books_discarded_and_displayed_usage_once() {
             });
             // The utility profile avoids all employee MCP/config preparation.
             // CHANNEL_REPLY_PARTIAL still loses to UTILITY_CALL, so only the
-            // display case uses the normal producer with an agent-less context.
+            // display case uses the normal producer with an employee directory.
             let settings = RuntimeSettings::default();
             let mut req = request(&call_home, agent, &settings);
+            if reply { req.agent_dir = Some(&call_home); }
             req.request_type = if reply { RequestType::Chat } else { RequestType::Evolution };
             let call = super::tests::COLLECT_PROBE.scope(probe,
                 runtime_dispatch::run_agent_prompt_detailed(req));

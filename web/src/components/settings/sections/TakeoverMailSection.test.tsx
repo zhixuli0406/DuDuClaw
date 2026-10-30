@@ -93,7 +93,9 @@ describe('<TeamDefaultsSection>', () => {
     localStorage.setItem('dudu.settings.advanced.settings.automation.teamRoles', '1');
     renderWithProviders(<TeamDefaultsSection />);
     await screen.findByDisplayValue('loaded');
-    await user.click(screen.getByRole('combobox', { name: 'Planning: runtime' }));
+    screen.getByRole('combobox', { name: 'Planning: runtime' }).focus();
+    await user.keyboard('[ArrowDown]');
+    expect(await screen.findByRole('listbox')).toBeVisible();
     const savedOption = screen.queryByRole('option', { name: 'custom-runtime (saved value)' });
     if (blocked) expect(savedOption).not.toBeInTheDocument();
     else expect(savedOption).toBeInTheDocument();
