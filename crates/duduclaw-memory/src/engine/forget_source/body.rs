@@ -151,12 +151,13 @@ pub(super) fn compute(
     max_rows: usize,
     external: &ExternalInputs,
 ) -> Result<Computation> {
-    let mut specs = tombstone_specs(sel);
+    let connector = sel.connector_ref.as_deref();
+    let mut specs = if connector.is_some() { Vec::new() } else { tombstone_specs(sel) };
     load_candidates(conn, agent_id, &specs)?;
     // The turns of the forgotten messages (or of the whole conversation) are
     // the same source: their `mcp_turn` keys get tombstones too, so a later
     // write that names only the turn is fenced as well.
-    let turns = super::turns::linked_turn_specs(conn, agent_id, sel)?;
+    let turns = if connector.is_some() { Vec::new() } else { super::turns::linked_turn_specs(conn, agent_id, sel)? };
     let linked_turns: Vec<String> = turns.iter().map(|t| t.message.clone()).collect();
     if !turns.is_empty() {
         specs.extend(turns);
@@ -206,6 +207,13 @@ pub(super) fn compute(
         }
     }
 
+    if let Some(reference) = connector {
+        for (store, id) in super::connector::matching_rows(conn, agent_id, reference)? {
+            found.rows.insert((store, id), ("connector_stamp".into(), vec![LineageKey {
+                session: reference.into(), message: String::new(), role: Role::Direct,
+            }]));
+        }
+    }
     let has_archive = crate::lineage::db::table_exists(conn, "main", "memories_archive")?;
     let mut memory_ids: BTreeMap<String, String> = BTreeMap::new(); // id → via
     let mut fact_ids: BTreeMap<String, String> = BTreeMap::new();
@@ -264,7 +272,8 @@ pub(super) fn compute(
     }
 
     // 2. Legacy rows by recorded session (session watermark only, D8).
-    if let Some(upto) = sel.upto_time.as_deref().and_then(parse_rfc3339) {
+    if connector.is_none()
+        && let Some(upto) = sel.upto_time.as_deref().and_then(parse_rfc3339) {
         legacy_session_rows(
             conn,
             agent_id,
@@ -301,6 +310,27 @@ pub(super) fn compute(
         )));
     }
 
+    if connector.is_some() {
+        let system = super::connector::system_ids(conn, agent_id)?;
+        memory_ids.retain(|id, _| !system.contains(&(STORE_MEMORIES.into(), id.clone())));
+        fact_ids.retain(|id, _| !system.contains(&(STORE_KEY_FACTS.into(), id.clone())));
+        archive_ids.retain(|id| !system.contains(&(STORE_MEMORIES.into(), id.clone())));
+        lineage_only.retain(|key| !system.contains(key));
+        // Apply removes archive copies of live and derived targets too.
+        // Bind each copy and its content to the same approved scope.
+        if has_archive {
+            for id in memory_ids.keys() {
+                if archived(conn, id, agent_id)? { archive_ids.insert(id.clone()); }
+            }
+        }
+        let total = memory_ids.len() + fact_ids.len() + archive_ids.len() + lineage_only.len();
+        if total > max_rows {
+            return Ok(Computation::TooLarge(format!(
+                "{total} rows exceed the limit of {max_rows}"
+            )));
+        }
+    }
+
     // 4. Per-target details and collateral.
     let mut targets: Vec<TargetEntry> = Vec::new();
     let mut collateral: BTreeMap<String, u64> = BTreeMap::new();
@@ -330,6 +360,20 @@ pub(super) fn compute(
         }
     }
 
+    if connector.is_some() {
+        for id in &archive_ids {
+            let content: String = conn.query_row(
+                "SELECT content FROM memories_archive WHERE id=?1 AND agent_id=?2",
+                params![id,agent_id], |row| row.get(0),
+            ).map_err(e)?;
+            targets.push(TargetEntry {
+                store: "archive".into(), id: id.clone(), content_sha256: sha256_hex(content.as_bytes()),
+                layer: "archive".into(), predicate: None, matched: Vec::new(),
+                other_sources: Vec::new(), via: "connector_stamp".into(), direct: true,
+            });
+        }
+    }
+
     // 5. Supersession links that would point at a deleted row.
     let target_set: HashSet<&str> = memory_ids.keys().map(String::as_str).collect();
     let cuts = supersession_cuts(conn, agent_id, &memory_ids, &target_set)?;
@@ -339,7 +383,9 @@ pub(super) fn compute(
         super::body_aux::orphan_entities(conn, agent_id, &memory_ids, &target_set)?;
 
     // 7. Counts shown to the operator.
-    let untracked = super::body_aux::untracked_count(conn, agent_id, &memory_ids, &fact_ids)?;
+    let untracked = if connector.is_some() {
+        super::connector::unattributed_count(conn, agent_id, &memory_ids, &fact_ids, &archive_ids)?
+    } else { super::body_aux::untracked_count(conn, agent_id, &memory_ids, &fact_ids)? };
     let other_ns: u64 = conn
         .query_row(
             "SELECT COUNT(DISTINCT memory_store || ':' || memory_id) FROM memory_origins
@@ -380,7 +426,11 @@ pub(super) fn compute(
         target: "session".into(),
     });
 
+    if connector.is_some() {
+        steps.retain(|step| step.step == STEP_REVIEW_SCRUB);
+    }
     let body = PlanBody {
+        system_rows: if connector.is_some() { super::connector::system_count(conn, agent_id)? } else { 0 },
         tombstones: specs
             .iter()
             .map(|s| TombstoneEntry {

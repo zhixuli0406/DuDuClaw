@@ -240,10 +240,14 @@ async fn remove(
         revoked = revoked_from.len(),
         "db_sources.remove completed"
     );
+    let forget_memories = crate::disconnect_forget::after_disconnect(home_dir,
+        &format!("db:{name}"), &name,
+        params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await;
     let mut payload = json!({
         "success": true,
         "name": name,
         "revoked_from": revoked_from,
+        "forget_memories": forget_memories,
     });
     if !revoke_failed.is_empty()
         && let Some(obj) = payload.as_object_mut()

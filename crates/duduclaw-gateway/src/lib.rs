@@ -251,6 +251,8 @@ pub mod maintenance;
 pub mod mast;
 pub mod memory_factory;
 pub mod memory_forget_approval;
+pub mod memory_forget_apply;
+pub mod disconnect_forget;
 pub mod memory_forget_steps;
 pub mod memory_migrate;
 pub mod memory_provenance;

@@ -232,7 +232,11 @@ impl MethodHandler {
         if let Err(e) = self.write_config_table_snapshot(&config_path,config_expected_hash,&table).await {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
         }
-        WsFrame::ok_response("", json!({ "ok": true, "mode": mode }))
+        let forget_memories = if mode == "none" {
+            crate::disconnect_forget::after_disconnect(&self.home_dir, "google:home", "Google",
+                params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await
+        } else { json!({"status":"skipped"}) };
+        WsFrame::ok_response("", json!({ "ok": true, "mode": mode, "forget_memories":forget_memories }))
     }
 
     /// Live-test the configured credential path: mint a token (service account)
@@ -337,7 +341,11 @@ impl MethodHandler {
         match mcp_oauth::remove_token(&self.home_dir, provider_id) {
             Ok(()) => {
                 info!(provider = %provider_id, "MCP OAuth token revoked");
-                WsFrame::ok_response("", json!({ "success": true }))
+                let forget_memories = if provider_id == "google" {
+                    crate::disconnect_forget::after_disconnect(&self.home_dir, "google:home", "Google",
+                        params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await
+                } else { json!({"status":"skipped","message":"此 OAuth 供應商沒有連線歸屬標記。"}) };
+                WsFrame::ok_response("", json!({ "success": true, "forget_memories":forget_memories }))
             }
             Err(e) => WsFrame::error_response("", &e),
         }

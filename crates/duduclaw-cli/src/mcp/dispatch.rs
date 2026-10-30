@@ -792,7 +792,7 @@ pub(crate) async fn handle_tools_call(
     };
 
     let result = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
-        google_caller.finish(home_dir, default_agent, tool_name, result)
+        google_caller.finish(home_dir, default_agent, tool_name, result).await
     } else {
         result
     };

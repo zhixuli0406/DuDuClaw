@@ -56,11 +56,11 @@ impl TaintCache {
             }
         }
         match self.entries.get(&key) {
-            Some(entry) => Taint {
+            Some(entry) => Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None,
                 tainted: true,
                 sources: entry.sources.iter().cloned().collect(),
             },
-            None => Taint { tainted: false, sources: Vec::new() },
+            None => Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: Vec::new() },
         }
     }
 }
@@ -139,7 +139,7 @@ pub async fn mark(home: &Path, agent: &str, tool: &str) -> Result<(), String> {
     let key = (home.into(), agent.into(), turn.clone());
     merge(
         key.clone(),
-        Taint {
+        Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None,
             tainted: true,
             sources: vec![tool.into()],
         },
@@ -156,6 +156,49 @@ pub async fn mark(home: &Path, agent: &str, tool: &str) -> Result<(), String> {
             Err(reason)
         }
     }
+}
+
+fn attribution_uncertain() -> &'static Mutex<std::collections::HashSet<Key>> {
+    static UNCERTAIN: OnceLock<Mutex<std::collections::HashSet<Key>>> = OnceLock::new();
+    UNCERTAIN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn note_attribution_failure(key: Key) {
+    if let Ok(mut failures) = attribution_uncertain().lock() {
+        if failures.len() < MAX_CACHE_ENTRIES { failures.insert(key); }
+        else { failures.insert((PathBuf::new(), String::new(), String::new())); }
+    }
+}
+
+/// Always query the live ledger: a cached egress taint is not attribution evidence.
+pub async fn connector_snapshot(home: &Path, agent: &str) -> crate::egress_guard::ConnectorSnapshot {
+    use crate::egress_guard::ConnectorSnapshot;
+    let Ok(turn) = checked_turn_id() else { return ConnectorSnapshot::unknown(); };
+    let mut snapshot = exchange(home, agent, &turn, "query", None, None, None).await
+        .map(|state| state.connector_snapshot())
+        .unwrap_or_else(|_| ConnectorSnapshot::unknown());
+    let uncertain = attribution_uncertain().lock().map(|failures|
+        failures.contains(&(home.into(), agent.into(), turn))
+            || failures.contains(&(PathBuf::new(), String::new(), String::new())))
+        .unwrap_or(true);
+    if uncertain && !snapshot.refs.iter().any(|reference| reference == "unknown") { snapshot.refs.push("unknown".into()); }
+    snapshot
+}
+
+pub async fn mark_connector(home: &Path, agent: &str, tool: &str, reference: &str) -> Result<(), String> {
+    let turn = checked_turn_id().map_err(str::to_owned)?;
+    let state = exchange_with_connector(home, agent, &turn, "mark", Some(tool), None, None, None, Some(reference), None).await
+        .map_err(|reason| { note_attribution_failure((home.into(), agent.into(), turn.clone())); reason })?;
+    merge((home.into(), agent.into(), turn), state);
+    Ok(())
+}
+
+pub async fn mark_remote(home: &Path, agent: &str, tool: &str, server: &str) -> Result<(), String> {
+    let turn = checked_turn_id().map_err(str::to_owned)?;
+    let state = exchange_with_connector(home, agent, &turn, "mark", Some(tool), None, None, None, None, Some(server)).await
+        .map_err(|reason| { note_attribution_failure((home.into(), agent.into(), turn.clone())); reason })?;
+    merge((home.into(), agent.into(), turn), state);
+    Ok(())
 }
 
 /// The identity is captured once, so completion cannot affect a different turn.
@@ -317,6 +360,14 @@ async fn exchange_with_read(
     payload: Option<bool>,
     own_read: Option<&str>,
 ) -> Result<Taint, String> {
+    exchange_with_connector(home, agent, turn, op, source, reservation, payload, own_read, None, None).await
+}
+
+async fn exchange_with_connector(
+    home: &Path, agent: &str, turn: &str, op: &str,
+    source: Option<&str>, reservation: Option<&str>, payload: Option<bool>, own_read: Option<&str>,
+    connector_ref: Option<&str>, remote_server: Option<&str>,
+) -> Result<Taint, String> {
     let key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).map_err(|_| "missing gateway key")?;
     let token =
         std::env::var(duduclaw_core::ENV_AGENT_TOKEN).map_err(|_| "missing employee token")?;
@@ -332,7 +383,9 @@ async fn exchange_with_read(
         _ => crate::egress_guard::QUERY_ROUTE,
     };
     let body = serde_json::to_vec(&serde_json::json!({
-        "op": op, "turn_id": turn, "source": source, "reservation": reservation, "payload": payload, "own_read": own_read
+        "op": op, "turn_id": turn, "source": source, "reservation": reservation, "payload": payload, "own_read": own_read,
+        "connector_ref": connector_ref, "remote_server": remote_server,
+        "stamp_only": connector_ref.is_some() || remote_server.is_some()
     })).map_err(|_| "bad request")?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -411,6 +464,8 @@ fn interpret(
     let state: Taint = serde_json::from_slice(bytes).map_err(|_| "invalid gateway response")?;
     if state.tainted == state.sources.is_empty()
         || state.sources.len() > 514
+        || state.connector_refs.len() > 513
+        || state.connector_refs.iter().any(|s| s.is_empty() || s.len() > 256 || s.chars().any(char::is_control))
         || state
             .sources
             .iter()
@@ -546,14 +601,14 @@ mod tests {
     fn local_taint_never_downgrades() {
         let tmp = tempfile::tempdir().unwrap();
         let key = (tmp.path().into(), "agent".into(), "turn".into());
-        let state = Taint {
+        let state = Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None,
             tainted: true,
             sources: vec!["memory_search".into()],
         };
         assert!(merge(key.clone(), state).tainted);
         let result = merge(
             key,
-            Taint {
+            Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None,
                 tainted: false,
                 sources: Vec::new(),
             },
@@ -569,21 +624,21 @@ mod tests {
         // Missing-turn callers share this key for the life of the process.
         let key = (PathBuf::from("isolated-home"), "agent".into(), String::new());
         let sources: Vec<_> = (0..MAX_CACHED_SOURCES).map(|n| format!("private_tool_{n:04}")).collect();
-        let state = cache.merge(key.clone(), Taint { tainted: true, sources: sources.clone() }, now);
+        let state = cache.merge(key.clone(), Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: true, sources: sources.clone() }, now);
         assert_eq!(state.sources.len(), MAX_CACHED_SOURCES);
         assert!(!state.sources.iter().any(|source| source == ADDITIONAL_PRIVATE_SOURCES));
         // Duplicates do not consume capacity or imply additional sources.
-        let state = cache.merge(key.clone(), Taint { tainted: true, sources }, now);
+        let state = cache.merge(key.clone(), Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: true, sources }, now);
         assert!(!state.sources.iter().any(|source| source == ADDITIONAL_PRIVATE_SOURCES));
         for n in 0..1024 {
-            let state = cache.merge(key.clone(), Taint {
+            let state = cache.merge(key.clone(), Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None,
                 tainted: true, sources: vec![format!("another_private_tool_{n}")],
             }, now);
             assert!(state.tainted);
             assert_eq!(state.sources.len(), MAX_CACHED_SOURCES);
             assert!(state.sources.iter().any(|source| source == ADDITIONAL_PRIVATE_SOURCES));
         }
-        let clean = Taint { tainted: false, sources: Vec::new() };
+        let clean = Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: Vec::new() };
         assert!(cache.merge(key, clean, now).tainted);
     }
 
@@ -593,9 +648,9 @@ mod tests {
         let now = Instant::now();
         let old = (PathBuf::from("isolated-home"), "agent".into(), "old-turn".into());
         let live = (PathBuf::from("isolated-home"), "agent".into(), "live-turn".into());
-        cache.merge(old.clone(), Taint { tainted: true, sources: vec!["old_source".into()] }, now);
-        cache.merge(live.clone(), Taint { tainted: true, sources: vec!["live_source".into()] }, now + Duration::from_secs(1));
-        let clean = Taint { tainted: false, sources: Vec::new() };
+        cache.merge(old.clone(), Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: true, sources: vec!["old_source".into()] }, now);
+        cache.merge(live.clone(), Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: true, sources: vec!["live_source".into()] }, now + Duration::from_secs(1));
+        let clean = Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: Vec::new() };
         assert!(cache.merge(old.clone(), clean.clone(), now + crate::egress_guard::TTL - Duration::from_nanos(1)).tainted);
         let result = cache.merge(live, clean, now + crate::egress_guard::TTL);
         assert!(result.tainted);
@@ -612,9 +667,9 @@ mod tests {
         let mut cache = TaintCache::default();
         let now = Instant::now();
         let key = (PathBuf::from("isolated-home"), "agent".into(), "turn".into());
-        cache.merge(key.clone(), Taint { tainted: true, sources: vec!["private_source".into()] }, now);
+        cache.merge(key.clone(), Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: true, sources: vec!["private_source".into()] }, now);
         cache.overflowed = true;
-        let state = cache.merge(key, Taint { tainted: false, sources: Vec::new() }, now + crate::egress_guard::TTL);
+        let state = cache.merge(key, Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: Vec::new() }, now + crate::egress_guard::TTL);
         assert_eq!(state, Taint::unknown());
         assert!(cache.entries.is_empty());
     }

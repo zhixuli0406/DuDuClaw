@@ -151,7 +151,29 @@ impl GoogleCaller {
         )
         .await
         {
-            Ok(result) => result,
+            Ok(result) => {
+                if let Some(selection) = self.dedicated.as_ref().and_then(|c| c.selection_stamp()) {
+                    use duduclaw_core::google_identity::ApprovedGoogleIdentity;
+                    let personal = selection.approval.selected_identity == ApprovedGoogleIdentity::Personal;
+                    self.record(CallRecord {
+                        identity: if personal { "personal" } else { "home" },
+                        account: String::new(),
+                        user_id: personal.then(|| selection.approval.selected_credential_owner.clone()),
+                        fallback: !personal,
+                        notice: None,
+                    });
+                } else if matches!(effective_for(home, Some(agent)).effective, Effective::Home) {
+                    self.record(CallRecord {
+                        identity: "home", account: String::new(), user_id: None,
+                        fallback: false, notice: None,
+                    });
+                } else {
+                    // Legacy delegated execution can fall back inside the host.
+                    // Without its selected-account receipt no exact stamp is safe.
+                    let _ = duduclaw_gateway::egress_client::mark_connector(home, agent, tool, "unknown").await;
+                }
+                result
+            },
             Err(error) => super::tool_error(&error),
         }
     }
@@ -281,7 +303,7 @@ impl GoogleCaller {
     /// After a Google tool ran: prepend a fallback notice to the result and
     /// write the audit row for a person-identity path (the home path keeps
     /// today's audit exactly).
-    pub(crate) fn finish(
+    pub(crate) async fn finish(
         &self,
         home: &Path,
         audit_agent: &str,
@@ -291,6 +313,21 @@ impl GoogleCaller {
         let Some(rec) = self.last.lock().unwrap_or_else(|p| p.into_inner()).take() else {
             return result;
         };
+        if !result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+            let reference = match (rec.identity, rec.user_id.as_deref()) {
+                ("home", _) => Some("google:home".to_string()),
+                ("delegate", _) => Some("google:delegation".to_string()),
+                ("personal" | "owner" | "user", Some(user)) => Some(format!("google:person:{user}")),
+                _ => None,
+            };
+            if let Some(reference) = reference {
+                if let Err(reason) = duduclaw_gateway::egress_client::mark_connector(
+                    home, self.agent.as_deref().unwrap_or(audit_agent), tool, &reference,
+                ).await {
+                    tracing::warn!(%reason, "Google connection attribution unavailable");
+                }
+            }
+        }
         if let Some(n) = &rec.notice
             && let Some(first) = result
                 .get_mut("content")
@@ -679,14 +716,14 @@ mod tests {
             "bot",
             "gmail_search",
             json!({"content":[{"type":"text","text":err}],"isError":true}),
-        );
+        ).await;
         assert_eq!(out["isError"], true);
         let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
         assert!(audit.contains("\"google_identity\":\"refused\""), "{audit}");
     }
 
-    #[test]
-    fn fallback_notice_is_prepended() {
+    #[tokio::test]
+    async fn fallback_notice_is_prepended() {
         let home = tempfile::tempdir().unwrap();
         let c = GoogleCaller::test(Some("bot"), None);
         c.record(CallRecord {
@@ -701,7 +738,7 @@ mod tests {
             "bot",
             "gmail_search",
             json!({"content":[{"type":"text","text":"結果"}]}),
-        );
+        ).await;
         assert_eq!(
             out["content"][0]["text"],
             "（已改用公司共用帳號處理）\n結果"

@@ -490,7 +490,15 @@ where
     F: std::future::Future<Output = Result<String, String>>,
 {
     use crate::cost_telemetry::RequestType as RT;
-    let fut = crate::runtime_turn::scope(agent_id, fut);
+    let connector_snapshot = std::sync::Arc::new(std::sync::Mutex::new(crate::egress_guard::ConnectorSnapshot::unknown()));
+    let snapshot_after_run = connector_snapshot.clone();
+    let fut = crate::runtime_turn::scope(agent_id, async move {
+        let result = fut.await;
+        let turn = duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten();
+        let refs = crate::egress_guard::query_turn(agent_id, turn.as_deref()).connector_snapshot();
+        if let Ok(mut snapshot) = snapshot_after_run.lock() { *snapshot = refs; }
+        result
+    });
     let fut = crate::computer_use_sessions::attended_call::runtime_scope(
         request_type == RT::Chat,
         crate::on_behalf_of::context::scope(home_dir, agent_id, fut),
@@ -598,11 +606,13 @@ where
                 &run_key,
                 chrono::Utc::now(),
             )];
+            let connectors = connector_snapshot.lock().map(|snapshot| snapshot.clone())
+                .unwrap_or_else(|_| crate::egress_guard::ConnectorSnapshot::unknown());
             tokio::spawn(async move {
-                crate::wiki_ingest::run_ingest(
+                crate::memory_provenance::CONNECTOR_STAMPS.scope(connectors, crate::wiki_ingest::run_ingest(
                     &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
                     sources,
-                )
+                ))
                 .await;
             });
         }

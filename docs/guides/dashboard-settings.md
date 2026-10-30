@@ -329,3 +329,16 @@ Direct-binding history privacy: `[people] bound_history_privacy = true` is enabl
 The security page offers four values for `config.toml [security] egress_guard`: **Off** (`off`), **Observe only** (`shadow`, default), **Ask before sending** (`ask`) and **Block sending** (`block`). Saving uses the existing locked `system.update_config` writer; calls read the setting at the guard. The per-employee `agent.toml [capabilities] egress_guard` can only raise the restriction (`off < shadow < ask < block`). A missing `config.toml` means the default (Observe only); invalid or unreadable configuration blocks the affected call.
 
 After a successful private MCP read in a turn, the guard checks outgoing calls. Observe only records `would_ask` and source tools while allowing execution. Ask shows a single-use approval with destination, expanded complete content, source tools and expiry; only a current dashboard Admin can approve it (channel buttons and chat replies cannot). Block refuses. This covers platform MCP calls and the third-party MCP proxy, not Claude CLI built-ins or other native runtime tools. Tracking is per turn. See [Outgoing data guard](../features/69-egress-guard.md).
+
+## Security → Data deletion receipts (unreleased F1)
+
+Disconnecting a channel, Google account, database source or Remote MCP automatically prepares a memory-deletion request. A disconnect success and a completed deletion are separate results.
+
+1. Disconnect the service in its settings. The response offers **View approval** when a batch is ready. If `[memory] forget_source` is off or its setting cannot be read, no plan is created; planning failures are also reported separately.
+2. An Admin opens the inbox card and reviews the counts for each AI employee. A batch expires after seven days. A deletion scope that grows before execution needs another approval; a smaller scope can proceed.
+3. After approval is saved, the gateway queues durable background work. It retries unfinished work and resumes after a restart. There is no receipt while deletion or its required follow-up is incomplete.
+4. Open **System → Security → Data deletion receipts**, expand a connection and choose **Download JSON**. Refresh the list to see newly completed work. Counts distinguish deleted memories, key facts and archive copies from unattributed and retained system rows.
+
+Google personal connections are attributed to the user whose credential was used, while the receipt groups deletions by AI employee. Old memories without a connection stamp cannot be assigned retrospectively. Conversation text, `tool_calls.jsonl`, wiki and backups are outside this deletion. Remote MCP's existing `forget` option removes the saved connection entry; the independent `forget_memories` option controls the memory request and defaults to enabled.
+
+Non-Google OAuth revocations currently have no connection attribution and report that forgetting was skipped. Clearing the configured Google credential path does not itself revoke a separately stored OAuth authorization; disconnect that authorization through its own control.

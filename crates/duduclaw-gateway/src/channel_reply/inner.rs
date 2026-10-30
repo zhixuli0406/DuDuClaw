@@ -2157,7 +2157,7 @@ pub(super) async fn build_reply_with_session_inner(
                     .unwrap_or(7);
                 let agent_dir_for_dec = agent_dir.clone();
                 let home_for_dec = ctx.home_dir.clone();
-                let decision_provenance = turn_sources.assistant_provenance();
+                let decision_provenance = turn_sources.assistant_provenance().map(|p| crate::egress_guard::query_turn(&agent_id, Some(&turn_id)).connector_snapshot().stamp(p));
                 let ctx_meta = {
                     let (ch, cid) = parse_session_id_parts(session_id);
                     serde_json::json!({ "channel": ch, "chat_id": cid, "session_id": session_id })
@@ -2285,7 +2285,7 @@ pub(super) async fn build_reply_with_session_inner(
                 let session_for_res = session_id.to_string();
                 let home_for_res = ctx.home_dir.clone();
                 let home_for_res_engine = home_for_res.clone();
-                let choice_provenance = turn_sources.user_provenance();
+                let choice_provenance = turn_sources.user_provenance().map(|p| crate::egress_guard::query_turn(&agent_id, Some(&turn_id)).connector_snapshot().stamp(p));
                 tokio::spawn(async move {
                     let _ = tokio::task::spawn_blocking(move || {
                         // H4: single construction point.
@@ -2486,7 +2486,7 @@ pub(super) async fn build_reply_with_session_inner(
                 let agent_dir_for_facts = agent_dir.clone();
                 let home_for_activity = ctx.home_dir.clone();
                 let tx_for_activity = ctx.event_tx.clone();
-                let fact_provenance = turn_sources.provenance();
+                let fact_provenance = turn_sources.provenance().map(|p| crate::egress_guard::query_turn(&agent_id, Some(&turn_id)).connector_snapshot().stamp(p));
                 tokio::spawn(async move {
                     // P2-B: key facts carry the turn's two messages.
                     let Some(fact_provenance) = fact_provenance else {
@@ -2598,7 +2598,7 @@ pub(super) async fn build_reply_with_session_inner(
             let gvu = ctx.gvu_loop.clone();
             let user_id_for_pred = user_id.to_string();
             let agent_id_for_pred = agent_id.clone();
-            let episodic_provenance = turn_sources.provenance();
+            let episodic_provenance = turn_sources.provenance().map(|p| crate::egress_guard::query_turn(&agent_id, Some(&turn_id)).connector_snapshot().stamp(p));
             let session_id_for_pred = session_id.to_string();
             let turn_id_for_pred = turn_id.clone();
             let text_clone = text.to_string();
@@ -3603,13 +3603,14 @@ pub(super) async fn build_reply_with_session_inner(
             // below; capture the originating conversation here.
             let origin_for_distill = crate::decision_notify::origin_target();
             let sources_for_distill = turn_sources.all();
+            let connectors_for_distill = crate::egress_guard::query_turn(&agent_id, Some(&turn_id)).connector_snapshot();
             tokio::spawn(async move {
                 if let Some(verdict) = delivery_verdict {
                     if !matches!(verdict.await, Ok(true)) {
                         return;
                     }
                 }
-                crate::wiki_ingest::run_ingest(
+                crate::memory_provenance::CONNECTOR_STAMPS.scope(connectors_for_distill, crate::wiki_ingest::run_ingest(
                     &user_text_for_distill,
                     &reply_for_distill,
                     &agent_id_for_distill,
@@ -3619,7 +3620,7 @@ pub(super) async fn build_reply_with_session_inner(
                     &session_for_distill,
                     origin_for_distill,
                     sources_for_distill,
-                )
+                ))
                 .await;
             });
         }

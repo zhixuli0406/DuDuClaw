@@ -500,6 +500,13 @@ impl ThirdPartyGate {
                     }});
                 }
             }
+            if self.seen_by == "bridge" {
+                if let Err(reason) = crate::egress_client::mark_remote(
+                    &self.home, &self.agent_id, &entry.source, &self.server,
+                ).await {
+                    tracing::warn!(%reason, "Remote MCP connection attribution unavailable");
+                }
+            }
             let _ = entry.done.send(());
         }
     }

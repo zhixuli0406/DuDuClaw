@@ -215,8 +215,8 @@ mod tests {
 
     #[test]
     fn egress_hook_decision_table() {
-        let clean = Taint { tainted: false, sources: vec![] };
-        let tainted = Taint { tainted: true, sources: vec!["memory_search".into()] };
+        let clean = Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: vec![] };
+        let tainted = Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: true, sources: vec!["memory_search".into()] };
         for (mode, dirty, unknown) in [(Mode::Off, Policy::Allow, Policy::Allow),
             (Mode::Shadow, Policy::WouldAsk, Policy::WouldRefuseUnavailable),
             (Mode::Ask, Policy::Ask, Policy::Unavailable), (Mode::Block, Policy::Refuse, Policy::Unavailable)] {

@@ -62,6 +62,17 @@ pub(crate) fn mcp_write_provenance(
     .map(duduclaw_memory::lineage::Provenance::Sources)
 }
 
+/// Read connection attribution from the signed gateway ledger at the write boundary.
+pub(crate) async fn mcp_stamped_provenance(
+    namespace: &str,
+) -> Result<duduclaw_memory::lineage::Provenance, String> {
+    let provenance = mcp_write_provenance(namespace)?;
+    let snapshot = duduclaw_gateway::egress_client::connector_snapshot(
+        &duduclaw_core::duduclaw_home(), namespace,
+    ).await;
+    Ok(snapshot.stamp(provenance))
+}
+
 /// The turn identity a host put into this process's env (raw strings).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct McpTurnEnv {
@@ -467,7 +478,7 @@ pub async fn handle_memory_store(
         origin: Some(origin.to_string()),
         ..Default::default()
     };
-    let provenance = match mcp_write_provenance(&namespace) {
+    let provenance = match mcp_stamped_provenance(&namespace).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "memory_store refused: malformed host env");
@@ -1183,7 +1194,7 @@ pub async fn handle_user_profile_record(
     // The AI employee's record of a user is stamped with the `user_profile`
     // origin class (ceiling 0.6, below operator-approved values) — see
     // `duduclaw_memory::origin::USER_PROFILE`.
-    let provenance = match mcp_write_provenance(&namespace) {
+    let provenance = match mcp_stamped_provenance(&namespace).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "user_profile_record refused: malformed host env");

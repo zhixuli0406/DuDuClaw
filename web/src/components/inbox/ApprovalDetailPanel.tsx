@@ -546,7 +546,13 @@ function GenericApprovalView({
   const described = DESCRIBED_KINDS.has(approval.kind);
   const knowledge = parseKnowledgeQuarantine(approval.kind, approval.payload, approval.summary);
   const knowledgeConflict = knowledge?.variant === 'conflict' ? knowledge : null;
-  const kindDesc = knowledgeConflict
+  const disconnectPayload = approval.payload && typeof approval.payload === 'object'
+    ? approval.payload as Record<string, unknown> : null;
+  const disconnectForget = approval.kind === 'memory_forget_source'
+    && disconnectPayload?.origin === 'connector_disconnect';
+  const kindDesc = disconnectForget
+    ? t('forget.approval.description')
+    : knowledgeConflict
     ? t('approval.plan.kind.knowledge_quarantine.conflict')
     : described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
   const discoverySpec = approval.kind === 'discovery' ? parseDiscoveryApproval(approval.payload) : null;
@@ -607,6 +613,8 @@ function GenericApprovalView({
       </Section>
 
       {actionGrant && <ActionGrantSection grant={actionGrant} expiresAt={expiresAtEpoch} t={t} />}
+
+      {disconnectForget && <DisconnectForgetFacts payload={disconnectPayload} />}
 
       {discoverySpec && <DiscoverySpecSection spec={discoverySpec} intl={intl} />}
 
@@ -771,6 +779,31 @@ function GenericApprovalView({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+function DisconnectForgetFacts({ payload }: { payload: Record<string, unknown> | null }) {
+  const intl = useIntl();
+  const rows = Array.isArray(payload?.counts_by_agent) ? payload.counts_by_agent : [];
+  return (
+    <div className="space-y-3 rounded-lg border p-3" data-testid="disconnect-forget-counts">
+      <p className="text-sm">{intl.formatMessage({ id: 'forget.approval.scope' })}</p>
+      {rows.map((row, index) => {
+        if (!row || typeof row !== 'object' || !('agent_id' in row) || typeof row.agent_id !== 'string') return null;
+        const values = row as Record<string, unknown>;
+        const count = (key: string) => typeof values[key] === 'number' ? String(values[key]) : '—';
+        return (
+          <div key={`${row.agent_id}-${index}`} className="space-y-1 border-t pt-2 text-sm">
+            <p className="font-medium">{row.agent_id}</p>
+            <p>{intl.formatMessage({ id: 'forget.approval.counts' }, {
+              memories: count('memories'), facts: count('key_facts'), archives: count('archive'),
+              unattributed: count('unattributed'), system: count('system_kept'),
+            })}</p>
+          </div>
+        );
+      })}
+      <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'forget.receipts.outOfScope' })}</p>
     </div>
   );
 }

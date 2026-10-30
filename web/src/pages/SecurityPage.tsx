@@ -9,6 +9,7 @@ import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
+import { ForgetReceiptsPanel } from '@/components/ForgetReceiptsPanel';
 import { toast, formatError } from '@/lib/toast';
 import {
   TRIGGER_KEYS,
@@ -148,6 +149,8 @@ export function SecurityPage() {
       <CredentialProtectionPanel />
 
       <EgressGuardSection status={status} onSaved={refreshSecurityStatus} />
+
+      <ForgetReceiptsPanel />
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an

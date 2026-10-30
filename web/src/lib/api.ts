@@ -1,4 +1,5 @@
 import { client } from './ws-client';
+import { notifyDisconnectForget } from './forget-receipts';
 import { callTaskRpc, type TaskAttachmentInput } from './task-rpc';
 // v1.68 W2 — dashboard-switches RPC wire types.
 import type {
@@ -6576,7 +6577,7 @@ export const api = {
         detail: string;
       }>,
     remove: (type: string) =>
-      client.call('channels.remove', { type }),
+      client.call('channels.remove', { type }).then(notifyDisconnectForget),
     // WP1.1 (ecosystem): LINE OA add-friend link for the QR onboarding card /
     // printable poster. QR is rendered client-side from `add_friend_url`.
     lineAddFriend: () =>
@@ -7701,7 +7702,7 @@ export const api = {
         name: string;
       }>,
     remove: (name: string) =>
-      client.call('db_sources.remove', { name }) as Promise<{
+      client.call('db_sources.remove', { name }).then(notifyDisconnectForget) as Promise<{
         success: boolean;
         name: string;
         /** Agent ids whose grant to this source was revoked as a side effect
@@ -7751,7 +7752,7 @@ export const api = {
   googleCredentials: {
     get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
     set: (params: GoogleCredentialsInput) =>
-      client.call('google.credentials.set', params) as Promise<{ ok: boolean; mode: string }>,
+      client.call('google.credentials.set', params).then(notifyDisconnectForget) as Promise<{ ok: boolean; mode: string }>,
     test: () =>
       client.call('google.credentials.test') as Promise<{
         ok: boolean;
@@ -7776,7 +7777,7 @@ export const api = {
     delegation: () => client.call('google.delegation.get') as Promise<GoogleDelegationStatus>,
     importKey: (keyJson: string) =>
       client.call('google.delegation.import_key', { key_json: keyJson }) as Promise<{ key: GoogleDelegationKeyInfo }>,
-    removeKey: () => client.call('google.delegation.remove_key', { confirm: true }) as Promise<{ removed: boolean }>,
+    removeKey: () => client.call('google.delegation.remove_key', { confirm: true }).then(notifyDisconnectForget) as Promise<{ removed: boolean }>,
     setSettings: (params: { allowed_subject_domains?: string[]; allowed_domains?: string[]; default_identity?: 'home' | 'none' }) =>
       client.call('google.delegation.settings_set', { ...params }) as Promise<{
         default_identity: 'home' | 'none';
@@ -7799,10 +7800,10 @@ export const api = {
     start: (acknowledgeGoogleData: boolean) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
     finish: (state: string) => client.call('me.google.connect_finish', { state }),
     paste: (url: string) => client.call('me.google.connect_paste', { url }),
-    disconnect: () => client.call('me.google.disconnect', { confirm: true }) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
+    disconnect: () => client.call('me.google.disconnect', { confirm: true }).then(notifyDisconnectForget) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
     consent: (agentId: string, allowed: boolean) => client.call('me.google.consents.set', { agent_id: agentId, allowed, confirm_shared_access: allowed }),
     primaryOwner: (agentId: string, userId: string) => client.call('agents.primary_owner_set', { agent_id: agentId, user_id: userId }),
-    disconnectUser: (userId: string) => client.call('users.google_disconnect', { user_id: userId, confirm: true }),
+    disconnectUser: (userId: string) => client.call('users.google_disconnect', { user_id: userId, confirm: true }).then(notifyDisconnectForget),
   },
   mcp: {
     list: () =>
@@ -7813,7 +7814,7 @@ export const api = {
         action,
         server_name: serverName,
         ...(serverDef ? { server_def: serverDef } : {}),
-      }) as Promise<{ success: boolean }>,
+      }).then(notifyDisconnectForget) as Promise<{ success: boolean }>,
     oauthProviders: () =>
       client.call('mcp.oauth.providers') as Promise<{ providers: McpOAuthProvider[] }>,
     oauthStart: (providerId: string, clientId?: string, clientSecret?: string, acknowledgeGoogleData?: boolean) =>
@@ -7834,7 +7835,7 @@ export const api = {
         scopes?: string[];
       }>,
     oauthRevoke: (providerId: string) =>
-      client.call('mcp.oauth.revoke', { provider_id: providerId }) as Promise<{ success: boolean }>,
+      client.call('mcp.oauth.revoke', { provider_id: providerId }).then(notifyDisconnectForget) as Promise<{ success: boolean }>,
     importFetch: (url: string) =>
       client.call('mcp.import.fetch', { url }) as Promise<McpImportFetchResult>,
     importInstall: (params: {
@@ -7934,8 +7935,8 @@ export const api = {
     toolEffects: (agentId: string) =>
       client.call('mcp.tool_effects', { agent_id: agentId }) as Promise<{ servers: McpServerToolEffects[] }>,
     /** Admin: delete stored credentials; `forget` also removes the entry. */
-    remoteDisconnect: (agentId: string, name: string, forget = false) =>
-      client.call('mcp.remote_disconnect', { agent_id: agentId, name, forget }) as Promise<{
+    remoteDisconnect: (agentId: string, name: string, forget = false, forgetMemories = true) =>
+      client.call('mcp.remote_disconnect', { agent_id: agentId, name, forget, forget_memories: forgetMemories }).then(notifyDisconnectForget) as Promise<{
         success: boolean;
         existed: boolean;
       }>,

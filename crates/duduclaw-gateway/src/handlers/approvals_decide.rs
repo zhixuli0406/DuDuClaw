@@ -266,6 +266,20 @@ impl MethodHandler {
             );
         }
 
+        if approve && let Some(rec) = record.as_ref().filter(|r|
+            r.action_kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
+                && r.payload.get("origin").and_then(Value::as_str) == Some(crate::memory_forget_approval::ORIGIN_DISCONNECT))
+        {
+            let Some(batch_id) = rec.payload.get("batch_id").and_then(Value::as_str) else {
+                return WsFrame::error_response("", "disconnect batch missing");
+            };
+            if let Err(error) = crate::disconnect_forget::enqueue_approved(&self.home_dir, batch_id).await {
+                return WsFrame::ok_response("", json!({"id":id,"decided":"approved",
+                    "execution_status":"retry_pending","message":error}));
+            }
+            return WsFrame::ok_response("", json!({"id":id,"decided":"approved","execution_status":"awaiting_execution"}));
+        }
+
         // ── S1 (PORTICO): mint an epoch-bound capability on approve ──
         // Approving is no longer a permanent grant. If the approval payload
         // carries a `scope_epoch` (a task_id / session_id subgoal key), mint
