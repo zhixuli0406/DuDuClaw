@@ -158,6 +158,7 @@ pub mod cron_store;
 pub mod cron_templates;
 pub mod departments;
 pub mod distributor_notice;
+pub mod distributor_brand;
 pub mod distributor_store;
 mod image_data;
 pub mod license_runtime;

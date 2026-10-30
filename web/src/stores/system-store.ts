@@ -1,3 +1,4 @@
+import { loadPublicBrand, useBrandStore } from '@/stores/brand-store';
 import { create } from 'zustand';
 import { api, type DoctorCheck, type SystemStatus } from '@/lib/api';
 import { client } from '@/lib/ws-client';
@@ -22,6 +23,8 @@ export const useSystemStore = create<SystemStore>((set) => {
   client.subscribe('system.status_changed', (payload) => {
     const data = payload as SystemStatus;
     set({ status: data });
+    useBrandStore.getState().setBrand(null);
+    void loadPublicBrand();
   });
 
   return {
@@ -61,4 +64,6 @@ export const useSystemStore = create<SystemStore>((set) => {
 useConnectionStore.subscribe((state, previous) => {
   if (state.state === previous.state || state.state !== 'authenticated') return;
   void useSystemStore.getState().fetchStatus();
+  useBrandStore.getState().setBrand(null);
+  void loadPublicBrand();
 });

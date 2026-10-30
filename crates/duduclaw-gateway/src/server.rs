@@ -2383,6 +2383,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/refresh", post(handle_refresh))
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
+        .route("/api/brand", get(handle_public_brand))
         .route("/api/first-run/status", get(handle_first_run_status))
         .route("/api/first-run/claim", post(handle_first_run_claim))
         // D4a: OOBE pre-auth network setup — see `first_run_network_gate`'s
@@ -3296,7 +3297,8 @@ async fn handle_otp_request(
                 challenge.code.clone(),
             );
             tokio::spawn(async move {
-                let text = format!("DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
+                let product = crate::distributor_brand::product_name();
+                let text = format!("{product} 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
                 match deliverer.deliver(&channel, &chat_id, &text).await {
                     Ok(()) => {
                         let _ = user_db.log_action(
@@ -3871,6 +3873,14 @@ struct FirstRunClaimRequest {
     #[serde(default)]
     email: Option<String>,
     password: String,
+}
+
+/// Public identity only: no subscription, license or distributor metadata.
+async fn handle_public_brand() -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(crate::distributor_brand::effective()),
+    )
 }
 
 /// GET /api/first-run/status — report whether this instance is unclaimed, so the
@@ -16688,7 +16698,7 @@ fn personal_google_callback_response(
             axum::response::Redirect::to(&target).into_response()
         }
         Err(message) => axum::response::Html(format!(
-            "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>DuDuClaw Google</title></head><body><h1>Google 連結未完成</h1><p>{}</p><p>請回到 DuDuClaw「我的連線」。</p></body></html>", html_escape(&message)
+            "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>{product} Google</title></head><body><h1>Google 連結未完成</h1><p>{}</p><p>請回到 {product}「我的連線」。</p></body></html>", html_escape(&message), product = html_escape(&crate::distributor_brand::product_name())
         )).into_response(),
     };
     let headers = response.headers_mut();
@@ -16796,11 +16806,12 @@ fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::
     };
     let body = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
-         <title>DuDuClaw</title></head><body style=\"font-family:system-ui,sans-serif;display:flex;justify-content:center;\
+         <title>{product}</title></head><body style=\"font-family:system-ui,sans-serif;display:flex;justify-content:center;\
          align-items:center;min-height:100vh;margin:0;background:#F5F4F0;color:#102B48\"><div style=\"max-width:32rem;padding:1.5rem;text-align:center\">\
          <h2>{}</h2><p style=\"color:#5B6470\">{}</p>{link}</div></body></html>",
         html_escape(title),
         html_escape(message),
+        product = html_escape(&crate::distributor_brand::product_name()),
     );
     let mut resp = axum::response::Html(body).into_response();
     let headers = resp.headers_mut();

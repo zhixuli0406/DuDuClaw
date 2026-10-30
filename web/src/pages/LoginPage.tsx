@@ -5,7 +5,7 @@ import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
 import { Card, Button, Input, Spinner } from '@/components/mds';
 import { Field } from '@/components/onboarding';
-import { DuDu } from '@/components/mascot';
+import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
 import { useEffectiveName } from '@/lib/product-identity';
 
 type Mode = 'password' | 'otp';

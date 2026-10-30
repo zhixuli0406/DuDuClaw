@@ -128,9 +128,7 @@ const BOT_INTENTS: u64 = INTENT_GUILDS
 // ── Slash command definitions ───────────────────────────────
 
 fn slash_command_definitions() -> Vec<Value> {
-    // Product attribution is fixed across messaging channels.
-    let product =
-        "DuDuClaw".to_string();
+    let product = crate::distributor_brand::product_name();
     vec![
         json!({
             "name": "ask",
@@ -2929,7 +2927,7 @@ async fn handle_slash_command(
                     .is_guild_allowed("discord", guild_id)
                     .await
             {
-                let product = "DuDuClaw".to_string();
+                let product = crate::distributor_brand::channel_name();
                 send_interaction_response(http, interaction_id, interaction_token, 4,
                     Some(json!({"content": format!("❌ 此伺服器未被授權使用 {product}"), "flags": 64}))).await;
                 return;
@@ -3027,8 +3025,7 @@ async fn handle_slash_command(
                 if auto_thread { "✅" } else { "❌" },
             );
 
-            let product =
-                "DuDuClaw".to_string();
+            let product = crate::distributor_brand::product_name().replace('@', "@\u{200b}");
             let embed = json!({
                 "embeds": [{
                     "title": format!("{product} Status"),

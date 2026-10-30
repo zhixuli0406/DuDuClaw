@@ -1004,4 +1004,6 @@ port = 18889
 #   [model]         agents/<id>/agent.toml — that agent's model, effort, account pool
 #   [router]        inference.toml — local-inference cascade routing
 #   [voice] TTS     inference.toml — text-to-speech; only STT lives in this file
-#   [branding]      ~/.duduclaw/branding.json, written by the dashboard only
+#   Distributor brand: signed <home>/distributor_brand.json, Oem only.
+#   No [branding] section or customer-side setter; old branding.json is ignored.
+#   See docs/guides/white-label.md for the signed name/logo contract.

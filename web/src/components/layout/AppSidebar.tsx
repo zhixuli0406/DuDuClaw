@@ -30,7 +30,7 @@ import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
 import { useEffectiveName } from '@/lib/product-identity';
-import { BrandMark } from '@/components/brand/BrandMark';
+import { ProductLogo } from '@/components/brand/ProductLogo';
 import {
   SidebarHeader,
   SidebarContent,
@@ -331,7 +331,7 @@ function CompanySwitcher({ collapsed }: { collapsed: boolean }) {
   const setLocale = useLocaleStore((s) => s.setLocale);
 
   // C1 mark at nav size (28 px); no chip behind it (logo usage rules).
-  const logoNode = <BrandMark size={28} title={brandName} />;
+  const logoNode = <ProductLogo size={28} title={brandName} />;
 
   return (
     <DropdownMenu>

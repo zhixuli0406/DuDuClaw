@@ -7,6 +7,7 @@
 //! the embedded dashboard in a native window with a tray. NOT compiled in this
 //! environment (no Tauri toolchain) — see Phase D verification notes.
 
+mod distributor_brand;
 mod gateway_picker;
 mod lifecycle;
 mod mascot_window;
@@ -106,6 +107,7 @@ fn main() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            app.manage(distributor_brand::RuntimeBrand::default());
 
             // Hot-update (§D4): stage new versions in the background, apply on
             // restart/quit. Without this the updater plugin is inert and the
@@ -196,7 +198,11 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "開啟 DuDuClaw", true, None::<&str>)?;
+    let name = distributor_brand::product_name(app);
+    let open = MenuItem::with_id(app, "open", format!("開啟 {name}"), true, None::<&str>)?;
+    if let Some(state) = app.try_state::<distributor_brand::RuntimeBrand>() {
+        *state.open_menu.lock().unwrap() = Some(open.clone());
+    }
     let switch_gw = MenuItem::with_id(app, "switch_gateway", "切換 Gateway", true, None::<&str>)?;
     let mascot = MenuItem::with_id(app, "toggle_mascot", "顯示/隱藏桌寵", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重啟背景服務", true, None::<&str>)?;
@@ -236,7 +242,7 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
     let autostart_item = autostart.clone();
     TrayIconBuilder::with_id("main-tray")
         .icon(app.default_window_icon().unwrap().clone())
-        .tooltip("DuDuClaw")
+        .tooltip(&name)
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
@@ -282,6 +288,7 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
             _ => {}
         })
         .build(app)?;
+    distributor_brand::apply(app);
     Ok(())
 }
 

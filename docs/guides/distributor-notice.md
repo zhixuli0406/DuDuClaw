@@ -27,9 +27,12 @@ When both exist the runtime one wins; a signed "distributor cleared it" also
 overrides the compiled copy. No setting or RPC on an installed system can
 change the block, so an end customer cannot replace it.
 
-White-label branding (custom product name, logo, colours) stays removed; see
-[white-label.md](white-label.md). This block does not change the product name,
-the vendor credit, the version or the license tier shown on the page.
+A separate signed [distributor brand](white-label.md) can change the product
+name and logo only for the `Oem` tier. The notice itself does not change them.
+When branded, About shows the brand card, then this notice, then the fixed
+Software development block. Vendor credit, vendor website, version and license
+type remain visible; the distributor cannot hide or overwrite that block.
+Accent colours, customer-side brand setters and custom About HTML remain removed.
 
 ## Build input
 

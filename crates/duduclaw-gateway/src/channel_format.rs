@@ -184,9 +184,10 @@ pub fn to_discord_messages_mode(
     // downgrade those to monospace code fences (no-op when no table).
     let text = &crate::markdown_render::preprocess_discord_markdown(text);
     let color = if error { ERROR_COLOR } else { DUDUCLAW_COLOR };
+    let product = crate::distributor_brand::product_name().replace('@', "@\u{200b}");
     let footer_text = agent_name
-        .map(|n| format!("DuDuClaw \u{00b7} {n}"))
-        .unwrap_or_else(|| "DuDuClaw".to_string());
+        .map(|n| format!("{product} \u{00b7} {n}"))
+        .unwrap_or_else(|| product.clone());
 
     // Plain mode → plain-text messages only, split at the message limit.
     if mode == ResponseMode::Plain && !error {
@@ -304,9 +305,10 @@ fn split_code_segments(text: &str) -> Vec<(bool, String)> {
 /// Like [`to_line_flex_message`] with error styling: error replies render as
 /// a red-accented bubble, and fenced code blocks render as dark code panels.
 pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: bool) -> Value {
+    let product = crate::distributor_brand::product_name();
     let footer_text = agent_name
-        .map(|n| format!("DuDuClaw \u{00b7} {n}"))
-        .unwrap_or_else(|| "DuDuClaw".to_string());
+        .map(|n| format!("{product} \u{00b7} {n}"))
+        .unwrap_or_else(|| product.clone());
 
     // Short prose replies → plain text (errors always get the styled bubble).
     if !error && text.len() < 200 && !text.contains("```") {

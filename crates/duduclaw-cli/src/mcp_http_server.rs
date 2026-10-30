@@ -302,7 +302,30 @@ fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
 
 // ── Server entry point ────────────────────────────────────────────────────────
 
+/// Keep the license refresh/feed loops scoped to the standalone HTTP server,
+/// including bind errors or cancellation of its `run` future.
+struct LicenseTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for LicenseTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 pub async fn run(cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result<(), String> {
+    // OAuth pages also run without start_gateway. Use the same verified local
+    // license and cached distributor document; network refresh runs separately
+    // and never delays serving the HTTP routes or changes their authentication.
+    let license_runtime = duduclaw_gateway::license_runtime::LicenseRuntime::bootstrap(
+        cfg.home_dir.clone(),
+        duduclaw_gateway::license_runtime::production_registry(),
+    )
+    .await;
+    duduclaw_gateway::license_runtime::set_global(license_runtime.clone());
+    let _license_tasks = LicenseTasks(license_runtime.spawn_background_tasks());
+
     let state = HttpState {
         dispatcher: Arc::new(dispatcher),
         sse_store: Arc::new(SseEventStore::new()),

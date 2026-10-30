@@ -1,11 +1,14 @@
-import { StrictMode } from 'react';
+import { StrictMode, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { IntlProvider } from 'react-intl';
 import { BrowserRouter } from 'react-router';
 import { App } from './App';
 import { ToastProvider } from './components/Toast';
 import { AppErrorBoundary } from './components/layout/AppErrorBoundary';
-import { messages, useLocaleStore } from './i18n';
+import { brandedMessages, useLocaleStore } from './i18n';
+import { loadPublicBrand, useBrandStore } from './stores/brand-store';
+import { useDarkAppearance } from './components/brand/ProductLogo';
+import { applyDocumentBrand } from './lib/brand-document';
 import { applyTheme, useThemeStore } from './stores/theme-store';
 import { setTimeAgoNowLabel } from './lib/format';
 import { installExternalLinkInterceptor } from './lib/external-link';
@@ -20,15 +23,21 @@ applyTheme(useThemeStore.getState().theme);
 // reroute them to the system browser. No-op in a plain browser tab.
 installExternalLinkInterceptor();
 
+void loadPublicBrand();
+
 function Root() {
   const locale = useLocaleStore((s) => s.locale);
+  const brand = useBrandStore((state) => state.brand);
+  const dark = useDarkAppearance();
+  const messages = useMemo(() => brandedMessages(locale, brand?.product_name), [locale, brand?.product_name]);
+  useEffect(() => applyDocumentBrand(brand, dark), [brand, dark]);
   // Keep the (non-hook) `timeAgo` "now" token in sync with the active locale.
-  setTimeAgoNowLabel(messages[locale]?.['format.timeAgo.now'] ?? 'now');
+  setTimeAgoNowLabel(messages['format.timeAgo.now'] ?? 'now');
   return (
     // IntlProvider must wrap ToastProvider: ToastItem calls useIntl(), so the
     // toast viewport has to live inside the intl context or it throws
     // "Could not find required `intl` object" the first time a toast renders.
-    <IntlProvider locale={locale} messages={messages[locale]} defaultLocale="zh-TW">
+    <IntlProvider locale={locale} messages={messages} defaultLocale="zh-TW">
       {/* Root safety net: a crash in the layout chrome shows a reload
           message instead of a blank tab (RouteErrorBoundary covers pages). */}
       <AppErrorBoundary>

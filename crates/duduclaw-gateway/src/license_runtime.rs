@@ -338,6 +338,10 @@ impl LicenseRuntime {
             license.as_ref().map(|l| l.subscription_id.as_str()),
         );
 
+        crate::distributor_brand::runtime::load_cached(
+            &home_dir, &registry, license.as_ref().map(|l| l.subscription_id.as_str()),
+        );
+
         Self {
             state: Arc::new(RwLock::new(LicenseRuntimeInner {
                 license,
@@ -357,7 +361,8 @@ impl LicenseRuntime {
         let phone_home = tokio::spawn(phone_home_loop(self.clone()));
         let crl_poll = tokio::spawn(crl_loop(self.clone()));
         let notice_poll = tokio::spawn(crate::distributor_notice::runtime::poll_loop(self.clone()));
-        vec![phone_home, crl_poll, notice_poll]
+        let brand_poll = tokio::spawn(crate::distributor_brand::runtime::poll_loop(self.clone()));
+        vec![phone_home, crl_poll, notice_poll, brand_poll]
     }
 
     /// `(subscription_id, machine_fingerprint)` of the installed license, for
@@ -523,6 +528,7 @@ impl LicenseRuntime {
         // A notice cached for the previous license no longer applies; the
         // next fetch brings the new subscription's.
         crate::distributor_notice::runtime::reset(&self.home_dir);
+        crate::distributor_brand::runtime::reset(&self.home_dir);
         {
             let mut inner = self.state.write().await;
             inner.license = validated;
@@ -534,6 +540,7 @@ impl LicenseRuntime {
             );
         }
         crate::distributor_notice::runtime::spawn_fetch_now(self.clone());
+        crate::distributor_brand::runtime::spawn_fetch_now(self.clone());
         Ok(self.snapshot().await)
     }
 }
@@ -1133,6 +1140,7 @@ impl LicenseRuntime {
         let mut inner = self.state.write().await;
         inner.license = None;
         crate::distributor_notice::runtime::reset(&self.home_dir);
+        crate::distributor_brand::runtime::reset(&self.home_dir);
         // Best-effort: remove the local file so subsequent restarts don't
         // reload a known-bad license.
         if let Err(e) = storage::delete_default() {

@@ -1,10 +1,24 @@
-# 經銷商金鑰控制台（白牌功能已移除）
+# 總經銷的產品名稱與 Logo
 
-> **白牌功能已在 1.72.2 移除。** 產品名稱、logo、副標題、主題色、公司欄位、About HTML 區塊、簽章品牌包與 `branding.*` RPC 都不存在了，`branding.json`／`branding.bundle.json` 會被忽略。每個 dashboard 一律顯示 DuDuClaw 的產品識別與固定的上游原廠標示（嘟嘟數位科技有限公司 / Dudu Technology Ltd.），這個標示編譯在執行檔裡，設定檔和 RPC 都改不了。
->
-> 總經銷專用 build 可以在關於頁多一塊總經銷資訊。內容由總經銷在授權 console 維護，不是 dashboard 設定，請見 [distributor-notice.md](distributor-notice.md)。
+v1.78.0 起，總經銷可以在授權主控台設定產品名稱與 Logo。只有有效授權方案為 `Oem`，而且收到屬於該訂閱、驗簽通過的文件時才生效；其他情況顯示原本的 DuDuClaw 品牌。取件或驗證失敗不會擋住開機。範圍只有名稱與 Logo；副標題、主題色、公司欄位、自訂 About HTML 與 `branding.*` RPC 仍未恢復。舊的 `branding.json`、`branding.bundle.json` 仍會被忽略，客戶端沒有設定檔、HTTP 或 RPC 修改入口。
 
-這一頁現在只說明原廠端的經銷商金鑰控制台。
+總經銷在授權主控台的公告頁一併編輯名稱與 Logo，預覽後發布。gateway 沿用公告的下發週期與釘選 Ed25519 公鑰接收簽章內容。公開 repo 負責讀取，主控台的編輯功能由另一個專案維護。
+
+## 簽章文件契約
+
+- Schema 是 `duduclaw.distributor_brand.v1`，採用與公告相同的 canonical JSON 與 Ed25519 簽章方式，文件與測試向量各自獨立。
+- 端點是 `POST /v1/license/distributor-brand`。請求與公告一樣帶 `subscription_id`、`machine_fingerprint` 與新產生的 `nonce`。回應帶回同一個 `nonce` 與 `distributor_brand`（沒有品牌時為 `null`，否則為簽章文件）。簽章涵蓋 `subscription_id`、`version`、`nonce`、`issued_at`、`product_name`、`logo_light`、選填的 `logo_dark`，並沿用公告的簽章識別欄位。canonical 欄位順序為 `kind`, `subscription_id`, `distributor_id`, `version`, `product_name`, `logo_light`, `logo_dark`, `issued_at`, `nonce`, `public_key_id`；`signature` 不參與簽章。沒有 `logo_dark` 時序列化為 `null`。回應文件為 `null` 表示清除品牌，不能單獨清空名稱或淺色 Logo。
+- 訂閱不符、nonce 不符、未知公鑰、簽章無效或版本倒退都拒絕。快取在 `<home>/distributor_brand.json`，讀取時重新驗簽，沒有編譯內建品牌。
+- 名稱為 1～40 字元，不可有控制字元、換行、URL 或 `<`、`>`。Logo 只收 PNG、JPEG、WebP 的 base64 data URI，檔案 magic bytes 必須符合宣告的格式；每張解碼後上限 128 KiB。不收 SVG 或遠端圖片。任何欄位不符，整份文件都拒絕。
+- `about.get` 只在品牌有效時加上 `brand`；公開唯讀的 `GET /api/brand` 只提供 `product_name`、`logo_light`、`logo_dark`，不帶授權或客戶資訊；有效時直接回傳這三欄的物件，無效時回 `null` 並使用原廠識別。
+
+## 顯示範圍與固定的原廠標示
+
+儀表板使用名稱與 Logo，涵蓋吉祥物位置、登入與歡迎頁、網頁標題、favicon 和 LINE QR 海報。通道頁尾、OTP 與 OAuth 頁面使用逸出後的名稱。繁體中文、英文、日文在載入翻譯時替換產品文案，法律聲明與隱私連結保留原文。CLI 與日誌維持原有名稱。
+
+品牌生效時，關於頁依序顯示總經銷的 Logo 與名稱、總經銷公告、固定的「軟體開發」區塊，包含原廠、網站、版本與授權方案。**嘟嘟數位科技有限公司 / Dudu Technology Ltd.** 與原廠網站都是編譯時常數，總經銷不能覆寫或隱藏。[總經銷公告](distributor-notice.md) 是另一份經消毒的內容，不會覆蓋這個區塊。
+
+桌面視窗標題、系統匣提示與更新對話框使用執行時名稱。安裝檔名稱、macOS Dock 名稱與 App 圖示仍是編譯時決定；更換這些項目需要另外打包，不在 v1.78.0 範圍。Logo 保留原始長寬比，完整放入顯示框。
 
 ## 給原廠：經銷商控制台
 
@@ -78,7 +92,7 @@ public_url      = "https://your-gateway.example.com"
 
 | 方法 | 存取權限 |
 |---|---|
-| `about.get` | 任何已登入使用者都能呼叫（固定的產品與原廠欄位、版本、授權方案；只有總經銷專用 build，或總經銷發的授權取得簽章內容時，才帶 `distributor_notice`） |
+| `about.get` | 任何已登入使用者都能呼叫（固定的原廠欄位、版本、授權方案；Oem 驗簽通過時另帶 `brand`；只有總經銷專用 build，或總經銷發的授權取得簽章內容時，才帶 `distributor_notice`） |
 | `distributor.status/list/add/update/remove/issue/revoke/upgrade` | 需要管理員身分 |
 
 ## HTTP 控制平面介面（原廠 gateway，以簽發金鑰把關）

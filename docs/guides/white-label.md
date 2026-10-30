@@ -1,18 +1,64 @@
-# Distributor key console (white-label branding removed)
+# Distributor name and logo
 
-> **White-label branding was removed in 1.72.2.** The product name, logo,
-> subtitle, accent colour, company fields, the About HTML block, signed
-> branding bundles and the `branding.*` RPCs no longer exist, and
-> `branding.json` / `branding.bundle.json` files are ignored. Every dashboard
-> shows the DuDuClaw identity and the fixed upstream vendor credit
-> (嘟嘟數位科技有限公司 / Dudu Technology Ltd.), which is compiled into the
-> binary and cannot be changed through config or any RPC.
->
-> A distributor build can carry one block of distributor information on the
-> About page. The distributor maintains it in the license console; it is not
-> a dashboard setting: see [distributor-notice.md](distributor-notice.md).
+In v1.78.0, a distributor can set a product name and logo in the license
+console. Only a gateway whose effective license tier is `Oem` uses them, and
+only after verifying the signed document for its subscription. Without a
+valid document it shows the original DuDuClaw brand. A failed fetch or invalid
+document never prevents startup. The name and logo are the entire scope:
+subtitle, accent colour, company fields, custom About HTML and `branding.*`
+RPCs remain removed. Old `branding.json` and `branding.bundle.json` are ignored.
+Customers have no setter in config, HTTP or RPC.
 
-This page now describes only the vendor-side distributor key console.
+The distributor edits the name and logos alongside its notice in the license
+console, previews them and publishes. A signed runtime copy reaches the gateway
+through the same feed cadence and pinned Ed25519 keys as the distributor notice.
+This public repo provides the reader; console editing is maintained separately.
+
+## Signed brand contract
+
+- Schema: `duduclaw.distributor_brand.v1`; signing uses the same canonical JSON
+  and Ed25519 procedure as the notice, with a separate document and vectors.
+- Endpoint: `POST /v1/license/distributor-brand`. Request fields are
+  `subscription_id`, `machine_fingerprint` and a fresh `nonce`, exactly as for
+  the notice. The response echoes `nonce` and returns `distributor_brand`
+  (`null` when absent, otherwise the signed document). The signature binds
+  `subscription_id`, `version`, `nonce`, `issued_at`, `product_name`,
+  `logo_light` and optional `logo_dark`, with the notice's signing metadata.
+  Canonical field order is `kind`, `subscription_id`, `distributor_id`, `version`, `product_name`, `logo_light`, `logo_dark`, `issued_at`, `nonce`, `public_key_id`.
+  `signature` is excluded from signing; absent `logo_dark` is serialized as
+  `null`. A `null` response document clears the brand; names and light logos
+  cannot be cleared individually.
+- A subscription mismatch, wrong nonce, unknown key, invalid signature or
+  version rollback is refused. The cache is `<home>/distributor_brand.json`;
+  cached content is verified again before use. No brand is compiled in.
+- Names contain 1–40 characters, no controls, newlines, URL or `<` / `>`.
+  Logos must be base64 PNG, JPEG or WebP data URIs whose magic bytes match the
+  declared MIME type; each decoded logo is at most 128 KiB. SVG and remote
+  images are refused. One invalid field rejects the entire document.
+- `about.get` adds `brand` only when effective. Public read-only `GET /api/brand`
+  exposes only `product_name`, `logo_light` and `logo_dark`, without license or
+  customer information. The response is a top-level object, or `null` when
+  ineffective, which means the original identity.
+
+## Where the brand appears
+
+The dashboard uses the name and logo, including product mascot positions,
+login and welcome screens, page title, favicon and LINE QR posters. Channel
+footers, OTP and OAuth pages use the escaped name. Translation loading changes
+product copy in English, Traditional Chinese and Japanese; legal notices and
+privacy links keep their original text. CLI and logs keep their existing name.
+
+When branded, About shows the distributor logo and name first, the distributor
+notice next, then a fixed **Software development** block with vendor, website,
+version and license type. **嘟嘟數位科技有限公司 / Dudu Technology Ltd.** and the
+vendor website are compile-time constants and cannot be changed or hidden by
+the distributor. The separate sanitized [distributor notice](distributor-notice.md)
+does not override that block.
+
+Desktop window titles, tray tooltips and update dialogs use the runtime name.
+Installer names, the macOS Dock name and application icons remain compile-time
+assets; changing those requires separate packaging and is outside v1.78.0.
+Logos preserve any aspect ratio and fit inside their display box.
 
 ## For the vendor (distributor console)
 
@@ -148,7 +194,7 @@ same as today). A refresh preserves the original `control_url`.
 
 | Method | Access |
 |---|---|
-| `about.get` | any logged-in user (fixed product and vendor fields, version, tier; `distributor_notice` only from a distributor build or a signed runtime copy for a distributor-issued license) |
+| `about.get` | any logged-in user (fixed vendor fields, version, tier; `brand` only for verified Oem branding; `distributor_notice` only from a distributor build or a signed runtime copy for a distributor-issued license) |
 | `distributor.status/list/add/update/remove/issue/revoke/upgrade` | admin |
 
 ## HTTP control-plane surface (owner gateway, issuer-key-gated)

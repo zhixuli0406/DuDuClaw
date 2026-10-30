@@ -1,3 +1,4 @@
+import { useBrandStore } from '@/stores/brand-store';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -9,6 +10,7 @@ import { LoginPage } from './LoginPage';
  * layout on the app-shell surface and the three-mode form (password default).
  */
 beforeEach(() => {
+    useBrandStore.getState().setBrand(null);
   useAuthStore.setState({
     loading: false,
     // Not a first-run instance → the password form is shown.
@@ -21,6 +23,15 @@ beforeEach(() => {
 });
 
 describe('<LoginPage>', () => {
+  it('uses an effective distributor brand without customer-side branding controls', async () => {
+    useBrandStore.getState().setBrand({ product_name: 'Partner Desk', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
+    renderWithProviders(<LoginPage />);
+    expect(await screen.findByText('Partner Desk')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'Partner Desk' })).toHaveAttribute('src', 'data:image/png;base64,iVBORw0KGgo=');
+    expect(screen.getByText('Sign in to your account')).toBeInTheDocument();
+    expect(screen.queryByText(/change brand/i)).not.toBeInTheDocument();
+  });
+
   it('renders the brand seal, subtitle and password sign-in form', async () => {
     renderWithProviders(<LoginPage />);
 

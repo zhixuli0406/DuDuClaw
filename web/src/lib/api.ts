@@ -1,3 +1,4 @@
+import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
 import { notifyDisconnectForget } from './forget-receipts';
 import { callTaskRpc, type TaskAttachmentInput } from './task-rpc';
@@ -5656,7 +5657,8 @@ export interface MigrateResult {
 export interface SoftwareVendor { name_zh: string; name_en: string; url: string; }
 export interface AboutResponse {
   vendor: SoftwareVendor;
-  product_name: 'DuDuClaw';
+  product_name: string;
+  brand?: DistributorBrand | null;
   version: string;
   tier: string;
   /**
@@ -7739,7 +7741,11 @@ export const api = {
      * OpenSource defaults when no license is installed, so the caller
      * can render without conditional-loading the call.
      */
-    status: () => client.call('license.status') as Promise<LicenseSnapshot>,
+    status: async (): Promise<LicenseSnapshot> => {
+      const status = await client.call('license.status') as LicenseSnapshot;
+      if (status?.tier !== 'oem') useBrandStore.getState().setBrand(null);
+      return status;
+    },
     /** Machine fingerprint provided to the general distributor for licensing. */
     fingerprint: () =>
       client.call('license.fingerprint', {}) as Promise<{ fingerprint: string }>,
@@ -7749,11 +7755,14 @@ export const api = {
      * error strings, already localized zh-TW (bad signature / fingerprint
      * mismatch / expired / malformed). No gateway restart needed on success.
      */
-    activate: (key: string) =>
-      client.call('license.activate', { key }) as Promise<{
-        success: boolean;
-        status: LicenseSnapshot;
-      }>,
+    activate: async (key: string): Promise<{ success: boolean; status: LicenseSnapshot }> => {
+      const result = await client.call('license.activate', { key }) as { success: boolean; status: LicenseSnapshot };
+      if (result.success) {
+        useBrandStore.getState().setBrand(null);
+        await loadPublicBrand();
+      }
+      return result;
+    },
   },
   marketplace: {
     list: () =>
@@ -8825,8 +8834,13 @@ export const api = {
       client.call('users.audit_log', params ?? {}) as Promise<{ entries: AuditEntry[] }>,
   },
   about: {
-    /** Fixed software identity, vendor attribution and version. */
-    get: () => client.call('about.get') as Promise<AboutResponse>,
+    /** Verified display brand, immutable vendor attribution and version. */
+    get: async (): Promise<AboutResponse> => {
+      const apply = beginBrandRequest();
+      const about = await client.call('about.get') as AboutResponse;
+      apply(about.brand);
+      return about;
+    },
   },
   // ── Distributor management (owner instance only) ──────────────
   distributor: {

@@ -1,3 +1,4 @@
+import { useBrandStore } from '@/stores/brand-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -13,7 +14,24 @@ vi.mock('@/lib/api', () => ({
 import { AboutPage } from './AboutPage';
 
 describe('<AboutPage>', () => {
+  it('shows the signed narrow brand and notice before an immutable software vendor', async () => {
+    useBrandStore.getState().setBrand({ product_name: 'Partner Desk', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
+    aboutGet.mockResolvedValue({
+      vendor: { name_zh: 'Fake vendor', name_en: 'Fake', url: 'https://evil.test' },
+      brand: { product_name: 'Partner Desk', logo_light: 'data:image/png;base64,iVBORw0KGgo=' },
+      distributor_notice: '<p>Partner support</p>', version: '1.78.0', tier: 'oem',
+    });
+    renderWithProviders(<AboutPage />);
+    expect(await screen.findByText('Partner Desk')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'Partner Desk' })).toHaveAttribute('src', 'data:image/png;base64,iVBORw0KGgo=');
+    expect(screen.getByText('嘟嘟數位科技有限公司')).toBeInTheDocument();
+    expect(screen.queryByText('Fake vendor')).not.toBeInTheDocument();
+    expect(screen.getByRole('link')).toHaveAttribute('href', 'https://duduclaw.dudustudio.monster');
+    expect(document.querySelector('iframe')).not.toBeNull();
+  });
+
   beforeEach(() => {
+    useBrandStore.getState().setBrand(null);
     aboutGet.mockReset();
   });
 

@@ -1,3 +1,4 @@
+import { useBrandStore } from '@/stores/brand-store';
 import {describe, it, expect, vi, beforeEach} from 'vitest';
 import {screen, waitFor} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -11,6 +12,7 @@ import {api} from '@/lib/api';
 import {SoftLimitBanner} from '@/components/SoftLimitBanner';
 
 beforeEach(() => {
+    useBrandStore.getState().setBrand(null);
   vi.clearAllMocks();
   useConnectionStore.setState({state: 'authenticated'});
   useAgentsStore.setState({agents: []});
@@ -25,7 +27,7 @@ beforeEach(() => {
 });
 
 describe('license management without direct sales', () => {
-  it('keeps license activation and the general distributor contact, without sales or branding controls', async () => {
+  it('keeps license activation and the general distributor contact, without sales or customer-side branding controls', async () => {
     const user = userEvent.setup();
     renderWithProviders(<LicenseShell />);
     await screen.findByText('machine-123');

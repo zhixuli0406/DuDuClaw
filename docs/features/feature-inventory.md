@@ -463,7 +463,7 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| License Tiers | Nine tiers in `crates/duduclaw-license/src/tier.rs` (opensource, hobby, solo, studio, business, partner, personal_pro_self_host, self_host_pro, oem). The capability gates are `premium_templates`, `white_label` and `industry_evolution_params`; see [LICENSING.md](../../LICENSING.md) |
+| License Tiers | Nine tiers in `crates/duduclaw-license/src/tier.rs` (opensource, hobby, solo, studio, business, partner, personal_pro_self_host, self_host_pro, oem). The capability flags are `premium_templates` and `industry_evolution_params`; distributor name/logo require an effective `Oem` tier and a separately verified signed brand document (not the removed `white_label` flag); see [LICENSING.md](../../LICENSING.md) |
 | Hardware Fingerprint | License binding |
 | Industry Templates | Manufacturing / Restaurant / Trading (free); premium industry packs need `premium_templates` |
 | CLI Tools | 12+ subcommands |

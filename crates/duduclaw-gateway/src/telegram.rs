@@ -544,9 +544,7 @@ enum TokenCheck {
 
 /// Register bot commands with Telegram.
 async fn register_commands(client: &reqwest::Client, api_base: &str) {
-    // Product attribution is fixed across messaging channels.
-    let product =
-        "DuDuClaw".to_string();
+    let product = crate::distributor_brand::product_name();
     let commands = json!({
         "commands": [
             { "command": "ask", "description": format!("向 {product} AI 提問") },

@@ -1,3 +1,4 @@
+import { useBrandStore } from '@/stores/brand-store';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -6,6 +7,7 @@ import { LoginPage } from './LoginPage';
 
 // Login always uses the software identity.
 beforeEach(() => {
+    useBrandStore.getState().setBrand(null);
   useAuthStore.setState({
     loading: false,
     firstRunStatus: (async () => false) as never,

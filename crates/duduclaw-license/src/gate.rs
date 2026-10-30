@@ -313,7 +313,9 @@ license_grace_period_days = 60
     fn capability_gates_stay_on_check_only() {
         let g = gate();
         assert!(g.check(LicenseTier::Studio, "premium_templates"));
+        // No feature flag grants customer brand-editing rights.
         assert!(!g.check(LicenseTier::Oem, "white_label"));
+        assert!(!g.check(LicenseTier::Oem, "distributor_brand"));
         assert!(!g.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(!g.service_commitment(LicenseTier::Studio, "premium_templates"));
         assert!(!g.service_commitment(LicenseTier::Oem, "white_label"));
@@ -427,8 +429,11 @@ license_grace_period_days = 60
         let g = gate();
         assert!(g.check(LicenseTier::Oem, "premium_templates"));
         assert!(g.check(LicenseTier::Oem, "industry_evolution_params"));
-        // Removed white-label capability stays unavailable.
+        // Signed Oem name/logo uses the runtime tier and a verified feed;
+        // it does not restore the old editable white-label capability.
+        // No feature flag grants customer brand-editing rights.
         assert!(!g.check(LicenseTier::Oem, "white_label"));
+        assert!(!g.check(LicenseTier::Oem, "distributor_brand"));
         // Service commitments inherit through the same chain, read through
         // the display-only reader.
         assert!(g.service_commitment(LicenseTier::Oem, "dashboard_enterprise"));
@@ -569,7 +574,9 @@ license_grace_period_days = 60
         // Sanity checks
         assert!(!gate.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(gate.check(LicenseTier::Studio, "premium_templates"));
+        // Runtime signed name/logo remains separate from manifest flags.
         assert!(!gate.check(LicenseTier::Oem, "white_label"));
+        assert!(!gate.check(LicenseTier::Oem, "distributor_brand"));
         assert!(gate.service_commitment(LicenseTier::SelfHostPro, "dashboard_enterprise"));
 
         // Phone-home defaults

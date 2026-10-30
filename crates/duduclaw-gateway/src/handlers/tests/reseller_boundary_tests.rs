@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn removed_branding_and_partner_sales_methods_are_unavailable_to_admins() {
+async fn local_branding_setters_and_partner_sales_methods_remain_unavailable_to_admins() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     for method in [
@@ -42,13 +42,15 @@ async fn removed_branding_and_partner_sales_methods_are_unavailable_to_admins() 
 }
 
 #[tokio::test]
-async fn about_uses_fixed_product_metadata_without_local_brand_overrides() {
+async fn about_keeps_vendor_fixed_and_ignores_unsigned_local_brand_overrides() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("branding.json"),
         r#"{"product_name":"Other Brand","website":"https://direct-sales.example"}"#,
     )
     .unwrap();
+    std::fs::write(home.path().join("distributor_brand.json"),
+        r#"{"product_name":"Unsigned Brand","logo_light":"data:image/png;base64,iVBORw0KGgo="}"#).unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let frame = handler
         .handle("about.get", json!({}), &UserContext::admin_fallback())
@@ -60,6 +62,7 @@ async fn about_uses_fixed_product_metadata_without_local_brand_overrides() {
             ..
         } => {
             assert_eq!(result["product_name"], "DuDuClaw");
+            assert!(result.get("brand").is_none());
             assert_eq!(result["vendor"]["name_zh"], "嘟嘟數位科技有限公司");
             assert_eq!(result["vendor"]["name_en"], "Dudu Technology Ltd.");
             assert!(result.get("version").is_some());

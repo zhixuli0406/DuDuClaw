@@ -39,8 +39,8 @@ import {
 } from '@/components/chat';
 import { CharacterAvatar } from '@/components/character';
 import { AgentGlyph } from '@/lib/agent-glyph';
-import { BrandMark } from '@/components/brand';
-import { DuDu } from '@/components/mascot';
+import { ProductLogo } from '@/components/brand';
+import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
 import { isImageMime, readAttachment } from '@/lib/attachments';
 import {
   applyMention,
@@ -503,7 +503,7 @@ function InteractiveWebChatPage() {
         ) : (
           // No agent icon (the server resolved no agent): show the product
           // mark instead of AgentGlyph's 🐾 per-agent placeholder.
-          <BrandMark size={28} />
+          <ProductLogo size={28} />
         )}
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">

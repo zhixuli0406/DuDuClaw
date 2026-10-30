@@ -44,6 +44,7 @@ App Shell 是浮島式（inset）：sidebar 與內容區各自 `rounded-xl`，�
 | 用途 | 元件 / token | 規則 |
 |---|---|---|
 | 產品標誌 | `components/brand/BrandMark.tsx`（`<BrandMark size title mono />`） | C1 坐姿貓 mark，path 原封不動取自品牌包 `duduclaw-mark.svg`（`components/brand/mark-paths.ts`，不要手改）。墨色層吃 `--logo-ink`（light Navy / dark Cream），尾巴吃 `--logo-accent`（Amber，永不換色）。螢幕上最小 32px，導航列可用 28px；不放進色塊或圓圈裡；不加陰影、漸層、外框。 |
+| 總經銷標誌 | `components/brand/ProductLogo.tsx` | 僅使用閘道驗證後的品牌名稱與 PNG／JPEG／WebP；深色主題優先深色圖，缺省使用淺色圖。一般最小 32px、導航列可用 28px；置於固定尺寸盒中以 `object-fit: contain`（SVG 圖像用 `preserveAspectRatio="xMidYMid meet"`）保留任意長寬比，不拉伸、不裁切、不加色塊、陰影、外框。品牌生效時，產品標誌與吉祥物位置都顯示此標誌。 |
 | 吉祥物 | `components/mascot/DuDu.tsx` | 直接用 mark 的剪影畫成角色：身體 `--logo-ink`、尾巴 `--logo-accent`、五官 `--logo-face`（墨色的反色，light 是 Cream、dark 是 Navy）。13 個表情 preset、viseme 對嘴、尾巴擺動與前爪姿勢都在同一個 SVG；`prefers-reduced-motion` 時整隻靜止。 |
 | AI 員工角色 | `components/character/CharacterAvatar.tsx` | 每位員工各自的色調（`--agent-1..10`），五官墨色 `--character-ink` = Navy，臉頰 `--character-blush` = Amber，bust 版的手是貓掌（Navy 掌心 + Cream 肉球）。 |
 | Favicon | `components/brand/assets/favicon.svg`（+ 32px PNG） | 由 Vite 打包進 `/assets/`（gateway 只對外提供 `/assets/*`）。SVG 內含 `prefers-color-scheme: dark` 規則，深色分頁列上墨色會換成 Cream。 |
