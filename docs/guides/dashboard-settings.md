@@ -7,6 +7,16 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 Goal cost and loop guards currently use the **Advanced config editor**, without dedicated Automation controls. In `config.toml [goal_loop]`, `default_cost_cap_cents = 0` sets the fallback goal ceiling in US cents (`0` = no cap), and `tool_streak_pause = 8` pauses after that many identical consecutive tool calls within one finished round (`0` = disabled). Saving in the Advanced config editor reloads the goal loop; direct edits to `config.toml` require a gateway restart. `tool_streak_advisory` independently controls the existing hints. Per-goal ceilings are set when assigning a goal; `/goals` shows spend and lets an authorized operator raise a paused goal's ceiling and retry.
 
 
+## Account roles and visible AI staff
+
+Employee accounts see only the AI staff directly bound to them. Managers also see their reports' AI staff in the sidebar, AI staff list, Timeline and Runs, marked as a team member's AI employee. Team entries are read-only: Timeline shows work cards and timing; Runs shows status and timing without conversation text or tool steps. Team access does not open memory, staff settings or persona files. Direct bindings keep their existing access levels, and team grants never exceed Operator. The organization entry counts direct and team staff together.
+
+Under **Manage → Members**, each account lists its directly bound AI staff with the access level and a remove action. When adding a binding, choose an AI employee explicitly; none is selected for you. The default level is Operator, including `users.bind_agent` calls that omit `access_level`. Existing bindings stay as they are; review and remove any grants that should not be there. Removing a binding takes effect on the next RPC or file request, including download and preview links with an older token.
+
+Shared wiki pages follow the account's department in member settings (`users.db`, `users.department`). Non-admins see company pages and only their own department's pages, including restrictions set with `visible_to_departments`. An account without a department sees company pages only. Lists, search, page reads, statistics and exports use the same rule. Unreadable permissions or invalid visibility settings refuse access. Admins retain company-wide access. Sharing a page still requires the source AI employee's Owner binding or Admin.
+
+Company usage (`billing.usage`) and daily growth reports require Manager. Widget generation and model refresh also require Manager because they use model quota or contact providers. Routines and system logs require Admin. Only Admin sees the cost section of Reports and Home, or the upload-and-install action in Experts. Other account roles do not request these restricted sections.
+
 ## Codex CLI updates
 
 On macOS and Linux, Codex CLI 0.164.0 or newer is required for normal employee runs with workspace-write permissions. When an installed version is too old or cannot be confirmed, Admins see a banner across dashboard pages showing the current version and an **Update Codex CLI** button. The button runs `npm install -g @openai/codex` on the gateway computer and streams progress. After a verified update the banner disappears; no gateway restart is needed.

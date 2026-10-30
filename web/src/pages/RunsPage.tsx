@@ -148,8 +148,8 @@ export function RunsPage() {
   // above is derived, not a filter the user picked, so it stays out (W3-3).
 
   const agentName = useCallback(
-    (id: string) => agents.find((a) => a.name === id)?.display_name || id,
-    [agents],
+    (id: string) => visibleAgents.find((a) => a.name === id)?.display_name || id,
+    [visibleAgents],
   );
 
   const channelLabel = useCallback(
@@ -294,7 +294,7 @@ export function RunsPage() {
               )}
               {visibleAgents.map((a) => (
                 <SelectItem key={a.name} value={a.name}>
-                  {a.display_name || a.name}
+                  {a.display_name || a.name}{a.readOnly ? ` · ${intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}` : ''}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -455,7 +455,8 @@ export function RunsPage() {
             onScroll={onTranscriptScroll}
             className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4"
           >
-            {cards.length === 0 && (
+            {detail.omitted?.includes('conversation_content') && <p role="note" className="py-4 text-sm text-muted-foreground">{intl.formatMessage({ id: 'runs.teamReadOnly' })}</p>}
+            {cards.length === 0 && !detail.omitted?.includes('conversation_content') && (
               <p className="py-8 text-center text-sm text-muted-foreground">
                 {intl.formatMessage({ id: 'runs.transcript.empty' })}
               </p>

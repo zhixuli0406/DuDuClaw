@@ -274,11 +274,8 @@ export function App() {
               <Route path="runs" element={<RunsPage />} />
               <Route path="canvas" element={<CanvasPage />} />
               <Route path="files" element={<FilesPage />} />
-              {/* D7 (09-edition-split-features.md §4): dropped out of the
-                  manager+ RoleGuard block below — a cron schedule for one's own
-                  agent is the same "own scope" as /plans and /runs above, not a
-                  manager-level concern. */}
-              <Route path="routines" element={<RoutinesPage />} />
+              {/* cron.* is admin-only, including read operations. */}
+              <Route element={<RoleGuard minRole="admin" />}><Route path="routines" element={<RoutinesPage />} /></Route>
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
@@ -407,7 +404,7 @@ export function App() {
                   {/* 授權 relocated to `/app/system/license` (N-3). */}
                   <Route path="license" element={<LegacyRouteRedirect to="/app/system/license" />} />
                   <Route path="migrate" element={<MigratePage />} />
-                  <Route path="logs" element={<LogsPage />} />
+                  <Route element={<RoleGuard minRole="admin" />}><Route path="logs" element={<LogsPage />} /></Route>
                   {/* 安全審計（secaudit dashboard）— manager+, not admin-only:
                       reviewing a finding is closer to analytics.* than the
                       admin-gated credential-rotation surfaces below. */}
@@ -494,7 +491,7 @@ export function App() {
                     license management); it now lands on the same
                     canonical `LicenseShell` every other license route does. */}
                 <Route path="license" element={<LegacyRouteRedirect to="/app/system/license" />} />
-                <Route path="logs" element={<LogsPage />} />
+                <Route element={<RoleGuard minRole="admin" />}><Route path="logs" element={<LogsPage />} /></Route>
               </Route>
               <Route element={<RoleGuard minRole="admin" />}>
                 <Route path="channels" element={<Navigate to="/manage/channels" replace />} />

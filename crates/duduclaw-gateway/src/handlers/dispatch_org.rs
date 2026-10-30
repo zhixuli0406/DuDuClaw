@@ -68,7 +68,14 @@ impl MethodHandler {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {
                             if let Err(e) = acl::require_agent_access(ctx, id, $min_level) {
-                                return WsFrame::error_response("", &e);
+                                // Only these read methods admit a live team grant.
+                                // All mutations and every other filtered RPC stay direct-only.
+                                if !matches!(method, "timeline.list" | "runs.list")
+                                    || $min_level != AccessLevel::Viewer
+                                    || !team_visibility::may_monitor(ctx, id)
+                                {
+                                    return WsFrame::error_response("", &e);
+                                }
                             }
                         }
                         _ => {
@@ -111,7 +118,10 @@ impl MethodHandler {
             "widgets.custom.update" => self.handle_widgets_custom_update(params, ctx).await,
             "widgets.custom.remove" => self.handle_widgets_custom_remove(params, ctx).await,
             "widgets.custom.share" => self.handle_widgets_custom_share(params, ctx).await,
-            "widgets.custom.generate" => self.handle_widgets_custom_generate(params).await,
+            "widgets.custom.generate" => {
+                require_manager!();
+                self.handle_widgets_custom_generate(params).await
+            },
             "users.subordinates" => {
                 require_manager!();
                 self.handle_users_subordinates(ctx).await

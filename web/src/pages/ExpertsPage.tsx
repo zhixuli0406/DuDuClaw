@@ -422,10 +422,6 @@ export function ExpertsPage() {
             <ShieldCheck className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
             <h2 className="text-sm font-medium">{t('experts.adminOnly.title')}</h2>
             <p className="text-sm text-muted-foreground">{t('experts.adminOnly.desc')}</p>
-            <Button variant="outline" size="sm" disabled>
-              <Upload />
-              {t('experts.upload')}
-            </Button>
           </div>
         </div>
       </div>

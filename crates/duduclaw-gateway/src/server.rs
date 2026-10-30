@@ -4644,7 +4644,15 @@ fn authorize_file_access(
     let token = extract_bearer_token(headers)
         .or(token_query)
         .ok_or_else(unauthorized)?;
-    let ctx = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
+    // The token proves identity only. Like RPC live_context, rebuild all
+    // authority from one current users.db snapshot, never JWT bindings.
+    // This also refuses inactive users and database errors without a fallback.
+    let claims = state.jwt_config.verify_access_token(token).map_err(|_| unauthorized())?;
+    let ctx = state
+        .user_db
+        .live_user_context(&claims.sub)
+        .map_err(|_| unauthorized())?
+        .ok_or_else(unauthorized)?;
     require_password_changed(&ctx)?;
 
     let allowed = match agent {

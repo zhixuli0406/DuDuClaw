@@ -124,6 +124,18 @@ function actorStatus(status: string, archived: boolean, live: boolean): ActorSta
  */
 export function AgentDetailPage() {
   const intl = useIntl();
+  const { id } = useParams();
+  const user = useAuthStore(s => s.user);
+  const bindings = useAuthStore(s => s.bindings);
+  // Team access is display-only; do not mount editors or memory loaders.
+  if (user?.role === 'manager' && !bindings.some(b => b.agent_name === id)) {
+    return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
+  }
+  return <AgentDetailPageContent />;
+}
+
+function AgentDetailPageContent() {
+  const intl = useIntl();
   const navigate = useNavigate();
   const openAssign = useOpenAssign();
   const params = useParams();

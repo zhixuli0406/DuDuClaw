@@ -56,7 +56,14 @@ pub(super) fn collect(
         &mut entries,
         &mut |relative| {
             (&mut *checkpoint.borrow_mut())()?;
-            authorize(home, ctx, request)?;
+            let live = authorize(home, ctx, request)?;
+            if shared {
+                let reader = crate::handlers::SharedWikiReader::new(home, &live)
+                    .map_err(|_| "EXPORT_PERMISSION_DENIED".to_string())?;
+                if !reader.page_visible(relative) {
+                    return Ok(());
+                }
+            }
             pages += 1;
             if pages > MAX_ROWS {
                 return Err("EXPORT_TOO_LARGE".into());

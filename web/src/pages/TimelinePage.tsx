@@ -122,7 +122,7 @@ export function TimelinePage() {
   const items = useMemo(() => workItems(rows), [rows]);
   const counts = Object.fromEntries(BUCKETS.map((bucket) => [bucket, items.filter((row) => bucketFor(row) === bucket).length])) as Record<Bucket, number>;
   const nameFor = (id: string) => id && id !== 'unassigned'
-    ? agents.find((agent) => agent.name === id)?.display_name || id
+    ? visibleAgents.find((agent) => agent.name === id)?.display_name || id
     : intl.formatMessage({ id: 'timeline.unassigned', defaultMessage: 'Unassigned' });
   const groups = useMemo(() => {
     const ids = new Set(rows.map((row) => row.agent_id));
@@ -180,7 +180,7 @@ export function TimelinePage() {
           </SelectTrigger>
           <SelectContent>
             {scope === 'all' && <SelectItem value="">{intl.formatMessage({ id: 'timeline.allAgents' })}</SelectItem>}
-            {visibleAgents.filter((agent) => agent.name !== 'channel_alert').map((agent) => <SelectItem key={agent.name} value={agent.name}>{agent.display_name || agent.name}</SelectItem>)}
+            {visibleAgents.filter((agent) => agent.name !== 'channel_alert').map((agent) => <SelectItem key={agent.name} value={agent.name}>{agent.display_name || agent.name}{agent.readOnly ? ` · ${intl.formatMessage({ id: 'agents.teamMember' }, { name: agent.teamMember })}` : ''}</SelectItem>)}
           </SelectContent>
         </Select>
         {!loaded ? <div className="space-y-3" aria-busy="true"><Skeleton className="h-16 w-full" /><Skeleton className="h-32 w-full" /></div>

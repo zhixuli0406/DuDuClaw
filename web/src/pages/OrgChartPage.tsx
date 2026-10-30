@@ -1,3 +1,5 @@
+import { useVisibleAgents } from '@/lib/data-scope';
+import { Link } from 'react-router';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -25,6 +27,8 @@ export function OrgChartPage() {
   // user to hire someone when the real problem was the connection.
   const { agents, fetchAgents, pauseAgent, resumeAgent, loading, loaded, error, clearError } =
     useAgentsStore();
+  const visibleAgents = useVisibleAgents();
+  const teamAgents = visibleAgents.filter(a => a.readOnly);
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null);
   const { setPanel, clearPanel, setSheetOpen } = usePanel();
 
@@ -89,13 +93,14 @@ export function OrgChartPage() {
       <CollectionPageHeader
         icon={Users}
         title={intl.formatMessage({ id: 'nav.org' })}
-        count={agents.length}
+        count={visibleAgents.length}
         description={intl.formatMessage({ id: 'nav.org.desc' })}
       />
 
       {/* Team page = the org chart itself. The immersive world lives at its own
           /world entry (Sidebar), so this page no longer duplicates it as a tab. */}
       <div className="mx-auto w-full max-w-6xl p-6">
+        {teamAgents.length > 0 && <ul className="mb-4 space-y-2">{teamAgents.map(a => <li key={a.name} className="text-sm"><Link className="text-brand hover:underline" to={`/runs?agent=${encodeURIComponent(a.name)}`}>{a.display_name}</Link><span className="ml-2 text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span></li>)}</ul>}
         {!loaded && loading ? (
           <CollectionPageState state="loading" />
         ) : error != null && agents.length === 0 ? (
@@ -107,9 +112,9 @@ export function OrgChartPage() {
               void fetchAgents();
             }}
           />
-        ) : agents.length === 0 ? (
+        ) : visibleAgents.length === 0 ? (
           <CollectionPageState state="empty" icon={Users} title={intl.formatMessage({ id: 'agents.empty' })} />
-        ) : (
+        ) : agents.length > 0 ? (
           <Card className="gap-0 p-2">
             <OrgChart
               agents={agents}
@@ -122,7 +127,7 @@ export function OrgChartPage() {
               }}
             />
           </Card>
-        )}
+        ) : null}
       </div>
     </div>
   );

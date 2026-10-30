@@ -37,7 +37,7 @@ Rights that come through a report stop at Operator, never Owner:
 | Task board listing for the employee | ✅ | ✅ | ✅ | ✅ | ✅ when work may be handed over; cards only (title, status), no content | — | — |
 | Memory, conversation history, employee settings and persona files | ✅ | by binding level | by binding level | by binding level | ❌ | — | — |
 
-When the report's binding is Viewer, the manager may only chat with that employee. The **AI staff** page and the employee settings pages still list direct bindings only.
+The sidebar, **AI staff**, Timeline and Runs also list team employees for Managers, labelled as a team member's AI employee. This includes Viewer-derived team grants. These entries are read-only: Timeline shows work cards and timing; Runs shows status and timing without private conversation text or tool steps. Memory, settings and persona pages explain that a direct binding is required. `agents.list` remains direct-only because its result includes model and budget data; team names come from `agents.callable` entries with `via: "team"`. Team grants remain capped at Operator.
 
 Pausing or resuming an employee requires both the Manager role and a direct Operator or Owner binding; Admins retain full access. The gateway re-reads the account role and binding from `users.db` before writing. Missing or unknown employee ids and unreadable permissions are refused.
 

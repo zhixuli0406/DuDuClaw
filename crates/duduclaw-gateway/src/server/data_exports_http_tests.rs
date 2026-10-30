@@ -263,6 +263,47 @@ async fn http_get(router: &Router, uri: &str, token: Option<&str>) -> axum::resp
 }
 
 #[tokio::test]
+async fn file_http_unbinding_revokes_header_and_query_tokens_immediately() {
+    let fixture = fixture().await;
+    let employee = fixture.state.user_db.create_user(
+        "file-reader@test.invalid",
+        "File reader",
+        PASSWORD,
+        UserRole::Employee,
+    ).unwrap();
+    fixture.state.user_db.bind_agent(
+        &employee.id, AGENT, duduclaw_auth::AccessLevel::Operator,
+    ).unwrap();
+    let bindings: Vec<_> = fixture.state.user_db.get_user_agents(&employee.id).unwrap()
+        .into_iter().map(|binding| (binding.agent_name, binding.access_level)).collect();
+    let token = fixture.state.jwt_config.issue_access_token(&employee, &bindings).unwrap();
+    let router = Router::new()
+        .route("/api/files", get(handle_files_list))
+        .route("/api/files/download", get(handle_files_download))
+        .route("/api/files/preview", get(handle_files_preview))
+        .with_state(fixture.state.clone());
+    let list_url = format!("/api/files?agent={AGENT}");
+    assert_eq!(http_get(&router, &list_url, Some(&token)).await.status(), StatusCode::OK);
+    // Browser links use a query token; it must resolve the same live authority.
+    let headers = axum::http::HeaderMap::new();
+    assert!(authorize_file_access(&fixture.state, &headers, Some(&token), Some(AGENT)).is_ok());
+
+    fixture.state.user_db.unbind_agent(&employee.id, AGENT).unwrap();
+    // Reuse the exact JWT issued before removal, without refreshing or logging in.
+    assert_eq!(http_get(&router, &list_url, Some(&token)).await.status(), StatusCode::FORBIDDEN);
+    for route in ["download", "preview"] {
+        let url = format!("/api/files/{route}?agent={AGENT}&name=example.txt");
+        assert_eq!(http_get(&router, &url, Some(&token)).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(http_get(&router, &format!("{url}&token={token}"), None).await.status(), StatusCode::FORBIDDEN);
+    }
+
+    // A corrupt authority store must not restore bindings from that JWT.
+    let raw = Connection::open(fixture.state.home_dir.join("users.db")).unwrap();
+    raw.execute_batch("DROP TABLE user_agent_bindings").unwrap();
+    assert_eq!(http_get(&router, &list_url, Some(&token)).await.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn export_http_requires_bearer_owner_and_current_role_and_returns_native_files() {
     let fixture = fixture().await;
     let router = download_router(fixture.state.clone());

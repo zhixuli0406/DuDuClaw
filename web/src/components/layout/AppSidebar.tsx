@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
@@ -228,7 +229,7 @@ function StaffZone({
   onToggle: () => void;
 }) {
   const intl = useIntl();
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents();
   const navClass = useNavClass(collapsed);
 
   const shown = useMemo(() => {
@@ -246,7 +247,7 @@ function StaffZone({
             <SidebarMenuItem key={a.name}>
               <NavLink
                 to={`/agents/${encodeURIComponent(a.name)}`}
-                title={a.display_name}
+                title={a.readOnly ? intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember }) : a.display_name}
                 className={navClass}
               >
                 <ActorAvatar
@@ -295,7 +296,7 @@ function StaffZone({
                     showStatusDot
                     status={AGENT_STATUS_DOT[a.status] ?? 'offline'}
                   />
-                  <span className="min-w-0 flex-1 truncate">{a.display_name}</span>
+                  <span className="min-w-0 flex-1 truncate">{a.display_name}{a.readOnly && <span className="block text-[10px] text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span>}</span>
                 </NavLink>
               </SidebarMenuItem>
             ))
@@ -484,7 +485,7 @@ export function AppSidebar() {
   const connectionState = useConnectionStore((s) => s.state);
   const inboxCount = useApprovalsStore(selectInboxCount);
   const fetchInboxCount = useApprovalsStore((s) => s.fetchCount);
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents();
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const theme = useThemeStore((s) => s.theme);
   const cycleTheme = useThemeStore((s) => s.cycleTheme);
@@ -499,7 +500,7 @@ export function AppSidebar() {
     fetchAgents();
     const interval = setInterval(fetchInboxCount, 60_000);
     return () => clearInterval(interval);
-  }, [connectionState, fetchInboxCount, fetchAgents]);
+  }, [connectionState, fetchInboxCount, fetchAgents, user?.id, user?.role]);
 
   const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
   // WP-C: `/device` is admin-only server-side too, so only probe for admins —

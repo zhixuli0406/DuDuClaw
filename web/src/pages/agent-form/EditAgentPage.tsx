@@ -220,6 +220,18 @@ const DEFAULT_ODOO_FORM: OdooFormState = {
  * overwritten. Admin-only fields are disabled and never sent for non-admins.
  */
 export function EditAgentPage() {
+  const intl = useIntl();
+  const { id } = useParams();
+  const user = useAuthStore(s => s.user);
+  const bindings = useAuthStore(s => s.bindings);
+  // Team access is display-only; do not mount editors or memory loaders.
+  if (user?.role === 'manager' && !bindings.some(b => b.agent_name === id)) {
+    return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
+  }
+  return <EditAgentPageContent />;
+}
+
+function EditAgentPageContent() {
   const policy = useProductPolicy();
   const intl = useIntl();
   const errorText = useErrorMessage();

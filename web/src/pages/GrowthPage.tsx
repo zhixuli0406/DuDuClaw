@@ -1,3 +1,5 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { HelpCircle, TrendingUp, Bot, CircleCheckBig, BookOpen, Wand2, Repeat, Wand } from 'lucide-react';
@@ -158,6 +160,7 @@ function DailyReportArchive() {
  * `growth.daily_report` — the front end never invents XP or unlock state.
  */
 export function GrowthPage() {
+  const canReadReport = hasMinRole(useAuthStore(s => s.user?.role), 'manager');
   const intl = useIntl();
   const snapshot = useGrowthStore((s) => s.snapshot);
   const loaded = useGrowthStore((s) => s.loaded);
@@ -291,7 +294,7 @@ export function GrowthPage() {
         )}
 
         {/* Daily report archive (last 7 days). */}
-        {authed && <DailyReportArchive />}
+        {authed && canReadReport && <DailyReportArchive />}
       </div>
     </div>
   );

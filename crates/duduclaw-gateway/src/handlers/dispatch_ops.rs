@@ -223,7 +223,10 @@ impl MethodHandler {
 
             // ── Growth / gamification (login-readable; V10-T10.0) ───
             "growth.snapshot" => self.handle_growth_snapshot().await,
-            "growth.daily_report" => self.handle_growth_daily_report(params).await,
+            "growth.daily_report" => {
+                require_manager!();
+                self.handle_growth_daily_report(params).await
+            },
 
             // Fixed product and upstream attribution.
             "about.get" => self.handle_about_get().await,
@@ -263,7 +266,10 @@ impl MethodHandler {
             }
 
             // ── Billing ──────────────────────────────────────
-            "billing.usage" => self.handle_billing_usage().await,
+            "billing.usage" => {
+                require_manager!();
+                self.handle_billing_usage().await
+            },
             "billing.history" | "billing.plan" => WsFrame::error_response(
                 "",
                 "Billing features are not available in the current edition",

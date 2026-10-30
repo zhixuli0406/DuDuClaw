@@ -352,10 +352,10 @@ impl MethodHandler {
             }
 
             // ── Shared Wiki ─────────────────────────────────
-            "shared_wiki.pages" => self.handle_shared_wiki_pages().await,
-            "shared_wiki.read" => self.handle_shared_wiki_read(params).await,
-            "shared_wiki.search" => self.handle_shared_wiki_search(params).await,
-            "shared_wiki.stats" => self.handle_shared_wiki_stats().await,
+            "shared_wiki.pages" => self.handle_shared_wiki_pages(ctx).await,
+            "shared_wiki.read" => self.handle_shared_wiki_read(params, ctx).await,
+            "shared_wiki.search" => self.handle_shared_wiki_search(params, ctx).await,
+            "shared_wiki.stats" => self.handle_shared_wiki_stats(ctx).await,
 
             // ── I-5: cross-source content search (⌘K backend) ──
             // Aggregates conversations / artifacts / memory / wiki behind one
@@ -496,7 +496,10 @@ impl MethodHandler {
                 self.handle_system_doctor_repair().await
             }
             "models.list" => self.handle_models_list().await,
-            "models.refresh" => self.handle_models_refresh().await,
+            "models.refresh" => {
+                require_manager!();
+                self.handle_models_refresh().await
+            },
 
             // ── Local-model marketplace (design doc: DESIGN-local-model-
             //    marketplace-2026-08-13). Reads for any logged-in user;
