@@ -11,6 +11,7 @@ pub struct Doc {
     /// Path relative to the import root, `/`-separated (report + lineage).
     pub source: String,
     pub text: String,
+    pub masked_values: usize,
 }
 
 impl Doc {
@@ -18,6 +19,7 @@ impl Doc {
         Doc {
             source: source.into(),
             text: text.into(),
+            masked_values: 0,
         }
     }
 }

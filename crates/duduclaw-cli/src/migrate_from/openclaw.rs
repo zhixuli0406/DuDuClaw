@@ -213,11 +213,12 @@ pub(super) async fn migrate_with_home(
         }
     };
 
-    let profile_drafts: Vec<_> = cfg.agents.iter().map(|spec| {
+    let mut profile_drafts: Vec<_> = cfg.agents.iter().map(|spec| {
         let ws = workspace_dir(&src, spec, cfg.agents.len() == 1);
         crate::expert::agent_config::adapters::read_workspace(
             &ws, &src, &spec.id, &mut Vec::new(), &mut Vec::new())
     }).collect();
+    for draft in &mut profile_drafts { crate::expert::agent_config::credentials::sanitize_draft(draft)?; }
     review_profiles(ctx, &mut report, &profile_drafts)?;
 
     // ── API keys: ANTHROPIC from env section + .env; others → SKIPPED hint ──

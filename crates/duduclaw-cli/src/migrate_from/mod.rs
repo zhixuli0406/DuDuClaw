@@ -438,7 +438,7 @@ pub(super) fn sanitize_agent_id(raw: &str) -> String {
 /// Require human review before any migration side effects.
 fn review_profiles(ctx: &Ctx, report: &mut Report, agents: &[crate::expert::agent_config::ir::AgentDraft]) -> Result<()> {
     use crate::expert::agent_config::preview::{sections, digest};
-    let preview = sections(agents);
+    let preview = sections(agents)?;
     let hash = digest(&preview);
     report.profile_preview = preview.clone();
     report.profile_confirmation = Some(hash.clone());

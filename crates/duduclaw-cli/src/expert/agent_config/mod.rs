@@ -20,6 +20,7 @@
 //! from openclaw|hermes` ([`slots`], [`adapters::read_workspace`]).
 
 pub mod adapters;
+pub(crate) mod credentials;
 pub mod detect;
 pub mod ir;
 pub mod md;

@@ -189,9 +189,16 @@ fn rejected(input: &SaveInput, findings: &[verdict::RuleFinding]) -> Value {
 
 /// Run the pipeline. `Err` = a request the caller must not retry as is
 /// (permission, a stale or mismatched confirm record, a missing reason).
-pub(crate) async fn save(c: &Caller<'_>, input: SaveInput) -> Result<Value, String> {
+pub(crate) async fn save(c: &Caller<'_>, mut input: SaveInput) -> Result<Value, String> {
     if !input.key.text_editable() {
         return Err("基本設定請在員工的編輯頁修改".into());
+    }
+    if input.key == FileKey::User {
+        if input.content.len() > input.key.max_bytes() || input.content.chars().count() > super::MAX_USER_CHARS {
+            return Err("服務對象介紹超過大小限制".into());
+        }
+        input.content = duduclaw_security::credential_detect::mask_document(&input.content)
+            .map_err(|_| "憑證掃描失敗，未寫入 USER.md".to_string())?;
     }
     let path = super::file_path(c.home, &input.agent_id, &input.key)?;
     let current = super::read_or_empty(&path)?;

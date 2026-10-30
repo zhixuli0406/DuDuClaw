@@ -193,6 +193,27 @@ the suspected secret. A successful export records an audit event. Credential
 shape detection does not prove that arbitrary prose contains no sensitive data;
 the human choosing what to export remains responsible for its content.
 
+## Credential handling / 憑證處理 / 認証情報の扱い
+
+Imported prompt-bearing documents, including SOUL, IDENTITY, USER, INSTRUCTIONS,
+Contract, memory, knowledge and skill text, pass through the shared credential
+masker before preview or resolved installation planning. Each profile section's
+`input_guard` entry reports `masked_values` without exposing values. Preview,
+report, confirmation digest and installed files use the same masked document
+bytes; retained UTF-8 source copies are masked too. Re-previewing unchanged input
+produces the same digest. Text scanning is bounded to 512 KiB per imported text
+file; a scan failure or an oversized text file refuses the import with a
+value-free error. Secret-shaped structured settings are refused by field path
+(such as `duduclaw.model.preferred`), never rewritten. Credential-bearing metadata
+is also refused. Dashboard and external/MCP `user` writes mask USER.md before
+review, hashing, version history and baseline acceptance. Size limits apply
+before and after masking. This does not scrub existing files, history or backups,
+and credential detection does not identify every kind of private information.
+
+匯入的提示文件（包含 SOUL、IDENTITY、USER、INSTRUCTIONS、Contract、記憶、知識與技能文字）會先經過共用憑證遮罩，再產生預覽或解析安裝計畫。各設定檔區段的 `input_guard` 以 `masked_values` 顯示遮罩數量，不顯示原值。預覽、報告、確認摘要與安裝檔案使用相同的遮罩文件位元組；保留的 UTF-8 來源副本也會遮罩。來源未變更時，重新預覽的確認摘要相同。每個匯入文字檔的掃描上限為 512 KiB；掃描失敗或文字超限時，以不含原值的錯誤拒絕匯入。結構化設定若含疑似憑證，會指出欄位路徑（例如 `duduclaw.model.preferred`）並拒絕，不會改寫設定值；中繼資料若含憑證也會拒絕。儀表板與外部／MCP 的 `user` 寫入，在審查、雜湊、版本保存與接受基準前先遮罩 USER.md；遮罩前後都檢查大小限制。此變更不會回溯清除既有檔案、歷史或備份，憑證偵測也無法辨識所有私人資訊。
+
+取り込むプロンプト文書（SOUL、IDENTITY、USER、INSTRUCTIONS、Contract、記憶、知識、スキルのテキスト）は、プレビューや確定したインストール計画を作る前に共通の認証情報マスクを通します。各プロファイルセクションの `input_guard` は `masked_values` で件数だけを示し、元の値を表示しません。プレビュー、レポート、確認ダイジェスト、インストール先は同じマスク済み文書のバイト列を使用し、保存する UTF-8 ソースのコピーもマスクします。入力が同じなら再プレビューのダイジェストも同じです。取り込むテキストはファイルごとに 512 KiB まで検査し、検査失敗や上限超過では値を含まないエラーで取り込みを拒否します。構造化設定の認証情報は書き換えず、`duduclaw.model.preferred` などのフィールドパスを示して拒否します。認証情報を含むメタデータも拒否します。ダッシュボードと外部／MCP の `user` 書き込みでは、審査、ハッシュ計算、履歴保存、基準の承認より前に USER.md をマスクし、マスク前後にサイズ制限を確認します。既存ファイル、履歴、バックアップの遡及削除は行いません。また、認証情報検出がすべての個人情報を識別するわけではありません。
+
 ## Runtime prompt order
 
 The shared profile loader supplies sections; each builder preserves its existing

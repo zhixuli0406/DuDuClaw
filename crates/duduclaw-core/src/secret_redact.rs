@@ -49,10 +49,16 @@ pub fn mask_secret(s: &str) -> String {
 /// Returns `Cow::Borrowed` when nothing matched, so the overwhelmingly common
 /// "no secret in this message" case allocates nothing.
 pub fn redact_secrets(input: &str) -> Cow<'_, str> {
+    redact_secrets_with_count(input).0
+}
+
+/// Return the redacted text and the number of credential values replaced.
+pub fn redact_secrets_with_count(input: &str) -> (Cow<'_, str>, usize) {
     if input.is_empty() {
-        return Cow::Borrowed(input);
+        return (Cow::Borrowed(input), 0);
     }
 
+    let mut count = 0;
     let mut out = String::new();
     let mut changed = false;
     let mut word_start: Option<usize> = None;
@@ -65,7 +71,7 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
         if is_delim(c) {
             if let Some(s) = word_start.take() {
                 let w = &input[s..i];
-                push_word(&mut out, input, s, w, prev_word, &mut changed);
+                push_word(&mut out, input, s, w, prev_word, &mut changed, &mut count);
                 prev_word = Some(w);
             }
             if changed {
@@ -77,13 +83,13 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
     }
     if let Some(s) = word_start {
         let w = &input[s..];
-        push_word(&mut out, input, s, w, prev_word, &mut changed);
+        push_word(&mut out, input, s, w, prev_word, &mut changed, &mut count);
     }
 
     if changed {
-        Cow::Owned(out)
+        (Cow::Owned(out), count)
     } else {
-        Cow::Borrowed(input)
+        (Cow::Borrowed(input), 0)
     }
 }
 
@@ -104,8 +110,9 @@ fn push_word(
     word: &str,
     prev_word: Option<&str>,
     changed: &mut bool,
+    count: &mut usize,
 ) {
-    let redacted = redact_word(word, prev_word);
+    let redacted = redact_word(word, prev_word, count);
     match redacted {
         Cow::Borrowed(_) if !*changed => {}
         Cow::Borrowed(w) => out.push_str(w),
@@ -142,10 +149,10 @@ fn looks_like_opaque_credential(w: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/' | '='))
 }
 
-fn redact_word<'a>(word: &'a str, prev_word: Option<&str>) -> Cow<'a, str> {
+fn redact_word<'a>(word: &'a str, prev_word: Option<&str>, count: &mut usize) -> Cow<'a, str> {
     // 1. Anything URL-shaped: mask secret path segments + sensitive query params.
     if word.contains("://") {
-        return mask_url(word);
+        return mask_url(word, count);
     }
 
     // 2. `Bearer <tok>` / `token <tok>` pairs — keyword AND credential shape.
@@ -155,23 +162,31 @@ fn redact_word<'a>(word: &'a str, prev_word: Option<&str>) -> Cow<'a, str> {
             .trim_end_matches('=')
             .to_ascii_lowercase();
         if AUTH_KEYWORDS.contains(&key.as_str()) && looks_like_opaque_credential(word) {
-            return Cow::Owned(mask_secret(word));
+            let masked = mask_secret(word);
+            *count += usize::from(masked != word);
+            return Cow::Owned(masked);
         }
     }
 
     // 3. A bare Telegram bot token pasted into a message.
     if split_telegram_token(word).is_some() {
-        return Cow::Owned(mask_telegram_token(word));
+        let masked = mask_telegram_token(word);
+        *count += usize::from(masked != word);
+        return Cow::Owned(masked);
     }
 
     // 4. Vendor-prefixed credentials (Slack / GitHub / Anthropic / Meta / …).
     if has_secret_prefix(word) {
-        return Cow::Owned(mask_secret(word));
+        let masked = mask_secret(word);
+        *count += usize::from(masked != word);
+        return Cow::Owned(masked);
     }
 
     // 5. Three-segment base64 credentials (Discord bot tokens, JWTs).
     if is_dotted_token_shape(word) {
-        return Cow::Owned(mask_secret(word));
+        let masked = mask_secret(word);
+        *count += usize::from(masked != word);
+        return Cow::Owned(masked);
     }
 
     Cow::Borrowed(word)
@@ -225,7 +240,7 @@ fn is_sensitive_param(name: &str) -> bool {
         .any(|w| SENSITIVE_PARAM_WORDS.contains(&w))
 }
 
-fn mask_url(url: &str) -> Cow<'_, str> {
+fn mask_url<'a>(url: &'a str, count: &mut usize) -> Cow<'a, str> {
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),
         None => (url, None),
@@ -241,6 +256,7 @@ fn mask_url(url: &str) -> Cow<'_, str> {
         match mask_path_segment(seg) {
             Cow::Borrowed(s) => out.push_str(s),
             Cow::Owned(s) => {
+                *count += usize::from(s != seg);
                 out.push_str(&s);
                 changed = true;
             }
@@ -257,7 +273,9 @@ fn mask_url(url: &str) -> Cow<'_, str> {
                 Some((k, v)) if !v.is_empty() && is_sensitive_param(k) => {
                     out.push_str(k);
                     out.push('=');
-                    out.push_str(&mask_secret(v));
+                    let masked = mask_secret(v);
+                    *count += usize::from(masked != v);
+                    out.push_str(&masked);
                     changed = true;
                 }
                 _ => out.push_str(pair),

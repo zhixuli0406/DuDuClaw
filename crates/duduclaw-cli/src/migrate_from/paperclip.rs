@@ -346,11 +346,15 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
         }
     }
 
-    let profiles: Vec<_> = agents.iter().map(|agent| crate::expert::agent_config::ir::AgentDraft {
+    let mut profiles: Vec<_> = agents.iter().map(|agent| crate::expert::agent_config::ir::AgentDraft {
         id_hint: agent.node_id.clone(), display_name: agent.card.name.clone(),
         soul: Some(crate::expert::agent_config::ir::Doc::new("AGENTS.md", &agent.card.instructions)),
         ..Default::default()
     }).collect();
+    for (agent, profile) in agents.iter_mut().zip(&mut profiles) {
+        crate::expert::agent_config::credentials::sanitize_draft(profile)?;
+        if let Some(doc) = &profile.soul { agent.card.instructions = doc.text.clone(); }
+    }
     review_profiles(ctx, &mut report, &profiles)?;
 
     // ── COMPANY.md → shared wiki ──

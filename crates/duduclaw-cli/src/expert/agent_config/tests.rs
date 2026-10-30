@@ -526,6 +526,79 @@ async fn native_profile_requires_preview_and_round_trips_exact_bytes() {
 }
 
 #[tokio::test]
+async fn imported_password_is_masked_in_preview_report_plan_archive_and_disk() {
+    use crate::expert::agent_config::preview::digest;
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let file = src.path().join("masked.agent.md");
+    write(&file, "---\nschema: duduclaw.agent/v1\nid: masked\nname: Masked\n---\n# Persona\nHelp carefully.\n# User\npassword: hunter2\n# Rules\nAsk first.\n");
+    let preview_path = reports.path().join("preview.json");
+    crate::expert::install::cmd_install_with(home.path(), file.to_str().unwrap(), opts(true, Some(preview_path.clone()))).await.unwrap();
+    let first = report_json(&preview_path);
+    let details = &first["details"];
+    let profiles = &details["profile_preview"];
+    let effects = &details["profile_install_plan"];
+    let masked = profiles[0]["user"].as_str().unwrap();
+    assert!(masked.contains("[已遮罩的密碼]"));
+    assert!(!read(&preview_path).contains("hunter2"));
+    assert!(profiles[0]["input_guard"].as_array().unwrap().iter()
+        .any(|scan| scan["section"] == "user" && scan["masked_values"] == 1));
+    let digest_input = serde_json::json!({"version": 2, "profiles": profiles, "effects": effects});
+    assert!(!digest_input.to_string().contains("hunter2"));
+    let token = details["profile_confirmation"].as_str().unwrap();
+    assert_eq!(token, digest(&digest_input));
+    let user_hash = crate::expert::registry::sha256_hex(masked.as_bytes());
+    assert!(effects["agents"][0]["files"].as_array().unwrap().iter()
+        .any(|file| file["path"] == "agents/masked/USER.md" && file["sha256"] == user_hash));
+    crate::expert::install::cmd_install_with(home.path(), file.to_str().unwrap(), opts(true, Some(preview_path.clone()))).await.unwrap();
+    assert_eq!(first["details"], report_json(&preview_path)["details"]);
+    let mut install_opts = opts(false, Some(reports.path().join("installed.json")));
+    install_opts.confirm_profile = Some(token.to_string());
+    crate::expert::install::cmd_install_with(home.path(), file.to_str().unwrap(), install_opts).await.unwrap();
+    assert_eq!(read(&home.path().join("agents/masked/USER.md")), masked);
+    assert!(!read(&reports.path().join("installed.json")).contains("hunter2"));
+    fn check_files(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { check_files(&path); }
+            else { assert!(!std::fs::read(path).unwrap().windows(7).any(|bytes| bytes == b"hunter2")); }
+        }
+    }
+    check_files(home.path());
+}
+
+#[tokio::test]
+async fn credential_in_duduclaw_settings_is_refused_before_preview_or_writes() {
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let file = src.path().join("settings.agent.md");
+    write(&file, "---\nschema: duduclaw.agent/v1\nid: settings\nname: Settings\nduduclaw:\n  model:\n    preferred: 'password: hunter2'\n---\n# Persona\nHelp carefully.\n");
+    let report_path = src.path().join("report.json");
+    let error = crate::expert::install::cmd_install_with(home.path(), file.to_str().unwrap(), opts(true, Some(report_path.clone()))).await.unwrap_err().to_string();
+    assert!(error.contains("duduclaw.model.preferred"));
+    assert!(!error.contains("hunter2"));
+    assert!(!read(&report_path).contains("hunter2"));
+    assert!(report_json(&report_path)["details"]["profile_preview"].is_null());
+    assert!(!home.path().join("agents").exists());
+}
+
+#[tokio::test]
+async fn unavailable_document_scan_refuses_import_without_preview_or_writes() {
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let ws = src.path().join("scan-failure");
+    write(&ws.join("SOUL.md"), "Help carefully.");
+    // The scanner's reserved failure marker is not a usable masked document.
+    write(&ws.join("USER.md"), duduclaw_security::credential_detect::UNAVAILABLE_MASK);
+    let report_path = src.path().join("report.json");
+    let error = crate::expert::install::cmd_install_with(home.path(), ws.to_str().unwrap(), opts(true, Some(report_path.clone()))).await.unwrap_err().to_string();
+    assert!(error.contains("憑證掃描失敗"));
+    assert!(report_json(&report_path)["details"]["profile_preview"].is_null());
+    assert!(!home.path().join("agents").exists());
+}
+
+#[tokio::test]
 async fn invalid_native_id_never_joins_an_employee_path() {
     let home = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();

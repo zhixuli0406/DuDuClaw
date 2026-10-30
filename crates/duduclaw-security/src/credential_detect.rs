@@ -253,11 +253,18 @@ pub fn mask(text: &str) -> String {
 
 /// Mask a complete document. The caller must enforce its own size bound.
 pub fn mask_document(text: &str) -> Result<String, DetectError> {
+    mask_document_with_count(text).map(|(masked, _)| masked)
+}
+
+/// The same document mask, with a value-free replacement count for previews.
+pub fn mask_document_with_count(text: &str) -> Result<(String, usize), DetectError> {
     guarded_detect(|| {
         let findings = detect_inner(text, text.len())?;
         let masked = mask_with_ids_limit(text, &findings, &[], text.len());
         if masked == UNAVAILABLE_MASK { return Err(DetectError); }
-        Ok(duduclaw_core::secret_redact::redact_secrets(&masked).into_owned())
+        let (redacted, extra) = duduclaw_core::secret_redact::redact_secrets_with_count(&masked);
+        let count = findings.iter().filter(|finding| text.get(finding.span.clone()) != Some("[已遮罩的密碼]")).count();
+        Ok((redacted.into_owned(), count + extra))
     })
 }
 
@@ -274,6 +281,17 @@ fn mask_detected(text: &str, detected: Result<Vec<Finding>, DetectError>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_count_includes_context_and_url_values_and_matches_document_mask() {
+        let raw = "password: hunter2\nhttps://example.test/?client_secret=synthetic-test-value&session=other-test-value";
+        let (masked, count) = mask_document_with_count(raw).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(masked, mask_document(raw).unwrap());
+        for secret in ["hunter2", "synthetic-test-value", "other-test-value"] {
+            assert!(!masked.contains(secret));
+        }
+    }
 
     #[test]
     fn english_and_traditional_chinese_contexts() {

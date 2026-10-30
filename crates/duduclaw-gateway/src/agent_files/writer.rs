@@ -151,6 +151,15 @@ pub(crate) fn commit_locked(
             Ok(n) => n,
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
         };
+        let new = if c.key == FileKey::User {
+            if new.len() > c.key.max_bytes() || new.chars().count() > super::MAX_USER_CHARS {
+                return Ok(Locked::Err(CommitError::Refused("服務對象介紹超過大小限制".into())));
+            }
+            match duduclaw_security::credential_detect::mask_document(&new) {
+                Ok(masked) => masked,
+                Err(_) => return Ok(Locked::Err(CommitError::Refused("憑證掃描失敗，未寫入 USER.md".into()))),
+            }
+        } else { new };
         let hash = super::hash_of(&new);
         let accept_current = new == current && c.baseline == Baseline::AcceptCurrent && c.key.protected_doc().is_some();
         if existed && new == current && !accept_current {

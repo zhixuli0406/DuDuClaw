@@ -67,10 +67,11 @@ fn is_known_tool(t: &str) -> bool {
 
 pub async fn install(
     ctx: &InstallCtx,
-    bundle: ImportBundle,
+    mut bundle: ImportBundle,
     root: &Path,
     report: &mut Report,
 ) -> Result<InstallRecord> {
+    super::credentials::sanitize_bundle(&mut bundle)?;
     report.imported("format", &bundle.format_label);
     report.tag("format.detected", json!({ "format": bundle.format_code }));
     for w in &bundle.warnings {
@@ -205,6 +206,9 @@ fn plan_agent(
     source: &AgentDraft, id: &str, parent: &str, format: &str, slug: &str, stage: &Path,
     book: &mut NameBook, report: &mut Report,
 ) -> Result<AgentPlan> {
+    let mut source = source.clone();
+    super::credentials::sanitize_draft(&mut source)?;
+    let source = &source;
     if format == "duduclaw" {
         duduclaw_core::agent_profile::validate_settings(&source.settings).map_err(|e| cfg_err(e.to_string()))?;
     }
@@ -254,8 +258,29 @@ fn plan_agent(
     let mut skills = Vec::new();
     let mut skill_effects = Vec::new();
     let mut taken = BTreeSet::new();
-    for skill in &draft.skills {
-        let mut prepared = super::skills::prepare(skill, &stage.join(id), format, &mut taken);
+    for (index, skill) in draft.skills.iter().enumerate() {
+        // Prepare from an owned masked snapshot, so normalization never stages raw secrets.
+        let mut dropped = Vec::new();
+        let input_files = snapshot_tree_filtered(&skill.dir, true, &mut dropped)?;
+        let folder = skill.dir.file_name().ok_or_else(|| cfg_err("技能目錄名稱無效".into()))?;
+        let input_dir = stage.join(id).join("inputs").join(index.to_string()).join(folder);
+        for (rel, bytes) in &input_files {
+            let path = input_dir.join(rel);
+            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| cfg_err(e.to_string()))?; }
+            std::fs::write(&path, bytes).map_err(|e| cfg_err(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::symlink_metadata(skill.dir.join(rel)).map_err(|e| cfg_err(e.to_string()))?;
+                if !meta.is_file() { return Err(cfg_err("技能來源已變更".into())); }
+                let mode = if meta.permissions().mode() & 0o111 != 0 { 0o700 } else { 0o600 };
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|e| cfg_err(e.to_string()))?;
+            }
+        }
+        let mut masked_skill = skill.clone();
+        masked_skill.dir = input_dir;
+        let mut prepared = super::skills::prepare(&masked_skill, &stage.join(id).join("prepared"), format, &mut taken);
+        prepared.dropped.extend(dropped);
         if matches!(prepared.verdict, super::skills::Verdict::Enable)
             && files.keys().any(|file| file.starts_with(&format!("SKILLS/{}/", prepared.name))) {
             prepared.verdict = super::skills::Verdict::Blocked("與內建技能同名，未覆蓋".into());
@@ -295,7 +320,14 @@ fn read_plan_file(path: &Path, expected: u64) -> Result<Vec<u8>> {
 }
 
 fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut u64) -> Result<()> {
+    snapshot_tree_filtered(root, false, &mut Vec::new())
+}
+
+fn snapshot_tree_filtered(root: &Path, skip_private: bool, dropped: &mut Vec<String>) -> Result<BTreeMap<String, Vec<u8>>> {
+    fn walk(
+        root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut u64,
+        skip_private: bool, dropped: &mut Vec<String>,
+    ) -> Result<()> {
         for entry in std::fs::read_dir(dir).map_err(|e| cfg_err(e.to_string()))? {
             let entry = entry.map_err(|e| cfg_err(e.to_string()))?;
             let name = entry.file_name();
@@ -304,19 +336,28 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
             }
             let path = entry.path();
             let meta = std::fs::symlink_metadata(&path).map_err(|e| cfg_err(e.to_string()))?;
-            if meta.is_dir() { walk(root, &path, files, total)?; }
+            let name = name.to_str().ok_or_else(|| cfg_err("安裝計畫檔名不是 UTF-8".into()))?;
+            if skip_private && (meta.file_type().is_symlink() || name.starts_with('.')
+                || super::adapters::is_secret_file(name)
+                || (meta.is_dir() && super::adapters::is_secret_dir(name))) {
+                let rel = path.strip_prefix(root).map_err(|e| cfg_err(e.to_string()))?.to_str()
+                    .ok_or_else(|| cfg_err("安裝計畫路徑不是 UTF-8".into()))?.replace('\\', "/");
+                dropped.push(rel);
+                continue;
+            }
+            if meta.is_dir() { walk(root, &path, files, total, skip_private, dropped)?; }
             else if meta.is_file() {
                 *total = total.saturating_add(meta.len());
                 if *total > crate::expert::safe_zip::MAX_UNPACK_BYTES || files.len() >= 10_000 { return Err(cfg_err("安裝計畫超過大小限制".into())); }
                 let rel = path.strip_prefix(root).map_err(|e| cfg_err(e.to_string()))?.to_str()
                     .ok_or_else(|| cfg_err("安裝計畫路徑不是 UTF-8".into()))?.replace('\\', "/");
-                files.insert(rel, read_plan_file(&path, meta.len())?);
+                files.insert(rel, super::credentials::mask_bytes(read_plan_file(&path, meta.len())?)?);
             } else { return Err(cfg_err("安裝計畫不接受連結或特殊檔案".into())); }
         }
         Ok(())
     }
     let mut files = BTreeMap::new();
-    walk(root, root, &mut files, &mut 0)?;
+    walk(root, root, &mut files, &mut 0, skip_private, dropped)?;
     Ok(files)
 }
 
@@ -344,7 +385,9 @@ fn plan_archive(root: &Path, bundle: &ImportBundle) -> Result<BTreeMap<String, V
         if !meta.is_file() { return Err(cfg_err("原始檔不是一般檔案".into())); }
         total = total.saturating_add(meta.len());
         if total > crate::expert::safe_zip::MAX_UNPACK_BYTES { return Err(cfg_err("原始檔超過備份上限".into())); }
-        files.insert(rel.clone(), read_plan_file(&root.join(rel), meta.len())?);
+        let bytes = read_plan_file(&root.join(&rel), meta.len())?;
+        let bytes = super::credentials::mask_bytes(bytes)?;
+        files.insert(rel.clone(), bytes);
     }
     Ok(files)
 }
@@ -702,6 +745,35 @@ mod tests {
         assert!(std::str::from_utf8(&plan.skills[0].1["SKILL.md"]).unwrap().contains("Original body"));
         assert!(plan.files.contains_key(".mcp.json"));
         assert!(plan.files.contains_key("SKILLS/code-review/SKILL.md"));
+    }
+
+    #[test]
+    fn skill_inputs_are_masked_before_staging_and_private_files_are_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let skill = src.path().join("helper");
+        std::fs::create_dir_all(skill.join("refs")).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: helper\ndescription: Help\n---\npassword: hunter2").unwrap();
+        std::fs::write(skill.join("refs/guide.md"), "password: hunter2").unwrap();
+        // Reading this private file through the masker would refuse the plan.
+        std::fs::write(skill.join(".env"), duduclaw_security::credential_detect::UNAVAILABLE_MASK).unwrap();
+        let source = AgentDraft { id_hint: "worker".into(), display_name: "Worker".into(),
+            skills: vec![super::super::ir::SkillDraft { dir: skill, name_hint: "helper".into(),
+                label: None, version: None, source: "helper".into() }], ..Default::default() };
+        let stage = tempfile::tempdir().unwrap();
+        let plan = plan_agent(&source, "worker", "", "claude-subagent", "team", stage.path(),
+            &mut NameBook::load(home.path()), &mut Report::default()).unwrap();
+        let (prepared, files) = &plan.skills[0];
+        assert!(prepared.dropped.iter().any(|path| path == ".env"));
+        assert!(!files.contains_key(".env"));
+        for file in ["SKILL.md", "refs/guide.md"] {
+            let text = std::str::from_utf8(&files[file]).unwrap();
+            assert!(!text.contains("hunter2"));
+            assert!(text.contains("[已遮罩的密碼]"));
+        }
+        let staged = std::fs::read_to_string(stage.path().join("worker/inputs/0/helper/SKILL.md")).unwrap();
+        assert!(!staged.contains("hunter2"));
+        assert!(!stage.path().join("worker/inputs/0/helper/.env").exists());
     }
 
 }

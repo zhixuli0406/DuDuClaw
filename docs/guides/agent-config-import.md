@@ -76,6 +76,19 @@ A skill is not installed at all when its SKILL.md fails the content scanners or 
 
 ## Safety
 
+Imported prompt documents (SOUL, IDENTITY, USER, INSTRUCTIONS, Contract, memory,
+knowledge and skill text) are credential-masked before preview and installation
+planning. Each profile section shows `masked_values`, a count without the values.
+The report, confirmation digest and installed files use the exact masked document
+bytes; retained UTF-8 originals are masked too. Re-previewing unchanged input
+keeps the same digest. A scan failure or a text file over the 512 KiB scan limit
+refuses the import without echoing values. Structured settings containing
+credentials are refused by field path, never silently rewritten; credential-bearing
+metadata is refused too. Dashboard and external/MCP `user` writes also mask
+USER.md before review, hashes, history and baseline acceptance. Existing files,
+history and backups are not scrubbed, and arbitrary private prose may still need
+manual removal.
+
 - Persona, User, Rules and Contract are displayed with input-guard results before confirmation. A blocked section refuses the whole profile before any employee is created.
 - Credentials are never imported: `.env`, `auth.json`, `auth-profiles.json` and similar files are not read or kept, channel tokens in `openclaw.json` are ignored here, and Dify secret variables are dropped.
 - An OpenClaw workspace path that points outside the uploaded folder is not followed.

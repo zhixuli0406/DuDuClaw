@@ -409,7 +409,7 @@ async fn install_native(
             Ok(Some(super::agent_config::ir::Doc::new(file, text)))
         };
         let settings = match read_doc("agent.partial.toml")? {
-            Some(doc) => toml::from_str(&doc.text).map_err(|e| cfg_err(format!("專家包設定格式不正確：{e}")))?,
+            Some(doc) => toml::from_str(&doc.text).map_err(|_| cfg_err("專家包設定格式不正確".into()))?,
             None => toml::Table::new(),
         };
         super::agent_config::preview::reject_mcp_settings(&settings)?;
@@ -420,6 +420,9 @@ async fn install_native(
             soul: read_doc("soul.md")?, contract: read_doc("CONTRACT.toml")?,
             settings, ..Default::default()
         });
+    }
+    for profile in profiles.values_mut() {
+        super::agent_config::credentials::sanitize_draft(profile)?;
     }
     if profiles.len() != e.agents.len() {
         return Err(cfg_err("專家包含重複員工代號".into()));
@@ -896,6 +899,7 @@ fn snapshot_native_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
             }
             file.take(meta.len().saturating_add(1)).read_to_end(&mut bytes).map_err(|e| cfg_err(e.to_string()))?;
             if bytes.len() as u64 != meta.len() { return Err(cfg_err("來源檔案讀取期間變更".into())); }
+            let bytes = super::agent_config::credentials::mask_bytes(bytes)?;
             let relative = path.strip_prefix(base).map_err(|e| cfg_err(e.to_string()))?;
             let mut parts = Vec::new();
             for part in relative.components() {

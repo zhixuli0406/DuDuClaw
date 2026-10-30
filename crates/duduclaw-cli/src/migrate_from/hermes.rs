@@ -88,9 +88,10 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
         }
     }
 
-    let profile_bundle = crate::expert::agent_config::adapters::read(
+    let mut profile_bundle = crate::expert::agent_config::adapters::read(
         crate::expert::agent_config::ConfigKind::Hermes, &profile_root)
         .map_err(DuDuClawError::Config)?;
+    crate::expert::agent_config::credentials::sanitize_bundle(&mut profile_bundle)?;
     review_profiles(ctx, &mut report, &profile_bundle.agents)?;
 
     // ── config.yaml → model ──
