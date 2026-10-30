@@ -168,8 +168,8 @@ export function GrowthPage() {
   const retry = useGrowthStore((s) => s.retry);
   const authed = useConnectionStore((s) => s.state === 'authenticated');
 
-  const unlockedCount = snapshot?.achievements.filter((a) => a.unlocked).length ?? 0;
-  const totalAchievements = snapshot?.achievements.length ?? 0;
+  const unlockedCount = snapshot?.achievements?.filter((a) => a.unlocked).length ?? 0;
+  const totalAchievements = snapshot?.achievements?.length ?? 0;
   const xpPct =
     snapshot && snapshot.xp_for_next_level > 0
       ? Math.min(100, (snapshot.xp_into_level / snapshot.xp_for_next_level) * 100)
@@ -249,7 +249,7 @@ export function GrowthPage() {
                 </div>
 
                 {/* Six-fact mini grid — the datable basis for the XP score. */}
-                <div className="grid grid-cols-2 gap-3 border-t border-surface-border pt-4 sm:grid-cols-3">
+                {canReadReport && snapshot.facts && <div className="grid grid-cols-2 gap-3 border-t border-surface-border pt-4 sm:grid-cols-3">
                   {FACT_ROWS.map(({ key, icon: Icon, labelId }) => (
                     <div key={key} className="flex items-center gap-2.5">
                       <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
@@ -257,7 +257,7 @@ export function GrowthPage() {
                       </span>
                       <div className="min-w-0">
                         <p className="text-lg font-semibold leading-none tabular-nums text-foreground">
-                          {snapshot.facts[key]}
+                          {snapshot.facts?.[key]}
                         </p>
                         <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
                           {intl.formatMessage({ id: labelId })}
@@ -265,12 +265,12 @@ export function GrowthPage() {
                       </div>
                     </div>
                   ))}
-                </div>
+                </div>}
               </CardContent>
             </Card>
 
             {/* Achievement wall. */}
-            <Card>
+            {canReadReport && snapshot.achievements && <Card>
               <CardHeader>
                 <CardTitle>{intl.formatMessage({ id: 'growth.achievements.title' })}</CardTitle>
                 <CardAction>
@@ -289,7 +289,7 @@ export function GrowthPage() {
                   ))}
                 </div>
               </CardContent>
-            </Card>
+            </Card>}
           </>
         )}
 

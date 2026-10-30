@@ -107,3 +107,15 @@ describe('growth-store', () => {
     expect(useGrowthStore.getState().levelUpNonce).toBe(0);
   });
 });
+
+it('replaces full snapshots with reduced summaries and treats restored details as a baseline', () => {
+  vi.clearAllMocks();
+  useGrowthStore.setState({ snapshot: null, loaded: false, levelUpNonce: 0 });
+  useGrowthStore.getState().applySnapshot(snap());
+  const reduced = { xp: 100, level: 1, xp_into_level: 0, xp_for_next_level: 300 };
+  useGrowthStore.getState().applySnapshot(reduced);
+  useGrowthStore.getState().applySnapshot(reduced);
+  expect(useGrowthStore.getState().snapshot).toEqual(reduced);
+  useGrowthStore.getState().applySnapshot(snap({ achievements: [ach('tasks_100', true)] }));
+  expect(celebrate).not.toHaveBeenCalled();
+});

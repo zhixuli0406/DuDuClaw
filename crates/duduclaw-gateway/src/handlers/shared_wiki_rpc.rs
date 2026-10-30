@@ -9,6 +9,7 @@ pub(crate) struct SharedWikiReader {
     admin: bool,
     department: Option<String>,
     policy: duduclaw_core::DepartmentVisibilityPolicy,
+    policy_source: Option<String>,
 }
 
 impl SharedWikiReader {
@@ -22,6 +23,7 @@ impl SharedWikiReader {
                 admin: true,
                 department: None,
                 policy: duduclaw_core::DepartmentVisibilityPolicy::empty(),
+                policy_source: None,
             });
         }
         let db_path = home.join("users.db");
@@ -35,7 +37,7 @@ impl SharedWikiReader {
             |row| row.get(0),
         ).map_err(|_| ())?;
         let path = home.join("shared/wiki/.scope.toml");
-        let policy = match std::fs::read_to_string(&path) {
+        let (policy, policy_source) = match std::fs::read_to_string(&path) {
             Ok(raw) => {
                 // The agent parser is deliberately lenient. Dashboard reads
                 // fail closed if a declared visibility rule has a bad shape.
@@ -50,14 +52,27 @@ impl SharedWikiReader {
                         }
                     }
                 }
-                duduclaw_core::DepartmentVisibilityPolicy::parse(&raw).map_err(|_| ())?
+                let policy = duduclaw_core::DepartmentVisibilityPolicy::parse(&raw).map_err(|_| ())?;
+                (policy, Some(raw))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
-                duduclaw_core::DepartmentVisibilityPolicy::empty()
+                (duduclaw_core::DepartmentVisibilityPolicy::empty(), None)
             }
             Err(_) => return Err(()),
         };
-        Ok(Self { admin: false, department, policy })
+        Ok(Self { admin: false, department, policy, policy_source })
+    }
+
+    /// Refuse a response built under a different human authority or policy.
+    pub(crate) fn recheck(&self, home: &Path, ctx: &UserContext) -> Result<(), ()> {
+        let current = Self::new(home, ctx)?;
+        if self.admin != current.admin
+            || self.department != current.department
+            || self.policy_source != current.policy_source
+        {
+            return Err(());
+        }
+        Ok(())
     }
 
     pub(crate) fn page_visible(&self, path: &str) -> bool {
@@ -104,6 +119,9 @@ impl MethodHandler {
                         })
                     })
                     .collect();
+                if reader.recheck(&self.home_dir, ctx).is_err() {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 WsFrame::ok_response("", json!({ "pages": items, "exists": true }))
             }
             Err(e) => {
@@ -131,6 +149,9 @@ impl MethodHandler {
         let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
         match store.read_raw(page_path) {
             Ok(content) => {
+                if reader.recheck(&self.home_dir, ctx).is_err() {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 WsFrame::ok_response("", json!({ "content": content, "path": page_path }))
             }
             Err(e) => WsFrame::error_response("", &format!("Failed to read shared wiki page: {e}")),
@@ -191,6 +212,9 @@ impl MethodHandler {
                         })
                     })
                     .collect();
+                if reader.recheck(&self.home_dir, ctx).is_err() {
+                    return WsFrame::error_response("", "permission denied");
+                }
                 WsFrame::ok_response("", json!({ "hits": items }))
             }
             Err(e) => WsFrame::error_response("", &format!("Shared wiki search failed: {e}")),
@@ -244,6 +268,9 @@ impl MethodHandler {
             })
         });
 
+        if reader.recheck(&self.home_dir, ctx).is_err() {
+            return WsFrame::error_response("", "permission denied");
+        }
         WsFrame::ok_response(
             "",
             json!({
@@ -278,6 +305,7 @@ mod visibility_tests {
         let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
         let user = db.create_user("reader@test.invalid", "Reader", "test-password", UserRole::Employee).unwrap();
         db.set_department(&user.id, Some("sales")).unwrap();
+        db.bind_agent(&user.id, "sales", AccessLevel::Operator).unwrap();
         let ctx = UserContext {
             user_id: user.id.clone(),
             email: user.email.clone(),
@@ -295,6 +323,8 @@ mod visibility_tests {
         for path in ["company.md", "departments/sales/own.md", "departments/hr/secret.md", "legal/secret.md"] {
             store.write_page(path, "# Handbook\nhandbook content").unwrap();
         }
+        store.write_page("departments/hr/secret.md", "# HR confidential handbook\nconfidential HR-only-snippet").unwrap();
+        store.write_page("legal/secret.md", "# Legal confidential handbook\nconfidential legal-only-snippet").unwrap();
         std::fs::write(home.path().join("shared/wiki/.scope.toml"), "[namespaces.legal]\nvisible_to_departments = [\"hr\"]\n").unwrap();
 
         let list = payload(handler.handle("shared_wiki.pages", json!({}), &ctx).await);
@@ -312,8 +342,23 @@ mod visibility_tests {
         assert!(stats["by_directory"].get("departments/hr").is_none());
         payload(handler.handle("shared_wiki.read", json!({"page_path": "departments/sales/own.md"}), &ctx).await);
 
+        let query = json!({"agent_id": "sales", "sources": ["wiki"], "q": "handbook", "limit": 2});
+        let found = payload(handler.handle("search.query", query.clone(), &ctx).await);
+        assert_eq!(found["hits"].as_array().unwrap().len(), 2);
+        let serialized = found.to_string();
+        for hidden in ["departments/hr", "legal/secret", "_index.md", "HR confidential", "HR-only-snippet", "legal-only-snippet"] {
+            assert!(!serialized.contains(hidden), "hidden path leaked: {serialized}");
+        }
+        let limited = payload(handler.handle("search.query", json!({"agent_id": "sales", "sources": ["wiki"], "q": "handbook confidential", "limit": 1}), &ctx).await);
+        assert_eq!(limited["hits"].as_array().unwrap().len(), 1);
+        assert!(matches!(limited["hits"][0]["id"].as_str(), Some("company.md" | "departments/sales/own.md")));
+        let initial_reader = SharedWikiReader::new(home.path(), &ctx).unwrap();
+
         // The same logged-in account loses department visibility immediately.
         db.set_department(&user.id, None).unwrap();
+        assert!(initial_reader.recheck(home.path(), &ctx).is_err());
+        let found = payload(handler.handle("search.query", query.clone(), &ctx).await);
+        assert_eq!(found["hits"].as_array().unwrap().len(), 1);
         denied(handler.handle("shared_wiki.read", json!({"page_path": "departments/sales/own.md"}), &ctx).await);
         let list = payload(handler.handle("shared_wiki.pages", json!({}), &ctx).await);
         assert_eq!(list["pages"].as_array().unwrap().len(), 1);
@@ -321,9 +366,13 @@ mod visibility_tests {
         denied(handler.handle("wiki.share", json!({"agent_id": "sales", "page_path": "auto/test.md"}), &ctx).await);
 
         for raw in ["[broken", "[namespaces.legal]\nvisible_to_departments = true\n"] {
+            let reader = SharedWikiReader::new(home.path(), &ctx).unwrap();
             std::fs::write(home.path().join("shared/wiki/.scope.toml"), raw).unwrap();
+            assert!(reader.recheck(home.path(), &ctx).is_err());
+            denied(handler.handle("search.query", query.clone(), &ctx).await);
             denied(handler.handle("shared_wiki.read", json!({"page_path": "company.md"}), &ctx).await);
             denied(handler.handle("shared_wiki.pages", json!({}), &ctx).await);
+            std::fs::write(home.path().join("shared/wiki/.scope.toml"), "").unwrap();
         }
     }
 }

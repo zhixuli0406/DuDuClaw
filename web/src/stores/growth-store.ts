@@ -88,12 +88,14 @@ export const useGrowthStore = create<GrowthStore>((set, get) => ({
     // Only diff when we have a known previous state — never firehose on first load.
     if (prev) {
       const prevUnlocked = new Set(
-        prev.achievements.filter((a) => a.unlocked).map((a) => a.id),
+        (prev.achievements ?? []).filter((a) => a.unlocked).map((a) => a.id),
       );
-      for (const a of next.achievements) {
-        if (a.unlocked && !prevUnlocked.has(a.id)) {
-          celebrate('badge');
-          growthEventBus.emit({ type: 'achievement_unlocked', id: a.id });
+      if (prev.achievements && next.achievements) {
+        for (const a of next.achievements) {
+          if (a.unlocked && !prevUnlocked.has(a.id)) {
+            celebrate('badge');
+            growthEventBus.emit({ type: 'achievement_unlocked', id: a.id });
+          }
         }
       }
       if (next.level > prev.level) {

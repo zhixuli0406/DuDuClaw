@@ -63,6 +63,15 @@ impl MethodHandler {
 
         let live=match self.bound_history_live(ctx) { Ok(c)=>c, Err(e)=>return WsFrame::error_response("",&e) };
         let mode=if let Some(a)=agent_id { match privacy::mode(&self.home_dir,&live,a) { Ok(m)=>m,Err(e)=>return WsFrame::error_response("",&e) } } else if live.is_admin() {Mode::Full} else {return WsFrame::error_response("","agent_id required");};
+        // Shared wiki authority is independent of the selected AI employee.
+        let shared_reader = if wants("wiki") {
+            match SharedWikiReader::new(&self.home_dir, &live) {
+                Ok(reader) => Some(reader),
+                Err(()) => return WsFrame::error_response("", "permission denied"),
+            }
+        } else {
+            None
+        };
         if wants("conversations") {
             if mode==Mode::Filtered {
                 match self.bound_conversation_search(&live,agent_id.unwrap(),query,per_source_limit).await {Ok(found)=>hits.extend(found),Err(e)=>return WsFrame::error_response("",&e)}
@@ -162,7 +171,11 @@ impl MethodHandler {
             let shared_dir = self.home_dir.join("shared").join("wiki");
             if shared_dir.exists() {
                 let shared = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
-                if let Ok(wh) = shared.search(query, per_source_limit) {
+                if let Ok(wh) = shared.search(query, usize::MAX) {
+                    let wh: Vec<_> = wh.into_iter()
+                        .filter(|hit| shared_reader.as_ref().is_some_and(|r| r.page_visible(&hit.path)))
+                        .take(per_source_limit)
+                        .collect();
                     hits.extend(crate::search_index::wiki_hits(
                         crate::search_index::SOURCE_SHARED_WIKI,
                         None,
@@ -175,6 +188,9 @@ impl MethodHandler {
 
         let still_allowed=if let Some(a)=agent_id { self.bound_history_recheck(&live,a,mode).is_ok() } else {self.bound_history_live(&live).is_ok_and(|c|c.is_admin())};
         if !still_allowed { return WsFrame::error_response("","history authority changed; refresh"); }
+        if shared_reader.as_ref().is_some_and(|reader| reader.recheck(&self.home_dir, &live).is_err()) {
+            return WsFrame::error_response("", "permission denied");
+        }
         let (hits, truncated) = crate::search_index::merge_and_cap(hits);
         let rows: Vec<Value> = hits
             .iter()

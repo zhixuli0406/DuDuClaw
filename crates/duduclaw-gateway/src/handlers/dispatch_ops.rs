@@ -222,7 +222,7 @@ impl MethodHandler {
             "skills.custom_retire" => self.handle_skills_custom_retire(params, ctx).await,
 
             // ── Growth / gamification (login-readable; V10-T10.0) ───
-            "growth.snapshot" => self.handle_growth_snapshot().await,
+            "growth.snapshot" => self.handle_growth_snapshot(ctx).await,
             "growth.daily_report" => {
                 require_manager!();
                 self.handle_growth_daily_report(params).await

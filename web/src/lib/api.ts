@@ -8798,11 +8798,11 @@ export const api = {
     },
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,
-    bindAgent: (userId: string, agentName: string, accessLevel?: string) =>
+    bindAgent: (userId: string, agentName: string, accessLevel: UserAgentBinding['access_level']) =>
       client.call('users.bind_agent', {
         user_id: userId,
         agent_name: agentName,
-        access_level: accessLevel ?? 'owner',
+        access_level: accessLevel,
       }) as Promise<{ status: string }>,
     unbindAgent: (userId: string, agentName: string) =>
       client.call('users.unbind_agent', { user_id: userId, agent_name: agentName }) as Promise<{ status: string }>,
