@@ -340,7 +340,7 @@ pub(crate) async fn gate_bus_dispatch(
         let denied = DelegationDenied {
             sender: sender_agent.or(origin_agent).unwrap_or("system").to_string(),
             target: target.to_string(),
-            policy: effective_policy(home_dir),
+            policy: duduclaw_core::delegation_policy_from_home(home_dir),
             reason: duduclaw_core::DelegationDenyReason::HumanPrincipalNotPermitted,
         };
         audit_denial(home_dir, &denied, task_id, path_kind, on_behalf_of);
