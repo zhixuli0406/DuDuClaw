@@ -152,6 +152,7 @@ async fn watch_falls_back_to_real_poll_shapes_without_screen_control() {
             duduclaw_tui::WatchOptions {
                 client,
                 agent: "adu".into(),
+                content: false,
             },
             &mut output,
         ),
@@ -160,6 +161,6 @@ async fn watch_falls_back_to_real_poll_shapes_without_screen_control() {
     assert!(result.is_err());
     let text = String::from_utf8(output).unwrap();
     assert!(text.contains(duduclaw_tui::strings::WATCH_POLLING));
-    assert!(text.contains("done"));
+    assert!(!text.contains("done"));
     assert!(!text.contains('\x1b'));
 }

@@ -58,7 +58,8 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let connection = options.client.connection();
         let client = options.client.clone();
         let chat = client.chat();
-        let chat_state = chat.state();
+        let mut chat_state = chat.state();
+        app.chat = chat_state.borrow_and_update().clone();
         let route = if settings.notifications { crate::notifications::route().await } else { crate::notifications::Route::Skip };
         let mut notifications = crate::notifications::Notifications::new(settings.notifications, route);
         let started = std::time::Instant::now();
@@ -77,7 +78,9 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 return Err(error);
             }
             app.refresh(&model);
-            app.chat = chat_state.borrow().clone();
+            if chat_state.has_changed().unwrap_or(false) {
+                app.chat = chat_state.borrow_and_update().clone();
+            }
             app.spinner = (started.elapsed().as_millis() / 150) as usize;
             if let Some(sequence) = notifications.update(model.inbox.count(), std::time::Instant::now()) {
                 use std::io::Write;

@@ -16,6 +16,7 @@ const BUDGET: Duration = Duration::from_secs(15);
 pub struct WatchOptions {
     pub client: Client,
     pub agent: String,
+    pub content: bool,
 }
 #[derive(Default)]
 struct Tail {
@@ -61,7 +62,7 @@ impl Tail {
                 .and_then(Value::as_str)
                 .ok_or(Error::Protocol)?;
             if self.new_item("run", run) {
-                write_line(output, &format_run(run))?;
+                write_line(output, &format_run(run, options.content))?;
             }
             let detail = options
                 .client
@@ -76,7 +77,7 @@ impl Tail {
             }
             for event in events.iter().skip(events.len().saturating_sub(256)) {
                 if self.new_item(id, event) {
-                    write_line(output, &format_event(event))?;
+                    write_line(output, &format_event(event, options.content))?;
                 }
             }
         }
@@ -104,32 +105,30 @@ fn field(value: &Value, name: &str) -> String {
     .plain()
     .replace('\n', " ")
 }
-pub fn format_run(value: &Value) -> String {
-    format!(
-        "{} [{}] {} {}",
-        field(value, "started_at"),
-        field(value, "status"),
-        field(value, "agent_id"),
-        field(value, "preview")
-    )
+pub fn format_run(value: &Value, content: bool) -> String {
+    let metadata = format!("{} [{}] {}", field(value, "started_at"),
+        field(value, "status"), field(value, "agent_id"));
+    with_content(metadata, value, content)
 }
-pub fn format_event(value: &Value) -> String {
-    format!(
-        "{} [{}] {} {}",
-        field(value, "ts"),
-        field(value, "kind"),
-        field(
-            value,
-            if value.get("label").is_some() {
-                "label"
-            } else if value.get("tool").is_some() {
-                "tool"
-            } else {
-                "role"
-            }
-        ),
-        field(value, "preview")
-    )
+fn with_content(metadata: String, value: &Value, content: bool) -> String {
+    if content { format!("{metadata} {}", field(value, "preview")) } else { metadata }
+}
+pub fn format_event(value: &Value, content: bool) -> String {
+    let kind = field(value, "kind");
+    // Unknown schemas never expose payloads, even with content enabled.
+    if !matches!(kind.as_str(), "text" | "tool_use" | "tool_step" | "todo_update") {
+        return kind;
+    }
+    let metadata = format!("{} [{}] {} {} {}", field(value, "ts"), kind,
+        field(value, "agent_id"), field(value, "status"), field(value, "tool"));
+    with_content(metadata, value, content)
+}
+fn format_subscription(name: &str, payload: &Value, content: bool) -> String {
+    if name == "run.step" && payload.get("kind").and_then(Value::as_str).is_some() {
+        format_event(payload, content)
+    } else {
+        TerminalText::new(name.to_owned()).plain().replace('\n', " ")
+    }
 }
 fn write_line<W: Write>(output: &mut W, line: &str) -> Result<()> {
     writeln!(output, "{}", TerminalText::new(line.to_owned()).plain())
@@ -140,6 +139,7 @@ pub async fn run_watch(options: WatchOptions) -> Result<()> {
     run_watch_to(options, &mut std::io::stdout()).await
 }
 pub async fn run_watch_to<W: Write>(options: WatchOptions, output: &mut W) -> Result<()> {
+    if options.content { eprintln!("{}", strings::WATCH_CONTENT_WARNING); }
     let shutdown = crate::ui::terminal::shutdown_signal();
     tokio::pin!(shutdown);
     tokio::select! {
@@ -207,9 +207,7 @@ async fn watch_loop<W: Write>(options: &WatchOptions, output: &mut W) -> Result<
             event = events.recv() => match event {
                 Ok(event) if event.name == "run.step" && subscribed => {
                     if event.payload.get("agent_id").and_then(Value::as_str) == Some(options.agent.as_str()) {
-                        // Subscription frames are additive. Render fields we know;
-                        // use the sanitized JSON for newer shapes rather than inventing a schema.
-                        write_line(output, &TerminalText::new(event.payload.to_string()).plain())?;
+                        write_line(output, &format_subscription(&event.name, &event.payload, options.content))?;
                     }
                 }
                 Ok(event) if event.name == "events_lost" => {
@@ -230,13 +228,37 @@ async fn watch_loop<W: Write>(options: &WatchOptions, output: &mut W) -> Result<
 mod tests {
     use super::*;
     #[test]
+    fn content_requires_explicit_opt_in_for_poll_and_subscription() {
+        let run = json!({"started_at":"09:00", "status":"running", "agent_id":"adu", "preview":"private-user"});
+        assert!(!format_run(&run, false).contains("private-user"));
+        assert!(format_run(&run, true).contains("private-user"));
+        for (kind, secret) in [("text", "private-assistant"), ("tool_use", "private-args"),
+            ("tool_step", "private-step"), ("todo_update", "private-todo")] {
+            let event = json!({"kind":kind, "ts":"09:01", "tool":"Read", "preview":secret,
+                "label":"private-label", "content":"private-content", "arguments":"private-arguments"});
+            for output in [format_event(&event, false), format_subscription("run.step", &event, false)] {
+                assert!(!output.contains("private-"));
+                assert!(output.contains(kind));
+            }
+            assert!(format_event(&event, true).contains(secret));
+            assert!(format_subscription("run.step", &event, true).contains(secret));
+        }
+        let unknown = json!({"kind":"future", "preview":"secret", "arguments":{"token":"secret"}});
+        for content in [false, true] {
+            assert_eq!(format_event(&unknown, content), "future");
+            assert_eq!(format_subscription("run.step", &unknown, content), "future");
+            assert_eq!(format_subscription("future.event", &unknown, content), "future.event");
+            assert_eq!(format_subscription("run.step", &json!({"content":"secret"}), content), "run.step");
+        }
+    }
+    #[test]
     fn plain_watch_output_is_safe_and_deduplicated() {
         let run = json!({"id":"s:1","agent_id":"adu\u{1b}]9;evil\u{7}","started_at":"09:00","status":"running","preview":"你好\n世界\u{202e}"});
         let event = json!({"kind":"tool_step","label":"Read","ts":"09:01","seq":1,"preview":"\u{1b}]8;;https://evil\u{7}file"});
         let mut output = Vec::new();
         write_line(&mut output, strings::WATCH_POLLING).unwrap();
-        write_line(&mut output, &format_run(&run)).unwrap();
-        write_line(&mut output, &format_event(&event)).unwrap();
+        write_line(&mut output, &format_run(&run, false)).unwrap();
+        write_line(&mut output, &format_event(&event, false)).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(!text.chars().any(crate::sanitize::forbidden));
         insta::assert_snapshot!("watch_plain", text);

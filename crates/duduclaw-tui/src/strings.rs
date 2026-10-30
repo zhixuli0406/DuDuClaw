@@ -138,3 +138,7 @@ pub const WATCH_HELP: &str = "持續查看一位員工的執行紀錄";
 
 pub const WATCH_TRUNCATED: &str = "較早事件已省略，每次執行僅顯示最近 256 筆";
 pub const CHAT_DONE: &str = "回覆完成";
+
+pub const WATCH_CONTENT_HELP: &str = "顯示未遮蔽的內容預覽";
+pub const WATCH_CONTENT_WARNING: &str = "警告：內容未經機密遮蔽，可能包含敏感資料。";
+pub const CHAT_GUTTER: &str = "> ";

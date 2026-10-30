@@ -81,7 +81,9 @@ fn old_gateway_resume_and_attribution() {
 fn transcript_is_bounded_and_cannot_emit_escape_codes() {
     let mut s = connected();
     s.append("assistant", &"界".repeat(MAX_LINES * MAX_LINE_CHARS + 1));
-    assert_eq!(s.lines.len(), MAX_LINES);
+    assert!(s.lines.len() <= MAX_LINES);
+    assert!(s.transcript_bytes <= MAX_TRANSCRIPT_BYTES);
+    assert_eq!(s.transcript_bytes, s.lines.iter().map(|line| line.plain().len()).sum::<usize>());
     assert!(
         s.lines
             .iter()

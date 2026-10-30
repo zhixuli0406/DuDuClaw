@@ -170,10 +170,10 @@ impl Actor {
         }) else {
             return;
         };
-        let wire = Zeroizing::new(wire);
+        let mut wire = Zeroizing::new(wire);
         if !send(
             socket,
-            Message::Text(wire.as_str().into()),
+            Message::Text(std::mem::take(&mut *wire).into()),
             self.options.request_timeout,
         )
         .await

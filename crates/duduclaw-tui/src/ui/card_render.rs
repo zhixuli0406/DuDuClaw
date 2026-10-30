@@ -9,6 +9,17 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, card: &mut Card, settings: &Se
 pub(super) fn draw_at(frame: &mut Frame, area: Rect, card: &mut Card, settings: &Settings, fresh: bool, now: Instant, epoch: i64) {
     frame.render_widget(ratatui::widgets::Clear, area);
     let inner = panel(frame, area, strings::CARD_TITLE, settings, !fresh);
+    // Decision frames use a double ASCII rail, distinct from chat's single rail.
+    if !inner.is_empty() {
+        let buf = frame.buffer_mut();
+        for x in area.x..area.right() {
+            buf[(x, area.y)].set_symbol("=");
+            buf[(x, area.bottom() - 1)].set_symbol("=");
+        }
+        super::widgets::text(frame,
+            Rect::new(area.x + 2, area.y, area.width.saturating_sub(4), 1),
+            crate::sanitize::TerminalText::new(strings::CARD_TITLE.into()), settings, !fresh, false);
+    }
     let controls_height = 8.min(inner.height.saturating_sub(1));
     let body = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(controls_height));
     // All payload fields are present; controls are separate and cannot be forged

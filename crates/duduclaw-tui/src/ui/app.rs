@@ -138,6 +138,7 @@ pub struct App {
     pub blocks: crate::chat::Blocks,
     pub chat: crate::chat::ChatState,
     pub chat_scroll: usize,
+    pub(super) chat_cache: super::chat_render::TranscriptCache,
     pub spinner: usize,
     pub detail_open: bool,
     pub help: bool,

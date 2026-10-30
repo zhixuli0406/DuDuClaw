@@ -9,6 +9,7 @@ pub use transport::ChatClient;
 pub(crate) use transport::Credentials;
 
 pub const MAX_LINES: usize = 2_000;
+pub const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
 const MAX_LINE_CHARS: usize = 512;
 pub const MAX_INPUT_CHARS: usize = 8_000;
 
@@ -107,6 +108,8 @@ pub(crate) struct SendFrame {
 #[derive(Clone)]
 pub struct ChatState {
     pub lines: VecDeque<TerminalText>,
+    pub(crate) revision: u64,
+    transcript_bytes: usize,
     pub status: TerminalText,
     pub connected: bool,
     pub stale: bool,
@@ -123,6 +126,8 @@ impl Default for ChatState {
     fn default() -> Self {
         Self {
             lines: VecDeque::new(),
+            revision: 0,
+            transcript_bytes: 0,
             status: TerminalText::new(strings::CONNECTING.into()),
             connected: false,
             stale: true,
@@ -161,10 +166,14 @@ impl ChatState {
         }
     }
     fn push_line(&mut self, line: String) {
+        self.transcript_bytes += line.len();
         self.lines.push_back(TerminalText::new(line));
-        while self.lines.len() > MAX_LINES {
-            self.lines.pop_front();
+        while self.lines.len() > MAX_LINES || self.transcript_bytes > MAX_TRANSCRIPT_BYTES {
+            if let Some(old) = self.lines.pop_front() {
+                self.transcript_bytes -= old.plain().len();
+            }
         }
+        self.revision = self.revision.wrapping_add(1);
     }
     pub fn disconnected(&mut self) {
         if self.running {

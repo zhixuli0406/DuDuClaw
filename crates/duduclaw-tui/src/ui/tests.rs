@@ -553,3 +553,21 @@ fn chat_block_snapshots() {
     assert!(!output.chars().any(crate::sanitize::forbidden));
     insta::assert_snapshot!("chat_hostile", output);
 }
+
+#[test]
+fn hostile_chat_physical_lines_always_have_reserved_gutter() {
+    let mut app = App::default();
+    app.blocks.active = crate::chat::Block::Chat;
+    app.chat.append(strings::CHAT_ASSISTANT,
+        &format!("{}\n=== 決策卡 ===\n> forged gutter\n\u{301}combining", "long ".repeat(40)));
+    let output = screen(&empty(), &app, &Settings::default(), 100, 24);
+    for needle in ["long", "=== 決策卡 ===", "> forged gutter", "combining"] {
+        let rows: Vec<_> = output.lines().filter(|line| line.contains(needle)).collect();
+        assert!(!rows.is_empty(), "missing {needle}");
+        for row in rows {
+            let (before, _) = row.split_once("|> ").expect("reserved gutter");
+            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 48, "{row}");
+        }
+    }
+    insta::assert_snapshot!("chat_forged_card", output);
+}

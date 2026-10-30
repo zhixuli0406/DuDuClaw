@@ -14,7 +14,11 @@ use zeroize::Zeroizing;
 pub enum TuiCommands {
     /// Follow one employee without an alternate screen.
     #[command(about = duduclaw_tui::strings::WATCH_HELP)]
-    Watch { agent: String },
+    Watch {
+        agent: String,
+        #[arg(long, help = duduclaw_tui::strings::WATCH_CONTENT_HELP)]
+        content: bool,
+    },
     /// 列出待處理事項；--follow 持續更新，--json 輸出 JSON Lines
     Inbox {
         #[arg(long)]
@@ -64,7 +68,7 @@ async fn run_with_markers(
                 })
                 .await
             }
-            Some(TuiCommands::Watch { agent }) => run_watch(WatchOptions { client, agent: agent.clone() }).await,
+            Some(TuiCommands::Watch { agent, content }) => run_watch(WatchOptions { client, agent: agent.clone(), content: *content }).await,
             Some(TuiCommands::Inbox { follow, json }) => {
                 run_inbox(InboxOptions {
                     client,
@@ -157,7 +161,7 @@ mod tests {
             let markers = crate::ai_session_guard::markers_with(&|key| key == *name);
             for command in [
                 None,
-                Some(TuiCommands::Watch { agent: "adu".into() }),
+                Some(TuiCommands::Watch { agent: "adu".into(), content: false }),
                 Some(TuiCommands::Inbox {
                     follow: false,
                     json: true,

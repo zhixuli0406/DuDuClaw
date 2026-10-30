@@ -67,6 +67,8 @@ OTP 是另一種完整登入方式，**不是雙因素驗證**。只輸入正確
 
 `duduclaw tui watch adu` 輸出清理過的純文字行，適合窄分割視窗，不切換 alternate screen。先嘗試 `runs.subscribe { agent_id }`；目前閘道回應未知方法時，明示「輪詢模式」，每五秒讀取 `runs.list` 與 `runs.get`，取最近四次執行、每次最近 256 筆事件，並限制去重紀錄大小。支援訂閱的閘道另接收 `run.step`，仍定期核對已保存紀錄。`Ctrl-C` 離開；同樣拒絕 AI 工作階段，沿用帳號登入。
 
+預設只輸出時間、狀態、員工、步驟類型或工具名稱，不顯示使用者與助理文字或工具參數。使用 `duduclaw tui watch adu --content` 才會顯示內容預覽，並在 stderr 警告內容未經機密遮蔽。兩種模式遇到未知事件格式都只顯示名稱，絕不輸出 JSON payload。
+
 ## 終端通知
 
 預設關閉，設有 `SSH_CONNECTION` 也不會自動開啟。可在 `tui.toml` 明確設定 `notifications = true`。終端失焦且有效收件匣件數增加時，發出 OSC 9，文字固定為「DuDuClaw：N 項需要你處理」；只有 N 是數字，沒有員工名稱、任務標題或工具內容。支援時使用終端焦點事件，未提供事件時視為失焦。每分鐘最多一次，被抑制的增加不排隊。tmux 下只有簡單檢查 `tmux show-option -gv allow-passthrough` 回傳 `on` 或 `all` 才使用 passthrough，其餘略過。是否顯示仍取決於終端支援。

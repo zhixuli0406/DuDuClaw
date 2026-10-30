@@ -67,6 +67,8 @@ One `/ws/chat` connection shares the `/ws` client's in-memory token refresh and 
 
 `duduclaw tui watch adu` prints sanitized lines suitable for a narrow split, without an alternate screen. It tries `runs.subscribe { agent_id }`; the current gateway reports an unknown method, so it explicitly announces polling and uses `runs.list` and `runs.get` every five seconds. Recent history is limited to four runs and the last 256 events per run, with bounded duplicate tracking. A supporting gateway also supplies `run.step` events; persisted history still reconciles periodically. `Ctrl-C` exits. The same AI-session refusal and account login rules apply.
 
+By default, output contains metadata only (time, status, agent, step kind or tool name), with no user/assistant text or tool arguments. Use `duduclaw tui watch adu --content` to include content previews; stderr warns that content is not redacted. Unknown event shapes show only their name in either mode, never their JSON payload.
+
 ## Terminal notifications
 
 Notifications are off by default, including under `SSH_CONNECTION`. Explicit `notifications = true` in `tui.toml` opts in. An increased fresh inbox count while the terminal is unfocused emits OSC 9 with only `DuDuClaw：N 項需要你處理`; employee names, task titles, and tool content never enter it. Focus events are used when available; otherwise the terminal is treated as unfocused. At most one notification is emitted per minute; suppressed rises are not queued. Inside tmux, passthrough is used only if `tmux show-option -gv allow-passthrough` returns `on` or `all`; otherwise notifications are skipped. Actual display depends on the terminal.
