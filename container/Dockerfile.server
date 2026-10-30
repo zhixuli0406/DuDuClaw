@@ -56,7 +56,7 @@ RUN if [ -n "$CARGO_JOBS" ]; then export CARGO_BUILD_JOBS="$CARGO_JOBS"; fi && \
 # Stage 3a: CLI tooling — everything the runtime needs that does NOT depend on
 # the Rust build. Its own stage so BuildKit schedules it in parallel with
 # `rust-builder` (they share no inputs): a broken third-party installer
-# (agy / grok / nodesource) now fails the build within minutes instead of
+# (grok / nodesource) now fails the build within minutes instead of
 # after a multi-hour compile, and `docker build --target cli-tools` gives a
 # five-minute smoke test of the whole tooling layer (2026-09-29 decision).
 FROM python:3.12-slim AS cli-tools
@@ -75,31 +75,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Antigravity CLI (`agy`) — Google's official installer (the 2026-06-18
-# Gemini-CLI successor). Bundled as a first-class runtime alongside
-# claude/codex so the Antigravity backend works out of the box. The installer
-# supports linux amd64/arm64 (glibc); it drops the binary in $HOME/.local/bin,
-# which we relocate to /usr/local/bin so every user (incl. `duduclaw`) resolves
-# it on PATH — matching `duduclaw-core::which_agy`.
-#
-# Fetched to a file and validated before it runs: on 2026-09-29 the endpoint
-# briefly served a non-script body and `curl | bash` died with a bash syntax
-# error — after five hours of QEMU arm64 compilation. Five attempts with
-# backoff, a shebang check, and a loud failure message replace the pipe.
-RUN set -eu; \
-    for attempt in 1 2 3 4 5; do \
-      if curl -fsSL --compressed --retry 3 -o /tmp/agy-install.sh https://antigravity.google/cli/install.sh \
-         && head -c 2 /tmp/agy-install.sh | grep -q '^#!'; then break; fi; \
-      echo "antigravity install script fetch/validation failed (attempt $attempt/5)" >&2; \
-      if [ "$attempt" = 5 ]; then echo "ERROR: https://antigravity.google/cli/install.sh did not return a shell script" >&2; head -c 300 /tmp/agy-install.sh >&2 || true; exit 1; fi; \
-      sleep $((attempt * 20)); \
-    done && \
-    bash /tmp/agy-install.sh && rm -f /tmp/agy-install.sh && \
-    install -m 0755 "$HOME/.local/bin/agy" /usr/local/bin/agy && \
-    agy --version
-
 # Grok CLI (`grok`, aka "Grok Build") — xAI's official installer. Bundled as a
-# first-class runtime alongside claude/codex/agy so the Grok backend
+# first-class runtime alongside claude/codex so the Grok backend
 # works out of the box. There is no npm/apt package (see
 # crates/duduclaw-gateway/src/runtime/grok.rs header for the verification
 # notes); the official install method is this curl|bash script. It resolves
@@ -111,9 +88,9 @@ RUN set -eu; \
 # binary (not a dangling link into $HOME/.grok/downloads) lands in
 # /usr/local/bin. NOTE: `XAI_API_KEY` auth is NOT baked in here — it is
 # supplied at container **runtime** via env / agent.toml, same as the other
-# CLIs (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).
-# Same fetch → validate → retry discipline as the agy step above (a third-party
-# installer endpoint must not be able to fail a five-hour image build silently).
+# CLIs (ANTHROPIC_API_KEY / OPENAI_API_KEY).
+# Fetch → validate → retry: a third-party installer endpoint must not be able
+# to fail a five-hour image build silently.
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \
       if curl -fsSL --compressed --retry 3 -o /tmp/grok-install.sh https://x.ai/cli/install.sh \
@@ -128,7 +105,7 @@ RUN set -eu; \
 
 
 # Stage 3b: runtime — the tooling layer plus the freshly built binaries.
-# `FROM cli-tools` (rather than copying binaries across) keeps node/npm/agy/
+# `FROM cli-tools` (rather than copying binaries across) keeps node/npm/
 # grok exactly as their installers laid them out; only the Rust artifacts
 # and the pure-Python extensions land on top.
 FROM cli-tools AS runtime
@@ -151,7 +128,6 @@ RUN mkdir -p \
         /home/duduclaw/.duduclaw \
         /home/duduclaw/.claude \
         /home/duduclaw/.codex \
-        /home/duduclaw/.gemini \
         /home/duduclaw/.grok \
         /home/duduclaw/.kimi-code \
         /home/duduclaw/.copilot \
@@ -165,7 +141,6 @@ WORKDIR /home/duduclaw
 VOLUME /home/duduclaw/.duduclaw
 VOLUME /home/duduclaw/.claude
 VOLUME /home/duduclaw/.codex
-VOLUME /home/duduclaw/.gemini
 VOLUME /home/duduclaw/.grok
 EXPOSE 18789 18889
 
