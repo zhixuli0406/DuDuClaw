@@ -338,3 +338,19 @@ async fn trace_handshake_child() {
         assert!(result.is_ok());
     }).await;
 }
+
+
+#[test]
+fn control_room_tokens_never_enter_pty_child_environment() {
+    let session = Session {
+        account: Account { id: "owner".into(), email: TerminalText::new("owner@example.invalid".into()), role: Role::Admin, must_change_password: false },
+        access_token: Zeroizing::new("M4_ACCESS_TOKEN_CANARY".into()),
+        refresh_token: Zeroizing::new("M4_REFRESH_TOKEN_CANARY".into()),
+        expires_at: u64::MAX,
+    };
+    let command = crate::pty::command_with_env(None, std::env::vars_os());
+    for (_, value) in command.iter_full_env_as_str() {
+        assert!(!value.contains(session.access_token.as_str()));
+        assert!(!value.contains(session.refresh_token.as_str()));
+    }
+}

@@ -26,6 +26,9 @@ tempfile = "3"
 unicode-width = "0.2.2"
 unicode-segmentation = "1"
 
+portable-pty = "0.9"
+vt100 = "0.16"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

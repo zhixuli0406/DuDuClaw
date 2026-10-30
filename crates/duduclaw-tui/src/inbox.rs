@@ -115,6 +115,12 @@ pub async fn run_inbox(options: InboxOptions) -> Result<()> {
 }
 /// Writer-injected entry point for scripts, embedding, and fake-gateway tests.
 pub async fn run_inbox_to<W: Write>(options: InboxOptions, output: &mut W) -> Result<()> {
+    let client = options.client.clone();
+    let result = inbox_loop(options, output).await;
+    client.shutdown().await;
+    result
+}
+async fn inbox_loop<W: Write>(options: InboxOptions, output: &mut W) -> Result<()> {
     let home = resolve_home(options.home)?;
     let (settings, notice) = Settings::load(&home);
     let (read, read_notice) = ReadState::load(&home);

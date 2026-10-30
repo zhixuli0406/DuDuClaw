@@ -131,6 +131,8 @@ impl Selection {
 }
 #[derive(Default, Clone)]
 pub struct App {
+    pub pty_focus: bool,
+    pub(super) pty_confirm: Option<KeyEvent>,
     pub selected: Option<Selection>,
     pub focus: crate::chat::Focus,
     pub input: String,
@@ -170,7 +172,9 @@ pub enum Action {
 }
 impl App {
     pub fn focus_label(&self) -> &'static str {
-        if self.palette.is_some() { strings::PALETTE_FOCUS }
+        if self.pty_confirm.is_some() { strings::PTY_CONFIRM_FOCUS }
+        else if self.pty_focus { strings::PTY_FOCUS }
+        else if self.palette.is_some() { strings::PALETTE_FOCUS }
         else if self.card.is_some() || self.control_card.is_some() { strings::CARD_FOCUS }
         else if self.help { strings::HELP_FOCUS }
         else if self.focus == crate::chat::Focus::Input { strings::INPUT_FOCUS }
@@ -225,6 +229,36 @@ impl App {
         self.key_at(key, model, std::time::Instant::now(), crate::snooze::epoch_now())
     }
     pub fn key_at(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant, epoch: i64) -> Action {
+        if self.pty_focus {
+            if crate::pty::escape(key) {
+                if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty {
+                    pty.lock().unwrap_or_else(|e| e.into_inner()).flush_input();
+                }
+                self.pty_focus = false; return Action::None;
+            }
+            if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty {
+                let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
+                let bytes = crate::pty::key_bytes(key, pty.parser.screen().application_cursor());
+                pty.send(bytes);
+            }
+            return Action::None;
+        }
+        if let Some(pending) = self.pty_confirm {
+            if key.kind != KeyEventKind::Press { return Action::None; }
+            if key.code == KeyCode::Esc { self.pty_confirm = None; self.notice = None; }
+            else if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                self.pty_confirm = None; self.notice = None;
+                let mut cleaned = true;
+                if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty {
+                    let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
+                    pty.stop(); cleaned = pty.cleanup_complete;
+                }
+                let action = self.key_at(pending, model, now, epoch);
+                if !cleaned { self.notice = Some(strings::PTY_STOP_FAILED.into()); }
+                return action;
+            }
+            return Action::None;
+        }
         if self.palette.is_some() {
             return self.palette_key(key, model, now, epoch);
         }
@@ -303,6 +337,13 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        let replaces = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w')
+            || !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                && matches!(key.code, KeyCode::Char('D' | 'C' | 'R' | 'T' | 'L' | '/')) && !self.help;
+        if replaces && self.blocks.panes[self.blocks.focused].pty.as_ref().is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).pending_or_running()) {
+            self.pty_confirm = Some(key); self.notice = Some(strings::PTY_CONFIRM.into());
+            return Action::None;
+        }
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w') {
             self.blocks.close(); return Action::None;
         }
@@ -311,6 +352,21 @@ impl App {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             return Action::None;
+        }
+        if !self.help && self.blocks.active == crate::blocks::Block::Pty {
+            match key.code {
+                KeyCode::Char('i' | 'P') | KeyCode::Enter => {
+                    if !crate::pty::SUPPORTED { self.notice = Some(strings::PTY_DISABLED.into()); return Action::None; }
+                    self.pty_focus = true;
+                    if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty { pty.lock().unwrap_or_else(|e| e.into_inner()).parser.screen_mut().set_scrollback(0); }
+                    return Action::None;
+                }
+                KeyCode::PageUp | KeyCode::PageDown => {
+                    if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty { pty.lock().unwrap_or_else(|e| e.into_inner()).scroll(key.code == KeyCode::PageUp); }
+                    return Action::None;
+                }
+                _ => {}
+            }
         }
         if !self.help && let KeyCode::Char(c) = key.code && let Some(action) = self.m2_key(c, model, now) { return action; }
         match key.code {
@@ -400,6 +456,16 @@ impl App {
         Action::None
     }
     pub fn paste(&mut self, text: &str) {
+        if self.pty_confirm.is_some() { return; }
+        if self.pty_focus {
+            if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty {
+                let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
+                pty.flush_input();
+                if text.len() > crate::pty::MAX_INPUT { pty.status = strings::PTY_INPUT_FULL.into(); }
+                else { let bytes = crate::pty::paste_bytes(text, pty.parser.screen().bracketed_paste()); pty.send(bytes); }
+            }
+            return;
+        }
         if let Some(palette) = &mut self.palette { palette.paste(text); return; }
         if let Some(card) = &mut self.control_card { card.paste(text); return; }
         if self.focus != crate::chat::Focus::Input || self.card.is_some() { return; }

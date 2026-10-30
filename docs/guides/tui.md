@@ -24,6 +24,29 @@ The CLI connects to `127.0.0.1`, using `DUDUCLAW_PORT`, then `<home>/config.toml
 
 **For remote use, SSH into the gateway host and run it there; do not port-forward the gateway.** Port forwarding would expose its loopback-only local login route to programs on the forwarding host.
 
+## Embedded local terminal (M4)
+
+Press `P` in list focus, or choose `pty` in the command palette, to open an owner-local PTY in the focused block. It runs `$SHELL` (fallback `/bin/sh`) and inherits the owner's environment after removing every `DUDUCLAW_*` variable. Gateway JWTs remain in memory and are never added to the child's environment. The existing AI-session startup refusal still applies. No gateway response can supply a local command.
+
+While terminal input has focus, **`Ctrl-\` or `F12` returns to the control room** (`Ctrl-4` is the legacy encoding of `Ctrl-\`). All other ordinary terminal keys, including `Esc`, `Ctrl-C`, `Ctrl-P`, arrows, function keys and page keys, go to the child. `Enter` / `i` returns to terminal input. In control-room focus, `PgUp` / `PgDn` scroll the terminal's bounded 5,000-line history. Paste forwards text, preserving newlines and tabs but removing control characters that could escape a bracketed-paste wrapper; the wrapper is used when the child requests it. Input from each event batch is coalesced and written in order by a dedicated writer. At 64 KiB pending, terminal event reads pause until the child catches up. The buffer counts queued and in-flight bytes, with a 1 MiB hard limit; a chunk that would exceed it is refused in full with a visible message. Mouse events are not forwarded. The status line identifies the focus and escape key.
+
+To use a specific command, add an argument array to the operator-owned `tui.toml`:
+
+```toml
+[pty]
+command = ["claude"]
+# Or: command = ["/bin/sh", "-c", "your explicit shell command"]
+```
+
+Arguments are passed directly; shell syntax is interpreted only when you explicitly select a shell and its `-c` argument. Maximum 64 arguments, each at most 4,096 bytes, no NUL; the program name cannot be empty. The setting is read at startup and applies to newly opened PTY blocks.
+
+The child output only updates a VT screen model. The renderer emits sanitized cell text, colors and bold; it never replays the child's OSC clipboard/title/hyperlink controls, DCS, sixel, or terminal mode sequences to the host. Layout changes resize the PTY (bounded to 200 rows × 500 columns). CJK wide cells and combining marks are drawn in both configured width modes. The parser uses narrow ambiguous-character coordinates; wide-mode rendering expands ambiguous glyphs and clips at the block boundary. Full-screen child applications that require wide ambiguous cursor coordinates are not yet verified.
+
+Closing or replacing a block with a pending/running child asks for `y`; `Esc` cancels. Quitting stops local PTY children; gateway employees continue. Unix cleanup uses the existing process-group helper and inventories other job-control groups in the same session before reaping the shell. A process deliberately escaping into another session is outside this fallback's containment. If process inventory or signalling fails, cleanup is reported as unconfirmed. Windows PTYs are disabled with an explanation: ConPTY tree cleanup has not been verified, despite the existing Job Object helper for other process launch paths. No waiting-for-you badge is inferred from terminal text, and terminal output never authorizes an operation.
+
+RPC `/ws` and WebChat `/ws/chat` send Close and allow up to one second for the peer's closing handshake on normal shutdown. The control-room, inbox and watch entry points await shutdown.
+
+
 ## Command palette and exit summary (M3)
 
 Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chinese labels or English aliases such as `stop`, `steer`, `log`); arrows select, `Enter` runs the displayed shortcut, and `Esc` returns to the previous focus with the chat draft intact. `Ctrl-K` remains reserved. The list is recalculated from the focused block, current role, employee binding and fresh data. A selected control opens the same confirmation card as its shortcut; it never approves or confirms for you. Cards and content warnings own their keyboard, so the palette cannot open over them.
@@ -142,6 +165,7 @@ Every supported top-level key is listed below. Each invalid value keeps only tha
 | `poll_interval_seconds` | Integer, 5–3600 inclusive | `15`; authoritative list reconciliation; run/task/log blocks retain their five-second reconciliation |
 | `notifications` | Boolean | `false`, including SSH; explicit opt-in enables fixed-text background notifications |
 | `default_layout` | `"single"`, `"vertical"`, `"horizontal"` | `"single"`; one detail block, two side-by-side detail blocks, or two stacked detail blocks; starts with block 1 focused |
+| `pty.command` | Nonempty string array, up to 64 arguments | Owner-local argv; absent uses `$SHELL` or `/bin/sh`; see M4 above |
 
 Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Borders use ASCII. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
 

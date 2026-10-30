@@ -22,6 +22,7 @@ pub enum Block {
     Run,
     Task,
     Log,
+    Pty,
 }
 impl Block {
     pub fn label(self) -> &'static str {
@@ -31,6 +32,7 @@ impl Block {
             Self::Run => strings::RUN_BLOCK,
             Self::Task => strings::TASK_BLOCK,
             Self::Log => strings::LOG_BLOCK,
+            Self::Pty => strings::PTY_BLOCK,
         }
     }
 }
@@ -42,6 +44,7 @@ pub enum Split {
 }
 #[derive(Clone)]
 pub struct Pane {
+    pub pty: Option<crate::pty::Shared>,
     pub kind: Block,
     pub agent: Option<String>,
     pub task_id: Option<String>,
@@ -54,6 +57,7 @@ pub struct Pane {
 impl Pane {
     fn new(kind: Block) -> Self {
         Self {
+            pty: (kind == Block::Pty).then(crate::pty::Session::shared),
             kind,
             agent: None,
             task_id: None,

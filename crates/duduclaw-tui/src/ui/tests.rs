@@ -892,3 +892,143 @@ fn m3_empty_task_palette_has_no_enter_command() {
     app.blocks.panes[0].data = crate::blocks::Data::default();
     assert!(!app.commands(&model).iter().any(|c| c.key.code == KeyCode::Enter));
 }
+
+#[cfg(unix)]
+#[test]
+fn m4_pty_focus_owns_escape_ctrl_c_palette_and_close_confirmation() {
+    let model=empty(); let mut app=App::default();
+    assert_eq!(app.key(KeyEvent::new(KeyCode::Char('P'),KeyModifiers::NONE),&model),Action::None);
+    assert_eq!(app.blocks.active,crate::blocks::Block::Pty); assert!(app.pty_focus);
+    for key in [KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),KeyEvent::new(KeyCode::Char('c'),KeyModifiers::CONTROL),KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),KeyEvent::new(KeyCode::Char('q'),KeyModifiers::NONE)] {
+        assert_eq!(app.key(key,&model),Action::None); assert!(app.pty_focus); assert!(app.palette.is_none());
+    }
+    app.key(KeyEvent::new(KeyCode::Char('\\'),KeyModifiers::CONTROL),&model);
+    assert!(!app.pty_focus);
+    app.key(KeyEvent::new(KeyCode::Char('w'),KeyModifiers::CONTROL),&model);
+    assert!(app.pty_confirm.is_some()); assert_eq!(app.blocks.active,crate::blocks::Block::Pty);
+    app.paste("y"); assert!(app.pty_confirm.is_some());
+    app.key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),&model);
+    assert!(app.pty_confirm.is_none());
+    // Replacing a running/pending PTY is also a close operation.
+    app.key(KeyEvent::new(KeyCode::Char('D'),KeyModifiers::NONE),&model);
+    assert!(app.pty_confirm.is_some());
+    app.key(KeyEvent::new(KeyCode::Char('y'),KeyModifiers::NONE),&model);
+    assert_eq!(app.blocks.active,crate::blocks::Block::Detail);
+}
+
+#[test]
+fn m4_pty_cjk_and_combining_snapshots_in_both_width_modes() {
+    let mut app=App::default(); app.blocks.open(crate::blocks::Block::Pty,None); app.pty_focus=true;
+    {
+        let mut pty=app.blocks.panes[0].pty.as_ref().unwrap().lock().unwrap();
+        pty.parser.process("繁體中文 cafe\u{301}\r\n\x1b[1;32m彩色粗體\x1b[0m\r\n·αΩ end".as_bytes());
+        pty.status=crate::strings::PTY_RUNNING.into();
+    }
+    for width in [AmbiguousWidth::Narrow,AmbiguousWidth::Wide] {
+        let settings=Settings { ambiguous_width:width,..Settings::default() };
+        insta::assert_snapshot!(format!("m4_pty_cjk_{width:?}"),screen(&empty(),&app,&settings,100,24));
+    }
+}
+
+
+#[cfg(not(unix))]
+#[test]
+fn m4_unsupported_platform_never_enters_child_input() {
+    let mut app = App::default();
+    app.key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE), &empty());
+    assert!(!app.pty_focus);
+    let mut session = app.blocks.panes[0].pty.as_ref().unwrap().lock().unwrap();
+    session.start(None);
+    assert_eq!(session.status, strings::PTY_DISABLED);
+    assert!(!session.pending_or_running());
+}
+
+// Run the public crossterm event reader in a fresh process so its global input
+// reader/raw-mode state cannot interfere with the parallel library tests.
+#[cfg(unix)]
+#[test]
+fn m4_real_crossterm_parser_probe() {
+    use std::{io::Write, time::Duration};
+    if std::env::var_os("TUI_RAW_PARSER_PROBE").is_none() { return; }
+    crossterm::terminal::enable_raw_mode().unwrap();
+    println!("PARSER_READY");
+    std::io::stdout().flush().unwrap();
+    let model = empty();
+    let mut app = App::default();
+    app.blocks.open(crate::blocks::Block::Pty, None);
+    let read_key = || {
+        assert!(crossterm::event::poll(Duration::from_secs(5)).unwrap());
+        let crossterm::event::Event::Key(key) = crossterm::event::read().unwrap() else {
+            panic!("expected parsed key");
+        };
+        key
+    };
+    // Raw 0x1c, CSI-u backslash, CSI-u raw control char, then F12.
+    for expected in [
+        KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('\u{1c}'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('\u{1c}'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+    ] {
+        let key = read_key();
+        assert_eq!(key, expected);
+        app.pty_focus = true;
+        assert_eq!(app.key(key, &model), Action::None);
+        assert!(!app.pty_focus, "escape must leave terminal focus: {key:?}");
+    }
+    // Verify the other app control bindings from their actual legacy bytes.
+    let close = read_key();
+    assert_eq!(close, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(crate::pty::key_bytes(close, false), b"\x17");
+    app.key(close, &model);
+    assert!(app.pty_confirm.is_some());
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &model);
+    let palette = read_key();
+    assert_eq!(palette, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(crate::pty::key_bytes(palette, false), b"\x10");
+    app.key(palette, &model);
+    assert!(app.palette.is_some());
+    crossterm::terminal::disable_raw_mode().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn m4_escape_and_control_bindings_through_real_terminal_parser() {
+    use std::{io::{Read, Write}, sync::mpsc, time::Duration};
+    let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
+        rows: 24, cols: 80, pixel_width: 0, pixel_height: 0,
+    }).unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut cmd = portable_pty::CommandBuilder::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "ui::tests::m4_real_crossterm_parser_probe", "--nocapture"]);
+    cmd.env("TUI_RAW_PARSER_PROBE", "1");
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = [0; 4096];
+        while let Ok(n) = reader.read(&mut bytes) {
+            if n == 0 || tx.send(bytes[..n].to_vec()).is_err() { break; }
+        }
+    });
+    let mut output = Vec::new();
+    let result = (|| {
+        while !String::from_utf8_lossy(&output).contains("PARSER_READY") {
+            output.extend(rx.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?);
+        }
+        writer.write_all(b"\x1c\x1b[92;5u\x1b[28u\x1b[28;5u\x1b[24~\x17\x10").map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                return if status.success() { Ok(()) } else { Err(format!("probe exit {status:?}")) };
+            }
+            if std::time::Instant::now() >= deadline { return Err("parser probe timeout".into()); }
+            if let Ok(bytes) = rx.recv_timeout(Duration::from_millis(20)) { output.extend(bytes); }
+        }
+    })();
+    if result.is_err() { let _ = child.kill(); }
+    let _ = child.wait();
+    assert!(result.is_ok(), "{result:?}: {}", String::from_utf8_lossy(&output));
+}

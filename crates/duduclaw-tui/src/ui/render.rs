@@ -146,7 +146,7 @@ pub fn draw(
     text(
         frame,
         Rect::new(footer.x, footer.y + 1, footer.width, footer.height.saturating_sub(if app.notice.is_some() { 3 } else { 1 }).min(2)),
-        TerminalText::new((if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else { strings::LIST_KEY_HINTS }).into()),
+        TerminalText::new((if app.pty_confirm.is_some() { strings::PTY_CONFIRM } else if app.pty_focus { strings::PTY_KEYS } else if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else if app.blocks.active == crate::blocks::Block::Pty { strings::PTY_LIST_KEYS } else { strings::LIST_KEY_HINTS }).into()),
         settings,
         false,
         true,

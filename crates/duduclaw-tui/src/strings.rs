@@ -54,7 +54,7 @@ pub const AUTONOMY: &str = "自主狀態";
 pub const LIST_FOCUS: &str = "焦點：清單";
 pub const CONTROL_KEY_FOCUS: &str = "p / n 僅在詳情區塊或清單焦點可用";
 pub const LIST_KEY_HINTS: &str = "j/k 選取  1–4 焦點  v/x 分割  Ctrl-W 關閉  ? 說明";
-pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任；p：員工或排程暫停\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。";
+pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任；p：員工或排程暫停\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";
 pub const READ_STATE_NOTICE: &str = "已讀紀錄無法讀取，從空白紀錄開始";
 pub const SAVED: &str = "已標為已讀";
@@ -244,3 +244,22 @@ pub const EXIT_RETURN: &str = "返回控制室";
 pub const EXIT_NONE: &str = "無";
 
 pub fn exit_more(count: usize) -> String { format!("另 {count} 位") }
+
+
+pub const PTY_BLOCK: &str = "本機終端";
+pub const PTY_STARTING: &str = "本機終端準備中";
+pub const PTY_RUNNING: &str = "本機行程執行中";
+pub const PTY_EXITED: &str = "本機行程已結束，代碼：";
+pub const PTY_STOPPED: &str = "本機行程已停止";
+pub const PTY_STOP_FAILED: &str = "本機行程清理未完整確認";
+pub const PTY_DISABLED: &str = "此平台尚未驗證終端行程樹清理，本機終端已停用";
+pub const PTY_START_FAILED: &str = "無法啟動本機終端，請檢查 shell 與本機命令設定";
+pub const PTY_RESIZE_FAILED: &str = "無法調整本機終端大小";
+pub const PTY_INPUT_FAILED: &str = "輸入寫入失敗：行程已結束或終端無法寫入，請檢查命令";
+pub const PTY_INPUT_FULL: &str = "整段輸入未送出：待寫入資料超過 1 MiB";
+pub const PTY_FOCUS: &str = "本機終端；Ctrl-\\ / F12 返回控制室";
+pub const PTY_KEYS: &str = "Ctrl-\\ / F12 返回控制室；其他按鍵送至本機行程";
+pub const PTY_LIST_KEYS: &str = "Enter / i 輸入；PgUp / PgDn 捲動；Ctrl-W 關閉";
+pub const PTY_CONFIRM: &str = "本機行程仍在執行，關閉會停止其子行程。y 確認；Esc 取消";
+pub const PTY_CONFIRM_FOCUS: &str = "確認關閉本機終端";
+pub const CMD_PTY: &str = "開啟本機終端";
