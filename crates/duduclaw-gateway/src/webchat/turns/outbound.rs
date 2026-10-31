@@ -168,7 +168,7 @@ impl OutboundReceiver {
                 biased;
                 Some(frame) = self.terminal.recv() => self.terminals.push_back(frame),
                 Some(frame) = self.control.recv() => return Some(frame.frame),
-                progress = self.progress.recv(), if !self.control.is_closed() => return Some(Outbound {
+                progress = self.progress.recv(), if !self.control.is_closed() => return Some(Outbound { identity_notice: None,
                     message: progress.message, ack: None, deadline: None,
                 }),
                 else => return None,
@@ -181,7 +181,7 @@ impl OutboundReceiver {
 pub(in crate::webchat) struct SocketSender(pub(in crate::webchat) OutboundSender);
 impl SocketSender {
     pub(in crate::webchat) async fn send(&mut self, message: Message) -> Result<(), ()> {
-        self.0.send(Outbound { message, ack: None, deadline: None }).await
+        self.0.send(Outbound { identity_notice: None, message, ack: None, deadline: None }).await
     }
 }
 
@@ -221,13 +221,27 @@ impl TurnSink {
         self
     }
 
+    /// This method accepts no reply content. The writer still checks revocation.
+    pub(in crate::webchat) async fn identity_unavailable(
+        &self, validity: crate::handlers::live_context::SocketValidity, admission: bool,
+    ) {
+        if validity != crate::handlers::live_context::SocketValidity::Unavailable { return; }
+        self.tx.finish_progress(&self.progress_dropped);
+        let notice = IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, admission);
+        let frame = Outbound {
+            message: notice.message(), identity_notice: Some(notice), ack: None,
+            deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT),
+        };
+        let _ = self.tx.send_owned(frame, Some(self.progress_dropped.clone()), true).await;
+    }
+
     pub(in crate::webchat) async fn frame(&self, frame: ChatMessage) {
         if let Ok(value) = serde_json::to_value(frame) { self.value(value).await; }
     }
 
     pub(in crate::webchat) async fn value(&self, value: serde_json::Value) {
         let terminal = is_terminal(&value);
-        let _ = self.tx.send_owned(Outbound {
+        let _ = self.tx.send_owned(Outbound { identity_notice: None,
             message: self.envelope(value), ack: None, deadline: None,
         }, Some(self.progress_dropped.clone()), terminal).await;
     }
@@ -260,13 +274,14 @@ impl TurnSink {
             }
             let terminal = is_terminal(&value);
             if !self.wait_ack || is_redaction(&value) {
-                return self.tx.send_owned(Outbound {
+                return self.tx.send_owned(Outbound { identity_notice: None,
                     message: self.envelope(value), ack: None, deadline: None,
                 }, Some(self.progress_dropped.clone()), terminal).await;
             }
             let (ack, received) = oneshot::channel();
             let deadline = tokio::time::Instant::now() + SEND_TIMEOUT;
             self.tx.send_owned(Outbound {
+                identity_notice: terminal.then(|| IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, false)),
                 message: self.envelope(value), ack: Some(ack), deadline: Some(deadline),
             }, Some(self.progress_dropped.clone()), terminal).await?;
             if !tokio::time::timeout_at(deadline, received).await.ok()
@@ -325,10 +340,10 @@ mod tests {
     async fn full_control_lane_backpressures_without_dropping_controls() {
         let (tx, mut rx) = outbound_channel();
         for _ in 0..CONTROL_CAPACITY {
-            tx.send(Outbound { message: Message::Ping(vec![].into()), ack: None, deadline: None }).await.unwrap();
+            tx.send(Outbound { identity_notice: None, message: Message::Ping(vec![].into()), ack: None, deadline: None }).await.unwrap();
         }
         let next = tokio::spawn(async move {
-            tx.send(Outbound { message: Message::Pong(vec![].into()), ack: None, deadline: None }).await
+            tx.send(Outbound { identity_notice: None, message: Message::Pong(vec![].into()), ack: None, deadline: None }).await
         });
         tokio::task::yield_now().await;
         assert!(!next.is_finished());
@@ -441,10 +456,10 @@ mod tests {
         let (tx, mut rx) = outbound_channel();
         // Queue a frame whose deadline expires while the writer stalls.
         let (ack, received_expired) = oneshot::channel();
-        tx.send(Outbound { message: Message::Text("expired".into()), ack: Some(ack),
+        tx.send(Outbound { identity_notice: None, message: Message::Text("expired".into()), ack: Some(ack),
             deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT) }).await.unwrap();
         tokio::time::advance(SEND_TIMEOUT).await;
-        tx.send(Outbound { message: Message::Text("live".into()), ack: None, deadline: None }).await.unwrap();
+        tx.send(Outbound { identity_notice: None, message: Message::Text("live".into()), ack: None, deadline: None }).await.unwrap();
         drop(tx);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let captured = sent.clone();
@@ -496,7 +511,7 @@ mod tests {
         });
         let task = tokio::spawn(async move {
             let mut writer = BoundedSocketSink(Box::pin(stalled));
-            Outbound { message: Message::Text("partial".into()), ack: Some(ack),
+            Outbound { identity_notice: None, message: Message::Text("partial".into()), ack: Some(ack),
                 deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT) }.deliver(&mut writer).await
         });
         polled.notified().await;

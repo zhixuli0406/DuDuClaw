@@ -1,4 +1,8 @@
 {
+  "chat.unanswered": "這則訊息還沒有回覆。AI 員工可能還在處理，回覆到了會自動顯示。",
+  "chat.unansweredExpired": "一直沒有收到回覆。可以重新傳送，或請管理員查看閘道紀錄。",
+  "chat.stalled": "AI 員工還沒有回應，已等待 {minutes} 分鐘。",
+  "chat.otherConversationFailed": "另一個對話的回覆失敗，請回到該對話查看。",
   "nav.account": "帳號",
   "nav.account.desc": "變更自己的密碼、電子郵件與登入驗證設定。",
   "liveEvents.stale": "資料可能已過時",

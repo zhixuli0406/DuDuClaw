@@ -1,4 +1,8 @@
 {
+  "chat.unanswered": "このメッセージにはまだ返信がありません。AI スタッフが処理中の可能性があります。返信が届くと自動で表示されます。",
+  "chat.unansweredExpired": "返信が届いていません。再送するか、管理者にゲートウェイのログ確認を依頼してください。",
+  "chat.stalled": "AI スタッフからまだ応答がありません。{minutes} 分待っています。",
+  "chat.otherConversationFailed": "別の会話で返信に失敗しました。その会話に戻って確認してください。",
   "nav.account": "アカウント",
   "nav.account.desc": "自分のパスワード、メールアドレス、ログイン認証を管理します。",
   "liveEvents.stale": "データが古い可能性があります",
