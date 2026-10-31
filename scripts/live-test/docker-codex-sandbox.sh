@@ -18,6 +18,11 @@ python3 - <<'PY'
 import os
 from pathlib import Path
 assert os.getuid() == 1000 and os.geteuid() == 1000, 'container must run as uid 1000'
+try:
+    scope = Path('/proc/sys/kernel/yama/ptrace_scope').read_text().strip()
+except OSError:
+    scope = 'unavailable (no Yama or unreadable)'
+print(f'Host kernel.yama.ptrace_scope={scope}')
 status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
 for field in ('CapEff', 'CapBnd'):
     assert int(status[field].strip(), 16) == 0, f'{field} must be zero'

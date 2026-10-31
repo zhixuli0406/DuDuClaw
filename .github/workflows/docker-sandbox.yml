@@ -50,6 +50,11 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
+      - name: Require Yama process isolation on Ubuntu runners
+        run: |
+          scope="$(cat /proc/sys/kernel/yama/ptrace_scope)"
+          echo "kernel.yama.ptrace_scope=$scope"
+          test "$scope" -ge 1
       - name: Check generated seccomp profile
         run: |
           python3 scripts/gen-seccomp-bwrap.py > "$RUNNER_TEMP/seccomp-bwrap.json"

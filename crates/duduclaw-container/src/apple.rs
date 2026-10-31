@@ -49,6 +49,7 @@ impl AppleContainerRuntime {
     /// Run a command via the `container` CLI.
     async fn run_cmd(&self, args: &[&str]) -> Result<String> {
         let mut cmd = tokio::process::Command::new(&self.binary);
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
         if args == ["--version"] {
             duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
         }

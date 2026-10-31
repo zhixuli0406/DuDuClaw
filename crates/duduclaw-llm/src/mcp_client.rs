@@ -482,6 +482,7 @@ impl McpClient {
         clear_env: bool,
     ) -> Result<Self, McpError> {
         let mut cmd = Command::new(command);
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
         if clear_env {
             cmd.env_clear();
         }
@@ -1883,6 +1884,37 @@ mod boundary_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stdio_mcp_namespace_guard_survives_env_clear() {
+        const CHILD: &str = "DUDUCLAW_MCP_GUARD_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mcp_client::tests::stdio_mcp_namespace_guard_survives_env_clear", "--nocapture"])
+                .env("DUDUCLAW_IN_CONTAINER", "1").env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("guard.txt");
+        // Unlike unshare, process_vm_readv of our own memory is normally allowed
+        // by Docker's baseline seccomp profile. EPERM proves the extra guard.
+        let script = r#"import ctypes, errno, os, pathlib, platform, sys
+libc = ctypes.CDLL(None, use_errno=True)
+nr = 310 if platform.machine() == 'x86_64' else 270
+assert libc.syscall(nr, os.getpid(), 0, 0, 0, 0, 0) == -1
+assert ctypes.get_errno() == errno.EPERM
+pathlib.Path(sys.argv[1]).write_text('guarded')
+"#;
+        let result = McpClient::spawn_and_handshake(
+            "python3", &["-c".into(), script.into(), out.to_string_lossy().into_owned()],
+            &[], Duration::from_secs(5), std::process::Stdio::inherit(), true,
+        ).await;
+        assert!(result.is_err(), "probe deliberately exits before handshake");
+        assert_eq!(std::fs::read_to_string(out).unwrap(), "guarded");
+    }
 
     /// `connect_scrubbed` starts the child from the allowlist, not this
     /// process's environment (cargo sets `CARGO_MANIFEST_DIR` on the test

@@ -19,6 +19,28 @@ pub fn is_active() -> bool {
     cfg!(target_os = "linux") && is_containerized()
 }
 
+/// Protect the unfiltered gateway from same-uid injection without requiring Yama.
+/// Linux resets dumpability on exec, so ordinary child programs are unaffected.
+pub fn harden_gateway_process() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if is_active() {
+        // SAFETY: PR_SET_DUMPABLE takes an integer and no pointers.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Read the current process's kernel dumpability, failing closed on probe errors.
+pub fn gateway_process_is_non_dumpable() -> bool {
+    #[cfg(target_os = "linux")]
+    // SAFETY: PR_GET_DUMPABLE takes no pointers.
+    return unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } == 0;
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 /// Attach a fail-closed filter before exec, without changing the environment.
 pub fn guard_command(cmd: &mut tokio::process::Command) {
     guard_command_std(cmd.as_std_mut());
@@ -108,7 +130,7 @@ mod linux {
 
     // Offsets are fixed by the seccomp_data UAPI: nr=0, arch=4, args[0]=16.
     // Both supported ABIs are little endian, so offset 16 is its low word.
-    const fn program(arch: u32, sys: [u32; 7]) -> [libc::sock_filter; 23] {
+    const fn program(arch: u32, sys: [u32; 10]) -> [libc::sock_filter; 29] {
         [
             op(LD, 0, 0, 4),
             op(JEQ, 1, 0, arch),
@@ -125,6 +147,9 @@ mod linux {
             op(JEQ, 0, 1, sys[3]), op(RET, 0, 0, DENY),
             op(JEQ, 0, 1, sys[4]), op(RET, 0, 0, DENY),
             op(JEQ, 0, 1, sys[5]), op(RET, 0, 0, NOSYS),
+            op(JEQ, 0, 1, sys[7]), op(RET, 0, 0, DENY),
+            op(JEQ, 0, 1, sys[8]), op(RET, 0, 0, DENY),
+            op(JEQ, 0, 1, sys[9]), op(RET, 0, 0, DENY),
             op(JEQ, 0, 3, sys[6]),
             op(LD, 0, 0, 16),
             op(JSET, 0, 1, NAMESPACE_FLAGS),
@@ -133,10 +158,11 @@ mod linux {
         ]
     }
 
-    static FILTER: [libc::sock_filter; 23] = program(ARCH, [
+    static FILTER: [libc::sock_filter; 29] = program(ARCH, [
         libc::SYS_unshare as u32, libc::SYS_mount as u32, libc::SYS_umount2 as u32,
         libc::SYS_pivot_root as u32, libc::SYS_setns as u32,
         libc::SYS_clone3 as u32, libc::SYS_clone as u32,
+        libc::SYS_ptrace as u32, libc::SYS_process_vm_readv as u32, libc::SYS_process_vm_writev as u32,
     ]);
 
     pub(super) fn install(sync_threads: bool) -> io::Result<()> {
@@ -190,12 +216,13 @@ mod linux {
         #[test]
         fn bpf_layout_for_both_architectures() {
             // Linux UAPI syscall numbers; compare the native variant to libc.
-            for (arch, sys) in [(X86_64, [272, 165, 166, 155, 308, 435, 56]),
-                                (AARCH64, [97, 40, 39, 41, 268, 435, 220])] {
+            for (arch, sys) in [(X86_64, [272, 165, 166, 155, 308, 435, 56, 101, 310, 311]),
+                                (AARCH64, [97, 40, 39, 41, 268, 435, 220, 117, 270, 271])] {
                 let p = program(arch, sys);
                 assert_eq!(evaluate(&p, 0, 0, 0), DENY);
                 assert_eq!(evaluate(&p, if arch == X86_64 { AARCH64 } else { X86_64 }, 0, 0), DENY);
                 for nr in &sys[..5] { assert_eq!(evaluate(&p, arch, *nr, 0), DENY); }
+                for nr in &sys[7..] { assert_eq!(evaluate(&p, arch, *nr, 0), DENY); }
                 assert_eq!(evaluate(&p, arch, sys[5], 0), NOSYS);
                 assert_eq!(evaluate(&p, arch, sys[6], 0), ALLOW);
                 for bit in 0..32 {
@@ -273,6 +300,10 @@ mod linux {
         #[test]
         fn thread_clone_child() {
             if std::env::var("DUDUCLAW_NS_GUARD_TEST_CHILD").as_deref() != Ok("1") { return; }
+            for nr in [libc::SYS_ptrace, libc::SYS_process_vm_readv, libc::SYS_process_vm_writev] {
+                assert_eq!(unsafe { libc::syscall(nr, 0, 0, 0, 0, 0, 0) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            }
             std::thread::spawn(|| {
                 assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWUSER) }, -1);
                 assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
@@ -291,6 +322,44 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn harden_gateway_child() {
+        const CHILD: &str = "DUDUCLAW_HARDEN_GATEWAY_TEST";
+        match std::env::var(CHILD).as_deref() {
+            Ok("harden") => {
+                super::harden_gateway_process().unwrap();
+                assert!(super::gateway_process_is_non_dumpable());
+                // Self-access remains usable even as a non-dumpable process.
+                std::fs::File::open("/proc/self/mem").unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "ns_guard::tests::harden_gateway_child", "--nocapture"])
+                    .env(CHILD, "probe")
+                    .env("DUDUCLAW_HARDEN_PARENT_PID", std::process::id().to_string())
+                    .status().unwrap();
+                assert!(status.success());
+            }
+            Ok("probe") => {
+                assert!(!super::gateway_process_is_non_dumpable(), "exec must reset dumpability");
+                // CAP_SYS_PTRACE can bypass this protection; acceptance runs without it.
+                let caps = std::fs::read_to_string("/proc/self/status").unwrap();
+                let effective = caps.lines().find_map(|l| l.strip_prefix("CapEff:\t")).unwrap();
+                assert_eq!(u64::from_str_radix(effective.trim(), 16).unwrap() & (1 << 19), 0);
+                let pid = std::env::var("DUDUCLAW_HARDEN_PARENT_PID").unwrap();
+                let error = std::fs::OpenOptions::new().write(true)
+                    .open(format!("/proc/{pid}/mem")).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            _ => {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "ns_guard::tests::harden_gateway_child", "--nocapture"])
+                    .env("DUDUCLAW_IN_CONTAINER", "1").env(CHILD, "harden")
+                    .status().unwrap();
+                assert!(status.success());
+            }
+        }
+    }
+
     #[test]
     fn marker_only_containers_and_native_detection() {
         for marker in ["1", "true", "yes"] {

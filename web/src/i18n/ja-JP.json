@@ -4702,6 +4702,7 @@
   "settings.doctor.check.config_file": "設定ファイル",
   "settings.doctor.check.agents": "AI 社員",
   "settings.doctor.check.api_key": "API キー",
+  "settings.doctor.check.container_process_isolation": "コンテナのプロセス分離",
   "settings.doctor.check.codex_employee_shell": "Codex 従業員のシェル",
   "settings.doctor.check.container_runtime": "コンテナ環境",
   "settings.doctor.check.mcp_server": "MCP ツールサービス",

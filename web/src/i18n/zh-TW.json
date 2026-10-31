@@ -4702,6 +4702,7 @@
   "settings.doctor.check.config_file": "設定檔",
   "settings.doctor.check.agents": "AI 員工",
   "settings.doctor.check.api_key": "API 金鑰",
+  "settings.doctor.check.container_process_isolation": "容器行程隔離",
   "settings.doctor.check.codex_employee_shell": "Codex 員工 shell",
   "settings.doctor.check.container_runtime": "容器環境",
   "settings.doctor.check.mcp_server": "MCP 工具服務",

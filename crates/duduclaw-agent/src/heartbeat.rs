@@ -1251,6 +1251,7 @@ async fn execute_proactive_check(
 
             let max_turns_str = agent_config.proactive.max_turns.to_string();
             let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
+            duduclaw_core::ns_guard::guard_command(&mut cmd);
             cmd.arg("--print")
                 .args(["--system-prompt-file", &prompt_path.to_string_lossy()])
                 .args(["--max-turns", &max_turns_str])

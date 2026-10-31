@@ -8730,6 +8730,10 @@ mod admin_auth_token_tests {
 }
 
 async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
+    if let Err(error) = duduclaw_core::ns_guard::harden_gateway_process() {
+        eprintln!("ERROR: 無法啟用容器 gateway 行程保護，拒絕啟動：{error}");
+        std::process::exit(1);
+    }
     let home = duduclaw_home();
 
     // Resolve bind/port with priority: env var > config.toml [gateway] >
@@ -10338,6 +10342,14 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
         if status == "warn" { CheckStatus::Warn } else { CheckStatus::Pass },
         message.into(),
     ));
+
+    if let Some((status, message)) = duduclaw_gateway::handlers::container_process_isolation_status_and_message() {
+        checks.push((
+            "容器行程隔離".into(),
+            if status == "warn" { CheckStatus::Warn } else { CheckStatus::Pass },
+            message.into(),
+        ));
+    }
 
     // Check 4c: agents on a deprecated runtime (R1, 2026-10).
     checks.push(deprecated_runtime_check(&home).await);
