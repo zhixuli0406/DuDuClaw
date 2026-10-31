@@ -1,0 +1,39 @@
+[package]
+name = "duduclaw-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duduclaw-core.workspace = true
+duduclaw-gateway.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+url = "2"
+rand = "0.8"
+toml.workspace = true
+tempfile = "3"
+unicode-width = "0.2.2"
+unicode-segmentation = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+insta.workspace = true
+axum.workspace = true
+tracing-subscriber.workspace = true
+log = "0.4"
+
+[lints]
+workspace = true

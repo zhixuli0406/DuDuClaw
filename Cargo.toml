@@ -23,6 +23,7 @@ members = [
     "crates/duduclaw-container",
     "crates/duduclaw-agent",
     "crates/duduclaw-cli",
+    "crates/duduclaw-tui",
     "crates/duduclaw-dashboard",
     "crates/duduclaw-odoo",
     "crates/duduclaw-inference",
@@ -82,6 +83,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # unchanged; the binary-size trade-off is preferable to carrying unsafe codecs.
 rust-embed = "8"
 mime_guess = "2"
+
+# Terminal client (stable releases older than 14 days on 2026-10-30).
+ratatui = { version = "=0.30.2", default-features = false }
+crossterm = { version = "=0.29.0", default-features = false, features = ["events", "windows"] }
+insta = { version = "=1.49.0", default-features = false }
+zeroize = { version = "1", features = ["serde"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
