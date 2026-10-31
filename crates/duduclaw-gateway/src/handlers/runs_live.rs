@@ -377,10 +377,10 @@ mod tests {
             Arc::new(move |step| {
                 let handler = handler.clone();
                 let ctx = ctx.clone();
-                Box::pin(async move { handler.may_push_run_step(&step, &ctx).await })
+                Box::pin(async move { (0, handler.may_push_run_step(&step, &ctx).await) })
             }),
         )
         .await;
-        outbound_rx.try_recv().ok()
+        outbound_rx.try_recv().ok().map(|ready| ready.step)
     }
 }

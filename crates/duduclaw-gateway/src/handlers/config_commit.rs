@@ -244,6 +244,41 @@ pub(crate) fn commit_text_locked_with_guard(
     })
 }
 
+/// MFA-only adapter; the guard and policy transition run inside the config lock.
+pub(crate) async fn commit_mfa_table_locked_with_guard(
+    path: &Path,
+    expected_hash: String,
+    table: &toml::Table,
+    actor: String,
+    guard: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let table = table.clone();
+    tokio::task::spawn_blocking(move || {
+        commit_mfa_table_inner(&path, &expected_hash, &table, &actor, guard)
+    })
+    .await
+    .map_err(|e| format!("config write task failed: {e}"))?
+}
+
+fn commit_mfa_table_inner(
+    path: &Path,
+    expected_hash: &str,
+    table: &toml::Table,
+    actor: &str,
+    guard: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    commit_rendered_policy(path, expected_hash, |current| {
+        guard()?;
+        render_preserving(current, table)
+    }, true, Some(actor))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static MFA_BEFORE_REPLACE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
 /// Commit `table` with [`commit_text_locked`]. The bytes written are the
 /// file as it is on disk (verified against `expected_hash` under the lock)
 /// with only the keys that differ from `table` edited in place — see
@@ -287,24 +322,24 @@ pub(crate) fn commit_rendered_locked(
     expected_hash: &str,
     render: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<(), String> {
-    commit_rendered_policy(path,expected_hash,render,true)
+    commit_rendered_policy(path,expected_hash,render,true,None)
 }
 /// Existing local CLI policy remains at its caller. This narrow final-write
 /// adapter changes locking/durability, not operator role/product policy.
 pub(crate) fn commit_local_config_rendered(
     home:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,
 )->Result<(),String> {
-    commit_rendered_policy(&home.join("config.toml"),expected_hash,render,false)
+    commit_rendered_policy(&home.join("config.toml"),expected_hash,render,false,None)
 }
-fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool)->Result<(),String> {
+fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,mfa_actor:Option<&str>)->Result<(),String> {
     if path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
         let home=path.parent().ok_or("config.toml has no parent")?;
-        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(commit_rendered_inner(path,expected_hash,render,dashboard_policy,Some(g))))
+        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(commit_rendered_inner(path,expected_hash,render,dashboard_policy,Some(g),mfa_actor)))
             .map_err(|e|e.to_string())?;
     }
-    commit_rendered_inner(path,expected_hash,render,dashboard_policy,None)
+    commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor)
 }
-fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>)->Result<(),String> {
+fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>)->Result<(),String> {
     let outcome = duduclaw_core::with_file_lock(path, || {
         let current = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -328,15 +363,37 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
                 }
             }
         }
-        if let Some(g)=source {
-            return Ok(crate::google_identity::home_source::commit_google_config_under_guard(g,&current,&new_content).map_err(|e|e.to_string()));
+        if mfa_actor.is_none() && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
+            if let Err(error) = crate::mfa::refuse_policy_change(&current, &new_content) {
+                return Ok(Err(error));
+            }
         }
-        replace_owner_only(path, &new_content)?;
-        Ok(Ok(()))
+        let write = || {
+            #[cfg(test)]
+            if mfa_actor.is_some() {
+                MFA_BEFORE_REPLACE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() { hook(); }
+                });
+            }
+            if let Some(g) = source {
+                crate::google_identity::home_source::commit_google_config_under_guard(g, &current, &new_content)
+                    .map_err(|e| e.to_string())
+            } else {
+                replace_owner_only(path, &new_content).map_err(|e| e.to_string())
+            }
+        };
+        if let Some(actor) = mfa_actor {
+            let Some(home) = path.parent().filter(|_| path.file_name().and_then(|n| n.to_str()) == Some("config.toml")) else {
+                return Ok(Err("MFA policy requires config.toml".into()));
+            };
+            Ok(crate::mfa::commit_policy(home, &new_content, actor, write))
+        } else {
+            Ok(write())
+        }
     });
     match outcome {
         Ok(inner) => {
-            if inner.is_ok() && path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
+            if mfa_actor.is_none() && inner.is_ok() && path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
                 if let Some(home)=path.parent() { crate::mfa::reload_policy(home); }
             }
             inner
@@ -917,6 +974,101 @@ name = "oa1"
 #[cfg(test)]
 mod mfa_guard_tests {
     use super::*;
+    fn policy_value(home: &Path) -> bool {
+        rusqlite::Connection::open(home.join("users.db")).unwrap()
+            .query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn mfa_ordinary_config_writers_refuse_changes_under_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "[auth]\nmfa_enforced=true\n";
+        std::fs::write(&path, original).unwrap();
+        for next in ["", "[auth]\nmfa_enforced=false\n"] {
+            let error = commit_text_locked(&path, &content_hash(original), next).unwrap_err();
+            assert!(error.contains("system.update_config"));
+            let error = commit_local_config_rendered(home.path(), &content_hash(original), |_| Ok(next.into())).unwrap_err();
+            assert!(error.contains("system.update_config"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+        commit_text_locked(&path, &content_hash(original),
+            "[auth]\nmfa_enforced=true\n[general]\nlog_level='debug'\n").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("log_level"));
+    }
+
+    #[test]
+    fn mfa_enable_is_strict_at_real_config_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "[auth]\nmfa_enforced=false\n";
+        std::fs::write(&path, original).unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        crate::mfa::reload_policy(home.path());
+        let observed_home = home.path().to_path_buf();
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = observed.clone();
+        MFA_BEFORE_REPLACE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(policy_value(&observed_home));
+            assert_eq!(std::fs::read_to_string(observed_home.join("config.toml")).unwrap(), original);
+            // A separate credential transaction already observes the strict state.
+            let conn = rusqlite::Connection::open(observed_home.join("users.db")).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, bool>(0)).unwrap());
+            flag.set(true);
+        })));
+        let next = "[auth]\nmfa_enforced=true\n".parse().unwrap();
+        commit_mfa_table_inner(&path, &content_hash(original), &next, "test-admin", || Ok(())).unwrap();
+        assert!(observed.get());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("mfa_enforced=true"));
+        assert!(crate::mfa::enforced(home.path(), false).unwrap());
+    }
+
+    #[test]
+    fn mfa_commit_db_failure_preserves_strict_order_and_reload_reconciles() {
+        for initial in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("config.toml");
+            let original = format!("[auth]\nmfa_enforced={initial}\n");
+            std::fs::write(&path, &original).unwrap();
+            let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+            crate::mfa::reload_policy(home.path());
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            conn.execute_batch("CREATE TRIGGER fail_policy BEFORE INSERT ON mfa_policy_state BEGIN SELECT RAISE(FAIL, 'policy write failed'); END;").unwrap();
+            let next: toml::Table = format!("[auth]\nmfa_enforced={}\n", !initial).parse().unwrap();
+            let error = commit_mfa_table_inner(&path, &content_hash(&original), &next, "test-admin", || Ok(())).unwrap_err();
+            assert!(error.contains("policy write failed"), "{error}");
+            assert_eq!(policy_value(home.path()), initial);
+            let disk = std::fs::read_to_string(&path).unwrap();
+            if initial {
+                assert_eq!(disk.parse::<toml::Table>().unwrap(), next);
+                assert!(crate::mfa::enforced(home.path(), false).unwrap());
+            } else {
+                assert_eq!(disk, original);
+            }
+            assert_eq!(crate::mfa::policy_status(home.path())["degraded"], true);
+            conn.execute_batch("DROP TRIGGER fail_policy").unwrap();
+            crate::mfa::reload_policy(home.path());
+            assert!(!policy_value(home.path()));
+            assert_eq!(crate::mfa::policy_status(home.path())["degraded"], false);
+        }
+    }
+
+    #[test]
+    fn mfa_commit_guard_and_hash_fail_before_policy_write() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "[auth]\nmfa_enforced=false\n";
+        std::fs::write(&path, original).unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        crate::mfa::reload_policy(home.path());
+        let next = "[auth]\nmfa_enforced=true\n".parse().unwrap();
+        assert!(commit_mfa_table_inner(&path, &content_hash(original), &next, "test-admin", || Err("guard refused".into())).is_err());
+        assert!(commit_mfa_table_inner(&path, "stale hash", &next, "test-admin", || panic!("guard ran before CAS")).is_err());
+        assert!(!policy_value(home.path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
     #[tokio::test]
     async fn mfa_config_writers_recheck_admin_inside_commit_guard() {
         let home=tempfile::tempdir().unwrap();

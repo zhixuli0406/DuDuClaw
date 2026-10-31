@@ -81,6 +81,104 @@ fn parse_policy(text: &str) -> Result<bool, String> {
         Some(v) => v.as_bool().ok_or_else(|| "雙因素驗證設定必須是布林值。".into()),
     }
 }
+
+/// Restore must preserve the live policy; an unreadable policy defaults to strict.
+pub(crate) fn restore_policy(home: &Path) -> bool {
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok().and_then(|text| parse_policy(&text).ok())
+        .unwrap_or(true)
+}
+
+pub(crate) fn restore_policy_differs(home: &Path, text: &str) -> bool {
+    parse_policy(text).ok() != Some(restore_policy(home))
+}
+
+pub(crate) const RESTORE_POLICY_NOTICE: &str =
+    "還原會保留目前的雙因素驗證強制設定；如需變更，請使用雙因素驗證專用開關。";
+
+/// Edit only this key, retaining the backup's other settings and formatting.
+pub(crate) fn preserve_restore_policy(text: &str, value: bool) -> Result<String, String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
+    if doc.get("auth").is_none() {
+        doc["auth"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let auth = doc.get_mut("auth").and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or("登入設定格式不正確。")?;
+    let mut replacement = toml_edit::Value::from(value);
+    if let Some(old) = auth.get("mfa_enforced").and_then(toml_edit::Item::as_value) {
+        *replacement.decor_mut() = old.decor().clone();
+    }
+    auth.insert("mfa_enforced", toml_edit::Item::Value(replacement));
+    Ok(doc.to_string())
+}
+/// Ordinary writers must preserve the effective policy (an absent key is false).
+pub(crate) fn refuse_policy_change(before: &str, after: &str) -> Result<(), String> {
+    if parse_policy(before)? != parse_policy(after)? {
+        return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更（system.update_config，需 expected_state）；請保留目前設定。".into());
+    }
+    Ok(())
+}
+
+/// Keep reloads from reading the old config between the strict DB transition
+/// and file replacement. The caller already holds the config lock.
+pub(crate) fn commit_policy(
+    home: &Path,
+    new_content: &str,
+    actor: &str,
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let value = parse_policy(new_content)?;
+    let mut snapshots = POLICY.write().unwrap_or_else(|e| e.into_inner());
+    let snapshot = snapshots.entry(home.to_path_buf()).or_default();
+    let result = (|| {
+        let since = if value { record_policy(home, true)? } else { None };
+        // If replacement fails after enabling, deliberately retain strict DB state.
+        write()?;
+        // Record the file effect before the fallible disable-side DB transition.
+        crate::security_autopilot::audit_and_emit(
+            home,
+            &duduclaw_security::audit::AuditEvent::new(
+                "config_protected_key_changed", actor,
+                duduclaw_security::audit::Severity::Warning,
+                json!({"key":"auth.mfa_enforced", "before":snapshot.value, "after":value,
+                    "user_id":actor, "source":"system.update_config", "config_applied":true,
+                    "policy_reconciled":value, "reconciling":!value}),
+            ),
+        );
+        if !value {
+            record_policy(home, false).map_err(|error| format!(
+                "雙因素驗證變更已在 config.toml 生效，資料庫政策正在等待重新載入同步；同步前保留原強制政策。{error}"
+            ))?;
+        }
+        Ok(since)
+    })();
+    match result {
+        Ok(since) => {
+            snapshot.value = Some(value);
+            snapshot.enforced_at = since;
+            snapshot.degraded = false;
+            Ok(())
+        }
+        Err(error) => {
+            snapshot.degraded = true;
+            Err(error)
+        }
+    }
+}
+
+fn record_policy(home: &Path, value: bool) -> Result<Option<i64>, String> {
+    if home.join("users.db").exists() {
+        let mut db = rusqlite::Connection::open_with_flags(
+            home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        ).map_err(|e| e.to_string())?;
+        duduclaw_auth::mfa::record_enforcement(&mut db, value, chrono::Utc::now().timestamp_micros())
+    } else if value {
+        Err("MFA identity store unavailable".into())
+    } else {
+        Ok(None)
+    }
+}
+
 /// Boot and configuration reload only. A failed reload never discards a good snapshot.
 pub(crate) fn reload_policy(home: &Path) {
     // Serialize reloads so an older disk read cannot overwrite a newer snapshot.
@@ -88,12 +186,7 @@ pub(crate) fn reload_policy(home: &Path) {
     let result = std::fs::read_to_string(home.join("config.toml"))
         .map_err(|e|e.to_string()).and_then(|s|parse_policy(&s))
         .and_then(|value| {
-            let since = if home.join("users.db").exists() {
-                let mut db = rusqlite::Connection::open_with_flags(home.join("users.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|e|e.to_string())?;
-                duduclaw_auth::mfa::record_enforcement(&mut db,value,chrono::Utc::now().timestamp_micros())?
-            } else if value {
-                return Err("MFA identity store unavailable".into());
-            } else { None };
+            let since = record_policy(home, value)?;
             Ok((value,since))
         });
     let snapshot = snapshots.entry(home.to_path_buf()).or_default();
@@ -122,9 +215,62 @@ pub(crate) fn enrollment_payload(secret: String, email: &str) -> Value {
     json!({"secret":secret,"otpauth_uri":format!("otpauth://totp/{label}?secret={secret}&issuer=DuDuClaw&algorithm=SHA1&digits=6&period=30")})
 }
 
+/// Called inside the MFA write transaction. No token-issuance failure can
+/// commit enrollment without its recovery codes or commit a partial disable.
+pub(crate) fn replacement_session(
+    jwt: &duduclaw_auth::JwtConfig,
+    user: &duduclaw_auth::User,
+    access: &[(String, duduclaw_auth::AccessLevel)],
+    previous_epoch: u64,
+    codes: Vec<String>,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    if previous_epoch.checked_add(1) != Some(user.credential_epoch) {
+        return Err("登入憑證已失效，請重新登入。".into());
+    }
+    let (access_token, refresh_token) = jwt.issue_session_tokens(user, access)?;
+    Ok(serde_json::json!({
+        "enabled": enabled, "recovery_codes": codes,
+        "access_token": access_token, "refresh_token": refresh_token, "user": user,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mfa_restore_policy_defaults_strict_when_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(restore_policy(home.path()));
+        std::fs::create_dir(home.path().join("config.toml")).unwrap();
+        assert!(restore_policy(home.path()));
+    }
+
+    #[test]
+    fn mfa_restore_rewrites_only_key_in_inline_auth_table() {
+        let before = "auth = { mfa_enforced = false, other = 'keep' } # comment\n";
+        let after = preserve_restore_policy(before, true).unwrap();
+        assert_eq!(after, before.replacen("false", "true", 1));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true").unwrap();
+        assert!(restore_policy_differs(home.path(), before));
+        assert!(!restore_policy_differs(home.path(), &after));
+    }
+
+    #[test]
+    fn mfa_ordinary_writes_compare_effective_parsed_values() {
+        for (before, after) in [
+            ("", "[auth]\nmfa_enforced=true"),
+            ("[auth]\nmfa_enforced=true", ""),
+            ("[auth]\nmfa_enforced=true", "[auth]"),
+            ("[auth]\nmfa_enforced=true", "auth=false"),
+        ] {
+            assert!(refuse_policy_change(before, after).is_err());
+        }
+        assert!(refuse_policy_change("", "[auth]\nmfa_enforced=false").is_ok());
+        assert!(refuse_policy_change("[auth]\nmfa_enforced=true", "# comment\n[auth]\nmfa_enforced = true\n[general]\nlog_level='debug'").is_ok());
+    }
+
     #[test]
     fn mfa_policy_snapshot_keeps_last_good_on_reload_failure() {
         let home=tempfile::tempdir().unwrap();

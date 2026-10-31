@@ -94,11 +94,7 @@ impl UserDb {
 
     /// A policy toggle must not grandfather an unconfirmed password-only setup.
     pub fn mfa_require_independent_proof(&self, token: &str, now: i64) -> Result<()> {
-        let conn=self.conn();
-        challenge_user(&conn,token,"enroll",now)?;
-        let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_enrollment_proofs WHERE token_hash=?1 AND verified=1 AND kind IN ('channel','admin'))",
-            [token_hash(token)],|r|r.get(0)).map_err(|e|e.to_string())?;
-        if valid { Ok(()) } else { Err("請重新開始註冊並完成獨立身分驗證。".into()) }
+        require_independent_proof(&self.conn(), token, now)
     }
 
     pub fn mfa_prove_enrollment(&self, token: &str, code: &str, now: i64) -> Result<()> {
@@ -151,4 +147,11 @@ impl UserDb {
         tx.commit().map_err(|e|e.to_string())?;
         Ok(code)
     }
+}
+
+pub(super) fn require_independent_proof(conn: &Connection, token: &str, now: i64) -> Result<()> {
+    challenge_user(conn,token,"enroll",now)?;
+    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_enrollment_proofs WHERE token_hash=?1 AND verified=1 AND kind IN ('channel','admin'))",
+        [token_hash(token)],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if valid { Ok(()) } else { Err("請重新開始註冊並完成獨立身分驗證。".into()) }
 }

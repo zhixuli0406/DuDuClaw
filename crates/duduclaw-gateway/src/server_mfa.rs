@@ -119,6 +119,60 @@ async fn socket_expired(state: &AppState, ctx: &UserContext, expires: Option<u64
     socket_validity(state, ctx, expires, legacy, true).await != crate::handlers::live_context::SocketValidity::Valid
 }
 
+/// Only these two short local operations must exclude interleaved socket
+/// gates between their commit and handover. Long-running RPCs stay spawned.
+pub(super) fn is_session_handover(method: &str) -> bool {
+    matches!(method, "mfa.enroll_confirm" | "mfa.disable")
+}
+
+pub(super) struct MfaRpcResult {
+    pub response: WsFrame,
+    pub handover: Option<MfaSessionHandover>,
+}
+
+/// Private transport metadata: never accepted from a client or serialized.
+pub(super) struct MfaSessionHandover {
+    ctx: UserContext,
+    session: String,
+    expires: u64,
+}
+
+impl MfaSessionHandover {
+    pub(super) fn apply(self, ctx: &mut UserContext,
+        session: &mut Option<(String, String)>, expires: &mut Option<u64>) {
+        *session = Some((self.ctx.user_id.clone(), self.session));
+        *expires = Some(self.expires);
+        *ctx = self.ctx;
+    }
+}
+
+/// Run the real authorized dispatcher, then attach an explicit handover only
+/// to a successful MFA epoch transition for this caller. The normal send gate
+/// still checks the new context, including any intervening reset/suspension.
+pub(super) async fn call_with_handover(
+    state: &AppState, method: &str, params: serde_json::Value, ctx: &UserContext,
+    conn: crate::power_local::RpcConnInfo,
+) -> MfaRpcResult {
+    let response = state.handler.handle_conn(method, params, ctx, conn).await;
+    let handover = if is_session_handover(method) {
+        match &response {
+            WsFrame::Response { ok: true, payload: Some(payload), .. } => {
+                payload.get("access_token").and_then(serde_json::Value::as_str)
+                    .and_then(|token| state.jwt_config.verify_access_token(token).ok())
+                    .filter(|claims| claims.sub == ctx.user_id
+                        && ctx.credential_epoch.checked_add(1) == Some(claims.credential_epoch))
+                    .and_then(|claims| {
+                        let session = claims.jti.clone()?;
+                        let new_ctx = UserContext::from_claims(&claims, ctx.must_change_password).ok()?;
+                        Some(MfaSessionHandover { ctx: new_ctx, session, expires: claims.exp })
+                    })
+            }
+            _ => None,
+        }
+    } else { None };
+    MfaRpcResult { response, handover }
+}
+
 fn session(
     state: &AppState,
     user_id: &str,
@@ -252,14 +306,21 @@ async fn enroll(
         let cipher = Cipher(&work.home_dir);
         if confirm {
             let epoch = work.user_db.get_user(&id)?.ok_or("無法登入此帳號。")?.credential_epoch;
-            let codes = work.user_db.mfa_confirm(
+            let payload = work.user_db.mfa_confirm_and_issue(
                 &id,
                 Some(&body.enrollment_token),
                 body.code.as_deref().unwrap_or(""),
                 &cipher,
                 now,
+                personal,
+                |user, access, codes| crate::mfa::replacement_session(
+                    &work.jwt_config, user, access, epoch, codes, true,
+                ),
             )?;
-            session(&work, &id, epoch + 1, Some(codes))
+            if work.user_db.update_last_login(&id).is_err() {
+                tracing::warn!("MFA enrollment succeeded but last-login bookkeeping failed");
+            }
+            Ok(payload)
         } else {
             let user = work.user_db.get_user(&id)?.ok_or("無法登入此帳號。")?;
             let secret = work

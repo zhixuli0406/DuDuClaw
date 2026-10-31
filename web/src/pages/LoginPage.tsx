@@ -2,7 +2,8 @@ import { useState, useEffect, type FormEvent } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { browserWatchReturn } from '@/lib/browser-watch-return';
 import { useIntl } from 'react-intl';
-import { useAuthStore } from '@/stores/auth-store';
+import { LoginMfa } from '@/components/mfa/LoginMfa';
+import { useAuthStore, type LoginChallenge } from '@/stores/auth-store';
 import { Card, Button, Input, Spinner } from '@/components/mds';
 import { Field } from '@/components/onboarding';
 import { DuDu } from '@/components/mascot';
@@ -25,6 +26,7 @@ export function LoginPage() {
   const tryLocalSession = useAuthStore((s) => s.tryLocalSession);
   const loading = useAuthStore((s) => s.loading);
 
+  const [mfa, setMfa] = useState<LoginChallenge | null>(null);
   const [mode, setMode] = useState<Mode>('password');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -109,8 +111,10 @@ export function LoginPage() {
     e.preventDefault();
     setError('');
     try {
-      await login(email, password);
-      navigate(returnTo, { replace: true });
+      const result = await login(email, password);
+      setPassword('');
+      if (result) setMfa(result);
+      else navigate(returnTo, { replace: true });
     } catch (err) {
       setError(localizeLoginError(err instanceof Error ? err.message : String(err)));
     }
@@ -136,8 +140,10 @@ export function LoginPage() {
     e.preventDefault();
     setError('');
     try {
-      await otpVerify(challengeId, code);
-      navigate(returnTo, { replace: true });
+      const result = await otpVerify(challengeId, code);
+      setCode(''); setChallengeId('');
+      if (result) setMfa(result);
+      else navigate(returnTo, { replace: true });
     } catch (err) {
       setError(localizeLoginError(err instanceof Error ? err.message : String(err)));
     }
@@ -183,7 +189,10 @@ export function LoginPage() {
             </div>
           )}
 
-          {firstRun ? (
+          {mfa ? (
+            <LoginMfa challenge={mfa} onComplete={() => navigate(returnTo, { replace: true })}
+              onCancel={() => { setMfa(null); setOtpStep('email'); setError(''); }} />
+          ) : firstRun ? (
             <form onSubmit={handleClaim} className="space-y-4">
               <p className="text-sm text-muted-foreground">
                 {intl.formatMessage({ id: 'login.claim.intro' })}

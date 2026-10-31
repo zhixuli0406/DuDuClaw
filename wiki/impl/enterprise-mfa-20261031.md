@@ -320,3 +320,52 @@ Each filter used `-- --skip server::live_events_socket_tests`. The final push re
 - `line::ingress::f5_tests::refused_reply_token_pushes_the_answer_without_the_thinking_footer` (TCP bind refused)
 
 Status: PARTIAL acceptance. The requested integration is implemented and compiles; runnable filtered tests passed. Real socket behavior remains unverified, and the automatic Pong limitation and pre-existing OS-role downgrade issue above remain. No commit, push, stash, branch switch, workspace formatting, network access or review subagents were used.
+
+### MFA handover live-event identity repair (2026-10-31)
+
+- `MfaSocket` writes a valid `[auth] mfa_enforced=false` configuration, matching `mfa_http_tests`; enrollment still uses the production config/password/session checks.
+- `handle_socket` shares a connection-local `watch<(u64, UserContext)>` between the run enqueue and deliver authorizers. Each call snapshots the current identity before awaiting authorization. Successful enrollment/disable advances the revision and identity together; failed handovers leave them unchanged. The same user retains subscription slots.
+- The forwarder carries the revision of its authorization snapshot with each ready step through the one-slot channel. The socket first discards steps for unsubscribed runs without taking the pending saturation notice. For a still-subscribed run it then drops a mismatched revision, including a handover during authorization, and coalesces pending saturation and the discarded authorized step into one `events_lost` notice. The stale step passed authorization for this same reader, so the loss signal reveals nothing they could not see at that moment. Forbidden authorization results remain silent.
+- A successful handover aborts the old prepared-push task and re-authorizes its retained source frame under a new gate. The old result is never used. During re-authorization `event_gate` remains empty and `pending_push` owns the gate; completion clears the source and restores the returned gate before output checks. An idle handover replaces `event_gate` directly. Handover itself neither advances sequence nor reports loss; a refused frame stays silent.
+- Socket regressions use identity-checked Agent events (fresh identity lookup, no TTL), actual enrollment/disable RPCs, both real run authorizers, and barriers around push filtering and handover. A ready-slot test lets both real authorizers complete at the old epoch while the socket is held, then commits handover before dequeue. Assertions cover one reconciliation notice, contiguous sequence, exactly-once re-authorized events, silent refused events, an old-gate-allowed Agent event whose sales binding is revoked before handover (fresh identity lookup bypasses the TTL), silent unsubscribed old-revision steps, peer retirement and failed-handover preservation. The socket task is awaited to expose panics. Hooks exist only under `cfg(test)`.
+- Counterfactuals (static unless explicitly rerun): retaining the old broadcast gate refuses the first Agent event after handover and hits the receive deadline; omitting ready revision comparison sends `run.step` instead of the expected `events_lost`; marking every pending push lost sends an unexpected loss frame in the refused-event test; discarding an allowed pending source fails the event-99 assertion. Retaining either old run authorizer times out on the next real published step. Reusing the held old-task allowed result after binding revocation leaks event 99 in the permission-flip test; checking revision before subscription produces an unexpected loss frame in the unsubscribed-step test.
+- Identity-copy audit: both push gates are rebuilt on handover; both run closures read the shared holder. `task_ctx` remains a current per-request clone. No awaited run authorization was added to the select loop and no authorized JSON queue was introduced.
+- Current validation results are recorded below. Socket behavior needs an outside-sandbox rerun if TCP binding is refused; compilation alone does not establish acceptance. No review subagents were run, per instruction.
+
+Prior validation before the re-authorization follow-up (sequential Cargo commands, `CARGO_INCREMENTAL=0`, `CARGO_NET_OFFLINE=true`, `-j 4`; logs in `artifacts/mfa/handover-live-events-20261031/`):
+
+- `cargo check -p duduclaw-gateway --tests`: exit 0; `Finished dev profile [unoptimized + debuginfo] target(s) in 9m 19s`. This includes all three new socket regression tests.
+- `cargo test -p duduclaw-gateway --lib mfa -- --skip server::live_events_socket_tests`: interrupted with Ctrl-C, exit 130, at the session time limit while building the test executable; no `test result` line and no executed-test result. `mfa-build-interrupted.log` preserves the build output.
+- `cargo test -p duduclaw-gateway --lib live_event -- --skip server::live_events_socket_tests`: **NOT RUN**, time limit reached before the MFA test build completed. All six tests in `server::live_events_socket_tests` are **NOT RUN** because socket binding is unavailable.
+- The former discard-and-loss regression assertions were superseded by the re-authorization and revision tests described above. The earlier unpatched socket run was **NOT RUN**.
+
+Status: PARTIAL validation. The repair and tests compile; filtered test execution and real-socket acceptance remain outstanding. No commit, push, stash, branch switch, workspace formatting or network access was performed.
+
+
+### Re-authorization follow-up validation (2026-10-31)
+
+All commands run sequentially, offline, with `CARGO_INCREMENTAL=0` and `-j 3`. Logs: `artifacts/mfa/handover-reauthorization-20261031/` (gitignored).
+
+- `cargo check -j 3 -p duduclaw-gateway --tests`: final exit 0; `Finished dev profile [unoptimized + debuginfo] target(s) in 2m 30s`. Earlier checks found the existing `runs_live` test helper still returning the old channel type, then a moved test-hook sender; both were corrected before this passing check. Their logs are retained as `check-initial.log` and `check-hook-ownership.log`.
+- With `DUDUCLAW_P1_PILOT_BINARY=/Users/lizhixu/Project/DuDuClaw-wt-merge/target/debug/duduclaw`, `cargo test -j 3 -p duduclaw-gateway --lib -- --test-threads=4 mfa_live_events`: exit 101; test executable built successfully (`Finished test profile [unoptimized + debuginfo] target(s) in 6m 17s`). Raw runner result: `test result: FAILED. 1 passed; 7 failed; 0 ignored; 0 measured; 10404 filtered out; finished in 0.81s`. Log: `tests.log`.
+- **PASS**: `live_events::tests::mfa_live_events_forwarder_keeps_authorizing_revision_during_handover`. This socket-free test changes identity while the authorization future is held and verifies that both ready results retain the revision captured before authorization.
+- All seven runner failures occurred at `server.rs:18265`, `TcpListener::bind("127.0.0.1:0")`, with `PermissionDenied: Operation not permitted`. They never reached enrollment or behavior assertions and are **NOT RUN** for behavior acceptance:
+  - `server::live_events_socket_tests::mfa_live_events_enroll_and_disable_keep_events_and_both_run_authorizers_current`
+  - `server::live_events_socket_tests::mfa_live_events_handover_reauthorizes_in_flight_push_and_restores_gate`
+  - `server::live_events_socket_tests::mfa_live_events_handover_drops_ready_old_revision_with_one_loss`
+  - `server::live_events_socket_tests::mfa_live_events_handover_refused_in_flight_push_is_silent`
+  - `server::live_events_socket_tests::mfa_live_events_failed_handover_preserves_in_flight_push_and_run_identity`
+  - `server::live_events_socket_tests::mfa_live_events_pause_two_events_and_step_then_recover_once_with_contiguous_sequence`
+  - `server::live_events_socket_tests::mfa_live_events_revoked_socket_closes_without_event_step_or_loss`
+- `git diff --check`: exit 0.
+
+Status: **PARTIAL validation**. All changes compile and the socket-free revision race passes; fixture enrollment and actual socket handover behavior still need Claude's outside-sandbox rerun of the exact test command above. Mutation runs with deliberately stale gates or removed revision checks were not executed; the counterfactual failure assertions above are static evidence only. No commit, push, stash, branch switch, worktree creation/removal, workspace formatting, clippy, full workspace build, cargo clean, cargo fetch, network access or review subagents were used. The original uncommitted changes were retained and extended.
+
+
+### Subscription-first and permission-flip follow-up validation (2026-10-31)
+
+- `CARGO_INCREMENTAL=0 cargo check -j 3 -p duduclaw-gateway --tests`: exit 0; `Finished dev profile [unoptimized + debuginfo] target(s) in 2m 35s`. Gateway lib-test output reports 55 warnings (49 duplicates). Log: `/tmp/duduclaw-mfa-check-20261031.log`.
+- `git diff --check`: exit 0.
+- **NOT RUN**: all socket tests, including the new `mfa_live_events_handover_revoked_in_flight_push_is_silent` and `mfa_live_events_handover_unsubscribed_old_revision_is_silent`; this sandbox refuses socket binds. Claude must rerun them outside the sandbox. Compilation does not establish socket behavior acceptance.
+- **NOT RUN**: mutation tests. Static failure expectations: reusing the old allowed push result leaks event 99 after permission revocation; checking ready revision before subscription emits an unexpected `events_lost` after unsubscribe. Either extra frame or sequence movement fails the next-allowed-event assertions (baseline seq 1, next seq 2); trailing extra frames fail the silence assertion.
+- This follow-up changes only `server.rs` and this note, retaining all existing uncommitted changes. No commit, push, stash, branch switch, workspace formatting, clippy, review subagents or additional Cargo command was run.
