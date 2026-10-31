@@ -1495,7 +1495,9 @@ pub async fn suggest_pattern(home: &Path, input: &SuggestInput) -> Value {
     let cloud = CloudSuggester {
         home_dir: home.to_path_buf(),
     };
-    suggest_pattern_with(Some(&local), Some(&cloud), input).await
+    crate::autonomous_runtime::human_interactive(
+        home, suggest_pattern_with(Some(&local), Some(&cloud), input),
+    ).await
 }
 
 #[cfg(test)]

@@ -78,6 +78,8 @@ mod playbook_export; // WP2.2/B4 batch: gene JSON export CLI (`duduclaw export p
 mod playbook_migrate; // WP1.4: SOUL.md → playbook migration drafts (`duduclaw playbook migrate-soul`)
 mod portability; // Personal-edition data portability: export/import ~/.duduclaw
 mod premium_templates; // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
+#[cfg(test)]
+mod profile_edit_test_hook;
 mod preset_cmd; // WP-6F: `duduclaw preset` — agent preset ("職務組合") CLI surface
 mod ptc;
 pub mod redaction_verify; // WP2: `duduclaw redaction verify` evidence report
@@ -7254,6 +7256,10 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             return Ok(());
         }
 
+        // Drain publishers before the first reset side effect.
+        let _lifecycle = duduclaw_core::autonomy_gate::exclusive_barrier_async(&home).await
+            .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+
         // Back up existing config to timestamped directory
         let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let backup_dir = home.join(format!("backup_{ts}"));
@@ -7284,18 +7290,21 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             copy_dir_recursive(&agents_src, &agents_dst).await;
         }
 
-        // Keep config.toml until the snapshot-bound final publication. A
-        // cancelled/failed wizard must not unlink the guarded source file.
-        for name in &["inference.toml"] {
-            let p = home.join(name);
-            if p.exists() {
-                let _ = tokio::fs::remove_file(&p).await;
+        // Keep config.toml until final publication. The blocking worker owns
+        // the barrier through removal even if the onboarding future is dropped.
+        let reset_home = home.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let _lifecycle = _lifecycle;
+            let inference = reset_home.join("inference.toml");
+            if inference.exists() {
+                let _ = std::fs::remove_file(inference);
             }
-        }
-        // Remove old agents (will be recreated)
-        if agents_src.exists() {
-            let _ = tokio::fs::remove_dir_all(&agents_src).await;
-        }
+            if agents_src.exists() {
+                std::fs::remove_dir_all(agents_src)?;
+            }
+            Ok(())
+        }).await.map_err(|e| DuDuClawError::Agent(format!("重設員工工作失敗：{e}")))?
+            .map_err(|e| DuDuClawError::Agent(format!("移除舊員工失敗：{e}")))?;
 
         println!(
             "  {} 現有設定已備份至 {}",

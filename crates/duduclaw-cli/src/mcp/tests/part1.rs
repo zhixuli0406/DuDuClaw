@@ -141,6 +141,7 @@ fn humanize_cron_rejects_the_shapes_it_would_describe_wrongly() {
 async fn scheduled_tasks_create_persists_and_raises_cron_changed() {
     let tmp = TempDir::new();
     let home = tmp.path();
+    create_test_agent(&home.join("agents"), "agnes", "");
 
     let args = serde_json::json!({
         "title": "每日晨報",
@@ -615,4 +616,19 @@ async fn delegation_open_policy_restores_old_behaviour() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn paused_create_task_writes_no_spec_or_signal() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    duduclaw_core::autonomy_gate::set_pause(home, Some("sales-rep"), "test", "operator")
+        .unwrap();
+    let result = handle_create_task(
+        &serde_json::json!({"goal": "must not land", "steps": [{"description": "work"}]}),
+        home, "sales-rep",
+    ).await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(!home.join("bus_queue.jsonl").exists());
+    assert!(!home.join("agents/sales-rep/tasks").exists());
 }

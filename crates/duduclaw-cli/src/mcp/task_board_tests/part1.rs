@@ -1,7 +1,7 @@
 use super::*;
 use crate::mcp::caller_shims::{
-    handle_activity_list, handle_activity_post, handle_tasks_block, handle_tasks_claim, handle_tasks_complete, handle_tasks_create,
-    handle_tasks_list, handle_tasks_update,
+    handle_activity_list, handle_activity_post, handle_tasks_block, handle_tasks_claim,
+    handle_tasks_complete, handle_tasks_create, handle_tasks_list, handle_tasks_update,
 };
 
 #[tokio::test(flavor = "current_thread")]
@@ -24,9 +24,10 @@ async fn tasks_create_allows_assigning_to_direct_report() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_create_allows_self_assign_without_org() {
-    // Self-assignment never invokes the predicate — no agents/ directory
-    // needed, self-delegation would be a hard DENY under every policy.
+    // Self-assignment needs a live employee but no organization relationships.
+    // It never invokes the cross-agent delegation predicate.
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "lone-agent", "");
     let result = handle_tasks_create(
         &serde_json::json!({ "title": "My own task" }),
         tmp.path(),
@@ -180,6 +181,7 @@ async fn tasks_claim_is_unaffected_by_the_delegation_gate() {
     // tasks_claim never reassigns to a third party — the caller always
     // takes it for itself — so it must keep working with zero org setup.
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({ "title": "Up for grabs" }),
         tmp.path(),
@@ -199,6 +201,7 @@ async fn tasks_claim_is_unaffected_by_the_delegation_gate() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_create_then_list_returns_task() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({
             "title": "Ship feature X",
@@ -294,6 +297,7 @@ async fn plan_get_defaults_to_callers_active_plan() {
 #[tokio::test(flavor = "current_thread")]
 async fn plan_update_step_is_holder_guarded_fail_closed() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let (_plan, agent_step, user_step) = seed_plan(tmp.path()).await;
 
     // The agent may tick ITS OWN step.
@@ -362,6 +366,8 @@ async fn tasks_claim_transitions_to_in_progress_and_rejects_stealing() {
     // via the legacy fallback). The fallback is now restricted to todo
     // tasks that are unassigned or already assigned to the caller.
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
+    create_test_agent(&tmp.path().join("agents"), "bruno", "");
     let create = handle_tasks_create(
         &serde_json::json!({
             "title": "Bruno's task",
@@ -397,6 +403,7 @@ async fn tasks_claim_is_gated_by_unfinished_dependencies() {
     // HIGH-1 (2026-07 review): a durable task whose depends_on are not all
     // `done` must not be claimable, and the error names the unmet ids.
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let dep = handle_tasks_create(
         &serde_json::json!({ "title": "dep", "durable": true }),
         tmp.path(),
@@ -466,6 +473,8 @@ async fn tasks_complete_and_block_are_holder_guarded() {
     // blocked by X — a reclaimed zombie worker must not clobber the new
     // holder's in_progress task.
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
+    create_test_agent(&tmp.path().join("agents"), "bruno", "");
     let create = handle_tasks_create(
         &serde_json::json!({ "title": "guarded", "durable": true }),
         tmp.path(),
@@ -476,9 +485,7 @@ async fn tasks_complete_and_block_are_holder_guarded() {
         .as_str()
         .unwrap()
         .to_string();
-    parse_ok(
-        &handle_tasks_claim(&serde_json::json!({ "task_id": id }), tmp.path(), "agnes").await,
-    );
+    parse_ok(&handle_tasks_claim(&serde_json::json!({ "task_id": id }), tmp.path(), "agnes").await);
 
     // Non-holder completion / block are rejected.
     let zombie_complete = handle_tasks_complete(
@@ -512,6 +519,7 @@ async fn tasks_complete_and_block_are_holder_guarded() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_complete_marks_done_and_sets_completed_at() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({ "title": "Finish me" }),
         tmp.path(),
@@ -551,6 +559,7 @@ async fn tasks_complete_marks_done_and_sets_completed_at() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_block_requires_reason() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({ "title": "Stuck" }),
         tmp.path(),

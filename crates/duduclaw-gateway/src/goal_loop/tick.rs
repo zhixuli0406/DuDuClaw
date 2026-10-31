@@ -277,6 +277,38 @@ impl GoalLoopDriver {
         };
 
         for task in &candidates {
+            // Preserve the employee origin before kickoff/planning can call a model.
+            if let Some(caller) = crate::autonomous_runtime::task_caller(&self.home_dir, task) {
+                if duduclaw_core::autonomy_gate::check(&self.home_dir, &caller,
+                    duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop).is_err() {
+                    continue;
+                }
+            }
+            if let Err(pause) = duduclaw_core::autonomy_gate::check(
+                &self.home_dir, &task.assigned_to,
+                duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
+            ) {
+                if pause.is_agent_config_refusal() {
+                    if let Err(detail) = crate::team_composer::check_team_dispatchable_for_task(
+                        &self.home_dir, &task.assigned_to, &task.id,
+                    ) {
+                        self.escalate(&mut inflight, task, &detail,
+                            crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
+                        active = inflight.len();
+                    }
+                    continue;
+                }
+                // Fresh tasks wait unchanged. A completed/rejected turn must
+                // require a human before a later round can be admitted.
+                if (task.revision_round > 0 || task.status == "revising")
+                    && !crate::dispatcher::goal_turn_active(&self.home_dir, &task.id).await?
+                {
+                    self.escalate(&mut inflight, task, &pause.to_string(),
+                        crate::pause_reason::PauseReason::OperatorPaused).await?;
+                    active = inflight.len();
+                }
+                continue;
+            }
             // ── P2-A E-H2: register the dispatch, then re-check the task. A
             // stop that lands from here on stays `cancel_pending` until this
             // iteration is over (and the dispatcher fences the round); a stop
@@ -430,9 +462,28 @@ impl GoalLoopDriver {
             // Default (no policy) ⇒ `task` unchanged (dispatch to `assigned_to`).
             // A policy may re-route to another roster member; the reassignment is
             // persisted so downstream (heartbeat pull, activity) is consistent.
+            let callers = crate::autonomous_runtime::task_caller(&self.home_dir, task)
+                .into_iter().collect::<Vec<_>>();
+            let selection = match &self.policy {
+                Some(policy) => {
+                    let (selection, denied) = crate::autonomous_runtime::scope(
+                        &self.home_dir, &task.assigned_to, &callers, async {
+                            let selection = policy.select(task, &roster).await;
+                            (selection, crate::autonomous_runtime::was_denied())
+                        },
+                    ).await;
+                    // A scorer can fall back to the original assignment on error.
+                    // A pause refusal must instead leave this candidate untouched.
+                    if denied {
+                        continue;
+                    }
+                    selection
+                }
+                None => None,
+            };
             let reassigned;
             let task: &TaskRow = match &self.policy {
-                Some(policy) => match policy.select(task, &roster).await {
+                Some(policy) => match selection {
                     Some(sel) if !sel.trim().is_empty() && sel != task.assigned_to => {
                         match self
                             .store
@@ -471,6 +522,15 @@ impl GoalLoopDriver {
                 },
                 None => task,
             };
+
+            // The dispatch policy can select another employee. Check the
+            // effective recipient before any kickoff or model work for them.
+            if duduclaw_core::autonomy_gate::check(
+                &self.home_dir, &task.assigned_to,
+                duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
+            ).is_err() {
+                continue;
+            }
 
             // ── D4 item 3: per-task iteration cap (MaAS dynamic depth) ──
             let iter_cap = self.iteration_cap_for(task);
@@ -988,6 +1048,24 @@ impl GoalLoopDriver {
                 && !matches!(self.kickoff_gate(task).await?, KickoffGate::Proceed)
             {
                 continue;
+            }
+            if duduclaw_core::autonomy_gate::check(
+                &self.home_dir, &task.assigned_to,
+                duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
+            ).is_err() {
+                if let Some(lease) = acquired_lease.take() {
+                    duduclaw_core::concurrency_release(&self.home_dir, &lease);
+                }
+                continue;
+            }
+            if let Some(caller) = crate::autonomous_runtime::task_caller(&self.home_dir, task) {
+                if duduclaw_core::autonomy_gate::check(&self.home_dir, &caller,
+                    duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop).is_err() {
+                    if let Some(lease) = acquired_lease.take() {
+                        duduclaw_core::concurrency_release(&self.home_dir, &lease);
+                    }
+                    continue;
+                }
             }
             // P2-A: a durable round always runs Solo on the fixed-id rail.
             let team_result = if durable.is_some() {

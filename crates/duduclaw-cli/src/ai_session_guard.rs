@@ -58,9 +58,64 @@ pub(crate) fn markers() -> Vec<&'static str> {
     markers_with(&|k| std::env::var_os(k).is_some())
 }
 
+// Explicit utility classification shared by operator commands. An incomplete
+// employee environment must never turn a command into a human interaction.
+fn utility_employee_identity(marked: bool, agent: Option<&str>) -> Option<String> {
+    if !marked {
+        return None;
+    }
+    Some(match agent {
+        Some(id) if duduclaw_core::is_valid_agent_id(id)
+            && !duduclaw_core::is_system_sender(id)
+            && !duduclaw_core::is_reserved_queue_sender(id) => id.to_string(),
+        _ => "invalid:utility-caller".to_string(),
+    })
+}
+
+fn utility_employee() -> Option<String> {
+    utility_employee_identity(!markers().is_empty(), std::env::var(duduclaw_core::ENV_AGENT_ID).ok().as_deref())
+}
+
+pub(crate) async fn with_cli_utility_context<F: std::future::Future>(
+    home: &std::path::Path,
+    target: Option<&str>,
+    future: F,
+) -> F::Output {
+    use duduclaw_gateway::runtime_dispatch::{UtilityContext, with_utility_context};
+    match utility_employee() {
+        Some(caller) => {
+            let target = target.unwrap_or(&caller);
+            let callers = vec![caller.clone()];
+            with_utility_context(home, UtilityContext::Autonomous { target, callers: &callers }, future).await
+        }
+        None => with_utility_context(home, UtilityContext::HumanInteractive, future).await,
+    }
+}
+
+/// MCP and detached work is autonomous even without an employee environment.
+/// The caller is additional authority; it never replaces the real target.
+pub(crate) async fn with_autonomous_utility_context<F: std::future::Future>(
+    home: &std::path::Path,
+    target: &str,
+    future: F,
+) -> F::Output {
+    use duduclaw_gateway::runtime_dispatch::{UtilityContext, with_utility_context};
+    let callers = utility_employee().into_iter().collect::<Vec<_>>();
+    with_utility_context(home, UtilityContext::Autonomous { target, callers: &callers }, future).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utility_context_requires_an_unmarked_operator_or_an_employee_identity() {
+        assert_eq!(utility_employee_identity(false, None), None);
+        assert_eq!(utility_employee_identity(true, Some("alice")), Some("alice".into()));
+        for agent in [None, Some(""), Some("../alice"), Some("heartbeat-scheduler")] {
+            assert_eq!(utility_employee_identity(true, agent), Some("invalid:utility-caller".into()));
+        }
+    }
 
     #[test]
     fn any_single_marker_counts_and_none_means_operator() {

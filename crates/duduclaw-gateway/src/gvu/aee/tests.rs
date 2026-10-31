@@ -530,3 +530,37 @@ fn round_record_payload_carries_the_intent() {
     assert_eq!(payload["round_seq"], 41);
     assert_eq!(payload["exit"], "skipped");
 }
+
+#[tokio::test]
+async fn autonomy_pause_prevents_second_generator_round() {
+    let root = eval_root();
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("agents/agent-aee/agent.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[agent]\nstatus = \"active\"\n").unwrap();
+    let none = Vec::<String>::new();
+    let canaries = Vec::<CanaryTest>::new();
+    let calls = AtomicUsize::new(0);
+    let out = crate::autonomous_runtime::scope(home.path(), "agent-aee", &[],
+        run_inner_loop(input(root.path(), &none, &canaries, PlaybookSnapshot::default()),
+            &NullScorer, |_prompt| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let home = home.path().to_path_buf();
+                async move {
+                    duduclaw_core::autonomy_handoff::admit().await.unwrap().handed_off();
+                    let paused = tokio::time::timeout(std::time::Duration::from_secs(1),
+                        duduclaw_core::autonomy_gate::mutate_async(&home, Some("agent-aee"), Some(
+                            duduclaw_core::autonomy_gate::PauseEntry {
+                                reason: "test".into(), who: "operator".into(), at: chrono::Utc::now().to_rfc3339(),
+                            },
+                        )),
+                    ).await.expect("completed handoff must not hold the callback lease");
+                    assert!(matches!(paused, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+                    Ok("invalid first response".to_string())
+                }
+            }),
+    ).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(out.rounds_used, 2);
+    assert!(matches!(out.exit, InnerLoopExit::GeneratorUnavailable { .. }));
+}

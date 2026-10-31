@@ -383,6 +383,7 @@ pub mod relevance_ranker;
 pub mod reminder_scheduler;
 pub mod risk_detector;
 pub mod run_steps;
+pub(crate) mod autonomous_runtime;
 pub mod runtime;
 pub mod runtime_config;
 pub mod runtime_dispatch;

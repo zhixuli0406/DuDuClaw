@@ -92,7 +92,10 @@ fn wiki_scope_comes_from_the_scope_argument_only() {
         resolve_wiki_scope(&serde_json::json!({"scope": "shared"})).unwrap(),
         WikiScope::Shared
     );
-    assert_eq!(resolve_wiki_scope(&serde_json::json!({})).unwrap(), WikiScope::Agent);
+    assert_eq!(
+        resolve_wiki_scope(&serde_json::json!({})).unwrap(),
+        WikiScope::Agent
+    );
 }
 
 /// The merged wiki entry point keeps `wiki:read` / `wiki:write` — adding a
@@ -100,7 +103,13 @@ fn wiki_scope_comes_from_the_scope_argument_only() {
 #[test]
 fn merged_wiki_tools_keep_their_original_scopes() {
     use crate::mcp_auth::{Scope, tool_requires_scope};
-    for name in ["wiki_ls", "wiki_read", "wiki_search", "wiki_stats", "wiki_lint"] {
+    for name in [
+        "wiki_ls",
+        "wiki_read",
+        "wiki_search",
+        "wiki_stats",
+        "wiki_lint",
+    ] {
         assert_eq!(
             tool_requires_scope(name),
             Some(Scope::WikiRead),
@@ -168,6 +177,7 @@ async fn tasks_create_rejects_unknown_kind_and_malformed_schedule() {
 async fn tasks_create_kind_goal_freezes_the_acceptance_contract() {
     let home = std::env::temp_dir().join(format!("duduclaw-o4g-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).unwrap();
+    super::tests::create_test_agent(&home.join("agents"), "a", "");
 
     let out = handle_tasks_create(
         &serde_json::json!({
@@ -198,6 +208,7 @@ async fn tasks_create_kind_goal_freezes_the_acceptance_contract() {
 async fn tasks_create_schedule_routes_to_the_cron_and_reminder_rails() {
     let home = std::env::temp_dir().join(format!("duduclaw-o4s-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).unwrap();
+    super::tests::create_test_agent(&home.join("agents"), "a", "");
 
     let cron = handle_tasks_create(
         &serde_json::json!({

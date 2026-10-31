@@ -81,6 +81,9 @@ impl WorkflowRunner {
         run: &WorkflowRun,
         point: &GuardPoint<'_>,
     ) -> Result<(), String> {
+        duduclaw_core::autonomy_gate::check(
+            &self.home, &run.actor, duduclaw_core::autonomy_gate::AutonomyPath::Workflow,
+        ).map_err(|_| super::WORKFLOW_AUTONOMY_PAUSED.to_string())?;
         if point.live_status {
             let stored = self
                 .store

@@ -221,6 +221,17 @@ impl GoalLoopDriver {
                     }),
                 )).await;
             drop(live_round);
+            if let Err(pause) = duduclaw_core::autonomy_gate::check(
+                &home_dir, &task.assigned_to,
+                duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+            ) {
+                if let Err(error) = store.mark_needs_human_with_pause(
+                    &task.id, &pause.to_string(), crate::pause_reason::PauseReason::OperatorPaused,
+                ).await {
+                    warn!(task = %task.id, %error, "could not park paused team goal");
+                }
+                return;
+            }
             match outcome {
                 crate::team_composer::TeamRoundOutcome::Submitted { summary, .. } => {
                     // Lands exactly where an agent's `tasks_complete` would:

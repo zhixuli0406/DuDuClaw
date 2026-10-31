@@ -129,10 +129,16 @@ pub(crate) async fn spawn_agent_with_ctx(
     // fallback.  Concrete error → caller can inform the user / stop early.
     // Use std::result::Result explicitly — the crate-level `Result<T>` alias
     // is single-arg (DuDuClawError default), incompatible with our String error.
+    let admission = match admit_background_identity(home_dir, caller, "spawn_agent").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let entry_str = entry.to_string();
         move || -> std::result::Result<(), String> {
+            // The blocking writer owns the lease even if its caller is cancelled.
+            let _admission = admission;
             use std::io::Write;
             // Project convention #3 (2026-07 MED): hold the cross-process
             // advisory lock — the dispatcher REWRITES bus_queue.jsonl and a
@@ -309,10 +315,16 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
     // REQUEST, not of when it happens to be admitted.
     let incoming_hop_for_admission_queue = incoming_hop_depth();
     let home = home_dir.to_path_buf();
-    let scaffolded =
-        tokio::task::spawn_blocking(move || duduclaw_gateway::ephemeral::scaffold(&home, &spec))
-            .await
-            .unwrap_or_else(|join_err| Err(format!("spawn_blocking panicked: {join_err}")));
+    let admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
+    let scaffolded = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        duduclaw_gateway::ephemeral::scaffold(&home, &spec)
+    })
+    .await
+    .unwrap_or_else(|join_err| Err(format!("spawn_blocking panicked: {join_err}")));
 
     let scaffolded = match scaffolded {
         Ok(s) => s,
@@ -349,12 +361,17 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
                 "outgoing_depth": outgoing_depth,
                 "incoming_hop": incoming_hop_for_admission_queue,
             });
-            return match duduclaw_core::spawn_admission::enqueue(
+            let _admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
+                Ok(guard) => guard,
+                Err(reason) => return tool_error(&reason),
+            };
+            return match duduclaw_core::spawn_admission::enqueue_checked(
                 home_dir,
                 duduclaw_gateway::ephemeral::EPHEMERAL_ADMISSION_CLASS,
                 &admission_cfg,
                 owner_key.as_deref(),
                 payload,
+                || duduclaw_gateway::ephemeral::check_parent_autonomy(home_dir, caller),
             ) {
                 Ok(duduclaw_core::spawn_admission::EnqueueOutcome::Queued {
                     ticket_id,
@@ -445,10 +462,16 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
     if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
         entry["lane"] = serde_json::json!(lane);
     }
+    let admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let entry_str = entry.to_string();
         move || -> std::result::Result<(), String> {
+            // The blocking writer owns the lease even if its caller is cancelled.
+            let _admission = admission;
             use std::io::Write;
             // Project convention #3 (2026-07 MED): same advisory lock as the
             // spawn_agent enqueue — the dispatcher rewrites this file.

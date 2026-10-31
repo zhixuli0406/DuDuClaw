@@ -264,6 +264,8 @@ impl OpenAiCompatRuntime {
         };
 
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let admission = crate::autonomous_runtime::admit_current().await?;
+        crate::autonomous_runtime::mark_handoff();
         let response = completion_request(&url, context)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
@@ -272,6 +274,7 @@ impl OpenAiCompatRuntime {
             .await
             .map_err(|e| transport_error("HTTP request", e))?;
 
+        drop(admission);
         let status = response.status();
         let response_text = response
             .text()
@@ -755,6 +758,7 @@ impl<P: ChatProvider> ChatProvider for UsageTap<P> {
     }
 
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        // Admission belongs to each provider send, not the response/usage wait.
         let resp = self.inner.complete(req).await?;
         if let Ok(mut t) = self.total.lock() {
             *t = t.saturating_add(&resp.usage);
@@ -981,6 +985,8 @@ impl OpenAiCompatRuntime {
             stream: true,
         };
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let admission = crate::autonomous_runtime::admit_current().await?;
+        crate::autonomous_runtime::mark_handoff();
         let response = completion_request(&url, context)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
@@ -989,6 +995,7 @@ impl OpenAiCompatRuntime {
             .await
             .map_err(|e| transport_error("SSE request", e))?;
 
+        drop(admission);
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.map_err(|e| transport_error("SSE error body", e))?;

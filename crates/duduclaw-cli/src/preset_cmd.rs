@@ -125,7 +125,7 @@ pub async fn cmd_preset_bind(agent: &str, preset_ref: &str, reason: &str) -> Res
     let outcome = preset::bind(&home, agent, &dir, preset_ref, &actor(), reason)
         .map_err(|e| DuDuClawError::Agent(preset_error_zh(&e)))?;
 
-    write_preset_mirror(&dir, &outcome.binding)
+    write_preset_mirror(&home, agent, &outcome.binding)
         .map_err(|e| DuDuClawError::Agent(format!("寫入 agent.toml [preset] 鏡像失敗：{e}")))?;
 
     record_traces(
@@ -180,7 +180,7 @@ pub async fn cmd_preset_unbind(agent: &str, reason: &str) -> Result<()> {
         )));
     }
     let home = crate::duduclaw_home();
-    let dir = agent_dir_or_err(&home, agent)?;
+    agent_dir_or_err(&home, agent)?;
 
     let removed = preset::unbind(&home, agent, &actor(), reason)
         .map_err(|e| DuDuClawError::Agent(format!("解除綁定失敗：{e}")))?;
@@ -189,7 +189,7 @@ pub async fn cmd_preset_unbind(agent: &str, reason: &str) -> Result<()> {
         return Ok(());
     };
 
-    let _ = clear_preset_mirror(&dir);
+    let mirror_result = clear_preset_mirror(&home, agent);
     record_traces(
         &home,
         agent,
@@ -203,6 +203,7 @@ pub async fn cmd_preset_unbind(agent: &str, reason: &str) -> Result<()> {
         &format!("AI 員工「{agent}」解除職務組合「{}」", prev.preset_id),
     )
     .await;
+    mirror_result.map_err(|e| DuDuClawError::Agent(format!("解除綁定已完成，但更新 agent.toml [preset] 鏡像失敗：{e}")))?;
     println!(
         "{} 「{agent}」已解除職務組合「{}」v{}，現在完全以自己的 agent.toml 運作。",
         style("✓").green().bold(),
@@ -362,61 +363,64 @@ fn refuse_preset_write_in_agent_session(claimed: &str) -> String {
     )
 }
 
-/// Write the read-only `[preset]` mirror into `<agent_dir>/agent.toml`
-/// (design §3.1). Table-based read-modify-write, same shape as
-/// `expert::patch_agent_toml` — comments elsewhere in the file are not
-/// preserved, which is the pre-existing behaviour of every agent.toml
-/// rewrite path in this codebase (`agent_update`, `update_agent_toml_with`),
-/// not a new regression. The mirror is informational only — resolution
-/// always reads `preset_bindings.toml`, never this block.
-fn write_preset_mirror(agent_dir: &Path, binding: &preset::PresetBinding) -> std::io::Result<()> {
-    let path = agent_dir.join("agent.toml");
-    let content = std::fs::read_to_string(&path)?;
-    let mut table: toml::value::Table = content
-        .parse::<toml::Table>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut preset_tbl = toml::value::Table::new();
-    preset_tbl.insert(
-        "ref".to_string(),
-        toml::Value::String(binding.preset_id.clone()),
-    );
-    preset_tbl.insert(
-        "version".to_string(),
-        toml::Value::String(binding.version.clone()),
-    );
-    preset_tbl.insert(
-        "bound_at".to_string(),
-        toml::Value::String(binding.bound_at.clone()),
-    );
-    table.insert("preset".to_string(), toml::Value::Table(preset_tbl));
-    write_agent_toml_atomic(&path, &table)
+/// Update only the informational mirror, from fresh TOML under the profile lock.
+/// Resolution still reads `preset_bindings.toml`, never this block.
+fn write_preset_mirror(home: &Path, agent_id: &str, binding: &preset::PresetBinding) -> std::io::Result<()> {
+    #[cfg(test)]
+    crate::profile_edit_test_hook::run();
+    duduclaw_gateway::agent_files::external::edit_agent_toml(
+        home, agent_id, "preset", &actor(), |table| {
+            let mut mirror = toml::Table::new();
+            mirror.insert("ref".into(), toml::Value::String(binding.preset_id.clone()));
+            mirror.insert("version".into(), toml::Value::String(binding.version.clone()));
+            mirror.insert("bound_at".into(), toml::Value::String(binding.bound_at.clone()));
+            table.insert("preset".into(), toml::Value::Table(mirror));
+            Ok(())
+        },
+    ).map(|_| ()).map_err(std::io::Error::other)
 }
 
-fn clear_preset_mirror(agent_dir: &Path) -> std::io::Result<()> {
-    let path = agent_dir.join("agent.toml");
-    let content = std::fs::read_to_string(&path)?;
-    let mut table: toml::value::Table = content
-        .parse::<toml::Table>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    table.remove("preset");
-    write_agent_toml_atomic(&path, &table)
-}
-
-fn write_agent_toml_atomic(path: &Path, table: &toml::value::Table) -> std::io::Result<()> {
-    let out = toml::to_string_pretty(table)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, out)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+fn clear_preset_mirror(home: &Path, agent_id: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    crate::profile_edit_test_hook::run();
+    duduclaw_gateway::agent_files::external::edit_agent_toml(
+        home, agent_id, "preset", &actor(), |table| {
+            table.remove("preset");
+            Ok(())
+        },
+    ).map(|_| ()).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_delayed_bind_and_unbind_preserve_completed_lifecycle_changes() {
+        for clear in [false, true] {
+            for (old, new) in [("active", "archived"), ("paused", "active"), ("active", "paused")] {
+                let home = tempfile::tempdir().unwrap();
+                write_agent(home.path(), &format!("[agent]\nname='clinic-sales'\nstatus='{old}'\n"));
+                write_preset_mirror(home.path(), "clinic-sales", &sample_binding()).unwrap();
+                crate::profile_edit_test_hook::after_snapshot(home.path(), "clinic-sales", old, new);
+                if clear {
+                    clear_preset_mirror(home.path(), "clinic-sales").unwrap();
+                } else {
+                    let mut binding = sample_binding();
+                    binding.version = "2.0.0".into();
+                    write_preset_mirror(home.path(), "clinic-sales", &binding).unwrap();
+                }
+                let text = std::fs::read_to_string(home.path().join("agents/clinic-sales/agent.toml")).unwrap();
+                let table: toml::Table = text.parse().unwrap();
+                assert_eq!(table["agent"]["status"].as_str(), Some(new));
+                if clear {
+                    assert!(!table.contains_key("preset"));
+                } else {
+                    assert_eq!(table["preset"]["version"].as_str(), Some("2.0.0"));
+                }
+            }
+        }
+    }
 
     fn sample_binding() -> preset::PresetBinding {
         preset::PresetBinding {
@@ -430,7 +434,8 @@ mod tests {
     }
 
     fn write_agent(dir: &Path, body: &str) {
-        std::fs::create_dir_all(dir).unwrap();
+        let dir = dir.join("agents/clinic-sales");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent.toml"), body).unwrap();
     }
 
@@ -442,9 +447,9 @@ mod tests {
             "[agent]\nname = \"clinic-sales\"\ndisplay_name = \"x\"\n",
         );
 
-        write_preset_mirror(tmp.path(), &sample_binding()).unwrap();
+        write_preset_mirror(tmp.path(), "clinic-sales", &sample_binding()).unwrap();
 
-        let table: toml::value::Table = std::fs::read_to_string(tmp.path().join("agent.toml"))
+        let table: toml::value::Table = std::fs::read_to_string(tmp.path().join("agents/clinic-sales/agent.toml"))
             .unwrap()
             .parse()
             .unwrap();
@@ -475,17 +480,17 @@ mod tests {
     fn clear_preset_mirror_removes_the_block_and_is_a_noop_if_absent() {
         let tmp = tempfile::tempdir().unwrap();
         write_agent(tmp.path(), "[agent]\nname = \"clinic-sales\"\n");
-        write_preset_mirror(tmp.path(), &sample_binding()).unwrap();
+        write_preset_mirror(tmp.path(), "clinic-sales", &sample_binding()).unwrap();
 
-        clear_preset_mirror(tmp.path()).unwrap();
-        let table: toml::value::Table = std::fs::read_to_string(tmp.path().join("agent.toml"))
+        clear_preset_mirror(tmp.path(), "clinic-sales").unwrap();
+        let table: toml::value::Table = std::fs::read_to_string(tmp.path().join("agents/clinic-sales/agent.toml"))
             .unwrap()
             .parse()
             .unwrap();
         assert!(!table.contains_key("preset"));
 
         // Calling again (nothing to clear) must not error.
-        assert!(clear_preset_mirror(tmp.path()).is_ok());
+        assert!(clear_preset_mirror(tmp.path(), "clinic-sales").is_ok());
     }
 
     #[test]

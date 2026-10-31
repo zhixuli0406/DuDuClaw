@@ -306,6 +306,16 @@ pub fn classify_identity_surface(file_path: &Path, home: &Path) -> Option<Protec
         }
     }
 
+    for basename in [crate::autonomy_gate::STATE_FILE, crate::autonomy_gate::INIT_FILE, crate::autonomy_gate::ADMISSION_LOCK_FILE, "autonomy_pause.json.lock"] {
+        if file_name.eq_ignore_ascii_case(basename) {
+            let expected = lexical_normalize(&home.join(basename));
+            return match components_after_ci(&normalized, &expected) {
+                Some(rest) if rest.is_empty() => Some(ProtectedSurface::AutonomyPause),
+                _ => None,
+            };
+        }
+    }
+
     let agents_root = lexical_normalize(&home.join("agents"));
     let rest = components_after_ci(&normalized, &agents_root)?;
     // `<agent-id>/…/<file>` — at least an agent directory plus the basename.
@@ -417,6 +427,9 @@ pub fn check_identity_surface_write_as(
     };
 
     match surface {
+        ProtectedSurface::AutonomyPause => blocked(
+            "自主工作暫停狀態只能由具權限的管理者透過 autonomy RPC 調整。".to_string(),
+        ),
         ProtectedSurface::IdentityKey => blocked(
             "identity.key 是身分簽章金鑰，覆寫它等同關閉或接管身分驗證；它只由 DuDuClaw 本身產生。"
                 .to_string(),

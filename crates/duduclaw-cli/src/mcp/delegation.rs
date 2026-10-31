@@ -85,7 +85,7 @@ pub(crate) async fn send_to_agent_with_ctx(
     // target agent's Claude CLI when it spawns. Best-effort: if the
     // ALTER TABLE migration hasn't run yet the fallback INSERT (without
     // reply_channel) succeeds on the legacy schema.
-    let queued = {
+    let (queued, admission) = {
         let db_path = home_dir.join("message_queue.db");
         let msg_id_cl = msg_id.clone();
         let caller_cl = caller.to_string();
@@ -126,7 +126,19 @@ pub(crate) async fn send_to_agent_with_ctx(
         // carry it, so it is not used (losing it would lose the person's
         // limits on the receiving run).
         let on_behalf_of = host_on_behalf_of(home_dir, caller);
-        tokio::task::spawn_blocking(move || -> bool {
+        #[cfg(test)]
+        if let Ok(barrier) = SEND_BEFORE_COMMIT.try_with(Clone::clone) {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        let admission = match admit_background_identity(home_dir, caller, "send_to_agent").await {
+            Ok(guard) => guard.map(std::sync::Arc::new),
+            Err(reason) => return tool_error(&reason),
+        };
+        let writer_admission = admission.clone();
+        let queued = tokio::task::spawn_blocking(move || -> bool {
+            // The blocking writer owns the lease even if the request is cancelled.
+            let _admission = writer_admission;
             let Ok(conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
             };
@@ -237,7 +249,8 @@ pub(crate) async fn send_to_agent_with_ctx(
             .unwrap_or(false)
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or(false);
+        (queued, admission)
     };
 
     // Register delegation callback if running inside a channel context.
@@ -254,7 +267,9 @@ pub(crate) async fn send_to_agent_with_ctx(
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| duduclaw_core::is_valid_agent_id(s));
+        let writer_admission = admission.clone();
         let _ = tokio::task::spawn_blocking(move || {
+            let _admission = writer_admission;
             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                 let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
                 // Ensure table exists (MCP process may open DB before gateway).
@@ -325,6 +340,7 @@ pub(crate) async fn send_to_agent_with_ctx(
         }).await;
     }
 
+    drop(admission);
     let ts = chrono::Utc::now().to_rfc3339();
     if queued {
         serde_json::json!({
@@ -743,4 +759,62 @@ pub(crate) async fn validate_reports_to(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static SEND_BEFORE_COMMIT: std::sync::Arc<tokio::sync::Barrier>;
+}
+
+#[cfg(test)]
+mod autonomy_commit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn send_to_agent_pause_between_check_and_insert_lands_no_message() {
+        let home = tempfile::tempdir().unwrap();
+        super::super::tests::create_test_agent(&home.path().join("agents"), "sender", "");
+        super::super::tests::create_test_agent(&home.path().join("agents"), "receiver", "sender");
+        duduclaw_gateway::message_queue::MessageQueue::open(home.path()).unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("message_queue.db")).unwrap();
+        let params = serde_json::json!({"agent_id":"receiver", "prompt":"queued work"});
+        let actor = RecordActor::Agent("sender");
+        assert!(check_background_caller(home.path(), actor, "send_to_agent").is_ok());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let call = SEND_BEFORE_COMMIT.scope(
+            barrier.clone(),
+            send_to_agent_with_ctx(&params, home.path(), "sender", DelegationContext {
+                depth: 0, origin: None,
+            }),
+        );
+        let pause = async {
+            barrier.wait().await;
+            let outcome = duduclaw_core::autonomy_gate::mutate_async(
+                home.path(), Some("sender"),
+                Some(duduclaw_core::autonomy_gate::PauseEntry {
+                    reason: "race".into(), who: "operator".into(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                }),
+            ).await;
+            assert!(matches!(outcome, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+            barrier.wait().await;
+        };
+        let (response, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(10), async { tokio::join!(call, pause) },
+        ).await.expect("handler must reach the commit barrier");
+        assert_eq!(response["isError"], true);
+        assert_eq!(response, tool_error(
+            &check_background_caller(home.path(), actor, "send_to_agent").unwrap_err(),
+        ));
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM message_queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        assert!(!home.path().join("bus_queue.jsonl").exists());
+        duduclaw_core::autonomy_gate::resume(home.path(), Some("sender")).unwrap();
+        let response = send_to_agent_with_ctx(&params, home.path(), "sender", DelegationContext {
+            depth: 0, origin: None,
+        }).await;
+        assert_ne!(response["isError"], true, "{response}");
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM message_queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
 }

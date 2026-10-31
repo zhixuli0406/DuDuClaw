@@ -149,6 +149,13 @@ enum ReadEvent {
 impl PtyHandle {
     /// Spawn a child under a fresh PTY pair and start the async pumps.
     pub fn spawn(cmd: PtyCommand) -> Result<Self, PtyError> {
+        Self::spawn_with_handoff(cmd, || {})
+    }
+
+    /// Notify immediately after the native child exists, before pump setup.
+    pub(crate) fn spawn_with_handoff(
+        cmd: PtyCommand, handed_off: impl FnOnce(),
+    ) -> Result<Self, PtyError> {
         let system = native_pty_system();
         let pair = system
             .openpty(PtySize {
@@ -179,6 +186,7 @@ impl PtyHandle {
                 source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
             }
         })?;
+        handed_off();
         let pid = child.process_id();
 
         let master = pair.master;

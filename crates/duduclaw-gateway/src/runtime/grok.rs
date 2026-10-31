@@ -669,7 +669,7 @@ impl AgentRuntime for GrokRuntime {
 
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let output = crate::process_group::output(
+        let output = crate::process_group::output_for_model(
             &mut cmd, None, deadline.saturating_duration_since(tokio::time::Instant::now()),
         ).await.map_err(|e| match e {
             crate::process_group::OutputError::Timeout => format!("Grok CLI hard timeout after {timeout_secs}s"),
@@ -884,6 +884,7 @@ impl GrokRuntime {
         }
         // The retry shares the primary run's deadline rather than adding a
         // second time allowance after a slow, empty pipe-mode response.
+        // The PTY adapter admits at native spawn and releases at handoff.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(format!("Grok CLI hard timeout after {timeout_secs}s"));

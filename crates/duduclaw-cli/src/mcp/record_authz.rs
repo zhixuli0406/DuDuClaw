@@ -102,7 +102,12 @@ pub(crate) fn record_actor_for<'a>(
 ) -> RecordActor<'a> {
     let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
     let client_is_agent = crate::mcp_namespace::client_is_agent(home_dir, caller_client_id);
-    RecordActor::resolve(caller_client_id, default_agent, env_agent.as_deref(), client_is_agent)
+    RecordActor::resolve(
+        caller_client_id,
+        default_agent,
+        env_agent.as_deref(),
+        client_is_agent,
+    )
 }
 
 /// What kind of record is being changed — only shapes the refusal text.
@@ -125,7 +130,9 @@ impl RecordKind {
     fn no_owner_hint(self) -> &'static str {
         match self {
             RecordKind::Task => "先用 tasks_claim 認領這個任務，再做變更；或請操作者在儀表板處理。",
-            RecordKind::Cron => "這筆例行工作沒有可辨識的執行者，請操作者在儀表板的「例行工作」頁處理。",
+            RecordKind::Cron => {
+                "這筆例行工作沒有可辨識的執行者，請操作者在儀表板的「例行工作」頁處理。"
+            }
             RecordKind::Reminder => "請在 agent_id 填上要收到提醒的 AI 員工 id。",
         }
     }
@@ -178,7 +185,14 @@ pub(crate) fn check_actor_identity(
         return Err(format!("{tool} 遭拒：無法確認呼叫者身分，未做任何變更。"));
     }
     if duduclaw_core::is_system_sender(caller) || duduclaw_core::is_reserved_queue_sender(caller) {
-        audit_record_refused(home_dir, caller, tool, target, "system_sender_identity", &[]);
+        audit_record_refused(
+            home_dir,
+            caller,
+            tool,
+            target,
+            "system_sender_identity",
+            &[],
+        );
         return Err(format!(
             "{tool} 遭拒：「{}」是系統保留名稱，不能當作 AI 員工身分使用，未做任何變更。",
             duduclaw_core::truncate_chars(caller, 64)
@@ -257,7 +271,9 @@ pub(crate) const RESERVED_TASK_TAGS: &[&str] = &["auto-research"];
 /// Does this single tag carry control meaning?
 pub(crate) fn is_reserved_task_tag(tag: &str) -> bool {
     let tag = tag.trim();
-    RESERVED_TASK_TAG_PREFIXES.iter().any(|p| tag.starts_with(p))
+    RESERVED_TASK_TAG_PREFIXES
+        .iter()
+        .any(|p| tag.starts_with(p))
         || RESERVED_TASK_TAGS.iter().any(|t| tag == *t)
 }
 
@@ -300,7 +316,140 @@ pub(crate) fn check_no_reserved_tags(
     Err(tool_error(RESERVED_TAG_REFUSAL))
 }
 
-pub(crate) const RESERVED_TAG_REFUSAL: &str =
-    "tags refused: tags starting with `outcome:` or `grant:`, and the `auto-research` tag, \
+pub(crate) const RESERVED_TAG_REFUSAL: &str = "tags refused: tags starting with `outcome:` or `grant:`, and the `auto-research` tag, \
      control how a task is accepted and what it may do; an AI employee cannot add, remove or \
      reorder them. Leave those tags exactly as they are and change only the others.";
+
+/// Background work is forbidden for a paused verified employee, even when the
+/// destination is another employee. Operators retain dashboard/TUI control.
+pub(crate) fn check_background_caller(
+    home: &Path,
+    actor: RecordActor<'_>,
+    tool: &str,
+) -> std::result::Result<(), String> {
+    let Some(agent) = actor.agent() else {
+        return Ok(());
+    };
+    duduclaw_core::autonomy_gate::check(
+        home,
+        agent,
+        duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    )
+    .map_err(|info| background_caller_refusal(tool, &info))
+}
+
+// Retain the verified caller through handlers whose legacy API accepts only
+// an id. This scope carries identity, never a lease across parsing/model calls.
+tokio::task_local! {
+    static BACKGROUND_CALLER: Option<String>;
+}
+
+pub(crate) fn with_background_caller<F: std::future::Future>(
+    actor: RecordActor<'_>,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    BACKGROUND_CALLER.scope(actor.agent().map(str::to_owned), Box::pin(future))
+}
+
+/// Acquire immediately before a durable write, and move the guard into any
+/// detached/blocking writer so cancellation cannot release its lease early.
+pub(crate) async fn admit_background_caller(
+    home: &Path,
+    actor: RecordActor<'_>,
+    tool: &str,
+) -> std::result::Result<Option<duduclaw_core::autonomy_gate::AdmissionGuard>, String> {
+    let Some(agent) = actor.agent() else { return Ok(None); };
+    duduclaw_core::autonomy_gate::admit(
+        home, agent, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ).await.map(Some).map_err(|info| background_caller_refusal(tool, &info))
+}
+
+pub(crate) async fn admit_background_identity(
+    home: &Path,
+    caller: &str,
+    tool: &str,
+) -> std::result::Result<Option<duduclaw_core::autonomy_gate::AdmissionGuard>, String> {
+    match BACKGROUND_CALLER.try_with(Clone::clone) {
+        Ok(Some(agent)) => admit_background_caller(home, RecordActor::Agent(&agent), tool).await,
+        Ok(None) => Ok(None),
+        Err(_) => admit_background_caller(home, RecordActor::Agent(caller), tool).await,
+    }
+}
+
+/// Used inside the profile file lock to keep lifecycle lock ordering consistent.
+pub(crate) fn admit_background_identity_blocking(
+    home: &Path,
+    caller: &str,
+    tool: &str,
+) -> std::result::Result<Option<duduclaw_core::autonomy_gate::AdmissionGuard>, String> {
+    let agent = match BACKGROUND_CALLER.try_with(Clone::clone) {
+        Ok(agent) => agent,
+        Err(_) => Some(caller.to_string()),
+    };
+    let Some(agent) = agent else { return Ok(None); };
+    duduclaw_core::autonomy_gate::admit_blocking(
+        home, &agent, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ).map(Some).map_err(|info| background_caller_refusal(tool, &info))
+}
+
+pub(crate) fn background_caller_refusal(tool: &str, info: &duduclaw_core::autonomy_gate::PauseInfo) -> String {
+    // Stable categories only: never expose state contents, OS paths or parser errors.
+    let reason = info
+        .reason
+        .split_once(':')
+        .map_or(info.reason.as_str(), |(code, _)| code);
+    let message = match reason {
+        "agent_pause" => "這位員工已暫停自主工作",
+        "global_pause" => "所有員工的自主工作已暫停",
+        "state_unreadable" => "暫停狀態無法讀取",
+        "invalid_agent_id" => "員工識別碼無效",
+        "agent_missing" => "找不到這位員工的設定",
+        "agent_status_unreadable" => "員工狀態無法讀取",
+        "ephemeral_parent_invalid" => "臨時成員的上層員工資料無法確認",
+        "agent_not_operational" => "員工目前不在可執行工作的狀態",
+        "admission_wait_timeout" => "等待自主工作狀態鎖逾時",
+        "admission_unavailable" => "自主工作狀態鎖無法取得",
+        _ => "無法確認自主工作權限",
+    };
+    format!(
+        "{tool} 遭拒：{message}，不能建立或委派背景工作。請由真人從儀表板或 duduclaw tui 操作。"
+    )
+}
+
+pub(crate) fn creates_background_work(tool: &str) -> bool {
+    matches!(
+        tool,
+        "send_to_agent"
+            | "spawn_agent"
+            | "spawn_ephemeral"
+            | "tasks_create"
+            | "goals_create"
+            | "create_task"
+            | "tasks_update"
+            | "tasks_claim"
+            | "update_cron_task"
+            | "run_cron_task"
+            | "pause_cron_task"
+            | "create_reminder"
+            | "responsibility_followup"
+            | "responsibility_ask"
+            | "plan_update_step"
+            | "working_state_handoff"
+            | "team_handoff"
+            | "fork_run"
+            | "merge_or_select"
+            | "create_agent"
+            | "evolution_toggle"
+            | "skill_synthesis_run"
+            | "skill_from_recording"
+    )
+}
+
+/// Configuration edits can arm a wake-up without creating a task row.
+pub(crate) fn changes_background_work(tool: &str, args: &Value) -> bool {
+    creates_background_work(tool)
+        || (tool == "agent_update"
+            && ["heartbeat_enabled", "heartbeat_cron", "status"]
+                .iter()
+                .any(|key| args.get(*key).is_some()))
+}

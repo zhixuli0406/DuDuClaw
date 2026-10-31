@@ -32,7 +32,9 @@ fn parse_ok(value: &Value) -> Value {
 }
 
 fn mk_agent(home: &std::path::Path, id: &str) {
-    fs::create_dir_all(home.join("agents").join(id)).unwrap();
+    let dir = home.join("agents").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -252,4 +254,21 @@ fn working_state_scopes_enumerated() {
     ] {
         assert!(!EXTERNAL_TOOLS_WHITELIST.contains(&tool));
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn paused_handoff_preserves_the_previous_durable_state() {
+    let tmp = TempDir::new();
+    mk_agent(tmp.path(), "trader");
+    let args = serde_json::json!({ "note": "previous handoff" });
+    parse_ok(&handle_working_state_handoff(&args, tmp.path(), "trader").await);
+    let before = handle_working_state_get(&serde_json::json!({}), tmp.path(), "trader").await;
+    duduclaw_core::autonomy_gate::set_pause(tmp.path(), Some("trader"), "test", "operator")
+        .unwrap();
+    let refused = handle_working_state_handoff(
+        &serde_json::json!({ "note": "must not land" }), tmp.path(), "trader",
+    ).await;
+    assert!(refused["isError"].as_bool().unwrap_or(false), "{refused}");
+    let after = handle_working_state_get(&serde_json::json!({}), tmp.path(), "trader").await;
+    assert_eq!(parse_ok(&before), parse_ok(&after));
 }

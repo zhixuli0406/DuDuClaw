@@ -756,7 +756,7 @@ pub(super) async fn launch(
     }
     let mut start = client_command();
     start.args(["start", "--attach", "--interactive", &id]);
-    let output = process::run(start, payload, remaining, 256 * 1024, on_event).await;
+    let output = process::run_admitted(start, payload, remaining, 256 * 1024, on_event).await;
     cleanup.stop().await.map_err(LaunchError::Cleanup)?;
     output.map_err(|e| LaunchError::Transport(e.to_string()))
 }

@@ -577,3 +577,23 @@ async fn filling_is_never_a_bypass() {
         assert_eq!(refusal_code(&out), code, "{patch}");
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn parent_pause_refuses_ephemeral_packet_commit_and_resume_restores_it() {
+    let tmp = TempDir::new();
+    let member = "eph-planner-pause";
+    mk_ephemeral_member(tmp.path(), member, "planner", Some(TASK), Some(1));
+    let p = packet(Role::Planner, Role::Executor, 1);
+    duduclaw_core::autonomy_gate::set_pause(tmp.path(), Some("agnes"), "test", "operator")
+        .unwrap();
+    let refused = call(tmp.path(), member, &p).await;
+    assert!(is_error(&refused), "{refused}");
+    assert!(text_of(&refused).contains("已暫停"), "{refused}");
+    let path = duduclaw_core::task_packet::packet_path(
+        tmp.path(), TASK, 1, Role::Planner, Role::Executor,
+    ).unwrap();
+    assert!(!path.exists());
+    duduclaw_core::autonomy_gate::resume(tmp.path(), Some("agnes")).unwrap();
+    let accepted = call(tmp.path(), member, &p).await;
+    assert!(!is_error(&accepted), "{accepted}");
+}

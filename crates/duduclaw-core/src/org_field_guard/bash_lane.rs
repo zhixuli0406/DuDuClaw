@@ -81,6 +81,7 @@ pub(super) fn bash_home_state_write(
 pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDecision {
     // `agent.toml` anywhere: the basename is DuDuClaw-specific, and writing
     // one outside the canonical tree is already forbidden by `agent_guard`.
+    let mentions_autonomy = normalized.contains("autonomy_pause.");
     let mentions_agent_toml = normalized.contains("agent.toml");
 
     // `config.toml`: only the DuDuClaw home one. Any other `config.toml`
@@ -121,7 +122,8 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         .iter()
         .any(|f| normalized.contains(&format!(".claude/{f}")));
 
-    if !mentions_agent_toml
+    if !mentions_autonomy
+        && !mentions_agent_toml
         && !mentions_home_config
         && !mentions_org_store
         && !mentions_mcp_json
@@ -135,7 +137,9 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         return GuardDecision::NotAgentFile;
     };
 
-    let file_name = if mentions_agent_toml {
+    let file_name = if mentions_autonomy {
+        crate::autonomy_gate::STATE_FILE
+    } else if mentions_agent_toml {
         "agent.toml"
     } else if mentions_org_store {
         crate::org_store::ORG_STORE_FILE

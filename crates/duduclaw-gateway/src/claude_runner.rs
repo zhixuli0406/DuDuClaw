@@ -487,9 +487,11 @@ async fn invoke_recorded<F>(
     fut: F,
 ) -> Result<String, String>
 where
-    F: std::future::Future<Output = Result<String, String>>,
+    F: std::future::Future<Output = Result<String, String>> + Send,
 {
     use crate::cost_telemetry::RequestType as RT;
+    let fut =
+        crate::autonomous_runtime::request_scope(home_dir, agent_id, request_type != RT::Chat, fut);
     let fut = crate::computer_use_sessions::attended_call::runtime_scope(
         request_type == RT::Chat,
         crate::on_behalf_of::context::scope(home_dir, agent_id, fut),
@@ -612,11 +614,15 @@ where
                 &run_key,
                 chrono::Utc::now(),
             )];
+            let ingest_scope = crate::autonomous_runtime::capture();
             tokio::spawn(async move {
-                crate::wiki_ingest::run_ingest(
-                    &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
-                    sources,
-                )
+                crate::autonomous_runtime::restore(ingest_scope, async {
+                    crate::wiki_ingest::run_ingest(
+                        &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
+                        sources,
+                    )
+                    .await;
+                })
                 .await;
             });
         }
@@ -1657,6 +1663,8 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         &self,
         req: &duduclaw_llm::ChatRequest,
     ) -> Result<duduclaw_llm::ChatResponse, duduclaw_llm::LlmError> {
+        // Each provider transport admits immediately before sending, including
+        // every tool-loop iteration. Billing must not retain its lease.
         let resp = self.inner.complete(req).await?;
         // Reasoning fold: bill reasoning exactly once at the output rate
         // (mirrors the legacy single-shot mapping).
@@ -2968,6 +2976,8 @@ async fn call_local_inference_raw(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    // Provider transports admit each request, including local tool-loop rounds.
+    crate::autonomous_runtime::check_current().await?;
     let engine = get_inference_engine(home_dir)
         .await
         .ok_or_else(|| "Local inference engine not available".to_string())?;
@@ -3391,6 +3401,11 @@ async fn call_with_rotation(
                 if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
                     return Err(e);
                 }
+                // An autonomy pause refusal is not the account's fault, and every
+                // other account would be refused the same way.
+                if crate::autonomous_runtime::was_denied() {
+                    return Err(e);
+                }
                 last_error = e.clone();
                 if is_billing_error(&e) {
                     // Billing/credit exhaustion: long cooldown (24h), mark unhealthy immediately
@@ -3614,9 +3629,12 @@ async fn call_claude_streaming(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
+    let admission = crate::autonomous_runtime::admit_current().await?;
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    crate::autonomous_runtime::mark_handoff();
+    drop(admission);
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 

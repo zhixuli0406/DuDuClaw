@@ -212,7 +212,9 @@ pub(crate) async fn tick_once(
         "titler: dispatching"
     );
     for c in to_run {
-        match title_one(session_manager, home_dir, c).await {
+        match crate::autonomous_runtime::scope(
+            home_dir, &c.agent_id, &[], title_one(session_manager, home_dir, c),
+        ).await {
             Ok(title) => {
                 info!(session_id = %c.session_id, title = %title, "titler: persisted title")
             }
@@ -317,7 +319,7 @@ mod tests {
         let (sm, home) = make_session_manager();
         let dir = home.path().join("agents/utility-worker");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\n[runtime]\nprovider='openai_compat'\n[model]\npreferred='gpt-5.4'\n").unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='openai_compat'\n[model]\npreferred='gpt-5.4'\n").unwrap();
         // A mistaken global dispatch also reaches the fake runtime, but with
         // a different model/id, failing before any external call can occur.
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4-mini'\n").unwrap();
@@ -331,7 +333,11 @@ mod tests {
         sm.get_or_create("owned", "utility-worker").await.unwrap();
         sm.append_message("owned", "user", "Summarize this session", 4).await.unwrap();
         sm.append_message("owned", "assistant", "Here is the discussion", 4).await.unwrap();
-        title_one(&sm, home.path(), &cand("owned", 2, 0)).await.unwrap();
+        // Production `tick_once` scopes the owner before `title_one`.
+        crate::autonomous_runtime::scope(
+            home.path(), "utility-worker", &[],
+            title_one(&sm, home.path(), &cand("owned", 2, 0)),
+        ).await.unwrap();
         assert_eq!(sm.get_title("owned").await.unwrap(), ("Session utility result".into(), 2));
     }
 
@@ -340,7 +346,7 @@ mod tests {
         let (sm, home) = make_session_manager();
         let dir = home.path().join("agents/utility-worker");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4'\n").unwrap();
         let runtimes = std::collections::HashMap::from([(
             crate::runtime::RuntimeType::OpenAiCompat,
@@ -352,7 +358,10 @@ mod tests {
         sm.get_or_create("fallback-owner", "utility-worker").await.unwrap();
         sm.append_message("fallback-owner", "user", "Summarize this session", 4).await.unwrap();
         sm.append_message("fallback-owner", "assistant", "Here is the discussion", 4).await.unwrap();
-        title_one(&sm, home.path(), &cand("fallback-owner", 2, 0)).await.unwrap();
+        crate::autonomous_runtime::scope(
+            home.path(), "utility-worker", &[],
+            title_one(&sm, home.path(), &cand("fallback-owner", 2, 0)),
+        ).await.unwrap();
         assert_eq!(sm.get_title("fallback-owner").await.unwrap().0, "Session utility result");
     }
 
@@ -419,6 +428,7 @@ mod tests {
     fn cand(id: &str, turns: u32, titled: u32) -> TitleCandidate {
         TitleCandidate {
             session_id: id.to_string(),
+            agent_id: "worker".to_string(),
             turn_count: turns,
             titled_through_turn: titled,
         }

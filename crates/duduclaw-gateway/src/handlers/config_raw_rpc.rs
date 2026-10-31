@@ -925,11 +925,7 @@ impl MethodHandler {
             }
         }
 
-        let backup = if stored.is_empty() {
-            None
-        } else {
-            Some(write_backup(&path, &stored, chrono::Utc::now().timestamp())?)
-        };
+        let mut backup = None;
         if let RawFile::Agent(id) = &kind {
             // agent.toml goes through the profile file writer (version kept
             // outside the employee directory, `agent_file_changed` audit).
@@ -945,11 +941,21 @@ impl MethodHandler {
                     baseline: crate::agent_files::writer::Baseline::Accept,
                 },
                 move |_| Ok(text),
-                || Ok(()),
+                || {
+                    // The writer holds the profile lock and lifecycle barrier here.
+                    // A drain timeout must neither create nor prune raw backups.
+                    if !stored.is_empty() {
+                        backup = Some(write_backup(&path, &stored, chrono::Utc::now().timestamp())?);
+                    }
+                    Ok(())
+                },
             )
             .await
             .map_err(|e| rctx.scrub(&e.message()))?;
         } else {
+            if !stored.is_empty() {
+                backup = Some(write_backup(&path, &stored, chrono::Utc::now().timestamp())?);
+            }
             let (p, h, t) = (path.clone(), stored_hash.clone(), new_text.clone());
             tokio::task::spawn_blocking(move || commit_text_locked_with_guard(&p, &h, &t, || Ok(())))
                 .await
@@ -1145,6 +1151,56 @@ impl MethodHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_raw_lifecycle_timeout_leaves_backups_and_profile_unchanged() {
+        use duduclaw_core::autonomy_gate::{admit, AutonomyPath};
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let created = handler.handle_agents_create_as(
+            json!({"name": "a1", "display_name": "A1"}), Some(&UserContext::admin_fallback()),
+        ).await;
+        assert!(matches!(created, WsFrame::Response { ok: true, .. }), "{created:?}");
+        let path = home.path().join("agents/a1/agent.toml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        // Fill the retention window so an early backup would also prune a file.
+        for n in 0..super::super::config_commit::RAW_BACKUPS_KEPT {
+            write_backup(&path, &format!("backup {n}"), n as i64).unwrap();
+        }
+        let snapshot = || {
+            let mut entries: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("agent.toml.bak-"))
+                .map(|p| (p.file_name().unwrap().to_os_string(), std::fs::read(&p).unwrap()))
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before = snapshot();
+        let mut table: toml::Table = original.parse().unwrap();
+        table.get_mut("agent").unwrap().as_table_mut().unwrap()
+            .insert("status".into(), toml::Value::String("archived".into()));
+        let edited = super::super::config_commit::render_preserving(&original, &table).unwrap();
+        let shared = admit(home.path(), "a1", AutonomyPath::Background).await.unwrap();
+        // Exercise the real 30-second barrier timeout, not a simulated error.
+        let response = handler.handle_config_raw_set(json!({
+            "file": "agent:a1", "base_hash": content_hash(&original), "content": edited,
+        }), &UserContext::admin_fallback()).await;
+        assert!(matches!(&response, WsFrame::Response { ok: false, .. }), "{response:?}");
+        assert!(serde_json::to_string(&response).unwrap().contains("admission_wait_timeout"), "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(snapshot(), before);
+        drop(shared);
+        // A later successful save must still create a backup of the old bytes.
+        let response = handler.handle_config_raw_set(json!({
+            "file": "agent:a1", "base_hash": content_hash(&original), "content": edited,
+        }), &UserContext::admin_fallback()).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        let after = snapshot();
+        assert_eq!(after.len(), before.len());
+        assert_ne!(after, before);
+        assert!(after.iter().any(|(_, bytes)| bytes == original.as_bytes()));
+    }
 
     #[test]
     fn bound_history_transition_key_is_boolean_and_security_audited() {

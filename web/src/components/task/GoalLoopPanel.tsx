@@ -29,6 +29,7 @@ const PAUSE_REASONS: readonly PauseReasonToken[] = [
   'blocked_needs_decision',
   'infra',
   'restart',
+  'operator_paused',
   'unknown',
 ];
 

@@ -104,7 +104,13 @@ pub(crate) async fn tick_once(
     );
 
     for (session_id, through_turn) in to_run {
-        match summarize_one(session_manager, home_dir, &session_id, through_turn).await {
+        let Some(candidate) = candidates.iter().find(|c| c.session_id == session_id) else {
+            continue;
+        };
+        match crate::autonomous_runtime::scope(
+            home_dir, &candidate.agent_id, &[],
+            summarize_one(session_manager, home_dir, &session_id, through_turn),
+        ).await {
             Ok(bytes) => info!(
                 session_id = %session_id,
                 through_turn,
@@ -250,7 +256,7 @@ mod tests {
         let (sm, home) = make_session_manager();
         let dir = home.path().join("agents/utility-worker");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\n[runtime]\nprovider='openai_compat'\n[model]\npreferred='gpt-5.4'\n").unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='openai_compat'\n[model]\npreferred='gpt-5.4'\n").unwrap();
         // A mistaken global dispatch also reaches the fake runtime, but with
         // a different model/id, failing before any external call can occur.
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4-mini'\n").unwrap();
@@ -264,7 +270,11 @@ mod tests {
         sm.get_or_create("owned", "utility-worker").await.unwrap();
         sm.append_message("owned", "user", "Summarize this session", 4).await.unwrap();
         sm.append_message("owned", "assistant", "Here is the discussion", 4).await.unwrap();
-        summarize_one(&sm, home.path(), "owned", 2).await.unwrap();
+        // Production `tick_once` scopes the owner before `summarize_one`.
+        crate::autonomous_runtime::scope(
+            home.path(), "utility-worker", &[],
+            summarize_one(&sm, home.path(), "owned", 2),
+        ).await.unwrap();
         assert_eq!(sm.get_summary("owned").await.unwrap(), ("Session utility result".into(), 2));
     }
 
@@ -273,7 +283,7 @@ mod tests {
         let (sm, home) = make_session_manager();
         let dir = home.path().join("agents/utility-worker");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='utility-worker'\nstatus='active'\n[runtime]\nprovider='grok'\n[model]\npreferred='grok-3'\n").unwrap();
         std::fs::write(home.path().join("config.toml"), "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4'\n").unwrap();
         let runtimes = std::collections::HashMap::from([(
             crate::runtime::RuntimeType::OpenAiCompat,
@@ -285,7 +295,10 @@ mod tests {
         sm.get_or_create("fallback-owner", "utility-worker").await.unwrap();
         sm.append_message("fallback-owner", "user", "Summarize this session", 4).await.unwrap();
         sm.append_message("fallback-owner", "assistant", "Here is the discussion", 4).await.unwrap();
-        summarize_one(&sm, home.path(), "fallback-owner", 2).await.unwrap();
+        crate::autonomous_runtime::scope(
+            home.path(), "utility-worker", &[],
+            summarize_one(&sm, home.path(), "fallback-owner", 2),
+        ).await.unwrap();
         assert_eq!(sm.get_summary("fallback-owner").await.unwrap().0, "Session utility result");
     }
 

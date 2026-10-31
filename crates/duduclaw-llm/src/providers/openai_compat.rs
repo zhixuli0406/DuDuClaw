@@ -747,11 +747,15 @@ impl OpenAiCompatProvider {
         for (name, value) in &self.extra_headers {
             http = http.header(name, value);
         }
+        let mut admission = duduclaw_core::autonomy_handoff::admit().await
+            .map_err(LlmError::InvalidRequest)?;
+        admission.request_started();
         let response = http
             .json(&body)
             .send()
             .await
             .map_err(|e| classify_transport(&e))?;
+        admission.handed_off();
 
         let status = response.status();
         if !status.is_success() {
@@ -816,6 +820,106 @@ impl ChatProvider for OpenAiCompatProvider {
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, SystemBlock, ToolDef};
+
+    tokio::task_local! {
+        static ADMISSION_HOME: std::path::PathBuf;
+        static HANDOFF_NOTICE: std::sync::Arc<tokio::sync::Notify>;
+    }
+
+    fn test_admission() -> duduclaw_core::autonomy_handoff::AdmissionFuture {
+        let home = ADMISSION_HOME.with(Clone::clone);
+        Box::pin(async move {
+            duduclaw_core::autonomy_gate::admit(
+                &home, "alice", duduclaw_core::autonomy_gate::AutonomyPath::Background,
+            ).await.map(Some).map_err(|error| error.to_string())
+        })
+    }
+
+    fn test_handoff() {
+        HANDOFF_NOTICE.with(|notice| notice.notify_one());
+    }
+
+    struct ContinueTool(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl crate::tool_loop::ToolExecutor for ContinueTool {
+        fn defs(&self) -> Vec<crate::types::ToolDef> {
+            vec![crate::types::ToolDef {
+                name: "continue".into(), description: "Continue the fake model turn".into(),
+                input_schema: json!({"type": "object"}),
+            }]
+        }
+
+        async fn call(&self, name: &str, _args: Value) -> Result<crate::tool_loop::ToolOutcome, String> {
+            assert_eq!(name, "continue");
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::tool_loop::ToolOutcome::ok("continue"))
+        }
+    }
+
+    #[tokio::test]
+    async fn response_headers_release_admission_before_slow_body_and_tool_loop_next_call_refuses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::time::Duration;
+        let home = tempfile::tempdir().unwrap();
+        let employee = home.path().join("agents/alice");
+        std::fs::create_dir_all(&employee).unwrap();
+        std::fs::write(employee.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let headers = String::from_utf8(request).unwrap();
+            let length: usize = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+            }).unwrap();
+            let mut request_body = vec![0; length];
+            socket.read_exact(&mut request_body).await.unwrap();
+            let body = r#"{"model":"fake","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"one","type":"function","function":{"name":"continue","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            body_rx.await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            // A paused second call must fail before it opens another socket.
+            assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err());
+        });
+        let notice = std::sync::Arc::new(tokio::sync::Notify::new());
+        let call_home = home.path().to_path_buf();
+        let call_notice = notice.clone();
+        let call = tokio::spawn(ADMISSION_HOME.scope(call_home,
+            HANDOFF_NOTICE.scope(call_notice, duduclaw_core::autonomy_handoff::scope(
+                test_admission, test_handoff, async move {
+                    let provider = OpenAiCompatProvider::new("local", ApiAuth::new(""), url);
+                    let req = ChatRequest::new("fake");
+                    let tools = ContinueTool(std::sync::atomic::AtomicUsize::new(0));
+                    let result = crate::tool_loop::run_tool_loop(&provider, req, &tools, 3).await;
+                    assert!(matches!(result, Err(LlmError::InvalidRequest(_))));
+                    assert_eq!(tools.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+                },
+            )),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), notice.notified()).await.unwrap();
+        let paused = tokio::time::timeout(Duration::from_secs(2),
+            duduclaw_core::autonomy_gate::mutate_async(home.path(), Some("alice"), Some(
+                duduclaw_core::autonomy_gate::PauseEntry {
+                    reason: "test".into(), who: "test".into(), at: "2026-10-29T00:00:00Z".into(),
+                },
+            )),
+        ).await.unwrap();
+        assert!(matches!(paused, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+        assert!(!call.is_finished(), "body must still be pending when pause lands");
+        body_tx.send(()).unwrap();
+        call.await.unwrap();
+        server.await.unwrap();
+    }
 
     #[test]
     fn request_timeout_overrides_shared_client_for_all_completion_modes() {

@@ -113,6 +113,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         user_id,
         on_progress,
     ));
+    let pipeline = crate::autonomous_runtime::human_interactive(&ctx.home_dir, pipeline);
     let turn = Box::pin(reply_identity_scope(
         session_id,
         user_id,

@@ -313,7 +313,9 @@ async fn run_sandboxed(
         Err(e) => return Err(format!("sandbox confinement failed: {e}")),
     }
 
+    let admission = duduclaw_core::autonomy_handoff::admit().await?;
     let child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
+    admission.handed_off();
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("wait: {e}")),
