@@ -275,6 +275,26 @@ impl MessageQueue {
         Ok(())
     }
 
+    /// Cancel only delegations not yet handed to the dispatcher. The existing
+    /// failed terminal is never selected by pending/stale retry queries.
+    pub(crate) async fn cancel_pending_turn(&self, session: &str, turn: &str) -> Result<usize, String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE message_queue SET status='failed', error='origin turn cancelled', completed_at=?3
+             WHERE status='pending' AND session_id=?1 AND turn_id=?2",
+            params![session, turn, Utc::now().to_rfc3339()],
+        ).map_err(|e| format!("cancel pending turn delegations: {e}"))
+    }
+
+    /// Claim a pending snapshot without reviving a row cancelled since the read.
+    pub(crate) async fn claim_pending(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE message_queue SET status='acked', acked_at=?2 WHERE id=?1 AND status='pending'",
+            params![id, Utc::now().to_rfc3339()],
+        ).map(|n| n == 1).map_err(|e| format!("claim pending delegation: {e}"))
+    }
+
     /// Mark a message as acknowledged (dispatcher has picked it up).
     pub async fn ack(&self, message_id: &str) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
@@ -696,6 +716,29 @@ mod tests {
             lane: None,
             on_behalf_of: None,
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_turn_is_exact_and_cannot_be_revived_by_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let queue = MessageQueue::open(tmp.path()).unwrap();
+        for (id, session, turn) in [("cancel", "s", "t"), ("other-turn", "s", "other"),
+            ("other-session", "other", "t"), ("dispatched", "s", "t")] {
+            let mut msg = sample_msg(id, None);
+            msg.session_id = Some(session.into());
+            msg.turn_id = Some(turn.into());
+            queue.enqueue(&msg).await.unwrap();
+        }
+        assert!(queue.claim_pending("dispatched").await.unwrap());
+        let snapshot = queue.pending_messages(10).await.unwrap();
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(queue.cancel_pending_turn("s", "t").await.unwrap(), 1);
+        assert!(!queue.claim_pending("cancel").await.unwrap());
+        assert_eq!(queue.get_by_id("cancel").await.unwrap().unwrap().status, MessageStatus::Failed);
+        assert_eq!(queue.get_by_id("dispatched").await.unwrap().unwrap().status, MessageStatus::Acked);
+        assert_eq!(queue.stale_messages(-1).await.unwrap().len(), 1);
+        assert!(queue.claim_pending("other-turn").await.unwrap());
+        assert!(queue.claim_pending("other-session").await.unwrap());
     }
 
     #[tokio::test]

@@ -50,6 +50,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     Arc<CcrTurnDelivery>,
     Option<crate::trigger_route::AnsweredBy>,
     Vec<duduclaw_knowledge::cite::CitationRef>,
+    TurnBuildRollback,
 ) {
     // P10: one model-free status line if this turn stays silent too long
     // (off by default; external channel sessions only).
@@ -76,6 +77,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // message and schedules distillation BEFORE the lease is rechecked, so
     // both register here and are rolled back / never started on a refusal.
     let delivery = Arc::new(CcrTurnDelivery::default());
+    let build_rollback = TurnBuildRollback::new(delivery.clone(), ctx.session_manager.clone());
     let answered: Arc<std::sync::Mutex<Option<crate::trigger_route::AnsweredBy>>> =
         Arc::new(std::sync::Mutex::new(None));
     // Document knowledge base: attachments the adapter saved for this
@@ -164,7 +166,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         .lock()
         .map(|mut c| std::mem::take(&mut *c))
         .unwrap_or_default();
-    (raw, operator_result_artifact, guards, delivery, answered_by, cited)
+    (raw, operator_result_artifact, guards, delivery, answered_by, cited, build_rollback)
 }
 
 /// Build this turn's thinking sink (see `crate::thinking`). The agent is only
@@ -302,7 +304,7 @@ pub async fn build_guarded_reply_for_agent(
     // Boxed so every channel adapter that wraps this future in its own
     // task-local scopes carries a pointer, not the turn state (see the
     // stack note in `build_reply_with_session_inner_capturing_operator_result`).
-    let (raw, operator_result_artifact, guards, delivery, answered_by, cited) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by, cited, mut build_rollback) =
         Box::pin(build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -334,16 +336,16 @@ pub async fn build_guarded_reply_for_agent(
         append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
     };
     let final_text = crate::knowledge::cite_turn::with_footer(final_text, session_id, &cited);
-    attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
+    let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
-        .with_citations(cited)
+        .with_citations(cited);
+    build_rollback.disarm();
+    reply
 }
 
-/// Hand the turn's rollback handle to the reply when (and only when) the
-/// answer holds a CCR lease. A lease-free turn has nothing a later revocation
-/// could undo, so it publishes the delivery verdict here exactly as before —
-/// keeping the overwhelming majority of replies byte-identical.
+/// Keep WebChat's persisted assistant row revocable until delivery even when
+/// no CCR lease was used. Other channels retain the existing lease-only gate.
 pub(super) async fn attach_turn_rollback(
     text: String,
     artifact: Option<serde_json::Value>,
@@ -351,7 +353,7 @@ pub(super) async fn attach_turn_rollback(
     delivery: Arc<CcrTurnDelivery>,
     ctx: &ReplyContext,
 ) -> GuardedReply {
-    if guards
+    if !delivery.waits_for_turn_delivery() && guards
         .iter()
         .all(duduclaw_llm::CcrDeliveryGuards::is_empty)
     {
@@ -379,7 +381,7 @@ pub async fn build_guarded_reply_with_session(
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
     // Boxed for the same reason as in `build_guarded_reply_for_agent`.
-    let (raw, operator_result_artifact, guards, delivery, answered_by, cited) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by, cited, mut build_rollback) =
         Box::pin(build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -418,10 +420,12 @@ pub async fn build_guarded_reply_with_session(
     };
     let with_sources = crate::knowledge::cite_turn::with_footer(labelled, session_id, &cited);
     let final_text = append_product_footer(with_sources, session_id);
-    attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
+    let reply = attach_turn_rollback(final_text, artifact, guards, delivery, ctx)
         .await
         .with_answered_by(answered_by)
-        .with_citations(cited)
+        .with_citations(cited);
+    build_rollback.disarm();
+    reply
 }
 
 /// Default product attribution on external messaging replies. Internal sessions,

@@ -342,7 +342,9 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             continue; // Do not claim it: resume can pick up the pending message.
         }
         // ACK immediately to prevent double-pickup
-        queue.ack(&msg.id).await?;
+        if !queue.claim_pending(&msg.id).await? {
+            continue;
+        }
         // Workflow queue rows are authorized by the server-owned handoff outbox,
         // never by a sender spelling or a user-controlled JSON payload alone.
         // A run executes in its own task so this loop keeps serving other
@@ -634,6 +636,11 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         } else {
             String::new()
         };
+        // Recheck immediately before polling the runtime: an MCP enqueue may
+        // have raced the cancellation's pending-row cleanup.
+        if fence_cancelled_turn(home_dir, queue, &msg).await? {
+            continue;
+        }
         let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
             (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -1546,6 +1553,21 @@ impl DelegationEnv {
         map.insert(ENV_HOP_DEPTH.to_string(), self.hop_depth.to_string());
         map
     }
+}
+
+/// Returns true only after persisting the cancelled message's terminal state.
+async fn fence_cancelled_turn(
+    home: &Path,
+    queue: &crate::message_queue::MessageQueue,
+    msg: &crate::message_queue::QueueMessage,
+) -> Result<bool, String> {
+    let (Some(session), Some(turn)) = (&msg.session_id, &msg.turn_id) else { return Ok(false); };
+    if crate::approval::is_turn_cancelled(home, session, turn).await? {
+        warn!(message_id = %msg.id, "SQLite queue: cancelled origin turn; dropping delegation");
+        queue.fail(&msg.id, "origin turn cancelled").await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Dispatch a task to an agent — task sandbox (when enabled) → direct call.

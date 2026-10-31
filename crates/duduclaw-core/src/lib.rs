@@ -1466,3 +1466,6 @@ pub mod show_thinking;
 pub mod think_tags;
 
 pub mod egress_guard;
+
+/// Cancellation-safe ownership of spawned process trees.
+pub mod process_tree;

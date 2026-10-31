@@ -49,7 +49,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
+use duduclaw_core::process_tree::ManagedChild;
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -377,7 +378,7 @@ fn concat_content_blocks(blocks: &[Value]) -> String {
 enum McpTransport {
     /// Line-delimited JSON-RPC over a spawned child's stdin/stdout.
     Stdio {
-        child: Child,
+        child: ManagedChild,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
     },
@@ -530,12 +531,12 @@ impl McpClient {
             cmd.env("HOME", home);
         }
 
-        let mut child = cmd.spawn().map_err(|e| McpError::Spawn(e.to_string()))?;
-        let stdin = child
+        let mut child = ManagedChild::spawn(&mut cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
+        let stdin = child.child()
             .stdin
             .take()
             .ok_or_else(|| McpError::Spawn("child stdin unavailable".into()))?;
-        let stdout = child
+        let stdout = child.child()
             .stdout
             .take()
             .ok_or_else(|| McpError::Spawn("child stdout unavailable".into()))?;
@@ -555,7 +556,7 @@ impl McpClient {
         if let Err(e) = client.handshake().await {
             // Best-effort teardown before surfacing the failure.
             if let McpTransport::Stdio { child, .. } = &mut client.transport {
-                let _ = child.start_kill();
+                child.kill_and_reap().await;
             }
             return Err(e);
         }
@@ -1068,15 +1069,9 @@ fn sse_extract_response(body: &str, expect_id: i64) -> Option<Value> {
     None
 }
 
-impl Drop for McpClient {
-    fn drop(&mut self) {
-        // Fail-closed: never leave a stdio server running. `kill_on_drop(true)`
-        // covers the tokio Child too, but start_kill is explicit + immediate.
-        if let McpTransport::Stdio { child, .. } = &mut self.transport {
-            let _ = child.start_kill();
-        }
-    }
-}
+// The stdio transport owns a ManagedChild. Dropping a client, including while
+// its handshake or tool call is suspended, kills its whole process tree and
+// schedules leader reaping through the same helper used by gateway runtimes.
 
 // ---------------------------------------------------------------------------
 // Registry — aggregates N clients behind the ToolExecutor trait
@@ -2770,5 +2765,39 @@ mod http_transport_tests {
             before,
             "denied queued call never reaches provider"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod process_tree_cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mcp_stdio_cancel_during_handshake_kills_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let target = pidfile.to_string_lossy().into_owned();
+        let task = tokio::spawn(async move {
+            McpClient::connect("/bin/sh", &[
+                "-c".into(), "/bin/sleep 300 & echo $! > \"$PIDFILE\"; wait".into(),
+            ], &[("PIDFILE".into(), target)], Duration::from_secs(60)).await
+        });
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pidfile)
+                    .ok().and_then(|text| text.trim().parse::<u32>().ok()) {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("fixture must start a grandchild");
+        assert!(duduclaw_core::platform::process_alive(pid));
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while duduclaw_core::platform::process_alive(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("cancel must kill the MCP server's grandchild");
     }
 }

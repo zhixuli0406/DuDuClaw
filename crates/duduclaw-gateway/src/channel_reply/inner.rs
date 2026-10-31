@@ -129,7 +129,8 @@ pub(super) async fn build_reply_with_session_inner(
     // it as the citation key meant prior turns' citations were attributed
     // to the next turn's prediction error. The session id is still used for
     // session manager / metrics; only the trust feedback path switches.
-    let turn_id = format!("{session_id}#{}", uuid::Uuid::new_v4());
+    let turn_id = crate::webchat::current_turn_id()
+        .unwrap_or_else(|| format!("{session_id}#{}", uuid::Uuid::new_v4()));
     // Runs this turn dispatches (they carry its turn id) are limited to
     // what this turn's person may read.
     crate::knowledge::turn_requesters::remember_turn_origin(
@@ -951,7 +952,7 @@ pub(super) async fn build_reply_with_session_inner(
     // covers. Falls through to verbatim history when no summary exists
     // (summarizer hasn't run yet, or session is below the threshold).
     let max_history_turns = 20;
-    let mut compression_summary = String::new();
+    let compression_summary = session_mgr.compression_summary(session_id).await.unwrap_or_default();
     let (async_summary, summarized_through) = session_mgr
         .get_summary(session_id)
         .await
@@ -983,10 +984,6 @@ pub(super) async fn build_reply_with_session_inner(
                     .take(msgs.len().saturating_sub(1))
                     .filter_map(|m| {
                         if m.role == "system" {
-                            // Capture compression summary for system prompt injection
-                            if !m.content.is_empty() {
-                                compression_summary = m.content.clone();
-                            }
                             None
                         } else {
                             Some(ConversationTurn {
@@ -1373,6 +1370,12 @@ pub(super) async fn build_reply_with_session_inner(
         }
         prompt
     };
+    #[cfg(test)]
+    if let Some(captured) = super::tests::compression_after_cancel::capture(
+        &full_system_prompt, &conversation_history,
+    ) {
+        return captured;
+    }
     let full_system_prompt = match crate::ccr_runtime::historical_reference_note(
         &session_mgr,
         &ctx.home_dir,
@@ -1478,11 +1481,12 @@ pub(super) async fn build_reply_with_session_inner(
         None => Default::default(),
     };
     if let Some(direct) = turn_knowledge.direct_reply.clone() {
-        if let Err(e) = session_mgr
+        match session_mgr
             .append_message_with_id(session_id, "assistant", &direct, estimate_tokens(&direct))
             .await
         {
-            warn!("Failed to save assistant message to session: {e}");
+            Ok(id) => super::record_turn_assistant_message(session_id, id),
+            Err(e) => warn!("Failed to save assistant message to session: {e}"),
         }
         return direct;
     }

@@ -942,6 +942,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
+                // Reuse this hourly maintenance timer. Only the gateway lock
+                // holder sweeps fences, even when no dashboard is connected.
+                if duduclaw_core::gateway_instance::held(&hd) && hd.join("approvals.db").exists() {
+                    let home = hd.clone();
+                    match tokio::task::spawn_blocking(move || crate::approval::ApprovalBroker::open(&home)).await {
+                        Ok(Ok(broker)) => {
+                            if let Err(error) = broker.sweep_cancelled_turns().await {
+                                warn!(%error, "approval cancellation fence sweep failed");
+                            }
+                        }
+                        Ok(Err(error)) => warn!(%error, "approval cancellation fence store unavailable"),
+                        Err(error) => warn!(%error, "approval cancellation fence sweep worker failed"),
+                    }
+                }
                 crate::cost_telemetry::adaptive_routing_check(&hd).await;
             }
         });

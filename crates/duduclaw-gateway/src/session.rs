@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -24,6 +24,10 @@ fn gdpr_like_escape(s: &str) -> String {
 
 /// Number of connections in the pool.
 const POOL_SIZE: usize = 4;
+
+// Cancellation records are UI/audit metadata, not the approval fencing store.
+const WEBCHAT_CANCEL_RETENTION_DAYS: u64 = 90;
+const WEBCHAT_CANCEL_PER_SESSION_CAP: i64 = 1_000;
 
 /// A conversation session for a specific agent.
 pub struct Session {
@@ -94,7 +98,10 @@ impl SessionManager {
             let conn =
                 Connection::open(db_path).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             // Enable WAL mode for better concurrent read performance
-            let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             pool.push(Mutex::new(conn));
         }
 
@@ -163,6 +170,19 @@ impl SessionManager {
 
             CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON session_messages(session_id);
+
+            CREATE TABLE IF NOT EXISTS webchat_turn_cancellations (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                turn_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                cancelled_at TEXT NOT NULL,
+                PRIMARY KEY(session_id, turn_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_webchat_cancellations_age
+                ON webchat_turn_cancellations(cancelled_at);
+            CREATE INDEX IF NOT EXISTS idx_webchat_cancellations_session_age
+                ON webchat_turn_cancellations(session_id, cancelled_at DESC, turn_id DESC);
 
             CREATE TABLE IF NOT EXISTS session_ccr_references (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -275,6 +295,7 @@ impl SessionManager {
         // for a signed-in WebChat account, who owns it. NULL on rows written
         // before this migration (see `session_origin::backfill`).
         crate::session_origin::store::migrate(conn);
+        Self::sweep_webchat_cancellations(conn, WEBCHAT_CANCEL_RETENTION_DAYS)?;
 
         Ok(())
     }
@@ -457,6 +478,71 @@ impl SessionManager {
             }
         }
         Ok(results)
+    }
+
+    /// Control records never enter conversation history or prompt content. The
+    /// owner check and insert share one write transaction; absent sessions stay absent.
+    pub(crate) async fn record_webchat_cancel(
+        &self, session_id: &str, agent: &str, turn_id: &str, msg_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.acquire().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let owner: Option<String> = tx.query_row(
+            "SELECT agent_id FROM sessions WHERE id=?1", [session_id], |r| r.get(0),
+        ).optional().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if let Some(owner) = owner {
+            if owner != agent {
+                return Err(DuDuClawError::Gateway("cancel session owner changed".into()));
+            }
+            tx.execute("INSERT OR IGNORE INTO webchat_turn_cancellations
+                (session_id,turn_id,msg_id,cancelled_at) VALUES (?1,?2,?3,?4)",
+                params![session_id, turn_id, msg_id, chrono::Utc::now().to_rfc3339()])
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+        // Enforce the per-session bound in the same transaction as insertion.
+        // The periodic sweep applies any shorter configured session retention.
+        tx.execute(
+            "DELETE FROM webchat_turn_cancellations WHERE session_id=?1 AND
+             (julianday(cancelled_at) < julianday('now') - ?2 OR turn_id NOT IN (
+                 SELECT turn_id FROM webchat_turn_cancellations WHERE session_id=?1
+                 ORDER BY cancelled_at DESC, turn_id DESC LIMIT ?3
+             ))",
+            params![session_id, WEBCHAT_CANCEL_RETENTION_DAYS, WEBCHAT_CANCEL_PER_SESSION_CAP],
+        ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
+    fn sweep_webchat_cancellations(conn: &Connection, session_retention_days: u64) -> Result<()> {
+        conn.execute(
+            "DELETE FROM webchat_turn_cancellations
+             WHERE julianday(cancelled_at) < julianday('now') - ?1
+                OR NOT EXISTS (SELECT 1 FROM sessions
+                               WHERE sessions.id=webchat_turn_cancellations.session_id)",
+            params![session_retention_days.min(WEBCHAT_CANCEL_RETENTION_DAYS)],
+        ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        // Also trim existing databases that predate the insertion-time cap.
+        conn.execute(
+            "DELETE FROM webchat_turn_cancellations WHERE rowid IN (
+                 SELECT cancellation_rowid FROM (
+                     SELECT rowid AS cancellation_rowid,
+                            ROW_NUMBER() OVER (PARTITION BY session_id
+                                ORDER BY cancelled_at DESC, turn_id DESC) AS position
+                     FROM webchat_turn_cancellations
+                 ) WHERE position > ?1
+             )",
+            [WEBCHAT_CANCEL_PER_SESSION_CAP],
+        ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Only compress() (and handoff of its stored summary) writes this column.
+    /// System messages can also be provenance/control records, never summaries.
+    pub(crate) async fn compression_summary(&self, session_id: &str) -> Result<String> {
+        self.acquire().await.query_row(
+            "SELECT COALESCE(summary, '') FROM sessions WHERE id=?1", [session_id], |r| r.get(0),
+        ).optional().map(|v| v.unwrap_or_default())
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))
     }
 
     /// Retrieve all messages for a session, ordered by timestamp.
@@ -653,6 +739,11 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
 
         tx.execute(
+            "DELETE FROM webchat_turn_cancellations WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        tx.execute(
             "DELETE FROM session_ccr_references WHERE session_id = ?1",
             params![session_id],
         )
@@ -753,6 +844,13 @@ impl SessionManager {
             .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
         tx.execute(
+            "DELETE FROM webchat_turn_cancellations WHERE session_id IN (
+                 SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
+             )",
+            params![contact, like],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        tx.execute(
             "DELETE FROM session_ccr_references WHERE session_id IN (
                  SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
              )",
@@ -809,6 +907,8 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
+        Self::sweep_webchat_cancellations(&conn, purge_after_days)?;
+
         // Step 1: archive inactive live sessions (soft).
         let archived = conn
             .execute(
@@ -819,6 +919,13 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         // Step 2: purge sessions archived beyond the retention window.
+        conn.execute(
+            "DELETE FROM webchat_turn_cancellations WHERE session_id IN (
+                SELECT id FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1
+            )",
+            params![purge_cutoff],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         conn.execute(
             "DELETE FROM session_ccr_references WHERE session_id IN (
                 SELECT id FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1
@@ -1338,6 +1445,97 @@ impl SessionManager {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn webchat_cancellation_purge_uses_second_connection_and_explicit_delete() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        for connection in &mgr.pool {
+            let enabled: i64 = connection.lock().await
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
+            assert_eq!(enabled, 1, "every pooled connection enforces foreign keys");
+        }
+        for foreign_keys in [true, false] {
+            mgr.get_or_create("webchat:purge", "agent").await.unwrap();
+            mgr.record_webchat_cancel("webchat:purge", "agent", "turn", "msg")
+                .await.unwrap();
+            // Holding the first connection forces purge_session onto the second.
+            let first = mgr.pool[0].lock().await;
+            mgr.pool[1].lock().await.execute_batch(if foreign_keys {
+                "PRAGMA foreign_keys=ON"
+            } else {
+                "PRAGMA foreign_keys=OFF"
+            }).unwrap();
+            mgr.purge_session("webchat:purge").await.unwrap();
+            let count: i64 = first.query_row(
+                "SELECT COUNT(*) FROM webchat_turn_cancellations", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 0, "explicit deletion does not depend on cascade");
+            mgr.pool[1].lock().await.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn webchat_cancellation_sweep_uses_shorter_session_retention_or_ninety_days() {
+        for (retention_days, old_days) in [(30, 31), (180, 91)] {
+            let tmp = NamedTempFile::new().unwrap();
+            let mgr = SessionManager::new(tmp.path()).unwrap();
+            mgr.get_or_create("webchat:retained", "agent").await.unwrap();
+            mgr.record_webchat_cancel("webchat:retained", "agent", "old", "old-msg")
+                .await.unwrap();
+            mgr.record_webchat_cancel("webchat:retained", "agent", "recent", "new-msg")
+                .await.unwrap();
+            mgr.acquire().await.execute(
+                "UPDATE webchat_turn_cancellations SET cancelled_at=?1 WHERE turn_id='old'",
+                [(chrono::Utc::now() - chrono::Duration::days(old_days)).to_rfc3339()],
+            ).unwrap();
+            mgr.cleanup_inactive_with_retention(24, retention_days).await.unwrap();
+            let turns: Vec<String> = mgr.acquire().await
+                .prepare("SELECT turn_id FROM webchat_turn_cancellations").unwrap()
+                .query_map([], |row| row.get(0)).unwrap()
+                .collect::<std::result::Result<_, _>>().unwrap();
+            assert_eq!(turns, vec!["recent"]);
+            assert!(mgr.session_agent("webchat:retained").await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn webchat_cancellation_cap_preserves_latest_and_other_sessions() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        for session in ["webchat:busy", "webchat:other"] {
+            mgr.get_or_create(session, "agent").await.unwrap();
+        }
+        mgr.record_webchat_cancel("webchat:other", "agent", "other", "msg")
+            .await.unwrap();
+        {
+            let mut conn = mgr.acquire().await;
+            let tx = conn.transaction().unwrap();
+            for index in 0..WEBCHAT_CANCEL_PER_SESSION_CAP + 1 {
+                tx.execute(
+                    "INSERT INTO webchat_turn_cancellations VALUES
+                     ('webchat:busy', ?1, 'old-msg', datetime('now', '-1 day'))",
+                    [format!("old-{index}")],
+                ).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        mgr.record_webchat_cancel("webchat:busy", "agent", "latest", "new-msg")
+            .await.unwrap();
+        let conn = mgr.acquire().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM webchat_turn_cancellations WHERE session_id='webchat:busy'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, WEBCHAT_CANCEL_PER_SESSION_CAP);
+        for turn in ["latest", "other"] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM webchat_turn_cancellations WHERE turn_id=?1)",
+                [turn], |row| row.get(0),
+            ).unwrap();
+            assert!(exists);
+        }
+    }
 
     #[tokio::test]
     async fn ccr_references_follow_source_turn_undo_and_compression() {
