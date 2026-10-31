@@ -428,7 +428,7 @@ impl Actor {
                         }
                         Some(Ok(Message::Pong(_))) => {},
                         Some(Ok(Message::Close(close))) => {
-                            break if close.is_some_and(|f| matches!(u16::from(f.code), 4001 | 1008)) { End::Refresh } else { End::Reconnect };
+                            break if close.is_some_and(|f| u16::from(f.code) == 4001) { End::Refresh } else { End::Reconnect };
                         }
                         Some(Ok(_)) => {},
                         _ => break End::Reconnect,
@@ -509,7 +509,7 @@ where
                 .await
                 .map_err(|_| Error::Disconnected)?,
             Message::Close(close) => return Err(
-                if close.is_some_and(|f| matches!(u16::from(f.code), 4001 | 1008)) {
+                if close.is_some_and(|f| u16::from(f.code) == 4001) {
                     Error::LoginRequired
                 } else { Error::Disconnected }
             ),

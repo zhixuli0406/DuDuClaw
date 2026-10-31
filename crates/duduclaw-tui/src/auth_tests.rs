@@ -534,7 +534,7 @@ async fn rejected_connect_or_auth_close_requires_refresh_but_normal_close_does_n
             let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::join!(crate::client::authenticate(&mut client, &session, 1), fake)
             }).await.unwrap();
-            let expected = if rejected || matches!(code, Some(4001 | 1008)) {
+            let expected = if rejected || matches!(code, Some(4001)) {
                 Error::LoginRequired
             } else { Error::Disconnected };
             assert!(matches!(result, Err(error) if error == expected), "rejected={rejected}, close={code:?}");

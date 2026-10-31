@@ -257,7 +257,7 @@ impl Actor {
                             if !send(socket, Message::Pong(bytes), self.options.request_timeout).await { return; }
                         }
                         Some(Ok(Message::Close(close))) => {
-                            if close.is_some_and(|c| matches!(u16::from(c.code), 4001 | 1008)) {
+                            if close.is_some_and(|c| u16::from(c.code) == 4001) {
                                 let _ = self.refresh.try_send(!self.refresh_attempted);
                                 self.refresh_attempted = true;
                             }
@@ -331,7 +331,7 @@ mod tests {
                     tokio::join!(actor.serve(&mut client, &credentials), fake);
                 }).await.unwrap();
                 assert_eq!(refresh_rx.try_recv().ok(),
-                    matches!(code, Some(4001 | 1008)).then_some(true),
+                    matches!(code, Some(4001)).then_some(true),
                     "authenticated={authenticated}, close={code:?}");
 
                 // An abrupt transport loss is also a reconnect, even before auth.
