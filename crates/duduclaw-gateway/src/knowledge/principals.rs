@@ -39,6 +39,13 @@ use serde_json::{Value, json};
 /// Dynamic visibility of agent-own collections. Stored ACLs remain untouched.
 /// Read errors deny even when an old user or department grant still exists.
 pub(crate) fn collection_visible(home: &Path, conn: &Connection, id: &str, admin: bool) -> bool {
+    collection_visible_to(home, conn, id, admin, None)
+}
+
+fn collection_visible_to(
+    home: &Path, conn: &Connection, id: &str, admin: bool,
+    unattended_agent: Option<&acl::AgentCtx>,
+) -> bool {
     use rusqlite::OptionalExtension;
     if admin { return true; }
     let owner = conn.query_row(
@@ -47,16 +54,18 @@ pub(crate) fn collection_visible(home: &Path, conn: &Connection, id: &str, admin
     ).optional();
     match owner {
         Ok(None) => true,
-        Ok(Some(agent)) => !crate::machine_employee::requires_admin_for_id(home, &agent),
+        Ok(Some(owner)) => unattended_agent.is_some_and(|agent| agent.agent_id == owner)
+            || !crate::machine_employee::requires_admin_for_id(home, &owner),
         Err(_) => false,
     }
 }
 
 pub(crate) fn filter_readable(
-    home: &Path, conn: &Connection, human: &acl::HumanCtx, allowed: &acl::AllowedSet,
+    home: &Path, conn: &Connection, human: &acl::HumanCtx,
+    agent: Option<&acl::AgentCtx>, allowed: &acl::AllowedSet,
 ) -> acl::AllowedSet {
-    if human.mode == acl::HumanMode::InternalOnly { return allowed.clone(); }
-    allowed.filtered(|id| collection_visible(home, conn, id, human.is_admin))
+    let unattended_agent = if human.mode == acl::HumanMode::InternalOnly { agent } else { None };
+    allowed.filtered(|id| collection_visible_to(home, conn, id, human.is_admin, unattended_agent))
 }
 
 pub(crate) fn effective_collections(
@@ -64,7 +73,7 @@ pub(crate) fn effective_collections(
     agent: Option<&acl::AgentCtx>, narrowing: &acl::Narrowing,
 ) -> KbResult<acl::AllowedSet> {
     let allowed = acl::effective_collections(conn, human, agent, narrowing)?;
-    Ok(filter_readable(home, conn, human, &allowed))
+    Ok(filter_readable(home, conn, human, agent, &allowed))
 }
 
 pub(crate) fn require_role(

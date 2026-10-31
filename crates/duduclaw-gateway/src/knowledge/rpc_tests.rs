@@ -477,18 +477,43 @@ fn restricted_own_collection_keeps_unattended_internal_reads() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     agent(h, "sales", "[agent]\nname='sales'\n");
+    agent(h, "ordinary", "[agent]\nname='ordinary'\n");
+    let grants = [
+        (PrincipalKind::User, "viewer", Role::Owner),
+        (PrincipalKind::Agent, "sales", Role::Viewer),
+        (PrincipalKind::Agent, "ordinary", Role::Viewer),
+    ];
     let (cid, _, _) = collection(h, "own-sales", "internal",
-        &[(PrincipalKind::User, "viewer", Role::Owner), (PrincipalKind::Agent, "sales", Role::Viewer)], "Internal knowledge.");
+        &grants, "Internal knowledge.");
+    let (ordinary_cid, _, _) = collection(h, "own-ordinary", "internal",
+        &grants, "Ordinary knowledge.");
     let conn = schema::open_home(h).unwrap();
     conn.execute("INSERT INTO agent_own_collections (agent_id, collection_id, created_by, created_at) VALUES ('sales', ?1, 'admin', 't')", [&cid]).unwrap();
+    conn.execute("INSERT INTO agent_own_collections (agent_id, collection_id, created_by, created_at) VALUES ('ordinary', ?1, 'admin', 't')", [&ordinary_cid]).unwrap();
     preset::install_system_operator_preset(h, false).unwrap();
     preset::bind(h, "sales", &h.join("agents/sales"), "system-operator", "test", "test").unwrap();
     let employee = acl::AgentCtx { agent_id: "sales".into(), department: None, narrowing: acl::AgentNarrowing::All };
+    let other = acl::AgentCtx { agent_id: "ordinary".into(), department: None, narrowing: acl::AgentNarrowing::All };
     let full = acl::HumanCtx::dashboard("viewer", None, false);
     let internal = acl::HumanCtx { mode: acl::HumanMode::InternalOnly, ..acl::HumanCtx::nobody() };
-    for (human, keeps) in [(&internal, true), (&full, false)] {
-        let allowed = acl::effective_collections(&conn, human, Some(&employee), &acl::Narrowing::default()).unwrap();
+    for (human, requesting_agent, keeps) in [
+        (&internal, Some(&employee), true),
+        (&internal, Some(&other), false),
+        (&internal, None, false),
+        (&full, Some(&employee), false),
+        (&full, Some(&other), false),
+        (&full, None, false),
+    ] {
+        let allowed = acl::effective_collections(&conn, human, requesting_agent, &acl::Narrowing::default()).unwrap();
         assert!(allowed.contains(&cid));
-        assert_eq!(super::super::principals::filter_readable(h, &conn, human, &allowed).contains(&cid), keeps);
+        assert!(allowed.contains(&ordinary_cid));
+        let filtered = super::super::principals::effective_collections(h, &conn, human, requesting_agent, &acl::Narrowing::default()).unwrap();
+        assert_eq!(filtered.contains(&cid), keeps);
+        assert!(filtered.contains(&ordinary_cid));
     }
+    let allowed = acl::effective_collections(&conn, &internal, Some(&employee), &acl::Narrowing::default()).unwrap();
+    conn.execute("DROP TABLE agent_own_collections", []).unwrap();
+    let filtered = super::super::principals::filter_readable(h, &conn, &internal, Some(&employee), &allowed);
+    assert!(!filtered.contains(&cid));
+    assert!(!filtered.contains(&ordinary_cid));
 }
