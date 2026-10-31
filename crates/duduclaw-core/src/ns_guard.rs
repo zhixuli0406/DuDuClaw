@@ -330,8 +330,11 @@ mod tests {
             Ok("harden") => {
                 super::harden_gateway_process().unwrap();
                 assert!(super::gateway_process_is_non_dumpable());
-                // Self-access remains usable even as a non-dumpable process.
-                std::fs::File::open("/proc/self/mem").unwrap();
+                // Non-dumpable makes /proc/self files root-owned, so non-root gateways lose 0400/0600 entries such as mem and environ.
+                // These self-access paths remain usable.
+                std::fs::read_to_string("/proc/self/status").unwrap();
+                std::fs::read_dir("/proc/self/fd").unwrap();
+                std::env::current_exe().unwrap();
                 let status = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "ns_guard::tests::harden_gateway_child", "--nocapture"])
                     .env(CHILD, "probe")
