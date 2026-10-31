@@ -4069,6 +4069,7 @@ mod tests {
         duduclaw_core::autonomy_gate::resume(&tmp, Some("a1")).unwrap();
         engine.create_os_watch_goal("a1", "work", None).await.unwrap();
         assert_eq!(engine.task_store.list_tasks(None, None, None).await.unwrap().len(), 1);
+        drop(engine);
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
@@ -4091,6 +4092,9 @@ mod tests {
         engine.fire_matched_rule(&rule, "tick", &fields).await;
         assert_eq!(mq.pending_messages(10).await.unwrap().len(), 1);
         assert_eq!(screener.calls().len(), 1);
+        drop(engine);
+        drop(screener);
+        drop(mq);
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
@@ -4136,6 +4140,9 @@ mod tests {
             // A screen configured to pass on failure still cannot dispatch
             // after a pause; execute_action repeats this same final check.
             assert!(engine.autonomy_check(&action, &fields).is_err());
+            drop(engine);
+            drop(screener);
+            drop(_queue);
             std::fs::remove_dir_all(tmp).unwrap();
         }
     }
