@@ -146,6 +146,12 @@ impl Actor {
                 result = tokio::time::timeout(self.options.request_timeout,
                     tokio_tungstenite::connect_async_with_config(url.as_str(), Some(config), false)) => result,
             };
+            if let Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) = &opened
+                && response.status().as_u16() == 401
+            {
+                let _ = self.refresh.try_send(!self.refresh_attempted);
+                self.refresh_attempted = true;
+            }
             if let Ok(Ok((mut socket, _))) = opened {
                 let started = tokio::time::Instant::now();
                 let mut shutdown = self.shutdown.clone();
@@ -251,8 +257,9 @@ impl Actor {
                             if !send(socket, Message::Pong(bytes), self.options.request_timeout).await { return; }
                         }
                         Some(Ok(Message::Close(close))) => {
-                            if close.is_some_and(|c| matches!(u16::from(c.code), 4001 | 1008)) {
-                                let _ = self.refresh.try_send(!self.refresh_attempted); self.refresh_attempted = true;
+                            if close.is_some_and(|c| u16::from(c.code) == 4001) {
+                                let _ = self.refresh.try_send(!self.refresh_attempted);
+                                self.refresh_attempted = true;
                             }
                             return;
                         }
@@ -290,6 +297,55 @@ mod tests {
             WebSocketStream::from_raw_socket(a, Role::Client, None),
             WebSocketStream::from_raw_socket(b, Role::Server, None)
         )
+    }
+    #[tokio::test]
+    async fn only_authentication_closes_request_refresh() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        for authenticated in [false, true] {
+            for code in [None, Some(1000), Some(1011), Some(4001), Some(1008)] {
+                let credentials = Arc::new(Credentials {
+                    token: Zeroizing::new("close-test-token".into()), generation: 1,
+                });
+                let (_credential_tx, credential_rx) = watch::channel(Some(credentials.clone()));
+                let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
+                let (_command_tx, command_rx) = mpsc::channel(1);
+                let (state_tx, _) = watch::channel(ChatState::default());
+                let (_shutdown_tx, shutdown) = watch::channel(false);
+                let mut actor = Actor {
+                    shutdown, target: GatewayUrl::parse("http://127.0.0.1").unwrap(),
+                    credentials: credential_rx, refresh: refresh_tx,
+                    options: ClientOptions::default(), commands: command_rx,
+                    state: state_tx, model: ChatState::default(), refresh_attempted: false,
+                };
+                let (mut client, mut server) = pair().await;
+                let fake = async {
+                    let _ = server.next().await.unwrap().unwrap();
+                    if authenticated {
+                        server.send(Message::Text(json!({"type":"session_info"}).to_string().into())).await.unwrap();
+                    }
+                    server.send(Message::Close(code.map(|code| CloseFrame {
+                        code: CloseCode::from(code), reason: "fixture".into(),
+                    }))).await.unwrap();
+                };
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(actor.serve(&mut client, &credentials), fake);
+                }).await.unwrap();
+                assert_eq!(refresh_rx.try_recv().ok(),
+                    matches!(code, Some(4001)).then_some(true),
+                    "authenticated={authenticated}, close={code:?}");
+
+                // An abrupt transport loss is also a reconnect, even before auth.
+                let (mut client, mut server) = pair().await;
+                let fake = async move {
+                    let _ = server.next().await.unwrap().unwrap();
+                    drop(server);
+                };
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(actor.serve(&mut client, &credentials), fake);
+                }).await.unwrap();
+                assert!(refresh_rx.try_recv().is_err());
+            }
+        }
     }
     #[tokio::test]
     async fn in_memory_gateway_auth_refresh_and_credential_rotation() {
