@@ -1,5 +1,12 @@
 services:
   duduclaw:
+    # Bubblewrap needs namespaces and mounts; keep capabilities dropped.
+    security_opt:
+      - seccomp=./container/seccomp-bwrap.json
+      - apparmor=${DUDUCLAW_APPARMOR_PROFILE:-unconfined}
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     build:
       context: .
       dockerfile: container/Dockerfile.server
@@ -17,7 +24,6 @@ services:
       - duduclaw-kiro:/home/duduclaw/.kiro
       - duduclaw-cursor:/home/duduclaw/.cursor
       - duduclaw-opencode:/home/duduclaw/.local/share/opencode
-      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       # Claude: API key, or an OAuth token from `claude setup-token`. The OAuth token is a
       # subscription credential; Anthropic's policy does not permit third-party products to
