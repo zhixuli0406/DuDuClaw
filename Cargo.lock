@@ -2413,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-tui"
-version = "1.77.0"
+version = "1.77.1"
 dependencies = [
  "async-trait",
  "axum",
