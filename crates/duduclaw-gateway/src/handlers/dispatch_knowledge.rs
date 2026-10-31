@@ -81,15 +81,15 @@ impl MethodHandler {
             // never become rotator accounts still show on the accounts page.
             "accounts.cli_credentials" => {
                 require_manager!();
-                self.handle_accounts_cli_credentials().await
+                boxed_frame(|| self.handle_accounts_cli_credentials()).await
             }
             "accounts.rotate" => {
                 require_admin!();
-                self.handle_accounts_rotate(params).await
+                boxed_frame(|| self.handle_accounts_rotate(params)).await
             }
             "accounts.health" => {
                 require_admin!();
-                self.handle_accounts_health().await
+                boxed_frame(|| self.handle_accounts_health()).await
             }
             "accounts.add" => {
                 require_admin!();
@@ -112,19 +112,19 @@ impl MethodHandler {
                         return frame;
                     }
                 }
-                self.handle_accounts_add_authorized(params, ctx, conn).await
+                boxed_frame(|| self.handle_accounts_add_authorized(params, ctx, conn)).await
             }
             "accounts.update_budget" => {
                 require_admin!();
-                self.handle_accounts_update_budget_authorized(params, ctx, conn).await
+                boxed_frame(|| self.handle_accounts_update_budget_authorized(params, ctx, conn)).await
             }
             "accounts.update" => {
                 require_admin!();
-                self.handle_accounts_update_authorized(params, ctx, conn).await
+                boxed_frame(|| self.handle_accounts_update_authorized(params, ctx, conn)).await
             }
             "accounts.remove" => {
                 require_admin!();
-                self.handle_accounts_remove_authorized(params, ctx, conn).await
+                boxed_frame(|| self.handle_accounts_remove_authorized(params, ctx, conn)).await
             }
             // Interactive CLI login ("Dashboard 一鍵登入") — drives the CLI's
             // native login in a PTY and streams it to the dashboard.
@@ -154,23 +154,23 @@ impl MethodHandler {
                 {
                     return frame;
                 }
-                self.handle_cli_login_start(params, ctx, conn).await
+                boxed_frame(|| self.handle_cli_login_start(params, ctx, conn)).await
             }
             "auth.cli_login.input" => {
                 require_admin!();
-                self.handle_cli_login_input(params, ctx, conn).await
+                boxed_frame(|| self.handle_cli_login_input(params, ctx, conn)).await
             }
             "auth.cli_login.status" => {
                 require_admin!();
-                self.handle_cli_login_status(params, ctx).await
+                boxed_frame(|| self.handle_cli_login_status(params, ctx)).await
             }
             "auth.cli_login.cancel" => {
                 require_admin!();
-                self.handle_cli_login_cancel(params, ctx).await
+                boxed_frame(|| self.handle_cli_login_cancel(params, ctx)).await
             }
             "auth.cli_login.finalize" => {
                 require_admin!();
-                self.handle_cli_login_finalize(params, ctx, conn).await
+                boxed_frame(|| self.handle_cli_login_finalize(params, ctx, conn)).await
             }
             // WP-D: "訂閱帳號" device-code-style setup wizard — a guided,
             // single-flight, pre-validated specialization of the generic
@@ -191,19 +191,19 @@ impl MethodHandler {
                 ) {
                     return frame;
                 }
-                self.handle_accounts_setup_token_start(ctx, conn).await
+                boxed_frame(|| self.handle_accounts_setup_token_start(ctx, conn)).await
             }
             "accounts.setup_token_submit" => {
                 require_admin!();
-                self.handle_accounts_setup_token_submit(params, ctx, conn).await
+                boxed_frame(|| self.handle_accounts_setup_token_submit(params, ctx, conn)).await
             }
             "accounts.setup_token_status" => {
                 require_admin!();
-                self.handle_accounts_setup_token_status(params, ctx).await
+                boxed_frame(|| self.handle_accounts_setup_token_status(params, ctx)).await
             }
             "accounts.setup_token_cancel" => {
                 require_admin!();
-                self.handle_accounts_setup_token_cancel(params, ctx).await
+                boxed_frame(|| self.handle_accounts_setup_token_cancel(params, ctx)).await
             }
 
             // ── Memory (agent-scoped, H2 fix) ────────────────
@@ -236,50 +236,50 @@ impl MethodHandler {
             }
             "memory.search" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_search(params).await
+                boxed_frame(|| self.handle_memory_search(params)).await
             }
             "memory.browse" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_browse(params).await
+                boxed_frame(|| self.handle_memory_browse(params)).await
             }
             "memory.key_facts" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_key_facts(params).await
+                boxed_frame(|| self.handle_memory_key_facts(params)).await
             }
             // Freshness histogram + top-N + accumulation trend for the memory
             // page's decay visualisation. Read-only aggregate over the same
             // rows `memory.browse` lists.
             "memory.decay_overview" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_decay_overview(params).await
+                boxed_frame(|| self.handle_memory_decay_overview(params)).await
             }
             // F1 Temporal Memory (v1.19.0): supersession chain + point-in-time.
             "memory.history" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_history(params).await
+                boxed_frame(|| self.handle_memory_history(params)).await
             }
             "memory.at" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_at(params).await
+                boxed_frame(|| self.handle_memory_at(params)).await
             }
             // D6 alias — the D1 point-in-time lookup is also exposed under the
             // engine method name so the curation UI reads consistently.
             "memory.get_at" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_at(params).await
+                boxed_frame(|| self.handle_memory_at(params)).await
             }
             // D6 HITL knowledge-graph curation (2026-07): SPO graph export for
             // the force-directed viewer + a destructive by-origin rollback.
             "memory.graph" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_memory_graph(params).await
+                boxed_frame(|| self.handle_memory_graph(params)).await
             }
             // Destructive: expire every currently-valid fact from one source.
             // Owner access to the agent + Manager role (dashboard-local only).
             "memory.invalidate_origin" => {
                 require_manager!();
                 let _ = check_agent!(AccessLevel::Owner);
-                self.handle_memory_invalidate_origin(params).await
+                boxed_frame(|| self.handle_memory_invalidate_origin(params)).await
             }
             // Destructive but recoverable: forget one entry (archived, not
             // dropped). Owner access mirrors `memory.invalidate_origin`; the
@@ -288,7 +288,7 @@ impl MethodHandler {
             // not an admin-only rollback.
             "memory.forget" => {
                 let _ = check_agent!(AccessLevel::Owner);
-                self.handle_memory_forget(params).await
+                boxed_frame(|| self.handle_memory_forget(params)).await
             }
 
             // ── Wiki (agent-scoped — HS4 fix, mirrors memory.*) ───────
@@ -296,11 +296,11 @@ impl MethodHandler {
             // agent A must not be able to read agent B's private wiki/SOPs.
             "wiki.pages" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_wiki_pages(params).await
+                boxed_frame(|| self.handle_wiki_pages(params)).await
             }
             "wiki.read" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_wiki_read(params).await
+                boxed_frame(|| self.handle_wiki_read(params)).await
             }
             // WP5c curation station — the auto-filing audit surface.
             // Listing is read-only (Viewer); the three state-changing actions
@@ -309,53 +309,53 @@ impl MethodHandler {
             // routine hygiene for whoever owns them, not an admin-only lever.
             "wiki.auto_pages" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_wiki_auto_pages(params).await
+                boxed_frame(|| self.handle_wiki_auto_pages(params)).await
             }
             "wiki.promote" => {
                 let _ = check_agent!(AccessLevel::Owner);
-                self.handle_wiki_promote(params).await
+                boxed_frame(|| self.handle_wiki_promote(params)).await
             }
             "wiki.archive" => {
                 let _ = check_agent!(AccessLevel::Owner);
-                self.handle_wiki_archive(params).await
+                boxed_frame(|| self.handle_wiki_archive(params)).await
             }
             "wiki.share" => {
                 let _ = check_agent!(AccessLevel::Owner);
-                self.handle_wiki_share(params).await
+                boxed_frame(|| self.handle_wiki_share(params)).await
             }
             "wiki.search" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_wiki_search(params).await
+                boxed_frame(|| self.handle_wiki_search(params)).await
             }
             "wiki.lint" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_wiki_lint(params).await
+                boxed_frame(|| self.handle_wiki_lint(params)).await
             }
             "wiki.stats" => {
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_wiki_stats(params).await
+                boxed_frame(|| self.handle_wiki_stats(params)).await
             }
             // Phase 4: trust feedback inspection + manual override.
             // Trust state exposes per-conversation citation history that
             // can correlate with user activity → manager+ only (review H1).
             "wiki.trust_audit" => {
                 require_manager!();
-                self.handle_wiki_trust_audit(params).await
+                boxed_frame(|| self.handle_wiki_trust_audit(params)).await
             }
             "wiki.trust_override" => {
                 require_admin!();
-                self.handle_wiki_trust_override(params).await
+                boxed_frame(|| self.handle_wiki_trust_override(params)).await
             }
             "wiki.trust_history" => {
                 require_manager!();
-                self.handle_wiki_trust_history(params).await
+                boxed_frame(|| self.handle_wiki_trust_history(params)).await
             }
 
             // ── Shared Wiki ─────────────────────────────────
-            "shared_wiki.pages" => self.handle_shared_wiki_pages(ctx).await,
-            "shared_wiki.read" => self.handle_shared_wiki_read(params, ctx).await,
-            "shared_wiki.search" => self.handle_shared_wiki_search(params, ctx).await,
-            "shared_wiki.stats" => self.handle_shared_wiki_stats(ctx).await,
+            "shared_wiki.pages" => boxed_frame(|| self.handle_shared_wiki_pages(ctx)).await,
+            "shared_wiki.read" => boxed_frame(|| self.handle_shared_wiki_read(params, ctx)).await,
+            "shared_wiki.search" => boxed_frame(|| self.handle_shared_wiki_search(params, ctx)).await,
+            "shared_wiki.stats" => boxed_frame(|| self.handle_shared_wiki_stats(ctx)).await,
 
             // ── I-5: cross-source content search (⌘K backend) ──
             // Aggregates conversations / artifacts / memory / wiki behind one
@@ -365,140 +365,140 @@ impl MethodHandler {
             // teams' conversations or knowledge).
             "search.query" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_search_query(params, ctx).await
+                boxed_frame(|| self.handle_search_query(params, ctx)).await
             }
 
             // ── Skills (open to all) ─────────────────────────
             // B8: filtered to the employees the caller may view (read live).
-            "skills.list" => self.handle_skills_list(params, ctx).await,
+            "skills.list" => boxed_frame(|| self.handle_skills_list(params, ctx)).await,
             // B8: per-employee switches and removal — Owner of each named
             // employee (or admin), checked live inside the handlers.
-            "skills.set_enabled" => self.handle_skills_set_enabled(params, ctx).await,
-            "skills.remove" => self.handle_skills_remove(params, ctx).await,
-            "skills.archived" => self.handle_skills_archived(params, ctx).await,
-            "skills.restore" => self.handle_skills_restore(params, ctx).await,
-            "skills.search" => self.handle_skills_search(params, ctx).await,
+            "skills.set_enabled" => boxed_frame(|| self.handle_skills_set_enabled(params, ctx)).await,
+            "skills.remove" => boxed_frame(|| self.handle_skills_remove(params, ctx)).await,
+            "skills.archived" => boxed_frame(|| self.handle_skills_archived(params, ctx)).await,
+            "skills.restore" => boxed_frame(|| self.handle_skills_restore(params, ctx)).await,
+            "skills.search" => boxed_frame(|| self.handle_skills_search(params, ctx)).await,
             "skills.content" => {
                 // HS4: skill content is read from a specific agent's registry —
                 // scope to an agent the caller is bound to.
                 let _ = check_agent!(AccessLevel::Viewer);
-                self.handle_skills_content(params).await
+                boxed_frame(|| self.handle_skills_content(params)).await
             }
             // Read-only preview (fetch + security scan, no mutation): any
             // authenticated user may scan a skill before requesting install.
-            "skills.vet" => self.handle_skills_vet(params).await,
+            "skills.vet" => boxed_frame(|| self.handle_skills_vet(params)).await,
             // Direct install stays admin-only; non-admins file an install request.
             "skills.install" => {
                 require_admin!();
-                self.handle_skills_install(params).await
+                boxed_frame(|| self.handle_skills_install(params)).await
             }
-            "skills.install_request" => self.handle_skills_install_request(params, ctx).await,
+            "skills.install_request" => boxed_frame(|| self.handle_skills_install_request(params, ctx)).await,
 
             // ── Expert packs (專家包, admin only) ────────────────
             "experts.list" => {
                 require_admin!();
-                self.handle_experts_list().await
+                boxed_frame(|| self.handle_experts_list()).await
             }
             "experts.install" => {
                 require_admin!();
-                self.handle_experts_install(params).await
+                boxed_frame(|| self.handle_experts_install(params)).await
             }
             "experts.remove" => {
                 require_admin!();
-                self.handle_experts_remove(params).await
+                boxed_frame(|| self.handle_experts_remove(params)).await
             }
             "experts.hooks_apply" => {
                 require_admin!();
-                self.handle_experts_hooks_apply(params).await
+                boxed_frame(|| self.handle_experts_hooks_apply(params)).await
             }
             "experts.skills_apply" => {
                 require_admin!();
-                self.handle_experts_skills_apply(params).await
+                boxed_frame(|| self.handle_experts_skills_apply(params)).await
             }
             "experts.catalog" => {
                 require_admin!();
-                self.handle_experts_catalog().await
+                boxed_frame(|| self.handle_experts_catalog()).await
             }
             "experts.install_builtin" => {
                 require_admin!();
-                self.handle_experts_install_builtin(params).await
+                boxed_frame(|| self.handle_experts_install_builtin(params)).await
             }
             "experts.generate" => {
                 require_admin!();
-                self.handle_experts_generate(params).await
+                boxed_frame(|| self.handle_experts_generate(params)).await
             }
             "experts.generate_revise" => {
                 require_admin!();
-                self.handle_experts_generate_revise(params).await
+                boxed_frame(|| self.handle_experts_generate_revise(params)).await
             }
             "experts.generate_status" => {
                 require_admin!();
-                self.handle_experts_generate_status(params).await
+                boxed_frame(|| self.handle_experts_generate_status(params)).await
             }
             "experts.generate_cancel" => {
                 require_admin!();
-                self.handle_experts_generate_cancel(params).await
+                boxed_frame(|| self.handle_experts_generate_cancel(params)).await
             }
             "experts.install_draft" => {
                 require_admin!();
-                self.handle_experts_install_draft(params).await
+                boxed_frame(|| self.handle_experts_install_draft(params)).await
             }
 
             // ── Inspiration gallery (P2-b, curated-only, admin only —
             //    mirrors experts.catalog's license/premium-tree gate) ──
             "gallery.list" => {
                 require_admin!();
-                self.handle_gallery_list().await
+                boxed_frame(|| self.handle_gallery_list()).await
             }
 
             // ── Cron (admin only) ────────────────────────────
             "cron.list" => {
                 require_admin!();
-                self.handle_cron_list().await
+                boxed_frame(|| self.handle_cron_list()).await
             }
             "cron.add" => {
                 require_admin!();
-                self.handle_cron_add(params).await
+                boxed_frame(|| self.handle_cron_add(params)).await
             }
             "cron.update" => {
                 require_admin!();
-                self.handle_cron_update(params).await
+                boxed_frame(|| self.handle_cron_update(params)).await
             }
             "cron.pause" => {
                 require_admin!();
-                self.handle_cron_set_enabled(params, false).await
+                boxed_frame(|| self.handle_cron_set_enabled(params, false)).await
             }
             "cron.resume" => {
                 require_admin!();
-                self.handle_cron_set_enabled(params, true).await
+                boxed_frame(|| self.handle_cron_set_enabled(params, true)).await
             }
             "cron.remove" => {
                 require_admin!();
-                self.handle_cron_remove(params).await
+                boxed_frame(|| self.handle_cron_remove(params)).await
             }
             "cron.run_now" => {
                 require_admin!();
-                self.handle_cron_run_now(params).await
+                boxed_frame(|| self.handle_cron_run_now(params)).await
             }
             "cron.templates" => {
                 require_admin!();
-                self.handle_cron_templates().await
+                boxed_frame(|| self.handle_cron_templates()).await
             }
 
             // ── System (admin only for config changes) ───────
-            "system.status" => self.handle_system_status().await,
+            "system.status" => boxed_frame(|| self.handle_system_status()).await,
             "system.doctor" => {
                 require_admin!();
-                self.handle_system_doctor().await
+                boxed_frame(|| self.handle_system_doctor()).await
             }
             "system.doctor_repair" => {
                 require_admin!();
-                self.handle_system_doctor_repair().await
+                boxed_frame(|| self.handle_system_doctor_repair()).await
             }
-            "models.list" => self.handle_models_list().await,
+            "models.list" => boxed_frame(|| self.handle_models_list()).await,
             "models.refresh" => {
                 require_manager!();
-                self.handle_models_refresh().await
+                boxed_frame(|| self.handle_models_refresh()).await
             },
 
             // ── Local-model marketplace (design doc: DESIGN-local-model-
@@ -506,20 +506,20 @@ impl MethodHandler {
             //    mutations (install/cancel/remove) manager+. ──
             "localmodels.search" => {
                 let intent = params.get("intent").and_then(|v| v.as_str()).unwrap_or("chat");
-                match crate::local_models::search(intent, &self.home_dir).await {
+                match boxed_frame(|| crate::local_models::search(intent, &self.home_dir)).await {
                     Ok(v) => WsFrame::ok_response("", v),
                     Err(e) => WsFrame::error_response("", &e),
                 }
             }
             "localmodels.quants" => {
                 let repo = params.get("repo").and_then(|v| v.as_str()).unwrap_or("");
-                match crate::local_models::quants(repo, &self.home_dir).await {
+                match boxed_frame(|| crate::local_models::quants(repo, &self.home_dir)).await {
                     Ok(v) => WsFrame::ok_response("", v),
                     Err(e) => WsFrame::error_response("", &e),
                 }
             }
             "localmodels.installed" => {
-                WsFrame::ok_response("", crate::local_models::installed(&self.home_dir).await)
+                WsFrame::ok_response("", boxed_frame(|| crate::local_models::installed(&self.home_dir)).await)
             }
             "localmodels.install_status" => {
                 WsFrame::ok_response("", crate::local_models::install_status())
@@ -537,9 +537,9 @@ impl MethodHandler {
                 if filename.is_empty() {
                     WsFrame::error_response("", "filename is required")
                 } else {
-                    match crate::local_models::install(
+                    match boxed_frame(|| crate::local_models::install(
                         repo, filename, shards, total, &self.home_dir,
-                    )
+                    ))
                     .await
                     {
                         Ok(id) => WsFrame::ok_response("", json!({ "job_id": id })),
@@ -558,7 +558,7 @@ impl MethodHandler {
             "localmodels.remove" => {
                 require_manager!();
                 let filename = params.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-                match crate::local_models::remove(filename, &self.home_dir).await {
+                match boxed_frame(|| crate::local_models::remove(filename, &self.home_dir)).await {
                     Ok(()) => WsFrame::ok_response("", json!({ "removed": true })),
                     Err(e) => WsFrame::error_response("", &e),
                 }
@@ -589,7 +589,7 @@ impl MethodHandler {
                 )
             }
 
-            _ => Box::pin(self.dispatch_system(method, params, ctx, conn)).await,
+            _ => boxed_frame(|| self.dispatch_system(method, params, ctx, conn)).await,
         }
     }
 }

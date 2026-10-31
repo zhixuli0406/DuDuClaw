@@ -55,50 +55,50 @@ impl MethodHandler {
         match method {
             "autopilot.create" => {
                 require_admin!();
-                self.handle_autopilot_create(params).await
+                boxed_frame(|| self.handle_autopilot_create(params)).await
             }
             "autopilot.update" => {
                 require_admin!();
-                self.handle_autopilot_update(params).await
+                boxed_frame(|| self.handle_autopilot_update(params)).await
             }
             "autopilot.remove" => {
                 require_admin!();
-                self.handle_autopilot_remove(params).await
+                boxed_frame(|| self.handle_autopilot_remove(params)).await
             }
             "autopilot.history" => {
                 require_admin!();
-                self.handle_autopilot_history(params).await
+                boxed_frame(|| self.handle_autopilot_history(params)).await
             }
 
             // ── Resident sensing observability (WP4, admin only) ──
             "ticks.sources" => {
                 require_admin!();
-                self.handle_ticks_sources().await
+                boxed_frame(|| self.handle_ticks_sources()).await
             }
             "ticks.recent" => {
                 require_admin!();
-                self.handle_ticks_recent(params).await
+                boxed_frame(|| self.handle_ticks_recent(params)).await
             }
             // ── v1.68: [[tick.sources]] CRUD (admin; hot-respawns the tasks) ──
             "channel_ingress.list" => {
                 require_admin!();
-                self.handle_channel_ingress_list(params, ctx).await
+                boxed_frame(|| self.handle_channel_ingress_list(params, ctx)).await
             }
             "channel_ingress.resolve" => {
                 require_admin!();
-                self.handle_channel_ingress_resolve(params, ctx).await
+                boxed_frame(|| self.handle_channel_ingress_resolve(params, ctx)).await
             }
             "channel_ingress.inspect" => {
                 require_admin!();
-                self.handle_channel_ingress_inspect(params, ctx).await
+                boxed_frame(|| self.handle_channel_ingress_inspect(params, ctx)).await
             }
             // Live view / takeover (P8): role and binding re-read and
             // judged per call inside the handler (Admin, or bound Manager /
             // Operator), so no blanket role gate here.
             "computer_profiles.status" | "computer_profiles.reset" => {
-                self.handle_computer_profiles(method, params, ctx).await
+                boxed_frame(|| self.handle_computer_profiles(method, params, ctx)).await
             }
-            "computer_sessions.open_link" => self.handle_computer_open_link(params, ctx).await,
+            "computer_sessions.open_link" => boxed_frame(|| self.handle_computer_open_link(params, ctx)).await,
             "computer_sessions.status"
             | "computer_sessions.view"
             | "computer_sessions.takeover"
@@ -106,7 +106,7 @@ impl MethodHandler {
             | "computer_sessions.resume"
             | "computer_sessions.stop"
             | "computer_sessions.snapshot" => {
-                self.handle_computer_sessions(method, params, ctx).await
+                boxed_frame(|| self.handle_computer_sessions(method, params, ctx)).await
             }
             "computer_workspaces.list"
             | "computer_workspaces.fence"
@@ -116,46 +116,46 @@ impl MethodHandler {
             | "computer_workspaces.rebind_runner"
             | "computer_workspaces.delete" => {
                 require_admin!();
-                self.handle_computer_workspaces(method, params, ctx).await
+                boxed_frame(|| self.handle_computer_workspaces(method, params, ctx)).await
             }
             "tick.sources.list" => {
                 require_admin!();
-                self.handle_tick_sources_list().await
+                boxed_frame(|| self.handle_tick_sources_list()).await
             }
             "tick.sources.upsert" => {
                 require_admin!();
-                self.handle_tick_sources_upsert(params, ctx).await
+                boxed_frame(|| self.handle_tick_sources_upsert(params, ctx)).await
             }
             "tick.sources.remove" => {
                 require_admin!();
-                self.handle_tick_sources_remove(params, ctx).await
+                boxed_frame(|| self.handle_tick_sources_remove(params, ctx)).await
             }
 
             // ── OS-native page (P4-3, admin management surface) ─
             "os.status" => {
                 require_admin!();
-                self.handle_os_status().await
+                boxed_frame(|| self.handle_os_status()).await
             }
             "os.settings.update" => {
                 require_admin!();
                 // The write path judges admin-only keys by the caller: read
                 // the caller live (D7), not from the session token.
                 match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
-                    Ok(live) => Box::pin(self.handle_os_settings_update(params, Some(&live))).await,
+                    Ok(live) => boxed_frame(|| self.handle_os_settings_update(params, Some(&live))).await,
                     Err(_) => WsFrame::error_response("", "permission denied"),
                 }
             }
             "os.gate.recent" => {
                 require_admin!();
-                self.handle_os_gate_recent(params).await
+                boxed_frame(|| self.handle_os_gate_recent(params)).await
             }
             "os.events.recent" => {
                 require_admin!();
-                self.handle_os_events_recent(params).await
+                boxed_frame(|| self.handle_os_events_recent(params)).await
             }
             "os.doctor.run" => {
                 require_admin!();
-                self.handle_os_doctor_run().await
+                boxed_frame(|| self.handle_os_doctor_run()).await
             }
             // P4-3+: opt this WebSocket connection into the live os_file/
             // os_frontmost tail. `require_admin!` here is the ONLY authority
@@ -175,24 +175,24 @@ impl MethodHandler {
             // ── Redaction (RFC-23, manager-only) ──────────────
             "redaction.stats" => {
                 require_manager!();
-                self.handle_redaction_stats().await
+                boxed_frame(|| self.handle_redaction_stats()).await
             }
             "redaction.recent_audit" => {
                 require_manager!();
-                self.handle_redaction_recent_audit(params).await
+                boxed_frame(|| self.handle_redaction_recent_audit(params)).await
             }
             "redaction.override_status" => {
                 require_manager!();
-                self.handle_redaction_override_status().await
+                boxed_frame(|| self.handle_redaction_override_status()).await
             }
             "redaction.policy_status" => {
                 require_manager!();
-                self.handle_redaction_policy_status().await
+                boxed_frame(|| self.handle_redaction_policy_status()).await
             }
 
             // ── Shared Skills (open to all authenticated) ───
-            "skills.leaderboard" => self.handle_skills_leaderboard(params, ctx).await,
-            "skills.shared" => self.handle_skills_shared_list().await,
+            "skills.leaderboard" => boxed_frame(|| self.handle_skills_leaderboard(params, ctx)).await,
+            "skills.shared" => boxed_frame(|| self.handle_skills_shared_list()).await,
             // B8: sharing copies from an employee and adopting writes into
             // one — both need Owner of that employee (or admin), read live.
             "skills.share" => {
@@ -200,75 +200,75 @@ impl MethodHandler {
                 if let Err(e) = crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, agent, AccessLevel::Owner) {
                     return WsFrame::error_response("", &e);
                 }
-                self.handle_skills_share(params).await
+                boxed_frame(|| self.handle_skills_share(params)).await
             }
             "skills.adopt" => {
                 let agent = params.get("target_agent_id").and_then(|v| v.as_str()).unwrap_or("");
                 if let Err(e) = crate::agent_files::flow::require_live_agent_access(&self.home_dir, ctx, agent, AccessLevel::Owner) {
                     return WsFrame::error_response("", &e);
                 }
-                self.handle_skills_adopt(params).await
+                boxed_frame(|| self.handle_skills_adopt(params)).await
             }
 
             // ── Custom skills (human × agent authored; V13-T13.0) ───
             // create/update/submit/list are open to any logged-in user (the
             // record carries `created_by`); retire is gated to creator/admin
             // inside the handler.
-            "skills.custom_create" => self.handle_skills_custom_create(params, ctx).await,
-            "skills.custom_generate" => self.handle_skills_custom_generate(params, ctx).await,
-            "skills.custom_update" => self.handle_skills_custom_update(params, ctx).await,
-            "skills.custom_submit" => self.handle_skills_custom_submit(params, ctx).await,
-            "skills.custom_list" => self.handle_skills_custom_list(ctx).await,
-            "skills.custom_retire" => self.handle_skills_custom_retire(params, ctx).await,
+            "skills.custom_create" => boxed_frame(|| self.handle_skills_custom_create(params, ctx)).await,
+            "skills.custom_generate" => boxed_frame(|| self.handle_skills_custom_generate(params, ctx)).await,
+            "skills.custom_update" => boxed_frame(|| self.handle_skills_custom_update(params, ctx)).await,
+            "skills.custom_submit" => boxed_frame(|| self.handle_skills_custom_submit(params, ctx)).await,
+            "skills.custom_list" => boxed_frame(|| self.handle_skills_custom_list(ctx)).await,
+            "skills.custom_retire" => boxed_frame(|| self.handle_skills_custom_retire(params, ctx)).await,
 
             // ── Growth / gamification (login-readable; V10-T10.0) ───
-            "growth.snapshot" => self.handle_growth_snapshot(ctx).await,
+            "growth.snapshot" => boxed_frame(|| self.handle_growth_snapshot(ctx)).await,
             "growth.daily_report" => {
                 require_manager!();
-                self.handle_growth_daily_report(params).await
+                boxed_frame(|| self.handle_growth_daily_report(params)).await
             },
 
             // Fixed product and upstream attribution.
-            "about.get" => self.handle_about_get(params).await,
+            "about.get" => boxed_frame(|| self.handle_about_get(params)).await,
 
             // ── Distributor management (owner instance) ──────
             "distributor.status" => {
                 require_admin!();
-                self.handle_distributor_status().await
+                boxed_frame(|| self.handle_distributor_status()).await
             }
             "distributor.list" => {
                 require_admin!();
-                self.handle_distributor_list().await
+                boxed_frame(|| self.handle_distributor_list()).await
             }
             "distributor.add" => {
                 require_admin!();
-                self.handle_distributor_add(params).await
+                boxed_frame(|| self.handle_distributor_add(params)).await
             }
             "distributor.update" => {
                 require_admin!();
-                self.handle_distributor_update(params).await
+                boxed_frame(|| self.handle_distributor_update(params)).await
             }
             "distributor.remove" => {
                 require_admin!();
-                self.handle_distributor_remove(params).await
+                boxed_frame(|| self.handle_distributor_remove(params)).await
             }
             "distributor.issue" => {
                 require_admin!();
-                self.handle_distributor_issue(params).await
+                boxed_frame(|| self.handle_distributor_issue(params)).await
             }
             "distributor.revoke" => {
                 require_admin!();
-                self.handle_distributor_revoke(params).await
+                boxed_frame(|| self.handle_distributor_revoke(params)).await
             }
             "distributor.upgrade" => {
                 require_admin!();
-                self.handle_distributor_upgrade(params).await
+                boxed_frame(|| self.handle_distributor_upgrade(params)).await
             }
 
             // ── Billing ──────────────────────────────────────
             "billing.usage" => {
                 require_manager!();
-                self.handle_billing_usage().await
+                boxed_frame(|| self.handle_billing_usage()).await
             },
             "billing.history" | "billing.plan" => WsFrame::error_response(
                 "",
@@ -281,10 +281,10 @@ impl MethodHandler {
             | "browser.browserbase_cost" => {
                 WsFrame::error_response("", "Browser automation features require the Pro edition")
             }
-            "marketplace.list" => self.handle_marketplace_list().await,
+            "marketplace.list" => boxed_frame(|| self.handle_marketplace_list()).await,
             "marketplace.install" => {
                 require_admin!();
-                self.handle_marketplace_install(params).await
+                boxed_frame(|| self.handle_marketplace_install(params)).await
             }
 
             // ── WP-B: appliance device management ────────────────
@@ -295,82 +295,82 @@ impl MethodHandler {
             "device.status" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_status().await
+                boxed_frame(|| self.handle_device_status()).await
             }
             "device.network" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_network(params).await
+                boxed_frame(|| self.handle_device_network(params)).await
             }
             "device.update_status" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_update_status().await
+                boxed_frame(|| self.handle_device_update_status()).await
             }
             "device.update_check" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_update_check().await
+                boxed_frame(|| self.handle_device_update_check()).await
             }
             "device.update_apply" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_update_apply().await
+                boxed_frame(|| self.handle_device_update_apply()).await
             }
             "device.update_rollback" => {
                 require_admin!();
                 require_appliance!();
                 require_confirm!();
-                self.handle_device_update_rollback().await
+                boxed_frame(|| self.handle_device_update_rollback()).await
             }
             "device.boot_assessment" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_boot_assessment().await
+                boxed_frame(|| self.handle_device_boot_assessment()).await
             }
             "device.backup_create" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_backup_create().await
+                boxed_frame(|| self.handle_device_backup_create()).await
             }
             // ── WP-G1: scheduled backups + device-migration restore ──
             "device.backup_schedule_get" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_backup_schedule_get().await
+                boxed_frame(|| self.handle_device_backup_schedule_get()).await
             }
             "device.backup_schedule_set" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_backup_schedule_set(params).await
+                boxed_frame(|| self.handle_device_backup_schedule_set(params)).await
             }
             "device.backup_list" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_backup_list().await
+                boxed_frame(|| self.handle_device_backup_list()).await
             }
             "device.backup_delete" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_backup_delete(params).await
+                boxed_frame(|| self.handle_device_backup_delete(params)).await
             }
             "device.backup_restore" => {
                 require_admin!();
                 require_appliance!();
                 require_confirm!();
-                self.handle_device_backup_restore(params).await
+                boxed_frame(|| self.handle_device_backup_restore(params)).await
             }
             "device.factory_reset" => {
                 require_admin!();
                 require_appliance!();
                 require_confirm!();
-                self.handle_device_factory_reset(params).await
+                boxed_frame(|| self.handle_device_factory_reset(params)).await
             }
             "device.power" => {
                 require_admin!();
                 require_appliance!();
                 require_confirm!();
-                self.handle_device_power(params).await
+                boxed_frame(|| self.handle_device_power(params)).await
             }
             // ── IMPL-POWER: the lock screen's login-free power surface ──
             // Deliberately carries NONE of the three macros above:
@@ -388,7 +388,7 @@ impl MethodHandler {
             //     confirm step), not a param the caller asserts about itself.
             // What replaces them is stricter, not looser: appliance AND
             // loopback-peer AND a closed two-value action AND a rate limit.
-            "device.power_local" => self.handle_device_power_local(params, conn).await,
+            "device.power_local" => boxed_frame(|| self.handle_device_power_local(params, conn)).await,
 
             // ── D4a: network settings (Wi-Fi over iwd D-Bus) ──────────
             // Same admin + appliance gate as the `device.*` family above
@@ -401,22 +401,22 @@ impl MethodHandler {
             "network.wifi_scan" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_network_wifi_scan(params).await
+                boxed_frame(|| self.handle_network_wifi_scan(params)).await
             }
             "network.wifi_connect" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_network_wifi_connect(params).await
+                boxed_frame(|| self.handle_network_wifi_connect(params)).await
             }
             "network.wifi_forget" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_network_wifi_forget(params).await
+                boxed_frame(|| self.handle_network_wifi_forget(params)).await
             }
             "network.status" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_network_status().await
+                boxed_frame(|| self.handle_network_status()).await
             }
 
             // ── System-settings app: device.about / device.timedate* /
@@ -429,27 +429,27 @@ impl MethodHandler {
             "device.about" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_about().await
+                boxed_frame(|| self.handle_device_about()).await
             }
             "device.timedate" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_timedate().await
+                boxed_frame(|| self.handle_device_timedate()).await
             }
             "device.timedate_set" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_device_timedate_set(params).await
+                boxed_frame(|| self.handle_device_timedate_set(params)).await
             }
             "network.wired_status" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_network_wired_status().await
+                boxed_frame(|| self.handle_network_wired_status()).await
             }
             "network.wired_config" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_network_wired_config(params).await
+                boxed_frame(|| self.handle_network_wired_config(params)).await
             }
 
             // ── Maintenance Mode — Entry A ────────────────────
@@ -462,17 +462,17 @@ impl MethodHandler {
             "maintenance.enable" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_maintenance_enable(params, ctx).await
+                boxed_frame(|| self.handle_maintenance_enable(params, ctx)).await
             }
             "maintenance.disable" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_maintenance_disable(params, ctx).await
+                boxed_frame(|| self.handle_maintenance_disable(params, ctx)).await
             }
             "maintenance.status" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_maintenance_status(ctx).await
+                boxed_frame(|| self.handle_maintenance_status(ctx)).await
             }
             "maintenance.history" => {
                 require_admin!();
@@ -482,7 +482,7 @@ impl MethodHandler {
             "maintenance.log_access" => {
                 require_admin!();
                 require_appliance!();
-                self.handle_maintenance_log_access(params, ctx).await
+                boxed_frame(|| self.handle_maintenance_log_access(params, ctx)).await
             }
 
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),

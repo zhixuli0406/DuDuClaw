@@ -596,14 +596,21 @@ mod tests {
 
     #[test]
     fn egress_grok_document_names_native_web_and_shell_tools_and_bakes_identity() {
-        let doc = guard_hooks_document(Path::new("/srv/dudu/agents/tester"), &fake_bin());
+        #[cfg(unix)]
+        let home = PathBuf::from("/srv/dudu");
+        #[cfg(windows)]
+        let home = PathBuf::from("C:/dudu-hook-home");
+        assert!(home.is_absolute());
+        let doc = guard_hooks_document(&home.join("agents/tester"), &fake_bin());
         let entries = doc["hooks"]["PreToolUse"].as_array().unwrap();
         let entry = entries.iter().find(|entry| entry[HOOK_TAG] == EGRESS_HOOK_ID).unwrap();
         let matcher: Vec<_> = entry["matcher"].as_str().unwrap().split('|').collect();
         for name in ["WebFetch", "WebSearch", "Bash", "Fetch", "Shell", "web_fetch", "web_search", "run_terminal_command"] {
             assert!(matcher.iter().any(|part| part == &name));
         }
-        assert_eq!(entry["hooks"][0]["command"], "\"/usr/local/bin/duduclaw\" hook egress-guard --agent \"tester\" --home \"/srv/dudu\"");
+        assert_eq!(entry["hooks"][0]["command"], format!(
+            "\"/usr/local/bin/duduclaw\" hook egress-guard --agent \"tester\" --home \"{}\"", home.display(),
+        ));
         assert!(entry["hooks"][0].get("timeout").is_none());
     }
 

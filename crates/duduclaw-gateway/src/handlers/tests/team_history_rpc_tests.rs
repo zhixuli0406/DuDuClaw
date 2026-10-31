@@ -720,17 +720,31 @@ fn team_history_rpc_future_sizes() {
     }
 }
 
-#[tokio::test]
-async fn approval_dispatch_fits_default_worker_stack() {
-    let f = fixture().await;
-    // Exercise every RPC fallthrough used by workflow approval decisions on
-    // the default test stack, without a CLI subprocess or socket fixture.
-    let response = f.handler.handle(
-        "approvals.decide",
-        json!({"id":"missing-workflow-approval","approve":false}),
-        &f.admin,
-    ).await;
-    assert_eq!(denied(response), json!("approval not found"));
+#[test]
+fn approval_dispatch_fits_one_mib_stack() {
+    std::thread::Builder::new()
+        .name("approval-dispatch-1mib".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let f = fixture().await;
+                    // Exercise every RPC fallthrough used by workflow decisions
+                    // with an explicit bound, independent of RUST_MIN_STACK.
+                    let response = f.handler.handle(
+                        "approvals.decide",
+                        json!({"id":"missing-workflow-approval","approve":false}),
+                        &f.admin,
+                    ).await;
+                    assert_eq!(denied(response), json!("approval not found"));
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[tokio::test]

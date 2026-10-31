@@ -197,6 +197,8 @@ mod maintenance_rpc;
 mod device_backup;
 mod agent_channels_gchat_rpc;
 mod agent_channels_rpc;
+mod boxed_frame;
+use boxed_frame::boxed_frame;
 mod dispatch_core;
 mod dispatch_kb;
 mod dispatch_kb_agent;
@@ -517,15 +519,15 @@ impl MethodHandler {
         {
             return frame;
         }
-        if let Some(frame) = Box::pin(self.dispatch_kb(method, &params, ctx)).await {
+        if let Some(frame) = boxed_frame(|| self.dispatch_kb(method, &params, ctx)).await {
             return frame;
         }
-        if let Some(frame) = Box::pin(self.dispatch_agent_channels(method, &params, ctx)).await {
+        if let Some(frame) = boxed_frame(|| self.dispatch_agent_channels(method, &params, ctx)).await {
             return frame;
         }
         // Each dispatch layer must own only its handlers, not the futures of
         // every later layer. Even an approvals call otherwise reserves the
         // stack used by unrelated runtime/spawn handlers along the fallthrough.
-        Box::pin(self.dispatch_core(method, params, ctx, conn)).await
+        boxed_frame(|| self.dispatch_core(method, params, ctx, conn)).await
     }
 }

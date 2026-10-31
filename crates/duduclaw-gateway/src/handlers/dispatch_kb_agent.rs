@@ -64,7 +64,7 @@ impl MethodHandler {
         if method == "knowledge.agent.data_sources" {
             let owns = fresh.has_agent_access(&agent_id, AccessLevel::Owner);
             let home = self.home_dir.clone();
-            return crate::knowledge::blocking(move || {
+            return boxed_frame(|| crate::knowledge::blocking(move || {
                 let input = DescribeInput {
                     agent: &agent,
                     agent_dir: &agent_dir,
@@ -78,7 +78,7 @@ impl MethodHandler {
                     default_readers: &readers,
                 };
                 own::describe(&home, &input)
-            })
+            }))
             .await;
         }
         if offboarded {
@@ -86,7 +86,7 @@ impl MethodHandler {
                 "這位 AI 員工已封存，資料來源暫停使用；請先恢復這位員工。".to_string(),
             ));
         }
-        self.kb_own_ensure(params, &fresh, caller, (agent, agent_dir), readers)
+        boxed_frame(|| self.kb_own_ensure(params, &fresh, caller, (agent, agent_dir), readers))
             .await
     }
 
@@ -120,7 +120,7 @@ impl MethodHandler {
             .unwrap_or(false);
         let home = self.home_dir.clone();
         let (agent_c, caller_c) = (agent.clone(), caller.clone());
-        let outcome = crate::knowledge::blocking(move || {
+        let outcome = boxed_frame(|| crate::knowledge::blocking(move || {
             own::ensure_collection(
                 &home,
                 &EnsureInput {
@@ -131,7 +131,7 @@ impl MethodHandler {
                     readers,
                 },
             )
-        })
+        }))
         .await?;
         if outcome.created {
             own::audit_created(
@@ -159,11 +159,11 @@ impl MethodHandler {
         }
         let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = changed.clone();
-        self.update_agent_toml_as(&agent.id, "knowledge.agent.own.ensure", Some(fresh), Some(fresh), move |table| {
+        boxed_frame(|| self.update_agent_toml_as(&agent.id, "knowledge.agent.own.ensure", Some(fresh), Some(fresh), move |table| {
             let did = own::bind_slug(table, &slug)?;
             flag.store(did, std::sync::atomic::Ordering::SeqCst);
             Ok(())
-        })
+        }))
         .await
         .map_err(|e| {
             tracing::warn!(agent = %agent.id, error = %e, "knowledge: own collection not bound");
