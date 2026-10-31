@@ -194,6 +194,8 @@ interface ChatStore {
    *  moves onto that assistant message). Null between turns. */
   readonly thinking: TurnThinking | null;
   readonly isStreaming: boolean;
+  /** Client message id of the foreground turn; other turns may still run. */
+  readonly activeMessageId: string | null;
   /** Fine-grained turn phase for the companion face (thinking/speaking/…). */
   readonly phase: ChatPhase;
   /** Current mouth shape while `speaking` — sampled per assistant chunk. */
@@ -349,6 +351,39 @@ export function buildUserMessageFrame(opts: {
   };
 }
 
+/** Correlate additive turn ids without changing legacy connection frames.
+ * `conv` identifies the view even when an @ call routes to another session.
+ * `msg_id` rejects late frames from an earlier turn in the same view. A frame
+ * with only a session id must match the resumed or composed current session.
+ */
+export function shouldRenderChatFrame(
+  frame: Record<string, unknown>,
+  current: Pick<ChatStore, 'convId' | 'activeMessageId' | 'sessionId' | 'selectedAgentId' | 'resumedExplicitly'>,
+): boolean {
+  // Control-request failures never complete the targeted turn. Older gateways
+  // echoed its msg_id here, so do not infer terminal ownership from that field.
+  if (frame.type === 'error' && (frame.code === 'turn_not_found' || frame.code === 'duplicate_message')) {
+    return false;
+  }
+  const conv = typeof frame.conv === 'string' && frame.conv ? frame.conv : null;
+  const requestId = typeof frame.request_id === 'string' && frame.request_id ? frame.request_id : null;
+  const msg = frame.type === 'error' && frame.code === 'turn_limit'
+    ? requestId ?? (typeof frame.msg_id === 'string' && frame.msg_id ? frame.msg_id : null)
+    : typeof frame.msg_id === 'string' && frame.msg_id ? frame.msg_id : null;
+  // An uncorrelated admission refusal must not clear another accepted turn.
+  if (frame.type === 'error' && frame.code === 'turn_limit' && !msg) return false;
+  if (conv && conv !== current.convId) return false;
+  if (msg && msg !== current.activeMessageId) return false;
+  if (conv || msg) return true;
+  if (frame.type !== 'session_info' && typeof frame.session_id === 'string' && frame.session_id) {
+    const composed = current.resumedExplicitly
+      ? current.sessionId
+      : `${current.sessionId}${current.selectedAgentId ? `#agent:${current.selectedAgentId}` : ''}#conv:${current.convId}`;
+    return frame.session_id === current.sessionId || frame.session_id === composed;
+  }
+  return shouldRenderFrame(frame.type, frame.conv, current.convId);
+}
+
 /** The wire shape of one message returned by `chat.sessions.history`. */
 export interface HistoryMessageWire {
   readonly role: string;
@@ -446,7 +481,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // A fresh connection re-derives its own server session id, so start a fresh
     // conversation nonce too (the previous connection's buckets are unreachable
     // once the server mints a new suffix).
-    set({ connectionState: 'connecting', ownSessionId: null, convId: nextConvId() });
+    set({ connectionState: 'connecting', ownSessionId: null, activeMessageId: null, convId: nextConvId() });
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/chat`;
@@ -478,23 +513,15 @@ export const useChatStore = create<ChatStore>((set, get) => {
         // about to be dropped below — changed the server-side session list
         // (created/updated a session bucket). Signal the page to refresh the
         // list so the conversation becomes resumable right away.
-        if (data.type === 'assistant_done') {
-          set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
-        } else if (awaitingFirstServerFrame && IN_TURN_FRAME_TYPES.has(data.type)) {
-          // First server frame after a send: the user message is now
-          // persisted server-side — refresh the list once (persistence-
-          // confirmed complement to the optimistic bump in `send`).
-          awaitingFirstServerFrame = false;
+        if (data.type === 'assistant_done' || (data.type === 'error' && data.code === 'cancelled')) {
           set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
         }
-        // Attribution guard: drop reply frames (chunk/step/progress/thinking/
-        // done) that belong to a conversation the user has since left.
-        // `session_info` and `error` are connection-level (untagged) and pass
-        // through. Without this, a long task from conversation A would render
-        // into conversation B when it finishes after the user opened B — the
-        // reported bug.
-        if (!shouldRenderFrame(data.type, data.conv, get().convId)) {
-          return;
+        // Errors and resume confirmations can now belong to a turn too.
+        // Reject another turn before changing the foreground activity state.
+        if (!shouldRenderChatFrame(data, get())) return;
+        if (awaitingFirstServerFrame && IN_TURN_FRAME_TYPES.has(data.type)) {
+          awaitingFirstServerFrame = false;
+          set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
         }
         switch (data.type) {
           case 'session_info':
@@ -682,6 +709,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 messages: msgs,
                 thinking: null,
                 isStreaming: false,
+                activeMessageId: null,
                 phase: 'done' as ChatPhase,
                 viseme: REST_VISEME,
                 // The backend reported the model that ACTUALLY produced this
@@ -716,6 +744,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 stepTree: [],
                 thinking: null,
                 isStreaming: false,
+                activeMessageId: null,
                 phase: 'idle' as ChatPhase,
                 viseme: REST_VISEME,
               });
@@ -736,6 +765,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
               ],
               thinking: null,
               isStreaming: false,
+              activeMessageId: null,
               phase: 'error' as ChatPhase,
               viseme: REST_VISEME,
             }));
@@ -766,6 +796,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     stepTree: [],
     thinking: null,
     isStreaming: false,
+    activeMessageId: null,
     phase: 'idle',
     viseme: REST_VISEME,
     sessionId: null,
@@ -808,6 +839,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         stepTree: [],
         thinking: null,
         isStreaming: false,
+        activeMessageId: null,
         phase: 'idle',
         viseme: REST_VISEME,
         // Fresh conversation with the new partner — bump the nonce so any reply
@@ -833,7 +865,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     discardHistory: (identityChanged = false) => {
       clearVisemeIdle();
       set(state => ({
-        messages: [], steps: [], stepTree: [], thinking: null, isStreaming: false,
+        messages: [], steps: [], stepTree: [], thinking: null, isStreaming: false, activeMessageId: null,
         phase: 'idle', viseme: REST_VISEME, resumedExplicitly: false, convId: nextConvId(),
         sessionId: identityChanged ? null : state.ownSessionId,
         ...(identityChanged ? { ownSessionId: null, selectedAgentId: null } : {}),
@@ -850,6 +882,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         stepTree: [],
         thinking: null,
         isStreaming: false,
+        activeMessageId: null,
         phase: 'idle',
         viseme: REST_VISEME,
         // Fresh view token for the resumed conversation so a reply in flight for
@@ -878,6 +911,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return;
 
       const atts = attachments ?? [];
+      const msgId = newClientMessageId();
 
       // Add user message to local state immediately (with attachment chips)
       set((state) => ({
@@ -897,6 +931,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         // provider reporting thinking.
         thinking: startTurnThinking(Date.now()),
         isStreaming: true,
+        activeMessageId: msgId,
         phase: 'thinking' as ChatPhase,
         viseme: REST_VISEME,
       }));
@@ -910,7 +945,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             agentId: get().selectedAgentId,
             attachments: atts,
             convId: get().convId,
-            msgId: newClientMessageId(),
+            msgId,
           }),
         ),
       );
@@ -946,6 +981,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         stepTree: [],
         thinking: null,
         isStreaming: false,
+        activeMessageId: null,
         phase: 'idle',
         viseme: REST_VISEME,
         sessionId: target,

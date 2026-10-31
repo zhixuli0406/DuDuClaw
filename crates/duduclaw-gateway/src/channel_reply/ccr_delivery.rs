@@ -42,7 +42,6 @@ tokio::task_local! {
 }
 
 /// Per-turn record of everything that must not outlive a refused CCR delivery.
-#[derive(Default)]
 pub(crate) struct CcrTurnDelivery {
     /// `(session_id, row id)` of the assistant message already persisted by
     /// `build_reply_with_session_inner`.
@@ -54,9 +53,56 @@ pub(crate) struct CcrTurnDelivery {
     /// (send finished) or as soon as a recheck loses the lease, whichever
     /// comes first — never twice.
     pub(super) settled: std::sync::atomic::AtomicBool,
+    cleanup: Option<DeliveryCleanup>,
+}
+
+type DeliveryCleanup = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<Result<(), String>>>>>;
+
+tokio::task_local! {
+    static DELIVERY_CLEANUP: DeliveryCleanup;
+}
+
+impl Default for CcrTurnDelivery {
+    fn default() -> Self {
+        Self {
+            assistant_message: Default::default(),
+            waiters: Default::default(),
+            settled: Default::default(),
+            cleanup: DELIVERY_CLEANUP.try_with(Clone::clone).ok(),
+        }
+    }
+}
+
+/// Keep the session FIFO occupied until cancellation's spawned row revocations
+/// finish. Guards capture the collector at construction, before their task-local
+/// scope can be dropped. Other channel callers retain their existing behavior.
+pub(crate) async fn with_delivery_cleanup<F: std::future::Future>(future: F) -> (F::Output, Result<(), String>) {
+    let jobs: DeliveryCleanup = Arc::new(std::sync::Mutex::new(Vec::new()));
+    use futures_util::FutureExt;
+    // Drop unwinding guards inside the collector scope, then join revocations
+    // before rethrowing to the turn supervisor and releasing its FIFO ticket.
+    let result = DELIVERY_CLEANUP.scope(jobs.clone(),
+        std::panic::AssertUnwindSafe(future).catch_unwind()).await;
+    let pending = std::mem::take(&mut *jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    let mut cleanup = Ok(());
+    for job in pending {
+        match job.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => cleanup = Err(error),
+            Err(error) => cleanup = Err(error.to_string()),
+        }
+    }
+    match result {
+        Ok(result) => (result, cleanup),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 impl CcrTurnDelivery {
+    pub(super) fn waits_for_turn_delivery(&self) -> bool {
+        self.cleanup.is_some()
+    }
+
     pub(super) fn subscribe(&self) -> tokio::sync::oneshot::Receiver<bool> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.waiters
@@ -97,25 +143,46 @@ impl CcrTurnDelivery {
 
     /// Publish the verdict and, when the reply was refused, erase the
     /// source-derived assistant message this turn already committed.
-    pub(super) async fn settle(&self, session_mgr: &SessionManager, delivered: bool) {
-        let Some((session_id, message_id)) = self.publish(delivered) else {
-            return;
-        };
-        match session_mgr
-            .revoke_message(&session_id, message_id, CCR_DELIVERY_REFUSED_TEXT)
-            .await
-        {
-            Ok(true) => warn!(
-                session_id,
-                message_id, "CCR delivery refused — assistant turn revoked from session history"
-            ),
-            Ok(false) => {}
-            Err(e) => warn!(
-                session_id,
-                message_id, "CCR delivery refused but the assistant turn could not be revoked: {e}"
-            ),
+    pub(super) async fn settle(&self, session_mgr: &Arc<SessionManager>, delivered: bool) {
+        let Some(row) = self.publish(delivered) else { return; };
+        if let Some(done) = self.start_revocation(session_mgr.clone(), row) {
+            // The owned job remains in the cleanup collector if this waiter is
+            // dropped while waiting for a pooled database connection.
+            let _ = done.await;
         }
     }
+
+    fn start_revocation(
+        &self, session_mgr: Arc<SessionManager>, (session_id, message_id): (String, i64),
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(session_id, message_id,
+                "CCR delivery refused but no runtime remains to revoke the assistant turn");
+            return None;
+        };
+        let (done, completed) = tokio::sync::oneshot::channel();
+        let task = handle.spawn(async move {
+            let result = session_mgr.revoke_message(&session_id, message_id, CCR_DELIVERY_REFUSED_TEXT).await;
+            let result = match result {
+                Ok(true) => {
+                    warn!(session_id, message_id, "CCR delivery refused — assistant turn revoked from session history");
+                    Ok(())
+                }
+                Ok(false) => Ok(()),
+                Err(error) => {
+                    warn!(session_id, message_id, %error, "CCR assistant revocation failed");
+                    Err(error.to_string())
+                }
+            };
+            let _ = done.send(());
+            result
+        });
+        if let Some(cleanup) = &self.cleanup {
+            cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(task);
+        }
+        Some(completed)
+    }
+
 }
 
 /// Remember the assistant row this turn just persisted so a later CCR refusal
@@ -143,6 +210,7 @@ pub(super) fn ccr_delivery_verdict() -> Option<tokio::sync::oneshot::Receiver<bo
 /// refusal takes (`CcrTurnDelivery::settle` → `SessionManager::revoke_message`
 /// plus the distillation verdict). Only attached when the turn actually holds
 /// a CCR lease; a lease-free turn settles at build time as before.
+#[derive(Clone)]
 pub(super) struct TurnRollback {
     pub(super) delivery: Arc<CcrTurnDelivery>,
     pub(super) session_mgr: Arc<SessionManager>,
@@ -151,6 +219,40 @@ pub(super) struct TurnRollback {
 impl std::fmt::Debug for TurnRollback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("TurnRollback")
+    }
+}
+
+/// Own rollback before the raw pipeline has produced a `GuardedReply`.
+/// Cancellation can happen after the assistant row was persisted but while
+/// citations, thinking metadata, restoration or the contract are still awaited.
+pub(super) struct TurnBuildRollback(Option<TurnRollback>);
+
+impl TurnBuildRollback {
+    pub(super) fn new(delivery: Arc<CcrTurnDelivery>, session_mgr: Arc<SessionManager>) -> Self {
+        Self(Some(TurnRollback { delivery, session_mgr }))
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TurnBuildRollback {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.0.take() {
+            rollback.settle_on_drop(false);
+        }
+    }
+}
+
+impl TurnRollback {
+    /// Shared synchronous verdict plus asynchronous row rollback for both
+    /// raw-pipeline cancellation and a guarded reply's final delivery verdict.
+    fn settle_on_drop(self, delivered: bool) {
+        let Some((session_id, message_id)) = self.delivery.publish(delivered) else {
+            return;
+        };
+        self.delivery.start_revocation(self.session_mgr, (session_id, message_id));
     }
 }
 
@@ -205,7 +307,11 @@ impl GuardedReply {
             rollback,
             revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+        // Declared after `reply` so cancellation publishes refusal before
+        // `reply`'s ordinary Drop could publish successful delivery.
+        let mut building = TurnBuildRollback(reply.rollback.clone());
         if reply.still_valid().await {
+            building.disarm();
             return reply;
         }
         // `still_valid` already ran the rollback; drop the handle so the
@@ -288,6 +394,21 @@ impl GuardedReply {
         live
     }
 
+    /// Mark an undelivered reply before dropping it; Drop schedules revocation
+    /// in the cleanup collector even when the turn future is cancelled.
+    pub(crate) fn refuse_delivery(&self) {
+        self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// An unconfirmed terminal send is a refusal, even if its source is valid.
+    /// The captured cleanup scope joins the row revocation when this guard drops.
+    pub(crate) async fn confirm_send<F>(&self, send: F) -> Result<(), ()>
+    where F: std::future::Future<Output = Result<(), ()>> {
+        let result = send.await;
+        if result.is_err() { self.refuse_delivery(); }
+        result
+    }
+
     pub(super) async fn revoke_turn(&self) {
         use std::sync::atomic::Ordering;
         if self.revoked.swap(true, Ordering::SeqCst) {
@@ -327,40 +448,9 @@ impl Drop for GuardedReply {
         let Some(rollback) = self.rollback.take() else {
             return;
         };
-        let delivered = !self.revoked.load(std::sync::atomic::Ordering::SeqCst);
-        // Publish synchronously first: deferred work must never be left
-        // waiting on a verdict, even during runtime shutdown. Only a refusal
-        // has anything left to undo, and that undo needs an await.
-        let Some((session_id, message_id)) = rollback.delivery.publish(delivered) else {
-            return;
-        };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            warn!(
-                session_id,
-                message_id,
-                "CCR delivery refused but no runtime remains to revoke the assistant turn"
-            );
-            return;
-        };
-        let session_mgr = rollback.session_mgr;
-        handle.spawn(async move {
-            match session_mgr
-                .revoke_message(&session_id, message_id, CCR_DELIVERY_REFUSED_TEXT)
-                .await
-            {
-                Ok(true) => warn!(
-                    session_id,
-                    message_id,
-                    "CCR delivery refused — assistant turn revoked from session history"
-                ),
-                Ok(false) => {}
-                Err(e) => warn!(
-                    session_id,
-                    message_id,
-                    "CCR delivery refused but the assistant turn could not be revoked: {e}"
-                ),
-            }
-        });
+        let delivered = !std::thread::panicking()
+            && !self.revoked.load(std::sync::atomic::Ordering::SeqCst);
+        rollback.settle_on_drop(delivered);
     }
 }
 

@@ -133,6 +133,8 @@ pub(super) struct WebRoute {
     /// The message called someone other than the selected / default
     /// employee: the reply goes to that employee's own session bucket.
     pub switched: bool,
+    /// The message used an allowed `@` call, including the selected employee.
+    pub called: bool,
 }
 
 /// Decide which employee answers `text`. `selected` is the employee the
@@ -173,9 +175,11 @@ pub(super) async fn decide_webchat_route(
                     .map(str::to_string)
                     .or_else(|| (default_id != main_id).then(|| default_id.clone())),
                 switched: false,
+                called: false,
             },
             Some(id) => WebRoute {
                 switched: id != current,
+                called: true,
                 agent: (selected.is_some() || id != main_id).then_some(id),
             },
         },
@@ -234,13 +238,13 @@ pub(super) async fn pending_assign_reply(
     user_id: &str,
     conv: Option<String>,
     assign_event: Option<&str>,
+    seq: i64,
 ) -> Option<ChatMessage> {
     use crate::trigger_route::pending::{self, PendingKey, PendingKind};
     if super::is_widget_visitor(auth_user) {
         return None;
     }
     let key = PendingKey::new("webchat", sid, auth_user);
-    let seq = pending::next_seq();
     let event = uuid::Uuid::new_v4().to_string();
     if !matches!(pending::peek_kind(&key, seq), Some((_, PendingKind::Assign))) {
         return None;

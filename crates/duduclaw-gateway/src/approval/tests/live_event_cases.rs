@@ -212,3 +212,40 @@ async fn quarantine_creation_event_failure_rolls_back_card_and_connection_recove
     assert!(broker.get(&rec.id).await.unwrap().is_some());
     assert_eq!(bus.fetch_since(0, 100).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn quarantine_cancelled_turn_rolls_back_and_detaches_before_connection_reuse() {
+    let home = tempfile::tempdir().unwrap();
+    let broker = ApprovalBroker::open(home.path()).unwrap();
+    let bus = crate::events_store::EventBusStore::open(home.path()).unwrap();
+    broker.withdraw_turn("session", "cancelled").await.unwrap();
+    let mut rec = aged(0, 300, false);
+    rec.action_kind = crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE.into();
+    let error = crate::approval::scope_turn("session", "cancelled", broker.store.insert(&rec))
+        .await.unwrap_err();
+    assert_eq!(error, "approval turn was cancelled");
+    assert!(broker.get(&rec.id).await.unwrap().is_none());
+    assert!(bus.fetch_since(0, 100).await.unwrap().is_empty());
+    {
+        let conn = broker.store.conn.lock().await;
+        let attached: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name='quarantine_live_events')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!attached, "failed insertion must detach the event database");
+    }
+    assert!(crate::approval::scope_turn("session", "live", broker.store.insert_if_absent(&rec)).await.unwrap());
+    assert!(!crate::approval::scope_turn("session", "other", broker.store.insert_if_absent(&rec)).await.unwrap());
+    let conn = broker.store.conn.lock().await;
+    let attached: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name='quarantine_live_events')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(!attached, "same-card early return must detach the event database");
+    let origins: i64 = conn.query_row(
+        "SELECT count(*) FROM approval_turn_origins WHERE approval_id=?1", [rec.id.as_str()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(origins, 2);
+    drop(conn);
+    assert_eq!(bus.fetch_since(0, 100).await.unwrap().len(), 1);
+}
