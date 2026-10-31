@@ -434,6 +434,28 @@ mod audience_tests {
     }
 
     #[tokio::test]
+    async fn personal_multi_account_access_keeps_machine_and_diagnostic_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password", duduclaw_auth::UserRole::Admin).unwrap();
+        let employee = db.create_user("employee@example.invalid", "Employee", "isolated-test-password", duduclaw_auth::UserRole::Employee).unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Personal);
+        for (principal, allowed) in [
+            (format!("user:{}", admin.id), true),
+            (format!("user:{}", employee.id), false),
+            ("unmapped:line:owner".into(), false),
+            ("unmapped:telegram:owner".into(), false),
+        ] {
+            crate::on_behalf_of::scope_first(Some(principal), async {
+                assert_eq!(operator_machine_access_allowed(dir.path(), "line:owner"), allowed);
+                assert_eq!(operator_diagnostics_allowed(dir.path(), "line:owner"), allowed);
+            }).await;
+        }
+        assert!(operator_machine_access_allowed(dir.path(), "cron:worker"));
+        assert!(!operator_diagnostics_allowed(dir.path(), "cron:worker"));
+    }
+
+    #[tokio::test]
     async fn system_operator_access_preserves_personal_owner_without_identity_database() {
         let dir = tempfile::tempdir().unwrap();
         crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Personal);

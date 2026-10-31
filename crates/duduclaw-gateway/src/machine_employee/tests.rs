@@ -110,11 +110,23 @@ async fn system_operator_access_cannot_be_reached_through_default_public_or_exis
     assert!(check_loaded(f.home.path(), agent, Some("bad-principal")).is_err());
     assert!(check_loaded(f.home.path(), agent, Some(&format!("user:{}", f.admin.user_id))).is_ok());
     crate::team_edition::record(f.home.path(), duduclaw_core::EditionProfile::Personal);
-    assert!(!requires_admin(agent), "Personal edition stays unchanged");
-    assert!(crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")));
-    for principal in [None, Some("unmapped:line:owner"), Some("unmapped:telegram:owner")] {
-        assert!(check_loaded(f.home.path(), agent, principal).is_ok());
-        assert!(check_target(f.home.path(), "operator", principal).is_ok());
+    assert!(requires_admin(agent), "a lapsed license must not reopen a multi-account deployment");
+    assert!(!crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")));
+    for user in [&f.employee, &f.manager] {
+        let sender = crate::trigger_route::SenderAccess::from_effective(Arc::new(f.db.effective_access(&user.user_id).unwrap().unwrap()));
+        assert!(!sender.may_call(agent, Some("operator")));
+        assert!(!crate::trigger_route::callable_ids(&reg, &sender, Some("operator")).contains(&"operator".to_string()));
+        let principal = format!("user:{}", user.user_id);
+        assert!(check_loaded(f.home.path(), agent, Some(&principal)).is_err());
+        assert!(check_target(f.home.path(), "operator", Some(&principal)).is_err());
+    }
+    for principal in ["unmapped:line:owner", "unmapped:telegram:owner"] {
+        assert!(check_loaded(f.home.path(), agent, Some(principal)).is_err());
+        assert!(check_target(f.home.path(), "operator", Some(principal)).is_err());
+    }
+    for principal in [None, Some(format!("user:{}", f.admin.user_id))] {
+        assert!(check_loaded(f.home.path(), agent, principal.as_deref()).is_ok());
+        assert!(check_target(f.home.path(), "operator", principal.as_deref()).is_ok());
     }
 }
 
@@ -219,4 +231,54 @@ async fn mirror_flags_do_not_choose_the_preset_and_unresolved_binding_stays_rest
     std::fs::remove_file(f.home.path().join("presets/system-operator/preset.toml")).unwrap();
     assert!(check_target(f.home.path(), "operator", Some(&principal)).is_err());
     assert!(check_target(f.home.path(), "operator", None).is_ok());
+}
+
+#[tokio::test]
+async fn personal_machine_access_requires_single_owner_evidence() {
+    for scenario in ["missing", "empty", "admin", "employee", "corrupt", "suspended", "offboarded", "list-error"] {
+        let home = tempfile::tempdir().unwrap();
+        crate::trigger_route::tests::write_agent(
+            &home.path().join("agents"), "operator", "Operator", "@operator", "main", "",
+        );
+        preset::install_system_operator_preset(home.path(), false).unwrap();
+        preset::bind(home.path(), "operator", &home.path().join("agents/operator"),
+            "system-operator", "test", "test").unwrap();
+        let path = home.path().join("users.db");
+        if scenario == "corrupt" {
+            std::fs::write(&path, "not a SQLite database").unwrap();
+        } else if scenario != "missing" {
+            let db = UserDb::new(&path).unwrap();
+            if scenario != "empty" {
+                let role = if scenario == "employee" { UserRole::Employee } else { UserRole::Admin };
+                db.create_user("owner@test.invalid", "Owner", "Test-password-123!", role).unwrap();
+            }
+            if matches!(scenario, "suspended" | "offboarded") {
+                crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+                let extra = db.create_user("extra@test.invalid", "Extra", "Test-password-123!", UserRole::Employee).unwrap();
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET status=?1 WHERE id=?2", [scenario, &extra.id]).unwrap();
+                assert_eq!(db.list_users().unwrap().len(), 2);
+            }
+            if scenario == "list-error" {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET role='invalid'", []).unwrap();
+                assert!(db.list_users().is_err());
+            }
+        }
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Personal);
+        let allowed = matches!(scenario, "missing" | "empty" | "admin");
+        let mut reg = AgentRegistry::new(home.path().join("agents"));
+        reg.scan().await.unwrap();
+        let agent = reg.get("operator").unwrap();
+        assert_eq!(requires_admin(agent), !allowed, "{scenario}");
+        assert_eq!(crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")), allowed, "{scenario}");
+        for principal in ["unmapped:line:owner", "unmapped:telegram:owner"] {
+            assert_eq!(check_loaded(home.path(), agent, Some(principal)).is_ok(), allowed, "{scenario}");
+            assert_eq!(check_target(home.path(), "operator", Some(principal)).is_ok(), allowed, "{scenario}");
+        }
+        assert!(check_loaded(home.path(), agent, None).is_ok(), "{scenario}");
+        if scenario == "missing" {
+            assert!(!path.exists());
+        }
+    }
 }

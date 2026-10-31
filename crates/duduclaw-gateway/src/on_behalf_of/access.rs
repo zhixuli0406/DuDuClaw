@@ -122,15 +122,27 @@ pub fn check(
     }
 }
 
-/// Personal installs keep their single-owner behaviour. An unknown edition
-/// never widens machine access while the gateway is still resolving it.
-pub(crate) fn system_operation_requires_admin(home: &Path) -> bool {
-    !crate::team_edition::is_personal(home)
+fn identity_store_has_single_owner(home: &Path) -> bool {
+    match crate::decision_notify::open_user_db(home) {
+        Ok(None) => true,
+        Ok(Some(db)) => db.list_users().is_ok_and(|users| {
+            // Inactive accounts still prove this was a multi-account deployment.
+            users.is_empty() || (users.len() == 1 && users[0].role == duduclaw_auth::UserRole::Admin)
+        }),
+        Err(_) => false,
+    }
 }
 
-/// Outside Personal, machine tools require the live human administrator,
-/// independently of delegation mode. `None` is allowed only after the caller
-/// proves a gateway-registered background context at the signed authority route.
+/// Only Personal installs whose identity store proves a single owner are
+/// exempt. Unknown editions and unreadable stores never widen machine access.
+pub(crate) fn system_operation_requires_admin(home: &Path) -> bool {
+    !crate::team_edition::is_personal(home) || !identity_store_has_single_owner(home)
+}
+
+/// Unless Personal and the identity store proves a single owner, machine tools
+/// require the live human administrator, independently of delegation mode.
+/// `None` is allowed only after the caller proves a gateway-registered
+/// background context at the signed authority route.
 pub(crate) fn system_operation_permitted(home: &Path, principal: Option<&str>) -> bool {
     if !system_operation_requires_admin(home) {
         return true;
