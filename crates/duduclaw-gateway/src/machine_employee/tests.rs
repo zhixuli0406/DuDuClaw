@@ -356,7 +356,7 @@ fn known_identity_sources_call_the_narrowing_helper() {
         (include_str!("../handlers/live_context.rs"), "return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()))"),
         (include_str!("../handlers/live_context.rs"), "Ok(crate::machine_employee::without_restricted_access(&self.home_dir, live))"),
         (include_str!("../review_evidence/audience.rs"), "Ok(crate::machine_employee::without_restricted_access(home, duduclaw_auth::UserContext {"),
-        (include_str!("../knowledge/principals.rs"), "crate::machine_employee::requires_admin_for_id(home, &agent)"),
+        (include_str!("../knowledge/principals.rs"), "crate::machine_employee::requires_admin_for_id(home, &owner)"),
         (include_str!("../assign_schedule/manage.rs"), "crate::machine_employee::requires_admin_for_id(home, agent)"),
         (include_str!("../recipient_guard.rs"), "crate::machine_employee::requires_admin_for_id(home, agent)"),
         (include_str!("../computer_profiles/mod.rs"), "crate::machine_employee::restriction_known(home, agent)"),

@@ -18323,7 +18323,8 @@ mod live_events_socket_tests {
     type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn next_json(client: &mut Client) -> Value {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // This deadline only bounds a hung test; these RPCs run real Argon2 in a debug build.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 match client.next().await.expect("socket open").expect("valid frame") {
                     ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
