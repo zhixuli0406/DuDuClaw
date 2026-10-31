@@ -591,6 +591,11 @@ pub fn perform_pending_restore_swap(
         &read_config(&restore_root.join("config.toml"))?,
     ).map_err(RestoreSwapError::Io)?;
 
+    crate::mfa::refuse_policy_change(
+        &read_config(&current_config)?,
+        &read_config(&restore_root.join("config.toml"))?,
+    ).map_err(RestoreSwapError::Io)?;
+
     // LINE inbox (F2/F5): events restored from an archive may already have
     // been handled on the device the archive came from. This one-shot marker
     // makes the inbox hold them for an operator instead of running them
@@ -1000,6 +1005,25 @@ mod tests {
     }
 
     // ── perform_pending_restore_swap ────────────────────────────
+
+    #[test]
+    fn mfa_restore_cannot_change_policy_before_moving_data() {
+        for restored in ["", "[auth]\nmfa_enforced=false\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let original = "[auth]\nmfa_enforced=true\n";
+            std::fs::write(home.join("config.toml"), original).unwrap();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("config.toml"), restored).unwrap();
+            write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename:"test.tar.gz".into() }).unwrap();
+            let result = perform_pending_restore_swap(home, "mfa-test");
+            assert!(matches!(result, Err(RestoreSwapError::Io(ref e)) if e.contains("system.update_config")));
+            assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), original);
+            assert!(staging.join("config.toml").exists());
+            assert!(!home.join("restore-backup-mfa-test").exists());
+        }
+    }
 
     #[test]
     fn restore_cannot_remove_or_replace_installation_profile() {

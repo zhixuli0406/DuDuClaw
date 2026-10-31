@@ -712,6 +712,64 @@ async fn mfa_personal_self_service_ignores_enterprise_enforcement() {
 }
 
 #[tokio::test]
+async fn config_raw_mfa_policy_changes_refused_but_unrelated_edits_pass() {
+    let (_dir, state, user) = fixture(false, true).await;
+    let path = state.home_dir.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut ctx = UserContext::admin_fallback();
+    ctx.user_id = user.id.clone();
+    for content in ["[auth]\nmfa_enforced=false\n", "[auth]\n", "[general]\nlog_level='debug'\n"] {
+        let response = state.handler.handle("config.raw.set", json!({"file":"config",
+            "base_hash":crate::handlers::config_commit::content_hash(&original), "content":content}), &ctx).await;
+        let WsFrame::Response { ok:false, error:Some(error), .. } = response else { panic!("{response:?}") };
+        assert!(error.as_str().unwrap().contains("system.update_config"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(enforced(&state.home_dir, false).unwrap());
+        let events = duduclaw_security::audit::read_recent_events(&state.home_dir, 100);
+        assert!(!events.iter().any(|e| matches!(e.event_type.as_str(),
+            "config_raw_edited" | "config_protected_key_changed" | "config_changed")));
+        assert!(!std::fs::read_dir(&state.home_dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains(".bak-")));
+    }
+    let response = state.handler.handle("config.raw.set", json!({"file":"config",
+        "base_hash":crate::handlers::config_commit::content_hash(&original),
+        "content":"[auth]\nmfa_enforced=true\n[general]\nlog_level='debug'\n"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:true, .. }), "{response:?}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("log_level"));
+    assert!(enforced(&state.home_dir, false).unwrap());
+
+    let (_dir, state, user) = fixture(false, false).await;
+    let path = state.home_dir.join("config.toml");
+    // Adding a previously absent key must also use the dedicated switch.
+    std::fs::write(&path, "").unwrap();
+    ctx.user_id = user.id;
+    let response = state.handler.handle("config.raw.set", json!({"file":"config",
+        "base_hash":crate::handlers::config_commit::content_hash(""),
+        "content":"[auth]\nmfa_enforced=true\n"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:false, .. }), "{response:?}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+}
+
+#[tokio::test]
+async fn mfa_nested_batch_config_uses_dedicated_switch() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let mut ctx = UserContext::admin_fallback();
+    ctx.user_id = user.id;
+    let path = state.home_dir.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let response = state.handler.handle("system.update_config",
+        json!({"auth":{"mfa_enforced":true},"log_level":"debug"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:false, .. }), "{response:?}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let response = state.handler.handle("system.update_config",
+        json!({"auth":{"mfa_enforced":true},"log_level":"debug","expected_state":false}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:true, .. }), "{response:?}");
+    assert!(enforced(&state.home_dir, false).unwrap());
+    let events = duduclaw_security::audit::read_recent_events(&state.home_dir, 100);
+    assert!(events.iter().any(|e| e.event_type == "config_protected_key_changed"
+        && e.details["key"] == "auth.mfa_enforced" && e.details["policy_reconciled"] == true));
+}
+
+#[tokio::test]
 async fn mfa_policy_rpc_db_failure_obeys_commit_order() {
     for initial in [false, true] {
         let (_dir, state, user) = fixture(false, initial).await;
@@ -726,6 +784,24 @@ async fn mfa_policy_rpc_db_failure_obeys_commit_order() {
         assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
         let actual: bool = conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
         assert_eq!(actual, initial);
+        let events = duduclaw_security::audit::read_recent_events(&state.home_dir, 100);
+        let policy_events: Vec<_> = events.iter().filter(|e| e.event_type == "config_protected_key_changed"
+            && e.details["key"] == "auth.mfa_enforced").collect();
+        if initial {
+            let WsFrame::Response { error:Some(error), .. } = &response else { panic!("{response:?}") };
+            assert!(error.as_str().unwrap().contains("已在 config.toml 生效"));
+            assert!(error.as_str().unwrap().contains("同步"));
+            assert_eq!(policy_events.len(), 1);
+            let event = policy_events[0];
+            assert_eq!(event.agent_id, user.id);
+            assert_eq!(event.details["before"], true);
+            assert_eq!(event.details["after"], false);
+            assert_eq!(event.details["config_applied"], true);
+            assert_eq!(event.details["reconciling"], true);
+            assert_eq!(event.details["policy_reconciled"], false);
+        } else {
+            assert!(policy_events.is_empty());
+        }
         let disk = std::fs::read_to_string(&path).unwrap();
         if initial {
             assert_eq!(disk.parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(false));

@@ -81,11 +81,20 @@ fn parse_policy(text: &str) -> Result<bool, String> {
         Some(v) => v.as_bool().ok_or_else(|| "雙因素驗證設定必須是布林值。".into()),
     }
 }
+/// Ordinary writers must preserve the effective policy (an absent key is false).
+pub(crate) fn refuse_policy_change(before: &str, after: &str) -> Result<(), String> {
+    if parse_policy(before)? != parse_policy(after)? {
+        return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更（system.update_config，需 expected_state）；請保留目前設定。".into());
+    }
+    Ok(())
+}
+
 /// Keep reloads from reading the old config between the strict DB transition
 /// and file replacement. The caller already holds the config lock.
 pub(crate) fn commit_policy(
     home: &Path,
     new_content: &str,
+    actor: &str,
     write: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let value = parse_policy(new_content)?;
@@ -95,7 +104,22 @@ pub(crate) fn commit_policy(
         let since = if value { record_policy(home, true)? } else { None };
         // If replacement fails after enabling, deliberately retain strict DB state.
         write()?;
-        if !value { record_policy(home, false)?; }
+        // Record the file effect before the fallible disable-side DB transition.
+        crate::security_autopilot::audit_and_emit(
+            home,
+            &duduclaw_security::audit::AuditEvent::new(
+                "config_protected_key_changed", actor,
+                duduclaw_security::audit::Severity::Warning,
+                json!({"key":"auth.mfa_enforced", "before":snapshot.value, "after":value,
+                    "user_id":actor, "source":"system.update_config", "config_applied":true,
+                    "policy_reconciled":value, "reconciling":!value}),
+            ),
+        );
+        if !value {
+            record_policy(home, false).map_err(|error| format!(
+                "雙因素驗證變更已在 config.toml 生效，資料庫政策正在等待重新載入同步；同步前保留原強制政策。{error}"
+            ))?;
+        }
         Ok(since)
     })();
     match result {
@@ -184,6 +208,20 @@ pub(crate) fn replacement_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mfa_ordinary_writes_compare_effective_parsed_values() {
+        for (before, after) in [
+            ("", "[auth]\nmfa_enforced=true"),
+            ("[auth]\nmfa_enforced=true", ""),
+            ("[auth]\nmfa_enforced=true", "[auth]"),
+            ("[auth]\nmfa_enforced=true", "auth=false"),
+        ] {
+            assert!(refuse_policy_change(before, after).is_err());
+        }
+        assert!(refuse_policy_change("", "[auth]\nmfa_enforced=false").is_ok());
+        assert!(refuse_policy_change("[auth]\nmfa_enforced=true", "# comment\n[auth]\nmfa_enforced = true\n[general]\nlog_level='debug'").is_ok());
+    }
+
     #[test]
     fn mfa_policy_snapshot_keeps_last_good_on_reload_failure() {
         let home=tempfile::tempdir().unwrap();

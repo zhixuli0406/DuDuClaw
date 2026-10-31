@@ -242,6 +242,27 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
     #[test]
+    fn mfa_import_cannot_change_policy_before_moving_agents() {
+        let root = unique_tmp("mfa-policy");
+        let source = root.join("source");
+        let target = root.join("target");
+        let original = "[auth]\nmfa_enforced=true\n";
+        write(&target.join("config.toml"), original);
+        write(&target.join("agents/kept/SOUL.md"), "keep");
+        for restored in ["", "[auth]\nmfa_enforced=false\n"] {
+            write(&source.join("config.toml"), restored);
+            let archive = root.join("input.tar.gz");
+            export_home(&source, &archive).unwrap();
+            let error = import_archive(&archive, &target, true).unwrap_err();
+            assert!(error.to_string().contains("system.update_config"));
+            assert_eq!(fs::read_to_string(target.join("config.toml")).unwrap(), original);
+            assert_eq!(fs::read_to_string(target.join("agents/kept/SOUL.md")).unwrap(), "keep");
+            assert!(!target.join("agents.pre-import").exists());
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn import_cannot_remove_installation_profile_or_restore_blocked_agent() {
         let root = unique_tmp("profile-policy");
         let source = root.join("source");
@@ -280,7 +301,13 @@ fn validate_import_policy(archive: &Path, home: &Path) -> Result<()> {
             let table: toml::Table = text.parse().map_err(|_| io_err("import policy", "invalid configuration"))?;
             duduclaw_gateway::product_policy::validate_table(policy, &table).map_err(DuDuClawError::Config)?;
             if path == Path::new("config.toml") {
-                let before = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+                let before = match std::fs::read_to_string(home.join("config.toml")) {
+                    Ok(text) => text,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => return Err(io_err("import policy", error)),
+                };
+                duduclaw_gateway::validate_mfa_config_unchanged(&before, &text)
+                    .map_err(DuDuClawError::Config)?;
                 duduclaw_gateway::product_policy::validate_write(home, &home.join("config.toml"), &before, &text)
                     .map_err(DuDuClawError::Config)?;
             }

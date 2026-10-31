@@ -966,7 +966,7 @@ impl MethodHandler {
                 Ok(())
             };
         let result = if security_change {
-            super::config_commit::commit_mfa_table_locked_with_guard(&config_path, original_hash, &table, guard).await
+            super::config_commit::commit_mfa_table_locked_with_guard(&config_path, original_hash, &table, ctx.user_id.clone(), guard).await
         } else {
             super::config_commit::commit_table_locked_with_guard(&config_path, original_hash, &table, guard).await
         };
