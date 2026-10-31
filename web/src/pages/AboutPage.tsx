@@ -63,8 +63,8 @@ export function AboutPage() {
         </CardContent>
       </Card>
 
-      {/* Distributor information — only present in a distributor build; the
-          HTML is a build input, sanitized server-side and sandboxed here. */}
+      {/* Server-provided distributor information, independent of license tier;
+          sanitized server-side and sandboxed here. */}
       {typeof about?.distributor_notice === 'string' && about.distributor_notice.length > 0 && (
         <DistributorNoticeCard html={about.distributor_notice} />
       )}

@@ -18,8 +18,8 @@ fn restricted(resolution: &PresetResolution) -> bool {
 
 pub(crate) fn requires_admin(agent: &LoadedAgent) -> bool {
     restricted(&agent.preset_resolution)
-        && !preset::agent_home_dir(&agent.dir)
-            .is_some_and(|home| crate::team_edition::is_personal(&home))
+        && preset::agent_home_dir(&agent.dir)
+            .is_none_or(|home| crate::on_behalf_of::access::system_operation_requires_admin(&home))
 }
 
 pub(crate) fn check_loaded(home: &Path, agent: &LoadedAgent, principal: Option<&str>) -> Result<(), String> {
@@ -35,9 +35,7 @@ pub(crate) fn check_loaded(home: &Path, agent: &LoadedAgent, principal: Option<&
 /// Shared creation-time check for paths without an in-memory registry.
 /// Resolve exactly as AgentRegistry does, without trusting `[preset]` in agent.toml.
 pub(crate) fn check_target(home: &Path, target: &str, principal: Option<&str>) -> Result<(), String> {
-    if principal.is_none() || crate::team_edition::is_personal(home)
-        || crate::on_behalf_of::access::system_operation_permitted(home, principal)
-    {
+    if crate::on_behalf_of::access::system_operation_permitted(home, principal) {
         return Ok(());
     }
     if !duduclaw_core::is_valid_agent_id(target) {
@@ -47,9 +45,7 @@ pub(crate) fn check_target(home: &Path, target: &str, principal: Option<&str>) -
     // store; per-agent overrides cannot change it. An empty config is enough
     // for this identity-only resolution and preserves normal ephemeral work.
     let (_, resolution) = preset::resolve_for_agent(home, target, &toml::Table::new());
-    if restricted(&resolution)
-        && !crate::on_behalf_of::access::system_operation_permitted(home, principal)
-    {
+    if restricted(&resolution) {
         return Err(REFUSAL.into());
     }
     Ok(())

@@ -122,10 +122,19 @@ pub fn check(
     }
 }
 
-/// Machine tools require the live human administrator, independently of the
-/// delegation mode. `None` is allowed only after the caller proves a
-/// gateway-registered background context at the signed authority route.
+/// Personal installs keep their single-owner behaviour. An unknown edition
+/// never widens machine access while the gateway is still resolving it.
+pub(crate) fn system_operation_requires_admin(home: &Path) -> bool {
+    !crate::team_edition::is_personal(home)
+}
+
+/// Outside Personal, machine tools require the live human administrator,
+/// independently of delegation mode. `None` is allowed only after the caller
+/// proves a gateway-registered background context at the signed authority route.
 pub(crate) fn system_operation_permitted(home: &Path, principal: Option<&str>) -> bool {
+    if !system_operation_requires_admin(home) {
+        return true;
+    }
     let id = match super::PrincipalState::from_wire(principal) {
         super::PrincipalState::Background => return true,
         super::PrincipalState::Human(HumanPrincipal::User(id)) => id,

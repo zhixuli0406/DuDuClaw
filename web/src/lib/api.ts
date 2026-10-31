@@ -5664,8 +5664,8 @@ export interface AboutResponse {
   version: string;
   tier: string;
   /**
-   * Sanitized distributor-information HTML compiled into a distributor build.
-   * Absent on public builds. Render only through DistributorNoticeCard
+   * Sanitized distributor-information HTML from a signed runtime document
+   * or a distributor build, independent of license tier. Render only through DistributorNoticeCard
    * (sandboxed iframe), never into the dashboard DOM.
    */
   distributor_notice?: string;
@@ -7743,11 +7743,8 @@ export const api = {
      * OpenSource defaults when no license is installed, so the caller
      * can render without conditional-loading the call.
      */
-    status: async (): Promise<LicenseSnapshot> => {
-      const status = await client.call('license.status') as LicenseSnapshot;
-      if (status?.tier !== 'oem') useBrandStore.getState().setBrand(null);
-      return status;
-    },
+    status: (): Promise<LicenseSnapshot> =>
+      client.call('license.status') as Promise<LicenseSnapshot>,
     /** Machine fingerprint provided to the general distributor for licensing. */
     fingerprint: () =>
       client.call('license.fingerprint', {}) as Promise<{ fingerprint: string }>,
@@ -8836,7 +8833,7 @@ export const api = {
       client.call('users.audit_log', params ?? {}) as Promise<{ entries: AuditEntry[] }>,
   },
   about: {
-    /** Verified display brand, immutable vendor attribution and version. */
+    /** Server-verified display brand on any licensed tier, immutable vendor attribution and version. */
     get: async (): Promise<AboutResponse> => {
       const apply = beginBrandRequest();
       const about = await client.call('about.get') as AboutResponse;

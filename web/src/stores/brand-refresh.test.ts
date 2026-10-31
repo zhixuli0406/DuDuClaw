@@ -16,12 +16,13 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllGlobals(); mockWsClient.call.mockReset(); useBrandStore.getState().setBrand(null); });
 
 describe('brand refresh after license changes', () => {
-  it('clears an active brand when license.status is no longer Oem', async () => {
-    mockWsClient.call.mockResolvedValue({ tier: 'open_source' });
-    await api.license.status();
-    expect(useBrandStore.getState().brand).toBeNull();
+  it.each(['self_host_pro', 'solo', 'business', 'open_source'])('preserves the server-provided brand when license.status reports %s', async (tier) => {
+    mockWsClient.call.mockResolvedValue({ tier });
+    expect(await api.license.status()).toEqual({ tier });
+    expect(useBrandStore.getState().brand).toEqual(brand);
+    expect(fetch).not.toHaveBeenCalled();
   });
-  it('refuses a late About brand after license invalidation and a newer public response', async () => {
+  it('refuses a late About brand after a newer public response clears it', async () => {
     let resolveAbout!: (value: unknown) => void;
     mockWsClient.call.mockImplementation((method: string) => method === 'about.get'
       ? new Promise((resolve) => { resolveAbout = resolve; })
@@ -30,12 +31,12 @@ describe('brand refresh after license changes', () => {
     await api.license.status();
     await loadPublicBrand();
     expect(useBrandStore.getState().brand).toBeNull();
-    resolveAbout({ brand, tier: 'oem' });
+    resolveAbout({ brand, tier: 'self_host_pro' });
     await pending;
     expect(useBrandStore.getState().brand).toBeNull();
   });
   it('refetches public branding after a successful activation', async () => {
-    mockWsClient.call.mockResolvedValue({ success: true, status: { tier: 'oem' } });
+    mockWsClient.call.mockResolvedValue({ success: true, status: { tier: 'self_host_pro' } });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ...brand, product_name: 'New Partner' }) }));
     await api.license.activate('signed-key');
     expect(fetch).toHaveBeenCalledWith('/api/brand', { cache: 'no-cache' });

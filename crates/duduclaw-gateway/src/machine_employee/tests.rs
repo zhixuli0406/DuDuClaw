@@ -88,7 +88,7 @@ async fn server_resolved_preset_limits_binding_tasks_goals_and_callable_list() {
 }
 
 #[tokio::test]
-async fn preset_cannot_be_reached_through_default_public_or_existing_binding() {
+async fn system_operator_access_cannot_be_reached_through_default_public_or_existing_binding() {
     let f = fixture().await;
     let reg = f.registry.read().await;
     let agent = reg.get("operator").unwrap();
@@ -102,11 +102,20 @@ async fn preset_cannot_be_reached_through_default_public_or_existing_binding() {
         assert!(check_loaded(f.home.path(), agent, Some(&format!("user:{}", user.user_id))).is_err());
     }
     assert!(!crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")));
+    for principal in ["unmapped:line:owner", "unmapped:telegram:owner"] {
+        assert!(check_loaded(f.home.path(), agent, Some(principal)).is_err());
+        assert!(check_target(f.home.path(), "operator", Some(principal)).is_err());
+    }
     assert!(check_loaded(f.home.path(), agent, None).is_ok(), "unattended work stays permitted");
     assert!(check_loaded(f.home.path(), agent, Some("bad-principal")).is_err());
     assert!(check_loaded(f.home.path(), agent, Some(&format!("user:{}", f.admin.user_id))).is_ok());
     crate::team_edition::record(f.home.path(), duduclaw_core::EditionProfile::Personal);
     assert!(!requires_admin(agent), "Personal edition stays unchanged");
+    assert!(crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")));
+    for principal in [None, Some("unmapped:line:owner"), Some("unmapped:telegram:owner")] {
+        assert!(check_loaded(f.home.path(), agent, principal).is_ok());
+        assert!(check_target(f.home.path(), "operator", principal).is_ok());
+    }
 }
 
 #[tokio::test]

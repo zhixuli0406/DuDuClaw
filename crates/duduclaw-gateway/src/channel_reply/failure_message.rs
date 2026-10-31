@@ -350,33 +350,24 @@ pub(super) fn classify_cli_error_hint(err: &str) -> &'static str {
 }
 
 
-/// Operator details require a live Admin identity. Unknown/public origins
-/// fail closed; an internal job without a human keeps its existing tools.
+/// Share the machine-operation policy with preset and delegated entry points.
+/// Public/unknown origins fail closed; only internal jobs may omit a human.
 pub(super) fn operator_machine_access_allowed(home: &Path, session: &str) -> bool {
-    use crate::session_origin::OriginKind;
-    if crate::on_behalf_of::current().is_none()
-        && crate::session_origin::origin_for_current_turn(session).kind() == OriginKind::Internal
-    {
-        return true;
-    }
-    operator_diagnostics_allowed(home, session)
-}
-
-pub(super) fn operator_diagnostics_allowed(home: &Path, session: &str) -> bool {
     use crate::session_origin::OriginKind;
     let origin = crate::session_origin::origin_for_current_turn(session);
     if matches!(origin.kind(), OriginKind::PublicVisitor | OriginKind::WebchatVisitor | OriginKind::Unknown) {
         return false;
     }
-    let Some(principal) = crate::on_behalf_of::current()
-        .and_then(|p| duduclaw_core::HumanPrincipal::parse(&p).ok()) else { return false; };
-    let duduclaw_core::HumanPrincipal::User(id) = principal else { return false; };
-    let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return false; };
-    db.get_user(&id).ok().flatten().is_some_and(|u| {
-        u.role == duduclaw_auth::models::UserRole::Admin
-            && matches!(u.status, duduclaw_auth::models::UserStatus::Active)
-            && !u.must_change_password
-    })
+    let principal = crate::on_behalf_of::current();
+    let wire = principal.as_deref().or_else(|| {
+        (origin.kind() != OriginKind::Internal).then_some("unknown:requester")
+    });
+    crate::on_behalf_of::access::system_operation_permitted(home, wire)
+}
+
+pub(super) fn operator_diagnostics_allowed(home: &Path, session: &str) -> bool {
+    // Background jobs may operate but never receive interactive diagnostics.
+    crate::on_behalf_of::current().is_some() && operator_machine_access_allowed(home, session)
 }
 
 pub(super) fn operator_access_refusal(language: Option<&str>) -> &'static str {
@@ -403,13 +394,17 @@ mod audience_tests {
     use super::*;
 
     #[tokio::test]
-    async fn machine_operations_require_live_active_admin_and_public_origins_never_get_details() {
+    async fn system_operator_access_requires_live_enterprise_admin_and_rejects_public_origins() {
         let dir = tempfile::tempdir().unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
         let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
         let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password", duduclaw_auth::models::UserRole::Admin).unwrap();
         let employee = db.create_user("employee@example.invalid", "Employee", "isolated-test-password", duduclaw_auth::models::UserRole::Employee).unwrap();
         assert!(!admin.must_change_password, "a newly enrolled test account is usable");
         for (user, allowed) in [(&admin, true), (&employee, false)] {
+            assert_eq!(crate::on_behalf_of::access::system_operation_permitted(
+                dir.path(), Some(&format!("user:{}", user.id)),
+            ), allowed);
             crate::on_behalf_of::scope_first(Some(format!("user:{}", user.id)), async {
                 crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(user.id.clone(), async {
                     assert_eq!(operator_machine_access_allowed(dir.path(), "webchat:account:connection"), allowed);
@@ -436,5 +431,40 @@ mod audience_tests {
         crate::on_behalf_of::scope_first(Some(format!("user:{}", admin.id)), async {
             assert!(!operator_machine_access_allowed(dir.path(), "line:admin"));
         }).await;
+    }
+
+    #[tokio::test]
+    async fn system_operator_access_preserves_personal_owner_without_identity_database() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Personal);
+        for channel in ["line", "telegram"] {
+            for principal in [None, Some(format!("unmapped:{channel}:owner"))] {
+                assert!(crate::on_behalf_of::access::system_operation_permitted(dir.path(), principal.as_deref()));
+                crate::on_behalf_of::scope_first(principal, async {
+                    assert!(operator_machine_access_allowed(dir.path(), &format!("{channel}:owner")));
+                    assert!(!operator_machine_access_allowed(dir.path(), "webchat:visitor"));
+                    assert!(!operator_machine_access_allowed(dir.path(), "odoolivechat:1:42"));
+                    assert!(!operator_machine_access_allowed(dir.path(), "unknown:visitor"));
+                }).await;
+            }
+        }
+        assert!(!dir.path().join("users.db").exists(), "owner access must not create users.db");
+    }
+
+    #[tokio::test]
+    async fn system_operator_access_refuses_unmapped_enterprise_senders_and_missing_identity_store() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
+        for channel in ["line", "telegram"] {
+            for principal in [None, Some(format!("unmapped:{channel}:owner")), Some("user:missing".into())] {
+                if let Some(principal) = principal.as_deref() {
+                    assert!(!crate::on_behalf_of::access::system_operation_permitted(dir.path(), Some(principal)));
+                }
+                crate::on_behalf_of::scope_first(principal, async {
+                    assert!(!operator_machine_access_allowed(dir.path(), &format!("{channel}:owner")));
+                }).await;
+            }
+        }
+        assert!(!dir.path().join("users.db").exists());
     }
 }
