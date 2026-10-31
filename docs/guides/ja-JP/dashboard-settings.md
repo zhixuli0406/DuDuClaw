@@ -81,7 +81,7 @@ npm がない場合やインストールに失敗した場合は、手動コマ�
 - WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk：6 つの webhook ルートは常にマウントされています。チャネルが設定されるまでは 404 を返し、設定後はプラットフォームの署名を検証して、署名が不正なら 401 を返します。`channels.add` は再起動なしでチャネルを起動します。`channels.add` は `hot_started` と `restart_required: false` を返し、認証情報が足りないときは `not_started_reason` を付けます。従業員ごとの Slack bot も追加時に起動します。
 - メッセージングアプリでの思考表示（専用の設定項目はなく、設定ファイルの詳細編集で設定。返信ごとに読み直します）：`[thinking] channel_audience` = `internal`（既定：チャネル ID が検証済みで、有効な dashboard アカウントが管理者または回答する社員に紐付いている送信者はタイマーと伏せ字化した要約、それ以外はタイマーのみ）、`all`（1 対 1 チャットのすべての送信者が要約を見られる）、`none`（何も表示しない）。`[thinking] channel_group_display` = `status`（既定：グループチャットはタイマーのみ）、`summary`、`off`。`[thinking] display` と回答する社員の `[model] show_thinking` のうち厳しい方が、引き続き両方の上限になります。`config.toml` が読めない、または不明な値のときは何も表示しません。Web サイトの訪問者（Odoo ライブチャット、WebChat ウィジェット）には思考は表示されません。詳しくは[メッセージングアプリでの思考表示](../../features/ja-JP/66-thinking-in-messaging-apps.md)。
 
-### WebChat プロトコルと並行ターン（未リリース）
+### WebChat プロトコルと並行ターン
 
 `/ws/chat` は既存の `auth` と `user_message` フレームを使います。1 本の接続でも異なる session は並行実行でき、同じ session のメッセージは受信順に実行します。複数の接続から送った場合も同じです。session の所有者と社員へのアクセス権は引き続き確認します。ユーザーごとと gateway 全体の上限は設定ファイルの詳細編集で指定します。
 

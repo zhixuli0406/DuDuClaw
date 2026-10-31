@@ -6,7 +6,7 @@ import { useAuthStore, type UserRole } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { ErrorState } from '@/components/mds/error-state';
-import { ROLE_LEVELS } from '@/lib/roles';
+import { hasMinRole } from '@/lib/roles';
 import { browserWatchReturn } from '@/lib/browser-watch-return';
 
 /** The account-settings tab that owns self-service password change (the only
@@ -143,7 +143,7 @@ export function AuthGuard() {
  */
 export function RoleGuard({ minRole }: { minRole: UserRole }) {
   const userRole = useAuthStore((s) => s.user?.role);
-  if (!userRole || ROLE_LEVELS[userRole] < ROLE_LEVELS[minRole]) {
+  if (!hasMinRole(userRole, minRole)) {
     return <Navigate to="/" replace />;
   }
   return <Outlet />;

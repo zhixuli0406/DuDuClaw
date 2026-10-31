@@ -104,7 +104,7 @@ OTP は代替のログイン方法であり、**二要素認証ではありま�
 
 予定欄は有効・停止中の cron（Admin）と heartbeat（Manager／Admin）を表示します。cron は `p` 一時停止／再開、`n` 一回実行、heartbeat は `n` 手動実行です。cron 手動実行には新しい `request_id` を付けます。現行 `cron.list` に次回時刻、`heartbeat.status` に前回結果はないため、未提供と表示して推測しません。詳細に規則、タイムゾーン、取得できた前回時刻／結果を示します。
 
-従業員の `p` は `agents.pause`／`agents.resume` による状態停止／復帰です。Manager と Operator／Owner binding が必要で、Admin はゲートウェイの管理者規則に従います。このブランチには `autonomy.pause` がなく、カードで全面的な自律停止ではないと明示します。全体停止は提供しません。
+従業員の `p` は `agents.pause`／`agents.resume` による状態停止／復帰です。Manager と Operator／Owner binding が必要で、Admin はゲートウェイの管理者規則に従います。カードで全面的な自律停止ではないと明示します。コントロールルームに全体停止はなく、自律作業の停止は `autonomy.pause` RPC で行います。
 
 新しい操作は独立した確認カードを使い、一秒間のキー無視、全文確認、新しい二桁コードを要求します。古いデータや表示対象の変更時は送信を拒否し、自動再送はしません。受付、拒否、競合後は再取得し、成功状態を先に表示しません。停止受付後も `cancel_pending` の場合があります。制限付き sandbox では socket 偽ゲートウェイ、実ゲートウェイ、ネイティブ端末検証は NOT RUN。プロセス内の偽 RPC テストで wire 形式と確認状態遷移を検証します。
 

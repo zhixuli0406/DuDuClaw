@@ -1,4 +1,6 @@
 {
+  "nav.account": "アカウント",
+  "nav.account.desc": "自分のパスワード、メールアドレス、ログイン認証を管理します。",
   "liveEvents.stale": "データが古い可能性があります",
   "googleDataDisclosure.title": "Google に接続する前に確認してください",
   "googleDataDisclosure.access": "DuDuClaw は、許可された Google データ（Gmail、カレンダー、ドライブ、ドキュメント、スプレッドシート、スライド、フォーム、Tasks、アカウントのメールアドレス）を、依頼された Google 機能の提供に使用します。",

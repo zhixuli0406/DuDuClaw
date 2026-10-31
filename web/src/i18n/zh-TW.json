@@ -1,4 +1,6 @@
 {
+  "nav.account": "帳號",
+  "nav.account.desc": "變更自己的密碼、電子郵件與登入驗證設定。",
   "liveEvents.stale": "資料可能已過時",
   "googleDataDisclosure.title": "連接 Google 前請先確認",
   "googleDataDisclosure.access": "DuDuClaw 會使用你授權的 Google 資料（Gmail、日曆、雲端硬碟、文件、試算表、簡報、表單、Tasks 與帳戶電子郵件），提供你要求的 Google 功能。",

@@ -435,7 +435,7 @@ enum Commands {
         #[command(subcommand)]
         command: egress_leases_cmd::EgressLeasesCommands,
     },
-    /// 開啟唯讀控制室，查看待處理事項與員工狀態
+    /// 開啟終端控制室，查看待處理事項與員工狀態，並處理決策
     Tui {
         #[command(subcommand)]
         command: Option<tui_cmd::TuiCommands>,

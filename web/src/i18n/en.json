@@ -1,4 +1,6 @@
 {
+  "nav.account": "Account",
+  "nav.account.desc": "Manage your password, email address and sign-in verification.",
   "liveEvents.stale": "Data may be stale",
   "googleDataDisclosure.title": "Before connecting Google",
   "googleDataDisclosure.access": "DuDuClaw uses the Google data you authorize—Gmail, Calendar, Drive, Docs, Sheets, Slides, Forms, Tasks, and your account email—to provide the Google features you request.",

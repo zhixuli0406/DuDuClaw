@@ -256,3 +256,20 @@ describe('nav RPC role alignment', () => {
     expect(isVisible(routines, 'admin', false)).toBe(true);
   });
 });
+
+describe('self-service account navigation', () => {
+  it('appears once in both editions with a version badge and no role gate', () => {
+    for (const personal of [false, true]) {
+      const items = [...primaryItemsForEdition(personal), ...navGroupsForEdition(personal).flatMap(g => g.items)];
+      const entries = items.filter(i => i.to === '/me/account');
+      expect(entries).toHaveLength(1);
+      expect(entries[0].newIn).toBe('1.78.0');
+      expect(entries[0].minRole).toBeUndefined();
+      expect(entries[0].enterprise).toBeUndefined();
+      for (const role of ['admin', 'manager', 'employee'] as const) {
+        expect(isVisible(entries[0], role, personal)).toBe(true);
+      }
+    }
+    expect(crumbsFor('/me/account')).toEqual([{ labelId: 'nav.account' }]);
+  });
+});

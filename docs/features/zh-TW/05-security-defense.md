@@ -397,7 +397,7 @@ Claude/Grok 網頁工具與 Bash 字面網路指令新增由 gateway 判定的�
 
 [憑證稽核](70-credential-audit.md)只登錄偵測結果的中繼資料。密碼、連線字串不算指紋；高熵類型只有在憑證保護可用時才算帶金鑰的指紋。帳號只保留首字元與網域。每則訊息最多 5 筆、每位寄件者每小時 50 筆、總列數 100,000，超額合併為節流事件。兩種模式都遮罩衍生儲存中偵測到的值；預設 `audit` 仍保留對話明文，`mask` 在交付前遮罩新訊息。沒有語境的單獨密碼不會偵測，真值代換仍在規劃、不承諾版本。Admin 專用 RPC 與 doctor 可檢查稽核鏈；Read 檔案守門也拒絕讀取憑證登錄目錄。
 
-## 雙因素登入（phase 1，尚未發版）
+## 雙因素登入
 
 Gateway 支援 [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238) SHA-1 TOTP：160 位元隨機密鑰、6 位數、30 秒週期、前後各一個週期與交易內防重播。密鑰使用通道憑證相同的 AES-256-GCM 與主機 `.keyfile`，金鑰不放入 `users.db`。10 組單次備援碼只顯示一次、以 Argon2 雜湊保存；驗證備援碼不需要解密 TOTP。只要還有啟用或待註冊資料，金鑰遺失就拒絕建立替代金鑰；請還原原金鑰或走主機救援。金鑰輪替不在本階段範圍。
 
@@ -409,7 +409,7 @@ Enterprise 強制期間，首次註冊還需獨立證明。只有已記錄且早
 
 已註冊者的密碼與通道 OTP 登入只回傳 `mfa_required` 與 `challenge_id`。`/api/mfa/verify` 接受 challenge 及 `code`／`recovery_code` 二擇一。Challenge 綁定帳號與第一因素，持久保存、單次成功、5 分鐘有效、最多 5 次嘗試。`mfa.status` 查本人狀態；`mfa.recovery_regenerate {code}` 替換全部備援碼；`mfa.disable {code,password}` 需要目前密碼（與註冊密碼驗證共用限流）及新的 TOTP 或未使用備援碼，強制期間不能停用。每帳號因素驗證錯誤最多 5 次／15 分鐘。
 
-分階段啟用：先保持 `[auth] mfa_enforced=false`，讓帳號自願註冊；備妥支援新回應的客戶端、確認通道送達與主機救援，再由目前 Admin 查看 `mfa.overview`，透過 `system.update_config` 或設定檔編輯器啟用強制。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
+分階段啟用：先保持 `[auth] mfa_enforced=false`，讓帳號自願註冊；備妥支援新回應的客戶端、確認通道送達與主機救援，再由目前 Admin 查看 `mfa.overview`，在「使用者 → 雙因素登入管理」用專用開關啟用強制。`system.update_config`、設定檔編輯器與匯入都不能變更有效值。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
 
 單純開啟強制不立即撤銷帳號 access token；未註冊者不能 refresh，原 token 自然到期（預設 30 分鐘）。Enterprise MFA WebSocket 在到期後的下一次心跳關閉，最多延後 30 秒，不取消執行中工作。強制期間拒絕舊共用 token 的 `/ws` 登入及 RPC；已建立的共用 token 連線在下一次心跳關閉，停止推播訂閱。註冊、停用、重設會增加該帳號的 credential epoch，之後變更／重設密碼也會增加；舊 access／refresh token 失效，既有 dashboard 連線於下一次即時身分檢查拒絕，沿用 ACL 快取失效機制。沒有 claim 的 token 視為 epoch 0；從未註冊者即使變更密碼仍維持 0，以保持既有客戶行為。任何密碼變更都會作廢待註冊 challenge。
 

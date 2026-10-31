@@ -77,6 +77,7 @@ const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'Local
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
+const AccountPage = lazyPage(() => import('./pages/AccountPage'), 'AccountPage');
 const MyConnectionsPage = lazyPage(() => import('./pages/MyConnectionsPage'), 'MyConnectionsPage');
 const MyHistoryViewsPage = lazyPage(() => import('./pages/MyHistoryViewsPage'), 'MyHistoryViewsPage');
 const TeamHistoryPage = lazyPage(() => import('./pages/TeamHistoryPage'), 'TeamHistoryPage');
@@ -338,6 +339,7 @@ export function App() {
                 </Route>
               </Route>
 
+              <Route path="me/account" element={<AccountPage />} />
               <Route element={<EditionGuard enterprise />}><Route path="me/connections" element={<MyConnectionsPage />} /></Route>
               {/* Self-only receipts are available to every Enterprise account. */}
               <Route element={<EditionGuard enterprise />}>

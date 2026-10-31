@@ -415,6 +415,7 @@ export const navGroups: NavGroup[] = [
     // 設定 — management shell entry + brand/about page.
     label: 'navGroup.settings',
     items: [
+      { to: '/me/account', icon: KeyRound, label: 'nav.account', desc: 'nav.account.desc', ownScope: true, newIn: '1.78.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
