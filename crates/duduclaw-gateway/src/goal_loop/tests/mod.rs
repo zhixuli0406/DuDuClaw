@@ -84,6 +84,13 @@ fn goal_task(id: &str, agent: &str) -> TaskRow {
 }
 
 async fn open_stores(dir: &Path) -> (Arc<TaskStore>, Arc<MessageQueue>) {
+    // Multi-employee cases need a real operational recipient under the gate.
+    let bob_dir = dir.join("agents/bob");
+    std::fs::create_dir_all(&bob_dir).unwrap();
+    let bob_config = bob_dir.join("agent.toml");
+    if !bob_config.exists() {
+        std::fs::write(bob_config, "[agent]\nname = \"bob\"\nstatus = \"active\"\n").unwrap();
+    }
     let agent_dir = dir.join("agents/alice");
     std::fs::create_dir_all(&agent_dir).unwrap();
     let path = agent_dir.join("agent.toml");

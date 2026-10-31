@@ -1,6 +1,26 @@
 use super::*;
 use crate::GuardDecision;
 
+#[test]
+fn config_refusal_classification_excludes_pauses_and_unrelated_reasons() {
+    let path = AutonomyPath::GoalLoop;
+    for reason in ["agent_missing", "agent_status_unreadable: invalid agent config"] {
+        assert!(denied(path, reason.into(), None, None).is_agent_config_refusal());
+    }
+    for reason in [
+        "agent_pause", "global_pause", "state_unreadable", "agent_not_operational",
+        "ephemeral_parent_invalid", "invalid_agent_id",
+        "prefix agent_status_unreadable: invalid agent config", "agent_status_unreadable_other",
+    ] {
+        assert!(!denied(path, reason.into(), None, None).is_agent_config_refusal());
+    }
+    let entry = PauseEntry { reason: "agent_status_unreadable: user text".into(),
+        who: "operator".into(), at: chrono::Utc::now().to_rfc3339() };
+    assert!(!denied(path, "agent_missing".into(), Some(entry), None).is_agent_config_refusal());
+    assert!(!denied(path, "agent_missing".into(), None, Some("unreadable".into()))
+        .is_agent_config_refusal());
+}
+
 #[cfg(unix)]
 #[test]
 fn existing_autonomy_files_are_tightened_before_use() {

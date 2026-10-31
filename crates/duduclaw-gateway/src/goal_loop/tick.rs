@@ -288,6 +288,16 @@ impl GoalLoopDriver {
                 &self.home_dir, &task.assigned_to,
                 duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
             ) {
+                if pause.is_agent_config_refusal() {
+                    if let Err(detail) = crate::team_composer::check_team_dispatchable_for_task(
+                        &self.home_dir, &task.assigned_to, &task.id,
+                    ) {
+                        self.escalate(&mut inflight, task, &detail,
+                            crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
+                        active = inflight.len();
+                    }
+                    continue;
+                }
                 // Fresh tasks wait unchanged. A completed/rejected turn must
                 // require a human before a later round can be admitted.
                 if (task.revision_round > 0 || task.status == "revising")

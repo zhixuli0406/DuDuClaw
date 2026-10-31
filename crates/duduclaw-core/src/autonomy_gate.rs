@@ -166,6 +166,15 @@ pub struct PauseInfo {
     pub state_error: Option<String>,
 }
 
+impl PauseInfo {
+    /// Configuration failures are distinct from operator pauses and state failures.
+    pub fn is_agent_config_refusal(&self) -> bool {
+        self.entry.is_none() && self.state_error.is_none()
+            && (self.reason == "agent_missing"
+                || self.reason.starts_with("agent_status_unreadable: "))
+    }
+}
+
 impl std::fmt::Display for PauseInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "autonomy paused ({:?}): {}", self.path, self.reason)

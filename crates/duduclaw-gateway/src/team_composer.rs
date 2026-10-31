@@ -665,10 +665,42 @@ fn fatal_dispatch_refusal(error: &TeamConfigError) -> bool {
 
 /// Check before inserting a goal so a refusal cannot leave an orphan task.
 pub(crate) fn check_team_dispatchable(home_dir: &Path, agent_id: &str) -> Result<(), String> {
+    check_team_dispatchable_inner(home_dir, agent_id, None)
+}
+
+/// A candidate refused before freezing still needs the same task-scoped audit.
+pub(crate) fn check_team_dispatchable_for_task(
+    home_dir: &Path, agent_id: &str, task_id: &str,
+) -> Result<(), String> {
+    check_team_dispatchable_inner(home_dir, agent_id, Some(task_id))
+}
+
+fn check_team_dispatchable_inner(
+    home_dir: &Path, agent_id: &str, task_id: Option<&str>,
+) -> Result<(), String> {
     match resolve_team(home_dir, agent_id).result {
-        Err(error) if fatal_dispatch_refusal(&error) => Err(error.to_string()),
+        Err(error) if fatal_dispatch_refusal(&error) => {
+            if let Some(task_id) = task_id {
+                audit_team_refusal(home_dir, task_id, agent_id, &error);
+            }
+            Err(error.to_string())
+        }
         _ => Ok(()),
     }
+}
+
+fn audit_team_refusal(home_dir: &Path, task_id: &str, agent_id: &str, error: &TeamConfigError) {
+    audit_team_event(
+        home_dir,
+        AUDIT_TEAM_REFUSED,
+        agent_id,
+        serde_json::json!({
+            "task_id": task_id,
+            "code": error.code(),
+            "role": error.role().map(|r| r.as_str()),
+            "detail": error.to_string(),
+        }),
+    );
 }
 
 /// What [`freeze_for_task`] did.
@@ -785,17 +817,7 @@ pub async fn freeze_for_task(
                 );
                 return FreezeOutcome::SoloByDefault { code: err.code() };
             }
-            audit_team_event(
-                home_dir,
-                AUDIT_TEAM_REFUSED,
-                agent_id,
-                serde_json::json!({
-                    "task_id": task_id,
-                    "code": err.code(),
-                    "role": err.role().map(|r| r.as_str()),
-                    "detail": err.to_string(),
-                }),
-            );
+            audit_team_refusal(home_dir, task_id, agent_id, &err);
             warn!(
                 task = %task_id, agent = %agent_id, code = err.code(),
                 "team refused: {err}"
