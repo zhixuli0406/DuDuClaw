@@ -673,6 +673,8 @@ docker compose up -d
 | Ubuntu 24.04 | compose を更新し、上記のスクリプトを実行 | x64 で検証済み |
 | その他の Linux、NAS | `duduclaw doctor` の結果に従う | 未検証 |
 
+Docker では、Codex 以外の社員は namespace を作成できず、`strace` や `gdb` も使えません。Docker Desktop のカーネルには Yama がないため、doctor の「コンテナのプロセス分離」に警告が表示されます。シングルテナントでは許容できますが、マルチテナントでは Yama が有効な Linux ホストを使用してください。
+
 `distribution/nas/docker-compose.yml` はイメージのみを使い seccomp ファイルを含まないため、この compose にはまだこれらの設定がありません。更新後も doctor が同じ問題を報告する場合、ホストで user namespace が無効になっています。
 
 ### コンテナ再構築後にOAuth状態が消える

@@ -674,6 +674,8 @@ docker compose up -d
 | Ubuntu 24.04 | 更新 compose，再執行上面的腳本 | 已測 x64 |
 | 其他 Linux、NAS | 依 `duduclaw doctor` 的結果處理 | 未測 |
 
+在 Docker 中，Claude、Grok 等 Codex 以外的員工不能建立 namespace，也不能使用 `strace`、`gdb`。Docker Desktop 的核心沒有 Yama，doctor 的「容器行程隔離」會顯示警告；單一租戶可接受，多租戶請使用開啟 Yama 的 Linux 主機。
+
 `distribution/nas/docker-compose.yml` 只使用映像，沒有帶 seccomp 檔，所以這份 compose 還沒有這些設定。若更新後 doctor 仍回報相同問題，代表宿主機停用了 user namespace。
 
 ### OAuth 狀態在容器重建後消失

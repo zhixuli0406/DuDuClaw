@@ -640,6 +640,8 @@ docker compose up -d
 | Ubuntu 24.04 | Update compose, then run the script above | x64 |
 | Other Linux, NAS | Follow `duduclaw doctor` | No |
 
+In Docker, employees other than Codex cannot create namespaces or use `strace` and `gdb`. Docker Desktop's kernel has no Yama, so doctor shows a warning on the "Container process isolation" check. That is acceptable for a single tenant; for multi-tenant use a Linux host with Yama on.
+
 `distribution/nas/docker-compose.yml` is image-only and ships no seccomp file, so it does not have these settings yet. If doctor reports the same problem after the update, the host has user namespaces disabled.
 
 ### OAuth state disappears after a container rebuild
