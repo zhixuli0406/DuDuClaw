@@ -18179,10 +18179,13 @@ mod live_events_socket_tests {
     use serde_json::{Value, json};
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
+    // Argon2 hashes recovery codes in debug builds, which can be slow under CI load.
+    const SOCKET_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
     type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn next_json(client: &mut Client) -> Value {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(SOCKET_FRAME_DEADLINE, async {
             loop {
                 match client.next().await.expect("socket open").expect("valid frame") {
                     ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
