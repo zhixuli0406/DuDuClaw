@@ -355,10 +355,17 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
             format_label(format)
         );
     } else {
-        println!(
-            "  {} 以上為 --dry-run 計畫，未寫入任何檔案；移除該旗標即實際安裝。\n",
-            style("ℹ").cyan()
-        );
+        if let Some(code) = report.to_json(true)["details"]["profile_confirmation"].as_str() {
+            println!(
+                "  {} 以上為 --dry-run 計畫，未寫入任何檔案；確認內容後移除 --dry-run，並加上 --confirm-profile {code} 即可實際安裝。\n",
+                style("ℹ").cyan()
+            );
+        } else {
+            println!(
+                "  {} 以上為 --dry-run 計畫，未寫入任何檔案；移除該旗標即實際安裝。\n",
+                style("ℹ").cyan()
+            );
+        }
     }
 
     drop(cleanup);
