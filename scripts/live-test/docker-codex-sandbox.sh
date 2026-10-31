@@ -11,8 +11,24 @@ docker run --rm -i --pull=never \
   --security-opt "seccomp=$repo_root/container/seccomp-bwrap.json" \
   --security-opt "apparmor=${DUDUCLAW_APPARMOR_PROFILE:-unconfined}" \
   --security-opt no-new-privileges:true \
+  --env "EXPECTED_APPARMOR_PROFILE=${DUDUCLAW_APPARMOR_PROFILE:-unconfined}" \
   --cap-drop ALL --entrypoint /bin/bash "$1" -s <<'CONTAINER'
 set -euo pipefail
+python3 - <<'PY'
+import os
+from pathlib import Path
+assert os.getuid() == 1000 and os.geteuid() == 1000, 'container must run as uid 1000'
+status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
+for field in ('CapEff', 'CapBnd'):
+    assert int(status[field].strip(), 16) == 0, f'{field} must be zero'
+assert status['NoNewPrivs'].strip() == '1', 'NoNewPrivs must be enabled'
+assert not os.path.lexists('/var/run/docker.sock'), 'Docker socket must not be exposed'
+label = Path('/proc/self/attr/current').read_text().strip()
+expected = os.environ['EXPECTED_APPARMOR_PROFILE']
+expected_label = 'unconfined' if expected == 'unconfined' else f'{expected} (unconfined)'
+assert label == expected_label, f'AppArmor label mismatch: {label!r} != {expected_label!r}'
+print(f'PASS: uid=1000; CapEff=0; CapBnd=0; NoNewPrivs=1; no Docker socket; AppArmor={label}')
+PY
 suite="$(mktemp -d "$HOME/codex-sandbox-XXXXXX")"
 export HOME="$suite/home"
 export CODEX_HOME="$HOME/.codex"

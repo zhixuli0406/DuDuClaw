@@ -16,8 +16,8 @@ import urllib.request
 COMMIT = "4b8214fc4971e06172938a1f1554ccff6647ee80"
 SHA256 = "6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6"
 URL = f"https://raw.githubusercontent.com/moby/profiles/{COMMIT}/seccomp/default.json"
-REMOVED = frozenset(("clone", "clone3", "mount", "umount2", "unshare"))
-ALLOWED = ["clone", "clone3", "mount", "umount2", "pivot_root", "unshare"]
+REMOVED = frozenset(("clone", "mount", "umount2", "unshare"))
+ALLOWED = ["clone", "mount", "umount2", "pivot_root", "unshare"]
 
 
 def generate(raw):

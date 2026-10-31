@@ -984,6 +984,7 @@
     {
       "names": [
         "bpf",
+        "clone3",
         "fanotify_init",
         "fsconfig",
         "fsmount",
@@ -1007,6 +1008,18 @@
       ],
       "action": "SCMP_ACT_ALLOW",
       "includes": {
+        "caps": [
+          "CAP_SYS_ADMIN"
+        ]
+      }
+    },
+    {
+      "names": [
+        "clone3"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38,
+      "excludes": {
         "caps": [
           "CAP_SYS_ADMIN"
         ]
@@ -1161,7 +1174,6 @@
     {
       "names": [
         "clone",
-        "clone3",
         "mount",
         "umount2",
         "pivot_root",
