@@ -2,7 +2,7 @@
 use duduclaw_core::error::{DuDuClawError as Error, Result};
 use duduclaw_tui::{
     ControlRoomOptions, InboxOptions, WatchOptions,
-    auth::{AuthClient, LoginMethod, LoginMode, LoginPrompt, PromptField, disable_core_dumps},
+    auth::{AuthClient, LoginMethod, LoginMode, LoginPrompt, MfaMethod, PromptField, disable_core_dumps},
     client::{Client, ClientOptions},
     run_control_room, run_inbox, run_watch,
     transport::GatewayUrl,
@@ -101,11 +101,35 @@ fn tui_error(error: duduclaw_tui::Error) -> Error {
 struct TerminalPrompt;
 #[async_trait::async_trait]
 impl LoginPrompt for TerminalPrompt {
+    fn is_interactive(&self) -> bool {
+        console::Term::stderr().is_term()
+    }
+    fn mfa_retry(&mut self) {
+        eprintln!("{}", duduclaw_tui::strings::MFA_RETRY);
+    }
+    async fn mfa_method(&mut self) -> duduclaw_tui::Result<MfaMethod> {
+        tokio::task::spawn_blocking(|| {
+            let term = console::Term::stderr();
+            if !term.is_term() {
+                return Err(duduclaw_tui::Error::MfaTerminalRequired);
+            }
+            let choice = dialoguer::Select::new()
+                .with_prompt(duduclaw_tui::strings::MFA_METHOD)
+                .items(&[
+                    duduclaw_tui::strings::MFA_AUTHENTICATOR,
+                    duduclaw_tui::strings::MFA_RECOVERY,
+                ])
+                .default(0)
+                .interact_on(&term)
+                .map_err(|_| duduclaw_tui::Error::PromptCancelled)?;
+            Ok(if choice == 0 { MfaMethod::Authenticator } else { MfaMethod::RecoveryCode })
+        }).await.map_err(|_| duduclaw_tui::Error::PromptCancelled)?
+    }
     async fn method(&mut self) -> duduclaw_tui::Result<LoginMethod> {
         tokio::task::spawn_blocking(|| {
             let term = console::Term::stderr();
             if !term.is_term() {
-                return Err(duduclaw_tui::Error::PromptCancelled);
+                return Err(duduclaw_tui::Error::Terminal);
             }
             let choice = dialoguer::Select::new()
                 .with_prompt(duduclaw_tui::strings::LOGIN_METHOD)
@@ -129,7 +153,7 @@ impl LoginPrompt for TerminalPrompt {
         tokio::task::spawn_blocking(move || {
             let term = console::Term::stderr();
             if !term.is_term() {
-                return Err(duduclaw_tui::Error::PromptCancelled);
+                return Err(duduclaw_tui::Error::Terminal);
             }
             // dialoguer/console own their input buffers; zeroization of their
             // internal allocations is not guaranteed. Move the result directly.

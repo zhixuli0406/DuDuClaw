@@ -327,7 +327,7 @@ impl Actor {
         let url = self.auth.target().websocket();
         let (mut socket, _) = tokio::select! {
             _ = shutdown.changed() => return Err(Error::Disconnected),
-            result = timeout(self.options.request_timeout, tokio_tungstenite::connect_async_with_config(url.as_str(), Some(config), false)) => result.map_err(|_| Error::Timeout)?.map_err(|_| Error::Network)?,
+            result = timeout(self.options.request_timeout, tokio_tungstenite::connect_async_with_config(url.as_str(), Some(config), false)) => result.map_err(|_| Error::Timeout)?.map_err(connect_error)?,
         };
         let info = tokio::select! {
             _ = shutdown.changed() => Err(Error::Disconnected),
@@ -428,7 +428,7 @@ impl Actor {
                         }
                         Some(Ok(Message::Pong(_))) => {},
                         Some(Ok(Message::Close(close))) => {
-                            break if close.is_some_and(|f| u16::from(f.code) == 4001 || u16::from(f.code) == 1008) { End::Refresh } else { End::Reconnect };
+                            break if close.is_some_and(|f| u16::from(f.code) == 4001) { End::Refresh } else { End::Reconnect };
                         }
                         Some(Ok(_)) => {},
                         _ => break End::Reconnect,
@@ -481,9 +481,9 @@ where
     socket
         .send(Message::Text(std::mem::take(&mut *wire).into()))
         .await
-        .map_err(|_| Error::Network)?;
+        .map_err(|_| Error::Disconnected)?;
     while let Some(message) = socket.next().await {
-        match message.map_err(|_| Error::Network)? {
+        match message.map_err(|_| Error::Disconnected)? {
             Message::Text(text) => {
                 let frame: WsFrame = serde_json::from_str(&text).map_err(|_| Error::Protocol)?;
                 match frame {
@@ -507,8 +507,12 @@ where
             Message::Ping(bytes) => socket
                 .send(Message::Pong(bytes))
                 .await
-                .map_err(|_| Error::Network)?,
-            Message::Close(_) => return Err(Error::Disconnected),
+                .map_err(|_| Error::Disconnected)?,
+            Message::Close(close) => return Err(
+                if close.is_some_and(|f| u16::from(f.code) == 4001) {
+                    Error::LoginRequired
+                } else { Error::Disconnected }
+            ),
             _ => {}
         }
     }
@@ -573,6 +577,15 @@ pub(crate) fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
     ceiling.mul_f64(rand::thread_rng().gen_range(0.5..=1.0))
 }
 
+
+fn connect_error(error: tokio_tungstenite::tungstenite::Error) -> Error {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status().as_u16() == 401 => Error::LoginRequired,
+        _ => Error::Network,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +627,14 @@ mod tests {
             handshake(json!({"status":"connected"}), "u1", 1),
             Err(Error::LegacyIdentity)
         ));
+    }
+    #[test]
+    fn websocket_http_401_requires_login() {
+        use tokio_tungstenite::tungstenite::{Error as WsError, http::Response};
+        for (status, expected) in [(401, Error::LoginRequired), (503, Error::Network)] {
+            let response = Response::builder().status(status).body(None).unwrap();
+            assert_eq!(connect_error(WsError::Http(response)), expected);
+        }
     }
     #[test]
     fn backoff_is_bounded_and_jittered() {
