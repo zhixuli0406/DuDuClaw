@@ -511,3 +511,33 @@ async fn closed_authentication_socket_is_not_a_network_retry() {
         assert!(matches!(crate::client::authenticate(&mut client, &session, 1).await, Err(Error::Disconnected)));
     }
 }
+
+#[tokio::test]
+async fn rejected_connect_or_auth_close_requires_refresh_but_normal_close_does_not() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{WebSocketStream, tungstenite::{Message, protocol::{Role as WsRole, CloseFrame, frame::coding::CloseCode}}};
+    for code in [None, Some(1000), Some(1011), Some(4001), Some(1008)] {
+        for rejected in [false, true] {
+            let session = serde_json::from_value::<TokenPair>(pair("u1", false)).unwrap().into_session().unwrap();
+            let (a, b) = tokio::io::duplex(8192);
+            let mut client = WebSocketStream::from_raw_socket(a, WsRole::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(b, WsRole::Server, None).await;
+            let fake = async {
+                let _ = server.next().await.unwrap().unwrap();
+                let message = if rejected {
+                    Message::Text(json!({"type":"res","id":"connect","ok":false,"error":{"code":"unauthorized"}}).to_string().into())
+                } else {
+                    Message::Close(code.map(|code| CloseFrame { code: CloseCode::from(code), reason: "fixture".into() }))
+                };
+                server.send(message).await.unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(crate::client::authenticate(&mut client, &session, 1), fake)
+            }).await.unwrap();
+            let expected = if rejected || matches!(code, Some(4001 | 1008)) {
+                Error::LoginRequired
+            } else { Error::Disconnected };
+            assert!(matches!(result, Err(error) if error == expected), "rejected={rejected}, close={code:?}");
+        }
+    }
+}

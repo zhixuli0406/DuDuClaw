@@ -631,6 +631,7 @@ async fn retired_credential_close_or_http_401_stops_after_one_refresh() {
         let client = gateway.client().await;
         if !reject_upgrade {
             connected(&client, 1).await;
+            gateway.fixture.reject_upgrade.store(true, Ordering::SeqCst);
             gateway.fixture.events.send(Control::Close).unwrap();
         }
         let mut state = client.connection();

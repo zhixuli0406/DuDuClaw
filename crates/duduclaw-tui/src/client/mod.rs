@@ -264,7 +264,7 @@ impl Actor {
                     }
                     end
                 }
-                Err(Error::LoginRequired | Error::Disconnected) if !refresh_attempted => {
+                Err(Error::LoginRequired) if !refresh_attempted => {
                     refresh_attempted = true;
                     End::Refresh
                 }
@@ -274,7 +274,6 @@ impl Actor {
                     | Error::IdentityChanged
                     | Error::PasswordChangeRequired),
                 ) => End::Login(e),
-                Err(Error::Disconnected) => End::Login(Error::LoginRequired),
                 _ => End::Reconnect,
             };
             self.credentials.send_replace(None);
@@ -428,13 +427,11 @@ impl Actor {
                             if !send(socket, Message::Pong(bytes), self.options.request_timeout).await { break End::Reconnect; }
                         }
                         Some(Ok(Message::Pong(_))) => {},
-                        Some(Ok(Message::Close(_))) => {
-                            // A retired credential may be closed without an auth
-                            // close code. Validate refresh before reconnecting.
-                            break End::Refresh;
+                        Some(Ok(Message::Close(close))) => {
+                            break if close.is_some_and(|f| matches!(u16::from(f.code), 4001 | 1008)) { End::Refresh } else { End::Reconnect };
                         }
                         Some(Ok(_)) => {},
-                        _ => break End::Refresh,
+                        _ => break End::Reconnect,
                     }
                 }
             }
@@ -511,7 +508,11 @@ where
                 .send(Message::Pong(bytes))
                 .await
                 .map_err(|_| Error::Disconnected)?,
-            Message::Close(_) => return Err(Error::Disconnected),
+            Message::Close(close) => return Err(
+                if close.is_some_and(|f| matches!(u16::from(f.code), 4001 | 1008)) {
+                    Error::LoginRequired
+                } else { Error::Disconnected }
+            ),
             _ => {}
         }
     }
