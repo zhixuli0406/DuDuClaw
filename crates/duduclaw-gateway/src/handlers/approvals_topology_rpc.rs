@@ -54,8 +54,9 @@ impl MethodHandler {
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                 {
                     let (home, record) = (self.home_dir.clone(), r.clone());
+                    let reader = fresh.clone();
                     let visibility = match tokio::task::spawn_blocking(move || {
-                        super::approval_visibility::ApprovalVisibility::load(&home, &record)
+                        super::approval_visibility::ApprovalVisibility::load(&home, &record, &reader)
                     }).await {
                         Ok(visibility) => visibility,
                         Err(_) => continue,

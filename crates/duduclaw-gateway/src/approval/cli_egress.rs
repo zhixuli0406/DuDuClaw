@@ -4,7 +4,7 @@ use super::*;
 use super::action_grant::{ActionGrant, ACTION_GRANT_KEY, verify_and_consume};
 use serde_json::json;
 
-const KIND: &str = "cli_egress";
+pub(crate) const KIND: &str = "cli_egress";
 const MAX_OPEN: usize = 20;
 const TTL_SECONDS: i64 = 1800;
 

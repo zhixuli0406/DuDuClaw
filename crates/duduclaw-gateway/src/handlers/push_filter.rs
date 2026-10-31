@@ -123,7 +123,7 @@ impl PreparedPush {
                 if !duduclaw_core::is_valid_agent_id(id) || uuid::Uuid::parse_str(id).is_err() { return None; }
                 let record = crate::approval::ApprovalStore::get_readonly(home,
                     &crate::approval::ApprovalId::from(id.to_owned())).ok()??;
-                let visibility = super::approval_visibility::ApprovalVisibility::load(home, &record);
+                let visibility = super::approval_visibility::ApprovalVisibility::load_shared(home, &record);
                 line = serde_json::to_string(&WsFrame::event(event, json!({
                     "id":id, "agent_id":record.agent_id, "action_kind":record.action_kind, "status":record.status,
                 }))).ok()?;
@@ -280,6 +280,9 @@ impl PushGate {
                     Some(agent) if !live.has_agent_access(agent, AccessLevel::Viewer) => {
                         self.drop_event(&event, "no binding")
                     }
+                    Some(agent) if !live.is_admin() && crate::machine_employee::requires_admin_for_id(&self.home, agent) => {
+                        self.drop_event(&event, "admin-only employee")
+                    }
                     None if matches!(event.as_str(), "agent.turn_started" | "agent.turn_finished" | "agent.status_changed") => self.drop_event(&event, "employee event without employee"),
                     None if !live.is_admin() => self.drop_event(&event, "unscoped employee event"),
                     _ => Some(line.to_string()),
@@ -304,7 +307,8 @@ impl PushGate {
             let result = if let Some((record, visibility)) = &frame.approval {
                 if gate.pre_auth { None } else {
                     super::approval_visibility::fresh_reader(&gate.home, &gate.ctx).and_then(|(fresh, department)| {
-                        visibility.may_read(record, &fresh, department.as_deref()).then(|| frame.line.clone())
+                        visibility.clone().for_reader(&gate.home, record, &fresh)
+                            .may_read(record, &fresh, department.as_deref()).then(|| frame.line.clone())
                     })
                 }
             } else { gate.filter(&frame.line) };
@@ -339,6 +343,9 @@ impl PushGate {
                 Some(agent) if !live.has_agent_access(agent, AccessLevel::Viewer) => {
                     self.drop_event(event, "no binding")
                 }
+                Some(agent) if !live.is_admin() && crate::machine_employee::requires_admin_for_id(&self.home, agent) => {
+                    self.drop_event(event, "admin-only employee")
+                }
                 _ if event == "activity.new" => Some(line.to_string()),
                 _ => self.drop_event(event, "task event without task"),
             };
@@ -357,6 +364,9 @@ impl PushGate {
         }
         if !live.has_agent_access(&owner, AccessLevel::Viewer) {
             return self.drop_event(event, "no binding");
+        }
+        if !live.is_admin() && crate::machine_employee::requires_admin_for_id(&self.home, &owner) {
+            return self.drop_event(event, "admin-only employee");
         }
         if dashboard_may_read_task(live, &audience) {
             return Some(line.to_string());
@@ -385,6 +395,45 @@ pub fn filter_push_event(home: &Path, ctx: &UserContext, line: &str) -> Option<S
 #[cfg(test)]
 mod live_event_tests {
     use super::*;
+    #[tokio::test]
+    async fn machine_employee_frames_refuse_old_viewer_bindings_per_reader() {
+        use crate::handlers::task_privacy_tests::{admin, fixture, OPEN};
+        let f = fixture().await;
+        let root = admin(&f);
+        f.db.bind_agent(&f.bob.user_id, "sales", AccessLevel::Viewer).unwrap();
+        let mut manager = PushGate::new(&f.home, &f.bob, false);
+        let mut admin = PushGate::new(&f.home, &root, false);
+        let lines = [
+            WsFrame::event("agent.turn_started", json!({"agent_id":"sales"})),
+            WsFrame::event("task.updated", json!({"id":OPEN,"assigned_to":"sales"})),
+            WsFrame::event("goal.done", json!({"task_id":OPEN})),
+            WsFrame::event("activity.new", json!({"agent_id":"sales"})),
+        ].map(|frame| serde_json::to_string(&frame).unwrap());
+        for line in &lines {
+            assert!(manager.filter_live(line, &f.handler).await.is_some(), "normal employee");
+        }
+        duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+        duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+            "system-operator", "test", "test").unwrap();
+        for line in &lines {
+            let shared = std::sync::Arc::new(PreparedPush::prepare(f.home.clone(), line.clone()).await.unwrap());
+            assert!(admin.filter_prepared(shared.clone()).await.is_some());
+            assert!(manager.filter_prepared(shared.clone()).await.is_none());
+            assert!(admin.filter_prepared(shared).await.is_some());
+            assert!(manager.filter(line).is_none());
+        }
+        let path = duduclaw_core::preset::bindings_path(&f.home);
+        std::fs::remove_file(path.clone()).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        for line in &lines {
+            assert!(manager.filter_live(line, &f.handler).await.is_none(), "unreadable binding");
+            assert!(admin.filter_live(line, &f.handler).await.is_some());
+        }
+        f.db.unbind_agent(&f.bob.user_id, "sales").unwrap();
+        // Without Viewer, even an unreadable binding cannot admit the reader.
+        assert!(manager.filter(&lines[0]).is_none());
+    }
+
     #[tokio::test]
     async fn next_agent_frame_rechecks_demotion_suspension_and_binding() {
         use crate::handlers::task_privacy_tests::{admin, fixture};

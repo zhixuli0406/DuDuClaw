@@ -22,6 +22,47 @@ pub(crate) fn requires_admin(agent: &LoadedAgent) -> bool {
             .is_none_or(|home| crate::on_behalf_of::access::system_operation_requires_admin(&home))
 }
 
+/// Read-only identity check for readers without a registry. Inspect only the
+/// authoritative binding: an unresolved system-operator binding is restricted
+/// too. Unlike load_bindings, unreadable or malformed data must not be Unbound.
+pub(crate) fn requires_admin_for_id(home: &Path, agent_id: &str) -> bool {
+    if !duduclaw_core::is_valid_agent_id(agent_id) { return true; }
+    let dir = home.join("agents").join(agent_id);
+    match std::fs::read_dir(&dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return !matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        }
+        Err(_) => return true,
+    }
+    let Some(home) = preset::agent_home_dir(&dir) else { return true; };
+    let path = preset::bindings_path(&home);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return !matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        }
+        Err(_) => return true,
+    };
+    let Ok(table) = content.parse::<toml::Table>() else { return true; };
+    if table.get("schema").is_some_and(|v| {
+        v.as_integer().is_none_or(|schema| schema > preset::PRESET_BINDINGS_SCHEMA)
+    }) { return true; }
+    let agents = match table.get("agents") {
+        None => return false,
+        Some(value) => match value.as_table() {
+            Some(agents) => agents,
+            None => return true,
+        },
+    };
+    let Some(binding) = agents.get(agent_id) else { return false; };
+    let Some(preset_id) = binding.as_table()
+        .and_then(|b| b.get("preset_id")).and_then(toml::Value::as_str)
+        .filter(|id| !id.is_empty()) else { return true; };
+    preset_id == "system-operator"
+        && crate::on_behalf_of::access::system_operation_requires_admin(&home)
+}
+
 pub(crate) fn check_loaded(home: &Path, agent: &LoadedAgent, principal: Option<&str>) -> Result<(), String> {
     if !requires_admin(agent)
         || crate::on_behalf_of::access::system_operation_permitted(home, principal)

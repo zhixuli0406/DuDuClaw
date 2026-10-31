@@ -235,7 +235,7 @@ async fn mirror_flags_do_not_choose_the_preset_and_unresolved_binding_stays_rest
 
 #[tokio::test]
 async fn personal_machine_access_requires_single_owner_evidence() {
-    for scenario in ["missing", "empty", "admin", "employee", "corrupt", "suspended", "offboarded", "list-error"] {
+    for scenario in ["missing", "empty", "admin", "employee", "corrupt", "suspended", "offboarded", "sole-suspended", "sole-offboarded", "password-change", "row-error", "list-error"] {
         let home = tempfile::tempdir().unwrap();
         crate::trigger_route::tests::write_agent(
             &home.path().join("agents"), "operator", "Operator", "@operator", "main", "",
@@ -259,6 +259,20 @@ async fn personal_machine_access_requires_single_owner_evidence() {
                     .execute("UPDATE users SET status=?1 WHERE id=?2", [scenario, &extra.id]).unwrap();
                 assert_eq!(db.list_users().unwrap().len(), 2);
             }
+            if let Some(status) = scenario.strip_prefix("sole-") {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET status=?1", [status]).unwrap();
+                assert_eq!(db.list_users().unwrap().len(), 1);
+            }
+            if scenario == "password-change" {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET must_change_password=1", []).unwrap();
+            }
+            if scenario == "row-error" {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET department=x'FF'", []).unwrap();
+                assert!(db.list_users().is_err());
+            }
             if scenario == "list-error" {
                 rusqlite::Connection::open(&path).unwrap()
                     .execute("UPDATE users SET role='invalid'", []).unwrap();
@@ -271,6 +285,7 @@ async fn personal_machine_access_requires_single_owner_evidence() {
         reg.scan().await.unwrap();
         let agent = reg.get("operator").unwrap();
         assert_eq!(requires_admin(agent), !allowed, "{scenario}");
+        assert_eq!(requires_admin_for_id(home.path(), "operator"), !allowed, "{scenario}");
         assert_eq!(crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")), allowed, "{scenario}");
         for principal in ["unmapped:line:owner", "unmapped:telegram:owner"] {
             assert_eq!(check_loaded(home.path(), agent, Some(principal)).is_ok(), allowed, "{scenario}");
@@ -281,4 +296,38 @@ async fn personal_machine_access_requires_single_owner_evidence() {
             assert!(!path.exists());
         }
     }
+}
+
+#[tokio::test]
+async fn reader_identity_check_is_read_only_and_fails_closed() {
+    let f = fixture().await;
+    assert!(requires_admin_for_id(f.home.path(), "operator"));
+    assert!(!requires_admin_for_id(f.home.path(), "ordinary"));
+    assert!(!requires_admin_for_id(f.home.path(), "missing"));
+    assert!(requires_admin_for_id(f.home.path(), "../operator"));
+    std::fs::remove_file(f.home.path().join("presets/system-operator/preset.toml")).unwrap();
+    assert!(requires_admin_for_id(f.home.path(), "operator"), "unresolved binding");
+    let path = preset::bindings_path(f.home.path());
+    for content in ["not [ toml", "schema = 2", "agents = 1", "[agents.ordinary]\nversion = '1'"] {
+        std::fs::write(&path, content).unwrap();
+        assert!(requires_admin_for_id(f.home.path(), "ordinary"), "{content}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(requires_admin_for_id(f.home.path(), "ordinary"), "unreadable binding");
+    std::fs::remove_dir(&path).unwrap();
+    assert!(!requires_admin_for_id(f.home.path(), "ordinary"), "plain unbound employee");
+    assert!(!path.exists(), "a read must not recreate the binding store");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(f.home.path().join("missing-bindings"), &path).unwrap();
+        assert!(requires_admin_for_id(f.home.path(), "ordinary"), "dangling binding symlink");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(f.home.path().join("missing-agent"), f.home.path().join("agents/dangling")).unwrap();
+        assert!(requires_admin_for_id(f.home.path(), "dangling"), "dangling employee symlink");
+    }
+    std::fs::remove_dir_all(f.home.path().join("agents/ordinary")).unwrap();
+    std::fs::write(f.home.path().join("agents/ordinary"), "not a directory").unwrap();
+    assert!(requires_admin_for_id(f.home.path(), "ordinary"), "unreadable employee directory");
 }
