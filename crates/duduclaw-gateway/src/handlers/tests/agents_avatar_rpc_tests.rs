@@ -9,6 +9,7 @@ fn viewer_ctx(agents: &[&str]) -> UserContext {
         agent_access.insert((*a).to_string(), AccessLevel::Viewer);
     }
     UserContext {
+        credential_epoch: 0,
         user_id: "u1".to_string(),
         email: "u1@test.local".to_string(),
         role: UserRole::Employee,

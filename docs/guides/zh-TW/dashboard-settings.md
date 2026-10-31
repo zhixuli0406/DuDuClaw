@@ -322,3 +322,16 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 安全頁可把 `config.toml [security] egress_guard` 設成四種值：**關閉**（`off`）、**僅記錄**（`shadow`，預設）、**先詢問**（`ask`）、**直接阻擋**（`block`）。存檔沿用既有加鎖的 `system.update_config` 寫入；每次呼叫時由防護讀取設定。員工的 `agent.toml [capabilities] egress_guard` 只能更嚴格（`off < shadow < ask < block`）。沒有 `config.toml` 時採用預設的僅記錄；設定無效或讀不到時，該次呼叫會被阻擋。
 
 AI 員工在同一回合成功讀過私人資料後，之後的外送呼叫會先經過防護。僅記錄會在稽核寫下 `would_ask` 與讀過的工具，照常執行；先詢問會開出一次性的核准單，列出目的地、完整內容、讀過的工具與到期時間，只有目前具 Admin 權限的儀表板帳號能核准（通道按鈕與聊天回覆都不行）；直接阻擋則拒絕。涵蓋平台 MCP 呼叫與第三方 MCP 代理，不涵蓋 Claude CLI 內建工具與其他 runtime 的原生工具；以回合為單位追蹤。詳見[資料外送防護](../../features/zh-TW/69-egress-guard.md)。
+
+## 雙因素驗證強制設定（phase 1）
+
+```toml
+[auth]
+mfa_enforced = false
+```
+
+先保持關閉，讓使用者以目前密碼自願註冊。Admin 查看 `mfa.overview`，確認綁定通道能收碼，或安排另一位 Admin 核發一次性註冊碼；測試主機救援並備妥支援 MFA 的客戶端後才開啟強制。兩種 dashboard 設定寫入都要求目前有效的 Admin。註冊及後續憑證變更透過帳號 epoch 作廢舊 JWT；單純切換強制則讓既有 access token 自然到期，拒絕未註冊者 refresh。強制時拒絕舊共用 token WebSocket 登入。
+
+設定使用啟動時載入的記憶體快照；dashboard 寫入後更新，外部檔案每 30 秒重載。失敗時警告並保留最後有效值，僅 Enterprise 從未載入有效值才拒絕。沒有 `[auth]` 表格就是 false。Personal 忽略強制，本機自動登入不變。MFA 畫面仍屬 phase 2；證明欄位、工作階段綁定及 `duduclaw ops users mfa-reset`／`mfa-enrollment-code` 主機救援見[安全防禦](../../features/zh-TW/05-security-defense.md)。金鑰輪替不在本階段範圍。
+
+啟用前請從 `mfa.overview` 檢查通道綁定時間；只有早於強制啟用的已驗證綁定可作註冊證明。持有密碼者在強制前植入的綁定仍無法辨識。請將回傳的 12 字元 `challenge_ref` 讀給另一位 Admin，以 `users.mfa_enrollment_code {user_id,challenge_ref}`，或主機 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發該次註冊碼。重載失敗會在 `mfa.overview.policy` 及 `system.status.mfa_policy` 顯示；最後有效值為 false 就保持 false。兩個設定寫入路徑都在寫入鎖內重查 Admin。

@@ -12,6 +12,7 @@ use super::*;
 /// it only needs to be a plausible fixture value.
 pub(super) fn admin_ctx() -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: "admin-test".to_string(),
         email: "admin@test.local".to_string(),
         role: UserRole::Admin,

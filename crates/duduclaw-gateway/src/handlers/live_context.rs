@@ -51,6 +51,67 @@ pub(crate) const INACTIVE_ACCOUNT_ERROR: &str = "account is suspended or offboar
 /// be read at handshake.
 pub(crate) const READ_FAILURE_ERROR: &str = "authentication service unavailable";
 
+/// Live sockets distinguish revoked credentials from a temporarily unreadable store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketValidity {
+    Valid,
+    Revoked,
+    Unavailable,
+}
+
+impl SocketValidity {
+    pub(crate) fn from_error(error: &str) -> Self {
+        if error == INACTIVE_ACCOUNT_ERROR || error == "登入憑證已失效，請重新登入。" {
+            Self::Revoked
+        } else {
+            Self::Unavailable
+        }
+    }
+}
+
+/// Only heartbeat failures consume the recovery window; traffic cannot shorten it.
+#[derive(Default)]
+pub(crate) struct SocketRecovery {
+    failed_heartbeats: u8,
+    paused: bool,
+    closed: bool,
+}
+
+impl SocketRecovery {
+    pub(crate) fn observe(&mut self, validity: SocketValidity, heartbeat: bool) -> bool {
+        if self.closed { return false; }
+        match validity {
+            SocketValidity::Valid => { self.failed_heartbeats = 0; self.paused = false; }
+            SocketValidity::Revoked => self.closed = true,
+            SocketValidity::Unavailable => {
+                self.paused = true;
+                if heartbeat {
+                    self.failed_heartbeats += 1;
+                    self.closed = self.failed_heartbeats >= 3;
+                }
+            }
+        }
+        if self.closed {
+            log_socket_close(if validity == SocketValidity::Revoked {
+                "credential revoked or expired"
+            } else { "identity unavailable for three heartbeats" });
+        }
+        !self.closed && !self.paused
+    }
+
+    pub(crate) fn closed(&self) -> bool { self.closed }
+}
+
+fn log_socket_close(reason: &str) {
+    static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+    let now = chrono::Utc::now().timestamp().max(1) as u64;
+    let last = LAST_LOG.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 30
+        && LAST_LOG.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::warn!(reason, "closing authenticated socket");
+    }
+}
+
 /// Most cached identities; beyond it stale generations are dropped first,
 /// then everything.
 const LIVE_CONTEXT_CACHE_CAP: usize = 4096;
@@ -58,11 +119,11 @@ const LIVE_CONTEXT_CACHE_CAP: usize = 4096;
 /// `user_id → (acl_generation, context)`.
 #[derive(Default)]
 pub(crate) struct LiveContextCache {
-    entries: Mutex<HashMap<String, (u64, UserContext)>>,
+    entries: Mutex<HashMap<String, (u64, UserContext, std::time::Instant)>>,
 }
 
 impl LiveContextCache {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, UserContext)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, UserContext, std::time::Instant)>> {
         // A panicked holder leaves plain data behind; keep serving.
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -70,20 +131,20 @@ impl LiveContextCache {
     fn get(&self, user_id: &str, generation: u64) -> Option<UserContext> {
         self.lock()
             .get(user_id)
-            .filter(|(g, _)| *g == generation)
-            .map(|(_, ctx)| ctx.clone())
+            .filter(|(g, _, _)| *g == generation)
+            .map(|(_, ctx, _)| ctx.clone())
     }
 
     fn put(&self, ctx: &UserContext) {
         let mut entries = self.lock();
         if entries.len() >= LIVE_CONTEXT_CACHE_CAP && !entries.contains_key(&ctx.user_id) {
             let current = ctx.acl_generation;
-            entries.retain(|_, (g, _)| *g == current);
+            entries.retain(|_, (g, _, _)| *g == current);
             if entries.len() >= LIVE_CONTEXT_CACHE_CAP {
                 entries.clear();
             }
         }
-        entries.insert(ctx.user_id.clone(), (ctx.acl_generation, ctx.clone()));
+        entries.insert(ctx.user_id.clone(), (ctx.acl_generation, ctx.clone(), std::time::Instant::now()));
     }
 
     #[cfg(test)]
@@ -102,6 +163,7 @@ pub(crate) fn resolve_live_context(
     let generation = db.acl_generation();
     if let Ok(g) = generation {
         if let Some(hit) = cache.get(&jwt_ctx.user_id, g) {
+            if !duduclaw_auth::mfa::credential_epoch_matches(jwt_ctx.credential_epoch, hit.credential_epoch) { return Err("登入憑證已失效，請重新登入。".into()); }
             return Ok(hit);
         }
     }
@@ -113,6 +175,7 @@ pub(crate) fn resolve_live_context(
             if generation.as_ref().is_ok_and(|g| *g == live.acl_generation) {
                 cache.put(&live);
             }
+            if !duduclaw_auth::mfa::credential_epoch_matches(jwt_ctx.credential_epoch, live.credential_epoch) { return Err("登入憑證已失效，請重新登入。".into()); }
             Ok(live)
         }
         Ok(None) => Err(INACTIVE_ACCOUNT_ERROR.to_string()),
@@ -126,6 +189,29 @@ pub(crate) fn resolve_live_context(
             Err(READ_FAILURE_ERROR.to_string())
         }
     }
+}
+
+/// Socket messages reuse the same identity reader/cache as RPCs, with the
+/// existing push-cache window. Heartbeats always force a generation check.
+/// A message checks expiry independently and does not read SQLite on a cache hit.
+pub(crate) fn resolve_socket_context(db: &UserDb, cache: &LiveContextCache,
+    ctx: &UserContext, heartbeat: bool) -> Result<UserContext, String> {
+    if !heartbeat {
+        let entries = cache.lock();
+        if let Some((_, live, at)) = entries.get(&ctx.user_id) {
+            if at.elapsed() < std::time::Duration::from_secs(super::push_filter::PUSH_CACHE_SECS) {
+                return if duduclaw_auth::mfa::credential_epoch_matches(ctx.credential_epoch, live.credential_epoch) {
+                    Ok(live.clone())
+                } else { Err("登入憑證已失效，請重新登入。".into()) };
+            }
+        }
+    }
+    let live = resolve_live_context(db, cache, ctx).inspect_err(|_| {
+        // Do not let a failed forced read fall back to a previously valid hit.
+        cache.lock().remove(&ctx.user_id);
+    })?;
+    cache.put(&live);
+    Ok(live)
 }
 
 /// Live ACL reads that failed (and so refused a call) since the gateway started.
@@ -149,6 +235,18 @@ pub(crate) fn read_failure_stats() -> (u64, u64) {
 }
 
 impl MethodHandler {
+    pub(crate) async fn socket_context(&self, ctx: &UserContext, heartbeat: bool) -> Result<UserContext, SocketValidity> {
+        if ctx.user_id == "system" { return Ok(ctx.clone()); }
+        let Some(db) = self.user_db.read().await.clone() else { return Ok(ctx.clone()); };
+        let cache = self.live_ctx_cache.clone();
+        let ctx = ctx.clone();
+        match tokio::task::spawn_blocking(move || resolve_socket_context(&db, &cache, &ctx, heartbeat)).await {
+            Ok(Ok(live)) => Ok(live),
+            Ok(Err(e)) => Err(SocketValidity::from_error(&e)),
+            Err(_) => Err(SocketValidity::Unavailable),
+        }
+    }
+
     /// The context this RPC runs under. See the module docs.
     pub(crate) async fn live_context(&self, ctx: &UserContext) -> Result<UserContext, WsFrame> {
         if ctx.user_id == "system" {
@@ -222,5 +320,80 @@ mod tests {
         assert!(cache.get("newcomer", 2).is_some());
         // A hit needs the same generation.
         assert!(cache.get("newcomer", 3).is_none());
+    }
+}
+
+#[cfg(test)]
+mod mfa_socket_tests {
+    use super::*;
+    #[test]
+    fn mfa_socket_cache_skips_message_reads_and_heartbeat_fails_closed() {
+        let home=tempfile::tempdir().unwrap();
+        let path=home.path().join("users.db");
+        let db=UserDb::new(&path).unwrap();
+        let user=db.create_user("cache@example.com","Cache","password-test",duduclaw_auth::UserRole::Admin).unwrap();
+        let ctx=db.live_user_context(&user.id).unwrap().unwrap();
+        let cache=LiveContextCache::default();
+        resolve_socket_context(&db,&cache,&ctx,true).unwrap();
+        // No SQLite read on a message cache hit, even if the database breaks.
+        let raw=rusqlite::Connection::open(path).unwrap();
+        raw.execute("DROP TABLE auth_meta",[]).unwrap();
+        assert!(resolve_socket_context(&db,&cache,&ctx,false).is_ok());
+        assert!(resolve_socket_context(&db,&cache,&ctx,true).is_err());
+        assert!(!cache.lock().contains_key(&ctx.user_id));
+        assert!(resolve_socket_context(&db,&cache,&ctx,false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mfa_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn mfa_unavailable_withholds_frames_recovers_and_resets_window() {
+        let mut recovery = SocketRecovery::default();
+        assert!(recovery.observe(SocketValidity::Valid, true));
+        assert!(!recovery.observe(SocketValidity::Unavailable, true));
+        assert!(!recovery.closed());
+        for _ in 0..10 { assert!(!recovery.observe(SocketValidity::Unavailable, false)); }
+        assert!(recovery.observe(SocketValidity::Valid, true));
+        assert!(!recovery.observe(SocketValidity::Unavailable, true));
+        assert!(!recovery.observe(SocketValidity::Unavailable, true));
+        assert!(!recovery.closed());
+        assert!(!recovery.observe(SocketValidity::Unavailable, true));
+        assert!(recovery.closed());
+        assert!(!recovery.observe(SocketValidity::Valid, false));
+    }
+
+    #[test]
+    fn mfa_revoked_drops_every_queued_frame_immediately() {
+        let mut recovery = SocketRecovery::default();
+        assert!(!recovery.observe(SocketValidity::Revoked, false));
+        assert!(recovery.closed());
+        let queued = ["rpc response", "os event", "sensitive push"];
+        let sent: Vec<_> = queued.into_iter().filter(|_| recovery.observe(SocketValidity::Valid, false)).collect();
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn mfa_identity_read_recovers_after_one_failure_and_detects_retirement() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("users.db");
+        let db = UserDb::new(&path).unwrap();
+        let user = db.create_user("recover@example.com", "Recovery", "password-test", duduclaw_auth::UserRole::Admin).unwrap();
+        let ctx = db.live_user_context(&user.id).unwrap().unwrap();
+        let cache = LiveContextCache::default();
+        let raw = rusqlite::Connection::open(path).unwrap();
+        resolve_socket_context(&db, &cache, &ctx, true).unwrap();
+        raw.execute("ALTER TABLE auth_meta RENAME TO saved_auth_meta", []).unwrap();
+        let error = resolve_socket_context(&db, &cache, &ctx, true).unwrap_err();
+        assert_eq!(SocketValidity::from_error(&error), SocketValidity::Unavailable);
+        raw.execute("ALTER TABLE saved_auth_meta RENAME TO auth_meta", []).unwrap();
+        resolve_socket_context(&db, &cache, &ctx, false).unwrap();
+        db.mfa_operator_reset(&user.email).unwrap();
+        // The send gate uses the two-second cache, not a per-frame DB read.
+        cache.lock().get_mut(&ctx.user_id).unwrap().2 -= std::time::Duration::from_secs(3);
+        let error = resolve_socket_context(&db, &cache, &ctx, false).unwrap_err();
+        assert_eq!(SocketValidity::from_error(&error), SocketValidity::Revoked);
     }
 }

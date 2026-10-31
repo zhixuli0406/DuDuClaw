@@ -388,6 +388,7 @@ pub mod search_index;
 /// Credential redaction for operator-visible channel diagnostics (WP12).
 pub mod secret_redact;
 pub mod server;
+mod mfa;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;

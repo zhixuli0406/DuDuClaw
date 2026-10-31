@@ -466,6 +466,13 @@ impl MethodHandler {
             return WsFrame::error_response("", "請使用 Dashboard 帳號登入後再連接 CLI。");
         }
 
+        if ctx.user_id == "system" && conn.peer.is_some() && !conn.pre_auth {
+            let personal=self.resolve_edition_profile().await.is_personal();
+            if !matches!(crate::mfa::enforced(&self.home_dir,personal),Ok(false)) {
+                return WsFrame::error_response("", "已要求雙因素驗證，請使用帳號重新登入。");
+            }
+        }
+
         // ── Live identity ───────────────────────────────────────────────
         // The JWT proves who the caller is; what they may do is read from
         // users.db now (`live_context.rs`), so an unbinding, a demotion or a
@@ -508,6 +515,18 @@ impl MethodHandler {
             return enterprise_only_reject_frame();
         }
 
+        // MFA is a gateway-owned authentication namespace, never delegated to
+        // plugins. Every allowed method has an explicit authorization entry.
+        if method.split('.').next() == Some("mfa") || matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") {
+            let Some(role) = mfa_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不允許此操作。");
+            };
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return self.dispatch_org(method, params, ctx, conn).await;
+        }
+
         // ── Plugin extension dispatch ──────
         // Try extension first; if it returns Some, the method is handled.
         if let Some(frame) = self
@@ -527,3 +546,5 @@ impl MethodHandler {
         Box::pin(self.dispatch_core(method, params, ctx, conn)).await
     }
 }
+
+mod mfa_rpc;

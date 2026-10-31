@@ -469,6 +469,13 @@ enum Commands {
     #[command(flatten)]
     Causal(CausalCommands),
 
+    /// 主機帳號救援
+    #[command(name = "ops")]
+    MfaOps {
+        #[command(subcommand)]
+        command: users_mfa_cmd::MfaOpsCommands,
+    },
+
     // Operator maintenance leaves (doctor .. restore).
     #[command(flatten)]
     Ops(OpsCommands),
@@ -5243,6 +5250,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             acl,
             artifact,
         }) => causal_cmd::clear_revocation_fence(&db, &tenant, &acl, &artifact),
+        Commands::MfaOps { command: users_mfa_cmd::MfaOpsCommands::Users { command } } => users_mfa_cmd::run(&duduclaw_home(), command),
         Commands::Ops(OpsCommands::Doctor { fix_residue }) => cmd_doctor(fix_residue).await,
         Commands::Ops(OpsCommands::Responsibility { command }) => {
             responsibility_cmd::run(&duduclaw_home(), command).await
@@ -6447,6 +6455,9 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             responsibility_cmd::bash_responsibility_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            users_mfa_cmd::bash_decision(command, caller)
                         })
                         .or_else(|| {
                             agent_control_cmd::bash_agent_control_decision(command, &caller)
@@ -14564,3 +14575,5 @@ mod removed_name_hook_tests {
         assert!(d.is_allowed(), "{d:?}");
     }
 }
+
+mod users_mfa_cmd;

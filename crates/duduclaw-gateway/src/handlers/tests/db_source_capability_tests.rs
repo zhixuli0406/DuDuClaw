@@ -275,6 +275,7 @@ async fn grant_rpcs_require_admin() {
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
     let viewer = UserContext {
+        credential_epoch: 0,
         user_id: "u1".to_string(),
         email: "u1@test.local".to_string(),
         role: UserRole::Employee,

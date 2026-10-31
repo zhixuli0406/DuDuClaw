@@ -16,7 +16,7 @@ impl MethodHandler {
         let channels_connected = channel_map.values().filter(|s| s.connected).count();
         drop(channel_map);
         let edition_profile = self.resolve_edition_profile().await;
-        json!({
+        let mut payload = json!({
             "version": crate::updater::current_version(),
             "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
@@ -62,7 +62,10 @@ impl MethodHandler {
             // Without it `[telemetry] otlp_endpoint` is accepted and saved but
             // exports nothing, so the settings page says so next to the field.
             "otel_compiled": cfg!(feature = "otel"),
-        })
+        });
+        let policy = crate::mfa::policy_status(&self.home_dir);
+        if policy["degraded"] == true { payload["mfa_policy"] = policy; }
+        payload
     }
 
     pub(crate) async fn handle_system_status(&self) -> WsFrame {

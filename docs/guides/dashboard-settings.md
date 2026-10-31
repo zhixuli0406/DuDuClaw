@@ -335,3 +335,16 @@ Direct-binding history privacy: `[people] bound_history_privacy = true` is enabl
 The security page offers four values for `config.toml [security] egress_guard`: **Off** (`off`), **Observe only** (`shadow`, default), **Ask before sending** (`ask`) and **Block sending** (`block`). Saving uses the existing locked `system.update_config` writer; calls read the setting at the guard. The per-employee `agent.toml [capabilities] egress_guard` can only raise the restriction (`off < shadow < ask < block`). A missing `config.toml` means the default (Observe only); invalid or unreadable configuration blocks the affected call.
 
 After a successful private MCP read in a turn, the guard checks outgoing calls. Observe only records `would_ask` and source tools while allowing execution. Ask shows a single-use approval with destination, expanded complete content, source tools and expiry; only a current dashboard Admin can approve it (channel buttons and chat replies cannot). Block refuses. This covers platform MCP calls and the third-party MCP proxy, not Claude CLI built-ins or other native runtime tools. Tracking is per turn. See [Outgoing data guard](../features/69-egress-guard.md).
+
+## MFA enforcement (phase 1)
+
+```toml
+[auth]
+mfa_enforced = false
+```
+
+Keep this off while users enroll voluntarily with their current password. Check `mfa.overview`, verify linked-channel delivery or arrange another Admin's one-time enrollment code, test host recovery, and prepare an MFA-capable client before enabling enforcement. Both dashboard config writers require a current active Admin. Enrollment and later credential changes invalidate older JWTs through a per-user epoch; enforcement alone lets existing access tokens expire naturally and refuses unenrolled refresh. Legacy shared-token WebSocket login is refused when enforced.
+
+Configuration is an in-memory snapshot, loaded at boot and after dashboard writes; external file changes reload every 30 seconds. A failed reload warns and preserves the last good value; only Enterprise with no valid snapshot fails closed. Without `[auth]`, enforcement is false. Personal ignores enforcement and local auto-login stays unchanged. Dashboard screens remain phase 2. See [Security defense](../features/05-security-defense.md) for proof fields, session binding and `duduclaw ops users mfa-reset` / `mfa-enrollment-code` host recovery. Key rotation is out of scope.
+
+Before enabling, review channel binding times in `mfa.overview`; only verified bindings predating enforcement qualify as enrollment proof. A password holder who planted a binding before enforcement cannot be detected. Read the returned 12-character `challenge_ref` to another Admin, who issues a code for that pending challenge (`users.mfa_enrollment_code {user_id,challenge_ref}` or host `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`). Failed reloads are visible in `mfa.overview.policy` and `system.status.mfa_policy`; a last-good false value remains false. Both config writers re-check Admin under the write lock.
