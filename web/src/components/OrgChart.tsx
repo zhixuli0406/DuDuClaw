@@ -1,3 +1,5 @@
+import { useBrandStore } from '@/stores/brand-store';
+import { useDarkAppearance } from '@/components/brand/ProductLogo';
 import { useEffect, useRef, useCallback } from 'react';
 import * as d3 from 'd3';
 import type { AgentDetail } from '@/lib/api';
@@ -147,8 +149,10 @@ const NODE_RX = 10;
 export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  // Use the fixed product identity for the synthetic root.
+  // Use the effective product identity for the synthetic root.
   const brandName = useEffectiveName();
+  const brand = useBrandStore((state) => state.brand);
+  const dark = useDarkAppearance();
 
   const render = useCallback(() => {
     if (!svgRef.current || !containerRef.current || agents.length === 0)
@@ -295,6 +299,12 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
         // Synthetic root = the product itself → the C1 brand mark (ink follows
         // the theme via --logo-ink, the tail keeps the amber accent).
         const MARK = 28;
+        if (brand) {
+          g.append('image').attr('href', (dark && brand.logo_dark) || brand.logo_light)
+            .attr('x', HEAD_CX - MARK / 2).attr('y', HEAD_CY - MARK / 2)
+            .attr('width', MARK).attr('height', MARK).attr('preserveAspectRatio', 'xMidYMid meet');
+          return;
+        }
         const mark = g
           .append('svg')
           .attr('x', HEAD_CX - MARK / 2)
@@ -388,7 +398,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
       .attr('cy', 16)
       .attr('r', 4)
       .attr('fill', (d) => statusColors[d.data.status]?.stroke ?? '#a8a29e');
-  }, [agents, onNodeClick, brandName]);
+  }, [agents, onNodeClick, brandName, brand, dark]);
 
   // Render on mount and when agents change
   useEffect(() => {

@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use duduclaw_knowledge::acl::{self, Narrowing, Role};
+use duduclaw_knowledge::acl::{Narrowing, Role};
 use duduclaw_knowledge::citations::{cited_in_session, shown_for_viewer};
 use duduclaw_knowledge::requester::ResolvedUser;
 use duduclaw_knowledge::{KbError, KbResult, schema};
@@ -73,7 +73,7 @@ pub async fn citations_for_session(
         }
         rows.truncate(MAX_SESSION_CITATIONS);
         let human = dashboard_human(&user);
-        let allowed = acl::effective_collections(&conn, &human, None, &Narrowing::default())?;
+        let allowed = super::principals::effective_collections(&home, &conn, &human, None, &Narrowing::default())?;
         let shown = shown_for_viewer(&conn, rows, &allowed)?;
         Ok(json!({ "citations": shown }))
     })
@@ -167,7 +167,8 @@ pub async fn editable_source_title(
         let conn = schema::open_home(&home)?;
         let src = duduclaw_knowledge::sources::get_source(&conn, &sid)?
             .ok_or(KbError::PermissionDenied)?;
-        acl::require_role(
+        super::principals::require_role(
+            &home,
             &conn,
             &src.collection_id,
             &user.user_id,

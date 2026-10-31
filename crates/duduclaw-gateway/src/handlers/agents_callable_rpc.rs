@@ -134,6 +134,7 @@ impl MethodHandler {
             &ctx.user_id,
         )
         .await
+        .filter(|a| sender.may_call(a, Some(&a.config.agent.name)))
         .map(|a| a.config.agent.name.clone());
         let grants = trigger_route::callable_grants(&reg, &sender, default_id.as_deref());
         let ids: Vec<String> = grants.iter().map(|(id, _)| id.clone()).collect();

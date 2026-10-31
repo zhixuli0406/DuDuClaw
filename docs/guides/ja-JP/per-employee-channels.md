@@ -1,5 +1,7 @@
 # AI 社員に専用の Telegram Bot と Google Chat アプリを持たせる
 
+Google Chat チャネルの認証情報は Chat アプリ（`chat.bot`）用で、Gmail、Drive、Calendar は接続しません。データツールは [Google 接続](google-setup.md)で別途設定します。ダッシュボードの保存は即時反映し、設定ファイルを手編集した場合は再起動します。
+
 既定では、すべての AI 社員は会社の共用チャンネル（Telegram Bot 1 つ、Google Chat アプリ 1 つ）で話します。このガイドの設定をすると、特定の社員専用の Bot やアプリに話しかけられ、その社員が答えます。
 
 場所：**AI 社員 → 社員を開く → 連携 → 専用チャンネル**。

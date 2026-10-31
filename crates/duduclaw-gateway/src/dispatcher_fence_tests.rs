@@ -949,7 +949,10 @@ async fn default_alias_cannot_retarget_after_admission_identity_is_selected() {
     let message_id = format!("goal:{}:1", task.id);
     let hook = test_hooks::install("autonomy_dispatch_handoff", &message_id);
     duduclaw_core::autonomy_gate::set_pause(home, Some("bob"), "test", "operator").unwrap();
-    let delegation = DelegationEnv { depth: 0, origin: String::new(), sender: String::new(), hop_depth: 0 };
+    let delegation = DelegationEnv {
+        credential_source: format!("test:{message_id}"),
+        depth: 0, origin: String::new(), sender: String::new(), hop_depth: 0,
+    };
     model_call_probe::set_dry_run(true);
     let before = model_call_probe::calls();
     let retarget = async {

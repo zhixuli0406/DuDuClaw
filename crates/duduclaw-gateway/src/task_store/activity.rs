@@ -14,9 +14,9 @@ impl TaskStore {
                 row.event_type,
                 row.agent_id,
                 row.task_id,
-                row.summary,
+                mask_derived_text(&row.summary),
                 row.timestamp,
-                row.metadata,
+                row.metadata.as_deref().map(mask_derived_text),
             ],
         )
         .map_err(|e| format!("append activity: {e}"))?;
@@ -158,7 +158,7 @@ impl TaskStore {
                 row.id,
                 row.task_id,
                 row.author_user,
-                row.body,
+                mask_derived_text(&row.body),
                 row.created_at
             ],
         )

@@ -183,14 +183,13 @@ pub async fn maybe_scan(home_dir: &Path, agent_dir: Option<&Path>, agent_id: &st
 
 /// Emit the three best-effort outputs of one anomaly: log, Activity Feed, push.
 async fn report(home_dir: &Path, agent_dir: Option<&Path>, agent_id: &str, v: &AnomalyVerdict) {
-    // The series is in millicents; render the human-facing number in cents so
-    // it lines up with the budget breaker's wording.
-    let spent_cents = v.current_cents / 1000;
-    let baseline_cents = (v.mean_cents / 1000.0).round() as u64;
+    // Telemetry stores cents despite its historical column name.
+    let spent_cents = v.current_cents;
+    let baseline_cents = v.mean_cents.round() as u64;
     tracing::warn!(
         agent_id,
-        current_millicents = v.current_cents,
-        mean_millicents = v.mean_cents,
+        current_cents = v.current_cents,
+        mean_cents = v.mean_cents,
         z = v.z,
         "cost anomaly: today's burn rate is a statistical outlier above this agent's own baseline"
     );
@@ -213,9 +212,9 @@ async fn report(home_dir: &Path, agent_dir: Option<&Path>, agent_id: &str, v: &A
             ),
             timestamp: chrono::Utc::now().to_rfc3339(),
             metadata: serde_json::to_string(&serde_json::json!({
-                "current_millicents": v.current_cents,
-                "mean_millicents": v.mean_cents,
-                "std_millicents": v.std_cents,
+                "current_cents": v.current_cents,
+                "mean_cents": v.mean_cents,
+                "std_cents": v.std_cents,
                 "z": v.z,
                 "sigma": DEFAULT_SIGMA,
                 "baseline_days": BASELINE_DAYS,
@@ -291,6 +290,20 @@ fn claim_daily_alert(home_dir: &Path, agent_id: &str, today: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn anomaly_report_preserves_stored_cents() {
+        let home = tempfile::tempdir().unwrap();
+        let verdict = detect(&[100, 100, 100, 100, 100], 500, DEFAULT_SIGMA, DEFAULT_MIN_SAMPLES);
+        report(home.path(), None, "employee", &verdict).await;
+        let store = crate::task_store::TaskStore::open(home.path()).unwrap();
+        let (rows, total) = store.list_activity(Some("employee"), Some("cost_anomaly_detected"), 10, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert!(rows[0].summary.contains("今日 500 分"));
+        assert!(rows[0].summary.contains("基線 100 分"));
+        let metadata: serde_json::Value = serde_json::from_str(rows[0].metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["current_cents"], 500);
+    }
 
     #[test]
     fn flags_spike_above_baseline() {

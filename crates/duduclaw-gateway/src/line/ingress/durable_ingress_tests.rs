@@ -141,7 +141,9 @@ async fn failed_signature_missing_identity_and_disk_full_never_ack() {
     );
     state.ingress.as_ref().unwrap().simulate_full().await;
     let mut huge = envelope("event-1");
-    huge["events"][0]["extra"] = "x".repeat(1024 * 1024).into();
+    // Keep each string below the credential scan cap so this reaches disk
+    // as a large sanitized envelope rather than a short unavailable marker.
+    huge["events"][0]["extra"] = serde_json::json!(vec!["x".repeat(32 * 1024); 32]);
     let (h, b) = signed(&huge);
     assert_eq!(
         handle_line_webhook(state.clone(), &h, b).await,

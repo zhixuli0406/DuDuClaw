@@ -46,7 +46,8 @@ function setEdition(profile: 'personal' | 'enterprise') {
   useSystemStore.setState({ status: { edition_profile: profile } as unknown as SystemStatus });
 }
 
-function setRole(role: 'admin' | 'manager' | 'employee') {
+// Viewer is a defensive fixture: current persisted roles stop at Employee.
+function setRole(role: 'admin' | 'manager' | 'employee' | 'viewer') {
   useAuthStore.setState({
     user: { id: 'u1', username: 'owner', display_name: 'Owner', role },
   } as never);
@@ -87,7 +88,7 @@ beforeEach(() => {
     isAuthenticated: true,
     user: { id: 'u1', username: 'owner', display_name: 'Owner', role: 'admin' },
   } as never);
-  useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  useConnectionStore.setState({ state: 'authenticated' as never, error: null, mustChangePassword: false });
   useAgentsStore.setState({ agents: AGENTS as never[], loaded: true, loading: false } as never);
   setEdition('enterprise');
 });
@@ -115,6 +116,15 @@ describe('App routes — legacy paths land somewhere real (WP-A §2-8/§2-13)', 
 
   it('/legacy-dashboard → / (the page it was an early draft of)', async () => {
     await expectLandsOn('/legacy-dashboard', '/');
+  });
+});
+
+describe('App routes — machine console access', () => {
+  it.each(['employee', 'manager'] as const)('blocks %s from a direct console URL', async role => {
+    setRole(role);
+    await expectLandsOn('/console', '/');
+    expect(screen.queryByPlaceholderText(en['console.placeholder'])).not.toBeInTheDocument();
+    expect(screen.queryByText(en['home.console.cta'])).not.toBeInTheDocument();
   });
 });
 
@@ -362,5 +372,27 @@ describe('App routes — 系統設定 app relocation (N-3)', () => {
     // page header title is the same `app.system.name` string the launcher
     // card and sidebar breadcrumb reuse.
     await waitFor(() => expect(screen.getByText(en['app.system.name'])).toBeInTheDocument());
+  });
+});
+
+describe('App routes — self-service account access', () => {
+  for (const role of ['admin', 'manager', 'employee', 'viewer'] as const) {
+    for (const edition of ['enterprise', 'personal'] as const) {
+      it(`renders the account page for ${role} on ${edition}`, async () => {
+        setRole(role);
+        setEdition(edition);
+        renderAppAt('/me/account');
+        expect(await screen.findByRole('heading', { name: 'Account' })).toBeInTheDocument();
+        expect(await screen.findByText(en['settings.account.signedInAs'])).toBeInTheDocument();
+        expect(screen.getByTestId('loc')).toHaveTextContent(/^\/me\/account$/);
+      });
+    }
+  }
+
+  it.each(['manager', 'employee', 'viewer'] as const)('still redirects %s away from system settings', async (role) => {
+    setRole(role);
+    renderAppAt('/app/system/settings');
+    await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent(/^\/$/));
+    expect(screen.queryByText(en['settings.account.signedInAs'])).not.toBeInTheDocument();
   });
 });

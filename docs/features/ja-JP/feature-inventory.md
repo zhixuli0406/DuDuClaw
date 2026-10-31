@@ -39,10 +39,10 @@
 | ゴール契約の凍結(v1.60) | 作成時に受け入れ基準を不変の `acceptance_criteria_baseline` として凍結、判定と評価器はこのベースラインのみを読む;エージェント身分による goal タスクの受け入れ基準・`title`・`description` の変更は拒否 + 監査記録;基準なしの `/goal` には 4 要素ガイダンスと outcome 式基準の提案を付与 |
 | ゴールループの人間シグナル + アドミッションキュー(v1.60) | needs_human に閉じた 6 分類の `pause_reason`(トリガー現場で静的スタンプ、LLM の記述から逆解析しない);超過進捗レポート(`progress_report_minutes`);LLM ゼロのツール連打アドバイザリ(3/5/8 段階);ephemeral spawn の上限超過は有界 FIFO キューに(デフォルト `queue`);予算枯渇時は「ベストラウンド成果物」を引き渡し(決定論的選択 + ギャップ一覧、手ぶらエスカレーションの廃止) |
 | Agent Mail(v1.60) | エージェントごとのメールボックス(`/mail` ページ):Gmail API / drop folder 受信、送信は常にドラフト作成 → ApprovalBroker 確認待ち(実送信はバックグラウンドワーカーのみ)、メール内容は DATA フェンス、外部付与不可の専用 scope、エージェント横断の閲覧は組織権限判定を通過([47-agent-mail.md](47-agent-mail.md)) |
-| エージェント設定プリセット P1(v1.60) | `duduclaw preset` コマンド群 + `agent create --preset`——名前付きで再利用可能な設定バンドル;バインディング権威は `preset_bindings.toml`、解決結果はエージェントディレクトリ外へ実体化(自己改変による回避を防止)、org フィールドは値があれば全体拒否、機微セクションは静かに剥離;組み込み部門プリセット 9 種 |
+| エージェント設定プリセット(v1.60) | `duduclaw preset` コマンド群 + `agent create --preset`——名前付きで再利用可能な設定バンドル;バインディング権威は `preset_bindings.toml`、解決結果はエージェントディレクトリ外へ実体化(自己改変による回避を防止)、org フィールドは値があれば全体拒否、機微セクションは静かに剥離;組み込み部門プリセット 9 種 |
 | 統一アサインパネル + 計画モード + ギャラリー(v1.60) | すべての入口が同一のアサインパネルを共有(個人版にようやく主要アクション)、質問 / 委任 / 「考えてみて」の 3 モード——計画モードは 3-8 ステップの計画を生成して needs_human で承認待ち、承認後 `<execution_plan>` として 1 回だけ注入;終了したゴールへの「続きをやって」対応;インスピレーションギャラリー `/gallery` が 22 業種チームの実例をワンクリック複製カードに展開;タスク詳細は 4 タブ化(成果物/ファイル/変更/経過) |
 | 成果物 provenance + 納品安全(v1.60) | `artifacts.jsonl` 5 種 origin の provenance 台帳(declared/swept/uploaded/produced/unknown;exact/inferred の帰属表示、時間窓による推測は絶対にしない);goal 受け入れ時に成果物コピーを `attachments/` へアーカイブ(canonicalize 封じ込め、20MB/100MB 上限);📎DELIVER 前の LLM ゼロ納品ゲート(ゼロバイト/magic 不一致/zip 破損はハード失敗);`[limits]` DocumentLimits が下流 3 パーサーを防御;エキスパートパック解凍の「ヘッダ虚偽申告」バイパスを修正 |
-| 認証情報 P1 + secret 参照の収斂(v1.60) | `secret://keychain` と `secret://file` のローカル backend、tick ソース headers の `secret://` 対応、認証情報インベントリカード + `doctor --fix-residue`;`SecretRef`/`Secret` 型が手作り復号 7 方言を収斂——`secret://` 参照リテラルが本物の認証情報として vendor API へ送られる漏洩を修正;WhatsApp webhook 署名検証を fail-closed 化;ActionGuard 判定は 21 トークンの閉じた列挙 findings のみを受領(攻撃者制御テキストは構造的に判定プロンプトへ到達不能);MCP キーのローテーション即時反映、`denied_tools`/`allowed_tools` を MCP ディスパッチゲートでも強制 |
+| 認証情報と secret 参照の統合(v1.60) | `secret://keychain` と `secret://file` のローカル backend、tick ソース headers の `secret://` 対応、認証情報インベントリカード + `doctor --fix-residue`;`SecretRef`/`Secret` 型が手作り復号 7 方言を収斂——`secret://` 参照リテラルが本物の認証情報として vendor API へ送られる漏洩を修正;WhatsApp webhook 署名検証を fail-closed 化;ActionGuard 判定は 21 トークンの閉じた列挙 findings のみを受領(攻撃者制御テキストは構造的に判定プロンプトへ到達不能);MCP キーのローテーション即時反映、`denied_tools`/`allowed_tools` を MCP ディスパッチゲートでも強制 |
 | 10 チャネル通知統一(v1.60) | autopilot `notify`、MCP `send_message`、リマインダーがすべて共有 `create_sender` ファクトリ経由の 10 チャネル対応に(WebChat は誠実に拒否)——一度も配信されたことのなかった autopilot Slack 通知の生きた bug と Google Chat / Teams の静かなスキップ欠陥を修正 |
 | 進化計測の強化(v1.60) | AEE コミットゲートを visible / held-out の 2 次元に分離(fence-only:拒否のみ可能で昇格には使えない);チャンピオン bootstrap を同形計測に;`duduclaw evolution clear-holdout-rotation` オペレーター出口;ラウンドごとに 14 ノブのスナップショットを `aee_round` イベントへ |
 | cron 曜日規約の修正(v1.61、**BREAKING**) | 数値曜日フィールドをパース時に Unix crontab 規約(0/7=日曜、1-5=月〜金)から `cron` crate の Quartz 序数へ変換、スケジューラ/heartbeat/MCP 検証/ダッシュボードが同一 normaliser を共有——従来 `* * 1-5` は日曜〜木曜に発火していた(日曜のゴースト発火 + 金曜の静かなスキップ);意図的に Quartz 規約で書かれたスケジュールはアップグレード後 1 日ずれる |
@@ -57,7 +57,7 @@
 | 機能 | 説明 |
 |------|------|
 | 進化システム v3:AEE + playbook | デフォルトの進化対象を「SOUL.md の全面書き換え」から遺伝子形 playbook 行動ルールへ変更——Gate/Measure 分離、champion + matches-or-improves コミットゲート、エントリ単位の観察ウィンドウ;SOUL.md はエージェントに対して読み取り専用([38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)) |
-| E1 エントリアサーション + 反 reward-hacking 監査 | 新規ルールは機械検証可能なアサーション必須。録画済み transcript に対し LLM ゼロで再生検証(`G-Assertions`);コミット前に評価問題の丸写し / 恒真表現 / 失敗隠蔽を決定論的にスクリーニング |
+| エントリアサーション + 反 reward-hacking 監査 | 新規ルールは機械検証可能なアサーション必須。録画済み transcript に対し LLM ゼロで再生検証(`G-Assertions`);コミット前に評価問題の丸写し / 恒真表現 / 失敗隠蔽を決定論的にスクリーニング |
 | タスク層フォワードモデル | goal loop 上の predict-act-verify 世界モデル:4 段階退化の統計予測(コールドスタート LLM ゼロ)、観察証拠の忠実度分級(ネイティブツールイベント / 監査ログのみ / なし)、`<state>` ブロック + (状態, 行動) 訪問グラフによる振動検出、決定論的タスクルール帰納;`[task_forward_model]`、v1.54 以降デフォルト on |
 | ディスパッチ証拠グラウンディング事前チェック | 受け入れ判定の前に LLM ゼロの証拠チェック——最終回答は実在する非エラーのツール結果と重なる必要がある;自己エコー除外リスト + 入力重複控除で自己証明を防止;`[dispatch] grounding_precheck_enabled`、デフォルト on |
 | メモリ新規性ゲート | 意味層のほぼ重複した書き込みを書き込み時に拒否しテレメトリ記録(0.92 文字 n-gram cosine)——偽サプライズの蓄積防止;時間的置換・再確認パスは除外;`[memory] novelty_gate`、デフォルト on |
@@ -84,7 +84,7 @@
 | レコーディング → スキル | ブラウザ(Playwright trace+HAR、シークレットはその場で秘匿処理)とデスクトップのレコーダーを、承認ゲート付き SKILL.md ドラフトへ蒸留([36-recording-to-skill.md](36-recording-to-skill.md)) |
 | 写真 → デスクトップペット | ローカルで写真 → 背景除去 → ピクセル量子化 → Codex-Pets 8×9 スプライトシート。本物の常時最前面ウィンドウを動かす自律徘徊エンジン([35-photo-desktop-pet.md](35-photo-desktop-pet.md)) |
 | ケイパビリティ機能トグル | 生の allow/deny ツールリストの上に置かれた 16 の平易な機能グループ。完全性ガード付きツールカタログが裏付け |
-| Google Workspace / Notion / GitHub ネイティブツール | Gmail/Calendar/Drive/Sheets、Notion、GitHub のファーストパーティ MCP ツール(v1.45。設定されるまでデフォルト非表示) |
+| Google Workspace / Notion / GitHub ネイティブツール | Google は八サービス・19 ツール、全体スイッチ既定オフ。Apps Script は三サービス・状態込み八アクション。[接続ウィザード](../../guides/ja-JP/google-setup.md)。Notion と GitHub は個別設定。 |
 | デスクトップシェル(Tauri 2) | ゲートウェイ + ダッシュボードを包むネイティブウィンドウ、トレイ、ゲートウェイピッカー、透明なデスクトップペットオーバーレイウィンドウ |
 | インタラクションペーシングガード | 会話履歴フレーミング + 常時有効なペーシングルールにより、挨拶が直前のツール多用タスクを再トリガーしないようにする |
 
@@ -97,7 +97,7 @@
 | セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入（gateway の抽出と承認済みの審査から）。`user_profile_record` / `user_profile_get` MCP ツールは gateway が起動する全従業員で共有される別の名前空間を読み書きするため、このブロックには反映されない（既知の制限、v1.67.1） |
 | GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.69.0 で削除)が記憶(triple + 本文言及 + key_facts + 減衰/forget のアーカイブ複製、5 テーブルのカスケード、SHA-256 仮名 tombstone。アーカイブ複製は本文しか残らないため本文言及で照合。subject/object だけで本人と結び付き、本文が本人に触れていないアーカイブ行は見つからない。試行とエクスポートのアーカイブ件数は本文で一致した行だけを数え、実際の消去では削除した記憶と同じ id のアーカイブ行も消すため、消去件数のほうが多くなることがある)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象。連絡先が空、または前後の空白を除いて 3 文字未満の場合は、何も読む前に拒否 |
 | Custom Dashboard Widgets | サンドボックス化されたランタイムで動作する、AI ガイドまたは生 HTML のダッシュボードカード。Widget Studio での共有/インポート/エクスポート([30-custom-widgets.md](30-custom-widgets.md)) |
-| 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
+| 予算サーキットブレーカー | 一時子社員の費用を含む直近 24 時間／30 日間の上限。すべての社員モデル呼び出し経路で起動前に確認。`[budget] when_unavailable` は費用データを取得できない場合の続行（既定 `allow`）か拒否（`deny`）を選択し、設定の読み取り・解析の失敗や未知の方針は必ず拒否。予算拒否でアカウントを切り替えず、フェイルオーバーもしない。`budget_events.jsonl` |
 | バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |
 | 監査エクスポート + SIEM sink | `duduclaw export audit`(旧 `duduclaw audit`) — JSONL 監査ログを正規化し NDJSON / webhook へストリーム |
 | 送信 guardrail フック | opt-in `[guardrails]` — 送信前に秘密情報の漏洩 / インジェクション反響 / 禁止フレーズ / PII をスキャン |
@@ -166,7 +166,7 @@
 | Slack | Socket Mode、mention-only、thread 返信 |
 | WhatsApp | Cloud API webhook、署名検証は fail-closed |
 | Feishu | Open Platform v2 |
-| Google Chat | Webhook（JWT 検証）、サービスアカウントで送信 |
+| Google Chat | JWT 検証 webhook、`chat.bot` サービスアカウント送信。ダッシュボード即時反映、Workspace データ認証と別（[設定](../../guides/ja-JP/channels-googlechat-teams.md)） |
 | Microsoft Teams | Azure Bot / Connector v3（JWT 検証） |
 | WeCom | HMAC-SHA1 署名 + AES-256-CBC メッセージ暗号化 |
 | DingTalk | HMAC-SHA256 署名 + 時間ウィンドウ |
@@ -226,7 +226,7 @@
 | GitHub ライブインデックス | Search API + 24h ローカルキャッシュ + 加重検索 |
 | スキルマーケット | Web ダッシュボード、インストール、セキュリティスキャン |
 | スキル自動合成 | ギャップアキュムレーター → エピソード記憶から合成（Voyager 由来）→ サンドボックス試用（TTL） → クロスエージェント卒業。デフォルト off（`agent.toml [evolution] skill_synthesis_enabled`） |
-| スキル合成スケジューラ（W19-P1、v1.22.0）| 「会話 → skill」抽出を一定間隔で自律実行 — `config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + ダッシュボード `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` は `u32` カウント（registry スキャンが `0.7` を拒否する不具合を修正）|
+| スキル合成スケジューラ（v1.22.0）| 「会話 → skill」抽出を一定間隔で自律実行 — `config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + ダッシュボード `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` は `u32` カウント（registry スキャンが `0.7` を拒否する不具合を修正）|
 | Skill セキュリティスキャナー（Rust ネイティブ）| `skill_lifecycle::security_scanner` が候補スキルをスキャン、Python 依存なし |
 
 ## ローカル推論エンジン
@@ -264,7 +264,7 @@
 |------|------|
 | `agent-file-guard` PreToolUse フック | `duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash`、`agent_hook_installer` が `--agent` と `--home` 付きでエージェント毎に導入）——正規ツリー外のエージェント構造ファイル、自分の SOUL.md と CONTRACT.toml への書き込み、他エージェントへの書き込み、DuDuClaw ホーム内で自分のエージェントディレクトリと `attachments/` 以外への社員の書き込み（シンボリックリンク解決後の実パスで判定）、自分の `agent.toml` の編集可能セクション以外の変更をブロック。Bash 側はヒューリスティック、`Read` は対象外。ルールと制約は [05-security-defense.md](05-security-defense.md) を参照 |
 | `org_field_guard` | 同じフック内のフィールド単位の凍結：`[agent] reports_to`／`department`／`name`、`[capabilities]` テーブル全体、`config.toml [delegation]`／`[acp]`。パース不能・書き込み意図の再構成不能はいずれも fail-closed |
-| `data-file-guard` PreToolUse フック | `duduclaw hook data-file-guard`（RFC-23 §14.4、H10 2026-09 から Rust サブコマンド、matcher `Read\|Bash`）。匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック |
+| `data-file-guard` PreToolUse フック | `duduclaw hook data-file-guard`（RFC-23 §14.4、2026-09 から Rust サブコマンド、matcher `Read\|Bash`）。匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック |
 | ダッシュボード認証 | JWT アカウントログイン（Argon2id パスワード、`users.db`）または gateway の管理者トークン。以前の Ed25519 チャレンジレスポンスの経路は削除されました。どの設定からも有効にできないものでした |
 | AES-256-GCM | API キーの保存時暗号化、per-agent 隔離 |
 | Prompt Injection スキャナ | `input_guard` — 11 ルールカテゴリ、ブロック閾値 60、NFKC 正規化、英語＋zh-TW パターン、XML 区切りタグ保護 |
@@ -290,14 +290,14 @@
 | メモリ減衰スケジューラ | 日次バックグラウンド — 低重要度 + 30 日以上アーカイブ、アーカイブ + 90 日以上完全削除 |
 | 認知メモリ MCP ツール | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
 | Key-Fact Accumulator | `key_facts` + FTS5 — セッション横断の軽量メモリ（セッションメモリスタック参照） |
-| Temporal Memory（F1、v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結（v1.67.1 から、書き込みの信頼度が現在の事実以上の場合のみ置き換え）；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
+| Temporal Memory（v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結（v1.67.1 から、書き込みの信頼度が現在の事実以上の場合のみ置き換え）；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
 | Reflexion Loop（F2、v1.19.0）| 既存 `MistakeNotebook` をブリッジ — F2a は未解決の最近のミスを回答プロンプトに注入（`## Past Mistakes to Avoid`、CJK セーフ照合 + recency フォールバック）；F2b は同一 `MistakeCategory` のミス ≥3 件を 1 つの意味メモリルールに統合（`reflexion.rs`）し元を解決済みに。トリガー = `ErrorCategory` Significant/Critical（MetaCognition 適応） |
 | `memory_fetch_batch`（F3、v1.19.0）| MCP ツール + `get_by_ids` が ≤100 件を ID で一括取得（名前空間/所有権を強制、部分ヒット → `missing_ids`） |
 | Bi-temporal + build-time provenance（D1）| `memories` に冪等マイグレーションで `ingested_at`（transaction-time 軸、world-time の `valid_from` とは別）＋ `invalidated_by_event`/`invalidated_at`（どの source_event が行をいつクローズしたか）を追加。`store_temporal()` の置換は world-time の `valid_from` で決定（順不同に強い — 先行する事実は現行を乱さず有界の履歴セグメントとして挿入；`valid_from` なしの書き込みは従来の取り込み順の挙動を維持）；同一事実の再観測は行を追加せず**再確認**（metadata `reaffirmed_by`、≤20、＋ `access_count` 加算） |
 | `memory_get_history` / `memory_get_at`（D1）| 時系列読み取り API の MCP 露出 — 完全な置換チェーン（provenance 列付き）と `(subject, predicate)` トリプルのポイントインタイム参照（scope `memory:read`） |
 | 置き換え時の信頼度チェック（v1.67.1） | 書き込みの実効 `origin_trust` が現在の事実（保存値をクラス上限で頭打ち）より厳密に低い場合は置き換え不可。同じか高ければ従来どおり置き換え。会話事実とプロフィール特性の抽出で拒否された主張は保留され、ダッシュボード専用の `knowledge_quarantine` 審査へ（24 時間、AI 従業員ごとに UTC 日あたり新規 20 件まで、超過分は監査ログのみ）。他の経路はスキップまたはエラー。`user_profile` オリジン上限 1.0 → 0.6。`config.toml [memory] supersession_trust_guard`（デフォルト有効）（[20-memory-intelligence.md](20-memory-intelligence.md#置き換え時の信頼度チェックv1671)） |
 | `memory_invalidate_by_origin`（D1）| ソースロールバックのプリミティブ — **厳密な** `origin` のすべての現在有効な事実を失効（削除はしない、任意でカットオフ以降に限定）、`origin_trust ≤ 0.1` を `derived_from` の子孫へカスケード；履歴は保持（`invalidated_by_event = "origin_purge"`）。scope `admin`。v1.67.1 から AI 従業員として呼ぶ場合は `channel` / `mcp_external` / `tool_echo` のみ（他は拒否、監査 `memory_invalidate_refused`） |
-| 出典単位のメモリ忘却（v1.70.0、実際の gateway では未検証） | メモリの書き込みはすべて出典（チャネルメッセージ、スケジュールまたはディスパッチの実行、MCP ターン、インポートファイル）を記録します。`duduclaw memory forget-source {list,plan,show,apply,resume}`（オペレーターのターミナルのみ）は、出典から直接または派生で生まれたメモリを物理削除し、同じ出典から再び学習されないようブロック記録を書き、`memory.db` の外の後続ステップを実行します。`apply` にはダッシュボードでの管理者の承認が必要です。会話の原文、送信済みメッセージ、バックアップは削除しません。[会話・スケジュール実行・インポートファイルを忘れる](../../guides/ja-JP/memory-and-knowledge.md#45-会話スケジュール実行インポートファイルを忘れる) |
+| 出典単位のメモリ忘却（v1.70.0） | メモリの書き込みはすべて出典（チャネルメッセージ、スケジュールまたはディスパッチの実行、MCP ターン、インポートファイル）を記録します。`duduclaw memory forget-source {list,plan,show,apply,resume}`（オペレーターのターミナルのみ）は、出典から直接または派生で生まれたメモリを物理削除し、同じ出典から再び学習されないようブロック記録を書き、`memory.db` の外の後続ステップを実行します。`apply` にはダッシュボードでの管理者の承認が必要です。会話の原文、送信済みメッセージ、バックアップは削除しません。[会話・スケジュール実行・インポートファイルを忘れる](../../guides/ja-JP/memory-and-knowledge.md#45-会話スケジュール実行インポートファイルを忘れる) |
 | グラフ検索の進化（D3）| HippoRAG-lite graph が4つの fail-safe な改良を獲得（未使用時はバイト単位で同一）：**(1)** per-agent 永続グラフキャッシュ（`RwLock`）、トリプル変更書き込みごとに加算される per-agent 世代カウンタで無効化、`GRAPH_CACHE_MIN_TRIPLES = 500` 超のみ有効；**(2)** `entity_alias(agent_id, canonical, alias)` によるエンティティエイリアス統合 — 構築＋シード前に表層形を1ノードへ畳み込み、正規化＋チェーン平坦化；**(3)** エッジに付帯する述語エッジラベル（PPR 不変）が `engine.export_graph(agent, limit)` → シリアライズ可能な `{nodes, edges}` スナップショット（隔離事実はフラグ付き）に供給し D6 キュレーション UI へ；**(4)** オプトインの embedding seeding（`graph_embed_seed`）— PPR シード ＝ whole-word FTS ∪ クエリ埋め込み最近傍エンティティベクトル（同一モデル cosine、top-k、遅延 `entity_embedding` キャッシュ）、デフォルトオフ |
 | `memory_alias_add` / `memory_alias_list`（D3）| エンティティエイリアスを管理する MCP ツール — add は `alias` を `canonical` エンティティに畳み込む（scope `memory:write`）、list は `(canonical, alias)` ペアを返す（scope `memory:read`）；名前空間分離 |
 | Decision Continuity（RFC-24、v1.23.0）| エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`decision_resolve` / `decision_list` MCP ツール + ダッシュボードパネル + Prometheus カウンタ；`[memory] decision_continuity = true` でエージェント単位の opt-in（TTL `decision_ttl_days`、既定 7）|
@@ -331,7 +331,7 @@
 | 機能 | 説明 |
 |------|------|
 | タスクサンドボックス | エージェント単位で有効化（`agent.toml [container] sandbox_enabled = true`）。委任されたタスクは Docker コンテナ内でエージェントの AI CLI として実行されます。読み取り専用ルートファイルシステム、非 root、全 capability 破棄、メモリ／プロセス／CPU 制限、使い捨ての専用ワークスペース、エージェントのディレクトリを `/agent` に読み取り専用マウント。ファイルツールとシェルツールのみで、プラットフォームの MCP ツールはありません。`network_access = true` とローカルに取得済みのイメージが必要で、Docker のみ対応。使えないときはタスクが失敗し（監査 `task_sandbox_unavailable`）、`config.toml [container.sandbox]` の `when_unavailable = "run_unsandboxed"` で隔離なし実行に戻せます。サンドボックスを有効にした従業員はチームを組まず（goal ラウンドはサンドボックス内で Solo）、メールでも起動されません。チャネル返信、cron、リマインダーなどの会話系の経路はホスト上で実行され、監査イベント `task_sandbox_not_applied` が書かれます。[タスクサンドボックスガイド](../../guides/ja-JP/task-sandbox.md)を参照 |
-| スクリプトサンドボックス | PTC `execute_program` と `duduclaw secaudit` の PoC ステップが使用。`duduclaw-container` 経由で、macOS／Linux は Docker、Windows はまず WSL2、次に Docker（WSL2 は実際の Windows ホストでは未実行）。Apple Container バックエンドは選ばれません。タスクサンドボックスと同じイメージで、自動ダウンロードなし。`--network=none`、読み取り専用ルート、2 GiB／256 プロセス／1 CPU、`/tmp` tmpfs、600 秒の絶対上限、マウントは読み取り専用の専用スクリプトディレクトリのみ。使えないとき PTC は既定で失敗し（`[container.sandbox] script_when_unavailable`）、PoC はホスト上で実行されません（[ガイド](../../guides/ja-JP/task-sandbox.md)） |
+| スクリプトサンドボックス | PTC `execute_program` と `duduclaw secaudit` の PoC ステップが使用。`duduclaw-container` 経由で、macOS／Linux は Docker、Windows はまず WSL2、次に Docker。Apple Container バックエンドは選ばれません。タスクサンドボックスと同じイメージで、自動ダウンロードなし。`--network=none`、読み取り専用ルート、2 GiB／256 プロセス／1 CPU、`/tmp` tmpfs、600 秒の絶対上限、マウントは読み取り専用の専用スクリプトディレクトリのみ。使えないとき PTC は既定で失敗し（`[container.sandbox] script_when_unavailable`）、PoC はホスト上で実行されません（[ガイド](../../guides/ja-JP/task-sandbox.md)） |
 
 ## スケジューリング
 
@@ -435,6 +435,8 @@
 
 | 機能 | 説明 |
 |------|------|
+| 受信トレイ `/inbox` | 共通の要対応件数、期限順の整理、安全な保管、対応結果とモバイルの判断操作。[ガイド](../../guides/ja-JP/dashboard-settings.md#受信トレイと作業タイムライン)。 |
+| 作業タイムライン `/timeline` | 4 状態の件数と従業員カードで成果、停止中、判断待ちを確認。タスクへのリンクと任意の期間図。 |
 | ルート | `web/src/App.tsx` に約 74 のリダイレクトでないルート（加えて旧ブックマーク維持用のレガシーリダイレクト別名が約 30）。4 つのシェル：ワークスペース（`/`、`/chat`、`/tasks`、`/goals`、`/inbox`、`/files`、`/mail`、`/timeline`、`/foresight`、`/gallery`、`/canvas` …）、エージェント（`/agents`、`/agents/:id/:tab`、`/agents/new`、`/experts`、`/org`、`/presets`）、`/manage/*`（チャネル、ログ、請求、メンバー、部門、ディストリビューター、推論、ローカルモデル、ファインチューン、信頼性、セキュリティ監査、Wiki 信頼 …）、`/app/system/*`（設定、セキュリティ、アカウント、ライセンス、因果、Decision Lab、CCR …）、加えて単独ページ（`/login`、`/welcome`、`/webchat`、`/console`、`/mascot-overlay`、`/pet-studio`、`/world`、`/launcher`）。サイドバーに何が出るかは `web/src/components/layout/nav-model.ts` が真実の源 |
 | 技術スタック | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
 | DuDuClaw デザインシステム（mds）| 共有 `web/src/components/mds/` コンポーネントライブラリ（OKLCH トークン、4 層サーフェス、3 段シャドウ、Inter／Geist Mono）+ `nav-model.ts` のグループ化サイドバー（個人／作業／会社／設定）+ `web/DESIGN.md` 仕様；全ページを共有プリミティブで構築、en/ja/zh i18n 同期 |
@@ -456,7 +458,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| ライセンスティア | `crates/duduclaw-license/src/tier.rs` に 9 ティア（opensource、hobby、solo、studio、business、partner、personal_pro_self_host、self_host_pro、oem）。能力ゲートは `premium_templates`、`white_label`、`industry_evolution_params` の 3 つ。[LICENSING.md](../../../LICENSING.md) を参照 |
+| ライセンスティア | `crates/duduclaw-license/src/tier.rs` に 9 ティア（opensource、hobby、solo、studio、business、partner、personal_pro_self_host、self_host_pro、oem）。能力フラグは `premium_templates` と `industry_evolution_params`。総代理店の顧客には、有効なライセンスと完全に一致するサブスクリプションの署名済み文書を検証し、有効期限とオフライン猶予の確認を通過した場合、ティアに関係なく名前とロゴを適用します。オープンソース版とライセンス未設定の環境にはサブスクリプションがなく、ブランドは適用されません。削除済みの `white_label` フラグは使いません。[LICENSING.md](../../../LICENSING.md) を参照 |
 | ハードウェアフィンガープリント | ライセンスバインディング |
 | 業種テンプレート | 製造業 / 飲食業 / 貿易業（無料）。premium 産業パックには `premium_templates` が必要 |
 | CLI ツール | 12+ サブコマンド |

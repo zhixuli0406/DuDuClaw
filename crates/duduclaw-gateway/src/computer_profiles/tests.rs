@@ -229,3 +229,83 @@ fn an_unobserved_suspension_cycle_invalidates_saved_logins() {
     assert_eq!(replacement.restore().unwrap().1, "empty");
     assert!(state(home.path(), "alice").unwrap().is_none());
 }
+
+/// Reproduce the pre-filter fingerprint, including its exact serialized fields.
+fn legacy_owner_fingerprint(home: &Path, agent: &str) -> Vec<(String, String)> {
+    let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+    let generation = duduclaw_auth::google_identity::read_primary_owner_generation(&conn, agent).unwrap();
+    let mut stmt = conn.prepare("SELECT b.user_id, b.bound_at, u.status, b.is_primary, u.updated_at FROM user_agent_bindings b JOIN users u ON u.id=b.user_id WHERE b.agent_name=?1 AND b.access_level='owner' ORDER BY b.user_id").unwrap();
+    let rows = stmt.query_map([agent], |r| Ok((r.get::<_, String>(0)?, serde_json::json!([
+        r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, generation
+    ]).to_string()))).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    rows
+}
+
+#[test]
+fn restricted_profile_ignores_non_admin_self_updates_and_preserves_legacy_admin_only_identity() {
+    use duduclaw_auth::{AccessLevel, UserDb, UserRole};
+    use duduclaw_core::preset;
+    for leftover in [false, true] {
+        let home = fixture();
+        let h = home.path();
+        let db = UserDb::new(&h.join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.invalid", "Admin", "fixture-password", UserRole::Admin).unwrap();
+        let employee = db.create_user("owner@test.invalid", "Owner", "fixture-password", UserRole::Employee).unwrap();
+        db.bind_agent(&admin.id, "alice", AccessLevel::Owner).unwrap();
+        if leftover { db.bind_agent(&employee.id, "alice", AccessLevel::Owner).unwrap(); }
+        let old = owners(h, "alice").unwrap().unwrap();
+        assert_eq!(old, legacy_owner_fingerprint(h, "alice"));
+        let session = prepare(h, &[]);
+        let profile_id = session.identity.profile_id.clone();
+        session.save(b"admin-login").unwrap();
+        drop(session);
+        preset::install_system_operator_preset(h, false).unwrap();
+        preset::bind(h, "alice", &h.join("agents/alice"), "system-operator", "test", "test").unwrap();
+        let restricted = owners(h, "alice").unwrap().unwrap();
+        assert_eq!(restricted.len(), 1);
+        assert_eq!(restricted == old, !leftover);
+        let session = prepare(h, &[]);
+        assert_eq!(session.identity.profile_id == profile_id, !leftover);
+        session.save(b"admin-login").unwrap();
+        let current_id = session.identity.profile_id.clone();
+        let previous_update = db.get_user(&employee.id).unwrap().unwrap().updated_at;
+        db.update_user(&employee.id, Some("New display name"), None, None).unwrap();
+        assert_ne!(db.get_user(&employee.id).unwrap().unwrap().updated_at, previous_update);
+        if leftover { assert_ne!(legacy_owner_fingerprint(h, "alice"), old); }
+        assert_eq!(owners(h, "alice").unwrap().unwrap(), restricted);
+        assert!(session.valid_owner().unwrap());
+        drop(session);
+        let session = prepare(h, &[]);
+        assert_eq!(session.identity.profile_id, current_id);
+        assert_eq!(session.restore().unwrap().0.unwrap().as_slice(), b"admin-login");
+        drop(session);
+        preset::unbind(h, "alice", "test", "test").unwrap();
+        assert_eq!(owners(h, "alice").unwrap().unwrap(), legacy_owner_fingerprint(h, "alice"));
+    }
+}
+
+#[test]
+fn malformed_preset_bindings_refuse_prepare_without_clearing_saved_login() {
+    use duduclaw_auth::{AccessLevel, UserDb, UserRole};
+    let home = fixture();
+    let h = home.path();
+    let db = UserDb::new(&h.join("users.db")).unwrap();
+    let owner = db.create_user("owner@test.invalid", "Owner", "fixture-password", UserRole::Employee).unwrap();
+    db.bind_agent(&owner.id, "alice", AccessLevel::Owner).unwrap();
+    let session = prepare(h, &[]);
+    session.save(b"saved-login").unwrap();
+    drop(session);
+    let identity_path = h.join("agents/alice/state").join(IDENTITY);
+    let identity = std::fs::read(&identity_path).unwrap();
+    let state_path = h.join(ROOT).join("alice/state.json");
+    let saved_state = std::fs::read(&state_path).unwrap();
+    let blob_path = current_blob(h);
+    let saved_blob = std::fs::read(&blob_path).unwrap();
+    let bindings_path = duduclaw_core::preset::bindings_path(h);
+    std::fs::create_dir_all(bindings_path.parent().unwrap()).unwrap();
+    std::fs::write(bindings_path, "not [ toml").unwrap();
+    assert!(ProfileSession::prepare(h, "alice", &[], ProfilesConfig::active(h).unwrap()).is_err());
+    assert_eq!(std::fs::read(&identity_path).unwrap(), identity);
+    assert_eq!(std::fs::read(&state_path).unwrap(), saved_state);
+    assert_eq!(std::fs::read(&blob_path).unwrap(), saved_blob);
+}

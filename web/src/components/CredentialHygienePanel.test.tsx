@@ -11,13 +11,32 @@ beforeEach(() => {
 
 describe('<CredentialHygienePanel>', () => {
   it('renders the clean state when no plaintext credentials are found', async () => {
-    mockWsClient.call.mockResolvedValue({ clean: true, count: 0, findings: [] });
+    mockWsClient.call.mockResolvedValue({ clean: true, count: 0, findings: [], entries: [] });
 
     renderWithProviders(<CredentialHygienePanel onGoToAccounts={() => {}} />);
 
-    expect(await screen.findByText('No plaintext credential residue found')).toBeInTheDocument();
+    expect(await screen.findByText('No plaintext credentials or residue in the checked scope')).toBeInTheDocument();
     // "Clean Up" stays disabled — nothing to act on.
     expect(screen.getByRole('button', { name: 'Clean Up' })).toBeDisabled();
+  });
+
+  it.each([{ source: 'legacy', residue: false }, { source: 'inline', residue: true }])('reports inventory plaintext or residue even when the shape scan is empty: $source', async ({ source, residue }) => {
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'security.credential_inventory'
+      ? { entries: [{ source, configured: true, residue, path: 'service.password' }] }
+      : { clean: true, count: 0, findings: [], entries: [] }));
+    renderWithProviders(<CredentialHygienePanel onGoToAccounts={() => {}} />);
+    expect(await screen.findByText(/The inventory has 1 plaintext item/)).toBeInTheDocument();
+    expect(screen.queryByText('No plaintext credentials or residue in the checked scope')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clean Up' })).toBeDisabled();
+  });
+
+  it('shows an error if the inventory cannot be read instead of claiming no plaintext', async () => {
+    mockWsClient.call.mockImplementation((method: string) => method === 'security.credential_inventory'
+      ? Promise.reject(new Error('inventory unavailable'))
+      : Promise.resolve({ clean: true, count: 0, findings: [] }));
+    renderWithProviders(<CredentialHygienePanel onGoToAccounts={() => {}} />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Credential hygiene scan failed');
+    expect(screen.queryByText('No plaintext credentials or residue in the checked scope')).not.toBeInTheDocument();
   });
 
   it('splits findings into cleanable (has an _enc twin) and manual-only rows', async () => {
@@ -32,7 +51,7 @@ describe('<CredentialHygienePanel>', () => {
           ],
         });
       }
-      return Promise.resolve({});
+      return Promise.resolve({ entries: [] });
     });
 
     renderWithProviders(<CredentialHygienePanel onGoToAccounts={() => {}} />);
@@ -55,7 +74,7 @@ describe('<CredentialHygienePanel>', () => {
       if (method === 'security.credential_hygiene') {
         return Promise.resolve(
           cleaned
-            ? { clean: true, count: 0, findings: [] }
+            ? { clean: true, count: 0, findings: [], entries: [] }
             : {
                 clean: false,
                 count: 1,
@@ -73,7 +92,7 @@ describe('<CredentialHygienePanel>', () => {
           backup_path: '/home/config.toml.bak.20260815T090000Z',
         });
       }
-      return Promise.resolve({});
+      return Promise.resolve({ entries: [] });
     });
 
     renderWithProviders(<CredentialHygienePanel onGoToAccounts={() => {}} />);
@@ -92,13 +111,13 @@ describe('<CredentialHygienePanel>', () => {
       expect(mockWsClient.call).toHaveBeenCalledWith('security.credential_cleanup'),
     );
     // The panel reloads the report after cleanup, flipping back to clean.
-    expect(await screen.findByText('No plaintext credential residue found')).toBeInTheDocument();
+    expect(await screen.findByText('No plaintext credentials or residue in the checked scope')).toBeInTheDocument();
   });
 
   it('the rotate-guidance link calls the onGoToAccounts callback', async () => {
     const user = userEvent.setup();
     const onGoToAccounts = vi.fn();
-    mockWsClient.call.mockResolvedValue({ clean: true, count: 0, findings: [] });
+    mockWsClient.call.mockResolvedValue({ clean: true, count: 0, findings: [], entries: [] });
 
     renderWithProviders(<CredentialHygienePanel onGoToAccounts={onGoToAccounts} />);
 

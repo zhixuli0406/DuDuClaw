@@ -291,6 +291,22 @@ fn a_future_capability_key_is_frozen_without_a_list_update() {
     }
 }
 
+#[test]
+fn recipient_policy_keys_are_frozen() {
+    for key in ["recipient_guard = 'ask'", "recipients = ['line:U123']"] {
+        let configured = BASE_WITH_CAPS.replace("[capabilities]\n", &format!("[capabilities]\n{key}\n"));
+        for (before, after) in [
+            (BASE_WITH_CAPS, configured.as_str()),
+            (configured.as_str(), BASE_WITH_CAPS),
+        ] {
+            assert!(matches!(
+                check_protected_toml_write(&agent_toml(), &home(), Some(before), after),
+                GuardDecision::BlockedProtectedField { .. }
+            ));
+        }
+    }
+}
+
 /// `[capabilities] action_rules` (2026-10) is frozen like every other
 /// capability key: an employee can neither add a rule list, nor loosen an
 /// existing one, nor rewrite a single verdict. This is why the key lives in

@@ -271,6 +271,12 @@ pub fn apply_agent_cli_env_allowlist(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// The same base environment for synchronous discovery probes.
+pub fn apply_agent_cli_env_allowlist_std(cmd: &mut std::process::Command) {
+    cmd.env_clear();
+    cmd.envs(agent_cli_spawn_env_pairs());
+}
+
 // ── WP-10A: per-agent git/SSH/GPG credential opt-in ──────────────────────
 
 /// Env var names carrying the operator's SSH/GPG identity, additionally
@@ -432,6 +438,7 @@ mod tests {
             "DASHSCOPE_API_KEY",
             "QWEN_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
             "DUDUCLAW_MCP_API_KEY",
         ] {
             assert!(
@@ -461,6 +468,40 @@ mod tests {
     // Serialize the few env-mutating tests so they don't race each other
     // (matches the idiom in `platform.rs::home_tests`).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_probe_allowlist_drops_messaging_token_for_sync_and_async_commands() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
+        let key = "CLAUDE_CODE_MESSAGING_TOKEN";
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, "discovery-fixture-value") };
+        let (sync_output, async_output) = runtime.block_on(async {
+            let mut sync = std::process::Command::new("/usr/bin/env");
+            apply_agent_cli_env_allowlist_std(&mut sync);
+            let sync_output = sync.output();
+
+            let mut asynchronous = tokio::process::Command::new("/usr/bin/env");
+            apply_agent_cli_env_allowlist(&mut asynchronous);
+            let async_output = asynchronous.output().await;
+
+            (sync_output, async_output)
+        });
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        for output in [sync_output.unwrap(), async_output.unwrap()] {
+            assert!(output.status.success());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(!stdout.contains(key));
+            assert!(!stdout.contains("discovery-fixture-value"));
+            assert!(stdout.lines().any(|line| line.starts_with("PATH=")));
+        }
+    }
 
     #[test]
     fn pairs_include_present_allowlisted_vars_and_skip_others() {

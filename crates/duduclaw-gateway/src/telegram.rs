@@ -544,9 +544,7 @@ enum TokenCheck {
 
 /// Register bot commands with Telegram.
 async fn register_commands(client: &reqwest::Client, api_base: &str) {
-    // Product attribution is fixed across messaging channels.
-    let product =
-        "DuDuClaw".to_string();
+    let product = crate::distributor_brand::product_name();
     let commands = json!({
         "commands": [
             { "command": "ask", "description": format!("向 {product} AI 提問") },
@@ -1064,7 +1062,7 @@ async fn process_telegram_message(
             Ok(text) => {
                 info!(
                     "🎙 Telegram [{sender}] transcribed: {}",
-                    truncate_bytes(&text, 80)
+                    truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80)
                 );
                 text
             }
@@ -1229,7 +1227,7 @@ async fn process_telegram_message(
 
     info!(
         "📩 Telegram [{sender}]: {}",
-        truncate_bytes(&input_text, 80)
+        truncate_bytes(&duduclaw_security::credential_detect::mask(&input_text), 80)
     );
 
     // ── Build session ID (topic-aware) ──
@@ -1811,7 +1809,7 @@ async fn handle_callback_query(
     let chat_id = msg.chat.id;
     let thread_id = msg.message_thread_id;
 
-    info!("🔘 Telegram [{sender}] pressed: {data}");
+    info!("🔘 Telegram [{sender}] pressed a callback button");
 
     // Decision buttons — every "a human must decide this" card, whichever
     // store backs it. `None` ⇒ not a decision button, fall through to this
@@ -1862,10 +1860,10 @@ async fn handle_callback_query(
         }
     }
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` above (see
-    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
-    // it needs no pressing-user identity, only the single-use nonce.
+    // Goal-intent confirmation buttons (P1) use a separate codec from
+    // `decision_action` above. Ordinary employees keep
+    // nonce-based confirmation; machine employees also require the pressing
+    // sender's verified Admin account.
     //
     // The outcome (`accept-as-goal`'s reply especially, and `plan-first`'s
     // narrative plan) can run well past Telegram's short callback-toast
@@ -1880,8 +1878,10 @@ async fn handle_callback_query(
         let ctx = ctx.clone();
         let client = client.clone();
         let api_base = api_base.to_string();
+        let sender = cb.from.as_ref().filter(|user| !user.is_bot)
+            .map(|user| user.id.to_string()).unwrap_or_default();
         tokio::spawn(async move {
-            let outcome = crate::goal_intent::handle_gintent_button(&ctx, choice, &nonce).await;
+            let outcome = crate::goal_intent::handle_gintent_button_for_sender(&ctx, choice, &nonce, "telegram", &sender).await;
             send_reply_markdown(
                 &client,
                 &api_base,
@@ -3188,7 +3188,7 @@ async fn send_message_once(
         error!(
             "Telegram send failed ({}): {}",
             status,
-            data.description.as_deref().unwrap_or("(no description)")
+            duduclaw_security::credential_detect::mask(data.description.as_deref().unwrap_or("(no description)"))
         );
         // Prefer Telegram's own `error_code` from the JSON body (the documented
         // API contract) and fall back to the transport-level HTTP status —
@@ -3483,7 +3483,7 @@ async fn send_reply_with_guard(
                     && !data.ok
                 {
                     let desc = data.description.unwrap_or_default();
-                    error!("Telegram send failed: {desc}");
+                    error!("Telegram send failed: {}", duduclaw_security::credential_detect::mask(&desc));
 
                     // Retry without reply_parameters if the referenced message
                     // is invalid (deleted, wrong chat, etc.)
@@ -3524,7 +3524,7 @@ async fn send_reply_with_guard(
                                 {
                                     error!(
                                         "Telegram retry also failed: {}",
-                                        d2.description.unwrap_or_default()
+                                        duduclaw_security::credential_detect::mask(&d2.description.unwrap_or_default())
                                     );
                                 }
                             }

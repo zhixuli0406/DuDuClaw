@@ -122,6 +122,19 @@ pub(crate) fn fold_session_runs(rows: &[RunMsgRow], now: chrono::DateTime<Utc>) 
     runs
 }
 
+/// Overlay an exact persisted failure, without guessing from fallback text.
+pub(crate) fn apply_channel_run_failures(home: &Path, runs: &mut [RunSummary]) {
+    let Some(store) = crate::run_steps::shared_store(home) else { return; };
+    for run in runs {
+        let Some((session, message)) = run.id.rsplit_once('#') else { continue; };
+        let Ok(message) = message.parse::<i64>() else { continue; };
+        if let Some(end) = store.channel_failure_end(session, message) {
+            run.status = "failed".into();
+            run.ended_at = Some(end);
+        }
+    }
+}
+
 /// One MCP tool-call receipt from `tool_calls.jsonl`.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallRow {

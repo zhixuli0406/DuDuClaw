@@ -110,6 +110,7 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("model.account_pool", &["adv.account_pool"], Change),
     key("budget.monthly_limit_cents", &["form.monthly_limit_cents"], Loosen),
     key("budget.daily_cap_cents", &["v.daily_cap_cents"], Loosen),
+    key("budget.when_unavailable", &["form.when_unavailable"], Loosen),
     key("budget.hard_stop", &["form.hard_stop"], Loosen),
     // Whose Google account the employee acts as (a colleague's mailbox).
     key("google", &["form.google."], GoogleNarrow),
@@ -142,6 +143,11 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         | "permissions.can_modify_own_skills"
         | "guardrails.block_secrets" => or(Value::Bool(true)),
         "model.account_pool" | "permissions.allowed_channels" => or(json!([])),
+        "budget.when_unavailable" => json!(match raw.as_str() {
+            None if raw.is_null() => "allow",
+            Some("allow") => "allow",
+            _ => "deny",
+        }),
         "budget.monthly_limit_cents" | "budget.daily_cap_cents" => or(json!(0)),
         "capabilities" => {
             let defaults = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
@@ -177,6 +183,9 @@ fn needs_admin(k: &AuthorityKey, before: &Value, after: &Value) -> bool {
     match k.kind {
         Change => true,
         RoleMain => (before.as_str() == Some("main")) != (after.as_str() == Some("main")),
+        Loosen if k.toml_key == "budget.when_unavailable" => {
+            before.as_str() == Some("deny") && after.as_str() == Some("allow")
+        }
         Loosen if k.toml_key == "budget.hard_stop" => {
             before.as_bool() == Some(true) && after.as_bool() != Some(true)
         }
@@ -291,6 +300,18 @@ mod tests {
         assert_eq!(keys(&base(2000, 100, true)), vec!["budget.monthly_limit_cents"]);
         assert_eq!(keys(&base(1000, 0, true)), vec!["budget.daily_cap_cents"], "0 removes the cap");
         assert_eq!(keys(&base(1000, 100, false)), vec!["budget.hard_stop"]);
+    }
+
+    #[test]
+    fn budget_unavailable_only_deny_to_allow_needs_admin() {
+        let policy = |value: &str| t(&format!("[budget]\nwhen_unavailable={value}\n"));
+        let deny = policy("'deny'");
+        let allow = policy("'allow'");
+        assert!(authority_diff(&allow, &deny).is_empty());
+        assert_eq!(authority_diff(&deny, &allow).into_iter().map(|c| c.key).collect::<Vec<_>>(), vec!["budget.when_unavailable"]);
+        assert_eq!(authority_diff(&deny, &t("")).len(), 1, "removing deny restores allow");
+        assert_eq!(authority_diff(&policy("'typo'"), &allow).len(), 1, "unknown is effectively deny");
+        assert!(authority_diff(&deny, &policy("42")).is_empty());
     }
 
     #[test]

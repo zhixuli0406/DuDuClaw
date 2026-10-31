@@ -163,6 +163,7 @@ pub mod cron_store;
 pub mod cron_templates;
 pub mod departments;
 pub mod distributor_notice;
+pub mod distributor_brand;
 pub mod distributor_store;
 mod image_data;
 pub mod license_runtime;
@@ -256,12 +257,15 @@ pub mod maintenance;
 pub mod mast;
 pub mod memory_factory;
 pub mod memory_forget_approval;
+pub mod memory_forget_apply;
+pub mod disconnect_forget;
 pub mod memory_forget_steps;
 pub mod memory_migrate;
 pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
 pub mod on_behalf_of;
+pub(crate) mod machine_employee;
 pub mod wiki_host_sources;
 // G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +
 // background poller → autopilot bus. Both transports default OFF.
@@ -387,6 +391,7 @@ pub(crate) mod autonomous_runtime;
 pub mod runtime;
 pub mod runtime_config;
 pub mod runtime_dispatch;
+mod runtime_turn;
 pub mod runtime_install;
 pub mod runtime_models;
 pub mod screenshot_audit;
@@ -624,10 +629,15 @@ pub mod product_policy;
 pub mod thinking;
 
 pub mod egress_guard;
+pub mod recipient_guard;
+pub mod turn_context;
 
 pub mod egress_client;
 
 pub mod egress_gate;
+pub mod egress_shadow;
+pub mod credential_ledger;
+pub mod credential_declaration;
 
 mod egress_registry;
 

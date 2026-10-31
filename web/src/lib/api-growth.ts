@@ -41,7 +41,7 @@ export interface Achievement {
   unlocked_at?: string | null;
 }
 
-/** `growth.snapshot` — company XP/level + the achievement wall. */
+/** `growth.snapshot` — saved XP/level for everyone; company details for Managers. */
 export interface GrowthSnapshot {
   xp: number;
   level: number;
@@ -49,8 +49,8 @@ export interface GrowthSnapshot {
   xp_into_level: number;
   /** XP span of the current level (`((level+1)² − level²)·100`). */
   xp_for_next_level: number;
-  facts: GrowthFacts;
-  achievements: Achievement[];
+  facts?: GrowthFacts;
+  achievements?: Achievement[];
 }
 
 /**
@@ -75,7 +75,7 @@ export interface DailyReport {
 }
 
 export const growthApi = {
-  /** Company XP/level + achievement wall. Any authed viewer may read. */
+  /** XP/level summary for any authed viewer; company details require Manager. */
   snapshot: () => client.call('growth.snapshot') as Promise<GrowthSnapshot>,
   /**
    * A day's settlement card. Pass `date` (YYYY-MM-DD) for a specific day;

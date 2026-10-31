@@ -1,3 +1,4 @@
+import { effectiveName } from '@/lib/product-identity';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -560,7 +561,7 @@ function LineQrDialog({ open, onClose }: { open: boolean; onClose: () => void })
     qr.addData(info.add_friend_url);
     qr.make();
     const svg = qr.createSvgTag({ scalable: true });
-    const title = escapeHtml(info.display_name ?? 'DuDuClaw AI');
+    const title = escapeHtml(info.display_name ?? `${effectiveName()} AI`);
     const scanLine = escapeHtml(intl.formatMessage({ id: 'channels.lineQr.posterScan' }));
     const idLine = escapeHtml(info.basic_id);
     const w = window.open('', '_blank', 'width=520,height=720');
@@ -579,7 +580,7 @@ function LineQrDialog({ open, onClose }: { open: boolean; onClose: () => void })
 </style></head><body>
 <h1>${title}</h1><div class="id">LINE ID：${idLine}</div>
 <div class="qr">${svg}</div><div class="scan">${scanLine}</div>
-<div class="brand">Powered by DuDuClaw</div>
+<div class="brand">Powered by ${escapeHtml(effectiveName())}</div>
 </body></html>`);
     w.document.close();
     w.focus();

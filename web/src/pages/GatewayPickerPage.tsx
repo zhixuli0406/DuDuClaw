@@ -4,7 +4,7 @@ import { Navigate } from 'react-router';
 import { Server, Wifi, RefreshCw, Plug, ArrowRight, AlertCircle, HardDrive } from 'lucide-react';
 import { Button, Card, CardContent, Input, Badge, Spinner } from '@/components/mds';
 import { toast } from '@/lib/toast';
-import { BrandMark } from '@/components/brand/BrandMark';
+import { ProductLogo } from '@/components/brand/ProductLogo';
 import {
   isTauri,
   isSwitchIntent,
@@ -259,7 +259,7 @@ export function GatewayPickerPage() {
       <div className="min-h-screen w-full bg-app-shell text-foreground">
         <div className="mx-auto flex min-h-screen max-w-2xl flex-col items-center justify-center gap-4 px-6">
           <div className="flex items-center gap-2 text-brand">
-            <BrandMark size={32} />
+            <ProductLogo size={32} />
             <span className="text-sm font-medium">{t('app.name')}</span>
           </div>
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -276,7 +276,7 @@ export function GatewayPickerPage() {
         {/* Header */}
         <header className="space-y-1.5">
           <div className="flex items-center gap-2 text-brand">
-            <BrandMark size={32} />
+            <ProductLogo size={32} />
             <span className="text-sm font-medium">{t('app.name')}</span>
           </div>
           <h1 className="text-2xl font-semibold tracking-tight">{t('gateway.title')}</h1>

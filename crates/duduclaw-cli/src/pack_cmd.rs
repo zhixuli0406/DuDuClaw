@@ -71,6 +71,9 @@ pub enum PackCommands {
         /// Preview the plan without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Digest shown by the Agent File preview; confirms that exact content.
+        #[arg(long)]
+        confirm_profile: Option<String>,
         /// Team packs: import under a `-imported` suffix on agent-id clashes.
         #[arg(long)]
         rename: bool,
@@ -120,6 +123,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
         PackCommands::Install {
             source,
             dry_run,
+            confirm_profile,
             rename,
             trust_hooks,
             attach_under,
@@ -140,6 +144,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
                 &source,
                 InstallOptions {
                     dry_run,
+                    confirm_profile,
                     rename,
                     trust_hooks,
                     attach_under,
@@ -171,6 +176,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InstallOptions {
     pub dry_run: bool,
+    pub confirm_profile: Option<String>,
     pub rename: bool,
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
@@ -202,7 +208,7 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
 }
 
 async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) -> Result<()> {
-    refuse_in_ai_session(&crate::ai_session_guard::markers())?;
+    refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
@@ -210,6 +216,7 @@ async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) ->
     let root = crate::expert::resolve_pack_root(&resolved.dir);
     let pipeline = crate::expert::PipelineOpts {
         dry_run: opts.dry_run,
+        confirm_profile: opts.confirm_profile.clone(),
         rename: opts.rename,
         trust_hooks: opts.trust_hooks,
         attach_under: opts.attach_under.clone(),
@@ -1139,36 +1146,9 @@ reports_to = "front"
 
     /// Every regular file under `root`, as (relative path, bytes), sorted.
     /// `experts/` is excluded: its `install.json` records a wall-clock
-    /// `installed_at`. Profile history and audit retain all content and metadata
-    /// except wall-clock timestamps (including the timestamp part of version IDs
-    /// and the audit chain derived from timestamped rows).
+    /// `installed_at`. Profile history and audit are validated before their
+    /// wall-clock timestamps, version IDs and derived audit chain are normalized.
     fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
-        fn stable_version(value: &str) -> &str {
-            value.split_once('-').map(|(_, hash)| hash).unwrap_or(value)
-        }
-        fn stable_jsonl(bytes: &[u8], history: bool) -> Vec<u8> {
-            let text = std::str::from_utf8(bytes).unwrap();
-            let mut out = String::new();
-            for line in text.lines() {
-                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
-                let object = row.as_object_mut().unwrap();
-                if history {
-                    object.remove("at");
-                } else {
-                    object.remove("timestamp");
-                    object.remove("_prev_hash");
-                }
-                let version = if history { row.get_mut("version_id") }
-                    else { row.get_mut("details").and_then(|d| d.get_mut("version_id")) };
-                if let Some(version) = version.and_then(|v| v.as_str().map(str::to_owned)) {
-                    if history { row["version_id"] = serde_json::json!(stable_version(&version)); }
-                    else { row["details"]["version_id"] = serde_json::json!(stable_version(&version)); }
-                }
-                out.push_str(&serde_json::to_string(&row).unwrap());
-                out.push('\n');
-            }
-            out.into_bytes()
-        }
         fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             let Ok(rd) = std::fs::read_dir(dir) else {
                 return;
@@ -1184,29 +1164,148 @@ reports_to = "front"
                 } else if ft.is_file()
                     && let Ok(rel) = p.strip_prefix(base)
                 {
-                    let mut rel = rel.to_string_lossy().replace('\\', "/");
+                    let rel = rel.to_string_lossy().replace('\\', "/");
                     if rel.starts_with("experts/") {
                         continue;
                     }
-                    let mut bytes = std::fs::read(&p).unwrap();
-                    if rel.starts_with("agent_file_history/") {
-                        if rel.ends_with("/index.jsonl") {
-                            bytes = stable_jsonl(&bytes, true);
-                        } else if rel.ends_with(".toml") {
-                            let (dir, file) = rel.rsplit_once('/').unwrap();
-                            rel = format!("{dir}/{}", stable_version(file));
-                        }
-                    } else if rel == "security_audit.jsonl" {
-                        bytes = stable_jsonl(&bytes, false);
-                    }
-                    out.push((rel, bytes));
+                    out.push((rel, std::fs::read(&p).unwrap()));
                 }
             }
         }
         let mut out = Vec::new();
         walk(root, root, &mut out);
         out.sort();
+        assert_eq!(
+            duduclaw_security::audit_chain::verify_chain(&root.join("security_audit.jsonl")).unwrap(),
+            duduclaw_security::audit_chain::ChainVerifyResult::Intact { lines_checked: 4 },
+        );
+        normalize_history_snapshot(&mut out);
+        out.sort();
         out
+    }
+
+    fn normalize_history_snapshot(files: &mut [(String, Vec<u8>)]) {
+        let mut version_paths = std::collections::BTreeMap::new();
+        let mut indexes = std::collections::BTreeMap::new();
+        let mut history_rows = std::collections::BTreeMap::new();
+        for (path, content) in files.iter().filter(|(path, _)| {
+            path.starts_with("agent_file_history/") && path.ends_with("/index.jsonl")
+        }) {
+            let dir = Path::new(path).parent().unwrap();
+            let mut normalized = String::new();
+            for (ordinal, line) in std::str::from_utf8(content).unwrap().lines().enumerate() {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                let version = row["version_id"].as_str().unwrap();
+                let (millis, short_hash) = version.split_once('-').unwrap();
+                let millis: i64 = millis.parse().unwrap();
+                let at = chrono::DateTime::parse_from_rfc3339(row["at"].as_str().unwrap()).unwrap();
+                assert_eq!(at.timestamp_millis(), millis, "history timestamp: {path}");
+                let key = row["file"].as_str().unwrap();
+                assert_eq!(dir.file_name().unwrap().to_str().unwrap(), key);
+                let ext = match key {
+                    "agent_toml" | "contract" => "toml",
+                    "soul" | "identity" | "instructions" | "user" => "md",
+                    _ => panic!("unexpected history slot: {key}"),
+                };
+                let body_path = dir.join(format!("{version}.{ext}")).to_string_lossy().replace('\\', "/");
+                let body = &files.iter().find(|(p, _)| p == &body_path)
+                    .unwrap_or_else(|| panic!("missing indexed history body: {body_path}")).1;
+                let hash = crate::expert::registry::sha256_hex(body);
+                assert_eq!(row["sha256"].as_str().unwrap(), hash, "history digest: {body_path}");
+                assert_eq!(short_hash, hash.chars().take(12).collect::<String>());
+                assert_eq!(row["size"].as_u64().unwrap(), body.len() as u64);
+                let stable_id = format!("version-{ordinal}-{short_hash}");
+                let agent = dir.parent().unwrap().file_name().unwrap().to_str().unwrap();
+                assert!(history_rows.insert(
+                    (agent.to_owned(), key.to_owned(), version.to_owned()),
+                    (stable_id.clone(), row.clone()),
+                ).is_none());
+                let stable_path = dir.join(format!("{stable_id}.{ext}")).to_string_lossy().replace('\\', "/");
+                assert!(version_paths.insert(body_path, stable_path).is_none(), "duplicate history version");
+                row["version_id"] = serde_json::json!(stable_id);
+                row["at"] = serde_json::json!("<wall-clock>");
+                normalized.push_str(&serde_json::to_string(&row).unwrap());
+                normalized.push('\n');
+            }
+            assert!(!normalized.is_empty(), "history index must contain a version");
+            indexes.insert(path.clone(), normalized.into_bytes());
+        }
+        for (path, content) in files.iter().filter(|(path, _)| {
+            path.starts_with("soul_hashes/") && path.ends_with(".established")
+        }) {
+            chrono::DateTime::parse_from_rfc3339(std::str::from_utf8(content).unwrap()).unwrap();
+            let agent = Path::new(path).file_stem().unwrap().to_str().unwrap();
+            let soul = &files.iter().find(|(path, _)| path == &format!("agents/{agent}/SOUL.md"))
+                .expect("baseline marker must name an installed SOUL").1;
+            let baseline = &files.iter().find(|(path, _)| path == &format!("soul_hashes/{agent}.hash"))
+                .expect("baseline marker must have its protected hash").1;
+            assert_eq!(std::str::from_utf8(baseline).unwrap(), crate::expert::registry::sha256_hex(soul));
+            indexes.insert(path.clone(), b"<wall-clock>".to_vec());
+        }
+        let audit = &files.iter().find(|(path, _)| path == "security_audit.jsonl")
+            .expect("import must write the security audit").1;
+        indexes.insert("security_audit.jsonl".into(), normalize_import_audit(audit, history_rows));
+        let mut soul_versions = std::collections::BTreeMap::<String, usize>::new();
+        for (path, content) in files {
+            if let Some(normalized) = indexes.remove(path) {
+                *content = normalized;
+            } else if path.starts_with("agent_file_history/") && !path.ends_with(".lock") {
+                *path = version_paths.remove(path)
+                    .unwrap_or_else(|| panic!("unindexed history body: {path}"));
+            } else if path.contains("/.soul_history/") {
+                let file = Path::new(path);
+                let stamp = file.file_name().unwrap().to_str().unwrap()
+                    .strip_prefix("SOUL_").unwrap().strip_suffix(".md").unwrap();
+                chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d_%H%M%S_%3f").unwrap();
+                let dir = file.parent().unwrap().to_string_lossy().replace('\\', "/");
+                let ordinal = soul_versions.entry(dir.clone()).or_default();
+                *path = format!("{dir}/SOUL_version-{ordinal}.md");
+                *ordinal += 1;
+            }
+        }
+        assert!(version_paths.is_empty() && indexes.is_empty());
+    }
+
+    fn normalize_import_audit(
+        audit: &[u8],
+        mut history: std::collections::BTreeMap<(String, String, String), (String, serde_json::Value)>,
+    ) -> Vec<u8> {
+        let mut raw_previous = duduclaw_security::audit_chain::genesis_hash();
+        let mut normalized_previous = raw_previous.clone();
+        let mut normalized = String::new();
+        for line in std::str::from_utf8(audit).unwrap().lines() {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["_prev_hash"].as_str().unwrap(), raw_previous);
+            raw_previous = crate::expert::registry::sha256_hex(line.as_bytes());
+            assert_eq!(row["event_type"], "agent_file_changed");
+            assert_eq!(row["severity"], "info");
+            let details = &row["details"];
+            assert_eq!(row["agent_id"], details["agent_id"]);
+            let key = (
+                row["agent_id"].as_str().unwrap().to_owned(),
+                details["file"].as_str().unwrap().to_owned(),
+                details["version_id"].as_str().unwrap().to_owned(),
+            );
+            let (stable_id, version) = history.remove(&key)
+                .unwrap_or_else(|| panic!("audit must reference exactly one recorded version: {key:?}"));
+            assert_eq!(details["after_sha"], version["sha256"]);
+            assert_eq!(details["size_after"], version["size"]);
+            for field in ["user_id", "source", "verdict", "reason_categories", "confirm_reason", "approval_id", "decided_by"] {
+                assert_eq!(details[field], version[field], "audit/history metadata: {field}");
+            }
+            let at = chrono::DateTime::parse_from_rfc3339(row["timestamp"].as_str().unwrap()).unwrap();
+            let recorded = chrono::DateTime::parse_from_rfc3339(version["at"].as_str().unwrap()).unwrap();
+            assert!(at >= recorded, "audit must follow the recorded version");
+            row["timestamp"] = serde_json::json!("<wall-clock>");
+            row["details"]["version_id"] = serde_json::json!(stable_id);
+            row["_prev_hash"] = serde_json::json!(normalized_previous);
+            let serialized = serde_json::to_string(&row).unwrap();
+            normalized_previous = crate::expert::registry::sha256_hex(serialized.as_bytes());
+            normalized.push_str(&serialized);
+            normalized.push('\n');
+        }
+        assert!(history.is_empty(), "every recorded import version needs its audit event");
+        normalized.into_bytes()
     }
 
     #[tokio::test]
@@ -1232,9 +1331,22 @@ reports_to = "front"
         .expect("legacy pipeline installs");
 
         let new_home = tempfile::tempdir().unwrap();
-        install_pack(new_home.path(), &src, InstallOptions::default())
+        let preview_report = tmp.path().join("preview.json");
+        install_pack(new_home.path(), &src, InstallOptions {
+            dry_run: true, report_json: Some(preview_report.clone()), ..Default::default()
+        })
+        .await
+        .expect("unified front door previews");
+        assert!(!new_home.path().join("agents").exists());
+        let preview: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(preview_report).unwrap(),
+        ).unwrap();
+        let confirmation = preview["details"]["profile_confirmation"].as_str().unwrap().to_owned();
+        install_pack(new_home.path(), &src, InstallOptions {
+            confirm_profile: Some(confirmation), ..Default::default()
+        })
             .await
-            .expect("unified front door installs");
+            .expect("unified front door installs the confirmed preview");
 
         let a = snapshot(old_home.path());
         let b = snapshot(new_home.path());
@@ -1242,14 +1354,22 @@ reports_to = "front"
         let names_a: Vec<&str> = a.iter().map(|(p, _)| p.as_str()).collect();
         let names_b: Vec<&str> = b.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(names_a, names_b, "the two routes must write the same files");
+        for agent in ["front", "helper"] {
+            for slot in ["soul", "agent_toml"] {
+                let index = format!("agent_file_history/{agent}/{slot}/index.jsonl");
+                assert!(names_a.contains(&index.as_str()), "missing history index: {index}");
+            }
+            let legacy = format!("agents/{agent}/.soul_history/SOUL_version-0.md");
+            assert!(names_a.contains(&legacy.as_str()), "missing SOUL backup: {legacy}");
+        }
         assert!(
             names_a.iter().any(|p| p.starts_with("agents/front/")),
             "sanity: the pack actually installed something: {names_a:?}"
         );
         for ((pa, ba), (_, bb)) in a.iter().zip(b.iter()) {
             assert_eq!(
-                String::from_utf8_lossy(ba),
-                String::from_utf8_lossy(bb),
+                ba,
+                bb,
                 "content differs for {pa}"
             );
         }
@@ -1355,11 +1475,18 @@ reports_to = "front"
 
 #[cfg(test)]
 mod ai_session_tests {
-    #[test]
-    fn pack_install_is_refused_inside_an_ai_session() {
-        assert!(super::refuse_in_ai_session(&[]).is_ok());
-        let err = super::refuse_in_ai_session(&["DUDUCLAW_AGENT_ID"]).unwrap_err();
-        assert!(format!("{err}").contains("AI 員工不能安裝"), "{err}");
+    #[tokio::test(flavor = "current_thread")]
+    async fn pack_install_is_refused_inside_an_ai_session() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("missing");
+        for &marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
+            let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
+            let err = super::install_pack(
+                &missing, missing.to_str().unwrap(), super::InstallOptions::default(),
+            ).await.unwrap_err();
+            assert_eq!(crate::expert::import_error::failure_of(&err).unwrap().code, "import.ai_session", "{marker}");
+            assert!(!missing.exists());
+        }
     }
 }
 }

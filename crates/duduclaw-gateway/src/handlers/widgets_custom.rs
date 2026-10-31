@@ -226,6 +226,9 @@ impl MethodHandler {
         let caps = crate::night_llm::night_capabilities();
         let model = crate::custom_widgets::GENERATE_MODEL;
 
+        if let Err(refusal) = crate::budget::gate_before_spawn(&self.home_dir, None, "", "widget_generate").await {
+            return WsFrame::error_response("", &refusal.to_string());
+        }
         let cli_err = match crate::autonomous_runtime::human_interactive(&self.home_dir,
             crate::channel_reply::call_claude_cli_rotated(
             &user,
@@ -258,6 +261,9 @@ impl MethodHandler {
             Err(e) => duduclaw_core::truncate_chars(&e, 200),
         };
 
+        if let Err(refusal) = crate::budget::gate_before_spawn(&self.home_dir, None, "", "widget_direct_fallback").await {
+            return WsFrame::error_response("", &refusal.to_string());
+        }
         let api_key = crate::claude_runner::get_api_key_from_home(&self.home_dir).await;
         if api_key.is_empty() {
             return WsFrame::error_response(

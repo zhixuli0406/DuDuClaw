@@ -66,6 +66,8 @@ pub enum SpawnOutcome {
     /// cross-branch aggregate pre-emption (it was the most-expensive in-flight
     /// branch when the combined live spend crossed the aggregate cap).
     BudgetExceeded,
+    /// Employee budget refused before execution; do not mark an account unhealthy.
+    BudgetRefused,
     /// Killed by an external `terminate_branch` request.
     Cancelled,
     /// Spawn or execution error.
@@ -362,7 +364,7 @@ impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
         } else { match out.outcome {
             SpawnOutcome::Failed => BranchState::Failed,
             SpawnOutcome::Cancelled => BranchState::Terminated,
-            SpawnOutcome::BudgetExceeded => BranchState::BudgetKilled,
+            SpawnOutcome::BudgetExceeded | SpawnOutcome::BudgetRefused => BranchState::BudgetKilled,
             SpawnOutcome::Completed => match charge {
                 // Completed but pushed the aggregate over its cap ⇒ exclude (fail-closed).
                 Charge::BranchExceeded | Charge::AggregateExceeded => BranchState::BudgetKilled,
@@ -371,9 +373,9 @@ impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
         }};
 
         let cost_cents = (out.spent_usd * 100.0).round().max(0.0) as u64;
-        self.provider
-            .report(&account.id, out.ok(), cost_cents)
-            .await;
+        if out.outcome != SpawnOutcome::BudgetRefused {
+            self.provider.report(&account.id, out.ok(), cost_cents).await;
+        }
 
         Ok(BranchResult {
             id: inv.branch_id,
@@ -938,7 +940,10 @@ pub async fn build_rotator_provider(home_dir: &Path) -> Option<Arc<RotatorProvid
 /// Spawns the real `claude` CLI for a branch. Best-effort: discovers the binary
 /// via `duduclaw_core::which_claude`, runs `claude -p` with stream-json output in
 /// the branch workspace, and extracts the final text + usage cost.
-pub struct ClaudeCliSpawner;
+pub struct ClaudeCliSpawner {
+    pub home_dir: std::path::PathBuf,
+    pub agent_id: String,
+}
 
 #[async_trait]
 impl CliSpawner for ClaudeCliSpawner {
@@ -951,6 +956,12 @@ impl CliSpawner for ClaudeCliSpawner {
     ) -> CliRunOutput {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
+        let agent_dir = duduclaw_gateway::budget::agent_dir_for_id(&self.home_dir, &self.agent_id);
+        if let Err(refusal) = duduclaw_gateway::budget::gate_before_spawn(
+            &self.home_dir, Some(&agent_dir), &self.agent_id, "fork",
+        ).await {
+            return CliRunOutput { output: refusal.to_string(), spent_usd: 0.0, outcome: SpawnOutcome::BudgetRefused };
+        }
         let bin = match duduclaw_core::which_claude() {
             Some(b) => b,
             None => {
@@ -2199,5 +2210,24 @@ mod tests {
         assert!(took_budget_kill(bid), "first take sees the budget tag");
         assert!(!took_budget_kill(bid), "tag is consumed exactly once");
         unregister_kill(bid);
+    }
+}
+
+#[cfg(test)]
+mod employee_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn budget_refuses_fork_before_discovering_claude_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "not valid [[[").unwrap();
+        let spawner = ClaudeCliSpawner { home_dir: home.path().to_path_buf(), agent_id: "a".into() };
+        let result = spawner.spawn(&SpawnCtx { branch_id: "b".into(), budget_usd: 1.0, aggregate: None },
+            "never execute", home.path(), &HashMap::new()).await;
+        assert_eq!(result.outcome, SpawnOutcome::BudgetRefused);
+        assert_eq!(result.spent_usd, 0.0);
+        assert!(result.output.contains("無法確認預算"));
     }
 }

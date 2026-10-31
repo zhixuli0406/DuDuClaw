@@ -280,6 +280,7 @@ const CAPABILITY_TOOL_LISTS: &[(&str, &str)] = &[
 const PROMPT_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
+    "USER.md",
     "INSTRUCTIONS.md",
     "CLAUDE.md",
     "AGENTS.md",

@@ -1,10 +1,13 @@
 import { create } from 'zustand';
-import { api, type AgentDetail, type AgentUpdateParams, type AgentHandoffParams, type AgentHandoffResult } from '@/lib/api';
+import { api, type AgentDetail, type AgentUpdateParams, type AgentHandoffParams, type AgentHandoffResult, type CallableAgent } from '@/lib/api';
+import { useAuthStore } from './auth-store';
 import { subscribeInvalidations } from '@/lib/live-events';
 import { useAgentAvatarStore } from './agent-avatar-store';
 
 interface AgentsStore {
   readonly agents: ReadonlyArray<AgentDetail>;
+  readonly teamAgents: ReadonlyArray<CallableAgent>;
+  readonly teamSubject: string;
   readonly selectedAgentId: string | null;
   readonly loading: boolean;
   /** WP4 — whether the roster currently includes archived AI staff. */
@@ -48,6 +51,8 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
 
   return {
     agents: [],
+    teamAgents: [],
+    teamSubject: '',
     selectedAgentId: null,
     loading: false,
     includeArchived: false,
@@ -57,11 +62,20 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
       const withArchived = includeArchived ?? get().includeArchived;
       set({ loading: true, error: null, includeArchived: withArchived });
       try {
-        const result = await api.agents.list({ include_archived: withArchived });
+        const user = useAuthStore.getState().user;
+        const subject = JSON.stringify([user?.id, user?.role]);
+        // Keep the detailed roster direct-only. Team grants carry display data only.
+        set({ teamAgents: [], teamSubject: subject });
+        const [result, callable] = await Promise.all([
+          api.agents.list({ include_archived: withArchived }),
+          user?.role === 'manager' ? api.agents.callable().catch(() => null) : Promise.resolve(null),
+        ]);
+        const current = useAuthStore.getState().user;
+        if (subject !== JSON.stringify([current?.id, current?.role])) return false;
         const agents = result?.agents ?? [];
         // Seed the avatar cache so uploaded images resolve everywhere.
         useAgentAvatarStore.getState().seed(agents);
-        set({ agents, loading: false, loaded: true });
+        set({ agents, teamAgents: callable?.agents.filter(a => a.via === 'team') ?? [], teamSubject: subject, loading: false, loaded: true });
         return true;
       } catch (e) {
         set({ error: e, loading: false, loaded: true });

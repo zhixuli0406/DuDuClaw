@@ -3,7 +3,7 @@
 > **Read this first**: DuDuClaw's supported path for Google Workspace is **native
 > tools** — Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks, all
 > eight services, all through the GA REST API, 19 MCP tools. See
-> [google-workspace.md](google-workspace.md). **You don't need to read this page
+> [google-setup.md](google-setup.md). **You don't need to read this page
 > for normal use.**
 >
 > The official remote MCP documented here is an **advanced option** with two hard
@@ -14,6 +14,10 @@
 > GCP project). Given that, the 2026-07-30 decision was: the product ships
 > entirely on native tools, and this mount is kept only for internal use and for
 > advanced users willing to enroll themselves.
+
+## Client requirement from 2026-11-11
+
+From 2026-11-11, Google's Workspace MCP servers reject clients that are not marked for an AI-powered agent. In Google Auth platform → Clients, create a separate client for this advanced MCP use and select “Use this client for an AI-powered agent”. REST-only applications are unaffected. DuDuClaw's native Google tools use REST. The requirement and Console paths use research checked 2026-10-30; Console screens were not re-verified live here.
 
 ## Coverage across the eight services
 
@@ -36,11 +40,11 @@ count is 19 total (including `google_status`).
 The "none official" verdict for Forms and Tasks is a verified fact, not a guess:
 `formsmcp.googleapis.com` / `tasksmcp.googleapis.com` both return 404 in practice, and
 Google's MCP documentation doesn't mention either service (not even as "coming soon").
-Separately, Google also offers Chat (`preset = "google:chat"`, usable) and People
+Separately, Google also offers Chat (`preset = "google:chat"`) and People
 (different endpoint naming, not included in a preset) — neither currently has a native
 tool equivalent.
 
-### Per-service tool list (from a live `tools/list` call)
+### Per-service tool list (historical 2026-07-30 `tools/list`, not re-verified)
 
 - **Gmail**: `search_threads` `get_thread` `get_message` `create_draft`
   `list_drafts` `list_labels` `create_label` `label_message` `unlabel_message`
@@ -122,7 +126,7 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 
 - Still preview stage; rate limits aren't publicly documented (check the GCP
   Console quota page).
-- OAuth is interactive-only — **no service account / headless authorization path**.
+- The normal OAuth flow needs browser consent. A remote or headless host can use the SSH tunnel in [Connect Google](google-setup.md#remote-host-or-docker). Native service-account delegation is supported; acceptance of delegated tokens by each official remote MCP service needs separate verification.
 - Gmail has no send-mail tool; the official reference page's tool count doesn't
   match the live endpoint (the reference lists 10, the endpoint actually has 13)
   — trust a live `tools/list` call over the docs.
@@ -135,3 +139,5 @@ Sources:
 [Gmail MCP reference](https://developers.google.com/workspace/gmail/api/reference/mcp),
 [Calendar MCP reference](https://developers.google.com/workspace/calendar/api/v3/reference/mcp),
 [Developer Preview Program](https://developers.google.com/workspace/preview).
+
+The `google:chat` preset does not add Chat authorization scopes. The native Workspace scope list does not include Chat; configure separate suitable authorization before using that mount. The Google Chat channel uses `chat.bot` and is a separate connection.

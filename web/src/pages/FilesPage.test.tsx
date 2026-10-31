@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 import { FilesPage } from './FilesPage';
 import { useAuthStore } from '@/stores/auth-store';
@@ -13,11 +14,12 @@ function jsonResponse(body: unknown) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // `manager` scope passes the roster through unfiltered (`useVisibleAgents`)
-  // while resolving straight to the first agent — `sales` — rather than the
-  // admin-only shared bucket, so every test below gets a deterministic,
-  // concrete `agent=sales` request without extra URL-state setup.
-  useAuthStore.setState({ user: { display_name: 'Boss', role: 'manager' } as never, jwt: null, bindings: [] });
+  // Scoped viewers need a direct binding; team visibility does not grant files.
+  useAuthStore.setState({
+    user: { id: 'u1', display_name: 'Boss', role: 'manager' } as never,
+    jwt: null,
+    bindings: [{ user_id: 'u1', agent_name: 'sales', access_level: 'owner', bound_at: '' }],
+  });
   useAgentsStore.setState({
     agents: AGENTS as never,
     loading: false,
@@ -115,11 +117,50 @@ describe('<FilesPage> — I-4 search / task / date filters', () => {
     expect(screen.getByText('Delivered by AI staff')).toBeInTheDocument();
   });
 
-  it('never calls fetch when no agent bucket is selectable yet', () => {
+  it('shows an empty state without fetching when the loaded roster has no selectable bucket', async () => {
+    useAuthStore.setState({ user: { id: 'u1', display_name: 'Alice', role: 'employee' } as never, bindings: [] });
     useAgentsStore.setState({ agents: [], loading: false, loaded: true, fetchAgents: vi.fn() } as never);
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     renderWithProviders(<FilesPage />);
+    expect(await screen.findByText('No files yet')).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('waits for the roster before resolving an empty view', async () => {
+    useAgentsStore.setState({ agents: [], loaded: false });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    renderWithProviders(<FilesPage />);
+    expect(screen.queryByText('No files yet')).not.toBeInTheDocument();
+
+    act(() => useAgentsStore.setState({ loaded: true }));
+    expect(await screen.findByText('No files yet')).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['owner', 'operator', 'viewer'] as const)('loads an employee’s directly bound files with %s access', async (access_level) => {
+    const user = userEvent.setup();
+    useAuthStore.setState({
+      user: { id: 'u1', display_name: 'Alice', role: 'employee' } as never,
+      jwt: 'employee-token',
+      bindings: [{ user_id: 'u1', agent_name: 'sales', access_level, bound_at: '' }],
+    });
+    useAgentsStore.setState({ agents: [...AGENTS, { ...AGENTS[0], name: 'private', display_name: 'Private worker' }] as never });
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      files: [{ name: 'employee.pdf', size: 1024, mtime: 0, origin: 'uploaded' }],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    renderWithProviders(<FilesPage />);
+
+    expect(await screen.findByText('employee.pdf')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith('/api/files?agent=sales', {
+      headers: { Authorization: 'Bearer employee-token' },
+    });
+    await user.click(screen.getByRole('combobox'));
+    expect(await screen.findByRole('option', { name: '業務小美' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Shared files' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Private worker' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

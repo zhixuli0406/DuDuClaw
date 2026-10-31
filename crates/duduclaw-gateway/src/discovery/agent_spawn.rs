@@ -474,7 +474,7 @@ impl AttemptRunner for ClaudeAttemptRunner {
         let model = match req.model.as_ref() {
             Some(model) if !model.trim().is_empty() => model.clone(),
             _ => {
-                let config = std::fs::read_to_string(self.home_dir.join("agents").join(&req.agent_id).join("agent.toml"))
+                let config = std::fs::read_to_string(crate::budget::agent_dir_for_id(&self.home_dir, &req.agent_id).join("agent.toml"))
                     .map_err(|e| AttemptInfraError::Spawn(e.to_string()))?;
                 config.parse::<toml::Table>().ok()
                     .and_then(|v| v.get("model")?.get("preferred")?.as_str().map(str::to_owned))
@@ -488,6 +488,9 @@ impl AttemptRunner for ClaudeAttemptRunner {
         let mut incurred = NodeCost { usd_source: CostSource::Reported, ..Default::default() };
         let mut last = String::new();
         for retry in 0..=2u32 {
+            let agent_dir = crate::budget::agent_dir_for_id(&self.home_dir, &req.agent_id);
+            crate::budget::gate_before_spawn(&self.home_dir, Some(&agent_dir), &req.agent_id, "discovery_native")
+                .await.map_err(|e| AttemptInfraError::Spawn(e.to_string()))?;
             if retry > 0 { seed.restore(&node)?; }
             read_guards.iter().try_for_each(super::workspace::IntegrityGuard::verify).map_err(|e| AttemptInfraError::Spawn(e.to_string()))?;
             let account = rotator.select_with_pool(&req.account_pool).await.ok_or(AttemptInfraError::NoAccount)?;
@@ -775,6 +778,9 @@ impl AttemptRunner for ContainerAttemptRunner {
         let mut rejected=std::collections::BTreeSet::new();
         let mut next=None;
         for retry in 0..=2 {
+            let agent_dir = crate::budget::agent_dir_for_id(&factory.home_dir, &req.agent_id);
+            crate::budget::gate_before_spawn(&factory.home_dir, Some(&agent_dir), &req.agent_id, "discovery_container")
+                .await.map_err(|e| AttemptInfraError::Spawn(e.to_string()))?;
             if retry>0 {seed.restore(&node)?;}
             read_guards.iter().try_for_each(super::workspace::IntegrityGuard::verify).map_err(|e|AttemptInfraError::Spawn(e.to_string()))?;
             let timeout=req.timeout.min(budget.remaining_wall());

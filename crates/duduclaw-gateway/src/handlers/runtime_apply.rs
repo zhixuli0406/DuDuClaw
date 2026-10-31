@@ -49,10 +49,16 @@ pub(crate) async fn detect_claude_oauth(claude_bin: Option<&str>) -> (bool, Opti
     let Some(bin) = claude_bin else {
         return (false, None);
     };
+    let mut cmd = duduclaw_core::platform::async_command_for(bin);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") { cmd.env("CLAUDE_CONFIG_DIR", dir); }
+    // This host-login probe intentionally accepts the configured setup token.
+    if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        if !token.trim().is_empty() { cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token); }
+    }
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        tokio::process::Command::new(bin)
-            .args(["auth", "status"])
+        cmd.args(["auth", "status"])
             .output(),
     )
     .await;

@@ -34,6 +34,11 @@ pub struct OperatorCommand {
     pub path: &'static [&'static str],
 }
 
+/// Offline egress recovery is denied to employees and unverified callers.
+pub const EGRESS_LEASE_COMMANDS: &[OperatorCommand] = &[
+    OperatorCommand { name: "duduclaw egress-leases", path: &["egress-leases"] },
+];
+
 /// The commands that issue an MCP key. A key is a credential for the MCP
 /// server with whatever scopes the command grants, so an AI employee must
 /// not mint one for itself: `mcp init` also refuses in an AI session
@@ -92,7 +97,7 @@ const MAX_PRINT_REPARSE_BYTES: usize = 64 * 1024;
 
 /// Only known shell command text is re-parsed, never Python/Node strings.
 /// `eval` joins its arguments with spaces before interpreting them.
-fn shell_payload(cmd: &str, args: &[String]) -> Option<String> {
+pub(super) fn shell_payload(cmd: &str, args: &[String]) -> Option<String> {
     if cmd == "eval" {
         return (!args.is_empty()).then(|| args.join(" "));
     }

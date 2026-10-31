@@ -2,7 +2,7 @@
 // out of UsersPage.tsx unchanged).
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api } from '@/lib/api';
+import { api, type UserAgentBinding } from '@/lib/api';
 import { bindChannelIdentity } from '@/lib/channel-identity-api';
 import {
   Button,
@@ -34,7 +34,7 @@ export function BindAgentDialog({
 }) {
   const intl = useIntl();
   const [agentName, setAgentName] = useState('');
-  const [accessLevel, setAccessLevel] = useState('owner');
+  const [accessLevel, setAccessLevel] = useState<UserAgentBinding['access_level']>('operator');
   const [agentOptions, setAgentOptions] = useState<Option[] | null>(null);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -53,7 +53,6 @@ export function BindAgentDialog({
             label: a.display_name && a.display_name !== a.name ? `${a.display_name} · ${a.name}` : a.name,
           }));
         setAgentOptions(options);
-        setAgentName((prev) => prev || options[0]?.value || '');
       })
       .catch(() => {
         // Roster fetch failed — fall back to the free-text input below.
@@ -97,7 +96,7 @@ export function BindAgentDialog({
             {agentOptions && agentOptions.length > 0 ? (
               <Select value={agentName} onValueChange={(v) => setAgentName(String(v))}>
                 <SelectTrigger className="w-full">
-                  <SelectValue>{agentOptions.find((o) => o.value === agentName)?.label ?? agentName}</SelectValue>
+                  <SelectValue>{agentOptions.find((o) => o.value === agentName)?.label ?? intl.formatMessage({ id: 'users.bind.chooseAgent' })}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   {agentOptions.map((o) => (
@@ -118,7 +117,9 @@ export function BindAgentDialog({
             )}
           </DialogField>
           <DialogField label={intl.formatMessage({ id: 'users.action.bind.accessLevel' })}>
-            <Select value={accessLevel} onValueChange={(v) => setAccessLevel(String(v))}>
+            <Select value={accessLevel} onValueChange={(v) => {
+              if (v === 'owner' || v === 'operator' || v === 'viewer') setAccessLevel(v);
+            }}>
               <SelectTrigger className="w-full">
                 <SelectValue>{accesses.find((a) => a.value === accessLevel)?.label}</SelectValue>
               </SelectTrigger>

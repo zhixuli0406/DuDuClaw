@@ -117,7 +117,7 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
     // 進階設定 is manager-visible, and so is what a manager may see under it.
     expect(screen.getByRole('link', { name: en['manage.advanced'] })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: en['manage.billing'] })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: en['manage.logs'] })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: en['manage.logs'] })).not.toBeInTheDocument();
   });
 
   it('hides enterprise-only items on the personal edition', () => {

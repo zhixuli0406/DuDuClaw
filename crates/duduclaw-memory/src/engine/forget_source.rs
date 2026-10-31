@@ -25,6 +25,8 @@ mod apply;
 mod body;
 mod body_aux;
 mod turns;
+mod connector;
+pub use connector::connector_plan_is_subset;
 
 /// `schema` of a plan document.
 pub const PLAN_SCHEMA: &str = "duduclaw.memory.forget_plan.v1";
@@ -102,6 +104,8 @@ impl ExternalInputs {
 /// The selector as frozen into the plan (watermark resolved).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FrozenSelector {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_ref: Option<String>,
     pub session: String,
     pub messages: Vec<String>,
     pub upto_seq: Option<i64>,
@@ -176,9 +180,15 @@ pub struct StepEntry {
     pub target: String,
 }
 
+fn is_zero(value: &u64) -> bool { *value == 0 }
+
 /// The recomputable part of a plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanBody {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub system_rows: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retained_shared: u64,
     pub tombstones: Vec<TombstoneEntry>,
     pub targets: Vec<TargetEntry>,
     pub reaffirm_only: Vec<ReaffirmOnlyEntry>,
@@ -187,6 +197,8 @@ pub struct PlanBody {
     pub collateral: Vec<CollateralEntry>,
     pub supersession_cuts: Vec<CutEntry>,
     pub entity_embeddings_orphaned: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphan_entity_ids: Vec<String>,
     pub untracked_in_namespace: u64,
     pub other_namespaces_referencing: u64,
     /// The `turn:` keys tombstoned because the forgotten messages (or the
@@ -235,6 +247,8 @@ impl PlanDocument {
     pub fn plan_hash(&self) -> Result<String> {
         let mut d = self.clone();
         d.body.untracked_in_namespace = 0;
+        d.body.system_rows = 0;
+        d.body.retained_shared = 0;
         d.body.other_namespaces_referencing = 0;
         Ok(crate::lineage::sha256_hex(d.canonical_json()?.as_bytes()))
     }
@@ -339,6 +353,7 @@ pub const PLAN_PART_NAMES: &[&str] = &[
     "collateral",
     "supersession_cuts",
     "entity_embeddings_orphaned",
+    "orphan_entity_ids",
     "wiki_pages",
     "review_cards_matching",
     "session_messages",
@@ -347,11 +362,15 @@ pub const PLAN_PART_NAMES: &[&str] = &[
 ];
 
 /// Counts of one successful apply.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyReport {
     pub plan_id: String,
     pub agent_id: String,
     pub plan_hash: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub system_rows: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retained_shared: u64,
     pub memories_deleted: u64,
     pub key_facts_deleted: u64,
     pub archive_deleted: u64,
@@ -435,6 +454,7 @@ impl ForgetSelector {
         messages.sort();
         if !messages.is_empty() {
             return Ok(FrozenSelector {
+                connector_ref: None,
                 session: session.to_string(),
                 messages,
                 upto_seq: None,
@@ -448,6 +468,7 @@ impl ForgetSelector {
         // observation time says nothing about whether they are new.
         if session.starts_with(crate::lineage::IMPORT_SESSION_PREFIX) {
             return Ok(FrozenSelector {
+                connector_ref: None,
                 session: session.to_string(),
                 messages,
                 upto_seq: None,
@@ -455,6 +476,7 @@ impl ForgetSelector {
             });
         }
         Ok(FrozenSelector {
+            connector_ref: None,
             session: session.to_string(),
             messages,
             upto_seq: self.upto_seq,
@@ -473,19 +495,39 @@ impl SqliteMemoryEngine {
         options: PlanOptions,
         external: &ExternalInputs,
     ) -> Result<PlanOutcome> {
-        if agent_id.trim().is_empty() {
-            return Err(err("plan_forget_source: empty namespace"));
+        self.plan_frozen(agent_id, selector.freeze(Utc::now())?, options, external, false).await
+    }
+
+    pub async fn plan_forget_connector(
+        &self,
+        agent_id: &str,
+        connector_ref: &str,
+        options: PlanOptions,
+    ) -> Result<PlanOutcome> {
+        if !crate::lineage::connectors::valid_ref(connector_ref)
+            || matches!(connector_ref, "unknown" | "none") {
+            return Err(err("invalid connector selector"));
         }
+        self.plan_frozen(agent_id, FrozenSelector {
+            connector_ref: Some(connector_ref.into()), session: String::new(),
+            messages: Vec::new(), upto_seq: None, upto_time: Some(format_ts(Utc::now())),
+        }, options, &ExternalInputs::default(), true).await
+    }
+
+    async fn plan_frozen(
+        &self, agent_id: &str, frozen: FrozenSelector, options: PlanOptions,
+        external: &ExternalInputs, connector: bool,
+    ) -> Result<PlanOutcome> {
+        if agent_id.trim().is_empty() { return Err(err("empty namespace")); }
         let now = Utc::now();
-        let frozen = selector.freeze(now)?;
         let max_rows = options
             .max_rows
             .unwrap_or(DEFAULT_MAX_ROWS)
             .clamp(1, HARD_MAX_ROWS);
         let ttl = options
             .ttl_minutes
-            .unwrap_or(DEFAULT_TTL_MINUTES)
-            .clamp(1, MAX_TTL_MINUTES);
+            .unwrap_or(if connector { 7 * 24 * 60 } else { DEFAULT_TTL_MINUTES })
+            .clamp(1, if connector { 7 * 24 * 60 } else { MAX_TTL_MINUTES });
         let external = external.canonical();
 
         let conn = self.conn.lock().await;
@@ -496,7 +538,7 @@ impl SqliteMemoryEngine {
                 body::Computation::Ok(c) => c,
                 body::Computation::TooLarge(reason) => return Ok(PlanOutcome::TooLarge { reason }),
             };
-            if computed.is_empty() {
+            if !connector && computed.is_empty() {
                 return Ok(PlanOutcome::NothingToForget {
                     untracked_in_namespace: computed.body.untracked_in_namespace,
                 });
@@ -699,6 +741,7 @@ impl SqliteMemoryEngine {
                 hash: s.content_hash.clone(),
                 role: crate::lineage::db::Role::Direct,
                 via: None,
+                connectors: Vec::new(),
             });
         }
         let conn = self.conn.lock().await;

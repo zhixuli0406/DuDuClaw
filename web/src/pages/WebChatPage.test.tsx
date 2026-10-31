@@ -11,10 +11,12 @@ import { render } from '@testing-library/react';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import en from '@/i18n/en.json';
+import { useBrandStore } from '@/stores/brand-store';
 import { stashChatAttachments } from '@/lib/chat-handoff';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useBrandStore.getState().setBrand(null);
   useChatStore.setState({
     messages: [],
     isStreaming: false,
@@ -27,6 +29,15 @@ beforeEach(() => {
 });
 
 describe('WebChatPage', () => {
+  it('uses the verified product name for the default partner header and heading', () => {
+    useBrandStore.getState().setBrand({ product_name: '晨光智能', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
+    useChatStore.setState({ selectedAgentId: null, agentName: 'DuDuClaw' });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByRole('heading', { name: '晨光智能' })).toBeInTheDocument();
+    expect(screen.getAllByText('晨光智能')).toHaveLength(2);
+    expect(screen.queryByText('DuDuClaw')).not.toBeInTheDocument();
+  });
+
   it('shows oversight notice only for the selected server-confirmed staff and removes it after refresh', async () => {
     useChatStore.setState({ selectedAgentId: 'sales', sessionId: null });
     useAgentsStore.setState({ loaded: true, agents: [{ name: 'sales', display_name: 'Sales', role: 'specialist', status: 'active' }] as never });

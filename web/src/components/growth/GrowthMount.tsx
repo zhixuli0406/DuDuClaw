@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSharedLeaderQuery } from '@/hooks/useSharedLeaderQuery';
 import { useGrowthStore, growthEventBus } from '@/stores/growth-store';
@@ -25,6 +26,8 @@ import { DailyReportCard } from './DailyReportCard';
 export function GrowthMount() {
   const intl = useIntl();
   const authed = useConnectionStore((s) => s.state === 'authenticated');
+  const user = useAuthStore((s) => s.user);
+  const authorityKey = JSON.stringify([authed, user?.id, user?.role, user?.status]);
   const applySnapshot = useGrowthStore((s) => s.applySnapshot);
   const setError = useGrowthStore((s) => s.setError);
   const setRetry = useGrowthStore((s) => s.setRetry);
@@ -34,17 +37,24 @@ export function GrowthMount() {
   // `/growth` sat on its skeleton forever with no hint that anything was wrong
   // (P05 Blocker, phase-4 audit — the "infinite spinner" case).
   const { data, error, refetch } = useSharedLeaderQuery<GrowthSnapshot>(
-    'growth.snapshot',
+    `growth.snapshot:${authorityKey}`,
     () => growthApi.snapshot(),
     60_000,
-    authed,
+    authed && !!user,
   );
 
+  // A full Manager response must never survive an identity/role switch.
   useEffect(() => {
-    if (data) applySnapshot(data);
-  }, [data, applySnapshot]);
+    useGrowthStore.setState({ snapshot: null, loaded: false, levelUpNonce: 0, error: null });
+    return () => { useGrowthStore.setState({ snapshot: null, loaded: false, levelUpNonce: 0, error: null }); };
+  }, [authorityKey]);
 
   useEffect(() => {
+    if (authed && user && data && !error) applySnapshot(data);
+  }, [data, error, applySnapshot, authorityKey, authed, user]);
+
+  useEffect(() => {
+    if (error) useGrowthStore.setState({ snapshot: null, loaded: false });
     setError(error ?? null);
   }, [error, setError]);
 

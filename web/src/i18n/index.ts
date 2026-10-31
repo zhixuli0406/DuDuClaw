@@ -11,6 +11,24 @@ export const messages: Record<string, Record<string, string>> = {
   'ja-JP': { ...en, ...jaJP },
 };
 
+/** Legal notices and privacy disclosures keep the software vendor's identity.
+ * Google privacy links are defined outside the catalogues and remain untouched.
+ */
+export const BRAND_EXCLUDED_PREFIXES = ['googleDataDisclosure.', 'subscriptionRisk.', 'license.nfr.', 'license.mode.', 'about.'];
+export const BRAND_EXCLUDED_IDS: string[] = [];
+
+export function brandedMessages(locale: string, productName?: string): Record<string, string> {
+  const catalogue = messages[locale] ?? messages[defaultLocale];
+  if (!productName || productName === 'DuDuClaw') return catalogue;
+  // Brand names are plain text, never ICU placeholders or rich-text syntax.
+  const literal = productName.replace(/'/g, "''").replace(/[{}]/g, (char) => "'" + char + "'");
+  return Object.fromEntries(Object.entries(catalogue).map(([id, value]) => [id,
+    BRAND_EXCLUDED_PREFIXES.some((prefix) => id.startsWith(prefix)) || BRAND_EXCLUDED_IDS.includes(id)
+      || /(?:copyright|trademark|著作權|商標|著作権|https?:\/\/)/iu.test(value)
+      ? value : value.replaceAll('DuDuClaw', () => literal),
+  ]));
+}
+
 /** Native-language labels for the language switcher. */
 export const localeNames: Record<string, string> = {
   'zh-TW': '繁體中文',

@@ -64,7 +64,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 57 | [UCCI Calibrated Cascade](57-ucci-calibrated-cascade.md) | Experimental, opt-in local-routing tier — an isotonic-calibrated router decides LocalFast→LocalStrong→cloud escalation from token-margin uncertainty instead of the legacy post-hoc confidence gate; fitted offline, off by default |
 | 58 | [Night Engine](58-night-engine.md) | Idle-window memory tidy-up: four sub-passes (two deterministic, two on the utility model), a per-pass spend cap and a daily circuit breaker, behind two separate opt-in switches; productive passes appear in Activity Feed |
 | 59 | [Local Proxy](59-local-proxy.md) | `duduclaw proxy` — an OpenAI-compatible localhost endpoint so Aider / Cline / Codex can borrow the account pool; Bearer-gated, loopback by default, honest about OAuth seats not being forwardable |
-| 60 | [Discovery](60-discovery.md) | Approved-workspace exploration, budgeted tree records, verified artifacts and zero-LLM held-out policy comparisons; integration validation in progress |
+| 60 | [Discovery](60-discovery.md) | Approved-workspace exploration, budgeted tree records, verified artifacts and zero-LLM held-out policy comparisons |
 | 61 | [Odoo website live chat](61-odoo-livechat.md) | AI employees answer Odoo Live Chat visitors as an operator; audience rules pick the employee per visitor; human takeover and handoff |
 | 62 | [Calling AI staff with `@`](62-calling-ai-staff.md) | Hand one message to another AI employee by `@name`, limited to the employees the sender may call; `@` list in WebChat, LINE and Telegram; one-shot call; mention-only groups |
 | 63 | [Document knowledge base](63-knowledge-base.md) | Collections of company documents with per-collection permissions (users, departments, AI employees, channels), sandboxed extraction, keyword search with page / row locations, read-only `knowledge_*` MCP tools, `duduclaw knowledge eval` |
@@ -74,6 +74,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 67 | [Assigning tasks from a chat](67-assigning-tasks.md) | `/交辦 @employee task` (`/assign`) creates a goal task on the sender's behalf, limited to employees they may assign to; progress back to the chat; `/交辦 狀態`; "Assigned by me" on the Goals page; the dashboard 交辦任務 page (`/assign`: hand over a skill, or the full form; attachments) |
 | 68 | [Read-only team conversations](68-manager-team-history.md) | Enterprise backend (v1.76.0): live reporting-line scope, full-text report WebChat, masked external transcripts, activation boundary, mandatory audit and limits; [繁體中文](zh-TW/68-manager-team-history.md) / [日本語](ja-JP/68-manager-team-history.md) |
 | 69 | [Outgoing data guard](69-egress-guard.md) | v1.77.0: per-turn MCP private-read tracking, outgoing approval and standing-grant limits; [繁體中文](zh-TW/69-egress-guard.md) / [日本語](ja-JP/69-egress-guard.md) |
+| 70 | [Conversation credential audit](70-credential-audit.md) | credential metadata, routing-based holders, masking and Admin review; [繁體中文](zh-TW/70-credential-audit.md) / [日本語](ja-JP/70-credential-audit.md) |
 
 ---
 

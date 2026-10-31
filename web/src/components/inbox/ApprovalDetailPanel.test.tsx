@@ -22,6 +22,26 @@ import { diffRows } from './AgentFileChangeFacts';
 import { client } from '@/lib/ws-client';
 import type { ApprovalItem } from '@/lib/api';
 
+describe('disconnect memory approval', () => {
+  it('shows per-employee counts and the completion boundary for a disconnect batch', () => {
+    const approval: ApprovalItem = {
+      id: 'disconnect-approval', agent_id: 'system', kind: 'memory_forget_source',
+      summary: 'Disconnected Company Google', created_at: new Date().toISOString(), ttl_seconds: 604800,
+      payload: {
+        origin: 'connector_disconnect',
+        counts_by_agent: [{ agent_id: 'assistant', memories: 7, key_facts: 3, archive: 2, unattributed: 11, system_kept: 5, retained_shared: 13 }],
+      },
+    };
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const counts = screen.getByTestId('disconnect-forget-counts');
+    expect(counts).toHaveTextContent('assistant');
+    expect(counts).toHaveTextContent('13 shared memories stay because another connected source also supplied them.');
+    expect(counts).toHaveTextContent('Memories: 7; key facts: 3; archive copies: 2; cannot attribute: 11; system rows kept: 5.');
+    expect(counts).toHaveTextContent('Out of scope: conversation text, tool_calls.jsonl, wiki and backups.');
+    expect(screen.getByText(/the receipt is created only when deletion finishes/)).toBeInTheDocument();
+  });
+});
+
 const SKILL_MD = 'name: my-skill\ndescription: does a thing\n\n# Body\nStep one.';
 
 function skillCreateApproval(payloadOverride?: Record<string, unknown>): ApprovalItem {
@@ -64,7 +84,7 @@ describe('<ApprovalDetailPanel> skill_create', () => {
     // Safety finding surfaces.
     expect(screen.getByText(/prefer explicit tools list/)).toBeInTheDocument();
     // Risk level badge.
-    expect(screen.getByText('Low')).toBeInTheDocument();
+    expect(screen.getByText('Low risk')).toBeInTheDocument();
     // Human display name.
     expect(screen.getByText('客服待辦整理')).toBeInTheDocument();
   });
@@ -108,7 +128,7 @@ describe('<ApprovalDetailPanel> generic (U2 redesign)', () => {
     renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} onApprove={vi.fn()} onReject={vi.fn()} />);
     // The full JSON payload is not force-read.
     expect(screen.queryByText(/"command": "rm \/tmp\/old.log"/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByText('Spot-check full details'));
+    fireEvent.click(screen.getByText(en['approval.spotCheck.toggle']));
     expect(screen.getByText(/"command": "rm \/tmp\/old.log"/)).toBeInTheDocument();
   });
 
@@ -128,7 +148,7 @@ describe('<ApprovalDetailPanel> generic (U2 redesign)', () => {
     fireEvent.click(screen.getByText('Approve'));
     expect(onApprove).not.toHaveBeenCalled();
     // Confirming in the dialog runs the approval exactly once.
-    fireEvent.click(screen.getByText('Confirm approve'));
+    fireEvent.click(screen.getByText(en['approval.confirm.approve']));
     expect(onApprove).toHaveBeenCalledTimes(1);
   });
 });
@@ -301,7 +321,7 @@ describe('<ApprovalDetailPanel> discovery (L7)', () => {
     // nodes per round = branches × (refinements + 1) = 2 × 2
     expect(screen.getByText(/Up to 4 candidates per round/)).toBeInTheDocument();
     // The raw spot-check expander stays.
-    expect(screen.getByRole('button', { name: /Spot-check full details/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: en['approval.spotCheck.toggle'] })).toBeInTheDocument();
   });
 
   it('renders payload strings as text, never markup', () => {
@@ -531,7 +551,7 @@ describe('<ApprovalDetailPanel> P7 bound tool-call approval', () => {
     renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
     const box = screen.getByTestId('action-grant');
     expect(box).toHaveTextContent('odoo_sale_confirm');
-    expect(box).toHaveTextContent('purchase');
+    expect(box).toHaveTextContent(en['agents.actionRules.effect.purchase']);
     expect(box).toHaveTextContent('order_id = 42');
     expect(box).toHaveTextContent('0123456789abcdef');
     expect(box).toHaveTextContent('Covers exactly this one call');
@@ -684,6 +704,36 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(screen.queryByTestId('approval-full-content')).not.toBeInTheDocument();
   });
 
+  it.each([false, true])('shows recipient and egress reasons on one card (egress=%s)', (hasPrivateRead) => {
+    const approval = genericApproval({
+      payload: {
+        name: 'send_message', arguments: { channel: 'line', chat_id: 'third-party', text: 'message' },
+        recipient_guard: { reason: 'outside_allowed_recipients' },
+        egress_guard: { reason: hasPrivateRead ? 'egress_guard' : 'recipient_guard', sources: hasPrivateRead ? ['mail_read'] : [] },
+        action_grant: { tool: 'send_message', effect: 'send', args_digest: 'abc123', args_summary: [] },
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getAllByTestId('action-grant')).toHaveLength(1);
+    const box = screen.getByTestId('action-grant');
+    expect(box).toHaveTextContent('The target is neither the source conversation nor on the allowed list');
+    if (hasPrivateRead) expect(box).toHaveTextContent('Private data was read during this turn');
+    else expect(box).not.toHaveTextContent('Private data was read during this turn');
+    expect(within(box).getByTestId('approval-full-content')).toHaveTextContent('third-party');
+  });
+
+  it('shows the nested recipient reason carried by workflow approvals', () => {
+    const approval = genericApproval({ payload: {
+      name: 'update_cron_task', arguments: { notify_channel: 'line', notify_chat_id: 'third-party' },
+      egress_guard: { reason: 'recipient_guard', sources: [], recipient_guard: { reason: 'outside_allowed_recipients' } },
+      action_grant: { tool: 'update_cron_task', effect: 'modify', args_digest: 'abc123', args_summary: [] },
+    } });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const box = screen.getByTestId('action-grant');
+    expect(box).toHaveTextContent('neither the source conversation nor on the allowed list');
+    expect(box).not.toHaveTextContent('Private data was read during this turn');
+  });
+
   it('shows both egress and matching action-rule reasons on one approval', () => {
     const approval = genericApproval({
       payload: {
@@ -749,5 +799,43 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(box).toHaveTextContent('mail_read');
     expect(box).toHaveTextContent('Private data was read during this turn');
     expect(box.querySelector('time')).toHaveAttribute('datetime', new Date(1793210400000).toISOString());
+  });
+});
+
+
+describe('<ApprovalDetailPanel> processed receipts', () => {
+  it.each(['approved', 'denied'] as const)('shows the %s outcome without decision buttons', (outcome) => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} processed outcome={outcome} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText(en[`inbox.status.${outcome}`])).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: en['inbox.approval.approve'] })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: en['inbox.approval.reject'] })).not.toBeInTheDocument();
+  });
+
+  it('also makes processed skill installation requests read-only', () => {
+    renderWithProviders(<ApprovalDetailPanel approval={skillCreateApproval()} processed outcome="approved" onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText(en['inbox.status.approved'])).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: en['inbox.skillCreate.approve'] })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: en['inbox.skillCreate.reject'] })).not.toBeInTheDocument();
+  });
+
+  it('treats a server-decided approval as read-only even without local processed state', () => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval({ status: 'denied' })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText(en['inbox.status.denied'])).toBeInTheDocument();
+    expect(screen.queryByTestId('approval-actions')).not.toBeInTheDocument();
+  });
+
+  it('keeps the action bar outside the scrolling evidence', () => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval()} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByTestId('approval-actions')).toHaveClass('shrink-0');
+    expect(screen.getByTestId('approval-actions').previousElementSibling).toHaveClass('overflow-y-auto');
+  });
+
+  it('does not expose an unknown internal approval kind', () => {
+    const kind = 'future_internal_kind' as ApprovalItem['kind'];
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval({ kind })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByText(kind)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: en['approval.spotCheck.toggle'] }));
+    expect(screen.queryByText(kind)).not.toBeInTheDocument();
+    expect(screen.getByText(en['approvals.kind.unknown'])).toBeInTheDocument();
   });
 });

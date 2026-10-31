@@ -363,7 +363,7 @@ pub(crate) fn agent_settings_json(raw: &toml::Table) -> Value {
         "capabilities": pick(
             raw,
             "capabilities",
-            &["approval_required_tools", "irreversible_tools", "maybe_irreversible_tools", "scoped_tools", "grant_ttl_secs", "action_rules", "trusted_read_hint_servers"],
+            &["approval_required_tools", "irreversible_tools", "maybe_irreversible_tools", "scoped_tools", "grant_ttl_secs", "action_rules", "trusted_read_hint_servers", "recipient_guard", "recipients"],
         ),
     })
 }

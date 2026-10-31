@@ -1,3 +1,4 @@
+import { useBrandStore } from '@/stores/brand-store';
 import {describe, it, expect, vi, beforeEach} from 'vitest';
 import {screen, waitFor} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -6,15 +7,18 @@ import {renderWithProviders} from '@/test/render';
 import {useConnectionStore} from '@/stores/connection-store';
 import {useAgentsStore} from '@/stores/agents-store';
 import {useSystemStore} from '@/stores/system-store';
+import {useAuthStore} from '@/stores/auth-store';
 import {LicenseShell} from './LicenseShell';
 import {api} from '@/lib/api';
 import {SoftLimitBanner} from '@/components/SoftLimitBanner';
 
 beforeEach(() => {
+    useBrandStore.getState().setBrand(null);
   vi.clearAllMocks();
   useConnectionStore.setState({state: 'authenticated'});
   useAgentsStore.setState({agents: []});
   useSystemStore.setState({status: null});
+  useAuthStore.setState({user: {id: 'admin', display_name: 'Admin', role: 'admin'} as never, bindings: []});
   mockWsClient.call.mockImplementation(async (method: string) => {
     if (method === 'license.status') return {tier: 'open_source', mode: 'opensource', installed: false};
     if (method === 'license.fingerprint') return {fingerprint: 'machine-123'};
@@ -25,7 +29,7 @@ beforeEach(() => {
 });
 
 describe('license management without direct sales', () => {
-  it('keeps license activation and the general distributor contact, without sales or branding controls', async () => {
+  it('keeps license activation and the general distributor contact, without sales or customer-side branding controls', async () => {
     const user = userEvent.setup();
     renderWithProviders(<LicenseShell />);
     await screen.findByText('machine-123');

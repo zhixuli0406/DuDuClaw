@@ -180,6 +180,7 @@ pub struct Enabled {
 
 /// The unwrapped protected key. Only obtainable inside the gateway process.
 pub struct ProtectedKey {
+    level: ProtectionLevel,
     key: Zeroizing<[u8; KEY_LEN]>,
     key_id: String,
 }
@@ -191,6 +192,25 @@ impl fmt::Debug for ProtectedKey {
 }
 
 impl ProtectedKey {
+    /// Domain-separated HMAC for high-entropy chat credentials. The protected
+    /// root key and the derived ledger key never leave this type.
+    pub fn credential_fingerprint(&self, kind: &str, value: &[u8]) -> Option<String> {
+        if self.level != ProtectionLevel::AppBound {
+            return None;
+        }
+        let value_text = std::str::from_utf8(value).ok()?;
+        if !crate::credential_detect::strict_structure(kind, value_text) {
+            return None;
+        }
+        use ring::hmac;
+        let root = hmac::Key::new(hmac::HMAC_SHA256, self.key.as_ref());
+        let derived = hmac::sign(&root, b"duduclaw/chat-credential-ledger/v1");
+        let ledger = hmac::Key::new(hmac::HMAC_SHA256, derived.as_ref());
+        let digest = hmac::sign(&ledger, value);
+        let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        Some(format!("{}:{hex}", self.key_id))
+    }
+
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
@@ -444,7 +464,16 @@ impl CredentialProtection {
         let key = self
             .load_verified(&m)
             .map_err(|(state, extra)| ProtectionError::from_state(state, &extra))?;
-        Ok(ProtectedKey { key: key.key, key_id: key.key_id })
+        Ok(ProtectedKey { level: self.store.level(), key: key.key, key_id: key.key_id })
+    }
+
+    /// Ledger fingerprints require an application-bound key. User stores can
+    /// be read by another process of the same OS user and are not sufficient.
+    pub fn load_key_for_credential_fingerprint(&self) -> Result<ProtectedKey, ProtectionError> {
+        if self.store.level() != ProtectionLevel::AppBound {
+            return Err(ProtectionError::new("level_too_low", "憑證指紋需要應用程式綁定的保護金鑰"));
+        }
+        self.load_key_for_gateway()
     }
 
     /// The single check B2a/B2b call before using a person's credentials.
@@ -530,4 +559,46 @@ pub fn credential_protection_level(home: &Path) -> ProtectionStatus {
 /// The single gate for person identities (B2a/B2b), on this platform's store.
 pub fn person_identity_gate(home: &Path) -> Result<ProtectedKey, ProtectionError> {
     CredentialProtection::platform(home).person_identity_gate()
+}
+
+#[cfg(test)]
+mod ledger_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn low_entropy_kinds_refuse_even_with_a_protected_key() {
+        let key = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+        for kind in ["password", "connection_string", "other", "cookie"] {
+            assert!(key.credential_fingerprint(kind, &[b'x'; 80]).is_none());
+        }
+    }
+
+    #[test]
+    fn high_entropy_fingerprints_are_keyed_stable_and_domain_separated() {
+        let first = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+        let second = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new([8; KEY_LEN]), key_id: "fixture".into() };
+        let value = format!("sk-{}", "x".repeat(40)).into_bytes();
+        let digest = first.credential_fingerprint("api_key", &value).unwrap();
+        assert_eq!(Some(digest.clone()), first.credential_fingerprint("api_key", &value));
+        assert_ne!(Some(digest.clone()), second.credential_fingerprint("api_key", &value));
+        let raw = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; KEY_LEN]), &value);
+        let raw: String = raw.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(digest, format!("fixture:{raw}"));
+    }
+}
+
+// Security review regressions: written but not run (owner prohibits builds).
+#[cfg(test)]
+mod fingerprint_protection_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprints_require_app_bound_protection_even_for_provider_shapes() {
+        let value = format!("sk-{}", "x".repeat(40));
+        for level in [ProtectionLevel::File, ProtectionLevel::UserStore, ProtectionLevel::AppBound] {
+            let key = ProtectedKey { level, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+            assert_eq!(key.credential_fingerprint("api_key", value.as_bytes()).is_some(), level == ProtectionLevel::AppBound);
+            assert!(key.credential_fingerprint("api_key", "guessable".repeat(8).as_bytes()).is_none());
+        }
+    }
 }

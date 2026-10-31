@@ -13,6 +13,7 @@ import {
   Settings,
   Shirt,
   Upload,
+  Download,
   Trash2,
   MoreHorizontal,
   Cpu,
@@ -65,6 +66,9 @@ import {
 import { StatusIcon } from '@/components/ui';
 import { agentTaskStats, isLiveState, type AgentTaskStats } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
+import { ExportProfileDialog } from '@/components/agent/ExportProfileDialog';
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
 import { ComputerSessionPanel } from '@/components/agent/ComputerSessionPanel';
 import { AgentFilesTab } from '@/pages/agent-files/AgentFilesTab';
@@ -120,6 +124,18 @@ function actorStatus(status: string, archived: boolean, live: boolean): ActorSta
  */
 export function AgentDetailPage() {
   const intl = useIntl();
+  const { id } = useParams();
+  const user = useAuthStore(s => s.user);
+  const bindings = useAuthStore(s => s.bindings);
+  // Team access is display-only; do not mount editors or memory loaders.
+  if (user?.role === 'manager' && !bindings.some(b => b.agent_name === id)) {
+    return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
+  }
+  return <AgentDetailPageContent />;
+}
+
+function AgentDetailPageContent() {
+  const intl = useIntl();
   const navigate = useNavigate();
   const openAssign = useOpenAssign();
   const params = useParams();
@@ -150,6 +166,8 @@ export function AgentDetailPage() {
   const [busy, setBusy] = useState(false);
   const [showOffboard, setShowOffboard] = useState(false);
   const [showWardrobe, setShowWardrobe] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const canExport = hasMinRole(useAuthStore((s) => s.user?.role), 'manager');
   const [avatarBusy, setAvatarBusy] = useState(false);
   const avatarFileRef = useRef<HTMLInputElement>(null);
 
@@ -489,6 +507,12 @@ export function AgentDetailPage() {
                       {intl.formatMessage({ id: 'agents.avatar.remove' })}
                     </DropdownMenuItem>
                   )}
+                  {canExport && (
+                    <DropdownMenuItem onClick={() => setShowExport(true)}>
+                      <Download />
+                      {intl.formatMessage({ id: 'agentProfile.export.title' })}
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => navigate(`/agents/${encodeURIComponent(id)}/edit`)}>
                     <Settings />
@@ -625,6 +649,7 @@ export function AgentDetailPage() {
         }}
       />
 
+      {showExport && <ExportProfileDialog agentId={id} onClose={() => setShowExport(false)} />}
       {showWardrobe && (
         <WardrobeDialog
           agentId={detail.name}

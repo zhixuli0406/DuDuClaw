@@ -9,6 +9,20 @@
 目標費用與重複呼叫防護目前在「設定檔進階編輯」設定，沒有獨立的自動化控制項。`config.toml [goal_loop]` 的 `default_cost_cap_cents = 0` 是未設定個別上限的目標所使用的美分上限（`0`＝不限額）；`tool_streak_pause = 8` 表示一輪結束後，相同工具與參數連續呼叫達此次數就暫停（`0`＝關閉）。透過進階編輯器儲存會重新載入目標迴圈；直接修改 `config.toml` 則需重新啟動 gateway。`tool_streak_advisory` 另行控制既有提醒。個別上限可在交辦目標時填寫；`/goals` 顯示費用，並讓有權限的操作者提高暫停目標的上限後重試。
 
 
+## 帳號角色與可見的 AI 員工
+
+給 AI 員工 Bash 或機器操作工具，就代表綁定者可以指揮它使用這些工具。綁定前請先確認這位員工能做什麼，只授權給合適的人；管理員仍可授予一般 AI 員工原生工具。
+
+使用 `system-operator` 預設組的員工只供管理員使用，伺服器會檢查解析後的預設組綁定。非管理員不能綁定、聊天、建立交辦任務或目標，也不能以自己的身分派工給它；`agents.callable` 不會列出它。既有綁定保留，但使用時拒絕。非管理員即使保留 `system-operator` 員工的舊綁定或團隊授權，也讀不到它的對話紀錄、任務、記憶、檔案、自有知識集合與匯出，也收不到即時更新、執行步驟或審批卡片；綁定紀錄保留。非管理員先前建立的交辦排程不再為這位員工建立任務或目標，觸發時自動暫停，恢復時會拒絕。外送審批卡片（CLI 內建工具與 MCP 工具都算）僅供管理員查看，主管不再看到遮罩後的卡片。通道與 Mini App 僅顯示純文字通知，不再顯示外送審批卡片、摘要或操作按鈕。管理員與已授權的無人值守工作維持原有行為。Personal 只有在帳號資料庫不存在、沒有帳號，或僅有一個已完成首次密碼變更的啟用中 Admin 帳號時才適用單一擁有者豁免；停權與離職帳號也計入總數。多帳號部署即使因付費授權到期而回到 Personal，仍須有效管理員身分；帳號資料庫無法讀取時也一樣。
+
+一般員工帳號只看自己直接綁定的 AI 員工。主管也能在側欄、AI 員工清單、時間軸與執行紀錄看到部屬綁定的 AI 員工，並標示為團隊成員的 AI 員工。這些團隊項目只能查看：時間軸顯示工作卡片與時間，執行紀錄顯示狀態與時間，不含對話內容或工具步驟。經由部屬取得的權限不能開啟記憶、員工設定或人格檔案；最高仍是 Operator。直接綁定沿用原有等級，組織入口的人數門檻會合計直接綁定與團隊員工。
+
+在「管理 → 成員」可以逐一查看每個帳號直接綁定的 AI 員工、權限等級，並移除綁定。新增時必須自行選擇 AI 員工，不會預選第一位；預設權限是 Operator。`users.bind_agent` 未填 `access_level` 時也使用 Operator。既有綁定不會自動更動，請在此檢查並移除不該保留的權限。解除綁定後，下一次 RPC 或檔案請求立即採用新權限；舊 token 的下載與預覽連結也一樣。
+
+共享 Wiki 依成員設定中的帳號部門判斷（`users.db` 的 `users.department`）。非管理員可讀公司頁面，以及自己部門的頁面，也必須符合 `visible_to_departments` 限制；未設定部門的帳號只能讀公司頁面。清單、搜尋、頁面內容、統計與匯出都使用相同規則。讀不到權限或可見範圍設定損壞時拒絕讀取。管理員仍可讀全部公司頁面。分享頁面仍需要來源 AI 員工的 Owner 綁定或管理員權限。
+
+公司用量（`billing.usage`）與每日成長報告需要主管權限。小工具生成與模型刷新會使用模型額度或連線到服務商，也需要主管權限。例行工作與系統日誌需要管理員。報表與首頁的費用區塊、專家頁的上傳安裝按鈕只對管理員顯示；其他角色不會載入這些受限內容。
+
 ## Codex CLI 更新
 
 在 macOS 與 Linux，一般員工以 WorkspaceWrite 權限執行時需要 Codex CLI 0.164.0 以上。已安裝版本過舊或無法確認時，Admin 會在儀表板各頁上方看到目前版本與「**更新 Codex CLI**」按鈕。按下後會在閘道主機執行 `npm install -g @openai/codex` 並顯示進度。確認更新成功後，提示會消失，不必重啟閘道。
@@ -140,6 +154,7 @@ max_global_turns = 10
 | 分頁 → 區塊 | 設定鍵 |
 |---|---|
 | 預算 → 每日上限 | `[budget] daily_cap_cents` |
+| 預算 → 費用資料讀不到時 | `[budget] when_unavailable`（`allow` / `deny`） |
 | 技能 → 這位員工的技能（v1.76.0） | 不是設定鍵：開關存在 `<home>/skill_state/<agent_id>.json`（`skills.set_enabled`），移除的技能搬到 `<home>/skill_archive/<agent_id>/`（`skills.remove`／`skills.restore`）；需員工負責人或管理員。見[技能庫頁面](../../features/zh-TW/15-skill-lifecycle.md) |
 | 工具與權限 → 需要把關的工具（一律等人核可、視為不可逆、先由判官判斷、需任務授權） | `[capabilities] approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`scoped_tools` |
 | 工具與權限 → 平行分支 | `[fork] enabled` |
@@ -157,6 +172,8 @@ max_global_turns = 10
 | 自動化 → 記憶 → 決策延續、決定保留天數 | `[memory] decision_continuity`、`decision_ttl_days`（1 到 3650） |
 | 進階 → 模型進階 → 進階鍵值 | 任意 `[區段] 鍵`，每列帶型別（字串、整數、小數、布林、字串陣列）；寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。`agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime`、`prompt`、`os_watch`、`budget` 區段不能在這裡改（v1.76.0：新增 `prompt`、`os_watch`、`budget`，裡面有只限管理員的設定，例如 `prompt.cli_bare_mode`，管理員改用設定檔進階編輯修改） |
 
+**員工預算。** `[budget] daily_cap_cents` 與 `monthly_limit_cents` 分別比對最近 24 小時與 30 天的已記錄花費，`hard_stop = true` 時達上限就拒絕下一次模型呼叫；0 代表不限額，執行中的呼叫仍可能超過上限。檢查涵蓋 Claude 與其他員工後端、派工與排程、提醒、郵件、心跳、輔助工作及 CLI 分支／評測。短期員工的已記錄花費也算進父員工，先以千分之一美分加總，再換算美分。員工設定檔可讀時，`[budget] when_unavailable = "allow"`（未填時的預設值）會在費用資料庫或查詢讀不到時留下明確警告與稽核紀錄並繼續；設成 `"deny"` 則在模型呼叫前拒絕。設定檔本身讀不到或無法解析時，無法確認這項政策，一律拒絕。未知政策值按 `"deny"` 處理並警告。無法檢查會顯示自己的原因與稽核事件，不會說成「花費達上限」，也不會發出斷路器開關通知。預算拒絕不觸發帳號輪替或備援。沒有員工 id 的呼叫不適用此政策。 指定員工目錄的輔助呼叫，以有效設定的 `[agent].name` 檢查預算並記錄後續花費，即使呼叫端原本使用作業名稱。舊有只記在作業名稱下的費用，無法可靠回填到各員工。
+
 單次執行時間上限與容器任務的逾時設定分開儲存。伺服器會拒絕非整數或超出 30～3600 秒的值；手動編輯檔案時，超出範圍的整數會調整到界線，型別錯誤則用預設值，兩者都會記錄警告。OpenAI 相容 API 員工需要在 `utility` 或 `preferred` 指定模型；Codex 可使用 CLI 預設模型；Grok 與通用 CLI 員工改用全域背景設定。輔助模型與 runtime 的廠商家族不符時，畫面會提醒對話壓縮、事實擷取等背景工作將失敗。
 
 提高 `timeout_secs` 的實際上限需要管理員。員工擁有者可降低上限；清空設定會還原為 300 秒，若因此高於目前上限，同樣需要管理員。
@@ -165,7 +182,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。既有評審上層可依降級策略，不帶不支援的指定重試，仍須遵守相同模式。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](../../features/zh-TW/05-security-defense.md)。
 
-**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）與（v1.76.0）`[permissions] allowed_channels`，`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（v1.76.0）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
+**只限管理員的欄位。** `[agent] reports_to`、`department`、`name`，整個 `[capabilities]`，`[container] sandbox_enabled`、`network_access`、`readonly_project`，`[permissions]` 的五個旗標（`can_modify_own_soul`、`can_create_agents`、`can_send_cross_agent`、`can_schedule_tasks`、`can_modify_own_skills`）與（v1.76.0）`[permissions] allowed_channels`，`[guardrails] enabled` 與 `block_secrets`，`[channels] public_trigger`（v1.76），以及（v1.76.0）各員工自己的 bot token `[channels.discord]`、`[channels.telegram]`、`[channels.slack]`、`[channels.googlechat]`、整個 `[odoo]`、`[runtime] provider` 與 `fallback`、`[prompt] cli_bare_mode`、整個 `[os_watch]`、`[model] account_pool`、設成或取消 `role = "main"`，還有放寬預算：調高 `monthly_limit_cents` 或 `daily_cap_cents`、拿掉上限（0 代表不限）、關閉 `hard_stop`，或把 `when_unavailable` 從 `deny` 改成 `allow`。員工的負責人仍可以新增或調低上限、打開 `hard_stop`。非管理員送出改動會被拒絕，管理員改動成功後寫稽核事件 `agent_authority_changed`，被拒絕的嘗試寫 `agent_authority_refused`。換模型會自動切換執行環境時，非管理員會看到說明。`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。`agents.inspect` 以 `admin_only_fields` 回傳對應的表單欄位，編輯頁對非管理員停用這些欄位。
 
 **誰能存檔（v1.76.0，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔v1760)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
@@ -253,19 +270,22 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 ## 設定檔（v1.76.0）
 
-RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`；員工編輯頁的「行為界線」也走同一套（`contract.update`）。檔案：人格設定（`SOUL.md`）、自我介紹（`IDENTITY.md`）、工作規則（`INSTRUCTIONS.md`）、行為界線（`CONTRACT.toml`）、基本設定（`agent.toml`，這裡只能看，機密遮蔽；要改請到編輯頁，管理員也可用設定檔進階編輯），以及這位員工自己的技能（`SKILLS/` 底下已經存在的 `.md`，檔案代號 `skill:<路徑>`，例如 `skill:quote/SKILL.md`）。技能在這裡只能修改，不能新增或刪除（新增請用自建技能流程），旁邊的程式檔不會被碰到；路徑每一層都必須是單一名稱、不能有 `..`、不能有看不見的字元（零寬、方向控制等）、最多四層；捷徑（symlink）與硬連結一律拒絕，存檔時在檔案鎖內確認資料夾沒有被換掉才寫入（鎖檔放在員工資料夾外）。其他寫技能檔的途徑（自建技能、員工自己的技能工具、技能畢業）不經過這裡，沒有版本紀錄，也不拿同一把鎖。上限：Markdown 與技能每檔 64 KB，`CONTRACT.toml` 32 KB，`must_not` 與 `must_always` 各最多 100 條、每條最多 500 字。
+RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pending_get`；員工編輯頁的「行為界線」也走同一套（`contract.update`）。檔案：人格設定（`SOUL.md`）、自我介紹（`IDENTITY.md`）、服務對象（`USER.md`，key `user`，最多 4,000 個 Unicode 字元）、工作規則（`INSTRUCTIONS.md`）、行為界線（`CONTRACT.toml`）、基本設定（`agent.toml`，這裡只能看，機密遮蔽；要改請到編輯頁，管理員也可用設定檔進階編輯），以及這位員工自己的技能（`SKILLS/` 底下已經存在的 `.md`，檔案代號 `skill:<路徑>`，例如 `skill:quote/SKILL.md`）。技能在這裡只能修改，不能新增或刪除（新增請用自建技能流程），旁邊的程式檔不會被碰到；路徑每一層都必須是單一名稱、不能有 `..`、不能有看不見的字元（零寬、方向控制等）、最多四層；捷徑（symlink）與硬連結一律拒絕，存檔時在檔案鎖內確認資料夾沒有被換掉才寫入（鎖檔放在員工資料夾外）。其他寫技能檔的途徑（自建技能、員工自己的技能工具、技能畢業）不經過這裡，沒有版本紀錄，也不拿同一把鎖。上限：Markdown 與技能每檔 64 KB，`CONTRACT.toml` 32 KB，`must_not` 與 `must_always` 各最多 100 條、每條最多 500 字。
 
 - **設定檔分頁：** 員工詳情頁的「設定檔」分頁（`/agents/<員工>/files`）。左邊是白話的檔案清單，小字灰色是實際檔名，標記「等待審核」「在系統外被改過」「你只能檢視」；右邊先以唯讀方式顯示，負責人與管理員按「編輯」後可以修改，下方顯示大小與上限，按鈕有「檢視差異」「儲存並檢查」「捨棄修改」。檢查結果用同一個確認對話框。存檔時若別人剛存過，會並排顯示你的內容與目前內容，可以「複製我的內容」再「重新載入」。「版本紀錄」（Operator 以上）列出時間、修改人與來源，可以檢視、和目前內容比較或還原。還沒存的修改在切換檔案、切換分頁或關閉頁面前會先詢問（從側邊欄等其他連結離開時目前不會詢問）。只能檢視的人會看到「你可以檢視；只有這位員工的負責人或管理員可以修改。」
 - **工作規則與 AGENTS.md／Agent.md：** 清單與標題把「工作規則」寫成「工作規則（AGENTS.md／Agent.md）」，因為很多人用業界通用的名字找它；實際檔名仍是小字的 `INSTRUCTIONS.md`。匯入功能把 AGENTS.md、CLAUDE.md、GEMINI.md、Agent.md、copilot-instructions 的內容合併進這份檔案，每次對話都會交給員工，不論它用哪一種執行環境。新員工沒有這個檔案時，分頁顯示「建立工作規則」（只有負責人與管理員看得到按鈕），按下去帶出一段短範本，按「儲存並檢查」才會寫入，走的是同一條存檔、檢查與送審流程，沒有另開寫入路徑。
 - **執行環境自動產生的檔案（唯讀）：** 分頁最下方收合的區塊，第一次展開才讀取，顯示建立員工時替它的執行環境產生的 `CLAUDE.md` 與 `AGENTS.md`（RPC `agent_files.runtime_files`，Viewer 以上；只列這兩個固定檔名，沿用員工資料夾的檢查，捷徑與非一般檔案一律不讀，每檔最多顯示 64 KB）。這裡不能修改，要改規則請改工作規則。
 - **搜尋：** 命令面板（⌘K）輸入 `agent.md`、`agents.md`、`CLAUDE.md` 或「工作規則」，每位員工會有一列「<員工> · 設定檔」，直接開啟該員工的設定檔分頁。
 - **誰能做什麼：** 綁定這位員工的人都能看檔案；Operator 以上能看版本與差異；員工的負責人與管理員能存檔。每次呼叫都重讀帳號資料庫，不看登入時的快照。審核只有管理員能決定。
-- **每次存檔都檢查：** 先跑固定規則（大小、控制字元、嚴格解析 `CONTRACT.toml`、隱藏或看不見的內容、這次新增的文字或新的 `must_always` 裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪改 `must_not`／`must_always` 或調高／取消工具次數上限；技能另外檢查：開頭的 `---` 設定區要能照技能載入器的格式讀出，`name` 必須是單一名稱，技能掃描器在這次新增的行上找到的執行指令、外送資料、注入句型會升級為高風險（以實際新增的行判斷，同類的第二行照樣算新的），裸露的網址與提到行為界線禁止的事項只標為需要注意；原本就在檔案裡的高風險內容會列為「這個技能裡原本就有可疑內容」；技能在上次儲存後被系統外改過時整份重新檢查，並和上次在這裡存的版本比較），再請部署的輔助模型看一次差異（`[runtime] utility_provider`／`utility_model`，可用 `[agent_files] review_provider`／`review_model` 指定；費用記在部署的 `agent-file-review`，不扣員工預算）。模型只能讓結果更嚴。結果：`pass` 直接套用；`warn` 要寫理由（至少 4 個字）或送管理員審核；`block` 非管理員只能送審，管理員要寫理由並勾「我了解風險」才能套用（稽核記為 Critical）。檢查沒完成時（沒有輔助模型、逾時、回答無法使用、額度用完），或內容太長只檢查了一部分，結果至少是 `warn`（設 `[agent_files] on_analysis_failure = "block"` 則是 `block`），非管理員只能送管理員審核，管理員要勾「我了解風險」才能套用；不會默默放行，也不能關掉。每天的額度：整個部署 200 次、每人 40 次、每位員工 60 次（`review_daily_limit`、`review_daily_limit_per_user`、`review_daily_limit_per_agent`），另外每人每分鐘最多檢查 10 次（`checks_per_minute`）；同一份修改 15 分鐘內再檢查沿用上次結果。確認時不再跑一次模型；確認必須是同一人、同一檔、同一個起始版本與同樣內容，並在 15 分鐘內，固定規則用你現在的權限重跑（比檢查時嚴就要重新檢查），確認高風險的修改時會在檔案鎖內再確認一次你仍是管理員。在系統外被改過的 SOUL.md 或 INSTRUCTIONS.md 會整份重新檢查，並和上次核可的版本比較（原因「在系統外被改過」）。
+- **每次存檔都檢查：** 先跑固定規則（大小、控制字元、嚴格解析 `CONTRACT.toml`、隱藏或看不見的內容、這次新增的文字或新的 `must_always` 裡的注入句型、像金鑰的文字、人格設定被刪掉大半、行為界線刪改 `must_not`／`must_always` 或調高／取消工具次數上限；技能另外檢查：開頭的 `---` 設定區要能照技能載入器的格式讀出，`name` 必須是單一名稱，技能掃描器在這次新增的行上找到的執行指令、外送資料、注入句型會升級為高風險（以實際新增的行判斷，同類的第二行照樣算新的），裸露的網址與提到行為界線禁止的事項只標為需要注意；原本就在檔案裡的高風險內容會列為「這個技能裡原本就有可疑內容」；技能在上次儲存後被系統外改過時整份重新檢查，並和上次在這裡存的版本比較），再請部署的輔助模型看一次差異（`[runtime] utility_provider`／`utility_model`，可用 `[agent_files] review_provider`／`review_model` 指定；費用記在部署的 `agent-file-review`，不扣員工預算）。模型只能讓結果更嚴。結果：`pass` 直接套用；`warn` 要寫理由（至少 4 個字）或送管理員審核；`block` 非管理員只能送審，管理員要寫理由並勾「我了解風險」才能套用（稽核記為 Critical）。檢查沒完成時（沒有輔助模型、逾時、回答無法使用、額度用完），或內容太長只檢查了一部分，結果至少是 `warn`（設 `[agent_files] on_analysis_failure = "block"` 則是 `block`），非管理員只能送管理員審核，管理員要勾「我了解風險」才能套用；不會默默放行，也不能關掉。每天的額度：整個部署 200 次、每人 40 次、每位員工 60 次（`review_daily_limit`、`review_daily_limit_per_user`、`review_daily_limit_per_agent`），另外每人每分鐘最多檢查 10 次（`checks_per_minute`）；同一份修改 15 分鐘內再檢查沿用上次結果。確認時不再跑一次模型；確認必須是同一人、同一檔、同一個起始版本與同樣內容，並在 15 分鐘內，固定規則用你現在的權限重跑（比檢查時嚴就要重新檢查），確認高風險的修改時會在檔案鎖內再確認一次你仍是管理員。在系統外被改過的 SOUL.md、IDENTITY.md、USER.md 或 INSTRUCTIONS.md 會整份重新檢查，並和上次核可的版本比較（原因「在系統外被改過」）。
 - **存檔：** 在檔案鎖內比對編輯器讀到的雜湊（`base_hash`），期間被別人改過就當作衝突拒絕。新內容從員工的下一則對話開始生效，通道的下一則回覆會附一行提示。
 - **版本：** 存在員工資料夾外的 `<home>/agent_file_history/<員工>/<檔案>/`（只有擁有者能讀），每檔預設保留 20 份（`[agent_files] history_keep`，5–100）。第一次修改也會留下修改前的內容。還原版本會跑同樣的檢查。刪除員工時版本整份移到 `agent_file_history/_trash/`，之後同一個代號的新員工從零開始。
-- **核可基準：** 存 SOUL.md 或 INSTRUCTIONS.md 會更新核可指紋（INSTRUCTIONS.md 現在也有，heartbeat 以 `_instructions_integrity_drift` 回報）。在系統外被改過的檔案會標示出來，可以還原到上次核可版本，或檢查後接受目前內容（照原樣再存一次：整份重新檢查，至少要寫理由確認或送審，確認後不改寫檔案，只把目前內容記成一個版本並設為核可基準；沒有被改過的檔案照原樣存一次仍然是「沒有變動」）。員工改名會同步 SOUL.md／IDENTITY.md 裡的名字，原本核可的 SOUL 維持核可，原本已在系統外被改過的 SOUL 仍然標示。名字必須是純文字（1–64 字，不能換行、不能有看不見的字元或 `< > [ ] { }`、反引號），改名後的內容若被固定規則標出問題就不同步（列在 `identity_files_skipped`）。
+- **核可基準：** 存 SOUL.md、IDENTITY.md、USER.md 或 INSTRUCTIONS.md 會更新核可指紋（INSTRUCTIONS.md 現在也有，heartbeat 以 `_instructions_integrity_drift` 回報）。在系統外被改過的檔案會標示出來，可以還原到上次核可版本，或檢查後接受目前內容（照原樣再存一次：整份重新檢查，至少要寫理由確認或送審，確認後不改寫檔案，只把目前內容記成一個版本並設為核可基準；沒有被改過的檔案照原樣存一次仍然是「沒有變動」）。員工改名會同步 SOUL.md／IDENTITY.md 裡的名字，原本核可的 SOUL 維持核可，原本已在系統外被改過的 SOUL 仍然標示。名字必須是純文字（1–64 字，不能換行、不能有看不見的字元或 `< > [ ] { }`、反引號），改名後的內容若被固定規則標出問題就不同步（列在 `identity_files_skipped`）。
 - **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
+
+- **匯出設定檔：** Manager 與管理員可從有權檢視的員工頁選單選擇「匯出設定檔」，支援 DuDuClaw、OpenClaw、Hermes、AGENTS.md 與 Claude Code subagent。服務對象介紹預設不包含，要明確勾選。OpenClaw／Hermes 請逐一下載並放入同一個資料夾。秘密、通道、能力、權限、帳號池與記憶不會匯出。見 [Agent File 參考](../../spec/zh-TW/agent-file-spec.md)。
+- **服務對象：** 使用相同的鎖定、版本與審查流程儲存。提示詞以 `<user_profile>` 資料區塊載入，明確註明不是指令，並經過與人格相同的輸入檢查。最多 4,000 個字，優先於一般 Markdown 的位元組上限。
 
 ## 排程交辦（v1.76.0）
 
@@ -327,7 +347,7 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 關閉未獲裝置確認時會持續顯示警告。展開「維修紀錄」可查最近的
 視窗金鑰指紋與連線事件。畫面每 30 秒讀取一次狀態，到期或裝置
 自行關閉可能要等下次讀取才顯示。完整 OS 映像、真實 SSH 與推播
-流程尚未驗證；這頁要搭配帶有維修帳號的 OS 映像才能使用，也不代表整機已驗收。
+
 
 ## 安全 → 憑證保護（v1.76.0）
 
@@ -358,6 +378,41 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 安全頁可把 `config.toml [security] egress_guard` 設成四種值：**關閉**（`off`）、**僅記錄**（`shadow`，預設）、**先詢問**（`ask`）、**直接阻擋**（`block`）。存檔沿用既有加鎖的 `system.update_config` 寫入；每次呼叫時由防護讀取設定。員工的 `agent.toml [capabilities] egress_guard` 只能更嚴格（`off < shadow < ask < block`）。沒有 `config.toml` 時採用預設的僅記錄；設定無效或讀不到時，該次呼叫會被阻擋。
 
 AI 員工在同一回合成功讀過私人資料後，之後的外送呼叫會先經過防護。僅記錄會在稽核寫下 `would_ask` 與讀過的工具，照常執行；先詢問會開出一次性的核准單，列出目的地、完整內容、讀過的工具與到期時間，只有目前具 Admin 權限的儀表板帳號能核准（通道按鈕與聊天回覆都不行）；直接阻擋則拒絕。涵蓋平台 MCP 呼叫與第三方 MCP 代理，不涵蓋 Claude CLI 內建工具與其他 runtime 的原生工具；以回合為單位追蹤。詳見[資料外送防護](../../features/zh-TW/69-egress-guard.md)。
+
+設定下方的僅 Admin 可讀觀察報表，可選最近 7 或 30 天，查看去重後的預估核准單數、員工／工具／來源／日期分類，以及 CLI 內建工具與 MCP 入口的數量。原本會拒絕的紀錄不增加預估開單數；沒有觀察紀錄或收集失敗不代表安全。`duduclaw doctor` 可看租約健康；停止所有 gateway 與外送動作後，可用 `duduclaw egress-leases list` 取得確認 token，再用 `clear` 離線復原。完整步驟見資料外送防護的復原章節。
+
+## 安全 → 資料刪除收據
+
+斷開通道、Google 帳戶、資料庫來源或 Remote MCP 時，會自動準備記憶刪除申請。「已斷開」與「記憶已刪除」是兩個不同的結果。
+
+1. 在對應設定頁斷開服務。批次建立後，回應會提供「查看審批」。若 `[memory] forget_source` 已關閉，或設定無法讀取，就不建立計畫；規劃失敗也會另外回報。
+2. 管理員到收件匣開啟卡片，查看每位 AI 員工的筆數。批次七天後到期；執行前刪除範圍擴大，需要重新核准，範圍縮小可繼續。
+3. 核准結果存妥後，gateway 建立持久的背景工作，重試未完成步驟，重啟後也會繼續。刪除或必要後續步驟尚未完成時，不會產生收據。
+4. 開啟**系統 → 安全 → 資料刪除收據**，展開連線並按「下載 JSON」。可重新整理查看新完成的工作。筆數分開列出已刪記憶、關鍵事實、封存副本、無法歸屬，以及保留的系統紀錄。
+
+Google 個人連線依實際使用憑證的使用者歸屬，收據則按 AI 員工列出刪除筆數。沒有連線標記的舊記憶無法事後確定歸屬。對話原文、`tool_calls.jsonl`、wiki、備份不在此次刪除範圍。Remote MCP 原有 `forget` 選項是刪除已儲存的連線紀錄；獨立的 `forget_memories` 選項控制記憶申請，預設啟用。
+
+非 Google 的 OAuth 撤銷目前沒有連線歸屬，會回報略過記憶刪除。清除 Google 設定的憑證路徑，不會同時撤銷另一份獨立儲存的 OAuth 授權；請用該授權自己的斷開操作處理。
+
+連線來源標記會保留來源與角色；單純佐證不會取得刪除所有權。另一個仍連線的來源也提供過同一筆記憶時，該記憶會保留，計畫、管理員核准卡與收據以 `retained_shared` 逐員工列出數量。只有全部擁有來源的連線都已斷開，且沒有其他仍有效的直接來源，才會刪除；因此第二個連線斷開時，才可能選入先前保留的共享記憶。歸屬不明的記憶（包含無法還原角色的舊標記）保留並計入無法歸屬。衍生記憶也逐筆檢查來源。規劃與套用前會重新核對連線狀態；透過平台重新連線時，會先撤銷舊的斷線證據再發布連線。
+
+核准會綁定排序後的孤兒實體向量識別值，不只綁定數量；即使數量相同，替換成其他實體也必須重新核准。未完成工作會持久保存嘗試次數與下次執行時間，以 60／120／240／480 秒退避，並公平選取已到期工作。連續五次失敗或執行中斷後會隔離；管理員可在「資料刪除收據」查看不含記憶內容的失敗原因並按「重試」。重試沿用既有核准並重查範圍，擴大時仍須重新核准。
+
+
+## 對話憑證
+
+Admin 可在「系統 → 安全 → 憑證稽核」查看中繼資料、篩選、編輯服務、標記誤判，以及匯出有稽核紀錄的本頁 CSV。旁邊的清冊以唯讀方式列出系統設定憑證。透過 `system.update_config` 的 `security.chat_credentials` 或設定編輯器設定 `[security] chat_credentials = "audit" | "mask"`。預設 `audit`；未知值視為 `mask`。稽核模式保留對話原文；遮罩模式只改新進站訊息中偵測到的值，不改舊紀錄。兩種模式都遮罩衍生儲存中偵測到的值。偵測限制與登錄配額見[憑證稽核](../../features/zh-TW/70-credential-audit.md)。服務名稱與備註不可填入真正的憑證。
+
+## 管理 → 整合 → Google 設定
+
+管理員可在 `/manage/integrations?tab=google` 開啟可續接的設定精靈，依情況選公司委派、Internal OAuth、Apps Script 或個人 External OAuth。進階表單仍可使用。替換生效路徑前須確認；OAuth 權杖保留到明確中斷連線。測試逐項回報服務結果，Sheets、Docs 僅檢查權限時標記未驗證。主控台步驟、遠端轉送與 Testing 到期見[連接 Google](google-setup.md)。
+
+
+## 收件匣與工作時間軸
+
+收件匣的「待處理」只列出還需要你處理的事，先排快到期的項目，再排高風險、員工提問與等你決定的任務、預算通知。「等太久」列出已等超過一天的待處理事項。點選或用鍵盤才會開啟並標記已讀，滑鼠移過不會切換內容。核准、安裝申請與等你決定的任務，必須先處理才能封存；其他項目可在任何分頁封存，包含沒完成的工作。在收件匣頁面按 ⌘Z 或 Ctrl+Z 復原封存，輸入文字時保留原本的復原功能；U 標記未讀。處理後會顯示結果，不再顯示同意、拒絕按鈕；電腦與手機的決策按鈕都固定在詳情底部。清單與詳情在畫面可用高度內各自捲動，選另一項時從詳情頂端開始。首頁沿用收件匣的急迫排序，包含核准期限與風險。側邊欄、手機鈴鐺、收件匣標題與首頁共用待辦數，排除已處理與已封存的項目；沒有待辦時仍可點手機鈴鐺。員工提問目前只檢查前 12 位員工，頁面會提示涵蓋範圍與載入失敗。
+
+工作時間軸回答「這段時間誰完成了什麼、誰卡住、哪件在等我」。點選「完成、進行中、等你決定、沒做完」可篩選下方員工卡片。等你決定的員工排最前，其中距上次更新最久的先列出，再來是沒做完、進行中與沒有工作紀錄的員工。等待時間標示為「已等 N 天（距上次更新）」。點任務名稱就能查看任務；距上次更新的時間可用來判斷是否等太久，但不代表精準的狀態開始時間。「查看時間分布」預設收合，顏色與不同形狀共同代表狀態，長條表示任務開啟多久，不代表實際工作時數。任務長條可用鍵盤或觸控開啟。
 
 ## 雙因素驗證強制設定
 

@@ -56,6 +56,9 @@ impl MethodHandler {
         let message_id = uuid::Uuid::new_v4().to_string();
 
         if wait {
+            if let Err(refusal) = crate::budget::gate_before_spawn(&self.home_dir, Some(&agent.dir), agent_id, "delegate_sync").await {
+                return WsFrame::error_response("", &refusal.to_string());
+            }
             // Synchronous delegation: Rust-native Direct API call (no Python).
             let home = self.home_dir.clone();
             let system_prompt = agent

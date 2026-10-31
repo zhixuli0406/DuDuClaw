@@ -68,3 +68,43 @@ describe('HealthOverview total failure of the needs_human query (L2 round 7)', (
     expect(screen.queryByText(/all clear|Nothing needs you/i)).toBeNull();
   });
 });
+
+
+it('shows plain failed-work titles and keeps an expiring approval in the top slice', async () => {
+  useAuthStore.setState({ user: null, bindings: [], isAuthenticated: false });
+  mockWsClient.call.mockReset();
+  mockWsClient.call.mockImplementation((method: string) => {
+    if (method === 'approvals.list') return Promise.resolve({ approvals: [
+      ...Array.from({ length: 7 }, (_, i) => ({ id: `a-${i}`, agent_id: 'staff', kind: 'tool_call', summary: `Later request ${i}`, payload: {}, created_at: new Date().toISOString(), expires_at: Date.now() / 1000 + 3600 })),
+      { id: 'urgent', agent_id: 'staff', kind: 'tool_call', summary: 'Expiring request', payload: {}, created_at: new Date().toISOString(), expires_at: Date.now() / 1000 + 30 },
+    ] });
+    if (method === 'audit.unified_log') return Promise.resolve({ events: [{ agent_id: 'staff', timestamp: new Date().toISOString(), event_type: 'channel_reply_fallback', summary: '{"origin":"Claude Code","preflight":null}', details: {} }] });
+    return Promise.resolve({});
+  });
+  renderWithProviders(<HealthOverview agents={[]} enabled />);
+  const urgent = await screen.findByText('Expiring request');
+  expect(urgent.closest('li') ?? urgent.closest('a')).toBeInTheDocument();
+  expect(screen.queryByText(/preflight|Claude Code/)).toBeNull();
+});
+
+it('never renders the raw spawn failure payload on Home', async () => {
+  useAuthStore.setState({ user: null, bindings: [], isAuthenticated: false });
+  mockWsClient.call.mockReset();
+  mockWsClient.call.mockImplementation((method: string) => method === 'audit.unified_log'
+    ? Promise.resolve({ events: [{ agent_id: 'staff', timestamp: new Date().toISOString(), event_type: 'channel_reply_fallback', summary: '{"origin":"Claude Code","preflight":null}', details: {} }] })
+    : Promise.resolve({}));
+  renderWithProviders(<HealthOverview agents={[]} enabled />);
+  expect(await screen.findByText("staff's work did not finish")).toBeInTheDocument();
+  expect(screen.queryByText(/preflight|Claude Code/)).toBeNull();
+});
+
+
+it('links webchat failures to the same run as Inbox', async () => {
+  useAuthStore.setState({ user: null, bindings: [], isAuthenticated: false });
+  mockWsClient.call.mockReset();
+  mockWsClient.call.mockImplementation((method: string) => method === 'audit.unified_log'
+    ? Promise.resolve({ events: [{ agent_id: 'staff', timestamp: new Date().toISOString(), event_type: 'channel_reply_fallback', summary: '{}', details: { channel_failure: { channel: 'webchat', run_id: 'run:42' } } }] })
+    : Promise.resolve({}));
+  renderWithProviders(<HealthOverview agents={[]} enabled />);
+  expect(await screen.findByRole('link', { name: /staff's work did not finish/ })).toHaveAttribute('href', '/runs?run=run%3A42');
+});

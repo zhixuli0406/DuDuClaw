@@ -47,11 +47,13 @@ type ResolveAction = 'retry' | 'done' | 'abort';
 export function NeedsHumanActions({
   taskId,
   onResolved,
+  onOutcome,
   size,
   className,
 }: {
   taskId: string;
   onResolved: () => void;
+  onOutcome?: (action: ResolveAction) => void;
   /** `sm` for the compact board card; default for detail surfaces. */
   size?: 'sm';
   className?: string;
@@ -75,6 +77,7 @@ export function NeedsHumanActions({
         toast.success(intl.formatMessage({ id: `inbox.needsHuman.${action}Toast` }));
         setNoteOpen(false);
         setNote('');
+        onOutcome?.(action);
         onResolved();
       } catch (e) {
         toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
@@ -82,7 +85,7 @@ export function NeedsHumanActions({
         setBusy(null);
       }
     },
-    [busy, taskId, intl, onResolved],
+    [busy, taskId, intl, onResolved, onOutcome],
   );
 
   return (
@@ -142,11 +145,13 @@ export function NeedsHumanTaskPanel({
   typeLabel,
   agentName,
   onResolved,
+  onOutcome,
 }: {
   task: TaskInfo;
   typeLabel: string;
   agentName?: string;
   onResolved: () => void;
+  onOutcome?: (action: ResolveAction) => void;
 }) {
   const intl = useIntl();
   const t = useCallback((id: string) => intl.formatMessage({ id }), [intl]);
@@ -202,7 +207,7 @@ export function NeedsHumanTaskPanel({
         </TabsPanel>
       </Tabs>
 
-      <NeedsHumanActions taskId={task.id} onResolved={onResolved} />
+      <NeedsHumanActions taskId={task.id} onResolved={onResolved} onOutcome={onOutcome} />
 
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="ghost" onClick={() => navigate(`/tasks/${task.id}`)}>

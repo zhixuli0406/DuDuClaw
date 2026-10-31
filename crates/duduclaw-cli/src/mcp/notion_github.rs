@@ -37,13 +37,13 @@ pub(crate) async fn handle_notion_search(args: &Value, home_dir: &Path) -> Value
 
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(q) => q,
-        None => return tool_error("Missing required parameter: query"),
+        None => return super::egress_gate::pre_dispatch_error("Missing required parameter: query"),
     };
     let max = arg_u32(args, "max_results", 10);
 
     let token = match nw::get_valid_notion_token(home_dir).await {
         Ok(t) => t,
-        Err(e) => return tool_error(&e.to_string()),
+        Err(e) => return super::egress_gate::pre_dispatch_error(&e.to_string()),
     };
     match nw::notion_search(&token, query, max).await {
         Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
@@ -56,12 +56,12 @@ pub(crate) async fn handle_notion_page_read(args: &Value, home_dir: &Path) -> Va
 
     let page_id = match args.get("page_id").and_then(|v| v.as_str()) {
         Some(id) if !id.trim().is_empty() => id.trim(),
-        _ => return tool_error("Missing required parameter: page_id"),
+        _ => return super::egress_gate::pre_dispatch_error("Missing required parameter: page_id"),
     };
 
     let token = match nw::get_valid_notion_token(home_dir).await {
         Ok(t) => t,
-        Err(e) => return tool_error(&e.to_string()),
+        Err(e) => return super::egress_gate::pre_dispatch_error(&e.to_string()),
     };
     match nw::notion_page_read(&token, page_id).await {
         Ok(r) => tool_text(&serde_json::to_string_pretty(&r).unwrap_or_default()),
@@ -74,16 +74,16 @@ pub(crate) async fn handle_notion_page_append(args: &Value, home_dir: &Path) -> 
 
     let page_id = match args.get("page_id").and_then(|v| v.as_str()) {
         Some(id) if !id.trim().is_empty() => id.trim(),
-        _ => return tool_error("Missing required parameter: page_id"),
+        _ => return super::egress_gate::pre_dispatch_error("Missing required parameter: page_id"),
     };
     let text = match args.get("text").and_then(|v| v.as_str()) {
         Some(t) if !t.trim().is_empty() => t,
-        _ => return tool_error("Missing required parameter: text"),
+        _ => return super::egress_gate::pre_dispatch_error("Missing required parameter: text"),
     };
 
     let token = match nw::get_valid_notion_token(home_dir).await {
         Ok(t) => t,
-        Err(e) => return tool_error(&e.to_string()),
+        Err(e) => return super::egress_gate::pre_dispatch_error(&e.to_string()),
     };
     match nw::notion_page_append(&token, page_id, text).await {
         Ok(r) => tool_text(&format!(
@@ -156,12 +156,15 @@ pub(crate) async fn handle_github_search_issues(args: &Value, home_dir: &Path) -
 
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q,
-        _ => return tool_error("Missing required parameter: query"),
+        _ => return super::egress_gate::pre_dispatch_error("Missing required parameter: query"),
     };
     let max = arg_u32(args, "max_results", 10);
 
     let token = match gh::get_valid_github_token(home_dir).await {
         Ok(t) => t,
+        Err(e @ (gh::GithubAuthError::NotConnected | gh::GithubAuthError::NoRefreshToken | gh::GithubAuthError::ClientConfigMissing)) => {
+            return super::egress_gate::pre_dispatch_error(&e.to_string());
+        }
         Err(e) => return tool_error(&e.to_string()),
     };
     match gh::github_search_issues(&token, query, max).await {
@@ -196,10 +199,13 @@ pub(crate) async fn handle_github_issue_read(args: &Value, home_dir: &Path) -> V
 
     let (owner, repo, number) = match github_target(args) {
         Ok(t) => t,
-        Err(e) => return tool_error(e),
+        Err(e) => return super::egress_gate::pre_dispatch_error(e),
     };
     let token = match gh::get_valid_github_token(home_dir).await {
         Ok(t) => t,
+        Err(e @ (gh::GithubAuthError::NotConnected | gh::GithubAuthError::NoRefreshToken | gh::GithubAuthError::ClientConfigMissing)) => {
+            return super::egress_gate::pre_dispatch_error(&e.to_string());
+        }
         Err(e) => return tool_error(&e.to_string()),
     };
     match gh::github_issue_read(&token, &owner, &repo, number).await {
@@ -213,10 +219,13 @@ pub(crate) async fn handle_github_pr_read(args: &Value, home_dir: &Path) -> Valu
 
     let (owner, repo, number) = match github_target(args) {
         Ok(t) => t,
-        Err(e) => return tool_error(e),
+        Err(e) => return super::egress_gate::pre_dispatch_error(e),
     };
     let token = match gh::get_valid_github_token(home_dir).await {
         Ok(t) => t,
+        Err(e @ (gh::GithubAuthError::NotConnected | gh::GithubAuthError::NoRefreshToken | gh::GithubAuthError::ClientConfigMissing)) => {
+            return super::egress_gate::pre_dispatch_error(&e.to_string());
+        }
         Err(e) => return tool_error(&e.to_string()),
     };
     match gh::github_pr_read(&token, &owner, &repo, number).await {
@@ -230,14 +239,17 @@ pub(crate) async fn handle_github_issue_comment(args: &Value, home_dir: &Path) -
 
     let (owner, repo, number) = match github_target(args) {
         Ok(t) => t,
-        Err(e) => return tool_error(e),
+        Err(e) => return super::egress_gate::pre_dispatch_error(e),
     };
     let body = match args.get("body").and_then(|v| v.as_str()) {
         Some(b) if !b.trim().is_empty() => b,
-        _ => return tool_error("Missing required parameter: body"),
+        _ => return super::egress_gate::pre_dispatch_error("Missing required parameter: body"),
     };
     let token = match gh::get_valid_github_token(home_dir).await {
         Ok(t) => t,
+        Err(e @ (gh::GithubAuthError::NotConnected | gh::GithubAuthError::NoRefreshToken | gh::GithubAuthError::ClientConfigMissing)) => {
+            return super::egress_gate::pre_dispatch_error(&e.to_string());
+        }
         Err(e) => return tool_error(&e.to_string()),
     };
     match gh::github_issue_comment(&token, &owner, &repo, number, body).await {

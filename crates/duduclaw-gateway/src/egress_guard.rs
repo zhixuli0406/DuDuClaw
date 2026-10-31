@@ -1,6 +1,11 @@
 //! Gateway-owned, monotonic turn taint. Unknown/expired turns are tainted.
 
 mod lease_store;
+pub mod recovery;
+mod hook;
+mod connectors;
+
+pub const HOOK_CHECK_ROUTE: &str = "/api/internal/egress-guard/hook-check";
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -23,6 +28,7 @@ use crate::computer_use_sessions::auth::{
 };
 
 pub const MARK_ROUTE: &str = "/api/internal/egress-guard/mark";
+pub const RECIPIENTS_ROUTE: &str = "/api/internal/recipient-guard/query";
 pub const QUERY_ROUTE: &str = "/api/internal/egress-guard/query";
 pub const RESERVE_ROUTE: &str = "/api/internal/egress-guard/reserve";
 pub const FINISH_ROUTE: &str = "/api/internal/egress-guard/finish";
@@ -53,20 +59,59 @@ type Key = (String, String);
 pub struct Taint {
     pub tainted: bool,
     pub sources: Vec<String>,
+    #[serde(default = "unknown_connectors")]
+    pub connector_refs: Vec<String>,
+    #[serde(default)]
+    pub dropped_connector_refs: u64,
+    #[serde(default)]
+    pub turn_started_at: Option<String>,
 }
+
+fn unknown_connectors() -> Vec<String> { vec!["unknown".into()] }
 
 impl Taint {
     pub fn unknown() -> Self {
         Self {
             tainted: true,
             sources: vec!["turn_state_unavailable".into()],
+            connector_refs: vec!["unknown".into()],
+            dropped_connector_refs: 0,
+            turn_started_at: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectorSnapshot {
+    pub refs: Vec<String>,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ConnectorSnapshot {
+    pub fn unknown() -> Self {
+        Self { refs: vec!["unknown".into()], observed_at: chrono::DateTime::UNIX_EPOCH }
+    }
+
+    pub fn stamp(&self, provenance: duduclaw_memory::lineage::Provenance) -> duduclaw_memory::lineage::Provenance {
+        provenance.with_connector_refs_at(self.refs.clone(), self.observed_at)
+    }
+}
+
+impl Taint {
+    pub(crate) fn connector_snapshot(&self) -> ConnectorSnapshot {
+        match self.turn_started_at.as_deref().and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()) {
+            Some(at) => ConnectorSnapshot { refs: self.connector_refs.clone(), observed_at: at.with_timezone(&chrono::Utc) },
+            None => ConnectorSnapshot::unknown(),
         }
     }
 }
 
 struct Turn {
     created: Instant,
+    started_at: String,
     sources: BTreeSet<String>,
+    connector_refs: BTreeSet<String>,
+    dropped_connector_refs: u64,
     pending: HashMap<String, String>,
 }
 
@@ -225,7 +270,10 @@ impl Ledger {
         if self.make_turn_room(&key) {
             self.turns.entry(key).or_insert(Turn {
                 created: now,
+                started_at: duduclaw_memory::format_ts(chrono::Utc::now()),
                 pending: HashMap::new(),
+                connector_refs: if seen { BTreeSet::from(["unknown".into()]) } else { BTreeSet::new() },
+                dropped_connector_refs: 0,
                 sources: if seen {
                     BTreeSet::from(["turn_state_unavailable".into()])
                 } else {
@@ -239,6 +287,9 @@ impl Ledger {
         self.prune(now);
         match self.turns.get(key) {
             Some(turn) => Taint {
+                connector_refs: turn.connector_refs.iter().cloned().collect(),
+                dropped_connector_refs: turn.dropped_connector_refs,
+                turn_started_at: Some(turn.started_at.clone()),
                 tainted: !turn.sources.is_empty() || !turn.pending.is_empty(),
                 sources: turn.sources.iter().cloned()
                     .chain((!turn.pending.is_empty()).then(|| "pending_private_read".into()))
@@ -318,6 +369,9 @@ impl Ledger {
             Some(turn) => {
                 let pending = turn.pending.keys().any(|read| Some(read.as_str()) != own_read);
                 Taint {
+                    connector_refs: turn.connector_refs.iter().cloned().collect(),
+                    dropped_connector_refs: turn.dropped_connector_refs,
+                    turn_started_at: Some(turn.started_at.clone()),
                     tainted: !turn.sources.is_empty() || pending,
                     sources: turn.sources.iter().cloned()
                         .chain(pending.then(|| "pending_private_read".into())).collect(),
@@ -375,6 +429,23 @@ impl Ledger {
         }
     }
 
+    fn stamp(&mut self, key: &Key, connector: Option<&str>, rejected: bool, now: Instant) {
+        self.prune(now);
+        if let Some(turn) = self.turns.get_mut(key) {
+            if rejected {
+                turn.dropped_connector_refs = turn.dropped_connector_refs.saturating_add(1);
+                turn.connector_refs.insert("unknown".into());
+            }
+            if let Some(reference) = connector {
+                if turn.connector_refs.len() < MAX_SOURCES - 1 {
+                    turn.connector_refs.insert(reference.into());
+                } else {
+                    turn.connector_refs.insert("unknown".into());
+                }
+            }
+        }
+    }
+
     fn mark(&mut self, key: &Key, source: &str, now: Instant) -> Taint {
         self.prune(now);
         self.note_registration(key, now);
@@ -383,7 +454,10 @@ impl Ledger {
                 key.clone(),
                 Turn {
                     created: now,
+                    started_at: duduclaw_memory::format_ts(chrono::Utc::now()),
                     pending: HashMap::new(),
+                    connector_refs: BTreeSet::from(["unknown".into()]),
+                    dropped_connector_refs: 0,
                     sources: BTreeSet::from(["turn_state_unavailable".into()]),
                 },
             );
@@ -408,7 +482,13 @@ fn ledger() -> &'static Mutex<Ledger> {
 /// Re-registration cannot clear previously recorded sources.
 pub(crate) fn register_turn(agent: &str, turn: &str) {
     if let Ok(mut ledger) = ledger().lock() {
-        ledger.register((agent.into(), turn.into()), Instant::now());
+        let key = (agent.into(), turn.into());
+        ledger.register(key.clone(), Instant::now());
+        if let Ok(Some(session)) = duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone) {
+            if let Some(reference) = channel_connector(&session) {
+                ledger.stamp(&key, Some(&reference), false, Instant::now());
+            }
+        }
     }
 }
 
@@ -429,6 +509,9 @@ pub(crate) fn mark_turn(agent: &str, turn: Option<&str>, tool: &str) -> Taint {
         return Taint {
             tainted: true,
             sources: vec!["turn_state_unavailable".into(), tool.into()],
+            connector_refs: vec!["unknown".into()],
+            dropped_connector_refs: 0,
+            turn_started_at: None,
         };
     };
     if !valid_source(tool) {
@@ -438,6 +521,16 @@ pub(crate) fn mark_turn(agent: &str, turn: Option<&str>, tool: &str) -> Taint {
         .lock()
         .map(|mut ledger| ledger.mark(&(agent.into(), turn.into()), tool, Instant::now()))
         .unwrap_or_else(|_| Taint::unknown())
+}
+
+pub(crate) fn channel_connector(session: &str) -> Option<String> {
+    let (kind, _) = session.split_once(':')?;
+    if !matches!(kind, "line" | "telegram" | "discord" | "slack" | "googlechat") { return None; }
+    match session.split_once("#agent:") {
+        Some((_, agent)) if duduclaw_core::is_valid_agent_id(agent) => Some(format!("channel:{kind}:{agent}")),
+        Some(_) => None,
+        None => Some(format!("channel:{kind}")),
+    }
 }
 
 /// A reservation survives cancellation; only an explicit payload-less completion releases it.
@@ -476,6 +569,7 @@ pub struct RouteState {
     home: PathBuf,
     replay: ReplayGuard,
     rate: RateLimiter,
+    hook_rate: RateLimiter,
     blocking: Arc<Semaphore>,
 }
 
@@ -491,6 +585,7 @@ impl RouteState {
             home,
             replay: ReplayGuard::default(),
             rate: RateLimiter::default(),
+            hook_rate: RateLimiter::default(),
             blocking: Arc::new(Semaphore::new(MAX_BLOCKING_WORK)),
         }
     }
@@ -509,6 +604,12 @@ struct Request {
     payload: Option<bool>,
     #[serde(default)]
     own_read: Option<String>,
+    #[serde(default)]
+    connector_ref: Option<String>,
+    #[serde(default)]
+    remote_server: Option<String>,
+    #[serde(default)]
+    stamp_only: bool,
 }
 
 pub fn router(state: Arc<RouteState>) -> Router {
@@ -536,11 +637,13 @@ pub fn router(state: Arc<RouteState>) -> Router {
     Router::new()
         .route(MARK_ROUTE, post(mark))
         .route(QUERY_ROUTE, post(query))
+        .route(RECIPIENTS_ROUTE, post(recipients))
         .route(RESERVE_ROUTE, post(reserve))
         .route(FINISH_ROUTE, post(finish))
         .route(ACQUIRE_SINK_ROUTE, post(acquire_sink))
         .route(RELEASE_SINK_ROUTE, post(release_sink))
         .layer(DefaultBodyLimit::max(4096))
+        .route(HOOK_CHECK_ROUTE, post(hook::check).layer(DefaultBodyLimit::max(128 * 1024)))
         .with_state(state)
 }
 
@@ -560,6 +663,10 @@ async fn query(
     body: Bytes,
 ) -> Response {
     handle_async(state, peer, headers, body, "query").await
+}
+
+async fn recipients(State(state): State<Arc<RouteState>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes) -> Response {
+    handle_async(state, peer, headers, body, "recipients").await
 }
 
 async fn reserve(State(state): State<Arc<RouteState>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes) -> Response {
@@ -629,18 +736,19 @@ fn handle(
         return StatusCode::BAD_REQUEST.into_response();
     };
     if request.op != op || !(crate::computer_use_sessions::turns::valid_turn_id(&request.turn_id)
-        || (matches!(op, "reserve" | "acquire_sink" | "release_sink") && request.turn_id.is_empty())) {
+        || (matches!(op, "recipients" | "reserve" | "acquire_sink" | "release_sink") && request.turn_id.is_empty())) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let valid = match op {
-        "query" => request.source.is_none() && request.reservation.is_none() && request.payload.is_none(),
+        "query" | "recipients" => request.source.is_none() && request.reservation.is_none() && request.payload.is_none(),
         "mark" => request.source.as_deref().is_some_and(valid_source) && request.reservation.is_none() && request.payload.is_none(),
         "reserve" => request.source.as_deref().is_some_and(valid_source) && request.payload.is_none(),
         "finish" => request.source.is_none() && request.payload.is_some(),
         "acquire_sink" | "release_sink" => request.source.is_none() && request.payload.is_none(),
         _ => false,
     };
-    if !valid || (request.own_read.is_some() && (op != "acquire_sink" || !request.own_read.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())))
+    if !valid || ((request.stamp_only || request.connector_ref.is_some() || request.remote_server.is_some()) && op != "mark")
+        || (request.connector_ref.is_some() && request.remote_server.is_some()) || (request.own_read.is_some() && (op != "acquire_sink" || !request.own_read.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())))
         || (matches!(op, "reserve" | "finish" | "acquire_sink" | "release_sink") && !request.reservation.as_deref()
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -675,25 +783,41 @@ fn handle(
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let turn_key = (caller.agent_id.clone(), request.turn_id);
-    let result = match ledger().lock() {
-        Ok(mut ledger) => {
-            let now = Instant::now();
-            match op {
-                "reserve" => ledger.reserve_with_policy(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.source.as_deref().unwrap(), now),
-                "acquire_sink" => ledger.acquire_persisted_sink(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.own_read.as_deref(), now, chrono::Utc::now().timestamp_millis()),
-                "release_sink" => Ok(ledger.release_sink(&turn_key, request.reservation.as_deref().unwrap(), now)),
-                "finish" => Ok(ledger.finish(&turn_key, request.reservation.as_deref().unwrap(), request.payload.unwrap(), now)),
-                "mark" => Ok(ledger.mark(&turn_key, request.source.as_deref().unwrap(), now)),
-                _ => Ok(ledger.query(&turn_key, now)),
-            }
-        },
-        Err(_) => Err("ledger unavailable".into()),
-    };
-    // Refusals are authenticated too: never trust an unsigned error message.
-    let value = match result {
-        Ok(taint) => serde_json::json!(taint),
-        Err(error) => serde_json::json!({"error": error}),
+    let value = if op == "recipients" {
+        match crate::recipient_guard::context(&state.home, &caller.agent_id, &request.turn_id) {
+            Ok(context) => serde_json::json!(context),
+            Err(error) => serde_json::json!({"error": error}),
+        }
+    } else {
+        let remote_connector = request.remote_server.as_deref().filter(|_| op == "mark")
+            .and_then(|server| connectors::remote_reference(&state.home, &caller.agent_id, server));
+        let connector = request.connector_ref.as_deref().filter(|reference|
+            op == "mark" && connectors::declared_allowed(&state.home, &caller.agent_id, reference)).or(remote_connector.as_deref());
+        let rejected_connector = (request.connector_ref.is_some() || request.remote_server.is_some()) && connector.is_none();
+        let turn_key = (caller.agent_id.clone(), request.turn_id.clone());
+        let result = match ledger().lock() {
+            Ok(mut ledger) => {
+                let now = Instant::now();
+                match op {
+                    "reserve" => ledger.reserve_with_policy(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.source.as_deref().unwrap(), now),
+                    "acquire_sink" => ledger.acquire_persisted_sink(&state.home, &turn_key, request.reservation.as_deref().unwrap(), request.own_read.as_deref(), now, chrono::Utc::now().timestamp_millis()),
+                    "release_sink" => Ok(ledger.release_sink(&turn_key, request.reservation.as_deref().unwrap(), now)),
+                    "finish" => Ok(ledger.finish(&turn_key, request.reservation.as_deref().unwrap(), request.payload.unwrap(), now)),
+                    "mark" => {
+                        if !request.stamp_only { ledger.mark(&turn_key, request.source.as_deref().unwrap(), now); }
+                        ledger.stamp(&turn_key, connector, rejected_connector, now);
+                        Ok(ledger.query(&turn_key, now))
+                    },
+                    _ => Ok(ledger.query(&turn_key, now)),
+                }
+            },
+            Err(_) => Err("ledger unavailable".into()),
+        };
+        // Refusals are authenticated too: never trust an unsigned error message.
+        match result {
+            Ok(taint) => serde_json::json!(taint),
+            Err(error) => serde_json::json!({"error": error}),
+        }
     };
     let bytes = serde_json::to_vec(&value).expect("egress response serialization");
     let response_sig = duduclaw_core::internal_request_signature(
@@ -724,6 +848,37 @@ fn valid_source(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_stamps_do_not_change_taint_or_cross_employees() {
+        let now = Instant::now();
+        let mut ledger = Ledger::default();
+        let alice = ("alice".into(), "turn".into());
+        let bob = ("bob".into(), "turn".into());
+        ledger.register(alice.clone(), now);
+        ledger.register(bob.clone(), now);
+        ledger.stamp(&alice, Some("google:person:owner"), false, now);
+        let state = ledger.query(&alice, now);
+        assert!(!state.tainted);
+        assert!(state.sources.is_empty());
+        assert_eq!(state.connector_refs, ["google:person:owner"]);
+        assert!(ledger.query(&bob, now).connector_refs.is_empty());
+        ledger.stamp(&alice, None, true, now);
+        let state = ledger.query(&alice, now);
+        assert_eq!(state.dropped_connector_refs, 1);
+        assert!(state.connector_refs.iter().any(|r| r == "unknown"));
+        assert!(!state.tainted);
+        assert_eq!(ledger.query(&alice, now + TTL).connector_refs, ["unknown"]);
+    }
+
+    #[test]
+    fn channel_stamps_keep_global_and_employee_bots_distinct() {
+        assert_eq!(channel_connector("telegram:123:0"), Some("channel:telegram".into()));
+        assert_eq!(channel_connector("telegram:123:0#agent:alice"), Some("channel:telegram:alice".into()));
+        assert_eq!(channel_connector("googlechat:spaces/xyz#agent:alice"), Some("channel:googlechat:alice".into()));
+        assert_eq!(channel_connector("telegram:123#agent:../bob"), None);
+        assert_eq!(channel_connector("runtime:alice:turn"), None);
+    }
 
     fn policy_home(mode: &str) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
@@ -984,7 +1139,7 @@ mod tests {
         for i in 0..MAX_AGENT_TURNS {
             let key = ("bot".into(), i.to_string());
             ledger.note_registration(&key, now);
-            ledger.turns.insert(key, Turn { created: now, sources: BTreeSet::from(["private".into()]), pending: HashMap::new() });
+            ledger.turns.insert(key, Turn { created: now, started_at: duduclaw_memory::format_ts(chrono::Utc::now()), connector_refs: BTreeSet::new(), dropped_connector_refs: 0, sources: BTreeSet::from(["private".into()]), pending: HashMap::new() });
         }
         let refused = ("bot".into(), "over-quota".into());
         ledger.register(refused.clone(), now);
@@ -1115,7 +1270,7 @@ mod tests {
         let home = policy_home("block");
         let agent = format!("phase-{}", uuid::Uuid::new_v4());
         for dispatched in [false, true] {
-            for outcome in ["terminal", "error", "timeout", "cancel", "panic"] {
+            for outcome in ["terminal", "not_dispatched", "error", "timeout", "cancel", "panic"] {
                 let turn = uuid::Uuid::new_v4().to_string();
                 register_turn(&agent, &turn);
                 let (lease, _) = crate::egress_client::SinkLease::direct(home.path(), &agent, Some(&turn), None).unwrap();
@@ -1135,11 +1290,12 @@ mod tests {
                         if outcome == "cancel" { task.abort(); }
                         assert!(task.await.is_err());
                     }
+                    "not_dispatched" => { lease.not_dispatched(); lease.release().await; }
                     "error" => { let _: Result<(), ()> = async move { let _held = lease; Err(()) }.await; }
                     _ => { lease.terminal_response(); lease.release().await; }
                 }
                 let refused = reserve_turn(home.path(), &agent, Some(&turn), "memory_search", "read").is_err();
-                assert_eq!(refused, dispatched && outcome != "terminal", "{dispatched}/{outcome}");
+                assert_eq!(refused, dispatched && !matches!(outcome, "terminal" | "not_dispatched"), "{dispatched}/{outcome}");
                 if refused {
                     let mut ledger = ledger().lock().unwrap();
                     let key = (agent.clone(), turn);
@@ -1209,6 +1365,15 @@ mod tests {
         assert_eq!(ledger.sink_count, 0);
     }
 
+    fn assert_unknown_turn(ledger: &mut Ledger, key: &Key, now: Instant) {
+        let actual = ledger.query(key, now);
+        let expected = Taint {
+            turn_started_at: ledger.turns.get(key).map(|turn| turn.started_at.clone()),
+            ..Taint::unknown()
+        };
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn egress_full_turn_ledger_preserves_fences_without_refusing_other_sinks() {
         let home = policy_home("ask");
@@ -1220,13 +1385,16 @@ mod tests {
         // Fill directly so the test does not repeatedly prune a growing ledger.
         for i in 1..MAX_TURNS {
             ledger.turns.insert(("filler".into(), i.to_string()), Turn {
-                created: now, sources: BTreeSet::from(["memory_read".into()]), pending: HashMap::new(),
+                created: now,
+                started_at: duduclaw_memory::format_ts(chrono::Utc::now()),
+                connector_refs: BTreeSet::new(), dropped_connector_refs: 0,
+                sources: BTreeSet::from(["memory_read".into()]), pending: HashMap::new(),
             });
         }
         let overflow = ("bot".into(), "overflow".into());
         ledger.register(overflow.clone(), now);
         assert!(!ledger.turns.contains_key(&overflow));
-        assert_eq!(ledger.query(&overflow, now), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now);
         for sink_key in [&key, &overflow, &("bot".into(), "".into())] {
             assert!(ledger.acquire_sink(sink_key, "new-sink", None, now).is_ok());
             ledger.release_sink(sink_key, "new-sink", now);
@@ -1236,7 +1404,7 @@ mod tests {
         // If capacity returns, retrying the failed registration is still tainted.
         ledger.turns.remove(&("filler".into(), "1".into()));
         ledger.register(overflow.clone(), now);
-        assert_eq!(ledger.query(&overflow, now), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now);
         ledger.release_sink(&key, "sink", now);
         assert_eq!(ledger.sink_count, 0);
     }
@@ -1281,9 +1449,9 @@ mod tests {
         ledger.register(early.clone(), now);
         ledger.turns.remove(&early); // Simulate clean-turn capacity eviction.
         for at in [now, now + TTL * 2, now + TTL * 10] {
-            assert_eq!(ledger.query(&early, at), Taint::unknown());
+            assert_unknown_turn(&mut ledger, &early, at);
             ledger.register(early.clone(), at);
-            assert_eq!(ledger.query(&early, at), Taint::unknown());
+            assert_unknown_turn(&mut ledger, &early, at);
             ledger.turns.remove(&early);
         }
         let other = ("bob".into(), "early".into());
@@ -1301,7 +1469,7 @@ mod tests {
         ledger.seen.get_mut("alice").unwrap().fill(u64::MAX);
         let registered = now + TTL - Duration::from_secs(1);
         ledger.register(key.clone(), registered);
-        assert_eq!(ledger.query(&key, registered), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, registered);
         ledger.mark(&key, "memory_search", registered);
         ledger.register(key.clone(), now + TTL);
         assert_eq!(
@@ -1312,9 +1480,9 @@ mod tests {
         ledger.register(other.clone(), now + TTL);
         assert!(!ledger.query(&other, now + TTL).tainted);
         // Expiring and re-registering the entry still fails closed.
-        assert_eq!(ledger.query(&key, now + TTL * 3), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL * 3);
         ledger.register(key.clone(), now + TTL * 3);
-        assert_eq!(ledger.query(&key, now + TTL * 3), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL * 3);
     }
 
     #[test]
@@ -1326,9 +1494,9 @@ mod tests {
         }
         let overflow = ("overflow".into(), "T".into());
         ledger.register(overflow.clone(), now);
-        assert_eq!(ledger.query(&overflow, now), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now);
         ledger.register(overflow.clone(), now + TTL * 10);
-        assert_eq!(ledger.query(&overflow, now + TTL * 10), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &overflow, now + TTL * 10);
         assert_eq!(ledger.seen.len(), MAX_REGISTRATION_AGENTS);
         let known = ("agent-0".into(), "fresh".into());
         ledger.register(known.clone(), now + TTL * 10);
@@ -1355,9 +1523,9 @@ mod tests {
             ledger.query(&("bob".into(), "turn-a".into()), now),
             Taint::unknown()
         );
-        assert_eq!(ledger.query(&key, now + TTL), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL);
         ledger.register(key.clone(), now + TTL);
-        assert_eq!(ledger.query(&key, now + TTL), Taint::unknown());
+        assert_unknown_turn(&mut ledger, &key, now + TTL);
     }
 
     #[test]
@@ -1738,4 +1906,50 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn recipient_route_authenticates_context_and_rejects_caller_source_fields() {
+        use crate::computer_use_sessions::auth::{AGENT_ID_HEADER, NONCE_HEADER};
+        use duduclaw_knowledge::requester::RequesterIdentity;
+        let home = policy_home("shadow");
+        let identity = duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key(home.path()).unwrap();
+        let state = RouteState::new(home.path().into());
+        let agent = "recipient-route-bot";
+        let token = duduclaw_core::mint_identity_token(&identity, agent);
+        let _turn = crate::turn_context::register(agent, "live", "line:source#agent:recipient-route-bot").unwrap();
+        let _requester = crate::knowledge::turn_requesters::register(agent, "live",
+            RequesterIdentity::ChannelUser {channel:"line".into(),chat:"source".into(),sender:"person".into(),user_id:Some("verified-person".into())}).unwrap();
+        let _guest_turn = crate::turn_context::register(agent, "guest", "line:guest").unwrap();
+        let _guest = crate::knowledge::turn_requesters::register(agent, "guest",
+            RequesterIdentity::ChannelUser { channel: "line".into(), chat: "guest".into(),
+                sender: "guest".into(), user_id: None }).unwrap();
+        for (turn, forged_source, expected) in [("live", false, Some("line:source")), ("guest", false, None), ("unknown", false, None), ("", false, None), ("live", true, None)] {
+            let mut request = serde_json::json!({"op":"recipients", "turn_id":turn});
+            if forged_source { request["source"] = serde_json::json!("line:forged"); }
+            let body = serde_json::to_vec(&request).unwrap();
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let signature = duduclaw_core::internal_request_signature(api_key.as_bytes(), agent, &token, &timestamp, &nonce, &body);
+            let mut headers = HeaderMap::new();
+            for (name, value) in [(AGENT_ID_HEADER, agent), (TIMESTAMP_HEADER, timestamp.as_str()),
+                (NONCE_HEADER, nonce.as_str()), (SIGNATURE_HEADER, signature.as_str())] {
+                headers.insert(name, value.parse().unwrap());
+            }
+            let response = handle(&state, "127.0.0.1:50001".parse().unwrap(), &headers, &body, "recipients");
+            if forged_source {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::OK);
+            let signature = response.headers()[duduclaw_core::egress_guard::RESPONSE_SIGNATURE_HEADER].to_str().unwrap().to_string();
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            assert!(duduclaw_core::verify_internal_request_signature(api_key.as_bytes(), agent, &token,
+                duduclaw_core::egress_guard::RESPONSE_DOMAIN, &nonce, &bytes, &signature));
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["source"].as_str(), expected);
+            assert_eq!(value["owners"], serde_json::json!([]));
+            assert_eq!(handle(&state, "127.0.0.1:50001".parse().unwrap(), &headers, &body, "recipients").status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
 }

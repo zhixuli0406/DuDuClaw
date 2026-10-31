@@ -457,6 +457,13 @@ impl MethodHandler {
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                 .as_table_mut();
             if let Some(budget) = budget {
+                if let Some(raw) = params_clone.get("when_unavailable") {
+                    let policy: duduclaw_core::types::BudgetWhenUnavailable =
+                        serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+                    let v = if policy == duduclaw_core::types::BudgetWhenUnavailable::Allow { "allow" } else { "deny" };
+                    budget.insert("when_unavailable".into(), toml::Value::String(v.into()));
+                    changes.push(format!("budget.when_unavailable = {v}"));
+                }
                 if let Some(v) = params_clone.get("monthly_limit_cents").and_then(|v| v.as_u64()) {
                     budget.insert("monthly_limit_cents".into(), toml::Value::Integer(v as i64));
                     changes.push(format!("budget.monthly_limit_cents = {v}"));

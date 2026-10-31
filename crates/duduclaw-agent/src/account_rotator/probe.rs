@@ -111,6 +111,7 @@ impl AccountRotator {
                     method: a.auth_method.clone(),
                     state: a.credential_state,
                     secret: probe_secret_for(a),
+                    env: super::load::build_account_env(a).env_vars,
                 })
                 .collect()
         };
@@ -211,10 +212,13 @@ impl AccountRotator {
                 AuthMethod::OAuth => {
                     // Legacy path: keychain / profile sessions and foreign
                     // subscription seats have no secret we can present.
-                    tokio::task::spawn_blocking(|| {
+                    let account_env = candidate.env.clone();
+                    tokio::task::spawn_blocking(move || {
                         let claude = duduclaw_core::which_claude();
                         claude.and_then(|bin| {
-                            let output = duduclaw_core::platform::command_for(&bin)
+                            let mut cmd = super::load::oauth_status_command(&bin);
+                            cmd.envs(account_env);
+                            let output = cmd
                                 .args(["auth", "status"])
                                 .stdout(std::process::Stdio::piped())
                                 .stderr(std::process::Stdio::null())
@@ -291,6 +295,7 @@ struct ProbeCandidate {
     method: AuthMethod,
     state: CredentialState,
     secret: Option<(CredentialKind, String)>,
+    env: HashMap<String, String>,
 }
 
 /// Whether the weak `claude auth status` signal is allowed to restore an

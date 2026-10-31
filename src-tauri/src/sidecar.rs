@@ -202,6 +202,7 @@ impl SidecarManager {
                 *self.port.lock().unwrap() = port;
                 self.attached.store(true, Ordering::SeqCst);
                 self.set_status(SidecarStatus::Running);
+                crate::distributor_brand::load_once(app, port);
                 Ok(port)
             }
             lifecycle::GatewayPlan::Spawn { port } => self.spawn_sidecar(app, port),
@@ -257,6 +258,7 @@ impl SidecarManager {
         // still refuses connections (the old behavior behind the picker's
         // "could not connect" right after app relaunch).
         let me = Arc::clone(self);
+        let ready_app = app.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let deadline = Instant::now() + READY_TIMEOUT;
             loop {
@@ -268,6 +270,7 @@ impl SidecarManager {
                 if lifecycle::is_duduclaw_gateway(lifecycle::DEFAULT_HOST, port) {
                     if me.generation.load(Ordering::SeqCst) == my_gen {
                         me.set_status(SidecarStatus::Running);
+                        crate::distributor_brand::load_once(&ready_app, port);
                         tracing::info!("gateway sidecar ready on port {port}");
                     }
                     return;
@@ -405,7 +408,7 @@ fn notify_sidecar_failure(app: &AppHandle) {
     let _ = app
         .notification()
         .builder()
-        .title("DuDuClaw")
+        .title(crate::distributor_brand::product_name(app))
         .body("背景服務無法啟動,請查看日誌。")
         .show();
 }

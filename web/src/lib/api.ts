@@ -1,4 +1,6 @@
+import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
+import { notifyDisconnectForget } from './forget-receipts';
 import { callTaskRpc, type TaskAttachmentInput } from './task-rpc';
 // v1.68 W2 — dashboard-switches RPC wire types.
 import type {
@@ -39,6 +41,18 @@ import type {
 } from './autopilot-rules';
 
 // Type definitions matching Rust types
+export interface EgressShadowReport {
+  days: 7 | 30;
+  total: number;
+  ticket_total: number;
+  capped: boolean;
+  by_employee: Array<{ key: string; count: number }>;
+  by_tool: Array<{ key: string; count: number }>;
+  by_source_class: Array<{ key: string; count: number }>;
+  daily: Array<{ key: string; count: number }>;
+  by_transport: Array<{ key: string; count: number }>;
+}
+
 export interface AgentInfo {
   name: string;
   display_name: string;
@@ -70,6 +84,7 @@ export interface AgentBudget {
   spent_cents: number;
   warn_threshold_percent: number;
   hard_stop: boolean;
+  when_unavailable?: 'allow' | 'deny';
 }
 
 export interface AgentModel {
@@ -739,7 +754,53 @@ export interface CredentialEntry {
   writable: boolean;
   /** A plaintext twin sits next to an encrypted twin (design §1.5). */
   residue: boolean;
+  source_kind?: string;
+  holder?: string | null;
+  service?: string | null;
+  kind?: string | null;
 }
+export type ChatCredentialKind = 'password' | 'api_key' | 'oauth_token' | 'ssh_key' | 'certificate' | 'connection_string' | 'cookie' | 'other';
+export type ChatCredentialStatus = 'active' | 'revoked' | 'rotated' | 'expired' | 'false_positive';
+export interface ChatCredential {
+  id: string;
+  kind: ChatCredentialKind;
+  account_hint: string | null;
+  service: string | null;
+  service_source: string | null;
+  source_kind: string;
+  source_ref: string;
+  source_ordinal?: number;
+  provided_by: string;
+  status: ChatCredentialStatus;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_used_at: string | null;
+  note: string | null;
+  note_source?: string;
+  holders: Array<{ holder_kind: string; holder_id: string; revoked_at?: string | null }>;
+}
+export interface CredentialAuditQuery {
+  kind?: string;
+  status?: string;
+  service?: string;
+  limit?: number;
+  offset?: number;
+  export?: boolean;
+}
+export interface SecurityAuditVerification {
+  status: 'missing' | 'unverified' | 'current_segment_consistent' | 'broken';
+  scope: 'current_segment';
+  intact: boolean;
+  lines_checked?: number;
+  line_number?: number;
+}
+
+export interface CredentialAuditReport {
+  credentials: ChatCredential[];
+  mode: 'audit' | 'mask';
+  total?: number;
+}
+
 export interface CredentialInventoryReport {
   entries: CredentialEntry[];
   total: number;
@@ -1212,6 +1273,7 @@ export type TimelineKind =
   | 'skill'
   | 'autopilot'
   | 'governance'
+  | 'problem'
   | 'activity';
 
 /** One Gantt row of the company work timeline — derived server-side from real
@@ -1226,6 +1288,10 @@ export interface TimelineRow {
   ended_at: string | null;
   status: string;
   ref_id: string;
+  /** Linked task; activity ref_id identifies the activity rather than the task. */
+  task_id?: string | null;
+  /** Last task update, not necessarily the moment its status changed. */
+  updated_at?: string;
 }
 
 export interface TimelineListResult {
@@ -3084,6 +3150,7 @@ export interface AgentUpdateParams {
   monthly_limit_cents?: number;
   warn_threshold_percent?: number;
   hard_stop?: boolean;
+  when_unavailable?: 'allow' | 'deny';
   // Heartbeat
   heartbeat_enabled?: boolean;
   heartbeat_interval?: number;
@@ -3411,6 +3478,32 @@ export interface RuntimeInstallStatus {
   docs_url: string;
 }
 
+export interface AgentProfilePreview {
+  id: string;
+  name?: string;
+  model?: string | null;
+  tools?: string[] | null;
+  disallowed_tools?: string[];
+  reports_to?: string | null;
+  files?: Array<{ path: string; sha256: string }>;
+  metadata?: { description?: string };
+  unmapped_fields?: Array<[string, string]>;
+  persona: { soul: string; identity: string };
+  user: string;
+  rules: string;
+  contract: string;
+  settings?: Record<string, unknown>;
+  input_guard: Array<{ section: string; blocked: boolean; matched_rules: string[]; score: number }>;
+}
+
+export type AgentProfileFormat = 'duduclaw' | 'openclaw' | 'hermes' | 'agents-md' | 'claude-subagent';
+export interface AgentProfileExport {
+  agent_id: string;
+  format: AgentProfileFormat;
+  include_user: boolean;
+  files: Array<{ name: string; content: string }>;
+}
+
 // ── Expert packs (專家包) ─────────────────────────
 
 /** One installed expert pack row from `experts.list` (admin-only). */
@@ -3458,7 +3551,13 @@ export interface ExpertImportReport {
   dry_run: boolean;
   meta: Record<string, string>;
   /** Structured extras: `replace` (what a replace moves away), `replaced`. */
-  details?: { replace?: ExpertReplaceInfo; replaced?: { agents: string[] } } | null;
+  details?: {
+    replace?: ExpertReplaceInfo;
+    replaced?: { agents: string[] };
+    profile_confirmation?: string;
+    profile_preview?: AgentProfilePreview[];
+    profile_install_plan?: Record<string, unknown>;
+  } | null;
   /** Set when the run failed. */
   error?: { code: string; params?: Record<string, unknown> | null; message?: string } | null;
   counts: Record<ExpertImportItem['status'], number>;
@@ -4267,6 +4366,8 @@ export type AutonomyLevel = 'operator' | 'collaborator' | 'consultant' | 'approv
 /** The `capabilities` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present (partial update). */
 export interface AgentCapabilities {
+  recipient_guard?: 'off' | 'shadow' | 'ask';
+  recipients?: string[];
   computer_use?: boolean;
   computer_use_mode?: ComputerUseMode;
   browser_via_bash?: boolean;
@@ -5135,8 +5236,7 @@ export interface CostPriceCliff {
 }
 
 /** Response of `cost.summary`. `available:false` = telemetry not initialized;
- *  all numeric fields are then absent. Costs are in millicents (1 cent =
- *  1000 millicents). */
+ *  all numeric fields are then absent. Cost fields are in cents. */
 export interface CostSummary {
   available: boolean;
   period?: string;
@@ -5546,6 +5646,8 @@ export interface MigrateSummary {
 /** Result shape shared by `migrate.scan` (dry_run:true) and `migrate.apply`
  *  (dry_run:false, report_path populated). */
 export interface MigrateResult {
+  profile_preview?: AgentProfilePreview[];
+  profile_confirmation?: string;
   platform: MigratePlatform;
   source: string;
   dry_run: boolean;
@@ -5561,12 +5663,14 @@ export interface MigrateResult {
 export interface SoftwareVendor { name_zh: string; name_en: string; url: string; }
 export interface AboutResponse {
   vendor: SoftwareVendor;
-  product_name: 'DuDuClaw';
+  product_name: string;
+  brand?: DistributorBrand | null;
+  brand_revision?: string;
   version: string;
   tier: string;
   /**
-   * Sanitized distributor-information HTML compiled into a distributor build.
-   * Absent on public builds. Render only through DistributorNoticeCard
+   * Sanitized distributor-information HTML from a signed runtime document
+   * or a distributor build, independent of license tier. Render only through DistributorNoticeCard
    * (sandboxed iframe), never into the dashboard DOM.
    */
   distributor_notice?: string;
@@ -5646,11 +5750,19 @@ export interface GoogleCredentialSection {
   error: string;
 }
 
+export interface GoogleServiceProbe {
+  service: string;
+  ok: boolean;
+  verified: boolean;
+  reason: string;
+  enable_url?: string | null;
+}
+
 export interface GoogleCredentialsStatus {
   /** `config.toml [integrations] google_workspace` — the master gate. */
   integration_enabled: boolean;
   /** Which path a real tool call would take right now. */
-  effective: 'direct' | 'apps_script' | 'none';
+  effective: 'direct' | 'oauth' | 'service_account' | 'apps_script' | 'none';
   service_account: GoogleCredentialSection;
   apps_script: GoogleCredentialSection;
   /** Scope list to hand a Workspace admin for delegation. */
@@ -5726,11 +5838,12 @@ export interface PersonalGoogleStatus {
   recent_usage: { timestamp: string; agent_id: string; tool_name: string; success: boolean }[];
 }
 
-export type GoogleCredentialsInput =
+export type GoogleCredentialsInput = (
   | { mode: 'service_account'; key_file: string; subject: string }
   /** Omit `secret` to keep the stored one while editing the URL. */
   | { mode: 'apps_script'; url: string; secret?: string }
-  | { mode: 'none' };
+  | { mode: 'none' | 'oauth'; testing?: boolean }
+) & { replace_confirmed?: boolean };
 
 /** One past WebChat session, as returned by `chat.sessions.list`
  *  (newest first, archived excluded). */
@@ -6101,6 +6214,8 @@ export const api = {
       }) as Promise<ChatSessionHistory>,
   },
   agents: {
+    exportProfile: (agentId: string, format: AgentProfileFormat, includeUser = false) =>
+      client.call('agents.export_profile', { agent_id: agentId, format, include_user: includeUser }) as Promise<AgentProfileExport>,
     /** WP4 — pass `include_archived: true` to also list archived AI staff
      *  (hidden by default). */
     list: (params?: { include_archived?: boolean }) =>
@@ -6323,13 +6438,14 @@ export const api = {
     /** Install from a server-local path (use `POST /api/experts/upload` to
      *  stage a .zip first — see ExpertsPage). Long-running: security scans run
      *  inside the install pipeline. */
-    install: (path: string, attachUnder?: string, dryRun?: boolean, reimport?: ExpertReimport) =>
+    install: (path: string, attachUnder?: string, dryRun?: boolean, reimport?: ExpertReimport, profileConfirmation?: string) =>
       client.call(
         'experts.install',
         {
           path,
           ...(attachUnder ? { attach_under: attachUnder } : {}),
           ...(dryRun ? { dry_run: true } : {}),
+          ...(profileConfirmation ? { confirm_profile: profileConfirmation } : {}),
           ...(reimport?.mode === 'copy' ? { reimport: 'copy' } : {}),
           ...(reimport?.mode === 'replace'
             ? { reimport: 'replace', replace_slug: reimport.slug, ...(reimport.acceptEdits ? { accept_edits: true } : {}) }
@@ -6585,9 +6701,10 @@ export const api = {
         sent: boolean;
         mode: 'live' | 'credential_only';
         detail: string;
+        services?: GoogleServiceProbe[];
       }>,
     remove: (type: string) =>
-      client.call('channels.remove', { type }),
+      client.call('channels.remove', { type }).then(notifyDisconnectForget),
     // WP1.1 (ecosystem): LINE OA add-friend link for the QR onboarding card /
     // printable poster. QR is rendered client-side from `add_friend_url`.
     lineAddFriend: () =>
@@ -7393,7 +7510,19 @@ export const api = {
     trigger: (agentId: string) =>
       client.call('heartbeat.trigger', { agent_id: agentId }) as Promise<{ success: boolean }>,
   },
+  credentials: {
+    auditList: (params: CredentialAuditQuery = {}) =>
+      client.call('credentials.audit_list', { ...params }) as Promise<CredentialAuditReport>,
+    auditGet: (id: string) =>
+      client.call('credentials.audit_get', { id }) as Promise<ChatCredential>,
+    auditUpdate: (params: { id: string; service?: string; note?: string; status?: ChatCredentialStatus }) =>
+      client.call('credentials.audit_update', params) as Promise<ChatCredential>,
+  },
   security: {
+    egressShadowReport: (days: 7 | 30 = 7) =>
+      client.call('security.egress_shadow_report', { days }) as Promise<EgressShadowReport>,
+    auditVerify: () =>
+      client.call('security.audit_verify') as Promise<SecurityAuditVerification>,
     auditLog: (limit = 50) =>
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
     status: () =>
@@ -7620,7 +7749,8 @@ export const api = {
      * OpenSource defaults when no license is installed, so the caller
      * can render without conditional-loading the call.
      */
-    status: () => client.call('license.status') as Promise<LicenseSnapshot>,
+    status: (): Promise<LicenseSnapshot> =>
+      client.call('license.status') as Promise<LicenseSnapshot>,
     /** Machine fingerprint provided to the general distributor for licensing. */
     fingerprint: () =>
       client.call('license.fingerprint', {}) as Promise<{ fingerprint: string }>,
@@ -7630,11 +7760,14 @@ export const api = {
      * error strings, already localized zh-TW (bad signature / fingerprint
      * mismatch / expired / malformed). No gateway restart needed on success.
      */
-    activate: (key: string) =>
-      client.call('license.activate', { key }) as Promise<{
-        success: boolean;
-        status: LicenseSnapshot;
-      }>,
+    activate: async (key: string): Promise<{ success: boolean; status: LicenseSnapshot }> => {
+      const result = await client.call('license.activate', { key }) as { success: boolean; status: LicenseSnapshot };
+      if (result.success) {
+        useBrandStore.getState().setBrand(null);
+        await loadPublicBrand();
+      }
+      return result;
+    },
   },
   marketplace: {
     list: () =>
@@ -7713,7 +7846,7 @@ export const api = {
         name: string;
       }>,
     remove: (name: string) =>
-      client.call('db_sources.remove', { name }) as Promise<{
+      client.call('db_sources.remove', { name }).then(notifyDisconnectForget) as Promise<{
         success: boolean;
         name: string;
         /** Agent ids whose grant to this source was revoked as a side effect
@@ -7763,13 +7896,15 @@ export const api = {
   googleCredentials: {
     get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
     set: (params: GoogleCredentialsInput) =>
-      client.call('google.credentials.set', params) as Promise<{ ok: boolean; mode: string }>,
+      client.call('google.credentials.set', params).then(notifyDisconnectForget) as Promise<{ ok: boolean; mode: string; staged?: boolean }>,
     test: () =>
-      client.call('google.credentials.test') as Promise<{
+      client.call('google.credentials.test', {}, false, 90000) as Promise<{
         ok: boolean;
+        result?: 'complete' | 'partial' | 'failed';
         path: string;
-        account?: string;
+        account?: string | null;
         detail: string;
+        services?: GoogleServiceProbe[];
       }>,
     /**
      * Flip `config.toml [integrations] google_workspace` — the master gate
@@ -7788,7 +7923,7 @@ export const api = {
     delegation: () => client.call('google.delegation.get') as Promise<GoogleDelegationStatus>,
     importKey: (keyJson: string) =>
       client.call('google.delegation.import_key', { key_json: keyJson }) as Promise<{ key: GoogleDelegationKeyInfo }>,
-    removeKey: () => client.call('google.delegation.remove_key', { confirm: true }) as Promise<{ removed: boolean }>,
+    removeKey: () => client.call('google.delegation.remove_key', { confirm: true }).then(notifyDisconnectForget) as Promise<{ removed: boolean }>,
     setSettings: (params: { allowed_subject_domains?: string[]; allowed_domains?: string[]; default_identity?: 'home' | 'none' }) =>
       client.call('google.delegation.settings_set', { ...params }) as Promise<{
         default_identity: 'home' | 'none';
@@ -7811,10 +7946,10 @@ export const api = {
     start: (acknowledgeGoogleData: boolean) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
     finish: (state: string) => client.call('me.google.connect_finish', { state }),
     paste: (url: string) => client.call('me.google.connect_paste', { url }),
-    disconnect: () => client.call('me.google.disconnect', { confirm: true }) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
+    disconnect: () => client.call('me.google.disconnect', { confirm: true }).then(notifyDisconnectForget) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
     consent: (agentId: string, allowed: boolean) => client.call('me.google.consents.set', { agent_id: agentId, allowed, confirm_shared_access: allowed }),
     primaryOwner: (agentId: string, userId: string) => client.call('agents.primary_owner_set', { agent_id: agentId, user_id: userId }),
-    disconnectUser: (userId: string) => client.call('users.google_disconnect', { user_id: userId, confirm: true }),
+    disconnectUser: (userId: string) => client.call('users.google_disconnect', { user_id: userId, confirm: true }).then(notifyDisconnectForget),
   },
   mcp: {
     list: () =>
@@ -7825,7 +7960,7 @@ export const api = {
         action,
         server_name: serverName,
         ...(serverDef ? { server_def: serverDef } : {}),
-      }) as Promise<{ success: boolean }>,
+      }).then(notifyDisconnectForget) as Promise<{ success: boolean }>,
     oauthProviders: () =>
       client.call('mcp.oauth.providers') as Promise<{ providers: McpOAuthProvider[] }>,
     oauthStart: (providerId: string, clientId?: string, clientSecret?: string, acknowledgeGoogleData?: boolean) =>
@@ -7842,11 +7977,16 @@ export const api = {
         /** Whether the access token itself is still fresh (it lasts ~1h on Google). */
         access_token_valid?: boolean;
         can_refresh?: boolean;
+        error_code?: 'access_denied' | 'admin_policy_enforced' | 'invalid_scope' | 'other' | null;
+        needs_reconnect?: boolean;
+        testing_warning?: boolean;
+        testing?: boolean;
+        connected_at?: string | null;
         expires_at: string | null;
         scopes?: string[];
       }>,
     oauthRevoke: (providerId: string) =>
-      client.call('mcp.oauth.revoke', { provider_id: providerId }) as Promise<{ success: boolean }>,
+      client.call('mcp.oauth.revoke', { provider_id: providerId }).then(notifyDisconnectForget) as Promise<{ success: boolean }>,
     importFetch: (url: string) =>
       client.call('mcp.import.fetch', { url }) as Promise<McpImportFetchResult>,
     importInstall: (params: {
@@ -7946,8 +8086,8 @@ export const api = {
     toolEffects: (agentId: string) =>
       client.call('mcp.tool_effects', { agent_id: agentId }) as Promise<{ servers: McpServerToolEffects[] }>,
     /** Admin: delete stored credentials; `forget` also removes the entry. */
-    remoteDisconnect: (agentId: string, name: string, forget = false) =>
-      client.call('mcp.remote_disconnect', { agent_id: agentId, name, forget }) as Promise<{
+    remoteDisconnect: (agentId: string, name: string, forget = false, forgetMemories = true) =>
+      client.call('mcp.remote_disconnect', { agent_id: agentId, name, forget, forget_memories: forgetMemories }).then(notifyDisconnectForget) as Promise<{
         success: boolean;
         existed: boolean;
       }>,
@@ -8605,10 +8745,10 @@ export const api = {
     /** Execute the migration — writes agents/tokens/skills/etc. and returns the
      *  same shape with `dry_run:false` + a `report_path`. May run up to 300s
      *  server-side, so a 300s response timeout is used. manager-gated. */
-    apply: (platform: MigratePlatform, source?: string, rename?: boolean) =>
+    apply: (platform: MigratePlatform, source?: string, rename?: boolean, profileConfirmation?: string) =>
       client.call(
         'migrate.apply',
-        migrateApplyArgs(platform, source, rename),
+        migrateApplyArgs(platform, source, rename, profileConfirmation),
         false,
         300000,
       ) as Promise<MigrateResult>,
@@ -8662,11 +8802,11 @@ export const api = {
     },
     remove: (userId: string) =>
       client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,
-    bindAgent: (userId: string, agentName: string, accessLevel?: string) =>
+    bindAgent: (userId: string, agentName: string, accessLevel: UserAgentBinding['access_level']) =>
       client.call('users.bind_agent', {
         user_id: userId,
         agent_name: agentName,
-        access_level: accessLevel ?? 'owner',
+        access_level: accessLevel,
       }) as Promise<{ status: string }>,
     unbindAgent: (userId: string, agentName: string) =>
       client.call('users.unbind_agent', { user_id: userId, agent_name: agentName }) as Promise<{ status: string }>,
@@ -8699,8 +8839,13 @@ export const api = {
       client.call('users.audit_log', params ?? {}) as Promise<{ entries: AuditEntry[] }>,
   },
   about: {
-    /** Fixed software identity, vendor attribution and version. */
-    get: () => client.call('about.get') as Promise<AboutResponse>,
+    /** Server-verified display brand on any licensed tier, immutable vendor attribution and version. */
+    get: async (): Promise<AboutResponse> => {
+      const apply = beginBrandRequest();
+      const about = await client.call('about.get') as AboutResponse;
+      apply(about.brand, about.brand_revision);
+      return about;
+    },
   },
   // ── Distributor management (owner instance only) ──────────────
   distributor: {

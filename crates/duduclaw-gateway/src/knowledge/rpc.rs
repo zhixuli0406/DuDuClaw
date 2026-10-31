@@ -69,12 +69,14 @@ fn access(op: &str, user: &ResolvedUser, collection_id: Option<&str>) -> AccessE
 }
 
 fn role_on(
+    home: &Path,
     conn: &Connection,
     collection_id: &str,
     user: &ResolvedUser,
     min: Role,
 ) -> KbResult<Role> {
-    acl::require_role(
+    super::principals::require_role(
+        home,
         conn,
         collection_id,
         &user.user_id,
@@ -186,12 +188,12 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
     match call.method.as_str() {
         "knowledge.collections.list" => {
             let list =
-                store::list_for_user(&conn, &u.user_id, u.department.as_deref(), u.is_admin)?;
+                super::principals::list_for_user(&call.home, &conn, u)?;
             Ok(json!({ "collections": list, "can_create": call.can_create }))
         }
         "knowledge.collections.get" => {
             let id = req(p, "id")?;
-            let role = role_on(&conn, id, u, Role::Viewer)?;
+            let role = role_on(&call.home, &conn, id, u, Role::Viewer)?;
             let mut list = store::list_by_ids(&conn, &[id.to_string()])?;
             let mut c = list.pop().ok_or(KbError::PermissionDenied)?;
             c.my_role = Some(role);
@@ -215,7 +217,7 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
         }
         "knowledge.collections.update" => {
             let id = req(p, "id")?;
-            role_on(&conn, id, u, Role::Owner)?;
+            role_on(&call.home, &conn, id, u, Role::Owner)?;
             let patch: CollectionPatch = serde_json::from_value(p.clone())
                 .map_err(|_| KbError::Invalid("集合資料格式不正確。".to_string()))?;
             let c =
@@ -231,7 +233,7 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
         }
         "knowledge.collections.delete" => {
             let id = req(p, "id")?.to_string();
-            role_on(&conn, &id, u, Role::Owner)?;
+            role_on(&call.home, &conn, &id, u, Role::Owner)?;
             let source_ids: Vec<String> = duduclaw_knowledge::sources::list_sources(&conn, &id)?
                 .into_iter()
                 .map(|s| s.id)
@@ -256,24 +258,24 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
         }
         "knowledge.acl.get" => {
             let id = req(p, "collection_id")?;
-            role_on(&conn, id, u, Role::Owner)?;
+            role_on(&call.home, &conn, id, u, Role::Owner)?;
             let (entries, revision) = acl::get_acl(&conn, id)?;
             Ok(json!({ "entries": entries, "revision": revision }))
         }
         "knowledge.acl.set" => acl_set(&mut conn, &call),
         "knowledge.sources.list" => {
             let id = req(p, "collection_id")?;
-            role_on(&conn, id, u, Role::Viewer)?;
+            role_on(&call.home, &conn, id, u, Role::Viewer)?;
             Ok(json!({ "sources": duduclaw_knowledge::sources::list_sources(&conn, id)? }))
         }
         "knowledge.sources.get" => {
             let src = source_collection(&conn, req(p, "source_id")?)?;
-            role_on(&conn, &src.collection_id, u, Role::Viewer)?;
+            role_on(&call.home, &conn, &src.collection_id, u, Role::Viewer)?;
             Ok(json!({ "source": src }))
         }
         "knowledge.sources.delete" => {
             let src = source_collection(&conn, req(p, "source_id")?)?;
-            role_on(&conn, &src.collection_id, u, Role::Editor)?;
+            role_on(&call.home, &conn, &src.collection_id, u, Role::Editor)?;
             if let Some(sha) = duduclaw_knowledge::sources::delete_source(&mut conn, &src.id)? {
                 remove_blobs(&call.home, &mut conn, &[sha]);
             }
@@ -292,7 +294,7 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
         }
         "knowledge.sources.reindex" => {
             let src = source_collection(&conn, req(p, "source_id")?)?;
-            role_on(&conn, &src.collection_id, u, Role::Editor)?;
+            role_on(&call.home, &conn, &src.collection_id, u, Role::Editor)?;
             duduclaw_knowledge::sources::request_reindex(&mut conn, &src.id)?;
             log_access(&conn, &access("reindex", u, Some(&src.collection_id)))?;
             Ok(json!({ "queued": true }))
@@ -301,7 +303,7 @@ fn dispatch(call: Call, embedder: Option<Arc<dyn duduclaw_knowledge::embed::Embe
         "knowledge.passage.get" => passage(&conn, &call),
         "knowledge.access_log.list" => {
             let id = req(p, "collection_id")?;
-            role_on(&conn, id, u, Role::Owner)?;
+            role_on(&call.home, &conn, id, u, Role::Owner)?;
             let source_ids: Vec<String> = duduclaw_knowledge::sources::list_sources(&conn, id)?
                 .into_iter()
                 .map(|s| s.id)
@@ -339,7 +341,7 @@ fn remove_blobs(home: &Path, conn: &mut Connection, shas: &[String]) {
 fn acl_set(conn: &mut Connection, call: &Call) -> KbResult<Value> {
     let p = &call.params;
     let id = req(p, "collection_id")?;
-    role_on(conn, id, &call.user, Role::Owner)?;
+    role_on(&call.home, conn, id, &call.user, Role::Owner)?;
     let expected = p
         .get("expected_revision")
         .and_then(Value::as_i64)
@@ -402,7 +404,7 @@ fn search(
     let p = &call.params;
     let query = req(p, "query")?;
     let human = dashboard_human(&call.user);
-    let allowed = acl::effective_collections(conn, &human, None, &narrowing(p))?;
+    let allowed = super::principals::effective_collections(&call.home, conn, &human, None, &narrowing(p))?;
     let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
     let embedder = embedder.unwrap_or_else(|| Arc::new(duduclaw_knowledge::embed::NoEmbedder));
     let cache = super::embedding::cache(&call.home);
@@ -436,7 +438,7 @@ fn passage(conn: &Connection, call: &Call) -> KbResult<Value> {
         .and_then(Value::as_i64)
         .ok_or_else(|| KbError::Invalid("缺少參數 chunk_id。".to_string()))?;
     let human = dashboard_human(&call.user);
-    let allowed = acl::effective_collections(conn, &human, None, &Narrowing::default())?;
+    let allowed = super::principals::effective_collections(&call.home, conn, &human, None, &Narrowing::default())?;
     let ctx = p
         .get("context_chars")
         .and_then(Value::as_u64)
@@ -518,7 +520,7 @@ async fn add_source(call: Call) -> KbResult<Value> {
     let home = call.home.clone();
     let result = blocking(move || {
         let mut conn = schema::open_home(&home)?;
-        role_on(&conn, &collection_id, &call.user, Role::Editor)?;
+        role_on(&call.home, &conn, &collection_id, &call.user, Role::Editor)?;
         let store = BlobStore::for_home(&home);
         let (sha, size) = match &bytes {
             Some(b) => (store.put(b)?, b.len() as u64),

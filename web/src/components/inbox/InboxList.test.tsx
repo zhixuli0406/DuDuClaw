@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { screen, fireEvent, within } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -39,6 +40,37 @@ function baseProps(over?: Partial<React.ComponentProps<typeof InboxList>>) {
 }
 
 describe('<InboxList>', () => {
+  it('pointer movement never selects or marks a row read', () => {
+    const props = baseProps({ selectedId: 'approval:1' });
+    renderWithProviders(<InboxList {...props} />);
+    fireEvent.mouseEnter(screen.getByText('Task is blocked').closest('[role="option"]')!);
+    expect(props.onSelect).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText('Task is blocked'));
+    expect(props.onSelect).toHaveBeenCalledWith(items[1]);
+  });
+
+  it('pending approvals cannot be archived by mouse or keyboard', () => {
+    const props = baseProps({ selectedId: 'approval:1', labels: { ...labels, archiveBlocked: 'Resolve first' } });
+    renderWithProviders(<InboxList {...props} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve first' }));
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'a' });
+    expect(props.onArchive).not.toHaveBeenCalled();
+  });
+
+  it('Enter on a nested archive button keeps its native action and never selects', () => {
+    const props = baseProps();
+    renderWithProviders(<InboxList {...props} />);
+    expect(fireEvent.keyDown(screen.getByRole('button', { name: 'Archive' }), { key: 'Enter' })).toBe(true);
+    expect(props.onSelect).not.toHaveBeenCalled();
+  });
+
+  it('Enter selects the focused row', () => {
+    const props = baseProps();
+    renderWithProviders(<InboxList {...props} />);
+    fireEvent.keyDown(screen.getByText('Task is blocked').closest('[role="option"]')!, { key: 'Enter' });
+    expect(props.onSelect).toHaveBeenCalledWith(items[1]);
+  });
+
   it('renders every item title', () => {
     renderWithProviders(<InboxList {...baseProps()} />);
     expect(screen.getByText('Approve the deploy')).toBeInTheDocument();
@@ -74,7 +106,7 @@ describe('<InboxList>', () => {
   });
 
   it('keyboard: j/k move selection, a archives, U marks unread, ⌘Z undoes', () => {
-    const props = baseProps({ selectedId: 'approval:1' });
+    const props = baseProps({ selectedId: 'blocked:2' });
     renderWithProviders(<InboxList {...props} />);
     const listbox = screen.getByRole('listbox');
     fireEvent.keyDown(listbox, { key: 'j' });
@@ -150,4 +182,30 @@ describe('<InboxList>', () => {
     expect(within(farRow).queryByText('Expiring soon')).not.toBeInTheDocument();
     expect(within(nearRow).getByText('Expiring soon')).toBeInTheDocument();
   });
+});
+
+
+it('j/k moves actual keyboard focus with the selected row', () => {
+  function List() {
+    const [selectedId, onSelect] = useState('approval:1');
+    return <InboxList {...baseProps({ selectedId, onSelect: (item) => onSelect(item.id) })} />;
+  }
+  renderWithProviders(<List />);
+  const rows = screen.getAllByRole('option');
+  rows[0].focus();
+  fireEvent.keyDown(rows[0], { key: 'j' });
+  expect(rows[1]).toHaveFocus();
+  expect(rows[1]).toHaveAttribute('aria-selected', 'true');
+  fireEvent.keyDown(rows[1], { key: 'k' });
+  expect(rows[0]).toHaveFocus();
+});
+
+it('processed approvals have no pending countdown', () => {
+  renderWithProviders(<InboxList {...baseProps({
+    groups: [{ key: '', items: [{ ...items[0], expiresAt: Date.now() / 1000 + 60 }] }],
+    isProcessed: () => true,
+    labels: { ...labels, typeLabel: () => 'Approved' },
+  })} />);
+  expect(screen.getByText('Approved')).toBeInTheDocument();
+  expect(screen.queryByTitle(labels.nearExpiryTooltip)).toBeNull();
 });

@@ -42,35 +42,34 @@ pub fn build_minimal_system_prompt(
     sender_block: &str,
     pinned_instructions: &str,
     default_language: Option<&str>,
-) -> String {
-    let contract_prompt = duduclaw_agent::contract::contract_to_prompt(&agent.contract);
+) -> std::io::Result<String> {
+    let mut profile = duduclaw_core::profile_sections::ProfileSections::load(&agent.dir)?;
     let display_name = if agent.config.agent.display_name.trim().is_empty() {
         &agent.config.agent.name
     } else {
         &agent.config.agent.display_name
     };
-    build_minimal_inner(MinimalInput {
-        agent_name: &agent.config.agent.name,
-        display_name,
-        default_language,
-        soul: agent.soul.as_deref(),
-        identity: agent.identity.as_deref(),
-        instructions: agent.instructions.as_deref(),
-        contract: &contract_prompt,
-        sender_block,
-        pinned_instructions,
-        minimal_core_kb: agent.config.prompt.minimal_core_kb,
-    })
+    profile.set_identity_directive(crate::prompt_identity::identity_and_language_section(
+        display_name, default_language,
+    ));
+    let sections = profile.rendered(duduclaw_core::profile_sections::ProfileRenderOptions {
+        core_max_bytes: Some(agent.config.prompt.minimal_core_kb as usize * 1024),
+        identity_max_bytes: Some(IDENTITY_MAX_BYTES),
+        ..Default::default()
+    });
+    Ok(finish_minimal(&agent.config.agent.name, sections, sender_block, pinned_instructions))
 }
 
 /// Pure-args shape for the minimal renderer. Lets tests pin behaviour
 /// without touching `LoadedAgent` or filesystem.
+#[cfg(test)]
 pub(crate) struct MinimalInput<'a> {
     pub agent_name: &'a str,
     pub display_name: &'a str,
     pub default_language: Option<&'a str>,
     pub soul: Option<&'a str>,
     pub identity: Option<&'a str>,
+    pub user: Option<&'a str>,
     /// INSTRUCTIONS.md — capped like SOUL.md (`minimal_core_kb`).
     pub instructions: Option<&'a str>,
     pub contract: &'a str,
@@ -79,72 +78,57 @@ pub(crate) struct MinimalInput<'a> {
     pub minimal_core_kb: u32,
 }
 
+#[cfg(test)]
 pub(crate) fn build_minimal_inner(input: MinimalInput<'_>) -> String {
+    use duduclaw_core::profile_sections::{ProfileSection, ProfileSectionKind as Kind, ProfileSections};
+    let mut profile = ProfileSections::default();
+    profile.set_identity_directive(crate::prompt_identity::identity_and_language_section(
+        input.display_name, input.default_language,
+    ));
+    for (kind, value) in [
+        (Kind::Soul, input.soul),
+        (Kind::Identity, input.identity),
+        (Kind::User, input.user),
+        (Kind::Instructions, input.instructions),
+        (Kind::Contract, Some(input.contract)),
+    ] {
+        if let Some(content) = value.filter(|s| !s.trim().is_empty()) {
+            profile.sections.push(ProfileSection { kind, content: content.to_string() });
+        }
+    }
+    let sections = profile.rendered(duduclaw_core::profile_sections::ProfileRenderOptions {
+        core_max_bytes: Some(input.minimal_core_kb as usize * 1024),
+        identity_max_bytes: Some(IDENTITY_MAX_BYTES),
+        ..Default::default()
+    });
+    finish_minimal(input.agent_name, sections, input.sender_block, input.pinned_instructions)
+}
+
+fn finish_minimal(
+    agent_name: &str,
+    sections: Vec<duduclaw_core::profile_sections::ProfileSection>,
+    sender_block: &str,
+    pinned_instructions: &str,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut audit: Vec<crate::prompt_audit::PromptSection> = Vec::new();
-
-    // 0. Authoritative identity + global default language, ahead of SOUL so
-    //    it wins over any stale name/language text SOUL.md still contains.
-    if let Some(s) = crate::prompt_identity::identity_and_language_section(
-        input.display_name,
-        input.default_language,
-    ) {
-        audit.push(crate::prompt_audit::PromptSection::new(
-            "identity_directive",
-            &s,
-        ));
-        parts.push(s);
-    }
-
-    // 1. SOUL core (truncated to minimal_core_kb)
-    if let Some(soul) = input.soul {
-        let max_bytes = (input.minimal_core_kb as usize) * 1024;
-        let trimmed = truncate_to_byte_budget(soul, max_bytes);
-        let s = if trimmed.len() < soul.len() {
-            format!(
-                "{}\n\n[truncated for minimal mode]",
-                trimmed
-            )
+    for section in sections {
+        let label = if section.kind == duduclaw_core::profile_sections::ProfileSectionKind::Soul {
+            "soul_core"
         } else {
-            trimmed.to_string()
+            section.kind.label()
         };
-        audit.push(crate::prompt_audit::PromptSection::new("soul_core", &s));
-        parts.push(s);
-    }
-
-    // 2. IDENTITY.md — short by convention; truncate at IDENTITY_MAX_BYTES
-    if let Some(identity) = input.identity {
-        let trimmed = truncate_to_byte_budget(identity, IDENTITY_MAX_BYTES);
-        audit.push(crate::prompt_audit::PromptSection::new("identity", trimmed));
-        parts.push(trimmed.to_string());
-    }
-
-    // 2b. INSTRUCTIONS.md — operator-imported operating instructions, cut to
-    //     the same `minimal_core_kb` budget SOUL gets above.
-    if let Some(s) = duduclaw_agent::instructions::render_section_capped(
-        input.instructions,
-        (input.minimal_core_kb as usize) * 1024,
-    ) {
-        audit.push(crate::prompt_audit::PromptSection::new("instructions", &s));
-        parts.push(s);
-    }
-
-    // 3. CONTRACT — keep verbatim, it's the safety guard
-    if !input.contract.is_empty() {
-        audit.push(crate::prompt_audit::PromptSection::new(
-            "contract",
-            input.contract,
-        ));
-        parts.push(input.contract.to_string());
+        audit.push(crate::prompt_audit::PromptSection::new(label, &section.content));
+        parts.push(section.content);
     }
 
     // 4. Sender block (RFC-21) — small XML island, always include if present
-    if !input.sender_block.is_empty() {
+    if !sender_block.is_empty() {
         audit.push(crate::prompt_audit::PromptSection::new(
             "sender",
-            input.sender_block,
+            sender_block,
         ));
-        parts.push(input.sender_block.to_string());
+        parts.push(sender_block.to_string());
     }
 
     // 5. MCP tool index — the active-retrieval contract: agent knows what's
@@ -153,19 +137,19 @@ pub(crate) fn build_minimal_inner(input: MinimalInput<'_>) -> String {
     parts.push(mcp_tool_index().to_string());
 
     // 6. Pinned task at the bottom (Anthropic best practice — high-attention tail)
-    if !input.pinned_instructions.is_empty() {
+    if !pinned_instructions.is_empty() {
         let s = format!(
             "## Pinned Task Instructions\n\
              The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
              {pinned}",
-            pinned = input.pinned_instructions
+            pinned = pinned_instructions
         );
         audit.push(crate::prompt_audit::PromptSection::new("pinned", &s));
         parts.push(s);
     }
 
     crate::prompt_audit::maybe_log_breakdown(
-        input.agent_name,
+        agent_name,
         "prompt_minimal",
         &audit,
         crate::prompt_audit::DEFAULT_EMIT_THRESHOLD_BYTES,
@@ -182,18 +166,9 @@ pub(crate) fn build_minimal_inner(input: MinimalInput<'_>) -> String {
 /// rule across SOUL/IDENTITY and any future minimal section. Pinning the
 /// boundary semantics in tests prevents silent panics if someone swaps
 /// the slice with raw byte indexing later.
+#[cfg(test)]
 pub(crate) fn truncate_to_byte_budget(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Walk back from max_bytes to the nearest char boundary so we never
-    // slice mid-codepoint. `is_char_boundary(0)` is always true so this
-    // terminates.
-    let mut end = max_bytes;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    duduclaw_core::truncate_bytes(s, max_bytes)
 }
 
 /// The fixed MCP tool index injected in place of inlined wiki/skill bodies.
@@ -235,6 +210,7 @@ mod tests {
             default_language: None,
             soul,
             identity,
+            user: None,
             instructions: None,
             contract: "",
             sender_block: sender,
@@ -377,6 +353,7 @@ mod tests {
             default_language: Some("zh-TW"),
             soul: Some("Be friendly."),
             identity: None,
+            user: None,
             instructions: None,
             contract: "",
             sender_block: "",
@@ -404,6 +381,7 @@ mod tests {
             default_language: None,
             soul: Some("SOUL-BODY"),
             identity: Some("IDENTITY-BODY"),
+            user: None,
             instructions: Some(&long),
             contract: "",
             sender_block: "",

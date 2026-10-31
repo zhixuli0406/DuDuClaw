@@ -216,6 +216,7 @@ impl TaskStore {
     ///
     /// There is deliberately **no** setter that overwrites an existing value.
     pub async fn freeze_team_spec(&self, id: &str, spec_json: &str) -> Result<bool, String> {
+        require_safe_contract(spec_json)?;
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
@@ -429,7 +430,9 @@ impl TaskStore {
             macro_rules! opt_field {
                 ($key:expr, $col:expr) => {
                     if let Some(v) = fields.get($key).and_then(|v| v.as_str()) {
-                        binds.push(v.to_string());
+                        binds.push(if matches!($key, "title" | "description" | "blocked_reason" | "acceptance_criteria") {
+                            mask_derived_text(v)
+                        } else { v.to_string() });
                         sets.push(format!("{} = ?{}", $col, binds.len()));
                     }
                 };
@@ -458,7 +461,7 @@ impl TaskStore {
             // after `insert_task`.
             opt_field!("acceptance_criteria", "acceptance_criteria");
             if let Some(v) = fields.get("tags").and_then(|v| v.as_str()) {
-                binds.push(v.to_string());
+                binds.push(mask_derived_text(v));
                 sets.push(format!("tags = ?{}", binds.len()));
             }
             // I-3b task list operations: archived/pinned are booleans, not
@@ -519,7 +522,7 @@ impl TaskStore {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE tasks SET goal_state_json = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, state_json, Utc::now().to_rfc3339()],
+            params![id, state_json.map(mask_derived_text), Utc::now().to_rfc3339()],
         )
         .map_err(|e| format!("set goal_state_json: {e}"))?;
         Ok(())
@@ -575,6 +578,7 @@ impl TaskStore {
             value = serde_json::json!({});
         }
         f(&mut value);
+        duduclaw_security::credential_detect::mask_json(&mut value);
         let new_json = serde_json::to_string(&value)
             .map_err(|e| format!("merge_goal_state_json serialize: {e}"))?;
         conn.execute(
@@ -698,6 +702,11 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
 /// P2-A C7: a task whose `parent_task_id` lies inside a stop request's tree is
 /// refused — an employee cannot open new sub-tasks under a stopped run.
 pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), String> {
+    for contract in [&row.team_spec_json, &row.discovery_spec_json, &row.criteria_ledger,
+        &row.acceptance_criteria_baseline].into_iter().flatten()
+    {
+        require_safe_contract(contract)?;
+    }
     if row
         .cost_cap_cents
         .is_some_and(|cap| cap == 0 || cap > i64::MAX as u64)
@@ -770,8 +779,8 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
                  ?47, ?48, ?49, ?50)",
         params![
             row.id,
-            row.title,
-            row.description,
+            mask_derived_text(&row.title),
+            mask_derived_text(&row.description),
             row.status,
             row.priority,
             row.assigned_to,
@@ -779,9 +788,9 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
             row.created_at,
             row.updated_at,
             row.completed_at,
-            row.blocked_reason,
+            row.blocked_reason.as_deref().map(mask_derived_text),
             row.parent_task_id,
-            row.tags,
+            mask_derived_text(&row.tags),
             row.message_id,
             row.claimed_by,
             row.claimed_at,
@@ -790,9 +799,9 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
             row.retry_count,
             row.max_retries,
             row.goal_mode as i64,
-            row.acceptance_criteria,
-            row.result_summary,
-            row.judge_feedback,
+            row.acceptance_criteria.as_deref().map(mask_derived_text),
+            row.result_summary.as_deref().map(mask_derived_text),
+            row.judge_feedback.as_deref().map(mask_derived_text),
             row.goal_id,
             row.lease_renewed_at,
             row.source_channel,
@@ -802,10 +811,10 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
             row.agent_seconds,
             row.source_discord_guild_id,
             row.deadline_at,
-            row.risk_boundary,
+            row.risk_boundary.as_deref().map(mask_derived_text),
             row.acceptance_criteria_baseline,
-            row.pause_reason,
-            row.plan_pending,
+            row.pause_reason.as_deref().map(mask_derived_text),
+            row.plan_pending.as_deref().map(mask_derived_text),
             row.archived as i64,
             row.pinned as i64,
             row.team_spec_json,

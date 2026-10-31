@@ -138,6 +138,15 @@ impl MethodHandler {
         if dry_run {
             args.push("--dry-run".into());
         }
+        if let Some(value) = params.get("confirm_profile") {
+            let Some(digest) = value.as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())) else {
+                return WsFrame::error_response("", "請先預覽設定檔，再確認匯入");
+            };
+            if !dry_run {
+                args.push("--confirm-profile".into());
+                args.push(digest.into());
+            }
+        }
         args.push("--report-json".into());
         args.push(report_path.as_os_str().to_os_string());
         for extra in [Self::attach_under_args(params), Self::reimport_args(params)] {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import type { InboxItem } from '@/lib/inbox-model';
+import { canArchiveInboxItem, type InboxItem } from '@/lib/inbox-model';
 import { InboxRow, type InboxRowLabels } from './InboxRow';
 
 /** A precomputed group the page hands down (label omitted ⇒ no header row). */
@@ -130,7 +130,7 @@ export function InboxList(props: InboxListProps) {
   );
 
   const onKeyDown = (e: ReactKeyboardEvent) => {
-    if (isEditableTarget(e.target)) return;
+    if (isEditableTarget(e.target) || (e.target instanceof HTMLElement && e.target.closest('button, a'))) return;
 
     // ⌘Z / Ctrl+Z — undo the last archive.
     if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
@@ -146,12 +146,20 @@ export function InboxList(props: InboxListProps) {
       case 'j':
       case 'ArrowDown':
         e.preventDefault();
-        if (rows.length) props.onSelect(rows[Math.min(currentRowIdx + 1, rows.length - 1)].item);
+        if (rows.length) {
+          const next = rows[Math.min(currentRowIdx + 1, rows.length - 1)];
+          rowRefs.current.get(next.key)?.querySelector<HTMLElement>('[role="option"]')?.focus({ preventScroll: true });
+          props.onSelect(next.item);
+        }
         break;
       case 'k':
       case 'ArrowUp':
         e.preventDefault();
-        if (rows.length) props.onSelect(rows[Math.max(currentRowIdx - 1, 0)].item);
+        if (rows.length) {
+          const next = rows[Math.max(currentRowIdx - 1, 0)];
+          rowRefs.current.get(next.key)?.querySelector<HTMLElement>('[role="option"]')?.focus({ preventScroll: true });
+          props.onSelect(next.item);
+        }
         break;
       case 'ArrowLeft':
         e.preventDefault();
@@ -166,7 +174,7 @@ export function InboxList(props: InboxListProps) {
         if (curItem) props.onSelect(curItem);
         break;
       case 'a':
-        if (curItem && canArchive) {
+        if (curItem && canArchive && canArchiveInboxItem(curItem, isProcessed(curItem))) {
           e.preventDefault();
           props.onArchive(curItem);
         }

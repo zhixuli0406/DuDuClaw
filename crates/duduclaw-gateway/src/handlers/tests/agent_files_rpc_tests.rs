@@ -90,6 +90,18 @@ pub(super) async fn fixture() -> Fx {
     Fx { _dir: dir, home, h, admin, owner_a, owner_b, operator, viewer }
 }
 
+#[tokio::test]
+async fn profile_export_refuses_context_passwords_in_every_format() {
+    let f = fixture().await;
+    std::fs::write(f.home.join("agents/a1/INSTRUCTIONS.md"), "db password: hunter2xyz").unwrap();
+    for format in ["duduclaw", "openclaw", "hermes", "agents-md", "claude-subagent"] {
+        let response = f.call("agents.export_profile", json!({"agent_id": "a1", "format": format}), &f.admin).await;
+        let error = err(&response);
+        assert!(error.contains("Rules"), "{format}: {error}");
+        assert!(!format!("{response:?}").contains("hunter2xyz"));
+    }
+}
+
 impl Fx {
     /// Boxed: debug builds keep every awaited `handle` future's state, and a
     /// test with many of them overflows the test thread's stack otherwise.
@@ -127,13 +139,13 @@ async fn reads_need_a_binding_and_writes_need_owner() {
     test_seam::set(&f.home, |_| Ok(PASS.into()));
     let list = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.viewer).await);
     let files: Vec<&str> = list["files"].as_array().unwrap().iter().map(|x| x["file"].as_str().unwrap()).collect();
-    // The five fixed files first; the employee's own skill files follow.
-    assert_eq!(files[..5], ["soul", "identity", "instructions", "contract", "agent_toml"]);
-    assert!(files[5..].iter().all(|f| f.starts_with("skill:")), "{files:?}");
+    // The six fixed files first; the employee's own skill files follow.
+    assert_eq!(files[..6], ["soul", "identity", "user", "instructions", "contract", "agent_toml"]);
+    assert!(files[6..].iter().all(|f| f.starts_with("skill:")), "{files:?}");
     assert!(list["files"].as_array().unwrap().iter().all(|x| x["editable_by_me"] == false));
     let mine = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.owner_a).await);
     assert_eq!(mine["files"][0]["editable_by_me"], true);
-    assert_eq!(mine["files"][4]["editable_by_me"], false, "agent.toml is never edited as text here");
+    assert_eq!(mine["files"][5]["editable_by_me"], false, "agent.toml is never edited as text here");
     // Versions and diffs: Operator and up.
     assert!(err(&f.call("agent_files.history", json!({ "agent_id": "a1", "file": "soul" }), &f.viewer).await).contains("permission"));
     ok(&f.call("agent_files.history", json!({ "agent_id": "a1", "file": "soul" }), &f.operator).await);
@@ -731,7 +743,7 @@ async fn a_missing_instructions_file_is_listed_and_can_be_created_through_save()
     test_seam::set(&f.home, |_| Ok(PASS.into()));
     let _ = std::fs::remove_file(f.home.join("agents/a1/INSTRUCTIONS.md"));
     let list = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.owner_a).await);
-    let row = &list["files"][2];
+    let row = list["files"].as_array().unwrap().iter().find(|row| row["file"] == "instructions").unwrap();
     assert_eq!(row["file"], "instructions");
     assert_eq!(row["exists"], false);
     assert_eq!(row["editable_by_me"], true, "the owner can create it");
@@ -742,7 +754,7 @@ async fn a_missing_instructions_file_is_listed_and_can_be_created_through_save()
     let text = std::fs::read_to_string(f.home.join("agents/a1/INSTRUCTIONS.md")).unwrap();
     assert!(text.contains("Reply politely."));
     let list = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.owner_a).await);
-    assert_eq!(list["files"][2]["exists"], true);
+    assert_eq!(list["files"].as_array().unwrap().iter().find(|row| row["file"] == "instructions").unwrap()["exists"], true);
 }
 
 #[tokio::test]
@@ -759,4 +771,35 @@ async fn runtime_files_are_read_only_and_follow_the_viewer_gate() {
     assert!(err(&f.call("agent_files.runtime_files", json!({ "agent_id": "a1" }), &f.owner_b).await).contains("permission"));
     // Neither name is a valid `agent_files.get` / `save` key.
     assert!(err(&f.call("agent_files.get", json!({ "agent_id": "a1", "file": "AGENTS.md" }), &f.admin).await).contains("file must be"));
+}
+
+#[tokio::test]
+async fn profile_export_requires_live_manager_visibility_and_explicit_user() {
+    let f = fixture().await;
+    let dir = f.home.join("agents/a1");
+    std::fs::write(dir.join("USER.md"), "Private user introduction").unwrap();
+    let request = json!({ "agent_id": "a1", "format": "duduclaw" });
+    assert!(!err(&f.call("agents.export_profile", request.clone(), &f.owner_a).await).is_empty());
+    let db = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
+    db.execute("UPDATE users SET role='manager' WHERE id='owner-a'", []).unwrap();
+    let manager = ctx("owner-a", UserRole::Manager, &[("a1", AccessLevel::Owner)]);
+    let result = ok(&f.call("agents.export_profile", request.clone(), &manager).await);
+    assert!(!result.to_string().contains("Private user introduction"));
+    let result = ok(&f.call("agents.export_profile", json!({ "agent_id": "a1", "format": "duduclaw", "include_user": true }), &manager).await);
+    assert!(result.to_string().contains("Private user introduction"));
+    assert_eq!(audit_rows(&f.home, "agent_profile_exported").len(), 2);
+    assert!(!err(&f.call("agents.export_profile", json!({ "agent_id": "b1", "format": "duduclaw" }), &manager).await).is_empty());
+    assert!(!err(&f.call("agents.export_profile", json!({ "agent_id": "a1", "format": "duduclaw", "include_user": "yes" }), &manager).await).is_empty());
+    db.execute("UPDATE users SET role='employee' WHERE id='owner-a'", []).unwrap();
+    assert!(!err(&f.call("agents.export_profile", request, &manager).await).is_empty(), "stale session must not retain Manager export rights");
+}
+
+#[tokio::test]
+async fn profile_export_refuses_secrets_without_returning_content() {
+    let f = fixture().await;
+    let token = fake_discord_token();
+    std::fs::write(f.home.join("agents/a1/SOUL.md"), format!("token: {token}")).unwrap();
+    let message = err(&f.call("agents.export_profile", json!({ "agent_id": "a1", "format": "duduclaw" }), &f.admin).await);
+    assert!(!message.contains(&token));
+    assert!(message.contains("Persona"), "{message}");
 }

@@ -68,7 +68,14 @@ impl MethodHandler {
                     match params.get("agent_id").and_then(|v| v.as_str()) {
                         Some(id) if !id.is_empty() => {
                             if let Err(e) = acl::require_agent_access(ctx, id, $min_level) {
-                                return WsFrame::error_response("", &e);
+                                // Only these read methods admit a live team grant.
+                                // All mutations and every other filtered RPC stay direct-only.
+                                if !matches!(method, "timeline.list" | "runs.list")
+                                    || $min_level != AccessLevel::Viewer
+                                    || !team_visibility::may_monitor(ctx, id)
+                                {
+                                    return WsFrame::error_response("", &e);
+                                }
                             }
                         }
                         _ => {
@@ -96,177 +103,180 @@ impl MethodHandler {
             | "me.google.consents.set"
             | "users.google_disconnect"
             | "agents.primary_owner_set" => {
-                Box::pin(self.handle_personal_google_rpc(method, params, ctx)).await
+                boxed_frame(|| self.handle_personal_google_rpc(method, params, ctx)).await
             }
-            "users.my_history_views" => Box::pin(self.handle_my_history_views(params, ctx)).await,
-            "users.team_history.list" => Box::pin(self.handle_team_history_list(params, ctx)).await,
-            "users.team_history.get" => Box::pin(self.handle_team_history_get(params, ctx)).await,
+            "users.my_history_views" => boxed_frame(|| self.handle_my_history_views(params, ctx)).await,
+            "users.team_history.list" => boxed_frame(|| self.handle_team_history_list(params, ctx)).await,
+            "users.team_history.get" => boxed_frame(|| self.handle_team_history_get(params, ctx)).await,
             "users.org_settings.get" | "users.org_settings.update" => {
                 require_admin!();
-                Box::pin(self.handle_org_history_settings(params, ctx, method.ends_with(".update")))
+                boxed_frame(|| self.handle_org_history_settings(params, ctx, method.ends_with(".update")))
                     .await
             }
             "discovery.catalog" | "discovery.list" | "discovery.tree" | "discovery.artifact"
-            | "discovery.cancel" => Box::pin(self.handle_discovery_rpc(method, params, ctx)).await,
+            | "discovery.cancel" => boxed_frame(|| self.handle_discovery_rpc(method, params, ctx)).await,
             "dashboard.layout.view" => {
                 require_manager!();
-                Box::pin(self.handle_dashboard_layout_view(params, ctx)).await
+                boxed_frame(|| self.handle_dashboard_layout_view(params, ctx)).await
             }
             // ── Custom widgets (sandboxed-iframe HTML cards; 2026-07-16) ──
-            "widgets.custom.list" => Box::pin(self.handle_widgets_custom_list(ctx)).await,
-            "widgets.custom.get" => Box::pin(self.handle_widgets_custom_get(params, ctx)).await,
-            "widgets.custom.create" => Box::pin(self.handle_widgets_custom_create(params, ctx)).await,
-            "widgets.custom.update" => Box::pin(self.handle_widgets_custom_update(params, ctx)).await,
-            "widgets.custom.remove" => Box::pin(self.handle_widgets_custom_remove(params, ctx)).await,
-            "widgets.custom.share" => Box::pin(self.handle_widgets_custom_share(params, ctx)).await,
-            "widgets.custom.generate" => Box::pin(self.handle_widgets_custom_generate(params)).await,
+            "widgets.custom.list" => boxed_frame(|| self.handle_widgets_custom_list(ctx)).await,
+            "widgets.custom.get" => boxed_frame(|| self.handle_widgets_custom_get(params, ctx)).await,
+            "widgets.custom.create" => boxed_frame(|| self.handle_widgets_custom_create(params, ctx)).await,
+            "widgets.custom.update" => boxed_frame(|| self.handle_widgets_custom_update(params, ctx)).await,
+            "widgets.custom.remove" => boxed_frame(|| self.handle_widgets_custom_remove(params, ctx)).await,
+            "widgets.custom.share" => boxed_frame(|| self.handle_widgets_custom_share(params, ctx)).await,
+            "widgets.custom.generate" => {
+                require_manager!();
+                boxed_frame(|| self.handle_widgets_custom_generate(params)).await
+            },
             "users.subordinates" => {
                 require_manager!();
-                Box::pin(self.handle_users_subordinates(ctx)).await
+                boxed_frame(|| self.handle_users_subordinates(ctx)).await
             }
             // 我的團隊: the caller's reporting tree and the employees they may
             // call through it. Enterprise-only through the `users` family gate.
             "users.my_team" => {
                 require_manager!();
-                Box::pin(self.handle_users_my_team(ctx)).await
+                boxed_frame(|| self.handle_users_my_team(ctx)).await
             }
             // ── Departments (org structure for agent create/edit) ──
             "departments.list" => {
                 require_manager!();
-                Box::pin(self.handle_departments_list()).await
+                boxed_frame(|| self.handle_departments_list()).await
             }
             "departments.create" => {
                 require_admin!();
-                Box::pin(self.handle_departments_create(params)).await
+                boxed_frame(|| self.handle_departments_create(params)).await
             }
             "departments.remove" => {
                 require_admin!();
-                Box::pin(self.handle_departments_remove(params)).await
+                boxed_frame(|| self.handle_departments_remove(params)).await
             }
             "users.list" => {
                 require_admin!();
-                Box::pin(self.handle_users_list()).await
+                boxed_frame(|| self.handle_users_list()).await
             }
             "users.create" => {
                 require_admin!();
-                Box::pin(self.handle_users_create(params, ctx)).await
+                boxed_frame(|| self.handle_users_create(params, ctx)).await
             }
             "users.update" => {
                 require_admin!();
-                Box::pin(self.handle_users_update(params, ctx)).await
+                boxed_frame(|| self.handle_users_update(params, ctx)).await
             }
             "users.remove" => {
                 require_admin!();
-                Box::pin(self.handle_users_remove(params, ctx)).await
+                boxed_frame(|| self.handle_users_remove(params, ctx)).await
             }
             "users.bind_agent" => {
                 require_admin!();
-                Box::pin(self.handle_users_bind_agent(params, ctx)).await
+                boxed_frame(|| self.handle_users_bind_agent(params, ctx)).await
             }
             "users.unbind_agent" => {
                 require_admin!();
-                Box::pin(self.handle_users_unbind_agent(params, ctx)).await
+                boxed_frame(|| self.handle_users_unbind_agent(params, ctx)).await
             }
             "users.offboard" => {
                 require_admin!();
-                Box::pin(self.handle_users_offboard(params, ctx)).await
+                boxed_frame(|| self.handle_users_offboard(params, ctx)).await
             }
-            "users.me" => Box::pin(self.handle_users_me(ctx)).await,
+            "users.me" => boxed_frame(|| self.handle_users_me(ctx)).await,
             // Self-service: any logged-in user changes their OWN password. Not
             // admin-gated on purpose — it only ever mutates the caller's account,
             // and it's the sole password path in the single-owner edition (the
             // multi-user Users page is hidden there).
-            "users.change_password" => Box::pin(self.handle_users_change_password(params, ctx)).await,
+            "users.change_password" => boxed_frame(|| self.handle_users_change_password(params, ctx)).await,
             // Self-service, same reasoning as `users.change_password`: it only
             // changes the caller's own login email.
-            "users.change_email" => Box::pin(self.handle_users_change_email(params, ctx)).await,
+            "users.change_email" => boxed_frame(|| self.handle_users_change_email(params, ctx)).await,
             "users.audit_log" => {
                 require_admin!();
-                Box::pin(self.handle_users_audit_log(params)).await
+                boxed_frame(|| self.handle_users_audit_log(params)).await
             }
 
             "mcp.list" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_list()).await
+                boxed_frame(|| self.handle_mcp_list()).await
             }
             "mcp.update" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_update(&params)).await
+                boxed_frame(|| self.handle_mcp_update(&params)).await
             }
             // Read-only preview (fetch + scan): any authenticated user may
             // browse and scan candidates before requesting install.
-            "mcp.import.fetch" => Box::pin(self.handle_mcp_import_fetch(params)).await,
+            "mcp.import.fetch" => boxed_frame(|| self.handle_mcp_import_fetch(params)).await,
             // Direct install stays admin-only; non-admins file an install request.
             "mcp.import.install" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_import_install(params)).await
+                boxed_frame(|| self.handle_mcp_import_install(params)).await
             }
-            "mcp.install_request" => Box::pin(self.handle_mcp_install_request(params, ctx)).await,
+            "mcp.install_request" => boxed_frame(|| self.handle_mcp_install_request(params, ctx)).await,
             // MCP Registry: search is read-only (like mcp.import.fetch);
             // install routes Admins to the direct install and everyone else
             // to an install request inside the handler.
-            "mcp.registry_search" => Box::pin(self.handle_mcp_registry_search(params)).await,
-            "mcp.registry_install" => Box::pin(self.handle_mcp_registry_install(params, ctx)).await,
+            "mcp.registry_search" => boxed_frame(|| self.handle_mcp_registry_search(params)).await,
+            "mcp.registry_install" => boxed_frame(|| self.handle_mcp_registry_install(params, ctx)).await,
             // Native remote MCP connections hold credentials: Admin only.
             "mcp.remote_connect" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_remote_connect(params, ctx)).await
+                boxed_frame(|| self.handle_mcp_remote_connect(params, ctx)).await
             }
             "mcp.remote_complete" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_remote_complete(params, ctx)).await
+                boxed_frame(|| self.handle_mcp_remote_complete(params, ctx)).await
             }
             "mcp.remote_status" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_remote_status(params)).await
+                boxed_frame(|| self.handle_mcp_remote_status(params)).await
             }
             "mcp.remote_disconnect" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_remote_disconnect(params, ctx)).await
+                boxed_frame(|| self.handle_mcp_remote_disconnect(params, ctx)).await
             }
             // Third-party tools with their derived effect class (2026-10-08).
             "mcp.tool_effects" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_tool_effects(params)).await
+                boxed_frame(|| self.handle_mcp_tool_effects(params)).await
             }
             // MCP Events subscriptions hold signing secrets: Admin only.
             "mcp.events_subscribe" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_events_subscribe(params)).await
+                boxed_frame(|| self.handle_mcp_events_subscribe(params)).await
             }
             "mcp.events_discover" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_events_discover(params)).await
+                boxed_frame(|| self.handle_mcp_events_discover(params)).await
             }
             "mcp.events_list" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_events_list(params)).await
+                boxed_frame(|| self.handle_mcp_events_list(params)).await
             }
             "mcp.events_unsubscribe" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_events_unsubscribe(params)).await
+                boxed_frame(|| self.handle_mcp_events_unsubscribe(params)).await
             }
             "mcp.events_rotate" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_events_rotate(params)).await
+                boxed_frame(|| self.handle_mcp_events_rotate(params)).await
             }
 
             // ── MCP OAuth (admin only) ──────────────────────────
             "mcp.oauth.providers" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_oauth_providers()).await
+                boxed_frame(|| self.handle_mcp_oauth_providers()).await
             }
             "mcp.oauth.start" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_oauth_start(params, ctx)).await
+                boxed_frame(|| self.handle_mcp_oauth_start(params, ctx)).await
             }
             "mcp.oauth.status" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_oauth_status(params)).await
+                boxed_frame(|| self.handle_mcp_oauth_status(params)).await
             }
             "mcp.oauth.revoke" => {
                 require_admin!();
-                Box::pin(self.handle_mcp_oauth_revoke(params)).await
+                boxed_frame(|| self.handle_mcp_oauth_revoke(params)).await
             }
 
             // ── Google credential paths (admin only) ────────────
@@ -275,15 +285,15 @@ impl MethodHandler {
             // returns the stored bridge secret.
             "google.credentials.get" => {
                 require_admin!();
-                Box::pin(self.handle_google_credentials_get()).await
+                boxed_frame(|| self.handle_google_credentials_get()).await
             }
             "google.credentials.set" => {
                 require_admin!();
-                Box::pin(self.handle_google_credentials_set(params)).await
+                boxed_frame(|| self.handle_google_credentials_set(params)).await
             }
             "google.credentials.test" => {
                 require_admin!();
-                Box::pin(self.handle_google_credentials_test()).await
+                boxed_frame(|| self.handle_google_credentials_test()).await
             }
             // G6 (2026-09 feature audit): the master gate as a first-class
             // control. The page used to be unconditionally visible while
@@ -293,7 +303,7 @@ impl MethodHandler {
             // and offers this switch instead.
             "google.integration.set" => {
                 require_admin!();
-                Box::pin(self.handle_google_integration_set(params)).await
+                boxed_frame(|| self.handle_google_integration_set(params)).await
             }
             // ── Per-employee Google identity (B2a) ──────────────
             // Who each AI employee acts as. Writing an identity, the sealed
@@ -301,24 +311,24 @@ impl MethodHandler {
             // employee's own identity needs Viewer access to that employee.
             "google.delegation.get" => {
                 require_admin!();
-                Box::pin(self.handle_google_delegation_get()).await
+                boxed_frame(|| self.handle_google_delegation_get()).await
             }
             "google.delegation.import_key" => {
                 require_admin!();
-                Box::pin(self.handle_google_delegation_import_key(params, ctx)).await
+                boxed_frame(|| self.handle_google_delegation_import_key(params, ctx)).await
             }
             "google.delegation.remove_key" => {
                 require_admin!();
-                Box::pin(self.handle_google_delegation_remove_key(params, ctx)).await
+                boxed_frame(|| self.handle_google_delegation_remove_key(params, ctx)).await
             }
             "google.delegation.settings_set" => {
                 require_admin!();
-                Box::pin(self.handle_google_delegation_settings_set(params, ctx))
+                boxed_frame(|| self.handle_google_delegation_settings_set(params, ctx))
                     .await
             }
             "google.identity.test" => {
                 require_admin!();
-                Box::pin(self.handle_google_identity_test(params)).await
+                boxed_frame(|| self.handle_google_identity_test(params)).await
             }
             "agents.google_identity_get" => {
                 let agent_id = params
@@ -327,18 +337,18 @@ impl MethodHandler {
                     .unwrap_or("")
                     .to_string();
                 check_agent_named!(&agent_id, AccessLevel::Viewer);
-                Box::pin(self.handle_agents_google_identity_get(&agent_id)).await
+                boxed_frame(|| self.handle_agents_google_identity_get(&agent_id)).await
             }
             "agents.google_identity_set" => {
                 let agent_id = params.get("agent_id").and_then(Value::as_str).unwrap_or("");
                 check_agent_named!(agent_id, AccessLevel::Owner);
-                Box::pin(self.handle_agents_google_identity_set(params, ctx)).await
+                boxed_frame(|| self.handle_agents_google_identity_set(params, ctx)).await
             }
 
             // P9 employee digest + feedback on finished work (per-call ACL
             // inside: Viewer to read, Operator + task audience to rate).
             "digest.latest" | "digest.feedback" => {
-                Box::pin(self.handle_digest_rpc(method, params, ctx)).await
+                boxed_frame(|| self.handle_digest_rpc(method, params, ctx)).await
             }
 
             // ── Task Board (agent-scoped — HS4 fix) ────
@@ -357,73 +367,73 @@ impl MethodHandler {
             | "tasks.steer"
             | "tasks.steering"
             | "tasks.stop"
-            | "tasks.stop_status" => Box::pin(self.handle_responsibilities_rpc(method, params, ctx)).await,
+            | "tasks.stop_status" => boxed_frame(|| self.handle_responsibilities_rpc(method, params, ctx)).await,
             "tasks.review_snapshot" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_tasks_review_snapshot(params, ctx)).await,
+                boxed_frame(|| self.handle_tasks_review_snapshot(params, ctx)).await,
             ),
             "tasks.review_accept" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_tasks_review_accept(params, ctx)).await,
+                boxed_frame(|| self.handle_tasks_review_accept(params, ctx)).await,
             ),
             "workflow_drafts.create" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_drafts_create(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_drafts_create(params, ctx)).await,
             ),
             "workflow_drafts.get" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_drafts_get(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_drafts_get(params, ctx)).await,
             ),
             "workflow_drafts.list" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_drafts_list(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_drafts_list(params, ctx)).await,
             ),
             "workflow_drafts.run_fixture" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_drafts_run_fixture(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_drafts_run_fixture(params, ctx)).await,
             ),
             "workflow_drafts.request_activation" => {
                 super::workflow_errors::with_workflow_error_code(
                     method,
-                    Box::pin(self.handle_workflow_drafts_request_activation(params, ctx))
+                    boxed_frame(|| self.handle_workflow_drafts_request_activation(params, ctx))
                         .await,
                 )
             }
             "workflow_drafts.commit_activation" => {
                 super::workflow_errors::with_workflow_error_code(
                     method,
-                    Box::pin(self.handle_workflow_drafts_commit_activation(params, ctx))
+                    boxed_frame(|| self.handle_workflow_drafts_commit_activation(params, ctx))
                         .await,
                 )
             }
             "workflow_drafts.revoke_activation" => {
                 super::workflow_errors::with_workflow_error_code(
                     method,
-                    Box::pin(self.handle_workflow_drafts_revoke_activation(params, ctx))
+                    boxed_frame(|| self.handle_workflow_drafts_revoke_activation(params, ctx))
                         .await,
                 )
             }
             "workflow_runs.get" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_runs_get(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_runs_get(params, ctx)).await,
             ),
             "workflow_runs.list" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_runs_list(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_runs_list(params, ctx)).await,
             ),
             "workflow_runs.cancel" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_runs_cancel(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_runs_cancel(params, ctx)).await,
             ),
             "workflow_runs.reset_failures" => super::workflow_errors::with_workflow_error_code(
                 method,
-                Box::pin(self.handle_workflow_runs_reset_failures(params, ctx)).await,
+                boxed_frame(|| self.handle_workflow_runs_reset_failures(params, ctx)).await,
             ),
             "tasks.list" => {
                 // Non-admins must scope the listing to an agent they are
                 // bound to or may assign to.
                 check_task_board_filter!();
-                Box::pin(self.handle_tasks_list(params, ctx)).await
+                boxed_frame(|| self.handle_tasks_list(params, ctx)).await
             }
             "tasks.create" => {
                 // The target agent is `assigned_to`; creating work for an agent
@@ -441,20 +451,20 @@ impl MethodHandler {
                 if !ctx.can_assign_to(assigned_to) {
                     return WsFrame::error_response("", "permission denied");
                 }
-                Box::pin(self.handle_tasks_create(params, ctx)).await
+                boxed_frame(|| self.handle_tasks_create(params, ctx)).await
             }
-            "tasks.update" => Box::pin(self.handle_tasks_update(params, ctx)).await,
-            "tasks.remove" => Box::pin(self.handle_tasks_remove(params, ctx)).await,
-            "tasks.assign" => Box::pin(self.handle_tasks_assign(params, ctx)).await,
+            "tasks.update" => boxed_frame(|| self.handle_tasks_update(params, ctx)).await,
+            "tasks.remove" => boxed_frame(|| self.handle_tasks_remove(params, ctx)).await,
+            "tasks.assign" => boxed_frame(|| self.handle_tasks_assign(params, ctx)).await,
             // I-3b task list operations (dashboard-ux-workbuddy 2026-08):
             // archive/pin/rename, thin wrappers over `handle_tasks_update`
             // (same delegation pattern as `tasks.assign` above) so HS4
             // agent-binding authorization is enforced exactly once.
-            "tasks.archive" => Box::pin(self.handle_tasks_archive(params, ctx)).await,
-            "tasks.unarchive" => Box::pin(self.handle_tasks_unarchive(params, ctx)).await,
-            "tasks.pin" => Box::pin(self.handle_tasks_pin(params, ctx)).await,
-            "tasks.unpin" => Box::pin(self.handle_tasks_unpin(params, ctx)).await,
-            "tasks.rename" => Box::pin(self.handle_tasks_rename(params, ctx)).await,
+            "tasks.archive" => boxed_frame(|| self.handle_tasks_archive(params, ctx)).await,
+            "tasks.unarchive" => boxed_frame(|| self.handle_tasks_unarchive(params, ctx)).await,
+            "tasks.pin" => boxed_frame(|| self.handle_tasks_pin(params, ctx)).await,
+            "tasks.unpin" => boxed_frame(|| self.handle_tasks_unpin(params, ctx)).await,
+            "tasks.rename" => boxed_frame(|| self.handle_tasks_rename(params, ctx)).await,
             // I-3b: paginated task listing (with total count) — replaces the
             // client-side `.slice(0, 20)` hard cut the `/goals` page used to
             // apply to finished tasks. Same Viewer/agent-filter gate as
@@ -466,36 +476,36 @@ impl MethodHandler {
                 if !super::tasks_rpc::assigned_by_me(&params) {
                     check_task_board_filter!();
                 }
-                Box::pin(self.handle_tasks_list_page(params, ctx)).await
+                boxed_frame(|| self.handle_tasks_list_page(params, ctx)).await
             }
             // L2: task comments. Access is gated inside the handler by the
             // task's owning agent (Viewer) — anyone who can see the task may
             // read/post; unknown task fails closed for non-admins.
-            "tasks.comment" => Box::pin(self.handle_tasks_comment(params, ctx)).await,
-            "tasks.comments" => Box::pin(self.handle_tasks_comments(params, ctx)).await,
+            "tasks.comment" => boxed_frame(|| self.handle_tasks_comment(params, ctx)).await,
+            "tasks.comments" => boxed_frame(|| self.handle_tasks_comments(params, ctx)).await,
             // Iterative Kanban: per-task revision timeline + per-agent flow
             // metrics. Both are read-only board analytics (Viewer). The
             // per-task call gates on the task's owning agent inside the handler
             // (like tasks.comments); the aggregate forces non-admins to scope to
             // a bound agent (check_agent_filter) and filters the result to it.
-            "tasks.iterations" => Box::pin(self.handle_tasks_iterations(params, ctx)).await,
-            "tasks.timeline" => Box::pin(self.handle_tasks_timeline(params, ctx)).await,
+            "tasks.iterations" => boxed_frame(|| self.handle_tasks_iterations(params, ctx)).await,
+            "tasks.timeline" => boxed_frame(|| self.handle_tasks_timeline(params, ctx)).await,
             // WP-F (P2-c): per-task file-change evidence for the needs_human
             // 「變更」tab. Same read-only, task-scoped gate as tasks.comments.
-            "tasks.changes" => Box::pin(self.handle_tasks_changes(params, ctx)).await,
-            "tasks.artifacts" => Box::pin(self.handle_tasks_artifacts(params, ctx)).await,
-            "tasks.role_turns" => Box::pin(self.handle_tasks_role_turns(params, ctx)).await,
-            "tasks.goal_decide" => Box::pin(self.handle_tasks_goal_decide(params, ctx)).await,
-            "tasks.goal_create" => Box::pin(self.handle_tasks_goal_create(params, ctx)).await,
+            "tasks.changes" => boxed_frame(|| self.handle_tasks_changes(params, ctx)).await,
+            "tasks.artifacts" => boxed_frame(|| self.handle_tasks_artifacts(params, ctx)).await,
+            "tasks.role_turns" => boxed_frame(|| self.handle_tasks_role_turns(params, ctx)).await,
+            "tasks.goal_decide" => boxed_frame(|| self.handle_tasks_goal_decide(params, ctx)).await,
+            "tasks.goal_create" => boxed_frame(|| self.handle_tasks_goal_create(params, ctx)).await,
             // 交辦任務 page 「一般」 tab: a skill handed to the employee that last
             // ran it. Same right as goal_create, checked on the server-picked
             // runner inside (`tasks_skill_assign_rpc`).
-            "tasks.skill_assign" => Box::pin(self.handle_tasks_skill_assign(params, ctx)).await,
+            "tasks.skill_assign" => boxed_frame(|| self.handle_tasks_skill_assign(params, ctx)).await,
             // Scheduled assignments: the caller's own (an Admin: everyone's).
             // Ownership is decided inside (`assign_schedule::manage`).
-            "assign_schedules.list" => Box::pin(self.handle_assign_schedules_list(params, ctx)).await,
+            "assign_schedules.list" => boxed_frame(|| self.handle_assign_schedules_list(params, ctx)).await,
             "assign_schedules.pause" => {
-                Box::pin(self.handle_assign_schedules_manage(
+                boxed_frame(|| self.handle_assign_schedules_manage(
                     params,
                     ctx,
                     crate::assign_schedule::ManageAction::Pause,
@@ -503,7 +513,7 @@ impl MethodHandler {
                 .await
             }
             "assign_schedules.resume" => {
-                Box::pin(self.handle_assign_schedules_manage(
+                boxed_frame(|| self.handle_assign_schedules_manage(
                     params,
                     ctx,
                     crate::assign_schedule::ManageAction::Resume,
@@ -511,7 +521,7 @@ impl MethodHandler {
                 .await
             }
             "assign_schedules.remove" => {
-                Box::pin(self.handle_assign_schedules_manage(
+                boxed_frame(|| self.handle_assign_schedules_manage(
                     params,
                     ctx,
                     crate::assign_schedule::ManageAction::Remove,
@@ -520,7 +530,7 @@ impl MethodHandler {
             }
             "tasks.flow_metrics" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_tasks_flow_metrics(params)).await
+                boxed_frame(|| self.handle_tasks_flow_metrics(params)).await
             }
 
             // ── Co-edited plans (U4, Cocoa arXiv:2412.10999) ──
@@ -529,9 +539,9 @@ impl MethodHandler {
             // owning agent inside the handler and fail closed (HS4).
             "plans.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_plans_list(params)).await
+                boxed_frame(|| self.handle_plans_list(params)).await
             }
-            "plans.get" => Box::pin(self.handle_plans_get(params, ctx)).await,
+            "plans.get" => boxed_frame(|| self.handle_plans_get(params, ctx)).await,
             "plans.create" => {
                 // The owning agent is `agent_id`; creating a shared plan for
                 // an agent is side-effecting → Operator binding required.
@@ -543,18 +553,18 @@ impl MethodHandler {
                     return WsFrame::error_response("", "agent_id is required");
                 }
                 check_agent_named!(agent_id, AccessLevel::Operator);
-                Box::pin(self.handle_plans_create(params, ctx)).await
+                boxed_frame(|| self.handle_plans_create(params, ctx)).await
             }
-            "plans.update" => Box::pin(self.handle_plans_update(params, ctx)).await,
-            "plans.remove" => Box::pin(self.handle_plans_remove(params, ctx)).await,
-            "plans.add_step" => Box::pin(self.handle_plans_add_step(params, ctx)).await,
-            "plans.update_step" => Box::pin(self.handle_plans_update_step(params, ctx)).await,
-            "plans.remove_step" => Box::pin(self.handle_plans_remove_step(params, ctx)).await,
+            "plans.update" => boxed_frame(|| self.handle_plans_update(params, ctx)).await,
+            "plans.remove" => boxed_frame(|| self.handle_plans_remove(params, ctx)).await,
+            "plans.add_step" => boxed_frame(|| self.handle_plans_add_step(params, ctx)).await,
+            "plans.update_step" => boxed_frame(|| self.handle_plans_update_step(params, ctx)).await,
+            "plans.remove_step" => boxed_frame(|| self.handle_plans_remove_step(params, ctx)).await,
 
             // ── Activity Feed (agent-scoped — HS4 fix) ───
             "activity.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_activity_list(params, ctx)).await
+                boxed_frame(|| self.handle_activity_list(params, ctx)).await
             }
             // Per-topic filtering is NOT implemented: BroadcastLayer fans out every
             // activity event to every authenticated WS client unconditionally. This
@@ -573,7 +583,7 @@ impl MethodHandler {
             //    as activity.list: viewing is read-only, agent-scoped.
             "timeline.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_timeline_list(params, ctx)).await
+                boxed_frame(|| self.handle_timeline_list(params, ctx)).await
             }
 
             // ── Run inspector (G12) — per-run transcript derived from
@@ -581,13 +591,13 @@ impl MethodHandler {
             //    activity.list: read-only, agent-scoped, fail-closed.
             "runs.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_runs_list(params, ctx)).await
+                boxed_frame(|| self.handle_runs_list(params, ctx)).await
             }
             // Gated inside the handler by the run's owning agent (Viewer) —
             // the agent id is only known after resolving the run's session;
             // unknown run fails closed for non-admins.
-            "runs.get" => Box::pin(self.handle_runs_get(params, ctx)).await,
-            "runs.subscribe" | "runs.unsubscribe" => Box::pin(self.handle_runs_subscription(params, ctx)).await,
+            "runs.get" => boxed_frame(|| self.handle_runs_get(params, ctx)).await,
+            "runs.subscribe" | "runs.unsubscribe" => boxed_frame(|| self.handle_runs_subscription(params, ctx)).await,
 
             // ── WebChat session history + resume (WP3) ──────
             // Same gate as runs.list: read-only, agent-scoped, fail-closed.
@@ -596,22 +606,22 @@ impl MethodHandler {
             // conversations.
             "chat.sessions.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_chat_sessions_list(params, ctx)).await
+                boxed_frame(|| self.handle_chat_sessions_list(params, ctx)).await
             }
             // Gated inside the handler by the session's owning agent (Viewer) —
             // the agent id is resolved from the session; an unknown session id
             // fails closed ("session not found") before any turns are exposed.
-            "chat.sessions.history" => Box::pin(self.handle_chat_sessions_history(params, ctx)).await,
+            "chat.sessions.history" => boxed_frame(|| self.handle_chat_sessions_history(params, ctx)).await,
 
             // ── Decision Continuity (RFC-24, agent-scoped) ──
             "decisions.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_decisions_list(params)).await
+                boxed_frame(|| self.handle_decisions_list(params)).await
             }
             "decisions.dismiss" => {
                 // Marking a captured decision as a false positive mutates state.
                 check_agent_filter!(AccessLevel::Operator);
-                Box::pin(self.handle_decisions_dismiss(params)).await
+                boxed_frame(|| self.handle_decisions_dismiss(params)).await
             }
 
             // ── Live Canvas (G15) — agent-pushed HTML workspace. Same gate
@@ -622,7 +632,7 @@ impl MethodHandler {
             //    dashboard renders it inside `<iframe sandbox="">`.
             "canvas.get" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                Box::pin(self.handle_canvas_get(params)).await
+                boxed_frame(|| self.handle_canvas_get(params)).await
             }
 
             // ── Notification governance (W2-4) ──────────────
@@ -658,21 +668,21 @@ impl MethodHandler {
             // depend on the duduclaw-cli crate.
             "migrate.scan" => {
                 require_manager!();
-                Box::pin(self.handle_migrate_scan(params)).await
+                boxed_frame(|| self.handle_migrate_scan(params)).await
             }
             "migrate.apply" => {
                 require_manager!();
-                Box::pin(self.handle_migrate_apply(params)).await
+                boxed_frame(|| self.handle_migrate_apply(params)).await
             }
 
             // ── Approvals (WP14-T14.7 approval center) ──────
             "approvals.operations" => {
                 require_admin!();
-                Box::pin(self.handle_approval_operations(params, ctx, false)).await
+                boxed_frame(|| self.handle_approval_operations(params, ctx, false)).await
             }
             "approvals.resolve_uncertain" => {
                 require_admin!();
-                Box::pin(self.handle_approval_operations(params, ctx, true)).await
+                boxed_frame(|| self.handle_approval_operations(params, ctx, true)).await
             }
             "approvals.list" | "approvals.get" => {
                 require_manager!();
@@ -681,12 +691,12 @@ impl MethodHandler {
                 {
                     return WsFrame::error_response("", "id is required");
                 }
-                Box::pin(self.handle_approvals_list(params, ctx)).await
+                boxed_frame(|| self.handle_approvals_list(params, ctx)).await
             }
             "approvals.decide" => {
                 require_manager!();
                 // Keep the approval future out of every outer dispatch frame on Windows.
-                Box::pin(self.handle_approvals_decide(params, ctx)).await
+                boxed_frame(|| self.handle_approvals_decide(params, ctx)).await
             }
 
             // ── Agent Mail (P2-d) — 信箱 ────────────────────
@@ -694,44 +704,44 @@ impl MethodHandler {
             // correspondence and confirming a send is a real-world act.
             "mail.status" => {
                 require_manager!();
-                Box::pin(self.handle_mail_status()).await
+                boxed_frame(|| self.handle_mail_status()).await
             }
-            "mail.list" => match self.mailbox_reader_gate(ctx).await {
-                Ok(reader) => Box::pin(self.handle_mail_list(params, reader)).await,
+            "mail.list" => match boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
+                Ok(reader) => boxed_frame(|| self.handle_mail_list(params, reader)).await,
                 Err(e) => WsFrame::error_response("", &e),
             },
             "mail.read" => {
-                if let Err(e) = self.mailbox_reader_gate(ctx).await {
+                if let Err(e) = boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
                 }
-                Box::pin(self.handle_mail_read(params, ctx)).await
+                boxed_frame(|| self.handle_mail_read(params, ctx)).await
             }
             "mail.archive" => {
                 require_manager!();
-                if let Err(e) = self.mailbox_viewer_gate(ctx).await {
+                if let Err(e) = boxed_frame(|| self.mailbox_viewer_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
                 }
-                Box::pin(self.handle_mail_archive(params, ctx)).await
+                boxed_frame(|| self.handle_mail_archive(params, ctx)).await
             }
             "mail.outbox" => {
                 require_manager!();
-                if let Err(e) = self.mailbox_viewer_gate(ctx).await {
+                if let Err(e) = boxed_frame(|| self.mailbox_viewer_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
                 }
-                Box::pin(self.handle_mail_outbox(params)).await
+                boxed_frame(|| self.handle_mail_outbox(params)).await
             }
             "mail.decide" => {
                 require_manager!();
-                if let Err(e) = self.mailbox_viewer_gate(ctx).await {
+                if let Err(e) = boxed_frame(|| self.mailbox_viewer_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
                 }
-                Box::pin(self.handle_mail_decide(params, ctx)).await
+                boxed_frame(|| self.handle_mail_decide(params, ctx)).await
             }
 
             // ── D5 topology evolution: routing overrides + pending reroute proposals ──
             "topology.list" => {
                 require_manager!();
-                Box::pin(self.handle_topology_list()).await
+                boxed_frame(|| self.handle_topology_list()).await
             }
 
             // ── W3-1 human takeover: READ-ONLY surface ──────
@@ -750,27 +760,27 @@ impl MethodHandler {
             // Install approval requests (Skill / MCP two-stage signature chain)
             "install_requests.list" => {
                 require_manager!();
-                Box::pin(self.handle_install_requests_list(ctx)).await
+                boxed_frame(|| self.handle_install_requests_list(ctx)).await
             }
-            "install_requests.mine" => Box::pin(self.handle_install_requests_mine(ctx)).await,
+            "install_requests.mine" => boxed_frame(|| self.handle_install_requests_mine(ctx)).await,
             "install_requests.decide" => {
                 require_manager!();
-                Box::pin(self.handle_install_requests_decide(params, ctx)).await
+                boxed_frame(|| self.handle_install_requests_decide(params, ctx)).await
             }
 
             // ── Budget incidents (WP14-T14.6) ───────────────
             "budget.incidents" => {
                 require_manager!();
-                Box::pin(self.handle_budget_incidents(params)).await
+                boxed_frame(|| self.handle_budget_incidents(params)).await
             }
 
             // ── Autopilot (admin only) ──────────────────────
             "autopilot.list" => {
                 require_admin!();
-                Box::pin(self.handle_autopilot_list()).await
+                boxed_frame(|| self.handle_autopilot_list()).await
             }
 
-            _ => Box::pin(self.dispatch_ops(method, params, ctx, conn)).await,
+            _ => boxed_frame(|| self.dispatch_ops(method, params, ctx, conn)).await,
         }
     }
 }

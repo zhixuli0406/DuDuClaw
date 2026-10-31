@@ -37,7 +37,9 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
             }
             "system.version" => json!({"version":"canary-fixture"}),
             "agents.list" => json!({"agents":[]}),
+            "users.me" => json!({"user":user(),"bindings":[]}),
             "approvals.list" => json!({"approvals":[],"count":0}),
+            "tasks.list_page" => json!({"tasks":[],"total":0,"limit":200,"offset":0}),
             _ => panic!("unexpected method: {method}"),
         };
         let response = WsFrame::ok_response(&id, payload);

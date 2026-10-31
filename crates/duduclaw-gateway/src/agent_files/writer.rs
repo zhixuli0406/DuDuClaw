@@ -5,7 +5,7 @@
 //! (the AI review may have taken seconds, and a binding can be revoked in
 //! between), render the new text from the bytes just read, validate the
 //! artifact that will take effect, keep the version, replace the file
-//! owner-only and atomically, and update the SOUL / INSTRUCTIONS baseline.
+//! owner-only and atomically, and update the SOUL / IDENTITY / USER / INSTRUCTIONS baseline.
 //! After the lock: audit, registry rescan, channel notice, config event.
 
 use std::path::Path;
@@ -22,7 +22,7 @@ use super::history::{self, VersionMeta};
 use super::verdict::Verdict;
 use super::{AgentFilesConfig, FileKey};
 
-/// What happens to the stored SOUL / INSTRUCTIONS baseline after the write.
+/// What happens to the stored SOUL / IDENTITY / USER / INSTRUCTIONS baseline after the write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Baseline {
     /// The person reviewed the whole content: it becomes the baseline.
@@ -143,9 +143,9 @@ pub(crate) fn commit_locked_with_lifecycle(
             Ok(_) => return Ok(Locked::Err(CommitError::Refused("skill file not found".into()))),
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
         };
-        let current = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !c.key.is_skill() => String::new(),
+        let (current, existed) = match std::fs::read_to_string(&path) {
+            Ok(s) => (s, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !c.key.is_skill() => (String::new(), false),
             Err(e) => return Ok(Locked::Err(CommitError::Failed(format!("cannot read {}: {e}", c.key.file_name())))),
         };
         let before_hash = super::hash_of(&current);
@@ -158,6 +158,15 @@ pub(crate) fn commit_locked_with_lifecycle(
             Ok(n) => n,
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
         };
+        let new = if c.key == FileKey::User {
+            if new.len() > c.key.max_bytes() || new.chars().count() > super::MAX_USER_CHARS {
+                return Ok(Locked::Err(CommitError::Refused("服務對象介紹超過大小限制".into())));
+            }
+            match duduclaw_security::credential_detect::mask_document(&new) {
+                Ok(masked) => masked,
+                Err(_) => return Ok(Locked::Err(CommitError::Refused("憑證掃描失敗，未寫入 USER.md".into()))),
+            }
+        } else { new };
         // Compare fresh bytes under the file lock, before any history or write.
         // The lease also covers external MCP edits and raw profile restoration.
         let _lifecycle = if c.key == FileKey::AgentToml
@@ -174,7 +183,7 @@ pub(crate) fn commit_locked_with_lifecycle(
         }
         let hash = super::hash_of(&new);
         let accept_current = new == current && c.baseline == Baseline::AcceptCurrent && c.key.protected_doc().is_some();
-        if new == current && !accept_current {
+        if existed && new == current && !accept_current {
             return Ok(Locked::Done(Outcome {
                 before: current,
                 after: new,
@@ -185,6 +194,9 @@ pub(crate) fn commit_locked_with_lifecycle(
                 registry_reloaded: true,
             }));
         }
+        if c.key == FileKey::User && new.chars().count() > super::MAX_USER_CHARS {
+            return Ok(Locked::Err(CommitError::Refused("服務對象介紹最多 4,000 個字".into())));
+        }
         if new.len() > c.key.max_bytes() {
             return Ok(Locked::Err(CommitError::Refused(format!("內容太長：最多 {} KB", c.key.max_bytes() / 1024))));
         }
@@ -192,6 +204,15 @@ pub(crate) fn commit_locked_with_lifecycle(
             && let Err(e) = crate::product_policy::validate_write(c.home, &path, &current, &new)
         {
             return Ok(Locked::Err(CommitError::Refused(e)));
+        }
+        if c.key == FileKey::AgentToml {
+            let table = match new.parse::<toml::Table>() {
+                Ok(table) => table,
+                Err(_) => return Ok(Locked::Err(CommitError::Refused("invalid agent.toml; connection ownership cannot be verified".into()))),
+            };
+            if let Err(e) = crate::disconnect_forget::connections::mark_config_connecting(c.home, &table, Some(c.agent_id)) {
+                return Ok(Locked::Err(CommitError::Refused(e)));
+            }
         }
         // The version first: a change that cannot be undone is not written.
         let meta = VersionMeta {

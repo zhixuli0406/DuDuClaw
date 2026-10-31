@@ -136,6 +136,21 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 description: "Rename the task",
                 required: false,
             },
+            ParamDef {
+                name: "notify_channel",
+                description: "Result channel; supply with notify_chat_id (empty pair clears routing)",
+                required: false,
+            },
+            ParamDef {
+                name: "notify_chat_id",
+                description: "Result destination; supply with notify_channel",
+                required: false,
+            },
+            ParamDef {
+                name: "notify_thread_id",
+                description: "Discord thread destination; supply the complete channel/chat pair",
+                required: false,
+            },
         ],
     },
     ToolDef {

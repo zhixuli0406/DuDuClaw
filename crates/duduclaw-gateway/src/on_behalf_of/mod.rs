@@ -10,8 +10,8 @@
 //! | approval raised in the run | `approvals.on_behalf_of` | approval broker (task-local, else host env) | approval cards |
 //!
 //! The first value set wins; a later hop never overwrites it. Tool
-//! arguments are never read. A malformed stored value is dropped and audited
-//! as `on_behalf_of_rejected`.
+//! arguments are never read. A malformed stored value stays Unknown and is
+//! audited as `on_behalf_of_rejected`; it never becomes background work.
 //!
 //! The person is resolved by the same requester mapping the knowledge base
 //! uses ([`crate::knowledge::requester_map`]): a WebChat account or a
@@ -42,13 +42,46 @@ tokio::task_local! {
 /// Audit event for a principal value that was not accepted.
 pub const AUDIT_REJECTED: &str = "on_behalf_of_rejected";
 
+/// A present but invalid principal must survive every existing string carrier.
+/// This deliberately is not a valid `HumanPrincipal` wire form.
+const UNKNOWN_WIRE: &str = "unknown:rejected-principal";
+
+/// Provenance at an authority boundary. Only an absent carrier is Background.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrincipalState {
+    Human(HumanPrincipal),
+    Background,
+    Unknown,
+}
+
+impl PrincipalState {
+    pub fn from_wire(raw: Option<&str>) -> Self {
+        match raw {
+            None => Self::Background,
+            Some(raw) => match HumanPrincipal::parse(raw.trim()) {
+                Ok(principal) => Self::Human(principal),
+                Err(_) => Self::Unknown,
+            },
+        }
+    }
+
+    /// Preserve all three states in queue rows and existing spawn variables.
+    pub fn to_wire(&self) -> Option<String> {
+        match self {
+            Self::Human(principal) => Some(principal.to_string()),
+            Self::Background => None,
+            Self::Unknown => Some(UNKNOWN_WIRE.to_string()),
+        }
+    }
+}
+
 /// The principal in scope, if any.
 pub fn current() -> Option<String> {
     ON_BEHALF_OF.try_with(Clone::clone).ok().flatten()
 }
 
 /// Run `fut` with `value` as the principal, unless one is already in scope
-/// (the first writer wins). `value` must already be validated
+/// (the first writer wins). `value` must already be classified
 /// ([`principal_for_requester`], [`from_stored`]).
 pub fn scope_first<F: Future>(value: Option<String>, fut: F) -> impl Future<Output = F::Output> {
     let effective = current().or(value);
@@ -106,15 +139,15 @@ pub fn principal_for_requester(home: &Path, who: &RequesterIdentity) -> Option<S
     principal.map(|p| p.to_string())
 }
 
-/// A stored value (queue row, task row), validated. A malformed value is
-/// audited and dropped; `source` names where it was read for the audit.
+/// Classify a stored value (queue row, task row). A malformed present value
+/// is audited and kept as Unknown; only an absent old-row value is Background.
 pub fn from_stored(home: &Path, raw: Option<&str>, agent: &str, source: &str) -> Option<String> {
-    let raw = raw.map(str::trim).filter(|r| !r.is_empty())?;
+    let raw = raw?.trim();
     match HumanPrincipal::parse(raw) {
         Ok(p) => Some(p.to_string()),
         Err(rejection) => {
             audit_rejected(home, agent, source, &rejection);
-            None
+            PrincipalState::Unknown.to_wire()
         }
     }
 }

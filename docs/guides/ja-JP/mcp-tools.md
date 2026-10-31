@@ -21,7 +21,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 |---|---|---|
 | 外部クライアント許可リスト | `principal.is_external` | 従来の許可リスト 7 ツールと、明示的に付与した scope のツールのみ。続けて次の行の scope 規則が適用されます |
 | 社員でない呼び出し元の scope | `principal.scopes`。`admin` を持たず AI 社員でもないキー（gateway 内部キーでも、社員ごとのキーでも、gateway が社員用に起動したプロセスでもない）に適用 | キーが最低 scope を持つツールだけを掲載。プロセス自身のエージェントとして動くツール（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` と三つの統合状態の参照など）は掲載せず、すべての外部キーにも掲載しません。呼び出しはディスパッチゲートが同じ規則で拒否します（`process_agent_tool`）。[mcp-standalone.md](mcp-standalone.md) を参照 |
-| Google Workspace | `config.toml [integrations] google_workspace` | Google 系 19 ツールを非表示 |
+| Google Workspace | `config.toml [integrations] google_workspace` | オフ時は `google_status` を含む全 19 ツールが非表示。ダッシュボードの設定・テストは可能。[接続手順](google-setup.md)。 |
 | Google の身元（v1.76.0） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 19 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
 | GitHub | `config.toml [integrations] github` | `github_*` 5 ツールを非表示 |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 拒否分を非表示。許可リストが非空なら他を全て非表示。項目は完全一致、または末尾の `*` で照合：`*`、`mcp__duduclaw__*`（DuDuClaw の全ツール）、`mcp__duduclaw__odoo_*`／`memory_*`（先頭からの前方一致）。`mcp__<他のサーバー>__…` は DuDuClaw のツールに一致しない。それ以外の位置の `*` は通常の文字。3 つの承認リストと `scoped_tools` も同じ規則 |
@@ -35,6 +35,8 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | `[knowledge] enabled` とコレクションの付与 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | ナレッジベースが有効で、社員またはその部門に（`[knowledge] collections` で絞り込んだ後も）1 つ以上のコレクションが付与されていない限り `knowledge_*` 4 ツールを非表示。付与の変更で `list_changed` を送信（下の [`knowledge_*`](#knowledge_ドキュメントナレッジベース) を参照） |
 | `[responsibilities] enabled` | `config.toml` | `responsibility_*` 3 ツールを非表示（下の[継続タスクのツール](#responsibility_get--responsibility_followup--responsibility_ask--継続タスクのツール)を参照） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有効な付与 | タスクスコープの付与が有効になるまで非表示 |
+
+機器操作コンソール（`/console`）は管理者だけが利用できます。`system_operator` スタッフが機器操作ツールを実行するときも、サーバーで依頼者が有効な管理者かを確認します。他の AI スタッフとの通常の会話は、従来のアクセス規則で利用できます。
 
 新規作成したエージェントは上記のいずれも有効ではありません。それが狙いで、既定の構成は使えるツールの分だけを支払います。
 
@@ -258,3 +260,7 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 - [remote-mcp.md](../remote-mcp.md) — HTTP/OAuth トランスポート
 - [../../spec/task-packet.md](../../spec/task-packet.md) — TaskPacket 仕様
 - [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md) — `duduclaw_ccr_*` ツール。MCP サーバーではなく直接 API のツールループが注入します
+
+## 認証情報の用途を宣言する
+
+`credential_declare` は `credential_id` と `service` だけを受け取り、社員のメモを拒否します。サービスは `^[a-z0-9][a-z0-9._-]{0,63}$` に一致し、認証情報の検出を通過する必要があります。認証済みでその認証情報を保持する社員だけが、署名付き gateway loopback ルート経由で宣言できます。Admin が設定したサービスを社員が上書きすることはできません。このツールは既存の監査メタデータへの注記であり、秘密の取得、新たな保持者への権限付与、ツール呼び出しへの実値代入は行いません。Admin は「セキュリティ → 認証情報の監査」で確認・修正できます。[認証情報監査](../../features/ja-JP/70-credential-audit.md)を参照してください。

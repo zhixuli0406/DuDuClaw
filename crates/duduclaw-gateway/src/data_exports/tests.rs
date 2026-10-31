@@ -310,6 +310,18 @@ fn binding_and_admin_role_are_refreshed_and_unknown_usage_stays_unknown() {
     );
 }
 #[test]
+fn usage_export_converts_stored_cents_to_usd() {
+    let dir = fixture();
+    let conn = rusqlite::Connection::open(dir.path().join("cost_telemetry.db")).unwrap();
+    conn.execute_batch("CREATE TABLE token_usage(id INTEGER PRIMARY KEY,agent_id TEXT,created_at TEXT,model TEXT,request_type TEXT,input_tokens INTEGER,cache_read_tokens INTEGER,cache_creation_tokens INTEGER,output_tokens INTEGER,cost_millicents INTEGER); INSERT INTO token_usage VALUES (1,'sales','2026-10-11T00:00:00Z','model','chat',1,0,0,0,500);").unwrap();
+    let ctx = UserContext::admin_fallback();
+    let req = request(Dataset::Usage, ExportFormat::Csv);
+    let table = source::collect(dir.path(), &ctx, &req, || Ok(())).unwrap();
+    assert_eq!(table.rows[0].cells[10], Cell::Number(500));
+    assert_eq!(table.rows[0].cells[11], Cell::from("5.00"));
+}
+
+#[test]
 fn memory_forget_and_wiki_change_invalidate_existing_files() {
     let dir = fixture();
     let ctx = UserContext::admin_fallback();
@@ -718,4 +730,51 @@ fn bound_conversation_exports_scope_mask_and_recollect_on_privilege_downgrade() 
     assert!(download(dir.path(),&user,&old).is_err());
     std::fs::write(dir.path().join("config.toml"),"private_api_key = 'SYNTHETIC-CONFIG-SECRET").unwrap();
     assert_eq!(source::collect(dir.path(),&user,&req,||Ok(())).err().unwrap(),"EXPORT_MASKING_FAILED");
+}
+
+#[test]
+fn bounded_export_masks_credentials_past_the_message_scan_cap_without_losing_cjk() {
+    let prefix = "中".repeat(32_000);
+    let row = LogicalRow { id: "long-secret".into(), cells: vec![Cell::Text(format!("{prefix}password: fixture-export"))] };
+    let mut table = source::Table { headers: vec!["text"], rows: vec![] };
+    let mut bytes = 0;
+    source::push(&mut table, row.clone(), &mut bytes).unwrap();
+    let Cell::Text(masked) = &table.rows[0].cells[0] else { panic!("expected text") };
+    assert_eq!(masked, &format!("{prefix}password: [已遮罩的密碼]"));
+    let joined: String = writer::physical_rows(&row).iter().map(|part| {
+        let Cell::Text(text) = &part.cells[0] else { panic!("expected text") };
+        text.clone()
+    }).collect();
+    assert_eq!(&joined, masked);
+}
+
+#[test]
+fn shared_wiki_export_filters_department_pages_and_revokes_existing_downloads() {
+    let dir = fixture();
+    let (db, ctx) = user(dir.path(), "wiki-reader@test.invalid", UserRole::Employee);
+    db.set_department(&ctx.user_id, Some("sales")).unwrap();
+    let store = duduclaw_memory::WikiStore::new_shared(dir.path());
+    store.ensure_scaffold().unwrap();
+    for path in ["company.md", "departments/sales/own.md", "departments/hr/secret.md", "restricted/secret.md"] {
+        store.write_page(path, "# Export knowledge\nDepartment content").unwrap();
+    }
+    std::fs::write(dir.path().join("shared/wiki/.scope.toml"), "[namespaces.restricted]\nvisible_to_departments = [\"hr\"]\n").unwrap();
+    let mut req = request(Dataset::Wiki, ExportFormat::Csv);
+    req.agent_id = None;
+    req.scope = Some("shared".into());
+    let table = source::collect(dir.path(), &ctx, &req, || Ok(())).unwrap();
+    assert_eq!(table.rows.len(), 2);
+    assert!(table.rows.iter().all(|row| {
+        row.id.ends_with(":company.md") || row.id.ends_with(":departments/sales/own.md")
+    }));
+    let id = build_now(dir.path(), &ctx, &req);
+    assert!(download(dir.path(), &ctx, &id).is_ok());
+    db.set_department(&ctx.user_id, None).unwrap();
+    assert_eq!(download(dir.path(), &ctx, &id).err().unwrap(), "EXPORT_SOURCE_CHANGED");
+    let table = source::collect(dir.path(), &ctx, &req, || Ok(())).unwrap();
+    assert_eq!(table.rows.len(), 1);
+    assert!(table.rows[0].id.ends_with(":company.md"));
+    std::fs::write(dir.path().join("shared/wiki/.scope.toml"), "[broken").unwrap();
+    assert_eq!(authorize(dir.path(), &ctx, &req).err().unwrap(), "EXPORT_PERMISSION_DENIED");
+    assert!(source::collect(dir.path(), &ctx, &req, || Ok(())).is_err());
 }

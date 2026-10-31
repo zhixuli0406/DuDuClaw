@@ -85,7 +85,10 @@ pub(crate) enum DashboardOnlyReader {
 /// the decide gate for that kind is.
 pub(crate) fn dashboard_only_reader(record: &ApprovalRecord) -> DashboardOnlyReader {
     // Payload-detected activation is Admin even when `action_kind` differs.
-    if crate::approval::is_activation_record(record) {
+    if crate::approval::is_activation_record(record)
+        || record.action_kind == crate::approval::cli_egress::KIND
+        || record.payload.get("egress_guard").is_some()
+    {
         return DashboardOnlyReader::Admin;
     }
     if record.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
@@ -111,11 +114,17 @@ pub(crate) struct ApprovalVisibility {
     collection_acl: Option<Vec<AclEntry>>,
     activation: Option<Option<ActivationVisibility>>,
     task: Option<TaskVisibility>,
+    employee_requires_admin: Option<bool>,
 }
 
 impl ApprovalVisibility {
     /// Call off the socket loop. Failure to load a required fact denies.
-    pub(crate) fn load(home: &Path, record: &ApprovalRecord) -> Self {
+    pub(crate) fn load(home: &Path, record: &ApprovalRecord, fresh: &UserContext) -> Self {
+        Self::load_shared(home, record).for_reader(home, record, fresh)
+    }
+
+    /// Only resource facts are shared; employee authority is loaded per reader.
+    pub(crate) fn load_shared(home: &Path, record: &ApprovalRecord) -> Self {
         let collection_acl = if record.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
             record.payload.get("collection_id").and_then(Value::as_str).and_then(|id| {
                 let db = readonly_db(&duduclaw_knowledge::schema::db_path(home)).ok()?;
@@ -126,7 +135,16 @@ impl ApprovalVisibility {
             .then(|| ActivationVisibility::load(home, &record.payload));
         let task = approval_task_ref(&record.payload).filter(|_| record.binding.is_none())
             .map(|id| TaskVisibility::load(home, &id));
-        Self { collection_acl, activation, task }
+        Self { collection_acl, activation, task, employee_requires_admin: None }
+    }
+
+    pub(crate) fn for_reader(mut self, home: &Path, record: &ApprovalRecord, fresh: &UserContext) -> Self {
+        self.employee_requires_admin = None;
+        if !fresh.is_admin()
+        {
+            self.employee_requires_admin = Some(crate::machine_employee::requires_admin_for_id(home, &record.agent_id));
+        }
+        self
     }
 
     /// No I/O: both approvals.get/list and live pushes use this decision.
@@ -134,6 +152,7 @@ impl ApprovalVisibility {
     /// decide is a separate gate and does not hide their metadata here.
     pub(crate) fn may_read(&self, record: &ApprovalRecord, fresh: &UserContext, department: Option<&str>) -> bool {
         if !fresh.has_role(UserRole::Manager) || fresh.requires_password_change() { return false; }
+        if !fresh.is_admin() && self.employee_requires_admin != Some(false) { return false; }
         let allowed = match dashboard_only_reader(record) {
             DashboardOnlyReader::Admin => fresh.is_admin(),
             // Same predicate as `add_source_approval::may_decide`, on this
@@ -180,6 +199,94 @@ mod tests {
     use crate::handlers::task_privacy_tests::{admin, fixture, payload};
 
     #[tokio::test]
+    async fn machine_employee_approval_refuses_old_viewer_binding_in_rpc_and_shared_push() {
+        let f = fixture().await;
+        let root = admin(&f);
+        f.db.bind_agent(&f.bob.user_id, "sales", AccessLevel::Viewer).unwrap();
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "dynamic_review_kind", "Review", json!({}), 300).await.unwrap();
+        let record = broker.get(&id).await.unwrap().unwrap();
+        assert!(ApprovalVisibility::load(&f.home, &record, &f.bob).may_read(&record, &f.bob, None));
+        duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+        duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+            "system-operator", "test", "test").unwrap();
+        let line = serde_json::to_string(&WsFrame::event("approval.created", json!({"id":id.as_str()}))).unwrap();
+        let shared = Arc::new(crate::handlers::push_filter::PreparedPush::prepare(f.home.clone(), line.clone()).await.unwrap());
+        // The same frame goes to an Admin first, then the old bound Manager.
+        for (ctx, expected) in [(&root, true), (&f.bob, false), (&root, true)] {
+            let (fresh, department) = fresh_reader(&f.home, ctx).unwrap();
+            let snapshot = ApprovalVisibility::load(&f.home, &record, &fresh);
+            assert_eq!(snapshot.may_read(&record, &fresh, department.as_deref()), expected);
+            let rpc = payload(f.handler.handle_approvals_list(json!({"id":id.as_str()}), ctx).await);
+            assert_eq!(rpc["count"], if expected { 1 } else { 0 });
+            let mut gate = crate::handlers::push_filter::PushGate::new(&f.home, ctx, false);
+            assert_eq!(gate.filter_prepared(shared.clone()).await.is_some(), expected);
+        }
+        std::fs::remove_file(f.home.join("presets/system-operator/preset.toml")).unwrap();
+        assert!(!ApprovalVisibility::load(&f.home, &record, &f.bob).may_read(&record, &f.bob, None));
+        let path = duduclaw_core::preset::bindings_path(&f.home);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(!ApprovalVisibility::load(&f.home, &record, &f.bob).may_read(&record, &f.bob, None));
+        assert!(ApprovalVisibility::load(&f.home, &record, &root).may_read(&record, &root, None));
+        // A previously prepared frame must load this fact for each reader.
+        let mut gate = crate::handlers::push_filter::PushGate::new(&f.home, &f.bob, false);
+        assert!(gate.filter_prepared(shared).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn collection_editor_cannot_read_machine_employee_cards() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let db = duduclaw_knowledge::schema::open_home(&f.home).unwrap();
+        db.execute("INSERT INTO collections (id,slug,name,created_by,created_at,updated_at) VALUES ('c','c','Collection','system','now','now')", []).unwrap();
+        db.execute("INSERT INTO collection_acl (collection_id,principal_kind,principal_id,role,granted_by,granted_at) VALUES ('c','user',?1,'editor','system','now')", [&f.alice.user_id]).unwrap();
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", crate::knowledge::add_source_approval::ACTION_KIND,
+            "Review source", json!({"collection_id":"c"}), 300).await.unwrap();
+        let record = broker.get(&id).await.unwrap().unwrap();
+        assert!(ApprovalVisibility::load(&f.home, &record, &f.alice).may_read(&record, &f.alice, None));
+        duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+        duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+            "system-operator", "test", "test").unwrap();
+        assert!(!ApprovalVisibility::load(&f.home, &record, &f.alice).may_read(&record, &f.alice, None));
+        assert!(ApprovalVisibility::load(&f.home, &record, &root).may_read(&record, &root, None));
+        let mut normal = record.clone();
+        normal.agent_id = "normal".into();
+        assert!(ApprovalVisibility::load(&f.home, &normal, &f.alice).may_read(&normal, &f.alice, None));
+        let mut unloaded = ApprovalVisibility::load_shared(&f.home, &normal);
+        assert!(!unloaded.may_read(&normal, &f.alice, None));
+        unloaded.employee_requires_admin = Some(true);
+        assert!(!unloaded.may_read(&normal, &f.alice, None));
+    }
+
+    #[tokio::test]
+    async fn cli_egress_kind_or_payload_is_visible_only_to_admins() {
+        let f = fixture().await;
+        let root = admin(&f);
+        f.db.bind_agent(&f.bob.user_id, "sales", AccessLevel::Viewer).unwrap();
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        for (kind, body) in [
+            (crate::approval::cli_egress::KIND, json!({})),
+            ("dynamic_kind", json!({"egress_guard":{}})),
+            ("dynamic_kind", json!({"egress_guard":null})),
+        ] {
+            let id = broker.request("sales", kind, "Outbound review", body, 300).await.unwrap();
+            let record = broker.get(&id).await.unwrap().unwrap();
+            let line = serde_json::to_string(&WsFrame::event("approval.created", json!({"id":id.as_str()}))).unwrap();
+            for (ctx, expected) in [(&f.bob, false), (&root, true)] {
+                let (fresh, department) = fresh_reader(&f.home, ctx).unwrap();
+                let snapshot = ApprovalVisibility::load(&f.home, &record, &fresh);
+                assert_eq!(snapshot.may_read(&record, &fresh, department.as_deref()), expected);
+                let rpc = payload(f.handler.handle_approvals_list(json!({"id":id.as_str()}), ctx).await);
+                assert_eq!(rpc["count"], if expected { 1 } else { 0 });
+                let mut gate = crate::handlers::push_filter::PushGate::new(&f.home, ctx, false);
+                assert_eq!(gate.filter_live(&line, &f.handler).await.is_some(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn knowledge_visibility_matches_rpc_and_revocations() {
         let f = fixture().await;
         let db = duduclaw_knowledge::schema::open_home(&f.home).unwrap();
@@ -189,7 +296,7 @@ mod tests {
         let id = broker.request("sales", crate::knowledge::add_source_approval::ACTION_KIND,
             "Review source", json!({"collection_id":"c"}), 300).await.unwrap();
         let record = broker.get(&id).await.unwrap().unwrap();
-        let snapshot = ApprovalVisibility::load(&f.home, &record);
+        let snapshot = ApprovalVisibility::load(&f.home, &record, &f.alice);
         let line = serde_json::to_string(&WsFrame::event("approval.created", json!({"id":id.as_str()}))).unwrap();
         for (ctx, expected) in [(&f.bob, false), (&f.alice, true), (&admin(&f), true)] {
             let (fresh, department) = fresh_reader(&f.home, ctx).unwrap();
@@ -204,7 +311,7 @@ mod tests {
         db.execute("INSERT INTO collection_acl (collection_id,principal_kind,principal_id,role,granted_by,granted_at) VALUES ('c','department','sales','editor','system','now')", []).unwrap();
         let users = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
         users.execute("UPDATE users SET department='sales' WHERE id=?1", [&f.alice.user_id]).unwrap();
-        let snapshot = ApprovalVisibility::load(&f.home, &record);
+        let snapshot = ApprovalVisibility::load(&f.home, &record, &f.alice);
         let (fresh, department) = fresh_reader(&f.home, &f.alice).unwrap();
         assert!(snapshot.may_read(&record, &fresh, department.as_deref()));
         users.execute("UPDATE users SET department=NULL WHERE id=?1", [&f.alice.user_id]).unwrap();
@@ -212,7 +319,7 @@ mod tests {
         assert!(!snapshot.may_read(&record, &fresh, department.as_deref()));
         // A subsequent frame observes collection revocation.
         db.execute("DELETE FROM collection_acl", []).unwrap();
-        assert!(!ApprovalVisibility::load(&f.home, &record).may_read(&record, &f.alice, Some("sales")));
+        assert!(!ApprovalVisibility::load(&f.home, &record, &f.alice).may_read(&record, &f.alice, Some("sales")));
         // An already prepared frame never retains the reader's role/status.
         db.execute("INSERT INTO collection_acl (collection_id,principal_kind,principal_id,role,granted_by,granted_at) VALUES ('c','user',?1,'editor','system','now')", [&f.alice.user_id]).unwrap();
         let frame = crate::handlers::push_filter::PreparedPush::prepare(f.home.clone(), line.clone()).await.unwrap();
@@ -229,7 +336,7 @@ mod tests {
         let id = broker.request("sales", "goal_kickoff", "Review task",
             json!({"task_id": crate::handlers::task_privacy_tests::PRIVATE}), 300).await.unwrap();
         let record = broker.get(&id).await.unwrap().unwrap();
-        let snapshot = ApprovalVisibility::load(&f.home, &record);
+        let snapshot = ApprovalVisibility::load(&f.home, &record, &f.alice);
         assert!(snapshot.may_read(&record, &f.alice, None));
         assert!(!snapshot.may_read(&record, &f.bob, None));
         f.db.unbind_agent(&f.alice.user_id, "sales").unwrap();
@@ -251,7 +358,7 @@ mod tests {
             300,
         ).await.unwrap();
         let record = broker.get(&id).await.unwrap().unwrap();
-        let snapshot = ApprovalVisibility::load(&f.home, &record);
+        let snapshot = ApprovalVisibility::load(&f.home, &record, &f.alice);
         let line = serde_json::to_string(&WsFrame::event(
             "approval.created",
             json!({"id": id.as_str()}),

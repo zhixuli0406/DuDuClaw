@@ -368,6 +368,16 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
                 return Ok(Err(error));
             }
         }
+        if path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
+            let Some(home) = path.parent() else { return Ok(Err("config.toml has no parent".into())); };
+            let table = match new_content.parse::<toml::Table>() {
+                Ok(table) => table,
+                Err(_) => return Ok(Err("invalid config.toml; connection ownership cannot be verified".into())),
+            };
+            if let Err(e) = crate::disconnect_forget::connections::mark_config_connecting(home, &table, None) {
+                return Ok(Err(e));
+            }
+        }
         let write = || {
             #[cfg(test)]
             if mfa_actor.is_some() {
@@ -692,6 +702,30 @@ pub(crate) fn prune_backups(dir: &Path, name: &str, keep: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Added regression tests; not run in this change.
+    #[tokio::test]
+    async fn connecting_config_clears_disconnect_evidence_before_publication() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = duduclaw_memory::SqliteMemoryEngine::new(&home.path().join("memory.db")).unwrap();
+        engine.record_connector_disconnect("db:live").await.unwrap();
+        let path = home.path().join("config.toml");
+        let next = "[db_sources.live]\ndriver='sqlite'\nurl='/tmp/live.sqlite'\nallowed_tables=['*']\n";
+        commit_text_locked(&path, &content_hash(""), next).unwrap();
+        assert!(engine.disconnected_connector_refs().await.unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), next);
+    }
+
+    #[test]
+    fn connecting_config_refuses_publication_when_memory_fence_is_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("memory.db"), "not a database").unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let next = "[db_sources.live]\ndriver='sqlite'\nurl='/tmp/live.sqlite'\nallowed_tables=['*']\n";
+        assert!(commit_text_locked(&path, &content_hash(""), next).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+    }
 
     #[test]
     fn temp_copy_keeps_the_whole_file_name() {

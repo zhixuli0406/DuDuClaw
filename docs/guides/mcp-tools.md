@@ -32,7 +32,7 @@ still reaches the real gate and is still refused, with the gate's own message.
 |---|---|---|
 | External client whitelist | `principal.is_external` | Only the 7 legacy whitelist tools plus tools in explicitly granted scopes; then the scope row below applies |
 | Scopes of a non-employee caller | `principal.scopes`, for a key that holds no `admin` and is not an AI employee (not the gateway-internal key, not a per-agent key, not a process the gateway spawned for an employee) | Only tools whose minimum scope the key holds; tools that act for the process's own agent (`working_state_*`, `canvas_*`, `shared_wiki_delete`, `memory_search_by_layer` and three consolidation reads, …) are hidden from it, and from every external key, and the dispatch gate refuses them by the same rule (`process_agent_tool`). See [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | 19 `gmail_*` / `calendar_*` / `sheets_*` / `forms_*` / `gtasks_*` / `drive_*` / `docs_*` / `slides_*` tools hidden |
+| Google Workspace | `config.toml [integrations] google_workspace` | All 19 Google tools, including `google_status`, are hidden while off. Dashboard setup and tests remain available: [Connect Google](google-setup.md). |
 | Google identity (v1.76.0) | `agent.toml [google] identity`, else `config.toml [integrations.google_identity] default_identity` | `none` hides the same 19 tools and the dispatch gate refuses them. Any other value keeps them listed; a call that cannot use the identity returns the reason. `google_status` now starts with who the employee acts as |
 | GitHub | `config.toml [integrations] github` | 5 `github_*` tools hidden |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | Denied tools hidden; a non-empty allowlist hides everything else. An entry matches a tool exactly, or by a trailing `*`: `*`, `mcp__duduclaw__*` (every DuDuClaw tool), `mcp__duduclaw__odoo_*` / `memory_*` (anchored prefix). `mcp__<other server>__…` never names a DuDuClaw tool; a `*` elsewhere is literal. The approval lists and `scoped_tools` use the same rule |
@@ -47,6 +47,8 @@ still reaches the real gate and is still refused, with the gate's own message.
 | `[knowledge] enabled` + collection grants | `config.toml` / `knowledge.db` / `agent.toml [knowledge] collections` | 4 `knowledge_*` tools hidden unless the knowledge base is on and at least one collection is granted to the employee or its department (after `[knowledge] collections` narrowing); a grant change sends `list_changed` (see [`knowledge_*`](#knowledge_--document-knowledge-base) below) |
 | `[responsibilities] enabled` | `config.toml` | 3 `responsibility_*` tools hidden (see [responsibility tools](#responsibility_get--responsibility_followup--responsibility_ask--responsibility-tools) below) |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
+
+The machine-operation console (`/console`) is available only to administrators. Machine-operation tools used by a `system_operator` employee also verify on the server that the person requesting them is an active administrator; ordinary chat with other AI employees remains available according to existing access rules.
 
 A freshly created agent has none of these opted in, which is the point: the
 default deployment pays for the tools it can use and nothing else.
@@ -516,3 +518,7 @@ new table is [deprecations.md](deprecations.md). No MCP tool is deprecated at th
 - [../spec/reversible-context-ccr.md](../spec/reversible-context-ccr.md) — the
   `duduclaw_ccr_*` tools, which are injected by the direct-API tool loop rather
   than dispatched by the MCP server
+
+## Declare a credential's service
+
+`credential_declare` accepts `credential_id` and `service` only. Employee notes are rejected; the service must match `^[a-z0-9][a-z0-9._-]{0,63}$` and pass credential detection. Only an authenticated employee holding that credential may declare it, through the signed gateway loopback route. An employee cannot override an Admin-set service. This tool annotates existing audit metadata; it does not retrieve a secret, grant another holder access or substitute a value into a tool call. Use **Security → Credential audit** as an Admin to review and correct records. See [Credential audit](../features/70-credential-audit.md).

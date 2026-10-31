@@ -37,6 +37,14 @@ impl MethodHandler {
             .min(RUNS_LIST_MAX_LIMIT as u64) as usize;
 
         let live = match self.bound_history_live(ctx) { Ok(c)=>c, Err(e)=>return WsFrame::error_response("",&e) };
+        if !live.has_agent_access(&agent_filter, AccessLevel::Viewer)
+            && team_visibility::may_monitor(&live, &agent_filter)
+        {
+            return match self.team_runs_metadata(&live, &agent_filter, limit) {
+                Ok(runs) => WsFrame::ok_response("", json!({"runs": runs, "read_only": true})),
+                Err(e) => WsFrame::error_response("", &e),
+            };
+        }
         let initial = if agent_filter.is_empty() {
             if live.is_admin() { Mode::Full } else { return WsFrame::error_response("","agent_id required"); }
         } else { match privacy::mode(&self.home_dir,&live,&agent_filter) { Ok(m)=>m,Err(_)=>return WsFrame::error_response("","permission denied") } };
@@ -67,6 +75,7 @@ impl MethodHandler {
         rows.sort_by(|a, b| (&a.session_id, a.rowid).cmp(&(&b.session_id, b.rowid)));
         let now = Utc::now();
         let mut runs = fold_session_runs(&rows, now);
+        apply_channel_run_failures(&self.home_dir, &mut runs);
         runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         runs.truncate(limit);
 
@@ -177,6 +186,11 @@ impl MethodHandler {
             let Ok(Some(run)) = store.get_dispatch_run(id) else {
                 return WsFrame::error_response("", "Run not found");
             };
+            if !ctx.has_agent_access(&run.agent_id, AccessLevel::Viewer)
+                && team_visibility::may_monitor(ctx, &run.agent_id)
+            {
+                return self.team_run_metadata_response(ctx, &run.agent_id, run_id);
+            }
             if !ctx.is_admin() {
                 if let Err(e) = acl::require_agent_access(ctx, &run.agent_id, AccessLevel::Viewer) {
                     return WsFrame::error_response("", &e);
@@ -261,6 +275,11 @@ impl MethodHandler {
         };
 
         let owner=match conn.query_row("SELECT agent_id FROM sessions WHERE id=?1",[session_id],|r|r.get::<_,String>(0)) {Ok(a)=>a,Err(_)=>return WsFrame::error_response("","Run not found")};
+        if !live.has_agent_access(&owner, AccessLevel::Viewer)
+            && team_visibility::may_monitor(&live, &owner)
+        {
+            return self.team_run_metadata_response(&live, &owner, run_id);
+        }
         let initial=match privacy::mode(&self.home_dir,&live,&owner) { Ok(m)=>m, Err(_)=>return WsFrame::error_response("","Run not found") };
         if initial==Mode::Filtered {
             let metadata=match read::metadata(&conn,&live.user_id,session_id) { Ok(Some(m))=>m, _=>return WsFrame::error_response("","Run not found") };
@@ -365,7 +384,7 @@ impl MethodHandler {
             .ok();
 
         let now = Utc::now();
-        let (status, ended_at) = match &assistant {
+        let (mut status, mut ended_at) = match &assistant {
             Some((_, ts)) => ("completed".to_string(), Some(ts.clone())),
             None => {
                 if next_user.is_some() {
@@ -375,6 +394,13 @@ impl MethodHandler {
                 }
             }
         };
+
+        if let Some(end) = crate::run_steps::shared_store(&self.home_dir)
+            .and_then(|s| s.channel_failure_end(session_id, rowid))
+        {
+            status = "failed".into();
+            ended_at = Some(end);
+        }
 
         // Tool events (MCP audit trail) inside the run window.
         let window_end: Option<chrono::DateTime<Utc>> = match &ended_at {

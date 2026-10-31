@@ -1,3 +1,6 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { useConnectionStore } from '@/stores/connection-store';
+import { DailyReportCard } from '@/components/growth/DailyReportCard';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
@@ -7,6 +10,8 @@ import { GrowthPage } from './GrowthPage';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useConnectionStore.setState({ state: 'authenticated' as never });
   mockWsClient.call.mockResolvedValue({});
   useGrowthStore.setState({
     snapshot: null,
@@ -54,4 +59,45 @@ describe('GrowthPage', () => {
     // Inline banner (not the full-page card) so the page body still renders.
     expect(screen.getByRole('alert')).toHaveAttribute('data-variant', 'inline');
   });
+});
+
+it('does not load the company daily report for employees in the page or popup', () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useConnectionStore.setState({ state: 'authenticated' as never });
+  renderWithProviders(<><GrowthPage /><DailyReportCard /></>);
+  expect(mockWsClient.call.mock.calls.some(([m]) => m === 'growth.daily_report')).toBe(false);
+});
+
+it('renders repeated reduced snapshots without company details or report calls', () => {
+  const reduced = { xp: 450, level: 2, xp_into_level: 50, xp_for_next_level: 500 };
+  useGrowthStore.getState().applySnapshot(reduced);
+  useGrowthStore.getState().applySnapshot(reduced);
+  renderWithProviders(<GrowthPage />);
+  expect(screen.getByText('Lv')).toBeInTheDocument();
+  expect(screen.queryByText('Achievement wall')).not.toBeInTheDocument();
+  expect(screen.queryByText('AI staff')).not.toBeInTheDocument();
+  expect(mockWsClient.call).not.toHaveBeenCalled();
+});
+
+it('renders a reduced snapshot for a cached Manager role without missing-field errors', () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never });
+  useConnectionStore.setState({ state: 'disconnected' as never });
+  useGrowthStore.getState().applySnapshot({ xp: 450, level: 2, xp_into_level: 50, xp_for_next_level: 500 });
+  renderWithProviders(<GrowthPage />);
+  expect(screen.getByText('Lv')).toBeInTheDocument();
+  expect(screen.queryByText('Achievement wall')).not.toBeInTheDocument();
+  expect(screen.queryByText('AI staff')).not.toBeInTheDocument();
+});
+
+it('preserves the Manager fact grid and achievement wall on a full snapshot', () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never });
+  useConnectionStore.setState({ state: 'disconnected' as never });
+  useGrowthStore.getState().applySnapshot({
+    xp: 450, level: 2, xp_into_level: 50, xp_for_next_level: 500,
+    facts: { agents_count: 7, tasks_completed: 5, knowledge_pages: 4, skills_acquired: 3, routines_completed: 2, custom_skills_approved: 1 },
+    achievements: [],
+  });
+  renderWithProviders(<GrowthPage />);
+  expect(screen.getByText('AI staff')).toBeInTheDocument();
+  expect(screen.getByText('Achievement wall')).toBeInTheDocument();
 });

@@ -544,6 +544,39 @@ fn to_slack_mrkdwn(text: &str) -> String {
     text.replace("**", "*")
 }
 
+/// Distributor identity belongs in Slack plain_text, which never interprets
+/// stars, links, mentions or emoji shortcodes as channel markup.
+fn distributor_identity_blocks(text: &str) -> Option<(Vec<serde_json::Value>, String)> {
+    let brand = crate::distributor_brand::effective()?;
+    distributor_identity_blocks_for(text, &brand.product_name)
+}
+
+fn distributor_identity_blocks_for(text: &str, name: &str) -> Option<(Vec<serde_json::Value>, String)> {
+    if name == crate::distributor_brand::ORIGINAL_PRODUCT_NAME {
+        return None;
+    }
+    let marker = "— Powered by ";
+    let split = text.rsplit_once("\n\n— Powered by ")
+        .or_else(|| text.strip_prefix(marker).map(|name| ("", name)));
+    if let Some((content, encoded)) = split {
+        if encoded == crate::distributor_brand::escape_channel_name(name) {
+            let footer = format!("{marker}{name}");
+            let mut blocks = Vec::new();
+            if !content.is_empty() {
+                blocks.push(json!({ "type": "markdown", "text": content }));
+            }
+            blocks.push(json!({ "type": "section", "text": { "type": "plain_text", "text": footer, "emoji": false } }));
+            let fallback = if content.is_empty() { footer } else { format!("{content}\n\n{footer}") };
+            return Some((blocks, fallback));
+        }
+    }
+    let denied_prefix = "❌ 此頻道未被授權使用 ";
+    if text.strip_prefix(denied_prefix) == Some(name) {
+        return Some((vec![json!({ "type": "section", "text": { "type": "plain_text", "text": text, "emoji": false } })], text.into()));
+    }
+    None
+}
+
 // ── Event handling ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -689,7 +722,7 @@ async fn handle_event(
         return;
     }
 
-    info!("📩 Slack [{user}]: {}", truncate_bytes(&text, 80));
+    info!("📩 Slack [{user}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     // Add thinking emoji reaction
     let _ = http
@@ -1040,11 +1073,17 @@ async fn respond_via_response_url(
         warn!("Slack: rejecting suspicious response_url");
         return;
     }
-    let body = json!({
+    let mut body = json!({
         "response_type": response_type,
         "replace_original": false,
         "text": text,
     });
+    if let Some((blocks, fallback)) = distributor_identity_blocks(text) {
+        body["blocks"] = json!(blocks);
+        body["text"] = json!(fallback);
+        body["mrkdwn"] = json!(false);
+        body["parse"] = json!("none");
+    }
     #[cfg(test)]
     let response_url = crate::test_channel_provider::url(
         response_url.rsplit('/').next().unwrap_or(""),
@@ -1078,7 +1117,7 @@ async fn handle_slash_command_envelope(
 
     info!(
         "📩 Slack slash {command} from [{user_id}]: {}",
-        truncate_bytes(&text, 80)
+        truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80)
     );
 
     // ── Channel whitelist applies to slash commands too ──
@@ -1087,8 +1126,7 @@ async fn handle_slash_command_envelope(
         .is_channel_allowed("slack", "global", channel_id)
         .await
     {
-        let product =
-            "DuDuClaw".to_string();
+        let product = crate::distributor_brand::product_name();
         respond_via_response_url(
             http,
             response_url,
@@ -1331,10 +1369,10 @@ async fn handle_interactive_envelope(
         }
     }
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` above (see
-    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
-    // it needs no pressing-user identity, only the single-use nonce.
+    // Goal-intent confirmation buttons (P1) use a separate codec from
+    // `decision_action` above. Ordinary employees keep
+    // nonce-based confirmation; machine employees also require the pressing
+    // sender's verified Admin account.
     // `handle_interactive_envelope` already runs detached (see the caller's
     // own comment: "an AI reply can take minutes… blocking here would delay
     // acks for subsequent envelopes"), so awaiting `handle_gintent_button`'s
@@ -1342,7 +1380,8 @@ async fn handle_interactive_envelope(
     // ephemeral) so the result — a created goal task, or a generated plan —
     // is visible the same way a plain-text `1`/`2`/`3` reply would have been.
     if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(action_data) {
-        let outcome = crate::goal_intent::handle_gintent_button(ctx, choice, &nonce).await;
+        let sender = payload["user"]["id"].as_str().unwrap_or("");
+        let outcome = crate::goal_intent::handle_gintent_button_for_sender(ctx, choice, &nonce, "slack", sender).await;
         respond_via_response_url(http, response_url, "in_channel", &outcome).await;
         return;
     }
@@ -1361,8 +1400,8 @@ async fn handle_interactive_envelope(
             };
             respond_via_response_url(http, response_url, "ephemeral", &msg).await;
         }
-        other => {
-            warn!("Slack: unknown block action: {other}");
+        _ => {
+            warn!("Slack: unknown block action");
         }
     }
 }
@@ -1431,7 +1470,12 @@ async fn send_markdown_message(
                 }));
             }
         }
-        blocks.push(json!({ "type": "markdown", "text": chunk }));
+        let identity = distributor_identity_blocks(chunk);
+        if let Some((identity_blocks, _)) = &identity {
+            blocks.extend(identity_blocks.iter().cloned());
+        } else {
+            blocks.push(json!({ "type": "markdown", "text": chunk }));
+        }
         if i == last_idx {
             if let Some(sid) = session_id {
                 // P1: the goal-intent confirmation buttons when `markdown`
@@ -1452,6 +1496,11 @@ async fn send_markdown_message(
         // Fallback text keeps notifications readable if blocks fail to render.
         let fallback = channel_format::truncate_chars(&to_slack_mrkdwn(chunk), 3000);
         let mut body = json!({ "channel": channel, "blocks": blocks, "text": fallback });
+        if let Some((_, fallback)) = &identity {
+            body["text"] = json!(channel_format::truncate_chars(fallback, 3000));
+            body["mrkdwn"] = json!(false);
+            body["parse"] = json!("none");
+        }
         if let Some(th) = thread_ts {
             body["thread_ts"] = json!(th);
         }
@@ -1510,13 +1559,19 @@ async fn send_message(
         thread_ts: thread_ts.map(|s| s.to_string()),
     };
 
-    match http
+    let request = http
         .post(format!("{SLACK_API}/chat.postMessage"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
-        .await
-    {
+        .header("Authorization", format!("Bearer {token}"));
+    let request = if let Some((_, fallback)) = distributor_identity_blocks(text) {
+        // A workspace rejecting markdown blocks still gets a safe literal
+        // fallback. Keep the old serialized body for every original-brand call.
+        let mut plain = json!({ "channel": channel, "text": fallback, "mrkdwn": false, "parse": "none" });
+        if let Some(ts) = thread_ts { plain["thread_ts"] = json!(ts); }
+        request.json(&plain)
+    } else {
+        request.json(&body)
+    };
+    match request.send().await {
         Ok(resp) => {
             if let Ok(data) = resp.json::<SlackApiResponse>().await {
                 if !data.ok {
@@ -1662,6 +1717,25 @@ mod tests {
     fn test_to_slack_mrkdwn() {
         assert_eq!(to_slack_mrkdwn("**bold**"), "*bold*");
         assert_eq!(to_slack_mrkdwn("normal text"), "normal text");
+    }
+
+    #[test]
+    fn distributor_identity_uses_slack_plain_text_and_preserves_original_payloads() {
+        let name = "A*_[x](target) & @everyone";
+        let footer = format!("— Powered by {}", crate::distributor_brand::escape_channel_name(name));
+        let text = format!("**answer**\n\n{footer}");
+        let (blocks, fallback) = distributor_identity_blocks_for(&text, name).unwrap();
+        assert_eq!(blocks[0], json!({ "type": "markdown", "text": "**answer**" }));
+        assert_eq!(blocks[1]["text"]["type"], "plain_text");
+        assert_eq!(blocks[1]["text"]["text"], format!("— Powered by {name}"));
+        assert_eq!(blocks[1]["text"]["emoji"], false);
+        assert_eq!(fallback, format!("**answer**\n\n— Powered by {name}"));
+        let refusal = format!("❌ 此頻道未被授權使用 {name}");
+        let (blocks, _) = distributor_identity_blocks_for(&refusal, name).unwrap();
+        assert_eq!(blocks[0]["text"]["type"], "plain_text");
+        assert_eq!(blocks[0]["text"]["text"], refusal);
+        assert!(distributor_identity_blocks_for("answer\n\n— Powered by DuDuClaw", "DuDuClaw").is_none());
+        assert!(distributor_identity_blocks_for("answer\n\n— Powered by Other\\*", name).is_none());
     }
 
     // ── W2-7: slack_workspace_domain_from_url ────────────────

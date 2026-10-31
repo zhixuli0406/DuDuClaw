@@ -10,14 +10,21 @@
 use super::*;
 
 /// The principal from the host env, validated. A malformed value is audited
-/// once per process as `on_behalf_of_rejected` and treated as absent.
+/// once per process as `on_behalf_of_rejected` and carried as Unknown.
 pub(crate) fn host_on_behalf_of(home_dir: &Path, caller: &str) -> Option<String> {
-    match duduclaw_core::host_principal_checked() {
+    let principal = duduclaw_core::host_principal_checked();
+    if let Err(rejection) = &principal {
+        audit_rejection_once(home_dir, caller, rejection);
+    }
+    principal_wire(principal)
+}
+
+fn principal_wire(
+    principal: std::result::Result<Option<duduclaw_core::HumanPrincipal>, duduclaw_core::PrincipalRejection>,
+) -> Option<String> {
+    match principal {
         Ok(p) => p.map(|p| p.to_string()),
-        Err(rejection) => {
-            audit_rejection_once(home_dir, caller, &rejection);
-            None
-        }
+        Err(_) => duduclaw_gateway::on_behalf_of::PrincipalState::Unknown.to_wire(),
     }
 }
 
@@ -88,6 +95,13 @@ pub(crate) async fn check_human_principal(
             Err(denied.message_zh())
         }
     }
+}
+
+/// Machine operations always require the gateway's live host-context check,
+/// even when delegation permission tracking is configured as record-only.
+pub(crate) async fn check_system_operation_principal(home: &Path, agent: &str) -> bool {
+    let Ok(principal) = duduclaw_core::host_principal_checked() else { return false; };
+    authority_check(home, agent, agent, "system_operation", principal.as_ref()).await
 }
 
 /// Async loopback bridge. Failure, absent context and identity disagreement
@@ -172,8 +186,9 @@ async fn authority_check(
 }
 
 /// Preserve every existing path's semantics, including mail, record changes
-/// and schedule hand-overs. The wire vocabulary is closed to two rights.
+/// and schedule hand-overs. Machine operations use a separate Admin check.
 fn authority_operation(path: &str) -> &'static str {
+    if path == "system_operation" { return "system_operation"; }
     match duduclaw_core::human_right_for_path(path) {
         duduclaw_core::HumanRight::Call => "call",
         duduclaw_core::HumanRight::Assign => "assign",
@@ -182,7 +197,20 @@ fn authority_operation(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn relayed_principal_keeps_unknown_distinct_from_old_background_rows() {
+        use duduclaw_gateway::on_behalf_of::PrincipalState;
+        assert!(super::principal_wire(Ok(None)).is_none());
+        let valid = duduclaw_core::HumanPrincipal::parse("user:alice").unwrap();
+        assert_eq!(super::principal_wire(Ok(Some(valid))).as_deref(), Some("user:alice"));
+        for raw in ["malformed", "unknown:rejected-principal"] {
+            let carried = super::principal_wire(duduclaw_core::HumanPrincipal::parse(raw).map(Some));
+            assert_eq!(PrincipalState::from_wire(carried.as_deref()), PrincipalState::Unknown);
+        }
+    }
+
+    #[test]
     fn permission_wire_kind_covers_all_shared_delegation_paths() {
+        assert_eq!(super::authority_operation("system_operation"), "system_operation");
         for path in ["send_to_agent", "spawn_agent"] {
             assert_eq!(super::authority_operation(path), "call");
         }

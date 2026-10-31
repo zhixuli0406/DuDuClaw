@@ -119,6 +119,7 @@ export interface ActionGrantView {
   fullArgs?: Record<string, unknown>;
   sources?: string[];
   reason?: string;
+  recipientGuard: boolean;
   ruleMatches: ActionRuleMatch[];
 }
 
@@ -152,14 +153,18 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
   const record = p as Record<string, unknown>;
   const egress = record.egress_guard;
   const isEgress = !!egress && typeof egress === 'object';
-  const showFull = isEgress || ['send', 'publish', 'purchase'].includes(String(g.effect));
+  const recipientReason = record.recipient_guard ?? (isEgress ? (egress as Record<string, unknown>).recipient_guard : undefined);
+  const recipientGuard = !!recipientReason && typeof recipientReason === 'object' && !Array.isArray(recipientReason);
+  const showFull = isEgress || recipientGuard || ['send', 'publish', 'purchase'].includes(String(g.effect));
   const args = record.arguments;
   const sources = isEgress ? (egress as Record<string, unknown>).sources : undefined;
   return {
     fullArgs: showFull && args && typeof args === 'object' && !Array.isArray(args)
       ? args as Record<string, unknown> : undefined,
     sources: Array.isArray(sources) ? sources.filter((s): s is string => typeof s === 'string') : undefined,
-    reason: isEgress ? 'egress_guard' : typeof record.reason === 'string' ? record.reason : undefined,
+    reason: isEgress && Array.isArray(sources) && sources.length > 0 ? 'egress_guard'
+      : recipientGuard ? 'recipient_guard' : typeof record.reason === 'string' ? record.reason : undefined,
+    recipientGuard,
     ruleMatches: Array.isArray(record.action_rule_matches) ? record.action_rule_matches.filter(isActionRuleMatch) : [],
     tool,
     effect: typeof g.effect === 'string' ? g.effect : '',
@@ -170,7 +175,7 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
 
 function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; expiresAt: number | null; t: (id: string) => string }) {
   const destinations = Object.entries(grant.fullArgs ?? {}).filter(([key]) =>
-    ['channel', 'chat_id', 'recipient', 'recipients', 'to', 'cc', 'bcc', 'email', 'url', 'destination', 'agent', 'agent_id'].includes(key),
+    ['channel', 'chat_id', 'recipient', 'recipients', 'to', 'cc', 'bcc', 'email', 'url', 'destination', 'agent', 'agent_id', 'notify_channel', 'notify_chat_id', 'notify_thread_id', 'attendees'].includes(key),
   );
   return (
     <Section title={t('approval.grant.title')}>
@@ -181,7 +186,7 @@ function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; e
         </Row>
         {grant.effect && (
           <Row label={t('approval.grant.effect')}>
-            <Mono>{grant.effect}</Mono>
+            <span>{t(['read', 'draft', 'send', 'publish', 'purchase', 'delete', 'modify', 'admin'].includes(grant.effect) ? `agents.actionRules.effect.${grant.effect}` : 'approval.plan.kind.unknown')}</span>
           </Row>
         )}
         <div className="pt-1">
@@ -213,7 +218,8 @@ function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; e
               </pre>
             </>
           )}
-          <p className="text-sm">{t('approval.grant.reason')}: {t(grant.reason === 'egress_guard' ? 'approval.grant.reasonEgress' : grant.reason === 'action_rule' ? 'approval.grant.reasonRule' : 'approval.grant.reasonRequired')}</p>
+          {grant.reason !== 'recipient_guard' && <p className="text-sm">{t('approval.grant.reason')}: {t(grant.reason === 'egress_guard' ? 'approval.grant.reasonEgress' : grant.reason === 'action_rule' ? 'approval.grant.reasonRule' : 'approval.grant.reasonRequired')}</p>}
+          {grant.recipientGuard && <p className="text-sm">{t('approval.grant.reasonRecipient')}</p>}
           {!!grant.sources?.length && <ul className="list-inside list-disc text-xs">{grant.sources.map((source, i) => <li key={i} className="break-all">{source}</li>)}</ul>}
           {grant.ruleMatches.length > 0 && (
             <div>
@@ -465,6 +471,23 @@ function QuestionRequestView({ approval }: { approval: ApprovalItem }) {
   );
 }
 
+function ProcessedApprovalView({ approval, outcome }: { approval: ApprovalItem; outcome?: 'approved' | 'denied' }) {
+  const intl = useIntl();
+  const status = outcome ?? approval.status;
+  const labelKey = status === 'approved' ? 'inbox.status.approved'
+    : status === 'denied' ? 'inbox.status.denied'
+    : status === 'expired' ? 'inbox.status.expired'
+    : status === 'answered' ? 'approval.question.answered' : 'inbox.processed.receipt';
+  return (
+    <div className="space-y-4">
+      <Badge variant="secondary">{intl.formatMessage({ id: labelKey })}</Badge>
+      <p className="whitespace-pre-wrap break-words text-sm">{approval.summary}</p>
+      {typeof approval.answer === 'string' && <p className="whitespace-pre-wrap text-sm">{approval.answer}</p>}
+      <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />
+    </div>
+  );
+}
+
 export function ApprovalDetailPanel({
   approval,
   agentName,
@@ -472,6 +495,8 @@ export function ApprovalDetailPanel({
   onReject,
   onDecided,
   decideError,
+  processed = false,
+  outcome,
 }: {
   approval: ApprovalItem;
   agentName?: string;
@@ -479,10 +504,15 @@ export function ApprovalDetailPanel({
   onReject: () => void;
   /** Called after a self-contained (skill_create) decision succeeds, so the
    *  parent can remove the decided row without issuing a second decide. */
-  onDecided?: () => void;
+  onDecided?: (outcome?: 'approved' | 'denied') => void;
   /** Set when the parent's last decide failed; the item is still pending. */
   decideError?: unknown;
+  processed?: boolean;
+  outcome?: 'approved' | 'denied';
 }) {
+  if (processed || (approval.status != null && approval.status !== 'pending')) {
+    return <ProcessedApprovalView approval={approval} outcome={outcome} />;
+  }
   if (approval.request_kind === 'question') {
     return <QuestionRequestView approval={approval} />;
   }
@@ -546,7 +576,13 @@ function GenericApprovalView({
   const described = DESCRIBED_KINDS.has(approval.kind);
   const knowledge = parseKnowledgeQuarantine(approval.kind, approval.payload, approval.summary);
   const knowledgeConflict = knowledge?.variant === 'conflict' ? knowledge : null;
-  const kindDesc = knowledgeConflict
+  const disconnectPayload = approval.payload && typeof approval.payload === 'object'
+    ? approval.payload as Record<string, unknown> : null;
+  const disconnectForget = approval.kind === 'memory_forget_source'
+    && disconnectPayload?.origin === 'connector_disconnect';
+  const kindDesc = disconnectForget
+    ? t('forget.approval.description')
+    : knowledgeConflict
     ? t('approval.plan.kind.knowledge_quarantine.conflict')
     : described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
   const discoverySpec = approval.kind === 'discovery' ? parseDiscoveryApproval(approval.payload) : null;
@@ -582,7 +618,8 @@ function GenericApprovalView({
   };
 
   return (
-    <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       {/* ── Plan summary first (arXiv:2604.04918) ── */}
       <Section title={t('approval.plan.title')}>
         <div className="space-y-2 rounded-lg bg-muted p-3">
@@ -600,13 +637,14 @@ function GenericApprovalView({
             <div className="flex items-center gap-1.5 pt-0.5 text-xs text-muted-foreground">
               <ActorAvatar actorType="agent" size="xs" name={agentName ?? approval.agent_id} />
               <span className="truncate">{agentName ?? approval.agent_id}</span>
-              {!described && <Mono className="text-[11px]">{approval.kind}</Mono>}
             </div>
           )}
         </div>
       </Section>
 
       {actionGrant && <ActionGrantSection grant={actionGrant} expiresAt={expiresAtEpoch} t={t} />}
+
+      {disconnectForget && <DisconnectForgetFacts payload={disconnectPayload} />}
 
       {discoverySpec && <DiscoverySpecSection spec={discoverySpec} intl={intl} />}
 
@@ -703,7 +741,7 @@ function GenericApprovalView({
           <div className="space-y-3 pl-1.5">
             <div className="grid grid-cols-1 gap-0.5">
               <Row label={t('inbox.approval.kind')}>
-                <Mono>{approval.kind}</Mono>
+                <span>{t(Object.hasOwn(intl.messages, `approvals.kind.${approval.kind}`) ? `approvals.kind.${approval.kind}` : 'approvals.kind.unknown')}</span>
               </Row>
               <Row label={t('inbox.approval.created')}>{timeAgo(approval.created_at)}</Row>
               {expiry && (
@@ -734,8 +772,9 @@ function GenericApprovalView({
         </div>
       )}
 
-      {/* ── Decision (after the summary is read) ── */}
-      <div className="flex items-center gap-2">
+      </div>
+      {/* Keep decisions visible while the evidence scrolls. */}
+      <div data-testid="approval-actions" className="z-10 flex shrink-0 items-center gap-2 border-t border-surface-border bg-surface py-3">
         <Button variant="brand" onClick={requestApprove} className="flex-1">
           {t('inbox.approval.approve')}
         </Button>
@@ -775,6 +814,32 @@ function GenericApprovalView({
   );
 }
 
+function DisconnectForgetFacts({ payload }: { payload: Record<string, unknown> | null }) {
+  const intl = useIntl();
+  const rows = Array.isArray(payload?.counts_by_agent) ? payload.counts_by_agent : [];
+  return (
+    <div className="space-y-3 rounded-lg border p-3" data-testid="disconnect-forget-counts">
+      <p className="text-sm">{intl.formatMessage({ id: 'forget.approval.scope' })}</p>
+      {rows.map((row, index) => {
+        if (!row || typeof row !== 'object' || !('agent_id' in row) || typeof row.agent_id !== 'string') return null;
+        const values = row as Record<string, unknown>;
+        const count = (key: string) => typeof values[key] === 'number' ? String(values[key]) : '—';
+        return (
+          <div key={`${row.agent_id}-${index}`} className="space-y-1 border-t pt-2 text-sm">
+            <p className="font-medium">{row.agent_id}</p>
+            <p>{intl.formatMessage({ id: 'forget.approval.counts' }, {
+              memories: count('memories'), facts: count('key_facts'), archives: count('archive'),
+              unattributed: count('unattributed'), system: count('system_kept'),
+            })}</p>
+            <p>{intl.formatMessage({ id: 'forget.approval.retainedShared' }, { count: count('retained_shared') })}</p>
+          </div>
+        );
+      })}
+      <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'forget.receipts.outOfScope' })}</p>
+    </div>
+  );
+}
+
 // ── skill_create approval view ──────────────────────────────
 
 type DecidedState = { kind: 'approved'; installed: string; selfApproved: boolean } | { kind: 'rejected' } | null;
@@ -788,7 +853,7 @@ function SkillCreateApprovalView({
   approval: ApprovalItem;
   agentName?: string;
   payload: SkillCreatePayload;
-  onDecided?: () => void;
+  onDecided?: (outcome?: 'approved' | 'denied') => void;
 }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
@@ -816,7 +881,7 @@ function SkillCreateApprovalView({
       const selfApproved = se.self_approved === true;
       setDecided({ kind: 'approved', installed, selfApproved });
       toast.success(intl.formatMessage({ id: 'inbox.skillCreate.installedToast' }, { name: installed }));
-      onDecided?.();
+      onDecided?.('approved');
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     } finally {
@@ -832,7 +897,7 @@ function SkillCreateApprovalView({
       const rejectedId = res.side_effect?.custom_skill_rejected ?? payload.custom_skill_id;
       setDecided({ kind: 'rejected' });
       toast.success(intl.formatMessage({ id: 'inbox.skillCreate.rejectedToast' }, { id: rejectedId }));
-      onDecided?.();
+      onDecided?.('denied');
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     } finally {
@@ -841,7 +906,8 @@ function SkillCreateApprovalView({
   };
 
   return (
-    <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       <div className="flex items-start gap-2">
         <p className="min-w-0 flex-1 text-sm text-foreground">{approval.summary}</p>
         <RiskBadge level={risk} label={t(`approval.risk.${risk}`)} />
@@ -881,16 +947,14 @@ function SkillCreateApprovalView({
             )}
             <span className="text-sm text-foreground">{t('inbox.skillCreate.risk')}</span>
             <Badge variant={sr?.passed ? 'secondary' : 'outline'} className="ml-auto">
-              {sr?.risk_level ?? '—'}
+              {sr?.risk_level ? t(`approval.risk.${['clean', 'low'].includes(sr.risk_level.toLowerCase()) ? 'low' : sr.risk_level.toLowerCase() === 'medium' ? 'medium' : 'high'}`) : '—'}
             </Badge>
           </div>
           {sr && sr.findings.length > 0 ? (
             <ul className="space-y-1 px-0.5">
               {sr.findings.map((f, i) => (
                 <li key={i} className="text-xs text-muted-foreground">
-                  <span className="font-medium uppercase text-foreground">{f.severity}</span>
-                  <span className="mx-1 text-muted-foreground/40">|</span>
-                  {f.category}
+                  <span className="font-medium text-foreground">{t(`skills.install.severity.${['critical', 'high', 'medium', 'low', 'warning', 'info'].includes(f.severity.toLowerCase()) ? f.severity.toLowerCase() : 'info'}`)}</span>
                   {f.line_number != null && <span className="text-muted-foreground/70"> (L{f.line_number})</span>}
                   <span className="block text-muted-foreground/80">{f.description}</span>
                 </li>
@@ -912,6 +976,8 @@ function SkillCreateApprovalView({
         </pre>
       </Section>
 
+      </div>
+      <div data-testid="approval-actions" className="z-10 shrink-0 border-t border-surface-border bg-surface py-3">
       {/* Decision */}
       {decided ? (
         <div
@@ -966,6 +1032,7 @@ function SkillCreateApprovalView({
         </div>
       )}
 
+      </div>
       <ConfirmDialog
         open={confirmOpen}
         onClose={() => setConfirmOpen(false)}

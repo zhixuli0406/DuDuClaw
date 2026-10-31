@@ -1,38 +1,6 @@
-# Google Workspace integration (all eight services, native)
+# Google Workspace tools and security
 
-> **Visibility status (updated in v1.49.0):** the dashboard's **Integrations →
-> Google** tab is now **visible by default**. Earlier versions hid it pending
-> Google's OAuth app verification, but verification turns out to gate only the
-> "bring your own OAuth client" path (domain-wide delegation via service
-> account and the Apps Script bridge are unaffected), so there was no reason to
-> keep the tab hidden. Being visible does not mean the tools are active,
-> though: there is still a separate master switch, `config.toml
-> [integrations] google_workspace`, **defaulting to `false`**. Without it,
-> credentials can be configured and the connection test can pass, but the
-> tools never reach your AI employees, and the dashboard shows a clear yellow
-> warning. For a guided walkthrough of the three credential paths, see
-> [google-workspace-integration.md](google-workspace-integration.md).
-
-> **Design decision (D5, 2026-08-04):** DuDuClaw does not ship shared Google
-> OAuth credentials. Users supply their own OAuth client (or use the DWD /
-> Apps Script paths instead), and DuDuClaw only stores and refreshes the
-> resulting token — it never bundles a client id/secret of its own. See
-> [google-workspace-integration.md](google-workspace-integration.md) for the
-> decision context (D5).
-
-Connect a Google account so your AI employees can search and read mail, prepare
-draft replies, list your calendar, create events (with Google Meet links), and
-read/append rows in your Google Sheets, read Google Forms responses, and manage
-Google Tasks. DuDuClaw talks to the Google REST APIs natively — there is no
-third-party MCP server to install. The access token is stored in DuDuClaw's
-encrypted OAuth vault and refreshed automatically.
-
-**All eight Workspace services are covered natively** — Gmail, Calendar,
-Sheets, Drive, Docs, Slides, Forms, Tasks — on GA REST APIs, so nothing here
-depends on Google's Developer Preview program and any customer can use it.
-(Google's own remote MCP servers cover six of the eight but are Preview-only,
-and their terms forbid exposing Pre-GA APIs to users outside your own domain.
-They remain available as an advanced opt-in: [google-mcp.md](google-mcp.md).)
+For setup, use [Connect Google](google-setup.md). Native REST tools cover eight services and nineteen tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
 
 ## What you get
 
@@ -41,7 +9,7 @@ Nineteen agent-facing MCP tools, gated by two scopes (`google:read` /
 
 | Tool | Class | What it does |
 |------|-------|--------------|
-| `google_status` | read | Connection diagnostics: connected?, granted scopes, token validity. Reads local state only. |
+| `google_status` | read | Identity and credential diagnostics; output depends on the account path. Does not prove per-service access. Hidden while Google integration or the employee identity is disabled. |
 | `gmail_search` | read | Search the mailbox using Gmail query syntax (`from:… is:unread`, etc.). Returns sender/subject/date/snippet. |
 | `gmail_read` | read | Read one message in full: headers, plain-text body (truncated if long), attachment manifest (filename + size only — never downloaded). |
 | `gmail_create_draft` | write | Create a Gmail **draft**. Never sends — sending stays a manual human action. |
@@ -95,26 +63,6 @@ which is why they are served natively here.
   [capabilities]
   approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
   ```
-
-## Choosing a credential path
-
-Three ways to authorize the same nineteen tools. They differ in who has to set
-something up, and in whether Google needs to have verified an app first.
-
-| | Personal @gmail.com | Workspace domain | Who sets it up | Tool coverage |
-|---|---|---|---|---|
-| **OAuth client** (below) | ✅ | ✅ | each customer creates their own Google Cloud OAuth client | all 19 |
-| **Service account + domain-wide delegation** | ❌ | ✅ | the domain's super admin authorizes one client id | all 19 |
-| **Apps Script bridge** | ✅ | ✅ (unless the admin disables Apps Script) | the end user deploys a script in their own account | Gmail / Calendar / Sheets only |
-
-When more than one is configured the order of precedence is service account →
-OAuth vault → Apps Script bridge; the bridge sits last because it covers the
-fewest tools. `google_status` names the source actually in effect.
-
-The two credential-free paths are documented in
-[google-no-oauth-client.md](google-no-oauth-client.md). To give each AI
-employee its own colleague's account, see
-[Per-employee Google accounts](#per-employee-google-accounts-company-delegation-v1760).
 
 ## Per-employee Google accounts (company delegation, v1.76.0)
 
@@ -291,110 +239,19 @@ Dedicated gateway execution makes one attempt for non-GET/HEAD REST requests: tr
   Google directly with a token it was issued for its own colleague.
 - An employee with a shell runs as the same OS user as the gateway; see the
   keychain limits in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
-- Not yet verified against a real Workspace tenant: the exact Admin console
-  flow, Google's real error strings, a Gmail-disabled organizational unit,
-  and whether Google's own remote MCP endpoints accept delegated tokens.
+- Google's own remote MCP endpoints may not accept delegated tokens.
 
-## Prerequisites: create a Google OAuth client
 
-You supply your own Google OAuth client (DuDuClaw never ships shared
-credentials). One-time setup:
+## What was ruled out, and why
 
-1. Open the [Google Cloud Console → Credentials](https://console.cloud.google.com/apis/credentials)
-   page (create/select a project first).
-2. Enable these eight APIs for the project (APIs & Services → Library), or in
-   one command:
-
-   ```bash
-   gcloud services enable gmail.googleapis.com calendar-json.googleapis.com \
-     sheets.googleapis.com drive.googleapis.com docs.googleapis.com \
-     slides.googleapis.com forms.googleapis.com tasks.googleapis.com \
-     --project=PROJECT_ID
-   ```
-3. Configure the OAuth consent screen (External or Internal). Add your own
-   Google account as a test user if the app stays in "Testing".
-4. Create an **OAuth client ID** of type **Web application**.
-5. Under **Authorized redirect URIs**, add exactly:
-
-   ```
-   http://localhost:18889/api/mcp/oauth/callback
-   ```
-
-   18889 is the gateway's default port. If you run it elsewhere (`DUDUCLAW_PORT`),
-   register that port instead — the dashboard's setup step shows the exact URI,
-   derived from the port the gateway is actually listening on. A mismatch here
-   is silent: Google redirects the browser to a port with nothing on it, so the
-   token never arrives and the page stays on "not connected".
-
-6. Copy the generated **Client ID** and **Client secret**.
-
-The requested scopes are:
-
-```
-https://www.googleapis.com/auth/gmail.readonly
-https://www.googleapis.com/auth/gmail.compose
-https://www.googleapis.com/auth/calendar.events
-https://www.googleapis.com/auth/spreadsheets
-https://www.googleapis.com/auth/drive.readonly
-https://www.googleapis.com/auth/documents
-https://www.googleapis.com/auth/presentations.readonly
-https://www.googleapis.com/auth/forms.body.readonly
-https://www.googleapis.com/auth/forms.responses.readonly
-https://www.googleapis.com/auth/tasks
-https://www.googleapis.com/auth/userinfo.email
-```
-
-> **Scope change (v1.45):** the `spreadsheets` scope was added for the Sheets
-> tools. A Google account connected before v1.45 will get a `403` from the Sheets
-> APIs because its token predates this scope — `google_status` flags the missing
-> scope, and reconnecting from the dashboard re-consents with the full set.
->
-> **Scope change (v1.47):** Drive (`drive.readonly`), Docs (`documents`),
-> Slides (`presentations.readonly`), Forms (`forms.body.readonly`,
-> `forms.responses.readonly`) and Tasks (`tasks`) were added for the new native
-> tools. Same rule as above — an older token yields `403` with re-auth
-> guidance; reconnect from Integrations → Google to re-consent.
-
-## Connect from the dashboard
-
-1. Go to **Integrations → Google** (`/manage/integrations?tab=google`).
-2. Paste the Client ID and Client secret, then click **Connect Google**.
-3. A Google consent window opens. Approve access. The window confirms success
-   and the dashboard flips to **Google is connected**.
-
-The client credentials are persisted (secret encrypted at rest) so the access
-token can be refreshed automatically, and so re-authorizing later does not
-require re-entering the secret.
-
-To disconnect, click **Disconnect** on the connected view. Your stored client
-credentials are kept so you can reconnect in one click; the access token is
-removed.
-
-## How refresh works
-
-Google issues a refresh token only when the authorization requests offline
-access, so the connect flow adds `access_type=offline&prompt=consent`
-automatically for Google. When the access token expires, `get_valid_google_token`
-runs a refresh grant with your stored client credentials, saves the new token,
-and continues. If refresh is not possible (no refresh token, or missing stored
-credentials), the tools return a clear message directing you back to the
-Integrations → Google page to reconnect.
-
-## Re-authorizing after a scope change
-
-A token authorized before this integration shipped (older scope set) will get a
-`403` from the new write APIs. The tools detect this and return guidance listing
-the scopes to grant. Reconnect from Integrations → Google to re-consent with the
-current scopes.
-
-## Troubleshooting
-
-- **"Google is not connected."** — No token stored. Connect from the dashboard.
-- **`401 Unauthorized`** — The authorization was revoked or is invalid.
-  Reconnect.
-- **`403` with a scope list** — The token is missing required scopes. Reconnect
-  to re-consent.
-- **Redirect URI mismatch during consent** — The redirect URI in your Google
-  OAuth client must be exactly `http://localhost:18889/api/mcp/oauth/callback`.
-
-Run `google_status` at any time for a live diagnosis.
+**Reading Mail.app / Calendar.app locally via AppleScript.** Calendar works and
+ships today (`os_calendar_today`), because a day of events is a small query.
+Mail does not: measured against a real 54,000-message mailbox on macOS 15,
+`Mail.inbox.messages.dateReceived()` took 17 seconds, and both
+`whose({dateReceived: …})` and `whose({readStatus: false})` failed to return
+within 60–90 seconds. Message order from `inbox.messages` is also not
+chronological, so cheap index access returns arbitrary old mail. Spotlight does
+not index mail messages (`kMDItemKind == 'Mail Message'` returns nothing), and
+reading `~/Library/Mail` directly needs Full Disk Access plus an undocumented,
+version-specific SQLite schema. Gmail on this path goes through Apps Script
+instead.

@@ -63,6 +63,8 @@ pub(crate) struct Report {
     pub platform: String,
     pub source: String,
     pub apply: bool,
+    pub profile_preview: serde_json::Value,
+    pub profile_confirmation: Option<String>,
     pub items: Vec<Item>,
     /// Extra freeform notes surfaced to the operator (v1 non-goals, hints).
     pub notes: Vec<String>,
@@ -74,6 +76,8 @@ impl Report {
             platform: platform.to_string(),
             source: source.to_string(),
             apply,
+            profile_preview: serde_json::Value::Null,
+            profile_confirmation: None,
             items: Vec::new(),
             notes: Vec::new(),
         }
@@ -237,6 +241,8 @@ impl Report {
             "platform": self.platform,
             "source": self.source,
             "dry_run": !self.apply,
+            "profile_preview": self.profile_preview,
+            "profile_confirmation": self.profile_confirmation,
             "items": items,
             "summary": {
                 "imported": self.count("IMPORTED"),

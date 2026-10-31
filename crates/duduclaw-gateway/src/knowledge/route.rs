@@ -40,7 +40,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use duduclaw_auth::db::UserDb;
-use duduclaw_knowledge::acl::{AllowedSet, Narrowing, effective_collections};
+use duduclaw_knowledge::acl::{AllowedSet, Narrowing};
 use duduclaw_knowledge::audit::{AccessEntry, log_access};
 use duduclaw_knowledge::requester::{RequesterIdentity, UserDirectory, agent_ctx, human_ctx};
 use duduclaw_knowledge::{KbError, schema};
@@ -342,7 +342,7 @@ fn serve_with(
         outcome: "ok".into(),
         ..Default::default()
     };
-    let allowed = match effective_collections(&conn, &human, Some(&agent_side), &narrowing) {
+    let allowed = match super::principals::effective_collections(&st.home, &conn, &human, Some(&agent_side), &narrowing) {
         Ok(a) => a,
         Err(e) => {
             entry.op = "search".into();

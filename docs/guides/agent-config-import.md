@@ -12,17 +12,22 @@ Also in [繁體中文](zh-TW/agent-config-import.md) and [日本語](ja-JP/agent
 
 ```bash
 duduclaw pack install ./報告顧問.zip --dry-run   # plan only, writes nothing
-duduclaw pack install ./報告顧問.zip             # import
-duduclaw pack install ./reviewer.agent.md            # a single file works too
-duduclaw pack install ~/.openclaw                     # a folder works too
+duduclaw pack install ./報告顧問.zip --confirm-profile <preview-digest>
+duduclaw pack install ./reviewer.agent.md --dry-run
+duduclaw pack install ~/.openclaw --dry-run
 ```
 
 `--rename` imports under an `-imported` suffix when a staff member with the same id already exists (otherwise the clash is reported and that staff member is skipped). When the same content was imported before, add `--replace <slug>` to replace the earlier version (plus `--accept-edits` when its staff were edited since), or `--as-copy` to keep both; see "Importing the same thing again" below. `duduclaw pack install` is the same command that installs expert packs; there is no separate import command. `duduclaw migrate from openclaw|hermes` still exists for moving a whole platform, including channel tokens and schedules (see [migrate-from.md](migrate-from.md)), and it now uses the same file mapping described below.
+
+The preview shows all four profile sections and input-guard results. A terminal import requires `--confirm-profile` with the exact digest printed by the preview; editing the source invalidates that confirmation. AI sessions cannot import. In the native `duduclaw:` block, only editable settings are accepted; frozen fields are listed and rejected. MCP servers are never imported. OpenClaw retired `TOOLS.md` and `HEARTBEAT.md`, but older imports remain supported.
+
+Export from the employee page, or run `duduclaw agent export <id> --format duduclaw --out <path>`. Other formats: `openclaw`, `hermes`, `agents-md`, `claude-subagent`. User data is excluded unless `--include-user` is explicit. Export refuses secret-shaped content and is unavailable in AI sessions. See the [Agent File reference](../spec/agent-file-spec.md).
 
 ## Supported formats
 
 | Format | How it is recognised | One staff member per |
 |---|---|---|
+| DuDuClaw Agent File | YAML frontmatter `schema: duduclaw.agent/v1`, independent of filename (256 KiB maximum) | file |
 | Doubao partner package (豆包「導出夥伴安裝包」) | `manifest.json` with `units`, or `agents/<ref>/agent.yml` + `persona/` | `agents/<ref>/` |
 | OpenClaw folder | `openclaw.json` (also `moltbot.json`, `clawdbot.json`) | entry in `agents.list[]` or `agents.entries` |
 | OpenClaw / SoulSpec persona workspace | `SOUL.md` at the top | folder |
@@ -40,7 +45,7 @@ Expert packs (`expert.toml`), Claude Code plugins and single Agent Skills keep w
 | `SOUL.md`, Doubao `persona/SOUL.md` | `SOUL.md` | Read-only to the staff member. |
 | `IDENTITY.md` | `IDENTITY.md`, plus name and emoji in `agent.toml` | OpenClaw `- Name:` / `- Emoji:` lines and the Doubao `## 簽名` section are both read. |
 | `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, subagent body, Dify `pre_prompt` | `INSTRUCTIONS.md` (new) | Loaded into every prompt after SOUL and IDENTITY. Read-only to the staff member. |
-| `USER.md` (Hermes: `memories/USER.md`) | knowledge page "服務對象" | Core layer, so it is in every prompt. |
+| `USER.md` (Hermes: `memories/USER.md`) | `USER.md` | Up to 4,000 characters; injected as data, never instructions. Existing wiki pages are not moved. |
 | `TOOLS.md` | knowledge page "工具備註" | Notes only. It grants no tool. |
 | `HEARTBEAT.md` | knowledge page "定期檢查清單" | Not scheduled automatically; create a schedule in the dashboard if you want one. |
 | `BOOT.md`, Dify opening statement | knowledge page | Searched on demand. |
@@ -71,7 +76,20 @@ A skill is not installed at all when its SKILL.md fails the content scanners or 
 
 ## Safety
 
-- The import is the only review point for SOUL and INSTRUCTIONS, because staff members cannot edit them afterwards. Both, and every other imported text, go through the prompt-injection guard; SOUL and INSTRUCTIONS also go through the skill security scanner. A refused SOUL skips that staff member; a refused instruction file is left out and reported.
+Imported prompt documents (SOUL, IDENTITY, USER, INSTRUCTIONS, Contract, memory,
+knowledge and skill text) are credential-masked before preview and installation
+planning. Each profile section shows `masked_values`, a count without the values.
+The report, confirmation digest and installed files use the exact masked document
+bytes; retained UTF-8 originals are masked too. Re-previewing unchanged input
+keeps the same digest. A scan failure or a text file over the 512 KiB scan limit
+refuses the import without echoing values. Structured settings containing
+credentials are refused by field path, never silently rewritten; credential-bearing
+metadata is refused too. Dashboard and external/MCP `user` writes also mask
+USER.md before review, hashes, history and baseline acceptance. Existing files,
+history and backups are not scrubbed, and arbitrary private prose may still need
+manual removal.
+
+- Persona, User, Rules and Contract are displayed with input-guard results before confirmation. A blocked section refuses the whole profile before any employee is created.
 - Credentials are never imported: `.env`, `auth.json`, `auth-profiles.json` and similar files are not read or kept, channel tokens in `openclaw.json` are ignored here, and Dify secret variables are dropped.
 - An OpenClaw workspace path that points outside the uploaded folder is not followed.
 - Zip files: `__MACOSX/`, `._*`, `.DS_Store`, `Thumbs.db` and `desktop.ini` are skipped. File names are read as UTF-8 (flagged, or unflagged as macOS writes them), then GBK or Big5 for archives made on Chinese Windows. If no encoding fits, or GBK and Big5 are equally likely, the upload is refused with the raw bytes in the message rather than written with garbled names. Symbolic links are not extracted. Names must mean the same thing on every system, so a `:` in a name, a trailing dot or space, Windows device names (`CON`, `NUL`, `COM1`, …) and two entries that differ only in upper/lower case are refused. The size, entry-count and compression-ratio limits of expert packs apply.

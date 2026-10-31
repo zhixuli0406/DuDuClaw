@@ -209,6 +209,10 @@ impl FailoverManager {
                     crate::metrics::global_metrics().record_failover();
                 }
                 Err(error)=>{
+                    if let Some(message) = crate::budget::budget_refusal_message(&error) {
+                        return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                            RuntimePreflightKind::Budget, message.to_owned()));
+                    }
                     // An autonomy pause refusal is not a provider failure: it must
                     // not put the runtime into cooldown for human chat.
                     let stop=is_non_retryable(&error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error)
@@ -244,6 +248,10 @@ impl FailoverManager {
         if !context.allow_cross_family_failover && (!family_known || !crate::runtime_config::same_model_family(&context.model,&fb_model)) {
             failure.push(Fallback,*fb,Some(&fb_model),Outcome::CrossFamilyRefused);return Err(failure);
         }
+        crate::budget::gate_before_spawn(&context.home_dir, context.agent_dir.as_deref(),
+            &context.agent_id, "runtime_fallback").await.map_err(|e|
+                RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                    RuntimePreflightKind::Budget, e.to_string()))?;
         warn!(agent=%context.agent_id,from_runtime=?primary,to_runtime=?fb,from_model=%context.model,to_model=%fb_model,model_source,"Explicit runtime fallback — substituting a compatible model");
         let mut fb_context=context.clone();fb_context.model=fb_model;
         match {
@@ -263,7 +271,13 @@ impl FailoverManager {
                 failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::Empty);Err(failure)
             }
             Err(error)=>{
-                if !crate::autonomous_runtime::was_denied() {self.record_failure(fb).await;}
+                if let Some(message) = crate::budget::budget_refusal_message(&error) {
+                    return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                        RuntimePreflightKind::Budget, message.to_owned()));
+                }
+                if !crate::autonomous_runtime::was_denied() && !error.starts_with("AUTONOMY_PAUSED:") {
+                    self.record_failure(fb).await;
+                }
                 failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::ExecutionError(error));Err(failure)
             }
         }
@@ -371,6 +385,7 @@ fn record_successful_response(runtime:&RuntimeType,context:&RuntimeContext,respo
 /// Avoids broad substring matches like "safety" or "content policy" that
 /// could unintentionally match legitimate error descriptions.
 fn is_non_retryable(error: &str) -> bool {
+    if error.starts_with("AUTONOMY_PAUSED:") { return true; }
     let lower = error.to_lowercase();
     // 4xx client errors (except 429 rate limit which is retryable)
     lower.contains("400 ") || lower.contains("401 ") || lower.contains("403 ")

@@ -28,7 +28,7 @@ use crate::channel_settings::keys;
 mod assign;
 mod ingress;
 mod trigger;
-pub(crate) use ingress::durable_line_enabled;
+pub(crate) use ingress::{attach_credential_holder, durable_line_enabled};
 use ingress::{drain_line_ingress, line_conversation, record_reply_failure};
 
 const LINE_API_ORIGIN: &str = "https://api.line.me";
@@ -529,6 +529,14 @@ pub(crate) async fn handle_line_webhook(
             return StatusCode::BAD_REQUEST;
         };
         let conversation = line_conversation(event);
+        // Register metadata before the durable sink discards the original.
+        // No employee holder exists until the worker validates its route.
+        if let Some(text) = event.message.as_ref().and_then(|message| message.text.as_deref()) {
+            let ingress_id = crate::channel_ingress::digest(&["line", &account, event_id]);
+            let source = format!("line-ingress:{ingress_id}");
+            let principal = crate::credential_ledger::chat_principal(&format!("line:{conversation}"), "");
+            let _ = crate::credential_ledger::process_message(&state.home_dir, text, &source, &principal, "", "chat").await;
+        }
         accepted.push(crate::channel_ingress::AcceptedEvent {
             decision_fastlane: line_decision_fastlane(event),
             decision_binding: line_decision_request_id(event).map(|request_id| serde_json::json!({
@@ -837,7 +845,7 @@ async fn process_line_events(
                                     Ok(t) if !t.trim().is_empty() => {
                                         info!(
                                             "🎙 LINE [{sender}] transcribed: {}",
-                                            duduclaw_core::truncate_bytes(&t, 80)
+                                            duduclaw_core::truncate_bytes(&duduclaw_security::credential_detect::mask(&t), 80)
                                         );
                                         voice_text = t;
                                     }
@@ -895,7 +903,7 @@ async fn process_line_events(
                     continue;
                 }
 
-                info!("📩 LINE [{sender}]: {}", truncate_bytes(&input_text, 80));
+                info!("📩 LINE [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&input_text), 80));
 
                 // ── Chat commands (/status, /new, /handoff, /undo, /rollback, …) ──
                 // Intercepted before the AI pipeline — zero LLM cost. Mirrors slack.rs.
@@ -1311,11 +1319,10 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
         }
     }
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` above (see
-    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
-    // it needs no pressing-user identity, only the single-use nonce. This
-    // whole webhook handler already runs in a `tokio::spawn`ed detached task
+    // Goal-intent confirmation buttons (P1) use a separate codec from
+    // `decision_action` above. Ordinary employees keep
+    // nonce-based confirmation; machine employees require verified Admin.
+    // This whole webhook handler already runs in a detached task
     // (see the caller: "LINE times out a slow webhook response… blocking the
     // 200 on a multi-second model reply gets the handler future… cancelled"),
     // so awaiting `handle_gintent_button`'s possible plan-first LLM call here
@@ -1323,7 +1330,7 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
     if sender != "unknown" {
         if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(data) {
             let outcome =
-                crate::goal_intent::handle_gintent_button(&state.ctx, choice, &nonce).await;
+                crate::goal_intent::handle_gintent_button_for_sender(&state.ctx, choice, &nonce, "line", sender).await;
             let messages = vec![serde_json::json!({ "type": "text", "text": outcome })];
             let _ = send_reply_rich(&state.http, token, reply_token, messages.clone()).await;
             return;

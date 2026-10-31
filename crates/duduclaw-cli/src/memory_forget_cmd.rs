@@ -22,6 +22,7 @@ use duduclaw_gateway::memory_forget_steps as steps;
 use duduclaw_memory::{ForgetPlan, ForgetSelector, PlanOptions, PlanOutcome, SqliteMemoryEngine};
 
 pub const AUDIT_PLANNED: &str = "memory_source_forget_planned";
+#[cfg(test)]
 pub const AUDIT_APPLIED: &str = "memory_source_forget_applied";
 pub const AUDIT_REFUSED: &str = "memory_source_forget_refused";
 

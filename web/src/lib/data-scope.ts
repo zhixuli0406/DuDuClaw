@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import type { AgentDetail } from '@/lib/api';
+import type { AgentDetail, AgentInfo } from '@/lib/api';
 import type { UserRole, AgentBinding } from '@/stores/auth-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -34,25 +34,38 @@ export function useDataScope(): DataScope {
   return scopeForRole(role);
 }
 
-/**
- * The AI staff the current viewer should see. For `own`, filters to bound
- * agents. For `all`/`reports`, trusts the (backend-scoped) `agents.list`
- * result as-is.
- *
- * NOTE (DEGRADED): the `reports` subtree is computed server-side from the
- * person org (`manager_id`, WP11-T11.0) which is not yet wired, so a manager
- * currently sees whatever `agents.list` returns. The employee `own` path is
- * fully enforced client-side here.
- */
-export function useVisibleAgents(): ReadonlyArray<AgentDetail> {
+/** Display-only team entries never contain model, budget, or memory data. */
+export type VisibleAgent = AgentInfo & Partial<AgentDetail> & {
+  readOnly?: boolean;
+  teamMember?: string;
+};
+
+export function useVisibleAgents(includeTeam: false): ReadonlyArray<AgentDetail>;
+export function useVisibleAgents(includeTeam?: true): ReadonlyArray<VisibleAgent>;
+export function useVisibleAgents(includeTeam = true): ReadonlyArray<VisibleAgent> {
   const scope = useDataScope();
   const agents = useAgentsStore((s) => s.agents);
+  const teamAgents = useAgentsStore((s) => s.teamAgents);
+  const teamSubject = useAgentsStore((s) => s.teamSubject);
+  const user = useAuthStore((s) => s.user);
   const bindings = useAuthStore((s) => s.bindings);
   return useMemo(() => {
     if (scope === 'own') {
       const owned = ownedAgentNames(bindings);
       return agents.filter((a) => owned.has(a.name));
     }
-    return agents;
-  }, [scope, agents, bindings]);
+    if (scope !== 'reports') return agents;
+    const owned = ownedAgentNames(bindings);
+    const directAgents = agents.filter(a => owned.has(a.name));
+    if (!includeTeam || teamSubject !== JSON.stringify([user?.id, user?.role])) return directAgents;
+    const direct = new Set(directAgents.map(a => a.name));
+    const team: VisibleAgent[] = (teamAgents ?? []).filter(a => a.via === 'team' && !direct.has(a.name)).map(a => ({
+      name: a.name, display_name: a.display_name, department: a.department,
+      role: a.role === 'main' || a.role === 'specialist' ? a.role : 'worker',
+      status: a.status === 'active' || a.status === 'paused' ? a.status : 'terminated',
+      trigger: a.trigger ?? '', icon: a.icon ?? '', reports_to: '',
+      readOnly: true, teamMember: a.via_user_name || a.via_user || '',
+    }));
+    return [...directAgents, ...team];
+  }, [scope, agents, bindings, includeTeam, teamAgents, teamSubject, user?.id, user?.role]);
 }

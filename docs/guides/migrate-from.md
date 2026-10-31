@@ -12,13 +12,13 @@ The older spelling `duduclaw migrate-from` was removed in v1.69.0. It prints the
 duduclaw migrate from openclaw
 
 # Apply after reviewing the plan
-duduclaw migrate from openclaw --apply
+duduclaw migrate from openclaw --apply --confirm-profile <preview-digest>
 ```
 
 ## Command
 
 ```
-duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename] [--agent <id>] [--no-redact] [--json]
 ```
 
 | Flag | Effect |
@@ -27,6 +27,10 @@ duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [-
 | `--source <path>` | Source directory. openclaw/hermes have defaults; **paperclip requires it**. |
 | `--apply` | Actually perform the write. |
 | `--rename` | On an agent-id collision, import under an `-imported` suffix instead of skipping. |
+| `--confirm-profile <digest>` | Required with `--apply` for OpenClaw, Hermes and paperclip; use the digest from the profile preview. Not required for `claude-code`. |
+| `--agent <id>` | Existing target employee; required for `claude-code`. |
+| `--no-redact` | Disable the default PII redaction of `claude-code` session transcripts. |
+| `--json` | Emit one machine-readable JSON result instead of the human-readable plan. |
 
 Every item is tagged with a status:
 
@@ -46,7 +50,7 @@ the report.
 
 ```bash
 duduclaw migrate from openclaw            # defaults to ~/.openclaw
-duduclaw migrate from openclaw --source /path/to/.openclaw --apply
+duduclaw migrate from openclaw --source /path/to/.openclaw --apply --confirm-profile <preview-digest>
 ```
 
 Reads `openclaw.json` (JSON5) and imports:
@@ -54,7 +58,7 @@ Reads `openclaw.json` (JSON5) and imports:
 - **Agents**: `agents.list[]` (or a single default `main`), each with its workspace
   files placed as in [agent-config import](agent-config-import.md#where-each-file-goes):
   `SOUL.md` → SOUL, `IDENTITY.md` → IDENTITY (+ name and emoji), `AGENTS.md` →
-  `INSTRUCTIONS.md`, `USER.md` / `TOOLS.md` / `HEARTBEAT.md` → knowledge pages,
+  `INSTRUCTIONS.md`, `USER.md` → native user data; `TOOLS.md` / `HEARTBEAT.md` → knowledge pages,
   `MEMORY.md` + `memory/*.md` → memory facts with their source recorded. Before
   1.76 the persona files were copied into `agents/<id>/memory/`, where nothing reads them.
 - **Channel tokens**: `channels.telegram.botToken`, `channels.discord.token`,
@@ -73,9 +77,9 @@ The legacy directory names `~/.moltbot` and `~/.clawdbot` are also supported.
 ### Hermes (`~/.hermes`)
 
 ```bash
-duduclaw migrate from hermes --apply
+duduclaw migrate from hermes --apply --confirm-profile <preview-digest>
 # migrate a non-active profile:
-duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply
+duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply --confirm-profile <preview-digest>
 ```
 
 Hermes is a single-agent platform, so this produces one DuDuClaw agent (id `hermes`).
@@ -86,7 +90,7 @@ Imports:
   `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`. `EMAIL_*` channels are not yet supported in v1
   and are `SKIPPED`.
 - **Persona / memory**: `SOUL.md`, `memories/MEMORY.md` (memory facts, entries split
-  on `§`), `memories/USER.md` (knowledge page "服務對象").
+  on `§`), `memories/USER.md` (native `USER.md`).
 - **Cron**: `cron/jobs.json` (parsed defensively).
 - Only the **active profile** is migrated; other profiles are listed as `SKIPPED`, with
   a prompt to migrate each one individually via `--source`.
@@ -100,7 +104,7 @@ to that database directly. Export from the paperclip side first:
 paperclipai company export <company-id> --out ./export \
   --include company,agents,projects,issues,tasks,skills
 
-duduclaw migrate from paperclip --source ./export --apply
+duduclaw migrate from paperclip --source ./export --apply --confirm-profile <preview-digest>
 ```
 
 `--source` is **required** (omitting it prints the instructions above). Imports:
@@ -153,3 +157,9 @@ value from config.toml first and rerun, or import as a separate agent with `--re
 It is kept as-is in `[model] preferred` and marked `PARTIAL`, prompting you to manually
 confirm which runtime it maps to (codex / openai_compat). DuDuClaw will not
 guess on your behalf.
+
+## Profile review and Claude Code
+
+OpenClaw, Hermes and paperclip migrations show Persona, User, Rules and Contract with input-guard results in preview mode. Apply requires the corresponding `--confirm-profile <digest>`; changed section content requires another review. This migration digest covers the Persona, User, Rules and Contract sections only; it does not bind every migration output file. In contrast, `pack install` requires `--confirm-profile <digest>` from its preview and binds all files it will write. AI sessions cannot run migration. `USER.md` is limited to 4,000 characters and injected as data, not instructions.
+
+Claude Code migration is also supported: `duduclaw migrate from claude-code --source ~/.claude --agent <existing-id>`. Add `--apply` after inspecting the preview; `--confirm-profile` is not required for this path. It imports curated memory, low-trust knowledge pages and filtered session transcripts into that existing employee; it does not create a new employee. Redaction is enabled by default; `--no-redact` disables the transcript redaction pass.

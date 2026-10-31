@@ -91,6 +91,7 @@ async fn a_third_party_server_is_registered_behind_a_spawn_scoped_proxy() {
     assert_eq!(ml["enabled"].as_bool(), Some(true));
     assert_eq!(ml["env"]["DUDUCLAW_AGENT_TOKEN"].as_str(), Some("${DUDUCLAW_AGENT_TOKEN:-}"));
     assert_eq!(ml["env"]["DUDUCLAW_TURN_ID"].as_str(), Some("${DUDUCLAW_TURN_ID:-}"));
+    assert_eq!(ml["env"][duduclaw_core::egress_guard::ENV_TURN_ALIAS].as_str(), Some("${DUDUCLAW_EGRESS_TURN_ID:-}"));
 
     let exe = duduclaw_core::resolve_duduclaw_bin();
     assert_eq!(ml["command"].as_str(), Some(exe.to_string_lossy().as_ref()));

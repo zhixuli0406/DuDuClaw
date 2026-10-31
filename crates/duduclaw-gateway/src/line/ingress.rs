@@ -176,3 +176,20 @@ pub(super) async fn decision_commit_test_pause(state: &LineState, event_id: &str
         release.notified().await;
     }
 }
+
+/// Called by the shared reply path after channel access gates and injection
+/// checks, never merely because an ingress snapshot selected an employee.
+pub(crate) async fn attach_credential_holder(home: &Path, agent: &str) {
+    let Ok(ids) = INGRESS_BINDING.try_with(|binding| {
+        let mut ids = vec![binding.row.id.clone()];
+        if let Some(merged) = binding.payload.get("merged").and_then(serde_json::Value::as_array) {
+            ids.extend(merged.iter().filter_map(|m| m["id"].as_str().map(str::to_owned)));
+        }
+        ids
+    }) else { return };
+    for id in ids {
+        if crate::credential_ledger::attach_ingress_holder(home, &format!("line-ingress:{id}"), agent).await.is_err() {
+            warn!("LINE credential holder registration unavailable");
+        }
+    }
+}

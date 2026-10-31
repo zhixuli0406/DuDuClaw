@@ -261,6 +261,31 @@ mod imp {
             }
         }
 
+        /// Create only: never overwrite an operator file or follow a link.
+        pub(crate) fn create_file_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
+            check_name(name)?;
+            let raw = match openat(
+                Some(self.fd.as_raw_fd()), name,
+                OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            ) {
+                Ok(raw) => raw,
+                Err(Errno::EEXIST) => {
+                    return match self.entry(name)? {
+                        Some(entry) if entry.kind == EntryKind::File && entry.nlink == 1 => Ok(false),
+                        _ => Err(refused("existing skill is not a regular, single-link file")),
+                    };
+                }
+                Err(e) => return Err(to_io(e)),
+            };
+            // SAFETY: openat returned a fresh descriptor owned only here.
+            let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+            file.write_all(contents)?;
+            file.sync_all()?;
+            self.sync_dir();
+            Ok(true)
+        }
+
         /// Replace regular file `name` atomically through temp file `tmp`
         /// (created with `O_EXCL|O_NOFOLLOW`), then `renameat`. A symlink or
         /// non-regular file at `name` is refused. New files are 0600; an
@@ -535,6 +560,11 @@ mod imp {
                     .map(Some)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8")),
             }
+        }
+
+        /// Refuse creation where fd-relative no-follow operations are unavailable.
+        pub(crate) fn create_file_new(&self, _name: &str, _contents: &[u8]) -> io::Result<bool> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "secure skill creation requires no-follow directory handles"))
         }
 
         pub(crate) fn write_bytes_atomic_with(

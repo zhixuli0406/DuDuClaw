@@ -228,6 +228,8 @@ impl UserModel {
 
     /// Update from conversation metrics extracted after a completed conversation.
     pub fn update_from_metrics(&mut self, metrics: &super::metrics::ConversationMetrics) {
+        let masked = metrics.masked();
+        let metrics = &masked;
         self.preferred_response_length
             .push(metrics.avg_assistant_response_length);
 

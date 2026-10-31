@@ -18,6 +18,7 @@ import { formatThinkingDuration, formatThinkingTokens } from '@/components/chat/
 import { useUrlState, useUrlStateNullable } from '@/lib/use-url-state';
 import {
   cardsForEvents,
+  displayRunText,
   isRunLive,
   relativeParts,
   runDurationSecs,
@@ -79,6 +80,7 @@ const CHANNEL_NAMES: Record<string, string> = {
 function statusDotClass(status: RunStatus | string): string {
   if (status === 'running') return 'bg-brand';
   if (status === 'completed') return 'bg-success';
+  if (status === 'failed') return 'bg-destructive';
   return 'bg-muted-foreground';
 }
 
@@ -148,8 +150,8 @@ export function RunsPage() {
   // above is derived, not a filter the user picked, so it stays out (W3-3).
 
   const agentName = useCallback(
-    (id: string) => agents.find((a) => a.name === id)?.display_name || id,
-    [agents],
+    (id: string) => visibleAgents.find((a) => a.name === id)?.display_name || id,
+    [visibleAgents],
   );
 
   const channelLabel = useCallback(
@@ -294,7 +296,7 @@ export function RunsPage() {
               )}
               {visibleAgents.map((a) => (
                 <SelectItem key={a.name} value={a.name}>
-                  {a.display_name || a.name}
+                  {a.display_name || a.name}{a.readOnly ? ` · ${intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}` : ''}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -350,7 +352,7 @@ export function RunsPage() {
                         <span className={cn('size-1.5 shrink-0 rounded-full', statusDotClass(r.status))} aria-hidden />
                       </span>
                       <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-                        {r.preview || intl.formatMessage({ id: 'runs.preview.empty' })}
+                        {displayRunText(r.preview ?? '') || intl.formatMessage({ id: 'runs.preview.empty' })}
                       </span>
                       <span className="mt-1 flex items-center gap-2 text-xs text-muted-foreground/70">
                         <span>{channelLabel(r.channel)}</span>
@@ -455,7 +457,8 @@ export function RunsPage() {
             onScroll={onTranscriptScroll}
             className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4"
           >
-            {cards.length === 0 && (
+            {detail.omitted?.includes('conversation_content') && <p role="note" className="py-4 text-sm text-muted-foreground">{intl.formatMessage({ id: 'runs.teamReadOnly' })}</p>}
+            {cards.length === 0 && !detail.omitted?.includes('conversation_content') && (
               <p className="py-8 text-center text-sm text-muted-foreground">
                 {intl.formatMessage({ id: 'runs.transcript.empty' })}
               </p>

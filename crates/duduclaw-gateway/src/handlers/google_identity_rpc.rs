@@ -234,7 +234,10 @@ impl MethodHandler {
                     ctx,
                     json!({}),
                 );
-                WsFrame::ok_response("", json!({ "removed": true }))
+                let forget_memories = crate::disconnect_forget::after_disconnect(&self.home_dir,
+                    "google:delegation", "Google Workspace delegation",
+                    params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await;
+                WsFrame::ok_response("", json!({ "removed": true, "forget_memories":forget_memories }))
             }
             Err(e) => WsFrame::error_response("", &e),
         }

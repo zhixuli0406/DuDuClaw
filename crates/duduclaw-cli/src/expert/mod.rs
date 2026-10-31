@@ -229,7 +229,7 @@ use report::Report;
 // ─────────────────────────── Security ───────────────────────────
 
 /// Result of scanning a foreign persona/skill body.
-enum ScanVerdict {
+pub(crate) enum ScanVerdict {
     Ok,
     Blocked(String),
 }
@@ -238,7 +238,7 @@ enum ScanVerdict {
 /// the prompt-injection input-guard (`duduclaw-security`) and the skill
 /// security scanner (`duduclaw-gateway::skill_lifecycle::security_scanner`).
 /// Fail-closed: any block/high-risk finding stops this asset from landing.
-fn scan_external(content: &str) -> ScanVerdict {
+pub(crate) fn scan_external(content: &str) -> ScanVerdict {
     // One scanner for install and for the dashboard's pre-install check
     // (`experts.generate` preview / `experts.install_draft` report), so the
     // two can never disagree about what gets skipped.
@@ -319,6 +319,7 @@ pub(crate) use duduclaw_gateway::expert_admin::{copy_dir, now_iso};
 /// The wired MCP server key the scaffold always writes; never overwritten by
 /// imported pack servers (fail-safe — a pack cannot hijack the duduclaw tool
 /// surface).
+#[cfg(test)]
 const WIRED_MCP_KEY: &str = "duduclaw";
 
 /// Read a `.mcp.json` file's `mcpServers` object (JSON5-tolerant). `None` when
@@ -335,6 +336,7 @@ pub(super) fn read_mcp_servers(path: &Path) -> Option<serde_json::Map<String, se
 /// entries **except** [`WIRED_MCP_KEY`] (`duduclaw`), which is never touched.
 /// Ensures `doc.mcpServers` exists. Returns the number of servers written.
 /// Pure (no I/O) so it is directly unit-testable.
+#[cfg(test)]
 pub(super) fn merge_mcp_servers(
     doc: &mut serde_json::Value,
     extra: &serde_json::Map<String, serde_json::Value>,
@@ -365,6 +367,7 @@ pub(super) fn merge_mcp_servers(
 /// scaffold already wrote with the duduclaw server). Preserves the duduclaw
 /// entry. Returns the number of servers written. Used by both the native and
 /// Claude-plugin importers.
+#[cfg(test)]
 pub(super) fn merge_agent_mcp(
     home: &Path,
     agent_id: &str,

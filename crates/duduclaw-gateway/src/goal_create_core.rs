@@ -204,6 +204,7 @@ async fn create_goal_task_inner(
     slot: Option<&crate::task_store::AssignScheduleSlot<'_>>,
     admission: Option<duduclaw_core::autonomy_handoff::AdmissionFuture>,
 ) -> Result<GoalCreated, String> {
+    crate::machine_employee::check_target(home_dir, &req.agent_id, req.on_behalf_of.as_deref())?;
     let description = req.description.trim();
     if description.is_empty() {
         return Err("description is required".to_string());

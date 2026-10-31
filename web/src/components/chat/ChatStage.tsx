@@ -1,6 +1,7 @@
 import { useIntl } from 'react-intl';
 import type { VisemeShape } from '@/components/mascot';
-import { DuDu, type DuduFace } from '@/components/mascot';
+import { type DuduFace } from '@/components/mascot';
+import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
 import { CharacterAvatar, agentPose, type AgentLifecycle } from '@/components/character';
 import type { ChatPhase } from '@/stores/chat-store';
 

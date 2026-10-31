@@ -128,9 +128,7 @@ const BOT_INTENTS: u64 = INTENT_GUILDS
 // ── Slash command definitions ───────────────────────────────
 
 fn slash_command_definitions() -> Vec<Value> {
-    // Product attribution is fixed across messaging channels.
-    let product =
-        "DuDuClaw".to_string();
+    let product = crate::distributor_brand::product_name();
     vec![
         json!({
             "name": "ask",
@@ -611,7 +609,7 @@ async fn register_slash_commands(http: &reqwest::Client, token: &str, app_id: &s
             let body = resp.text().await.unwrap_or_default();
             warn!(
                 "Discord: slash command registration failed ({status}): {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             );
         }
         Err(e) => {
@@ -952,7 +950,7 @@ async fn gateway_loop(
                     let payload: GatewayPayload = match serde_json::from_str(&msg) {
                         Ok(p) => p,
                         Err(e) => {
-                            warn!("Discord Gateway: failed to parse payload: {e} (first 200 chars: {})", truncate_bytes(&msg, 200));
+                            warn!("Discord Gateway: failed to parse payload: {e}");
                             continue;
                         }
                     };
@@ -1674,7 +1672,7 @@ async fn handle_message_create(
 
     info!(
         "📩 Discord [{author_name}] (guild:{guild_id}): {}",
-        truncate_bytes(&clean_content, 80)
+        truncate_bytes(&duduclaw_security::credential_detect::mask(&clean_content), 80)
     );
 
     // ── Auto-thread ──
@@ -2276,7 +2274,7 @@ async fn create_thread(
         let body = resp.text().await.unwrap_or_default();
         warn!(
             "Discord: failed to create thread ({status}): {}",
-            truncate_bytes(&body, 200)
+            truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
         );
         return None;
     }
@@ -2352,7 +2350,7 @@ async fn send_raw(
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            let detail = truncate_bytes(&body, 200).to_string();
+            let detail = truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200).to_string();
 
             // Retry without message_reference when Discord reports a cross-channel
             // reference error.  This can happen when gateway channel metadata is
@@ -2380,7 +2378,7 @@ async fn send_raw(
                     Ok(r2) => {
                         let s2 = r2.status();
                         let b2 = r2.text().await.unwrap_or_default();
-                        let d2 = truncate_bytes(&b2, 200).to_string();
+                        let d2 = truncate_bytes(&duduclaw_security::credential_detect::mask(&b2), 200).to_string();
                         error!("Discord send failed on retry ({s2}): {d2}");
                         return Err(DiscordSendError {
                             status: Some(s2.as_u16()),
@@ -2628,15 +2626,15 @@ async fn handle_component_interaction(
     let custom_id = cdata["custom_id"].as_str().unwrap_or("");
     let guild_id = data["guild_id"].as_str().unwrap_or("");
 
-    // Goal-intent confirmation buttons (P1) — a separate, deliberately
-    // UN-authorized codec from `decision_action` below (see
+    // Goal-intent confirmation buttons (P1) use a separate
+    // codec from `decision_action` below (see
     // `channel_format`'s "Goal-intent confirmation" module doc): wire format
     // `gintent:<choice>:<nonce>`, NOT `duduclaw:…`, so this must be checked
     // BEFORE the `ns != "duduclaw"` gate right below — that gate would
     // otherwise silently swallow every gintent press before it's ever
     // decoded (custom_id.splitn(3, ':').next() would be "gintent", not
-    // "duduclaw"). Consuming it needs no pressing-user identity, only the
-    // single-use nonce.
+    // "duduclaw"). Ordinary employees keep nonce-based confirmation;
+    // machine employees also require the pressing sender's verified Admin.
     //
     // Deferred response (type 5, "thinking…"): `handle_gintent_button`'s
     // plan-first branch calls a live LLM (`goal_plan::generate_plan_first`),
@@ -2647,7 +2645,9 @@ async fn handle_component_interaction(
     // `3` as plain text would have produced.
     if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(custom_id) {
         send_interaction_response(http, interaction_id, interaction_token, 5, None).await;
-        let outcome = crate::goal_intent::handle_gintent_button(ctx, choice, &nonce).await;
+        let sender = data["member"]["user"]["id"].as_str()
+            .or_else(|| data["user"]["id"].as_str()).unwrap_or("");
+        let outcome = crate::goal_intent::handle_gintent_button_for_sender(ctx, choice, &nonce, "discord", sender).await;
         let payload = channel_format::to_discord_message(&outcome, None, false);
         edit_interaction_response(http, app_id, interaction_token, &payload, &ctx.home_dir).await;
         return;
@@ -2929,7 +2929,7 @@ async fn handle_slash_command(
                     .is_guild_allowed("discord", guild_id)
                     .await
             {
-                let product = "DuDuClaw".to_string();
+                let product = crate::distributor_brand::channel_name();
                 send_interaction_response(http, interaction_id, interaction_token, 4,
                     Some(json!({"content": format!("❌ 此伺服器未被授權使用 {product}"), "flags": 64}))).await;
                 return;
@@ -3027,8 +3027,7 @@ async fn handle_slash_command(
                 if auto_thread { "✅" } else { "❌" },
             );
 
-            let product =
-                "DuDuClaw".to_string();
+            let product = crate::distributor_brand::product_name().replace('@', "@\u{200b}");
             let embed = json!({
                 "embeds": [{
                     "title": format!("{product} Status"),
@@ -3370,7 +3369,7 @@ async fn edit_interaction_response(
             let body = resp.text().await.unwrap_or_default();
             error!(
                 "Discord edit interaction failed ({status}): {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             );
         }
         Err(e) => error!("Discord edit interaction error: {e}"),

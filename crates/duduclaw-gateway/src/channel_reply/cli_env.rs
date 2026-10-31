@@ -40,6 +40,7 @@ pub(super) async fn spawn_claude_cli_with_env(
     };
 
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
+    let hook_args = crate::agent_hook_installer::claude_hook_args(home_dir, work_dir, false)?;
 
     // WP-8B (credentials doctrine P3, 2026-08): stop the child from
     // inheriting the gateway's full environment — that used to leak every
@@ -178,7 +179,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         // kill-switch DUDUCLAW_MINIMAL_CONTEXT / per-agent [runtime]
         // minimal_context = false opts out.
         if duduclaw_core::agent_toml::resolve_minimal_context(work_dir) {
-            cmd.args(["--setting-sources", "project,local"]);
+            if hook_args.is_empty() { cmd.args(["--setting-sources", "project,local"]); }
             if explore_lane.is_none() {
                 let tools =
                     caps.minimal_builtin_tools(&duduclaw_core::types::CURATED_BUILTIN_TOOLS);
@@ -221,15 +222,9 @@ pub(super) async fn spawn_claude_cli_with_env(
         // <agent_dir>/.claude/settings.json before spawning. This blocks
         // the sub-agent from using raw Write/Edit to create agent-structure
         // files (agent.toml/SOUL.md/…) outside <home>/agents/<name>/.
-        // Best-effort — logs warning on failure but does not abort spawn.
+        // Ask/block require installation; shadow warns and continues.
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
-        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(dir, &bin).await {
-            warn!(
-                agent_dir = %dir.display(),
-                error = %e,
-                "Failed to install agent-file-guard hook — spawn continuing without enforcement"
-            );
-        }
+        crate::agent_hook_installer::ensure_spawn_hook_settings(home_dir, dir, &bin).await?;
         cmd.current_dir(dir);
 
         // --bare disables .mcp.json auto-discovery, so explicitly specify it.
@@ -262,6 +257,7 @@ pub(super) async fn spawn_claude_cli_with_env(
     } else {
         _mcp_proxy_guard = None;
     }
+    cmd.args(&hook_args);
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
     }
@@ -327,12 +323,17 @@ pub(super) async fn spawn_claude_cli_with_env(
     {
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
+    cmd.env_remove(duduclaw_core::egress_guard::ENV_TURN_ALIAS);
+    if let Some(turn) = crate::runtime_turn::current() {
+        cmd.env(duduclaw_core::egress_guard::ENV_TURN_ALIAS, turn);
+    }
     crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
     // The person this turn is for (never an inherited gateway value).
     crate::on_behalf_of::inject_env(&mut cmd);
-    let _principal_context = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
-        .try_with(|id| id.clone()).ok()
-        .and_then(|agent| crate::on_behalf_of::context::register(home_dir, &agent));
+    // This path also serves background fallback into ClaudeRuntime.
+    // The installed hook's identity comes from the verified agent directory.
+    let _principal_context = work_dir.and_then(|dir| dir.file_name()).and_then(|id| id.to_str())
+        .and_then(|agent| crate::on_behalf_of::context::register(home_dir, agent));
     crate::on_behalf_of::context::inject(&mut cmd, _principal_context.as_ref());
     // Record `(agent, turn) → reply channel` for as long as this CLI runs, so
     // the computer-use route can ask a human in THIS chat (and only here)

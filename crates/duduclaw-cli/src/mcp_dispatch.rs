@@ -772,6 +772,7 @@ impl McpDispatcher {
         let mut params_owned = params.clone();
         if let Some(obj) = params_owned.as_object_mut() {
             obj.remove("egress_guard");
+            obj.remove("recipient_guard");
             obj.remove("reason");
             obj.remove("action_grant");
             obj.remove("action_rule_matches");
@@ -1460,6 +1461,23 @@ impl McpDispatcher {
             );
         }
 
+        // Agent Admin scope does not grant the human Employee machine rights.
+        // An opaque gateway-owned context distinguishes true background work
+        // from a human-created task; missing/stale proof always refuses.
+        if SYSTEM_OPERATOR_TOOLS.contains(&tool_name)
+            && !crate::mcp::check_system_operation_principal(&self.home_dir, gate_agent).await
+        {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            self.audit_dispatch_denial(tool_name, &params_owned, "system_operation_human_denied", "A live administrator or proven background context is required");
+            let language = duduclaw_gateway::prompt_identity::read_default_language(&self.home_dir).await;
+            let message = match language.as_deref() {
+                Some("en") => "Only an administrator can operate the machine.",
+                Some("ja" | "ja-JP") => "機器を操作できるのは管理者だけです。",
+                _ => "只有系統管理員可以操作機器。",
+            };
+            return jsonrpc_error(id, -32003, message);
+        }
+
         // ── 3.627 Co-drive capability gate (CD-1, deny-by-default, I5) ───────
         // `codrive_run` is already `Scope::Admin`-scoped, but scope alone is
         // an opt-out posture (design red line 1: "共駕能力預設關；開啟是
@@ -1663,11 +1681,13 @@ impl McpDispatcher {
                 }
             }
         } else { (None, None) };
+        let egress_call_id = uuid::Uuid::new_v4().to_string();
         // ── 3.69 Per-turn private-data egress guard ──────────────────────────
         // Never accept a model-supplied reason; bind the final arguments after
         // policy/redaction rewrites to the existing single-use approval.
         if let Some(obj) = params_owned.as_object_mut() {
             obj.remove("egress_guard");
+            obj.remove("recipient_guard");
         }
         let sink = matches!(
                 duduclaw_core::tool_effect::effect_of_call(tool_name, params_owned.get("arguments").unwrap_or(&Value::Null)),
@@ -1678,9 +1698,9 @@ impl McpDispatcher {
         {
             let decision = if !principal.is_external {
                 if let Some(taint) = read_taint {
-                    duduclaw_gateway::egress_gate::evaluate(&self.home_dir, gate_agent, tool_name, sink, taint)
+                    duduclaw_gateway::egress_gate::evaluate_with_call(&self.home_dir, gate_agent, tool_name, sink, taint, &egress_call_id)
                 } else {
-                    crate::mcp::egress_gate::check(&self.home_dir, gate_agent, tool_name, sink).await
+                    duduclaw_gateway::egress_gate::check_with_call(&self.home_dir, gate_agent, tool_name, sink, &egress_call_id).await
                 }
             } else if dedicated_google {
                 duduclaw_gateway::egress_gate::check_unattributed_employee(&self.home_dir, gate_agent, tool_name, sink)
@@ -1695,6 +1715,14 @@ impl McpDispatcher {
                     return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                 }
             }
+        }
+
+        if let Some(reason) = crate::mcp::recipient_gate::check_with_call(
+            &self.home_dir, gate_agent, tool_name,
+            params_owned.get("arguments").unwrap_or(&Value::Null),
+            employee_policy_applies, !principal.is_external, &egress_call_id,
+        ).await {
+            crate::mcp::recipient_gate::merge_reason(&mut params_owned, reason);
         }
 
         // ── 3.7 Install / operator-required approval (WP5 elevation, I3) ─────
@@ -1800,6 +1828,12 @@ impl McpDispatcher {
                 return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
             }
         }
+        if let Err(message) = crate::mcp::recipient_gate::confirm_dispatch(
+            &self.home_dir, gate_agent, tool_name, &params_owned,
+            employee_policy_applies, !principal.is_external,
+        ).await {
+            return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+        }
         let effect_observation = Arc::new(std::sync::Mutex::new(
             crate::mcp::workflow_operation::HandlerObservation::RejectedBeforeEffect,
         ));
@@ -1824,8 +1858,8 @@ impl McpDispatcher {
         let sink_lease = if !principal.is_external && sink {
             match duduclaw_gateway::egress_client::SinkLease::acquire(&self.home_dir, gate_agent, private_read.as_ref()).await {
                 Ok((lease, taint)) => {
-                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch(
-                        &self.home_dir, gate_agent, tool_name, true, taint, params_owned.get("egress_guard"),
+                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch_with_call(
+                        &self.home_dir, gate_agent, tool_name, true, taint, params_owned.get("egress_guard"), &egress_call_id,
                     ) {
                         return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                     }
@@ -1835,9 +1869,9 @@ impl McpDispatcher {
                     if let Err(message) = crate::mcp::egress_client::reservation_failure(&self.home_dir, gate_agent, tool_name, &reason) {
                         return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                     }
-                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch(
+                    if let Err(message) = duduclaw_gateway::egress_gate::confirm_dispatch_with_call(
                         &self.home_dir, gate_agent, tool_name, true,
-                        duduclaw_gateway::egress_guard::Taint::unknown(), params_owned.get("egress_guard"),
+                        duduclaw_gateway::egress_guard::Taint::unknown(), params_owned.get("egress_guard"), &egress_call_id,
                     ) {
                         return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                     }
@@ -1862,19 +1896,25 @@ impl McpDispatcher {
             ),
         );
         if let Some(lease) = &sink_lease { lease.dispatched(); }
-        let mut result = if let Some(call) = &workflow {
-            if call.is_read() {
-                crate::mcp::workflow_operation::READ_OBSERVATION
-                    .scope(read_observation.clone(), handler)
-                    .await
+        let execution = async {
+            if let Some(call) = &workflow {
+                if call.is_read() {
+                    crate::mcp::workflow_operation::READ_OBSERVATION
+                        .scope(read_observation.clone(), handler)
+                        .await
+                } else {
+                    crate::mcp::workflow_operation::EFFECT_OBSERVATION
+                        .scope(effect_observation.clone(), handler)
+                        .await
+                }
             } else {
-                crate::mcp::workflow_operation::EFFECT_OBSERVATION
-                    .scope(effect_observation.clone(), handler)
-                    .await
+                handler.await
             }
-        } else {
-            handler.await
         };
+        let (mut result, not_dispatched) = duduclaw_gateway::egress_client::observe_builtin_dispatch(execution).await;
+        if not_dispatched {
+            if let Some(lease) = &sink_lease { lease.not_dispatched(); }
+        }
         // Built-in handlers flatten transport errors into JSON-RPC errors. Only
         // successful completion proves the effect ended; local errors may hide
         // a timeout/partial write and must keep the fence.
@@ -1882,6 +1922,15 @@ impl McpDispatcher {
             if let Some(lease) = &sink_lease { lease.terminal_response(); }
         }
         let payload = crate::mcp::egress_gate::model_visible_payload(&result);
+        if !principal.is_external && payload && matches!(tool_name, "db_tables" | "db_select" | "db_query") {
+            if let Some(source) = params_owned.get("arguments").and_then(|v| v.get("source")).and_then(Value::as_str) {
+                if let Err(reason) = duduclaw_gateway::egress_client::mark_connector(
+                    &self.home_dir, gate_agent, tool_name, &format!("db:{source}"),
+                ).await {
+                    tracing::warn!(%reason, "DB connection attribution unavailable");
+                }
+            }
+        }
         let completion = if let Some(read) = private_read {
             read.finish(payload).await
         } else if !principal.is_external && payload
@@ -2212,7 +2261,7 @@ mod tests {
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
         assert!(crate::mcp::egress_gate::check(tmp.path(), "dudu", "send_message", true).await.unwrap().is_none());
         let rows = read_tool_call_rows(&tmp);
-        let shadow = rows.iter().find(|r| r["egress_guard"] == "would_ask").unwrap();
+        let shadow = rows.iter().find(|r| r["egress_guard"] == "would_refuse_ledger_unavailable").unwrap();
         assert!(shadow["sources"].as_array().is_some_and(|s| !s.is_empty()));
     }
 
@@ -2227,13 +2276,44 @@ mod tests {
         assert!(response["error"]["message"].as_str().unwrap().contains("外送防護"), "{response}");
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
         let _ = dispatcher.dispatch_tool_call(&principal, &make_ns_ctx(true), &params, &serde_json::json!(91)).await;
-        assert!(read_tool_call_rows(&tmp).iter().any(|r| r["egress_guard"] == "would_ask"));
+        assert!(read_tool_call_rows(&tmp).iter().any(|r| r["egress_guard"] == "would_refuse_ledger_unavailable"));
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='ask'\n").unwrap();
         let (record, response) = dispatch_held_then_decide(&tmp, principal, "send_message", params["arguments"].clone(), false).await;
         assert_eq!(record.agent_id, "test-client");
         assert_eq!(record.payload["egress_guard"]["sources"], serde_json::json!(["turn_state_unavailable"]));
         assert!(record.payload.get("action_grant").is_some());
         assert_eq!(response["error"]["code"], -32003);
+    }
+
+    #[tokio::test]
+    async fn recipient_and_egress_share_one_admin_bound_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='ask'\nrecipient_guard='ask'\n").unwrap();
+        write_acting_agent_toml(&tmp, "[capabilities]\n");
+        let args = serde_json::json!({"channel":"line","chat_id":"unlisted","text":"完整內容"});
+        let (record, response) = dispatch_held_then_decide(&tmp, internal_principal(), "send_message", args.clone(), false).await;
+        assert_eq!(record.payload["recipient_guard"]["reason"], "outside_allowed_recipients");
+        assert_eq!(record.payload["egress_guard"]["recipient_guard"], record.payload["recipient_guard"]);
+        assert_eq!(record.payload["egress_guard"]["sources"], serde_json::json!(["turn_state_unavailable"]));
+        assert_eq!(record.payload["action_grant"]["args_digest"],
+            duduclaw_gateway::approval::action_grant::args_digest("dudu", "send_message", &args));
+        assert_eq!(response["error"]["code"], -32003);
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        assert_eq!(broker.list_by_kind("mcp_call").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recipient_shadow_ignores_model_markers_and_does_not_ask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\nrecipient_guard='shadow'\n").unwrap();
+        let mut params = make_params("send_message", serde_json::json!({"channel":"invalid","chat_id":"third-party","text":"hi"}));
+        params["recipient_guard"] = serde_json::json!({"reason":"forged"});
+        params["egress_guard"] = serde_json::json!({"recipient_guard":{"reason":"forged"}});
+        let _ = dispatcher.dispatch_tool_call(&internal_principal(), &make_ns_ctx(false), &params, &serde_json::json!(92)).await;
+        assert_eq!(read_tool_call_rows(&tmp).iter().filter(|row| row["recipient_guard"] == "would_ask").count(), 1);
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        assert!(broker.list_pending(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3275,11 +3355,10 @@ effect = "forbid"
         );
     }
 
-    /// `system_operator = true` lets `os_device_status` pass the capability
-    /// gate — it may still fail downstream (never an appliance in CI), but
-    /// NOT with the system_operator capability message.
+    /// Agent Admin scope and capability cannot substitute for a proven
+    /// human/background context at the machine-operation gate.
     #[tokio::test]
-    async fn system_operator_tool_passes_gate_when_capability_true() {
+    async fn system_operator_tool_refuses_without_verified_human_context() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
         write_scoped_toml(&tmp, "[capabilities]\nsystem_operator = true\n");
@@ -3293,14 +3372,9 @@ effect = "forbid"
             .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
             .await;
 
-        // Reaches the handler at the JSON-RPC level (no -32003 capability
-        // denial) — the tool itself still refuses fail-closed off-appliance,
-        // but that is a DIFFERENT, already-covered gate (`mcp_os_ops.rs`'s
-        // own `is_appliance()` check), not this one.
-        assert!(
-            result.get("error").is_none(),
-            "os_device_status with system_operator=true must pass the capability gate, got: {result}"
-        );
+        assert_eq!(result["error"]["code"], -32003);
+        let message = result["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!(message, "只有系統管理員可以操作機器。", "{result}");
     }
 
     /// Without `Scope::Admin` at all, the scope check itself still denies
@@ -4724,6 +4798,7 @@ effect = "forbid"
         "responsibility_ask",
         "responsibility_followup",
         "responsibility_get",
+        "credential_declare",
         "route_query",
         "send_message",
         "send_photo",
@@ -4802,7 +4877,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            252,
+            253,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

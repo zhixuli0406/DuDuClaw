@@ -1,8 +1,10 @@
+import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Inbox } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
 import { api, type UnifiedAuditEvent, type UnifiedAuditSource } from '@/lib/api';
 import { Badge, Empty, Segmented, Skeleton, type SegmentedOption } from '@/components/mds';
 import { useDevPanelIdJump } from './id-jump';
@@ -204,6 +206,7 @@ function EventRow({
   readonly onAgentClick: (agentId: string) => void;
 }) {
   const intl = useIntl();
+  const agentName = useAgentsStore((s) => s.agents.find((a) => a.name === event.agent_id)?.display_name || event.agent_id);
   const sourceLabel = intl.formatMessage({ id: `logs.filter.source.${event.source}` });
   const time = (() => {
     try {
@@ -249,13 +252,13 @@ function EventRow({
             }}
             className="rounded font-mono text-[11px] font-medium text-brand hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
-            {event.agent_id}
+            {agentName}
           </button>
         )}
         <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">{time}</span>
       </div>
       {event.summary && (
-        <p className="mt-1 whitespace-normal break-words text-foreground">{event.summary}</p>
+        <p className="mt-1 whitespace-normal break-words text-foreground">{auditEventSummary(event, intl.formatMessage, agentName)}</p>
       )}
       {expanded && event.details && Object.keys(event.details).length > 0 && (
         <pre className="mt-1.5 overflow-x-auto rounded-md bg-muted p-2 font-mono text-[10px] text-muted-foreground">

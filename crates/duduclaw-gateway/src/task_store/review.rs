@@ -76,7 +76,7 @@ impl TaskStore {
                         SET status = 'review', result_summary = ?2,
                             lease_expires_at = NULL, updated_at = ?3
                       WHERE id = ?1 AND kind IN ('task','goal') AND status NOT IN ('done', 'cancelled')",
-                        params![id, summary, now],
+                        params![id, mask_derived_text(summary), now],
                     )
                     .map_err(|e| format!("complete (review): {e}"))?;
                 // Iterative Kanban: stamp this round's submission and add the
@@ -101,7 +101,7 @@ impl TaskStore {
                         SET status = 'done', result_summary = ?2,
                             completed_at = ?3, lease_expires_at = NULL, updated_at = ?3
                       WHERE id = ?1 AND kind IN ('task','goal') AND status NOT IN ('done', 'cancelled')",
-                    params![id, summary, now],
+                    params![id, mask_derived_text(summary), now],
                 )
                 .map_err(|e| format!("complete (done): {e}"))?;
             }
@@ -160,7 +160,7 @@ impl TaskStore {
                 "UPDATE tasks
                     SET status = 'done', completed_at = ?2, judge_feedback = ?3, updated_at = ?2
                   WHERE id = ?1 AND kind IN ('task','goal') AND status = 'review'",
-                params![id, now, feedback],
+                params![id, now, mask_derived_text(feedback)],
             )
             .map_err(|e| format!("accept review: {e}"))?;
         if n == 1 {
@@ -258,7 +258,7 @@ impl TaskStore {
                         diminishing = ?4, judge_feedback = ?5, result_summary = NULL,
                         updated_at = ?6
                   WHERE id = ?1 AND kind IN ('task','goal') AND status = 'review'",
-                    params![id, new_retry, new_round, diminishing as i64, feedback, now],
+                    params![id, new_retry, new_round, diminishing as i64, mask_derived_text(feedback), now],
                 )
                 .map_err(|e| format!("reject review (revising): {e}"))?;
             if n == 1 {
@@ -287,7 +287,7 @@ impl TaskStore {
                   WHERE id = ?1 AND kind IN ('task','goal') AND status = 'review'",
                     params![
                         id,
-                        feedback,
+                        mask_derived_text(feedback),
                         now,
                         crate::pause_reason::PauseReason::BudgetExhausted.as_str()
                     ],
@@ -324,7 +324,7 @@ impl TaskStore {
                             crate::goal_budget_best_round::compose_escalation_note(feedback, &pick);
                         let _ = conn.execute(
                             "UPDATE tasks SET judge_feedback = ?2 WHERE id = ?1 AND kind IN ('task','goal')",
-                            params![id, enriched],
+                            params![id, mask_derived_text(&enriched)],
                         );
                     }
                 }
@@ -376,7 +376,7 @@ impl TaskStore {
                         updated_at = ?3
                   WHERE id = ?1 AND kind IN ('task','goal')
                     AND status NOT IN ('done', 'cancelled', 'failed')",
-                params![id, reason, now, pause.as_str()],
+                params![id, mask_derived_text(reason), now, pause.as_str()],
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
         Ok(n > 0)
@@ -407,7 +407,7 @@ impl TaskStore {
                         updated_at = ?3
                   WHERE id = ?1 AND kind IN ('task','goal')
                     AND status NOT IN ('done', 'cancelled', 'failed')",
-                params![id, reason, now, pause.as_str()],
+                params![id, mask_derived_text(reason), now, pause.as_str()],
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
         if n > 0 {
@@ -514,7 +514,7 @@ impl TaskStore {
                             lease_expires_at = NULL, result_summary = NULL,
                             judge_feedback = ?2, pause_reason = NULL, updated_at = ?3
                       WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
-                    params![id, note_opt, now],
+                    params![id, note_opt.map(mask_derived_text), now],
                 )
                 .map_err(|e| format!("resolve needs_human (retry): {e}"))?,
             "done" => tx
@@ -523,7 +523,7 @@ impl TaskStore {
                         SET status = 'done', completed_at = ?3, judge_feedback = ?2,
                             pause_reason = NULL, updated_at = ?3
                       WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
-                    params![id, note_opt, now],
+                    params![id, note_opt.map(mask_derived_text), now],
                 )
                 .map_err(|e| format!("resolve needs_human (done): {e}"))?,
             "abort" => tx
@@ -532,7 +532,7 @@ impl TaskStore {
                         SET status = 'cancelled', judge_feedback = ?2, pause_reason = NULL,
                             updated_at = ?3
                       WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
-                    params![id, note_opt, now],
+                    params![id, note_opt.map(mask_derived_text), now],
                 )
                 .map_err(|e| format!("resolve needs_human (abort): {e}"))?,
             other => return Err(format!("unknown needs_human decision: {other}")),
@@ -620,7 +620,7 @@ impl TaskStore {
                   WHERE id = ?1 AND kind IN ('task','goal') AND status IN ('done', 'failed', 'cancelled')
                     AND COALESCE(goal_mode, 0) = 1
                     AND NOT EXISTS (SELECT 1 FROM responsibility_occurrences WHERE task_id = ?1)",
-                params![id, stamped, now],
+                params![id, mask_derived_text(&stamped), now],
             )
             .map_err(|e| format!("continue from terminal: {e}"))?;
         if n == 1 && authenticated {
@@ -744,7 +744,7 @@ impl TaskStore {
                 "UPDATE tasks
                     SET status = 'cancelled', judge_feedback = ?2, updated_at = ?3
                   WHERE id = ?1 AND kind IN ('task','goal') AND status NOT IN ('done', 'cancelled', 'failed')",
-                params![id, reason, now],
+                params![id, mask_derived_text(reason), now],
             )
             .map_err(|e| format!("cancel task: {e}"))?;
         Ok(n == 1)

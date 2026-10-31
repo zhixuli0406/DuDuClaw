@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 /// A recognised agent-definition format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKind {
+    /// Product-owned single-file interchange, detected by schema.
+    DuDuClaw,
     /// 豆包「夥伴安裝包」(`manifest.json` + `agents/<ref>/{agent.yml,persona/}`).
     Doubao,
     /// OpenClaw state dir (`openclaw.json` + `workspace*/`).
@@ -31,6 +33,7 @@ impl ConfigKind {
     /// zh-TW label used in reports and the dashboard.
     pub fn label(self) -> &'static str {
         match self {
+            ConfigKind::DuDuClaw => "DuDuClaw Agent File",
             ConfigKind::Doubao => "豆包夥伴安裝包",
             ConfigKind::OpenClawState => "OpenClaw 資料夾",
             ConfigKind::Hermes => "Hermes 資料夾",
@@ -44,6 +47,7 @@ impl ConfigKind {
     /// Short ASCII code (fallback ids, archive folder names, JSON).
     pub fn code(self) -> &'static str {
         match self {
+            ConfigKind::DuDuClaw => "duduclaw",
             ConfigKind::Doubao => "doubao",
             ConfigKind::OpenClawState => "openclaw",
             ConfigKind::Hermes => "hermes",
@@ -67,6 +71,9 @@ pub const INSTRUCTION_PRECEDENCE: &[&str] = &[
 ];
 
 pub fn detect(dir: &Path) -> Option<ConfigKind> {
+    if !native_files(dir).is_empty() {
+        return Some(ConfigKind::DuDuClaw);
+    }
     if is_doubao(dir) {
         return Some(ConfigKind::Doubao);
     }
@@ -284,5 +291,55 @@ mod tests {
             "---\nname: x\ndescription: y\n---\n",
         );
         assert!(subagent_files(r.path()).is_empty());
+    }
+}
+
+/// Schema detection is independent of the file name or extension.
+pub fn native_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter().flatten().flatten()
+        .map(|entry| entry.path())
+        .filter(|path| has_native_header(path))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Keep a declared native schema on the native path even when its body is too large.
+pub(crate) fn has_native_header(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return false; };
+    if !meta.is_file() { return false; }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(path) else { return false; };
+    if !file.metadata().map(|meta| meta.is_file()).unwrap_or(false) { return false; }
+    let mut prefix = Vec::new();
+    if file.take((duduclaw_core::agent_profile::MAX_BYTES + 1) as u64).read_to_end(&mut prefix).is_err() { return false; }
+    let prefix = String::from_utf8_lossy(&prefix);
+    let prefix = prefix.strip_prefix('\u{feff}').unwrap_or(&prefix);
+    if prefix.starts_with("---\n") || prefix.starts_with("---\r\n") {
+        // An over-limit or unterminated header cannot downgrade to a looser adapter.
+        if !prefix.lines().skip(1).any(|line| line.trim_end() == "---") { return true; }
+    }
+    duduclaw_core::agent_profile::has_schema(&prefix)
+}
+
+#[cfg(test)]
+mod native_detection_tests {
+    use super::*;
+    #[test]
+    fn oversized_native_never_falls_back_to_subagent_or_instructions() {
+        for name in ["bad.agent.md", "AGENTS.md"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join(name), format!("---\nschema: duduclaw.agent/v1\nid: worker\nname: Worker\ndescription: Example\n---\n{}", "x".repeat(600 * 1024))).unwrap();
+            assert_eq!(detect(root.path()), Some(ConfigKind::DuDuClaw));
+            assert!(super::super::adapters::read(ConfigKind::DuDuClaw, root.path()).is_err());
+        }
     }
 }

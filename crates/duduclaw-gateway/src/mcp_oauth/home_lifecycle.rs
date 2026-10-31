@@ -878,25 +878,27 @@ fn finish_claimed_callback(
             Some(b) => std::str::from_utf8(b).map_err(|_| Error::Invalid)?,
             None => "",
         };
-        let table: toml::Table = current.parse().map_err(|_| Error::Invalid)?;
-        let already = table
-            .get("integrations")
-            .and_then(toml::Value::as_table)
-            .and_then(|t| t.get("google_workspace"))
-            .and_then(toml::Value::as_bool)
-            == Some(true);
-        let next = Zeroizing::new(if already {
-            current.to_owned()
-        } else {
-            let mut doc: toml_edit::DocumentMut = current.parse().map_err(|_| Error::Invalid)?;
-            doc.as_table_mut()
-                .entry("integrations")
-                .or_insert(toml_edit::table())
-                .as_table_mut()
-                .ok_or(Error::Invalid)?
-                .insert("google_workspace", toml_edit::value(true));
-            doc.to_string()
-        });
+        let mut doc: toml_edit::DocumentMut = current.parse().map_err(|_| Error::Invalid)?;
+        let integrations = doc.as_table_mut()
+            .entry("integrations")
+            .or_insert(toml_edit::table())
+            .as_table_mut()
+            .ok_or(Error::Invalid)?;
+        // Retain the old configuration outside the active credential sections.
+        // Token and selection publish through the same fail-closed transaction.
+        let mut inactive = toml_edit::Table::new();
+        for key in ["google_service_account", "google_apps_script"] {
+            if let Some(value) = integrations.remove(key) {
+                inactive.insert(key, value);
+            }
+        }
+        if !inactive.is_empty() {
+            integrations.insert("google_inactive_credentials", toml_edit::Item::Table(inactive));
+        }
+        integrations.insert("google_credential_path", toml_edit::value("oauth"));
+        integrations.insert("google_workspace", toml_edit::value(true));
+        let next = Zeroizing::new(doc.to_string());
+        let already = next.as_str() == current;
         crate::product_policy::validate_write(
             g.home(),
             &g.home().join("config.toml"),

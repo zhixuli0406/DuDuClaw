@@ -1,14 +1,18 @@
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { api, type AuditEvent, type KillswitchConfig } from '@/lib/api';
+import { api, type AuditEvent, type KillswitchConfig, type EgressShadowReport } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { AdvancedSection, ConfirmDialog, OptionSelect } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
+import { CredentialAuditPanel } from '@/components/CredentialAuditPanel';
+import { isNewFeature } from '@/apps/registry';
+import { useAuthStore } from '@/stores/auth-store';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
+import { ForgetReceiptsPanel } from '@/components/ForgetReceiptsPanel';
 import { toast, formatError } from '@/lib/toast';
 import {
   TRIGGER_KEYS,
@@ -19,6 +23,10 @@ import {
 } from '@/lib/killswitch-triggers';
 import type { KillswitchTriggers } from '@/lib/api';
 import {
+  Tabs,
+  TabsList,
+  TabsTab,
+  TabsPanel,
   Card,
   CardHeader,
   CardTitle,
@@ -66,6 +74,7 @@ interface SecurityStatus {
     tool_use: boolean; web_access: boolean;
     file_write: boolean; shell_exec: boolean; delegate: boolean;
   }>;
+  egress_bash_exposure?: Array<{ agent_id: string; mode: 'ask' | 'block' }>;
   rate_limiter: { requests_per_minute: number; concurrent_requests: number };
   soul_drift: Array<{ agent_id: string; soul_exists: boolean; gvu_enabled: boolean }>;
 }
@@ -73,6 +82,8 @@ interface SecurityStatus {
 export function SecurityPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin';
+  const version = useSystemStore((s) => s.status?.version ?? null);
   // D9 (09-edition-split-features.md §4): a single operator still needs an
   // emergency brake and a way to see what happened, so kill switch + audit
   // log stay — folded into a page-internal collapsed section rather than
@@ -86,6 +97,8 @@ export function SecurityPage() {
   const [status, setStatus] = useState<SecurityStatus | null>(null);
   const connectionState = useConnectionStore((s) => s.state);
 
+  const refreshSecurityStatus = useCallback(() => api.security.status().then(setStatus).catch(() => setStatus(null)), []);
+
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
     setAuditLoading(true);
@@ -95,11 +108,8 @@ export function SecurityPage() {
       .catch(() => setAuditEvents([]))
       .finally(() => setAuditLoading(false));
 
-    api.security
-      .status()
-      .then(setStatus)
-      .catch(() => setStatus(null));
-  }, [connectionState]);
+    void refreshSecurityStatus();
+  }, [connectionState, refreshSecurityStatus]);
 
   return (
     <div className="mx-auto w-full max-w-[1200px] space-y-6">
@@ -140,14 +150,32 @@ export function SecurityPage() {
           the two answer adjacent questions: hygiene says what is wrong, the
           inventory says where every credential comes from. Same reasoning for
           showing it to every edition. */}
-      <CredentialInventoryPanel />
+      <Tabs defaultValue="inventory" variant="line">
+        <TabsList>
+          <TabsTab value="inventory">
+            {intl.formatMessage({ id: 'security.credentialInventory.title' })}
+          </TabsTab>
+          {isAdmin && (
+            <TabsTab value="credentialAudit">
+              {intl.formatMessage({ id: 'security.credentialAudit.title' })}
+              {isNewFeature('1.78.0', version) && (
+                <Badge variant="secondary">{intl.formatMessage({ id: 'nav.badge.new' })}</Badge>
+              )}
+            </TabsTab>
+          )}
+        </TabsList>
+        <TabsPanel value="inventory"><CredentialInventoryPanel /></TabsPanel>
+        {isAdmin && <TabsPanel value="credentialAudit"><CredentialAuditPanel /></TabsPanel>}
+      </Tabs>
 
       {/* Credential protection (B2c) — the one line "憑證保護：系統金鑰圈／檔案".
           Every edition: person identities by domain-wide delegation exist in
           both, so both need to see (and change) where they are protected. */}
       <CredentialProtectionPanel />
 
-      <EgressGuardSection />
+      <EgressGuardSection status={status} onSaved={refreshSecurityStatus} />
+
+      <ForgetReceiptsPanel />
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an
@@ -693,14 +721,17 @@ function SecurityCard({
 // G2 (2026-09 feature audit): `StatusRow` and `RuleRow` were removed with the
 // Credential Proxy and Mount Guard cards — they had no other call site.
 
-function EgressGuardSection() {
+function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null; onSaved: () => Promise<void> }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const form = useConfigForm((tables) => ({
     'security.egress_guard': tables.security?.egress_guard ?? 'shadow',
+    'security.recipient_guard': tables.security?.recipient_guard ?? 'shadow',
   }));
   const mode = vStr(form.values, 'security.egress_guard');
   const modes = ['off', 'shadow', 'ask', 'block'];
+  const recipientMode = vStr(form.values, 'security.recipient_guard');
+  const recipientModes = ['off', 'shadow', 'ask'];
   return (
     <SecurityCard icon={Shield} title={t('security.egress.title')} description={t('security.egress.description')}>
       <div className="space-y-3">
@@ -713,11 +744,111 @@ function EgressGuardSection() {
           disabled={!form.loaded || form.saving || form.loadError != null}
         />
         <p className="text-xs text-muted-foreground">{t('security.egress.limits')}</p>
+        <EgressShadowReportPanel />
+        <label htmlFor="recipient-guard-mode" className="text-sm">{t('security.recipient.mode')}</label>
+        <OptionSelect
+          id="recipient-guard-mode"
+          value={recipientModes.includes(recipientMode) ? recipientMode : 'ask'}
+          onChange={(value) => form.set('security.recipient_guard', value)}
+          options={recipientModes.map((value) => ({ value, label: t(`security.egress.${value}`) }))}
+          disabled={!form.loaded || form.saving || form.loadError != null}
+        />
+        <p className="text-xs text-muted-foreground">{t('security.recipient.description')}</p>
+        {status?.egress_bash_exposure && status.egress_bash_exposure.length > 0 && (
+          <div role="alert" className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
+            <p>{t('security.egress.bashWarning')}</p>
+            <ul className="list-inside list-disc">
+              {status.egress_bash_exposure.map((agent) => (
+                <li key={agent.agent_id}>{agent.agent_id} · {t(`security.egress.${agent.mode}`)}</li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">{t('security.egress.sandboxScope')}</p>
+          </div>
+        )}
+        {!status?.egress_bash_exposure && (mode === 'ask' || mode === 'block' || !recipientModes.includes(recipientMode) || recipientMode === 'ask') && (
+          <p role="alert" className="text-sm text-destructive">{t('security.egress.exposureUnavailable')}</p>
+        )}
         {form.loadError != null && <p role="alert" className="text-sm text-destructive">{t('security.egress.loadFailed')}</p>}
-        <Button size="sm" variant="brand" onClick={() => void form.save()} disabled={!form.loaded || form.saving || form.loadError != null || form.dirtyKeys.length === 0}>
+        <Button size="sm" variant="brand" onClick={() => void form.save().then((saved) => { if (saved !== null) return onSaved(); })} disabled={!form.loaded || form.saving || form.loadError != null || form.dirtyKeys.length === 0}>
           {t(form.saving ? 'common.saving' : 'security.egress.save')}
         </Button>
       </div>
     </SecurityCard>
+  );
+}
+
+
+function EgressShadowReportPanel() {
+  const intl = useIntl();
+  const connectionState = useConnectionStore((s) => s.state);
+  const [days, setDays] = useState<7 | 30>(7);
+  const [report, setReport] = useState<EgressShadowReport | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+  const t = (id: string) => intl.formatMessage({ id: `security.egress.${id}` });
+
+  useEffect(() => {
+    let active = true;
+    setReport(null);
+    setFailed(false);
+    setLoading(true);
+    if (connectionState !== 'authenticated') return () => { active = false; };
+    api.security.egressShadowReport(days).then((value) => {
+      if (!active) return;
+      if (!value || typeof value.total !== 'number' || typeof value.ticket_total !== 'number'
+        || ![value.by_employee, value.by_tool, value.by_source_class, value.by_transport, value.daily].every(Array.isArray)) {
+        setFailed(true);
+        return;
+      }
+      setReport(value);
+    }).catch(() => { if (active) setFailed(true); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [connectionState, days]);
+
+  const breakdown = (title: string, rows: Array<{ key: string; count: number }>, employee = false, translate = false) => (
+    <div className="min-w-0 space-y-2">
+      <h4 className="text-sm font-medium">{t(title)}</h4>
+      <ul className="space-y-1 text-sm">
+        {rows.map((row) => (
+          <li key={row.key} className="flex min-w-0 items-center gap-2">
+            {employee && <ActorAvatar actorType="agent" size="xs" name={row.key} />}
+            <span className="min-w-0 flex-1 truncate" title={row.key}>{translate ? intl.formatMessage({ id: `security.egress.class.${row.key}`, defaultMessage: t('class.other') }) : row.key}</span>
+            <span className="font-mono tabular-nums">{intl.formatNumber(row.count)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+  return (
+    <section className="space-y-3 rounded-lg border border-border p-4" aria-label={t('reportTitle')}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-medium">{t('reportTitle')}</h3>
+        <label htmlFor="egress-shadow-days" className="sr-only">{t('period')}</label>
+        <OptionSelect id="egress-shadow-days" value={String(days)}
+          onChange={(value) => setDays(value === '30' ? 30 : 7)}
+          options={[7, 30].map((value) => ({ value: String(value), label: intl.formatMessage({ id: 'security.egress.periodDays' }, { days: value }) }))} />
+      </div>
+      {loading && <p role="status" className="text-sm text-muted-foreground">{t('reportLoading')}</p>}
+      {!loading && failed && <p role="alert" className="text-sm text-destructive">{t('reportFailed')}</p>}
+      {!loading && report && (report.total === 0 ? (
+        <Empty icon={History} title={t('reportEmpty')} description={t('reportEmptyDescription')} />
+      ) : (
+        <>
+          <p className="text-sm font-medium">{intl.formatMessage({ id: 'security.egress.ticketEstimate' }, { days, count: report.ticket_total })}</p>
+          <p className="text-xs text-muted-foreground">{t('reportCountNote')}</p>
+          <p className="text-xs text-muted-foreground">{t('reportTrust')}</p>
+          {report.capped && <p className="text-xs font-medium text-amber-700">{t('reportCapped')}</p>}
+          <div className="grid gap-4 sm:grid-cols-2">
+            {breakdown('byEmployee', report.by_employee, true)}
+            {breakdown('byTool', report.by_tool)}
+            {breakdown('bySource', report.by_source_class, false, true)}
+            {breakdown('byTransport', report.by_transport, false, true)}
+            {breakdown('daily', report.daily)}
+          </div>
+        </>
+      ))}
+    </section>
   );
 }

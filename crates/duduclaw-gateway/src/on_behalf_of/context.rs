@@ -13,7 +13,7 @@ const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 struct Entry {
     home: PathBuf,
     agent: String,
-    principal: Option<String>,
+    principal: super::PrincipalState,
     created: Instant,
     attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
     task: Option<String>,
@@ -51,9 +51,7 @@ fn register_value(home: &Path, agent: &str, principal: Option<String>) -> Option
     if !duduclaw_core::is_valid_agent_id(agent) {
         return None;
     }
-    if let Some(p) = &principal {
-        duduclaw_core::HumanPrincipal::parse(p).ok()?;
-    }
+    let principal = super::PrincipalState::from_wire(principal.as_deref());
     let home = home.canonicalize().ok()?;
     let mut entries = entries().lock().unwrap_or_else(|p| p.into_inner());
     let now = Instant::now();
@@ -122,7 +120,7 @@ pub(crate) fn lookup(home: &Path, agent: &str, reference: &str) -> Option<Option
     let entries = entries().lock().unwrap_or_else(|p| p.into_inner());
     let e = entries.get(reference)?;
     (e.home == home && e.agent == agent && e.created.elapsed() < MAX_AGE)
-        .then(|| e.principal.clone())
+        .then(|| e.principal.to_wire())
 }
 
 /// Every host runtime call gets its own lifetime, including background calls.
@@ -209,6 +207,33 @@ mod tests {
         .await;
         assert_eq!(lookup(home.path(), "bot", &p), None);
         assert!(env_pair().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_stored_provenance_stays_unknown_in_host_context_and_nested_scopes() {
+        let home = tempfile::tempdir().unwrap();
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Personal);
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        for (name, role) in [("admin", duduclaw_auth::UserRole::Admin), ("employee", duduclaw_auth::UserRole::Employee)] {
+            db.create_user(&format!("{name}@test.invalid"), name, "isolated-test-password", role).unwrap();
+        }
+        for raw in ["not-a-principal", "user:dashboard", "", " "] {
+            let carried = super::super::from_stored(home.path(), Some(raw), "bot", "test_queue");
+            super::super::scope_first(carried, async {
+                super::super::scope_first(None, async {
+                    let guard = register(home.path(), "bot").unwrap();
+                    let stored = lookup(home.path(), "bot", guard.reference()).unwrap();
+                    assert_eq!(super::super::PrincipalState::from_wire(stored.as_deref()),
+                        super::super::PrincipalState::Unknown);
+                    assert!(!super::super::access::system_operation_permitted(home.path(), stored.as_deref()));
+                    assert!(super::super::env_pairs().iter().any(|(key, value)| {
+                        key == duduclaw_core::ENV_ON_BEHALF_OF
+                            && super::super::PrincipalState::from_wire(Some(value))
+                                == super::super::PrincipalState::Unknown
+                    }));
+                }).await;
+            }).await;
+        }
     }
     #[tokio::test]
     async fn scope_boxes_large_futures_and_registers_the_poll_time_principal() {

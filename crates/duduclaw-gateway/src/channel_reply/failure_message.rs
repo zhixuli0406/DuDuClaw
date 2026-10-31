@@ -349,3 +349,144 @@ pub(super) fn classify_cli_error_hint(err: &str) -> &'static str {
     }
 }
 
+
+/// Share the machine-operation policy with preset and delegated entry points.
+/// Public/unknown origins fail closed; only internal jobs may omit a human.
+pub(super) fn operator_machine_access_allowed(home: &Path, session: &str) -> bool {
+    use crate::session_origin::OriginKind;
+    let origin = crate::session_origin::origin_for_current_turn(session);
+    if matches!(origin.kind(), OriginKind::PublicVisitor | OriginKind::WebchatVisitor | OriginKind::Unknown) {
+        return false;
+    }
+    let principal = crate::on_behalf_of::current();
+    let wire = principal.as_deref().or_else(|| {
+        (origin.kind() != OriginKind::Internal).then_some("unknown:requester")
+    });
+    crate::on_behalf_of::access::system_operation_permitted(home, wire)
+}
+
+pub(super) fn operator_diagnostics_allowed(home: &Path, session: &str) -> bool {
+    // Background jobs may operate but never receive interactive diagnostics.
+    crate::on_behalf_of::current().is_some() && operator_machine_access_allowed(home, session)
+}
+
+pub(super) fn operator_access_refusal(language: Option<&str>) -> &'static str {
+    match language.unwrap_or("zh-TW") {
+        "en" => "Only an administrator can use this AI employee to operate the machine. Please choose another AI employee for your work.",
+        "ja" | "ja-JP" => "この AI スタッフで機器を操作できるのは管理者だけです。業務には別の AI スタッフを選んでください。",
+        _ => "只有系統管理員可以透過這位 AI 員工操作機器。請改用其他 AI 員工處理工作。",
+    }
+}
+
+pub(super) fn end_user_failure_message(agent: &str, reason: FailureReason, language: Option<&str>) -> String {
+    match (language.unwrap_or("zh-TW"), reason) {
+        ("en", FailureReason::Timeout) => format!("{agent} took too long to respond. Please try again later or split the work into smaller steps."),
+        ("en", _) => format!("{agent} cannot respond right now. Please try again later; if this continues, contact an administrator."),
+        ("ja" | "ja-JP", FailureReason::Timeout) => format!("{agent} の応答が時間切れになりました。時間をおいて再試行するか、作業を小さな手順に分けてください。"),
+        ("ja" | "ja-JP", _) => format!("{agent} は現在応答できません。時間をおいて再試行し、問題が続く場合は管理者に連絡してください。"),
+        (_, FailureReason::Timeout) => format!("{agent} 這次處理逾時，請稍後重試，或將工作拆成較小的步驟。"),
+        _ => format!("{agent} 暫時無法回應，請稍後再試；若持續發生，請聯絡管理員。"),
+    }
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn system_operator_access_requires_live_enterprise_admin_and_rejects_public_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
+        let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password", duduclaw_auth::models::UserRole::Admin).unwrap();
+        let employee = db.create_user("employee@example.invalid", "Employee", "isolated-test-password", duduclaw_auth::models::UserRole::Employee).unwrap();
+        assert!(!admin.must_change_password, "a newly enrolled test account is usable");
+        for (user, allowed) in [(&admin, true), (&employee, false)] {
+            assert_eq!(crate::on_behalf_of::access::system_operation_permitted(
+                dir.path(), Some(&format!("user:{}", user.id)),
+            ), allowed);
+            crate::on_behalf_of::scope_first(Some(format!("user:{}", user.id)), async {
+                crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(user.id.clone(), async {
+                    assert_eq!(operator_machine_access_allowed(dir.path(), "webchat:account:connection"), allowed);
+                    assert_eq!(operator_diagnostics_allowed(dir.path(), "webchat:account:connection"), allowed);
+                    assert!(!operator_machine_access_allowed(dir.path(), "odoolivechat:1:42"));
+                    assert!(!operator_diagnostics_allowed(dir.path(), "odoolivechat:1:42"));
+                }).await;
+            }).await;
+        }
+        assert!(!operator_machine_access_allowed(dir.path(), "webchat:visitor"));
+        assert!(!operator_machine_access_allowed(dir.path(), "unknown:visitor"));
+        assert!(operator_machine_access_allowed(dir.path(), "cron:worker"));
+        for reason in [FailureReason::SpawnError, FailureReason::Unknown, FailureReason::AuthFailed] {
+            let text = end_user_failure_message("Worker", reason, None);
+            assert!(!text.contains("debug.log") && !text.contains("~/") && !text.contains("http"));
+        }
+        for language in ["en", "ja-JP", "zh-TW"] {
+            let text = end_user_failure_message("Worker", FailureReason::SpawnError, Some(language));
+            assert!(!text.contains("debug.log") && !text.contains("~/"));
+            assert!(!operator_access_refusal(Some(language)).is_empty());
+        }
+        rusqlite::Connection::open(dir.path().join("users.db")).unwrap()
+            .execute("UPDATE users SET status='suspended' WHERE id=?1", [&admin.id]).unwrap();
+        crate::on_behalf_of::scope_first(Some(format!("user:{}", admin.id)), async {
+            assert!(!operator_machine_access_allowed(dir.path(), "line:admin"));
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn personal_multi_account_access_keeps_machine_and_diagnostic_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password", duduclaw_auth::UserRole::Admin).unwrap();
+        let employee = db.create_user("employee@example.invalid", "Employee", "isolated-test-password", duduclaw_auth::UserRole::Employee).unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Personal);
+        for (principal, allowed) in [
+            (format!("user:{}", admin.id), true),
+            (format!("user:{}", employee.id), false),
+            ("unmapped:line:owner".into(), false),
+            ("unmapped:telegram:owner".into(), false),
+        ] {
+            crate::on_behalf_of::scope_first(Some(principal), async {
+                assert_eq!(operator_machine_access_allowed(dir.path(), "line:owner"), allowed);
+                assert_eq!(operator_diagnostics_allowed(dir.path(), "line:owner"), allowed);
+            }).await;
+        }
+        assert!(operator_machine_access_allowed(dir.path(), "cron:worker"));
+        assert!(!operator_diagnostics_allowed(dir.path(), "cron:worker"));
+    }
+
+    #[tokio::test]
+    async fn system_operator_access_preserves_personal_owner_without_identity_database() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Personal);
+        for channel in ["line", "telegram"] {
+            for principal in [None, Some(format!("unmapped:{channel}:owner"))] {
+                assert!(crate::on_behalf_of::access::system_operation_permitted(dir.path(), principal.as_deref()));
+                crate::on_behalf_of::scope_first(principal, async {
+                    assert!(operator_machine_access_allowed(dir.path(), &format!("{channel}:owner")));
+                    assert!(!operator_machine_access_allowed(dir.path(), "webchat:visitor"));
+                    assert!(!operator_machine_access_allowed(dir.path(), "odoolivechat:1:42"));
+                    assert!(!operator_machine_access_allowed(dir.path(), "unknown:visitor"));
+                }).await;
+            }
+        }
+        assert!(!dir.path().join("users.db").exists(), "owner access must not create users.db");
+    }
+
+    #[tokio::test]
+    async fn system_operator_access_refuses_unmapped_enterprise_senders_and_missing_identity_store() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
+        for channel in ["line", "telegram"] {
+            for principal in [None, Some(format!("unmapped:{channel}:owner")), Some("user:missing".into())] {
+                if let Some(principal) = principal.as_deref() {
+                    assert!(!crate::on_behalf_of::access::system_operation_permitted(dir.path(), Some(principal)));
+                }
+                crate::on_behalf_of::scope_first(principal, async {
+                    assert!(!operator_machine_access_allowed(dir.path(), &format!("{channel}:owner")));
+                }).await;
+            }
+        }
+        assert!(!dir.path().join("users.db").exists());
+    }
+}

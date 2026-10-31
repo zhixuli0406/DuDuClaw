@@ -4,7 +4,7 @@ import { Info, Globe } from 'lucide-react';
 import { Card, CardContent } from '@/components/mds';
 import { api, type AboutResponse, type SoftwareVendor } from '@/lib/api';
 import { useEffectiveName } from '@/lib/product-identity';
-import { BrandMark } from '@/components/brand/BrandMark';
+import { ProductLogo } from '@/components/brand/ProductLogo';
 import { tierLabel } from '@/lib/license-labels';
 import { DistributorNoticeCard } from '@/components/about/DistributorNoticeCard';
 
@@ -25,7 +25,9 @@ export function AboutPage() {
     api.about
       .get()
       .then((res) => {
-        if (active) setAbout(res);
+        if (active) {
+          setAbout(res);
+        }
       })
       .catch(() => {
         /* about is best-effort; the fixed vendor fallback still renders */
@@ -35,7 +37,7 @@ export function AboutPage() {
     };
   }, []);
 
-  const vendor = about?.vendor ?? VENDOR_FALLBACK;
+  const vendor = VENDOR_FALLBACK;
 
   return (
     <div className="space-y-6">
@@ -52,7 +54,7 @@ export function AboutPage() {
       <Card>
         <CardContent>
           <div className="flex items-start gap-4">
-            <BrandMark size={64} title={brandName} />
+            <ProductLogo size={64} title={brandName} />
             <div className="min-w-0 flex-1">
               <h2 className="text-xl font-semibold tracking-tight text-foreground">{brandName}</h2>
             </div>
@@ -61,8 +63,8 @@ export function AboutPage() {
         </CardContent>
       </Card>
 
-      {/* Distributor information — only present in a distributor build; the
-          HTML is a build input, sanitized server-side and sandboxed here. */}
+      {/* Server-provided distributor information, independent of license tier;
+          sanitized server-side and sandboxed here. */}
       {typeof about?.distributor_notice === 'string' && about.distributor_notice.length > 0 && (
         <DistributorNoticeCard html={about.distributor_notice} />
       )}

@@ -197,6 +197,24 @@ pub struct ConversationMetrics {
 }
 
 impl ConversationMetrics {
+    /// Drop secrets before embedding, learning or persisting caller-built metrics.
+    pub(super) fn masked(&self) -> Self {
+        let mut metrics = self.clone();
+        metrics.user_text = duduclaw_security::credential_detect::mask(&self.user_text);
+        metrics.extracted_topics = if metrics.user_text != self.user_text {
+            // The original keywords may have lost the context that made a
+            // short password detectable. Re-extract from the masked source.
+            extract_keywords(&metrics.user_text, 5)
+        } else {
+            self.extracted_topics.iter()
+                .map(|topic| duduclaw_security::credential_detect::mask(topic))
+                .collect()
+        };
+        metrics.feedback_signal = self.feedback_signal.as_deref()
+            .map(duduclaw_security::credential_detect::mask);
+        metrics
+    }
+
     /// Extract metrics from session messages.
     ///
     /// This is a pure function — no LLM calls, no I/O.
@@ -258,7 +276,7 @@ impl ConversationMetrics {
         // Detect language
         let all_user_text: String = user_msgs
             .iter()
-            .map(|m| m.content.as_str())
+            .map(|m| duduclaw_security::credential_detect::mask(&m.content))
             .collect::<Vec<_>>()
             .join(" ");
         let detected_language = detect_language(&all_user_text);
@@ -538,6 +556,8 @@ fn detect_language(text: &str) -> String {
 /// For CJK text: uses character bigrams as terms.
 /// For ASCII text: splits on whitespace, filters common stopwords.
 pub fn extract_keywords(text: &str, top_k: usize) -> Vec<String> {
+    let masked = duduclaw_security::credential_detect::mask(text);
+    let text = masked.as_str();
     let mut freq: HashMap<String, u32> = HashMap::new();
 
     // Collect CJK bigrams
@@ -583,4 +603,32 @@ fn is_cjk(cp: u32) -> bool {
         || (0x3400..=0x4DBF).contains(&cp)
         || (0xF900..=0xFAFF).contains(&cp)
         || (0x20000..=0x2A6DF).contains(&cp)
+}
+
+#[cfg(test)]
+mod credential_sink_tests {
+    use super::*;
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[test]
+    fn metrics_mask_before_extracting_keywords_and_learning_bigrams() {
+        let messages = vec![SessionMessage {
+            role: "user".into(), content: "password: uniquepassword".into(),
+            tokens: 10, timestamp: String::new(),
+        }];
+        let metrics = ConversationMetrics::extract("session", "agent", "user", &messages, 0);
+        assert!(!metrics.user_text.contains("uniquepassword"));
+        assert!(!metrics.extracted_topics.iter().any(|t| t.contains("uniquepassword")));
+        assert!(!extract_keywords("password: uniquepassword", 5).iter()
+            .any(|t| t.contains("uniquepassword")));
+
+        // A caller-built metric must not bypass the model's own sink guard.
+        let mut raw = metrics;
+        raw.user_text = "password: uniquepassword".into();
+        raw.extracted_topics = vec!["uniquepassword".into()];
+        let mut model = super::super::user_model::UserModel::new("user".into(), "agent".into());
+        model.update_from_metrics(&raw);
+        assert!(!model.topic_distribution.contains_key("uniquepassword"));
+        assert!(!model.historical_bigrams.contains("qu"));
+    }
 }

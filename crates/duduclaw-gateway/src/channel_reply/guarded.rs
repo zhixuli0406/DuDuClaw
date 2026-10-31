@@ -428,14 +428,19 @@ pub async fn build_guarded_reply_with_session(
     reply
 }
 
-/// Fixed product attribution on external messaging replies. Internal sessions,
+/// Default product attribution on external messaging replies. Internal sessions,
 /// the dashboard console and deliberate silence remain unchanged.
+#[cfg(test)]
 pub(super) const PRODUCT_FOOTER: &str = "— Powered by DuDuClaw";
+
+pub(super) fn product_footer_for(name: &str) -> String {
+    format!("— Powered by {}", crate::distributor_brand::escape_channel_name(name))
+}
 
 /// The text [`append_product_footer`] adds to a reply (for channels that
 /// insert more lines above it).
 pub(crate) fn product_footer_suffix() -> String {
-    format!("\n\n{PRODUCT_FOOTER}")
+    format!("\n\n{}", product_footer_for(&crate::distributor_brand::product_name()))
 }
 
 /// Session prefixes that reach end customers (external messaging platforms).
@@ -470,7 +475,7 @@ pub(super) fn append_product_footer(reply: String, session_id: &str) -> String {
     if reply.is_empty() || !footer_applies_to_session(session_id) {
         return reply;
     }
-    format!("{reply}\n\n{PRODUCT_FOOTER}")
+    format!("{reply}{}", product_footer_suffix())
 }
 
 /// The employee and session a reply's secrets are restored and its contract

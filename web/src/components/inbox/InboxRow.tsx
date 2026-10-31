@@ -2,7 +2,7 @@ import { Archive, CheckCircle2, Hourglass } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ActorAvatar } from '@/components/mds';
 import { timeAgo, timeRemaining } from '@/lib/format';
-import { expiryState, type InboxItem } from '@/lib/inbox-model';
+import { canArchiveInboxItem, expiryState, type InboxItem } from '@/lib/inbox-model';
 import { useNowTick } from '@/hooks/useNowTick';
 import type { RiskLevel } from '@/lib/approval-risk';
 import { TYPE_META } from './meta';
@@ -12,6 +12,7 @@ export interface InboxRowLabels {
   /** Whole-action risk band → short label ("低/中/高"). */
   riskLabel: (level: RiskLevel) => string;
   archive: string;
+  archiveBlocked?: string;
   /** Short amber-marker label shown once an approval's TTL has burned
    *  through two-thirds of its window ("即將逾時"). */
   nearExpiry: string;
@@ -60,7 +61,7 @@ export function InboxRow(props: InboxRowProps) {
   // Live TTL countdown (approvals + installs — both are two-stage-signable
   // decisions with a server-computed deadline) — ticks only while this row
   // actually has a deadline to track, so every other row costs nothing.
-  const tracksExpiry = (item.type === 'approval' || item.type === 'install') && item.expiresAt != null;
+  const tracksExpiry = (item.type === 'approval' || item.type === 'install') && !processed && item.expiresAt != null;
   const now = useNowTick(tracksExpiry);
   const expiry = tracksExpiry ? expiryState(item, now) : null;
 
@@ -68,10 +69,11 @@ export function InboxRow(props: InboxRowProps) {
     <div
       role="option"
       aria-selected={selected}
-      onMouseEnter={props.onSelect}
+      tabIndex={selected ? 0 : -1}
       onClick={props.onSelect}
+      onKeyDown={(e) => { if (e.target !== e.currentTarget) return; if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); props.onSelect(); } }}
       className={cn(
-        'group/row flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors',
+        'outline-none focus-visible:ring-3 focus-visible:ring-ring/50 group/row flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors',
         selected ? 'bg-surface-selected' : 'hover:bg-surface-hover',
         // Sunk + dimmed, never hidden — the row stays reachable (§C6).
         processed && !selected && 'opacity-55',
@@ -105,7 +107,7 @@ export function InboxRow(props: InboxRowProps) {
         <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
           <span className="truncate">{labels.typeLabel(item)}</span>
           {item.type === 'approval' && item.risk && (
-            <span className="inline-flex shrink-0 items-center gap-1">
+            <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-surface-border px-1.5">
               <span className={cn('size-1.5 rounded-full', riskDot(item.risk))} aria-hidden="true" />
               {labels.riskLabel(item.risk)}
             </span>
@@ -145,8 +147,9 @@ export function InboxRow(props: InboxRowProps) {
             e.stopPropagation();
             props.onArchive();
           }}
-          title={labels.archive}
-          aria-label={labels.archive}
+          disabled={!canArchiveInboxItem(item, processed)}
+          title={canArchiveInboxItem(item, processed) ? labels.archive : labels.archiveBlocked}
+          aria-label={canArchiveInboxItem(item, processed) ? labels.archive : labels.archiveBlocked}
           className="shrink-0 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-surface-hover hover:text-foreground focus-visible:opacity-100 focus-visible:ring-3 focus-visible:ring-ring/50 group-hover/row:opacity-100 pointer-coarse:opacity-100"
         >
           <Archive className="size-3.5" />

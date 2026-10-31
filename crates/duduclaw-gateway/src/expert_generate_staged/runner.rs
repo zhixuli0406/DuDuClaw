@@ -53,6 +53,8 @@ pub struct RotatedStageLlm {
 #[async_trait::async_trait]
 impl StageLlm for RotatedStageLlm {
     async fn complete(&self, stage: Stage, system: &str, user: &str) -> Result<StageReply, String> {
+        crate::budget::gate_before_spawn(&self.home_dir, None, "", "expert_generate")
+            .await.map_err(|e| e.to_string())?;
         let caps = caps_for(stage, self.research);
         let web_search = caps.allowed_tools().iter().any(|t| t == "WebSearch");
         let model = eg::GENERATE_MODEL;
@@ -82,6 +84,8 @@ impl StageLlm for RotatedStageLlm {
             Ok(_) => "empty CLI response".to_string(),
             Err(e) => duduclaw_core::truncate_chars(&e, 200),
         };
+        crate::budget::gate_before_spawn(&self.home_dir, None, "", "expert_generate_direct_fallback")
+            .await.map_err(|e| e.to_string())?;
         let api_key = crate::claude_runner::get_api_key_from_home(&self.home_dir).await;
         if api_key.is_empty() {
             return Err(format!("（{cli_err}），且未設定 API key 可作備援"));

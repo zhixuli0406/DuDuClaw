@@ -74,7 +74,10 @@ mod integration_tests {
         // Sanity checks against the v2 manifest
         assert!(!gate.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(gate.check(LicenseTier::Studio, "premium_templates"));
+        // Signed distributor name/logo is a gateway decision, not the old
+        // customer-editable white_label gate or a new manifest capability.
         assert!(!gate.check(LicenseTier::Oem, "white_label"));
+        assert!(!gate.check(LicenseTier::Oem, "distributor_brand"));
         // Service commitments are display-only — `check()` never gates on
         // them, even where the manifest says `true`.
         assert!(!gate.check(LicenseTier::SelfHostPro, "dashboard_enterprise"));

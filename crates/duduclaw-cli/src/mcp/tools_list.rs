@@ -527,6 +527,7 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_cu_workspace || !COMPUTER_WORKSPACE_TOOLS.contains(&t.name))
         .filter(|t| allow_fork || !FORK_TOOLS.contains(&t.name))
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
+        .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
         // O7: PORTICO scoped tools without an active grant.
         .filter(|t| {

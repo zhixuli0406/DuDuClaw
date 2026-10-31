@@ -248,7 +248,13 @@ pub async fn send_channel_message(
     chat_id: &str,
     text: &str,
 ) -> Result<(), String> {
-    let target = resolve_channel_target(home_dir, channel, chat_id).await?;
+    let target = match resolve_channel_target(home_dir, channel, chat_id).await {
+        Ok(target) => target,
+        Err(error) => {
+            crate::egress_client::builtin_not_dispatched();
+            return Err(error);
+        }
+    };
     crate::channel_sender::create_sender_for_home(home_dir, &target, http.clone())
         .send_text(text)
         .await
@@ -273,12 +279,18 @@ pub async fn send_channel_message_as(
     };
     match channel {
         "telegram" => {
-            crate::product_policy::require_channel(home_dir, channel)?;
+            crate::product_policy::require_channel(home_dir, channel).map_err(|error| {
+                crate::egress_client::builtin_not_dispatched();
+                error
+            })?;
             let sm_cfg = SecretManagerConfig::load_from_home(home_dir).await;
             let token = crate::config_crypto::read_agent_channel_token(home_dir, agent, "telegram", &sm_cfg)
                 .await
                 .map(|t| crate::config_crypto::repair_telegram_token(t.expose()).into_owned())
-                .ok_or_else(|| format!("AI employee {agent}'s own Telegram bot is no longer configured"))?;
+                .ok_or_else(|| {
+                    crate::egress_client::builtin_not_dispatched();
+                    format!("AI employee {agent}'s own Telegram bot is no longer configured")
+                })?;
             let target = crate::channel_sender::ChannelTarget {
                 channel_type: "telegram".into(),
                 chat_id: chat_id.to_string(),
@@ -291,7 +303,10 @@ pub async fn send_channel_message_as(
                 .map_err(|e| e.to_string())
         }
         "googlechat" => {
-            crate::product_policy::require_channel(home_dir, channel)?;
+            crate::product_policy::require_channel(home_dir, channel).map_err(|error| {
+                crate::egress_client::builtin_not_dispatched();
+                error
+            })?;
             crate::googlechat::send_text_to_space_as(home_dir, Some(agent), chat_id, text).await
         }
         _ => send_channel_message(home_dir, http, channel, chat_id, text).await,
@@ -865,6 +880,9 @@ where
     F: FnOnce(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
+    let mut resolved_reminder = reminder.clone();
+    resolved_reminder.agent_id = crate::recipient_guard::scheduled_agent(registry, &reminder.agent_id).await?;
+    let reminder = &resolved_reminder;
     let mut effective_reminder = reminder.clone();
     effective_reminder.agent_id = reminder_autonomy_check(home_dir, registry, reminder).await?;
     let reminder = &effective_reminder;
@@ -927,32 +945,25 @@ where
         }
     };
 
-    // M61: acquire the concurrency permit only for the bounded send step (and
-    // its single 2s retry). Held across the channel I/O, NOT across the LLM call
-    // above. The permit is dropped at the end of this scope.
-    {
-        let _permit = sem
-            .acquire()
-            .await
-            .map_err(|_| "Semaphore closed".to_string())?;
+    let recipients = vec![duduclaw_core::recipient_policy::channel_recipient(&reminder.channel, &reminder.chat_id)
+        .unwrap_or_default()];
+    let recipient_args = serde_json::json!({"reminder_id": reminder.id, "channel": reminder.channel,
+        "chat_id": reminder.chat_id, "text": text});
+    crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args.clone()).await?;
 
-        // Retry once on failure
-        let sender = reminder.sender_agent.as_deref();
-        let result = send_channel_message_as(
-            home_dir,
-            http,
-            &reminder.channel,
-            &reminder.chat_id,
-            &text,
-            sender,
-        )
-        .await;
-        if let Err(first_err) = result {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
-                .await
-                .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
-        }
+    // Keep the send permit out of approval waits and callback generation.
+    let sender = reminder.sender_agent.as_deref();
+    let result = {
+        let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender).await
+    };
+    if let Err(first_err) = result {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        crate::recipient_guard::admit_scheduled(home_dir, &reminder.agent_id, &recipients, recipient_args).await?;
+        let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+        send_channel_message_as(home_dir, http, &reminder.channel, &reminder.chat_id, &text, sender)
+            .await
+            .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
     }
 
     info!(

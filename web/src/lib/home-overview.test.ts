@@ -1,6 +1,11 @@
+import { createIntl, createIntlCache } from 'react-intl';
+import en from '@/i18n/en.json';
+import { auditEventSummary, resolveFailureAgentId } from './home-overview';
 import { describe, it, expect } from 'vitest';
 import {
   countStandbyAgents,
+  failedRunHref,
+  failureRunId,
   withinRecentWindow,
   buildAttentionItems,
   overviewCounts,
@@ -71,9 +76,9 @@ describe('buildAttentionItems', () => {
     expect(byType.failed_run).toMatchObject({ id: 'failed_run:f1', actionable: false });
   });
 
-  it('sorts by urgency (budget > failed_run > blocked > approval > decision)', () => {
+  it('sorts by urgency (budget > blocked > failed_run > approval > decision)', () => {
     const items = buildAttentionItems(approvals, needsHuman, undelivered);
-    expect(items.map((i) => i.type)).toEqual(['failed_run', 'blocked', 'approval']);
+    expect(items.map((i) => i.type)).toEqual(['blocked', 'failed_run', 'approval']);
   });
 
   it('empty sources → empty list, not a placeholder row', () => {
@@ -180,4 +185,38 @@ describe('overviewCounts + isAllClear', () => {
     const items = buildAttentionItems([], [], [{ id: 'f1', title: 'w' }]);
     expect(isAllClear(overviewCounts(0, items))).toBe(false);
   });
+});
+
+
+describe('failed work summaries', () => {
+  const intl = createIntl({ locale: 'en', messages: en }, createIntlCache());
+  it('uses plain words on every unified-log summary surface', () => {
+    expect(auditEventSummary({ ...failureEvent(), source: 'channel_failure', summary: '{"origin":"Claude Code"}' }, intl.formatMessage)).toBe("nova's work did not finish");
+    expect(auditEventSummary({ ...failureEvent(), source: 'security', summary: 'Normal summary' }, intl.formatMessage)).toBe('Normal summary');
+    expect(auditEventSummary({ ...failureEvent(), source: 'channel_failure', summary: 'billing exhausted' }, intl.formatMessage)).toBe('billing exhausted');
+    expect(auditEventSummary({ ...failureEvent(), source: 'channel_failure', event_type: 'channel.recovered', summary: 'Recovered' }, intl.formatMessage)).toBe('Recovered');
+  });
+  it('avoids ambiguous or unknown display-name filters', () => {
+    expect(resolveFailureAgentId('Name', [{ name: 'id', display_name: 'Name' }])).toBe('id');
+    expect(resolveFailureAgentId('Name', [{ name: 'a', display_name: 'Name' }, { name: 'b', display_name: 'Name' }])).toBeUndefined();
+    expect(resolveFailureAgentId('unknown', [])).toBeUndefined();
+  });
+  it('preserves risk and expiry for the Inbox urgency sort', () => {
+    const items = buildAttentionItems([
+      { id: 'low', title: 'Low', risk: 'low' },
+      { id: 'high', title: 'High', risk: 'high' },
+      { id: 'expiring', title: 'Expiring', expiresAt: Date.now() / 1000 + 30 },
+    ], [], [{ id: 'failure', title: 'Failed' }]);
+    expect(items.map((item) => item.id)).toEqual(['approval:expiring', 'approval:high', 'failed_run:failure', 'approval:low']);
+  });
+});
+
+
+it('shares failed-run links across Home and Inbox, including nested audit records', () => {
+  const event = { agent_id: 'staff', timestamp: 'now', event_type: 'failure', summary: '', details: { channel_failure: { channel: 'webchat', run_id: 'run:42' } } };
+  expect(failedRunHref({ runId: failureRunId(event), agentId: 'staff' })).toBe('/runs?run=run%3A42');
+  expect(failedRunHref({ agentId: 'staff' })).toBe('/runs?agent=staff');
+  expect(failedRunHref({})).toBe('/runs');
+  const [item] = buildAttentionItems([], [], [{ id: 'failure', title: 'Failed', runId: 'run:42' }]);
+  expect(item.runId).toBe('run:42');
 });

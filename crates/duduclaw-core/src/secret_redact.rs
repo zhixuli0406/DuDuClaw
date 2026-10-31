@@ -28,6 +28,46 @@
 //! refused`, host names, CJK text) survive byte-identical.
 
 use std::borrow::Cow;
+use std::ops::Range;
+
+/// Complete, value-free display markers shared by the masking layers.
+/// Match the marker grammar, never arbitrary bracketed text containing secrets.
+pub fn redaction_placeholder_ranges(input: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    for (start, c) in input.char_indices() {
+        if start < cursor || !matches!(c, '[' | '〔') { continue; }
+        let tail = &input[start..];
+        let len = if tail.starts_with("[REDACTED]") {
+            Some("[REDACTED]".len())
+        } else if tail.starts_with("[憑證偵測不可用，已遮罩此訊息]") {
+            Some("[憑證偵測不可用，已遮罩此訊息]".len())
+        } else if let Some(body) = tail.strip_prefix("[已遮罩的") {
+            body.find(']').and_then(|end| {
+                let body = &body[..end];
+                let valid = ["密碼", " API key", "權杖", "私密金鑰", "憑證", "連線字串", "Cookie"].iter().any(|label| {
+                    body.strip_prefix(label).is_some_and(|suffix| suffix.is_empty()
+                        || suffix.strip_prefix(" cred_").is_some_and(|id| !id.is_empty()
+                            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')))
+                });
+                valid.then_some("[已遮罩的".len() + end + 1)
+            })
+        } else if let Some(body) = tail.strip_prefix("〔已遮蔽·") {
+            body.find('〕').and_then(|end| {
+                let category = &body[..end];
+                (matches!(category, "secret" | "text") || (!category.is_empty() && category.len() <= 32
+                    && category.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+                    && !has_secret_prefix(category) && !category.starts_with("AKIA") && !category.starts_with("ASIA")))
+                    .then_some("〔已遮蔽·".len() + end + '〕'.len_utf8())
+            })
+        } else { None };
+        if let Some(len) = len {
+            cursor = start + len;
+            ranges.push(start..cursor);
+        }
+    }
+    ranges
+}
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -49,23 +89,42 @@ pub fn mask_secret(s: &str) -> String {
 /// Returns `Cow::Borrowed` when nothing matched, so the overwhelmingly common
 /// "no secret in this message" case allocates nothing.
 pub fn redact_secrets(input: &str) -> Cow<'_, str> {
+    redact_secrets_with_count(input).0
+}
+
+/// Return the redacted text and the number of credential values replaced.
+pub fn redact_secrets_with_count(input: &str) -> (Cow<'_, str>, usize) {
     if input.is_empty() {
-        return Cow::Borrowed(input);
+        return (Cow::Borrowed(input), 0);
     }
 
+    let mut count = 0;
     let mut out = String::new();
     let mut changed = false;
     let mut word_start: Option<usize> = None;
     let mut prev_word: Option<&str> = None;
 
+    let mut placeholders = redaction_placeholder_ranges(input).into_iter().peekable();
+
     // Walk the string word-by-word, keeping the delimiters verbatim. A "word"
     // is any run of non-delimiter characters; URLs, bare tokens and
     // `Bearer <tok>` pairs are all recognised at that granularity.
     for (i, c) in input.char_indices() {
+        if placeholders.peek().is_some_and(|span| i >= span.end) { placeholders.next(); }
+        if let Some(span) = placeholders.peek().filter(|span| span.contains(&i)) {
+            if i == span.start {
+                if let Some(s) = word_start.take() {
+                    push_word(&mut out, input, s, &input[s..i], prev_word, &mut changed, &mut count);
+                }
+                if changed { out.push_str(&input[span.clone()]); }
+                prev_word = None;
+            }
+            continue;
+        }
         if is_delim(c) {
             if let Some(s) = word_start.take() {
                 let w = &input[s..i];
-                push_word(&mut out, input, s, w, prev_word, &mut changed);
+                push_word(&mut out, input, s, w, prev_word, &mut changed, &mut count);
                 prev_word = Some(w);
             }
             if changed {
@@ -77,13 +136,13 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
     }
     if let Some(s) = word_start {
         let w = &input[s..];
-        push_word(&mut out, input, s, w, prev_word, &mut changed);
+        push_word(&mut out, input, s, w, prev_word, &mut changed, &mut count);
     }
 
     if changed {
-        Cow::Owned(out)
+        (Cow::Owned(out), count)
     } else {
-        Cow::Borrowed(input)
+        (Cow::Borrowed(input), 0)
     }
 }
 
@@ -104,8 +163,9 @@ fn push_word(
     word: &str,
     prev_word: Option<&str>,
     changed: &mut bool,
+    count: &mut usize,
 ) {
-    let redacted = redact_word(word, prev_word);
+    let redacted = redact_word(word, prev_word, count);
     match redacted {
         Cow::Borrowed(_) if !*changed => {}
         Cow::Borrowed(w) => out.push_str(w),
@@ -142,10 +202,10 @@ fn looks_like_opaque_credential(w: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/' | '='))
 }
 
-fn redact_word<'a>(word: &'a str, prev_word: Option<&str>) -> Cow<'a, str> {
+fn redact_word<'a>(word: &'a str, prev_word: Option<&str>, count: &mut usize) -> Cow<'a, str> {
     // 1. Anything URL-shaped: mask secret path segments + sensitive query params.
     if word.contains("://") {
-        return mask_url(word);
+        return mask_url(word, count);
     }
 
     // 2. `Bearer <tok>` / `token <tok>` pairs — keyword AND credential shape.
@@ -155,23 +215,31 @@ fn redact_word<'a>(word: &'a str, prev_word: Option<&str>) -> Cow<'a, str> {
             .trim_end_matches('=')
             .to_ascii_lowercase();
         if AUTH_KEYWORDS.contains(&key.as_str()) && looks_like_opaque_credential(word) {
-            return Cow::Owned(mask_secret(word));
+            let masked = mask_secret(word);
+            *count += usize::from(masked != word);
+            return Cow::Owned(masked);
         }
     }
 
     // 3. A bare Telegram bot token pasted into a message.
     if split_telegram_token(word).is_some() {
-        return Cow::Owned(mask_telegram_token(word));
+        let masked = mask_telegram_token(word);
+        *count += usize::from(masked != word);
+        return Cow::Owned(masked);
     }
 
     // 4. Vendor-prefixed credentials (Slack / GitHub / Anthropic / Meta / …).
     if has_secret_prefix(word) {
-        return Cow::Owned(mask_secret(word));
+        let masked = mask_secret(word);
+        *count += usize::from(masked != word);
+        return Cow::Owned(masked);
     }
 
     // 5. Three-segment base64 credentials (Discord bot tokens, JWTs).
     if is_dotted_token_shape(word) {
-        return Cow::Owned(mask_secret(word));
+        let masked = mask_secret(word);
+        *count += usize::from(masked != word);
+        return Cow::Owned(masked);
     }
 
     Cow::Borrowed(word)
@@ -182,7 +250,7 @@ fn redact_word<'a>(word: &'a str, prev_word: Option<&str>) -> Cow<'a, str> {
 /// Words that mark a query parameter as carrying a credential. Matched on
 /// **whole words** after splitting the name on `_`, `-` and `.` — a substring
 /// match would fire on `monkey` (key), `design` / `assign` (sign) and
-/// `authority` (auth).
+/// `authority` (auth). Ambiguous words also require a credential-shaped value.
 const SENSITIVE_PARAM_WORDS: &[&str] = &[
     "secret",
     "secrets",
@@ -215,17 +283,34 @@ const SENSITIVE_PARAM_EXACT: &[&str] = &[
     "authtoken",   //
 ];
 
-fn is_sensitive_param(name: &str) -> bool {
+fn is_sensitive_param(name: &str, value: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     if SENSITIVE_PARAM_EXACT.contains(&lower.as_str()) {
         return true;
     }
-    lower
-        .split(['_', '-', '.'])
-        .any(|w| SENSITIVE_PARAM_WORDS.contains(&w))
+    lower.split(['_', '-', '.']).any(|word| {
+        SENSITIVE_PARAM_WORDS.contains(&word)
+            && (!matches!(word, "key" | "keys" | "sign" | "signature" | "auth" | "session")
+                || looks_like_query_credential(value))
+    }) || matches!(lower.as_str(), "api_key" | "api-key" | "api.key")
 }
 
-fn mask_url(url: &str) -> Cow<'_, str> {
+/// Ambiguous navigation parameters need more evidence than their name.
+fn looks_like_query_credential(value: &str) -> bool {
+    if has_secret_prefix(value) || is_dotted_token_shape(value) {
+        return true;
+    }
+    let lower = value.chars().any(|c| c.is_ascii_lowercase());
+    let upper = value.chars().any(|c| c.is_ascii_uppercase());
+    let digit = value.chars().any(|c| c.is_ascii_digit());
+    let symbol = value.chars().any(|c| matches!(c, '_' | '-' | '+' | '/' | '=' | '%'));
+    value.len() >= 20
+        && value.chars().all(|c| c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '+' | '/' | '=' | '%' | '.'))
+        && [lower, upper, digit, symbol].into_iter().filter(|mixed| *mixed).count() >= 2
+}
+
+fn mask_url<'a>(url: &'a str, count: &mut usize) -> Cow<'a, str> {
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),
         None => (url, None),
@@ -241,6 +326,7 @@ fn mask_url(url: &str) -> Cow<'_, str> {
         match mask_path_segment(seg) {
             Cow::Borrowed(s) => out.push_str(s),
             Cow::Owned(s) => {
+                *count += usize::from(s != seg);
                 out.push_str(&s);
                 changed = true;
             }
@@ -254,10 +340,12 @@ fn mask_url(url: &str) -> Cow<'_, str> {
                 out.push('&');
             }
             match pair.split_once('=') {
-                Some((k, v)) if !v.is_empty() && is_sensitive_param(k) => {
+                Some((k, v)) if !v.is_empty() && is_sensitive_param(k, v) => {
                     out.push_str(k);
                     out.push('=');
-                    out.push_str(&mask_secret(v));
+                    let masked = mask_secret(v);
+                    *count += usize::from(masked != v);
+                    out.push_str(&masked);
                     changed = true;
                 }
                 _ => out.push_str(pair),
@@ -302,7 +390,10 @@ pub(crate) fn split_telegram_token(s: &str) -> Option<(&str, char, &str)> {
     let sep = chars.next()?;
     let secret = chars.as_str();
     let id_ok = (5..=16).contains(&id.len()) && id.chars().all(|c| c.is_ascii_digit());
-    let secret_ok = secret.len() >= 20
+    // A hyphen is also a UUID separator. Require Telegram's complete
+    // secret length for this corrupted-token compatibility form.
+    let minimum_secret_len = if sep == '-' { 35 } else { 20 };
+    let secret_ok = secret.len() >= minimum_secret_len
         && secret
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
@@ -391,6 +482,25 @@ fn last_chars(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layered_placeholders_are_preserved_and_neighboring_secrets_are_masked() {
+        for marker in ["[REDACTED]", "[已遮罩的 API key cred_test]", "[已遮罩的密碼]", "〔已遮蔽·secret〕"] {
+            let text = format!("Bearer {marker} https://example.test/?api_key={marker}&offset=1");
+            assert_eq!(redact_secrets(&text), text);
+            let text = format!("{marker} {}", anthropic_key());
+            let once = redact_secrets(&text);
+            assert!(once.starts_with(marker));
+            assert!(!once.contains("abcdefghijklmnopqrstuvwx"));
+            assert_eq!(redact_secrets(&once), once);
+        }
+    }
+
+    #[test]
+    fn credential_shaped_categories_are_not_safe_placeholders() {
+        let marker = format!("〔已遮蔽·AKIA{}〕", "A".repeat(16));
+        assert!(redaction_placeholder_ranges(&marker).is_empty());
+    }
 
     // ── Synthetic fixtures, assembled at run time ────────────────────────────
     //
@@ -481,6 +591,22 @@ mod tests {
             out.contains("getUpdates?offset=0"),
             "non-secret query kept: {out}"
         );
+    }
+
+    #[test]
+    fn digit_led_uuid_is_preserved_but_complete_corrupted_telegram_tokens_are_masked() {
+        let uuid = "12345678-abcd-4abc-abcd-123456789abc";
+        assert!(split_telegram_token(uuid).is_none());
+        for text in [uuid.to_string(), format!("task id {uuid}"),
+            format!("https://example.test/tasks/{uuid}")] {
+            assert_eq!(redact_secrets(&text), text);
+        }
+        assert_eq!(tg_secret().len(), 35);
+        for separator in [':', '-'] {
+            let token = tg_token(separator);
+            assert!(split_telegram_token(&token).is_some());
+            assert!(!redact_secrets(&token).contains(&tg_secret()));
+        }
     }
 
     #[test]
@@ -602,6 +728,22 @@ mod tests {
         let url = "https://example.com/api?monkey=curious&design=flat&assign=bob&authority=local&offset=42&keyboard=qwerty";
         let out = redact_secrets(url);
         assert_eq!(out, url, "no value should have been masked: {out}");
+    }
+
+    #[test]
+    fn ambiguous_query_params_preserve_navigation_values() {
+        for query in ["session=overview", "key=value", "sign=up"] {
+            let url = format!("https://example.com/?{query}");
+            assert_eq!(redact_secrets(&url), url);
+        }
+        for name in ["session", "key", "sign", "signature", "auth"] {
+            let url = format!("https://example.com/?{name}=AbCdEf0123456789abcdef");
+            assert!(!redact_secrets(&url).contains("AbCdEf0123456789abcdef"));
+        }
+        for name in ["password", "token", "api_key", "access_token", "client_secret"] {
+            let url = format!("https://example.com/?{name}=short");
+            assert!(!redact_secrets(&url).contains("short"));
+        }
     }
 
     #[test]

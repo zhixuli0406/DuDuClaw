@@ -298,29 +298,6 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
     report
         .note("paperclip 官方匯出格式不含機密（channel token / API key / DB id），故一律未匯入。");
 
-    // ── COMPANY.md → shared wiki ──
-    let company = src.join("COMPANY.md");
-    if company.exists() {
-        let dest = ctx
-            .home
-            .join("shared")
-            .join("wiki")
-            .join("imported")
-            .join("paperclip-company.md");
-        if ctx.apply {
-            let ok = std::fs::create_dir_all(dest.parent().unwrap())
-                .and_then(|_| std::fs::copy(&company, &dest).map(|_| ()));
-            match ok {
-                Ok(()) => report.imported("wiki", "paperclip-company.md"),
-                Err(e) => report.skipped("wiki", "COMPANY.md", format!("複製失敗: {e}")),
-            }
-        } else {
-            report.imported("wiki", "paperclip-company.md");
-        }
-    } else {
-        report.skipped("wiki", "COMPANY.md", "匯出目錄內無 COMPANY.md");
-    }
-
     // ── Agents: parse cards → topo sort by reportsTo → create ──
     let mut agents: Vec<PaperclipAgent> = Vec::new();
     let mut raw_to_node: HashMap<String, String> = HashMap::new();
@@ -367,6 +344,42 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
                 reports_to_node: None,
             });
         }
+    }
+
+    let mut profiles: Vec<_> = agents.iter().map(|agent| crate::expert::agent_config::ir::AgentDraft {
+        id_hint: agent.node_id.clone(), display_name: agent.card.name.clone(),
+        soul: Some(crate::expert::agent_config::ir::Doc::new("AGENTS.md", &agent.card.instructions)),
+        ..Default::default()
+    }).collect();
+    for (agent, profile) in agents.iter_mut().zip(&mut profiles) {
+        crate::expert::agent_config::credentials::sanitize_draft(profile)?;
+        if let Some(doc) = &profile.soul { agent.card.instructions = doc.text.clone(); }
+    }
+    review_profiles(ctx, &mut report, &profiles)?;
+
+    // ── COMPANY.md → shared wiki ──
+    let company = src.join("COMPANY.md");
+    if company.exists() {
+        let dest = ctx
+            .home
+            .join("shared")
+            .join("wiki")
+            .join("imported")
+            .join("paperclip-company.md");
+        match read_masked_text(&company) {
+            Ok(content) if ctx.apply => {
+                let ok = std::fs::create_dir_all(dest.parent().unwrap())
+                    .and_then(|_| std::fs::write(&dest, content));
+                match ok {
+                    Ok(()) => report.imported("wiki", "paperclip-company.md"),
+                    Err(e) => report.skipped("wiki", "COMPANY.md", format!("複製失敗: {e}")),
+                }
+            }
+            Ok(_) => report.imported("wiki", "paperclip-company.md"),
+            Err(_) => report.skipped("wiki", "COMPANY.md", "讀取或憑證遮罩失敗，未匯入"),
+        }
+    } else {
+        report.skipped("wiki", "COMPANY.md", "匯出目錄內無 COMPANY.md");
     }
 
     // Resolve reportsTo → node id space now that all agents are known.

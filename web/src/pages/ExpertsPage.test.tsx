@@ -170,7 +170,7 @@ describe('ExpertsPage — who may import', () => {
     mockCatalog([teamEntry]);
     renderPage();
     expect(await screen.findByText('Only administrators can import AI teams')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Upload/i })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: /Upload/i })).not.toBeInTheDocument();
     expect(mockWsClient.call).not.toHaveBeenCalledWith('experts.list', expect.anything(), expect.anything(), expect.anything());
     expect(mockWsClient.call.mock.calls.some(([m]) => String(m).startsWith('experts.'))).toBe(false);
   });

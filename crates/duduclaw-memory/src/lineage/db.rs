@@ -181,6 +181,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&origins_trigger)
         .map_err(|e| DuDuClawError::Memory(format!("lineage trigger: {e}")))?;
 
+    super::connectors::migrate(conn)?;
     let now = format_ts(chrono::Utc::now());
     super::links::backfill_turn_links(conn)?;
     conn.execute(
@@ -272,6 +273,7 @@ pub(crate) struct OriginRow {
     pub hash: Option<String>,
     pub role: Role,
     pub via: Option<String>,
+    pub connectors: Vec<(String, String)>,
 }
 
 impl OriginRow {
@@ -301,19 +303,47 @@ pub(crate) fn resolve(
     prov: &Provenance,
     extra_parents: &[String],
 ) -> Result<Resolved> {
+    if let Provenance::Connectors { provenance, refs, observed_at } = prov {
+        if refs.len() > MAX_LINEAGE_SOURCES || refs.iter().any(|r| !super::connectors::valid_ref(r)) {
+            return Err(mem_err("invalid connector stamps"));
+        }
+        let resolved = resolve(conn, agent_id, provenance, extra_parents)?;
+        return match resolved {
+            Err(refusal) => Ok(Err(refusal)),
+            Ok(mut rows) => {
+                let refs = if refs.is_empty() { vec!["none".into()] } else { refs.clone() };
+                for row in &mut rows {
+                    // A new turn cannot relabel the owners inherited from a parent.
+                    if row.role != Role::Direct { continue; }
+                    let at = observed_at.map(format_ts).unwrap_or_else(|| row.observed_at.clone());
+                    row.connectors.extend(refs.iter().cloned().map(|reference| (reference, at.clone())));
+                }
+                if super::connectors::fenced(conn, agent_id, &rows)? {
+                    return Ok(Err(refusal(FenceReason::SourceForgotten, None, None)));
+                }
+                Ok(Ok(rows))
+            }
+        };
+    }
     let now = format_ts(chrono::Utc::now());
     let mut rows: BTreeMap<(String, String), OriginRow> = BTreeMap::new();
     let add = |row: OriginRow, rows: &mut BTreeMap<(String, String), OriginRow>| {
         let key = (row.session.clone(), row.message.clone());
-        match rows.get(&key) {
-            Some(existing) if existing.role >= row.role => {}
-            _ => {
-                rows.insert(key, row);
+        match rows.get_mut(&key) {
+            Some(existing) => {
+                let mut connectors = existing.connectors.clone();
+                connectors.extend(row.connectors.iter().cloned());
+                connectors.sort();
+                connectors.dedup();
+                if existing.role < row.role { *existing = row; }
+                existing.connectors = connectors;
             }
+            None => { rows.insert(key, row); }
         }
     };
 
     let (direct, parents): (Vec<&super::SourceRef>, Vec<String>) = match prov {
+        Provenance::Connectors { .. } => unreachable!("handled above"),
         Provenance::Sources(v) => {
             if v.is_empty() {
                 return Err(mem_err("provenance has no source"));
@@ -335,6 +365,7 @@ pub(crate) fn resolve(
                     hash: None,
                     role: Role::Direct,
                     via: None,
+                    connectors: Vec::new(),
                 },
                 &mut rows,
             );
@@ -354,6 +385,7 @@ pub(crate) fn resolve(
                 hash: s.content_hash.clone(),
                 role: Role::Direct,
                 via: None,
+                connectors: Vec::new(),
             },
             &mut rows,
         );
@@ -390,6 +422,7 @@ pub(crate) fn resolve(
                     hash: None,
                     role: Role::Inherited,
                     via: Some(parent.clone()),
+                    connectors: Vec::new(),
                 },
                 &mut rows,
             );
@@ -407,6 +440,9 @@ pub(crate) fn resolve(
     }
 
     let rows: Vec<OriginRow> = rows.into_values().collect();
+    if super::connectors::fenced(conn, agent_id, &rows)? {
+        return Ok(Err(refusal(FenceReason::SourceForgotten, None, None)));
+    }
     if let Some(r) = first_forgotten(conn, agent_id, &rows)? {
         return Ok(Err(r));
     }
@@ -489,11 +525,15 @@ pub(crate) fn parent_origins(
                 hash: r.get(5)?,
                 role: Role::parse(&r.get::<_, String>(6)?),
                 via: r.get(7)?,
+                connectors: Vec::new(),
             })
         })
         .map_err(mem_err)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(mem_err)
+    let mut rows = rows.collect::<std::result::Result<Vec<_>, _>>().map_err(mem_err)?;
+    for row in &mut rows {
+        row.connectors = super::connectors::load_origin(conn, memory_id, row)?;
+    }
+    Ok(rows)
 }
 
 /// The first row of `rows` that matches a tombstone of `agent_id`, as a
@@ -568,6 +608,7 @@ pub(crate) fn insert_origins(
         ])
         .map_err(|e| DuDuClawError::Memory(format!("lineage insert: {e}")))?;
     }
+    super::connectors::insert(conn, store, memory_id, rows)?;
     super::links::record_turn_links(conn, rows)
 }
 
@@ -628,6 +669,10 @@ pub(crate) fn add_reaffirm(
         if let Some(r) = first_forgotten(conn, agent_id, &as_reaffirm)? {
             return Ok(Some(r));
         }
+        if super::connectors::fenced(conn, agent_id, &as_reaffirm)? {
+            return Ok(Some(refusal(FenceReason::SourceForgotten, None, None)));
+        }
+        super::connectors::insert(conn, STORE_MEMORIES, survivor_id, &as_reaffirm)?;
         skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(None);
     }

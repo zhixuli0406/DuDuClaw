@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) mod db;
+pub(crate) mod connectors;
 pub(crate) mod hooks;
 pub(crate) mod links;
 
@@ -318,9 +319,20 @@ pub enum Provenance {
     },
     /// Non-conversation content; cannot be forgotten by a conversation source.
     System { producer: &'static str },
+    /// Host-validated connections read during this write's turn.
+    Connectors { provenance: Box<Provenance>, refs: Vec<String>, observed_at: Option<DateTime<Utc>> },
 }
 
 impl Provenance {
+    pub fn with_connector_refs(self, refs: Vec<String>) -> Self {
+        Self::Connectors { provenance: Box::new(self), refs, observed_at: None }
+    }
+
+    /// The host's turn-start time prevents delayed extraction from reviving a disconnected source.
+    pub fn with_connector_refs_at(self, refs: Vec<String>, observed_at: DateTime<Utc>) -> Self {
+        Self::Connectors { provenance: Box::new(self), refs, observed_at: Some(observed_at) }
+    }
+
     /// One direct source.
     pub fn source(s: SourceRef) -> Self {
         Self::Sources(vec![s])
@@ -349,6 +361,9 @@ impl Provenance {
     /// knows the rows a write is derived from, e.g. decision resolution).
     pub(crate) fn with_parents(self, more: Vec<String>) -> Self {
         match self {
+            Self::Connectors { provenance, refs, observed_at } => Self::Connectors {
+                provenance: Box::new(provenance.with_parents(more)), refs, observed_at,
+            },
             Self::Sources(extra) => Self::Derived {
                 parents: more,
                 extra,

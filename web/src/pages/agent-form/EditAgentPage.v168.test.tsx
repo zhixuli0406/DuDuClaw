@@ -76,6 +76,7 @@ function renderAt(path: string) {
 function setRole(role: 'admin' | 'manager' | 'employee') {
   useAuthStore.setState({
     user: { id: 'u1', email: 'a@b.c', display_name: 'U', role, status: 'active' },
+    bindings: [{ user_id: 'u1', agent_name: 'my-bot', access_level: 'owner', bound_at: '' }],
   } as never);
 }
 

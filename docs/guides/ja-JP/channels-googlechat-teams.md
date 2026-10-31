@@ -1,5 +1,7 @@
 # Google Chat & Microsoft Teams チャネル
 
+Google Chat チャネルの認証情報は Chat アプリ（`chat.bot`）用で、Gmail、Drive、Calendar は接続しません。データツールは [Google 接続](google-setup.md)で別途設定します。ダッシュボードの保存は即時反映し、設定ファイルを手編集した場合は再起動します。
+
 DuDuClawはGoogle ChatとMicrosoft Teamsを、Telegram／LINE／Discord／Slack／
 WhatsApp／Feishu／WebChatと並ぶ一級チャネルとしてサポートしています。どち
 らもwebhookベースで、gatewayが公開HTTPS経由で到達可能である必要がありま
@@ -43,7 +45,7 @@ googlechat_project_number = "123456789012"
 googlechat_service_account_json = '{ "type": "service_account", ... }'
 ```
 
-6. gatewayを再起動する。ログに
+6. 設定ファイルを手編集した場合は gateway を再起動します。ダッシュボードの変更は即時反映します。ログに
    `✅ Google Chat webhook ready at /webhook/googlechat`と表示されれば
    成功。
 

@@ -1,5 +1,5 @@
 //! "Is this process running inside an AI employee's turn?" for operator-only
-//! commands: `memory forget-source`, `memory migrate-namespace`,
+//! commands: `egress-leases`, `memory forget-source`, `memory migrate-namespace`,
 //! `responsibility …` and `agent pause|resume|freeze|unfreeze` (present
 //! even when empty counts), and
 //! `channel-ingress` / `computer-workspaces` (same list, non-empty
@@ -58,6 +58,54 @@ pub(crate) fn markers() -> Vec<&'static str> {
     markers_with(&|k| std::env::var_os(k).is_some())
 }
 
+// Unit tests share process env with unrelated identity tests. Only these
+// command paths use the isolated source; raw environment tests keep markers().
+pub(crate) fn command_markers() -> Vec<&'static str> {
+    #[cfg(not(test))]
+    {
+        markers()
+    }
+    #[cfg(test)]
+    {
+        markers_with(&|k| test_session_env(k).is_some())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SESSION_ENV: std::cell::RefCell<Vec<(&'static str, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn test_session_env(key: &str) -> Option<&'static str> {
+    TEST_SESSION_ENV.with(|env| env.borrow().iter().find(|(k, _)| *k == key).map(|(_, v)| *v))
+}
+
+#[cfg(test)]
+pub(crate) struct TestSessionGuard {
+    previous: Vec<(&'static str, &'static str)>,
+    // The override must be restored on the thread that installed it.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl Drop for TestSessionGuard {
+    fn drop(&mut self) {
+        TEST_SESSION_ENV.with(|env| *env.borrow_mut() = std::mem::take(&mut self.previous));
+    }
+}
+
+// Use only in synchronous or current-thread async tests, before polling the
+// guarded entry point. Spawned tasks get their own default empty environment.
+#[cfg(test)]
+pub(crate) fn test_session(env: &[(&'static str, &'static str)]) -> TestSessionGuard {
+    TestSessionGuard {
+        previous: TEST_SESSION_ENV.with(|current| current.replace(env.to_vec())),
+        _thread: std::marker::PhantomData,
+    }
+}
+
 // Explicit utility classification shared by operator commands. An incomplete
 // employee environment must never turn a command into a human interaction.
 fn utility_employee_identity(marked: bool, agent: Option<&str>) -> Option<String> {
@@ -73,7 +121,14 @@ fn utility_employee_identity(marked: bool, agent: Option<&str>) -> Option<String
 }
 
 fn utility_employee() -> Option<String> {
-    utility_employee_identity(!markers().is_empty(), std::env::var(duduclaw_core::ENV_AGENT_ID).ok().as_deref())
+    #[cfg(not(test))]
+    {
+        utility_employee_identity(!markers().is_empty(), std::env::var(duduclaw_core::ENV_AGENT_ID).ok().as_deref())
+    }
+    #[cfg(test)]
+    {
+        utility_employee_identity(!command_markers().is_empty(), test_session_env(duduclaw_core::ENV_AGENT_ID))
+    }
 }
 
 pub(crate) async fn with_cli_utility_context<F: std::future::Future>(
@@ -107,6 +162,30 @@ pub(crate) async fn with_autonomous_utility_context<F: std::future::Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_session_is_thread_local_and_restored_after_unwind() {
+        assert!(command_markers().is_empty());
+        assert_eq!(utility_employee(), None);
+        let session = test_session(&[(duduclaw_core::ENV_AGENT_ID, "alice")]);
+        assert_eq!(command_markers(), vec![duduclaw_core::ENV_AGENT_ID]);
+        assert_eq!(utility_employee(), Some("alice".into()));
+        std::thread::spawn(|| {
+            assert!(command_markers().is_empty());
+            assert_eq!(utility_employee(), None);
+        }).join().unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _nested = test_session(&[(duduclaw_core::ENV_AGENT_TOKEN, "")]);
+            assert_eq!(utility_employee(), Some("invalid:utility-caller".into()));
+            panic!("restore the outer session");
+        });
+        assert!(result.is_err());
+        assert_eq!(command_markers(), vec![duduclaw_core::ENV_AGENT_ID]);
+        assert_eq!(utility_employee(), Some("alice".into()));
+        drop(session);
+        assert!(command_markers().is_empty());
+        assert_eq!(utility_employee(), None);
+    }
 
     #[test]
     fn utility_context_requires_an_unmarked_operator_or_an_employee_identity() {

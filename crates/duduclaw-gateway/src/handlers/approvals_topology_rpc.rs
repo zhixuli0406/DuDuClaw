@@ -54,8 +54,9 @@ impl MethodHandler {
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                 {
                     let (home, record) = (self.home_dir.clone(), r.clone());
+                    let reader = fresh.clone();
                     let visibility = match tokio::task::spawn_blocking(move || {
-                        super::approval_visibility::ApprovalVisibility::load(&home, &record)
+                        super::approval_visibility::ApprovalVisibility::load(&home, &record, &reader)
                     }).await {
                         Ok(visibility) => visibility,
                         Err(_) => continue,
@@ -142,7 +143,7 @@ impl MethodHandler {
                         "binding": if may_decide { json!(r.binding) } else { Value::Null },
                         "answer": if may_decide { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
-                        "decided_in_dashboard_only": r.payload.get("egress_guard").is_some() || crate::approval_notify::is_dashboard_only_kind(&r.action_kind),
+                        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(r),
                         "submitter_is_viewer": activation
                             && super::approval_decider::submitter_is_decider(r, &fresh),
                         // A-H-1: what an Admin accepts — each effect and the

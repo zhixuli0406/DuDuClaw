@@ -39,8 +39,8 @@ impl MethodHandler {
             .unwrap_or(Value::Null))
     }
 
-    /// `users.subordinates` — the ACTIVE users STRICTLY below the caller's
-    /// rank, minimal fields only (id / display name / role). Feeds the
+    /// `users.subordinates` — ACTIVE reports in the caller's reporting tree
+    /// (all other active accounts for Admin), with minimal fields. Feeds the
     /// read-only dashboard viewer's picker; deliberately far narrower than
     /// the admin-gated `users.list` (no email, no bindings, no status detail).
     pub(crate) async fn handle_users_subordinates(&self, ctx: &UserContext) -> WsFrame {
@@ -48,12 +48,14 @@ impl MethodHandler {
             Some(db) => db.clone(),
             None => return WsFrame::ok_response("", json!({ "users": [] })),
         };
-        let users: Vec<Value> = db
-            .list_users()
-            .unwrap_or_default()
-            .into_iter()
+        let all = match db.list_users() {
+            Ok(users) => users,
+            Err(_) => return WsFrame::error_response("", "user list unavailable"),
+        };
+        let visible = dashboard_report_ids(&all, ctx);
+        let users: Vec<Value> = all.into_iter()
             .filter(|u| {
-                u.role.level() < ctx.role.level()
+                visible.contains(&u.id)
                     && matches!(u.status, duduclaw_auth::models::UserStatus::Active)
             })
             .map(|u| {
@@ -67,13 +69,8 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "users": users }))
     }
 
-    /// `dashboard.layout.view` — a manager/admin views a SUBORDINATE's personal
-    /// dashboard, read-only (§view-as, dashboard-redesign). Gates, fail-closed:
-    /// caller must outrank the target STRICTLY (a manager cannot view a peer
-    /// manager or an admin; nobody views themselves through this path — they
-    /// have `layout.get`). There is deliberately NO `layout.set_for`: the write
-    /// path only ever touches the caller's own layout, so "view but never edit
-    /// on their behalf" is structural, not a UI courtesy.
+    /// Read-only view of an actual report's board (Admin may view all others).
+    /// The write path always remains the caller's own layout.
     pub(crate) async fn handle_dashboard_layout_view(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let Some(target_id) = params
             .get("user_id")
@@ -89,8 +86,13 @@ impl MethodHandler {
         let Ok(Some(target)) = db.get_user(target_id) else {
             return WsFrame::error_response("", "user not found");
         };
-        if ctx.role.level() <= target.role.level() {
-            // Same generic wording as acl::require_role — no rank enumeration.
+        let users = match db.list_users() {
+            Ok(users) => users,
+            Err(_) => return WsFrame::error_response("", "user list unavailable"),
+        };
+        if !dashboard_report_ids(&users, ctx).contains(&target.id)
+            || !matches!(target.status, duduclaw_auth::models::UserStatus::Active)
+        {
             return WsFrame::error_response("", "permission denied");
         }
 
@@ -267,4 +269,30 @@ impl MethodHandler {
         }
         WsFrame::ok_response("", json!({ "success": true, "layout": layout }))
     }
+}
+
+/// Walk the existing manager links, including through suspended managers,
+/// but never through offboarded accounts or invalid Employee managers.
+fn dashboard_report_ids(users: &[duduclaw_auth::models::User], ctx: &UserContext) -> std::collections::HashSet<String> {
+    use duduclaw_auth::models::UserStatus;
+    if ctx.is_admin() {
+        return users.iter().filter(|u| u.id != ctx.user_id).map(|u| u.id.clone()).collect();
+    }
+    let mut seen = std::collections::HashSet::from([ctx.user_id.clone()]);
+    let mut visible = std::collections::HashSet::new();
+    if ctx.role.level() < UserRole::Manager.level() { return visible; }
+    let mut parents = vec![ctx.user_id.clone()];
+    for _ in 0..duduclaw_auth::org::MAX_ORG_DEPTH {
+        let mut next = Vec::new();
+        for user in users {
+            if matches!(user.status, UserStatus::Offboarded)
+                || !user.manager_user_id.as_ref().is_some_and(|id| parents.contains(id))
+                || !seen.insert(user.id.clone()) { continue; }
+            visible.insert(user.id.clone());
+            if user.role.level() >= UserRole::Manager.level() { next.push(user.id.clone()); }
+        }
+        if next.is_empty() { break; }
+        parents = next;
+    }
+    visible
 }

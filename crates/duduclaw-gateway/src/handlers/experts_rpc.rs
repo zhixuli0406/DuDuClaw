@@ -104,15 +104,43 @@ impl MethodHandler {
         self.spawn_cli_group("expert", args, timeout_secs).await
     }
 
-    /// Spawn our own binary's `duduclaw pack <args…>` sub-command — the
-    /// install front door (`expert install` was removed in v1.69.0). Same
-    /// home pinning, timeout and output handling as [`Self::spawn_expert_cli`].
-    pub(crate) async fn spawn_pack_cli(
+    /// Built-in packs are trusted artifacts, and installing a generated
+    /// draft is the dashboard operator's confirmation. Both still use the
+    /// full installer: its preview binds all written files and placement to
+    /// the digest checked again during the real install. The CLI retains
+    /// its AI-session refusal on both runs.
+    pub(crate) async fn spawn_confirmed_pack_cli(
         &self,
         args: &[std::ffi::OsString],
         timeout_secs: u64,
     ) -> Result<String, String> {
-        self.spawn_cli_group("pack", args, timeout_secs).await
+        let bin = duduclaw_core::resolve_duduclaw_bin();
+        self.spawn_confirmed_pack_cli_with_bin(&bin, args, timeout_secs).await
+    }
+
+    pub(crate) async fn spawn_confirmed_pack_cli_with_bin(
+        &self,
+        bin: &std::path::Path,
+        args: &[std::ffi::OsString],
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let report_path = crate::expert_admin::upload_dir(&self.home_dir)
+            .join(format!("preview-{}.json", uuid::Uuid::new_v4()));
+        let mut preview_args = args.to_vec();
+        preview_args.extend(["--dry-run".into(), "--report-json".into(),
+            report_path.as_os_str().to_os_string()]);
+        let preview = self.spawn_cli_group_with_bin(bin, "pack", &preview_args, timeout_secs).await;
+        let report = std::fs::read(&report_path)
+            .ok().and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+        let _ = std::fs::remove_file(&report_path);
+        preview?;
+        let digest = report.as_ref()
+            .and_then(|r| r["details"]["profile_confirmation"].as_str())
+            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| "無法取得這份專家包的安裝預覽，未安裝".to_string())?;
+        let mut install_args = args.to_vec();
+        install_args.extend(["--confirm-profile".into(), digest.into()]);
+        self.spawn_cli_group_with_bin(bin, "pack", &install_args, timeout_secs).await
     }
 
     async fn spawn_cli_group(
@@ -268,7 +296,7 @@ impl MethodHandler {
             args.extend(attach_args);
             args.extend(self.agent_cap_args().await);
             // The dashboard adds its own "安裝失敗" prefix: send the reason only.
-            return match self.spawn_pack_cli(&args, 300).await {
+            return match self.spawn_confirmed_pack_cli(&args, 300).await {
                 Ok(output) => WsFrame::ok_response(
                     "",
                     json!({ "success": true, "slug": slug, "output": output }),
@@ -324,7 +352,7 @@ impl MethodHandler {
         let mut args = vec!["install".into(), cache_pack.into_os_string()];
         args.extend(attach_args);
         args.extend(self.agent_cap_args().await);
-        match self.spawn_pack_cli(&args, 300).await {
+        match self.spawn_confirmed_pack_cli(&args, 300).await {
             Ok(output) => WsFrame::ok_response(
                 "",
                 json!({

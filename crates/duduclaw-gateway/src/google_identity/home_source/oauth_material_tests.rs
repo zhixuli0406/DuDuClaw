@@ -872,3 +872,17 @@ async fn cancellation_after_second_encrypted_unseal_drops_pending_send_and_both_
     assert_eq!(wire.requests(), 1);
     assert_eq!(probe.google_crypto_count(), 2);
 }
+
+#[tokio::test]
+async fn google_invalid_grant_marks_reconnect_without_token_deletion() {
+    let d = fixture(true, true);
+    let receipt = prepare_home_selection(d.path(), &[]).unwrap();
+    let before = raw(d.path());
+    let wire = refresh_io::testing::Wire::scenario(d.path(), "invalid_grant");
+    assert!(resolve_home_oauth_pinned(d.path(), &receipt, &[]).await.is_err());
+    assert_eq!(wire.requests(), 1);
+    assert_eq!(raw(d.path()), before);
+    assert_eq!(crate::mcp_oauth::google_setup_status(d.path())["needs_reconnect"], true);
+    let diagnostics = std::fs::read_to_string(d.path().join("google-setup-status.json")).unwrap();
+    assert!(!diagnostics.contains("secret-provider-description"));
+}

@@ -337,7 +337,8 @@ pub fn may_decide(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser) -> KbR
         .as_str()
         .ok_or(KbError::PermissionDenied)?;
     let conn = schema::open_home(home)?;
-    duduclaw_knowledge::acl::require_role(
+    super::principals::require_role(
+        home,
         &conn,
         cid,
         &user.user_id,

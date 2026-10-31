@@ -568,6 +568,14 @@ pub(crate) fn current_goal_principal() -> Option<(String, String)> {
     GOAL_PRINCIPAL.try_with(|p| p.clone()).ok().flatten()
 }
 
+/// Use the same host-owned provenance for both authorization and task rows.
+/// WebChat has a dashboard principal, not a messaging-app identity binding.
+pub(crate) fn goal_principal_for_session(session: &str) -> Option<(String, String)> {
+    current_goal_principal().or_else(|| {
+        crate::on_behalf_of::current().map(|who| (who, source_from_session(session).0))
+    })
+}
+
 /// The principal of a messaging-app sender in `session_id`
 /// (`<channel>:<chat>`), for a confirmed goal suggestion.
 pub(crate) fn channel_principal(
@@ -654,7 +662,11 @@ pub async fn handle_command(
         ChatCommand::SafetyStopAll => handle_safety_stop_all(ctx).await,
         ChatCommand::SafetyResume => handle_safety_resume(ctx, session_id).await,
         ChatCommand::SafetyStatus => handle_safety_status(ctx, session_id).await,
-        ChatCommand::Goal(goal) => handle_goal(ctx, session_id, agent_id, goal).await,
+        ChatCommand::Goal(goal) => {
+            let principal = current_goal_principal()
+                .or_else(|| channel_principal(&ctx.home_dir, session_id, channel_user_id));
+            with_goal_principal(principal, Box::pin(handle_goal(ctx, session_id, agent_id, goal))).await
+        }
         ChatCommand::Rules { all, off: None } => handle_rules(ctx, agent_id, *all).await,
         ChatCommand::Rules { off: Some(n), .. } => {
             handle_rules_off(ctx, session_id, channel_user_id, agent_id, *n).await
@@ -1185,6 +1197,9 @@ pub(crate) async fn handle_goal_create(
     risk_boundary: Option<&str>,
     plan_first: bool,
 ) -> String {
+    if let Err(refusal) = crate::machine_employee::check_chat_goal(ctx, agent_id, session_id).await {
+        return refusal;
+    }
     let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -1298,7 +1313,7 @@ pub(crate) async fn handle_goal_create(
     }
     task.source_chat_id = Some(chat_id);
     task.source_discord_guild_id = source_discord_guild_id;
-    if let Some((who, via)) = current_goal_principal() {
+    if let Some((who, via)) = goal_principal_for_session(session_id) {
         task.on_behalf_of = Some(who);
         task.created_via = Some(via);
     }
@@ -1451,7 +1466,7 @@ async fn try_decompose_goal(
             }
         }
     }
-    if let Some((who, via)) = current_goal_principal() {
+    if let Some((who, via)) = goal_principal_for_session(&format!("{channel}:{chat_id}")) {
         for row in &mut rows {
             row.on_behalf_of = Some(who.clone());
             row.created_via = Some(via.clone());

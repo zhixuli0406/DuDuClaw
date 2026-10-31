@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Schema version written to `PRAGMA user_version` after migration.
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 const BASE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ingress (
       seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
@@ -151,6 +151,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(V2_SCHEMA).map_err(|e| e.to_string())?;
     conn.execute_batch(V3_SCHEMA).map_err(|e| e.to_string())?;
     conn.execute_batch(V4_SCHEMA).map_err(|e| e.to_string())?;
+    // Discard legacy recoverable originals. Retry identity and delivery tokens
+    // stay intact; all workers consume only the persisted masked projection.
+    let mut stmt = conn.prepare("SELECT id,payload FROM ingress_payload").map_err(|e| e.to_string())?;
+    let payloads = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in payloads {
+        let (id, payload) = row.map_err(|e| e.to_string())?;
+        conn.execute("UPDATE ingress_payload SET payload=?2 WHERE id=?1",
+            rusqlite::params![id, super::credential_payload::protect(&payload)])
+            .map_err(|e| e.to_string())?;
+    }
+    drop(stmt);
     // Before F2 every `failed` row had crossed the dispatch boundary
     // (reply rejected, expired, authority changed before delivery): it is
     // "executed, not delivered", never a plain retry.

@@ -571,6 +571,51 @@ mod resume_cases;
 mod f1b_cases;
 mod stop_case;
 
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn operation_sink_refuses_secret_payload_and_masks_receipt() {
+    let home = fixture();
+    let payload = json!({"send":"one"});
+    let bound = binding(home.path(), &payload, "workflow_v1");
+    let b = ApprovalBroker::open(home.path()).unwrap();
+    let id = b.request_bound(RequestKind::Approval, "alice", "send", payload, bound.clone())
+        .await.unwrap();
+    let operation = b.prepare_operation(&id, "send", Some("provider-key-1")).await.unwrap();
+    b.decide_bound(&id, &context(), true).await.unwrap();
+    let claim = b.claim_operation(&operation, &bound, "runner-1", 30).await.unwrap();
+    b.begin_execution(&claim, &bound).await.unwrap();
+    b.settle_operation(&claim, OperationState::Succeeded,
+        Some(json!({"nested":{"password":"fixture-receipt"}})), None).await.unwrap();
+    let stored = b.inspect_operation(&operation).await.unwrap().unwrap();
+    assert!(!stored.receipt.unwrap().to_string().contains("fixture-receipt"));
+
+    let payload = json!({"send":"two"});
+    let bound = binding(home.path(), &payload, "workflow_v1");
+    let id = b.request_bound(RequestKind::Approval, "alice", "send", payload, bound)
+        .await.unwrap();
+    b.store.conn.lock().await.execute("UPDATE approvals SET payload=?1 WHERE id=?2",
+        params![json!({"nested":{"password": format!("sk-{}", "x".repeat(40))}}).to_string(), id.as_str()])
+        .unwrap();
+    assert_eq!(b.prepare_operation(&id, "send", None).await.unwrap_err(),
+        "credentials are not accepted in approval payloads");
+}
+
+// Written for F1; not run (the review task prohibits builds/tests).
+#[tokio::test]
+async fn bound_question_refuses_credential_answer_without_consuming_request() {
+    let home = fixture();
+    let payload = json!({"question":"What should happen?"});
+    let bound = binding(home.path(), &payload, "workflow_v1");
+    let b = ApprovalBroker::open(home.path()).unwrap();
+    let id = b.request_bound(RequestKind::Question, "alice", "question", payload, bound)
+        .await.unwrap();
+    assert_eq!(b.answer_question(&id, &context(), json!(format!("password: sk-{}", "x".repeat(40))))
+        .await.unwrap_err(), "credentials are not accepted in approval payloads");
+    let rec = b.get(&id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ApprovalStatus::Pending);
+    assert!(rec.answer.is_none());
+}
+
 #[tokio::test]
 async fn bound_requests_emit_redacted_created_and_decided_events() {
     let home = fixture();

@@ -12,17 +12,22 @@
 
 ```bash
 duduclaw pack install ./報告顧問.zip --dry-run   # 只列計畫，不寫入
-duduclaw pack install ./報告顧問.zip             # 匯入
-duduclaw pack install ./reviewer.agent.md            # 單一檔案也可以
-duduclaw pack install ~/.openclaw                     # 資料夾也可以
+duduclaw pack install ./報告顧問.zip --confirm-profile <preview-digest>
+duduclaw pack install ./reviewer.agent.md --dry-run
+duduclaw pack install ~/.openclaw --dry-run
 ```
 
 已有同代號的員工時，加 `--rename` 會以 `-imported` 結尾匯入；不加的話，報告列出衝突並略過那位員工。同一份內容之前已經匯入過時，加 `--replace <代號>` 取代舊版本（員工改過時還要再加 `--accept-edits`），或加 `--as-copy` 另存一份副本，見下面「再次匯入同一份」。`duduclaw pack install` 就是安裝專家包的同一個指令，沒有另開匯入指令。要連同通道金鑰與排程整個平台搬過來，仍然用 `duduclaw migrate from openclaw|hermes`（見 [migrate-from.md](migrate-from.md)），它現在也照下面同一張表放置檔案。
+
+預覽會顯示四個區段全文與輸入安全掃描結果。終端機匯入必須加上預覽印出的 `--confirm-profile` 摘要；來源內容改變，就要重新確認。AI 工作階段不能匯入。原生 `duduclaw:` 區塊只接受可編輯設定；凍結欄位會逐項列出並拒絕，MCP 伺服器一律不匯入。OpenClaw 雖已退役 `TOOLS.md` 和 `HEARTBEAT.md`，舊檔仍可匯入。
+
+從員工頁匯出，或執行 `duduclaw agent export <id> --format duduclaw --out <path>`。其他格式：`openclaw`、`hermes`、`agents-md`、`claude-subagent`。預設不包含服務對象資料，需明確加 `--include-user`。匯出會拒絕疑似秘密，AI 工作階段不能使用匯出指令。詳見 [Agent File 參考](../../spec/agent-file-spec.md)。
 
 ## 支援的格式
 
 | 格式 | 怎麼辨認 | 每位員工對應 |
 |---|---|---|
+| DuDuClaw Agent File | YAML frontmatter 的 `schema: duduclaw.agent/v1`，不依檔名（上限 256 KiB） | 檔案 |
 | 豆包夥伴安裝包（詳情頁「…」› 導出夥伴安裝包） | 有 `units` 的 `manifest.json`，或 `agents/<ref>/agent.yml` 加 `persona/` | `agents/<ref>/` |
 | OpenClaw 資料夾 | `openclaw.json`（也認 `moltbot.json`、`clawdbot.json`） | `agents.list[]` 或 `agents.entries` 的一項 |
 | OpenClaw／SoulSpec 人格工作區 | 最上層有 `SOUL.md` | 資料夾 |
@@ -40,7 +45,7 @@ duduclaw pack install ~/.openclaw                     # 資料夾也可以
 | `SOUL.md`、豆包 `persona/SOUL.md` | `SOUL.md` | 員工只能讀。 |
 | `IDENTITY.md` | `IDENTITY.md`，名稱與 emoji 另寫進 `agent.toml` | OpenClaw 的 `- Name:`／`- Emoji:` 行與豆包的「## 簽名」段落都讀得懂。 |
 | `AGENTS.md`、`CLAUDE.md`、`GEMINI.md`、子代理本文、Dify `pre_prompt` | `INSTRUCTIONS.md`（新） | 每次對話都放在 SOUL、IDENTITY 後面。員工只能讀。 |
-| `USER.md`（Hermes：`memories/USER.md`） | 知識頁「服務對象」 | 核心層，每次對話都會帶入。 |
+| `USER.md`（Hermes：`memories/USER.md`） | `USER.md` | 上限 4,000 字，以資料區塊帶入，不當作指令；既有知識頁不搬移。 |
 | `TOOLS.md` | 知識頁「工具備註」 | 只是說明，不會開放任何工具。 |
 | `HEARTBEAT.md` | 知識頁「定期檢查清單」 | 不會自動排程；需要的話到儀表板建立排程。 |
 | `BOOT.md`、Dify 開場白 | 知識頁 | 需要時才搜尋。 |
@@ -71,7 +76,9 @@ SKILL.md 沒通過內容安全檢查，或任何文字附件沒通過提示注�
 
 ## 安全
 
-- 員工之後不能改 SOUL 與 INSTRUCTIONS，所以匯入當下是唯一的檢查點。這兩份和其他所有匯入的文字都會經過提示注入檢查；SOUL 與 INSTRUCTIONS 另外再過技能安全掃描。SOUL 沒通過，那位員工就不匯入；操作指令檔沒通過，就不寫入並在報告註明。
+匯入的提示文件（SOUL、IDENTITY、USER、INSTRUCTIONS、Contract、記憶、知識與技能文字）會在產生預覽與安裝計畫前遮罩憑證。各設定檔區段以 `masked_values` 顯示遮罩數量，不顯示原值。報告、確認摘要與實際安裝使用相同的遮罩文件位元組；保留的 UTF-8 來源副本也會遮罩。輸入未變更時，重新預覽的摘要相同。掃描失敗，或文字檔超過 512 KiB 掃描上限時，會以不含原值的錯誤拒絕整筆匯入。結構化設定含憑證時，只指出欄位路徑並拒絕，不會暗中改寫設定；中繼資料含憑證也會拒絕。儀表板與外部／MCP 的 `user` 寫入也會在審查、雜湊、版本保存與接受基準前遮罩 USER.md。此變更不會回溯清除既有檔案、歷史或備份；其他私人敘述仍可能需要手動移除。
+
+- 人格、服務對象、工作規則與契約都會先顯示全文和輸入安全掃描結果，交由人確認。任何區段未通過掃描，整份設定檔都不會落地。
 - 金鑰一律不匯入：`.env`、`auth.json`、`auth-profiles.json` 等檔案不讀也不保存，`openclaw.json` 裡的通道金鑰在這裡不處理，Dify 的機密變數直接丟掉。
 - OpenClaw 工作區路徑指到上傳資料夾以外時，不會去讀。
 - 壓縮檔：略過 `__MACOSX/`、`._*`、`.DS_Store`、`Thumbs.db`、`desktop.ini`。檔名先當 UTF-8 讀（有標記，或像 macOS 那樣沒標記），中文 Windows 做的壓縮檔再試 GBK 或 Big5。都對不上，或 GBK 與 Big5 一樣可能時，會拒絕上傳並在訊息裡顯示原始位元組，不會寫出亂碼檔名。符號連結不解開。檔名在每種系統上都要代表同一件事，所以含 `:`、結尾是句點或空白、Windows 裝置名稱（`CON`、`NUL`、`COM1` 等），以及只差大小寫的兩個項目，都會拒絕。專家包的大小、項目數與壓縮比上限一樣適用。

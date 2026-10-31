@@ -17,6 +17,9 @@ use super::FileKey;
 pub enum ExternalFile {
     Soul,
     Identity,
+    User,
+    Instructions,
+    Contract,
     AgentToml,
 }
 
@@ -25,6 +28,9 @@ impl ExternalFile {
         match self {
             Self::Soul => FileKey::Soul,
             Self::Identity => FileKey::Identity,
+            Self::User => FileKey::User,
+            Self::Instructions => FileKey::Instructions,
+            Self::Contract => FileKey::Contract,
             Self::AgentToml => FileKey::AgentToml,
         }
     }
@@ -192,6 +198,40 @@ mod tests {
         assert!(text.starts_with("# keep me\n") && text.contains("icon = \"x\""), "{text}");
         assert!(std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap().contains("agent_file_changed"));
         assert_eq!(super::super::history::list(&home, "a1", &FileKey::AgentToml)[0].source, "mcp");
+    }
+
+    #[test]
+    fn importing_an_empty_slot_creates_and_baselines_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("agents/a1")).unwrap();
+        for (file, name, doc) in [
+            (ExternalFile::Identity, "IDENTITY.md", duduclaw_security::soul_guard::ProtectedDoc::Identity),
+            (ExternalFile::User, "USER.md", duduclaw_security::soul_guard::ProtectedDoc::User),
+            (ExternalFile::Instructions, "INSTRUCTIONS.md", duduclaw_security::soul_guard::ProtectedDoc::Instructions),
+        ] {
+            let result = write_file(&home, "a1", file, "import", "operator", ExternalBaseline::Accept, |_| Ok(String::new())).unwrap();
+            assert!(result.changed);
+            assert_eq!(std::fs::read(home.join("agents/a1").join(name)).unwrap(), b"");
+            assert_eq!(duduclaw_security::soul_guard::doc_drift(doc, &home.join("agents/a1")), duduclaw_security::soul_guard::DocDrift::Intact);
+        }
+    }
+
+    #[test]
+    fn mcp_user_writes_use_the_same_credential_mask_and_refuse_scan_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("agents/a1")).unwrap();
+        let raw = "password: hunter2";
+        let masked = duduclaw_security::credential_detect::mask_document(raw).unwrap();
+        let outcome = write_file(&home, "a1", ExternalFile::User, "mcp", "operator",
+            ExternalBaseline::Accept, |_| Ok(raw.into())).unwrap();
+        assert_eq!(outcome.after, masked);
+        assert_eq!(std::fs::read_to_string(home.join("agents/a1/USER.md")).unwrap(), masked);
+        let error = write_file(&home, "a1", ExternalFile::User, "mcp", "operator",
+            ExternalBaseline::Accept, |_| Ok(duduclaw_security::credential_detect::UNAVAILABLE_MASK.into())).unwrap_err();
+        assert!(error.contains("憑證掃描失敗"));
+        assert_eq!(std::fs::read_to_string(home.join("agents/a1/USER.md")).unwrap(), masked);
     }
 
     #[test]

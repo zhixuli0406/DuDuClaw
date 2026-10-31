@@ -6,11 +6,12 @@ use std::path::PathBuf;
 
 /// One text file lifted from the source, with where it came from (shown in
 /// the import report and used as the memory source lineage).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Doc {
     /// Path relative to the import root, `/`-separated (report + lineage).
     pub source: String,
     pub text: String,
+    pub masked_values: usize,
 }
 
 impl Doc {
@@ -18,14 +19,16 @@ impl Doc {
         Doc {
             source: source.into(),
             text: text.into(),
+            masked_values: 0,
         }
     }
 }
 
 /// A skill directory found in the source (normalised later by the writer).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillDraft {
     /// The skill directory on disk (inside the staging copy).
+    #[serde(skip_serializing)]
     pub dir: PathBuf,
     /// Name the source gave it (`name:` / `dir`), possibly non-ASCII.
     pub name_hint: String,
@@ -38,14 +41,14 @@ pub struct SkillDraft {
 
 /// A file the importer could not map to a DuDuClaw slot. Archived verbatim
 /// under `<home>/imported/<slug>/` and listed in the report.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Unmapped {
     pub rel: String,
     pub reason: String,
 }
 
 /// One imported AI employee.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AgentDraft {
     /// The agent's key inside the source (`a1`, a workspace id, a file stem).
     pub ref_id: String,
@@ -59,13 +62,15 @@ pub struct AgentDraft {
     pub identity: Option<Doc>,
     pub instructions: Option<Doc>,
     pub user_profile: Option<Doc>,
+    pub contract: Option<Doc>,
+    /// Product-native settings, validated against the editable allowlist.
+    pub settings: toml::Table,
     pub tools_notes: Option<Doc>,
     pub heartbeat: Option<Doc>,
     pub memory: Vec<Doc>,
     pub knowledge: Vec<Doc>,
     pub skills: Vec<SkillDraft>,
-    /// MCP servers in the portable `mcpServers` shape (secrets stripped by
-    /// the writer before anything lands).
+    /// MCP servers are only named in the report; never installed.
     pub mcp_servers: serde_json::Map<String, serde_json::Value>,
     pub model: Option<String>,
     /// Source tool allowlist (`None` = the source did not restrict tools).
@@ -83,7 +88,7 @@ pub struct AgentDraft {
 }
 
 /// Everything one source yields.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ImportBundle {
     /// Source label for the report (`豆包夥伴安裝包`, `OpenClaw 工作區`, …).
     pub format_label: String,

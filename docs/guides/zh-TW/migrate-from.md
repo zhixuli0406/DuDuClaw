@@ -11,13 +11,13 @@
 duduclaw migrate from openclaw
 
 # 確認計畫後實際套用
-duduclaw migrate from openclaw --apply
+duduclaw migrate from openclaw --apply --confirm-profile <preview-digest>
 ```
 
 ## 指令
 
 ```
-duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename] [--agent <id>] [--no-redact] [--json]
 ```
 
 | 旗標 | 作用 |
@@ -26,6 +26,10 @@ duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [-
 | `--source <path>` | 指定來源目錄。openclaw/hermes 有預設值；**paperclip 必填**。 |
 | `--apply` | 實際執行寫入。 |
 | `--rename` | 遇到同名 agent 時，以 `-imported` 後綴匯入，不再跳過。 |
+| `--confirm-profile <digest>` | OpenClaw、Hermes、paperclip 搭配 `--apply` 時必填，使用預覽提供的確認碼；`claude-code` 不需要。 |
+| `--agent <id>` | 指定既有的目標員工；`claude-code` 必填。 |
+| `--no-redact` | 關閉 `claude-code` 對話逐字稿預設的個資遮罩。 |
+| `--json` | 輸出單一機器可讀的 JSON 結果，取代一般文字計畫。 |
 
 每一項都會標示狀態：
 
@@ -44,7 +48,7 @@ duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [-
 
 ```bash
 duduclaw migrate from openclaw            # 預設來源 ~/.openclaw
-duduclaw migrate from openclaw --source /path/to/.openclaw --apply
+duduclaw migrate from openclaw --source /path/to/.openclaw --apply --confirm-profile <preview-digest>
 ```
 
 會讀取 `openclaw.json`（JSON5），並匯入：
@@ -52,7 +56,7 @@ duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 - **Agents**：`agents.list[]`（或預設單一 `main`），連同各自的 workspace persona
   檔案照[匯入 AI 員工](agent-config-import.md#每個檔案的去處)的對應放置：`SOUL.md` →
   SOUL、`IDENTITY.md` → IDENTITY（另寫入名稱與 emoji）、`AGENTS.md` → `INSTRUCTIONS.md`、
-  `USER.md`／`TOOLS.md`／`HEARTBEAT.md` → 知識頁、`MEMORY.md` 與 `memory/*.md` → 記憶（記下來源檔）。
+  `USER.md` → 原生服務對象資料；`TOOLS.md`／`HEARTBEAT.md` → 知識頁、`MEMORY.md` 與 `memory/*.md` → 記憶（記下來源檔）。
   1.76 之前這些人格檔被複製到 `agents/<id>/memory/`，沒有任何地方會讀。
 - **通道 token**：`channels.telegram.botToken`、`channels.discord.token`、
   `channels.slack.botToken` + `appToken`（加密寫入 config.toml）。WhatsApp 為
@@ -67,9 +71,9 @@ duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 ### Hermes（`~/.hermes`）
 
 ```bash
-duduclaw migrate from hermes --apply
+duduclaw migrate from hermes --apply --confirm-profile <preview-digest>
 # 轉移非 active 的 profile：
-duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply
+duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply --confirm-profile <preview-digest>
 ```
 
 Hermes 是單一 agent 平台，會產生一個 DuDuClaw agent（id `hermes`）。匯入：
@@ -77,7 +81,7 @@ Hermes 是單一 agent 平台，會產生一個 DuDuClaw agent（id `hermes`）�
 - **模型**：`config.yaml` 的 `model.default`。
 - **通道 token**（來自 `.env`）：`TELEGRAM_BOT_TOKEN`、`DISCORD_BOT_TOKEN`、
   `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`。`EMAIL_*` 通道 v1 尚未支援 → `SKIPPED`。
-- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`（記憶，依 `§` 分條）、`memories/USER.md`（知識頁「服務對象」）。
+- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`（記憶，依 `§` 分條）、`memories/USER.md`（原生 `USER.md`）。
 - **Cron**：`cron/jobs.json`（防禦性解析）。
 - 只轉移 **active profile**；其餘 profile 會列為 `SKIPPED`，並提示用 `--source` 逐一轉。
 
@@ -89,7 +93,7 @@ paperclip 的資料在內嵌 PostgreSQL，DuDuClaw 不直連資料庫。請先�
 paperclipai company export <company-id> --out ./export \
   --include company,agents,projects,issues,tasks,skills
 
-duduclaw migrate from paperclip --source ./export --apply
+duduclaw migrate from paperclip --source ./export --apply --confirm-profile <preview-digest>
 ```
 
 `--source` 為**必填**（未給時會印出上面的教學）。匯入：
@@ -136,3 +140,9 @@ config.toml 裡的舊值再重跑，或改用 `--rename` 匯入成獨立 agent�
 **Q：非 Claude 模型會怎樣？**
 會原樣保留成 `[model] preferred` 並標 `PARTIAL`，提示你人工確認要對映到哪個 runtime
 （codex / openai_compat）。DuDuClaw 不會替你猜。
+
+## 設定檔確認與 Claude Code
+
+OpenClaw、Hermes 與 paperclip 移轉會先預覽人格、服務對象、工作規則、契約及輸入安全掃描結果；套用時必須加對應的 `--confirm-profile <摘要>`，區段內容變動就要重新預覽。這個移轉確認碼只涵蓋人格、服務對象、工作規則與契約四段，不涵蓋所有移轉輸出檔；`pack install` 也要帶預覽提供的 `--confirm-profile <摘要>`，其確認碼涵蓋全部將寫入的檔案。AI 工作階段不能執行移轉。`USER.md` 上限 4,000 字，以資料帶入，不當作指令。
+
+也支援 Claude Code：`duduclaw migrate from claude-code --source ~/.claude --agent <既有員工代號>`。檢視預覽後加 `--apply`，此路徑不需要 `--confirm-profile`。此路徑把整理過的記憶、低可信知識頁與過濾後的對話紀錄匯入指定員工，不建立新員工；預設遮蔽逐字稿個資，`--no-redact` 可關閉。

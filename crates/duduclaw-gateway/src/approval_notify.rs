@@ -215,6 +215,13 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
         || crate::approval::operator_cli_gate::spec_for(kind).is_some()
 }
 
+/// Record-level restrictions also cover outbound guards on arbitrary kinds.
+pub(crate) fn is_dashboard_only_record(rec: &ApprovalRecord) -> bool {
+    is_dashboard_only_kind(&rec.action_kind)
+        || rec.action_kind == crate::approval::cli_egress::KIND
+        || rec.payload.get("egress_guard").is_some()
+}
+
 /// What the dashboard answers when a dashboard-only card is decided after it
 /// lapsed. Each kind names itself; any other kind gets the general wording
 /// (F5-A: a LINE inbox card used to be called a knowledge review here).
@@ -252,6 +259,11 @@ pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
 pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+    if rec.action_kind == crate::approval::cli_egress::KIND || rec.payload.get("egress_guard").is_some() {
+        let head = if reminder { "有一則對外操作審核快到期了。" } else { "有一則對外操作等待審核。" };
+        return format!("{head}\n請管理員開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
+            deadline_phrase(rec), rec.id.as_str());
+    }
     if rec.action_kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
         return activation_notice_body(rec, reminder);
     }
@@ -439,7 +451,7 @@ async fn push_dashboard_only(
 }
 
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
-    if is_dashboard_only_kind(&rec.action_kind) {
+    if is_dashboard_only_record(rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
     }
     // A reminder retraces the delivered destination; a first push resolves the
@@ -569,7 +581,7 @@ pub(crate) async fn apply_decision(
     }
     // H1: decided in the dashboard only — an older card's button, a crafted
     // callback or a text reply never decides it; the approval stays pending.
-    if is_dashboard_only_kind(&rec.action_kind) {
+    if is_dashboard_only_record(&rec) {
         return Err(dashboard_only_refusal(&rec.action_kind).into());
     }
     if rec.status.is_terminal() {
@@ -1300,6 +1312,30 @@ mod tests {
             assert_eq!(out, Err(DASHBOARD_ONLY_REFUSAL.to_string()));
         }
         assert_eq!(disk.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn outbound_records_get_only_dashboard_notices_and_refuse_channel_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = ApprovalBroker::open(dir.path()).unwrap();
+        for (kind, payload) in [
+            (crate::approval::cli_egress::KIND, json!({})),
+            ("mcp_call", json!({"egress_guard":null})),
+        ] {
+            let id = broker.request("sales", kind, "secret outbound content", payload, 300).await.unwrap();
+            let record = broker.get(&id).await.unwrap().unwrap();
+            assert!(is_dashboard_only_record(&record));
+            for reminder in [false, true] {
+                let notice = dashboard_only_notice_body(&record, reminder);
+                assert!(notice.contains("對外操作") && notice.contains("儀表板"));
+                assert!(!notice.contains("secret") && !notice.contains("知識"));
+            }
+            assert_eq!(decide_from_channel(dir.path(), "telegram", "555",
+                &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, id.as_str()))
+                .await.unwrap(), Err(DASHBOARD_ONLY_REFUSAL.to_string()));
+            assert_eq!(broker.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+        }
+        assert!(!is_dashboard_only_record(&rec("mcp_call")));
     }
 
     #[test]

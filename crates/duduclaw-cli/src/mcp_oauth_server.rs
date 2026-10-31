@@ -504,9 +504,38 @@ fn filter_scope(requested: &str) -> String {
 const BRAND_MARK_SVG: &str = include_str!("../assets/duduclaw-mark.svg");
 
 /// Shared head + page chrome for the OAuth pages: C1 palette (cream page, navy
-/// text, navy primary button) and a heading row of mark + title. `title` is
-/// trusted static text; callers escape anything user-supplied in `body`.
+/// text, navy primary button) and a heading row of mark + title. Callers
+/// escape anything user-supplied in `body`; the page escapes the identity.
 fn oauth_page(title: &str, heading: &str, body: &str) -> String {
+    let brand = duduclaw_gateway::distributor_brand::effective();
+    oauth_page_with_brand(title, heading, body, brand.as_ref())
+}
+
+fn oauth_page_with_brand(
+    title: &str,
+    heading: &str,
+    body: &str,
+    brand: Option<&duduclaw_gateway::distributor_brand::Brand>,
+) -> String {
+    let (title, heading, mark) = match brand {
+        Some(brand) => (
+            escape_html(&title.replace("DuDuClaw", &brand.product_name)),
+            escape_html(&heading.replace("DuDuClaw", &brand.product_name)),
+            format!(
+                "<img src=\"{}\" alt=\"\" aria-hidden=\"true\" style=\"width:120px;height:40px;object-fit:contain;flex:none\">",
+                escape_html(&brand.logo_light),
+            ),
+        ),
+        None => (
+            title.to_string(),
+            heading.to_string(),
+            BRAND_MARK_SVG.trim().replacen(
+                "<svg ",
+                "<svg aria-hidden=\"true\" focusable=\"false\" ",
+                1,
+            ),
+        ),
+    };
     format!(
         "<!doctype html><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -526,11 +555,6 @@ button{{border-radius:8px;font:inherit;cursor:pointer}}\
 .note{{color:#5B6470;font-size:.85rem}}\
 </style>\
 <body><div class=\"brand\">{mark}<h2>{heading}</h2></div>{body}</body>",
-        mark = BRAND_MARK_SVG.trim().replacen(
-            "<svg ",
-            "<svg aria-hidden=\"true\" focusable=\"false\" ",
-            1
-        ),
     )
 }
 
@@ -601,7 +625,7 @@ pub(crate) async fn authorize_handler(
     };
 
     let body = format!(
-        "<p>應用程式 <b>{name}</b> 想連接你的 DuDuClaw（remote MCP）。</p>\
+        "<p>應用程式 <b>{name}</b> 想連接你的 {product}（remote MCP）。</p>\
 <p>授權範圍：{scope_note}</p>\
 <p>貼上一把<b>內部 MCP API key</b>（<code>config.toml [mcp_keys]</code> 中 \
 <code>is_external = false</code> 的 key）以確認你是操作者本人：</p>\
@@ -619,6 +643,7 @@ style=\"width:100%;padding:.5rem\" autocomplete=\"off\" required></p>\
 <p class=\"note\">OAuth 簽發的存取權杖永遠是「外部客戶端」等級：\
 只能使用基礎工具面與你在 key 簽發時明示授與的範圍，連接器／執行類／管理工具永不開放。</p>",
         name = escape_html(&client.client_name),
+        product = escape_html(&duduclaw_gateway::distributor_brand::product_name()),
         scope_note = scope_note,
         client_id = escape_html(client_id),
         redirect_uri = escape_html(redirect_uri),
@@ -1016,8 +1041,8 @@ mod tests {
     }
 
     #[test]
-    fn oauth_pages_carry_the_inline_brand_mark() {
-        let page = oauth_page("DuDuClaw 授權", "DuDuClaw 連線授權", "<p>x</p>");
+    fn default_oauth_pages_keep_the_inline_brand_mark() {
+        let page = oauth_page_with_brand("DuDuClaw 授權", "DuDuClaw 連線授權", "<p>x</p>", None);
         // Mark is inlined (both color layers), decorative, and precedes the heading.
         assert!(page.contains("<svg aria-hidden=\"true\" focusable=\"false\" "));
         assert!(page.contains("class=\"ink\" fill=\"#102B48\""));
@@ -1027,8 +1052,27 @@ mod tests {
         assert!(mark_at < heading_at);
         // The retired paw glyph is gone from both pages.
         assert!(!page.contains('🐾'));
-        let err = oauth_page("DuDuClaw OAuth", "DuDuClaw", "<p>missing client_id</p>");
+        let err = oauth_page_with_brand("DuDuClaw OAuth", "DuDuClaw", "<p>missing client_id</p>", None);
         assert!(!err.contains('🐾'));
         assert!(err.contains("<h2>DuDuClaw</h2>"));
+        assert!(page.contains("<title>DuDuClaw 授權</title>"));
+        assert!(page.ends_with("<h2>DuDuClaw 連線授權</h2></div><p>x</p></body>"));
+        assert!(!page.contains("<img"));
+    }
+
+    #[test]
+    fn distributor_oauth_identity_is_escaped_and_logo_keeps_its_aspect_ratio() {
+        let brand = duduclaw_gateway::distributor_brand::Brand {
+            product_name: "A & \"B\" <tag>".into(),
+            logo_light: "data:image/png;base64,test\" onerror=\"bad".into(),
+            logo_dark: None,
+        };
+        let page = oauth_page_with_brand("DuDuClaw 授權", "DuDuClaw 連線授權", "<p>safe</p>", Some(&brand));
+        assert!(page.contains("<title>A &amp; &quot;B&quot; &lt;tag&gt; 授權</title>"));
+        assert!(page.contains("<h2>A &amp; &quot;B&quot; &lt;tag&gt; 連線授權</h2>"));
+        assert!(page.contains("object-fit:contain"));
+        assert!(page.contains("test&quot; onerror=&quot;bad\""));
+        assert!(!page.contains(" onerror=\"bad"));
+        assert!(!page.contains("<svg"));
     }
 }

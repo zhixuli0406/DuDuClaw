@@ -7,7 +7,7 @@
 //! |--------------------|-------------------------------------------------------|
 //! | `identity`         | `IDENTITY.md` (+ `agent.toml` display name / icon)    |
 //! | `instructions`     | `INSTRUCTIONS.md` (prompt slot, employee read-only)   |
-//! | `user_profile`     | wiki L1 page「服務對象」(always in the prompt)         |
+//! | `user_profile`     | `USER.md` (data-only prompt slot, 4,000 characters)         |
 //! | `tools_notes`      | wiki page「工具備註」(notes only, grants nothing)      |
 //! | `heartbeat`        | wiki page「定期檢查清單」(not scheduled automatically) |
 //! | `knowledge`        | wiki pages (searched on demand)                       |
@@ -43,6 +43,20 @@ pub struct SlotCtx<'a> {
 
 pub async fn write_slots(ctx: &SlotCtx<'_>, draft: &AgentDraft) -> Vec<Outcome> {
     let mut out = Vec::new();
+    if !crate::is_valid_agent_id(ctx.agent_id) {
+        out.push(Outcome::skipped("agent", ctx.agent_id, "無效的員工代號"));
+        return out;
+    }
+    if let Some(doc) = &draft.user_profile {
+        if doc.text.chars().count() > 4_000 {
+            out.push(Outcome::skipped("user-profile", &doc.source, "服務對象資料超過 4,000 字，未寫入"));
+        } else {
+            write_file_slot(ctx, doc, "USER.md", "user-profile", "服務對象資料（USER.md）", &mut out);
+        }
+    }
+    if let Some(doc) = &draft.contract {
+        write_file_slot(ctx, doc, "CONTRACT.toml", "contract", "工作契約（CONTRACT.toml）", &mut out);
+    }
     if let Some(doc) = &draft.identity {
         write_file_slot(
             ctx,
@@ -78,13 +92,6 @@ pub async fn write_slots(ctx: &SlotCtx<'_>, draft: &AgentDraft) -> Vec<Outcome> 
         }
     }
     let pages = [
-        WikiSlot {
-            doc: &draft.user_profile,
-            kind: "user-profile",
-            title: "服務對象",
-            layer: duduclaw_memory::WikiLayer::Core,
-            banner: "",
-        },
         WikiSlot {
             doc: &draft.tools_notes,
             kind: "tools-notes",
@@ -144,6 +151,47 @@ pub async fn write_slots(ctx: &SlotCtx<'_>, draft: &AgentDraft) -> Vec<Outcome> 
     out
 }
 
+/// Exact imported page payloads for confirmation. Import timestamps belong to
+/// the wiki audit log; source documents do not assert a creation/update date.
+pub(super) fn plan_wiki_files(draft: &AgentDraft, format: &str) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    use duduclaw_memory::WikiLayer;
+    let mut pages = Vec::new();
+    for (doc, kind, title, banner) in [
+        (&draft.tools_notes, "tools-notes", "工具備註", "> 這頁只是工具使用說明，不會開放任何工具權限。\n\n"),
+        (&draft.heartbeat, "heartbeat", "定期檢查清單", "> 原平台的定期檢查清單。DuDuClaw 不會自動照表執行；需要時請在儀表板建立排程。\n\n"),
+    ] {
+        if let Some(doc) = doc {
+            pages.push((doc, format!("imported/{format}/{kind}.md"), title.to_string(), WikiLayer::Context, banner));
+        }
+    }
+    for (i, doc) in draft.knowledge.iter().enumerate() {
+        let path = format!("imported/{format}/knowledge/{}.md", knowledge_slug(&doc.source, i));
+        let title = doc.text.lines().find(|line| line.starts_with("# "))
+            .map(|line| line.trim_start_matches("# ").trim().to_string()).unwrap_or_else(|| doc.source.clone());
+        pages.push((doc, path, title, WikiLayer::Deep, ""));
+    }
+    let mut files = std::collections::BTreeMap::new();
+    for (doc, path, title, layer, banner) in pages {
+        let scan = duduclaw_security::input_guard::scan_input(&doc.text, duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD);
+        if scan.blocked { return Err("匯入知識頁未通過安全掃描".into()); }
+        let page = duduclaw_memory::WikiPage {
+            path: path.clone(), title, created: chrono::DateTime::UNIX_EPOCH, updated: chrono::DateTime::UNIX_EPOCH,
+            tags: vec![format!("imported-from-{format}")], related: Vec::new(), sources: vec![doc.source.clone()],
+            author: Some("import".into()), layer, trust: 0.5, source_type: duduclaw_memory::SourceType::Unknown,
+            last_verified: None, citation_count: 0, error_signal_count: 0, success_signal_count: 0,
+            do_not_inject: false, body: format!("{banner}{}", doc.text.trim_end()),
+        };
+        let serialized = duduclaw_memory::serialize_page(&page);
+        let (header, body) = serialized.split_once("\n---\n")
+            .ok_or_else(|| "無法產生知識頁".to_string())?;
+        let header = header.lines().filter(|line| !line.starts_with("created:") && !line.starts_with("updated:"))
+            .collect::<Vec<_>>().join("\n");
+        let content = format!("{header}\n---\n{body}");
+        if files.insert(path, content.into_bytes()).is_some() { return Err("匯入知識頁路徑重複".into()); }
+    }
+    Ok(files)
+}
+
 /// One persona file that becomes a wiki page.
 struct WikiSlot<'a> {
     doc: &'a Option<Doc>,
@@ -174,9 +222,20 @@ fn write_file_slot(
         out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}"))));
         return;
     }
-    let path = ctx.home.join("agents").join(ctx.agent_id).join(file);
-    match std::fs::write(&path, &doc.text) {
-        Ok(()) => out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}")))),
+    use duduclaw_gateway::agent_files::external::{self, ExternalFile, ExternalBaseline};
+    let key = match file {
+        "IDENTITY.md" => ExternalFile::Identity,
+        "USER.md" => ExternalFile::User,
+        "INSTRUCTIONS.md" => ExternalFile::Instructions,
+        "CONTRACT.toml" => ExternalFile::Contract,
+        _ => {
+            out.push(Outcome::skipped(kind, &doc.source, "不支援的設定檔區段"));
+            return;
+        }
+    };
+    match external::write_file(ctx.home, ctx.agent_id, key, "import", "本機匯入（身分未驗證）",
+        ExternalBaseline::Accept, |_| Ok(doc.text.clone())) {
+        Ok(_) => out.push(done(Outcome::imported(kind, &doc.source, format!("→ {label}")))),
         Err(e) => out.push(
             Outcome::skipped(kind, &doc.source, format!("寫入失敗：{e}"))
                 .with("slot.failed", serde_json::json!({ "slot": kind })),

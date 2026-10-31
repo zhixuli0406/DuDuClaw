@@ -34,7 +34,8 @@
 //!   checks before sending a file.
 //!
 //! Writes happen only here. Every read goes through
-//! `duduclaw_knowledge::acl::effective_collections`.
+//! `duduclaw_knowledge::acl::effective_collections`, narrowed by
+//! [`principals`] for restricted employees' own collections.
 
 pub mod add_source_approval;
 pub mod add_source_guard;

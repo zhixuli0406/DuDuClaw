@@ -214,7 +214,9 @@ async fn sqlite_full_rolls_back_whole_envelope() {
             .unwrap();
     }
     let mut large = event("large", "chat");
-    large.payload = "x".repeat(1024 * 1024);
+    // A valid envelope whose individual values remain below the masking cap
+    // still exercises SQLite exhaustion after credential sanitization.
+    large.payload = serde_json::json!({"extra": vec!["x".repeat(32 * 1024); 32]}).to_string();
     assert!(s.append(&[event("a", "chat"), large], 10).await.is_err());
     assert!(s.list().await.unwrap().is_empty());
 }
@@ -563,4 +565,46 @@ async fn two_explicit_retries_have_atomic_distinct_runs_and_old_workers_cannot_f
     assert_eq!(inspected["attempts"].as_array().unwrap().len(), 3);
     let reopened = IngressStore::open(dir.path()).unwrap();
     assert_eq!(reopened.list().await.unwrap()[0].run_id, third.run_id);
+}
+
+// F3 regression; not run (owner forbids builds).
+#[tokio::test]
+async fn masked_ingress_survives_reopen_and_pre_dispatch_retry_without_keyfile() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[security]\nchat_credentials='mask'\n").unwrap();
+    let mut incoming = event("masked", "chat");
+    incoming.payload = serde_json::json!({"event":{"replyToken":"routing-token", "message":{"id":"m1", "type":"text", "text":"password: fixture-retry"}}}).to_string();
+    {
+        let store = IngressStore::open(dir.path()).unwrap();
+        store.append(&[incoming], 10).await.unwrap();
+    }
+    let store = IngressStore::open(dir.path()).unwrap();
+    let first = store.claim(10).await.unwrap().unwrap();
+    let payload = first.payload.as_ref().unwrap();
+    assert!(!payload.contains("fixture-retry"));
+    assert!(!payload.contains("_credential_text_enc"));
+    assert!(payload.contains("routing-token"));
+    assert!(!dir.path().join(".keyfile").exists());
+    store.recover_and_purge(101).await.unwrap();
+    let retry = store.claim(102).await.unwrap().unwrap();
+    assert_eq!(first.id, retry.id);
+    assert_eq!(first.payload, retry.payload);
+    assert_eq!(retry.attempt, 2);
+}
+
+// F3 migration regression; not run (owner forbids builds).
+#[tokio::test]
+async fn legacy_ingress_ciphertext_is_removed_on_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = IngressStore::open(dir.path()).unwrap();
+        store.append(&[event("legacy", "chat")], 10).await.unwrap();
+        let conn = store.conn.lock().await;
+        conn.execute("UPDATE ingress_payload SET payload=?1", [serde_json::json!({"event":{"replyToken":"routing", "message":{"text":"masked", "_credential_text_enc":"old-ciphertext"}}}).to_string()]).unwrap();
+        conn.execute_batch("PRAGMA user_version=4;").unwrap();
+    }
+    let store = IngressStore::open(dir.path()).unwrap();
+    let row = store.claim(11).await.unwrap().unwrap();
+    assert!(!row.payload.as_ref().unwrap().contains("old-ciphertext"));
+    assert!(row.payload.as_ref().unwrap().contains("routing"));
 }

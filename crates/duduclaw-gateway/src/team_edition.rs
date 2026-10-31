@@ -33,6 +33,13 @@ pub fn record(home: &Path, edition: EditionProfile) {
     }
 }
 
+/// Personal behaviour applies only when the gateway resolved this home as Personal.
+pub(crate) fn is_personal(home: &Path) -> bool {
+    home.canonicalize().ok().is_some_and(|home| {
+        editions().get(&home).is_some_and(|e| *e == EditionProfile::Personal)
+    })
+}
+
 /// Team grants apply only when `home` was last resolved as Enterprise.
 pub fn team_grants_enabled(home: &Path) -> bool {
     home.canonicalize().ok().is_some_and(|home| {

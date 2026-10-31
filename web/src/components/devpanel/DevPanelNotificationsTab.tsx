@@ -3,6 +3,8 @@ import { useIntl } from 'react-intl';
 import { BellRing, ExternalLink, TriangleAlert } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
+import { auditEventSummary } from '@/lib/home-overview';
 import { api, type NotifyTypeStat, type UnifiedAuditEvent } from '@/lib/api';
 import { Empty, Skeleton } from '@/components/mds';
 import { useDevPanelIdJump } from './id-jump';
@@ -146,6 +148,7 @@ function NotifyStatsSection({ connectionState }: { readonly connectionState: str
 
 function ChannelFailuresSection({ connectionState }: { readonly connectionState: string }) {
   const intl = useIntl();
+  const agents = useAgentsStore((s) => s.agents);
   const { jumpToAgent, jumpToConversation } = useDevPanelIdJump();
   const [events, setEvents] = useState<UnifiedAuditEvent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -195,6 +198,7 @@ function ChannelFailuresSection({ connectionState }: { readonly connectionState:
         <div className="space-y-1">
           {events.map((evt, i) => {
             const row = (evt.details?.channel_failure ?? {}) as ChannelFailureRow;
+            const agentName = agents.find((a) => a.name === (row.agent || evt.agent_id))?.display_name || row.agent || evt.agent_id;
             return (
               <div
                 key={`${evt.timestamp}-${i}`}
@@ -212,7 +216,7 @@ function ChannelFailuresSection({ connectionState }: { readonly connectionState:
                       onClick={() => jumpToAgent(row.agent!)}
                       className="font-mono text-[11px] font-medium text-brand hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                     >
-                      {row.agent}
+                      {agentName}
                     </button>
                   )}
                   {row.session_id && (
@@ -240,7 +244,7 @@ function ChannelFailuresSection({ connectionState }: { readonly connectionState:
                     })()}
                   </span>
                 </div>
-                {evt.summary && <p className="mt-1 text-foreground">{evt.summary}</p>}
+                {evt.summary && <p className="mt-1 text-foreground">{auditEventSummary(evt, intl.formatMessage, agentName)}</p>}
                 {(row.console_url || row.doc_url) && (
                   <div className="mt-1 flex items-center gap-3">
                     {row.console_url && (

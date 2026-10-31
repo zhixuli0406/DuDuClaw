@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
@@ -16,7 +17,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
-import { useApprovalsStore } from '@/stores/approvals-store';
+import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useOpenAssign } from '@/hooks/useOpenAssign';
@@ -30,7 +31,7 @@ import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
 import { useEffectiveName } from '@/lib/product-identity';
-import { BrandMark } from '@/components/brand/BrandMark';
+import { ProductLogo } from '@/components/brand/ProductLogo';
 import {
   SidebarHeader,
   SidebarContent,
@@ -228,7 +229,7 @@ function StaffZone({
   onToggle: () => void;
 }) {
   const intl = useIntl();
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents();
   const navClass = useNavClass(collapsed);
 
   const shown = useMemo(() => {
@@ -246,7 +247,7 @@ function StaffZone({
             <SidebarMenuItem key={a.name}>
               <NavLink
                 to={`/agents/${encodeURIComponent(a.name)}`}
-                title={a.display_name}
+                title={a.readOnly ? intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember }) : a.display_name}
                 className={navClass}
               >
                 <ActorAvatar
@@ -295,7 +296,7 @@ function StaffZone({
                     showStatusDot
                     status={AGENT_STATUS_DOT[a.status] ?? 'offline'}
                   />
-                  <span className="min-w-0 flex-1 truncate">{a.display_name}</span>
+                  <span className="min-w-0 flex-1 truncate">{a.display_name}{a.readOnly && <span className="block text-[10px] text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span>}</span>
                 </NavLink>
               </SidebarMenuItem>
             ))
@@ -331,7 +332,7 @@ function CompanySwitcher({ collapsed }: { collapsed: boolean }) {
   const setLocale = useLocaleStore((s) => s.setLocale);
 
   // C1 mark at nav size (28 px); no chip behind it (logo usage rules).
-  const logoNode = <BrandMark size={28} title={brandName} />;
+  const logoNode = <ProductLogo size={28} title={brandName} />;
 
   return (
     <DropdownMenu>
@@ -482,7 +483,7 @@ export function AppSidebar() {
   );
 
   const connectionState = useConnectionStore((s) => s.state);
-  const inboxCount = useApprovalsStore((s) => s.pendingCount);
+  const inboxCount = useApprovalsStore(selectInboxCount);
   const inboxStale = useApprovalsStore((s) => s.stale);
   const inboxStaleLabel = intl.formatMessage({ id: 'liveEvents.stale', defaultMessage: 'Data may be stale' });
   const inboxName = intl.formatMessage({ id: 'nav.inbox' });
@@ -492,7 +493,7 @@ export function AppSidebar() {
       ? `${inboxName} (${intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })})`
       : inboxName;
   const fetchInboxCount = useApprovalsStore((s) => s.fetchCount);
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents();
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const theme = useThemeStore((s) => s.theme);
   const cycleTheme = useThemeStore((s) => s.cycleTheme);
@@ -507,7 +508,7 @@ export function AppSidebar() {
     fetchAgents();
     const interval = setInterval(fetchInboxCount, 5 * 60_000);
     return () => clearInterval(interval);
-  }, [connectionState, fetchInboxCount, fetchAgents]);
+  }, [connectionState, fetchInboxCount, fetchAgents, user?.id, user?.role]);
 
   const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
   // WP-C: `/device` is admin-only server-side too, so only probe for admins —
