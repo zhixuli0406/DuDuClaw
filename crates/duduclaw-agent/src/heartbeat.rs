@@ -1830,10 +1830,10 @@ mod tests {
         let states = tokio::sync::Mutex::new(HashMap::new());
         let timing = crate::proactive_timing::DeferralLedger::new();
         autonomy_gate::set_pause(home, Some("cycle"), "maintenance", "user").unwrap();
-        execute_heartbeat(home, "cycle", &semaphore, &states, &timing, None).await;
+        execute_heartbeat(home, "cycle", &semaphore, &states, &timing, None, None).await;
         assert!(read_audit_rows(home, "_soul_integrity_drift").is_empty());
         autonomy_gate::resume(home, Some("cycle")).unwrap();
-        execute_heartbeat(home, "cycle", &semaphore, &states, &timing, None).await;
+        execute_heartbeat(home, "cycle", &semaphore, &states, &timing, None, None).await;
         assert_eq!(read_audit_rows(home, "_soul_integrity_drift").len(), 1);
     }
 
