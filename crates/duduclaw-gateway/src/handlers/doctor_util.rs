@@ -47,19 +47,24 @@ pub async fn codex_sandbox_status_and_message() -> (&'static str, &'static str) 
 /// Container-only guidance, shared by dashboard and operator CLI doctor.
 /// The standalone CLI probes itself and can therefore warn even if a running
 /// gateway is already hardened; only the gateway RPC proves its live state.
-pub fn container_process_isolation_status_and_message() -> Option<(&'static str, &'static str)> {
+pub fn container_process_isolation_status_and_message(gateway_process: bool) -> Option<(&'static str, &'static str)> {
     if !duduclaw_core::ns_guard::is_containerized() {
         return None;
     }
     let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok();
     Some(container_process_isolation_result(
-        duduclaw_core::ns_guard::gateway_process_is_non_dumpable(), scope.as_deref(),
+        gateway_process,
+        duduclaw_core::ns_guard::gateway_process_is_non_dumpable(),
+        scope.as_deref(),
     ))
 }
 
-fn container_process_isolation_result(non_dumpable: bool, scope: Option<&str>) -> (&'static str, &'static str) {
+fn container_process_isolation_result(gateway_process: bool, non_dumpable: bool, scope: Option<&str>) -> (&'static str, &'static str) {
     if !scope.and_then(|v| v.trim().parse::<u32>().ok()).is_some_and(|v| v >= 1) {
         return ("warn", "這台主機沒有開啟 Yama，員工之間的行程保護較弱；單一租戶可接受，多租戶請改用開啟 Yama 的 Linux 主機。");
+    }
+    if !gateway_process {
+        return ("pass", "主機 Yama 行程隔離已開啟；gateway 的 non-dumpable 狀態請看儀表板健檢。");
     }
     if !non_dumpable {
         return ("warn", "目前行程尚未啟用 non-dumpable 保護；請重新啟動 gateway，並從儀表板執行健檢以確認 gateway 的保護狀態。");
@@ -75,14 +80,18 @@ mod container_process_isolation_tests {
     fn container_process_isolation_requires_both_protections() {
         for scope in [None, Some("0"), Some("bad"), Some("")] {
             for hardened in [false, true] {
-                let (status, message) = container_process_isolation_result(hardened, scope);
+                let (status, message) = container_process_isolation_result(true, hardened, scope);
                 assert_eq!(status, "warn");
                 assert!(message.contains("這台主機沒有開啟 Yama"));
             }
         }
         for scope in ["1", "2", "3\n"] {
-            assert_eq!(container_process_isolation_result(true, Some(scope)).0, "pass");
-            assert_eq!(container_process_isolation_result(false, Some(scope)).0, "warn");
+            assert_eq!(container_process_isolation_result(true, true, Some(scope)).0, "pass");
+            assert_eq!(container_process_isolation_result(true, false, Some(scope)).0, "warn");
+            assert_eq!(
+                container_process_isolation_result(false, false, Some(scope)),
+                ("pass", "主機 Yama 行程隔離已開啟；gateway 的 non-dumpable 狀態請看儀表板健檢。"),
+            );
         }
     }
 }

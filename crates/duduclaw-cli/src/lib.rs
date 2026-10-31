@@ -10343,7 +10343,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
         message.into(),
     ));
 
-    if let Some((status, message)) = duduclaw_gateway::handlers::container_process_isolation_status_and_message() {
+    if let Some((status, message)) = duduclaw_gateway::handlers::container_process_isolation_status_and_message(false) {
         checks.push((
             "容器行程隔離".into(),
             if status == "warn" { CheckStatus::Warn } else { CheckStatus::Pass },

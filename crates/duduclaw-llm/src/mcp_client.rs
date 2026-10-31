@@ -1897,6 +1897,16 @@ mod tests {
             assert!(status.success());
             return;
         }
+        let python3_available = std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !python3_available {
+            println!("SKIP: python3 missing");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("guard.txt");
         // Unlike unshare, process_vm_readv of our own memory is normally allowed

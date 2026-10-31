@@ -111,7 +111,7 @@ impl MethodHandler {
             "message": codex_sandbox.1,
             "can_repair": false,
         }));
-        if let Some((status, message)) = container_process_isolation_status_and_message() {
+        if let Some((status, message)) = container_process_isolation_status_and_message(true) {
             checks.push(json!({
                 "name": "container_process_isolation",
                 "status": status,
