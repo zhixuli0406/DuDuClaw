@@ -742,7 +742,21 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
             pixel_height: 0,
         })
         .ok()?;
+    let (program, args) = if duduclaw_core::ns_guard::is_active() {
+        match std::env::current_exe().and_then(|exe| {
+            crate::pty_runtime::namespace_guard_invocation(program.into(), vec![], exe)
+        }) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                tracing::warn!(%error, "PTY model probe namespace wrapper failed; refusing unfiltered execution");
+                return None;
+            }
+        }
+    } else {
+        (program.to_string(), vec![])
+    };
     let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
     cmd.env_clear();
     for (key, value) in duduclaw_core::spawn_env::agent_cli_spawn_env_pairs() { cmd.env(key, value); }
     cmd.env("NO_COLOR", "1");

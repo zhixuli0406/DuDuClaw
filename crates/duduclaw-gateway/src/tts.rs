@@ -471,7 +471,9 @@ impl TtsProvider for PiperTtsProvider {
         info!(model = %self.model_path, text_len = text.len(), "Piper TTS: synthesizing");
 
         // Use piper subprocess (cross-platform, no Rust binding needed)
-        let mut child = tokio::process::Command::new("piper")
+        let mut cmd = tokio::process::Command::new("piper");
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
+        let mut child = cmd
             .args([
                 "--model",
                 &self.model_path,

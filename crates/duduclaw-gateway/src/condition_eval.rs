@@ -313,6 +313,7 @@ async fn run_sandboxed(
         Err(e) => return Err(format!("sandbox confinement failed: {e}")),
     }
 
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
     let child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),

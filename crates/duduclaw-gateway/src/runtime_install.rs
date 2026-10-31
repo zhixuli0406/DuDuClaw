@@ -404,6 +404,7 @@ pub async fn start_install(
     };
 
     let mut cmd = tokio::process::Command::new(&program);
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

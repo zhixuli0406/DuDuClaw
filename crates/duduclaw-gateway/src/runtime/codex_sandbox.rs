@@ -136,7 +136,7 @@ async fn run_probe(bin: &str) -> SandboxProbe {
         std::fs::create_dir_all(&agent).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
         let mut cmd = tokio::process::Command::new(&bin);
-        duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+        duduclaw_core::spawn_env::apply_agent_cli_env_allowlist_keep_namespaces(&mut cmd);
         cmd.env("HOME", &home).env("CODEX_HOME", &codex_home)
             .env("XDG_CONFIG_HOME", &home).env("XDG_DATA_HOME", &home)
             .env("XDG_CACHE_HOME", &home).env("XDG_STATE_HOME", &home)

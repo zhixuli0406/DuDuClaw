@@ -78,6 +78,11 @@ fn sandbox_args_for(caps: Option<&CapabilitiesConfig>, explore: bool) -> Vec<Str
     }
 }
 
+// Bubblewrap needs namespaces; only a spawn without its sandbox can inherit the guard.
+fn employee_needs_namespace_guard(caps: Option<&CapabilitiesConfig>, explore: bool) -> bool {
+    !explore && sandbox_level_for(caps) == duduclaw_core::types::SandboxLevel::FullAccess
+}
+
 // Enforcing egress downgrades FullAccess before choosing employee permissions.
 fn egress_sandbox_caps(caps: Option<&CapabilitiesConfig>, mode: duduclaw_core::egress_guard::Mode) -> Option<&CapabilitiesConfig> {
     if mode >= duduclaw_core::egress_guard::Mode::Ask
@@ -550,6 +555,18 @@ fn turn_source_override_args(pairs: &[(String, String)]) -> Vec<String> {
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
     mcp_env_override_args(&env)
+}
+
+/// Preserve the host container decision through Codex's MCP environment scrub.
+fn turn_source_override_args_with_namespace_guard(
+    pairs: &[(String, String)],
+    namespace_guard_active: bool,
+) -> Vec<String> {
+    let mut pairs = pairs.to_vec();
+    if namespace_guard_active {
+        pairs.push(("DUDUCLAW_IN_CONTAINER".into(), "1".into()));
+    }
+    turn_source_override_args(&pairs)
 }
 
 /// The `-c mcp_servers.duduclaw.env.<K>=<V>` half of [`mcp_override_args`],
@@ -1477,6 +1494,9 @@ impl AgentRuntime for CodexRuntime {
         cmd.arg("--skip-git-repo-check");
         let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
         let effective_caps = egress_sandbox_caps(caps, egress_mode);
+        if employee_needs_namespace_guard(effective_caps, explore) {
+            duduclaw_core::ns_guard::guard_command(&mut cmd);
+        }
         #[cfg(unix)]
         {
             let needs_permissions = !explore
@@ -1558,7 +1578,12 @@ impl AgentRuntime for CodexRuntime {
         // read-only tools only.
         let mut source_pairs = crate::memory_provenance::turn_source_env_pairs();
         source_pairs.extend(crate::explore_lane::lane_env());
-        cmd.args(turn_source_override_args(&source_pairs));
+        // Codex clears the MCP child environment. Carry our host decision
+        // explicitly so marker-only containers also self-guard their MCP.
+        cmd.args(turn_source_override_args_with_namespace_guard(
+            &source_pairs,
+            duduclaw_core::ns_guard::is_active(),
+        ));
 
         // Pass system prompt via AGENTS.md in the working root.
         // Codex exec has no --instructions/--system-prompt flag (verified on
@@ -2384,6 +2409,23 @@ mod tests {
     }
 
     #[test]
+    fn employee_namespace_guard_only_when_bubblewrap_will_not_run() {
+        let full = caps(true, false, &[], &[]);
+        let read_only = caps(false, false, &["Read"], &[]);
+        assert_eq!(sandbox_level_for(Some(&full)), duduclaw_core::types::SandboxLevel::FullAccess);
+        for caps in [None, Some(&read_only), Some(&full)] {
+            assert!(!employee_needs_namespace_guard(caps, true));
+            assert_eq!(employee_needs_namespace_guard(caps, false),
+                sandbox_level_for(caps) == duduclaw_core::types::SandboxLevel::FullAccess);
+        }
+        use duduclaw_core::egress_guard::Mode;
+        for mode in [Mode::Off, Mode::Shadow, Mode::Ask, Mode::Block] {
+            assert_eq!(employee_needs_namespace_guard(egress_sandbox_caps(Some(&full), mode), false),
+                mode < Mode::Ask);
+        }
+    }
+
+    #[test]
     fn egress_codex_args_only_narrow_and_preserve_mcp_approver() {
         use duduclaw_core::egress_guard::Mode;
         let full = caps(true, true, &[], &[]);
@@ -2865,6 +2907,19 @@ mod tests {
             assert!(args.iter().any(|a| a == want), "{args:?}");
         }
         assert!(turn_source_override_args(&[]).is_empty());
+    }
+
+    #[test]
+    fn marker_only_container_reaches_builtin_mcp_after_env_scrub() {
+        // Inject the host decision rather than mutating the process environment
+        // or relying on /.dockerenv on the test machine.
+        let source_pairs = vec![("DUDUCLAW_TURN_ID".into(), "t-marker".into())];
+        let marker = "mcp_servers.duduclaw.env.DUDUCLAW_IN_CONTAINER=\"1\"";
+        let args = turn_source_override_args_with_namespace_guard(&source_pairs, true);
+        assert!(args.iter().any(|arg| arg == marker), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "mcp_servers.duduclaw.env.DUDUCLAW_TURN_ID=\"t-marker\""));
+        assert!(!turn_source_override_args_with_namespace_guard(&source_pairs, false)
+            .iter().any(|arg| arg.contains("DUDUCLAW_IN_CONTAINER")));
     }
 
     /// P2-B N4: inside a turn, the pairs the codex spawn adds name it.

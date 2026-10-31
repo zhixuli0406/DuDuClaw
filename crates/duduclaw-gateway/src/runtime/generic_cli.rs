@@ -658,6 +658,7 @@ impl GenericCliRuntime {
             "generic print-mode runtime: spawning"
         );
 
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         let output = crate::process_group::output(
             &mut cmd, stdin_prompt.then_some(payload.as_bytes()), Duration::from_secs(timeout_secs),

@@ -241,8 +241,9 @@ impl MethodHandler {
                 params: Value::Null,
             });
         }
-        let spawned = tokio::process::Command::new(bin)
-            .arg(group)
+        let mut command = tokio::process::Command::new(bin);
+        duduclaw_core::ns_guard::guard_command(&mut command);
+        let spawned = command.arg(group)
             .args(args)
             .env("DUDUCLAW_HOME", &self.home_dir)
             .env(IMPORT_MARKER_NONCE_ENV, &nonce)

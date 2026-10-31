@@ -716,7 +716,9 @@ pub fn parse_remote_status(stdout: &str) -> RemoteStatus {
 }
 
 async fn run(program: &str, args: &[String]) -> Result<(bool, String, String)> {
-    let out = tokio::process::Command::new(program)
+    let mut cmd = tokio::process::Command::new(program);
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    let out = cmd
         .args(args)
         .output()
         .await

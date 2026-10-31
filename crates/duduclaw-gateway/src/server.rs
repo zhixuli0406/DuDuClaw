@@ -14712,10 +14712,11 @@ async fn handle_files_preview(
         // profile fight over its lock and abort.
         let profile = cache_dir.join(".lo_profile");
         let profile_arg = format!("-env:UserInstallation=file://{}", profile.display());
+        let mut command = tokio::process::Command::new(&soffice);
+        duduclaw_core::ns_guard::guard_command(&mut command);
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            tokio::process::Command::new(&soffice)
-                .arg("--headless")
+            command.arg("--headless")
                 .arg(profile_arg)
                 .arg("--convert-to")
                 .arg("pdf")

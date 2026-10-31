@@ -276,6 +276,7 @@ pub async fn run(
             "這台主機無法在隔離環境中解析文件，為了安全已拒絕。管理員可在 config.toml 設 [knowledge] extract_when_unavailable = \"run_unsandboxed\" 改為只靠時間與資源上限解析。",
         ));
     }
+    duduclaw_core::ns_guard::guard_command_std(&mut std_cmd);
     let mut child = tokio::process::Command::from(std_cmd)
         .kill_on_drop(true)
         .spawn()

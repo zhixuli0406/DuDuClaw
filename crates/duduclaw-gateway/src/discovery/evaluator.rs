@@ -313,6 +313,7 @@ impl RegisteredEvaluator {
                 command.args(&config.command[1..]);
                 command.current_dir(&scratch);
                 scrub_environment(&mut command, &scratch);
+                duduclaw_core::ns_guard::guard_command_std(&mut command);
                 (command, snapshot.to_string_lossy().into_owned())
             }
             IsolationBackend::Native => unreachable!(),

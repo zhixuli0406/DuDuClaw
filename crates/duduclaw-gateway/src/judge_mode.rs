@@ -1090,6 +1090,7 @@ impl ExternalAcceptanceJudge {
         // same-family follow-up that needs its own decision + doc update,
         // not a silent fix.
         let mut cmd = tokio::process::Command::new(&self.config.command[0]);
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
         cmd.args(&self.config.command[1..]);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());

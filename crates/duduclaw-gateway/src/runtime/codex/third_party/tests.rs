@@ -587,3 +587,36 @@ async fn live_codex_spawn_registers_third_party_servers() {
     let reply = runtime.execute("live check", &ctx).await.expect("spawn");
     assert_eq!(reply.content, "shim-ok");
 }
+
+#[test]
+fn marker_only_container_reaches_proxy_and_remote_bridge_after_env_scrub() {
+    let home = tempfile::tempdir().unwrap();
+    for active in [false, true] {
+        let host_env = crate::runtime::third_party_mcp::host_proxy_env_with_namespace_guard(
+            home.path(), "trader", active,
+        );
+        for supports_env_vars in [false, true] {
+            let servers = BTreeMap::from([
+                ("proxy".into(), GatedServer {
+                    command: EXE.into(),
+                    args: vec!["mcp-proxy".into(), "--server".into(), "test".into(), "--".into(), "python3".into()],
+                    env: host_env.iter().cloned().collect(),
+                }),
+                ("bridge".into(), GatedServer {
+                    command: EXE.into(),
+                    args: vec!["mcp-remote-bridge".into(), "--agent".into(), "trader".into(), "--server".into(), "test".into()],
+                    env: host_env.iter().cloned().collect(),
+                }),
+            ]);
+            let overrides = override_args(&servers, supports_env_vars, None, &[], home.path()).unwrap();
+            for name in ["proxy", "bridge"] {
+                let marker = format!("mcp_servers.{name}.env.DUDUCLAW_IN_CONTAINER=\"1\"");
+                assert_eq!(overrides.args.iter().any(|arg| arg == &marker), active,
+                    "active={active}, supports_env_vars={supports_env_vars}: {name}");
+            }
+            // The marker must be an explicit child env override, not merely
+            // an ambient variable on Codex that its MCP env scrub would lose.
+            assert!(!overrides.process_env.iter().any(|(key, _)| key == "DUDUCLAW_IN_CONTAINER"));
+        }
+    }
+}

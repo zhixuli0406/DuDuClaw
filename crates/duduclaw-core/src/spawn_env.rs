@@ -109,6 +109,8 @@ pub const AGENT_CLI_ENV_ALLOWLIST: &[&str] = &[
     // scrub silently kept this off even when the operator set `=1` — the
     // TODO-spawn-env-allowlist-fallout sweep's one silent in-child casualty.
     "DUDUCLAW_SEMANTIC_VECTORS",
+    // Preserve container detection on deployments without /.dockerenv.
+    "DUDUCLAW_IN_CONTAINER",
     // RFC-23 §14.4 data-file guard mode ("on" / "read_only" / "off"). Not a
     // credential — a three-value policy word the PreToolUse hook reads to
     // decide whether a built-in `Read`/`Bash` may touch a CSV/spreadsheet.
@@ -265,6 +267,13 @@ pub fn agent_cli_spawn_env_pairs() -> Vec<(&'static str, String)> {
 /// credentials, per-agent context propagation env) so those always win —
 /// mirrors the existing "explicit env wins" contract at every call site.
 pub fn apply_agent_cli_env_allowlist(cmd: &mut tokio::process::Command) {
+    crate::ns_guard::guard_command(cmd);
+    apply_agent_cli_env_allowlist_keep_namespaces(cmd);
+}
+
+/// Codex bubblewrap only: scrub credentials while preserving namespace access.
+/// All other children must use the guarded variants, including Codex probes.
+pub fn apply_agent_cli_env_allowlist_keep_namespaces(cmd: &mut tokio::process::Command) {
     cmd.env_clear();
     for (k, v) in agent_cli_spawn_env_pairs() {
         cmd.env(k, v);
@@ -273,6 +282,7 @@ pub fn apply_agent_cli_env_allowlist(cmd: &mut tokio::process::Command) {
 
 /// The same base environment for synchronous discovery probes.
 pub fn apply_agent_cli_env_allowlist_std(cmd: &mut std::process::Command) {
+    crate::ns_guard::guard_command_std(cmd);
     cmd.env_clear();
     cmd.envs(agent_cli_spawn_env_pairs());
 }
@@ -369,6 +379,7 @@ pub fn apply_agent_cli_env_allowlist_for(
     cmd: &mut tokio::process::Command,
     capabilities: Option<&crate::types::CapabilitiesConfig>,
 ) -> Vec<&'static str> {
+    crate::ns_guard::guard_command(cmd);
     cmd.env_clear();
     for (k, v) in agent_cli_spawn_env_pairs_for(capabilities) {
         cmd.env(k, v);
