@@ -1,4 +1,5 @@
 //! One socket actor owns credentials, correlation, refresh and reconnect.
+pub(crate) mod close;
 use crate::{
     Error, Result,
     auth::{Account, AuthClient, Role, Session},
@@ -13,7 +14,6 @@ use std::{collections::HashMap, sync::{Arc, OnceLock}, time::Duration};
 use tokio::{
     net::TcpStream,
     sync::{broadcast, mpsc, oneshot, watch},
-    task::AbortHandle,
     time::{Instant, timeout},
 };
 use tokio_tungstenite::{
@@ -94,7 +94,8 @@ struct Inner {
     commands: mpsc::Sender<Command>,
     status: watch::Receiver<ConnectionState>,
     events: broadcast::Sender<ServerEvent>,
-    abort: AbortHandle,
+    shutdown: watch::Sender<bool>,
+    finished: watch::Receiver<bool>,
     chat: OnceLock<crate::chat::ChatClient>,
     credentials: watch::Receiver<Option<Arc<crate::chat::Credentials>>>,
     chat_refresh: mpsc::Sender<bool>,
@@ -103,7 +104,7 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.abort.abort();
+        self.shutdown.send_replace(true);
     }
 }
 #[derive(Clone)]
@@ -111,7 +112,7 @@ pub struct Client {
     inner: Arc<Inner>,
 }
 impl Client {
-    /// Dropping the last handle cancels the actor and destroys its tokens.
+    /// Dropping the last handle requests graceful shutdown and token destruction.
     pub fn start(auth: AuthClient, session: Session, options: ClientOptions) -> Result<Self> {
         if options.request_timeout.is_zero()
             || options.backoff_base.is_zero()
@@ -126,7 +127,10 @@ impl Client {
         let (chat_refresh_tx, chat_refresh_rx) = mpsc::channel(1);
         let target = auth.target().clone();
         let chat_options = options.clone();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (finished_tx, finished) = watch::channel(false);
         let actor = Actor {
+            shutdown: shutdown_rx,
             credentials: credentials_tx,
             chat_refresh: chat_refresh_rx,
             auth,
@@ -138,17 +142,26 @@ impl Client {
             next_id: 0,
             generation: 0,
         };
-        let task = tokio::spawn(crate::without_tracing(actor.run()));
+        tokio::spawn(crate::without_tracing(async move { actor.run().await; finished_tx.send_replace(true); }));
         Ok(Self {
             inner: Arc::new(Inner {
                 commands: tx,
                 status: status_rx,
                 events,
-                abort: task.abort_handle(),
+                shutdown, finished,
                 chat: OnceLock::new(), credentials: credentials_rx,
                 chat_refresh: chat_refresh_tx, target, options: chat_options,
             }),
         })
+    }
+    /// Stop both sockets and wait for bounded closing handshakes.
+    pub async fn shutdown(&self) {
+        if let Some(chat) = self.inner.chat.get() { chat.shutdown().await; }
+        self.inner.shutdown.send_replace(true);
+        let mut finished = self.inner.finished.clone();
+        let _ = timeout(Duration::from_secs(2), async {
+            while !*finished.borrow_and_update() { if finished.changed().await.is_err() { break; } }
+        }).await;
     }
     /// Lazily start exactly one chat actor, shared by every cloned handle.
     pub fn chat(&self) -> crate::chat::ChatClient {
@@ -195,6 +208,7 @@ impl Client {
     }
 }
 struct Actor {
+    shutdown: watch::Receiver<bool>,
     credentials: watch::Sender<Option<Arc<crate::chat::Credentials>>>,
     chat_refresh: mpsc::Receiver<bool>,
     auth: AuthClient,
@@ -218,16 +232,18 @@ impl Actor {
         let mut attempt = 0;
         let mut refresh_attempted = false;
         loop {
-            if self.session.refresh_in(Duration::ZERO).is_zero()
-                && self.auth.refresh(&mut self.session).await.is_err()
-            {
-                self.login_required(Error::LoginRequired);
-                return;
+            if *self.shutdown.borrow() { return; }
+            if self.session.refresh_in(Duration::ZERO).is_zero() {
+                let refreshed = tokio::select! {
+                    _ = self.shutdown.changed() => return,
+                    result = self.auth.refresh(&mut self.session) => result,
+                };
+                if refreshed.is_err() { self.login_required(Error::LoginRequired); return; }
             }
             self.status.send_replace(ConnectionState::Connecting);
-            let opened = timeout(self.options.request_timeout, self.open()).await;
+            let opened = self.open().await;
             let end = match opened {
-                Ok(Ok((mut socket, info))) => {
+                Ok((mut socket, info)) => {
                     self.generation = info.generation;
                     self.credentials.send_replace(Some(Arc::new(crate::chat::Credentials {
                         token: Zeroizing::new(self.session.access_token().to_owned()), generation: self.generation,
@@ -235,25 +251,29 @@ impl Actor {
                     self.status.send_replace(ConnectionState::Connected(info));
                     refresh_attempted = false;
                     let connected_at = Instant::now();
-                    let end = self.serve(&mut socket).await;
+                    let mut shutdown = self.shutdown.clone();
+                    let end = tokio::select! {
+                        _ = shutdown.changed() => End::Shutdown,
+                        end = self.serve(&mut socket) => end,
+                    };
                     // Close before the next socket is opened. Bound the close so a
                     // stalled peer cannot stop refresh or application shutdown.
-                    let _ = timeout(Duration::from_secs(1), socket.close(None)).await;
+                    close::socket(&mut socket).await;
                     if connected_at.elapsed() >= Duration::from_secs(30) {
                         attempt = 0;
                     }
                     end
                 }
-                Ok(Err(Error::LoginRequired)) if !refresh_attempted => {
+                Err(Error::LoginRequired) if !refresh_attempted => {
                     refresh_attempted = true;
                     End::Refresh
                 }
-                Ok(Err(
+                Err(
                     e @ (Error::LoginRequired
                     | Error::LegacyIdentity
                     | Error::IdentityChanged
                     | Error::PasswordChangeRequired),
-                )) => End::Login(e),
+                ) => End::Login(e),
                 _ => End::Reconnect,
             };
             self.credentials.send_replace(None);
@@ -261,6 +281,7 @@ impl Actor {
             while let Ok(command) = self.rx.try_recv() {
                 let _ = command.reply.send(Err(Error::Disconnected));
             }
+            if *self.shutdown.borrow() { return; }
             match end {
                 End::Shutdown => return,
                 End::Login(error) => {
@@ -268,10 +289,11 @@ impl Actor {
                     return;
                 }
                 End::Refresh => {
-                    if self.auth.refresh(&mut self.session).await.is_err() {
-                        self.login_required(Error::LoginRequired);
-                        return;
-                    }
+                    let refreshed = tokio::select! {
+                        _ = self.shutdown.changed() => return,
+                        result = self.auth.refresh(&mut self.session) => result,
+                    };
+                    if refreshed.is_err() { self.login_required(Error::LoginRequired); return; }
                 }
                 End::Reconnect => {
                     let delay = backoff(&self.options, attempt);
@@ -280,6 +302,7 @@ impl Actor {
                     tokio::pin!(sleep);
                     loop {
                         tokio::select! {
+                            _ = self.shutdown.changed() => return,
                             _ = &mut sleep => break,
                             cmd = self.rx.recv() => match cmd {
                                 Some(cmd) => { let _ = cmd.reply.send(Err(Error::Disconnected)); }
@@ -300,15 +323,20 @@ impl Actor {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_FRAME_BYTES))
             .max_frame_size(Some(MAX_FRAME_BYTES));
-        let (mut socket, _) = tokio_tungstenite::connect_async_with_config(
-            self.auth.target().websocket().as_str(),
-            Some(config),
-            false,
-        )
-        .await
-        .map_err(|_| Error::Network)?;
-        let info = authenticate(&mut socket, &self.session, self.generation + 1).await?;
-        Ok((socket, info))
+        let mut shutdown = self.shutdown.clone();
+        let url = self.auth.target().websocket();
+        let (mut socket, _) = tokio::select! {
+            _ = shutdown.changed() => return Err(Error::Disconnected),
+            result = timeout(self.options.request_timeout, tokio_tungstenite::connect_async_with_config(url.as_str(), Some(config), false)) => result.map_err(|_| Error::Timeout)?.map_err(|_| Error::Network)?,
+        };
+        let info = tokio::select! {
+            _ = shutdown.changed() => Err(Error::Disconnected),
+            result = timeout(self.options.request_timeout, authenticate(&mut socket, &self.session, self.generation + 1)) => result.unwrap_or(Err(Error::Timeout)),
+        };
+        match info {
+            Ok(info) => Ok((socket, info)),
+            Err(error) => { close::socket(&mut socket).await; Err(error) }
+        }
     }
     async fn serve(&mut self, socket: &mut Socket) -> End {
         let mut pending: HashMap<String, Command> = HashMap::new();
@@ -334,6 +362,7 @@ impl Actor {
         let mut last_received = Instant::now();
         let end = loop {
             tokio::select! {
+                _ = self.shutdown.changed() => break End::Shutdown,
                 _ = &mut refresh => break End::Refresh,
                 request = self.chat_refresh.recv() => {
                     break if request == Some(true) { End::Refresh } else { End::Login(Error::LoginRequired) };

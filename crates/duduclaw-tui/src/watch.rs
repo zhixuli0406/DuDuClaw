@@ -146,10 +146,12 @@ pub async fn run_watch_to<W: Write>(options: WatchOptions, output: &mut W) -> Re
     if options.content { eprintln!("{}", strings::WATCH_CONTENT_WARNING); }
     let shutdown = crate::ui::terminal::shutdown_signal();
     tokio::pin!(shutdown);
-    tokio::select! {
+    let result = tokio::select! {
         result = watch_loop(&options, output) => result,
         result = &mut shutdown => result,
-    }
+    };
+    options.client.shutdown().await;
+    result
 }
 async fn watch_loop<W: Write>(options: &WatchOptions, output: &mut W) -> Result<()> {
     let mut connection = options.client.connection();

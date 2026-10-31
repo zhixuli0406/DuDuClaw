@@ -26,11 +26,12 @@ enum Command {
 struct Inner {
     commands: mpsc::Sender<Command>,
     state: watch::Receiver<ChatState>,
-    abort: tokio::task::AbortHandle,
+    shutdown: watch::Sender<bool>,
+    finished: watch::Receiver<bool>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.abort.abort();
+        self.shutdown.send_replace(true);
     }
 }
 #[derive(Clone)]
@@ -46,8 +47,11 @@ impl ChatClient {
     ) -> Self {
         let (commands, rx) = mpsc::channel(1);
         let (state, receiver) = watch::channel(ChatState::default());
-        let task = tokio::spawn(crate::without_tracing(
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (finished_tx, finished) = watch::channel(false);
+        tokio::spawn(crate::without_tracing(async move {
             Actor {
+                shutdown: shutdown_rx,
                 target,
                 credentials,
                 refresh,
@@ -57,15 +61,23 @@ impl ChatClient {
                 model: ChatState::default(),
                 refresh_attempted: false,
             }
-            .run(),
-        ));
+            .run().await;
+            finished_tx.send_replace(true);
+        }));
         Self {
             inner: Arc::new(Inner {
                 commands,
                 state: receiver,
-                abort: task.abort_handle(),
+                shutdown, finished,
             }),
         }
+    }
+    pub async fn shutdown(&self) {
+        self.inner.shutdown.send_replace(true);
+        let mut finished = self.inner.finished.clone();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while !*finished.borrow_and_update() { if finished.changed().await.is_err() { break; } }
+        }).await;
     }
     pub fn state(&self) -> watch::Receiver<ChatState> {
         self.inner.state.clone()
@@ -94,6 +106,7 @@ impl ChatClient {
     }
 }
 struct Actor {
+    shutdown: watch::Receiver<bool>,
     target: GatewayUrl,
     credentials: watch::Receiver<Option<Arc<Credentials>>>,
     refresh: mpsc::Sender<bool>,
@@ -110,13 +123,15 @@ impl Actor {
     async fn run(mut self) {
         let mut attempt = 0;
         loop {
+            if *self.shutdown.borrow() { return; }
             if self.credentials.has_changed().is_err() {
                 return;
             }
             let credential = self.credentials.borrow_and_update().clone();
             let Some(credential) = credential else {
-                if self.credentials.changed().await.is_err() {
-                    return;
+                tokio::select! {
+                    _ = self.shutdown.changed() => return,
+                    changed = self.credentials.changed() => if changed.is_err() { return; },
                 }
                 continue;
             };
@@ -126,20 +141,26 @@ impl Actor {
                 .max_message_size(Some(MAX_FRAME_BYTES))
                 .max_frame_size(Some(MAX_FRAME_BYTES));
             let opened = tokio::select! {
+                _ = self.shutdown.changed() => return,
                 changed = self.credentials.changed() => { if changed.is_err() { return; } continue; }
                 result = tokio::time::timeout(self.options.request_timeout,
                     tokio_tungstenite::connect_async_with_config(url.as_str(), Some(config), false)) => result,
             };
             if let Ok(Ok((mut socket, _))) = opened {
                 let started = tokio::time::Instant::now();
-                self.serve(&mut socket, &credential).await;
-                let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
+                let mut shutdown = self.shutdown.clone();
+                tokio::select! {
+                    _ = shutdown.changed() => {},
+                    _ = self.serve(&mut socket, &credential) => {},
+                }
+                crate::client::close::socket(&mut socket).await;
                 if started.elapsed() > Duration::from_secs(30) {
                     attempt = 0;
                 }
             }
             self.model.disconnected();
             self.publish();
+            if *self.shutdown.borrow() { return; }
             // Never replay an uncertain user send or cancel after reconnect.
             while self.commands.try_recv().is_ok() {}
             match self.credentials.has_changed() {
@@ -150,6 +171,7 @@ impl Actor {
             let delay = crate::client::backoff(&self.options, attempt);
             attempt = attempt.saturating_add(1);
             tokio::select! {
+                _ = self.shutdown.changed() => return,
                 _ = tokio::time::sleep(delay) => {},
                 changed = self.credentials.changed() => if changed.is_err() { return; },
             }
@@ -188,6 +210,7 @@ impl Actor {
         let mut last_received = tokio::time::Instant::now();
         loop {
             tokio::select! {
+                _ = self.shutdown.changed() => return,
                 _ = &mut handshake, if !authenticated => return,
                 changed = self.credentials.changed() => {
                     if changed.is_err() { return; }
@@ -278,7 +301,9 @@ mod tests {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let (_command_tx, command_rx) = mpsc::channel(1);
         let (state_tx, mut state_rx) = watch::channel(ChatState::default());
+        let (_shutdown_tx, shutdown) = watch::channel(false);
         let mut actor = Actor {
+            shutdown,
             target: GatewayUrl::parse("http://127.0.0.1").unwrap(),
             credentials: credential_rx,
             refresh: refresh_tx,

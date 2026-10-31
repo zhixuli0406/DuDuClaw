@@ -79,6 +79,8 @@ impl Settings {
         let Ok(table) = text.parse::<toml::Table>() else {
             return (Self::default(), Some(strings::SETTINGS_NOTICE));
         };
+        let removed_command = table.get("pty").and_then(toml::Value::as_table)
+            .is_some_and(|pty| pty.contains_key("command"));
         let mut result = Self::default();
         let mut bad = false;
         for (key, value) in table {
@@ -112,7 +114,7 @@ impl Settings {
                 _ => bad = true,
             }
         }
-        (result, bad.then_some(strings::SETTINGS_NOTICE))
+        (result, if removed_command { Some(strings::PTY_COMMAND_IGNORED) } else { bad.then_some(strings::SETTINGS_NOTICE) })
     }
 }
 /// An explicit CLI home wins; otherwise honor DUDUCLAW_HOME before the OS home.

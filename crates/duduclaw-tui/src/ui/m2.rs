@@ -111,6 +111,7 @@ impl App {
                     crate::blocks::Split::Horizontal
                 });
             }
+            'P' => { self.blocks.open(Block::Pty, None); self.pty_focus = crate::pty::SUPPORTED; self.focus = crate::chat::Focus::List; },
             'D' => self.blocks.open(Block::Detail, None),
             'C' => self.blocks.chat(),
             'R' | 'T' => {

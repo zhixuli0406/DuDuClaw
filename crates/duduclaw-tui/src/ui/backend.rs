@@ -9,7 +9,7 @@ use ratatui::{
     backend::{Backend, ClearType, WindowSize},
     buffer::Cell,
     layout::{Position, Size},
-    style::Color,
+    style::{Color, Modifier},
 };
 use std::io::{self, Write};
 
@@ -49,7 +49,10 @@ impl<W: Write> Backend for ScreenBackend<W> {
                 cursor::MoveTo(x, y),
                 style::SetAttribute(Attribute::Reset),
                 style::SetForegroundColor(color(cell.fg)),
-                style::SetBackgroundColor(color(cell.bg)),
+                style::SetBackgroundColor(color(cell.bg))
+            )?;
+            if cell.modifier.contains(Modifier::BOLD) { queue!(self.0, style::SetAttribute(Attribute::Bold))?; }
+            queue!(self.0,
                 style::Print(cell.symbol())
             )?;
         }

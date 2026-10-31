@@ -1,9 +1,10 @@
-//! Full screen with explicit, locally guarded decisions. No subprocesses.
+//! Full screen with guarded gateway decisions and owner-local PTY blocks.
 pub mod app;
 pub mod card;
 mod card_data;
 mod control_card;
 mod block_render;
+mod pty_render;
 mod m2;
 mod palette;
 mod exit_summary;
@@ -60,6 +61,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         app.notice = Some(notices.join(" / "));
     }
     let guard = terminal::TerminalGuard::enter()?;
+    let shutdown_client = options.client.clone();
     let mut exit_text = None;
     let result = std::panic::AssertUnwindSafe(async {
         let mut terminal = Terminal::new(backend::ScreenBackend(std::io::stdout()))
@@ -131,6 +133,13 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 }));
                 fetched_revision = revision; block_poll = std::time::Instant::now();
             }
+            for pane in &app.blocks.panes {
+                if let Some(pty) = &pane.pty {
+                    let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
+                    pty.start();
+                    pty.poll();
+                }
+            }
             app.refresh(&model);
             if chat_state.has_changed().unwrap_or(false) {
                 app.chat = chat_state.borrow_and_update().clone();
@@ -154,8 +163,14 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 })
                 .map_err(|_| Error::Terminal)?;
             // Never block a Tokio worker waiting for user input; only read ready events.
-            while event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? {
-                let key = match event::read().map_err(|_| Error::Terminal)? {
+            // Bound each batch for redraw/shutdown fairness. Always read host events,
+            // including escape, quit and resize, even when child input is full.
+            for _ in 0..256 {
+                let Some(event) = read_host_event(&mut app, || {
+                    if !event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? { return Ok(None); }
+                    event::read().map(Some).map_err(|_| Error::Terminal)
+                })? else { break; };
+                let key = match event {
                     Event::Resize(_, _) => {
                         if let Some(card) = &mut app.card { card.invalidate_viewport(); }
                         if let Some(card) = &mut app.control_card { card.resize(); }
@@ -201,6 +216,11 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     Action::None => {}
                 }
             }
+            for pane in &app.blocks.panes {
+                if let Some(pty) = &pane.pty {
+                    pty.lock().unwrap_or_else(|e| e.into_inner()).flush_input();
+                }
+            }
             tokio::select! {
                 outcome = async { decision.as_mut().expect("guarded decision").await }, if decision.is_some() => {
                     decision = None;
@@ -235,7 +255,17 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
     })
     .catch_unwind()
     .await;
+    for pane in &app.blocks.panes {
+        if let Some(pty) = &pane.pty {
+            let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
+            pty.stop();
+            if !pty.cleanup_complete {
+                exit_text.get_or_insert_with(String::new).push_str(&format!("\n{}\n", strings::PTY_STOP_FAILED));
+            }
+        }
+    }
     drop(guard);
+    shutdown_client.shutdown().await;
     let result = result.unwrap_or(Err(Error::Terminal));
     if result.is_ok() && let Some(text) = exit_text {
         use std::io::Write;
@@ -244,4 +274,16 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         output.flush().map_err(|_| Error::Output)?;
     }
     result
+}
+
+/// Host events are independent of child writer capacity. Keep this path shared
+/// with the stalled-child regression test so control keys cannot be gated again.
+fn read_host_event(app: &mut App, read: impl FnOnce() -> Result<Option<Event>>) -> Result<Option<Event>> {
+    let event = read()?;
+    if event.is_some() && app.pty_focus
+        && let Some(pty) = &app.blocks.panes[app.blocks.focused].pty
+    {
+        pty.lock().unwrap_or_else(|e| e.into_inner()).begin_input_batch();
+    }
+    Ok(event)
 }

@@ -257,6 +257,10 @@ pub(super) fn draw(
             super::chat_render::draw(frame, region, app, settings, &title);
             continue;
         }
+        if kind == Block::Pty && !(app.help && index == app.blocks.focused) {
+            super::pty_render::draw(frame, region, &app.blocks.panes[index], settings, &title, app.pty_focus && index == app.blocks.focused);
+            continue;
+        }
         let pane = &app.blocks.panes[index];
         let stale = if app.help && index == app.blocks.focused {
             false
