@@ -1,4 +1,5 @@
 {
+  "liveEvents.stale": "データが古い可能性があります",
   "googleDataDisclosure.title": "Google に接続する前に確認してください",
   "googleDataDisclosure.access": "DuDuClaw は、許可された Google データ（Gmail、カレンダー、ドライブ、ドキュメント、スプレッドシート、スライド、フォーム、Tasks、アカウントのメールアドレス）を、依頼された Google 機能の提供に使用します。",
   "googleDataDisclosure.storage": "認証情報はローカルで暗号化され、Google にだけ送信されます。タスクデータは設定済みの AI プロバイダーに送信されることがあり、Google データはローカルの会話履歴、メモリ、ナレッジ、タスク、ツール／ランタイム記録、バックアップに保存されることがあります。切断しても削除されるのは認証情報だけで、既存のコンテンツは削除されません。",

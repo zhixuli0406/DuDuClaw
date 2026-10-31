@@ -497,6 +497,10 @@ where
     if !matches!(request_type, RT::Cron | RT::Dispatch) {
         return fut.await;
     }
+    // The implementation resolves the provider from registry/preloaded
+    // configuration. Default false: a preflight failure publishes no steps.
+    let live_claude_steps = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fut = LIVE_CLAUDE_STEPS.scope(live_claude_steps.clone(), fut);
     let started_at = chrono::Utc::now().to_rfc3339();
     // P2-B M-6: the run key is minted before the spawn and handed to it, so
     // MCP memory writes made during the run and the post-run distillation
@@ -518,6 +522,12 @@ where
     let outer_scope = crate::runtime::NATIVE_TOOL_COLLECTOR
         .try_with(|_| ())
         .is_ok();
+    // A reused collector can already hold evidence from other runtimes.
+    // Persistence keeps its established behavior, while live delivery only
+    // includes steps appended by this invocation.
+    let live_steps_start = crate::runtime::NATIVE_TOOL_COLLECTOR
+        .try_with(|c| c.lock().map(|g| g.len()).unwrap_or(usize::MAX))
+        .unwrap_or(0);
     let (result, events) = if outer_scope {
         let r = fut.await;
         let ev = crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -551,6 +561,8 @@ where
         // Store masks + caps again; this pre-trim just bounds the move.
         let preview_in = duduclaw_core::truncate_chars(prompt, 500);
         let watch_run_key = run_key.clone();
+        let live_home = home_dir.to_path_buf();
+        let publish_live = live_claude_steps.load(std::sync::atomic::Ordering::Relaxed);
         let _ = tokio::task::spawn_blocking(move || {
             match store.record_dispatch_run(
                 &agent,
@@ -562,7 +574,10 @@ where
                 &preview_out,
                 &steps,
             ) {
-                Ok(id) => { let _ = store.attach_computer_watches(&agent, &watch_run_key, id); }
+                Ok(id) => {
+                    let _ = store.attach_computer_watches(&agent, &watch_run_key, id);
+                    publish_dispatch_steps(&live_home, &agent, id, &steps, live_steps_start, publish_live);
+                }
                 Err(e) => tracing::debug!(error = %e, "dispatch run record failed (ignored)"),
             }
         })
@@ -659,6 +674,20 @@ pub async fn call_claude_for_agent_preloaded(
         DispatchOverrides::default(),
     )
     .await
+}
+
+/// Dispatch run ids are assigned only at persistence, so these compact step
+/// invalidations arrive at completion. Non-Claude runs remain available through
+/// runs.get, but do not publish a live step stream in this implementation.
+fn publish_dispatch_steps(
+    home: &Path, agent_id: &str, run_id: i64, steps: &[(String, bool)],
+    start: usize, is_claude: bool,
+) {
+    if !is_claude { return; }
+    let run_id = format!("dispatch:{run_id}");
+    for (tool, _) in steps.iter().skip(start) {
+        crate::live_events::publish_step(home, agent_id, &run_id, tool, "finished");
+    }
 }
 
 /// [`call_claude_for_agent_preloaded`] with caller-imposed
@@ -939,6 +968,14 @@ async fn call_claude_for_agent_impl(
     // the runtime id, which is the most specific true thing we know. Both
     // attributes get the same value, matching what the `chat` spans below do.
     record_runtime_on_span(delegation_settings.provider);
+    let _ = LIVE_CLAUDE_STEPS.try_with(|flag| flag.store(
+        delegation_settings.provider == duduclaw_core::types::RuntimeType::Claude,
+        std::sync::atomic::Ordering::Relaxed,
+    ));
+    // This scope includes Claude, Codex, Grok and API runtime branches.
+    let _live_turn = crate::dashboard_feedback::LiveTurn::dispatch(
+        home_dir, agent_id, request_type, delegation_settings.provider.as_str(),
+    ).await;
 
     // The read-only explore lane (`crate::explore_lane`) is carried by the
     // Claude CLI spawn and the OpenAI-compatible runtime only. Any other
@@ -3842,6 +3879,9 @@ async fn call_claude_streaming(
 // ── Delegation context (task-local) ──────────────────────────
 
 tokio::task_local! {
+    /// Per invocation provider marker for opt-in live dispatch steps.
+    static LIVE_CLAUDE_STEPS: Arc<std::sync::atomic::AtomicBool>;
+
     /// Delegation environment injected by the bus dispatcher before calling
     /// Claude CLI.  `prepare_claude_cmd` reads this to set per-subprocess
     /// env vars.  Thread-safe because each dispatch runs in its own
@@ -5850,3 +5890,33 @@ pub fn reply_sender_for(channel: &str, chat_id: &str) -> Option<String> {
 #[cfg(test)]
 #[path = "claude_runner/attended_call_tests.rs"]
 mod attended_call_producer_tests;
+
+#[cfg(test)]
+mod live_dispatch_step_tests {
+    use super::*;
+
+    #[test]
+    fn non_claude_dispatch_steps_remain_off_live_stream() {
+        let home = tempfile::tempdir().unwrap();
+        let (subscription, mut rx) = crate::live_events::RunSubscriptions::new(home.path());
+        subscription.update(crate::live_events::RunSelector::Run("dispatch:41".into()), true).unwrap();
+        publish_dispatch_steps(home.path(), "worker", 41,
+            &[("Bash".into(), true)], 0, false);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn claude_dispatch_only_publishes_this_invocations_steps_after_persistence_id() {
+        let home = tempfile::tempdir().unwrap();
+        let (subscription, mut rx) = crate::live_events::RunSubscriptions::new(home.path());
+        subscription.update(crate::live_events::RunSelector::Run("dispatch:42".into()), true).unwrap();
+        publish_dispatch_steps(home.path(), "worker", 42,
+            &[("OldNonClaudeStep".into(), true), ("Read".into(), true)], 1, true);
+        let step = rx.try_recv().unwrap();
+        assert_eq!(step.run_id, "dispatch:42");
+        assert_eq!(step.agent_id, "worker");
+        assert_eq!(step.tool, "Read");
+        assert_eq!(step.phase, "finished");
+        assert!(rx.try_recv().is_err());
+    }
+}

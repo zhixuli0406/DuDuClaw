@@ -309,6 +309,7 @@ pub async fn prepare_approval_decision(store: &TaskStore, broker: &ApprovalBroke
     caller: &TrustedCaller, id: &ApprovalId, approve: bool) -> Result<(),String> {
     validate_approval_decision(store,broker,caller,id).await?;
     let record=broker.get(id).await?.ok_or("approval not found")?;
+    crate::approval::check_expected_digest(&record)?;
     let task=approval_task(store,&record,id).await?;
     let decider=match &caller.principal { Principal::User(user)=>format!("dashboard:{}",user.user_id),
         Principal::Agent(_)=>return Err("permission denied".into()) };

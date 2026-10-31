@@ -4,7 +4,7 @@
 export type WsFrame =
   | { type: 'req'; id: string; method: string; params: Record<string, unknown> }
   | { type: 'res'; id: string; ok: boolean; payload?: unknown; error?: unknown }
-  | { type: 'event'; event: string; payload: unknown; seq?: number; state_version?: number };
+  | { type: 'event'; event: string; payload: unknown; seq?: number; state_version?: number; boot_id?: string };
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'authenticated';
 
@@ -49,6 +49,7 @@ export class DuDuClawClient {
   private pendingRequests = new Map<string, PendingRequest>();
   private eventHandlers = new Map<string, Set<EventHandler>>();
   private requestId = 0;
+  private bootId: string | undefined;
   private reconnectAttempt = 0;
   private maxReconnectAttempts = 10;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -88,6 +89,8 @@ export class DuDuClawClient {
   private setState(state: ConnectionState) {
     this._state = state;
     this._onStateChange?.(state);
+    if (state === 'authenticated') this.emitEvent('connection.ready', {});
+    if (state === 'disconnected' || state === 'connecting') this.emitEvent('connection.stale', {});
   }
 
   private setMustChangePassword(flag: boolean) {
@@ -167,8 +170,9 @@ export class DuDuClawClient {
               ? { jwt: token }
               : { token };
             const payload = (await this.call('connect', params, true)) as
-              | { must_change_password?: boolean }
+              | { must_change_password?: boolean; boot_id?: string }
               | undefined;
+            this.observeBoot(payload?.boot_id);
             this.setMustChangePassword(payload?.must_change_password === true);
             this.setState('authenticated');
           } catch (e) {
@@ -187,8 +191,9 @@ export class DuDuClawClient {
           // No token — try server handshake for local-only mode
           try {
             const payload = (await this.call('connect', { version: '0.6.5' }, true)) as
-              | { must_change_password?: boolean }
+              | { must_change_password?: boolean; boot_id?: string }
               | undefined;
+            this.observeBoot(payload?.boot_id);
             this.setMustChangePassword(payload?.must_change_password === true);
             this.setState('authenticated');
           } catch {
@@ -245,12 +250,8 @@ export class DuDuClawClient {
         }
       }
     } else if (frame.type === 'event') {
-      const handlers = this.eventHandlers.get(frame.event);
-      if (handlers) {
-        for (const handler of handlers) {
-          try { handler(frame.payload); } catch { /* ignore */ }
-        }
-      }
+      this.observeBoot(frame.boot_id);
+      this.emitEvent(frame.event, frame.payload);
       // Wildcard handlers
       const wildcardHandlers = this.eventHandlers.get('*');
       if (wildcardHandlers) {
@@ -259,6 +260,20 @@ export class DuDuClawClient {
         }
       }
     }
+  }
+
+  private emitEvent(event: string, payload: unknown) {
+    for (const handler of this.eventHandlers.get(event) ?? []) {
+      try { handler(payload); } catch { /* isolate subscribers */ }
+    }
+  }
+
+  private observeBoot(bootId: string | undefined) {
+    if (!bootId) return; // Older gateways omit this optional field.
+    if (this.bootId !== undefined && this.bootId !== bootId) {
+      this.emitEvent('events_lost', { reason: 'gateway_restarted' });
+    }
+    this.bootId = bootId;
   }
 
   /**
@@ -340,6 +355,7 @@ export class DuDuClawClient {
       this.reconnectTimer = null;
     }
     this.maxReconnectAttempts = 0;
+    this.bootId = undefined;
     const ws = this.ws;
     this.ws = null; // Clear ref BEFORE close — onclose guard checks this
     ws?.close();

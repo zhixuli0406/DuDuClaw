@@ -483,6 +483,14 @@ export function AppSidebar() {
 
   const connectionState = useConnectionStore((s) => s.state);
   const inboxCount = useApprovalsStore((s) => s.pendingCount);
+  const inboxStale = useApprovalsStore((s) => s.stale);
+  const inboxStaleLabel = intl.formatMessage({ id: 'liveEvents.stale', defaultMessage: 'Data may be stale' });
+  const inboxName = intl.formatMessage({ id: 'nav.inbox' });
+  const inboxLabel = inboxStale
+    ? `${inboxName} (${inboxStaleLabel})`
+    : inboxCount > 0
+      ? `${inboxName} (${intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })})`
+      : inboxName;
   const fetchInboxCount = useApprovalsStore((s) => s.fetchCount);
   const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
@@ -497,7 +505,7 @@ export function AppSidebar() {
     if (connectionState !== 'authenticated') return;
     fetchInboxCount();
     fetchAgents();
-    const interval = setInterval(fetchInboxCount, 60_000);
+    const interval = setInterval(fetchInboxCount, 5 * 60_000);
     return () => clearInterval(interval);
   }, [connectionState, fetchInboxCount, fetchAgents]);
 
@@ -696,31 +704,23 @@ export function AppSidebar() {
           <NavLink
             to={inboxEntry.to}
             data-tour={`nav:${inboxEntry.to}`}
-            aria-label={
-              inboxCount > 0
-                ? intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })
-                : intl.formatMessage({ id: 'nav.inbox' })
-            }
-            title={
-              inboxCount > 0
-                ? intl.formatMessage({ id: 'nav.inbox.pending' }, { count: inboxCount })
-                : intl.formatMessage({ id: 'nav.inbox' })
-            }
+            aria-label={inboxLabel}
+            title={inboxLabel}
             className={({ isActive }) =>
               cn(
                 'relative grid size-8 place-items-center rounded-md outline-none transition-colors hover:bg-sidebar-accent/70 focus-visible:ring-2 focus-visible:ring-sidebar-ring',
                 isActive
                   ? 'text-sidebar-accent-foreground'
-                  : inboxCount > 0
+                  : !inboxStale && inboxCount > 0
                     ? 'text-brand'
                     : 'text-muted-foreground',
               )
             }
           >
             <Bell className="size-4" />
-            {inboxCount > 0 && (
+            {(inboxStale || inboxCount > 0) && (
               <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[9px] font-medium leading-none tabular-nums text-brand-foreground">
-                {inboxCount > 99 ? '99+' : inboxCount}
+                {inboxStale ? '?' : inboxCount > 99 ? '99+' : inboxCount}
               </span>
             )}
           </NavLink>

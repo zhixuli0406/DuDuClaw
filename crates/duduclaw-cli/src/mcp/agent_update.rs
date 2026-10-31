@@ -627,6 +627,11 @@ pub(crate) async fn handle_agent_update(
         });
     }
 
+    if config_before.agent.status != config.agent.status {
+        duduclaw_gateway::dashboard_feedback::emit(home_dir, "agent.status_changed",
+            serde_json::json!({ "agent_id": agent_id, "status": config.agent.status })).await;
+    }
+
     // WP: sync SOUL.md / IDENTITY.md self-introduction text to the new
     // display_name (see comment above the capture site). Best-effort: a
     // missing file is skipped, an IO error is logged but does not fail the

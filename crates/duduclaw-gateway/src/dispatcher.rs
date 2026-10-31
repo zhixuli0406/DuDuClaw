@@ -1465,6 +1465,15 @@ async fn dispatch_sandboxed(
     agent_id: &str,
     prompt: &str,
 ) -> crate::task_sandbox::SandboxDispatch {
+    let runtime = {
+        let reg = registry.read().await;
+        let agent = if agent_id == "default" { reg.main_agent() } else { reg.get(agent_id) };
+        agent.map(|a| crate::runtime_config::load_runtime_settings(&a.dir).provider)
+    };
+    let _live_turn = crate::dashboard_feedback::LiveTurn::dispatch(
+        home_dir, agent_id, crate::cost_telemetry::RequestType::Dispatch,
+        runtime.map(|r| r.as_str()).unwrap_or("claude"),
+    ).await;
     crate::task_sandbox::dispatch(home_dir, registry, agent_id, prompt).await
 }
 

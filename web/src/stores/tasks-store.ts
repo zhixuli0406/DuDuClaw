@@ -10,6 +10,7 @@ import {
   type TaskComment,
 } from '@/lib/api';
 import { client } from '@/lib/ws-client';
+import { subscribeInvalidations, TASK_INVALIDATIONS } from '@/lib/live-events';
 
 interface TasksStore {
   readonly tasks: ReadonlyArray<TaskInfo>;
@@ -32,7 +33,7 @@ interface TasksStore {
   clearError: () => void;
   readonly filterAgent: string | null;
   readonly filterPriority: TaskPriority | null;
-  fetchTasks: (filters?: { status?: TaskStatus; agent_id?: string }) => Promise<void>;
+  fetchTasks: (filters?: { status?: TaskStatus; agent_id?: string }) => Promise<boolean>;
   createTask: (params: TaskCreateParams) => Promise<TaskInfo | null>;
   updateTask: (taskId: string, fields: TaskUpdateParams) => Promise<void>;
   removeTask: (taskId: string) => Promise<void>;
@@ -80,26 +81,11 @@ export const useTasksStore = create<TasksStore>((set, get) => {
   // response must never overwrite a newer one (rows and partial flag alike).
   let tasksSeq = 0;
   let activitiesSeq = 0;
-  // Subscribe to real-time task updates
-  client.subscribe('task.updated', (payload) => {
-    const data = payload as TaskInfo;
-    set({
-      tasks: get().tasks.map((t) => (t.id === data.id ? data : t)),
-    });
-  });
-
-  client.subscribe('task.created', (payload) => {
-    const data = payload as TaskInfo;
-    // Upsert, not append: the creating client already added this task
-    // optimistically in `createTask`, so a blind append would duplicate the
-    // card until the next refetch (#2).
-    set({ tasks: upsertTask(get().tasks, data) });
-  });
-
-  client.subscribe('task.removed', (payload) => {
-    const data = payload as { task_id: string };
-    set({ tasks: get().tasks.filter((t) => t.id !== data.task_id) });
-  });
+  // MCP pushes carry only ids. Fetch the current list instead of casting
+  // these compact invalidations into incomplete TaskInfo objects.
+  let lastFilters: { status?: TaskStatus; agent_id?: string } | undefined;
+  // Includes events_lost; reconciliation shares the ordinary event refresh budget.
+  subscribeInvalidations(TASK_INVALIDATIONS, () => get().fetchTasks(lastFilters));
 
   // Subscribe to activity events
   client.subscribe('activity.new', (payload) => {
@@ -127,16 +113,19 @@ export const useTasksStore = create<TasksStore>((set, get) => {
     filterPriority: null,
 
     fetchTasks: async (filters) => {
+      lastFilters = filters;
       const seq = ++tasksSeq;
       set({ loading: true, error: null });
       try {
         const result = await api.tasks.list(filters);
-        if (seq !== tasksSeq) return; // a newer fetch owns the state now
+        if (seq !== tasksSeq) return result?.partial_error == null; // a newer fetch owns the state now
         set({ tasks: result?.tasks ?? [], loading: false, tasksPartialError: result?.partial_error ?? null });
+        return result?.partial_error == null;
       } catch (e) {
-        if (seq !== tasksSeq) return;
+        if (seq !== tasksSeq) return false;
         // A total failure is not "partial": drop any stale partial flag.
         set({ error: e, loading: false, tasksPartialError: null });
+        return false;
       }
     },
 

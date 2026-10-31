@@ -19,6 +19,16 @@ pub(crate) const OCCURRENCE_FROZEN_FIELDS: [&str; 11] = [
 ];
 
 impl TaskStore {
+    /// Bounded metadata read for untrusted dashboard invalidation hints.
+    /// Never migrate a database or create an absent installation on this path.
+    pub(crate) fn live_metadata(home: &Path, id: &str) -> Result<Option<(String, String)>, String> {
+        if !duduclaw_core::is_valid_agent_id(id) { return Ok(None); }
+        let conn = crate::review_evidence::audience::readonly_db(&home.join("tasks.db"))?;
+        conn.query_row("SELECT assigned_to, status FROM tasks WHERE id=?1", params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional().map_err(|e| format!("read task event metadata: {e}"))
+    }
+
     pub async fn list_tasks(
         &self,
         status: Option<&str>,

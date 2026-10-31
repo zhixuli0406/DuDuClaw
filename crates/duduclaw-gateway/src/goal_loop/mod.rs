@@ -110,6 +110,34 @@ use futures_util::FutureExt as _;
 /// counts as a denial (ApprovalBroker fail-closed) ⇒ the goal is aborted.
 const KICKOFF_TTL_SECS: i64 = 3600;
 
+tokio::task_local! {
+    /// Team role calls share one outer round; they still emit their agent turns.
+    pub(crate) static TEAM_LIVE_ROUND: bool;
+}
+
+/// Runtime boundary for a goal round, separate from queue admission and review.
+/// Drop closes the round on ordinary completion, error or future cancellation.
+pub(crate) struct LiveRuntimeRound {
+    home: PathBuf,
+    agent_id: String,
+    task_id: String,
+}
+
+impl LiveRuntimeRound {
+    pub(crate) fn start(home: &Path, agent_id: &str, task_id: &str) -> Self {
+        crate::dashboard_feedback::emit_live(home, "goal.round_started",
+            serde_json::json!({ "agent_id": agent_id, "task_id": task_id }));
+        Self { home: home.to_path_buf(), agent_id: agent_id.into(), task_id: task_id.into() }
+    }
+}
+
+impl Drop for LiveRuntimeRound {
+    fn drop(&mut self) {
+        crate::dashboard_feedback::emit_live(&self.home, "goal.round_finished",
+            serde_json::json!({ "agent_id": self.agent_id, "task_id": self.task_id }));
+    }
+}
+
 // ── Driver internals (audit O6, 2026-09-29) — the driver body was split
 //    into one file per phase for size only; every path below is re-exported
 //    so `goal_loop::…` callers are unchanged. ──

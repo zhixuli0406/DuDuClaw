@@ -623,3 +623,5 @@ pub mod egress_client;
 pub mod egress_gate;
 
 mod egress_registry;
+
+pub(crate) mod live_events;

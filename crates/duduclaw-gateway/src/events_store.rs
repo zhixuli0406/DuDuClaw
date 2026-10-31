@@ -66,6 +66,31 @@ pub struct EventBusStore {
 }
 
 impl EventBusStore {
+    pub(crate) fn home_dir(&self) -> &Path {
+        self.db_path.parent().expect("event store home")
+    }
+
+    /// Remove only lifecycle rows for this approval, including withdrawal's
+    /// terminal event. The exact id tombstone fences delayed cross-process
+    /// appends after a scrub; it stores no source identifiers or card text.
+    pub async fn delete_approval_lifecycle(&self, approval_id: &str) -> Result<usize, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin approval events scrub: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO scrubbed_approval_events (approval_id) VALUES (?1)",
+            params![approval_id],
+        ).map_err(|e| format!("fence approval events: {e}"))?;
+        let deleted = tx.execute(
+            "DELETE FROM events
+             WHERE event IN ('approval.created', 'approval.decided', 'approval.expired')
+               AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.id') END = ?1",
+            params![approval_id],
+        ).map_err(|e| format!("scrub approval events: {e}"))?;
+        tx.commit().map_err(|e| format!("commit approval events scrub: {e}"))?;
+        Ok(deleted)
+    }
+
     /// Open (or create) the event bus at `<home>/events.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("events.db");
@@ -89,6 +114,10 @@ impl EventBusStore {
                  event    TEXT NOT NULL,
                  payload  TEXT NOT NULL,
                  ts       TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS scrubbed_approval_events (
+                 approval_id TEXT PRIMARY KEY NOT NULL
              );
 
              CREATE INDEX IF NOT EXISTS idx_events_id ON events(id);
@@ -154,7 +183,15 @@ impl EventBusStore {
     ) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO events (event, payload, ts, source) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO events (event, payload, ts, source)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM scrubbed_approval_events
+                 WHERE approval_id = CASE
+                     WHEN ?1 IN ('approval.created', 'approval.decided', 'approval.expired')
+                          AND json_valid(?2) THEN json_extract(?2, '$.id')
+                     END
+             )",
             params![event, payload, ts_rfc3339, source],
         )
         .map_err(|e| format!("append event: {e}"))?;
@@ -326,6 +363,30 @@ mod tests {
         let p = std::env::temp_dir().join(format!("duduclaw-eventbus-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[tokio::test]
+    async fn approval_lifecycle_scrub_is_exact_and_retryable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = EventBusStore::open(home.path()).unwrap();
+        for event in ["approval.created", "approval.decided", "approval.expired"] {
+            store.append(event, r#"{"id":"card-1"}"#).await.unwrap();
+            store.append(event, r#"{"id":"card-10"}"#).await.unwrap();
+        }
+        store.append("task.updated", r#"{"id":"card-1"}"#).await.unwrap();
+        store.append("approval.created", "malformed").await.unwrap();
+        assert_eq!(store.delete_approval_lifecycle("card-1").await.unwrap(), 3);
+        assert_eq!(store.delete_approval_lifecycle("card-1").await.unwrap(), 0);
+        // A writer that committed an approval before the scrub can finish
+        // emitting later, including through a newly opened process handle.
+        let late_writer = EventBusStore::open(home.path()).unwrap();
+        for event in ["approval.created", "approval.decided", "approval.expired"] {
+            late_writer.append(event, r#"{"id":"card-1"}"#).await.unwrap();
+        }
+        let rows = store.fetch_since(0, 100).await.unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.iter().filter(|row| row.payload.contains("card-10")).count(), 3);
+        assert!(rows.iter().any(|row| row.event == "task.updated"));
     }
 
     #[tokio::test(flavor = "current_thread")]

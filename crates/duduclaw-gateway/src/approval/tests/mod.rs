@@ -4,6 +4,7 @@
 //! files for size only.
 
 mod broker_cases;
+mod live_event_cases;
 mod gate_cases;
 mod guard_cases;
 mod simulation_cases;

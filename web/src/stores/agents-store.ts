@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { api, type AgentDetail, type AgentUpdateParams, type AgentHandoffParams, type AgentHandoffResult } from '@/lib/api';
-import { client } from '@/lib/ws-client';
+import { subscribeInvalidations } from '@/lib/live-events';
 import { useAgentAvatarStore } from './agent-avatar-store';
 
 interface AgentsStore {
@@ -20,7 +20,7 @@ interface AgentsStore {
    */
   readonly error: unknown;
   clearError: () => void;
-  fetchAgents: (includeArchived?: boolean) => Promise<void>;
+  fetchAgents: (includeArchived?: boolean) => Promise<boolean>;
   setIncludeArchived: (v: boolean) => Promise<void>;
   selectAgent: (id: string | null) => void;
   pauseAgent: (id: string) => Promise<void>;
@@ -40,17 +40,11 @@ interface AgentsStore {
 }
 
 export const useAgentsStore = create<AgentsStore>((set, get) => {
-  // Subscribe to agent status change events
-  client.subscribe('agent.status_changed', (payload) => {
-    const data = payload as { agent_id: string; new_status: string };
-    set({
-      agents: get().agents.map((a) =>
-        a.name === data.agent_id
-          ? { ...a, status: data.new_status as AgentDetail['status'] }
-          : a
-      ),
-    });
-  });
+  // Keep loss and ordinary invalidations on the same two-second limiter.
+  subscribeInvalidations([
+    'agent.status_changed', 'agent.turn_started', 'agent.turn_finished',
+    'events_lost', 'connection.ready',
+  ], () => get().fetchAgents());
 
   return {
     agents: [],
@@ -68,8 +62,10 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
         // Seed the avatar cache so uploaded images resolve everywhere.
         useAgentAvatarStore.getState().seed(agents);
         set({ agents, loading: false, loaded: true });
+        return true;
       } catch (e) {
         set({ error: e, loading: false, loaded: true });
+        return false;
       }
     },
     setIncludeArchived: async (v) => {

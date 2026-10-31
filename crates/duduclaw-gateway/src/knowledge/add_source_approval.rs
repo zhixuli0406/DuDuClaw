@@ -388,6 +388,11 @@ pub async fn decide(
         Ok(_) => return Err("找不到這筆審核".into()),
         Err(e) => return Err(format!("讀取審核失敗：{e}")),
     };
+    let (h, r, u) = (home.to_path_buf(), rec.clone(), user.clone());
+    let allowed = super::blocking(move || may_decide(&h, &r, &u)).await;
+    if allowed.is_err() {
+        return Err(NOT_EDITOR.into());
+    }
     if rec.status != ApprovalStatus::Pending {
         return Err(format!(
             "approval {} already {}",
@@ -400,11 +405,7 @@ pub async fn decide(
         remove_sidecar(home, &rec.payload);
         return Err(EXPIRED_TEXT.into());
     }
-    let (h, r, u) = (home.to_path_buf(), rec.clone(), user.clone());
-    let allowed = super::blocking(move || may_decide(&h, &r, &u)).await;
-    if allowed.is_err() {
-        return Err(NOT_EDITOR.into());
-    }
+    crate::approval::check_expected_digest(&rec)?;
     let decided_by = format!("dashboard:{}", user.user_id);
     if !approve {
         broker.decide(id, false, &decided_by).await?;

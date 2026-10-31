@@ -391,6 +391,14 @@ impl GoalLoopDriver {
 
     /// Best-effort append to the dashboard Activity Feed. A failure here must not
     /// break the loop — it is progress telemetry, not control flow.
+    /// Invalidation only: never put autonomous transitions on autopilot's
+    /// task.updated bus and never include title, judge output or task prose.
+    pub(super) fn emit_goal_event(&self, event: &str, task: &TaskRow) {
+        crate::dashboard_feedback::emit_live(&self.home_dir, event,
+            serde_json::json!({ "task_id": task.id, "agent_id": task.assigned_to,
+                "status": task.status }));
+    }
+
     pub(super) async fn post_activity(
         &self,
         event_type: &str,
