@@ -244,7 +244,7 @@ impl PushGate {
                     &self.ctx,
                 ).ok()
             }
-        } else if matches!(rule, PushRule::Task | PushRule::Approval | PushRule::Agent) {
+        } else if matches!(rule, PushRule::Task | PushRule::Approval | PushRule::Agent | PushRule::Autonomy) {
             live_reader_context(&self.home, &self.ctx).ok()
         } else {
             self.live()
@@ -529,6 +529,18 @@ mod live_event_tests {
         // The next frame gets a new snapshot, even with identical wire JSON.
         let next = std::sync::Arc::new(PreparedPush::prepare(f.home.clone(), line).await.unwrap());
         assert!(bob.filter_prepared(next).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn autonomy_frame_rechecks_binding_after_cache_warmup() {
+        let f = crate::handlers::task_privacy_tests::fixture().await;
+        let line = serde_json::to_string(&WsFrame::event("autonomy.changed",
+            json!({"agent_id":"sales", "all":false, "paused":true}))).unwrap();
+        let frame = std::sync::Arc::new(PreparedPush::prepare(f.home.clone(), line).await.unwrap());
+        let mut alice = PushGate::new(&f.home, &f.alice, false);
+        assert!(alice.filter_prepared(frame.clone()).await.is_some());
+        f.db.unbind_agent(&f.alice.user_id, "sales").unwrap();
+        assert!(alice.filter_prepared(frame).await.is_none());
     }
 
     #[test]

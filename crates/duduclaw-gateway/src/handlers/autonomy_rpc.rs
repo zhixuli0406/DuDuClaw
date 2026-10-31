@@ -260,7 +260,7 @@ fn record_completion(
         };
         let frame = WsFrame::Event {
             event: "autonomy.changed".into(), payload: change_event(agent, paused),
-            seq: None, state_version: None,
+            seq: None, state_version: None, boot_id: None,
         };
         let line = serde_json::to_string(&frame).map_err(|error| error.to_string())?;
         let _ = tx.send(line);
