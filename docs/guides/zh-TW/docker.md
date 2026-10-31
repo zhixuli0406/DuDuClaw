@@ -365,7 +365,6 @@ claude auth status
 
 | 路徑 | 用途 | 必要性 |
 |------|------|-------|
-| `/var/run/docker.sock` | 讓容器呼叫宿主機 Docker daemon | 只有逐員工的任務沙箱會用到（預設關閉）；gateway 本身跑在容器裡時使用任務沙箱，[task-sandbox.md](task-sandbox.md) 沒有涵蓋，也沒有驗證過 |
 
 ### 7.1 備份
 
@@ -405,7 +404,6 @@ docker run --rm \
       - ./data/kiro:/home/duduclaw/.kiro
       - ./data/cursor:/home/duduclaw/.cursor
       - ./data/opencode:/home/duduclaw/.local/share/opencode
-      - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 注意宿主機目錄的 **owner 必須是 UID 1000**（容器內 `duduclaw` 使用者）：
@@ -645,22 +643,38 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 
 ### 任務沙箱無法啟動
 
-這只適用於 `agent.toml [container] sandbox_enabled = true` 的員工。gateway 本身跑在容器裡時使用任務沙箱，並未涵蓋也沒有驗證過；沙箱 image 必須已存在於 socket 指向的那個 Docker daemon，而且不會自動下載（見 [task-sandbox.md](task-sandbox.md)）。下面的容器端步驟只確認 socket 能不能用：
+這只適用於 `agent.toml [container] sandbox_enabled = true` 的員工。官方映像不支援在容器裡的 gateway 使用任務沙箱：映像沒有 Docker client，預設 compose 也不掛載 `docker.sock`。需要任務沙箱時，請把 gateway 裝在宿主機上（見 [task-sandbox.md](task-sandbox.md)）。
+
+### Codex 員工的 shell 指令無法執行
+
+Codex 員工的 shell 在 bubblewrap 沙箱裡執行，需要容器允許 user namespace。沙箱起不來時，員工仍能對話和使用 MCP 工具，但 shell 指令全部失敗，檔案不會被改動。`duduclaw doctor` 與儀表板的檢查頁會列出「Codex 員工 shell」並說明下一步。
+
+先把 compose 檔更新到目前版本，重建容器：
 
 ```bash
-# 測試 socket 能否從容器內使用
-docker compose exec duduclaw docker ps
-# 要能看到宿主機上的 container 清單
+git pull
+docker compose up -d
 ```
 
-若 Permission denied，多半是 SELinux / AppArmor 擋住。Linux 上可試：
+目前的 compose 檔會套用 `container/seccomp-bwrap.json`、`apparmor=unconfined`、`no-new-privileges` 與 `cap_drop: ALL`。Watchtower 只更新映像，不會更新 compose 檔，這一步要手動做。
 
-```yaml
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:rw
-    group_add:
-      - "${DOCKER_GID:-999}"   # 對齊宿主機 docker group GID
+Ubuntu 24.04 預設限制非特權 user namespace，還要在宿主機載入 AppArmor 設定檔：
+
+```bash
+sudo scripts/docker-apparmor-setup.sh
+# 把印出的這行加進 .env
+# DUDUCLAW_APPARMOR_PROFILE=duduclaw-userns
+docker compose up -d
 ```
+
+| 宿主機 | 要做的事 | 驗證狀態 |
+|---|---|---|
+| Docker Desktop | 更新 compose | 已測 arm64 |
+| Ubuntu 22.04 | 更新 compose | 已測 x64 |
+| Ubuntu 24.04 | 更新 compose，再執行上面的腳本 | 已測 x64 |
+| 其他 Linux、NAS | 依 `duduclaw doctor` 的結果處理 | 未測 |
+
+`distribution/nas/docker-compose.yml` 只使用映像，沒有帶 seccomp 檔，所以這份 compose 還沒有這些設定。若更新後 doctor 仍回報相同問題，代表宿主機停用了 user namespace。
 
 ### OAuth 狀態在容器重建後消失
 

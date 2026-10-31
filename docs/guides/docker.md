@@ -347,7 +347,6 @@ Plus a mounted host path:
 
 | Path | Purpose | Requirement |
 |------|------|-------|
-| `/var/run/docker.sock` | Lets the container talk to the host Docker daemon | Only for the per-agent task sandbox (off by default); running the task sandbox from a containerised gateway is not covered by [task-sandbox.md](task-sandbox.md) and has not been verified |
 
 ### 7.1 Backup
 
@@ -387,7 +386,6 @@ If you'd rather browse the data directly, you can swap named volumes for bind mo
       - ./data/kiro:/home/duduclaw/.kiro
       - ./data/cursor:/home/duduclaw/.cursor
       - ./data/opencode:/home/duduclaw/.local/share/opencode
-      - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 Note that the host directories **must be owned by UID 1000** (the `duduclaw` user inside the container):
@@ -611,22 +609,38 @@ After a restart, the startup log prints the extra origins that took effect. See
 
 ### Task sandbox can't start
 
-This only applies to agents with `agent.toml [container] sandbox_enabled = true`. Running the task sandbox from a gateway that itself runs in a container is not covered and has not been verified; the sandbox image must be present on the Docker daemon that the socket points to, and the sandbox is never pulled automatically (see [task-sandbox.md](task-sandbox.md)). The container-side steps below only check that the socket works:
+This applies only to employees with `agent.toml [container] sandbox_enabled = true`. The official image does not support the task sandbox for a gateway running in a container: the image has no Docker client and the default compose files do not mount `docker.sock`. If you need the task sandbox, install the gateway on the host (see [task-sandbox.md](task-sandbox.md)).
+
+### Codex employees can't run shell commands
+
+Codex employee shells run in a bubblewrap sandbox, which needs the container to allow user namespaces. When the sandbox can't start, the employee can still chat and use MCP tools, but every shell command fails and no files change. `duduclaw doctor` and the dashboard's doctor page show a "Codex employee shell" check with the next step.
+
+First update to the current compose files and recreate the container:
 
 ```bash
-# Test whether the socket works from inside the container
-docker compose exec duduclaw docker ps
-# You should see the container list from the host
+git pull
+docker compose up -d
 ```
 
-If you get permission denied, it's usually SELinux/AppArmor blocking it. On Linux, try:
+The current compose files apply `container/seccomp-bwrap.json`, `apparmor=unconfined`, `no-new-privileges` and `cap_drop: ALL`. Watchtower updates the image only, so this step is manual.
 
-```yaml
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:rw
-    group_add:
-      - "${DOCKER_GID:-999}"   # match the host's docker group GID
+Ubuntu 24.04 restricts unprivileged user namespaces by default, so it also needs an AppArmor profile loaded on the host:
+
+```bash
+sudo scripts/docker-apparmor-setup.sh
+# Add the printed line to .env
+# DUDUCLAW_APPARMOR_PROFILE=duduclaw-userns
+docker compose up -d
 ```
+
+| Host | What to do | Tested |
+|---|---|---|
+| Docker Desktop | Update compose | arm64 |
+| Ubuntu 22.04 | Update compose | x64 |
+| Ubuntu 24.04 | Update compose, then run the script above | x64 |
+| Other Linux, NAS | Follow `duduclaw doctor` | No |
+
+`distribution/nas/docker-compose.yml` is image-only and ships no seccomp file, so it does not have these settings yet. If doctor reports the same problem after the update, the host has user namespaces disabled.
 
 ### OAuth state disappears after a container rebuild
 

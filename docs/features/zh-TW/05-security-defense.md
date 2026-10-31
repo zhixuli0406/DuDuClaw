@@ -142,7 +142,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 合法變更的既有路徑全部保留：MCP `agent_update` 工具與儀表板 `agents.update` RPC，兩者都不經過這個 hook。
 
-**Codex 員工控制檔（Unix、WorkspaceWrite）。** 一般員工執行時，除了既有沙箱模式，還會套用 `duduclaw-employee` 權限 profile，將員工目錄最上層的 `agent.toml`、`SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、`.mcp.json`、`.codex/`、`.grok/`、`.claude/`、`.agents/` 設為唯讀，尚未存在的路徑也不能建立。保護項目使用員工目錄的絕對路徑，工作根目錄被覆寫時仍有效。`MEMORY.md`、`CLAUDE.md`、一般工作檔與暫存檔維持可寫。需要 Codex CLI 0.164.0 以上；版本過舊、無法確認版本或缺少員工目錄時，拒絕啟動。版本探測以執行檔路徑快取。版本過舊或無法確認時，儀表板向 Admin 顯示一鍵更新提示；透過此按鈕更新後會清除支援快取並重新探測，不必重啟 gateway。若優先找到的仍是舊執行檔，會顯示其路徑，不會報成成功。設定仍可透過 `agent_update` 與儀表板修改。ReadOnly、明確授予的 FullAccess、探索與輔助路徑維持原有參數。這項控制檔鎖不涵蓋 Grok、其他 CLI runtime 與 Windows（未驗證）；其他 CLI runtime 除非開啟 `native_sandbox`，否則沒有 OS 沙箱。
+**Codex 員工控制檔（Unix、WorkspaceWrite）。** 一般員工執行時，除了既有沙箱模式，還會套用 `duduclaw-employee` 權限 profile，將員工目錄最上層的 `agent.toml`、`SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、`.mcp.json`、`.codex/`、`.grok/`、`.claude/`、`.agents/` 設為唯讀，尚未存在的路徑也不能建立。保護項目使用員工目錄的絕對路徑，工作根目錄被覆寫時仍有效。`MEMORY.md`、`CLAUDE.md`、一般工作檔與暫存檔維持可寫。需要 Codex CLI 0.164.0 以上；版本過舊、無法確認版本或缺少員工目錄時，拒絕啟動。版本探測以執行檔路徑快取。版本過舊或無法確認時，儀表板向 Admin 顯示一鍵更新提示；透過此按鈕更新後會清除支援快取並重新探測，不必重啟 gateway。若優先找到的仍是舊執行檔，會顯示其路徑，不會報成成功。設定仍可透過 `agent_update` 與儀表板修改。ReadOnly、明確授予的 FullAccess、探索與輔助路徑維持原有參數。這項控制檔鎖不涵蓋 Grok、其他 CLI runtime 與 Windows（未驗證）；其他 CLI runtime 除非開啟 `native_sandbox`，否則沒有 OS 沙箱。 Docker 部署需要目前版本的 compose 檔，它會套用窄版 seccomp、`apparmor=unconfined`、`no-new-privileges` 與 `cap_drop: ALL`；Ubuntu 24.04 還要在宿主機載入 AppArmor 設定檔。沙箱起不來時 shell 指令會失敗、檔案不會被改動，DuDuClaw 不會降低沙箱來繞過，`duduclaw doctor` 會回報原因。見 [docker.md](../../guides/zh-TW/docker.md)。
 
 ---
 

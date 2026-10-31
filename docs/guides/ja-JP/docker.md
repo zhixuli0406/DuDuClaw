@@ -361,7 +361,6 @@ claude auth status
 
 | パス | 用途 | 必要性 |
 |------|------|-------|
-| `/var/run/docker.sock` | コンテナがホストの Docker daemon を呼び出すために使用 | エージェント単位のタスクサンドボックスでのみ使用（デフォルトはオフ）。gateway 自体がコンテナ内で動く場合のタスクサンドボックスは [task-sandbox.md](task-sandbox.md) の対象外で、検証もされていません |
 
 ### 7.1 バックアップ
 
@@ -401,7 +400,6 @@ docker run --rm \
       - ./data/kiro:/home/duduclaw/.kiro
       - ./data/cursor:/home/duduclaw/.cursor
       - ./data/opencode:/home/duduclaw/.local/share/opencode
-      - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 ホスト側ディレクトリの**ownerはUID 1000でなければならない**点に注意してください（コンテナ内の `duduclaw` ユーザー）。
@@ -644,22 +642,38 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 
 ### タスクサンドボックスが起動しない
 
-これは `agent.toml [container] sandbox_enabled = true` のエージェントにのみ当てはまります。gateway 自体がコンテナ内で動く場合のタスクサンドボックスは対象外で、検証もされていません。サンドボックスイメージは、ソケットが指す Docker daemon 上に存在している必要があり、自動ダウンロードはされません（[task-sandbox.md](task-sandbox.md) を参照）。以下のコンテナ側の手順は、ソケットが使えるかどうかだけを確認します。
+これは `agent.toml [container] sandbox_enabled = true` の社員にのみ該当します。公式イメージは、コンテナ内の gateway からのタスクサンドボックスに対応していません。イメージに Docker client がなく、既定の compose も `docker.sock` をマウントしません。タスクサンドボックスが必要な場合は、gateway をホストにインストールしてください（[task-sandbox.md](task-sandbox.md) を参照）。
+
+### Codex 社員のシェルコマンドが実行できない
+
+Codex 社員のシェルは bubblewrap サンドボックス内で動くため、コンテナが user namespace を許可している必要があります。サンドボックスが起動できない場合、社員は会話と MCP ツールを引き続き使えますが、シェルコマンドはすべて失敗し、ファイルは変更されません。`duduclaw doctor` とダッシュボードの診断ページに「Codex 社員シェル」のチェックと次の手順が表示されます。
+
+まず compose ファイルを最新版に更新し、コンテナを再作成します。
 
 ```bash
-# コンテナ内からsocketが使えるかテストする
-docker compose exec duduclaw docker ps
-# ホスト上のcontainer一覧が見えるはず
+git pull
+docker compose up -d
 ```
 
-Permission deniedになる場合、多くはSELinux / AppArmorがブロックしています。Linuxでは以下を試してください。
+最新の compose ファイルは `container/seccomp-bwrap.json`、`apparmor=unconfined`、`no-new-privileges`、`cap_drop: ALL` を適用します。Watchtower はイメージしか更新しないため、この手順は手動です。
 
-```yaml
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:rw
-    group_add:
-      - "${DOCKER_GID:-999}"   # ホストのdocker group GIDに合わせる
+Ubuntu 24.04 は非特権 user namespace を既定で制限しているため、ホストに AppArmor プロファイルの読み込みも必要です。
+
+```bash
+sudo scripts/docker-apparmor-setup.sh
+# 表示された行を .env に追加する
+# DUDUCLAW_APPARMOR_PROFILE=duduclaw-userns
+docker compose up -d
 ```
+
+| ホスト | 必要な作業 | 検証状況 |
+|---|---|---|
+| Docker Desktop | compose を更新 | arm64 で検証済み |
+| Ubuntu 22.04 | compose を更新 | x64 で検証済み |
+| Ubuntu 24.04 | compose を更新し、上記のスクリプトを実行 | x64 で検証済み |
+| その他の Linux、NAS | `duduclaw doctor` の結果に従う | 未検証 |
+
+`distribution/nas/docker-compose.yml` はイメージのみを使い seccomp ファイルを含まないため、この compose にはまだこれらの設定がありません。更新後も doctor が同じ問題を報告する場合、ホストで user namespace が無効になっています。
 
 ### コンテナ再構築後にOAuth状態が消える
 
