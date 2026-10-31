@@ -146,6 +146,12 @@ impl Actor {
                 result = tokio::time::timeout(self.options.request_timeout,
                     tokio_tungstenite::connect_async_with_config(url.as_str(), Some(config), false)) => result,
             };
+            if let Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) = &opened
+                && response.status().as_u16() == 401
+            {
+                let _ = self.refresh.try_send(!self.refresh_attempted);
+                self.refresh_attempted = true;
+            }
             if let Ok(Ok((mut socket, _))) = opened {
                 let started = tokio::time::Instant::now();
                 let mut shutdown = self.shutdown.clone();
@@ -250,15 +256,18 @@ impl Actor {
                         Some(Ok(Message::Ping(bytes))) => {
                             if !send(socket, Message::Pong(bytes), self.options.request_timeout).await { return; }
                         }
-                        Some(Ok(Message::Close(close))) => {
-                            if close.is_some_and(|c| matches!(u16::from(c.code), 4001 | 1008)) {
-                                let _ = self.refresh.try_send(!self.refresh_attempted); self.refresh_attempted = true;
-                            }
+                        Some(Ok(Message::Close(_))) => {
+                            let _ = self.refresh.try_send(!self.refresh_attempted);
+                            self.refresh_attempted = true;
                             return;
                         }
                         Some(Ok(Message::Pong(_))) => {},
                         Some(Ok(_)) => {},
-                        _ => return,
+                        _ => {
+                            let _ = self.refresh.try_send(!self.refresh_attempted);
+                            self.refresh_attempted = true;
+                            return;
+                        }
                     }
                 }
             }

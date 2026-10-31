@@ -1,4 +1,6 @@
 //! Socket tests deliberately fail on bind refusal unless explicitly opted out.
+#[path = "mfa/mod.rs"]
+mod mfa;
 #[path = "decisions/mod.rs"]
 mod decisions;
 #[path = "m2/mod.rs"]
@@ -56,7 +58,9 @@ struct Fixture {
     chat_sent: std::sync::Mutex<Vec<Value>>,
     refreshed_connections: AtomicUsize,
     refreshes: AtomicUsize,
+    auth_steps: std::sync::Mutex<std::collections::VecDeque<mfa::Step>>,
     fail_refresh: AtomicBool,
+    reject_upgrade: AtomicBool,
     fail_version: AtomicBool,
     list_calls: AtomicUsize,
     list_delay_ms: AtomicU64,
@@ -105,7 +109,9 @@ impl Gateway {
             chat_sent: std::sync::Mutex::new(Vec::new()),
             refreshed_connections: AtomicUsize::new(0),
             refreshes: AtomicUsize::new(0),
+            auth_steps: std::sync::Mutex::new(std::collections::VecDeque::new()),
             fail_refresh: AtomicBool::new(false),
+            reject_upgrade: AtomicBool::new(false),
             fail_version: AtomicBool::new(false),
             list_calls: AtomicUsize::new(0),
             list_delay_ms: AtomicU64::new(0),
@@ -119,6 +125,10 @@ impl Gateway {
         let app = Router::new()
             .route("/api/session/local", post(local_session))
             .route("/api/refresh", post(refresh))
+            .route("/api/login", post(mfa::auth_step))
+            .route("/api/otp/request", post(mfa::auth_step))
+            .route("/api/otp/verify", post(mfa::auth_step))
+            .route("/api/mfa/verify", post(mfa::auth_step))
             .route("/ws", get(upgrade))
             .route("/ws/chat", get(chat::upgrade))
             .with_state(fixture.clone());
@@ -204,8 +214,11 @@ async fn refresh(
     }
     Json(json!({"access_token":token(3600,true)})).into_response()
 }
-async fn upgrade(ws: WebSocketUpgrade, State(f): State<Arc<Fixture>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| serve(socket, f))
+async fn upgrade(ws: WebSocketUpgrade, State(f): State<Arc<Fixture>>) -> axum::response::Response {
+    if f.reject_upgrade.load(Ordering::SeqCst) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    ws.on_upgrade(move |socket| serve(socket, f)).into_response()
 }
 async fn send(socket: &mut WebSocket, frame: WsFrame) -> bool {
     socket
@@ -607,4 +620,30 @@ async fn event_flood_is_bounded_and_oversized_frame_reconnects() {
     assert!(matches!(events.recv().await, Err(broadcast::error::RecvError::Lagged(_))));
     gateway.fixture.events.send(Control::Push(json!({"type":"event", "event":"future.event", "payload":{"blob":"x".repeat(duduclaw_tui::client::MAX_FRAME_BYTES + 1)}}))).unwrap();
     connected(&client, 2).await;
+}
+
+#[tokio::test]
+async fn retired_credential_close_or_http_401_stops_after_one_refresh() {
+    for reject_upgrade in [false, true] {
+        let Some(gateway) = Gateway::start(false).await else { return; };
+        gateway.fixture.fail_refresh.store(true, Ordering::SeqCst);
+        gateway.fixture.reject_upgrade.store(reject_upgrade, Ordering::SeqCst);
+        let client = gateway.client().await;
+        if !reject_upgrade {
+            connected(&client, 1).await;
+            gateway.fixture.events.send(Control::Close).unwrap();
+        }
+        let mut state = client.connection();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(*state.borrow_and_update(), ConnectionState::LoginRequired(Error::LoginRequired)) {
+                    return;
+                }
+                state.changed().await.unwrap();
+            }
+        }).await.expect("retired credential must require login");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(gateway.fixture.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(gateway.fixture.connections.load(Ordering::SeqCst), usize::from(!reject_upgrade));
+    }
 }
