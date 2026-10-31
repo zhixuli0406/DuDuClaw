@@ -60,7 +60,7 @@ impl MethodHandler {
         };
         let agent = agent.ok_or(KbError::PermissionDenied)?;
         let caller = crate::knowledge::dashboard_user(&fresh, dir.users.as_ref());
-        let readers = own::default_readers(dir.users.as_ref(), &agent_id, dir.personal);
+        let readers = own::default_readers(&self.home_dir, dir.users.as_ref(), &agent_id, dir.personal);
         if method == "knowledge.agent.data_sources" {
             let owns = fresh.has_agent_access(&agent_id, AccessLevel::Owner);
             let home = self.home_dir.clone();

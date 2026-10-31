@@ -351,15 +351,46 @@ async fn narrowed_context_keeps_admin_and_ordinary_bindings_and_does_not_write()
 }
 
 #[test]
-fn production_identity_sources_keep_the_restriction_boundary() {
+fn known_identity_sources_call_the_narrowing_helper() {
     for (source, boundary) in [
         (include_str!("../handlers/live_context.rs"), "return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()))"),
         (include_str!("../handlers/live_context.rs"), "Ok(crate::machine_employee::without_restricted_access(&self.home_dir, live))"),
         (include_str!("../review_evidence/audience.rs"), "Ok(crate::machine_employee::without_restricted_access(home, duduclaw_auth::UserContext {"),
+        (include_str!("../knowledge/principals.rs"), "crate::machine_employee::requires_admin_for_id(home, &agent)"),
+        (include_str!("../assign_schedule/manage.rs"), "crate::machine_employee::requires_admin_for_id(home, agent)"),
+        (include_str!("../recipient_guard.rs"), "crate::machine_employee::requires_admin_for_id(home, agent)"),
+        (include_str!("../computer_profiles/mod.rs"), "crate::machine_employee::restriction_known(home, agent)"),
         (include_str!("../team_oversight.rs"), "crate::machine_employee::live_user_context(home, db, &ctx.user_id)"),
         (include_str!("../server.rs"), "crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)"),
         (include_str!("../server.rs"), ".map(|ctx| crate::machine_employee::without_restricted_access(state.handler.home_dir(), ctx))"),
     ] {
         assert!(source.contains(boundary), "missing identity narrowing: {boundary}");
     }
+}
+
+#[tokio::test]
+async fn request_local_lookup_matches_individual_checks_and_parses_once() {
+    let f = fixture().await;
+    let ids = ["ordinary", "operator", "missing", "../operator"];
+    for malformed in [false, true] {
+        if malformed { std::fs::write(preset::bindings_path(f.home.path()), "not [ toml").unwrap(); }
+        assert_eq!(restriction_known(f.home.path(), "ordinary"), if malformed { None } else { Some(false) });
+        let mut ctx = f.employee.clone();
+        for id in ids {
+            ctx.agent_access.insert(id.into(), duduclaw_auth::AccessLevel::Owner);
+            ctx.team_access.insert(id.into(), duduclaw_auth::TeamGrant { level: AccessLevel::Operator, via_user: f.employee.user_id.clone(), depth: 1 });
+        }
+        let expected: Vec<_> = ids.iter().map(|id| !requires_admin_for_id(f.home.path(), id)).collect();
+        let narrowed = without_restricted_access(f.home.path(), ctx);
+        for (id, keep) in ids.iter().zip(expected) {
+            assert_eq!(narrowed.agent_access.contains_key(*id), keep, "{id}");
+            assert_eq!(narrowed.team_access.contains_key(*id), keep, "{id}");
+        }
+    }
+    let lookup = RestrictionLookup::new(f.home.path());
+    assert!(lookup.requires_admin("ordinary"));
+    // Once read, both direct and team grants use this call's snapshot.
+    std::fs::write(preset::bindings_path(f.home.path()), "schema = 1").unwrap();
+    assert!(lookup.requires_admin("ordinary"));
+    assert!(!requires_admin_for_id(f.home.path(), "ordinary"));
 }

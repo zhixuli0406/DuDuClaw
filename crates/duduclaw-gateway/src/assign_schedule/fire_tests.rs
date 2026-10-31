@@ -497,3 +497,35 @@ async fn a_non_admin_schedule_only_narrows_the_run_limit_and_it_reaches_the_goal
     let task = store.get_task(&report.created[0]).await.unwrap().unwrap();
     assert_eq!(task.timeout_secs, Some(120));
 }
+
+#[tokio::test]
+async fn old_task_and_goal_schedules_pause_after_restricted_preset_and_cannot_resume() {
+    use crate::assign_schedule::manage::{manage, ManageError};
+    use crate::assign_schedule::ManageAction;
+    use duduclaw_core::preset;
+    for kind in [AssignKind::Task, AssignKind::Goal] {
+        let (dir, reg) = home().await;
+        let h = dir.path();
+        let o = org(h);
+        let store = TaskStore::open(h).unwrap();
+        let creator = Creator::new(&o.mgr, false).unwrap();
+        let mut req = weekly_goal("old schedule");
+        req.kind = kind;
+        req.payload.title = "old task".into();
+        let row = create(h, &store, &creator, req, now()).await.unwrap();
+        preset::install_system_operator_preset(h, false).unwrap();
+        preset::bind(h, "sales-rep", &h.join("agents/sales-rep"), "system-operator", "test", "test").unwrap();
+        assert!(matches!(fire_one(h, &store, &reg, &row, at(MONDAY)).await, Fired::Paused));
+        let saved = store.get_assign_schedule(&row.id).await.unwrap().unwrap();
+        assert_eq!(saved.status, "paused");
+        assert_eq!(saved.pause_reason.as_deref(), Some("access_lost"));
+        assert_eq!(saved.fire_count, 0);
+        assert!(store.get_task(&task_id_for_slot(&row.id, MONDAY)).await.unwrap().is_none());
+        for actor in [&creator, &Creator::new(&o.admin, true).unwrap()] {
+            assert_eq!(manage(h, &store, actor, &row.id, ManageAction::Resume, now()).await.unwrap_err(), ManageError::CreatorLostAccess);
+        }
+        assert!(store.get_task(&task_id_for_slot(&row.id, MONDAY)).await.unwrap().is_none());
+        preset::unbind(h, "sales-rep", "test", "test").unwrap();
+        assert!(manage(h, &store, &creator, &row.id, ManageAction::Resume, now()).await.is_ok());
+    }
+}

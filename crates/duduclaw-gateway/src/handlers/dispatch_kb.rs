@@ -148,8 +148,9 @@ impl MethodHandler {
         }
         .ok_or(duduclaw_knowledge::KbError::PermissionDenied)?;
         let home = self.home_dir.clone();
+        let is_admin = ctx.is_admin();
         boxed_frame(|| crate::knowledge::blocking(move || {
-            crate::knowledge::agent_binding::describe(&home, &agent, &agent_dir).map(Some)
+            crate::knowledge::agent_binding::describe(&home, &agent, &agent_dir, is_admin).map(Some)
         }))
         .await
     }

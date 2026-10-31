@@ -50,11 +50,24 @@ pub fn granted_collections(home: &Path, agent: &AgentRef) -> KbResult<Vec<Collec
 /// is not necessarily a reader of these collections, so only what the
 /// binding editor needs goes out: id, code, name and sensitivity label —
 /// no description and no counts.
-pub fn describe(home: &Path, agent: &AgentRef, agent_dir: &Path) -> KbResult<Value> {
-    let granted = granted_collections(home, agent)?;
+pub fn describe(home: &Path, agent: &AgentRef, agent_dir: &Path, is_admin: bool) -> KbResult<Value> {
+    let conn = schema::open_home(home)?;
+    let granted: Vec<_> = granted_collections(home, agent)?.into_iter()
+        .filter(|c| super::principals::collection_visible(home, &conn, &c.collection.id, is_admin)).collect();
     let (bound, unreadable) = match knowledge_scope(agent_dir) {
         KnowledgeScope::All => (Value::Null, false),
-        KnowledgeScope::Only(list) => (json!(list), false),
+        KnowledgeScope::Only(list) => {
+            use rusqlite::OptionalExtension;
+            let list: Vec<_> = list.into_iter().filter(|slug| {
+                if is_admin { return true; }
+                match conn.query_row("SELECT id FROM collections WHERE slug=?1", [slug], |r| r.get::<_, String>(0)).optional() {
+                    Ok(Some(id)) => super::principals::collection_visible(home, &conn, &id, false),
+                    Ok(None) => true,
+                    Err(_) => false,
+                }
+            }).collect();
+            (json!(list), false)
+        },
         KnowledgeScope::Unreadable => (Value::Null, true),
     };
     let rows: Vec<Value> = granted

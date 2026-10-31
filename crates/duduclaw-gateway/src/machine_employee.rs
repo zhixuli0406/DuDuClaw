@@ -9,8 +9,9 @@ use duduclaw_core::preset::{self, PresetResolution};
 #[inline(never)]
 pub(crate) fn without_restricted_access(home: &Path, mut ctx: duduclaw_auth::UserContext) -> duduclaw_auth::UserContext {
     if ctx.is_admin() { return ctx; }
-    ctx.agent_access.retain(|id, _| !requires_admin_for_id(home, id));
-    ctx.team_access.retain(|id, _| !requires_admin_for_id(home, id));
+    let lookup = RestrictionLookup::new(home);
+    ctx.agent_access.retain(|id, _| !lookup.requires_admin(id));
+    ctx.team_access.retain(|id, _| !lookup.requires_admin(id));
     ctx
 }
 
@@ -40,41 +41,78 @@ pub(crate) fn requires_admin(agent: &LoadedAgent) -> bool {
 /// authoritative binding: an unresolved system-operator binding is restricted
 /// too. Unlike load_bindings, unreadable or malformed data must not be Unbound.
 pub(crate) fn requires_admin_for_id(home: &Path, agent_id: &str) -> bool {
-    if !duduclaw_core::is_valid_agent_id(agent_id) { return true; }
-    let dir = home.join("agents").join(agent_id);
-    match std::fs::read_dir(&dir) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return !matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
-        }
-        Err(_) => return true,
+    RestrictionLookup::new(home).requires_admin(agent_id)
+}
+
+/// Preserve unknown restriction state for callers that must refuse without mutation.
+pub(crate) fn restriction_known(home: &Path, agent_id: &str) -> Option<bool> {
+    RestrictionLookup::new(home).classify(agent_id)
+}
+
+/// Request-local binding snapshot, loaded lazily after the per-agent directory check.
+struct RestrictionLookup<'a> {
+    home: &'a Path,
+    bindings: std::cell::OnceCell<Result<Option<toml::Table>, ()>>,
+}
+
+impl<'a> RestrictionLookup<'a> {
+    fn new(home: &'a Path) -> Self {
+        Self { home, bindings: std::cell::OnceCell::new() }
     }
-    let Some(home) = preset::agent_home_dir(&dir) else { return true; };
-    let path = preset::bindings_path(&home);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return !matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+
+    fn read_bindings(&self) -> Result<Option<toml::Table>, ()> {
+        let path = preset::bindings_path(self.home);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return if matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                    Ok(None)
+                } else { Err(()) };
+            }
+            Err(_) => return Err(()),
+        };
+        let table = content.parse::<toml::Table>().map_err(|_| ())?;
+        if table.get("schema").is_some_and(|v| {
+            v.as_integer().is_none_or(|schema| schema > preset::PRESET_BINDINGS_SCHEMA)
+        }) { return Err(()); }
+        Ok(Some(table))
+    }
+
+    fn requires_admin(&self, agent_id: &str) -> bool {
+        self.classify(agent_id).unwrap_or(true)
+    }
+
+    fn classify(&self, agent_id: &str) -> Option<bool> {
+        if !duduclaw_core::is_valid_agent_id(agent_id) { return None; }
+        let dir = self.home.join("agents").join(agent_id);
+        match std::fs::read_dir(&dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return if matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                    Some(false)
+                } else { None };
+            }
+            Err(_) => return None,
         }
-        Err(_) => return true,
-    };
-    let Ok(table) = content.parse::<toml::Table>() else { return true; };
-    if table.get("schema").is_some_and(|v| {
-        v.as_integer().is_none_or(|schema| schema > preset::PRESET_BINDINGS_SCHEMA)
-    }) { return true; }
-    let agents = match table.get("agents") {
-        None => return false,
-        Some(value) => match value.as_table() {
-            Some(agents) => agents,
-            None => return true,
-        },
-    };
-    let Some(binding) = agents.get(agent_id) else { return false; };
-    let Some(preset_id) = binding.as_table()
-        .and_then(|b| b.get("preset_id")).and_then(toml::Value::as_str)
-        .filter(|id| !id.is_empty()) else { return true; };
-    preset_id == "system-operator"
-        && crate::on_behalf_of::access::system_operation_requires_admin(&home)
+        let table = match self.bindings.get_or_init(|| self.read_bindings()) {
+            Ok(Some(table)) => table,
+            Ok(None) => return Some(false),
+            Err(()) => return None,
+        };
+        let agents = match table.get("agents") {
+            None => return Some(false),
+            Some(value) => match value.as_table() {
+                Some(agents) => agents,
+                None => return None,
+            },
+        };
+        let Some(binding) = agents.get(agent_id) else { return Some(false); };
+        let Some(preset_id) = binding.as_table()
+            .and_then(|b| b.get("preset_id")).and_then(toml::Value::as_str)
+            .filter(|id| !id.is_empty()) else { return None; };
+        Some(preset_id == "system-operator"
+            && crate::on_behalf_of::access::system_operation_requires_admin(self.home))
+    }
 }
 
 pub(crate) fn check_loaded(home: &Path, agent: &LoadedAgent, principal: Option<&str>) -> Result<(), String> {

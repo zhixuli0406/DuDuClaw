@@ -14,7 +14,7 @@ use std::sync::Arc;
 use duduclaw_auth::db::UserDb;
 use duduclaw_core::knowledge_agent::{AnswerMode, RetrievalSettings};
 use duduclaw_knowledge::acl::{
-    AllowedSet, Narrowing, agent_side_collections, effective_collections,
+    AllowedSet, Narrowing, agent_side_collections,
 };
 use duduclaw_knowledge::audit::{AccessEntry, log_access};
 use duduclaw_knowledge::inject::{self, ChannelSettings, NumberedPassage};
@@ -134,7 +134,7 @@ pub(crate) fn prepare_blocking(
         &input.requester,
         super::user_directory(&input.home, input.users.as_ref()).as_ref(),
     );
-    let allowed = effective_collections(&conn, &human, Some(&agent), &Narrowing::default())?;
+    let allowed = super::principals::effective_collections(&input.home, &conn, &human, Some(&agent), &Narrowing::default())?;
     let allowed = injectable(&conn, &allowed)?;
     let mut out = TurnKnowledge {
         rules: true,
