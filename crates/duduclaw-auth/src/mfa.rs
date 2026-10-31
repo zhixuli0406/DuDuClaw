@@ -416,6 +416,21 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
+        self.mfa_confirm_and_issue(user, enrollment, code, cipher, now, |_, _, codes| Ok(codes))
+    }
+
+    /// Issue the replacement session while enrollment, recovery codes and epoch
+    /// are still uncommitted. An issuer error rolls back all of them.
+    /// The callback must not re-enter UserDb (the connection is locked).
+    pub fn mfa_confirm_and_issue<T>(
+        &self,
+        user: &str,
+        enrollment: Option<&str>,
+        code: &str,
+        cipher: &dyn MfaCipher,
+        now: i64,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
+    ) -> Result<T> {
         if enrollment.is_none() { return Err(DENIED.into()); }
         let mut conn = self.conn();
         let tx = conn
@@ -465,8 +480,9 @@ impl UserDb {
             .map_err(|e| e.to_string())?;
         bump_epoch(&tx, user)?;
         audit(&tx, user, "mfa.enrolled", None)?;
+        let result = issue_mfa_result(&tx, user, codes, issue)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(codes)
+        Ok(result)
     }
     pub fn mfa_verify(
         &self,
@@ -510,6 +526,20 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
+        self.mfa_change_and_issue(user, code, disable, cipher, now, |_, _, codes| Ok(codes))
+    }
+
+    /// As with enrollment, failed session issuance rolls back a disable,
+    /// including factor consumption and the credential epoch.
+    pub fn mfa_change_and_issue<T>(
+        &self,
+        user: &str,
+        code: &str,
+        disable: bool,
+        cipher: &dyn MfaCipher,
+        now: i64,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
+    ) -> Result<T> {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -536,8 +566,9 @@ impl UserDb {
             },
             None,
         )?;
+        let result = issue_mfa_result(&tx, user, codes, issue)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(codes)
+        Ok(result)
     }
     /// Host break-glass recovery for any account.
     /// The CLI must enforce its AI-session and Bash-lane guards before calling.
@@ -590,6 +621,17 @@ impl UserDb {
         tx.commit().map_err(|e| e.to_string())
     }
 }
+fn issue_mfa_result<T>(
+    tx: &Connection,
+    user: &str,
+    codes: Vec<String>,
+    issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
+) -> Result<T> {
+    let user = crate::user_row::load_user(tx, user)?.ok_or(DENIED)?;
+    let bindings = crate::org::direct_bindings(tx, &user.id)?.into_iter().collect::<Vec<_>>();
+    issue(&user, &bindings, codes)
+}
+
 fn bump_epoch(tx: &Connection, user: &str) -> Result<()> {
     tx.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [user]).map_err(|e|e.to_string())?;
     crate::user_row::bump_acl_generation(tx).map_err(|e|e.to_string())

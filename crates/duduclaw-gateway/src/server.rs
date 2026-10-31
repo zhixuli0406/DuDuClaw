@@ -15860,7 +15860,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     //   3. Appliance lock screen: credential-less, loopback, restricted
     //   4. No auth configured: admin fallback
 
-    let user_ctx: UserContext = if state.auth.is_auth_required() || has_users(&state.user_db) {
+    let mut user_ctx: UserContext = if state.auth.is_auth_required() || has_users(&state.user_db) {
         // Timeout auth handshake to prevent Slowloris-style resource exhaustion (BE-C4)
         let auth_timeout = std::time::Duration::from_secs(10);
         let result = match tokio::time::timeout(auth_timeout, socket.recv()).await {
@@ -16283,6 +16283,42 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
 
                         match frame {
                             WsFrame::Request { id, method, params } => {
+                                if server_mfa::is_session_handover(&method) {
+                                    // Keep commit -> rebind -> send in one socket turn. These
+                                    // local MFA operations do not call external services. A
+                                    // spawned response would let a heartbeat retire this
+                                    // connection after commit but before it could rebind.
+                                    let result = crate::mfa::ACCESS_EXPIRY.scope(access_expires,
+                                        crate::google_personal::DASHBOARD_SESSION.scope(
+                                            dashboard_session.clone(),
+                                            server_mfa::call_with_handover(&state, &method, params, &user_ctx, conn_info),
+                                        )).await;
+                                    if let Some(handover) = result.handover {
+                                        handover.apply(&mut user_ctx, &mut dashboard_session, &mut access_expires);
+                                        push_gate = crate::handlers::PushGate::new_with_legacy(
+                                            &state.home_dir, &user_ctx, pre_auth, legacy_admin_authenticated,
+                                        );
+                                    }
+                                    // Force a fresh read: a pre-commit cache hit belongs to
+                                    // the old epoch; another reset must still revoke us.
+                                    let validity = server_mfa::socket_validity(
+                                        &state, &user_ctx, access_expires, legacy_admin_authenticated, true,
+                                    ).await;
+                                    if !recovery.observe(validity, false) {
+                                        if recovery.closed() {
+                                            let _ = sink.send(Message::Close(None)).await;
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    let mut response = result.response;
+                                    if let WsFrame::Response { id: ref mut response_id, .. } = response {
+                                        *response_id = id;
+                                    }
+                                    let text = serde_json::to_string(&response).unwrap_or_default();
+                                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                                    continue;
+                                }
                                 let is_run_command = matches!(method.as_str(), "runs.subscribe" | "runs.unsubscribe");
                                 if is_run_command {
                                     if run_command_pending || !run_commands.command(conn_start.elapsed().as_millis() as u64) {

@@ -289,6 +289,13 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(done["recovery_codes"].as_array().unwrap().len(), 10);
     assert!(done["access_token"].is_string());
+    let access = state.jwt_config.verify_access_token(done["access_token"].as_str().unwrap()).unwrap();
+    let refresh = state.jwt_config.verify_refresh_token(done["refresh_token"].as_str().unwrap()).unwrap();
+    let epoch = state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch;
+    assert_eq!(access.credential_epoch, epoch);
+    assert_eq!(refresh.credential_epoch, epoch);
+    assert_eq!(access.jti, refresh.jti);
+    assert!(authenticate_jwt(&state, done["access_token"].as_str().unwrap()).is_ok());
     assert!(state.user_db.mfa_active(&user.id).unwrap());
     assert_eq!(
         enroll_confirm(
@@ -536,4 +543,90 @@ async fn mfa_live_socket_read_failure_pauses_recovers_and_retires_queued_output(
     }
     assert!(sent.is_empty());
     assert!(recovery.closed());
+}
+
+#[tokio::test]
+async fn mfa_rpc_enroll_confirm_and_disable_handover_preserves_only_calling_connection() {
+    use crate::handlers::live_context::SocketValidity;
+    use crate::power_local::RpcConnInfo;
+    let (_dir, state, user) = fixture(false, false).await;
+    let (access, mut refresh) = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
+    let claims = state.jwt_config.verify_access_token(&access).unwrap();
+    let mut ctx = authenticate_jwt(&state, &access).unwrap();
+    let mut expires = Some(claims.exp);
+    let mut dashboard_session = Some((user.id.clone(), claims.jti.unwrap()));
+    // A different login of the same user must never inherit the handover.
+    let other_access = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let other_ctx = authenticate_jwt(&state, &other_access).unwrap();
+    let begin = crate::google_personal::DASHBOARD_SESSION.scope(
+        dashboard_session.clone(), state.handler.handle("mfa.enroll_begin",
+            json!({"password":"correct horse battery"}), &ctx),
+    ).await;
+    let WsFrame::Response { ok: true, payload: Some(begin), .. } = begin else { panic!("enrollment begin failed") };
+    let params = json!({"enrollment_token":begin["enrollment_token"],"code":totp(begin["secret"].as_str().unwrap())});
+    let mut codes = Vec::new();
+    for (method, expected_epoch, n) in [("mfa.enroll_confirm", 1, 190), ("mfa.disable", 2, 191)] {
+        let old_ctx = ctx.clone();
+        let old_session = dashboard_session.clone();
+        // Prime the old-epoch cache. Handover must replace it even before its
+        // two-second expiry; heartbeats force a read after expiry as well.
+        assert_eq!(socket_validity(&state, &ctx, expires, false, true).await, SocketValidity::Valid);
+        let request = if expected_epoch == 1 { params.clone() } else { json!({"code":codes[0]}) };
+        let result = crate::mfa::ACCESS_EXPIRY.scope(expires,
+            crate::google_personal::DASHBOARD_SESSION.scope(dashboard_session.clone(),
+                call_with_handover(&state, method, request, &ctx, RpcConnInfo::internal()),
+            ),
+        ).await;
+        let WsFrame::Response { ok: true, payload: Some(payload), .. } = result.response else { panic!("MFA transition failed") };
+        let handover = result.handover.expect("successful transition must carry explicit handover");
+        handover.apply(&mut ctx, &mut dashboard_session, &mut expires);
+        assert_eq!(ctx.credential_epoch, expected_epoch);
+        assert_ne!(dashboard_session, old_session);
+        let claims = state.jwt_config.verify_access_token(payload["access_token"].as_str().unwrap()).unwrap();
+        assert_eq!(claims.credential_epoch, expected_epoch);
+        assert_eq!(dashboard_session.as_ref().unwrap().1, claims.jti.unwrap());
+        assert_eq!(expires, Some(claims.exp));
+        // The exact forced send gate used by the socket, the ordinary send
+        // gate, and the next heartbeat all accept the rebound connection.
+        for heartbeat in [true, false, true] {
+            assert_eq!(socket_validity(&state, &ctx, expires, false, heartbeat).await, SocketValidity::Valid);
+        }
+        assert_eq!(socket_validity(&state, &old_ctx, expires, false, true).await, SocketValidity::Revoked);
+        assert_eq!(socket_validity(&state, &other_ctx, expires, false, true).await, SocketValidity::Revoked);
+        assert_eq!(handle_refresh(State(state.clone()), ConnectInfo(peer(n)),
+            Json(RefreshRequest { refresh_token: refresh })).await.into_response().status(), StatusCode::UNAUTHORIZED);
+        refresh = payload["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(handle_refresh(State(state.clone()), ConnectInfo(peer(n)),
+            Json(RefreshRequest { refresh_token: refresh.clone() })).await.into_response().status(), StatusCode::OK);
+        assert_eq!(state.user_db.mfa_active(&user.id).unwrap(), expected_epoch == 1);
+        if expected_epoch == 1 {
+            codes = payload["recovery_codes"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect();
+            assert_eq!(codes.len(), 10);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mfa_rpc_handover_is_success_only_and_cannot_bypass_later_revocation() {
+    use crate::handlers::live_context::SocketValidity;
+    use crate::power_local::RpcConnInfo;
+    let (_dir, state, user) = fixture(false, false).await;
+    let codes = enroll(&state, &user);
+    let user = state.user_db.get_user(&user.id).unwrap().unwrap();
+    let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let mut ctx = authenticate_jwt(&state, &token).unwrap();
+    let mut session = None;
+    let mut expires = Some(u64::MAX);
+    let failed = call_with_handover(&state, "mfa.disable", json!({"code":"invalid"}), &ctx, RpcConnInfo::internal()).await;
+    assert!(matches!(failed.response, WsFrame::Response { ok: false, .. }));
+    assert!(failed.handover.is_none());
+    assert_eq!(state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch, ctx.credential_epoch);
+    let status = call_with_handover(&state, "mfa.status", json!({}), &ctx, RpcConnInfo::internal()).await;
+    assert!(matches!(status.response, WsFrame::Response { ok: true, .. }));
+    assert!(status.handover.is_none());
+    let result = call_with_handover(&state, "mfa.disable", json!({"code":codes[0]}), &ctx, RpcConnInfo::internal()).await;
+    // A second revocation after commit must not be overwritten by handover.
+    state.user_db.mfa_operator_reset(&user.email).unwrap();
+    result.handover.unwrap().apply(&mut ctx, &mut session, &mut expires);
+    assert_eq!(socket_validity(&state, &ctx, expires, false, true).await, SocketValidity::Revoked);
 }

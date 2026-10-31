@@ -37,6 +37,8 @@ impl MethodHandler {
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), &ctx.email) {
             return WsFrame::error_response("", "嘗試次數過多，請稍後再試。");
         }
+        let jwt = self.jwt_config.read().await.clone();
+        let previous_epoch = ctx.credential_epoch;
         let home = self.home_dir.clone();
         let id = ctx.user_id.clone();
         let method = method.to_owned();
@@ -74,13 +76,22 @@ impl MethodHandler {
                     let token=token?;
                     db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
                     if required { db.mfa_require_independent_proof(token,now)?; }
-                    Ok(json!({"enabled":true,"recovery_codes":db.mfa_confirm(&id,Some(token),code,&cipher,now)?}))
+                    let jwt = jwt.as_ref().ok_or("登入服務無法使用。")?;
+                    db.mfa_confirm_and_issue(&id, Some(token), code, &cipher, now, |user, access, codes| {
+                        crate::mfa::replacement_session(jwt, user, access, previous_epoch, codes, true)
+                    })
                 }
                 "mfa.disable" | "mfa.recovery_regenerate" => {
                     if method=="mfa.disable" && required { return Err("管理員已要求雙因素驗證，無法停用。".into()); }
                     let code=params.get("code").and_then(Value::as_str).unwrap_or("");
-                    let codes=db.mfa_change(&id,code,method=="mfa.disable",&cipher,now)?;
-                    Ok(if method=="mfa.disable" {json!({"enabled":false})} else {json!({"recovery_codes":codes})})
+                    if method == "mfa.disable" {
+                        let jwt = jwt.as_ref().ok_or("登入服務無法使用。")?;
+                        db.mfa_change_and_issue(&id, code, true, &cipher, now, |user, access, codes| {
+                            crate::mfa::replacement_session(jwt, user, access, previous_epoch, codes, false)
+                        })
+                    } else {
+                        Ok(json!({"recovery_codes": db.mfa_change(&id, code, false, &cipher, now)?}))
+                    }
                 }
                 "users.mfa_reset"=> {
                     let target=params.get("user_id").and_then(Value::as_str).ok_or("請指定帳號。")?;

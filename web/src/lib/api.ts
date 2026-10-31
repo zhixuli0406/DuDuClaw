@@ -320,6 +320,7 @@ export interface DoctorCheck {
 export type EditionProfile = 'personal' | 'enterprise';
 
 export interface SystemStatus {
+  mfa_policy?: import('./mfa-api').MfaPolicy;
   version: string;
   uptime_seconds: number;
   agents_count: number;

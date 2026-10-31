@@ -1,3 +1,4 @@
+import { AccountMfa } from '@/components/mfa/AccountMfa';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useLocation, useNavigate } from 'react-router';
@@ -140,6 +141,7 @@ export function AccountTab() {
 
   return (
     <div className="space-y-8">
+      <AccountMfa />
       {mustChangePassword && (
         <div
           role="status"

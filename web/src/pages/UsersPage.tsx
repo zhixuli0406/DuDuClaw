@@ -1,3 +1,4 @@
+import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type UserDetail } from '@/lib/api';
@@ -123,6 +124,7 @@ export function UsersPage() {
       </div>
 
       <OrgHistorySettings />
+      <AdminMfa />
 
       {fetchError && (
         <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">

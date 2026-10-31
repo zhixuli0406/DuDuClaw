@@ -122,6 +122,26 @@ pub(crate) fn enrollment_payload(secret: String, email: &str) -> Value {
     json!({"secret":secret,"otpauth_uri":format!("otpauth://totp/{label}?secret={secret}&issuer=DuDuClaw&algorithm=SHA1&digits=6&period=30")})
 }
 
+/// Called inside the MFA write transaction. No token-issuance failure can
+/// commit enrollment without its recovery codes or commit a partial disable.
+pub(crate) fn replacement_session(
+    jwt: &duduclaw_auth::JwtConfig,
+    user: &duduclaw_auth::User,
+    access: &[(String, duduclaw_auth::AccessLevel)],
+    previous_epoch: u64,
+    codes: Vec<String>,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    if previous_epoch.checked_add(1) != Some(user.credential_epoch) {
+        return Err("登入憑證已失效，請重新登入。".into());
+    }
+    let (access_token, refresh_token) = jwt.issue_session_tokens(user, access)?;
+    Ok(serde_json::json!({
+        "enabled": enabled, "recovery_codes": codes,
+        "access_token": access_token, "refresh_token": refresh_token, "user": user,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

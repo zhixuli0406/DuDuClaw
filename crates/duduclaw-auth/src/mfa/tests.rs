@@ -405,3 +405,63 @@ fn mfa_channel_binding_must_predate_enforcement_and_rebinding_resets_time() {
     record_enforcement(&mut db.conn(),false,since+200).unwrap();
     assert_eq!(record_enforcement(&mut db.conn(),true,since+300).unwrap(),Some(since+300));
 }
+
+#[test]
+fn mfa_enrollment_session_issue_failure_rolls_back_codes_epoch_and_challenge() {
+    let (_dir, db, id) = setup();
+    let token = db.mfa_password_challenge(&id, "password-test", "session", 3000).unwrap();
+    db.mfa_prepare_enrollment(&token, false, 3000).unwrap();
+    let secret = db.mfa_begin(&id, Some(&token), &Cipher, 3000).unwrap();
+    let code = hotp(&decode_secret(&secret).unwrap(), 100, 6);
+    let generation = db.acl_generation().unwrap();
+    let result: Result<()> = db.mfa_confirm_and_issue(
+        &id, Some(&token), &code, &Cipher, 3000, |user, _, codes| {
+            assert_eq!(user.credential_epoch, 1);
+            assert_eq!(codes.len(), 10);
+            Err("injected token issuer failure".into())
+        },
+    );
+    assert_eq!(result.unwrap_err(), "injected token issuer failure");
+    assert!(!db.mfa_active(&id).unwrap());
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch, 0);
+    assert_eq!(db.acl_generation().unwrap(), generation);
+    assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM mfa_recovery_codes", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    // The same pending secret, challenge and TOTP remain usable after rollback.
+    let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
+    let (codes, tokens) = db.mfa_confirm_and_issue(
+        &id, Some(&token), &code, &Cipher, 3000, |user, access, codes| {
+            Ok((codes, jwt.issue_session_tokens(user, access)?))
+        },
+    ).unwrap();
+    assert_eq!(codes.len(), 10);
+    assert!(db.mfa_active(&id).unwrap());
+    assert_eq!(jwt.verify_access_token(&tokens.0).unwrap().credential_epoch, 1);
+    assert_eq!(jwt.verify_refresh_token(&tokens.1).unwrap().credential_epoch, 1);
+}
+
+#[test]
+fn mfa_disable_session_issue_failure_rolls_back_factor_and_epoch() {
+    let (_dir, db, id) = setup();
+    let (_, codes) = enroll(&db, &id);
+    let generation = db.acl_generation().unwrap();
+    let result: Result<()> = db.mfa_change_and_issue(
+        &id, &codes[0], true, &Cipher, 3030, |user, _, codes| {
+            assert_eq!(user.credential_epoch, 2);
+            assert!(codes.is_empty());
+            Err("injected token issuer failure".into())
+        },
+    );
+    assert!(result.is_err());
+    assert!(db.mfa_active(&id).unwrap());
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch, 1);
+    assert_eq!(db.acl_generation().unwrap(), generation);
+    // A failed issuer must not consume the submitted recovery code.
+    let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
+    let tokens = db.mfa_change_and_issue(
+        &id, &codes[0], true, &Cipher, 3030,
+        |user, access, _| jwt.issue_session_tokens(user, access),
+    ).unwrap();
+    assert!(!db.mfa_active(&id).unwrap());
+    assert_eq!(jwt.verify_access_token(&tokens.0).unwrap().credential_epoch, 2);
+    assert_eq!(jwt.verify_refresh_token(&tokens.1).unwrap().credential_epoch, 2);
+}
