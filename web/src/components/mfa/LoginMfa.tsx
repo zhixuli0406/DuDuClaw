@@ -14,10 +14,12 @@ export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: Login
   const [error, setError] = useState('');
   const session = useRef<SessionTokens | null>(null);
   const active = useRef(true);
+  const attempt = useRef(useAuthStore.getState().authAttempt);
   useEffect(() => { active.current = true; return () => { active.current = false; session.current = null; }; }, []);
   const finish = async (tokens: SessionTokens) => {
-    await useAuthStore.getState().establishSession(tokens);
-    if (active.current) onComplete();
+    if (!active.current || attempt.current !== useAuthStore.getState().authAttempt) return;
+    const established = await useAuthStore.getState().establishSession(tokens, attempt.current, () => active.current);
+    if (established !== false && active.current && attempt.current === useAuthStore.getState().authAttempt) onComplete();
   };
   const verify = async (e: FormEvent) => {
     e.preventDefault();

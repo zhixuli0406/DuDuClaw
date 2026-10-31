@@ -28,7 +28,7 @@ export const mfaApi = {
   begin: (input: EnrollmentInput) => client.call('mfa.enroll_begin', { ...input }) as Promise<Enrollment>,
   confirm: (input: EnrollmentInput) => client.call('mfa.enroll_confirm', { ...input }) as Promise<RecoveryResult & SessionTokens>,
   regenerate: (code: string) => client.call('mfa.recovery_regenerate', { code }) as Promise<RecoveryResult>,
-  disable: (code: string) => client.call('mfa.disable', { code }) as Promise<{ enabled: false } & SessionTokens>,
+  disable: (code: string, password: string) => client.call('mfa.disable', { code, password }) as Promise<{ enabled: false } & SessionTokens>,
   overview: () => client.call('mfa.overview') as Promise<MfaOverview>,
   reset: (actor: string, user_id: string, code: string) => {
     if (actor === user_id) return Promise.reject(new Error('MFA_SELF_RESET'));

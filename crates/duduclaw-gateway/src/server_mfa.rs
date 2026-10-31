@@ -312,6 +312,7 @@ async fn enroll(
                 body.code.as_deref().unwrap_or(""),
                 &cipher,
                 now,
+                personal,
                 |user, access, codes| crate::mfa::replacement_session(
                     &work.jwt_config, user, access, epoch, codes, true,
                 ),

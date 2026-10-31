@@ -948,9 +948,22 @@ impl MethodHandler {
         let security_change = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))).is_some();
         let db = self.user_db.read().await.clone();
         let actor = ctx.user_id.clone();
+        let config_path_for_guard = config_path.clone();
+        let expected_state = params.get("expected_state").and_then(Value::as_bool);
         if let Err(e) =
             super::config_commit::commit_table_locked_with_guard(&config_path, original_hash, &table, move || {
-                if security_change { crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?; }
+                if security_change {
+                    crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?;
+                    let expected = expected_state
+                        .ok_or("請重新整理並確認目前的雙因素驗證設定。")?;
+                    // This read is inside the config lock, after the file hash CAS.
+                    let current = super::config_commit::read_text_or_empty(&config_path_for_guard)?;
+                    let current: toml::Table = current.parse().map_err(|_| "登入設定格式不正確。")?;
+                    let actual = super::config_commit::toml_at(&current, "auth.mfa_enforced")
+                        .map(|v| v.as_bool().ok_or("雙因素驗證設定必須是布林值。"))
+                        .transpose()?.unwrap_or(false);
+                    if actual != expected { return Err("雙因素驗證設定已變更，請重新整理後再確認。".into()); }
+                }
                 Ok(())
             }).await
         {

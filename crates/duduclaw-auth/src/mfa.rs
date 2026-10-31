@@ -87,6 +87,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// Read under the same immediate transaction as the credential mutation.
+fn policy_enforced(conn: &Connection) -> Result<bool> {
+    conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0))
+        .optional().map(|v| v.unwrap_or(false)).map_err(|e| e.to_string())
+}
+
 /// Persist the observed policy transition; timestamps are Unix microseconds.
 /// A restart/reload of true preserves the original boundary.
 pub fn record_enforcement(conn: &mut Connection, enforced: bool, now: i64) -> Result<Option<i64>> {
@@ -416,12 +422,13 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
-        self.mfa_confirm_and_issue(user, enrollment, code, cipher, now, |_, _, codes| Ok(codes))
+        self.mfa_confirm_and_issue(user, enrollment, code, cipher, now, false, |_, _, codes| Ok(codes))
     }
 
     /// Issue the replacement session while enrollment, recovery codes and epoch
     /// are still uncommitted. An issuer error rolls back all of them.
     /// The callback must not re-enter UserDb (the connection is locked).
+    /// `policy_exempt` is only for the installation-owned Personal edition.
     pub fn mfa_confirm_and_issue<T>(
         &self,
         user: &str,
@@ -429,6 +436,7 @@ impl UserDb {
         code: &str,
         cipher: &dyn MfaCipher,
         now: i64,
+        policy_exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
         if enrollment.is_none() { return Err(DENIED.into()); }
@@ -437,6 +445,9 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
+        if !policy_exempt && policy_enforced(&tx)? {
+            enrollment::require_independent_proof(&tx, enrollment.ok_or(DENIED)?, now)?;
+        }
         if let Some(token) = enrollment {
             if challenge_user(&tx, token, "enroll", now)? != user || !proof_verified(&tx, token)? {
                 return Err(DENIED.into());
@@ -526,11 +537,12 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
-        self.mfa_change_and_issue(user, code, disable, cipher, now, |_, _, codes| Ok(codes))
+        self.mfa_change_and_issue(user, code, disable, cipher, now, false, |_, _, codes| Ok(codes))
     }
 
     /// As with enrollment, failed session issuance rolls back a disable,
     /// including factor consumption and the credential epoch.
+    /// `policy_exempt` is only for the installation-owned Personal edition.
     pub fn mfa_change_and_issue<T>(
         &self,
         user: &str,
@@ -538,6 +550,7 @@ impl UserDb {
         disable: bool,
         cipher: &dyn MfaCipher,
         now: i64,
+        policy_exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.conn();
@@ -545,6 +558,9 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
+        if disable && !policy_exempt && policy_enforced(&tx)? {
+            return Err("管理員已要求雙因素驗證，無法停用。".into());
+        }
         if check_factor(&tx, user, code, code.len() != 6, cipher, now).is_err() {
             audit(&tx, user, "mfa.verification_failed", None)?;
             tx.commit().map_err(|e| e.to_string())?;

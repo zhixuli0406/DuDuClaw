@@ -415,7 +415,7 @@ fn mfa_enrollment_session_issue_failure_rolls_back_codes_epoch_and_challenge() {
     let code = hotp(&decode_secret(&secret).unwrap(), 100, 6);
     let generation = db.acl_generation().unwrap();
     let result: Result<()> = db.mfa_confirm_and_issue(
-        &id, Some(&token), &code, &Cipher, 3000, |user, _, codes| {
+        &id, Some(&token), &code, &Cipher, 3000, false, |user, _, codes| {
             assert_eq!(user.credential_epoch, 1);
             assert_eq!(codes.len(), 10);
             Err("injected token issuer failure".into())
@@ -429,7 +429,7 @@ fn mfa_enrollment_session_issue_failure_rolls_back_codes_epoch_and_challenge() {
     // The same pending secret, challenge and TOTP remain usable after rollback.
     let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
     let (codes, tokens) = db.mfa_confirm_and_issue(
-        &id, Some(&token), &code, &Cipher, 3000, |user, access, codes| {
+        &id, Some(&token), &code, &Cipher, 3000, false, |user, access, codes| {
             Ok((codes, jwt.issue_session_tokens(user, access)?))
         },
     ).unwrap();
@@ -445,7 +445,7 @@ fn mfa_disable_session_issue_failure_rolls_back_factor_and_epoch() {
     let (_, codes) = enroll(&db, &id);
     let generation = db.acl_generation().unwrap();
     let result: Result<()> = db.mfa_change_and_issue(
-        &id, &codes[0], true, &Cipher, 3030, |user, _, codes| {
+        &id, &codes[0], true, &Cipher, 3030, false, |user, _, codes| {
             assert_eq!(user.credential_epoch, 2);
             assert!(codes.is_empty());
             Err("injected token issuer failure".into())
@@ -458,10 +458,62 @@ fn mfa_disable_session_issue_failure_rolls_back_factor_and_epoch() {
     // A failed issuer must not consume the submitted recovery code.
     let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
     let tokens = db.mfa_change_and_issue(
-        &id, &codes[0], true, &Cipher, 3030,
+        &id, &codes[0], true, &Cipher, 3030, false,
         |user, access, _| jwt.issue_session_tokens(user, access),
     ).unwrap();
     assert!(!db.mfa_active(&id).unwrap());
     assert_eq!(jwt.verify_access_token(&tokens.0).unwrap().credential_epoch, 2);
     assert_eq!(jwt.verify_refresh_token(&tokens.1).unwrap().credential_epoch, 2);
+}
+
+#[test]
+fn mfa_policy_toggle_serializes_with_enrollment_and_disable() {
+    // Both requests observed enforcement off before another connection enables it.
+    // The immediate write transaction must see the newer committed policy.
+    for disable in [false, true] {
+        let (dir, db, id) = setup();
+        record_enforcement(&mut db.conn(), false, 3000).unwrap();
+        let (token, code) = if disable {
+            let (_, codes) = enroll(&db, &id);
+            (String::new(), codes[0].clone())
+        } else {
+            let token = db.mfa_password_challenge(&id, "password-test", "session", 3000).unwrap();
+            db.mfa_prepare_enrollment(&token, false, 3000).unwrap();
+            let secret = db.mfa_begin(&id, Some(&token), &Cipher, 3000).unwrap();
+            (token, hotp(&decode_secret(&secret).unwrap(), 100, 6))
+        };
+        let worker_db = UserDb::new(&dir.path().join("users.db")).unwrap();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker_id = id.clone();
+        let worker_code = code.clone();
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            assert!(!policy_enforced(&worker_db.conn()).unwrap());
+            observed_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            if disable {
+                worker_db.mfa_change(&worker_id, &worker_code, true, &Cipher, 3000)
+            } else {
+                worker_db.mfa_confirm(&worker_id, Some(&worker_token), &worker_code, &Cipher, 3000)
+            }
+        });
+        observed_rx.recv().unwrap();
+        record_enforcement(&mut db.conn(), true, 3001).unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(db.mfa_active(&id).unwrap(), disable);
+        assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch, u64::from(disable));
+        // Turning enforcement off permits the same legitimate operation.
+        record_enforcement(&mut db.conn(), false, 3002).unwrap();
+        if disable {
+            let stored: i64 = db.conn().query_row("SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id=?1", [&id], |r| r.get(0)).unwrap();
+            assert_eq!(stored, 10);
+            db.mfa_change(&id, &code, true, &Cipher, 3000).unwrap();
+        } else {
+            assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM mfa_pending WHERE user_id=?1", [&id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            db.mfa_confirm(&id, Some(&token), &code, &Cipher, 3000).unwrap();
+        }
+        assert_eq!(db.mfa_active(&id).unwrap(), !disable);
+    }
 }

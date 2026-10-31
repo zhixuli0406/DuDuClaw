@@ -18,7 +18,7 @@ async fn fixture(
     let db = Arc::new(UserDb::new(&home.join("users.db")).unwrap());
     let user = db
         .create_user(
-            "mfa@example.test",
+            &format!("mfa-{}@example.test", uuid::Uuid::new_v4()),
             "MFA",
             "correct horse battery",
             UserRole::Admin,
@@ -68,7 +68,7 @@ async fn login(state: &Arc<AppState>, n: u8) -> (StatusCode, Value) {
             State(state.clone()),
             ConnectInfo(peer(n)),
             Json(LoginRequest {
-                email: "mfa@example.test".into(),
+                email: state.user_db.list_users().unwrap().into_iter().find(|u| u.display_name == "MFA").unwrap().email,
                 password: "correct horse battery".into(),
             }),
         )
@@ -188,7 +188,7 @@ async fn mfa_password_and_channel_otp_return_no_token_in_entire_body() {
 #[tokio::test]
 async fn mfa_enforcement_off_preserves_login_response_and_personal_ignores_on() {
     for (personal, enforce, n) in [(false, false, 182), (true, true, 183)] {
-        let (_dir, state, _) = fixture(personal, enforce).await;
+        let (_dir, state, user) = fixture(personal, enforce).await;
         let (status, response) = login(&state, n).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -202,7 +202,7 @@ async fn mfa_enforcement_off_preserves_login_response_and_personal_ignores_on() 
         );
         assert!(response["access_token"].is_string());
         assert!(response["refresh_token"].is_string());
-        assert_eq!(response["user"]["email"], "mfa@example.test");
+        assert_eq!(response["user"]["email"], user.email);
         assert!(response["user"].get("credential_epoch").is_none());
         let claims=state.jwt_config.verify_access_token(response["access_token"].as_str().unwrap()).unwrap();
         assert!(serde_json::to_value(claims).unwrap().get("credential_epoch").is_none());
@@ -381,7 +381,7 @@ async fn mfa_rpc_permissions_fresh_admin_and_unknown_method_denied() {
             .handler
             .handle(
                 "system.update_config",
-                json!({"auth.mfa_enforced":true}),
+                json!({"auth.mfa_enforced":true,"expected_state":false}),
                 &forged
             )
             .await,
@@ -404,7 +404,7 @@ async fn mfa_rpc_permissions_fresh_admin_and_unknown_method_denied() {
             .handler
             .handle(
                 "system.update_config",
-                json!({"auth.mfa_enforced":true}),
+                json!({"auth.mfa_enforced":true,"expected_state":false}),
                 &admin
             )
             .await,
@@ -571,7 +571,7 @@ async fn mfa_rpc_enroll_confirm_and_disable_handover_preserves_only_calling_conn
         // Prime the old-epoch cache. Handover must replace it even before its
         // two-second expiry; heartbeats force a read after expiry as well.
         assert_eq!(socket_validity(&state, &ctx, expires, false, true).await, SocketValidity::Valid);
-        let request = if expected_epoch == 1 { params.clone() } else { json!({"code":codes[0]}) };
+        let request = if expected_epoch == 1 { params.clone() } else { json!({"code":codes[0],"password":"correct horse battery"}) };
         let result = crate::mfa::ACCESS_EXPIRY.scope(expires,
             crate::google_personal::DASHBOARD_SESSION.scope(dashboard_session.clone(),
                 call_with_handover(&state, method, request, &ctx, RpcConnInfo::internal()),
@@ -617,16 +617,96 @@ async fn mfa_rpc_handover_is_success_only_and_cannot_bypass_later_revocation() {
     let mut ctx = authenticate_jwt(&state, &token).unwrap();
     let mut session = None;
     let mut expires = Some(u64::MAX);
-    let failed = call_with_handover(&state, "mfa.disable", json!({"code":"invalid"}), &ctx, RpcConnInfo::internal()).await;
+    let failed = call_with_handover(&state, "mfa.disable", json!({"code":"invalid","password":"correct horse battery"}), &ctx, RpcConnInfo::internal()).await;
     assert!(matches!(failed.response, WsFrame::Response { ok: false, .. }));
     assert!(failed.handover.is_none());
     assert_eq!(state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch, ctx.credential_epoch);
     let status = call_with_handover(&state, "mfa.status", json!({}), &ctx, RpcConnInfo::internal()).await;
     assert!(matches!(status.response, WsFrame::Response { ok: true, .. }));
     assert!(status.handover.is_none());
-    let result = call_with_handover(&state, "mfa.disable", json!({"code":codes[0]}), &ctx, RpcConnInfo::internal()).await;
+    let result = call_with_handover(&state, "mfa.disable", json!({"code":codes[0],"password":"correct horse battery"}), &ctx, RpcConnInfo::internal()).await;
     // A second revocation after commit must not be overwritten by handover.
     state.user_db.mfa_operator_reset(&user.email).unwrap();
     result.handover.unwrap().apply(&mut ctx, &mut session, &mut expires);
     assert_eq!(socket_validity(&state, &ctx, expires, false, true).await, SocketValidity::Revoked);
+}
+
+#[tokio::test]
+async fn mfa_policy_switch_rejects_stale_or_missing_expected_state() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let mut ctx = UserContext::admin_fallback();
+    ctx.user_id = user.id.clone();
+    for expected in [json!(null), json!(true), json!("false")] {
+        let response = state.handler.handle("system.update_config",
+            json!({"auth.mfa_enforced":true,"expected_state":expected}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+        assert!(!enforced(&state.home_dir, false).unwrap());
+    }
+    let response = state.handler.handle("system.update_config",
+        json!({"auth.mfa_enforced":true,"expected_state":false}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    let response = state.handler.handle("system.update_config",
+        json!({"auth.mfa_enforced":false,"expected_state":false}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    assert!(enforced(&state.home_dir, false).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_disable_requires_fresh_password_without_consuming_factor_on_failure() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let codes = enroll(&state, &user);
+    let user = state.user_db.get_user(&user.id).unwrap().unwrap();
+    let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let ctx = authenticate_jwt(&state, &token).unwrap();
+    for password in [json!(null), json!("incorrect")] {
+        let response = state.handler.handle("mfa.disable",
+            json!({"code":codes[0],"password":password}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+        assert!(state.user_db.mfa_active(&user.id).unwrap());
+        assert_eq!(state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch, user.credential_epoch);
+    }
+    let response = state.handler.handle("mfa.disable",
+        json!({"code":codes[0],"password":"correct horse battery"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    assert!(!state.user_db.mfa_active(&user.id).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_disable_password_attempts_share_enrollment_rate_limit() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let codes = enroll(&state, &user);
+    let user = state.user_db.get_user(&user.id).unwrap().unwrap();
+    let access = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let ctx = authenticate_jwt(&state, &access).unwrap();
+    for _ in 0..5 {
+        let response = state.handler.handle("mfa.disable", json!({"code":codes[0]}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    }
+    for method in ["mfa.disable", "mfa.enroll_begin"] {
+        let response = crate::google_personal::DASHBOARD_SESSION.scope(
+            Some((user.id.clone(), uuid::Uuid::new_v4().to_string())),
+            state.handler.handle(method, json!({"code":codes[0],"password":"correct horse battery"}), &ctx),
+        ).await;
+        let WsFrame::Response { ok: false, error: Some(error), .. } = response else { panic!("rate limit was bypassed") };
+        assert!(error.as_str().unwrap().contains("嘗試次數過多"));
+    }
+    assert!(state.user_db.mfa_active(&user.id).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_personal_self_service_ignores_enterprise_enforcement() {
+    let (_dir, state, user) = fixture(true, true).await;
+    let access = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let ctx = authenticate_jwt(&state, &access).unwrap();
+    let session = Some((user.id.clone(), uuid::Uuid::new_v4().to_string()));
+    let begin = crate::google_personal::DASHBOARD_SESSION.scope(session.clone(),
+        state.handler.handle("mfa.enroll_begin", json!({"password":"correct horse battery"}), &ctx)).await;
+    let WsFrame::Response { ok: true, payload: Some(begin), .. } = begin else { panic!("begin failed") };
+    let confirm = crate::google_personal::DASHBOARD_SESSION.scope(session,
+        state.handler.handle("mfa.enroll_confirm", json!({"enrollment_token":begin["enrollment_token"],"code":totp(begin["secret"].as_str().unwrap())}), &ctx)).await;
+    let WsFrame::Response { ok: true, payload: Some(confirm), .. } = confirm else { panic!("confirm failed") };
+    let ctx = authenticate_jwt(&state, confirm["access_token"].as_str().unwrap()).unwrap();
+    let response = state.handler.handle("mfa.disable", json!({"password":"correct horse battery","code":confirm["recovery_codes"][0]}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    assert!(!state.user_db.mfa_active(&user.id).unwrap());
 }

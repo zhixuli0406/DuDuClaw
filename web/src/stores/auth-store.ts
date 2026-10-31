@@ -35,9 +35,10 @@ interface AuthStore {
   readonly initialized: boolean;
   readonly bindings: AgentBinding[];
   readonly loading: boolean;
+  readonly authAttempt: number;
 
   login: (email: string, password: string) => Promise<LoginResult>;
-  establishSession: (tokens: SessionTokens) => Promise<void>;
+  establishSession: (tokens: SessionTokens, attempt?: number, isActive?: () => boolean) => Promise<boolean>;
   /** The MFA RPC has already rebound this socket; keep the mounted route. */
   replaceSessionTokens: (tokens: SessionTokens, previousRefreshToken: string | null) => void;
   /** Passwordless login step 1: ask the gateway to DM a code. Returns the
@@ -251,13 +252,17 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   initialized: false,
   bindings: [],
   loading: false,
+  authAttempt: 0,
 
-  establishSession: async (data) => {
+  establishSession: async (data, attempt = get().authAttempt, isActive = () => true) => {
+    if (attempt !== get().authAttempt || !isActive()) return false;
     const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>('/api/me', data.access_token);
+    if (attempt !== get().authAttempt || !isActive()) return false;
     refreshTokenStorage.set(data.refresh_token);
     set({ user: me.user, jwt: data.access_token, refreshToken: data.refresh_token,
       isAuthenticated: true, initialized: true, bindings: me.bindings });
     startRefreshTimer(get().refresh);
+    return true;
   },
 
   replaceSessionTokens: (data, previousRefreshToken) => {
@@ -274,15 +279,18 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   login: async (email, password) => {
-    set({ loading: true });
+    const attempt = get().authAttempt + 1;
+    set({ loading: true, authAttempt: attempt });
     try {
       const data = await apiPost<SessionTokens | LoginChallenge>('/api/login', { email, password });
+      if (attempt !== get().authAttempt) return;
       if ('mfa_required' in data || 'mfa_enrollment_required' in data) return data;
-      await get().establishSession(data);
-    } finally { set({ loading: false }); }
+      await get().establishSession(data, attempt);
+    } finally { if (attempt === get().authAttempt) set({ loading: false }); }
   },
 
   otpRequest: async (email: string) => {
+    set({ authAttempt: get().authAttempt + 1 });
     const data = await apiPost<{ challenge_id: string; sent: boolean; hint?: string }>(
       '/api/otp/request',
       { email },
@@ -291,17 +299,21 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   otpVerify: async (challengeId, code) => {
-    set({ loading: true });
+    const attempt = get().authAttempt + 1;
+    set({ loading: true, authAttempt: attempt });
     try {
       const data = await apiPost<SessionTokens | LoginChallenge>('/api/otp/verify', { challenge_id: challengeId, code });
+      if (attempt !== get().authAttempt) return;
       if ('mfa_required' in data || 'mfa_enrollment_required' in data) return data;
-      await get().establishSession(data);
-    } finally { set({ loading: false }); }
+      await get().establishSession(data, attempt);
+    } finally { if (attempt === get().authAttempt) set({ loading: false }); }
   },
 
   tryLocalSession: async () => {
     if (localSessionTried) return false;
     localSessionTried = true;
+    const attempt = get().authAttempt + 1;
+    set({ authAttempt: attempt });
     try {
       const res = await fetch('/api/session/local', {
         method: 'POST',
@@ -314,24 +326,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       };
       if (!data.access_token || !data.refresh_token) return false;
 
-      refreshTokenStorage.set(data.refresh_token);
-      // Same shape as `login`: the endpoint returns tokens, `/api/me` returns
-      // the authoritative user + bindings.
-      const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
-        '/api/me',
-        data.access_token,
-      );
-      set({
-        user: me.user,
-        jwt: data.access_token,
-        refreshToken: data.refresh_token,
-        isAuthenticated: true,
-        initialized: true,
-        bindings: me.bindings,
-        loading: false,
-      });
-      startRefreshTimer(get().refresh);
-      return true;
+      return await get().establishSession({ access_token: data.access_token, refresh_token: data.refresh_token }, attempt);
     } catch {
       return false; // network/parse failure → login form, never an error toast
     }
@@ -349,21 +344,24 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   firstRunClaim: async (email: string, password: string) => {
-    set({ loading: true });
+    const attempt = get().authAttempt + 1;
+    set({ loading: true, authAttempt: attempt });
     try {
       const res = await apiPost<{ email?: string }>('/api/first-run/claim', { email, password });
+      if (attempt !== get().authAttempt) return;
       // Claim only sets the owner's email and password; establish the session
       // via the normal login path so token wiring / refresh timer are
       // identical. The server echoes the stored (trimmed) email.
       await get().login(res.email ?? email.trim(), password);
     } catch (e) {
-      set({ loading: false });
+      if (attempt === get().authAttempt) set({ loading: false });
       throw e;
     }
   },
 
   // R2 fix: disconnect WebSocket on logout (via client singleton, avoids circular dep)
   logout: () => {
+    set({ authAttempt: get().authAttempt + 1 });
     stopRefreshTimer();
     client.disconnect();
     refreshTokenStorage.clear();

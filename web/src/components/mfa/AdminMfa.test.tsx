@@ -44,7 +44,7 @@ it('requires typed confirmation and reports the accounts enforcement would block
   expect(confirm).toBeDisabled();
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'CHANGE TWO-FACTOR POLICY' } });
   fireEvent.click(confirm);
-  await waitFor(() => expect(update).toHaveBeenCalledWith({ 'auth.mfa_enforced': true }));
+  await waitFor(() => expect(update).toHaveBeenCalledWith({ 'auth.mfa_enforced': true, expected_state: false }));
 });
 
 it('shows system.status degraded state and blocks policy changes', async () => {
@@ -76,4 +76,22 @@ it('hides administration on Personal and from non-Admins', () => {
   useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
   rerender(<AdminMfa />);
   expect(screen.queryByText('Two-factor login management')).toBeNull();
+});
+
+it('clears typed confirmation on refresh before the opposite policy action', async () => {
+  const update = vi.spyOn(api.system, 'updateConfig').mockResolvedValue({} as never);
+  renderWithProviders(<AdminMfaPanel actor="admin" />);
+  fireEvent.click(await screen.findByRole('switch'));
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'CHANGE TWO-FACTOR POLICY' } });
+  vi.mocked(mfaApi.overview).mockResolvedValue({ ...overview, enforced: true });
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+  await waitFor(() => expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'true'));
+  expect(screen.queryByRole('textbox')).toBeNull();
+  fireEvent.click(screen.getByRole('switch'));
+  expect(screen.getByRole('textbox')).toHaveValue('');
+  expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+  expect(update).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'CHANGE TWO-FACTOR POLICY' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+  await waitFor(() => expect(update).toHaveBeenCalledWith({ 'auth.mfa_enforced': false, expected_state: true }));
 });

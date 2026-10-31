@@ -365,7 +365,7 @@ Enterprise 強制期間，首次註冊還需獨立證明。只有已記錄且早
 
 強制期間未註冊者登入只取得 `mfa_enrollment_required`、`enrollment_token` 與 12 字元 `challenge_ref`，沒有 session token。呼叫 `/api/mfa/enroll/begin {enrollment_token,proof_code}` 後，再呼叫 `/api/mfa/enroll/confirm {enrollment_token,code}`；通道 OTP 登入者兩次都要帶 `password`。Dashboard 強制註冊的第一次 begin 回傳 `proof_required`、`enrollment_token` 與 `challenge_ref`，再以 `password`、該 token 及 `proof_code` 重呼 begin，才取得 `secret` 與 `otpauth_uri`。Confirm 才會啟用。註冊憑證不能登入 `/ws`、refresh 或一般 HTTP；dashboard 的註冊憑證也不能拿去 HTTP 註冊路由換 session。
 
-已註冊者的密碼與通道 OTP 登入只回傳 `mfa_required` 與 `challenge_id`。`/api/mfa/verify` 接受 challenge 及 `code`／`recovery_code` 二擇一。Challenge 綁定帳號與第一因素，持久保存、單次成功、5 分鐘有效、最多 5 次嘗試。`mfa.status` 查本人狀態；`mfa.recovery_regenerate {code}` 替換全部備援碼；`mfa.disable {code}` 需要新的 TOTP 或未使用備援碼，強制期間不能停用。每帳號因素驗證錯誤最多 5 次／15 分鐘。
+已註冊者的密碼與通道 OTP 登入只回傳 `mfa_required` 與 `challenge_id`。`/api/mfa/verify` 接受 challenge 及 `code`／`recovery_code` 二擇一。Challenge 綁定帳號與第一因素，持久保存、單次成功、5 分鐘有效、最多 5 次嘗試。`mfa.status` 查本人狀態；`mfa.recovery_regenerate {code}` 替換全部備援碼；`mfa.disable {code,password}` 需要目前密碼（與註冊密碼驗證共用限流）及新的 TOTP 或未使用備援碼，強制期間不能停用。每帳號因素驗證錯誤最多 5 次／15 分鐘。
 
 分階段啟用：先保持 `[auth] mfa_enforced=false`，讓帳號自願註冊；備妥支援新回應的客戶端、確認通道送達與主機救援，再由目前 Admin 查看 `mfa.overview`，透過 `system.update_config` 或設定檔編輯器啟用強制。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
 

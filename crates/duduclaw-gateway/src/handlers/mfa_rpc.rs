@@ -33,7 +33,7 @@ impl MethodHandler {
                 Ok(s) => Some(s), Err(_) => return WsFrame::error_response("", "請重新使用帳號登入後再註冊雙因素驗證。"),
             }
         } else { None };
-        if method=="mfa.enroll_begin" && !crate::server::check_login_rate_limit(
+        if matches!(method, "mfa.enroll_begin" | "mfa.disable") && !crate::server::check_login_rate_limit(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), &ctx.email) {
             return WsFrame::error_response("", "嘗試次數過多，請稍後再試。");
         }
@@ -75,18 +75,22 @@ impl MethodHandler {
                     let token=params.get("enrollment_token").and_then(Value::as_str).ok_or("缺少註冊憑證。");
                     let token=token?;
                     db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
-                    if required { db.mfa_require_independent_proof(token,now)?; }
                     let jwt = jwt.as_ref().ok_or("登入服務無法使用。")?;
-                    db.mfa_confirm_and_issue(&id, Some(token), code, &cipher, now, |user, access, codes| {
+                    db.mfa_confirm_and_issue(&id, Some(token), code, &cipher, now, personal, |user, access, codes| {
                         crate::mfa::replacement_session(jwt, user, access, previous_epoch, codes, true)
                     })
                 }
                 "mfa.disable" | "mfa.recovery_regenerate" => {
-                    if method=="mfa.disable" && required { return Err("管理員已要求雙因素驗證，無法停用。".into()); }
                     let code=params.get("code").and_then(Value::as_str).unwrap_or("");
                     if method == "mfa.disable" {
+                        let password = params.get("password").and_then(Value::as_str)
+                            .filter(|p| !p.is_empty() && p.len() <= 4096).ok_or("請輸入目前密碼。")?;
+                        let verified = db.verify_password(&user.email, password)?;
+                        if verified.id != id || verified.credential_epoch != previous_epoch {
+                            return Err("登入憑證已失效，請重新登入。".into());
+                        }
                         let jwt = jwt.as_ref().ok_or("登入服務無法使用。")?;
-                        db.mfa_change_and_issue(&id, code, true, &cipher, now, |user, access, codes| {
+                        db.mfa_change_and_issue(&id, code, true, &cipher, now, personal, |user, access, codes| {
                             crate::mfa::replacement_session(jwt, user, access, previous_epoch, codes, false)
                         })
                     } else {

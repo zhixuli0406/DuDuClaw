@@ -21,7 +21,7 @@ describe('MFA login', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Verify & sign in' }));
     await waitFor(() => expect(done).toHaveBeenCalled());
     expect(verify).toHaveBeenCalledWith('challenge', recovery ? 'unused-recovery' : '123456', recovery);
-    expect(establishSession).toHaveBeenCalledWith(tokens);
+    expect(establishSession).toHaveBeenCalledWith(tokens, useAuthStore.getState().authAttempt, expect.any(Function));
   });
 
   it.each([401, 429])('shows localized failure for HTTP %s without logging in', async status => {
@@ -53,7 +53,7 @@ describe('MFA login', () => {
     expect(establishSession).not.toHaveBeenCalled(); expect(local).not.toHaveBeenCalled();
     fireEvent.click(screen.getByLabelText('I saved my recovery codes'));
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
-    await waitFor(() => expect(establishSession).toHaveBeenCalledWith(tokens));
+    await waitFor(() => expect(establishSession).toHaveBeenCalledWith(tokens, useAuthStore.getState().authAttempt, expect.any(Function)));
   });
 });
 
@@ -67,4 +67,19 @@ it('does not establish a session when verification finishes after leaving the MF
   unmount(); resolve(tokens);
   await Promise.resolve();
   expect(establishSession).not.toHaveBeenCalled();
+});
+
+it('ignores verification after logout invalidates the mounted login attempt', async () => {
+  let resolve!: (value: typeof tokens) => void;
+  vi.spyOn(mfaApi, 'verify').mockReturnValue(new Promise(r => { resolve = r; }));
+  const establishSession = vi.fn(); useAuthStore.setState({ establishSession });
+  const done = vi.fn();
+  renderWithProviders(<LoginMfa challenge={challenge} onComplete={done} onCancel={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText('Authenticator code'), { target: { value: '123456' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Verify & sign in' }));
+  useAuthStore.getState().logout();
+  resolve(tokens);
+  await waitFor(() => expect(screen.getByLabelText('Authenticator code')).toHaveValue(''));
+  expect(establishSession).not.toHaveBeenCalled();
+  expect(done).not.toHaveBeenCalled();
 });

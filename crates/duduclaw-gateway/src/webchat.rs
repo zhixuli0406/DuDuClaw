@@ -2039,8 +2039,8 @@ mod tests {
         let mut recovery = crate::handlers::live_context::SocketRecovery::default();
         let archive = tempfile::NamedTempFile::new().unwrap();
         let archive_path = archive.path().to_path_buf();
-        assert!(rollback_before_final_reply(crate::handlers::live_context::SocketValidity::Revoked,
-            &mut recovery, std::slice::from_ref(&archive_path)).await == false);
+        assert!(!rollback_before_final_reply(crate::handlers::live_context::SocketValidity::Revoked,
+            &mut recovery, std::slice::from_ref(&archive_path)).await);
         assert!(recovery.closed());
         assert!(!archive_path.exists());
     }

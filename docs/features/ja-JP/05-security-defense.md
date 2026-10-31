@@ -366,7 +366,7 @@ Enterprise の強制中は初回登録にも独立した証明が必要です。
 
 強制中の未登録ログインは `mfa_enrollment_required`、`enrollment_token`、12文字の `challenge_ref` のみを返します。`/api/mfa/enroll/begin {enrollment_token,proof_code}` の後、`/api/mfa/enroll/confirm {enrollment_token,code}` を呼びます。チャネル第一要素では両方に `password` が必要です。Dashboardでの強制登録は最初のbeginが `proof_required` とtokenを返すので、パスワード、token、`proof_code` を付けて再度beginを呼び、`secret` と `otpauth_uri` を取得します。Confirmだけが有効化します。登録tokenは `/ws`、refresh、通常HTTP認証には使えず、Dashboard登録tokenもHTTP登録ルートで交換できません。
 
-登録済みアカウントのパスワード／チャネルOTPログインは `mfa_required` と `challenge_id` のみを返します。`/api/mfa/verify` にchallengeと `code` または `recovery_code` を送ります。ユーザーと第一要素に限定し、永続化、成功1回、5分間有効、試行5回までです。`mfa.status` は本人の状態、`mfa.recovery_regenerate {code}` は全コードの置換、`mfa.disable {code}` は無効化です。後二者は新しいTOTPまたは未使用コードが必要で、強制中は無効化できません。要素の誤入力はアカウントごとに15分で5回までです。
+登録済みアカウントのパスワード／チャネルOTPログインは `mfa_required` と `challenge_id` のみを返します。`/api/mfa/verify` にchallengeと `code` または `recovery_code` を送ります。ユーザーと第一要素に限定し、永続化、成功1回、5分間有効、試行5回までです。`mfa.status` は本人の状態、`mfa.recovery_regenerate {code}` は全コードの置換、`mfa.disable {code,password}` は現在のパスワード（登録時と同じパスワード試行制限）も必要な無効化です。後二者は新しいTOTPまたは未使用コードが必要で、強制中は無効化できません。要素の誤入力はアカウントごとに15分で5回までです。
 
 導入順序：`[auth] mfa_enforced=false` で任意登録を進め、対応クライアント、チャネル配信、ホスト復旧を確認します。現在のAdminが `mfa.overview` を確認してから `system.update_config` または設定エディターで強制を有効にします。強制なし・登録歴なしでは既存応答とepoch 0 JWT内容は変わりません。Personalは強制設定を無視し、`/api/session/local` はパスワード不要のままです。
 

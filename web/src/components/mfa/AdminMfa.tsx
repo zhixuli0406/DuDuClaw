@@ -26,9 +26,12 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
   const [factor, setFactor] = useState('');
   const [reference, setReference] = useState('');
   const [issued, setIssued] = useState<{ enrollment_code: string; expires_in: number } | null>(null);
-  const [confirmPolicy, setConfirmPolicy] = useState(false);
+  const [confirmPolicy, setConfirmPolicy] = useState<{ expected_state: boolean; desired_state: boolean } | null>(null);
   const [typed, setTyped] = useState('');
-  const load = useCallback(async () => { setOverview(await mfaApi.overview()); }, []);
+  const load = useCallback(async () => {
+    setConfirmPolicy(null); setTyped('');
+    setOverview(await mfaApi.overview());
+  }, []);
   useEffect(() => {
     let active = true;
     void mfaApi.overview().then(value => { if (active) setOverview(value); })
@@ -56,18 +59,18 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
       {overview.policy.enforced_at != null && <p className="text-sm text-muted-foreground">{t('mfa.enforcedAt')}: {intl.formatDate(overview.policy.enforced_at / 1000, { dateStyle: 'medium', timeStyle: 'short' })}</p>}
       {blocked > 0 && <p role="alert" className="text-sm text-warning">{t('mfa.admin.warning')}</p>}
       <p className="text-sm text-muted-foreground">{t('mfa.admin.review')}</p>
-      <Button role="switch" aria-checked={overview.enforced === true} variant="outline" disabled={busy || degraded || overview.enforced === null} onClick={() => { setConfirmPolicy(true); setTyped(''); }}>{t(overview.enforced ? 'mfa.policy.disable' : 'mfa.policy.enable')}</Button>
+      <Button role="switch" aria-checked={overview.enforced === true} variant="outline" disabled={busy || degraded || overview.enforced === null} onClick={() => { if (overview.enforced !== null) setConfirmPolicy({ expected_state: overview.enforced, desired_state: !overview.enforced }); setTyped(''); }}>{t(overview.enforced ? 'mfa.policy.disable' : 'mfa.policy.enable')}</Button>
       {confirmPolicy && <form className="space-y-3 rounded-lg border p-3" onSubmit={e => {
         e.preventDefault();
         if (typed !== t('mfa.policy.phrase')) return;
         void run(async () => {
-          await api.system.updateConfig({ 'auth.mfa_enforced': !overview.enforced });
-          setConfirmPolicy(false); setTyped(''); await load(); setNotice(t('mfa.updated'));
+          await api.system.updateConfig({ 'auth.mfa_enforced': confirmPolicy.desired_state, expected_state: confirmPolicy.expected_state });
+          setConfirmPolicy(null); setTyped(''); await load(); setNotice(t('mfa.updated'));
         });
       }}>
         <label className="block space-y-2">{intl.formatMessage({ id: 'mfa.policy.confirm' }, { phrase: t('mfa.policy.phrase') })}<Input value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off" /></label>
         <Button type="submit" disabled={busy || degraded || typed !== t('mfa.policy.phrase')}>{t('mfa.confirm')}</Button>
-        <Button type="button" variant="outline" disabled={busy} onClick={() => setConfirmPolicy(false)}>{t('mfa.cancel')}</Button>
+        <Button type="button" variant="outline" disabled={busy} onClick={() => setConfirmPolicy(null)}>{t('mfa.cancel')}</Button>
       </form>}
       <ul className="divide-y">
         {overview.users.map(row => <li key={row.user_id} className="space-y-2 py-3">

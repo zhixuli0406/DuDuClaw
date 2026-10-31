@@ -75,3 +75,42 @@ it.each([false, true])('ignores an MFA response after leaving its session (new l
   expect(useAuthStore.getState().refreshToken).toBe(newLogin ? 'other-refresh' : null);
   expect(sessionStorage.getItem('duduclaw-refresh-token')).toBeNull();
 });
+
+it.each(['logout', 'new login'])('ignores MFA completion while /api/me is pending after %s', async action => {
+  let finish!: (value: Response) => void;
+  const pending = new Promise<Response>(resolve => { finish = resolve; });
+  const fetcher = vi.fn().mockReturnValueOnce(pending)
+    .mockResolvedValueOnce(response({ access_token: 'other-access', refresh_token: 'other-refresh' }))
+    .mockResolvedValueOnce(response({ user: { ...user, id: 'other' }, bindings: [] }));
+  vi.stubGlobal('fetch', fetcher);
+  const old = useAuthStore.getState().establishSession({ access_token: 'old-access', refresh_token: 'old-refresh' });
+  if (action === 'logout') useAuthStore.getState().logout();
+  else await useAuthStore.getState().login('other@example.com', 'pw');
+  const writes = vi.spyOn(Storage.prototype, 'setItem');
+  finish(response({ user, bindings: [] }));
+  expect(await old).toBe(false);
+  expect(writes).not.toHaveBeenCalled();
+  expect(useAuthStore.getState().jwt).toBe(action === 'logout' ? null : 'other-access');
+  expect(sessionStorage.getItem('duduclaw-refresh-token')).toBe(action === 'logout' ? null : 'other-refresh');
+});
+
+it('rejects an MFA attempt invalidated before session establishment starts', async () => {
+  const attempt = useAuthStore.getState().authAttempt;
+  useAuthStore.getState().logout();
+  const fetcher = vi.fn(); vi.stubGlobal('fetch', fetcher);
+  expect(await useAuthStore.getState().establishSession({ access_token: 'old', refresh_token: 'old' }, attempt)).toBe(false);
+  expect(fetcher).not.toHaveBeenCalled();
+});
+
+it('ignores session establishment after its MFA page unmounts during /api/me', async () => {
+  let finish!: (value: Response) => void;
+  vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise<Response>(resolve => { finish = resolve; })));
+  let active = true;
+  const pending = useAuthStore.getState().establishSession({ access_token: 'old', refresh_token: 'old' }, useAuthStore.getState().authAttempt, () => active);
+  active = false;
+  const writes = vi.spyOn(Storage.prototype, 'setItem');
+  finish(response({ user, bindings: [] }));
+  expect(await pending).toBe(false);
+  expect(writes).not.toHaveBeenCalled();
+  expect(useAuthStore.getState().isAuthenticated).toBe(false);
+});

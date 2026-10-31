@@ -50,15 +50,17 @@ it('regenerates with a fresh factor and requires saving without ending the sessi
   await waitFor(() => expect(screen.queryByLabelText('Recovery codes')).toBeNull());
   expect(logout).not.toHaveBeenCalled();
 });
-it('disables with a fresh factor when enforcement is off', async () => {
+it('requires the current password and fresh factor when enforcement is off', async () => {
   vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: true, enforced: false });
   const disable = vi.spyOn(mfaApi, 'disable').mockResolvedValue({ enabled: false, ...tokens });
   const logout = vi.fn(); useAuthStore.setState({ logout });
   renderWithProviders(<AccountMfa />);
   await screen.findByText('Enrolled');
   fireEvent.change(screen.getByLabelText('Fresh authenticator code or unused recovery code'), { target: { value: 'fresh-code' } });
+  expect(screen.getByRole('button', { name: 'Disable two-factor login' })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText('Current password'), { target: { value: 'current-password' } });
   fireEvent.click(screen.getByRole('button', { name: 'Disable two-factor login' }));
-  await waitFor(() => expect(disable).toHaveBeenCalledWith('fresh-code'));
+  await waitFor(() => expect(disable).toHaveBeenCalledWith('fresh-code', 'current-password'));
   expect(logout).not.toHaveBeenCalled();
   expect(await screen.findByText('Not enrolled')).toBeInTheDocument();
   expect(useAuthStore.getState().jwt).toBe(tokens.access_token);
