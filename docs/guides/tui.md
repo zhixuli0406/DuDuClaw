@@ -2,9 +2,9 @@
 
 [繁體中文](zh-TW/tui.md) · [日本語](ja-JP/tui.md)
 
-`duduclaw tui` opens a read-only view of pending approvals, goals needing a reply, and employee status. Select a row to inspect its details. Where the gateway provides it, administrators also see the next scheduled autonomous run. Closing the control room does not stop employees.
+`duduclaw tui` opens a control room for pending approvals, goals needing a reply, and employee status. Select a row to inspect its details. Where the gateway provides it, administrators also see the next scheduled autonomous run. Closing the control room does not stop employees.
 
-This first version does not approve or reject requests, send chat messages, pause employees, or provide `tui watch`. Decisions and chat will come later; use the dashboard for those actions now. The terminal interface currently uses Traditional Chinese.
+Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee pause controls remain deferred. The terminal interface currently uses Traditional Chinese.
 
 ## Start
 
@@ -15,6 +15,7 @@ duduclaw tui
 duduclaw tui inbox
 duduclaw tui inbox --follow
 duduclaw tui inbox --follow --json
+duduclaw tui watch adu
 ```
 
 The full screen needs a terminal. `inbox` prints one snapshot and exits; `--follow` prints a new complete snapshot when it changes. `--json` produces one JSON object per line on stdout, with `type`, `stale`, `count`, `error`, and `items`. Output itself needs no TTY; if account login is needed, an interactive terminal is required. There is no token flag or credential file for unattended login.
@@ -42,27 +43,62 @@ OTP is an alternative login method, **not two-factor authentication**. A correct
 | Key | Action |
 |---|---|
 | Arrows / `j` / `k` | Move selection |
-| `Enter` | Open read-only details |
+| `Enter` | Open details or a decision card |
 | `r` | Mark this item or identified completed run as read on this client |
 | `PgUp` / `PgDn` | Scroll details |
 | `?` / `F1` | Toggle help |
 | `q` / `Ctrl-C` | Exit |
 
-New items never take selection. Read marks do not dismiss pending requests at the gateway. Completion badges use recent run history, not a complete history of everything you have missed.
+New items never take selection. Read marks do not dismiss pending requests at the gateway. Completion badges use recent run history, not a complete history of everything you have missed. If the selected row disappears, selection moves to the same position, or the last row; an existing selected ID stays selected through new arrivals and reordering.
 
 On disconnect, lost events, or an incomplete refetch, lists show `資料可能過期` (“data may be stale”) and counts become `?`; JSON uses `stale: true` and `count: null`. The last complete list remains visible. A refetch has a shared limit of 2,000 rows and 4 MiB of encoded response content across employees, inbox, recent runs, and schedules. Exceeding either limit stops that refetch and keeps it stale, never publishes a partial list as complete. Responses and events are limited to 256 KiB per WebSocket message/frame, with a 16-event queue. Large installations may need the dashboard.
+
+## Chat and input focus
+
+The status line always identifies the focus. In list focus, `1` selects details and `2` selects the chat block. Select an employee and press `i` to type; `/` starts input with a slash. `Esc` returns to list focus and keeps the draft. While typing, single-letter shortcuts are text. CJK characters, committed IME text, and bracketed paste are supported. `Enter` sends; `Ctrl-C` exits.
+
+A leading `@name ` selects the WebChat `agent` field and is removed from the message. Without it, the employee selected when input opened is the recipient. `/goal`, `/status`, and `/cost` pass unchanged to the gateway. `/pause`, `/stop`, and `/resume` show a Computer Use note: these commands do **not** pause an employee.
+
+The right pane contains details or one chat block; layouts with up to four blocks come in M2. This version permits one in-flight chat turn. Thinking and tool steps collapse to one status line; an ASCII spinner also works with `glyphs = "ascii"`. `PgUp` / `PgDn` in list focus scroll chat history, capped at 2,000 lines of at most 512 characters each. New output never changes focus. Employee output passes through `TerminalText`; the client emits no OSC 8 hyperlinks.
+
+One `/ws/chat` connection shares the `/ws` client's in-memory token refresh and reconnects with backoff. Interrupted messages are not automatically resent; their outcome is uncertain. Completed conversations can resume on reconnect; changing employee starts a new conversation. In list focus, `x` cancels a running reply only after the gateway has sent a frame carrying `msg_id`. Otherwise the block says cancellation is unavailable. `cancel_accepted` only means the request was accepted; the turn ends on `cancelled` or a final response. This requires the additive protocol from PR #264; ordinary chat works with the current gateway.
+
+## Watch one employee
+
+`duduclaw tui watch adu` prints sanitized lines suitable for a narrow split, without an alternate screen. It tries `runs.subscribe { agent_id }`; the current gateway reports an unknown method, so it explicitly announces polling and uses `runs.list` and `runs.get` every five seconds. Recent history is limited to four runs and the last 256 events per run, with bounded duplicate tracking. A supporting gateway also supplies `run.step` events; persisted history still reconciles periodically. `Ctrl-C` exits. The same AI-session refusal and account login rules apply.
+
+By default, output contains metadata only (time, status, agent, step kind or tool name), with no user/assistant text or tool arguments. Use `duduclaw tui watch adu --content` to include content previews; stderr warns that content is not redacted. Unknown event shapes show only their name in either mode, never their JSON payload.
+
+## Terminal notifications
+
+Notifications are off by default, including under `SSH_CONNECTION`. Explicit `notifications = true` in `tui.toml` opts in. An increased fresh inbox count while the terminal is unfocused emits OSC 9 with only `DuDuClaw：N 項需要你處理`; employee names, task titles, and tool content never enter it. Focus events are used when available; otherwise the terminal is treated as unfocused. At most one notification is emitted per minute; suppressed rises are not queued. Inside tmux, passthrough is used only if `tmux show-option -gv allow-passthrough` returns `on` or `all`; otherwise notifications are skipped. Actual display depends on the terminal.
+
+## Decision cards
+
+Select an inbox row and press `Enter` to open its card. New arrivals only update the list and badges; they never open a card or move focus. All key presses during the first second are ignored. `Esc` closes a card; arrows and `PgUp` / `PgDn` scroll it.
+
+For an approval, type the two-digit confirmation code and press `Enter`; `n` denies immediately. Each opening generates a random code different from the previous opening. All approval operations show the full payload with control characters made visible; the code input stays locked until the bottom is visible. Resizing can lock it again. This only guards against mistyped or blind input: **a process running under the same UID that can read the screen can bypass it**. It is not a person-presence or authentication check. All approvals currently count as high risk: `approvals.list` supplies `kind` but no gateway-produced safety classification; neither action kind alone nor fields inside `payload` can reduce risk. Resize clears typed input and redraws before queued keys are processed. Footer hints follow list, card, or help focus.
+
+Goal cards use `r` for retry. `a` aborts, `d` marks done, and `t` takes over: press the same key twice, with no countdown; another key cancels confirmation. `c` continues a finished goal only after an explicit follow-up message (`i` to edit, `Esc` to finish editing). The current inbox lists only `needs_human` tasks, so it does not offer `continue`; use the dashboard for finished goals. The `tasks.goal_decide` handler accepts `task_id`, `action`, optional `note`, and requires `message` for `continue`. The optional `expected_updated_at` must exactly match the task’s `updated_at` string; comparison and mutation run in the same SQLite transaction for all five actions. A mismatch returns `goal_decide_revision_mismatch` without changing the task or recording a decision. Omission preserves dashboard behavior. The control room always sends the value shown on the card and refuses goal decisions if it is missing.
+
+Cards with `may_decide=false` are read-only and explain why. Goal actions require a known Operator/Owner binding or Admin access from `users.me`. Dashboard-only approvals, questions requiring answers, and bound operations stay in the dashboard. The TUI displays a fixed instruction and never opens a link supplied by the server. Standing-authority and global configuration changes remain in the dashboard.
+
+Approval requires a nonempty string `digest`, sent as `expected_digest`. If it is absent or null (including a redacted viewer payload), approval sends no RPC and the card stays open with the fixed line: **內容未綁定：這張卡無法確認你看到的就是實際內容，請到儀表板決定**. Denial remains available with `n`. Approving from the control room therefore requires **PR #261 merged**, which adds digests to `approvals.list`. A structured digest mismatch closes the card and refetches with a fixed change notice. Every sent decision, including RPC errors and uncertain timeouts, triggers a refetch; no optimistic success or automatic resend. Server errors pass through `TerminalText`; stale, expired, or deadline-free approvals cannot be decided.
+
+`s` in the list or card snoozes the row locally for up to ten minutes. Approvals are capped at 80% of remaining TTL and resurface no later than when 20% of TTL or ten minutes (whichever is less) remains, with a reason; an earlier requested wake-up wins. A shortened deadline also resurfaces the row. Expiry means denial, and snooze cannot extend it. Only identifiers and timestamps are saved in `tui-state.json`; the line-oriented `inbox` command continues to show the authoritative pending list. A wall clock earlier than the snooze start clears that snooze permanently; a monotonic deadline also bounds it during the session. Restart loses clock continuity and shows snoozed cards again.
 
 ## Local files
 
 | File under home | Use |
 |---|---|
-| `tui-state.json` | Written when marking items read. Contains identifiers only; atomically replaced through a temporary file in the same directory. |
+| `tui-state.json` | Written when marking items read or snoozing. Contains read identifiers and snooze timestamps only; atomically replaced through a temporary file in the same directory. |
 | `tui.toml` | Optional, operator-created settings; the TUI reads it and does not create or rewrite it. |
 
 ```toml
 # ~/.duduclaw/tui.toml
 glyphs = "ascii"                 # or "unicode"
 ambiguous_width = "narrow"        # or "wide", matching your terminal
+notifications = false
 poll_interval_seconds = 15        # 5..3600
 ```
 

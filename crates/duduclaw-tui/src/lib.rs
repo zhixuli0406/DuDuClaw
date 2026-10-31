@@ -1,4 +1,6 @@
-//! Read-only control room and line-oriented inbox. The host CLI owns login and guards.
+//! Control room and line-oriented inbox. The host CLI owns login and guards.
+pub mod decide;
+pub mod snooze;
 pub mod auth;
 pub mod budget;
 pub mod client;
@@ -55,3 +57,8 @@ pub async fn without_tracing<F: std::future::Future>(future: F) -> F::Output {
     use tracing::instrument::WithSubscriber;
     future.with_subscriber(tracing::subscriber::NoSubscriber::default()).await
 }
+
+pub mod chat;
+pub mod notifications;
+pub mod watch;
+pub use watch::{WatchOptions, run_watch};

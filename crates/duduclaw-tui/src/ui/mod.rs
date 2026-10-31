@@ -1,9 +1,15 @@
-//! Read-only full screen. No CLI parsing, credentials, approvals or subprocesses.
+//! Full screen with explicit, locally guarded decisions. No subprocesses.
 pub mod app;
+pub mod card;
+mod card_data;
+mod card_render;
+#[cfg(test)]
+mod card_tests;
 mod backend;
 mod panels;
+mod chat_render;
 pub mod render;
-mod terminal;
+pub(crate) mod terminal;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -50,7 +56,15 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             .map_err(|_| Error::Terminal)?;
         terminal.clear().map_err(|_| Error::Terminal)?;
         let connection = options.client.connection();
+        let client = options.client.clone();
+        let chat = client.chat();
+        let mut chat_state = chat.state();
+        app.chat = chat_state.borrow_and_update().clone();
+        let route = if settings.notifications { crate::notifications::route().await } else { crate::notifications::Route::Skip };
+        let mut notifications = crate::notifications::Notifications::new(settings.notifications, route);
+        let started = std::time::Instant::now();
         let feed = StateFeed::start(options.client, settings.poll_interval);
+        let mut decision: Option<futures_util::future::BoxFuture<'_, crate::decide::Outcome>> = None;
         let home_text = TerminalText::new(home.to_string_lossy().into_owned());
         let shutdown = terminal::shutdown_signal();
         tokio::pin!(shutdown);
@@ -58,11 +72,21 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             if terminal::panicked() {
                 return Err(Error::Terminal);
             }
-            let model = feed.receiver.borrow().clone();
+            let mut model = feed.receiver.borrow().clone();
+            model.inbox.items.retain(|item| !app.read.hidden(item, crate::snooze::epoch_now()));
             if let Some(error) = model.login_required {
                 return Err(error);
             }
             app.refresh(&model);
+            if chat_state.has_changed().unwrap_or(false) {
+                app.chat = chat_state.borrow_and_update().clone();
+            }
+            app.spinner = (started.elapsed().as_millis() / 150) as usize;
+            if let Some(sequence) = notifications.update(model.inbox.count(), std::time::Instant::now()) {
+                use std::io::Write;
+                std::io::stdout().write_all(sequence.as_bytes()).map_err(|_| Error::Output)?;
+                std::io::stdout().flush().map_err(|_| Error::Output)?;
+            }
             terminal
                 .draw(|frame| {
                     render::draw(
@@ -70,29 +94,53 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                         &model,
                         &connection.borrow(),
                         &home_text,
-                        &app,
+                        &mut app,
                         &settings,
                     )
                 })
                 .map_err(|_| Error::Terminal)?;
             // Never block a Tokio worker waiting for user input; only read ready events.
-            if event::poll(Duration::ZERO).map_err(|_| Error::Terminal)?
-                && let Event::Key(key) = event::read().map_err(|_| Error::Terminal)?
-            {
+            while event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? {
+                let key = match event::read().map_err(|_| Error::Terminal)? {
+                    Event::Resize(_, _) => {
+                        if let Some(card) = &mut app.card { card.invalidate_viewport(); }
+                        // Stop this batch: queued keys must see the newly rendered viewport.
+                        break;
+                    }
+                    Event::FocusGained => { notifications.focus(true); continue; }
+                    Event::FocusLost => { notifications.focus(false); continue; }
+                    Event::Paste(text) => { app.paste(&text); continue; }
+                    Event::Key(key) => key,
+                    _ => continue,
+                };
                 let before = app.read.clone();
                 match app.key(key, &model) {
                     Action::Quit => return Ok(()),
-                    Action::Save => match app.read.save(&home) {
-                        Ok(()) => app.notice = Some(strings::SAVED.into()),
+                    action @ (Action::Save | Action::Snooze) => match app.read.save(&home) {
+                        Ok(()) => app.notice = Some(if action == Action::Snooze { strings::SNOOZED } else { strings::SAVED }.into()),
                         Err(error) => {
                             app.read = before;
                             app.notice = Some(error.to_string());
                         }
                     },
+                    Action::Decide(request) => {
+                        let client = client.clone();
+                        decision = Some(Box::pin(async move { crate::decide::send(&client, &request).await }));
+                    }
+                    Action::Chat(input) => match chat.send(input) {
+                        Ok(()) => { app.input.clear(); app.chat_scroll = 0; app.notice = None; app.chat.running = true; }
+                        Err(error) => app.notice = Some(error.to_string()),
+                    },
+                    Action::CancelChat => if let Err(error) = chat.cancel() { app.notice = Some(error.to_string()); },
                     Action::None => {}
                 }
             }
             tokio::select! {
+                outcome = async { decision.as_mut().expect("guarded decision").await }, if decision.is_some() => {
+                    decision = None;
+                    app.decision_finished(outcome);
+                    feed.refetch();
+                }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                 result = &mut shutdown => return result,
             }

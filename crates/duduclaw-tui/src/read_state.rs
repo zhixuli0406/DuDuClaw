@@ -2,7 +2,7 @@
 use crate::{Error, Result, strings};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, BTreeMap},
     io::{Read, Write},
     path::Path,
 };
@@ -12,8 +12,22 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct ReadState {
     ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    snoozes: BTreeMap<String, crate::snooze::Snooze>,
 }
 impl ReadState {
+    pub fn snooze(&mut self, item: &crate::state::InboxItem, now: i64) -> bool {
+        if let Some(snooze) = crate::snooze::Snooze::new(item, now, 600) {
+            self.snoozes.insert(item.key(), snooze);
+            true
+        } else { false }
+    }
+    pub fn hidden(&self, item: &crate::state::InboxItem, now: i64) -> bool {
+        self.snoozes.get(&item.key()).is_some_and(|s| s.hidden(item, now))
+    }
+    pub fn resurfaced(&self, item: &crate::state::InboxItem, now: i64) -> bool {
+        self.snoozes.contains_key(&item.key()) && !self.hidden(item, now)
+    }
     pub fn contains(&self, id: &str) -> bool {
         self.ids.contains(id)
     }

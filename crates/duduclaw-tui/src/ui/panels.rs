@@ -54,14 +54,17 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 .map(|i| Row {
                     selection: Selection::Inbox(i.key()),
                     text: TerminalText::new(format!(
-                        "[{}] {}{}",
+                        "[{}] {}{}{}",
                         i.source_label(),
                         i.title().plain(),
                         if app.read.contains(&i.key()) {
                             format!(" ({})", strings::READ)
                         } else {
                             String::new()
-                        }
+                        },
+                        if app.read.resurfaced(i, crate::snooze::epoch_now()) {
+                            format!(" ({})", strings::RESURFACED)
+                        } else { String::new() }
                     )),
                 })
                 .collect(),

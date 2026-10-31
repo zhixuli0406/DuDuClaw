@@ -651,6 +651,11 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
+        let expected_updated_at = match params.get("expected_updated_at") {
+            None => None,
+            Some(Value::String(value)) => Some(value.as_str()),
+            Some(_) => return WsFrame::error_response("", "expected_updated_at must be a string"),
+        };
         let action_str = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         if action_str == "continue" {
@@ -669,11 +674,12 @@ impl MethodHandler {
                 return f;
             }
             let decider = format!("dashboard:{}", ctx.user_id);
-            return match crate::goal_notify::apply_continue_from_dashboard(
+            return match crate::goal_notify::apply_continue_from_dashboard_checked(
                 &self.home_dir,
                 &decider,
                 task_id,
                 &message,
+                expected_updated_at,
             )
             .await
             {
@@ -717,13 +723,14 @@ impl MethodHandler {
         }
         let decider = format!("dashboard:{}", ctx.user_id);
         let decider_name = self.user_display_name(&ctx.user_id).await;
-        match crate::goal_notify::apply_needs_human_from_dashboard(
+        match crate::goal_notify::apply_needs_human_from_dashboard_checked(
             &self.home_dir,
             &decider,
             decider_name,
             task_id,
             act,
             &note,
+            expected_updated_at,
         )
         .await
         {
@@ -963,5 +970,51 @@ mod criteria_ledger_rpc_tests {
         assert!(unit["updated_round"].is_null());
         assert!(v["last_report_round"].is_null());
         assert_eq!(v["invalid_reports"], 0);
+    }
+}
+
+#[cfg(test)]
+mod goal_decide_revision_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn goal_decide_match_mismatch_and_absent_for_every_action() {
+        for action in ["retry", "done", "abort", "takeover", "continue"] {
+            for mode in ["match", "mismatch", "absent", "wrong_type"] {
+                let home = tempfile::tempdir().unwrap();
+                let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+                let user = db.create_user("admin@test.invalid", "Admin", "isolated-test-password", UserRole::Admin).unwrap();
+                let mut ctx = UserContext::admin_fallback(); ctx.user_id = user.id;
+                let handler = MethodHandler::new(home.path().to_path_buf()).await;
+                let store = Arc::new(TaskStore::open(home.path()).unwrap());
+                handler.set_task_store(store.clone()).await;
+                let mut row = TaskRow::new("goal".into(), "Goal".into(), String::new(), "normal".into(), "sales".into(), "system".into());
+                row.goal_mode = true;
+                row.status = if action == "continue" { "done" } else { "needs_human" }.into();
+                store.insert_task(&row).await.unwrap();
+                let before = task_row_to_json(&store.get_task("goal").await.unwrap().unwrap());
+                let mut params = json!({"task_id":"goal", "action":action, "message":"Follow up"});
+                match mode {
+                    "match" => params["expected_updated_at"] = before["updated_at"].clone(),
+                    "mismatch" => params["expected_updated_at"] = json!("stale"),
+                    "wrong_type" => params["expected_updated_at"] = Value::Null,
+                    _ => {},
+                }
+                let reply = handler.handle_tasks_goal_decide(params, &ctx).await;
+                let WsFrame::Response { ok, error, .. } = reply else { panic!("expected response"); };
+                let after = task_row_to_json(&store.get_task("goal").await.unwrap().unwrap());
+                if matches!(mode, "mismatch" | "wrong_type") {
+                    assert!(!ok, "{action}/{mode}");
+                    assert!(error.unwrap().to_string().contains(if mode == "mismatch" { "goal_decide_revision_mismatch" } else { "expected_updated_at must be a string" }));
+                    assert_eq!(before, after, "mismatch must not mutate any task field");
+                    assert!(store.list_activity_for_task("goal", 10).await.unwrap().is_empty());
+                } else {
+                    assert!(ok, "{action}/{mode}: {error:?}");
+                    assert_ne!(before, after);
+                    assert_eq!(after["status"], match action { "retry" | "continue" => "pending", "done" => "done", "abort" => "cancelled", _ => "needs_human" });
+                    if action == "takeover" { assert_eq!(after["claimed_by"], format!("dashboard:{}", ctx.user_id)); }
+                }
+            }
+        }
     }
 }

@@ -21,6 +21,8 @@ fn restore() {
         io::stdout(),
         style::ResetColor,
         cursor::Show,
+        crossterm::event::DisableFocusChange,
+        crossterm::event::DisableBracketedPaste,
         terminal::LeaveAlternateScreen
     );
     let _ = io::stdout().flush();
@@ -48,7 +50,8 @@ impl TerminalGuard {
             previous: Some(previous),
         };
         terminal::enable_raw_mode().map_err(|_| Error::Terminal)?;
-        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)
+        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide,
+            crossterm::event::EnableFocusChange, crossterm::event::EnableBracketedPaste)
             .map_err(|_| Error::Terminal)?;
         Ok(guard)
     }

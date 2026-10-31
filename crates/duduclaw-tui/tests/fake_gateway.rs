@@ -1,4 +1,8 @@
 //! Socket tests deliberately fail on bind refusal unless explicitly opted out.
+#[path = "decisions/mod.rs"]
+mod decisions;
+#[path = "chat/mod.rs"]
+mod chat;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -43,6 +47,11 @@ enum Control {
 struct Fixture {
     events: broadcast::Sender<Control>,
     connections: AtomicUsize,
+    chat_connections: AtomicUsize,
+    chat_active: AtomicUsize,
+    chat_max_active: AtomicUsize,
+    chat_refreshed: AtomicUsize,
+    chat_sent: std::sync::Mutex<Vec<Value>>,
     refreshed_connections: AtomicUsize,
     refreshes: AtomicUsize,
     fail_refresh: AtomicBool,
@@ -52,6 +61,12 @@ struct Fixture {
     short_token: bool,
     flood: AtomicUsize,
     task_calls: AtomicUsize,
+    decisions: std::sync::Mutex<Vec<(String, Value)>>,
+    digest_mismatch: AtomicBool,
+    employee_role: AtomicBool,
+}
+impl Fixture {
+    fn role(&self) -> &'static str { if self.employee_role.load(Ordering::SeqCst) { "employee" } else { "manager" } }
 }
 struct Gateway {
     target: GatewayUrl,
@@ -81,6 +96,11 @@ impl Gateway {
         let fixture = Arc::new(Fixture {
             events,
             connections: AtomicUsize::new(0),
+            chat_connections: AtomicUsize::new(0),
+            chat_active: AtomicUsize::new(0),
+            chat_max_active: AtomicUsize::new(0),
+            chat_refreshed: AtomicUsize::new(0),
+            chat_sent: std::sync::Mutex::new(Vec::new()),
             refreshed_connections: AtomicUsize::new(0),
             refreshes: AtomicUsize::new(0),
             fail_refresh: AtomicBool::new(false),
@@ -90,11 +110,15 @@ impl Gateway {
             short_token,
             flood: AtomicUsize::new(0),
             task_calls: AtomicUsize::new(0),
+            decisions: std::sync::Mutex::new(Vec::new()),
+            digest_mismatch: AtomicBool::new(false),
+            employee_role: AtomicBool::new(false),
         });
         let app = Router::new()
             .route("/api/session/local", post(local_session))
             .route("/api/refresh", post(refresh))
             .route("/ws", get(upgrade))
+            .route("/ws/chat", get(chat::upgrade))
             .with_state(fixture.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -160,7 +184,7 @@ async fn local_session(State(f): State<Arc<Fixture>>, headers: HeaderMap) -> Jso
     );
     Json(
         json!({"access_token":token(if f.short_token { 3 } else { 3600 },false),"refresh_token":token(7200,false),
-        "user":{"id":"u1","email":"fixture@example.com","role":"employee","must_change_password":false}}),
+        "user":{"id":"u1","email":"fixture@example.com","role":f.role(),"must_change_password":false}}),
     )
 }
 async fn refresh(
@@ -205,7 +229,7 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
         f.refreshed_connections.fetch_add(1, Ordering::SeqCst);
     }
     f.connections.fetch_add(1, Ordering::SeqCst);
-    if !send(&mut socket,WsFrame::ok_response(&id,json!({"status":"authenticated","user":{"id":"u1","email":"fixture@example.com","role":"employee"},"must_change_password":false,"boot_id":"boot-a"}))).await { return; }
+    if !send(&mut socket,WsFrame::ok_response(&id,json!({"status":"authenticated","user":{"id":"u1","email":"fixture@example.com","role":f.role()},"must_change_password":false,"boot_id":"boot-a"}))).await { return; }
     let mut first = None;
     loop {
         tokio::select! {
@@ -228,6 +252,25 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                 }
                                 json!({"version":"fixture","edition":"community","auto_update":false})
                             },
+                            "users.me" => json!({"user":{"id":"u1","role":f.role()},"bindings":[{"agent_name":"adu","access_level":"operator"}]}),
+                            "approvals.decide" | "tasks.goal_decide" => {
+                                f.decisions.lock().unwrap().push((method.clone(), params.clone()));
+                                if method == "tasks.goal_decide" && params.get("expected_updated_at").is_some_and(|v| v != "revision") {
+                                    let response = WsFrame::Response { id, ok:false, payload:None,
+                                        error:Some(json!({"message":"goal_decide_revision_mismatch"})) };
+                                    if !send(&mut socket,response).await { return; }
+                                    continue;
+                                }
+                                if f.digest_mismatch.load(Ordering::SeqCst) {
+                                    let response = WsFrame::Response { id, ok:false, payload:None,
+                                        error:Some(json!({"code":"digest_mismatch","message":"changed\u{1b}]52;bad\u{7}"})) };
+                                    if !send(&mut socket,response).await { return; }
+                                    continue;
+                                }
+                                if method == "approvals.decide" {
+                                    json!({"id":params["id"],"decided":if params["approve"] == true {"approved"} else {"denied"},"side_effect":null,"capability_handle":null})
+                                } else { json!({"ok":true,"message":"done","task":{"id":params["task_id"],"status":"pending"}}) }
+                            },
                             "agents.list" => {
                                 if f.flood.load(Ordering::SeqCst) == 0 {
                                     json!({"agents":[{"name":"adu","display_name":"阿嘟\u{202e}\u{1b}","status":"active","archived":false}]})
@@ -238,7 +281,7 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                             "approvals.list" => {
                                 f.list_calls.fetch_add(1,Ordering::SeqCst);
                                 tokio::time::sleep(Duration::from_millis(f.list_delay_ms.load(Ordering::SeqCst))).await;
-                                json!({"approvals":[{"id":"a1","agent_id":"adu","kind":"tool","summary":"需要審核\u{1b}[2K\u{202e}","status":"pending","request_kind":"question","expires_at":null,"decided_in_dashboard_only":true}],"count":1})
+                                json!({"approvals":[{"id":"a1","digest":"shown-digest","agent_id":"adu","kind":"tool","summary":"需要審核\u{1b}[2K\u{202e}","status":"pending","request_kind":"question","expires_at":null,"decided_in_dashboard_only":true}],"count":1})
                             }
                             "tasks.list_page" => {
                                 f.task_calls.fetch_add(1, Ordering::SeqCst);
@@ -246,7 +289,7 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                 let flood = f.flood.load(Ordering::SeqCst);
                                 if flood == 0 {
                                     assert_eq!(params["agent_id"],"adu","non-admin requires agent scope");
-                                    json!({"tasks":[{"id":"t1","title":"請確認","assigned_to":"adu","status":"needs_human","pause_reason":"unknown","goal_mode":true}],"total":1,"limit":200,"offset":0})
+                                    json!({"tasks":[{"id":"t1","updated_at":"revision","title":"請確認","assigned_to":"adu","status":"needs_human","pause_reason":"unknown","goal_mode":true}],"total":1,"limit":200,"offset":0})
                                 } else {
                                     let agent = params["agent_id"].as_str().expect("agent scope");
                                     let count = if flood == 1 { 100 } else { 1 };
@@ -254,6 +297,11 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                     json!({"tasks":(0..count).map(|i| json!({"id":format!("{agent}-{i}"), "title":title, "assigned_to":agent,"status":"needs_human"})).collect::<Vec<_>>(),"total":count})
                                 }
                             }
+                            "runs.subscribe" => {
+                                if !send(&mut socket, WsFrame::error_response(&id, "Unknown method: runs.subscribe")).await { return; }
+                                continue;
+                            }
+                            "runs.get" => json!({"run":{"id":"r1","agent_id":"adu"},"events":[{"kind":"text","label":"assistant","ts":"09:00","preview":"done"}]}),
                             "runs.list" => {
                                 assert_eq!(params["agent_id"], "adu");
                                 json!({"runs":[{"id":"r1","agent_id":"adu","status":"completed"}]})

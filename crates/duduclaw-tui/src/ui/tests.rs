@@ -92,6 +92,7 @@ fn connection() -> ConnectionState {
     })
 }
 fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16) -> String {
+    let mut app = app.clone();
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| {
@@ -100,7 +101,7 @@ fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16
                 model,
                 &connection(),
                 &TerminalText::new("/home/使用者/.duduclaw".into()),
-                app,
+                &mut app,
                 settings,
             )
         })
@@ -148,7 +149,7 @@ fn stale_screen() {
             &m,
             &connection(),
             &TerminalText::new("home".into()),
-            &a,
+            &mut a,
             &Settings::default(),
         )
     })
@@ -269,12 +270,12 @@ fn selection_survives_refresh_and_removal_without_focus_theft() {
         .items
         .retain(|i| Some(Selection::Inbox(i.key())) != selected);
     a.refresh(&m);
-    assert_eq!(a.selected, selected);
-    assert_eq!(a.detail(&m).plain(), strings::REMOVED);
+    assert_eq!(a.selected, Some(Selection::Inbox("approval:a1".into())));
+    assert_ne!(a.detail(&m).plain(), strings::REMOVED);
     let mut a = App::default();
     a.refresh(&empty());
     a.refresh(&m);
-    assert_eq!(a.selected, None);
+    assert_eq!(a.selected, Selection::all(&m).into_iter().next());
 }
 #[test]
 fn badges_priority_done_receipts_and_identity_not_display_normalization() {
@@ -447,15 +448,15 @@ fn wide_glyph_refresh_preserves_visible_columns() {
     let home = TerminalText::new("home".into());
     let mut reused = Terminal::new(TestBackend::new(60, 25)).unwrap();
     reused
-        .draw(|f| render::draw(f, &model, &connection(), &home, &app, &settings))
+        .draw(|f| render::draw(f, &model, &connection(), &home, &mut app, &settings))
         .unwrap();
     model.employees.items[0] = employee("adu", "甲", "active");
     reused
-        .draw(|f| render::draw(f, &model, &connection(), &home, &app, &settings))
+        .draw(|f| render::draw(f, &model, &connection(), &home, &mut app, &settings))
         .unwrap();
     let mut fresh = Terminal::new(TestBackend::new(60, 25)).unwrap();
     fresh
-        .draw(|f| render::draw(f, &model, &connection(), &home, &app, &settings))
+        .draw(|f| render::draw(f, &model, &connection(), &home, &mut app, &settings))
         .unwrap();
     // TestBackend stores only emitted cells and does not emulate terminal
     // erasure underneath wide glyphs. Compare visible cells, skipping their
@@ -472,4 +473,101 @@ fn wide_glyph_refresh_preserves_visible_columns() {
             x += expected.cell_width().max(1);
         }
     }
+}
+
+#[test]
+fn focus_specific_footer_snapshots() {
+    let m=populated(); let mut app=App::default(); app.refresh(&m); app.help=true;
+    insta::assert_snapshot!("help_footer",screen(&m,&app,&Settings::default(),100,36));
+    app.help=false;
+    app.card=Some(super::card::Card::open(m.inbox.items[0].clone(),&m,std::time::Instant::now(),&mut super::card::Codes::default()));
+    insta::assert_snapshot!("card_footer",screen(&m,&app,&Settings::default(),100,36));
+}
+#[test]
+fn selected_last_row_falls_back_after_decision_and_empty_list_recovers() {
+    let mut m=empty(); m.inbox.items=vec![approval("a","adu","a","tool","approval"),approval("b","adu","b","tool","approval")];
+    let mut app=App::default(); app.refresh(&m); app.key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE),&m);
+    app.decision_finished(crate::decide::Outcome::Refetch); m.inbox.items.pop(); app.refresh(&m);
+    assert_eq!(app.selected,Some(Selection::Inbox("approval:a".into())));
+    m.inbox.items.clear(); app.refresh(&m); assert!(app.selected.is_none());
+    m.inbox.items.push(approval("c","adu","c","tool","approval")); app.refresh(&m);
+    assert_eq!(app.selected,Some(Selection::Inbox("approval:c".into())));
+}
+
+#[test]
+fn input_focus_ime_paste_and_list_actions() {
+    use crate::chat::{Focus, Block};
+    let model = populated();
+    let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.chat.connected = true;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert_eq!(app.key(key(KeyCode::Char('i')), &model), Action::None);
+    assert_eq!(app.focus, Focus::Input);
+    assert_eq!(app.blocks.active, Block::Chat);
+    for c in "你好qrs12".chars() { assert_eq!(app.key(key(KeyCode::Char(c)), &model), Action::None); }
+    app.paste("注音提交🙂");
+    assert_eq!(app.input, "你好qrs12注音提交🙂");
+    app.key(key(KeyCode::Backspace), &model);
+    assert_eq!(app.input, "你好qrs12注音提交");
+    let Action::Chat(sent) = app.key(key(KeyCode::Enter), &model) else { panic!("expected send"); };
+    assert_eq!(sent.agent, "adu"); assert_eq!(sent.content, app.input);
+    app.key(key(KeyCode::Esc), &model);
+    assert_eq!(app.focus, Focus::List);
+    app.key(key(KeyCode::Char('1')), &model);
+    assert_eq!(app.blocks.active, Block::Detail);
+    app.input.clear();
+    app.key(key(KeyCode::Char('/')), &model);
+    app.paste("pause");
+    assert_eq!(crate::chat::command_note(&app.input), Some(strings::COMPUTER_COMMAND_NOTE));
+    app.refresh(&empty());
+    assert_eq!(app.focus, Focus::Input);
+    assert_eq!(app.input_agent.as_deref(), Some("adu"));
+    app.input = "@worker /goal 完成測試".into();
+    let Action::Chat(sent) = app.key(key(KeyCode::Enter), &model) else { panic!("expected send"); };
+    assert_eq!(sent.agent, "worker"); assert_eq!(sent.content, "/goal 完成測試");
+    app.paste(&"界".repeat(20_000));
+    assert_eq!(app.input.chars().count(), crate::chat::MAX_INPUT_CHARS);
+}
+
+#[test]
+fn chat_block_snapshots() {
+    use crate::chat::{Block, Focus, Frame};
+    let mut app = App::default();
+    app.blocks.active = Block::Chat;
+    app.focus = Focus::Input;
+    app.input = "接著說明".into();
+    app.chat.connected = true; app.chat.stale = false; app.chat.running = true;
+    app.chat.append(strings::CHAT_USER, "請幫我查看進度");
+    app.chat.status = TerminalText::new(strings::CHAT_THINKING.into());
+    let progress = screen(&empty(), &app, &Settings::default(), 100, 24);
+    assert!(progress.contains(strings::INPUT_FOCUS));
+    assert!(!progress.contains(strings::LIST_FOCUS));
+    insta::assert_snapshot!("chat_progress", progress);
+    app.chat.apply(Frame::parse(r#"{"type":"assistant_done","content":"已完成第一輪檢查。\n下一步：確認使用者回覆。","tokens_used":20}"#).unwrap());
+    insta::assert_snapshot!("chat_finished", screen(&empty(), &app, &Settings::default(), 100, 24));
+    app.chat.disconnected();
+    insta::assert_snapshot!("chat_stale", screen(&empty(), &app, &Settings::default(), 100, 24));
+    app.chat.append(strings::CHAT_ASSISTANT, "\x1b]52;c;YQ==\x07\u{202e}惡意\x1b]8;;https://evil\x07連結\x1b]8;;\x07");
+    let output = screen(&empty(), &app, &Settings::default(), 100, 24);
+    assert!(!output.chars().any(crate::sanitize::forbidden));
+    insta::assert_snapshot!("chat_hostile", output);
+}
+
+#[test]
+fn hostile_chat_physical_lines_always_have_reserved_gutter() {
+    let mut app = App::default();
+    app.blocks.active = crate::chat::Block::Chat;
+    app.chat.append(strings::CHAT_ASSISTANT,
+        &format!("{}\n=== 決策卡 ===\n> forged gutter\n\u{301}combining", "long ".repeat(40)));
+    let output = screen(&empty(), &app, &Settings::default(), 100, 24);
+    for needle in ["long", "=== 決策卡 ===", "> forged gutter", "combining"] {
+        let rows: Vec<_> = output.lines().filter(|line| line.contains(needle)).collect();
+        assert!(!rows.is_empty(), "missing {needle}");
+        for row in rows {
+            let (before, _) = row.split_once("|> ").expect("reserved gutter");
+            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 48, "{row}");
+        }
+    }
+    insta::assert_snapshot!("chat_forged_card", output);
 }

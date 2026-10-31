@@ -129,33 +129,125 @@ impl Selection {
             .collect()
     }
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct App {
     pub selected: Option<Selection>,
+    pub focus: crate::chat::Focus,
+    pub input: String,
+    pub input_agent: Option<String>,
+    pub blocks: crate::chat::Blocks,
+    pub chat: crate::chat::ChatState,
+    pub chat_scroll: usize,
+    pub(super) chat_cache: super::chat_render::TranscriptCache,
+    pub spinner: usize,
     pub detail_open: bool,
     pub help: bool,
     pub detail_scroll: usize,
     pub read: ReadState,
     pub notice: Option<String>,
-    initialized: bool,
+    pub card: Option<super::card::Card>,
+    pub waiting_refresh: Option<u64>,
+    selected_position: usize,
+    codes: super::card::Codes,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     None,
     Quit,
     Save,
+    Snooze,
+    Decide(crate::decide::Decision),
+    Chat(crate::chat::Submission),
+    CancelChat,
 }
 impl App {
+    pub fn focus_label(&self) -> &'static str {
+        if self.card.is_some() { strings::CARD_FOCUS }
+        else if self.help { strings::HELP_FOCUS }
+        else if self.focus == crate::chat::Focus::Input { strings::INPUT_FOCUS }
+        else { strings::LIST_FOCUS }
+    }
+    pub fn decision_finished(&mut self, outcome: crate::decide::Outcome) {
+        self.card = None;
+        self.notice = Some(outcome.notice());
+        // waiting_refresh is cleared only by an authoritative StateFeed result.
+    }
     pub fn refresh(&mut self, model: &Model) {
-        // Establish an initial selection once. Later insertions, removals and
-        // reordering never move it; a removed ID remains a visible tombstone.
-        if !self.initialized && model.inbox.count().is_some() && model.employees.count().is_some() {
-            self.selected = Selection::all(model).into_iter().next();
-            self.initialized = true;
+        if self.waiting_refresh.is_some_and(|n| model.local_refresh > n) {
+            self.waiting_refresh = None;
+        }
+        if model.inbox.count().is_some() && let Some(card) = &mut self.card {
+            match model.inbox.items.iter().find(|i| i.key() == card.item.key()) {
+                None => card.blocked = Some(TerminalText::new(strings::REMOVED.into())),
+                Some(current) if current.data() != card.item.data() => {
+                    card.blocked = Some(TerminalText::new(strings::CARD_REOPEN.into()));
+                }
+                Some(current) if card.blocked.is_none() => card.blocked = super::card_data::blocked(current, model),
+                _ => {}
+            }
+        }
+        // Keep a surviving ID through insertions/reordering. If it disappears,
+        // select the row now at its previous position, or the last row.
+        let all = Selection::all(model);
+        if let Some(index) = self.selected.as_ref().and_then(|id| all.iter().position(|row| row == id)) {
+            self.selected_position = index;
+        } else if match &self.selected {
+            Some(Selection::Inbox(_)) => model.inbox.count().is_some(),
+            Some(Selection::Employee(_)) => model.employees.count().is_some(),
+            Some(Selection::Schedule(_)) => model.schedules.count().is_some(),
+            None => model.inbox.count().is_some() && model.employees.count().is_some(),
+        } {
+            self.selected_position = self.selected_position.min(all.len().saturating_sub(1));
+            self.selected = all.get(self.selected_position).cloned();
+            self.detail_scroll = 0;
         }
     }
+
     pub fn key(&mut self, key: KeyEvent, model: &Model) -> Action {
-        if key.kind == KeyEventKind::Release {
+        self.key_at(key, model, std::time::Instant::now(), crate::snooze::epoch_now())
+    }
+    pub fn key_at(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant, epoch: i64) -> Action {
+        if let Some(card) = &mut self.card {
+            let fresh = model.inbox.count().is_some() && self.waiting_refresh.is_none();
+            return match card.key(key, now, epoch, fresh) {
+                super::card::Effect::None => Action::None,
+                super::card::Effect::Quit => Action::Quit,
+                super::card::Effect::Close => { self.card = None; Action::None },
+                super::card::Effect::Snooze => {
+                    if self.read.snooze(&card.item, epoch) { self.card = None; Action::Snooze }
+                    else { self.notice = Some(strings::SNOOZE_UNAVAILABLE.into()); Action::None }
+                }
+                super::card::Effect::Send(decision) => {
+                    self.card = None;
+                    self.waiting_refresh = Some(model.local_refresh);
+                    self.notice = Some(strings::DECISION_SENDING.into());
+                    Action::Decide(decision)
+                }
+            };
+        }
+        if self.focus == crate::chat::Focus::Input {
+            if key.kind == KeyEventKind::Release { return Action::None; }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { return Action::Quit; }
+            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) { return Action::None; }
+            match key.code {
+                KeyCode::Esc => self.focus = crate::chat::Focus::List,
+                KeyCode::Char(c) => self.paste(&c.to_string()),
+                KeyCode::Backspace => {
+                    use unicode_segmentation::UnicodeSegmentation;
+                    if let Some((index, _)) = self.input.grapheme_indices(true).next_back() { self.input.truncate(index); }
+                }
+                KeyCode::Enter => {
+                    if self.chat.running || !self.chat.connected {
+                        self.notice = Some(if self.chat.running { crate::Error::Busy } else { crate::Error::Disconnected }.to_string());
+                    } else if let Some(input) = crate::chat::submission(&self.input, self.input_agent.as_deref()) {
+                        return Action::Chat(input);
+                    } else { self.notice = Some(strings::INPUT_NEEDS_AGENT.into()); }
+                }
+                _ => {},
+            }
+            return Action::None;
+        }
+        if key.kind != KeyEventKind::Press {
             return Action::None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -168,6 +260,21 @@ impl App {
             return Action::None;
         }
         match key.code {
+            KeyCode::Char('i' | '/') if !self.help => {
+                self.focus = crate::chat::Focus::Input;
+                self.blocks.select(1);
+                self.input_agent = match &self.selected {
+                    Some(Selection::Employee(id)) => Some(id.clone()),
+                    _ => None,
+                };
+                if key.code == KeyCode::Char('/') && self.input.is_empty() { self.input.push('/'); }
+            }
+            KeyCode::Char('1') if !self.help => self.blocks.select(0),
+            KeyCode::Char('2') if !self.help => self.blocks.select(1),
+            KeyCode::Char('x') if !self.help && self.blocks.active == crate::chat::Block::Chat => {
+                if self.chat.can_cancel() { return Action::CancelChat; }
+                self.notice = Some(strings::CHAT_CANCEL_UNAVAILABLE.into());
+            }
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') | KeyCode::F(1) => self.help = !self.help,
             KeyCode::Esc => {
@@ -175,10 +282,22 @@ impl App {
                 self.detail_open = false;
             }
             KeyCode::Enter => {
+                if let Some(Selection::Inbox(id)) = &self.selected
+                    && let Some(item) = model.inbox.items.iter().find(|i| i.key() == *id)
+                {
+                    self.card = Some(super::card::Card::open(item.clone(), model, now, &mut self.codes));
+                    if self.read.resurfaced(item, epoch) {
+                        self.card.as_mut().expect("just opened").hint = Some(strings::RESURFACED);
+                    }
+                    self.help = false;
+                    return Action::None;
+                }
                 self.detail_open = true;
                 self.help = false;
                 self.detail_scroll = 0;
             }
+            KeyCode::PageDown if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_sub(5),
+            KeyCode::PageUp if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_add(5),
             KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
             KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
             KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => self.move_by(model, true),
@@ -201,9 +320,23 @@ impl App {
                 }
                 self.notice = Some(strings::NO_ID.into());
             }
+            KeyCode::Char('s') => {
+                if let Some(Selection::Inbox(id)) = &self.selected
+                    && let Some(item) = model.inbox.items.iter().find(|i| i.key() == *id)
+                {
+                    if self.read.snooze(item, epoch) { return Action::Snooze; }
+                    self.notice = Some(strings::SNOOZE_UNAVAILABLE.into());
+                }
+            }
             _ => {}
         }
         Action::None
+    }
+    pub fn paste(&mut self, text: &str) {
+        if self.focus != crate::chat::Focus::Input || self.card.is_some() { return; }
+        let remaining = crate::chat::MAX_INPUT_CHARS.saturating_sub(self.input.chars().count());
+        self.input.extend(text.chars().filter(|c| !crate::sanitize::forbidden(*c))
+            .map(|c| if c == '\n' { ' ' } else { c }).take(remaining));
     }
     fn move_by(&mut self, model: &Model, down: bool) {
         let all = Selection::all(model);
@@ -219,6 +352,7 @@ impl App {
             Some(i) => i.saturating_sub(1),
             None => 0,
         };
+        self.selected_position = next;
         self.selected = Some(all[next].clone());
         self.detail_scroll = 0;
     }

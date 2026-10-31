@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::{Arc, OnceLock}, time::Duration};
 use tokio::{
     net::TcpStream,
     sync::{broadcast, mpsc, oneshot, watch},
@@ -71,13 +71,35 @@ struct Command {
     method: String,
     params: Value,
     deadline: Instant,
-    reply: oneshot::Sender<Result<Value>>,
+    reply: oneshot::Sender<Result<RpcReply>>,
+}
+/// Keep server errors safe without changing the fixed, credential-free Error type.
+#[derive(Debug)]
+pub enum RpcReply {
+    Accepted(Value),
+    Rejected { message: TerminalText, digest_mismatch: bool },
+}
+impl RpcReply {
+    fn rejected(error: Option<Value>) -> Self {
+        let error = error.unwrap_or(Value::Null);
+        let code = error.get("code").and_then(Value::as_str);
+        Self::Rejected {
+            message: TerminalText::new(error.as_str().or_else(|| error.get("message").and_then(Value::as_str))
+                .unwrap_or(crate::strings::error(Error::RpcRejected)).to_owned()),
+            digest_mismatch: matches!(code, Some("digest_mismatch" | "approval_digest_mismatch" | "expected_digest_mismatch")),
+        }
+    }
 }
 struct Inner {
     commands: mpsc::Sender<Command>,
     status: watch::Receiver<ConnectionState>,
     events: broadcast::Sender<ServerEvent>,
     abort: AbortHandle,
+    chat: OnceLock<crate::chat::ChatClient>,
+    credentials: watch::Receiver<Option<Arc<crate::chat::Credentials>>>,
+    chat_refresh: mpsc::Sender<bool>,
+    target: crate::transport::GatewayUrl,
+    options: ClientOptions,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -100,7 +122,13 @@ impl Client {
         let (tx, rx) = mpsc::channel(64);
         let (status_tx, status_rx) = watch::channel(ConnectionState::Connecting);
         let (events, _) = broadcast::channel(EVENT_QUEUE_CAPACITY);
+        let (credentials_tx, credentials_rx) = watch::channel(None);
+        let (chat_refresh_tx, chat_refresh_rx) = mpsc::channel(1);
+        let target = auth.target().clone();
+        let chat_options = options.clone();
         let actor = Actor {
+            credentials: credentials_tx,
+            chat_refresh: chat_refresh_rx,
             auth,
             session,
             options,
@@ -117,8 +145,16 @@ impl Client {
                 status: status_rx,
                 events,
                 abort: task.abort_handle(),
+                chat: OnceLock::new(), credentials: credentials_rx,
+                chat_refresh: chat_refresh_tx, target, options: chat_options,
             }),
         })
+    }
+    /// Lazily start exactly one chat actor, shared by every cloned handle.
+    pub fn chat(&self) -> crate::chat::ChatClient {
+        self.inner.chat.get_or_init(|| crate::chat::ChatClient::start(
+            self.inner.target.clone(), self.inner.credentials.clone(),
+            self.inner.chat_refresh.clone(), self.inner.options.clone())).clone()
     }
     pub fn connection(&self) -> watch::Receiver<ConnectionState> {
         self.inner.status.clone()
@@ -128,6 +164,12 @@ impl Client {
         self.inner.events.subscribe()
     }
     pub async fn call(&self, method: &str, params: Value, duration: Duration) -> Result<Value> {
+        match self.call_detailed(method, params, duration).await? {
+            RpcReply::Accepted(value) => Ok(value),
+            RpcReply::Rejected { .. } => Err(Error::RpcRejected),
+        }
+    }
+    pub async fn call_detailed(&self, method: &str, params: Value, duration: Duration) -> Result<RpcReply> {
         // Credentials can only travel through the actor's private handshake.
         if matches!(method, "connect" | "connect.challenge") {
             return Err(Error::RpcRejected);
@@ -153,6 +195,8 @@ impl Client {
     }
 }
 struct Actor {
+    credentials: watch::Sender<Option<Arc<crate::chat::Credentials>>>,
+    chat_refresh: mpsc::Receiver<bool>,
     auth: AuthClient,
     session: Session,
     options: ClientOptions,
@@ -185,6 +229,9 @@ impl Actor {
             let end = match opened {
                 Ok(Ok((mut socket, info))) => {
                     self.generation = info.generation;
+                    self.credentials.send_replace(Some(Arc::new(crate::chat::Credentials {
+                        token: Zeroizing::new(self.session.access_token().to_owned()), generation: self.generation,
+                    })));
                     self.status.send_replace(ConnectionState::Connected(info));
                     refresh_attempted = false;
                     let connected_at = Instant::now();
@@ -209,6 +256,7 @@ impl Actor {
                 )) => End::Login(e),
                 _ => End::Reconnect,
             };
+            self.credentials.send_replace(None);
             self.status.send_replace(ConnectionState::Disconnected);
             while let Ok(command) = self.rx.try_recv() {
                 let _ = command.reply.send(Err(Error::Disconnected));
@@ -244,6 +292,7 @@ impl Actor {
         }
     }
     fn login_required(&self, error: Error) {
+        self.credentials.send_replace(None);
         self.status
             .send_replace(ConnectionState::LoginRequired(error));
     }
@@ -286,6 +335,9 @@ impl Actor {
         let end = loop {
             tokio::select! {
                 _ = &mut refresh => break End::Refresh,
+                request = self.chat_refresh.recv() => {
+                    break if request == Some(true) { End::Refresh } else { End::Login(Error::LoginRequired) };
+                }
                 _ = heartbeat.tick() => {
                     if last_received.elapsed() > Duration::from_secs(60) { break End::Reconnect; }
                     if !send(socket, Message::Ping(Vec::new().into()), self.options.request_timeout).await { break End::Reconnect; }
@@ -330,7 +382,7 @@ impl Actor {
                                     if matches!(code, Some("token_expired" | "jwt_expired" | "unauthorized")) { break End::Refresh; }
                                     if let Some(cmd) = pending.remove(&id) {
                                         let result = if cmd.deadline <= Instant::now() { Err(Error::Timeout) }
-                                            else if ok { payload.ok_or(Error::Protocol) } else { Err(Error::RpcRejected) };
+                                            else if ok { payload.map(RpcReply::Accepted).ok_or(Error::Protocol) } else { Ok(RpcReply::rejected(error)) };
                                         let _ = cmd.reply.send(result);
                                     }
                                 }
@@ -484,7 +536,7 @@ fn handshake(payload: Value, expected_user: &str, generation: u64) -> Result<Con
         })),
     })
 }
-fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
+pub(crate) fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
     let ceiling = options
         .backoff_base
         .saturating_mul(2u32.saturating_pow(attempt.min(20)))
@@ -496,6 +548,16 @@ fn backoff(options: &ClientOptions, attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn rpc_rejection_preserves_real_string_and_structured_errors_safely() {
+        for error in [json!("拒絕\u{1b}\u{202e}"), json!({"message":"拒絕\u{1b}\u{202e}"})] {
+            let RpcReply::Rejected { message, digest_mismatch } = RpcReply::rejected(Some(error)) else { unreachable!() };
+            assert_eq!(message.visible(), "拒絕␛⟨U+202E⟩");
+            assert!(!digest_mismatch);
+        }
+        let RpcReply::Rejected { digest_mismatch, .. } = RpcReply::rejected(Some(json!({"code":"digest_mismatch"}))) else { unreachable!() };
+        assert!(digest_mismatch);
+    }
     #[test]
     fn handshake_rejects_legacy_and_password_change() {
         let mut hello =

@@ -8,7 +8,7 @@ license.workspace = true
 duduclaw-core.workspace = true
 duduclaw-gateway.workspace = true
 ratatui.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["bracketed-paste"] }
 tokio.workspace = true
 tracing.workspace = true
 tokio-tungstenite.workspace = true
