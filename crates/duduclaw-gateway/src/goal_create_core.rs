@@ -173,7 +173,18 @@ pub async fn create_goal_task(
     store: &TaskStore,
     req: GoalCreateRequest,
 ) -> Result<GoalCreated, String> {
-    create_goal_task_inner(home_dir, store, req, None).await
+    create_goal_task_inner(home_dir, store, req, None, None).await
+}
+
+/// Create a goal with a caller-owned admission future, polled only after planning.
+/// The shared lease spans the durable insertion, never the model call.
+pub async fn create_goal_task_with_admission(
+    home_dir: &Path,
+    store: &TaskStore,
+    req: GoalCreateRequest,
+    admission: duduclaw_core::autonomy_handoff::AdmissionFuture,
+) -> Result<GoalCreated, String> {
+    create_goal_task_inner(home_dir, store, req, None, Some(admission)).await
 }
 
 /// The same goal contract, with an atomic scheduled-slot fence at insert.
@@ -183,7 +194,7 @@ pub(crate) async fn create_scheduled_goal_task(
     req: GoalCreateRequest,
     slot: &crate::task_store::AssignScheduleSlot<'_>,
 ) -> Result<GoalCreated, String> {
-    create_goal_task_inner(home_dir, store, req, Some(slot)).await
+    create_goal_task_inner(home_dir, store, req, Some(slot), None).await
 }
 
 async fn create_goal_task_inner(
@@ -191,6 +202,7 @@ async fn create_goal_task_inner(
     store: &TaskStore,
     req: GoalCreateRequest,
     slot: Option<&crate::task_store::AssignScheduleSlot<'_>>,
+    admission: Option<duduclaw_core::autonomy_handoff::AdmissionFuture>,
 ) -> Result<GoalCreated, String> {
     crate::machine_employee::check_target(home_dir, &req.agent_id, req.on_behalf_of.as_deref())?;
     let description = req.description.trim();
@@ -327,9 +339,12 @@ async fn create_goal_task_inner(
     // under the `infra` pause class, for a human to retry or cancel.
     if req.plan_first {
         let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
-        let plan_result =
-            crate::goal_plan::generate_plan_first(home_dir, &task.description, criteria_for_plan)
-                .await;
+        let callers: Vec<String> = crate::autonomous_runtime::task_caller(home_dir, &task)
+            .into_iter().collect();
+        let plan_result = crate::autonomous_runtime::scope(
+            home_dir, &task.assigned_to, &callers,
+            crate::goal_plan::generate_plan_first(home_dir, &task.description, criteria_for_plan),
+        ).await;
         if let Err(e) = &plan_result {
             warn!(
                 agent = %req.agent_id,
@@ -340,6 +355,10 @@ async fn create_goal_task_inner(
         crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
     }
 
+    let admission = match admission {
+        Some(admission) => admission.await?,
+        None => None,
+    };
     match slot {
         Some(slot) => store.insert_assign_schedule_task(&task, slot).await,
         None => store.insert_task(&task).await,
@@ -384,6 +403,7 @@ async fn create_goal_task_inner(
         })
         .await;
 
+    drop(admission);
     Ok(GoalCreated {
         task,
         plan_first: req.plan_first,

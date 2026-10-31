@@ -118,6 +118,16 @@ fn write_config_disabling_grounding(home: &Path) {
     .unwrap();
 }
 
+fn write_fixture_agent(home: &Path) {
+    let agent_dir = home.join("agents").join(AGENT_ID);
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("agent.toml"),
+        format!("[agent]\nname = \"{AGENT_ID}\"\nrole = \"fixture\"\nstatus = \"active\"\n"),
+    )
+    .unwrap();
+}
+
 /// A `tool_calls.jsonl` line inside the `[CLAIMED_AT, now]` window every
 /// round shares (fixed far-past `since`, real `until`) — this is what gives
 /// the A3 settle hook `fidelity = McpOnly` evidence (design §5.3: the only
@@ -169,6 +179,7 @@ struct ScenarioOutcome {
 /// matters — two independently-constructed models would never see each
 /// other's settled buckets).
 async fn run_scenario(dir: &Path, forward_model: Option<Arc<TaskForwardModel>>) -> ScenarioOutcome {
+    write_fixture_agent(dir);
     let store = Arc::new(TaskStore::open(dir).unwrap());
     let queue = Arc::new(MessageQueue::open(dir).unwrap());
     store.insert_task(&goal_task("g1")).await.unwrap();

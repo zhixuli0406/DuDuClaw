@@ -1118,6 +1118,19 @@ impl AutopilotEngine {
     ) {
         debug!(rule = %rule.name, event = event_name, "autopilot: rule matched");
 
+        let action: Value = serde_json::from_str(&rule.action).unwrap_or(Value::Null);
+        if let Err(reason) = self.autonomy_check(&action, fields) {
+            let _ = self.store.append_history(&AutopilotHistoryRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
+                triggered_at: chrono::Utc::now().to_rfc3339(),
+                result: "skipped".into(),
+                details: Some(reason),
+            }).await;
+            return;
+        }
+
         // Circuit breaker — protects against self-reinforcing loops
         // (e.g. `task_created → delegate → agent creates task → ...`).
         // Three-state: Closed (normal) / Open (cooldown) / HalfOpen
@@ -1200,7 +1213,6 @@ impl AutopilotEngine {
         if !allowed {
             return;
         }
-        let action: Value = serde_json::from_str(&rule.action).unwrap_or(Value::Null);
 
         // ── WP3 local-model screening ─────────────────────────
         // Deterministic conditions matched and the breaker allowed the fire;
@@ -1351,7 +1363,17 @@ impl AutopilotEngine {
             }
             ScreenPlan::Spec(spec) => {
                 let context = self.screen_context(fields).await;
-                Some(run_screen(self.screener.as_ref(), &spec, &context).await)
+                let target = action.get("target_agent").and_then(Value::as_str)
+                    .or_else(|| fields.get("agent_id").and_then(Value::as_str))
+                    .unwrap_or("");
+                let callers: Vec<String> = fields.get("agent_id")
+                    .and_then(Value::as_str).map(str::to_owned).into_iter().collect();
+                // An empty target installs a global scope; event-owned work
+                // retains its source even when the action targets another agent.
+                Some(crate::autonomous_runtime::scope(
+                    &self.home_dir, target, &callers,
+                    run_screen(self.screener.as_ref(), &spec, &context),
+                ).await)
             }
         }
     }
@@ -1408,6 +1430,21 @@ impl AutopilotEngine {
         )
     }
 
+    /// Check both the recipient and the employee whose event caused a rule.
+    /// Agent-less notifications still obey the global pause and store failures.
+    fn autonomy_check(&self, action: &Value, fields: &serde_json::Map<String, Value>) -> Result<(), String> {
+        use duduclaw_core::autonomy_gate::{self, AutonomyPath};
+        autonomy_gate::check_global(&self.home_dir, AutonomyPath::Autopilot)
+            .map_err(|pause| format!("autonomy paused: {pause}"))?;
+        for agent in [action.get("target_agent"), fields.get("agent_id")]
+            .into_iter().flatten().filter_map(Value::as_str)
+        {
+            autonomy_gate::check(&self.home_dir, agent, AutonomyPath::Autopilot)
+                .map_err(|pause| format!("autonomy paused: {pause}"))?;
+        }
+        Ok(())
+    }
+
     async fn execute_action(
         &self,
         rule_id: &str,
@@ -1415,6 +1452,8 @@ impl AutopilotEngine {
         action: &Value,
         fields: &serde_json::Map<String, Value>,
     ) -> Result<(), String> {
+        // Re-check after an awaited screening decision, before any side effect.
+        self.autonomy_check(action, fields)?;
         let action_type = action.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         // ── Perception input sanitization (P2-5) ──────────────
@@ -1603,6 +1642,7 @@ impl AutopilotEngine {
         fields: &serde_json::Map<String, Value>,
         banner: Option<&str>,
     ) -> Result<(), String> {
+        self.autonomy_check(action, fields)?;
         let channel = action
             .get("channel")
             .and_then(|v| v.as_str())
@@ -1801,7 +1841,9 @@ impl AutopilotEngine {
         agent_id: &str,
         fields: &serde_json::Map<String, Value>,
     ) {
-        if !is_safe_agent_id(agent_id) {
+        if !is_safe_agent_id(agent_id)
+            || duduclaw_core::autonomy_gate::check(&self.home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Autopilot).is_err()
+        {
             return;
         }
         let agent_dir = self.home_dir.join("agents").join(agent_id);
@@ -1958,6 +2000,8 @@ impl AutopilotEngine {
         description: &str,
         acceptance: Option<&str>,
     ) -> Result<(), String> {
+        duduclaw_core::autonomy_gate::check(&self.home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Autopilot)
+            .map_err(|pause| format!("autonomy paused: {pause}"))?;
         let task_id = uuid::Uuid::new_v4().to_string();
         let short = duduclaw_core::truncate_chars(&task_id, 8);
         let title = duduclaw_core::truncate_chars(description, 60);
@@ -2073,6 +2117,8 @@ impl AutopilotEngine {
         prompt: &str,
         lane: Option<String>,
     ) -> Result<(), String> {
+        duduclaw_core::autonomy_gate::check(&self.home_dir, target, duduclaw_core::autonomy_gate::AutonomyPath::Autopilot)
+            .map_err(|pause| format!("autonomy paused: {pause}"))?;
         let mq = match &self.message_queue {
             Some(q) => q.clone(),
             None => return Err("message queue not available".into()),
@@ -3320,6 +3366,7 @@ mod tests {
         let store = Arc::new(AutopilotStore::open(&tmp_dir).unwrap());
         let ts = Arc::new(TaskStore::open(&tmp_dir).unwrap());
         let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        write_agent_toml(&tmp_dir, "a1", "");
         let engine = AutopilotEngine::new(tmp_dir.clone(), store, ts, None, rx);
         (engine, tmp_dir)
     }
@@ -3422,7 +3469,7 @@ mod tests {
     fn write_agent_toml(home: &Path, agent_id: &str, body: &str) {
         let dir = home.join("agents").join(agent_id);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), body).unwrap();
+        std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = {agent_id:?}\nstatus = \"active\"\n{body}")).unwrap();
     }
 
     fn os_file_fields(path: &str, change: &str) -> serde_json::Map<String, Value> {
@@ -3699,6 +3746,7 @@ mod tests {
         let ts = Arc::new(TaskStore::open(&tmp_dir).unwrap());
         let mq = Arc::new(MessageQueue::open(&tmp_dir).unwrap());
         let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        write_agent_toml(&tmp_dir, "worker", "");
         let engine = AutopilotEngine::new(tmp_dir.clone(), store, ts, Some(mq.clone()), rx);
 
         let action = serde_json::json!({
@@ -3757,6 +3805,7 @@ mod tests {
         let ts = Arc::new(TaskStore::open(&tmp_dir).unwrap());
         let mq = Arc::new(MessageQueue::open(&tmp_dir).unwrap());
         let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        write_agent_toml(&tmp_dir, "worker", "");
         let engine = AutopilotEngine::new(tmp_dir.clone(), store, ts, Some(mq.clone()), rx);
         let action = serde_json::json!({ "target_agent": "worker", "prompt": "Look at {name}" });
         let (eff, banner) = sanitize_perception_fields(&fields, &tmp_dir).unwrap();
@@ -3803,6 +3852,11 @@ mod tests {
             .await;
         }
 
+        for agent in ["trader", "scout", "worker"] {
+            let agent_dir = tmp_dir.join("agents").join(agent);
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::write(agent_dir.join("agent.toml"), format!("[agent]\nname = {agent:?}\nstatus = \"active\"\n")).unwrap();
+        }
         let engine = AutopilotEngine::new(tmp_dir.clone(), store, ts, Some(mq.clone()), rx)
             .with_tick_hub(hub);
         (engine, mq, tmp_dir)
@@ -4004,6 +4058,86 @@ mod tests {
             .collect();
         let history = engine.store.list_history(None, 10).await.unwrap();
         (payloads, history, tmp_dir)
+    }
+
+    #[tokio::test]
+    async fn autonomy_pause_autopilot_os_goal_cannot_bypass_rule_gate() {
+        let (engine, tmp) = make_engine().await;
+        duduclaw_core::autonomy_gate::set_pause(&tmp, Some("a1"), "pause", "user").unwrap();
+        assert!(engine.create_os_watch_goal("a1", "work", None).await.is_err());
+        assert!(engine.task_store.list_tasks(None, None, None).await.unwrap().is_empty());
+        duduclaw_core::autonomy_gate::resume(&tmp, Some("a1")).unwrap();
+        engine.create_os_watch_goal("a1", "work", None).await.unwrap();
+        assert_eq!(engine.task_store.list_tasks(None, None, None).await.unwrap().len(), 1);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn autonomy_pause_autopilot_rule_skips_screen_and_action_then_resumes() {
+        let (engine, mq, tmp) = engine_with_ticks("test", 0).await;
+        let screener = ScriptedScreener::ok("YES");
+        let engine = engine.with_screener(screener.clone());
+        let rule = screened_rule(Some(local_screen("pass")));
+        let fields = tick_fields("test");
+        for target in [Some("trader"), None] {
+            duduclaw_core::autonomy_gate::set_pause(&tmp, target, "pause", "user").unwrap();
+            engine.fire_matched_rule(&rule, "tick", &fields).await;
+            assert!(mq.pending_messages(10).await.unwrap().is_empty());
+            assert!(screener.calls().is_empty());
+            let history = engine.store.list_history(None, 10).await.unwrap();
+            assert!(history.iter().all(|row| row.result == "skipped"));
+            duduclaw_core::autonomy_gate::resume(&tmp, target).unwrap();
+        }
+        engine.fire_matched_rule(&rule, "tick", &fields).await;
+        assert_eq!(mq.pending_messages(10).await.unwrap().len(), 1);
+        assert_eq!(screener.calls().len(), 1);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn autopilot_screen_pause_after_check_refuses_target_caller_and_global_handoff() {
+        struct PausingScreener {
+            home: std::path::PathBuf,
+            paused: Option<String>,
+            sent: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl crate::autopilot_screen::LocalScreener for PausingScreener {
+            async fn infer(&self, _system: &str, _user: &str) -> Result<String, String> {
+                use duduclaw_core::autonomy_gate::{self, MutationOutcome, PauseEntry};
+                let outcome = autonomy_gate::mutate_async(&self.home, self.paused.as_deref(), Some(PauseEntry {
+                    reason: "between check and send".into(),
+                    who: "operator".into(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                })).await;
+                assert!(matches!(outcome, MutationOutcome::Applied(_)));
+                duduclaw_core::autonomy_handoff::admit().await?.handed_off();
+                self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("YES".into())
+            }
+        }
+        for paused in [Some("trader"), Some("scout"), None] {
+            let (engine, _queue, tmp) = engine_with_ticks("test", 0).await;
+            let screener = Arc::new(PausingScreener {
+                home: tmp.clone(),
+                paused: paused.map(str::to_owned),
+                sent: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let engine = engine.with_screener(screener.clone());
+            let mut action = serde_json::json!({ "screen": local_screen("pass") });
+            let mut fields = tick_fields("test");
+            if paused.is_some() {
+                action["target_agent"] = serde_json::json!("trader");
+                fields.insert("agent_id".into(), serde_json::json!("scout"));
+            }
+            assert!(engine.autonomy_check(&action, &fields).is_ok());
+            assert!(engine.screen_decision(&action, &fields).await.is_some());
+            assert_eq!(screener.sent.load(std::sync::atomic::Ordering::SeqCst), 0);
+            // A screen configured to pass on failure still cannot dispatch
+            // after a pause; execute_action repeats this same final check.
+            assert!(engine.autonomy_check(&action, &fields).is_err());
+            std::fs::remove_dir_all(tmp).unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

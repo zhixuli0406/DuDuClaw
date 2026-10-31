@@ -1146,8 +1146,8 @@ reports_to = "front"
 
     /// Every regular file under `root`, as (relative path, bytes), sorted.
     /// `experts/` is excluded: its `install.json` records a wall-clock
-    /// `installed_at`. Profile history is retained and validated below; only
-    /// its wall-clock identifiers are normalized for cross-run comparison.
+    /// `installed_at`. Profile history and audit are validated before their
+    /// wall-clock timestamps, version IDs and derived audit chain are normalized.
     fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
         fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             let Ok(rd) = std::fs::read_dir(dir) else {

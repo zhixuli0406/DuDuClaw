@@ -496,10 +496,13 @@ mod pause_reason {
             PauseReason::BlockedNeedsDecision,
             PauseReason::Infra,
             PauseReason::Restart,
+            PauseReason::OperatorPaused,
             PauseReason::Unknown,
         ] {
             assert_eq!(PauseReason::from_stored(Some(r.as_str())), r);
             assert!(!r.label_zh().is_empty());
+            let json = serde_json::to_string(&r).unwrap();
+            assert_eq!(serde_json::from_str::<PauseReason>(&json).unwrap(), r);
         }
     }
 
@@ -894,5 +897,25 @@ mod a1_ledger {
         assert_eq!(v["truncated"], true);
         assert!(v["original_bytes"].as_u64().unwrap() > STATE_BLOCK_LEDGER_MAX_BYTES as u64);
         assert_eq!(v["state_hash"], h.as_str());
+    }
+}
+
+#[test]
+fn autonomy_pause_reason_unknown_wire_token_stays_safe() {
+    use super::PauseReason;
+    assert_eq!(serde_json::from_str::<PauseReason>("\"future_pause_reason\"").unwrap(), PauseReason::Unknown);
+    assert_eq!(PauseReason::OperatorPaused.as_str(), "operator_paused");
+}
+
+#[test]
+fn observer_autoclose_is_an_allowlist() {
+    use super::PauseReason;
+    for reason in [PauseReason::Unknown, PauseReason::OperatorPaused,
+        PauseReason::from_stored(Some("future_reason"))] {
+        assert!(!reason.observer_may_autoclose());
+    }
+    for reason in [PauseReason::NoProgress, PauseReason::BudgetExhausted,
+        PauseReason::BlockedNeedsDecision, PauseReason::Infra, PauseReason::Restart] {
+        assert!(reason.observer_may_autoclose());
     }
 }

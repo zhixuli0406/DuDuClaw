@@ -475,7 +475,7 @@ async fn invoke_recorded<F>(
     fut: F,
 ) -> Result<String, String>
 where
-    F: std::future::Future<Output = Result<String, String>>,
+    F: std::future::Future<Output = Result<String, String>> + Send,
 {
     use crate::cost_telemetry::RequestType as RT;
     let connector_snapshot = std::sync::Arc::new(std::sync::Mutex::new(crate::egress_guard::ConnectorSnapshot::unknown()));
@@ -491,6 +491,8 @@ where
         request_type == RT::Chat,
         crate::on_behalf_of::context::scope(home_dir, agent_id, fut),
     );
+    let fut =
+        crate::autonomous_runtime::request_scope(home_dir, agent_id, request_type != RT::Chat, fut);
     if !matches!(request_type, RT::Cron | RT::Dispatch) {
         return fut.await;
     }
@@ -611,11 +613,13 @@ where
             )];
             let connectors = connector_snapshot.lock().map(|snapshot| snapshot.clone())
                 .unwrap_or_else(|_| crate::egress_guard::ConnectorSnapshot::unknown());
+            let ingest_scope = crate::autonomous_runtime::capture();
             tokio::spawn(async move {
-                crate::memory_provenance::CONNECTOR_STAMPS.scope(connectors, crate::wiki_ingest::run_ingest(
-                    &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
-                    sources,
-                ))
+                crate::autonomous_runtime::restore(ingest_scope,
+                    crate::memory_provenance::CONNECTOR_STAMPS.scope(connectors, crate::wiki_ingest::run_ingest(
+                        &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
+                        sources,
+                    )))
                 .await;
             });
         }
@@ -1215,7 +1219,7 @@ async fn call_claude_for_agent_impl(
             .await;
             return match primary_result {
                 Ok(text) => Ok(text),
-                Err(e) if crate::budget::budget_refusal_message(&e).is_some() => Err(e),
+                Err(e) if is_admission_refusal(&e) => Err(e),
                 Err(ref e)
                     if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e)
                         .is_some() =>
@@ -1246,7 +1250,7 @@ async fn call_claude_for_agent_impl(
                     )
                     .await
                     .map_err(|fe| {
-                        if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                        if is_admission_refusal(&fe) { fe } else {
                             format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
                         }
                     })
@@ -1359,7 +1363,7 @@ async fn call_claude_for_agent_impl(
         {
             Ok(text) => return Ok(text),
             Err(e) => {
-                if crate::budget::budget_refusal_message(&e).is_some() { return Err(e); }
+                if is_admission_refusal(&e) { return Err(e); }
                 let is_rate = is_rate_limit_error(&e);
                 let is_fallback_trigger = is_llm_fallback_error(&e);
                 let can_model_fallback =
@@ -1398,7 +1402,7 @@ async fn call_claude_for_agent_impl(
                     )
                     .await
                     .map_err(|fe| {
-                        if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                        if is_admission_refusal(&fe) { fe } else {
                             format_fallback_error_message(&claude_model, &e, &fallback_model, &fe)
                         }
                     });
@@ -1469,7 +1473,7 @@ async fn call_claude_for_agent_impl(
     .await
     {
         Ok(text) => Ok(text),
-        Err(e) if crate::budget::budget_refusal_message(&e).is_some() => Err(e),
+        Err(e) if is_admission_refusal(&e) => Err(e),
         Err(ref e)
             if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e).is_some() =>
         {
@@ -1494,7 +1498,7 @@ async fn call_claude_for_agent_impl(
             )
             .await
             .map_err(|fe| {
-                if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                if is_admission_refusal(&fe) { fe } else {
                     format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
                 }
             })
@@ -1503,12 +1507,19 @@ async fn call_claude_for_agent_impl(
     }
 }
 
+/// Admission refusals never trigger account, model, or provider retries.
+fn is_admission_refusal(error: &str) -> bool {
+    crate::budget::budget_refusal_message(error).is_some()
+        || crate::autonomous_runtime::was_denied()
+        || error.starts_with("AUTONOMY_PAUSED:")
+}
+
 /// Check whether an error string indicates a billing/credit exhaustion issue.
 ///
 /// These errors should NOT be retried with the same account — the account
 /// needs a long cooldown (topped up manually).
 pub(crate) fn is_billing_error(error: &str) -> bool {
-    if crate::budget::budget_refusal_message(error).is_some() { return false; }
+    if is_admission_refusal(error) { return false; }
     let lower = error.to_lowercase();
     lower.contains("credit")
         || lower.contains("balance")
@@ -1693,6 +1704,8 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         &self,
         req: &duduclaw_llm::ChatRequest,
     ) -> Result<duduclaw_llm::ChatResponse, duduclaw_llm::LlmError> {
+        // Each provider transport admits immediately before sending, including
+        // every tool-loop iteration. Billing must not retain its lease.
         let resp = self.inner.complete(req).await?;
         // Reasoning fold: bill reasoning exactly once at the output rate
         // (mirrors the legacy single-shot mapping).
@@ -2489,7 +2502,7 @@ struct ChainError {
 /// failover-class (rate limit / billing / 5xx / timeout / overloaded) vs.
 /// terminal (auth / invalid). Terminal short-circuits the chain.
 fn is_chain_failover(err: &str) -> bool {
-    if crate::budget::budget_refusal_message(err).is_some() { return false; }
+    if is_admission_refusal(err) { return false; }
     is_rate_limit_error(err) || is_billing_error(err) || is_llm_fallback_error(err)
 }
 
@@ -3026,6 +3039,8 @@ async fn call_local_inference_raw(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    // Provider transports admit each request, including local tool-loop rounds.
+    crate::autonomous_runtime::check_current().await?;
     let engine = get_inference_engine(home_dir)
         .await
         .ok_or_else(|| "Local inference engine not available".to_string())?;
@@ -3455,7 +3470,12 @@ async fn call_with_rotation(
                 // per-account spawn, it still must not count against the
                 // account or try the next one.
                 if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e)
-                    || crate::budget::budget_refusal_message(&e).is_some() {
+                    || is_admission_refusal(&e) {
+                    return Err(e);
+                }
+                // An autonomy pause refusal is not the account's fault, and every
+                // other account would be refused the same way.
+                if crate::autonomous_runtime::was_denied() {
                     return Err(e);
                 }
                 last_error = e.clone();
@@ -3681,9 +3701,12 @@ async fn call_claude_streaming(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
+    let admission = crate::autonomous_runtime::admit_current().await?;
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    crate::autonomous_runtime::mark_handoff();
+    drop(admission);
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 

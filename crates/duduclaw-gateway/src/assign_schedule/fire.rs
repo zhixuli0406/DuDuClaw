@@ -162,6 +162,11 @@ async fn fire_one(
     if !agent_operational(registry, &row.agent_id).await {
         return auto_pause(home, store, row, &slot_s, "agent_unavailable").await;
     }
+    if duduclaw_core::autonomy_gate::check(
+        home, &row.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::AssignSchedule,
+    ).is_err() {
+        return advance_skip(home, store, row, &slot_s, next.as_deref(), skip("autonomy_paused"), now).await;
+    }
     if previous_run_open(store, row).await {
         return advance_skip(
             home,

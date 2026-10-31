@@ -67,6 +67,7 @@ mod templates_util;
 mod templates_rpc;
 mod templates_create;
 mod agents_ops;
+mod autonomy_rpc;
 mod agents_update;
 mod contract_rpc;
 mod redaction_rpc;

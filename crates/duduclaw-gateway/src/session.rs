@@ -50,6 +50,7 @@ pub struct SessionMessage {
 /// may need to (re)title.
 pub struct TitleCandidate {
     pub session_id: String,
+    pub agent_id: String,
     pub turn_count: u32,
     pub titled_through_turn: u32,
 }
@@ -1067,7 +1068,7 @@ impl SessionManager {
                 "SELECT s.id,
                         (SELECT COUNT(*) FROM session_messages m
                            WHERE m.session_id = s.id AND m.hidden = 0 AND m.undone_at IS NULL),
-                        COALESCE(s.titled_through_turn, 0)
+                        COALESCE(s.titled_through_turn, 0), s.agent_id
                  FROM sessions s
                  WHERE s.archived_at IS NULL AND s.last_active >= ?1
                  ORDER BY s.last_active DESC",
@@ -1079,6 +1080,7 @@ impl SessionManager {
                     session_id: row.get(0)?,
                     turn_count: row.get::<_, i64>(1)?.max(0) as u32,
                     titled_through_turn: row.get::<_, i64>(2)?.max(0) as u32,
+                    agent_id: row.get(3)?,
                 })
             })
             .map_err(|e| DuDuClawError::Gateway(format!("list_title_candidates query: {e}")))?;

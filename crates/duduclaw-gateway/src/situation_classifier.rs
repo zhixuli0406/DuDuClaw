@@ -478,13 +478,16 @@ pub async fn classify_llm(
     args: &Value,
 ) -> ClassificationResult {
     let prompt = build_situation_prompt(tool_name, args);
-    match crate::runtime_dispatch::run_utility_prompt(
+    match crate::autonomous_runtime::scope(
+        home_dir, agent_dir.file_name().and_then(|s| s.to_str()).unwrap_or("invalid:agent-dir"), &[],
+        crate::runtime_dispatch::run_utility_prompt(
         home_dir,
         Some(agent_dir),
         "situation-classifier",
         "", // instructions live in the prompt itself
         &prompt,
         crate::runtime_dispatch::UTILITY_MAX_TOKENS,
+    )
     )
     .await
     {

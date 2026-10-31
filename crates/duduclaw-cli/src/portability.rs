@@ -102,6 +102,10 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool) -> Result<()> {
         ));
     }
     validate_import_policy(archive, home)?;
+    // Create only the empty root before locking; no employee data is written.
+    fs::create_dir_all(home).map_err(|e| io_err("import mkdir home", e))?;
+    let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home)
+        .map_err(|error| io_err("import", error))?;
     let existing_agents = home.join("agents");
     if existing_agents.exists() {
         if !force {
@@ -124,7 +128,18 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool) -> Result<()> {
     let file = File::open(archive).map_err(|e| io_err("import open", e))?;
     let dec = GzDecoder::new(file);
     let mut ar = tar::Archive::new(dec);
-    ar.unpack(home).map_err(|e| io_err("import unpack", e))?;
+    for entry in ar.entries().map_err(|e| io_err("import unpack", e))? {
+        let mut entry = entry.map_err(|e| io_err("import unpack", e))?;
+        let path: PathBuf = entry.path().map_err(|e| io_err("import unpack", e))?
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .collect();
+        // Restoring a lock file would replace the inode carrying our lease.
+        if path.starts_with(duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE) {
+            continue;
+        }
+        entry.unpack_in(home).map_err(|e| io_err("import unpack", e))?;
+    }
     Ok(())
 }
 
@@ -259,6 +274,24 @@ mod tests {
             assert_eq!(fs::read_to_string(target.join("agents/kept/SOUL.md")).unwrap(), "keep");
             assert!(!target.join("agents.pre-import").exists());
         }
+    }
+
+    #[test]
+    fn import_preserves_the_live_admission_lock() {
+        let root = unique_tmp("admission-lock");
+        let source = root.join("source");
+        let target = root.join("target");
+        let lock = duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE;
+        write(&source.join(lock), "archived lock");
+        write(&source.join("agents/new/SOUL.md"), "new");
+        write(&target.join(lock), "live lock");
+        write(&target.join("agents/old/SOUL.md"), "old");
+        let archive = root.join("input.tar.gz");
+        export_home(&source, &archive).unwrap();
+        import_archive(&archive, &target, true).unwrap();
+        assert_eq!(fs::read_to_string(target.join(lock)).unwrap(), "live lock");
+        assert!(target.join("agents/new/SOUL.md").is_file());
+        assert!(target.join("agents.pre-import/old/SOUL.md").is_file());
         let _ = fs::remove_dir_all(&root);
     }
 

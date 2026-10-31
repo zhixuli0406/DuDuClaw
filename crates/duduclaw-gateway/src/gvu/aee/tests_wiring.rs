@@ -149,7 +149,7 @@ fn home_with_script(agent_toml: &str, script: impl FnOnce(&Path) -> String) -> H
         "# Agent\n\n## \u{6838}\u{5FC3}\u{50F9}\u{503C}\n\n- \u{8AA0}\u{5BE6}\n",
     )
     .unwrap();
-    std::fs::write(agent_dir.join("agent.toml"), agent_toml).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"), format!("[agent]\nname = {AGENT:?}\nstatus = \"active\"\n{agent_toml}")).unwrap();
 
     // Eval suite: two visible cases plus one held-out.
     let suite = root.join("evals").join(AGENT);

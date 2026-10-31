@@ -1,3 +1,5 @@
+pub mod autonomy_gate;
+pub mod autonomy_handoff;
 pub mod agent_guard;
 pub mod agent_names;
 pub mod agent_profile;

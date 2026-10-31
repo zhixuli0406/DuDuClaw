@@ -121,6 +121,16 @@ pub(crate) fn commit_locked(
     render: impl FnOnce(&str) -> Result<String, String>,
     guard: impl FnOnce() -> Result<(), String>,
 ) -> Result<Outcome, CommitError> {
+    commit_locked_with_lifecycle(c, render, guard, false)
+}
+
+/// A stop request can require a barrier even if its status was already set.
+pub(crate) fn commit_locked_with_lifecycle(
+    c: &Commit<'_>,
+    render: impl FnOnce(&str) -> Result<String, String>,
+    guard: impl FnOnce() -> Result<(), String>,
+    force_lifecycle_barrier: bool,
+) -> Result<Outcome, CommitError> {
     let path = super::file_path(c.home, c.agent_id, &c.key).map_err(CommitError::Refused)?;
     let keep = AgentFilesConfig::load(c.home).history_keep;
     let result = duduclaw_core::with_file_lock(&lock_anchor(c, &path), || {
@@ -144,9 +154,6 @@ pub(crate) fn commit_locked(
         {
             return Ok(Locked::Err(CommitError::Conflict { current_hash: before_hash }));
         }
-        if let Err(e) = guard() {
-            return Ok(Locked::Err(CommitError::Refused(e)));
-        }
         let new = match render(&current) {
             Ok(n) => n,
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
@@ -160,6 +167,20 @@ pub(crate) fn commit_locked(
                 Err(_) => return Ok(Locked::Err(CommitError::Refused("憑證掃描失敗，未寫入 USER.md".into()))),
             }
         } else { new };
+        // Compare fresh bytes under the file lock, before any history or write.
+        // The lease also covers external MCP edits and raw profile restoration.
+        let _lifecycle = if c.key == FileKey::AgentToml
+            && (force_lifecycle_barrier
+                || duduclaw_core::autonomy_gate::lifecycle_barrier_required(&current, &new))
+        {
+            Some(duduclaw_core::autonomy_gate::exclusive_barrier(c.home)?)
+        } else {
+            None
+        };
+        // Recheck authority after a potentially long admission drain.
+        if let Err(e) = guard() {
+            return Ok(Locked::Err(CommitError::Refused(e)));
+        }
         let hash = super::hash_of(&new);
         let accept_current = new == current && c.baseline == Baseline::AcceptCurrent && c.key.protected_doc().is_some();
         if existed && new == current && !accept_current {

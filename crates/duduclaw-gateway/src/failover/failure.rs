@@ -91,7 +91,8 @@ impl RuntimeDispatchFailure {
             .find_map(|step| match &step.outcome {
                 RuntimeStepOutcome::ExecutionError(error)
                     if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
-                        || crate::budget::budget_refusal_message(error).is_some() =>
+                        || crate::budget::budget_refusal_message(error).is_some()
+                        || error.starts_with("AUTONOMY_PAUSED:") =>
                 {
                     Some(error.clone())
                 }

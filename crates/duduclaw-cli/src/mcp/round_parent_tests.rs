@@ -301,6 +301,7 @@ async fn env_child_tasks_create_is_refused() {
         "the parent test sets the variable"
     );
     let home = Home::new();
+    super::tests::create_test_agent(&home.path().join("agents"), "worker", "");
     let out = handle_tasks_create(&json!({ "title": "t" }), home.path(), EMP).await;
     assert!(
         out.get("isError")

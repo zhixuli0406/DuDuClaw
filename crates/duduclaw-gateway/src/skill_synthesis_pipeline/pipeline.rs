@@ -184,6 +184,18 @@ impl PipelineRun {
 /// into [`PipelineRun::errors`] rather than propagating. The caller is
 /// responsible for logging the run summary.
 pub async fn run(config: &PipelineConfig) -> PipelineRun {
+    run_for_caller(config, None).await
+}
+
+/// Preserve the verified MCP caller at every model/publication boundary.
+pub async fn run_for_caller(config: &PipelineConfig, caller: Option<&str>) -> PipelineRun {
+    let callers = caller.map(str::to_owned).into_iter().collect::<Vec<_>>();
+    crate::autonomous_runtime::scope(
+        &config.home_dir, &config.target_agent_id, &callers, run_scoped(config),
+    ).await
+}
+
+async fn run_scoped(config: &PipelineConfig) -> PipelineRun {
     let started_at = Utc::now();
     let mut errors: Vec<String> = Vec::new();
 
@@ -447,6 +459,16 @@ async fn graduate_trajectories(
             break;
         }
         let spec = crate::runtime_config::resolve_utility(&config.home_dir, Some(&agent_dir));
+        match duduclaw_core::autonomy_gate::check(
+            &config.home_dir, &config.target_agent_id,
+            duduclaw_core::autonomy_gate::AutonomyPath::Background,
+        ) {
+            Ok(()) => (),
+            Err(pause) => {
+                errors.push(format!("{span_prefix} {pause}"));
+                break;
+            }
+        };
         let llm_result: Result<String, String> =
             if spec.provider == duduclaw_core::types::RuntimeType::Claude {
                 call_direct_api(&api_key, &spec.model, system, &prompt, &[])
@@ -512,20 +534,24 @@ async fn graduate_trajectories(
 
         // ── Step 5: Write skill to agent SKILLS directory ─────────────────────
 
-        if let Err(e) = tokio::fs::create_dir_all(&agent_skills_dir).await {
-            let msg = format!("{span_prefix} Failed to create SKILLS dir: {e}");
-            warn!("{}", msg);
-            errors.push(msg);
-            continue;
-        }
-
-        let skill_path = agent_skills_dir.join(format!("{}.md", synthesized.name));
-        if let Err(e) = tokio::fs::write(&skill_path, &synthesized.full_markdown).await {
-            let msg = format!("{span_prefix} Failed to write skill file: {e}");
-            warn!("{}", msg);
-            errors.push(msg);
-            continue;
-        }
+        // Keep publication and graduation in the same admission transaction.
+        let _publication = match duduclaw_core::autonomy_gate::admit(
+            &config.home_dir, &config.target_agent_id,
+            duduclaw_core::autonomy_gate::AutonomyPath::Background,
+        ).await {
+            Ok(guard) => guard,
+            Err(pause) => {
+                errors.push(format!("{span_prefix} {pause}"));
+                break;
+            }
+        };
+        let caller_publication = match crate::autonomous_runtime::admit_current().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                errors.push(format!("{span_prefix} {error}"));
+                break;
+            }
+        };
 
         // ── Step 6: Graduate to global Skill Bank ─────────────────────────────
 
@@ -538,17 +564,34 @@ async fn graduate_trajectories(
             first_activated: traj.window_start,
         };
 
-        match graduation::graduate_to_global(&candidate, &agent_skills_dir, &global_skills_dir)
-            .await
-        {
-            Ok(record) => {
-                let home_clone = config.home_dir.clone();
-                let record_clone = record.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    graduation::append_graduation_log(&record_clone, &home_clone);
-                })
-                .await;
+        // The blocking writer owns both leases through every filesystem call.
+        // Request cancellation or runtime shutdown cannot release the leases
+        // while publication, graduation, cleanup or log append is in flight.
+        let publish_agent_dir = agent_skills_dir.clone();
+        let publish_global_dir = global_skills_dir.clone();
+        let publish_home = config.home_dir.clone();
+        let markdown = synthesized.full_markdown.clone();
+        let publication = tokio::task::spawn_blocking(move || {
+            let _leases = (_publication, caller_publication);
+            std::fs::create_dir_all(&publish_agent_dir)
+                .map_err(|e| format!("Failed to create SKILLS dir: {e}"))?;
+            let skill_path = publish_agent_dir.join(format!("{}.md", candidate.skill_name));
+            std::fs::write(&skill_path, markdown)
+                .map_err(|e| format!("Failed to write skill file: {e}"))?;
+            match graduation::graduate_to_global_blocking(&candidate, &publish_agent_dir, &publish_global_dir) {
+                Ok(record) => {
+                    graduation::append_graduation_log(&record, &publish_home);
+                    Ok::<(), String>(())
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&skill_path);
+                    Err(error)
+                }
+            }
+        }).await.unwrap_or_else(|e| Err(format!("Skill publication task failed: {e}")));
 
+        match publication {
+            Ok(()) => {
                 info!(
                     skill = %synthesized.name,
                     score = %format!("{:.3}", traj.quality_score),
@@ -589,8 +632,6 @@ async fn graduate_trajectories(
                 graduated += 1;
             }
             Err(e) => {
-                // Clean up the skill file we wrote but failed to graduate.
-                let _ = tokio::fs::remove_file(&skill_path).await;
                 let msg = format!(
                     "{span_prefix} Graduation to global scope failed for '{}': {e}",
                     synthesized.name
@@ -988,4 +1029,27 @@ mod tests {
         );
         assert!(out[0].contains("30-day policy"));
     }
+    #[tokio::test]
+    async fn paused_direct_api_synthesis_does_not_write_or_graduate() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/agent-a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some("agent-a"), "test", "operator").unwrap();
+        let config = PipelineConfig {
+            home_dir: home.path().to_path_buf(), target_agent_id: "agent-a".into(),
+            api_key: Some("must-not-be-used".into()), dry_run: false,
+            ..Default::default()
+        };
+        let trajectory = ScoredTrajectory {
+            agent_id: "agent-a".into(), window_start: Utc::now(), window_end: Utc::now(),
+            event_count: 1, success_count: 1, quality_score: 1.0, events: Vec::new(),
+        };
+        let (count, errors) = graduate_trajectories(&[trajectory], &config).await;
+        assert_eq!(count, 0);
+        assert!(errors.iter().any(|error| error.contains("agent_pause")));
+        assert!(!dir.join("SKILLS").exists());
+        assert!(!home.path().join("skills").exists());
+    }
+
 }

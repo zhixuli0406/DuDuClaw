@@ -6089,6 +6089,7 @@
   "goals.pauseReason.blocked_needs_decision": "Waiting on your decision",
   "goals.pauseReason.infra": "System problem",
   "goals.pauseReason.restart": "Paused after a restart",
+  "goals.pauseReason.operator_paused": "Paused by an operator",
   "goals.pauseReason.unknown": "Needs a human to check",
   "goals.takenOver": "Taken over",
   "goals.create.title": "Assign task",

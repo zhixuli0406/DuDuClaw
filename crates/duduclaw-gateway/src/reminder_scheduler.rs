@@ -497,11 +497,23 @@ pub async fn append_reminder_checked(
     reminder: &Reminder,
     max_per_agent: usize,
 ) -> Result<AppendResult, String> {
+    append_reminder_checked_admitted(home_dir, reminder, max_per_agent, None).await
+}
+
+/// The writer owns the caller's admission lease through its atomic append,
+/// including when the awaiting MCP request is cancelled.
+pub async fn append_reminder_checked_admitted(
+    home_dir: &Path,
+    reminder: &Reminder,
+    max_per_agent: usize,
+    admission: Option<duduclaw_core::autonomy_gate::AdmissionGuard>,
+) -> Result<AppendResult, String> {
     let r = reminder.clone();
     let agent = reminder.agent_id.clone();
     let home = home_dir.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         let _lock = acquire_lock(&home)?;
         let mut reminders = load_reminders_sync(&home);
 
@@ -655,6 +667,15 @@ impl ReminderScheduler {
             }
         }
 
+        // Keep paused callbacks pending on disk; reload retries after resume.
+        // Static reminders send the user's stored text without waking an employee.
+        let mut admitted = Vec::new();
+        for reminder in to_fire {
+            if reminder_autonomy_check(&self.home_dir, &self.registry, &reminder).await.is_ok() {
+                admitted.push(reminder);
+            }
+        }
+        let to_fire = admitted;
         if to_fire.is_empty() {
             return;
         }
@@ -697,7 +718,7 @@ impl ReminderScheduler {
                         warn!(id = %reminder.id, "Reminder delivery failed: {e}");
                         DeliveryResult {
                             id: reminder.id.clone(),
-                            status: ReminderStatus::Failed,
+                            status: if e.starts_with(AUTONOMY_PAUSED) { ReminderStatus::Pending } else { ReminderStatus::Failed },
                             error: Some(e),
                         }
                     }
@@ -808,6 +829,24 @@ async fn run_gc(home_dir: &Path) {
 /// The `sem` permit is acquired only around the bounded channel-send step
 /// (M61) — the potentially-unbounded `AgentCallback` text generation runs
 /// without holding a permit so slow LLM callbacks cannot stall other reminders.
+const AUTONOMY_PAUSED: &str = "autonomy paused: ";
+
+async fn reminder_autonomy_check(home: &Path, registry: &Arc<RwLock<AgentRegistry>>, reminder: &Reminder) -> Result<String, String> {
+    if reminder.mode == ReminderMode::Direct {
+        return Ok(reminder.agent_id.clone());
+    }
+    let effective = if reminder.agent_id == "default" {
+        registry.read().await.main_agent()
+            .map(|agent| agent.config.agent.name.clone())
+            .ok_or_else(|| format!("{AUTONOMY_PAUSED}default employee unavailable"))?
+    } else {
+        reminder.agent_id.clone()
+    };
+    duduclaw_core::autonomy_gate::check(home, &effective, duduclaw_core::autonomy_gate::AutonomyPath::Background)
+        .map_err(|pause| format!("{AUTONOMY_PAUSED}{pause}"))?;
+    Ok(effective)
+}
+
 async fn deliver_reminder(
     home_dir: &Path,
     http: &reqwest::Client,
@@ -815,9 +854,38 @@ async fn deliver_reminder(
     sem: &Arc<tokio::sync::Semaphore>,
     reminder: &Reminder,
 ) -> Result<(), String> {
+    deliver_reminder_with(home_dir, http, registry, sem, reminder, |agent_id, prompt| async move {
+        call_claude_for_agent_with_type(
+            home_dir,
+            registry,
+            &agent_id,
+            &prompt,
+            crate::cost_telemetry::RequestType::Cron,
+        )
+        .await
+    })
+    .await
+}
+
+// Share admission and channel delivery with tests while replacing only the model call.
+async fn deliver_reminder_with<F, Fut>(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    sem: &Arc<tokio::sync::Semaphore>,
+    reminder: &Reminder,
+    invoke: F,
+) -> Result<(), String>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
     let mut resolved_reminder = reminder.clone();
     resolved_reminder.agent_id = crate::recipient_guard::scheduled_agent(registry, &reminder.agent_id).await?;
     let reminder = &resolved_reminder;
+    let mut effective_reminder = reminder.clone();
+    effective_reminder.agent_id = reminder_autonomy_check(home_dir, registry, reminder).await?;
+    let reminder = &effective_reminder;
     let text = match reminder.mode {
         ReminderMode::Direct => reminder
             .message
@@ -855,15 +923,24 @@ async fn deliver_reminder(
                 crate::task_sandbox::HostPath::Reminder,
                 crate::task_sandbox::HostAction::RanOnHost,
             );
-            let result = call_claude_for_agent_with_type(
-                home_dir,
-                registry,
-                &reminder.agent_id,
-                &full_prompt,
-                crate::cost_telemetry::RequestType::Cron,
+            reminder_autonomy_check(home_dir, registry, reminder).await?;
+            // Read the denial flag inside the scope: runtimes wrap the refusal
+            // text, so a pause landing after the check above must still leave
+            // the reminder Pending rather than Failed.
+            let (result, denied) = crate::autonomous_runtime::scope(
+                home_dir, &reminder.agent_id, &[],
+                async {
+                    let result = invoke(reminder.agent_id.clone(), full_prompt).await;
+                    (result, crate::autonomous_runtime::was_denied())
+                },
             )
             .await;
             drop(typing_guard);
+            if denied {
+                if let Err(e) = &result {
+                    return Err(format!("{AUTONOMY_PAUSED}{e}"));
+                }
+            }
             result.map_err(|e| format!("Agent callback failed: {e}"))?
         }
     };
@@ -988,6 +1065,72 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ddc-reminder-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autonomy_pause_reminder_callback_defers_but_static_reminder_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"worker\"\nstatus = \"active\"\n").unwrap();
+        let mut reminder: Reminder = serde_json::from_value(serde_json::json!({
+            "id": "pause-reminder", "agent_id": "worker", "trigger_at": Utc::now(),
+            "channel": "test", "chat_id": "chat", "mode": "agent_callback", "prompt": "work"
+        })).unwrap();
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let http = reqwest::Client::new();
+        let calls = std::cell::Cell::new(0);
+        let invoke = |agent: String, prompt: String| {
+            calls.set(calls.get() + 1);
+            assert_eq!(agent, "worker");
+            assert!(prompt.contains("work"));
+            std::future::ready(Ok("callback output".to_string()))
+        };
+        for target in [Some("worker"), None] {
+            let before = calls.get();
+            duduclaw_core::autonomy_gate::set_pause(dir.path(), target, "pause", "user").unwrap();
+            let error = deliver_reminder_with(dir.path(), &http, &registry, &sem, &reminder, invoke).await.unwrap_err();
+            assert!(error.starts_with(AUTONOMY_PAUSED));
+            assert_eq!(calls.get(), before);
+            reminder.mode = ReminderMode::Direct;
+            // The unsupported channel is a deterministic, network-free send boundary.
+            let error = deliver_reminder_with(dir.path(), &http, &registry, &sem, &reminder, invoke).await.unwrap_err();
+            assert!(error.starts_with("Delivery failed after retry"), "{error}");
+            assert_eq!(calls.get(), before, "static reminders never invoke a model");
+            reminder.mode = ReminderMode::AgentCallback;
+            duduclaw_core::autonomy_gate::resume(dir.path(), target).unwrap();
+            let error = deliver_reminder_with(dir.path(), &http, &registry, &sem, &reminder, invoke).await.unwrap_err();
+            assert!(error.starts_with("Delivery failed after retry"), "{error}");
+            assert_eq!(calls.get(), before + 1, "resumed callback reaches channel delivery");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autonomy_pause_reminder_default_alias_uses_the_main_employee() {
+        let (dir, reg) = crate::trigger_route::tests::registry(false).await;
+        let agent = reg.main_agent().unwrap().config.agent.name.clone();
+        let registry = Arc::new(RwLock::new(reg));
+        let reminder: Reminder = serde_json::from_value(serde_json::json!({
+            "id": "alias-reminder", "agent_id": "default", "trigger_at": Utc::now(),
+            "channel": "test", "chat_id": "chat", "mode": "agent_callback", "prompt": "work"
+        })).unwrap();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let http = reqwest::Client::new();
+        let calls = std::cell::Cell::new(0);
+        let invoke = |effective_agent: String, _prompt: String| {
+            calls.set(calls.get() + 1);
+            assert_eq!(effective_agent, agent);
+            std::future::ready(Ok("callback output".to_string()))
+        };
+        duduclaw_core::autonomy_gate::set_pause(dir.path(), Some(&agent), "pause", "user").unwrap();
+        let error = deliver_reminder_with(dir.path(), &http, &registry, &sem, &reminder, invoke).await.unwrap_err();
+        assert!(error.starts_with(AUTONOMY_PAUSED));
+        assert_eq!(calls.get(), 0);
+        duduclaw_core::autonomy_gate::resume(dir.path(), Some(&agent)).unwrap();
+        let error = deliver_reminder_with(dir.path(), &http, &registry, &sem, &reminder, invoke).await.unwrap_err();
+        assert!(error.starts_with("Delivery failed after retry"), "{error}");
+        assert_eq!(calls.get(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

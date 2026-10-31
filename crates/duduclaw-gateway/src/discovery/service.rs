@@ -227,6 +227,15 @@ fn validate_spec(home: &Path, config: &DiscoveryConfig, agent: &str,
 pub async fn create(home: &Path, store: &TaskStore, broker: &ApprovalBroker,
     caller: &TrustedCaller, agent: &str, title: &str, description: &str,
     spec: PublicDiscoverySpec) -> Result<CreatedDiscovery, String> {
+    create_inner(home, store, broker, caller, agent, title, description, spec, None).await
+}
+
+// MCP supplies a lazy admission future so evaluator hashing and validation run
+// before acquiring the lease; RPC keeps its existing operator authority.
+async fn create_inner(home: &Path, store: &TaskStore, broker: &ApprovalBroker,
+    caller: &TrustedCaller, agent: &str, title: &str, description: &str,
+    spec: PublicDiscoverySpec, admission: Option<duduclaw_core::autonomy_handoff::AdmissionFuture>,
+) -> Result<CreatedDiscovery, String> {
     caller.authorize_create(home, agent).inspect_err(|_| {
         crate::security_autopilot::audit_and_emit(home, &duduclaw_security::audit::AuditEvent::new(
             "discovery_create_denied", &caller.id(), duduclaw_security::audit::Severity::Warning,
@@ -247,6 +256,10 @@ pub async fn create(home: &Path, store: &TaskStore, broker: &ApprovalBroker,
         scorer_hash: scorer_hash.clone(), direction: spec.direction,
         approved_root_id: spec.approved_root_id.clone(), runtime: spec.runtime.clone(),
         configured_model: spec.model.clone() };
+    let _admission = match admission {
+        Some(admission) => admission.await?,
+        None => None,
+    };
     let defaults = DiscoveryStore::open(home).map_err(|e| e.to_string())?
         .load_discovery_default(&namespace).map_err(|e| e.to_string())?;
     let frozen = FrozenCreation { spec, scorer_hash, creator_origin: caller.origin().into(), defaults };
@@ -370,4 +383,14 @@ pub async fn create_from_value(home: &Path, store: &TaskStore, broker: &Approval
     if !request.kind.trim().eq_ignore_ascii_case("discovery") { return Err("wrong task kind".into()); }
     create(home, store, broker, caller, &request.assigned_to, &request.title,
         &request.description, request.discovery).await
+}
+
+/// MCP admission is evaluated after request validation and before durable writes.
+pub async fn create_from_value_with_admission(home: &Path, store: &TaskStore, broker: &ApprovalBroker,
+    caller: &TrustedCaller, value: Value, admission: duduclaw_core::autonomy_handoff::AdmissionFuture,
+) -> Result<CreatedDiscovery, String> {
+    let request: CreateEnvelope = serde_json::from_value(value).map_err(|_| "invalid discovery create request")?;
+    if !request.kind.trim().eq_ignore_ascii_case("discovery") { return Err("wrong task kind".into()); }
+    create_inner(home, store, broker, caller, &request.assigned_to, &request.title,
+        &request.description, request.discovery, Some(admission)).await
 }

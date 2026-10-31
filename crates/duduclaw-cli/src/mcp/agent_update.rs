@@ -588,20 +588,14 @@ pub(crate) async fn handle_agent_update(
         });
     }
 
-    // WP22 T1 — re-parenting lands in the authoritative store first, then in
-    // the `agent.toml` mirror below (see the ordering note in
-    // `handle_create_agent`). Only written when this call actually touched
-    // `reports_to`: an unrelated edit (icon, model, …) must not quietly adopt
-    // a mirror value the operator has not synced.
-    if let Some(v) = params.get("reports_to").and_then(|v| v.as_str()) {
-        if let Err(e) = duduclaw_core::org_store::upsert(
-            home_dir,
-            agent_id,
-            duduclaw_core::OrgEntry::new(v, &config.agent.department),
-        ) {
-            tracing::warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agent_update");
-        }
-    }
+    // A status stop takes the exclusive lease in the profile writer. Never
+    // retain a shared lease while waiting for that exclusive barrier.
+    let stopping = params.get("status").and_then(Value::as_str)
+        .is_some_and(|status| status.to_lowercase() != "active");
+    let background_edit = changes_background_work("agent_update", params);
+    // Acquire the shared lease inside the file lock too: the reverse order
+    // would deadlock against a lifecycle writer waiting for admissions.
+    let mut admission = None;
 
     // Write through the gateway's profile file writer: under the shared
     // cross-process lock, only the changed keys (comments and the keys the
@@ -616,10 +610,40 @@ pub(crate) async fn handle_agent_update(
             return serde_json::json!({ "content": [{"type": "text", "text": e}], "isError": true });
         }
     };
-    let written = duduclaw_gateway::agent_files::external::edit_agent_toml(home_dir, agent_id, "mcp", caller, |raw| {
+    let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded(home_dir, agent_id, "mcp", caller, |raw| {
         duduclaw_gateway::agent_files::external::apply_typed_changes(raw, &before_t, &after_t);
+        // A requested stop must reach the fresh artifact even if the initial
+        // snapshot had that status already and another writer resumed it.
+        if stopping {
+            let status = after_t.get("agent").and_then(|a| a.get("status")).cloned()
+                .ok_or_else(|| "agent.toml missing status".to_string())?;
+            raw.get_mut("agent").and_then(toml::Value::as_table_mut)
+                .ok_or_else(|| "agent.toml missing [agent] section".to_string())?
+                .insert("status".into(), status);
+        }
         Ok(())
-    });
+    }, || {
+        if background_edit {
+            if stopping {
+                check_background_caller(home_dir, actor, "agent_update")?;
+            } else if let Some(agent) = actor.agent() {
+                admission = Some(duduclaw_core::autonomy_gate::admit_blocking(
+                    home_dir, agent, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+                ).map_err(|info| background_caller_refusal("agent_update", &info))?);
+            }
+        }
+        // Keep the authoritative org write after the lifecycle barrier and
+        // before its TOML mirror. A drain timeout must have no side effects.
+        if let Some(v) = params.get("reports_to").and_then(Value::as_str)
+            && let Err(e) = duduclaw_core::org_store::upsert(
+                home_dir, agent_id, duduclaw_core::OrgEntry::new(v, &config.agent.department),
+            )
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agent_update");
+        }
+        Ok(())
+    }, stopping);
+    drop(admission);
     if let Err(e) = written {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],

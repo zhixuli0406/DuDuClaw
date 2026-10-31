@@ -408,6 +408,30 @@ async fn trigger_for_mail(
     registry: &Arc<RwLock<AgentRegistry>>,
     mail_id: &str,
 ) -> bool {
+    trigger_for_mail_with(home_dir, registry, mail_id, |agent_id, prompt| async move {
+        crate::claude_runner::call_claude_for_agent_with_type(
+            home_dir,
+            registry,
+            &agent_id,
+            &prompt,
+            crate::cost_telemetry::RequestType::Cron,
+        )
+        .await
+    })
+    .await
+}
+
+// Keep admission and the durable receipt on the same path in production and tests.
+async fn trigger_for_mail_with<F, Fut>(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    mail_id: &str,
+    invoke: F,
+) -> bool
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
     let Some(item) = mail::get_inbox_item(home_dir, mail_id) else {
         return false;
     };
@@ -428,14 +452,12 @@ async fn trigger_for_mail(
         "[Agent Mail] 你的信箱收到一封新信，請閱讀後決定要不要處理。\n\n{}",
         mail::render_mail_as_data(&item)
     );
-    let outcome = crate::claude_runner::call_claude_for_agent_with_type(
-        home_dir,
-        registry,
-        &item.agent_id,
-        &prompt,
-        crate::cost_telemetry::RequestType::Cron,
-    )
-    .await;
+    if duduclaw_core::autonomy_gate::check(
+        home_dir, &item.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ).is_err() {
+        return false;
+    }
+    let outcome = invoke(item.agent_id.clone(), prompt).await;
     match outcome {
         Ok(_) => {
             mail::mark_triggered(home_dir, mail_id, &item.agent_id, "auto_trigger");
@@ -1197,6 +1219,35 @@ skill_security_scan = false
             audit.contains("\"path\":\"mail\"") && audit.contains("\"action\":\"skipped\""),
             "{audit}"
         );
+    }
+
+    #[tokio::test]
+    async fn autonomy_pause_mail_defers_callback_then_resume_records_trigger() {
+        let h = home();
+        write_agent(h.path(), "mail-paused", false);
+        let mut reg = AgentRegistry::new(h.path().join("agents"));
+        reg.scan().await.unwrap();
+        let registry = Arc::new(RwLock::new(reg));
+        write_eml(h.path(), "pause.eml", "From: a@b.com\r\nSubject: hello\r\nMessage-ID: <pause@x>\r\n\r\nhello\r\n");
+        let mut report = PollReport::default();
+        let mut budget = 10;
+        let fresh = poll_dropfolder(h.path(), &enabled_cfg(), "mail-paused", &mut report, &mut budget);
+        assert_eq!(fresh.len(), 1);
+        duduclaw_core::autonomy_gate::set_pause(h.path(), Some("mail-paused"), "maintenance", "admin").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let invoke = |agent: String, prompt: String| {
+            calls.set(calls.get() + 1);
+            assert_eq!(agent, "mail-paused");
+            assert!(prompt.contains("hello"));
+            std::future::ready(Ok("handled".to_string()))
+        };
+        assert!(!trigger_for_mail_with(h.path(), &registry, &fresh[0], invoke).await);
+        assert_eq!(calls.get(), 0);
+        assert!(!mail::get_inbox_item(h.path(), &fresh[0]).unwrap().triggered);
+        duduclaw_core::autonomy_gate::resume(h.path(), Some("mail-paused")).unwrap();
+        assert!(trigger_for_mail_with(h.path(), &registry, &fresh[0], invoke).await);
+        assert_eq!(calls.get(), 1);
+        assert!(mail::get_inbox_item(h.path(), &fresh[0]).unwrap().triggered);
     }
 
     #[tokio::test]

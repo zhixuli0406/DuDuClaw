@@ -444,3 +444,20 @@ async fn disabled_switch_reads_nothing() {
         .unwrap_err();
     assert_eq!(err.code, "responsibilities_disabled");
 }
+
+#[tokio::test]
+async fn autonomy_pause_responsibility_records_skip_then_next_fire_runs() {
+    let env = Env::new();
+    let now = t0();
+    let resp = create(&env, &input(now), now).await;
+    arm_time(&env, &resp, now).await;
+    duduclaw_core::autonomy_gate::set_pause(env.home(), Some(OWNER), "休息", "op").unwrap();
+    assert!(env.wake(1, now).await.created.is_empty());
+    let fires = env.store.list_fires(&resp.responsibility_id, 20).await.unwrap();
+    assert!(!fires.is_empty());
+    assert!(fires.iter().all(|f| f.state == "dropped" && f.drop_reason.as_deref() == Some("autonomy_paused")));
+    duduclaw_core::autonomy_gate::resume(env.home(), Some(OWNER)).unwrap();
+    let later = now + Duration::minutes(10);
+    arm_time(&env, &resp, later).await;
+    assert_eq!(env.wake(1, later).await.created.len(), 1);
+}

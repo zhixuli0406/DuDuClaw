@@ -24,6 +24,8 @@ pub enum DispatchOutcome {
     Done(WorkflowRun),
     /// Infrastructure was unavailable; dispatch the same message later.
     Retry(String),
+    /// Operator pause: retain the same run and queue row, without spending retries.
+    Deferred,
 }
 
 /// Counts from one sweep pass, for the log.
@@ -106,8 +108,12 @@ impl WorkflowService {
         let mut blocked = false;
         if row.kind == "enqueue" && run.status == RunStatus::Pending {
             if let Err(reason) = self.run_still_authorized(&run).await {
-                self.mark_blocked(&row.run_id, &reason).await?;
-                blocked = true;
+                // A pause narrows execution, not authority. Deliver the wake-up
+                // and let dispatch defer it; never turn a pause into a failed run.
+                if reason != super::runner::WORKFLOW_AUTONOMY_PAUSED {
+                    self.mark_blocked(&row.run_id, &reason).await?;
+                    blocked = true;
+                }
             }
         }
         self.deliver_handoff(&row.outbox_id, &run, row.payload.clone())
@@ -201,6 +207,7 @@ impl WorkflowService {
         match self.dispatch_queue_message_outcome(message).await? {
             DispatchOutcome::Done(run) => Ok(run),
             DispatchOutcome::Retry(reason) => Err(reason),
+            DispatchOutcome::Deferred => Err(super::runner::WORKFLOW_AUTONOMY_PAUSED.into()),
         }
     }
 
@@ -244,6 +251,9 @@ impl WorkflowService {
         }
         match Box::pin(self.runner.execute(&id)).await {
             Ok(run) => Ok(DispatchOutcome::Done(run)),
+            Err(error) if error == super::runner::WORKFLOW_AUTONOMY_PAUSED => {
+                Ok(DispatchOutcome::Deferred)
+            }
             Err(error) if error == super::runner::WORKFLOW_BUSY => {
                 Ok(DispatchOutcome::Retry(error))
             }

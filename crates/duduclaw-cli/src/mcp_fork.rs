@@ -191,12 +191,12 @@ fn sweep_retained(home_dir: &Path, settings: &ForkSettings) {
     duduclaw_fork::retention::sweep_expired(&retained_root(home_dir), ttl);
 }
 
-/// Remove a fork's retained workspaces and clear their store paths. Best-effort.
-pub(crate) fn discard_retained_fork(home_dir: &Path, store: &ForkStore, fork_id: &str) {
-    if let Err(e) = duduclaw_fork::retention::remove_fork(&retained_root(home_dir), fork_id) {
-        tracing::warn!("fork {fork_id}: removing retained workspaces failed: {e}");
-    }
-    let _ = store.clear_fork_workspaces(fork_id);
+/// Remove retained workspaces, then clear their store paths. Report either
+/// failure so callers cannot silently claim cleanup succeeded.
+pub(crate) fn discard_retained_fork(home_dir: &Path, store: &ForkStore, fork_id: &str) -> std::io::Result<()> {
+    duduclaw_fork::retention::remove_fork(&retained_root(home_dir), fork_id)
+        .map_err(std::io::Error::other)?;
+    store.clear_fork_workspaces(fork_id).map_err(std::io::Error::other)
 }
 
 /// Resolve the retained workspace + recorded parent for a manual selection.
@@ -277,19 +277,20 @@ fn require_enabled(settings: &ForkSettings) -> Option<Value> {
 /// settings and account rotation.
 struct UtilityJudgeCaller {
     home_dir: std::path::PathBuf,
+    agent_id: String,
 }
 
 #[async_trait::async_trait]
 impl duduclaw_fork::judge::LlmCaller for UtilityJudgeCaller {
     async fn complete(&self, prompt: &str) -> duduclaw_fork::Result<String> {
-        duduclaw_gateway::runtime_dispatch::run_utility_prompt(
+        crate::ai_session_guard::with_autonomous_utility_context(&self.home_dir, &self.agent_id, duduclaw_gateway::runtime_dispatch::run_utility_prompt(
             &self.home_dir,
             None,         // agent-less: resolve the global utility runtime
             "fork-judge", // attribution id for telemetry
             "",           // judge instructions live in the prompt itself
             prompt,
             duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
-        )
+        ))
         .await
         .map_err(duduclaw_fork::ForkError::Executor)
     }
@@ -397,6 +398,10 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
         aggregate_spent_usd: 0.0,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
+    let _admission = match crate::mcp::admit_background_identity(home_dir, agent_id, "fork_run").await {
+        Ok(guard) => guard,
+        Err(reason) => return err(reason),
+    };
     if let Err(e) = store.insert_fork(&fork_row, &branch_rows) {
         return err(format!("could not persist fork: {e}"));
     }
@@ -438,6 +443,7 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
                 // a logged warning instead of failing the fork.
                 let llm_judge = duduclaw_fork::judge::LlmJudge::new(UtilityJudgeCaller {
                     home_dir: home_dir.to_path_buf(),
+                    agent_id: agent_id.to_string(),
                 })
                 .with_fine_grained(settings.fine_grained_judge);
                 tokio::spawn(crate::mcp_fork_exec::execute_fork(
@@ -496,10 +502,16 @@ pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &s
         Err(e) => return err(format!("store error: {e}")),
     };
     let branches = store.list_branches(fork_id).unwrap_or_default();
+    let decision = match store.resolution_decision(fork_id) {
+        Ok(decision) => decision,
+        Err(error) => return err(format!("store error: {error}")),
+    };
     ok_json(json!({
         "fork_id": fork.fork_id,
         "resolved": fork.resolved,
         "winner": fork.winner,
+        "needs_confirmation": decision.as_ref().map(|d| d.needs_confirmation),
+        "reason": decision.as_ref().map(|d| d.reason.as_str()),
         "branches": branches.iter().map(|b| json!({
             "branch_id": b.branch_id,
             "state": b.state,
@@ -561,13 +573,16 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
     if let Some(e) = require_enabled(&settings) {
         return e;
     }
+    let _admission = match crate::mcp::admit_background_identity(home_dir, agent_id, "merge_or_select").await {
+        Ok(guard) => guard,
+        Err(reason) => return err(reason),
+    };
     match duduclaw_core::with_file_lock(&home_dir.join("fork_resolution.lock"), || {
         let value = (|| {
             let store = match open_store(home_dir) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
-            sweep_retained(home_dir, &settings);
             let fork_id = match args.get("fork_id").and_then(|v| v.as_str()) {
                 Some(f) => f.to_string(),
                 None => return err("fork_id is required"),
@@ -596,10 +611,24 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
             if fork.agent_id != agent_id {
                 return err(format!("fork {fork_id} belongs to another agent"));
             }
+            // A reused employee id must not inherit authority to publish work
+            // whose automatic admission was refused. Keep the decision check
+            // under the resolution lock and before any retention side effects.
+            match store.resolution_decision(&fork_id) {
+                Ok(Some(decision)) if decision.needs_confirmation
+                    && decision.reason.starts_with("autonomy_refused:") => {
+                    return err("此分支因自主執行遭拒而保留，必須由人員在控制台審查並透過 fork.resolve 選擇結果；員工無法發布。");
+                }
+                Err(error) => return err(format!("store decision error: {error}")),
+                _ => {}
+            }
             if fork.resolved {
-                discard_retained_fork(home_dir, &store, &fork_id);
+                if let Err(error) = discard_retained_fork(home_dir, &store, &fork_id) {
+                    tracing::warn!("fork {fork_id}: retained cleanup failed: {error}");
+                }
                 return err(format!("fork already resolved (winner: {:?})", fork.winner));
             }
+            sweep_retained(home_dir, &settings);
             let branches = store.list_branches(&fork_id).unwrap_or_default();
 
             let winner = match explicit {
@@ -633,7 +662,9 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
                 if let Err(e) = store.set_resolution(&fork_id, Some(&winner), true, true, aggregate) {
                     return Ok(err(format!("files were promoted but the store update failed: {e}")));
                 }
-                discard_retained_fork(home_dir, &store, &fork_id);
+                if let Err(error) = discard_retained_fork(home_dir, &store, &fork_id) {
+                    tracing::warn!("fork {fork_id}: retained cleanup failed: {error}");
+                }
                 Ok(ok_json(json!({
                     "fork_id": fork_id,
                     "resolved": true,
@@ -982,7 +1013,7 @@ test_timeout_s = 60
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
             agent_dir.join("agent.toml"),
-            "[fork]\nenabled = true\nmax_branches = 3\n",
+            "[agent]\nstatus = \"active\"\n[fork]\nenabled = true\nmax_branches = 3\n",
         )
         .unwrap();
         home
@@ -1280,7 +1311,7 @@ test_timeout_s = 60
         let home = enabled_home();
         let other = home.path().join("agents").join("a2");
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("agent.toml"), "[fork]\nenabled = true\n").unwrap();
+        std::fs::write(other.join("agent.toml"), "[agent]\nstatus = \"active\"\n[fork]\nenabled = true\n").unwrap();
         let parent = tempfile::tempdir().unwrap();
         let (fork_id, winner) = fork_two(home.path()).await;
         stage_retained(home.path(), &fork_id, &winner, parent.path());
@@ -1298,7 +1329,7 @@ test_timeout_s = 60
         let home = enabled_home();
         let other = home.path().join("agents/a2");
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("agent.toml"), "[fork]\nenabled = true\n").unwrap();
+        std::fs::write(other.join("agent.toml"), "[agent]\nstatus = \"active\"\n[fork]\nenabled = true\n").unwrap();
         let parent = tempfile::tempdir().unwrap();
         let (fork_id, bid) = fork_two(home.path()).await;
         let ws = stage_retained(home.path(), &fork_id, &bid, parent.path());
@@ -1331,6 +1362,23 @@ test_timeout_s = 60
         assert!(!is_error(&t));
         assert!(!retained_root(home.path()).join(&fork_id).exists());
         assert_eq!(open_store(home.path()).unwrap().branch_workspace(&bid).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn discard_retained_fork_reports_database_cleanup_failure() {
+        let home = enabled_home();
+        let parent = tempfile::tempdir().unwrap();
+        let (fork_id, branch) = fork_two(home.path()).await;
+        let workspace = stage_retained(home.path(), &fork_id, &branch, parent.path());
+        let store = open_store(home.path()).unwrap();
+        rusqlite::Connection::open(fork_store_path(home.path())).unwrap().execute_batch(
+            "CREATE TRIGGER cleanup_fault BEFORE UPDATE OF workspace_path ON fork_branches
+                BEGIN SELECT RAISE(ABORT,'trusted fixture cleanup fault'); END;",
+        ).unwrap();
+        let error = discard_retained_fork(home.path(), &store, &fork_id).unwrap_err();
+        assert!(error.to_string().contains("trusted fixture cleanup fault"));
+        assert!(!workspace.exists());
+        assert!(store.branch_workspace(&branch).unwrap().is_some());
     }
 
     #[test]

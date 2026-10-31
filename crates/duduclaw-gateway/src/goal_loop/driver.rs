@@ -5,11 +5,12 @@ use super::*;
 
 impl GoalLoopDriver {
     pub fn new(store: Arc<TaskStore>, queue: Arc<MessageQueue>, config: GoalLoopConfig) -> Self {
+        let home_dir = store.home_dir().unwrap_or_else(|| Path::new(".")).to_path_buf();
         Self {
             store,
             queue,
             config,
-            home_dir: PathBuf::from("."),
+            home_dir,
             broker: None,
             policy: None,
             inflight: Mutex::new(HashMap::new()),

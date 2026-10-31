@@ -341,6 +341,16 @@ impl MessageQueue {
 
     /// Fetch up to `limit` pending messages, ordered by creation time.
     pub async fn pending_messages(&self, limit: usize) -> Result<Vec<QueueMessage>, String> {
+        self.pending_messages_after(limit, None).await
+    }
+
+    /// Keyset pagination lets a dispatcher pass paused recipients without
+    /// claiming them or starving other recipients behind a paused backlog.
+    pub(crate) async fn pending_messages_after(
+        &self,
+        limit: usize,
+        after: Option<(&str, &str)>,
+    ) -> Result<Vec<QueueMessage>, String> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
@@ -348,12 +358,13 @@ impl MessageQueue {
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
                  reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of \
                  FROM message_queue WHERE status = 'pending' \
-                 ORDER BY created_at ASC LIMIT ?1",
+                 AND (?2 IS NULL OR created_at > ?2 OR (created_at = ?2 AND id > ?3)) \
+                 ORDER BY created_at ASC, id ASC LIMIT ?1",
             )
             .map_err(|e| format!("prepare pending: {e}"))?;
 
         let rows = stmt
-            .query_map(params![limit as i64], |row| Self::row_to_message(row))
+            .query_map(params![limit as i64, after.map(|a| a.0), after.map(|a| a.1)], |row| Self::row_to_message(row))
             .map_err(|e| format!("query pending: {e}"))?;
 
         let mut result = Vec::new();

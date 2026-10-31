@@ -201,8 +201,15 @@ impl WorkflowRunner {
         self.renew_lease(&run.run_id, token).await?;
         #[cfg(test)]
         super::super::security_race_tests::checkpoint("runner_before_effect_execute").await;
+        // Keep Prepared/checkpoint intact on refusal; this is not an effect failure.
+        let admission = duduclaw_core::autonomy_gate::admit(
+            &self.home, &run.actor, duduclaw_core::autonomy_gate::AutonomyPath::Workflow,
+        ).await.map_err(|_| super::WORKFLOW_AUTONOMY_PAUSED.to_string())?;
+        // The MCP execute API combines write, response and receipt inspection.
+        // Bound this indivisible section below the 30 s pause wait. A timeout
+        // leaves the outcome unconfirmed; never replay it as a clean refusal.
         let reply = match tokio::time::timeout(
-            timeout,
+            timeout.min(std::time::Duration::from_secs(10)),
             session.as_mut().unwrap().execute(
                 &self.broker,
                 &operation_id,
@@ -219,6 +226,7 @@ impl WorkflowRunner {
                 return Err("workflow_effect_timeout_outcome_unconfirmed".into());
             }
         };
+        drop(admission);
         let error = reply.error_code;
         match reply.state {
             OperationState::Succeeded => {

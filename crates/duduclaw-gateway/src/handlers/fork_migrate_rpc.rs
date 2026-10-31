@@ -158,18 +158,18 @@ impl MethodHandler {
         )
     }
 
-    pub(crate) fn handle_fork_resolve(&self, params: Value) -> WsFrame {
+    pub(crate) fn handle_fork_resolve(&self, params: Value, actor_id: &str) -> WsFrame {
         // MCP selection uses the same key. Hold the lock across the fresh
         // resolved check, file promotion, durable resolution and retention GC.
         match duduclaw_core::with_file_lock(&self.home_dir.join("fork_resolution.lock"), || {
-            Ok(self.handle_fork_resolve_locked(params))
+            Ok(self.handle_fork_resolve_locked(params, actor_id))
         }) {
             Ok(response) => response,
             Err(e) => WsFrame::error_response("", &format!("fork resolution lock unavailable: {e}")),
         }
     }
 
-    fn handle_fork_resolve_locked(&self, params: Value) -> WsFrame {
+    fn handle_fork_resolve_locked(&self, params: Value, actor_id: &str) -> WsFrame {
         let store = match self.open_fork_store() {
             Ok(s) => s,
             Err(f) => return f,
@@ -195,6 +195,23 @@ impl MethodHandler {
         if fork.resolved {
             return WsFrame::error_response("", "fork already resolved");
         }
+        // Capture the refusal before set_resolution clears decision metadata.
+        let prior_reason = match store.resolution_decision(fork_id) {
+            Ok(Some(decision)) if decision.reason.starts_with("autonomy_refused:") => {
+                // Audit reason codes only; never copy arbitrary stored text.
+                let code = decision.reason.strip_prefix("autonomy_refused:").unwrap()
+                    .split(':').next().unwrap_or("");
+                let code = if !code.is_empty() && code.len() <= 80
+                    && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+                    code
+                } else {
+                    "unknown"
+                };
+                Some(format!("autonomy_refused:{code}"))
+            }
+            Ok(_) => None,
+            Err(e) => return WsFrame::error_response("", &format!("get fork decision: {e}")),
+        };
         let branches = store.list_branches(fork_id).unwrap_or_default();
         if !branches.iter().any(|b| b.branch_id == branch_id) {
             return WsFrame::error_response("", "branch not found in fork");
@@ -219,18 +236,61 @@ impl MethodHandler {
             let aggregate = branches.iter().map(|b| b.spent_usd).sum();
             Ok(match store.set_resolution(fork_id, Some(branch_id), true, true, aggregate) {
                 Ok(_) => {
+                    let audit_error = prior_reason.as_ref().and_then(|reason| {
+                        duduclaw_security::audit::try_append_audit_event(
+                            &self.home_dir,
+                            &duduclaw_security::audit::AuditEvent::new(
+                                "fork_autonomy_refusal_resolved",
+                                &fork.agent_id,
+                                duduclaw_security::audit::Severity::Info,
+                                json!({
+                                    "fork_id": fork_id, "branch_id": branch_id,
+                                    "prior_reason": reason, "actor_id": actor_id,
+                                    "channel": "dashboard",
+                                }),
+                            ),
+                        ).err()
+                    });
                     if let Err(e) = duduclaw_fork::retention::remove_fork(
                         &duduclaw_fork::retention::retained_root(&self.home_dir), fork_id,
                     ) {
                         tracing::warn!("fork {fork_id}: removing retained copies failed: {e}");
                     }
                     let _ = store.clear_fork_workspaces(fork_id);
+                    if let Some(error) = audit_error {
+                        tracing::error!(%error, fork_id, "resolved fork security audit failed");
+                        return Ok(WsFrame::error_response("", "分支結果已發布並完成選擇，但安全稽核紀錄寫入失敗；請勿重試發布。"));
+                    }
                     WsFrame::ok_response("", json!({
                         "fork_id": fork_id, "resolved": true, "promoted": true,
                         "winner": branch_id, "files_copied": report.files_copied,
                     }))
                 }
-                Err(e) => WsFrame::error_response("", &format!("files were promoted but the store update failed: {e}")),
+                Err(e) => {
+                    let audit_error = prior_reason.as_ref().and_then(|reason| {
+                        duduclaw_security::audit::try_append_audit_event(
+                            &self.home_dir,
+                            &duduclaw_security::audit::AuditEvent::new(
+                                "fork_autonomy_refusal_published_unrecorded",
+                                &fork.agent_id,
+                                duduclaw_security::audit::Severity::Warning,
+                                json!({
+                                    "fork_id": fork_id, "branch_id": branch_id,
+                                    "prior_reason": reason, "actor_id": actor_id,
+                                    "channel": "dashboard",
+                                }),
+                            ),
+                        ).err()
+                    });
+                    tracing::error!(error = %e, fork_id, "published fork store update failed");
+                    let message = if let Some(error) = audit_error {
+                        tracing::error!(%error, fork_id, "published fork security audit failed");
+                        "分支結果已發布，但選擇結果與安全稽核紀錄寫入失敗；請勿重試發布。"
+                    } else {
+                        "分支結果已發布，但選擇結果寫入失敗；請勿重試發布。"
+                    };
+                    WsFrame::error_response("", message)
+                }
             })
         }) {
             Ok(response) => response,
@@ -410,12 +470,124 @@ mod fork_promotion_tests {
         std::fs::write(workspace.join(".env"), "secret fixture").unwrap();
         store.set_branch_workspace("branch-test", Some(&workspace.to_string_lossy())).unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
-        let response = handler.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}));
+        let response = handler.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}), "test-operator");
         assert!(matches!(response, WsFrame::Response { ok: true, .. }));
         assert_eq!(std::fs::read_to_string(parent.join("artifact.txt")).unwrap(), "winner");
         assert!(!parent.join(".env").exists());
         assert!(store.get_fork("fork-test").unwrap().unwrap().promoted);
         assert!(!workspace.exists());
+        assert!(!duduclaw_security::audit::read_recent_events(home.path(), 100).iter()
+            .any(|event| event.event_type == "fork_autonomy_refusal_resolved"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_resolves_autonomy_refusal_and_audits_original_reason_once() {
+        for reason in ["autonomy_refused:agent_pause", "autonomy_refused:agent_missing"] {
+            let home = tempfile::tempdir().unwrap();
+            let (store, parent) = fixture(home.path());
+            store.set_resolution_decision("fork-test", &duduclaw_fork::MergeDecision {
+                winner: None, needs_confirmation: true, reason: reason.into(),
+            }, false, false, 0.02).unwrap();
+            let workspace = home.path().join("fork_ws/fork-test/branch-test");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("artifact.txt"), "private winner content").unwrap();
+            store.set_branch_workspace("branch-test", Some(&workspace.to_string_lossy())).unwrap();
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            let params = json!({"fork_id":"fork-test","branch_id":"branch-test"});
+            let response = handler.handle_fork_resolve(params.clone(), "human-operator");
+            assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+            let fork = store.get_fork("fork-test").unwrap().unwrap();
+            assert!(fork.resolved && fork.promoted);
+            assert_eq!(fork.winner.as_deref(), Some("branch-test"));
+            assert!(store.resolution_decision("fork-test").unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(parent.join("artifact.txt")).unwrap(), "private winner content");
+            assert!(!workspace.exists());
+            assert!(matches!(handler.handle_fork_resolve(params, "human-operator"),
+                WsFrame::Response { ok: false, .. }));
+            let events = duduclaw_security::audit::read_recent_events(home.path(), 100);
+            let events: Vec<_> = events.iter()
+                .filter(|event| event.event_type == "fork_autonomy_refusal_resolved").collect();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].agent_id, "test");
+            assert_eq!(events[0].details, json!({
+                "fork_id": "fork-test", "branch_id": "branch-test",
+                "prior_reason": reason, "actor_id": "human-operator", "channel": "dashboard",
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_resolution_audit_failure_reports_already_applied() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, parent) = fixture(home.path());
+        store.set_resolution_decision("fork-test", &duduclaw_fork::MergeDecision {
+            winner: None, needs_confirmation: true, reason: "autonomy_refused:agent_pause".into(),
+        }, false, false, 0.02).unwrap();
+        let workspace = home.path().join("fork_ws/fork-test/branch-test");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("artifact.txt"), "winner").unwrap();
+        store.set_branch_workspace("branch-test", Some(&workspace.to_string_lossy())).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        // A directory cannot be appended as a security audit log.
+        let audit = home.path().join("security_audit.jsonl");
+        if audit.exists() { std::fs::remove_file(&audit).unwrap(); }
+        std::fs::create_dir(&audit).unwrap();
+        let response = handler.handle_fork_resolve(
+            json!({"fork_id":"fork-test","branch_id":"branch-test"}), "human-operator",
+        );
+        assert!(matches!(&response, WsFrame::Response { ok: false, .. }));
+        assert!(serde_json::to_string(&response).unwrap().contains("請勿重試發布"));
+        let fork = store.get_fork("fork-test").unwrap().unwrap();
+        assert!(fork.resolved && fork.promoted);
+        assert_eq!(std::fs::read_to_string(parent.join("artifact.txt")).unwrap(), "winner");
+    }
+
+    #[tokio::test]
+    async fn dashboard_published_store_failure_preserves_refusal_audit() {
+        for fail_audit in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let (store, parent) = fixture(home.path());
+            store.set_resolution_decision("fork-test", &duduclaw_fork::MergeDecision {
+                winner: None, needs_confirmation: true, reason: "autonomy_refused:agent_pause".into(),
+            }, false, false, 0.02).unwrap();
+            let workspace = home.path().join("fork_ws/fork-test/branch-test");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("artifact.txt"), "winner").unwrap();
+            store.set_branch_workspace("branch-test", Some(&workspace.to_string_lossy())).unwrap();
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            // A fixture-local SQLite trigger fails the actual store UPDATE after promotion.
+            rusqlite::Connection::open(home.path().join("fork_store.db")).unwrap().execute_batch(
+                "CREATE TRIGGER reject_resolution BEFORE UPDATE OF resolved ON forks
+                 BEGIN SELECT RAISE(FAIL, 'injected resolution failure'); END;",
+            ).unwrap();
+            if fail_audit {
+                let audit = home.path().join("security_audit.jsonl");
+                if audit.exists() { std::fs::remove_file(&audit).unwrap(); }
+                std::fs::create_dir(&audit).unwrap();
+            }
+            let response = handler.handle_fork_resolve(
+                json!({"fork_id":"fork-test","branch_id":"branch-test"}), "human-operator",
+            );
+            assert!(matches!(&response, WsFrame::Response { ok: false, .. }));
+            let message = serde_json::to_string(&response).unwrap();
+            assert!(message.contains("已發布") && message.contains("請勿重試發布"));
+            assert_eq!(message.contains("安全稽核紀錄寫入失敗"), fail_audit);
+            assert_eq!(std::fs::read_to_string(parent.join("artifact.txt")).unwrap(), "winner");
+            assert!(!store.get_fork("fork-test").unwrap().unwrap().resolved);
+            assert_eq!(store.resolution_decision("fork-test").unwrap().unwrap().reason, "autonomy_refused:agent_pause");
+            assert!(workspace.exists());
+            if !fail_audit {
+                let events = duduclaw_security::audit::read_recent_events(home.path(), 100);
+                let events: Vec<_> = events.iter().filter(|e| e.event_type.starts_with("fork_autonomy_refusal_")).collect();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].event_type, "fork_autonomy_refusal_published_unrecorded");
+                assert_eq!(events[0].details, json!({
+                    "fork_id": "fork-test", "branch_id": "branch-test",
+                    "prior_reason": "autonomy_refused:agent_pause", "actor_id": "human-operator",
+                    "channel": "dashboard",
+                }));
+            }
+        }
     }
 
     #[tokio::test]
@@ -429,7 +601,7 @@ mod fork_promotion_tests {
                 store.set_branch_workspace("branch-test", Some(&outside.to_string_lossy())).unwrap();
             }
             let handler = MethodHandler::new(home.path().to_path_buf()).await;
-            let response = handler.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}));
+            let response = handler.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}), "test-operator");
             assert!(matches!(response, WsFrame::Response { ok: false, .. }));
             let fork = store.get_fork("fork-test").unwrap().unwrap();
             assert!(!fork.promoted && !fork.resolved);
@@ -452,8 +624,8 @@ mod fork_promotion_tests {
         let first = handler.clone();
         let second = handler.clone();
         let (first, second) = tokio::join!(
-            tokio::task::spawn_blocking(move || first.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}))),
-            tokio::task::spawn_blocking(move || second.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-second"}))),
+            tokio::task::spawn_blocking(move || first.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}), "test-operator")),
+            tokio::task::spawn_blocking(move || second.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-second"}), "test-operator")),
         );
         let succeeded = [first.unwrap(), second.unwrap()].into_iter()
             .filter(|response| matches!(response, WsFrame::Response { ok: true, .. })).count();

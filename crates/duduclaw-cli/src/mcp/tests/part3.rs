@@ -855,3 +855,27 @@ async fn create_agent_omitted_reports_to_defaults_to_non_main_caller() {
         toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(cfg.agent.reports_to, "sales-rep");
 }
+
+#[tokio::test]
+async fn synthesis_authorizes_subject_and_checks_caller_and_target_pause() {
+    use crate::mcp::record_authz::RecordActor;
+    let home = delegation_home();
+    let result = crate::mcp::skills_lifecycle::handle_skill_synthesis_run(
+        &serde_json::json!({"agent_id": "mkt-rep", "dry_run": true}),
+        home.path(), RecordActor::Agent("sales-lead"),
+    ).await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("不在你的團隊之內"));
+
+    for paused in [Some("ceo"), Some("sales-rep"), None] {
+        let home = delegation_home();
+        duduclaw_core::autonomy_gate::set_pause(home.path(), paused, "test", "operator").unwrap();
+        let result = crate::mcp::skills_lifecycle::handle_skill_synthesis_run(
+            &serde_json::json!({"agent_id": "sales-rep", "dry_run": true}),
+            home.path(), RecordActor::Agent("ceo"),
+        ).await;
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("暫停"));
+        assert!(!home.path().join("skills").exists());
+    }
+}

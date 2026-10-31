@@ -638,6 +638,7 @@ pub async fn ask_verifier(
         duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
         Some(&hint),
     );
+    let call = crate::ai_session_guard::with_cli_utility_context(home, None, call);
     let returned = duduclaw_gateway::runtime::RUNTIME_OUTCOME
         .scope(Arc::clone(&outcome), call)
         .await?;

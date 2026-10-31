@@ -167,8 +167,8 @@ async fn missing_dependency_escalates_downstream() {
 
 // ── D4 item 2: dispatch policy integration ──────────────
 
-/// With a RoundRobin policy wired, a task assigned to a non-roster agent is
-/// re-routed to a roster member and the reassignment is persisted.
+/// RoundRobin can re-route an operational employee's task to another
+/// roster member and persists the effective recipient.
 #[tokio::test]
 async fn round_robin_policy_reassigns_and_persists() {
     let dir = tempfile::tempdir().unwrap();
@@ -185,8 +185,8 @@ async fn round_robin_policy_reassigns_and_persists() {
         "[capabilities]\nautonomy_level = \"approver\"\n",
     );
 
-    // Task assigned to someone NOT in the roster ⇒ policy must re-route.
-    store.insert_task(&goal_task("g1", "zzz")).await.unwrap();
+    // Both the original and effective recipients must be operational.
+    store.insert_task(&goal_task("g1", "bob")).await.unwrap();
 
     let policy: Arc<dyn DispatchPolicy> = Arc::new(crate::dispatch_policy::RoundRobin::new());
     let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
@@ -410,4 +410,63 @@ async fn state_capture_seen_is_cleared_on_driver_escalate() {
         !d.state_capture_seen.lock().await.contains("g1"),
         "escalate() must clear state_capture_seen too"
     );
+}
+
+#[tokio::test]
+async fn pause_after_goal_preflight_prevents_policy_model_handoff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PausingPolicy {
+        home: std::path::PathBuf,
+        paused: Option<String>,
+        entered: AtomicUsize,
+        model_calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl crate::dispatch_policy::DispatchPolicy for PausingPolicy {
+        fn kind(&self) -> crate::dispatch_policy::DispatchPolicyKind {
+            crate::dispatch_policy::DispatchPolicyKind::LlmSelect
+        }
+        async fn select(&self, _: &TaskRow, _: &[String]) -> Option<String> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let outcome = duduclaw_core::autonomy_gate::mutate_async(
+                &self.home, self.paused.as_deref(),
+                Some(duduclaw_core::autonomy_gate::PauseEntry {
+                    reason: "between check and send".into(),
+                    who: "operator".into(),
+                    at: Utc::now().to_rfc3339(),
+                }),
+            ).await;
+            assert!(matches!(outcome, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+            if let Ok(admission) = duduclaw_core::autonomy_handoff::admit().await {
+                self.model_calls.fetch_add(1, Ordering::SeqCst);
+                admission.handed_off();
+            }
+            // Even a policy fallback must not reassign a refused candidate.
+            Some("bob".into())
+        }
+    }
+    for paused in [Some("alice"), Some("bob"), None] {
+        let home = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(home.path()).await;
+        write_agent_toml(home.path(), "bob", "[capabilities]\nautonomy_level = \"approver\"\n");
+        let mut task = goal_task("policy-race", "alice");
+        task.created_by = "bob".into();
+        task.created_via = Some("agent".into());
+        store.insert_task(&task).await.unwrap();
+        let policy = Arc::new(PausingPolicy {
+            home: home.path().to_path_buf(),
+            paused: paused.map(str::to_string),
+            entered: AtomicUsize::new(0),
+            model_calls: AtomicUsize::new(0),
+        });
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(home.path().to_path_buf())
+            .with_policy(policy.clone());
+        d.tick_once().await.unwrap();
+        assert_eq!(policy.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(policy.model_calls.load(Ordering::SeqCst), 0);
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().assigned_to, "alice");
+    }
 }

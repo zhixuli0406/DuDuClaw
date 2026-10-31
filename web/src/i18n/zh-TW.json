@@ -6089,6 +6089,7 @@
   "goals.pauseReason.blocked_needs_decision": "等你決策",
   "goals.pauseReason.infra": "系統問題",
   "goals.pauseReason.restart": "系統重啟後暫停",
+  "goals.pauseReason.operator_paused": "操作人員已暫停",
   "goals.pauseReason.unknown": "需要人工確認",
   "goals.takenOver": "人工接手中",
   "goals.create.title": "交辦任務",

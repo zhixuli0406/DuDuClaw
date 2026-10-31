@@ -146,6 +146,7 @@ struct ScaffoldPlan<'a> {
     role: Option<&'a RoleMemberSpec>,
 }
 
+pub(crate) use dispatch::check_autonomy;
 pub use dispatch::{
     dispatch, dispatch_with, is_due_for_gc, read_meta, resolve_agent_dir, resolve_tier_model_for_dir,
 };
@@ -165,3 +166,5 @@ use ids::stable_role_soul;
 #[cfg(test)]
 use role_member::role_member_payload;
 use scaffold::{active_count, scaffold_with, validate_role_runtime_model};
+
+pub use scaffold::check_parent_autonomy;

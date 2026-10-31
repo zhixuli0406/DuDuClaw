@@ -86,6 +86,9 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Operator);
                 boxed_frame(|| self.handle_agents_delegate(params)).await
             }
+            "autonomy.pause" | "autonomy.resume" | "autonomy.status" => {
+                boxed_frame(|| self.handle_autonomy_rpc(method, params, ctx)).await
+            }
             "agents.pause" => {
                 require_manager!();
                 let agent_id = check_agent!(AccessLevel::Operator);

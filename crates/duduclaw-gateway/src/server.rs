@@ -1955,6 +1955,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // does no workflow reconciliation, dispatch or sweep at all.
     match duduclaw_core::gateway_instance::acquire(&home_dir) {
         Ok(()) => {
+            handler.reconcile_autonomy_changes().await;
             reconcile_workflows_on_boot(&home_dir).await;
             spawn_workflow_sweep(home_dir.to_path_buf());
         }
@@ -7989,7 +7990,8 @@ async fn handle_causal_extract(
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let store = CausalStore::new(state.home_dir.join("memory.db"));
-    match crate::causal_extraction_runner::extract_candidates_with_provider(
+    match crate::autonomous_runtime::human_interactive(&state.home_dir,
+        crate::causal_extraction_runner::extract_candidates_with_provider(
         &store,
         &scope,
         &request.artifact_id,
@@ -7997,6 +7999,7 @@ async fn handle_causal_extract(
         policy.model(),
         provider.as_ref(),
         |scope, provider, model| policy.allows(scope, provider, model),
+    )
     )
     .await
     {
@@ -18320,11 +18323,13 @@ mod live_events_socket_tests {
     use serde_json::{Value, json};
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
+    // Argon2 hashes recovery codes in debug builds, which can be slow under CI load.
+    const SOCKET_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
     type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn next_json(client: &mut Client) -> Value {
-        // This deadline only bounds a hung test; these RPCs run real Argon2 in a debug build.
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(SOCKET_FRAME_DEADLINE, async {
             loop {
                 match client.next().await.expect("socket open").expect("valid frame") {
                     ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),

@@ -943,6 +943,7 @@ export type PauseReasonToken =
   | 'blocked_needs_decision'
   | 'infra'
   | 'restart'
+  | 'operator_paused'
   | 'unknown';
 
 export type CriteriaUnitStatus = 'planned' | 'covered' | 'blocked' | 'candidate';

@@ -659,7 +659,7 @@ impl MethodHandler {
             // Resolving a fork promotes a winner's workspace → side-effecting.
             "fork.resolve" => {
                 require_manager!();
-                self.handle_fork_resolve(params)
+                self.handle_fork_resolve(params, &ctx.user_id)
             }
 
             // ── Migrate-from (spawns the CLI's `migrate from --json`) ──

@@ -2240,8 +2240,11 @@ pub(super) async fn build_reply_with_session_inner(
                         crate::decision_capture::DetectionResult::Suspected => {
                             let prompt =
                                 crate::decision_capture::build_extraction_prompt(&reply_for_dec);
-                            match super::cli_spawn::call_background_utility(
-                                &prompt, &home_for_dec, agent_dir_for_dec.as_deref(), &agent_for_dec, 512,
+                            match crate::autonomous_runtime::scope(
+                                &home_for_dec, &agent_for_dec, &[],
+                                super::cli_spawn::call_background_utility(
+                                    &prompt, &home_for_dec, agent_dir_for_dec.as_deref(), &agent_for_dec, 512,
+                                ),
                             )
                                 .await
                             {
@@ -2498,8 +2501,11 @@ pub(super) async fn build_reply_with_session_inner(
                      and deliverables. Max 200 words. Use the same language as the input.\n\n\
                      {user_text}"
                 );
-                match super::cli_spawn::call_background_utility(
-                    &prompt, &home, agent_dir_for_pin.as_deref(), &agent_for_pin, 512,
+                match crate::autonomous_runtime::scope(
+                    &home, &agent_for_pin, &[],
+                    super::cli_spawn::call_background_utility(
+                        &prompt, &home, agent_dir_for_pin.as_deref(), &agent_for_pin, 512,
+                    ),
                 )
                 .await
                 {
@@ -2549,8 +2555,11 @@ pub(super) async fn build_reply_with_session_inner(
                          User: {user_text_for_facts}\n\
                          Assistant: {reply_snippet}"
                     );
-                    let facts_text = match super::cli_spawn::call_background_utility(
-                        &prompt, &home_for_facts, agent_dir_for_facts.as_deref(), &agent_id_for_facts, 512,
+                    let facts_text = match crate::autonomous_runtime::scope(
+                        &home_for_facts, &agent_id_for_facts, &[],
+                        super::cli_spawn::call_background_utility(
+                            &prompt, &home_for_facts, agent_dir_for_facts.as_deref(), &agent_id_for_facts, 512,
+                        ),
                     )
                     .await
                     {
@@ -3186,6 +3195,10 @@ pub(super) async fn build_reply_with_session_inner(
                                         crate::skill_lifecycle::sandbox_trial::TrialDecision::Graduate => {
                                             info!(agent = %agent_id_for_pred, skill = %name, "Sandbox trial → GRADUATE");
                                             let mut store = sandbox_for_pred.lock().await;
+                                            let Ok(_publication) = duduclaw_core::autonomy_gate::admit(
+                                                &home_for_pred, &agent_id_for_pred,
+                                                duduclaw_core::autonomy_gate::AutonomyPath::Background,
+                                            ).await else { continue };
                                             store.graduate(&agent_id_for_pred, name);
                                         }
                                         crate::skill_lifecycle::sandbox_trial::TrialDecision::Discard => {
@@ -3725,12 +3738,24 @@ pub(super) async fn build_reply_with_session_inner(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match super::cli_spawn::call_background_utility(
-                    &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
+                // Read the denial flag inside the scope: non-Claude runtimes
+                // wrap the refusal text, so the prefix alone can miss a pause
+                // that lands between the context check and spawn/send.
+                let (result, denied) = crate::autonomous_runtime::scope(
+                    &home_for_compress, &agent_for_compress, &[],
+                    async {
+                        let result = super::cli_spawn::call_background_utility(
+                            &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
+                        )
+                        .await;
+                        (result, crate::autonomous_runtime::was_denied())
+                    },
                 )
-                .await
-                {
+                .await;
+                let summary = match result {
+                    _ if denied => return,
                     Ok(s) => s,
+                    Err(e) if e.starts_with("AUTONOMY_") => return,
                     Err(_) => {
                         "[Session compressed — previous conversation summary omitted for brevity]"
                             .to_string()

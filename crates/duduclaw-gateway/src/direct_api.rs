@@ -373,6 +373,8 @@ async fn call_direct_api_inner(
     if let Some(timeout) = limits.timeout {
         request = request.timeout(timeout);
     }
+    let admission = crate::autonomous_runtime::admit_current().await?;
+    crate::autonomous_runtime::mark_handoff();
     let response = request
         .header("x-api-key", api_key)
         .header("anthropic-version", API_VERSION)
@@ -383,6 +385,7 @@ async fn call_direct_api_inner(
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
 
+    drop(admission);
     let status = response.status();
     let response_text = response
         .text()
@@ -696,15 +699,14 @@ pub async fn call_moa_model(
     // `Handle::block_on` (no Send bound) so this outer future stays Send for
     // the channel-reply pipeline.
     let model_id_owned = model_id.to_string();
-    let handle = tokio::runtime::Handle::current();
-    let moa = tokio::task::spawn_blocking(move || {
+    let moa = run_moa_blocking(move || async move {
         let lookup = move |pid: &str| providers.get(pid).cloned();
-        handle.block_on(duduclaw_llm::complete_moa_model(
+        duduclaw_llm::complete_moa_model(
             &model_id_owned,
             &req,
             crate::cost_telemetry::model_registry(),
             &lookup,
-        ))
+        ).await
     })
     .await
     .map_err(|e| format!("MoA 執行緒失敗：{e}"))?
@@ -724,6 +726,21 @@ pub async fn call_moa_model(
         "MoA ensemble completed"
     );
     Ok(moa.response.text())
+}
+
+/// The MoA future is not Send, but its factory is. Reinstall the host-owned
+/// identities and shared admission outcome flags on the blocking worker.
+async fn run_moa_blocking<F, Fut, T>(make_future: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    let snapshot = crate::autonomous_runtime::capture();
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(crate::autonomous_runtime::restore(snapshot, make_future()))
+    }).await
 }
 
 /// Build the MoA request's message list from the session history plus the
@@ -795,6 +812,73 @@ fn normalize_system_prompt(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn moa_blocking_worker_preserves_caller_pause_between_members() {
+        use duduclaw_llm::{ChatProvider, ChatRequest, ChatResponse, LlmError};
+        use std::sync::{Arc, Mutex};
+        struct PausingProvider {
+            home: std::path::PathBuf,
+            started: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ChatProvider for PausingProvider {
+            fn id(&self) -> &str { "fake" }
+
+            async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+                let admission = duduclaw_core::autonomy_handoff::admit().await
+                    .map_err(LlmError::InvalidRequest)?;
+                self.started.lock().unwrap().push(req.model.clone());
+                admission.handed_off();
+                // The first proposal has been sent. Pausing its originating
+                // caller must block the next proposer and aggregator.
+                let outcome = tokio::time::timeout(std::time::Duration::from_secs(1),
+                    duduclaw_core::autonomy_gate::mutate_async(&self.home, Some("caller"), Some(
+                        duduclaw_core::autonomy_gate::PauseEntry {
+                            reason: "test".into(), who: "operator".into(), at: chrono::Utc::now().to_rfc3339(),
+                        },
+                    )),
+                ).await.expect("pause blocked after MoA handoff");
+                assert!(matches!(outcome, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+                Ok(ChatResponse {
+                    parts: vec![duduclaw_llm::ContentPart::Text("proposal".into())],
+                    stop: duduclaw_llm::StopReason::EndTurn,
+                    usage: Default::default(), model_used: req.model.clone(), provider: "fake".into(),
+                })
+            }
+
+            async fn stream(&self, _: &ChatRequest) -> Result<
+                futures_util::stream::BoxStream<'static, Result<duduclaw_llm::StreamEvent, LlmError>>, LlmError,
+            > {
+                unreachable!("MoA complete must not stream")
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        for agent in ["caller", "worker"] {
+            let dir = home.path().join("agents").join(agent);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+        }
+        let provider = Arc::new(PausingProvider {
+            home: home.path().to_path_buf(), started: Mutex::new(Vec::new()),
+        });
+        let worker_provider = provider.clone();
+        crate::autonomous_runtime::scope(home.path(), "worker", &["caller".into()], async {
+            let result = run_moa_blocking(move || async move {
+                let spec = duduclaw_llm::MoaSpec {
+                    name: "pause".into(), proposers: vec!["fake/first".into(), "fake/second".into()],
+                    aggregator: "fake/final".into(), max_parallel: 1, proposer_max_tokens: 16,
+                };
+                let req = ChatRequest::new("moa:pause");
+                let lookup = move |_: &str| Some(worker_provider.clone() as Arc<dyn ChatProvider>);
+                duduclaw_llm::complete_moa(&spec, &req, &lookup).await
+            }).await.unwrap();
+            assert!(result.unwrap_err().to_string().contains("AUTONOMY_PAUSED"));
+            assert!(crate::autonomous_runtime::was_handed_off());
+            assert!(crate::autonomous_runtime::was_denied());
+        }).await;
+        assert_eq!(*provider.started.lock().unwrap(), vec!["fake/first"]);
+    }
 
     #[test]
     fn normalize_removes_trailing_whitespace() {

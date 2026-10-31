@@ -160,6 +160,18 @@ pub fn finish_role_member(
     if !is_ephemeral_id(member_id) {
         return Err(format!("not an ephemeral agent id: {member_id:?}"));
     }
+    crate::agent_files::writer::run_blocking(|| {
+        let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home_dir)
+            .map_err(|error| error.to_string())?;
+        finish_role_member_locked(home_dir, member_id, outcome)
+    })
+}
+
+fn finish_role_member_locked(
+    home_dir: &Path,
+    member_id: &str,
+    outcome: RoleMemberOutcome,
+) -> Result<(), String> {
     let Some(dir) = resolve_agent_dir(home_dir, member_id) else {
         // Already swept, never existed, or escapes the namespace —
         // `resolve_agent_dir` has already logged the escape case.
@@ -303,8 +315,10 @@ pub fn admit_role_member(
             // may be deferred.
             let cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home_dir);
             let payload = role_member_payload(spec);
-            match duduclaw_core::spawn_admission::enqueue_role_member(
-                home_dir, &cfg, owner_key, payload,
+            match duduclaw_core::spawn_admission::enqueue_checked(
+                home_dir, duduclaw_core::spawn_admission::ROLE_TEAM_ADMISSION_CLASS,
+                &cfg, owner_key, payload,
+                || super::scaffold::check_parent_autonomy(home_dir, &spec.parent_agent),
             ) {
                 Ok(duduclaw_core::spawn_admission::EnqueueOutcome::Queued {
                     ticket_id,

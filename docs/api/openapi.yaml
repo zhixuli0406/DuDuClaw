@@ -624,6 +624,125 @@ paths:
                   status:
                     type: string
 
+  /rpc/autonomy.pause:
+    post:
+      tags: [agents]
+      summary: Pause autonomous work for one employee or all employees
+      description: >-
+        Requires live Manager role plus a live Operator binding for agent_id
+        (Admin bypasses binding), or Admin for all. Exactly one scope is required.
+        Does not change employee lifecycle status or block direct human chat.
+        Persists across restart and emits visibility-filtered autonomy.changed.
+        Not exposed to AI employees through MCP. A running goal turn finishes
+        before parking at needs_human with operator_paused. Audit intent must persist
+        before mutation; an unavailable audit log refuses the change without
+        changing state. Optional audit_error means state was applied but its
+        completion audit or acknowledgement failed; clients must not assume the write failed.
+        The same atomic state write stores a validated receipt (change_id, pause/resume
+        method, typed scope, actor, canonical-request SHA-256, applied_at and
+        completion_recorded=false). Startup derives reconciliation only from this
+        state file, never from audit rows. It appends a reconciled completion,
+        pushes current state, then marks completion under the writer lock.
+        The 4096-receipt cap prunes only the oldest completed entry; all-pending
+        capacity refuses new mutations. Failed completion is logged for retry on
+        startup. A crash between completion output and acknowledgement can repeat
+        a completion with the same change_id; broadcast delivery is best-effort.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [agent_id]
+                  additionalProperties: false
+                  properties:
+                    agent_id: {type: string}
+                    reason: {type: string, maxLength: 1000, description: Longer inputs are truncated by Unicode character count.}
+                - type: object
+                  required: [all]
+                  additionalProperties: false
+                  properties:
+                    all: {type: boolean, enum: [true]}
+                    reason: {type: string, maxLength: 1000}
+      responses:
+        "200":
+          description: Selected scope saved; result contains agent_id, all, paused, and pause (reason, who, at), applied=true, optional durability_warning=applied_durability_unknown after rename, and audit_error if completion audit or acknowledgement failed. Lock wait timeout returns admission_wait_timeout without applying. autonomy.changed carries only agent_id, all, paused, at.
+        "403":
+          description: Live role or agent binding insufficient.
+
+  /rpc/autonomy.resume:
+    post:
+      tags: [agents]
+      summary: Remove the selected autonomy pause
+      description: >-
+        Same authorization as autonomy.pause. Individual resume does not remove
+        global pause; global resume does not clear individual entries. Employee
+        lifecycle status and needs_human goal tasks are unchanged. Corrupt state
+        is refused, never overwritten. Emits autonomy.changed. Audit intent must
+        persist before mutation. Optional audit_error means the state was
+        applied but its completion audit or acknowledgement failed. State-owned receipt
+        reconciliation and capacity rules are the same as autonomy.pause.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [agent_id]
+                  additionalProperties: false
+                  properties:
+                    agent_id: {type: string}
+                - type: object
+                  required: [all]
+                  additionalProperties: false
+                  properties:
+                    all: {type: boolean, enum: [true]}
+      responses:
+        "200":
+          description: Selected scope removed; result contains agent_id, all, paused=false, pause=null, applied=true, optional durability_warning=applied_durability_unknown after rename, and audit_error if completion audit or acknowledgement failed. Lock wait timeout returns admission_wait_timeout without applying. autonomy.changed carries only agent_id, all, paused, at.
+        "403":
+          description: Live role or agent binding insufficient.
+
+  /rpc/autonomy.status:
+    post:
+      tags: [agents]
+      summary: Read global and visible employee autonomy pauses
+      description: >-
+        Any authenticated user. Employee entries are filtered using current
+        Viewer bindings; Admin sees all. Non-null state_error means ALL autonomous
+        work is denied, even if global and agents appear empty. Missing state
+        after initialization, invalid JSON and unsupported versions fail closed.
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200":
+          description: Current persistent pause state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  global:
+                    type: object
+                    nullable: true
+                    properties:
+                      reason: {type: string}
+                      who: {type: string}
+                      at: {type: string, format: date-time}
+                  agents:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        reason: {type: string}
+                        who: {type: string}
+                        at: {type: string, format: date-time}
+                  state_error: {type: string, nullable: true}
+
   /rpc/agents.pause:
     post:
       tags: [agents]

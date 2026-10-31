@@ -6089,6 +6089,7 @@
   "goals.pauseReason.blocked_needs_decision": "あなたの判断待ち",
   "goals.pauseReason.infra": "システムの問題",
   "goals.pauseReason.restart": "再起動により一時停止",
+  "goals.pauseReason.operator_paused": "管理者により一時停止",
   "goals.pauseReason.unknown": "人による確認が必要",
   "goals.takenOver": "人間対応中",
   "goals.create.title": "タスクを任せる",

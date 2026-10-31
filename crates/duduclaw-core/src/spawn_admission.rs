@@ -198,6 +198,10 @@ struct State {
     next_seq: u64,
     #[serde(default)]
     tickets: HashMap<String, QueuedSpawn>,
+    /// Only matching-dequeue callers can temporarily return a selected ticket.
+    /// Owner invalidation also removes these reservations, preventing revival.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    dequeued: HashMap<String, QueuedSpawn>,
 }
 
 fn now_epoch_ms() -> i64 {
@@ -222,6 +226,7 @@ fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
 /// Remove every expired ticket from `state`, returning what was removed
 /// (sorted oldest-first) so the caller can audit-log the drop.
 fn prune_expired_state(state: &mut State, now_ms: i64) -> Vec<QueuedSpawn> {
+    state.dequeued.retain(|_, ticket| ticket.expires_ms > now_ms);
     let expired_ids: Vec<String> = state
         .tickets
         .values()
@@ -282,6 +287,19 @@ pub fn enqueue(
     owner_key: Option<&str>,
     payload: serde_json::Value,
 ) -> Result<EnqueueOutcome, String> {
+    enqueue_checked(home_dir, class, cfg, owner_key, payload, || Ok(()))
+}
+
+/// Run a caller-owned admission gate under the queue capacity lock, before
+/// creating a ticket. Used by ephemeral scaffolds and team role members.
+pub fn enqueue_checked(
+    home_dir: &Path,
+    class: &str,
+    cfg: &AdmissionConfig,
+    owner_key: Option<&str>,
+    payload: serde_json::Value,
+    check: impl FnOnce() -> Result<(), String>,
+) -> Result<EnqueueOutcome, String> {
     if cfg.admission == AdmissionMode::Fail {
         return Ok(EnqueueOutcome::Rejected {
             reason: "admission mode is 'fail' — queuing disabled by config".to_string(),
@@ -295,6 +313,7 @@ pub fn enqueue(
     let owner_key = owner_key.map(|s| s.to_string());
 
     crate::with_file_lock(&path, || {
+        check().map_err(std::io::Error::other)?;
         let mut state = load_state(&path);
 
         let live = count_class(&state, &class, now_ms);
@@ -350,6 +369,29 @@ pub struct DequeueResult {
 /// stays queued (on disk, if the file is merely transiently unavailable) and
 /// is retried on the next drain tick.
 pub fn dequeue_next(home_dir: &Path, class: &str) -> DequeueResult {
+    dequeue_matching_inner(home_dir, class, |_| true, false)
+}
+
+/// Pop the oldest eligible ticket while preserving ineligible tickets, their
+/// FIFO position, ownership and original expiry. The predicate runs under the
+/// queue lock and must not mutate this admission queue or acquire its lock.
+/// Callers use this for temporary execution gates without starving other owners.
+/// The selected ticket keeps a reservation until `restore_dequeued` or
+/// `finish_dequeued`; owner invalidation and its original TTL revoke it.
+pub fn dequeue_next_matching(
+    home_dir: &Path,
+    class: &str,
+    eligible: impl Fn(&QueuedSpawn) -> bool,
+) -> DequeueResult {
+    dequeue_matching_inner(home_dir, class, eligible, true)
+}
+
+fn dequeue_matching_inner(
+    home_dir: &Path,
+    class: &str,
+    eligible: impl Fn(&QueuedSpawn) -> bool,
+    reserve: bool,
+) -> DequeueResult {
     let path = home_dir.join(STATE_FILE);
     let now_ms = now_epoch_ms();
     let class = class.to_string();
@@ -361,15 +403,58 @@ pub fn dequeue_next(home_dir: &Path, class: &str) -> DequeueResult {
         let oldest_id = state
             .tickets
             .values()
-            .filter(|t| t.class == class)
+            .filter(|t| t.class == class && eligible(t))
             .min_by_key(|t| t.seq)
             .map(|t| t.ticket_id.clone());
 
         let ticket = oldest_id.and_then(|id| state.tickets.remove(&id));
+        if let Some(ticket) = ticket.as_ref().filter(|_| reserve) {
+            state.dequeued.insert(ticket.ticket_id.clone(), ticket.clone());
+        }
         save_state(&path, &state)?;
         Ok::<DequeueResult, std::io::Error>(DequeueResult { ticket, expired })
     })
     .unwrap_or_default()
+}
+
+/// Return a dequeued ticket when a temporary gate changed before execution.
+/// Compare-and-insert under the admission lock: never replace another copy,
+/// refresh its TTL, or move it behind newer tickets. Expired work stays expired.
+pub fn restore_dequeued(home_dir: &Path, ticket: &QueuedSpawn) -> std::io::Result<bool> {
+    let path = home_dir.join(STATE_FILE);
+    crate::with_file_lock(&path, || {
+        let mut state = load_state(&path);
+        let Some(reserved) = state.dequeued.get(&ticket.ticket_id).cloned() else {
+            return Ok(false); // Completed or invalidated while outside the lock.
+        };
+        if reserved.seq != ticket.seq {
+            return Ok(false);
+        }
+        state.dequeued.remove(&ticket.ticket_id);
+        let restore = reserved.expires_ms > now_epoch_ms()
+            && !state.tickets.contains_key(&ticket.ticket_id);
+        if restore {
+            // Restore the persisted reservation, never caller-supplied content.
+            state.tickets.insert(reserved.ticket_id.clone(), reserved);
+        }
+        save_state(&path, &state)?;
+        Ok(restore)
+    })
+}
+
+/// Finish matching-dequeue processing without returning the ticket to pending.
+/// A pause restore is the only path that moves a valid reservation back.
+pub fn finish_dequeued(home_dir: &Path, ticket: &QueuedSpawn) -> std::io::Result<bool> {
+    let path = home_dir.join(STATE_FILE);
+    crate::with_file_lock(&path, || {
+        let mut state = load_state(&path);
+        if state.dequeued.get(&ticket.ticket_id).is_none_or(|r| r.seq != ticket.seq) {
+            return Ok(false);
+        }
+        state.dequeued.remove(&ticket.ticket_id);
+        save_state(&path, &state)?;
+        Ok(true)
+    })
 }
 
 /// Prune every expired ticket in `class` without popping a live one —
@@ -425,6 +510,10 @@ pub fn invalidate_owner(home_dir: &Path, class: &str, owner: &str) -> Vec<Queued
             .into_iter()
             .filter_map(|id| state.tickets.remove(&id))
             .collect();
+        let reserved_ids: Vec<String> = state.dequeued.values()
+            .filter(|t| t.class == class && t.owner_key.as_deref() == Some(owner.as_str()))
+            .map(|t| t.ticket_id.clone()).collect();
+        removed.extend(reserved_ids.into_iter().filter_map(|id| state.dequeued.remove(&id)));
         removed.sort_by_key(|t| t.seq);
         save_state(&path, &state)?;
         Ok::<Vec<QueuedSpawn>, std::io::Error>(removed)
@@ -711,6 +800,38 @@ mod tests {
             queue_item_ttl_secs: ttl_secs,
             ..AdmissionConfig::default()
         }
+    }
+
+    #[test]
+    fn autonomy_pause_matching_dequeue_preserves_deferred_ticket() {
+        let home = tempfile::tempdir().unwrap();
+        let config = cfg(AdmissionMode::Queue, 10, 600);
+        for parent in ["paused", "active"] {
+            enqueue(home.path(), "test", &config, Some(parent), serde_json::json!({"parent": parent})).unwrap();
+        }
+        let active = dequeue_next_matching(home.path(), "test", |t| t.owner_key.as_deref() == Some("active"));
+        assert_eq!(active.ticket.unwrap().owner_key.as_deref(), Some("active"));
+        assert_eq!(queue_depth(home.path(), "test"), 1);
+        let restored = dequeue_next(home.path(), "test").ticket.unwrap();
+        assert_eq!(restored.owner_key.as_deref(), Some("paused"));
+        assert!(restored.expires_ms > restored.enqueued_ms);
+    }
+
+    #[test]
+    fn autonomy_pause_invalidated_dequeue_cannot_be_restored() {
+        let home = tempfile::tempdir().unwrap();
+        let config = cfg(AdmissionMode::Queue, 10, 600);
+        enqueue(home.path(), "test", &config, Some("finished-turn"), serde_json::json!({})).unwrap();
+        let ticket = dequeue_next_matching(home.path(), "test", |_| true).ticket.unwrap();
+        let removed = invalidate_owner(home.path(), "test", "finished-turn");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].ticket_id, ticket.ticket_id);
+        assert!(!restore_dequeued(home.path(), &ticket).unwrap());
+        assert_eq!(queue_depth(home.path(), "test"), 0);
+        // The old API never reserves, so its consumed ticket cannot be revived.
+        enqueue(home.path(), "test", &config, None, serde_json::json!({})).unwrap();
+        let legacy = dequeue_next(home.path(), "test").ticket.unwrap();
+        assert!(!restore_dequeued(home.path(), &legacy).unwrap());
     }
 
     #[test]

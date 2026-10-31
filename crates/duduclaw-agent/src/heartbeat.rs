@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use chrono::{self, Utc};
 use cron::Schedule;
-use duduclaw_core::types::{AgentStatus, HeartbeatConfig};
+use duduclaw_core::types::HeartbeatConfig;
+use duduclaw_core::autonomy_gate::{self, AutonomyPath};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -288,12 +289,8 @@ impl HeartbeatScheduler {
         agents.retain(|name, _| current_names.contains(name));
 
         for la in &snapshot {
-            // Terminated / Archived / Deleted agents are off the scheduler —
-            // archived + soft-deleted (WP4) also halt heartbeat/evolution.
-            if matches!(
-                la.config.agent.status,
-                AgentStatus::Terminated | AgentStatus::Archived | AgentStatus::Deleted
-            ) {
+            // Only operational employees participate; Paused must also stop heartbeat.
+            if !la.config.agent.status.is_operational() {
                 agents.remove(&la.config.agent.name);
                 continue;
             }
@@ -419,7 +416,9 @@ impl HeartbeatScheduler {
             {
                 let mut agents = self.agents.write().await;
                 for agent in agents.values_mut() {
-                    if !agent.config.enabled {
+                    if !agent.config.enabled
+                        || autonomy_gate::check(&self.home_dir, &agent.agent_id, AutonomyPath::Heartbeat).is_err()
+                    {
                         continue;
                     }
 
@@ -480,6 +479,9 @@ impl HeartbeatScheduler {
             // `[proactive] natural_timing = false` (kill switch) the gate
             // returns SendNow unconditionally — identical to pre-U1 behaviour.
             for (aid, hours) in silence_candidates {
+                if autonomy_gate::check(&self.home_dir, &aid, AutonomyPath::Heartbeat).is_err() {
+                    continue;
+                }
                 let key = format!("silence:{aid}");
                 let decision = crate::proactive_timing::gate_keyed_send(
                     &self.home_dir,
@@ -579,6 +581,9 @@ async fn execute_heartbeat(
     host_run_notice: Option<&HostRunNotice>,
     budget_gate: Option<&BudgetGate>,
 ) {
+    if autonomy_gate::check(home_dir, agent_id, AutonomyPath::Heartbeat).is_err() {
+        return;
+    }
     let _permit = match semaphore.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -812,6 +817,9 @@ fn append_task_board_activity(home: &Path, agent: &str, summary: &str) -> Result
 }
 
 async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), String> {
+    if autonomy_gate::check(home_dir, agent_id, AutonomyPath::Heartbeat).is_err() {
+        return Ok(());
+    }
     let tasks_db = home_dir.join("tasks.db");
     let queue_db = home_dir.join("message_queue.db");
     if !tasks_db.exists() || !queue_db.exists() {
@@ -1082,6 +1090,9 @@ async fn execute_proactive_check(
 ) {
     use crate::proactive;
 
+    if autonomy_gate::check(home_dir, agent_id, AutonomyPath::Heartbeat).is_err() {
+        return;
+    }
     // Validate agent_id format (defense in depth)
     if agent_id.contains("..") || agent_id.contains('/') || agent_id.contains('\\') || agent_id.contains('\0') {
         warn!(agent = agent_id, "Invalid agent_id in proactive check, skipping");
@@ -1310,7 +1321,18 @@ async fn execute_proactive_check(
                 cmd.arg("--strict-mcp-config");
             }
 
-            let output = cmd.output().await;
+            // Preparation can await disk and MCP validation; honor a pause
+            // that arrived during it before launching the employee.
+            let Ok(admission) = autonomy_gate::admit(home_dir, agent_id, AutonomyPath::Heartbeat).await else {
+                return;
+            };
+            cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            let child = cmd.spawn();
+            drop(admission);
+            let output = match child {
+                Ok(child) => child.wait_with_output().await,
+                Err(error) => Err(error),
+            };
             drop(prompt_file); // explicit: temp file survives until after spawn exits
             match output {
                 Ok(o) if o.status.success() => {
@@ -1753,6 +1775,9 @@ mod tests {
     /// `duduclaw-gateway/src/task_store.rs` has far more; this mirrors just
     /// what's read).
     fn init_test_tasks_db(path: &Path) {
+        let agent_dir = path.parent().unwrap().join("agents/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"worker\"\nstatus = \"active\"\n").unwrap();
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch(
             "CREATE TABLE tasks (
@@ -1791,6 +1816,52 @@ mod tests {
              );",
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn autonomy_pause_heartbeat_cycle_skips_work_then_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = make_test_agent_dir(home, "cycle", Some("original"));
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"cycle\"\nstatus = \"active\"\n").unwrap();
+        duduclaw_security::soul_guard::accept_soul_change("cycle", &agent_dir).unwrap();
+        std::fs::write(agent_dir.join("SOUL.md"), "changed").unwrap();
+        let semaphore = tokio::sync::Semaphore::new(1);
+        let states = tokio::sync::Mutex::new(HashMap::new());
+        let timing = crate::proactive_timing::DeferralLedger::new();
+        autonomy_gate::set_pause(home, Some("cycle"), "maintenance", "user").unwrap();
+        execute_heartbeat(home, "cycle", &semaphore, &states, &timing, None).await;
+        assert!(read_audit_rows(home, "_soul_integrity_drift").is_empty());
+        autonomy_gate::resume(home, Some("cycle")).unwrap();
+        execute_heartbeat(home, "cycle", &semaphore, &states, &timing, None).await;
+        assert_eq!(read_audit_rows(home, "_soul_integrity_drift").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn autonomy_pause_heartbeat_task_pull_resumes_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        init_test_tasks_db(&home.join("tasks.db"));
+        init_test_queue_db(&home.join("message_queue.db"));
+        let tasks = rusqlite::Connection::open(home.join("tasks.db")).unwrap();
+        let now = Utc::now().to_rfc3339();
+        tasks.execute("INSERT INTO tasks(id,title,status,assigned_to,goal_mode,created_at,updated_at) VALUES('pause-task','work','todo','worker',0,?1,?1)", [&now]).unwrap();
+        let queue = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+        let count = || queue.query_row("SELECT COUNT(*) FROM message_queue", [], |row| row.get::<_, i64>(0)).unwrap();
+        for target in [Some("worker"), None] {
+            autonomy_gate::set_pause(home, target, "maintenance", "user").unwrap();
+            poll_assigned_tasks(home, "worker").await.unwrap();
+            assert_eq!(count(), 0);
+            autonomy_gate::resume(home, target).unwrap();
+        }
+        // Lifecycle Paused has the same effect even without an autonomy entry.
+        let config = home.join("agents/worker/agent.toml");
+        std::fs::write(&config, "[agent]\nname = \"worker\"\nstatus = \"paused\"\n").unwrap();
+        poll_assigned_tasks(home, "worker").await.unwrap();
+        assert_eq!(count(), 0);
+        std::fs::write(&config, "[agent]\nname = \"worker\"\nstatus = \"active\"\n").unwrap();
+        poll_assigned_tasks(home, "worker").await.unwrap();
+        assert_eq!(count(), 1);
     }
 
     #[tokio::test]

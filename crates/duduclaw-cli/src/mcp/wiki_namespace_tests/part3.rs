@@ -286,11 +286,11 @@ async fn mcp_agent_toml_writes_are_format_preserving_and_versioned() {
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(after.starts_with("# operator note\n"), "{after}");
     assert!(after.contains("[custom_section]") && after.contains("icon = \"🐱\""), "{after}");
-    let r = super::super::evolution::handle_evolution_toggle(
+    let r = super::super::with_background_caller(op, super::super::evolution::handle_evolution_toggle(
         &serde_json::json!({ "agent_id": "keeper", "field": "gvu_enabled", "value": "false" }),
         home,
         op,
-    )
+    ))
     .await;
     assert!(r.get("isError").and_then(|v| v.as_bool()) != Some(true), "{r}");
     let after = std::fs::read_to_string(&path).unwrap();

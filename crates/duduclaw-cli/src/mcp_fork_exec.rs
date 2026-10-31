@@ -250,6 +250,7 @@ pub struct RotatingBranchExecutor<P: AccountProvider, S: CliSpawner> {
     /// `pool`'s post-completion fail-closed accounting.
     aggregate: Arc<duduclaw_fork::LiveAggregate>,
     durable: Option<(Arc<duduclaw_fork::ForkStore>, String)>,
+    autonomy_scope: Option<duduclaw_core::autonomy_handoff::CapturedScope>,
 }
 
 impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
@@ -261,6 +262,7 @@ impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
             pool: Arc::new(Pool::new(cap)),
             aggregate: Arc::new(duduclaw_fork::LiveAggregate::new(cap)),
             durable: None,
+            autonomy_scope: duduclaw_core::autonomy_handoff::capture(),
         }
     }
 
@@ -280,6 +282,15 @@ impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
 #[async_trait]
 impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecutor<P, S> {
     async fn run_branch(&self, inv: BranchInvocation) -> ForkResult<BranchResult> {
+        // ForkController spawns each branch in a new Tokio task.
+        duduclaw_core::autonomy_handoff::restore(
+            self.autonomy_scope.clone(), self.run_branch_inner(inv),
+        ).await
+    }
+}
+
+impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
+    async fn run_branch_inner(&self, inv: BranchInvocation) -> ForkResult<BranchResult> {
         self.pool.register(inv.branch_id.clone(), inv.budget_usd);
 
         // Honor a cancellation requested before the branch started.
@@ -419,6 +430,39 @@ pub async fn execute_fork<P, S, J>(
     S: CliSpawner + 'static,
     J: JudgeAgent + 'static,
 {
+    // Resolve the persisted owner, never the synthetic fork-judge accounting id.
+    let store = match duduclaw_fork::ForkStore::open(crate::mcp_fork::fork_store_path(&req.home_dir)) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(fork = %req.fork_id, %error, "fork owner store unreadable");
+            return;
+        }
+    };
+    let owner = match store.get_fork(&req.fork_id) {
+        Ok(Some(fork)) if !fork.agent_id.is_empty() => fork.agent_id,
+        _ => {
+            tracing::error!(fork = %req.fork_id, "fork owner missing; execution refused");
+            return;
+        }
+    };
+    drop(store);
+    let home = req.home_dir.clone();
+    crate::ai_session_guard::with_autonomous_utility_context(
+        &home, &owner, execute_fork_scoped(req, &owner, provider, spawner, judge),
+    ).await;
+}
+
+async fn execute_fork_scoped<P, S, J>(
+    req: ForkExecRequest,
+    owner: &str,
+    provider: Arc<P>,
+    spawner: Arc<S>,
+    judge: Arc<J>,
+) where
+    P: AccountProvider + 'static,
+    S: CliSpawner + 'static,
+    J: JudgeAgent + 'static,
+{
     let ForkExecRequest {
         fork_id,
         prompt,
@@ -440,12 +484,42 @@ pub async fn execute_fork<P, S, J>(
         .canonicalize()
         .unwrap_or_else(|_| parent_workspace.clone());
     let requested = branches.iter().map(|branch| branch.id.0.clone()).collect::<Vec<_>>();
-    let claimed = match duduclaw_core::with_file_lock(&home_dir.join("fork_resolution.lock"), || {
-        store.claim_pending_branches(&fork_id, &requested, &parent_record.to_string_lossy())
-            .map_err(std::io::Error::other)
-    }) {
-        Ok(rows) => rows,
-        Err(error) => { tracing::error!("fork {fork_id}: cannot claim pending branches: {error}"); return; }
+    #[cfg(test)]
+    execution_checkpoint("before_claim");
+    let claim = {
+        let home = home_dir.clone();
+        let store = store.clone();
+        let fork_id = fork_id.clone();
+        let owner = owner.to_owned();
+        tokio::task::spawn_blocking(move || {
+            // Wait for the publication lock without an admission lease.
+            duduclaw_core::with_file_lock(&home.join("fork_resolution.lock"), || {
+                let _admission = match admit_fork_owner_blocking(&home, &owner) {
+                    Ok(guard) => guard,
+                    Err(info) => {
+                        // Cancellation bookkeeping is allowed after pause. No
+                        // claim, workspace copy, model call or spawn has begun.
+                        store.cancel_pending_claim(&fork_id, &requested,
+                            &autonomy_refusal_reason(&info.reason))
+                            .map_err(std::io::Error::other)?;
+                        return Ok(Vec::new());
+                    }
+                };
+                store.claim_pending_branches(&fork_id, &requested, &parent_record.to_string_lossy())
+                    .map_err(std::io::Error::other)
+            })
+        }).await
+    };
+    let claimed = match claim {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(error)) => {
+            tracing::error!("fork {fork_id}: cannot claim pending branches: {error}");
+            return;
+        }
+        Err(error) => {
+            tracing::error!("fork {fork_id}: claim worker failed: {error}");
+            return;
+        }
     };
     if claimed.is_empty() { return; }
     let branches = claimed.into_iter().map(|row| duduclaw_fork::Branch::with_id(
@@ -518,8 +592,10 @@ pub async fn execute_fork<P, S, J>(
         .await
     {
         Ok(prepared) => {
-            let resolution = match publish_prepared_resolution(&home_dir, &store, &fork_id,
-                prepared, retain_dir.as_deref()) {
+            #[cfg(test)]
+            execution_checkpoint("before_publication");
+            let resolution = match publish_when_admitted(&home_dir, owner, &store, &fork_id,
+                prepared, retain_dir.as_deref()).await {
                 Ok(Some(resolution)) => resolution,
                 Ok(None) => {
                     tracing::info!("fork {fork_id}: a final selection already exists; background publication skipped");
@@ -587,11 +663,121 @@ pub async fn execute_fork<P, S, J>(
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static EXECUTION_CHECKPOINT: Arc<dyn Fn(&str) + Send + Sync>;
+}
+
+#[cfg(test)]
+fn execution_checkpoint(phase: &str) {
+    let _ = EXECUTION_CHECKPOINT.try_with(|hook| hook(phase));
+}
+
+fn admit_fork_owner_blocking(
+    home: &Path, owner: &str,
+) -> Result<duduclaw_core::autonomy_gate::AdmissionGuard, Box<duduclaw_core::autonomy_gate::PauseInfo>> {
+    duduclaw_core::autonomy_gate::admit_blocking(
+        home, owner, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    )
+}
+
+/// Only persist the stable gate code, never paths or diagnostic error text.
+fn autonomy_refusal_reason(reason: &str) -> String {
+    let code = reason.split_once(':').map_or(reason, |(code, _)| code);
+    let code = if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        code
+    } else {
+        "unknown"
+    };
+    format!("autonomy_refused:{code}")
+}
+
+async fn publish_when_admitted(
+    home: &Path, owner: &str, store: &Arc<duduclaw_fork::ForkStore>, fork_id: &str,
+    prepared: duduclaw_fork::PreparedFork, retain_dir: Option<&Path>,
+) -> std::io::Result<Option<duduclaw_fork::ForkResolution>> {
+    let home = home.to_path_buf();
+    let owner = owner.to_owned();
+    let store = store.clone();
+    let fork_id = fork_id.to_owned();
+    let retain_dir = retain_dir.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        try_publish_when_admitted(&home, &owner, &store, &fork_id, prepared,
+            retain_dir.as_deref())
+    }).await.map_err(std::io::Error::other)?
+}
+
+fn try_publish_when_admitted(
+    home: &Path, owner: &str, store: &duduclaw_fork::ForkStore, fork_id: &str,
+    prepared: duduclaw_fork::PreparedFork, retain_dir: Option<&Path>,
+) -> std::io::Result<Option<duduclaw_fork::ForkResolution>> {
+    let parent = prepared.parent().to_path_buf();
+    let mut pending = Some(prepared);
+    let result = duduclaw_core::with_file_lock(&home.join("fork_resolution.lock"), || {
+        duduclaw_fork::with_parent_publication(&parent, |publication| {
+            // Both lock waits precede admission. The lease is owned by this
+            // blocking writer through recovery, promotion, DB commit and cleanup.
+            let admission = admit_fork_owner_blocking(home, owner);
+            let prepared = pending.take().expect("one publication attempt");
+            let (_admission, prepared) = match admission {
+                Ok(guard) => (Some(guard), prepared),
+                Err(info) => {
+                    // Explicit bookkeeping exception after pause: use the same
+                    // retention and result staging as manual mode. No retry or
+                    // parent write is possible once the winner is cleared.
+                    (None, prepared.require_manual_resolution(autonomy_refusal_reason(&info.reason)))
+                }
+            };
+            publish_prepared_resolution(home, store, fork_id, prepared, retain_dir, publication)
+                .map_err(|error| duduclaw_fork::ForkError::Overlay(error.to_string()))
+        }).map_err(std::io::Error::other)
+    });
+    if let (Err(error), Some(prepared)) = (&result, pending) {
+        // Lock acquisition failed before publication could make recovery copies.
+        // Preserve real output, but never preserve an automatic winner when
+        // admission is refused. This is IO recovery, not a publication retry.
+        let admission = admit_fork_owner_blocking(home, owner);
+        let (_admission, prepared) = match admission {
+            Ok(guard) => (Some(guard), prepared),
+            Err(info) => (None, prepared.require_manual_resolution(autonomy_refusal_reason(&info.reason))),
+        };
+        preserve_unpublished_failure(home, store, fork_id, prepared, &error.to_string());
+    }
+    result
+}
+
+fn preserve_unpublished_failure(
+    home: &Path, store: &duduclaw_fork::ForkStore, fork_id: &str,
+    prepared: duduclaw_fork::PreparedFork, error: &str,
+) {
+    let original = prepared.resolution().clone();
+    let sources = match recovery::Recovery::prepare(home, fork_id, &prepared) {
+        Ok(recovery) => {
+            if let Err(journal_error) = recovery.failed(error) {
+                tracing::error!("fork {fork_id}: cannot update recovery journal: {journal_error}");
+            }
+            recovery.sources
+        }
+        Err(recovery_error) => {
+            let sources = prepared.keep_sources();
+            if let Err(journal_error) = recovery::emergency_journal(home, fork_id, &original, &sources, error) {
+                tracing::error!("fork {fork_id}: recovery unavailable: {recovery_error}; journal: {journal_error}; sources={sources:?}");
+            }
+            sources
+        }
+    };
+    if let Err(db_error) = store.record_publication_failure(fork_id, &original.results,
+        &sources, original.aggregate_spent_usd, error) {
+        tracing::error!("fork {fork_id}: publication failure persisted only in recovery journal: {db_error}");
+    }
+}
+
 /// Publish all result rows and retained paths atomically with respect to manual
 /// selection/termination/GC. A late publisher must not reopen a resolved fork.
 fn publish_prepared_resolution(
     home: &Path, store: &duduclaw_fork::ForkStore, fork_id: &str,
     prepared: duduclaw_fork::PreparedFork, retain_dir: Option<&Path>,
+    publication: &duduclaw_fork::ParentPublication,
 ) -> std::io::Result<Option<duduclaw_fork::ForkResolution>> {
     let original = prepared.resolution().clone();
     // Agent-structure files are never carried back into an agent directory;
@@ -614,7 +800,7 @@ fn publish_prepared_resolution(
             return Err(error);
         }
     };
-    let result = duduclaw_core::with_file_lock(&home.join("fork_resolution.lock"), || {
+    let result = (|| {
         let current = store.get_fork(fork_id).map_err(std::io::Error::other)?
             .ok_or_else(|| std::io::Error::other("fork disappeared before publication"))?;
         if current.resolved { return Ok(None); }
@@ -623,14 +809,14 @@ fn publish_prepared_resolution(
             .map(|branch| duduclaw_fork::BranchId(branch.branch_id)).collect::<Vec<_>>();
         // The home lock protects retained sources and state; the canonical-parent
         // lock also serializes different homes publishing into the same tree.
-        prepared.publish_with_observer(retain_dir, &cancelled,
+        prepared.publish_under_parent_lock(publication, retain_dir, &cancelled,
             || recovery.before_parent_write().map_err(|error| duduclaw_fork::ForkError::Overlay(error.to_string())),
             |resolution| {
             publish_resolution_locked(home, store, fork_id, &resolution)
                 .map_err(|error| duduclaw_fork::ForkError::Overlay(error.to_string()))?;
             Ok(Some(resolution))
         }).map_err(std::io::Error::other)
-    });
+    })();
     match result {
         Ok(resolution) => { recovery.complete(); Ok(resolution) }
         Err(error) => {
@@ -683,9 +869,9 @@ fn publish_resolution_locked(
     }
     let winner = resolution.decision.winner.as_ref().map(|winner| winner.0.as_str());
     let resolved = winner.is_some() && !resolution.decision.needs_confirmation;
-    store.set_resolution(fork_id, winner, resolution.promoted, resolved,
+    store.set_resolution_decision(fork_id, &resolution.decision, resolution.promoted, resolved,
         resolution.aggregate_spent_usd).map_err(std::io::Error::other)?;
-    if resolved { crate::mcp_fork::discard_retained_fork(home, store, fork_id); }
+    if resolved { crate::mcp_fork::discard_retained_fork(home, store, fork_id)?; }
     Ok(true)
 }
 
@@ -800,6 +986,22 @@ impl CliSpawner for ClaudeCliSpawner {
             cmd.env(k, v);
         }
 
+        // The lease ends immediately after spawn, not after branch completion.
+        if duduclaw_core::autonomy_handoff::capture().is_none() {
+            return CliRunOutput {
+                output: "autonomous fork context missing".into(),
+                spent_usd: 0.0,
+                outcome: SpawnOutcome::Failed,
+            };
+        }
+        let admission = match duduclaw_core::autonomy_handoff::admit().await {
+            Ok(admission) => admission,
+            Err(error) => return CliRunOutput {
+                output: error,
+                spent_usd: 0.0,
+                outcome: SpawnOutcome::Failed,
+            },
+        };
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -810,6 +1012,7 @@ impl CliSpawner for ClaudeCliSpawner {
                 };
             }
         };
+        admission.handed_off();
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
@@ -1047,10 +1250,26 @@ mod tests {
     use super::*;
     use duduclaw_fork::BranchId;
 
+    #[test]
+    fn autonomy_refusal_reason_contains_only_the_code() {
+        for code in ["agent_pause", "global_pause", "agent_missing", "invalid_agent_id",
+            "ephemeral_parent_invalid", "agent_not_operational", "admission_unavailable",
+            "agent_status_unreadable", "state_unreadable", "admission_wait_timeout", "unknown"] {
+            assert_eq!(autonomy_refusal_reason(&format!("{code}: /private/error details")),
+                format!("autonomy_refused:{code}"));
+        }
+        for invalid in ["", "/private/error", "unexpected error text"] {
+            assert_eq!(autonomy_refusal_reason(invalid), "autonomy_refused:unknown");
+        }
+    }
+
     fn publication_fixture(home: &Path) -> (duduclaw_fork::ForkStore, duduclaw_fork::ForkResolution, std::path::PathBuf) {
         let agent_dir = home.join("agents/a1");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[fork]\nenabled=true\n").unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[agent]\nstatus = \"active\"\n[fork]\nenabled = true\n",
+        ).unwrap();
         let store = duduclaw_fork::ForkStore::open(crate::mcp_fork::fork_store_path(home)).unwrap();
         store.insert_fork(&duduclaw_fork::ForkRow {
             fork_id: "publication-fork".into(), agent_id: "a1".into(), prompt: "fixture".into(),
@@ -1113,9 +1332,56 @@ mod tests {
         });
         barrier.wait();
         let selected = await_completion.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert_ne!(selected.get("isError").and_then(serde_json::Value::as_bool), Some(true));
+        assert_ne!(selected.get("isError").and_then(serde_json::Value::as_bool), Some(true), "manual selection failed: {selected}");
         assert!(!publish_resolution(home.path(), &store, "publication-fork", &resolution).unwrap());
         selector.join().unwrap();
+        let fork = store.get_fork("publication-fork").unwrap().unwrap();
+        assert!(fork.resolved && fork.promoted);
+        assert_eq!(fork.winner.as_deref(), Some("publication-branch"));
+        assert_eq!(std::fs::read_to_string(parent.join("winner.txt")).unwrap(), "winner fixture");
+        assert!(store.branch_workspace("publication-branch").unwrap().is_none());
+        assert!(!resolution.retained[0].workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn paused_manual_selection_preserves_publication_state_and_resume_allows_it() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, resolution, parent) = publication_fixture(home.path());
+        assert!(publish_resolution(home.path(), &store, "publication-fork", &resolution).unwrap());
+        std::fs::write(parent.join("winner.txt"), "original parent").unwrap();
+        let fork_before = store.get_fork("publication-fork").unwrap();
+        let branches_before = store.list_branches("publication-fork").unwrap();
+        let workspace_before = store.branch_workspace("publication-branch").unwrap();
+        let parent_before = store.parent_workspace("publication-fork").unwrap();
+        let args = serde_json::json!({
+            "fork_id": "publication-fork", "branch_id": "publication-branch",
+        });
+
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some("a1"), "test", "operator").unwrap();
+        let selected = crate::mcp_fork::handle_merge_or_select(&args, home.path(), "a1").await;
+        assert_eq!(selected.get("isError").and_then(serde_json::Value::as_bool), Some(true), "{selected}");
+        assert_eq!(selected["content"][0]["text"], format!(
+            "Error: {}",
+            crate::mcp::check_background_caller(
+                home.path(), crate::mcp::RecordActor::Agent("a1"), "merge_or_select",
+            ).unwrap_err(),
+        ));
+        assert_eq!(
+            duduclaw_core::autonomy_gate::check(
+                home.path(), "a1", duduclaw_core::autonomy_gate::AutonomyPath::Background,
+            ).unwrap_err().reason,
+            "agent_pause",
+        );
+        assert_eq!(store.get_fork("publication-fork").unwrap(), fork_before);
+        assert_eq!(store.list_branches("publication-fork").unwrap(), branches_before);
+        assert_eq!(store.branch_workspace("publication-branch").unwrap(), workspace_before);
+        assert_eq!(store.parent_workspace("publication-fork").unwrap(), parent_before);
+        assert_eq!(std::fs::read_to_string(parent.join("winner.txt")).unwrap(), "original parent");
+        assert_eq!(std::fs::read_to_string(resolution.retained[0].workspace.join("winner.txt")).unwrap(), "winner fixture");
+
+        duduclaw_core::autonomy_gate::resume(home.path(), Some("a1")).unwrap();
+        let selected = crate::mcp_fork::handle_merge_or_select(&args, home.path(), "a1").await;
+        assert_ne!(selected.get("isError").and_then(serde_json::Value::as_bool), Some(true), "{selected}");
         let fork = store.get_fork("publication-fork").unwrap().unwrap();
         assert!(fork.resolved && fork.promoted);
         assert_eq!(fork.winner.as_deref(), Some("publication-branch"));
@@ -1212,6 +1478,194 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             ConflictingSpawner.spawn(ctx, prompt, ws, env).await
         }
+    }
+
+    fn checkpoint_worker<S: CliSpawner + 'static>(
+        request: ForkExecRequest, phase: &'static str,
+        spawner: Arc<S>,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>, std::sync::mpsc::Sender<()>) {
+        let (ready, await_ready) = std::sync::mpsc::channel();
+        let (permit, await_permit) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let await_permit = std::sync::Mutex::new(await_permit);
+            let hook: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |point| {
+                if point == phase {
+                    ready.send(point.to_owned()).unwrap();
+                    await_permit.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                }
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all().max_blocking_threads(1).build().unwrap();
+            runtime.block_on(EXECUTION_CHECKPOINT.scope(hook, execute_fork(request,
+                Arc::new(FakeProvider { accounts: 1 }), spawner,
+                Arc::new(duduclaw_fork::judge::HeuristicJudge))));
+        });
+        (worker, await_ready, permit)
+    }
+
+    #[test]
+    fn pause_after_handler_admission_before_detached_claim_terminates_without_running() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, parent) = publication_fixture(home.path());
+        std::fs::write(home.path().join("config.toml"),
+            "[account_loading]\ninherit_host_credentials = false\n").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all().max_blocking_threads(1).build().unwrap();
+        // Use the real handler, with no credentials/backend. Drive its persisted
+        // pending rows with fakes only after the handler has returned.
+        let response = runtime.block_on(crate::mcp_fork::handle_fork_run(
+            &serde_json::json!({"prompt": "fixture", "n": 2}), home.path(), "a1",
+        ));
+        assert_ne!(response.get("isError").and_then(serde_json::Value::as_bool), Some(true), "{response}");
+        let payload: serde_json::Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["status"], "pending_execution_backend");
+        let fork_id = payload["fork_id"].as_str().unwrap();
+        let request = ForkExecRequest {
+            fork_id: fork_id.into(), prompt: "fixture".into(),
+            branches: store.list_branches(fork_id).unwrap().into_iter().map(|row| {
+                duduclaw_fork::Branch::with_id(BranchId(row.branch_id),
+                    duduclaw_fork::BranchSpec { steering: row.steering, budget_usd: row.budget_usd })
+            }).collect(),
+            parent_workspace: parent.clone(), home_dir: home.path().to_path_buf(),
+            settings: ForkSettings::default(),
+        };
+        let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (worker, ready, permit) = checkpoint_worker(request, "before_claim", Arc::new(CountingSpawner(spawned.clone())));
+        assert_eq!(ready.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), "before_claim");
+        let before = store.list_branches(fork_id).unwrap();
+        let parent_before = store.parent_workspace(fork_id).unwrap();
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some("a1"), "test", "operator").unwrap();
+        permit.send(()).unwrap();
+        assert_eq!(ready.recv_timeout(std::time::Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+        worker.join().unwrap();
+        assert!(before.iter().all(|branch| branch.state == "pending"));
+        let after = store.list_branches(fork_id).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert!(after.iter().all(|branch| branch.state == "terminated"
+            && branch.spent_usd == 0.0 && branch.output == "autonomy_refused:agent_pause"));
+        let fork = store.get_fork(fork_id).unwrap().unwrap();
+        assert!(fork.resolved && !fork.promoted && fork.winner.is_none());
+        let decision = store.resolution_decision(fork_id).unwrap().unwrap();
+        assert!(!decision.needs_confirmation);
+        assert_eq!(decision.reason, "autonomy_refused:agent_pause");
+        assert_eq!(store.parent_workspace(fork_id).unwrap(), parent_before);
+        assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!parent.join("winner.txt").exists());
+    }
+
+    #[test]
+    fn pause_after_prepare_requires_dashboard_resolution_even_after_resume() {
+        refused_publication_stages_manual_resolution(false);
+    }
+
+    #[test]
+    fn deleted_owner_after_prepare_stages_manual_resolution_without_destroying_results() {
+        refused_publication_stages_manual_resolution(true);
+    }
+
+    fn refused_publication_stages_manual_resolution(delete_owner: bool) {
+        struct TrackingSpawner(std::sync::Mutex<Vec<std::path::PathBuf>>);
+        #[async_trait]
+        impl CliSpawner for TrackingSpawner {
+            async fn spawn(&self, ctx: &SpawnCtx, prompt: &str, ws: &Path,
+                env: &HashMap<String, String>) -> CliRunOutput {
+                self.0.lock().unwrap().push(ws.to_path_buf());
+                ConflictingSpawner.spawn(ctx, prompt, ws, env).await
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, parent) = publication_fixture(home.path());
+        // This test executes real preparation instead of the fixture's staged copy.
+        duduclaw_fork::retention::remove_fork(&crate::mcp_fork::retained_root(home.path()),
+            "publication-fork").unwrap();
+        for name in ["winner.txt", "paired.txt"] {
+            std::fs::write(parent.join(name), "original parent").unwrap();
+        }
+        let request = automatic_request(home.path(), &parent);
+        let duplicate_request = automatic_request(home.path(), &parent);
+        let spawner = Arc::new(TrackingSpawner(std::sync::Mutex::new(Vec::new())));
+        let (worker, ready, permit) = checkpoint_worker(request, "before_publication", spawner.clone());
+        assert_eq!(ready.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), "before_publication");
+        let overlays = spawner.0.lock().unwrap().clone();
+        assert_eq!(overlays.len(), 1);
+        assert!(overlays[0].join("winner.txt").exists());
+        let expected_reason = if delete_owner {
+            std::fs::remove_dir_all(home.path().join("agents/a1")).unwrap();
+            "autonomy_refused:agent_missing"
+        } else {
+            // Pause has acknowledged before any refusal bookkeeping occurs.
+            duduclaw_core::autonomy_gate::set_pause(home.path(), Some("a1"), "test", "operator").unwrap();
+            "autonomy_refused:agent_pause"
+        };
+        // A parent's newer edit must survive refusal and subsequent resume.
+        for name in ["winner.txt", "paired.txt"] {
+            std::fs::write(parent.join(name), "newer parent edit").unwrap();
+        }
+        permit.send(()).unwrap();
+        assert_eq!(ready.recv_timeout(std::time::Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected), "the worker must end without retrying");
+        worker.join().unwrap();
+        let fork = store.get_fork("publication-fork").unwrap().unwrap();
+        assert!(!fork.resolved && !fork.promoted && fork.winner.is_none());
+        let decision = store.resolution_decision("publication-fork").unwrap().unwrap();
+        assert!(decision.needs_confirmation && decision.winner.is_none());
+        assert_eq!(decision.reason, expected_reason);
+        let branch = store.list_branches("publication-fork").unwrap().remove(0);
+        assert_eq!(branch.state, "finished");
+        assert_eq!(branch.output, "automatic answer");
+        assert_eq!(branch.spent_usd, 0.01);
+        assert_eq!(fork.aggregate_spent_usd, branch.spent_usd);
+        let retained = std::path::PathBuf::from(store.branch_workspace("publication-branch").unwrap().unwrap());
+        assert!(retained.starts_with(crate::mcp_fork::retained_root(home.path())));
+        for name in ["winner.txt", "paired.txt"] {
+            assert_eq!(std::fs::read_to_string(retained.join(name)).unwrap(), "automatic winner");
+            assert_eq!(std::fs::read_to_string(parent.join(name)).unwrap(), "newer parent edit");
+        }
+        assert!(!overlays[0].parent().unwrap().exists(), "no live private TempDir remains");
+        assert_eq!(spawner.0.lock().unwrap().len(), 1);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let args = serde_json::json!({"fork_id": "publication-fork", "branch_id": "publication-branch"});
+        if !delete_owner {
+            let denied = runtime.block_on(crate::mcp_fork::handle_merge_or_select(&args, home.path(), "a1"));
+            assert_eq!(denied["isError"], true, "{denied}");
+            assert!(retained.exists());
+            duduclaw_core::autonomy_gate::resume(home.path(), Some("a1")).unwrap();
+        } else {
+            // Reusing the id must not inherit manual publication authority.
+            let agent = home.path().join("agents/a1");
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(agent.join("agent.toml"),
+                "[agent]\nstatus = \"active\"\n[fork]\nenabled = true\n").unwrap();
+        }
+        runtime.block_on(execute_fork(duplicate_request, Arc::new(FakeProvider { accounts: 1 }),
+            spawner.clone(), Arc::new(duduclaw_fork::judge::HeuristicJudge)));
+        assert_eq!(spawner.0.lock().unwrap().len(), 1);
+        assert_eq!(store.get_fork("publication-fork").unwrap(), Some(fork));
+        for name in ["winner.txt", "paired.txt"] {
+            assert_eq!(std::fs::read_to_string(parent.join(name)).unwrap(), "newer parent edit");
+        }
+        let fork_before = store.get_fork("publication-fork").unwrap();
+        let branches_before = store.list_branches("publication-fork").unwrap();
+        let workspace_before = store.branch_workspace("publication-branch").unwrap();
+        let parent_before = store.parent_workspace("publication-fork").unwrap();
+        let selected = runtime.block_on(crate::mcp_fork::handle_merge_or_select(&args, home.path(), "a1"));
+        assert_eq!(selected["isError"], true, "{selected}");
+        assert!(selected["content"][0]["text"].as_str().unwrap().contains("fork.resolve"));
+        assert_eq!(store.get_fork("publication-fork").unwrap(), fork_before);
+        assert_eq!(store.list_branches("publication-fork").unwrap(), branches_before);
+        assert_eq!(store.branch_workspace("publication-branch").unwrap(), workspace_before);
+        assert_eq!(store.parent_workspace("publication-fork").unwrap(), parent_before);
+        assert_eq!(store.resolution_decision("publication-fork").unwrap().unwrap().reason, expected_reason);
+        assert!(store.resolution_decision("publication-fork").unwrap().unwrap().needs_confirmation);
+        assert!(retained.exists());
+        for name in ["winner.txt", "paired.txt"] {
+            assert_eq!(std::fs::read_to_string(parent.join(name)).unwrap(), "newer parent edit");
+            assert_eq!(std::fs::read_to_string(retained.join(name)).unwrap(), "automatic winner");
+        }
+        let history = std::fs::read_to_string(home.path().join("fork_history.jsonl")).unwrap();
+        assert_eq!(history.lines().count(), 1);
     }
 
     struct FaultingPublicationJudge(std::path::PathBuf);
@@ -1412,6 +1866,61 @@ mod tests {
             steering: Some("be bold".into()),
             workspace: ws,
             budget_usd: budget,
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_fork_branch_retains_target_and_caller_at_handoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct PausingSpawner {
+            home: std::path::PathBuf,
+            paused: Option<String>,
+            model_calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl CliSpawner for PausingSpawner {
+            async fn spawn(&self, _: &SpawnCtx, _: &str, _: &Path, _: &HashMap<String, String>) -> CliRunOutput {
+                let outcome = duduclaw_core::autonomy_gate::mutate_async(
+                    &self.home, self.paused.as_deref(),
+                    Some(duduclaw_core::autonomy_gate::PauseEntry {
+                        reason: "before fork spawn".into(), who: "operator".into(),
+                        at: chrono::Utc::now().to_rfc3339(),
+                    }),
+                ).await;
+                assert!(matches!(outcome, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+                match duduclaw_core::autonomy_handoff::admit().await {
+                    Ok(admission) => {
+                        self.model_calls.fetch_add(1, Ordering::SeqCst);
+                        admission.handed_off();
+                        CliRunOutput { output: "unexpected spawn".into(), spent_usd: 0.0, outcome: SpawnOutcome::Completed }
+                    }
+                    Err(error) => CliRunOutput { output: error, spent_usd: 0.0, outcome: SpawnOutcome::Failed },
+                }
+            }
+        }
+        for paused in [Some("fork-owner"), Some("fork-caller"), None] {
+            let home = tempfile::tempdir().unwrap();
+            for id in ["fork-owner", "fork-caller"] {
+                let dir = home.path().join("agents").join(id);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+            }
+            let spawner = Arc::new(PausingSpawner {
+                home: home.path().to_path_buf(), paused: paused.map(str::to_string),
+                model_calls: AtomicUsize::new(0),
+            });
+            let callers = vec!["fork-caller".to_string()];
+            let executor = duduclaw_gateway::runtime_dispatch::with_utility_context(
+                home.path(),
+                duduclaw_gateway::runtime_dispatch::UtilityContext::Autonomous {
+                    target: "fork-owner", callers: &callers,
+                },
+                async { RotatingBranchExecutor::new(Arc::new(FakeProvider { accounts: 1 }), spawner.clone(), 1.0) },
+            ).await;
+            let invocation = inv(0.5);
+            let result = tokio::spawn(async move { executor.run_branch(invocation).await }).await.unwrap().unwrap();
+            assert_eq!(result.state, BranchState::Failed);
+            assert_eq!(spawner.model_calls.load(Ordering::SeqCst), 0);
         }
     }
 

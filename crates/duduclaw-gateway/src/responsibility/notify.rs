@@ -283,6 +283,9 @@ impl Notifier<'_> {
         if !policy_allows(resp, event.policy_kind()) {
             return NoticeOutcome::Suppressed("policy_off");
         }
+        if duduclaw_core::autonomy_gate::check(self.home, &resp.owner_agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Responsibility).is_err() {
+            return NoticeOutcome::Suppressed("autonomy_paused");
+        }
         let agent_dir = self.home.join("agents").join(&resp.owner_agent_id);
         let cfg = crate::proactive_gate::read_proactive_config(&agent_dir);
         if !cfg.enabled {
@@ -300,16 +303,26 @@ impl Notifier<'_> {
         }
         let episode = match event.task_id() {
             Some(t) => Some(t.to_string()),
-            None => self
-                .store
-                .last_occurrence_task(&resp.responsibility_id)
-                .await
-                .ok()
-                .flatten(),
+            None => match self.store.last_occurrence_task(&resp.responsibility_id).await {
+                Ok(task) => task,
+                Err(_) => return NoticeOutcome::Suppressed("task_unreadable"),
+            },
         };
-        let decide = self
-            .scorer
-            .decide(self.home, &resp.owner_agent_id, &cfg, text);
+        // The occurrence can have an employee creator distinct from its owner.
+        // Preserve that caller through the scorer's provider send, not only the
+        // early owner check above. An unreadable task store cannot drop identity.
+        let callers = match episode.as_deref() {
+            Some(task_id) => match self.store.get_task(task_id).await {
+                Ok(Some(task)) => crate::autonomous_runtime::task_caller(self.home, &task)
+                    .into_iter().collect::<Vec<_>>(),
+                Ok(None) | Err(_) => return NoticeOutcome::Suppressed("task_unreadable"),
+            },
+            None => Vec::new(),
+        };
+        let decide = crate::autonomous_runtime::scope(
+            self.home, &resp.owner_agent_id, &callers,
+            self.scorer.decide(self.home, &resp.owner_agent_id, &cfg, text),
+        );
         let decision = match episode {
             Some(episode_id) => {
                 crate::runtime::GOAL_ROUND_ATTRIBUTION
@@ -326,6 +339,9 @@ impl Notifier<'_> {
         };
         if let GateDecision::Suppress { reason } = decision {
             return NoticeOutcome::Suppressed(reason);
+        }
+        if duduclaw_core::autonomy_gate::check(self.home, &resp.owner_agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Responsibility).is_err() {
+            return NoticeOutcome::Suppressed("autonomy_paused");
         }
         use crate::goal_notify::NotifyOutcome as N;
         match self

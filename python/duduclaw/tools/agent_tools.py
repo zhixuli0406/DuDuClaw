@@ -1,4 +1,5 @@
 """Agent management MCP tools"""
+import asyncio
 import logging
 import os
 import re
@@ -8,6 +9,49 @@ logger = logging.getLogger(__name__)
 
 # Valid agent name: lowercase alphanumeric + hyphens, 1-64 chars
 _VALID_AGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]?$")
+_STATUS_TIMEOUT_SECONDS = 45
+_TERMINATE_GRACE_SECONDS = 2
+_STATUS_UNKNOWN = "Rust CLI result unknown; re-read agent status before retrying"
+
+
+def _resolve_cli_path() -> str:
+    """Require the operator's absolute CLI override; never search inherited PATH."""
+    configured = os.environ.get("DUDUCLAW_BIN", "")
+    error = "DUDUCLAW_BIN must name a trusted absolute path to an executable Rust CLI"
+    if not configured or not Path(configured).is_absolute():
+        raise ValueError(error)
+    try:
+        binary = Path(configured).resolve(strict=True)
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise ValueError(error)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(error) from exc
+    return str(binary)
+
+
+async def _terminate_status_child(process: asyncio.subprocess.Process) -> None:
+    """Stop and reap a child while draining its pipes to avoid wait deadlocks."""
+    if process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass  # The child exited between the returncode check and the signal.
+    try:
+        await asyncio.wait_for(process.communicate(), _TERMINATE_GRACE_SECONDS)
+    except (asyncio.TimeoutError, OSError):
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        # Continue draining after kill; wait() alone can block on full pipes.
+        # A failed pipe cannot be drained, but the child still must be reaped.
+        try:
+            await asyncio.wait_for(process.communicate(), _TERMINATE_GRACE_SECONDS)
+        except (asyncio.TimeoutError, OSError):
+            pass
+    finally:
+        await process.wait()
 
 
 def _is_valid_agent_id(name: str) -> bool:
@@ -247,18 +291,40 @@ class AgentTools:
         if not toml_path.exists():
             return {"success": False, "error": f"Agent '{name}' not found"}
 
-        content = toml_path.read_text()
-        lines = []
-        in_agent_section = False
-        for line in content.splitlines():
-            if line.strip() == "[agent]":
-                in_agent_section = True
-            elif line.strip().startswith("[") and line.strip() != "[agent]":
-                in_agent_section = False
-
-            if in_agent_section and line.strip().startswith("status"):
-                lines.append(f'status = "{status}"')
-            else:
-                lines.append(line)
-        toml_path.write_text("\n".join(lines) + "\n")
+        # Delegate to the Rust profile writer: it re-reads under the file lock
+        # and drains admission before a lifecycle change. Never write a snapshot.
+        action = {"paused": "pause", "active": "resume"}.get(status)
+        if action is None:
+            return {"success": False, "error": "Unsupported agent status"}
+        try:
+            binary = _resolve_cli_path()
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        try:
+            process = await asyncio.create_subprocess_exec(
+                binary, "agent", action, name,
+                env={**os.environ, "DUDUCLAW_HOME": str(agents_dir.parent)},
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            return {"success": False, "error": f"Rust CLI unavailable; status unchanged: {exc}"}
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), _STATUS_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, asyncio.CancelledError, OSError) as exc:
+            # Shield cleanup even from repeated cancellation. A killed child may
+            # already have committed, so neither failure implies "unchanged".
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            cleanup = asyncio.create_task(_terminate_status_child(process))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup.result()
+            if cancelled:
+                raise asyncio.CancelledError(_STATUS_UNKNOWN) from exc
+            reason = "timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
+            return {"success": False, "error": f"{_STATUS_UNKNOWN}: {reason}"}
+        if process.returncode != 0:
+            return {"success": False, "error": stderr.decode(errors="replace")[:2000] or "Rust CLI refused the status change"}
         return {"success": True, "name": name, "status": status}

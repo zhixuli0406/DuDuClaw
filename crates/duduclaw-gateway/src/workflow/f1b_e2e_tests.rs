@@ -336,3 +336,39 @@ async fn runner_effect_revoked_between_prepare_and_execute_never_runs() {
         assert_ne!(state, "executing");
     }
 }
+
+/// Pause after approval/lease renewal leaves the existing operation Prepared.
+#[tokio::test]
+async fn autonomy_pause_after_prepare_preserves_effect_for_resume() {
+    let r = Resume::new().await;
+    let (run, _, effect_card) = r.to_effect_card().await;
+    r.decide(&effect_card, true).await;
+    let resume = r.sweep_resume(&run, &effect_card).await;
+    let message = r.message(&resume).await;
+    let runner_side = r.pilot.reopen();
+    let (outcome, paused) = super::security_race_tests::race_at(
+        "runner_before_effect_execute",
+        runner_side.dispatch_queue_message_outcome(&message),
+        async {
+            duduclaw_core::autonomy_gate::set_pause(
+                r.pilot.home.path(), Some("alice"), "maintenance", "operator",
+            )
+        },
+    ).await;
+    paused.unwrap();
+    assert!(matches!(outcome.unwrap(), DispatchOutcome::Deferred));
+    assert_eq!(r.title().await, "before-resume");
+    let checkpoint = r.step(&run, "update").await;
+    assert_eq!(checkpoint.status, StepStatus::Running);
+    assert!(checkpoint.operation_id.is_some());
+    assert!(r.operations(&run).iter().any(|(_, state)| state == "prepared"));
+    assert!(r.operations(&run).iter().all(|(_, state)| state != "executing" && state != "succeeded"));
+    let stored = r.pilot.service.store.get_run(&run).await.unwrap().unwrap();
+    assert!(stored.failure_class.is_none());
+    let retained = r.message(&resume).await;
+    assert_eq!(retained.retry_count, message.retry_count);
+    duduclaw_core::autonomy_gate::resume(r.pilot.home.path(), Some("alice")).unwrap();
+    let done = runner_side.dispatch_queue_message_outcome(&retained).await.unwrap();
+    assert!(matches!(done, DispatchOutcome::Done(ref run) if run.status == RunStatus::Succeeded));
+    assert_eq!(r.step(&run, "update").await.operation_id, checkpoint.operation_id);
+}

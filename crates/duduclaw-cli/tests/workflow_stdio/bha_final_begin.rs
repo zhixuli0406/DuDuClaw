@@ -60,7 +60,7 @@ async fn run_case(case: Case) {
     let (home, key) = setup();
     std::fs::write(
         home.path().join("agents/alice/agent.toml"),
-        format!("[agent]\nname='alice'\nrole='fixture'\n[capabilities]\nautonomy_level='auto'\n{ASK_POLICY}"),
+        format!("[agent]\nname='alice'\nrole='fixture'\nstatus='active'\n[capabilities]\nautonomy_level='auto'\n{ASK_POLICY}"),
     )
     .unwrap();
     let mut alice = session(home.path(), "alice", &key).await;

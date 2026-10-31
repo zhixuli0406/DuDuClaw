@@ -213,7 +213,10 @@ impl FailoverManager {
                         return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
                             RuntimePreflightKind::Budget, message.to_owned()));
                     }
-                    let stop=is_non_retryable(&error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error);
+                    // An autonomy pause refusal is not a provider failure: it must
+                    // not put the runtime into cooldown for human chat.
+                    let stop=is_non_retryable(&error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error)
+                        || crate::autonomous_runtime::was_denied();
                     failure.push(Primary,*primary,Some(&context.model),Outcome::ExecutionError(error));
                     if stop {return Err(failure);}
                     self.record_failure(primary).await;
@@ -272,7 +275,9 @@ impl FailoverManager {
                     return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
                         RuntimePreflightKind::Budget, message.to_owned()));
                 }
-                self.record_failure(fb).await;
+                if !crate::autonomous_runtime::was_denied() && !error.starts_with("AUTONOMY_PAUSED:") {
+                    self.record_failure(fb).await;
+                }
                 failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::ExecutionError(error));Err(failure)
             }
         }
@@ -380,6 +385,7 @@ fn record_successful_response(runtime:&RuntimeType,context:&RuntimeContext,respo
 /// Avoids broad substring matches like "safety" or "content policy" that
 /// could unintentionally match legitimate error descriptions.
 fn is_non_retryable(error: &str) -> bool {
+    if error.starts_with("AUTONOMY_PAUSED:") { return true; }
     let lower = error.to_lowercase();
     // 4xx client errors (except 429 rate limit which is retryable)
     lower.contains("400 ") || lower.contains("401 ") || lower.contains("403 ")
@@ -900,6 +906,100 @@ mod tests {
             .find(|h| h.runtime_type == RuntimeType::Kiro)
             .expect("kiro health recorded");
         assert_eq!(kiro.consecutive_failures, 1);
+    }
+
+    /// Refuses through the autonomy gate at transport time, wrapping the
+    /// refusal the way non-Claude runtimes report spawn errors.
+    struct PausedRuntime;
+
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for PausedRuntime {
+        fn name(&self) -> &str {
+            "paused"
+        }
+        async fn execute(
+            &self,
+            _prompt: &str,
+            context: &RuntimeContext,
+        ) -> Result<RuntimeResponse, String> {
+            let refusal = crate::autonomous_runtime::require_utility_context(&context.home_dir)
+                .await
+                .expect_err("paused scope must refuse");
+            Err(format!("Failed to run stub: {refusal}"))
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn autonomy_refusal_never_puts_a_runtime_into_cooldown() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"alice\"\nstatus = \"active\"\n").unwrap();
+        duduclaw_core::autonomy_gate::set_pause(home.path(), None, "pause", "operator").unwrap();
+        let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        map.insert(RuntimeType::Grok, Box::new(PausedRuntime));
+        map.insert(RuntimeType::Claude, Box::new(PausedRuntime));
+        let reg = RuntimeRegistry::with_runtimes(map);
+        let mgr = FailoverManager::new(300);
+        let mut ctx = stub_context();
+        ctx.home_dir = home.path().to_path_buf();
+        // More refusals than the three-failure cooldown threshold.
+        for _ in 0..4 {
+            crate::autonomous_runtime::scope(
+                home.path(),
+                "alice",
+                &[],
+                mgr.execute_with_failover(
+                    &reg,
+                    &RuntimeType::Grok,
+                    Some(&RuntimeType::Claude),
+                    "hi",
+                    &ctx,
+                    &[],
+                ),
+            )
+            .await
+            .expect_err("paused scope must refuse");
+        }
+        for health in mgr.health_summary().await {
+            assert_eq!(health.consecutive_failures, 0, "{:?}", health.runtime_type);
+            assert!(health.is_available, "{:?}", health.runtime_type);
+        }
+
+        // The fallback branch: an unregistered primary hands over to a
+        // fallback that is refused at transport time.
+        let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        map.insert(RuntimeType::Claude, Box::new(PausedRuntime));
+        let reg = RuntimeRegistry::with_runtimes(map);
+        let mgr = FailoverManager::new(300);
+        for _ in 0..4 {
+            crate::autonomous_runtime::scope(
+                home.path(),
+                "alice",
+                &[],
+                mgr.execute_with_failover(
+                    &reg,
+                    &RuntimeType::Grok,
+                    Some(&RuntimeType::Claude),
+                    "hi",
+                    &ctx,
+                    &[],
+                ),
+            )
+            .await
+            .expect_err("paused scope must refuse");
+        }
+        let fallback = mgr
+            .health_summary()
+            .await
+            .into_iter()
+            .find(|h| h.runtime_type == RuntimeType::Claude)
+            .expect("fallback health tracked");
+        assert_eq!(fallback.consecutive_failures, 0);
+        assert!(fallback.is_available);
     }
 }
 

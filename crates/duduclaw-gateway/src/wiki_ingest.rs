@@ -1541,6 +1541,7 @@ pub async fn run_ingest(
     origin: Option<(String, String)>,
     sources: Vec<duduclaw_memory::SourceRef>,
 ) {
+    crate::autonomous_runtime::scope(home_dir, agent_id, &[], async {
     INGEST_ORIGIN
         .scope(
             origin,
@@ -1557,6 +1558,7 @@ pub async fn run_ingest(
             ),
         )
         .await
+    }).await
 }
 
 tokio::task_local! {

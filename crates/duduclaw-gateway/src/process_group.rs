@@ -223,16 +223,50 @@ async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
 
 /// Collect a CLI while keeping ownership of its leader. The deadline includes
 /// writing stdin and draining both pipes, so a stalled reader cannot outlive it.
+/// Version probes use this path: it does not take an autonomy lease.
 pub async fn output(
     cmd: &mut tokio::process::Command,
     input: Option<&[u8]>,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, OutputError> {
+    collect_output(cmd, input, timeout, false).await
+}
+
+/// Model spawn. One admission lease is held across `spawn` and released before
+/// stdin or pipe draining, so a pause cannot land between the check and a
+/// running process, and the lease is not held for the whole deadline.
+pub async fn output_for_model(
+    cmd: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, OutputError> {
+    collect_output(cmd, input, timeout, true).await
+}
+
+async fn collect_output(
+    cmd: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+    timeout: std::time::Duration,
+    admit: bool,
+) -> Result<std::process::Output, OutputError> {
     use tokio::io::AsyncWriteExt;
     use std::process::Stdio;
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped()).stderr(Stdio::piped());
+    let admission = if admit {
+        Some(
+            crate::autonomous_runtime::admit_current()
+                .await
+                .map_err(|error| OutputError::Io(std::io::Error::other(error)))?,
+        )
+    } else {
+        None
+    };
     let mut managed = ManagedChild::spawn(cmd).map_err(OutputError::Io)?;
+    if admission.is_some() {
+        crate::autonomous_runtime::mark_handoff();
+    }
+    drop(admission);
     let mut stdin = managed.child().stdin.take();
     let mut stdout = managed.child().stdout.take().expect("piped stdout");
     let mut stderr = managed.child().stderr.take().expect("piped stderr");

@@ -659,7 +659,7 @@ impl GenericCliRuntime {
         );
 
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
-        let output = crate::process_group::output(
+        let output = crate::process_group::output_for_model(
             &mut cmd, stdin_prompt.then_some(payload.as_bytes()), Duration::from_secs(timeout_secs),
         ).await.map_err(|e| match e {
             crate::process_group::OutputError::Timeout => GenericCliError::Timeout {
