@@ -4,7 +4,7 @@
 
 `duduclaw tui` opens a control room for pending approvals, goals needing a reply, and employee status. Select a row to inspect its details. Where the gateway provides it, administrators also see the next scheduled autonomous run. Closing the control room does not stop employees.
 
-Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee status pause/resume uses the M2 permission checks and confirmation cards. The terminal interface currently uses Traditional Chinese.
+Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee status pause/resume uses the same permission checks and confirmation cards. The terminal interface currently uses Traditional Chinese.
 
 ## Start
 
@@ -24,7 +24,7 @@ The CLI connects to `127.0.0.1`, using `DUDUCLAW_PORT`, then `<home>/config.toml
 
 **For remote use, SSH into the gateway host and run it there; do not port-forward the gateway.** Port forwarding would expose its loopback-only local login route to programs on the forwarding host.
 
-## Embedded local terminal (M4)
+## Embedded local terminal
 
 Press `P` in list focus, or choose `pty` in the command palette, to open an owner-local PTY in the focused block. It runs `$SHELL` (fallback `/bin/sh`) and inherits the owner's environment after removing every `DUDUCLAW_*` variable. Gateway JWTs remain in memory and are never added to the child's environment. The existing AI-session startup refusal still applies. No gateway response can supply a local command.
 
@@ -39,7 +39,7 @@ Closing or replacing a block with a pending/running child asks for `y`; `Esc` ca
 RPC `/ws` and WebChat `/ws/chat` send Close and allow up to one second for the peer's closing handshake on normal shutdown. The control-room, inbox and watch entry points await shutdown.
 
 
-## Command palette and exit summary (M3)
+## Command palette and exit summary
 
 Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chinese labels or English aliases such as `stop`, `steer`, `log`); arrows select, `Enter` runs the displayed shortcut, and `Esc` returns to the previous focus with the chat draft intact. `Ctrl-K` remains reserved. The list is recalculated from the focused block, current role, employee binding and fresh data. A selected control opens the same confirmation card as its shortcut; it never approves or confirms for you. Cards and content warnings own their keyboard, so the palette cannot open over them.
 
@@ -90,7 +90,7 @@ The right area tiles up to four blocks as described below. This version permits 
 
 One `/ws/chat` connection shares the `/ws` client's in-memory token refresh and reconnects with backoff. Interrupted messages are not automatically resent; their outcome is uncertain. Completed conversations can resume on reconnect; changing employee starts a new conversation. In list focus, `X` cancels a running reply only after the gateway has sent a frame carrying `msg_id`. Otherwise the block says cancellation is unavailable. `cancel_accepted` only means the request was accepted; the turn ends on `cancelled` or a final response. This requires the additive protocol from PR #264; ordinary chat works with the current gateway.
 
-## Tiled blocks and task controls (M2)
+## Tiled blocks and task controls
 
 The right side holds one to four blocks. `v` splits left/right, `x` splits top/bottom, `1`–`4` focuses a block, and `Ctrl-W` closes it locally. Closing a block does not cancel a task or chat turn. Layout survives resizing during the session; when the right area is narrower than 64 columns or shorter than 16 rows, only the focused block is shown with the hidden count. It returns to the same layout when enlarged. Layout is not saved across application restarts.
 
@@ -130,7 +130,7 @@ Goal cards use `r` for retry. `a` aborts, `d` marks done, and `t` takes over: pr
 
 Cards with `may_decide=false` are read-only and explain why. Goal actions require a known Operator/Owner binding or Admin access from `users.me`. Dashboard-only approvals, questions requiring answers, and bound operations stay in the dashboard. The TUI displays a fixed instruction and never opens a link supplied by the server. Standing-authority and global configuration changes remain in the dashboard.
 
-Approval requires a nonempty string `digest`, sent as `expected_digest`. If it is absent or null (including a redacted viewer payload), approval sends no RPC and the card stays open with the fixed line: **內容未綁定：這張卡無法確認你看到的就是實際內容，請到儀表板決定**. Denial remains available with `n`. Approving from the control room therefore requires **PR #261 merged**, which adds digests to `approvals.list`. A structured digest mismatch closes the card and refetches with a fixed change notice. Every sent decision, including RPC errors and uncertain timeouts, triggers a refetch; no optimistic success or automatic resend. Server errors pass through `TerminalText`; stale, expired, or deadline-free approvals cannot be decided.
+Approval requires a nonempty string `digest`, sent as `expected_digest`. If it is absent or null (including a redacted viewer payload), approval sends no RPC and the card stays open with the fixed line: **內容未綁定：這張卡無法確認你看到的就是實際內容，請到儀表板決定**. Denial remains available with `n`. `approvals.list` supplies the digest. A structured digest mismatch closes the card and refetches with a fixed change notice. Every sent decision, including RPC errors and uncertain timeouts, triggers a refetch; no optimistic success or automatic resend. Server errors pass through `TerminalText`; stale, expired, or deadline-free approvals cannot be decided.
 
 `s` in the list or card snoozes the row locally for up to ten minutes. Approvals are capped at 80% of remaining TTL and resurface no later than when 20% of TTL or ten minutes (whichever is less) remains, with a reason; an earlier requested wake-up wins. A shortened deadline also resurfaces the row. Expiry means denial, and snooze cannot extend it. Only identifiers and timestamps are saved in `tui-state.json`; the line-oriented `inbox` command continues to show the authoritative pending list. A wall clock earlier than the snooze start clears that snooze permanently; a monotonic deadline also bounds it during the session. Restart loses clock continuity and shows snoozed cards again.
 
