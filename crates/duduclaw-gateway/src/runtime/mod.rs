@@ -5,6 +5,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod codex_sandbox;
 pub mod generic_cli;
 pub mod grok;
 pub mod openai_compat;

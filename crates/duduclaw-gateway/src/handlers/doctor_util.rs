@@ -36,12 +36,21 @@ pub async fn has_api_key_configured(home_dir: &Path) -> bool {
     false
 }
 
+/// Shared status and operator guidance for both doctor surfaces. Raw probe
+/// output stays internal; only the fixed zh-TW guidance reaches the UI.
+pub async fn codex_sandbox_status_and_message() -> (&'static str, &'static str) {
+    let binary = duduclaw_core::which_codex().unwrap_or_else(|| "codex".into());
+    let result = crate::runtime::codex_sandbox::probe(&binary).await;
+    (if result.blocked() { "warn" } else { "pass" }, result.message(crate::updater::is_containerized()))
+}
+
 /// Repair-hint text for one failing/warning `system.doctor` check name.
 /// Extracted from `MethodHandler::handle_system_doctor_repair` (now a thin
 /// delegate) so the O-0 `os_doctor_repair` MCP tool (`duduclaw-cli::mcp`)
 /// shares the exact same hint copy instead of re-deriving it.
 pub fn doctor_repair_hint(check_name: &str) -> &'static str {
     match check_name {
+        "codex_employee_shell" => "請依此檢查項目的訊息，由管理者確認主機的 user namespace 與容器設定。",
         "agents" => "Run 'duduclaw agent create <name>' to create your first agent.",
         "api_key" => "Set ANTHROPIC_API_KEY environment variable with a valid key.",
         "config_file" => "Run 'duduclaw init' to create a default config.toml.",

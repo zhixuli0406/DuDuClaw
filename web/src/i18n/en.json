@@ -4702,6 +4702,7 @@
   "settings.doctor.check.config_file": "Config file",
   "settings.doctor.check.agents": "AI employees",
   "settings.doctor.check.api_key": "API key",
+  "settings.doctor.check.codex_employee_shell": "Codex employee shell",
   "settings.doctor.check.container_runtime": "Container runtime",
   "settings.doctor.check.mcp_server": "MCP tool service",
   "settings.doctor.check.grok_cli": "Grok CLI",

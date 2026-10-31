@@ -10261,6 +10261,13 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     checks.push(computer_workspaces_check(&home).await);
     checks.push(computer_profiles_check(&home));
 
+    let (status, message) = duduclaw_gateway::handlers::codex_sandbox_status_and_message().await;
+    checks.push((
+        "Codex 員工 shell".into(),
+        if status == "warn" { CheckStatus::Warn } else { CheckStatus::Pass },
+        message.into(),
+    ));
+
     // Check 4c: agents on a deprecated runtime (R1, 2026-10).
     checks.push(deprecated_runtime_check(&home).await);
 

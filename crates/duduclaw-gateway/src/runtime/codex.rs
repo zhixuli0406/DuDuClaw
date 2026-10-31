@@ -168,7 +168,7 @@ const EMPLOYEE_PERMISSION_PROFILE: &str = "duduclaw-employee";
 
 /// Absolute exclusions keep protecting the employee when the spawn cwd is overridden.
 #[cfg(unix)]
-fn employee_permission_args(agent_dir: &std::path::Path, work_root: Option<&std::path::Path>) -> Result<Vec<String>, String> {
+pub(super) fn employee_permission_args(agent_dir: &std::path::Path, work_root: Option<&std::path::Path>) -> Result<Vec<String>, String> {
     let mut entries = vec![
         format!("{}={}", toml_string_literal(":root"), toml_string_literal("read")),
         format!("{}={}", toml_string_literal(":tmpdir"), toml_string_literal("write")),
@@ -725,6 +725,7 @@ pub(crate) async fn probe_codex_version_output(bin: &str) -> Option<String> {
 
 /// Replace the per-path cell: an in-flight old probe cannot repopulate it.
 pub(crate) fn clear_codex_support(bin: &str) {
+    super::codex_sandbox::clear(bin);
     let mut map = CODEX_SUPPORT
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock().unwrap_or_else(|e| e.into_inner());

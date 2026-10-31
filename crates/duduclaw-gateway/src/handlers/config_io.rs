@@ -90,13 +90,14 @@ impl MethodHandler {
         let has_key = self.has_api_key().await;
         let config_exists = self.home_dir.join("config.toml").exists();
 
-        // The three spawning probes run concurrently — worst case the RPC
+        // The spawning probes run concurrently — worst case the RPC
         // costs max(docker, grok ping 15s+version 5s, mcp cold-start 10s),
         // not the sum. The dashboard passes an extended per-call timeout.
-        let (docker, mcp, grok) = tokio::join!(
+        let (docker, mcp, grok, codex_sandbox) = tokio::join!(
             check_docker(),
             crate::doctor_probes::mcp_cold_start_probe(&self.home_dir),
             crate::doctor_probes::grok_probe(&self.home_dir),
+            codex_sandbox_status_and_message(),
         );
 
         // O16: the three always-present rows come from `crate::os_ops`, which
@@ -104,6 +105,12 @@ impl MethodHandler {
         // one definition of "what config_file/agents/api_key look like",
         // two projections (`can_repair` is dashboard-only).
         let mut checks = crate::os_ops::doctor_base_checks(config_exists, has_agents, has_key, true);
+        checks.push(json!({
+            "name": "codex_employee_shell",
+            "status": codex_sandbox.0,
+            "message": codex_sandbox.1,
+            "can_repair": false,
+        }));
         checks.push({
             let (docker_status, docker_msg) = docker;
             json!({
