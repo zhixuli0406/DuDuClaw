@@ -140,9 +140,7 @@ impl ApprovalVisibility {
 
     pub(crate) fn for_reader(mut self, home: &Path, record: &ApprovalRecord, fresh: &UserContext) -> Self {
         self.employee_requires_admin = None;
-        if matches!(dashboard_only_reader(record), DashboardOnlyReader::EmployeeViewer)
-            && fresh.has_role(UserRole::Manager) && !fresh.requires_password_change()
-            && fresh.has_agent_access(&record.agent_id, AccessLevel::Viewer) && !fresh.is_admin()
+        if !fresh.is_admin()
         {
             self.employee_requires_admin = Some(crate::machine_employee::requires_admin_for_id(home, &record.agent_id));
         }
@@ -154,6 +152,7 @@ impl ApprovalVisibility {
     /// decide is a separate gate and does not hide their metadata here.
     pub(crate) fn may_read(&self, record: &ApprovalRecord, fresh: &UserContext, department: Option<&str>) -> bool {
         if !fresh.has_role(UserRole::Manager) || fresh.requires_password_change() { return false; }
+        if !fresh.is_admin() && self.employee_requires_admin != Some(false) { return false; }
         let allowed = match dashboard_only_reader(record) {
             DashboardOnlyReader::Admin => fresh.is_admin(),
             // Same predicate as `add_source_approval::may_decide`, on this
@@ -170,7 +169,6 @@ impl ApprovalVisibility {
             }
             DashboardOnlyReader::EmployeeViewer => {
                 fresh.has_agent_access(&record.agent_id, AccessLevel::Viewer)
-                    && (fresh.is_admin() || self.employee_requires_admin == Some(false))
             }
         };
         if !allowed { return false; }
@@ -234,6 +232,32 @@ mod tests {
         // A previously prepared frame must load this fact for each reader.
         let mut gate = crate::handlers::push_filter::PushGate::new(&f.home, &f.bob, false);
         assert!(gate.filter_prepared(shared).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn collection_editor_cannot_read_machine_employee_cards() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let db = duduclaw_knowledge::schema::open_home(&f.home).unwrap();
+        db.execute("INSERT INTO collections (id,slug,name,created_by,created_at,updated_at) VALUES ('c','c','Collection','system','now','now')", []).unwrap();
+        db.execute("INSERT INTO collection_acl (collection_id,principal_kind,principal_id,role,granted_by,granted_at) VALUES ('c','user',?1,'editor','system','now')", [&f.alice.user_id]).unwrap();
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", crate::knowledge::add_source_approval::ACTION_KIND,
+            "Review source", json!({"collection_id":"c"}), 300).await.unwrap();
+        let record = broker.get(&id).await.unwrap().unwrap();
+        assert!(ApprovalVisibility::load(&f.home, &record, &f.alice).may_read(&record, &f.alice, None));
+        duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+        duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+            "system-operator", "test", "test").unwrap();
+        assert!(!ApprovalVisibility::load(&f.home, &record, &f.alice).may_read(&record, &f.alice, None));
+        assert!(ApprovalVisibility::load(&f.home, &record, &root).may_read(&record, &root, None));
+        let mut normal = record.clone();
+        normal.agent_id = "normal".into();
+        assert!(ApprovalVisibility::load(&f.home, &normal, &f.alice).may_read(&normal, &f.alice, None));
+        let mut unloaded = ApprovalVisibility::load_shared(&f.home, &normal);
+        assert!(!unloaded.may_read(&normal, &f.alice, None));
+        unloaded.employee_requires_admin = Some(true);
+        assert!(!unloaded.may_read(&normal, &f.alice, None));
     }
 
     #[tokio::test]

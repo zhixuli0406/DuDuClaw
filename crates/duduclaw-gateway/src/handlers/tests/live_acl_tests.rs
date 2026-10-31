@@ -662,3 +662,31 @@ async fn managers_monitor_live_team_grants_without_content_or_write_access() {
     }
     assert!(matches!(f.handler.handle("runs.get", json!({"run_id": run["id"]}), &ctx).await, WsFrame::Response { ok: false, .. }));
 }
+
+#[tokio::test]
+async fn preset_change_reaches_cached_connection_without_generation_change() {
+    let f = fixture().await;
+    let emp = person(&f.db, "preset-reader", UserRole::Employee);
+    f.db.bind_agent(&emp, "sales", AccessLevel::Owner).unwrap();
+    f.db.bind_agent(&emp, "hr", AccessLevel::Owner).unwrap();
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[("sales", AccessLevel::Owner), ("hr", AccessLevel::Owner)]);
+    let params = json!({"agent_id":"sales"});
+    ok_payload(&f.handler.handle("agents.inspect", params.clone(), &ctx).await);
+    assert!(f.handler.live_context(&ctx).await.unwrap().agent_access.contains_key("sales"));
+    let generation = f.db.acl_generation().unwrap();
+    duduclaw_core::preset::install_system_operator_preset(f.home.path(), false).unwrap();
+    duduclaw_core::preset::bind(f.home.path(), "sales", &f.home.path().join("agents/sales"),
+        "system-operator", "test", "test").unwrap();
+    assert_eq!(f.db.acl_generation().unwrap(), generation);
+    let live = f.handler.live_context(&ctx).await.unwrap();
+    assert!(!live.agent_access.contains_key("sales"));
+    assert!(live.agent_access.contains_key("hr"));
+    assert_eq!(error_of(&f.handler.handle("agents.inspect", params.clone(), &ctx).await), json!("permission denied"));
+    ok_payload(&f.handler.handle("agents.inspect", json!({"agent_id":"hr"}), &ctx).await);
+    ok_payload(&f.handler.handle("agents.inspect", params, &UserContext::admin_fallback()).await);
+    // The cache retains raw authority, so unbinding the preset restores the
+    // existing grant at the same generation, without touching users.db.
+    std::fs::write(duduclaw_core::preset::bindings_path(f.home.path()), "schema = 1\n").unwrap();
+    assert!(f.handler.live_context(&ctx).await.unwrap().agent_access.contains_key("sales"));
+    assert_eq!(f.db.acl_generation().unwrap(), generation);
+}

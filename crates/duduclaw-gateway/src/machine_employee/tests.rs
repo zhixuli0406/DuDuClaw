@@ -331,3 +331,35 @@ async fn reader_identity_check_is_read_only_and_fails_closed() {
     std::fs::write(f.home.path().join("agents/ordinary"), "not a directory").unwrap();
     assert!(requires_admin_for_id(f.home.path(), "ordinary"), "unreadable employee directory");
 }
+
+#[tokio::test]
+async fn narrowed_context_keeps_admin_and_ordinary_bindings_and_does_not_write() {
+    let f = fixture().await;
+    for original in [&f.employee, &f.manager] {
+        let narrowed = without_restricted_access(f.home.path(), original.clone());
+        assert!(!narrowed.agent_access.contains_key("operator"));
+        assert!(narrowed.agent_access.contains_key("ordinary"));
+        assert!(original.agent_access.contains_key("operator"));
+        assert!(f.db.live_user_context(&original.user_id).unwrap().unwrap().agent_access.contains_key("operator"));
+    }
+    // Even an unreadable/non-directory home cannot affect Admin authority.
+    let bad_home = f.home.path().join("not-a-directory");
+    std::fs::write(&bad_home, "unreadable as a directory").unwrap();
+    let admin = without_restricted_access(&bad_home, f.admin.clone());
+    assert_eq!(admin.agent_access, f.admin.agent_access);
+    assert_eq!(admin.team_access, f.admin.team_access);
+}
+
+#[test]
+fn production_identity_sources_keep_the_restriction_boundary() {
+    for (source, boundary) in [
+        (include_str!("../handlers/live_context.rs"), "return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()))"),
+        (include_str!("../handlers/live_context.rs"), "Ok(crate::machine_employee::without_restricted_access(&self.home_dir, live))"),
+        (include_str!("../review_evidence/audience.rs"), "Ok(crate::machine_employee::without_restricted_access(home, duduclaw_auth::UserContext {"),
+        (include_str!("../team_oversight.rs"), "crate::machine_employee::live_user_context(home, db, &ctx.user_id)"),
+        (include_str!("../server.rs"), "crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)"),
+        (include_str!("../server.rs"), ".map(|ctx| crate::machine_employee::without_restricted_access(state.handler.home_dir(), ctx))"),
+    ] {
+        assert!(source.contains(boundary), "missing identity narrowing: {boundary}");
+    }
+}

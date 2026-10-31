@@ -177,7 +177,7 @@ impl PushGate {
         if let Some((at, v)) = &self.live
             && Self::fresh(*at)
         {
-            return v.clone();
+            return v.clone().map(|ctx| crate::machine_employee::without_restricted_access(&self.home, ctx));
         }
         let v = live_reader_context(&self.home, &self.ctx).ok();
         self.live = Some((Instant::now(), v.clone()));

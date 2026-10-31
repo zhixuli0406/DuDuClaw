@@ -544,7 +544,7 @@ pub fn trusted_dashboard_principal(
     } else {
         Default::default()
     };
-    Ok(duduclaw_auth::UserContext {
+    Ok(crate::machine_employee::without_restricted_access(home, duduclaw_auth::UserContext {
         user_id: principal.into(),
         email,
         role,
@@ -552,7 +552,7 @@ pub fn trusted_dashboard_principal(
         must_change_password: false,
         team_access,
         acl_generation: 0,
-    })
+    }))
 }
 /// Artifact/review audience belongs to the human dashboard decision principal,
 /// not the worker actor. An empty audience still requires current task ACL.

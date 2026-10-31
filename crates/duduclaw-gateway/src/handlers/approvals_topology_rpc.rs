@@ -143,7 +143,7 @@ impl MethodHandler {
                         "binding": if may_decide { json!(r.binding) } else { Value::Null },
                         "answer": if may_decide { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
-                        "decided_in_dashboard_only": r.payload.get("egress_guard").is_some() || crate::approval_notify::is_dashboard_only_kind(&r.action_kind),
+                        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(r),
                         "submitter_is_viewer": activation
                             && super::approval_decider::submitter_is_decider(r, &fresh),
                         // A-H-1: what an Admin accepts — each effect and the

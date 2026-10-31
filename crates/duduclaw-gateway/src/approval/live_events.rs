@@ -46,8 +46,7 @@ pub(crate) fn decision_digest_with_activation(rec: &ApprovalRecord, facts: &Valu
         "expires_at": rec.expires_at_epoch(),
         "simulation": rec.simulation,
         "workflow_activation": facts,
-        "decided_in_dashboard_only": rec.payload.get("egress_guard").is_some()
-            || crate::approval_notify::is_dashboard_only_kind(&rec.action_kind),
+        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(rec),
     }))
 }
 

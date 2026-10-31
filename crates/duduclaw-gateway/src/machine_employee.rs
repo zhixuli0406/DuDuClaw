@@ -4,6 +4,20 @@ use std::path::Path;
 use duduclaw_agent::registry::LoadedAgent;
 use duduclaw_core::preset::{self, PresetResolution};
 
+/// Remove stale direct and team authority without changing stored bindings.
+/// Keep this synchronous frame out of the stack-sensitive RPC future.
+#[inline(never)]
+pub(crate) fn without_restricted_access(home: &Path, mut ctx: duduclaw_auth::UserContext) -> duduclaw_auth::UserContext {
+    if ctx.is_admin() { return ctx; }
+    ctx.agent_access.retain(|id, _| !requires_admin_for_id(home, id));
+    ctx.team_access.retain(|id, _| !requires_admin_for_id(home, id));
+    ctx
+}
+
+pub(crate) fn live_user_context(home: &Path, db: &duduclaw_auth::UserDb, id: &str) -> Result<Option<duduclaw_auth::UserContext>, String> {
+    db.live_user_context(id).map(|ctx| ctx.map(|ctx| without_restricted_access(home, ctx)))
+}
+
 pub(crate) const REFUSAL: &str = "這位 AI 員工可操作電腦，僅限管理員使用或綁定。";
 
 /// Use the server's resolved binding, including a binding that failed to

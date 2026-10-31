@@ -4739,9 +4739,7 @@ fn authorize_file_access(
     // authority from one current users.db snapshot, never JWT bindings.
     // This also refuses inactive users and database errors without a fallback.
     let claims = state.jwt_config.verify_access_token(token).map_err(|_| unauthorized())?;
-    let ctx = state
-        .user_db
-        .live_user_context(&claims.sub)
+    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)
         .map_err(|_| unauthorized())?
         .ok_or_else(unauthorized)?;
     require_password_changed(&ctx)?;
@@ -16615,6 +16613,7 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
     // change-password allowlist until the flag clears (C1's original intent
     // — block all operations — is preserved, just enforced one layer up).
     UserContext::from_claims(&claims, must_change_password)
+        .map(|ctx| crate::machine_employee::without_restricted_access(state.handler.home_dir(), ctx))
 }
 
 /// Check if any users exist in the database (to decide whether auth is needed).
