@@ -16141,6 +16141,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // Authorize again off the select loop, into a one-slot channel. The arm
     // below only receives a step that already passed that check.
     let (ready_tx, mut run_rx) = tokio::sync::mpsc::channel(1);
+    #[cfg(test)]
+    let test_ready_tx = ready_tx.clone();
     {
         let subscriptions = run_subscriptions.clone();
         let deliver_state = state.clone();
@@ -16201,16 +16203,53 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
         tokio::sync::mpsc::channel::<(WsFrame, Option<bool>, Option<bool>, Option<(bool, serde_json::Value)>)>(64);
 
     let mut recovery = crate::handlers::live_context::SocketRecovery::default();
-    loop {
-        tokio::select! {
-            // ── Heartbeat ping ─────────────────────────────
-            _ = heartbeat_interval.tick() => {
-                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, true).await;
-                recovery.observe(validity, true);
+
+    // Coalesce authorized output discarded during identity-store outages.
+    // Only heartbeat checks consume SocketRecovery's three-tick window.
+    let mut output_lost = false;
+    #[cfg(test)]
+    let _ = live_events_socket_tests::SOCKET_TEST_HOOKS.try_with(|hooks| {
+        if let Some(tx) = hooks.ready.lock().unwrap().take() {
+            let _ = tx.send(live_events_socket_tests::SocketProbe {
+                steps: test_ready_tx,
+                subscriptions: run_subscriptions.clone(),
+                events: prepared_tx.clone(),
+            });
+        }
+    });
+    macro_rules! socket_output_gate {
+        ($heartbeat:expr, $drops_output:expr) => {
+            let validity = server_mfa::socket_validity(
+                &state, &user_ctx, access_expires, legacy_admin_authenticated, $heartbeat,
+            ).await;
+            let allowed = recovery.observe(validity, $heartbeat);
+            #[cfg(test)]
+            let _ = live_events_socket_tests::SOCKET_TEST_HOOKS.try_with(|hooks| {
+                let _ = hooks.checked.send(($heartbeat, $drops_output, allowed));
+            });
+            if !allowed {
                 if recovery.closed() {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
+                output_lost |= $drops_output;
+                // No ping is sent while paused. Do not let the ordinary
+                // pong deadline cut short the identity recovery window.
+                if $heartbeat { last_pong = std::time::Instant::now(); }
+                continue;
+            }
+            if output_lost {
+                let Some(text) = sequence.lost() else { break; };
+                if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                output_lost = false;
+            }
+        };
+    }
+    loop {
+        tokio::select! {
+            // ── Heartbeat ping ─────────────────────────────
+            _ = heartbeat_interval.tick() => {
+                socket_output_gate!(true, false);
                 if last_pong.elapsed().as_secs() > 60 {
                     warn!("Dashboard WebSocket heartbeat timeout");
                     break;
@@ -16230,15 +16269,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
-                        let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
-                if !recovery.observe(validity, false) {
-                    if recovery.closed() {
-                        let _ = sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                    continue;
-                }
-                let frame = match serde_json::from_str::<WsFrame>(&text) {
+                        socket_output_gate!(false, false);
+                        let frame = match serde_json::from_str::<WsFrame>(&text) {
                             Ok(f) => f,
                             Err(e) => {
                                 error!("Failed to parse WsFrame: {e}");
@@ -16324,6 +16356,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                     }
                     Message::Close(_) => { info!("WebSocket connection closed by client"); break; }
                     Message::Ping(data) => {
+                        socket_output_gate!(false, false);
                         if sink.send(Message::Pong(data)).await.is_err() { break; }
                     }
                     Message::Pong(_) => {
@@ -16347,14 +16380,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                         }
                     }
                 }
-                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
-                if !recovery.observe(validity, false) {
-                    if recovery.closed() {
-                        let _ = sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                    continue;
-                }
+                socket_output_gate!(false, false);
                 if let Some(on) = logs_update {
                     logs_subscribed = on;
                 }
@@ -16375,8 +16401,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             // admission keeps one silent marker until a later authorized step.
             _ = run_subscriptions.loss_notified() => {
                 if run_subscriptions.take_lost() {
-                    let Some(text) = sequence.lost() else { break; };
-                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                    output_lost = true;
+                    socket_output_gate!(false, false);
                 }
             }
 
@@ -16386,10 +16412,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             // there and does not set events_lost.
             Some(step) = run_rx.recv() => {
                 if !run_subscriptions.matches(&step) { continue; }
-                if run_subscriptions.take_lost() {
-                    let Some(text) = sequence.lost() else { break; };
-                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
-                }
+                output_lost |= run_subscriptions.take_lost();
+                socket_output_gate!(false, true);
                 if !run_rate.take(conn_start.elapsed().as_millis() as u64, crate::live_events::RUN_STEPS_PER_SEC) {
                     // Emit one reconciliation signal per capped window.
                     if run_dropped_notice { continue; }
@@ -16405,19 +16429,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
 
             // ── Outbound log broadcast (only when subscribed) ─
             log_line = log_rx.recv(), if logs_subscribed => {
-                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
-                if !recovery.observe(validity, false) {
-                    if recovery.closed() {
-                        let _ = sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                    continue;
-                }
                 match log_line {
                     // The log tail is Manager+; a downgraded or suspended
                     // account stops receiving it within the push cache window.
-                    Ok(_) if !push_gate.allows_log_tail() => {}
+                    Ok(_) if !push_gate.allows_log_tail() => {
+                        socket_output_gate!(false, false);
+                    }
                     Ok(line) => {
+                        socket_output_gate!(false, true);
                         // Send as WsFrame::Event so the frontend can parse it uniformly
                         let data = serde_json::from_str::<serde_json::Value>(&line)
                             .unwrap_or(serde_json::Value::String(line));
@@ -16432,8 +16451,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                         if sink.send(Message::Text(text.into())).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(text) = sequence.lost() else { break; };
-                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                        output_lost = true;
+                        socket_output_gate!(false, false);
                     }
                     Err(_) => break,
                 }
@@ -16445,8 +16464,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 let frame = match event_frame {
                     Ok(frame) => frame,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(text) = sequence.lost() else { break; };
-                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                        output_lost = true;
+                        socket_output_gate!(false, false);
                         continue;
                     }
                     Err(_) => break,
@@ -16460,8 +16479,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             result = async { pending_push.as_mut().expect("pending push").await }, if pending_push.is_some() => {
                 pending_push = None;
                 let Ok((gate, line)) = result else { break; };
+                // Restore before the gate can continue or break the loop.
                 event_gate = Some(gate);
                 if let Some(line) = line {
+                    socket_output_gate!(false, true);
                     let Some(json) = sequence.filtered(&line) else { break; };
                     if sink.send(Message::Text(json.into())).await.is_err() { break; }
                 }
@@ -16477,17 +16498,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                     None => std::future::pending().await,
                 }
             }, if os_events_subscribed => {
-                let validity = server_mfa::socket_validity(&state, &user_ctx, access_expires, legacy_admin_authenticated, false).await;
-                if !recovery.observe(validity, false) {
-                    if recovery.closed() {
-                        let _ = sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                    continue;
-                }
                 match os_ev {
                     Ok(ev) => {
                         if let Some(payload) = crate::os_events::os_event_push_payload(&ev) {
+                            socket_output_gate!(false, true);
                             let now_ms = conn_start.elapsed().as_millis() as u64;
                             let (allow, new_start, new_count) = crate::os_events::rate_limit_tick(
                                 os_window_start_ms,
@@ -16517,19 +16531,22 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     );
                                 }
                             }
+                        } else {
+                            socket_output_gate!(false, false);
                         }
                         // Non-OS AutopilotEvent variants (TaskCreated, AgentIdle, ...)
                         // are silently ignored — this tail forwards os_file/os_frontmost only.
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(text) = sequence.lost() else { break; };
-                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                        output_lost = true;
+                        socket_output_gate!(false, false);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Autopilot event bus torn down — stop polling a dead
                         // receiver instead of hot-looping on repeated `Closed`.
                         os_rx = None;
                         os_events_subscribed = false;
+                        socket_output_gate!(false, false);
                     }
                 }
             }
@@ -18075,6 +18092,190 @@ mod live_events_socket_tests {
                 }
             }
         }).await.expect("socket frame deadline")
+    }
+
+    // Observe the real socket task, including panics, and inject output that
+    // already passed authorization to exercise the final-delivery race.
+    pub(super) struct SocketProbe {
+        pub(super) steps: tokio::sync::mpsc::Sender<crate::live_events::RunStep>,
+        pub(super) subscriptions: crate::live_events::RunSubscriptions,
+        pub(super) events: broadcast::Sender<Arc<crate::handlers::PreparedPush>>,
+    }
+    pub(super) struct SocketTestHooks {
+        pub(super) ready: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<SocketProbe>>>,
+        pub(super) checked: tokio::sync::mpsc::UnboundedSender<(bool, bool, bool)>,
+    }
+    tokio::task_local! {
+        pub(super) static SOCKET_TEST_HOOKS: SocketTestHooks;
+    }
+
+    struct MfaSocket {
+        _home: tempfile::TempDir,
+        state: Arc<AppState>,
+        user: duduclaw_auth::User,
+        ctx: UserContext,
+        client: Client,
+        probe: SocketProbe,
+        checked: tokio::sync::mpsc::UnboundedReceiver<(bool, bool, bool)>,
+        done: tokio::sync::oneshot::Receiver<Result<(), tokio::task::JoinError>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for MfaSocket {
+        fn drop(&mut self) { self.server.abort(); }
+    }
+    impl MfaSocket {
+        async fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
+            let user = db.create_user("socket@example.test", "Socket", "password-test", duduclaw_auth::UserRole::Admin).unwrap();
+            let jwt = Arc::new(JwtConfig::new(b"live-events-test-secret-32-bytes!!"));
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            handler.set_user_db(db.clone(), jwt.clone()).await;
+            let (tx, _) = broadcast::channel(4);
+            let (event_tx, _) = broadcast::channel(4);
+            let state = Arc::new(AppState {
+                auth: AuthManager::new(None), handler, tx, event_tx,
+                prepared_events: Default::default(), user_db: db, jwt_config: jwt,
+                otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new())),
+                home_dir: home.path().to_path_buf(),
+            });
+            let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+            let ctx = authenticate_jwt(&state, &token).unwrap();
+            let (ready_tx, ready) = tokio::sync::oneshot::channel();
+            let (checked_tx, checked) = tokio::sync::mpsc::unbounded_channel();
+            let (done_tx, done) = tokio::sync::oneshot::channel();
+            let hooks = Arc::new(std::sync::Mutex::new(Some((SocketTestHooks {
+                ready: std::sync::Mutex::new(Some(ready_tx)), checked: checked_tx,
+            }, done_tx))));
+            let socket_state = state.clone();
+            let app = Router::new().route("/ws", get(move |ws: WebSocketUpgrade| {
+                let state = socket_state.clone();
+                let hooks = hooks.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        let (hooks, done) = hooks.lock().unwrap().take().unwrap();
+                        let result = tokio::spawn(SOCKET_TEST_HOOKS.scope(hooks,
+                            handle_socket(socket, state, "127.0.0.1:12345".parse().unwrap()))).await;
+                        let _ = done.send(result);
+                    })
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+            client.send(ClientMessage::Text(json!({"type":"req","id":"connect","method":"connect","params":{"jwt":token}}).to_string().into())).await.unwrap();
+            assert_eq!(next_json(&mut client).await["ok"], true);
+            let probe = tokio::time::timeout(std::time::Duration::from_secs(5), ready).await.unwrap().unwrap();
+            probe.subscriptions.update(crate::live_events::RunSelector::Run("test-run".into()), true).unwrap();
+            let mut fixture = Self { _home: home, state, user, ctx, client, probe, checked, done, server };
+            fixture.check((true, false, true)).await;
+            // Drain the initial heartbeat so silence assertions include every frame.
+            assert!(matches!(fixture.client.next().await.unwrap().unwrap(), ClientMessage::Ping(_)));
+            fixture.client.send(ClientMessage::Pong(vec![].into())).await.unwrap();
+            fixture
+        }
+        async fn check(&mut self, expected: (bool, bool, bool)) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if self.checked.recv().await.expect("socket task still running") == expected { break; }
+                }
+            }).await.expect("socket gate deadline");
+        }
+        async fn event(&self, id: u64) {
+            let line = serde_json::to_string(&WsFrame::event("system.status_changed", json!({"id":id}))).unwrap();
+            let frame = crate::handlers::PreparedPush::prepare(self.state.home_dir.clone(), line).await.unwrap();
+            assert!(self.probe.events.send(Arc::new(frame)).is_ok(), "socket event receiver alive");
+        }
+        async fn step(&self) {
+            self.probe.steps.send(crate::live_events::RunStep {
+                agent_id: "sales".into(), run_id: "test-run".into(), tool: "Read".into(), phase: "started",
+            }).await.unwrap();
+        }
+        async fn silent(&mut self) {
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(100), self.client.next()).await.is_err(),
+                "paused socket delivered a frame or closed");
+        }
+        async fn finish(&mut self) {
+            self.client.close(None).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.done).await
+                .expect("socket task termination").expect("task monitor alive").expect("socket task must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_revoked_socket_closes_without_event_step_or_loss() {
+        // Each output source must independently retire the socket; no
+        // heartbeat or incoming request is allowed to mask a missing gate.
+        for source in ["event", "step", "loss", "lagged", "pong"] {
+            let mut f = MfaSocket::new().await;
+            f.state.user_db.mfa_operator_reset(&f.user.email).unwrap();
+            assert!(f.state.handler.socket_context(&f.ctx, true).await.is_err());
+            match source {
+                "event" => f.event(1).await,
+                "step" => f.step().await,
+                "loss" => f.probe.subscriptions.mark_authorized_loss_for_test(),
+                "lagged" => {
+                    let frame = Arc::new(crate::handlers::PreparedPush::prepare(f.state.home_dir.clone(),
+                        serde_json::to_string(&WsFrame::event("system.status_changed", json!({}))).unwrap()).await.unwrap());
+                    for _ in 0..2048 { assert!(f.probe.events.send(frame.clone()).is_ok(), "socket event receiver alive"); }
+                }
+                "pong" => f.client.send(ClientMessage::Ping(vec![].into())).await.unwrap(),
+                _ => unreachable!(),
+            }
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), f.client.next()).await.unwrap().unwrap().unwrap();
+            assert!(matches!(frame, ClientMessage::Close(_)), "{source} escaped revocation: {frame:?}");
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut f.done).await
+                .expect("socket termination").expect("task monitor alive").expect("socket task must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_pause_two_events_and_step_then_recover_once_with_contiguous_sequence() {
+        for heartbeat_recovery in [false, true] {
+            let mut f = MfaSocket::new().await;
+            f.event(0).await;
+            let baseline = next_json(&mut f.client).await;
+            assert_eq!(baseline["seq"], 1);
+            let raw = rusqlite::Connection::open(f.state.home_dir.join("users.db")).unwrap();
+            raw.execute("ALTER TABLE auth_meta RENAME TO saved_auth_meta", []).unwrap();
+            assert!(f.state.handler.socket_context(&f.ctx, true).await.is_err());
+            // Waiting for both observations proves the second event reached
+            // the arm (and that the first drop restored event_gate).
+            for id in 1..=2 {
+                f.event(id).await;
+                f.check((false, true, false)).await;
+            }
+            f.step().await;
+            f.check((false, true, false)).await;
+            f.probe.subscriptions.mark_authorized_loss_for_test();
+            f.check((false, false, false)).await;
+            f.silent().await;
+            raw.execute("ALTER TABLE saved_auth_meta RENAME TO auth_meta", []).unwrap();
+            if heartbeat_recovery {
+                // Idle recovery must report loss without another event/RPC.
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(30)).await;
+                tokio::time::resume();
+                f.check((true, false, true)).await;
+            } else {
+                f.event(3).await;
+            }
+            let lost = next_json(&mut f.client).await;
+            assert_eq!(lost["event"], "events_lost");
+            assert_eq!(lost["seq"], 2);
+            if heartbeat_recovery { f.event(3).await; }
+            let normal = next_json(&mut f.client).await;
+            assert_eq!(normal["event"], "system.status_changed");
+            assert_eq!(normal["payload"]["id"], 3);
+            assert_eq!(normal["seq"], 3);
+            f.step().await;
+            let step = next_json(&mut f.client).await;
+            assert_eq!(step["event"], "run.step");
+            assert_eq!(step["seq"], 4);
+            f.silent().await;
+            f.finish().await;
+        }
     }
 
     #[tokio::test]

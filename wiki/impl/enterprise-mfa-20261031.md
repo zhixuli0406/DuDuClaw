@@ -282,3 +282,41 @@ CARGO_INCREMENTAL=0 cargo test -j 4 -p duduclaw-gateway --lib push_filter
 - 完整 workspace 測試、完整 clippy、Windows／Linux 原生驗收及正式客戶驗收。
 - 獨立安全審查與 review subagents：依本次交辦未執行。
 - Commit、push、stash、切換分支、workspace `cargo fmt`、部署與發版：依交辦未執行。
+
+
+## Live-events integration (2026-10-31)
+
+- `server.rs::handle_socket` now shares one local output-gate macro across RPC admission/responses, heartbeat/Pong, logs, OS events, run loss/steps, prepared-event lag and completed push delivery. Revoked sends Close and exits; Unavailable drops output without consuming recovery ticks outside heartbeats. The existing two-second identity-cache window remains in effect.
+- One connection-local flag coalesces authorized output lost during a pause. The next successful gate (including an idle heartbeat) sends one `events_lost` before further frames. Dropped frames never allocate sequence numbers. The pending push restores `event_gate` before checking validity; run subscription updates and `run_command_pending` reset still precede the RPC response gate.
+- Real-socket regression tests use isolated users.db fixtures, prepared-event and already-authorized step injection, and an awaited socket-task JoinHandle so a panic fails the test. They cover each revoked output source, consecutive paused events, a paused step/loss notice, event-triggered and idle-heartbeat recovery, and contiguous sequence numbers. These tests require TCP binding; compilation does not prove socket behavior.
+- Send-path audit: handshake success/error/Close remains at the authentication boundary; all established-socket application output and explicit Ping/Pong sends pass the shared gate. `live_events.rs` writes only internal channels, never the socket; its existing authorization/queue checks remain unchanged. `PushGate`, `may_push_run_step` and `fresh_dashboard_context` were not changed.
+- Transport caveat: Axum/Tungstenite automatically queues Pong on receiving Ping (see the local dependency documentation for `axum::extract::ws::Message`). The explicit application Pong path is gated, but that library-generated control reply is outside this gate; no application data is carried by it. Absolute suppression of all transport control frames during a pause is not provided by the current WebSocket API.
+- Additional static finding (pre-existing, outside the MFA-output integration): the OS tail checks Admin only at `os.events.subscribe` (`handlers/dispatch_ops.rs`); subsequent OS sends check socket validity but do not re-check the current role. `user_update.rs` bumps ACL generation on role changes without retiring the credential epoch, so an active account downgraded from Admin can retain an existing OS subscription. This was not changed or verified over a live socket in this pass.
+
+
+### Integration validation
+
+All Cargo commands ran sequentially with `CARGO_INCREMENTAL=0` and `-j 4`. Logs: `artifacts/mfa/live-events-integration-20261031/` (gitignored).
+
+- `cargo check -p duduclaw-gateway --tests`: final exit 0, `Finished dev profile [unoptimized + debuginfo] target(s) in 2m 52s`. Initial check exited 101 on two new test-channel `unwrap()` calls requiring `PreparedPush: Debug`; both changed to success assertions before the passing check. The rebase fixture in `mfa_http_tests.rs` also needed `prepared_events`.
+- `cargo test -p duduclaw-gateway --lib mfa`: exit 0; `test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 10364 filtered out; finished in 8.04s`
+- `cargo test -p duduclaw-gateway --lib live_event`: exit 0; `test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 10350 filtered out; finished in 2.59s`
+- `cargo test -p duduclaw-gateway --lib push` (initial, socket setup refused): exit 101; `test result: FAILED. 52 passed; 7 failed; 0 ignored; 0 measured; 10330 filtered out; finished in 4.74s`
+- `cargo test -p duduclaw-gateway --lib push` (after excluding refused socket fixtures): exit 0; `test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 10337 filtered out; finished in 5.08s`
+
+Each filter used `-- --skip server::live_events_socket_tests`. The final push retry additionally skipped exactly the seven setup failures below; the initial push log preserves their `PermissionDenied: Operation not permitted` errors. No assertion failure in the tested behavior was observed in those fixtures because socket setup failed first. These are NOT RUN for behavior acceptance, never counted as passing. The new socket tests were compiled by the passing check but never attempted to bind.
+
+### NOT RUN (socket binding unavailable)
+
+- `server::live_events_socket_tests::mfa_live_events_revoked_socket_closes_without_event_step_or_loss`
+- `server::live_events_socket_tests::mfa_live_events_pause_two_events_and_step_then_recover_once_with_contiguous_sequence`
+- `server::live_events_socket_tests::broker_database_bridge_reaches_ws_with_filtered_sequence_and_loss`
+- `codrive::tests_mode::driving_mode_push_at_session_start_lands_in_the_report` (Unix socket bind refused)
+- `line::ingress::f2_tests::failed_progress_push_never_changes_the_event_status` (TCP bind refused)
+- `line::ingress::f2_tests::queue_wait_past_the_reply_window_pushes_to_the_same_conversation` (TCP bind refused)
+- `line::ingress::f5_tests::expired_reply_token_pushes_the_answer_without_the_thinking_footer` (TCP bind refused)
+- `line::ingress::f5_tests::redelivered_webhook_never_uses_its_reply_token_and_pushes` (TCP bind refused)
+- `line::ingress::f5_tests::refused_reply_token_falls_back_to_push_when_allowed` (TCP bind refused)
+- `line::ingress::f5_tests::refused_reply_token_pushes_the_answer_without_the_thinking_footer` (TCP bind refused)
+
+Status: PARTIAL acceptance. The requested integration is implemented and compiles; runnable filtered tests passed. Real socket behavior remains unverified, and the automatic Pong limitation and pre-existing OS-role downgrade issue above remain. No commit, push, stash, branch switch, workspace formatting, network access or review subagents were used.

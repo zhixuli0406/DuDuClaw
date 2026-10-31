@@ -41,6 +41,7 @@ async fn fixture(
         handler,
         tx,
         event_tx,
+        prepared_events: Default::default(),
         user_db: db,
         jwt_config: jwt,
         otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
