@@ -157,7 +157,6 @@ Every supported top-level key is listed below. Each invalid value keeps only tha
 | `poll_interval_seconds` | Integer, 5–3600 inclusive | `15`; authoritative list reconciliation; run/task/log blocks retain their five-second reconciliation |
 | `notifications` | Boolean | `false`, including SSH; explicit opt-in enables fixed-text background notifications |
 | `default_layout` | `"single"`, `"vertical"`, `"horizontal"` | `"single"`; one detail block, two side-by-side detail blocks, or two stacked detail blocks; starts with block 1 focused |
-| `pty.command` | Nonempty string array, up to 64 arguments | Owner-local argv; absent uses `$SHELL` or `/bin/sh`; see M4 above |
 
 Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Borders use ASCII. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
 

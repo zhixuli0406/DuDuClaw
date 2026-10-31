@@ -141,7 +141,7 @@ async fn terminated() {
 /// dashboard can always show what happened. The file must be a new `.json`
 /// path: an existing file is never overwritten.
 pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOpts) -> Result<()> {
-    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::markers())?;
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     let mut report_file = match &opts.report_json {
         Some(p) => Some(super::report::open_report_file(p)?),
         None => None,

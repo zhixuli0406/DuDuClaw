@@ -587,3 +587,13 @@ async fn openclaw_persona_files_land_in_read_slots_not_memory_dir() {
     }
     assert_eq!(report.overall(), "COMPLETE");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn migration_refuses_each_ai_session_marker_before_validating_platform() {
+    for &marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
+        let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
+        let err = run("invalid-platform", None, false, false, false, None, false, None)
+            .await.unwrap_err();
+        assert_eq!(crate::expert::import_error::failure_of(&err).unwrap().code, "import.ai_session", "{marker}");
+    }
+}

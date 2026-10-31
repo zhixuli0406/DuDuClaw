@@ -862,3 +862,17 @@ fn expert_profile_patch_preserves_lifecycle_and_comments() {
     assert_eq!(table["agent"]["status"].as_str(), Some("archived"));
     assert_eq!(table["capabilities"]["allowed_tools"][0].as_str(), Some("Read"));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn install_refuses_each_ai_session_marker_before_resolving_source() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("missing");
+    for &marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
+        let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
+        let err = super::install::cmd_install_with(
+            &missing, missing.to_str().unwrap(), super::install::PipelineOpts::default(),
+        ).await.unwrap_err();
+        assert_eq!(super::import_error::failure_of(&err).unwrap().code, "import.ai_session", "{marker}");
+        assert!(!missing.exists());
+    }
+}

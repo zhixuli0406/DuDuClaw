@@ -96,7 +96,7 @@ pub async fn run(
     no_redact: bool,
     confirm_profile: Option<String>,
 ) -> Result<()> {
-    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::markers())?;
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     let plat = match platform.trim().to_ascii_lowercase().as_str() {
         "openclaw" | "moltbot" | "clawdbot" => Platform::OpenClaw,
         "hermes" => Platform::Hermes,

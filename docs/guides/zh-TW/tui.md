@@ -157,7 +157,6 @@ default_layout = "single"         # "vertical" / "horizontal"
 | `poll_interval_seconds` | 5～3600 的整數 | `15`；權威清單重新核對間隔；執行／任務／日誌區塊維持每五秒核對 |
 | `notifications` | 布林值 | `false`，SSH 亦同；明確開啟後提供固定文字背景通知 |
 | `default_layout` | `"single"`、`"vertical"`、`"horizontal"` | `"single"`；一個詳情區塊、左右兩個詳情區塊、上下兩個詳情區塊；初始焦點為區塊 1 |
-| `pty.command` | 非空字串陣列，最多 64 個參數 | 操作者本機命令；未設定用 `$SHELL` 或 `/bin/sh`，詳見上方 M4 |
 
 操作中的版面變更不會寫回設定。這些設定不能變更連線、認證、權限、確認或任何安全規則。框線一律使用 ASCII。兩個檔案都受既有 agent-file-guard 家目錄政策保護，員工不能寫入。
 

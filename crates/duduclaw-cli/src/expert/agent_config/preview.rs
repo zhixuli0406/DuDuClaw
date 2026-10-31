@@ -114,7 +114,7 @@ pub(in crate::expert) fn bind_context(ctx: &crate::expert::install::InstallCtx, 
 pub(in crate::expert) fn require_plan_confirmation(
     bundle: &ImportBundle, effects: Value, dry_run: bool, confirmation: Option<&str>, report: &mut Report,
 ) -> Result<()> {
-    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::markers())?;
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     let mut bundle = bundle.clone();
     super::credentials::sanitize_bundle(&mut bundle)?;
     let mut preview = sections(&bundle.agents)?;
@@ -167,6 +167,17 @@ pub(in crate::expert) fn require_plan_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confirmation_refuses_each_ai_session_marker_before_building_preview() {
+        for &marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
+            let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
+            let err = require_plan_confirmation(
+                &ImportBundle::default(), Value::Null, true, None, &mut Report::default(),
+            ).unwrap_err();
+            assert_eq!(crate::expert::import_error::failure_of(&err).unwrap().code, "import.ai_session", "{marker}");
+        }
+    }
+
     #[test]
     fn confirmation_binds_every_section_and_settings() {
         let mut bundle = ImportBundle { agents: vec![AgentDraft::default()], ..Default::default() };

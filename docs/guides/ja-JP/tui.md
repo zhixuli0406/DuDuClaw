@@ -157,7 +157,6 @@ default_layout = "single"         # "vertical" / "horizontal"
 | `poll_interval_seconds` | 5～3600 の整数 | `15`。一覧の再照合間隔。実行／タスク／ログの照合は五秒のまま |
 | `notifications` | 真偽値 | `false`。SSH も同様。明示的な有効化で固定文の背景通知 |
 | `default_layout` | `"single"`, `"vertical"`, `"horizontal"` | `"single"`。詳細一個、左右二個、上下二個。初期フォーカスはブロック 1 |
-| `pty.command` | 空でない文字列配列、最大 64 引数 | 操作者のローカル argv。省略時は `$SHELL` または `/bin/sh`。上記 M4 参照 |
 
 セッション中の配置変更は保存しません。接続、認証、権限、確認、安全規則は変更できません。枠線は ASCII です。両ファイルとも既存の agent-file-guard のホームディレクトリ保護対象です。
 
