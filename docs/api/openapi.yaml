@@ -432,6 +432,45 @@ paths:
 
   # ── Connection ───────────────────────────────────────────────
 
+  /rpc/tasks.goal_decide:
+    post:
+      tags: [tasks]
+      summary: Decide a paused goal or continue a finished goal
+      description: |
+        Requires Operator access to the task's agent and private-task authorization.
+        retry/done/abort/takeover apply to needs_human; continue requires a
+        goal-mode task in done/failed/cancelled and a nonempty message.
+        If expected_updated_at is supplied, compare the exact tasks.list_page
+        updated_at string inside the same SQLite IMMEDIATE transaction as the
+        decision. All five actions return goal_decide_revision_mismatch on a
+        mismatch without changing the task or emitting decision side effects.
+        Omitting it preserves existing dashboard behavior. Null/non-string values
+        are rejected. The control room always supplies it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id, action]
+              properties:
+                task_id:
+                  type: string
+                action:
+                  type: string
+                  enum: [retry, done, abort, takeover, continue]
+                note:
+                  type: string
+                message:
+                  type: string
+                  description: Required nonempty follow-up for continue.
+                expected_updated_at:
+                  type: string
+                  description: Exact updated_at string from the displayed task.
+      responses:
+        "200":
+          description: RPC result with ok/message/task, or a stable revision mismatch error.
+
   /rpc/connect.challenge:
     post:
       tags: [connection]

@@ -1322,6 +1322,18 @@ pub(crate) async fn apply_needs_human_from_dashboard(
     act: DecisionAct,
     note: &str,
 ) -> Result<String, String> {
+    apply_needs_human_from_dashboard_checked(home_dir, decider, decider_name, task_id, act, note, None).await
+}
+
+pub(crate) async fn apply_needs_human_from_dashboard_checked(
+    home_dir: &Path,
+    decider: &str,
+    decider_name: Option<String>,
+    task_id: &str,
+    act: DecisionAct,
+    note: &str,
+    expected_updated_at: Option<&str>,
+) -> Result<String, String> {
     let verb = crate::decision_notify::settled_verb(DecisionSource::Goal, act);
     let store = TaskStore::open(home_dir).map_err(|e| format!("開啟任務資料庫失敗：{e}"))?;
     let task = store.get_task(task_id).await.map_err(|e| e.to_string())?;
@@ -1331,7 +1343,7 @@ pub(crate) async fn apply_needs_human_from_dashboard(
 
     if act == DecisionAct::Takeover {
         let changed = store
-            .claim_needs_human(task_id, decider)
+            .claim_needs_human_checked(task_id, decider, expected_updated_at)
             .await
             .map_err(|e| e.to_string())?;
         if !changed {
@@ -1364,7 +1376,7 @@ pub(crate) async fn apply_needs_human_from_dashboard(
         _ => return Err("不支援的動作".into()),
     };
     let changed = store
-        .resolve_needs_human_with_survival_evidence(task_id, decision, note)
+        .resolve_needs_human_checked(task_id, decision, note, expected_updated_at)
         .await
         .map_err(|e| e.to_string())?;
     if !changed {
@@ -1408,6 +1420,16 @@ pub(crate) async fn apply_continue_from_dashboard(
     task_id: &str,
     message: &str,
 ) -> Result<String, String> {
+    apply_continue_from_dashboard_checked(home_dir, decider, task_id, message, None).await
+}
+
+pub(crate) async fn apply_continue_from_dashboard_checked(
+    home_dir: &Path,
+    decider: &str,
+    task_id: &str,
+    message: &str,
+    expected_updated_at: Option<&str>,
+) -> Result<String, String> {
     let store = TaskStore::open(home_dir).map_err(|e| format!("開啟任務資料庫失敗：{e}"))?;
     let task = store.get_task(task_id).await.map_err(|e| e.to_string())?;
     let Some(task) = task else {
@@ -1416,7 +1438,7 @@ pub(crate) async fn apply_continue_from_dashboard(
     if !task.goal_mode {
         return Err("只有目標任務可以接著做".into());
     }
-    let changed = store.continue_from_terminal_with_survival_evidence(task_id, message).await?;
+    let changed = store.continue_from_terminal_checked(task_id, message, expected_updated_at).await?;
     if !changed {
         return Ok("此任務目前的狀態不允許接著做（可能已被他人變更）。".into());
     }
