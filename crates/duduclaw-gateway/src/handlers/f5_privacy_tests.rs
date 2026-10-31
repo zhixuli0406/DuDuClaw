@@ -287,6 +287,7 @@ async fn push_table_by_event_kind() {
     assert!(live_login_gate.filter(&login).is_none(), "revocation applies to the next PTY chunk");
     // Lock screen: system status only.
     let lock = UserContext {
+        credential_epoch: 0,
         user_id: "lockscreen".into(),
         email: "lockscreen@local".into(),
         role: UserRole::Employee,
@@ -353,6 +354,7 @@ async fn production_identities_pass_the_live_check() {
     assert!(live_reader_context(home.path(), &jwt).unwrap().is_admin());
     // (d) lock screen: not an account, refused.
     let lock = UserContext {
+        credential_epoch: 0,
         user_id: "lockscreen".into(),
         email: "lockscreen@local".into(),
         role: UserRole::Employee,

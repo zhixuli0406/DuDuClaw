@@ -119,6 +119,7 @@ pub(super) async fn fixture() -> Fixture {
 /// replaces it per RPC).
 pub(super) fn jwt_ctx(user_id: &str, role: UserRole) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: user_id.to_string(),
         email: format!("{user_id}@test.invalid"),
         role,

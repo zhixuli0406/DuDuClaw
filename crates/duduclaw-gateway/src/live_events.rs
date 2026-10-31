@@ -188,6 +188,11 @@ impl RunSubscriptions {
     pub(crate) async fn loss_notified(&self) { self.0.loss_notice.notified().await; }
     pub(crate) fn take_lost(&self) -> bool { self.0.lost.swap(false, Ordering::Relaxed) }
     #[cfg(test)]
+    pub(crate) fn mark_authorized_loss_for_test(&self) {
+        self.0.lost.store(true, Ordering::Relaxed);
+        self.0.loss_notice.notify_one();
+    }
+    #[cfg(test)]
     pub(crate) async fn wait_for_authorization(&self) {
         let _all = self.0.admission.acquire_many(RUN_AUTH_CAP as u32).await.unwrap();
     }

@@ -39,6 +39,7 @@ pub(super) const PASS: &str = r#"{"verdict":"pass","summary_zh":"沒有問題","
 /// The session snapshot a JWT would carry.
 fn ctx(id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: id.into(),
         email: format!("{id}@example.invalid"),
         role,

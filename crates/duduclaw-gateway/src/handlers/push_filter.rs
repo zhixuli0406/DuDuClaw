@@ -235,9 +235,9 @@ impl PushGate {
             if self.ctx.user_id == "system" && self.legacy_admin_authenticated {
                 Some(self.ctx.clone())
             } else {
-                crate::review_evidence::audience::trusted_dashboard_principal(
+                crate::review_evidence::audience::fresh_dashboard_context(
                     &self.home,
-                    &self.ctx.user_id,
+                    &self.ctx,
                 ).ok()
             }
         } else if matches!(rule, PushRule::Task | PushRule::Approval | PushRule::Agent) {
@@ -574,5 +574,28 @@ mod live_event_tests {
         for name in ["approval.created", "approval.decided", "approval.expired"] { assert_eq!(classify(name), PushRule::Approval); }
         for name in ["unknown", "agent.unknown", "task.unknown", "approval.unknown", "budget.breaker_open", "autopilot.breaker_open"] { assert_eq!(classify(name), PushRule::Admin); }
         assert_eq!(classify("run.step"), PushRule::Never);
+    }
+}
+
+#[cfg(test)]
+mod mfa_push_tests {
+    use super::*;
+
+    #[test]
+    fn push_filter_mfa_retired_admin_receives_no_login_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db.create_user("push@example.com", "Push", "password-test", UserRole::Admin).unwrap();
+        let ctx = db.live_user_context(&user.id).unwrap().unwrap();
+        let mut gate = PushGate::new(home.path(), &ctx, false);
+        let frame = serde_json::json!({"event":"auth.cli_login.output", "payload":{"owner_user_id":user.id,"text":"secret"}}).to_string();
+        assert!(gate.filter(&frame).is_some());
+        let raw = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        raw.execute("ALTER TABLE users RENAME TO saved_users", []).unwrap();
+        assert!(gate.filter(&frame).is_none());
+        raw.execute("ALTER TABLE saved_users RENAME TO users", []).unwrap();
+        assert!(gate.filter(&frame).is_some());
+        db.mfa_operator_reset(&user.email).unwrap();
+        assert!(gate.filter(&frame).is_none());
     }
 }

@@ -7,6 +7,7 @@ use super::*;
 
 fn ctx(id: &str, role: UserRole) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: id.to_string(),
         email: format!("{id}@example.test"),
         role,

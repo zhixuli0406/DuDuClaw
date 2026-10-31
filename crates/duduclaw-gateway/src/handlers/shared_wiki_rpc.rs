@@ -307,6 +307,7 @@ mod visibility_tests {
         db.set_department(&user.id, Some("sales")).unwrap();
         db.bind_agent(&user.id, "sales", AccessLevel::Operator).unwrap();
         let ctx = UserContext {
+            credential_epoch: 0,
             user_id: user.id.clone(),
             email: user.email.clone(),
             role: UserRole::Employee,

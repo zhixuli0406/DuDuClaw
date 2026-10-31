@@ -506,6 +506,7 @@ async fn os_events_recent_reads_os_events_only() {
 
 fn manager_ctx() -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: "m1".to_string(),
         email: "m1@test.local".to_string(),
         role: UserRole::Manager,

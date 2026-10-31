@@ -93,6 +93,7 @@ fn person(db: &UserDb, name: &str, role: UserRole) -> String {
 /// What `authenticate_jwt` builds at handshake: claims as they were then.
 fn handshake_ctx(user_id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: user_id.to_string(),
         email: format!("{user_id}@test.invalid"),
         role,

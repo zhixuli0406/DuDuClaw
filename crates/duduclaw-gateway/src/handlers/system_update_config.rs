@@ -38,6 +38,19 @@ impl MethodHandler {
             }
         };
         let mut changes: Vec<String> = Vec::new();
+        if let Some(value) = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))) {
+            if let Err(e) = self.mfa_require_current_admin(ctx).await {
+                return WsFrame::error_response("", &e);
+            }
+            let Some(value) = value.as_bool() else {
+                return WsFrame::error_response("", "雙因素驗證設定必須是布林值。");
+            };
+            let Some(auth) = table.entry("auth").or_insert_with(||toml::Value::Table(toml::Table::new())).as_table_mut() else {
+                return WsFrame::error_response("", "登入設定格式不正確。");
+            };
+            auth.insert("mfa_enforced".into(), toml::Value::Boolean(value));
+            changes.push(format!("auth.mfa_enforced = {value}"));
+        }
         let mut restart_required: Vec<String> = Vec::new();
         // Cleaned remote-access allowlist to hot-apply AFTER a successful write
         // (Some(..) iff the payload carried `allowed_origins`).
@@ -932,8 +945,14 @@ impl MethodHandler {
 
         // Atomic write (temp + rename) under the cross-process config lock,
         // refused when another writer changed the file since it was read.
+        let security_change = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))).is_some();
+        let db = self.user_db.read().await.clone();
+        let actor = ctx.user_id.clone();
         if let Err(e) =
-            super::config_commit::commit_table_locked(&config_path, original_hash, &table).await
+            super::config_commit::commit_table_locked_with_guard(&config_path, original_hash, &table, move || {
+                if security_change { crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?; }
+                Ok(())
+            }).await
         {
             return WsFrame::error_response("", &e);
         }

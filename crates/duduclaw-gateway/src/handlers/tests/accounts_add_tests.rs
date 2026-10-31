@@ -435,6 +435,7 @@ async fn remove_account_rechecks_admin_role_on_an_open_connection() {
         )
         .unwrap();
     let cached = UserContext {
+        credential_epoch: 0,
         user_id: user.id.clone(),
         email: user.email,
         role: UserRole::Admin,

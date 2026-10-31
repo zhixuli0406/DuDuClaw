@@ -30,6 +30,7 @@ fn admin() -> UserContext {
 
 fn manager_ctx(id: &str) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: id.into(),
         email: format!("{id}@example.com"),
         role: UserRole::Manager,
@@ -190,7 +191,7 @@ async fn an_idle_takeover_expires_on_the_reaper_and_control_returns() {
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
-    mgr.live_takeover("alice", &manager_ctx("u1")).await.unwrap();
+    crate::mfa::ACCESS_EXPIRY.scope(Some(u64::MAX), mgr.live_takeover("alice", &manager_ctx("u1"))).await.unwrap();
     let entry = mgr.entry("alice").unwrap();
     entry.shared.live.takeover.lock().unwrap().as_mut().unwrap().last_input =
         ago(Duration::from_secs(601));
@@ -379,7 +380,7 @@ async fn a_ticket_issued_to_a_non_users_db_identity_is_refused_on_connect() {
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     // Issued to a Manager context that `users.db` does not know (no store):
     // the re-read on connect fails closed.
-    let t = mgr.live_view_open("alice", &manager_ctx("ghost")).await.unwrap()["ticket"]
+    let t = crate::mfa::ACCESS_EXPIRY.scope(Some(u64::MAX), mgr.live_view_open("alice", &manager_ctx("ghost"))).await.unwrap()["ticket"]
         .as_str()
         .unwrap()
         .to_string();
@@ -415,4 +416,29 @@ fn paused_containers_past_their_deadline_go_only_with_maintenance() {
     let mut other = listed("paused");
     other.name = "someone-else".into();
     assert!(!sweep::paused_past_deadline(&other, u64::MAX));
+}
+
+#[tokio::test]
+async fn computer_use_mfa_ticket_keeps_epoch_and_access_deadline_at_admission() {
+    let tmp = home();
+    let db = duduclaw_auth::UserDb::new(&tmp.path().join("users.db")).unwrap();
+    let user = db.create_user("viewer@test.invalid", "Viewer", "password-test", duduclaw_auth::UserRole::Admin).unwrap();
+    db.mfa_operator_reset(&user.email).unwrap();
+    let ctx = db.live_user_context(&user.id).unwrap().unwrap();
+    let state = Arc::new(FakeState::default());
+    let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+    insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    let exp = chrono::Utc::now().timestamp() as u64 + 10;
+    let body = crate::mfa::ACCESS_EXPIRY.scope(Some(exp), mgr.live_view_open("alice", &ctx)).await.unwrap();
+    assert!(body["expires_in"].as_u64().unwrap() <= 10);
+    let admitted = view_ws::admit_viewer(&mgr, body["ticket"].as_str().unwrap(), Instant::now()).unwrap();
+    assert_eq!(admitted.ticket.ctx.credential_epoch, 1);
+    assert_eq!(admitted.ticket.access_expires, Some(exp));
+    drop(admitted);
+    let body = crate::mfa::ACCESS_EXPIRY.scope(Some(exp), mgr.live_view_open("alice", &ctx)).await.unwrap();
+    db.mfa_operator_reset(&user.email).unwrap();
+    assert_eq!(view_ws::admit_viewer(&mgr, body["ticket"].as_str().unwrap(), Instant::now()).err(), Some(axum::http::StatusCode::FORBIDDEN));
+    let ctx = db.live_user_context(&user.id).unwrap().unwrap();
+    assert!(crate::mfa::ACCESS_EXPIRY.scope(Some(1), mgr.live_view_open("alice", &ctx)).await.is_err());
+    assert!(mgr.live_view_open("alice", &ctx).await.is_err());
 }
