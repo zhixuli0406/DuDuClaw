@@ -221,6 +221,7 @@ impl Model {
         }
         match result {
             Ok(lists) => {
+                self.role = lists.role;
                 self.goal_operators = lists.goal_operators;
                 self.employees.replace(lists.employees);
                 self.activity.retain(|id, _| self.employees.items.iter().any(|e| e.id() == id));
@@ -246,6 +247,7 @@ impl Model {
     }
 }
 struct Lists {
+    role: Option<Role>,
     goal_operators: HashSet<String>,
     recent_activity: Result<HashMap<String, Activity>>,
     schedules: Result<Vec<ScheduledRun>>,
@@ -264,15 +266,18 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     // users.me supplies actual Operator/Owner bindings, not role heuristics.
     // Missing capability data leaves goals read-only, while observation continues.
     let mut goal_operators = HashSet::new();
+    let mut live_role = None;
     if let Ok(me) = client.call("users.me", json!({}), RPC_TIMEOUT).await {
         budget.charge(&me, "bindings")?;
-        let admin = me["user"]["role"] == "admin";
+        live_role = serde_json::from_value(me["user"]["role"].clone()).ok();
+        let admin = live_role == Some(Role::Admin);
         for agent in &agents.agents {
             let operator = me["bindings"].as_array().is_some_and(|bindings| bindings.iter().any(|b|
                 b["agent_name"] == agent.id() && matches!(b["access_level"].as_str(), Some("operator" | "owner"))));
-            if admin || operator { goal_operators.insert(agent.id().to_owned()); }
+            if live_role.is_some() && (admin || operator) { goal_operators.insert(agent.id().to_owned()); }
         }
     }
+    let role = live_role.unwrap_or(role);
     // approvals.list requires Manager, whereas goal_decide accepts an
     // employee's Operator binding. Do not fail the whole employee inbox by
     // making an RPC that its role cannot call.
@@ -345,9 +350,10 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     }
     let recent_activity = crate::state_extra::recent_activity(client, &agents.agents, &mut budget).await;
     if matches!(recent_activity, Err(Error::SnapshotBudget)) { return Err(Error::SnapshotBudget); }
-    let schedules = if role == Role::Admin { crate::state_extra::schedules(client, &mut budget).await } else { Ok(Vec::new()) };
+    let schedules = if matches!(role, Role::Admin | Role::Manager) { crate::state_extra::schedules(client, role, &mut budget).await } else { Ok(Vec::new()) };
     if matches!(schedules, Err(Error::SnapshotBudget)) { return Err(Error::SnapshotBudget); }
     Ok(Lists {
+        role: live_role,
         goal_operators,
         recent_activity,
         schedules,
@@ -486,7 +492,7 @@ mod tests {
                 let requests = requests.clone();
                 Box::pin(async move { let (reply, rx) = oneshot::channel(); requests.send(reply).unwrap(); rx.await.unwrap() })
             }));
-        let complete = || Ok(Lists { goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()),
+        let complete = || Ok(Lists { role: Some(Role::Admin), goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()),
             schedules: Ok(vec![]), employees: vec![], inbox: vec![] });
         tokio::time::timeout(Duration::from_secs(2), async {
             calls.recv().await.unwrap().send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
@@ -505,7 +511,7 @@ mod tests {
         let mut m = Model::default();
         assert!(m.apply(
             0,
-            Ok(Lists {
+            Ok(Lists { role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -543,7 +549,7 @@ mod tests {
                 result.await.unwrap()
             })
         }));
-        let complete = || Ok(Lists {
+        let complete = || Ok(Lists { role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
@@ -654,7 +660,7 @@ mod tests {
         m.invalidate_all();
         assert!(!m.apply(
             old_revision,
-            Ok(Lists {
+            Ok(Lists { role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -667,7 +673,7 @@ mod tests {
         assert_eq!(m.inbox.count(), None);
         assert!(m.apply(
             m.revision,
-            Ok(Lists {
+            Ok(Lists { role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -707,7 +713,7 @@ mod tests {
         }
         assert!(model.activity.is_empty());
         model.activity.insert("removed".into(), Activity::default());
-        assert!(model.apply(model.revision, Ok(Lists {
+        assert!(model.apply(model.revision, Ok(Lists { role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
@@ -718,7 +724,7 @@ mod tests {
     #[test]
     fn unavailable_history_does_not_claim_fresh_employee_state() {
         let mut model = fresh();
-        assert!(model.apply(model.revision, Ok(Lists {
+        assert!(model.apply(model.revision, Ok(Lists { role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Err(Error::RpcRejected),
             schedules: Ok(vec![]), employees: vec![], inbox: vec![],

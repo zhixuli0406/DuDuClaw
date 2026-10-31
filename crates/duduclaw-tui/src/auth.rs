@@ -398,6 +398,8 @@ pub fn disable_core_dumps() -> Result<()> {
 }
 #[cfg(not(unix))]
 pub fn disable_core_dumps() -> Result<()> {
+    // Windows does not implement Unix RLIMIT_CORE. OS crash-dump policy is
+    // outside this client; this branch makes no dump-suppression guarantee.
     Ok(())
 }
 

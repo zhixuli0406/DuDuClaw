@@ -31,7 +31,7 @@ pub struct Card {
 #[derive(Clone, Default)]
 pub struct Codes { previous: Option<u8> }
 impl Codes {
-    fn next(&mut self) -> String {
+    pub(super) fn next(&mut self) -> String {
         let mut rng = rand::thread_rng();
         let mut next = rng.gen_range(0..100);
         while self.previous == Some(next) { next = rng.gen_range(0..100); }

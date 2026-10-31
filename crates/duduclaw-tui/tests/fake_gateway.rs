@@ -1,6 +1,8 @@
 //! Socket tests deliberately fail on bind refusal unless explicitly opted out.
 #[path = "decisions/mod.rs"]
 mod decisions;
+#[path = "m2/mod.rs"]
+mod m2;
 #[path = "chat/mod.rs"]
 mod chat;
 use async_trait::async_trait;
@@ -271,6 +273,22 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                     json!({"id":params["id"],"decided":if params["approve"] == true {"approved"} else {"denied"},"side_effect":null,"capability_handle":null})
                                 } else { json!({"ok":true,"message":"done","task":{"id":params["task_id"],"status":"pending"}}) }
                             },
+                            "tasks.steer" | "tasks.stop" | "agents.pause" | "agents.resume"
+                            | "heartbeat.trigger" | "responsibilities.pause" | "responsibilities.disable" => {
+                                f.decisions.lock().unwrap().push((method.clone(), params.clone()));
+                                if method == "tasks.stop" && params["expected_authority_revision"] != 7 {
+                                    if !send(&mut socket, WsFrame::error_response(&id, "task_changed")).await { return; }
+                                    continue;
+                                }
+                                match method.as_str() {
+                                    "tasks.steer" => json!({"steering":{"task_id":params["task_id"],"state":"pending"},"duplicate":false}),
+                                    "tasks.stop" => json!({"stop":{"state":"cancel_pending","affected_task_ids":[params["task_id"]]}}),
+                                    "responsibilities.pause" | "responsibilities.disable" if params["expected_control_epoch"] != 2 => json!({"conflict":true,"current":{"control_epoch":3}}),
+                                    "responsibilities.pause" | "responsibilities.disable" => json!({"responsibility":{"responsibility_id":params["responsibility_id"],"state":"paused","control_epoch":3}}),
+                                    _ => json!({"success":true}),
+                                }
+                            },
+                            "heartbeat.status" => json!({"heartbeats":[{"agent_id":"adu","enabled":true,"cron":"0 * * * *","cron_timezone":"UTC","last_run":"09:00","next_run":"10:00","total_runs":1,"active_runs":0,"max_concurrent":1}]}),
                             "agents.list" => {
                                 if f.flood.load(Ordering::SeqCst) == 0 {
                                     json!({"agents":[{"name":"adu","display_name":"阿嘟\u{202e}\u{1b}","status":"active","archived":false}]})

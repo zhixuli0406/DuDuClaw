@@ -52,8 +52,9 @@ pub const DISCONNECTED: &str = "已斷線";
 pub const GATEWAY: &str = "閘道";
 pub const AUTONOMY: &str = "自主狀態";
 pub const LIST_FOCUS: &str = "焦點：清單";
-pub const LIST_KEY_HINTS: &str = "j/k 移動  i 輸入  1/2 區塊  Enter 開卡  ? 說明  q 離開";
-pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1 / 2：詳情 / 對話；x 取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。";
+pub const CONTROL_KEY_FOCUS: &str = "p / n 僅在詳情區塊或清單焦點可用";
+pub const LIST_KEY_HINTS: &str = "j/k 選取  1–4 焦點  v/x 分割  Ctrl-W 關閉  ? 說明";
+pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任；p：員工或排程暫停\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。";
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";
 pub const READ_STATE_NOTICE: &str = "已讀紀錄無法讀取，從空白紀錄開始";
 pub const SAVED: &str = "已標為已讀";
@@ -125,13 +126,14 @@ pub const CHAT_RESPONDING: &str = "正在回覆";
 pub const CHAT_ERROR: &str = "對話發生錯誤";
 pub const CHAT_TURN_LIMIT: &str = "同時進行的對話已達上限，請稍後再傳送";
 pub const CHAT_CANCEL_UNAVAILABLE: &str = "此閘道尚未確認支援取消，無法取消";
-pub const CHAT_CANCEL_HINT: &str = "x 取消這次回覆";
+pub const CHAT_CANCEL_HINT: &str = "X 取消這次回覆";
 pub const CHAT_CANCELLING: &str = "已接受取消，等待停止確認";
 pub const CHAT_CANCELLED: &str = "回覆已取消";
 pub const CHAT_INTERRUPTED: &str = "連線中斷，回覆結果未確認；不會自動重送訊息";
 pub const WATCH_POLLING: &str = "輪詢模式：閘道未提供即時訂閱，每五秒更新";
 pub const WATCH_SUBSCRIBED: &str = "已訂閱員工執行事件";
 pub const WATCH_GAP: &str = "事件可能遺失，正在重新取得執行紀錄";
+pub const WATCH_RUN_MISMATCH: &str = "警告：執行紀錄與目標不符，已略過";
 pub fn notification(count: usize) -> String { format!("DuDuClaw：{count} 項需要你處理") }
 
 pub const WATCH_HELP: &str = "持續查看一位員工的執行紀錄";
@@ -142,3 +144,103 @@ pub const CHAT_DONE: &str = "回覆完成";
 pub const WATCH_CONTENT_HELP: &str = "顯示未遮蔽的內容預覽";
 pub const WATCH_CONTENT_WARNING: &str = "警告：內容未經機密遮蔽，可能包含敏感資料。";
 pub const CHAT_GUTTER: &str = "> ";
+
+pub const CHAT_BLOCK: &str = "對話";
+pub const RUN_BLOCK: &str = "執行紀錄";
+pub const TASK_BLOCK: &str = "任務";
+pub const LOG_BLOCK: &str = "日誌";
+pub const NOT_PROVIDED: &str = "閘道未提供";
+pub const MANAGER_ONLY: &str = "需要主管權限";
+pub const CRON_ADMIN_ONLY: &str = "排程需要管理員權限；此處僅顯示心跳";
+pub const RUNTIME_ENDPOINTS: &str = "此 runtime 只回報起訖";
+pub const SELECT_EMPLOYEE: &str = "請先選取員工，再開啟執行或任務區塊";
+pub const CONTENT_CONFIRM: &str = "警告：預覽僅截短，未遮蔽機密；再按 c 顯示內容，其他鍵取消。";
+pub const RUN_KEYS: &str = "[ / ] 切換紀錄；c 顯示／隱藏內容";
+pub const ROW_KEYS: &str = "[ / ] 切換；b 任務／責任";
+pub const TASK_KEYS: &str = "[ / ] 切換；b 任務／責任；Enter 查看目標卡";
+pub const RESP_LIST: &str = "持續責任";
+pub const RESP_KEYS: &str = "p 暫停；d 停用（均需確認）";
+pub const RESP_OCCURRENCE: &str = "補充方向或停止請切回任務，選取這次責任的執行任務";
+pub const ITERATIONS: &str = "回合";
+pub const TIMELINE: &str = "時間軸";
+pub const CHANGES: &str = "檔案變更";
+pub const BLOCK_TRUNCATED: &str = "部分資料已省略，請到儀表板查看";
+pub const LOG_GAP: &str = "僅保留最近 256 行；較早或遺失的日誌無法重播";
+pub const STEER: &str = "補充任務方向";
+pub const STOP: &str = "停止任務與子任務";
+pub const EMPLOYEE_PAUSE: &str = "暫停員工狀態（agents.pause，非自主性全面暫停）";
+pub const EMPLOYEE_RESUME: &str = "恢復員工狀態（agents.resume）";
+pub const CRON_PAUSE: &str = "暫停排程";
+pub const CRON_RESUME: &str = "恢復排程";
+pub const RUN_NOW: &str = "立即執行一次";
+pub const RESP_DISABLE: &str = "停用持續責任";
+pub const RESP_PAUSE: &str = "暫停持續責任";
+pub const CONTROL_SCOPE: &str = "請核對操作與目標；送出後會重新取得狀態。Esc 取消。";
+pub const CONTROL_SCROLL: &str = "請先捲到底部核對完整內容。Esc 取消。";
+pub const CONTROL_CONFIRM: &str = "輸入兩位確認碼後按 Enter；Esc 取消。";
+pub const STEER_EDIT: &str = "輸入方向（最多 4000 字）；Enter 進入確認；Esc 取消。";
+pub const EMPLOYEE_KEYS: &str = "p 暫停／恢復員工狀態（非全面自主暫停，需確認）";
+pub const HEARTBEAT_KEYS: &str = "n 觸發心跳（需確認）；上次結果：閘道未提供";
+pub const CRON_KEYS: &str = "p 暫停／恢復；n 立即執行（需確認）";
+pub fn hidden_blocks(count: usize) -> String { format!("另有 {count} 個區塊隱藏；1–4 切換焦點") }
+pub const OPEN_OCCURRENCE: &str = "o 開啟此次執行任務（可補充方向、停止）";
+pub const TASK_STEER_KEY: &str = "e 補充方向（需確認）";
+pub const TASK_STOP_KEY: &str = "s 停止（需確認）";
+pub fn field_label(key: &str) -> &str {
+    match key {
+        "responsibility_id" => "責任", "objective" => "目標", "title" => "標題", "status" | "state" => "狀態", "assigned_to" | "owner_agent_id" => "員工",
+        "pause_reason" => "暫停原因", "updated_at" => "更新時間", "name" => "名稱", "stop_at" => "截止時間",
+        "last_run" | "last_run_at" => "上次執行", "last_status" => "上次結果", "cron" => "排程規則",
+        "cron_timezone" => "時區", "enabled" => "啟用", _ => key,
+    }
+}
+
+pub const LAST_RESULT: &str = "上次結果";
+
+pub const RUN_WAIT: &str = "正在確認執行紀錄與訂閱能力";
+
+pub const RUN_LIMIT: &str = "只顯示最近 50 次執行";
+pub const EMPTY_RUNS: &str = "目前沒有可見的執行紀錄";
+
+pub const CONTROL_KEY_HINTS: &str = "↑↓ / PgUp PgDn 捲動  Esc 關卡  Ctrl-C 離開；確認方式見卡片";
+
+pub const PALETTE_FOCUS: &str = "焦點：命令面板";
+pub const PALETTE_TITLE: &str = "命令面板";
+pub const PALETTE_KEYS: &str = "輸入搜尋  ↑/↓ 選取  Enter 執行  Esc 返回";
+pub const PALETTE_EMPTY: &str = "沒有符合的可用命令";
+pub const CMD_QUIT: &str = "離開控制室";
+pub const CMD_BACK: &str = "返回清單／關閉說明";
+pub const CMD_SEND: &str = "傳送訊息";
+pub const CMD_HELP: &str = "開關此區塊的說明";
+pub const CMD_UP: &str = "向上捲動";
+pub const CMD_DOWN: &str = "向下捲動";
+pub const CMD_DETAIL: &str = "開啟詳情區塊";
+pub const CMD_CHAT: &str = "開啟對話區塊";
+pub const CMD_INPUT: &str = "輸入對話訊息";
+pub const CMD_RUN: &str = "查看選取員工的執行紀錄";
+pub const CMD_TASK: &str = "查看選取員工的任務";
+pub const CMD_LOG: &str = "查看日誌";
+pub const CMD_VERTICAL: &str = "左右分割區塊";
+pub const CMD_HORIZONTAL: &str = "上下分割區塊";
+pub const CMD_CLOSE: &str = "關閉目前區塊";
+pub const CMD_FOCUS: &str = "切換區塊焦點";
+pub const CMD_PREVIOUS: &str = "前一筆紀錄";
+pub const CMD_NEXT: &str = "下一筆紀錄";
+pub const CMD_RESP: &str = "切換任務／持續責任";
+pub const CMD_CONTENT: &str = "切換執行內容顯示";
+pub const CMD_CANCEL: &str = "取消目前回覆";
+pub const CMD_OPEN: &str = "開啟詳情／決策卡";
+pub const CMD_READ: &str = "標為已讀";
+pub const CMD_SNOOZE: &str = "本機稍後提醒";
+pub const CMD_OCCURRENCE: &str = "開啟本次責任任務";
+pub const CMD_STEER: &str = "調整任務方向（需確認）";
+pub const CMD_STOP: &str = "停止任務（需確認）";
+pub const CMD_PAUSE: &str = "暫停／恢復（需確認）";
+pub const CMD_DISABLE: &str = "停用持續責任（需確認）";
+pub const CMD_NOW: &str = "立即執行（需確認）";
+pub const EXIT_PENDING: &str = "待處理收件匣";
+pub const EXIT_RUNNING: &str = "執行中的員工";
+pub const EXIT_RETURN: &str = "返回控制室";
+pub const EXIT_NONE: &str = "無";
+
+pub fn exit_more(count: usize) -> String { format!("另 {count} 位") }
