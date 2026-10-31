@@ -950,8 +950,7 @@ impl MethodHandler {
         let actor = ctx.user_id.clone();
         let config_path_for_guard = config_path.clone();
         let expected_state = params.get("expected_state").and_then(Value::as_bool);
-        if let Err(e) =
-            super::config_commit::commit_table_locked_with_guard(&config_path, original_hash, &table, move || {
+        let guard = move || {
                 if security_change {
                     crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?;
                     let expected = expected_state
@@ -965,8 +964,13 @@ impl MethodHandler {
                     if actual != expected { return Err("雙因素驗證設定已變更，請重新整理後再確認。".into()); }
                 }
                 Ok(())
-            }).await
-        {
+            };
+        let result = if security_change {
+            super::config_commit::commit_mfa_table_locked_with_guard(&config_path, original_hash, &table, guard).await
+        } else {
+            super::config_commit::commit_table_locked_with_guard(&config_path, original_hash, &table, guard).await
+        };
+        if let Err(e) = result {
             return WsFrame::error_response("", &e);
         }
 

@@ -710,3 +710,28 @@ async fn mfa_personal_self_service_ignores_enterprise_enforcement() {
     assert!(matches!(response, WsFrame::Response { ok: true, .. }));
     assert!(!state.user_db.mfa_active(&user.id).unwrap());
 }
+
+#[tokio::test]
+async fn mfa_policy_rpc_db_failure_obeys_commit_order() {
+    for initial in [false, true] {
+        let (_dir, state, user) = fixture(false, initial).await;
+        let path = state.home_dir.join("config.toml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let conn = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_policy BEFORE INSERT ON mfa_policy_state BEGIN SELECT RAISE(FAIL, 'policy write failed'); END;").unwrap();
+        let mut ctx = UserContext::admin_fallback();
+        ctx.user_id = user.id.clone();
+        let response = state.handler.handle("system.update_config",
+            json!({"auth.mfa_enforced":!initial,"expected_state":initial}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
+        let actual: bool = conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(actual, initial);
+        let disk = std::fs::read_to_string(&path).unwrap();
+        if initial {
+            assert_eq!(disk.parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(false));
+            assert!(enforced(&state.home_dir, false).unwrap());
+        } else {
+            assert_eq!(disk, original);
+        }
+    }
+}

@@ -81,6 +81,50 @@ fn parse_policy(text: &str) -> Result<bool, String> {
         Some(v) => v.as_bool().ok_or_else(|| "雙因素驗證設定必須是布林值。".into()),
     }
 }
+/// Keep reloads from reading the old config between the strict DB transition
+/// and file replacement. The caller already holds the config lock.
+pub(crate) fn commit_policy(
+    home: &Path,
+    new_content: &str,
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let value = parse_policy(new_content)?;
+    let mut snapshots = POLICY.write().unwrap_or_else(|e| e.into_inner());
+    let snapshot = snapshots.entry(home.to_path_buf()).or_default();
+    let result = (|| {
+        let since = if value { record_policy(home, true)? } else { None };
+        // If replacement fails after enabling, deliberately retain strict DB state.
+        write()?;
+        if !value { record_policy(home, false)?; }
+        Ok(since)
+    })();
+    match result {
+        Ok(since) => {
+            snapshot.value = Some(value);
+            snapshot.enforced_at = since;
+            snapshot.degraded = false;
+            Ok(())
+        }
+        Err(error) => {
+            snapshot.degraded = true;
+            Err(error)
+        }
+    }
+}
+
+fn record_policy(home: &Path, value: bool) -> Result<Option<i64>, String> {
+    if home.join("users.db").exists() {
+        let mut db = rusqlite::Connection::open_with_flags(
+            home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        ).map_err(|e| e.to_string())?;
+        duduclaw_auth::mfa::record_enforcement(&mut db, value, chrono::Utc::now().timestamp_micros())
+    } else if value {
+        Err("MFA identity store unavailable".into())
+    } else {
+        Ok(None)
+    }
+}
+
 /// Boot and configuration reload only. A failed reload never discards a good snapshot.
 pub(crate) fn reload_policy(home: &Path) {
     // Serialize reloads so an older disk read cannot overwrite a newer snapshot.
@@ -88,12 +132,7 @@ pub(crate) fn reload_policy(home: &Path) {
     let result = std::fs::read_to_string(home.join("config.toml"))
         .map_err(|e|e.to_string()).and_then(|s|parse_policy(&s))
         .and_then(|value| {
-            let since = if home.join("users.db").exists() {
-                let mut db = rusqlite::Connection::open_with_flags(home.join("users.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|e|e.to_string())?;
-                duduclaw_auth::mfa::record_enforcement(&mut db,value,chrono::Utc::now().timestamp_micros())?
-            } else if value {
-                return Err("MFA identity store unavailable".into());
-            } else { None };
+            let since = record_policy(home, value)?;
             Ok((value,since))
         });
     let snapshot = snapshots.entry(home.to_path_buf()).or_default();
