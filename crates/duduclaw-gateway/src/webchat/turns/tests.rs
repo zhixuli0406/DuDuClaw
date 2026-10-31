@@ -519,7 +519,7 @@ async fn revoked_or_unavailable_identity_withholds_queued_frames_and_rejects_ack
         });
         let mut writer = BoundedSocketSink(Box::pin(accepting));
         let (ack, received) = oneshot::channel();
-        let frame = Outbound { message: Message::Text("sensitive".into()), ack: Some(ack),
+        let frame = Outbound { identity_notice: None, message: Message::Text("sensitive".into()), ack: Some(ack),
             deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT) };
         let mut recovery = SocketRecovery::default();
         let result = frame.deliver_authorized(validity, &mut recovery, &mut writer).await;
@@ -528,7 +528,7 @@ async fn revoked_or_unavailable_identity_withholds_queued_frames_and_rejects_ack
         assert_eq!(recovery.closed(), validity == SocketValidity::Revoked);
         assert_eq!(result.is_err(), validity == SocketValidity::Revoked);
         if validity == SocketValidity::Unavailable {
-            Outbound { message: Message::Text("recovered".into()), ack: None, deadline: None }
+            Outbound { identity_notice: None, message: Message::Text("recovered".into()), ack: None, deadline: None }
                 .deliver_authorized(SocketValidity::Valid, &mut recovery, &mut writer).await.unwrap();
             assert!(matches!(&sent.lock().unwrap()[0], Message::Text(text) if text.as_str() == "recovered"));
         }
@@ -711,7 +711,7 @@ async fn unavailable_at_each_start_gate_is_terminal_and_releases_fifo_without_mo
         let Message::Text(text) = rx.recv().await.unwrap().message else { panic!("text") };
         let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(frame["type"], "error", "{stage}");
-        assert_eq!(frame["code"], "credential_check_unavailable", "{stage}");
+        assert_eq!(frame["code"], "identity_unavailable", "{stage}");
         assert_eq!(frame["msg_id"], "first", "{stage}");
         assert!(frame["message"].as_str().unwrap().contains("稍後再試"));
         let next_task = tokio::spawn(execute(credential_input(state.clone()), TurnSink::new(tx, "session", None, "next"), next));
@@ -840,3 +840,6 @@ async fn execute_revoked_running_credential_withdraws_and_refuses_card() {
     }
     assert!(cancelled);
 }
+
+#[path = "identity_tests.rs"]
+mod identity_tests;

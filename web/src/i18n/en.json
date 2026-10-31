@@ -1,4 +1,8 @@
 {
+  "chat.unanswered": "This message has no reply yet. The AI employee may still be working; the reply will appear automatically.",
+  "chat.unansweredExpired": "No reply has arrived. You can send the message again or ask an administrator to check the gateway logs.",
+  "chat.stalled": "The AI employee has not responded yet. Waiting for {minutes} min.",
+  "chat.otherConversationFailed": "A reply in another conversation failed. Please return to that conversation to check.",
   "nav.account": "Account",
   "nav.account.desc": "Manage your password, email address and sign-in verification.",
   "liveEvents.stale": "Data may be stale",

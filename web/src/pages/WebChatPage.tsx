@@ -1,3 +1,4 @@
+import { ChatWaitingNotice } from '@/components/chat/ChatWaitingNotice';
 import { ReadOnlyHistoryView } from '@/components/chat/ReadOnlyHistoryView';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -61,7 +62,7 @@ export function WebChatPage() {
   useEffect(() => {
     const refresh = () => {
       void useConversationsStore.getState().fetch();
-      if (useConversationsStore.getState().viewOnly || useChatStore.getState().resumedExplicitly) void useConversationsStore.getState().refreshView();
+      if (useConversationsStore.getState().viewOnly) void useConversationsStore.getState().refreshView();
     };
     window.addEventListener('focus', refresh);
     return () => window.removeEventListener('focus', refresh);
@@ -623,6 +624,7 @@ function InteractiveWebChatPage() {
             </>
           )}
 
+          <ChatWaitingNotice />
           <div ref={messagesEndRef} />
         </div>
       </div>

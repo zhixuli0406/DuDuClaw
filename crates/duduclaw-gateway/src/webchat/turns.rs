@@ -8,6 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 mod run;
 mod progress;
+mod identity;
+pub(super) use identity::IdentityUnavailable;
 #[cfg(test)]
 mod tests;
 pub(super) use run::TurnInput;
@@ -249,9 +251,7 @@ pub(super) async fn credential_allows_turn(
         SocketValidity::Valid => true,
         SocketValidity::Revoked => false,
         SocketValidity::Unavailable => {
-            sink.frame(ChatMessage::error_coded(
-                "暫時無法確認登入狀態，請稍後再試。", "credential_check_unavailable",
-            )).await;
+            sink.identity_unavailable(validity, true).await;
             false
         }
     }
@@ -310,6 +310,7 @@ pub(super) struct Outbound {
     pub message: Message,
     pub ack: Option<oneshot::Sender<bool>>,
     pub deadline: Option<tokio::time::Instant>,
+    pub identity_notice: Option<IdentityUnavailable>,
 }
 
 impl Outbound {
@@ -322,10 +323,19 @@ impl Outbound {
         sink: &mut BoundedSocketSink<S>,
     ) -> Result<(), ()> {
         if !recovery.observe(validity, false) {
+            let notice_live = self.deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+                && self.ack.as_ref().is_none_or(|ack| !ack.is_closed());
             if let Some(ack) = self.ack { let _ = ack.send(false); }
             if recovery.closed() {
                 let _ = sink.send(Message::Close(None)).await;
                 return Err(());
+            }
+            // Only typed, content-free refusal metadata can cross a temporary
+            // identity outage. Never serialize or forward the queued reply here.
+            if notice_live {
+                if let Some(notice) = self.identity_notice {
+                    return sink.send(notice.message()).await;
+                }
             }
             return Ok(());
         }
@@ -335,6 +345,11 @@ impl Outbound {
     pub(super) async fn deliver<S: futures_util::Sink<Message> + Unpin>(
         self, sink: &mut BoundedSocketSink<S>,
     ) -> Result<(), ()> {
+        if self.identity_notice.is_some()
+            && self.deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            if let Some(ack) = self.ack { let _ = ack.send(false); }
+            return Ok(());
+        }
         let Some(ack) = self.ack else { return sink.send(self.message).await; };
         let Some(deadline) = self.deadline else {
             let _ = ack.send(false);

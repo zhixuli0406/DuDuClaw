@@ -5,6 +5,8 @@ import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
 import { effectiveName } from '@/lib/product-identity';
 import type { ChatArtifact } from '@/components/console/artifact-types';
+import { lookupMessage, toast } from '@/lib/toast';
+import { isOtherConversationFailure, isTurnActivity } from './chat-silence';
 import { mentionErrorText } from '@/lib/mention';
 import { attachHistoryCitations, parseChatCitations, type ChatCitation, type SessionCitationRow } from '@/lib/knowledge-citations';
 import {
@@ -196,6 +198,8 @@ interface ChatStore {
   readonly isStreaming: boolean;
   /** Client message id of the foreground turn; other turns may still run. */
   readonly activeMessageId: string | null;
+  readonly lastTurnFrameAt: number | null;
+  readonly historyReplyRevision: number;
   /** Fine-grained turn phase for the companion face (thinking/speaking/…). */
   readonly phase: ChatPhase;
   /** Current mouth shape while `speaking` — sampled per assistant chunk. */
@@ -367,11 +371,11 @@ export function shouldRenderChatFrame(
   }
   const conv = typeof frame.conv === 'string' && frame.conv ? frame.conv : null;
   const requestId = typeof frame.request_id === 'string' && frame.request_id ? frame.request_id : null;
-  const msg = frame.type === 'error' && frame.code === 'turn_limit'
+  const msg = frame.type === 'error' && (frame.code === 'turn_limit' || frame.code === 'identity_unavailable')
     ? requestId ?? (typeof frame.msg_id === 'string' && frame.msg_id ? frame.msg_id : null)
     : typeof frame.msg_id === 'string' && frame.msg_id ? frame.msg_id : null;
   // An uncorrelated admission refusal must not clear another accepted turn.
-  if (frame.type === 'error' && frame.code === 'turn_limit' && !msg) return false;
+  if (frame.type === 'error' && (frame.code === 'turn_limit' || frame.code === 'identity_unavailable') && !msg) return false;
   if (conv && conv !== current.convId) return false;
   if (msg && msg !== current.activeMessageId) return false;
   if (conv || msg) return true;
@@ -518,7 +522,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
         // Errors and resume confirmations can now belong to a turn too.
         // Reject another turn before changing the foreground activity state.
-        if (!shouldRenderChatFrame(data, get())) return;
+        if (data.type === 'assistant_done' && data.session_id === get().sessionId) {
+          set(state => ({ historyReplyRevision: state.historyReplyRevision + 1 }));
+        }
+        if (!shouldRenderChatFrame(data, get())) {
+          if (isOtherConversationFailure(data, get())) toast.info(lookupMessage('chat.otherConversationFailed'));
+          return;
+        }
+        if (get().isStreaming && isTurnActivity(data, get().activeMessageId)) {
+          set({ lastTurnFrameAt: Date.now() });
+        }
         if (awaitingFirstServerFrame && IN_TURN_FRAME_TYPES.has(data.type)) {
           awaitingFirstServerFrame = false;
           set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
@@ -797,6 +810,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
     thinking: null,
     isStreaming: false,
     activeMessageId: null,
+    lastTurnFrameAt: null,
+    historyReplyRevision: 0,
     phase: 'idle',
     viseme: REST_VISEME,
     sessionId: null,
@@ -932,6 +947,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         thinking: startTurnThinking(Date.now()),
         isStreaming: true,
         activeMessageId: msgId,
+        lastTurnFrameAt: Date.now(),
         phase: 'thinking' as ChatPhase,
         viseme: REST_VISEME,
       }));
