@@ -3887,6 +3887,7 @@ export interface DeviceBackupRestoreResult {
   staged: true;
   files_written: number;
   restart_required: true;
+  notice?: string | null;
 }
 
 export interface GalleryCard {

@@ -81,6 +81,36 @@ fn parse_policy(text: &str) -> Result<bool, String> {
         Some(v) => v.as_bool().ok_or_else(|| "雙因素驗證設定必須是布林值。".into()),
     }
 }
+
+/// Restore must preserve the live policy; an unreadable policy defaults to strict.
+pub(crate) fn restore_policy(home: &Path) -> bool {
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok().and_then(|text| parse_policy(&text).ok())
+        .unwrap_or(true)
+}
+
+pub(crate) fn restore_policy_differs(home: &Path, text: &str) -> bool {
+    parse_policy(text).ok() != Some(restore_policy(home))
+}
+
+pub(crate) const RESTORE_POLICY_NOTICE: &str =
+    "還原會保留目前的雙因素驗證強制設定；如需變更，請使用雙因素驗證專用開關。";
+
+/// Edit only this key, retaining the backup's other settings and formatting.
+pub(crate) fn preserve_restore_policy(text: &str, value: bool) -> Result<String, String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
+    if doc.get("auth").is_none() {
+        doc["auth"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let auth = doc.get_mut("auth").and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or("登入設定格式不正確。")?;
+    let mut replacement = toml_edit::Value::from(value);
+    if let Some(old) = auth.get("mfa_enforced").and_then(toml_edit::Item::as_value) {
+        *replacement.decor_mut() = old.decor().clone();
+    }
+    auth.insert("mfa_enforced", toml_edit::Item::Value(replacement));
+    Ok(doc.to_string())
+}
 /// Ordinary writers must preserve the effective policy (an absent key is false).
 pub(crate) fn refuse_policy_change(before: &str, after: &str) -> Result<(), String> {
     if parse_policy(before)? != parse_policy(after)? {
@@ -208,6 +238,25 @@ pub(crate) fn replacement_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mfa_restore_policy_defaults_strict_when_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(restore_policy(home.path()));
+        std::fs::create_dir(home.path().join("config.toml")).unwrap();
+        assert!(restore_policy(home.path()));
+    }
+
+    #[test]
+    fn mfa_restore_rewrites_only_key_in_inline_auth_table() {
+        let before = "auth = { mfa_enforced = false, other = 'keep' } # comment\n";
+        let after = preserve_restore_policy(before, true).unwrap();
+        assert_eq!(after, before.replacen("false", "true", 1));
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true").unwrap();
+        assert!(restore_policy_differs(home.path(), before));
+        assert!(!restore_policy_differs(home.path(), &after));
+    }
+
     #[test]
     fn mfa_ordinary_writes_compare_effective_parsed_values() {
         for (before, after) in [

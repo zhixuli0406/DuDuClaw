@@ -429,6 +429,7 @@ impl UserDb {
     /// are still uncommitted. An issuer error rolls back all of them.
     /// The callback must not re-enter UserDb (the connection is locked).
     /// `policy_exempt` is only for the installation-owned Personal edition.
+    #[allow(clippy::too_many_arguments)]
     pub fn mfa_confirm_and_issue<T>(
         &self,
         user: &str,
@@ -543,6 +544,7 @@ impl UserDb {
     /// As with enrollment, failed session issuance rolls back a disable,
     /// including factor consumption and the credential epoch.
     /// `policy_exempt` is only for the installation-owned Personal edition.
+    #[allow(clippy::too_many_arguments)]
     pub fn mfa_change_and_issue<T>(
         &self,
         user: &str,

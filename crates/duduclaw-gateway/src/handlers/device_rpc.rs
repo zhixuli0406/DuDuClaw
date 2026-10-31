@@ -511,6 +511,11 @@ impl MethodHandler {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let restore_root = crate::backup_restore::resolve_restore_root(&staging, &home);
+        let mfa_notice = std::fs::read_to_string(restore_root.join("config.toml"))
+            .map(|text| crate::mfa::restore_policy_differs(&home, &text))
+            .unwrap_or(true)
+            .then_some(crate::mfa::RESTORE_POLICY_NOTICE);
         let marker = crate::backup_restore::RestoreMarker {
             staged_at: Utc::now(),
             source_filename,
@@ -530,6 +535,7 @@ impl MethodHandler {
                 "staged": true,
                 "files_written": report.files_written,
                 "restart_required": true,
+                "notice": mfa_notice,
             }),
         )
     }

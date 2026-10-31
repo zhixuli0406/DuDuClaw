@@ -336,6 +336,8 @@ mfa_enforced = false
 
 啟用前請從 `mfa.overview` 檢查通道綁定時間；只有早於強制啟用的已驗證綁定可作註冊證明。持有密碼者在強制前植入的綁定仍無法辨識。請將回傳的 12 字元 `challenge_ref` 讀給另一位 Admin，以 `users.mfa_enrollment_code {user_id,challenge_ref}`，或主機 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發該次註冊碼。重載失敗會在 `mfa.overview.policy` 及 `system.status.mfa_policy` 顯示；最後有效值為 false 就保持 false。兩個設定寫入路徑都在寫入鎖內重查 Admin。
 
+備份還原會保留還原前目前有效的 `auth.mfa_enforced`，只覆寫備份中的這個設定鍵，其餘資料照常還原。讀不到目前設定時採嚴格值（Enterprise 強制啟用）；備份值不同時儀表板會提示，還原後記錄 `backup_restore_mfa_policy_preserved` 稽核。需要變更時請使用雙因素驗證專用開關；設定匯入仍會直接拒絕變更這個值。
+
 ### 儀表板雙因素登入
 
 Enterprise 使用者在「設定 → 帳號」選擇「設定雙因素登入」，輸入目前密碼，以驗證器 App 掃描 QR Code（或手動輸入密鑰），再輸入六位數代碼確認。複製或下載十組復原碼，勾選「我已保存復原碼」後繼續。密鑰與復原碼只保留在元件記憶體，離開畫面即清除；複製及下載需自行按下按鈕。註冊與停用會換發目前工作階段的權杖並保留連線，其他工作階段則失效。復原碼會顯示到你確認保存或離開畫面。權杖簽發與 MFA 變更在同一交易提交；簽發失敗時不會完成註冊或停用，可重試。重產復原碼及停用需提供新的驗證器代碼或未使用復原碼；停用另需目前密碼，強制期間無法停用。
