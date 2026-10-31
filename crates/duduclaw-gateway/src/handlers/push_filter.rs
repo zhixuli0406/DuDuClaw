@@ -1,7 +1,8 @@
 //! Per-connection filter for dashboard WebSocket broadcast events (F3, F5-D).
 //!
-//! Every event the gateway broadcasts goes through [`PushGate::filter`] once
-//! per connection before it is sent. The rule per event kind is in
+//! Every event the gateway broadcasts goes through [`PushGate::filter`] per
+//! connection before it is sent. A session handover rechecks any retained
+//! candidate with the replacement identity. The rule per event kind is in
 //! [`classify`]; the full table is in `docs/guides/reviewable-workflow-drafts.md`
 //! ("Live dashboard updates").
 //!

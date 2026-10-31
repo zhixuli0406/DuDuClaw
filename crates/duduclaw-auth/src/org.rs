@@ -305,7 +305,7 @@ pub fn overseen_reports_on(
     Ok(reports)
 }
 
-fn direct_bindings(conn: &Connection, user_id: &str) -> Result<BTreeMap<String, AccessLevel>, String> {
+pub(crate) fn direct_bindings(conn: &Connection, user_id: &str) -> Result<BTreeMap<String, AccessLevel>, String> {
     let mut stmt = conn
         .prepare("SELECT agent_name, access_level FROM user_agent_bindings WHERE user_id = ?1")
         .map_err(|e| format!("binding query error: {e}"))?;

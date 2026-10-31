@@ -18,7 +18,7 @@ async fn fixture(
     let db = Arc::new(UserDb::new(&home.join("users.db")).unwrap());
     let user = db
         .create_user(
-            "mfa@example.test",
+            &format!("mfa-{}@example.test", uuid::Uuid::new_v4()),
             "MFA",
             "correct horse battery",
             UserRole::Admin,
@@ -68,7 +68,7 @@ async fn login(state: &Arc<AppState>, n: u8) -> (StatusCode, Value) {
             State(state.clone()),
             ConnectInfo(peer(n)),
             Json(LoginRequest {
-                email: "mfa@example.test".into(),
+                email: state.user_db.list_users().unwrap().into_iter().find(|u| u.display_name == "MFA").unwrap().email,
                 password: "correct horse battery".into(),
             }),
         )
@@ -188,7 +188,7 @@ async fn mfa_password_and_channel_otp_return_no_token_in_entire_body() {
 #[tokio::test]
 async fn mfa_enforcement_off_preserves_login_response_and_personal_ignores_on() {
     for (personal, enforce, n) in [(false, false, 182), (true, true, 183)] {
-        let (_dir, state, _) = fixture(personal, enforce).await;
+        let (_dir, state, user) = fixture(personal, enforce).await;
         let (status, response) = login(&state, n).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -202,7 +202,7 @@ async fn mfa_enforcement_off_preserves_login_response_and_personal_ignores_on() 
         );
         assert!(response["access_token"].is_string());
         assert!(response["refresh_token"].is_string());
-        assert_eq!(response["user"]["email"], "mfa@example.test");
+        assert_eq!(response["user"]["email"], user.email);
         assert!(response["user"].get("credential_epoch").is_none());
         let claims=state.jwt_config.verify_access_token(response["access_token"].as_str().unwrap()).unwrap();
         assert!(serde_json::to_value(claims).unwrap().get("credential_epoch").is_none());
@@ -289,6 +289,13 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(done["recovery_codes"].as_array().unwrap().len(), 10);
     assert!(done["access_token"].is_string());
+    let access = state.jwt_config.verify_access_token(done["access_token"].as_str().unwrap()).unwrap();
+    let refresh = state.jwt_config.verify_refresh_token(done["refresh_token"].as_str().unwrap()).unwrap();
+    let epoch = state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch;
+    assert_eq!(access.credential_epoch, epoch);
+    assert_eq!(refresh.credential_epoch, epoch);
+    assert_eq!(access.jti, refresh.jti);
+    assert!(authenticate_jwt(&state, done["access_token"].as_str().unwrap()).is_ok());
     assert!(state.user_db.mfa_active(&user.id).unwrap());
     assert_eq!(
         enroll_confirm(
@@ -374,7 +381,7 @@ async fn mfa_rpc_permissions_fresh_admin_and_unknown_method_denied() {
             .handler
             .handle(
                 "system.update_config",
-                json!({"auth.mfa_enforced":true}),
+                json!({"auth.mfa_enforced":true,"expected_state":false}),
                 &forged
             )
             .await,
@@ -397,7 +404,7 @@ async fn mfa_rpc_permissions_fresh_admin_and_unknown_method_denied() {
             .handler
             .handle(
                 "system.update_config",
-                json!({"auth.mfa_enforced":true}),
+                json!({"auth.mfa_enforced":true,"expected_state":false}),
                 &admin
             )
             .await,
@@ -536,4 +543,271 @@ async fn mfa_live_socket_read_failure_pauses_recovers_and_retires_queued_output(
     }
     assert!(sent.is_empty());
     assert!(recovery.closed());
+}
+
+#[tokio::test]
+async fn mfa_rpc_enroll_confirm_and_disable_handover_preserves_only_calling_connection() {
+    use crate::handlers::live_context::SocketValidity;
+    use crate::power_local::RpcConnInfo;
+    let (_dir, state, user) = fixture(false, false).await;
+    let (access, mut refresh) = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
+    let claims = state.jwt_config.verify_access_token(&access).unwrap();
+    let mut ctx = authenticate_jwt(&state, &access).unwrap();
+    let mut expires = Some(claims.exp);
+    let mut dashboard_session = Some((user.id.clone(), claims.jti.unwrap()));
+    // A different login of the same user must never inherit the handover.
+    let other_access = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let other_ctx = authenticate_jwt(&state, &other_access).unwrap();
+    let begin = crate::google_personal::DASHBOARD_SESSION.scope(
+        dashboard_session.clone(), state.handler.handle("mfa.enroll_begin",
+            json!({"password":"correct horse battery"}), &ctx),
+    ).await;
+    let WsFrame::Response { ok: true, payload: Some(begin), .. } = begin else { panic!("enrollment begin failed") };
+    let params = json!({"enrollment_token":begin["enrollment_token"],"code":totp(begin["secret"].as_str().unwrap())});
+    let mut codes = Vec::new();
+    for (method, expected_epoch, n) in [("mfa.enroll_confirm", 1, 190), ("mfa.disable", 2, 191)] {
+        let old_ctx = ctx.clone();
+        let old_session = dashboard_session.clone();
+        // Prime the old-epoch cache. Handover must replace it even before its
+        // two-second expiry; heartbeats force a read after expiry as well.
+        assert_eq!(socket_validity(&state, &ctx, expires, false, true).await, SocketValidity::Valid);
+        let request = if expected_epoch == 1 { params.clone() } else { json!({"code":codes[0],"password":"correct horse battery"}) };
+        let result = crate::mfa::ACCESS_EXPIRY.scope(expires,
+            crate::google_personal::DASHBOARD_SESSION.scope(dashboard_session.clone(),
+                call_with_handover(&state, method, request, &ctx, RpcConnInfo::internal()),
+            ),
+        ).await;
+        let WsFrame::Response { ok: true, payload: Some(payload), .. } = result.response else { panic!("MFA transition failed") };
+        let handover = result.handover.expect("successful transition must carry explicit handover");
+        handover.apply(&mut ctx, &mut dashboard_session, &mut expires);
+        assert_eq!(ctx.credential_epoch, expected_epoch);
+        assert_ne!(dashboard_session, old_session);
+        let claims = state.jwt_config.verify_access_token(payload["access_token"].as_str().unwrap()).unwrap();
+        assert_eq!(claims.credential_epoch, expected_epoch);
+        assert_eq!(dashboard_session.as_ref().unwrap().1, claims.jti.unwrap());
+        assert_eq!(expires, Some(claims.exp));
+        // The exact forced send gate used by the socket, the ordinary send
+        // gate, and the next heartbeat all accept the rebound connection.
+        for heartbeat in [true, false, true] {
+            assert_eq!(socket_validity(&state, &ctx, expires, false, heartbeat).await, SocketValidity::Valid);
+        }
+        assert_eq!(socket_validity(&state, &old_ctx, expires, false, true).await, SocketValidity::Revoked);
+        assert_eq!(socket_validity(&state, &other_ctx, expires, false, true).await, SocketValidity::Revoked);
+        assert_eq!(handle_refresh(State(state.clone()), ConnectInfo(peer(n)),
+            Json(RefreshRequest { refresh_token: refresh })).await.into_response().status(), StatusCode::UNAUTHORIZED);
+        refresh = payload["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(handle_refresh(State(state.clone()), ConnectInfo(peer(n)),
+            Json(RefreshRequest { refresh_token: refresh.clone() })).await.into_response().status(), StatusCode::OK);
+        assert_eq!(state.user_db.mfa_active(&user.id).unwrap(), expected_epoch == 1);
+        if expected_epoch == 1 {
+            codes = payload["recovery_codes"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect();
+            assert_eq!(codes.len(), 10);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mfa_rpc_handover_is_success_only_and_cannot_bypass_later_revocation() {
+    use crate::handlers::live_context::SocketValidity;
+    use crate::power_local::RpcConnInfo;
+    let (_dir, state, user) = fixture(false, false).await;
+    let codes = enroll(&state, &user);
+    let user = state.user_db.get_user(&user.id).unwrap().unwrap();
+    let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let mut ctx = authenticate_jwt(&state, &token).unwrap();
+    let mut session = None;
+    let mut expires = Some(u64::MAX);
+    let failed = call_with_handover(&state, "mfa.disable", json!({"code":"invalid","password":"correct horse battery"}), &ctx, RpcConnInfo::internal()).await;
+    assert!(matches!(failed.response, WsFrame::Response { ok: false, .. }));
+    assert!(failed.handover.is_none());
+    assert_eq!(state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch, ctx.credential_epoch);
+    let status = call_with_handover(&state, "mfa.status", json!({}), &ctx, RpcConnInfo::internal()).await;
+    assert!(matches!(status.response, WsFrame::Response { ok: true, .. }));
+    assert!(status.handover.is_none());
+    let result = call_with_handover(&state, "mfa.disable", json!({"code":codes[0],"password":"correct horse battery"}), &ctx, RpcConnInfo::internal()).await;
+    // A second revocation after commit must not be overwritten by handover.
+    state.user_db.mfa_operator_reset(&user.email).unwrap();
+    result.handover.unwrap().apply(&mut ctx, &mut session, &mut expires);
+    assert_eq!(socket_validity(&state, &ctx, expires, false, true).await, SocketValidity::Revoked);
+}
+
+#[tokio::test]
+async fn mfa_policy_switch_rejects_stale_or_missing_expected_state() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let mut ctx = UserContext::admin_fallback();
+    ctx.user_id = user.id.clone();
+    for expected in [json!(null), json!(true), json!("false")] {
+        let response = state.handler.handle("system.update_config",
+            json!({"auth.mfa_enforced":true,"expected_state":expected}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+        assert!(!enforced(&state.home_dir, false).unwrap());
+    }
+    let response = state.handler.handle("system.update_config",
+        json!({"auth.mfa_enforced":true,"expected_state":false}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    let response = state.handler.handle("system.update_config",
+        json!({"auth.mfa_enforced":false,"expected_state":false}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    assert!(enforced(&state.home_dir, false).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_disable_requires_fresh_password_without_consuming_factor_on_failure() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let codes = enroll(&state, &user);
+    let user = state.user_db.get_user(&user.id).unwrap().unwrap();
+    let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let ctx = authenticate_jwt(&state, &token).unwrap();
+    for password in [json!(null), json!("incorrect")] {
+        let response = state.handler.handle("mfa.disable",
+            json!({"code":codes[0],"password":password}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+        assert!(state.user_db.mfa_active(&user.id).unwrap());
+        assert_eq!(state.user_db.get_user(&user.id).unwrap().unwrap().credential_epoch, user.credential_epoch);
+    }
+    let response = state.handler.handle("mfa.disable",
+        json!({"code":codes[0],"password":"correct horse battery"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    assert!(!state.user_db.mfa_active(&user.id).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_disable_password_attempts_share_enrollment_rate_limit() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let codes = enroll(&state, &user);
+    let user = state.user_db.get_user(&user.id).unwrap().unwrap();
+    let access = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let ctx = authenticate_jwt(&state, &access).unwrap();
+    for _ in 0..5 {
+        let response = state.handler.handle("mfa.disable", json!({"code":codes[0]}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    }
+    for method in ["mfa.disable", "mfa.enroll_begin"] {
+        let response = crate::google_personal::DASHBOARD_SESSION.scope(
+            Some((user.id.clone(), uuid::Uuid::new_v4().to_string())),
+            state.handler.handle(method, json!({"code":codes[0],"password":"correct horse battery"}), &ctx),
+        ).await;
+        let WsFrame::Response { ok: false, error: Some(error), .. } = response else { panic!("rate limit was bypassed") };
+        assert!(error.as_str().unwrap().contains("嘗試次數過多"));
+    }
+    assert!(state.user_db.mfa_active(&user.id).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_personal_self_service_ignores_enterprise_enforcement() {
+    let (_dir, state, user) = fixture(true, true).await;
+    let access = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let ctx = authenticate_jwt(&state, &access).unwrap();
+    let session = Some((user.id.clone(), uuid::Uuid::new_v4().to_string()));
+    let begin = crate::google_personal::DASHBOARD_SESSION.scope(session.clone(),
+        state.handler.handle("mfa.enroll_begin", json!({"password":"correct horse battery"}), &ctx)).await;
+    let WsFrame::Response { ok: true, payload: Some(begin), .. } = begin else { panic!("begin failed") };
+    let confirm = crate::google_personal::DASHBOARD_SESSION.scope(session,
+        state.handler.handle("mfa.enroll_confirm", json!({"enrollment_token":begin["enrollment_token"],"code":totp(begin["secret"].as_str().unwrap())}), &ctx)).await;
+    let WsFrame::Response { ok: true, payload: Some(confirm), .. } = confirm else { panic!("confirm failed") };
+    let ctx = authenticate_jwt(&state, confirm["access_token"].as_str().unwrap()).unwrap();
+    let response = state.handler.handle("mfa.disable", json!({"password":"correct horse battery","code":confirm["recovery_codes"][0]}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    assert!(!state.user_db.mfa_active(&user.id).unwrap());
+}
+
+#[tokio::test]
+async fn config_raw_mfa_policy_changes_refused_but_unrelated_edits_pass() {
+    let (_dir, state, user) = fixture(false, true).await;
+    let path = state.home_dir.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut ctx = UserContext::admin_fallback();
+    ctx.user_id = user.id.clone();
+    for content in ["[auth]\nmfa_enforced=false\n", "[auth]\n", "[general]\nlog_level='debug'\n"] {
+        let response = state.handler.handle("config.raw.set", json!({"file":"config",
+            "base_hash":crate::handlers::config_commit::content_hash(&original), "content":content}), &ctx).await;
+        let WsFrame::Response { ok:false, error:Some(error), .. } = response else { panic!("{response:?}") };
+        assert!(error.as_str().unwrap().contains("system.update_config"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(enforced(&state.home_dir, false).unwrap());
+        let events = duduclaw_security::audit::read_recent_events(&state.home_dir, 100);
+        assert!(!events.iter().any(|e| matches!(e.event_type.as_str(),
+            "config_raw_edited" | "config_protected_key_changed" | "config_changed")));
+        assert!(!std::fs::read_dir(&state.home_dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains(".bak-")));
+    }
+    let response = state.handler.handle("config.raw.set", json!({"file":"config",
+        "base_hash":crate::handlers::config_commit::content_hash(&original),
+        "content":"[auth]\nmfa_enforced=true\n[general]\nlog_level='debug'\n"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:true, .. }), "{response:?}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("log_level"));
+    assert!(enforced(&state.home_dir, false).unwrap());
+
+    let (_dir, state, user) = fixture(false, false).await;
+    let path = state.home_dir.join("config.toml");
+    // Adding a previously absent key must also use the dedicated switch.
+    std::fs::write(&path, "").unwrap();
+    ctx.user_id = user.id;
+    let response = state.handler.handle("config.raw.set", json!({"file":"config",
+        "base_hash":crate::handlers::config_commit::content_hash(""),
+        "content":"[auth]\nmfa_enforced=true\n"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:false, .. }), "{response:?}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+}
+
+#[tokio::test]
+async fn mfa_nested_batch_config_uses_dedicated_switch() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let mut ctx = UserContext::admin_fallback();
+    ctx.user_id = user.id;
+    let path = state.home_dir.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let response = state.handler.handle("system.update_config",
+        json!({"auth":{"mfa_enforced":true},"log_level":"debug"}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:false, .. }), "{response:?}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let response = state.handler.handle("system.update_config",
+        json!({"auth":{"mfa_enforced":true},"log_level":"debug","expected_state":false}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok:true, .. }), "{response:?}");
+    assert!(enforced(&state.home_dir, false).unwrap());
+    let events = duduclaw_security::audit::read_recent_events(&state.home_dir, 100);
+    assert!(events.iter().any(|e| e.event_type == "config_protected_key_changed"
+        && e.details["key"] == "auth.mfa_enforced" && e.details["policy_reconciled"] == true));
+}
+
+#[tokio::test]
+async fn mfa_policy_rpc_db_failure_obeys_commit_order() {
+    for initial in [false, true] {
+        let (_dir, state, user) = fixture(false, initial).await;
+        let path = state.home_dir.join("config.toml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let conn = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_policy BEFORE INSERT ON mfa_policy_state BEGIN SELECT RAISE(FAIL, 'policy write failed'); END;").unwrap();
+        let mut ctx = UserContext::admin_fallback();
+        ctx.user_id = user.id.clone();
+        let response = state.handler.handle("system.update_config",
+            json!({"auth.mfa_enforced":!initial,"expected_state":initial}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
+        let actual: bool = conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(actual, initial);
+        let events = duduclaw_security::audit::read_recent_events(&state.home_dir, 100);
+        let policy_events: Vec<_> = events.iter().filter(|e| e.event_type == "config_protected_key_changed"
+            && e.details["key"] == "auth.mfa_enforced").collect();
+        if initial {
+            let WsFrame::Response { error:Some(error), .. } = &response else { panic!("{response:?}") };
+            assert!(error.as_str().unwrap().contains("已在 config.toml 生效"));
+            assert!(error.as_str().unwrap().contains("同步"));
+            assert_eq!(policy_events.len(), 1);
+            let event = policy_events[0];
+            assert_eq!(event.agent_id, user.id);
+            assert_eq!(event.details["before"], true);
+            assert_eq!(event.details["after"], false);
+            assert_eq!(event.details["config_applied"], true);
+            assert_eq!(event.details["reconciling"], true);
+            assert_eq!(event.details["policy_reconciled"], false);
+        } else {
+            assert!(policy_events.is_empty());
+        }
+        let disk = std::fs::read_to_string(&path).unwrap();
+        if initial {
+            assert_eq!(disk.parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(false));
+            assert!(enforced(&state.home_dir, false).unwrap());
+        } else {
+            assert_eq!(disk, original);
+        }
+    }
 }

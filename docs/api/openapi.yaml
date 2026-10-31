@@ -365,7 +365,7 @@ paths:
   /rpc/mfa.disable:
     post:
       tags: [auth]
-      summary: 以新的 TOTP 或未使用備援碼停用；強制期間拒絕
+      summary: 以目前密碼及新的 TOTP 或未使用備援碼停用；強制期間拒絕
       description: 透過已認證 dashboard WebSocket 呼叫；不接受 enrollment_token 作為身分。
       requestBody:
         required: true
@@ -373,9 +373,10 @@ paths:
           application/json:
             schema:
               type: object
-              required: [code]
+              required: [code, password]
               properties:
                 code: {type: string}
+                password: {type: string, format: password, maxLength: 4096}
       responses:
         '200': {description: RPC 結果（成功或拒絕）；確認／重產的備援碼僅顯示一次}
   /rpc/mfa.overview:

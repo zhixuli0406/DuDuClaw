@@ -1,5 +1,7 @@
 //! Connection-local event reconciliation and opt-in run step delivery.
 //! The run hub uses bounded mpsc queues, never the dashboard broadcast bus.
+//! Ready steps carry their authorizing identity revision for the socket to
+//! discard stale output after handover and request reconciliation.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -86,6 +88,10 @@ impl RunStep {
     }
 }
 type RunAuthorizer = Arc<dyn Fn(RunStep) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync>;
+/// The revision and decision must come from the same identity snapshot.
+type ReadyAuthorizer = Arc<dyn Fn(RunStep) -> std::pin::Pin<Box<dyn std::future::Future<Output = (u64, bool)> + Send>> + Send + Sync>;
+#[derive(Debug)]
+pub(crate) struct ReadyRunStep { pub revision: u64, pub step: RunStep }
 const RUN_AUTH_CAP: usize = 4;
 // Across sockets: two full 16-selector connections per user, sixteen globally.
 // At most four jobs per blocking-pool permit (8), including final delivery checks.
@@ -214,8 +220,8 @@ impl Drop for ForwarderGuard {
 pub(crate) fn spawn_forwarder(
     subscriptions: RunSubscriptions,
     inbound: tokio::sync::mpsc::Receiver<RunStep>,
-    outbound: tokio::sync::mpsc::Sender<RunStep>,
-    authorize: RunAuthorizer,
+    outbound: tokio::sync::mpsc::Sender<ReadyRunStep>,
+    authorize: ReadyAuthorizer,
 ) -> tokio::task::JoinHandle<()> {
     let guard = ForwarderGuard(subscriptions);
     tokio::spawn(async move {
@@ -223,19 +229,17 @@ pub(crate) fn spawn_forwarder(
     })
 }
 
-/// Re-check a queued step immediately before it can be sent. A failed check
-/// is dropped here and does not set `events_lost`. The outbound channel is
-/// one slot, and that slot is reserved before the check, so at most one
-/// already-authorized step can wait for a slow socket.
-///
-/// Returns when the connection drops its receiver. `inbound` never closes on
-/// its own (the listener owns its sender), so `outbound.closed()` is what ends
-/// this task and releases the listener.
+/// Re-check a queued step off the socket loop. Failed checks are silent.
+/// Reserve the one-slot outbound channel before checking; carry the exact
+/// identity revision used by that check so the socket can reject a result
+/// that became stale during authorization or while waiting in the slot.
+/// Returns when the socket drops its receiver; the listener owns the inbound
+/// sender, so outbound closure ends this task and releases its subscriptions.
 pub(crate) async fn forward_authorized(
     subscriptions: &RunSubscriptions,
     mut inbound: tokio::sync::mpsc::Receiver<RunStep>,
-    outbound: tokio::sync::mpsc::Sender<RunStep>,
-    authorize: RunAuthorizer,
+    outbound: tokio::sync::mpsc::Sender<ReadyRunStep>,
+    authorize: ReadyAuthorizer,
 ) {
     loop {
         let step = tokio::select! {
@@ -252,7 +256,7 @@ pub(crate) async fn forward_authorized(
             set_pending_loss(&subscriptions.0, &step);
             continue;
         };
-        let allowed = tokio::select! {
+        let (revision, allowed) = tokio::select! {
             allowed = authorize(step.clone()) => allowed,
             _ = outbound.closed() => break,
         };
@@ -263,7 +267,7 @@ pub(crate) async fn forward_authorized(
             continue;
         }
         flush_pending_loss(&subscriptions.0, &step);
-        permit.send(step);
+        permit.send(ReadyRunStep { revision, step });
     }
     if outbound.is_closed() { subscriptions.clear(); }
 }
@@ -522,7 +526,7 @@ mod tests {
             let task = spawn_forwarder(s.clone(), inbound, tx, Arc::new(move |_| {
                 let allowed = reader.load(Ordering::Relaxed);
                 let check = check.clone();
-                Box::pin(async move { check.notify_one(); allowed })
+                Box::pin(async move { check.notify_one(); (0, allowed) })
             }));
             let permits = s.0.limits.authorization.clone().acquire_many_owned(RUN_GLOBAL_AUTH_CAP as u32).await.unwrap();
             publish_step(home.path(), "a", "run", "Read", "started");
@@ -547,6 +551,41 @@ mod tests {
             drop(rx);
             task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_forwarder_keeps_authorizing_revision_during_handover() {
+        let home = tempfile::tempdir().unwrap();
+        let (subscriptions, inbound) = RunSubscriptions::new(home.path());
+        subscriptions.update(RunSelector::Run("run".into()), true).unwrap();
+        let (identity, current) = tokio::sync::watch::channel((0u64, true));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let checked = entered.clone();
+        let resume = release.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let task = spawn_forwarder(subscriptions, inbound, tx, Arc::new(move |_| {
+            // Capture the decision and its revision before the async check.
+            let snapshot = *current.borrow();
+            let checked = checked.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                checked.notify_one();
+                resume.notified().await;
+                snapshot
+            })
+        }));
+        for revision in 0..2 {
+            publish_step(home.path(), "sales", "run", "Read", "started");
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await.unwrap();
+            identity.send_replace((revision + 1, true));
+            release.notify_one();
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(ready.revision, revision, "handover must not relabel an in-flight authorization");
+            assert_eq!(ready.step.run_id, "run");
+        }
+        drop(rx);
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -593,7 +632,7 @@ mod tests {
         let forwarder = s.clone();
         let task = tokio::spawn(async move {
             forward_authorized(&forwarder, inbound, tx, Arc::new(move |_step| {
-                Box::pin(async move { true })
+                Box::pin(async move { (0, true) })
             }))
             .await;
         });
