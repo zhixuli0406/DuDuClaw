@@ -8116,7 +8116,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     } else {
         (
             "127.0.0.1".to_string(),
-            duduclaw_core::DEFAULT_GATEWAY_PORT,
+            onboard_initial_gateway_port(std::env::var("DUDUCLAW_PORT").ok().as_deref()),
         )
     };
 
@@ -8588,6 +8588,36 @@ max_active_skills = 5
 
     println!();
     Ok(())
+}
+
+fn onboard_initial_gateway_port(env_port: Option<&str>) -> u16 {
+    duduclaw_core::resolve_gateway_port(env_port, None, duduclaw_core::DEFAULT_GATEWAY_PORT).0
+}
+
+#[cfg(test)]
+mod onboard_initial_gateway_port_tests {
+    use super::onboard_initial_gateway_port;
+
+    #[test]
+    fn uses_valid_environment_port() {
+        assert_eq!(onboard_initial_gateway_port(Some("18789")), 18789);
+    }
+
+    #[test]
+    fn invalid_environment_port_falls_back_to_default() {
+        assert_eq!(
+            onboard_initial_gateway_port(Some("not-a-port")),
+            duduclaw_core::DEFAULT_GATEWAY_PORT
+        );
+    }
+
+    #[test]
+    fn missing_environment_port_uses_default() {
+        assert_eq!(
+            onboard_initial_gateway_port(None),
+            duduclaw_core::DEFAULT_GATEWAY_PORT
+        );
+    }
 }
 
 /// `duduclaw run [--yes]` - Start the DuDuClaw server (gateway + dashboard).
