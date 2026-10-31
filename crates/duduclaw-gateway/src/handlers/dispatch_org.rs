@@ -589,6 +589,7 @@ impl MethodHandler {
             // the agent id is only known after resolving the run's session;
             // unknown run fails closed for non-admins.
             "runs.get" => boxed_frame(|| self.handle_runs_get(params, ctx)).await,
+            "runs.subscribe" | "runs.unsubscribe" => boxed_frame(|| self.handle_runs_subscription(params, ctx)).await,
 
             // ── WebChat session history + resume (WP3) ──────
             // Same gate as runs.list: read-only, agent-scoped, fail-closed.
@@ -675,8 +676,13 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_approval_operations(params, ctx, true)).await
             }
-            "approvals.list" => {
+            "approvals.list" | "approvals.get" => {
                 require_manager!();
+                if method == "approvals.get"
+                    && params.get("id").and_then(Value::as_str).is_none_or(|id| id.is_empty())
+                {
+                    return WsFrame::error_response("", "id is required");
+                }
                 boxed_frame(|| self.handle_approvals_list(params, ctx)).await
             }
             "approvals.decide" => {

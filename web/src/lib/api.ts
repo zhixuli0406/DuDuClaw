@@ -5537,6 +5537,8 @@ export interface ApprovalSimulation {
 }
 
 export interface ApprovalItem {
+  /** Digest of the decision payload; absent on older gateways. */
+  digest?: string | null;
   request_kind?: 'approval' | 'question' | 'invalid';
   status?: 'pending' | 'approved' | 'denied' | 'expired' | 'answered' | 'invalidated';
   answer?: unknown;
@@ -7711,10 +7713,11 @@ export const api = {
         approvals: ApprovalItem[];
         count: number;
       }>,
-    decide: (id: string, approve: boolean, reason?: string) =>
+    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string) =>
       client.call('approvals.decide', {
         id,
         approve,
+        ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
         ...(reason ? { reason } : {}),
       }) as Promise<{
         id: string;

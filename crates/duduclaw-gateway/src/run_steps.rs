@@ -111,6 +111,7 @@ pub struct RunStepRow {
 /// `std::sync::Mutex` (never held across an await) because appends happen
 /// inline in the CLI streaming loop and must stay cheap.
 pub struct RunStepStore {
+    home: Option<PathBuf>,
     conn: Mutex<Connection>,
     /// Total inserts through this handle — drives piggybacked pruning.
     insert_count: AtomicU64,
@@ -163,6 +164,7 @@ impl RunStepStore {
             let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
         }
         Ok(Self {
+            home: Some(home_dir.to_path_buf()),
             conn: Mutex::new(conn),
             insert_count: AtomicU64::new(0),
         })
@@ -173,6 +175,7 @@ impl RunStepStore {
         let conn = Connection::open_in_memory().map_err(|e| format!("open in-memory: {e}"))?;
         Self::init_schema(&conn)?;
         Ok(Self {
+            home: None,
             conn: Mutex::new(conn),
             insert_count: AtomicU64::new(0),
         })
@@ -300,6 +303,42 @@ impl RunStepStore {
                 params![agent_id, session_key, ts, kind, label, preview, seq],
             )
             .map_err(|e| format!("insert run step: {e}"))?;
+        }
+        if kind == KIND_TOOL_STEP && !session_key.starts_with("dispatch:") {
+            if let Some(home) = &self.home {
+                let user_row = crate::memory_provenance::TURN_USER_MESSAGE
+                    .try_with(|turn| turn.as_ref().map(|(seq, _)| *seq)).ok().flatten();
+                // Pin the host's invocation row. Never fall back to the latest
+                // user message: another turn can be stored while this CLI runs,
+                // and a hidden/undone turn must not attach to an older run.
+                // Open sessions.db only when a live selector already names this
+                // candidate. A subscriber still has to pass the visibility query
+                // before the step is published.
+                if let Some(row) = user_row {
+                    let candidate = format!("{session_key}#{row}");
+                    if crate::live_events::has_run_subscriber(home, &candidate) {
+                        let run_id = Connection::open_with_flags(
+                            home.join("sessions.db"),
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .ok()
+                        .and_then(|conn| {
+                            conn.query_row(
+                                "SELECT m.id FROM session_messages m JOIN sessions s ON s.id=m.session_id
+                                 WHERE m.session_id=?1 AND s.agent_id=?2 AND m.id=?3 AND m.role='user'
+                                   AND COALESCE(m.hidden,0)=0 AND m.undone_at IS NULL",
+                                params![session_key, agent_id, row],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .ok()
+                        })
+                        .map(|id| format!("{session_key}#{id}"));
+                        if let Some(run_id) = run_id {
+                            crate::live_events::publish_step(home, agent_id, &run_id, &label, "started");
+                        }
+                    }
+                }
+            }
         }
         let n = self.insert_count.fetch_add(1, Ordering::Relaxed) + 1;
         if n % PRUNE_EVERY_INSERTS == 0 {
@@ -1075,5 +1114,42 @@ mod tests {
         // Plain paths / CJK labels pass through untouched.
         assert_eq!(mask_secretish("src/lib.rs"), "src/lib.rs");
         assert_eq!(mask_secretish("正在讀取 檔案.md"), "正在讀取 檔案.md");
+    }
+}
+
+#[cfg(test)]
+mod live_step_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn channel_steps_stay_on_the_host_turn_and_never_fall_back_after_undo() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+        let (first, second) = {
+            let conn = sessions.acquire().await;
+            conn.execute("INSERT INTO sessions(id,agent_id,last_active,created_at) VALUES ('s','a','2026-10-29T00:00:00Z','2026-10-29T00:00:00Z')", []).unwrap();
+            conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','user','first','2026-10-29T00:00:00Z')", []).unwrap();
+            let first = conn.last_insert_rowid();
+            conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('s','user','second','2026-10-29T00:00:01Z')", []).unwrap();
+            (first, conn.last_insert_rowid())
+        };
+        let store = RunStepStore::open(home.path()).unwrap();
+        let (subscriptions, mut rx) = crate::live_events::RunSubscriptions::new(home.path());
+        subscriptions.update(crate::live_events::RunSelector::Run(format!("s#{first}")), true).unwrap();
+        crate::memory_provenance::TURN_USER_MESSAGE.scope(Some((first, String::new())), async {
+            store.append("a", "s", KIND_TOOL_STEP, "Read", "secret arguments", 1).unwrap();
+        }).await;
+        assert_eq!(rx.try_recv().unwrap().run_id, format!("s#{first}"));
+        assert_ne!(first, second);
+        {
+            let conn = sessions.acquire().await;
+            conn.execute("UPDATE session_messages SET hidden=1 WHERE id=?1", [first]).unwrap();
+        }
+        crate::memory_provenance::TURN_USER_MESSAGE.scope(Some((first, String::new())), async {
+            store.append("a", "s", KIND_TOOL_STEP, "Read", "secret arguments", 2).unwrap();
+        }).await;
+        assert!(rx.try_recv().is_err());
+        store.append("a", "s", KIND_TOOL_STEP, "Read", "secret arguments", 3).unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }

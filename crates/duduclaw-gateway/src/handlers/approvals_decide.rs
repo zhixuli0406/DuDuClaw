@@ -9,6 +9,32 @@ impl MethodHandler {
         params: Value,
         ctx: &UserContext,
     ) -> WsFrame {
+        let expected = match params.get("expected_digest") {
+            None => None,
+            Some(Value::String(digest)) if digest.len() == 64
+                && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {
+                let Some(id) = params.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) else {
+                    return WsFrame::error_response("", "id is required");
+                };
+                Some((id.to_owned(), digest.clone()))
+            }
+            Some(_) => return WsFrame::error_response("", "expected_digest must be a lowercase SHA-256 hex digest"),
+        };
+        crate::approval::EXPECTED_DECISION_DIGEST.scope(
+            expected,
+            crate::approval::EXPECTED_DECISION_HOME.scope(
+                self.home_dir.clone(),
+                // Keep the large decision future out of both task-local wrappers.
+                Box::pin(self.handle_approvals_decide_inner(params, ctx)),
+            ),
+        ).await
+    }
+
+    async fn handle_approvals_decide_inner(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return WsFrame::error_response("", "id is required"),
@@ -36,6 +62,16 @@ impl MethodHandler {
         if let Some(r) = &record {
             if let Err(error) = self.authorize_egress_decider(r, ctx) {
                 return WsFrame::error_response("", &error);
+            }
+            // Reject hidden-payload guesses before any digest-dependent outcome,
+            // including expired cards and specialized decision paths.
+            if params.get("expected_digest").is_some() {
+                let fresh = crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx);
+                if fresh.as_ref().map_or(true, |fresh| {
+                    super::approvals_topology_rpc::digest_hidden_by_redaction(r, fresh.is_admin())
+                }) {
+                    return WsFrame::error_response("", "expected_digest is not accepted for this approval");
+                }
             }
             if self
                 .authorize_workflow_activation_record(&r.payload, ctx)
@@ -73,21 +109,25 @@ impl MethodHandler {
             }
         }
         if let Some(rec) = record.as_ref().filter(|r| r.binding.is_some()) {
-            if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind)
-                && rec.is_stale(chrono::Utc::now())
-            {
-                let _ = broker.poll(&approval_id).await;
-                return WsFrame::error_response(
-                    "",
-                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind),
-                );
-            }
             // A-M-3 / U3: who may decide is re-derived from a fresh identity
             // read (employee access, run audience, Admin for activations).
             let decider = match Box::pin(self.authorize_bound_decider(rec, ctx)).await {
                 Ok(c) => c,
                 Err(e) => return WsFrame::error_response("", &e),
             };
+            if rec.is_stale(chrono::Utc::now()) {
+                let _ = broker.poll(&approval_id).await;
+                let error = if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind)
+                } else { "approval expired" };
+                return WsFrame::error_response("", error);
+            }
+            if rec.status != crate::approval::ApprovalStatus::Pending {
+                return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
+            }
+            if let Err(error) = crate::approval::check_expected_digest(rec) {
+                return WsFrame::error_response("", &error);
+            }
             if let Err(e) = Box::pin(broker.decide_bound_dashboard(&approval_id, &decider, approve))
                 .await
             {
@@ -103,20 +143,6 @@ impl MethodHandler {
                     "submitter_is_decider": super::approval_decider::submitter_is_decider(rec, &decider),
                 }),
             );
-        }
-        // L1: a knowledge review past its deadline is a denial (TTL = DENY),
-        // even before the expiry sweep has flipped its status — approving it
-        // would write knowledge on a card the reviewer could no longer rely on.
-        if let Some(rec) = &record {
-            if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind)
-                && rec.is_stale(chrono::Utc::now())
-            {
-                let _ = broker.poll(&approval_id).await;
-                return WsFrame::error_response(
-                    "",
-                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind),
-                );
-            }
         }
         // A proposal to add a source to a knowledge collection: decided only
         // by an Admin or the collection's editor / owner (re-read now), side
@@ -165,6 +191,8 @@ impl MethodHandler {
         // Board-kind gate (WP17 invariant).
         if let Some(rec) = &record {
             let kind = crate::governance::ApprovalKind::parse(&rec.action_kind);
+            // List, get and live push use the same per-kind split:
+            // `approval_visibility::dashboard_only_reader`.
             // U5: a request filed from an operator terminal (LINE inbox,
             // continuous responsibilities, forget by source, computer
             // workspaces) is decided only by a current Admin (role re-read
@@ -179,17 +207,49 @@ impl MethodHandler {
             }
             // Decision Lab is admin-only. A manager who cannot inspect the
             // exact synthetic run must not mint its human-inspection receipt.
-            if rec.action_kind == "support_pilot_review" && !ctx.is_admin() {
+            // Role is re-read from users.db, same as list/get/push, not the
+            // handshake snapshot.
+            if rec.action_kind == "support_pilot_review"
+                && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
+                    .is_err()
+            {
                 return WsFrame::error_response(
                     "",
                     "synthetic pilot review requires an admin who can inspect Decision Lab",
                 );
             }
-            if kind.requires_board() && !ctx.is_admin() {
+            if kind.requires_board()
+                && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
+                    .is_err()
+            {
                 return WsFrame::error_response(
                     "",
                     "this approval kind requires board (admin) rights to decide",
                 );
+            }
+        }
+        // L1: a knowledge review past its deadline is a denial (TTL = DENY),
+        // even before the expiry sweep has flipped its status — approving it
+        // would write knowledge on a card the reviewer could no longer rely on.
+        if let Some(rec) = record.as_ref().filter(|r| r.action_kind != "discovery") {
+            if rec.is_stale(chrono::Utc::now()) {
+                let _ = broker.poll(&approval_id).await;
+                let error = if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind)
+                } else { "approval expired" };
+                return WsFrame::error_response("", error);
+            }
+        }
+        if let Some(rec) = record.as_ref().filter(|r| r.action_kind != "discovery") {
+            if rec.status != crate::approval::ApprovalStatus::Pending {
+                return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
+            }
+        }
+        // Specialized paths check after their own authorization, before writes.
+        // The broker also rechecks inside its decision transaction.
+        if let Some(rec) = record.as_ref().filter(|r| r.action_kind != "discovery") {
+            if let Err(error) = crate::approval::check_expected_digest(rec) {
+                return WsFrame::error_response("", &error);
             }
         }
         if record
@@ -435,6 +495,9 @@ impl MethodHandler {
         if rec.is_stale(chrono::Utc::now()) {
             let _ = broker.poll(approval_id).await;
             return WsFrame::error_response("", "這則知識審核已逾期，已自動捨棄，無法再核准。");
+        }
+        if let Err(error) = crate::approval::check_expected_digest(rec) {
+            return WsFrame::error_response("", &error);
         }
         let memory_db = rec
             .payload
@@ -785,5 +848,138 @@ fn take_forced_decide_failure(id: &str) -> Option<String> {
     match g.as_ref() {
         Some((i, _)) if i == id => g.take().map(|(_, e)| e),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approvals_decide_keeps_scoped_inner_future_on_heap() {
+        // Inspect future types without constructing a handler or polling a future.
+        fn future_size<F: std::future::Future>(
+            _: impl FnOnce(&'static MethodHandler, &'static UserContext) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+
+        let inner = future_size(|handler, ctx| {
+            handler.handle_approvals_decide_inner(Value::Null, ctx)
+        });
+        let inline_scopes = future_size(|handler, ctx| {
+            crate::approval::EXPECTED_DECISION_DIGEST.scope(
+                None,
+                crate::approval::EXPECTED_DECISION_HOME.scope(
+                    handler.home_dir.clone(),
+                    handler.handle_approvals_decide_inner(Value::Null, ctx),
+                ),
+            )
+        });
+        let wrapper = future_size(|handler, ctx| {
+            handler.handle_approvals_decide(Value::Null, ctx)
+        });
+        eprintln!("approvals.decide future bytes: inner={inner}, inline_scopes={inline_scopes}, wrapper={wrapper}");
+        assert!(
+            wrapper < inner,
+            "the task-local wrapper must not embed the decision future: wrapper={wrapper}, inner={inner}"
+        );
+    }
+
+    fn refusal(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { ok: false, error: Some(Value::String(text)), .. } => text.clone(),
+            other => panic!("expected an error response, got {other:?}"),
+        }
+    }
+
+    /// Handshake still says Admin. The users.db row is what decide must read.
+    fn claiming_admin(user: &duduclaw_auth::User) -> UserContext {
+        let mut ctx = UserContext::admin_fallback();
+        ctx.user_id = user.id.clone();
+        ctx.email = user.email.clone();
+        ctx.role = UserRole::Admin;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn demoted_or_suspended_admin_cannot_decide_board_or_pilot_cards() {
+        let home = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db
+            .create_user("ada@example.com", "Ada", "fixture-password-only", UserRole::Admin)
+            .unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = claiming_admin(&user);
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let board = broker
+            .request("sales", "strategic_plan", "review", json!({}), 300)
+            .await
+            .unwrap();
+        let pilot = broker
+            .request("sales", "support_pilot_review", "review", json!({}), 300)
+            .await
+            .unwrap();
+
+        db.update_user(&user.id, None, Some(UserRole::Manager), None).unwrap();
+        let board_frame = handler
+            .handle_approvals_decide(json!({"id": board.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &ctx)
+            .await;
+        let pilot_frame = handler
+            .handle_approvals_decide(json!({"id": pilot.as_str(), "approve": true}), &ctx)
+            .await;
+        assert_eq!(refusal(&board_frame), "this approval kind requires board (admin) rights to decide");
+        assert_eq!(
+            refusal(&pilot_frame),
+            "synthetic pilot review requires an admin who can inspect Decision Lab"
+        );
+        assert_eq!(
+            broker.get(&board).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Pending
+        );
+        assert_eq!(
+            broker.get(&pilot).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Pending
+        );
+
+        db.update_user(&user.id, None, Some(UserRole::Admin), None).unwrap();
+        db.set_user_status(&user.id, duduclaw_auth::UserStatus::Suspended).unwrap();
+        let board_frame = handler
+            .handle_approvals_decide(json!({"id": board.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &ctx)
+            .await;
+        let pilot_frame = handler
+            .handle_approvals_decide(json!({"id": pilot.as_str(), "approve": true}), &ctx)
+            .await;
+        assert_eq!(refusal(&board_frame), "expected_digest is not accepted for this approval");
+        assert_eq!(
+            refusal(&pilot_frame),
+            "synthetic pilot review requires an admin who can inspect Decision Lab"
+        );
+        assert_eq!(
+            broker.get(&board).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Pending
+        );
+        assert_eq!(
+            broker.get(&pilot).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Pending
+        );
+
+        db.set_user_status(&user.id, duduclaw_auth::UserStatus::Active).unwrap();
+        let board_frame = handler
+            .handle_approvals_decide(json!({"id": board.as_str(), "approve": true}), &ctx)
+            .await;
+        let pilot_frame = handler
+            .handle_approvals_decide(json!({"id": pilot.as_str(), "approve": true}), &ctx)
+            .await;
+        assert!(matches!(board_frame, WsFrame::Response { ok: true, .. }), "{board_frame:?}");
+        assert!(matches!(pilot_frame, WsFrame::Response { ok: true, .. }), "{pilot_frame:?}");
+        assert_eq!(
+            broker.get(&board).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Approved
+        );
+        assert_eq!(
+            broker.get(&pilot).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Approved
+        );
     }
 }

@@ -385,6 +385,9 @@ impl MethodHandler {
             fa::remove_sidecar(&self.home_dir, approval_id.as_str());
             return WsFrame::error_response("", crate::approval_notify::dashboard_only_expired_text(fa::ACTION_KIND));
         }
+        if let Err(error) = crate::approval::check_expected_digest(&rec) {
+            return WsFrame::error_response("", &error);
+        }
         let decided_by = format!("dashboard:{}", ctx.user_id);
         if !approve {
             if let Err(e) = broker.decide(approval_id, false, &decided_by).await {

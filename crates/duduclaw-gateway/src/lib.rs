@@ -633,3 +633,5 @@ pub mod credential_ledger;
 pub mod credential_declaration;
 
 mod egress_registry;
+
+pub(crate) mod live_events;

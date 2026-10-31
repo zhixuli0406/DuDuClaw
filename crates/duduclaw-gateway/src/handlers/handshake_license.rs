@@ -18,7 +18,7 @@ impl MethodHandler {
             .unwrap_or("unknown");
         WsFrame::ok_response(
             "",
-            json!({ "version": crate::updater::current_version(), "client_version": version, "status": "connected" }),
+            json!({ "version": crate::updater::current_version(), "client_version": version, "status": "connected", "boot_id": crate::live_events::boot_id() }),
         )
     }
 

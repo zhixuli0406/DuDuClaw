@@ -120,6 +120,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [rfc/RFC-24-decision-continuity.md](rfc/RFC-24-decision-continuity.md) | Cross-session decision/proposal durability (fixes session-chain breakage) |
 | [rfc/RFC-26-deep-agents-alignment.md](rfc/RFC-26-deep-agents-alignment.md) | Deep-agents / live-forking alignment |
 | [rfc/RFC-27-personal-edition-concurrency-cap.md](rfc/RFC-27-personal-edition-concurrency-cap.md) | Personal-edition concurrency cap — cross-process limit on in-flight goal dispatches |
+| [rfc/RFC-28-duduclaw-tui.md](rfc/RFC-28-duduclaw-tui.md) | DuDuClaw control room (`duduclaw tui`) — terminal client for autonomous employees, autonomy pause, live events |
 | [adr/ADR-002-x-duduclaw-capability-negotiation.md](adr/ADR-002-x-duduclaw-capability-negotiation.md) | ACP capability negotiation decision |
 | [adr/ADR-003-excluded-channels.md](adr/ADR-003-excluded-channels.md) | Excluded channels (Signal / personal WeChat / Viber) |
 | [adr/ADR-004-erp-connector-abstraction.md](adr/ADR-004-erp-connector-abstraction.md) | ERP connector abstraction (`trait ErpConnector`) |

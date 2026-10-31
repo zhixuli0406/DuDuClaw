@@ -415,3 +415,66 @@ async fn feedback_citing_different_gaps_keeps_retrying() {
         "citations to different gaps must keep retrying"
     );
 }
+
+#[tokio::test]
+async fn escalation_pushes_only_pause_enum_and_identifiers_without_autopilot_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    let mut task = goal_task("live-goal", "alice");
+    task.title = "SECRET TITLE".into();
+    store.insert_task(&task).await.unwrap();
+    let d = driver(store, queue, small_cfg()).with_home_dir(dir.path().to_path_buf());
+    let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+    crate::dashboard_feedback::register_live_sender(dir.path(), tx);
+    d.escalate(&mut HashMap::new(), &task, "SECRET REASON",
+        crate::pause_reason::PauseReason::Infra).await.unwrap();
+    let line = rx.try_recv().unwrap();
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(event["event"], "task.needs_human");
+    assert_eq!(event["payload"]["task_id"], "live-goal");
+    assert_eq!(event["payload"]["pause_reason"], "infra");
+    assert!(!line.contains("SECRET"));
+    assert!(!dir.path().join("events.db").exists());
+}
+
+#[tokio::test]
+async fn goal_enqueue_does_not_pretend_the_runtime_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    store.insert_task(&goal_task("live-round", "alice")).await.unwrap();
+    let d = driver(store, queue.clone(), small_cfg()).with_home_dir(dir.path().to_path_buf());
+    let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+    crate::dashboard_feedback::register_live_sender(dir.path(), tx);
+    d.tick_once().await.unwrap();
+    let mut names = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        names.push(event["event"].as_str().unwrap().to_string());
+    }
+    assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
+    assert!(!names.iter().any(|name| name == "goal.round_started"));
+    assert!(!names.iter().any(|name| name == "task.updated"));
+}
+
+#[tokio::test]
+async fn runtime_round_boundaries_close_on_cancellation_and_team_roles_do_not_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+    crate::dashboard_feedback::register_live_sender(dir.path(), tx);
+    let outer = LiveRuntimeRound::start(dir.path(), "alice", "goal-1");
+    TEAM_LIVE_ROUND.scope(true, async {
+        let role = crate::dashboard_feedback::LiveTurn::start(dir.path(), "member",
+            Some("goal-1"), "goal", "codex");
+        drop(role);
+    }).await;
+    drop(outer);
+    let mut names = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        names.push(event["event"].as_str().unwrap().to_string());
+    }
+    assert_eq!(names.iter().filter(|name| *name == "goal.round_started").count(), 1);
+    assert_eq!(names.iter().filter(|name| *name == "goal.round_finished").count(), 1);
+    assert!(names.iter().any(|name| name == "agent.turn_started"));
+    assert!(names.iter().any(|name| name == "agent.turn_finished"));
+}

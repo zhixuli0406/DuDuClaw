@@ -177,6 +177,7 @@ impl GoalLoopDriver {
                 "done" => {
                     let handled = match &task_opt {
                         Some(t) => {
+                            self.emit_goal_event("goal.done", t);
                             self.push_progress(t, "done", crate::goal_notify::GoalProgress::Done)
                                 .await
                         }
@@ -206,6 +207,11 @@ impl GoalLoopDriver {
                 // needs_human) — no longer the driver's dispatch concern.
                 // needs_human progress is pushed by reconcile_needs_human.
                 _ => {
+                    if let Some(t) = &task_opt {
+                        if t.status == "failed" {
+                            self.emit_goal_event("goal.failed", t);
+                        }
+                    }
                     if let Some(removed) = inflight.remove(&id) {
                         self.release_lease(&removed); // RFC-27: free the slot
                     }

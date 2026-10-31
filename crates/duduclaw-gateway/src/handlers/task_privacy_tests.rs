@@ -4,16 +4,16 @@
 use super::*;
 use duduclaw_auth::UserStatus;
 
-pub(super) const PRIVATE: &str = "private-task";
-pub(super) const OPEN: &str = "open-task";
+pub(in crate::handlers) const PRIVATE: &str = "private-task";
+pub(in crate::handlers) const OPEN: &str = "open-task";
 
-pub(super) struct Fixture {
-    pub(super) _home: tempfile::TempDir,
-    pub(super) home: PathBuf,
-    pub(super) handler: MethodHandler,
-    pub(super) db: UserDb,
-    pub(super) alice: UserContext,
-    pub(super) bob: UserContext,
+pub(in crate::handlers) struct Fixture {
+    pub(in crate::handlers) _home: tempfile::TempDir,
+    pub(in crate::handlers) home: PathBuf,
+    pub(in crate::handlers) handler: MethodHandler,
+    pub(in crate::handlers) db: UserDb,
+    pub(in crate::handlers) alice: UserContext,
+    pub(in crate::handlers) bob: UserContext,
 }
 
 fn cached(user: &duduclaw_auth::User, level: AccessLevel) -> UserContext {
@@ -25,7 +25,7 @@ fn cached(user: &duduclaw_auth::User, level: AccessLevel) -> UserContext {
     ctx
 }
 
-pub(super) async fn fixture() -> Fixture {
+pub(in crate::handlers) async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
     std::fs::create_dir_all(home.join("agents/sales")).unwrap();
@@ -93,14 +93,14 @@ pub(super) async fn fixture() -> Fixture {
     }
 }
 
-pub(super) fn denied(frame: &WsFrame) -> bool {
+pub(in crate::handlers) fn denied(frame: &WsFrame) -> bool {
     matches!(frame, WsFrame::Response { ok: false, payload: None, error: Some(e), .. }
         if e == PERMISSION_DENIED)
 }
-pub(super) fn ok(frame: &WsFrame) -> bool {
+pub(in crate::handlers) fn ok(frame: &WsFrame) -> bool {
     matches!(frame, WsFrame::Response { ok: true, .. })
 }
-pub(super) fn payload(frame: WsFrame) -> Value {
+pub(in crate::handlers) fn payload(frame: WsFrame) -> Value {
     match frame {
         WsFrame::Response {
             payload: Some(p), ..
@@ -339,7 +339,7 @@ async fn timeline_forward_and_approval_cards_follow_the_task_gate() {
 
 // ── F3 follow-up: AI-written audiences cannot lock out admins or people ──
 
-pub(super) fn set_packet(f: &Fixture, raw: &str) {
+pub(in crate::handlers) fn set_packet(f: &Fixture, raw: &str) {
     let dir = f
         .home
         .join(duduclaw_core::task_packet::TEAM_PACKETS_DIR)
@@ -347,7 +347,7 @@ pub(super) fn set_packet(f: &Fixture, raw: &str) {
         .join("1");
     std::fs::write(dir.join("p.json"), raw).unwrap();
 }
-pub(super) fn packet_with(audience: &[&str]) -> String {
+pub(in crate::handlers) fn packet_with(audience: &[&str]) -> String {
     json!({
         "packet_id": "p", "goal_id": PRIVATE, "round": 1,
         "from_role": "executor", "to_role": "verifier",
@@ -356,7 +356,7 @@ pub(super) fn packet_with(audience: &[&str]) -> String {
     })
     .to_string()
 }
-pub(super) fn admin(f: &Fixture) -> UserContext {
+pub(in crate::handlers) fn admin(f: &Fixture) -> UserContext {
     let u =
         f.db.create_user(
             "root@test.invalid",

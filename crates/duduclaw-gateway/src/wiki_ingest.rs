@@ -2807,7 +2807,7 @@ pub struct ErasedReviewScrub {
     pub withdrawn: usize,
     /// Review cards (any status) whose text was replaced.
     pub scrubbed: usize,
-    /// `knowledge.quarantined` events.db rows deleted.
+    /// Matching knowledge and approval lifecycle events.db rows deleted.
     pub events_deleted: usize,
 }
 
@@ -2824,8 +2824,8 @@ const ERASED_CARD_TEXT: &str = "（內容已依資料刪除請求移除）";
 
 /// Forget-by-source follow-up (P2-B step `review_scrub`): every review card
 /// covering one of `forgotten_ids` is withdrawn when pending and has its
-/// text replaced in any status; matching `knowledge.quarantined` events.db
-/// rows are deleted. Idempotent.
+/// text replaced in any status; matching `knowledge.quarantined` and approval
+/// lifecycle events.db rows are deleted. Idempotent.
 pub async fn scrub_review_store_for_forgotten(
     home_dir: &Path,
     forgotten_ids: &[String],
@@ -2843,7 +2843,7 @@ pub async fn scrub_review_store_for_forgotten(
     .await?;
     let events = crate::events_store::EventBusStore::open(home_dir)
         .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
-    out.events_deleted = events
+    out.events_deleted += events
         .delete_by_quarantined_ids("knowledge.quarantined", &ids)
         .await?;
     Ok(out)
@@ -2879,6 +2879,7 @@ fn card_quarantined_ids(rec: &crate::approval::ApprovalRecord) -> Vec<String> {
 /// (system deny, `decided_by = system:gdpr_erase`), every such card of any
 /// status has its summary and text fields replaced, and every
 /// `knowledge.quarantined` events.db row listing an erased id is deleted.
+/// Approval lifecycle events naming each matching card are deleted too.
 /// `knowledge.quarantined` rows that carry no ids (injection drops, blocked
 /// pages) cannot be matched by id and stay until the events.db retention
 /// prune (7 days).
@@ -2903,7 +2904,7 @@ pub async fn scrub_review_store_for_erased(
     .await?;
     let events = crate::events_store::EventBusStore::open(home_dir)
         .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
-    out.events_deleted = events
+    out.events_deleted += events
         .delete_by_quarantined_ids("knowledge.quarantined", &erased)
         .await?;
     Ok(out)
@@ -2926,7 +2927,7 @@ pub async fn scrub_review_store_for_contact(
     .await?;
     let events = crate::events_store::EventBusStore::open(home_dir)
         .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
-    out.events_deleted = events
+    out.events_deleted += events
         .delete_by_payload_subject("knowledge.quarantined", contact)
         .await?;
     Ok(out)
@@ -2964,6 +2965,11 @@ async fn scrub_cards(
         {
             out.withdrawn += 1;
         }
+        // Withdraw emits approval.decided. Scrub that and earlier lifecycle
+        // events before replacing the subject, so a failed deletion remains
+        // retryable by contact as well as by the retained quarantined ids.
+        let events = crate::events_store::EventBusStore::open(home_dir)?;
+        out.events_deleted += events.delete_approval_lifecycle(rec.id.as_str()).await?;
         let payload = serde_json::json!({
             "agent_id": rec.payload.get("agent_id").cloned().unwrap_or_default(),
             "memory_db": rec.payload.get("memory_db").cloned().unwrap_or_default(),
@@ -5114,7 +5120,7 @@ mod tests {
         let out = scrub_review_store_for_erased(home.path(), &summary.erased_memory_ids)
             .await
             .unwrap();
-        assert_eq!((out.withdrawn, out.scrubbed, out.events_deleted), (1, 1, 1));
+        assert_eq!((out.withdrawn, out.scrubbed, out.events_deleted), (1, 1, 3));
         assert!(pending_quarantine_cards(home.path()).await.is_empty());
         let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
         let rec = broker.list_by_kind(ACTION_KIND_KNOWLEDGE_QUARANTINE).await.unwrap().remove(0);
@@ -5125,6 +5131,11 @@ mod tests {
             assert!(!dump.contains(leaked), "{leaked} survived: {dump}");
         }
         let events = crate::events_store::EventBusStore::open(home.path()).unwrap();
+        assert!(events.fetch_since(0, 100).await.unwrap().is_empty());
+        let retry = scrub_review_store_for_forgotten(home.path(), &summary.erased_memory_ids)
+            .await.unwrap();
+        assert_eq!(retry.withdrawn, 0);
+        assert_eq!(retry.events_deleted, 0);
         assert!(events.fetch_since(0, 100).await.unwrap().is_empty());
     }
 
@@ -5212,10 +5223,21 @@ mod tests {
         let out = scrub_review_store_after_erase(home.path(), &again.erased_memory_ids, "user:alice")
             .await
             .unwrap();
-        assert_eq!((out.withdrawn, out.scrubbed, out.events_deleted), (1, 1, 1));
+        assert_eq!((out.withdrawn, out.scrubbed, out.events_deleted), (1, 1, 3));
         let pending = pending_quarantine_cards(home.path()).await;
         assert_eq!(pending.len(), 1, "alice2's card untouched");
         assert_eq!(pending[0].payload["subject"], "user:alice2");
+        let events = crate::events_store::EventBusStore::open(home.path()).unwrap();
+        let remaining = events.fetch_since(0, 100).await.unwrap();
+        assert_eq!(remaining.len(), 2, "alice2's knowledge and approval events remain");
+        let approval = remaining.iter().find(|row| row.event == "approval.created").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&approval.payload).unwrap();
+        assert_eq!(payload["id"], pending[0].id.as_str());
+        assert!(remaining.iter().all(|row| row.event != "approval.decided"));
+        let retry = scrub_review_store_after_erase(home.path(), &[], "user:alice")
+            .await.unwrap();
+        assert_eq!(retry.events_deleted, 0);
+        assert_eq!(events.fetch_since(0, 100).await.unwrap().len(), 2);
     }
 
     /// Item 5: a release-converted row too long for a card is audited like the

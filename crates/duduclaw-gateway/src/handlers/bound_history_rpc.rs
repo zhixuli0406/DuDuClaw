@@ -4,14 +4,19 @@ use super::*;
 use crate::history_privacy::{self as privacy, Class, Mode, handles, read};
 use crate::team_history::{audit, limits, mask};
 
+/// Fresh dashboard identity for a history read. Missing, unreadable or
+/// password-change accounts are the same refusal as a missing session.
+pub(crate) fn live_bound_reader(home: &Path, ctx: &UserContext) -> Result<UserContext, String> {
+    let live = task_privacy::live_reader_context(home, ctx).map_err(|_| "session not found")?;
+    if live.requires_password_change() {
+        return Err("session not found".into());
+    }
+    Ok(live)
+}
+
 impl MethodHandler {
     pub(super) fn bound_history_live(&self, ctx: &UserContext) -> Result<UserContext, String> {
-        let live = task_privacy::live_reader_context(&self.home_dir, ctx)
-            .map_err(|_| "session not found")?;
-        if live.requires_password_change() {
-            return Err("session not found".into());
-        }
-        Ok(live)
+        live_bound_reader(&self.home_dir, ctx)
     }
 
     pub(super) fn bound_history_recheck(

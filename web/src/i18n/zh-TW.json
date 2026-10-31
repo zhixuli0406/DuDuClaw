@@ -1,4 +1,5 @@
 {
+  "liveEvents.stale": "資料可能已過時",
   "googleDataDisclosure.title": "連接 Google 前請先確認",
   "googleDataDisclosure.access": "DuDuClaw 會使用你授權的 Google 資料（Gmail、日曆、雲端硬碟、文件、試算表、簡報、表單、Tasks 與帳戶電子郵件），提供你要求的 Google 功能。",
   "googleDataDisclosure.storage": "憑證會加密保存在本機，只傳送至 Google。任務資料可能送至你設定的 AI 服務供應商；Google 資料也可能保存在本機對話、記憶、知識、任務、工具／runtime 紀錄與備份。中斷連線只會刪除憑證，不會刪除既有內容。",

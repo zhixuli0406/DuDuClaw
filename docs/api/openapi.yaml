@@ -29,6 +29,46 @@ info:
     2. Sign the challenge with your Ed25519 private key.
     3. Send `connect` with the signed response and your client version.
 
+    ## Live events (2026-10-29)
+
+    The current dashboard protocol uses WsFrame envelopes:
+    `{"type":"req","id":"1","method":"runs.subscribe","params":{"run_id":"dispatch:42"}}`,
+    `{"type":"res","id":"1","ok":true,"payload":{...}}`, and
+    `{"type":"event","event":"agent.turn_started","payload":{...},"seq":1,"boot_id":"..."}`.
+    `seq` is a per-connection u64 starting at 1 after push authorization filtering.
+    `boot_id` is an additive optional field on events and successful connect payloads.
+    The general broadcast capacity is 1024; lag sends `events_lost` with an empty
+    payload. On loss, reconnect or changed boot_id, refetch existing list RPCs.
+    No replay buffer or snapshot method exists. Duplicate invalidations are allowed.
+
+    Live names: agent.turn_started, agent.turn_finished, agent.status_changed,
+    task.created, task.updated, task.needs_human, goal.round_started,
+    goal.round_finished, goal.done, goal.failed, approval.created,
+    approval.decided, approval.expired, budget.breaker_open, autopilot.breaker_open.
+    Agent events require employee access, task/goal events require task audience,
+    approval events require Manager plus the per-kind card audience
+    (knowledge_add_source: Admin or a collection editor/owner; operator-CLI,
+    workflow activation, agent file, support pilot and board kinds: Admin;
+    knowledge quarantine and expert-skills enable: employee Viewer),
+    and breakers/unknown names require Admin. run.step is never broadcast: it uses
+    an explicitly subscribed connection queue and the runs.get content gates.
+    Payloads are identifiers, enums and compact labels, not prompts/tool arguments.
+    agent.turn_started/finished payloads contain only agent_id, source and runtime;
+    they never include session_id or task_id. source is one of channel, goal, cron,
+    heartbeat, responsibility, assign or autopilot.
+    Bridged task/approval/status metadata is rebuilt from authoritative stores.
+    Legacy cron.changed/memory.changed/skill.changed/channel_config.changed
+    bridge payloads are pure invalidations: only a validated agent_id, or an
+    empty object. Entity labels, subjects and content are never forwarded.
+    Dashboard bridge payloads are limited to 8192 bytes before parsing, coalesced
+    by event/entity, and capped at 64 authoritative projections per poll. Invalid
+    or missing ids do not consume that delivery budget. A separate 256-row cap
+    bounds parsing and lookups. Byte/work/delivery cap drops advance the cursor
+    and send one empty events_lost per tick; tasks, agents and inbox stores refetch.
+    Only inbox counts have a five-minute periodic fallback; tasks and agents do not.
+    Web invalidation reads use a 2-second minimum interval
+    with leading/trailing refresh and exponential error backoff up to 60 seconds.
+
     ## Method Categories
 
     | Prefix | Description |
@@ -1935,6 +1975,111 @@ paths:
       responses:
         "200":
           description: Freshly-probed model list (same shape as models.list)
+
+  /rpc/runs.subscribe:
+    post:
+      tags: [runs]
+      summary: Subscribe this connection to compact run.step notifications
+      description: |
+        An exact run_id is required; agent-wide selectors are not supported.
+        At most 16 selectors per connection,
+        20 subscription commands per second (one in flight), 20 steps per second.
+        Every step checks current run read authority before enqueue and again
+        before delivery, including task audience and history privacy;
+        filtered history omits steps. Unauthorized steps never enter the queue,
+        set loss state or consume delivery rate. Authorized queue or rate overflow
+        sends events_lost. At most 4 authorization checks run per connection;
+        candidates arriving while all checks are busy are silently discarded
+        without events_lost. Refresh runs.get to reconcile; step order may vary.
+        Only Claude emits live steps: channel starts at persistence, dispatch
+        finished steps in a batch after run recording. Dispatch run ids are
+        allocated only then, so clients generally cannot subscribe before that
+        batch; use runs.get for dispatch history. Disconnect unsubscribes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [run_id]
+              properties:
+                run_id: {type: string, minLength: 1, maxLength: 512}
+      responses:
+        "200":
+          description: Subscription acknowledged, or a permission/cap/rate error frame
+
+  /rpc/runs.unsubscribe:
+    post:
+      tags: [runs]
+      summary: Remove an exact run selector from this connection
+      description: Same selector format and authorization as runs.subscribe. Idempotent.
+      requestBody:
+        $ref: "#/paths/~1rpc~1runs.subscribe/post/requestBody"
+      responses:
+        "200":
+          description: Subscription removed, or an error frame
+
+  /rpc/approvals.list:
+    post:
+      tags: [approvals]
+      summary: Read visible approval cards with optimistic decision digests
+      description: |
+        Returns {approvals, count}. Same visibility as the live approval
+        invalidation: current Manager (a pending password change denies).
+        knowledge_add_source requires Admin or a current collection
+        editor/owner. Operator-CLI kinds, workflow activation, agent file
+        changes, support pilot review and board kinds require a current Admin.
+        knowledge quarantine and expert-skills enable require employee Viewer.
+        The workflow-activation snapshot and unbound task audience still apply.
+        Cards include digest,
+        null when decision material is withheld. See the Task Board feature page
+        for canonical digest fields (including workflow activation pricing).
+      responses:
+        "200":
+          description: Visible approval cards
+
+  /rpc/approvals.get:
+    post:
+      tags: [approvals]
+      summary: Read one approval using the same envelope and visibility as list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: {type: string, minLength: 1}
+      responses:
+        "200":
+          description: "{approvals, count}; invisible or missing cards give an empty list"
+
+  /rpc/approvals.decide:
+    post:
+      tags: [approvals]
+      summary: Decide an approval, optionally checking the displayed card digest
+      description: |
+        expected_digest is the card's digest: lowercase SHA-256 of recursive
+        sorted-key compact UTF-8 JSON with array order preserved. A mismatch
+        rejects the decision and asks for a refetch; omission preserves behavior.
+        The stored approval is checked again in the decision write transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, approve]
+              properties:
+                id: {type: string, minLength: 1}
+                approve: {type: boolean}
+                reason: {type: string}
+                expected_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+      responses:
+        "200":
+          description: Decision result or permission/digest error frame
 
   # ── Logs ─────────────────────────────────────────────────────
 

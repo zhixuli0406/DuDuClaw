@@ -1556,6 +1556,11 @@ pub(super) async fn build_reply_with_session_inner(
         crate::task_sandbox::HostAction::RanOnHost,
     );
 
+    let _live_turn = crate::dashboard_feedback::LiveTurn::start(
+        &ctx.home_dir, &agent_id, None, "channel",
+        runtime_settings.as_ref().map(|s| s.provider.as_str()).unwrap_or("claude"),
+    );
+
     let cli_future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ReplyAttempt, ReplyFailure>> + Send + '_>,
     > = if duduclaw_llm::is_moa_model_id(&model) {

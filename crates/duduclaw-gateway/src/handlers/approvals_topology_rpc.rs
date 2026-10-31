@@ -34,10 +34,17 @@ impl MethodHandler {
             broker.list_pending(agent_filter).await
         };
         // A-M-3: rows are filtered by the viewer's live role and employee
-        // bindings, not by the session's claims.
-        let fresh = match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
-            Ok(c) => c,
-            Err(_) => return WsFrame::error_response("", "permission denied"),
+        // bindings, not by the session's claims. One identity read per request.
+        let (fresh, department) = {
+            let (home, session) = (self.home_dir.clone(), ctx.clone());
+            match tokio::task::spawn_blocking(move || {
+                super::approval_visibility::fresh_reader(&home, &session)
+            })
+            .await
+            {
+                Ok(Some(reader)) => reader,
+                _ => return WsFrame::error_response("", "permission denied"),
+            }
         };
         match rows {
             Ok(rows) => {
@@ -46,32 +53,14 @@ impl MethodHandler {
                     .iter()
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                 {
-                    // Add-source cards (title, collection, preview) only to
-                    // whoever may decide them: an Admin or an editor of
-                    // that collection, re-read now. Everything else keeps
-                    // the employee-access rule.
-                    if r.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
-                        if !self.may_decide_knowledge_card(r, &fresh).await {
-                            continue;
-                        }
-                    } else if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer) {
-                        continue;
-                    }
-                    if self.authorize_workflow_activation_record(&r.payload,&fresh).await.is_err(){continue;}
-                    // Cards built from a task (goal kickoff, task-triggered
-                    // automation) carry its text: same task gate as the
-                    // task's own RPCs. Bound cards (workflow steps) have their
-                    // own gate: employee access and run audience decide, and
-                    // the binding is withheld from anyone else below.
-                    if let Some(task_id) = approval_task_ref(&r.payload).filter(|_| r.binding.is_none()) {
-                        let visible = task_owner_readonly(&self.home_dir, &task_id)
-                            .is_some_and(|owner| {
-                                task_content_visible(&self.home_dir, &fresh, &task_id, &owner)
-                            });
-                        if !visible {
-                            continue;
-                        }
-                    }
+                    let (home, record) = (self.home_dir.clone(), r.clone());
+                    let visibility = match tokio::task::spawn_blocking(move || {
+                        super::approval_visibility::ApprovalVisibility::load(&home, &record)
+                    }).await {
+                        Ok(visibility) => visibility,
+                        Err(_) => continue,
+                    };
+                    if !visibility.may_read(r, &fresh, department.as_deref()) { continue; }
                     // Binding data and question answers go only to a viewer
                     // who may decide this card.
                     let may_decide = self.authorize_egress_decider(r, &fresh).is_ok()
@@ -132,8 +121,14 @@ impl MethodHandler {
                             }
                             _ => None,
                         };
+                    let activation_facts = if activation && may_decide {
+                        super::approval_decider::activation_facts(&self.home_dir, r)
+                    } else {
+                        Value::Null
+                    };
                     items.push(json!({
                         "id": r.id.as_str(),
+                        "digest": viewer_digest(r, &activation_facts, fresh.is_admin(), may_decide),
                         "agent_id": r.agent_id,
                         "kind": kind.as_str(),
                         "summary": r.summary,
@@ -152,11 +147,7 @@ impl MethodHandler {
                             && super::approval_decider::submitter_is_decider(r, &fresh),
                         // A-H-1: what an Admin accepts — each effect and the
                         // one record it may change.
-                        "workflow_activation": if activation && may_decide {
-                            super::approval_decider::activation_facts(&self.home_dir, r)
-                        } else {
-                            Value::Null
-                        },
+                        "workflow_activation": activation_facts,
                         "invalidated_reason":r.invalidated_reason,
                         "created_at": r.created_at,
                         "ttl_seconds": r.ttl_seconds,
@@ -265,31 +256,214 @@ impl MethodHandler {
     }
 }
 
-impl MethodHandler {
-    /// Whether `fresh` may decide this knowledge add-source card (Admin or
-    /// an editor of its collection); `false` for every other kind.
-    async fn may_decide_knowledge_card(
-        &self,
-        r: &crate::approval::ApprovalRecord,
-        fresh: &UserContext,
-    ) -> bool {
-        if r.action_kind != crate::knowledge::add_source_approval::ACTION_KIND {
-            return false;
+#[cfg(test)]
+mod live_event_tests {
+    use super::*;
+    use crate::handlers::task_privacy_tests::{admin, fixture, ok, payload};
+
+    #[tokio::test]
+    async fn list_digest_matches_decide_and_mismatch_leaves_pending() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "mcp_call", "reviewed", json!({"name": "send_message"}), 300)
+            .await.unwrap();
+        let listed = payload(f.handler.handle_approvals_list(json!({"id": id.as_str()}), &root).await);
+        let digest = listed["approvals"][0]["digest"].as_str().unwrap().to_owned();
+        let bad = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(!ok(&bad));
+        assert!(matches!(bad, WsFrame::Response { error: Some(error), .. }
+            if error.as_str().is_some_and(|s| s.contains("digest mismatch"))));
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        assert!(ok(&f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": digest}), &root,
+        ).await));
+    }
+
+    #[tokio::test]
+    async fn malformed_digest_is_rejected_and_absence_preserves_legacy_decision() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "mcp_call", "reviewed", json!({}), 300).await.unwrap();
+        for malformed in [json!(null), json!(42), json!("bad")] {
+            assert!(!ok(&f.handler.handle_approvals_decide(
+                json!({"id": id.as_str(), "approve": false, "expected_digest": malformed}), &root,
+            ).await));
         }
-        let users = self.user_db.read().await.clone();
-        let user = crate::knowledge::dashboard_user(fresh, users.as_ref());
-        let (home, rec) = (self.home_dir.clone(), r.clone());
-        crate::knowledge::blocking(move || {
-            crate::knowledge::add_source_approval::may_decide(&home, &rec, &user)
-        })
-        .await
-        .is_ok()
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        assert!(ok(&f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": false}), &root,
+        ).await));
+    }
+
+    #[tokio::test]
+    async fn get_requires_an_id_and_returns_the_same_digest_as_list() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "mcp_call", "reviewed", json!({}), 300).await.unwrap();
+        let list = payload(f.handler.handle_approvals_list(json!({"id": id.as_str()}), &root).await);
+        let get = payload(f.handler.dispatch_org(
+            "approvals.get", json!({"id": id.as_str()}), &root,
+            crate::power_local::RpcConnInfo::internal(),
+        ).await);
+        assert_eq!(get["approvals"][0]["digest"], list["approvals"][0]["digest"]);
+        assert!(!ok(&f.handler.dispatch_org(
+            "approvals.get", json!({}), &root,
+            crate::power_local::RpcConnInfo::internal(),
+        ).await));
+    }
+
+    #[tokio::test]
+    async fn hidden_purchase_digest_guesses_are_identically_refused() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "mcp_call", "purchase", json!({
+            "action_grant": {"effect": "purchase"}, "args": {"amount": 123}
+        }), 300).await.unwrap();
+        let listed = payload(f.handler.handle_approvals_list(json!({"id": id.as_str()}), &root).await);
+        let correct = listed["approvals"][0]["digest"].as_str().unwrap();
+        for digest in [correct.to_owned(), "0".repeat(64)] {
+            let result = f.handler.handle_approvals_decide(
+                json!({"id": id.as_str(), "approve": false, "expected_digest": digest}), &f.alice,
+            ).await;
+            assert!(matches!(result, WsFrame::Response { ok: false, error: Some(error), .. }
+                if error == json!("expected_digest is not accepted for this approval")));
+            assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        }
+        let bad_admin = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": false, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(bad_admin, WsFrame::Response { error: Some(error), .. }
+            if error.as_str().is_some_and(|s| s.contains("digest mismatch"))));
+        assert!(ok(&f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": false}), &f.alice,
+        ).await));
+    }
+
+    #[tokio::test]
+    async fn expired_hidden_purchase_never_compares_guesses() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "mcp_call", "purchase", json!({
+            "action_grant": {"effect": "purchase"}, "args": {"amount": 123}
+        }), 300).await.unwrap();
+        rusqlite::Connection::open(f.home.join("approvals.db")).unwrap().execute(
+            "UPDATE approvals SET created_at='2000-01-01T00:00:00Z' WHERE id=?1", [id.as_str()],
+        ).unwrap();
+        let rec = broker.get(&id).await.unwrap().unwrap();
+        for digest in [crate::approval::decision_digest(&rec), "f".repeat(64)] {
+            let result = f.handler.handle_approvals_decide(
+                json!({"id": id.as_str(), "approve": true, "expected_digest": digest}), &f.alice,
+            ).await;
+            assert!(matches!(result, WsFrame::Response { error: Some(error), .. }
+                if error == json!("expected_digest is not accepted for this approval")));
+            assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        }
+        let expired_admin = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(expired_admin, WsFrame::Response { error: Some(error), .. }
+            if error == json!("approval expired")));
+        // Fresh-context failure also refuses without comparing a candidate.
+        f.db.set_user_status(&root.user_id, duduclaw_auth::UserStatus::Suspended).unwrap();
+        let result = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(result, WsFrame::Response { error: Some(error), .. }
+            if error == json!("expected_digest is not accepted for this approval")));
+    }
+
+    #[tokio::test]
+    async fn dashboard_expiry_precedes_digest_mismatch() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "responsibility_operator_change", "operator", json!({}), 300).await.unwrap();
+        rusqlite::Connection::open(f.home.join("approvals.db")).unwrap().execute(
+            "UPDATE approvals SET created_at='2000-01-01T00:00:00Z' WHERE id=?1", [id.as_str()],
+        ).unwrap();
+        let result = f.handler.handle_approvals_decide(
+            json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
+        ).await;
+        assert!(matches!(result, WsFrame::Response { error: Some(error), .. }
+            if error == json!(crate::approval_notify::dashboard_only_expired_text("responsibility_operator_change"))));
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn redacted_unbound_purchase_has_no_digest_for_manager() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let full_payload = json!({
+            "action_grant": {"effect": "purchase"},
+            "args": {"recipient": "private@example.com", "amount": 123}
+        });
+        let id = broker.request("sales", "mcp_call", "purchase", full_payload.clone(), 300)
+            .await.unwrap();
+        for method in ["approvals.list", "approvals.get"] {
+            let manager = payload(f.handler.dispatch_org(
+                method, json!({"id": id.as_str()}), &f.alice,
+                crate::power_local::RpcConnInfo::internal(),
+            ).await);
+            assert_eq!(manager["count"], 1);
+            assert_eq!(manager["approvals"][0]["may_decide"], true);
+            assert_eq!(manager["approvals"][0]["payload"], json!({"redacted": true}));
+            assert_eq!(manager["approvals"][0]["digest"], Value::Null);
+            let admin = payload(f.handler.dispatch_org(
+                method, json!({"id": id.as_str()}), &root,
+                crate::power_local::RpcConnInfo::internal(),
+            ).await);
+            assert_eq!(admin["approvals"][0]["payload"], full_payload);
+            assert!(admin["approvals"][0]["digest"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_only_approval_cards_are_admin_only() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("sales", "responsibility_operator_change", "operator request", json!({}), 300)
+            .await.unwrap();
+        let manager = payload(f.handler.handle_approvals_list(json!({"id": id.as_str()}), &f.alice).await);
+        assert_eq!(manager["count"], 0);
+        let admin = payload(f.handler.handle_approvals_list(json!({"id": id.as_str()}), &root).await);
+        assert_eq!(admin["count"], 1);
+        assert!(admin["approvals"][0]["digest"].is_string());
     }
 }
 
 /// Full outbound content is only delivered to the dashboard administrator.
 fn may_show_bound_egress(payload: &Value, admin: bool, may_decide: bool) -> bool {
     admin && may_decide && payload.get("egress_guard").is_some()
+}
+
+/// An unbound digest must never become an oracle for redacted payload fields.
+pub(super) fn digest_hidden_by_redaction(rec: &crate::approval::ApprovalRecord, admin: bool) -> bool {
+    rec.binding.is_none() && dashboard_action_payload(&rec.payload, admin) != rec.payload
+}
+
+/// Only disclose a digest when the viewer can see every field it hashes.
+fn viewer_digest(
+    rec: &crate::approval::ApprovalRecord,
+    activation_facts: &Value,
+    admin: bool,
+    may_decide: bool,
+) -> Value {
+    if !may_decide
+        || digest_hidden_by_redaction(rec, admin)
+    {
+        Value::Null
+    } else {
+        json!(crate::approval::decision_digest_with_activation(rec, activation_facts))
+    }
 }
 
 fn dashboard_action_payload(payload: &Value, admin: bool) -> Value {

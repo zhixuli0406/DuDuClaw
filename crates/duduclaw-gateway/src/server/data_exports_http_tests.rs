@@ -192,6 +192,7 @@ skill_security_scan = true
         handler,
         tx,
         event_tx,
+        prepared_events: Default::default(),
         user_db,
         jwt_config,
         otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(

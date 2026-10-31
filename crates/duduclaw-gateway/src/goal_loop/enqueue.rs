@@ -206,7 +206,8 @@ impl GoalLoopDriver {
         let round_guard = crate::responsibility::team_activity::RoundGuard::register(&task.id);
         tokio::spawn(async move {
             let _round_guard = round_guard;
-            let outcome = crate::runtime::GOAL_ROUND_ATTRIBUTION
+            let live_round = super::LiveRuntimeRound::start(&home_dir, &task.assigned_to, &task.id);
+            let outcome = super::TEAM_LIVE_ROUND.scope(true, crate::runtime::GOAL_ROUND_ATTRIBUTION
                 .scope(
                     goal_attr,
                     crate::team_composer::run_team_round(crate::team_composer::TeamRoundContext {
@@ -218,8 +219,8 @@ impl GoalLoopDriver {
                         spawns_used,
                         grey_band,
                     }),
-                )
-                .await;
+                )).await;
+            drop(live_round);
             match outcome {
                 crate::team_composer::TeamRoundOutcome::Submitted { summary, .. } => {
                     // Lands exactly where an agent's `tasks_complete` would:
