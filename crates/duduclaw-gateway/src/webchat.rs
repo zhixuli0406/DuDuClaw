@@ -485,6 +485,8 @@ pub struct WebChatState {
     /// C5: user store — confirms the authenticated user is still active.
     user_db: Arc<UserDb>,
     live_ctx_cache: Arc<crate::handlers::live_context::LiveContextCache>,
+    #[cfg(test)]
+    credential_results: std::sync::Mutex<std::collections::VecDeque<crate::handlers::live_context::SocketValidity>>,
     /// Track active connections per user_id.
     turns: Arc<turns::Registry>,
     approvals: Option<crate::approval::ApprovalBroker>,
@@ -506,6 +508,8 @@ impl WebChatState {
             jwt_config,
             user_db,
             live_ctx_cache: Arc::new(Default::default()),
+            #[cfg(test)]
+            credential_results: Default::default(),
             turns: Arc::new(turns::Registry::default()),
             approvals,
             connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -533,6 +537,10 @@ impl WebChatState {
 
     async fn credential_validity(&self, claims: Option<&duduclaw_auth::jwt::Claims>, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
         use crate::handlers::live_context::SocketValidity;
+        #[cfg(test)]
+        if let Some(result) = self.credential_results.lock().unwrap().pop_front() {
+            return result;
+        }
         let Some(claims) = claims else { return SocketValidity::Valid; }; // Public widget.
         let Ok(ctx) = duduclaw_auth::UserContext::from_claims(claims, false) else { return SocketValidity::Revoked; };
         let db = self.user_db.clone();
@@ -1362,7 +1370,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 )).await {
                                     Ok(ticket) => {
                                         let validity = state.credential_validity(credential.as_ref(), true).await;
-                                        if !recovery.observe(validity, false) {
+                                        recovery.observe(validity, false);
+                                        if !turns::credential_allows_turn(validity, &turn_sink).await {
                                             if recovery.closed() { break; }
                                             continue;
                                         }

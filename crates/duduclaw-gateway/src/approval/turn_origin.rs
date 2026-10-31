@@ -10,6 +10,15 @@
 
 use super::*;
 
+/// Both origin columns must agree. Scoped cards need a surviving detail row;
+/// missing detail rows never grant decision authority.
+pub(super) const LIVE_ORIGIN_SQL: &str = "(
+    (origin_session_id IS NULL AND origin_turn_id IS NULL)
+    OR (origin_session_id IS NOT NULL AND origin_turn_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM approval_turn_origins o WHERE o.approval_id=approvals.id
+            AND NOT EXISTS (SELECT 1 FROM cancelled_approval_turns c
+                WHERE c.session_id=o.session_id AND c.turn_id=o.turn_id))))";
+
 tokio::task_local! {
     static TURN_ORIGIN: (String, String);
 }
@@ -230,6 +239,36 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn decide_requires_complete_origin_and_live_detail() {
+        for case in ["missing", "session_null", "turn_null", "cancelled", "unscoped", "live"] {
+            let broker = ApprovalBroker::new(std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap()));
+            let id = request(&broker, "session", "turn").await;
+            {
+                let conn = broker.store.conn.lock().await;
+                match case {
+                    "missing" => { conn.execute("DELETE FROM approval_turn_origins WHERE approval_id=?1", [id.as_str()]).unwrap(); }
+                    "session_null" => { conn.execute("UPDATE approvals SET origin_session_id=NULL WHERE id=?1", [id.as_str()]).unwrap(); }
+                    "turn_null" => { conn.execute("UPDATE approvals SET origin_turn_id=NULL WHERE id=?1", [id.as_str()]).unwrap(); }
+                    "unscoped" => {
+                        conn.execute("UPDATE approvals SET origin_session_id=NULL,origin_turn_id=NULL WHERE id=?1", [id.as_str()]).unwrap();
+                        conn.execute("DELETE FROM approval_turn_origins WHERE approval_id=?1", [id.as_str()]).unwrap();
+                    }
+                    _ => {
+                        conn.execute("INSERT INTO cancelled_approval_turns(session_id,turn_id,cancelled_at) VALUES ('session','turn',datetime('now'))", []).unwrap();
+                        if case == "live" {
+                            conn.execute("INSERT INTO approval_turn_origins VALUES (?1,'session','live')", [id.as_str()]).unwrap();
+                        }
+                    }
+                }
+            }
+            let allowed = matches!(case, "unscoped" | "live");
+            assert_eq!(broker.decide(&id, true, "human:test").await.is_ok(), allowed, "{case}");
+            assert_eq!(broker.get(&id).await.unwrap().unwrap().status,
+                if allowed { ApprovalStatus::Approved } else { ApprovalStatus::Pending }, "{case}");
+        }
     }
 
     #[tokio::test]

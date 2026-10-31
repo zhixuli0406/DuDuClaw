@@ -395,15 +395,12 @@ impl ApprovalBroker {
             check_expected_digest(&current)?;
             let n = tx
                 .execute(
-                    "UPDATE approvals SET status=?1, decided_at=?2, decided_by=?3, answer_json=?4
+                    &format!("UPDATE approvals SET status=?1, decided_at=?2, decided_by=?3, answer_json=?4
                 WHERE id=?5 AND status='pending' AND request_kind=?6 AND binding_json=?7
-                AND (origin_session_id IS NULL OR NOT EXISTS (
-                SELECT 1 FROM approval_turn_origins o WHERE o.approval_id=approvals.id)
-                OR EXISTS (SELECT 1 FROM approval_turn_origins o WHERE o.approval_id=approvals.id
-                    AND NOT EXISTS (SELECT 1 FROM cancelled_approval_turns c
-                                    WHERE c.session_id=o.session_id AND c.turn_id=o.turn_id)))
+                AND {live_origin}
                 AND julianday(?2) < julianday(json_extract(binding_json,'$.expires_at'))
                 AND julianday(?2) < julianday(created_at) + ttl_seconds/86400.0",
+                        live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
                     params![
                         status.as_str(),
                         Utc::now().to_rfc3339(),

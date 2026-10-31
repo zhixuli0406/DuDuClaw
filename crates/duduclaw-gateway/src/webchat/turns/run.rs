@@ -34,8 +34,9 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         resume_acl: _,
         arrival_seq,
     } = input;
-    if state.credential_validity(credential.as_ref(), true).await
-        != crate::handlers::live_context::SocketValidity::Valid {
+    if !credential_allows_turn(
+        state.credential_validity(credential.as_ref(), true).await, &sink,
+    ).await {
         return;
     }
     let sid = sid.as_str();

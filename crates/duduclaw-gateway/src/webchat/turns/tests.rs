@@ -534,3 +534,309 @@ async fn revoked_or_unavailable_identity_withholds_queued_frames_and_rejects_ack
         }
     }
 }
+
+struct DropFlag(Arc<AtomicBool>);
+impl Drop for DropFlag {
+    fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_watcher_three_failures_reset_and_ends_with_turn() {
+    use crate::handlers::live_context::SocketValidity::{Unavailable, Valid};
+    for results in [vec![Unavailable, Unavailable, Unavailable], vec![Unavailable, Unavailable, Valid, Unavailable, Unavailable, Unavailable]] {
+        let registry = Arc::new(Registry::default());
+        let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let work_dropped = Arc::new(AtomicBool::new(false));
+        let mut results = std::collections::VecDeque::from(results);
+        let expected = results.len();
+        let watcher = async {
+            let _guard = DropFlag(dropped.clone());
+            watch_credential(&ticket, || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(results.pop_front().expect("no checks after cancellation"))
+            }).await;
+        };
+        let work = async {
+            let _guard = DropFlag(work_dropped.clone());
+            std::future::pending::<()>().await;
+        };
+        let (cancelled, cleanup) = run_cancellable("s", &ticket, credential_watched(work, watcher)).await;
+        assert!(cancelled);
+        cleanup.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), expected);
+        assert!(work_dropped.load(Ordering::SeqCst));
+        assert!(dropped.load(Ordering::SeqCst));
+        tokio::time::advance(CREDENTIAL_CHECK_INTERVAL * 4).await;
+        assert_eq!(reads.load(Ordering::SeqCst), expected);
+    }
+    // Completing work drops an in-progress check without waiting for it.
+    let registry = Arc::new(Registry::default());
+    let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+    let watcher_dropped = Arc::new(AtomicBool::new(false));
+    let watcher = async {
+        let _guard = DropFlag(watcher_dropped.clone());
+        watch_credential(&ticket, || std::future::pending()).await;
+    };
+    let started = tokio::time::Instant::now();
+    let (cancelled, cleanup) = run_cancellable("s", &ticket, credential_watched(async {}, watcher)).await;
+    assert!(!cancelled);
+    cleanup.unwrap();
+    assert!(watcher_dropped.load(Ordering::SeqCst));
+    assert_eq!(tokio::time::Instant::now(), started);
+}
+
+async fn credential_fixture(home: &std::path::Path) -> Arc<WebChatState> {
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    Arc::new(WebChatState::new(
+        crate::agent_channels::e2e_tests::reply_ctx(home).await,
+        Arc::new(JwtConfig::new(b"turn-credential-test-key")),
+        Arc::new(UserDb::new(&home.join("users.db")).unwrap()),
+    ))
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_revocation_drops_work_and_fences_even_without_socket() {
+    for disconnected in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let state = credential_fixture(home.path()).await;
+        let user = state.user_db.create_user("alice@test.invalid", "Alice", "Test-Password-12345", duduclaw_auth::UserRole::Admin).unwrap();
+        let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+        let claims = state.jwt_config.verify_access_token(&token).unwrap();
+        assert_eq!(state.credential_validity(Some(&claims), true).await, crate::handlers::live_context::SocketValidity::Valid);
+        let ticket = state.turns.admit("alice", "session", None, "m", 3, 10).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let broker = state.approvals.as_ref().unwrap();
+        let (ready, started) = oneshot::channel();
+        let work = async {
+            let _guard = DropFlag(dropped.clone());
+            let id = broker.request("bot", "test", "pending", serde_json::Value::Null, 600).await.unwrap();
+            ready.send(id).unwrap();
+            std::future::pending::<()>().await;
+        };
+        let watcher = watch_credential(&ticket, || state.credential_validity(Some(&claims), true));
+        let revoke = async {
+            let id = started.await.unwrap();
+            state.user_db.mfa_operator_reset("alice@test.invalid").unwrap();
+            id
+        };
+        let ((cancelled, cleanup), id) = tokio::join!(
+            run_cancellable("session", &ticket, credential_watched(work, watcher)), revoke,
+        );
+        assert!(cancelled);
+        assert!(dropped.load(Ordering::SeqCst));
+        let (tx, rx) = outbound_channel();
+        let mut rx = if disconnected { drop(rx); None } else { Some(rx) };
+        let sink = TurnSink::new(tx, "session", None, "m").acknowledged();
+        finish_cancel(home.path(), Some(broker), &state.ctx.session_manager, "session", "bot", &ticket, &sink, cleanup).await;
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
+        assert!(broker.decide(&id, true, "human:test").await.is_err());
+        assert!(crate::approval::is_turn_cancelled(home.path(), "session", &ticket.id).await.unwrap());
+        if !disconnected {
+            // The normal writer still refuses every frame after revocation,
+            // including the cancelled frame; cleanup has already committed.
+            let output = rx.as_mut().unwrap().recv().await.unwrap();
+            let sent = Arc::new(AtomicBool::new(false));
+            let captured = sent.clone();
+            let writer = futures_util::sink::unfold(captured, |captured, message: Message| async move {
+                assert!(matches!(message, Message::Close(_)), "revoked turn data must stay blocked");
+                captured.store(true, Ordering::SeqCst);
+                Ok::<_, ()>(captured)
+            });
+            // A Close frame is allowed, turn data is not.
+            let Message::Text(text) = &output.message else { panic!("text") };
+            assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap()["code"], "cancelled");
+            let _ = output.deliver_authorized(crate::handlers::live_context::SocketValidity::Revoked,
+                &mut Default::default(), &mut BoundedSocketSink(Box::pin(writer))).await;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn plain_disconnect_and_recovered_credential_do_not_cancel_work() {
+    use crate::handlers::live_context::SocketValidity::{Unavailable, Valid};
+    let registry = Arc::new(Registry::default());
+    let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+    let (tx, rx) = outbound_channel();
+    let _sink = TurnSink::new(tx, "s", None, "m");
+    drop(rx);
+    let reads = std::sync::atomic::AtomicUsize::new(0);
+    let watcher = watch_credential(&ticket, || {
+        let n = reads.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(if n < 2 { Unavailable } else { Valid })
+    });
+    let (cancelled, cleanup) = run_cancellable("s", &ticket, credential_watched(async {
+        tokio::time::sleep(CREDENTIAL_CHECK_INTERVAL * 5).await;
+    }, watcher)).await;
+    assert!(!cancelled);
+    cleanup.unwrap();
+    assert!(reads.load(Ordering::SeqCst) >= 3);
+}
+
+fn credential_input(state: Arc<WebChatState>) -> TurnInput {
+    TurnInput {
+        state, auth_user: "widget:test".into(), credential: None,
+        user_id: "alice".into(), agent_id: "dudu".into(), requested_agent: None,
+        effective_agent: None, sid: "session".into(), conv_nonce: None,
+        content: "Hello".into(), attachments: Vec::new(), assign_event: None,
+        resume_acl: false, arrival_seq: 1,
+    }
+}
+
+#[tokio::test]
+async fn unavailable_at_each_start_gate_is_terminal_and_releases_fifo_without_model() {
+    use crate::handlers::live_context::SocketValidity::{Unavailable, Valid};
+    for stage in ["after_admission", "fifo_resume", "before_run"] {
+        let home = tempfile::tempdir().unwrap();
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "dudu", "Main", "@dudu", "main", "");
+        let state = credential_fixture(home.path()).await;
+        let mut gate = crate::agent_channels::e2e_seam::arm_waiting(home.path());
+        let first = state.turns.admit("alice", "session", None, "first", 3, 10).unwrap();
+        let next = state.turns.admit("alice", "session", None, "next", 3, 10).unwrap();
+        assert!(next.predecessor.is_some());
+        let (tx, mut rx) = outbound_channel();
+        let first_sink = TurnSink::new(tx.clone(), "session", None, "first");
+        state.credential_results.lock().unwrap().extend(
+            if stage == "before_run" { vec![Valid, Unavailable] } else { vec![Unavailable] },
+        );
+        if stage == "after_admission" {
+            assert!(!credential_allows_turn(state.credential_validity(None, true).await, &first_sink).await);
+            drop(first);
+        } else {
+            execute(credential_input(state.clone()), first_sink, first).await;
+        }
+        assert!(gate.entered.try_recv().is_err(), "{stage}: refused turn must never call the model");
+        assert!(state.ctx.session_manager.session_agent("session").await.unwrap().is_none(), "{stage}: no session write before rejection");
+        let Message::Text(text) = rx.recv().await.unwrap().message else { panic!("text") };
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame["type"], "error", "{stage}");
+        assert_eq!(frame["code"], "credential_check_unavailable", "{stage}");
+        assert_eq!(frame["msg_id"], "first", "{stage}");
+        assert!(frame["message"].as_str().unwrap().contains("稍後再試"));
+        let next_task = tokio::spawn(execute(credential_input(state.clone()), TurnSink::new(tx, "session", None, "next"), next));
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.recv()).await.unwrap().unwrap();
+        assert_eq!(entered.session_id, "session");
+        entered.release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), next_task).await.unwrap().unwrap();
+        assert!(state.turns.entries.lock().unwrap().is_empty(), "{stage}: all tickets released");
+    }
+}
+
+#[tokio::test]
+async fn revoked_start_gate_has_no_terminal_frame() {
+    let (tx, mut rx) = outbound_channel();
+    let sink = TurnSink::new(tx, "s", None, "m");
+    assert!(!credential_allows_turn(crate::handlers::live_context::SocketValidity::Revoked, &sink).await);
+    drop(sink);
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_watcher_preserves_delivery_until_work_completes() {
+    let registry = Arc::new(Registry::default());
+    let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+    let completed = Arc::new(AtomicBool::new(false));
+    let prematurely_dropped = Arc::new(AtomicBool::new(false));
+    struct DeliveryGuard {
+        completed: Arc<AtomicBool>,
+        prematurely_dropped: Arc<AtomicBool>,
+    }
+    impl Drop for DeliveryGuard {
+        fn drop(&mut self) {
+            if !self.completed.load(Ordering::SeqCst) {
+                self.prematurely_dropped.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    let reads = std::sync::atomic::AtomicUsize::new(0);
+    let work = async {
+        let _guard = DeliveryGuard {
+            completed: completed.clone(), prematurely_dropped: prematurely_dropped.clone(),
+        };
+        assert!(ticket.begin_delivery());
+        tokio::time::sleep(CREDENTIAL_CHECK_INTERVAL * 3).await;
+        assert!(!ticket.cancel.is_cancelled());
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "watching stops after delivery wins");
+        completed.store(true, Ordering::SeqCst);
+    };
+    let watcher = watch_credential(&ticket, || {
+        reads.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(crate::handlers::live_context::SocketValidity::Revoked)
+    });
+    credential_watched(work, watcher).await;
+    assert!(completed.load(Ordering::SeqCst));
+    assert!(!prematurely_dropped.load(Ordering::SeqCst));
+    assert!(!ticket.cancel.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_watcher_cancellation_prevents_delivery() {
+    let registry = Arc::new(Registry::default());
+    let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+    watch_credential(&ticket, || {
+        std::future::ready(crate::handlers::live_context::SocketValidity::Revoked)
+    }).await;
+    assert!(ticket.cancel.is_cancelled());
+    assert!(!ticket.begin_delivery());
+}
+
+#[test]
+fn credential_cancellation_and_delivery_cannot_both_win() {
+    for _ in 0..128 {
+        let registry = Arc::new(Registry::default());
+        let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (cancelled, delivering) = std::thread::scope(|scope| {
+            let cancel = scope.spawn(|| {
+                barrier.wait();
+                ticket.cancel_unless_delivering()
+            });
+            barrier.wait();
+            let delivering = ticket.begin_delivery();
+            (cancel.join().unwrap(), delivering)
+        });
+        assert_ne!(cancelled, delivering, "exactly one transition must win");
+        assert_eq!(ticket.cancel.is_cancelled(), cancelled);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn execute_revoked_running_credential_withdraws_and_refuses_card() {
+    let home = tempfile::tempdir().unwrap();
+    crate::trigger_route::tests::write_agent(&home.path().join("agents"), "dudu", "Main", "@dudu", "main", "");
+    let state = credential_fixture(home.path()).await;
+    let user = state.user_db.create_user("alice@test.invalid", "Alice", "Test-Password-12345", duduclaw_auth::UserRole::Admin).unwrap();
+    let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+    let claims = state.jwt_config.verify_access_token(&token).unwrap();
+    let mut gate = crate::agent_channels::e2e_seam::arm_waiting(home.path());
+    let ticket = state.turns.admit(&user.id, "session", None, "m", 3, 10).unwrap();
+    let turn_id = ticket.id.clone();
+    let mut input = credential_input(state.clone());
+    input.auth_user = user.id.clone();
+    input.credential = Some(claims);
+    let (tx, mut rx) = outbound_channel();
+    let task = tokio::spawn(execute(input, TurnSink::new(tx, "session", None, "m"), ticket));
+    let entered = gate.entered.recv().await.unwrap();
+    let broker = state.approvals.as_ref().unwrap();
+    // Simulate a tool's card while the real execute pipeline is inside the model.
+    let id = crate::approval::scope_turn("session", &turn_id,
+        broker.request("dudu", "test", "pending", serde_json::Value::Null, 600),
+    ).await.unwrap();
+    state.user_db.mfa_operator_reset("alice@test.invalid").unwrap();
+    task.await.unwrap();
+    assert!(entered.release.is_closed(), "the running model future must be dropped");
+    assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
+    assert!(broker.decide(&id, true, "human:test").await.is_err());
+    assert!(crate::approval::is_turn_cancelled(home.path(), "session", &turn_id).await.unwrap());
+    assert!(state.turns.entries.lock().unwrap().is_empty());
+    let mut cancelled = false;
+    while let Some(output) = rx.recv().await {
+        if let Message::Text(text) = output.message {
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["type"], "assistant_done");
+            cancelled |= frame["code"] == "cancelled";
+        }
+    }
+    assert!(cancelled);
+}

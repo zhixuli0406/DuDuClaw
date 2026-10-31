@@ -509,3 +509,69 @@ warning: `duduclaw-gateway` (lib test) generated 54 warnings (48 duplicates)
 決定不改程式：這些卡片都是 pending，必須人工決定，不會自動核准；文件已載明已交給其他員工的工作會繼續執行。row cap 保留的理由改為：全域拒絕會讓任何人擋住所有使用者的新回合，代價大於 fence 提早失效，而 fence 失效的最壞結果只是多一張待人工決定的卡。
 
 後續（另案，屬產品決定）：取消是否沿交辦鏈傳遞到已派送的員工。
+
+## Round 7：執行中憑證撤銷與核准來源拒絕
+
+- 每個已開始的認證回合擁有自己的憑證監看 future，每 30 秒強制讀取當下身分；不依賴 socket。撤銷立即取消，連續三次無法讀取也取消，有效結果重設失敗次數。監看與工作在同一個 select 中，沒有額外 spawn；工作完成便丟棄監看，不等待下一個 tick。Widget 不監看，單純斷線不取消。
+- 監看只觸發既有 cancel token，沿用 future drop、delivery cleanup、撤回核准／持久化 fence、取消 pending 交辦與 session 記帳。清理先於終態傳送，因此 writer 拒絕撤銷後的所有資料或 socket 消失，仍完成清理；已派送交辦沿用既有界線。
+- admission 後、FIFO 恢復與執行前的身分檢查，Unavailable 回傳終態 `error`／`credential_check_unavailable`，提示稍後重試且釋放 ticket；Revoked 保持不傳回合資料。終態經正常 sink，writer 當下仍不可讀時可以扣住輸出。
+- `approval/turn_origin.rs::LIVE_ORIGIN_SQL` 共用於一般與 bound decision：只有兩欄皆 NULL 才是 unscoped；scoped 必須兩欄皆非 NULL 且至少一筆未取消 detail。缺 detail、一欄 NULL、全部取消均拒絕。
+- 已掃描所有 approvals UPDATE：人工 approved／denied／answered 決策只有 `store.rs` 與 `binding.rs` 兩條 SQL；durable 與 workflow decide 也經這兩處。`turn_origin.rs` 的 system cancellation denial 是撤回路徑，保留原條件；其餘 status UPDATE 是 invalidation。唯一產品 INSERT 在 `store.rs::insert_row`，一般與 if_absent 都在同一交易記錄來源；相同 keyed card 重用時只加未取消來源，合法 unscoped 重用會明確清空兩欄。
+- Web 前端 `chat-store.ts` 的 error 分支以 `mentionErrorText(data) ?? data.message` 顯示未知碼，停止 streaming；`mention.ts` 對未知碼回 NULL。本 checkout 無 `crates/duduclaw-tui`，只有 RFC，無法確認 TUI 實作的未知碼行為。
+- 測試補上真憑證 MFA 撤銷＋長 future drop＋核准撤回／拒絕決策＋fence（有／無 sink）、三次不可讀／有效重設、正常斷線、監看壽命，以及三個 gate 的拒絕／FIFO 接續。post-admission 案例直接呼叫 reader 共用 gate，不是完整 reader 整合測試；FIFO 與 before-run 案例執行真正 execute。一般／bound 決策各覆蓋六種來源資料狀態。
+
+驗證命令與結果於本輪完成後補記；未啟動審查子代理、提交、推送、stash、切換分支或 workspace fmt。
+
+### 首輪驗證與 fixture 修正
+
+- `CARGO_INCREMENTAL=0 cargo check -j 3 -p duduclaw-gateway --tests` 首輪 exit 0（2m 36s），reader recovery 更新後再跑 exit 0（2m 26s）。原始日誌：`/private/tmp/duduclaw-credential-check.log`、`/private/tmp/duduclaw-credential-check-final.log`。
+- 固定 `DUDUCLAW_P1_PILOT_BINARY=/Users/lizhixu/Project/DuDuClaw-wt-merge/target/debug/duduclaw`，執行 `CARGO_INCREMENTAL=0 cargo test -j 3 -p duduclaw-gateway --lib -- --test-threads=4 webchat approval --nocapture`。建置 6m 08s，exit 101：`test result: FAILED. 471 passed; 13 failed; 0 ignored; 0 measured; 10111 filtered out; finished in 14.64s`。日誌：`/private/tmp/duduclaw-credential-tests.log`。
+- 其中一項是本輪新增 fixture 錯誤：`credential_revocation_drops_work_and_fences_even_without_socket` 在 `reply_ctx` 掃描前沒有建立 `agents` 目錄，尚未進入憑證測試本體。已在 `credential_fixture` 補 `create_dir_all`；產品程式沒有再修改。修正後重新跑 check 與完整指定測試，結果另記。
+- 另外 12 個 harness failure 都在 socket bind 時收到 `PermissionDenied: Operation not permitted`，情境列 NOT RUN。WebChat TCP 案例雖顯示 ok，實際輸出 `NOT RUN: WebChat TCP integration: loopback bind denied by sandbox: Operation not permitted (os error 1)`，同樣列 NOT RUN。首輪其餘六個新增測試通過，沒有將首輪 fixture failure 混成環境問題。
+
+### NOT RUN 清單（socket sandbox）
+
+以下需由 Claude 在沙箱外重跑，不把 harness 提前 return 當作通過：
+
+1. `approval::delivery::provider_roundtrip_tests::interleaved_account_thread_transport_scope_never_crosses_and_error_cleans_up`：`test_channel_provider.rs:98` TCP bind。
+2. `codrive::tests_atspi_locate::consequential_locate_step_still_waits_for_approval`：`codrive/tests.rs:87` Unix socket bind。
+3. `codrive::tests_mode::plan_approval_approved_lets_the_session_run`：`codrive/tests_mode.rs:71` Unix socket bind。
+4. `codrive::tests_mode::plan_approval_denied_aborts_without_ever_connecting`：同上。
+5. `codrive::tests_mode::plan_approval_expiry_is_a_denial`：同上。
+6. `codrive::tests_mode::plan_approval_off_files_no_card_at_all`：同上。
+7. `codrive::tests_registry::consequential_api_action_step_still_waits_for_approval`：`codrive/tests.rs:87` Unix socket bind。
+8. `codrive::tests_takeover::explicit_take_over_step_completes_and_skips_approval`：同上。
+9. `workflow::f1b_e2e_tests::activation_card_is_admin_only_and_reports_self_approval`：`workflow/pilot_test_factory.rs:59` TCP bind。
+10. `workflow::f5a_e2e_tests::a_card_that_lapsed_with_its_run_ends_as_approval_expired`：同上。
+11. `workflow::resume_tests::resume_approval_step_then_human_gated_effect_completes_the_same_run`：同上。
+12. `workflow::security_race_tests::security_race_request_approval_write_cannot_revive_terminal_projection`：同上。
+13. `webchat::turns::socket_tests::webchat_real_socket_concurrency_fifo_user_limits_and_foreign_cancel`：`webchat/turns/socket_tests.rs:54` TCP bind，harness 提前回傳。
+
+另：本 checkout 無 TUI crate，未知 error code 的 TUI 顯示行為未驗證；未做原生平台、真模型、真 provider、部署或發版驗收。依交辦沒有審查子代理。
+
+### 修正後驗證
+
+最後的 fixture 修正後，`CARGO_INCREMENTAL=0 cargo check -j 3 -p duduclaw-gateway --tests` exit 0：
+
+```text
+warning: `duduclaw-gateway` (lib test) generated 54 warnings (48 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 32s
+```
+
+日誌：`/private/tmp/duduclaw-credential-check-fixed.log`。指定測試完整重跑的日誌為 `/private/tmp/duduclaw-credential-tests-fixed.log`，命令與 exit／耗時保存在 `/private/tmp/duduclaw-credential-fixed-results.json`。
+
+共用主機上，以 `lsof -a -c cargo -d cwd` 觀察到 `DuDuClaw-wt-v178-integ` 也有 Cargo 在執行。本 session 自己的 Cargo 全部串行、`-j 3`、`CARGO_INCREMENTAL=0`，沒有干預其他工作樹，不宣稱整台主機全程只有一個 Cargo。
+
+最終重跑 exit 101，建置 14m 02s：
+
+```text
+test result: FAILED. 472 passed; 12 failed; 0 ignored; 0 measured; 10111 filtered out; finished in 18.54s
+```
+
+本輪新增 7 個測試全部通過，包括修正 fixture 後的 `credential_revocation_drops_work_and_fences_even_without_socket`（真 MFA epoch 撤銷、工作 future drop、核准撤回／拒絕決策、fence、有／無 sink）。其餘新增測試涵蓋三次不可讀、Valid 重設、斷線不取消、監看生命週期、三個啟動 gate 的終態與 FIFO，以及一般／bound 的六種來源狀態。
+
+最後 12 個 harness failure 全部是上述清單第 1–12 項的 `PermissionDenied` bind 拒絕，沒有其他 assertion failure。第 13 項仍輸出 NOT RUN 後提前回傳；所以不能把 472 個 harness pass 全部視為情境通過，共有 13 個 socket 情境未執行。記憶體 WebSocket 測試與可執行的既有程序樹取消回歸通過。
+
+最終狀態為 **PARTIAL（程式與可執行測試通過，13 項 socket 行為待 Claude 沙箱外驗收；TUI 原始碼不在 checkout）**。最後測試後只更新本紀錄，沒有再修改程式。分支維持 `feat/webchat-concurrent-turns-20261030`；未提交、推送、stash、切分支、執行 workspace fmt／clippy 或啟動子代理；`git diff --check` exit 0。本 session 沒有建立 worktree，保留交付的工作樹。
+
+- 交付與憑證撤銷取消共用 registry 鎖：取消先取得鎖便拒絕 begin_delivery；交付先取得鎖便停止憑證輪詢並保持監看 future pending，讓 send_terminal 以最新憑證檢查完成拒絕與封存回復；補交付優先、取消優先、競態及真實 execute 入口核准撤回測試；cargo check --tests 通過，指定 webchat 測試回報 167 passed／0 failed（實際通過 166 項，另 1 項 TCP bind 遭沙箱拒絕，列 NOT RUN），新增四項皆通過。

@@ -430,17 +430,14 @@ impl ApprovalStore {
                 }
             }
             let n = tx.execute(
-                "UPDATE approvals
+                &format!("UPDATE approvals
                  SET status = ?1, decided_by = ?2, decided_at = ?3
                  WHERE id = ?4 AND status = 'pending'
-                 AND (origin_session_id IS NULL OR NOT EXISTS (
-                SELECT 1 FROM approval_turn_origins o WHERE o.approval_id=approvals.id)
-                OR EXISTS (SELECT 1 FROM approval_turn_origins o WHERE o.approval_id=approvals.id
-                    AND NOT EXISTS (SELECT 1 FROM cancelled_approval_turns c
-                                    WHERE c.session_id=o.session_id AND c.turn_id=o.turn_id)))
+                 AND {live_origin}
                 AND (?1 NOT IN ('approved','denied','answered') OR
                       (julianday(created_at) IS NOT NULL
                        AND julianday(?3) < julianday(created_at) + ttl_seconds / 86400.0))",
+                    live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
                 params![status.as_str(), decided_by, decided_at, id.as_str()],
             ).map_err(|e| format!("decide approval: {e}"))?;
             tx.commit().map_err(|e| format!("commit approval decision: {e}"))?;

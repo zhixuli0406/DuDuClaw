@@ -596,3 +596,38 @@ async fn bound_requests_emit_redacted_created_and_decided_events() {
         vec!["approval.created", "approval.decided"]);
     assert!(rows.iter().all(|r| !r.payload.contains("secret") && !r.payload.contains("private")));
 }
+
+#[tokio::test]
+async fn bound_decide_requires_complete_origin_and_live_detail() {
+    for case in ["missing", "session_null", "turn_null", "cancelled", "unscoped", "live"] {
+        let home = fixture();
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let payload = json!({"tool":"test"});
+        let id = crate::approval::scope_turn("session", "turn", broker.request_bound(
+            RequestKind::Approval, "alice", "test", payload.clone(),
+            binding(home.path(), &payload, "workflow_v1"),
+        )).await.unwrap();
+        {
+            let conn = broker.store.conn.lock().await;
+            match case {
+                "missing" => { conn.execute("DELETE FROM approval_turn_origins WHERE approval_id=?1", [id.as_str()]).unwrap(); }
+                "session_null" => { conn.execute("UPDATE approvals SET origin_session_id=NULL WHERE id=?1", [id.as_str()]).unwrap(); }
+                "turn_null" => { conn.execute("UPDATE approvals SET origin_turn_id=NULL WHERE id=?1", [id.as_str()]).unwrap(); }
+                "unscoped" => {
+                    conn.execute("UPDATE approvals SET origin_session_id=NULL,origin_turn_id=NULL WHERE id=?1", [id.as_str()]).unwrap();
+                    conn.execute("DELETE FROM approval_turn_origins WHERE approval_id=?1", [id.as_str()]).unwrap();
+                }
+                _ => {
+                    conn.execute("INSERT INTO cancelled_approval_turns(session_id,turn_id,cancelled_at) VALUES ('session','turn',datetime('now'))", []).unwrap();
+                    if case == "live" {
+                        conn.execute("INSERT INTO approval_turn_origins VALUES (?1,'session','live')", [id.as_str()]).unwrap();
+                    }
+                }
+            }
+        }
+        let allowed = matches!(case, "unscoped" | "live");
+        assert_eq!(broker.decide_bound(&id, &context(), true).await.is_ok(), allowed, "{case}");
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status,
+            if allowed { ApprovalStatus::Approved } else { ApprovalStatus::Pending }, "{case}");
+    }
+}

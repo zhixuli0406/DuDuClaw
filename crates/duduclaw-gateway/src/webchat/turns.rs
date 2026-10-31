@@ -172,6 +172,18 @@ impl Ticket {
         entry.tail = Some(tail);
     }
 
+    /// Serialize credential cancellation with the delivery fence. Once delivery
+    /// starts, its awaited validity checks own refusal and archive rollback.
+    fn cancel_unless_delivering(&self) -> bool {
+        let entries = self.registry.entries.lock().unwrap();
+        let entry = entries.get(&self.id).unwrap();
+        if entry.delivering {
+            return false;
+        }
+        entry.cancel.cancel();
+        true
+    }
+
     pub(super) fn begin_delivery(&self) -> bool {
         let mut entries = self.registry.entries.lock().unwrap();
         let entry = entries.get_mut(&self.id).unwrap();
@@ -221,6 +233,64 @@ fn configured_bound(home: &std::path::Path, key: &str, default: usize) -> usize 
             .as_integer()
             .filter(|n| (1..=64).contains(n))
             .map_or(0, |n| n as usize),
+    }
+}
+
+/// Match the authenticated socket heartbeat cadence, even after disconnect.
+const CREDENTIAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A refused turn must release its ticket even if the writer withholds output.
+pub(super) async fn credential_allows_turn(
+    validity: crate::handlers::live_context::SocketValidity,
+    sink: &TurnSink,
+) -> bool {
+    use crate::handlers::live_context::SocketValidity;
+    match validity {
+        SocketValidity::Valid => true,
+        SocketValidity::Revoked => false,
+        SocketValidity::Unavailable => {
+            sink.frame(ChatMessage::error_coded(
+                "暫時無法確認登入狀態，請稍後再試。", "credential_check_unavailable",
+            )).await;
+            false
+        }
+    }
+}
+
+/// This future is owned by the turn: no detached watcher task or join delay.
+async fn watch_credential<C, F>(ticket: &Ticket, mut check: C)
+where
+    C: FnMut() -> F,
+    F: std::future::Future<Output = crate::handlers::live_context::SocketValidity>,
+{
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + CREDENTIAL_CHECK_INTERVAL, CREDENTIAL_CHECK_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut recovery = crate::handlers::live_context::SocketRecovery::default();
+    loop {
+        interval.tick().await;
+        recovery.observe(check().await, true);
+        if recovery.closed() {
+            if ticket.cancel_unless_delivering() {
+                return;
+            }
+            // Returning would win credential_watched's select and drop delivery.
+            // Leave the work alive to finish its own refusal/rollback path.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn credential_watched<F, W>(future: F, watcher: W)
+where
+    F: std::future::Future<Output = ()>,
+    W: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = watcher => {},
+        () = future => {},
     }
 }
 
@@ -373,8 +443,9 @@ async fn execute_inner(input: TurnInput, sink: TurnSink, mut ticket: Ticket) {
         .as_deref()
         .unwrap_or(&input.agent_id)
         .to_owned();
-    if state.credential_validity(input.credential.as_ref(), true).await
-        != crate::handlers::live_context::SocketValidity::Valid {
+    if !credential_allows_turn(
+        state.credential_validity(input.credential.as_ref(), true).await, &sink,
+    ).await {
         return;
     }
     let allowed = recheck_turn_access(
@@ -394,8 +465,18 @@ async fn execute_inner(input: TurnInput, sink: TurnSink, mut ticket: Ticket) {
     }
     // Keep the large model/reply future out of the nested cancellation state
     // machines, including on default-size Tokio worker stacks.
+    let credential = input.credential.clone();
     let work = Box::pin(run::run(input, sink.clone(), &ticket));
-    let (cancelled, cleanup) = run_cancellable(&sid, &ticket, work).await;
+    let watcher = async {
+        if credential.is_some() {
+            watch_credential(&ticket, || state.credential_validity(credential.as_ref(), true)).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let (cancelled, cleanup) = run_cancellable(
+        &sid, &ticket, credential_watched(work, watcher),
+    ).await;
     if cancelled {
         crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
             .scope(
