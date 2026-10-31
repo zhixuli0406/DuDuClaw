@@ -1095,7 +1095,7 @@ impl McpDispatcher {
         // Rejected calls never reach execution or generate a second scan audit.
         // Reference-monitor invariant I3: all admitted runtime calls flow through
         // this one choke point, so scanning the tool arguments here covers
-        // Claude / codex / antigravity uniformly. Fail-closed (I5):
+        // Claude / codex uniformly. Fail-closed (I5):
         // an argument value that cannot even be serialized is treated as
         // blocked rather than being waved through.
         {
