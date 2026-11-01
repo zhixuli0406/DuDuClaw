@@ -106,6 +106,17 @@ pub fn is_duduclaw_server(name: &str, _def: &Value, _self_exe: &Path) -> bool {
     name == "duduclaw" || name == "duduclaw-pro" || name == crate::mcp_server_key()
 }
 
+/// Stricter persistence exemption: only an exact built-in name invoking this
+/// binary with exactly `mcp-server` may keep its host-owned environment.
+/// Slot replacement uses `is_duduclaw_server` instead; a reserved name alone
+/// must never exempt third-party credentials from encryption at rest.
+pub fn is_host_owned_entry(name: &str, def: &Value, self_exe: &Path) -> bool {
+    is_duduclaw_server(name, def, self_exe)
+        && def.get("command").and_then(Value::as_str)
+            .is_some_and(|command| Some(command) == self_exe.to_str())
+        && def.get("args") == Some(&json!(["mcp-server"]))
+}
+
 /// The host-generated built-in definition; never derive identity from raw JSON.
 pub fn canonical_duduclaw_server(home: &Path, agent: &str, self_exe: &Path) -> Value {
     let mut env = Map::new();
@@ -461,6 +472,26 @@ mod tests {
         assert!(!is_duduclaw_server("duduclaw-evil", &own, exe));
         let raw = json!({"mcpServers":{"duduclaw-evil":own}});
         assert!(validate_raw_mcp_config(&raw, exe, &own).is_err());
+    }
+
+    #[test]
+    fn host_owned_exemption_requires_exact_name_command_and_args() {
+        let exe = Path::new("/opt/duduclaw");
+        let own = json!({"command":exe, "args":["mcp-server"]});
+        for name in ["duduclaw".to_string(), "duduclaw-pro".into(), crate::mcp_server_key()] {
+            assert!(is_host_owned_entry(&name, &own, exe));
+            for entry in [
+                json!({"command":"/tmp/evil", "args":["mcp-server"]}),
+                json!({"command":exe}),
+                json!({"command":exe, "args":["mcp-server", "--extra"]}),
+                json!({"command":exe, "args":["mcp-proxy"]}),
+                json!({"args":["mcp-server"]}),
+            ] {
+                assert!(!is_host_owned_entry(&name, &entry, exe));
+                assert!(is_duduclaw_server(&name, &entry, exe));
+            }
+        }
+        assert!(!is_host_owned_entry("duduclaw-evil", &own, exe));
     }
 
     #[test]

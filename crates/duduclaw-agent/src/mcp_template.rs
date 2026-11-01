@@ -1015,7 +1015,7 @@ pub fn read_mcp_config(agent_dir: &Path) -> Result<McpConfig, String> {
 /// Persist only third-party env references. Definitions stay plaintext only
 /// in memory while the operator's install/update request is being handled.
 fn protect_server_env(agent_dir: &Path, server: &str, def: &mut McpServerDef) -> Result<(), String> {
-    if duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(
+    if duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(
         server, &serde_json::to_value(&*def).map_err(|e| e.to_string())?,
         &duduclaw_core::resolve_duduclaw_bin(),
     ) || def.env.is_empty() {
@@ -1042,7 +1042,7 @@ pub fn protect_mcp_config_env(home: &Path, agent: &str, doc: &mut serde_json::Va
     let servers = doc.get_mut("mcpServers").and_then(serde_json::Value::as_object_mut)
         .ok_or("Invalid MCP server map")?;
     for (server, def) in servers {
-        if duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(
+        if duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(
             server, def, &duduclaw_core::resolve_duduclaw_bin(),
         ) {
             continue;

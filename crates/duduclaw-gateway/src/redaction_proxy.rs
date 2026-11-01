@@ -246,6 +246,17 @@ fn maybe_proxy_mcp_config_with_agent_dir(
         secret_env: duduclaw_core::mcp_proxy_rewrite::has_mcp_secret_refs(&parsed),
         tool_gate,
     };
+    // Secret ownership comes from a host-known employee directory, never
+    // from the basename of an arbitrary copied workspace or its raw built-in.
+    if purpose.secret_env && !agent_dir.is_some_and(|dir| {
+        duduclaw_core::is_valid_agent_id(&agent_id)
+            && (dir == home_dir.join("agents").join(&agent_id)
+                || dir == home_dir.join("agents/.ephemeral").join(&agent_id))
+    }) {
+        return Err(refuse_gate_config_unavailable(
+            home_dir, &agent_id, "cannot verify MCP secret owner outside an employee directory", explore_lane,
+        ));
+    }
     if purpose.none() && preserve_cli_discovery {
         return Ok(None);
     }

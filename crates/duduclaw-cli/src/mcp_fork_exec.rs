@@ -1297,7 +1297,7 @@ mod tests {
             home.path(), &agent_dir.join(".mcp.json"),
         ).unwrap().is_some());
         std::fs::copy(agent_dir.join(".mcp.json"), workspace.join(".mcp.json")).unwrap();
-        // Path inference would call this employee "branch" and reject Alice.
+        // An arbitrary copy has no verifiable secret owner; its basename is not an employee.
         assert!(duduclaw_gateway::redaction_proxy::maybe_proxy_mcp_config(
             home.path(), &workspace.join(".mcp.json"),
         ).is_err());
@@ -1314,18 +1314,25 @@ mod tests {
         drop(guard);
         assert!(!path.exists());
 
-        // Host-supplied context must not bless a different employee or command.
+        // Raw built-in identity and command are discarded; only Alice's host context survives.
         let mut forged: serde_json::Value = serde_json::from_str(&source).unwrap();
         forged["mcpServers"]["duduclaw"] =
             duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home.path(), "bob", &exe);
         std::fs::write(workspace.join(".mcp.json"), forged.to_string()).unwrap();
-        let mut refused = tokio::process::Command::new("claude");
-        assert!(super::prepare_fork_mcp_proxy(home.path(), &agent_dir, &workspace, &mut refused).is_err());
-        forged["mcpServers"]["duduclaw"] = own;
+        let assert_canonical = |forged: &serde_json::Value| {
+            let mut command = tokio::process::Command::new("claude");
+            let guard = super::prepare_fork_mcp_proxy(home.path(), &agent_dir, &workspace, &mut command)
+                .unwrap().unwrap();
+            let effective: serde_json::Value = serde_json::from_slice(&std::fs::read(&guard).unwrap()).unwrap();
+            assert_eq!(effective["mcpServers"]["duduclaw"], own);
+            assert_eq!(effective["mcpServers"]["vendor"]["env"]["DUDUCLAW_AGENT_ID"], "alice");
+            assert_eq!(std::fs::read_to_string(workspace.join(".mcp.json")).unwrap(), forged.to_string());
+        };
+        assert_canonical(&forged);
+        forged["mcpServers"]["duduclaw"] = own.clone();
         forged["mcpServers"]["duduclaw"]["command"] = serde_json::json!("/untrusted/duduclaw");
         std::fs::write(workspace.join(".mcp.json"), forged.to_string()).unwrap();
-        assert!(super::prepare_fork_mcp_proxy(home.path(), &agent_dir, &workspace, &mut refused).is_err());
-        assert_eq!(refused.as_std().get_args().count(), 0);
+        assert_canonical(&forged);
     }
 
     #[test]

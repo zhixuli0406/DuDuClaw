@@ -254,7 +254,7 @@ fn keeps_plaintext_env(name: &str, value: &str) -> bool {
 
 /// The only transformation for env written into employee MCP configuration.
 /// All third-party values except PUBLIC_ENV, DUDUCLAW_* and existing references are sealed.
-/// Callers may skip a fully verified built-in definition; an env-only API
+/// Callers may skip `mcp_proxy_rewrite::is_host_owned_entry` definitions; an env-only API
 /// cannot infer trust from a server name and therefore never exempts one.
 pub fn store_mcp_env(home: &Path, agent: &str, server: &str, env: &Map<String, Value>) -> io::Result<Map<String, Value>> {
     validate_agent(agent)?;

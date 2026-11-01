@@ -379,9 +379,11 @@ fn duduclaw_prefix_and_wrong_builtin_command_are_migrated() {
         duduclaw_core::mcp_proxy_rewrite::ProxyPurpose { redaction: false, tool_gate: false, secret_env: true },
         &input["mcpServers"]["duduclaw"],
     ).unwrap();
-    for name in ["duduclaw-evil", "duduclaw-pro"] {
-        assert_eq!(rewritten.config["mcpServers"][name]["args"][0], "mcp-proxy");
-    }
+    assert_eq!(rewritten.config["mcpServers"]["duduclaw-evil"]["args"][0], "mcp-proxy");
+    let rewritten_builtin = &rewritten.config["mcpServers"]["duduclaw-pro"];
+    assert_eq!(rewritten_builtin["args"][0], "mcp-server");
+    assert_eq!(rewritten_builtin["command"], input["mcpServers"]["duduclaw"]["command"]);
+    assert_ne!(rewritten_builtin["command"], "evil-mcp");
 }
 
 #[test]

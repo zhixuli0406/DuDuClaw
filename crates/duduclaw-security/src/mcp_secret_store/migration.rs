@@ -33,7 +33,7 @@ pub fn migrate_agent(home: &Path, agent: &str, path: &Path) -> io::Result<bool> 
         .ok_or_else(|| invalid("MCP configuration has no server map"))?;
     let mut needs_migration = false;
     for (server, entry) in servers.iter() {
-        if duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(
+        if duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(
             server, entry, &duduclaw_core::resolve_duduclaw_bin(),
         ) { continue }
         if let Some(env) = entry.get("env") {
@@ -81,7 +81,7 @@ pub fn migrate_agent(home: &Path, agent: &str, path: &Path) -> io::Result<bool> 
     if *verified != *original { return Err(invalid("MCP migration backup readback failed")) }
 
     for (server, entry) in servers.iter_mut() {
-        if duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(
+        if duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(
             server, entry, &duduclaw_core::resolve_duduclaw_bin(),
         ) { continue }
         if let Some(env) = entry.get_mut("env") {
