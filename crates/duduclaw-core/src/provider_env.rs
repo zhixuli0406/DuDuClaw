@@ -30,6 +30,7 @@ pub const KNOWN_PROVIDER_IDS: &[&str] = &[
     "google",
     "deepseek",
     "minimax",
+    "azure",
     "groq",
     "together",
     "mistral",
@@ -51,6 +52,7 @@ pub fn provider_env_key_names(provider: &str) -> &'static [&'static str] {
         "gemini" | "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "deepseek" => &["DEEPSEEK_API_KEY"],
         "minimax" => &["MINIMAX_API_KEY"],
+        "azure" => &["AZURE_SPEECH_KEY"],
         "groq" => &["GROQ_API_KEY"],
         "together" => &["TOGETHER_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
@@ -60,6 +62,15 @@ pub fn provider_env_key_names(provider: &str) -> &'static [&'static str] {
         // the community convention some proxies use instead.
         "qwen" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         _ => &[],
+    }
+}
+
+/// All gateway configuration names for a provider, including non-secret settings.
+/// These names are not an agent spawn allowlist.
+pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "azure" => &["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION"],
+        _ => provider_env_key_names(provider),
     }
 }
 
@@ -107,11 +118,17 @@ mod tests {
                     "`{name}` (provider `{provider}`) is not SCREAMING_SNAKE_CASE"
                 );
                 assert!(
-                    name.ends_with("_API_KEY"),
+                    name.ends_with("_API_KEY") || *name == "AZURE_SPEECH_KEY",
                     "`{name}` (provider `{provider}`) does not end in _API_KEY"
                 );
             }
         }
+    }
+
+    #[test]
+    fn azure_region_is_configuration_not_a_credential_fallback() {
+        assert_eq!(provider_env_key_names("azure"), &["AZURE_SPEECH_KEY"]);
+        assert_eq!(provider_env_names("azure"), &["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION"]);
     }
 
     #[test]

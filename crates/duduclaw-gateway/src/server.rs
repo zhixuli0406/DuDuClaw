@@ -15540,7 +15540,7 @@ struct TtsRequestBody {
 
 /// POST /api/tts — synthesize speech for `text`, returning audio bytes.
 ///
-/// Reuses `tts.rs` (edge-tts / MiniMax / OpenAI / Piper). The provider strategy
+/// Reuses `tts.rs` (Kokoro / Azure / MiniMax / OpenAI / Piper). The provider strategy
 /// follows `inference.toml [voice] tts_provider`. When TTS is explicitly
 /// disabled (or no provider is available) this returns HTTP 501 so the client
 /// can quietly turn its play toggle off.

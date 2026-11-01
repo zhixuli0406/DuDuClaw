@@ -442,3 +442,13 @@ Enterprise 使用者在「設定 → 帳號」選擇「設定雙因素登入」�
 Admin 在「使用者 → 雙因素登入管理」查看註冊狀態與通道驗證時間，使用自己的新因素重設其他帳號，或依對方這次的註冊識別碼核發一次性代碼。不能自我重設或自我核發。強制開關顯示未設定帳號數、登入受阻警告，並要求輸入畫面上的確認文字。確認開啟時固定本次動作，重新整理會清除確認；切換 RPC 必須提供 `expected_state`，設定鎖內發現狀態不同就拒絕。設定重載降級時會警告並停用開關。**強制登入仍須經審查後才能啟用**；請先保持關閉，完成獨立安全審查、真實 gateway／通道流程與救援驗證。Personal 只有已註冊帳號才顯示相關設定，本機自動登入維持原狀。
 
 呼叫端連線會在註冊／停用的成功回應取得新權杖，並在一般送出檢查前完成身分交接；HTTP 註冊也在註冊交易提交前簽發權杖。啟用強制前仍須完成真實瀏覽器／WebSocket 驗證，包括跨過心跳後復原碼仍可見，以及另一工作階段失效；行程內 handler 與前端單元測試不能代表這些驗收通過。
+
+## 語音合成
+
+`auto` 依序嘗試已安裝 Piper → 已安裝 Kokoro → MiniMax → OpenAI → Azure，並遵守產品政策。指定供應商時只用該供應商；`off` 停用合成。`duduclaw doctor` 會列出可用供應商，不發送合成請求。
+
+從 **設定 → 語音** 下載 Kokoro（約 134 MB，Apache-2.0）。安裝會驗證檔案與共用 ONNX Runtime，下載中斷後可續傳；模型權重不內含於執行檔。模型位於 `<home>/models/kokoro-zh/`。預設聲音為 `zf_001`，另提供 `zm_010` 與純英文用的 `af_maple`。中文帶有中國大陸口音，多音字可能誤讀。繁體字與數字會正規化，但發音規則無法涵蓋所有詞語。輸入上限 2,000 字，每段最多 500 tokens，段落間加入 150 ms 靜音。Kokoro 輸出 24 kHz WAV；Telegram 透過 `sendAudio` 收到 `reply.wav`。
+
+Azure 會將文字傳送至 Microsoft。請在 gateway 環境設定 `AZURE_SPEECH_KEY` 與 `AZURE_SPEECH_REGION`。預設中文聲音為 `zh-TW-HsiaoChenNeural`，英文為 `en-US-AriaNeural`，輸出 MP3。`tts_voice` 可指定該供應商支援的聲音。
+
+Admin 專用 RPC：`voice.kokoro_status` 回報安裝狀態、缺少的檔案、大小、執行環境、進度與錯誤；`voice.kokoro_install` 以可重複呼叫的方式啟動背景安裝。語音下載卡會輪詢狀態並顯示安裝錯誤。

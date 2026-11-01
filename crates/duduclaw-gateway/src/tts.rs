@@ -1,13 +1,71 @@
-//! Text-to-Speech (TTS) support — MiniMax T2A API.
-//!
-//! MiniMax Speech API: POST https://api.minimax.io/v1/t2a_v2
-//! Returns audio bytes (MP3 by default).
+//! Text-to-speech routing for local models and official cloud APIs.
+//! Returns WAV for local synthesis and MP3 for cloud synthesis.
 
 use duduclaw_core::truncate_bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tracing::{info, warn};
 use zeroize::Zeroize;
+
+/// Split a TTS command template like STT does, replacing path placeholders as
+/// individual argv tokens. The input text is deliberately never an argument.
+pub fn build_tts_command_args(command: &str, input_path: &str, output_path: &str) -> Result<(String, Vec<String>), String> {
+    let mut tokens: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    if tokens.is_empty() { return Err("tts_command is empty".into()); }
+    let has_output = tokens.iter().any(|arg| arg.contains("{output}"));
+    if !has_output { return Err("tts_command must contain the {output} placeholder".into()); }
+    for arg in &mut tokens {
+        *arg = arg.replace("{input}", input_path).replace("{output}", output_path);
+    }
+    let program = tokens.remove(0);
+    Ok((program, tokens))
+}
+
+pub struct CommandTtsProvider { command: String }
+impl CommandTtsProvider { pub fn new(command: String) -> Self { Self { command } } }
+
+async fn run_tts_command(command: &str, input: &std::path::Path, output: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
+    let input_s = input.to_string_lossy();
+    let output_s = output.to_string_lossy();
+    let (program, args) = build_tts_command_args(command, &input_s, &output_s)?;
+    let mut cmd = tokio::process::Command::new(&program);
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    cmd.args(&args).env_clear();
+    for key in ["PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "SYSTEMROOT"] {
+        if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
+    }
+    let mut child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
+        .kill_on_drop(true).spawn().map_err(|e| format!("TTS command spawn failed: {e}"))?;
+    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    let process_output = match result {
+        Ok(result) => result.map_err(|e| format!("TTS command wait failed: {e}"))?,
+        Err(_) => return Err("TTS command timeout (60s)".into()),
+    };
+    if !process_output.status.success() {
+        let stderr = String::from_utf8_lossy(&process_output.stderr);
+        return Err(format!("TTS command exited with {}: {}", process_output.status, truncate_bytes(stderr.trim(), 300)));
+    }
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for CommandTtsProvider {
+    fn name(&self) -> &str { "command" }
+    async fn synthesize(&self, text: &str, _voice: &str) -> Result<Vec<u8>, String> {
+        let dir = tempfile::Builder::new().prefix("duduclaw-tts-").tempdir()
+            .map_err(|e| format!("TTS temp directory: {e}"))?;
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("TTS temp permissions: {e}"))?;
+        }
+        let input = dir.path().join("input.txt");
+        let output = dir.path().join("output.audio");
+        tokio::fs::write(&input, text.as_bytes()).await.map_err(|e| format!("TTS input write: {e}"))?;
+        run_tts_command(&self.command, &input, &output, std::time::Duration::from_secs(60)).await?;
+        tokio::fs::read(&output).await.map_err(|e| format!("TTS command output read failed: {e}"))
+    }
+}
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -159,125 +217,81 @@ impl TtsProvider for MiniMaxTts {
     }
 }
 
-// ── edge-tts (Microsoft Edge TTS, free) ─────────────────────────
+// ── Azure AI Speech REST ───────────────────────────────────────
 
-/// Microsoft Edge TTS provider — free, high-quality Neural TTS.
-///
-/// Invokes the separately installed `edge-tts` CLI (`pipx install edge-tts`).
-/// Its unofficial Microsoft endpoint can stop working; update with `pipx upgrade edge-tts`.
-///
-/// Default voices:
-/// - zh-TW: `zh-TW-HsiaoChenNeural` (female) / `zh-TW-YunJheNeural` (male)
-/// - en-US: `en-US-AriaNeural` (female)
-pub struct EdgeTtsProvider {
-    default_voice_zh: String,
-    default_voice_en: String,
-    #[cfg(test)]
-    binary_path: Option<std::path::PathBuf>,
+/// Official Azure AI Speech service. Credentials remain in the gateway.
+pub struct AzureTts {
+    api_key: String,
+    region: String,
 }
 
-impl EdgeTtsProvider {
-    pub fn new() -> Self {
-        Self {
-            default_voice_zh: "zh-TW-HsiaoChenNeural".into(),
-            default_voice_en: "en-US-AriaNeural".into(),
-            #[cfg(test)]
-            binary_path: None,
-        }
+impl Drop for AzureTts {
+    fn drop(&mut self) { self.api_key.zeroize(); }
+}
+
+impl AzureTts {
+    pub fn from_env() -> Option<Self> {
+        let api_key = std::env::var("AZURE_SPEECH_KEY").ok()?;
+        let region = std::env::var("AZURE_SPEECH_REGION").ok()?;
+        if api_key.is_empty() || !Self::valid_region(&region) { return None; }
+        Some(Self { api_key, region })
     }
 
-    pub fn with_voices(zh_voice: String, en_voice: String) -> Self {
-        Self {
-            default_voice_zh: zh_voice,
-            default_voice_en: en_voice,
-            #[cfg(test)]
-            binary_path: None,
-        }
-    }
-
-    fn detect_voice(&self, text: &str) -> &str {
-        let cjk_count = text.chars().filter(|c| *c > '\u{2E80}').count();
-        let total = text.chars().count().max(1);
-        if cjk_count as f64 / total as f64 > 0.3 {
-            &self.default_voice_zh
-        } else {
-            &self.default_voice_en
-        }
-    }
-
-    /// Discover the separately installed CLI, without contacting the service.
-    pub fn is_installed() -> bool {
-        Self::binary().is_some()
-    }
-
-    fn binary() -> Option<String> {
-        let path = duduclaw_core::which_cli("edge-tts")?;
-        let metadata = std::fs::metadata(&path).ok()?;
-        if !metadata.is_file() { return None; }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 { return None; }
-        }
-        Some(path)
+    fn valid_region(region: &str) -> bool {
+        !region.is_empty() && region.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     }
 
     fn valid_voice(voice: &str) -> bool {
         !voice.is_empty() && voice.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
     }
+
+    fn detect_voice(text: &str) -> &'static str {
+        let cjk_count = text.chars().filter(|c| *c > '\u{2E80}').count();
+        let total = text.chars().count().max(1);
+        if cjk_count as f64 / total as f64 > 0.3 {
+            "zh-TW-HsiaoChenNeural"
+        } else {
+            "en-US-AriaNeural"
+        }
+    }
+
+    fn ssml(text: &str, voice: &str) -> String {
+        let language = voice.split('-').take(2).collect::<Vec<_>>().join("-");
+        let escaped = text.replace('&', "&amp;").replace('<', "&lt;")
+            .replace('>', "&gt;").replace('\"', "&quot;").replace('\'', "&apos;");
+        format!("<speak version=\"1.0\" xmlns=\"http://www.w3.org/2001/10/synthesis\" xml:lang=\"{language}\"><voice name=\"{voice}\">{escaped}</voice></speak>")
+    }
 }
 
 #[async_trait::async_trait]
-impl TtsProvider for EdgeTtsProvider {
-    fn name(&self) -> &str {
-        "edge-tts"
-    }
+impl TtsProvider for AzureTts {
+    fn name(&self) -> &str { "azure" }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
-        let voice = if voice.is_empty() { self.detect_voice(text) } else { voice };
-        if !Self::valid_voice(voice) {
-            return Err("Invalid edge-tts voice".into());
+        if !Self::valid_region(&self.region) { return Err("Invalid Azure Speech region".into()); }
+        let voice = if voice.is_empty() { Self::detect_voice(text) } else { voice };
+        if !Self::valid_voice(voice) { return Err("Invalid Azure Speech voice".into()); }
+        // A redirect must never forward the subscription key to a different endpoint.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .build().map_err(|_| "Azure Speech HTTP client initialization failed".to_string())?;
+        let response = client
+            .post(format!("https://{}.tts.speech.microsoft.com/cognitiveservices/v1", self.region))
+            .header("Ocp-Apim-Subscription-Key", &self.api_key)
+            .header("Content-Type", "application/ssml+xml")
+            .header("X-Microsoft-OutputFormat", "audio-24khz-48kbitrate-mono-mp3")
+            .header("User-Agent", "duduclaw")
+            .body(Self::ssml(text, voice))
+            .send().await.map_err(|_| "Azure Speech request failed".to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            // Do not echo the remote response or request headers containing credentials.
+            return Err(format!("Azure Speech error ({status})"));
         }
-        #[cfg(test)]
-        let binary = self.binary_path.clone().or_else(|| Self::binary().map(Into::into));
-        #[cfg(not(test))]
-        let binary = Self::binary().map(std::path::PathBuf::from);
-        let binary = binary.ok_or("edge-tts is not installed. Install: pipx install edge-tts")?;
-
-        // TempDir owns cleanup on success, errors, timeout and cancellation.
-        let dir = tempfile::Builder::new().prefix("duduclaw-tts-").tempdir()
-            .map_err(|e| format!("edge-tts temporary directory: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("edge-tts directory permissions: {e}"))?;
-        }
-        let input = dir.path().join("input.txt");
-        let output = dir.path().join("output.mp3");
-        tokio::fs::write(&input, text).await.map_err(|e| format!("edge-tts input: {e}"))?;
-        let mut cmd = tokio::process::Command::new(binary);
-        cmd.env_clear();
-        for key in ["PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "SYSTEMROOT"] {
-            if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
-        }
-        duduclaw_core::ns_guard::guard_command(&mut cmd);
-        cmd.arg("--file").arg(&input).arg("--voice").arg(voice)
-            .arg("--write-media").arg(&output)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
-            .await.map_err(|_| "edge-tts synthesis timeout (30s)".to_string())?
-            .map_err(|e| format!("edge-tts execution failed: {e}"))?;
-        if !result.status.success() {
-            return Err(format!("edge-tts failed ({}): {}", result.status,
-                truncate_bytes(&String::from_utf8_lossy(&result.stderr), 300)));
-        }
-        let audio = tokio::fs::read(&output).await.map_err(|e| format!("edge-tts output: {e}"))?;
-        if audio.is_empty() { return Err("edge-tts returned no audio data".into()); }
-        Ok(audio)
+        let audio = response.bytes().await.map_err(|_| "Azure Speech audio read failed".to_string())?;
+        if audio.is_empty() { return Err("Azure Speech returned no audio".into()); }
+        Ok(audio.to_vec())
     }
 }
 
@@ -504,7 +518,7 @@ impl TtsProvider for PiperTtsProvider {
 }
 
 /// Encode raw PCM i16 bytes as WAV.
-fn pcm_i16_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+pub(crate) fn pcm_i16_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     let data_size = pcm.len() as u32;
     let file_size = 36 + data_size;
     let mut buf = Vec::with_capacity(44 + pcm.len());
@@ -530,15 +544,18 @@ fn pcm_i16_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
 /// TTS routing strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtsStrategy {
-    /// Local first → edge-tts → MiniMax → OpenAI.
+    /// Piper → Kokoro → MiniMax → OpenAI → Azure → configured command.
     LocalFirst,
-    /// edge-tts only (free, no API key).
-    EdgeOnly,
+    /// Local Kokoro only.
+    KokoroOnly,
+    /// Official Azure AI Speech only.
+    AzureOnly,
     /// Best quality cloud provider.
     CloudBest,
     PiperOnly,
     MiniMaxOnly,
     OpenAiOnly,
+    CommandOnly,
 }
 
 /// TTS Router — dispatches to the best available provider.
@@ -603,10 +620,18 @@ impl TtsRouter {
     fn strategy_for_setting(setting: &str) -> Option<TtsStrategy> {
         Some(match setting {
             "none" | "off" | "disabled" => return None,
-            "edge-tts" | "edge" => TtsStrategy::EdgeOnly,
+            // Deprecated settings remain accepted until v1.81.0.
+            "edge-tts" | "edge" => {
+                static WARN: std::sync::Once = std::sync::Once::new();
+                WARN.call_once(|| warn!("edge-tts is deprecated; using auto. Choose Kokoro or Azure; compatibility ends in v1.81.0"));
+                TtsStrategy::LocalFirst
+            }
+            "kokoro" => TtsStrategy::KokoroOnly,
+            "azure" => TtsStrategy::AzureOnly,
             "piper" => TtsStrategy::PiperOnly,
             "minimax" => TtsStrategy::MiniMaxOnly,
             "openai-tts" | "openai" => TtsStrategy::OpenAiOnly,
+            "command" => TtsStrategy::CommandOnly,
             _ => TtsStrategy::LocalFirst,
         })
     }
@@ -628,10 +653,7 @@ impl TtsRouter {
 
     /// Build a router with auto-detected providers.
     ///
-    /// Provider priority depends on strategy:
-    /// - LocalFirst: Piper → edge-tts → MiniMax → OpenAI
-    /// - EdgeOnly: edge-tts only
-    /// - CloudBest: MiniMax → OpenAI → edge-tts (paid first for quality)
+    /// Auto prefers installed local providers, then configured cloud services.
     pub fn auto_detect(models_dir: &std::path::Path, strategy: TtsStrategy) -> Self {
         Self::auto_detect_for_home(&duduclaw_core::platform::duduclaw_home(), models_dir, strategy)
     }
@@ -641,50 +663,41 @@ impl TtsRouter {
         router.home_dir = Some(home_dir.to_path_buf());
         let Ok(policy) = crate::product_policy::load(home_dir) else { return router; };
 
-        if matches!(strategy, TtsStrategy::LocalFirst) {
-            // Piper local (highest priority)
+        if matches!(strategy, TtsStrategy::LocalFirst | TtsStrategy::PiperOnly) {
             if let Some(piper) = PiperTtsProvider::from_models_dir(models_dir) {
                 router.providers.push(Box::new(piper));
             }
-            // edge-tts free cloud
-            if EdgeTtsProvider::is_installed() {
-                router.providers.push(Box::new(EdgeTtsProvider::new()));
-            }
-            // Paid fallbacks
-            if let Some(minimax) = MiniMaxTts::from_env() {
-                router.providers.push(Box::new(minimax));
-            }
-            if let Some(openai) = OpenAiTtsProvider::from_env() {
-                router.providers.push(Box::new(openai));
-            }
-        } else if matches!(strategy, TtsStrategy::CloudBest) {
-            // Paid providers first (better quality)
-            if let Some(minimax) = MiniMaxTts::from_env() {
-                router.providers.push(Box::new(minimax));
-            }
-            if let Some(openai) = OpenAiTtsProvider::from_env() {
-                router.providers.push(Box::new(openai));
-            }
-            // edge-tts as free fallback
-            if EdgeTtsProvider::is_installed() {
-                router.providers.push(Box::new(EdgeTtsProvider::new()));
-            }
-        } else if matches!(strategy, TtsStrategy::PiperOnly) {
-            if let Some(piper) = PiperTtsProvider::from_models_dir(models_dir) {
-                router.providers.push(Box::new(piper));
-            }
-        } else if matches!(strategy, TtsStrategy::MiniMaxOnly) {
+        }
+        if matches!(strategy, TtsStrategy::LocalFirst | TtsStrategy::KokoroOnly)
+            && crate::tts_kokoro::is_installed(home_dir) {
+            router.providers.push(Box::new(crate::tts_kokoro::KokoroTtsProvider::new(home_dir.to_path_buf())));
+        }
+        if matches!(strategy, TtsStrategy::LocalFirst | TtsStrategy::CloudBest | TtsStrategy::MiniMaxOnly) {
             if let Some(minimax) = MiniMaxTts::from_env() { router.providers.push(Box::new(minimax)); }
-        } else if matches!(strategy, TtsStrategy::OpenAiOnly) {
+        }
+        if matches!(strategy, TtsStrategy::LocalFirst | TtsStrategy::CloudBest | TtsStrategy::OpenAiOnly) {
             if let Some(openai) = OpenAiTtsProvider::from_env() { router.providers.push(Box::new(openai)); }
-        } else {
-            // EdgeOnly
-            if EdgeTtsProvider::is_installed() {
-                router.providers.push(Box::new(EdgeTtsProvider::new()));
+        }
+        if matches!(strategy, TtsStrategy::LocalFirst | TtsStrategy::CloudBest | TtsStrategy::AzureOnly) {
+            if let Some(azure) = AzureTts::from_env() { router.providers.push(Box::new(azure)); }
+        }
+
+        if matches!(strategy, TtsStrategy::LocalFirst | TtsStrategy::CommandOnly) {
+            if let Ok(config) = Self::load_inference_config(home_dir) {
+                if let Some(command) = config.get("voice").and_then(|v| v.get("tts_command")).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    if command.split_whitespace().any(|arg| arg.contains("{output}")) {
+                        router.providers.push(Box::new(CommandTtsProvider::new(command.to_string())));
+                    } else {
+                        warn!("TTS command provider unavailable: tts_command has no {output} placeholder");
+                    }
+                }
             }
         }
 
-        router.providers.retain(|provider| policy.require_provider(provider.name()).is_ok());
+        router.providers.retain(|provider| {
+            policy.require_provider(provider.name()).is_ok()
+                && (!matches!(strategy, TtsStrategy::CommandOnly) || provider.name() == "command")
+        });
         if router.providers.is_empty() {
             tracing::warn!("TTS Router: no providers available");
         }
@@ -740,9 +753,9 @@ mod tests {
 
     #[test]
     fn voice_validation_rejects_shell_syntax() {
-        assert!(!EdgeTtsProvider::valid_voice("a;b"));
-        assert!(!EdgeTtsProvider::valid_voice(""));
-        assert!(EdgeTtsProvider::valid_voice("zh-TW-HsiaoChenNeural"));
+        assert!(!AzureTts::valid_voice("a;b"));
+        assert!(!AzureTts::valid_voice(""));
+        assert!(AzureTts::valid_voice("zh-TW-HsiaoChenNeural"));
     }
 
     #[test]
@@ -750,12 +763,15 @@ mod tests {
         for (setting, strategy) in [
             ("", TtsStrategy::LocalFirst),
             ("auto", TtsStrategy::LocalFirst),
-            ("edge", TtsStrategy::EdgeOnly),
-            ("edge-tts", TtsStrategy::EdgeOnly),
+            ("edge", TtsStrategy::LocalFirst),
+            ("edge-tts", TtsStrategy::LocalFirst),
+            ("kokoro", TtsStrategy::KokoroOnly),
+            ("azure", TtsStrategy::AzureOnly),
             ("piper", TtsStrategy::PiperOnly),
             ("minimax", TtsStrategy::MiniMaxOnly),
             ("openai", TtsStrategy::OpenAiOnly),
             ("openai-tts", TtsStrategy::OpenAiOnly),
+            ("command", TtsStrategy::CommandOnly),
         ] {
             assert_eq!(TtsRouter::strategy_for_setting(setting), Some(strategy));
         }
@@ -763,6 +779,56 @@ mod tests {
             assert_eq!(TtsRouter::strategy_for_setting(setting), None);
         }
         assert!(!TtsRouter::new().is_available());
+    }
+
+    #[test]
+    fn command_placeholders_are_separate_argv_and_missing_output_is_rejected() {
+        let (program, args) = build_tts_command_args("/bin/tool --in {input} --out {output}", "/tmp/in file", "/tmp/out file").unwrap();
+        assert_eq!(program, "/bin/tool");
+        assert_eq!(args, ["--in", "/tmp/in file", "--out", "/tmp/out file"]);
+        assert!(build_tts_command_args("tool --in {input}", "/tmp/in", "/tmp/out").unwrap_err().contains("{output}"));
+    }
+
+    #[test]
+    fn command_is_a_supported_router_strategy() {
+        assert_eq!(TtsRouter::strategy_for_setting("command"), Some(TtsStrategy::CommandOnly));
+    }
+
+    #[tokio::test]
+    async fn command_provider_reports_nonzero_exit_with_truncated_stderr() {
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            let script = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(script.path(), "#!/bin/sh\nprintf 'failure detail' >&2\nexit 7\n").unwrap();
+            std::fs::set_permissions(script.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let err = run_tts_command(&format!("{} {{output}}", script.path().display()), std::path::Path::new("/tmp/in"), std::path::Path::new("/tmp/out"), std::time::Duration::from_secs(2)).await.unwrap_err();
+            assert!(err.contains("failure detail"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_provider_uses_input_file_and_returns_script_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(script.path(), "#!/bin/sh\n[ \"$#\" -eq 4 ] || exit 21\n[ \"$1\" = --in ] || exit 22\n[ \"$3\" = --out ] || exit 23\n[ -f \"$2\" ] || exit 24\n[ \"$2\" != 'hidden phrase' ] || exit 25\ncat \"$2\" | grep -q 'hidden phrase' || exit 26\nprintf 'RIFFfake' > \"$4\"\n").unwrap();
+        std::fs::set_permissions(script.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = CommandTtsProvider::new(format!("{} --in {{input}} --out {{output}}", script.path().display()));
+        assert_eq!(provider.synthesize("hidden phrase", "").await.unwrap(), b"RIFFfake");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_provider_timeout_is_reported() {
+        let script = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(script.path(), "#!/bin/sh\nsleep 61\n").unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(script.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let provider = CommandTtsProvider::new(format!("{} {{output}}", script.path().display()));
+        let result = run_tts_command(&provider.command, std::path::Path::new("/tmp/in"), std::path::Path::new("/tmp/out"), std::time::Duration::from_millis(100)).await;
+        assert!(result.unwrap_err().contains("timeout"));
     }
 
     #[test]
@@ -813,56 +879,17 @@ mod tests {
         assert_eq!(router.synthesize("hello", "override").await.unwrap(), b"override");
     }
 
-    #[cfg(unix)]
-    fn fake_edge(script: &str) -> (tempfile::TempDir, EdgeTtsProvider) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("edge-tts");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut provider = EdgeTtsProvider::new();
-        provider.binary_path = Some(path);
-        (dir, provider)
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn edge_cli_passes_text_only_by_private_file_and_returns_audio() {
-        let (_dir, provider) = fake_edge(r#"
-[ "$#" -eq 6 ] || exit 11
-[ "$1" = '--file' ] && [ "$3" = '--voice' ] && [ "$5" = '--write-media' ] || exit 12
-[ "$4" = 'zh-TW-HsiaoChenNeural' ] || exit 13
-[ "$(/bin/cat "$2")" = '你好 **私密文字** $()' ] || exit 14
-[ -z "${OPENAI_API_KEY}${MINIMAX_API_KEY}${DUDUCLAW_AGENT_TOKEN}" ] || exit 15
-printf '%s' "$2" > "$0.input-path"
-printf 'fake-mp3' > "$6"
-"#);
-        let audio = provider.synthesize("你好 **私密文字** $()", "").await.unwrap();
-        assert_eq!(audio, b"fake-mp3");
-        let marker = provider.binary_path.as_ref().unwrap().with_file_name("edge-tts.input-path");
-        let input_path = std::fs::read_to_string(marker).unwrap();
-        assert!(!std::path::Path::new(&input_path).exists());
-        assert!(!std::path::Path::new(&input_path).parent().unwrap().exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn edge_cli_nonzero_exit_truncates_cjk_stderr_safely() {
-        // 299 bytes precede a three-byte character, exercising a UTF-8 boundary.
-        let stderr = format!("{}中{}", "x".repeat(299), "錯誤".repeat(200));
-        let (_dir, provider) = fake_edge(&format!("printf '%s' '{}' >&2\nexit 9", stderr));
-        let error = provider.synthesize("hello", "").await.unwrap_err();
-        assert!(error.contains("edge-tts failed"));
-        assert!(error.contains(&"x".repeat(299)));
-        assert!(!error.contains("錯誤"));
-        assert!(error.len() < 400);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn edge_cli_rejects_invalid_voice_before_spawning() {
-        let (_dir, provider) = fake_edge("exit 99");
-        assert_eq!(provider.synthesize("hello", "a;b").await.unwrap_err(), "Invalid edge-tts voice");
+    #[test]
+    fn azure_validates_region_and_escapes_ssml() {
+        assert!(AzureTts::valid_region("eastasia"));
+        assert!(!AzureTts::valid_region("a.evil.com"));
+        assert!(!AzureTts::valid_region(""));
+        assert!(!AzureTts::valid_region("EastAsia"));
+        assert_eq!(AzureTts::detect_voice("你好，今天天氣真好。"), "zh-TW-HsiaoChenNeural");
+        assert_eq!(AzureTts::detect_voice("Hello world"), "en-US-AriaNeural");
+        let ssml = AzureTts::ssml("<&>", "zh-TW-HsiaoChenNeural");
+        assert!(ssml.contains("&lt;&amp;&gt;"));
+        assert!(ssml.contains("xml:lang=\"zh-TW\""));
     }
 
     #[test]

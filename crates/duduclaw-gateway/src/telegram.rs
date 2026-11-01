@@ -2906,9 +2906,14 @@ async fn send_voice(
     chat_id: i64,
     audio_data: Vec<u8>,
 ) -> bool {
+    let (filename, mime) = if audio_data.starts_with(b"RIFF") {
+        ("reply.wav", "audio/wav")
+    } else {
+        ("reply.mp3", "audio/mpeg")
+    };
     let part = match reqwest::multipart::Part::bytes(audio_data)
-        .file_name("reply.mp3")
-        .mime_str("audio/mpeg")
+        .file_name(filename)
+        .mime_str(mime)
     {
         Ok(p) => p,
         Err(e) => {

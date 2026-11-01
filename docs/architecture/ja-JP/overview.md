@@ -81,9 +81,9 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - 以前の Meta-Token（LTSC）/ LLMLingua-2 / StreamingLLM 圧縮器と、その `compress_text` / `decompress_text` ツールは v1.33 で削除されました。
 
 ### 音声パイプライン
-- **HTTP エンドポイント**：`POST /api/stt`（OpenAI 互換の文字起こし API またはローカルのコマンドテンプレート。STT provider が未設定なら 501）、`POST /api/tts`（Piper（ローカル）/ Edge TTS / MiniMax T2A / OpenAI TTS）。
+- **HTTP エンドポイント**：`POST /api/stt`（OpenAI 互換の文字起こし API またはローカルのコマンドテンプレート。STT provider が未設定なら 501）、`POST /api/tts`（Piper（ローカル）/ Kokoro / Azure / MiniMax T2A / OpenAI TTS）。
 - **Telegram の音声**：文字起こしは設定済み STT プロバイダーを使用（未設定時は従来の Whisper にフォールバック）。音声返信は共通 TTS ルーターとダッシュボードの TTS 設定に従い、失敗時はテキストに戻ります。
-- **任意の Edge TTS**：`pipx install edge-tts` で別途インストールし、`pipx upgrade edge-tts` で更新します。Microsoft の非公式エンドポイントのため、動作しなくなる可能性があります。
+- ローカル Kokoro-82M v1.1-zh（Apache-2.0、設定 → 音声から約 134 MB をダウンロード）が従来の任意 CLI に代わります。自動選択順はインストール済み Piper → インストール済み Kokoro → MiniMax → OpenAI → Azure。Kokoro の中国語は中国大陸のアクセントで、多音字を誤読する場合があります。公式 Azure AI Speech REST は台湾の中国語音声を提供し、テキストを Microsoft に送信します。`AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` が必要です。Telegram はローカル Kokoro 音声を WAV として受信します（`sendAudio`）。
 - **リリースバイナリに含まれないもの**：プロセス内 Whisper（`whisper` feature）、ONNX 埋め込み（`onnx` feature）、Discord ボイス（`discord-voice` feature）。
 - SenseVoice、Deepgram、Silero VAD、`symphonia` によるデコード、LiveKit の音声ルームは以前ここに記載されていましたが、いずれもコードが存在しません。[`docs/features/ja-JP/14-voice-pipeline.md`](../../features/ja-JP/14-voice-pipeline.md) を参照。
 

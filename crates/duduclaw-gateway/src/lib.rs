@@ -414,6 +414,7 @@ pub mod stt;
 pub mod task_spec;
 pub mod telegram;
 pub mod tts;
+pub mod tts_kokoro;
 pub mod uki_patch;
 pub mod updater;
 pub mod web_extract;

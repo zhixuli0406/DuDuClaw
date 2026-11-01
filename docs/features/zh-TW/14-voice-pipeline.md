@@ -23,7 +23,7 @@ HTTP 與 Telegram 使用 `config.toml [voice] stt_*` 設定語音辨識。HTTP�
 | 端點 | 驗證 | 行為 |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | body 上限 10 MiB。**在碰 body 之前**先從 `config.toml [voice]` 解析供應商，沒設定就回 **501 fail-closed**——絕不猜測、絕不編造逐字稿 |
-| `POST /api/tts` | Bearer JWT | 使用共用 router：`edge-tts`、`piper`、`minimax`、`openai-tts` 各只使用指定供應商；其他啟用設定採本機優先。設成 `none`／`off`／`disabled` 時回 501 |
+| `POST /api/tts` | Bearer JWT | 使用共用 router：`kokoro`、`azure`、`piper`、`minimax`、`openai-tts` 各只使用指定供應商；其他啟用設定採本機優先。設成 `none`／`off`／`disabled` 時回 501 |
 | `GET`／`POST /api/voice/config` | Bearer JWT | 讀寫 `[voice]` 的 STT 設定 |
 
 **STT 供應商**（`stt.rs`，兩個實作）：
@@ -40,18 +40,25 @@ stt_model     = "whisper-1"
 stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --no-prints"
 ```
 
-**TTS 供應商**（`tts.rs`，同一個 `TtsProvider` trait 下四個實作）：
+**TTS**
 
-| 供應商 | 位置 | 說明 |
+| 供應商 | 執行位置 | 說明 |
 |---|---|---|
-| `PiperTtsProvider` | 本機 | 從模型目錄讀 ONNX 語音 |
-| `EdgeTtsProvider` | 雲端 | 選用、須另行安裝的 `edge-tts` CLI；不用 API key |
-| `MiniMaxTts` | 雲端 | T2A v2；分析文字內容自動挑 CJK 或拉丁語音 |
-| `OpenAiTtsProvider` | 雲端 | 依字元計費 |
+| `PiperTtsProvider` | 本機 | 已安裝的 ONNX 語音 |
+| `KokoroTtsProvider` | 本機 | Kokoro-82M v1.1-zh，Apache-2.0，按需下載 |
+| `MiniMaxTts` | 雲端 | T2A v2，自動選擇 CJK 或拉丁語音 |
+| `OpenAiTtsProvider` | 雲端 | OpenAI TTS |
+| `AzureTts` | 雲端 | 官方 Azure AI Speech REST，提供台灣國語聲音 |
 
-`TtsRouter` 支援本機優先（Piper → edge-tts → MiniMax → OpenAI）、雲端優先與指定單一供應商，只使用偵測到且產品政策允許的供應商。
+`auto` 依序嘗試已安裝 Piper → 已安裝 Kokoro → MiniMax → OpenAI → Azure，並遵守產品政策。指定供應商時只用該供應商；`off` 停用合成。`duduclaw doctor` 會列出可用供應商，不發送合成請求。
 
-Edge TTS 為選用功能，必須另行執行 `pipx install edge-tts` 安裝，並以 `pipx upgrade edge-tts` 更新。它使用 Microsoft 非官方端點，可能隨時失效。DuDuClaw 以獨立子行程呼叫 CLI，不內含該 Python 套件。`duduclaw doctor` 會列出本機可用供應商，不會連線測試。
+`command` 供應商會執行 Admin 設定的外部程式；DuDuClaw 不附帶合成程式。透過「設定 → 語音」設定 `tts_provider = "command"` 與 `tts_command = "/path/to/my-tts --in {input} --out {output}"`。指令字串以空白切分為 argv，不經 shell；`{input}`、`{output}` 會各自替換成一個 argv 項目。文字寫入私有暫存目錄的 `input.txt`，程式須將音訊位元組寫入 `output.audio`。指令逾時為 60 秒，且只接收 `PATH`、`HOME`、`USERPROFILE`、`TEMP`、`TMP`、`SYSTEMROOT` 環境變數。`auto` 會在其他既有供應商之後才嘗試此供應商。
+
+從 **設定 → 語音** 下載 Kokoro（約 134 MB，Apache-2.0）。安裝會驗證檔案與共用 ONNX Runtime，下載中斷後可續傳；模型權重不內含於執行檔。模型位於 `<home>/models/kokoro-zh/`。預設聲音為 `zf_001`，另提供 `zm_010` 與純英文用的 `af_maple`。中文帶有中國大陸口音，多音字可能誤讀。繁體字與數字會正規化，但發音規則無法涵蓋所有詞語。輸入上限 2,000 字，每段最多 500 tokens，段落間加入 150 ms 靜音。Kokoro 輸出 24 kHz WAV；Telegram 透過 `sendAudio` 收到 `reply.wav`。
+
+Azure 會將文字傳送至 Microsoft。請在 gateway 環境設定 `AZURE_SPEECH_KEY` 與 `AZURE_SPEECH_REGION`。預設中文聲音為 `zh-TW-HsiaoChenNeural`，英文為 `en-US-AriaNeural`，輸出 MP3。`tts_voice` 可指定該供應商支援的聲音。
+
+Admin 專用 RPC：`voice.kokoro_status` 回報安裝狀態、缺少的檔案、大小、執行環境、進度與錯誤；`voice.kokoro_install` 以可重複呼叫的方式啟動背景安裝。語音下載卡會輪詢狀態並顯示安裝錯誤。
 
 ### 路徑 2 — Telegram 語音訊息
 

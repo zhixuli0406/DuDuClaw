@@ -23,7 +23,7 @@ HTTP と Telegram の音声認識は `config.toml [voice] stt_*` を使用しま
 | エンドポイント | 認証 | 挙動 |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | ボディ上限 10 MiB。ボディに触れる**前に** `config.toml [voice]` からプロバイダを解決し、未設定なら **501 で fail-closed**——推測も文字起こしの捏造もしません |
-| `POST /api/tts` | Bearer JWT | 共通ルーターを使用。`edge-tts`、`piper`、`minimax`、`openai-tts` は指定したプロバイダーのみ、それ以外の有効な設定はローカル優先。`none` / `off` / `disabled` は 501 を返します |
+| `POST /api/tts` | Bearer JWT | 共通ルーターを使用。`kokoro`、`azure`、`piper`、`minimax`、`openai-tts` は指定したプロバイダーのみ、それ以外の有効な設定はローカル優先。`none` / `off` / `disabled` は 501 を返します |
 | `GET`／`POST /api/voice/config` | Bearer JWT | `[voice]` の STT 設定を読み書き |
 
 **STT プロバイダ**（`stt.rs`、実装は2つ）：
@@ -40,18 +40,25 @@ stt_model     = "whisper-1"
 stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --no-prints"
 ```
 
-**TTS プロバイダ**（`tts.rs`、1つの `TtsProvider` トレイトの下に4実装）：
+**TTS**
 
-| プロバイダ | 場所 | 備考 |
+| プロバイダー | 場所 | 説明 |
 |---|---|---|
-| `PiperTtsProvider` | ローカル | モデルディレクトリの ONNX ボイス |
-| `EdgeTtsProvider` | クラウド | 任意機能。別途インストールする `edge-tts` CLI。API キー不要 |
-| `MiniMaxTts` | クラウド | T2A v2。テキストを解析して CJK かラテン系のボイスを選択 |
-| `OpenAiTtsProvider` | クラウド | 文字単位課金 |
+| `PiperTtsProvider` | ローカル | インストール済み ONNX 音声 |
+| `KokoroTtsProvider` | ローカル | Kokoro-82M v1.1-zh、Apache-2.0、必要時にダウンロード |
+| `MiniMaxTts` | クラウド | T2A v2、CJK またはラテン文字の音声を選択 |
+| `OpenAiTtsProvider` | クラウド | OpenAI TTS |
+| `AzureTts` | クラウド | 公式 Azure AI Speech REST、台湾の中国語音声 |
 
-`TtsRouter` はローカル優先（Piper → edge-tts → MiniMax → OpenAI）、クラウド優先、単一プロバイダーのルーティングを備え、検出済みで製品ポリシーが許可するプロバイダーだけを使用します。
+`auto` はインストール済み Piper → インストール済み Kokoro → MiniMax → OpenAI → Azure の順に試し、製品ポリシーを適用します。プロバイダーを指定した場合はそのプロバイダーのみ使用し、`off` は音声合成を無効にします。`duduclaw doctor` は合成リクエストを送らずに利用可能なプロバイダーを表示します。
 
-Edge TTS は任意機能で、`pipx install edge-tts` による別途インストールが必要です。更新には `pipx upgrade edge-tts` を使います。Microsoft の非公式エンドポイントを使用するため、動作しなくなる可能性があります。DuDuClaw は CLI を独立した子プロセスとして呼び出し、Python パッケージを同梱しません。`duduclaw doctor` はネットワークに接続せず、ローカルで利用可能なプロバイダーを表示します。
+`command` プロバイダーは Admin が設定した外部プログラムを実行します。DuDuClaw に合成プログラムは同梱されません。「設定 → 音声」で `tts_provider = "command"` と `tts_command = "/path/to/my-tts --in {input} --out {output}"` を設定してください。コマンド文字列は空白で argv に分割し、shell は使いません。`{input}` と `{output}` はそれぞれ1つの argv 項目としてパスに置換されます。テキストはプライベートな一時ディレクトリの `input.txt` に書き込まれ、プログラムは音声バイト列を `output.audio` に書き込みます。タイムアウトは60秒で、環境変数は `PATH`、`HOME`、`USERPROFILE`、`TEMP`、`TMP`、`SYSTEMROOT` のみです。`auto` では既存の他プロバイダーの後に試します。
+
+**設定 → 音声** から Kokoro をダウンロードします（約 134 MB、Apache-2.0）。インストール時にファイルと共有 ONNX Runtime を検証し、中断したダウンロードは再開できます。モデルの重みはバイナリに含まれません。保存先は `<home>/models/kokoro-zh/`。既定音声は `zf_001`、ほかに `zm_010` と英語専用の `af_maple` を選べます。中国語は中国大陸のアクセントで、多音字を誤読する場合があります。繁体字と数値を正規化しますが、すべての単語の発音を網羅するものではありません。入力上限は 2,000 文字、各チャンクは最大 500 tokens、間に 150 ms の無音を追加します。Kokoro は 24 kHz WAV を出力し、Telegram には `sendAudio` で `reply.wav` を送ります。
+
+Azure はテキストを Microsoft に送信します。gateway 環境に `AZURE_SPEECH_KEY` と `AZURE_SPEECH_REGION` を設定してください。中国語の既定音声は `zh-TW-HsiaoChenNeural`、英語は `en-US-AriaNeural` で、MP3 を返します。`tts_voice` でプロバイダーの対応音声を指定できます。
+
+Admin 専用 RPC：`voice.kokoro_status` はインストール、欠落ファイル、サイズ、ランタイム、進捗、エラーを返します。`voice.kokoro_install` は冪等なバックグラウンドインストールを開始します。音声のダウンロードカードは状態をポーリングし、エラーを表示します。
 
 ### 経路2 — Telegram の音声メッセージ
 

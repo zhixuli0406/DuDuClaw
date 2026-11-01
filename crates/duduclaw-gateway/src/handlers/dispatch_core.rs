@@ -290,6 +290,17 @@ impl MethodHandler {
             // §13.4 「AI 智慧偵測」 model lifecycle. Same operator gate as the
             // rest of `redaction.*`: installing a 945 MB artefact and changing
             // what the detector can see are both operator actions.
+            "voice.kokoro_status" => {
+                require_admin!();
+                WsFrame::ok_response("", crate::tts_kokoro::install::status(&self.home_dir))
+            }
+            "voice.kokoro_install" => {
+                require_admin!();
+                match crate::tts_kokoro::install::install_start(&self.home_dir) {
+                    Ok(v) => WsFrame::ok_response("", v),
+                    Err(e) => WsFrame::error_response("", &e),
+                }
+            }
             "redaction.model.status" => {
                 require_admin!();
                 boxed_frame(|| self.handle_redaction_model_status()).await

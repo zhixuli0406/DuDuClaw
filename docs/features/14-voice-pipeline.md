@@ -23,7 +23,7 @@ HTTP and Telegram use `config.toml [voice] stt_*` for speech recognition. HTTP, 
 | Endpoint | Auth | Behavior |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | 10 MiB body cap. Resolves the provider from `config.toml [voice]` **before** touching the body, and returns **501 fail-closed** when none is configured — it never guesses or fabricates a transcript |
-| `POST /api/tts` | Bearer JWT | Uses the shared router: `edge-tts`, `piper`, `minimax` and `openai-tts` select only that provider; other enabled settings use local-first routing. `none` / `off` / `disabled` returns 501 |
+| `POST /api/tts` | Bearer JWT | Uses the shared router: `kokoro`, `azure`, `piper`, `minimax` and `openai-tts` select only that provider; other enabled settings use local-first routing. `none` / `off` / `disabled` returns 501 |
 | `GET`/`POST /api/voice/config` | Bearer JWT | Read/write the `[voice]` STT settings |
 
 **STT providers** (`stt.rs`, two implementations):
@@ -40,18 +40,25 @@ stt_model     = "whisper-1"
 stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --no-prints"
 ```
 
-**TTS providers** (`tts.rs`, four implementations behind one `TtsProvider` trait):
+**TTS**
 
 | Provider | Location | Notes |
 |---|---|---|
-| `PiperTtsProvider` | Local | ONNX voices from the models directory |
-| `EdgeTtsProvider` | Cloud | Optional, separately installed `edge-tts` CLI; no API key |
-| `MiniMaxTts` | Cloud | T2A v2; picks a CJK or Latin voice by analyzing the text |
-| `OpenAiTtsProvider` | Cloud | Pay per character |
+| `PiperTtsProvider` | Local | Installed ONNX voices |
+| `KokoroTtsProvider` | Local | Kokoro-82M v1.1-zh, Apache-2.0, downloaded on request |
+| `MiniMaxTts` | Cloud | T2A v2; CJK or Latin voice selection |
+| `OpenAiTtsProvider` | Cloud | OpenAI TTS |
+| `AzureTts` | Cloud | Official Azure AI Speech REST; Taiwanese Mandarin voices |
 
-`TtsRouter` supports local-first (Piper → edge-tts → MiniMax → OpenAI), cloud-first and single-provider routing. Only detected providers allowed by product policy are used.
+`auto` tries installed Piper → installed Kokoro → MiniMax → OpenAI → Azure, subject to product policy. Explicit providers use only that provider; `off` disables synthesis. `duduclaw doctor` lists available providers without making synthesis requests.
 
-Edge TTS is optional and must be installed separately with `pipx install edge-tts`; update it with `pipx upgrade edge-tts`. It uses an unofficial Microsoft endpoint that can stop working. DuDuClaw invokes the CLI as a separate process; it does not bundle the Python package. `duduclaw doctor` lists locally available providers without contacting them.
+The `command` provider runs an Admin-configured external program; DuDuClaw ships no synthesis program. Set `tts_provider = "command"` and `tts_command = "/path/to/my-tts --in {input} --out {output}"` through Settings → Voice. The command string is split on whitespace into argv (no shell); `{input}` and `{output}` are individual argument substitutions. Text is written to `input.txt` in a private temporary directory, and the program must write audio bytes to `output.audio`. The command has a 60-second timeout and receives only `PATH`, `HOME`, `USERPROFILE`, `TEMP`, `TMP` and `SYSTEMROOT`. In `auto`, this provider is attempted after the existing providers.
+
+Download Kokoro from **Settings → Voice** (about 134 MB, Apache-2.0). Assets and the shared ONNX Runtime are verified during installation; interrupted downloads resume. Weights are not bundled in the binary. The model lives under `<home>/models/kokoro-zh/`. Default voice: `zf_001`; alternatives: `zm_010` and `af_maple` for pure English. Chinese speech has a mainland accent; polyphonic words may be mispronounced. Traditional characters and numbers are normalized, but the pronunciation rules do not cover every word. Input is capped at 2,000 characters and split into chunks of at most 500 tokens, joined with 150 ms silence. Kokoro produces 24 kHz WAV; Telegram receives it as `reply.wav` through `sendAudio`.
+
+Azure sends the text to Microsoft. Set `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION` in the gateway environment. Default Chinese voice: `zh-TW-HsiaoChenNeural`; default English voice: `en-US-AriaNeural`. Azure returns MP3. `tts_voice` can select a supported provider voice.
+
+Admin RPCs: `voice.kokoro_status` reports installation, missing files, size, runtime readiness, progress and errors; `voice.kokoro_install` starts an idempotent background install. The Voice download card polls the status and displays install errors.
 
 ### Path 2 — Telegram voice messages
 
