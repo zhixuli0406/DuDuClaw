@@ -17,6 +17,37 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+pub fn launchd_exit_78(output: &str) -> bool {
+    output.lines().any(|line| line.trim() == "last exit code = 78")
+}
+
+#[cfg(target_os = "macos")]
+pub async fn launchd_restart_warning() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let home = dirs::home_dir().unwrap_or_default();
+    for label in [duduclaw_core::autostart::LAUNCHD_LABEL, duduclaw_core::autostart::LEGACY_LAUNCHD_LABEL] {
+        let plist = duduclaw_core::autostart::launchd_plist_path_in(&home, label);
+        if !plist.exists() { continue; }
+        let target = format!("gui/{uid}/{label}");
+        if let Ok(output) = tokio::process::Command::new("/bin/launchctl").args(["print", &target]).output().await {
+            if output.status.success() && launchd_exit_78(&String::from_utf8_lossy(&output.stdout)) {
+                return Some(format!("launchd reports exit code 78. Restart the service with `{}`.", "duduclaw service restart"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod launchd_tests {
+    use super::launchd_exit_78;
+    #[test]
+    fn parses_launchd_last_exit_78() {
+        assert!(launchd_exit_78("gui/501/com.duduclaw.gateway = {\n state = waiting\n last exit code = 78\n}"));
+        assert!(!launchd_exit_78("state = running\nlast exit code = 0"));
+    }
+}
+
 // ── MCP server cold-start ───────────────────────────────────────
 
 /// Outcome of spawning `duduclaw mcp-server` with a runtime-shaped env.

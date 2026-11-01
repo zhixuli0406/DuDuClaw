@@ -381,6 +381,7 @@ impl MethodHandler {
                         "success": result.success,
                         "message": result.message,
                         "needs_restart": result.needs_restart,
+                        "restart_hint": result.restart_hint,
                     }),
                 )
             }
