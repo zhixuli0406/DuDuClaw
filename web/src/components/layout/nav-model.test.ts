@@ -1,13 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import {
   navGroups,
+  employeeNavItems,
+  isEmployeeSidebar,
+  mobileNavItems,
+  mobileNavItemsForRole,
+  type UserRole,
   personalPrimaryItems,
   manageAdvancedNav,
   personalAdvancedGroup,
   navGroupsForEdition,
   primaryItemsForEdition,
 } from './nav-model';
-import { isVisible } from '@/lib/nav-visibility';
+import { filterVisible, isVisible } from '@/lib/nav-visibility';
 import { crumbsFor } from './nav-model';
 
 describe('machine console visibility', () => {
@@ -271,5 +276,279 @@ describe('self-service account navigation', () => {
       }
     }
     expect(crumbsFor('/me/account')).toEqual([{ labelId: 'nav.account' }]);
+  });
+});
+
+
+describe('enterprise employee navigation', () => {
+  it('shows exactly the daily employee destinations in the agreed order', () => {
+    expect(employeeNavItems().map((item) => item.to)).toEqual([
+      '/', '/inbox', '/skills', '/memory', '/world',
+    ]);
+    expect(employeeNavItems(false)).toEqual(employeeNavItems());
+    expect(employeeNavItems().every((item) => item.newIn === undefined)).toBe(true);
+    expect(employeeNavItems().find((item) => item.to === '/inbox')?.badge).toBe('inbox');
+  });
+
+  it('restores task rows only when enabled, retaining the manager-only foresight gate', () => {
+    expect(employeeNavItems(true).map((item) => item.to)).toEqual([
+      '/', '/inbox', '/skills', '/memory', '/world', '/tasks', '/goals', '/responsibilities',
+    ]);
+    expect(employeeNavItems(true).some((item) => item.to === '/routines' || item.to === '/org')).toBe(false);
+    expect(employeeNavItems(true).every((item) => item.newIn === undefined)).toBe(true);
+  });
+
+  it('applies only to employees outside the Personal edition', () => {
+    for (const role of ['admin', 'manager', 'employee', undefined] as const) {
+      expect(isEmployeeSidebar(role, true)).toBe(false);
+      expect(isEmployeeSidebar(role, false)).toBe(role === 'employee');
+    }
+  });
+
+  it('keeps mobile employee entries within the simplified sidebar or conversation history', () => {
+    for (const enabled of [false, true]) {
+      const allowed = [...employeeNavItems(enabled).map((item) => item.to), '/conversations'];
+      const mobile = mobileNavItemsForRole('employee', false, enabled).map((item) => item.to);
+      expect(mobile.every((path) => allowed.includes(path))).toBe(true);
+      expect(mobile.includes('/chat')).toBe(false);
+      expect(mobile.includes('/tasks')).toBe(enabled);
+    }
+  });
+
+  it('preserves the previous mobile array for admins, managers and Personal', () => {
+    expect(mobileNavItems.map((item) => item.to)).toEqual(['/', '/chat', '/conversations', '/tasks']);
+    for (const role of ['admin', 'manager', 'employee'] as const) {
+      for (const personal of [false, true]) {
+        if (isEmployeeSidebar(role, personal)) continue;
+        for (const enabled of [false, true]) {
+          expect(mobileNavItemsForRole(role, personal, enabled)).toBe(mobileNavItems);
+        }
+      }
+    }
+  });
+});
+
+// Fixed route snapshots captured from the arrays before the employee shell change.
+// All progressive-disclosure facts are enabled to make every prior entry observable.
+const previousNavigation = {
+  "admin:enterprise": {
+    "primary": [
+      "/chat",
+      "/",
+      "/console"
+    ],
+    "groups": [
+      [
+        "/routines",
+        "/plans",
+        "/goals",
+        "/responsibilities",
+        "/runs",
+        "/canvas",
+        "/files",
+        "/mail",
+        "/timeline",
+        "/reports",
+        "/foresight",
+        "/forks",
+        "/os",
+        "/presets",
+        "/app/system/device",
+        "/tasks"
+      ],
+      [
+        "/skills",
+        "/memory",
+        "/knowledge-base",
+        "/agents",
+        "/world",
+        "/growth",
+        "/org",
+        "/experts",
+        "/gallery",
+        "/widgets",
+        "/pet-studio"
+      ],
+      [
+        "/me/account",
+        "/my/history-views",
+        "/manage",
+        "/about"
+      ],
+      [
+        "/me/connections",
+        "/team",
+        "/team/conversations"
+      ]
+    ]
+  },
+  "admin:personal": {
+    "primary": [
+      "/chat",
+      "/",
+      "/console",
+      "/routines",
+      "/goals",
+      "/responsibilities",
+      "/foresight",
+      "/skills",
+      "/memory",
+      "/knowledge-base",
+      "/agents",
+      "/world",
+      "/experts",
+      "/gallery",
+      "/pet-studio"
+    ],
+    "groups": [
+      [
+        "/me/account",
+        "/manage",
+        "/about"
+      ],
+      [
+        "/tasks",
+        "/plans",
+        "/runs",
+        "/canvas",
+        "/files",
+        "/mail",
+        "/timeline",
+        "/reports",
+        "/forks",
+        "/os",
+        "/presets",
+        "/app/system/device",
+        "/growth",
+        "/org",
+        "/widgets"
+      ]
+    ]
+  },
+  "manager:enterprise": {
+    "primary": [
+      "/chat",
+      "/"
+    ],
+    "groups": [
+      [
+        "/plans",
+        "/goals",
+        "/responsibilities",
+        "/runs",
+        "/canvas",
+        "/files",
+        "/mail",
+        "/timeline",
+        "/reports",
+        "/foresight",
+        "/forks",
+        "/tasks"
+      ],
+      [
+        "/skills",
+        "/memory",
+        "/knowledge-base",
+        "/agents",
+        "/world",
+        "/growth",
+        "/org",
+        "/experts",
+        "/widgets",
+        "/pet-studio"
+      ],
+      [
+        "/me/account",
+        "/my/history-views",
+        "/manage",
+        "/about"
+      ],
+      [
+        "/me/connections",
+        "/team",
+        "/team/conversations"
+      ]
+    ]
+  },
+  "manager:personal": {
+    "primary": [
+      "/chat",
+      "/",
+      "/goals",
+      "/responsibilities",
+      "/foresight",
+      "/skills",
+      "/memory",
+      "/knowledge-base",
+      "/agents",
+      "/world",
+      "/experts",
+      "/pet-studio"
+    ],
+    "groups": [
+      [
+        "/me/account",
+        "/manage",
+        "/about"
+      ],
+      [
+        "/tasks",
+        "/plans",
+        "/runs",
+        "/canvas",
+        "/files",
+        "/mail",
+        "/timeline",
+        "/reports",
+        "/forks",
+        "/growth",
+        "/org",
+        "/widgets"
+      ]
+    ]
+  },
+  "employee:personal": {
+    "primary": [
+      "/chat",
+      "/",
+      "/goals",
+      "/responsibilities",
+      "/skills",
+      "/memory",
+      "/knowledge-base",
+      "/agents",
+      "/world",
+      "/experts",
+      "/pet-studio"
+    ],
+    "groups": [
+      [
+        "/me/account",
+        "/about"
+      ],
+      [
+        "/tasks",
+        "/plans",
+        "/runs",
+        "/canvas",
+        "/files",
+        "/growth",
+        "/widgets"
+      ]
+    ]
+  }
+} as const;
+
+describe('previous admin, manager and Personal navigation snapshots', () => {
+  it.each(Object.keys(previousNavigation))('preserves %s', (key) => {
+    const [role, edition] = key.split(':') as [UserRole, string];
+    const personal = edition === 'personal';
+    const ctx = { hasOperatorAccess: true, forksExist: true, agentCount: 100, isDesktop: true, isAppliance: true };
+    const routes = (items: typeof personalPrimaryItems) =>
+      filterVisible(items, role, personal, ctx).map((item) => item.to);
+    expect({
+      primary: routes(primaryItemsForEdition(personal)),
+      groups: navGroupsForEdition(personal).map((group) => routes(group.items)),
+    }).toEqual(previousNavigation[key as keyof typeof previousNavigation]);
   });
 });

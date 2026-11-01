@@ -367,6 +367,8 @@ export interface SystemStatus {
    * gateway's own 404 middleware). Read through `useDecisionEnabled`.
    */
   decision_enabled?: boolean;
+  /** Employee task navigation preference; absent means false. UX only. */
+  employee_tasks?: boolean;
   /** v1.68 W2: whether this build was compiled with OpenTelemetry tracing
    *  (`otel` cargo feature). Absent on older gateways → treat as `false`. */
   otel_compiled?: boolean;

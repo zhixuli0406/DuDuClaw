@@ -57,7 +57,7 @@ import {
   Eye,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
-import type { Gated } from '@/lib/nav-visibility';
+import { filterVisible, type Gated } from '@/lib/nav-visibility';
 
 export type NavItem = Gated & {
   to: string;
@@ -469,6 +469,25 @@ function pickItems(paths: string[]): NavItem[] {
   });
 }
 
+/** Employee navigation is presentation only; route and RPC gates stay unchanged. */
+export function isEmployeeSidebar(role: UserRole | undefined, isPersonal: boolean): boolean {
+  return role === 'employee' && !isPersonal;
+}
+
+/** Existing pages, reordered for employees without advertising them as new features. */
+export function employeeNavItems(employeeTasks = false): NavItem[] {
+  const items = [
+    ...pickItems(['/']),
+    inboxEntry,
+    ...pickItems(['/skills', '/memory', '/world']),
+    ...(employeeTasks ? pickItems(['/tasks', '/goals', '/responsibilities', '/foresight']) : []),
+  ];
+  return filterVisible(items, 'employee', false).map((item) => {
+    const { newIn: _newIn, ...existingPage } = item;
+    return existingPage;
+  });
+}
+
 /**
  * Personal 主區 — rendered flat right after the daily row (no group label).
  *
@@ -801,5 +820,18 @@ export const mobileNavItems: NavItem[] = [
   // balanced 2/2 around the centre ＋交辦 action.
   { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc' },
 ];
+
+/** Mobile retains the previous four slots outside the employee enterprise shell. */
+export function mobileNavItemsForRole(
+  role: UserRole | undefined,
+  isPersonal: boolean,
+  employeeTasks = false,
+): NavItem[] {
+  if (!isEmployeeSidebar(role, isPersonal)) return mobileNavItems;
+  return [
+    ...employeeNavItems(employeeTasks).filter((item) => ['/', '/inbox', '/skills', '/tasks'].includes(item.to)),
+    conversationsEntry,
+  ];
+}
 
 export type { UserRole };

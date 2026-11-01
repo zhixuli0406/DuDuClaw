@@ -75,6 +75,12 @@ port = 18889
 # inference_mode = "hybrid"    # local | claude | hybrid — whether local models run at all
 # name = "DuDuClaw"            # Device name broadcast over mDNS on the LAN
 
+# ── Dashboard navigation ────────────────────────────────────
+# Employee task navigation is hidden by default on non-Personal editions.
+# This affects dashboard navigation only; routes and RPC permissions stay unchanged.
+# [dashboard]
+# employee_tasks = false
+
 # ── Autonomous goal loop ────────────────────────────────────
 # The outer loop behind `/goal`: dispatch → judge → redispatch until done or
 # escalated. Full reference: docs/features/34-goal-loop.md, docs/guides/goal-loop.md
