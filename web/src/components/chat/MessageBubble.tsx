@@ -6,7 +6,8 @@ import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
 import { AssignedTaskCard } from './AssignedTaskCard';
-import { CitedText, CitationSourceList } from './CitationChips';
+import { CitationSourceList } from './CitationChips';
+import { MarkdownContent } from './MarkdownContent';
 import { PassageDrawer } from '@/components/knowledge/PassageDrawer';
 
 /** A single chat turn rendered as a left/right-aligned bubble (Multica plain
@@ -37,7 +38,7 @@ export function MessageBubble({
       {!isUser && leading && <div className="mb-0.5 shrink-0">{leading}</div>}
       <div
         className={cn(
-          'max-w-[80%] rounded-xl px-3.5 py-2 text-sm leading-relaxed',
+          'min-w-0 max-w-[80%] rounded-xl px-3.5 py-2 text-sm leading-relaxed',
           isUser
             ? 'bg-secondary text-secondary-foreground'
             : isSystem
@@ -53,22 +54,14 @@ export function MessageBubble({
             ))}
           </div>
         )}
-        {message.content && (
+        {message.content && (message.role === 'assistant' ? (
+          <MarkdownContent text={message.content} citations={citations} onOpen={(chunkId) => setOpenChunk(chunkId)} />
+        ) : (
           <div className={cn('whitespace-pre-wrap break-words', isSystem && 'flex items-start gap-1.5')}>
             {isSystem && <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />}
-            <span>
-              {hasCitations ? (
-                <CitedText
-                  text={message.content}
-                  citations={citations}
-                  onOpen={(chunkId) => setOpenChunk(chunkId)}
-                />
-              ) : (
-                message.content
-              )}
-            </span>
+            <span>{message.content}</span>
           </div>
-        )}
+        ))}
         {message.task && !isUser && <AssignedTaskCard task={message.task} />}
         {message.computerWatch && !isUser && (
           <Link to={message.computerWatch.href} target="_blank" rel="noreferrer"
