@@ -3344,6 +3344,7 @@
   "assign.skill.search": "スキルを検索",
   "assign.skill.recent": "最近実行したもの",
   "assign.skill.other": "その他のスキル",
+  "assign.skill.recentUsed": "最近使ったスキル",
   "assign.skill.neverRun": "まだ実行されていません",
   "assign.skill.runner": "{name} が実行します（このスキルを最近実行した AI 社員）",
   "assign.skill.runnerFirst": "{name} が実行します（まだ誰も実行していないため、このスキルを持つ AI 社員に任せます）",

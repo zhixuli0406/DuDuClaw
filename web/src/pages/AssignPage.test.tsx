@@ -138,6 +138,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  window.localStorage.removeItem('assign.recentSkills');
   vi.unstubAllGlobals();
 });
 
@@ -227,6 +228,50 @@ describe('一般 tab', () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(mockNavigate).toHaveBeenCalledWith('/goals?task=gt-9');
     expect(toastSuccess).toHaveBeenCalled();
+  });
+
+  it('inserts and toggles recent skill chips in the note', async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['quote', 'beta']));
+    renderAt('/assign');
+    const quote = await screen.findByRole('button', { name: /Quote.*Make a quote/ });
+    expect(quote).toHaveAttribute('aria-pressed', 'false');
+    await user.click(quote);
+    expect(screen.getByLabelText('Anything to add? (optional)')).toHaveValue('/quote ');
+    expect(quote).toHaveAttribute('aria-pressed', 'true');
+    await user.click(quote);
+    expect(screen.getByLabelText('Anything to add? (optional)')).toHaveValue('');
+    expect(quote).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('supports multiple selected chips and submits the first chip skill', async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['quote', 'beta']));
+    renderAt('/assign');
+    await user.click(await screen.findByRole('button', { name: /Quote.*Make a quote/ }));
+    await user.click(screen.getByRole('button', { name: /Beta skill.*Never run/ }));
+    await user.type(screen.getByLabelText('Anything to add? (optional)'), 'more detail');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.skill_assign', {
+      skill_name: 'quote', note: '/quote /beta more detail',
+    }));
+  });
+
+  it('drops recent names missing from the available skill list', async () => {
+    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['removed', 'quote']));
+    renderAt('/assign');
+    expect(await screen.findByRole('button', { name: /Quote.*Make a quote/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /removed/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps successful assignment working when localStorage writes fail', async () => {
+    const user = userEvent.setup();
+    renderAt('/assign');
+    await user.click(await screen.findByRole('radio', { name: /Quote/ }));
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('blocked'); });
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/goals?task=gt-9'));
+    setItem.mockRestore();
   });
 
   it('sends files over HTTP with the request', async () => {

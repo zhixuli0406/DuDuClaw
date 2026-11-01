@@ -3344,6 +3344,7 @@
   "assign.skill.search": "Search skills",
   "assign.skill.recent": "Recently run",
   "assign.skill.other": "Other skills",
+  "assign.skill.recentUsed": "Recently used skills",
   "assign.skill.neverRun": "Not run yet",
   "assign.skill.runner": "{name} will do it (the AI employee who ran this skill most recently)",
   "assign.skill.runnerFirst": "{name} will do it (nobody has run this skill yet, so it goes to an AI employee who has it)",
