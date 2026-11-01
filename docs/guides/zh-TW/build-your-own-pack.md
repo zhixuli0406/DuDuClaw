@@ -115,4 +115,6 @@ duduclaw pack verify ./my-first-pack
 
 `MANIFEST.sha256` 以 `name: <name>`、`version: <version>`、`publisher: <id>` 三行開頭，後接排序後的 `<sha256>  <relative path>`。清單涵蓋所有檔案，但排除 `MANIFEST.sha256` 與 `MANIFEST.sha256.minisig`；發佈時須附上這兩個檔案。名稱與版本須符合 `pack.toml`，舊版清單的版本不符時會拒絕。缺少檔案、多出檔案、內容變動、絕對路徑、路徑穿越及符號連結都會使 pack 無效。任何編輯後，都須重新產生並簽署清單。
 
+請以封存檔散布 pack，或確保所有已簽署檔案保留完全相同的換行格式。
+
 `pack verify` 顯示來源狀態。職務預設安裝也須先預覽並以 `--confirm-profile` 確認，綁定簽章狀態、內容及安裝目的地；任一項改變都須重新確認。有效簽章只證明來源；安裝時仍執行內容掃描、hook 隔離及核准。已釘選發行者缺少簽章視為無效，未釘選且未簽章的 pack 則警告後繼續。

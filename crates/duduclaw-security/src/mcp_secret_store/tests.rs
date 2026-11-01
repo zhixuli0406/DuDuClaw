@@ -46,7 +46,7 @@ fn config() -> Value {
 }
 
 #[test]
-fn round_trip_seals_all_non_allowlisted_values_without_name_only_exemptions() {
+fn round_trip_seals_third_party_values_and_preserves_duduclaw_env() {
     let home = Home::new();
     let input = env(json!({"TOKEN":"sk-test-only", "OPTION":"even non-token text", "EMPTY":"", "PATH":"/bin", "HOME":"/home", "NODE_ENV":"production", "LOG_LEVEL":"warn"}));
     let protected = store_mcp_env(home.path(), "alice", "vendor", &input).unwrap();
@@ -57,10 +57,13 @@ fn round_trip_seals_all_non_allowlisted_values_without_name_only_exemptions() {
     assert_eq!(resolve_mcp_env(home.path(), "alice", "vendor", &protected).unwrap(), input);
     let stored = fs::read_to_string(home.path().join("secrets/mcp/alice.enc")).unwrap();
     assert!(!stored.contains("sk-test-only"));
-    let own = env(json!({"DUDUCLAW_API_KEY":"own-key", "DUDUCLAW_AGENT_ID":"alice"}));
-    let own_refs = store_mcp_env(home.path(), "alice", "duduclaw", &own).unwrap();
-    assert_ne!(own_refs, own, "an env-only API cannot authenticate a built-in command");
-    assert_eq!(resolve_mcp_env(home.path(), "alice", "duduclaw", &own_refs).unwrap(), own);
+    let duduclaw_env = env(json!({"DUDUCLAW_API_KEY":"own-key", "DUDUCLAW_AGENT_ID":"alice"}));
+    assert_eq!(store_mcp_env(home.path(), "alice", "duduclaw", &duduclaw_env).unwrap(), duduclaw_env);
+    let evil_env = env(json!({"VENDOR_KEY":"vendor-secret", "DUDUCLAW_FOO":"leave-unchanged"}));
+    let evil_protected = store_mcp_env(home.path(), "alice", "duduclaw-evil", &evil_env).unwrap();
+    assert_eq!(evil_protected["VENDOR_KEY"], "secret://mcp/duduclaw-evil/VENDOR_KEY");
+    assert_eq!(evil_protected["DUDUCLAW_FOO"], evil_env["DUDUCLAW_FOO"]);
+    assert_eq!(resolve_mcp_env(home.path(), "alice", "duduclaw-evil", &evil_protected).unwrap(), evil_env);
     assert_eq!(store_mcp_env(home.path(), "alice", "vendor", &protected).unwrap(), protected);
 }
 

@@ -115,4 +115,6 @@ Use your separately managed minisign secret key; DuDuClaw neither creates nor st
 
 `MANIFEST.sha256` starts with `name: <name>`, `version: <version>` and `publisher: <id>`, followed by sorted `<sha256>  <relative path>` lines. It covers every file except `MANIFEST.sha256` and `MANIFEST.sha256.minisig`. Include both files in the distributed pack. Name and version must match `pack.toml`; a manifest from an older version is refused when the version differs. Missing, extra or changed files, absolute paths, traversal and symlinks invalidate the pack. Regenerate and sign the manifest after any edit.
 
+Distribute packs as an archive, or preserve the exact line endings of every signed file.
+
 `pack verify` reports the source state. Job preset installs also require a preview and `--confirm-profile`, binding signature state, content and destination; a change requires a fresh confirmation. A valid signature only proves origin: the installer still scans content, quarantines hooks and enforces approval. Missing signatures for pinned publishers are invalid; unpinned unsigned packs warn before continuing.
