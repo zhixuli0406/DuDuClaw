@@ -1,6 +1,6 @@
 # 音声パイプライン
 
-> 音声を入れて音声を出す——設定をまだ共有していない2つの経路と、このページがかつて主張していたがコードの無い4つのコンポーネント。
+> HTTP と Telegram の音声認識・音声合成で、プロバイダー設定を共有します。
 
 ---
 
@@ -14,16 +14,16 @@
 
 ---
 
-## 2つの経路、2つの設定
+## 共通の音声設定
 
-最も重要な点：**HTTP の音声エンドポイントと Telegram の音声ハンドラは別々に配線されています。** v1.68.0 から音声認識（`config.toml [voice] stt_*`）は両方に届き、LINE の音声メッセージにも使われます。音声合成（`inference.toml [voice] tts_*`）は引き続き HTTP エンドポイントにだけ効きます。
+HTTP と Telegram の音声認識は `config.toml [voice] stt_*` を使用します。HTTP、Telegram の音声返信と `synthesize_speech` MCP ツールは `TtsRouter::for_home` を共有し、`inference.toml [voice] tts_provider` / `tts_voice` に従って音声を合成します。
 
 ### 経路1 — HTTP エンドポイント（ダッシュボード、WebChat）
 
 | エンドポイント | 認証 | 挙動 |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | ボディ上限 10 MiB。ボディに触れる**前に** `config.toml [voice]` からプロバイダを解決し、未設定なら **501 で fail-closed**——推測も文字起こしの捏造もしません |
-| `POST /api/tts` | Bearer JWT | リクエストごとに `inference.toml [voice] tts_provider` / `tts_voice` を読み、`TtsRouter` の戦略を選びます（`edge-tts` → edge のみ、`minimax` / `openai-tts` → クラウド優先、それ以外 → ローカル優先）。`none` / `off` / `disabled` のときは 501 を返します |
+| `POST /api/tts` | Bearer JWT | 共通ルーターを使用。`edge-tts`、`piper`、`minimax`、`openai-tts` は指定したプロバイダーのみ、それ以外の有効な設定はローカル優先。`none` / `off` / `disabled` は 501 を返します |
 | `GET`／`POST /api/voice/config` | Bearer JWT | `[voice]` の STT 設定を読み書き |
 
 **STT プロバイダ**（`stt.rs`、実装は2つ）：
@@ -45,19 +45,21 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 | プロバイダ | 場所 | 備考 |
 |---|---|---|
 | `PiperTtsProvider` | ローカル | モデルディレクトリの ONNX ボイス |
-| `EdgeTtsProvider` | クラウド | 無料、API キー不要 |
+| `EdgeTtsProvider` | クラウド | 任意機能。別途インストールする `edge-tts` CLI。API キー不要 |
 | `MiniMaxTts` | クラウド | T2A v2。テキストを解析して CJK かラテン系のボイスを選択 |
 | `OpenAiTtsProvider` | クラウド | 文字単位課金 |
 
-`TtsRouter` は3つの戦略のいずれかで振り分けます：`LocalFirst`（ローカル → edge → MiniMax → OpenAI）、`EdgeOnly`、`CloudBest`。
+`TtsRouter` はローカル優先（Piper → edge-tts → MiniMax → OpenAI）、クラウド優先、単一プロバイダーのルーティングを備え、検出済みで製品ポリシーが許可するプロバイダーだけを使用します。
+
+Edge TTS は任意機能で、`pipx install edge-tts` による別途インストールが必要です。更新には `pipx upgrade edge-tts` を使います。Microsoft の非公式エンドポイントを使用するため、動作しなくなる可能性があります。DuDuClaw は CLI を独立した子プロセスとして呼び出し、Python パッケージを同梱しません。`duduclaw doctor` はネットワークに接続せず、ローカルで利用可能なプロバイダーを表示します。
 
 ### 経路2 — Telegram の音声メッセージ
 
 音声または音声ファイルのメッセージは `transcribe_voice` を起動します：bot が `getFile` を呼び、返ってきた `file_path` をトラバーサル検証（`..`、絶対パス、NUL、許可外文字）し、`content_length` と実バイト数の両方でサイズ上限を確認してダウンロードし、文字起こしします。
 
-**v1.68.0 からは `stt::transcribe_channel_audio` を呼び、ダッシュボードの音声認識設定（`config.toml [voice] stt_*`、`/api/stt` と同じプロバイダ）を使います。** 音声認識プロバイダが未設定の場合だけ、環境変数 `OPENAI_API_KEY` の OpenAI Whisper にフォールバックします。設定済みのプロバイダが失敗した場合はエラーになり、フォールバックしません。言語は引き続き `zh` 固定です。LINE の音声メッセージも同じ経路です。v1.68.0 より前は、どちらのチャネルも常に環境変数キーの Whisper を使っていました。 音声返信（チャットごとに `/voice` で切替）は `EdgeTtsProvider` を直接構築します。これもハードコードで、音声アップロードが失敗したらテキストにフォールバックします。
+**v1.68.0 からは `stt::transcribe_channel_audio` を呼び、ダッシュボードの音声認識設定（`config.toml [voice] stt_*`、`/api/stt` と同じプロバイダ）を使います。** 音声認識プロバイダが未設定の場合だけ、環境変数 `OPENAI_API_KEY` の OpenAI Whisper にフォールバックします。設定済みのプロバイダが失敗した場合はエラーになり、フォールバックしません。言語は引き続き `zh` 固定です。LINE の音声メッセージも同じ経路です。v1.68.0 より前は、どちらのチャネルも常に環境変数キーの Whisper を使っていました。
 
-つまりダッシュボードの「語音」タブが書き込む `inference.toml [voice] tts_provider` / `tts_voice` は `POST /api/tts` にだけ効き、**現状 Telegram 経路には影響しません**。UI で変えても Telegram の音声メッセージの挙動は変わりません。既知のギャップとして、運用者が自分でぶつかる前にここに明記します。
+Telegram の音声返信（チャットごとに `/voice` で切替）は共通 TTS ルーターにプレーンテキストを渡します。利用可能なプロバイダーがなければボタンを非表示にし、`/voice` はオフのままです。合成失敗時はテキストに戻し、セッション内の初回失敗だけ短い通知を添えます。音声アップロード失敗時のテキスト返信も維持します。
 
 v1.67.1 から、「語音」タブには「語音回覆模式」（音声返信モード）、「語音辨識」（音声認識）、「語言」（言語）の3項目が表示されません。これらが書き込んでいた `voice_reply_enabled`、`asr_provider`、`asr_language` を gateway で読むコードはありません。`inference.toml` に既にある値はそのまま残り、タブの保存ではこれらのキーを送りません。v1.68.0 からは設定構造からもこれらのフィールドが削除され、`system.update_config` は受け取っても無視します。`/api/stt` の音声認識は同じタブの詳細カード（`config.toml [voice] stt_*`）で設定します。
 
@@ -92,4 +94,4 @@ v1.67.1 から、「語音」タブには「語音回覆模式」（音声返信
 
 ## まとめ
 
-音声が動くのは2か所で、正直版はそれをそのまま言います：ダッシュボードが設定する fail-closed な HTTP のペアと、音声返信のプロバイダがまだハードコードされた Telegram ハンドラ（文字起こしは v1.68.0 からダッシュボード設定に従います）。2つ目を名指しするほうが、一度も書かれなかった VAD の図より役に立ちます。
+HTTP、Telegram の音声返信と MCP 合成ツールは TTS 設定を共有します。プロバイダーの検出はエンドポイントへの接続確認ではありません。Telegram では合成に失敗するとテキストに戻ります。

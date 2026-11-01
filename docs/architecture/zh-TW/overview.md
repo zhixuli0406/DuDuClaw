@@ -82,7 +82,8 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 
 ### 語音管線
 - **HTTP endpoints**：`POST /api/stt`（OpenAI 相容的轉錄 API 或本機指令範本；未設定 STT provider 時回 501）、`POST /api/tts`，後端為 Piper（本機）／Edge TTS／MiniMax T2A／OpenAI TTS。
-- **Telegram 語音**：透過 OpenAI Whisper API 轉錄、以 Edge TTS 回覆，兩者皆為寫死的設定；dashboard 的語音設定不會作用到這條路徑。
+- **Telegram 語音**：轉錄使用設定的 STT 供應商（未設定時保留 Whisper 備援）；語音回覆使用共用 TTS router 與儀表板 TTS 設定，失敗時退回文字。
+- **選用 Edge TTS**：須另行執行 `pipx install edge-tts` 安裝，以 `pipx upgrade edge-tts` 更新；使用 Microsoft 非官方端點，可能隨時失效。
 - **正式發布的執行檔不含**：行程內 Whisper（`whisper` feature）、ONNX embedding（`onnx` feature）與 Discord 語音（`discord-voice` feature）。
 - 此處過去列出的 SenseVoice、Deepgram、Silero VAD、`symphonia` 解碼與 LiveKit 語音房，都沒有對應的程式碼。詳見 [`docs/features/zh-TW/14-voice-pipeline.md`](../../features/zh-TW/14-voice-pipeline.md)。
 

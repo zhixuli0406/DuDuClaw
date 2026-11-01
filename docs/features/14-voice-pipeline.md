@@ -1,6 +1,6 @@
 # Voice Pipeline
 
-> Speech in, speech out — two paths that do not yet share a config, and four components this page used to claim that have no code.
+> Speech recognition and synthesis for HTTP clients and Telegram, with shared provider settings.
 
 ---
 
@@ -14,16 +14,16 @@ What follows is what actually exists.
 
 ---
 
-## Two paths, two configurations
+## Shared voice settings
 
-The most important thing to know: **the HTTP voice endpoints and the Telegram voice handler are wired separately.** Since v1.68.0 speech-to-text (`config.toml [voice] stt_*`) reaches both, plus LINE audio messages; text-to-speech (`inference.toml [voice] tts_*`) still reaches the HTTP endpoints only.
+HTTP and Telegram use `config.toml [voice] stt_*` for speech recognition. HTTP, Telegram replies and the `synthesize_speech` MCP tool share `TtsRouter::for_home` and `inference.toml [voice] tts_provider` / `tts_voice` for synthesis.
 
 ### Path 1 — the HTTP endpoints (dashboard, WebChat)
 
 | Endpoint | Auth | Behavior |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | 10 MiB body cap. Resolves the provider from `config.toml [voice]` **before** touching the body, and returns **501 fail-closed** when none is configured — it never guesses or fabricates a transcript |
-| `POST /api/tts` | Bearer JWT | Reads `inference.toml [voice] tts_provider` / `tts_voice` on each request and picks a `TtsRouter` strategy from them (`edge-tts` → edge only, `minimax` / `openai-tts` → cloud best, anything else → local first); `none` / `off` / `disabled` returns 501 |
+| `POST /api/tts` | Bearer JWT | Uses the shared router: `edge-tts`, `piper`, `minimax` and `openai-tts` select only that provider; other enabled settings use local-first routing. `none` / `off` / `disabled` returns 501 |
 | `GET`/`POST /api/voice/config` | Bearer JWT | Read/write the `[voice]` STT settings |
 
 **STT providers** (`stt.rs`, two implementations):
@@ -45,19 +45,21 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 | Provider | Location | Notes |
 |---|---|---|
 | `PiperTtsProvider` | Local | ONNX voices from the models directory |
-| `EdgeTtsProvider` | Cloud | Free, no API key |
+| `EdgeTtsProvider` | Cloud | Optional, separately installed `edge-tts` CLI; no API key |
 | `MiniMaxTts` | Cloud | T2A v2; picks a CJK or Latin voice by analyzing the text |
 | `OpenAiTtsProvider` | Cloud | Pay per character |
 
-`TtsRouter` dispatches across them under one of three strategies: `LocalFirst` (local → edge → MiniMax → OpenAI), `EdgeOnly`, or `CloudBest`.
+`TtsRouter` supports local-first (Piper → edge-tts → MiniMax → OpenAI), cloud-first and single-provider routing. Only detected providers allowed by product policy are used.
+
+Edge TTS is optional and must be installed separately with `pipx install edge-tts`; update it with `pipx upgrade edge-tts`. It uses an unofficial Microsoft endpoint that can stop working. DuDuClaw invokes the CLI as a separate process; it does not bundle the Python package. `duduclaw doctor` lists locally available providers without contacting them.
 
 ### Path 2 — Telegram voice messages
 
 A voice or audio message triggers `transcribe_voice`: the bot calls `getFile`, validates the returned `file_path` against traversal (`..`, absolute paths, NUL, non-allowlisted characters), downloads with a size cap checked both on `content_length` and on the actual bytes, and transcribes.
 
-**Since v1.68.0 it calls `stt::transcribe_channel_audio`, which uses the dashboard's speech-to-text settings (`config.toml [voice] stt_*`, the same provider `/api/stt` uses).** Only when no STT provider is configured does it fall back to OpenAI Whisper with the environment variable `OPENAI_API_KEY`; a configured provider that fails is an error, with no fallback. The language is still fixed to `zh`. LINE audio messages take the same path. Before v1.68.0 both channels always used the environment-key Whisper path. Voice replies (toggled per chat with `/voice`) construct `EdgeTtsProvider` directly, also hardcoded, with a text fallback when the audio upload fails.
+**Since v1.68.0 it calls `stt::transcribe_channel_audio`, which uses the dashboard's speech-to-text settings (`config.toml [voice] stt_*`, the same provider `/api/stt` uses).** Only when no STT provider is configured does it fall back to OpenAI Whisper with the environment variable `OPENAI_API_KEY`; a configured provider that fails is an error, with no fallback. The language is still fixed to `zh`. LINE audio messages take the same path. Before v1.68.0 both channels always used the environment-key Whisper path.
 
-So `inference.toml [voice] tts_provider` / `tts_voice`, which the dashboard's Voice tab writes, reach `POST /api/tts` only and **do not currently affect the Telegram path**. Changing them in the UI changes nothing for a Telegram voice message. This is a known gap, stated here rather than left for an operator to discover.
+Voice replies (toggled per Telegram chat with `/voice`) use the shared TTS router and plain text. Without an available provider, the toggle button is hidden and `/voice` stays off. Synthesis failures fall back to text and add a short notice on the first failure per session; audio upload failures also retain the text fallback.
 
 Since v1.67.1 the Voice tab no longer shows 語音回覆模式 (voice reply mode), 語音辨識 (speech recognition provider) or 語言 (language). They wrote `voice_reply_enabled`, `asr_provider` and `asr_language`, which nothing in the gateway reads. Values already in `inference.toml` stay there untouched; the tab no longer sends those keys, and since v1.68.0 the fields are gone from the configuration struct and `system.update_config` ignores them. Speech-to-text for `/api/stt` is configured in the tab's advanced card (`config.toml [voice] stt_*`).
 
@@ -92,4 +94,4 @@ The `onnx` feature of `duduclaw-inference` enables `OnnxEmbeddingProvider` (ONNX
 
 ## The takeaway
 
-Voice works in two places, and the honest version says so: a fail-closed HTTP pair that the dashboard configures, and a Telegram handler whose voice replies still use a hardcoded provider (its transcription follows the dashboard since v1.68.0). Naming the second one is more useful than a diagram of a VAD that was never written.
+HTTP, Telegram voice replies and the MCP synthesis tool share TTS settings. A detected provider is not proof that its endpoint is reachable; failed synthesis falls back to text in Telegram.

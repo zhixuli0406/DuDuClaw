@@ -82,7 +82,8 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 
 ### Voice Pipeline
 - **HTTP endpoints**: `POST /api/stt` (an OpenAI-compatible transcription API or a local command template; 501 when no STT provider is configured), `POST /api/tts` over Piper (local) / Edge TTS / MiniMax T2A / OpenAI TTS.
-- **Telegram voice**: transcription through the OpenAI Whisper API and Edge TTS replies, both hardcoded; the dashboard voice settings do not reach this path.
+- **Telegram voice**: transcription follows the configured STT provider (with the existing Whisper fallback when unconfigured); spoken replies use the shared TTS router and dashboard TTS settings, with a text fallback.
+- **Optional Edge TTS**: install separately with `pipx install edge-tts` and update with `pipx upgrade edge-tts`. Its unofficial Microsoft endpoint can stop working.
 - **Not in release binaries**: in-process Whisper (`whisper` feature), ONNX embedding (`onnx` feature) and Discord voice (`discord-voice` feature).
 - SenseVoice, Deepgram, Silero VAD, `symphonia` decoding and LiveKit voice rooms were listed here before; none of them has code. See [`docs/features/14-voice-pipeline.md`](../features/14-voice-pipeline.md).
 

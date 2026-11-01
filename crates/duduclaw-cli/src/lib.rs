@@ -9344,6 +9344,21 @@ async fn computer_use_check(home: &std::path::Path) -> (String, CheckStatus, Str
     ("電腦操作".to_string(), status, message)
 }
 
+/// Inspect configured speech providers locally without a synthesis/network probe.
+fn voice_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let router = duduclaw_gateway::tts::TtsRouter::for_home(home);
+    let providers = router.available_providers();
+    let (status, message) = if providers.is_empty() {
+        (
+            CheckStatus::Warn,
+            "尚未設定可用的語音服務；請在設定啟用供應商。選用 Edge TTS：pipx install edge-tts（更新：pipx upgrade edge-tts）。".into(),
+        )
+    } else {
+        (CheckStatus::Pass, format!("可用供應商：{}（未連線驗證）", providers.join("、")))
+    };
+    ("語音回覆".into(), status, message)
+}
+
 /// `duduclaw doctor` row 「電腦操作工作區」 (P2-C design §8.5).
 async fn computer_workspaces_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let (status, message) = duduclaw_gateway::computer_workspaces::doctor::check(home).await;
@@ -10451,6 +10466,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);
     checks.push(credential_audit_chain_check(&home));
+    checks.push(voice_check(&home));
 
     // Print results
     let mut has_failure = false;

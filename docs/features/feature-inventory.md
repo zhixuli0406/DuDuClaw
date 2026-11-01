@@ -253,15 +253,17 @@
 
 ## Voice Pipeline
 
-See [14-voice-pipeline.md](14-voice-pipeline.md). The HTTP endpoints and the Telegram voice handler are wired separately.
+See [14-voice-pipeline.md](14-voice-pipeline.md). HTTP, Telegram and MCP synthesis share the configured TTS router.
 
 | Feature | Description |
 |---------|-------------|
 | HTTP endpoints | `POST /api/stt` (OpenAI-compatible transcription API or a local command template; returns 501 when `[voice]` has no STT provider), `POST /api/tts`, `GET`/`POST /api/voice/config` |
 | TTS providers | Piper (local ONNX voices) / Edge TTS / MiniMax T2A (picks a CJK or Latin voice) / OpenAI TTS, behind one router |
-| Telegram voice | Voice messages are transcribed with the OpenAI Whisper API; `/voice` replies use Edge TTS. Both are hardcoded, so the dashboard voice settings do not affect Telegram |
+| Telegram voice | Voice messages use the configured STT provider (Whisper fallback when unconfigured); `/voice` replies use the shared configured TTS router, with a text fallback |
 | Not in release binaries | In-process Whisper (`whisper` feature of `duduclaw-inference`), ONNX embedding (`onnx` feature) and Discord voice channels (`discord-voice` feature) compile only when you build with those features |
 | Never implemented | SenseVoice, Deepgram, Silero VAD, `symphonia` decoding and LiveKit voice rooms were listed here before; none of them has code |
+
+Edge TTS is optional and must be installed separately with `pipx install edge-tts`; update it with `pipx upgrade edge-tts`. It uses an unofficial Microsoft endpoint that can stop working. DuDuClaw invokes the CLI as a separate process; it does not bundle the Python package. `duduclaw doctor` lists locally available providers without contacting them.
 
 ## Security
 

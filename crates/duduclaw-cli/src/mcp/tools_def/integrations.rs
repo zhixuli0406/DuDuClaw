@@ -213,7 +213,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "synthesize_speech",
-        description: "Convert text to speech audio using TTS (edge-tts free or MiniMax paid). Returns base64-encoded MP3 audio.",
+        description: "Convert text to speech using providers available in this process (Piper or optional separately installed edge-tts CLI). Paid TTS keys are held only by the gateway and are not available to this MCP process. Returns base64-encoded audio (MP3 or WAV depending on provider).",
         params: &[
             ParamDef {
                 name: "text",
@@ -222,7 +222,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "voice",
-                description: "Voice name (default: auto-detect zh-TW/en-US)",
+                description: "Provider-specific voice name (default: configured voice, then provider auto-detection)",
                 required: false,
             },
         ],

@@ -15549,7 +15549,7 @@ async fn handle_tts(
     headers: axum::http::HeaderMap,
     Json(req): Json<TtsRequestBody>,
 ) -> axum::response::Response {
-    use crate::tts::{TtsProvider, TtsRouter, TtsStrategy};
+    use crate::tts::{TtsProvider, TtsRouter};
 
     if let Err(resp) = require_bearer(&state, &headers) {
         return resp;
@@ -15564,63 +15564,18 @@ async fn handle_tts(
             .into_response();
     }
 
-    // Read [voice] tts_provider / tts_voice from inference.toml (where the
-    // dashboard Voice tab persists them).
-    let (tts_provider, cfg_voice) = {
-        let path = state.home_dir.join("inference.toml");
-        let table: toml::Table = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .and_then(|c| c.parse().ok())
-            .unwrap_or_default();
-        let voice = table
-            .get("voice")
-            .and_then(|v| v.as_table())
-            .cloned()
-            .unwrap_or_default();
-        (
-            voice
-                .get("tts_provider")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase(),
-            voice
-                .get("tts_voice")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        )
-    };
-
-    // Explicit opt-out → 501 (client closes its play toggle).
-    if matches!(tts_provider.as_str(), "none" | "off" | "disabled") {
+    let router = TtsRouter::for_home(&state.home_dir);
+    if !router.is_available() {
         return (
             axum::http::StatusCode::NOT_IMPLEMENTED,
             Json(serde_json::json!({
                 "error": "尚未啟用語音朗讀（TTS）。請至「設定 → 語音」選擇語音供應商後再試。"
             })),
-        )
-            .into_response();
+        ).into_response();
     }
-
-    let strategy = match tts_provider.as_str() {
-        "edge-tts" | "edge" => TtsStrategy::EdgeOnly,
-        "minimax" | "openai-tts" | "openai" => TtsStrategy::CloudBest,
-        _ => TtsStrategy::LocalFirst,
-    };
-
-    let models_dir = state.home_dir.join("models");
-    let router = TtsRouter::auto_detect_for_home(&state.home_dir, &models_dir, strategy);
-
-    let voice = if req.voice.trim().is_empty() {
-        cfg_voice
-    } else {
-        req.voice.trim().to_string()
-    };
-
-    match router.synthesize(text, &voice).await {
+    let voice = req.voice.trim();
+    let text = crate::markdown_render::to_line_plain(text);
+    match router.synthesize(&text, voice).await {
         Ok(audio) if !audio.is_empty() => {
             // Sniff the container so the browser <audio> element decodes it.
             let ct = if audio.starts_with(b"RIFF") {

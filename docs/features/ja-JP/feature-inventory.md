@@ -248,15 +248,17 @@
 
 ## 音声パイプライン
 
-[14-voice-pipeline.md](14-voice-pipeline.md) を参照。HTTP エンドポイントと Telegram の音声ハンドラは別々に配線されている。
+[14-voice-pipeline.md](14-voice-pipeline.md) を参照。HTTP、Telegram と MCP の音声合成は設定済み TTS ルーターを共有します。
 
 | 機能 | 説明 |
 |------|------|
 | HTTP エンドポイント | `POST /api/stt`（OpenAI 互換の文字起こし API またはローカルコマンドテンプレート。`[voice]` に STT プロバイダーがないと 501 を返す）、`POST /api/tts`、`GET`/`POST /api/voice/config` |
 | TTS プロバイダー | Piper（ローカル ONNX 音声）/ Edge TTS / MiniMax T2A（CJK かラテン文字の音声を選択）/ OpenAI TTS を 1 つのルーターの背後に配置 |
-| Telegram 音声 | 音声メッセージは OpenAI Whisper API で文字起こしし、`/voice` の返信は Edge TTS を使う。どちらもハードコードのため、ダッシュボードの音声設定は Telegram に影響しない |
+| Telegram 音声 | 設定済み STT プロバイダーで文字起こし（未設定時は Whisper）。`/voice` は共通設定の TTS ルーターで返信し、失敗時はテキストに戻る |
 | リリースバイナリに含まれないもの | プロセス内 Whisper（`duduclaw-inference` の `whisper` feature）、ONNX embedding（`onnx` feature）、Discord ボイスチャンネル（`discord-voice` feature）は、それらの feature を指定してビルドしたときだけコンパイルされる |
 | 未実装 | 以前ここに載っていた SenseVoice、Deepgram、Silero VAD、`symphonia` デコード、LiveKit 音声ルームはいずれもコードが存在しない |
+
+Edge TTS は任意機能で、`pipx install edge-tts` による別途インストールが必要です。更新には `pipx upgrade edge-tts` を使います。Microsoft の非公式エンドポイントを使用するため、動作しなくなる可能性があります。DuDuClaw は CLI を独立した子プロセスとして呼び出し、Python パッケージを同梱しません。`duduclaw doctor` はネットワークに接続せず、ローカルで利用可能なプロバイダーを表示します。
 
 ## セキュリティ
 

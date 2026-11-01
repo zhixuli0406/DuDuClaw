@@ -249,15 +249,17 @@
 
 ## 語音管線
 
-見 [14-voice-pipeline.md](14-voice-pipeline.md)。HTTP 端點與 Telegram 語音處理是分開接線的。
+見 [14-voice-pipeline.md](14-voice-pipeline.md)。HTTP、Telegram 與 MCP 語音合成共用設定的 TTS router。
 
 | 功能 | 說明 |
 |------|------|
 | HTTP 端點 | `POST /api/stt`（OpenAI 相容轉錄 API 或本機指令範本；`[voice]` 沒有 STT provider 時回 501）、`POST /api/tts`、`GET`/`POST /api/voice/config` |
 | TTS provider | Piper（本機 ONNX 語音）／Edge TTS／MiniMax T2A（自動挑 CJK 或拉丁語系語音）／OpenAI TTS，由同一個 router 分派 |
-| Telegram 語音 | 語音訊息以 OpenAI Whisper API 轉錄；`/voice` 回覆使用 Edge TTS。兩者都寫死在程式碼中，儀表板的語音設定不影響 Telegram |
+| Telegram 語音 | 語音訊息使用設定的 STT 供應商（未設定時以 Whisper 備援）；`/voice` 回覆使用共用且遵循設定的 TTS router，失敗時退回文字 |
 | 不在 release binary 中 | 行程內 Whisper（`duduclaw-inference` 的 `whisper` feature）、ONNX embedding（`onnx` feature）與 Discord 語音頻道（`discord-voice` feature）只有在建置時啟用這些 feature 才會編譯 |
 | 從未實作 | 先前這裡列過 SenseVoice、Deepgram、Silero VAD、`symphonia` 解碼與 LiveKit 語音房，這些都沒有任何程式碼 |
+
+Edge TTS 為選用功能，必須另行執行 `pipx install edge-tts` 安裝，並以 `pipx upgrade edge-tts` 更新。它使用 Microsoft 非官方端點，可能隨時失效。DuDuClaw 以獨立子行程呼叫 CLI，不內含該 Python 套件。`duduclaw doctor` 會列出本機可用供應商，不會連線測試。
 
 ## 安全層
 

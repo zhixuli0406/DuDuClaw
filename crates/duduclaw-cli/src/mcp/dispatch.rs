@@ -400,7 +400,7 @@ pub(crate) async fn handle_tools_call(
         "cost_multi_vs_single" => handle_cost_multi_vs_single(&arguments, home_dir).await,
         // Voice / ASR / TTS tools
         "transcribe_audio" => handle_transcribe_audio(&arguments).await,
-        "synthesize_speech" => handle_synthesize_speech(&arguments).await,
+        "synthesize_speech" => handle_synthesize_speech(&arguments, home_dir).await,
         // Wiki Knowledge Base tools — use wiki_agent (namespace-aware) instead of
         // default_agent so external clients stay isolated in their own namespace.
         // T5/O3 — one `wiki_*` entry point with a `scope` parameter
