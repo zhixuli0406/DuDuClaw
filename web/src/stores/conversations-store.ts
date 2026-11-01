@@ -21,6 +21,7 @@ interface ConversationsState {
   fetch: () => Promise<void>;
   resume: (session: ChatSessionSummary) => Promise<boolean>;
   refreshView: () => Promise<void>;
+  refreshUnanswered: (isCurrent: () => boolean) => Promise<void>;
   startNew: () => void;
 }
 let fetchEpoch = 0;
@@ -107,6 +108,42 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
       } catch {
         if (ticket === resumeEpoch) set({ viewOnly: true, viewLoading: false, viewError: true, readOnlyView: null });
         return false;
+      }
+    },
+    refreshUnanswered: async (isCurrent) => {
+      const before = useChatStore.getState();
+      const { sessionId, convId, messages } = before;
+      const last = messages.at(-1);
+      if (!isCurrent() || !sessionId || !before.resumedExplicitly || before.isStreaming || before.activeMessageId || last?.role !== 'user' || get().viewOnly) return;
+      const ticket = resumeEpoch;
+      const key = scopeKey();
+      const stillCurrent = () => {
+        const now = useChatStore.getState();
+        return isCurrent() && ticket === resumeEpoch && key === scopeKey() && !get().viewOnly
+          && now.sessionId === sessionId && now.convId === convId && now.messages === messages
+          && now.resumedExplicitly && !now.isStreaming && !now.activeMessageId;
+      };
+      try {
+        const hist = await api.chatSessions.history(sessionId);
+        if (!stillCurrent() || !hist || hist.session_id !== sessionId || hist.read_only
+          || !Array.isArray(hist.messages)) return;
+        // Require the unanswered row and a later assistant row. A stale or
+        // truncated snapshot must not replace a newer transcript.
+        const anchor = hist.messages.findLastIndex(row => last.historyId !== undefined
+          ? row.id === last.historyId && row.role === 'user'
+          : row.role === 'user' && row.content === last.content && Date.parse(row.timestamp) === last.timestamp);
+        if (anchor < 0 || !hist.messages.slice(anchor + 1).some(row => row.role === 'assistant')) return;
+        const updated = historyToMessages(hist.messages);
+        useChatStore.setState({ messages: updated });
+        void fetchSessionCitations(sessionId).then(rows => {
+          const now = useChatStore.getState();
+          if (ticket === resumeEpoch && key === scopeKey() && now.sessionId === sessionId && now.convId === convId
+            && now.messages === updated && !now.isStreaming && !now.activeMessageId && rows.length) {
+            now.applyHistoryCitations(sessionId, rows);
+          }
+        }).catch(() => {});
+      } catch {
+        // The bounded poll retries; retain the unanswered notice and draft.
       }
     },
     refreshView: async () => { if (lastTarget) await get().resume(lastTarget); },
