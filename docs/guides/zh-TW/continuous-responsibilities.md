@@ -332,7 +332,7 @@ AI 員工不能建立、修改、恢復、重新啟用持續任務，也不能�
 
 Workflow 在核准處理及 lease renewal 後、effect 執行前再次取得 admission。若回傳 `WORKFLOW_AUTONOMY_PAUSED`，操作維持 Prepared，保留 checkpoint 與 queue retry 次數；這是延後執行，不是 effect failure。
 
-暫停／恢復會等待獨占 admission lease，鎖取得期限為 30 秒。Runtime 在共享 lease 內檢查暫停狀態並交付程序或請求；對已接入此 lease 的入口，暫停成功回覆代表先前通過檢查的 admission 都已離開 handoff 前的區間。本輪僅做靜態安全修補，尚未完成 runtime 驗收。`admission_wait_timeout` 代表這次變更未套用。rename 已提交、但後續持久化或重讀確認失敗時，回覆仍是 `applied: true`，並帶 `durability_warning: "applied_durability_unknown"`，不能當成狀態未變。程序與 PTY 在 spawn 成功後釋鎖；API 收到 response headers 後釋鎖，不持鎖讀取 body 或串流。工具迴圈及模型 callback 每次請求重新取得 admission。Workflow MCP execute 尚未拆開送出與完成，因此該持鎖區間上限為 10 秒（步驟原上限更短時沿用）；逾時仍視為副作用結果未確認。HTTP 等待 response headers 時仍持鎖，服務端延遲 headers 仍可能造成暫停逾時。逾時訊息列出本程序 holder 數量與路徑分類；其他程序的 holder 標為未知。本次修改與回歸測試尚未編譯或執行。
+暫停／恢復會等待獨占 admission lease，鎖取得期限為 30 秒。Runtime 在共享 lease 內檢查暫停狀態並交付程序或請求；對已接入此 lease 的入口，暫停成功回覆代表先前通過檢查的 admission 都已離開 handoff 前的區間。`admission_wait_timeout` 代表這次變更未套用。rename 已提交、但後續持久化或重讀確認失敗時，回覆仍是 `applied: true`，並帶 `durability_warning: "applied_durability_unknown"`，不能當成狀態未變。程序與 PTY 在 spawn 成功後釋鎖；API 收到 response headers 後釋鎖，不持鎖讀取 body 或串流。工具迴圈及模型 callback 每次請求重新取得 admission。Workflow MCP execute 尚未拆開送出與完成，因此該持鎖區間上限為 10 秒（步驟原上限更短時沿用）；逾時仍視為副作用結果未確認。HTTP 等待 response headers 時仍持鎖，服務端延遲 headers 仍可能造成暫停逾時。逾時訊息列出本程序 holder 數量與路徑分類；其他程序的 holder 標為未知。
 
 `autonomy.changed` 只帶 `agent_id`、`all`、`paused`、`at`。原因與操作者身分須透過重新檢查目前綁定的 `autonomy.status` 取得。完成稽核錯誤及持久化警告只回傳給這次請求者，不會廣播。
 
@@ -344,4 +344,4 @@ Workflow 在核准處理及 lease renewal 後、effect 執行前再次取得 adm
 
 隱藏範圍包含 `skill_synthesis_run` 與 `skill_from_recording`。已在執行的臨時團隊成員也繼承正式登記父鏈上每位員工的暫停；上層資料遺失、損壞、循環或整條鏈超過 32 個身分時，拒絕背景工作。恢復後須整條鏈都通過檢查才重新顯示工具。每次背景工作入列或新增資料，都在實際寫入前持有共享暫停鎖並重新檢查，直到寫入完成；解析與模型呼叫不占用這段鎖。先取得許可的寫入完成後，暫停才能回報成功；暫停先套用時，後來的寫入會被拒絕。
 
-封存、刪除或將員工改成不可執行工作的狀態時，會先等待既有 admission 釋放，最多等待 30 秒；逾時不套用這次生命週期變更。等待的是已取得許可的背景寫入與工作交接，不保證每個執行中的模型串流都已結束。交接流程若已搬移任務或知識，最後的封存步驟才失敗，仍依既有部分完成回覆呈現。因 `autonomy_refused:` 而保留的 fork 結果，必須由真人從儀表板檢視後選取（`fork.resolve`）；員工恢復或同 ID 重建，都不能透過 MCP `merge_or_select` 發布舊結果。一般手動模式 fork 維持原有選取行為。儀表板選取會留下 fork、分支、原拒絕代碼、操作者與管道的安全稽核，不記錄路徑或檔案內容。若發布完成後稽核寫入失敗，回覆會明示已發布，請勿重試發布。本輪修改與回歸測試僅完成靜態檢查，尚未編譯或執行。
+封存、刪除或將員工改成不可執行工作的狀態時，會先等待既有 admission 釋放，最多等待 30 秒；逾時不套用這次生命週期變更。等待的是已取得許可的背景寫入與工作交接，不保證每個執行中的模型串流都已結束。交接流程若已搬移任務或知識，最後的封存步驟才失敗，仍依既有部分完成回覆呈現。因 `autonomy_refused:` 而保留的 fork 結果，必須由真人從儀表板檢視後選取（`fork.resolve`）；員工恢復或同 ID 重建，都不能透過 MCP `merge_or_select` 發布舊結果。一般手動模式 fork 維持原有選取行為。儀表板選取會留下 fork、分支、原拒絕代碼、操作者與管道的安全稽核，不記錄路徑或檔案內容。若發布完成後稽核寫入失敗，回覆會明示已發布，請勿重試發布。

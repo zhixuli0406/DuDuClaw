@@ -310,9 +310,10 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         reply.refuse_delivery();
         return;
     }
-    if state.credential_validity(credential.as_ref(), true).await
-        != crate::handlers::live_context::SocketValidity::Valid {
+    let validity = state.credential_validity(credential.as_ref(), true).await;
+    if validity != crate::handlers::live_context::SocketValidity::Valid {
         reply.refuse_delivery();
+        sink.identity_unavailable(validity, false).await;
         return;
     }
     thinking_visibility.flush_redaction(&progress, &mut sink).await;
@@ -504,6 +505,7 @@ async fn send_terminal(
     let mut recovery = crate::handlers::live_context::SocketRecovery::default();
     if !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
         guarded.refuse_delivery();
+        sink.identity_unavailable(validity, false).await;
         return Err(());
     }
     let result = guarded.confirm_send(sink.send(frame)).await;
