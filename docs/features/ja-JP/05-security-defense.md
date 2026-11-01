@@ -187,7 +187,7 @@ action_rules = [
 ]
 ```
 
-`tool` ルール（他の `[capabilities]` ツール一覧と同じアンカー付きの照合なので、`mcp__duduclaw__mail_send` や `wiki_*` も使えます）は `effect` ルールより優先され、同じ種類のルール同士では最も厳しい判定が採用されます。`block` は MCP の dispatch ゲートで `denied_tools` と同じ場所で拒否し（JSON-RPC `-32003`、監査 `error_class` `action_rule`）、`tools/list` からも隠します。`ask` は承認ゲートの静的な「常に確認」の集合に加わるため、`approval_required_tools` と同様に ApprovalBroker の流れになります。`allow` は「このレイヤーでは何も足さない」という意味だけで、`denied_tools`、承認リスト、機能スイッチ、scope を外すことはありません。8 つの `computer_*` ツールと 3 つの `computer_workspace_*` ツールは、セッションを持つ gateway の computer-use ルートで同じ判定を適用します。このキーは意図的に `[capabilities]` に置いています。`org_field_guard` がこの表全体を社員自身の書き込みから凍結するためです。一覧やエントリの形式が不正な場合（未知の判定や種類、`effect` と `tool` の両方またはどちらもない、余分なキー、配列でない値）でもファイル全体は失敗せず、書かれたまま保持され、副作用のある呼び出しはすべて少なくとも「先に確認」になります。有効な `block` ルールは引き続き拒否します。`agent.toml` が存在するのに読めない、または正しい TOML でない場合も同じ扱いです。ダッシュボードでは社員の編集ページ（操作の種類ごとのルールと個別ツールの例外）から、管理者専用の `agents.update` の capabilities 経路で編集します。各エントリは検証され、変更は `agent_authority_changed` として監査されます。
+`tool` ルール（他の `[capabilities]` ツール一覧と同じアンカー付きの照合なので、`mcp__duduclaw__mail_send` や `wiki_*` も使えます）は `effect` ルールより優先され、同じ種類のルール同士では最も厳しい判定が採用されます。`block` は MCP の dispatch ゲートで `denied_tools` と同じ場所で拒否し（JSON-RPC `-32003`、監査 `error_class` `action_rule`）、`tools/list` からも隠します。`ask` は承認ゲートの静的な「常に確認」の集合に加わるため、`approval_required_tools` と同様に ApprovalBroker の流れになります。`allow` は「このレイヤーでは何も足さない」という意味だけで、`denied_tools`、承認リスト、機能スイッチ、scope を外すことはありません。9 つの `computer_*` ツールと 3 つの `computer_workspace_*` ツールは、セッションを持つ gateway の computer-use ルートで同じ判定を適用します。このキーは意図的に `[capabilities]` に置いています。`org_field_guard` がこの表全体を社員自身の書き込みから凍結するためです。一覧やエントリの形式が不正な場合（未知の判定や種類、`effect` と `tool` の両方またはどちらもない、余分なキー、配列でない値）でもファイル全体は失敗せず、書かれたまま保持され、副作用のある呼び出しはすべて少なくとも「先に確認」になります。有効な `block` ルールは引き続き拒否します。`agent.toml` が存在するのに読めない、または正しい TOML でない場合も同じ扱いです。ダッシュボードでは社員の編集ページ（操作の種類ごとのルールと個別ツールの例外）から、管理者専用の `agents.update` の capabilities 経路で編集します。各エントリは検証され、変更は `agent_authority_changed` として監査されます。
 
 **Claude Code の組み込みツール（2026-10-08 の仕上げ）。** `action_rules` は起動時に Claude CLI 自身のツールにも適用されます。組み込みツールは名前の完全一致で分類されます（`duduclaw_core::effect_of_cli_builtin`）：`Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` は `read`、`TodoWrite` は `draft`、`Write`、`Edit`、`MultiEdit`、`NotebookEdit` は `modify`、`Bash`、`Task`、`Agent` とそれ以外の名前は `admin` です。組み込みツールの呼び出しは ApprovalBroker を通らないため、組み込みツールに対する `ask` は守れず、`block` として扱います（fail closed）。そのツールは `CapabilitiesConfig::disallowed_tools()` を通じて `--disallowedTools` に加わり `--tools` から外れます。`denied_tools` を既に反映しているすべての Claude CLI 起動がこれを読みます（`claude_runner` のディスパッチ、cron、goal とハートビートの起床、`channel_reply/cli_env.rs` のチャネル返信、ハートビートの能動チェック、eval、チームのロールメンバー）。そのため形式の誤ったルール一覧では副作用のある組み込みツール（`Write`、`Edit`、`Bash` など）がすべて外れ、読み取り系は残ります。挙動の変更：MCP ツール向けに `{ effect = "modify", verdict = "ask" }` を書いていた運用者は、Claude CLI の `Write`／`Edit` も使えなくなります。
 
@@ -238,7 +238,6 @@ v1.76 より前は、ダッシュボードの WebSocket 接続はハンドシェ
 コンピューター操作 start／action の承認は、認証済み従業員と `turn_id` をキーにホストが登録した実行中の会話から本人を取得します。要求本文で本人を指定したり他の従業員の会話を借用したりできません。turn がない・未登録の場合は本人情報なしとなるため自己承認者を識別できません。turn のない workspace・screenshot・stop 要求も本人情報を記録しません。
 
 本人の確認は従業員の権限を狭める方向にだけ働きます。記録モードはホストの身元情報を記録するだけで、権限を強制しません。強制モードでは、本人の環境変数だけを変えても gateway の context に登録された人は変わりません。OS による隔離ではないため、同じ OS アカウントで無制限の Bash を持つ従業員は、プロセスの認証情報を読んだりローカル DB を書き換えたりできます。`tasks_create` で作ったスケジュールの後の実行には本人情報が引き継がれません。`spawn_ephemeral` とその待機キューもまだ本人情報を引き継ぎません。Grok と非推奨 Gemini CLI は、起動環境を MCP 子プロセスへ引き継ぐことを保証しません。
-
 
 ## 補助レイヤー
 
@@ -369,7 +368,6 @@ AI 社員が特定の人（例：同僚の Google アカウント）として動
 
 Store は存続中に `<home>/egress_leases.lock` の排他ファイルロック（Unix 0600）を保持します。同じ home を使う二つ目の gateway は強制モードで読み取りと新規送信を拒否して再試行し、取得後に全 lease を復元してから読み取りを許可します。`shadow` は許可して監査します。Gateway の実行中はロックファイルを削除しないでください。有効な lease ID の重複は挿入前に拒否し、他のスタッフを停止しません。
 
-
 ## CLI 送信検査
 
 Claude/Grok の Web ツールと Bash のリテラルなネットワークコマンドに gateway 承認 hook を追加し、Codex の強制モードは起動時にネットワークと検索を制限します。バックグラウンド実行も host ターンを登録します。Security ページは Bash、ask/block、タスク sandbox 無効のスタッフを表示します。Bash は減速帯とテレメトリのみで、ネイティブ読み取り、同一 OS ユーザーによる変更、検査後の並行読み取りは隔離しません。ネイティブ検査は実行全体の MCP lease を保持しません。強制モードは Claude bare mode と Grok 共有 cwd を拒否します。汎用 CLI のネイティブツールは対象外です。[送信ガード](69-egress-guard.md)を参照してください。
@@ -446,3 +444,10 @@ Proxy は自分の社員に属する参照だけを、上流サーバーの起�
 Gateway の起動時に既存の平文 env を移行します。まず元のファイルを `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc` に暗号化して保存し、資格情報ストアへの書き込みと読み戻し検証を終えてから、設定をアトミックに置き換えます。ある社員の移行が失敗した場合は処理を中止し、ほかの社員を処理します。設定の復元も失敗した場合の回復方法は上記のとおりです。クリーンアップ後の移行バックアップは社員ごとに最大三つです。I/O エラーで削除できなかった場合は記録し、次回の走査で再試行します。サーバーや社員の削除時にはストアの該当項目を削除します。削除した社員を復元した場合はキーの再入力が必要です。
 
 Read ガードは `<home>/secrets` への読み取りを拒否します。これは Bash に対する隔離ではありません。同じ OS ユーザーで動く社員が Bash を持つ場合、`.keyfile` を含む gateway のファイルを読めます。実際の隔離には Bash を与えないか、タスクサンドボックスを使う必要があります。対象は `env` のみで、`args`／`url` 内のキーや、キーを返すツール結果は対象外です。既存の平文エクスポートやバックアップを遡って消すことはありません。
+## Web サイトのログイン情報
+
+管理者は **システム → セキュリティ** で `website_credentials.list`、`.upsert`、`.delete` を通じてログイン情報を管理します。Upsert はオリジンの代わりに正規化される HTTPS `login_url` と、任意の `allowed_paths`（同じオリジンの二段階目用の正確なパス、既定値は空）を受け取り、オリジンとログインパスを URL から導出します。一覧にはパスワードを含めません。レコードは `CryptoEngine` と gateway の `.keyfile` で暗号化し、`<home>/secrets/website_credentials.enc` に保存します。書き込みはファイルロックとアトミックな置換を使い、権限は 0600 です。一覧、ログイン検索、すべての変更は既存の全レコードの復号と検証を必要とし、失敗すると利用不可のエラーを返してファイルを変更しません。旧形式のオリジンのみのレコードも対象です。管理操作の監査に認証情報の値を含めず、外側の ACL 拒否はパラメータなしで記録し、削除結果は `deleted`、`noop`、`refused` に分けます。利用ごとに認証情報 ID、スタッフ、オリジン、結果を記録します。
+
+`computer_login` はラベルのみを受け取ります。Gateway は検証済みのスタッフを空でない `allowed_agents` リストと照合し、独立したツール名でツールとセッションのゲートを適用します。既存のナビゲーション検査で保存済みのログイン URL を最初に開きます。秘密は stdin でコンテナのヘルパーへ送り、コマンドライン引数やモデルへの結果には含めません。入力前に正確なオリジンとログインパスの一致が必要です。`allowed_paths` はヘルパーの最初の送信後に到達し、パスワード欄が表示された二段階目にのみ使えます。入力前、同期 input/change イベント後、submit ハンドラー後に有効な送信方法が POST であることを確認します。ネイティブの `requestSubmit` と代替経路の両方で、選択した送信ボタンの `formmethod` を検査します。ネットワーク側でもデコードしたクエリ値が完全なユーザー名またはパスワードと一致する非 POST リクエストを拒否します。CDP Fetch は別オリジンへのリクエストとリダイレクトをすべて中止し、処理中はサービスワーカーも迂回します。インターセプトを解除する前に、ヘルパーは `Network.requestWillBeSent`、`Network.loadingFinished`、`Network.loadingFailed` を追跡し、リクエストの終了を確認します。最大 3 秒待機し、保留リクエストも新しい活動もないコマンド往復が 2 回連続することを要求します。完了を確認できない場合は `failed_uncleared` とし、Fetch の制限を維持したまま `Browser.close` を呼び出して、その後 Gateway がセッションとコンテナを削除します。スクリーンショットを抑止し、消去を確認できない場合はセッションとコンテナを停止・削除して、新しいセッションを要求します。
+
+同一オリジンの JavaScript による入力済みフィールドの読み取りは防げません。また、gateway と同じ OS ユーザー権限を持つプロセスからのファイル隔離を提供するものでも、ネットワーク許可リストの代わりでもありません。対象は保存した HTTPS オリジンと許可されたログインパスのみで、localhost も HTTPS が必要です。二要素認証や CAPTCHA は既存の引き継ぎ機能で人が処理します。`duduclaw-fill-login` の追加には Computer Use イメージの再ビルドが必要です。結果の意味と設定は[ブラウザ自動化](08-browser-automation.md)を参照してください。

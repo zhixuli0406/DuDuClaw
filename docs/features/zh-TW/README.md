@@ -15,7 +15,7 @@
 | 4 | [檔案式 IPC 訊息匯流排](04-file-based-ipc.md) | 結構化跨 Agent 委派 + TaskSpec 工作流 |
 | 5 | [安全防線](05-security-defense.md) | 四道現役守衛各跑在哪裡，以及它們都擋不住什麼 |
 | 7 | [多帳號輪替與跨供應商容錯](07-account-rotation.md) | 跨 Claude/Codex 的認證資料智慧排程 |
-| 8 | [瀏覽器自動化與 Computer Use](08-browser-automation.md) | agent 自行選擇的兩個抓取工具與可選的瀏覽器 server，加上透過八個 `computer_*` MCP 工具驅動的電腦操作 session；沒有自動路由器 |
+| 8 | [瀏覽器自動化與 Computer Use](08-browser-automation.md) | agent 自行選擇的兩個抓取工具與可選的瀏覽器 server，加上透過九個 `computer_*` MCP 工具驅動的電腦操作 session；沒有自動路由器 |
 | 9 | [行為契約與紅隊測試](09-behavioral-contracts.md) | 可機器執行的 Agent 行為邊界 |
 | 10 | [認知記憶系統](10-cognitive-memory.md) | 仿人腦記憶設計，具備遺忘曲線 |
 | 11 | [Prompt 預算強制](11-token-compression.md) | 估算 prompt、走三個階段，不然就拒絕 |

@@ -324,7 +324,7 @@
 | L1 `web_fetch_cached` | 經 SSRF 閘、帶磁碟快取的 HTTP GET（body 截斷在 6 萬字元） |
 | L2 `web_extract` | 同一條抓取路徑＋CSS 選擇器擷取（`text`／`html`／`json`） |
 | L3 headless（可選，外部） | 在該 agent 的 `.mcp.json` 註冊 Playwright 或 Browserbase MCP server；不在 binary 內，也不會自動降級過去 |
-| L5 Computer Use | 由 `computer_use_orchestrator` 啟動的容器虛擬顯示器（映像 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>`，不會自動下載），由 AI 員工透過八個 `computer_*` MCP 工具驅動（`session_start`／`screenshot`／`click`／`type`／`key`／`scroll`／`navigate`／`session_stop`；session 由 gateway 持有，透過簽章的 loopback 路由連線，每位員工一個，不需要 API 金鑰，網路只通到 `[capabilities.computer_use_config] allowed_domains` 列出的主機）。聊天觸發的 gateway 迴圈與 `native` 主機桌面模式已移除 |
+| L5 Computer Use | 由 `computer_use_orchestrator` 啟動的容器虛擬顯示器（映像 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>`，不會自動下載），由 AI 員工透過九個 `computer_*` MCP 工具驅動（`session_start`／`screenshot`／`click`／`type`／`login`／`key`／`scroll`／`navigate`／`session_stop`；session 由 gateway 持有，透過簽章的 loopback 路由連線，每位員工一個，不需要 API 金鑰，網路只通到 `[capabilities.computer_use_config] allowed_domains` 列出的主機）。聊天觸發的 gateway 迴圈與 `native` 主機桌面模式已移除 |
 | 能力閘門 | `agent.toml [capabilities]` 預設拒絕（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）；`denied_tools` 同時以 `--disallowedTools` 與 MCP 分派總門兩處強制 |
 
 ## 容器沙盒

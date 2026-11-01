@@ -323,7 +323,7 @@
 | L1 `web_fetch_cached` | SSRF ゲート付き・ディスクキャッシュ付き HTTP GET（本文は 6 万文字で切り詰め） |
 | L2 `web_extract` | 同じ取得経路＋CSS セレクタ抽出（`text`／`html`／`json`） |
 | L3 ヘッドレス（任意・外部） | Playwright または Browserbase をエージェント毎の `.mcp.json` に MCP サーバーとして登録。バイナリには含まれず、L2 からのフォールバックもなし |
-| L5 Computer Use | `computer_use_orchestrator` が起動するコンテナの仮想ディスプレイ（イメージ `ghcr.io/zhixuli0406/duduclaw-computer-use:v<バージョン>`、自動 pull なし）。スタッフが 8 つの `computer_*` MCP ツール（`session_start` / `screenshot` / `click` / `type` / `key` / `scroll` / `navigate` / `session_stop`。署名付き loopback ルート経由で到達する gateway 所有のセッション、スタッフごとに 1 つ、API キー不要、ネットワークは `[capabilities.computer_use_config] allowed_domains` のホストにのみ）で駆動します。チャットで起動する gateway のループと `native` のホストデスクトップモードは削除されました |
+| L5 Computer Use | `computer_use_orchestrator` が起動するコンテナの仮想ディスプレイ（イメージ `ghcr.io/zhixuli0406/duduclaw-computer-use:v<バージョン>`、自動 pull なし）。スタッフが 9 つの `computer_*` MCP ツール（`session_start` / `screenshot` / `click` / `type` / `login` / `key` / `scroll` / `navigate` / `session_stop`。署名付き loopback ルート経由で到達する gateway 所有のセッション、スタッフごとに 1 つ、API キー不要、ネットワークは `[capabilities.computer_use_config] allowed_domains` のホストにのみ）で駆動します。チャットで起動する gateway のループと `native` のホストデスクトップモードは削除されました |
 | 能力ゲーティング | `agent.toml [capabilities]` はデフォルト拒否（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）。`denied_tools` は `--disallowedTools` と MCP ディスパッチゲートの両方で強制 |
 
 ## コンテナサンドボックス

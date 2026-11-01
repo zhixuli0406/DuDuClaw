@@ -46,7 +46,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 | `recording` | `agent.toml [capabilities]` | 隱藏 5 個錄製工具 |
 | `system_operator` | `agent.toml [capabilities]` | 隱藏 19 個值班機操作工具 |
 | `codrive` | `agent.toml [capabilities]` | 隱藏 `codrive_run` / `codrive_status` |
-| `computer_use` | `agent.toml [capabilities]` | 隱藏 8 個 `computer_*`（見下方 [`computer_*`](#computer_由-gateway-執行的-session)） |
+| `computer_use` | `agent.toml [capabilities]` | 隱藏 9 個 `computer_*`（見下方 [`computer_*`](#computer_由-gateway-執行的-session)） |
 | `db_sources` | `agent.toml [capabilities]` | 隱藏 4 個 `db_*` |
 | `[fork] enabled` | `agent.toml` | 隱藏 6 個分支工具 |
 | `[knowledge] enabled` 加集合授權 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | 除非知識庫啟用、且至少有一個集合授權給員工或其部門（經 `[knowledge] collections` 縮小後），否則隱藏 4 個 `knowledge_*`；授權變更會送出 `list_changed`（見下方 [`knowledge_*`](#knowledge_文件知識庫)） |
@@ -191,7 +191,7 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 ### `computer_*`：由 gateway 執行的 session
 
-這八個工具為每位 AI 員工驅動一個電腦操作 session：一個帶虛擬顯示器與 kiosk 瀏覽器的隔離容器。MCP server 只負責把每次呼叫透過 loopback 轉給 gateway（`POST /api/internal/computer-use`，每個請求各自簽章）；容器由 gateway 持有，所有檢查也由 gateway 執行，所以 gateway 必須在執行中。除非 `agent.toml [capabilities] computer_use = true`，否則這些工具是隱藏的。
+這九個工具為每位 AI 員工驅動一個電腦操作 session：一個帶虛擬顯示器與 kiosk 瀏覽器的隔離容器。MCP server 只負責把每次呼叫透過 loopback 轉給 gateway（`POST /api/internal/computer-use`，每個請求各自簽章）；容器由 gateway 持有，所有檢查也由 gateway 執行，所以 gateway 必須在執行中。除非 `agent.toml [capabilities] computer_use = true`，否則這些工具是隱藏的。
 
 | 工具 | 參數 | 備註 |
 |---|---|---|
@@ -199,12 +199,17 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 | `computer_screenshot` | 無 | MCP 圖片區塊（PNG，已遮罩），後面接一個文字區塊，寫已用動作數與剩餘時間。整張圖被遮掉時，文字會如實說明，並寫出原因（多個視窗、焦點視窗敏感或讀不到、偵測失敗）與下一步 |
 | `computer_click` | `x`、`y` 整數（必填）；`button` 字串 `left`/`right`；`double` 布林 | `double` 只限左鍵 |
 | `computer_type` | `text` 字串（必填），1–2,000 字元 | 稽核只記字元數 |
+| `computer_login` | `credential`（必填，憑證標籤字串） | Gateway 代允許的員工填入並送出登入，只回傳狀態與一句說明 |
 | `computer_key` | `key` 字串（必填）：字母、數字、`+`、`-`、`_` | 例如 `Return`、`ctrl+s` |
 | `computer_scroll` | `x`、`y` 整數（必填）；`direction` 字串 `up`/`down`（預設 `down`）；`amount` 整數 1–20（預設 3） | |
 | `computer_navigate` | `url` 字串（必填） | 只接受 `https://`，主機必須剛好在該員工的 `[capabilities.computer_use_config] allowed_domains` 上且在 session 啟動時解析成功，連接埠不寫或為 443，不得帶使用者名稱或密碼，最長 2,000 位元組。沒有白名單時 session 沒有網路，呼叫會被拒絕 |
 | `computer_session_stop` | `session_id` 字串，選填 | 移除容器 |
 
-整數與布林參數也接受數字字串與 `"true"`/`"false"` 字串。點擊、輸入、按鍵、捲動與導覽各算一個動作，計入 `max_actions`（預設 50）。各項上限、審批與確認規則、網路白名單及其殘留風險，見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)。
+`computer_login` 是第九個 session 工具。管理員在 **系統 → 安全 → 網站登入憑證** 建立帶標籤、HTTPS `login_url` 的登入資料，並指定至少一位允許的員工；密碼只輸入該表單，不貼到聊天。選填的 `allowed_paths` 預設為空，只允許 helper 送出第一步後到達、含可見密碼欄位的相同來源第二步確切路徑。Gateway 先透過既有導覽檢查開啟保存的網址；導覽與登入各消耗一次 session 動作額度。Helper 檢查確切來源、路徑及 POST 提交方式，包含原生 `requestSubmit` 與備援路徑實際選用送出按鈕的 `formmethod`，submit 事件後也會重查；攔截每個請求與轉址以拒絕其他來源，拒絕查詢參數含完整帳號或密碼值的非 POST 請求，並略過 service worker。MCP 請求只帶標籤，session 啟動與狀態回應只顯示呼叫員工可用的標籤，不含使用者名稱。收到 `needs_takeover` 時請人員使用既有接手流程，沒有 OTP 輸入工具。`logged_in` 只表示密碼欄位消失；若清除失敗（`failed_uncleared`），Gateway 會停止並移除 session 與容器，回傳錯誤要求啟動新 session，不能靠導覽恢復。解除攔截前，helper 會追蹤 `Network.requestWillBeSent`、`Network.loadingFinished` 與 `Network.loadingFailed`，確認請求已結束。最多等待 3 秒，且須連續兩次命令往返都沒有新請求活動或待完成請求。若無法確認完成，回傳 `failed_uncleared`，在 Fetch 攔截仍啟用時呼叫 `Browser.close`，再由 Gateway 移除 session 與容器。登入執行期間暫停截圖。
+
+登入僅限保存的來源（協定、主機、連接埠），表單送出也必須同源。所有網址都必須使用 HTTPS，localhost 也不例外。同源網頁 JavaScript 能讀取已填入的欄位；雙因素驗證須由人員處理。使用前須重建電腦操作容器映像，加入新的 helper。
+
+整數與布林參數也接受數字字串與 `"true"`/`"false"` 字串。點擊、輸入、登入、按鍵、捲動與導覽各算一個動作，計入 `max_actions`（預設 50）。各項上限、審批與確認規則、網路白名單及其殘留風險，見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)。
 
 ### `os_*`：DuDuClaw OS 上的裝置操作
 

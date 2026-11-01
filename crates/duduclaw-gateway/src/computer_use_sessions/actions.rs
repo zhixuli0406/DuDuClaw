@@ -16,7 +16,7 @@ pub const SCROLL_AMOUNT_RANGE: std::ops::RangeInclusive<i64> = 1..=20;
 pub const DEFAULT_SCROLL_AMOUNT: i64 = 3;
 
 /// One action as the MCP client sends it.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionRequest {
     Click {
@@ -29,6 +29,10 @@ pub enum ActionRequest {
     },
     Type {
         text: String,
+    },
+    /// Contains a label only. Secrets never enter the action/request enum.
+    Login {
+        credential: String,
     },
     Key {
         key: String,
@@ -46,6 +50,19 @@ pub enum ActionRequest {
     Navigate {
         url: String,
     },
+}
+
+impl std::fmt::Debug for ActionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Click { .. } => "Click",
+            Self::Type { .. } => "Type { text: [REDACTED] }",
+            Self::Login { .. } => "Login { credential: [LABEL] }",
+            Self::Key { .. } => "Key",
+            Self::Scroll { .. } => "Scroll",
+            Self::Navigate { .. } => "Navigate",
+        })
+    }
 }
 
 fn invalid(message: String) -> OpError {
@@ -67,6 +84,9 @@ fn coordinate(x: i64, y: i64, width: u32, height: u32) -> Result<[u32; 2], OpErr
 /// `Escape`, the argv builder's last-resort fallback).
 pub fn to_action(req: &ActionRequest, width: u32, height: u32) -> Result<ComputerAction, OpError> {
     match req {
+        ActionRequest::Login { .. } => Err(invalid(
+            "登入必須使用 gateway 的專用憑證路徑。".to_string(),
+        )),
         ActionRequest::Navigate { .. } => Err(invalid(
             "導覽不是畫面操作，請改用 computer_navigate。".to_string(),
         )),

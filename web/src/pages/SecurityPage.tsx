@@ -12,6 +12,7 @@ import { isNewFeature } from '@/apps/registry';
 import { useAuthStore } from '@/stores/auth-store';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
+import { WebsiteCredentialsPanel } from '@/components/WebsiteCredentialsPanel';
 import { ForgetReceiptsPanel } from '@/components/ForgetReceiptsPanel';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -172,6 +173,8 @@ export function SecurityPage() {
           Every edition: person identities by domain-wide delegation exist in
           both, so both need to see (and change) where they are protected. */}
       <CredentialProtectionPanel />
+
+      {isAdmin && <WebsiteCredentialsPanel />}
 
       <EgressGuardSection status={status} onSaved={refreshSecurityStatus} />
 

@@ -110,7 +110,7 @@ pub(crate) use duduclaw_core::mcp_tool_defs::DB_SOURCE_TOOLS;
 /// in `mcp::dispatch::handle_tools_call`, which is what actually denies the
 /// call) and the `tools/list` filter — they used to be a hand-written match
 /// arm and nothing respectively, so a capability-less agent was shown seven
-/// (now eight) tools every call would reject.
+/// (now nine) tools every call would reject.
 pub(crate) use duduclaw_core::mcp_tool_defs::COMPUTER_USE_TOOLS;
 
 /// The durable-workspace tools (P2-C). Gated like [`COMPUTER_USE_TOOLS`] by
@@ -4594,6 +4594,7 @@ effect = "forbid"
         "computer_session_start",
         "computer_session_stop",
         "computer_type",
+        "computer_login",
         "computer_workspace_list",
         "computer_workspace_read",
         "computer_workspace_write",
@@ -4822,7 +4823,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            253,
+            254,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

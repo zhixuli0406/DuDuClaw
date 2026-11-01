@@ -3,11 +3,11 @@
 //!
 //! | op | body | answer |
 //! |---|---|---|
-//! | `start` | `width?`, `height?`, `task?`, `turn_id?` | session id, size, limits, `network`, `reachable_hosts`, `unreachable_hosts`, `network_message` |
+//! | `start` | `width?`, `height?`, `task?`, `turn_id?` | session id, size, limits, `network`, `reachable_hosts`, `unreachable_hosts`, `network_message`, `available_credentials` (labels only) |
 //! | `screenshot` | `session_id?` | `png_base64`, `fully_masked`, `mask_reason` (`helper_failed` / `several_pages` / `title_sensitive` / `title_unreadable`, or `null`) + counters |
-//! | `action` | `session_id?`, `turn_id?`, `action: {type: click/type/key/scroll/navigate, …}` | `message` (+ `host` for navigate) + counters |
+//! | `action` | `session_id?`, `turn_id?`, `action: {type: click/type/login/key/scroll/navigate, …}` | `message` (+ `host` for navigate) + counters; login returns only `status` + `message` |
 //! | `stop` | `session_id?` | statistics |
-//! | `status` | — | `active` + counters |
+//! | `status` | — | `active`, `available_credentials` (labels only) + counters |
 //! | `workspace_list` | — | own workspaces: state, usage, quota, files |
 //! | `workspace_read` | `workspace_id`, `path` | fenced `content`, `sha256`, `injection_scan` |
 //! | `workspace_write` | `workspace_id`, `path`, `content`, `expected_revision?` | `data_revision`, usage |
