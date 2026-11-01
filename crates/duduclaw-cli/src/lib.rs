@@ -3564,6 +3564,9 @@ enum ServiceCommands {
     /// Stop the background service
     Stop,
 
+    /// Restart the background service
+    Restart,
+
     /// Show service status
     Status,
 
@@ -5454,6 +5457,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
+            ServiceCommands::Restart => service::handle_service(service::ServiceAction::Restart).await,
             ServiceCommands::Status => {
                 service::handle_service(service::ServiceAction::Status).await
             }
@@ -12808,6 +12812,9 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
         println!("  {}", result.message);
         if result.needs_restart {
             println!("\n  Please restart DuDuClaw to use the new version.");
+        }
+        if let Some(hint) = result.restart_hint {
+            println!("  Restart hint: {hint}");
         }
         Ok(())
     } else {

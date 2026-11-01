@@ -5496,6 +5496,7 @@
   "console.artifact.updateConfirm.desc.system": "為 DuDuClaw 安裝最新的應用程式更新。",
   "console.artifact.updateConfirm.cta": "套用更新",
   "console.artifact.updateConfirm.needsRestart": "更新已套用，服務即將自動重新啟動，頁面稍後會自動重新整理。",
+  "console.artifact.updateConfirm.restartHint": "若服務未能啟動，請執行 `{command}`。",
   "console.artifact.approvalRequest.title": "需要你核准",
   "console.artifact.approvalRequest.expiresIn": "{time} 後過期",
   "console.artifact.wifiPasswordRequest.title": "需要 Wi-Fi 密碼",

@@ -5496,6 +5496,7 @@
   "console.artifact.updateConfirm.desc.system": "Installs the newest available DuDuClaw app update.",
   "console.artifact.updateConfirm.cta": "Apply update",
   "console.artifact.updateConfirm.needsRestart": "Update applied — the service will restart automatically and the page will reload shortly.",
+  "console.artifact.updateConfirm.restartHint": "If it does not start, run `{command}`.",
   "console.artifact.approvalRequest.title": "Needs your approval",
   "console.artifact.approvalRequest.expiresIn": "Expires in {time}",
   "console.artifact.wifiPasswordRequest.title": "Wi-Fi password needed",

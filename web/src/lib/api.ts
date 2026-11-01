@@ -7446,6 +7446,7 @@ export const api = {
         success: boolean;
         message: string;
         needs_restart: boolean;
+        restart_hint?: string | null;
       }>,
     /**
      * Restart onto the binary already on disk (`restart_pending_version`).

@@ -17,6 +17,7 @@ pub enum ServiceAction {
     Install,
     Start,
     Stop,
+    Restart,
     Status,
     Logs { lines: usize },
     Uninstall,
@@ -28,10 +29,19 @@ pub async fn handle_service(action: ServiceAction) -> Result<()> {
         ServiceAction::Install => install_service().await,
         ServiceAction::Start => start_service().await,
         ServiceAction::Stop => stop_service().await,
+        ServiceAction::Restart => restart_service().await,
         ServiceAction::Status => service_status().await,
         ServiceAction::Logs { lines } => service_logs(lines).await,
         ServiceAction::Uninstall => uninstall_service().await,
     }
+}
+
+async fn restart_service() -> Result<()> {
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
+    #[cfg(target_os = "macos")]
+    { launchd::restart().await }
+    #[cfg(not(target_os = "macos"))]
+    { Err(DuDuClawError::Gateway("`duduclaw service restart` is unsupported on this platform".into())) }
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +72,75 @@ mod systemd {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
 mod launchd {
-    use duduclaw_core::error::Result;
+    use duduclaw_core::error::{DuDuClawError, Result};
+
+    pub fn domain_target(uid: u32, label: &str) -> String { format!("gui/{uid}/{label}") }
+    pub fn bootout_args(target: &str) -> Vec<String> { vec!["bootout".into(), target.into()] }
+    pub fn bootstrap_args(domain: &str, plist: &str) -> Vec<String> { vec!["bootstrap".into(), domain.into(), plist.into()] }
+    pub fn job_runs(output: &str) -> bool { output.lines().any(|line| line.trim() == "state = running") }
+    pub fn last_exit_status(output: &str) -> Option<i32> {
+        output.lines().find_map(|line| line.trim().strip_prefix("last exit code = ")?.parse().ok())
+    }
+    pub fn is_job_missing(output: &str) -> bool {
+        let lower = output.to_ascii_lowercase();
+        lower.contains("could not find service") || lower.contains("service not found") || lower.contains("no such process")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn builds_launchctl_arguments_and_parses_print_output() {
+            assert_eq!(domain_target(501, "com.duduclaw.gateway"), "gui/501/com.duduclaw.gateway");
+            assert_eq!(bootout_args("gui/501/com.duduclaw.gateway"), ["bootout", "gui/501/com.duduclaw.gateway"]);
+            assert_eq!(bootstrap_args("gui/501", "/tmp/job.plist"), ["bootstrap", "gui/501", "/tmp/job.plist"]);
+            assert!(job_runs("state = running\nlast exit code = 0"));
+            assert_eq!(last_exit_status("state = running\nlast exit code = 78"), Some(78));
+            assert!(is_job_missing("Could not find service \"x\" in domain"));
+        }
+    }
+
+    async fn launchctl(args: &[String]) -> Result<std::process::Output> {
+        let output = tokio::process::Command::new("/bin/launchctl").args(args).output().await
+            .map_err(|e| DuDuClawError::Gateway(format!("/bin/launchctl {} failed: {e}", args.join(" "))))?;
+        if !output.status.success() {
+            return Err(DuDuClawError::Gateway(format!("/bin/launchctl {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim())));
+        }
+        Ok(output)
+    }
+
+    pub async fn restart() -> Result<()> {
+        let home = dirs::home_dir().unwrap_or_default();
+        let (label, plist) = [duduclaw_core::autostart::LAUNCHD_LABEL, duduclaw_core::autostart::LEGACY_LAUNCHD_LABEL]
+            .into_iter().map(|label| (label, duduclaw_core::autostart::launchd_plist_path_in(&home, label)))
+            .find(|(_, path)| path.exists()).ok_or_else(|| DuDuClawError::Gateway("No LaunchAgent plist found. Run `duduclaw service install` first.".into()))?;
+        let uid = unsafe { libc::getuid() };
+        let target = domain_target(uid, label);
+        if let Err(error) = launchctl(&bootout_args(&target)).await {
+            if !error.to_string().to_ascii_lowercase().contains("could not find service")
+                && !error.to_string().to_ascii_lowercase().contains("service not found")
+            {
+                return Err(error);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let output = tokio::process::Command::new("/bin/launchctl").args(["print", &target]).output().await
+                .map_err(|e| DuDuClawError::Gateway(format!("/bin/launchctl print {target} failed: {e}")))?;
+            if !output.status.success() && is_job_missing(&String::from_utf8_lossy(&output.stderr)) { break; }
+            if !output.status.success() {
+                return Err(DuDuClawError::Gateway(format!("/bin/launchctl print {target} failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+            }
+            if tokio::time::Instant::now() >= deadline { return Err(DuDuClawError::Gateway(format!("Timed out waiting for launchd job {target} to unload"))); }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        launchctl(&bootstrap_args(&format!("gui/{uid}"), &plist.to_string_lossy())).await?;
+        let output = launchctl(&["print".into(), target.clone()]).await?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        if !job_runs(&text) { return Err(DuDuClawError::Gateway(format!("LaunchAgent {target} bootstrapped but is not running"))); }
+        println!("LaunchAgent restarted; last exit status: {}", last_exit_status(&text).map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()));
+        Ok(())
+    }
 
     pub async fn start() -> Result<()> {
         let home = dirs::home_dir().unwrap_or_default();
