@@ -160,6 +160,9 @@ pub async fn handle(cmd: Command<'_>) -> String {
         let Some(id) = ids.into_iter().next() else {
             return Ok(None);
         };
+        if !super::principals::collection_visible(&home, &conn, &id, user.is_admin) {
+            return Ok(None);
+        }
         let role = duduclaw_knowledge::acl::user_role(
             &conn,
             &id,

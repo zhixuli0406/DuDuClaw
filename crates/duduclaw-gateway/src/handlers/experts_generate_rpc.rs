@@ -54,7 +54,11 @@ impl MethodHandler {
             let Ok(_slot) = rx.await else {
                 return Err("工作未啟動".to_string());
             };
-            run_job(spec, &llm).await
+            // This job can outlive the human RPC and has no employee owner.
+            // Its CLI and direct-API fallbacks both acquire global admission
+            // at each handoff; a later stage cannot bypass a global pause.
+            let home = spec.home_dir.clone();
+            crate::autonomous_runtime::scope(&home, "", &[], run_job(spec, &llm)).await
         });
         slot.attach(handle.abort_handle());
         if tx.send(slot).is_err() {

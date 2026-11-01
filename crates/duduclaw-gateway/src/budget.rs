@@ -490,6 +490,10 @@ async fn notify_breaker_transition(
     if !record_breaker_transition(home_dir, agent_id, new_state) {
         return; // already alerted on this state (or was never open) — stay quiet
     }
+    if is_open {
+        crate::dashboard_feedback::emit_live(home_dir, "budget.breaker_open",
+            serde_json::json!({ "agent_id": agent_id }));
+    }
     let name = agent_display_name(agent_dir, agent_id);
     let link =
         crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)

@@ -13,9 +13,11 @@ async fn egress_approval_unbound_manager_list_and_decide_require_admin() {
         "name":"send_message", "arguments":{"text":"private"}, "egress_guard":null
     }), 300).await.unwrap();
     let manager = payload(f.handler.handle_approvals_list(json!({"id":id.as_str()}), &f.alice).await);
-    let row = &manager["approvals"][0];
-    assert_eq!(row["may_decide"], false);
-    assert!(!row["payload"].to_string().contains("private"));
+    assert_eq!(manager["count"], 0);
+    assert_eq!(manager["approvals"], json!([]));
+    let manager_response = manager.to_string();
+    assert!(!manager_response.contains("private"));
+    assert!(!manager_response.contains(id.as_str()));
     let args = json!({"id":id.as_str(),"approve":true});
     assert!(!ok(&f.handler.handle_approvals_decide(args.clone(), &f.alice).await));
     assert!(broker.decide(&id, true, "channel:manager").await.is_err());
@@ -285,6 +287,7 @@ async fn push_table_by_event_kind() {
     assert!(live_login_gate.filter(&login).is_none(), "revocation applies to the next PTY chunk");
     // Lock screen: system status only.
     let lock = UserContext {
+        credential_epoch: 0,
         user_id: "lockscreen".into(),
         email: "lockscreen@local".into(),
         role: UserRole::Employee,
@@ -351,6 +354,7 @@ async fn production_identities_pass_the_live_check() {
     assert!(live_reader_context(home.path(), &jwt).unwrap().is_admin());
     // (d) lock screen: not an account, refused.
     let lock = UserContext {
+        credential_epoch: 0,
         user_id: "lockscreen".into(),
         email: "lockscreen@local".into(),
         role: UserRole::Employee,

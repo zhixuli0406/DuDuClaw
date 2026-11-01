@@ -31,11 +31,27 @@ pub(crate) async fn handle_agent_remove(params: &Value, home_dir: &Path, caller:
         });
     }
 
+    let home = home_dir.to_path_buf();
+    let agent = agent_id.to_string();
+    let caller = caller.to_string();
+    // The worker owns the lease through rename even if the MCP call is cancelled.
+    match tokio::task::spawn_blocking(move || remove_agent_locked(&home, &agent, &caller)).await {
+        Ok(value) => value,
+        Err(error) => tool_error(&format!("移除員工工作失敗：{error}")),
+    }
+}
+
+fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
+    let _lifecycle = match duduclaw_core::autonomy_gate::exclusive_barrier(home_dir) {
+        Ok(guard) => guard,
+        Err(error) => return tool_error(&error.to_string()),
+    };
+
     let agent_dir = home_dir.join("agents").join(agent_id);
     let toml_path = agent_dir.join("agent.toml");
 
     // Verify agent exists
-    let content = match tokio::fs::read_to_string(&toml_path).await {
+    let content = match std::fs::read_to_string(&toml_path) {
         Ok(c) => c,
         Err(_) => {
             return serde_json::json!({
@@ -57,12 +73,12 @@ pub(crate) async fn handle_agent_remove(params: &Value, home_dir: &Path, caller:
 
     // Move to trash instead of hard delete
     let trash_dir = home_dir.join("agents").join("_trash");
-    let _ = tokio::fs::create_dir_all(&trash_dir).await;
+    let _ = std::fs::create_dir_all(&trash_dir);
     let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
     let trash_name = format!("{agent_id}_{timestamp}");
     let trash_path = trash_dir.join(&trash_name);
 
-    if let Err(e) = tokio::fs::rename(&agent_dir, &trash_path).await {
+    if let Err(e) = std::fs::rename(&agent_dir, &trash_path) {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error moving agent to trash: {e}")}],
             "isError": true

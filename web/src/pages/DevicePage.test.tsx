@@ -445,9 +445,10 @@ describe('<DevicePage> — WP-G1 scheduled backups + device migration restore', 
 
   it('imports a backup from an old device: upload → confirm → stage → restart prompt', async () => {
     vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    const notice = '雙因素驗證設定會保留目前值，請使用專用開關變更。';
     const restore = vi
       .spyOn(api.device, 'backupRestore')
-      .mockResolvedValue({ staged: true, files_written: 12, restart_required: true });
+      .mockResolvedValue({ staged: true, files_written: 12, restart_required: true, notice });
     const power = vi.spyOn(api.device, 'power').mockResolvedValue({ success: true, stdout: '', stderr: '' });
 
     // `uploadBackup` drives a raw XHR (fetch has no upload-progress event) —
@@ -487,6 +488,7 @@ describe('<DevicePage> — WP-G1 scheduled backups + device migration restore', 
     // Staged ⇒ restart prompt, restart button wires to the existing
     // device.power('restart') RPC.
     expect(await screen.findByText('Import ready — restart to finish')).toBeInTheDocument();
+    expect(screen.getByText(notice)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Restart' }));
     await waitFor(() => expect(power).toHaveBeenCalledWith('restart'));
   });

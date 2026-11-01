@@ -1066,6 +1066,10 @@ impl MethodHandler {
 
         match result {
             Ok(hot_reloaded) => {
+                if let Some(status) = params.get("status").and_then(Value::as_str) {
+                    self.broadcast_event("agent.status_changed",
+                        json!({ "agent_id": agent_id, "status": status })).await;
+                }
                 // WP22 T5 — the mirror write committed, so the authority may
                 // now follow, and only when the org pair actually changed
                 // (see the comment above `caller_is_admin`). A failed write

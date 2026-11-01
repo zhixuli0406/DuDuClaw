@@ -14,7 +14,7 @@ pub(crate) async fn handle_create_reminder(
 ) -> Value {
     use duduclaw_gateway::reminder_scheduler::{
         AppendResult, MAX_FUTURE_DAYS, MAX_MESSAGE_LEN, MAX_PROMPT_LEN, MAX_REMINDERS_PER_AGENT,
-        Reminder, ReminderMode, ReminderStatus, append_reminder_checked, is_valid_discord_chat_id,
+        Reminder, ReminderMode, ReminderStatus, append_reminder_checked_admitted, is_valid_discord_chat_id,
         parse_time_spec,
     };
 
@@ -178,8 +178,14 @@ pub(crate) async fn handle_create_reminder(
     let id = reminder.id.clone();
     let trigger_display = trigger_at.to_rfc3339();
 
-    // Atomic count-check + append (no TOCTOU race)
-    match append_reminder_checked(home_dir, &reminder, MAX_REMINDERS_PER_AGENT).await {
+    let admission = match admit_background_caller(home_dir, actor, "create_reminder").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
+    // Atomic count-check + append, with the lease owned by the blocking writer.
+    match append_reminder_checked_admitted(
+        home_dir, &reminder, MAX_REMINDERS_PER_AGENT, admission,
+    ).await {
         Ok(AppendResult::Ok) => serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Reminder created (id: {id}, trigger: {trigger_display}, channel: {channel})"

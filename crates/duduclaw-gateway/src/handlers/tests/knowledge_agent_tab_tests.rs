@@ -64,6 +64,7 @@ fn person(
         db.bind_agent(id, a, *l).unwrap();
     }
     UserContext {
+        credential_epoch: 0,
         user_id: id.into(),
         email: format!("{id}@test.invalid"),
         role,

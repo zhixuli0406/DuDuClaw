@@ -29,6 +29,7 @@ fn audit_rows(home: &Path, event: &str) -> Vec<Value> {
 
 fn employee() -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: "emp-1".into(),
         email: "emp-1@example.invalid".into(),
         role: UserRole::Employee,

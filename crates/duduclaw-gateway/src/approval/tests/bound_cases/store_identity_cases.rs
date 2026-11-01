@@ -397,3 +397,21 @@ async fn operator_resolution_inspection_preserves_actor_reason_time_without_payl
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn bound_decision_refuses_tombstoned_origin_inside_transaction() {
+    let home = fixture();
+    let broker = ApprovalBroker::open(home.path()).unwrap();
+    let payload = json!({"write":"one"});
+    let id = crate::approval::scope_turn("session", "turn", broker.request_bound(
+        RequestKind::Approval, "alice", "write", payload.clone(),
+        binding(home.path(), &payload, "workflow_v1"),
+    )).await.unwrap();
+    {
+        let conn = broker.store.conn.lock().await;
+        conn.execute("INSERT INTO cancelled_approval_turns(session_id, turn_id, cancelled_at) VALUES ('session','turn',?1)",
+            [Utc::now().to_rfc3339()]).unwrap();
+    }
+    assert!(broker.decide_bound(&id, &context(), true).await.is_err());
+    assert_eq!(broker.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Pending);
+}

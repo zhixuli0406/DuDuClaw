@@ -110,7 +110,7 @@ async fn a_heartbeat_wake_up_under_an_explore_lane_run_gets_the_lane_refusal() {
     child(&env, "sub-hb", &occ).await;
     std::fs::write(
         env.home().join("agents").join(OWNER).join("agent.toml"),
-        "[agent]\nname = \"alice\"\n\n[container]\nsandbox_enabled = true\n",
+        "[agent]\nname = \"alice\"\nstatus = \"active\"\n\n[container]\nsandbox_enabled = true\n",
     )
     .unwrap();
     env.queue

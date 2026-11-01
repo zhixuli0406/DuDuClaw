@@ -597,6 +597,7 @@ pub fn ensure_broadcast_bridge(
                             payload: serde_json::json!({ "agent_id": agent_id, "seq": seq }),
                             seq: None,
                             state_version: None,
+                            boot_id: None,
                         };
                         if let Ok(json) = serde_json::to_string(&frame) {
                             let _ = event_tx.send(json);

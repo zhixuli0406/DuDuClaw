@@ -96,6 +96,7 @@ pub(super) async fn accept_activation(
             .unwrap(),
     };
     let admin_ctx = duduclaw_auth::UserContext {
+        credential_epoch: 0,
         user_id: admin.id,
         email: admin.email,
         role: duduclaw_auth::UserRole::Admin,
@@ -227,7 +228,7 @@ async fn race(mode: &str, phase: &str) {
     };
     std::fs::write(
         home.path().join("agents/alice/agent.toml"),
-        format!("[agent]\nname='alice'\nrole='fixture'\n[capabilities]\nautonomy_level='auto'\n{config}"),
+        format!("[agent]\nname='alice'\nrole='fixture'\nstatus='active'\n[capabilities]\nautonomy_level='auto'\n{config}"),
     )
     .unwrap();
     let mut alice = session(home.path(), "alice", &key).await;

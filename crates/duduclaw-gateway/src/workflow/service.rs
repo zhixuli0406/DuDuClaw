@@ -38,6 +38,9 @@ impl WorkflowService {
             .ok_or("active workflow grant missing")?;
         let (spec, state) = self.broker.inspect_revision_grant(&grant).await?;
         spec.validate()?;
+        duduclaw_core::autonomy_gate::check(
+            &self.home, &spec.actor, duduclaw_core::autonomy_gate::AutonomyPath::Workflow,
+        ).map_err(|e| e.to_string())?;
         if state != "active" || spec.hash() != activation.request.spec.hash() {
             return Err("workflow grant revoked or drifted".into());
         }
@@ -353,7 +356,9 @@ impl WorkflowService {
         match validation {
             Ok(()) => {
                 if let Err(error) = self.runner.execute(&run_id).await {
-                    self.mark_blocked(&run_id, &error).await?;
+                    if error != super::runner::WORKFLOW_AUTONOMY_PAUSED {
+                        self.mark_blocked(&run_id, &error).await?;
+                    }
                 }
             }
             Err(error) => self.mark_blocked(&run_id, &error).await?,

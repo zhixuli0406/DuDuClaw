@@ -16,6 +16,8 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 /// Another execution of the same run holds the lease.
 pub const WORKFLOW_BUSY: &str = "workflow run already executing";
+/// Operator pause defers this run without consuming retries or changing step outcomes.
+pub const WORKFLOW_AUTONOMY_PAUSED: &str = "workflow_autonomy_paused";
 /// This execution's lease could not be extended.
 pub const WORKFLOW_LEASE_LOST: &str = "workflow run lease lost";
 /// This dispatch used up its own execution time; the next one continues.

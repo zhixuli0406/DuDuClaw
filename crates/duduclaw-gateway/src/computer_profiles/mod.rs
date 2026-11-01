@@ -182,14 +182,16 @@ fn owners(home: &Path, agent: &str) -> Result<Option<Vec<(String, String)>>, Str
         .map_err(failure)?
         .iter()
         .any(|name| name == "is_primary");
+    let restricted = crate::machine_employee::restriction_known(home, agent)
+        .ok_or_else(|| failure("employee restriction unknown"))?;
     let sql = if primary {
-        "SELECT b.user_id, b.bound_at, u.status, b.is_primary, u.updated_at FROM user_agent_bindings b JOIN users u ON u.id=b.user_id WHERE b.agent_name=?1 AND b.access_level='owner' ORDER BY b.user_id"
+        "SELECT b.user_id, b.bound_at, u.status, b.is_primary, u.updated_at FROM user_agent_bindings b JOIN users u ON u.id=b.user_id WHERE b.agent_name=?1 AND b.access_level='owner' AND (?2=0 OR u.role='admin') ORDER BY b.user_id"
     } else {
-        "SELECT b.user_id, b.bound_at, u.status, 0, u.updated_at FROM user_agent_bindings b JOIN users u ON u.id=b.user_id WHERE b.agent_name=?1 AND b.access_level='owner' ORDER BY b.user_id"
+        "SELECT b.user_id, b.bound_at, u.status, 0, u.updated_at FROM user_agent_bindings b JOIN users u ON u.id=b.user_id WHERE b.agent_name=?1 AND b.access_level='owner' AND (?2=0 OR u.role='admin') ORDER BY b.user_id"
     };
     let mut query = tx.prepare(sql).map_err(failure)?;
     let rows = query
-        .query_map([agent], |r| {
+        .query_map(rusqlite::params![agent, restricted], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 serde_json::json!([

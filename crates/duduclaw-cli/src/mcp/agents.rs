@@ -230,14 +230,19 @@ pub(crate) async fn handle_create_agent(
     }
     let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
+    let admission = match admit_background_identity(home_dir, caller_agent, "create_agent").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
+    // These short synchronous writes cannot outlive the admission on cancellation.
     // Create directory structure
-    if let Err(e) = tokio::fs::create_dir_all(&agent_dir).await {
+    if let Err(e) = std::fs::create_dir_all(&agent_dir) {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error creating agent directory: {e}")}],
             "isError": true
         });
     }
-    let _ = tokio::fs::create_dir_all(agent_dir.join("SKILLS")).await;
+    let _ = std::fs::create_dir_all(agent_dir.join("SKILLS"));
     // RFC-26 P6.3: seed the deep-agents default skill set (code-review / refactor
     // / test-writer / git-workflow). Idempotent; never overwrites operator edits.
     match duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS")) {
@@ -248,7 +253,7 @@ pub(crate) async fn handle_create_agent(
         Err(e) => warn!("failed to seed built-in skills for {name}: {e}"),
     }
 
-    if let Err(e) = tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await {
+    if let Err(e) = std::fs::write(agent_dir.join("agent.toml"), &agent_toml) {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
             "isError": true
@@ -273,11 +278,13 @@ pub(crate) async fn handle_create_agent(
 
     // Write SOUL.md if provided
     if !soul.is_empty() {
-        let _ = tokio::fs::write(agent_dir.join("SOUL.md"), soul).await;
+        let _ = std::fs::write(agent_dir.join("SOUL.md"), soul);
     }
 
     // Write empty MEMORY.md
-    let _ = tokio::fs::write(agent_dir.join("MEMORY.md"), "").await;
+    let _ = std::fs::write(agent_dir.join("MEMORY.md"), "");
+
+    drop(admission);
 
     // Install agent-file-guard PreToolUse hook so the newly-created agent
     // immediately gets protected against out-of-tree Write/Edit.
@@ -704,7 +711,8 @@ mod product_policy_creation_tests {
         let valid_params = params("anthropic/claude-sonnet-4-6");
         let (denied, valid) = tokio::join!(
             handle_create_agent(&denied_params, home.path(), "dashboard"),
-            handle_create_agent(&valid_params, home.path(), "dashboard")
+            with_background_caller(RecordActor::Operator("dashboard"),
+                handle_create_agent(&valid_params, home.path(), "dashboard"))
         );
         assert_eq!(denied["isError"], true, "{denied}");
         assert_ne!(valid["isError"], true, "{valid}");

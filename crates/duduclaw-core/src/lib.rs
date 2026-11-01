@@ -1,3 +1,5 @@
+pub mod autonomy_gate;
+pub mod autonomy_handoff;
 pub mod agent_guard;
 pub mod agent_names;
 pub mod agent_profile;
@@ -1464,3 +1466,6 @@ pub mod show_thinking;
 pub mod think_tags;
 
 pub mod egress_guard;
+
+/// Cancellation-safe ownership of spawned process trees.
+pub mod process_tree;

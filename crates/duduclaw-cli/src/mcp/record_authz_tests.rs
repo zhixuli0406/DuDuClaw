@@ -17,7 +17,8 @@ use std::fs;
 struct Home(std::path::PathBuf);
 impl Home {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("duduclaw-authz-test-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("duduclaw-authz-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(path.join("agents")).unwrap();
         for (name, parent, dept) in [
             ("ceo", "", ""),
@@ -153,7 +154,12 @@ async fn seed_task(
 }
 
 async fn load_task(home: &std::path::Path, id: &str) -> TaskRow {
-    TaskStore::open(home).unwrap().get_task(id).await.unwrap().unwrap()
+    TaskStore::open(home)
+        .unwrap()
+        .get_task(id)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 #[allow(non_snake_case)]
@@ -167,7 +173,9 @@ const OP: RecordActor<'static> = RecordActor::Operator("dudu");
 /// `"default"` alias resolves to.
 fn make_main(home: &std::path::Path, name: &str) {
     let path = home.join("agents").join(name).join("agent.toml");
-    let text = fs::read_to_string(&path).unwrap().replace("role = \"specialist\"", "role = \"main\"");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("role = \"specialist\"", "role = \"main\"");
     fs::write(path, text).unwrap();
 }
 
@@ -177,17 +185,34 @@ fn make_main(home: &std::path::Path, name: &str) {
 fn actor_classification_follows_the_key_and_the_process_identity() {
     let internal = duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID;
     // Internal key with a process identity → the resolved process identity.
-    assert_eq!(RecordActor::resolve(internal, "sales-rep", Some("sales-rep"), false), A("sales-rep"));
+    assert_eq!(
+        RecordActor::resolve(internal, "sales-rep", Some("sales-rep"), false),
+        A("sales-rep")
+    );
     // ...even when the raw env text was refused by `get_default_agent`.
     assert_eq!(
-        RecordActor::resolve(internal, duduclaw_core::UNTRUSTED_AGENT_ID, Some("cron"), false),
+        RecordActor::resolve(
+            internal,
+            duduclaw_core::UNTRUSTED_AGENT_ID,
+            Some("cron"),
+            false
+        ),
         A(duduclaw_core::UNTRUSTED_AGENT_ID)
     );
     // Internal key without one → the internal client id, which owns nothing.
-    assert_eq!(RecordActor::resolve(internal, "dudu", None, false), A(internal));
-    assert_eq!(RecordActor::resolve("", "dudu", Some("  "), false), A(internal));
+    assert_eq!(
+        RecordActor::resolve(internal, "dudu", None, false),
+        A(internal)
+    );
+    assert_eq!(
+        RecordActor::resolve("", "dudu", Some("  "), false),
+        A(internal)
+    );
     // A per-agent key → that agent, whatever the process says.
-    assert_eq!(RecordActor::resolve("mkt-rep", "dudu", None, true), A("mkt-rep"));
+    assert_eq!(
+        RecordActor::resolve("mkt-rep", "dudu", None, true),
+        A("mkt-rep")
+    );
     // A non-agent key in a process started for an employee → the employee.
     assert_eq!(
         RecordActor::resolve("claude-desktop", "sales-rep", Some("sales-rep"), false),
@@ -207,15 +232,26 @@ fn actor_classification_follows_the_key_and_the_process_identity() {
 #[test]
 fn actor_classification_agrees_with_the_memory_tools() {
     let internal = duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID;
-    let clients = ["", internal, "mkt-rep", "eph-agnes-r1-planner-abc", "admin-cli", "claude-desktop"];
+    let clients = [
+        "",
+        internal,
+        "mkt-rep",
+        "eph-agnes-r1-planner-abc",
+        "admin-cli",
+        "claude-desktop",
+    ];
     let envs: [Option<&str>; 4] = [None, Some(""), Some("  "), Some("sales-rep")];
     for client in clients {
         for env in envs {
             for client_is_agent in [false, true] {
-                let memory = crate::mcp_memory_handlers::ai_employee_caller(client, env, client_is_agent);
+                let memory =
+                    crate::mcp_memory_handlers::ai_employee_caller(client, env, client_is_agent);
                 // `default_agent` equals the env claim when it is set, the
                 // config fallback otherwise — as `get_default_agent` resolves it.
-                let default_agent = env.map(str::trim).filter(|e| !e.is_empty()).unwrap_or("dudu");
+                let default_agent = env
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or("dudu");
                 let actor = RecordActor::resolve(client, default_agent, env, client_is_agent);
                 let ctx = format!("client={client:?} env={env:?} is_agent={client_is_agent}");
                 match memory {
@@ -243,8 +279,14 @@ fn reserved_tags_match_whole_tags_by_prefix_only_and_keep_order() {
         vec!["grant:a", "outcome:b", "auto-research", "grant:a"]
     );
     // Order and duplicates are part of the comparison.
-    assert_ne!(reserved_task_tags("outcome:a,outcome:b"), reserved_task_tags("outcome:b,outcome:a"));
-    assert_ne!(reserved_task_tags("grant:a"), reserved_task_tags("grant:a,grant:a"));
+    assert_ne!(
+        reserved_task_tags("outcome:a,outcome:b"),
+        reserved_task_tags("outcome:b,outcome:a")
+    );
+    assert_ne!(
+        reserved_task_tags("grant:a"),
+        reserved_task_tags("grant:a,grant:a")
+    );
 }
 
 // ── The shared check ────────────────────────────────────────────────────────
@@ -255,13 +297,29 @@ async fn shared_check_allows_and_refuses_by_relationship() {
     let h = home.path();
     let task = RecordKind::Task;
     // Operator and self.
-    assert!(check_record_change_allowed(h, OP, "mkt-rep", "t", task).await.is_ok());
-    assert!(check_record_change_allowed(h, A("mkt-rep"), "mkt-rep", "t", task).await.is_ok());
+    assert!(
+        check_record_change_allowed(h, OP, "mkt-rep", "t", task)
+            .await
+            .is_ok()
+    );
+    assert!(
+        check_record_change_allowed(h, A("mkt-rep"), "mkt-rep", "t", task)
+            .await
+            .is_ok()
+    );
     // Same department, manager → report, report → manager.
     let r = check_record_change_allowed(h, A("sales-rep2"), "sales-rep", "t", task).await;
     assert!(r.is_ok(), "{r:?}");
-    assert!(check_record_change_allowed(h, A("sales-lead"), "sales-rep", "t", task).await.is_ok());
-    assert!(check_record_change_allowed(h, A("sales-rep"), "sales-lead", "t", task).await.is_ok());
+    assert!(
+        check_record_change_allowed(h, A("sales-lead"), "sales-rep", "t", task)
+            .await
+            .is_ok()
+    );
+    assert!(
+        check_record_change_allowed(h, A("sales-rep"), "sales-lead", "t", task)
+            .await
+            .is_ok()
+    );
     // Unrelated departments: the reply names the owner and does not hand the
     // employee org-editing advice it cannot follow.
     let err = check_record_change_allowed(h, A("mkt-rep"), "sales-rep", "t", task)
@@ -269,20 +327,32 @@ async fn shared_check_allows_and_refuses_by_relationship() {
         .unwrap_err();
     assert!(err.contains("屬於「sales-rep」"), "{err}");
     assert!(!err.contains("reports_to"), "{err}");
-    assert!(!audit_rows(h, "delegation_denied").is_empty(), "the predicate audits its refusal");
+    assert!(
+        !audit_rows(h, "delegation_denied").is_empty(),
+        "the predicate audits its refusal"
+    );
     // No owner: the hint depends on the record kind.
-    let err = check_record_change_allowed(h, A("sales-rep"), "  ", "tasks_x", task).await.unwrap_err();
+    let err = check_record_change_allowed(h, A("sales-rep"), "  ", "tasks_x", task)
+        .await
+        .unwrap_err();
     assert!(err.contains("tasks_claim"), "{err}");
     let err = check_record_change_allowed(h, A("sales-rep"), "", "cron_x", RecordKind::Cron)
         .await
         .unwrap_err();
-    assert!(err.contains("例行工作") && !err.contains("tasks_claim"), "{err}");
+    assert!(
+        err.contains("例行工作") && !err.contains("tasks_claim"),
+        "{err}"
+    );
     let rows = audit_rows(h, "tasks_x");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["reason"], "owner_unknown");
     // An unproven internal caller owns nothing.
     let internal = duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID;
-    assert!(check_record_change_allowed(h, A(internal), "sales-rep", "t", task).await.is_err());
+    assert!(
+        check_record_change_allowed(h, A(internal), "sales-rep", "t", task)
+            .await
+            .is_err()
+    );
 }
 
 /// A system-sender name presented as an MCP identity is self-asserted (no
@@ -293,18 +363,32 @@ async fn system_sender_identity_is_refused_and_audited() {
     let home = Home::new();
     let h = home.path();
     for sender in duduclaw_core::SYSTEM_SENDERS {
-        let r = check_record_change_allowed(h, A(sender), "mkt-rep", "sys_x", RecordKind::Task).await;
+        let r =
+            check_record_change_allowed(h, A(sender), "mkt-rep", "sys_x", RecordKind::Task).await;
         assert!(r.is_err(), "{sender}");
     }
     let rows = audit_rows(h, "sys_x");
     assert_eq!(rows.len(), duduclaw_core::SYSTEM_SENDERS.len());
-    assert!(rows.iter().all(|r| r["reason"] == "system_sender_identity"), "{rows:?}");
+    assert!(
+        rows.iter().all(|r| r["reason"] == "system_sender_identity"),
+        "{rows:?}"
+    );
 
     // ...including where the caller would otherwise count as a party.
     let id = seed_task(h, "cron", "cron", "todo", false, "").await;
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "title": "x" }), h, A("cron")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "title": "x" }),
+        h,
+        A("cron"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
-    let out = handle_agent_update(&serde_json::json!({ "agent_id": "mkt-rep", "icon": "x" }), h, A("dashboard")).await;
+    let out = handle_agent_update(
+        &serde_json::json!({ "agent_id": "mkt-rep", "icon": "x" }),
+        h,
+        A("dashboard"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
 }
 
@@ -317,12 +401,22 @@ async fn tasks_update_requires_a_relationship_to_the_task() {
     let id = seed_task(h, "sales-rep", "sales-lead", "todo", false, "").await;
 
     // Unrelated department: refused, nothing written.
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "priority": "urgent" }), h, A("mkt-rep")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "priority": "urgent" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
     assert_eq!(load_task(h, &id).await.priority, "medium");
 
     // Same-department peer: allowed.
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "priority": "high" }), h, A("sales-rep2")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "priority": "high" }),
+        h,
+        A("sales-rep2"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert_eq!(load_task(h, &id).await.priority, "high");
 
@@ -345,15 +439,29 @@ async fn tasks_update_creator_may_edit_but_not_take_an_unrelated_task() {
     // Created by mkt-rep, assigned to sales-rep (e.g. via a whitelist pair
     // that has since been removed).
     let id = seed_task(h, "sales-rep", "mkt-rep", "todo", false, "").await;
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "title": "creator edit" }), h, A("mkt-rep")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "title": "creator edit" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     // Taking it for itself needs a relationship with the current assignee.
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "assigned_to": "mkt-rep" }), h, A("mkt-rep")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "assigned_to": "mkt-rep" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
     assert_eq!(load_task(h, &id).await.assigned_to, "sales-rep");
     // A same-department peer may take it.
-    let out =
-        handle_tasks_update(&serde_json::json!({ "task_id": id, "assigned_to": "sales-rep2" }), h, A("sales-rep2")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "assigned_to": "sales-rep2" }),
+        h,
+        A("sales-rep2"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert_eq!(load_task(h, &id).await.assigned_to, "sales-rep2");
 }
@@ -363,10 +471,18 @@ async fn tasks_update_unassigned_task_is_refused_for_an_unrelated_agent() {
     let home = Home::new();
     let h = home.path();
     let id = seed_task(h, "", "dashboard", "todo", false, "").await;
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "title": "x" }), h, A("sales-rep")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "title": "x" }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
     let rows = audit_rows(h, "tasks_update");
-    assert!(rows.iter().any(|r| r["reason"] == "owner_unknown"), "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r["reason"] == "owner_unknown"),
+        "{rows:?}"
+    );
     // An operator may.
     let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "title": "x" }), h, OP).await;
     assert!(!is_error(&out), "{out}");
@@ -378,23 +494,49 @@ async fn tasks_update_goal_title_and_description_are_frozen_for_agents() {
     let h = home.path();
     let goal = seed_task(h, "sales-rep", "goal:telegram", "todo", true, "").await;
     for field in ["title", "description"] {
-        let out = handle_tasks_update(&serde_json::json!({ "task_id": goal, field: "rewritten goal" }), h, A("sales-rep")).await;
+        let out = handle_tasks_update(
+            &serde_json::json!({ "task_id": goal, field: "rewritten goal" }),
+            h,
+            A("sales-rep"),
+        )
+        .await;
         assert!(is_error(&out), "{field}: {out}");
     }
     let t = load_task(h, &goal).await;
     assert_eq!(t.title, "original title");
     assert_eq!(t.description, "original description");
     let rows = audit_rows(h, "tasks_update");
-    assert_eq!(rows.iter().filter(|r| r["reason"] == "goal_contract_frozen").count(), 2, "{rows:?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["reason"] == "goal_contract_frozen")
+            .count(),
+        2,
+        "{rows:?}"
+    );
     // Other fields still work for the assignee.
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": goal, "priority": "high" }), h, A("sales-rep")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": goal, "priority": "high" }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     // A plain task's title is not frozen.
     let plain = seed_task(h, "sales-rep", "sales-lead", "todo", false, "").await;
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": plain, "title": "new" }), h, A("sales-rep")).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": plain, "title": "new" }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     // An operator may edit the goal text.
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": goal, "title": "operator edit" }), h, OP).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": goal, "title": "operator edit" }),
+        h,
+        OP,
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
 }
 
@@ -407,17 +549,34 @@ async fn tasks_update_reserved_tags_cannot_be_added_removed_or_reordered_by_agen
 
     for (what, new_tags) in [
         ("add a grant", format!("{tags},grant:send_email")),
-        ("remove an outcome", "billing,outcome:eyJ0IjoianNvbiJ9".to_string()),
+        (
+            "remove an outcome",
+            "billing,outcome:eyJ0IjoianNvbiJ9".to_string(),
+        ),
         // `OutcomeSpec::from_tags` reads the first `outcome:` tag only.
-        ("swap the outcomes", "outcome:eyJ0IjoianNvbiJ9,billing,outcome:eyJ0IjoidGV4dCJ9".to_string()),
-        ("duplicate an outcome", format!("{tags},outcome:eyJ0IjoianNvbiJ9")),
+        (
+            "swap the outcomes",
+            "outcome:eyJ0IjoianNvbiJ9,billing,outcome:eyJ0IjoidGV4dCJ9".to_string(),
+        ),
+        (
+            "duplicate an outcome",
+            format!("{tags},outcome:eyJ0IjoianNvbiJ9"),
+        ),
     ] {
-        let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "tags": new_tags }), h, A("sales-rep")).await;
+        let out = handle_tasks_update(
+            &serde_json::json!({ "task_id": id, "tags": new_tags }),
+            h,
+            A("sales-rep"),
+        )
+        .await;
         assert!(is_error(&out), "{what}: {out}");
     }
     assert_eq!(load_task(h, &id).await.tags, tags);
     assert_eq!(
-        audit_rows(h, "tasks_update").iter().filter(|r| r["reason"] == "reserved_tag_change").count(),
+        audit_rows(h, "tasks_update")
+            .iter()
+            .filter(|r| r["reason"] == "reserved_tag_change")
+            .count(),
         4
     );
     // Ordinary tags change freely (and may move around) while the reserved
@@ -430,7 +589,12 @@ async fn tasks_update_reserved_tags_cannot_be_added_removed_or_reordered_by_agen
     .await;
     assert!(!is_error(&out), "{out}");
     // An operator may change the reserved tags.
-    let out = handle_tasks_update(&serde_json::json!({ "task_id": id, "tags": "grant:send_email" }), h, OP).await;
+    let out = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "tags": "grant:send_email" }),
+        h,
+        OP,
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert_eq!(load_task(h, &id).await.tags, "grant:send_email");
 }
@@ -441,18 +605,40 @@ async fn tasks_update_reserved_tags_cannot_be_added_removed_or_reordered_by_agen
 async fn tasks_create_refuses_caller_supplied_reserved_tags() {
     let home = Home::new();
     let h = home.path();
-    for tags in ["grant:send_email", "billing, outcome:eyJ0IjoidGV4dCJ9", "auto-research"] {
-        let out = handle_tasks_create(&serde_json::json!({ "title": "t", "tags": tags }), h, A("sales-rep")).await;
+    for tags in [
+        "grant:send_email",
+        "billing, outcome:eyJ0IjoidGV4dCJ9",
+        "auto-research",
+    ] {
+        let out = handle_tasks_create(
+            &serde_json::json!({ "title": "t", "tags": tags }),
+            h,
+            A("sales-rep"),
+        )
+        .await;
         assert!(is_error(&out), "{tags}: {out}");
     }
     assert_eq!(
-        audit_rows(h, "tasks_create").iter().filter(|r| r["reason"] == "reserved_tag_change").count(),
+        audit_rows(h, "tasks_create")
+            .iter()
+            .filter(|r| r["reason"] == "reserved_tag_change")
+            .count(),
         3
     );
     // Ordinary tags, and an operator, are unaffected.
-    let out = handle_tasks_create(&serde_json::json!({ "title": "t", "tags": "billing,my-grant:x" }), h, A("sales-rep")).await;
+    let out = handle_tasks_create(
+        &serde_json::json!({ "title": "t", "tags": "billing,my-grant:x" }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
-    let out = handle_tasks_create(&serde_json::json!({ "title": "t", "tags": "grant:send_email" }), h, OP).await;
+    let out = handle_tasks_create(
+        &serde_json::json!({ "title": "t", "tags": "grant:send_email" }),
+        h,
+        OP,
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
 }
 
@@ -492,13 +678,19 @@ async fn tasks_claim_of_another_agents_task_needs_a_relationship() {
 
     let out = handle_tasks_claim(&serde_json::json!({ "task_id": id }), h, A("sales-lead")).await;
     assert!(!is_error(&out), "{out}");
-    assert_eq!(load_task(h, &id).await.claimed_by.as_deref(), Some("sales-lead"));
+    assert_eq!(
+        load_task(h, &id).await.claimed_by.as_deref(),
+        Some("sales-lead")
+    );
 
     // Unassigned tasks claim exactly as before, for anyone.
     let open = seed_task(h, "", "dashboard", "pending", false, "").await;
     let out = handle_tasks_claim(&serde_json::json!({ "task_id": open }), h, A("mkt-rep")).await;
     assert!(!is_error(&out), "{out}");
-    assert_eq!(load_task(h, &open).await.claimed_by.as_deref(), Some("mkt-rep"));
+    assert_eq!(
+        load_task(h, &open).await.claimed_by.as_deref(),
+        Some("mkt-rep")
+    );
 }
 
 // ── tasks_complete / tasks_block ────────────────────────────────────────────
@@ -509,23 +701,44 @@ async fn tasks_complete_and_block_need_holder_or_relationship() {
     let h = home.path();
     let id = seed_task(h, "sales-rep", "sales-lead", "todo", false, "").await;
 
-    let out = handle_tasks_complete(&serde_json::json!({ "task_id": id, "summary": "done" }), h, A("mkt-rep")).await;
+    let out = handle_tasks_complete(
+        &serde_json::json!({ "task_id": id, "summary": "done" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
-    let out = handle_tasks_block(&serde_json::json!({ "task_id": id, "reason": "stuck" }), h, A("mkt-rep")).await;
+    let out = handle_tasks_block(
+        &serde_json::json!({ "task_id": id, "reason": "stuck" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
     assert_eq!(load_task(h, &id).await.status, "todo");
 
     // The assignee may block; a same-department peer may complete.
-    let out = handle_tasks_block(&serde_json::json!({ "task_id": id, "reason": "waiting on data" }), h, A("sales-rep")).await;
+    let out = handle_tasks_block(
+        &serde_json::json!({ "task_id": id, "reason": "waiting on data" }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
-    let out = handle_tasks_complete(&serde_json::json!({ "task_id": id, "summary": "done" }), h, A("sales-rep2")).await;
+    let out = handle_tasks_complete(
+        &serde_json::json!({ "task_id": id, "summary": "done" }),
+        h,
+        A("sales-rep2"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert_eq!(load_task(h, &id).await.status, "done");
 
     // Nobody owns an unassigned, unclaimed task: an agent must claim it
     // first; an operator may act on it.
     let open = seed_task(h, "", "dashboard", "todo", false, "").await;
-    let out = handle_tasks_complete(&serde_json::json!({ "task_id": open }), h, A("sales-rep")).await;
+    let out =
+        handle_tasks_complete(&serde_json::json!({ "task_id": open }), h, A("sales-rep")).await;
     assert!(is_error(&out), "{out}");
     let out = handle_tasks_complete(&serde_json::json!({ "task_id": open }), h, OP).await;
     assert!(!is_error(&out), "{out}");
@@ -554,7 +767,8 @@ async fn activity_post_on_another_agents_task_needs_a_relationship() {
     let out = handle_activity_post(&post("no-such-task"), h, A("sales-rep")).await;
     assert!(is_error(&out), "{out}");
     // Activity without a task is unaffected.
-    let out = handle_activity_post(&serde_json::json!({ "summary": "hello" }), h, A("mkt-rep")).await;
+    let out =
+        handle_activity_post(&serde_json::json!({ "summary": "hello" }), h, A("mkt-rep")).await;
     assert!(!is_error(&out), "{out}");
 }
 
@@ -574,8 +788,15 @@ async fn seed_cron(home: &std::path::Path, name: &str, agent: &str) -> String {
     id
 }
 
-async fn load_cron(home: &std::path::Path, id: &str) -> Option<duduclaw_gateway::cron_store::CronTaskRow> {
-    duduclaw_gateway::cron_store::CronStore::open(home).unwrap().get(id).await.unwrap()
+async fn load_cron(
+    home: &std::path::Path,
+    id: &str,
+) -> Option<duduclaw_gateway::cron_store::CronTaskRow> {
+    duduclaw_gateway::cron_store::CronStore::open(home)
+        .unwrap()
+        .get(id)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -585,23 +806,53 @@ async fn cron_management_is_limited_to_the_owner_and_related_agents() {
     let id = seed_cron(h, "daily-report", "sales-rep").await;
 
     // Unrelated department: update / pause / delete / run all refused.
-    let out = handle_update_cron_task(&serde_json::json!({ "id": id, "task": "exfiltrate" }), h, A("mkt-rep")).await;
+    let out = handle_update_cron_task(
+        &serde_json::json!({ "id": id, "task": "exfiltrate" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
-    let out = handle_pause_cron_task(&serde_json::json!({ "id": id, "enabled": false }), h, A("mkt-rep")).await;
+    let out = handle_pause_cron_task(
+        &serde_json::json!({ "id": id, "enabled": false }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
-    let out = handle_run_cron_task(&serde_json::json!({ "name": "daily-report" }), h, A("mkt-rep")).await;
+    let out = handle_run_cron_task(
+        &serde_json::json!({ "name": "daily-report" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
-    let out = handle_delete_cron_task(&serde_json::json!({ "name": "daily-report" }), h, A("mkt-rep")).await;
+    let out = handle_delete_cron_task(
+        &serde_json::json!({ "name": "daily-report" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
     let row = load_cron(h, &id).await.expect("row must survive");
     assert_eq!(row.task, "original prompt");
     assert!(row.enabled);
 
     // The owner (by unique name) and its manager (by id).
-    let out = handle_update_cron_task(&serde_json::json!({ "name": "daily-report", "task": "new prompt" }), h, A("sales-rep")).await;
+    let out = handle_update_cron_task(
+        &serde_json::json!({ "name": "daily-report", "task": "new prompt" }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert_eq!(load_cron(h, &id).await.unwrap().task, "new prompt");
-    let out = handle_pause_cron_task(&serde_json::json!({ "id": id, "enabled": false }), h, A("sales-lead")).await;
+    let out = handle_pause_cron_task(
+        &serde_json::json!({ "id": id, "enabled": false }),
+        h,
+        A("sales-lead"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert!(!load_cron(h, &id).await.unwrap().enabled);
     // An operator.
@@ -618,10 +869,34 @@ async fn cron_name_shared_by_several_rows_is_refused_with_candidate_ids() {
     let theirs = seed_cron(h, "standup", "mkt-rep").await;
 
     for (tool, out) in [
-        ("update", handle_update_cron_task(&serde_json::json!({ "name": "standup", "task": "x" }), h, A("sales-rep")).await),
-        ("pause", handle_pause_cron_task(&serde_json::json!({ "name": "standup", "enabled": false }), h, A("sales-rep")).await),
-        ("delete", handle_delete_cron_task(&serde_json::json!({ "name": "standup" }), h, A("sales-rep")).await),
-        ("run", handle_run_cron_task(&serde_json::json!({ "name": "standup" }), h, A("sales-rep")).await),
+        (
+            "update",
+            handle_update_cron_task(
+                &serde_json::json!({ "name": "standup", "task": "x" }),
+                h,
+                A("sales-rep"),
+            )
+            .await,
+        ),
+        (
+            "pause",
+            handle_pause_cron_task(
+                &serde_json::json!({ "name": "standup", "enabled": false }),
+                h,
+                A("sales-rep"),
+            )
+            .await,
+        ),
+        (
+            "delete",
+            handle_delete_cron_task(&serde_json::json!({ "name": "standup" }), h, A("sales-rep"))
+                .await,
+        ),
+        (
+            "run",
+            handle_run_cron_task(&serde_json::json!({ "name": "standup" }), h, A("sales-rep"))
+                .await,
+        ),
     ] {
         assert!(is_error(&out), "{tool}: {out}");
         let t = text(&out);
@@ -633,11 +908,21 @@ async fn cron_name_shared_by_several_rows_is_refused_with_candidate_ids() {
     assert!(load_cron(h, &mine).await.is_some() && load_cron(h, &theirs).await.is_some());
 
     // By id, the owner acts on its own row only.
-    let out = handle_pause_cron_task(&serde_json::json!({ "id": mine, "enabled": false }), h, A("sales-rep")).await;
+    let out = handle_pause_cron_task(
+        &serde_json::json!({ "id": mine, "enabled": false }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert!(!load_cron(h, &mine).await.unwrap().enabled);
     assert!(load_cron(h, &theirs).await.unwrap().enabled);
-    let out = handle_pause_cron_task(&serde_json::json!({ "id": theirs, "enabled": false }), h, A("sales-rep")).await;
+    let out = handle_pause_cron_task(
+        &serde_json::json!({ "id": theirs, "enabled": false }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
 }
 
@@ -647,18 +932,42 @@ async fn cron_row_owned_by_default_resolves_to_the_main_agent() {
     let h = home.path();
     // No main agent: the owner cannot be determined → refused.
     let id = seed_cron(h, "morning", "default").await;
-    let out = handle_update_cron_task(&serde_json::json!({ "id": id, "task": "x" }), h, A("mkt-rep")).await;
+    let out = handle_update_cron_task(
+        &serde_json::json!({ "id": id, "task": "x" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
-    assert!(audit_rows(h, "update_cron_task").iter().any(|r| r["reason"] == "owner_unknown"));
+    assert!(
+        audit_rows(h, "update_cron_task")
+            .iter()
+            .any(|r| r["reason"] == "owner_unknown")
+    );
 
     make_main(h, "sales-lead");
     // The main agent itself and its report may change it; another
     // department may not.
-    let out = handle_update_cron_task(&serde_json::json!({ "id": id, "task": "by main" }), h, A("sales-lead")).await;
+    let out = handle_update_cron_task(
+        &serde_json::json!({ "id": id, "task": "by main" }),
+        h,
+        A("sales-lead"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
-    let out = handle_pause_cron_task(&serde_json::json!({ "id": id, "enabled": false }), h, A("sales-rep")).await;
+    let out = handle_pause_cron_task(
+        &serde_json::json!({ "id": id, "enabled": false }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
-    let out = handle_update_cron_task(&serde_json::json!({ "id": id, "task": "x" }), h, A("mkt-rep")).await;
+    let out = handle_update_cron_task(
+        &serde_json::json!({ "id": id, "task": "x" }),
+        h,
+        A("mkt-rep"),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
     assert_eq!(load_cron(h, &id).await.unwrap().task, "by main");
 }
@@ -716,7 +1025,12 @@ async fn agent_update_refuses_self_authority_changes() {
         ("role", serde_json::json!("main")),
         ("reports_to", serde_json::json!("ceo")),
     ] {
-        let out = handle_agent_update(&serde_json::json!({ "agent_id": "sales-rep", key: value }), h, A("sales-rep")).await;
+        let out = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", key: value }),
+            h,
+            A("sales-rep"),
+        )
+        .await;
         assert!(is_error(&out), "{key}: {out}");
     }
     assert_eq!(budget_of(h, "sales-rep"), 1000);
@@ -727,11 +1041,21 @@ async fn agent_update_refuses_self_authority_changes() {
     assert_eq!(rows[0]["reason"], "self_authority_change");
 
     // Ordinary self-edits are unchanged.
-    let out = handle_agent_update(&serde_json::json!({ "agent_id": "sales-rep", "display_name": "小業" }), h, A("sales-rep")).await;
+    let out = handle_agent_update(
+        &serde_json::json!({ "agent_id": "sales-rep", "display_name": "小業" }),
+        h,
+        A("sales-rep"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
 
     // A manager may set a report's budget; an operator may set anyone's.
-    let out = handle_agent_update(&serde_json::json!({ "agent_id": "sales-rep", "budget_cents": 2000 }), h, A("sales-lead")).await;
+    let out = handle_agent_update(
+        &serde_json::json!({ "agent_id": "sales-rep", "budget_cents": 2000 }),
+        h,
+        A("sales-lead"),
+    )
+    .await;
     assert!(!is_error(&out), "{out}");
     assert_eq!(budget_of(h, "sales-rep"), 2000);
     let out = handle_agent_update(
@@ -752,7 +1076,12 @@ async fn agent_update_unproven_internal_caller_cannot_edit_the_default_agent() {
     let home = Home::new();
     let h = home.path();
     let internal = duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID;
-    let out = handle_agent_update(&serde_json::json!({ "agent_id": "ceo", "budget_cents": 1 }), h, A(internal)).await;
+    let out = handle_agent_update(
+        &serde_json::json!({ "agent_id": "ceo", "budget_cents": 1 }),
+        h,
+        A(internal),
+    )
+    .await;
     assert!(is_error(&out), "{out}");
     assert_eq!(budget_of(h, "ceo"), 1000);
 }
@@ -792,4 +1121,180 @@ async fn activity_post_refuses_reserved_event_types() {
         .await;
         assert!(is_error(&out), "{kind}: {out}");
     }
+}
+
+#[tokio::test]
+async fn paused_verified_caller_cannot_create_background_work_for_another_agent() {
+    let home = Home::new();
+    let h = home.path();
+    let memory = SqliteMemoryEngine::new(&h.join("memory.db")).unwrap();
+    let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+    let ns = crate::mcp_namespace::NamespaceContext {
+        write_namespace: "internal/sales-rep".into(),
+        read_namespaces: vec!["internal/sales-rep".into()],
+    };
+    let quota = crate::mcp_memory_quota::DailyQuota::new();
+    let http = reqwest::Client::new();
+    for scope in [Some("sales-rep"), None] {
+        duduclaw_core::autonomy_gate::set_pause(h, scope, "test", "operator").unwrap();
+        for tool in [
+            "send_to_agent",
+            "spawn_agent",
+            "spawn_ephemeral",
+            "tasks_create",
+            "goals_create",
+            "create_task",
+            "create_reminder",
+            "run_cron_task",
+            "update_cron_task",
+        ] {
+            let result = handle_tools_call(
+                &serde_json::json!(1),
+                &serde_json::json!({"name": tool, "arguments": {
+                    "agent_id": "sales-rep2", "assigned_to": "sales-rep2",
+                    "prompt": "work", "task": "work", "title": "work",
+                    "instruction": "work", "context": "work", "tools": ["Read"]
+                }}),
+                h,
+                &http,
+                &memory,
+                // Deliberately different: a valid per-agent key must win over this default.
+                "sales-rep2",
+                &odoo,
+                &ns,
+                &quota,
+                "sales-rep",
+                false,
+            )
+            .await;
+            assert_eq!(result["result"]["isError"], true, "{tool}: {result}");
+            assert!(
+                result["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("duduclaw tui")
+            );
+        }
+        for path in [
+            "tasks.db",
+            "message_queue.db",
+            "bus_queue.jsonl",
+            "spawn_admission_queue.json",
+            "agents/.ephemeral",
+        ] {
+            assert!(!h.join(path).exists(), "paused caller created {path}");
+        }
+        duduclaw_core::autonomy_gate::resume(h, scope).unwrap();
+    }
+    assert!(check_background_caller(h, A("sales-rep"), "send_to_agent").is_ok());
+    let created = handle_tasks_create(
+        &serde_json::json!({"title": "allowed", "assigned_to": "sales-rep2"}),
+        h,
+        A("sales-rep"),
+    )
+    .await;
+    assert!(!is_error(&created), "{created}");
+    assert!(h.join("tasks.db").is_file());
+    let _queue = duduclaw_gateway::message_queue::MessageQueue::open(h).unwrap();
+    for (tool, args) in [
+        (
+            "send_to_agent",
+            serde_json::json!({"agent_id": "sales-rep2", "prompt": "work"}),
+        ),
+        (
+            "spawn_agent",
+            serde_json::json!({"agent_id": "sales-rep2", "task": "work"}),
+        ),
+    ] {
+        let result = handle_tools_call(
+            &serde_json::json!(2),
+            &serde_json::json!({"name": tool, "arguments": args}),
+            h,
+            &http,
+            &memory,
+            "sales-rep2",
+            &odoo,
+            &ns,
+            &quota,
+            "sales-rep",
+            false,
+        )
+        .await;
+        assert_ne!(
+            result["result"]["isError"], true,
+            "unpaused {tool}: {result}"
+        );
+    }
+    assert!(h.join("bus_queue.jsonl").is_file());
+}
+
+#[test]
+fn paused_background_gate_preserves_operator_and_direct_reply_routes() {
+    let home = Home::new();
+    duduclaw_core::autonomy_gate::set_pause(home.path(), None, "test", "operator").unwrap();
+    assert!(check_background_caller(home.path(), OP, "tasks_create").is_ok());
+    assert!(!creates_background_work("send_message"));
+    assert!(!creates_background_work("tasks_list"));
+    assert!(!creates_background_work("plan_start"));
+    assert!(!changes_background_work("plan_start", &serde_json::json!({"task": "plan"})));
+    assert!(creates_background_work("tasks_create"));
+    assert!(changes_background_work(
+        "agent_update",
+        &serde_json::json!({"heartbeat_cron": "* * * * *"})
+    ));
+    assert!(!changes_background_work(
+        "agent_update",
+        &serde_json::json!({"display_name": "new name"})
+    ));
+}
+
+#[test]
+fn autonomy_caller_reports_real_failure_and_allows_an_unused_home() {
+    let home = Home::new();
+    let h = home.path();
+    assert!(!h.join("autonomy_pause.json").exists());
+    assert!(!h.join("autonomy_pause.initialized").exists());
+    assert!(check_background_caller(h, A("sales-rep"), "tasks_create").is_ok());
+    for (agent, expected) in [
+        ("missing-worker", "找不到這位員工的設定"),
+        ("../invalid", "員工識別碼無效"),
+    ] {
+        let error = check_background_caller(h, A(agent), "tasks_create").unwrap_err();
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("已暫停"), "{error}");
+    }
+    for (config, expected) in [
+        (
+            "[agent]\nstatus = \"paused\"",
+            "員工目前不在可執行工作的狀態",
+        ),
+        ("[agent]", "員工狀態無法讀取"),
+        ("[agent]\nstatus = \"unknown\"", "員工狀態無法讀取"),
+    ] {
+        fs::write(h.join("agents/sales-rep/agent.toml"), config).unwrap();
+        let error = check_background_caller(h, A("sales-rep"), "tasks_create").unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
+    write_agent(h, "sales-rep", "sales-lead", "業務");
+    for state in ["{", r#"{"version":99,"global":null,"agents":{}}"#] {
+        fs::write(h.join("autonomy_pause.json"), state).unwrap();
+        let error = check_background_caller(h, A("sales-rep"), "tasks_create").unwrap_err();
+        assert!(error.contains("暫停狀態無法讀取"), "{error}");
+        assert!(!error.contains("已暫停"), "{error}");
+    }
+    fs::remove_file(h.join("autonomy_pause.json")).unwrap();
+    fs::create_dir(h.join("autonomy_pause.json")).unwrap();
+    assert!(
+        check_background_caller(h, A("sales-rep"), "tasks_create")
+            .unwrap_err()
+            .contains("暫停狀態無法讀取")
+    );
+    fs::remove_dir(h.join("autonomy_pause.json")).unwrap();
+    fs::write(h.join("autonomy_pause.initialized"), "").unwrap();
+    assert!(
+        check_background_caller(h, A("sales-rep"), "tasks_create")
+            .unwrap_err()
+            .contains("暫停狀態無法讀取")
+    );
+    assert!(!h.join("tasks.db").exists());
 }

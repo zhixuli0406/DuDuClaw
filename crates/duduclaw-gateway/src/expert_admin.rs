@@ -369,6 +369,19 @@ pub struct RemoveItem {
 ///
 /// The exact semantics of `duduclaw expert remove <slug>`.
 pub async fn remove_pack(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, String> {
+    let home = home.to_path_buf();
+    let slug = slug.to_string();
+    // The blocking worker owns the lease even if the request is cancelled.
+    tokio::task::spawn_blocking(move || {
+        let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(&home)
+            .map_err(|error| error.to_string())?;
+        remove_pack_locked(&home, &slug)
+    })
+    .await
+    .map_err(|error| format!("移除專家包工作失敗：{error}"))?
+}
+
+fn remove_pack_locked(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, String> {
     let Some(rec) = read_record(home, slug) else {
         return Err(format!(
             "找不到已安裝的專家包 '{slug}'（用 `duduclaw expert list` 查看）"
@@ -390,7 +403,7 @@ pub async fn remove_pack(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, Str
         }
         let dir = home.join("agents").join(agent);
         if dir.exists() {
-            match tokio::fs::remove_dir_all(&dir).await {
+            match std::fs::remove_dir_all(&dir) {
                 Ok(()) => items.push(RemoveItem {
                     status: "removed",
                     kind: "agent",
@@ -425,7 +438,7 @@ pub async fn remove_pack(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, Str
         }
         let dir = home.join("agents").join(agent).join("SKILLS").join(skill);
         if dir.is_dir() {
-            let status = match tokio::fs::remove_dir_all(&dir).await {
+            let status = match std::fs::remove_dir_all(&dir) {
                 Ok(()) => "removed",
                 Err(_) => "skipped",
             };
@@ -451,7 +464,7 @@ pub async fn remove_pack(home: &Path, slug: &str) -> Result<Vec<RemoveItem>, Str
         }
         let dir = home.join("skills").join(skill);
         if dir.exists() {
-            match tokio::fs::remove_dir_all(&dir).await {
+            match std::fs::remove_dir_all(&dir) {
                 Ok(()) => items.push(RemoveItem {
                     status: "removed",
                     kind: "skill",
@@ -729,6 +742,36 @@ mod tests {
         );
         // Record dir gone ⇒ list is empty.
         assert!(list_records(h).is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_pack_waits_for_inflight_admission() {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents/pack-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
+        let mut rec = record("demo");
+        rec.agents = vec!["pack-agent".into()];
+        write_record(home.path(), &rec).unwrap();
+        let held = duduclaw_core::autonomy_gate::admit(
+            home.path(), "pack-agent", duduclaw_core::autonomy_gate::AutonomyPath::Background,
+        ).await.unwrap();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held = held;
+            released.blocking_recv().unwrap();
+        });
+        let removing_home = home.path().to_path_buf();
+        let mut removing = tokio::spawn(async move { remove_pack(&removing_home, "demo").await });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut removing).await.is_err());
+        assert!(agent_dir.join("agent.toml").is_file());
+        assert!(read_record(home.path(), "demo").is_some());
+        release.send(()).unwrap();
+        holder.await.unwrap();
+        let items = tokio::time::timeout(std::time::Duration::from_secs(5), removing)
+            .await.unwrap().unwrap().unwrap();
+        assert!(items.iter().any(|item| item.kind == "agent" && item.status == "removed"));
+        assert!(!agent_dir.exists());
     }
 
     #[tokio::test]

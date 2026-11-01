@@ -110,7 +110,7 @@ fn setup() -> (tempfile::TempDir, String) {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("agent.toml"),
-            format!("[agent]\nname = \"{actor}\"\nrole = \"fixture\"\n[capabilities]\n[permissions]\ncan_schedule_tasks = true\n")
+            format!("[agent]\nname = \"{actor}\"\nrole = \"fixture\"\nstatus = \"active\"\n[capabilities]\n[permissions]\ncan_schedule_tasks = true\n")
         )
         .unwrap();
     }

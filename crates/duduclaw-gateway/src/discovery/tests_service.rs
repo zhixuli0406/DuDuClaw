@@ -3,7 +3,7 @@ use super::*;
 use crate::approval::ApprovalStore;
 use std::collections::HashMap;
 fn context(id: &str, role: UserRole) -> UserContext {
-    UserContext {user_id:id.into(),email:format!("{id}@example.invalid"),role,
+    UserContext {credential_epoch:0,user_id:id.into(),email:format!("{id}@example.invalid"),role,
         agent_access:HashMap::from([("worker".into(),AccessLevel::Operator)]),must_change_password:false, team_access: Default::default(), acl_generation: 0,}
 }
 fn user(id: &str, role: UserRole) -> TrustedCaller {
@@ -875,4 +875,24 @@ async fn discovery_rows_carry_kind_through_the_real_tasks_list_rpc() {
     let kind_of=|id:&str|rows.iter().find(|row|row["id"]==id).unwrap_or_else(||panic!("{id} missing from {listed}"))["kind"].clone();
     assert_eq!(kind_of(&created.task_id),"discovery");
     assert_eq!(kind_of("ordinary-kind"),"task");
+}
+
+#[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery filesystem validation is unix-only")]
+async fn refused_mcp_admission_creates_no_discovery_task_or_approval() {
+    let (dir, spec, broker) = fixture();
+    let home = dir.path().canonicalize().unwrap();
+    let store = TaskStore::open(&home).unwrap();
+    let caller = user("employee", UserRole::Employee);
+    let result = create_from_value_with_admission(
+        &home, &store, &broker, &caller,
+        json!({
+            "kind": "discovery", "assigned_to": "worker", "title": "Explore",
+            "description": "Improve fixture", "discovery": spec,
+        }),
+        Box::pin(async { Err("admission refused at commit".to_string()) }),
+    ).await;
+    assert_eq!(result.unwrap_err(), "admission refused at commit");
+    assert!(broker.list_pending(None).await.unwrap().is_empty());
+    assert!(store.discovery_active_tasks().await.unwrap().is_empty());
 }

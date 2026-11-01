@@ -337,3 +337,138 @@ fn role_member_scaffold_admits_the_team_intrinsic_tool() {
     let err = scaffold_role_member(home, &wide).unwrap_err();
     assert!(err.contains("privilege escalation"), "got: {err}");
 }
+
+#[tokio::test]
+async fn autonomy_pause_ephemeral_admission_keeps_ticket_then_resume_replays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "");
+    write_parent(home, "other", "");
+    let cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home);
+    for parent in ["boss", "other"] {
+        duduclaw_core::spawn_admission::enqueue(home, EPHEMERAL_ADMISSION_CLASS, &cfg, None,
+            queued_ephemeral_payload(parent, "queued helper", "context")).unwrap();
+    }
+    duduclaw_core::autonomy_gate::set_pause(home, Some("boss"), "pause", "op").unwrap();
+    let first = drain_admission_queue(home).await;
+    assert_eq!(first.admitted, 1, "another parent is not starved by a paused head ticket");
+    assert_eq!(first.failed, 0);
+    assert_eq!(duduclaw_core::spawn_admission::queue_depth(home, EPHEMERAL_ADMISSION_CLASS), 1);
+    let before = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+    assert_eq!(before.lines().count(), 1);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(before.trim()).unwrap()["sender_agent"], "other");
+    duduclaw_core::autonomy_gate::resume(home, Some("boss")).unwrap();
+    assert_eq!(drain_admission_queue(home).await.admitted, 1);
+    assert_eq!(duduclaw_core::spawn_admission::queue_depth(home, EPHEMERAL_ADMISSION_CLASS), 0);
+    assert_eq!(std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap().lines().count(), 2);
+}
+
+#[tokio::test]
+async fn autonomy_pause_ephemeral_dispatch_follows_authoritative_parent_and_resumes() {
+    use crate::message_queue::{MessageQueue, MessageStatus, QueueMessage};
+    use std::sync::Arc;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "");
+    let child = scaffold(home, &EphemeralSpawnSpec {
+        parent: "boss".into(), instruction: "helper".into(), tools: strs(&["Read"]), tier: "standard".into(),
+    }).unwrap();
+    let queue = Arc::new(MessageQueue::open(home).unwrap());
+    let registry = Arc::new(tokio::sync::RwLock::new(duduclaw_agent::registry::AgentRegistry::new(home.join("agents"))));
+    let message: QueueMessage = serde_json::from_value(serde_json::json!({
+        "id": "ephemeral-pause-test", "sender": "cron", "target": child.agent_id,
+        "payload": "helper work", "status": "pending", "retry_count": 0,
+        "delegation_depth": 1, "sender_agent": "cron", "upstream_unknown": false,
+        "created_at": chrono::Utc::now().to_rfc3339()
+    })).unwrap();
+    queue.enqueue(&message).await.unwrap();
+    crate::model_call_probe::set_dry_run(true);
+    let before = crate::model_call_probe::calls();
+    duduclaw_core::autonomy_gate::set_pause(home, Some("boss"), "pause", "op").unwrap();
+    crate::dispatcher::poll_and_dispatch_sqlite(&queue, home, &registry, None, None).await.unwrap();
+    assert_eq!(crate::model_call_probe::calls(), before);
+    assert_eq!(queue.get_by_id(&message.id).await.unwrap().unwrap().status, MessageStatus::Pending);
+    assert!(dispatch_with(home, &registry, &child.agent_id, "work", Default::default()).await.is_err());
+    duduclaw_core::autonomy_gate::resume(home, Some("boss")).unwrap();
+    crate::dispatcher::poll_and_dispatch_sqlite(&queue, home, &registry, None, None).await.unwrap();
+    crate::model_call_probe::set_dry_run(false);
+    assert_eq!(crate::model_call_probe::calls(), before + 1);
+    assert_eq!(queue.get_by_id(&message.id).await.unwrap().unwrap().status, MessageStatus::Done);
+}
+
+#[test]
+fn autonomy_pause_ephemeral_parent_metadata_cannot_override_org_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "");
+    write_parent(home, "other", "");
+    let child = scaffold(home, &EphemeralSpawnSpec {
+        parent: "boss".into(), instruction: "helper".into(), tools: strs(&["Read"]), tier: "standard".into(),
+    }).unwrap();
+    assert!(check_autonomy(home, &child.agent_id).is_ok());
+    let original = std::fs::read_to_string(child.dir.join("ephemeral.toml")).unwrap();
+    let mut meta = read_meta(&child.dir).unwrap();
+    meta.parent = "other".into();
+    std::fs::write(child.dir.join("ephemeral.toml"), toml::to_string(&meta).unwrap()).unwrap();
+    assert!(check_autonomy(home, &child.agent_id).unwrap_err().contains("ephemeral_parent_invalid"));
+    std::fs::write(child.dir.join("ephemeral.toml"), "broken [").unwrap();
+    assert!(check_autonomy(home, &child.agent_id).is_err());
+    std::fs::write(child.dir.join("ephemeral.toml"), original).unwrap();
+    std::fs::write(home.join("org.toml"), "broken [").unwrap();
+    assert!(check_autonomy(home, &child.agent_id).unwrap_err().contains("ephemeral_parent_invalid"));
+}
+
+#[tokio::test]
+async fn autonomy_pause_after_ephemeral_dequeue_restores_original_ticket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "");
+    let cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home);
+    duduclaw_core::spawn_admission::enqueue(home, EPHEMERAL_ADMISSION_CLASS, &cfg, Some("turn-owner"),
+        queued_ephemeral_payload("boss", "race helper", "context")).unwrap();
+    let ticket = duduclaw_core::spawn_admission::dequeue_next_matching(home, EPHEMERAL_ADMISSION_CLASS, |_| true).ticket.unwrap();
+    duduclaw_core::autonomy_gate::set_pause(home, Some("boss"), "pause", "op").unwrap();
+    assert!(matches!(super::super::gc::replay_queued_ephemeral(home, &ticket),
+        Err(super::super::gc::ReplayError::Paused(_))));
+    assert!(!home.join("bus_queue.jsonl").exists());
+    assert!(duduclaw_core::spawn_admission::restore_dequeued(home, &ticket).unwrap());
+    assert!(!duduclaw_core::spawn_admission::restore_dequeued(home, &ticket).unwrap(), "CAS prevents duplicate restoration");
+    let saved = duduclaw_core::spawn_admission::dequeue_next_matching(home, EPHEMERAL_ADMISSION_CLASS, |_| true).ticket.unwrap();
+    assert_eq!(saved.ticket_id, ticket.ticket_id);
+    assert_eq!(saved.seq, ticket.seq);
+    assert_eq!(saved.enqueued_ms, ticket.enqueued_ms);
+    assert_eq!(saved.expires_ms, ticket.expires_ms);
+    assert_eq!(saved.owner_key, ticket.owner_key);
+    duduclaw_core::spawn_admission::restore_dequeued(home, &saved).unwrap();
+    duduclaw_core::autonomy_gate::resume(home, Some("boss")).unwrap();
+    assert_eq!(drain_admission_queue(home).await.admitted, 1);
+}
+
+#[test]
+fn paused_parent_cannot_create_scaffold_or_capacity_ticket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "");
+    let spec = EphemeralSpawnSpec {
+        parent: "boss".into(), instruction: "work".into(),
+        tools: strs(&["Read"]), tier: "standard".into(),
+    };
+    let cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home);
+    for scope in [Some("boss"), None] {
+        duduclaw_core::autonomy_gate::set_pause(home, scope, "test", "operator").unwrap();
+        assert!(scaffold(home, &spec).unwrap_err().contains("autonomy paused"));
+        assert!(!ephemeral_root(home).exists());
+        let queued = duduclaw_core::spawn_admission::enqueue_checked(
+            home, EPHEMERAL_ADMISSION_CLASS, &cfg, None,
+            queued_ephemeral_payload("boss", "work", "ctx"),
+            || check_parent_autonomy(home, "boss"),
+        );
+        assert!(queued.is_err());
+        assert!(!home.join("spawn_admission_queue.json").exists());
+        duduclaw_core::autonomy_gate::resume(home, scope).unwrap();
+    }
+    let member = scaffold(home, &spec).unwrap();
+    // The original parent remains authoritative after the child exists.
+    duduclaw_core::autonomy_gate::set_pause(home, Some("boss"), "test", "operator").unwrap();
+    assert!(check_parent_autonomy(home, &member.agent_id).is_err());
+}

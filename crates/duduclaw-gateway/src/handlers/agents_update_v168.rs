@@ -420,24 +420,20 @@ pub(crate) fn migrate_all_agent_permissions(home_dir: &Path) {
         if !path.is_file() {
             continue;
         }
-        let outcome = duduclaw_core::with_file_lock(&path, || {
-            let text = std::fs::read_to_string(&path)?;
-            match migrate_permission_flags(&text) {
-                Err(e) => Ok(Err(e)),
-                Ok(None) => Ok(Ok(Vec::new())),
-                Ok(Some((new_text, reset))) => {
-                    let tmp = path.with_extension("toml.tmp");
-                    super::config_commit::write_owner_only(&tmp, &new_text)?;
-                    if let Err(e) = std::fs::rename(&tmp, &path) {
-                        let _ = std::fs::remove_file(&tmp);
-                        return Err(e);
-                    }
-                    Ok(Ok(reset))
+        let mut reset = Vec::new();
+        let outcome = crate::agent_files::external::write_file(
+            home_dir, &name, crate::agent_files::external::ExternalFile::AgentToml,
+            "permission-migration", "system", crate::agent_files::external::ExternalBaseline::Accept,
+            |text| match migrate_permission_flags(text)? {
+                None => Ok(text.to_string()),
+                Some((new_text, keys)) => {
+                    reset = keys;
+                    Ok(new_text)
                 }
-            }
-        });
+            },
+        );
         match outcome {
-            Ok(Ok(reset)) if !reset.is_empty() => {
+            Ok(_) if !reset.is_empty() => {
                 info!(agent = %name, keys = ?reset, "v1.68 permission flags reset to true (enforced from now on)");
                 crate::security_autopilot::audit_and_emit(
                     home_dir,
@@ -449,8 +445,7 @@ pub(crate) fn migrate_all_agent_permissions(home_dir: &Path) {
                     ),
                 );
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => warn!(agent = %name, error = %e, "permission flag migration skipped: agent.toml does not parse"),
+            Ok(_) => {}
             Err(e) => warn!(agent = %name, error = %e, "permission flag migration failed"),
         }
     }

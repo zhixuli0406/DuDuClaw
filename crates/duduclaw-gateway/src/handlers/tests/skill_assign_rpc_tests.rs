@@ -33,6 +33,7 @@ fn err(frame: &WsFrame) -> String {
 
 fn ctx(id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: id.into(),
         email: format!("{id}@example.invalid"),
         role,

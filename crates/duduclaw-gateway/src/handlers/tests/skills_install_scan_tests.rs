@@ -342,9 +342,13 @@ async fn dashboard_cron_add_emits_dashboard_feedback_event() {
     assert_eq!(payload["cron"], "0 9 * * *");
     assert_eq!(payload["agent_id"], "agnes");
 
+    // The bridge resolves employee identity from the stored configuration.
+    std::fs::create_dir_all(home.path().join("agents/agnes")).unwrap();
+    std::fs::write(home.path().join("agents/agnes/agent.toml"),
+        "[agent]\nname = \"agnes\"\nstatus = \"active\"\n").unwrap();
     // ...and it is a row the bridge will actually push to the socket.
     assert!(
-        crate::dashboard_feedback::dashboard_push_frame(&row.event, &row.payload).is_some(),
+        crate::dashboard_feedback::dashboard_push_frame(home.path(), &row.event, &row.payload).await.is_some(),
         "the emitted row must be pushable to the dashboard"
     );
 }

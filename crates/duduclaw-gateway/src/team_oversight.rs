@@ -108,7 +108,7 @@ pub fn manager_may_read(home: &Path, db: &UserDb, ctx: &UserContext, agent: &str
     if !crate::team_edition::team_grants_enabled(home) || !configured(home) {
         return false;
     }
-    let Ok(Some(live)) = db.live_user_context(&ctx.user_id) else {
+    let Ok(Some(live)) = crate::machine_employee::live_user_context(home, db, &ctx.user_id) else {
         return false;
     };
     if !live
@@ -159,8 +159,7 @@ pub fn can_view_team_history(
     if ctx.user_id == "system" {
         return Err(OversightDenied::NotManager);
     }
-    let live = db
-        .live_user_context(&ctx.user_id)
+    let live = crate::machine_employee::live_user_context(home, db, &ctx.user_id)
         .map_err(|_| OversightDenied::ReadError)?
         .ok_or(OversightDenied::NotManager)?;
     if !live.role.at_least(UserRole::Manager) {
@@ -168,6 +167,9 @@ pub fn can_view_team_history(
     }
     if live.requires_password_change() {
         return Err(OversightDenied::PasswordChange);
+    }
+    if !live.is_admin() && crate::machine_employee::requires_admin_for_id(home, agent) {
+        return Err(OversightDenied::NotInTeam);
     }
     let reports = db
         .overseen_reports(&live.user_id, agent)

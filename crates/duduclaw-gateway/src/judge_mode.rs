@@ -1103,9 +1103,11 @@ impl ExternalAcceptanceJudge {
         cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
         cmd.kill_on_drop(true);
 
+        let admission = duduclaw_core::autonomy_handoff::admit().await?;
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn external judge `{}` failed: {e}", self.program()))?;
+        admission.handed_off();
         let pid = child.id();
 
         // Feed stdin, drain both pipes and wait — all concurrently under ONE

@@ -281,21 +281,12 @@ fn patch_agent_toml(
     agent_id: &str,
     mutate: impl FnOnce(&mut toml::value::Table),
 ) -> Result<()> {
-    let path = home.join("agents").join(agent_id).join("agent.toml");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| io_err(format!("讀取 {} 失敗: {e}", path.display())))?;
-    let mut table: toml::value::Table = content
-        .parse::<toml::Table>()
-        .map_err(|e| cfg_err(format!("解析 agent.toml 失敗: {e}")))?;
-    mutate(&mut table);
-    let out = toml::to_string_pretty(&table)
-        .map_err(|e| cfg_err(format!("序列化 agent.toml 失敗: {e}")))?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, out).map_err(|e| io_err(format!("寫入暫存檔失敗: {e}")))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io_err(format!("覆寫 agent.toml 失敗: {e}"))
-    })?;
+    duduclaw_gateway::agent_files::external::edit_agent_toml(
+        home, agent_id, "expert", "local-cli", |table| {
+            mutate(table);
+            Ok(())
+        },
+    ).map_err(cfg_err)?;
     Ok(())
 }
 

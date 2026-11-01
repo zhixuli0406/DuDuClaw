@@ -591,6 +591,16 @@ pub fn perform_pending_restore_swap(
         &read_config(&restore_root.join("config.toml"))?,
     ).map_err(RestoreSwapError::Io)?;
 
+    let kept_mfa = crate::mfa::restore_policy(home_dir);
+    let restored_config_path = restore_root.join("config.toml");
+    let restored_config = read_config(&restored_config_path)?;
+    if crate::mfa::restore_policy_differs(home_dir, &restored_config) {
+        let updated = crate::mfa::preserve_restore_policy(&restored_config, kept_mfa)
+            .map_err(RestoreSwapError::Io)?;
+        std::fs::write(&restored_config_path, updated)
+            .map_err(|e| RestoreSwapError::Io(e.to_string()))?;
+    }
+
     // LINE inbox (F2/F5): events restored from an archive may already have
     // been handled on the device the archive came from. This one-shot marker
     // makes the inbox hold them for an operator instead of running them
@@ -639,6 +649,17 @@ pub fn perform_pending_restore_swap(
     if let Err(e) = clear_marker(home_dir) {
         warn!(error = %e, "backup-restore: 換入完成但清除標記檔失敗（下次開機會偵測到殘留 staging 為空而略過，不會重複換入）");
     }
+
+    crate::security_autopilot::audit_and_emit(
+        home_dir,
+        &duduclaw_security::audit::AuditEvent::new(
+            "backup_restore_mfa_policy_preserved", "gateway",
+            duduclaw_security::audit::Severity::Info,
+            serde_json::json!({"key":"auth.mfa_enforced", "kept":kept_mfa,
+                "notice":crate::mfa::RESTORE_POLICY_NOTICE}),
+        ),
+    );
+    tracing::info!(mfa_enforced = kept_mfa, "{}", crate::mfa::RESTORE_POLICY_NOTICE);
 
     Ok(Some(RestoreSwapReport {
         preserved_dir,
@@ -1000,6 +1021,45 @@ mod tests {
     }
 
     // ── perform_pending_restore_swap ────────────────────────────
+
+    #[test]
+    fn mfa_restore_keeps_current_policy_and_restores_all_data_once() {
+        for (current, restored, kept) in [
+            ("[auth]\nmfa_enforced=true\n", "[auth]\nmfa_enforced=false # keep comment\n", true),
+            ("[auth]\nmfa_enforced=false\n", "[auth]\nmfa_enforced=true # keep comment\n", false),
+            ("[auth]\nmfa_enforced=true\n", "", true),
+            ("[auth]\nmfa_enforced='invalid'\n", "[auth]\nmfa_enforced=false\n", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            std::fs::write(home.join("config.toml"), current).unwrap();
+            std::fs::write(home.join("old.txt"), "old").unwrap();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(&staging).unwrap();
+            let backup_config = format!("# backup\n{restored}\n[general]\nlog_level = 'debug' # untouched\n");
+            std::fs::write(staging.join("config.toml"), &backup_config).unwrap();
+            std::fs::write(staging.join("customer-data.txt"), "restored").unwrap();
+            write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename:"test.tar.gz".into() }).unwrap();
+            let report = perform_pending_restore_swap(home, "mfa-test").unwrap().unwrap();
+            let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            let parsed: toml::Table = config.parse().unwrap();
+            assert_eq!(parsed["auth"]["mfa_enforced"].as_bool(), Some(kept));
+            assert!(config.starts_with("# backup\n"));
+            assert!(config.contains("log_level = 'debug' # untouched"));
+            if restored.contains("# keep comment") { assert!(config.contains("# keep comment")); }
+            assert_eq!(std::fs::read_to_string(home.join("customer-data.txt")).unwrap(), "restored");
+            assert_eq!(std::fs::read_to_string(report.preserved_dir.join("config.toml")).unwrap(), current);
+            assert!(report.preserved_dir.join("old.txt").exists());
+            assert!(!home.join("old.txt").exists());
+            assert!(!staging.exists());
+            assert!(read_marker(home).is_none());
+            let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+            assert!(audit.contains("backup_restore_mfa_policy_preserved"));
+            assert_eq!(perform_pending_restore_swap(home, "second-boot"), Ok(None));
+            assert!(!home.join("restore-backup-second-boot").exists());
+            assert_eq!(std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap(), audit);
+        }
+    }
 
     #[test]
     fn restore_cannot_remove_or_replace_installation_profile() {

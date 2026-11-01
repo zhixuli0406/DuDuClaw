@@ -90,6 +90,8 @@ fn run_with_markers(home: &Path, agent: &str, action: Action, markers: &[&str]) 
         ));
     }
 
+    #[cfg(test)]
+    crate::profile_edit_test_hook::run();
     let written = duduclaw_gateway::agent_files::external::edit_agent_toml(
         home,
         agent,

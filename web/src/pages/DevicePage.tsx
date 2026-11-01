@@ -525,6 +525,7 @@ export function DevicePage() {
   const [restoring, setRestoring] = useState(false);
   const [restoreCandidate, setRestoreCandidate] = useState<{ path: string; name: string } | null>(null);
   const [restoreDone, setRestoreDone] = useState(false);
+  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
 
   const uploadBackup = (file: File): Promise<string> =>
     new Promise((resolve, reject) => {
@@ -578,7 +579,8 @@ export function DevicePage() {
     if (!restoreCandidate) return;
     setRestoring(true);
     try {
-      await api.device.backupRestore(restoreCandidate.path);
+      const result = await api.device.backupRestore(restoreCandidate.path);
+      setRestoreNotice(result.notice ?? null);
       setRestoreCandidate(null);
       setRestoreDone(true);
     } catch (e) {
@@ -1147,6 +1149,7 @@ export function DevicePage() {
           <DialogHeader>
             <DialogTitle>{t('device.restore.doneTitle')}</DialogTitle>
             <DialogDescription>{t('device.restore.doneMessage')}</DialogDescription>
+            {restoreNotice && <p className="text-sm text-muted-foreground">{restoreNotice}</p>}
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" size="sm" onClick={() => setRestoreDone(false)}>

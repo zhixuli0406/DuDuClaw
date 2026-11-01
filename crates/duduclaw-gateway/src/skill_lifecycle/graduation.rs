@@ -101,11 +101,25 @@ pub async fn graduate_to_global(
     agent_skills_dir: &Path,
     global_skills_dir: &Path,
 ) -> Result<GraduationRecord, String> {
+    let candidate = candidate.clone();
+    let agent_skills_dir = agent_skills_dir.to_path_buf();
+    let global_skills_dir = global_skills_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        graduate_to_global_blocking(&candidate, &agent_skills_dir, &global_skills_dir)
+    }).await.map_err(|e| format!("Skill graduation task failed: {e}"))?
+}
+
+/// Blocking publication for callers that own an admission lease. Keep that
+/// lease on this same blocking thread through graduation and related writes.
+pub(crate) fn graduate_to_global_blocking(
+    candidate: &GraduationCandidate,
+    agent_skills_dir: &Path,
+    global_skills_dir: &Path,
+) -> Result<GraduationRecord, String> {
     let filename = format!("{}.md", candidate.skill_name);
     let source = agent_skills_dir.join(&filename);
 
-    let content = tokio::fs::read_to_string(&source)
-        .await
+    let content = std::fs::read_to_string(&source)
         .map_err(|e| format!("Failed to read skill {}: {e}", source.display()))?;
 
     // Add graduation metadata to frontmatter
@@ -113,13 +127,11 @@ pub async fn graduate_to_global(
         inject_graduation_metadata(&content, &candidate.source_agent_id, candidate.lift);
 
     // Write to global skills directory
-    tokio::fs::create_dir_all(global_skills_dir)
-        .await
+    std::fs::create_dir_all(global_skills_dir)
         .map_err(|e| format!("Failed to create global skills dir: {e}"))?;
 
     let dest = global_skills_dir.join(&filename);
-    tokio::fs::write(&dest, &graduated_content)
-        .await
+    std::fs::write(&dest, &graduated_content)
         .map_err(|e| format!("Failed to write global skill: {e}"))?;
 
     let record = GraduationRecord {

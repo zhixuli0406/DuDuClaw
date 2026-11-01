@@ -578,6 +578,11 @@ const TRAJECTORY_FEEDBACK_MAX_CHARS: usize = 300;
 /// back to the plain needs_human body with no trajectory line, exactly as
 /// before this feature existed.
 async fn build_needs_human_trajectory(home_dir: &Path, task: &TaskRow) -> Option<String> {
+    if crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
+        == crate::pause_reason::PauseReason::OperatorPaused
+    {
+        return None;
+    }
     let goal = task.description.trim();
     if goal.is_empty() {
         return None;
@@ -600,7 +605,7 @@ async fn build_needs_human_trajectory(home_dir: &Path, task: &TaskRow) -> Option
     // `notify_goal_needs_human`), so an unbounded LLM call here can stall
     // EVERY other candidate's dispatch this tick. Bound it — a slow/unreachable
     // provider degrades to no trajectory line instead of stalling the loop.
-    let reply = with_llm_timeout(&task.id, TRAJECTORY_LLM_TIMEOUT, async {
+    let reply = run_task_trajectory(home_dir, task, async {
         crate::runtime_dispatch::run_utility_prompt(
             home_dir,
             Some(&agent_dir),
@@ -614,6 +619,23 @@ async fn build_needs_human_trajectory(home_dir: &Path, task: &TaskRow) -> Option
     .await?;
 
     render_trajectory_reply(&reply)
+}
+
+/// Both notification trajectories retain the task owner and initiating employee
+/// through the provider handoff, including pauses after this cheap preflight.
+async fn run_task_trajectory<F>(home_dir: &Path, task: &TaskRow, model: F) -> Option<String>
+where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    duduclaw_core::autonomy_gate::check(
+        home_dir, &task.assigned_to, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ).ok()?;
+    let callers = crate::autonomous_runtime::task_caller(home_dir, task)
+        .into_iter().collect::<Vec<_>>();
+    crate::autonomous_runtime::scope(
+        home_dir, &task.assigned_to, &callers,
+        with_llm_timeout(&task.id, TRAJECTORY_LLM_TIMEOUT, model),
+    ).await
 }
 
 /// Pure prompt-builder for [`build_needs_human_trajectory`], factored out so
@@ -1025,7 +1047,7 @@ async fn build_kickoff_trajectory(home_dir: &Path, approval_id: &str) -> Option<
     // M4 (mirrors build_needs_human_trajectory): bounded so an
     // unreachable/slow provider degrades to no trajectory line instead of
     // stalling the kickoff push.
-    let reply = with_llm_timeout(task_id, TRAJECTORY_LLM_TIMEOUT, async {
+    let reply = run_task_trajectory(home_dir, &task, async {
         crate::runtime_dispatch::run_utility_prompt(
             home_dir,
             Some(&agent_dir),
@@ -1300,6 +1322,18 @@ pub(crate) async fn apply_needs_human_from_dashboard(
     act: DecisionAct,
     note: &str,
 ) -> Result<String, String> {
+    apply_needs_human_from_dashboard_checked(home_dir, decider, decider_name, task_id, act, note, None).await
+}
+
+pub(crate) async fn apply_needs_human_from_dashboard_checked(
+    home_dir: &Path,
+    decider: &str,
+    decider_name: Option<String>,
+    task_id: &str,
+    act: DecisionAct,
+    note: &str,
+    expected_updated_at: Option<&str>,
+) -> Result<String, String> {
     let verb = crate::decision_notify::settled_verb(DecisionSource::Goal, act);
     let store = TaskStore::open(home_dir).map_err(|e| format!("開啟任務資料庫失敗：{e}"))?;
     let task = store.get_task(task_id).await.map_err(|e| e.to_string())?;
@@ -1309,7 +1343,7 @@ pub(crate) async fn apply_needs_human_from_dashboard(
 
     if act == DecisionAct::Takeover {
         let changed = store
-            .claim_needs_human(task_id, decider)
+            .claim_needs_human_checked(task_id, decider, expected_updated_at)
             .await
             .map_err(|e| e.to_string())?;
         if !changed {
@@ -1342,7 +1376,7 @@ pub(crate) async fn apply_needs_human_from_dashboard(
         _ => return Err("不支援的動作".into()),
     };
     let changed = store
-        .resolve_needs_human_with_survival_evidence(task_id, decision, note)
+        .resolve_needs_human_checked(task_id, decision, note, expected_updated_at)
         .await
         .map_err(|e| e.to_string())?;
     if !changed {
@@ -1386,6 +1420,16 @@ pub(crate) async fn apply_continue_from_dashboard(
     task_id: &str,
     message: &str,
 ) -> Result<String, String> {
+    apply_continue_from_dashboard_checked(home_dir, decider, task_id, message, None).await
+}
+
+pub(crate) async fn apply_continue_from_dashboard_checked(
+    home_dir: &Path,
+    decider: &str,
+    task_id: &str,
+    message: &str,
+    expected_updated_at: Option<&str>,
+) -> Result<String, String> {
     let store = TaskStore::open(home_dir).map_err(|e| format!("開啟任務資料庫失敗：{e}"))?;
     let task = store.get_task(task_id).await.map_err(|e| e.to_string())?;
     let Some(task) = task else {
@@ -1394,7 +1438,7 @@ pub(crate) async fn apply_continue_from_dashboard(
     if !task.goal_mode {
         return Err("只有目標任務可以接著做".into());
     }
-    let changed = store.continue_from_terminal_with_survival_evidence(task_id, message).await?;
+    let changed = store.continue_from_terminal_checked(task_id, message, expected_updated_at).await?;
     if !changed {
         return Ok("此任務目前的狀態不允許接著做（可能已被他人變更）。".into());
     }
@@ -1666,6 +1710,56 @@ async fn append_activity(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn paused_trajectory_is_absent_without_starting_a_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        let mut task = mk_task("paused-trajectory");
+        task.pause_reason = Some("operator_paused".into());
+        assert!(build_needs_human_trajectory(home.path(), &task).await.is_none());
+        task.pause_reason = None;
+        for target in [Some("alice"), None] {
+            duduclaw_core::autonomy_gate::set_pause(home.path(), target, "pause", "user").unwrap();
+            assert!(build_needs_human_trajectory(home.path(), &task).await.is_none());
+            duduclaw_core::autonomy_gate::resume(home.path(), target).unwrap();
+        }
+        assert!(!home.path().join("agents/alice").exists());
+    }
+
+    #[tokio::test]
+    async fn pause_after_trajectory_preflight_prevents_model_handoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for paused in [Some("alice"), Some("bob"), None] {
+            let home = tempfile::tempdir().unwrap();
+            for agent in ["alice", "bob"] {
+                let dir = home.path().join("agents").join(agent);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+            }
+            let mut task = mk_task("trajectory-race");
+            task.created_by = "bob".into();
+            task.created_via = Some("agent".into());
+            let model_calls = AtomicUsize::new(0);
+            // This future is polled only after run_task_trajectory's preflight.
+            let reply = run_task_trajectory(home.path(), &task, async {
+                let outcome = duduclaw_core::autonomy_gate::mutate_async(
+                    home.path(), paused,
+                    Some(duduclaw_core::autonomy_gate::PauseEntry {
+                        reason: "between check and send".into(),
+                        who: "operator".into(),
+                        at: chrono::Utc::now().to_rfc3339(),
+                    }),
+                ).await;
+                assert!(matches!(outcome, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+                let admission = duduclaw_core::autonomy_handoff::admit().await?;
+                model_calls.fetch_add(1, Ordering::SeqCst);
+                admission.handed_off();
+                Ok("unexpected model result".into())
+            }).await;
+            assert!(reply.is_none());
+            assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+        }
+    }
 
     #[test]
     fn notify_outcome_is_final_only_for_sent_and_no_target() {

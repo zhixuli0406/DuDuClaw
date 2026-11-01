@@ -447,13 +447,30 @@ async fn consume_pass(
         let Some(resp) = ctx.store.get_responsibility(&resp_id).await? else {
             continue;
         };
-        if resp.state != "active" || free == 0 {
+        if resp.state != "active" {
             continue;
         }
         let pending = ctx.store.pending_fires(&resp_id).await?;
         let Some(first) = pending.first().cloned() else {
             continue;
         };
+        if duduclaw_core::autonomy_gate::check(
+            ctx.home, &resp.owner_agent_id,
+            duduclaw_core::autonomy_gate::AutonomyPath::Responsibility,
+        ).is_err() {
+            // Consume due facts as explicit skips, never replay a backlog
+            // after resume. A future scheduled/event fact can wake normally.
+            for fire in &pending {
+                ctx.store.drop_pending_fires(
+                    &resp_id, &fire.reason, "autonomy_paused", now,
+                ).await?;
+            }
+            continue;
+        }
+
+        if free == 0 {
+            continue;
+        }
         let Ok(window) = period_key(&resp.budget_period, &resp.budget_timezone, now) else {
             warn!(responsibility = %resp_id, "invalid budget window — not waking");
             continue;
@@ -515,6 +532,18 @@ async fn consume_pass(
             now,
         )?;
         super::test_hooks::pause_point("consume_after_read", &resp_id).await;
+        if duduclaw_core::autonomy_gate::check(
+            ctx.home, &resp.owner_agent_id,
+            duduclaw_core::autonomy_gate::AutonomyPath::Responsibility,
+        ).is_err() {
+            for fire in &pending {
+                ctx.store.drop_pending_fires(
+                    &resp_id, &fire.reason, "autonomy_paused", now,
+                ).await?;
+            }
+            continue;
+        }
+
         let req = MaterializeRequest {
             responsibility_id: resp_id.clone(),
             expected_fire_id: first.fire_id.clone(),

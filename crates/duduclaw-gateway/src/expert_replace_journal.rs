@@ -220,6 +220,20 @@ fn move_into(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Works from any point of the replace — a move that never happened is
 /// skipped. Best effort: failed steps are listed.
 pub fn undo(home: &Path, j: &ReplaceJournal) -> UndoOutcome {
+    crate::agent_files::writer::run_blocking(|| {
+        let _barrier = match duduclaw_core::autonomy_gate::exclusive_barrier(home) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let mut out = UndoOutcome::default();
+                out.failures.push(error.to_string());
+                return out;
+            }
+        };
+        undo_locked(home, j)
+    })
+}
+
+fn undo_locked(home: &Path, j: &ReplaceJournal) -> UndoOutcome {
     let mut out = UndoOutcome::default();
     if let Err(e) = j.checked() {
         out.failures.push(e);

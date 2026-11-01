@@ -250,6 +250,8 @@ pub enum ProtectedSurface {
     /// through the gated MCP / dashboard paths or `duduclaw org sync`, none of
     /// which run through this hook.
     OrgStore,
+    /// Operator-owned autonomous execution gate and its initialization marker.
+    AutonomyPause,
 }
 
 impl ProtectedSurface {
@@ -260,6 +262,7 @@ impl ProtectedSurface {
             Self::HookSettings => "settings.json",
             Self::IdentityKey => crate::identity_token::IDENTITY_KEY_FILE,
             Self::OrgStore => crate::org_store::ORG_STORE_FILE,
+            Self::AutonomyPause => crate::autonomy_gate::STATE_FILE,
         }
     }
 }

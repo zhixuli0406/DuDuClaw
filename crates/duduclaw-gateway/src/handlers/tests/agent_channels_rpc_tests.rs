@@ -35,6 +35,7 @@ fn admin() -> UserContext {
 
 fn user(id: &str, bound: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: id.into(),
         email: format!("{id}@example.invalid"),
         role: UserRole::Employee,

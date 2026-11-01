@@ -420,25 +420,83 @@ async fn internal_tools_list_allowlist_shows_only_allowed() {
 #[tokio::test(flavor = "current_thread")]
 async fn role_member_tools_list_uses_ephemeral_capabilities() {
     use serde_json::json;
+    // A real role member uses the shared key in a verified employee process.
+    // Isolate process-wide identity from other tests, as round_parent_tests does.
+    const CHILD: &str = "DUDUCLAW_TEST_ROLE_MEMBER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mcp::wiki_namespace_tests::part1::role_member_tools_list_uses_ephemeral_capabilities", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(duduclaw_core::ENV_AGENT_ID, "eph-planner-123456")
+            .env_remove(duduclaw_core::ENV_LANE)
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
     let home = tmp_home_for_tools_list();
     let member = "eph-planner-123456";
     let dir = home.path().join("agents/.ephemeral").join(member);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("agent.toml"),
-        "[capabilities]\nallowed_tools = [\"team_handoff\"]\n",
+        "[agent]\nstatus = \"active\"\nreports_to = 'parent'\n[team_member]\nrole = 'planner'\ntask_id = 'task-round'\nround = 1\nparent = 'parent'\n[capabilities]\nallowed_tools = [\"team_handoff\"]\n",
     )
     .unwrap();
-    let principal =
+    let parent_dir = home.path().join("agents/parent");
+    std::fs::create_dir_all(&parent_dir).unwrap();
+    std::fs::write(parent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
+    let metadata = "parent = 'parent'\ntier = 'standard'\ncreated_at = '2026-10-29T00:00:00Z'\nexpires_at = '2026-10-30T00:00:00Z'\n";
+    std::fs::write(dir.join("ephemeral.toml"), metadata).unwrap();
+    duduclaw_core::org_store::upsert(
+        home.path(), member, duduclaw_core::org_store::OrgEntry::new("parent", ""),
+    ).unwrap();
+    let mut principal =
         internal_principal_named(duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID);
+    principal.scopes.insert(crate::mcp_auth::Scope::Admin);
+    let actor = super::record_actor_for(home.path(), &principal.client_id, member);
+    assert_eq!(actor, super::RecordActor::Agent(member));
+    assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_ok());
     let listed = super::handle_tools_list_for_agent(&json!(1), &principal, home.path(), member).await;
     assert_eq!(names_of(&listed), vec!["team_handoff"]);
+
+    for paused_identity in [member, "parent"] {
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some(paused_identity), "test", "operator").unwrap();
+        assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_err());
+        let paused = super::handle_tools_list_for_agent(&json!(4), &principal, home.path(), member).await;
+        assert!(names_of(&paused).is_empty());
+        duduclaw_core::autonomy_gate::resume(home.path(), Some(paused_identity)).unwrap();
+        assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_ok());
+        let resumed = super::handle_tools_list_for_agent(&json!(5), &principal, home.path(), member).await;
+        assert_eq!(names_of(&resumed), vec!["team_handoff"]);
+    }
+
+    std::fs::remove_file(parent_dir.join("agent.toml")).unwrap();
+    assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_err());
+    assert!(names_of(&super::handle_tools_list_for_agent(&json!(6), &principal, home.path(), member).await).is_empty());
+    std::fs::write(parent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
+    for corrupt_metadata in ["invalid [", "parent = 'parent'"] {
+        std::fs::write(dir.join("ephemeral.toml"), corrupt_metadata).unwrap();
+        assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_err());
+        assert!(names_of(&super::handle_tools_list_for_agent(&json!(7), &principal, home.path(), member).await).is_empty());
+    }
+    std::fs::write(dir.join("ephemeral.toml"), metadata.replace("parent = 'parent'", &format!("parent = '{member}'"))).unwrap();
+    duduclaw_core::org_store::upsert(
+        home.path(), member, duduclaw_core::org_store::OrgEntry::new(member, ""),
+    ).unwrap();
+    assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_err());
+    assert!(names_of(&super::handle_tools_list_for_agent(&json!(8), &principal, home.path(), member).await).is_empty());
+    std::fs::write(dir.join("ephemeral.toml"), metadata).unwrap();
+    duduclaw_core::org_store::upsert(
+        home.path(), member, duduclaw_core::org_store::OrgEntry::new("parent", ""),
+    ).unwrap();
 
     // Syntactically valid TOML with a wrong capability type must match
     // the dispatch gate's stricter policy-only parse and expose nothing.
     std::fs::write(
         dir.join("agent.toml"),
-        "[capabilities]\nos_native = \"invalid-boolean\"\n",
+        "[agent]\nstatus = \"active\"\n[capabilities]\nos_native = \"invalid-boolean\"\n",
     )
     .unwrap();
     let malformed =

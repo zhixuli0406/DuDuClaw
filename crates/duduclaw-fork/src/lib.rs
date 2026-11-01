@@ -361,6 +361,16 @@ impl PreparedFork {
         self
     }
 
+    /// Convert prepared output to the existing manual-resolution path before
+    /// any publication. Retention still runs, but promotion cannot run.
+    pub fn require_manual_resolution(mut self, reason: String) -> Self {
+        self.resolution.decision = MergeDecision {
+            winner: None, needs_confirmation: true, reason,
+        };
+        self.resolution.promoted = false;
+        self
+    }
+
     /// Preserve independent private copies before entering publication, so an
     /// IO/DB fault cannot drop the only source with the prepared TempDirs.
     pub fn archive_sources(&self, destination: &std::path::Path) -> Result<Vec<RetainedBranch>> {
@@ -393,52 +403,60 @@ impl PreparedFork {
 
     /// Persist a truthful uncertainty marker before the first parent write.
     pub fn publish_with_observer<T>(
-        mut self, retain_dir: Option<&std::path::Path>, cancelled: &[BranchId],
+        self, retain_dir: Option<&std::path::Path>, cancelled: &[BranchId],
         before_parent_write: impl FnOnce() -> Result<()>,
         publish: impl FnOnce(ForkResolution) -> Result<T>,
     ) -> Result<T> {
         let parent = self.parent.clone();
         with_parent_publication(&parent, |publication| {
-            let eligible = |id: &BranchId| !cancelled.contains(id) && self.resolution.results.iter()
-                .any(|result| &result.id == id && result.state == BranchState::Finished);
-            if self.resolution.decision.winner.as_ref().is_some_and(|id| !eligible(id)) {
-                self.resolution.decision.winner = None;
-                self.resolution.decision.needs_confirmation = true;
-                self.resolution.decision.reason = "selected branch no longer eligible for publication".into();
-            }
-            let winner_overlay = self.resolution.decision.winner.as_ref()
-                .filter(|_| !self.resolution.decision.needs_confirmation)
-                .and_then(|winner| self.overlays.get(winner));
-            if let Some(overlay) = winner_overlay {
-                before_parent_write()?;
-                publication.promote(overlay.workspace(), &self.promote_policy)?;
-                self.resolution.promoted = true;
-            }
-            if let (false, Some(dir)) = (self.resolution.promoted, retain_dir) {
-                let survivors: Vec<BranchId> = self.resolution.results
-                    .iter()
-                    .filter(|r| r.state == BranchState::Finished && !cancelled.contains(&r.id))
-                    .map(|r| r.id.clone())
-                    .collect();
-                if !survivors.is_empty() {
-                    retention::ensure_private_dir(dir)?;
-                    for id in survivors {
-                        let Some(overlay) = self.overlays.remove(&id) else { continue };
-                        retention::validate_id(&id.0)?;
-                        let dest = dir.join(&id.0);
-                        match overlay.persist_to(&dest) {
-                            Ok(path) => {
-                                retention::set_private(&path)?;
-                                self.resolution.retained.push(RetainedBranch { branch_id: id, workspace: path });
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
+            self.publish_under_parent_lock(publication, retain_dir, cancelled, before_parent_write, publish)
+        })
+    }
+
+    /// Publish using a capability for this parent, acquired before admission.
+    /// This lets callers avoid holding an admission lease while waiting on locks.
+    pub fn publish_under_parent_lock<T>(
+        mut self, publication: &ParentPublication,
+        retain_dir: Option<&std::path::Path>, cancelled: &[BranchId],
+        before_parent_write: impl FnOnce() -> Result<()>,
+        publish: impl FnOnce(ForkResolution) -> Result<T>,
+    ) -> Result<T> {
+        publication.require_parent(&self.parent)?;
+        let eligible = |id: &BranchId| !cancelled.contains(id) && self.resolution.results.iter()
+            .any(|result| &result.id == id && result.state == BranchState::Finished);
+        if self.resolution.decision.winner.as_ref().is_some_and(|id| !eligible(id)) {
+            self.resolution.decision.winner = None;
+            self.resolution.decision.needs_confirmation = true;
+            self.resolution.decision.reason = "selected branch no longer eligible for publication".into();
+        }
+        let winner_overlay = self.resolution.decision.winner.as_ref()
+            .filter(|_| !self.resolution.decision.needs_confirmation)
+            .and_then(|winner| self.overlays.get(winner));
+        if let Some(overlay) = winner_overlay {
+            before_parent_write()?;
+            publication.promote(overlay.workspace(), &self.promote_policy)?;
+            self.resolution.promoted = true;
+        }
+        if let (false, Some(dir)) = (self.resolution.promoted, retain_dir) {
+            let survivors: Vec<BranchId> = self.resolution.results
+                .iter()
+                .filter(|r| r.state == BranchState::Finished && !cancelled.contains(&r.id))
+                .map(|r| r.id.clone())
+                .collect();
+            if !survivors.is_empty() {
+                retention::ensure_private_dir(dir)?;
+                for id in survivors {
+                    let Some(overlay) = self.overlays.remove(&id) else { continue };
+                    retention::validate_id(&id.0)?;
+                    let dest = dir.join(&id.0);
+                    let path = overlay.persist_to(&dest)?;
+                    retention::set_private(&path)?;
+                    self.resolution.retained.push(RetainedBranch { branch_id: id, workspace: path });
                 }
             }
+        }
 
-            publish(self.resolution)
-        })
+        publish(self.resolution)
     }
 }
 
@@ -492,6 +510,24 @@ mod tests {
 
     fn ctrl() -> ForkController<EchoExecutor> {
         ForkController::new(ForkConfig::default(), Arc::new(EchoExecutor)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_rejects_another_parent_lock() {
+        let parent = tempfile::tempdir().unwrap();
+        let other_parent = tempfile::tempdir().unwrap();
+        let prepared = ctrl().prepare_branches("fixture", vec![Branch::with_id(
+            BranchId("parent-lock-fixture".into()),
+            BranchSpec { steering: None, budget_usd: 0.5 },
+        )], parent.path(), &judge::HeuristicJudge).await.unwrap();
+        let result: Result<()> = with_parent_publication(other_parent.path(), |publication| {
+            prepared.publish_under_parent_lock(publication, None, &[],
+                || panic!("wrong parent must be refused before any write"),
+                |_| panic!("wrong parent must not publish a resolution"))
+        });
+        assert!(result.unwrap_err().to_string().contains("another parent"));
+        assert!(!parent.path().join("branch_out.txt").exists());
+        assert!(!other_parent.path().join("branch_out.txt").exists());
     }
 
     #[test]

@@ -387,6 +387,10 @@ impl InferenceEngine {
         if !eligible {
             return;
         }
+        let Some(admission_scope) = duduclaw_core::autonomy_handoff::capture() else {
+            debug!(request_id, "UCCI shadow skipped: no autonomous host admission context");
+            return;
+        };
         let permit = match Arc::clone(&self.shadow_inflight).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -402,14 +406,14 @@ impl InferenceEngine {
         let engine = Arc::clone(self);
         let request_id = request_id.to_string();
         let request = request.clone();
-        let handle = tokio::spawn(async move {
+        let handle = tokio::spawn(duduclaw_core::autonomy_handoff::restore(Some(admission_scope), async move {
             // Held until the shadow generation finishes (success, error, or
             // panic-unwind) so the permit count always tracks reality.
             let _permit = permit;
             engine
                 .record_strong_shadow(&request_id, tier, &request)
                 .await;
-        });
+        }));
         let mut tasks = self.shadow_tasks.lock().await;
         tasks.retain(|task| !task.is_finished());
         tasks.push(handle);
@@ -1036,7 +1040,51 @@ ucci_observations = "observations.jsonl"
     }
 
     #[tokio::test]
+    async fn ucci_shadow_without_autonomous_context_never_starts_strong_model() {
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::write(
+            tmp.path().join("inference.toml"),
+            r#"
+enabled = true
+[router]
+enabled = true
+fast_model = "fast-model"
+strong_model = "strong-model"
+ucci_observations = "observations.jsonl"
+ucci_shadow_strong = true
+"#,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(InferenceEngine::new(tmp.path()).await);
+        let backend = Arc::new(
+            CascadeStub::new(&[]).with_margins(&[("fast-model", 0.2), ("strong-model", 0.1)]),
+        );
+        engine.set_backend_for_test(backend.clone()).await;
+        let result = engine
+            .route_and_generate(&fast_request())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.model_id, "fast-model");
+        // The shadow now runs detached, so its call and its row are only
+        // guaranteed once the engine has been flushed. Everything after the
+        // flush is exactly what this test asserted while it ran inline.
+        engine.flush_shadow_observations().await;
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &["fast-model"]
+        );
+        let rows = tokio::fs::read_to_string(tmp.path().join("observations.jsonl"))
+            .await
+            .unwrap();
+        assert_eq!(rows.lines().count(), 1);
+    }
+
+    #[tokio::test]
     async fn ucci_collection_can_shadow_strong_without_changing_fast_reply() {
+        duduclaw_core::autonomy_handoff::scope_owned(
+            || Box::pin(async { Ok(None) }), || {}, async {
         let tmp = TempDir::new().unwrap();
         tokio::fs::write(
             tmp.path().join("inference.toml"),
@@ -1075,6 +1123,7 @@ ucci_shadow_strong = true
             .await
             .unwrap();
         assert_eq!(rows.lines().count(), 2);
+        }).await;
     }
 
     /// Regression: `ucci_shadow_strong` ran its Strong generation inline, so
@@ -1083,6 +1132,8 @@ ucci_shadow_strong = true
     /// reply must now return without waiting for it.
     #[tokio::test]
     async fn ucci_shadow_strong_does_not_block_the_fast_reply() {
+        duduclaw_core::autonomy_handoff::scope_owned(
+            || Box::pin(async { Ok(None) }), || {}, async {
         let tmp = TempDir::new().unwrap();
         tokio::fs::write(
             tmp.path().join("inference.toml"),
@@ -1138,6 +1189,7 @@ ucci_shadow_strong = true
             .await
             .unwrap();
         assert_eq!(rows.lines().count(), 2);
+        }).await;
     }
 
     /// The flush must be a no-op when nothing was ever spawned: a disabled
@@ -1166,6 +1218,8 @@ ucci_shadow_strong = true
     /// foreground reply for the second request must not wait for it either.
     #[tokio::test]
     async fn ucci_shadow_max_inflight_default_skips_a_second_concurrent_shadow() {
+        duduclaw_core::autonomy_handoff::scope_owned(
+            || Box::pin(async { Ok(None) }), || {}, async {
         let tmp = TempDir::new().unwrap();
         tokio::fs::write(
             tmp.path().join("inference.toml"),
@@ -1244,6 +1298,7 @@ ucci_shadow_strong = true
         // 2 local_fast rows (one per accepted reply) + 1 local_strong row
         // (only the first request's shadow completed).
         assert_eq!(rows.lines().count(), 3);
+        }).await;
     }
 
     /// Companion to the default-cap test: raising `ucci_shadow_max_inflight`
@@ -1251,6 +1306,8 @@ ucci_shadow_strong = true
     /// (both parked on the blocking gate at once), with nothing skipped.
     #[tokio::test]
     async fn ucci_shadow_max_inflight_configured_allows_two_concurrent_shadows() {
+        duduclaw_core::autonomy_handoff::scope_owned(
+            || Box::pin(async { Ok(None) }), || {}, async {
         let tmp = TempDir::new().unwrap();
         tokio::fs::write(
             tmp.path().join("inference.toml"),
@@ -1328,6 +1385,7 @@ ucci_shadow_max_inflight = 2
             .await
             .unwrap();
         assert_eq!(rows.lines().count(), 4);
+        }).await;
     }
 
     #[tokio::test]

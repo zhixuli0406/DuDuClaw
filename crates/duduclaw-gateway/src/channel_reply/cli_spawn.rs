@@ -22,6 +22,7 @@ pub(crate) async fn call_claude_cli_public(
     system_prompt: &str,
     home_dir: &Path,
 ) -> Result<String, String> {
+    crate::autonomous_runtime::require_utility_context(home_dir).await?;
     if !KNOWN_EVOLUTION_MODELS.contains(&model) {
         warn!(
             model,
@@ -114,6 +115,7 @@ pub(super) async fn call_claude_cli_lightweight(
     model: &str,
     home_dir: &Path,
 ) -> Result<String, String> {
+    crate::autonomous_runtime::require_utility_context(home_dir).await?;
     let claude_path =
         duduclaw_core::which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
 
@@ -138,11 +140,18 @@ pub(super) async fn call_claude_cli_lightweight(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let output = crate::process_group::output(&mut cmd, None,
+    let output = crate::process_group::output_for_model(&mut cmd, None,
         std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS)).await
         .map_err(|e| match e {
             crate::process_group::OutputError::Timeout => "Claude utility hard timeout".to_owned(),
-            crate::process_group::OutputError::Io(e) => format!("Claude utility process error: {e}"),
+            crate::process_group::OutputError::Io(e) => {
+                let message = e.to_string();
+                if message.starts_with("AUTONOMY_") {
+                    message
+                } else {
+                    format!("Claude utility process error: {message}")
+                }
+            }
         })?;
     let mut result_text = String::new();
     let mut observed_model: Option<String> = None;
@@ -579,6 +588,12 @@ where
                         account = %selected.id,
                         "MCP config could not be confirmed — not an account failure, not retried"
                     );
+                    return Err(e);
+                }
+                // Same for an autonomy pause refusal: not an account failure,
+                // and the next account would be refused too.
+                if crate::autonomous_runtime::was_denied() {
+                    warn!(account = %selected.id, "Autonomy paused — not an account failure, not retried");
                     return Err(e);
                 }
                 last_error = e.clone();

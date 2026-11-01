@@ -110,11 +110,23 @@ async fn system_operator_access_cannot_be_reached_through_default_public_or_exis
     assert!(check_loaded(f.home.path(), agent, Some("bad-principal")).is_err());
     assert!(check_loaded(f.home.path(), agent, Some(&format!("user:{}", f.admin.user_id))).is_ok());
     crate::team_edition::record(f.home.path(), duduclaw_core::EditionProfile::Personal);
-    assert!(!requires_admin(agent), "Personal edition stays unchanged");
-    assert!(crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")));
-    for principal in [None, Some("unmapped:line:owner"), Some("unmapped:telegram:owner")] {
-        assert!(check_loaded(f.home.path(), agent, principal).is_ok());
-        assert!(check_target(f.home.path(), "operator", principal).is_ok());
+    assert!(requires_admin(agent), "a lapsed license must not reopen a multi-account deployment");
+    assert!(!crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")));
+    for user in [&f.employee, &f.manager] {
+        let sender = crate::trigger_route::SenderAccess::from_effective(Arc::new(f.db.effective_access(&user.user_id).unwrap().unwrap()));
+        assert!(!sender.may_call(agent, Some("operator")));
+        assert!(!crate::trigger_route::callable_ids(&reg, &sender, Some("operator")).contains(&"operator".to_string()));
+        let principal = format!("user:{}", user.user_id);
+        assert!(check_loaded(f.home.path(), agent, Some(&principal)).is_err());
+        assert!(check_target(f.home.path(), "operator", Some(&principal)).is_err());
+    }
+    for principal in ["unmapped:line:owner", "unmapped:telegram:owner"] {
+        assert!(check_loaded(f.home.path(), agent, Some(principal)).is_err());
+        assert!(check_target(f.home.path(), "operator", Some(principal)).is_err());
+    }
+    for principal in [None, Some(format!("user:{}", f.admin.user_id))] {
+        assert!(check_loaded(f.home.path(), agent, principal.as_deref()).is_ok());
+        assert!(check_target(f.home.path(), "operator", principal.as_deref()).is_ok());
     }
 }
 
@@ -219,4 +231,166 @@ async fn mirror_flags_do_not_choose_the_preset_and_unresolved_binding_stays_rest
     std::fs::remove_file(f.home.path().join("presets/system-operator/preset.toml")).unwrap();
     assert!(check_target(f.home.path(), "operator", Some(&principal)).is_err());
     assert!(check_target(f.home.path(), "operator", None).is_ok());
+}
+
+#[tokio::test]
+async fn personal_machine_access_requires_single_owner_evidence() {
+    for scenario in ["missing", "empty", "admin", "employee", "corrupt", "suspended", "offboarded", "sole-suspended", "sole-offboarded", "password-change", "row-error", "list-error"] {
+        let home = tempfile::tempdir().unwrap();
+        crate::trigger_route::tests::write_agent(
+            &home.path().join("agents"), "operator", "Operator", "@operator", "main", "",
+        );
+        preset::install_system_operator_preset(home.path(), false).unwrap();
+        preset::bind(home.path(), "operator", &home.path().join("agents/operator"),
+            "system-operator", "test", "test").unwrap();
+        let path = home.path().join("users.db");
+        if scenario == "corrupt" {
+            std::fs::write(&path, "not a SQLite database").unwrap();
+        } else if scenario != "missing" {
+            let db = UserDb::new(&path).unwrap();
+            if scenario != "empty" {
+                let role = if scenario == "employee" { UserRole::Employee } else { UserRole::Admin };
+                db.create_user("owner@test.invalid", "Owner", "Test-password-123!", role).unwrap();
+            }
+            if matches!(scenario, "suspended" | "offboarded") {
+                crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+                let extra = db.create_user("extra@test.invalid", "Extra", "Test-password-123!", UserRole::Employee).unwrap();
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET status=?1 WHERE id=?2", [scenario, &extra.id]).unwrap();
+                assert_eq!(db.list_users().unwrap().len(), 2);
+            }
+            if let Some(status) = scenario.strip_prefix("sole-") {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET status=?1", [status]).unwrap();
+                assert_eq!(db.list_users().unwrap().len(), 1);
+            }
+            if scenario == "password-change" {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET must_change_password=1", []).unwrap();
+            }
+            if scenario == "row-error" {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET department=x'FF'", []).unwrap();
+                assert!(db.list_users().is_err());
+            }
+            if scenario == "list-error" {
+                rusqlite::Connection::open(&path).unwrap()
+                    .execute("UPDATE users SET role='invalid'", []).unwrap();
+                assert!(db.list_users().is_err());
+            }
+        }
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Personal);
+        let allowed = matches!(scenario, "missing" | "empty" | "admin");
+        let mut reg = AgentRegistry::new(home.path().join("agents"));
+        reg.scan().await.unwrap();
+        let agent = reg.get("operator").unwrap();
+        assert_eq!(requires_admin(agent), !allowed, "{scenario}");
+        assert_eq!(requires_admin_for_id(home.path(), "operator"), !allowed, "{scenario}");
+        assert_eq!(crate::trigger_route::SenderAccess::unmapped().may_call(agent, Some("operator")), allowed, "{scenario}");
+        for principal in ["unmapped:line:owner", "unmapped:telegram:owner"] {
+            assert_eq!(check_loaded(home.path(), agent, Some(principal)).is_ok(), allowed, "{scenario}");
+            assert_eq!(check_target(home.path(), "operator", Some(principal)).is_ok(), allowed, "{scenario}");
+        }
+        assert!(check_loaded(home.path(), agent, None).is_ok(), "{scenario}");
+        if scenario == "missing" {
+            assert!(!path.exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn reader_identity_check_is_read_only_and_fails_closed() {
+    let f = fixture().await;
+    assert!(requires_admin_for_id(f.home.path(), "operator"));
+    assert!(!requires_admin_for_id(f.home.path(), "ordinary"));
+    assert!(!requires_admin_for_id(f.home.path(), "missing"));
+    assert!(requires_admin_for_id(f.home.path(), "../operator"));
+    std::fs::remove_file(f.home.path().join("presets/system-operator/preset.toml")).unwrap();
+    assert!(requires_admin_for_id(f.home.path(), "operator"), "unresolved binding");
+    let path = preset::bindings_path(f.home.path());
+    for content in ["not [ toml", "schema = 2", "agents = 1", "[agents.ordinary]\nversion = '1'"] {
+        std::fs::write(&path, content).unwrap();
+        assert!(requires_admin_for_id(f.home.path(), "ordinary"), "{content}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(requires_admin_for_id(f.home.path(), "ordinary"), "unreadable binding");
+    std::fs::remove_dir(&path).unwrap();
+    assert!(!requires_admin_for_id(f.home.path(), "ordinary"), "plain unbound employee");
+    assert!(!path.exists(), "a read must not recreate the binding store");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(f.home.path().join("missing-bindings"), &path).unwrap();
+        assert!(requires_admin_for_id(f.home.path(), "ordinary"), "dangling binding symlink");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(f.home.path().join("missing-agent"), f.home.path().join("agents/dangling")).unwrap();
+        assert!(requires_admin_for_id(f.home.path(), "dangling"), "dangling employee symlink");
+    }
+    std::fs::remove_dir_all(f.home.path().join("agents/ordinary")).unwrap();
+    std::fs::write(f.home.path().join("agents/ordinary"), "not a directory").unwrap();
+    assert!(requires_admin_for_id(f.home.path(), "ordinary"), "unreadable employee directory");
+}
+
+#[tokio::test]
+async fn narrowed_context_keeps_admin_and_ordinary_bindings_and_does_not_write() {
+    let f = fixture().await;
+    for original in [&f.employee, &f.manager] {
+        let narrowed = without_restricted_access(f.home.path(), original.clone());
+        assert!(!narrowed.agent_access.contains_key("operator"));
+        assert!(narrowed.agent_access.contains_key("ordinary"));
+        assert!(original.agent_access.contains_key("operator"));
+        assert!(f.db.live_user_context(&original.user_id).unwrap().unwrap().agent_access.contains_key("operator"));
+    }
+    // Even an unreadable/non-directory home cannot affect Admin authority.
+    let bad_home = f.home.path().join("not-a-directory");
+    std::fs::write(&bad_home, "unreadable as a directory").unwrap();
+    let admin = without_restricted_access(&bad_home, f.admin.clone());
+    assert_eq!(admin.agent_access, f.admin.agent_access);
+    assert_eq!(admin.team_access, f.admin.team_access);
+}
+
+#[test]
+fn known_identity_sources_call_the_narrowing_helper() {
+    for (source, boundary) in [
+        (include_str!("../handlers/live_context.rs"), "return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()))"),
+        (include_str!("../handlers/live_context.rs"), "Ok(crate::machine_employee::without_restricted_access(&self.home_dir, live))"),
+        (include_str!("../review_evidence/audience.rs"), "Ok(crate::machine_employee::without_restricted_access(home, duduclaw_auth::UserContext {"),
+        (include_str!("../knowledge/principals.rs"), "crate::machine_employee::requires_admin_for_id(home, &owner)"),
+        (include_str!("../assign_schedule/manage.rs"), "crate::machine_employee::requires_admin_for_id(home, agent)"),
+        (include_str!("../recipient_guard.rs"), "crate::machine_employee::requires_admin_for_id(home, agent)"),
+        (include_str!("../computer_profiles/mod.rs"), "crate::machine_employee::restriction_known(home, agent)"),
+        (include_str!("../team_oversight.rs"), "crate::machine_employee::live_user_context(home, db, &ctx.user_id)"),
+        (include_str!("../server.rs"), "crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)"),
+        (include_str!("../server.rs"), ".map(|ctx| crate::machine_employee::without_restricted_access(state.handler.home_dir(), ctx))"),
+    ] {
+        assert!(source.contains(boundary), "missing identity narrowing: {boundary}");
+    }
+}
+
+#[tokio::test]
+async fn request_local_lookup_matches_individual_checks_and_parses_once() {
+    let f = fixture().await;
+    let ids = ["ordinary", "operator", "missing", "../operator"];
+    for malformed in [false, true] {
+        if malformed { std::fs::write(preset::bindings_path(f.home.path()), "not [ toml").unwrap(); }
+        assert_eq!(restriction_known(f.home.path(), "ordinary"), if malformed { None } else { Some(false) });
+        let mut ctx = f.employee.clone();
+        for id in ids {
+            ctx.agent_access.insert(id.into(), duduclaw_auth::AccessLevel::Owner);
+            ctx.team_access.insert(id.into(), duduclaw_auth::TeamGrant { level: AccessLevel::Operator, via_user: f.employee.user_id.clone(), depth: 1 });
+        }
+        let expected: Vec<_> = ids.iter().map(|id| !requires_admin_for_id(f.home.path(), id)).collect();
+        let narrowed = without_restricted_access(f.home.path(), ctx);
+        for (id, keep) in ids.iter().zip(expected) {
+            assert_eq!(narrowed.agent_access.contains_key(*id), keep, "{id}");
+            assert_eq!(narrowed.team_access.contains_key(*id), keep, "{id}");
+        }
+    }
+    let lookup = RestrictionLookup::new(f.home.path());
+    assert!(lookup.requires_admin("ordinary"));
+    // Once read, both direct and team grants use this call's snapshot.
+    std::fs::write(preset::bindings_path(f.home.path()), "schema = 1").unwrap();
+    assert!(lookup.requires_admin("ordinary"));
+    assert!(!requires_admin_for_id(f.home.path(), "ordinary"));
 }

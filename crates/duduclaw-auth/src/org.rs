@@ -305,7 +305,7 @@ pub fn overseen_reports_on(
     Ok(reports)
 }
 
-fn direct_bindings(conn: &Connection, user_id: &str) -> Result<BTreeMap<String, AccessLevel>, String> {
+pub(crate) fn direct_bindings(conn: &Connection, user_id: &str) -> Result<BTreeMap<String, AccessLevel>, String> {
     let mut stmt = conn
         .prepare("SELECT agent_name, access_level FROM user_agent_bindings WHERE user_id = ?1")
         .map_err(|e| format!("binding query error: {e}"))?;
@@ -402,7 +402,7 @@ impl UserDb {
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("team query error: {e}"))?;
         let rows = stmt
             .query_map(rusqlite::params![manager_id, depth_cap], |row| {
-                Ok((user_from_row(row)?, row.get::<_, i64>(11)?))
+                Ok((user_from_row(row)?, row.get::<_, i64>(12)?))
             })
             .map_err(|e| format!("team query error: {e}"))?;
         let mut members = Vec::new();

@@ -194,11 +194,13 @@ async fn fatal_team_refusal_parks_only_that_goal_and_is_not_audited_again() {
         "[team]\nbroken = [",
         "[team.roles.verifier]\nruntime = \"antigravity\"\n",
         "[team.roles.verifier]\nmodel = 42\n",
+        "budget = 1\n",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().join("agents/alice");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), body).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            format!("{body}\n[agent]\nname = 'alice'\nstatus = 'active'\n")).unwrap();
         let (store, queue) = open_stores(dir.path()).await;
         let mut bad = goal_task("bad", "alice");
         bad.created_at = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
@@ -217,9 +219,9 @@ async fn fatal_team_refusal_parks_only_that_goal_and_is_not_audited_again() {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].target, "bob");
         assert!(pending[0].payload.contains("task_id=healthy"));
-        // Invalid TOML is refused by the budget preflight before team parsing.
-        // Valid TOML with invalid team fields still reaches the team gate.
-        let (audit_file, event) = if body.contains("broken = [") {
+        // Malformed TOML is now refused by the autonomy/config check first.
+        // Active employees still reach the independent team and budget gates.
+        let (audit_file, event) = if body.starts_with("budget =") {
             ("budget_events.jsonl", "budget_unavailable")
         } else {
             ("security_audit.jsonl", "team_refused")
@@ -235,6 +237,68 @@ async fn fatal_team_refusal_parks_only_that_goal_and_is_not_audited_again() {
         assert_eq!(audit().lines().filter(|line| line.contains(event)).count(), 1);
         assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
         assert_eq!(store.get_task("bad").await.unwrap().unwrap().status, "needs_human");
+    }
+}
+
+#[tokio::test]
+async fn autonomy_paused_broken_config_waits_then_resume_parks_once() {
+    for scope in [Some("alice"), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        std::fs::write(dir.path().join("agents/alice/agent.toml"), "[team]\nbroken = [").unwrap();
+        store.insert_task(&goal_task("bad", "alice")).await.unwrap();
+        let d = driver(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+        duduclaw_core::autonomy_gate::set_pause(dir.path(), scope, "maintenance", "operator").unwrap();
+
+        for _ in 0..2 {
+            d.tick_once().await.unwrap();
+            let waiting = store.get_task("bad").await.unwrap().unwrap();
+            assert_eq!(waiting.status, "todo");
+            assert!(waiting.pause_reason.is_none());
+            assert!(queue.pending_messages(10).await.unwrap().is_empty());
+            assert!(store.list_activity(None, None, 100, 0).await.unwrap().0.is_empty());
+            let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl"))
+                .unwrap_or_default();
+            assert!(!audit.contains("team_refused"));
+        }
+
+        duduclaw_core::autonomy_gate::resume(dir.path(), scope).unwrap();
+        for _ in 0..2 {
+            d.tick_once().await.unwrap();
+            let parked = store.get_task("bad").await.unwrap().unwrap();
+            assert_eq!(parked.status, "needs_human");
+            assert_eq!(parked.pause_reason.as_deref(), Some("blocked_needs_decision"));
+            assert!(queue.pending_messages(10).await.unwrap().is_empty());
+            let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
+            assert_eq!(audit.lines().filter(|line| line.contains("team_refused")).count(), 1);
+            assert!(!audit.contains("broken"));
+            assert!(!audit.contains(&dir.path().display().to_string()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn autonomy_unreadable_pause_state_with_broken_config_waits_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    std::fs::write(dir.path().join("agents/alice/agent.toml"), "[team]\nbroken = [").unwrap();
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), None, "maintenance", "operator").unwrap();
+    std::fs::write(dir.path().join(duduclaw_core::autonomy_gate::STATE_FILE), "{").unwrap();
+    store.insert_task(&goal_task("bad", "alice")).await.unwrap();
+    let d = driver(store.clone(), queue.clone(), small_cfg())
+        .with_home_dir(dir.path().to_path_buf());
+
+    for _ in 0..2 {
+        d.tick_once().await.unwrap();
+        let waiting = store.get_task("bad").await.unwrap().unwrap();
+        assert_eq!(waiting.status, "todo");
+        assert!(waiting.pause_reason.is_none());
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert!(store.list_activity(None, None, 100, 0).await.unwrap().0.is_empty());
+        let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl"))
+            .unwrap_or_default();
+        assert!(!audit.contains("team_refused"));
     }
 }
 

@@ -87,6 +87,7 @@ async fn serve_workflow_browser_fixture() {
         handler,
         tx,
         event_tx,
+        prepared_events: Default::default(),
         user_db: users,
         jwt_config: jwt,
         otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(

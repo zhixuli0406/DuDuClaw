@@ -335,6 +335,7 @@ export interface DoctorCheck {
 export type EditionProfile = 'personal' | 'enterprise';
 
 export interface SystemStatus {
+  mfa_policy?: import('./mfa-api').MfaPolicy;
   version: string;
   uptime_seconds: number;
   agents_count: number;
@@ -942,6 +943,7 @@ export type PauseReasonToken =
   | 'blocked_needs_decision'
   | 'infra'
   | 'restart'
+  | 'operator_paused'
   | 'unknown';
 
 export type CriteriaUnitStatus = 'planned' | 'covered' | 'blocked' | 'candidate';
@@ -3985,6 +3987,7 @@ export interface DeviceBackupRestoreResult {
   staged: true;
   files_written: number;
   restart_required: true;
+  notice?: string | null;
 }
 
 export interface GalleryCard {
@@ -5537,6 +5540,8 @@ export interface ApprovalSimulation {
 }
 
 export interface ApprovalItem {
+  /** Digest of the decision payload; absent on older gateways. */
+  digest?: string | null;
   request_kind?: 'approval' | 'question' | 'invalid';
   status?: 'pending' | 'approved' | 'denied' | 'expired' | 'answered' | 'invalidated';
   answer?: unknown;
@@ -7711,10 +7716,11 @@ export const api = {
         approvals: ApprovalItem[];
         count: number;
       }>,
-    decide: (id: string, approve: boolean, reason?: string) =>
+    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string) =>
       client.call('approvals.decide', {
         id,
         approve,
+        ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
         ...(reason ? { reason } : {}),
       }) as Promise<{
         id: string;

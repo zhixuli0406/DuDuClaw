@@ -541,6 +541,9 @@ impl ChatProvider for OpenAiProvider {
 
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let body = build_request_body(req);
+        let mut admission = duduclaw_core::autonomy_handoff::admit().await
+            .map_err(LlmError::InvalidRequest)?;
+        admission.request_started();
         let response = http_client()
             .post(self.responses_url())
             .bearer_auth(&self.auth.api_key)
@@ -549,6 +552,7 @@ impl ChatProvider for OpenAiProvider {
             .send()
             .await
             .map_err(|e| classify_transport(&e))?;
+        admission.handed_off();
 
         let status = response.status();
         if !status.is_success() {
@@ -570,6 +574,9 @@ impl ChatProvider for OpenAiProvider {
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
         let mut body = build_request_body(req);
         body["stream"] = json!(true);
+        let mut admission = duduclaw_core::autonomy_handoff::admit().await
+            .map_err(LlmError::InvalidRequest)?;
+        admission.request_started();
         let response = http_client()
             .post(self.responses_url())
             .bearer_auth(&self.auth.api_key)
@@ -578,6 +585,7 @@ impl ChatProvider for OpenAiProvider {
             .send()
             .await
             .map_err(|e| classify_transport(&e))?;
+        admission.handed_off();
 
         let status = response.status();
         if !status.is_success() {

@@ -484,11 +484,15 @@ impl AnthropicProvider {
         if let Some(beta) = super::anthropic_thinking::thinking_beta_header(&body) {
             http = http.header("anthropic-beta", beta);
         }
+        let mut admission = duduclaw_core::autonomy_handoff::admit().await
+            .map_err(LlmError::InvalidRequest)?;
+        admission.request_started();
         let response = http
             .json(&body)
             .send()
             .await
             .map_err(|e| classify_transport(&e))?;
+        admission.handed_off();
 
         let status = response.status();
         if !status.is_success() {

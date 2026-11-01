@@ -72,7 +72,36 @@ pub async fn run<F>(
     input: &[u8],
     timeout: Duration,
     stdout_cap: usize,
+    on_event: F,
+) -> io::Result<ProcessOutput>
+where
+    F: FnMut(&[u8]) -> bool + Send,
+{
+    run_inner(command, input, timeout, stdout_cap, on_event, false).await
+}
+
+/// Autonomous process handoff; probes and cleanup keep using `run`.
+/// Admit on this task, then release immediately after the child is spawned.
+pub(crate) async fn run_admitted<F>(
+    command: Command,
+    input: &[u8],
+    timeout: Duration,
+    stdout_cap: usize,
+    on_event: F,
+) -> io::Result<ProcessOutput>
+where
+    F: FnMut(&[u8]) -> bool + Send,
+{
+    run_inner(command, input, timeout, stdout_cap, on_event, true).await
+}
+
+async fn run_inner<F>(
+    command: Command,
+    input: &[u8],
+    timeout: Duration,
+    stdout_cap: usize,
     mut on_event: F,
+    admit_start: bool,
 ) -> io::Result<ProcessOutput>
 where
     F: FnMut(&[u8]) -> bool + Send,
@@ -88,7 +117,12 @@ where
         use std::os::unix::process::CommandExt;
         cmd.as_std_mut().process_group(0);
     }
+    let admission = if admit_start {
+        Some(duduclaw_core::autonomy_handoff::admit().await
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?)
+    } else { None };
     let mut child = cmd.spawn()?;
+    if let Some(admission) = admission { admission.handed_off(); }
     let group = GroupGuard(
         child
             .id()

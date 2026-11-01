@@ -104,6 +104,8 @@ pub mod policy_snapshot;
 mod delivery;
 pub(crate) use delivery::{CURRENT_TRUSTED_REPLY_TARGET, TrustedReplyTarget, scope_trusted_reply};
 mod broker;
+mod turn_origin;
+pub(crate) use turn_origin::scope_turn;
 pub(crate) use binding::require_current_dashboard_role_in_home;
 mod operations;
 mod workflow_grants;
@@ -121,6 +123,12 @@ mod gates;
 pub mod operator_cli_gate;
 mod simulation;
 mod store;
+mod live_events;
+pub use live_events::{decision_digest, decision_digest_at};
+pub(crate) use live_events::{
+    activation_facts, is_activation_record, decision_digest_with_activation,
+    check_expected_digest, EXPECTED_DECISION_DIGEST, EXPECTED_DECISION_HOME,
+};
 
 /// SQLite-backed persistence for approvals. Mirrors the `events_store` /
 /// `autopilot_store` idioms: `Mutex<Connection>`, WAL, self-healing
@@ -406,3 +414,5 @@ impl ApprovalRecord {
 }
 
 // ── Store ───────────────────────────────────────────────────
+
+pub(crate) use turn_origin::is_turn_cancelled;

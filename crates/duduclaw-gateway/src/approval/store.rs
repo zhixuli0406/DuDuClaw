@@ -145,13 +145,64 @@ impl ApprovalStore {
             ("invalidated_reason", "invalidated_reason TEXT"),
             // The person the raising run works for (`on_behalf_of`).
             ("on_behalf_of", "on_behalf_of TEXT"),
+            ("origin_session_id", "origin_session_id TEXT"),
+            ("origin_turn_id", "origin_turn_id TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
-                conn.execute(&format!("ALTER TABLE approvals ADD COLUMN {ddl}"), [])
-                    .map_err(|e| format!("add column {col}: {e}"))?;
+                if let Err(error) = conn.execute(&format!("ALTER TABLE approvals ADD COLUMN {ddl}"), []) {
+                    // Another process can finish this additive migration after
+                    // our initial snapshot. Accept only a confirmed column.
+                    let present: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name=?1)",
+                        [col], |row| row.get(0),
+                    ).map_err(|e| format!("recheck column {col}: {e}"))?;
+                    if !present {
+                        return Err(format!("add column {col}: {error}"));
+                    }
+                }
             }
         }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_approvals_turn_origin
+                 ON approvals(origin_session_id, origin_turn_id, status);
+             CREATE TABLE IF NOT EXISTS cancelled_approval_turns (
+                 session_id TEXT NOT NULL,
+                 turn_id TEXT NOT NULL,
+                 cancelled_at TEXT NOT NULL,
+                 PRIMARY KEY(session_id, turn_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_cancelled_approval_turns_time
+                 ON cancelled_approval_turns(cancelled_at);
+             CREATE TABLE IF NOT EXISTS approval_turn_origins (
+                 approval_id TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 turn_id TEXT NOT NULL,
+                 PRIMARY KEY(approval_id, session_id, turn_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_approval_turn_origins_turn
+                 ON approval_turn_origins(session_id, turn_id);
+             INSERT OR IGNORE INTO approval_turn_origins(approval_id, session_id, turn_id)
+                 SELECT id, origin_session_id, origin_turn_id FROM approvals
+                 WHERE origin_session_id IS NOT NULL AND origin_turn_id IS NOT NULL;",
+        ).map_err(|e| format!("init approval turn origins: {e}"))?;
+        let has_principal: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cancelled_approval_turns') WHERE name='principal')",
+            [], |row| row.get(0),
+        ).map_err(|e| format!("read cancellation principal column: {e}"))?;
+        if !has_principal {
+            if let Err(error) = conn.execute("ALTER TABLE cancelled_approval_turns ADD COLUMN principal TEXT", []) {
+                let present: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cancelled_approval_turns') WHERE name='principal')",
+                    [], |row| row.get(0),
+                ).map_err(|e| format!("recheck cancellation principal column: {e}"))?;
+                if !present { return Err(format!("add cancellation principal: {error}")); }
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_cancelled_turns_principal_time
+             ON cancelled_approval_turns(principal, julianday(cancelled_at));",
+        ).map_err(|e| format!("index cancellation principal: {e}"))?;
         Ok(())
     }
 
@@ -171,42 +222,125 @@ impl ApprovalStore {
         }
         let payload_text = rec.payload.to_string();
         let simulation_text = rec.simulation.as_ref().map(|v| masked_approval_value(v).to_string());
-        let conn = self.conn.lock().await;
+        let origin = super::turn_origin::current_origin()?;
+        // Quarantine creation must not add a post-commit emission window to
+        // the existing erase/card race. Attach before starting the transaction;
+        // the new invalidation and the existing card commit together.
+        let quarantine_bus = if rec.action_kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE {
+            self.db_path.as_ref().and_then(|p| p.parent()).map(|home| {
+                crate::events_store::EventBusStore::open(home)?;
+                Ok::<_, String>(home.join("events.db"))
+            }).transpose()?
+        } else {
+            None
+        };
+        let mut conn = self.conn.lock().await;
+        if let Some(path) = &quarantine_bus {
+            conn.execute("ATTACH DATABASE ?1 AS quarantine_live_events", params![path.to_string_lossy()])
+                .map_err(|e| format!("attach quarantine event store: {e}"))?;
+        }
         let sql = format!(
             "INSERT INTO approvals
                 (id, agent_id, action_kind, summary, payload, status,
                  created_at, decided_at, decided_by, ttl_seconds,
                  notify_channel, notify_chat_id, reminded_at, simulation, request_kind, binding_json, answer_json,
-                invalidated_reason, on_behalf_of)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19){}",
+                invalidated_reason, on_behalf_of, origin_session_id, origin_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21){}",
             if if_absent { " ON CONFLICT(id) DO NOTHING" } else { "" }
         );
-        conn.execute(
-            &sql,
-            params![
-                rec.id.as_str(),
-                rec.agent_id,
-                rec.action_kind,
-                duduclaw_security::credential_detect::mask(&rec.summary),
-                payload_text,
-                rec.status.as_str(),
-                rec.created_at,
-                rec.decided_at,
-                rec.decided_by,
-                rec.ttl_seconds,
-                rec.notify_channel,
-                rec.notify_chat_id,
-                rec.reminded_at,
-                simulation_text,
-                rec.request_kind.as_str(),
-                rec.binding.as_ref().map(|v| serde_json::to_string(v).unwrap()),
-                rec.answer.as_ref().map(Value::to_string),
-                rec.invalidated_reason.as_deref().map(duduclaw_security::credential_detect::mask),
-                rec.on_behalf_of,
-            ],
-        )
-        .map(|n| n == 1)
-        .map_err(|e| format!("insert approval: {e}"))
+        let result = (|| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| format!("begin approval insert: {e}"))?;
+            if if_absent {
+                let existing: Option<(String, String, Option<String>, String)> = tx.query_row(
+                    "SELECT agent_id, request_kind, binding_json, payload FROM approvals WHERE id=?1",
+                    [rec.id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                ).optional().map_err(|e| e.to_string())?;
+                if let Some((agent, kind, binding, payload)) = existing {
+                    // Verify the contract before recording another origin. An
+                    // unrelated keyed collision must not shield the real card.
+                    let same = agent == rec.agent_id && kind == rec.request_kind.as_str()
+                        && binding == rec.binding.as_ref().map(|v| serde_json::to_string(v).unwrap())
+                        && serde_json::from_str::<Value>(&payload).ok().as_ref() == Some(&rec.payload);
+                    if same {
+                        if let Some((session, turn)) = &origin {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO approval_turn_origins(approval_id, session_id, turn_id)
+                                 SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
+                                   SELECT 1 FROM cancelled_approval_turns WHERE session_id=?2 AND turn_id=?3)",
+                                params![rec.id.as_str(), session, turn],
+                            ).map_err(|e| e.to_string())?;
+                        } else {
+                            // A legitimate unscoped caller also owns this card;
+                            // no individual turn may withdraw its shared request.
+                            tx.execute("UPDATE approvals SET origin_session_id=NULL, origin_turn_id=NULL WHERE id=?1",
+                                [rec.id.as_str()]).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    tx.commit().map_err(|e| e.to_string())?;
+                    return Ok(false);
+                }
+            }
+            if let Some((session, turn)) = &origin {
+                let cancelled: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cancelled_approval_turns WHERE session_id=?1 AND turn_id=?2)",
+                    params![session, turn], |row| row.get(0),
+                ).map_err(|e| format!("check approval turn: {e}"))?;
+                if cancelled {
+                    return Err("approval turn was cancelled".into());
+                }
+            }
+            let inserted = tx.execute(
+                &sql,
+                params![
+                    rec.id.as_str(),
+                    rec.agent_id,
+                    rec.action_kind,
+                    duduclaw_security::credential_detect::mask(&rec.summary),
+                    payload_text,
+                    rec.status.as_str(),
+                    rec.created_at,
+                    rec.decided_at,
+                    rec.decided_by,
+                    rec.ttl_seconds,
+                    rec.notify_channel,
+                    rec.notify_chat_id,
+                    rec.reminded_at,
+                    simulation_text,
+                    rec.request_kind.as_str(),
+                    rec.binding.as_ref().map(|v| serde_json::to_string(v).unwrap()),
+                    rec.answer.as_ref().map(Value::to_string),
+                    rec.invalidated_reason.as_deref().map(duduclaw_security::credential_detect::mask),
+                    rec.on_behalf_of,
+                    origin.as_ref().map(|(session, _)| session),
+                    origin.as_ref().map(|(_, turn)| turn),
+                ],
+            )
+            .map(|n| n == 1)
+            .map_err(|e| format!("insert approval: {e}"))?;
+            if let Some((session, turn)) = &origin {
+                tx.execute(
+                    "INSERT OR IGNORE INTO approval_turn_origins(approval_id, session_id, turn_id) VALUES (?1, ?2, ?3)",
+                    params![rec.id.as_str(), session, turn],
+                ).map_err(|e| format!("insert approval origin: {e}"))?;
+            }
+            if inserted && quarantine_bus.is_some() {
+                Self::insert_quarantine_creation_event(&tx, rec)?;
+            }
+            tx.commit().map_err(|e| format!("commit approval insert: {e}"))?;
+            Ok::<_, String>(inserted)
+        })();
+        // Detach after both success and rollback, before reusing this connection.
+        if quarantine_bus.is_some() {
+            conn.execute_batch("DETACH DATABASE quarantine_live_events")
+                .map_err(|e| format!("detach quarantine event store: {e}"))?;
+        }
+        let inserted = result?;
+        drop(conn);
+        if inserted && quarantine_bus.is_none() {
+            self.emit_lifecycle("approval.created", rec, rec.status).await;
+        }
+        Ok(inserted)
     }
 
     /// WP20: record where the pending-approval push landed. Best-effort
@@ -242,6 +376,22 @@ impl ApprovalStore {
         Ok(n > 0)
     }
 
+    /// Fresh push authority without writable initialization or migrations.
+    pub(crate) fn get_readonly(home: &Path, id: &ApprovalId) -> Result<Option<ApprovalRecord>, String> {
+        let conn = crate::review_evidence::audience::readonly_db(&home.join("approvals.db"))?;
+        conn.query_row(
+            "SELECT id, agent_id, action_kind, summary, payload, status,
+                    created_at, decided_at, decided_by, ttl_seconds,
+                    notify_channel, notify_chat_id, reminded_at, simulation,
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+             FROM approvals WHERE id = ?1",
+            params![id.as_str()],
+            row_to_record,
+        )
+        .optional()
+        .map_err(|e| format!("get approval: {e}"))
+    }
+
     pub(super) async fn get(&self, id: &ApprovalId) -> Result<Option<ApprovalRecord>, String> {
         let conn = self.conn.lock().await;
         conn.query_row(
@@ -268,17 +418,46 @@ impl ApprovalStore {
         decided_by: &str,
         decided_at: &str,
     ) -> Result<usize, String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE approvals
-             SET status = ?1, decided_by = ?2, decided_at = ?3
-             WHERE id = ?4 AND status = 'pending'
-             AND (?1 NOT IN ('approved','denied','answered') OR
-                  (julianday(created_at) IS NOT NULL
-                   AND julianday(?3) < julianday(created_at) + ttl_seconds / 86400.0))",
-            params![status.as_str(), decided_by, decided_at, id.as_str()],
-        )
-        .map_err(|e| format!("decide approval: {e}"))
+        let (n, rec) = {
+            let mut conn = self.conn.lock().await;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| format!("begin approval decision: {e}"))?;
+            let rec = record_in_connection(&tx, id)?;
+            // Check inside the same write transaction as the decision: a
+            // concurrent privacy scrub cannot change the reviewed payload.
+            if let Some(rec) = &rec {
+                if status != ApprovalStatus::Expired {
+                    if rec.status != ApprovalStatus::Pending || rec.is_stale(Utc::now()) {
+                        return Ok(0);
+                    }
+                    check_expected_digest(rec)?;
+                }
+            }
+            let n = tx.execute(
+                &format!("UPDATE approvals
+                 SET status = ?1, decided_by = ?2, decided_at = ?3
+                 WHERE id = ?4 AND status = 'pending'
+                 AND {live_origin}
+                AND (?1 NOT IN ('approved','denied','answered') OR
+                      (julianday(created_at) IS NOT NULL
+                       AND julianday(?3) < julianday(created_at) + ttl_seconds / 86400.0))",
+                    live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
+                params![status.as_str(), decided_by, decided_at, id.as_str()],
+            ).map_err(|e| format!("decide approval: {e}"))?;
+            tx.commit().map_err(|e| format!("commit approval decision: {e}"))?;
+            (n, rec)
+        };
+        if n > 0 {
+            if let Some(rec) = rec {
+                let event = if status == ApprovalStatus::Expired {
+                    "approval.expired"
+                } else {
+                    "approval.decided"
+                };
+                self.emit_lifecycle(event, &rec, status).await;
+            }
+        }
+        Ok(n)
     }
 
     /// Every approval of one `action_kind`, any status (GDPR scrub).
@@ -417,3 +596,16 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
 }
 
 // ── Broker ──────────────────────────────────────────────────
+
+/// Read under the caller's transaction for an atomic expected-digest check.
+pub(super) fn record_in_connection(conn: &Connection, id: &ApprovalId) -> Result<Option<ApprovalRecord>, String> {
+    conn.query_row(
+        "SELECT id, agent_id, action_kind, summary, payload, status,
+                created_at, decided_at, decided_by, ttl_seconds,
+                notify_channel, notify_chat_id, reminded_at, simulation,
+                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+         FROM approvals WHERE id = ?1",
+        params![id.as_str()],
+        row_to_record,
+    ).optional().map_err(|e| format!("read approval for decision: {e}"))
+}

@@ -4,16 +4,16 @@
 use super::*;
 use duduclaw_auth::UserStatus;
 
-pub(super) const PRIVATE: &str = "private-task";
-pub(super) const OPEN: &str = "open-task";
+pub(in crate::handlers) const PRIVATE: &str = "private-task";
+pub(in crate::handlers) const OPEN: &str = "open-task";
 
-pub(super) struct Fixture {
-    pub(super) _home: tempfile::TempDir,
-    pub(super) home: PathBuf,
-    pub(super) handler: MethodHandler,
-    pub(super) db: UserDb,
-    pub(super) alice: UserContext,
-    pub(super) bob: UserContext,
+pub(in crate::handlers) struct Fixture {
+    pub(in crate::handlers) _home: tempfile::TempDir,
+    pub(in crate::handlers) home: PathBuf,
+    pub(in crate::handlers) handler: MethodHandler,
+    pub(in crate::handlers) db: UserDb,
+    pub(in crate::handlers) alice: UserContext,
+    pub(in crate::handlers) bob: UserContext,
 }
 
 fn cached(user: &duduclaw_auth::User, level: AccessLevel) -> UserContext {
@@ -25,7 +25,7 @@ fn cached(user: &duduclaw_auth::User, level: AccessLevel) -> UserContext {
     ctx
 }
 
-pub(super) async fn fixture() -> Fixture {
+pub(in crate::handlers) async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
     std::fs::create_dir_all(home.join("agents/sales")).unwrap();
@@ -93,14 +93,14 @@ pub(super) async fn fixture() -> Fixture {
     }
 }
 
-pub(super) fn denied(frame: &WsFrame) -> bool {
+pub(in crate::handlers) fn denied(frame: &WsFrame) -> bool {
     matches!(frame, WsFrame::Response { ok: false, payload: None, error: Some(e), .. }
         if e == PERMISSION_DENIED)
 }
-pub(super) fn ok(frame: &WsFrame) -> bool {
+pub(in crate::handlers) fn ok(frame: &WsFrame) -> bool {
     matches!(frame, WsFrame::Response { ok: true, .. })
 }
-pub(super) fn payload(frame: WsFrame) -> Value {
+pub(in crate::handlers) fn payload(frame: WsFrame) -> Value {
     match frame {
         WsFrame::Response {
             payload: Some(p), ..
@@ -339,7 +339,7 @@ async fn timeline_forward_and_approval_cards_follow_the_task_gate() {
 
 // ── F3 follow-up: AI-written audiences cannot lock out admins or people ──
 
-pub(super) fn set_packet(f: &Fixture, raw: &str) {
+pub(in crate::handlers) fn set_packet(f: &Fixture, raw: &str) {
     let dir = f
         .home
         .join(duduclaw_core::task_packet::TEAM_PACKETS_DIR)
@@ -347,7 +347,7 @@ pub(super) fn set_packet(f: &Fixture, raw: &str) {
         .join("1");
     std::fs::write(dir.join("p.json"), raw).unwrap();
 }
-pub(super) fn packet_with(audience: &[&str]) -> String {
+pub(in crate::handlers) fn packet_with(audience: &[&str]) -> String {
     json!({
         "packet_id": "p", "goal_id": PRIVATE, "round": 1,
         "from_role": "executor", "to_role": "verifier",
@@ -356,7 +356,7 @@ pub(super) fn packet_with(audience: &[&str]) -> String {
     })
     .to_string()
 }
-pub(super) fn admin(f: &Fixture) -> UserContext {
+pub(in crate::handlers) fn admin(f: &Fixture) -> UserContext {
     let u =
         f.db.create_user(
             "root@test.invalid",
@@ -531,4 +531,53 @@ async fn admin_decides_a_private_needs_human_task_on_the_dashboard() {
         store.get_task(PRIVATE).await.unwrap().unwrap().status,
         "needs_human"
     );
+}
+
+#[tokio::test]
+async fn machine_preset_revokes_old_owner_reads_without_deleting_bindings() {
+    let f = fixture().await;
+    let root = admin(&f);
+    f.db.bind_agent(&f.alice.user_id, "sales", AccessLevel::Owner).unwrap();
+    f.db.bind_agent(&f.alice.user_id, "ordinary", AccessLevel::Owner).unwrap();
+    std::fs::create_dir_all(f.home.join("agents/ordinary")).unwrap();
+    let connection = f.db.live_user_context(&f.alice.user_id).unwrap().unwrap();
+    let read = || f.handler.handle_tasks_comments(json!({"task_id":OPEN}), &connection);
+    assert!(ok(&read().await));
+    assert!(ok(&f.handler.handle("chat.sessions.list", json!({"agent_id":"sales"}), &connection).await));
+    let history = super::bound_history_rpc::live_bound_reader(&f.home, &connection).unwrap();
+    assert!(crate::history_privacy::mode(&f.home, &history, "sales").is_ok());
+    duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+    duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+        "system-operator", "test", "test").unwrap();
+    assert!(denied(&read().await));
+    assert!(denied(&f.handler.handle("chat.sessions.list", json!({"agent_id":"sales"}), &connection).await));
+    assert!(ok(&f.handler.handle("chat.sessions.list", json!({"agent_id":"ordinary"}), &connection).await));
+    let history = super::bound_history_rpc::live_bound_reader(&f.home, &connection).unwrap();
+    assert!(crate::history_privacy::mode(&f.home, &history, "sales").is_err());
+    assert!(crate::history_privacy::mode(&f.home, &history, "ordinary").is_ok());
+    let inspect = f.handler.handle("agents.inspect", json!({"agent_id":"sales"}), &connection).await;
+    assert!(denied(&inspect));
+    assert!(ok(&f.handler.handle_tasks_comments(json!({"task_id":OPEN}), &root).await));
+    assert!(ok(&f.handler.handle("chat.sessions.list", json!({"agent_id":"sales"}), &root).await));
+    let history = super::bound_history_rpc::live_bound_reader(&f.home, &root).unwrap();
+    assert!(crate::history_privacy::mode(&f.home, &history, "sales").is_ok());
+    let stored = f.db.live_user_context(&connection.user_id).unwrap().unwrap();
+    assert_eq!(stored.agent_access.get("sales"), Some(&AccessLevel::Owner));
+}
+
+#[tokio::test]
+async fn machine_preset_removes_manager_monitoring_grants() {
+    let f = fixture().await;
+    let mut manager = f.bob.clone();
+    manager.agent_access.clear();
+    manager.team_access.insert("sales".into(), duduclaw_auth::org::TeamGrant {
+        level: AccessLevel::Operator, via_user: f.alice.user_id.clone(), depth: 1,
+    });
+    assert!(super::team_visibility::may_monitor(&manager, "sales"));
+    duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+    duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+        "system-operator", "test", "test").unwrap();
+    let live = crate::machine_employee::without_restricted_access(&f.home, manager.clone());
+    assert!(!super::team_visibility::may_monitor(&live, "sales"));
+    assert!(manager.team_access.contains_key("sales"));
 }

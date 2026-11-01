@@ -19,10 +19,12 @@ pub fn owners(home: &Path, agent: &str) -> Result<Vec<String>, String> {
     let Some(db) = crate::decision_notify::open_user_db(home)? else {
         return Ok(Vec::new());
     };
+    let restricted = crate::machine_employee::requires_admin_for_id(home, agent);
     let mut recipients = Vec::new();
     for binding in db.get_agent_users(agent)? {
         if binding.access_level != AccessLevel::Owner { continue; }
-        if !db.get_user(&binding.user_id)?.is_some_and(|user| user.status == UserStatus::Active) {
+        if !db.get_user(&binding.user_id)?.is_some_and(|user| user.status == UserStatus::Active
+            && (!restricted || user.role == duduclaw_auth::UserRole::Admin)) {
             continue;
         }
         for identity in db.verified_channels_for_user(&binding.user_id)? {
@@ -312,4 +314,35 @@ recipient_guard = "ask"
         assert!(scheduled_agent(&empty, "default").await.is_err());
     }
 
+}
+
+#[cfg(test)]
+mod restricted_owner_tests {
+    use super::*;
+    use duduclaw_auth::{UserDb, UserRole};
+
+    #[test]
+    fn only_admin_owners_remain_trusted_while_the_preset_is_bound() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("agents/sales")).unwrap();
+        std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
+        let db = UserDb::new(&h.join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.invalid", "Admin", "fixture-password", UserRole::Admin).unwrap();
+        let employee = db.create_user("owner@test.invalid", "Owner", "fixture-password", UserRole::Employee).unwrap();
+        for (user, channel_id) in [(&admin, "admin"), (&employee, "old-owner")] {
+            db.bind_agent(&user.id, "sales", AccessLevel::Owner).unwrap();
+            db.bind_channel_identity(&user.id, "line", channel_id, true).unwrap();
+        }
+        let before = owners(h, "sales").unwrap();
+        assert_eq!(before, ["line:admin", "line:old-owner"]);
+        assert_eq!(scheduled_decision(h, "sales", &["line:old-owner".into()]).unwrap(), Decision::Allow);
+        duduclaw_core::preset::install_system_operator_preset(h, false).unwrap();
+        duduclaw_core::preset::bind(h, "sales", &h.join("agents/sales"), "system-operator", "test", "test").unwrap();
+        assert_eq!(owners(h, "sales").unwrap(), ["line:admin"]);
+        assert_eq!(scheduled_decision(h, "sales", &["line:old-owner".into()]).unwrap(), Decision::Ask);
+        assert_eq!(scheduled_decision(h, "sales", &["line:admin".into()]).unwrap(), Decision::Allow);
+        duduclaw_core::preset::unbind(h, "sales", "test", "test").unwrap();
+        assert_eq!(owners(h, "sales").unwrap(), before);
+    }
 }

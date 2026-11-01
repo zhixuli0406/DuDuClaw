@@ -665,10 +665,42 @@ fn fatal_dispatch_refusal(error: &TeamConfigError) -> bool {
 
 /// Check before inserting a goal so a refusal cannot leave an orphan task.
 pub(crate) fn check_team_dispatchable(home_dir: &Path, agent_id: &str) -> Result<(), String> {
+    check_team_dispatchable_inner(home_dir, agent_id, None)
+}
+
+/// A candidate refused before freezing still needs the same task-scoped audit.
+pub(crate) fn check_team_dispatchable_for_task(
+    home_dir: &Path, agent_id: &str, task_id: &str,
+) -> Result<(), String> {
+    check_team_dispatchable_inner(home_dir, agent_id, Some(task_id))
+}
+
+fn check_team_dispatchable_inner(
+    home_dir: &Path, agent_id: &str, task_id: Option<&str>,
+) -> Result<(), String> {
     match resolve_team(home_dir, agent_id).result {
-        Err(error) if fatal_dispatch_refusal(&error) => Err(error.to_string()),
+        Err(error) if fatal_dispatch_refusal(&error) => {
+            if let Some(task_id) = task_id {
+                audit_team_refusal(home_dir, task_id, agent_id, &error);
+            }
+            Err(error.to_string())
+        }
         _ => Ok(()),
     }
+}
+
+fn audit_team_refusal(home_dir: &Path, task_id: &str, agent_id: &str, error: &TeamConfigError) {
+    audit_team_event(
+        home_dir,
+        AUDIT_TEAM_REFUSED,
+        agent_id,
+        serde_json::json!({
+            "task_id": task_id,
+            "code": error.code(),
+            "role": error.role().map(|r| r.as_str()),
+            "detail": error.to_string(),
+        }),
+    );
 }
 
 /// What [`freeze_for_task`] did.
@@ -785,17 +817,7 @@ pub async fn freeze_for_task(
                 );
                 return FreezeOutcome::SoloByDefault { code: err.code() };
             }
-            audit_team_event(
-                home_dir,
-                AUDIT_TEAM_REFUSED,
-                agent_id,
-                serde_json::json!({
-                    "task_id": task_id,
-                    "code": err.code(),
-                    "role": err.role().map(|r| r.as_str()),
-                    "detail": err.to_string(),
-                }),
-            );
+            audit_team_refusal(home_dir, task_id, agent_id, &err);
             warn!(
                 task = %task_id, agent = %agent_id, code = err.code(),
                 "team refused: {err}"
@@ -1728,9 +1750,30 @@ pub struct TeamRoundContext<'a> {
 /// returns, on every path including the error ones — immediate GC, design
 /// §3.8 fix ①.
 pub async fn run_team_round(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
+    let callers: Vec<String> = crate::autonomous_runtime::task_caller(ctx.home_dir, ctx.task).into_iter().collect();
+    crate::autonomous_runtime::scope(ctx.home_dir, &ctx.task.assigned_to, &callers, async {
+        match crate::autonomous_runtime::check_current().await {
+            Ok(()) => (),
+            Err(reason) => return TeamRoundOutcome::NeedsHuman {
+                reason, pause: crate::pause_reason::PauseReason::OperatorPaused,
+            },
+        }
+        run_team_round_inner(ctx).await
+    }).await
+}
+
+async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
     let home = ctx.home_dir;
     let task = ctx.task;
     let agent_id = task.assigned_to.trim().to_string();
+    if let Err(pause) = duduclaw_core::autonomy_gate::check(
+        home, &agent_id, duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+    ) {
+        return TeamRoundOutcome::NeedsHuman {
+            reason: pause.to_string(), pause: crate::pause_reason::PauseReason::OperatorPaused,
+        };
+    }
+
     // Review finding 1: the round's own start, taken BEFORE any member runs.
     // `tasks.claimed_at` used to stand in for this and is structurally `None`
     // on the team path (`goal_loop::try_team_dispatch` completes the task as
@@ -3310,6 +3353,10 @@ async fn admit_and_wait_role_member(
                 ticket_id,
             };
             loop {
+                duduclaw_core::autonomy_gate::check(
+                    home_dir, &spec.parent_agent,
+                    duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+                ).map_err(|pause| pause.to_string())?;
                 match duduclaw_core::spawn_admission::role_member_ticket_status(
                     home_dir,
                     &ticket.ticket_id,
@@ -3364,6 +3411,9 @@ async fn run_member(
     // those packets can still become the round's product.
     artifact_verdicts: &mut PacketVerdicts,
 ) -> Result<(), String> {
+    duduclaw_core::autonomy_gate::check(
+        home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+    ).map_err(|pause| pause.to_string())?;
     let model = match resolve_member_model(home_dir, agent_id, role, frozen) {
         Some(m) => m,
         None => {
@@ -3581,7 +3631,13 @@ async fn run_member(
     let usage_slot: Arc<std::sync::Mutex<RoleTurnUsage>> =
         Arc::new(std::sync::Mutex::new(RoleTurnUsage::default()));
     let window_start = chrono::Utc::now().to_rfc3339();
-    let dispatched = crate::runtime::RUNTIME_OUTCOME
+    let callers: Vec<String> = crate::autonomous_runtime::task_caller(home_dir, task).into_iter().collect();
+    let dispatched = crate::autonomous_runtime::scope(home_dir, agent_id, &callers, async {
+        match duduclaw_core::autonomy_gate::check(
+        home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+    ) {
+        Err(pause) => Err(pause.to_string()),
+        Ok(()) => crate::runtime::RUNTIME_OUTCOME
         .scope(
             Arc::clone(&outcome_slot),
             crate::runtime::ROLE_COST_ATTRIBUTION.scope(
@@ -3604,7 +3660,9 @@ async fn run_member(
                 ),
             ),
         )
-        .await;
+        .await,
+        }
+    }).await;
     let window_end = chrono::Utc::now().to_rfc3339();
     let runtime_outcome = outcome_slot.lock().ok().and_then(|g| g.clone());
     let observed_usage = usage_slot.lock().map(|g| *g).unwrap_or_default();
@@ -4580,7 +4638,11 @@ async fn run_verifier(
         ..Default::default()
     };
     let prompt = build_verifier_prompt(home_dir, task, round, products, round_started_at, verdicts);
-    let raw = crate::runtime_dispatch::run_utility_prompt_with_hint(
+    duduclaw_core::autonomy_gate::check(
+        home_dir, &task.assigned_to, duduclaw_core::autonomy_gate::AutonomyPath::GoalRound,
+    ).map_err(|pause| pause.to_string())?;
+    let callers = crate::autonomous_runtime::task_caller(home_dir, task).into_iter().collect::<Vec<_>>();
+    let raw = crate::autonomous_runtime::scope(home_dir, &task.assigned_to, &callers, crate::runtime_dispatch::run_utility_prompt_with_hint(
         home_dir,
         None,
         "team-verifier",
@@ -4588,7 +4650,7 @@ async fn run_verifier(
         &prompt,
         crate::runtime_dispatch::UTILITY_MAX_TOKENS,
         Some(&hint),
-    )
+    ))
     .await?;
     Ok(parse_team_verifier_reply(&raw))
 }
@@ -8394,4 +8456,15 @@ skill_security_scan = false
             "the temp file must be renamed away, not left behind"
         );
     }
+    #[tokio::test]
+    async fn paused_team_verifier_refuses_before_runtime_call() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some("agnes"), "test", "operator").unwrap();
+        let result = run_verifier(
+            home.path(), &task("paused-verifier"), 1, &spec().verifier,
+            &[], "2026-10-29T00:00:00Z", &PacketVerdicts::new(),
+        ).await;
+        assert!(result.unwrap_err().contains("agent_pause"));
+    }
+
 }

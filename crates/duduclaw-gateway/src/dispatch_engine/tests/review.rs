@@ -359,6 +359,7 @@ use super::*;
 
         let store = Arc::new(TaskStore::open(dir.path()).unwrap());
         store.insert_task(&pending_goal("cf-ground")).await.unwrap();
+        ensure_autonomy_agent(&store, "w");
         store
             .atomic_claim(
                 "cf-ground",
@@ -422,6 +423,7 @@ use super::*;
 
         let store = Arc::new(TaskStore::open(dir.path()).unwrap());
         store.insert_task(&pending_goal("cf-echo")).await.unwrap();
+        ensure_autonomy_agent(&store, "w");
         store
             .atomic_claim(
                 "cf-echo",
@@ -459,3 +461,77 @@ use super::*;
         );
     }
 
+
+#[tokio::test]
+async fn autonomy_pause_review_parks_without_judge_and_resume_allows_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+    seed_review(&store, "autonomy-review").await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let judge = CountingJudge {
+        calls: calls.clone(),
+        verdict: AcceptanceVerdict { passed: true, feedback: "pass".into(), aspects: None },
+    };
+    let engine = DispatchEngine::new(store.clone(), Some(Arc::new(judge)))
+        .with_home_dir(dir.path().to_path_buf());
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), Some("w"), "pause", "op").unwrap();
+    engine.review_goal_tasks().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let task = store.get_task("autonomy-review").await.unwrap().unwrap();
+    assert_eq!(task.status, "needs_human");
+    assert_eq!(task.pause_reason.as_deref(), Some("operator_paused"));
+    duduclaw_core::autonomy_gate::resume(dir.path(), Some("w")).unwrap();
+    store.resolve_needs_human(&task.id, "retry", "resume").await.unwrap();
+    assert!(store.atomic_claim(&task.id, "w", "2026-10-28T00:00:00Z", "2099-01-01T00:00:00Z")
+        .await.unwrap().is_claimed());
+    store.complete_task(&task.id, "finished", "w").await.unwrap();
+    engine.review_goal_tasks().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().status, "done");
+}
+
+#[tokio::test]
+async fn paused_review_never_starts_evaluator_or_mav() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+    seed_review(&store, "paused-evaluator").await;
+    let (judge, judge_calls) = accepting_counting_judge();
+    let evaluator = StubPreEvaluator::new(Ok(pre_eval(PreDecision::CandidateComplete, None)));
+    let engine = DispatchEngine::new(store.clone(), Some(judge))
+        .with_home_dir(dir.path().to_path_buf()).with_evaluator(evaluator.clone());
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), Some("w"), "test", "operator").unwrap();
+    engine.tick_once().await.unwrap();
+    assert_eq!(evaluator.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.get_task("paused-evaluator").await.unwrap().unwrap().status, "needs_human");
+}
+
+#[tokio::test]
+async fn pause_after_evaluator_prevents_the_next_judge_stage() {
+    struct PausingEvaluator(std::path::PathBuf);
+    #[async_trait]
+    impl PreAcceptanceEvaluator for PausingEvaluator {
+        async fn evaluate(&self, _: &str, _: &str, _: &str) -> Result<PreEvaluation, String> {
+            duduclaw_core::autonomy_handoff::admit().await?.handed_off();
+            let paused = tokio::time::timeout(std::time::Duration::from_secs(1),
+                duduclaw_core::autonomy_gate::mutate_async(&self.0, Some("w"), Some(
+                    duduclaw_core::autonomy_gate::PauseEntry {
+                        reason: "test".into(), who: "operator".into(), at: chrono::Utc::now().to_rfc3339(),
+                    },
+                )),
+            ).await.expect("review callback kept its admission after handoff");
+            assert!(matches!(paused, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+            Ok(pre_eval(PreDecision::CandidateComplete, None))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+    seed_review(&store, "pause-between-stages").await;
+    let (judge, judge_calls) = accepting_counting_judge();
+    let evaluator = Arc::new(PausingEvaluator(dir.path().to_path_buf()));
+    let engine = DispatchEngine::new(store.clone(), Some(judge))
+        .with_home_dir(dir.path().to_path_buf()).with_evaluator(evaluator);
+    engine.tick_once().await.unwrap();
+    assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.get_task("pause-between-stages").await.unwrap().unwrap().status, "needs_human");
+}

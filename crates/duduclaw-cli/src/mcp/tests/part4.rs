@@ -76,7 +76,8 @@ skill_security_scan = false
         "name": "hire",
         "display_name": "新進",
     });
-    let res = handle_create_agent(&params, home, "dashboard").await;
+    let res = with_background_caller(RecordActor::Operator("dashboard"),
+        handle_create_agent(&params, home, "dashboard")).await;
     assert_ne!(res["isError"], true, "{res}");
 
     let path = home.join("agents").join("hire").join("agent.toml");
@@ -590,4 +591,50 @@ async fn f2_spawn_rejects_archived_agent() {
         !home.join("bus_queue.jsonl").exists(),
         "a rejected spawn must not enqueue a bus task"
     );
+}
+
+#[tokio::test]
+async fn agent_update_stop_with_background_edits_always_drains_admissions() {
+    for initial_status in ["active", "paused"] {
+        let tmp = delegation_home();
+        let home = tmp.path();
+        let path = home.join("agents/sales-rep/agent.toml");
+        let mut table: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        table.get_mut("agent").unwrap().as_table_mut().unwrap()
+            .insert("status".into(), toml::Value::String(initial_status.into()));
+        fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let org_before = fs::read(home.join("org.toml")).ok();
+        let shared = duduclaw_core::autonomy_gate::admit(
+            home, "sales-lead", duduclaw_core::autonomy_gate::AutonomyPath::Background,
+        ).await.unwrap();
+        let worker_home = home.to_path_buf();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut writer = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            // Keep reparenting within the caller's subtree so the request
+            // reaches the lifecycle barrier instead of the placement refusal.
+            runtime.block_on(handle_agent_update(&serde_json::json!({
+                "agent_id": "sales-rep", "status": "paused",
+                "heartbeat_enabled": true, "reports_to": "sales-rep2",
+            }), &worker_home, "sales-lead"))
+        });
+        started_rx.await.unwrap();
+        let waiting = tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer).await;
+        assert!(waiting.is_err(), "stop completed before admission drained ({initial_status}): {waiting:?}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(home.join("org.toml")).ok(), org_before);
+        drop(shared);
+        let result = writer.await.unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(after["agent"]["status"].as_str(), Some("paused"));
+        assert_eq!(after["heartbeat"]["enabled"].as_bool(), Some(true));
+        assert_eq!(after["agent"]["reports_to"].as_str(), Some("sales-rep2"));
+        assert_eq!(
+            duduclaw_core::org_store::load(home).get("sales-rep").unwrap().reports_to,
+            "sales-rep2",
+        );
+    }
 }

@@ -16,7 +16,7 @@ fn dispatch_future_sizes() {
     // JSONL spawns each run separately; its poll future is already small.
     let sizes = [
         ("dispatch.outcome", std::mem::size_of_val(&dispatch_to_agent_outcome(
-            home.path(), &registry, "prod-shaped", "wake", &delegation,
+            home.path(), &registry, "prod-shaped", "wake", &delegation, None,
         )), 24 * 1024),
         ("dispatch.jsonl", std::mem::size_of_val(&poll_and_dispatch(
             home.path(), &registry, None, None,

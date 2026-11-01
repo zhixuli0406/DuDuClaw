@@ -56,7 +56,7 @@ fn init_message_queue_schema(home: &std::path::Path) {
     .expect("init message_queue schema");
 }
 
-fn create_test_agent(agents_dir: &std::path::Path, name: &str, reports_to: &str) {
+pub(super) fn create_test_agent(agents_dir: &std::path::Path, name: &str, reports_to: &str) {
     create_test_agent_in_dept(agents_dir, name, reports_to, "");
 }
 
@@ -298,11 +298,7 @@ fn set_agent_status(agents_dir: &std::path::Path, name: &str, status: &str) {
 /// Like `create_test_agent` but with a restricted `allowed_tools` list
 /// (edits the empty allowlist inside the fixture's existing
 /// `[capabilities]` section).
-fn create_test_agent_with_caps(
-    agents_dir: &std::path::Path,
-    name: &str,
-    allowed_tools: &[&str],
-) {
+fn create_test_agent_with_caps(agents_dir: &std::path::Path, name: &str, allowed_tools: &[&str]) {
     create_test_agent(agents_dir, name, "");
     let toml_path = agents_dir.join(name).join("agent.toml");
     let content = fs::read_to_string(&toml_path).unwrap();

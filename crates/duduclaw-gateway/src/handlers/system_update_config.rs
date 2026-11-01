@@ -38,6 +38,19 @@ impl MethodHandler {
             }
         };
         let mut changes: Vec<String> = Vec::new();
+        if let Some(value) = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))) {
+            if let Err(e) = self.mfa_require_current_admin(ctx).await {
+                return WsFrame::error_response("", &e);
+            }
+            let Some(value) = value.as_bool() else {
+                return WsFrame::error_response("", "雙因素驗證設定必須是布林值。");
+            };
+            let Some(auth) = table.entry("auth").or_insert_with(||toml::Value::Table(toml::Table::new())).as_table_mut() else {
+                return WsFrame::error_response("", "登入設定格式不正確。");
+            };
+            auth.insert("mfa_enforced".into(), toml::Value::Boolean(value));
+            changes.push(format!("auth.mfa_enforced = {value}"));
+        }
         let mut restart_required: Vec<String> = Vec::new();
         // Cleaned remote-access allowlist to hot-apply AFTER a successful write
         // (Some(..) iff the payload carried `allowed_origins`).
@@ -932,9 +945,32 @@ impl MethodHandler {
 
         // Atomic write (temp + rename) under the cross-process config lock,
         // refused when another writer changed the file since it was read.
-        if let Err(e) =
-            super::config_commit::commit_table_locked(&config_path, original_hash, &table).await
-        {
+        let security_change = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))).is_some();
+        let db = self.user_db.read().await.clone();
+        let actor = ctx.user_id.clone();
+        let config_path_for_guard = config_path.clone();
+        let expected_state = params.get("expected_state").and_then(Value::as_bool);
+        let guard = move || {
+                if security_change {
+                    crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?;
+                    let expected = expected_state
+                        .ok_or("請重新整理並確認目前的雙因素驗證設定。")?;
+                    // This read is inside the config lock, after the file hash CAS.
+                    let current = super::config_commit::read_text_or_empty(&config_path_for_guard)?;
+                    let current: toml::Table = current.parse().map_err(|_| "登入設定格式不正確。")?;
+                    let actual = super::config_commit::toml_at(&current, "auth.mfa_enforced")
+                        .map(|v| v.as_bool().ok_or("雙因素驗證設定必須是布林值。"))
+                        .transpose()?.unwrap_or(false);
+                    if actual != expected { return Err("雙因素驗證設定已變更，請重新整理後再確認。".into()); }
+                }
+                Ok(())
+            };
+        let result = if security_change {
+            super::config_commit::commit_mfa_table_locked_with_guard(&config_path, original_hash, &table, ctx.user_id.clone(), guard).await
+        } else {
+            super::config_commit::commit_table_locked_with_guard(&config_path, original_hash, &table, guard).await
+        };
+        if let Err(e) = result {
             return WsFrame::error_response("", &e);
         }
 

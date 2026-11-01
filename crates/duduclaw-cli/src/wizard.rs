@@ -260,7 +260,7 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
             .map_err(DuDuClawError::Agent)?;
         // Patch the copied template with wizard inputs
         patch_agent_toml(
-            &agent_toml_path,
+            home,
             &agent_name,
             &company_name,
             channel_name,
@@ -579,56 +579,46 @@ async fn copy_template_files(src: &Path, dst: &Path) -> Result<()> {
 
 /// Patch an existing agent.toml with wizard-provided values.
 async fn patch_agent_toml(
-    path: &Path,
+    home: &Path,
     agent_name: &str,
     company_name: &str,
     channel: &str,
     features: &[&str],
 ) -> Result<()> {
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to read agent.toml: {e}")))?;
+    duduclaw_gateway::agent_files::external::edit_agent_toml(
+        home, agent_name, "wizard", "local-cli", |doc| {
+            // Patch [agent] section
+            if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
+                agent_table.insert("name".into(), toml::Value::String(agent_name.into()));
+                agent_table.insert(
+                    "display_name".into(),
+                    toml::Value::String(format!("{company_name} Assistant")),
+                );
+            }
 
-    let mut doc: toml::Value = content.parse().map_err(|e: toml::de::Error| {
-        DuDuClawError::Agent(format!("Failed to parse agent.toml: {e}"))
-    })?;
+            // Patch [permissions].allowed_channels
+            let channel_lower = channel.to_lowercase();
+            if let Some(perms) = doc.get_mut("permissions").and_then(|v| v.as_table_mut()) {
+                perms.insert(
+                    "allowed_channels".into(),
+                    toml::Value::Array(vec![toml::Value::String(channel_lower)]),
+                );
+            }
 
-    // Patch [agent] section
-    if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
-        agent_table.insert("name".into(), toml::Value::String(agent_name.into()));
-        agent_table.insert(
-            "display_name".into(),
-            toml::Value::String(format!("{company_name} Assistant")),
-        );
-    }
+            // Add features as a custom field for reference
+            if !features.is_empty()
+                && let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut())
+            {
+                let feat_array: Vec<toml::Value> = features
+                    .iter()
+                    .map(|f| toml::Value::String(f.to_string()))
+                    .collect();
+                agent_table.insert("features".into(), toml::Value::Array(feat_array));
+            }
 
-    // Patch [permissions].allowed_channels
-    let channel_lower = channel.to_lowercase();
-    if let Some(perms) = doc.get_mut("permissions").and_then(|v| v.as_table_mut()) {
-        perms.insert(
-            "allowed_channels".into(),
-            toml::Value::Array(vec![toml::Value::String(channel_lower)]),
-        );
-    }
-
-    // Add features as a custom field for reference
-    if !features.is_empty()
-        && let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut())
-    {
-        let feat_array: Vec<toml::Value> = features
-            .iter()
-            .map(|f| toml::Value::String(f.to_string()))
-            .collect();
-        agent_table.insert("features".into(), toml::Value::Array(feat_array));
-    }
-
-    let serialized = toml::to_string_pretty(&doc)
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to serialize agent.toml: {e}")))?;
-
-    tokio::fs::write(path, serialized)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
-
+            Ok(())
+        },
+    ).map_err(DuDuClawError::Agent)?;
     Ok(())
 }
 
@@ -797,6 +787,22 @@ max_tool_calls_per_turn = 5
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wizard_patch_preserves_lifecycle_and_unrelated_fields() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("agents/a1/agent.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# keep\n[agent]\nname='template'\nstatus='archived'\n[permissions]\nallowed_channels=[]\n").unwrap();
+        patch_agent_toml(home.path(), "a1", "Example", "WebChat", &["sales"]).await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("# keep"));
+        let table: toml::Table = text.parse().unwrap();
+        assert_eq!(table["agent"]["status"].as_str(), Some("archived"));
+        assert_eq!(table["agent"]["name"].as_str(), Some("a1"));
+        assert_eq!(table["agent"]["display_name"].as_str(), Some("Example Assistant"));
+        assert_eq!(table["permissions"]["allowed_channels"][0].as_str(), Some("webchat"));
+    }
 
     #[test]
     fn test_derive_agent_name_simple() {

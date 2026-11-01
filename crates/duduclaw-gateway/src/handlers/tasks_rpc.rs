@@ -27,12 +27,18 @@ impl MethodHandler {
 
     /// Broadcast an event via the injected event_tx (best-effort, no error on failure).
     pub(crate) async fn broadcast_event(&self, event: &str, payload: Value) {
+        // Both the direct RPC and events.db paths carry the same compact
+        // task invalidation. A dashboard must refetch through task privacy.
+        let payload = if matches!(event, "task.created" | "task.updated") {
+            json!({"id": payload.get("id"), "assigned_to": payload.get("assigned_to"), "status": payload.get("status")})
+        } else { payload };
         if let Some(tx) = self.event_tx.read().await.as_ref() {
             let frame = WsFrame::Event {
                 event: event.to_string(),
                 payload,
                 seq: None,
                 state_version: None,
+                boot_id: None,
             };
             let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
         }

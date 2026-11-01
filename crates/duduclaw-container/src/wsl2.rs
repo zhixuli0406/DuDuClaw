@@ -113,11 +113,25 @@ impl Wsl2Runtime {
     /// Execute a command inside the configured WSL2 distro and return stdout.
     #[cfg(target_os = "windows")]
     async fn wsl_exec(&self, args: &[&str]) -> Result<String> {
-        let output = tokio::process::Command::new(&self.wsl_binary)
+        self.wsl_exec_inner(args, false).await
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn wsl_exec_inner(&self, args: &[&str], admit_start: bool) -> Result<String> {
+        let mut command = tokio::process::Command::new(&self.wsl_binary);
+        command
             .args(distro_exec_args(&self.distro))
             .args(args)
-            .output()
-            .await
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let admission = if admit_start {
+            Some(duduclaw_core::autonomy_handoff::admit().await
+                .map_err(DuDuClawError::Container)?)
+        } else { None };
+        let child = command.spawn()
+            .map_err(|e| DuDuClawError::Container(format!("WSL exec failed: {}", e)))?;
+        if let Some(admission) = admission { admission.handed_off(); }
+        let output = child.wait_with_output().await
             .map_err(|e| DuDuClawError::Container(format!("WSL exec failed: {}", e)))?;
 
         if !output.status.success() {
@@ -259,7 +273,7 @@ impl ContainerRuntime for Wsl2Runtime {
     async fn start(&self, id: &ContainerId) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            self.wsl_exec(&["docker", "start", &id.0]).await?;
+            self.wsl_exec_inner(&["docker", "start", &id.0], true).await?;
             info!(id = %id.0, "WSL2 container started");
             Ok(())
         }

@@ -158,6 +158,9 @@ pub(crate) async fn handle_tasks_create(
 ) -> Value {
     // The one identity this call acts as: checked by every gate and stamped
     // as `created_by` / activity author.
+    if let Err(reason) = check_background_caller(home_dir, actor, "tasks_create") {
+        return tool_error(&reason);
+    }
     let default_agent = actor.id();
     if let Err(reason) = check_actor_identity(home_dir, actor, "", "tasks_create") {
         return tool_error(&reason);
@@ -372,15 +375,32 @@ pub(crate) async fn handle_tasks_create(
             parent_task_id: parent_task_id.clone(),
             source_label: String::new(),
             // Created while working for a person: the goal is theirs too.
-            created_via: on_behalf_of.as_ref().map(|_| "agent".to_string()),
+            created_via: matches!(actor, RecordActor::Agent(_)).then(|| "agent".to_string()),
             on_behalf_of: on_behalf_of.clone(),
             ..Default::default()
         };
-        return match duduclaw_gateway::goal_create_core::create_goal_task(home_dir, &store, req)
-            .await
+        let admission_home = home_dir.to_path_buf();
+        let admission_agent = actor.agent().map(str::to_owned);
+        let admission = Box::pin(async move {
+            let actor = match admission_agent.as_deref() {
+                Some(agent) => RecordActor::Agent(agent),
+                None => RecordActor::Operator("operator"),
+            };
+            admit_background_caller(&admission_home, actor, "tasks_create").await
+        });
+        return match duduclaw_gateway::goal_create_core::create_goal_task_with_admission(
+            home_dir, &store, req, admission,
+        ).await
         {
             Ok(created) => {
-                append_bus_event(home_dir, "task.created", &task_row_to_json(&created.task)).await;
+                // The goal already exists. A pause here suppresses only its
+                // best-effort wake event, never reports a retryable create failure.
+                match admit_background_caller(home_dir, actor, "tasks_create").await {
+                    Ok(_admission) => {
+                        append_bus_event(home_dir, "task.created", &task_row_to_json(&created.task)).await;
+                    }
+                    Err(_) => tracing::debug!("goal wake event suppressed by autonomy admission"),
+                }
                 tool_text(
                     &serde_json::json!({
                         "task": task_row_to_json(&created.task),
@@ -417,7 +437,7 @@ pub(crate) async fn handle_tasks_create(
                     "notify_thread_id": args.get("notify_thread_id"),
                     "cron_timezone": args.get("cron_timezone"),
                 });
-                handle_schedule_task(&synth, home_dir, default_agent).await
+                handle_schedule_task_for_actor(&synth, home_dir, actor).await
             }
             crate::mcp_alias::ScheduleSpec::Once(at) => {
                 // The one-shot rail needs somewhere to deliver the result —
@@ -472,7 +492,7 @@ pub(crate) async fn handle_tasks_create(
     );
     row.tags = tags;
     row.parent_task_id = parent_task_id;
-    row.created_via = on_behalf_of.as_ref().map(|_| "agent".to_string());
+    row.created_via = matches!(actor, RecordActor::Agent(_)).then(|| "agent".to_string());
     row.on_behalf_of = on_behalf_of;
 
     // G1 durable dispatch options. `depends_on` accepts a JSON array or a
@@ -551,9 +571,19 @@ pub(crate) async fn handle_tasks_create(
         row.status = "pending".into();
     }
 
+    #[cfg(test)]
+    if let Ok(barrier) = TASK_CREATE_BEFORE_COMMIT.try_with(Clone::clone) {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
+    let _admission = match admit_background_caller(home_dir, actor, "tasks_create").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     if let Err(e) = store.insert_task(&row).await {
         return tool_error(&format!("insert task: {e}"));
     }
+
 
     // Record activity
     append_activity(
@@ -806,6 +836,10 @@ pub(crate) async fn handle_tasks_update(
     if fields.is_empty() {
         return tool_error("no fields to update");
     }
+    let _admission = match admit_background_caller(home_dir, actor, "tasks_update").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     super::workflow_operation::effect_start();
     let updated = match store
         .update_task_with_cost_policy(task_id, &Value::Object(fields), employee_default_cap)
@@ -892,6 +926,10 @@ pub(crate) async fn handle_tasks_claim(
     let lease = (now
         + chrono::Duration::seconds(duduclaw_gateway::dispatch_engine::DEFAULT_LEASE_SECS))
     .to_rfc3339();
+    let _admission = match admit_background_caller(home_dir, actor, "tasks_claim").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     match store
         .atomic_claim(task_id, default_agent, &now_s, &lease)
         .await
@@ -1187,6 +1225,11 @@ async fn resolve_parent_inner(
 }
 
 #[cfg(test)]
+tokio::task_local! {
+    static TASK_CREATE_BEFORE_COMMIT: std::sync::Arc<tokio::sync::Barrier>;
+}
+
+#[cfg(test)]
 mod cost_cap_tests {
     use super::*;
 
@@ -1233,9 +1276,12 @@ mod cost_cap_tests {
     #[tokio::test]
     async fn tasks_create_timeout_only_narrows_the_assignee_limit() {
         let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join("agents/bot");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), "[runtime]\ntimeout_secs = 900\n").unwrap();
+        // Employee writes are admitted only for a readable, active profile.
+        super::super::tests::create_test_agent(&home.path().join("agents"), "bot", "");
+        let agent_path = home.path().join("agents/bot/agent.toml");
+        let mut profile = std::fs::read_to_string(&agent_path).unwrap();
+        profile.push_str("\n[runtime]\ntimeout_secs = 900\n");
+        std::fs::write(agent_path, profile).unwrap();
         for actor in [RecordActor::Agent("bot"), RecordActor::Operator("bot")] {
             let wider = handle_tasks_create(
                 &serde_json::json!({"title":"goal","kind":"goal","timeout_secs":901}),
@@ -1287,6 +1333,8 @@ mod cost_cap_tests {
     #[tokio::test]
     async fn tasks_update_cost_cap_operator_raises_employee_only_narrows() {
         let home = tempfile::tempdir().unwrap();
+        // Employee writes are admitted only for a readable, active profile.
+        super::super::tests::create_test_agent(&home.path().join("agents"), "bot", "");
         let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
         let mut task = duduclaw_gateway::task_store::TaskRow::new(
             "capped".into(),
@@ -1313,5 +1361,48 @@ mod cost_cap_tests {
         )
         .await;
         assert_eq!(parsed(&narrowed)["task"]["cost_cap_cents"], 150);
+    }
+}
+
+#[cfg(test)]
+mod autonomy_commit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tasks_create_pause_between_check_and_insert_lands_no_task() {
+        let home = tempfile::tempdir().unwrap();
+        super::super::tests::create_test_agent(&home.path().join("agents"), "worker", "");
+        let params = serde_json::json!({"title":"queued work", "durable":true});
+        let actor = RecordActor::Agent("worker");
+        assert!(check_background_caller(home.path(), actor, "tasks_create").is_ok());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let call = TASK_CREATE_BEFORE_COMMIT.scope(
+            barrier.clone(), handle_tasks_create(&params, home.path(), actor),
+        );
+        let pause = async {
+            barrier.wait().await;
+            let outcome = duduclaw_core::autonomy_gate::mutate_async(
+                home.path(), Some("worker"),
+                Some(duduclaw_core::autonomy_gate::PauseEntry {
+                    reason: "race".into(), who: "operator".into(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                }),
+            ).await;
+            assert!(matches!(outcome, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+            barrier.wait().await;
+        };
+        let (response, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(10), async { tokio::join!(call, pause) },
+        ).await.expect("handler must reach the commit barrier");
+        assert_eq!(response["isError"], true);
+        assert_eq!(response, tool_error(
+            &check_background_caller(home.path(), actor, "tasks_create").unwrap_err(),
+        ));
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+        duduclaw_core::autonomy_gate::resume(home.path(), Some("worker")).unwrap();
+        let response = handle_tasks_create(&params, home.path(), actor).await;
+        assert_ne!(response["isError"], true, "{response}");
+        assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
     }
 }

@@ -30,6 +30,14 @@ pub struct ParentPublication {
 }
 
 impl ParentPublication {
+    pub(crate) fn require_parent(&self, parent: &Path) -> Result<()> {
+        let parent = parent.canonicalize().map_err(|error| ForkError::Overlay(error.to_string()))?;
+        if parent != self.parent {
+            return Err(ForkError::Overlay("publication lock belongs to another parent".into()));
+        }
+        self.verify_parent()
+    }
+
     pub fn promote(&self, workspace: &Path, policy: &CopyPolicy) -> Result<CopyReport> {
         self.verify_parent()?;
         let report = policy.copy_tree(workspace, &self.parent)?;
