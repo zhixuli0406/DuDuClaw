@@ -11,11 +11,28 @@ If you are adding a tool, read
 declaration surface, not the implementation. To run the server on its own,
 without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
-## The rule: discoverable ⇔ callable
+
+## Per-employee tool list pruning
+
+In an employee's overview, Admins can open **Tool list pruning** to select a mode, inspect unused tools and estimated token savings, or restore the list while pruning is on. The selector uses the existing employee update path. The status and restore RPCs are Admin-only: `agents.tool_pruning_status {agent_id}` and `agents.tool_pruning_restore {agent_id}`. Estimates use each candidate tool's serialized definition length divided by four; they are not tokenizer measurements or measured provider savings.
+
+```toml
+# agent.toml
+[capabilities]
+tool_pruning = "shadow" # "off" | "shadow" | "on"
+```
+
+The default is `shadow`: observe and report, with the same `tools/list` response as `off`. Unknown or malformed values behave as `off` and warn once. Only `on` hides eligible tools, after all existing discovery filters. This never grants or revokes permission: a hidden tool remains callable through the existing dispatch gates. A successful hidden-tool call makes it visible again through `notifications/tools/list_changed`.
+
+The calculation reads at most the last 5 MB of `tool_calls.jsonl`. Missing or unreadable logs, and fewer than ten recorded turns, leave the list intact. A candidate must be unused across at least ten turns spanning two sessions, or five sessions. Memory, tasks, working state, messaging, approvals, wiki reads, tool discovery, Admin/unknown-effect tools and tools with active scoped task grants stay visible. A turn is a distinct host-stamped `(session_id, turn_id)` pair, not a log line. Channel calls use the conversation session and turn; dispatched work uses its own dispatch session and run (one run is one turn). Older rows without these identities do not establish turn samples, but a successful use still resets that tool’s unused window. Thresholds count the turns and sessions since each tool’s last successful use. Results are cached per process for five minutes. Restore writes an employee-specific reset marker; usage before that marker no longer contributes, so the full eligible list returns. Existing permission filters still apply.
+
+Claude CLI `minimal_context` uses `--tools` for built-in CLI tools; it does not prune MCP definitions. Its behavior is unchanged.
+
+## The rule: discovery follows authorization
 
 `tools/list` only lists the tools the calling agent can actually call right now.
-Every filter below mirrors a gate the dispatcher already enforces, so the list
-an agent reads and the calls the server accepts describe the same set.
+Authorization filters mirror the dispatcher gates. Optional per-employee pruning
+then narrows discovery only: an authorized tool can be callable while hidden.
 
 This matters for cost as much as correctness. The tool schemas are a *fixed*
 prompt cost paid on every spawn: the CLI reads `tools/list` once per session and
@@ -24,7 +41,7 @@ schema for a tool the gate would reject is paid for twice — the tokens, and th
 model planning around something it cannot use.
 
 Hiding a tool is **not** an authorization decision. Calling an unlisted tool
-still reaches the real gate and is still refused, with the gate's own message.
+still reaches the real gates, which accept or refuse it under the existing rules.
 
 ### What is filtered
 

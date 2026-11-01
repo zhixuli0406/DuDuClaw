@@ -25,6 +25,13 @@ pub(crate) fn apply_capabilities_to_table(
         .as_table_mut()
         .ok_or_else(|| "Invalid [capabilities] section".to_string())?;
 
+    if let Some(value) = cap.get("tool_pruning") {
+        let mode = value.as_str().filter(|mode| matches!(*mode, "off" | "shadow" | "on"))
+            .ok_or("tool_pruning must be one of: off, shadow, on")?;
+        section.insert("tool_pruning".into(), toml::Value::String(mode.into()));
+        changes.push(format!("capabilities.tool_pruning = {mode}"));
+    }
+
     if let Some(value) = cap.get("recipient_guard") {
         if value.is_null() || value.as_str() == Some("") {
             section.remove("recipient_guard");

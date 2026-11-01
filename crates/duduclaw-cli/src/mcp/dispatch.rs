@@ -871,6 +871,23 @@ pub(crate) async fn handle_tools_call(
         );
     }
 
+    // Read-only tools need usage evidence too. Do not retain arguments or
+    // results here; state-changing calls already have their canonical audit.
+    let pruning_success = !result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    if pruning_success {
+        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
+        let pruning_agent = acting_agent_id(caller_client_id, default_agent);
+        if !is_state_changing || actual_agent != pruning_agent {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir, pruning_agent, tool_name, "usage", true,
+                &[("usage_only", Value::Bool(true))],
+            );
+        }
+        // The existing tools/list_changed watcher now observes this restored
+        // name immediately, without waiting for the five-minute cache TTL.
+        duduclaw_core::tool_pruning::note_success(home_dir, pruning_agent, tool_name);
+    }
+
     // ── WP6: channel-action → dashboard live feedback ──────────
     // Everything this subprocess persists on behalf of a channel command
     // (a cron routine, a memory write, a synthesised skill) is invisible to

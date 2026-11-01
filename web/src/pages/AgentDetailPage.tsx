@@ -70,6 +70,7 @@ import { ExportProfileDialog } from '@/components/agent/ExportProfileDialog';
 import { useAuthStore } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
 import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
+import { ToolPruningCard } from '@/components/agent/ToolPruningCard';
 import { ComputerSessionPanel } from '@/components/agent/ComputerSessionPanel';
 import { AgentFilesTab } from '@/pages/agent-files/AgentFilesTab';
 import { UnsavedChangesDialog } from '@/components/agent-files/UnsavedChangesDialog';
@@ -705,6 +706,8 @@ function OverviewTab({
             <StatTile icon={Loader2} tone="text-info" value={stats.inProgress} label={intl.formatMessage({ id: 'agentDetail.stats.inProgress' })} />
             <StatTile icon={Ban} tone="text-destructive" value={stats.blocked} label={intl.formatMessage({ id: 'agentDetail.stats.blocked' })} />
           </div>
+
+          <ToolPruningCard key={detail.name} agentId={detail.name} />
 
           {/* Live activity tail. */}
           <Card>

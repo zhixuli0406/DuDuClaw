@@ -9543,5 +9543,16 @@
   "webchat.resend": "重新填入輸入框",
   "skills.my.source.verified": "已驗證來源：{publisher}",
   "skills.my.source.unsigned": "未簽章",
-  "voice.provider.edgeTts": "Edge TTS（免費）"
+  "voice.provider.edgeTts": "Edge TTS（免費）",
+  "toolPruning.title": "工具清單精簡",
+  "toolPruning.mode": "模式",
+  "toolPruning.mode.off": "關閉",
+  "toolPruning.mode.shadow": "僅觀察",
+  "toolPruning.mode.on": "啟用",
+  "toolPruning.savings": "{count} 個工具未使用，估計每次省約 {tokens} tokens（估計值）",
+  "toolPruning.listed": "目前列出 {count} 個工具",
+  "toolPruning.discoveryOnly": "只調整工具清單，不變更權限。隱藏工具仍依原有權限呼叫；僅觀察模式不會精簡清單。",
+  "toolPruning.expand": "展開未使用工具",
+  "toolPruning.restore": "還原所有工具",
+  "toolPruning.retry": "重試"
 }

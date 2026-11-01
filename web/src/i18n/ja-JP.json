@@ -9543,5 +9543,16 @@
   "webchat.resend": "入力欄に戻す",
   "skills.my.source.verified": "確認済みの発行元：{publisher}",
   "skills.my.source.unsigned": "署名なし",
-  "voice.provider.edgeTts": "Edge TTS（無料）"
+  "voice.provider.edgeTts": "Edge TTS（無料）",
+  "toolPruning.title": "ツール一覧の整理",
+  "toolPruning.mode": "モード",
+  "toolPruning.mode.off": "オフ",
+  "toolPruning.mode.shadow": "観測のみ",
+  "toolPruning.mode.on": "オン",
+  "toolPruning.savings": "未使用ツール {count} 個。リクエストごとに約 {tokens} tokens を節約（推定値）",
+  "toolPruning.listed": "現在の一覧は {count} 個",
+  "toolPruning.discoveryOnly": "ツールの表示だけを変更します。非表示のツールにも既存の権限が適用されます。観測モードでは一覧は変わりません。",
+  "toolPruning.expand": "未使用ツールを表示",
+  "toolPruning.restore": "すべてのツールを復元",
+  "toolPruning.retry": "再試行"
 }

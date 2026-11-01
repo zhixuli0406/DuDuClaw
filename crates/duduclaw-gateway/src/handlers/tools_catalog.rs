@@ -27,6 +27,8 @@ impl MethodHandler {
                     { "name": "agents.set_avatar", "description": "Upload an agent avatar image (data URI)" },
                     { "name": "agents.clear_avatar", "description": "Remove an agent's uploaded avatar" },
                     { "name": "agents.export_profile", "description": "Export an AI employee profile (Manager and visible employee; user introduction excluded unless requested)" },
+                    { "name": "agents.tool_pruning_status", "description": "Admin: inspect employee tool pruning estimates" },
+                    { "name": "agents.tool_pruning_restore", "description": "Admin: reset employee tool pruning observation window" },
                     { "name": "agents.inspect", "description": "Inspect agent details" },
                     { "name": "agents.avatar", "description": "Fetch an agent's uploaded avatar as a data URI (lightweight)" },
                     { "name": "agent_files.list", "description": "List an AI employee's profile files (persona, introduction, work rules, boundaries, basic settings)" },

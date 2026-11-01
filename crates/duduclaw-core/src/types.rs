@@ -1635,6 +1635,10 @@ pub struct PermissionsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CapabilitiesConfig {
+    /// Discovery filter only; authorization gates are unchanged.
+    #[serde(default)]
+    pub tool_pruning: crate::tool_pruning::Mode,
+
     /// Allow the `computer_*` MCP tools (screenshot + mouse + keyboard in a
     /// gateway-owned container session).
     #[serde(default)]
@@ -2143,6 +2147,7 @@ fn default_wiki_visible_to() -> Vec<String> {
 impl Default for CapabilitiesConfig {
     fn default() -> Self {
         Self {
+            tool_pruning: crate::tool_pruning::Mode::default(),
             computer_use: false,
             computer_use_mode: ComputerUseMode::default(),
             computer_use_config: ComputerUseCapConfig::default(),

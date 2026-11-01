@@ -9543,5 +9543,16 @@
   "webchat.resend": "Copy to composer",
   "skills.my.source.verified": "Verified source: {publisher}",
   "skills.my.source.unsigned": "Unsigned",
-  "voice.provider.edgeTts": "Edge TTS (Free)"
+  "voice.provider.edgeTts": "Edge TTS (Free)",
+  "toolPruning.title": "Tool list pruning",
+  "toolPruning.mode": "Mode",
+  "toolPruning.mode.off": "Off",
+  "toolPruning.mode.shadow": "Observe only",
+  "toolPruning.mode.on": "On",
+  "toolPruning.savings": "{count} unused tools; estimated saving of about {tokens} tokens per request (estimate)",
+  "toolPruning.listed": "{count} tools currently listed",
+  "toolPruning.discoveryOnly": "This only changes tool discovery. Hidden tools keep their existing permissions. Observation mode leaves the list unchanged.",
+  "toolPruning.expand": "Show unused tools",
+  "toolPruning.restore": "Restore all tools",
+  "toolPruning.retry": "Try again"
 }

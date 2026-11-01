@@ -81,6 +81,7 @@ mod agents_avatar;
 mod agents_callable_rpc;
 mod assign_schedules_rpc;
 mod agents_inspect;
+mod agents_tool_pruning;
 mod channels_status;
 mod channels_add;
 mod channels_test;

@@ -5,7 +5,7 @@
 //! parameter) and enforced by `mcp::tools_list_budget_tests` — long prose
 //! belongs in `docs/guides/mcp-tools.md`, not on the wire.
 
-use super::super::{ParamDef, ToolDef};
+use super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {

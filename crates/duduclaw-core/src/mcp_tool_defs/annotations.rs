@@ -3,7 +3,7 @@
 //!
 //! ## One source of truth
 //!
-//! The hints are derived from [`duduclaw_core::effect_of`], the same effect
+//! The hints are derived from [`crate::effect_of`], the same effect
 //! table the dispatch gate and `action_rules` use, so a tool cannot be gated
 //! as `modify` while advertising itself as read-only. Only three short
 //! exact-name overlays refine what the effect class alone cannot say.
@@ -22,7 +22,7 @@
 //! schema; annotations stay client-side. The O7 budget test therefore
 //! measures the listing without them (`tools_list_budget_tests`).
 
-use duduclaw_core::{ToolAnnotations, ToolEffect};
+use crate::{ToolAnnotations, ToolEffect};
 use serde_json::Value;
 
 /// Tools whose every effect stays inside DuDuClaw's own stores (memory, wiki,
@@ -67,11 +67,8 @@ pub(crate) const CLOSED_WORLD_TOOLS: &[&str] = &[
 /// here either: it overwrites the previous `exports/<agent>-wiki.html` or the
 /// files of the Obsidian vault in place, and a person may have edited that
 /// vault since the last export.
-pub(crate) const ADDITIVE_MODIFY_TOOLS: &[&str] = &[
-    "memory_store",
-    "user_profile_record",
-    "wiki_rebuild_fts",
-];
+pub(crate) const ADDITIVE_MODIFY_TOOLS: &[&str] =
+    &["memory_store", "user_profile_record", "wiki_rebuild_fts"];
 
 /// Non-read-only tools where repeating a call with the same arguments leaves
 /// the same state as calling once.
@@ -81,7 +78,7 @@ pub(crate) const IDEMPOTENT_TOOLS: &[&str] =
 /// The `annotations` object for one tool, in the same
 /// [`ToolAnnotations`] shape DuDuClaw reads from third-party servers.
 pub(crate) fn tool_annotations(name: &str) -> Value {
-    let effect = duduclaw_core::effect_of(name);
+    let effect = crate::effect_of(name);
     let read_only = effect == ToolEffect::Read;
     let hints = ToolAnnotations {
         read_only: Some(read_only),
@@ -111,7 +108,7 @@ fn is_destructive(effect: ToolEffect, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::tools_def::tools;
+    use crate::mcp_tool_defs::tools;
 
     #[test]
     fn annotation_overlays_name_real_tools() {
@@ -130,17 +127,17 @@ mod tests {
     #[test]
     fn annotation_overlays_never_soften_dangerous_classes() {
         for name in ADDITIVE_MODIFY_TOOLS {
-            assert_eq!(duduclaw_core::effect_of(name), ToolEffect::Modify, "{name}");
+            assert_eq!(crate::effect_of(name), ToolEffect::Modify, "{name}");
         }
         for name in IDEMPOTENT_TOOLS {
             assert_ne!(
-                duduclaw_core::effect_of(name),
+                crate::effect_of(name),
                 ToolEffect::Read,
                 "{name}: hint is moot"
             );
         }
         for t in tools() {
-            let effect = duduclaw_core::effect_of(t.name);
+            let effect = crate::effect_of(t.name);
             if matches!(
                 effect,
                 ToolEffect::Delete | ToolEffect::Purchase | ToolEffect::Admin
@@ -159,7 +156,7 @@ mod tests {
     #[test]
     fn read_only_hint_matches_the_effect_table() {
         for t in tools() {
-            let read = duduclaw_core::effect_of(t.name) == ToolEffect::Read;
+            let read = crate::effect_of(t.name) == ToolEffect::Read;
             assert_eq!(tool_annotations(t.name)["readOnlyHint"], read, "{}", t.name);
         }
     }
@@ -193,11 +190,9 @@ mod tests {
         assert_eq!(a["destructiveHint"], true);
 
         // A tool that reaches outside keeps the open-world default.
-        assert!(
-            tool_annotations("web_search")
-                .get("openWorldHint")
-                .is_none()
-        );
+        assert!(tool_annotations("web_search")
+            .get("openWorldHint")
+            .is_none());
         // Unknown names fail closed to admin.
         assert_eq!(tool_annotations("no_such_tool")["destructiveHint"], true);
     }
