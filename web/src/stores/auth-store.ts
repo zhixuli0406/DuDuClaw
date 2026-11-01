@@ -8,6 +8,7 @@ export interface AuthUser {
   id: string;
   email: string;
   display_name: string;
+  primary_agent_id?: string | null;
   department?: string | null;
   role: UserRole;
   status: string;

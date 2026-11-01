@@ -1,3 +1,4 @@
+import { SetupChecklistCard } from '@/components/home/SetupChecklistCard';
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
@@ -388,6 +389,7 @@ export function HomePage() {
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-5">
+      {!viewing && authed && <SetupChecklistCard />}
       {/* Plain greeting line (§5.2 reading container — no HUD). */}
       <div className="min-w-0">
         <h1 className="truncate text-base font-medium text-foreground">{greeting}</h1>

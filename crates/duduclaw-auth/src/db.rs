@@ -172,6 +172,10 @@ impl UserDb {
             conn.execute("ALTER TABLE users ADD COLUMN manager_user_id TEXT", [])
                 .map_err(|e| format!("failed to migrate users.manager_user_id: {e}"))?;
         }
+        if !has_column(&conn, "users", "primary_agent_id")? {
+            conn.execute("ALTER TABLE users ADD COLUMN primary_agent_id TEXT", [])
+                .map_err(|e| format!("failed to migrate users.primary_agent_id: {e}"))?;
+        }
         // `auth_meta.acl_generation` invalidates every cached live ACL: each
         // authorization-relevant write bumps it in the same transaction.
         conn.execute_batch(
@@ -181,6 +185,37 @@ impl UserDb {
         )
         .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
         Ok(())
+    }
+
+    /// Set a personal preference, checking the current binding in the same write.
+    /// NULL clears the preference; an unbound agent never changes the row.
+    pub fn set_primary_agent(&self, user_id: &str, agent_id: Option<&str>) -> Result<(), String> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE users SET primary_agent_id = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'active' AND
+             (?1 IS NULL OR EXISTS(SELECT 1 FROM user_agent_bindings
+                 WHERE user_id = ?3 AND agent_name = ?1))",
+            params![agent_id, Utc::now().to_rfc3339(), user_id],
+        ).map_err(|e| format!("set primary agent: {e}"))?;
+        if changed == 1 { Ok(()) } else { Err("agent is not bound to current user".into()) }
+    }
+
+    /// Resolve a stale preference against live bindings; clearing stays NULL.
+    pub fn primary_agent(&self, user_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT CASE WHEN primary_agent_id IS NULL THEN NULL
+             WHEN EXISTS(SELECT 1 FROM user_agent_bindings b
+                 WHERE b.user_id = users.id AND b.agent_name = primary_agent_id)
+             THEN primary_agent_id ELSE
+                 (SELECT agent_name FROM user_agent_bindings b
+                  WHERE b.user_id = users.id AND b.access_level = 'owner'
+                  ORDER BY bound_at, agent_name LIMIT 1) END
+             FROM users WHERE id = ?1",
+            [user_id], |row| row.get(0),
+        ).optional().map(|value| value.flatten())
+            .map_err(|e| format!("read primary agent: {e}"))
     }
 
     /// Set (or clear with `None`) a user's department. Empty string clears.
@@ -890,6 +925,24 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let db = UserDb::new(tmp.path()).unwrap();
         (db, tmp)
+    }
+
+    #[test]
+    fn primary_agent_checks_binding_falls_back_and_clears() {
+        let (db, _tmp) = test_db();
+        let user = db.create_user("primary@example.com", "Primary", "password1", UserRole::Employee).unwrap();
+        assert!(db.set_primary_agent(&user.id, Some("unbound")).is_err());
+        db.bind_agent(&user.id, "owner", AccessLevel::Owner).unwrap();
+        db.bind_agent(&user.id, "chosen", AccessLevel::Viewer).unwrap();
+        db.set_primary_agent(&user.id, Some("chosen")).unwrap();
+        assert_eq!(db.primary_agent(&user.id).unwrap().as_deref(), Some("chosen"));
+        db.unbind_agent(&user.id, "chosen").unwrap();
+        assert_eq!(db.primary_agent(&user.id).unwrap().as_deref(), Some("owner"));
+        db.set_primary_agent(&user.id, None).unwrap();
+        assert_eq!(db.primary_agent(&user.id).unwrap(), None);
+        db.set_primary_agent(&user.id, Some("owner")).unwrap();
+        db.unbind_agent(&user.id, "owner").unwrap();
+        assert_eq!(db.primary_agent(&user.id).unwrap(), None);
     }
 
     #[test]

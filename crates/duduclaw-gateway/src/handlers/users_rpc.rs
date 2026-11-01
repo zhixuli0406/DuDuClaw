@@ -482,6 +482,22 @@ impl MethodHandler {
         )
     }
 
+    pub(crate) async fn handle_users_set_primary_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let agent = match params.get("agent_id") {
+            Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() && id.len() <= 256 => Some(id.as_str()),
+            _ => return WsFrame::error_response("", "agent_id must be a string or null"),
+        };
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+        match db.set_primary_agent(&ctx.user_id, agent) {
+            Ok(()) => WsFrame::ok_response("", json!({ "primary_agent_id": agent })),
+            Err(_) => WsFrame::error_response("", "agent is not bound to current user"),
+        }
+    }
+
     pub(crate) async fn handle_users_me(&self, ctx: &UserContext) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
@@ -492,6 +508,7 @@ impl MethodHandler {
                     json!({
                         "user": {
                             "id": ctx.user_id,
+                            "primary_agent_id": null,
                             "email": ctx.email,
                             "role": ctx.role.to_string(),
                         },
@@ -504,7 +521,13 @@ impl MethodHandler {
         match db.get_user(&ctx.user_id) {
             Ok(Some(user)) => {
                 let bindings = db.get_user_agents(&user.id).unwrap_or_default();
+                let primary = match db.primary_agent(&user.id) {
+                    Ok(value) => value,
+                    Err(_) => return WsFrame::error_response("", "unable to read user preference"),
+                };
                 let setup = self.email_setup_state(&db, &user).await;
+                let mut user = json!(user);
+                user["primary_agent_id"] = json!(primary);
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -522,6 +545,7 @@ impl MethodHandler {
                 json!({
                     "user": {
                         "id": ctx.user_id,
+                            "primary_agent_id": null,
                         "email": ctx.email,
                         "role": ctx.role.to_string(),
                     },

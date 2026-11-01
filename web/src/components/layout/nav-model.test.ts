@@ -8,6 +8,7 @@ import {
   type UserRole,
   personalPrimaryItems,
   manageAdvancedNav,
+  manageNav,
   personalAdvancedGroup,
   navGroupsForEdition,
   primaryItemsForEdition,
@@ -550,5 +551,21 @@ describe('previous admin, manager and Personal navigation snapshots', () => {
       primary: routes(primaryItemsForEdition(personal)),
       groups: navGroupsForEdition(personal).map((group) => routes(group.items)),
     }).toEqual(previousNavigation[key as keyof typeof previousNavigation]);
+  });
+});
+
+
+describe('admin setup checklist navigation', () => {
+  it('is registered in management with a version badge and edition/role gates', () => {
+    const entry = manageNav.find(i => i.to === '/setup')!;
+    expect(entry).toBeDefined();
+    expect(entry.newIn).toBe('1.79.0');
+    expect(isVisible(entry, 'admin', false)).toBe(true);
+    for (const role of ['employee', 'manager'] as const) {
+      expect(isVisible(entry, role, false)).toBe(false);
+      expect(employeeNavItems(true).some(i => i.to === '/setup')).toBe(false);
+    }
+    expect(isVisible(entry, 'admin', true)).toBe(false);
+    expect(crumbsFor('/setup')).toEqual([{ labelId: 'nav.manage', to: '/manage' }, { labelId: 'setup.title' }]);
   });
 });
