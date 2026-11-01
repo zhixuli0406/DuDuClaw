@@ -3356,6 +3356,7 @@
   "assign.skill.search": "搜尋技能",
   "assign.skill.recent": "最近執行",
   "assign.skill.other": "其他技能",
+  "assign.skill.recentUsed": "最近使用的技能",
   "assign.skill.neverRun": "還沒執行過",
   "assign.skill.runner": "由 {name} 執行（最近執行這個技能的 AI 員工）",
   "assign.skill.runnerFirst": "由 {name} 執行（還沒有人執行過這個技能，先交給有這個技能的 AI 員工）",
