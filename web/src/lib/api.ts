@@ -5866,6 +5866,7 @@ export interface ChatSessionSummary {
 }
 
 export interface ChatSessionMessage {
+  notice_kind?: string | null;
   sender_label?: string;
   parts?: TeamHistoryPart[];
   artifact?: unknown;

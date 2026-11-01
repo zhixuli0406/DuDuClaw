@@ -203,3 +203,24 @@ describe('streaming silence', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Waiting for 1 min');
   });
 });
+
+describe('persisted failure notices', () => {
+  const failure = { ...answer, content: 'Turn failed', notice_kind: 'turn_failure' };
+  it('does not show or poll an unanswered notice when reopening a failed turn', async () => {
+    useChatStore.getState().resumeSession('webchat:past', historyToMessages([user, failure]));
+    renderWithProviders(<ChatWaitingNotice />);
+    expect(useChatStore.getState().messages.at(-1)?.role).toBe('system');
+    expect(screen.queryByRole('status')).toBeNull();
+    await advance(30_000);
+    expect(api.chatSessions.history).not.toHaveBeenCalled();
+  });
+  it('stops waiting when history polling discovers the failure', async () => {
+    vi.mocked(api.chatSessions.history).mockResolvedValue({ ...history(), messages: [user, failure] });
+    resume();
+    renderWithProviders(<ChatWaitingNotice />);
+    await advance(5_000);
+    expect(useChatStore.getState().messages.at(-1)?.role).toBe('system');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});

@@ -405,14 +405,31 @@ use outbound::Latest;
 pub(super) use outbound::TurnSink;
 pub(super) use outbound::{outbound_channel, SocketSender};
 
-pub(super) async fn execute(input: TurnInput, sink: TurnSink, ticket: Ticket) {
-    supervise(&sink, execute_inner(input, sink.clone(), ticket)).await;
+pub(super) async fn execute(input: TurnInput, sink: TurnSink, mut ticket: Ticket) {
+    let state = input.state.clone();
+    let sid = input.sid.clone();
+    // Keep the FIFO ticket alive through panic notice persistence.
+    supervise(&sink, execute_inner(input, sink.clone(), &mut ticket), || async {
+        persist_failure(&state.ctx.session_manager, &sid, "Internal turn error").await;
+    }).await;
 }
 
-async fn supervise<F: std::future::Future<Output = ()>>(sink: &TurnSink, future: F) {
+async fn persist_failure(sessions: &crate::session::SessionManager, sid: &str, text: &str) {
+    if let Err(error) = sessions.record_webchat_failure(sid, text).await {
+        warn!(%error, "WebChat failure notice persistence failed");
+    }
+}
+
+async fn supervise<F, P, PF>(sink: &TurnSink, future: F, persist: P)
+where
+    F: std::future::Future<Output = ()>,
+    P: FnOnce() -> PF,
+    PF: std::future::Future<Output = ()>,
+{
     use futures_util::FutureExt;
     if std::panic::AssertUnwindSafe(future)
         .catch_unwind().await.is_err() {
+        persist().await;
         sink.frame(ChatMessage::error_coded("Internal turn error", "internal_error")).await;
     }
 }
@@ -437,7 +454,7 @@ where
     }
 }
 
-async fn execute_inner(input: TurnInput, sink: TurnSink, mut ticket: Ticket) {
+async fn execute_inner(input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
     // Even a cancelled waiter keeps its FIFO link until its predecessor ends.
     if let Some(previous) = ticket.predecessor.take() {
         let _ = previous.await;

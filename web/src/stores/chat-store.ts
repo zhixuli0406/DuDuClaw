@@ -390,6 +390,7 @@ export function shouldRenderChatFrame(
 
 /** The wire shape of one message returned by `chat.sessions.history`. */
 export interface HistoryMessageWire {
+  readonly notice_kind?: string | null;
   readonly role: string;
   readonly content: string;
   /** RFC3339 timestamp. */
@@ -419,7 +420,7 @@ export interface HistoryMessageWire {
 export function historyToMessages(raw: readonly HistoryMessageWire[]): ChatMessage[] {
   return raw.map((m) => {
     const role: ChatMessage['role'] =
-      m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user';
+      m.notice_kind === 'turn_failure' ? 'system' : m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user';
     const ts = Date.parse(m.timestamp);
     const artifact = role === 'assistant' ? parseChatArtifact(m.artifact) : undefined;
     return {
