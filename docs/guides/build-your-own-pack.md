@@ -118,3 +118,5 @@ Use your separately managed minisign secret key; DuDuClaw neither creates nor st
 Distribute packs as an archive, or preserve the exact line endings of every signed file.
 
 `pack verify` reports the source state. Job preset installs also require a preview and `--confirm-profile`, binding signature state, content and destination; a change requires a fresh confirmation. A valid signature only proves origin: the installer still scans content, quarantines hooks and enforces approval. Missing signatures for pinned publishers are invalid; unpinned unsigned packs warn before continuing.
+
+Signatures do not prevent replay of an older signed version of a whole pack. Review the version you are installing, even when its signature is valid.

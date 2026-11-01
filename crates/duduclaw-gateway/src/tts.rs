@@ -7,6 +7,43 @@ use std::sync::OnceLock;
 use tracing::{info, warn};
 use zeroize::Zeroize;
 
+pub const MAX_TTS_TEXT_CHARS: usize = 5000;
+pub const MAX_TTS_AUDIO_BYTES: usize = 50 * 1024 * 1024;
+
+fn audio_limit_error() -> String { "TTS audio exceeds the 50 MiB limit".into() }
+
+async fn read_bounded(reader: impl tokio::io::AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes).await
+        .map_err(|e| format!("TTS read failed: {e}"))?;
+    if bytes.len() > limit { return Err("TTS response exceeds the byte limit".into()); }
+    Ok(bytes)
+}
+
+async fn read_audio_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let file = tokio::fs::File::open(path).await.map_err(|e| format!("TTS audio open failed: {e}"))?;
+    let metadata = file.metadata().await.map_err(|e| format!("TTS audio metadata failed: {e}"))?;
+    if !metadata.is_file() { return Err("TTS output must be a regular file".into()); }
+    if metadata.len() > MAX_TTS_AUDIO_BYTES as u64 { return Err(audio_limit_error()); }
+    // Bound the same open handle as well, in case the file grows after metadata.
+    read_bounded(file, MAX_TTS_AUDIO_BYTES).await
+}
+
+async fn read_http_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|len| len > limit as u64) {
+        return Err("TTS response exceeds the byte limit".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "TTS response read failed".to_string())? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err("TTS response exceeds the byte limit".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 /// Split a TTS command template like STT does, replacing path placeholders as
 /// individual argv tokens. The input text is deliberately never an argument.
 pub fn build_tts_command_args(command: &str, input_path: &str, output_path: &str) -> Result<(String, Vec<String>), String> {
@@ -36,14 +73,19 @@ async fn run_tts_command(command: &str, input: &std::path::Path, output: &std::p
     }
     let mut child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
         .kill_on_drop(true).spawn().map_err(|e| format!("TTS command spawn failed: {e}"))?;
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    let process_output = match result {
-        Ok(result) => result.map_err(|e| format!("TTS command wait failed: {e}"))?,
+    let stderr = child.stderr.take().ok_or("TTS command stderr unavailable")?;
+    let result = tokio::time::timeout(timeout, async {
+        let stderr = read_bounded(stderr, 64 * 1024).await?;
+        let status = child.wait().await.map_err(|e| format!("TTS command wait failed: {e}"))?;
+        Ok::<_, String>((status, stderr))
+    }).await;
+    let (status, stderr) = match result {
+        Ok(result) => result?,
         Err(_) => return Err("TTS command timeout (60s)".into()),
     };
-    if !process_output.status.success() {
-        let stderr = String::from_utf8_lossy(&process_output.stderr);
-        return Err(format!("TTS command exited with {}: {}", process_output.status, truncate_bytes(stderr.trim(), 300)));
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(format!("TTS command exited with {}: {}", status, truncate_bytes(stderr.trim(), 300)));
     }
     Ok(())
 }
@@ -63,7 +105,7 @@ impl TtsProvider for CommandTtsProvider {
         let output = dir.path().join("output.audio");
         tokio::fs::write(&input, text.as_bytes()).await.map_err(|e| format!("TTS input write: {e}"))?;
         run_tts_command(&self.command, &input, &output, std::time::Duration::from_secs(60)).await?;
-        tokio::fs::read(&output).await.map_err(|e| format!("TTS command output read failed: {e}"))
+        read_audio_file(&output).await
     }
 }
 
@@ -184,16 +226,17 @@ impl TtsProvider for MiniMaxTts {
 
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let bytes = read_http_bounded(response, 4096).await?;
+            let text = String::from_utf8_lossy(&bytes);
             return Err(format!(
                 "MiniMax TTS error ({status}): {}",
                 truncate_bytes(&text, 300)
             ));
         }
 
-        let resp: T2aResponse = response
-            .json()
-            .await
+        // Base64 expands audio by 4/3; leave bounded room for the JSON envelope.
+        let body = read_http_bounded(response, MAX_TTS_AUDIO_BYTES.div_ceil(3) * 4 + 64 * 1024).await?;
+        let resp: T2aResponse = serde_json::from_slice(&body)
             .map_err(|e| format!("Failed to parse TTS response: {e}"))?;
 
         // Check for API-level errors
@@ -207,11 +250,13 @@ impl TtsProvider for MiniMaxTts {
             .audio_file
             .ok_or_else(|| "MiniMax TTS returned no audio".to_string())?;
 
+        if audio_b64.len() > MAX_TTS_AUDIO_BYTES.div_ceil(3) * 4 { return Err(audio_limit_error()); }
         use base64::Engine;
         let audio_bytes = base64::engine::general_purpose::STANDARD
             .decode(&audio_b64)
             .map_err(|e| format!("Failed to decode audio base64: {e}"))?;
 
+        if audio_bytes.len() > MAX_TTS_AUDIO_BYTES { return Err(audio_limit_error()); }
         info!(bytes = audio_bytes.len(), "MiniMax TTS: synthesis complete");
         Ok(audio_bytes)
     }
@@ -289,9 +334,9 @@ impl TtsProvider for AzureTts {
             // Do not echo the remote response or request headers containing credentials.
             return Err(format!("Azure Speech error ({status})"));
         }
-        let audio = response.bytes().await.map_err(|_| "Azure Speech audio read failed".to_string())?;
+        let audio = read_http_bounded(response, MAX_TTS_AUDIO_BYTES).await?;
         if audio.is_empty() { return Err("Azure Speech returned no audio".into()); }
-        Ok(audio.to_vec())
+        Ok(audio)
     }
 }
 
@@ -373,19 +418,17 @@ impl TtsProvider for OpenAiTtsProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let bytes = read_http_bounded(resp, 4096).await?;
+            let text = String::from_utf8_lossy(&bytes);
             return Err(format!(
                 "OpenAI TTS error ({status}): {}",
                 truncate_bytes(&text, 200)
             ));
         }
 
-        let audio = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("OpenAI TTS read: {e}"))?;
+        let audio = read_http_bounded(resp, MAX_TTS_AUDIO_BYTES).await?;
         info!(bytes = audio.len(), "OpenAI TTS: synthesis complete");
-        Ok(audio.to_vec())
+        Ok(audio)
     }
 }
 
@@ -451,6 +494,7 @@ impl TtsProvider for PiperTtsProvider {
         let mut cmd = tokio::process::Command::new("piper");
         duduclaw_core::ns_guard::guard_command(&mut cmd);
         let mut child = cmd
+            .kill_on_drop(true)
             .args([
                 "--model",
                 &self.model_path,
@@ -478,30 +522,20 @@ impl TtsProvider for PiperTtsProvider {
             // stdin dropped here → EOF to piper
         }
 
-        // Wait with timeout; kill child on timeout to prevent zombie processes
-        // Note: child.kill() requires &mut, so we keep ownership outside the timeout.
+        // Read both pipes concurrently, bounding raw PCM before WAV allocation.
+        let stdout = child.stdout.take().ok_or("Piper stdout unavailable")?;
+        let stderr = child.stderr.take().ok_or("Piper stderr unavailable")?;
         let wait_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            use tokio::io::AsyncReadExt;
-            let mut stdout_data = Vec::new();
-            let mut stderr_data = Vec::new();
-            if let Some(mut stdout) = child.stdout.take() {
-                let _ = stdout.read_to_end(&mut stdout_data).await;
-            }
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_end(&mut stderr_data).await;
-            }
+            let (stdout_data, stderr_data) = tokio::try_join!(
+                read_bounded(stdout, MAX_TTS_AUDIO_BYTES - 44),
+                read_bounded(stderr, 64 * 1024),
+            )?;
             let status = child.wait().await;
-            (status, stdout_data, stderr_data)
-        })
-        .await;
-
+            Ok::<_, String>((status, stdout_data, stderr_data))
+        }).await;
         let (status, stdout_data, stderr_data) = match wait_result {
-            Ok((status, stdout, stderr)) => (status, stdout, stderr),
-            Err(_) => {
-                // Timeout — kill is best-effort (child handles already taken)
-                tracing::warn!("Piper TTS timeout (30s) — process may linger");
-                return Err("Piper TTS timeout (30s)".to_string());
-            }
+            Ok(result) => result?,
+            Err(_) => return Err("Piper TTS timeout (30s)".into()),
         };
 
         let status = status.map_err(|e| format!("Piper wait: {e}"))?;
@@ -712,6 +746,9 @@ impl TtsProvider for TtsRouter {
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
+        if text.chars().count() > MAX_TTS_TEXT_CHARS {
+            return Err(format!("TTS text exceeds the {MAX_TTS_TEXT_CHARS} characters limit"));
+        }
         let voice = if voice.is_empty() { &self.default_voice } else { voice };
         let mut last_err = None;
         for provider in &self.providers {
@@ -720,6 +757,7 @@ impl TtsProvider for TtsRouter {
                 if policy.require_provider(provider.name()).is_err() { continue; }
             }
             match provider.synthesize(text, voice).await {
+                Ok(audio) if audio.len() > MAX_TTS_AUDIO_BYTES => return Err(audio_limit_error()),
                 Ok(audio) if !audio.is_empty() => {
                     info!(
                         provider = provider.name(),
@@ -750,6 +788,67 @@ impl TtsProvider for TtsRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn router_rejects_overlong_text_by_character_count() {
+        let router = TtsRouter::new().add_provider(Box::new(VoiceEcho));
+        assert!(router.synthesize(&"字".repeat(MAX_TTS_TEXT_CHARS), "ok").await.is_ok());
+        let err = router.synthesize(&"字".repeat(MAX_TTS_TEXT_CHARS + 1), "").await.unwrap_err();
+        assert!(err.contains("5000 characters"));
+    }
+
+    struct OversizedAudio;
+    #[async_trait::async_trait]
+    impl TtsProvider for OversizedAudio {
+        fn name(&self) -> &str { "oversized-test" }
+        async fn synthesize(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+            Ok(vec![0; MAX_TTS_AUDIO_BYTES + 1])
+        }
+    }
+
+    #[tokio::test]
+    async fn router_rejects_oversized_audio() {
+        let router = TtsRouter::new().add_provider(Box::new(OversizedAudio));
+        assert!(router.synthesize("hello", "").await.unwrap_err().contains("50 MiB"));
+    }
+
+    #[tokio::test]
+    async fn output_file_size_is_checked_before_reading() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_TTS_AUDIO_BYTES as u64 + 1).unwrap();
+        assert!(read_audio_file(file.path()).await.unwrap_err().contains("50 MiB"));
+        file.as_file().set_len(0).unwrap();
+        std::fs::write(file.path(), b"small audio").unwrap();
+        assert_eq!(read_audio_file(file.path()).await.unwrap(), b"small audio");
+    }
+
+    #[tokio::test]
+    async fn http_audio_limit_checks_declared_and_streamed_sizes() {
+        for wire in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n12345\r\n0\r\n\r\n",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                stream.read(&mut request).await.unwrap();
+                stream.write_all(wire.as_bytes()).await.unwrap();
+            });
+            let response = reqwest::Client::builder().no_proxy().build().unwrap()
+                .get(format!("http://{addr}/")).send().await.unwrap();
+            assert!(read_http_bounded(response, 4).await.unwrap_err().contains("limit"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_growth_past_limit() {
+        assert!(read_bounded(&b"12345"[..], 4).await.unwrap_err().contains("limit"));
+        assert_eq!(read_bounded(&b"1234"[..], 4).await.unwrap(), b"1234");
+    }
 
     #[test]
     fn voice_validation_rejects_shell_syntax() {

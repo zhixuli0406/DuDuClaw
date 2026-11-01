@@ -67,7 +67,7 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
         if super::registry::extracted_code_lane(&unpack)? {
             entry.contains.skills = true;
             super::registry::verify_registry_signature(&entry, &archive, signature.as_deref(),
-                &duduclaw_core::publishers::TrustStore::load(&crate::duduclaw_home()))?;
+                &duduclaw_core::publishers::TrustStore::load(&crate::duduclaw_home()).map_err(super::bad_content)?)?;
         }
         return Ok(unpacked(unpack, z));
     }

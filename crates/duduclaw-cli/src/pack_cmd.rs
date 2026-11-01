@@ -131,7 +131,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
         }
         PackCommands::Verify { dir } => {
             let pack = load_pack_dir(&dir).map_err(|e| crate::expert::bad_content(e.to_string()))?;
-            let (status, reason) = duduclaw_core::pack::signatures::verify(&dir, &pack, &duduclaw_core::publishers::TrustStore::load(&home));
+            let (status, reason) = duduclaw_core::pack::signatures::verify(&dir, &pack, &duduclaw_core::publishers::TrustStore::load(&home).map_err(crate::expert::bad_content)?);
             println!("{}", serde_json::to_string(&status).map_err(|e| crate::expert::bad_content(e.to_string()))?);
             if let Some(reason) = reason { return Err(crate::expert::bad_content(reason)); }
             Ok(())
@@ -232,6 +232,7 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
 
 async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) -> Result<()> {
     refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
+    let trust_store = duduclaw_core::publishers::TrustStore::load(home).map_err(crate::expert::bad_content)?;
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
@@ -262,7 +263,7 @@ async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) ->
             let status = if source.starts_with("github:") {
                 duduclaw_core::publishers::SignatureStatus::unsigned(None)
             } else {
-                let (status, reason) = duduclaw_core::pack::signatures::verify(&root, &pack, &duduclaw_core::publishers::TrustStore::load(home));
+                let (status, reason) = duduclaw_core::pack::signatures::verify(&root, &pack, &trust_store);
                 if let Some(reason) = reason { return Err(crate::expert::bad_content(format!("pack 簽章狀態 invalid：{reason}"))); }
                 status
             };
@@ -1180,6 +1181,16 @@ preferred = "claude-haiku-4-5"
         assert!(confirm_preset(home.path(), &pack, root.path(), &changed_opts, &verified).is_err());
         let failure: serde_json::Value = serde_json::from_slice(&std::fs::read(failure_path).unwrap()).unwrap();
         assert!(!failure["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn invalid_publisher_store_refuses_all_pack_sources_before_resolution() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(duduclaw_core::publishers::TRUST_STORE_FILE), "[broken").unwrap();
+        for source in ["github:example/pack", "registry:example", "/missing-local-pack"] {
+            let err = install_pack_inner(home.path(), source, &InstallOptions::default()).await.unwrap_err();
+            assert!(err.to_string().contains("trusted_publishers.toml"), "{err}");
+        }
     }
 
     #[tokio::test]

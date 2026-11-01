@@ -94,7 +94,7 @@ async fn run_with_markers(home: &Path, command: PublisherCommands, markers: &[&s
         ));
     }
     if matches!(command, PublisherCommands::List) {
-        let store = TrustStore::load(home);
+        let store = TrustStore::load(home).map_err(err)?;
         println!(
             "duduclaw (built-in): {}",
             duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY
@@ -282,7 +282,7 @@ mod tests {
             .unwrap();
         run_with_markers(home.path(), add(), &[]).await.unwrap();
         assert_eq!(
-            TrustStore::load(home.path()).publishers["example"]
+            TrustStore::load(home.path()).unwrap().publishers["example"]
                 .keys
                 .len(),
             1
@@ -319,7 +319,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !TrustStore::load(home.path())
+            !TrustStore::load(home.path()).unwrap()
                 .publishers
                 .contains_key("example")
         );

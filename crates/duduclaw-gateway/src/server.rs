@@ -15554,6 +15554,45 @@ async fn handle_stt(
     }
 }
 
+/// Bounded sliding windows: at most 10,000 users and 30 timestamps per user.
+#[derive(Default)]
+struct TtsRateLimiter {
+    users: HashMap<String, std::collections::VecDeque<Instant>>,
+}
+
+impl TtsRateLimiter {
+    fn take(&mut self, user_id: &str, now: Instant) -> bool {
+        let window = std::time::Duration::from_secs(60);
+        self.users.retain(|_, requests| {
+            while requests.front().is_some_and(|at| now.duration_since(*at) >= window) {
+                requests.pop_front();
+            }
+            !requests.is_empty()
+        });
+        if self.users.len() >= 10_000 && !self.users.contains_key(user_id) { return false; }
+        let requests = self.users.entry(user_id.to_string()).or_default();
+        if requests.len() >= 30 { return false; }
+        requests.push_back(now);
+        true
+    }
+}
+
+static TTS_RATE_LIMITER: std::sync::LazyLock<Mutex<TtsRateLimiter>> =
+    std::sync::LazyLock::new(|| Mutex::new(TtsRateLimiter::default()));
+static TTS_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+fn check_tts_rate_limit(user_id: &str) -> bool {
+    TTS_RATE_LIMITER.lock().map(|mut limiter| limiter.take(user_id, Instant::now())).unwrap_or(false)
+}
+
+fn tts_busy_response() -> axum::response::Response {
+    (
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "60")],
+        Json(serde_json::json!({ "error": "語音合成請求過多，請稍後再試。" })),
+    ).into_response()
+}
+
 #[derive(serde::Deserialize)]
 struct TtsRequestBody {
     text: String,
@@ -15574,9 +15613,11 @@ async fn handle_tts(
 ) -> axum::response::Response {
     use crate::tts::{TtsProvider, TtsRouter};
 
-    if let Err(resp) = require_bearer(&state, &headers) {
-        return resp;
-    }
+    let caller = match knowledge_caller(&state, &headers) {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    if !check_tts_rate_limit(&caller.user_id) { return tts_busy_response(); }
 
     let text = req.text.trim();
     if text.is_empty() {
@@ -15586,6 +15627,17 @@ async fn handle_tts(
         )
             .into_response();
     }
+
+    if req.text.chars().count() > crate::tts::MAX_TTS_TEXT_CHARS {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "TTS text exceeds the 5000 characters limit" })),
+        ).into_response();
+    }
+    let _slot = match tokio::time::timeout(std::time::Duration::from_secs(10), TTS_SLOTS.acquire()).await {
+        Ok(Ok(slot)) => slot,
+        _ => return tts_busy_response(),
+    };
 
     let router = TtsRouter::for_home(&state.home_dir);
     if !router.is_available() {
@@ -18896,3 +18948,28 @@ mod live_events_socket_tests {
 
 #[path = "server_mfa.rs"]
 mod server_mfa;
+
+#[cfg(test)]
+mod tts_limit_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_31st_request_and_keeps_users_independent() {
+        let mut limiter = TtsRateLimiter::default();
+        let now = Instant::now();
+        for _ in 0..30 { assert!(limiter.take("user-a", now)); }
+        assert!(!limiter.take("user-a", now));
+        assert!(limiter.take("user-b", now));
+        assert!(limiter.take("user-a", now + std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn limiter_refuses_new_keys_at_capacity_without_evicting_active_users() {
+        let mut limiter = TtsRateLimiter::default();
+        let now = Instant::now();
+        for id in 0..10_000 { assert!(limiter.take(&format!("user-{id}"), now)); }
+        assert!(!limiter.take("extra", now));
+        assert!(limiter.take("user-0", now));
+        assert!(limiter.take("extra", now + std::time::Duration::from_secs(60)));
+    }
+}

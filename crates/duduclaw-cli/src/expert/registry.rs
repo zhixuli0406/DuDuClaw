@@ -301,7 +301,7 @@ pub async fn fetch_verified_archive(slug: &str) -> Result<(RegistryEntry, Vec<u8
     }
 
     // Publisher keys are local pins, never fetched from the registry host.
-    let store = duduclaw_core::publishers::TrustStore::load(&crate::duduclaw_home());
+    let store = duduclaw_core::publishers::TrustStore::load(&crate::duduclaw_home()).map_err(cfg)?;
     let pinned = store.is_pinned(&entry.publisher);
     if code_lane(&entry) && !pinned {
         return Err(cfg(format!("publisher {} 尚未釘選；先從獨立管道核對公鑰，再使用 duduclaw publishers add <id> <pubkey>；拒絕 code lane 安裝", entry.publisher)));

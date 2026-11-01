@@ -288,6 +288,29 @@ pub(crate) async fn handle_skill_gaps(params: &Value, home_dir: &Path, default_a
 // Fail-closed throughout: broker unavailable, request failure, denial, or TTL
 // expiry all resolve to a DENY — never a silent install.
 
+fn hub_install_approval_details(
+    gated: &duduclaw_gateway::skill_lifecycle::hub_install::GatedManifest,
+    hub: &str, skill_name: &str, owner: Option<&str>, scope: &str,
+) -> (String, Value) {
+    let summary = format!(
+        "安裝技能「{skill_name}」（來源 hub：{hub}，範圍：{scope}，掃描風險：{}，{} 項發現，簽章：{:?}，發布者：{}，內容 SHA-256：{}）",
+        gated.risk_level, gated.findings, gated.signature_status.state,
+        gated.signature_status.publisher.as_deref().unwrap_or("unknown"),
+        duduclaw_agent::skill_hub::sha256_hex(&gated.content)
+    );
+    let payload = serde_json::json!({
+        "tool": "skill_hub_install",
+        "signature_state": gated.signature_status.state,
+        "publisher": gated.signature_status.publisher,
+        "content_sha256": duduclaw_agent::skill_hub::sha256_hex(&gated.content),
+        "hub": hub,
+        "skill_name": skill_name,
+        "owner": owner,
+        "scope": scope,
+    });
+    (summary, payload)
+}
+
 /// Install a skill from a hub — always through the fail-closed scan gate, and
 /// (for non-admin callers) through the admin-approval gate.
 pub(crate) async fn handle_skill_hub_install(
@@ -351,17 +374,7 @@ pub(crate) async fn handle_skill_hub_install(
     };
 
     // ── Phase 2: admin approval (non-admin install-class or explicit) ───────
-    let summary = format!(
-        "安裝技能「{skill_name}」（來源 hub：{hub}，範圍：{scope}，掃描風險：{}，{} 項發現）",
-        gated.risk_level, gated.findings
-    );
-    let payload = serde_json::json!({
-        "tool": "skill_hub_install",
-        "hub": hub,
-        "skill_name": skill_name,
-        "owner": owner,
-        "scope": scope,
-    });
+    let (summary, payload) = hub_install_approval_details(&gated, hub, skill_name, owner, scope);
     match gate_install_approval(
         home_dir,
         default_agent,
@@ -379,8 +392,10 @@ pub(crate) async fn handle_skill_hub_install(
     // ── Phase 3: write the gated skill into the loader root ─────────────────
     match hub_install::install_gated(home_dir, &gated, scope).await {
         Ok(report) => mcp_text(&format!(
-            "Skill '{}' installed from hub '{}' into scope '{}' (scan: risk {}, {} finding(s)).",
-            report.skill_name, report.hub, report.scope, report.risk_level, report.findings
+            "Skill '{}' installed from hub '{}' into scope '{}' (scan: risk {}, {} finding(s); signature: {:?}; publisher: {}; content SHA-256: {}).",
+            report.skill_name, report.hub, report.scope, report.risk_level, report.findings,
+            report.signature_status.state, report.signature_status.publisher.as_deref().unwrap_or("unknown"),
+            report.content_sha256
         )),
         Err(e) => mcp_error(&e),
     }
@@ -596,6 +611,23 @@ async fn agent_department(agent_dir: &Path) -> Option<String> {
 mod skill_list_b8_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hub_approval_binds_signature_publisher_and_exact_content_hash() {
+        use duduclaw_core::publishers::{SignatureState, SignatureStatus};
+        let gated = duduclaw_gateway::skill_lifecycle::hub_install::GatedManifest {
+            hub: "hub".into(), skill_name: "notes".into(), content: "exact bytes\r\n".into(),
+            risk_level: "Low".into(), findings: 0,
+            signature_status: SignatureStatus { state: SignatureState::Verified, publisher: Some("alice".into()) },
+            trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None,
+        };
+        let (summary, payload) = hub_install_approval_details(&gated, "hub", "notes", None, "global");
+        let hash = duduclaw_agent::skill_hub::sha256_hex(&gated.content);
+        assert_eq!(payload["signature_state"], "verified");
+        assert_eq!(payload["publisher"], "alice");
+        assert_eq!(payload["content_sha256"], hash);
+        assert!(summary.contains("Verified") && summary.contains("alice") && summary.contains(&hash));
+    }
 
     fn text(v: &Value) -> String {
         v["content"][0]["text"].as_str().unwrap_or_default().to_string()

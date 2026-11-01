@@ -55,16 +55,20 @@ impl TrustStore {
         }
         Ok(store)
     }
-    /// A broken store trusts no configured publisher; the embedded key remains independent.
-    pub fn load(home: &Path) -> Self {
+    /// Only an absent store is empty. Existing invalid state must never downgrade trust.
+    pub fn load(home: &Path) -> Result<Self, String> {
         let path = home.join(TRUST_STORE_FILE);
+        let invalid = |reason| format!("invalid publisher trust store {}: {reason}; refusing provenance decision", path.display());
         match std::fs::read_to_string(&path) {
-            Ok(text) => match Self::parse(&text) {
-                Ok(store) => store,
-                Err(e) => { eprintln!("⚠ {}: {e}; configured publishers are untrusted", path.display()); Self::default() }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => { eprintln!("⚠ {}: {e}; configured publishers are untrusted", path.display()); Self::default() }
+            Ok(text) => Self::parse(&text).map_err(invalid),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is existing broken state, not an absent store.
+                match std::fs::symlink_metadata(&path) {
+                    Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                    _ => Err(invalid(e.to_string())),
+                }
+            }
+            Err(e) => Err(invalid(e.to_string())),
         }
     }
     pub fn keys(&self, id: &str) -> Vec<&str> {
@@ -97,10 +101,30 @@ mod tests {
         assert_eq!(store.verify_content(Some("unknown"), Some(SIG), b"x").unwrap().state, SignatureState::Unsigned);
     }
     #[test]
+    fn missing_store_is_empty_but_invalid_store_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(TrustStore::load(home.path()).unwrap().publishers.is_empty());
+        let path = home.path().join(TRUST_STORE_FILE);
+        for text in ["[broken", "[publishers.alice]\nkeys=['broken']"] {
+            std::fs::write(&path, text).unwrap();
+            assert!(TrustStore::load(home.path()).unwrap_err().contains(&path.display().to_string()));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(TrustStore::load(home.path()).unwrap_err().contains(TRUST_STORE_FILE));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn dangling_store_symlink_is_invalid_not_missing() {
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("absent", home.path().join(TRUST_STORE_FILE)).unwrap();
+        assert!(TrustStore::load(home.path()).unwrap_err().contains(TRUST_STORE_FILE));
+    }
+    #[test]
     fn malformed_store_is_untrusted() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join(TRUST_STORE_FILE), "[publishers.alice]\nkeys=['broken']").unwrap();
-        assert!(!TrustStore::load(home.path()).is_pinned("alice"));
+        assert!(TrustStore::load(home.path()).unwrap_err().contains(TRUST_STORE_FILE));
         assert!(TrustStore::parse("[publishers.duduclaw]\nkeys=[]").is_err());
     }
 }
