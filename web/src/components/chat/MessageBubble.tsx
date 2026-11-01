@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
-import type { ChatMessage } from '@/stores/chat-store';
+import { useChatStore, type ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
 import { AssignedTaskCard } from './AssignedTaskCard';
@@ -18,14 +18,17 @@ export function MessageBubble({
   message,
   leading,
   label,
+  onRetry,
 }: {
   message: ChatMessage;
   leading?: ReactNode;
   /** Small caption above an assistant bubble, e.g. who answered when a
    *  message called another AI staff member by `@`. */
   label?: string;
+  onRetry?: () => void;
 }) {
   const intl = useIntl();
+  const cancel = useChatStore(s => s.cancel);
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
   const citations = !isUser && !isSystem ? message.citations : undefined;
@@ -67,6 +70,22 @@ export function MessageBubble({
                 message.content
               )}
             </span>
+          </div>
+        )}
+        {isUser && message.delivery === 'queued' && (
+          <div className="mt-2 text-xs" role="status">
+            {intl.formatMessage({ id: 'webchat.queued' })}
+            <button type="button" className="ml-2 underline" onClick={() => cancel(message.turnId)}>
+              {intl.formatMessage({ id: 'webchat.cancelQueued' })}
+            </button>
+          </div>
+        )}
+        {isUser && message.deliveryError && (
+          <div className="mt-2 text-xs" role="status">
+            {message.deliveryError}
+            {message.delivery === 'failed' && onRetry && <button type="button" className="ml-2 underline" onClick={onRetry}>
+              {intl.formatMessage({ id: 'webchat.resend' })}
+            </button>}
           </div>
         )}
         {message.task && !isUser && <AssignedTaskCard task={message.task} />}

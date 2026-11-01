@@ -118,7 +118,7 @@ Cancellation also stops delegations for the exact session and turn that are stil
 
 A host-provided approval origin that is incomplete or invalid refuses the approval request; only a fully absent origin retains legacy unscoped behavior. Approval origin inherited through environment variables is not signed. An employee with unrestricted Bash can forge those variables; the Bash guard is a speed bump, not isolation. Withhold Bash or use the task sandbox when actual containment is required.
 
-Closing the socket does **not** cancel accepted turns, including queued messages. They continue to completion. Signed-in dashboard users can reconnect to resume an owned session or cancel a still-active turn. Widget visitors receive a new identity on reconnect and cannot resume or cancel the previous connection's turns; those turns still count toward the global limit. The dashboard continues to show one foreground turn and has no cancel button yet; protocol clients can send `cancel` directly.
+Closing the socket does **not** cancel accepted turns, including queued messages. They continue to completion. Signed-in dashboard users can reconnect to resume an owned session or cancel a still-active turn. Widget visitors receive a new identity on reconnect and cannot resume or cancel the previous connection's turns; those turns still count toward the global limit. The dashboard shows queued messages and a cancel action on each waiting message, plus a Stop button for the foreground running turn. Protocol clients can also send `cancel` directly.
 
 
 ## Integrations → Odoo → Connection
@@ -460,3 +460,12 @@ Password and channel-code login keep the original form until the gateway request
 Admins use **Users → Two-factor login management** to review enrollment and channel verification times, reset another account with their own fresh factor, or issue a code for a user's pending enrollment reference. Self-reset and self-issuance are unavailable. The enforcement switch shows how many accounts lack enrollment, warns of blocked sign-ins, and requires typing the displayed confirmation phrase. The action is fixed when confirmation opens; refreshing clears it. The switch RPC requires `expected_state` and refuses a stale value under the config lock. Degraded policy reloads show a warning and disable the switch. **Enforcement still needs review before it is turned on**; leave it off until independent security review, real gateway/channel checks and recovery verification are complete. Personal hides these controls unless the account is already enrolled; local auto-login remains unchanged.
 
 The calling connection now receives new tokens with the successful enrollment/disable response and is rebound before the normal send gate runs. HTTP enrollment also issues its tokens before the enrollment transaction commits. Live browser/WebSocket verification, including keeping codes visible beyond a heartbeat and retiring another session, remains required before enabling enforcement; in-process handler and frontend tests do not establish that acceptance.
+
+
+## Send another WebChat message during a reply
+
+You can keep typing and send another message while an AI staff member replies. In the same conversation, the new message shows “Queued — will be handled after the current reply”. It is handled after the current reply; it is not injected into the reply already in progress. The queued label clears when that message starts producing progress or a reply. An `@` call routed to another staff member can use a separate processing lane.
+
+Use **Cancel queued message** on a waiting message to cancel that message, or **Stop** beside Send to stop the active reply. Cancellation is confirmed by the server; sending a cancel request does not mean it has finished. Existing attachment support is unchanged.
+
+By default, the server allows up to three in-flight messages per user, including queued messages. If the limit is reached, the message shows an error and retains its text. Use **Copy to composer** to edit and send it again after a reply finishes.

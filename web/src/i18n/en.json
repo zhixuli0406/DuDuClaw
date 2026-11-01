@@ -9474,5 +9474,11 @@
   "mfa.issue": "Issue enrollment code",
   "mfa.issued": "One-time enrollment code",
   "mfa.expires": "Valid for {seconds} seconds from issuance",
-  "mfa.enforcedAt": "Enforcement started"
+  "mfa.enforcedAt": "Enforcement started",
+  "webchat.queued": "Queued — will be handled after the current reply",
+  "webchat.cancelQueued": "Cancel queued message",
+  "webchat.turnLimit": "Too many messages are being processed. Please wait for the current replies to finish.",
+  "webchat.send": "Send",
+  "webchat.stop": "Stop",
+  "webchat.resend": "Copy to composer"
 }

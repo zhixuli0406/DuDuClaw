@@ -33,6 +33,10 @@ export interface ChatMessage {
   readonly role: 'user' | 'assistant' | 'system';
   readonly content: string;
   readonly timestamp: number;
+  readonly turnId?: string;
+  readonly delivery?: 'queued' | 'running' | 'done' | 'cancelled' | 'failed';
+  readonly deliveryError?: string;
+  readonly liveActivity?: TurnActivity;
   readonly tokens?: number;
   /** Files attached to a user message (display chips). */
   readonly attachments?: readonly ChatAttachmentMeta[];
@@ -188,16 +192,17 @@ export type ChatPhase = 'idle' | 'thinking' | 'speaking' | 'done' | 'error';
 
 interface ChatStore {
   readonly messages: readonly ChatMessage[];
-  /** Live task-board insight steps for the current turn (cleared on each send). */
+  /** Live task-board insight steps for the running turn (preserved when queueing). */
   readonly steps: readonly ChatStep[];
   /** Live tool step tree for the current turn (folded from `step` frames). */
   readonly stepTree: readonly StepNode[];
-  /** The current turn's thinking, from send until its reply lands (then it
+  /** The running turn's thinking, until its reply lands (then it
    *  moves onto that assistant message). Null between turns. */
   readonly thinking: TurnThinking | null;
   readonly isStreaming: boolean;
-  /** Client message id of the foreground turn; other turns may still run. */
+  /** Client message id of the foreground running turn; queued turns keep theirs on the user message. */
   readonly activeMessageId: string | null;
+  readonly lastCompletedReplyId: string | null;
   readonly lastTurnFrameAt: number | null;
   readonly historyReplyRevision: number;
   /** Fine-grained turn phase for the companion face (thinking/speaking/…). */
@@ -271,6 +276,7 @@ interface ChatStore {
   connect: () => void;
   disconnect: () => void;
   send: (text: string, attachments?: readonly PendingAttachment[]) => void;
+  cancel: (msgId?: string) => void;
   reset: () => void;
   /** Pick the conversation partner (null → DuDu). Visual only for now. */
   selectAgent: (id: string | null) => void;
@@ -291,6 +297,28 @@ interface ChatStore {
   setRecording: (v: boolean) => void;
   setTranscribing: (v: boolean) => void;
   setTtsEnabled: (v: boolean) => void;
+}
+
+type TurnActivity = Pick<ChatStore, 'thinking' | 'steps' | 'stepTree' | 'phase' | 'viseme' | 'lastTurnFrameAt'>;
+
+function currentActivity(state: ChatStore): TurnActivity {
+  const { thinking, steps, stepTree, phase, viseme, lastTurnFrameAt } = state;
+  return { thinking, steps, stepTree, phase, viseme, lastTurnFrameAt };
+}
+
+function freshActivity(): TurnActivity {
+  return { thinking: startTurnThinking(Date.now()), steps: [], stepTree: [],
+    phase: 'thinking', viseme: REST_VISEME, lastTurnFrameAt: Date.now() };
+}
+
+/** Different @ routes can have independent server lanes in the same view. */
+function remainingActivity(messages: readonly ChatMessage[], phase: 'done' | 'error') {
+  const running = messages.find(m => m.role === 'user' && m.delivery === 'running');
+  return {
+    ...(running?.liveActivity ?? { thinking: null, phase, viseme: REST_VISEME }),
+    activeMessageId: running?.turnId ?? null,
+    isStreaming: !!running || messages.some(m => m.delivery === 'queued'),
+  };
 }
 
 let msgCounter = 0;
@@ -362,7 +390,7 @@ export function buildUserMessageFrame(opts: {
  */
 export function shouldRenderChatFrame(
   frame: Record<string, unknown>,
-  current: Pick<ChatStore, 'convId' | 'activeMessageId' | 'sessionId' | 'selectedAgentId' | 'resumedExplicitly'>,
+  current: Pick<ChatStore, 'convId' | 'activeMessageId' | 'sessionId' | 'selectedAgentId' | 'resumedExplicitly'> & Partial<Pick<ChatStore, 'messages'>>,
 ): boolean {
   // Control-request failures never complete the targeted turn. Older gateways
   // echoed its msg_id here, so do not infer terminal ownership from that field.
@@ -377,7 +405,8 @@ export function shouldRenderChatFrame(
   // An uncorrelated admission refusal must not clear another accepted turn.
   if (frame.type === 'error' && (frame.code === 'turn_limit' || frame.code === 'identity_unavailable') && !msg) return false;
   if (conv && conv !== current.convId) return false;
-  if (msg && msg !== current.activeMessageId) return false;
+  if (msg && msg !== current.activeMessageId && !current.messages?.some(m =>
+    m.role === 'user' && m.turnId === msg && (m.delivery === 'queued' || m.delivery === 'running'))) return false;
   if (conv || msg) return true;
   if (frame.type !== 'session_info' && typeof frame.session_id === 'string' && frame.session_id) {
     const composed = current.resumedExplicitly
@@ -386,6 +415,17 @@ export function shouldRenderChatFrame(
     return frame.session_id === current.sessionId || frame.session_id === composed;
   }
   return shouldRenderFrame(frame.type, frame.conv, current.convId);
+}
+
+/** Insert a reply beside its user message, even with later queued turns. */
+function replySlot(messages: readonly ChatMessage[], turnId: string | null): number {
+  const user = messages.findIndex(m => m.role === 'user' && m.turnId === turnId);
+  if (user < 0) return messages.length - (messages.at(-1)?.role === 'assistant' ? 1 : 0);
+  return user + 1;
+}
+
+function finishMessage(messages: readonly ChatMessage[], turnId: string | null, delivery: 'done' | 'failed' | 'cancelled') {
+  return messages.map(m => m.role === 'user' && m.turnId === turnId ? { ...m, delivery, liveActivity: undefined } : m);
 }
 
 /** The wire shape of one message returned by `chat.sessions.history`. */
@@ -485,7 +525,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // A fresh connection re-derives its own server session id, so start a fresh
     // conversation nonce too (the previous connection's buckets are unreachable
     // once the server mints a new suffix).
-    set({ connectionState: 'connecting', ownSessionId: null, activeMessageId: null, convId: nextConvId() });
+    set({ connectionState: 'connecting', ownSessionId: null, activeMessageId: null, lastCompletedReplyId: null, convId: nextConvId() });
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/chat`;
@@ -528,6 +568,22 @@ export const useChatStore = create<ChatStore>((set, get) => {
         if (!shouldRenderChatFrame(data, get())) {
           if (isOtherConversationFailure(data, get())) toast.info(lookupMessage('chat.otherConversationFailed'));
           return;
+        }
+        const frameTurnId = data.type === 'error' && ['turn_limit', 'identity_unavailable'].includes(data.code)
+          ? data.request_id ?? data.msg_id : data.msg_id;
+        const targetTurnId = typeof frameTurnId === 'string' ? frameTurnId : get().activeMessageId;
+        if ((IN_TURN_FRAME_TYPES.has(data.type) || data.type === 'assistant_done') && targetTurnId) {
+          const user = get().messages.find(m => m.role === 'user' && m.turnId === targetTurnId);
+          if (user && targetTurnId !== get().activeMessageId) {
+            clearVisemeIdle();
+            set(state => ({
+              messages: state.messages.map(m => m === user ? { ...m, delivery: 'running' as const }
+                : m.role === 'user' && m.turnId === state.activeMessageId
+                  ? { ...m, liveActivity: currentActivity(state) } : m),
+              activeMessageId: targetTurnId, isStreaming: true,
+              ...(user.liveActivity ?? freshActivity()),
+            }));
+          }
         }
         if (get().isStreaming && isTurnActivity(data, get().activeMessageId)) {
           set({ lastTurnFrameAt: Date.now() });
@@ -577,20 +633,22 @@ export const useChatStore = create<ChatStore>((set, get) => {
             break;
 
           case 'assistant_chunk':
-            // Streaming chunk — append to last assistant message or create new.
+            // Streaming chunk — append beside the matching user message.
             // Sample the mouth shape off the chunk cadence (T7.1) and arm the
             // idle timer so a stream pause relaxes the mouth back to REST.
             set((state) => {
               const msgs = [...state.messages];
-              const last = msgs[msgs.length - 1];
+              const slot = replySlot(msgs, targetTurnId);
+              const last = msgs[slot];
               if (last && last.role === 'assistant' && !('tokens' in last)) {
-                msgs[msgs.length - 1] = {
+                msgs[slot] = {
                   ...last,
                   content: last.content + data.content,
                 };
               } else {
-                msgs.push({
+                msgs.splice(slot, 0, {
                   id: nextId(),
+                  turnId: targetTurnId ?? undefined,
                   role: 'assistant',
                   content: data.content,
                   timestamp: Date.now(),
@@ -660,11 +718,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
             if (!computerWatch || !get().isStreaming || data.conv !== get().convId) break;
             set((state) => {
               const messages = [...state.messages];
-              const last = messages[messages.length - 1];
+              const slot = replySlot(messages, targetTurnId);
+              const last = messages[slot];
               if (last?.role === 'assistant') {
-                messages[messages.length - 1] = { ...last, computerWatch };
+                messages[slot] = { ...last, computerWatch };
               } else {
-                messages.push({ id: nextId(), role: 'assistant', content: '',
+                messages.splice(slot, 0, { id: nextId(), turnId: targetTurnId ?? undefined, role: 'assistant', content: '',
                   timestamp: Date.now(), computerWatch });
               }
               return { messages };
@@ -686,15 +745,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
             const assignedTask = parseAssignedTask(data.task);
             const taskField = assignedTask ? { task: assignedTask } : {};
             set((state) => {
-              const msgs = [...state.messages];
-              const last = msgs[msgs.length - 1];
+              const msgs = finishMessage(state.messages, targetTurnId, 'done');
+              const slot = replySlot(msgs, targetTurnId);
+              const last = msgs[slot];
               // The turn's thinking moves onto its reply; the wall time ends now.
               const thinking = state.thinking
                 ? { thinking: finishTurnThinking(state.thinking, Date.now(), thinkingMeta) }
                 : {};
               if (last && last.role === 'assistant') {
                 // Update with full content + tokens
-                msgs[msgs.length - 1] = {
+                msgs[slot] = {
                   ...last,
                   content: data.content,
                   tokens: data.tokens_used,
@@ -705,8 +765,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...taskField,
                 };
               } else {
-                msgs.push({
+                msgs.splice(slot, 0, {
                   id: nextId(),
+                  turnId: targetTurnId ?? undefined,
                   role: 'assistant',
                   content: data.content,
                   timestamp: Date.now(),
@@ -720,11 +781,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
               }
               return {
                 messages: msgs,
-                thinking: null,
-                isStreaming: false,
-                activeMessageId: null,
-                phase: 'done' as ChatPhase,
-                viseme: REST_VISEME,
+                lastCompletedReplyId: msgs[slot].id,
+                ...remainingActivity(msgs, 'done'),
                 // The backend reported the model that ACTUALLY produced this
                 // reply (post CLI-side substitution) — trust it over the
                 // configured intent from session_info.
@@ -738,6 +796,26 @@ export const useChatStore = create<ChatStore>((set, get) => {
           }
 
           case 'error':
+            if (targetTurnId && !isResumeNotFound(data.message)) {
+              set(state => {
+                const error = data.code === 'turn_limit' ? lookupMessage('webchat.turnLimit') : mentionErrorText(data) ?? data.message;
+                const messages = finishMessage(state.messages, targetTurnId, data.code === 'cancelled' ? 'cancelled' : 'failed')
+                  .map(m => m.role === 'user' && m.turnId === targetTurnId ? { ...m, ...(data.code === 'turn_limit' ? { deliveryError: error } : {}) } : m);
+                // Admission errors are shown on the retained user bubble. Other
+                // terminal notices follow this turn's reply, before queued users.
+                if (data.code !== 'turn_limit') {
+                  const slot = replySlot(messages, targetTurnId);
+                  messages.splice(slot + (messages[slot]?.role === 'assistant' ? 1 : 0), 0,
+                    { id: nextId(), role: 'system', content: error, timestamp: Date.now() });
+                }
+                return { messages,
+                  ...(state.activeMessageId === targetTurnId || !state.activeMessageId
+                    ? remainingActivity(messages, 'error') : {}),
+                };
+              });
+              if (!get().activeMessageId) clearVisemeIdle();
+              break;
+            }
             if (isResumeNotFound(data.message)) {
               // Resume miss: the session we tried to continue was archived or
               // removed between listing and sending. Drop back to a fresh
@@ -766,7 +844,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             }
             set((state) => ({
               messages: [
-                ...state.messages,
+                ...finishMessage(state.messages, targetTurnId, data.code === 'cancelled' ? 'cancelled' : 'failed'),
                 {
                   id: nextId(),
                   role: 'system',
@@ -777,7 +855,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 },
               ],
               thinking: null,
-              isStreaming: false,
+              isStreaming: state.messages.some(m => m.delivery === 'queued'),
               activeMessageId: null,
               phase: 'error' as ChatPhase,
               viseme: REST_VISEME,
@@ -804,7 +882,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
   }
 
   return {
-    messages: [],
+    messages: [], lastCompletedReplyId: null,
     steps: [],
     stepTree: [],
     thinking: null,
@@ -849,7 +927,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       clearVisemeIdle();
       set((state) => ({
         selectedAgentId: id,
-        messages: [],
+        messages: [], lastCompletedReplyId: null,
         steps: [],
         stepTree: [],
         thinking: null,
@@ -880,7 +958,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     discardHistory: (identityChanged = false) => {
       clearVisemeIdle();
       set(state => ({
-        messages: [], steps: [], stepTree: [], thinking: null, isStreaming: false, activeMessageId: null,
+        messages: [], lastCompletedReplyId: null, steps: [], stepTree: [], thinking: null, isStreaming: false, activeMessageId: null,
         phase: 'idle', viseme: REST_VISEME, resumedExplicitly: false, convId: nextConvId(),
         sessionId: identityChanged ? null : state.ownSessionId,
         ...(identityChanged ? { ownSessionId: null, selectedAgentId: null } : {}),
@@ -893,6 +971,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         sessionId,
         resumedExplicitly: true,
         messages: [...messages],
+        lastCompletedReplyId: null,
         steps: [],
         stepTree: [],
         thinking: null,
@@ -936,22 +1015,26 @@ export const useChatStore = create<ChatStore>((set, get) => {
             id: nextId(),
             role: 'user' as const,
             content: text,
+            turnId: msgId,
+            delivery: state.isStreaming ? 'queued' as const : 'running' as const,
             timestamp: Date.now(),
             attachments: atts.map((a) => ({ name: a.name, mime: a.mime })),
           },
         ],
-        steps: [], // fresh task-insight timeline for this turn
-        stepTree: [], // fresh tool step tree for this turn
-        // The timer starts now, for every runtime — it never waits on the
-        // provider reporting thinking.
-        thinking: startTurnThinking(Date.now()),
-        isStreaming: true,
-        activeMessageId: msgId,
-        lastTurnFrameAt: Date.now(),
-        phase: 'thinking' as ChatPhase,
-        viseme: REST_VISEME,
+        ...(!state.isStreaming ? {
+          steps: [], // fresh task-insight timeline for this turn
+          stepTree: [], // fresh tool step tree for this turn
+          // The timer starts now, for every runtime — it never waits on the
+          // provider reporting thinking.
+          thinking: startTurnThinking(Date.now()),
+          isStreaming: true,
+          activeMessageId: msgId,
+          lastTurnFrameAt: Date.now(),
+          phase: 'thinking' as ChatPhase,
+          viseme: REST_VISEME,
+        } : {}),
       }));
-      clearVisemeIdle();
+      if (get().activeMessageId === msgId) clearVisemeIdle();
 
       wsRef.send(
         JSON.stringify(
@@ -977,6 +1060,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
       set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
     },
 
+    cancel: (msgId = get().activeMessageId ?? undefined) => {
+      if (!msgId || !wsRef || wsRef.readyState !== WebSocket.OPEN) return;
+      wsRef.send(JSON.stringify({ type: 'cancel', request_id: newClientMessageId(),
+        conv: get().convId, msg_id: msgId }));
+    },
+
     reset: () => {
       const { ownSessionId, sessionId } = get();
       // "New conversation" simply starts a fresh conversation nonce: the next
@@ -992,7 +1081,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       const target = ownSessionId ?? sessionId;
       clearVisemeIdle();
       set({
-        messages: [],
+        messages: [], lastCompletedReplyId: null,
         steps: [],
         stepTree: [],
         thinking: null,
