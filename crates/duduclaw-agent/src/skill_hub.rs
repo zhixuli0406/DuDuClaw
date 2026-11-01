@@ -87,6 +87,11 @@ pub struct HubManifest {
     /// `None` means the hub is discovery-only for this skill — the install
     /// gate must then DENY (fail-closed), never guess.
     pub content: Option<String>,
+    /// Optional publisher identity and detached minisign signature over exact content bytes.
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
     /// Human-facing URL for the skill.
     pub url: String,
     /// SHA-256 (lowercase hex) of `content` when present — the hash of exactly
@@ -376,6 +381,8 @@ impl SkillHub for GitHubHub {
                 .iter()
                 .find(|s| s.name == name)
                 .map(|s| HubManifest {
+                    publisher: None,
+                    signature: None,
                     hub: HUB_GITHUB.to_string(),
                     name: s.name.clone(),
                     // GitHub search results are repo links — no inline SKILL.md.
@@ -611,6 +618,8 @@ impl SkillHub for ClawHubHub {
             };
             Ok(Some(
                 HubManifest {
+                    publisher: body["skill"]["publisher"].as_str().map(str::to_string),
+                    signature: body["skill"]["signature"].as_str().map(str::to_string),
                     hub: HUB_CLAWHUB.to_string(),
                     name: slug.to_string(),
                     content,
@@ -845,6 +854,8 @@ impl SkillHub for LobeHubHub {
                 .map_err(|e| format!("lobehub manifest body: {e}"))?;
             Ok(Some(
                 HubManifest {
+                    publisher: None,
+                    signature: None,
                     hub: HUB_LOBEHUB.to_string(),
                     name: name.to_string(),
                     content: Some(text),
@@ -1122,6 +1133,8 @@ impl SkillHub for AnthropicSkillsHub {
                 .map_err(|e| format!("anthropic-skills raw body: {e}"))?;
             Ok(Some(
                 HubManifest {
+                    publisher: None,
+                    signature: None,
                     hub: HUB_ANTHROPIC.to_string(),
                     name: name.to_string(),
                     content: Some(text),
@@ -1528,6 +1541,8 @@ mod tests {
                     .iter()
                     .find(|e| e.name == name)
                     .map(|e| HubManifest {
+                        publisher: None,
+                        signature: None,
                         hub: self.id.to_string(),
                         name: e.name.clone(),
                         content: Some(format!("# {}", e.name)),
@@ -1620,6 +1635,21 @@ mod tests {
             .await;
         assert_eq!(res.hits.len(), 1);
         assert_eq!(res.hits[0].hub, "hub");
+    }
+
+    #[test]
+    fn optional_origin_fields_preserve_exact_content() {
+        let bytes = "---\r\nname: notes\r\n---\r\nBody  \n";
+        let mut value = serde_json::json!({"hub": "clawhub", "name": "notes", "content": bytes, "url": "https://example.test"});
+        let unsigned: HubManifest = serde_json::from_value(value.clone()).unwrap();
+        assert!(unsigned.publisher.is_none());
+        assert!(unsigned.signature.is_none());
+        value["publisher"] = serde_json::json!("fixture");
+        value["signature"] = serde_json::json!("detached signature text");
+        let manifest: HubManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(manifest.content.as_deref().unwrap().as_bytes(), bytes.as_bytes());
+        assert_eq!(manifest.publisher.as_deref(), Some("fixture"));
+        assert_eq!(manifest.signature.as_deref(), Some("detached signature text"));
     }
 
     #[test]

@@ -89,6 +89,7 @@ mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
 mod computer_profiles_cmd;
+mod publishers_cmd;
 mod computer_workspaces_cmd; // P2-C: `duduclaw computer-workspaces` (operator-only)
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
@@ -2590,6 +2591,12 @@ enum MaintenanceCommands {
     Pack {
         #[command(subcommand)]
         command: pack_cmd::PackCommands,
+    },
+
+    /// Manage pinned publisher keys. Changes require dashboard Admin approval.
+    Publishers {
+        #[command(subcommand)]
+        command: publishers_cmd::PublisherCommands,
     },
 
     /// Manage expert packs: portable bundles of a team (agents + hierarchy),
@@ -5836,6 +5843,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Maintenance(MaintenanceCommands::License(license_cmd)) => license::run(license_cmd).await,
         Commands::Maintenance(MaintenanceCommands::Pack { command }) => pack_cmd::run(command).await,
+        Commands::Maintenance(MaintenanceCommands::Publishers { command }) => publishers_cmd::run(&duduclaw_home(), command).await,
         Commands::Maintenance(MaintenanceCommands::Expert { command }) => expert::run(command).await,
         Commands::Maintenance(MaintenanceCommands::WeeklyReport {
             days,
@@ -6615,6 +6623,9 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            publishers_cmd::bash_publishers_decision(command, &caller)
                         })
                         .or_else(|| {
                             computer_workspaces_cmd::bash_workspace_ops_decision(command, &caller)

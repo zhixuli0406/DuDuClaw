@@ -34,6 +34,8 @@
 //! `crate::is_valid_department`, `crate::org::OrgRank::parse` every other
 //! caller uses.
 
+pub mod signatures;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -285,6 +287,7 @@ pub struct Pack {
     pub kind: PackKind,
     pub tier: PackTier,
     pub version: String,
+    pub publisher: String,
     /// locale → display name. A legacy single `label` becomes
     /// `{"zh-TW": label}` (single→map is lossless; map→single is not, which
     /// is why this is stored as a map).
@@ -323,6 +326,7 @@ impl Default for Pack {
             kind: PackKind::Team,
             tier: PackTier::Free,
             version: String::new(),
+            publisher: String::new(),
             display_name: BTreeMap::new(),
             description: String::new(),
             author: String::new(),
@@ -638,6 +642,7 @@ pub fn parse_pack(id: &str, text: &str) -> Result<Pack, PackError> {
         kind,
         tier: PackTier::parse(&str_field(p, "tier")),
         version: str_field(p, "version"),
+        publisher: str_field(p, "publisher"),
         display_name,
         description: str_field(p, "description"),
         author: str_field(p, "author"),

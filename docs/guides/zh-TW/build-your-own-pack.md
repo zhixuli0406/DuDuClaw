@@ -98,3 +98,21 @@ duduclaw expert remove my-first-pack
 - [ ] `requires` 誠實列出前置條件
 - [ ] 附一份 eval 案例（`duduclaw eval-scaffold` 可從 SOUL 起草）——有 eval 的包在分級上會高一級
 - [ ] CHANGELOG 式的版本說明（哪版改了什麼）
+
+## 6. 使用 minisign 簽署 pack
+
+在 `pack.toml` 設定發行者，完成所有檔案後再產生並簽署清單：
+
+```bash
+duduclaw pack manifest ./my-first-pack --publisher example
+cd my-first-pack
+minisign -Sm MANIFEST.sha256
+cd ..
+duduclaw pack verify ./my-first-pack
+```
+
+請自行保管 minisign 私鑰；DuDuClaw 不建立也不儲存簽章私鑰。驗證前，安裝者須以 `duduclaw publishers add example <pubkey>`，經儀表板 Admin 核准來釘選你的公鑰。把公鑰與 pack 放在一起，並不會使它成為可信來源。
+
+`MANIFEST.sha256` 以 `name: <name>`、`version: <version>`、`publisher: <id>` 三行開頭，後接排序後的 `<sha256>  <relative path>`。清單涵蓋所有檔案，但排除 `MANIFEST.sha256` 與 `MANIFEST.sha256.minisig`；發佈時須附上這兩個檔案。名稱與版本須符合 `pack.toml`，舊版清單的版本不符時會拒絕。缺少檔案、多出檔案、內容變動、絕對路徑、路徑穿越及符號連結都會使 pack 無效。任何編輯後，都須重新產生並簽署清單。
+
+`pack verify` 顯示來源狀態。職務預設安裝也須先預覽並以 `--confirm-profile` 確認，綁定簽章狀態、內容及安裝目的地；任一項改變都須重新確認。有效簽章只證明來源；安裝時仍執行內容掃描、hook 隔離及核准。已釘選發行者缺少簽章視為無效，未釘選且未簽章的 pack 則警告後繼續。
