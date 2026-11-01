@@ -449,6 +449,7 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         // dashboard keeps its input locked until a
         // reply or an error arrives).
         warn!("WebChat: reply is empty — telling the client");
+        persist_failure(&state.ctx.session_manager, sid, NO_REPLY_TEXT).await;
         let frame = ChatMessage::error_coded(NO_REPLY_TEXT, NO_REPLY_CODE);
         if let Ok(json) = serde_json::to_string(&frame) {
             let _ = send_terminal(&state, credential.as_ref(), &mut sink, &guarded, &owned_archives, Message::Text(json.into())).await;
