@@ -138,7 +138,7 @@ describe('<WelcomePage> runtime setup (WP2 / D16)', () => {
 
   it('asks an installed-but-signed-out CLI to sign in, in place', async () => {
     const user = userEvent.setup();
-    mockDetect({ claude_cli: true, claude_oauth: false });
+    mockDetect({ claude_cli: true, claude_oauth: false, claude_account_ready: false });
     renderWithProviders(<WelcomePage />);
     await gotoBackendStep(user);
 
@@ -158,6 +158,18 @@ describe('<WelcomePage> runtime setup (WP2 / D16)', () => {
     expect(await screen.findByText(/signed in to claude \(plan: Max\)/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /install it for me/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /sign in now/i })).not.toBeInTheDocument();
+  });
+
+  it('accepts a usable subscription account without a CLI login', async () => {
+    const user = userEvent.setup();
+    mockDetect({ claude_cli: true, claude_oauth: false, claude_account_ready: true });
+    renderWithProviders(<WelcomePage />);
+    await gotoBackendStep(user);
+
+    await user.click(await screen.findByRole('button', { name: /i have a claude subscription/i }));
+    expect(await screen.findByText(/signed in to claude \(plan: OAuth\)/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sign in now/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install it for me/i })).not.toBeInTheDocument();
   });
 
   it('shows a risk line on the Claude subscription card and keeps it recommended', async () => {

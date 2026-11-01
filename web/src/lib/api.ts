@@ -3414,6 +3414,8 @@ export interface RuntimeDetect {
   /** Present since the R4 Grok runtime; older gateways omit it. */
   grok?: boolean;
   claude_oauth: boolean;
+  /** A usable Claude subscription account in the gateway account pool. */
+  claude_account_ready?: boolean;
   claude_subscription: string | null;
   /** Per-runtime rows; deprecation fields are absent on older gateways. */
   runtimes?: Array<{

@@ -165,6 +165,27 @@ function RuntimeSection({ connectionState }: { readonly connectionState: string 
             OAuth
             {detect.claude_subscription ? ` · ${detect.claude_subscription}` : ''}
           </span>
+          <span
+            className={cn(
+              'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium',
+              detect.claude_account_ready
+                ? 'border-success/30 bg-success/10 text-success'
+                : 'border-surface-border text-muted-foreground',
+            )}
+          >
+            {detect.claude_account_ready ? (
+              <CheckCircle2 className="size-3" aria-hidden="true" />
+            ) : (
+              <XCircle className="size-3" aria-hidden="true" />
+            )}
+            {intl.formatMessage({ id: 'devpanel.system.runtime.claudeAccountPool' })}
+            {' · '}
+            {intl.formatMessage({
+              id: detect.claude_account_ready
+                ? 'devpanel.system.runtime.accountReady'
+                : 'devpanel.system.runtime.accountNotReady',
+            })}
+          </span>
         </div>
       )}
     </section>
