@@ -415,6 +415,7 @@ pub const COMPUTER_USE_TOOLS: &[&str] = &[
     "computer_screenshot",
     "computer_click",
     "computer_type",
+    "computer_login",
     "computer_key",
     "computer_scroll",
     "computer_session_start",

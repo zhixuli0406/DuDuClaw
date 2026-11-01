@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### Added
+
+- 本機語音：新增 Kokoro 中文語音模型（Apache-2.0），在「設定 → 語音」下載後即可使用，文字不離開機器。Kokoro 的中文是中國口音，破音字準確度也有限。要台灣口音可改用新增的 Azure AI Speech，由你自備金鑰（`AZURE_SPEECH_KEY`、`AZURE_SPEECH_REGION`），文字會送到微軟。Telegram 目前收到的是 WAV 檔。
+- `[voice] tts_command`：Admin 可把語音合成指向自己的外部程式，比照 `stt_command`。
+- 網頁對話會把 AI 員工的回覆顯示成排版後的文字，支援粗體、表格、清單與程式碼。回覆中的 HTML 不會執行，遠端圖片不會載入，連結文字與網址不同時會顯示實際網域。獨立成段的連結顯示成按鈕。
+- LINE 的 Flex 回覆會為網址加上按鈕，每則最多 3 個。
+- 一般員工的側欄改版：只留交辦任務、儀表板、收件匣、技能庫、記憶、AI 虛擬辦公室、AI 員工與對話紀錄，底部改成個人選單，「我的連線」有未連結時顯示提示。Admin、主管與個人版不變。任務相關入口預設隱藏，可用 `[dashboard] employee_tasks = true` 開回來；隱藏只影響導覽，不影響權限。
+- 邀請同仁：Admin 可寄出一次性連結，同仁用它設定密碼，連結 7 天內有效、只能用一次，只適用還沒有密碼的帳號。要先設定 `[gateway] public_url`（必須是 HTTPS），寄信失敗時 Admin 可複製連結。員工首頁會列出還沒連結的工具。
+- 交辦任務頁列出最近用過的 5 個技能，點一下帶入 `/技能名稱`，可多選，不會直接執行。
+- 網頁對話在回覆進行中也能傳訊息。訊息會排隊，等這輪結束後處理，排隊時可取消，不會插入正在進行的回覆。
+- 想一想模式可開啟獨立審查：`[goal_loop] plan_review = "goldfish"`。三位審查者只看目標、驗收條件與計畫，看不到對話，意見顯示在核准畫面，不會自動改計畫或阻擋開工。預設關閉，呼叫算系統費用，不計入員工預算。
+- 工具清單精簡：`[capabilities] tool_pruning`，預設 `shadow`，只在員工頁顯示有哪些工具沒用過、估計能省多少 tokens，不改變行為。設成 `on` 才會從清單隱藏；隱藏的工具仍可呼叫，呼叫後會回到清單，一鍵可全部恢復。權限閘門不變。
+- 信件工具回傳內容前，會移除登入連結與一次性驗證碼，換成「已移除」的說明。涵蓋內建郵件與 Gmail 工具，第三方 MCP、Remote MCP 與 Bash 不在範圍內。
+- 第三方 MCP 的環境變數金鑰搬出員工的 `.mcp.json`，改存加密檔，由 proxy 啟動上游時才解開。升級時自動遷移並留下加密備份。`args`、`url` 裡的值與工具回傳的內容不在範圍內。**員工自己的內部金鑰仍在 `.mcp.json`；有 Bash 的員工與 gateway 是同一個 OS 使用者，讀得到 gateway 的檔案，要真正隔離請不要給 Bash，或用任務沙箱。**降版前請看 `docs/guides/deprecations.md`。
+- 網站登入代填：Admin 在「系統 → 安全」登錄網站帳密，綁定登入網址與可使用的員工。新工具 `computer_login` 由 gateway 導覽到該網址，一次完成填入與送出，AI 拿不到密碼。遇到二階段驗證要由人接手，同源網頁的 JavaScript 仍讀得到已填入的欄位。**要重建電腦操作映像。**
+- skill 與 pack 簽章：用 minisign 簽章，發行者公鑰釘選在本機 `trusted_publishers.toml`，`duduclaw publishers` 管理，變更要 Admin 核准。新增 `duduclaw pack manifest`、`pack verify`。未簽章的 skill 照舊走隔離與審批，畫面標示「未簽章」；簽章只證明來源，不會跳過掃描與審批。
+- `duduclaw service restart`：macOS 更新後若 launchd 一直重啟失敗（結束碼 78），用這個指令重新註冊，`doctor` 與更新畫面也會提示。
+
+### Changed
+
+- **Breaking:** registry 安裝含 hooks 或 skills 的 pack 時，不再從 registry 下載發行者公鑰，發行者要先用 `duduclaw publishers add` 釘選。
+- 「世界」改名「AI 虛擬辦公室」，「例行工作」改名「自動化」，路由不變。
+- 側欄對話紀錄的字級與導覽項目相同。
+
+### Deprecated
+
+- `tts_provider = "edge-tts"` 與 `"edge"`：仍可解析，會警告一次並當成 `auto`，v1.81.0 移除。
+
+### Removed
+
+- 內建 Edge TTS。微軟改用輪替的驗證 token 後，這條路徑一律回 403，語音從此無法使用。
+
+### Fixed
+
+- 語音設定在 Telegram 與 MCP 工具上沒有生效，都寫死 Edge；現在都依設定。沒有可用語音服務時，Telegram 不顯示 Voice Toggle 按鈕，合成失敗時會告知一次並改傳文字。`/voice` 在不支援的通道會直接說明。
+- 「— Powered by DuDuClaw」原本所有方案都會附加，與授權說明不符；現在只有 opensource、hobby 與沒有授權的安裝才附加，LINE Flex 頁尾比照。
+- 用儀表板連接 Claude 訂閱後，畫面仍顯示未連線。帳號池有可用的訂閱帳號現在算已連線。
+- 網頁對話回合失敗時，錯誤訊息只送到當下的連線，換頁或斷線就看不到。現在會留在對話紀錄，但不會進入 AI 的上下文。
+- 瀏覽器登入狀態偶爾無法還原：子行程繼承檔案鎖，造成鎖一直放不掉。
+
 ## [1.78.0] - 2026-11-01 — 憑證稽核、Agent 設定檔、總經銷品牌與審批權限修正
 
 ### Added
