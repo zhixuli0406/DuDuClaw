@@ -169,7 +169,7 @@ pub(super) async fn gmail_search<I: LocalIo>(
             id,
             thread_id,
             from: header_value(&headers, "From").unwrap_or_default(),
-            subject: header_value(&headers, "Subject").unwrap_or_default(),
+            subject: duduclaw_security::one_time_credential::strip_one_time_credentials(&header_value(&headers, "Subject").unwrap_or_default()).text,
             date: header_value(&headers, "Date").unwrap_or_default(),
             snippet: meta
                 .get("snippet")
@@ -177,6 +177,9 @@ pub(super) async fn gmail_search<I: LocalIo>(
                 .unwrap_or("")
                 .to_string(),
         });
+        if let Some(message) = messages.last_mut() {
+            message.snippet = duduclaw_security::one_time_credential::strip_one_time_credentials(&message.snippet).text;
+        }
     }
 
     Ok(GmailSearchResult {
@@ -204,8 +207,9 @@ pub(super) async fn gmail_read<I: LocalIo>(
     let headers = payload.get("headers").cloned().unwrap_or(Value::Null);
 
     let body_raw = io.sanitize(&extract_message_body(&payload));
-    let body = duduclaw_core::truncate_chars(&body_raw, BODY_MAX_CHARS);
-    let body_truncated = body.chars().count() < body_raw.chars().count();
+    let truncated_body = duduclaw_core::truncate_chars(&body_raw, BODY_MAX_CHARS);
+    let body_truncated = truncated_body.chars().count() < body_raw.chars().count();
+    let body = duduclaw_security::one_time_credential::strip_one_time_credentials(&truncated_body).text;
     let attachments = collect_attachments(&payload);
 
     Ok(GmailReadResult {
@@ -217,13 +221,13 @@ pub(super) async fn gmail_read<I: LocalIo>(
             .to_string(),
         from: header_value(&headers, "From").unwrap_or_default(),
         to: header_value(&headers, "To").unwrap_or_default(),
-        subject: header_value(&headers, "Subject").unwrap_or_default(),
+        subject: duduclaw_security::one_time_credential::strip_one_time_credentials(&header_value(&headers, "Subject").unwrap_or_default()).text,
         date: header_value(&headers, "Date").unwrap_or_default(),
-        snippet: msg
+        snippet: duduclaw_security::one_time_credential::strip_one_time_credentials(&msg
             .get("snippet")
             .and_then(|s| s.as_str())
             .unwrap_or("")
-            .to_string(),
+            .to_string()).text,
         body,
         body_truncated,
         attachments,

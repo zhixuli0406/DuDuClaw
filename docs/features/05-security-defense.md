@@ -314,6 +314,8 @@ What it does not stop: an employee with a shell can still replace the key (detec
 
 ## Acting as a colleague's Google account (v1.76.0)
 
+Inbound mail text returned by the built-in mail tools and Gmail search/read is scanned before it reaches an AI employee. Login links and nearby one-time codes are replaced with notices; mail identifiers and timestamps remain unchanged. This boundary covers only the built-in mail and Gmail result fields. It does not scan third-party MCP servers, Remote MCP, or content read through Bash.
+
 Company delegation lets an AI employee use Google as one named colleague. The gates, all failing closed:
 
 - **Only the proven employee.** The identity is chosen from the employee proven by `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN`, never from a tool argument. A process claiming an employee it cannot prove gets only the home default, and nothing when the claimed employee is set to anything else.

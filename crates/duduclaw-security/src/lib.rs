@@ -8,6 +8,7 @@ pub mod credential_protection;
 pub mod crypto;
 pub mod failsafe;
 pub mod input_guard;
+pub mod one_time_credential;
 pub mod keyfile;
 pub mod killswitch;
 pub mod perception;
