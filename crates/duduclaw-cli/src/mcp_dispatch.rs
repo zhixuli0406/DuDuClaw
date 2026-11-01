@@ -56,26 +56,13 @@ pub(crate) struct PolicyOnlyConfig {
 /// P2-4 adds three read-only structured sensing tools (frontmost app/window,
 /// Spotlight search, today's calendar) alongside the P1 action/status tools —
 /// same gate, no ActionGuard (they have no host side-effect).
-pub(crate) const OS_NATIVE_TOOLS: &[&str] = &[
-    "os_notify",
-    "os_watch_status",
-    "os_open",
-    "os_frontmost",
-    "os_spotlight_search",
-    "os_calendar_today",
-];
+pub(crate) use duduclaw_core::mcp_tool_defs::OS_NATIVE_TOOLS;
 
 /// The recording MCP tools gated by the `[capabilities] recording` master
 /// switch (WP3.3). Recording captures live browser traffic / desktop
 /// screenshots, so it is deny-by-default per agent — same enforcement shape
 /// as [`OS_NATIVE_TOOLS`].
-pub(crate) const RECORDING_TOOLS: &[&str] = &[
-    "browser_record_start",
-    "browser_record_stop",
-    "desktop_record_start",
-    "desktop_record_stop",
-    "skill_from_recording",
-];
+pub(crate) use duduclaw_core::mcp_tool_defs::RECORDING_TOOLS;
 
 /// The system-operator MCP tool face gated by the `[capabilities]
 /// system_operator` master switch (O-4, closing O-0's residual risk 4).
@@ -89,29 +76,7 @@ pub(crate) const RECORDING_TOOLS: &[&str] = &[
 /// agent's own machine footprint, `system_operator` is "this agent may
 /// operate the box on a human's behalf" — an agent can hold either, both,
 /// or neither.
-pub(crate) const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
-    "os_device_status",
-    "os_system_status",
-    "os_check_update",
-    "os_backup_list",
-    "os_network_info",
-    "os_wifi_status",
-    "os_wifi_scan",
-    "os_wifi_connect",
-    "os_apply_update",
-    "os_boot_assessment",
-    "os_update_rollback",
-    "os_backup_create",
-    "os_power",
-    "os_factory_reset",
-    "os_doctor_repair",
-    "os_display_get",
-    "os_display_set",
-    // Y10-1: agent→audio bridge (wpctl volume/mute/output) — same
-    // deny-by-default tier as os_display_get/set.
-    "os_audio_get",
-    "os_audio_set",
-];
+pub(crate) use duduclaw_core::mcp_tool_defs::SYSTEM_OPERATOR_TOOLS;
 
 /// The human-machine co-drive MCP tool face gated by the `[capabilities]
 /// codrive` master switch (CD-1,
@@ -124,7 +89,7 @@ pub(crate) const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
 /// A2 added the read-only `codrive_status`. It is gated identically and on
 /// purpose: an agent without the co-drive capability has no business
 /// learning whether a human is currently at the shared desktop.
-pub(crate) const CODRIVE_TOOLS: &[&str] = &["codrive_run", "codrive_status"];
+pub(crate) use duduclaw_core::mcp_tool_defs::CODRIVE_TOOLS;
 
 /// The read-only SQL connector tools gated by the per-agent
 /// `[capabilities] db_sources` grant list (WP-D,
@@ -137,7 +102,7 @@ pub(crate) const CODRIVE_TOOLS: &[&str] = &["codrive_run", "codrive_status"];
 /// source it may touch is checked inside each handler, which is the layer that
 /// knows the `source` argument — `db_sources` (the listing tool) takes none
 /// and simply lists what the agent was granted.
-pub(crate) const DB_SOURCE_TOOLS: &[&str] = &["db_sources", "db_tables", "db_select", "db_query"];
+pub(crate) use duduclaw_core::mcp_tool_defs::DB_SOURCE_TOOLS;
 
 /// The Computer Use tool face gated by `[capabilities] computer_use`.
 ///
@@ -146,26 +111,13 @@ pub(crate) const DB_SOURCE_TOOLS: &[&str] = &["db_sources", "db_tables", "db_sel
 /// call) and the `tools/list` filter — they used to be a hand-written match
 /// arm and nothing respectively, so a capability-less agent was shown seven
 /// (now eight) tools every call would reject.
-pub(crate) const COMPUTER_USE_TOOLS: &[&str] = &[
-    "computer_screenshot",
-    "computer_click",
-    "computer_type",
-    "computer_key",
-    "computer_scroll",
-    "computer_session_start",
-    "computer_session_stop",
-    "computer_navigate",
-];
+pub(crate) use duduclaw_core::mcp_tool_defs::COMPUTER_USE_TOOLS;
 
 /// The durable-workspace tools (P2-C). Gated like [`COMPUTER_USE_TOOLS`] by
 /// `[capabilities] computer_use` at dispatch, and additionally hidden from
 /// `tools/list` unless `[capabilities.computer_use_config] workspace` is on.
 /// Hiding is discovery only: the gateway re-checks every switch per call.
-pub(crate) const COMPUTER_WORKSPACE_TOOLS: &[&str] = &[
-    "computer_workspace_list",
-    "computer_workspace_read",
-    "computer_workspace_write",
-];
+pub(crate) use duduclaw_core::mcp_tool_defs::COMPUTER_WORKSPACE_TOOLS;
 
 /// Tools whose arguments are NEVER restored from redaction tokens, whatever
 /// `[redaction.tool_egress]` says (an exact, `computer_*` or `*` rule
@@ -177,14 +129,7 @@ pub(crate) const NEVER_RESTORE_ARGS_TOOLS: &[&str] = &["computer_workspace_write
 /// toggle. The hard gate stays inside each handler (`mcp_fork::require_enabled`);
 /// this list exists so `tools/list` can keep *discoverable ⇔ callable* for an
 /// agent that never opted into forking.
-pub(crate) const FORK_TOOLS: &[&str] = &[
-    "fork_run",
-    "inspect_branches",
-    "diff_branches",
-    "merge_or_select",
-    "terminate_branch",
-    "fork_cost",
-];
+pub(crate) use duduclaw_core::mcp_tool_defs::FORK_TOOLS;
 
 /// Neutralize `os_notify` `title`/`body` in place for the user's visual surface
 /// (P2-5). Each value is replaced by its perception-sanitized form (control

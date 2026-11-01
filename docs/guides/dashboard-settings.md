@@ -7,6 +7,23 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 Goal cost and loop guards currently use the **Advanced config editor**, without dedicated Automation controls. In `config.toml [goal_loop]`, `default_cost_cap_cents = 0` sets the fallback goal ceiling in US cents (`0` = no cap), and `tool_streak_pause = 8` pauses after that many identical consecutive tool calls within one finished round (`0` = disabled). Saving in the Advanced config editor reloads the goal loop; direct edits to `config.toml` require a gateway restart. `tool_streak_advisory` independently controls the existing hints. Per-goal ceilings are set when assigning a goal; `/goals` shows spend and lets an authorized operator raise a paused goal's ceiling and retry.
 
 
+
+## Per-employee tool list pruning
+
+In an employee's overview, Admins can open **Tool list pruning** to select a mode, inspect unused tools and estimated token savings, or restore the list while pruning is on. The selector uses the existing employee update path. The status and restore RPCs are Admin-only: `agents.tool_pruning_status {agent_id}` and `agents.tool_pruning_restore {agent_id}`. Estimates use each candidate tool's serialized definition length divided by four; they are not tokenizer measurements or measured provider savings.
+
+```toml
+# agent.toml
+[capabilities]
+tool_pruning = "shadow" # "off" | "shadow" | "on"
+```
+
+The default is `shadow`: observe and report, with the same `tools/list` response as `off`. Unknown or malformed values behave as `off` and warn once. Only `on` hides eligible tools, after all existing discovery filters. This never grants or revokes permission: a hidden tool remains callable through the existing dispatch gates. A successful hidden-tool call makes it visible again through `notifications/tools/list_changed`.
+
+The calculation reads at most the last 5 MB of `tool_calls.jsonl`. Missing or unreadable logs, and fewer than ten recorded turns, leave the list intact. A candidate must be unused across at least ten turns spanning two sessions, or five sessions. Memory, tasks, working state, messaging, approvals, wiki reads, tool discovery, Admin/unknown-effect tools and tools with active scoped task grants stay visible. A turn is a distinct host-stamped `(session_id, turn_id)` pair, not a log line. Channel calls use the conversation session and turn; dispatched work uses its own dispatch session and run (one run is one turn). Older rows without these identities do not establish turn samples, but a successful use still resets that tool’s unused window. Thresholds count the turns and sessions since each tool’s last successful use. Results are cached per process for five minutes. Restore writes an employee-specific reset marker; usage before that marker no longer contributes, so the full eligible list returns. Existing permission filters still apply.
+
+Claude CLI `minimal_context` uses `--tools` for built-in CLI tools; it does not prune MCP definitions. Its behavior is unchanged.
+
 ## Account roles and visible AI staff
 
 Giving an AI employee Bash or machine tools lets anyone bound to it direct those tools. Review the employee's capabilities before binding people to it; an Admin may still grant native tools to ordinary AI employees.

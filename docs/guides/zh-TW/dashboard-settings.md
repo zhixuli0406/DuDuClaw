@@ -9,6 +9,23 @@
 目標費用與重複呼叫防護目前在「設定檔進階編輯」設定，沒有獨立的自動化控制項。`config.toml [goal_loop]` 的 `default_cost_cap_cents = 0` 是未設定個別上限的目標所使用的美分上限（`0`＝不限額）；`tool_streak_pause = 8` 表示一輪結束後，相同工具與參數連續呼叫達此次數就暫停（`0`＝關閉）。透過進階編輯器儲存會重新載入目標迴圈；直接修改 `config.toml` 則需重新啟動 gateway。`tool_streak_advisory` 另行控制既有提醒。個別上限可在交辦目標時填寫；`/goals` 顯示費用，並讓有權限的操作者提高暫停目標的上限後重試。
 
 
+
+## 每位員工的工具清單精簡
+
+管理員可在員工總覽的「工具清單精簡」卡片選擇模式、展開未使用工具與查看預估節省量；啟用時可還原清單。模式選單沿用既有員工更新流程。`agents.tool_pruning_status {agent_id}` 與 `agents.tool_pruning_restore {agent_id}` 都限 Admin。估算方式是各候選工具定義序列化後的長度除以四，不是 tokenizer 的實際結果，也不代表供應商實測省下的用量。
+
+```toml
+# agent.toml
+[capabilities]
+tool_pruning = "shadow" # "off" | "shadow" | "on"
+```
+
+預設 `shadow` 僅觀察與回報，`tools/list` 回覆與 `off` 完全相同。未知或格式錯誤的值視為 `off`，並警告一次。只有 `on` 會在所有既有清單篩選之後隱藏符合條件的工具。這不會授予或撤銷權限：隱藏工具仍可通過原有 dispatch 閘呼叫；成功呼叫後，工具會經 `notifications/tools/list_changed` 重新出現在清單。
+
+計算只讀取 `tool_calls.jsonl` 最後 5 MB。紀錄不存在、無法讀取或不足十個已記錄回合時，不精簡任何工具。工具至少連續十個回合未使用且跨兩個 session，或跨五個 session 未使用，才符合條件。記憶、任務、工作狀態、訊息、核准、wiki 讀取、工具探索、Admin／未知效果類別工具，以及有有效任務範圍授權的工具都保留。回合以主機寫入的 `(session_id, turn_id)` 唯一組合計算，不是 log 行數。頻道呼叫使用對話 session 與 turn；派工作業使用自身的 dispatch session 與 run，一次 run 算一回合。舊紀錄缺少這些欄位時，不建立回合樣本，但成功使用仍會重設該工具的未使用期間。門檻從各工具最後一次成功使用之後開始計算。每個行程快取五分鐘。還原會寫入該員工的重設標記，不再採計標記時間之前的使用紀錄，讓符合既有權限的完整清單回來；原有權限篩選仍適用。
+
+Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不影響 MCP 工具定義；此流程維持原樣。
+
 ## 帳號角色與可見的 AI 員工
 
 給 AI 員工 Bash 或機器操作工具，就代表綁定者可以指揮它使用這些工具。綁定前請先確認這位員工能做什麼，只授權給合適的人；管理員仍可授予一般 AI 員工原生工具。

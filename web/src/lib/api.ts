@@ -4365,7 +4365,18 @@ export type AutonomyLevel = 'operator' | 'collaborator' | 'consultant' | 'approv
 
 /** The `capabilities` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present (partial update). */
+export type ToolPruningMode = 'off' | 'shadow' | 'on';
+
+export interface ToolPruningStatus {
+  mode: ToolPruningMode;
+  listed_count: number;
+  prunable_names: string[];
+  estimated_tokens: number;
+  estimate: true;
+}
+
 export interface AgentCapabilities {
+  tool_pruning?: ToolPruningMode;
   recipient_guard?: 'off' | 'shadow' | 'ask';
   recipients?: string[];
   computer_use?: boolean;
@@ -6262,6 +6273,10 @@ export const api = {
       client.call('agents.pause', { agent_id: agentId }) as Promise<{ success: boolean }>,
     resume: (agentId: string) =>
       client.call('agents.resume', { agent_id: agentId }) as Promise<{ success: boolean }>,
+    toolPruningStatus: (agentId: string) =>
+      client.call('agents.tool_pruning_status', { agent_id: agentId }) as Promise<ToolPruningStatus>,
+    toolPruningRestore: (agentId: string) =>
+      client.call('agents.tool_pruning_restore', { agent_id: agentId }) as Promise<ToolPruningStatus>,
     inspect: (agentId: string) =>
       client.call('agents.inspect', { agent_id: agentId }) as Promise<AgentDetail>,
     /** E1 — lightweight avatar-only fetch. Unlike `inspect` this does NOT run a

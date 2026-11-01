@@ -416,6 +416,24 @@ pub fn append_tool_call_with_extras(
         map.insert("on_behalf_of".into(), principal.to_string().into());
     }
 
+    // Usage identity comes only from the gateway's spawn environment. A
+    // dispatched run has its own identity, separate from an upstream turn.
+    map.remove("session_id");
+    map.remove("turn_id");
+    let identity_pair = if std::env::var_os(duduclaw_core::ENV_DISPATCH_SESSION).is_some()
+        || std::env::var_os(duduclaw_core::ENV_DISPATCH_RUN_ID).is_some() {
+        (duduclaw_core::ENV_DISPATCH_SESSION, duduclaw_core::ENV_DISPATCH_RUN_ID)
+    } else {
+        (duduclaw_core::ENV_TRUST_SESSION_ID, duduclaw_core::ENV_TRUST_TURN_ID)
+    };
+    if let (Ok(session), Ok(turn)) = (std::env::var(identity_pair.0), std::env::var(identity_pair.1)) {
+        let valid = |s: &str| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control);
+        if valid(&session) && valid(&turn) {
+            map.insert("session_id".into(), session.into());
+            map.insert("turn_id".into(), turn.into());
+        }
+    }
+
     // 0600 on create: since result_text landed, rows can carry business
     // data (e.g. Odoo reads), so the file must not be world/group-readable.
     // `append_chained_line` tightens an existing file's permissions if they
