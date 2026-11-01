@@ -1575,7 +1575,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // 3. Non-existent binary (e.g., stale `duduclaw-pro`) → fixes it
     {
         let agents_dir = home_dir.join("agents");
-        let fixed = duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all(&agents_dir);
+        // Backup and seal legacy third-party env before any config repair.
+        let migrated = duduclaw_agent::mcp_secret_migration::migrate_all(&home_dir);
+        if migrated.migrated > 0 {
+            info!(count = migrated.migrated, "Moved third-party MCP env into encrypted employee stores");
+        }
+        let fixed = if migrated.scan_complete {
+            duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all_except(&agents_dir, &migrated.failed)
+        } else {
+            // No second sweep may rewrite a config the migration could not inspect.
+            0
+        };
         if fixed > 0 {
             info!(
                 count = fixed,

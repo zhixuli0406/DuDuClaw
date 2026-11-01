@@ -225,3 +225,8 @@ OS ユーザーの CLI 設定に追加された許可ルールは自動削除し
 ## MFA
 
 MFAフェーズ1では `/api/login` と `/api/otp/verify` に条件付き応答を追加します。未登録かつ非強制の場合は従来の `access_token`、`refresh_token`、`user` を維持します。登録済みなら `mfa_required`、`challenge_id` のみ、強制中の未登録なら `mfa_enrollment_required`、`enrollment_token` のみです。クライアントは `/api/mfa/verify` または `/api/mfa/enroll/*` を完了してからログイン成功と判断してください。既存端点は削除せず、Dashboardは次フェーズで対応します。
+
+
+## 外部 MCP の環境変数資格情報
+
+MCP env の移行後に旧版へ戻すには、暗号化した移行バックアップとキーの再入力が必要です。旧版は `secret://` 参照を資格情報の文字列として送る可能性があります。`<home>/backups/mcp-migrate/*.enc` の復号に必要な元の `.keyfile` を保持し、旧版を起動する前に互換性のある設定を復元してキーを再入力してください。

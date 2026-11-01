@@ -2296,12 +2296,16 @@ fn explore_lane_mcp_config(
     let raw = std::fs::read_to_string(mcp_json).map_err(|e| format!("cannot read .mcp.json: {e}"))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("malformed .mcp.json: {e}"))?;
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate the duduclaw binary: {e}"))?;
+    let exe = duduclaw_core::resolve_duduclaw_bin();
+    let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home_dir, agent_id, &exe);
+    duduclaw_core::mcp_proxy_rewrite::validate_raw_mcp_config(&parsed, &exe, &own)
+        .map_err(|e| crate::mcp_spawn_gate::spawn_gate_error(&e))?;
     let rewrite = rewrite_mcp_config_for_gate(
         &parsed,
         &exe,
-        ProxyPurpose { redaction: false, tool_gate: true },
-    );
+        ProxyPurpose { redaction: false, tool_gate: true, secret_env: true },
+        &own,
+    ).map_err(|e| crate::mcp_spawn_gate::spawn_gate_error(&e))?;
     // Direct `url` / `type` entries cannot be gated; they were removed.
     for server in &rewrite.dropped_remote {
         duduclaw_security::audit::append_audit_event(
@@ -2320,6 +2324,11 @@ fn explore_lane_mcp_config(
         );
     }
     let rewritten = rewrite.config;
+    if duduclaw_core::mcp_proxy_rewrite::has_unrouted_mcp_secret_refs(&rewritten) {
+        return Err(crate::mcp_spawn_gate::spawn_gate_error(
+            "第三方 MCP 憑證引用無法交由代理解析，已拒絕啟動。",
+        ));
+    }
     if rewritten == parsed {
         return Ok(None);
     }
@@ -2337,6 +2346,29 @@ fn explore_lane_mcp_config(
     let path = file.into_temp_path();
     duduclaw_core::platform::set_owner_only(&path).ok();
     Ok(Some(path))
+}
+
+#[cfg(test)]
+mod secret_proxy_gate_tests {
+    #[test]
+    fn unrouteable_secret_references_refuse_proactive_spawn() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".mcp.json");
+        let exe = std::env::current_exe().unwrap();
+        let defs = [
+            serde_json::json!({"env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}),
+            serde_json::json!({"command":exe, "args":["mcp-proxy","--server","vendor","--","vendor-mcp"],
+                "env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}),
+        ];
+        for def in defs {
+            let raw = serde_json::json!({"mcpServers":{"vendor":def}}).to_string();
+            std::fs::write(&path, &raw).unwrap();
+            let error = super::explore_lane_mcp_config(home.path(), "alice", &path).unwrap_err();
+            assert!(crate::mcp_spawn_gate::is_spawn_gate_error(&error));
+            assert!(!error.contains("secret://"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+    }
 }
 
 #[cfg(test)]

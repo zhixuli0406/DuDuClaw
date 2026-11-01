@@ -40,7 +40,7 @@ async fn prepare_for(dir: &Path, home: &Path) -> Result<Prepared, String> {
 #[tokio::test]
 async fn no_mcp_json_or_only_duduclaw_is_the_old_spawn() {
     let only_own =
-        json!({ "mcpServers": { "duduclaw": { "command": "duduclaw", "args": [] } } }).to_string();
+        json!({ "mcpServers": { "duduclaw": { "command": duduclaw_core::resolve_duduclaw_bin(), "args": ["mcp-server"] } } }).to_string();
     for body in [None, Some(only_own), Some("{}".to_string())] {
         let (home, dir) = employee(body.as_deref());
         let before = std::fs::read(dir.join(".mcp.json")).ok();
@@ -55,6 +55,18 @@ async fn no_mcp_json_or_only_duduclaw_is_the_old_spawn() {
             before,
             "no gate ran: {body:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_builtin_name_with_a_third_party_command_cannot_take_the_old_spawn() {
+    let raw = json!({"mcpServers":{"duduclaw":{
+        "command":"third-party-mcp", "env":{"API_KEY":"secret://mcp/duduclaw/API_KEY"}
+    }}}).to_string();
+    let (home, dir) = employee(Some(&raw));
+    match prepare_for(&dir, home.path()).await {
+        Ok(prepared) => assert!(prepared.managed, "a name alone cannot skip the managed path"),
+        Err(error) => assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error)),
     }
 }
 
@@ -212,7 +224,7 @@ async fn names_differing_only_in_case_refuse_the_spawn() {
 #[tokio::test]
 async fn cursor_mcp_json_names_are_shadowed() {
     let only_own =
-        json!({ "mcpServers": { "duduclaw": { "command": "duduclaw", "args": [] } } }).to_string();
+        json!({ "mcpServers": { "duduclaw": { "command": duduclaw_core::resolve_duduclaw_bin(), "args": ["mcp-server"] } } }).to_string();
     let (home, dir) = employee(Some(only_own.as_str()));
     std::fs::create_dir_all(dir.join(".cursor")).unwrap();
     std::fs::write(
@@ -590,4 +602,25 @@ async fn live_grok_doctor_starts_only_gated_servers_and_only_in_their_spawn() {
         "without its spawn's env dir the proxy starts nothing"
     );
     assert!(!bad_marker.exists());
+}
+
+#[tokio::test]
+async fn secret_refs_are_shadowed_by_proxy_and_never_resolved_in_grok_config() {
+    let raw = broker_mcp_json().replace("broker-secret-pw", "secret://mcp/masterlink/ML_PASSWORD");
+    let (home, dir) = employee(Some(&raw));
+    let prepared = prepare_for(&dir, home.path()).await.unwrap();
+    let (persistent, config) = config(&dir);
+    assert_eq!(config["mcp_servers"]["masterlink"]["args"][0].as_str(), Some("mcp-proxy"));
+    assert!(!persistent.contains("secret://"));
+    let blob = std::fs::read_to_string(prepared.env_dir.unwrap().path().join("masterlink.json")).unwrap();
+    assert!(blob.contains("secret://mcp/masterlink/ML_PASSWORD"));
+}
+
+#[tokio::test]
+async fn a_reference_that_cannot_be_proxied_refuses_grok_spawn() {
+    let raw = json!({"mcpServers":{"vendor":{"env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}}}).to_string();
+    let (home, dir) = employee(Some(&raw));
+    let error = prepare_for(&dir, home.path()).await.unwrap_err();
+    assert!(error.starts_with(duduclaw_agent::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX));
+    assert!(!error.contains("secret://"));
 }

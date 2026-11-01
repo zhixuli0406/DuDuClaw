@@ -1082,8 +1082,9 @@ pub async fn cmd_export(home: &Path, slug: &str, format: &str, out: Option<&Path
         exported += 1;
 
         if let Some(servers) = super::read_mcp_servers(&agent_dir.join(".mcp.json")) {
-            for (k, v) in servers {
-                if k != "duduclaw" {
+            for (k, mut v) in servers {
+                if k != "duduclaw" && k != "duduclaw-pro" && k != duduclaw_core::mcp_server_key() {
+                    placeholder_export_env(&mut v);
                     plugin_servers.entry(k).or_insert(v);
                 }
             }
@@ -1107,6 +1108,31 @@ pub async fn cmd_export(home: &Path, slug: &str, format: &str, out: Option<&Path
         out_dir.display()
     );
     Ok(())
+}
+
+/// Exports carry variable names, never local references or stored values.
+/// Empty strings require the importer/operator to enter credentials again.
+fn placeholder_export_env(def: &mut serde_json::Value) {
+    if let Some(env) = def.get_mut("env").and_then(serde_json::Value::as_object_mut) {
+        for value in env.values_mut() {
+            *value = serde_json::Value::String(String::new());
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_export_secret_tests {
+    #[test]
+    fn export_preserves_names_only() {
+        let mut def = serde_json::json!({"command":"npx","args":["example"],"env":{
+            "API_KEY":"secret://mcp/example/API_KEY", "LEGACY_KEY":"sk-live-private", "HOME":"/private/home"
+        }});
+        super::placeholder_export_env(&mut def);
+        let text = def.to_string();
+        assert!(!text.contains("secret://") && !text.contains("sk-live-private") && !text.contains("/private/home"));
+        assert_eq!(def["env"], serde_json::json!({"API_KEY":"", "LEGACY_KEY":"", "HOME":""}));
+        assert_eq!(def["args"], serde_json::json!(["example"]));
+    }
 }
 
 /// Pull `[model] preferred` + `[capabilities] allowed/denied_tools` back out

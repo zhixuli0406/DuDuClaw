@@ -35,7 +35,7 @@ use tracing::warn;
 
 use duduclaw_core::mcp_proxy_rewrite::{
     PROXY_CARRY_ENV, PROXY_SPAWN_SCOPED_FLAG, PROXY_UPSTREAM_ENV_VAR, is_duduclaw_server,
-    is_portable_server_name, is_remote_bridge_invocation,
+    is_portable_server_name, is_proxy_private_env_key, is_remote_bridge_invocation,
 };
 
 pub(crate) mod env_files;
@@ -215,7 +215,7 @@ fn extract_gated(
     };
     let exe = self_exe.to_string_lossy();
     for (name, def) in servers {
-        if is_duduclaw_server(name) {
+        if is_duduclaw_server(name, def, self_exe) {
             continue;
         }
         if !is_portable_server_name(name) {
@@ -330,7 +330,7 @@ fn scope_one(name: &str, s: &GatedServer) -> ScopedServer {
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
         for (k, v) in &s.env {
-            if k != PROXY_UPSTREAM_ENV_VAR && !PROXY_CARRY_ENV.contains(&k.as_str()) {
+            if !is_proxy_private_env_key(k) && !PROXY_CARRY_ENV.contains(&k.as_str()) {
                 upstream
                     .entry(k.clone())
                     .or_insert_with(|| Value::String(v.clone()));
@@ -347,9 +347,13 @@ fn scope_one(name: &str, s: &GatedServer) -> ScopedServer {
             s.command.clone(),
         ];
         args.extend(s.args.iter().cloned());
+        // extract_gated added host identity for the bridge's direct spawn.
+        // It belongs to the outer proxy now, never to the declared upstream
+        // blob. The proxy injects verified identity into canonical bridges.
         let upstream = s
             .env
             .iter()
+            .filter(|(k, _)| !is_proxy_private_env_key(k))
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
             .collect();
         (args, upstream)

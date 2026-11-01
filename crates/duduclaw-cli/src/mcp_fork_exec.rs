@@ -373,7 +373,9 @@ impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
         }};
 
         let cost_cents = (out.spent_usd * 100.0).round().max(0.0) as u64;
-        if out.outcome != SpawnOutcome::BudgetRefused {
+        if out.outcome != SpawnOutcome::BudgetRefused
+            && !duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&out.output)
+        {
             self.provider.report(&account.id, out.ok(), cost_cents).await;
         }
 
@@ -937,6 +939,23 @@ pub async fn build_rotator_provider(home_dir: &Path) -> Option<Arc<RotatorProvid
 
 // ── Production claude spawner ────────────────────────────────────────────────
 
+/// A copied branch config still needs the normal spawn-time proxy rewrite.
+/// The returned guard must outlive the CLI; references stay encrypted until
+/// that proxy starts the upstream under the copied employee identity.
+fn prepare_fork_mcp_proxy(
+    home: &Path,
+    workspace: &Path,
+    command: &mut tokio::process::Command,
+) -> Result<Option<tempfile::TempPath>, String> {
+    let guard = duduclaw_gateway::redaction_proxy::maybe_proxy_mcp_config(
+        home, &workspace.join(".mcp.json"),
+    )?;
+    if let Some(path) = &guard {
+        command.arg("--mcp-config").arg(path.as_os_str()).arg("--strict-mcp-config");
+    }
+    Ok(guard)
+}
+
 /// Spawns the real `claude` CLI for a branch. Best-effort: discovers the binary
 /// via `duduclaw_core::which_claude`, runs `claude -p` with stream-json output in
 /// the branch workspace, and extracts the final text + usage cost.
@@ -985,6 +1004,14 @@ impl CliSpawner for ClaudeCliSpawner {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        let mcp_proxy_guard = match prepare_fork_mcp_proxy(&self.home_dir, workspace, &mut cmd) {
+            Ok(guard) => guard,
+            Err(error) => return CliRunOutput {
+                output: error,
+                spent_usd: 0.0,
+                outcome: SpawnOutcome::Failed,
+            },
+        };
 
         // The lease ends immediately after spawn, not after branch completion.
         if duduclaw_core::autonomy_handoff::capture().is_none() {
@@ -1085,6 +1112,7 @@ impl CliSpawner for ClaudeCliSpawner {
             }
         };
 
+        drop(mcp_proxy_guard); // The proxy config survives until the child is reaped.
         CliRunOutput {
             output: duduclaw_core::truncate_bytes(&text, 16_000).to_string(),
             spent_usd: running_cost,
@@ -1247,6 +1275,43 @@ pub fn append_fork_history(home_dir: &Path, entry: &ForkHistoryEntry) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copied_fork_secret_config_is_proxied_for_the_child_lifetime() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let workspace = home.path().join("branch");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = serde_json::json!({"mcpServers": {
+            "duduclaw":{"command":"/opt/duduclaw", "args":["mcp-server"], "env":{"DUDUCLAW_AGENT_ID":"alice"}},
+            "vendor":{"command":"vendor-mcp", "env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}
+        }}).to_string();
+        std::fs::write(workspace.join(".mcp.json"), &source).unwrap();
+        let mut cmd = tokio::process::Command::new("claude");
+        let guard = super::prepare_fork_mcp_proxy(home.path(), &workspace, &mut cmd).unwrap().unwrap();
+        let path = guard.to_path_buf();
+        let args: Vec<_> = cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec!["--mcp-config".to_string(), path.to_string_lossy().into_owned(), "--strict-mcp-config".to_string()]);
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["vendor"]["args"][0], "mcp-proxy");
+        assert_eq!(config["mcpServers"]["vendor"]["env"]["DUDUCLAW_AGENT_ID"], "alice");
+        assert_eq!(std::fs::read_to_string(workspace.join(".mcp.json")).unwrap(), source);
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn fork_secret_rewrite_failure_never_returns_original_config() {
+        let home = tempfile::tempdir().unwrap();
+        let source = serde_json::json!({"mcpServers":{"vendor":{"env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}}}).to_string();
+        std::fs::write(home.path().join(".mcp.json"), &source).unwrap();
+        let mut cmd = tokio::process::Command::new("claude");
+        let error = super::prepare_fork_mcp_proxy(home.path(), home.path(), &mut cmd).unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+        assert!(!error.contains("secret://"));
+        assert_eq!(cmd.as_std().get_args().count(), 0);
+        assert_eq!(std::fs::read_to_string(home.path().join(".mcp.json")).unwrap(), source);
+    }
+
     use super::*;
     use duduclaw_fork::BranchId;
 
