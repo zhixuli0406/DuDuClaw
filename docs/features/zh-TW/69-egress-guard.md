@@ -120,7 +120,7 @@ Cron、派工、提醒、信件、heartbeat、ephemeral 執行入口改為獨立
 
 Remote bridge 使用每次呼叫獨有的 generation wire ID，丟棄過期回覆，避免重用原始 ID 時，舊回覆提早結束新的外送 lease。呼叫端若使用保留的 `duduclaw-egress:` ID 命名空間，會收到明確拒絕。
 
-## 由伺服器綁定收件對象（未發行）
+## 由伺服器綁定收件對象
 
 收件對象防護不以「讀過私人資料」為前提。`config.toml [security] recipient_guard` 支援 `off`、`shadow`（預設）與 `ask`；未知值會警告並採用 `ask`。員工層 `[capabilities] recipient_guard` 只能收緊全域設定（`off < shadow < ask`）。安全頁「資料外送防護」可調整全域設定；Admin 可在員工編輯頁「工具與權限 → 允許的收件對象」設定額外清單。
 

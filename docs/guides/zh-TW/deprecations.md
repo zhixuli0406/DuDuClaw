@@ -2,7 +2,7 @@
 
 ## 舊版員工記憶檔
 
-`MEMORY.md` 標為 legacy，僅互動式 agent runner 仍會注入，頻道、精簡模式與任務沙箱不讀取，也不包含在 Agent File 匯出中。管理者維護的服務對象介紹請使用原生 `USER.md`；學到的事實使用既有記憶工具。既有檔案不搬移、不刪除，目前沒有排定移除版本。
+`MEMORY.md` 標為 legacy，互動式 agent runner 與 `claude_runner` 路徑仍會注入，頻道、精簡模式與任務沙箱不讀取，也不包含在 Agent File 匯出中。管理者維護的服務對象介紹請使用原生 `USER.md`；學到的事實使用既有記憶工具。既有檔案不搬移、不刪除，目前沒有排定移除版本。
 
 
 這頁列出改名或合併過的公開名稱，哪些已經移除，哪些還在棄用期。
@@ -202,6 +202,6 @@ CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 製作端指令 `expert pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`
 維持在 `duduclaw expert` 底下。
 
-## MFA (Unreleased)
+## MFA
 
 MFA 第一階段為 `/api/login` 與 `/api/otp/verify` 新增條件式回應。未註冊且未強制時仍維持 `access_token`、`refresh_token`、`user` 原格式；已註冊者只回 `mfa_required`、`challenge_id`；強制期間未註冊者只回 `mfa_enrollment_required`、`enrollment_token`。客戶端必須先完成 `/api/mfa/verify` 或 `/api/mfa/enroll/*`，才能視為登入成功。沒有移除原端點，Dashboard 支援留待下一階段。
