@@ -7,6 +7,17 @@ Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-J
 Goal cost and loop guards currently use the **Advanced config editor**, without dedicated Automation controls. In `config.toml [goal_loop]`, `default_cost_cap_cents = 0` sets the fallback goal ceiling in US cents (`0` = no cap), and `tool_streak_pause = 8` pauses after that many identical consecutive tool calls within one finished round (`0` = disabled). Saving in the Advanced config editor reloads the goal loop; direct edits to `config.toml` require a gateway restart. `tool_streak_advisory` independently controls the existing hints. Per-goal ceilings are set when assigning a goal; `/goals` shows spend and lets an authorized operator raise a paused goal's ceiling and retry.
 
 
+## Employee sidebar
+
+On non-Personal editions, Employee accounts see Dashboard, Inbox (with an unread count), Skills, Memory and Virtual office, followed by their bound AI staff and conversation history. The AI staff list is ordered Owner, Operator, Viewer, shows up to eight entries, and links to the full list. Search and Assign task remain at the top. Account settings, My connections, appearance, language, help and sign out are in the user menu; help is hidden for distributor brands. An amber dot beside My connections means at least one connection is missing. The gateway version appears at the bottom-right of the main area. Admin, Manager and Personal navigation keep their existing structure. Automations (`/routines`) remains Admin-only.
+
+Set the boolean `employee_tasks` under `[dashboard]` in `config.toml` to show task navigation for Employee accounts on non-Personal editions. It defaults to `false`; missing, unreadable or malformed configuration also means `false`. When false, `/tasks`, `/goals`, `/responsibilities` and `/foresight` are hidden from navigation, along with the Advanced task tab in `/assign`. `true` restores task rows within the account's existing role permissions; it does not grant access to Manager-only pages. The value is reported read-only by `system.status`, so a configuration change appears when status is next loaded. There is no dedicated settings page for this key. This changes presentation only: routes remain reachable by URL and all RPC and route authorization stays in force. Admin, Manager and Personal accounts are unaffected.
+
+```toml
+[dashboard]
+employee_tasks = false
+```
+
 ## Account roles and visible AI staff
 
 Giving an AI employee Bash or machine tools lets anyone bound to it direct those tools. Review the employee's capabilities before binding people to it; an Admin may still grant native tools to ordinary AI employees.
@@ -19,7 +30,7 @@ Under **Manage → Members**, each account lists its directly bound AI staff wit
 
 Shared wiki pages follow the account's department in member settings (`users.db`, `users.department`). Non-admins see company pages and only their own department's pages, including restrictions set with `visible_to_departments`. An account without a department sees company pages only. Lists, search, page reads, statistics and exports use the same rule. Unreadable permissions or invalid visibility settings refuse access. Admins retain company-wide access. Sharing a page still requires the source AI employee's Owner binding or Admin.
 
-Company usage (`billing.usage`) and daily growth reports require Manager. Widget generation and model refresh also require Manager because they use model quota or contact providers. Routines and system logs require Admin. Only Admin sees the cost section of Reports and Home, or the upload-and-install action in Experts. Other account roles do not request these restricted sections.
+Company usage (`billing.usage`) and daily growth reports require Manager. Widget generation and model refresh also require Manager because they use model quota or contact providers. Automations and system logs require Admin. Only Admin sees the cost section of Reports and Home, or the upload-and-install action in Experts. Other account roles do not request these restricted sections.
 
 ## Codex CLI updates
 

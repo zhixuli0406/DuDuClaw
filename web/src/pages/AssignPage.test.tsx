@@ -127,7 +127,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   useAgentsStore.setState({ agents: ROSTER as never, loaded: true });
   useSystemStore.setState({ status: { edition_profile: 'personal', channels_connected: 0 } as never });
-  useAuthStore.setState({ jwt: 'test-jwt' } as never);
+  useAuthStore.setState({ jwt: 'test-jwt', user: { role: 'admin', display_name: 'Boss' } as never });
   mockRpc();
   fetchMock.mockResolvedValue({
     ok: true,
@@ -514,5 +514,28 @@ describe('複雜任務 tab', () => {
     ]);
     expect(takeChatAttachments(opts.state.attachmentsKey)).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('employee task navigation preference', () => {
+  it.each([undefined, false])('hides the complex tab for enterprise employees when employee_tasks=%s', employeeTasks => {
+    useAuthStore.setState({ user: { role: 'employee' } as never });
+    useSystemStore.setState({ status: { edition_profile: 'enterprise', employee_tasks: employeeTasks } as never });
+    renderAt('/assign?tab=complex');
+    expect(screen.queryByRole('tab', { name: en['assign.tab.complex'] })).not.toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: en['assign.tab.general'] })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it.each([
+    ['employee', 'enterprise', true],
+    ['admin', 'enterprise', false],
+    ['manager', 'enterprise', false],
+    ['employee', 'personal', false],
+  ] as const)('keeps the complex tab for %s on %s with employee_tasks=%s', (role, edition, employeeTasks) => {
+    useAuthStore.setState({ user: { role } as never });
+    useSystemStore.setState({ status: { edition_profile: edition, employee_tasks: employeeTasks } as never });
+    renderAt('/assign?tab=complex');
+    expect(screen.getByRole('tab', { name: en['assign.tab.complex'] })).toHaveAttribute('aria-selected', 'true');
   });
 });

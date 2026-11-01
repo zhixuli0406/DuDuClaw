@@ -228,7 +228,8 @@ Badge variant：`default`（bg-primary）/ `secondary` / `destructive`（`bg-des
 
 - Root：`SidebarProvider` 容器 `h-svh bg-app-shell` + 左 `Sidebar variant="inset"`（浮島，`p-2`）+ 右 `SidebarInset`（`bg-page-canvas m-2 rounded-xl ring-1 ring-surface-border shadow`）。**無全域 topbar，每頁自帶 `PageHeader`。**
 - Sidebar 寬 256（可拖 200–360，存 localStorage），可折疊 icon 模式，行動版轉 Sheet 抽屜。
-- 導航分組（單一來源 `layout/nav-model.ts`）：企業版由上而下是**每日**（新對話 / 儀表板，無組標題）→ **工作** → **LIVE AI 員工**（讀 agents store 動態產生）→ **公司** → **對話紀錄**（最近 15 則，新的在上，`ConversationsZone` 動態產生，icon 模式不顯示）→ **設定**（管理 / 關於）；個人版是每日 + 主區六列（例行工作 / 技能庫 / 記憶 / AI 員工 / 世界 / 桌寵）→ 對話紀錄 → 設定（預設摺疊）→ 進階（預設摺疊）。收件匣自 2026-08-04 起不佔導航列，入口改為 footer 鈴鐺（有待辦才亮）。非管理者整組依可見性規則隱藏。
+- 非個人版的一般員工使用獨立精簡側欄：品牌（不可點擊）→ 搜尋 → 交辦任務 → 儀表板 → 收件匣（未讀數）→ 技能庫 → 記憶 → AI 虛擬辦公室 → AI 員工 → 對話紀錄。AI 員工依綁定權限 Owner、Operator、Viewer 排序，最多八位並提供「查看全部」。頁尾使用者選單包含綁定信箱、我的連線、設定、亮暗度、語言、取得幫助（經銷商品牌隱藏）、登出；移除鈴鐺與版本徽章，版本文字放主內容右下角。`[dashboard] employee_tasks` 預設 false，僅控制一般員工任務導覽及交辦頁進階任務分頁，讀取失敗視為 false，不改路由或 RPC 授權。設為 true 仍遵循既有角色限制。以下既有導覽規則適用於管理員、主管與個人版。
+- 導航分組（單一來源 `layout/nav-model.ts`）：企業版由上而下是**每日**（新對話 / 儀表板，無組標題）→ **工作** → **LIVE AI 員工**（讀 agents store 動態產生）→ **公司** → **對話紀錄**（最近 15 則，新的在上，`ConversationsZone` 動態產生，icon 模式不顯示）→ **設定**（管理 / 關於）；個人版是每日 + 主區六列（自動化 / 技能庫 / 記憶 / AI 員工 / AI 虛擬辦公室 / 桌寵）→ 對話紀錄 → 設定（預設摺疊）→ 進階（預設摺疊）。收件匣自 2026-08-04 起不佔導航列，入口改為 footer 鈴鐺（有待辦才亮）。非管理者整組依可見性規則隱藏。
 - 導航項可帶兩個修飾：`crumb` 讓側邊欄用動作口吻（新對話）而麵包屑保留名詞（對話）；`action: 'newConversation'` 在導航前先清空對話檢視，側邊欄與 ⌘K 走同一條路徑。
 - Menu item：`rounded-md p-2 h-8 text-sm`，未選 `text-muted-foreground`，hover `bg-sidebar-accent/70`，active `bg-sidebar-accent text-sidebar-accent-foreground font-medium`。active 判定 `pathname === href || startsWith(href + "/")`。
 - Sidebar footer 承載：主題切換、Edition / 升級卡、成本 / XP 摘要（原 header HUD 內容遷入）；語言 / 登出在公司下拉。⌘K 開 Command Palette。
@@ -242,9 +243,9 @@ Badge variant：`default`（bg-primary）/ `secondary` / `destructive`（`bg-des
 | **一般層**（預設展開） | 每日 rail + 工作 + 公司 | 頻率由高到低；用詞白話，機器語彙不進這一層 |
 | **進階層**（摺疊收納） | 管理 → 進階設定（`manageAdvancedNav`）＋個人版的「進階」組 | 低頻高重要在前（錢 → 存取與安全），低頻低重要在後（日誌 / 可靠性 / 模型用量 / 資料搬家），catch-all「設定」最後 |
 
-兩條排序鐵律高於上述法則，改版時一律先滿足：
+除非個人版一般員工的獨立精簡導覽外，兩條排序規則高於上述法則：
 
-1. **客戶日常序（2026-08-04，兩版一致）**：新對話 → 例行工作 → 技能庫 → 記憶 → AI 員工 → 世界；任務看板刻意降級（個人版收進「進階」，企業版放 `工作` 組最後一列）。
+1. **客戶日常序（2026-08-04，兩版一致）**：新對話 → 自動化 → 技能庫 → 記憶 → AI 員工 → AI 虛擬辦公室；任務看板刻意降級（個人版收進「進階」，企業版放 `工作` 組最後一列）。
 2. **客戶金錢序（`manageAdvancedNav`）**：帳務 → 授權 → 經銷，排在所有維運列之前；「設定」永遠最後。
 
 低頻列**不刪、只下沉**：企業版沒有「進階」組，所以「排在群組尾端」就是它的降級形式（`/forks`、`/os`）。降級是有代價的決定——把一項收進進階層，等於決定 95% 的使用者永遠用它的預設值，所以每次下沉都要順手複核該頁的預設值是否合理。
@@ -260,14 +261,14 @@ IA 稽核 14 組分散功能中至少 8 組是同一個形狀：A 頁可以編�
 代理層級設定的唯一寫入點是 `EditAgentPage`；主題頁（OS / Odoo / 設定頁的通知分頁）一律唯讀總覽 + 連結，不得再刻一份可編輯的表單。同一個值有兩個能存檔的地方，就會產生「以為改好了、其實改到另一份」的故障，而不只是重複的程式碼。
 
 **R-PLAIN-WORDS — 對使用者說白話。**
-使用者多為非技術人員，基調定在「高中程度、無工程背景可懂」。§5.2 的「內部術語不外洩」升級為**主動白話**：技術詞要有白話同義詞才能上畫面（retrievability → 新鮮度、consolidation → 整理歸納、needs_human → 等你決定、agent → AI 員工、session → 對話、cron → 例行工作）。數值優先用狀態詞呈現（新鮮 / 穩固 / 逐漸淡忘 / 即將歸檔），原始數字放 tooltip 或進階層。技術詞外洩的驗收嚴重度下限為 Major。
+使用者多為非技術人員，基調定在「高中程度、無工程背景可懂」。§5.2 的「內部術語不外洩」升級為**主動白話**：技術詞要有白話同義詞才能上畫面（retrievability → 新鮮度、consolidation → 整理歸納、needs_human → 等你決定、agent → AI 員工、session → 對話、cron → 自動化）。數值優先用狀態詞呈現（新鮮 / 穩固 / 逐漸淡忘 / 即將歸檔），原始數字放 tooltip 或進階層。技術詞外洩的驗收嚴重度下限為 Major。
 
 ---
 
 ## 5. 工程紀律
 
 1. **Token-only，禁 hardcode。** 顏色走 OKLCH token / Tailwind color utility，尺寸走 radius / spacing scale，陰影走 `--*-shadow`。任何 `#hex`、裸 `px`、手寫 rgba 陰影都是 bug。改一個 token 必須雙主題（`:root` + `.dark`）同步。
-2. **i18n 三語同步。** 所有面向使用者字串走 `intl.formatMessage`；**新增 key 必在同一 commit 內補齊 `en` / `ja-JP` / `zh-TW` 三份 catalogue**，數量與 key 完全一致。UI 用使用者視角詞彙，不外露內部術語（agent 稱「AI 員工」、session 稱「對話」、cron 稱「例行工作」；MCP / runtime / PTY 等永不出現在 UI）。
+2. **i18n 三語同步。** 所有面向使用者字串走 `intl.formatMessage`；**新增 key 必在同一 commit 內補齊 `en` / `ja-JP` / `zh-TW` 三份 catalogue**，數量與 key 完全一致。UI 用使用者視角詞彙，不外露內部術語（agent 稱「AI 員工」、session 稱「對話」、cron 稱「自動化」；MCP / runtime / PTY 等永不出現在 UI）。
 3. **a11y 是預設而非附加。** WCAG 2.1 AA 對比雙主題；所有互動元件 `focus-visible` ring 統一 `ring-3 ring-ring/50`；鍵盤可達（Dialog 走 Esc + focus-trap、列表可 roving-selection）；canvas / SVG 容器 `role="img"` + `aria-label`、內層裝飾 SVG `aria-hidden`；文字 overflow 一律 truncate + `title`，表格 scroll-x，長 CJK wrap；每個 async 面都有 loading / empty / error 三態。
 4. **功能元件 vs 視覺原語的邊界。** mds 是**視覺原語**——只管長相與互動語彙，不含業務邏輯。功能元件（審批風險判定、世界舞台狀態機、圖表資料計算、角色生成）**組合** mds 原語但把邏輯留在自己身上；反過來不要把業務條件寫進 mds。頁面 compose 原語，不 re-style 原語。
 5. **保守遷移行為。** 重設計是換視覺 / 結構，**功能一個不減**：不動 store / api signature，行為 diff 保守。規格變更（如列表預設視圖改變）要同步更新對應 `*.test.tsx` 斷言（這是規格變更，非遷就實作）。
