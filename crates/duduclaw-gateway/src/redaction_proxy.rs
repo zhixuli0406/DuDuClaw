@@ -378,10 +378,9 @@ pub fn gated_mcp_config_with_names(
     let Some(mut parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
         return Ok(None);
     };
-    let names: Vec<String> = parsed["mcpServers"]
-        .as_object()
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+    // Grok must shadow every declared name, including dropped entries, or it
+    // would start those entries itself.
+    let names: Vec<String> = parsed["mcpServers"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
     let servers = parsed
         .get_mut("mcpServers")
         .and_then(|s| s.as_object_mut())
@@ -583,8 +582,8 @@ fn write_gated_mcp_config_value(
     // producing a config for third-party servers, every built-in slot above
     // has already been replaced with the canonical host definition.
     let third_party = parsed.get("mcpServers").and_then(Value::as_object)
-        .is_some_and(|servers| servers.iter().any(|(name, def)|
-            !duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(name, def, self_exe)));
+        .is_some_and(|servers| servers.keys().any(|name|
+            !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name)));
     if (preserve_cli_discovery && (purpose.none() || !third_party)) || &rewrite.config == parsed {
         debug!("mcp-proxy: nothing to proxy in this .mcp.json");
         return Ok((None, Vec::new()));

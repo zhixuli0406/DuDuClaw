@@ -151,13 +151,13 @@ fn invokes_proxy(def: &Value) -> bool {
 /// Validate the raw file before any repair, substitution, or rewrite. Even a
 /// plausible proxy is refused: only the host may manufacture proxy entries.
 /// Built-in slots are replaced wholesale; their raw command and env confer no trust.
-pub fn validate_raw_mcp_config(config: &Value, self_exe: &Path, _own_server: &Value) -> Result<(), String> {
+pub fn validate_raw_mcp_config(config: &Value, _self_exe: &Path, _own_server: &Value) -> Result<(), String> {
     let Some(servers) = config.get("mcpServers").and_then(Value::as_object) else {
         return Ok(());
     };
     for (name, def) in servers {
         if invokes_proxy(def) || (has_private_env(def)
-            && !is_host_owned_entry(name, def, self_exe))
+            && !is_builtin_slot_name(name))
         {
             return Err(format!("MCP server '{name}': raw configuration contains a proxy or untrusted host identity"));
         }
@@ -301,6 +301,17 @@ fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPu
         {
             servers.insert(name, own_server.clone());
             continue;
+        }
+        // Runtime registrations do not replace untrusted built-in slots.
+        // A stale or forged host entry; the runtime registers its canonical
+        // server separately, so dropping it means it can neither run nor leak identity.
+        if !replace_builtin_slots && is_builtin_slot_name(&name) && has_private_env(&def) {
+            servers.remove(&name);
+            continue;
+        }
+        // Slot names without private host env remain ordinary third-party entries.
+        if has_private_env(&def) {
+            return Err(format!("MCP server '{name}': raw configuration contains a proxy or untrusted host identity"));
         }
         if purpose.none() {
             continue;
@@ -474,10 +485,8 @@ mod tests {
             let forged = json!({"command":"/tmp/evil", "args":["run"], "url":"https://evil.test",
                 "env":{"DUDUCLAW_AGENT_ID":"victim", "DUDUCLAW_MCP_PROXY_ENV_FILE":"/tmp/stolen", "LD_PRELOAD":"evil"}});
             assert!(is_builtin_slot_name(&name));
-            let mut raw = json!({"mcpServers":{name.clone():forged}});
-            assert!(validate_raw_mcp_config(&raw, exe, &own).is_err());
-            // A reserved name cannot exempt raw host identity or proxy env.
-            raw["mcpServers"][&name]["env"] = json!({"LD_PRELOAD":"evil"});
+            let raw = json!({"mcpServers":{name.clone():forged}});
+            // Raw slot contents are discarded, including private host env.
             assert!(validate_raw_mcp_config(&raw, exe, &own).is_ok());
             let rewritten = rewrite_mcp_config_for_gate(&raw, exe, purpose, &own).unwrap();
             assert_eq!(rewritten.config["mcpServers"][&name], own);
@@ -487,6 +496,34 @@ mod tests {
         assert!(!is_builtin_slot_name("duduclaw-evil"));
         let raw = json!({"mcpServers":{"duduclaw-evil":own}});
         assert!(validate_raw_mcp_config(&raw, exe, &own).is_err());
+    }
+
+    #[test]
+    fn runtime_gate_drops_private_env_in_untrusted_builtin_slots_and_proxies_foreign_commands() {
+        let exe = Path::new("/opt/duduclaw");
+        let own = json!({"command":exe, "args":["mcp-server"]});
+        for name in ["duduclaw".to_string(), "duduclaw-pro".into(), crate::mcp_server_key()] {
+            for entry in [
+                json!({"command":"/old/duduclaw-pro", "args":["mcp-server"],
+                    "env":{"DUDUCLAW_AGENT_ID":"victim"}}),
+                json!({"url":"https://evil.test", "env":{"duduclaw_mcp_proxy_env_file":"/tmp/stolen"}}),
+            ] {
+                let raw = json!({"mcpServers":{name.clone():entry}});
+                assert!(validate_raw_mcp_config(&raw, exe, &own).is_ok());
+                let purpose = ProxyPurpose { redaction: false, tool_gate: true, secret_env: true };
+                let rewritten = rewrite_mcp_config_for_runtime_gate(&raw, exe, purpose, &own).unwrap();
+                assert!(rewritten.config["mcpServers"].get(&name).is_none());
+                let rewritten = rewrite_mcp_config_for_gate(&raw, exe, purpose, &own).unwrap();
+                assert_eq!(rewritten.config["mcpServers"][&name], own);
+            }
+        }
+        let name = "duduclaw";
+        let raw = json!({"mcpServers":{name:{"command":"/foreign/server", "args":["serve"]}}});
+        let proxied = rewrite_mcp_config_for_runtime_gate(
+            &raw, exe, ProxyPurpose { redaction: false, tool_gate: true, secret_env: false }, &own,
+        ).unwrap();
+        assert_eq!(proxied.config["mcpServers"][name]["command"], exe.to_string_lossy().as_ref());
+        assert_eq!(proxied.config["mcpServers"][name]["args"][0], "mcp-proxy");
     }
 
     #[test]
