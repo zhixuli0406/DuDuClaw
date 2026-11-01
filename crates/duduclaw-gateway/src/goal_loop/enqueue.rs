@@ -478,3 +478,23 @@ mod label_tests {
         assert!(!is_hidden_or_breaking('A') && !is_hidden_or_breaking('（'));
     }
 }
+
+#[cfg(test)]
+mod plan_review_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn review_never_changes_enqueue_payload_or_approved_plan() {
+        let mut task = TaskRow::new("id".into(), "title".into(), "goal".into(), "medium".into(), "alice".into(), "test".into());
+        crate::goal_plan::apply_plan_first_result(&mut task, Ok("- approved plan".into()));
+        let before = build_goal_payload(&task, 1, "state", None);
+        let plan = task.plan_pending.clone();
+        let feedback = task.judge_feedback.clone();
+        task.plan_review = Some(r#"{"version":1,"lenses":[{"lens":"ready","status":"completed","text":"REVIEW_ONLY_SENTINEL"}]}"#.into());
+        let after = build_goal_payload(&task, 1, "state", None);
+        assert_eq!(before, after);
+        assert!(!after.contains("REVIEW_ONLY_SENTINEL"));
+        assert_eq!(task.plan_pending, plan);
+        assert_eq!(task.judge_feedback, feedback);
+    }
+}

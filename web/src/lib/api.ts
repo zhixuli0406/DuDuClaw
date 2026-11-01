@@ -1045,6 +1045,8 @@ export interface TaskInfo {
    *  after the first dispatch that follows approval, and scopes it to
    *  `needs_human` the same defensive way as `pause_reason`. */
   plan_pending?: string | null;
+  /** Independent, display-only review JSON; never execution instructions. */
+  plan_review?: string | null;
   parent_task_id?: string;
   tags: string[];
   message_id?: string;

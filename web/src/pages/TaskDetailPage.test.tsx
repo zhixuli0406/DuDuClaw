@@ -188,6 +188,20 @@ describe('TaskDetailPage — 想一想 plan-first (I-1c)', () => {
     ).toBeNull();
   });
 
+  it('shows the independent review alongside the unchanged approval plan', () => {
+    const reviewed = { ...PLAN_PENDING, plan_review: JSON.stringify({ version: 1, lenses: [
+      { lens: 'restate', status: 'completed', text: 'Clarify the source' },
+      { lens: 'simplify', status: 'completed', text: 'Skip unrelated work' },
+      { lens: 'ready', status: 'not_run', text: '' },
+    ] }) };
+    useTasksStore.setState({ tasks: [reviewed] });
+    renderAt('task-aaaa1111');
+    expect(screen.getByText('Independent review (without conversation context)')).toBeInTheDocument();
+    expect(screen.getByText('Clarify the source')).toBeInTheDocument();
+    expect(screen.getByText('Not run')).toBeInTheDocument();
+    expect(screen.getByText((_, el) => el?.textContent === PLAN_PENDING.plan_pending)).toBeInTheDocument();
+  });
+
   it('still offers the same three decision buttons — no new button kind', () => {
     renderAt('task-aaaa1111');
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();

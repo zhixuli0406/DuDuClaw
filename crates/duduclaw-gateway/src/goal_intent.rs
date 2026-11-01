@@ -1418,10 +1418,13 @@ async fn accept_as_plan_first(
         Err(e) => return format!("⚠️ 無法建立目標任務：{e}"),
     };
 
-    let plan_result = crate::goal_plan::generate_plan_first(
+    let (plan_result, plan_review) = crate::autonomous_runtime::human_interactive(
         &ctx.home_dir,
-        &pending.description,
-        &pending.description,
+        crate::goal_loop::plan_review::generate_plan_first_reviewed(
+            &ctx.home_dir,
+            &pending.description,
+            &pending.description,
+        ),
     )
     .await;
     if let Err(e) = &plan_result {
@@ -1431,16 +1434,18 @@ async fn accept_as_plan_first(
             "goal intent: plan-first generation failed — parking needs_human (infra class)"
         );
     }
-    let task = build_plan_first_task(&ctx.home_dir, session_id, pending, plan_result);
+    let mut task = build_plan_first_task(&ctx.home_dir, session_id, pending, plan_result);
+    task.plan_review = plan_review;
 
     if let Err(e) = store.insert_task(&task).await {
         return format!("⚠️ 無法建立目標任務：{e}");
     }
     record_outcome(ctx, "plan_first", pending, Some(task.id.clone())).await;
 
+    let review_hint = crate::goal_loop::plan_review::channel_hint(task.plan_review.as_deref());
     match task.plan_pending {
         Some(plan) => format!(
-            "🧭 已產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n請到 /goals 儀表板核准或修改。"
+            "🧭 已產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n{review_hint}請到 /goals 儀表板核准或修改。"
         ),
         None => "⚠️ 計畫生成失敗，任務已標記為待你決定，請到 /goals 儀表板處理。".to_string(),
     }

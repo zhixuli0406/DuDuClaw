@@ -1329,12 +1329,13 @@ pub(crate) async fn handle_goal_create(
     // branch exactly (same two functions, same field semantics).
     if plan_first {
         let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
-        let plan_result = crate::autonomous_runtime::human_interactive(&ctx.home_dir,
-            crate::goal_plan::generate_plan_first(
+        let (plan_result, plan_review) = crate::autonomous_runtime::human_interactive(
             &ctx.home_dir,
-            &task.description,
-            criteria_for_plan,
-        )
+            crate::goal_loop::plan_review::generate_plan_first_reviewed(
+                &ctx.home_dir,
+                &task.description,
+                criteria_for_plan,
+            ),
         )
         .await;
         if let Err(e) = &plan_result {
@@ -1345,14 +1346,16 @@ pub(crate) async fn handle_goal_create(
             );
         }
         crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
+        task.plan_review = plan_review;
 
         if let Err(e) = store.insert_task(&task).await {
             warn!(error = %e, "goal: insert plan-first task failed");
             return format!("⚠️ 無法建立目標任務：{e}");
         }
+        let review_hint = crate::goal_loop::plan_review::channel_hint(task.plan_review.as_deref());
         return match &task.plan_pending {
             Some(plan) => format!(
-                "🧭 已建立目標任務 #{short}，並產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n請到 /goals 儀表板核准或修改。"
+                "🧭 已建立目標任務 #{short}，並產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n{review_hint}請到 /goals 儀表板核准或修改。"
             ),
             None => format!(
                 "⚠️ 已建立目標任務 #{short}，但計畫生成失敗，已標記為待你決定，請到 /goals 儀表板處理。"

@@ -23,7 +23,7 @@ pub(crate) const TASK_COLUMNS: &str = "id, title, description, status, priority,
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
      pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json,
      discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision, \
-     on_behalf_of, created_via, cost_cap_cents, timeout_secs";
+     on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -351,6 +351,8 @@ pub struct TaskRow {
     /// all — the planner-failure fail-closed path never sets this).
     #[serde(default)]
     pub plan_pending: Option<String>,
+    /// Human-only independent review JSON; never part of execution or judging.
+    pub plan_review: Option<String>,
 
     // ── I-3b task list operations (dashboard-ux-workbuddy 2026-08) ─────
     /// Archived tasks are deliberately taken out of active consideration:
@@ -479,6 +481,7 @@ impl TaskRow {
             acceptance_criteria_baseline: None,
             pause_reason: None,
             plan_pending: None,
+            plan_review: None,
             archived: false,
             pinned: false,
             team_spec_json: None,

@@ -79,6 +79,9 @@ port = 18889
 # The outer loop behind `/goal`: dispatch → judge → redispatch until done or
 # escalated. Full reference: docs/features/34-goal-loop.md, docs/guides/goal-loop.md
 # [goal_loop]
+# Independent document-only plan review: "off" (default) or "goldfish".
+# System utility spending (goal-plan-review), not employee budget; up to 45s.
+# plan_review = "off"
 # iteration_cap = 5            # Dispatches a complex goal gets before needs_human
 # iteration_cap_simple = 3     # Same cap for goals graded simple
 # soft_cap = 3                 # Marks diminishing returns; does not block
