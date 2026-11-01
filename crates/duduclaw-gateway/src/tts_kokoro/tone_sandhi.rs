@@ -84,6 +84,11 @@ fn conventional(word: &str) -> bool {
     }
 }
 
+fn is_numeral(c: char) -> bool {
+    // Python str.isnumeric() includes Han numerals, unlike Rust char::is_numeric().
+    c.is_numeric() || "零一二三四五六七八九十百千万萬亿億兆壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌两兩".contains(c)
+}
+
 pub(super) fn modify(word: &mut Word, jieba: &Jieba) {
     let chars: Vec<char> = word.text.chars().collect();
     if chars.len() != word.syllables.len() || chars.is_empty() { return; }
@@ -97,7 +102,7 @@ pub(super) fn modify(word: &mut Word, jieba: &Jieba) {
         }
     }
     let number = chars.contains(&'一')
-        && chars.iter().all(|c| *c == '一' || c.is_numeric());
+        && chars.iter().all(|c| is_numeral(*c));
     if !number {
         if n == 3 && chars[1] == '一' && chars[0] == chars[2] { s[1].1 = 5; }
         else if word.text.starts_with("第一") { s[1].1 = 1; }
@@ -109,7 +114,9 @@ pub(super) fn modify(word: &mut Word, jieba: &Jieba) {
             }
         }
     }
-    if !NOT_NEUTRAL.contains(&word.text.as_str()) {
+    // Numeric repetitions are digits, not noun/verb reduplication, even when
+    // a minimal dictionary tags the whole sequence as a noun.
+    if !number && !NOT_NEUTRAL.contains(&word.text.as_str()) {
         for i in 1..n {
             if chars[i] == chars[i-1] && word.pos.chars().next().is_some_and(|c| matches!(c, 'n'|'v'|'a')) { s[i].1 = 5; }
         }
@@ -120,7 +127,7 @@ pub(super) fn modify(word: &mut Word, jieba: &Jieba) {
             || (n > 1 && "上下".contains(last) && matches!(word.pos.as_str(), "s"|"l"|"f"))
             || (n > 1 && "来去".contains(last) && "上下进出回过起开".contains(chars[n-2]));
         if neutral { s[n-1].1 = 5; }
-        else if let Some(i) = chars.iter().position(|c| *c == '个').filter(|i| *i == 0 && n == 1 || *i > 0 && (chars[*i-1].is_numeric() || "几有两半多各整每做是".contains(chars[*i-1]))) {
+        else if let Some(i) = chars.iter().position(|c| *c == '个').filter(|i| *i == 0 && n == 1 || *i > 0 && (is_numeral(chars[*i-1]) || "几有两半多各整每做是".contains(chars[*i-1]))) {
             s[i].1 = 5;
         } else if conventional(&word.text) { s[n-1].1 = 5; }
         let boundary = split(&word.text, jieba);
@@ -177,5 +184,20 @@ mod tests {
         assert_eq!(tones("看一看", &[4,1,4]), [4,5,4]);
         assert_eq!(tones("一零零", &[1,2,2]), [1,2,2]);
         assert_eq!(tones("所有人", &[3,3,2]), [2,3,2]);
+    }
+
+    #[test]
+    fn numeral_sequences_keep_yi_and_repeated_digit_tones() {
+        for (text, input) in [
+            ("二一零", [4,1,2]),
+            ("一壹壹", [1,1,1]),
+            ("一〇〇", [1,2,2]),
+            ("一１１", [1,1,1]),
+            ("一百一", [1,3,1]),
+        ] {
+            assert_eq!(tones(text, &input), input, "{text}");
+        }
+        assert_eq!(tones("三个", &[1,4]), [1,5]);
+        assert_eq!(tones("奶奶", &[3,3]), [3,5]);
     }
 }

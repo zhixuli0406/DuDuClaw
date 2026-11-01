@@ -196,7 +196,10 @@ async fn gmail_fanout_preserves_repeated_query_fields_and_curated_output() {
 
 #[tokio::test]
 async fn gmail_read_masks_body_subject_and_snippet_but_keeps_message_identifiers() {
+    use base64::Engine;
+
     let template = NativeCallTemplate::prepare("gmail_read", &json!({"message_id":"m123"})).unwrap();
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("安全碼 123456");
     let mut io = RecordingIo {
         json: VecDeque::from([json!({
             "threadId":"thread123",
@@ -206,7 +209,7 @@ async fn gmail_read_masks_body_subject_and_snippet_but_keeps_message_identifiers
                 {"name":"To","value":"Bob"},
                 {"name":"Subject","value":"驗證碼 654321"},
                 {"name":"Date","value":"2026-11-01T10:00:00Z"}
-            ],"mimeType":"text/plain","body":{"data":"5a6J6KiA56eBIDEyMzQ1Ng=="}}
+            ],"mimeType":"text/plain","body":{"data":body}}
         })]),
         ..Default::default()
     };
@@ -215,6 +218,9 @@ async fn gmail_read_masks_body_subject_and_snippet_but_keeps_message_identifiers
     assert_eq!(decoded["id"], "m123");
     assert_eq!(decoded["thread_id"], "thread123");
     assert_eq!(decoded["date"], "2026-11-01T10:00:00Z");
+    assert_eq!(decoded["subject"], "驗證碼 [已移除 1 組驗證碼]");
+    assert_eq!(decoded["snippet"], "OTP [已移除 1 組驗證碼]");
+    assert_eq!(decoded["body"], "安全碼 [已移除 1 組驗證碼]");
     assert!(!decoded.to_string().contains("123456"));
     assert!(!decoded.to_string().contains("654321"));
 }

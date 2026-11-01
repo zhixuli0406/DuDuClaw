@@ -896,11 +896,10 @@ mod tests {
     #[tokio::test]
     async fn command_provider_reports_nonzero_exit_with_truncated_stderr() {
         #[cfg(unix)] {
-            use std::os::unix::fs::PermissionsExt;
-            let script = tempfile::NamedTempFile::new().unwrap();
-            std::fs::write(script.path(), "#!/bin/sh\nprintf 'failure detail' >&2\nexit 7\n").unwrap();
-            std::fs::set_permissions(script.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-            let err = run_tts_command(&format!("{} {{output}}", script.path().display()), std::path::Path::new("/tmp/in"), std::path::Path::new("/tmp/out"), std::time::Duration::from_secs(2)).await.unwrap_err();
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("tts");
+            crate::test_exec::write_executable(&script, "#!/bin/sh\nprintf 'failure detail' >&2\nexit 7\n", 0o700);
+            let err = run_tts_command(&format!("{} {{output}}", script.display()), std::path::Path::new("/tmp/in"), std::path::Path::new("/tmp/out"), std::time::Duration::from_secs(2)).await.unwrap_err();
             assert!(err.contains("failure detail"));
         }
     }
@@ -908,24 +907,20 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn command_provider_uses_input_file_and_returns_script_output() {
-        use std::os::unix::fs::PermissionsExt;
-        let script = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(script.path(), "#!/bin/sh\n[ \"$#\" -eq 4 ] || exit 21\n[ \"$1\" = --in ] || exit 22\n[ \"$3\" = --out ] || exit 23\n[ -f \"$2\" ] || exit 24\n[ \"$2\" != 'hidden phrase' ] || exit 25\ncat \"$2\" | grep -q 'hidden phrase' || exit 26\nprintf 'RIFFfake' > \"$4\"\n").unwrap();
-        std::fs::set_permissions(script.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let provider = CommandTtsProvider::new(format!("{} --in {{input}} --out {{output}}", script.path().display()));
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tts");
+        crate::test_exec::write_executable(&script, "#!/bin/sh\n[ \"$#\" -eq 4 ] || exit 21\n[ \"$1\" = --in ] || exit 22\n[ \"$3\" = --out ] || exit 23\n[ -f \"$2\" ] || exit 24\n[ \"$2\" != 'hidden phrase' ] || exit 25\ncat \"$2\" | grep -q 'hidden phrase' || exit 26\nprintf 'RIFFfake' > \"$4\"\n", 0o700);
+        let provider = CommandTtsProvider::new(format!("{} --in {{input}} --out {{output}}", script.display()));
         assert_eq!(provider.synthesize("hidden phrase", "").await.unwrap(), b"RIFFfake");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn command_provider_timeout_is_reported() {
-        let script = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(script.path(), "#!/bin/sh\nsleep 61\n").unwrap();
-        #[cfg(unix)] {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(script.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let provider = CommandTtsProvider::new(format!("{} {{output}}", script.path().display()));
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tts");
+        crate::test_exec::write_executable(&script, "#!/bin/sh\nsleep 61\n", 0o700);
+        let provider = CommandTtsProvider::new(format!("{} {{output}}", script.display()));
         let result = run_tts_command(&provider.command, std::path::Path::new("/tmp/in"), std::path::Path::new("/tmp/out"), std::time::Duration::from_millis(100)).await;
         assert!(result.unwrap_err().contains("timeout"));
     }

@@ -99,13 +99,11 @@ pub const PROXY_CARRY_ENV: &[&str] = &[
 /// The `duduclaw` subcommand of a remote MCP bridge entry.
 pub const REMOTE_BRIDGE_SUBCOMMAND: &str = "mcp-remote-bridge";
 
-/// Only the exact names owned by this host can be built-in entries. A name
-/// alone never establishes trust: the command and arguments must match too.
-pub fn is_duduclaw_server(name: &str, def: &Value, self_exe: &Path) -> bool {
-    (name == "duduclaw" || name == "duduclaw-pro" || name == crate::mcp_server_key())
-        && self_exe.to_str().is_some_and(|exe| def.get("command").and_then(Value::as_str) == Some(exe))
-        && def.get("args") == Some(&json!(["mcp-server"]))
-        && !is_direct_remote_entry(def)
+/// Exact host-owned names reserve built-in slots, regardless of raw contents.
+/// This classifies a slot, not a trusted command: effective configs must replace
+/// its entire definition with the host-generated canonical server.
+pub fn is_duduclaw_server(name: &str, _def: &Value, _self_exe: &Path) -> bool {
+    name == "duduclaw" || name == "duduclaw-pro" || name == crate::mcp_server_key()
 }
 
 /// The host-generated built-in definition; never derive identity from raw JSON.
@@ -141,14 +139,14 @@ fn invokes_proxy(def: &Value) -> bool {
 
 /// Validate the raw file before any repair, substitution, or rewrite. Even a
 /// plausible proxy is refused: only the host may manufacture proxy entries.
-/// Identity-bearing built-ins must equal the entire host-generated definition.
-pub fn validate_raw_mcp_config(config: &Value, self_exe: &Path, own_server: &Value) -> Result<(), String> {
+/// Built-in slots are replaced wholesale; their raw command and env confer no trust.
+pub fn validate_raw_mcp_config(config: &Value, self_exe: &Path, _own_server: &Value) -> Result<(), String> {
     let Some(servers) = config.get("mcpServers").and_then(Value::as_object) else {
         return Ok(());
     };
     for (name, def) in servers {
         if invokes_proxy(def) || (has_private_env(def)
-            && !(is_duduclaw_server(name, def, self_exe) && def == own_server))
+            && !is_duduclaw_server(name, def, self_exe))
         {
             return Err(format!("MCP server '{name}': raw configuration contains a proxy or untrusted host identity"));
         }
@@ -219,7 +217,8 @@ impl ProxyPurpose {
 /// Rewrite every third-party **stdio** server so it launches through
 /// `duduclaw mcp-proxy` for `purpose`.
 ///
-/// Left untouched: DuDuClaw's own entry, `type` / `url` entries (no child
+/// Built-in slots are replaced with `own_server`. Left untouched: `type` /
+/// `url` entries (no child
 /// process to wrap), entries with no `command`, and, when redaction is not a purpose, remote
 /// bridge entries. The original `env` map rides along in
 /// [`PROXY_UPSTREAM_ENV_VAR`] rather than in argv.
@@ -263,9 +262,6 @@ pub fn rewrite_mcp_config_for_gate(json: &Value, self_exe: &Path, purpose: Proxy
     validate_raw_mcp_config(json, self_exe, own_server)?;
     let mut out = json.clone();
     let mut dropped_remote = Vec::new();
-    if purpose.none() {
-        return Ok(ProxyRewrite { config: out, dropped_remote });
-    }
     let exe = self_exe.to_string_lossy().into_owned();
 
     let Some(servers) = out.get_mut("mcpServers").and_then(|v| v.as_object_mut()) else {
@@ -280,6 +276,10 @@ pub fn rewrite_mcp_config_for_gate(json: &Value, self_exe: &Path, purpose: Proxy
             continue;
         };
         if is_duduclaw_server(&name, &def, self_exe) {
+            servers.insert(name, own_server.clone());
+            continue;
+        }
+        if purpose.none() {
             continue;
         }
         if is_direct_remote_entry(&def) {
@@ -442,23 +442,25 @@ mod tests {
     }
 
     #[test]
-    fn only_host_canonical_builtin_identity_is_accepted() {
+    fn builtin_slots_are_replaced_wholesale_and_prefixes_are_not_owned() {
         let home = std::env::temp_dir().join("duduclaw-canonical-test-nonexistent");
         let exe = Path::new("/opt/duduclaw");
         let own = canonical_duduclaw_server(&home, "alice", exe);
+        let purpose = ProxyPurpose { redaction: false, tool_gate: true, secret_env: false };
         for name in ["duduclaw".to_string(), "duduclaw-pro".into(), crate::mcp_server_key()] {
-            assert!(is_duduclaw_server(&name, &own, exe));
-            let raw = json!({"mcpServers":{name:own}});
+            let forged = json!({"command":"/tmp/evil", "args":["run"], "url":"https://evil.test",
+                "env":{"DUDUCLAW_AGENT_ID":"victim", "DUDUCLAW_MCP_PROXY_ENV_FILE":"/tmp/stolen", "LD_PRELOAD":"evil"}});
+            assert!(is_duduclaw_server(&name, &forged, exe));
+            let raw = json!({"mcpServers":{name.clone():forged}});
             assert!(validate_raw_mcp_config(&raw, exe, &own).is_ok());
+            let rewritten = rewrite_mcp_config_for_gate(&raw, exe, purpose, &own).unwrap();
+            assert_eq!(rewritten.config["mcpServers"][&name], own);
+            let raw_proxy = json!({"mcpServers":{name:{"command":exe,"args":["mcp-proxy"]}}});
+            assert!(validate_raw_mcp_config(&raw_proxy, exe, &own).is_err());
         }
-        let mut forged = own.clone();
-        forged["env"]["DUDUCLAW_AGENT_ID"] = json!("victim");
-        let raw = json!({"mcpServers":{"duduclaw":forged}});
-        assert!(validate_raw_mcp_config(&raw, exe, &own).is_err());
-        let mut wrong_command = own.clone();
-        wrong_command["command"] = json!("evil");
-        assert!(!is_duduclaw_server("duduclaw", &wrong_command, exe));
         assert!(!is_duduclaw_server("duduclaw-evil", &own, exe));
+        let raw = json!({"mcpServers":{"duduclaw-evil":own}});
+        assert!(validate_raw_mcp_config(&raw, exe, &own).is_err());
     }
 
     #[test]

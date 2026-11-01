@@ -292,7 +292,7 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 第三方 MCP 金鑰會移出員工的設定檔。`.mcp.json` 只保留 `secret://mcp/<server>/<ENV_NAME>` 參照，實際值使用既有 `.keyfile` 加密，存於 `<home>/secrets/mcp/<agent_id>.enc`。第三方伺服器的所有 `env` 項目都存入憑證庫，例外只有 `PATH`、`HOME`、`NODE_ENV`、`LOG_LEVEL` 與既有 `secret://` 參照。DuDuClaw 自身的伺服器項目與其中的 `DUDUCLAW_*` 變數維持不變。
 
-只有精確名稱 `duduclaw`、`duduclaw-pro` 或目前 instance 的 key，且 command 與 args 符合主程式產生的內容，才算內建伺服器；`duduclaw-evil` 仍視為第三方。啟動時拒絕原始設定中的 proxy 項目及 proxy 私有環境變數；帶有員工身分的內建項目必須與主程式產生的完整設定一致。讀取秘密必須有對應憑證庫擁有者的有效 `DUDUCLAW_AGENT_TOKEN` HMAC，即使 delegation 使用寬鬆設定也不能省略，且不會以預設員工身分代替。
+只有精確名稱 `duduclaw`、`duduclaw-pro` 或目前 instance 的 key 才是內建欄位；`duduclaw-evil` 仍視為第三方。產生有效設定時，內建欄位的 command、args、env 整筆換成主程式當次產生的 canonical 設定，因此金鑰輪替、執行檔改名或偽造 command 都不會沿用原始值。任何名稱的 raw `mcp-proxy` 呼叫仍被拒絕，第三方也不能攜帶 proxy 私有環境變數。Claude 在沒有代理用途或只有內建伺服器時維持不加旗標；內建設定仍由原本的啟動準備流程修復。Fork 複本的來源可能是未經員工準備流程的一般專案，因此即使 gate 關閉，複本仍會重建內建欄位。讀取秘密必須有對應憑證庫擁有者的有效 `DUDUCLAW_AGENT_TOKEN` HMAC，即使 delegation 使用寬鬆設定也不能省略，且不會以預設員工身分代替。
 
 Proxy 只解析自己所屬員工的參照，並在啟動上游伺服器前才取得實際值。參照不存在、不合法或無法解密時，該伺服器不會啟動；錯誤只指出伺服器與變數名稱，不含值。需要解析秘密的設定若無法改寫為 proxy 路徑，Claude／Grok 不會退回直接載入原檔。匯出時只留下環境變數名稱與空白佔位值，匯入者必須重新輸入。
 

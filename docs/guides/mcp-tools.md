@@ -16,10 +16,13 @@ without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 `DUDUCLAW_` environment variables remain unchanged when MCP credentials are
 moved into the encrypted store, regardless of the server name. This does not
-make a `duduclaw-*` server trusted: raw configuration still rejects proxy-private
-variables and untrusted host identity. Built-in entries must match the complete
-host-generated definition. Forked copies use the original employee's host-known
-identity and policy directory, even when the copied file lives elsewhere.
+make a `duduclaw-*` server trusted: only exact host-owned names reserve built-in
+slots. Effective rewritten configs replace those slots wholesale with the current
+host-generated command, arguments and env; stale keys or a different executable
+in raw JSON are never used. Raw `mcp-proxy` invocations are always refused, as are
+proxy-private env fields on third-party entries. Forked copies use the original
+employee's host-known identity and policy directory, even when the copied file
+lives elsewhere.
 
 ## Local text to speech
 
@@ -566,7 +569,7 @@ new table is [deprecations.md](deprecations.md). No MCP tool is deprecated at th
 
 Third-party MCP keys leave the employee's config files. `.mcp.json` stores `secret://mcp/<server>/<ENV_NAME>` references; values are encrypted in `<home>/secrets/mcp/<agent_id>.enc` with the existing `.keyfile`. All third-party `env` entries use the store except `PATH`, `HOME`, `NODE_ENV`, `LOG_LEVEL` and existing `secret://` references. DuDuClaw's own server entry and its `DUDUCLAW_*` variables are unchanged.
 
-A built-in entry must use exactly `duduclaw`, `duduclaw-pro` or the current instance key, with the host-generated command and arguments; `duduclaw-evil` is a third-party server. Raw proxy entries and proxy-private environment fields are refused at spawn. Identity-bearing built-ins must match the complete host-generated definition. Secret reads require a valid `DUDUCLAW_AGENT_TOKEN` HMAC for the store owner, even with lenient delegation settings; a default agent cannot authorize a read.
+A built-in slot must use exactly `duduclaw`, `duduclaw-pro` or the current instance key; `duduclaw-evil` is a third-party server. Rewriting replaces the entire built-in definition with the host's current canonical entry, including after MCP key rotation or an executable change. A forged built-in command cannot survive into that effective config. Raw proxy invocations remain forbidden under every name, and third-party entries cannot carry proxy-private env. Claude's existing no-flags behavior remains when no proxy purpose is active or the file contains only built-in slots; the ordinary built-in preparation path still owns their repair. Copied fork configs always regenerate built-in slots, including when gates are off, because a source project may not have passed employee preparation. Secret reads require a valid `DUDUCLAW_AGENT_TOKEN` HMAC for the store owner, even with lenient delegation settings; a default agent cannot authorize a read.
 
 The proxy resolves references for its own employee only, immediately before starting the upstream server. Missing, invalid or undecryptable references prevent that server from starting; the error names the server and variable, never the value. A config requiring secret resolution cannot fall back to direct Claude/Grok loading if proxy rewriting fails. Exports retain environment names with empty placeholders, so the importer must enter values again.
 

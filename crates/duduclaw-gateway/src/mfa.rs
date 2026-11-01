@@ -88,7 +88,11 @@ pub(crate) fn restore_policy(home: &Path) -> bool {
         .ok().and_then(|text| {
             let table: toml::Table = text.parse().ok()?;
             if table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() {
-                read_policy_state(home).ok()
+                if policy_store_is_absent(home) {
+                    Some(false)
+                } else {
+                    read_policy_state(home).ok()
+                }
             } else { parse_policy(&text).ok() }
         }).unwrap_or(true)
 }
@@ -197,9 +201,7 @@ fn read_policy_state(home: &Path) -> Result<bool, String> {
 pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
     // Only an absent directory entry means no policy has ever been recorded.
     // A dangling symlink or any other existing but unreadable store must fail closed.
-    if matches!(std::fs::symlink_metadata(home.join("users.db")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    {
+    if policy_store_is_absent(home) {
         return Ok(false);
     }
     match read_policy_state(home) {
@@ -211,6 +213,11 @@ pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
             Err(format!("MFA policy state unavailable; refusing config provisioning: {error}"))
         }
     }
+}
+
+fn policy_store_is_absent(home: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(home.join("users.db")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// A missing auth key is not permission for an ordinary writer to disable
@@ -310,6 +317,21 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         assert!(restore_policy(home.path()));
         std::fs::create_dir(home.path().join("config.toml")).unwrap();
+        assert!(restore_policy(home.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mfa_restore_missing_store_is_false_but_existing_unreadable_store_is_strict() {
+        let home = tempfile::tempdir().unwrap();
+        let config = "[gateway]\nport = 18789\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        assert!(!restore_policy(home.path()));
+        assert!(!restore_policy_differs(home.path(), config));
+
+        let db = home.path().join("users.db");
+        std::fs::write(&db, b"not a sqlite database").unwrap();
+        std::fs::set_permissions(&db, std::os::unix::fs::PermissionsExt::from_mode(0)).unwrap();
         assert!(restore_policy(home.path()));
     }
 

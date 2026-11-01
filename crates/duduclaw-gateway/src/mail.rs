@@ -1359,7 +1359,11 @@ mod tests {
         assert!(rendered.contains("id=\"12345678\""));
         assert!(rendered.contains("2026-11-01T12:34:56Z"));
         assert!(!rendered.contains("AbCdEf0123456789"));
-        assert!(!rendered.contains("123456"));
+        // The preserved mail ID deliberately contains the subject's code.
+        // Check the rendered content separately from that identifier.
+        let content = rendered.split_once('\n').unwrap().1;
+        assert!(content.contains("主旨：驗證碼 [已移除 1 組驗證碼]\n"));
+        assert!(!content.contains("123456"));
         assert!(!rendered.contains("654321"));
     }
 
