@@ -18,6 +18,8 @@
 - 第三方 MCP 的環境變數金鑰搬出員工的 `.mcp.json`，改存加密檔，由 proxy 啟動上游時才解開。升級時自動遷移並留下加密備份。`args`、`url` 裡的值與工具回傳的內容不在範圍內。**員工自己的內部金鑰仍在 `.mcp.json`；有 Bash 的員工與 gateway 是同一個 OS 使用者，讀得到 gateway 的檔案，要真正隔離請不要給 Bash，或用任務沙箱。**降版前請看 `docs/guides/deprecations.md`。
 - 網站登入代填：Admin 在「系統 → 安全」登錄網站帳密，綁定登入網址與可使用的員工。新工具 `computer_login` 由 gateway 導覽到該網址，一次完成填入與送出，AI 拿不到密碼。遇到二階段驗證要由人接手，同源網頁的 JavaScript 仍讀得到已填入的欄位。**要重建電腦操作映像。**
 - skill 與 pack 簽章：用 minisign 簽章，發行者公鑰釘選在本機 `trusted_publishers.toml`，`duduclaw publishers` 管理，變更要 Admin 核准。新增 `duduclaw pack manifest`、`pack verify`。未簽章的 skill 照舊走隔離與審批，畫面標示「未簽章」；簽章只證明來源，不會跳過掃描與審批。
+- Admin 上線檢查清單 `/setup`：依公司、人員、能力、開始四段列出該完成的設定，狀態讀取失敗時顯示「無法確認」，不算完成。
+- 主要 AI 員工：每位使用者可選一位，側欄排在最前面，交辦任務預設交給它；綁定移除後回到第一位 Owner 綁定。
 - `duduclaw service restart`：macOS 更新後若 launchd 一直重啟失敗（結束碼 78），用這個指令重新註冊，`doctor` 與更新畫面也會提示。
 
 ### Changed
