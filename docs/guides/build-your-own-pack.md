@@ -98,3 +98,21 @@ Quality checklist (a future tiered scorecard will look at these):
 - [ ] `requires` honestly lists prerequisites
 - [ ] Includes an eval case (`duduclaw eval-scaffold` can draft one from the SOUL) — packs with an eval rank higher
 - [ ] Changelog-style version notes (what changed in which version)
+
+## 6. Sign a pack with minisign
+
+Set the publisher in `pack.toml`, then generate and sign the manifest after finishing every file:
+
+```bash
+duduclaw pack manifest ./my-first-pack --publisher example
+cd my-first-pack
+minisign -Sm MANIFEST.sha256
+cd ..
+duduclaw pack verify ./my-first-pack
+```
+
+Use your separately managed minisign secret key; DuDuClaw neither creates nor stores signing keys. Before verification, the installer pins your public key with `duduclaw publishers add example <pubkey>` through dashboard Admin approval. Do not distribute a key alongside a pack and assume that makes it trusted.
+
+`MANIFEST.sha256` starts with `name: <name>`, `version: <version>` and `publisher: <id>`, followed by sorted `<sha256>  <relative path>` lines. It covers every file except `MANIFEST.sha256` and `MANIFEST.sha256.minisig`. Include both files in the distributed pack. Name and version must match `pack.toml`; a manifest from an older version is refused when the version differs. Missing, extra or changed files, absolute paths, traversal and symlinks invalidate the pack. Regenerate and sign the manifest after any edit.
+
+`pack verify` reports the source state. Job preset installs also require a preview and `--confirm-profile`, binding signature state, content and destination; a change requires a fresh confirmation. A valid signature only proves origin: the installer still scans content, quarantines hooks and enforces approval. Missing signatures for pinned publishers are invalid; unpinned unsigned packs warn before continuing.

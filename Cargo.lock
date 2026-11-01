@@ -1895,6 +1895,7 @@ dependencies = [
  "hmac",
  "keyring",
  "libc",
+ "minisign-verify",
  "percent-encoding",
  "serde",
  "serde_json",

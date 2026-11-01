@@ -1,5 +1,6 @@
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
+import type { SkillSignatureStatus } from './api-custom-skills';
 import { notifyDisconnectForget } from './forget-receipts';
 import { callTaskRpc, type TaskAttachmentInput } from './task-rpc';
 // v1.68 W2 — dashboard-switches RPC wire types.
@@ -576,6 +577,8 @@ export interface SkillInfo {
   /** Which layer the skill came from: company-wide / department / this staffer. */
   scope?: 'global' | 'department' | 'agent';
   security_status?: 'pass' | 'warn' | 'fail';
+  /** Absent on older gateways and locally authored skills: show as unsigned. */
+  signature_status?: SkillSignatureStatus;
   /** B8: localised name / description and tags from the frontmatter (search). */
   display_name?: string;
   description?: string;

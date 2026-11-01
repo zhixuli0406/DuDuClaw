@@ -21,6 +21,7 @@ pub(super) struct InstallCtx {
     pub home: PathBuf,
     pub dry_run: bool,
     pub confirm_profile: Option<String>,
+    pub signature_status: Option<duduclaw_core::publishers::SignatureStatus>,
     pub rename: bool,
     /// Explicit operator grant for pack hooks (`--trust-hooks`). Without it
     /// hooks land disabled behind an ApprovalBroker request (fail-closed).
@@ -46,6 +47,7 @@ pub(super) struct InstallCtx {
 pub(crate) struct PipelineOpts {
     pub dry_run: bool,
     pub confirm_profile: Option<String>,
+    pub signature_status: Option<duduclaw_core::publishers::SignatureStatus>,
     pub rename: bool,
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
@@ -207,7 +209,10 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     let staging = std::env::temp_dir().join(format!("duduclaw-expert-{}", uuid::Uuid::new_v4()));
     let cleanup = Cleanup(staging.clone());
 
-    let resolved = super::source::resolve_source_full(source, &staging).await?;
+    let resolved = if opts.extract_root.is_some() {
+        // The front door verified this private snapshot; never re-read its original source.
+        super::source::ResolvedSource { dir: PathBuf::from(source), zip: None, original_dir: None }
+    } else { super::source::resolve_source_full(source, &staging).await? };
     let (root, extract_root) = match &opts.extract_root {
         Some(er) => (resolved.dir.clone(), er.clone()),
         None => (detect::resolve_root(&resolved.dir), resolved.dir.clone()),
@@ -257,6 +262,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         home: home.to_path_buf(),
         dry_run,
         confirm_profile: opts.confirm_profile.clone(),
+        signature_status: opts.signature_status.clone(),
         rename: opts.rename || opts.reimport == super::reimport::ReimportMode::Copy,
         trust_hooks: opts.trust_hooks,
         attach_under,
@@ -1220,7 +1226,7 @@ mod native_plan_tests {
 
     fn ctx(home: &Path) -> InstallCtx {
         InstallCtx {
-            home: home.to_path_buf(), dry_run: true, confirm_profile: None,
+            home: home.to_path_buf(), dry_run: true, confirm_profile: None, signature_status: None,
             rename: false, trust_hooks: false, attach_under: None,
             reimport: Default::default(), replace: None, agent_cap: None,
             replace_state: Default::default(),
@@ -1247,7 +1253,7 @@ mod native_plan_tests {
     // Not run in this security-fix session: the owner prohibited builds/tests.
     #[tokio::test]
     async fn native_confirmation_rejects_changed_tools_skill_and_collision_plan() {
-        for change in ["tools", "skill", "collision", "parent", "model"] {
+        for change in ["tools", "skill", "collision", "parent", "model", "signature"] {
             let home = tempfile::tempdir().unwrap();
             let root = tempfile::tempdir().unwrap();
             source(root.path());
@@ -1264,6 +1270,9 @@ mod native_plan_tests {
                         "[agent]\nname = \"helper\"\n").unwrap();
                 }
                 "parent" => context.attach_under = Some("supervisor".into()),
+                "signature" => context.signature_status = Some(duduclaw_core::publishers::SignatureStatus {
+                    state: duduclaw_core::publishers::SignatureState::Verified, publisher: Some("fixture".into()),
+                }),
                 _ => std::fs::write(root.path().join("agents/helper/agent.partial.toml"),
                     "[model]\npreferred = \"claude-opus-4-5\"\n").unwrap(),
             }

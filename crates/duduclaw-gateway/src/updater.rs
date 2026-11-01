@@ -33,8 +33,8 @@ const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
 /// Every release asset must ship a `<asset>.minisig` signed by the matching
 /// secret key (CI `MINISIGN_SECRET_KEY` secret / `~/.minisign/duduclaw-release.key`).
 /// Rotating the key requires shipping a release signed by the OLD key that
-/// contains the NEW key here.
-pub(crate) const UPDATE_PUBKEY: &str = "RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh";
+/// contains the NEW shared `OFFICIAL_PUBLISHER_KEY` constant.
+pub(crate) const UPDATE_PUBKEY: &str = duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY;
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
 /// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
 pub fn current_version() -> &'static str {

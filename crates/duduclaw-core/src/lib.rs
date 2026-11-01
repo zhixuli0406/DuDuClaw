@@ -43,6 +43,7 @@ pub mod org;
 pub mod org_field_guard;
 pub mod org_store;
 pub mod pack;
+pub mod publishers;
 pub mod platform;
 pub mod preset;
 pub mod profile_sections;

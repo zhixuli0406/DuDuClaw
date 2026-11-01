@@ -1,4 +1,6 @@
 {
+  "skills.my.source.verified": "Verified source: {publisher}",
+  "skills.my.source.unsigned": "Unsigned",
   "chat.unanswered": "This message has no reply yet. The AI employee may still be working; the reply will appear automatically.",
   "chat.unansweredExpired": "No reply has arrived. You can send the message again or ask an administrator to check the gateway logs.",
   "chat.stalled": "The AI employee has not responded yet. Waiting for {minutes} min.",

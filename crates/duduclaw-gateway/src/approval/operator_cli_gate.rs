@@ -116,7 +116,50 @@ pub static OPERATOR_CLI_KINDS: &[&KindSpec] = &[
     &crate::responsibility::operator_gate::SPEC,
     &crate::memory_forget_approval::SPEC,
     &crate::computer_workspaces::cli_approval::SPEC,
+    &PUBLISHERS_SPEC,
 ];
+
+/// Trust-store changes can only be decided by a current dashboard Admin.
+pub const PUBLISHERS_ACTION_KIND: &str = "trusted_publishers_change";
+
+pub const PUBLISHERS_SPEC: KindSpec = KindSpec {
+    kind: PUBLISHERS_ACTION_KIND,
+    validity: Validity::Fixed(30),
+    consume: Consume::Once,
+    reminders: false,
+    max_pending_per_target: DEFAULT_MAX_PENDING_PER_TARGET,
+    max_pending_per_kind: DEFAULT_MAX_PENDING_PER_KIND,
+    push_cap_per_hour: Some(2),
+    legacy_scope_key: "publisher",
+    admin_refusal: "信任發行者的變更只能由管理員（Admin）在儀表板核准。",
+    expired_text: "這筆信任發行者的變更已逾期；請在終端機重新執行同一個指令。",
+    channel_refusal: Some("信任發行者的變更只能在儀表板由管理員決定。"),
+    notice: publishers_notice,
+    on_push_suppressed: publishers_push_suppressed,
+};
+
+fn publishers_notice(rec: &ApprovalRecord, _: bool, deadline: &str) -> String {
+    let publisher = rec.payload.get("publisher").and_then(Value::as_str).unwrap_or("?");
+    let action = match rec.payload.get("action").and_then(Value::as_str) {
+        Some("add") => "新增信任金鑰",
+        Some("remove") => "移除信任發行者",
+        _ => "變更信任發行者",
+    };
+    format!(
+        "信任發行者：{action}，{}。這筆請求由本機指令列建立，系統無法確認下指令的人是誰。請由管理員在儀表板決定。期限：{deadline}未決定將自動拒絕。",
+        crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(publisher, 64)),
+    )
+}
+
+fn publishers_push_suppressed(home: &Path, rec: &ApprovalRecord, pushed: usize) {
+    let event = duduclaw_security::audit::AuditEvent::new(
+        "trusted_publishers_push_suppressed",
+        UNVERIFIED_ACTOR,
+        duduclaw_security::audit::Severity::Warning,
+        json!({"approval_id": rec.id.as_str(), "pushed_last_hour": pushed}),
+    );
+    duduclaw_security::audit::append_audit_event(home, &event);
+}
 
 /// The spec of an operator-CLI kind, `None` for every other kind.
 pub fn spec_for(kind: &str) -> Option<&'static KindSpec> {

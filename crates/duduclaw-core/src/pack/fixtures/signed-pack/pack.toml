@@ -1,0 +1,7 @@
+[pack]
+schema = 1
+id = "signed-pack"
+kind = "team"
+tier = "free"
+version = "1.0.0"
+publisher = "fixture"

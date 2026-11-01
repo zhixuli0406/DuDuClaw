@@ -223,6 +223,12 @@ pub fn write_record(home: &Path, rec: &InstallRecord) -> Result<()> {
     duduclaw_gateway::expert_admin::write_record(home, rec).map_err(cfg_err)
 }
 
+pub(crate) use import_error::error_json as import_error_json;
+
+pub(crate) fn open_import_report(path: &std::path::Path) -> Result<std::fs::File> {
+    report::open_report_file(path)
+}
+
 mod report;
 use report::Report;
 

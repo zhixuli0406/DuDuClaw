@@ -1,0 +1,5 @@
+name: signed-pack
+version: 1.0.0
+publisher: fixture
+8cfea558ad7e8ae34f861b0439fa570f7d815b0e33b452a4b47e028dfaa03e1f  README.md
+236466ead2c364ba189b98e8b5572ecd4559d8f164c64658b3d56e569dd6fa94  pack.toml

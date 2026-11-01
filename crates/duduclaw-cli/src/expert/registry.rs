@@ -74,6 +74,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// Extract the base64 key line from a minisign `.pub` file (comment line +
 /// base64 line). Fails closed on anything that doesn't look like one.
+#[cfg(test)]
 pub fn pubkey_base64_from_file(text: &str) -> Result<String> {
     text.lines()
         .map(str::trim)
@@ -83,14 +84,45 @@ pub fn pubkey_base64_from_file(text: &str) -> Result<String> {
 }
 
 /// Verify `data` against a minisign signature + publisher pub file content.
+#[cfg(test)]
 pub fn verify_minisig(data: &[u8], sig_text: &str, pub_file: &str) -> Result<()> {
     let b64 = pubkey_base64_from_file(pub_file)?;
-    let pk = minisign_verify::PublicKey::from_base64(&b64)
-        .map_err(|e| cfg(format!("registry publisher key 無效：{e}")))?;
-    let sig = minisign_verify::Signature::decode(sig_text)
-        .map_err(|e| cfg(format!("minisig 簽章格式無效：{e}")))?;
-    pk.verify(data, &sig, false)
-        .map_err(|e| cfg(format!("簽章驗證失敗——拒絕安裝：{e}")))
+    duduclaw_core::publishers::verify_minisig(data, sig_text, &b64).map_err(cfg)
+}
+
+/// Enforce registry origin independently of the transport and the registry host.
+pub(crate) fn verify_registry_signature(
+    entry: &RegistryEntry, data: &[u8], signature: Option<&str>, store: &duduclaw_core::publishers::TrustStore,
+) -> Result<duduclaw_core::publishers::SignatureStatus> {
+    if code_lane(entry) && !store.is_pinned(&entry.publisher) {
+        return Err(cfg(format!("publisher {} 尚未釘選；先從獨立管道核對公鑰，再使用 duduclaw publishers add <id> <pubkey>；拒絕 code lane 安裝", entry.publisher)));
+    }
+    if code_lane(entry) && signature.is_none() { return Err(cfg("code lane 缺少 minisig——拒絕安裝")); }
+    if let Some(sig) = signature {
+        minisign_verify::Signature::decode(sig).map_err(|e| cfg(format!("minisig 簽章格式無效：{e}")))?;
+    }
+    store.verify_content(Some(&entry.publisher), signature, data).map_err(cfg)
+}
+
+/// Index flags are untrusted. Inspect the extracted payload before accepting its lane.
+pub(crate) fn extracted_code_lane(root: &std::path::Path) -> Result<bool> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut count = 0usize;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| cfg(e.to_string()))? {
+            let entry = entry.map_err(|e| cfg(e.to_string()))?;
+            count += 1;
+            if count > 10_000 { return Err(cfg("registry pack inventory exceeds limit")); }
+            let meta = entry.file_type().map_err(|e| cfg(e.to_string()))?;
+            if meta.is_symlink() { return Err(cfg("registry pack contains a symlink")); }
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            if (meta.is_dir() && matches!(name.as_str(), "skills" | "hooks" | "commands"))
+                || (meta.is_file() && matches!(name.as_str(), "skill.md" | "hooks.json")) { return Ok(true); }
+            if meta.is_dir() { pending.push(entry.path()); }
+        }
+    }
+    Ok(false)
 }
 
 /// WP2.5 — BRAT-style side door: `github:user/repo[@branch]` → the repo's
@@ -227,7 +259,7 @@ pub async fn fetch_small(url: &str, cap: usize, what: &str) -> Result<Vec<u8>> {
 
 /// Resolve `registry:<slug>` → verified archive bytes + the entry.
 /// Every failure is a hard refusal (fail-closed).
-pub async fn fetch_verified_archive(slug: &str) -> Result<(RegistryEntry, Vec<u8>)> {
+pub async fn fetch_verified_archive(slug: &str) -> Result<(RegistryEntry, Vec<u8>, Option<String>)> {
     if !slug_ok(slug) {
         return Err(cfg(format!("registry slug 不合法：{slug}")));
     }
@@ -268,29 +300,75 @@ pub async fn fetch_verified_archive(slug: &str) -> Result<(RegistryEntry, Vec<u8
         )));
     }
 
-    // 2) Authenticity: code lane must verify the publisher's signature.
-    if code_lane(&entry) {
-        let sig_url = entry.minisig_url.as_deref().ok_or_else(|| {
-            cfg("此包含 hooks/skills（code lane）但 entry 缺 minisig_url——拒絕安裝")
-        })?;
-        let sig_text = String::from_utf8(fetch_small(sig_url, 4 * 1024, "minisig 簽章").await?)
-            .map_err(|_| cfg("minisig 簽章不是合法 UTF-8"))?;
-        let key_url = format!("{base}/publishers/{}/minisign.pub", entry.publisher);
-        let pub_file = String::from_utf8(fetch_small(&key_url, 4 * 1024, "publisher 公鑰").await?)
-            .map_err(|_| cfg("publisher 公鑰不是合法 UTF-8"))?;
-        verify_minisig(&archive, &sig_text, &pub_file)?;
-        println!(
-            "🔏 code lane 簽章驗證通過（publisher: {}）",
-            entry.publisher
-        );
+    // Publisher keys are local pins, never fetched from the registry host.
+    let store = duduclaw_core::publishers::TrustStore::load(&crate::duduclaw_home());
+    let pinned = store.is_pinned(&entry.publisher);
+    if code_lane(&entry) && !pinned {
+        return Err(cfg(format!("publisher {} 尚未釘選；先從獨立管道核對公鑰，再使用 duduclaw publishers add <id> <pubkey>；拒絕 code lane 安裝", entry.publisher)));
     }
+    if entry.minisig_url.is_none() && (code_lane(&entry) || pinned) {
+        return Err(cfg("此來源缺少必要 minisig_url——拒絕安裝"));
+    }
+    let sig_text = if let Some(sig_url) = entry.minisig_url.as_deref() {
+        Some(String::from_utf8(fetch_small(sig_url, 4 * 1024, "minisig 簽章").await?)
+            .map_err(|_| cfg("minisig 簽章不是合法 UTF-8"))?)
+    } else { None };
+    let status = verify_registry_signature(&entry, &archive, sig_text.as_deref(), &store)?;
+    println!("🔏 registry 來源：{:?}（publisher: {}）", status.state, entry.publisher);
 
-    Ok((entry, archive))
+    Ok((entry, archive, sig_text))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_payload_cannot_hide_code_by_clearing_index_flags() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!extracted_code_lane(root.path()).unwrap());
+        for dirname in ["skills", "hooks", "commands", "SKILLS"] {
+            let dir = root.path().join(dirname);
+            std::fs::create_dir(&dir).unwrap();
+            assert!(extracted_code_lane(root.path()).unwrap(), "{dirname}");
+            std::fs::remove_dir(dir).unwrap();
+        }
+        for filename in ["SKILL.md", "hooks.json"] {
+            std::fs::write(root.path().join(filename), "payload").unwrap();
+            assert!(extracted_code_lane(root.path()).unwrap(), "{filename}");
+            std::fs::remove_file(root.path().join(filename)).unwrap();
+        }
+    }
+
+    #[test]
+    fn pinned_registry_signature_ok_and_wrong_key_refused() {
+        use duduclaw_core::publishers::{Publisher, SignatureState, TrustStore};
+        let data = include_bytes!("../../../duduclaw-core/src/pack/fixtures/signed-pack/MANIFEST.sha256");
+        let sig = include_str!("../../../duduclaw-core/src/pack/fixtures/signed-pack/MANIFEST.sha256.minisig");
+        let key = "RWRjwiSIobMFBdZAKNK+fZ+02Xp6J4fzbRRbKGtAxLLzCHjdDm7ZuKV/";
+        let mut store = TrustStore { publishers: std::collections::BTreeMap::from([("fixture".into(), Publisher { keys: vec![key.into()] })]) };
+        let entry: RegistryEntry = serde_json::from_str(r#"{"slug":"x-pack","publisher":"fixture","archive_url":"https://example.test/x.zip","sha256":"aa","contains":{"skills":true}}"#).unwrap();
+        assert_eq!(verify_registry_signature(&entry, data, Some(sig), &store).unwrap().state, SignatureState::Verified);
+        assert!(verify_minisig(data, sig, key).is_ok());
+        store.publishers.get_mut("fixture").unwrap().keys = vec![duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY.into()];
+        assert!(verify_registry_signature(&entry, data, Some(sig), &store).is_err());
+    }
+
+    #[test]
+    fn registry_never_accepts_an_unpinned_code_lane_or_downgrades_a_pin() {
+        let entry: RegistryEntry = serde_json::from_str(r#"{"slug":"x-pack","publisher":"fixture","archive_url":"https://example.test/x.zip","sha256":"aa","contains":{"skills":true}}"#).unwrap();
+        let store = duduclaw_core::publishers::TrustStore::default();
+        assert!(verify_registry_signature(&entry, b"x", None, &store).is_err());
+        let mut entry = entry;
+        entry.publisher = "duduclaw".into();
+        assert!(verify_registry_signature(&entry, b"x", None, &store).is_err());
+        assert!(verify_registry_signature(&entry, b"x", Some("bad"), &store).is_err());
+        entry.contains.skills = false;
+        assert!(verify_registry_signature(&entry, b"x", None, &store).is_err());
+        // A registry-provided key has no argument or transport path here.
+        entry.publisher = "unknown".into();
+        assert_eq!(verify_registry_signature(&entry, b"x", None, &store).unwrap().state, duduclaw_core::publishers::SignatureState::Unsigned);
+    }
 
     #[test]
     fn slug_rules_mirror_registry() {
