@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import '@/test/mocks';
+import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { SidebarProvider } from '@/components/mds';
 import { AppSidebar } from './AppSidebar';
@@ -360,6 +360,48 @@ describe('employee sidebar', () => {
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
     renderSidebar();
     expect(document.querySelector('svg.lucide-bell')).not.toBeNull();
+  });
+
+  it('marks and sorts the primary employee before an Owner binding', () => {
+    useAgentsStore.setState({ agents: makeAgents(2) as never });
+    useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'agent-1' } as never,
+      bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'viewer' }] as never });
+    renderSidebar();
+    const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
+    expect(links.map(link => link.getAttribute('href'))).toEqual(['/agents/agent-1', '/agents/agent-0']);
+    expect(links[0]).toHaveTextContent('Primary');
+    expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(2);
+  });
+
+  it('sets the primary from the row menu and refreshes the current user before updating staff', async () => {
+    const user = userEvent.setup();
+    const bindings = [
+      { agent_name: 'agent-0', access_level: 'owner' },
+      { agent_name: 'agent-1', access_level: 'viewer' },
+    ];
+    const currentUser = { id: 'employee', role: 'employee', display_name: 'Alice', primary_agent_id: 'agent-0' };
+    useAgentsStore.setState({ agents: makeAgents(2) as never });
+    useAuthStore.setState({ user: currentUser as never, bindings: bindings as never });
+    let finishRefresh!: (value: unknown) => void;
+    const refreshing = new Promise(resolve => { finishRefresh = resolve; });
+    const me = vi.spyOn(api.users, 'me').mockImplementation(() => refreshing as ReturnType<typeof api.users.me>);
+    renderSidebar();
+    const staffLinks = () => screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
+    expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0');
+    await user.click(screen.getAllByRole('button', { name: 'Set as primary' })[1]);
+    await user.click(await screen.findByRole('menuitem', { name: 'Set as primary' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('users.set_primary_agent', { agent_id: 'agent-1' }));
+    await waitFor(() => expect(me).toHaveBeenCalledOnce());
+    // The mutation alone does not invent a new local current-user state.
+    expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0');
+    finishRefresh({ user: { ...currentUser, primary_agent_id: 'agent-1' }, bindings });
+    await waitFor(() => {
+      expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-1');
+      expect(staffLinks()[0]).toHaveTextContent('Primary');
+      expect(staffLinks()[1]).not.toHaveTextContent('Primary');
+    });
+    expect(useAuthStore.getState().user?.primary_agent_id).toBe('agent-1');
+    me.mockRestore();
   });
 
   it('sorts bound staff by owner, operator, viewer and limits the list to eight', () => {

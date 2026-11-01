@@ -2363,6 +2363,7 @@ export interface LicenseSnapshot {
 // ── User management types ────────────────────────────────────
 
 export interface UserInfo {
+  primary_agent_id?: string | null;
   id: string;
   email: string;
   display_name: string;
@@ -8871,6 +8872,8 @@ export const api = {
         status: string;
         transferred_agents: string[];
       }>,
+    setPrimaryAgent: (agentId: string | null) =>
+      client.call('users.set_primary_agent', { agent_id: agentId }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>
       client.call('users.me') as Promise<{
         user: UserInfo;

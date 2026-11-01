@@ -13,9 +13,13 @@ import {
   Bell,
   Languages,
   ArrowRight,
+  MoreHorizontal,
 } from 'lucide-react';
 import { EmployeeAccountMenu } from './EmployeeAccountMenu';
 import { cn } from '@/lib/utils';
+import { api } from '@/lib/api';
+import { toast, formatError } from '@/lib/toast';
+import { sortPrimaryStaff } from '@/lib/primary-agent';
 import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
@@ -236,18 +240,30 @@ function StaffZone({
   const intl = useIntl();
   const agents = useVisibleAgents();
   const bindings = useAuthStore((s) => s.bindings);
+  const primaryAgent = useAuthStore((s) => s.user?.primary_agent_id);
+  const [settingPrimary, setSettingPrimary] = useState(false);
+  const setPrimary = async (agent: string) => {
+    setSettingPrimary(true);
+    const subject = useAuthStore.getState().user?.id;
+    try {
+      await api.users.setPrimaryAgent(agent);
+      const me = await api.users.me();
+      if (subject && useAuthStore.getState().user?.id === subject) {
+        useAuthStore.getState().setUser(me.user, me.bindings);
+      }
+    } catch (error) { toast.error(formatError(error)); }
+    finally { setSettingPrimary(false); }
+  };
   const navClass = useNavClass(collapsed);
 
   const shown = useMemo(() => {
     if (employee) {
-      const rank = { owner: 0, operator: 1, viewer: 2 };
-      const access = new Map(bindings.map(b => [b.agent_name, rank[b.access_level]]));
-      return agents.filter(a => access.has(a.name)).slice().sort((a, b) => access.get(a.name)! - access.get(b.name)!).slice(0, 8);
+      return sortPrimaryStaff(agents, bindings, primaryAgent).slice(0, 8);
     }
     const active = agents.filter((a) => a.status === 'active');
     if (active.length > 0) return active.slice(0, LIVE_LIMIT);
     return agents.slice(0, RECENT_LIMIT);
-  }, [agents, bindings, employee]);
+  }, [agents, bindings, employee, primaryAgent]);
 
   if (collapsed) {
     if (shown.length === 0 && !employee) return null;
@@ -305,7 +321,7 @@ function StaffZone({
               <SidebarMenuItem key={a.name}>
                 <NavLink
                   to={`/agents/${encodeURIComponent(a.name)}`}
-                  className={navClass}
+                  className={({ isActive }) => cn(navClass({ isActive }), employee && "pr-9")}
                 >
                   <ActorAvatar
                     actorType="agent"
@@ -315,7 +331,18 @@ function StaffZone({
                     status={AGENT_STATUS_DOT[a.status] ?? 'offline'}
                   />
                   <span className="min-w-0 flex-1 truncate">{a.display_name}{a.readOnly && <span className="block text-[10px] text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span>}</span>
+                  {employee && a.name === primaryAgent && <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'sidebar.primaryAgent' })}</span>}
                 </NavLink>
+                {employee && <DropdownMenu>
+                  <DropdownMenuTrigger render={<Button variant="ghost" size="icon" className="absolute right-1 top-1 size-6" aria-label={intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })} />}>
+                    <MoreHorizontal className="size-4" />
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent>
+                    <DropdownMenuItem disabled={settingPrimary || a.name === primaryAgent} onClick={() => void setPrimary(a.name)}>
+                      {intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>}
               </SidebarMenuItem>
             ))
           )}

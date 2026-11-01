@@ -616,6 +616,7 @@ export const manageNav: NavItem[] = [
   // 系統更新 — lifted out of the settings page's tab rail (2026-08-04, D18).
   // N-3: relocated to the 系統設定 app, same rationale as 帳戶與登入 above.
   { to: '/app/system/updates', icon: Download, label: 'manage.updates', desc: 'manage.updates.desc', minRole: 'admin' },
+  { to: '/setup', icon: ListChecks, label: 'setup.title', desc: 'setup.description', minRole: 'admin', enterprise: true, newIn: '1.79.0' },
   // 進階設定 — everything else, folded one level down. Nothing was removed;
   // `manageAdvancedNav` below is the full former list minus the four surfaces
   // promoted above.
@@ -752,6 +753,7 @@ export const allManageNav: NavItem[] = [...manageNav, ...manageAdvancedNav];
  * in here since they live outside `navGroups`.
  */
 export function crumbsFor(pathname: string): Array<{ labelId: string; to?: string }> {
+  if (pathname === '/setup') return [{ labelId: manageEntry.label, to: '/manage' }, { labelId: 'setup.title' }];
   if (pathname.startsWith('/manage')) {
     const item = allManageNav.find((i) => pathname.startsWith(i.to));
     const advanced = manageAdvancedNav.some((i) => i.to === item?.to);

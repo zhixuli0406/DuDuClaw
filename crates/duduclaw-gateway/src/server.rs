@@ -3884,6 +3884,13 @@ async fn handle_me(
     };
 
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
+    let primary = match state.user_db.primary_agent(&user.id) {
+        Ok(value) => value,
+        Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "unable to read user preference"}))).into_response(),
+    };
+    let mut user = serde_json::json!(user);
+    user["primary_agent_id"] = serde_json::json!(primary);
 
     Json(serde_json::json!({
         "user": user,

@@ -453,6 +453,23 @@ describe('複雜任務 tab', () => {
     });
   });
 
+  it('defaults to the primary employee without replacing an entry-point selection', async () => {
+    useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Use my primary');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ agent_id: 'nova' })));
+  });
+
+  it('keeps the explicit employee when the primary differs', async () => {
+    useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    const user = userEvent.setup();
+    renderAt({ pathname: '/assign', state: { assignPrefill: { agentId: 'scout', description: 'Explicit selection' } } });
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ agent_id: 'scout' })));
+  });
+
   it('想一想 mode sends plan_first and still lands on the created task', async () => {
     const user = userEvent.setup();
     openComplex();

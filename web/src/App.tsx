@@ -21,6 +21,7 @@ import { useIsAppliance } from './hooks/useIsAppliance';
 const lazyPage = <K extends string>(loader: () => Promise<Record<K, React.ComponentType>>, key: K) =>
   lazy(() => loader().then((m) => ({ default: m[key] })));
 
+const SetupChecklistPage = lazyPage(() => import('./pages/SetupChecklistPage'), 'SetupChecklistPage');
 const HomePage = lazyPage(() => import('./pages/HomePage'), 'HomePage');
 const InboxPage = lazyPage(() => import('./pages/InboxPage'), 'InboxPage');
 const RoutinesPage = lazyPage(() => import('./pages/RoutinesPage'), 'RoutinesPage');
@@ -253,6 +254,7 @@ export function App() {
                   board, /goals, agent cards, gallery) lands here. Not a nav
                   row; the sidebar's primary button is its entry. */}
               <Route path="assign" element={<AssignPage />} />
+              <Route element={<RoleGuard minRole="admin" />}><Route element={<EditionGuard enterprise />}><Route path="setup" element={<SetupChecklistPage />} /></Route></Route>
               {/* P5 持續任務 — every `responsibilities.*` RPC re-checks the
                   caller's binding to the owner employee server-side. */}
               <Route path="responsibilities" element={<ResponsibilitiesPage />} />
