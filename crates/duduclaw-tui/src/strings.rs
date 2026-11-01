@@ -3,9 +3,15 @@ use crate::Error;
 pub const STALE: &str = "資料可能過期";
 pub const UNKNOWN_COUNT: &str = "?";
 pub const ADMIN_ONLY: &str = "此面板需要管理員權限";
-pub const EMAIL: &str = "電子郵件：";
-pub const PASSWORD: &str = "密碼：";
-pub const OTP: &str = "驗證碼（若帳號已綁定通道，驗證碼已送出）：";
+pub const EMAIL: &str = "電子郵件";
+pub const PASSWORD: &str = "密碼";
+pub const OTP: &str = "驗證碼（若帳號已綁定通道，驗證碼已送出）";
+pub const MFA_METHOD: &str = "雙因素驗證方式";
+pub const MFA_AUTHENTICATOR: &str = "驗證器六位數驗證碼";
+pub const MFA_RECOVERY: &str = "復原碼";
+pub const MFA_CODE: &str = "驗證器六位數驗證碼";
+pub const MFA_RECOVERY_CODE: &str = "復原碼";
+pub const MFA_RETRY: &str = "驗證碼不正確，請重新輸入，或改用復原碼";
 pub const SOURCE_APPROVAL: &str = "審核";
 pub const SOURCE_GOAL: &str = "目標任務";
 pub const SOURCE_QUESTION: &str = "員工提問";
@@ -21,6 +27,9 @@ pub fn error(error: Error) -> &'static str {
         Error::LoginRequired => {
             "登入失敗或登入已失效，請重新登入；若尚未設定密碼，請先在儀表板設定密碼或啟用本機自動登入"
         }
+        Error::MfaEnrollmentRequired => "帳號必須先設定雙因素驗證，請到儀表板完成設定後重新登入",
+        Error::MfaTerminalRequired => "雙因素驗證需要互動終端，請在終端機重新執行並輸入驗證碼或復原碼",
+        Error::MfaFailed => "雙因素驗證未通過、已達嘗試上限或驗證已失效，請重新登入",
         Error::SetupRequired => "請先在儀表板設定密碼，或啟用本機自動登入",
         Error::PasswordChangeRequired => "請先在儀表板變更密碼，再重新登入",
         Error::LegacyIdentity => "不支援舊版管理員權杖或系統身分，請使用帳號登入",
@@ -74,7 +83,7 @@ pub const NO_ID: &str = "此項目沒有可保存的已讀識別碼";
 pub const TERMINAL_SMALL: &str = "終端太小，請放大至至少 24 欄、12 列；q 離開";
 
 pub const AI_SESSION_REFUSED: &str = "控制室只供操作者使用，不能在 AI 員工工作階段中啟動";
-pub const LOGIN_METHOD: &str = "選擇登入方式（擇一即可，驗證碼不是雙因素驗證）";
+pub const LOGIN_METHOD: &str = "選擇登入方式（已啟用雙因素驗證的帳號還需第二步驗證）";
 pub const LOGIN_PASSWORD: &str = "帳號密碼";
 pub const LOGIN_EMAIL_CODE: &str = "電子郵件帳號驗證碼";
 pub const CARD_TITLE: &str = "決策卡";

@@ -9,12 +9,19 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-/// Implementations must disable echo for Password and Otp, and never log input.
+/// Implementations must disable echo for every secret field and never log input.
 /// The CLI supplies the terminal implementation; tests supply scripted answers.
 #[async_trait]
 #[allow(clippy::double_must_use)] // async_trait annotates its already-must-use Future.
 pub trait LoginPrompt: Send {
     async fn read(&mut self, field: PromptField) -> Result<Zeroizing<String>>;
+    fn is_interactive(&self) -> bool {
+        true
+    }
+    async fn mfa_method(&mut self) -> Result<MfaMethod> {
+        Ok(MfaMethod::Authenticator)
+    }
+    fn mfa_retry(&mut self) {}
     async fn method(&mut self) -> Result<LoginMethod> {
         Ok(LoginMethod::Password)
     }
@@ -24,6 +31,8 @@ pub enum PromptField {
     Email,
     Password,
     Otp,
+    MfaCode,
+    RecoveryCode,
 }
 impl PromptField {
     pub fn label(self) -> &'static str {
@@ -31,6 +40,8 @@ impl PromptField {
             Self::Email => strings::EMAIL,
             Self::Password => strings::PASSWORD,
             Self::Otp => strings::OTP,
+            Self::MfaCode => strings::MFA_CODE,
+            Self::RecoveryCode => strings::MFA_RECOVERY_CODE,
         }
     }
     pub fn secret(self) -> bool {
@@ -42,6 +53,12 @@ impl PromptField {
 pub enum LoginMethod {
     Password,
     EmailCode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MfaMethod {
+    Authenticator,
+    RecoveryCode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -297,8 +314,7 @@ impl AuthClient {
         }
         let method = prompt.method().await?;
         let email = prompt.read(PromptField::Email).await?;
-        // Both endpoints issue full sessions. OTP is an alternative login,
-        // never a second factor appended to a successful password login.
+        // Either primary login can require the same MFA second step.
         if method == LoginMethod::Password {
             let password = prompt.read(PromptField::Password).await?;
             #[derive(Serialize)]
@@ -306,9 +322,12 @@ impl AuthClient {
                 email: &'a str,
                 password: &'a str,
             }
-            return Self::decode::<TokenPair>(self.post("/api/login", &PasswordBody {
+            let reply = self.post("/api/login", &PasswordBody {
                 email: &email, password: &password,
-            }).await?)?.into_session();
+            }).await?;
+            drop(password);
+            drop(email);
+            return self.complete_login(reply, prompt).await;
         }
         #[derive(Serialize)]
         struct OtpRequest<'a> {
@@ -332,17 +351,88 @@ impl AuthClient {
             challenge_id: &'a str,
             code: &'a str,
         }
-        let pair: TokenPair = Self::decode(
-            self.post(
+        let reply = self.post(
                 "/api/otp/verify",
                 &OtpVerify {
                     challenge_id: &challenge.challenge_id,
                     code: &code,
                 },
             )
-            .await?,
-        )?;
-        pair.into_session()
+            .await?;
+        drop(code);
+        drop(challenge);
+        drop(email);
+        self.complete_login(reply, prompt).await
+    }
+    async fn complete_login(&self, reply: HttpReply, prompt: &mut dyn LoginPrompt) -> Result<Session> {
+        #[derive(Deserialize)]
+        struct NextStep {
+            #[serde(default)]
+            mfa_required: bool,
+            #[serde(default)]
+            mfa_enrollment_required: bool,
+            challenge_id: Option<Zeroizing<String>>,
+            // enrollment_token is deliberately ignored and never materialized.
+        }
+        if !(200..300).contains(&reply.status) {
+            return Err(Error::LoginRequired);
+        }
+        let next: NextStep = serde_json::from_slice(&reply.body).map_err(|_| Error::Protocol)?;
+        if next.mfa_enrollment_required {
+            return Err(Error::MfaEnrollmentRequired);
+        }
+        if !next.mfa_required {
+            return Self::decode::<TokenPair>(reply)?.into_session();
+        }
+        let challenge = next.challenge_id.filter(|id| !id.is_empty()).ok_or(Error::Protocol)?;
+        // Drop the primary response before waiting for terminal input.
+        drop(reply);
+        if !prompt.is_interactive() {
+            return Err(Error::MfaTerminalRequired);
+        }
+        // A local safety bound also stops older/misbehaving servers that never
+        // retire a challenge. A server refusal/429 can stop this sooner.
+        const MAX_MFA_ATTEMPTS: usize = 5;
+        for attempt in 0..MAX_MFA_ATTEMPTS {
+            let method = prompt.mfa_method().await?;
+            let field = match method {
+                MfaMethod::Authenticator => PromptField::MfaCode,
+                MfaMethod::RecoveryCode => PromptField::RecoveryCode,
+            };
+            let code = prompt.read(field).await?;
+            if method == MfaMethod::Authenticator
+                && (code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()))
+            {
+                if attempt + 1 == MAX_MFA_ATTEMPTS {
+                    return Err(Error::MfaFailed);
+                }
+                prompt.mfa_retry();
+                continue;
+            }
+            #[derive(Serialize)]
+            struct Verify<'a> {
+                challenge_id: &'a str,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                code: Option<&'a str>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                recovery_code: Option<&'a str>,
+            }
+            let reply = self.post("/api/mfa/verify", &Verify {
+                challenge_id: &challenge,
+                code: (method == MfaMethod::Authenticator).then_some(code.as_str()),
+                recovery_code: (method == MfaMethod::RecoveryCode).then_some(code.as_str()),
+            }).await?;
+            if (200..300).contains(&reply.status) {
+                return Self::decode::<TokenPair>(reply)?.into_session();
+            }
+            // Never print the gateway body: it may contain sensitive values.
+            // Wrong-code 401 is retryable only within this bounded challenge.
+            if reply.status != 401 || attempt + 1 == MAX_MFA_ATTEMPTS {
+                return Err(Error::MfaFailed);
+            }
+            prompt.mfa_retry();
+        }
+        Err(Error::MfaFailed)
     }
     pub async fn refresh(&self, session: &mut Session) -> Result<()> {
         #[derive(Serialize)]

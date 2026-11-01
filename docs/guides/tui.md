@@ -56,12 +56,14 @@ After quitting and restoring the terminal, stdout shows the authoritative pendin
 | Personal, local auto-login enabled | The gateway may issue a local account session without prompting. |
 | Personal, auto-login disabled, password set | Choose account password and enter the account email and password. |
 | Personal, auto-login disabled, initial setup incomplete | Open the dashboard to set a password or enable local auto-login first. |
-| Team / Enterprise | Choose password **or** account email code. Each method completes login on its own. The gateway never grants these editions local auto-login. |
+| Team / Enterprise | Choose password **or** account email code. Accounts enrolled in MFA then require an authenticator code or recovery code. The gateway never grants these editions local auto-login. |
 | Password change required | Change the password in the dashboard before starting the control room. |
 | Session expires | Refresh in memory and reconnect. If refresh fails, request explicit account login again; never fall back to automatic local login. |
 | Non-admin account | Only permitted employees and inbox items are available. Admin panels explain the required permission. |
 
-OTP is an alternative login method, **not two-factor authentication**. A correct password alone can issue a full session; the client does not chain password and OTP or claim a second-factor guarantee. The code is requested for the entered account email and delivered through the gateway's configured, bound channel. Code delivery must already work in the dashboard. Password and code input are not echoed. Login prompts and fixed error messages go to stderr.
+Password and channel code are alternative primary login methods. For an account enrolled in MFA, either method is followed by a second step: a six-digit authenticator code or a recovery code. Wrong codes can be retried within the gateway's attempt limit (the terminal also stops after five attempts); an expired or exhausted challenge requires a new login. If enrollment is required, complete it in the dashboard; the terminal does not use the enrollment token.
+
+Channel codes are requested for the entered account email and delivered through the gateway's configured, bound channel; delivery must already work in the dashboard. Passwords, codes and recovery codes are not echoed. Login prompts and fixed errors go to stderr. Without an interactive terminal, a required code produces an error instead of waiting for input, including `tui inbox --json`. Gateways without MFA keep the existing login flow.
 
 ## Keys and freshness
 

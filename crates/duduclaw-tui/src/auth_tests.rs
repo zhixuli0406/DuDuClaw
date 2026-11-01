@@ -50,6 +50,11 @@ impl LoginPrompt for Prompt {
             LoginMethod::EmailCode
         } else { LoginMethod::Password })
     }
+    async fn mfa_method(&mut self) -> Result<MfaMethod> {
+        Ok(if self.0.front().is_some_and(|(field, _)| *field == PromptField::RecoveryCode) {
+            MfaMethod::RecoveryCode
+        } else { MfaMethod::Authenticator })
+    }
     async fn read(&mut self, field: PromptField) -> Result<Zeroizing<String>> {
         let (expected, value) = self.0.pop_front().expect("unexpected prompt");
         assert_eq!(field, expected);
@@ -352,5 +357,187 @@ fn control_room_tokens_never_enter_pty_child_environment() {
     for (_, value) in command.iter_full_env_as_str() {
         assert!(!value.contains(session.access_token.as_str()));
         assert!(!value.contains(session.refresh_token.as_str()));
+    }
+}
+
+fn mfa_challenge() -> Value {
+    json!({"mfa_required":true,"challenge_id":"mfa-memory-only"})
+}
+fn mfa_step(field: PromptField, value: &str, status: u16, response: Value) -> Step {
+    let key = if field == PromptField::RecoveryCode { "recovery_code" } else { "code" };
+    Step {
+        path: "/api/mfa/verify",
+        body: Some(json!({"challenge_id":"mfa-memory-only", key:value})),
+        status,
+        response,
+    }
+}
+#[tokio::test]
+async fn password_then_authenticator_or_recovery() {
+    for (field, value) in [(PromptField::MfaCode, "123456"), (PromptField::RecoveryCode, "fixture-recovery")] {
+        let (c, s) = client("https://example.com", vec![
+            password(mfa_challenge()), mfa_step(field, value, 200, pair("u1", false)),
+        ]);
+        let mut p = prompt(false);
+        p.0.push_back((field, value));
+        assert_eq!(c.login(LoginMode::Personal, &mut p).await.unwrap().account.id, "u1");
+        assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+        assert!(field.secret());
+    }
+}
+#[tokio::test]
+async fn mfa_wrong_code_then_right() {
+    let (c, s) = client("https://example.com", vec![
+        password(mfa_challenge()),
+        mfa_step(PromptField::MfaCode, "000000", 401, json!({"error":"wrong code"})),
+        mfa_step(PromptField::MfaCode, "123456", 200, pair("u1", false)),
+    ]);
+    let mut p = prompt(false);
+    p.0.extend([(PromptField::MfaCode, "000000"), (PromptField::MfaCode, "123456")]);
+    assert!(c.login(LoginMode::Personal, &mut p).await.is_ok());
+    assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn mfa_server_and_client_attempt_caps() {
+    for statuses in [vec![401, 429], vec![401; 5], vec![403], vec![500]] {
+        let mut steps = vec![password(mfa_challenge())];
+        let mut p = prompt(false);
+        for status in statuses {
+            steps.push(mfa_step(PromptField::MfaCode, "000000", status, json!({"error":"secret-never-display"})));
+            p.0.push_back((PromptField::MfaCode, "000000"));
+        }
+        let (c, s) = client("https://example.com", steps);
+        assert!(matches!(c.login(LoginMode::Personal, &mut p).await, Err(Error::MfaFailed)));
+        assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+    }
+}
+#[tokio::test]
+async fn mfa_enrollment_stops_without_using_token_or_prompting() {
+    let (c, s) = client("https://example.com", vec![password(json!({
+        "mfa_enrollment_required":true,"enrollment_token":"must-not-be-used"
+    }))]);
+    let mut p = prompt(false);
+    assert!(matches!(c.login(LoginMode::Personal, &mut p).await, Err(Error::MfaEnrollmentRequired)));
+    assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+}
+struct NonTerminal(Prompt);
+#[async_trait]
+impl LoginPrompt for NonTerminal {
+    fn is_interactive(&self) -> bool { false }
+    async fn read(&mut self, field: PromptField) -> Result<Zeroizing<String>> {
+        self.0.read(field).await
+    }
+    async fn mfa_method(&mut self) -> Result<MfaMethod> {
+        panic!("non-terminal must not prompt for MFA")
+    }
+}
+#[tokio::test]
+async fn mfa_non_terminal_stops_before_code_prompt() {
+    let (c, s) = client("https://example.com", vec![password(mfa_challenge())]);
+    let mut p = NonTerminal(prompt(false));
+    assert!(matches!(c.login(LoginMode::Personal, &mut p).await, Err(Error::MfaTerminalRequired)));
+    assert!(s.0.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn channel_code_then_mfa() {
+    let (c, s) = client("https://example.com", vec![
+        Step { path:"/api/otp/request", body:Some(json!({"email":"test@example.com"})), status:200,
+            response:json!({"challenge_id":"channel","sent":true}) },
+        Step { path:"/api/otp/verify", body:Some(json!({"challenge_id":"channel","code":"123456"})),
+            status:200, response:mfa_challenge() },
+        mfa_step(PromptField::MfaCode, "654321", 200, pair("u1", false)),
+    ]);
+    let mut p = prompt(true);
+    p.0.push_back((PromptField::MfaCode, "654321"));
+    assert!(c.login(LoginMode::TeamOrEnterprise, &mut p).await.is_ok());
+    assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn mfa_invalid_format_is_bounded_without_requests() {
+    let (c, s) = client("https://example.com", vec![password(mfa_challenge())]);
+    let mut p = prompt(false);
+    p.0.extend([(PromptField::MfaCode, "１２３４５６"); 5]);
+    assert!(matches!(c.login(LoginMode::Personal, &mut p).await, Err(Error::MfaFailed)));
+    assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mfa_can_switch_to_recovery_after_wrong_code() {
+    let (c, s) = client("https://example.com", vec![
+        password(mfa_challenge()),
+        mfa_step(PromptField::MfaCode, "000000", 401, json!({})),
+        mfa_step(PromptField::RecoveryCode, "fixture-recovery", 200, pair("u1", false)),
+    ]);
+    let mut p = prompt(false);
+    p.0.extend([(PromptField::MfaCode, "000000"), (PromptField::RecoveryCode, "fixture-recovery")]);
+    assert!(c.login(LoginMode::Personal, &mut p).await.is_ok());
+    assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn no_mfa_does_not_require_terminal_for_second_step() {
+    let (c, s) = client("https://example.com", vec![password(pair("u1", false))]);
+    let mut p = NonTerminal(prompt(false));
+    assert!(c.login(LoginMode::Personal, &mut p).await.is_ok());
+    assert!(s.0.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn mfa_last_allowed_attempt_can_succeed() {
+    let mut steps = vec![password(mfa_challenge())];
+    let mut p = prompt(false);
+    for _ in 0..4 {
+        steps.push(mfa_step(PromptField::MfaCode, "000000", 401, json!({})));
+        p.0.push_back((PromptField::MfaCode, "000000"));
+    }
+    steps.push(mfa_step(PromptField::MfaCode, "123456", 200, pair("u1", false)));
+    p.0.push_back((PromptField::MfaCode, "123456"));
+    let (c, s) = client("https://example.com", steps);
+    assert!(c.login(LoginMode::Personal, &mut p).await.is_ok());
+    assert!(p.0.is_empty() && s.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn closed_authentication_socket_is_not_a_network_retry() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::{WebSocketStream, tungstenite::{Message, protocol::Role as WsRole}};
+    for graceful in [true, false] {
+        let session = serde_json::from_value::<TokenPair>(pair("u1", false)).unwrap().into_session().unwrap();
+        let (a, b) = tokio::io::duplex(8192);
+        let mut client = WebSocketStream::from_raw_socket(a, WsRole::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(b, WsRole::Server, None).await;
+        if graceful {
+            server.send(Message::Close(None)).await.unwrap();
+        }
+        drop(server);
+        assert!(matches!(crate::client::authenticate(&mut client, &session, 1).await, Err(Error::Disconnected)));
+    }
+}
+
+#[tokio::test]
+async fn rejected_connect_or_auth_close_requires_refresh_but_normal_close_does_not() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{WebSocketStream, tungstenite::{Message, protocol::{Role as WsRole, CloseFrame, frame::coding::CloseCode}}};
+    for code in [None, Some(1000), Some(1011), Some(4001), Some(1008)] {
+        for rejected in [false, true] {
+            let session = serde_json::from_value::<TokenPair>(pair("u1", false)).unwrap().into_session().unwrap();
+            let (a, b) = tokio::io::duplex(8192);
+            let mut client = WebSocketStream::from_raw_socket(a, WsRole::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(b, WsRole::Server, None).await;
+            let fake = async {
+                let _ = server.next().await.unwrap().unwrap();
+                let message = if rejected {
+                    Message::Text(json!({"type":"res","id":"connect","ok":false,"error":{"code":"unauthorized"}}).to_string().into())
+                } else {
+                    Message::Close(code.map(|code| CloseFrame { code: CloseCode::from(code), reason: "fixture".into() }))
+                };
+                server.send(message).await.unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(crate::client::authenticate(&mut client, &session, 1), fake)
+            }).await.unwrap();
+            let expected = if rejected || matches!(code, Some(4001)) {
+                Error::LoginRequired
+            } else { Error::Disconnected };
+            assert!(matches!(result, Err(error) if error == expected), "rejected={rejected}, close={code:?}");
+        }
     }
 }
