@@ -1614,7 +1614,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join("agents/bot")).unwrap();
         std::fs::write(home.path().join("agents/bot/agent.toml"), "").unwrap();
         let identity = duduclaw_core::ensure_identity_key(home.path()).unwrap();
-        let key = crate::mcp_internal_key::ensure_internal_mcp_key(home.path()).unwrap();
+        let key = crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(home.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let state = Arc::new(RouteState::new(home.path().into()));
         let _permits = state.blocking.clone().try_acquire_many_owned(MAX_BLOCKING_WORK as u32).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1643,7 +1643,7 @@ mod tests {
     fn signed_request(home: &Path, agent: &str, turn: &str, op: &str, id: &str) -> (HeaderMap, Bytes) {
         use crate::computer_use_sessions::auth::{AGENT_ID_HEADER, NONCE_HEADER};
         let identity = duduclaw_core::load_identity_key(home).unwrap();
-        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key(home).unwrap();
+        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(home, "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let token = duduclaw_core::mint_identity_token(&identity, agent);
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
@@ -1763,7 +1763,7 @@ mod tests {
         use crate::computer_use_sessions::auth::{AGENT_ID_HEADER, NONCE_HEADER};
         let home = policy_home("block");
         let identity = duduclaw_core::ensure_identity_key(home.path()).unwrap();
-        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key(home.path()).unwrap();
+        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(home.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let state = RouteState::new(home.path().into());
         let agent = format!("route-{}", uuid::Uuid::new_v4());
         let other = format!("route-{}", uuid::Uuid::new_v4());
@@ -1816,7 +1816,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='block'\n").unwrap();
         let identity = duduclaw_core::ensure_identity_key(home.path()).unwrap();
-        let key = crate::mcp_internal_key::ensure_internal_mcp_key(home.path()).unwrap();
+        let key = crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(home.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let agent = "egress-test-agent";
         let token = duduclaw_core::mint_identity_token(&identity, agent);
         let turn = uuid::Uuid::new_v4().to_string();
@@ -1912,7 +1912,7 @@ mod tests {
         use duduclaw_knowledge::requester::RequesterIdentity;
         let home = policy_home("shadow");
         let identity = duduclaw_core::ensure_identity_key(home.path()).unwrap();
-        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key(home.path()).unwrap();
+        let api_key = crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(home.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let state = RouteState::new(home.path().into());
         let agent = "recipient-route-bot";
         let token = duduclaw_core::mint_identity_token(&identity, agent);

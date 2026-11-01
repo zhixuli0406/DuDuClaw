@@ -100,14 +100,10 @@ pub fn mcp_cold_start_status_and_message(
     }
 }
 
-/// Run the same internal-key provisioning the gateway does at startup, then
-/// spawn one `mcp-server` child and classify its cold-start behavior.
-/// Idempotent and side-effect-light: provisioning reuses the existing
-/// `gateway-internal` key (or mints it on a fresh home, exactly like a first
-/// gateway boot would). Same age rules as boot — a key past
-/// `mcp_internal_key::ROTATE_AFTER_DAYS` is rotated here too, so running
-/// `duduclaw doctor` on an install whose key expired both reports and repairs
-/// it.
+/// Rotate/provision a key in an existing config, then probe an MCP child.
+/// Without the running gateway's validated listener and edition this probe
+/// refuses to create a missing config. It also refuses an unreadable MFA
+/// policy store; start the gateway to initialize a fresh installation.
 pub async fn mcp_cold_start_probe(home: &Path) -> McpColdStartReport {
     let bin = duduclaw_core::resolve_duduclaw_bin();
     if !bin.is_absolute() {

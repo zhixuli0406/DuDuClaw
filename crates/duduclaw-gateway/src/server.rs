@@ -214,6 +214,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
 
     let home_dir = config.home_dir.clone();
+    // Resolve once, before config provisioning; persist and bind this same
+    // validated address instead of interpolating environment strings into TOML.
+    if config.port == 0 {
+        return Err(duduclaw_core::error::DuDuClawError::Gateway(
+            "gateway port must be between 1 and 65535".into(),
+        ));
+    }
+    let listener_addr = tokio::net::lookup_host((config.bind.as_str(), config.port))
+        .await
+        .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?
+        .next()
+        .ok_or_else(|| duduclaw_core::error::DuDuClawError::Gateway("gateway bind resolved to no address".into()))?;
+
 
     // ── B5 (OS security line P0): boot event ──────────────────────────────
     // One `os_boot` row per gateway process start, chained (B1) into
@@ -378,46 +391,41 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let extension = config.extension.clone();
     let edition_override = config.edition;
+    let boot_edition = duduclaw_core::EditionProfile::resolve(
+        std::env::var("DUDUCLAW_EDITION").ok().as_deref(),
+        edition_override.map(|e| e.as_str()),
+        None,
+    );
+    info!("edition_profile={}", boot_edition.as_str());
+    // Do not let schema initialization hide an unreadable/missing policy
+    // table in an existing non-Personal identity store.
+    if home_dir.join("users.db").try_exists().map_err(|e|
+        duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?
     {
-        // Startup-time best-effort resolution for the boot log (license tier
-        // may not be loaded yet; the live value is resolved per-request in
-        // `MethodHandler::resolve_edition_profile`).
-        let boot_edition = duduclaw_core::EditionProfile::resolve(
-            std::env::var("DUDUCLAW_EDITION").ok().as_deref(),
-            edition_override.map(|e| e.as_str()),
-            None,
-        );
-        info!("edition_profile={}", boot_edition.as_str());
+        crate::mfa::boot_policy(&home_dir, boot_edition.is_personal())
+            .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
     }
-
-    // Provision the internal MCP API key as early as possible (before any
-    // child spawn) and record it via `set_internal_mcp_api_key`, from where
-    // `mcp_forward_env_vars()` folds it into every MCP env assembly point
-    // (per-runtime MCP config writers, `.mcp.json` template, tool-loop
-    // client). Without this, the M6 fail-closed `mcp-server` auth (v1.31)
-    // kills the tool surface of every runtime whose CLI spawns MCP children
-    // with a sanitized env (the Grok "查 odoo 不行" incident). An
-    // operator-provided env key always wins; provisioning failure is
-    // warn-not-fatal (status quo: no key).
-    if std::env::var(duduclaw_core::ENV_MCP_API_KEY)
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
-        match crate::mcp_internal_key::ensure_internal_mcp_key(&home_dir) {
-            Ok(key) => {
-                duduclaw_core::set_internal_mcp_api_key(key);
-                info!(
-                    "internal MCP API key active for this gateway (spawned MCP children authenticate)"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "internal MCP key provisioning failed — CLI-spawned duduclaw \
-                     mcp-server children will fail auth unless DUDUCLAW_MCP_API_KEY \
-                     is provided in the environment"
-                );
-            }
+    // Initialize the identity schema before reading its durable MFA boundary.
+    // This also makes a fresh non-Personal install distinguishable from an
+    // existing unreadable identity store; initialization failures abort boot.
+    let user_db_path = home_dir.join("users.db");
+    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!(
+            "Failed to initialize user database: {e}"
+        ))
+    })?);
+    let env_key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).ok();
+    match crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+        &home_dir, listener_addr, boot_edition.is_personal(), env_key.as_deref(),
+    ) {
+        Ok(key) => {
+            duduclaw_core::set_internal_mcp_api_key(key);
+            info!("internal MCP API key registered for this gateway");
+        }
+        Err(error) => {
+            // No fallback config write. MFA reload remains degraded if its
+            // durable boundary/config cannot be read.
+            tracing::warn!(%error, "internal MCP key provisioning failed");
         }
     }
 
@@ -835,12 +843,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     computer_use_sessions.spawn_background();
 
     // ── Initialize user database & JWT ───────────────────────
-    let user_db_path = home_dir.join("users.db");
-    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
-        duduclaw_core::error::DuDuClawError::Gateway(format!(
-            "Failed to initialize user database: {e}"
-        ))
-    })?);
     crate::mfa::reload_policy(&home_dir);
     // Establish the non-retroactive window before any channel accepts turns.
     handler.resolve_edition_profile().await;
@@ -3029,7 +3031,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::decision_gate::decision_surface_gate,
     ));
 
-    let addr = format!("{}:{}", config.bind, config.port);
+    let addr = listener_addr;
     info!("boot: all background subsystems wired — binding HTTP");
     info!("Gateway starting on {}", addr);
 
