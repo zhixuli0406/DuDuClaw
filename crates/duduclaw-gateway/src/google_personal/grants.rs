@@ -15,7 +15,7 @@ pub const UNCERTAIN: &str =
     "上次 Google 授權撤銷尚未確認完成；新的連結已暫停，請管理員確認 Google 授權狀態。";
 
 pub struct Lease {
-    _file: std::fs::File,
+    _file: duduclaw_core::owner_lock::OwnerLock,
     home: PathBuf,
 }
 
@@ -131,7 +131,7 @@ pub async fn acquire(home: &Path) -> Result<Lease, String> {
             Ok(()) => match std::fs::symlink_metadata(marker(home)) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(Lease {
-                        _file: file,
+                        _file: duduclaw_core::owner_lock::OwnerLock::new(file),
                         home: canonical,
                     });
                 }

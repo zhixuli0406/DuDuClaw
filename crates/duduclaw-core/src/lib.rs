@@ -30,6 +30,8 @@ pub mod dispatch_guard;
 pub mod docker_probe;
 pub mod error;
 pub mod fs_lock;
+#[doc(hidden)]
+pub mod owner_lock;
 pub mod grounding;
 pub mod identity_token;
 pub mod keychain;

@@ -346,7 +346,7 @@ pub async fn sweep(home: &Path) -> Result<(), String> {
     }
     // Keep the OS lock across awaits: a slow live worker cannot lose its
     // plan pointer to a second process after the durable lease expires.
-    let _lock = lock;
+    let _lock = duduclaw_core::owner_lock::OwnerLock::new(lock);
     let engine = engine(home)?;
     for id in due_jobs(home)? {
         // Rotate even approval polls to the back of the due queue. Otherwise

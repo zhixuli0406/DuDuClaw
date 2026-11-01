@@ -1049,11 +1049,11 @@ async fn refresh_lock(
     home: &Path,
     agent_id: &str,
     server: &str,
-) -> Result<std::fs::File, AuthError> {
+) -> Result<duduclaw_core::owner_lock::OwnerLock, AuthError> {
     use fs2::FileExt;
     let dir = store::lock_dir(home);
     let path = dir.join(format!("{agent_id}__{server}.lock"));
-    tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
+    tokio::task::spawn_blocking(move || -> Result<duduclaw_core::owner_lock::OwnerLock, String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create lock dir: {e}"))?;
         let f = std::fs::OpenOptions::new()
             .create(true)
@@ -1064,7 +1064,7 @@ async fn refresh_lock(
             .map_err(|e| format!("cannot open refresh lock: {e}"))?;
         f.lock_exclusive()
             .map_err(|e| format!("cannot take refresh lock: {e}"))?;
-        Ok(f)
+        Ok(duduclaw_core::owner_lock::OwnerLock::new(f))
     })
     .await
     .map_err(|e| AuthError::Transient(format!("lock task failed: {e}")))?
