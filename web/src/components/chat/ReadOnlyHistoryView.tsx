@@ -4,6 +4,7 @@ import { Button } from '@/components/mds';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { channelLabel } from '@/lib/session-channel';
+import { MarkdownContent } from './MarkdownContent';
 import { HistoryPart } from './HistoryPart';
 
 /** A separate view keeps external transcripts out of the chat/composer,
@@ -26,7 +27,11 @@ export function ReadOnlyHistoryView() {
         {data.ner === false && <p className="flex gap-2 rounded-xl border border-amber-500/25 bg-amber-500/5 p-4 text-sm"><ShieldCheck className="mt-0.5 size-4 shrink-0" />{msg('regexOnly')}</p>}
         <ol className="flex flex-col gap-4">{data.messages.map((message, index) => <li key={index} className="rounded-xl border border-border/60 p-4">
           <div className="mb-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"><span>{(message.role==='assistant' && staff?.display_name) || message.sender_label || intl.formatMessage({ id: message.role === 'assistant' ? 'boundHistory.staff' : 'boundHistory.customer' })}</span><time>{Number.isFinite(Date.parse(message.timestamp)) ? intl.formatDate(new Date(message.timestamp), { dateStyle: 'medium', timeStyle: 'short' }) : ''}</time></div>
-          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.parts?.map((part, n) => <HistoryPart key={n} part={part} showAttachmentNames={false} />)}</p>
+          {message.role === 'assistant' ? (
+            <div className="min-w-0 text-sm leading-relaxed">{message.parts?.map((part, n) => part.t === 'text'
+              ? <MarkdownContent key={n} text={part.v} />
+              : <HistoryPart key={n} part={part} showAttachmentNames={false} />)}</div>
+          ) : <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.parts?.map((part, n) => <HistoryPart key={n} part={part} showAttachmentNames={false} />)}</p>}
         </li>)}</ol>
       </>}
   </section>;
