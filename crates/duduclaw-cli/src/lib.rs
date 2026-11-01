@@ -8649,7 +8649,7 @@ mod onboard_initial_gateway_port_tests {
 
     #[test]
     fn uses_valid_environment_port() {
-        assert_eq!(onboard_initial_gateway_port(Some("18789")), 18789);
+        assert_eq!(onboard_initial_gateway_port(Some("28789")), 28789);
     }
 
     #[test]
