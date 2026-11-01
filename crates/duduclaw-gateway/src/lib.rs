@@ -133,6 +133,7 @@ pub mod mcp_internal_key;
 pub mod msteams;
 pub mod notion_workspace;
 pub mod person_credentials;
+pub mod website_credentials;
 pub mod rate_limit_watch;
 pub mod redaction_sources;
 pub(crate) mod synthetic_connector_adapter;

@@ -322,7 +322,7 @@ container.
 
 ### `computer_*` — sessions run by the gateway
 
-The eight tools drive one computer-use session per employee: an isolated
+The nine tools drive one computer-use session per employee: an isolated
 container with a virtual display and a kiosk browser. The MCP server only
 forwards each call to the gateway over loopback
 (`POST /api/internal/computer-use`, signed per request); the gateway owns the
@@ -335,13 +335,18 @@ container and runs every check, so the gateway must be running. Hidden unless
 | `computer_screenshot` | none | MCP image block (PNG, masked) followed by a text block with actions used and time left. A fully masked picture is reported as such in the text, with the reason (several windows, sensitive or unreadable front window, detection failure) and the next step |
 | `computer_click` | `x`, `y` integers (required); `button` string `left`/`right`; `double` boolean | `double` is left button only |
 | `computer_type` | `text` string (required), 1–2,000 characters | Audited as a character count only |
+| `computer_login` | `credential` (required label string) | Gateway fills and submits a saved login for an allowed employee; only status and a sentence are returned |
 | `computer_key` | `key` string (required): letters, digits, `+`, `-`, `_` | e.g. `Return`, `ctrl+s` |
 | `computer_scroll` | `x`, `y` integers (required); `direction` string `up`/`down` (default `down`); `amount` integer 1–20 (default 3) | |
 | `computer_navigate` | `url` string (required) | `https://` only, host exactly on the employee's `[capabilities.computer_use_config] allowed_domains` and resolved at session start, port absent or 443, no user name or password, at most 2,000 bytes. With no allowlist the session has no network and the call is refused |
 | `computer_session_stop` | `session_id` string, optional | Removes the container |
 
+`computer_login` is the ninth session tool. An Admin creates the labeled login in **System → Security → Website login credentials**, with an HTTPS `login_url` and a non-empty allowed-employee list; passwords go in that form, never chat. Optional `allowed_paths` defaults to none and only permits exact same-origin second-step paths with a visible password input after the helper submits step one. The gateway first navigates to the saved URL through the existing navigation checks; this navigation and the login each consume one session action. The helper checks the exact origin/path and effective POST, including the selected submitter's `formmethod` in native `requestSubmit` and fallback paths and rechecks after submit handlers. It intercepts every request and redirect hop to refuse other origins, rejects non-POST queries containing a complete credential value and bypasses service workers. The MCP request carries only the label. Session start and status responses expose the caller's available labels, never usernames. Use the existing takeover flow when the result is `needs_takeover`; no OTP tool is provided. `logged_in` only means the password field disappeared. Failed cleanup (`failed_uncleared`) stops and removes the session and container and returns an error requiring a new session; navigation cannot restore it. Before removing interception, the helper tracks `Network.requestWillBeSent`, `Network.loadingFinished` and `Network.loadingFailed` to confirm requests have ended. It waits for at most three seconds and requires two quiet command barriers with no pending requests. If completion cannot be confirmed, it returns `failed_uncleared` and calls `Browser.close` while the Fetch fence is still active; the gateway then removes the session and container. Screenshots are suppressed during the call.
+
+Login is restricted to the saved origin (scheme, host, port), and form submission must use the same origin. HTTPS is required, including for localhost. Same-origin page JavaScript can read filled fields. 2FA requires a person. Rebuild the computer-use image for the new helper before use.
+
 Integer and boolean parameters also accept numeric and `"true"`/`"false"`
-strings. Click, type, key, scroll and navigate each count as one action
+strings. Click, type, login, key, scroll and navigate each count as one action
 against `max_actions` (default 50). Limits, the approval and confirmation
 rules, the network allowlist and its residual risks are in
 [Browser automation](../features/08-browser-automation.md).

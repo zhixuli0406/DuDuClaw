@@ -123,6 +123,15 @@ pub(super) const TOOLS: &[ToolDef] = &[
         }],
     },
     ToolDef {
+        name: "computer_login",
+        description: "Log in with a dashboard-saved credential label on its allowed origin. Never ask for passwords in chat. For 2FA/captcha, ask a person to use takeover.",
+        params: &[ParamDef {
+            name: "credential",
+            description: "Saved credential label (available labels are included when the session starts)",
+            required: true,
+        }],
+    },
+    ToolDef {
         name: "computer_key",
         description: "Press a key or key combination in your computer-use session, e.g. 'Return', 'Tab', 'ctrl+s'. Letters, digits, '+', '-', '_' only.",
         params: &[ParamDef {

@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Fill and submit one origin-and-path-bound login without exposing values to stdout.
+
+The gateway invokes this helper once, with JSON {origin, login_path, allowed_paths, username, password}
+on stdin only. Each DOM mutation and its checks share one synchronous isolated
+world evaluation; navigation is followed by a fresh context and origin check.
+No page values, CDP errors, or exception messages are returned to the caller.
+This cannot stop same-origin page JavaScript from reading a filled field.
+"""
+
+import json
+import signal
+import sys
+import time
+from urllib.parse import parse_qsl, urlsplit
+
+sys.dont_write_bytecode = True
+
+from duduclaw_cdp import CdpError, WebSocket, evaluate_isolated, list_pages  # noqa: E402
+
+MAX_INPUT_BYTES = 1024 * 1024
+STEP_TIMEOUT = 2.0
+TOTAL_TIMEOUT = 22
+PASSWORD_WAIT = 5.0
+RESULT_WAIT = 8.0
+NETWORK_WAIT = 3.0
+STATUSES = frozenset({
+    "logged_in", "needs_takeover", "failed", "failed_uncleared",
+    "origin_mismatch", "form_origin_mismatch",
+})
+
+# Only DOM references persist between evaluations, never the supplied values.
+# Native DOM methods come from the isolated world's unmodified prototypes.
+DOM = r"""
+const inputs = () => Array.from(document.querySelectorAll('input'));
+const attr = (el, name) => Element.prototype.getAttribute.call(el, name);
+const visible = el => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' &&
+        s.display !== 'none' && s.opacity !== '0' && !el.disabled;
+};
+const password = () => inputs().find(el => el.type === 'password' && visible(el));
+const isUsername = el => el.type === 'email' ||
+    (['text', 'tel', ''].includes(el.type) &&
+     (attr(el, 'autocomplete') === 'username' ||
+      /user|email|login|identifier/i.test((attr(el, 'name') || '') + ' ' + (el.id || ''))));
+const username = form => inputs().find(el => isUsername(el) && visible(el) &&
+    !el.readOnly && (!form || el.form === form));
+const takeover = () => inputs().some(el =>
+    (attr(el, 'autocomplete') || '').split(/\s+/).includes('one-time-code') && visible(el)) ||
+    Array.from(document.querySelectorAll('iframe')).some(el =>
+        /captcha|recaptcha|hcaptcha|challenges.cloudflare/i.test(
+            (attr(el, 'src') || '') + ' ' + (attr(el, 'title') || '')));
+const nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+const set = (el, value) => {
+    nativeSet.call(el, value);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+};
+const remembered = globalThis.__duduclawLoginFields ||
+    (globalThis.__duduclawLoginFields = new Set());
+const remember = el => { if (el) remembered.add(el); };
+const clear = (rememberedOnly = false) => {
+    const fields = new Set([...remembered, ...(rememberedOnly ? [] : inputs().filter(el =>
+        el.type === 'password' || isUsername(el)))]);
+    let ok = true;
+    for (const el of fields) {
+        try { set(el, ''); } catch (_) { ok = false; }
+    }
+    // Event handlers can refill another field; check only after all events.
+    for (const el of fields) {
+        try { if (el.value !== '') ok = false; } catch (_) { ok = false; }
+    }
+    if (ok) remembered.clear();
+    return ok;
+};
+const submitter = form => Array.from(document.querySelectorAll('button, input')).find(el =>
+    el.form === form && el.type === 'submit' && visible(el));
+const effectiveMethod = form => {
+    const button = submitter(form);
+    return (button && attr(button, 'formmethod')) ?? attr(form, 'method') ?? 'get';
+};
+const post = form => !!form && effectiveMethod(form).toLowerCase() === 'post';
+const safeForm = form => {
+    if (!form || !form.isConnected || !post(form)) return false;
+    const button = submitter(form);
+    if (!button && typeof HTMLFormElement.prototype.requestSubmit !== 'function') return false;
+    const base = document.querySelector('base[target]');
+    const target = (button && attr(button, 'formtarget')) ??
+        (attr(form, 'target') || (base && attr(base, 'target')) || '');
+    if (target && target.toLowerCase() !== '_self') return false;
+    try {
+        const action = (button && attr(button, 'formaction')) ?? attr(form, 'action');
+        return new URL(action || location.href, document.baseURI).origin === origin;
+    } catch (_) { return false; }
+};
+const submit = form => {
+    if (!safeForm(form)) return false;
+    const button = submitter(form);
+    if (typeof HTMLFormElement.prototype.requestSubmit === 'function') {
+        // Pass the checked submitter so its overrides match the effective form.
+        if (button) HTMLFormElement.prototype.requestSubmit.call(form, button);
+        else HTMLFormElement.prototype.requestSubmit.call(form);
+        return true;
+    }
+    if (!button) return false;
+    HTMLElement.prototype.click.call(button);
+    return true;
+};
+"""
+
+
+def expression(operation, origin, login_path, username="", password="", allowed_paths=None):
+    # JSON escaping is necessary: these values are data, never JavaScript code.
+    prefix = "(() => {const origin = " + json.dumps(origin) + ";\n"
+    guard = "if (location.origin !== origin) return 'origin_mismatch';\n"
+    paths = [login_path]
+    if operation in ("password", "inspect_step"):
+        paths.extend(allowed_paths or [])
+    prefix += "const pathAllowed = () => " + json.dumps(paths) + ".includes(location.pathname);\n"
+    if operation in ("start", "password"):
+        guard += "if (!pathAllowed()) return 'failed';\n"
+    if operation == "inspect_step":
+        body = "if (!pathAllowed()) return 'failed'; return takeover() ? 'needs_takeover' : (password() ? 'password' : 'no_password');"
+    elif operation == "inspect":
+        body = "return takeover() ? 'needs_takeover' : (password() ? 'password' : 'no_password');"
+    elif operation in ("clear", "release"):
+        body = "return clear(" + ("true" if operation == "release" else "false") + ") ? 'cleared' : 'failed_uncleared';"
+    elif operation in ("start", "password"):
+        values = "const supplied = " + json.dumps({"username": username, "password": password}) + ";\n"
+        body = values + r"""
+if (takeover()) return clear() ? 'needs_takeover' : 'failed_uncleared';
+const pw = password();
+const user = username(pw && pw.form);
+const field = pw || user;
+if (!field || field.readOnly || !field.form) return clear() ? 'failed' : 'failed_uncleared';
+const form = field.form;
+// No field is touched before the destination has been checked.
+if (!post(form)) return 'failed';
+if (!safeForm(form)) return 'form_origin_mismatch';
+if (user) { remember(user); set(user, supplied.username); }
+// Username event handlers can mutate the form or remove the password field.
+if (location.origin !== origin || !pathAllowed() || !safeForm(form) ||
+    (pw && (!pw.isConnected || pw.form !== form || pw.type !== 'password'))) {
+    return clear() ? (post(form) ? 'form_origin_mismatch' : 'failed') : 'failed_uncleared';
+}
+if (pw) { remember(pw); set(pw, supplied.password); }
+// Recheck after synchronous page input/change handlers before submitting.
+if (location.origin !== origin || !pathAllowed() || !safeForm(form)) {
+    return clear() ? (post(form) ? 'form_origin_mismatch' : 'failed') : 'failed_uncleared';
+}
+if (!submit(form)) return clear() ? 'failed' : 'failed_uncleared';
+// requestSubmit dispatches synchronous submit handlers too. Fetch holds any
+// resulting request until the host checks its origin and credential query.
+if (!post(form)) return clear() ? 'failed' : 'failed_uncleared';
+return pw ? 'submitted_password' : 'submitted_username';
+"""
+        if operation == "password":
+            body = "if (!password()) return 'waiting';\n" + body
+    else:
+        raise ValueError("unsupported operation")
+    return prefix + guard + DOM + "\n" + body + "\n})()"
+
+
+def evaluate(ws, operation, credential):
+    result = evaluate_isolated(ws, expression(operation, **credential))
+    if "exceptionDetails" in result:
+        raise CdpError("login evaluation failed")
+    status = result.get("result", {}).get("value")
+    if not isinstance(status, str):
+        raise CdpError("invalid login result")
+    return status
+
+
+def cleanup(ws, credential, status):
+    try:
+        if evaluate(ws, "clear", credential) == "cleared":
+            return status
+    except Exception:
+        pass
+    return "failed_uncleared"
+
+
+def _fill_login(ws, credential):
+    """One helper call owns the entire fill/wait/clear sequence."""
+    touched = False
+    try:
+        # Mark uncertain before the call: it may fill and then lose its context.
+        touched = True
+        status = evaluate(ws, "start", credential)
+        if status in ("origin_mismatch", "form_origin_mismatch"):
+            return status
+        if status in STATUSES:
+            return status
+        if status == "submitted_username":
+            deadline = time.monotonic() + PASSWORD_WAIT
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
+                try:
+                    state = evaluate(ws, "inspect_step", credential)
+                except (CdpError, OSError):
+                    # The old context can disappear while the next document loads.
+                    continue
+                if state == "needs_takeover":
+                    return cleanup(ws, credential, state)
+                if state == "origin_mismatch":
+                    return "failed_uncleared"
+                if state == "failed":
+                    return cleanup(ws, credential, "failed")
+                if state == "password":
+                    status = evaluate(ws, "password", credential)
+                    if status == "waiting":
+                        continue
+                    break
+            else:
+                return cleanup(ws, credential, "failed")
+        if status != "submitted_password":
+            return cleanup(ws, credential, status if status in STATUSES else "failed")
+        deadline = time.monotonic() + RESULT_WAIT
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            try:
+                state = evaluate(ws, "inspect", credential)
+            except (CdpError, OSError):
+                continue
+            if state == "needs_takeover":
+                return cleanup(ws, credential, state)
+            if state == "origin_mismatch":
+                return "failed_uncleared"
+            if state == "no_password":
+                # Release old/hidden fields too: a SPA can remove the form
+                # without destroying the isolated execution context.
+                return "logged_in" if evaluate(ws, "release", credential) == "cleared" else "failed_uncleared"
+        return cleanup(ws, credential, "failed")
+    except Exception:
+        # Never include exception text: CDP errors may contain page content.
+        return cleanup(ws, credential, "failed") if touched else "failed"
+
+
+class OriginGuard:
+    """Event-aware CDP pump: Fetch pauses each hop, including 307/308 redirects.
+
+    Never use WebSocket.call here: it discards the requestPaused events.
+    Commands sent while handling events have their replies consumed by this pump.
+    """
+    def __init__(self, ws, credential):
+        self.ws = ws
+        self.origin = credential["origin"]
+        self.values = (credential["username"], credential["password"])
+        self.blocked = False
+        self.inflight = set()
+        self.activity = 0
+        self.untracked = False
+
+    def permitted(self, url):
+        try:
+            parts = urlsplit(url)
+            expected = urlsplit(self.origin)
+            return (parts.scheme == expected.scheme == "https" and
+                    parts.hostname == expected.hostname and
+                    (parts.port if parts.port is not None else 443) ==
+                    (expected.port if expected.port is not None else 443) and
+                    parts.username is None and parts.password is None and
+                    not any(c.isspace() or ord(c) < 32 for c in url))
+        except (ValueError, TypeError):
+            return False
+
+    def call(self, method, params=None):
+        command = self.ws.send_command(method, params)
+        pending = {command}
+        answer = None
+        while pending:
+            message = self.ws.recv_json()
+            event_method = message.get("method")
+            if event_method == "Network.requestWillBeSent":
+                self.inflight.add(message["params"]["requestId"])
+                self.activity += 1
+            elif event_method in ("Network.loadingFinished", "Network.loadingFailed"):
+                self.inflight.discard(message["params"]["requestId"])
+                self.activity += 1
+            elif event_method == "Fetch.requestPaused":
+                event = message.get("params", {})
+                request_id = event.get("requestId")
+                if not isinstance(request_id, str) or not request_id:
+                    raise CdpError("invalid intercepted request")
+                request = event.get("request", {})
+                url = request.get("url")
+                allowed = self.permitted(url)
+                # A submit handler may change POST to GET during requestSubmit.
+                # Do not forward a credential-bearing query, even same-origin.
+                if allowed and request.get("method") != "POST":
+                    allowed = not any(value in self.values for _, value in
+                                      parse_qsl(urlsplit(url).query, keep_blank_values=True))
+                network_id = event.get("networkId")
+                if isinstance(network_id, str) and network_id:
+                    self.inflight.add(network_id)
+                else:
+                    self.untracked = True
+                self.activity += 1
+                if not allowed:
+                    self.blocked = True
+                action = "Fetch.continueRequest" if allowed else "Fetch.failRequest"
+                args = {"requestId": request_id}
+                if not allowed:
+                    args["errorReason"] = "BlockedByClient"
+                pending.add(self.ws.send_command(action, args))
+            elif message.get("id") in pending:
+                pending.remove(message["id"])
+                if "error" in message:
+                    raise CdpError("login interception failed")
+                if message["id"] == command:
+                    answer = message.get("result", {})
+        return answer
+
+    def drain(self):
+        """Wait for actual completion, not DOM disappearance or stopLoading.
+
+        A quiet pair of command barriers also consumes queued request events.
+        Long-lived or unobservable requests fail closed at the bounded deadline.
+        """
+        deadline = time.monotonic() + NETWORK_WAIT
+        stable = 0
+        while time.monotonic() < deadline:
+            activity = self.activity
+            time.sleep(0.1)
+            self.call("Page.getFrameTree")
+            stable = stable + 1 if not self.inflight and self.activity == activity else 0
+            if stable >= 2 and not self.untracked:
+                return True
+        return False
+
+
+def fill_login(ws, credential):
+    guard = OriginGuard(ws, credential)
+    status = "failed"
+    enabled = False
+    try:
+        guard.call("Network.enable")
+        guard.call("Network.setBypassServiceWorker", {"bypass": True})
+        guard.call("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+        enabled = True
+        status = _fill_login(guard, credential)
+        if status != "failed_uncleared":
+            if not guard.drain():
+                status = "failed_uncleared"
+            elif guard.blocked:
+                status = cleanup(guard, credential, "failed")
+                # Cleanup dispatches events; those requests must finish too.
+                if not guard.drain():
+                    status = "failed_uncleared"
+    except Exception:
+        # A protocol failure after enabling interception makes request state
+        # uncertain, regardless of whether the DOM can still be cleared.
+        status = "failed_uncleared" if enabled else "failed"
+    finally:
+        try:
+            if enabled and status == "failed_uncleared":
+                # Do not release paused/in-flight POSTs by disabling Fetch.
+                # Close Chromium while the fence is active; the gateway then
+                # removes this session/container and discards its snapshot.
+                guard.call("Browser.close")
+            else:
+                if enabled:
+                    guard.call("Fetch.disable")
+                guard.call("Network.setBypassServiceWorker", {"bypass": False})
+        except Exception:
+            if enabled:
+                status = "failed_uncleared"
+                try:
+                    guard.call("Browser.close")
+                except Exception:
+                    pass
+    if guard.blocked and status != "failed_uncleared":
+        return "failed"
+    return status
+
+
+def read_credential(stream):
+    raw = stream.read(MAX_INPUT_BYTES + 1)
+    if len(raw) > MAX_INPUT_BYTES:
+        raise ValueError("input too large")
+    credential = json.loads(raw)
+    required = {"origin", "login_path", "username", "password"}
+    if not isinstance(credential, dict) or not required <= set(credential) or set(credential) - required - {"allowed_paths"}:
+        raise ValueError("invalid input")
+    if any(not isinstance(value, str) or not value or len(value) > 16384
+           for key, value in credential.items() if key != "allowed_paths"):
+        raise ValueError("invalid input")
+    origin = credential["origin"]
+    parts = urlsplit(origin)
+    if parts.scheme != "https" \
+            or not parts.hostname or parts.username is not None or parts.password is not None \
+            or parts.path or parts.query or parts.fragment \
+            or any(c.isspace() or ord(c) < 32 for c in origin):
+        raise ValueError("invalid origin")
+    # Accessing .port also rejects malformed/out-of-range ports.
+    _ = parts.port
+    def valid_path(value):
+        if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
+            return False
+        parsed = urlsplit(value)
+        return (len(value) <= 4096 and not parsed.query and not parsed.fragment and
+                not any(c.isspace() or ord(c) < 32 for c in value) and
+                "?" not in value and "#" not in value and "\\" not in value)
+    paths = credential.get("allowed_paths", [])
+    if not isinstance(paths, list) or len(paths) > 100 or not all(valid_path(p) for p in paths) \
+            or not valid_path(credential["login_path"]):
+        raise ValueError("invalid login path")
+    return credential
+
+
+def visible_page():
+    visible = []
+    for path in list_pages(STEP_TIMEOUT):
+        ws = WebSocket(path, STEP_TIMEOUT)
+        try:
+            result = evaluate_isolated(ws, "document.visibilityState")
+            if result.get("result", {}).get("value") == "visible":
+                visible.append(path)
+        finally:
+            ws.close()
+    if len(visible) != 1:
+        raise CdpError("expected one visible page")
+    return visible[0]
+
+
+def on_alarm(_signum, _frame):
+    # Raising lets fill_login attempt cleanup; the socket still has its timeout.
+    raise TimeoutError("login timeout")
+
+
+def main():
+    status = "failed"
+    ws = None
+    try:
+        if len(sys.argv) != 1:
+            raise ValueError("stdin only")
+        signal.signal(signal.SIGALRM, on_alarm)
+        signal.alarm(TOTAL_TIMEOUT)
+        credential = read_credential(sys.stdin.buffer)
+        ws = WebSocket(visible_page(), STEP_TIMEOUT)
+        status = fill_login(ws, credential)
+    except Exception:
+        status = "failed_uncleared" if ws is not None else "failed"
+    finally:
+        signal.alarm(0)
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+    sys.stdout.write((status if status in STATUSES else "failed_uncleared") + "\n")
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

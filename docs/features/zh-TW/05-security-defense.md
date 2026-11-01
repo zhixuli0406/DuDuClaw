@@ -187,7 +187,7 @@ action_rules = [
 ]
 ```
 
-`tool` 規則（與其他 `[capabilities]` 工具清單同一套有錨定的比對，`mcp__duduclaw__mail_send`、`wiki_*` 都可用）優先於 `effect` 規則；同一種規則之間取最嚴格的判定。`block` 在 MCP dispatch 閘與 `denied_tools` 同一處拒絕（JSON-RPC `-32003`，稽核 `error_class` `action_rule`），並從 `tools/list` 隱藏；`ask` 併入核准閘的靜態「一律詢問」集合，所以跟 `approval_required_tools` 一樣走 ApprovalBroker。`allow` 只代表「這一層不加阻力」，不會解除 `denied_tools`、核准清單、能力開關或 scope。八個 `computer_*` 工具與三個 `computer_workspace_*` 工具在 gateway 的電腦操作路由用同一套判定，因為工作階段由 gateway 持有。這個鍵刻意放在 `[capabilities]`：`org_field_guard` 會凍結整張表，員工無法自己改。清單或某一筆格式錯誤（不認得的判定或類型、`effect` 與 `tool` 同時有或都沒有、多出的鍵、不是陣列）不會讓整個檔案失效：原樣保留，並讓每個有副作用的呼叫至少要「先問人」，其中有效的 `block` 仍然擋下。`agent.toml` 存在但讀不到或不是合法 TOML 時也一樣處理。儀表板在員工編輯頁編輯這份清單（依動作類型的規則，加上個別工具的例外），走只限管理員的 `agents.update` capabilities 路徑，每一筆都會檢查，變更記為 `agent_authority_changed`。
+`tool` 規則（與其他 `[capabilities]` 工具清單同一套有錨定的比對，`mcp__duduclaw__mail_send`、`wiki_*` 都可用）優先於 `effect` 規則；同一種規則之間取最嚴格的判定。`block` 在 MCP dispatch 閘與 `denied_tools` 同一處拒絕（JSON-RPC `-32003`，稽核 `error_class` `action_rule`），並從 `tools/list` 隱藏；`ask` 併入核准閘的靜態「一律詢問」集合，所以跟 `approval_required_tools` 一樣走 ApprovalBroker。`allow` 只代表「這一層不加阻力」，不會解除 `denied_tools`、核准清單、能力開關或 scope。九個 `computer_*` 工具與三個 `computer_workspace_*` 工具在 gateway 的電腦操作路由用同一套判定，因為工作階段由 gateway 持有。這個鍵刻意放在 `[capabilities]`：`org_field_guard` 會凍結整張表，員工無法自己改。清單或某一筆格式錯誤（不認得的判定或類型、`effect` 與 `tool` 同時有或都沒有、多出的鍵、不是陣列）不會讓整個檔案失效：原樣保留，並讓每個有副作用的呼叫至少要「先問人」，其中有效的 `block` 仍然擋下。`agent.toml` 存在但讀不到或不是合法 TOML 時也一樣處理。儀表板在員工編輯頁編輯這份清單（依動作類型的規則，加上個別工具的例外），走只限管理員的 `agents.update` capabilities 路徑，每一筆都會檢查，變更記為 `agent_authority_changed`。
 
 **Claude Code 內建工具（2026-10-08 收尾）。** `action_rules` 也會在啟動時套到 Claude CLI 自己的工具。內建工具依名稱精確分類（`duduclaw_core::effect_of_cli_builtin`）：`Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` 是 `read`；`TodoWrite` 是 `draft`；`Write`、`Edit`、`MultiEdit`、`NotebookEdit` 是 `modify`；`Bash`、`Task`、`Agent` 與其他任何名稱都是 `admin`。內建工具的呼叫不會經過 ApprovalBroker，所以對內建工具說 `ask` 的規則無法照辦，一律當成 `block`（fail closed）：該工具透過 `CapabilitiesConfig::disallowed_tools()` 加入 `--disallowedTools` 並從 `--tools` 移除，凡是已經套用 `denied_tools` 的 Claude CLI 啟動都會讀到（`claude_runner` 的派工、cron、goal 與心跳喚醒、`channel_reply/cli_env.rs` 的通道回覆、心跳主動檢查、eval 與團隊角色成員）。因此格式錯誤的規則清單會讓所有有副作用的內建工具（`Write`、`Edit`、`Bash`…）都拿不到，唯讀工具保留。行為變更：原本為 MCP 工具寫 `{ effect = "modify", verdict = "ask" }` 的操作者，現在 Claude CLI 的 `Write`／`Edit` 也會被拿掉。
 
@@ -367,7 +367,6 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0600）。使用同一 home 的第二個 gateway 會拒絕讀取與新外送並重試，取得鎖後先恢復所有 lease 才接受讀取；`shadow` 仍允許並稽核。Gateway 執行中不可刪除鎖檔。重複的有效 lease ID 會在寫入前拒絕，不會連帶阻擋其他員工。
 
-
 ## CLI 外送檢查
 
 Claude/Grok 網頁工具與 Bash 字面網路指令新增由 gateway 判定的審批 hook；Codex 強制模式在啟動時限制網路與搜尋。背景執行登錄 host 回合。安全頁列出有 Bash、使用 ask/block 且未啟用任務沙箱的員工。Bash 只提供減速帶與遙測：原生讀檔不標記污染、同 OS 使用者的改寫不受此機制隔離，事前檢查也不持有執行全程的 MCP lease。強制模式拒絕 Claude bare mode 與 Grok 共用工作目錄。通用 CLI 原生工具仍未涵蓋。模式表、單次核准重試與限制見[資料外送防護](69-egress-guard.md)。
@@ -391,7 +390,6 @@ Claude/Grok 網頁工具與 Bash 字面網路指令新增由 gateway 判定的�
 核准會綁定排序後的孤兒實體向量識別值，不只綁定數量；即使數量相同，替換成其他實體也必須重新核准。未完成工作會持久保存嘗試次數與下次執行時間，以 60／120／240／480 秒退避，並公平選取已到期工作。連續五次失敗或執行中斷後會隔離；管理員可在「資料刪除收據」查看不含記憶內容的失敗原因並按「重試」。重試沿用既有核准並重查範圍，擴大時仍須重新核准。
 
 每筆斷線紀錄都有獨立版本，建立時尚未驗證；連線狀態核對只驗證當時讀到的同一版本，延遲到達的舊斷線通知不能沿用先前的核對結果。
-
 
 ## 對話憑證稽核
 
@@ -430,3 +428,11 @@ Enterprise 使用者在「設定 → 帳號」選擇「設定雙因素登入」�
 Admin 在「使用者 → 雙因素登入管理」查看註冊狀態與通道驗證時間，使用自己的新因素重設其他帳號，或依對方這次的註冊識別碼核發一次性代碼。不能自我重設或自我核發。強制開關顯示未設定帳號數、登入受阻警告，並要求輸入畫面上的確認文字。設定重載降級時會警告並停用開關。**強制登入仍須經審查後才能啟用**；請先保持關閉，完成獨立安全審查、真實 gateway／通道流程與救援驗證。Personal 只有已註冊帳號才顯示相關設定，本機自動登入維持原狀。
 
 呼叫端連線會在註冊／停用的成功回應取得新權杖，並在一般送出檢查前完成身分交接；HTTP 註冊也在註冊交易提交前簽發權杖。啟用強制前仍須完成真實瀏覽器／WebSocket 驗證，包括跨過心跳後復原碼仍可見，以及另一工作階段失效；行程內 handler 與前端單元測試不能代表這些驗收通過。
+
+## 網站登入憑證
+
+管理員在 **系統 → 安全** 透過 `website_credentials.list`、`.upsert`、`.delete` 管理網站登入憑證。Upsert 改收會正規化的 HTTPS `login_url`，來源與登入路徑從網址衍生；選填的 `allowed_paths` 是相同來源第二步可用的確切路徑，預設為空。清單不回傳密碼。紀錄以 `CryptoEngine` 和 gateway 的 `.keyfile` 加密，保存在 `<home>/secrets/website_credentials.enc`；寫入使用檔案鎖、原子替換與 0600 權限。列清單、登入查詢與每次異動都要求所有既有紀錄可解密且通過驗證；任一失敗就回傳無法使用，憑證檔案維持原狀，舊有僅綁來源的紀錄也適用。管理操作的稽核不含憑證值；外層 ACL 拒絕會寫入不含參數的稽核，刪除結果區分 `deleted`、`noop` 與 `refused`。每次使用記錄憑證 id、員工、來源與結果。
+
+`computer_login` 只接受標籤。Gateway 用已驗證的員工身分比對非空的 `allowed_agents` 清單，再執行該工具獨立的工具與 session 閘門。Gateway 先透過既有導覽檢查開啟保存的登入網址。秘密只透過 stdin 送入容器 helper，不放在命令列參數或模型結果。Helper 填寫前須符合確切來源與登入路徑；只有送出第一步後到達、且有可見密碼欄位的第二步才能使用 `allowed_paths`。填寫前、同步 input/change 事件後及 submit 事件後都要求有效提交方式為 POST；原生 `requestSubmit` 與備援路徑都會檢查實際選用送出按鈕的 `formmethod`。網路層也會拒絕查詢參數解碼後的值等於完整帳號或密碼的非 POST 請求。CDP Fetch 會中止每個來源不符的請求與轉址，登入期間也會略過 service worker。解除攔截前，helper 會追蹤 `Network.requestWillBeSent`、`Network.loadingFinished` 與 `Network.loadingFailed`，確認請求已結束。最多等待 3 秒，且須連續兩次命令往返都沒有新請求活動或待完成請求。若無法確認完成，回傳 `failed_uncleared`，在 Fetch 攔截仍啟用時呼叫 `Browser.close`，再由 Gateway 移除 session 與容器。執行期間暫停截圖；若無法確認欄位已清除，Gateway 會停止並移除 session 與容器，要求重新啟動 session。
+
+這項保護無法阻止同來源 JavaScript 讀取已填入的欄位，也不提供對同一 OS 使用者程序的檔案隔離，更不取代網路白名單。登入僅限保存的 HTTPS 來源與允許的登入路徑，localhost 也必須使用 HTTPS。雙因素驗證與驗證碼須由人員透過既有接手流程處理。須重建電腦操作映像以安裝 `duduclaw-fill-login`。結果定義與設定方式見[瀏覽器自動化](08-browser-automation.md)。

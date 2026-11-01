@@ -114,6 +114,7 @@ mod audit_rpc;
 mod security_rpc;
 mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
+mod website_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
 mod playbook_rpc;
@@ -531,6 +532,16 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return self.dispatch_org(method, params, ctx, conn).await;
+        }
+
+        // Website passwords belong only to the gateway. Route before plugin
+        // dispatch so no extension receives a clone of credential values.
+        if method.split('.').next() == Some("website_credentials") {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                website_credentials_rpc::audit(&self.home_dir, method, &ctx.user_id, None, "refused");
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
         }
 
         // ── Plugin extension dispatch ──────

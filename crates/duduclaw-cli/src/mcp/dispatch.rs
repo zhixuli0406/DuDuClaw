@@ -87,7 +87,7 @@ pub(crate) async fn handle_tools_call(
             // block never reaches `extract_tool_result_text`).
             | "computer_screenshot"
             | "computer_click"
-            | "computer_type"
+            | "computer_type" | "computer_login"
             | "computer_key"
             | "computer_scroll"
             | "computer_session_start"

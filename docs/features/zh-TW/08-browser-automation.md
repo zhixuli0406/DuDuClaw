@@ -1,6 +1,6 @@
 # 瀏覽器自動化與 Computer Use
 
-> 從一次純 HTTP 抓取到完整虛擬桌面：兩個內建抓取工具、一個可選的外部瀏覽器 server，以及在隔離容器裡執行的電腦操作 session，由 AI 員工透過八個 `computer_*` MCP 工具驅動。沒有自動路由器。
+> 從一次純 HTTP 抓取到完整虛擬桌面：兩個內建抓取工具、一個可選的外部瀏覽器 server，以及在隔離容器裡執行的電腦操作 session，由 AI 員工透過九個 `computer_*` MCP 工具驅動。沒有自動路由器。
 
 ---
 
@@ -58,7 +58,7 @@ Browserbase 方面，`browserbase_mcp_config` 與 marketplace 的 `browserbase` 
 
 ### L5 — Computer Use
 
-電腦操作只有一條路徑：AI 員工呼叫八個 `computer_*` MCP 工具，每一步都由自己決定。員工必須設 `[capabilities] computer_use = true`。只要某個 runtime 的 CLI 拿得到 DuDuClaw MCP 工具，就能使用（見 [多 Runtime](13-multi-runtime.md)）。不涉及 Anthropic API 金鑰。
+電腦操作只有一條路徑：AI 員工呼叫九個 `computer_*` MCP 工具，每一步都由自己決定。員工必須設 `[capabilities] computer_use = true`。只要某個 runtime 的 CLI 拿得到 DuDuClaw MCP 工具，就能使用（見 [多 Runtime](13-multi-runtime.md)）。不涉及 Anthropic API 金鑰。
 
 | 工具 | 參數 | 作用 |
 |---|---|---|
@@ -66,6 +66,7 @@ Browserbase 方面，`browserbase_mcp_config` 與 marketplace 的 `browserbase` 
 | `computer_screenshot` | 無 | 回傳遮罩後的畫面，為 MCP 圖片區塊（PNG），另附一行文字說明已用動作數與剩餘時間。整張截圖被遮掉時，這段文字會如實說明，並寫出原因與下一步動作工具不會回傳截圖，所以 agent 要自己呼叫這個工具來確認結果 |
 | `computer_click` | `x`、`y`（整數，截圖像素，從 0 起算）、`button`（`left` 預設或 `right`）、`double`（布林，只限左鍵） | 點一下 |
 | `computer_type` | `text`（字串，1–2,000 字元） | 在焦點元素輸入文字 |
+| `computer_login` | `credential`（必填，憑證標籤字串） | Gateway 代允許的員工填入並送出登入，只回傳狀態與一句說明 |
 | `computer_key` | `key`（字串，由字母、數字、`+`、`-`、`_` 組成，最長 64 字元，例如 `Return`、`ctrl+s`） | 按下按鍵或組合鍵；無效的按鍵會被拒絕，不會被替換成別的 |
 | `computer_scroll` | `x`、`y`（整數）、`direction`（`up` 或 `down`，預設 `down`）、`amount`（整數 1–20，預設 3） | 把指標放在該像素上捲動 |
 | `computer_navigate` | `url`（字串） | 在容器的瀏覽器開啟頁面。瀏覽器以 kiosk 模式執行、沒有網址列，所以這是唯一開啟頁面的方式 |
@@ -77,7 +78,7 @@ Session 規則：
 
 - **每位員工一個 session。** 已有 session 在執行時再呼叫 `computer_session_start` 會被拒絕，並指出現有的 session。只有該員工能看到或驅動它。
 - **整個 gateway 同時最多五個 session。**
-- **上限。** Session 在 `max_session_minutes`（預設 10）之後、連續 2 分鐘沒有任何操作之後（等待審批、儀表板有人觀看或有人接手的時間不算閒置；設了 `keep_alive_minutes` 時改為暫停容器，見[閒置保留、即時畫面與接手](#閒置保留即時畫面與接手)），或呼叫 `computer_session_stop` 時結束。每次點擊、輸入、按鍵、捲動與導覽都計入 `max_actions`（預設 50），截圖不計。額度用完後，session 仍可截圖與停止。
+- **上限。** Session 在 `max_session_minutes`（預設 10）之後、連續 2 分鐘沒有任何操作之後（等待審批、儀表板有人觀看或有人接手的時間不算閒置；設了 `keep_alive_minutes` 時改為暫停容器，見[閒置保留、即時畫面與接手](#閒置保留即時畫面與接手)），或呼叫 `computer_session_stop` 時結束。每次點擊、輸入、登入、按鍵、捲動與導覽都計入 `max_actions`（預設 50），截圖不計。額度用完後，session 仍可截圖與停止。
 - **被拒絕的呼叫端與模式。** 臨時（ephemeral）agent 不能啟動 session，包含 Team-as-Agent 的角色成員（它們會複製父員工的 capabilities）。`[capabilities] computer_use_mode` 為 `"native"` 的員工會被拒絕，錯誤碼為 `native_unsupported`，訊息說明這個模式已移除，並請刪掉該鍵或設為 `"container"`；不會悄悄退回容器。`"auto"` 或沒有這個鍵時，行為等同 `"container"`。
 - **威脅等級。** 只有在 `~/.duduclaw/threat_level` 為 GREEN（或不存在）時才能啟動新 session。YELLOW 只允許截圖與停止；RED 會結束所有 session。內容恰好是緊急停止詞（`停止`、`stop`、`abort`、`やめて` 等）的聊天訊息，會結束所有電腦操作 session。
 - **清理。** 清掃程式每 15 秒檢查一次是否有 session 超過期限或閒置上限。容器帶有一個標示所屬 DuDuClaw home 的標籤與一個期限標籤；gateway 啟動時與之後每 10 分鐘，會掃除本 home 已結束、或超過期限 10 分鐘以上的容器，Docker 無法列出時則什麼都不移除。
@@ -86,7 +87,7 @@ Session 規則：
 gateway 自己套用的閘，因為這條路由不經過 MCP 分派器也能到達：
 
 - `[capabilities] denied_tools`／`allowed_tools` 與 `scoped_tools`（列在其中的工具需要有效的任務範圍授權）會在每個操作上以該工具自己的名稱檢查。
-- 列在 `approval_required_tools`、`irreversible_tools` 或 `maybe_irreversible_tools` 的工具，會透過 ApprovalBroker 等待人工決定（最長 300 秒，沒有回應視同拒絕）。屬於 maybe-irreversible 的 `computer_*` 工具一律會詢問，這裡沒有模型判官。審批文字會寫出工具名稱；`computer_type` 只給字元數，`computer_navigate` 只給驗證過的主機名稱（不含路徑與查詢字串）。`computer_navigate` 的 URL 會在詢問之前先驗證，所以會被拒絕的 URL 不會產生審批請求。MCP 端的審批閘會略過這八個工具，避免重複詢問。
+- 列在 `approval_required_tools`、`irreversible_tools` 或 `maybe_irreversible_tools` 的工具，會透過 ApprovalBroker 等待人工決定（最長 300 秒，沒有回應視同拒絕）。屬於 maybe-irreversible 的 `computer_*` 工具一律會詢問，這裡沒有模型判官。審批文字會寫出工具名稱；`computer_type` 只給字元數，`computer_navigate` 只給驗證過的主機名稱（不含路徑與查詢字串）。`computer_navigate` 的 URL 會在詢問之前先驗證，所以會被拒絕的 URL 不會產生審批請求。MCP 端的審批閘會略過這九個工具，避免重複詢問。
 - 每個動作都依固定規則（`risk_detector.rs`）評估風險。當焦點視窗的標題符合 `blocked_actions`（預設 `delete_file`、`terminal`、`system_preferences`）、符合 `CONTRACT.toml` 的 `[must_not] rules` 項目，或焦點視窗標題讀不到時，動作會被拒絕。高風險動作（輸入對準敏感欄位、輸入看起來像憑證的文字，或視窗在非空的 `allowed_apps` 之外）需要有人在 60 秒內於該對話的通道確認，前提是這次工具呼叫來自正在回覆某個通道對話的回合；gateway 是從自己記錄的該員工進行中回合找出通道，不會採用請求裡帶的值。沒有通道可問時（排程執行、被委派的任務），高風險動作會被拒絕。`auto_confirm_trusted = true` 會略過確認。
 
 #### 聊天觸發的迴圈後來怎麼了
@@ -165,13 +166,27 @@ allowed_domains = ["example.com", "docs.example.com"]
 
 ---
 
+## 不把密碼交給模型的網站登入
+
+管理員在 **系統 → 安全 → 網站登入憑證** 保存標籤、HTTPS 登入網址（`login_url`）、使用者名稱、密碼，以及至少一位允許使用的 AI 員工。Gateway 會正規化網址，再保存衍生的來源與確切路徑；網址不得包含帳密、查詢參數或片段。選填的 `allowed_paths` 是第二步可用的相同來源確切路徑，預設為空清單。密碼只在這個表單輸入，不要貼到聊天；保存後不會讀回表單，編輯時須重新輸入。使用前須重建電腦操作容器映像，加入更新的 `duduclaw-fill-login` helper。
+
+員工只傳 `{"credential":"工作帳號"}` 呼叫 `computer_login`。Gateway 用經驗證的員工身分檢查 `allowed_agents`，並以獨立的 `computer_login` 工具名稱執行 session、工具、scope 與核准檢查。Session 啟動與狀態回應只列出該員工可用的標籤，不含使用者名稱。Gateway 先透過既有導覽檢查開啟保存的 `login_url`（導覽與登入各消耗一次 session 動作額度），再透過 stdin 把衍生的 `origin`、`login_path`、選填的 `allowed_paths` 與帳密送入單一容器 helper；填表與送出在同一次 helper 呼叫內完成，模型無法在兩者之間插入動作。第一次填寫須同時符合確切來源與登入路徑。第二次填寫須為 helper 送出第一步後到達的相同來源頁面、有可見的密碼欄位，且路徑等於 `login_path` 或 `allowed_paths` 其中之一。額外允許的路徑不能用來接受第一次填寫。
+
+Helper 在填寫前及同步 input/change 事件後，都確認表單以 POST 送往憑證的確切來源；原生 `requestSubmit` 與備援路徑都會檢查實際選用送出按鈕的 `formmethod`，同步 submit 事件處理完也會重查提交方式。網路層會拒絕查詢參數解碼後的值等於完整帳號或密碼的非 POST 請求，涵蓋 submit 事件把 POST 改成 GET 的情況。GET 或預設 GET 的表單不會填入。執行期間透過 CDP Fetch 攔截每個請求與每一跳轉址；來源不同就中止請求並回傳 `failed`，同時略過 service worker。即使其他來源在員工的網路白名單內，也不能透過 307/308 轉址帶走 POST 本文。
+
+解除攔截前，helper 會追蹤 `Network.requestWillBeSent`、`Network.loadingFinished` 與 `Network.loadingFailed`，確認請求已結束。最多等待 3 秒，且須連續兩次命令往返都沒有新請求活動或待完成請求。若無法確認完成，回傳 `failed_uncleared`，在 Fetch 攔截仍啟用時呼叫 `Browser.close`，再由 Gateway 移除 session 與容器。
+
+工具只回傳狀態與一句說明，不含密碼或截圖。`logged_in` 表示密碼欄位已消失，不代表已另行驗證伺服器的帳號狀態。`needs_takeover` 表示需要人員透過既有接手流程完成雙因素驗證或驗證碼，沒有供模型輸入 OTP 的路徑。失敗或需要接手時，helper 會清除帳號與密碼欄位；若無法確認清除成功（`failed_uncleared`），Gateway 會停止並移除 session 與容器，回傳錯誤請員工重新啟動 session。導覽不能恢復該失敗 session。登入呼叫執行期間暫停截圖。頁面來源、路徑或表單來源不符時拒絕登入。
+
+登入僅限保存的來源（協定、主機與連接埠），不會擴大員工的網路白名單。所有網址都必須使用 HTTPS，localhost 也不例外。**可信任登入頁的 JavaScript 能讀取已填入的欄位。** Gateway 防止密碼直接交給模型，但無法讓不可信任的網站變安全；只應保存可信任網站的登入資料。
+
 ## 安全：預設拒絕
 
 L2 以上的每一層都需要在 `agent.toml` 明確授權：
 
 ```toml
 [capabilities]
-computer_use = false        # 電腦操作 session 與八個 computer_* 工具
+computer_use = false        # 電腦操作 session 與九個 computer_* 工具
 browser_via_bash = false    # 從 Bash 工具呼叫啟動瀏覽器
 allowed_tools = [...]       # 白名單
 denied_tools = [...]        # 黑名單
@@ -180,7 +195,7 @@ denied_tools = [...]        # 黑名單
 allowed_domains = []        # computer_navigate 可開啟的網站；空白 = 沒有網路
 ```
 
-- `computer_use = false`（預設）時，gateway 不會替該員工啟動電腦操作 session，八個 `computer_*` 工具會從 `tools/list` 隱藏，直接呼叫也會被拒絕，且是 fail-closed 檢查：檔案不存在、TOML 壞掉、鍵的型別不對，三者一律拒絕。gateway 在 session 期間會重新讀取這個設定；關閉後，session 在下一個操作時結束。
+- `computer_use = false`（預設）時，gateway 不會替該員工啟動電腦操作 session，九個 `computer_*` 工具會從 `tools/list` 隱藏，直接呼叫也會被拒絕，且是 fail-closed 檢查：檔案不存在、TOML 壞掉、鍵的型別不對，三者一律拒絕。gateway 在 session 期間會重新讀取這個設定；關閉後，session 在下一個操作時結束。
 - `denied_tools` 會以 `--disallowedTools` 傳給 CLI，**同時**在 MCP 分派總門強制。
 - `browser_via_bash` 已不再設任何環境旗標。過去讀 `DUDUCLAW_BROWSER_VIA_BASH` 的 `bash-gate.sh` 白名單，已隨其他 shell hook 一起在 `ba015a48` 移除。這個 capability 仍然有效：它餵給 `disallowed_tools()` 與 `CapabilitiesConfig::sandbox_level()`，runtime 藉它決定 `ReadOnly` 還是 `WorkspaceWrite` 沙盒的依據。
 - 只存在於那個死路由器欄位上的限制（信任／封鎖網域、每 session 頁數上限）從未以那種形式實作。現在有的是：逐員工網站白名單（上面的 `allowed_domains`）、session 動作額度、聊天中的高風險確認，以及透過 `ApprovalBroker` 與 `agent.toml [capabilities] approval_required_tools`／`irreversible_tools`／`maybe_irreversible_tools` 的審批閘，這個審批閘對 `computer_*` 工具和其他工具一視同仁。截圖稽核不是開關：一律會寫（見下方稽核日誌一項）。
@@ -205,7 +220,7 @@ L1 就答得出來的問題卻動用 L5，是最昂貴的誤用，而且要靠 a
 - **容器隔離** — L5 跑在自己的 Docker 容器裡（預設映像 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway 版本>`，不會自動下載）：唯讀根檔案系統、256 MB 的 tmpfs `/tmp`、1 個 CPU、512 MB 記憶體、512 個行程（Chromium 的執行緒也算在這個上限內）；使用 `--network=none`，除非 session 有解析成功的白名單主機，這時會改加 `--network bridge`、被釘住的主機與給網域過濾器用的 `NET_ADMIN`（見上方網路段落）。每個電腦操作容器都帶 `--security-opt no-new-privileges`。這個容器由 `computer_use_orchestrator` 啟動，與逐員工的任務沙箱是分開的（見[任務沙箱指南](../../guides/zh-TW/task-sandbox.md)）。
 - **安全防線** — capability 強制與稽核軌跡見 [05-security-defense.md](05-security-defense.md)。
 - **常駐感知** — `http_poll`／`websocket` tick 來源共用 L1 的 SSRF 閘，見 [41-resident-sensing.md](41-resident-sensing.md)。
-- **稽核日誌** — 八個 `computer_*` 工具都會記進 `tool_calls.jsonl`，輸入經過精簡：`computer_type` 只記字元數，`computer_navigate` 只記主機與路徑長度（不含查詢字串），`computer_screenshot` 不含圖片。`web_fetch_cached` 與 `web_extract` 屬唯讀，不會記。Session 還會在 `~/.duduclaw/audit/browser/audit.jsonl` 追加帶雜湊鏈的紀錄（tier `L5a`；session 開始與結束、每次截圖（含 `fully_masked` 與 `mask_reason`）、每個動作與其風險評級、每次導覽的主機與路徑但不含查詢字串、每次拒絕；輸入的文字同樣只記字元數），並把遮罩後的截圖存到 `~/.duduclaw/audit/browser/screenshots/<agent_id>/`。截圖每位員工保留 7 天，且最多 500 個檔案或 200 MiB，超過時先刪最舊的；`audit.jsonl` 超過 16 MiB 後輪替為 `audit.jsonl.old`。細節見[開發指南第 5 節](../../guides/zh-TW/development-guide.md#5-審計與監控)。
+- **稽核日誌** — 九個 `computer_*` 工具都會記進 `tool_calls.jsonl`，輸入經過精簡：`computer_type` 只記字元數，`computer_navigate` 只記主機與路徑長度（不含查詢字串），`computer_screenshot` 不含圖片。`web_fetch_cached` 與 `web_extract` 屬唯讀，不會記。Session 還會在 `~/.duduclaw/audit/browser/audit.jsonl` 追加帶雜湊鏈的紀錄（tier `L5a`；session 開始與結束、每次截圖（含 `fully_masked` 與 `mask_reason`）、每個動作與其風險評級、每次導覽的主機與路徑但不含查詢字串、每次拒絕；輸入的文字同樣只記字元數），並把遮罩後的截圖存到 `~/.duduclaw/audit/browser/screenshots/<agent_id>/`。截圖每位員工保留 7 天，且最多 500 個檔案或 200 MiB，超過時先刪最舊的；`audit.jsonl` 超過 16 MiB 後輪替為 `audit.jsonl.old`。細節見[開發指南第 5 節](../../guides/zh-TW/development-guide.md#5-審計與監控)。
 
 ---
 
@@ -258,7 +273,7 @@ gateway 會解析觀看端送來的協定內容（RFB 3.7/3.8）：鍵盤、滑�
 
 按「接手」會讓這個帳號取得 session 的接手權。持有期間：
 
-- 員工的 `computer_click`、`computer_type`、`computer_key`、`computer_scroll`、`computer_navigate` 與 `computer_workspace_write` 一律以 `human_has_control` 拒絕，並請它等待；截圖、狀態與結束照常，截圖照樣遮罩；
+- 員工的 `computer_click`、`computer_type`、`computer_login`、`computer_key`、`computer_scroll`、`computer_navigate` 與 `computer_workspace_write` 一律以 `human_has_control` 拒絕，並請它等待；截圖、狀態與結束照常，截圖照樣遮罩；
 - 串流以輸入模式、新密碼重新啟動，只有持有者的鍵盤滑鼠能到達畫面；
 - session 不會因閒置而結束或暫停。
 
