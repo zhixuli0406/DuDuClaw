@@ -72,6 +72,7 @@ pub fn migrate_all(home: &Path) -> MigrationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     #[test]
     fn sweep_continues_after_failure_and_skips_deleted_employees() {

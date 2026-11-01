@@ -1335,7 +1335,7 @@ mod tests {
         add_server_to_config(&agent, "second", &def).unwrap();
         remove_server_from_config(&agent, "first").unwrap();
         let resolve = |server: &str| {
-            let env = [("API_KEY".into(), serde_json::Value::String(format!("secret://mcp/{server}/API_KEY")))].into();
+            let env = serde_json::Map::from_iter([("API_KEY".to_string(), serde_json::Value::String(format!("secret://mcp/{server}/API_KEY")))]);
             duduclaw_security::mcp_secret_store::resolve_mcp_env(home.path(), "alice", server, &env)
         };
         assert!(resolve("first").is_err());
