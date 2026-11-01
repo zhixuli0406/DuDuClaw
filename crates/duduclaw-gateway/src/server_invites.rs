@@ -5,28 +5,64 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 // Only the TCP peer is trusted. Reverse-proxy headers never identify callers.
-// None is the coarse peer budget; Some contains 16 hex chars of a token digest.
-type InviteBuckets = HashMap<(IpAddr, Option<String>), (Instant, u32)>;
-static INVITE_RATE_LIMITER: std::sync::LazyLock<Mutex<InviteBuckets>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+// Tokens have 256 bits of entropy; a shared proxy peer needs no coarse budget.
+use std::collections::{BTreeMap, BTreeSet};
 
-fn within_budget(map: &mut InviteBuckets, key: (IpAddr, Option<String>), now: Instant, limit: u32) -> bool {
-    let entry = map.entry(key).or_insert((now, 0));
-    if now.duration_since(entry.0).as_secs() >= 900 { *entry = (now, 0); }
-    entry.1 = entry.1.saturating_add(1);
-    entry.1 <= limit
+const INVITE_BUCKET_CAPACITY: usize = 10_000;
+type InviteBucketKey = (IpAddr, String);
+
+struct InviteBucket {
+    start: Instant,
+    attempts: u32,
+    order: u64,
 }
 
+#[derive(Default)]
+struct InviteBuckets {
+    entries: HashMap<InviteBucketKey, InviteBucket>,
+    insertion_order: BTreeMap<u64, InviteBucketKey>,
+    expiry_order: BTreeSet<(Instant, u64)>,
+    next_order: u64,
+}
+
+static INVITE_RATE_LIMITER: std::sync::LazyLock<Mutex<InviteBuckets>> =
+    std::sync::LazyLock::new(|| Mutex::new(InviteBuckets::default()));
+
 fn rate_limit_at(map: &mut InviteBuckets, ip: IpAddr, token: &str, now: Instant) -> bool {
-    if map.len() > 10000 {
-        map.retain(|_, (start, _)| now.duration_since(*start).as_secs() < 900);
-    }
-    // Refused attempts also spend the coarse budget, without allocating more
-    // token buckets once the peer has exhausted its allowance.
-    if !within_budget(map, (ip, None), now, 300) { return false; }
     let digest = Sha256::digest(token.as_bytes());
     let prefix: String = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect();
-    within_budget(map, (ip, Some(prefix)), now, 10)
+    let key = (ip, prefix);
+    if !map.entries.contains_key(&key) {
+        if map.entries.len() == INVITE_BUCKET_CAPACITY {
+            // Prefer an expired bucket, even if an older insertion was renewed.
+            // One eviction makes room; ordered indexes avoid a whole-map scan.
+            let expired = map.expiry_order.first()
+                .filter(|(start, _)| now.duration_since(*start).as_secs() >= 900)
+                .map(|(_, order)| *order);
+            let oldest = expired.or_else(|| map.insertion_order.first_key_value().map(|(order, _)| *order));
+            if let Some(order) = oldest {
+                if let Some(oldest_key) = map.insertion_order.remove(&order) {
+                    if let Some(bucket) = map.entries.remove(&oldest_key) {
+                        map.expiry_order.remove(&(bucket.start, order));
+                    }
+                }
+            }
+        }
+        let order = map.next_order;
+        map.next_order += 1;
+        map.insertion_order.insert(order, key.clone());
+        map.expiry_order.insert((now, order));
+        map.entries.insert(key.clone(), InviteBucket { start: now, attempts: 0, order });
+    }
+    let entry = map.entries.get_mut(&key).expect("invite bucket just inserted");
+    if now.duration_since(entry.start).as_secs() >= 900 {
+        map.expiry_order.remove(&(entry.start, entry.order));
+        entry.start = now;
+        entry.attempts = 0;
+        map.expiry_order.insert((now, entry.order));
+    }
+    entry.attempts = entry.attempts.saturating_add(1);
+    entry.attempts <= 10
 }
 
 fn check_invite_rate_limit(ip: IpAddr, token: &str) -> bool {
@@ -139,19 +175,76 @@ mod tests {
     }
 
     #[test]
-    fn token_and_peer_budgets_expire_and_store_only_digest_prefixes() {
-        let mut map = InviteBuckets::new();
+    fn token_budgets_expire_and_store_only_digest_prefixes() {
+        let mut map = InviteBuckets::default();
         let ip = "192.0.2.101".parse().unwrap();
         let other = "192.0.2.102".parse().unwrap();
         let now = Instant::now();
         for _ in 0..10 { assert!(rate_limit_at(&mut map, ip, "secret-token", now)); }
         assert!(!rate_limit_at(&mut map, ip, "secret-token", now));
-        assert!(map.contains_key(&(ip, Some("930bbdc51b6aed5c".into()))));
-        assert!(map.keys().all(|(_, key)| key.as_ref().is_none_or(|key| key.len() == 16 && !key.contains("secret-token"))));
+        assert!(map.entries.contains_key(&(ip, "930bbdc51b6aed5c".into())));
+        assert!(map.entries.keys().all(|(_, key)| key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit())));
         assert!(rate_limit_at(&mut map, other, "secret-token", now));
-        for index in 11..300 { assert!(rate_limit_at(&mut map, ip, &format!("token-{index}"), now)); }
-        assert!(!rate_limit_at(&mut map, ip, "fresh-token", now));
+        assert!(!rate_limit_at(&mut map, ip, "secret-token", now + std::time::Duration::from_secs(899)));
         assert!(rate_limit_at(&mut map, ip, "secret-token", now + std::time::Duration::from_secs(900)));
+        assert_eq!(map.entries.len(), 2);
+        assert_eq!(map.insertion_order.len(), 2);
+        assert_eq!(map.expiry_order.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bogus_tokens_from_one_proxy_peer_do_not_block_a_real_invite() {
+        let (_dir, db, admin, user) = fixture();
+        let invite = db.issue_user_invite(&user, &admin).unwrap();
+        let mut map = InviteBuckets::default();
+        let ip = "192.0.2.101".parse().unwrap();
+        let now = Instant::now();
+        for index in 0..1000 {
+            assert!(rate_limit_at(&mut map, ip, &format!("bogus-{index}"), now));
+        }
+        assert!(rate_limit_at(&mut map, ip, &invite.token, now));
+        assert_eq!(read(inspect(db, invite.token).await).await.1["valid"], true);
+    }
+
+    #[test]
+    fn buckets_and_order_indexes_stay_bounded_and_evict_oldest() {
+        let mut map = InviteBuckets::default();
+        let ip = "192.0.2.101".parse().unwrap();
+        let now = Instant::now();
+        for index in 0..INVITE_BUCKET_CAPACITY * 2 {
+            // Exercise both live and expired capacity eviction.
+            let at = now + std::time::Duration::from_secs(if index > INVITE_BUCKET_CAPACITY { 900 } else { 0 });
+            assert!(rate_limit_at(&mut map, ip, &format!("bogus-{index}"), at));
+            assert!(map.entries.len() <= INVITE_BUCKET_CAPACITY);
+            assert_eq!(map.insertion_order.len(), map.entries.len());
+            assert_eq!(map.expiry_order.len(), map.entries.len());
+        }
+        assert_eq!(map.entries.len(), INVITE_BUCKET_CAPACITY);
+        let oldest = format!("{:x}", Sha256::digest(b"bogus-0"));
+        assert!(!map.entries.contains_key(&(ip, oldest[..16].into())));
+        let newest = format!("{:x}", Sha256::digest(format!("bogus-{}", INVITE_BUCKET_CAPACITY * 2 - 1).as_bytes()));
+        assert!(map.entries.contains_key(&(ip, newest[..16].into())));
+    }
+
+    #[test]
+    fn capacity_evicts_expired_buckets_before_renewed_oldest_insertion() {
+        let mut map = InviteBuckets::default();
+        let ip = "192.0.2.101".parse().unwrap();
+        let now = Instant::now();
+        for index in 0..INVITE_BUCKET_CAPACITY {
+            assert!(rate_limit_at(&mut map, ip, &format!("token-{index}"), now));
+        }
+        let later = now + std::time::Duration::from_secs(900);
+        for _ in 0..10 { assert!(rate_limit_at(&mut map, ip, "token-0", later)); }
+        assert!(!rate_limit_at(&mut map, ip, "token-0", later));
+        assert!(rate_limit_at(&mut map, ip, "fresh-token", later));
+        // Renewing the oldest insertion must not let capacity eviction reset it.
+        assert!(!rate_limit_at(&mut map, ip, "token-0", later));
+        let expired = format!("{:x}", Sha256::digest(b"token-1"));
+        assert!(!map.entries.contains_key(&(ip, expired[..16].into())));
+        assert_eq!(map.entries.len(), INVITE_BUCKET_CAPACITY);
+        assert_eq!(map.insertion_order.len(), INVITE_BUCKET_CAPACITY);
+        assert_eq!(map.expiry_order.len(), INVITE_BUCKET_CAPACITY);
     }
 
     #[tokio::test]

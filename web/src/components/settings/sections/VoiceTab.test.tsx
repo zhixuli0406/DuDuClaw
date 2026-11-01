@@ -72,7 +72,7 @@ describe('<VoiceTab>', () => {
     fireEvent.click(download);
     await waitFor(() => expect(installMock).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(statusMock).toHaveBeenCalledTimes(2));
-    expect(screen.getByText(/134 MB/)).toBeTruthy();
+    expect(screen.getByText(/139 MB/)).toBeTruthy();
     expect(screen.getByText(/mainland accent/)).toBeTruthy();
   });
 

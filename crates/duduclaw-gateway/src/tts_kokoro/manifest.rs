@@ -13,6 +13,7 @@ macro_rules! model_asset {
     };
 }
 pub const ASSETS: &[Asset] = &[
+    Asset { path: "jieba_dict.txt", url: "https://raw.githubusercontent.com/messense/jieba-rs/c6092233987bc6b25efb87f9685226456e8d987b/src/data/dict.txt", size: 5071843, sha256: "139519822fe8ab9e10d9d07e68ea0451045380aedaf54ecc51e2a28c6b42a13f" },
     model_asset!("onnx/model_uint8.onnx", 127356597, "a39469be791eeaa3089c1ed5e58b8731d1f2462ea0e7dae2bc44388e58f973d8"),
     model_asset!("voices/zf_001.bin", 522240, "0a89ec12bb93fb9c74077924daf02568baad64e1f869389f5aaee01a386035f8"),
     model_asset!("voices/zm_010.bin", 522240, "73b088f7e0dc47adca4d6a642ee68843df90ff56ec2800c29d96609989d6de0a"),
@@ -29,7 +30,7 @@ mod tests {
     #[test]
     fn all_assets_are_pinned() {
         for a in ASSETS {
-            assert!(a.url.contains(REVISION) || a.url.contains("fba1236595f2d2bf21d414ba6e57d25256afada3"));
+            assert!(a.url.contains("c6092233987bc6b25efb87f9685226456e8d987b") || a.url.contains(REVISION) || a.url.contains("fba1236595f2d2bf21d414ba6e57d25256afada3"));
             assert_eq!(a.sha256.len(), 64);
             assert!(a.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
         }

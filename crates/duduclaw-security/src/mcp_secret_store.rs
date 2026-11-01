@@ -319,7 +319,7 @@ pub fn remove_agent(home: &Path, agent: &str) -> io::Result<()> {
     let path = store_path(home, agent)?;
     if !path.exists() { return Ok(()) }
     duduclaw_core::with_file_lock(&path, || match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent(&path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     })

@@ -143,5 +143,32 @@ fn prune_backups(dir: &Path, agent: &str) -> io::Result<()> {
     backups.sort();
     let remove = backups.len().saturating_sub(3);
     for backup in backups.into_iter().take(remove) { fs::remove_file(backup)?; }
-    Ok(())
+    // Sync the backup directory once, including on retry after a failed sync.
+    sync_parent(&dir.join(".retention-sync"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_pruning_reports_directory_sync_failure_and_retries_barrier() {
+        let dir = std::env::temp_dir().join(format!("mcp-retention-sync-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for stamp in 0..5 {
+            fs::write(dir.join(format!("alice-{stamp:039}.enc")), b"encrypted backup").unwrap();
+        }
+        // Use the same thread-local, one-shot seam as the store durability tests.
+        FAIL_PARENT_SYNC.with(|failure| *failure.borrow_mut() = Some((dir.clone(), 0)));
+        let error = prune_backups(&dir, "alice").unwrap_err();
+        assert!(error.to_string().contains("injected MCP parent sync failure"));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+        assert!(!dir.join(format!("alice-{:039}.enc", 0)).exists());
+        assert!(!dir.join(format!("alice-{:039}.enc", 1)).exists());
+        // Even with no more files to prune, retry the failed directory barrier.
+        FAIL_PARENT_SYNC.with(|failure| *failure.borrow_mut() = Some((dir.clone(), 0)));
+        assert!(prune_backups(&dir, "alice").is_err());
+        prune_backups(&dir, "alice").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

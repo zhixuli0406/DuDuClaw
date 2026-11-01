@@ -8,7 +8,7 @@ embeddings are redistributed in the DuDuClaw binary.
 | Kokoro-82M v1.1-zh weights and voice embeddings | hexgrad | Apache-2.0 | Request download from the pinned onnx-community conversion, revision `6cc0f0d2ebe369a68b0df87c2b65c1af8c0ac3e3` |
 | misaki | hexgrad | Apache-2.0 | Modified Rust ports of `zh.py`, `zh_frontend.py`, and `tone_sandhi.py`; model vocabulary; request-downloaded English `us_gold.json`, revision `fba1236595f2d2bf21d414ba6e57d25256afada3` |
 | PaddleSpeech | Copyright (c) 2021 PaddlePaddle Authors. All Rights Reserved. | Apache-2.0 | Modified frontend and tone-sandhi algorithms, via misaki |
-| jieba-rs 0.7.1 | messense and contributors | MIT | Chinese word segmentation, default dictionary |
+| jieba-rs 0.11.0 | messense and contributors | MIT | Chinese word segmentation; MIT dictionary downloaded on request, pinned revision `c6092233987bc6b25efb87f9685226456e8d987b` |
 | pinyin 0.10.0 | mozillazg and contributors | MIT | Character-to-pinyin conversion |
 | ort 2.0.0-rc.12 | pyke.io and contributors | MIT OR Apache-2.0 | Existing workspace dependency, now also used directly by gateway |
 

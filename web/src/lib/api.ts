@@ -184,6 +184,7 @@ export interface AgentDetail extends AgentInfo {
 
 
 export interface VoiceSettings {
+  tts_command?: string;
   tts_provider: string;
   tts_voice: string;
 }

@@ -688,7 +688,7 @@ impl TtsRouter {
                     if command.split_whitespace().any(|arg| arg.contains("{output}")) {
                         router.providers.push(Box::new(CommandTtsProvider::new(command.to_string())));
                     } else {
-                        warn!("TTS command provider unavailable: tts_command has no {output} placeholder");
+                        warn!("TTS command provider unavailable: tts_command has no {{output}} placeholder");
                     }
                 }
             }

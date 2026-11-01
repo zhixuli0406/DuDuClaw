@@ -51,7 +51,7 @@ async fn review_with<C: LlmCaller>(
         return None;
     }
     // Poll in the current task: spawning would lose autonomous utility context.
-    let lenses = futures::future::join_all(LENSES.into_iter().map(|lens| async move {
+    let lenses = futures_util::future::join_all(LENSES.into_iter().map(|lens| async move {
         let prompt = build_prompt(lens, goal, criteria, plan);
         let (status, text) = match tokio::time::timeout(
             std::time::Duration::from_secs(45),

@@ -351,3 +351,14 @@ fn duduclaw_prefix_and_wrong_builtin_command_are_migrated() {
         assert_eq!(rewritten.config["mcpServers"][name]["args"][0], "mcp-proxy");
     }
 }
+
+#[test]
+fn remove_agent_reports_parent_sync_failure_after_unlink() {
+    let home = Home::new();
+    store_mcp_env(home.path(), "alice", "vendor", &env(json!({"TOKEN":"secret"}))).unwrap();
+    let path = home.path().join("secrets/mcp/alice.enc");
+    let _failure = ParentSyncFailure::at(path.clone());
+    let error = remove_agent(home.path(), "alice").unwrap_err();
+    assert!(error.to_string().contains("injected MCP parent sync failure"));
+    assert!(!path.exists());
+}

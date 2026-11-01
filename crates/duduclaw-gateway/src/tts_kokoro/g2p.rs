@@ -5,9 +5,11 @@
 // Modified: Rust, jieba-rs/pinyin, compact number and character normalization.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
-use std::sync::OnceLock;
-use jieba_rs::Jieba;
+use std::sync::{Mutex, OnceLock};
+use jieba_rs::{Jieba, Tag};
 use pinyin::ToPinyin;
 use super::{english, tone_sandhi::{self, Word}};
 
@@ -17,6 +19,24 @@ const NOT_ERHUA: &[&str] = &["虐儿","为儿","护儿","瞒儿","救儿","替�
 
 static VOCAB: OnceLock<HashMap<char, i64>> = OnceLock::new();
 static JIEBA: OnceLock<Jieba> = OnceLock::new();
+static JIEBA_INIT: Mutex<()> = Mutex::new(());
+
+fn init_jieba(model_dir: &Path) -> Result<&'static Jieba, String> {
+    if let Some(jieba) = JIEBA.get() { return Ok(jieba); }
+    let _guard = JIEBA_INIT.lock().map_err(|e| format!("Kokoro dictionary init: {e}"))?;
+    if let Some(jieba) = JIEBA.get() { return Ok(jieba); }
+    let file = File::open(model_dir.join("jieba_dict.txt"))
+        .map_err(|e| format!("Kokoro 尚未安裝完整，請下載語音模型：{e}"))?;
+    let jieba = Jieba::with_dict(&mut BufReader::new(file))
+        .map_err(|e| format!("Kokoro dictionary: {e}"))?;
+    Ok(JIEBA.get_or_init(|| jieba))
+}
+
+#[cfg(test)]
+pub(super) fn test_jieba() -> Jieba {
+    let dict = "你好 100 n\n台湾 100 ns\n小院儿 100 n\n女儿 100 n\n设置 100 v\n所有 100 b\n人 100 n\n";
+    Jieba::with_dict(&mut BufReader::new(dict.as_bytes())).unwrap()
+}
 
 pub(super) fn vocabulary() -> &'static HashMap<char, i64> {
     VOCAB.get_or_init(|| {
@@ -153,11 +173,10 @@ fn syllable(py: &str, tone: u8, erhua: bool) -> String {
     out
 }
 
-fn chinese(text: &str) -> String {
-    let jieba = JIEBA.get_or_init(Jieba::new);
-    let words = jieba.tag(text, false).into_iter().map(|t| Word {
-        text: t.word.into(), pos: if t.tag == "x" && t.word.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) { "X".into() } else { t.tag.into() },
-        syllables: pinyin(t.word),
+fn chinese(text: &str, jieba: &Jieba) -> String {
+    let words = jieba.tag(text, false).into_iter().map(|Tag { word, tag, .. }| Word {
+        text: word.into(), pos: if tag == "x" && word.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) { "X".into() } else { tag.into() },
+        syllables: pinyin(word),
     }).collect();
     let mut out = String::new();
     let mut prev_chinese = false;
@@ -186,7 +205,7 @@ pub fn is_pure_english(text: &str) -> bool {
         && !text.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c))
 }
 
-fn phonemes_with(text: &str, english: impl Fn(&str) -> Result<String, String>) -> Result<String, String> {
+fn phonemes_with(text: &str, jieba: &Jieba, english: impl Fn(&str) -> Result<String, String>) -> Result<String, String> {
     let text = simplify(&numbers(text));
     let chars: Vec<_> = text.chars().collect();
     let mut i = 0;
@@ -199,13 +218,13 @@ fn phonemes_with(text: &str, english: impl Fn(&str) -> Result<String, String>) -
         } else { !chars[i].is_ascii_alphabetic() } { i += 1; }
         let segment: String = chars[start..i].iter().collect();
         if en { parts.push(english(segment.trim())?); }
-        else { parts.push(chinese(&segment)); }
+        else { parts.push(chinese(&segment, jieba)); }
     }
     Ok(parts.join(" ").chars().filter(|c| vocabulary().contains_key(c)).collect())
 }
 
 fn phonemes(text: &str, model_dir: &Path) -> Result<String,String> {
-    phonemes_with(text, |s| english::phonemes(s, model_dir))
+    phonemes_with(text, init_jieba(model_dir)?, |s| english::phonemes(s, model_dir))
 }
 
 /// Sentence boundaries are preferred; the hard limit also handles a single
@@ -234,6 +253,18 @@ fn token_chunks(phones: &str) -> Vec<Vec<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_dictionary_tags_and_errors_without_default_features() {
+        let jieba = test_jieba();
+        let words = jieba.cut("你好台湾", false);
+        assert_eq!(words.iter().map(|token| token.word).collect::<Vec<_>>(), ["你好", "台湾"]);
+        let tags = jieba.tag("你好台湾", false);
+        assert_eq!(tags.iter().map(|tag| (tag.word, tag.tag)).collect::<Vec<_>>(), [("你好", "n"), ("台湾", "ns")]);
+        let error = Jieba::with_dict(&mut BufReader::new("你好 invalid n\n".as_bytes())).unwrap_err();
+        assert!(matches!(error, jieba_rs::Error::InvalidDictEntry(_)));
+        assert!(format!("Kokoro dictionary: {error}").contains("invalid dictionary entry"));
+    }
+
     #[test] fn tone_and_symbol_table() {
         assert_eq!(syllable("zhi", 1, false), "ㄓ十1");
         assert_eq!(syllable("yuan", 2, false), "元2");
@@ -242,33 +273,33 @@ mod tests {
         assert_eq!(syllable("liu", 2, false), "ㄌ又2");
         assert_eq!(syllable("zi", 5, false), "ㄗㄭ5");
         assert_eq!(syllable("ge", 1, true), "ㄍㄦ1");
-        assert_eq!(chinese("你好"), "ㄋㄧ2ㄏㄠ3");
+        assert_eq!(chinese("你好", &test_jieba()), "ㄋㄧ2ㄏㄠ3");
     }
     #[test] fn traditional_numbers_and_punctuation() {
         assert_eq!(simplify("臺灣"), "台湾");
-        assert_eq!(chinese(&simplify("臺灣")), chinese("台湾"));
+        assert_eq!(chinese(&simplify("臺灣"), &test_jieba()), chinese("台湾", &test_jieba()));
         assert_eq!(numbers("3.5 85%"), "三点五 百分之八十五");
         assert_eq!(numbers("101 10001 10"), "一百零一 一万零一 十");
         assert_eq!("，。！？「」".chars().map(punctuation).collect::<String>(), ",.!?“”");
     }
     #[test] fn erhua_and_unknown_cjk_are_safe() {
-        assert!(chinese("小院儿").contains('R'));
-        assert!(!chinese("女儿").contains('R'));
-        let phones = phonemes("你好👩‍💻𠀀！", Path::new("/unused")).unwrap();
-        let ids = chunks("你好👩‍💻𠀀！", Path::new("/unused")).unwrap();
+        assert!(chinese("小院儿", &test_jieba()).contains('R'));
+        assert!(!chinese("女儿", &test_jieba()).contains('R'));
+        let phones = phonemes_with("你好👩‍💻𠀀！", &test_jieba(), |_| unreachable!()).unwrap();
+        let ids = token_chunks(&phones);
         assert!(!ids.is_empty());
         assert!(phones.chars().all(|c| vocabulary().contains_key(&c)));
         assert!(!phones.contains('👩'));
     }
     #[test] fn empty_and_long_chunks() {
-        assert!(chunks("", Path::new("/unused")).unwrap().is_empty());
-        let result = chunks(&"你好".repeat(2000), Path::new("/unused")).unwrap();
+        assert!(token_chunks(&phonemes_with("", &test_jieba(), |_| unreachable!()).unwrap()).is_empty());
+        let result = token_chunks(&phonemes_with(&"你好".repeat(2000), &test_jieba(), |_| unreachable!()).unwrap());
         assert!(result.len() > 1);
         assert!(result.iter().all(|c| !c.is_empty() && c.len() <= 500));
     }
     #[test] fn mixed_english_uses_lexicon_and_vocab() {
         let lexicon = HashMap::from([("odoo".into(), "oʊdu".into())]);
-        let phones = phonemes_with("Odoo 設定", |s| Ok(english::lookup(s, &lexicon))).unwrap();
+        let phones = phonemes_with("Odoo 設定", &test_jieba(), |s| Ok(english::lookup(s, &lexicon))).unwrap();
         assert!(phones.starts_with("oʊdu"));
         assert!(phones.contains("ㄕㄜ4"));
         assert!(phones.chars().all(|c| vocabulary().contains_key(&c)));

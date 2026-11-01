@@ -202,7 +202,7 @@ function KokoroDownloadCard() {
   return (
     <SettingsCard>
       <div className="space-y-3 p-4">
-        <p className="text-sm font-medium">Kokoro-82M v1.1-zh · 134 MB · Apache-2.0</p>
+        <p className="text-sm font-medium">Kokoro-82M v1.1-zh · 139 MB · Apache-2.0</p>
         <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'voice.kokoro.note' })}</p>
         {status?.installed && <p className="text-sm">{intl.formatMessage({ id: 'voice.kokoro.ready' })}</p>}
         {status?.state === 'downloading' && (

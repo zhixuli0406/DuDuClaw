@@ -751,7 +751,9 @@ impl ComputerUseOrchestrator {
             }
             Err(_) => {
                 // Killing docker exec does not prove the in-container child ended.
-                self.control_handle().stopped.store(true, Ordering::Release);
+                self.control_handle()
+                    .stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
                 LoginStatus::FailedUncleared
             }
         }

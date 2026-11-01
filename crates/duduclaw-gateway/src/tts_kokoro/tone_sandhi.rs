@@ -71,11 +71,11 @@ pub(super) fn pre_merge(words: Vec<Word>) -> Vec<Word> {
 
 fn split(word: &str, jieba: &Jieba) -> usize {
     let mut subs = jieba.cut_for_search(word, false);
-    subs.sort_by_key(|s| s.chars().count());
+    subs.sort_by_key(|s| s.word.chars().count());
     let n = word.chars().count();
     let Some(first) = subs.first() else { return n; };
-    let len = first.chars().count();
-    if word.starts_with(*first) { len } else { n.saturating_sub(len) }
+    let len = first.word.chars().count();
+    if word.starts_with(first.word) { len } else { n.saturating_sub(len) }
 }
 fn conventional(word: &str) -> bool {
     NEUTRAL.contains(&word) || {
@@ -152,9 +152,21 @@ mod tests {
     use super::*;
     fn tones(text: &str, ts: &[u8]) -> Vec<u8> {
         let mut w = Word { text: text.into(), pos: "n".into(), syllables: ts.iter().map(|t| (String::new(), *t)).collect() };
-        modify(&mut w, &Jieba::new());
+        modify(&mut w, &super::super::g2p::test_jieba());
         w.syllables.iter().map(|s| s.1).collect()
     }
+    #[test]
+    fn search_tokens_split_by_character_length_and_word_text() {
+        let mut jieba = Jieba::empty();
+        jieba.add_word("所有", Some(100), Some("b"));
+        assert_eq!(split("所有人", &jieba), 2);
+        assert_eq!(split("人所有", &jieba), 1);
+        assert_eq!(split("", &jieba), 0);
+        // Search mode includes the shorter dictionary match and the full word.
+        jieba.add_word("所有人", Some(1000), Some("n"));
+        assert_eq!(split("所有人", &jieba), 2);
+    }
+
     #[test] fn source_sandhi_table() {
         assert_eq!(tones("你好", &[3,3]), [2,3]);
         assert_eq!(tones("不怕", &[4,4]), [2,4]);

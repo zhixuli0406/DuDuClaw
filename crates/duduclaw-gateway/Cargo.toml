@@ -25,7 +25,7 @@ duduclaw-knowledge = { workspace = true }
 # Shared ONNX Runtime manifest (platform support shown by the embedding status RPC).
 duduclaw-onnx = { workspace = true, features = ["runtime", "install"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"] }
-jieba-rs = { version = "=0.7.1", default-features = false, features = ["default-dict"] }
+jieba-rs = { version = "=0.11.0", default-features = false }
 pinyin = { version = "=0.10.0", default-features = false, features = ["with_tone_num_end"] }
 duduclaw-identity = { workspace = true }
 # `ner` is default-on in the redaction crate; named explicitly here because
