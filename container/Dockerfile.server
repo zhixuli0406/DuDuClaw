@@ -64,7 +64,8 @@ FROM python:3.12-slim AS cli-tools
 # Install Python dependencies
 RUN pip install --no-cache-dir anthropic==0.50.0
 
-# Install Docker CLI, Node.js 22, multi-runtime AI CLIs (Claude/Codex), and curl for healthcheck
+# Install docker.io (includes the Docker client), Node.js 22, AI CLIs, and curl.
+# The runtime inherits this client via FROM cli-tools; no daemon/socket is started here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     docker.io ca-certificates curl gnupg && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \

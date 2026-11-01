@@ -94,8 +94,10 @@ fn internal_key_entry(now: DateTime<Utc>) -> toml::Value {
 }
 
 /// Ensure a *valid* internal MCP key exists in `<home>/config.toml
-/// [mcp_keys]`, creating it on first boot and rotating it before the
-/// authenticator's hard expiry. Returns the cleartext key.
+/// [mcp_keys]`, rotating it before the
+/// authenticator's hard expiry. Returns the cleartext key. Legacy entry point:
+/// refuses a missing config or unavailable durable MFA state. Gateway boot
+/// callers must use [`ensure_internal_mcp_key_for_gateway`] with their listener.
 ///
 /// Rules (all scoped to `client_id = "gateway-internal"` — foreign keys are
 /// never read for rotation and never modified):
@@ -111,12 +113,58 @@ fn internal_key_entry(now: DateTime<Utc>) -> toml::Value {
 ///   read-only boot (and `config.toml`'s mtime — which the MCP auth registry
 ///   cache keys off — stays put).
 pub fn ensure_internal_mcp_key(home_dir: &Path) -> Result<String, String> {
-    let config_path = home_dir.join("config.toml");
-    duduclaw_core::with_file_lock(&config_path, || {
-        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        let mut table: toml::Table = toml::from_str(&content)
-            .map_err(|e| std::io::Error::other(format!("malformed config.toml: {e}")))?;
+    // Legacy callers may rotate an existing config, but cannot invent the
+    // running listener or edition for a missing file. Migrate boot callers
+    // (including Pro) to ensure_internal_mcp_key_for_gateway.
+    provision_internal_mcp_key(home_dir, None, false, None)
+}
 
+/// Provision using the validated listener and edition of the running gateway.
+/// The environment override remains the child key and is also registered locally.
+pub fn ensure_internal_mcp_key_for_gateway(
+    home_dir: &Path,
+    listener: std::net::SocketAddr,
+    personal: bool,
+    env_key: Option<&str>,
+) -> Result<String, String> {
+    if listener.port() == 0 {
+        return Err("gateway port must be between 1 and 65535".into());
+    }
+    provision_internal_mcp_key(home_dir, Some(listener), personal, env_key)
+}
+
+fn provision_internal_mcp_key(
+    home_dir: &Path,
+    listener: Option<std::net::SocketAddr>,
+    personal: bool,
+    env_key: Option<&str>,
+) -> Result<String, String> {
+    let env_key = env_key.filter(|key| !key.trim().is_empty());
+    let (key, restored) = crate::handlers::config_commit::commit_boot_config(home_dir, |content, missing| {
+        if missing && listener.is_none() {
+            return Err("missing config.toml requires validated gateway listener and edition".into());
+        }
+        let mut table: toml::Table = toml::from_str(content)
+            .map_err(|_| "malformed config.toml".to_string())?;
+
+        // Read durable MFA state before any config creation or replacement.
+        let enforced = crate::mfa::boot_policy(home_dir, personal)?;
+        let mut restored = false;
+        if missing {
+            let listener = listener.ok_or("missing validated gateway listener")?;
+            let mut gateway = toml::Table::new();
+            gateway.insert("port".into(), toml::Value::Integer(listener.port().into()));
+            gateway.insert("bind".into(), toml::Value::String(listener.ip().to_string()));
+            table.insert("gateway".into(), toml::Value::Table(gateway));
+        }
+        let auth_missing = table.get("auth").is_none_or(|auth|
+            auth.as_table().is_some_and(|auth| !auth.contains_key("mfa_enforced")));
+        if enforced && auth_missing {
+            let auth = table.entry("auth").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            auth.as_table_mut().ok_or("config.toml [auth] is not a table")?
+                .insert("mfa_enforced".into(), toml::Value::Boolean(true));
+            restored = true;
+        }
         let now = Utc::now();
 
         // Survey every existing `gateway-internal` entry.
@@ -175,14 +223,34 @@ pub fn ensure_internal_mcp_key(home_dir: &Path) -> Result<String, String> {
             .filter(|(_, _, age)| *age < ROTATE_AFTER_DAYS)
             .map(|(k, _, _)| k.clone());
 
-        let (key, minted) = match reused {
-            Some(k) => (k, false),
-            None => (mint_key(), true),
+        let (key, minted) = if let Some(key) = env_key {
+            // Refresh the same row when metadata or age requires it; never
+            // create a second row or overwrite a foreign client's key.
+            if let Some(entry) = table.get("mcp_keys").and_then(|v| v.get(key)) {
+                if entry.get("client_id").and_then(|v| v.as_str()) != Some(INTERNAL_CLIENT_ID) {
+                    return Err("environment MCP key belongs to another client".into());
+                }
+            }
+            let valid = table.get("mcp_keys").and_then(|v| v.get(key))
+                .is_some_and(|entry| {
+                    entry.get("is_external").and_then(|v| v.as_bool()) == Some(false)
+                        && entry.get("scopes").and_then(|v| v.as_array())
+                            .is_some_and(|v| v == &vec![toml::Value::String("admin".into())])
+                        && entry.get("created_at").and_then(|v| v.as_str())
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .is_some_and(|dt| age_in_days(dt.with_timezone(&Utc), now) < ROTATE_AFTER_DAYS)
+                });
+            (key.to_owned(), !valid)
+        } else {
+            match reused {
+                Some(k) => (k, false),
+                None => (mint_key(), true),
+            }
         };
 
         // Steady state: a young key and nothing to prune ⇒ no write at all.
-        if !minted && prune.is_empty() {
-            return Ok(key);
+        if !minted && prune.is_empty() && !restored && !missing {
+            return Ok(((key, false), None));
         }
 
         let mcp_keys = table
@@ -190,7 +258,7 @@ pub fn ensure_internal_mcp_key(home_dir: &Path) -> Result<String, String> {
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
         let mcp_keys = mcp_keys
             .as_table_mut()
-            .ok_or_else(|| std::io::Error::other("config.toml [mcp_keys] is not a table"))?;
+            .ok_or("config.toml [mcp_keys] is not a table")?;
         for stale in &prune {
             mcp_keys.remove(stale);
         }
@@ -201,13 +269,8 @@ pub fn ensure_internal_mcp_key(home_dir: &Path) -> Result<String, String> {
         // Atomic write (temp + rename) so a crash never truncates config.toml.
         // Format-preserving: only the [mcp_keys] rows that changed are
         // edited, the operator's comments and key order stay.
-        let rendered = crate::handlers::config_commit::render_preserving(&content, &table)
-            .map_err(|e| std::io::Error::other(format!("serialize config.toml: {e}")))?;
-        let tmp = config_path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &rendered)?;
-        std::fs::rename(&tmp, &config_path)?;
-        duduclaw_core::platform::set_owner_only(&config_path).ok();
-
+        let rendered = crate::handlers::config_commit::render_preserving(content, &table)
+            .map_err(|_| "serialize config.toml failed".to_string())?;
         // Never log the key itself — only ages and counts.
         let previous = match newest_age {
             Some(a) => format!("{a}d"),
@@ -237,9 +300,10 @@ pub fn ensure_internal_mcp_key(home_dir: &Path) -> Result<String, String> {
                 "Pruned expired internal MCP API keys from config.toml [mcp_keys]"
             );
         }
-        Ok(key)
-    })
-    .map_err(|e| format!("internal MCP key provisioning failed: {e}"))
+        Ok(((key, restored), Some(rendered)))
+    }).map_err(|e| format!("internal MCP key provisioning failed: {e}"))?;
+    if restored { crate::mfa::audit_policy_restored(home_dir); }
+    Ok(key)
 }
 
 /// Every currently valid `gateway-internal` key in
@@ -388,6 +452,99 @@ mod verify_tests {
 mod tests {
     use super::*;
 
+    fn provision(home: &Path, personal: bool, env: Option<&str>) -> Result<String, String> {
+        ensure_internal_mcp_key_for_gateway(home, "127.0.0.1:18888".parse().unwrap(), personal, env)
+    }
+
+    #[test]
+    fn env_key_first_boot_records_listener_and_is_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        let key = "ddc_prod_1234567890abcdef1234567890abcdef";
+        assert_eq!(provision(home.path(), true, Some(key)).unwrap(), key);
+        let before = config_text(home.path());
+        let table: toml::Table = before.parse().unwrap();
+        assert_eq!(table["gateway"]["port"].as_integer(), Some(18888));
+        assert_eq!(table["gateway"]["bind"].as_str(), Some("127.0.0.1"));
+        assert_eq!(table["mcp_keys"].as_table().unwrap().len(), 1);
+        assert!(verify_internal_key(home.path(), key));
+        provision(home.path(), true, Some(key)).unwrap();
+        assert_eq!(config_text(home.path()), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(home.path().join("config.toml")).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn invalid_listener_and_unreadable_config_never_write() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(ensure_internal_mcp_key_for_gateway(home.path(), "127.0.0.1:0".parse().unwrap(), true, None).is_err());
+        assert!(!home.path().join("config.toml").exists());
+        assert!("127.0.0.1\n[auth]\nmfa_enforced=false".parse::<std::net::IpAddr>().is_err());
+        let path = home.path().join("config.toml");
+        let bytes = [0xff, 0xfe, 0x00]; // Deterministic read_to_string failure, even as root.
+        std::fs::write(&path, bytes).unwrap();
+        assert!(provision(home.path(), true, None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_is_refused_even_when_dangling() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("target.toml");
+        let config = home.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &config).unwrap();
+        assert!(provision(home.path(), true, None).is_err());
+        assert!(!target.exists());
+        std::fs::write(&target, "# preserve\n").unwrap();
+        assert!(provision(home.path(), true, None).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "# preserve\n");
+        assert!(std::fs::symlink_metadata(config).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn enforced_state_is_restored_after_config_deletion() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        provision(home.path(), false, None).unwrap();
+        // A surviving key must not short-circuit repair of a missing auth table.
+        let text = config_text(home.path());
+        let mut without_auth: toml::Table = text.parse().unwrap();
+        without_auth.remove("auth");
+        std::fs::write(home.path().join("config.toml"), toml::to_string(&without_auth).unwrap()).unwrap();
+        provision(home.path(), false, None).unwrap();
+        assert_eq!(config_text(home.path()).parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+        provision(home.path(), false, None).unwrap();
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("mfa.policy_restored_from_state"));
+        assert!(!audit.contains("ddc_prod_"));
+        let table: toml::Table = config_text(home.path()).parse().unwrap();
+        assert_eq!(table["auth"]["mfa_enforced"].as_bool(), Some(true));
+        crate::mfa::reload_policy(home.path());
+        assert!(crate::mfa::enforced(home.path(), false).unwrap());
+        let since: i64 = conn.query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(since, 123);
+    }
+
+    #[test]
+    fn unreadable_policy_refuses_non_personal_config_writes() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(provision(home.path(), false, None).is_err());
+        assert!(!home.path().join("config.toml").exists());
+        std::fs::write(home.path().join("users.db"), b"not a database").unwrap();
+        assert!(provision(home.path(), false, None).is_err());
+        assert!(!home.path().join("config.toml").exists());
+        std::fs::write(home.path().join("config.toml"), "# preserve\n").unwrap();
+        assert!(provision(home.path(), false, None).is_err());
+        assert_eq!(config_text(home.path()), "# preserve\n");
+        assert_eq!(crate::mfa::policy_status(home.path())["degraded"], true);
+    }
+
     /// Write a `config.toml` containing one `gateway-internal` entry whose
     /// `created_at` is `age_days` in the past (or a literal string when
     /// `created_at` is given verbatim).
@@ -417,10 +574,10 @@ mod tests {
     #[test]
     fn provisions_once_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let k1 = ensure_internal_mcp_key(dir.path()).unwrap();
+        let k1 = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         assert!(k1.starts_with("ddc_prod_"), "canonical format: {k1}");
         assert_eq!(k1.len(), "ddc_prod_".len() + 32);
-        let k2 = ensure_internal_mcp_key(dir.path()).unwrap();
+        let k2 = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         assert_eq!(k1, k2, "second boot must reuse the same key, not mint");
 
         let content = config_text(dir.path());
@@ -435,7 +592,7 @@ mod tests {
         write_internal_key(dir.path(), existing, &days_ago(10));
         let before = config_text(dir.path());
 
-        let key = ensure_internal_mcp_key(dir.path()).unwrap();
+        let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         assert_eq!(key, existing, "a 10-day-old key still authenticates");
         assert_eq!(
             config_text(dir.path()),
@@ -450,7 +607,7 @@ mod tests {
         let old = "ddc_prod_22222222222222222222222222222222";
         write_internal_key(dir.path(), old, &days_ago(26));
 
-        let key = ensure_internal_mcp_key(dir.path()).unwrap();
+        let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         assert_ne!(key, old, "26d > ROTATE_AFTER_DAYS ⇒ must mint a fresh key");
         assert!(key.starts_with("ddc_prod_"));
 
@@ -463,7 +620,7 @@ mod tests {
         );
 
         // The fresh key is now the newest valid one — next boot reuses it.
-        assert_eq!(ensure_internal_mcp_key(dir.path()).unwrap(), key);
+        assert_eq!(ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap(), key);
     }
 
     #[test]
@@ -472,7 +629,7 @@ mod tests {
         let old = "ddc_prod_33333333333333333333333333333333";
         write_internal_key(dir.path(), old, &days_ago(40));
 
-        let key = ensure_internal_mcp_key(dir.path()).unwrap();
+        let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         assert_ne!(key, old);
         let content = config_text(dir.path());
         assert!(content.contains(&key));
@@ -488,7 +645,7 @@ mod tests {
         let old = "ddc_prod_44444444444444444444444444444444";
         write_internal_key(dir.path(), old, "not-a-timestamp");
 
-        let key = ensure_internal_mcp_key(dir.path()).unwrap();
+        let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         assert_ne!(
             key, old,
             "an undatable key must never be trusted as current"
@@ -526,7 +683,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(ensure_internal_mcp_key(dir.path()).unwrap(), newer);
+        assert_eq!(ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap(), newer);
     }
 
     #[test]
@@ -546,7 +703,7 @@ scopes = ["memory:read"]
 "#,
         )
         .unwrap();
-        let key = ensure_internal_mcp_key(dir.path()).unwrap();
+        let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let content = config_text(dir.path());
         assert!(content.contains("default_agent = \"anna\""));
         assert!(content.contains("claude-desktop"));
@@ -578,7 +735,7 @@ scopes = ["memory:read"]
         )
         .unwrap();
 
-        let key = ensure_internal_mcp_key(dir.path()).unwrap();
+        let key = ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let content = config_text(dir.path());
         assert!(content.contains(foreign), "foreign key must survive");
         assert!(content.contains("claude-desktop"));
@@ -595,7 +752,7 @@ scopes = ["memory:read"]
         let dir = tempfile::tempdir().unwrap();
         let existing = "ddc_prod_cccccccccccccccccccccccccccccccc";
         write_internal_key(dir.path(), existing, &days_ago(-10));
-        assert_eq!(ensure_internal_mcp_key(dir.path()).unwrap(), existing);
+        assert_eq!(ensure_internal_mcp_key_for_gateway(dir.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap(), existing);
     }
 
     /// The contract with `duduclaw-cli/src/mcp_auth.rs`: that module refuses
