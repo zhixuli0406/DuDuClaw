@@ -166,6 +166,7 @@ impl LlamafileManager {
         );
 
         let mut cmd = tokio::process::Command::new(&file_path);
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
         cmd.args([
             "--server",
             "--host", &self.config.host,

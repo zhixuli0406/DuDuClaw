@@ -53,6 +53,9 @@
 
 ### Fixed
 
+- Docker 部署的 Codex 員工 shell 恢復可用，控制檔保護也在 Docker 生效。`docker-compose.yml` 與兩份 quickstart 改用窄版 seccomp（只比 Docker 預設多放行 bubblewrap 需要的呼叫）與 `apparmor=unconfined`，同時加上 `no-new-privileges` 與 `cap_drop: ALL`。既有部署要更新 compose 檔並重建容器，Watchtower 不會更新 compose。Ubuntu 24.04 另外要執行 `sudo scripts/docker-apparmor-setup.sh`，把印出的設定加進 `.env`。`distribution/nas/docker-compose.yml` 只使用映像，這一版沒有改。
+- `duduclaw doctor` 與儀表板新增「Codex 員工 shell」檢查：Linux 上實跑一次沙箱，說明起不來的原因與下一步。gateway 開機時也會記一筆警告。檢查只提供建議，不會降低沙箱，也不會阻止員工啟動。
+- `duduclaw doctor` 與儀表板新增「容器行程隔離」檢查：宿主機沒有開啟 Yama 時提出警告。Docker Desktop 的核心沒有 Yama，所以一定會看到這則警告；單一租戶可接受。
 - WebChat 重開未回覆對話時會顯示提示並限時重讀；等待超過一分鐘與其他對話失敗時會提示，登入狀態暫時無法確認時回傳明確錯誤，避免畫面一直沒有回應。
 - 主管與一般帳號新增側欄「設定 → 帳號」頁，可自行變更密碼、Email 與設定雙因素登入；先前這些功能只在 Admin 限定的系統設定頁，其他角色沒有入口。
 - 儀表板查詢授權狀態時不再依 OEM 方案清除總經銷品牌，統一顯示伺服器驗證的品牌；Self-Host Pro 等有效訂閱方案也會保留名稱與 Logo。
@@ -98,6 +101,9 @@
 
 ### Security
 
+- Docker 部署中，Codex 以外的子行程（Claude、Grok、其他 CLI、MCP server、管理者設定的指令）都會加上一層 seccomp，還原 Docker 預設的 namespace 限制，也不能使用 `ptrace`。容器本身為了讓 Codex 的 bubblewrap 啟動而放寬，這層限制由 gateway 在啟動子行程時補回。gateway 在容器內會設為不可傾印，同 UID 的行程無法讀取或寫入它的記憶體，也不再產生 core dump。Docker 內的員工因此不能用 `strace`、`gdb` 這類除錯工具。
+- 已知限制：Codex 的沙箱內仍可建立巢狀 user namespace，Codex 目前沒有提供關閉的選項。單一租戶部署可接受；多租戶部署請使用 VM 隔離。
+- **Breaking（Docker）：** `docker-compose.yml` 與 `docker-compose.quickstart.yml` 的 gateway 服務不再掛載 `/var/run/docker.sock`。官方映像沒有 Docker client，這個掛載用不到，只留下攻擊面。容器裡的 gateway 不支援任務沙箱；需要任務沙箱請裝在宿主機。Watchtower 仍保留自己的掛載。
 - 非管理員即使保留 `system-operator` 員工的舊綁定或團隊授權，也讀不到它的對話紀錄、任務、記憶、檔案、自有知識集合與匯出，也收不到即時更新、執行步驟或審批卡片；綁定紀錄保留。非管理員先前建立的交辦排程不再為這位員工建立任務或目標，觸發時自動暫停，恢復時會拒絕。外送審批卡片（CLI 內建工具與 MCP 工具都算）僅供管理員查看，主管不再看到遮罩後的卡片。通道與 Mini App 僅顯示純文字通知，不再顯示外送審批卡片、摘要或操作按鈕。
 - 使用 `system-operator` 預設組的 AI 員工只供管理員使用。非管理員不能新增綁定、聊天、建立任務或目標，也不能以自己的身分派工給它；既有綁定保留，但使用時拒絕，可呼叫清單也不會列出。一般 AI 員工由管理員授予的 Bash 與原生工具維持原有行為。
 - 已儲存但格式錯誤的委託人改為「身分不明」，不能使用機器操作工具；舊排程與自主工作沒有委託人時，仍可依原有規則執行。

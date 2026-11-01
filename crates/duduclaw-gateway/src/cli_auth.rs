@@ -77,7 +77,9 @@ fn file_mtime(p: &std::path::Path) -> Option<SystemTime> {
 /// Kiro settings are not a credential signal. Check the CLI's documented
 /// authenticated-user command, without allowing an API key to satisfy it.
 fn kiro_session_verified(program: &str) -> bool {
-    let child = std::process::Command::new(program)
+    let mut cmd = std::process::Command::new(program);
+    duduclaw_core::ns_guard::guard_command_std(&mut cmd);
+    let child = cmd
         .args(["whoami", "--format", "json"])
         .env_remove("KIRO_API_KEY")
         .stdin(std::process::Stdio::null())

@@ -109,6 +109,7 @@ RUN set -eu; \
 # grok exactly as their installers laid them out; only the Rust artifacts
 # and the pure-Python extensions land on top.
 FROM cli-tools AS runtime
+ENV DUDUCLAW_IN_CONTAINER=1
 
 # Create non-root user
 RUN groupadd -r duduclaw && useradd -r -g duduclaw -u 1000 duduclaw

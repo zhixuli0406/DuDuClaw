@@ -112,6 +112,7 @@ impl EvalRunner {
         let report_path = report_dir.path().join("eval-report.json");
 
         let mut cmd = tokio::process::Command::new(&self.binary);
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
         cmd.arg("eval")
             .arg(&suite_path)
             .arg("--replay")

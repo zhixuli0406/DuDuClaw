@@ -392,9 +392,11 @@ impl CommandStt {
         let (prog, args) = build_command_args(&self.command, audio_path)?;
         info!(prog = %prog, "STT (command): transcribing");
 
+        let mut cmd = tokio::process::Command::new(&prog);
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            tokio::process::Command::new(&prog).args(&args).output(),
+            cmd.args(&args).output(),
         )
         .await
         .map_err(|_| "STT command timeout (120s)".to_string())?;

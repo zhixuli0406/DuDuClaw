@@ -215,12 +215,7 @@ pub fn update_channel_label(provider_present: bool) -> &'static str {
 /// that is worse than not updating at all. Container deployments update by
 /// pulling a new image, so [`install_verified_binary`] refuses here.
 pub fn is_containerized() -> bool {
-    if let Ok(val) = std::env::var("DUDUCLAW_IN_CONTAINER") {
-        if matches!(val.as_str(), "1" | "true" | "yes") {
-            return true;
-        }
-    }
-    std::path::Path::new("/.dockerenv").exists()
+    duduclaw_core::ns_guard::is_containerized()
 }
 
 /// Result of applying an update.

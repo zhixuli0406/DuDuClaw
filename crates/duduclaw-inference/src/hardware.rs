@@ -83,7 +83,9 @@ async fn detect_apple_chip() -> String {
 }
 
 async fn detect_nvidia() -> Option<String> {
-    let output = tokio::process::Command::new("nvidia-smi")
+    let mut cmd = tokio::process::Command::new("nvidia-smi");
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    let output = cmd
         .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
         .output()
         .await
@@ -104,7 +106,9 @@ async fn detect_nvidia() -> Option<String> {
 
 async fn detect_amd() -> Option<String> {
     // Try rocm-smi first
-    let output = tokio::process::Command::new("rocm-smi")
+    let mut cmd = tokio::process::Command::new("rocm-smi");
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    let output = cmd
         .args(["--showproductname"])
         .output()
         .await;
@@ -277,7 +281,9 @@ async fn detect_vram(gpu_type: &GpuType, ram_total: u64, ram_available: u64) -> 
 }
 
 async fn detect_nvidia_vram() -> (u64, u64) {
-    let output = tokio::process::Command::new("nvidia-smi")
+    let mut cmd = tokio::process::Command::new("nvidia-smi");
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    let output = cmd
         .args([
             "--query-gpu=memory.total,memory.free",
             "--format=csv,noheader,nounits",

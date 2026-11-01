@@ -549,6 +549,7 @@ impl AttemptRunner for ClaudeAttemptRunner {
                     pids: 256, allow_unconfined: false, operator_identity: false })
                     .map_err(|_| AttemptInfraError::IsolationUnavailable)?
             };
+            duduclaw_core::ns_guard::guard_command_std(&mut cmd);
             let _lease_guard = acquire_attempt_slot(&self.home_dir, self.max_concurrency, budget, seed_deadline).await?;
             let cfg = duduclaw_core::dispatch_guard::DispatchGuardConfig::from_home(&self.home_dir);
             if let duduclaw_core::dispatch_guard::DispatchGuardDecision::Trip { reason, .. } =

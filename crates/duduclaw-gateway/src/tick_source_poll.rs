@@ -251,6 +251,7 @@ pub(crate) async fn poll_once(
             // by `timeout` rather than by a byte cap. Anything over
             // `MAX_TICK_PAYLOAD_BYTES` is then refused in `emit_payload`.
             let mut command = tokio::process::Command::new(program);
+            duduclaw_core::ns_guard::guard_command(&mut command);
             command.args(args).kill_on_drop(true);
             let output = tokio::time::timeout(timeout, command.output())
                 .await

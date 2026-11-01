@@ -193,6 +193,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Initialise the log broadcast channel (must happen before subscribers connect).
     let log_tx = crate::log::init_log_broadcaster();
     let tx = log_tx;
+    // Advisory only: a blocked shell still permits chat and MCP tools. Keep
+    // discovery and the real sandbox probe off the gateway's startup path.
+    #[cfg(target_os = "linux")]
+    tokio::spawn(async {
+        if let Some(binary) = duduclaw_core::which_codex() {
+            let result = crate::runtime::codex_sandbox::probe(&binary).await;
+            if result.blocked() {
+                warn!("{}", result.message(crate::updater::is_containerized()));
+                if let crate::runtime::codex_sandbox::SandboxProbe::Blocked { detail, .. } = &result {
+                    tracing::debug!(detail = %duduclaw_core::truncate_bytes(detail, 2048), "Codex employee shell sandbox probe blocked");
+                }
+            }
+        }
+    });
     // Boot reference for the /healthz scheduler-staleness probe.
     SERVER_START_UNIX.store(
         chrono::Utc::now().timestamp(),
@@ -14774,10 +14788,11 @@ async fn handle_files_preview(
         // profile fight over its lock and abort.
         let profile = cache_dir.join(".lo_profile");
         let profile_arg = format!("-env:UserInstallation=file://{}", profile.display());
+        let mut command = tokio::process::Command::new(&soffice);
+        duduclaw_core::ns_guard::guard_command(&mut command);
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            tokio::process::Command::new(&soffice)
-                .arg("--headless")
+            command.arg("--headless")
                 .arg(profile_arg)
                 .arg("--convert-to")
                 .arg("pdf")

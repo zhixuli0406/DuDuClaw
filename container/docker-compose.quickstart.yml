@@ -1,6 +1,13 @@
 # Quickstart — single service, no volumes, no TLS
 services:
   gateway:
+    # Bubblewrap needs namespaces and mounts; keep capabilities dropped.
+    security_opt:
+      - seccomp=./seccomp-bwrap.json
+      - apparmor=${DUDUCLAW_APPARMOR_PROFILE:-unconfined}
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     build:
       context: ..
       dockerfile: container/Dockerfile.server
