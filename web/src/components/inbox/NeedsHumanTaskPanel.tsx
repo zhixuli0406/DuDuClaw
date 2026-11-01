@@ -1,3 +1,4 @@
+import { PlanReview } from '@/components/task/PlanReview';
 import { useCallback, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -197,6 +198,7 @@ export function NeedsHumanTaskPanel({
                 </p>
               )
             )}
+            <PlanReview review={task.plan_review} />
           </div>
         </TabsPanel>
 

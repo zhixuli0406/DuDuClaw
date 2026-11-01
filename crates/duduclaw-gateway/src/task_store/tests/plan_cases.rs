@@ -396,3 +396,34 @@ async fn plan_pending_round_trips_and_defaults_to_none() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn plan_review_round_trips_separately_and_defaults_to_null() {
+    let (store, _dir) = temp_store();
+    let mut task = pending_task("reviewed");
+    crate::goal_plan::apply_plan_first_result(&mut task, Ok("- approved plan".into()));
+    let review = r#"{"version":1,"lenses":[{"lens":"restate","status":"not_run","text":""}]}"#;
+    task.plan_review = Some(review.into());
+    store.insert_task(&task).await.unwrap();
+    let saved = store.get_task("reviewed").await.unwrap().unwrap();
+    assert_eq!(saved.plan_review.as_deref(), Some(review));
+    assert_eq!(saved.plan_pending, task.plan_pending);
+    assert_eq!(saved.judge_feedback, task.judge_feedback);
+    assert_eq!(saved.status, "needs_human");
+    store.insert_task(&pending_task("plain")).await.unwrap();
+    assert!(store.get_task("plain").await.unwrap().unwrap().plan_review.is_none());
+}
+
+#[tokio::test]
+async fn plan_review_masks_credentials_without_breaking_json() {
+    let (store, _dir) = temp_store();
+    let mut task = pending_task("review-secret");
+    task.plan_review = Some(r#"{"version":1,"lenses":[{"lens":"ready","status":"completed","text":"password: fixture-secret"}]}"#.into());
+    store.insert_task(&task).await.unwrap();
+    let saved = store.get_task(&task.id).await.unwrap().unwrap();
+    let raw = saved.plan_review.unwrap();
+    assert!(!raw.contains("fixture-secret"));
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["lenses"][0]["status"], "completed");
+}

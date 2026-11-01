@@ -17,6 +17,11 @@ Set the boolean `employee_tasks` under `[dashboard]` in `config.toml` to show ta
 [dashboard]
 employee_tasks = false
 ```
+## Optional independent plan review
+
+Set `plan_review = "goldfish"` in `config.toml [goal_loop]` to review a successfully generated plan before it is shown for human approval. The default is `"off"`; a missing or malformed setting also means off. Three fresh calls run concurrently in the current task, each with a 45-second timeout, adding at most 45 seconds: restate the goal and identify unclear parts, remove unnecessary work, and check the decisions, permissions and data needed to execute. Each reviewer receives only the XML-escaped goal, acceptance criteria and plan as data, without conversation, memory, SOUL or employee identity. Each reply asks for Traditional Chinese, at most five bullet points, and is kept to 400 characters.
+
+These calls are system utility spending under `goal-plan-review`, use the existing system provider resolution without an employee directory, and are **not charged to the employee budget**. The versioned `plan_review` JSON is display-only: it never changes `plan_pending` or `judge_feedback`, never enters an execution or judging prompt, and never replaces human approval. Failed, empty or timed-out reviews show **Not run**, including when all three fail; the task still waits in `needs_human`. Both task detail and the Inbox show a collapsed **Independent review (without conversation context)** section. Channels show only the number of completed lenses and a dashboard pointer, never review text. This count is completed lenses, not individual findings.
 
 ## Account roles and visible AI staff
 
