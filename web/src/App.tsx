@@ -75,6 +75,7 @@ const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPag
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
 const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'LocalModelsPage');
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
+const InvitePage = lazyPage(() => import('./pages/InvitePage'), 'InvitePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
 const AccountPage = lazyPage(() => import('./pages/AccountPage'), 'AccountPage');
@@ -195,6 +196,7 @@ export function App() {
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route path="login" element={<LoginPage />} />
+          <Route path="invite" element={<InvitePage />} />
           {/* `/wizard` was a second, older first-run wizard that nothing linked
               to and `FirstRunGate` never sent anyone to (§2-13). Its component
               is gone; the path redirects so any stale bookmark lands on the one

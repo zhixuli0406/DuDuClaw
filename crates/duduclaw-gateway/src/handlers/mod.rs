@@ -135,6 +135,7 @@ mod dashboard_layout;
 mod widgets_custom;
 mod departments_rpc;
 mod users_rpc;
+mod user_invites_rpc;
 mod users_org;
 mod team_rpc;
 pub(crate) mod live_context;
@@ -531,6 +532,19 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return self.dispatch_org(method, params, ctx, conn).await;
+        }
+
+        // Invitations are gateway-owned authentication methods. An extension
+        // must never replace their Admin checks or inspect a returned link.
+        if let Some(role) = user_invites_rpc::minimum_role(method) {
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
+        }
+
+        if method == "users.create" && params.get("invite").and_then(Value::as_bool) == Some(true) {
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // ── Plugin extension dispatch ──────

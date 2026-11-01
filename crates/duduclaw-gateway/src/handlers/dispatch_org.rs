@@ -157,6 +157,10 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_users_list()).await
             }
+            "users.invite" | "users.invite_status" => {
+                require_admin!();
+                boxed_frame(|| self.handle_user_invites(method, params, ctx)).await
+            }
             "users.create" => {
                 require_admin!();
                 boxed_frame(|| self.handle_users_create(params, ctx)).await

@@ -2385,6 +2385,8 @@ export interface UserAgentBinding {
 }
 
 export interface UserDetail extends UserInfo {
+  /** Server-computed eligibility; the invite RPC rechecks before issuing. */
+  invite_eligible?: boolean;
   bindings: UserAgentBinding[];
 }
 
@@ -5827,6 +5829,13 @@ export interface GoogleIdentitySetInput {
   confirm_shared_access?: boolean;
 }
 
+export interface UserInviteResult {
+  sent: boolean;
+  reason?: string;
+  link?: string;
+}
+export type UserInviteState = 'none' | 'pending' | 'expired' | 'used';
+
 export interface PersonalGoogleStatus {
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;
@@ -8754,6 +8763,10 @@ export const api = {
       ) as Promise<MigrateResult>,
   },
   users: {
+    invite: (userId: string, publicUrl: string) =>
+      client.call('users.invite', { user_id: userId, public_url: publicUrl }) as Promise<UserInviteResult>,
+    inviteStatus: () =>
+      client.call('users.invite_status') as Promise<{ statuses: Record<string, UserInviteState> }>,
     list: () =>
       client.call('users.list') as Promise<{ users: UserDetail[] }>,
     /** Active users strictly below the caller's rank (manager+). Minimal
@@ -8765,13 +8778,15 @@ export const api = {
     create: (params: {
       email: string;
       display_name: string;
-      password: string;
+      password?: string;
+      invite?: boolean;
+      public_url?: string;
       role?: string;
       department?: string;
       /** Direct manager; omit for none. */
       manager_user_id?: string;
     }) =>
-      client.call('users.create', params) as Promise<{ user: UserInfo }>,
+      client.call('users.create', params) as Promise<{ user: UserInfo; invite?: UserInviteResult }>,
     /** `department: ''` clears the user's department; omit to leave unchanged.
      *  `manager_user_id: null` (or `''`) clears the direct manager; omit to
      *  leave it unchanged. The gateway validates the reporting line and

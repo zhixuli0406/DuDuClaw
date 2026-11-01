@@ -1,4 +1,6 @@
 mod data_exports_http;
+#[path = "server_invites.rs"]
+mod server_invites;
 #[cfg(test)]
 mod data_exports_http_tests;
 #[cfg(test)]
@@ -2417,6 +2419,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // ── REST API endpoints for authentication ────────────────
     let auth_router = Router::new()
         .route("/api/login", post(handle_login))
+        .route("/api/invite/check", post(server_invites::check_invite))
+        .route("/api/invite/redeem", post(server_invites::post_invite))
         .route("/api/otp/request", post(handle_otp_request))
         .route("/api/otp/verify", post(handle_otp_verify))
         .route("/api/mfa/verify", post(server_mfa::verify))

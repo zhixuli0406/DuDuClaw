@@ -42,6 +42,9 @@ recipient_guard = "shadow" # off | shadow | ask
 # Scheduled fires have no source conversation and recheck this list.
 
 [gateway]
+# Public invitation link base URL. Required unless an Admin supplies public_url.
+# Never inferred from request Host or Origin headers.
+# public_url = "https://ai.example.com"
 bind = "127.0.0.1"
 port = 18889
 # auto_update = true  # Pro default: true (auto-download + install + restart)

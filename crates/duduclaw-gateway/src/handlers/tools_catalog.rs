@@ -9,6 +9,8 @@ impl MethodHandler {
             "",
             json!({
                 "tools": [
+                    { "name": "users.invite", "description": "Issue and deliver a one-time teammate invitation (Admin only)" },
+                    { "name": "users.invite_status", "description": "List per-user invitation states without links or tokens (Admin only)" },
                     { "name": "agents.list", "description": "List all registered agents" },
                     { "name": "agents.status", "description": "Get agent status" },
                     { "name": "presets.list", "description": "WP-6F: list agent presets (\"職務組合\") under ~/.duduclaw/presets/" },
