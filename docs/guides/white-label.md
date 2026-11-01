@@ -12,7 +12,7 @@ A failed refresh keeps the current verified brand while the license remains vali
 
 ## Where the brand appears
 
-The dashboard uses the name and logo, including product mascot positions, login and welcome screens, page title, favicon and LINE QR posters. Channel footers, OTP and OAuth pages use the supplied name. Product copy supports English, Traditional Chinese and Japanese. Legal notices and privacy links keep their original text; CLI and logs keep their existing name.
+The dashboard uses the name and logo, including product mascot positions, login and welcome screens, page title, favicon and LINE QR posters. OTP and OAuth pages use the supplied name, and so do channel footers on the tiers that show one (opensource and hobby). Product copy supports English, Traditional Chinese and Japanese. Legal notices and privacy links keep their original text; CLI and logs keep their existing name.
 
 When branded, About shows the distributor logo and name first, the [distributor notice](distributor-notice.md) next, then a fixed **Software development** block with vendor, website, version and license type. **嘟嘟數位科技有限公司 / Dudu Technology Ltd.** and the vendor website are compile-time constants and cannot be changed or hidden by the distributor. Branding covers only the product name and logo; it does not provide a subtitle, accent colour, custom company fields or custom About HTML.
 

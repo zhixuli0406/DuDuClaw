@@ -271,6 +271,31 @@ pub fn to_line_flex_message(text: &str, agent_name: Option<&str>) -> Value {
     to_line_flex_message_styled(text, agent_name, false)
 }
 
+fn footer_label(product: &str, agent: Option<&str>, attribution: bool) -> Option<String> {
+    match (attribution, agent.filter(|name| !name.is_empty())) {
+        (true, Some(agent)) => Some(format!("{product} \u{00b7} {agent}")),
+        (true, None) => Some(product.to_string()),
+        (false, Some(agent)) => Some(agent.to_string()),
+        (false, None) => None,
+    }
+}
+
+fn line_flex_footer(label: Option<&str>, error: bool) -> Option<Value> {
+    label.map(|text| {
+        json!({
+            "type": "box",
+            "layout": "vertical",
+            "contents": [{
+                "type": "text",
+                "text": text,
+                "size": "xxs",
+                "color": if error { LINE_ERROR_ACCENT } else { "#999999" },
+                "align": "end"
+            }]
+        })
+    })
+}
+
 /// Dark code-panel colors for LINE Flex code blocks (LINE has no monospace
 /// font control, so a dark panel visually separates code from prose).
 const LINE_CODE_BG: &str = "#1E293B";
@@ -306,9 +331,8 @@ fn split_code_segments(text: &str) -> Vec<(bool, String)> {
 /// a red-accented bubble, and fenced code blocks render as dark code panels.
 pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: bool) -> Value {
     let product = crate::distributor_brand::product_name();
-    let footer_text = agent_name
-        .map(|n| format!("{product} \u{00b7} {n}"))
-        .unwrap_or_else(|| product.clone());
+    let attribution = crate::channel_reply::product_footer_required();
+    let footer_text = footer_label(&product, agent_name, attribution);
 
     // Short prose replies → plain text (errors always get the styled bubble).
     if !error && text.len() < 200 && !text.contains("```") {
@@ -379,19 +403,11 @@ pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: 
             "type": "box",
             "layout": "vertical",
             "contents": body_contents
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [{
-                "type": "text",
-                "text": footer_text,
-                "size": "xxs",
-                "color": if error { LINE_ERROR_ACCENT } else { "#999999" },
-                "align": "end"
-            }]
         }
     });
+    if let Some(footer) = line_flex_footer(footer_text.as_deref(), error) {
+        bubble["footer"] = footer;
+    }
     if error {
         bubble["styles"] = json!({ "body": { "backgroundColor": "#FFF5F5" } });
     }
@@ -1548,6 +1564,34 @@ mod tests {
     }
 
     // ── LINE Flex styling ──────────────────────────────────────────
+
+    #[test]
+    fn footer_label_covers_attribution_and_agent_combinations() {
+        assert_eq!(
+            footer_label("Product", Some("Agent"), true).as_deref(),
+            Some("Product · Agent")
+        );
+        assert_eq!(footer_label("Product", None, true).as_deref(), Some("Product"));
+        assert_eq!(
+            footer_label("Product", Some("Agent"), false).as_deref(),
+            Some("Agent")
+        );
+        assert_eq!(footer_label("Product", None, false), None);
+    }
+
+    #[test]
+    fn line_flex_footer_without_label_has_no_empty_text_or_footer_box() {
+        assert!(line_flex_footer(None, false).is_none());
+
+        let encoded = serde_json::to_string(&line_flex_footer(None, false)).unwrap();
+        assert!(!encoded.contains("\"text\":\"\""));
+    }
+
+    #[test]
+    fn line_flex_footer_with_label_keeps_footer_text() {
+        let footer = line_flex_footer(Some("Product · Agent"), false).unwrap();
+        assert_eq!(footer["contents"][0]["text"], "Product · Agent");
+    }
 
     #[test]
     fn test_split_code_segments() {
