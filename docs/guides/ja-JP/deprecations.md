@@ -2,7 +2,7 @@
 
 ## 従来の従業員メモリファイル
 
-`MEMORY.md` は legacy として扱います。対話型 agent runner のみが引き続き注入し、チャネル、最小モード、タスクサンドボックスでは読み込みません。Agent File のエクスポートにも含めません。管理者が維持する利用者の紹介にはネイティブの `USER.md` を、学習した事実には既存のメモリツールを使用してください。既存ファイルの移動や削除は行わず、削除予定のバージョンもありません。
+`MEMORY.md` は legacy として扱います。対話型 agent runner と `claude_runner` の経路が引き続き注入し、チャネル、最小モード、タスクサンドボックスでは読み込みません。Agent File のエクスポートにも含めません。管理者が維持する利用者の紹介にはネイティブの `USER.md` を、学習した事実には既存のメモリツールを使用してください。既存ファイルの移動や削除は行わず、削除予定のバージョンもありません。
 
 
 このページは、名前が変わった、または統合された公開名称について、すでに削除されたもの
@@ -222,6 +222,6 @@ OS ユーザーの CLI 設定に追加された許可ルールは自動削除し
 `publish`、`export`、`convert-teams`、`hooks`、`remove` は `duduclaw expert` の下に
 残ります。
 
-## MFA (Unreleased)
+## MFA
 
 MFAフェーズ1では `/api/login` と `/api/otp/verify` に条件付き応答を追加します。未登録かつ非強制の場合は従来の `access_token`、`refresh_token`、`user` を維持します。登録済みなら `mfa_required`、`challenge_id` のみ、強制中の未登録なら `mfa_enrollment_required`、`enrollment_token` のみです。クライアントは `/api/mfa/verify` または `/api/mfa/enroll/*` を完了してからログイン成功と判断してください。既存端点は削除せず、Dashboardは次フェーズで対応します。
