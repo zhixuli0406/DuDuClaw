@@ -81,7 +81,20 @@ pub(crate) fn gated_servers(
 /// Per-spawn identity for host-owned proxies/bridges only. Never persist
 /// these pairs or merge them into an external server's declared environment.
 pub(crate) fn host_proxy_env(home: &Path, agent: &str) -> Vec<(String, String)> {
+    host_proxy_env_with_namespace_guard(home, agent, duduclaw_core::ns_guard::is_active())
+}
+
+pub(super) fn host_proxy_env_with_namespace_guard(
+    home: &Path,
+    agent: &str,
+    namespace_guard_active: bool,
+) -> Vec<(String, String)> {
     let mut env = duduclaw_core::agent_identity_env_vars(home, agent);
+    // Host-owned marker must survive the external runtime's env scrub, so
+    // proxy/remote-bridge processes install TSYNC in marker-only containers.
+    if namespace_guard_active {
+        env.push(("DUDUCLAW_IN_CONTAINER".into(), "1".into()));
+    }
     env.extend(crate::memory_provenance::turn_source_env_pairs());
     env.extend(crate::runtime::round_task_env());
     env

@@ -1000,6 +1000,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let _ = sink.send(Message::Close(None)).await;
                                 break;
                             }
+                            if validity == crate::handlers::live_context::SocketValidity::Unavailable {
+                                if let Ok(ChatMessage::UserMessage { msg_id, conv, .. }) = serde_json::from_str::<ChatMessage>(&text) {
+                                    let _ = sink.send(turns::IdentityUnavailable::before_routing(
+                                        msg_id.as_deref(), conv.as_deref(),
+                                    )).await;
+                                }
+                            }
                             continue;
                         }
                         let chat_msg: ChatMessage = match serde_json::from_str(&text) {
@@ -1372,6 +1379,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let validity = state.credential_validity(credential.as_ref(), true).await;
                                 if !recovery.observe(validity, false) {
                                     if recovery.closed() { break; }
+                                    turn_sink.identity_unavailable(validity, true).await;
                                     continue;
                                 }
                                 match Box::pin(state.turns.admit_persistent(
@@ -1415,7 +1423,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         let value = serde_json::json!({"type":"error", "code":code,
                                             "message":"Turn admission limit reached or duplicate message id",
                                             "request_id":msg_id});
-                                        let _ = out_tx.send(turns::Outbound { message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
+                                        let _ = out_tx.send(turns::Outbound { identity_notice: None, message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
                                     }
                                 }
                             }
@@ -1432,7 +1440,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     serde_json::json!({"type":"error", "code":"turn_not_found",
                                         "message":"Pending conversation not found or ambiguous", "request_id":request_id})
                                 };
-                                let frame = turns::Outbound {
+                                let frame = turns::Outbound { identity_notice: None,
                                     message: Message::Text(value.to_string().into()),
                                     ack: None, deadline: None,
                                 };

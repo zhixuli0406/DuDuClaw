@@ -1,4 +1,8 @@
 {
+  "chat.unanswered": "このメッセージにはまだ返信がありません。AI スタッフが処理中の可能性があります。返信が届くと自動で表示されます。",
+  "chat.unansweredExpired": "返信が届いていません。再送するか、管理者にゲートウェイのログ確認を依頼してください。",
+  "chat.stalled": "AI スタッフからまだ応答がありません。{minutes} 分待っています。",
+  "chat.otherConversationFailed": "別の会話で返信に失敗しました。その会話に戻って確認してください。",
   "nav.account": "アカウント",
   "nav.account.desc": "自分のパスワード、メールアドレス、ログイン認証を管理します。",
   "liveEvents.stale": "データが古い可能性があります",
@@ -4705,6 +4709,8 @@
   "settings.doctor.check.config_file": "設定ファイル",
   "settings.doctor.check.agents": "AI 社員",
   "settings.doctor.check.api_key": "API キー",
+  "settings.doctor.check.container_process_isolation": "コンテナのプロセス分離",
+  "settings.doctor.check.codex_employee_shell": "Codex 従業員のシェル",
   "settings.doctor.check.container_runtime": "コンテナ環境",
   "settings.doctor.check.mcp_server": "MCP ツールサービス",
   "settings.doctor.check.grok_cli": "Grok CLI",

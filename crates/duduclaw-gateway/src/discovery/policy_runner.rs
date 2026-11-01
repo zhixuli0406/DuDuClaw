@@ -503,7 +503,10 @@ impl PythonPolicyRuntime {
         let spec = ConfinementSpec { readonly, cpu_secs: 30, pids: 16,
             memory_bytes: 2 * 1024 * 1024 * 1024, ..Default::default() };
         match confine_command(&mut command, &spec) {
-            Ok(IsolationBackend::Native | IsolationBackend::Container) => Ok(command.into()),
+            Ok(IsolationBackend::Native | IsolationBackend::Container) => {
+                duduclaw_core::ns_guard::guard_command_std(&mut command);
+                Ok(command.into())
+            }
             _ => Err(PolicyDegraded::NoIsolation),
         }
     }

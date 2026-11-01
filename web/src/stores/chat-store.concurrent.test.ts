@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { shouldRenderChatFrame, useChatStore } from './chat-store';
+import { lookupMessage, toast } from '@/lib/toast';
 
 class FakeSocket {
   static OPEN = 1;
@@ -38,6 +39,7 @@ beforeEach(() => {
 afterEach(() => {
   useChatStore.getState().disconnect();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe('concurrent WebChat frame attribution', () => {
@@ -135,5 +137,101 @@ describe('concurrent WebChat frame attribution', () => {
     expect(shouldRenderChatFrame({ type: 'error', session_id: 'webchat:past' }, { ...current, sessionId: 'webchat:past', resumedExplicitly: true })).toBe(true);
     // An @ call can change the routed session while keeping its client ids.
     expect(shouldRenderChatFrame({ type: 'assistant_done', session_id: 'webchat:rerouted', conv: 'c1', msg_id: 'm1' }, current)).toBe(true);
+  });
+});
+
+
+describe('silent failure notifications', () => {
+  it('toasts another conversation failure without exposing text or changing the active turn', () => {
+    const first = send('first');
+    useChatStore.getState().reset();
+    send('second');
+    const show = vi.spyOn(toast, 'info').mockImplementation(() => {});
+    const before = useChatStore.getState();
+    deliver({ type: 'error', code: 'internal_error', message: 'PRIVATE SERVER TEXT',
+      conv: first.conv, msg_id: first.msg_id, session_id: 'webchat:first' });
+    expect(show).toHaveBeenCalledExactlyOnceWith(lookupMessage('chat.otherConversationFailed'));
+    expect(useChatStore.getState()).toBe(before);
+  });
+
+  it('also notifies a different session when conv is absent', () => {
+    send('current');
+    const show = vi.spyOn(toast, 'info').mockImplementation(() => {});
+    const before = useChatStore.getState();
+    deliver({ type: 'error', code: 'identity_unavailable', message: 'PRIVATE',
+      session_id: 'webchat:other', msg_id: 'other' });
+    expect(show).toHaveBeenCalledOnce();
+    expect(useChatStore.getState()).toBe(before);
+  });
+
+  it('preserves control, cancellation and uncorrelated admission exclusions', () => {
+    const turn = send('current');
+    const show = vi.spyOn(toast, 'info').mockImplementation(() => {});
+    for (const code of ['turn_not_found', 'duplicate_message', 'cancelled']) {
+      deliver({ type: 'error', code, conv: 'other', msg_id: 'other', message: 'PRIVATE' });
+    }
+    deliver({ type: 'error', code: 'turn_limit', conv: 'other', message: 'PRIVATE' });
+    deliver({ type: 'error', code: 'identity_unavailable', conv: 'other', message: 'PRIVATE' });
+    expect(show).not.toHaveBeenCalled();
+    expect(useChatStore.getState().messages.map(m => m.content)).toEqual(['current']);
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(useChatStore.getState().activeMessageId).toBe(turn.msg_id);
+  });
+
+  it('does not mislabel the reopened session or an older message in the current view', () => {
+    const turn = send('current');
+    const show = vi.spyOn(toast, 'info').mockImplementation(() => {});
+    deliver({ type: 'error', conv: turn.conv, msg_id: 'older', message: 'PRIVATE' });
+    useChatStore.getState().resumeSession('webchat:past', []);
+    deliver({ type: 'error', conv: 'old-view', msg_id: 'old', session_id: 'webchat:past', message: 'PRIVATE' });
+    expect(show).not.toHaveBeenCalled();
+    expect(useChatStore.getState().messages).toEqual([]);
+  });
+
+  it.each(['msg_id', 'request_id'])('identity_unavailable ends only the matching %s spinner', field => {
+    const turn = send('current');
+    const show = vi.spyOn(toast, 'info').mockImplementation(() => {});
+    deliver({ type: 'error', code: 'identity_unavailable', conv: turn.conv, [field]: 'other', message: 'wrong' });
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    deliver({ type: 'error', code: 'identity_unavailable', conv: turn.conv, [field]: turn.msg_id, message: 'fixed refusal' });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().activeMessageId).toBeNull();
+    expect(useChatStore.getState().thinking).toBeNull();
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('fixed refusal');
+    expect(show).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('identity outage before session ownership checks', () => {
+  const message = '暫時無法確認登入狀態，這則訊息沒有送出，請稍後再試。';
+
+  it.each([true, false])('ends the matching spinner without session_id (conv present: %s)', withConv => {
+    const turn = send('current');
+    deliver({ type: 'error', code: 'identity_unavailable', message,
+      msg_id: turn.msg_id, request_id: turn.msg_id,
+      ...(withConv ? { conv: turn.conv } : {}) });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().activeMessageId).toBeNull();
+    expect(useChatStore.getState().thinking).toBeNull();
+    expect(useChatStore.getState().phase).toBe('error');
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe(message);
+  });
+
+  it('leaves another in-flight turn untouched for missing or different message ids', () => {
+    const previous = send('previous');
+    deliver({ type: 'assistant_done', content: 'reply', tokens_used: 1,
+      conv: previous.conv, msg_id: previous.msg_id });
+    const current = send('current');
+    const before = useChatStore.getState();
+    for (const correlation of [{}, { msg_id: previous.msg_id, request_id: previous.msg_id }]) {
+      for (const conversation of [{}, { conv: current.conv }]) {
+        deliver({ type: 'error', code: 'identity_unavailable', message,
+          ...conversation, ...correlation });
+        expect(useChatStore.getState()).toBe(before);
+        expect(useChatStore.getState().isStreaming).toBe(true);
+        expect(useChatStore.getState().activeMessageId).toBe(current.msg_id);
+      }
+    }
   });
 });

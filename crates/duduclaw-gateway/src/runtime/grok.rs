@@ -690,6 +690,7 @@ impl AgentRuntime for GrokRuntime {
         // Scoped to the working root so an overridden cwd is the directory that
         // gets write access — same rule as `runtime/codex.rs`.
         super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "grok")?;
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
 
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);

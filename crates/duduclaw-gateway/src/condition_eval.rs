@@ -313,6 +313,7 @@ async fn run_sandboxed(
         Err(e) => return Err(format!("sandbox confinement failed: {e}")),
     }
 
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
     let admission = duduclaw_core::autonomy_handoff::admit().await?;
     let child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
     admission.handed_off();

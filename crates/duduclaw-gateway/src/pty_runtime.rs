@@ -110,6 +110,14 @@ pub async fn invoke_oneshot(
     deadline: Duration,
     clear_env: bool,
 ) -> Result<OneshotOutput, PtyError> {
+    let program = program.into();
+    let (program, args) = if duduclaw_core::ns_guard::is_active() {
+        std::env::current_exe()
+            .and_then(|exe| namespace_guard_invocation(program.clone(), args, exe))
+            .map_err(|source| PtyError::SpawnChild { program, source })?
+    } else {
+        (program, args)
+    };
     let mut inv = OneshotInvocation::new(program)
         .args(args)
         .envs(env_vars)
@@ -121,9 +129,46 @@ pub async fn invoke_oneshot(
     oneshot_pty_invoke(inv).await
 }
 
+/// Pure argv rewrite shared by PTY transports. Reject non-UTF-8 executable
+/// paths because OneshotInvocation accepts strings; never run a lossy path.
+pub(crate) fn namespace_guard_invocation(
+    program: String,
+    args: Vec<String>,
+    current_exe: PathBuf,
+) -> std::io::Result<(String, Vec<String>)> {
+    let executable = current_exe.into_os_string().into_string().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "namespace guard executable path is not UTF-8; refusing unfiltered execution")
+    })?;
+    let mut wrapped = vec!["ns-guard-exec".into(), "--".into(), program];
+    wrapped.extend(args);
+    Ok((executable, wrapped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_guard_rewrites_pty_argv_without_reinterpreting_arguments() {
+        let args = vec!["--help".into(), "space and 'quotes'".into(), "".into()];
+        let (program, rewritten) = namespace_guard_invocation(
+            "original cli".into(), args.clone(), PathBuf::from("/path with spaces/duduclaw"),
+        ).unwrap();
+        assert_eq!(program, "/path with spaces/duduclaw");
+        assert_eq!(&rewritten[..3], &["ns-guard-exec", "--", "original cli"]);
+        assert_eq!(&rewritten[3..], args.as_slice());
+        assert_eq!(namespace_guard_invocation("echo".into(), vec![], PathBuf::from("/cli"))
+            .unwrap().1, vec!["ns-guard-exec", "--", "echo"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_guard_rejects_non_utf8_executable() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+        assert!(namespace_guard_invocation("echo".into(), vec![], path).is_err());
+    }
 
     // Spawns a real PTY and reads child echo — unreliable on headless Windows CI
     // (ConPTY). Covered on Unix.

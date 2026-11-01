@@ -1944,6 +1944,12 @@ enum KnowledgeCommands {
 
 #[derive(Subcommand)]
 enum ToolingCommands {
+    /// Internal PTY trampoline: install the namespace filter before exec.
+    #[command(hide = true, name = "ns-guard-exec")]
+    NsGuardExec {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1.., required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Operator-only experimental exploration runner.
     #[command(hide = true)]
     Discover {
@@ -3070,6 +3076,38 @@ mod os_drive_help_never_executes_tests {
         );
     }
 
+    #[test]
+    fn ns_guard_exec_preserves_trailing_command_arguments() {
+        run_on_big_stack(|| {
+            let cli = Cli::try_parse_from([
+                "duduclaw", "ns-guard-exec", "--", "some cli", "--help", "-x", "", "two words",
+            ]).unwrap();
+            match cli.command {
+                Commands::Tooling(ToolingCommands::NsGuardExec { command }) => {
+                    let expected: Vec<std::ffi::OsString> = ["some cli", "--help", "-x", "", "two words"]
+                        .into_iter().map(Into::into).collect();
+                    assert_eq!(command, expected);
+                }
+                _ => panic!("expected namespace wrapper"),
+            }
+            assert!(Cli::try_parse_from(["duduclaw", "ns-guard-exec", "--"]).is_err());
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                let raw = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+                let argv: Vec<std::ffi::OsString> = vec!["duduclaw".into(), "ns-guard-exec".into(),
+                    "--".into(), raw.clone(), "--flag".into()];
+                let cli = Cli::try_parse_from(argv).unwrap();
+                match cli.command {
+                    Commands::Tooling(ToolingCommands::NsGuardExec { command }) => {
+                        assert_eq!(command, vec![raw, "--flag".into()]);
+                    }
+                    _ => panic!("expected namespace wrapper"),
+                }
+            }
+        });
+    }
+
     // NOTE: every test in this module reaches `Cli::try_parse_from` (directly
     // or via `assert_help_short_circuits`), so every test body is routed
     // through `run_on_big_stack` — see its definition for why.
@@ -4003,6 +4041,36 @@ pub fn entry_point_blocking() {
 
 pub async fn entry_point() {
     let cli = Cli::parse();
+    if let Commands::Tooling(ToolingCommands::NsGuardExec { command }) = &cli.command {
+        // Must run before logging, banners or any other stdout initialization.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            if let Err(error) = duduclaw_core::ns_guard::install_current_process_forced() {
+                eprintln!("Error: namespace guard installation failed; refusing execution: {error}");
+                std::process::exit(1);
+            }
+            let error = std::process::Command::new(&command[0]).args(&command[1..]).exec();
+            eprintln!("Error: namespace guard exec failed for {:?}: {error}", command[0]);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            eprintln!("Error: ns-guard-exec requires Unix; refusing execution");
+        }
+        std::process::exit(1);
+    }
+    if matches!(&cli.command, Commands::Tooling(
+        ToolingCommands::McpServer | ToolingCommands::McpProxy { .. }
+        | ToolingCommands::McpRemoteBridge { .. }
+    )) {
+        // Codex starts MCP outside bubblewrap. TSYNC covers the already-running
+        // Tokio workers as well as this thread; every later child inherits it.
+        if let Err(error) = duduclaw_core::ns_guard::install_current_process() {
+            eprintln!("Error: MCP container namespace guard failed; refusing to start: {error}");
+            std::process::exit(1);
+        }
+    }
     // The extraction child: no logger, no TLS, no home directory — it runs
     // with an empty environment under an OS sandbox that denies writes.
     if let Commands::Tooling(ToolingCommands::KnowledgeExtract { format, input, max_chars }) = &cli.command {
@@ -5482,6 +5550,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Ops(OpsCommands::Redteam { agent, out }) => cmd_redteam(agent, out).await,
         Commands::Ops(OpsCommands::Security) => cmd_security_posture().await,
         Commands::Ops(OpsCommands::Import { file, force }) => cmd_import_data(file, force).await,
+        Commands::Tooling(ToolingCommands::NsGuardExec { .. }) => {
+            unreachable!("namespace guard exec is dispatched before initialization")
+        }
         Commands::Tooling(ToolingCommands::McpServer) => cmd_mcp_server().await,
         Commands::Tooling(ToolingCommands::KnowledgeExtract { format, input, max_chars }) => {
             knowledge_extract_cmd::run(&format, &input, max_chars)
@@ -8738,6 +8809,10 @@ mod admin_auth_token_tests {
 }
 
 async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
+    if let Err(error) = duduclaw_core::ns_guard::harden_gateway_process() {
+        eprintln!("ERROR: 無法啟用容器 gateway 行程保護，拒絕啟動：{error}");
+        std::process::exit(1);
+    }
     let home = duduclaw_home();
 
     // Resolve bind/port with priority: env var > config.toml [gateway] >
@@ -10339,6 +10414,21 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4b-3: durable computer-use workspaces (P2-C).
     checks.push(computer_workspaces_check(&home).await);
     checks.push(computer_profiles_check(&home));
+
+    let (status, message) = duduclaw_gateway::handlers::codex_sandbox_status_and_message().await;
+    checks.push((
+        "Codex 員工 shell".into(),
+        if status == "warn" { CheckStatus::Warn } else { CheckStatus::Pass },
+        message.into(),
+    ));
+
+    if let Some((status, message)) = duduclaw_gateway::handlers::container_process_isolation_status_and_message(false) {
+        checks.push((
+            "容器行程隔離".into(),
+            if status == "warn" { CheckStatus::Warn } else { CheckStatus::Pass },
+            message.into(),
+        ));
+    }
 
     // Check 4c: agents on a deprecated runtime (R1, 2026-10).
     checks.push(deprecated_runtime_check(&home).await);

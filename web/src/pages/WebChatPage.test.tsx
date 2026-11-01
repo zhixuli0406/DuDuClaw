@@ -3,7 +3,8 @@ import { screen, fireEvent, act, waitFor } from '@testing-library/react';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { WebChatPage } from './WebChatPage';
-import { useChatStore } from '@/stores/chat-store';
+import { useChatStore, historyToMessages } from '@/stores/chat-store';
+import { useConversationsStore } from '@/stores/conversations-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { api } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -296,4 +297,31 @@ describe('WebChatPage', () => {
     renderWithProviders(<WebChatPage />);
     expect(screen.getByText(/財務小幫手/)).toBeInTheDocument();
   });
+});
+
+
+it('preserves the composer draft during history refresh and window focus', async () => {
+  const user = { id: 1, role: 'user', content: 'waiting question', timestamp: '2026-11-01T00:00:00Z', tokens: 0 };
+  const reply = { id: 2, role: 'assistant', content: 'arrived reply', timestamp: '2026-11-01T00:01:00Z', tokens: 2 };
+  useConversationsStore.setState({ viewOnly: false });
+  useChatStore.getState().resumeSession('webchat:past', historyToMessages([user]));
+  const load = vi.spyOn(api.chatSessions, 'history').mockResolvedValue({
+    session_id: 'webchat:past', agent_id: 'dudu', channel: 'webchat', privacy_mode: 'own', messages: [user, reply],
+  });
+  const resumeView = vi.spyOn(useConversationsStore.getState(), 'refreshView');
+  const view = renderWithProviders(<WebChatPage />);
+  try {
+    const input = screen.getByPlaceholderText(/message/i);
+    fireEvent.change(input, { target: { value: 'unsent draft' } });
+    fireEvent(window, new Event('focus'));
+    expect(resumeView).not.toHaveBeenCalled();
+    await act(async () => { await useConversationsStore.getState().refreshUnanswered(() => true); });
+    expect(screen.getByText('arrived reply')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('unsent draft')).toBe(input);
+  } finally {
+    view.unmount();
+    load.mockRestore();
+    resumeView.mockRestore();
+    useChatStore.getState().reset();
+  }
 });
