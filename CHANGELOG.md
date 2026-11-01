@@ -53,6 +53,7 @@
 
 ### Fixed
 
+- 全新 Docker 安裝現在聽 compose 公開的 18789：`duduclaw onboard --yes` 先前忽略容器的初始 port 設定，一律寫入 18889，導致儀表板連不上、健康檢查一直失敗。已經用 18889 建好的資料 volume 不會自動改寫，請在 `config.toml` 的 `[gateway]` 把 `port` 改成 18789 後重啟容器。
 - Docker 部署的 Codex 員工 shell 恢復可用，控制檔保護也在 Docker 生效。`docker-compose.yml` 與兩份 quickstart 改用窄版 seccomp（只比 Docker 預設多放行 bubblewrap 需要的呼叫）與 `apparmor=unconfined`，同時加上 `no-new-privileges` 與 `cap_drop: ALL`。既有部署要更新 compose 檔並重建容器，Watchtower 不會更新 compose。Ubuntu 24.04 另外要執行 `sudo scripts/docker-apparmor-setup.sh`，把印出的設定加進 `.env`。`distribution/nas/docker-compose.yml` 只使用映像，這一版沒有改。
 - `duduclaw doctor` 與儀表板新增「Codex 員工 shell」檢查：Linux 上實跑一次沙箱，說明起不來的原因與下一步。gateway 開機時也會記一筆警告。檢查只提供建議，不會降低沙箱，也不會阻止員工啟動。
 - `duduclaw doctor` 與儀表板新增「容器行程隔離」檢查：宿主機沒有開啟 Yama 時提出警告。Docker Desktop 的核心沒有 Yama，所以一定會看到這則警告；單一租戶可接受。
