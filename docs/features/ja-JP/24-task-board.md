@@ -251,3 +251,30 @@ poll_assigned_tasks(agent)：
 ## まとめ
 
 チームには、誰もが見て、引き受け、報告できる一枚のボードが必要です。DuDuClawのTask Boardがそのボードです——単一のSQLiteストアに、人間の扉（dashboard RPC）とエージェントの扉（MCPツール）、スタンドアップ用のリアルタイムActivity Feed、稼働中のエージェントが常に自分のキューを見られるプロンプト自動注入、そして作業が自分の名前に届いたときにアイドルなエージェントを起こすスケジューラレベルのプルを備えています。これこそが、AIエージェントを「呼び出す関数」から「カードを拾うチームメイト」へと変えるものです。
+
+## ゲートウェイのライブイベント
+
+ダッシュボードは `/ws` の通知を受けてタスク、受信トレイ、担当エージェントの状態を再取得します。5分間隔の補助更新は承認件数だけに残ります。タスクとエージェント状態には定期更新がなく、イベント、再接続、手動の再取得を利用します。承認件数の取得に失敗した場合は前の件数を保持し、`?` で古い可能性を示します。再接続、`events_lost`、または `boot_id` の変更後は、既存の list RPC で再取得してください。
+
+イベントは重複する場合があります。RPC の直接通知とデータベース経由の通知は、どちらも再取得のきっかけであり、確定したレコードではありません。各接続は権限フィルターを通過したイベントだけを `seq: 1` から採番します。ハンドシェイクとイベントには互換性を保つ追加フィールド `boot_id` が付きます。受信が遅れた接続には `events_lost` を送ります。リプレイバッファーや新しい snapshot RPC はありません。従業員プロセスのタスク・承認変更は `events.db` から約2秒間隔で転送し、ゲートウェイ内の実行・目標イベントは直接送ります。
+
+| イベント | 閲覧範囲 |
+|---|---|
+| `agent.turn_started`、`agent.turn_finished`、`agent.status_changed` | 対象エージェントへの閲覧権限。実行通知には runtime と source を含む |
+| `task.created`、`task.updated`、`task.needs_human`、`goal.round_started`、`goal.round_finished`、`goal.done`、`goal.failed` | エージェント権限とタスク audience。制限されたカードは引き続き秘匿 |
+| `approval.created`、`approval.decided`、`approval.expired` | その接続の `approvals.get` と同じ判定。現在の Manager であり、パスワード変更が必要なら拒否。`knowledge_add_source` は Admin、またはそのコレクションの現在の編集者／所有者（コレクションを読めないときは Admin 以外を拒否。従業員 Viewer は不要）。operator CLI、ワークフロー有効化、`agent_file_change`、`support_pilot_review`、ボード種類（`strategic_plan`、`agent_hire`）は現在の Admin のみ。`knowledge_quarantine` と `expert_skills_enable` は従業員 Viewer。その後もワークフロー有効化スナップショットと未バインドタスクの audience を確認する |
+| `budget.breaker_open`、`autopilot.breaker_open` | Admin |
+
+新しい通知は識別子と列挙状態だけを含み、プロンプト、ツール引数、ファイル内容は送りません。目標イベントは別名を使い、`task.updated` を監視する autopilot ルールを起動しません。source は `channel`、`goal`、`cron`、`heartbeat`、`responsibility`、`assign`、`autopilot` です。turn／round の finished はキャンセルを含む呼び出しの終了を表し、タスクの検収成功を意味しません。
+
+`runs.subscribe {"run_id":"…"}` で `run.step` を購読します。指定 run ID のみ対応し、エージェント全体の購読は拒否します。同じパラメーターの `runs.unsubscribe` で解除します。接続ごとに最大16件、購読操作は毎秒20回（同時1件）、配信は毎秒20ステップです。切断時に解除します。キュー投入前と配信前に現在の権限、タスク audience、履歴プライバシーを検査します。未許可のステップはキュー、欠落フラグ、レート枠に影響しません。制限付き履歴にはステップを配信しません。許可済みキューの溢れやレート超過は `events_lost` で通知します。同時の権限検査は接続ごとに4件までで、満杯時の候補は通知せず破棄します。`runs.get` を再取得して補完してください。配信順が変わる場合があります。
+
+指定 run 購読の制限：dispatch の run ID は完了記録時に初めて割り当てられるため、通常クライアントはそのバッチを事前購読できません。履歴は `runs.get` で取得します。従来の cron／memory／skill／channel ブリッジ通知は検証済み `agent_id` または空オブジェクトだけを含み、対象名や subject は配信しません。
+
+実行イベントは `agent_id`、`source`、`runtime` のみで、会話／タスク ID を含みません。DB ブリッジは ID を検証して保存済み情報を再読込し、8 KiB を超える payload を解析前に拒否します。各ポーリングでイベント種別と対象 ID ごとにまとめ、保存済み情報の検証に成功した対象だけを64件の配信枠に数えます。不正・未登録 ID は枠を消費しません。解析と照会は別途256行までに制限します。サイズ、作業量、配信数の上限による破棄時はカーソルを進め、空の `events_lost` をその回に一度送ります。タスク、エージェント状態、受信トレイはこの通知で再取得します。Web のイベント再取得間隔は最低2秒で、先頭と末尾を反映し、失敗時は最大60秒まで指数バックオフします。
+
+現在、このライブステップ通知を生成するのは Claude だけです。チャネルのツール開始は記録時に通知し、スケジュール／ディスパッチのステップは実行全体の記録後に phase `finished` でまとめて通知します。他の runtime は既存の履歴証拠を保持できても `run.step` は生成しません。要約は文字単位で切り詰めた固定ラベルで、引数のプレビューは含みません。
+
+`approvals.list` と `approvals.get {"id":"…"}` のカードには `digest` が付きます。決定資料を閲覧できない場合は `null` です。get は `{approvals, count}` 形式を使います。`approvals.decide` の任意項目 `expected_digest` に渡すと、不一致時は決定せず再取得を求めます。省略時の動作は従来どおりです。digest はオブジェクトのキーを再帰的に整列した compact UTF-8 JSON の SHA-256（小文字16進数）で、配列順序は保持します。対象は id、agent、kind、summary、可視 payload または bound hash、request kind、status、binding、answer、invalidated reason、作成・期限・TTL、simulation、dashboard-only フラグ、表示された workflow activation（pricing を含む）です。チャネルリンク、閲覧者の権限フラグ、digest 自体は除外します。承認とイベントは別々に書き込むため、その間のプロセス停止は補助更新で補います。
+
+turn イベントの `runtime` は呼び出し開始時に選択した provider です。後続の failover で変わる可能性があり、最終結果を生成した provider の証明ではありません。

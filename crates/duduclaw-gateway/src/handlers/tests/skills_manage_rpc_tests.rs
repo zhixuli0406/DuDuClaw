@@ -30,6 +30,7 @@ fn audit_rows(home: &Path, event: &str) -> Vec<Value> {
 
 fn ctx(id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: id.into(),
         email: format!("{id}@example.invalid"),
         role,

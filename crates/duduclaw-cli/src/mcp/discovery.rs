@@ -13,7 +13,12 @@ pub(crate) async fn handle_discovery_create(args: &Value, home: &Path, agent: &s
     let broker=match duduclaw_gateway::approval::ApprovalBroker::open(home) {Ok(broker)=>broker,Err(error)=>return tool_error(&error)};
     let mut request=args.clone();
     if request.get("assigned_to").is_none() { request["assigned_to"]=serde_json::json!(agent); }
-    match service::create_from_value(home,&store,&broker,&caller,request).await {
+    let admission_home = home.to_path_buf();
+    let admission_agent = agent.to_owned();
+    let admission = Box::pin(async move {
+        admit_background_caller(&admission_home, RecordActor::Agent(&admission_agent), "tasks_create").await
+    });
+    match service::create_from_value_with_admission(home,&store,&broker,&caller,request,admission).await {
         Ok(created)=>tool_text(&serde_json::to_string(&created).unwrap()),Err(error)=>tool_error(&error)
     }
 }

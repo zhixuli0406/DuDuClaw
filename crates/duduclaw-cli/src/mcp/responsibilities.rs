@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::record_authz::{RecordActor, check_actor_identity};
+use super::record_authz::{RecordActor, admit_background_caller, check_actor_identity};
 use super::{tool_error, tool_text};
 
 pub(crate) const RESPONSIBILITY_TOOLS: [&str; 3] = [
@@ -154,6 +154,10 @@ pub(crate) async fn handle_responsibility_followup(
         Ok(s) => s,
         Err(e) => return e,
     };
+    let _admission = match admit_background_caller(home, actor, "responsibility_followup").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
+    };
     match duduclaw_gateway::responsibility::service::followup(
         &store,
         id,
@@ -208,6 +212,10 @@ pub(crate) async fn handle_responsibility_ask(
     let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home) {
         Ok(b) => b,
         Err(e) => return tool_error(&format!("approval store unavailable: {e}")),
+    };
+    let _admission = match admit_background_caller(home, actor, "responsibility_ask").await {
+        Ok(guard) => guard,
+        Err(reason) => return tool_error(&reason),
     };
     match duduclaw_gateway::responsibility::service::ask(
         &store,

@@ -262,7 +262,9 @@ pub(crate) async fn review(input: &ReviewInput<'_>, cfg: &AgentFilesConfig) -> A
     }
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let (prompt, partial) = build_prompt(input, &nonce);
-    match call_model(input.home, &prompt, cfg).await {
+    match crate::autonomous_runtime::human_interactive(
+        input.home, call_model(input.home, &prompt, cfg),
+    ).await {
         Err(e) => failed(if e.contains("60 seconds") { "timeout" } else { "call_failed" }, &e),
         Ok(raw) => match parse_reply(&raw) {
             Ok((verdict, summary, reasons)) => {

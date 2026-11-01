@@ -212,6 +212,11 @@ mod tests {
     #[tokio::test]
     async fn rejected_stored_provenance_stays_unknown_in_host_context_and_nested_scopes() {
         let home = tempfile::tempdir().unwrap();
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Personal);
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        for (name, role) in [("admin", duduclaw_auth::UserRole::Admin), ("employee", duduclaw_auth::UserRole::Employee)] {
+            db.create_user(&format!("{name}@test.invalid"), name, "isolated-test-password", role).unwrap();
+        }
         for raw in ["not-a-principal", "user:dashboard", "", " "] {
             let carried = super::super::from_stored(home.path(), Some(raw), "bot", "test_queue");
             super::super::scope_first(carried, async {

@@ -10,13 +10,8 @@
 //! - a workflow step card additionally: a member of the run's audience
 //!   (the same check that guards `workflow_runs.get`).
 use super::*;
-use crate::approval::{ApprovalRecord, WORKFLOW_ACTIVATION_KIND};
-
-/// A card whose decision accepts a workflow version.
-pub(crate) fn is_activation_record(rec: &ApprovalRecord) -> bool {
-    rec.action_kind == WORKFLOW_ACTIVATION_KIND
-        || rec.payload.get("kind").and_then(Value::as_str) == Some(WORKFLOW_ACTIVATION_KIND)
-}
+use crate::approval::ApprovalRecord;
+pub(crate) use crate::approval::{activation_facts, is_activation_record};
 
 /// For an activation: the dashboard user who submitted it decides it too.
 pub(crate) fn submitter_is_decider(rec: &ApprovalRecord, decider: &UserContext) -> bool {
@@ -25,32 +20,6 @@ pub(crate) fn submitter_is_decider(rec: &ApprovalRecord, decider: &UserContext) 
             b.decision_context.channel == "dashboard"
                 && b.decision_context.principal_id == decider.user_id
         })
-}
-
-/// What the activation card shows: the workflow, its schedule and each
-/// effect's pinned target. `Null` when the stored request cannot be read.
-pub(crate) fn activation_facts(home: &std::path::Path, rec: &ApprovalRecord) -> Value {
-    let Some(request) = rec
-        .payload
-        .get("request")
-        .cloned()
-        .and_then(|v| serde_json::from_value::<crate::workflow::ActivationRequest>(v).ok())
-    else {
-        return Value::Null;
-    };
-    json!({
-        "workflow_id": request.spec.workflow_id,
-        "revision": request.spec.workflow_revision,
-        "actor": request.spec.actor,
-        "schedule": request.cron.as_ref().map(|c| json!({"expression": c.expression, "timezone": c.timezone})),
-        "budget": request.spec.budget,
-        // U8: how long the activation stays valid once approved.
-        "expires_at": request.spec.expires_at,
-        // R-M4: whether the money budgets bind, and the counts that always do.
-        "pricing": crate::workflow::cost_ledger::load_pricing(home).view(),
-        "effect_targets": crate::workflow::effect_targets::effect_targets(request.spec.templates.values()),
-        "submitted_by": rec.binding.as_ref().map(|b| b.decision_context.principal_id.clone()),
-    })
 }
 
 impl MethodHandler {

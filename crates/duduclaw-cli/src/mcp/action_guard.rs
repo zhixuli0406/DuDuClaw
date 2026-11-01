@@ -137,6 +137,7 @@ pub(crate) fn parse_action_guard_reply(
 pub(crate) async fn action_guard_judge(
     home_dir: &Path,
     agent_dir: &Path,
+    agent_id: &str,
     tool_name: &str,
     payload: &Value,
 ) -> ActionGuardOutcome {
@@ -155,14 +156,14 @@ pub(crate) async fn action_guard_judge(
     let reference = duduclaw_gateway::approval::render_grounding_block(&snippets);
 
     let prompt = build_action_guard_prompt(tool_name, &findings, reference.as_deref());
-    match duduclaw_gateway::runtime_dispatch::run_utility_prompt(
+    match crate::ai_session_guard::with_autonomous_utility_context(home_dir, agent_id, duduclaw_gateway::runtime_dispatch::run_utility_prompt(
         home_dir,
         Some(agent_dir),
         "action-guard-judge",
         "", // instructions live in the prompt itself
         &prompt,
         duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
-    )
+    ))
     .await
     {
         Ok(reply) => {

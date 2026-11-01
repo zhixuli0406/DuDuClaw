@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{ForkError, Result};
 
@@ -116,6 +116,8 @@ impl ForkStore {
         // the parent a fork was taken from and each branch's retained workspace.
         const ADDED: &[(&str, &str, &str)] = &[
             ("forks", "parent_workspace", "TEXT"),
+            ("forks", "resolution_reason", "TEXT"),
+            ("forks", "needs_confirmation", "INTEGER"),
             ("fork_branches", "workspace_path", "TEXT"),
         ];
         for (table, column, ty) in ADDED {
@@ -259,11 +261,66 @@ impl ForkStore {
         let conn = self.conn.lock().expect("fork store poisoned");
         let n = conn
             .execute(
-                "UPDATE forks SET winner=?2, promoted=?3, resolved=?4, aggregate_spent_usd=?5 WHERE fork_id=?1",
+                "UPDATE forks SET winner=?2, promoted=?3, resolved=?4, aggregate_spent_usd=?5,
+                    resolution_reason=NULL, needs_confirmation=NULL WHERE fork_id=?1",
                 params![fork_id, winner, promoted as i64, resolved as i64, aggregate_spent_usd],
             )
             .map_err(map_err)?;
         Ok(n > 0)
+    }
+
+    /// Persist the existing merge decision alongside the ordinary resolution.
+    /// Old rows have no decision metadata; explicit selection clears it.
+    pub fn set_resolution_decision(&self, fork_id: &str, decision: &crate::MergeDecision,
+        promoted: bool, resolved: bool, spent: f64) -> Result<bool> {
+        let conn = self.conn.lock().expect("fork store poisoned");
+        let n = conn.execute(
+            "UPDATE forks SET winner=?2,promoted=?3,resolved=?4,aggregate_spent_usd=?5,
+                resolution_reason=?6,needs_confirmation=?7 WHERE fork_id=?1",
+            params![fork_id, decision.winner.as_ref().map(|id| id.0.as_str()),
+                promoted as i64, resolved as i64, spent, decision.reason, decision.needs_confirmation as i64],
+        ).map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    pub fn resolution_decision(&self, fork_id: &str) -> Result<Option<crate::MergeDecision>> {
+        let conn = self.conn.lock().expect("fork store poisoned");
+        conn.query_row(
+            "SELECT winner,needs_confirmation,resolution_reason FROM forks
+                WHERE fork_id=?1 AND resolution_reason IS NOT NULL",
+            params![fork_id], |row| Ok(crate::MergeDecision {
+                winner: row.get::<_, Option<String>>(0)?.map(crate::BranchId),
+                needs_confirmation: row.get::<_, bool>(1)?,
+                reason: row.get(2)?,
+            }),
+        ).optional().map_err(map_err)
+    }
+
+    /// End an unadmitted claim using the same terminal state as cancellation.
+    /// Only pending requested rows change; concurrent work or a final selection
+    /// cannot be overwritten. The caller holds the HOME publication lock.
+    pub fn cancel_pending_claim(&self, fork_id: &str, requested: &[String], reason: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("fork store poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(map_err)?;
+        let mut changed = 0;
+        for id in requested {
+            changed += tx.execute(
+                "UPDATE fork_branches SET state='terminated',output=?3
+                    WHERE branch_id=?1 AND fork_id=?2 AND state='pending'
+                    AND EXISTS(SELECT 1 FROM forks WHERE fork_id=?2 AND resolved=0)",
+                params![id, fork_id, reason],
+            ).map_err(map_err)?;
+        }
+        if changed > 0 {
+            // No winner and no publication: all branches ended before starting.
+            tx.execute(
+                "UPDATE forks SET resolved=1,winner=NULL,promoted=0,
+                    resolution_reason=?2,needs_confirmation=0 WHERE fork_id=?1 AND resolved=0
+                    AND NOT EXISTS(SELECT 1 FROM fork_branches WHERE fork_id=?1 AND state!='terminated')",
+                params![fork_id, reason],
+            ).map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)
     }
 
     /// Transition active rows only; durable terminal states are never reopened.
@@ -466,6 +523,63 @@ mod tests {
             output: String::new(),
             test_exit_code: None,
         }
+    }
+
+    #[test]
+    fn manual_decision_survives_reopen_and_selection_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.db");
+        let decision = crate::MergeDecision {
+            winner: None, needs_confirmation: true, reason: "autonomy_refused:agent_pause".into(),
+        };
+        {
+            let store = ForkStore::open(&path).unwrap();
+            store.insert_fork(&fork_row("f1"), &[branch_row("b1", "f1", "finished")]).unwrap();
+            assert!(store.resolution_decision("f1").unwrap().is_none());
+            store.set_resolution_decision("f1", &decision, false, false, 0.1).unwrap();
+        }
+        let store = ForkStore::open(&path).unwrap();
+        assert_eq!(store.resolution_decision("f1").unwrap(), Some(decision));
+        assert!(!store.get_fork("f1").unwrap().unwrap().resolved);
+        store.set_resolution("f1", Some("b1"), true, true, 0.1).unwrap();
+        assert!(store.resolution_decision("f1").unwrap().is_none());
+    }
+
+    #[test]
+    fn refused_claim_cancels_pending_rows_once_without_overwriting_cancellation() {
+        let store = ForkStore::open_in_memory().unwrap();
+        store.insert_fork(&fork_row("f1"), &[
+            branch_row("b1", "f1", "pending"), branch_row("b2", "f1", "terminated"),
+        ]).unwrap();
+        let cancelled = store.list_branches("f1").unwrap().remove(1);
+        store.cancel_pending_claim("f1", &["b1".into(), "b2".into()],
+            "autonomy_refused:agent_pause").unwrap();
+        assert_eq!(store.list_branches("f1").unwrap()[1], cancelled);
+        let fork = store.get_fork("f1").unwrap().unwrap();
+        assert!(fork.resolved && !fork.promoted && fork.winner.is_none());
+        let decision = store.resolution_decision("f1").unwrap().unwrap();
+        assert!(!decision.needs_confirmation);
+        assert_eq!(decision.reason, "autonomy_refused:agent_pause");
+        assert!(store.claim_pending_branches("f1", &["b1".into()], "/unused").unwrap().is_empty());
+        store.cancel_pending_claim("f1", &["b1".into()], "autonomy_refused:agent_missing").unwrap();
+        assert_eq!(store.resolution_decision("f1").unwrap(), Some(decision));
+        assert_eq!(store.get_fork("f1").unwrap(), Some(fork));
+    }
+
+    #[test]
+    fn refused_claim_transaction_rolls_back_when_resolution_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.db");
+        let store = ForkStore::open(&path).unwrap();
+        store.insert_fork(&fork_row("f1"), &[branch_row("b1", "f1", "pending")]).unwrap();
+        let before = store.list_branches("f1").unwrap();
+        Connection::open(&path).unwrap().execute_batch(
+            "CREATE TRIGGER refusal_fault BEFORE UPDATE ON forks
+                BEGIN SELECT RAISE(ABORT,'trusted fixture resolution fault'); END;",
+        ).unwrap();
+        assert!(store.cancel_pending_claim("f1", &["b1".into()], "autonomy_refused:agent_pause").is_err());
+        assert_eq!(store.list_branches("f1").unwrap(), before);
+        assert!(!store.get_fork("f1").unwrap().unwrap().resolved);
     }
 
     #[test]

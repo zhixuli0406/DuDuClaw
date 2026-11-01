@@ -508,6 +508,9 @@ impl NightEngine {
         if !cfg.enabled {
             return None;
         }
+        if duduclaw_core::autonomy_gate::check(&self.home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background).is_err() {
+            return None;
+        }
         if !is_idle(last_active, now, cfg.idle_threshold_minutes) {
             return None;
         }
@@ -635,7 +638,15 @@ impl NightEngine {
                             .push("N1 skipped: daily spend cap reached".to_string());
                     } else {
                         let (sys, usr) = build_sleep_prompt(agent_id, &context);
-                        match llm.infer(&sys, &usr).await {
+                        let inference = match duduclaw_core::autonomy_gate::check(
+                            &self.home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+                        ) {
+                            Ok(()) => crate::autonomous_runtime::scope(
+                                &self.home_dir, agent_id, &[], llm.infer(&sys, &usr),
+                            ).await,
+                            Err(error) => Err(format!("autonomy paused: {error}")),
+                        };
+                        match inference {
                             Ok(inf) => {
                                 budget.charge(inf.cost_millicents);
                                 self.record_daily_spend(agent_id, now, inf.cost_millicents)
@@ -668,7 +679,15 @@ impl NightEngine {
                             .push("N2 skipped: daily spend cap reached".to_string());
                     } else {
                         let (sys, usr) = build_prefetch_prompt(agent_id, &context);
-                        match llm.infer(&sys, &usr).await {
+                        let inference = match duduclaw_core::autonomy_gate::check(
+                            &self.home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+                        ) {
+                            Ok(()) => crate::autonomous_runtime::scope(
+                                &self.home_dir, agent_id, &[], llm.infer(&sys, &usr),
+                            ).await,
+                            Err(error) => Err(format!("autonomy paused: {error}")),
+                        };
+                        match inference {
                             Ok(inf) => {
                                 budget.charge(inf.cost_millicents);
                                 self.record_daily_spend(agent_id, now, inf.cost_millicents)
@@ -1111,6 +1130,8 @@ mod tests {
         use duduclaw_core::traits::MemoryEngine;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
+        std::fs::create_dir_all(home.join("agents/a")).unwrap();
+        std::fs::write(home.join("agents/a/agent.toml"), "[agent]\nname = \"a\"\nstatus = \"active\"\n").unwrap();
         let mem = SqliteMemoryEngine::in_memory().unwrap();
         mem.store("a", ep("a", "restart persistence context"))
             .await
@@ -1146,6 +1167,8 @@ mod tests {
         use duduclaw_core::traits::MemoryEngine;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
+        std::fs::create_dir_all(home.join("agents/a")).unwrap();
+        std::fs::write(home.join("agents/a/agent.toml"), "[agent]\nname = \"a\"\nstatus = \"active\"\n").unwrap();
         std::fs::write(home.join("night_breaker.json"), "garbage \u{1F980} bytes").unwrap();
         let mem = SqliteMemoryEngine::in_memory().unwrap();
         mem.store("a", ep("a", "corrupt file context"))
@@ -1328,6 +1351,9 @@ mod tests {
     async fn run_pass_with_mock_llm_writes_cache_and_charges() {
         use duduclaw_core::traits::MemoryEngine;
         let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
         let engine = NightEngine::new(dir.path().to_path_buf());
         let mem = SqliteMemoryEngine::in_memory().unwrap();
         mem.store("a", ep("a", "user asked about deploy pricing"))
@@ -1373,6 +1399,9 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
         let engine = NightEngine::new(dir.path().to_path_buf());
         let mem = SqliteMemoryEngine::in_memory().unwrap();
         mem.store("a", ep("a", "context here")).await.unwrap();
@@ -1388,6 +1417,42 @@ mod tests {
         assert!(report.sleep_cached, "first call fits");
         assert!(!report.prefetch_cached, "second call blocked by budget");
         assert!(report.notes.iter().any(|n| n.contains("budget")));
+    }
+
+    #[tokio::test]
+    async fn pause_after_n1_prevents_n2_model_call() {
+        use duduclaw_core::traits::MemoryEngine;
+        struct PauseAfterFirst { home: std::path::PathBuf, calls: std::sync::atomic::AtomicUsize }
+        #[async_trait::async_trait]
+        impl NightLlm for PauseAfterFirst {
+            async fn infer(&self, _: &str, _: &str) -> Result<NightInference, String> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                duduclaw_core::autonomy_handoff::admit().await?.handed_off();
+                let paused = tokio::time::timeout(std::time::Duration::from_secs(1),
+                    duduclaw_core::autonomy_gate::mutate_async(&self.home, Some("a"), Some(
+                        duduclaw_core::autonomy_gate::PauseEntry {
+                            reason: "test".into(), who: "operator".into(), at: chrono::Utc::now().to_rfc3339(),
+                        },
+                    )),
+                ).await.expect("night model kept its admission after handoff");
+                assert!(matches!(paused, duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+                Ok(NightInference { text: "first".into(), cost_millicents: 1000 })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/a/agent.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[agent]\nstatus = \"active\"\n").unwrap();
+        let llm = PauseAfterFirst { home: dir.path().to_path_buf(), calls: std::sync::atomic::AtomicUsize::new(0) };
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        mem.store("a", ep("a", "context for both phases")).await.unwrap();
+        let report = NightEngine::new(dir.path().to_path_buf()).run_pass(
+            "a", &NightEngineConfig { enabled: true, ..Default::default() },
+            Utc::now(), &mem, Some(&llm),
+        ).await;
+        assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(report.sleep_cached);
+        assert!(!report.prefetch_cached);
     }
 
     #[tokio::test]
@@ -1422,6 +1487,9 @@ mod tests {
     async fn circuit_breaker_blocks_second_pass_same_window() {
         use duduclaw_core::traits::MemoryEngine;
         let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"a\"\nstatus = \"active\"\n").unwrap();
         let engine = NightEngine::new(dir.path().to_path_buf());
         let mem = SqliteMemoryEngine::in_memory().unwrap();
         mem.store("a", ep("a", "hello world context"))
@@ -1433,6 +1501,9 @@ mod tests {
             ..Default::default()
         };
         let now = Utc::now();
+        duduclaw_core::autonomy_gate::set_pause(dir.path(), Some("a"), "pause", "user").unwrap();
+        assert!(engine.maybe_run("a", &cfg, None, now, &mem, None).await.is_none());
+        duduclaw_core::autonomy_gate::resume(dir.path(), Some("a")).unwrap();
         let first = engine.maybe_run("a", &cfg, None, now, &mem, None).await;
         assert!(first.is_some(), "first pass runs");
         let second = engine.maybe_run("a", &cfg, None, now, &mem, None).await;

@@ -574,6 +574,9 @@ impl RuleInductor {
         let today = now.format("%Y-%m-%d").to_string();
 
         for p in &patterns {
+            if duduclaw_core::autonomy_gate::check(&self.home_dir, &p.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background).is_err() {
+                continue;
+            }
             if state.blocklist.iter().any(|fp| fp == &p.fingerprint) {
                 continue; // rejected before — never nag again
             }
@@ -710,6 +713,9 @@ impl RuleInductor {
     /// Materialize an approved candidate into an enabled autopilot rule with
     /// induced-provenance metadata.
     async fn enable_induced_rule(&self, payload: &Value, fingerprint: &str) -> Result<(), String> {
+        let agent = payload.get("agent_id").and_then(Value::as_str).ok_or("induced rule agent missing")?;
+        duduclaw_core::autonomy_gate::check(&self.home_dir, agent, duduclaw_core::autonomy_gate::AutonomyPath::Background)
+            .map_err(|pause| format!("autonomy paused: {pause}"))?;
         let rule = payload
             .get("rule")
             .ok_or_else(|| "approval payload missing 'rule'".to_string())?;
@@ -855,7 +861,8 @@ mod tests {
 
     fn fresh_home() -> PathBuf {
         let p = std::env::temp_dir().join(format!("duduclaw-ri-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
+        std::fs::create_dir_all(p.join("agents/bruno")).unwrap();
+        std::fs::write(p.join("agents/bruno/agent.toml"), "[agent]\nname = \"bruno\"\nstatus = \"active\"\n").unwrap();
         p
     }
 
@@ -1177,6 +1184,9 @@ mod tests {
         seed_pattern(&inductor.events, "bruno").await;
 
         // First pass: proposes one candidate, nothing enabled yet.
+        duduclaw_core::autonomy_gate::set_pause(&home, Some("bruno"), "pause", "user").unwrap();
+        assert_eq!(inductor.run_once().await.unwrap().proposed, 0);
+        duduclaw_core::autonomy_gate::resume(&home, Some("bruno")).unwrap();
         let out1 = inductor.run_once().await.unwrap();
         assert_eq!(out1.proposed, 1);
         assert!(inductor.autopilot.list_rules().await.unwrap().is_empty());

@@ -358,6 +358,34 @@ async fn three_consecutive_dispatch_failures_park_the_task_needs_human() {
 }
 
 #[tokio::test]
+async fn admission_refusals_after_enqueue_park_without_failure_or_retry() {
+    let budget = crate::budget::BudgetRefusal(crate::budget::BudgetVerdict::Deny {
+        scope: "daily", spent_cents: 40200, cap_cents: 40200,
+    }).legacy_message();
+    for (error, pause) in [
+        (budget, "blocked_needs_decision"),
+        ("AUTONOMY_PAUSED: handoff refused".to_string(), "operator_paused"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        let d = driver(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+        d.tick_once().await.unwrap();
+        assert_eq!(fail_all_pending(&queue, &error).await, 1);
+        d.tick_once().await.unwrap();
+        let task = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(task.status, "needs_human");
+        assert_eq!(task.pause_reason.as_deref(), Some(pause));
+        assert!(d.inflight.lock().await.is_empty());
+        assert!(!d.dispatch_failures.lock().await.contains_key("g1"));
+        d.tick_once().await.unwrap();
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert!(!d.dispatch_failures.lock().await.contains_key("g1"));
+    }
+}
+
+#[tokio::test]
 async fn dispatch_backoff_skips_the_task_until_its_window_passes() {
     let dir = tempfile::tempdir().unwrap();
     let (store, queue) = open_stores(dir.path()).await;
@@ -480,4 +508,40 @@ async fn dispatch_injects_the_criteria_ledger_only_when_present_and_not_off() {
     let none = payload(None, false).await;
     assert!(!off.contains("驗收帳本"));
     assert_eq!(off, none, "off with a ledger == no ledger");
+}
+
+#[tokio::test]
+async fn autonomy_pause_goal_admission_waits_and_resume_dispatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    store.insert_task(&goal_task("pause-new", "alice")).await.unwrap();
+    let d = driver(store.clone(), queue.clone(), small_cfg());
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), Some("alice"), "休息", "operator").unwrap();
+    d.tick_once().await.unwrap();
+    assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    assert_eq!(store.get_task("pause-new").await.unwrap().unwrap().status, "todo");
+    duduclaw_core::autonomy_gate::resume(dir.path(), Some("alice")).unwrap();
+    d.tick_once().await.unwrap();
+    assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn autonomy_pause_rejected_round_requires_human() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    let mut task = goal_task("pause-retry", "alice");
+    task.status = "revising".into();
+    task.revision_round = 1;
+    store.insert_task(&task).await.unwrap();
+    let d = driver(store.clone(), queue.clone(), small_cfg());
+    duduclaw_core::autonomy_gate::set_pause(dir.path(), None, "維護", "operator").unwrap();
+    d.tick_once().await.unwrap();
+    let paused = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(paused.status, "needs_human");
+    assert_eq!(paused.pause_reason.as_deref(), Some("operator_paused"));
+    assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    duduclaw_core::autonomy_gate::resume(dir.path(), None).unwrap();
+    store.resolve_needs_human(&task.id, "retry", "繼續").await.unwrap();
+    d.tick_once().await.unwrap();
+    assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
 }

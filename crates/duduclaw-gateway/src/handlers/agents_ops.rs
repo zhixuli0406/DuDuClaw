@@ -210,6 +210,7 @@ impl MethodHandler {
         source: &'static str,
         ctx: &UserContext,
     ) -> Result<(), String> {
+        let event_status = status.to_string();
         let status = status.to_string();
         let edit = crate::channel_reply::AgentTomlEdit {
             source,
@@ -231,6 +232,8 @@ impl MethodHandler {
             Ok(())
         })
         .await?;
+        self.broadcast_event("agent.status_changed",
+            json!({ "agent_id": agent_id, "status": event_status })).await;
         Ok(())
     }
 

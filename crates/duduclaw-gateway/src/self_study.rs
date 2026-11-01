@@ -287,6 +287,9 @@ impl SelfStudyScheduler {
                 continue;
             };
 
+            if duduclaw_core::autonomy_gate::check(&self.home_dir, &agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background).is_err() {
+                continue;
+            }
             let cfg = ResearchConfig::from_agent_dir(&agent_dir);
             if !cfg.self_study {
                 continue;
@@ -597,7 +600,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(
             dir.join("agent.toml"),
-            format!("[research]\nself_study = {self_study}\nself_study_hour = {hour}\n"),
+            format!("[agent]\nname = {id:?}\nstatus = \"active\"\n[research]\nself_study = {self_study}\nself_study_hour = {hour}\n"),
         )
         .await
         .unwrap();
@@ -661,6 +664,9 @@ mod tests {
         belief::settle(&prediction_db, "trader", &id, 90.0, None).unwrap(); // miss
 
         let sched = SelfStudyScheduler::new(home.path().to_path_buf());
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some("trader"), "pause", "user").unwrap();
+        assert_eq!(sched.tick().await, 0);
+        duduclaw_core::autonomy_gate::resume(home.path(), Some("trader")).unwrap();
         let created = sched.tick().await;
         assert_eq!(created, 1);
 

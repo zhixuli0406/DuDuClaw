@@ -475,7 +475,7 @@ async fn invoke_recorded<F>(
     fut: F,
 ) -> Result<String, String>
 where
-    F: std::future::Future<Output = Result<String, String>>,
+    F: std::future::Future<Output = Result<String, String>> + Send,
 {
     use crate::cost_telemetry::RequestType as RT;
     let connector_snapshot = std::sync::Arc::new(std::sync::Mutex::new(crate::egress_guard::ConnectorSnapshot::unknown()));
@@ -491,9 +491,15 @@ where
         request_type == RT::Chat,
         crate::on_behalf_of::context::scope(home_dir, agent_id, fut),
     );
+    let fut =
+        crate::autonomous_runtime::request_scope(home_dir, agent_id, request_type != RT::Chat, fut);
     if !matches!(request_type, RT::Cron | RT::Dispatch) {
         return fut.await;
     }
+    // The implementation resolves the provider from registry/preloaded
+    // configuration. Default false: a preflight failure publishes no steps.
+    let live_claude_steps = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fut = LIVE_CLAUDE_STEPS.scope(live_claude_steps.clone(), fut);
     let started_at = chrono::Utc::now().to_rfc3339();
     // P2-B M-6: the run key is minted before the spawn and handed to it, so
     // MCP memory writes made during the run and the post-run distillation
@@ -515,6 +521,12 @@ where
     let outer_scope = crate::runtime::NATIVE_TOOL_COLLECTOR
         .try_with(|_| ())
         .is_ok();
+    // A reused collector can already hold evidence from other runtimes.
+    // Persistence keeps its established behavior, while live delivery only
+    // includes steps appended by this invocation.
+    let live_steps_start = crate::runtime::NATIVE_TOOL_COLLECTOR
+        .try_with(|c| c.lock().map(|g| g.len()).unwrap_or(usize::MAX))
+        .unwrap_or(0);
     let (result, events) = if outer_scope {
         let r = fut.await;
         let ev = crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -548,6 +560,8 @@ where
         // Store masks + caps again; this pre-trim just bounds the move.
         let preview_in = duduclaw_core::truncate_chars(&duduclaw_security::credential_detect::mask(prompt), 500);
         let watch_run_key = run_key.clone();
+        let live_home = home_dir.to_path_buf();
+        let publish_live = live_claude_steps.load(std::sync::atomic::Ordering::Relaxed);
         let _ = tokio::task::spawn_blocking(move || {
             match store.record_dispatch_run(
                 &agent,
@@ -559,7 +573,10 @@ where
                 &preview_out,
                 &steps,
             ) {
-                Ok(id) => { let _ = store.attach_computer_watches(&agent, &watch_run_key, id); }
+                Ok(id) => {
+                    let _ = store.attach_computer_watches(&agent, &watch_run_key, id);
+                    publish_dispatch_steps(&live_home, &agent, id, &steps, live_steps_start, publish_live);
+                }
                 Err(e) => tracing::debug!(error = %e, "dispatch run record failed (ignored)"),
             }
         })
@@ -596,11 +613,13 @@ where
             )];
             let connectors = connector_snapshot.lock().map(|snapshot| snapshot.clone())
                 .unwrap_or_else(|_| crate::egress_guard::ConnectorSnapshot::unknown());
+            let ingest_scope = crate::autonomous_runtime::capture();
             tokio::spawn(async move {
-                crate::memory_provenance::CONNECTOR_STAMPS.scope(connectors, crate::wiki_ingest::run_ingest(
-                    &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
-                    sources,
-                ))
+                crate::autonomous_runtime::restore(ingest_scope,
+                    crate::memory_provenance::CONNECTOR_STAMPS.scope(connectors, crate::wiki_ingest::run_ingest(
+                        &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
+                        sources,
+                    )))
                 .await;
             });
         }
@@ -658,6 +677,20 @@ pub async fn call_claude_for_agent_preloaded(
         DispatchOverrides::default(),
     )
     .await
+}
+
+/// Dispatch run ids are assigned only at persistence, so these compact step
+/// invalidations arrive at completion. Non-Claude runs remain available through
+/// runs.get, but do not publish a live step stream in this implementation.
+fn publish_dispatch_steps(
+    home: &Path, agent_id: &str, run_id: i64, steps: &[(String, bool)],
+    start: usize, is_claude: bool,
+) {
+    if !is_claude { return; }
+    let run_id = format!("dispatch:{run_id}");
+    for (tool, _) in steps.iter().skip(start) {
+        crate::live_events::publish_step(home, agent_id, &run_id, tool, "finished");
+    }
 }
 
 /// [`call_claude_for_agent_preloaded`] with caller-imposed
@@ -961,6 +994,14 @@ async fn call_claude_for_agent_impl(
     // the runtime id, which is the most specific true thing we know. Both
     // attributes get the same value, matching what the `chat` spans below do.
     record_runtime_on_span(delegation_settings.provider);
+    let _ = LIVE_CLAUDE_STEPS.try_with(|flag| flag.store(
+        delegation_settings.provider == duduclaw_core::types::RuntimeType::Claude,
+        std::sync::atomic::Ordering::Relaxed,
+    ));
+    // This scope includes Claude, Codex, Grok and API runtime branches.
+    let _live_turn = crate::dashboard_feedback::LiveTurn::dispatch(
+        home_dir, agent_id, request_type, delegation_settings.provider.as_str(),
+    ).await;
 
     // The read-only explore lane (`crate::explore_lane`) is carried by the
     // Claude CLI spawn and the OpenAI-compatible runtime only. Any other
@@ -1178,7 +1219,7 @@ async fn call_claude_for_agent_impl(
             .await;
             return match primary_result {
                 Ok(text) => Ok(text),
-                Err(e) if crate::budget::budget_refusal_message(&e).is_some() => Err(e),
+                Err(e) if is_admission_refusal(&e) => Err(e),
                 Err(ref e)
                     if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e)
                         .is_some() =>
@@ -1209,7 +1250,7 @@ async fn call_claude_for_agent_impl(
                     )
                     .await
                     .map_err(|fe| {
-                        if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                        if is_admission_refusal(&fe) { fe } else {
                             format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
                         }
                     })
@@ -1322,7 +1363,7 @@ async fn call_claude_for_agent_impl(
         {
             Ok(text) => return Ok(text),
             Err(e) => {
-                if crate::budget::budget_refusal_message(&e).is_some() { return Err(e); }
+                if is_admission_refusal(&e) { return Err(e); }
                 let is_rate = is_rate_limit_error(&e);
                 let is_fallback_trigger = is_llm_fallback_error(&e);
                 let can_model_fallback =
@@ -1361,7 +1402,7 @@ async fn call_claude_for_agent_impl(
                     )
                     .await
                     .map_err(|fe| {
-                        if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                        if is_admission_refusal(&fe) { fe } else {
                             format_fallback_error_message(&claude_model, &e, &fallback_model, &fe)
                         }
                     });
@@ -1432,7 +1473,7 @@ async fn call_claude_for_agent_impl(
     .await
     {
         Ok(text) => Ok(text),
-        Err(e) if crate::budget::budget_refusal_message(&e).is_some() => Err(e),
+        Err(e) if is_admission_refusal(&e) => Err(e),
         Err(ref e)
             if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e).is_some() =>
         {
@@ -1457,7 +1498,7 @@ async fn call_claude_for_agent_impl(
             )
             .await
             .map_err(|fe| {
-                if crate::budget::budget_refusal_message(&fe).is_some() { fe } else {
+                if is_admission_refusal(&fe) { fe } else {
                     format_fallback_error_message(&claude_model, e, &fallback_model, &fe)
                 }
             })
@@ -1466,12 +1507,19 @@ async fn call_claude_for_agent_impl(
     }
 }
 
+/// Admission refusals never trigger account, model, or provider retries.
+fn is_admission_refusal(error: &str) -> bool {
+    crate::budget::budget_refusal_message(error).is_some()
+        || crate::autonomous_runtime::was_denied()
+        || error.starts_with("AUTONOMY_PAUSED:")
+}
+
 /// Check whether an error string indicates a billing/credit exhaustion issue.
 ///
 /// These errors should NOT be retried with the same account — the account
 /// needs a long cooldown (topped up manually).
 pub(crate) fn is_billing_error(error: &str) -> bool {
-    if crate::budget::budget_refusal_message(error).is_some() { return false; }
+    if is_admission_refusal(error) { return false; }
     let lower = error.to_lowercase();
     lower.contains("credit")
         || lower.contains("balance")
@@ -1656,6 +1704,8 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         &self,
         req: &duduclaw_llm::ChatRequest,
     ) -> Result<duduclaw_llm::ChatResponse, duduclaw_llm::LlmError> {
+        // Each provider transport admits immediately before sending, including
+        // every tool-loop iteration. Billing must not retain its lease.
         let resp = self.inner.complete(req).await?;
         // Reasoning fold: bill reasoning exactly once at the output rate
         // (mirrors the legacy single-shot mapping).
@@ -2452,7 +2502,7 @@ struct ChainError {
 /// failover-class (rate limit / billing / 5xx / timeout / overloaded) vs.
 /// terminal (auth / invalid). Terminal short-circuits the chain.
 fn is_chain_failover(err: &str) -> bool {
-    if crate::budget::budget_refusal_message(err).is_some() { return false; }
+    if is_admission_refusal(err) { return false; }
     is_rate_limit_error(err) || is_billing_error(err) || is_llm_fallback_error(err)
 }
 
@@ -2989,6 +3039,8 @@ async fn call_local_inference_raw(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    // Provider transports admit each request, including local tool-loop rounds.
+    crate::autonomous_runtime::check_current().await?;
     let engine = get_inference_engine(home_dir)
         .await
         .ok_or_else(|| "Local inference engine not available".to_string())?;
@@ -3418,7 +3470,12 @@ async fn call_with_rotation(
                 // per-account spawn, it still must not count against the
                 // account or try the next one.
                 if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e)
-                    || crate::budget::budget_refusal_message(&e).is_some() {
+                    || is_admission_refusal(&e) {
+                    return Err(e);
+                }
+                // An autonomy pause refusal is not the account's fault, and every
+                // other account would be refused the same way.
+                if crate::autonomous_runtime::was_denied() {
                     return Err(e);
                 }
                 last_error = e.clone();
@@ -3644,16 +3701,18 @@ async fn call_claude_streaming(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
+    let admission = crate::autonomous_runtime::admit_current().await?;
+    let mut child = crate::process_group::ManagedChild::spawn(cmd)
         .map_err(|e| format!("claude CLI spawn error: {e}"))?;
-    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    crate::autonomous_runtime::mark_handoff();
+    drop(admission);
+    let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
     // Drain stderr asynchronously to prevent pipe buffer deadlock.
     // Without this, if claude CLI writes >64KB to stderr (common in verbose
     // mode), the pipe fills up and the child blocks forever.
-    let stderr = child.stderr.take();
+    let stderr = child.child().stderr.take();
     tokio::spawn(async move {
         if let Some(e) = stderr {
             let mut lines = BufReader::new(e).lines();
@@ -3704,7 +3763,7 @@ async fn call_claude_streaming(
                 match line_result {
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = child.kill().await;
+                        child.kill_and_reap().await;
                         return Err(format!("claude CLI read error: {e}"));
                     }
                     Ok(Some(line)) => {
@@ -3732,7 +3791,7 @@ async fn call_claude_streaming(
                                             .and_then(|r| r.as_str())
                                             .or_else(|| event.get("error").and_then(|e| e.as_str()))
                                             .unwrap_or("Unknown stream-json error");
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         return Err(format!(
                                             "claude CLI stream error: {err_text}"
                                         ));
@@ -3749,7 +3808,7 @@ async fn call_claude_streaming(
                                 Some("assistant") => {
                                     // Envelope-level error field (newer claude-code)
                                     if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         return Err(format!(
                                             "claude CLI assistant error: {err}"
                                         ));
@@ -3852,7 +3911,7 @@ async fn call_claude_streaming(
 
             _ = &mut hard_deadline => {
                 warn!("claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process");
-                let _ = child.kill().await;
+                child.kill_and_reap().await;
                 return Err(format!(
                     "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, partial output: {} chars)",
                     result_text.len()
@@ -3862,7 +3921,10 @@ async fn call_claude_streaming(
     }
 
     thinking.finish();
-    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
+    let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
+    // Preserve successful completion semantics; cancellation before this point
+    // drops the managed owner and terminates all descendants.
+    child.disarm();
     // Any non-zero exit is now a hard failure. Previously we only errored
     // when result_text was empty, which would surface CLI error text as
     // the "reply" whenever the stream-json layer accidentally wrote it.
@@ -3909,6 +3971,9 @@ async fn call_claude_streaming(
 // ── Delegation context (task-local) ──────────────────────────
 
 tokio::task_local! {
+    /// Per invocation provider marker for opt-in live dispatch steps.
+    static LIVE_CLAUDE_STEPS: Arc<std::sync::atomic::AtomicBool>;
+
     /// Delegation environment injected by the bus dispatcher before calling
     /// Claude CLI.  `prepare_claude_cmd` reads this to set per-subprocess
     /// env vars.  Thread-safe because each dispatch runs in its own
@@ -5979,5 +6044,64 @@ mod dispatch_future_size_tests {
             eprintln!("{name}: {size} bytes");
             assert!(size <= limit, "{name}: {size} > {limit}; keep runtime futures boxed");
         }
+    }
+}
+
+#[cfg(test)]
+mod live_dispatch_step_tests {
+    use super::*;
+
+    #[test]
+    fn non_claude_dispatch_steps_remain_off_live_stream() {
+        let home = tempfile::tempdir().unwrap();
+        let (subscription, mut rx) = crate::live_events::RunSubscriptions::new(home.path());
+        subscription.update(crate::live_events::RunSelector::Run("dispatch:41".into()), true).unwrap();
+        publish_dispatch_steps(home.path(), "worker", 41,
+            &[("Bash".into(), true)], 0, false);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn claude_dispatch_only_publishes_this_invocations_steps_after_persistence_id() {
+        let home = tempfile::tempdir().unwrap();
+        let (subscription, mut rx) = crate::live_events::RunSubscriptions::new(home.path());
+        subscription.update(crate::live_events::RunSelector::Run("dispatch:42".into()), true).unwrap();
+        publish_dispatch_steps(home.path(), "worker", 42,
+            &[("OldNonClaudeStep".into(), true), ("Read".into(), true)], 1, true);
+        let step = rx.try_recv().unwrap();
+        assert_eq!(step.run_id, "dispatch:42");
+        assert_eq!(step.agent_id, "worker");
+        assert_eq!(step.tool, "Read");
+        assert_eq!(step.phase, "finished");
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod process_tree_cancellation_tests {
+    #[tokio::test]
+    async fn webchat_claude_streaming_cancel_kills_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.current_dir(dir.path())
+            .args(["-c", "/bin/sleep 300 & echo $! > grandchild.pid; wait"]);
+        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None).await });
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(dir.path().join("grandchild.pid"))
+                    .ok().and_then(|text| text.trim().parse::<u32>().ok()) {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("fixture must start a grandchild");
+        assert!(duduclaw_core::platform::process_alive(pid));
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while duduclaw_core::platform::process_alive(pid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("cancel must kill the actual streaming spawn's grandchild");
     }
 }

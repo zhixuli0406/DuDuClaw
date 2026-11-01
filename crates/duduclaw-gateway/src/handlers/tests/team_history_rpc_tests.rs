@@ -1039,3 +1039,50 @@ async fn bound_mask_failures_never_return_private_configuration_lines() {
     let error=denied(f.handler.handle("search.query",json!({"agent_id":"sales","sources":["conversations"],"q":"電話"}),&reader).await);
     assert_eq!(error,json!("masking_failed"));
 }
+
+#[tokio::test]
+async fn webchat_cancel_marker_never_appears_in_history_rpc() {
+    let f = fixture().await;
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    let sessions = &rc.session_manager;
+    sessions.compress("report", "Real compression summary survives cancellation").await.unwrap();
+    sessions.append_message("report", "user", "Continue the original task", 5).await.unwrap();
+    let before = payload(f.handler.handle(
+        "chat.sessions.history", json!({"session_id":"report"}), &f.admin,
+    ).await);
+    sessions.record_webchat_cancel("report", "sales", "cancel-turn-marker", "cancel-msg-marker")
+        .await.unwrap();
+    let after = payload(f.handler.handle(
+        "chat.sessions.history", json!({"session_id":"report"}), &f.admin,
+    ).await);
+    assert_eq!(after["messages"], before["messages"]);
+    assert!(!after.to_string().contains("cancel-turn-marker"));
+    assert!(!after.to_string().contains("cancel-msg-marker"));
+    assert_eq!(sessions.compression_summary("report").await.unwrap(),
+        "Real compression summary survives cancellation");
+    let owner = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let own_history = payload(f.handler.handle(
+        "chat.sessions.history", json!({"session_id":"report"}), &owner,
+    ).await);
+    assert_eq!(own_history["messages"], after["messages"]);
+    assert_eq!(sessions.acquire().await.query_row(
+        "SELECT COUNT(*) FROM webchat_turn_cancellations WHERE session_id='report'",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1, "the control record must exist without becoming content");
+}
+
+#[tokio::test]
+async fn webchat_queued_cancel_creates_no_session_and_checks_existing_owner() {
+    let f = fixture().await;
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    let sessions = &rc.session_manager;
+    sessions.record_webchat_cancel("never-started", "sales", "queued-turn", "queued-msg")
+        .await.unwrap();
+    assert!(sessions.session_agent("never-started").await.unwrap().is_none());
+    assert!(sessions.get_messages("never-started").await.unwrap().is_empty());
+    assert!(sessions.record_webchat_cancel("report", "other-agent", "foreign-turn", "foreign-msg")
+        .await.is_err());
+    assert_eq!(sessions.acquire().await.query_row(
+        "SELECT COUNT(*) FROM webchat_turn_cancellations", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 0);
+}

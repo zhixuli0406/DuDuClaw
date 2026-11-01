@@ -48,6 +48,11 @@ pub fn commit_config_rendered(
     handlers::config_commit::commit_local_config_rendered(home, expected_hash, render)
 }
 
+/// Validate an import or restore without allowing it to bypass the MFA switch.
+pub fn validate_mfa_config_unchanged(before: &str, after: &str) -> Result<(), String> {
+    mfa::refuse_policy_change(before, after)
+}
+
 pub mod a2a_signing;
 pub mod access_control;
 pub mod agent_binding;
@@ -382,6 +387,7 @@ pub mod relevance_ranker;
 pub mod reminder_scheduler;
 pub mod risk_detector;
 pub mod run_steps;
+pub(crate) mod autonomous_runtime;
 pub mod runtime;
 pub mod runtime_config;
 pub mod runtime_dispatch;
@@ -393,6 +399,7 @@ pub mod search_index;
 /// Credential redaction for operator-visible channel diagnostics (WP12).
 pub mod secret_redact;
 pub mod server;
+mod mfa;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;
@@ -633,3 +640,5 @@ pub mod credential_ledger;
 pub mod credential_declaration;
 
 mod egress_registry;
+
+pub(crate) mod live_events;

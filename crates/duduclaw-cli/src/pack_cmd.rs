@@ -208,7 +208,7 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
 }
 
 async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) -> Result<()> {
-    refuse_in_ai_session(&crate::ai_session_guard::markers())?;
+    refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
@@ -1146,8 +1146,8 @@ reports_to = "front"
 
     /// Every regular file under `root`, as (relative path, bytes), sorted.
     /// `experts/` is excluded: its `install.json` records a wall-clock
-    /// `installed_at`. Profile history is retained and validated below; only
-    /// its wall-clock identifiers are normalized for cross-run comparison.
+    /// `installed_at`. Profile history and audit are validated before their
+    /// wall-clock timestamps, version IDs and derived audit chain are normalized.
     fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
         fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             let Ok(rd) = std::fs::read_dir(dir) else {
@@ -1475,11 +1475,18 @@ reports_to = "front"
 
 #[cfg(test)]
 mod ai_session_tests {
-    #[test]
-    fn pack_install_is_refused_inside_an_ai_session() {
-        assert!(super::refuse_in_ai_session(&[]).is_ok());
-        let err = super::refuse_in_ai_session(&["DUDUCLAW_AGENT_ID"]).unwrap_err();
-        assert!(format!("{err}").contains("AI 員工不能安裝"), "{err}");
+    #[tokio::test(flavor = "current_thread")]
+    async fn pack_install_is_refused_inside_an_ai_session() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("missing");
+        for &marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
+            let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
+            let err = super::install_pack(
+                &missing, missing.to_str().unwrap(), super::InstallOptions::default(),
+            ).await.unwrap_err();
+            assert_eq!(crate::expert::import_error::failure_of(&err).unwrap().code, "import.ai_session", "{marker}");
+            assert!(!missing.exists());
+        }
     }
 }
 }

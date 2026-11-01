@@ -381,6 +381,14 @@ pub struct ViewTicket {
     /// The identity the ticket was issued to; re-read again on connect.
     pub ctx: UserContext,
     pub expires: Instant,
+    /// Original access-token expiry, retained for the entire viewer connection.
+    pub access_expires: Option<u64>,
+}
+
+impl ViewTicket {
+    pub(crate) fn credential_unexpired(&self) -> bool {
+        self.access_expires.is_none_or(|exp| (chrono::Utc::now().timestamp().max(0) as u64) < exp)
+    }
 }
 
 /// Single-use, short-lived tickets (a leaf lock, never held across await).
@@ -419,7 +427,7 @@ impl TicketBook {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(token)?;
-        (ticket.expires > now).then_some(ticket)
+        (ticket.expires > now && ticket.credential_unexpired()).then_some(ticket)
     }
 }
 
@@ -429,6 +437,7 @@ mod tests {
 
     fn ctx(role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
         UserContext {
+            credential_epoch: 0,
             user_id: "u1".into(),
             email: "u1@example.com".into(),
             role,
@@ -490,6 +499,7 @@ mod tests {
             session_id: "cu-1".into(),
             ctx: ctx(UserRole::Admin, &[]),
             expires: now + TICKET_TTL,
+            access_expires: None,
         };
         let token = book.issue(t.clone(), now);
         assert!(book.consume(&token, now).is_some());

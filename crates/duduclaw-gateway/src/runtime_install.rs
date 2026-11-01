@@ -253,6 +253,7 @@ fn emit(tx: &Option<tokio::sync::broadcast::Sender<String>>, event: &str, payloa
         payload,
         seq: None,
         state_version: None,
+        boot_id: None,
     };
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = tx.send(s);

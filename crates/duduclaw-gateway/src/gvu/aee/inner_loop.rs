@@ -277,6 +277,13 @@ where
 
         // ---- a. generate -------------------------------------------------
         let prompt_text = prompt::assemble(&input.base, &ctx);
+        match crate::autonomous_runtime::check_current().await {
+            Ok(()) => (),
+            Err(error) => {
+                outcome.exit = InnerLoopExit::GeneratorUnavailable { error };
+                return outcome;
+            }
+        };
         let response = match call_llm(prompt_text).await {
             Ok(r) => {
                 outcome.llm_calls += 1;
@@ -589,6 +596,13 @@ where
             cases: to_run,
             // Never. The inner loop must not even learn the held-out names.
             include_holdout: false,
+        };
+        match crate::autonomous_runtime::check_current().await {
+            Ok(()) => (),
+            Err(error) => {
+                outcome.exit = InnerLoopExit::GeneratorUnavailable { error };
+                return outcome;
+            }
         };
         let scored = match scorer.score(&req).await {
             Ok(Some(c)) => c,

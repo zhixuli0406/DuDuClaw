@@ -847,3 +847,32 @@ async fn native_and_plugin_profiles_require_preview_before_writes() {
         assert!(!home.path().join("agents").exists());
     }
 }
+
+#[test]
+fn expert_profile_patch_preserves_lifecycle_and_comments() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("agents/a1/agent.toml");
+    write(&path, "# operator comment\n[agent]\nname='a1'\nstatus='archived'\n");
+    super::patch_agent_toml(home.path(), "a1", |table| {
+        super::set_capabilities(table, &["Read".into()], &[]);
+    }).unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("# operator comment"));
+    let table: toml::Table = text.parse().unwrap();
+    assert_eq!(table["agent"]["status"].as_str(), Some("archived"));
+    assert_eq!(table["capabilities"]["allowed_tools"][0].as_str(), Some("Read"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn install_refuses_each_ai_session_marker_before_resolving_source() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("missing");
+    for &marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
+        let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
+        let err = super::install::cmd_install_with(
+            &missing, missing.to_str().unwrap(), super::install::PipelineOpts::default(),
+        ).await.unwrap_err();
+        assert_eq!(super::import_error::failure_of(&err).unwrap().code, "import.ai_session", "{marker}");
+        assert!(!missing.exists());
+    }
+}

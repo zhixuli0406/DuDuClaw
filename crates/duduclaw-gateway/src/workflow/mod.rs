@@ -51,3 +51,6 @@ mod f5a_e2e_tests;
 
 #[cfg(test)]
 mod security_race_tests;
+
+#[cfg(test)]
+mod autonomy_tests;

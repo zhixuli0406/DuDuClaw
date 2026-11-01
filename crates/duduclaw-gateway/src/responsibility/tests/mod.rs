@@ -56,7 +56,7 @@ impl Env {
         // S-L12: a responsibility needs an existing owner employee.
         let agent = dir.path().join("agents").join(OWNER);
         std::fs::create_dir_all(&agent).unwrap();
-        std::fs::write(agent.join("agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname = \"alice\"\nstatus = \"active\"\n").unwrap();
         let store = Arc::new(TaskStore::open(dir.path()).unwrap());
         let queue = Arc::new(MessageQueue::open(dir.path()).unwrap());
         Self {

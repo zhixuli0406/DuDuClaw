@@ -335,14 +335,14 @@ impl ProactiveGate {
             raw_event_text,
             persona_lines,
             |system, prompt| async move {
-                crate::runtime_dispatch::run_utility_prompt(
+                crate::autonomous_runtime::scope(&home, &aid, &[], crate::runtime_dispatch::run_utility_prompt(
                     &home,
                     agent_dir,
                     &aid,
                     &system,
                     &prompt,
                     crate::runtime_dispatch::UTILITY_MAX_TOKENS,
-                )
+                ))
                 .await
             },
         )

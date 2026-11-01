@@ -145,6 +145,8 @@ fn update_frontmatter_field_bumps_counter() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_renew_extends_lease_for_holder_only() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
+    create_test_agent(&tmp.path().join("agents"), "bruno", "");
     let create = handle_tasks_create(
         &serde_json::json!({ "title": "durable work", "durable": true }),
         tmp.path(),
@@ -206,6 +208,7 @@ async fn tasks_renew_extends_lease_for_holder_only() {
 #[tokio::test(flavor = "current_thread")]
 async fn goals_create_list_and_task_linkage() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let init = handle_goals_create(
         &serde_json::json!({ "title": "Grow revenue", "description": "2026 north star" }),
         tmp.path(),
@@ -269,8 +272,8 @@ async fn goals_create_list_and_task_linkage() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_depends_on_rejects_cycles_and_unknown_ids() {
     let tmp = TempDir::new();
-    let a =
-        handle_tasks_create(&serde_json::json!({ "title": "A" }), tmp.path(), "agnes").await;
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
+    let a = handle_tasks_create(&serde_json::json!({ "title": "A" }), tmp.path(), "agnes").await;
     let a_id = parse_ok(&a)["task"]["id"].as_str().unwrap().to_string();
 
     // B depends on A — legal.
@@ -357,6 +360,7 @@ async fn tasks_create_rejects_invalid_assigned_to() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_complete_is_idempotent() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({ "title": "Already done" }),
         tmp.path(),
@@ -398,13 +402,11 @@ async fn tasks_update_rejects_unknown_task() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_list_filters_by_status() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     // Create 3 tasks (sequential — parallel would race the SQLite lock)
-    let a =
-        handle_tasks_create(&serde_json::json!({ "title": "t1" }), tmp.path(), "agnes").await;
-    let b =
-        handle_tasks_create(&serde_json::json!({ "title": "t2" }), tmp.path(), "agnes").await;
-    let _c =
-        handle_tasks_create(&serde_json::json!({ "title": "t3" }), tmp.path(), "agnes").await;
+    let a = handle_tasks_create(&serde_json::json!({ "title": "t1" }), tmp.path(), "agnes").await;
+    let b = handle_tasks_create(&serde_json::json!({ "title": "t2" }), tmp.path(), "agnes").await;
+    let _c = handle_tasks_create(&serde_json::json!({ "title": "t3" }), tmp.path(), "agnes").await;
     let _ = b;
     let a_id = parse_ok(&a)["task"]["id"].as_str().unwrap().to_string();
 
@@ -451,6 +453,7 @@ async fn shared_skill_share_rejects_missing_skill_file() {
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_update_denies_agent_edit_of_acceptance_criteria_on_goal_mode_task_with_audit() {
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({
             "title": "Goal task",
@@ -494,8 +497,7 @@ async fn tasks_update_denies_agent_edit_of_acceptance_criteria_on_goal_mode_task
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn tasks_update_on_a_non_goal_mode_task_leaves_acceptance_criteria_unsupported_as_before()
-{
+async fn tasks_update_on_a_non_goal_mode_task_leaves_acceptance_criteria_unsupported_as_before() {
     // The H9-G reject-with-audit gate only fires for goal_mode tasks. On
     // an ordinary board task, `acceptance_criteria` was never part of the
     // agent-facing MCP update surface to begin with (unlike the dashboard
@@ -503,6 +505,7 @@ async fn tasks_update_on_a_non_goal_mode_task_leaves_acceptance_criteria_unsuppo
     // stay unchanged: the field is silently dropped, any other supplied
     // field still applies, and no reject/audit fires.
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({ "title": "Plain task" }),
         tmp.path(),
@@ -538,6 +541,7 @@ async fn tasks_update_goal_mode_freezes_goal_text_but_allows_other_fields() {
     // `description` (the goal text the judge reads); priority / ordinary
     // tags / depends_on remain agent-editable.
     let tmp = TempDir::new();
+    create_test_agent(&tmp.path().join("agents"), "agnes", "");
     let create = handle_tasks_create(
         &serde_json::json!({
             "title": "Goal task",

@@ -820,6 +820,9 @@ pub async fn maybe_run_induction_tick(
     agent_id: &str,
     now: DateTime<Utc>,
 ) -> io::Result<Option<InductionReport>> {
+    if duduclaw_core::autonomy_gate::check(home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background).is_err() {
+        return Ok(None);
+    }
     let state_path = home_dir.join(STATE_FILE_NAME);
     let today = now.format("%Y-%m-%d").to_string();
     let already_ran = load_state_map(&state_path)
@@ -1554,6 +1557,11 @@ mod tests {
     #[tokio::test]
     async fn maybe_run_induction_tick_is_day_gated() {
         let home = temp_home();
+        std::fs::create_dir_all(home.join("agents/agent-gate")).unwrap();
+        std::fs::write(home.join("agents/agent-gate/agent.toml"), "[agent]\nname = \"agent-gate\"\nstatus = \"active\"\n").unwrap();
+        duduclaw_core::autonomy_gate::set_pause(&home, Some("agent-gate"), "pause", "user").unwrap();
+        assert!(maybe_run_induction_tick(&home, "agent-gate", Utc::now()).await.unwrap().is_none());
+        duduclaw_core::autonomy_gate::resume(&home, Some("agent-gate")).unwrap();
         let now = Utc::now();
         let first = maybe_run_induction_tick(&home, "agent-gate", now)
             .await

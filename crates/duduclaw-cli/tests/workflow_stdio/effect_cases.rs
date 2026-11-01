@@ -418,7 +418,7 @@ async fn workflow_stdio_native_gates_block_prepare_without_effect_or_operation()
         let (home, key) = setup();
         std::fs::write(
             home.path().join("agents/alice/agent.toml"),
-            format!("[agent]\nname=\"alice\"\nrole=\"fixture\"\n[capabilities]\n{capabilities}\n[permissions]\n{permissions}\n")
+            format!("[agent]\nname=\"alice\"\nrole=\"fixture\"\nstatus=\"active\"\n[capabilities]\n{capabilities}\n[permissions]\n{permissions}\n")
         )
         .unwrap();
         let mut alice = session(home.path(), "alice", &key).await;
@@ -451,7 +451,7 @@ async fn workflow_stdio_static_human_required_never_accepts_json_approved() {
     let (home, key) = setup();
     std::fs::write(
         home.path().join("agents/alice/agent.toml"),
-        "[agent]\nname=\"alice\"\nrole=\"fixture\"\n[capabilities]\napproval_required_tools=[\"tasks_update\"]\n"
+        "[agent]\nname=\"alice\"\nrole=\"fixture\"\nstatus=\"active\"\n[capabilities]\napproval_required_tools=[\"tasks_update\"]\n"
     )
     .unwrap();
     let mut alice = session(home.path(), "alice", &key).await;

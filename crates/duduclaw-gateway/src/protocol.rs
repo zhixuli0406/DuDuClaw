@@ -36,6 +36,8 @@ pub enum WsFrame {
         seq: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         state_version: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot_id: Option<String>,
     },
 }
 
@@ -67,6 +69,7 @@ impl WsFrame {
             payload,
             seq: None,
             state_version: None,
+            boot_id: None,
         }
     }
 }

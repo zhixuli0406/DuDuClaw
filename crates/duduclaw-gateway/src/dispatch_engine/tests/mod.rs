@@ -92,6 +92,7 @@
 
 
     async fn seed_review(store: &TaskStore, id: &str) {
+        ensure_autonomy_agent(store, "w");
         let g = pending_goal(id);
         store.insert_task(&g).await.unwrap();
         // Claim + complete → goal-mode routes to `review`.
@@ -129,6 +130,7 @@
 
     /// Seed a `review` goal task carrying `tags` and a worker `result_summary`.
     async fn seed_review_with(store: &TaskStore, id: &str, tags: &str, result: &str) {
+        ensure_autonomy_agent(store, "w");
         let mut g = pending_goal(id);
         g.tags = tags.to_string();
         store.insert_task(&g).await.unwrap();
@@ -353,3 +355,12 @@
         path.to_string_lossy().into_owned()
     }
 
+
+    fn ensure_autonomy_agent(store: &TaskStore, id: &str) {
+        let dir = store.home_dir().unwrap().join("agents").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        if !path.exists() {
+            std::fs::write(path, format!("[agent]\nname = \"{id}\"\nstatus = \"active\"\n")).unwrap();
+        }
+    }

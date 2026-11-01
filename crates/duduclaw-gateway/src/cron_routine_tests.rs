@@ -138,6 +138,7 @@ async fn routine_cursor_survives_restart_and_two_store_competition() {
 async fn routine_disabled_manual_refuses_before_service_or_legacy_invocation() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(CronStore::open(home.path()).unwrap());
+    let registry = Arc::new(RwLock::new(AgentRegistry::new(home.path().join("agents"))));
     let mut row = routine("0 * * * * * *", "Asia/Taipei");
     row.enabled = false;
     store.insert(&row).await.unwrap();
@@ -148,6 +149,7 @@ async fn routine_disabled_manual_refuses_before_service_or_legacy_invocation() {
     let result = enqueue_routine_trigger(
         home.path(),
         &store,
+        &registry,
         &row.id,
         crate::workflow::Trigger::Manual {
             request_id: "manual-request".into(),
@@ -233,6 +235,14 @@ async fn enabling_a_routine_moves_its_cursor_to_now_and_skip_is_recorded() {
 #[tokio::test]
 async fn bound_routine_manual_run_without_request_id_is_refused_everywhere() {
     let home = tempfile::tempdir().unwrap();
+    // Reach the request-id gate with an operational employee.
+    let agent_dir = home.path().join("agents/worker");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("agent.toml"),
+        "[agent]\nname = \"worker\"\nstatus = \"active\"\n",
+    )
+    .unwrap();
     let store = Arc::new(CronStore::open(home.path()).unwrap());
     let mut row = routine("0 0 9 * * * *", "Asia/Taipei");
     row.enabled = false;

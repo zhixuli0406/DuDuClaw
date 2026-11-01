@@ -75,7 +75,7 @@ fn login_throttle_ip(ip: IpAddr) -> IpAddr {
 
 /// Returns `true` if the attempt from `(ip, email)` is within the rate budget.
 /// Loopback peers share one key per email ([`login_throttle_ip`]).
-fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
+pub(crate) fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
     let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
@@ -175,6 +175,7 @@ struct AppState {
     tx: broadcast::Sender<String>,
     /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
     event_tx: broadcast::Sender<String>,
+    prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
     /// User database for multi-user authentication.
     user_db: Arc<UserDb>,
     /// JWT configuration for token issuance and verification.
@@ -840,6 +841,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "Failed to initialize user database: {e}"
         ))
     })?);
+    crate::mfa::reload_policy(&home_dir);
     // Establish the non-retroactive window before any channel accepts turns.
     handler.resolve_edition_profile().await;
     if let Err(e) = crate::team_oversight::observe_window(&home_dir, &user_db, "gateway_boot") {
@@ -954,6 +956,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
+                // Reuse this hourly maintenance timer. Only the gateway lock
+                // holder sweeps fences, even when no dashboard is connected.
+                if duduclaw_core::gateway_instance::held(&hd) && hd.join("approvals.db").exists() {
+                    let home = hd.clone();
+                    match tokio::task::spawn_blocking(move || crate::approval::ApprovalBroker::open(&home)).await {
+                        Ok(Ok(broker)) => {
+                            if let Err(error) = broker.sweep_cancelled_turns().await {
+                                warn!(%error, "approval cancellation fence sweep failed");
+                            }
+                        }
+                        Ok(Err(error)) => warn!(%error, "approval cancellation fence store unavailable"),
+                        Err(error) => warn!(%error, "approval cancellation fence sweep worker failed"),
+                    }
+                }
                 crate::cost_telemetry::adaptive_routing_check(&hd).await;
             }
         });
@@ -1157,7 +1173,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
-    let (event_tx, _) = broadcast::channel::<String>(64);
+    let _ = crate::live_events::boot_id();
+    let (event_tx, _) = broadcast::channel::<String>(1024);
     handler.set_event_tx(event_tx.clone()).await;
     // B5: give `dashboard_navigate::push_dashboard_navigate` a handle to the
     // SAME sender every `/ws` connection subscribes to, so any code path in
@@ -1966,6 +1983,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // does no workflow reconciliation, dispatch or sweep at all.
     match duduclaw_core::gateway_instance::acquire(&home_dir) {
         Ok(()) => {
+            handler.reconcile_autonomy_changes().await;
             reconcile_workflows_on_boot(&home_dir).await;
             spawn_workflow_sweep(home_dir.to_path_buf());
         }
@@ -2089,6 +2107,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                             }),
                             seq: None,
                             state_version: None,
+                            boot_id: None,
                         };
                         if let Ok(json) = serde_json::to_string(&event) {
                             let _ = etx.send(json);
@@ -2154,6 +2173,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                         }),
                                         seq: None,
                                         state_version: None,
+                                        boot_id: None,
                                     };
                                     if let Ok(json) = serde_json::to_string(&done_event) {
                                         let _ = etx.send(json);
@@ -2320,11 +2340,21 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::otp_delivery::ConfigOtpDeliverer::new(home_dir.clone(), reqwest::Client::new()),
     );
 
+    let policy_home = home_dir.clone();
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            timer.tick().await;
+            let home = policy_home.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::mfa::reload_policy(&home)).await;
+        }
+    });
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
         handler,
         tx,
         event_tx,
+            prepared_events: Default::default(),
         user_db,
         jwt_config,
         otp_delivery,
@@ -2389,6 +2419,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/login", post(handle_login))
         .route("/api/otp/request", post(handle_otp_request))
         .route("/api/otp/verify", post(handle_otp_verify))
+        .route("/api/mfa/verify", post(server_mfa::verify))
+        .route("/api/mfa/enroll/begin", post(server_mfa::enroll_begin))
+        .route("/api/mfa/enroll/confirm", post(server_mfa::enroll_confirm))
         .route("/api/channel-identity/bind", post(handle_channel_bind))
         .route(
             "/api/channel-identity/list",
@@ -3235,6 +3268,10 @@ async fn handle_login(
     };
 
     // Get agent bindings for this user
+    if let Some(response) = server_mfa::after_first_factor(&state, &user, duduclaw_auth::mfa::FirstFactor::Password).await {
+        return response;
+    }
+
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
     let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
         .iter()
@@ -3243,7 +3280,7 @@ async fn handle_login(
 
     // Issue tokens
     let (access_token, refresh_token) =
-        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -3393,6 +3430,10 @@ async fn handle_otp_verify(
         }
     };
 
+    if let Some(response) = server_mfa::after_first_factor(&state, &user, duduclaw_auth::mfa::FirstFactor::ChannelOtp).await {
+        return response;
+    }
+
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
     let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
         .iter()
@@ -3400,7 +3441,7 @@ async fn handle_otp_verify(
         .collect();
 
     let (access_token, refresh_token) =
-        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -3465,6 +3506,9 @@ async fn handle_channel_bind(
                 .into_response();
         }
     };
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -3500,11 +3544,18 @@ async fn handle_channel_bind(
         )
             .into_response();
     }
-    match state.user_db.bind_channel_identity(
+    let personal = state.handler.resolve_edition_profile().await.is_personal();
+    match crate::mfa::enforced(&state.home_dir, personal) {
+        Ok(_) => (),
+        Err(_) => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"authentication service unavailable"}))).into_response(),
+    };
+    match state.user_db.bind_channel_identity_authorized(
         &body.user_id,
         &body.channel,
         &body.channel_user_id,
         true,
+        Some(&caller.id),
+        !personal,
     ) {
         Ok(()) => {
             let _ = state.user_db.log_action(
@@ -3557,6 +3608,9 @@ async fn handle_channel_identity_list(
                 .into_response();
         }
     };
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -3730,7 +3784,7 @@ async fn handle_refresh(
 
     // Fetch fresh user data and bindings
     let user = match state.user_db.get_user(&claims.sub) {
-        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active => u,
+        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, u.credential_epoch) => u,
         _ => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
@@ -3739,6 +3793,13 @@ async fn handle_refresh(
                 .into_response();
         }
     };
+
+    // Existing access tokens and open connections are not revoked. Stop renewal;
+    // the caller enrolls when its current access token naturally expires.
+    if !server_mfa::refresh_allowed(&state, &user.id).await {
+        return (axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "請重新登入並完成雙因素驗證註冊。"}))).into_response();
+    }
 
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
     let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
@@ -3781,6 +3842,9 @@ async fn handle_me(
         }
     };
 
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -3839,6 +3903,9 @@ async fn handle_change_password(
         }
     };
 
+    if authenticate_jwt(&state, token).is_err() {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid or expired token"}))).into_response();
+    }
     let claims = match state.jwt_config.verify_access_token(token) {
         Ok(c) => c,
         _ => {
@@ -4748,9 +4815,7 @@ fn authorize_file_access(
     // authority from one current users.db snapshot, never JWT bindings.
     // This also refuses inactive users and database errors without a fallback.
     let claims = state.jwt_config.verify_access_token(token).map_err(|_| unauthorized())?;
-    let ctx = state
-        .user_db
-        .live_user_context(&claims.sub)
+    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)
         .map_err(|_| unauthorized())?
         .ok_or_else(unauthorized)?;
     require_password_changed(&ctx)?;
@@ -7953,7 +8018,8 @@ async fn handle_causal_extract(
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let store = CausalStore::new(state.home_dir.join("memory.db"));
-    match crate::causal_extraction_runner::extract_candidates_with_provider(
+    match crate::autonomous_runtime::human_interactive(&state.home_dir,
+        crate::causal_extraction_runner::extract_candidates_with_provider(
         &store,
         &scope,
         &request.artifact_id,
@@ -7961,6 +8027,7 @@ async fn handle_causal_extract(
         policy.model(),
         provider.as_ref(),
         |scope, provider, model| policy.allows(scope, provider, model),
+    )
     )
     .await
     {
@@ -9087,6 +9154,7 @@ mod decision_shadow_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -9917,6 +9985,7 @@ mod decision_sla_shadow_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -10366,6 +10435,7 @@ mod decision_model_candidate_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -11240,6 +11310,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -11378,6 +11449,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -12041,6 +12113,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -12226,6 +12299,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -12388,6 +12462,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -14252,6 +14327,7 @@ mod causal_curation_api_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db,
             jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -15900,6 +15976,7 @@ fn pre_auth_handshake_allowed(
 /// rows never claim a person did this.
 fn pre_auth_context() -> UserContext {
     UserContext {
+        credential_epoch: 0,
         user_id: "lockscreen".to_string(),
         email: "lockscreen@local".to_string(),
         role: duduclaw_auth::UserRole::Employee,
@@ -15926,6 +16003,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     let mut pre_auth = false;
     let mut legacy_admin_authenticated = false;
     let mut dashboard_session: Option<(String, String)> = None;
+    let mut access_expires: Option<u64> = None;
 
     // --- Authentication gate ---
     // Resolve a UserContext from the first "connect" message.
@@ -15935,7 +16013,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     //   3. Appliance lock screen: credential-less, loopback, restricted
     //   4. No auth configured: admin fallback
 
-    let user_ctx: UserContext = if state.auth.is_auth_required() || has_users(&state.user_db) {
+    let mut user_ctx: UserContext = if state.auth.is_auth_required() || has_users(&state.user_db) {
         // Timeout auth handshake to prevent Slowloris-style resource exhaustion (BE-C4)
         let auth_timeout = std::time::Duration::from_secs(10);
         let result = match tokio::time::timeout(auth_timeout, socket.recv()).await {
@@ -15987,11 +16065,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     Ok(ctx) => {
                                         // Session provenance comes only from this
                                         // verified JWT, never connect parameters.
+                                        access_expires = Some(0);
                                         dashboard_session = state
                                             .jwt_config
                                             .verify_access_token(jwt_str)
                                             .ok()
                                             .and_then(|claims| {
+                                                access_expires = Some(claims.exp);
                                                 claims.jti.map(|jti| (claims.sub, jti))
                                             });
                                         // `must_change_password` is surfaced here so a
@@ -16004,6 +16084,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                             &id,
                                             serde_json::json!({
                                                 "status": "authenticated",
+                                                "boot_id": crate::live_events::boot_id(),
                                                 "user": {
                                                     "id": ctx.user_id,
                                                     "email": ctx.email,
@@ -16054,7 +16135,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 pre_auth = true;
                                 let ok = WsFrame::ok_response(
                                     &id,
-                                    serde_json::json!({ "status": "pre_auth" }),
+                                    serde_json::json!({ "status": "pre_auth", "boot_id": crate::live_events::boot_id() }),
                                 );
                                 let _ = socket
                                     .send(Message::Text(
@@ -16065,6 +16146,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 Ok(pre_auth_context())
                             }
                             // ── Legacy token authentication ────────────────────
+                            else if !server_mfa::legacy_token_allowed(&state).await {
+                                let err = WsFrame::error_response(&id, "已要求雙因素驗證；請使用帳號與雙因素驗證登入，不能使用舊版共用 token。");
+                                let _ = socket.send(Message::Text(serde_json::to_string(&err).unwrap_or_default().into())).await;
+                                Err(())
+                            }
                             else if state.auth.is_auth_required() {
                                 let token =
                                     params.get("token").and_then(|v| v.as_str()).unwrap_or("");
@@ -16073,7 +16159,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                         legacy_admin_authenticated = true;
                                         let ok = WsFrame::ok_response(
                                             &id,
-                                            serde_json::json!({"status": "authenticated"}),
+                                            serde_json::json!({"status": "authenticated", "boot_id": crate::live_events::boot_id()}),
                                         );
                                         let _ = socket
                                             .send(Message::Text(
@@ -16154,7 +16240,33 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // Split the socket so we can drive sending and receiving concurrently.
     let (mut sink, mut stream) = socket.split();
     let mut log_rx = state.tx.subscribe();
-    let mut event_rx = state.event_tx.subscribe();
+    // Clone before OnceCell::get_or_init. The init future must not borrow
+    // AppState while the cell itself is borrowed, and the snapshot task is
+    // shared by every connection on this process.
+    let raw_events = state.event_tx.clone();
+    let prepare_home = state.home_dir.clone();
+    let prepared_tx = state.prepared_events.get_or_init(|| async move {
+        let mut raw = raw_events.subscribe();
+        let (prepared_tx, _) = broadcast::channel(1024);
+        let output = prepared_tx.clone();
+        let home = prepare_home;
+        tokio::spawn(async move {
+            loop {
+                let line = match raw.recv().await {
+                    Ok(line) => line,
+                    Err(broadcast::error::RecvError::Lagged(_)) =>
+                        serde_json::to_string(&WsFrame::event("events_lost", serde_json::json!({}))).unwrap(),
+                    Err(_) => break,
+                };
+                if let Some(frame) = crate::handlers::PreparedPush::prepare(home.clone(), line).await {
+                    let _ = output.send(Arc::new(frame));
+                }
+            }
+        });
+        prepared_tx
+    }).await;
+    let mut prepared_rx = prepared_tx.subscribe();
+
     // Per-connection gate for broadcast events (task gate, employee binding,
     // admin-only kinds, lock screen); see `handlers/push_filter.rs`.
     let mut push_gate = crate::handlers::PushGate::new_with_legacy(
@@ -16163,7 +16275,50 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
         pre_auth,
         conn_info.legacy_admin_authenticated,
     );
+    // Keep at most one authorization future, started only after selecting a
+    // frame for delivery. Never queue already-authorized JSON: a slow socket
+    // must not build a backlog retaining a revoked reader's authority.
+    let mut event_gate = Some(push_gate.clone());
+    let mut pending_push: Option<tokio::task::JoinHandle<(crate::handlers::PushGate, Option<String>)>> = None;
+    let mut pending_source: Option<Arc<crate::handlers::PreparedPush>> = None;
     let mut logs_subscribed = false;
+    let mut sequence = crate::live_events::EventSequence::default();
+    let run_state = state.clone();
+    // Both run authorizers snapshot the connection's current identity at
+    // call time. A self-service MFA handover keeps the same user/slots.
+    let (run_identity, run_ctx) = tokio::sync::watch::channel((0u64, user_ctx.clone()));
+    let deliver_ctx = run_ctx.clone();
+    let (run_subscriptions, queued_rx) = crate::live_events::RunSubscriptions::new_authorized(
+        &state.home_dir, &user_ctx.user_id, Arc::new(move |step| {
+            let state = run_state.clone();
+            let (_, ctx) = run_ctx.borrow().clone();
+            Box::pin(async move { state.handler.may_push_run_step(&step, &ctx).await })
+        }),
+    );
+    // Authorize again off the select loop, into a one-slot channel. The arm
+    // below only receives a step that already passed that check.
+    let (ready_tx, mut run_rx) = tokio::sync::mpsc::channel(1);
+    #[cfg(test)]
+    let test_ready_tx = ready_tx.clone();
+    {
+        let subscriptions = run_subscriptions.clone();
+        let deliver_state = state.clone();
+        crate::live_events::spawn_forwarder(
+                subscriptions,
+                queued_rx,
+                ready_tx,
+                Arc::new(move |step| {
+                    let state = deliver_state.clone();
+                    let (revision, ctx) = deliver_ctx.borrow().clone();
+                    Box::pin(async move { (revision, state.handler.may_push_run_step(&step, &ctx).await) })
+                }),
+            );
+    }
+    let mut run_commands = crate::live_events::RateWindow::default();
+    let mut run_rate = crate::live_events::RateWindow::default();
+    // Serialize subscription changes; other RPCs remain fully concurrent.
+    let mut run_command_pending = false;
+    let mut run_dropped_notice = false;
 
     // ── P4-3+: OS-native live event tail (opt-in, admin-gated) ────────────
     // A fresh `Receiver` scoped to THIS connection — dropping it (loop exit /
@@ -16201,12 +16356,60 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // os_events_subscribed and logs_subscribed updates (see the
     // os.events.subscribe authorization note below).
     let (rpc_tx, mut rpc_rx) =
-        tokio::sync::mpsc::channel::<(WsFrame, Option<bool>, Option<bool>)>(64);
+        tokio::sync::mpsc::channel::<(WsFrame, Option<bool>, Option<bool>, Option<(bool, serde_json::Value)>)>(64);
 
+    let mut recovery = crate::handlers::live_context::SocketRecovery::default();
+
+    // Coalesce authorized output discarded during identity-store outages.
+    // Only heartbeat checks consume SocketRecovery's three-tick window.
+    let mut output_lost = false;
+    #[cfg(test)]
+    let _ = live_events_socket_tests::SOCKET_TEST_HOOKS.try_with(|hooks| {
+        if let Some(tx) = hooks.ready.lock().unwrap().take() {
+            let _ = tx.send(live_events_socket_tests::SocketProbe {
+                steps: test_ready_tx.clone(),
+                identity: run_identity.subscribe(),
+                subscriptions: run_subscriptions.clone(),
+                events: prepared_tx.clone(),
+                push_pause: hooks.push_pause.clone(),
+                handover_pause: hooks.handover_pause.clone(),
+                unsubscribe_after_stage: hooks.unsubscribe_after_stage.clone(),
+            });
+        }
+    });
+    macro_rules! socket_output_gate {
+        ($heartbeat:expr, $drops_output:expr) => {
+            let validity = server_mfa::socket_validity(
+                &state, &user_ctx, access_expires, legacy_admin_authenticated, $heartbeat,
+            ).await;
+            let allowed = recovery.observe(validity, $heartbeat);
+            #[cfg(test)]
+            let _ = live_events_socket_tests::SOCKET_TEST_HOOKS.try_with(|hooks| {
+                let _ = hooks.checked.send(($heartbeat, $drops_output, allowed));
+            });
+            if !allowed {
+                if recovery.closed() {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+                output_lost |= $drops_output;
+                // No ping is sent while paused. Do not let the ordinary
+                // pong deadline cut short the identity recovery window.
+                if $heartbeat { last_pong = std::time::Instant::now(); }
+                continue;
+            }
+            if output_lost {
+                let Some(text) = sequence.lost() else { break; };
+                if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                output_lost = false;
+            }
+        };
+    }
     loop {
         tokio::select! {
             // ── Heartbeat ping ─────────────────────────────
             _ = heartbeat_interval.tick() => {
+                socket_output_gate!(true, false);
                 if last_pong.elapsed().as_secs() > 60 {
                     warn!("Dashboard WebSocket heartbeat timeout");
                     break;
@@ -16226,6 +16429,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
+                        socket_output_gate!(false, false);
                         let frame = match serde_json::from_str::<WsFrame>(&text) {
                             Ok(f) => f,
                             Err(e) => {
@@ -16239,6 +16443,85 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
 
                         match frame {
                             WsFrame::Request { id, method, params } => {
+                                if server_mfa::is_session_handover(&method) {
+                                    #[cfg(test)]
+                                    if let Some((entered, release)) = live_events_socket_tests::SOCKET_TEST_HOOKS
+                                        .try_with(|hooks| hooks.handover_pause.lock().unwrap().take()).ok().flatten()
+                                    {
+                                        let _ = entered.send(true);
+                                        let _ = release.await;
+                                        // Stage an actually completed authorization in
+                                        // run_rx before committing the test handover.
+                                        let ready = run_rx.recv().await.expect("test ready step");
+                                        test_ready_tx.try_send(ready).expect("test ready slot");
+                                        if let Some(selector) = live_events_socket_tests::SOCKET_TEST_HOOKS
+                                            .try_with(|hooks| hooks.unsubscribe_after_stage.lock().unwrap().take())
+                                            .ok().flatten() {
+                                            run_subscriptions.update(selector, false).unwrap();
+                                        }
+                                    }
+                                    // Keep commit -> rebind -> send in one socket turn. These
+                                    // local MFA operations do not call external services. A
+                                    // spawned response would let a heartbeat retire this
+                                    // connection after commit but before it could rebind.
+                                    let result = crate::mfa::ACCESS_EXPIRY.scope(access_expires,
+                                        crate::google_personal::DASHBOARD_SESSION.scope(
+                                            dashboard_session.clone(),
+                                            server_mfa::call_with_handover(&state, &method, params, &user_ctx, conn_info),
+                                        )).await;
+                                    if let Some(handover) = result.handover {
+                                        handover.apply(&mut user_ctx, &mut dashboard_session, &mut access_expires);
+                                        push_gate = crate::handlers::PushGate::new_with_legacy(
+                                            &state.home_dir, &user_ctx, pre_auth, legacy_admin_authenticated,
+                                        );
+                                        let revision = run_identity.borrow().0.checked_add(1)
+                                            .expect("connection identity revision exhausted");
+                                        run_identity.send_replace((revision, user_ctx.clone()));
+                                        // Never use an old task's result or restore its gate.
+                                        // Re-authorize the source under the new identity;
+                                        // handover alone neither loses output nor advances seq.
+                                        if let Some(pending) = pending_push.take() {
+                                            pending.abort();
+                                            let frame = pending_source.as_ref().expect("pending push source").clone();
+                                            let mut gate = push_gate.clone();
+                                            pending_push = Some(tokio::spawn(async move {
+                                                let result = gate.filter_prepared(frame).await;
+                                                (gate, result)
+                                            }));
+                                        } else {
+                                            event_gate = Some(push_gate.clone());
+                                        }
+                                    }
+                                    // Force a fresh read: a pre-commit cache hit belongs to
+                                    // the old epoch; another reset must still revoke us.
+                                    let validity = server_mfa::socket_validity(
+                                        &state, &user_ctx, access_expires, legacy_admin_authenticated, true,
+                                    ).await;
+                                    if !recovery.observe(validity, false) {
+                                        if recovery.closed() {
+                                            let _ = sink.send(Message::Close(None)).await;
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    let mut response = result.response;
+                                    if let WsFrame::Response { id: ref mut response_id, .. } = response {
+                                        *response_id = id;
+                                    }
+                                    let text = serde_json::to_string(&response).unwrap_or_default();
+                                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                                    continue;
+                                }
+                                let is_run_command = matches!(method.as_str(), "runs.subscribe" | "runs.unsubscribe");
+                                if is_run_command {
+                                    if run_command_pending || !run_commands.command(conn_start.elapsed().as_millis() as u64) {
+                                        let response = WsFrame::error_response(&id, "run subscription rate limited; retry later");
+                                        let text = serde_json::to_string(&response).unwrap_or_default();
+                                        if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                                        continue;
+                                    }
+                                    run_command_pending = true;
+                                }
                                 // Log subscription state is gated on the
                                 // response below, like os.events (F5-D: the
                                 // flag used to flip on the method name before
@@ -16254,10 +16537,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 let task_tx = rpc_tx.clone();
                                 let task_session = dashboard_session.clone();
                                 tokio::spawn(async move {
-                                    let mut response = crate::google_personal::DASHBOARD_SESSION.scope(
+                                    let mut response = crate::mfa::ACCESS_EXPIRY.scope(access_expires, crate::google_personal::DASHBOARD_SESSION.scope(
                                         task_session,
                                         task_state.handler.handle_conn(&method, params, &task_ctx, conn_info),
-                                    ).await;
+                                    )).await;
 
                                     // P4-3+ OS live event tail: unlike `logs.subscribe` above
                                     // (which flips its flag on the method NAME alone, before
@@ -16287,7 +16570,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     if let WsFrame::Response { id: ref mut resp_id, .. } = response {
                                         *resp_id = id;
                                     }
-                                    let _ = task_tx.send((response, os_update, logs_update)).await;
+                                    let run_update = is_run_command.then(|| {
+                                        let selected = match &response {
+                                            WsFrame::Response { ok: true, payload: Some(p), .. } => p.get("subscription").cloned().unwrap_or_default(),
+                                            _ => serde_json::Value::Null,
+                                        };
+                                        (method == "runs.subscribe", selected)
+                                    });
+                                    let _ = task_tx.send((response, os_update, logs_update, run_update)).await;
                                 });
                             }
                             other => { warn!("Received non-request frame: {:?}", other); }
@@ -16295,6 +16585,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                     }
                     Message::Close(_) => { info!("WebSocket connection closed by client"); break; }
                     Message::Ping(data) => {
+                        socket_output_gate!(false, false);
                         if sink.send(Message::Pong(data)).await.is_err() { break; }
                     }
                     Message::Pong(_) => {
@@ -16308,7 +16599,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             // `rpc_tx` is held by this scope, so recv() can only yield None
             // after every in-flight task dropped its clone AND the local
             // sender was dropped — which never happens while this loop runs.
-            Some((response, os_update, logs_update)) = rpc_rx.recv() => {
+            Some((mut response, os_update, logs_update, run_update)) = rpc_rx.recv() => {
+                if let Some((subscribe, selected)) = run_update {
+                    run_command_pending = false;
+                    if let Ok(selector) = crate::live_events::RunSelector::parse(&selected) {
+                        if let Err(error) = run_subscriptions.update(selector, subscribe) {
+                            let id = match &response { WsFrame::Response { id, .. } => id.clone(), _ => String::new() };
+                            response = WsFrame::error_response(&id, error);
+                        }
+                    }
+                }
+                socket_output_gate!(false, false);
                 if let Some(on) = logs_update {
                     logs_subscribed = on;
                 }
@@ -16325,13 +16626,56 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 if sink.send(Message::Text(resp_text.into())).await.is_err() { break; }
             }
 
+            // Loss is signalled only after a successful authorization; saturated
+            // admission keeps one silent marker until a later authorized step.
+            _ = run_subscriptions.loss_notified() => {
+                if run_subscriptions.take_lost() {
+                    output_lost = true;
+                    socket_output_gate!(false, false);
+                }
+            }
+
+            // Dedicated per-connection step queue: no dashboard broadcast.
+            // The step was authorized on the forwarder immediately before it
+            // entered this one-slot channel. Reject results from an older
+            // identity, including handovers during the authorization itself.
+            Some(ready) = run_rx.recv() => {
+                if !run_subscriptions.matches(&ready.step) { continue; }
+                if ready.revision != run_identity.borrow().0 {
+                    // This stale step passed authorization for this same reader;
+                    // loss reveals nothing they could not see at that moment.
+                    // Coalesce saturation and this discarded step into one notice.
+                    let _ = run_subscriptions.take_lost();
+                    output_lost = true;
+                    socket_output_gate!(false, false);
+                    continue;
+                }
+                let step = ready.step;
+                output_lost |= run_subscriptions.take_lost();
+                socket_output_gate!(false, true);
+                if !run_rate.take(conn_start.elapsed().as_millis() as u64, crate::live_events::RUN_STEPS_PER_SEC) {
+                    // Emit one reconciliation signal per capped window.
+                    if run_dropped_notice { continue; }
+                    run_dropped_notice = true;
+                    let Some(text) = sequence.lost() else { break; };
+                    if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                    continue;
+                }
+                run_dropped_notice = false;
+                let Some(text) = sequence.encode(step.frame()) else { break; };
+                if sink.send(Message::Text(text.into())).await.is_err() { break; }
+            }
+
             // ── Outbound log broadcast (only when subscribed) ─
             log_line = log_rx.recv(), if logs_subscribed => {
                 match log_line {
                     // The log tail is Manager+; a downgraded or suspended
                     // account stops receiving it within the push cache window.
-                    Ok(_) if !push_gate.allows_log_tail() => {}
+                    Ok(_) if !push_gate.allows_log_tail() => {
+                        socket_output_gate!(false, false);
+                    }
                     Ok(line) => {
+                        socket_output_gate!(false, true);
                         // Send as WsFrame::Event so the frontend can parse it uniformly
                         let data = serde_json::from_str::<serde_json::Value>(&line)
                             .unwrap_or(serde_json::Value::String(line));
@@ -16340,30 +16684,56 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                             payload: data,
                             seq: None,
                             state_version: None,
+                            boot_id: None,
                         };
-                        let text = serde_json::to_string(&push).unwrap_or_default();
+                        let Some(text) = sequence.encode(push) else { break; };
                         if sink.send(Message::Text(text.into())).await.is_err() { break; }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        output_lost = true;
+                        socket_output_gate!(false, false);
+                    }
                     Err(_) => break,
                 }
             }
 
-            // ── Outbound event broadcast (always active for authenticated clients) ─
-            event_line = event_rx.recv() => {
-                match event_line {
-                    Ok(json) => {
-                        // Events are already serialized as WsFrame::Event JSON.
-                        // Task events pass the same per-reader gate as the
-                        // task RPCs (live identity + TaskPacket audience):
-                        // dropped or reduced to the board card per connection.
-                        let Some(json) = push_gate.filter(&json) else {
-                            continue;
-                        };
-                        if sink.send(Message::Text(json.into())).await.is_err() { break; }
+            // Start bounded authorization without blocking incoming frames,
+            // heartbeats or RPC responses. Preserve the future across selects.
+            event_frame = prepared_rx.recv(), if pending_push.is_none() => {
+                let frame = match event_frame {
+                    Ok(frame) => frame,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        output_lost = true;
+                        socket_output_gate!(false, false);
+                        continue;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
                     Err(_) => break,
+                };
+                let mut gate = event_gate.take().expect("one pending push");
+                pending_source = Some(frame.clone());
+                #[cfg(test)]
+                let push_pause = live_events_socket_tests::SOCKET_TEST_HOOKS
+                    .try_with(|hooks| hooks.push_pause.lock().unwrap().take()).ok().flatten();
+                pending_push = Some(tokio::spawn(async move {
+                    let result = gate.filter_prepared(frame).await;
+                    #[cfg(test)]
+                    if let Some((filtered, release)) = push_pause {
+                        let _ = filtered.send(result.is_some());
+                        let _ = release.await;
+                    }
+                    (gate, result)
+                }));
+            }
+            result = async { pending_push.as_mut().expect("pending push").await }, if pending_push.is_some() => {
+                pending_push = None;
+                pending_source = None;
+                let Ok((gate, line)) = result else { break; };
+                // Restore before the gate can continue or break the loop.
+                event_gate = Some(gate);
+                if let Some(line) = line {
+                    socket_output_gate!(false, true);
+                    let Some(json) = sequence.filtered(&line) else { break; };
+                    if sink.send(Message::Text(json.into())).await.is_err() { break; }
                 }
             }
 
@@ -16380,6 +16750,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                 match os_ev {
                     Ok(ev) => {
                         if let Some(payload) = crate::os_events::os_event_push_payload(&ev) {
+                            socket_output_gate!(false, true);
                             let now_ms = conn_start.elapsed().as_millis() as u64;
                             let (allow, new_start, new_count) = crate::os_events::rate_limit_tick(
                                 os_window_start_ms,
@@ -16395,8 +16766,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     payload,
                                     seq: None,
                                     state_version: None,
+                                    boot_id: None,
                                 };
-                                let text = serde_json::to_string(&push).unwrap_or_default();
+                                let Some(text) = sequence.encode(push) else { break; };
                                 if sink.send(Message::Text(text.into())).await.is_err() { break; }
                             } else {
                                 os_dropped += 1;
@@ -16408,22 +16780,29 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     );
                                 }
                             }
+                        } else {
+                            socket_output_gate!(false, false);
                         }
                         // Non-OS AutopilotEvent variants (TaskCreated, AgentIdle, ...)
                         // are silently ignored — this tail forwards os_file/os_frontmost only.
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        output_lost = true;
+                        socket_output_gate!(false, false);
+                    }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Autopilot event bus torn down — stop polling a dead
                         // receiver instead of hot-looping on repeated `Closed`.
                         os_rx = None;
                         os_events_subscribed = false;
+                        socket_output_gate!(false, false);
                     }
                 }
             }
         }
     }
 
+    run_subscriptions.clear();
     info!("WebSocket connection terminated");
 }
 
@@ -16463,7 +16842,10 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
 
     // Single DB lookup — fail-closed: DB error = reject.
     let must_change_password = match state.user_db.get_user(&claims.sub) {
-        Ok(Some(user)) => jwt_account_gate(user.status, user.must_change_password)?,
+        Ok(Some(user)) => {
+            if !duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, user.credential_epoch) { return Err("登入憑證已失效，請重新登入。".into()); }
+            jwt_account_gate(user.status, user.must_change_password)?
+        },
         Ok(None) => return Err("user not found".to_string()),
         Err(_) => return Err("authentication service unavailable".to_string()),
     };
@@ -16474,6 +16856,7 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
     // change-password allowlist until the flag clears (C1's original intent
     // — block all operations — is preserved, just enforced one layer up).
     UserContext::from_claims(&claims, must_change_password)
+        .map(|ctx| crate::machine_employee::without_restricted_access(state.handler.home_dir(), ctx))
 }
 
 /// Check if any users exist in the database (to decide whether auth is needed).
@@ -16619,7 +17002,7 @@ async fn handle_reliability_summary_http(
                 .into_response();
         }
     };
-    if state.jwt_config.verify_access_token(token).is_err() {
+    if authenticate_jwt(&state, token).is_err() {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid or expired token"})),
@@ -17034,6 +17417,7 @@ mod owner_verify_tests {
             handler: MethodHandler::new(home.clone()).await,
             tx,
             event_tx,
+            prepared_events: Default::default(),
             user_db: Arc::new(user_db),
             jwt_config: Arc::new(JwtConfig::new(b"owner-verify-test-secret-32-bytes!!")),
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
@@ -17961,3 +18345,576 @@ async fn reconcile_workflows_on_boot(home_dir: &std::path::Path) {
         Err(e) => warn!(error = %e, "workflow boot reconciliation unavailable"),
     }
 }
+
+#[cfg(test)]
+mod live_events_socket_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    // Argon2 hashes recovery codes in debug builds, which can be slow under CI load.
+    const SOCKET_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn next_json(client: &mut Client) -> Value {
+        tokio::time::timeout(SOCKET_FRAME_DEADLINE, async {
+            loop {
+                match client.next().await.expect("socket open").expect("valid frame") {
+                    ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                    ClientMessage::Ping(data) => client.send(ClientMessage::Pong(data)).await.unwrap(),
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }).await.expect("socket frame deadline")
+    }
+
+    // Observe the real socket task, including panics, and inject output that
+    // already passed authorization to exercise the final-delivery race.
+    pub(super) type PushPause = (tokio::sync::oneshot::Sender<bool>, tokio::sync::oneshot::Receiver<()>);
+    pub(super) type SharedPushPause = Arc<std::sync::Mutex<Option<PushPause>>>;
+    pub(super) type SharedUnsubscribeAfterStage = Arc<std::sync::Mutex<Option<crate::live_events::RunSelector>>>;
+    pub(super) struct SocketProbe {
+        pub(super) steps: tokio::sync::mpsc::Sender<crate::live_events::ReadyRunStep>,
+        pub(super) identity: tokio::sync::watch::Receiver<(u64, UserContext)>,
+        pub(super) subscriptions: crate::live_events::RunSubscriptions,
+        pub(super) events: broadcast::Sender<Arc<crate::handlers::PreparedPush>>,
+        pub(super) push_pause: SharedPushPause,
+        pub(super) handover_pause: SharedPushPause,
+        pub(super) unsubscribe_after_stage: SharedUnsubscribeAfterStage,
+    }
+    pub(super) struct SocketTestHooks {
+        pub(super) ready: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<SocketProbe>>>,
+        pub(super) checked: tokio::sync::mpsc::UnboundedSender<(bool, bool, bool)>,
+        pub(super) push_pause: SharedPushPause,
+        pub(super) handover_pause: SharedPushPause,
+        pub(super) unsubscribe_after_stage: SharedUnsubscribeAfterStage,
+    }
+    tokio::task_local! {
+        pub(super) static SOCKET_TEST_HOOKS: SocketTestHooks;
+    }
+
+    struct MfaSocket {
+        _home: Arc<tempfile::TempDir>,
+        state: Arc<AppState>,
+        user: duduclaw_auth::User,
+        ctx: UserContext,
+        client: Client,
+        probe: SocketProbe,
+        checked: tokio::sync::mpsc::UnboundedReceiver<(bool, bool, bool)>,
+        done: tokio::sync::oneshot::Receiver<Result<(), tokio::task::JoinError>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for MfaSocket {
+        fn drop(&mut self) { self.server.abort(); }
+    }
+    impl MfaSocket {
+        async fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+            let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
+            let user = db.create_user(&format!("socket-{}@example.test", uuid::Uuid::new_v4()), "Socket", "password-test", duduclaw_auth::UserRole::Admin).unwrap();
+            let jwt = Arc::new(JwtConfig::new(b"live-events-test-secret-32-bytes!!"));
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            handler.set_user_db(db.clone(), jwt.clone()).await;
+            handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+            let (tx, _) = broadcast::channel(4);
+            let (event_tx, _) = broadcast::channel(4);
+            let state = Arc::new(AppState {
+                auth: AuthManager::new(None), handler, tx, event_tx,
+                prepared_events: Default::default(), user_db: db, jwt_config: jwt,
+                otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new())),
+                home_dir: home.path().to_path_buf(),
+            });
+            Self::connect(Arc::new(home), state, user).await
+        }
+        async fn connect(home: Arc<tempfile::TempDir>, state: Arc<AppState>, user: duduclaw_auth::User) -> Self {
+            let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
+            let ctx = authenticate_jwt(&state, &token).unwrap();
+            let (ready_tx, ready) = tokio::sync::oneshot::channel();
+            let (checked_tx, checked) = tokio::sync::mpsc::unbounded_channel();
+            let (done_tx, done) = tokio::sync::oneshot::channel();
+            let hooks = Arc::new(std::sync::Mutex::new(Some((SocketTestHooks {
+                ready: std::sync::Mutex::new(Some(ready_tx)), checked: checked_tx,
+                push_pause: Default::default(), handover_pause: Default::default(),
+                unsubscribe_after_stage: Arc::default(),
+            }, done_tx))));
+            let socket_state = state.clone();
+            let app = Router::new().route("/ws", get(move |ws: WebSocketUpgrade| {
+                let state = socket_state.clone();
+                let hooks = hooks.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        let (hooks, done) = hooks.lock().unwrap().take().unwrap();
+                        let result = tokio::spawn(SOCKET_TEST_HOOKS.scope(hooks,
+                            handle_socket(socket, state, "127.0.0.1:12345".parse().unwrap()))).await;
+                        let _ = done.send(result);
+                    })
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+            client.send(ClientMessage::Text(json!({"type":"req","id":"connect","method":"connect","params":{"jwt":token}}).to_string().into())).await.unwrap();
+            assert_eq!(next_json(&mut client).await["ok"], true);
+            let probe = tokio::time::timeout(std::time::Duration::from_secs(5), ready).await.unwrap().unwrap();
+            probe.subscriptions.update(crate::live_events::RunSelector::Run("test-run".into()), true).unwrap();
+            let mut fixture = Self { _home: home, state, user, ctx, client, probe, checked, done, server };
+            fixture.check((true, false, true)).await;
+            // Drain the initial heartbeat so silence assertions include every frame.
+            assert!(matches!(fixture.client.next().await.unwrap().unwrap(), ClientMessage::Ping(_)));
+            fixture.client.send(ClientMessage::Pong(vec![].into())).await.unwrap();
+            fixture
+        }
+        async fn other_connection(&self) -> Self {
+            let user = self.state.user_db.get_user(&self.user.id).unwrap().unwrap();
+            Self::connect(self._home.clone(), self.state.clone(), user).await
+        }
+        async fn rpc(&mut self, method: &str, params: Value) -> Value {
+            self.client.send(ClientMessage::Text(json!({"type":"req","id":method,"method":method,"params":params})
+                .to_string().into())).await.unwrap();
+            let response = next_json(&mut self.client).await;
+            assert_eq!(response["id"], method, "unexpected frame before RPC response: {response}");
+            response
+        }
+        async fn begin_enrollment(&mut self) -> Value {
+            let response = self.rpc("mfa.enroll_begin", json!({"password":"password-test"})).await;
+            assert_eq!(response["ok"], true, "enrollment begin failed: {response}");
+            let begin = &response["payload"];
+            json!({"enrollment_token":begin["enrollment_token"],"code":totp(begin["secret"].as_str().unwrap())})
+        }
+        async fn enroll(&mut self) -> Value {
+            let params = self.begin_enrollment().await;
+            let response = self.rpc("mfa.enroll_confirm", params).await;
+            assert_eq!(response["ok"], true, "enrollment confirm failed: {response}");
+            response["payload"].clone()
+        }
+        fn pause_next_push(&self) -> (tokio::sync::oneshot::Receiver<bool>, tokio::sync::oneshot::Sender<()>) {
+            let (filtered_tx, filtered) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = tokio::sync::oneshot::channel();
+            *self.probe.push_pause.lock().unwrap() = Some((filtered_tx, release_rx));
+            (filtered, release)
+        }
+        async fn subscribe_real_run(&mut self) -> String {
+            let store = crate::run_steps::shared_store(&self.state.home_dir).unwrap();
+            let id = store.record_dispatch_run("sales", "dispatch", "2026-10-31T00:00:00Z",
+                "2026-10-31T00:01:00Z", "completed", "test prompt", "", &[]).unwrap();
+            let run = format!("dispatch:{id}");
+            let response = self.rpc("runs.subscribe", json!({"run_id":run})).await;
+            assert_eq!(response["ok"], true, "run subscription failed: {response}");
+            run
+        }
+        async fn published_step(&mut self, run: &str, seq: u64) {
+            // Exercise BOTH real authorizers, rather than the ready-queue
+            // injection used by the final-delivery-only tests below.
+            crate::live_events::publish_step(&self.state.home_dir, "sales", run, "Read", "started");
+            let step = next_json(&mut self.client).await;
+            assert_eq!(step["event"], "run.step");
+            assert_eq!(step["payload"]["run_id"], run);
+            assert_eq!(step["seq"], seq);
+        }
+        async fn check(&mut self, expected: (bool, bool, bool)) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if self.checked.recv().await.expect("socket task still running") == expected { break; }
+                }
+            }).await.expect("socket gate deadline");
+        }
+        async fn event(&self, id: u64) {
+            self.named_event("system.status_changed", id).await;
+        }
+        async fn identity_event(&self, id: u64) {
+            // Agent rules always re-read identity, bypassing the TTL cache.
+            self.named_event("agent.status_changed", id).await;
+        }
+        async fn named_event(&self, name: &str, id: u64) {
+            let line = serde_json::to_string(&WsFrame::event(name, json!({"id":id,"agent_id":"sales"}))).unwrap();
+            let frame = crate::handlers::PreparedPush::prepare(self.state.home_dir.clone(), line).await.unwrap();
+            assert!(self.probe.events.send(Arc::new(frame)).is_ok(), "socket event receiver alive");
+        }
+        async fn step(&self) {
+            let revision = self.probe.identity.borrow().0;
+            self.probe.steps.send(crate::live_events::ReadyRunStep {
+                revision,
+                step: crate::live_events::RunStep {
+                    agent_id: "sales".into(), run_id: "test-run".into(), tool: "Read".into(), phase: "started",
+                },
+            }).await.unwrap();
+        }
+        async fn silent(&mut self) {
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(100), self.client.next()).await.is_err(),
+                "paused socket delivered a frame or closed");
+        }
+        async fn finish(&mut self) {
+            self.client.close(None).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.done).await
+                .expect("socket task termination").expect("task monitor alive").expect("socket task must not panic");
+        }
+    }
+
+    fn totp(secret: &str) -> String {
+        use hmac::{Hmac, Mac};
+        let mut bytes = Vec::new();
+        let (mut acc, mut bits) = (0u32, 0);
+        for c in secret.bytes() {
+            let v = if c.is_ascii_uppercase() { c - b'A' } else { c - b'2' + 26 };
+            acc = (acc << 5) | v as u32;
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                bytes.push((acc >> bits) as u8);
+            }
+        }
+        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&bytes).unwrap();
+        mac.update(&((chrono::Utc::now().timestamp() / 30) as u64).to_be_bytes());
+        let hash = mac.finalize().into_bytes();
+        let offset = (hash[19] & 15) as usize;
+        let value = u32::from_be_bytes(hash[offset..offset + 4].try_into().unwrap()) & 0x7fff_ffff;
+        format!("{:06}", value % 1_000_000)
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_enroll_and_disable_keep_events_and_both_run_authorizers_current() {
+        let mut f = MfaSocket::new().await;
+        let run = f.subscribe_real_run().await;
+        f.identity_event(0).await;
+        assert_eq!(next_json(&mut f.client).await["seq"], 1);
+        f.published_step(&run, 2).await;
+        let mut codes = Value::Null;
+        for (method, seq) in [("mfa.enroll_confirm", 3), ("mfa.disable", 5)] {
+            let mut other = f.other_connection().await;
+            let params = if method == "mfa.enroll_confirm" {
+                f.begin_enrollment().await
+            } else { json!({"password":"password-test","code":codes[0]}) };
+            let old_ctx = f.probe.identity.borrow().1.clone();
+            let mut old_gate = crate::handlers::PushGate::new(&f.state.home_dir, &old_ctx, false);
+            let response = f.rpc(method, params).await;
+            assert_eq!(response["ok"], true, "handover failed: {response}");
+            if method == "mfa.enroll_confirm" { codes = response["payload"]["recovery_codes"].clone(); }
+            let identity_line = serde_json::to_string(&WsFrame::event("agent.status_changed", json!({"agent_id":"sales"}))).unwrap();
+            assert!(old_gate.filter(&identity_line).is_none(), "retired epoch must refuse this event");
+            // Neither authorizer may keep the original epoch. This fails
+            // independently of the broadcast gate if either copy is stale.
+            f.published_step(&run, seq).await;
+            f.identity_event(seq).await;
+            let event = next_json(&mut f.client).await;
+            assert_eq!(event["event"], "agent.status_changed");
+            assert_eq!(event["payload"]["id"], seq);
+            assert_eq!(event["seq"], seq + 1);
+            other.client.send(ClientMessage::Text(json!({"type":"req","id":"retired","method":"mfa.status","params":{}})
+                .to_string().into())).await.unwrap();
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), other.client.next())
+                .await.unwrap().unwrap().unwrap();
+            assert!(matches!(frame, ClientMessage::Close(_)), "other connection survived: {frame:?}");
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut other.done).await
+                .expect("other socket termination").expect("task monitor alive").expect("other socket must not panic");
+        }
+        f.silent().await;
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_handover_reauthorizes_in_flight_push_and_restores_gate() {
+        let mut f = MfaSocket::new().await;
+        let mut codes = Value::Null;
+        let mut seq = 0;
+        for method in ["mfa.enroll_confirm", "mfa.disable"] {
+            let params = if method == "mfa.enroll_confirm" {
+                f.begin_enrollment().await
+            } else { json!({"password":"password-test","code":codes[0]}) };
+            let (filtered, release) = f.pause_next_push();
+            f.identity_event(99).await;
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(5), filtered).await.unwrap().unwrap());
+            let response = f.rpc(method, params).await;
+            assert_eq!(response["ok"], true, "handover failed: {response}");
+            if method == "mfa.enroll_confirm" { codes = response["payload"]["recovery_codes"].clone(); }
+            let _ = release.send(());
+            let event = next_json(&mut f.client).await;
+            assert_eq!(event["event"], "agent.status_changed");
+            assert_eq!(event["payload"]["id"], 99);
+            assert_eq!(event["seq"], seq + 1);
+            // A stale gate refuses Agent events after its epoch is retired.
+            // No loss notice or duplicate is allowed before or after this.
+            f.identity_event(2).await;
+            let event = next_json(&mut f.client).await;
+            assert_eq!(event["event"], "agent.status_changed");
+            assert_eq!(event["payload"]["id"], 2);
+            assert_eq!(event["seq"], seq + 2);
+            seq += 2;
+            f.silent().await;
+        }
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_handover_refused_in_flight_push_is_silent() {
+        let mut f = MfaSocket::new().await;
+        let params = f.begin_enrollment().await;
+        let (filtered, release) = f.pause_next_push();
+        // Identity-checked transcript, refused even to an Admin when owned
+        // by someone else. Preparing it must not produce a loss signal.
+        f.named_event("auth.cli_login.output", 99).await;
+        assert!(!tokio::time::timeout(std::time::Duration::from_secs(5), filtered).await.unwrap().unwrap());
+        assert_eq!(f.rpc("mfa.enroll_confirm", params).await["ok"], true);
+        let _ = release.send(());
+        f.silent().await;
+        f.identity_event(1).await;
+        let event = next_json(&mut f.client).await;
+        assert_eq!(event["event"], "agent.status_changed");
+        assert_eq!(event["payload"]["id"], 1);
+        assert_eq!(event["seq"], 1);
+        f.silent().await;
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_handover_revoked_in_flight_push_is_silent() {
+        let mut f = MfaSocket::new().await;
+        // Admins bypass bindings. Make this reader depend on the sales binding
+        // before the old gate authorizes the identity-checked Agent event.
+        f.state.user_db.update_user(&f.user.id, None, Some(duduclaw_auth::UserRole::Employee), None).unwrap();
+        f.state.user_db.bind_agent(&f.user.id, "sales", duduclaw_auth::AccessLevel::Viewer).unwrap();
+        let params = f.begin_enrollment().await;
+        f.event(0).await;
+        assert_eq!(next_json(&mut f.client).await["seq"], 1);
+        let (filtered, release) = f.pause_next_push();
+        f.identity_event(99).await;
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), filtered).await.unwrap().unwrap(),
+            "old gate must have allowed the held event before permission revocation");
+        f.state.user_db.unbind_agent(&f.user.id, "sales").unwrap();
+        // Agent events always re-read identity and bindings, bypassing the TTL.
+        assert_eq!(f.rpc("mfa.enroll_confirm", params).await["ok"], true);
+        let _ = release.send(());
+        f.event(2).await;
+        // This must be the first frame after handover: neither the now-forbidden
+        // event nor a loss notice may escape or consume a sequence number.
+        let event = next_json(&mut f.client).await;
+        assert_eq!(event["event"], "system.status_changed");
+        assert_eq!(event["payload"]["id"], 2);
+        assert_eq!(event["seq"], 2);
+        f.silent().await;
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_handover_drops_ready_old_revision_with_one_loss() {
+        let mut f = MfaSocket::new().await;
+        let run = f.subscribe_real_run().await;
+        let params = f.begin_enrollment().await;
+        f.identity_event(0).await;
+        assert_eq!(next_json(&mut f.client).await["seq"], 1);
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *f.probe.handover_pause.lock().unwrap() = Some((entered_tx, release_rx));
+        f.client.send(ClientMessage::Text(json!({"type":"req","id":"handover","method":"mfa.enroll_confirm","params":params})
+            .to_string().into())).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered).await.unwrap().unwrap();
+        // The handover hook receives the fully authorized step before release.
+        crate::live_events::publish_step(&f.state.home_dir, "sales", &run, "Read", "started");
+        release.send(()).unwrap();
+        let response = next_json(&mut f.client).await;
+        assert_eq!(response["id"], "handover");
+        assert_eq!(response["ok"], true);
+        let lost = next_json(&mut f.client).await;
+        assert_eq!(lost["event"], "events_lost");
+        assert_eq!(lost["seq"], 2);
+        f.identity_event(3).await;
+        let event = next_json(&mut f.client).await;
+        assert_eq!(event["event"], "agent.status_changed");
+        assert_eq!(event["seq"], 3);
+        f.published_step(&run, 4).await;
+        f.silent().await;
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_handover_unsubscribed_old_revision_is_silent() {
+        let mut f = MfaSocket::new().await;
+        let run = f.subscribe_real_run().await;
+        let params = f.begin_enrollment().await;
+        f.identity_event(0).await;
+        assert_eq!(next_json(&mut f.client).await["seq"], 1);
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *f.probe.handover_pause.lock().unwrap() = Some((entered_tx, release_rx));
+        f.client.send(ClientMessage::Text(json!({"type":"req","id":"handover","method":"mfa.enroll_confirm","params":params})
+            .to_string().into())).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered).await.unwrap().unwrap();
+        // The hook waits until authorization is complete and the step is staged,
+        // then unsubscribes before the handover commits.
+        crate::live_events::publish_step(&f.state.home_dir, "sales", &run, "Read", "started");
+        *f.probe.unsubscribe_after_stage.lock().unwrap() = Some(crate::live_events::RunSelector::Run(run));
+        release.send(()).unwrap();
+        let response = next_json(&mut f.client).await;
+        assert_eq!(response["id"], "handover");
+        assert_eq!(response["ok"], true);
+        f.identity_event(2).await;
+        let event = next_json(&mut f.client).await;
+        assert_eq!(event["event"], "agent.status_changed");
+        assert_eq!(event["payload"]["id"], 2);
+        assert_eq!(event["seq"], 2);
+        f.silent().await;
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_failed_handover_preserves_in_flight_push_and_run_identity() {
+        let mut f = MfaSocket::new().await;
+        let run = f.subscribe_real_run().await;
+        let enrollment = f.enroll().await;
+        let (filtered, release) = f.pause_next_push();
+        f.identity_event(1).await;
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), filtered).await.unwrap().unwrap());
+        let response = f.rpc("mfa.disable", json!({"password":"wrong-password","code":enrollment["recovery_codes"][0]})).await;
+        assert_eq!(response["ok"], false);
+        release.send(()).unwrap();
+        let event = next_json(&mut f.client).await;
+        assert_eq!(event["event"], "agent.status_changed");
+        assert_eq!(event["payload"]["id"], 1);
+        assert_eq!(event["seq"], 1);
+        f.published_step(&run, 2).await;
+        f.silent().await;
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_revoked_socket_closes_without_event_step_or_loss() {
+        // Each output source must independently retire the socket; no
+        // heartbeat or incoming request is allowed to mask a missing gate.
+        for source in ["event", "step", "loss", "lagged", "pong"] {
+            let mut f = MfaSocket::new().await;
+            f.state.user_db.mfa_operator_reset(&f.user.email).unwrap();
+            assert!(f.state.handler.socket_context(&f.ctx, true).await.is_err());
+            match source {
+                "event" => f.event(1).await,
+                "step" => f.step().await,
+                "loss" => f.probe.subscriptions.mark_authorized_loss_for_test(),
+                "lagged" => {
+                    let frame = Arc::new(crate::handlers::PreparedPush::prepare(f.state.home_dir.clone(),
+                        serde_json::to_string(&WsFrame::event("system.status_changed", json!({}))).unwrap()).await.unwrap());
+                    for _ in 0..2048 { assert!(f.probe.events.send(frame.clone()).is_ok(), "socket event receiver alive"); }
+                }
+                "pong" => f.client.send(ClientMessage::Ping(vec![].into())).await.unwrap(),
+                _ => unreachable!(),
+            }
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), f.client.next()).await.unwrap().unwrap().unwrap();
+            assert!(matches!(frame, ClientMessage::Close(_)), "{source} escaped revocation: {frame:?}");
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut f.done).await
+                .expect("socket termination").expect("task monitor alive").expect("socket task must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn mfa_live_events_pause_two_events_and_step_then_recover_once_with_contiguous_sequence() {
+        for heartbeat_recovery in [false, true] {
+            let mut f = MfaSocket::new().await;
+            f.event(0).await;
+            let baseline = next_json(&mut f.client).await;
+            assert_eq!(baseline["seq"], 1);
+            let raw = rusqlite::Connection::open(f.state.home_dir.join("users.db")).unwrap();
+            raw.execute("ALTER TABLE auth_meta RENAME TO saved_auth_meta", []).unwrap();
+            assert!(f.state.handler.socket_context(&f.ctx, true).await.is_err());
+            // Waiting for both observations proves the second event reached
+            // the arm (and that the first drop restored event_gate).
+            for id in 1..=2 {
+                f.event(id).await;
+                f.check((false, true, false)).await;
+            }
+            f.step().await;
+            f.check((false, true, false)).await;
+            f.probe.subscriptions.mark_authorized_loss_for_test();
+            f.check((false, false, false)).await;
+            f.silent().await;
+            raw.execute("ALTER TABLE saved_auth_meta RENAME TO auth_meta", []).unwrap();
+            if heartbeat_recovery {
+                // Idle recovery must report loss without another event/RPC.
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(30)).await;
+                tokio::time::resume();
+                f.check((true, false, true)).await;
+            } else {
+                f.event(3).await;
+            }
+            let lost = next_json(&mut f.client).await;
+            assert_eq!(lost["event"], "events_lost");
+            assert_eq!(lost["seq"], 2);
+            if heartbeat_recovery { f.event(3).await; }
+            let normal = next_json(&mut f.client).await;
+            assert_eq!(normal["event"], "system.status_changed");
+            assert_eq!(normal["payload"]["id"], 3);
+            assert_eq!(normal["seq"], 3);
+            f.step().await;
+            let step = next_json(&mut f.client).await;
+            assert_eq!(step["event"], "run.step");
+            assert_eq!(step["seq"], 4);
+            f.silent().await;
+            f.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_database_bridge_reaches_ws_with_filtered_sequence_and_loss() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let (tx, _) = broadcast::channel(4);
+        let (event_tx, _) = broadcast::channel(1024);
+        handler.set_event_tx(event_tx.clone()).await;
+        let state = Arc::new(AppState {
+            auth: AuthManager::new(None), handler, tx, event_tx: event_tx.clone(),
+            prepared_events: Default::default(),
+            user_db: Arc::new(UserDb::new(&home.path().join("users.db")).unwrap()),
+            jwt_config: Arc::new(JwtConfig::new(b"live-events-test-secret-32-bytes!!")),
+            otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new())),
+            home_dir: home.path().to_path_buf(),
+        });
+        let app = Router::new().route("/ws", get(ws_handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        client.send(ClientMessage::Text(json!({"type":"req","id":"connect","method":"connect","params":{}}).to_string().into())).await.unwrap();
+        let connected = next_json(&mut client).await;
+        assert_eq!(connected["payload"]["boot_id"], crate::live_events::boot_id());
+        // A forbidden run broadcast consumes no per-connection sequence.
+        event_tx.send(serde_json::to_string(&WsFrame::event("run.step", json!({"secret":"must not escape"}))).unwrap()).unwrap();
+
+        // Independently opened broker models mcp-server: SQLite is its only
+        // link to this gateway, no handler or sender is passed to it.
+        let employee_broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let id = employee_broker.request("sales", "goal_kickoff", "secret prompt",
+            json!({"token":"secret token"}), 300).await.unwrap();
+        let bus = crate::events_store::EventBusStore::open(home.path()).unwrap();
+        let rows = bus.fetch_since(0, 100).await.unwrap();
+        // Drive the production bridge transform deterministically (the
+        // production poller's two-second scheduling is not exercised here).
+        for row in rows {
+            if let Some(frame) = crate::dashboard_feedback::dashboard_push_frame(home.path(), &row.event, &row.payload).await {
+                event_tx.send(frame).unwrap();
+            }
+        }
+        let event = next_json(&mut client).await;
+        assert_eq!(event["event"], "approval.created");
+        assert_eq!(event["payload"]["id"], id.as_str());
+        assert_eq!(event["seq"], 1);
+        assert_eq!(event["boot_id"], connected["payload"]["boot_id"]);
+        assert!(!event.to_string().contains("secret"));
+
+        // Current-thread runtime: this loop cannot schedule the socket reader
+        // until it has overflowed the bounded broadcast receiver.
+        for _ in 0..2048 {
+            event_tx.send(serde_json::to_string(&WsFrame::event("system.status_changed", json!({}))).unwrap()).unwrap();
+        }
+        let lost = next_json(&mut client).await;
+        assert_eq!(lost["event"], "events_lost");
+        assert_eq!(lost["seq"], 2);
+        assert_eq!(lost["payload"], json!({}));
+        client.close(None).await.unwrap();
+        server.abort();
+    }
+}
+
+#[path = "server_mfa.rs"]
+mod server_mfa;

@@ -40,6 +40,15 @@ pub enum ChatMessage {
     /// Client → Server: first frame, authenticates the connection (C5).
     #[serde(rename = "auth")]
     Auth { token: String },
+    /// Client → Server: cancel one owned pending turn.
+    #[serde(rename = "cancel")]
+    Cancel {
+        #[serde(default)]
+        request_id: Option<String>,
+        session_id: Option<String>,
+        conv: Option<String>,
+        msg_id: Option<String>,
+    },
     /// Client → Server: user sends a message, optionally with file attachments.
     #[serde(rename = "user_message")]
     UserMessage {
@@ -293,6 +302,11 @@ impl ChatMessage {
 }
 
 mod liveness;
+mod turns;
+
+pub(crate) fn current_turn_id() -> Option<String> {
+    turns::TURN_ID.try_with(Clone::clone).ok()
+}
 
 /// Sent instead of a reply when a turn produced none (B10).
 const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一次。";
@@ -470,7 +484,12 @@ pub struct WebChatState {
     jwt_config: Arc<JwtConfig>,
     /// C5: user store — confirms the authenticated user is still active.
     user_db: Arc<UserDb>,
+    live_ctx_cache: Arc<crate::handlers::live_context::LiveContextCache>,
+    #[cfg(test)]
+    credential_results: std::sync::Mutex<std::collections::VecDeque<crate::handlers::live_context::SocketValidity>>,
     /// Track active connections per user_id.
+    turns: Arc<turns::Registry>,
+    approvals: Option<crate::approval::ApprovalBroker>,
     connections: tokio::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// C-ACL (P0-S1): per-user callable-set snapshot cache, keyed by
     /// authenticated user id. Populated lazily; an entry is reused only at
@@ -481,10 +500,18 @@ pub struct WebChatState {
 
 impl WebChatState {
     pub fn new(ctx: Arc<ReplyContext>, jwt_config: Arc<JwtConfig>, user_db: Arc<UserDb>) -> Self {
+        let approvals = crate::approval::ApprovalBroker::open(&ctx.home_dir).map_err(|error| {
+            warn!(%error, "WebChat approval store unavailable");
+        }).ok();
         Self {
             ctx,
             jwt_config,
             user_db,
+            live_ctx_cache: Arc::new(Default::default()),
+            #[cfg(test)]
+            credential_results: Default::default(),
+            turns: Arc::new(turns::Registry::default()),
+            approvals,
             connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             acl_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -506,6 +533,27 @@ impl WebChatState {
             return widget_authenticate(&self.ctx.home_dir, presented).map(|id| (id, false));
         }
         authenticate_with(&self.jwt_config, &self.user_db, token)
+    }
+
+    async fn credential_validity(&self, claims: Option<&duduclaw_auth::jwt::Claims>, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
+        use crate::handlers::live_context::SocketValidity;
+        #[cfg(test)]
+        if let Some(result) = self.credential_results.lock().unwrap().pop_front() {
+            return result;
+        }
+        let Some(claims) = claims else { return SocketValidity::Valid; }; // Public widget.
+        let Ok(ctx) = duduclaw_auth::UserContext::from_claims(claims, false) else { return SocketValidity::Revoked; };
+        let db = self.user_db.clone();
+        let cache = self.live_ctx_cache.clone();
+        let live = tokio::task::spawn_blocking(move ||
+            crate::handlers::live_context::resolve_socket_context(&db, &cache, &ctx, heartbeat)).await;
+        match live {
+            Ok(Ok(live)) => if webchat_credential_valid(&self.ctx.home_dir, claims, &live, chrono::Utc::now().timestamp().max(0) as u64) {
+                SocketValidity::Valid
+            } else { SocketValidity::Revoked },
+            Ok(Err(e)) => SocketValidity::from_error(&e),
+            Err(_) => SocketValidity::Unavailable,
+        }
     }
 
     /// C-ACL (P0-S1): may `user_id` address `agent_name` by name in a
@@ -649,12 +697,22 @@ fn authenticate_with(
         .verify_access_token(token)
         .map_err(|e| format!("invalid token: {e}"))?;
     match user_db.get_user(&claims.sub) {
-        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active => {
+        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, u.credential_epoch) => {
             Ok((claims.sub, u.must_change_password))
         }
         Ok(Some(_)) => Err("account suspended".to_string()),
         Ok(None) => Err("user not found".to_string()),
         Err(_) => Err("auth service unavailable".to_string()),
+    }
+}
+
+fn webchat_credential_valid(home: &std::path::Path, claims: &duduclaw_auth::jwt::Claims,
+    live: &duduclaw_auth::UserContext, now: u64) -> bool {
+    if !duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, live.credential_epoch) { return false; }
+    let personal = !crate::team_edition::team_grants_enabled(home);
+    match crate::mfa::enforced(home, personal) {
+        Ok(required) => !(required || (!personal && live.credential_epoch > 0)) || now < claims.exp,
+        Err(_) => false,
     }
 }
 
@@ -727,6 +785,15 @@ async fn rollback_owned_webchat_archives(paths: &[PathBuf]) {
     }
 }
 
+async fn rollback_before_final_reply(validity: crate::handlers::live_context::SocketValidity,
+    recovery: &mut crate::handlers::live_context::SocketRecovery, paths: &[PathBuf]) -> bool {
+    if recovery.observe(validity, false) {
+        return true;
+    }
+    rollback_owned_webchat_archives(paths).await;
+    false
+}
+
 /// Process a WebChat WebSocket connection.
 async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip: IpAddr) {
     let _permit = match WEBCHAT_SEMAPHORE.try_acquire() {
@@ -749,7 +816,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         return;
     }
 
-    let (mut sink, mut stream) = socket.split();
+    let (sink, mut stream) = socket.split();
+    let mut sink = turns::BoundedSocketSink(sink);
 
     // ── C5: in-band authentication gate ──────────────────────────────────
     // The first frame MUST be `{"type":"auth","token":"<jwt>"}`. Without a
@@ -760,11 +828,19 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // normally; every `user_message` from a flagged account gets a
     // guidance-only reply instead of reaching the agent (checked below,
     // inside the message loop).
+    let mut credential = None;
     let (auth_user, must_change_password) = {
         let auth_timeout = std::time::Duration::from_secs(10);
         let authed = match tokio::time::timeout(auth_timeout, stream.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatMessage>(&text) {
-                Ok(ChatMessage::Auth { token }) => state.authenticate(&token),
+                Ok(ChatMessage::Auth { token }) => {
+                    state.authenticate(&token).and_then(|identity| {
+                        if !token.starts_with("widget:") {
+                            credential = Some(state.jwt_config.verify_access_token(&token)?);
+                        }
+                        Ok(identity)
+                    })
+                },
                 _ => Err("first frame must be an auth message".to_string()),
             },
             _ => Err("authentication handshake timed out or closed".to_string()),
@@ -790,6 +866,21 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // new "owner", so the resume guard rejected the user's own conversations —
     // history was readable over the dashboard RPC but never continuable, which
     // read as "the chat keeps resetting itself".
+    let rate_limit_id = if is_widget_visitor(&auth_user) {
+        // Widget identities are minted per socket, so retain the IP reservation.
+        rate_limit_id
+    } else {
+        let authenticated_key = format!("webchat:user:{}", webchat_owner_tag(&auth_user));
+        if !state.acquire_connection(&authenticated_key).await {
+            state.release_connection(&rate_limit_id).await;
+            let frame = ChatMessage::error_coded("Connection limit reached", "connection_limit");
+            let _ = sink.send(Message::Text(serde_json::to_string(&frame).unwrap().into())).await;
+            return;
+        }
+        state.release_connection(&rate_limit_id).await;
+        authenticated_key
+    };
+
     let owner_tag = webchat_owner_tag(&auth_user);
     let user_id = format!("webchat:{owner_tag}:{session_suffix}");
 
@@ -826,11 +917,34 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // `liveness`), not only pongs, which stay unread while a turn runs.
     let live = liveness::Liveness::new();
 
+    let (out_tx, mut out_rx) = turns::outbound_channel();
+    let writer_state = state.clone();
+    let writer_credential = credential.clone();
+    let mut writer = tokio::spawn(async move {
+        let mut recovery = crate::handlers::live_context::SocketRecovery::default();
+        while let Some(frame) = out_rx.recv().await {
+            let validity = writer_state.credential_validity(writer_credential.as_ref(), true).await;
+            if frame.deliver_authorized(validity, &mut recovery, &mut sink).await.is_err() { break; }
+        }
+    });
+    let mut sink = turns::SocketSender(out_tx.clone());
+
     // Message processing loop
+    let mut recovery = crate::handlers::live_context::SocketRecovery::default();
     loop {
         tokio::select! {
+            _ = &mut writer => {
+                state.release_connection(&rate_limit_id).await;
+                return;
+            },
             // Heartbeat tick
             _ = heartbeat_interval.tick() => {
+                let validity = state.credential_validity(credential.as_ref(), true).await;
+                recovery.observe(validity, true);
+                if recovery.closed() {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
                 if live.timed_out() {
                     warn!("WebChat heartbeat timeout: {user_id}");
                     break;
@@ -847,6 +961,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
             cfg_ev = cfg_rx.recv() => {
                 use tokio::sync::broadcast::error::RecvError;
                 if !matches!(cfg_ev, Err(RecvError::Closed)) {
+                    let validity = state.credential_validity(credential.as_ref(), false).await;
+                    if !recovery.observe(validity, false) {
+                        if recovery.closed() { let _ = sink.send(Message::Close(None)).await; break; }
+                        continue;
+                    }
                     let mut info = build_session_info_frame(
                         &state, &announced_sid, announced_agent.as_deref(),
                     ).await;
@@ -875,6 +994,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
+                        let validity = state.credential_validity(credential.as_ref(), false).await;
+                        if !recovery.observe(validity, false) {
+                            if recovery.closed() {
+                                let _ = sink.send(Message::Close(None)).await;
+                                break;
+                            }
+                            continue;
+                        }
                         let chat_msg: ChatMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(e) => {
@@ -888,7 +1015,15 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                         match chat_msg {
                             ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv, msg_id } => {
-                                let assign_event = assign_event_id(msg_id.as_deref());
+                                let arrival_seq = crate::trigger_route::pending::next_seq();
+                                // Reuse one event for admission and delayed command handling,
+                                // including legacy clients without a message id.
+                                let assign_event = Some(assign_event_id(msg_id.as_deref())
+                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+                                let mut sink = turns::TurnSink::new(
+                                    out_tx.clone(), custom_session.as_deref().unwrap_or(&session_id),
+                                    sanitize_conv_nonce(conv.as_deref()), msg_id.as_deref().unwrap_or(""),
+                                );
                                 // ── Forced password-change gate ──────────
                                 // Mirrors `handlers.rs::dispatch`'s gate on the
                                 // dashboard WS path (same error code, so a
@@ -1171,19 +1306,21 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // Chat commands keep the selected employee.
                                 // The message an armed `/交辦 @name` was waiting
                                 // for becomes that task (rights checked again).
+                                // Consume an armed assignment at arrival, before @ routing.
+                                // Commands arm on admission below, even while their reply waits in FIFO.
                                 if !crate::chat_commands::is_command(&content) {
                                     if let Some(frame) = Box::pin(route::pending_assign_reply(
                                         &state, &auth_user, &content, effective_agent.as_deref(),
-                                        &agent_id, sid, &user_id, conv_nonce.clone(), assign_event.as_deref(),
+                                        &agent_id, sid, &user_id, conv_nonce.clone(),
+                                        assign_event.as_deref(), arrival_seq,
                                     )).await {
-                                        if let Ok(json) = serde_json::to_string(&frame) {
-                                            let _ = sink.send(Message::Text(json.into())).await;
-                                        }
+                                        sink.frame(frame).await;
                                         continue;
                                     }
                                 }
+                                let resume_acl = is_resume && effective_agent.is_some();
                                 let routed = if crate::chat_commands::is_command(&content) {
-                                    route::WebRoute { agent: effective_agent.clone(), switched: false }
+                                    route::WebRoute { agent: effective_agent.clone(), switched: false, called: false }
                                 } else {
                                     match route::decide_webchat_route(
                                         &state,
@@ -1223,391 +1360,84 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // The agent id used for chat-command handling /
                                 // contract enforcement — the routed agent when one
                                 // was selected/adopted/called, else the default main agent.
-                                let effective_agent_id: &str = effective_agent.as_deref().unwrap_or(&agent_id);
 
-                                // Persist any uploaded files and append path references
-                                // to the prompt — the agent (Claude CLI) reads them from
-                                // disk, exactly as channel attachments are handled.
-                                let mut full_content = content.clone();
-                                if !attachments.is_empty() {
-                                    // WP1.3: land inbound files under the resolved agent's dir.
-                                    let attach_base = crate::channel_reply::resolve_attachment_base(
-                                        state.ctx.as_ref(), Some(effective_agent_id),
-                                    ).await;
-                                    let refs = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(auth_user.clone(),save_webchat_attachments(&attach_base, &attachments)).await;
-                                    if !refs.is_empty() {
-                                        if !full_content.trim().is_empty() {
-                                            full_content.push_str("\n\n");
-                                        }
-                                        full_content.push_str(&refs.join("\n"));
-                                    }
-                                }
-
-                                // Check for chat commands first
-                                if crate::chat_commands::is_command(&content) {
-                                    if let Some(cmd) = crate::chat_commands::parse_command(&content, None) {
-                                        // WebChat carries no addressable per-sender channel
-                                        // identity (no `agent_binding`-style account to bind
-                                        // in the dashboard), so `/rules off` can never resolve
-                                        // a verified Admin/Manager here — `handle_rules_off`
-                                        // correctly refuses with "use the dashboard" rather
-                                        // than guessing at an identity.
-                                        // v1.68.0: admin-gated commands (`!STOP ALL`,
-                                        // `!RESUME`, `/model <x>`) need an active
-                                        // dashboard Admin account — never a
-                                        // public-widget visitor (was hardcoded `true`).
-                                        let is_admin = webchat_command_admin(&state.user_db, &auth_user);
-                                        let caller = crate::chat_commands::CommandCaller {
-                                            channel: "webchat",
-                                            channel_user_id: if is_widget_visitor(&auth_user) { "" } else { &auth_user },
-                                            access: state.sender_access(&auth_user).await,
-                                            event: assign_event.as_deref(),
-                                            seq: crate::trigger_route::pending::next_seq(),
-                                        };
-                                        // `/交辦` keeps the task for a card; every other
-                                        // command answers with text only. `/rules off`
-                                        // still sees no channel identity here. The other
-                                        // commands run in the same principal scope as a
-                                        // reply turn, so one that creates the session
-                                        // (`/status`) records who owns it (B5 session origin).
-                                        let principal = &crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL;
-                                        let (reply, task) = match &cmd {
-                                            crate::chat_commands::ChatCommand::Assign(assign_cmd) => {
-                                                let ac = caller.assign_caller(&state.ctx.home_dir, sid, Some(effective_agent_id));
-                                                let r = Box::pin(crate::trigger_route::assign::run(&state.ctx, assign_cmd, &ac)).await;
-                                                (r.text, r.task)
-                                            }
-                                            crate::chat_commands::ChatCommand::Rules { .. } => (
-                                                principal.scope(
-                                                    auth_user.clone(),
-                                                    crate::chat_commands::handle_command(
-                                                        &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
-                                                    ),
-                                                ).await,
-                                                None,
-                                            ),
-                                            _ => (
-                                                principal.scope(
-                                                    auth_user.clone(),
-                                                    crate::chat_commands::handle_command_with_caller(
-                                                        &cmd, &state.ctx, sid, effective_agent_id, is_admin, &caller,
-                                                    ),
-                                                ).await,
-                                                None,
-                                            ),
-                                        };
-                                        let done = ChatMessage::AssistantDone {
-                                            content: reply,
-                                            tokens_used: 0,
-                                            conv: conv_nonce.clone(),
-                                            model: None,
-                                            // Chat commands (`/xxx`) never go through
-                                            // `build_reply_*` / O-4 at all — no marker
-                                            // can exist on this path.
-                                            artifact: None,
-                                            agent: None,
-                                            agent_name: None,
-                                            citations: None,
-                                            thinking: None,
-                                            task: task.map(|t| serde_json::json!({ "id": t.id, "agent": t.agent })),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&done) {
-                                            let _ = sink.send(Message::Text(json.into())).await;
-                                        }
-                                        continue;
-                                    }
-                                }
-
-                                // Build AI reply, interleaving progress events
-                                // (tool activity / TODO board) onto the socket
-                                // while the task runs.
-                                let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<
-                                    crate::channel_reply::ProgressEvent,
-                                >();
-                                let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(
-                                    crate::computer_watch_links::delivery::WEBCHAT_NOTICE_CAPACITY,
-                                );
-                                let on_progress: crate::channel_reply::ProgressCallback =
-                                    Box::new(move |event| {
-                                        // Forward the STRUCTURED event so the dashboard can
-                                        // build a task-insights timeline (not just a string).
-                                        let _ = ptx.send(event);
-                                    });
-                                // Route to the selected agent (per-agent
-                                // directory / SOUL / session) when one was
-                                // resolved, else the default-agent path. Both
-                                // branches consume `on_progress`; they are
-                                // mutually exclusive so the single move is valid.
-                                // O-4→O-3: the guarded builders return the
-                                // stripped reply text plus any O-4 pending-op
-                                // marker mapped to an O-3 chat-artifact. WebChat is
-                                // the only caller that reads the second half — see
-                                // `channel_reply::build_guarded_reply_with_session`
-                                // (these replaced the former `_with_artifact` siblings).
-                                // B10 review L1: learn whether an empty answer is a
-                                // deliberate silence (no `no_reply` frame then).
-                                let work = crate::computer_use_sessions::attended::verified_webchat_message(sid, Some(auth_user.as_str()), crate::channel_reply::track_silence(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
-                                    .scope(auth_user.clone(), async {
-                                        match &effective_agent {
-                                            Some(a) => {
-                                                crate::channel_reply::build_guarded_reply_for_agent(
-                                                    &full_content, &state.ctx, a, sid, &user_id, Some(on_progress),
-                                                )
-                                                .await
-                                            }
-                                            None => {
-                                                crate::channel_reply::build_guarded_reply_with_session(
-                                                    &full_content, &state.ctx, sid, &user_id, Some(on_progress),
-                                                )
-                                                .await
-                                            }
-                                        }
-                                    })));
-                                let work = crate::computer_watch_links::delivery::webchat_scope(
-                                    &state.ctx.home_dir, effective_agent_id, sid,
-                                    !is_widget_visitor(&auth_user), watch_tx, work,
-                                );
-                                tokio::pin!(work);
-                                // The model the backend ACTUALLY answered with
-                                // (ProgressEvent::ModelInfo) — stamped onto the
-                                // assistant_done frame below.
-                                let mut actual_model: Option<String> = None;
-                                // Summary of the thinking frames actually sent,
-                                // stamped onto the assistant_done frame below.
-                                let mut thinking_meta = crate::thinking::DoneMetaBuilder::default();
-                                let (reply, deliberate_silence) = loop {
-                                    tokio::select! {
-                                        r = &mut work => break r,
-                                        Some(notice) = watch_rx.recv() => {
-                                            let msg = ChatMessage::ComputerWatch {
-                                                agent_id: notice.agent_id, href: notice.href,
-                                                conv: conv_nonce.clone(),
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&msg) {
-                                                let _ = sink.send(Message::Text(json.into())).await;
-                                            }
-                                        }
-                                        Some(ev) = prx.recv() => {
-                                            use crate::channel_reply::ProgressEvent;
-                                            let content = ev.to_display();
-                                            let msg = match ev {
-                                                ProgressEvent::ModelInfo { model } => {
-                                                    actual_model = Some(model);
-                                                    continue;
-                                                }
-                                                ProgressEvent::ToolUse { tool, detail } => ChatMessage::Progress {
-                                                    content, kind: Some("tool".into()), tool: Some(tool), detail,
-                                                    conv: conv_nonce.clone(),
-                                                },
-                                                ProgressEvent::TodoUpdate { .. } => ChatMessage::Progress {
-                                                    content, kind: Some("todo".into()), tool: None, detail: None,
-                                                    conv: conv_nonce.clone(),
-                                                },
-                                                ProgressEvent::Keepalive => ChatMessage::Progress {
-                                                    content, kind: Some("keepalive".into()), tool: None, detail: None,
-                                                    conv: conv_nonce.clone(),
-                                                },
-                                                ProgressEvent::Interim { .. } => ChatMessage::Progress {
-                                                    content, kind: Some("status".into()), tool: None, detail: None,
-                                                    conv: conv_nonce.clone(),
-                                                },
-                                                // Already gated (masked / truncated) by the
-                                                // turn's thinking sink; widget visitors get
-                                                // nothing at all.
-                                                ProgressEvent::Thinking(t) => {
-                                                    let widget = is_widget_visitor(&auth_user);
-                                                    if !widget {
-                                                        thinking_meta.observe(&t);
-                                                    }
-                                                    match thinking_frame(t, conv_nonce.clone(), widget) {
-                                                        Some(frame) => frame,
-                                                        None => continue,
-                                                    }
-                                                }
-                                                // C-P1: structured step boundary → dedicated `step` frame.
-                                                ProgressEvent::Step(step) => ChatMessage::Step {
-                                                    phase: step.phase.as_str().to_string(),
-                                                    tool: step.tool,
-                                                    summary: step.summary,
-                                                    depth: step.depth,
-                                                    ts: step.ts_ms,
-                                                    conv: conv_nonce.clone(),
-                                                },
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&msg) {
-                                                let _ = sink.send(Message::Text(json.into())).await;
-                                            }
-                                        }
-                                    }
-                                };
-                                for notice in crate::computer_watch_links::delivery::take_pending(&mut watch_rx) {
-                                    let msg = ChatMessage::ComputerWatch {
-                                        agent_id: notice.agent_id, href: notice.href, conv: conv_nonce.clone(),
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&msg) {
-                                        let _ = sink.send(Message::Text(json.into())).await;
-                                    }
-                                }
-                                // O-4→O-3: split off the artifact half early — every
-                                // transformation below (📎DELIVER parsing, cli-noise,
-                                // branding, etc.) only ever operates on the text; the
-                                // artifact rides along untouched to the final frame.
-                                let guarded = reply;
-                                let reply = guarded.text.clone();
-                                let operator_artifact = guarded.artifact.clone();
-                                let answered_by = guarded.answered_by.clone();
-                                let citations = (!guarded.citations.is_empty())
-                                    .then(|| guarded.citations.clone());
-
-                                // WP1.3 + live-verification fix (2026-08-15):
-                                // 📎DELIVER: handling. WebChat has no in-band
-                                // binary frame, so the archival copy IS the
-                                // delivery — earlier code only validated the
-                                // path and appended a "downloadable from the
-                                // Files panel" note without archiving anything
-                                // (a false promise) and without running the
-                                // WP-4H delivery gate. Now each declared file
-                                // goes through the same channel-agnostic
-                                // stage_deliverable() as every other channel:
-                                // validate → delivery gate → archive + ledger.
-                                // Gate rejections surface as actionable text;
-                                // the download note is only made when a copy
-                                // really landed in attachments/.
-                                let mut owned_archives: Vec<PathBuf> = Vec::new();
-                                let reply = {
-                                    let (cleaned, paths) =
-                                        crate::office_docs::parse_deliverables(&reply);
-                                    if paths.is_empty() {
-                                        reply
-                                    } else {
-                                        let agent_dir = state
-                                            .ctx
-                                            .home_dir
-                                            .join("agents")
-                                            .join(effective_agent_id);
-                                        let mut delivered: Vec<String> = Vec::new();
-                                        let mut failed: Vec<String> = Vec::new();
-                                        // `office_docs::DeliveryCheck` is a sync
-                                        // `dyn Fn() -> bool`; the awaited rechecks
-                                        // around this loop carry the rollback.
-                                        let delivery_valid = || guarded.still_valid_blocking();
-                                        for p in &paths {
-                                            if !guarded.still_valid().await { break; }
-                                            match stage_owned_webchat_deliverable(
-                                                &auth_user,
-                                                p,
-                                                &agent_dir,
-                                                &state.ctx.home_dir,
-                                                Some(&delivery_valid),
-                                            )
-                                            .await
-                                            {
-                                                Ok(staged) if !guarded.still_valid().await => {
-                                                    staged.rollback_new_archive().await;
-                                                    break;
-                                                }
-                                                Ok(staged) if staged.archived => {
-                                                    if let Some(path) = staged.owned_archive_path() {
-                                                        owned_archives.push(path.to_path_buf());
-                                                    }
-                                                    delivered.push(staged.filename)
-                                                }
-                                                Ok(staged) => failed.push(format!(
-                                                    "{}：封存副本寫入失敗，檔案仍在工作目錄",
-                                                    staged.filename
-                                                )),
-                                                Err(e) => {
-                                                    // The gate/validator message is
-                                                    // already zh-TW actionable; the
-                                                    // raw path never echoes here.
-                                                    let name = std::path::Path::new(p)
-                                                        .file_name()
-                                                        .and_then(|n| n.to_str())
-                                                        .unwrap_or("檔案");
-                                                    failed.push(format!("{name}：{e}"));
-                                                }
-                                            }
-                                        }
-                                        if !guarded.still_valid().await {
-                                            rollback_owned_webchat_archives(&owned_archives).await;
-                                            owned_archives.clear();
-                                            String::new()
-                                        } else {
-                                        let mut notes: Vec<String> = Vec::new();
-                                        if !delivered.is_empty() {
-                                            notes.push(format!(
-                                                "📎 已生成檔案：{}（可至 Dashboard 檔案面板下載）",
-                                                delivered.join("、")
-                                            ));
-                                        }
-                                        for f in &failed {
-                                            notes.push(format!("⚠️ 交付被攔下——{f}"));
-                                        }
-                                        if notes.is_empty() {
-                                            cleaned
-                                        } else if cleaned.is_empty() {
-                                            notes.join("\n")
-                                        } else {
-                                            format!("{cleaned}\n\n{}", notes.join("\n"))
-                                        }
-                                        }
-                                    }
-                                };
-
-                                // Guard: don't send empty replies
-                                if !guarded.still_valid().await {
-                                    rollback_owned_webchat_archives(&owned_archives).await;
-                                    warn!("WebChat: source changed before reply delivery — skipping send");
+                                let msg_id = msg_id.filter(|id| assign_event_id(Some(id)).is_some())
+                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                let turn_sink = turns::TurnSink::new(
+                                    out_tx.clone(), sid, conv_nonce.clone(), &msg_id,
+                                ).acknowledged();
+                                let cancel_principal = turns::cancel_principal(&auth_user, peer_ip);
+                                // Routing and ownership checks above may await. Recheck
+                                // the credential before reserving or starting any turn.
+                                let validity = state.credential_validity(credential.as_ref(), true).await;
+                                if !recovery.observe(validity, false) {
+                                    if recovery.closed() { break; }
                                     continue;
                                 }
-                                if reply.trim().is_empty() && deliberate_silence {
-                                    // Kept silent on purpose (failsafe mute, breaker,
-                                    // access gate): no frame, as before (review L1).
-                                    warn!("WebChat: reply withheld by design — skipping send");
-                                    continue;
-                                }
-                                if reply.trim().is_empty() {
-                                    // B10: an explicit frame, so the page and the
-                                    // widget stop waiting for this message (the
-                                    // dashboard keeps its input locked until a
-                                    // reply or an error arrives).
-                                    warn!("WebChat: reply is empty — telling the client");
-                                    let frame = ChatMessage::error_coded(NO_REPLY_TEXT, NO_REPLY_CODE);
-                                    if let Ok(json) = serde_json::to_string(&frame) {
-                                        if sink.send(Message::Text(json.into())).await.is_err() {
-                                            break;
+                                match Box::pin(state.turns.admit_persistent(
+                                    state.approvals.as_ref(), &cancel_principal, &auth_user, sid, conv_nonce.clone(), &msg_id,
+                                    turns::configured_limit(&state.ctx.home_dir),
+                                    turns::configured_global_limit(&state.ctx.home_dir),
+                                )).await {
+                                    Ok(ticket) => {
+                                        let validity = state.credential_validity(credential.as_ref(), true).await;
+                                        recovery.observe(validity, false);
+                                        if !turns::credential_allows_turn(validity, &turn_sink).await {
+                                            if recovery.closed() { break; }
+                                            continue;
                                         }
+                                        // Commands can arm an assignment at admission. From this
+                                        // point they have begun and cannot truthfully be cancelled.
+                                        if crate::chat_commands::is_command(&content) && !ticket.begin_delivery() {
+                                            continue;
+                                        }
+                                        let access = state.sender_access(&auth_user).await;
+                                        let caller = crate::trigger_route::assign::AssignCaller {
+                                            home: &state.ctx.home_dir, channel: "webchat", conversation: sid,
+                                            sender: if is_widget_visitor(&auth_user) { "" } else { &auth_user },
+                                            event: assign_event.as_deref(), seq: arrival_seq,
+                                            fallback: effective_agent.as_deref().or(Some(&agent_id)), access,
+                                        };
+                                        crate::trigger_route::assign::arm_on_admission(
+                                            &*state.ctx.registry.read().await, &content, &caller,
+                                        );
+                                        let input = turns::TurnInput {
+                                            state: state.clone(), auth_user: auth_user.clone(),
+                                            credential: credential.clone(),
+                                            user_id: user_id.clone(), agent_id: agent_id.clone(),
+                                            effective_agent, requested_agent, sid: sid.to_owned(), conv_nonce,
+                                            content, attachments, assign_event, arrival_seq,
+                                            resume_acl: resume_acl || routed.called,
+                                        };
+                                        tokio::spawn(turns::execute(input, turn_sink, ticket));
                                     }
-                                    continue;
+                                    Err(code) => {
+                                        let value = serde_json::json!({"type":"error", "code":code,
+                                            "message":"Turn admission limit reached or duplicate message id",
+                                            "request_id":msg_id});
+                                        let _ = out_tx.send(turns::Outbound { message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
+                                    }
                                 }
-
-                                let tokens = crate::cost_telemetry::estimate_tokens(&reply) as u32;
-                                let done = ChatMessage::AssistantDone {
-                                    content: reply,
-                                    tokens_used: tokens,
-                                    conv: conv_nonce.clone(),
-                                    model: actual_model,
-                                    artifact: operator_artifact,
-                                    agent: answered_by.as_ref().map(|a| a.id.clone()),
-                                    agent_name: answered_by.map(|a| a.display_name),
-                                    citations,
-                                    thinking: thinking_meta.build(),
-                                    task: None,
+                            }
+                            ChatMessage::Cancel { request_id, session_id: cancel_sid, conv, msg_id } => {
+                                let request_id = request_id.filter(|id| assign_event_id(Some(id)).is_some())
+                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                let accepted = state.turns.cancel(
+                                    &auth_user, cancel_sid.as_deref(), conv.as_deref(), msg_id.as_deref(),
+                                    Some(&request_id),
+                                ).is_ok();
+                                let value = if accepted {
+                                    serde_json::json!({"type":"cancel_accepted", "request_id":request_id})
+                                } else {
+                                    serde_json::json!({"type":"error", "code":"turn_not_found",
+                                        "message":"Pending conversation not found or ambiguous", "request_id":request_id})
                                 };
-                                if let Ok(json) = serde_json::to_string(&done) {
-                                    if !guarded.still_valid().await {
-                                        rollback_owned_webchat_archives(&owned_archives).await;
-                                        continue;
-                                    }
-                                    let send_result = sink.send(Message::Text(json.into())).await;
-                                    if !guarded.still_valid().await {
-                                        rollback_owned_webchat_archives(&owned_archives).await;
-                                        warn!("WebChat: source changed during reply delivery");
-                                    }
-                                    if send_result.is_err() {
-                                        break;
-                                    }
-                                }
+                                let frame = turns::Outbound {
+                                    message: Message::Text(value.to_string().into()),
+                                    ack: None, deadline: None,
+                                };
+                                let _ = out_tx.send(frame).await;
+
                             }
                             _ => {
                                 // Client sent an unexpected message type
@@ -1634,6 +1464,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         }
     }
 
+    writer.abort();
+    let _ = writer.await;
     state.release_connection(&rate_limit_id).await;
     info!("WebChat connection terminated: {user_id}");
 }
@@ -1940,6 +1772,17 @@ fn assign_event_id(msg_id: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use duduclaw_auth::{AccessLevel, JwtConfig, UserDb, UserRole, UserStatus};
+
+    #[tokio::test]
+    async fn revoked_credential_rolls_back_archives_before_blocking_final_reply() {
+        let mut recovery = crate::handlers::live_context::SocketRecovery::default();
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        let archive_path = archive.path().to_path_buf();
+        assert!(!rollback_before_final_reply(crate::handlers::live_context::SocketValidity::Revoked,
+            &mut recovery, std::slice::from_ref(&archive_path)).await);
+        assert!(recovery.closed());
+        assert!(!archive_path.exists());
+    }
 
     #[tokio::test]
     async fn bound_outbound_archive_uses_socket_owner_and_preserves_delivery_fence() {
@@ -2746,5 +2589,35 @@ mod tests {
         );
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains(r#""code":"agent_forbidden""#), "{json}");
+    }
+}
+
+#[cfg(test)]
+mod mfa_tests {
+    use super::*;
+    #[test]
+    fn webchat_mfa_rechecks_expiry_epoch_and_preserves_legacy_off() {
+        let home=tempfile::tempdir().unwrap();
+        let db=UserDb::new(&home.path().join("users.db")).unwrap();
+        let user=db.create_user("chat@example.com","Chat","password-test",duduclaw_auth::UserRole::Admin).unwrap();
+        let jwt=JwtConfig::new(b"webchat-mfa-long-enough-test-secret");
+        let token=jwt.issue_access_token(&user,&[]).unwrap();
+        let mut claims=jwt.verify_access_token(&token).unwrap();
+        let cache=crate::handlers::live_context::LiveContextCache::default();
+        let ctx=duduclaw_auth::UserContext::from_claims(&claims,false).unwrap();
+        let live=crate::handlers::live_context::resolve_socket_context(&db,&cache,&ctx,true).unwrap();
+        crate::team_edition::record(home.path(),duduclaw_core::EditionProfile::Enterprise);
+        std::fs::write(home.path().join("config.toml"),"[auth]\nmfa_enforced=false").unwrap();
+        crate::mfa::reload_policy(home.path());
+        assert!(webchat_credential_valid(home.path(),&claims,&live,claims.exp));
+        std::fs::write(home.path().join("config.toml"),"[auth]\nmfa_enforced=true").unwrap();
+        crate::mfa::reload_policy(home.path());
+        assert!(webchat_credential_valid(home.path(),&claims,&live,claims.exp-1));
+        assert!(!webchat_credential_valid(home.path(),&claims,&live,claims.exp));
+        claims.credential_epoch+=1;
+        assert!(!webchat_credential_valid(home.path(),&claims,&live,0));
+        db.mfa_operator_reset(&user.email).unwrap();
+        // Heartbeat bypasses the short socket cache and observes retirement.
+        assert!(crate::handlers::live_context::resolve_socket_context(&db,&cache,&ctx,true).is_err());
     }
 }

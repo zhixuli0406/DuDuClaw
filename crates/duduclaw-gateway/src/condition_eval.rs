@@ -314,7 +314,9 @@ async fn run_sandboxed(
     }
 
     duduclaw_core::ns_guard::guard_command(&mut cmd);
+    let admission = duduclaw_core::autonomy_handoff::admit().await?;
     let child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
+    admission.handed_off();
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("wait: {e}")),

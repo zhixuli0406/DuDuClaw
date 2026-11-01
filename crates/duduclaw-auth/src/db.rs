@@ -128,6 +128,7 @@ impl UserDb {
         .map_err(|e| format!("failed to create auth tables: {e}"))?;
 
         crate::google_identity::migrate(&conn)?;
+        crate::mfa::migrate(&conn)?;
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.
@@ -217,6 +218,7 @@ impl UserDb {
         .map_err(|e| format!("failed to create user: {e}"))?;
 
         Ok(User {
+            credential_epoch: 0,
             id,
             email: email.to_string(),
             display_name: display_name.to_string(),
@@ -248,7 +250,7 @@ impl UserDb {
             conn.query_row(
                 &format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"),
                 params![email],
-                |row| Ok((user_from_row(row)?, row.get::<_, String>(11)?)),
+                |row| Ok((user_from_row(row)?, row.get::<_, String>(12)?)),
             )
         };
 

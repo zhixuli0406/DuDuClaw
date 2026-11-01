@@ -88,10 +88,20 @@ pub fn spawn(queue: Arc<MessageQueue>, home: PathBuf, message: QueueMessage) {
                     queue.reset_to_pending(&id).await
                 }
             }
+            Ok(DispatchOutcome::Deferred) => {
+                tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECONDS)).await;
+                defer_autonomy_pause(&queue, &id).await
+            }
             Err(error) => queue.fail(&id, &error).await,
         };
         if let Err(e) = settled {
             warn!(message_id = %id, error = %e, "workflow queue message not settled");
         }
     });
+}
+
+/// Keep an operator-paused handoff runnable, even past the transient retry cap.
+/// Shared with the queue lifecycle regression test; no workflow state is changed.
+pub(super) async fn defer_autonomy_pause(queue: &MessageQueue, id: &str) -> Result<(), String> {
+    queue.defer_to_pending(id).await
 }

@@ -482,13 +482,8 @@ pub fn build_state_block(
 
 /// Closed classification of why a goal task is parked `needs_human`.
 ///
-/// Six variants, one per family of trigger that actually exists in the
-/// codebase today (see the table in the module tests). Deliberately smaller
-/// than grok-build's eight states: `user_paused` has no DuDuClaw trigger (a
-/// human takeover keeps the task in `needs_human` via `claim_needs_human`
-/// without re-escalating it, and `takeover::is_target_paused` freezes a task
-/// *without* parking it), so inventing the state would mean shipping a chip
-/// nothing can ever set.
+/// Unknown tokens (including tokens from newer binaries) remain paused and
+/// decode to `Unknown`; adding a reason never makes an old reader resume work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseReason {
     /// The loop ran but the state stopped changing — A2 oscillation
@@ -508,6 +503,8 @@ pub enum PauseReason {
     /// `[goal_loop] resume_on_restart = "pause"` parked it for
     /// re-confirmation instead of silently resuming.
     Restart,
+    /// An operator paused autonomous work; the current turn has finished.
+    OperatorPaused,
     /// Not classified: rows written before this column existed, or any
     /// stored value this build does not recognise. Reads as "needs a human
     /// to look" — the safe direction.
@@ -524,6 +521,7 @@ impl PauseReason {
             PauseReason::BlockedNeedsDecision => "blocked_needs_decision",
             PauseReason::Infra => "infra",
             PauseReason::Restart => "restart",
+            PauseReason::OperatorPaused => "operator_paused",
             PauseReason::Unknown => "unknown",
         }
     }
@@ -539,8 +537,15 @@ impl PauseReason {
             "blocked_needs_decision" => PauseReason::BlockedNeedsDecision,
             "infra" => PauseReason::Infra,
             "restart" => PauseReason::Restart,
+            "operator_paused" => PauseReason::OperatorPaused,
             _ => PauseReason::Unknown,
         }
+    }
+
+    /// Unknown future reasons must retain human control, just like operator pauses.
+    pub fn observer_may_autoclose(self) -> bool {
+        matches!(self, Self::NoProgress | Self::BudgetExhausted
+            | Self::BlockedNeedsDecision | Self::Infra | Self::Restart)
     }
 
     /// One short zh-TW phrase for channel notices — end-user vocabulary, no
@@ -554,8 +559,22 @@ impl PauseReason {
             PauseReason::BlockedNeedsDecision => "等你決策",
             PauseReason::Infra => "系統問題",
             PauseReason::Restart => "系統重啟後暫停",
+            PauseReason::OperatorPaused => "操作人員已暫停",
             PauseReason::Unknown => "需要人工確認",
         }
+    }
+}
+
+impl serde::Serialize for PauseReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PauseReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let token = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::from_stored(Some(&token)))
     }
 }
 

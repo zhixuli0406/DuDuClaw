@@ -46,7 +46,7 @@ use super::principals::AgentRef;
 
 /// Default readers from the employee's account bindings (active accounts
 /// only). Personal edition has no people to share with: none.
-pub fn default_readers(users: Option<&Arc<UserDb>>, agent_id: &str, personal: bool) -> Vec<Grant> {
+pub fn default_readers(home: &Path, users: Option<&Arc<UserDb>>, agent_id: &str, personal: bool) -> Vec<Grant> {
     if personal {
         return Vec::new();
     }
@@ -60,9 +60,11 @@ pub fn default_readers(users: Option<&Arc<UserDb>>, agent_id: &str, personal: bo
             return Vec::new();
         }
     };
+    let restricted = crate::machine_employee::requires_admin_for_id(home, agent_id);
     let mut out: Vec<Grant> = Vec::new();
     for b in bindings {
-        let active = matches!(db.get_user(&b.user_id), Ok(Some(u)) if u.status == UserStatus::Active);
+        let active = matches!(db.get_user(&b.user_id), Ok(Some(u)) if u.status == UserStatus::Active
+            && (!restricted || u.role == duduclaw_auth::UserRole::Admin));
         if !active || out.iter().any(|(_, id, _)| *id == b.user_id) {
             continue;
         }
@@ -215,9 +217,10 @@ pub fn describe(home: &Path, input: &DescribeInput<'_>) -> KbResult<Value> {
     let granted = super::agent_binding::granted_collections(home, input.agent)?;
     let mut rows = Vec::with_capacity(granted.len());
     for c in &granted {
+        if !super::principals::collection_visible(home, &conn, &c.collection.id, input.caller.is_admin) { continue; }
         rows.push(collection_json(&conn, c, agent_id, &scope, input.caller, &input.names)?);
     }
-    let own = own_json(&conn, agent_id, &scope, input)?;
+    let own = own_json(home, &conn, agent_id, &scope, input)?;
     let own_role = own
         .as_ref()
         .and_then(|o| o["collection"]["my_role"].as_str())
@@ -266,6 +269,7 @@ fn manage_blocked(
 }
 
 fn own_json(
+    home: &Path,
     conn: &Connection,
     agent_id: &str,
     scope: &KnowledgeScope,
@@ -274,6 +278,7 @@ fn own_json(
     let Some(own) = agent_own::get(conn, agent_id)? else {
         return Ok(None);
     };
+    if !super::principals::collection_visible(home, conn, &own.collection_id, input.caller.is_admin) { return Ok(None); }
     let Some(summary) = store::list_by_ids(conn, std::slice::from_ref(&own.collection_id))?.pop() else {
         return Ok(None);
     };
@@ -338,6 +343,9 @@ pub struct EnsureOutcome {
 /// Create the employee's own collection, or return it when the caller may
 /// add files to it (editor or owner of that collection; Admin always).
 pub fn ensure_collection(home: &Path, input: &EnsureInput<'_>) -> KbResult<EnsureOutcome> {
+    if !input.caller.is_admin && crate::machine_employee::requires_admin_for_id(home, &input.agent.id) {
+        return Err(KbError::PermissionDenied);
+    }
     let cfg = duduclaw_knowledge::limits::KnowledgeConfig::from_home(home);
     let mut conn = schema::open_home(home)?;
     let readers: Vec<Grant> = if input.share_chat_users {

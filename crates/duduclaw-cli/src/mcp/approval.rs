@@ -556,7 +556,7 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
             ),
             ActionGate::RequireApproval => (ActionGate::RequireApproval, None, None, Vec::new()),
             ActionGate::ConsultJudge => {
-                let outcome = action_guard_judge(home_dir, &agent_dir, tool_name, &payload).await;
+                let outcome = action_guard_judge(home_dir, &agent_dir, agent_id, tool_name, &payload).await;
                 let resolved = resolve_action_gate(false, true, Some(outcome.verdict));
                 let status = match (outcome.verdict, outcome.errored) {
                     (JudgeVerdict::Safe, _) => "auto_ok",

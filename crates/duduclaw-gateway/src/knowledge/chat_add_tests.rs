@@ -197,6 +197,48 @@ async fn bound_sender_files_a_card_and_others_are_refused() {
 }
 
 #[tokio::test]
+async fn restricted_own_collection_hides_old_acl_before_chat_proposal() {
+    use duduclaw_core::preset;
+    let f = fx();
+    let h = f.home.path();
+    adapter_saved(&f);
+    let (cid, _, _) = collection(
+        h,
+        "own-hr-bot",
+        "internal",
+        &[(PrincipalKind::User, f.editor.as_str(), Role::Editor)],
+        "Restricted knowledge.",
+    );
+    let conn = schema::open_home(h).unwrap();
+    conn.execute(
+        "INSERT INTO agent_own_collections (agent_id, collection_id, created_by, created_at) VALUES ('hr-bot', ?1, 'admin', 't')",
+        [&cid],
+    ).unwrap();
+    preset::install_system_operator_preset(h, false).unwrap();
+    preset::bind(h, "hr-bot", &h.join("agents/hr-bot"), "system-operator", "test", "test").unwrap();
+    let editor = RequesterIdentity::DashboardUser { user_id: f.editor.clone() };
+    let broker = crate::approval::ApprovalBroker::open(h).unwrap();
+    let unknown = handle(cmd(&f, editor.clone(), "nope", "Ue")).await;
+    assert_eq!(unknown, NO_COLLECTION);
+    assert_eq!(handle(cmd(&f, editor.clone(), "own-hr-bot", "Ue")).await, unknown);
+    assert!(broker.list_by_kind(approval::ACTION_KIND).await.unwrap().is_empty());
+
+    let admin = f.users.create_user(
+        "a@example.test", "A", "password-123456", UserRole::Admin,
+    ).unwrap().id;
+    let reply = handle(cmd(&f, RequesterIdentity::DashboardUser { user_id: admin }, "own-hr-bot", "Ue")).await;
+    assert!(reply.contains("已送出審核") && reply.contains("own-hr-bot"), "{reply}");
+    assert_eq!(broker.list_by_kind(approval::ACTION_KIND).await.unwrap().len(), 1);
+    // A pending proposal must not change the hidden collection's reply.
+    assert_eq!(handle(cmd(&f, editor.clone(), "own-hr-bot", "Ue")).await, unknown);
+    assert_eq!(broker.list_by_kind(approval::ACTION_KIND).await.unwrap().len(), 1);
+
+    let reply = handle(cmd(&f, editor, "hr", "Ue")).await;
+    assert!(reply.contains("已送出審核") && reply.contains("「hr」"), "{reply}");
+    assert_eq!(broker.list_by_kind(approval::ACTION_KIND).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn forged_references_name_nothing() {
     let f = fx();
     let bound = |sender: &str| RequesterIdentity::ChannelUser {

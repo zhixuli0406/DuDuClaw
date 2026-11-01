@@ -312,6 +312,7 @@ mod digest_rpc_tests {
             let mut access = std::collections::HashMap::new();
             access.insert("alice".to_string(), level);
             UserContext {
+                credential_epoch: 0,
                 user_id: u.id,
                 email,
                 role: UserRole::Employee,

@@ -79,6 +79,8 @@ mod playbook_export; // WP2.2/B4 batch: gene JSON export CLI (`duduclaw export p
 mod playbook_migrate; // WP1.4: SOUL.md → playbook migration drafts (`duduclaw playbook migrate-soul`)
 mod portability; // Personal-edition data portability: export/import ~/.duduclaw
 mod premium_templates; // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
+#[cfg(test)]
+mod profile_edit_test_hook;
 mod preset_cmd; // WP-6F: `duduclaw preset` — agent preset ("職務組合") CLI surface
 mod ptc;
 pub mod redaction_verify; // WP2: `duduclaw redaction verify` evidence report
@@ -90,6 +92,7 @@ mod computer_profiles_cmd;
 mod computer_workspaces_cmd; // P2-C: `duduclaw computer-workspaces` (operator-only)
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
+mod tui_cmd;
 mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
@@ -432,6 +435,11 @@ enum Commands {
         #[command(subcommand)]
         command: egress_leases_cmd::EgressLeasesCommands,
     },
+    /// 開啟終端控制室，查看待處理事項與員工狀態，並處理決策
+    Tui {
+        #[command(subcommand)]
+        command: Option<tui_cmd::TuiCommands>,
+    },
     /// Initialize DuDuClaw environment and configuration
     Onboard {
         /// Skip interactive prompts and use defaults
@@ -481,6 +489,13 @@ enum Commands {
     // `causal-*` leaves.
     #[command(flatten)]
     Causal(CausalCommands),
+
+    /// 主機帳號救援
+    #[command(name = "ops")]
+    MfaOps {
+        #[command(subcommand)]
+        command: users_mfa_cmd::MfaOpsCommands,
+    },
 
     // Operator maintenance leaves (doctor .. restore).
     #[command(flatten)]
@@ -4082,6 +4097,21 @@ pub async fn entry_point() {
         }
         return;
     }
+    if is_tui_command(&cli.command) {
+        // The TUI owns the terminal. Never initialize a subscriber, log file,
+        // log facade bridge or OTLP here, regardless of RUST_LOG. In particular
+        // tungstenite TRACE payloads include the connect-frame JWT.
+        if cli.force_disable_redaction {
+            eprintln!("控制室不支援 --force-disable-redaction");
+            std::process::exit(2);
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        if let Err(error) = duduclaw_tui::without_tracing(run(cli)).await {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Install ring as the default rustls CryptoProvider (required for TLS WebSocket connections).
     // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -4233,6 +4263,10 @@ pub async fn entry_point() {
     }
 }
 
+fn is_tui_command(command: &Commands) -> bool {
+    matches!(command, Commands::Tui { .. })
+}
+
 fn is_read_only_survival_command(command: &Commands) -> bool {
     matches!(command, Commands::Maintenance(MaintenanceCommands::Knobs {
         command: KnobsCommands::Survival { .. },
@@ -4241,6 +4275,7 @@ fn is_read_only_survival_command(command: &Commands) -> bool {
 
 async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
     match cli.command {
+        Commands::Tui { command } => tui_cmd::run(&duduclaw_home(), command).await,
         Commands::Onboard { yes } => cmd_onboard(yes).await,
         Commands::Run { yes } => cmd_run_server(yes).await,
         Commands::Agent { command } => match command {
@@ -5349,6 +5384,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             artifact,
         }) => causal_cmd::clear_revocation_fence(&db, &tenant, &acl, &artifact),
         Commands::EgressLeases { command } => egress_leases_cmd::run(&duduclaw_home(), command),
+        Commands::MfaOps { command: users_mfa_cmd::MfaOpsCommands::Users { command } } => users_mfa_cmd::run(&duduclaw_home(), command),
         Commands::Ops(OpsCommands::Doctor { fix_residue }) => cmd_doctor(fix_residue).await,
         Commands::Ops(OpsCommands::Responsibility { command }) => {
             responsibility_cmd::run(&duduclaw_home(), command).await
@@ -6571,6 +6607,9 @@ fn agent_file_guard_decision(
                 } else {
                     bash_reserved_agent_create(command, &home, &caller)
                         .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, tui_cmd::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
                             channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
                         })
                         .or_else(|| {
@@ -6581,6 +6620,9 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             responsibility_cmd::bash_responsibility_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            users_mfa_cmd::bash_decision(command, caller)
                         })
                         .or_else(|| {
                             agent_control_cmd::bash_agent_control_decision(command, &caller)
@@ -7380,6 +7422,10 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             return Ok(());
         }
 
+        // Drain publishers before the first reset side effect.
+        let _lifecycle = duduclaw_core::autonomy_gate::exclusive_barrier_async(&home).await
+            .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+
         // Back up existing config to timestamped directory
         let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let backup_dir = home.join(format!("backup_{ts}"));
@@ -7410,18 +7456,21 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             copy_dir_recursive(&agents_src, &agents_dst).await;
         }
 
-        // Keep config.toml until the snapshot-bound final publication. A
-        // cancelled/failed wizard must not unlink the guarded source file.
-        for name in &["inference.toml"] {
-            let p = home.join(name);
-            if p.exists() {
-                let _ = tokio::fs::remove_file(&p).await;
+        // Keep config.toml until final publication. The blocking worker owns
+        // the barrier through removal even if the onboarding future is dropped.
+        let reset_home = home.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let _lifecycle = _lifecycle;
+            let inference = reset_home.join("inference.toml");
+            if inference.exists() {
+                let _ = std::fs::remove_file(inference);
             }
-        }
-        // Remove old agents (will be recreated)
-        if agents_src.exists() {
-            let _ = tokio::fs::remove_dir_all(&agents_src).await;
-        }
+            if agents_src.exists() {
+                std::fs::remove_dir_all(agents_src)?;
+            }
+            Ok(())
+        }).await.map_err(|e| DuDuClawError::Agent(format!("重設員工工作失敗：{e}")))?
+            .map_err(|e| DuDuClawError::Agent(format!("移除舊員工失敗：{e}")))?;
 
         println!(
             "  {} 現有設定已備份至 {}",
@@ -14126,6 +14175,20 @@ mod cli_verb_consolidation_tests {
     /// an about string — the regression this fixes is invisible to any
     /// behavioural test.
     #[test]
+    fn tui_commands_parse_into_no_logging_entry() {
+        run_on_big_stack(|| {
+            for args in [vec!["tui"], vec!["tui", "inbox"], vec!["tui", "inbox", "--follow", "--json"]] {
+                assert!(is_tui_command(&parse(&args).command));
+            }
+            assert!(matches!(parse(&["tui", "inbox", "--follow", "--json"]).command,
+                Commands::Tui { command: Some(tui_cmd::TuiCommands::Inbox { follow: true, json: true }) }));
+            assert!(!is_tui_command(&parse(&["agent", "list"]).command));
+            rejects(&["tui", "--token", "secret"]);
+            rejects(&["tui", "watch"]);
+        });
+    }
+
+    #[test]
     fn wizard_has_a_help_description() {
         run_on_big_stack(wizard_has_a_help_description_body);
     }
@@ -14595,6 +14658,34 @@ mod removed_name_hook_tests {
     /// matcher at the S9 rebase): `duduclaw responsibility …`, every
     /// subcommand, is refused for employees and unverified callers.
     #[test]
+    fn tui_bash_and_operator_files_are_protected_through_hook() {
+        let h = home_with_trash();
+        for caller in [agent("ceo"), HookCaller::Untrusted("ceo".into())] {
+            for cmd in ["duduclaw tui", "duduclaw tui inbox --json", "duduclaw-pro tui inbox --follow", "env -u DUDUCLAW_AGENT_ID duduclaw tui"] {
+                let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &caller).unwrap();
+                assert!(!d.is_allowed(), "{d:?}");
+                if matches!(caller, HookCaller::Agent(_)) {
+                    assert!(matches!(d, GuardDecision::BlockedOperatorCommand { command: "duduclaw tui", .. }), "{d:?}");
+                }
+            }
+            // The existing home allowlist already denies operator-owned files;
+            // pin both TUI entries here rather than add a weaker basename rule.
+            for file in ["tui-state.json", "tui.toml"] {
+                let path = h.path().join(file);
+                for tool in ["Write", "Edit", "MultiEdit"] {
+                    let envelope = json!({"tool_name":tool,"tool_input":{"file_path":path,"content":"x","old_string":"a","new_string":"b","edits":[{"old_string":"a","new_string":"b"}]}});
+                    let d = agent_file_guard_decision(tool, &envelope, h.path(), &caller).unwrap();
+                    assert!(!d.is_allowed(), "{file} {tool}: {d:?}");
+                }
+                let cmd = format!("echo x > '{}'", path.display());
+                let d = agent_file_guard_decision("Bash", &bash(&cmd), h.path(), &caller).unwrap();
+                assert!(!d.is_allowed(), "{file}: {d:?}");
+            }
+        }
+        assert!(agent_file_guard_decision("Bash", &bash("duduclaw tui"), h.path(), &HookCaller::Absent).unwrap().is_allowed());
+    }
+
+    #[test]
     fn bash_responsibility_is_blocked_through_the_hook() {
         let h = home_with_trash();
         let untrusted = HookCaller::Untrusted("ceo".into());
@@ -14978,3 +15069,4 @@ if [ -t 1 ]; then printf 'pty-probe-ok'; fi
         assert!(!stdout.contains("explicit-env-missing"), "{stdout}");
     }
 }
+mod users_mfa_cmd;

@@ -67,6 +67,7 @@ mod templates_util;
 mod templates_rpc;
 mod templates_create;
 mod agents_ops;
+mod autonomy_rpc;
 mod agents_update;
 mod contract_rpc;
 mod redaction_rpc;
@@ -171,12 +172,14 @@ mod workflow_runs_rpc;
 mod plans_rpc;
 mod activity_timeline_rpc;
 mod runs_rpc;
+mod runs_live;
 mod chat_sessions_rpc;
 mod bound_history_rpc;
 mod bound_runs_rpc;
 mod bound_search_rpc;
 mod fork_migrate_rpc;
 mod approvals_topology_rpc;
+pub(crate) mod approval_visibility;
 mod mail_rpc;
 mod approvals_decide;
 mod approval_decider;
@@ -248,6 +251,7 @@ pub(crate) use channel_util::*;
 pub(crate) use accounts_util::*;
 pub(crate) use task_json::*;
 pub(crate) use task_privacy::*;
+pub(crate) use push_filter::PreparedPush;
 pub use push_filter::{PUSH_CACHE_SECS, PushGate, filter_push_event};
 pub(crate) use timeline_util::*;
 pub(crate) use chat_history_util::*;
@@ -468,6 +472,13 @@ impl MethodHandler {
             return WsFrame::error_response("", "請使用 Dashboard 帳號登入後再連接 CLI。");
         }
 
+        if ctx.user_id == "system" && conn.peer.is_some() && !conn.pre_auth {
+            let personal=self.resolve_edition_profile().await.is_personal();
+            if !matches!(crate::mfa::enforced(&self.home_dir,personal),Ok(false)) {
+                return WsFrame::error_response("", "已要求雙因素驗證，請使用帳號重新登入。");
+            }
+        }
+
         // ── Live identity ───────────────────────────────────────────────
         // The JWT proves who the caller is; what they may do is read from
         // users.db now (`live_context.rs`), so an unbinding, a demotion or a
@@ -510,6 +521,18 @@ impl MethodHandler {
             return enterprise_only_reject_frame();
         }
 
+        // MFA is a gateway-owned authentication namespace, never delegated to
+        // plugins. Every allowed method has an explicit authorization entry.
+        if method.split('.').next() == Some("mfa") || matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") {
+            let Some(role) = mfa_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不允許此操作。");
+            };
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return self.dispatch_org(method, params, ctx, conn).await;
+        }
+
         // ── Plugin extension dispatch ──────
         // Try extension first; if it returns Some, the method is handled.
         if let Some(frame) = self
@@ -531,3 +554,5 @@ impl MethodHandler {
         boxed_frame(|| self.dispatch_core(method, params, ctx, conn)).await
     }
 }
+
+mod mfa_rpc;

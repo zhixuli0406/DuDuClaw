@@ -250,3 +250,81 @@ Claiming is compare-and-set, so two agents can't double-claim, and changing or c
 ## The Takeaway
 
 A team needs one board everyone can see, claim from, and report against. DuDuClaw's Task Board is that board — a single SQLite store with a human door (dashboard RPC) and an agent door (MCP tools), a real-time Activity Feed for standups, prompt auto-injection so working agents always see their queue, and a scheduler-level pull so idle agents still get woken when work lands on their name. It's what turns an AI agent from a function you call into a teammate who picks up cards.
+
+## Live gateway events
+
+The dashboard refreshes tasks, the inbox and employee status when `/ws` sends an
+invalidation. Only approval counts have a five-minute fallback refresh; tasks and
+employee status rely on events, reconnects or manual reads. A failed
+inbox refresh preserves the previous count and marks it stale (`?`). Reconnect,
+`events_lost`, or a changed `boot_id` requires refetching the existing list RPCs.
+Events can be duplicated, including a direct RPC push followed by the database
+bridge; they are not authoritative records or an exactly-once change log.
+
+Each connection numbers delivered events from `seq: 1` **after** authorization
+filtering. The handshake and event frames include an additive `boot_id`. A lagging
+connection receives `events_lost`; no replay buffer or snapshot RPC is provided.
+Employee-side task and approval changes cross the existing `events.db` bridge
+(approximately two seconds). Gateway runtime and goal events are sent in-process.
+
+| Events | Visibility |
+|---|---|
+| `agent.turn_started`, `agent.turn_finished`, `agent.status_changed` | Employee binding; turn metadata includes runtime and source |
+| `task.created`, `task.updated`, `task.needs_human`, `goal.round_started`, `goal.round_finished`, `goal.done`, `goal.failed` | Employee access plus task audience; restricted board cards remain redacted |
+| `approval.created`, `approval.decided`, `approval.expired` | Same decision as `approvals.get`: current Manager (a pending password change denies). `knowledge_add_source` requires Admin or a current collection editor/owner (a missing collection denies non-admins; employee Viewer is not required). Operator-CLI kinds, workflow activation, `agent_file_change`, `support_pilot_review`, and board kinds (`strategic_plan`, `agent_hire`) require a current Admin. `knowledge_quarantine` and `expert_skills_enable` require employee Viewer. The workflow-activation snapshot and unbound task audience still apply |
+| `budget.breaker_open`, `autopilot.breaker_open` | Admin |
+
+New notifications contain identifiers and enums, never prompts, tool arguments or
+file contents. Goal events use their own names and do not trigger autopilot rules
+listening to `task.updated`. A turn source is `channel`, `goal`, `cron`, `heartbeat`,
+`responsibility`, `assign` or `autopilot`. A finished turn/round means the invocation
+ended (including cancellation), not that the task passed acceptance.
+
+`runs.subscribe {"run_id":"…"}` opts one connection into compact `run.step`
+events. Only an exact run id is accepted; agent-wide subscriptions are refused. Use the
+same selector with `runs.unsubscribe`. There are at most 16 selectors per
+connection, 20 subscription commands per second (one in flight), and 20 delivered
+steps per second. Disconnect removes all subscriptions. Authorization is checked
+before enqueue and again before delivery, using the run inspector's employee, task-audience and history
+privacy rules. Filtered conversation history does not expose tool steps. Steps use
+a separate bounded connection queue, not the general broadcast stream; overflow
+or rate drops request reconciliation with `events_lost`. Unauthorized steps never
+enter the queue, mark loss or consume delivery rate. At most four authorization
+checks run per connection; candidates arriving while all four are busy are
+silently dropped without a loss signal. Refetch `runs.get` to reconcile; concurrent
+checks can reorder steps.
+
+Turn payloads contain only `agent_id`, `source`, and `runtime`; no session/task ids.
+The database bridge validates ids and reloads task/approval/agent metadata from
+storage, rejects payloads above 8 KiB before parsing, and coalesces each
+(event type, entity id) once per poll. Only successful authoritative projections
+consume the 64-entity delivery budget; missing or invalid ids do not. A separate
+256-row work cap bounds parsing and lookups. Rows dropped by the byte, work or
+delivery cap advance the cursor and trigger one empty `events_lost` per tick.
+Tasks, employee status and the inbox all refetch on that signal. Legacy cron/memory/skill/channel bridge events carry only a validated
+`agent_id` or an empty object; they do not expose entity names or subjects.
+Event-driven web refresh runs at most once every two seconds with
+leading/trailing behavior and error backoff up to 60 seconds.
+
+Only Claude currently produces these live step notifications. Channel tool starts
+are emitted when persisted; scheduled/dispatch steps are emitted as a batch after
+the run is recorded, with phase `finished`. Dispatch run ids are allocated at
+that point, so clients generally cannot subscribe before the batch; use
+`runs.get` for dispatch history. Other runtimes can retain existing
+historical evidence but produce no `run.step` notifications. Summaries are fixed,
+character-truncated labels, not argument previews.
+
+Approval cards returned by `approvals.list` and `approvals.get {"id":"…"}` include
+`digest` (or `null` when decision material is withheld). `approvals.get` uses the
+same `{approvals, count}` response envelope. Send it as optional `expected_digest`
+to `approvals.decide`; a mismatch rejects the decision and asks the client to
+refetch. Omitting it keeps the existing behavior. The digest is lowercase SHA-256
+of recursively key-sorted compact UTF-8 JSON; arrays retain order. It covers id,
+agent, kind, summary, visible payload (or its bound hash), request kind, status,
+binding, answer, invalidation reason, creation/expiry/TTL, simulation,
+dashboard-only flag and the displayed workflow-activation facts (including
+pricing). Channel links, reader permission flags and the digest itself are excluded.
+Approval persistence and event delivery are separate writes; the fallback refresh
+also reconciles a process crash between them.
+
+The turn event’s `runtime` names the provider selected at invocation start; a later failover can use another provider. It is not proof of which provider ultimately produced the result.

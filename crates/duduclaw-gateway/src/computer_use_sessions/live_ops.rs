@@ -296,12 +296,21 @@ impl ComputerUseSessions {
         let mode = Self::wanted_mode(entry);
         let password = self.ensure_vnc(entry, mode).await?;
         let now = Instant::now();
+        let access_expires = crate::mfa::ACCESS_EXPIRY.try_with(|v| *v).ok().flatten();
+        // A real account needs transport provenance; only the legacy host principal has no JWT.
+        if ctx.user_id != "system" && access_expires.is_none() {
+            return Err(stream_unavailable());
+        }
+        let remaining = access_expires.map(|exp| exp.saturating_sub(chrono::Utc::now().timestamp().max(0) as u64));
+        if remaining == Some(0) { return Err(stream_unavailable()); }
+        let ttl = remaining.map(|secs| TICKET_TTL.min(Duration::from_secs(secs))).unwrap_or(TICKET_TTL);
         let ticket = self.tickets.issue(
             ViewTicket {
                 agent_id: agent_id.to_string(),
                 session_id: entry.session_id.clone(),
                 ctx: ctx.clone(),
-                expires: now + TICKET_TTL,
+                expires: now + ttl,
+                access_expires,
             },
             now,
         );
@@ -318,7 +327,7 @@ impl ComputerUseSessions {
             "path": super::view_ws::VIEW_PATH,
             "mode": mode.as_str(),
             "input": mine,
-            "expires_in": TICKET_TTL.as_secs(),
+            "expires_in": ttl.as_secs(),
         }))
     }
 

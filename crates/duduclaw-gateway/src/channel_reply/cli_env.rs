@@ -360,8 +360,11 @@ pub(super) async fn spawn_claude_cli_with_env(
     cmd.kill_on_drop(true);
     // Own process group: an aborted or timed-out turn kills the CLI AND the
     // processes it started (MCP servers, tool subprocesses), not just the CLI.
+    let admission = crate::autonomous_runtime::admit_current().await?;
     let (mut child, mut group_guard) = crate::process_group::spawn_guarded(&mut cmd)
         .map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    crate::autonomous_runtime::mark_handoff();
+    drop(admission);
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 

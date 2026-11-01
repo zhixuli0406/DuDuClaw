@@ -371,10 +371,14 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn start(&self, id: &ContainerId) -> Result<()> {
+        let mut admission = duduclaw_core::autonomy_handoff::admit().await
+            .map_err(DuDuClawError::Container)?;
+        admission.request_started();
         self.client
             .start_container(&id.0, None::<StartContainerOptions<String>>)
             .await
             .map_err(|e| DuDuClawError::Container(format!("Failed to start container: {}", e)))?;
+        admission.handed_off();
 
         info!(id = %id.0, "Container started");
         Ok(())

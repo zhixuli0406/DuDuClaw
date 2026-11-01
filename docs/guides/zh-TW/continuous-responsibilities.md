@@ -313,3 +313,35 @@ AI 員工不能建立、修改、恢復、重新啟用持續任務，也不能�
 - Bash 通道阻擋：共用的操作者指令比對器（`duduclaw_core::bash_operator_command_decision`，`GuardDecision::BlockedOperatorCommand`），清單在 `responsibility_cmd::OPERATOR_COMMANDS`，在 agent-file-guard hook 中串接於 LINE 收件匣指令之後。
 - 每個持續任務、指示與停止 RPC 都會從帳號資料庫重新讀取呼叫者（`handlers/task_privacy.rs::live_reader_context`）；`tasks.steer`／`tasks.steering`／`tasks.stop`／`tasks.stop_status` 另外還要通過任務內容閘（`authorize_private_task_read`：員工存取權加上任務的受眾）。
 - 這一輪所屬的任務會以 `DUDUCLAW_TASK_ID` 傳給所有執行環境的 MCP 伺服器（`runtime::round_task_env`）；核准卡片使用同一個值。
+
+## 暫停自主工作
+
+已登入的 WebSocket 用戶端可呼叫 `autonomy.pause`，傳入 `{"agent_id":"alice","reason":"維護"}` 或 `{"all":true,"reason":"維護"}`。恢復用 `autonomy.resume`，傳相同範圍、不帶 `reason`；查詢用 `autonomy.status {}`。`agent_id` 與 `all: true` 必須擇一。原因最多 1,000 個 Unicode 字元，每筆保留操作人的使用者 ID 與時間。
+
+個別控制需要 Manager 以上角色，加上該員工目前有效的 Operator 以上綁定；Admin 不受綁定限制。全員控制限 Admin。任何登入使用者都能查詢，但只會看到有閱覽權限的員工；`autonomy.changed` 即時事件採相同過濾，全域事件會傳給所有登入者。AI 員工的 MCP 沒有這些控制工具。
+
+暫停會阻止新目標回合、dispatcher 領取、cron、心跳、持續職責的 occurrence、自動規則、排程交辦及 workflow 下一步；收信自動喚醒、提醒的員工回呼、夜間工作、自主研究、自主演化、技能合成、規則／偏好歸納及排隊中的臨時子員工也會停止。已排隊的 workflow 保留原 run 與 checkpoint，恢復後接續。已開始的目標回合可以完成，接著停在 `needs_human`，原因是 `operator_paused`。恢復只重新開放後續執行，不會自動續跑已等待人工處理的目標。Cron 與職責 fire 的跳過會留下紀錄。恢復個別員工不會解除全域暫停，解除全域暫停也不會清除個別暫停。
+
+真人 WebChat 與頻道直接對話仍可使用。原有員工生命週期狀態維持原本的路由效果；包含 `Paused` 在內的非 operational 狀態也會阻擋自主工作，`autonomy.resume` 不會改動它。排程提醒的直接傳送、管理通知、已核准的郵件寄送與系統維護仍持續，因為它們不會啟動員工回合。對話背景標題、摘要、壓縮、知識蒸餾、指令／決策與關鍵事實擷取也會停止替已暫停員工啟動模型。真人直接回覆及當回合所需的輔助處理仍可使用，因此不保證所有模型用量歸零。全域暫停也會阻擋已脫離請求的專家生成工作；本機 UCCI shadow 沒有自主工作身分時略過背景生成。
+
+狀態存於 DuDuClaw home 的 `autonomy_pause.json`，另有初始化標記辨識「首次使用」與「曾使用後檔案遺失」，重啟後保留。狀態讀取、解析或版本驗證失敗時，所有自主工作都停止，查詢的 `state_error` 會說明問題；變更 RPC 不會覆蓋損壞狀態，需由管理者從可信備份修復。這是新工作的入口控制，不會終止已執行的程序，也不是作業系統隔離。舊版程式不會執行此 gate；依賴暫停時不可降版。舊版讀到新的目標 pause reason 會顯示 `unknown`，目標仍停在待人工處理；但舊版不會執行自主工作的入口 gate。
+
+每次變更會先寫入稽核請求；稽核紀錄無法寫入時，拒絕變更並保留原暫停狀態。若狀態已落地但完成紀錄寫入失敗，回覆會帶 `audit_error`，此時狀態已套用。暫停期間收到的郵件保留在收件匣，恢復後不會自動補喚醒。
+
+已暫停的員工不能透過 MCP 替其他員工派工、建立臨時子員工、建立或指派 task／goal，或啟用 schedule、cron、會喚醒員工的 reminder。系統在副作用前檢查已驗證的呼叫身分；已入列的派工在 handoff 時也檢查來源員工。Goal 與 heartbeat 任務另檢查紀錄中的員工建立者。人員可從 dashboard 或 `duduclaw tui` 發起工作，真人對話中的直接回覆仍可使用。
+
+Workflow 在核准處理及 lease renewal 後、effect 執行前再次取得 admission。若回傳 `WORKFLOW_AUTONOMY_PAUSED`，操作維持 Prepared，保留 checkpoint 與 queue retry 次數；這是延後執行，不是 effect failure。
+
+暫停／恢復會等待獨占 admission lease，鎖取得期限為 30 秒。Runtime 在共享 lease 內檢查暫停狀態並交付程序或請求；對已接入此 lease 的入口，暫停成功回覆代表先前通過檢查的 admission 都已離開 handoff 前的區間。本輪僅做靜態安全修補，尚未完成 runtime 驗收。`admission_wait_timeout` 代表這次變更未套用。rename 已提交、但後續持久化或重讀確認失敗時，回覆仍是 `applied: true`，並帶 `durability_warning: "applied_durability_unknown"`，不能當成狀態未變。程序與 PTY 在 spawn 成功後釋鎖；API 收到 response headers 後釋鎖，不持鎖讀取 body 或串流。工具迴圈及模型 callback 每次請求重新取得 admission。Workflow MCP execute 尚未拆開送出與完成，因此該持鎖區間上限為 10 秒（步驟原上限更短時沿用）；逾時仍視為副作用結果未確認。HTTP 等待 response headers 時仍持鎖，服務端延遲 headers 仍可能造成暫停逾時。逾時訊息列出本程序 holder 數量與路徑分類；其他程序的 holder 標為未知。本次修改與回歸測試尚未編譯或執行。
+
+`autonomy.changed` 只帶 `agent_id`、`all`、`paused`、`at`。原因與操作者身分須透過重新檢查目前綁定的 `autonomy.status` 取得。完成稽核錯誤及持久化警告只回傳給這次請求者，不會廣播。
+
+此功能是 DuDuClaw 內部的 admission control，無法抵抗以相同作業系統使用者執行的 shell；該 shell 可刪除或改寫暫停狀態、標記與鎖檔。真正的隔離須靠不授予 Bash 或使用 sandbox。
+
+變更請求交給 gateway 後，即使原連線中斷，仍會完成變更後的稽核與即時通知。每次變更都在同一次原子寫入中，將完整回條存進狀態檔，包含 change ID、pause/resume、可區分全域與員工的 scope、操作者、標準化請求的 SHA-256、套用時間與完成旗標。啟動時只依狀態檔回條決定補寫內容，不從 requested 或 completion 稽核紀錄重建變更。未完成回條會補寫 `reconciled: true` 稽核、推送目前狀態，再持鎖標記完成；失敗記錄錯誤，留待下次啟動重試。最多保留 4096 筆，滿額只淘汰最舊的已完成回條，全部未完成時拒絕新變更。若在寫完稽核／推送後、標記完成前中斷，下次啟動可能重複補寫；可用 change ID 辨識重試，即時推送也不保證持久送達。Unix 的狀態、標記與鎖檔必須屬於目前使用者且只有一個連結；自己的檔案權限過寬時收緊為 0600，失敗即拒絕。Windows 行為未改，尚未驗證。
+
+已驗證員工的背景呼叫檢查失敗時（包含暫停或狀態不可讀），`tools/list` 會隱藏必定建立背景工作的工具。既有 watcher 每次重新計算可見清單，暫停或恢復造成清單改變時送出 `notifications/tools/list_changed`。`agent_update` 等依參數決定是否建立背景工作的工具仍列出，每次呼叫個別檢查。速率限制先於會寫入稽核的輸入掃描；背景工作的暫停檢查先於拒絕稽核，暫停拒絕只記一筆不含請求參數、內容受限的稽核。
+
+隱藏範圍包含 `skill_synthesis_run` 與 `skill_from_recording`。已在執行的臨時團隊成員也繼承正式登記父鏈上每位員工的暫停；上層資料遺失、損壞、循環或整條鏈超過 32 個身分時，拒絕背景工作。恢復後須整條鏈都通過檢查才重新顯示工具。每次背景工作入列或新增資料，都在實際寫入前持有共享暫停鎖並重新檢查，直到寫入完成；解析與模型呼叫不占用這段鎖。先取得許可的寫入完成後，暫停才能回報成功；暫停先套用時，後來的寫入會被拒絕。
+
+封存、刪除或將員工改成不可執行工作的狀態時，會先等待既有 admission 釋放，最多等待 30 秒；逾時不套用這次生命週期變更。等待的是已取得許可的背景寫入與工作交接，不保證每個執行中的模型串流都已結束。交接流程若已搬移任務或知識，最後的封存步驟才失敗，仍依既有部分完成回覆呈現。因 `autonomy_refused:` 而保留的 fork 結果，必須由真人從儀表板檢視後選取（`fork.resolve`）；員工恢復或同 ID 重建，都不能透過 MCP `merge_or_select` 發布舊結果。一般手動模式 fork 維持原有選取行為。儀表板選取會留下 fork、分支、原拒絕代碼、操作者與管道的安全稽核，不記錄路徑或檔案內容。若發布完成後稽核寫入失敗，回覆會明示已發布，請勿重試發布。本輪修改與回歸測試僅完成靜態檢查，尚未編譯或執行。

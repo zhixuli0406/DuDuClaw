@@ -229,7 +229,8 @@ impl MethodHandler {
         if let Err(refusal) = crate::budget::gate_before_spawn(&self.home_dir, None, "", "widget_generate").await {
             return WsFrame::error_response("", &refusal.to_string());
         }
-        let cli_err = match crate::channel_reply::call_claude_cli_rotated(
+        let cli_err = match crate::autonomous_runtime::human_interactive(&self.home_dir,
+            crate::channel_reply::call_claude_cli_rotated(
             &user,
             model,
             &system,
@@ -242,6 +243,7 @@ impl MethodHandler {
             // System-level utility call, not an agent turn — no account pool.
             &[],
             None, // P1/WP-3 effort: resolved from the agent dir in the callee
+        )
         )
         .await
         {
@@ -269,7 +271,10 @@ impl MethodHandler {
                 &format!("widget 產生失敗（{cli_err}），且未設定 API key 可作備援"),
             );
         }
-        match crate::direct_api::call_direct_api(&api_key, model, &system, &user, &[]).await {
+        match crate::autonomous_runtime::human_interactive(&self.home_dir,
+            crate::direct_api::call_direct_api(&api_key, model, &system, &user, &[])
+        )
+        .await {
             Ok(resp) if !resp.text.trim().is_empty() => {
                 let html = match crate::custom_widgets::extract_html_fragment(&resp.text) {
                     Ok(h) => h,

@@ -162,6 +162,11 @@ async fn fire_one(
     if !agent_operational(registry, &row.agent_id).await {
         return auto_pause(home, store, row, &slot_s, "agent_unavailable").await;
     }
+    if duduclaw_core::autonomy_gate::check(
+        home, &row.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::AssignSchedule,
+    ).is_err() {
+        return advance_skip(home, store, row, &slot_s, next.as_deref(), skip("autonomy_paused"), now).await;
+    }
     if previous_run_open(store, row).await {
         return advance_skip(
             home,
@@ -173,6 +178,10 @@ async fn fire_one(
             now,
         )
         .await;
+    }
+    // Defense shared by Task and Goal, immediately before any run creation.
+    if via != "admin" && crate::machine_employee::requires_admin_for_id(home, &row.agent_id) {
+        return auto_pause(home, store, row, &slot_s, "access_lost").await;
     }
     let task_id = task_id_for_slot(&row.id, &slot_s);
     let created = match store.get_task(&task_id).await {

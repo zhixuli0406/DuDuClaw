@@ -346,9 +346,11 @@ pub(crate) async fn handle_skill_synthesis_status(params: &Value, home_dir: &Pat
 /// Resolves the Anthropic API key from `ANTHROPIC_API_KEY` env var or
 /// the `~/.duduclaw/config.toml` `[api] anthropic_api_key` field.
 /// Non-blocking: all errors are captured and returned in the summary.
-pub(crate) async fn handle_skill_synthesis_run(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+pub(crate) async fn handle_skill_synthesis_run(
+    params: &Value, home_dir: &Path, actor: record_authz::RecordActor<'_>,
+) -> Value {
     use duduclaw_gateway::skill_synthesis_pipeline::pipeline::{
-        PipelineConfig, run as run_pipeline,
+        PipelineConfig, run_for_caller as run_pipeline,
     };
 
     let agent_id_param = params
@@ -356,10 +358,32 @@ pub(crate) async fn handle_skill_synthesis_run(params: &Value, home_dir: &Path, 
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let target_agent = if agent_id_param.is_empty() {
-        default_agent
+        actor.id()
     } else {
         agent_id_param
     };
+
+    let refusal = |reason: String| serde_json::json!({
+        "content": [{"type": "text", "text": reason}], "isError": true
+    });
+    if !is_valid_agent_id(target_agent) {
+        return refusal("無效的員工識別碼。".into());
+    }
+    if let Err(reason) = check_org_subject_allowed(
+        home_dir, actor.id(), target_agent, "執行技能合成",
+    ).await {
+        return refusal(reason);
+    }
+    // Check now for the MCP response; the pipeline carries the verified caller
+    // into each transport admission instead of holding a lease for the run.
+    if let Err(reason) = check_background_caller(home_dir, actor, "skill_synthesis_run") {
+        return refusal(reason);
+    }
+    if let Err(pause) = duduclaw_core::autonomy_gate::check(
+        home_dir, target_agent, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ) {
+        return refusal(format!("目標員工已暫停自主工作，無法啟動技能合成：{pause}"));
+    }
 
     let dry_run = params
         .get("dry_run")
@@ -411,7 +435,7 @@ pub(crate) async fn handle_skill_synthesis_run(params: &Value, home_dir: &Path, 
         ..Default::default()
     };
 
-    let result = run_pipeline(&config).await;
+    let result = run_pipeline(&config, actor.agent()).await;
 
     let mode = if result.dry_run { "DRY RUN" } else { "FULL" };
     let summary = result.summary();

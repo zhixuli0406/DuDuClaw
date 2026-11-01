@@ -209,12 +209,15 @@ pub async fn review(home: &Path, agent_dir: &Path, input: &ReviewInput) -> Optio
     if let Ok(fixed) = REVIEWER_FIXTURE.try_with(|v| *v) {
         return fixed;
     }
-    let idx = crate::decide::decide_for_agent(
+    let idx = crate::autonomous_runtime::scope(
+        home, agent_dir.file_name().and_then(|s| s.to_str()).unwrap_or("invalid:agent-dir"), &[],
+        crate::decide::decide_for_agent(
         home,
         Some(agent_dir),
         QUESTION,
         &ReviewVerdict::OPTIONS,
         &input.render(),
+    )
     )
     .await?;
     ReviewVerdict::from_index(idx)

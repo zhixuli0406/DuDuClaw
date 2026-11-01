@@ -20,6 +20,8 @@ pub struct JwtConfig {
 /// Claims embedded in the JWT access token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub credential_epoch: u64,
     /// Subject (user ID).
     pub sub: String,
     /// User email.
@@ -42,6 +44,8 @@ pub struct Claims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
 }
+
+fn is_zero(value: &u64) -> bool { *value == 0 }
 
 impl JwtConfig {
     /// Create a JwtConfig from a raw secret (at least 32 bytes recommended).
@@ -139,7 +143,7 @@ impl JwtConfig {
         let session = uuid::Uuid::new_v4().to_string();
         Ok((
             self.issue_access_token_in_session(user, agent_access, Some(&session))?,
-            self.issue_refresh_token_in_session(&user.id, Some(&session))?,
+            self.issue_refresh_token_in_session(&user.id, Some(&session), user.credential_epoch)?,
         ))
     }
 
@@ -159,6 +163,7 @@ impl JwtConfig {
             .collect();
 
         let claims = Claims {
+            credential_epoch: user.credential_epoch,
             sub: user.id.clone(),
             email: user.email.clone(),
             role: user.role.to_string(),
@@ -176,12 +181,13 @@ impl JwtConfig {
 
     /// Issue a refresh token (minimal claims).
     pub fn issue_refresh_token(&self, user_id: &str) -> Result<String, String> {
-        self.issue_refresh_token_in_session(user_id, Some(&uuid::Uuid::new_v4().to_string()))
+        self.issue_refresh_token_in_session(user_id, Some(&uuid::Uuid::new_v4().to_string()), 0)
     }
 
-    fn issue_refresh_token_in_session(&self, user_id: &str, session: Option<&str>) -> Result<String, String> {
+    fn issue_refresh_token_in_session(&self, user_id: &str, session: Option<&str>, credential_epoch: u64) -> Result<String, String> {
         let now = chrono::Utc::now().timestamp() as u64;
         let claims = Claims {
+            credential_epoch,
             sub: user_id.to_string(),
             email: String::new(),
             role: String::new(),
@@ -256,6 +262,7 @@ mod tests {
 
     fn test_user() -> User {
         User {
+            credential_epoch: 0,
             id: "user-123".to_string(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),
@@ -317,6 +324,7 @@ mod tests {
         // Manually craft a token with exp in the past
         let now = chrono::Utc::now().timestamp() as u64;
         let claims = Claims {
+            credential_epoch: 0,
             sub: "user-123".to_string(),
             email: "test@example.com".to_string(),
             role: "employee".to_string(),

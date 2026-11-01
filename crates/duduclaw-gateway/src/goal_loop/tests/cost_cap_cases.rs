@@ -414,6 +414,8 @@ async fn goal_loop_streak_store_error_skips_only_that_goal() {
             goal_task("broken", "alice")
         };
         store.insert_task(&broken).await.unwrap();
+        // Autonomous dispatch requires a readable, active employee profile.
+        write_agent_toml(home.path(), "bob", "");
         store.insert_task(&goal_task("healthy", "bob")).await.unwrap();
         // A corrupt ledger row fails list_iterations for just this task,
         // while the board, queue and other goals remain readable.
@@ -451,6 +453,7 @@ async fn goal_loop_review_streak_store_error_does_not_stall_other_reviews() {
     for with_judge in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let (store, _) = open_stores(home.path()).await;
+        write_agent_toml(home.path(), "bob", "");
         for (id, agent) in [("broken", "alice"), ("healthy", "bob")] {
             store.insert_task(&claimed_review_task(id, agent)).await.unwrap();
         }

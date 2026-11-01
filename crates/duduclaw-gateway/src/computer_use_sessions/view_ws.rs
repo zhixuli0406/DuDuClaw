@@ -249,7 +249,7 @@ async fn run_bridge(socket: WebSocket, sessions: &ComputerUseSessions, admitted:
                 }
                 if last_auth.elapsed() >= REAUTH_INTERVAL {
                     last_auth = Instant::now();
-                    let still = live_identity(sessions.home(), &admitted.ticket.ctx)
+                    let still = admitted.ticket.credential_unexpired() && live_identity(sessions.home(), &admitted.ticket.ctx)
                         .is_some_and(|l| authorize(&l, &admitted.ticket.agent_id, LiveAction::Watch));
                     if !still {
                         break;
@@ -319,5 +319,32 @@ mod tests {
         resize.extend_from_slice(&[0u8; 16]);
         let (out, _) = filter_viewer_bytes(&mut f, &live, "u1", now, &resize).unwrap();
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mfa_tests {
+    use super::*;
+    #[test]
+    fn computer_use_mfa_viewer_revalidates_epoch_and_original_jwt_expiry() {
+        let home=tempfile::tempdir().unwrap();
+        let db=duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user=db.create_user("viewer@example.com","Viewer","password-test",duduclaw_auth::UserRole::Admin).unwrap();
+        db.mfa_operator_reset(&user.email).unwrap();
+        let user=db.get_user(&user.id).unwrap().unwrap();
+        let jwt=duduclaw_auth::JwtConfig::new(b"viewer-mfa-test-secret-long-enough");
+        let claims=jwt.verify_access_token(&jwt.issue_access_token(&user,&[]).unwrap()).unwrap();
+        let ctx=duduclaw_auth::UserContext::from_claims(&claims,false).unwrap();
+        assert_eq!(live_identity(home.path(),&ctx).unwrap().credential_epoch,1);
+        let mut ticket=ViewTicket { agent_id:"alice".into(),session_id:"cu-1".into(),ctx:ctx.clone(),expires:Instant::now()+Duration::from_secs(30),access_expires:Some(1) };
+        assert!(!ticket.credential_unexpired());
+        ticket.access_expires=Some(u64::MAX);
+        assert!(ticket.credential_unexpired());
+        db.mfa_operator_reset(&user.email).unwrap();
+        assert!(live_identity(home.path(),&ticket.ctx).is_none());
+        ticket.ctx.credential_epoch=3;
+        assert!(live_identity(home.path(),&ticket.ctx).is_none());
+        ticket.ctx.credential_epoch=2;
+        assert!(live_identity(home.path(),&ticket.ctx).is_some());
     }
 }

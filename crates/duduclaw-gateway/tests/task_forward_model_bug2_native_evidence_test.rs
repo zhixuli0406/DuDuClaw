@@ -140,6 +140,16 @@ fn write_tool_calls_evidence(home: &Path) {
     .unwrap();
 }
 
+fn write_fixture_agent(home: &Path) {
+    let agent_dir = home.join("agents").join(AGENT_ID);
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("agent.toml"),
+        format!("[agent]\nname = \"{AGENT_ID}\"\nrole = \"fixture\"\nstatus = \"active\"\n"),
+    )
+    .unwrap();
+}
+
 fn settled_fidelities(db_path: &Path) -> Vec<Option<String>> {
     let conn = rusqlite::Connection::open(db_path).unwrap();
     let mut stmt = conn
@@ -154,6 +164,7 @@ fn settled_fidelities(db_path: &Path) -> Vec<Option<String>> {
 #[tokio::test]
 async fn native_evidence_reaches_grounding_and_tool_activity_without_breaking_a3_fidelity() {
     let dir = tempfile::tempdir().unwrap();
+    write_fixture_agent(dir.path());
     // Grounding pre-check left at its DEFAULT (enabled) — part of what this
     // test proves is that merging native evidence in never turns a
     // Degraded/Skip round into a spurious Reject.

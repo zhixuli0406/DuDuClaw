@@ -345,6 +345,36 @@ pub fn agent_side_collections(conn: &Connection, agent: &AgentCtx) -> KbResult<A
     Ok(AllowedSet::from_ids(ids))
 }
 
+/// Best role among `grants` for this user or department.
+///
+/// Same match as [`user_role`]: [`PrincipalKind::allows`], an exact user id,
+/// and a department id only when `department` is `Some` and non-empty. Agent
+/// and channel grants never match. This does not check that the collection
+/// exists and does not treat an admin as owner; [`user_role`] does both
+/// before calling it.
+pub fn role_from_grants(
+    grants: &[AclEntry],
+    user_id: &str,
+    department: Option<&str>,
+) -> Option<Role> {
+    let department = department.filter(|d| !d.is_empty());
+    let mut best: Option<Role> = None;
+    for grant in grants {
+        if !grant.kind.allows(grant.role) {
+            continue;
+        }
+        let hit = match grant.kind {
+            PrincipalKind::User => grant.id == user_id,
+            PrincipalKind::Department => department == Some(grant.id.as_str()),
+            _ => false,
+        };
+        if hit {
+            best = best.max(Some(grant.role));
+        }
+    }
+    best
+}
+
 /// The role a dashboard user holds on a collection (Admin ⇒ owner of all).
 /// Malformed rows are ignored, never upgraded.
 pub fn user_role(
@@ -367,27 +397,34 @@ pub fn user_role(
     if is_admin {
         return Ok(Some(Role::Owner));
     }
+    // All grants, then [`role_from_grants`]. A collection that disappears
+    // between the existence check and this read yields no rows (`Ok(None)`),
+    // not a permission error. A SQL error stays `Err`.
     let mut stmt = conn.prepare_cached(
-        "SELECT principal_kind, role FROM collection_acl WHERE collection_id = ?1
-          AND ((principal_kind = 'user' AND principal_id = ?2)
-            OR (principal_kind = 'department' AND ?3 IS NOT NULL AND principal_id = ?3))",
+        "SELECT principal_kind, principal_id, role FROM collection_acl WHERE collection_id = ?1",
     )?;
-    let rows = stmt.query_map(
-        params![collection_id, user_id, department.filter(|d| !d.is_empty())],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-    )?;
-    let mut best: Option<Role> = None;
+    let rows = stmt.query_map(params![collection_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut grants = Vec::new();
     for row in rows {
-        let (kind, role) = row?;
+        let (kind, id, role) = row?;
         let (Some(kind), Some(role)) = (PrincipalKind::parse(&kind), Role::parse(&role)) else {
             continue;
         };
-        if !kind.allows(role) {
-            continue;
-        }
-        best = best.max(Some(role));
+        grants.push(AclEntry {
+            kind,
+            id,
+            role,
+            granted_by: String::new(),
+            granted_at: String::new(),
+        });
     }
-    Ok(best)
+    Ok(role_from_grants(&grants, user_id, department))
 }
 
 /// Require at least `min` on `collection_id`; anything else is
@@ -544,3 +581,57 @@ pub fn set_acl(
 #[cfg(test)]
 #[path = "acl_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod role_from_grants_tests {
+    use super::{AclEntry, PrincipalKind, Role, role_from_grants};
+
+    fn grant(kind: PrincipalKind, id: &str, role: Role) -> AclEntry {
+        AclEntry {
+            kind,
+            id: id.to_string(),
+            role,
+            granted_by: String::new(),
+            granted_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn role_from_grants_matches_user_department_and_skips_disallowed() {
+        let grants = vec![
+            grant(PrincipalKind::User, "alice", Role::Viewer),
+            grant(PrincipalKind::Department, "人資", Role::Editor),
+            grant(PrincipalKind::Department, "人資", Role::Owner),
+            grant(PrincipalKind::Agent, "alice", Role::Viewer),
+            grant(PrincipalKind::Channel, "line", Role::Viewer),
+        ];
+        assert_eq!(role_from_grants(&grants, "alice", None), Some(Role::Viewer));
+        assert_eq!(
+            role_from_grants(&grants, "bob", Some("人資")),
+            Some(Role::Editor)
+        );
+        assert_eq!(role_from_grants(&grants, "bob", Some("")), None);
+        assert_eq!(role_from_grants(&grants, "bob", None), None);
+        assert_eq!(role_from_grants(&grants, "carol", Some("業務")), None);
+        assert_eq!(
+            role_from_grants(
+                &[grant(PrincipalKind::Agent, "alice", Role::Viewer)],
+                "alice",
+                None
+            ),
+            None
+        );
+
+        let grants = vec![
+            grant(PrincipalKind::User, "alice", Role::Owner),
+            grant(PrincipalKind::Department, "人資", Role::Editor),
+        ];
+        assert_eq!(
+            role_from_grants(&grants, "alice", Some("人資")),
+            Some(Role::Owner)
+        );
+
+        let grants = vec![grant(PrincipalKind::Department, "人資", Role::Owner)];
+        assert_eq!(role_from_grants(&grants, "bob", Some("人資")), None);
+    }
+}

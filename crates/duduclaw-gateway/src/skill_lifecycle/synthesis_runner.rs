@@ -83,7 +83,9 @@ pub enum FollowThrough {
 /// `generate` receives the fully-built (injection-hardened) prompt and returns
 /// the model's raw text. Production passes `run_utility_prompt`; tests pass a
 /// canned SKILL.md.
+#[allow(clippy::too_many_arguments)]
 pub async fn follow_through_with<F, Fut>(
+    home: &Path,
     trigger: &SynthesisTrigger,
     settings: SynthesisSettings,
     input: SynthesisInput,
@@ -104,7 +106,16 @@ where
     }
 
     let prompt = build_synthesis_prompt(&input);
-    let raw = match generate(prompt).await {
+    match duduclaw_core::autonomy_gate::check(
+        home, &trigger.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ) {
+        Ok(()) => (),
+        Err(pause) => return reject(trigger, gap_accumulator, pause.to_string()).await,
+    };
+    let generated = crate::autonomous_runtime::scope(
+        home, &trigger.agent_id, &[], generate(prompt),
+    ).await;
+    let raw = match generated {
         Ok(text) => text,
         Err(e) => return reject(trigger, gap_accumulator, format!("generation failed: {e}")).await,
     };
@@ -137,11 +148,28 @@ where
     }
 
     let skill_name = skill.name.clone();
-    sandbox.lock().await.add(SandboxedSkill::from_synthesized(
+    let mut sandbox = sandbox.lock().await;
+    let _publication = match duduclaw_core::autonomy_gate::admit(
+        home, &trigger.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ).await {
+        Ok(guard) => guard,
+        Err(pause) => {
+            drop(sandbox);
+            return reject(trigger, gap_accumulator, pause.to_string()).await;
+        }
+    };
+    if let Err(error) = crate::autonomous_runtime::check_current().await {
+        drop(_publication);
+        drop(sandbox);
+        return reject(trigger, gap_accumulator, error).await;
+    }
+    sandbox.add(SandboxedSkill::from_synthesized(
         skill,
         &trigger.agent_id,
         settings.trial_ttl,
     ));
+    drop(sandbox);
+    drop(_publication);
     gap_accumulator
         .lock()
         .await
@@ -192,6 +220,14 @@ pub async fn run(
     gap_accumulator: &Mutex<GapAccumulator>,
     sandbox: &Mutex<SandboxStore>,
 ) -> FollowThrough {
+    if trigger.agent_id != agent_id {
+        return reject(&trigger, gap_accumulator, "synthesis agent identity mismatch".into()).await;
+    }
+    if let Err(pause) = duduclaw_core::autonomy_gate::check(
+        home_dir, agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+    ) {
+        return reject(&trigger, gap_accumulator, pause.to_string()).await;
+    }
     let (settings, agent_soul, existing_skill_names) = {
         let reg = registry.read().await;
         match reg.get(agent_id) {
@@ -233,6 +269,7 @@ pub async fn run(
     let agent_dir = agent_dir.map(Path::to_path_buf);
     let agent = agent_id.to_string();
     follow_through_with(
+        home_dir,
         &trigger,
         settings,
         input,
@@ -288,6 +325,14 @@ async fn recent_evidence(home_dir: &Path, agent_id: &str, topic: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::skill_lifecycle::diagnostician::SkillGap;
+
+    fn synthesis_home(agent: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+        home
+    }
 
     fn gap(name: &str) -> SkillGap {
         SkillGap {
@@ -353,7 +398,9 @@ Quote the 14-day window and point at the policy page.
         }
         assert!(sandbox.lock().await.active_names("agent-a").is_empty());
 
+        let home = synthesis_home(&trigger.agent_id);
         let outcome = follow_through_with(
+            home.path(),
             &trigger,
             settings(true),
             input(&trigger),
@@ -402,7 +449,9 @@ Quote the 14-day window and point at the policy page.
             t
         };
 
+        let home = synthesis_home(&trigger.agent_id);
         let outcome = follow_through_with(
+            home.path(),
             &trigger,
             settings(true),
             input(&trigger),
@@ -433,7 +482,9 @@ Quote the 14-day window and point at the policy page.
             a.mark_pending("agent-c", &t.topic);
             t
         };
+        let home = synthesis_home(&trigger.agent_id);
         let outcome = follow_through_with(
+            home.path(),
             &trigger,
             settings(true),
             input(&trigger),
@@ -457,7 +508,9 @@ Quote the 14-day window and point at the policy page.
             a.mark_pending("agent-d", &t.topic);
             t
         };
+        let home = synthesis_home(&trigger.agent_id);
         let outcome = follow_through_with(
+            home.path(),
             &trigger,
             settings(false),
             input(&trigger),
@@ -469,4 +522,69 @@ Quote the 14-day window and point at the policy page.
         assert_eq!(outcome, FollowThrough::Disabled);
         assert!(sandbox.lock().await.active_names("agent-d").is_empty());
     }
+    #[tokio::test]
+    async fn paused_synthesis_does_not_call_model_or_publish() {
+        for global in [false, true] {
+            let home = synthesis_home("agent-a");
+            duduclaw_core::autonomy_gate::set_pause(
+                home.path(), if global { None } else { Some("agent-a") }, "test", "operator",
+            ).unwrap();
+            let acc = Mutex::new(GapAccumulator::new(1, 24));
+            let sandbox = Mutex::new(SandboxStore::new());
+            let trigger = acc.lock().await.record_gap("agent-a", &gap("refund-policy"), 0.7).unwrap();
+            let result = follow_through_with(
+                home.path(), &trigger, settings(true), input(&trigger), &acc, &sandbox,
+                |_| async { panic!("paused synthesis must not invoke a model") },
+            ).await;
+            assert!(matches!(result, FollowThrough::Rejected { .. }));
+            assert!(sandbox.lock().await.active_names("agent-a").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn long_model_handoff_allows_pause_and_prevents_publication() {
+        let home = synthesis_home("agent-a");
+        let acc = Mutex::new(GapAccumulator::new(1, 24));
+        let sandbox = Mutex::new(SandboxStore::new());
+        let trigger = acc.lock().await.record_gap("agent-a", &gap("refund-policy"), 0.7).unwrap();
+        let result = follow_through_with(
+            home.path(), &trigger, settings(true), input(&trigger), &acc, &sandbox,
+            |_| async {
+                // A fake transport sends its request, then waits for a long body.
+                duduclaw_core::autonomy_handoff::admit().await.unwrap().handed_off();
+                let body = tokio::time::sleep(std::time::Duration::from_secs(60));
+                tokio::pin!(body);
+                tokio::select! {
+                    _ = &mut body => panic!("pause waited for the model body"),
+                    paused = tokio::time::timeout(std::time::Duration::from_secs(1),
+                        duduclaw_core::autonomy_gate::mutate_async(home.path(), Some("agent-a"), Some(
+                            duduclaw_core::autonomy_gate::PauseEntry {
+                                reason: "test".into(), who: "operator".into(), at: chrono::Utc::now().to_rfc3339(),
+                            },
+                        )),
+                    ) => {
+                        assert!(matches!(paused.expect("pause blocked after handoff"),
+                            duduclaw_core::autonomy_gate::MutationOutcome::Applied(_)));
+                    }
+                }
+                Ok(GOOD_SKILL.to_string())
+            },
+        ).await;
+        assert!(matches!(result, FollowThrough::Rejected { .. }));
+        assert!(sandbox.lock().await.active_names("agent-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_entry_rejects_pause_before_registry_lookup() {
+        let home = synthesis_home("agent-a");
+        duduclaw_core::autonomy_gate::set_pause(home.path(), Some("agent-a"), "test", "operator").unwrap();
+        let acc = Mutex::new(GapAccumulator::new(1, 24));
+        let sandbox = Mutex::new(SandboxStore::new());
+        let trigger = acc.lock().await.record_gap("agent-a", &gap("refund-policy"), 0.7).unwrap();
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(home.path().join("agents"))));
+        let result = run(trigger, home.path(), None, "agent-a", &registry, &acc, &sandbox).await;
+        assert!(matches!(result, FollowThrough::Rejected { reason } if reason.contains("agent_pause")));
+        assert!(sandbox.lock().await.active_names("agent-a").is_empty());
+    }
+
 }

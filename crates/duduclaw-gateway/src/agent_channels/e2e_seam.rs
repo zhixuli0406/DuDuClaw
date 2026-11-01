@@ -15,6 +15,36 @@ pub(crate) fn arm(home: &Path) {
     armed().lock().unwrap().insert(home.to_path_buf());
 }
 
+/// One model seam invocation paused until the test explicitly releases it.
+pub(crate) struct WaitingTurn {
+    pub session_id: String,
+    pub release: tokio::sync::oneshot::Sender<()>,
+}
+
+fn waiting() -> &'static Mutex<HashMap<PathBuf, tokio::sync::mpsc::UnboundedSender<WaitingTurn>>> {
+    static WAITING: OnceLock<Mutex<HashMap<PathBuf, tokio::sync::mpsc::UnboundedSender<WaitingTurn>>>> = OnceLock::new();
+    WAITING.get_or_init(Default::default)
+}
+
+pub(crate) struct WaitingTurns {
+    home: PathBuf,
+    pub entered: tokio::sync::mpsc::UnboundedReceiver<WaitingTurn>,
+}
+
+pub(crate) fn arm_waiting(home: &Path) -> WaitingTurns {
+    arm(home);
+    let (tx, entered) = tokio::sync::mpsc::unbounded_channel();
+    assert!(waiting().lock().unwrap().insert(home.to_path_buf(), tx).is_none());
+    WaitingTurns { home: home.into(), entered }
+}
+
+impl Drop for WaitingTurns {
+    fn drop(&mut self) {
+        waiting().lock().unwrap().remove(&self.home);
+        armed().lock().unwrap().remove(&self.home);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AttendanceObservation {
     pub agent: String,
@@ -47,6 +77,13 @@ pub(crate) async fn answer(
 ) -> Option<String> {
     if !armed().lock().unwrap().contains(&ctx.home_dir) {
         return None;
+    }
+    let waiter = waiting().lock().unwrap().get(&ctx.home_dir).cloned();
+    if let Some(waiter) = waiter {
+        let (release, released) = tokio::sync::oneshot::channel();
+        if waiter.send(WaitingTurn { session_id: session_id.into(), release }).is_ok() {
+            let _ = released.await;
+        }
     }
     let agent = agent.unwrap_or("none");
     // Simulate only the model's host-owned environment AFTER the real reply

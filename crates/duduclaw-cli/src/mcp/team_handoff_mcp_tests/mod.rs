@@ -54,11 +54,20 @@ fn mk_ephemeral_member(
         task,
         round,
     );
+    let dir = home.join("agents/.ephemeral").join(id);
+    let parent = home.join("agents/agnes");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(parent.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+    fs::write(
+        dir.join("ephemeral.toml"),
+        "parent = \"agnes\"\ntier = \"standard\"\ncreated_at = \"2026-10-29T00:00:00Z\"\nexpires_at = \"2026-10-30T00:00:00Z\"\n",
+    ).unwrap();
+    duduclaw_core::org_store::upsert(home, id, duduclaw_core::OrgEntry::new("agnes", "")).unwrap();
 }
 
 fn mk_member_in(dir: &std::path::Path, role: &str, task: Option<&str>, round: Option<u32>) {
     fs::create_dir_all(dir).unwrap();
-    let mut toml = format!("[team_member]\nparent = \"agnes\"\nrole = \"{role}\"\n");
+    let mut toml = format!("[agent]\nstatus = \"active\"\nreports_to = \"agnes\"\n[team_member]\nparent = \"agnes\"\nrole = \"{role}\"\n");
     if let Some(t) = task {
         toml.push_str(&format!("task_id = \"{t}\"\n"));
     }

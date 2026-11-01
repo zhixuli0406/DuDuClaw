@@ -129,7 +129,8 @@ pub(super) async fn build_reply_with_session_inner(
     // it as the citation key meant prior turns' citations were attributed
     // to the next turn's prediction error. The session id is still used for
     // session manager / metrics; only the trust feedback path switches.
-    let turn_id = format!("{session_id}#{}", uuid::Uuid::new_v4());
+    let turn_id = crate::webchat::current_turn_id()
+        .unwrap_or_else(|| format!("{session_id}#{}", uuid::Uuid::new_v4()));
     // Runs this turn dispatches (they carry its turn id) are limited to
     // what this turn's person may read.
     crate::knowledge::turn_requesters::remember_turn_origin(
@@ -951,7 +952,7 @@ pub(super) async fn build_reply_with_session_inner(
     // covers. Falls through to verbatim history when no summary exists
     // (summarizer hasn't run yet, or session is below the threshold).
     let max_history_turns = 20;
-    let mut compression_summary = String::new();
+    let compression_summary = session_mgr.compression_summary(session_id).await.unwrap_or_default();
     let (async_summary, summarized_through) = session_mgr
         .get_summary(session_id)
         .await
@@ -983,10 +984,6 @@ pub(super) async fn build_reply_with_session_inner(
                     .take(msgs.len().saturating_sub(1))
                     .filter_map(|m| {
                         if m.role == "system" {
-                            // Capture compression summary for system prompt injection
-                            if !m.content.is_empty() {
-                                compression_summary = m.content.clone();
-                            }
                             None
                         } else {
                             Some(ConversationTurn {
@@ -1373,6 +1370,12 @@ pub(super) async fn build_reply_with_session_inner(
         }
         prompt
     };
+    #[cfg(test)]
+    if let Some(captured) = super::tests::compression_after_cancel::capture(
+        &full_system_prompt, &conversation_history,
+    ) {
+        return captured;
+    }
     let full_system_prompt = match crate::ccr_runtime::historical_reference_note(
         &session_mgr,
         &ctx.home_dir,
@@ -1478,11 +1481,12 @@ pub(super) async fn build_reply_with_session_inner(
         None => Default::default(),
     };
     if let Some(direct) = turn_knowledge.direct_reply.clone() {
-        if let Err(e) = session_mgr
+        match session_mgr
             .append_message_with_id(session_id, "assistant", &direct, estimate_tokens(&direct))
             .await
         {
-            warn!("Failed to save assistant message to session: {e}");
+            Ok(id) => super::record_turn_assistant_message(session_id, id),
+            Err(e) => warn!("Failed to save assistant message to session: {e}"),
         }
         return direct;
     }
@@ -1554,6 +1558,11 @@ pub(super) async fn build_reply_with_session_inner(
         sandbox_enabled,
         crate::task_sandbox::HostPath::ChannelReply,
         crate::task_sandbox::HostAction::RanOnHost,
+    );
+
+    let _live_turn = crate::dashboard_feedback::LiveTurn::start(
+        &ctx.home_dir, &agent_id, None, "channel",
+        runtime_settings.as_ref().map(|s| s.provider.as_str()).unwrap_or("claude"),
     );
 
     let cli_future: std::pin::Pin<
@@ -2235,8 +2244,11 @@ pub(super) async fn build_reply_with_session_inner(
                         crate::decision_capture::DetectionResult::Suspected => {
                             let prompt =
                                 crate::decision_capture::build_extraction_prompt(&reply_for_dec);
-                            match super::cli_spawn::call_background_utility(
-                                &prompt, &home_for_dec, agent_dir_for_dec.as_deref(), &agent_for_dec, 512,
+                            match crate::autonomous_runtime::scope(
+                                &home_for_dec, &agent_for_dec, &[],
+                                super::cli_spawn::call_background_utility(
+                                    &prompt, &home_for_dec, agent_dir_for_dec.as_deref(), &agent_for_dec, 512,
+                                ),
                             )
                                 .await
                             {
@@ -2493,8 +2505,11 @@ pub(super) async fn build_reply_with_session_inner(
                      and deliverables. Max 200 words. Use the same language as the input.\n\n\
                      {user_text}"
                 );
-                match super::cli_spawn::call_background_utility(
-                    &prompt, &home, agent_dir_for_pin.as_deref(), &agent_for_pin, 512,
+                match crate::autonomous_runtime::scope(
+                    &home, &agent_for_pin, &[],
+                    super::cli_spawn::call_background_utility(
+                        &prompt, &home, agent_dir_for_pin.as_deref(), &agent_for_pin, 512,
+                    ),
                 )
                 .await
                 {
@@ -2544,8 +2559,11 @@ pub(super) async fn build_reply_with_session_inner(
                          User: {user_text_for_facts}\n\
                          Assistant: {reply_snippet}"
                     );
-                    let facts_text = match super::cli_spawn::call_background_utility(
-                        &prompt, &home_for_facts, agent_dir_for_facts.as_deref(), &agent_id_for_facts, 512,
+                    let facts_text = match crate::autonomous_runtime::scope(
+                        &home_for_facts, &agent_id_for_facts, &[],
+                        super::cli_spawn::call_background_utility(
+                            &prompt, &home_for_facts, agent_dir_for_facts.as_deref(), &agent_id_for_facts, 512,
+                        ),
                     )
                     .await
                     {
@@ -3181,6 +3199,10 @@ pub(super) async fn build_reply_with_session_inner(
                                         crate::skill_lifecycle::sandbox_trial::TrialDecision::Graduate => {
                                             info!(agent = %agent_id_for_pred, skill = %name, "Sandbox trial → GRADUATE");
                                             let mut store = sandbox_for_pred.lock().await;
+                                            let Ok(_publication) = duduclaw_core::autonomy_gate::admit(
+                                                &home_for_pred, &agent_id_for_pred,
+                                                duduclaw_core::autonomy_gate::AutonomyPath::Background,
+                                            ).await else { continue };
                                             store.graduate(&agent_id_for_pred, name);
                                         }
                                         crate::skill_lifecycle::sandbox_trial::TrialDecision::Discard => {
@@ -3720,12 +3742,24 @@ pub(super) async fn build_reply_with_session_inner(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match super::cli_spawn::call_background_utility(
-                    &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
+                // Read the denial flag inside the scope: non-Claude runtimes
+                // wrap the refusal text, so the prefix alone can miss a pause
+                // that lands between the context check and spawn/send.
+                let (result, denied) = crate::autonomous_runtime::scope(
+                    &home_for_compress, &agent_for_compress, &[],
+                    async {
+                        let result = super::cli_spawn::call_background_utility(
+                            &prompt, &home_for_compress, agent_dir_for_compress.as_deref(), &agent_for_compress, 1024,
+                        )
+                        .await;
+                        (result, crate::autonomous_runtime::was_denied())
+                    },
                 )
-                .await
-                {
+                .await;
+                let summary = match result {
+                    _ if denied => return,
                     Ok(s) => s,
+                    Err(e) if e.starts_with("AUTONOMY_") => return,
                     Err(_) => {
                         "[Session compressed — previous conversation summary omitted for brevity]"
                             .to_string()

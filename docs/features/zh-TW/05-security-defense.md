@@ -10,7 +10,7 @@
 
 給 AI 員工 Bash 或機器操作工具，就代表綁定這位員工的人可以指揮它使用這些工具。請只綁定應該有這份權限的人。管理員授予一般 AI 員工的原生工具仍可照常使用。
 
-使用 `system-operator` 預設組的員工只供管理員使用。伺服器依解析後的預設組綁定識別，不採信客戶端旗標。非管理員不能綁定、聊天、建立交辦任務或目標，也不能以自己的身分派工給這位員工；`agents.callable` 不會列出它。既有綁定不刪除，但使用時會拒絕。管理員、Personal 版與已授權的無人值守工作維持原有行為。
+使用 `system-operator` 預設組的員工只供管理員使用。伺服器依解析後的預設組綁定識別，不採信客戶端旗標。非管理員不能綁定、聊天、建立交辦任務或目標，也不能以自己的身分派工給這位員工；`agents.callable` 不會列出它。既有綁定不刪除，但使用時會拒絕。非管理員即使保留 `system-operator` 員工的舊綁定或團隊授權，也讀不到它的對話紀錄、任務、記憶、檔案、自有知識集合與匯出，也收不到即時更新、執行步驟或審批卡片；綁定紀錄保留。非管理員先前建立的交辦排程不再為這位員工建立任務或目標，觸發時自動暫停，恢復時會拒絕。外送審批卡片（CLI 內建工具與 MCP 工具都算）僅供管理員查看，主管不再看到遮罩後的卡片。通道與 Mini App 僅顯示純文字通知，不再顯示外送審批卡片、摘要或操作按鈕。管理員與已授權的無人值守工作維持原有行為。Personal 只有在帳號資料庫不存在、沒有帳號，或僅有一個已完成首次密碼變更的啟用中 Admin 帳號時才適用單一擁有者豁免；停權與離職帳號也計入總數。多帳號部署即使因付費授權到期而回到 Personal，仍須有效管理員身分；帳號資料庫無法讀取時也一樣。
 
 工作的委託人分為 Human、Background、Unknown 三種狀態。已儲存但無法解析的委託人是 Unknown，不能授權機器操作工具；舊資料完全沒有委託人時仍是 Background，既有 cron 排程與自主工作可繼續執行。
 
@@ -396,3 +396,37 @@ Claude/Grok 網頁工具與 Bash 字面網路指令新增由 gateway 判定的�
 ## 對話憑證稽核
 
 [憑證稽核](70-credential-audit.md)只登錄偵測結果的中繼資料。密碼、連線字串不算指紋；高熵類型只有在憑證保護可用時才算帶金鑰的指紋。帳號只保留首字元與網域。每則訊息最多 5 筆、每位寄件者每小時 50 筆、總列數 100,000，超額合併為節流事件。兩種模式都遮罩衍生儲存中偵測到的值；預設 `audit` 仍保留對話明文，`mask` 在交付前遮罩新訊息。沒有語境的單獨密碼不會偵測，真值代換仍在規劃、不承諾版本。Admin 專用 RPC 與 doctor 可檢查稽核鏈；Read 檔案守門也拒絕讀取憑證登錄目錄。
+
+## 雙因素登入
+
+Gateway 支援 [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238) SHA-1 TOTP：160 位元隨機密鑰、6 位數、30 秒週期、前後各一個週期與交易內防重播。密鑰使用通道憑證相同的 AES-256-GCM 與主機 `.keyfile`，金鑰不放入 `users.db`。10 組單次備援碼只顯示一次、以 Argon2 雜湊保存；驗證備援碼不需要解密 TOTP。只要還有啟用或待註冊資料，金鑰遺失就拒絕建立替代金鑰；請還原原金鑰或走主機救援。金鑰輪替不在本階段範圍。
+
+Dashboard 註冊改為 `mfa.enroll_begin {password}`，在 blocking pool 驗證目前密碼並套用登入等級限流。回傳的 `enrollment_token` 綁定使用者、JWT 的 `jti`、這次密碼驗證與 5 分鐘期限；`mfa.enroll_confirm {enrollment_token,code}` 必須來自同一工作階段。只偷到 JWT 不能開始註冊。要替換密鑰，先以新的 TOTP 或備援碼停用，再重新驗證密碼註冊；begin 不會覆寫啟用中的密鑰。
+
+Enterprise 強制期間，首次註冊還需獨立證明。只有已記錄且早於強制啟用時間的已驗證通道綁定，系統透過既有通道服務送出另一組 OTP，以 `proof_code` 提交；沒有綁定者，由另一位目前有效的 Admin 呼叫 `users.mfa_enrollment_code {user_id,challenge_ref}` 核發一次性註冊碼並交給本人。註冊碼綁定帳號及指定的待完成 challenge、雜湊保存、5 分鐘有效、只顯示一次並留下稽核，不能自行核發。最後一位管理員可在主機執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`。證明綁定該次第一因素 challenge、同時到期、最多 5 次嘗試，成功後不能移用至其他 challenge。若第一因素是通道 OTP，註冊時還必須提供目前 `password`，避免同一通道的兩組碼被當成獨立因素。
+
+強制期間未註冊者登入只取得 `mfa_enrollment_required`、`enrollment_token` 與 12 字元 `challenge_ref`，沒有 session token。呼叫 `/api/mfa/enroll/begin {enrollment_token,proof_code}` 後，再呼叫 `/api/mfa/enroll/confirm {enrollment_token,code}`；通道 OTP 登入者兩次都要帶 `password`。Dashboard 強制註冊的第一次 begin 回傳 `proof_required`、`enrollment_token` 與 `challenge_ref`，再以 `password`、該 token 及 `proof_code` 重呼 begin，才取得 `secret` 與 `otpauth_uri`。Confirm 才會啟用。註冊憑證不能登入 `/ws`、refresh 或一般 HTTP；dashboard 的註冊憑證也不能拿去 HTTP 註冊路由換 session。
+
+已註冊者的密碼與通道 OTP 登入只回傳 `mfa_required` 與 `challenge_id`。`/api/mfa/verify` 接受 challenge 及 `code`／`recovery_code` 二擇一。Challenge 綁定帳號與第一因素，持久保存、單次成功、5 分鐘有效、最多 5 次嘗試。`mfa.status` 查本人狀態；`mfa.recovery_regenerate {code}` 替換全部備援碼；`mfa.disable {code,password}` 需要目前密碼（與註冊密碼驗證共用限流）及新的 TOTP 或未使用備援碼，強制期間不能停用。每帳號因素驗證錯誤最多 5 次／15 分鐘。
+
+分階段啟用：先保持 `[auth] mfa_enforced=false`，讓帳號自願註冊；備妥支援新回應的客戶端、確認通道送達與主機救援，再由目前 Admin 查看 `mfa.overview`，在「使用者 → 雙因素登入管理」用專用開關啟用強制。`system.update_config`、設定檔編輯器與匯入都不能變更有效值。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
+
+單純開啟強制不立即撤銷帳號 access token；未註冊者不能 refresh，原 token 自然到期（預設 30 分鐘）。Enterprise MFA WebSocket 在到期後的下一次心跳關閉，最多延後 30 秒，不取消執行中工作。強制期間拒絕舊共用 token 的 `/ws` 登入及 RPC；已建立的共用 token 連線在下一次心跳關閉，停止推播訂閱。註冊、停用、重設會增加該帳號的 credential epoch，之後變更／重設密碼也會增加；舊 access／refresh token 失效，既有 dashboard 連線於下一次即時身分檢查拒絕，沿用 ACL 快取失效機制。沒有 claim 的 token 視為 epoch 0；從未註冊者即使變更密碼仍維持 0，以保持既有客戶行為。任何密碼變更都會作廢待註冊 challenge。
+
+MFA 設定在啟動時載入有效的記憶體快照，dashboard 設定寫入後立即更新，外部檔案變更每 30 秒重載。失敗時保留上次有效值，於 `mfa.overview.policy` 及 `system.status.mfa_policy` 顯示 degraded 與警告；只有 Enterprise 從未取得有效快照才拒絕。沒有 `[auth]` 表格就是 false。登入不再讀取或解析設定檔。
+
+`users.mfa_reset {user_id,code}` 禁止自我重設，在同一交易內確認操作者仍是有效 Admin、驗證其新的 TOTP 或備援碼、清除目標因素與 challenge、增加 epoch 並稽核。主機人員可執行 `duduclaw ops users mfa-reset <email>` 重設任意帳號，包含金鑰遺失時的多位管理員。兩個主機救援指令都拒絕 AI 工作階段及員工／未驗證 Bash 呼叫；稽核標示「本機指令列（身分未驗證）」。這些規則不提供任意主機檔案寫入的 OS 隔離。註冊、證明／註冊碼核發、停用、備援碼使用與驗證失敗均稽核，不記錄密鑰或驗證碼。
+
+啟用前請檢查 `mfa.overview` 各帳號的 `channel_bindings.verified_at` 與政策 `enforced_at`（Unix 微秒）。無法確認的歷史綁定時間為 null，不能作為註冊證明；每次綁定或重新綁定都記錄新時間。強制期間，未註冊帳號不得自行綁定，需另一位有效 Admin 或主機人員核准。仍有一項限制：持有密碼的人在強制啟用前預先植入綁定，系統無法辨識。請將短 `challenge_ref` 讀給 Admin，不要提供完整註冊 token；註冊碼只會對符合的帳號與 challenge 兌換並刪除。
+
+JWT epoch 必須完全相等。Dashboard 每次心跳重查；WebChat 在心跳及每次 user_message 前檢查，沿用共用身分讀取器與兩秒 socket 快取，心跳強制重查 generation，訊息另行檢查適用的到期時間。電腦畫面與接管 ticket 保留原 JWT epoch 及期限，在入場及每 30 秒重驗時拒絕已退休憑證，也不會延長原 JWT 壽命。兩個設定寫入路徑都在設定鎖內重新確認有效 Admin。若最後有效設定是 false，重載失敗仍保留 false 並顯示警告；正常 `system.status` 欄位保持不變。
+
+### 儀表板雙因素登入
+
+Enterprise 使用者在「設定 → 帳號」選擇「設定雙因素登入」，輸入目前密碼，以驗證器 App 掃描 QR Code（或手動輸入密鑰），再輸入六位數代碼確認。複製或下載十組復原碼，勾選「我已保存復原碼」後繼續。密鑰與復原碼只保留在元件記憶體，離開畫面即清除；複製及下載需自行按下按鈕。註冊與停用會換發目前工作階段的權杖並保留連線，其他工作階段則失效。復原碼會顯示到你確認保存或離開畫面。權杖簽發與 MFA 變更在同一交易提交；簽發失敗時不會完成註冊或停用，可重試。重產復原碼及停用需提供新的驗證器代碼或未使用復原碼；強制期間無法停用。
+
+密碼與通道驗證碼登入保留原表單，只有 gateway 要求第二因素時才顯示驗證器代碼步驟，可切換使用單次復原碼。登入要求五分鐘內有效，最多五次嘗試。強制註冊會要求獨立的通道／管理員代碼，以及目前密碼（通道登入必填）；只把畫面上的註冊識別碼交給管理員，勿分享註冊憑證。
+
+Admin 在「使用者 → 雙因素登入管理」查看註冊狀態與通道驗證時間，使用自己的新因素重設其他帳號，或依對方這次的註冊識別碼核發一次性代碼。不能自我重設或自我核發。強制開關顯示未設定帳號數、登入受阻警告，並要求輸入畫面上的確認文字。設定重載降級時會警告並停用開關。**強制登入仍須經審查後才能啟用**；請先保持關閉，完成獨立安全審查、真實 gateway／通道流程與救援驗證。Personal 只有已註冊帳號才顯示相關設定，本機自動登入維持原狀。
+
+呼叫端連線會在註冊／停用的成功回應取得新權杖，並在一般送出檢查前完成身分交接；HTTP 註冊也在註冊交易提交前簽發權杖。啟用強制前仍須完成真實瀏覽器／WebSocket 驗證，包括跨過心跳後復原碼仍可見，以及另一工作階段失效；行程內 handler 與前端單元測試不能代表這些驗收通過。

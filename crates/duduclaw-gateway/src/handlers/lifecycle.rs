@@ -35,6 +35,7 @@ impl MethodHandler {
         }).await.cloned()
     }
     pub async fn new(home_dir: PathBuf) -> Self {
+        crate::mfa::reload_policy(&home_dir);
         Self::with_extension(home_dir, Arc::new(crate::extension::NullExtension)).await
     }
 
@@ -291,6 +292,7 @@ impl MethodHandler {
 
     /// Inject the event broadcast sender for task/activity real-time events.
     pub async fn set_event_tx(&self, tx: tokio::sync::broadcast::Sender<String>) {
+        crate::dashboard_feedback::register_live_sender(&self.home_dir, tx.clone());
         *self.event_tx.write().await = Some(tx);
     }
 

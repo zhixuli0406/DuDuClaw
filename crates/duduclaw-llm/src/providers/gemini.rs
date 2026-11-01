@@ -517,6 +517,9 @@ impl ChatProvider for GeminiProvider {
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let (_, bare_model) = split_model_id(&req.model);
         let body = build_request_body(req);
+        let mut admission = duduclaw_core::autonomy_handoff::admit().await
+            .map_err(LlmError::InvalidRequest)?;
+        admission.request_started();
         let response = http_client()
             .post(self.generate_url(bare_model))
             .header("x-goog-api-key", &self.auth.api_key)
@@ -525,6 +528,7 @@ impl ChatProvider for GeminiProvider {
             .send()
             .await
             .map_err(|e| classify_transport(&e))?;
+        admission.handed_off();
 
         let status = response.status();
         if !status.is_success() {
@@ -545,6 +549,9 @@ impl ChatProvider for GeminiProvider {
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
         let (_, bare_model) = split_model_id(&req.model);
         let body = build_request_body(req);
+        let mut admission = duduclaw_core::autonomy_handoff::admit().await
+            .map_err(LlmError::InvalidRequest)?;
+        admission.request_started();
         let response = http_client()
             .post(self.stream_url(bare_model))
             .header("x-goog-api-key", &self.auth.api_key)
@@ -553,6 +560,7 @@ impl ChatProvider for GeminiProvider {
             .send()
             .await
             .map_err(|e| classify_transport(&e))?;
+        admission.handed_off();
 
         let status = response.status();
         if !status.is_success() {

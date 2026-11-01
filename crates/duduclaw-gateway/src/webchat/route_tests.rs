@@ -105,7 +105,8 @@ async fn the_default_employee_stays_reachable_without_a_binding() {
         r,
         WebRoute {
             agent: None,
-            switched: false
+            switched: false,
+            called: false
         }
     );
     // Calling it by name while another employee is selected also works.
@@ -131,7 +132,8 @@ async fn calling_another_employee_needs_a_binding() {
         r,
         WebRoute {
             agent: Some("finance".into()),
-            switched: false
+            switched: false,
+            called: false
         }
     );
 }
@@ -229,7 +231,7 @@ async fn a_widget_visitor_is_not_told_about_a_refusal() {
     let f = fixture().await;
     // A forbidden name is plain text for the default employee.
     let r = route_as(&f, "widget-visitor:abc", "@財務小幫手 幫我算帳").await.unwrap();
-    assert_eq!(r, WebRoute { agent: None, switched: false });
+    assert_eq!(r, WebRoute { agent: None, switched: false, called: false });
 }
 
 #[tokio::test]
@@ -245,4 +247,34 @@ async fn resume_follows_the_same_rule_as_the_at_list() {
     assert!(!f.state.agent_access_allowed(&f.emp, "faq").await);
     let (mgr, _lead) = team(&f);
     assert!(f.state.may_resume_into(&mgr, "sales-rep", "webchat:x", "webchat:u").await, "team employee");
+}
+
+#[tokio::test]
+async fn same_agent_at_call_keeps_stronger_recheck_while_plain_selection_does_not() {
+    let f = fixture().await;
+    let plain = route(&f, "幫我算帳", Some("finance")).await.unwrap();
+    let called = route(&f, "@財務小幫手 幫我算帳", Some("finance")).await.unwrap();
+    assert!(!plain.called);
+    assert!(called.called);
+    assert!(!called.switched, "same selected employee still needs the call predicate");
+
+    // Pause the employee after admission, as can happen while this turn waits.
+    let path = f._dir.path().join("agents/finance/agent.toml");
+    let config = std::fs::read_to_string(&path).unwrap()
+        .replace("status = \"active\"", "status = \"paused\"");
+    std::fs::write(path, config).unwrap();
+    let mut registry = duduclaw_agent::AgentRegistry::new(f._dir.path().join("agents"));
+    registry.scan().await.unwrap();
+    *f.state.ctx.registry.write().await = registry;
+    assert!(f.state.agent_access_allowed(&f.emp, "finance").await);
+    assert!(!f.state.may_resume_into(&f.emp, "finance", "webchat:x", "webchat:u").await);
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    for (route, expected) in [(plain, true), (called, false)] {
+        assert_eq!(crate::webchat::turns::recheck_turn_access(
+            &cancel, route.called,
+            f.state.agent_access_allowed(&f.emp, "finance"),
+            f.state.may_resume_into(&f.emp, "finance", "webchat:x", "webchat:u"),
+        ).await, expected);
+    }
 }
