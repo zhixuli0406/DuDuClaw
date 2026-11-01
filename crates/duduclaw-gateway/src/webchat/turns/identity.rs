@@ -6,11 +6,12 @@ pub(in crate::webchat) struct IdentityUnavailable {
     conv: Option<String>,
     msg_id: Option<String>,
     admission: bool,
+    downstream_request: bool,
 }
 
 impl IdentityUnavailable {
     pub(super) fn new(sid: &str, conv: Option<String>, msg_id: &str, admission: bool) -> Self {
-        Self { sid: Some(sid.into()), conv, msg_id: Some(msg_id.into()), admission }
+        Self { sid: Some(sid.into()), conv, msg_id: Some(msg_id.into()), admission, downstream_request: false }
     }
 
     /// Before routing, no client-supplied session has passed ownership checks.
@@ -20,10 +21,20 @@ impl IdentityUnavailable {
             conv: sanitize_conv_nonce(conv),
             msg_id: msg_id.filter(|id| assign_event_id(Some(id)).is_some()).map(str::to_owned),
             admission: true,
+            downstream_request: false,
         }.message()
     }
 
-    pub(super) fn message(&self) -> Message {
+    pub(in crate::webchat) fn downstream(request_id: Option<String>) -> Self {
+        Self { sid: None, conv: None, msg_id: request_id, admission: true, downstream_request: true }
+    }
+
+    pub(in crate::webchat) fn message(&self) -> Message {
+        if self.downstream_request {
+            return Message::Text(serde_json::json!({"type":"error", "code":"credential_check_unavailable",
+                "message":"Credential check unavailable; retry later", "retryable":true,
+                "request_id":self.msg_id}).to_string().into());
+        }
         let text = if self.admission {
             "暫時無法確認登入狀態，這則訊息沒有送出，請稍後再試。"
         } else {

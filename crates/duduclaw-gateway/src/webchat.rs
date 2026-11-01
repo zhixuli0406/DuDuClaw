@@ -49,6 +49,9 @@ pub enum ChatMessage {
         conv: Option<String>,
         msg_id: Option<String>,
     },
+    /// Client → Server: consume an owned offer to stop downstream work.
+    #[serde(rename = "cancel_downstream")]
+    CancelDownstream { downstream_ref: String, #[serde(default)] request_id: Option<String> },
     /// Client → Server: user sends a message, optionally with file attachments.
     #[serde(rename = "user_message")]
     UserMessage {
@@ -929,6 +932,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     });
     let mut sink = turns::SocketSender(out_tx.clone());
 
+    let downstream_stop = Arc::new(tokio::sync::Semaphore::new(1));
+
     // Message processing loop
     let mut recovery = crate::handlers::live_context::SocketRecovery::default();
     loop {
@@ -994,6 +999,33 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
+                        // Stop requests narrow authority, including after credential revocation.
+                        // Reject malformed or concurrent frames before any credential I/O.
+                        if let Ok(ChatMessage::CancelDownstream { downstream_ref, request_id }) = serde_json::from_str::<ChatMessage>(&text) {
+                            let request_id = request_id.filter(|id| assign_event_id(Some(id)).is_some());
+                            let permit = match turns::downstream::admit_stop(&downstream_stop, &downstream_ref, request_id.as_deref()) {
+                                Ok(permit) => permit,
+                                Err(value) => {
+                                    let _ = out_tx.send(turns::Outbound { identity_notice: None,
+                                        message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
+                                    continue;
+                                }
+                            };
+                            let state = state.clone();
+                            let credential = credential.clone();
+                            let user = auth_user.clone();
+                            let out = out_tx.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let value = turns::downstream::stop_request(&state, credential.as_ref(), &user,
+                                    &downstream_ref, request_id.as_deref()).await;
+                                let notice = turns::IdentityUnavailable::downstream(request_id);
+                                let _ = out.send(turns::Outbound { identity_notice: Some(notice),
+                                    message: Message::Text(value.to_string().into()), ack: None,
+                                    deadline: Some(tokio::time::Instant::now() + turns::SEND_TIMEOUT) }).await;
+                            });
+                            continue;
+                        }
                         let validity = state.credential_validity(credential.as_ref(), false).await;
                         if !recovery.observe(validity, false) {
                             if recovery.closed() {
@@ -1427,6 +1459,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     }
                                 }
                             }
+                            ChatMessage::CancelDownstream { .. } => unreachable!("handled before credential check"),
                             ChatMessage::Cancel { request_id, session_id: cancel_sid, conv, msg_id } => {
                                 let request_id = request_id.filter(|id| assign_event_id(Some(id)).is_some())
                                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());

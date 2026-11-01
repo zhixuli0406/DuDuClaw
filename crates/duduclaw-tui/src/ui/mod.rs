@@ -213,6 +213,11 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                         Err(error) => app.notice = Some(error.to_string()),
                     },
                     Action::CancelChat => if let Err(error) = chat.cancel() { app.notice = Some(error.to_string()); },
+                    Action::CancelDownstream(reference) => if let Err(error) = chat.cancel_downstream(reference) {
+                        app.answered_downstream = None;
+                        app.notice = Some(error.to_string());
+                    },
+                    Action::DismissDownstream(reference) => chat.dismiss_downstream(reference),
                     Action::None => {}
                 }
             }

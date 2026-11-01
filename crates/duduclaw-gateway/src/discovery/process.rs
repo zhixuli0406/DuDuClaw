@@ -20,21 +20,6 @@ pub struct ProcessOutput {
     pub wall_secs: f64,
 }
 
-struct GroupGuard(u32);
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            let _ = duduclaw_core::platform::kill_process_group(self.0);
-        }
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &self.0.to_string(), "/T", "/F"])
-                .output();
-        }
-    }
-}
 
 async fn drain<R: AsyncRead + Unpin>(mut reader: R, cap: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -121,13 +106,8 @@ where
         Some(duduclaw_core::autonomy_handoff::admit().await
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?)
     } else { None };
-    let mut child = cmd.spawn()?;
+    let (mut child, group) = crate::process_group::spawn_guarded(&mut cmd)?;
     if let Some(admission) = admission { admission.handed_off(); }
-    let group = GroupGuard(
-        child
-            .id()
-            .ok_or_else(|| io::Error::other("missing child id"))?,
-    );
     let mut stdin = child
         .stdin
         .take()

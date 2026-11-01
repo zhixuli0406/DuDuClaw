@@ -339,7 +339,7 @@ impl MessageQueue {
     pub async fn defer_to_pending(&self, message_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE message_queue SET status = 'pending', acked_at = NULL WHERE id = ?1",
+            "UPDATE message_queue SET status = 'pending', acked_at = NULL WHERE id = ?1 AND NOT (status='failed' AND COALESCE(error,'') IN ('stopped with origin turn','origin turn cancelled'))",
             params![message_id],
         )
         .map_err(|e| format!("defer_to_pending: {e}"))?;
@@ -350,7 +350,7 @@ impl MessageQueue {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE message_queue SET status = 'pending', retry_count = retry_count + 1, \
-             acked_at = NULL WHERE id = ?1",
+             acked_at = NULL WHERE id = ?1 AND NOT (status='failed' AND COALESCE(error,'') IN ('stopped with origin turn','origin turn cancelled'))",
             params![message_id],
         )
         .map_err(|e| format!("reset_to_pending: {e}"))?;
