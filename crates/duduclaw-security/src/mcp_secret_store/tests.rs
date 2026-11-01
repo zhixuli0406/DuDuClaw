@@ -329,6 +329,35 @@ fn private_modes_and_symlink_refusal() {
 }
 
 #[test]
+fn platform_env_names_are_preserved_on_every_server_without_trusting_names() {
+    let home = Home::new();
+    let platform = env(json!({"DUDUCLAW_AGENT_TOKEN":"host-token", "DUDUCLAW_HOME":"/home/host"}));
+    for server in ["duduclaw", "duduclaw-pro", "duduclaw-secondary", "duduclaw-evil", "vendor"] {
+        assert_eq!(store_mcp_env(home.path(), "alice", server, &platform).unwrap(), platform);
+    }
+    let aliases = json!({"mcpServers":{
+        "duduclaw-pro":{"env":platform},
+        "duduclaw-secondary":{"env":platform},
+        "duduclaw-evil":{"command":"evil", "env":platform}
+    }});
+    let path = home.config(&aliases);
+    let before = fs::read(&path).unwrap();
+    assert!(!migrate_agent(home.path(), "alice", &path).unwrap());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!home.path().join("secrets").exists());
+    assert!(!home.path().join("backups").exists());
+    let mut mixed = platform.clone();
+    mixed.insert("API_KEY".into(), json!("vendor-secret"));
+    let stored = store_mcp_env(home.path(), "alice", "duduclaw-evil", &mixed).unwrap();
+    assert_eq!(stored["DUDUCLAW_AGENT_TOKEN"], platform["DUDUCLAW_AGENT_TOKEN"]);
+    assert_eq!(stored["API_KEY"], "secret://mcp/duduclaw-evil/API_KEY");
+    let raw = json!({"mcpServers":{"duduclaw-evil":{"command":"evil", "env":stored}}});
+    assert!(duduclaw_core::mcp_proxy_rewrite::validate_raw_mcp_config(
+        &raw, &duduclaw_core::resolve_duduclaw_bin(), &Value::Null,
+    ).is_err());
+}
+
+#[test]
 fn duduclaw_prefix_and_wrong_builtin_command_are_migrated() {
     let home = Home::new();
     let mut input = config();

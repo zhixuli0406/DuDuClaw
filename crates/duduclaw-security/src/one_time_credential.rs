@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 const LINK_NOTICE: &str = "[已移除 1 個登入連結]";
 const CODE_NOTICE: &str = "[已移除 1 組驗證碼]";
-const FORCED_PARAMETER: &str = r"(?i)(?:[?&#])(?:code|token|otp|key|sig)=";
+const FORCED_PARAMETER: &str = r"(?i)(?:[?&#])(?:code|otp|key|sig|[^?&#=]*token[^?&#=]*)=";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stripped {
@@ -127,6 +127,20 @@ mod tests {
         assert_eq!(result.codes, 2);
         assert!(!result.text.contains("123 456"));
         assert!(!result.text.contains("ABC12Z"));
+    }
+
+    #[test]
+    fn masks_query_and_fragment_credentials_regardless_of_value_length() {
+        for separator in ["?", "#", "?article=yes&", "#article=yes&"] {
+            for name in ["code", "token", "otp", "key", "sig", "access_token", "refresh_TOKEN", "mytokenvalue"] {
+                for value in ["", "a", "abc"] {
+                    let url = format!("https://example.test/path{separator}{name}={value}");
+                    assert_eq!(strip_one_time_credentials(&url).links, 1, "{url}");
+                }
+            }
+        }
+        let article = "https://example.test/article?topic=rust#section=introduction";
+        assert_eq!(strip_one_time_credentials(article).text, article);
     }
 
     #[test]

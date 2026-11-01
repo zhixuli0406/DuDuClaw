@@ -247,8 +247,13 @@ fn write_entries(home: &Path, path: &Path, entries: &Entries) -> io::Result<()> 
     Ok(())
 }
 
+// Keep migration detection and persistence on the same env-name boundary.
+fn keeps_plaintext_env(name: &str, value: &str) -> bool {
+    name.starts_with("DUDUCLAW_") || PUBLIC_ENV.contains(&name) || value.starts_with("secret://")
+}
+
 /// The only transformation for env written into employee MCP configuration.
-/// All third-party values except PUBLIC_ENV and existing references are sealed.
+/// All third-party values except PUBLIC_ENV, DUDUCLAW_* and existing references are sealed.
 /// Callers may skip a fully verified built-in definition; an env-only API
 /// cannot infer trust from a server name and therefore never exempts one.
 pub fn store_mcp_env(home: &Path, agent: &str, server: &str, env: &Map<String, Value>) -> io::Result<Map<String, Value>> {
@@ -258,7 +263,7 @@ pub fn store_mcp_env(home: &Path, agent: &str, server: &str, env: &Map<String, V
     for (name, value) in env {
         validate_names(server, name)?;
         let value = value.as_str().ok_or_else(|| invalid("MCP env value must be a string"))?;
-        if PUBLIC_ENV.contains(&name.as_str()) || value.starts_with("secret://") {
+        if keeps_plaintext_env(name, value) {
             continue;
         }
         additions.insert(format!("{server}/{name}"), value.to_owned());

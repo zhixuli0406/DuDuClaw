@@ -944,11 +944,12 @@ pub async fn build_rotator_provider(home_dir: &Path) -> Option<Arc<RotatorProvid
 /// that proxy starts the upstream under the copied employee identity.
 fn prepare_fork_mcp_proxy(
     home: &Path,
+    agent_dir: &Path,
     workspace: &Path,
     command: &mut tokio::process::Command,
 ) -> Result<Option<tempfile::TempPath>, String> {
-    let guard = duduclaw_gateway::redaction_proxy::maybe_proxy_mcp_config(
-        home, &workspace.join(".mcp.json"),
+    let guard = duduclaw_gateway::redaction_proxy::maybe_proxy_mcp_config_for_agent(
+        home, &workspace.join(".mcp.json"), agent_dir,
     )?;
     if let Some(path) = &guard {
         command.arg("--mcp-config").arg(path.as_os_str()).arg("--strict-mcp-config");
@@ -1004,7 +1005,7 @@ impl CliSpawner for ClaudeCliSpawner {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let mcp_proxy_guard = match prepare_fork_mcp_proxy(&self.home_dir, workspace, &mut cmd) {
+        let mcp_proxy_guard = match prepare_fork_mcp_proxy(&self.home_dir, &agent_dir, workspace, &mut cmd) {
             Ok(guard) => guard,
             Err(error) => return CliRunOutput {
                 output: error,
@@ -1281,22 +1282,75 @@ mod tests {
         std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
         let workspace = home.path().join("branch");
         std::fs::create_dir_all(&workspace).unwrap();
+        let agent_dir = home.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(home.path().join("identity.key"), [7u8; 32]).unwrap();
+        let exe = duduclaw_core::resolve_duduclaw_bin();
+        let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home.path(), "alice", &exe);
+        assert!(own["env"]["DUDUCLAW_AGENT_TOKEN"].as_str().is_some());
         let source = serde_json::json!({"mcpServers": {
-            "duduclaw":{"command":"/opt/duduclaw", "args":["mcp-server"], "env":{"DUDUCLAW_AGENT_ID":"alice"}},
+            "duduclaw":own,
             "vendor":{"command":"vendor-mcp", "env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}
         }}).to_string();
-        std::fs::write(workspace.join(".mcp.json"), &source).unwrap();
+        std::fs::write(agent_dir.join(".mcp.json"), &source).unwrap();
+        assert!(duduclaw_gateway::redaction_proxy::maybe_proxy_mcp_config(
+            home.path(), &agent_dir.join(".mcp.json"),
+        ).unwrap().is_some());
+        std::fs::copy(agent_dir.join(".mcp.json"), workspace.join(".mcp.json")).unwrap();
+        // Path inference would call this employee "branch" and reject Alice.
+        assert!(duduclaw_gateway::redaction_proxy::maybe_proxy_mcp_config(
+            home.path(), &workspace.join(".mcp.json"),
+        ).is_err());
         let mut cmd = tokio::process::Command::new("claude");
-        let guard = super::prepare_fork_mcp_proxy(home.path(), &workspace, &mut cmd).unwrap().unwrap();
+        let guard = super::prepare_fork_mcp_proxy(home.path(), &agent_dir, &workspace, &mut cmd).unwrap().unwrap();
         let path = guard.to_path_buf();
         let args: Vec<_> = cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
         assert_eq!(args, vec!["--mcp-config".to_string(), path.to_string_lossy().into_owned(), "--strict-mcp-config".to_string()]);
         let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["duduclaw"], own);
         assert_eq!(config["mcpServers"]["vendor"]["args"][0], "mcp-proxy");
         assert_eq!(config["mcpServers"]["vendor"]["env"]["DUDUCLAW_AGENT_ID"], "alice");
         assert_eq!(std::fs::read_to_string(workspace.join(".mcp.json")).unwrap(), source);
         drop(guard);
         assert!(!path.exists());
+
+        // Host-supplied context must not bless a different employee or command.
+        let mut forged: serde_json::Value = serde_json::from_str(&source).unwrap();
+        forged["mcpServers"]["duduclaw"] =
+            duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home.path(), "bob", &exe);
+        std::fs::write(workspace.join(".mcp.json"), forged.to_string()).unwrap();
+        let mut refused = tokio::process::Command::new("claude");
+        assert!(super::prepare_fork_mcp_proxy(home.path(), &agent_dir, &workspace, &mut refused).is_err());
+        forged["mcpServers"]["duduclaw"] = own;
+        forged["mcpServers"]["duduclaw"]["command"] = serde_json::json!("/untrusted/duduclaw");
+        std::fs::write(workspace.join(".mcp.json"), forged.to_string()).unwrap();
+        assert!(super::prepare_fork_mcp_proxy(home.path(), &agent_dir, &workspace, &mut refused).is_err());
+        assert_eq!(refused.as_std().get_args().count(), 0);
+    }
+
+    #[test]
+    fn fork_proxy_uses_original_employee_policy_without_secret_refs() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let agent_dir = home.path().join("agents/alice");
+        let workspace = home.path().join("branch");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[capabilities]\naction_rules = [{ effect = \"send\", verdict = \"block\" }]\n").unwrap();
+        assert!(duduclaw_core::agent_toml::third_party_gate_needed(&agent_dir, false));
+        assert!(!duduclaw_core::agent_toml::third_party_gate_needed(&workspace, false));
+        let exe = duduclaw_core::resolve_duduclaw_bin();
+        let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home.path(), "alice", &exe);
+        let source = serde_json::json!({"mcpServers":{
+            "duduclaw":own, "vendor":{"command":"vendor-mcp"}
+        }});
+        std::fs::write(workspace.join(".mcp.json"), source.to_string()).unwrap();
+        let mut command = tokio::process::Command::new("claude");
+        let guard = super::prepare_fork_mcp_proxy(home.path(), &agent_dir, &workspace, &mut command).unwrap().unwrap();
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&guard).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["vendor"]["args"][0], "mcp-proxy");
+        assert_eq!(config["mcpServers"]["vendor"]["env"]["DUDUCLAW_AGENT_ID"], "alice");
     }
 
     #[test]
@@ -1305,7 +1359,7 @@ mod tests {
         let source = serde_json::json!({"mcpServers":{"vendor":{"env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}}}).to_string();
         std::fs::write(home.path().join(".mcp.json"), &source).unwrap();
         let mut cmd = tokio::process::Command::new("claude");
-        let error = super::prepare_fork_mcp_proxy(home.path(), home.path(), &mut cmd).unwrap_err();
+        let error = super::prepare_fork_mcp_proxy(home.path(), &home.path().join("agents/alice"), home.path(), &mut cmd).unwrap_err();
         assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
         assert!(!error.contains("secret://"));
         assert_eq!(cmd.as_std().get_args().count(), 0);

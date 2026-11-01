@@ -96,7 +96,7 @@ fn internal_key_entry(now: DateTime<Utc>) -> toml::Value {
 /// Ensure a *valid* internal MCP key exists in `<home>/config.toml
 /// [mcp_keys]`, rotating it before the
 /// authenticator's hard expiry. Returns the cleartext key. Legacy entry point:
-/// refuses a missing config or unavailable durable MFA state. Gateway boot
+/// refuses a missing config or unreadable existing durable MFA state. Gateway boot
 /// callers must use [`ensure_internal_mcp_key_for_gateway`] with their listener.
 ///
 /// Rules (all scoped to `client_id = "gateway-internal"` — foreign keys are
@@ -532,10 +532,40 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_policy_refuses_non_personal_config_writes() {
+    fn absent_policy_allows_fresh_non_personal_boot_and_legacy_callers() {
         let home = tempfile::tempdir().unwrap();
+        let key = provision(home.path(), false, None).unwrap();
+        assert!(verify_internal_key(home.path(), &key));
+        assert!(!home.path().join("users.db").exists());
+        assert_eq!(ensure_internal_mcp_key(home.path()).unwrap(), key);
+
+        let legacy = tempfile::tempdir().unwrap();
+        std::fs::write(legacy.path().join("config.toml"), "# legacy caller\n").unwrap();
+        let key = ensure_internal_mcp_key(legacy.path()).unwrap();
+        assert!(verify_internal_key(legacy.path(), &key));
+        assert!(!legacy.path().join("users.db").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_policy_symlink_is_not_an_absent_policy() {
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(home.path().join("absent.db"), home.path().join("users.db")).unwrap();
         assert!(provision(home.path(), false, None).is_err());
         assert!(!home.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn unreadable_policy_directory_refuses_non_personal_boot() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("users.db")).unwrap();
+        assert!(provision(home.path(), false, None).is_err());
+        assert!(!home.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn unreadable_policy_refuses_non_personal_config_writes() {
+        let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("users.db"), b"not a database").unwrap();
         assert!(provision(home.path(), false, None).is_err());
         assert!(!home.path().join("config.toml").exists());

@@ -204,10 +204,30 @@ pub fn maybe_proxy_mcp_config_in_lane(
     mcp_json: &Path,
     explore_lane: bool,
 ) -> Result<Option<tempfile::TempPath>, String> {
-    let agent_dir = mcp_json.parent();
+    maybe_proxy_mcp_config_with_agent_dir(home_dir, mcp_json, mcp_json.parent(), explore_lane)
+}
+
+/// Rewrite a copied config using its host-known employee, not the copy's path
+/// or identity claimed by raw JSON. Policy checks use the original employee too.
+pub fn maybe_proxy_mcp_config_for_agent(
+    home_dir: &Path,
+    mcp_json: &Path,
+    agent_dir: &Path,
+) -> Result<Option<tempfile::TempPath>, String> {
+    maybe_proxy_mcp_config_with_agent_dir(home_dir, mcp_json, Some(agent_dir), false)
+}
+
+fn maybe_proxy_mcp_config_with_agent_dir(
+    home_dir: &Path,
+    mcp_json: &Path,
+    agent_dir: Option<&Path>,
+    explore_lane: bool,
+) -> Result<Option<tempfile::TempPath>, String> {
+    let agent_id = agent_dir.and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str()).unwrap_or("unknown").to_string();
     // Read once before choosing the purpose. An unreadable config cannot be
     // assumed to contain no references and must never fall back to CLI discovery.
-    let Some(parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
+    let Some(parsed) = read_mcp_json_for_runtime_for_agent(home_dir, mcp_json, explore_lane, &agent_id)? else {
         return Ok(None);
     };
     let purpose = ProxyPurpose {
@@ -222,11 +242,6 @@ pub fn maybe_proxy_mcp_config_in_lane(
     if purpose.none() {
         return Ok(None);
     }
-    let agent_id = agent_dir
-        .and_then(|d| d.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
     let self_exe = duduclaw_core::resolve_duduclaw_bin();
     let own_server = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
         home_dir, &agent_id, &self_exe,
@@ -428,8 +443,16 @@ fn read_mcp_json_for_runtime(
     mcp_json: &Path,
     explore_lane: bool,
 ) -> Result<Option<Value>, String> {
-    let agent_id = agent_id_of(mcp_json);
-    let refuse = |e: &str| refuse_gate_config_unavailable(home_dir, &agent_id, e, explore_lane);
+    read_mcp_json_for_runtime_for_agent(home_dir, mcp_json, explore_lane, &agent_id_of(mcp_json))
+}
+
+fn read_mcp_json_for_runtime_for_agent(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+    agent_id: &str,
+) -> Result<Option<Value>, String> {
+    let refuse = |e: &str| refuse_gate_config_unavailable(home_dir, agent_id, e, explore_lane);
     let raw = match std::fs::read_to_string(mcp_json) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -447,7 +470,7 @@ fn read_mcp_json_for_runtime(
         return Err(refuse("malformed .mcp.json: mcpServers is not an object"));
     }
     let exe = duduclaw_core::resolve_duduclaw_bin();
-    let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home_dir, &agent_id, &exe);
+    let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home_dir, agent_id, &exe);
     duduclaw_core::mcp_proxy_rewrite::validate_raw_mcp_config(&parsed, &exe, &own)
         .map_err(|e| refuse(&e))?;
     Ok(Some(parsed))

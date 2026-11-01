@@ -184,7 +184,7 @@ fn record_policy(home: &Path, value: bool) -> Result<Option<i64>, String> {
 }
 
 /// Read the durable boundary without creating/migrating the identity store.
-/// Missing stores are safe only for Personal installs, which do not enforce MFA.
+/// This reader is strict; boot_policy separately handles a genuinely absent store.
 fn read_policy_state(home: &Path) -> Result<bool, String> {
     use rusqlite::OptionalExtension;
     let db = rusqlite::Connection::open_with_flags(
@@ -195,6 +195,13 @@ fn read_policy_state(home: &Path) -> Result<bool, String> {
 }
 
 pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
+    // Only an absent directory entry means no policy has ever been recorded.
+    // A dangling symlink or any other existing but unreadable store must fail closed.
+    if matches!(std::fs::symlink_metadata(home.join("users.db")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(false);
+    }
     match read_policy_state(home) {
         Ok(value) => Ok(value),
         Err(_) if personal => Ok(false),

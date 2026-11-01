@@ -12,6 +12,22 @@ declaration surface, not the implementation. To run the server on its own,
 without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 
+## MCP credential boundaries
+
+`DUDUCLAW_` environment variables remain unchanged when MCP credentials are
+moved into the encrypted store, regardless of the server name. This does not
+make a `duduclaw-*` server trusted: raw configuration still rejects proxy-private
+variables and untrusted host identity. Built-in entries must match the complete
+host-generated definition. Forked copies use the original employee's host-known
+identity and policy directory, even when the copied file lives elsewhere.
+
+## Local text to speech
+
+`synthesize_speech` uses providers available in the MCP process: installed local
+Kokoro or Piper models. Paid TTS keys are held only by the gateway and are not
+available to this process. Audio is returned as base64, in MP3 or WAV format
+according to the provider.
+
 ## Per-employee tool list pruning
 
 In an employee's overview, Admins can open **Tool list pruning** to select a mode, inspect unused tools and estimated token savings, or restore the list while pruning is on. The selector uses the existing employee update path. The status and restore RPCs are Admin-only: `agents.tool_pruning_status {agent_id}` and `agents.tool_pruning_restore {agent_id}`. Estimates use each candidate tool's serialized definition length divided by four; they are not tokenizer measurements or measured provider savings.

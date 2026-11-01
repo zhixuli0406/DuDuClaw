@@ -213,7 +213,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "synthesize_speech",
-        description: "Convert text to speech using providers available in this process (installed local Kokoro or Piper models). Paid TTS keys are held only by the gateway and are not available to this MCP process. Returns base64-encoded audio (MP3 or WAV depending on provider).",
+        description: "Convert text to speech with installed local Kokoro or Piper models. Returns base64 MP3 or WAV audio. Gateway-held paid TTS keys are unavailable here.",
         params: &[
             ParamDef {
                 name: "text",

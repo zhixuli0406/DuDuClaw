@@ -41,7 +41,7 @@ pub fn migrate_agent(home: &Path, agent: &str, path: &Path) -> io::Result<bool> 
             for (name, value) in env {
                 validate_names(server, name)?;
                 let value = value.as_str().ok_or_else(|| invalid("MCP env value must be a string"))?;
-                needs_migration |= !PUBLIC_ENV.contains(&name.as_str()) && !value.starts_with("secret://");
+                needs_migration |= !keeps_plaintext_env(name, value);
             }
         }
     }
