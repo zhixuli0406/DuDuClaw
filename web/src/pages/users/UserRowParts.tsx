@@ -197,12 +197,14 @@ export function UserActions({
   onBind,
   onOffboard,
   onRemove,
+  onInvite,
 }: {
   user: UserDetail;
   onEdit: () => void;
   onBind: () => void;
   onOffboard: () => void;
   onRemove: () => void;
+  onInvite?: () => void;
 }) {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -227,6 +229,7 @@ export function UserActions({
         <MoreHorizontal />
       </DropdownMenuTrigger>
       <DropdownMenuContent>
+        {onInvite && viewerRole === 'admin' && user.status === 'active' && <DropdownMenuItem onClick={onInvite}>{intl.formatMessage({ id: 'users.invite.resend' })}</DropdownMenuItem>}
         {canViewDashboard && (
           <DropdownMenuItem onClick={() => navigate(`/?view_as=${encodeURIComponent(user.id)}`)}>
             <Eye />

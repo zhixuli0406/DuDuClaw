@@ -643,3 +643,5 @@ pub mod credential_declaration;
 mod egress_registry;
 
 pub(crate) mod live_events;
+
+pub(crate) mod user_invites;
