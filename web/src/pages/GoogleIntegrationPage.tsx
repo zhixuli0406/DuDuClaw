@@ -11,14 +11,18 @@ import {
   Plus,
   AlertTriangle,
   Loader2,
+  Settings2,
+  ChevronDown,
 } from 'lucide-react';
+import { GoogleSetupWizard } from '@/components/google/GoogleSetupWizard';
+import { useAuthStore } from '@/stores/auth-store';
 import { IntegrationConnectPanel } from '@/components/IntegrationConnectPanel';
 import { GoogleCredentialPaths } from '@/components/GoogleCredentialPaths';
 import { GoogleDelegationPanel } from '@/components/GoogleDelegationPanel';
 import { GooglePersonalAdminPanel } from '@/components/GooglePersonalAdminPanel';
 import { Card, CardContent, Button, Badge } from '@/components/mds';
 import { api } from '@/lib/api';
-import { toast } from '@/lib/toast';
+import { toast, formatError } from '@/lib/toast';
 
 const GOOGLE_CREDENTIALS_URL = 'https://console.cloud.google.com/apis/credentials';
 
@@ -73,6 +77,9 @@ export function GoogleIntegrationPage() {
   // off when it is on.
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
+  const admin = useAuthStore(s => s.user?.role === 'admin');
 
   const load = useCallback(async () => {
     try {
@@ -98,7 +105,7 @@ export function GoogleIntegrationPage() {
           : t('google.gate.disabled', 'Google 整合已關閉，AI 員工不再看得到這些工具。'),
       );
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(formatError(e));
     } finally {
       setBusy(false);
     }
@@ -106,6 +113,11 @@ export function GoogleIntegrationPage() {
 
   return (
     <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        {admin && <Button variant="brand" aria-haspopup="dialog" onClick={() => setWizardOpen(true)}><Settings2 />{t('google.wizard.open', '設定 Google 連線')}</Button>}
+        <Button variant="ghost" aria-expanded={advanced} aria-controls="google-advanced-settings" onClick={() => setAdvanced(value => !value)}>{t('google.wizard.advanced', '進階設定')}<ChevronDown /></Button>
+      </div>
+      {admin && <GoogleSetupWizard open={wizardOpen} onOpenChange={open => { setWizardOpen(open); if (!open) void load(); }} />}
       {enabled === false && (
         <Card data-testid="google-gate-off">
           <CardContent className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
@@ -118,7 +130,7 @@ export function GoogleIntegrationPage() {
                 <p className="text-sm text-muted-foreground">
                   {t(
                     'google.gate.offHint',
-                    '先在下面完成一種連線方式，再按「啟用」，19 個 Google 工具才會出現在 AI 員工面前。在那之前工具呼叫都會被拒絕。',
+                    '按「設定 Google 連線」完成設定，整合會自動啟用。也可開啟「進階設定」管理現有連線。',
                   )}
                 </p>
               </div>
@@ -150,6 +162,7 @@ export function GoogleIntegrationPage() {
         </Card>
       )}
 
+      {advanced && <div id="google-advanced-settings" className="space-y-4">
       <IntegrationConnectPanel
         providerId="google"
         prefix="google"
@@ -165,6 +178,7 @@ export function GoogleIntegrationPage() {
       <GoogleCredentialPaths />
       <GoogleDelegationPanel />
       <GooglePersonalAdminPanel />
+      </div>}
     </div>
   );
 }

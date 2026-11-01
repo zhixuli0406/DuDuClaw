@@ -57,11 +57,15 @@ const RISK_BADGE: Record<string, RiskBadge> = {
 export function InstallDetailPanel({
   request,
   onDecided,
+  processed = false,
+  outcome,
 }: {
   request: InstallRequestInfo;
   /** Called after a decision RPC succeeds so the parent can mark the row
    *  processed (§C6) without a full list refetch. */
-  onDecided: () => void;
+  onDecided: (outcome?: 'approved' | 'denied') => void;
+  processed?: boolean;
+  outcome?: 'approved' | 'denied';
 }) {
   const intl = useIntl();
   const t = useCallback((id: string) => intl.formatMessage({ id }), [intl]);
@@ -101,7 +105,7 @@ export function InstallDetailPanel({
           toast.success(intl.formatMessage({ id: 'install.request.deniedToast' }, { title: request.title }));
         }
         setDecided(approve ? 'approved' : 'denied');
-        onDecided();
+        onDecided(approve ? 'approved' : 'denied');
       } catch (e) {
         toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       } finally {
@@ -111,8 +115,17 @@ export function InstallDetailPanel({
     [busy, intl, request, onDecided],
   );
 
+  if (processed || !['awaiting_manager', 'awaiting_admin'].includes(request.stage)) {
+    const status = outcome ?? request.stage;
+    const key = status === 'approved' ? 'inbox.status.approved'
+      : status === 'denied' ? 'inbox.status.denied'
+      : status === 'expired' ? 'inbox.status.expired' : 'inbox.processed.receipt';
+    return <div className="space-y-4"><Badge variant="secondary">{t(key)}</Badge><h2 className="text-lg font-medium">{request.title}</h2>{request.description && <p className="text-sm">{request.description}</p>}</div>;
+  }
+
   return (
-    <div className="space-y-4">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
       <div className="flex items-start gap-3">
         <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-brand/10 text-brand">
           <KindIcon className="size-[1.125rem]" />
@@ -160,7 +173,7 @@ export function InstallDetailPanel({
           )}
           <span className="text-muted-foreground">{t('install.request.riskLabel')}:</span>
           <Badge variant={riskBadge.variant} className={riskBadge.className}>
-            {request.risk_level}
+            {t(`approval.risk.${['clean', 'low'].includes(request.risk_level.toLowerCase()) ? 'low' : request.risk_level.toLowerCase() === 'medium' ? 'medium' : 'high'}`)}
           </Badge>
           <span className="text-muted-foreground">
             {intl.formatMessage({ id: 'install.request.findingsCount' }, { count: request.scan?.length ?? 0 })}
@@ -175,7 +188,7 @@ export function InstallDetailPanel({
                 />
                 <span className="text-muted-foreground">
                   <span className={cn('font-semibold uppercase', SEVERITY_COLOR[f.severity] ?? SEVERITY_COLOR.info)}>
-                    {f.severity}
+                    {t(`skills.install.severity.${['critical', 'high', 'medium', 'low', 'warning', 'info'].includes(f.severity.toLowerCase()) ? f.severity.toLowerCase() : 'info'}`)}
                   </span>
                   {' · '}
                   {f.description}
@@ -196,6 +209,8 @@ export function InstallDetailPanel({
           channel. Renders nothing when the backend couldn't resolve a link. */}
       <OpenInChannelButton channel={request.channel} link={request.channel_link} variant="outline" />
 
+      </div>
+      <div data-testid="install-actions" className="z-10 shrink-0 border-t border-surface-border bg-surface py-3">
       {/* Decision */}
       {decided ? (
         <p
@@ -222,6 +237,7 @@ export function InstallDetailPanel({
           </Button>
         </div>
       )}
+      </div>
     </div>
   );
 }

@@ -292,13 +292,14 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user_id is required"),
         };
         let agent_name = match params.get("agent_name").and_then(|v| v.as_str()) {
-            Some(n) => n,
-            None => return WsFrame::error_response("", "agent_name is required"),
+            Some(n) if !n.trim().is_empty() => n,
+            _ => return WsFrame::error_response("", "agent_name is required"),
         };
-        let access_level_str = params
-            .get("access_level")
-            .and_then(|v| v.as_str())
-            .unwrap_or("owner");
+        let access_level_str = match params.get("access_level") {
+            None => "operator",
+            Some(Value::String(level)) => level.as_str(),
+            Some(_) => return WsFrame::error_response("", "invalid access_level"),
+        };
         let access_level: AccessLevel = match access_level_str.parse() {
             Ok(l) => l,
             Err(e) => return WsFrame::error_response("", &e),
@@ -308,6 +309,13 @@ impl MethodHandler {
         let reg = self.registry.read().await;
         if reg.get(agent_name).is_none() {
             return WsFrame::error_response("", &format!("agent not found: {agent_name}"));
+        }
+        if reg.get(agent_name).is_some_and(crate::machine_employee::requires_admin)
+            && !crate::on_behalf_of::access::system_operation_permitted(
+                &self.home_dir, Some(&format!("user:{user_id}")),
+            )
+        {
+            return WsFrame::error_response("", crate::machine_employee::REFUSAL);
         }
         drop(reg);
 
@@ -352,8 +360,8 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user_id is required"),
         };
         let agent_name = match params.get("agent_name").and_then(|v| v.as_str()) {
-            Some(n) => n,
-            None => return WsFrame::error_response("", "agent_name is required"),
+            Some(n) if !n.trim().is_empty() => n,
+            _ => return WsFrame::error_response("", "agent_name is required"),
         };
 
         let was_owner = match db.check_agent_access(user_id, agent_name) {

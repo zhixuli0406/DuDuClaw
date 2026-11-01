@@ -7,6 +7,9 @@ import { useSharedLeaderQuery } from '@/hooks/useSharedLeaderQuery';
 import { PartialLoadNotice } from '@/components/PartialLoadNotice';
 import {
   buildAttentionItems,
+  failedRunTitle,
+  failureRunId,
+  resolveFailureAgentId,
   countStandbyAgents,
   overviewCounts,
   isAllClear,
@@ -17,6 +20,7 @@ import {
   type AttentionSourceRow,
 } from '@/lib/home-overview';
 import { NeedsAttentionList } from './NeedsAttentionList';
+import { approvalRisk } from '@/lib/approval-risk';
 import { approvalListTitle } from '@/components/inbox/knowledge-quarantine';
 
 /** Rows shown before the "還有 N 件" overflow hint kicks in. */
@@ -106,6 +110,8 @@ export function HealthOverview({ agents, enabled }: HealthOverviewProps) {
       title: approvalListTitle(a, intl.formatMessage),
       agentId: a.agent_id,
       timestamp: a.created_at,
+      expiresAt: a.expires_at,
+      risk: approvalRisk(a.kind, a.payload),
     }));
     const taskRows: AttentionSourceRow[] = (data?.needsHumanTasks ?? []).map((t) => ({
       id: t.id,
@@ -120,10 +126,9 @@ export function HealthOverview({ agents, enabled }: HealthOverviewProps) {
     const recentFailures = withinRecentWindow(resolved, Date.now(), UNDELIVERED_WINDOW_MS);
     const failureRows: AttentionSourceRow[] = recentFailures.map((ev) => ({
       id: `${ev.agent_id}:${ev.timestamp}`,
-      title:
-        ev.summary ||
-        intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameOf.get(ev.agent_id) ?? ev.agent_id }),
-      agentId: ev.agent_id || undefined,
+      title: failedRunTitle(ev, intl.formatMessage, nameOf.get(ev.agent_id) ?? ev.agent_id),
+      agentId: resolveFailureAgentId(ev.agent_id, agents),
+      runId: failureRunId(ev),
       timestamp: ev.timestamp,
       channel: channelFailureChannel(ev),
     }));

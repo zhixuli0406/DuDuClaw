@@ -2,37 +2,32 @@
 //! quarantined behind an approval, or refused), the approval request, and the
 //! allowlisted archive of the original files. Split out of `writer.rs`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::json;
 
-use super::ir::{AgentDraft, ImportBundle};
-use super::skills::{self, PreparedSkill, Verdict};
+use super::ir::ImportBundle;
+use super::skills::{PreparedSkill, Verdict};
 use crate::expert::Report;
 use crate::expert::install::InstallCtx;
 use duduclaw_gateway::expert_skills::{self, QuarantinedSkill};
 
 /// One employee's skills.
 pub(super) struct SkillJob<'a> {
-    pub draft: &'a AgentDraft,
     pub id: &'a str,
     pub slug: &'a str,
-    pub format: &'static str,
 }
 
 pub(super) fn install_skills(
     ctx: &InstallCtx,
     job: &SkillJob<'_>,
-    stage: &Path,
+    prepared: &[(PreparedSkill, BTreeMap<String, Vec<u8>>)],
     report: &mut Report,
     quarantined: &mut Vec<QuarantinedSkill>,
-) {
-    let agent_stage = stage.join(job.id);
-    let mut taken = BTreeSet::new();
-    for draft in &job.draft.skills {
-        let p = skills::prepare(draft, &agent_stage, job.format, &mut taken);
-        let shown = skill_label(&p);
+) -> duduclaw_core::error::Result<()> {
+    for (p, files) in prepared {
+        let shown = skill_label(p);
         let base = json!({ "skill": shown });
         if let Some(old) = &p.renamed_from {
             report.ignored(
@@ -63,26 +58,28 @@ pub(super) fn install_skills(
                 report.skipped("skill", &shown, why.clone());
                 report.tag("skill.blocked", base);
             }
-            Verdict::Enable => place_enabled(ctx, job.id, &p, &shown, report),
-            Verdict::Quarantine(reasons) => quarantine(ctx, job, &p, &shown, reasons, report, quarantined),
+            Verdict::Enable => place_enabled(ctx, job.id, p, files, &shown, report)?,
+            Verdict::Quarantine(reasons) => quarantine(ctx, job, p, files, &shown, reasons, report, quarantined)?,
         }
     }
+    Ok(())
 }
 
 fn quarantine(
     ctx: &InstallCtx,
     job: &SkillJob<'_>,
     p: &PreparedSkill,
+    files: &BTreeMap<String, Vec<u8>>,
     shown: &str,
     reasons: &[String],
     report: &mut Report,
     quarantined: &mut Vec<QuarantinedSkill>,
-) {
+) -> duduclaw_core::error::Result<()> {
     let hard: Vec<_> = p.needs.iter().filter(|n| n.hard).collect();
     let mut digest = String::new();
     if !ctx.dry_run {
         let dest = expert_skills::quarantined_skill_dir(&ctx.home, job.slug, job.id, &p.name);
-        let stored = move_dir(&p.staged_dir, &dest)
+        let stored = write_skill_files(&ctx.home, files, &dest)
             .map_err(|e| e.to_string())
             .and_then(|_| expert_skills::tree_digest(&dest));
         match stored {
@@ -90,7 +87,7 @@ fn quarantine(
             Err(e) => {
                 report.skipped("skill", shown, format!("暫存失敗：{e}"));
                 report.tag("skill.failed", json!({ "skill": shown }));
-                return;
+                return Err(crate::expert::cfg_err(e));
             }
         }
     }
@@ -111,6 +108,7 @@ fn quarantine(
         needs: hard.iter().map(|n| n.label.to_string()).collect(),
         digest,
     });
+    Ok(())
 }
 
 fn skill_label(p: &PreparedSkill) -> String {
@@ -120,37 +118,33 @@ fn skill_label(p: &PreparedSkill) -> String {
     }
 }
 
-fn place_enabled(ctx: &InstallCtx, id: &str, p: &PreparedSkill, shown: &str, report: &mut Report) {
-    let params = json!({ "skill": shown });
-    if ctx.dry_run {
-        report.imported("skill", &format!("{shown} → {id}"));
-        report.tag("skill.enabled", params);
-        return;
+fn place_enabled(
+    ctx: &InstallCtx, id: &str, p: &PreparedSkill, files: &BTreeMap<String, Vec<u8>>,
+    shown: &str, report: &mut Report,
+) -> duduclaw_core::error::Result<()> {
+    if !ctx.dry_run {
+        let dest = ctx.home.join("agents").join(id).join("SKILLS").join(&p.name);
+        write_skill_files(&ctx.home, files, &dest).map_err(|e| crate::expert::cfg_err(e.to_string()))?;
     }
-    let dest = ctx.home.join("agents").join(id).join("SKILLS").join(&p.name);
-    if dest.exists() {
-        report.conflict("skill", shown, "這位 AI 員工已有同名技能，未覆蓋");
-        report.tag("skill.conflict", params);
-        return;
-    }
-    match move_dir(&p.staged_dir, &dest) {
-        Ok(()) => {
-            report.imported("skill", &format!("{shown} → {id}"));
-            report.tag("skill.enabled", params);
-        }
-        Err(e) => {
-            report.skipped("skill", shown, format!("安裝失敗：{e}"));
-            report.tag("skill.failed", params);
-        }
-    }
+    report.imported("skill", &format!("{shown} → {id}"));
+    report.tag("skill.enabled", json!({"skill": shown}));
+    Ok(())
 }
 
-fn move_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+fn write_skill_files(home: &Path, files: &BTreeMap<String, Vec<u8>>, dest: &Path) -> std::io::Result<()> {
+    match dest.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "技能目的地已存在")),
     }
-    crate::expert::copy_dir(src, dest)?;
-    let _ = std::fs::remove_dir_all(src);
+    let prefix = dest.strip_prefix(home).map_err(std::io::Error::other)?;
+    for (rel, bytes) in files {
+        let path = prefix.join(rel);
+        let rel = path.to_str().ok_or_else(|| std::io::Error::other("技能目的地不是 UTF-8"))?;
+        let rel = rel.replace('\\', "/");
+        crate::expert::install::write_planned_file(home, &rel, bytes)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -187,52 +181,9 @@ pub(super) async fn file_quarantine(
     }
 }
 
-/// Keep the files the import read or could not map under
-/// `<home>/imported/<slug>/source/` — the archive for unmapped files.
-/// Allowlist only: credential files, vendor config files (`openclaw.json`,
-/// Hermes `config.yaml`), session logs and hidden folders are never copied,
-/// and the total stays under the archive size cap.
-pub(super) fn archive_source(root: &Path, bundle: &ImportBundle, dest: &Path, report: &mut Report) {
-    let files = archive_list(bundle);
-    let mut copied = 0usize;
-    let mut total: u64 = 0;
-    for rel in &files {
-        let src = root.join(rel);
-        let Ok(meta) = std::fs::symlink_metadata(&src) else {
-            continue;
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        total = total.saturating_add(meta.len());
-        if total > crate::expert::safe_zip::MAX_UNPACK_BYTES {
-            report.warning("archive", "", "原始檔超過備份上限，其餘檔案未保存");
-            report.tag("archive.cap", json!({}));
-            break;
-        }
-        let to = dest.join(rel);
-        let res = to
-            .parent()
-            .map(std::fs::create_dir_all)
-            .unwrap_or(Ok(()))
-            .and_then(|_| std::fs::copy(&src, &to).map(|_| ()));
-        match res {
-            Ok(()) => copied += 1,
-            Err(e) => {
-                report.warning("archive", rel, format!("備份失敗：{e}"));
-                report.tag("archive.failed", json!({}));
-            }
-        }
-    }
-    if copied > 0 {
-        report.imported("archive", &format!("原始檔 {copied} 個已保存"));
-        report.tag("archive.saved", json!({ "count": copied }));
-    }
-}
-
 /// Relative paths the archive may hold: every slot document's source file
 /// plus every unmapped file, minus anything secret-shaped.
-fn archive_list(bundle: &ImportBundle) -> Vec<String> {
+pub(super) fn archive_list(bundle: &ImportBundle) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     let mut add = |src: &str| {
         let file = src.split('#').next().unwrap_or(src);
@@ -252,7 +203,7 @@ fn archive_list(bundle: &ImportBundle) -> Vec<String> {
         add(&u.rel);
     }
     for a in &bundle.agents {
-        let docs = [&a.soul, &a.identity, &a.instructions, &a.user_profile, &a.tools_notes, &a.heartbeat];
+        let docs = [&a.soul, &a.identity, &a.instructions, &a.user_profile, &a.contract, &a.tools_notes, &a.heartbeat];
         for d in docs.into_iter().flatten() {
             add(&d.source);
         }

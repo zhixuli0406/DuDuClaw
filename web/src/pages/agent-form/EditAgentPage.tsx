@@ -220,6 +220,18 @@ const DEFAULT_ODOO_FORM: OdooFormState = {
  * overwritten. Admin-only fields are disabled and never sent for non-admins.
  */
 export function EditAgentPage() {
+  const intl = useIntl();
+  const { id } = useParams();
+  const user = useAuthStore(s => s.user);
+  const bindings = useAuthStore(s => s.bindings);
+  // Team access is display-only; do not mount editors or memory loaders.
+  if (user?.role === 'manager' && !bindings.some(b => b.agent_name === id)) {
+    return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
+  }
+  return <EditAgentPageContent />;
+}
+
+function EditAgentPageContent() {
   const policy = useProductPolicy();
   const intl = useIntl();
   const errorText = useErrorMessage();
@@ -529,6 +541,7 @@ export function EditAgentPage() {
       monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
       warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
       hard_stop: agent.budget?.hard_stop ?? true,
+      when_unavailable: agent.budget?.when_unavailable ?? 'allow',
       heartbeat_enabled: agent.heartbeat?.enabled ?? false,
       heartbeat_interval: agent.heartbeat?.interval_seconds ?? 3600,
       // F1 — the saved cron (older gateways do not return it: the field then
@@ -557,6 +570,8 @@ export function EditAgentPage() {
     setCaps({
       ...DEFAULT_CAPABILITIES,
       ...(c ?? {}),
+      recipient_guard: c?.recipient_guard ?? DEFAULT_CAPABILITIES.recipient_guard,
+      recipients: Array.isArray(c?.recipients) ? c.recipients.filter((value) => typeof value === 'string') : [],
       computer_use_config: {
         ...DEFAULT_CAPABILITIES.computer_use_config,
         ...(c?.computer_use_config ?? {}),
@@ -1392,6 +1407,25 @@ export function EditAgentPage() {
             )}
           </SettingsSection>
 
+          <SettingsSection title={t('agents.recipients.title')} description={t('agents.recipients.description')}>
+            <SettingsCard>
+              <RowSelect
+                disabled={!isAdmin}
+                label={t('security.recipient.mode')}
+                description={t('agents.recipients.modeHelp')}
+                value={['off', 'shadow', 'ask'].includes(caps.recipient_guard) ? caps.recipient_guard : 'ask'}
+                onChange={(value) => updateCap('recipient_guard', value as 'off' | 'shadow' | 'ask')}
+                options={['off', 'shadow', 'ask'].map((value) => ({
+                  value,
+                  label: t(value === 'off' ? 'agents.recipients.inherit' : `security.egress.${value}`),
+                }))}
+              />
+            </SettingsCard>
+            <FieldBlock label={t('agents.recipients.list')} description={t('agents.recipients.listHelp')}>
+              <ChipEditor values={caps.recipients} onChange={(value) => updateCap('recipients', value)} placeholder="mail:ops@example.com" addLabel={t('common.add')} />
+            </FieldBlock>
+          </SettingsSection>
+
           {/* 2026-10 — [capabilities] action_rules: allow / ask / block per
               kind of action, plus per-tool overrides. */}
           <SettingsSection title={t('agents.actionRules.title')} description={t('agents.actionRules.desc')}>
@@ -1834,6 +1868,7 @@ export function EditAgentPage() {
                 <MoneyField cents={form.monthly_limit_cents ?? 5000} onChange={(c) => updateField('monthly_limit_cents', c)} />
               </SettingsRow>
               <RowNumber label={t('agents.edit.warnThreshold')} description={t('agents.edit.warnThreshold.help')} value={form.warn_threshold_percent ?? 80} min={0} max={100} onChange={(v) => updateField('warn_threshold_percent', v)} />
+              <RowSelect label={t('agents.edit.whenUnavailable')} description={t('agents.edit.whenUnavailable.help')} value={form.when_unavailable ?? 'allow'} onChange={(v) => updateField('when_unavailable', v as 'allow' | 'deny')} options={[{ value: 'allow', label: t('agents.edit.whenUnavailable.allow') }, { value: 'deny', label: t('agents.edit.whenUnavailable.deny') }]} />
               <RowSwitch label={t('agents.edit.hardStop')} description={t('agents.edit.hardStop.help')} checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} />
               <SettingsRow label={t('agents.v168.dailyCap')} description={t('agents.v168.dailyCap.help')} tier="select">
                 <MoneyField cents={v168.daily_cap_cents} onChange={(c) => updateV('daily_cap_cents', c)} />

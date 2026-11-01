@@ -59,6 +59,8 @@ const PROTECTED_KEYS: &[&str] = &[
     // 2026-10: turning the action review off removes a gate.
     "action_review.mode",
     "security.egress_guard",
+    "security.recipient_guard",
+    "security.chat_credentials",
 ];
 
 /// Team role slots. The dashboard contract says `synthesizer`; the config
@@ -384,12 +386,28 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
             out.applied_immediate = true;
         }
     }
+    if let Some(v) = str_param(params, "security.chat_credentials")? {
+        if !matches!(v, "audit" | "mask") {
+            return Err("security.chat_credentials must be audit or mask".into());
+        }
+        table_at_mut(table, &["security"])?.insert("chat_credentials".into(), toml::Value::String(v.into()));
+        out.changes.push(format!("security.chat_credentials = \"{v}\""));
+        out.applied_immediate = true;
+    }
     if let Some(v) = str_param(params, "security.egress_guard")? {
         if duduclaw_core::egress_guard::Mode::parse(v).is_none() {
             return Err("security.egress_guard must be one of: off, shadow, ask, block".into());
         }
         table_at_mut(table, &["security"])?.insert("egress_guard".into(), toml::Value::String(v.into()));
         out.changes.push(format!("security.egress_guard = \"{v}\""));
+        out.applied_immediate = true;
+    }
+    if let Some(v) = str_param(params, "security.recipient_guard")? {
+        if !matches!(v, "off" | "shadow" | "ask") {
+            return Err("security.recipient_guard must be one of: off, shadow, ask".into());
+        }
+        table_at_mut(table, &["security"])?.insert("recipient_guard".into(), toml::Value::String(v.into()));
+        out.changes.push(format!("security.recipient_guard = \"{v}\""));
         out.applied_immediate = true;
     }
     // 2026-10: `[action_review] mode`, read on every tool call.
@@ -758,5 +776,35 @@ mod tests {
         assert_eq!(p["log_level"], "info");
         assert_eq!(p["rotation_strategy"], "priority", "flat name wins");
         assert_eq!(p["log_format"], "pretty");
+    }
+    #[test]
+    fn recipient_guard_setting_accepts_only_known_modes() {
+        for mode in ["off", "shadow", "ask"] {
+            let (table, outcome) = apply(json!({"security.recipient_guard": mode})).unwrap();
+            assert_eq!(table["security"]["recipient_guard"].as_str(), Some(mode));
+            assert!(outcome.applied_immediate);
+        }
+        for mode in [json!("block"), json!("typo"), json!(true)] {
+            assert!(apply(json!({"security.recipient_guard":mode})).is_err());
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod chat_credential_config_tests {
+    use super::*;
+
+    #[test]
+    fn chat_credential_mode_is_validated_and_hot_applied() {
+        for mode in ["audit", "mask"] {
+            let mut table = toml::Table::new();
+            let result = apply_v168_keys(&mut table, &json!({"security.chat_credentials":mode})).unwrap();
+            assert!(result.applied_immediate);
+            assert_eq!(toml_at(&table, "security.chat_credentials").and_then(|v| v.as_str()), Some(mode));
+        }
+        for value in [json!("off"), json!(true), json!(1)] {
+            assert!(apply_v168_keys(&mut toml::Table::new(), &json!({"security.chat_credentials":value})).is_err());
+        }
     }
 }

@@ -636,6 +636,19 @@ impl GoalLoopDriver {
                 }
             }
 
+            // Refuse ordinary goals too, before another round is enqueued.
+            if durable.as_ref().and_then(|info| info.occurrence.as_ref()).is_none() {
+                let agent_dir = self.home_dir.join("agents").join(&task.assigned_to);
+                if let Err(refusal) = crate::budget::gate_before_spawn(
+                    &self.home_dir, Some(&agent_dir), &task.assigned_to, "goal_round",
+                ).await {
+                    self.escalate(&mut inflight, task, &refusal.to_string(),
+                        crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
+                    active = inflight.len();
+                    continue;
+                }
+            }
+
             // ── A1: build this round's structured `<state>` block ──
             // Computed once per candidate per tick (before any escalation
             // decision) and reused both for the A2 loop-detection checks
@@ -761,14 +774,14 @@ impl GoalLoopDriver {
                             crate::responsibility::activity::OCCURRENCE_COST_CAP,
                             &task.assigned_to,
                             Some(&task.id),
-                            &format!("員工的預算上限已用完，責任這次執行轉人工 — {}（{}）", task.title,
+                            &format!("員工的預算檢查未通過，責任這次執行轉人工 — {}（{}）", task.title,
                                 duduclaw_core::truncate_chars(&message, 120)),
                         )
                         .await;
                         self.escalate(
                             &mut inflight,
                             task,
-                            "employee budget cap",
+                            &message,
                             crate::pause_reason::PauseReason::BudgetExhausted,
                         )
                         .await?;

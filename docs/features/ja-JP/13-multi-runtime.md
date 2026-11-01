@@ -1,6 +1,6 @@
 # マルチランタイムエージェント実行
 
-> 1つのプラットフォームに 11 のランタイム ID：11 の CLI バックエンド（Claude、Codex、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
+> 1つのプラットフォームに 11 のランタイム ID：10 の CLI バックエンド（Claude、Codex、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
 
 ## 失敗の発生元と明示的なフォールバック
 
@@ -85,7 +85,7 @@ Gemini CLI は DuDuClaw のランタイムと Docker パッケージから削除
 
 ### バックエンドの駆動方法
 
-3 つの CLI バックエンド（`claude`、`codex`、`grok`。`runtime/mod.rs` の `BESPOKE_RUNTIME_IDS`）は専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。残り 7 つの CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）はこの汎用ランタイムを通ります。`openai_compat` は CLI ではなく、独自の HTTP モジュール（`runtime/openai_compat.rs`）を持ちます。手書きのモジュールは合計 5 つです。
+3 つの CLI バックエンド（`claude`、`codex`、`grok`。`runtime/mod.rs` の `BESPOKE_RUNTIME_IDS`）は専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。残り 7 つの CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）はこの汎用ランタイムを通ります。`openai_compat` は CLI ではなく、独自の HTTP モジュール（`runtime/openai_compat.rs`）を持ちます。手書きのモジュールは合計 4 つです。
 
 ### 主なバックエンド
 

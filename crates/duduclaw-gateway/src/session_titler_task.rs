@@ -91,7 +91,8 @@ pub(crate) fn decide_titling<'a>(
 /// explicitly; a Simplified conversation still gets a Simplified title, so the
 /// "follow the conversation" contract is preserved rather than hard-coded.
 pub(crate) fn format_title_prompt(transcript: &str) -> String {
-    let bounded = duduclaw_core::truncate_chars(transcript, TITLE_TRANSCRIPT_MAX_CHARS);
+    let masked = duduclaw_security::credential_detect::mask(transcript);
+    let bounded = duduclaw_core::truncate_chars(&masked, TITLE_TRANSCRIPT_MAX_CHARS);
     let language_rule = match duduclaw_core::dominant_variant(&bounded) {
         duduclaw_core::ChineseVariant::Traditional => {
             "- 這段對話使用繁體中文，標題必須用繁體中文（臺灣用語），一個簡體字都不可以出現"

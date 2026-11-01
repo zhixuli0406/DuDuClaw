@@ -495,6 +495,16 @@ fn turn_id() -> Option<String> {
         .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))
 }
 
+// Preserve malformed values as an invalid id, rather than silently falling
+// back to a possibly clean provenance identity.
+fn attach_egress_turn(body: &mut Value, execution: Option<std::ffi::OsString>) {
+    if body["op"] == "action" {
+        if let Some(turn) = execution {
+            body["egress_turn_id"] = json!(turn.into_string().unwrap_or_default());
+        }
+    }
+}
+
 /// Handle one `computer_*` tool call.
 pub(crate) async fn handle_computer_use_tool(
     tool: &str,
@@ -502,10 +512,11 @@ pub(crate) async fn handle_computer_use_tool(
     home: &Path,
     agent_id: &str,
 ) -> Value {
-    let body = match build_request(tool, args, turn_id()) {
+    let mut body = match build_request(tool, args, turn_id()) {
         Ok(body) => body,
         Err(msg) => return error(&msg),
     };
+    attach_egress_turn(&mut body, std::env::var_os(duduclaw_core::egress_guard::ENV_TURN_ALIAS));
     match post(home, agent_id, &body, timeout_for(tool)).await {
         Ok(v) if workspace_missing(&body, &v) => error(WORKSPACE_NOT_ATTACHED),
         Ok(v) => render(tool, &v),
@@ -526,6 +537,16 @@ pub(crate) fn workspace_missing(request: &Value, answer: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_identity_does_not_replace_attended_turn() {
+        let mut body = build_request("computer_type", &json!({"text": "hello"}), Some("provenance".into())).unwrap();
+        attach_egress_turn(&mut body, Some("execution".into()));
+        assert_eq!(body["turn_id"], "provenance");
+        assert_eq!(body["egress_turn_id"], "execution");
+        attach_egress_turn(&mut body, Some("".into()));
+        assert_eq!(body["egress_turn_id"], "");
+    }
 
     #[test]
     fn numbers_and_numeric_strings_are_both_accepted() {

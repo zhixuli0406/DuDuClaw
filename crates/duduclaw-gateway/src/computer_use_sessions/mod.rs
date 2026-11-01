@@ -1447,6 +1447,18 @@ impl ComputerUseSessions {
         turn_id: Option<&str>,
         req: &ActionRequest,
     ) -> Result<Value, OpError> {
+        self.action_with_egress(agent_id, session_id, turn_id, turn_id, req).await
+    }
+
+    /// Egress identity is separate from the turn used for attended approval.
+    pub(crate) async fn action_with_egress(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        egress_turn_id: Option<&str>,
+        req: &ActionRequest,
+    ) -> Result<Value, OpError> {
         let tool = action_tool(req);
         // `navigate`: the URL is checked against this session's pinned hosts
         // BEFORE any approval is requested, so an approver is never asked
@@ -1472,7 +1484,8 @@ impl ComputerUseSessions {
             }
             _ => (approval_detail(req), approval_action_snapshot(req)),
         };
-        let egress = gates::egress_check(&self.home, agent_id, tool, turn_id)?;
+        let egress_call_id = uuid::Uuid::new_v4().to_string();
+        let egress = gates::egress_check_with_call(&self.home, agent_id, tool, egress_turn_id, &egress_call_id)?;
         let grant_args = if egress.is_some() {
             let mut full = serde_json::to_value(req).expect("serializable action");
             full["session_id"] = json!(session_id);
@@ -1480,7 +1493,7 @@ impl ComputerUseSessions {
         } else { grant_args };
         self.admit_with_egress(agent_id, tool, &detail, &grant_args, egress.as_ref()).await?;
         // A policy change during approval can only narrow this operation.
-        if gates::egress_check(&self.home, agent_id, tool, turn_id)?.is_some() && egress.is_none() {
+        if gates::egress_check_with_call(&self.home, agent_id, tool, egress_turn_id, &egress_call_id)?.is_some() && egress.is_none() {
             return Err(OpError::new(ErrorCode::ApprovalDenied, "外送防護狀態已改變，請重新提出操作以取得完整內容核准。"));
         }
         let mut session = self.locked(agent_id, session_id).await?;

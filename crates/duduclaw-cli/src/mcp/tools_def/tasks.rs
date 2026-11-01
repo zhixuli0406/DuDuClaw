@@ -8,6 +8,14 @@
 use super::super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
+    ToolDef {
+        name: "credential_declare",
+        description: "Declare a service identifier for a credential you hold. Never supply a secret value. Administrator service labels take precedence.",
+        params: &[
+            ParamDef { name: "credential_id", description: "Opaque credential id supplied by the gateway.", required: true },
+            ParamDef { name: "service", description: "Non-secret identifier matching [a-z0-9][a-z0-9._-]{0,63}.", required: true },
+        ],
+    },
     ToolDef {name:"discovery_catalog",description:"List approved discovery root IDs, evaluators and supported runtimes; host paths and policy source remain private.",
         params:&[ParamDef {name:"agent_id",description:"Assigned agent; defaults to caller. Delegation authorization is checked.",required:false}]},
     ToolDef {name:"discovery_list",description:"List discovery runs visible to the verified creator or authorized manager.",

@@ -18,7 +18,7 @@ pub(crate) const TIMELINE_ROW_CAP: usize = 2000;
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct TimelineRow {
     pub agent_id: String,
-    /// "task" | "delegation" | "heartbeat" | "skill" | "autopilot" | "governance" | "activity"
+    /// "task" | "delegation" | "heartbeat" | "skill" | "autopilot" | "governance" | "problem" | "activity"
     pub kind: String,
     pub label: String,
     /// RFC3339.
@@ -28,6 +28,11 @@ pub(crate) struct TimelineRow {
     pub ended_at: Option<String>,
     pub status: String,
     pub ref_id: String,
+    /// Task linked to this row; activity `ref_id` remains the activity id.
+    pub task_id: Option<String>,
+    /// Last task update, not necessarily the moment its status changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 pub(crate) fn parse_timeline_ts(s: &str) -> Option<chrono::DateTime<Utc>> {
@@ -39,7 +44,13 @@ pub(crate) fn parse_timeline_ts(s: &str) -> Option<chrono::DateTime<Utc>> {
 /// Classify an activity `event_type` into a timeline lane kind.
 pub(crate) fn timeline_kind_for_event(event_type: &str) -> &'static str {
     let t = event_type.to_ascii_lowercase();
-    if t.contains("delegat") {
+    // Failures take precedence over their source (e.g. heartbeat_error).
+    // Match words, not arbitrary substrings such as "error" in "terror".
+    if t.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| {
+        matches!(word, "error" | "fail" | "failed" | "failure" | "anomaly")
+    }) {
+        "problem"
+    } else if t.contains("delegat") {
         "delegation"
     } else if t.contains("heartbeat") {
         "heartbeat"
@@ -57,13 +68,12 @@ pub(crate) fn timeline_kind_for_event(event_type: &str) -> &'static str {
 /// Derive a timeline row from one task, or `None` when the task has no
 /// parseable timestamps or falls entirely outside the `[from, to]` window.
 ///
-/// Honesty rules (never invent a duration):
+/// Bars describe an open task's lifetime, not employee working time:
 ///   • done / cancelled / failed → bar `start → completed_at` (fallback
 ///     `updated_at`, the moment the terminal status was written)
-///   • in_progress → running bar (`ended_at = None`)
-///   • blocked / in_review with a real claim → bar `claimed_at → updated_at`
-///     (the moment the task entered its current state)
-///   • anything never started (todo / backlog / unclaimed blocked) → an
+///   • running / reviewing / revising / waiting / blocked → open bar
+///     (`ended_at = None`), so old unresolved tasks still overlap the window
+///   • queued tasks (todo / backlog) → an
 ///     instant at `created_at`
 pub(crate) fn timeline_row_from_task(
     task: &TaskRow,
@@ -80,7 +90,8 @@ pub(crate) fn timeline_row_from_task(
     let start = claimed.or(created)?;
 
     let end: Option<chrono::DateTime<Utc>> = match task.status.as_str() {
-        "in_progress" => None,
+        "in_progress" | "review" | "revising" | "in_review" | "pending"
+        | "pending_approval" | "needs_human" | "blocked" => None,
         "done" | "cancelled" | "failed" => Some(
             task.completed_at
                 .as_deref()
@@ -88,14 +99,6 @@ pub(crate) fn timeline_row_from_task(
                 .or_else(|| parse_timeline_ts(&task.updated_at))
                 .unwrap_or(start),
         ),
-        "blocked" | "in_review" => {
-            if claimed.is_some() {
-                Some(parse_timeline_ts(&task.updated_at).unwrap_or(start))
-            } else {
-                // Never started: a queue-state instant, not a fake bar.
-                Some(start)
-            }
-        }
         // todo / backlog / unknown: queued, no real work interval.
         _ => Some(start),
     };
@@ -117,6 +120,8 @@ pub(crate) fn timeline_row_from_task(
         ended_at: end.map(|e| e.to_rfc3339()),
         status: task.status.clone(),
         ref_id: task.id.clone(),
+        task_id: Some(task.id.clone()),
+        updated_at: parse_timeline_ts(&task.updated_at).map(|t| t.to_rfc3339()),
     })
 }
 
@@ -129,7 +134,7 @@ pub(crate) fn timeline_row_from_activity(
 ) -> Option<TimelineRow> {
     // `task_created` duplicates the start edge of the task bar emitted by
     // `timeline_row_from_task` — drop it to avoid double-marking lanes.
-    if event.event_type == "task_created" {
+    if event.event_type == "task_created" || event.agent_id == "channel_alert" {
         return None;
     }
     let ts = parse_timeline_ts(&event.timestamp)?;
@@ -145,6 +150,8 @@ pub(crate) fn timeline_row_from_activity(
         ended_at: Some(rfc),
         status: event.event_type.clone(),
         ref_id: event.id.clone(),
+        task_id: event.task_id.clone().filter(|id| !id.is_empty()),
+        updated_at: None,
     })
 }
 
@@ -161,6 +168,9 @@ pub(crate) fn derive_timeline_rows(
 ) -> (Vec<TimelineRow>, bool) {
     let mut rows: Vec<TimelineRow> = Vec::new();
     for task in tasks {
+        if task.assigned_to == "channel_alert" {
+            continue;
+        }
         if let Some(r) = timeline_row_from_task(task, from, to, now) {
             rows.push(r);
         }
@@ -171,6 +181,9 @@ pub(crate) fn derive_timeline_rows(
         }
     }
     for (agent_id, last_run) in heartbeats {
+        if agent_id == "channel_alert" {
+            continue;
+        }
         let Some(ts) = last_run.as_deref().and_then(parse_timeline_ts) else {
             continue;
         };
@@ -186,6 +199,8 @@ pub(crate) fn derive_timeline_rows(
             ended_at: Some(rfc),
             status: "fired".into(),
             ref_id: format!("heartbeat:{agent_id}"),
+            task_id: None,
+            updated_at: None,
         });
     }
     rows.sort_by(|a, b| {

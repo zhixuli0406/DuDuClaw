@@ -138,6 +138,7 @@ pub async fn mcp_cold_start_probe(home: &Path) -> McpColdStartReport {
     // MCP server into a red doctor result. Signed ≠ authorized: `doctor-probe`
     // is no agent's ancestor and no system sender, so it still cannot delegate.
     let mut cmd = tokio::process::Command::new(&bin);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
     cmd.arg("mcp-server")
         .envs(duduclaw_core::agent_identity_env_vars(home, "doctor-probe"))
         .envs(forward.iter().map(|(k, v)| (k.clone(), v.clone())))
@@ -544,10 +545,11 @@ pub struct GrokProbeReport {
 pub async fn grok_probe(home: &Path) -> Option<GrokProbeReport> {
     let path = duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home))?;
 
+    let mut version_cmd = duduclaw_core::platform::async_command_for(&path);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut version_cmd);
     let version = match tokio::time::timeout(
         Duration::from_secs(5),
-        duduclaw_core::platform::async_command_for(&path)
-            .arg("--version")
+        version_cmd.arg("--version")
             .stdin(Stdio::null())
             .output(),
     )
@@ -567,6 +569,10 @@ pub async fn grok_probe(home: &Path) -> Option<GrokProbeReport> {
     let home_env = crate::runtime::grok::build_home_env(&user_home, grok_home_override.as_deref());
 
     let mut cmd = duduclaw_core::platform::async_command_for(&path);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+    if let Ok(key) = std::env::var("XAI_API_KEY") {
+        cmd.env("XAI_API_KEY", key);
+    }
     cmd.args(["-p", "ping"]).stdin(Stdio::null());
     for (k, v) in &home_env {
         cmd.env(k, v);
@@ -611,6 +617,38 @@ pub async fn grok_probe(home: &Path) -> Option<GrokProbeReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_probe_drops_ambient_secrets_and_keeps_explicit_env() {
+        if let Ok(home) = std::env::var("DUDUCLAW_TEST_GROK_PROBE_HOME") {
+            let report = grok_probe(Path::new(&home)).await.unwrap();
+            assert_eq!(report.version.as_deref(), Some("fixture-version"));
+            assert!(matches!(report.outcome, GrokProbeOutcome::Ok { .. }), "{report:?}");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("grok");
+        std::fs::write(&script, r#"#!/bin/sh
+if [ "${CLAUDE_CODE_MESSAGING_TOKEN+x}" = x ] || [ "${ANTHROPIC_API_KEY+x}" = x ]; then exit 71; fi
+if [ "$1" = --version ]; then printf 'fixture-version'; exit 0; fi
+if [ "$XAI_API_KEY" != fixture-xai ] || [ "$GROK_HOME" != "$HOME/grok-config" ] || [ "$USERPROFILE" != "$HOME" ]; then exit 72; fi
+printf 'probe-ok'
+"#).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "doctor_probes::tests::grok_probe_drops_ambient_secrets_and_keeps_explicit_env", "--nocapture"])
+            .env("DUDUCLAW_TEST_GROK_PROBE_HOME", root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).env("HOME", root.path())
+            .env("GROK_HOME", root.path().join("grok-config"))
+            .env("XAI_API_KEY", "fixture-xai")
+            .env("CLAUDE_CODE_MESSAGING_TOKEN", "fixture-messaging")
+            .env("ANTHROPIC_API_KEY", "fixture-anthropic")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
 
     #[test]
     fn classify_pass_on_initialize_result() {

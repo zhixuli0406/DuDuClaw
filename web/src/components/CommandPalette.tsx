@@ -238,7 +238,7 @@ export function CommandPalette() {
   // other role must supply one, so this defaults to the first agent the
   // viewer can see.
   const dataScope = useDataScope();
-  const visibleAgentsForSearch = useVisibleAgents();
+  const visibleAgentsForSearch = useVisibleAgents(false);
   const searchAgentId = visibleAgentsForSearch[0]?.name;
   // Operator/owner binding gates sensitive `operatorOnly` commands (fail-closed).
   const hasOperatorAccess = bindings.some(

@@ -55,7 +55,7 @@ pub use lineage::{
     MAX_LINEAGE_SOURCES,
 };
 pub use engine::forget_source::{
-    ApplyOutcome, ApplyReport, ExternalInputs, ForgetPlan, ForgetSelector, ForgetStep,
+    connector_plan_is_subset, ApplyOutcome, ApplyReport, ExternalInputs, ForgetPlan, ForgetSelector, ForgetStep,
     PlanDocument, PlanOptions, PlanOutcome, SessionMessageRef, StaleReason, WikiPageRef,
 };
 pub use novelty_gate::{NoveltyGateConfig, NoveltyRejection};

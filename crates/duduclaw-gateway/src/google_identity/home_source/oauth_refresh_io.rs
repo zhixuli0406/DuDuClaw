@@ -201,6 +201,7 @@ pub(super) async fn refresh_once_budget(
     budget.check()?;
     #[cfg(test)]
     testing::send_ready(home);
+    let setup_stamp = crate::mcp_oauth::google_token_stamp(home);
     let sent = budget
         .wait(
             sender
@@ -220,9 +221,7 @@ pub(super) async fn refresh_once_budget(
     budget.check()?;
     validate_capture(home, receipt, capture)?;
     let mut response = sent.map_err(|_| Error::Io)?;
-    if !response.status().is_success() {
-        return Err(Error::Io);
-    }
+    let success = response.status().is_success();
     if response
         .content_length()
         .is_some_and(|n| n > MAX_BODY as u64)
@@ -258,6 +257,14 @@ pub(super) async fn refresh_once_budget(
             return Err(Error::Invalid);
         }
         bytes.extend_from_slice(&chunk);
+    }
+    if !success {
+        let body = JsonBody(serde_json::from_slice(&bytes).unwrap_or(Value::Null));
+        if body.0["error"].as_str() == Some("invalid_grant") {
+            validate_capture(home, receipt, capture)?;
+            crate::mcp_oauth::record_google_invalid_grant(home, &setup_stamp).map_err(|_| Error::Io)?;
+        }
+        return Err(Error::Io);
     }
     let parsed = parse_tokens(
         serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?,

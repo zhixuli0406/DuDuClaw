@@ -381,6 +381,13 @@ impl MethodHandler {
         if !ctx.can_assign_to(agent_id) {
             return WsFrame::error_response("", "permission denied");
         }
+        if !ctx.is_admin() {
+            if let Err(refusal) = crate::machine_employee::check_target(
+                &self.home_dir, agent_id, Some(&format!("user:{}", ctx.user_id)),
+            ) {
+                return WsFrame::error_response("", &refusal);
+            }
+        }
         // T5/O4 (feature audit 2026-09-29): every field below is read
         // verbatim from the request and handed to `goal_create_core`, which
         // is now the ONE implementation of "create an autonomous goal" —

@@ -433,7 +433,9 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
                 settings: settings.clone(),
                 home_dir: home_dir.to_path_buf(),
             };
-            let spawner = std::sync::Arc::new(crate::mcp_fork_exec::ClaudeCliSpawner);
+            let spawner = std::sync::Arc::new(crate::mcp_fork_exec::ClaudeCliSpawner {
+                home_dir: home_dir.to_path_buf(), agent_id: agent_id.to_owned(),
+            });
             if settings.judge == "llm" {
                 // Opt-in LLM judge ([fork] judge = "llm"): utility-runtime
                 // backed caller + FineVerify toggle, wrapped so any LLM

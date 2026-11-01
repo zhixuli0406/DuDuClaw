@@ -55,7 +55,17 @@ pub fn physical_rows(row: &LogicalRow) -> Vec<PhysicalRow> {
         .cells
         .iter()
         .map(|cell| match cell {
-            Cell::Text(s) => chunks(s).into_iter().map(Cell::Text).collect(),
+            // Mask the complete cell before splitting, so a credential spanning
+            // two physical rows cannot evade detection at the output boundary.
+            Cell::Text(s) => {
+                let masked = if s.len() as u64 <= MAX_BYTES {
+                    duduclaw_security::credential_detect::mask_document(s)
+                        .unwrap_or_else(|_| duduclaw_security::credential_detect::UNAVAILABLE_MASK.into())
+                } else {
+                    duduclaw_security::credential_detect::UNAVAILABLE_MASK.into()
+                };
+                chunks(&masked).into_iter().map(Cell::Text).collect()
+            },
             Cell::Number(n) => vec![Cell::Number(*n)],
         })
         .collect();
@@ -137,6 +147,10 @@ pub fn encode(
                 .map_err(|_| "EXPORT_IO".to_string())?;
             for row in rows {
                 checkpoint()?;
+                let input_bytes = row.cells.iter().fold(row.id.len(), |total, cell| {
+                    total.saturating_add(match cell { Cell::Text(text) => text.len(), Cell::Number(_) => 8 })
+                });
+                if input_bytes as u64 > MAX_BYTES { return Err("EXPORT_TOO_LARGE".into()); }
                 for part in physical_rows(row) {
                     let mut cells = vec![part.id, part.index.to_string(), part.count.to_string()];
                     cells.extend(part.cells.iter().map(|c| match c {
@@ -168,6 +182,10 @@ pub fn encode(
             }
             for row in rows {
                 checkpoint()?;
+                let input_bytes = row.cells.iter().fold(row.id.len(), |total, cell| {
+                    total.saturating_add(match cell { Cell::Text(text) => text.len(), Cell::Number(_) => 8 })
+                });
+                if input_bytes as u64 > MAX_BYTES { return Err("EXPORT_TOO_LARGE".into()); }
                 for part in physical_rows(row) {
                     if physical_count >= 1_048_575 {
                         return Err("EXPORT_TOO_LARGE".into());
@@ -226,4 +244,29 @@ pub fn encode(
         }
     }
     Ok(physical_count)
+}
+
+#[cfg(test)]
+mod credential_sink_tests {
+    use super::*;
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[test]
+    fn export_masks_before_chunking_and_csv_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = LogicalRow {
+            id: "message:1".into(),
+            cells: vec![Cell::Text(format!("{}password: fixture-export", "a ".repeat(15_997)))],
+        };
+        let parts = physical_rows(&row);
+        assert!(parts.iter().all(|part| part.cells.iter().all(|cell| match cell {
+            Cell::Text(value) => !value.contains("fixture-export"),
+            Cell::Number(_) => true,
+        })));
+        let path = dir.path().join("export.csv");
+        encode(&path, ExportFormat::Csv, &["content"], &[row], || Ok(())).unwrap();
+        let stored = std::fs::read_to_string(path).unwrap();
+        assert!(!stored.contains("fixture-export"));
+        assert!(stored.contains("message:1"));
+    }
 }

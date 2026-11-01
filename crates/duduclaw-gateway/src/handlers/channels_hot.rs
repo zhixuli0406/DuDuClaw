@@ -98,11 +98,15 @@ impl MethodHandler {
             }
 
             info!(channel_type, "Per-agent channel removed and stopped");
+            let forget_memories = crate::disconnect_forget::after_disconnect(&self.home_dir,
+                &format!("channel:{platform}:{agent_name}"), channel_type,
+                params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await;
             return WsFrame::ok_response(
                 "",
                 json!({
                     "success": true,
                     "type": channel_type,
+                    "forget_memories": forget_memories,
                 }),
             );
         }
@@ -190,12 +194,16 @@ impl MethodHandler {
         }
 
         info!(channel_type, restarted = ?restarted_agents, "Channel removed and stopped");
+        let forget_memories = crate::disconnect_forget::after_disconnect(&self.home_dir,
+            &format!("channel:{channel_type}"), channel_type,
+            params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await;
         WsFrame::ok_response(
             "",
             json!({
                 "success": true,
                 "type": channel_type,
                 "restarted_per_agent": restarted_agents,
+                "forget_memories": forget_memories,
             }),
         )
     }

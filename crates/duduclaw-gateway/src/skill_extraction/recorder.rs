@@ -111,9 +111,9 @@ impl TrajectoryRecorder {
         if let Some(state) = self.active.get_mut(session_key) {
             state.turns.push(TrajectoryTurn {
                 role: role.to_string(),
-                content: content.to_string(),
+                content: duduclaw_security::credential_detect::mask(content),
                 timestamp: Utc::now(),
-                tools_used,
+                tools_used: tools_used.into_iter().map(|tool| duduclaw_security::credential_detect::mask(&tool)).collect(),
             });
         }
     }
@@ -234,13 +234,13 @@ impl SkillExtractor {
             .iter()
             .find(|t| t.role == "user")
             .map(|t| {
-                let preview: String = t.content.chars().take(50).collect();
+                let preview: String = duduclaw_security::credential_detect::mask(&t.content).chars().take(50).collect();
                 format!("auto:{}", sanitize_skill_name(&preview))
             })
             .unwrap_or_else(|| {
                 format!(
                     "auto:skill-{}",
-                    &trajectory.session_key[..8.min(trajectory.session_key.len())]
+                    duduclaw_core::truncate_chars(&trajectory.session_key, 8)
                 )
             });
 
@@ -250,7 +250,7 @@ impl SkillExtractor {
             .iter()
             .filter(|t| t.role == "assistant")
             .map(|t| {
-                let preview: String = t.content.chars().take(100).collect();
+                let preview: String = duduclaw_security::credential_detect::mask(&t.content).chars().take(100).collect();
                 preview
             })
             .next()
@@ -330,6 +330,9 @@ impl SkillCache {
         .map_err(|e| format!("Failed to init schema: {e}"))?;
 
         for skill in &self.skills {
+            let mut masked = serde_json::to_value(skill).map_err(|_| "Serialize skill".to_string())?;
+            duduclaw_security::credential_detect::mask_json(&mut masked);
+            let skill: ExtractedSkill = serde_json::from_value(masked).map_err(|_| "Mask skill".to_string())?;
             conn.execute(
                 "INSERT OR REPLACE INTO skill_cache \
                  (id, name, description, tools_used_json, confidence, source_session, extracted_at) \
@@ -414,6 +417,27 @@ fn sanitize_skill_name(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[test]
+    fn recorder_and_skill_cache_mask_at_sink() {
+        let mut recorder = TrajectoryRecorder::new();
+        recorder.start("session", "agent");
+        recorder.record_turn("session", "user", "password: fixture-user", vec![]);
+        recorder.record_turn("session", "assistant", "token: fixture-reply", vec![]);
+        let trajectory = recorder.finalize("session", TrajectoryOutcome::Success, None).unwrap();
+        assert!(!serde_json::to_string(&trajectory).unwrap().contains("fixture-"));
+        let mut cache = SkillCache::new();
+        cache.add(ExtractedSkill { id: "test".into(), name: "password: fixture-name".into(),
+            description: "token: fixture-desc".into(), tools_used: vec![], confidence: 0.8,
+            source_session: "session".into(), extracted_at: Utc::now() });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        cache.save_to_sqlite(file.path()).unwrap();
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        let stored: String = conn.query_row("SELECT name || description FROM skill_cache", [], |r| r.get(0)).unwrap();
+        assert!(!stored.contains("fixture-"));
+    }
+
 
     #[test]
     fn test_recorder_lifecycle() {

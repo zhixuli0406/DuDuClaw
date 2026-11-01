@@ -5,10 +5,10 @@ use std::path::Path;
 
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_gateway::memory_forget_steps as steps;
-use duduclaw_memory::{ApplyOutcome, ExternalInputs, ForgetPlan, SqliteMemoryEngine};
+use duduclaw_memory::{ApplyOutcome, ForgetPlan};
 
 use super::{
-    AUDIT_APPLIED, CmdOutput, extras, forget_source_enabled, gate, open_engine, refused, render,
+    CmdOutput, extras, forget_source_enabled, gate, open_engine, refused, render,
     stray_db,
 };
 
@@ -47,53 +47,21 @@ pub(super) async fn apply(home: &Path, plan_id: &str, confirm: bool) -> Result<C
     if let Err((reason, msg)) = gate::check(home, &plan).await {
         return Err(refused(home, &agent, Some(plan_id), &reason, msg));
     }
-    let external = steps::collect_external_for_apply(home, &plan)
-        .await
-        .map_err(DuDuClawError::Memory)?;
-    let outcome = engine.apply_forget_plan(plan_id, &external).await?;
-    apply_outcome(home, &engine, &plan, outcome, external).await
+    let (outcome, followup) = duduclaw_gateway::memory_forget_apply::apply(home, &engine, &plan).await?;
+    apply_outcome(home, &plan, outcome, followup).await
 }
 
 async fn apply_outcome(
     home: &Path,
-    engine: &SqliteMemoryEngine,
     plan: &ForgetPlan,
     outcome: ApplyOutcome,
-    _external: ExternalInputs,
+    followup: Option<steps::StepsReport>,
 ) -> Result<CmdOutput> {
     let agent = plan.document.agent_id.as_str();
     let pid = plan.plan_id.as_str();
     let mut o = String::new();
     match outcome {
         ApplyOutcome::Applied(r) => {
-            duduclaw_security::audit::append_audit_event(
-                home,
-                &duduclaw_security::audit::AuditEvent::new(
-                    AUDIT_APPLIED,
-                    agent,
-                    duduclaw_security::audit::Severity::Warning,
-                    serde_json::json!({
-                        "plan_id": r.plan_id,
-                        "agent_id": r.agent_id,
-                        "plan_hash": r.plan_hash,
-                        "memories_deleted": r.memories_deleted,
-                        "key_facts_deleted": r.key_facts_deleted,
-                        "archive_deleted": r.archive_deleted,
-                        "entity_embeddings_deleted": r.entity_embeddings_deleted,
-                        "supersession_links_cut": r.supersession_links_cut,
-                        "steps_pending": r.steps_pending,
-                        "forget_epoch": r.forget_epoch,
-                        "untracked_in_namespace": {
-                            "planned": r.untracked_in_namespace_planned,
-                            "at_apply": r.untracked_in_namespace_at_apply,
-                        },
-                        "other_namespaces_referencing": {
-                            "planned": r.other_namespaces_referencing_planned,
-                            "at_apply": r.other_namespaces_referencing_at_apply,
-                        },
-                    }),
-                ),
-            );
             if r.memories_deleted + r.key_facts_deleted + r.archive_deleted == 0 {
                 o.push_str(&format!(
                     "沒有可刪的記憶，但已設下之後不再學到的紀錄（{} ms）。\n",
@@ -148,9 +116,7 @@ async fn apply_outcome(
             ));
         }
     }
-    let report = steps::run_forget_steps(engine, home, pid)
-        .await
-        .map_err(DuDuClawError::Memory)?;
+    let report = followup.ok_or_else(|| DuDuClawError::Memory("missing follow-up result".into()))?;
     o.push_str(&render_steps(pid, &report));
     Ok(CmdOutput {
         text: o,

@@ -125,8 +125,8 @@ impl MethodHandler {
     }
 
     /// Force a live re-probe of every provider, persist the cache, and return
-    /// the fresh list. Authenticated (any logged-in dashboard user) — a manual
-    /// "refresh" action, not a config change.
+    /// the fresh list. Manager-only at dispatch: probing providers triggers
+    /// network requests and updates the shared discovery cache.
     pub(crate) async fn handle_models_refresh(&self) -> WsFrame {
         let cache = crate::runtime_models::refresh_and_save(&self.home_dir).await;
         self.build_models_response(&cache).await

@@ -249,6 +249,8 @@ mode         = "operator_only"
 
 ### 部門別の読み取り可視性（`visible_to_departments`）
 
+ダッシュボードの `shared_wiki.pages`、`.read`、`.search`、`.stats` と共有 Wiki のエクスポートにも同じ部署の規則を適用します。部署は `users.db` の人間のアカウントの `users.department` から読み、AI スタッフの部署や token の情報は使いません。管理者以外で部署がない場合は会社共通ページのみ、管理者は全ページを閲覧できます。表示設定が読めない場合や壊れている場合、ダッシュボードの読み取りは拒否します。`.scope.toml` がない場合は会社共通ページを閲覧できます。ページ共有には引き続き元のスタッフの Owner または管理者権限が必要です。
+
 上記の`mode`は「誰が書き込めるか」を制御します。「誰が**部門**レベルで読み取れるか」を制御するには、同じ`[namespaces."x"]`テーブルに`visible_to_departments`配列を追加します。`[agent] department`がリストに含まれるエージェントだけがそのネームスペースを見ることができます——**プロンプトインジェクション**（自動注入されるL0/L1ページ）でも、**`wiki_search` / `wiki_read` / `wiki_ls`（`scope="shared"`）**経由でも同様です。
 
 ```toml

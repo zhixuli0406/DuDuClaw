@@ -39,6 +39,7 @@ import {
   TableCell,
   type BadgeProps,
 } from '@/components/mds';
+import { AgentProfilePreview } from '@/components/experts/AgentProfilePreview';
 import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
@@ -324,7 +325,7 @@ export function MigratePage() {
     setError(null);
     setApplying(true);
     try {
-      const res = await api.migrate.apply(platform, source || undefined, rename);
+      const res = await api.migrate.apply(platform, source || undefined, rename, scan?.profile_confirmation);
       setApplied(res);
       setStep('result');
     } catch (e) {
@@ -463,6 +464,7 @@ export function MigratePage() {
       {step === 'preview' && scan && (
         <div className="space-y-5">
           <ResultReport result={scan} />
+          {scan.profile_preview && <AgentProfilePreview profiles={scan.profile_preview} />}
 
           {scan.summary.conflict > 0 && (
             <Card className="p-4">
@@ -485,7 +487,7 @@ export function MigratePage() {
               <ArrowLeft />
               {t('common.back')}
             </Button>
-            <Button variant="brand" onClick={() => setConfirmOpen(true)} disabled={applying}>
+            <Button variant="brand" onClick={() => setConfirmOpen(true)} disabled={applying || (!scan.profile_preview || !scan.profile_confirmation)}>
               <ArrowDownToLine />
               {t('migrate.action.apply')}
             </Button>

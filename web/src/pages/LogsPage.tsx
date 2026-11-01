@@ -1,3 +1,4 @@
+import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useRef, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useUrlState } from '@/lib/use-url-state';
@@ -60,6 +61,11 @@ type Tab = (typeof TABS)[number];
 
 export function LogsPage() {
   const intl = useIntl();
+  const fetchAgents = useAgentsStore((s) => s.fetchAgents);
+  const connectionState = useConnectionStore((s) => s.state);
+  useEffect(() => {
+    if (connectionState === 'authenticated') void fetchAgents();
+  }, [connectionState, fetchAgents]);
   // P11 (state-as-URL): which log view you are on is a link, not a mode you
   // have to re-pick after every refresh.
   const [tab, setTab] = useUrlState('tab', 'history', { allowed: TABS });
@@ -325,6 +331,7 @@ function AuditRow({
   readonly onToggle: () => void;
 }) {
   const intl = useIntl();
+  const agentName = useAgentsStore((s) => s.agents.find((a) => a.name === event.agent_id)?.display_name || event.agent_id);
   const time = (() => {
     try {
       return new Date(event.timestamp).toLocaleString('zh-TW', {
@@ -367,15 +374,15 @@ function AuditRow({
         <span className="font-mono text-xs text-muted-foreground">{event.event_type}</span>
         {event.agent_id && (
           <span className="flex items-center gap-1 text-xs font-medium text-brand">
-            <ActorAvatar actorType="agent" name={event.agent_id} size="xs" />
-            {event.agent_id}
+            <ActorAvatar actorType="agent" name={agentName} size="xs" />
+            {agentName}
           </span>
         )}
         <span className="ml-auto font-mono text-xs text-muted-foreground">{time}</span>
       </div>
 
       {event.summary && (
-        <p className="mt-2 whitespace-normal break-words text-sm text-foreground">{event.summary}</p>
+        <p className="mt-2 whitespace-normal break-words text-sm text-foreground">{auditEventSummary(event, intl.formatMessage, agentName)}</p>
       )}
 
       {expanded && event.details && Object.keys(event.details).length > 0 && (
@@ -408,18 +415,17 @@ function RealtimeTab() {
     () => selectFilteredEntries({ entries, filter: { ...filter, agentId: null } }),
     [entries, filter],
   );
-  const { fetchAgents } = useAgentsStore();
+  const agents = useAgentsStore((s) => s.agents);
   const connectionState = useConnectionStore((s) => s.state);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
-    fetchAgents();
     subscribe();
     return () => {
       unsubscribe();
     };
-  }, [connectionState, fetchAgents, subscribe, unsubscribe]);
+  }, [connectionState, subscribe, unsubscribe]);
 
   // Auto-scroll to bottom when new entries arrive (unless paused)
   useEffect(() => {
@@ -508,10 +514,10 @@ function RealtimeTab() {
                   {entry.level}
                 </span>
 
-                {/* Agent ID — always shown */}
+                {/* Resolve the label while retaining the id in the log entry. */}
                 {entry.agent_id ? (
                   <span className="shrink-0 rounded bg-amber-900/30 px-1.5 py-0.5 text-amber-400">
-                    {entry.agent_id}
+                    {agents.find((a) => a.name === entry.agent_id)?.display_name || entry.agent_id}
                   </span>
                 ) : (
                   <span className="shrink-0 rounded bg-stone-800 px-1.5 py-0.5 text-stone-500">

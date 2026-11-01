@@ -135,6 +135,9 @@ pub(crate) async fn insert_google_start(
     let (url, state, google) = started.into_response_parts();
     let mut map = pending.write().await;
     home_lifecycle::validate_google_home_pending(home, &google)?;
+    let mut diagnostics = setup_read(home);
+    diagnostics["error_code"] = serde_json::Value::Null;
+    setup_write(home, &diagnostics).map_err(|_| home_store::Error::Io)?;
     cleanup_pending(&mut map);
     map.retain(|_, entry| !entry.is_google());
     map.insert(
@@ -145,6 +148,16 @@ pub(crate) async fn insert_google_start(
     );
     Ok((url, state))
 }
+#[derive(Debug)]
+pub(crate) enum CallbackFailure {
+    Unknown,
+    Google(&'static str),
+}
+impl CallbackFailure {
+    pub(crate) fn google_code(&self) -> Option<&'static str> {
+        match self { Self::Google(code) => Some(code), Self::Unknown => None }
+    }
+}
 /// One identifiable RAM state is consumed even for provider rejection/missing
 /// code. Query scope/error_description are never token evidence or output.
 pub(crate) async fn complete_callback_query(
@@ -152,13 +165,14 @@ pub(crate) async fn complete_callback_query(
     pending: &tokio::sync::RwLock<HashMap<String, PendingOAuth>>,
     query: &str,
     actor_is_live_admin: impl Fn(&str) -> bool + Send + Sync,
-) -> Result<String, ()> {
+) -> Result<String, CallbackFailure> {
     // Unknown descriptions/scopes are never decoded or echoed. Even an
     // oversized rejection can consume its one unambiguous bounded state;
     // oversize/malformed code cannot become a provider request.
     let mut states = Vec::new();
     let mut code = None;
     let mut failed = query.len() > 16 * 1024;
+    let mut provider_error = "other";
     fn decoded(value: &str) -> String {
         let field = zeroize::Zeroizing::new(format!("v={value}"));
         url::form_urlencoded::parse(field.as_bytes())
@@ -175,7 +189,7 @@ pub(crate) async fn complete_callback_query(
         match key.as_str() {
             "state" => {
                 if raw_value.len() > 384 || states.len() >= 128 {
-                    return Err(());
+                    return Err(CallbackFailure::Unknown);
                 }
                 states.push(decoded(raw_value));
             }
@@ -186,34 +200,42 @@ pub(crate) async fn complete_callback_query(
                     code = Some(zeroize::Zeroizing::new(decoded(raw_value)));
                 }
             }
-            "error" => failed = true,
+            "error" => {
+                failed = true;
+                if raw_value.len() <= 128 { provider_error = google_callback_error(&decoded(raw_value)); }
+            },
             _ => {}
         }
     }
     if states.is_empty() || states.iter().any(|s| s != &states[0]) {
-        return Err(());
+        return Err(CallbackFailure::Unknown);
     }
     if states.len() != 1 {
         failed = true;
     }
     let state = &states[0];
     if state.is_empty() || state.len() > 128 || state.chars().any(char::is_control) {
-        return Err(());
+        return Err(CallbackFailure::Unknown);
     }
     let entry = {
         let mut map = pending.write().await;
         cleanup_pending(&mut map);
         map.remove(state)
     }
-    .ok_or(())?;
-    if failed {
-        return Err(());
+    .ok_or(CallbackFailure::Unknown)?;
+    if let PendingOAuthFlow::Google(google) = &entry.flow {
+        if !actor_is_live_admin(google.consent_actor()) { return Err(CallbackFailure::Unknown); }
+        if failed || code.as_ref().is_none_or(|c| c.is_empty()) {
+            record_google_callback(home, Some(provider_error)).map_err(|_| CallbackFailure::Unknown)?;
+            return Err(CallbackFailure::Google(provider_error));
+        }
     }
-    let code = code.filter(|c| !c.is_empty()).ok_or(())?;
+    if failed { return Err(CallbackFailure::Unknown); }
+    let code = code.filter(|c| !c.is_empty()).ok_or(CallbackFailure::Unknown)?;
     match entry.flow {
         PendingOAuthFlow::Google(google) => {
             if !actor_is_live_admin(google.consent_actor()) {
-                return Err(());
+                return Err(CallbackFailure::Unknown);
             }
             home_lifecycle::complete_google_home_authorization_with_admin_check(
                 home,
@@ -223,7 +245,11 @@ pub(crate) async fn complete_callback_query(
                 &actor_is_live_admin,
             )
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                let _ = record_google_callback(home, Some("other"));
+                CallbackFailure::Google("other")
+            })?;
+            record_google_callback(home, None).map_err(|_| CallbackFailure::Unknown)?;
             Ok("google".into())
         }
         PendingOAuthFlow::Other {
@@ -231,10 +257,90 @@ pub(crate) async fn complete_callback_query(
         } => {
             exchange_and_store(home, &config, &code, &verifier)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| CallbackFailure::Unknown)?;
             Ok(config.provider_id)
         }
     }
+}
+
+/// Setup diagnostics contain only closed codes and timestamps, never provider
+/// text or credentials. A token-file digest binds refresh failure to that row.
+pub(crate) fn google_token_stamp(home: &Path) -> String {
+    use std::io::Read;
+    let row = (|| {
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        std::fs::File::open(home.join(TOKEN_FILE)).ok()?.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 4 * 1024 * 1024 { return None; }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let mut rows = value.as_array()?.iter().filter(|r| r["provider_id"] == "google");
+        let row = rows.next()?.clone();
+        if rows.next().is_some() { return None; }
+        Some(row)
+    })();
+    row.and_then(|row| serde_json::to_vec(&serde_json::json!({
+        "access_token":row["access_token"],"refresh_token":row["refresh_token"],
+        "expires_at":row["expires_at"],"scopes":row["scopes"]
+    })).ok()).map(|b| format!("{:x}", Sha256::digest(b))).unwrap_or_default()
+}
+fn setup_read(home: &Path) -> serde_json::Value {
+    use std::io::Read;
+    let value = (|| {
+        let mut bytes = Vec::new();
+        std::fs::File::open(home.join("google-setup-status.json")).ok()?.take(16 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 16 * 1024 { return None; }
+        serde_json::from_slice::<serde_json::Value>(&bytes).ok().filter(serde_json::Value::is_object)
+    })();
+    value.unwrap_or_else(|| serde_json::json!({}))
+}
+fn setup_write(home: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = home.join(format!(".google-setup-{}.json", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    let result = (|| {
+        let mut file = options.open(&path)?;
+        file.write_all(&serde_json::to_vec(value)?)?;
+        file.sync_all()?;
+        std::fs::rename(&path, home.join("google-setup-status.json"))
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(path); }
+    result
+}
+pub(crate) fn google_callback_error(code: &str) -> &'static str {
+    match code {
+        "access_denied" => "access_denied",
+        "admin_policy_enforced" => "admin_policy_enforced",
+        "invalid_scope" => "invalid_scope",
+        _ => "other",
+    }
+}
+fn record_google_callback(home: &Path, error: Option<&str>) -> std::io::Result<()> {
+    let mut value = setup_read(home);
+    value["error_code"] = error.map(|e| serde_json::json!(google_callback_error(e))).unwrap_or(serde_json::Value::Null);
+    if error.is_none() {
+        value["connected_at"] = serde_json::json!(chrono::Utc::now());
+        value["reconnect_stamp"] = serde_json::Value::Null;
+    }
+    setup_write(home, &value)
+}
+pub(crate) fn record_google_invalid_grant(home: &Path, original_stamp: &str) -> std::io::Result<()> {
+    let mut value = setup_read(home);
+    value["reconnect_stamp"] = serde_json::json!(original_stamp);
+    setup_write(home, &value)
+}
+pub(crate) fn google_setup_status(home: &Path) -> serde_json::Value {
+    let value = setup_read(home);
+    let config: toml::Table = std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|s| s.parse().ok()).unwrap_or_default();
+    let testing = config.get("integrations").and_then(toml::Value::as_table)
+        .and_then(|t| t.get("google_oauth_testing")).and_then(toml::Value::as_bool).unwrap_or(false);
+    let connected_at = value["connected_at"].as_str().and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok());
+    let warning = testing && connected_at.is_some_and(|t| chrono::Utc::now().signed_duration_since(t).num_days() >= 6);
+    let reconnect = value["reconnect_stamp"].as_str().is_some_and(|s| !s.is_empty() && s == google_token_stamp(home));
+    serde_json::json!({"needs_reconnect":reconnect,"error_code":value["error_code"].as_str().map(google_callback_error),
+        "testing":testing,"testing_warning":warning,"connected_at":value["connected_at"]})
 }
 
 pub const TOKEN_FILE: &str = "mcp-oauth-tokens.json";
@@ -1203,5 +1309,58 @@ mod saved_credential_display_tests {
         assert!(stored.refresh_token.is_some());
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod google_setup_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn google_diagnostics_keep_closed_codes_and_expiry_warning() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[integrations]\ngoogle_oauth_testing=true\n").unwrap();
+        std::fs::write(home.path().join(TOKEN_FILE), r#"[{"provider_id":"google","access_token":"old-access"}]"#).unwrap();
+        record_google_callback(home.path(), None).unwrap();
+        assert_eq!(google_setup_status(home.path())["testing_warning"], false);
+        let mut value = setup_read(home.path());
+        value["connected_at"] = serde_json::json!(chrono::Utc::now() - chrono::Duration::days(6));
+        setup_write(home.path(), &value).unwrap();
+        assert_eq!(google_setup_status(home.path())["testing_warning"], true);
+        record_google_invalid_grant(home.path(), &google_token_stamp(home.path())).unwrap();
+        assert_eq!(google_setup_status(home.path())["needs_reconnect"], true);
+        std::fs::write(home.path().join(TOKEN_FILE), r#"[{"provider_id":"github","access_token":"changed-other"},{"provider_id":"google","access_token":"old-access"}]"#).unwrap();
+        assert_eq!(google_setup_status(home.path())["needs_reconnect"], true);
+        std::fs::write(home.path().join(TOKEN_FILE), r#"[{"provider_id":"google","access_token":"new-access"}]"#).unwrap();
+        assert_eq!(google_setup_status(home.path())["needs_reconnect"], false);
+        for (input, expected) in [("access_denied", "access_denied"), ("admin_policy_enforced", "admin_policy_enforced"), ("invalid_scope", "invalid_scope"), ("<script>private-token</script>", "other")] {
+            record_google_callback(home.path(), Some(input)).unwrap();
+            assert_eq!(google_setup_status(home.path())["error_code"], expected);
+            assert!(!std::fs::read_to_string(home.path().join("google-setup-status.json")).unwrap().contains("private-token"));
+        }
+    }
+
+    #[test]
+    fn google_setup_diagnostics_ignore_malformed_nonobject_storage() {
+        let home = tempfile::tempdir().unwrap();
+        for raw in ["null", "[]", "broken"] {
+            std::fs::write(home.path().join("google-setup-status.json"), raw).unwrap();
+            record_google_callback(home.path(), Some("access_denied")).unwrap();
+            assert_eq!(google_setup_status(home.path())["error_code"], "access_denied");
+        }
+    }
+
+    #[tokio::test]
+    async fn google_rejected_callback_surfaces_code_without_description() {
+        let home = tempfile::tempdir().unwrap();
+        let input = home_lifecycle::GoogleHomeStartInput::new(Some("client-fixture"), Some("secret-fixture"), "test-admin").unwrap();
+        let plan = home_lifecycle::capture_google_home_start(home.path(), input).unwrap();
+        let started = home_lifecycle::begin_google_home_authorization(home.path(), plan).await.unwrap();
+        let pending = tokio::sync::RwLock::new(HashMap::new());
+        let (_, state) = insert_google_start(home.path(), started, &pending).await.unwrap();
+        let query = format!("state={state}&error=access_denied&error_description=%3Cscript%3Eprivate-token%3C/script%3E");
+        assert!(complete_callback_query(home.path(), &pending, &query, |_| true).await.is_err());
+        assert_eq!(google_setup_status(home.path())["error_code"], "access_denied");
+        assert!(pending.read().await.is_empty());
+        assert!(!std::fs::read_to_string(home.path().join("google-setup-status.json")).unwrap().contains("private-token"));
     }
 }

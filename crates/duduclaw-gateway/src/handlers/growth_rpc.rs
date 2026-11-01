@@ -133,10 +133,50 @@ impl MethodHandler {
         pending.saturating_add(blocked).saturating_add(incidents)
     }
 
-    /// `growth.snapshot` — company XP/level + the achievement wall (progress,
-    /// availability, unlock timestamps). Login-readable; the judging engine is
-    /// pure and every scored value is a real fact.
-    pub(crate) async fn handle_growth_snapshot(&self) -> WsFrame {
+    /// Reduced reads use the last Manager-persisted XP, never gather company
+    /// facts or settle inbox / achievement snapshots. A fresh install has zero
+    /// recorded XP; corrupt/unreadable stores refuse.
+    fn reduced_growth_snapshot(&self) -> Result<Value, String> {
+        use rusqlite::OptionalExtension;
+        let path = self.home_dir.join("growth.db");
+        let xp = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return Err("growth snapshot unavailable".into()),
+            Ok(_) => {
+                let db = crate::review_evidence::audience::readonly_db(&path)?;
+                db.query_row("SELECT xp FROM xp_snapshots ORDER BY id DESC LIMIT 1", [], |row| row.get::<_, u64>(0))
+                    .optional().map_err(|_| "growth snapshot unavailable")?.unwrap_or(0)
+            }
+        };
+        let level = crate::growth::level_from_xp(xp);
+        let floor = crate::growth::xp_threshold_for_level(level);
+        Ok(json!({
+            "xp": xp,
+            "level": level,
+            "xp_into_level": xp.saturating_sub(floor),
+            "xp_for_next_level": crate::growth::xp_threshold_for_level(level + 1).saturating_sub(floor),
+        }))
+    }
+
+    /// Managers receive company facts and persist growth; other authenticated
+    /// humans receive only the saved level / XP summary.
+    pub(crate) async fn handle_growth_snapshot(&self, ctx: &UserContext) -> WsFrame {
+        let live = match self.bound_history_live(ctx) {
+            Ok(live) => live,
+            Err(_) => return WsFrame::error_response("", "permission denied"),
+        };
+        if !live.role.at_least(UserRole::Manager) {
+            let summary = match self.reduced_growth_snapshot() {
+                Ok(summary) => summary,
+                Err(_) => return WsFrame::error_response("", "growth snapshot unavailable"),
+            };
+            if self.bound_history_live(&live).is_err() {
+                return WsFrame::error_response("", "permission denied");
+            }
+            return WsFrame::ok_response("", summary);
+        }
+        let may_manage = || self.bound_history_live(&live)
+            .is_ok_and(|current| current.role.at_least(UserRole::Manager));
         let store = match crate::growth::GrowthStore::open(&self.home_dir) {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", &format!("open growth store: {e}")),
@@ -147,6 +187,9 @@ impl MethodHandler {
         let now = chrono::Utc::now();
         let today = now.format("%Y-%m-%d").to_string();
         let actionable = self.count_actionable_inbox().await;
+        if !may_manage() {
+            return WsFrame::error_response("", "permission denied");
+        }
         let _ = store
             .record_inbox_snapshot(&today, actionable as i64, &now.to_rfc3339())
             .await;
@@ -154,6 +197,9 @@ impl MethodHandler {
 
         let mut facts = self.gather_growth_facts().await;
         facts.inbox_zero_streak_days = inbox_streak;
+        if !may_manage() {
+            return WsFrame::error_response("", "permission denied");
+        }
         let (snap, unlock_times) = match crate::growth::snapshot_with_store(&store, &facts).await {
             Ok(v) => v,
             Err(e) => return WsFrame::error_response("", &format!("growth snapshot: {e}")),
@@ -174,6 +220,9 @@ impl MethodHandler {
                 })
             })
             .collect();
+        if !may_manage() {
+            return WsFrame::error_response("", "permission denied");
+        }
         WsFrame::ok_response(
             "",
             json!({
@@ -311,5 +360,68 @@ impl MethodHandler {
         }
 
         WsFrame::ok_response("", payload)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_authorization_tests {
+    use super::*;
+
+    fn payload(frame: WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(value), .. } => value,
+            other => panic!("expected success: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn employee_snapshot_is_reduced_read_only_and_uses_live_role() {
+        let home = tempfile::tempdir().unwrap();
+        let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
+        let user = db.create_user("growth@test.invalid", "Reader", "test-password", UserRole::Employee).unwrap();
+        let employee = db.live_user_context(&user.id).unwrap().unwrap();
+        let handler = MethodHandler::new(home.path().into()).await;
+        handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
+        handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+
+        let reduced = payload(handler.handle("growth.snapshot", json!({}), &employee).await);
+        assert_eq!(reduced.as_object().unwrap().len(), 4);
+        assert_eq!(reduced["level"], 0);
+        assert!(!home.path().join("growth.db").exists());
+        assert!(!home.path().join("custom_skills.db").exists());
+
+        // Manager path still exposes details and records the company inbox.
+        db.update_user(&user.id, None, Some(UserRole::Manager), None).unwrap();
+        let manager = db.live_user_context(&user.id).unwrap().unwrap();
+        let full = payload(handler.handle("growth.snapshot", json!({}), &manager).await);
+        assert!(full["facts"].is_object());
+        assert!(full["achievements"].is_array());
+        let store = crate::growth::GrowthStore::open(home.path()).unwrap();
+        assert_eq!(store.inbox_snapshots().await.unwrap().len(), 1);
+        store.save_snapshot(450, 2, "{}", "2026-10-31T00:00:00Z").await.unwrap();
+        let counts = || {
+            let conn = crate::review_evidence::audience::readonly_db(&home.path().join("growth.db")).unwrap();
+            ["inbox_daily_snapshot", "xp_snapshots", "achievement_unlocks"].map(|table| {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).unwrap()
+            })
+        };
+        let before = counts();
+        // A stale Manager context must take the reduced lane immediately.
+        db.update_user(&user.id, None, Some(UserRole::Employee), None).unwrap();
+        for _ in 0..2 {
+            let reduced = payload(handler.handle("growth.snapshot", json!({}), &manager).await);
+            assert_eq!(reduced, json!({"xp":450,"level":2,"xp_into_level":50,"xp_for_next_level":500}));
+        }
+        assert_eq!(before, counts());
+        db.set_user_status(&user.id, duduclaw_auth::UserStatus::Suspended).unwrap();
+        assert!(matches!(handler.handle("growth.snapshot", json!({}), &manager).await, WsFrame::Response { ok: false, .. }));
+    }
+
+    #[tokio::test]
+    async fn reduced_snapshot_refuses_corrupt_growth_store() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().into()).await;
+        std::fs::write(home.path().join("growth.db"), "not a database").unwrap();
+        assert!(handler.reduced_growth_snapshot().is_err());
     }
 }

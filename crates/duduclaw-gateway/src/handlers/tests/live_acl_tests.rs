@@ -584,3 +584,110 @@ async fn live_acl_latency_with_two_concurrent_logins() {
     rpc_latency_under_logins("inline", n).await;
     assert!(p95 < std::time::Duration::from_millis(250), "p95 {p95:?} with logins on the blocking pool");
 }
+
+#[tokio::test]
+async fn employee_lists_only_bound_agents_and_binding_defaults_to_operator() {
+    let f = fixture().await;
+    let admin = handshake_ctx(&person(&f.db, "admin", UserRole::Admin), UserRole::Admin, &[]);
+    let emp = person(&f.db, "emp", UserRole::Employee);
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    ok_payload(&f.handler.handle("users.bind_agent", json!({"user_id": emp, "agent_name": "sales"}), &admin).await);
+    assert_eq!(f.db.check_agent_access(&emp, "sales").unwrap(), Some(AccessLevel::Operator));
+    assert_eq!(listed_agents(&f.handler.handle("agents.list", json!({}), &ctx).await), vec!["sales"]);
+    assert!(matches!(f.handler.handle("users.bind_agent", json!({"user_id": emp, "agent_name": ""}), &admin).await,
+        WsFrame::Response { ok: false, .. }));
+    assert_eq!(f.db.get_user_agents(&emp).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn company_aggregates_and_expensive_actions_refuse_employees() {
+    let f = fixture().await;
+    let emp = person(&f.db, "emp", UserRole::Employee);
+    // Even Owner bindings do not grant a company-wide role.
+    f.db.bind_agent(&emp, "sales", AccessLevel::Owner).unwrap();
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    for method in ["billing.usage", "growth.daily_report", "widgets.custom.generate", "models.refresh"] {
+        assert_eq!(error_of(&f.handler.handle(method, json!({}), &ctx).await), json!("permission denied"), "{method}");
+    }
+}
+
+#[tokio::test]
+async fn managers_monitor_live_team_grants_without_content_or_write_access() {
+    let f = fixture().await;
+    let manager = person(&f.db, "mgr", UserRole::Manager);
+    let report = person(&f.db, "report", UserRole::Employee);
+    f.db.set_manager(&report, Some(&manager)).unwrap();
+    f.db.bind_agent(&report, "sales", AccessLevel::Owner).unwrap();
+    f.db.bind_agent(&report, "hr", AccessLevel::Viewer).unwrap();
+    let ctx = handshake_ctx(&manager, UserRole::Manager, &[]);
+    f.handler.set_task_store(Arc::new(TaskStore::open(f.home.path()).unwrap())).await;
+    let sessions = crate::session::SessionManager::new(&f.home.path().join("sessions.db")).unwrap();
+    let private_session = "telegram:private-contact-123";
+    sessions.get_or_create(private_session, "sales").await.unwrap();
+    sessions.append_message(private_session, "user", "PRIVATE PROMPT", 1).await.unwrap();
+    sessions.append_message(private_session, "assistant", "PRIVATE ANSWER", 1).await.unwrap();
+
+    // agents.list remains direct-only; callable grants are capped at Operator.
+    assert!(listed_agents(&f.handler.handle("agents.list", json!({}), &ctx).await).is_empty());
+    let live = resolve_live_context(&f.db, &LiveContextCache::default(), &ctx).unwrap();
+    assert_eq!(live.team_access["sales"].level, AccessLevel::Operator);
+    assert!(!live.has_agent_access("sales", AccessLevel::Viewer));
+    for agent in ["sales", "hr"] {
+        ok_payload(&f.handler.handle("timeline.list", json!({"agent_id": agent}), &ctx).await);
+        ok_payload(&f.handler.handle("runs.list", json!({"agent_id": agent}), &ctx).await);
+    }
+    let runs = ok_payload(&f.handler.handle("runs.list", json!({"agent_id": "sales"}), &ctx).await);
+    let run = &runs["runs"][0];
+    assert_eq!(run["read_only"], true);
+    let serialized = runs.to_string();
+    for secret in [private_session, "PRIVATE PROMPT", "PRIVATE ANSWER"] {
+        assert!(!serialized.contains(secret), "{serialized}");
+    }
+    let detail = ok_payload(&f.handler.handle("runs.get", json!({"run_id": run["id"]}), &ctx).await);
+    assert_eq!(detail["events"], json!([]));
+    assert_eq!(detail["read_only"], true);
+    for (method, params) in [
+        ("agents.pause", json!({"agent_id": "sales"})),
+        ("agents.update", json!({"agent_id": "sales", "display_name": "changed"})),
+        ("memory.search", json!({"agent_id": "sales", "query": "secret"})),
+        ("decisions.dismiss", json!({"agent_id": "sales", "decision_id": "x"})),
+        ("activity.list", json!({"agent_id": "sales"})),
+    ] {
+        assert!(matches!(f.handler.handle(method, params, &ctx).await, WsFrame::Response { ok: false, .. }), "{method}");
+    }
+    assert!(matches!(f.handler.handle("runs.list", json!({"agent_id": "finance"}), &ctx).await, WsFrame::Response { ok: false, .. }));
+    assert!(matches!(f.handler.handle("timeline.list", json!({}), &ctx).await, WsFrame::Response { ok: false, .. }));
+    f.db.unbind_agent(&report, "sales").unwrap();
+    for method in ["runs.list", "timeline.list"] {
+        assert!(matches!(f.handler.handle(method, json!({"agent_id": "sales"}), &ctx).await, WsFrame::Response { ok: false, .. }), "{method}");
+    }
+    assert!(matches!(f.handler.handle("runs.get", json!({"run_id": run["id"]}), &ctx).await, WsFrame::Response { ok: false, .. }));
+}
+
+#[tokio::test]
+async fn preset_change_reaches_cached_connection_without_generation_change() {
+    let f = fixture().await;
+    let emp = person(&f.db, "preset-reader", UserRole::Employee);
+    f.db.bind_agent(&emp, "sales", AccessLevel::Owner).unwrap();
+    f.db.bind_agent(&emp, "hr", AccessLevel::Owner).unwrap();
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[("sales", AccessLevel::Owner), ("hr", AccessLevel::Owner)]);
+    let params = json!({"agent_id":"sales"});
+    ok_payload(&f.handler.handle("agents.inspect", params.clone(), &ctx).await);
+    assert!(f.handler.live_context(&ctx).await.unwrap().agent_access.contains_key("sales"));
+    let generation = f.db.acl_generation().unwrap();
+    duduclaw_core::preset::install_system_operator_preset(f.home.path(), false).unwrap();
+    duduclaw_core::preset::bind(f.home.path(), "sales", &f.home.path().join("agents/sales"),
+        "system-operator", "test", "test").unwrap();
+    assert_eq!(f.db.acl_generation().unwrap(), generation);
+    let live = f.handler.live_context(&ctx).await.unwrap();
+    assert!(!live.agent_access.contains_key("sales"));
+    assert!(live.agent_access.contains_key("hr"));
+    assert_eq!(error_of(&f.handler.handle("agents.inspect", params.clone(), &ctx).await), json!("permission denied"));
+    ok_payload(&f.handler.handle("agents.inspect", json!({"agent_id":"hr"}), &ctx).await);
+    ok_payload(&f.handler.handle("agents.inspect", params, &UserContext::admin_fallback()).await);
+    // The cache retains raw authority, so unbinding the preset restores the
+    // existing grant at the same generation, without touching users.db.
+    std::fs::write(duduclaw_core::preset::bindings_path(f.home.path()), "schema = 1\n").unwrap();
+    assert!(f.handler.live_context(&ctx).await.unwrap().agent_access.contains_key("sales"));
+    assert_eq!(f.db.acl_generation().unwrap(), generation);
+}

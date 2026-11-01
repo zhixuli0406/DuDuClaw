@@ -422,3 +422,98 @@ async fn acl_conflicts_and_disabled_switch() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn old_own_collection_acl_is_dynamically_hidden_and_restored() {
+    use crate::knowledge::test_fixtures::{agent, collection};
+    use duduclaw_core::preset;
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    crate::team_edition::record(h, duduclaw_core::EditionProfile::Enterprise);
+    agent(h, "sales", "[agent]\nname='sales'\n[knowledge]\ncollections=['own-sales']\n");
+    let viewer = ctx("viewer", UserRole::Employee);
+    let admin = ctx("admin", UserRole::Admin);
+    let (cid, source, chunk) = collection(h, "own-sales", "internal",
+        &[(PrincipalKind::User, "viewer", Role::Owner), (PrincipalKind::Agent, "sales", Role::Viewer)], "特休假七日。");
+    let conn = schema::open_home(h).unwrap();
+    conn.execute("INSERT INTO agent_own_collections (agent_id, collection_id, created_by, created_at) VALUES ('sales', ?1, 'admin', 't')", [&cid]).unwrap();
+    let acl_before = acl::get_acl(&conn, &cid).unwrap();
+    let employee = crate::knowledge::principals::AgentRef {
+        id: "sales".into(), display_name: "Sales".into(), department: None,
+    };
+    for restricted in [false, true, false] {
+        if restricted {
+            preset::install_system_operator_preset(h, false).unwrap();
+            preset::bind(h, "sales", &h.join("agents/sales"), "system-operator", "test", "test").unwrap();
+        } else {
+            preset::unbind(h, "sales", "test", "test").unwrap();
+        }
+        for who in [&viewer, &admin] {
+            let visible = !restricted || who.is_admin();
+            let list = call(h, who, "knowledge.collections.list", json!({})).await.unwrap();
+            assert_eq!(!list["collections"].as_array().unwrap().is_empty(), visible);
+            assert_eq!(call(h, who, "knowledge.collections.get", json!({"id":cid})).await.is_ok(), visible);
+            let found = call(h, who, "knowledge.search", json!({"query":"特休假"})).await.unwrap();
+            assert_eq!(!found["hits"].as_array().unwrap().is_empty(), visible);
+            assert_eq!(call(h, who, "knowledge.sources.list", json!({"collection_id":cid})).await.is_ok(), visible);
+            assert_eq!(call(h, who, "knowledge.sources.get", json!({"source_id":source})).await.is_ok(), visible);
+            assert_eq!(call(h, who, "knowledge.passage.get", json!({"chunk_id":chunk})).await.is_ok(), visible);
+            assert_eq!(call(h, who, "knowledge.acl.get", json!({"collection_id":cid})).await.is_ok(), visible);
+            let metadata = crate::knowledge::agent_binding::describe(h, &employee, &h.join("agents/sales"), who.is_admin()).unwrap();
+            assert_eq!(!metadata["granted"].as_array().unwrap().is_empty(), visible);
+            assert_eq!(!metadata["bound"].as_array().unwrap().is_empty(), visible);
+        }
+        assert_eq!(acl::get_acl(&conn, &cid).unwrap(), acl_before);
+    }
+    // A failed own-collection lookup never falls back to the old ACL.
+    conn.execute("DROP TABLE agent_own_collections", []).unwrap();
+    assert!(!super::super::principals::collection_visible(h, &conn, &cid, false));
+}
+
+#[test]
+fn restricted_own_collection_keeps_unattended_internal_reads() {
+    use crate::knowledge::test_fixtures::{agent, collection};
+    use duduclaw_core::preset;
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    agent(h, "sales", "[agent]\nname='sales'\n");
+    agent(h, "ordinary", "[agent]\nname='ordinary'\n");
+    let grants = [
+        (PrincipalKind::User, "viewer", Role::Owner),
+        (PrincipalKind::Agent, "sales", Role::Viewer),
+        (PrincipalKind::Agent, "ordinary", Role::Viewer),
+    ];
+    let (cid, _, _) = collection(h, "own-sales", "internal",
+        &grants, "Internal knowledge.");
+    let (ordinary_cid, _, _) = collection(h, "own-ordinary", "internal",
+        &grants, "Ordinary knowledge.");
+    let conn = schema::open_home(h).unwrap();
+    conn.execute("INSERT INTO agent_own_collections (agent_id, collection_id, created_by, created_at) VALUES ('sales', ?1, 'admin', 't')", [&cid]).unwrap();
+    conn.execute("INSERT INTO agent_own_collections (agent_id, collection_id, created_by, created_at) VALUES ('ordinary', ?1, 'admin', 't')", [&ordinary_cid]).unwrap();
+    preset::install_system_operator_preset(h, false).unwrap();
+    preset::bind(h, "sales", &h.join("agents/sales"), "system-operator", "test", "test").unwrap();
+    let employee = acl::AgentCtx { agent_id: "sales".into(), department: None, narrowing: acl::AgentNarrowing::All };
+    let other = acl::AgentCtx { agent_id: "ordinary".into(), department: None, narrowing: acl::AgentNarrowing::All };
+    let full = acl::HumanCtx::dashboard("viewer", None, false);
+    let internal = acl::HumanCtx { mode: acl::HumanMode::InternalOnly, ..acl::HumanCtx::nobody() };
+    for (human, requesting_agent, keeps) in [
+        (&internal, Some(&employee), true),
+        (&internal, Some(&other), false),
+        (&internal, None, false),
+        (&full, Some(&employee), false),
+        (&full, Some(&other), false),
+        (&full, None, false),
+    ] {
+        let allowed = acl::effective_collections(&conn, human, requesting_agent, &acl::Narrowing::default()).unwrap();
+        assert!(allowed.contains(&cid));
+        assert!(allowed.contains(&ordinary_cid));
+        let filtered = super::super::principals::effective_collections(h, &conn, human, requesting_agent, &acl::Narrowing::default()).unwrap();
+        assert_eq!(filtered.contains(&cid), keeps);
+        assert!(filtered.contains(&ordinary_cid));
+    }
+    let allowed = acl::effective_collections(&conn, &internal, Some(&employee), &acl::Narrowing::default()).unwrap();
+    conn.execute("DROP TABLE agent_own_collections", []).unwrap();
+    let filtered = super::super::principals::filter_readable(h, &conn, &internal, Some(&employee), &allowed);
+    assert!(!filtered.contains(&cid));
+    assert!(!filtered.contains(&ordinary_cid));
+}

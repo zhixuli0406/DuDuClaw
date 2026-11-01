@@ -95,7 +95,7 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
 
-        let reader = match self.task_list_reader(ctx, agent_id) {
+        let reader = match self.monitoring_reader(ctx, agent_id) {
             Ok(r) => r,
             Err(f) => return f,
         };
@@ -114,11 +114,17 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("timeline activity: {e}")),
         };
         // Task titles are board-card fields; activity text tied to a task the
-        // reader may not read is dropped (task_privacy gate).
+        // reader may not read is dropped (task_privacy gate). The linked
+        // task id is board-card metadata, just as it is in activity.list;
+        // adding navigation must not restore a private summary or metadata.
         let owners = activity_task_owners(&store, &activities).await;
         let activities: Vec<ActivityRow> = activities
             .into_iter()
             .map(|mut a| {
+                if !reader.live().has_agent_access(&a.agent_id, AccessLevel::Viewer) {
+                    a.summary.clear();
+                    a.metadata = None;
+                }
                 if let Some(t) = a.task_id.as_deref().filter(|t| !t.is_empty()) {
                     let readable = reader.can_read_owned(t, owners.get(t).map(String::as_str));
                     if !readable {

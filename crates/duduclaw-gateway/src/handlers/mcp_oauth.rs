@@ -26,7 +26,17 @@ impl MethodHandler {
             .map(|p| {
                 let token = mcp_oauth::get_stored_token(&self.home_dir, &p.provider_id);
                 let stored = mcp_oauth::get_client_config(&self.home_dir, &p.provider_id);
-                Self::oauth_provider_entry(p, token, stored)
+                let mut entry = Self::oauth_provider_entry(p, token, stored);
+                if p.provider_id == "google" {
+                    let diagnostics = mcp_oauth::google_setup_status(&self.home_dir);
+                    if diagnostics["needs_reconnect"] == true {
+                        entry["status"] = json!("needs_reconnect");
+                        entry["token_status"] = json!("needs_reconnect");
+                    }
+                    entry["needs_reconnect"] = diagnostics["needs_reconnect"].clone();
+                    entry["testing_warning"] = diagnostics["testing_warning"].clone();
+                }
+                entry
             })
             .collect();
 

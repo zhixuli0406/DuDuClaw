@@ -29,6 +29,7 @@ pub(crate) fn plain_name(key: &FileKey) -> &'static str {
     match key {
         FileKey::Soul => "人格設定",
         FileKey::Identity => "自我介紹",
+        FileKey::User => "服務對象",
         FileKey::Instructions => "工作規則",
         FileKey::Contract => "行為界線",
         FileKey::AgentToml => "基本設定",

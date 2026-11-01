@@ -32,8 +32,8 @@ impl MethodHandler {
             if !crate::knowledge::enabled(&self.home_dir) {
                 return Some(WsFrame::error_response("", "文件知識庫已由管理員關閉。"));
             }
-            let dir = self.knowledge_directory(users).await;
-            return Some(match self.kb_agent_tab(method, params, ctx, dir).await {
+            let dir = boxed_frame(|| self.knowledge_directory(users)).await;
+            return Some(match boxed_frame(|| self.kb_agent_tab(method, params, ctx, dir)).await {
                 Ok(v) => WsFrame::ok_response("", v),
                 Err(e) => kb_error_frame(method, e),
             });
@@ -42,12 +42,12 @@ impl MethodHandler {
             if !crate::knowledge::enabled(&self.home_dir) {
                 return Some(WsFrame::error_response("", "文件知識庫已由管理員關閉。"));
             }
-            let dir = self.knowledge_directory(users.clone()).await;
-            if let Some(frame) = self.dispatch_kb_registry(method, params, ctx, dir).await {
+            let dir = boxed_frame(|| self.knowledge_directory(users.clone())).await;
+            if let Some(frame) = boxed_frame(|| self.dispatch_kb_registry(method, params, ctx, dir)).await {
                 return Some(frame);
             }
         }
-        let result = crate::knowledge::rpc::handle(&self.home_dir, method, params, ctx, users).await?;
+        let result = boxed_frame(|| crate::knowledge::rpc::handle(&self.home_dir, method, params, ctx, users)).await?;
         Some(match result {
             Ok(v) => WsFrame::ok_response("", v),
             Err(e) => WsFrame::error_response("", &e),
@@ -56,12 +56,12 @@ impl MethodHandler {
 
     /// The grant rules' inputs: edition, accounts, employees, departments.
     async fn knowledge_directory(&self, users: Option<Arc<duduclaw_auth::db::UserDb>>) -> Directory {
-        let personal = self.resolve_edition_profile().await.is_personal();
+        let personal = boxed_frame(|| self.resolve_edition_profile()).await.is_personal();
         let agents: Vec<AgentRef> = {
             let reg = self.registry.read().await;
             reg.list().iter().map(|a| agent_ref(a)).collect()
         };
-        let pairs = self.agent_department_pairs().await;
+        let pairs = boxed_frame(|| self.agent_department_pairs()).await;
         let departments = crate::departments::list_departments(&self.home_dir, &pairs)
             .into_iter()
             .map(|d| d.name)
@@ -89,18 +89,18 @@ impl MethodHandler {
         let c = ctx.clone();
         let result: duduclaw_knowledge::KbResult<Option<Value>> = match method {
             "knowledge.principals.search" => {
-                crate::knowledge::blocking(move || {
+                boxed_frame(|| crate::knowledge::blocking(move || {
                     crate::knowledge::principals::search(&home, &dir, &c, &user, &p).map(Some)
-                })
+                }))
                 .await
             }
             "knowledge.acl.set" => {
-                crate::knowledge::blocking(move || {
+                boxed_frame(|| crate::knowledge::blocking(move || {
                     crate::knowledge::principals::check_new_grants(&home, &dir, &c, &user, &p).map(|_| None)
-                })
+                }))
                 .await
             }
-            "knowledge.agent.collections" => self.kb_agent_collections(params, ctx, &dir).await,
+            "knowledge.agent.collections" => boxed_frame(|| self.kb_agent_collections(params, ctx, &dir)).await,
             // Signed in is enough: these are the route's public limits.
             "knowledge.limits" => Ok(Some(crate::knowledge::upload_limits::describe(&self.home_dir))),
             "knowledge.access_log.denied" => {
@@ -109,9 +109,9 @@ impl MethodHandler {
                 } else {
                     let before = params.get("before_id").and_then(Value::as_i64);
                     let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-                    crate::knowledge::blocking(move || {
+                    boxed_frame(|| crate::knowledge::blocking(move || {
                         crate::knowledge::denied::list(&home, before, limit).map(|rows| Some(json!({ "entries": rows })))
-                    })
+                    }))
                     .await
                 }
             }
@@ -148,9 +148,10 @@ impl MethodHandler {
         }
         .ok_or(duduclaw_knowledge::KbError::PermissionDenied)?;
         let home = self.home_dir.clone();
-        crate::knowledge::blocking(move || {
-            crate::knowledge::agent_binding::describe(&home, &agent, &agent_dir).map(Some)
-        })
+        let is_admin = ctx.is_admin();
+        boxed_frame(|| crate::knowledge::blocking(move || {
+            crate::knowledge::agent_binding::describe(&home, &agent, &agent_dir, is_admin).map(Some)
+        }))
         .await
     }
 

@@ -377,7 +377,38 @@ pub fn escape_html(s: &str) -> String {
 /// Convert inline markdown (`**bold**`, `~~strike~~`, `` `code` ``,
 /// `[text](url)`) in a single line/paragraph to the target dialect.
 /// Code spans are preserved verbatim (with target-appropriate wrapping).
+fn distributor_footer(text: &str, target: InlineTarget, name: &str) -> Option<String> {
+    if name == crate::distributor_brand::ORIGINAL_PRODUCT_NAME
+        || text != format!("— Powered by {}", crate::distributor_brand::escape_channel_name(name))
+    {
+        return None;
+    }
+    let literal = format!("— Powered by {name}");
+    Some(match target {
+        InlineTarget::TelegramHtml => escape_html(&literal),
+        InlineTarget::Plain => literal,
+        // These native dialects have no plain-text parse mode. A code span
+        // preserves punctuation; refuse a name that could terminate the span.
+        InlineTarget::WhatsApp | InlineTarget::GoogleChat => {
+            if name.contains('`') {
+                "— Powered by DuDuClaw".into()
+            } else {
+                format!("```{literal}```")
+            }
+        }
+    })
+}
+
 pub fn convert_inline(text: &str, target: InlineTarget) -> String {
+    // Match the exact host footer for the effective brand. Ordinary model
+    // Markdown, including footer-like text in unbranded builds, stays intact.
+    if text.starts_with("— Powered by ") {
+        if let Some(brand) = crate::distributor_brand::effective() {
+            if let Some(literal) = distributor_footer(text, target, &brand.product_name) {
+                return literal;
+            }
+        }
+    }
     let mut out = String::with_capacity(text.len() + 16);
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -775,6 +806,35 @@ pub fn to_teams_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distributor_footer_is_literal_in_each_platform_renderer() {
+        let name = "A*_[x](target) & @everyone";
+        let escaped = format!("— Powered by {}", crate::distributor_brand::escape_channel_name(name));
+        let plain = format!("— Powered by {name}");
+        assert_eq!(distributor_footer(&escaped, InlineTarget::TelegramHtml, name), Some("— Powered by A*_[x](target) &amp; @everyone".into()));
+        assert_eq!(distributor_footer(&escaped, InlineTarget::Plain, name), Some(plain.clone()));
+        assert_eq!(distributor_footer(&escaped, InlineTarget::WhatsApp, name), Some(format!("```{plain}```")));
+        assert_eq!(distributor_footer(&escaped, InlineTarget::GoogleChat, name), Some(format!("```{plain}```")));
+        let discord = preprocess_discord_markdown(&escaped);
+        assert_eq!(discord, escaped);
+        assert!(discord.contains("@\u{200b}everyone"));
+        assert!(!discord.contains("@everyone"));
+        assert!(!discord.contains("[x](target)"));
+        let dangerous = "A```brand";
+        let footer = format!("— Powered by {}", crate::distributor_brand::escape_channel_name(dangerous));
+        assert_eq!(distributor_footer(&footer, InlineTarget::WhatsApp, dangerous), Some("— Powered by DuDuClaw".into()));
+    }
+
+    #[test]
+    fn default_footer_and_unrelated_markdown_keep_their_existing_bytes() {
+        let default = "— Powered by DuDuClaw";
+        assert_eq!(to_telegram_html(default), default);
+        assert_eq!(to_line_plain(default), default);
+        assert_eq!(preprocess_discord_markdown(default), default);
+        assert!(distributor_footer(default, InlineTarget::Plain, "DuDuClaw").is_none());
+        assert!(distributor_footer("— Powered by Other\\*", InlineTarget::Plain, "Acme").is_none());
+    }
 
     const SAMPLE: &str = "# 標題\n\n這是 **粗體** 與 `code` 和 [連結](https://example.com)。\n\n| 名稱 | 狀態 |\n|------|------|\n| foo | ok |\n| 中文名 | 進行中 |\n\n```rust\nfn main() {}\n```\n\n> 引用文字\n\n- 項目一\n- 項目二";
 

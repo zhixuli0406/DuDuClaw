@@ -139,8 +139,8 @@ fn valid_digest(digest: &str) -> bool {
 
 /// The principal this process was spawned for: `Ok(None)` when the variable
 /// is absent or empty, `Err` when it is present but malformed (the caller
-/// records `on_behalf_of_rejected` and treats it as absent, or denies in
-/// enforce mode).
+/// records `on_behalf_of_rejected` and preserves the rejected state in
+/// provenance carriers, or refuses the operation).
 pub fn host_principal_checked() -> Result<Option<HumanPrincipal>, PrincipalRejection> {
     match std::env::var(ENV_ON_BEHALF_OF) {
         Ok(raw) if !raw.trim().is_empty() => HumanPrincipal::parse(raw.trim()).map(Some),

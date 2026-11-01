@@ -86,6 +86,8 @@ pub enum Request {
         session_id: Option<String>,
         #[serde(default)]
         turn_id: Option<String>,
+        #[serde(default)]
+        egress_turn_id: Option<String>,
         action: ActionRequest,
     },
     Stop {
@@ -247,11 +249,11 @@ async fn handle(
             Request::Screenshot { session_id } if valid_session_id(&session_id) => {
                 sessions.screenshot(&agent_id, session_id.as_deref()).await
             }
-            Request::Action { session_id, turn_id, action }
-                if valid_session_id(&session_id) && valid_turn_id(&turn_id) =>
+            Request::Action { session_id, turn_id, egress_turn_id, action }
+                if valid_session_id(&session_id) && valid_turn_id(&turn_id) && valid_turn_id(&egress_turn_id) =>
             {
                 sessions
-                    .action(&agent_id, session_id.as_deref(), turn_id.as_deref(), &action)
+                    .action_with_egress(&agent_id, session_id.as_deref(), turn_id.as_deref(), egress_turn_id.as_deref().or(turn_id.as_deref()), &action)
                     .await
             }
             Request::Action { session_id, .. } if valid_session_id(&session_id) => {
@@ -292,5 +294,25 @@ async fn handle(
     match outcome {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(&err),
+    }
+}
+
+#[cfg(test)]
+mod egress_identity_tests {
+    use super::*;
+
+    #[test]
+    fn action_execution_turn_is_independent_and_malformed_values_are_rejected() {
+        for execution in ["runtime-execution", "", "bad\nexecution"] {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "op": "action", "turn_id": "provenance",
+                "egress_turn_id": execution,
+                "action": {"type": "type", "text": "hello"},
+            })).unwrap();
+            let Request::Action { turn_id, egress_turn_id, .. } = request else { panic!("action expected"); };
+            assert_eq!(turn_id.as_deref(), Some("provenance"));
+            assert_eq!(valid_turn_id(&egress_turn_id), execution == "runtime-execution");
+            assert_eq!(egress_turn_id.as_deref().or(turn_id.as_deref()), Some(execution));
+        }
     }
 }

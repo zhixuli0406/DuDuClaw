@@ -1,0 +1,348 @@
+//! Content-free, cross-process shadow counts independent of rotating tool logs.
+use std::path::{Path, PathBuf};
+use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
+use serde::Serialize;
+
+const MAX_AGENT_DAY_ROWS: u64 = 10_000;
+const MAX_TOTAL_ROWS: u64 = 1_000_000;
+
+#[derive(Clone, Copy)]
+pub enum Transport { Hook, Mcp }
+impl Transport {
+    fn name(self) -> &'static str { match self { Self::Hook => "hook", Self::Mcp => "mcp" } }
+}
+
+/// Only closed classes reach the database; tool/source arguments never become
+/// free-form source text. Multiple classes count once as `mixed`.
+pub fn source_class(sources: &[String]) -> &'static str {
+    let classes: std::collections::BTreeSet<_> = sources.iter().map(|s| {
+        match s.as_str() {
+            "turn_state_unavailable" => "unknown",
+            "pending_private_read" => "pending",
+            "additional_private_sources" => "mixed",
+            s if s.starts_with("memory_") || s.starts_with("wiki_") || s == "user_profile_get" => "memory",
+            s if s.starts_with("gmail_") || s.starts_with("mail_") => "mail",
+            s if s.starts_with("db_") => "database",
+            s if s.starts_with("drive_") || s.starts_with("docs_") || s.starts_with("sheets_")
+                || s.starts_with("slides_") || s.starts_with("calendar_") || s.starts_with("gtasks_")
+                || s.starts_with("forms_") => "google",
+            s if s.starts_with("computer_") => "computer",
+            s if s.contains('.') => "external_tool",
+            _ => "other",
+        }
+    }).collect();
+    if classes.len() > 1 { "mixed" } else { classes.first().copied().unwrap_or("unknown") }
+}
+
+fn private_files(path: &Path, create: bool) -> Result<(), String> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = PathBuf::from(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        if suffix.is_empty() && create { options.create(true).truncate(false); }
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() { return Err("shadow store is not a regular file".into()); }
+        #[cfg(unix)] {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if meta.nlink() != 1 { return Err("shadow store hard link refused".into()); }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+struct Store(Connection);
+impl Store {
+    fn open(home: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+        // Resolve the trusted home, including macOS /var, while retaining
+        // NOFOLLOW and hard-link checks on the database and its sidecars.
+        let home = std::fs::canonicalize(home).map_err(|e| e.to_string())?;
+        let path = home.join("egress_shadow.db");
+        private_files(&path, true)?;
+        let mut conn = Connection::open_with_flags(&path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+            .map_err(|e| e.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS shadow_events (
+                day TEXT NOT NULL, agent_id TEXT NOT NULL, tool TEXT NOT NULL,
+                kind TEXT NOT NULL, source_class TEXT NOT NULL,
+                call_id TEXT NOT NULL, at INTEGER NOT NULL,
+                transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')), UNIQUE(call_id,kind));
+            CREATE TABLE IF NOT EXISTS shadow_overflow (
+                day TEXT NOT NULL, agent_id TEXT NOT NULL, overflow_count INTEGER NOT NULL,
+                PRIMARY KEY(day,agent_id));
+            CREATE INDEX IF NOT EXISTS shadow_events_at ON shadow_events(at);
+            CREATE TABLE IF NOT EXISTS shadow_maintenance (id INTEGER PRIMARY KEY CHECK(id=1), pruned_at INTEGER NOT NULL);")
+            .map_err(|e| e.to_string())?;
+        // Migrate the historical call-only uniqueness under one write lock.
+        // Both gates may observe one call; each kind is deduplicated separately.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let schema: String = tx.query_row("SELECT sql FROM sqlite_master WHERE name='shadow_events'", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if schema.contains("call_id TEXT NOT NULL UNIQUE") {
+            tx.execute_batch("ALTER TABLE shadow_events RENAME TO shadow_events_legacy;
+                CREATE TABLE shadow_events (
+                    day TEXT NOT NULL, agent_id TEXT NOT NULL, tool TEXT NOT NULL,
+                    kind TEXT NOT NULL, source_class TEXT NOT NULL,
+                    call_id TEXT NOT NULL, at INTEGER NOT NULL,
+                    transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')), UNIQUE(call_id,kind));
+                INSERT INTO shadow_events SELECT * FROM shadow_events_legacy;
+                DROP TABLE shadow_events_legacy;
+                CREATE INDEX shadow_events_at ON shadow_events(at);").map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        private_files(&path, false)?;
+        Ok(Self(conn))
+    }
+
+    fn write(&mut self, agent: &str, tool: &str, kind: &str, class: &str, call: &str, transport: Transport, at: i64) -> Result<bool, String> {
+        if !(kind == "would_ask" || kind == "recipient_would_ask" || kind.starts_with("would_refuse_")) {
+            return Err("invalid shadow event kind".into());
+        }
+        let tx = self.0.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let day: String = tx.query_row("SELECT date(?1,'unixepoch')", [at], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let duplicate: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM shadow_events WHERE call_id=?1 AND kind=?2)", params![call,kind], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let mut inserted = 0;
+        if !duplicate {
+            let agent_rows: u64 = tx.query_row("SELECT COUNT(*) FROM shadow_events WHERE day=?1 AND agent_id=?2", params![day,agent], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if agent_rows >= MAX_AGENT_DAY_ROWS {
+                tx.execute("INSERT INTO shadow_overflow(day,agent_id,overflow_count) VALUES(?1,?2,1)
+                    ON CONFLICT(day,agent_id) DO UPDATE SET overflow_count=overflow_count+1", params![day,agent]).map_err(|e| e.to_string())?;
+            } else {
+                let total_rows: u64 = tx.query_row("SELECT COUNT(*) FROM shadow_events", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if total_rows >= MAX_TOTAL_ROWS {
+                    tx.execute("INSERT INTO shadow_overflow(day,agent_id,overflow_count) VALUES(?1,?2,1)
+                        ON CONFLICT(day,agent_id) DO UPDATE SET overflow_count=overflow_count+1", params![day,agent]).map_err(|e| e.to_string())?;
+                } else {
+                    inserted = tx.execute("INSERT INTO shadow_events(day,agent_id,tool,kind,source_class,call_id,at,transport)
+                        VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![day,agent,tool,kind,class,call,at,transport.name()]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        let prune = tx.execute("INSERT INTO shadow_maintenance VALUES(1,?1)
+            ON CONFLICT(id) DO UPDATE SET pruned_at=excluded.pruned_at WHERE pruned_at <= ?1-3600", [at]).map_err(|e| e.to_string())?;
+        if prune != 0 {
+            tx.execute("DELETE FROM shadow_events WHERE at < ?1-35*86400", [at]).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM shadow_overflow WHERE day < date(?1-35*86400,'unixepoch')", [at]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(inserted != 0)
+    }
+}
+
+/// Best effort only. A failed telemetry write cannot change a gate decision.
+/// Returns true only for the first row, so preflight and dispatch also share
+/// one tool-log row instead of counting the same would-be ticket twice.
+pub fn record(home: &Path, agent: &str, tool: &str, kind: &str, sources: &[String], call_id: &str, transport: Transport) -> bool {
+    match Store::open(home).and_then(|mut s| s.write(agent, tool, kind, source_class(sources), call_id, transport, chrono::Utc::now().timestamp())) {
+        Ok(inserted) => inserted,
+        Err(error) => { tracing::warn!(%error, "egress shadow count unavailable"); false }
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub struct Count { pub key: String, pub count: u64 }
+#[derive(Serialize, Debug)]
+pub struct Report {
+    pub days: u32, pub total: u64, pub ticket_total: u64,
+    pub capped: bool,
+    pub by_employee: Vec<Count>, pub by_tool: Vec<Count>, pub by_source_class: Vec<Count>,
+    pub by_transport: Vec<Count>, pub by_kind: Vec<Count>, pub daily: Vec<Count>,
+}
+
+pub fn report(home: &Path, days: u32) -> Result<Report, String> {
+    report_at(home, days, chrono::Utc::now().timestamp())
+}
+fn report_at(home: &Path, days: u32, now: i64) -> Result<Report, String> {
+    if !matches!(days, 7 | 30) { return Err("days must be 7 or 30".into()); }
+    let mut result = Report { days, total: 0, ticket_total: 0, capped: false, by_employee: vec![], by_tool: vec![],
+        by_source_class: vec![], by_transport: vec![], by_kind: vec![], daily: vec![] };
+    // Include today and the preceding UTC calendar days, zero-filled below.
+    let today = now.div_euclid(86400) * 86400;
+    let start = today - i64::from(days - 1) * 86400;
+    for offset in 0..days {
+        let at = start + i64::from(offset)*86400;
+        let date = chrono::DateTime::from_timestamp(at, 0).ok_or("invalid report time")?.format("%Y-%m-%d").to_string();
+        result.daily.push(Count { key: date, count: 0 });
+    }
+    match std::fs::symlink_metadata(home.join("egress_shadow.db")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => (),
+    }
+    let mut store = Store::open(home)?;
+    let tx = store.0.transaction().map_err(|e| e.to_string())?;
+    result.capped = tx.query_row("SELECT EXISTS(SELECT 1 FROM shadow_overflow WHERE day>=date(?1,'unixepoch') AND day<=date(?2,'unixepoch'))", params![start,now], |r| r.get(0)).map_err(|e| e.to_string())?;
+    (result.total, result.ticket_total) = tx.query_row("SELECT COUNT(*), COUNT(DISTINCT CASE WHEN kind IN ('would_ask','recipient_would_ask') THEN call_id END)
+        FROM shadow_events WHERE at>=?1 AND at<=?2", params![start,now], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
+    for (column, output) in [("agent_id", &mut result.by_employee), ("tool", &mut result.by_tool),
+        ("source_class", &mut result.by_source_class), ("transport", &mut result.by_transport), ("kind", &mut result.by_kind)] {
+        // Columns are a fixed host-owned list, never an RPC input.
+        let mut stmt = tx.prepare(&format!("SELECT {column},COUNT(*) FROM shadow_events WHERE at>=?1 AND at<=?2 GROUP BY {column} ORDER BY COUNT(*) DESC,{column}")).map_err(|e| e.to_string())?;
+        *output = stmt.query_map(params![start,now], |r| Ok(Count { key:r.get(0)?, count:r.get(1)? })).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+    }
+    let mut stmt = tx.prepare("SELECT day,COUNT(*) FROM shadow_events WHERE at>=?1 AND at<=?2 GROUP BY day").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map(params![start,now], |r| Ok(Count { key:r.get(0)?, count:r.get(1)? })).map_err(|e| e.to_string())?;
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        if let Some(day) = result.daily.iter_mut().find(|d| d.key == row.key) { day.count = row.count; }
+    }
+    let overflow = {
+        let mut stmt = tx.prepare("SELECT day,agent_id,overflow_count FROM shadow_overflow WHERE day>=date(?1,'unixepoch') AND day<=date(?2,'unixepoch')")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(params![start,now], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?)))
+            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?
+    };
+    for (date, agent, count) in overflow {
+        result.total += count;
+        if let Some(day) = result.daily.iter_mut().find(|day| day.key == date) { day.count += count; }
+        if let Some(row) = result.by_employee.iter_mut().find(|row| row.key == agent) { row.count += count; }
+        else { result.by_employee.push(Count { key: agent, count }); }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn egress_shadow_keeps_both_gates_for_one_call_and_migrates_legacy_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = Connection::open(home.path().join("egress_shadow.db")).unwrap();
+        conn.execute_batch("CREATE TABLE shadow_events (
+            day TEXT NOT NULL,agent_id TEXT NOT NULL,tool TEXT NOT NULL,kind TEXT NOT NULL,source_class TEXT NOT NULL,
+            call_id TEXT NOT NULL UNIQUE,at INTEGER NOT NULL,transport TEXT NOT NULL CHECK(transport IN ('hook','mcp')));
+            INSERT INTO shadow_events VALUES ('2026-01-01','bot','send_message','would_ask','memory','old',1,'mcp');").unwrap();
+        drop(conn);
+        let migrated = Store::open(home.path()).unwrap();
+        let old: u64 = migrated.0.query_row("SELECT COUNT(*) FROM shadow_events WHERE call_id='old'", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 1);
+        drop(migrated);
+        assert!(record(home.path(), "bot", "send_message", "would_ask", &[], "shared", Transport::Mcp));
+        assert!(record(home.path(), "bot", "send_message", "recipient_would_ask", &[], "shared", Transport::Mcp));
+        assert!(!record(home.path(), "bot", "send_message", "recipient_would_ask", &[], "shared", Transport::Mcp));
+        let report = report(home.path(), 7).unwrap();
+        assert_eq!(report.total, 2);
+        assert_eq!(report.ticket_total, 1);
+        assert_eq!(report.by_kind.len(), 2);
+        assert!(report.by_kind.iter().all(|row| row.count == 1));
+        let conn = Connection::open(home.path().join("egress_shadow.db")).unwrap();
+        let count: u64 = conn.query_row("SELECT COUNT(*) FROM shadow_events WHERE call_id='old'", [], |r| r.get(0)).unwrap();
+        // Old rows may be removed by the normal retention sweep; migration
+        // itself is also checked below before recording triggers that sweep.
+        assert!(count <= 1);
+    }
+
+    #[test]
+    fn writes_create_missing_home_and_failures_remain_best_effort() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("new/home");
+        assert_eq!(report(&home, 7).unwrap().total, 0);
+        assert!(!home.exists());
+        assert!(record(&home, "bot", "send", "would_ask", &["memory_read".into()], "call", Transport::Mcp));
+        assert_eq!(report(&home, 7).unwrap().total, 1);
+        let file = root.path().join("file");
+        std::fs::write(&file, "keep").unwrap();
+        assert!(!record(&file, "bot", "send", "would_ask", &[], "failure", Transport::Mcp));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep");
+    }
+
+    #[test]
+    fn aggregation_counts_calls_and_separates_tickets_from_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Store::open(home.path()).unwrap();
+        for (id,agent,tool,kind,class,transport) in [
+            ("a","bot","send_message","would_ask","memory",Transport::Mcp),
+            ("b","bot","WebFetch","would_ask","google",Transport::Hook),
+            ("c","other","Bash","would_refuse_ledger_unavailable","unknown",Transport::Hook),
+            ("d","other","mail_send","recipient_would_ask","mail",Transport::Mcp),
+        ] { assert!(store.write(agent,tool,kind,class,id,transport,NOW).unwrap()); }
+        let report = report_at(home.path(),7,NOW).unwrap();
+        assert_eq!((report.total,report.ticket_total),(4,3));
+        assert_eq!(report.daily.len(),7);
+        for series in [&report.by_employee,&report.by_tool,&report.by_source_class,&report.by_transport,&report.daily] {
+            assert_eq!(series.iter().map(|v| v.count).sum::<u64>(),4);
+        }
+        assert_eq!(report.by_transport.iter().find(|v| v.key=="hook").unwrap().count,2);
+        assert!(report_at(home.path(),8,NOW).is_err());
+    }
+
+    #[test]
+    fn retention_prunes_at_most_hourly_across_handles() {
+        let home = tempfile::tempdir().unwrap();
+        let mut a = Store::open(home.path()).unwrap();
+        let mut b = Store::open(home.path()).unwrap();
+        a.write("bot","send","would_ask","memory","old",Transport::Mcp,NOW-36*86400).unwrap();
+        b.write("bot","send","would_ask","memory","new",Transport::Mcp,NOW).unwrap();
+        assert_eq!(a.0.query_row("SELECT COUNT(*) FROM shadow_events",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+        // A backdated event is retained until the next hourly maintenance pass.
+        a.write("bot","send","would_ask","memory","late",Transport::Mcp,NOW-36*86400).unwrap();
+        b.write("bot","send","would_ask","memory","same-hour",Transport::Mcp,NOW+3599).unwrap();
+        assert_eq!(a.0.query_row("SELECT COUNT(*) FROM shadow_events WHERE call_id='late'",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+        b.write("bot","send","would_ask","memory","next-hour",Transport::Mcp,NOW+3600).unwrap();
+        assert_eq!(a.0.query_row("SELECT COUNT(*) FROM shadow_events WHERE call_id='late'",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn concurrent_handles_deduplicate_shared_call_ids() {
+        let home = tempfile::tempdir().unwrap();
+        Store::open(home.path()).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = (0..2).map(|_| {
+            let path = home.path().to_path_buf();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(&path).unwrap();
+                barrier.wait();
+                store.write("bot","send","would_ask","memory","same",Transport::Mcp,NOW).unwrap()
+            })
+        }).collect();
+        let inserted = threads.into_iter().map(|t| usize::from(t.join().unwrap())).sum::<usize>();
+        assert_eq!(inserted,1);
+        let store = Store::open(home.path()).unwrap();
+        assert_eq!(store.0.query_row("SELECT COUNT(*) FROM shadow_events",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn source_classes_never_persist_source_text_and_missing_store_is_empty() {
+        assert_eq!(source_class(&["secret-server.private-document".into()]),"external_tool");
+        assert_eq!(source_class(&["memory_search".into(),"gmail_read".into()]),"mixed");
+        let home = tempfile::tempdir().unwrap();
+        let report = report_at(home.path(),30,NOW).unwrap();
+        assert_eq!(report.total,0);
+        assert_eq!(report.daily.len(),30);
+        assert!(!home.path().join("egress_shadow.db").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shadow_store_refuses_links_and_keeps_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("target");
+        std::fs::write(&target,"keep").unwrap();
+        std::os::unix::fs::symlink(&target,home.path().join("egress_shadow.db")).unwrap();
+        assert!(Store::open(home.path()).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(),"keep");
+        let clean = tempfile::tempdir().unwrap();
+        let _store = Store::open(clean.path()).unwrap();
+        for suffix in ["","-wal","-shm"] {
+            let path = clean.path().join(format!("egress_shadow.db{suffix}"));
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777,0o600);
+        }
+    }
+}

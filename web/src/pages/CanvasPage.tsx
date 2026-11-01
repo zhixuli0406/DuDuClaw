@@ -49,7 +49,7 @@ export function CanvasPage() {
   const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const scope = useDataScope();
-  const visibleAgents = useVisibleAgents();
+  const visibleAgents = useVisibleAgents(false);
 
   // P11 (state-as-URL): whose canvas, and which version of it, are both page
   // state — `?agent=<id>&seq=<n>` makes "look at this version" a link.

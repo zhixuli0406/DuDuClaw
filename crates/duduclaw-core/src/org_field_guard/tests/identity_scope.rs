@@ -960,3 +960,25 @@ fn own_instructions_write_is_blocked_on_both_lanes() {
     // The location guard knows the file as an agent-structure file.
     assert!(crate::AGENT_STRUCTURE_FILES.contains(&"INSTRUCTIONS.md"));
 }
+
+#[test]
+fn user_and_identity_are_operator_owned_even_in_own_directory() {
+    for name in ["USER.md", "IDENTITY.md", "user.md", "identity.md"] {
+        let path = home().join("agents/sales-rep").join(name);
+        assert!(matches!(
+            check_own_instructions_write(&path, &home(), &agent("sales-rep")),
+            GuardDecision::BlockedOwnInstructionsWrite { .. }
+        ));
+        assert_eq!(
+            check_own_instructions_write(&path, &home(), &HookCaller::Absent),
+            GuardDecision::NotAgentFile
+        );
+    }
+    for name in ["USER.md", "IDENTITY.md"] {
+        assert!(crate::AGENT_STRUCTURE_FILES.contains(&name));
+        assert!(matches!(
+            check_bash_protected_write(&format!("echo changed > {name}"), &home(), &agent("sales-rep")),
+            GuardDecision::BlockedOwnInstructionsWrite { .. }
+        ));
+    }
+}

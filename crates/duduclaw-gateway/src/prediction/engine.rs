@@ -478,9 +478,9 @@ impl PredictionEngine {
         let etype = event_type.to_string();
         let ce = composite_error;
         let cat = error_category.map(String::from);
-        let ctx = trigger_context.map(|s| s.chars().take(500).collect::<String>());
+        let ctx = trigger_context.map(|s| duduclaw_security::credential_detect::mask(s).chars().take(500).collect::<String>());
         let vid = version_id.map(String::from);
-        let rr = rollback_reason.map(String::from);
+        let rr = rollback_reason.map(duduclaw_security::credential_detect::mask);
         let ts = Utc::now().to_rfc3339();
 
         tokio::task::spawn_blocking(move || {
@@ -583,6 +583,8 @@ impl PredictionEngine {
         prediction: &Prediction,
         actual: &ConversationMetrics,
     ) -> (PredictionError, Option<Vec<f32>>) {
+        let masked = actual.masked();
+        let actual = &masked;
         // --- Infer actual satisfaction from graded behavioural signals ---
         let mut inferred_satisfaction: f64 = 0.7; // neutral baseline
 
@@ -872,7 +874,9 @@ impl PredictionEngine {
             let aid = agent_id.to_string();
             Some(tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = Connection::open(&db_path) {
-                    let json = serde_json::to_string(&model).unwrap_or_default();
+                    let Ok(mut value) = serde_json::to_value(&model) else { return };
+                    duduclaw_security::credential_detect::mask_json(&mut value);
+                    let Ok(json) = serde_json::to_string(&value) else { return };
                     let _ = conn.execute(
                         "INSERT OR REPLACE INTO user_models (user_id, agent_id, model_json, total_conversations, last_updated)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1020,6 +1024,22 @@ impl PredictionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[tokio::test]
+    async fn model_storage_masks_caller_supplied_topic_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prediction.db");
+        let engine = PredictionEngine::new(db_path.clone(), None);
+        let mut model = UserModel::new("user".into(), "agent".into());
+        model.topic_distribution.insert("password: fixture-topic".into(), 1.0);
+        engine.models.lock().await.insert(("user".into(), "agent".into()), model);
+        engine.flush_all().await;
+        let conn = Connection::open(&db_path).unwrap();
+        let stored: String = conn.query_row("SELECT model_json FROM user_models", [], |r| r.get(0)).unwrap();
+        assert!(!stored.contains("fixture-topic"));
+        assert!(serde_json::from_str::<UserModel>(&stored).is_ok());
+    }
 
     /// Regression: `flush_all` must not return until every spawned SQLite write
     /// has actually landed. The shutdown chain may `exec()` into a new binary

@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use super::ReimportMode;
 use crate::expert::import_error::failure_of;
-use crate::expert::install::{PipelineOpts, cmd_install_with};
+use crate::expert::install::PipelineOpts;
+use crate::expert::agent_config::preview::confirmed_install as cmd_install_with;
 
 /// An instructions-format source: `<dir>/<name>/AGENTS.md` (id and import
 /// name are both `<name>`).

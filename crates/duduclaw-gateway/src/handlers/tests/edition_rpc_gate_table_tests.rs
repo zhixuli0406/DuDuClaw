@@ -89,6 +89,7 @@ fn personal_surfaces_are_untouched() {
         "audit.unified_log",
         "audit.evolution_query",
         "security.status",
+        "security.egress_shadow_report",
         "security.audit_log",
         "security.credential_hygiene",
         "security.credential_inventory",

@@ -340,6 +340,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
     }
 
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(error) = crate::disconnect_forget::sweep(&home).await {
+                    tracing::warn!(%error, "disconnect forget sweep deferred");
+                }
+            }
+        });
+    }
+
     // ── MCP Events: keep subscriptions alive (2026-10-08) ─────────
     // Re-calls `events/subscribe` before each grant runs out; does nothing
     // on an install with no subscriptions file.
@@ -1295,6 +1309,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler.registry().clone(),
         Some(silence_tx),
         Some(proactive_notice),
+        Some(Arc::new(|home, dir, agent| Box::pin(async move {
+            crate::budget::gate_before_spawn(&home, Some(&dir), &agent, "heartbeat_proactive")
+                .await.map_err(|e| e.to_string())
+        }))),
     );
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
@@ -2398,6 +2416,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/refresh", post(handle_refresh))
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
+        .route("/api/brand", get(handle_public_brand))
         .route("/api/first-run/status", get(handle_first_run_status))
         .route("/api/first-run/claim", post(handle_first_run_claim))
         // D4a: OOBE pre-auth network setup — see `first_run_network_gate`'s
@@ -2887,6 +2906,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::egress_guard::router(Arc::new(
         crate::egress_guard::RouteState::new(home_dir.clone()),
     )));
+    app = app.merge(crate::credential_declaration::router(home_dir.clone()));
     // ── Document knowledge base (internal) ────────────────────────
     // `POST /api/internal/knowledge` behind the read-only `knowledge_*` MCP
     // tools: same loopback + signed-identity authentication as the
@@ -3314,7 +3334,8 @@ async fn handle_otp_request(
                 challenge.code.clone(),
             );
             tokio::spawn(async move {
-                let text = format!("DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。");
+                let product = crate::distributor_brand::product_name();
+                let text = crate::otp_delivery::message(&channel, &product, &code);
                 match deliverer.deliver(&channel, &chat_id, &text).await {
                     Ok(()) => {
                         let _ = user_db.log_action(
@@ -3919,6 +3940,100 @@ struct FirstRunClaimRequest {
     #[serde(default)]
     email: Option<String>,
     password: String,
+}
+
+static PUBLIC_BRAND_LIMITER: std::sync::LazyLock<duduclaw_security::rate_limiter::RateLimiter> =
+    std::sync::LazyLock::new(|| duduclaw_security::rate_limiter::RateLimiter::new(
+        30, std::time::Duration::from_secs(60),
+    ));
+
+/// Public identity only: no subscription, license or distributor metadata.
+async fn handle_public_brand(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // Use the peer, never an untrusted forwarded header; count 304s as well.
+    if !PUBLIC_BRAND_LIMITER.check_and_record(&format!("public_brand:{}", login_throttle_ip(addr.ip()))).await {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "60"), (axum::http::header::CACHE_CONTROL, "no-store")],
+        ).into_response();
+    }
+    public_brand_response(&headers, crate::distributor_brand::effective())
+}
+
+fn public_brand_response(
+    headers: &axum::http::HeaderMap,
+    brand: Option<crate::distributor_brand::Brand>,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue, StatusCode};
+    let revision = crate::distributor_brand::revision(brand.as_ref());
+    let etag = format!("\"{revision}\"");
+    // GET uses weak comparison; a comma-separated validator list and '*' are valid.
+    let unchanged = headers.get_all(header::IF_NONE_MATCH).iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| {
+            let value = value.trim();
+            value == "*" || value.strip_prefix("W/").unwrap_or(value) == etag
+        });
+    let mut response = if unchanged {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Json(brand).into_response()
+    };
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60, must-revalidate"));
+    response.headers_mut().insert(header::ETAG, HeaderValue::from_str(&etag).expect("hex ETag"));
+    response.headers_mut().insert("x-brand-revision", HeaderValue::from_str(&revision).expect("hex revision"));
+    response
+}
+
+#[cfg(test)]
+mod public_brand_tests {
+    use super::*;
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    #[tokio::test]
+    async fn etag_validators_return_empty_304_and_short_public_cache() {
+        let headers = HeaderMap::new();
+        let fresh = public_brand_response(&headers, None);
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(fresh.headers()[header::CACHE_CONTROL], "public, max-age=60, must-revalidate");
+        let etag = fresh.headers()[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(fresh.headers()["x-brand-revision"], etag.trim_matches('"'));
+        assert_eq!(&axum::body::to_bytes(fresh.into_body(), 1024).await.unwrap()[..], b"null");
+        for validator in [etag.clone(), format!("\"other\", W/{etag}"), "*".into()] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&validator).unwrap());
+            let cached = public_brand_response(&headers, None);
+            assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(cached.headers()[header::ETAG], etag);
+            assert!(axum::body::to_bytes(cached.into_body(), 1024).await.unwrap().is_empty());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let changed = public_brand_response(&headers, Some(crate::distributor_brand::Brand {
+            product_name: "Changed".into(), logo_light: "logo".into(), logo_dark: None,
+        }));
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()[header::ETAG], etag);
+    }
+
+    #[tokio::test]
+    async fn public_brand_limits_each_peer_even_for_conditional_requests() {
+        // Dedicated test peers avoid racing any other public-route test.
+        let peer: SocketAddr = "198.51.100.219:1234".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        for _ in 0..30 {
+            assert_eq!(handle_public_brand(ConnectInfo(peer), headers.clone()).await.status(), StatusCode::NOT_MODIFIED);
+        }
+        let refused = handle_public_brand(ConnectInfo(peer), headers.clone()).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers()[header::RETRY_AFTER], "60");
+        assert_eq!(refused.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(handle_public_brand(ConnectInfo("198.51.100.220:1234".parse().unwrap()), headers).await.status(), StatusCode::NOT_MODIFIED);
+    }
 }
 
 /// GET /api/first-run/status — report whether this instance is unclaimed, so the
@@ -4682,7 +4797,13 @@ fn authorize_file_access(
     let token = extract_bearer_token(headers)
         .or(token_query)
         .ok_or_else(unauthorized)?;
-    let ctx = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
+    // The token proves identity only. Like RPC live_context, rebuild all
+    // authority from one current users.db snapshot, never JWT bindings.
+    // This also refuses inactive users and database errors without a fallback.
+    let claims = state.jwt_config.verify_access_token(token).map_err(|_| unauthorized())?;
+    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)
+        .map_err(|_| unauthorized())?
+        .ok_or_else(unauthorized)?;
     require_password_changed(&ctx)?;
 
     let allowed = match agent {
@@ -16720,6 +16841,7 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
     // change-password allowlist until the flag clears (C1's original intent
     // — block all operations — is preserved, just enforced one layer up).
     UserContext::from_claims(&claims, must_change_password)
+        .map(|ctx| crate::machine_employee::without_restricted_access(state.handler.home_dir(), ctx))
 }
 
 /// Check if any users exist in the database (to decide whether auth is needed).
@@ -16955,13 +17077,23 @@ async fn handle_mcp_oauth_callback(
     }
     // Google master enable already belongs to its same-ticket three-point
     // publication. A generic enable here would rotate/invalidate its source.
-    mcp_oauth_callback_html(result.is_ok())
+    let error = result.as_ref().err().and_then(crate::mcp_oauth::CallbackFailure::google_code);
+    mcp_oauth_callback_html_with_error(result.is_ok(), error)
 }
+#[cfg(test)]
 fn mcp_oauth_callback_html(success: bool) -> axum::response::Response {
+    mcp_oauth_callback_html_with_error(success, None)
+}
+fn mcp_oauth_callback_html_with_error(success: bool, error: Option<&str>) -> axum::response::Response {
     let body = if success {
         "<!doctype html><html><body><h2>Authentication Successful</h2><p>You can close this window and return to the dashboard.</p></body></html>"
     } else {
-        "<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>"
+        match error.map(crate::mcp_oauth::google_callback_error) {
+            Some("access_denied") => "<!doctype html><html><body><h2>Authentication failed</h2><p>access_denied: Consent was declined. Return to the dashboard, retry, and allow the requested access.</p></body></html>",
+            Some("admin_policy_enforced") => "<!doctype html><html><body><h2>Authentication failed</h2><p>admin_policy_enforced: Ask your Workspace administrator to allow this app, then retry from the dashboard.</p></body></html>",
+            Some("invalid_scope") => "<!doctype html><html><body><h2>Authentication failed</h2><p>invalid_scope: Check Data Access scopes in Google Cloud Console, then retry from the dashboard.</p></body></html>",
+            _ => "<!doctype html><html><body><h2>Authentication failed</h2><p>Please return to the dashboard and start a new connection.</p></body></html>",
+        }
     };
     let mut response = axum::response::Html(body).into_response();
     let headers = response.headers_mut();
@@ -16985,6 +17117,17 @@ fn mcp_oauth_callback_html(success: bool) -> axum::response::Response {
 #[cfg(test)]
 mod home_callback_response_tests {
     use super::*;
+    #[tokio::test]
+    async fn google_callback_html_uses_closed_actionable_errors_only() {
+        for (code, expected) in [("access_denied", "Consent was declined"), ("admin_policy_enforced", "Workspace administrator"), ("invalid_scope", "Data Access"), ("<script>private-token</script>", "start a new connection")] {
+            let response = mcp_oauth_callback_html_with_error(false, Some(code));
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(text.contains(expected));
+            assert!(!text.contains("private-token"));
+            assert!(!text.contains("<script>"));
+        }
+    }
     #[tokio::test]
     async fn callback_html_is_fixed_redacted_and_has_no_store_or_referrer() {
         for success in [false, true] {
@@ -17032,7 +17175,7 @@ fn personal_google_callback_response(
             axum::response::Redirect::to(&target).into_response()
         }
         Err(message) => axum::response::Html(format!(
-            "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>DuDuClaw Google</title></head><body><h1>Google 連結未完成</h1><p>{}</p><p>請回到 DuDuClaw「我的連線」。</p></body></html>", html_escape(&message)
+            "<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>{product} Google</title></head><body><h1>Google 連結未完成</h1><p>{}</p><p>請回到 {product}「我的連線」。</p></body></html>", html_escape(&message), product = html_escape(&crate::distributor_brand::product_name())
         )).into_response(),
     };
     let headers = response.headers_mut();
@@ -17140,11 +17283,12 @@ fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::
     };
     let body = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
-         <title>DuDuClaw</title></head><body style=\"font-family:system-ui,sans-serif;display:flex;justify-content:center;\
+         <title>{product}</title></head><body style=\"font-family:system-ui,sans-serif;display:flex;justify-content:center;\
          align-items:center;min-height:100vh;margin:0;background:#F5F4F0;color:#102B48\"><div style=\"max-width:32rem;padding:1.5rem;text-align:center\">\
          <h2>{}</h2><p style=\"color:#5B6470\">{}</p>{link}</div></body></html>",
         html_escape(title),
         html_escape(message),
+        product = html_escape(&crate::distributor_brand::product_name()),
     );
     let mut resp = axum::response::Html(body).into_response();
     let headers = resp.headers_mut();

@@ -81,7 +81,7 @@ pub(crate) async fn handle_odoo_tool(
                 &format!("DENIED: {model}/{verb} — Odoo module '{module}' is switched off"),
                 false,
             );
-            return mcp_error(&format!(
+            return super::egress_gate::pre_dispatch_error(&format!(
                 "Odoo feature_gate: module '{module}' is switched off in the dashboard (Odoo → 功能模組); \
                  '{model}' is not available."
             ));
@@ -97,7 +97,7 @@ pub(crate) async fn handle_odoo_tool(
                 &format!("DENIED: {model}/{verb} — {reason}"),
                 false,
             );
-            return mcp_error(&format!("Odoo permission denied: {reason}"));
+            return super::egress_gate::pre_dispatch_error(&format!("Odoo permission denied: {reason}"));
         }
     }
 
@@ -112,12 +112,9 @@ pub(crate) async fn handle_odoo_tool(
     {
         Ok(c) => c,
         Err(_) => {
-            return serde_json::json!({
-                "content": [{"type": "text", "text": format!(
-                    "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first."
-                )}],
-                "isError": true
-            });
+            return super::egress_gate::pre_dispatch_error(&format!(
+                "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first."
+            ));
         }
     };
     let conn: &OdooConnector = conn_arc.as_ref();

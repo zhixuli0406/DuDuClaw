@@ -12,6 +12,10 @@
 > 因此 2026-07-30 拍板：產品面完全走原生工具，本掛載只保留給自用與願意
 > 自行申請的進階使用者。
 
+## 2026-11-11 起的用戶端要求
+
+2026-11-11 起，Google Workspace MCP 伺服器會拒絕未標記為 AI agent 的用戶端。在 Google Auth platform → Clients 為這個進階用途另建用戶端，勾選「Use this client for an AI-powered agent」。只用 REST 的應用程式不受影響，DuDuClaw 原生 Google 工具使用 REST。要求與主控台路徑依 2026-10-30 的查證資料整理，這裡沒有重新驗證主控台畫面。
+
 ## 八個服務的覆蓋狀況
 
 | 服務 | 原生工具（**出貨路徑**，無資格限制） | 官方 MCP（preview，僅自用） |
@@ -31,7 +35,7 @@
 
 Forms 與 Tasks 的「官方無」是查證過的結果：`formsmcp.googleapis.com` /
 `tasksmcp.googleapis.com` 實測回 404，Google 的 MCP 文件也完全沒有這兩個服務
-（連 coming soon 都沒有）。另外官方還有 Chat（`preset = "google:chat"`，可用）
+（連 coming soon 都沒有）。另外官方還有 Chat（`preset = "google:chat"`）
 與 People（端點命名不同，未納入 preset）；這兩個目前沒有原生工具對應。
 
 ### 各服務工具清單（實測 `tools/list`）
@@ -110,7 +114,7 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 ## 已知限制
 
 - Preview 階段、rate limit 未公開文件化（GCP Console quota 頁可查）。
-- 只有互動式 OAuth，**無 service account／headless 授權路徑**。
+- 一般 OAuth 需要瀏覽器同意；遠端或無桌面主機可依[連接 Google](google-setup.md#遠端主機或-docker)建立 SSH 轉送。原生服務帳號委派可用，各官方遠端 MCP 是否接受委派權杖仍須分別驗證。
 - Gmail 無寄信工具；官方 reference 頁的工具數與實際端點有出入（reference 列
   10 個、端點實際 13 個），以 `tools/list` 實測為準。
 - 端點若在 GA 時改名，只需改 `mcp_external.rs` 的 `GOOGLE_MCP_PRESETS`
@@ -121,3 +125,5 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 [Gmail MCP reference](https://developers.google.com/workspace/gmail/api/reference/mcp)、
 [Calendar MCP reference](https://developers.google.com/workspace/calendar/api/v3/reference/mcp)、
 [Developer Preview Program](https://developers.google.com/workspace/preview)。
+
+`google:chat` 預設集不會增加 Chat 授權。原生 Workspace 權限清單沒有 Chat，掛載前要另行配置適當授權。Google Chat 頻道使用 `chat.bot`，是另一條連線。

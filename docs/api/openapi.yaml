@@ -894,6 +894,46 @@ paths:
                   trash_path:
                     type: string
 
+  /rpc/agents.export_profile:
+    post:
+      tags: [agents]
+      summary: Export an employee profile
+      description: Requires Manager or Admin and Viewer access to the employee, re-read from users.db. The gateway reads the authoritative profile files and refuses secret-shaped output. Excludes user introduction unless explicitly requested. Records agent_profile_exported without profile content.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id, format]
+              properties:
+                agent_id:
+                  type: string
+                format:
+                  type: string
+                  enum: [duduclaw, openclaw, hermes, agents-md, claude-subagent]
+                include_user:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Export artifacts, each with a safe filename and UTF-8 text. OpenClaw and Hermes return multiple files to put in one directory.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, content]
+                      properties:
+                        name:
+                          type: string
+                        content:
+                          type: string
+
   /rpc/agents.inspect:
     post:
       tags: [agents]

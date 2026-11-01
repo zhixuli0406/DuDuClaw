@@ -113,6 +113,39 @@ impl TaskKind {
     }
 }
 
+/// Derived text may itself be JSON. Preserve its shape while masking values
+/// instead of running a text replacement over JSON punctuation.
+fn mask_derived_text(text: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) {
+        let original = value.clone();
+        duduclaw_security::credential_detect::mask_json(&mut value);
+        if value == original {
+            text.to_string()
+        } else {
+            value.to_string()
+        }
+    } else {
+        duduclaw_security::credential_detect::mask(text)
+    }
+}
+
+/// Frozen contracts are not rewritten after their authority/hash was checked.
+/// Refuse a secret-bearing contract rather than persist plaintext or change it.
+fn require_safe_contract(text: &str) -> Result<(), String> {
+    let safe = if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        let mut masked = value.clone();
+        duduclaw_security::credential_detect::mask_json(&mut masked);
+        value == masked
+    } else {
+        duduclaw_security::credential_detect::mask(text) == text
+    };
+    if safe {
+        Ok(())
+    } else {
+        Err("credentials are not accepted in frozen task contracts".into())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRow {
     pub id: String,

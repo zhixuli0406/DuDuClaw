@@ -144,7 +144,7 @@ pub(crate) fn config_projection(raw: &str) -> Result<RawDigest> {
         Some(toml::Value::Boolean(v)) => *v,
         _ => return Err(Error::Invalid),
     };
-    let bytes=zeroize::Zeroizing::new(serde_json::to_vec(&json!({"master":master,"sa":integrations.get("google_service_account"),"bridge":integrations.get("google_apps_script"),"resolver":table.get("secret_manager")})).map_err(|_|Error::Invalid)?);
+    let bytes=zeroize::Zeroizing::new(serde_json::to_vec(&json!({"path":integrations.get("google_credential_path"),"master":master,"sa":integrations.get("google_service_account"),"bridge":integrations.get("google_apps_script"),"resolver":table.get("secret_manager")})).map_err(|_|Error::Invalid)?);
     Ok(RawDigest::of(&bytes))
 }
 /// Caller owns source then config; acquire ONLY client then token here.
@@ -252,12 +252,16 @@ pub(crate) struct RawClientSnapshot {
 
 pub(crate) struct ObservedSource {
     binding: SourceBinding,
+    #[cfg(test)]
     enabled_binding: SourceBinding,
+    oauth_binding: SourceBinding,
+    #[cfg(test)]
     disabled_binding: SourceBinding,
     stamp: SourceStamp,
     master: bool,
     sa_present: bool,
     bridge_present: bool,
+    disabled_path: bool,
     raw_client: Option<Value>,
 }
 /// Static raw-client validation only: no decrypt/protected key/provider.
@@ -310,8 +314,20 @@ impl ObservedSource {
             Some(toml::Value::Boolean(b)) => *b,
             _ => return Err(Error::Invalid),
         };
+        let disabled_path = match integrations.get("google_credential_path") {
+            None => false,
+            Some(toml::Value::String(v)) if matches!(v.as_str(), "oauth" | "service_account" | "apps_script" | "none") => v == "none",
+            _ => return Err(Error::Invalid),
+        };
         let sa_present = integrations.contains_key("google_service_account");
         let bridge_present = integrations.contains_key("google_apps_script");
+        if let Some(mode) = integrations.get("google_credential_path").and_then(toml::Value::as_str) {
+            if (mode == "service_account" && (!sa_present || bridge_present))
+                || (mode == "apps_script" && (!bridge_present || sa_present))
+                || (matches!(mode, "oauth" | "none") && (sa_present || bridge_present)) {
+                return Err(Error::Invalid);
+            }
+        }
         if sa_present && !integrations["google_service_account"].is_table() {
             return Err(Error::Invalid);
         }
@@ -339,7 +355,7 @@ impl ObservedSource {
                 .map_err(|_| Error::Invalid)?
                 .ok_or(Error::Invalid)?;
         }
-        let projection = json!({"google_workspace":master,"google_service_account":integrations.get("google_service_account"),"google_apps_script":integrations.get("google_apps_script")});
+        let projection = json!({"google_credential_path":integrations.get("google_credential_path"),"google_workspace":master,"google_service_account":integrations.get("google_service_account"),"google_apps_script":integrations.get("google_apps_script")});
         let resolver = RawDigest::of(
             &serde_json::to_vec(&table.get("secret_manager")).map_err(|_| Error::Invalid)?,
         );
@@ -350,18 +366,34 @@ impl ObservedSource {
             resolver,
             sa_key,
         };
-        let mut enabled_projection = projection;
+        let mut enabled_projection = projection.clone();
         enabled_projection["google_workspace"] = json!(true);
+        #[cfg(test)]
         let enabled_stamp = SourceStamp {
             configuration: RawDigest::of(
                 &serde_json::to_vec(&enabled_projection).map_err(|_| Error::Invalid)?,
             ),
             ..stamp.clone()
         };
-        enabled_projection["google_workspace"] = json!(false);
-        let disabled_stamp = SourceStamp {
+        // Only callback activation selects OAuth and retires the alternative.
+        enabled_projection["google_credential_path"] = json!("oauth");
+        enabled_projection["google_service_account"] = Value::Null;
+        enabled_projection["google_apps_script"] = Value::Null;
+        let oauth_stamp = SourceStamp {
             configuration: RawDigest::of(
                 &serde_json::to_vec(&enabled_projection).map_err(|_| Error::Invalid)?,
+            ),
+            resolver: stamp.resolver.clone(),
+            sa_key: None,
+        };
+        #[cfg(test)]
+        let disabled_stamp = SourceStamp {
+            configuration: RawDigest::of(
+                &serde_json::to_vec(&{
+                    let mut disabled_projection = projection;
+                    disabled_projection["google_workspace"] = json!(false);
+                    disabled_projection
+                }).map_err(|_| Error::Invalid)?,
             ),
             ..stamp.clone()
         };
@@ -398,10 +430,16 @@ impl ObservedSource {
             client,
             source: RawDigest::of(&serde_json::to_vec(&stamp).map_err(|_| Error::Invalid)?),
         };
+        let oauth_binding = SourceBinding {
+            source: RawDigest::of(&serde_json::to_vec(&oauth_stamp).map_err(|_| Error::Invalid)?),
+            ..binding.clone()
+        };
+        #[cfg(test)]
         let enabled_binding = SourceBinding {
             source: RawDigest::of(&serde_json::to_vec(&enabled_stamp).map_err(|_| Error::Invalid)?),
             ..binding.clone()
         };
+        #[cfg(test)]
         let disabled_binding = SourceBinding {
             source: RawDigest::of(
                 &serde_json::to_vec(&disabled_stamp).map_err(|_| Error::Invalid)?,
@@ -410,12 +448,16 @@ impl ObservedSource {
         };
         Ok(Self {
             binding,
+            #[cfg(test)]
             enabled_binding,
+            oauth_binding,
+            #[cfg(test)]
             disabled_binding,
             stamp,
             master,
             sa_present,
             bridge_present,
+            disabled_path,
             raw_client,
         })
     }
@@ -439,9 +481,10 @@ impl ObservedSource {
     pub(crate) fn binding(&self) -> &SourceBinding {
         &self.binding
     }
-    pub(crate) fn enabled_binding(&self) -> &SourceBinding {
-        &self.enabled_binding
+    pub(crate) fn oauth_binding(&self) -> &SourceBinding {
+        &self.oauth_binding
     }
+    #[cfg(test)]
     pub(crate) fn binding_with_master(&self, enabled: bool) -> &SourceBinding {
         if enabled {
             &self.enabled_binding
@@ -503,12 +546,12 @@ fn selection(
     scopes: &[&str],
     migrate: bool,
 ) -> Result<HomeSourceReceipt> {
-    if !s.master {
+    if !s.master || s.disabled_path {
         return Err(Error::NotReady);
     }
     // SA takes precedence; no invalid/pending SA configuration may silently
     // become OAuth. SA/Bridge receipt issuance is a later writer phase.
-    if s.sa_present {
+    if s.sa_present || s.bridge_present {
         return Err(Error::PendingWiring);
     }
     let scopes = home_store::normalized_scopes(scopes.iter().map(|s| s.to_string()).collect())?;

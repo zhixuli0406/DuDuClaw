@@ -23,7 +23,7 @@ export function WorldPage() {
   const intl = useIntl();
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   // Data-scoped: an employee sees only their own AI staff (§3.4 WP11-T11.3).
-  const agents = useVisibleAgents();
+  const agents = useVisibleAgents(false);
   const authed = useConnectionStore((s) => s.state) === 'authenticated';
 
   useEffect(() => {

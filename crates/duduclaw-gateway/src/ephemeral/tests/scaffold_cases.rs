@@ -44,6 +44,66 @@ fn scaffold_fails_closed_when_parent_config_missing_or_malformed() {
 }
 
 #[test]
+fn scaffold_inherits_resolved_recipient_policy_without_weakening() {
+    use duduclaw_core::recipient_policy::{Decision, Mode, load};
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "[capabilities]\nallowed_tools=['Read']\nrecipient_guard='off'\nrecipients=['line:raw']\n");
+    let source = std::fs::read_to_string(home.join("agents/boss/agent.toml")).unwrap();
+    let resolved = duduclaw_core::preset::agent_resolved_path(home, "boss");
+    std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+    std::fs::write(&resolved, source.replace("recipient_guard='off'", "recipient_guard='ask'")
+        .replace("line:raw", "line:resolved")).unwrap();
+    let spec = EphemeralSpawnSpec {
+        parent: "boss".into(), instruction: "x".into(),
+        tools: strs(&["Read"]), tier: "standard".into(),
+    };
+    let result = scaffold(home, &spec).unwrap();
+    let policy = load(home, Some(&result.dir));
+    assert_eq!(policy.mode, Mode::Ask);
+    assert_eq!(policy.recipients, strs(&["line:resolved"]));
+    assert_eq!(policy.evaluate(&strs(&["line:raw"]), None, &[]), Decision::Ask);
+    assert_eq!(policy.evaluate(&strs(&["line:resolved"]), None, &[]), Decision::Allow);
+}
+
+#[test]
+fn scaffold_preserves_invalid_recipient_values_fail_closed() {
+    use duduclaw_core::recipient_policy::{Decision, load};
+    for settings in ["recipient_guard=7\nrecipients=['line:owner']", "recipient_guard='ask'\nrecipients=7"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_parent(home, "boss", &format!("[capabilities]\nallowed_tools=['Read']\n{settings}\n"));
+        let result = scaffold(home, &EphemeralSpawnSpec {
+            parent: "boss".into(), instruction: "x".into(),
+            tools: strs(&["Read"]), tier: "standard".into(),
+        }).unwrap();
+        let parent: toml::Value = std::fs::read_to_string(home.join("agents/boss/agent.toml")).unwrap().parse().unwrap();
+        let child: toml::Value = std::fs::read_to_string(result.dir.join("agent.toml")).unwrap().parse().unwrap();
+        for key in ["recipient_guard", "recipients"] {
+            assert_eq!(parent["capabilities"][key], child["capabilities"][key]);
+        }
+        let policy = load(home, Some(&result.dir));
+        assert!(!policy.valid);
+        assert_eq!(policy.evaluate(&strs(&["line:owner"]), Some("line:owner"), &[]), Decision::Ask);
+    }
+}
+
+#[test]
+fn scaffold_refuses_malformed_resolved_policy_before_creating_a_helper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "[capabilities]\nallowed_tools=['Read']\n");
+    let resolved = duduclaw_core::preset::agent_resolved_path(home, "boss");
+    std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+    std::fs::write(resolved, "[").unwrap();
+    assert!(scaffold(home, &EphemeralSpawnSpec {
+        parent: "boss".into(), instruction: "x".into(),
+        tools: strs(&["Read"]), tier: "standard".into(),
+    }).is_err());
+    assert_no_scaffold(home);
+}
+
+#[test]
 fn scaffold_cap_is_race_safe_under_parallel_spawns() {
     // 2026-07 MED: the count-then-create circuit breaker used to be a
     // TOCTOU race — N parallel spawns could all observe count < cap and

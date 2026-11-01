@@ -104,7 +104,8 @@ impl SettleOutcome {
 /// normal here). Empty input becomes `unspecified` so the effect variable is
 /// never a bare prefix.
 pub fn normalize_goal_kind(kind: &str) -> String {
-    let folded: String = kind
+    let masked = duduclaw_security::credential_detect::mask(kind);
+    let folded: String = masked
         .trim()
         .to_lowercase()
         .chars()
@@ -126,14 +127,14 @@ pub fn normalize_goal_kind(kind: &str) -> String {
 pub fn cause_variable(fault_reason: &str, failing_tool: Option<&str>) -> String {
     match failing_tool {
         Some(tool) if !tool.trim().is_empty() => {
-            format!("tool_error:{}", truncate_bytes(tool.trim(), 60))
+            format!("tool_error:{}", truncate_bytes(&duduclaw_security::credential_detect::mask(tool.trim()), 60))
         }
         _ => {
             let token = fault_reason.trim();
             if token.is_empty() {
                 "unattributed".to_string()
             } else {
-                truncate_bytes(token, 60).to_string()
+                truncate_bytes(&duduclaw_security::credential_detect::mask(token), 60).to_string()
             }
         }
     }
@@ -172,7 +173,9 @@ pub fn render_artifact(rows: &[serde_json::Value]) -> Option<(String, Vec<AuditL
         .into_iter()
         .rev()
     {
-        let Ok(text) = serde_json::to_string(row) else {
+        let mut masked = row.clone();
+        duduclaw_security::credential_detect::mask_json(&mut masked);
+        let Ok(text) = serde_json::to_string(&masked) else {
             continue;
         };
         if content.len() + text.len() + 1 > MAX_ARTIFACT_BYTES {
@@ -401,7 +404,7 @@ pub fn ingest_settle(home_dir: &Path, facts: &SettleFacts<'_>) -> Option<Ingeste
             "agent_id": facts.agent_id,
             "task_id": facts.task_id,
             "round": facts.round,
-            "fault_reason": facts.fault_reason,
+            "fault_reason": duduclaw_security::credential_detect::mask(facts.fault_reason),
             "deterministic": true,
             "note": "Transcribed from the audit trail. Co-occurrence, not an inferred causal effect.",
         }),
@@ -765,6 +768,20 @@ mod tests {
             },
         );
         assert!(out.is_none(), "an empty audit trail is not a claim");
+    }
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[test]
+    fn causal_artifact_masks_before_computing_evidence_spans() {
+        let rows = vec![json!({"tool":"example", "arguments":{"password":"fixture-input"},
+            "error":"password: fixture-error"})];
+        let (text, lines) = render_artifact(&rows).unwrap();
+        assert!(!text.contains("fixture-"));
+        let line = &lines[0];
+        assert_eq!(text.get(line.span_start..line.span_end), Some(line.text.as_str()));
+        assert!(serde_json::from_str::<serde_json::Value>(&line.text).is_ok());
+        assert!(!effect_variable(SettleOutcome::Rejected, "password: fixture-kind").contains("fixture-kind"));
+        assert!(!cause_variable("password: fixture-reason", None).contains("fixture-reason"));
     }
 
     #[test]

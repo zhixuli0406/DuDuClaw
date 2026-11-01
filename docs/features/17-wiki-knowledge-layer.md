@@ -249,6 +249,8 @@ Use `wiki_namespace_status` MCP tool to inspect the active policy before writing
 
 ### Department read-visibility (`visible_to_departments`)
 
+Dashboard accounts follow the same department visibility rule for `shared_wiki.pages`, `.read`, `.search`, `.stats`, and shared wiki exports. Their department is the human account's `users.department` in `users.db`, not an AI employee's department or a token claim. Non-admin accounts without a department see only company-wide pages. Admins may read all pages. Dashboard reads fail closed on unreadable or malformed visibility settings; a missing `.scope.toml` keeps company-wide pages readable. Sharing retains the existing Owner-or-Admin permission for the source employee.
+
 The write `mode` above governs *who may write* a namespace. To govern *who may read* it at the **department** level, add a `visible_to_departments` array to the same `[namespaces."x"]` table. Only agents whose `[agent] department` is on the list see that namespace — both in **prompt injection** (auto-injected L0/L1 pages) and via **`wiki_search` / `wiki_read` / `wiki_ls` (`scope="shared"`)**.
 
 ```toml

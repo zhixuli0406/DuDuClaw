@@ -364,7 +364,7 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         );
     }
 
-    info!("📩 DingTalk [{sender}]: {}", truncate_bytes(&text, 80));
+    info!("📩 DingTalk [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     let session_id = format!(
         "dingtalk:{}",
@@ -602,7 +602,7 @@ async fn post_webhook(http: &reqwest::Client, webhook: &str, body: &serde_json::
                     let errmsg = v.get("errmsg").and_then(|m| m.as_str()).unwrap_or("");
                     warn!(
                         "DingTalk webhook errcode {code}: {}",
-                        truncate_bytes(errmsg, 200)
+                        truncate_bytes(&duduclaw_security::credential_detect::mask(errmsg), 200)
                     );
                 }
                 code == 0
@@ -614,7 +614,7 @@ async fn post_webhook(http: &reqwest::Client, webhook: &str, body: &serde_json::
             let text = resp.text().await.unwrap_or_default();
             warn!(
                 "DingTalk webhook send failed ({status}): {}",
-                truncate_bytes(&text, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 200)
             );
             false
         }

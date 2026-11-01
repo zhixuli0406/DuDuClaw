@@ -590,12 +590,18 @@ mod tests {
     }
 
     #[test]
-    fn distributor_license_has_no_brand_editing_rights() {
+    fn distributor_license_has_no_customer_brand_setter_or_inline_brand() {
         let license = make_license(LicenseTier::Oem, 30, 0);
         let encoded = serde_json::to_value(&license).unwrap();
-        assert!(encoded.get("branding_editable").is_none());
+        // Oem branding is a separate signed feed document, not a mutable
+        // license field or an end-customer editing permission.
+        for field in ["branding_editable", "product_name", "logo_light", "logo_dark"] {
+            assert!(encoded.get(field).is_none(), "license must not carry {field}");
+        }
         let payload = String::from_utf8(license.canonical_payload().unwrap()).unwrap();
-        assert!(!payload.contains("branding_editable"));
+        for field in ["branding_editable", "product_name", "logo_light", "logo_dark"] {
+            assert!(!payload.contains(field), "license signature must not include {field}");
+        }
     }
 
     #[test]

@@ -149,7 +149,7 @@ export function kvRowsFromTable(section: string, table: Record<string, unknown> 
 const FLAT_FORM_KEYS: ReadonlyArray<keyof AgentUpdateParams> = [
   'display_name', 'role', 'status', 'trigger', 'icon', 'reports_to', 'department',
   'api_mode', 'use_router',
-  'monthly_limit_cents', 'warn_threshold_percent', 'hard_stop',
+  'monthly_limit_cents', 'warn_threshold_percent', 'hard_stop', 'when_unavailable',
   'heartbeat_enabled', 'heartbeat_interval', 'heartbeat_cron',
   'can_create_agents', 'can_send_cross_agent', 'can_modify_own_skills', 'can_modify_own_soul', 'can_schedule_tasks',
   'timeout_ms', 'sandbox_enabled', 'network_access',
@@ -161,7 +161,7 @@ const CAP_LIST_KEYS: ReadonlyArray<keyof AgentCapabilities> = [
   'db_sources', 'native_sandbox', 'policy', 'os_native', 'recording', 'git_credentials', 'system_operator',
   'codrive', 'autonomy_level',
   'approval_required_tools', 'irreversible_tools', 'maybe_irreversible_tools', 'scoped_tools',
-  'action_rules',
+  'action_rules', 'recipient_guard', 'recipients',
 ];
 
 const COMPUTER_USE_CONFIG_KEYS: ReadonlyArray<keyof ComputerUseConfig> = [

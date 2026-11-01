@@ -39,8 +39,8 @@ import {
 } from '@/components/chat';
 import { CharacterAvatar } from '@/components/character';
 import { AgentGlyph } from '@/lib/agent-glyph';
-import { BrandMark } from '@/components/brand';
-import { DuDu } from '@/components/mascot';
+import { ProductLogo } from '@/components/brand';
+import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
 import { isImageMime, readAttachment } from '@/lib/attachments';
 import {
   applyMention,
@@ -53,6 +53,7 @@ import {
   type MentionAgent,
 } from '@/lib/mention';
 import { api, type CallableAgent } from '@/lib/api';
+import { PRODUCT_NAME, useEffectiveName } from '@/lib/product-identity';
 import { ManagerReadNotice } from '@/components/chat/ManagerReadNotice';
 
 export function WebChatPage() {
@@ -254,7 +255,8 @@ function InteractiveWebChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionsRevision]);
 
-  const partnerName = partner?.display_name ?? agentName;
+  const productName = useEffectiveName();
+  const partnerName = partner?.display_name ?? (agentName === PRODUCT_NAME ? productName : agentName);
 
   // Recording drives the `listening` face just like typing does.
   const face = useChatFace(phase, input.trim().length > 0 || isRecording, messages.length > 0);
@@ -503,7 +505,7 @@ function InteractiveWebChatPage() {
         ) : (
           // No agent icon (the server resolved no agent): show the product
           // mark instead of AgentGlyph's 🐾 per-agent placeholder.
-          <BrandMark size={28} />
+          <ProductLogo size={28} />
         )}
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">

@@ -1,40 +1,6 @@
-# Google Workspace統合(全8サービス、ネイティブ対応)
+# Google Workspace ツールと安全モデル
 
-> **公開ステータス(v1.49.0で更新):** ダッシュボードの「Integrations →
-> Google」タブは、デフォルトで**表示されるようになりました**。以前のバージョンでは
-> GoogleのOAuthアプリ審査待ちのため非表示にしていましたが、審査が制限するのは
-> 「自前のOAuth clientを持ち込む」経路だけであり、サービスアカウントによる
-> ドメイン全体委任やApps Scriptブリッジには影響しないことが確認できたため、
-> タブを隠しておく理由がなくなりました。ただし表示されていることは、ツールが
-> 有効であることを意味しません。バックエンドには独立したマスタースイッチ
-> `config.toml [integrations] google_workspace`があり、**デフォルトは
-> `false`**です。オフのままだと認証情報の設定や接続テストは通りますが、
-> ツールがAI従業員の前に現れることはなく、ダッシュボードには明確な黄色い
-> 警告が表示されます。3つの認証経路の選び方については
-> [google-workspace-integration.md](../google-workspace-integration.md)を参照してください。
-
-> **設計上の判断(D5、2026-08-04):** DuDuClawは共有のGoogle OAuth認証情報を
-> 同梱しません。ユーザーは自分自身のOAuth clientを用意する(あるいは代わりに
-> DWD／Apps Script経路を使う)必要があり、DuDuClawはその結果得られたトークンを
-> 保存・更新するだけで、自前のclient id／secretを同梱することは決してありません。
-> 判断の背景は
-> [google-workspace-integration.md](../google-workspace-integration.md)(D5)を
-> 参照してください。
-
-Googleアカウントを接続すると、あなたのAI従業員はメールの検索・閲覧、返信下書きの
-作成、カレンダーの一覧表示、イベントの作成(Google Meetリンク付き)、Googleスプレッド
-シートの行の読み取り・追記、Googleフォームの回答の読み取り、Google Tasksの管理が
-できるようになります。DuDuClawはGoogleのREST APIにネイティブに接続するため、
-サードパーティのMCP serverをインストールする必要はありません。アクセストークンは
-DuDuClawの暗号化されたOAuth vaultに保存され、自動的に更新されます。
-
-**8つのWorkspaceサービスすべてがネイティブに対応**しています。Gmail、Calendar、
-Sheets、Drive、Docs、Slides、Forms、TasksはすべてGA(一般提供)のREST API上で
-動くため、ここで説明する内容はGoogleのDeveloper Previewプログラムに一切依存せず、
-どの顧客でも利用できます。(Google自身が提供する公式のremote MCP serverは
-8つ中6つをカバーしますが、Preview限定であり、利用規約上Pre-GA APIを自分の
-ドメイン外のユーザーに公開することを禁じています。こちらは上級者向けの
-オプトインとして引き続き利用可能です: [google-mcp.md](../google-mcp.md))。
+設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は八サービス・十九ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
 
 ## 何が使えるようになるか
 
@@ -43,7 +9,7 @@ MCPツールです。
 
 | ツール | 分類 | 内容 |
 |------|-------|--------------|
-| `google_status` | read | 接続状態の診断: 接続済みか、付与されたスコープ、トークンの有効性。ローカルの状態のみを読み取る。 |
+| `google_status` | read | 経路別の身分・認証情報を診断。サービス読取の証明にはならず、連携または社員の Google が無効なら非表示。 |
 | `gmail_search` | read | Gmailのクエリ構文(`from:… is:unread`など)でメールボックスを検索。送信者／件名／日付／スニペットを返す。 |
 | `gmail_read` | read | 1件のメッセージを全文読み取る: ヘッダー、プレーンテキスト本文(長い場合は切り詰め)、添付ファイル一覧(ファイル名とサイズのみ、ダウンロードは行わない)。 |
 | `gmail_create_draft` | write | Gmailの**下書き**を作成する。送信は行わない。送信は常に人間が手動で行う。 |
@@ -100,25 +66,6 @@ MCPツールです。
   [capabilities]
   approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
   ```
-
-## 認証経路を選ぶ
-
-同じ19個のツールを認可する方法は3通りあります。違いは誰が設定を行うか、
-そしてGoogleが事前にアプリを審査している必要があるかどうかです。
-
-| | 個人の @gmail.com | Workspaceドメイン | 誰が設定するか | ツールの網羅範囲 |
-|---|---|---|---|---|
-| **OAuth client**(下記) | ✅ | ✅ | 各顧客が自分自身のGoogle Cloud OAuth clientを作成する | 全19個 |
-| **サービスアカウント + ドメイン全体委任** | ❌ | ✅ | ドメインのスーパー管理者が1つのclient idを認可する | 全19個 |
-| **Apps Scriptブリッジ** | ✅ | ✅(管理者がApps Scriptを無効化していない限り) | エンドユーザーが自分のアカウントにスクリプトをデプロイする | Gmail / Calendar / Sheetsのみ |
-
-複数が設定されている場合、優先順位はサービスアカウント → OAuth vault →
-Apps Scriptブリッジの順です。ブリッジはカバーするツールが最も少ないため
-最後に配置されています。実際に有効になっているソースは`google_status`が
-表示します。
-
-認証情報を必要としない2つの経路については
-[google-no-oauth-client.md](../google-no-oauth-client.md)に記載しています。AI 社員ごとに同僚として使わせる方法は[AI 社員ごとに別の Google アカウントを使う](#ai-社員ごとに別の-google-アカウントを使う会社の委任v1760)を参照してください。
 
 ## AI 社員ごとに別の Google アカウントを使う（会社の委任、v1.76.0）
 
@@ -203,110 +150,9 @@ Agent Mail は最後に完了したポーリング時刻、アカウント利用
 - シェルを持つ社員は gateway と同じ OS ユーザーで動きます。[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置くv1760)のキーチェーンの制限を参照してください。
 - 実際の Workspace ではまだ検証していません：管理コンソールの実際の流れ、Google の実際のエラー文字列、Gmail を無効にした組織部門、Google 自身のリモート MCP エンドポイントが委任トークンを受け付けるかどうか。
 
-## 前提条件: Google OAuth clientを作成する
 
-自分自身のGoogle OAuth clientを用意する必要があります(DuDuClawは共有の
-認証情報を同梱しません)。初回セットアップ:
+## What was ruled out, and why
 
-1. [Google Cloud Console → Credentials](https://console.cloud.google.com/apis/credentials)
-   ページを開く(先にプロジェクトを作成／選択)。
-2. プロジェクトに対して以下の8つのAPIを有効化する(APIs & Services →
-   Library)。またはコマンド1つで:
-
-   ```bash
-   gcloud services enable gmail.googleapis.com calendar-json.googleapis.com \
-     sheets.googleapis.com drive.googleapis.com docs.googleapis.com \
-     slides.googleapis.com forms.googleapis.com tasks.googleapis.com \
-     --project=PROJECT_ID
-   ```
-3. OAuth同意画面を設定する(ExternalまたはInternal)。アプリが「Testing」の
-   ままであれば、自分自身のGoogleアカウントをテストユーザーとして追加する。
-4. **Web application**タイプの**OAuth client ID**を作成する。
-5. **Authorized redirect URIs**に、正確に以下を追加する:
-
-   ```
-   http://localhost:18889/api/mcp/oauth/callback
-   ```
-
-   18889はgatewayのデフォルトポートです。別のポートで実行している場合
-   (`DUDUCLAW_PORT`)は、そのポートを代わりに登録してください。ダッシュボードの
-   セットアップ手順には、gatewayが実際にリッスンしているポートから導出された
-   正確なURIが表示されます。ここが一致していないと、失敗は静かに起こります。
-   Googleはブラウザを何も待ち受けていないポートにリダイレクトするため、
-   トークンが届くことはなく、ページは「未接続」のままになります。
-
-6. 生成された**Client ID**と**Client secret**をコピーする。
-
-要求されるスコープは以下のとおりです:
-
-```
-https://www.googleapis.com/auth/gmail.readonly
-https://www.googleapis.com/auth/gmail.compose
-https://www.googleapis.com/auth/calendar.events
-https://www.googleapis.com/auth/spreadsheets
-https://www.googleapis.com/auth/drive.readonly
-https://www.googleapis.com/auth/documents
-https://www.googleapis.com/auth/presentations.readonly
-https://www.googleapis.com/auth/forms.body.readonly
-https://www.googleapis.com/auth/forms.responses.readonly
-https://www.googleapis.com/auth/tasks
-https://www.googleapis.com/auth/userinfo.email
-```
-
-> **スコープ変更(v1.45):** Sheetsツールのために`spreadsheets`スコープが
-> 追加されました。v1.45より前に接続されたGoogleアカウントは、トークンが
-> このスコープの追加前に発行されたものであるため、Sheets APIから`403`を
-> 受け取ります。`google_status`は不足しているスコープを警告し、ダッシュボードから
-> 再接続するとフルセットのスコープで再度同意を求められます。
->
-> **スコープ変更(v1.47):** 新しいネイティブツールのために、Drive
-> (`drive.readonly`)、Docs(`documents`)、Slides
-> (`presentations.readonly`)、Forms(`forms.body.readonly`、
-> `forms.responses.readonly`)、Tasks(`tasks`)が追加されました。上記と
-> 同じルールが適用されます。古いトークンは`403`と再認証の案内を受け取ります。
-> Integrations → Googleから再接続して再度同意してください。
-
-## ダッシュボードから接続する
-
-1. **Integrations → Google**(`/manage/integrations?tab=google`)に移動する。
-2. Client IDとClient secretを貼り付け、**Connect Google**をクリックする。
-3. Googleの同意ウィンドウが開きます。アクセスを承認すると、ウィンドウに
-   成功が表示され、ダッシュボードは**Google is connected**に切り替わります。
-
-client認証情報は永続化されます(secretは保存時に暗号化)。これによりアクセス
-トークンを自動的に更新でき、後で再認可する際にsecretを再入力する必要も
-ありません。
-
-切断するには、接続済み画面で**Disconnect**をクリックします。保存されている
-client認証情報は保持されるためワンクリックで再接続できますが、アクセス
-トークンは削除されます。
-
-## 更新(リフレッシュ)の仕組み
-
-Googleはオフラインアクセスが要求された場合にのみrefresh tokenを発行するため、
-接続フローはGoogle向けに自動的に`access_type=offline&prompt=consent`を
-付与します。アクセストークンが期限切れになると、`get_valid_google_token`が
-保存されているclient認証情報でrefresh grantを実行し、新しいトークンを保存して
-処理を継続します。更新ができない場合(refresh tokenがない、または保存された
-認証情報が見つからない)、ツールは明確なメッセージを返し、Integrations →
-Googleページに戻って再接続するよう案内します。
-
-## スコープ変更後の再認可
-
-この統合が提供される前(古いスコープセット)に認可されたトークンは、新しい
-書き込みAPIから`403`を受け取ります。ツールはこれを検知し、付与すべき
-スコープの一覧を含む案内を返します。Integrations → Googleから再接続すると、
-現在のスコープセットで再度同意できます。
-
-## トラブルシューティング
-
-- **「Google is not connected.」**: トークンが保存されていません。
-  ダッシュボードから接続してください。
-- **`401 Unauthorized`**: 認可が取り消された、または無効です。
-  再接続してください。
-- **スコープ一覧付きの`403`**: トークンに必要なスコープが不足しています。
-  再接続して再同意してください。
-- **同意中のRedirect URI不一致**: Google OAuth clientのredirect URIは
-  正確に`http://localhost:18889/api/mcp/oauth/callback`である必要があります。
-
-いつでも`google_status`を実行すれば、その場で診断結果を確認できます。
+**ローカルでAppleScript経由でMail.app／Calendar.appを読む方法。** カレンダーはうまくいっており、すでに出荷済みです（`os_calendar_today`）。1日分の予定を問い合わせるだけなので、クエリが小さく済むからです。メールはそうはいきません。macOS 15上の実際の54,000通が入ったメールボックスで計測したところ、
+`Mail.inbox.messages.dateReceived()`は17秒かかり、
+`whose({dateReceived: …})`と`whose({readStatus: false})`はどちらも60〜90秒以内に応答を返せませんでした。`inbox.messages`が返す順序も時系列順ではないため、安価なインデックスアクセスでは任意の古いメールが返ってくることになります。Spotlightはメールメッセージをインデックス化していません（`kMDItemKind == 'Mail Message'`は何も返しません）。`~/Library/Mail`を直接読むにはFull Disk Accessに加えて、ドキュメント化されておらずバージョンごとに変わるSQLiteスキーマへの対応が必要です。GmailについてはこちらもApps Scriptを使います。

@@ -37,6 +37,9 @@ fn get_resp_conn(conn: &Connection, id: &str) -> Result<Option<ResponsibilityRow
 }
 
 pub(super) fn insert_wakeup_conn(conn: &Connection, w: &WakeupRow) -> Result<(), String> {
+    if let Some(filter) = &w.event_filter_json {
+        require_safe_contract(filter)?;
+    }
     conn.execute(
         &format!("INSERT INTO task_wakeups ({WAKEUP_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
         params![
@@ -97,7 +100,7 @@ fn retire_subscriptions_conn(
     conn.execute(
         "UPDATE wakeup_fires SET state = 'dropped', drop_reason = ?2, settled_at = ?3
           WHERE responsibility_id = ?1 AND state = 'pending'",
-        params![id, drop_reason, now],
+        params![id, mask_derived_text(drop_reason), now],
     )
     .map_err(|e| format!("drop pending fires: {e}"))?;
     Ok(())
@@ -113,6 +116,14 @@ impl TaskStore {
         wakeups: &[WakeupRow],
         init_event_cursor: Option<i64>,
     ) -> Result<(), String> {
+        for field in [&row.objective, &row.acceptance_template, &row.scope_json,
+            &row.source_refs_json, &row.notification_policy_json]
+        {
+            require_safe_contract(field)?;
+        }
+        if let Some(schedule) = &row.schedule_json {
+            require_safe_contract(schedule)?;
+        }
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -125,7 +136,7 @@ impl TaskStore {
                 row.notification_policy_json, row.schedule_json, row.occurrence_hours,
                 row.occurrence_cost_cap_cents, row.budget_period, row.budget_timezone,
                 row.period_cost_limit_cents, row.period_occurrence_limit, row.min_wake_interval_secs,
-                row.max_consecutive_failures, row.stop_at, row.state, row.state_reason,
+                row.max_consecutive_failures, row.stop_at, row.state, row.state_reason.as_deref().map(mask_derived_text),
                 row.state_changed_by, row.state_changed_at, row.contract_revision,
                 row.contract_hash, row.control_epoch, row.consecutive_failures,
                 row.last_occurrence_at, row.created_at, row.updated_at
@@ -202,6 +213,7 @@ impl TaskStore {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<RespCas, String> {
+        let reason = mask_derived_text(reason);
         let now = resp_ts(now);
         self.resp_state_cas(
             id,
@@ -272,7 +284,7 @@ impl TaskStore {
                         state_reason=?3, state_changed_by=?4, state_changed_at=?5, updated_at=?5
                   WHERE responsibility_id=?1 AND control_epoch=?2
                     AND state IN ('active','paused','budget_paused','failure_paused')",
-                params![id, expected_epoch, reason, actor, now],
+                params![id, expected_epoch, mask_derived_text(reason), actor, now],
             )
             .map_err(|e| format!("disable responsibility: {e}"))?;
         if n == 1 {
@@ -347,6 +359,14 @@ impl TaskStore {
         resubscribe: Option<&(dyn Fn(i64) -> Result<Vec<WakeupRow>, String> + Sync)>,
         now: DateTime<Utc>,
     ) -> Result<RespCas, String> {
+        for field in [&contract.objective, &contract.acceptance_template, &contract.scope_json,
+            &contract.source_refs_json, &contract.notification_policy_json]
+        {
+            require_safe_contract(field)?;
+        }
+        if let Some(schedule) = &contract.schedule_json {
+            require_safe_contract(schedule)?;
+        }
         let now = resp_ts(now);
         let epoch_bump: i64 = resubscribe.is_some() as i64;
         let mut conn = self.conn.lock().await;
@@ -613,11 +633,11 @@ impl TaskStore {
                     uuid::Uuid::new_v4().to_string(),
                     fire.wakeup_id,
                     fire.fire_key,
-                    fire.reason,
-                    data_json,
-                    guard_flags_json,
+                    mask_derived_text(&fire.reason),
+                    data_json.map(mask_derived_text),
+                    guard_flags_json.map(mask_derived_text),
                     state,
-                    drop_reason,
+                    drop_reason.map(mask_derived_text),
                     now_s,
                     settled
                 ],

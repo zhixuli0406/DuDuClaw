@@ -12,13 +12,13 @@ DuDuClaw に一発で移行するコマンドです。デフォルトは**プレ
 duduclaw migrate from openclaw
 
 # 計画を確認したうえで実際に適用
-duduclaw migrate from openclaw --apply
+duduclaw migrate from openclaw --apply --confirm-profile <preview-digest>
 ```
 
 ## コマンド
 
 ```
-duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip|claude-code> [--source <path>] [--apply] [--confirm-profile <digest>] [--rename] [--agent <id>] [--no-redact] [--json]
 ```
 
 | フラグ | 動作 |
@@ -27,6 +27,10 @@ duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [-
 | `--source <path>` | 移行元ディレクトリを指定。openclaw/hermes にはデフォルト値あり。**paperclip では必須**。 |
 | `--apply` | 実際に書き込みを実行する。 |
 | `--rename` | 同名の agent がある場合、スキップせず `-imported` サフィックス付きでインポートする。 |
+| `--confirm-profile <digest>` | OpenClaw、Hermes、paperclip の `--apply` に必須。プレビューの確認ダイジェストを使用。`claude-code` には不要。 |
+| `--agent <id>` | 既存の移行先スタッフを指定。`claude-code` では必須。 |
+| `--no-redact` | `claude-code` の会話記録で既定の個人情報マスキングを無効にする。 |
+| `--json` | 通常の表示の代わりに、機械可読な単一の JSON 結果を出力。 |
 
 各項目には以下のいずれかのステータスが付きます。
 
@@ -46,7 +50,7 @@ duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [-
 
 ```bash
 duduclaw migrate from openclaw            # デフォルトの移行元は ~/.openclaw
-duduclaw migrate from openclaw --source /path/to/.openclaw --apply
+duduclaw migrate from openclaw --source /path/to/.openclaw --apply --confirm-profile <preview-digest>
 ```
 
 `openclaw.json`（JSON5）を読み込み、以下をインポートします。
@@ -54,7 +58,7 @@ duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 - **Agents**：`agents.list[]`（未指定の場合は単一の `main`）。それぞれの workspace
   ファイルは [AI スタッフの取り込み](agent-config-import.md#各ファイルの取り込み先) と同じ配置になる：
   `SOUL.md` → SOUL、`IDENTITY.md` → IDENTITY（名前と絵文字も）、`AGENTS.md` → `INSTRUCTIONS.md`、
-  `USER.md`／`TOOLS.md`／`HEARTBEAT.md` → ナレッジページ、`MEMORY.md` と `memory/*.md` → 記憶（元ファイルを記録）。
+  `USER.md` → 利用者データ、`TOOLS.md`／`HEARTBEAT.md` → ナレッジページ、`MEMORY.md` と `memory/*.md` → 記憶（元ファイルを記録）。
   1.76 より前はペルソナファイルが `agents/<id>/memory/` にコピーされるだけで、どこからも読まれていなかった。
 - **チャンネルトークン**：`channels.telegram.botToken`、`channels.discord.token`、
   `channels.slack.botToken` + `appToken`（暗号化して config.toml に書き込み）。
@@ -72,9 +76,9 @@ duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 ### Hermes（`~/.hermes`）
 
 ```bash
-duduclaw migrate from hermes --apply
+duduclaw migrate from hermes --apply --confirm-profile <preview-digest>
 # active ではない profile を移行する場合：
-duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply
+duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply --confirm-profile <preview-digest>
 ```
 
 Hermes はシングル agent プラットフォームなので、DuDuClaw agent を 1 つ（id は
@@ -84,7 +88,7 @@ Hermes はシングル agent プラットフォームなので、DuDuClaw agent 
 - **チャンネルトークン**（`.env` から）：`TELEGRAM_BOT_TOKEN`、`DISCORD_BOT_TOKEN`、
   `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`。`EMAIL_*` チャンネルは v1 では未対応のため
   `SKIPPED`。
-- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`（記憶。`§` で項目を分割）、`memories/USER.md`（ナレッジページ「服務對象」）。
+- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`（記憶。`§` で項目を分割）、`memories/USER.md`（ネイティブ `USER.md`）。
 - **Cron**：`cron/jobs.json`（防御的にパース）。
 - 移行対象は **active な profile のみ**。それ以外の profile は `SKIPPED` として一覧
   表示され、`--source` を使って個別に移行するよう案内されます。
@@ -98,7 +102,7 @@ paperclip のデータは組み込みの PostgreSQL に格納されており、D
 paperclipai company export <company-id> --out ./export \
   --include company,agents,projects,issues,tasks,skills
 
-duduclaw migrate from paperclip --source ./export --apply
+duduclaw migrate from paperclip --source ./export --apply --confirm-profile <preview-digest>
 ```
 
 `--source` は**必須**です（指定しない場合は上記の手順が表示されます）。インポート
@@ -153,3 +157,9 @@ CONFLICT は移行先にすでに値があり、既存の設定を守るため�
 `[model] preferred` にそのまま保持され `PARTIAL` としてマークされます。どの
 runtime（codex / openai_compat）にマッピングするかは人手での確認が
 必要になります。DuDuClaw が代わりに推測することはありません。
+
+## プロファイルの確認と Claude Code
+
+OpenClaw、Hermes、paperclip の移行は Persona、User、Rules、Contract と入力検査結果をプレビューに表示します。適用には対応する `--confirm-profile <digest>` が必要で、セクションの内容が変われば再確認します。この移行ダイジェストは Persona、User、Rules、Contract の四つのセクションだけを対象とし、移行で出力する全ファイルを対象にはしません。`pack install` にもプレビューの `--confirm-profile <digest>` が必要で、こちらは書き込む全ファイルを対象にします。AI セッションからは実行できません。`USER.md` は最大 4,000 文字で、指示ではなくデータとして挿入します。
+
+Claude Code も対応します：`duduclaw migrate from claude-code --source ~/.claude --agent <既存ID>`。プレビューの確認後に `--apply` を付けます。この経路に `--confirm-profile` は不要です。整理済みの記憶、低信頼度のナレッジページ、フィルタ済みの会話記録を既存スタッフに取り込み、新しいスタッフは作りません。逐語録の個人情報マスキングは既定で有効で、`--no-redact` で無効にできます。

@@ -75,7 +75,7 @@ impl MethodHandler {
                 if let Some(obj) = capabilities_json.as_object_mut() {
                     // Empty lists are skipped on serialize; the editors need
                     // a stable `string[]`.
-                    for k in ["approval_required_tools", "irreversible_tools", "maybe_irreversible_tools", "scoped_tools"] {
+                    for k in ["approval_required_tools", "irreversible_tools", "maybe_irreversible_tools", "scoped_tools", "recipients"] {
                         obj.entry(k).or_insert_with(|| json!([]));
                     }
                 }
@@ -129,7 +129,7 @@ impl MethodHandler {
                                 "use_router": l.use_router,
                             })),
                         },
-                        "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop, "daily_cap_cents": cfg.budget.daily_cap_cents },
+                        "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop, "when_unavailable": cfg.budget.when_unavailable, "daily_cap_cents": cfg.budget.daily_cap_cents },
                         "heartbeat": {
                             "enabled": cfg.heartbeat.enabled,
                             "interval_seconds": cfg.heartbeat.interval_seconds,

@@ -36,6 +36,61 @@ use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+/// Dynamic visibility of agent-own collections. Stored ACLs remain untouched.
+/// Read errors deny even when an old user or department grant still exists.
+pub(crate) fn collection_visible(home: &Path, conn: &Connection, id: &str, admin: bool) -> bool {
+    collection_visible_to(home, conn, id, admin, None)
+}
+
+fn collection_visible_to(
+    home: &Path, conn: &Connection, id: &str, admin: bool,
+    unattended_agent: Option<&acl::AgentCtx>,
+) -> bool {
+    use rusqlite::OptionalExtension;
+    if admin { return true; }
+    let owner = conn.query_row(
+        "SELECT agent_id FROM agent_own_collections WHERE collection_id=?1",
+        [id], |r| r.get::<_, String>(0),
+    ).optional();
+    match owner {
+        Ok(None) => true,
+        Ok(Some(owner)) => unattended_agent.is_some_and(|agent| agent.agent_id == owner)
+            || !crate::machine_employee::requires_admin_for_id(home, &owner),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn filter_readable(
+    home: &Path, conn: &Connection, human: &acl::HumanCtx,
+    agent: Option<&acl::AgentCtx>, allowed: &acl::AllowedSet,
+) -> acl::AllowedSet {
+    let unattended_agent = if human.mode == acl::HumanMode::InternalOnly { agent } else { None };
+    allowed.filtered(|id| collection_visible_to(home, conn, id, human.is_admin, unattended_agent))
+}
+
+pub(crate) fn effective_collections(
+    home: &Path, conn: &Connection, human: &acl::HumanCtx,
+    agent: Option<&acl::AgentCtx>, narrowing: &acl::Narrowing,
+) -> KbResult<acl::AllowedSet> {
+    let allowed = acl::effective_collections(conn, human, agent, narrowing)?;
+    Ok(filter_readable(home, conn, human, agent, &allowed))
+}
+
+pub(crate) fn require_role(
+    home: &Path, conn: &Connection, id: &str, user_id: &str,
+    department: Option<&str>, admin: bool, min: Role,
+) -> KbResult<Role> {
+    if !collection_visible(home, conn, id, admin) { return Err(KbError::PermissionDenied); }
+    acl::require_role(conn, id, user_id, department, admin, min)
+}
+
+pub(crate) fn list_for_user(
+    home: &Path, conn: &Connection, user: &ResolvedUser,
+) -> KbResult<Vec<store::CollectionSummary>> {
+    Ok(store::list_for_user(conn, &user.user_id, user.department.as_deref(), user.is_admin)?
+        .into_iter().filter(|c| collection_visible(home, conn, &c.collection.id, user.is_admin)).collect())
+}
+
 /// Most rows returned per principal kind.
 pub const MAX_RESULTS_PER_KIND: usize = 50;
 /// People are returned only for a search at least this long (characters).
@@ -154,6 +209,7 @@ fn matches(query: &str, fields: &[&str]) -> bool {
 
 /// Admin, or the owner of `collection_id` (of any collection when `None`).
 fn require_granting_owner(
+    home: &Path,
     conn: &Connection,
     user: &ResolvedUser,
     collection_id: Option<&str>,
@@ -162,7 +218,8 @@ fn require_granting_owner(
         return Ok(());
     }
     if let Some(id) = collection_id {
-        acl::require_role(
+        require_role(
+            home,
             conn,
             id,
             &user.user_id,
@@ -172,7 +229,7 @@ fn require_granting_owner(
         )?;
         return Ok(());
     }
-    let owned = store::list_for_user(conn, &user.user_id, user.department.as_deref(), false)?
+    let owned = list_for_user(home, conn, user)?
         .iter()
         .any(|c| c.my_role == Some(Role::Owner));
     if owned {
@@ -195,7 +252,7 @@ pub fn search(
         .get("collection_id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
-    require_granting_owner(&conn, user, collection_id)?;
+    require_granting_owner(home, &conn, user, collection_id)?;
     let query = params
         .get("query")
         .and_then(Value::as_str)
@@ -333,7 +390,8 @@ pub fn check_new_grants(
         return Ok(());
     };
     let conn = schema::open_home(home)?;
-    acl::require_role(
+    require_role(
+        home,
         &conn,
         collection_id,
         &user.user_id,

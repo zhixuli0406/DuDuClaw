@@ -40,19 +40,34 @@ Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0
 
 每位員工有獨立且容量固定的 Bloom filter 記錄回合登記；同一 gateway 程序存續期間不清除，因此被淘汰或到期的回合重新登記也不能變回乾淨。雜湊碰撞或 filter 飽和時，可能保守地將該員工的新回合視為已污染。最多保留 1,024 位員工的歷史，每位 32 KiB、合計 32 MiB；超過此上限的其他員工，其回合一律視為已污染。這份歷史不跨重啟保存。
 
+## 外送觀察報表
+
+管理員可在安全頁查看最近 7 或 30 個 UTC 日期的觀察紀錄。預估開單數按原本會詢問的呼叫計算，事前檢查與送出前確認共用呼叫 ID，不會重複開算。原本會拒絕的紀錄列入分類，但不算核准單。分類涵蓋員工、工具、固定的私人資料來源類別、日期，以及 CLI 內建工具／MCP 入口。空白表示沒有保存的觀察資料，不代表沒有風險；寫入失敗不改變閘門決策，因此報表可能不完整。
+
+計數根據員工自身活動，只是估算。員工反覆呼叫可灌高數字；有 Bash 權限的員工也能修改 shadow 資料庫檔案。儲存上限為每位員工每日 10,000 筆明細、總計 1,000,000 筆；超出部分按員工與日期累計，因此封頂數字代表至少顯示的數量。
+
+`<home>/egress_shadow.db` 使用 SQLite WAL，Unix 權限 0600，保留 35 天；有新寫入時每小時最多清理一次。不存內容、收件對象或自由文字來源名稱，不受工具呼叫稽核輪替大小限制。RPC `security.egress_shadow_report` 只接受 `days: 7` 或 `days: 30`，限 Admin。
+
+報表涵蓋 MCP 外送閘門評估、電腦操作與 gateway hook 檢查。讀取預約衝突、不支援 runtime 的啟動警告及本機 hook 傳輸失敗，仍留在工具稽核紀錄，不納入這份呼叫計數。
+
 ## 復原
 
-檢查 gateway 日誌中的 `egress lease store unavailable; private reads fenced` 與 `error` 欄位。超限會顯示 `egress agent lease store over capacity` 或 `egress lease store over capacity`；格式異常列會顯示 `invalid egress lease row`，SQLite 檔案損壞則可能顯示資料庫錯誤。Gateway 每五秒重試，每分鐘最多記錄一次錯誤。`ask`／`block` 下，私人讀取與新外送會被拒絕。Gateway 回覆的拒絕原因為「外送防護紀錄無法讀取，暫停私人讀取及對外動作；請稍後重試。」，呼叫端也可能顯示一般的稍後重試提示。目前儀表板與 `doctor` 沒有專用的 lease store 健康狀態指標。
+`duduclaw doctor` 會顯示外送租約筆數、最舊租約年齡與是否可讀。健康檢查異常時，查看 gateway 日誌的 `egress lease store unavailable; private reads fenced` 與 `error` 欄位。紀錄無法讀取時，`ask`／`block` 拒絕私人讀取與新外送。
 
-外送動作（sink）可能仍在執行時，不可直接刪除資料庫：其中的列可能是唯一留下、能阻止平行私人讀取的 fence。若紀錄無法恢復，請依序離線處理：
+清除前先停止使用這個 home 的所有 gateway、暫停自動重啟，並確認員工 CLI 與 MCP／工具子程序的外送動作都已停止。若舊動作可能還在執行，保留其保護並先查明狀態。
 
-1. 停止使用這個 home 的所有 gateway，並暫停自動重啟。
-2. 將所有現存的 `<home>/egress_leases.db*` 檔案一起備份到私人位置，包含 WAL／SHM sidecar，保留原權限。
-3. 確認沒有員工 CLI 程序及其 MCP／工具子程序仍在執行，且它們的外送動作已停止。無法確認時，保持 gateway 停止，不要重設紀錄。
-4. 將資料庫與所有對應 sidecar 一起移到別處，保留備份；不要刪除 `egress_leases.lock`。
-5. 啟動 gateway，系統會建立空的 lease store。**所有先前的外送 fence 都會丟棄。** 若舊動作仍在執行，就會失去防止平行私人讀取的保護，因此只有完成第 3 步確認後才能重啟。確認日誌不再出現該錯誤，並檢查私人讀取與外送准入恢復正常。
+```sh
+duduclaw egress-leases list --json
+duduclaw egress-leases clear --all --confirm <list-顯示的-token>
+# 單筆清除改用 list 顯示的該筆 token：
+duduclaw egress-leases clear --lease <id> --confirm <該筆-token>
+```
 
-後續規劃提供受支援的離線復原指令；本版沒有復原 CLI。
+從操作者自己的終端機執行；AI 工作階段會被拒絕。兩個指令都要求 gateway 停止且租約鎖可用；gateway 鎖無法讀取時拒絕，不把未知狀態當成已停機。`clear` 持有租約獨占鎖，讀出目前租約，先建立帶時間戳、權限 0600 的資料庫備份，再比對排序後所選租約 ID 的確認 token，以單一交易刪除並寫入安全稽核。集合改變就會使 token 失效。保留備份，絕不刪除 `egress_leases.lock`。
+
+`egress-leases` 是操作者工具。AI 工作階段檢查依賴環境標記；以相同 OS 帳號執行的 FullAccess shell 可以繞過檢查。Windows 不會套用租約資料庫的硬連結檢查。
+
+清除租約會移除其阻止平行私人讀取的保護。確認對應外送已停止才重新啟動，再檢查 doctor 與 gateway 行為。此指令不會修復損壞或無法讀取的資料庫；遇到拒絕應查明原因，不要藉刪除資料庫或鎖檔繞過。復原採離線本機確認，因為儀表板核准需要 gateway 執行，與停機要求衝突。
 
 ## 核准前看清楚
 
@@ -60,15 +75,38 @@ Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0
 
 動作規則要求核准時，卡片會列出命中的工具或動作類別規則，讀取與草稿工具也會顯示。購買與刪除不能新增常設能力授權或工作流程授權；舊授權會被忽略，原紀錄保留。其他檢查與逐次核准仍然適用。
 
+## CLI 內建工具
+
+Claude 與 Grok 安裝 `PreToolUse` hook，涵蓋 `WebFetch`、`WebSearch` 與 Bash 字面網路指令。Grok 別名包含 `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command`；DuDuClaw 不保證 Grok 別名 matcher 與環境變數傳遞符合真實 CLI 行為。一般非網路 Bash 在本機直接放行，不聯絡 gateway。偵測清單為 `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`，以及 `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 參數最多重解析兩層，每段最多 64 KiB；echo/printf 中長得像指令的資料，即使沒有實際執行，也可能被保守列入。
+
+| 模式 | 未污染 | 已讀私人資料 | 帳本無法讀取或未知回合 |
+|---|---|---|---|
+| `off` | 放行 | 放行 | 放行 |
+| `shadow` | 放行 | 放行，記錄 `would_ask` | 放行，記錄 `would_refuse_ledger_unavailable` |
+| `ask` | 放行 | 開審批，拒絕並等待重試 | 拒絕 |
+| `block` | 放行 | 拒絕 | 拒絕 |
+
+Hook 將原始工具參數送至 `/api/internal/egress-guard/hook-check`，由 gateway 正規化、雜湊並產生卡片；不接受呼叫端提供的 digest 或摘要。請求與回覆都有簽章，埠從 `config.toml` 讀取，不依賴環境中的埠變數。Hook 有獨立的每員工每分鐘 120 次額度。審批的委託者來自 gateway 登錄的執行脈絡；無法驗證時不開單，避免略過禁止自行核准的政策。
+
+`ask` 第一次先開單並拒絕；目前具 Admin 身分的人在儀表板核准後，於同一回合以完全相同參數重試。審批綁定員工、回合、工具、完整參數及私人資料來源；`WebFetch` 包含完整 URL 與查詢字串。相同待決請求重用同一張卡，新增來源使舊卡失效。核准只可消耗一次，再重試需要新核准。Bash 只有一個直接、簡單指令與一個網路動詞能開單，不接受展開、替換、管線、重導向、`@file`、包裝指令或解釋器；需要核准時，不支援的形狀直接拒絕並解釋原因。綁定的是文字，不是 DNS 結果、執行檔內容、設定檔或符號連結指向。
+
+`ask`／`block` 的 hook 錯誤與可捕捉的 panic 一律 exit 2；安裝失敗停止啟動，不輪替帳號或 runtime。`shadow` 記錄警告並繼續。Claude 在強制模式使用 `--setting-sources "" --settings <file>`，只載入身分所屬的 `.claude/settings.json`，不併入工作目錄或使用者的其他設定，即使工作目錄不同也一樣；強制模式拒絕會略過 hook 的 `cli_bare_mode`。Grok 加上 `--disable-web-search`；目前強制模式拒絕借用／共用工作目錄，或 hook 目錄內留有其他員工 guard 的組合，請使用獨立員工目錄或 Claude/Codex。
+
+Codex 在 `ask`／`block` 加上 `-c sandbox_workspace_write.network_access=false -c web_search="disabled"`，FullAccess 降為 WorkspaceWrite，ReadOnly 保持更嚴，保留 MCP 的自動核准器。這是啟動時收緊網路，不是逐指令核准。通用 CLI 仍未涵蓋，強制模式記錄 `would_refuse_unsupported_runtime`。OpenAI 相容工具迴圈維持 MCP 閘門。
+
+Cron、派工、提醒、信件、heartbeat、ephemeral 執行入口改為獨立於通道 requester 登錄 host 回合並傳遞 `DUDUCLAW_TURN_ID`，也登錄 `default` 實際指向的員工。既有污染不會被清除；未知呼叫端回合仍視為污染。
+
+**Bash hook 是減速帶與遙測，不是隔離邊界。** 內建 `Read` 與 Bash 讀檔不會標記污染。解釋器、腳本、別名、改名執行檔、`/dev/tcp`、動態組裝指令都可能繞過字面偵測。Hook 程式不存在、被殺或逾時，可能被上游 CLI 忽略。同一 OS 使用者可存取的 hook、金鑰與環境變數，不受簽章機制隔離。原生工具的事前檢查也不會持有 MCP sink lease 到執行結束，無法阻止檢查後的並行讀取。需要隔離時不授予 Bash，或使用任務沙箱；任務沙箱只涵蓋派工任務，不涵蓋所有通道／CLI 執行。安全頁會列出強制模式下有 Bash 且未開任務沙箱的員工。
+
+
 ## 已知限制
 
 直接由 `[[mcp.external]]` 掛入 API 工具迴圈的工具（stdio、HTTP 與 Google 封閉橋接）也會經過檢查。這條路徑的工具登錄不保留 MCP annotations，因此全部保守視為 **Modify**；即使伺服器自述唯讀，讀過私人資料後仍可能要求外送核准，精確工具名稱的動作規則仍適用。MCP 代理與遠端橋接則保留原有 annotations 與 `trusted_read_hint_servers` 判定。
 
-這是每一輪的 MCP 邊界，不是網路沙箱。Claude CLI 原生工具（例如 `WebFetch`、透過 `Bash` 執行 `curl`）以及其他 runtime 的原生工具不在範圍內。提示中已有的私人資料、從範圍外工具取得的資料不會自動分類。新一輪使用新紀錄，不追蹤跨輪複製的資訊；gateway 重啟後不保留回合污點來源，但會恢復已持久化的外送 lease。「僅記錄」仍會允許外送。
+這是每一輪的 MCP 邊界，不是網路沙箱。CLI 內建工具檢查也涵蓋上述路徑，並未提供整個 runtime 的網路隔離。提示中已有的私人資料、從範圍外工具取得的資料不會自動分類。新一輪使用新紀錄，不追蹤跨輪複製的資訊；gateway 重啟後不保留回合污點來源，但會恢復已持久化的外送 lease。「僅記錄」仍會允許外送。
 
 另見[安全防護](05-security-defense.md)與[儀表板設定](../../guides/dashboard-settings.md)。
 
-驗證範圍：自動化測試涵蓋分類、閘門與核准行為。尚未使用實際員工與外部服務完成端到端驗證。
 
 直接外部連線的 scoped／closed 操作可能比核准卡更早逾時。逾時後再核准不會重新執行，必須重新提出工具呼叫；舊卡片可能持續顯示待核准，直到卡片上的期限。
 
@@ -81,3 +119,40 @@ Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0
 內建工具依逐一核對的精確名稱清單判定完成。本機信件草稿、任務／員工佇列與提案，以持久寫入完成為準，不代表下游工作結束。錯誤回覆保守保留 fence。`model_search`、`model_download`、`skill_search`、`codrive_run`、`browser_record_start`、`os_open` 即使表面成功，也保留到 lease 期限：彙整報告、替代下載或背景工作無法確認每個對外動作都已結束。
 
 Remote bridge 使用每次呼叫獨有的 generation wire ID，丟棄過期回覆，避免重用原始 ID 時，舊回覆提早結束新的外送 lease。呼叫端若使用保留的 `duduclaw-egress:` ID 命名空間，會收到明確拒絕。
+
+## 由伺服器綁定收件對象（未發行）
+
+收件對象防護不以「讀過私人資料」為前提。`config.toml [security] recipient_guard` 支援 `off`、`shadow`（預設）與 `ask`；未知值會警告並採用 `ask`。員工層 `[capabilities] recipient_guard` 只能收緊全域設定（`off < shadow < ask`）。安全頁「資料外送防護」可調整全域設定；Admin 可在員工編輯頁「工具與權限 → 允許的收件對象」設定額外清單。
+
+```toml
+# config.toml
+[security]
+recipient_guard = "shadow"
+
+# agents/<id>/agent.toml
+[capabilities]
+recipient_guard = "ask"
+recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+```
+
+允許集合是「本回合來源對話、已驗證的擁有者、員工設定的清單」。通道回合只有在伺服器登記的 `ChannelUser` 具有已驗證綁定（`user_id: Some(_)`）時，才提供來源收件者。未綁定的 LINE、Telegram 與公開網頁訪客，不提供副作用工具的來源收件者。在 `ask` 模式下，公開員工對未綁定訪客呼叫 `send_message` 需要 Admin 核准；對象另有已驗證擁有者身分或已列入設定清單時除外。一般回覆路徑不受影響。來源由 gateway 的回合表解析；MCP 只透過簽章內部路由傳遞不透明的回合 ID。未知回合沒有來源對話，`DUDUCLAW_REPLY_CHANNEL` 不授予收件許可。通道識別採 `parse_origin` 同款正規化，移除員工後綴與討論串後精確比對。
+
+擁有者**只來自 `users.db` 中 `AccessLevel::Owner` 的綁定**，再解析為 gateway 驗證的通道身分。`[proactive]` 通知對象可由員工修改，因此不算擁有者；需要允許時，由 Admin 加進 `[capabilities] recipients`。整個 capabilities 區段原本就禁止員工改寫，兩個新鍵也受到保護。
+
+| 模式 | 對象在允許集合內 | 對象在集合外 |
+|---|---|---|
+| `off` | 放行 | 放行 |
+| `shadow` | 放行 | 放行，在 `tool_calls.jsonl` 記錄 `recipient_guard: "would_ask"` |
+| `ask` | 放行 | 需要 Admin 單次核准 |
+
+核准卡會寫明「目標不是來源對話，也不在允許清單中」。與外送防護同時要求核准時，只開一張卡並列出兩個原因。ActionGrant 綁定員工、工具及完整參數；修改對象或內容需要重新核准。shadow 不會因收件對象阻擋呼叫。
+
+涵蓋 `send_message`、`send_photo`、`send_sticker`、`create_reminder`、`mail_send`，以及 `tasks_create`／`update_cron_task` 的 `notify_channel`、`notify_chat_id`、`notify_thread_id`。`calendar_create_event` 的 attendees 以郵件收件人檢查。排程通知在建立時及實際觸發時依當下設定重新檢查；觸發時來源集合為空，只有已驗證擁有者與設定清單能直接放行。
+
+`responsibility_ask` 的核准對象由伺服器路由，不讓模型指定收件人；`os_notify` 只顯示本機通知。`github_issue_comment` 指定的是議題資源，仍受外送與動作政策約束。`send_to_agent`、`spawn_agent`、`team_handoff` 維持委派政策；第三方 MCP 若沒有收件者 adapter，Send、Publish 與其他可能向外傳送資料的效果，在 `ask` 模式下都需要 Admin 核准，不以讀過私人資料為前提。第三方閘門保守涵蓋 Modify、Delete、Purchase、Admin；可信的 Read 與 Draft 除外。未知工具無可信的收件者解析，採 fail closed。`shadow` 記錄 `recipient_would_ask`（`recipient_guard: "would_ask"`）；`off` 不增加收件者核准。名為 `to` 的參數本身不算可信 adapter。
+
+實際傳送地址不能用對話後綴冒充清單中的收件人；Discord 通知 thread 會連同父頻道一起檢查。`update_cron_task` 修改通知目的地時，必須同時提供 `notify_channel` 與 `notify_chat_id`，空值配對可清除通知；任務與路由欄位一併原子寫入。等待其他核准後會再檢查收件權限。臨時助手繼承父員工的收件防護模式與設定清單，已驗證 owner 綁定仍以各員工為準。
+
+這項防護只涵蓋產品路徑，無法隔離具有同一使用者無限制檔案或網路權限的程序。
+
+具有無限制 Bash 權限的員工與系統以同一個 OS 使用者執行，可以修改本機政策或繞過 MCP 傳送路徑；收件對象防護無法阻止。即使 `egress_guard` 為 off 或 shadow，只要員工有效的 `recipient_guard` 為 `ask`，安全頁也會列出可用 Bash 且未開啟任務沙箱的員工。

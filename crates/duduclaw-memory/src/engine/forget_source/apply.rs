@@ -69,6 +69,7 @@ fn diff(planned: &PlanBody, now: &PlanBody) -> StaleReason {
         "entity_embeddings_orphaned",
         planned.entity_embeddings_orphaned == now.entity_embeddings_orphaned,
     );
+    part("orphan_entity_ids", planned.orphan_entity_ids == now.orphan_entity_ids);
     part("wiki_pages", planned.wiki_pages == now.wiki_pages);
     part(
         "review_cards_matching",
@@ -265,6 +266,8 @@ fn write_apply(
         plan_id: plan.plan_id.clone(),
         agent_id: agent.to_string(),
         plan_hash: plan.plan_hash.clone(),
+        system_rows: c.body.system_rows,
+        retained_shared: c.body.retained_shared,
         untracked_in_namespace_planned: doc.body.untracked_in_namespace,
         untracked_in_namespace_at_apply: c.body.untracked_in_namespace,
         other_namespaces_referencing_planned: doc.body.other_namespaces_referencing,
@@ -272,6 +275,14 @@ fn write_apply(
         ..Default::default()
     };
 
+    if let Some(reference) = &doc.selector.connector_ref {
+        conn.execute(
+            "INSERT INTO forgotten_connectors(agent_id,connector_ref,upto_time,plan_id)
+             VALUES(?1,?2,?3,?4) ON CONFLICT(agent_id,connector_ref) DO UPDATE SET
+             upto_time=MAX(upto_time,excluded.upto_time),plan_id=excluded.plan_id",
+            params![agent,reference,doc.selector.upto_time,plan.plan_id],
+        ).map_err(e)?;
+    }
     // Tombstones first: from here on no write can carry the source.
     for t in &c.tombstones {
         report.tombstones_written += conn
@@ -392,6 +403,10 @@ fn write_apply(
             del.execute(params![store, id, agent]).map_err(e)?;
         }
     }
+    conn.execute(
+        "DELETE FROM memory_connector_stamps WHERE (memory_store,memory_id) IN
+         (SELECT CASE WHEN store='archive' THEN 'memories' ELSE store END,id FROM temp.forget_ids)", [],
+    ).map_err(e)?;
     engine.hooks.fire_apply(ApplyHookPoint::AfterDeletes)?;
 
     // Supersession chain repair (§7.2, D2: a predecessor stays closed).
@@ -456,5 +471,9 @@ fn write_apply(
         params![now, plan.plan_id, scrubbed.canonical_json()?],
     )
     .map_err(e)?;
+    conn.execute(
+        "INSERT INTO memory_forget_apply_reports(plan_id,report_json) VALUES(?1,?2)",
+        params![plan.plan_id,serde_json::to_string(&report).map_err(e)?],
+    ).map_err(e)?;
     Ok(report)
 }

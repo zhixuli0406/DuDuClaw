@@ -196,6 +196,9 @@ impl NightLlm for RotatedNightLlm {
         // Night compute is pure reasoning: spawn with an explicit zero-tools
         // allowlist. `None` here would mean DEFAULT caps — i.e. the full tool
         // + MCP surface under --dangerously-skip-permissions.
+        let agent_dir = crate::budget::agent_dir_for_id(&self.home_dir, &self.agent_id);
+        crate::budget::gate_before_spawn(&self.home_dir, Some(&agent_dir), &self.agent_id, "night")
+            .await.map_err(|e| e.to_string())?;
         let caps = night_capabilities();
         // ── 1) Rotated Claude CLI (subscription quota first) ──
         let cli_err = match crate::channel_reply::call_claude_cli_rotated(
@@ -229,6 +232,9 @@ impl NightLlm for RotatedNightLlm {
             Ok(_) => "empty CLI response".to_string(),
             Err(e) => truncate_chars(&e, 200),
         };
+
+        crate::budget::gate_before_spawn(&self.home_dir, Some(&agent_dir), &self.agent_id, "night_direct_fallback")
+            .await.map_err(|e| e.to_string())?;
 
         // ── 2) Direct API fallback (paid, only if an API key is stored) ──
         let api_key = crate::claude_runner::get_api_key_from_home(&self.home_dir).await;
@@ -445,5 +451,22 @@ mod tests {
         );
         assert!(!inf.text.trim().is_empty(), "live call must return text");
         assert!(inf.cost_millicents >= 1, "live call must charge something");
+    }
+}
+
+#[cfg(test)]
+mod budget_entry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn budget_refuses_night_before_cli_or_direct_api_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "not valid [[[").unwrap();
+        let llm = RotatedNightLlm::new(home.path().to_path_buf(), "a".into(), "claude-sonnet-4-6".into());
+        let error = llm.infer("", "never execute").await.err().expect("budget refused");
+        assert!(error.contains("無法確認預算"), "{error}");
+        assert!(!error.contains("API key"));
     }
 }

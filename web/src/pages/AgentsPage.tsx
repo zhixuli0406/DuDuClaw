@@ -1,3 +1,5 @@
+import { useVisibleAgents, type VisibleAgent } from '@/lib/data-scope';
+import { useAuthStore } from '@/stores/auth-store';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link, useNavigate } from 'react-router';
@@ -87,7 +89,7 @@ export function AgentsPage() {
   const navigate = useNavigate();
   const errorText = useErrorMessage();
   const {
-    agents,
+    agents: directAgents,
     fetchAgents,
     pauseAgent,
     resumeAgent,
@@ -99,7 +101,9 @@ export function AgentsPage() {
     error,
     clearError,
   } = useAgentsStore();
-  const { tasks, fetchTasks } = useTasksStore();
+  const agents = useVisibleAgents();
+  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
+  const { tasks, fetchTasks, error: tasksError, tasksPartialError, loading: tasksLoading } = useTasksStore();
 
   const [scope, setScope] = useState<Scope>('active');
   // UX plan I-1a: "交辦任務" on an employee card opens the one shared panel with
@@ -134,7 +138,7 @@ export function AgentsPage() {
    * Confirm the success, and say so plainly when it didn't happen.
    */
   const runLifecycle = useCallback(
-    async (fn: () => Promise<void>, successId: string, agent: AgentDetail) => {
+    async (fn: () => Promise<void>, successId: string, agent: VisibleAgent) => {
       clearError();
       try {
         await fn();
@@ -175,7 +179,7 @@ export function AgentsPage() {
         title={intl.formatMessage({ id: 'agents.title' })}
         count={visible.length}
         description={intl.formatMessage({ id: 'nav.agents.desc' })}
-        action={hireButton}
+        action={isAdmin ? hireButton : undefined}
       />
 
       {/* Scope control row. */}
@@ -208,7 +212,7 @@ export function AgentsPage() {
             id: scope === 'archived' ? 'agents.scope.archived' : 'agents.empty',
           })}
           action={
-            scope === 'active' ? (
+            scope === 'active' && isAdmin ? (
               <Button variant="brand" size="sm" onClick={openCreate}>
                 <Plus />
                 {intl.formatMessage({ id: 'agents.empty.cta' })}
@@ -237,7 +241,7 @@ export function AgentsPage() {
             <AgentRow
               key={agent.name}
               agent={agent}
-              taskCount={agentTaskStats(tasks, agent.name).total}
+              taskCount={agent.readOnly || tasksError || tasksPartialError || tasksLoading ? null : agentTaskStats(tasks, agent.name).total}
               onPause={() => void runLifecycle(() => pauseAgent(agent.name), 'agentDetail.rested', agent)}
               onResume={() => void runLifecycle(() => resumeAgent(agent.name), 'agentDetail.resumed', agent)}
               onDelegate={() => openAssign({ agentId: agent.name })}
@@ -245,7 +249,7 @@ export function AgentsPage() {
               onUnarchive={() =>
                 void runLifecycle(() => unarchiveAgent(agent.name), 'agents.unarchive.done', agent)
               }
-              onOffboard={() => setOffboardTarget(agent)}
+              onOffboard={() => setOffboardTarget(directAgents.find(a => a.name === agent.name) ?? null)}
             />
           ))}
         </ListGridContainer>
@@ -278,8 +282,8 @@ function AgentRow({
   onUnarchive,
   onOffboard,
 }: {
-  agent: AgentDetail;
-  taskCount: number;
+  agent: VisibleAgent;
+  taskCount: number | null;
   onPause: () => void;
   onResume: () => void;
   onDelegate: () => void;
@@ -315,8 +319,8 @@ function AgentRow({
           >
             {agent.display_name}
           </Link>
-          <span className="truncate text-xs text-muted-foreground">
-            {agent.trigger || intl.formatMessage({ id: `agents.role.${agent.role}` })}
+          <span className="truncate text-xs text-muted-foreground" title={agent.readOnly ? intl.formatMessage({ id: 'agents.teamReadOnly' }) : undefined}>
+            {agent.readOnly ? intl.formatMessage({ id: 'agents.teamMember' }, { name: agent.teamMember }) : agent.trigger || intl.formatMessage({ id: `agents.role.${agent.role}` })}
           </span>
         </div>
       </ListGridCell>
@@ -326,7 +330,7 @@ function AgentRow({
         <span className={cn('mr-2 size-1.5 shrink-0 rounded-full', statusDotClass(agent.status, archived))} />
         <span className="flex min-w-0 flex-col leading-tight">
           <span className="truncate text-sm text-foreground">{statusLabel}</span>
-          {taskCount > 0 && (
+          {taskCount !== null && taskCount > 0 && (
             <span className="truncate text-xs text-muted-foreground">
               {intl.formatMessage({ id: 'agents.list.taskCount' }, { count: taskCount })}
             </span>
@@ -359,12 +363,12 @@ function AgentRow({
 
       {/* Task count. */}
       <ListGridCell hideBelow className="justify-end">
-        <span className="font-mono text-xs tabular-nums text-muted-foreground">{taskCount}</span>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{taskCount ?? intl.formatMessage({ id: 'agents.tasks.unavailable' })}</span>
       </ListGridCell>
 
       {/* Kebab. */}
       <ListGridCell className="justify-end">
-        <DropdownMenu>
+        {!agent.readOnly && <DropdownMenu>
           <DropdownMenuTrigger
             render={
               <Button
@@ -418,7 +422,7 @@ function AgentRow({
               )
             )}
           </DropdownMenuContent>
-        </DropdownMenu>
+        </DropdownMenu>}
       </ListGridCell>
     </ListGridRow>
   );

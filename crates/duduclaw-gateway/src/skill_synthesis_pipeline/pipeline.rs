@@ -452,6 +452,12 @@ async fn graduate_trajectories(
         // system prompt); any other provider routes through the registry
         // choke-point. Falls back to global config / Claude when unconfigured.
         let agent_dir = config.home_dir.join("agents").join(&config.target_agent_id);
+        if let Err(refusal) = crate::budget::gate_before_spawn(
+            &config.home_dir, Some(&agent_dir), &config.target_agent_id, "skill_synthesis",
+        ).await {
+            errors.push(format!("{span_prefix} {refusal}"));
+            break;
+        }
         let spec = crate::runtime_config::resolve_utility(&config.home_dir, Some(&agent_dir));
         match duduclaw_core::autonomy_gate::check(
             &config.home_dir, &config.target_agent_id,

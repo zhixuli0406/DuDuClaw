@@ -16,6 +16,8 @@ vi.mock('@/lib/ws-client', () => ({
   },
 }));
 
+const pendingApprovals = (count: number) => Array.from({ length: count }, (_, id) => ({ id: `pending-${id}` }));
+
 let useApprovalsStore: typeof import('./approvals-store').useApprovalsStore;
 let useTasksStore: typeof import('./tasks-store').useTasksStore;
 let useAuthStore: typeof import('./auth-store').useAuthStore;
@@ -35,16 +37,21 @@ beforeEach(async () => {
   ({ useAgentsStore } = await import('./agents-store'));
   call.mockReset();
   call.mockImplementation((method: string) => {
-    if (method === 'approvals.list') return Promise.resolve({ approvals: [], count: 2 });
+    if (method === 'approvals.list') return Promise.resolve({ approvals: pendingApprovals(2), count: 99 });
     if (method === 'budget.incidents') return Promise.resolve({ incidents: [] });
     if (method === 'tasks.list') return Promise.resolve({ tasks: [] });
+    if (method === 'install_requests.list') return Promise.resolve({ requests: [] });
+    if (method === 'agents.list') return Promise.resolve({ agents: [] });
     return Promise.resolve(null);
   });
   useAuthStore.setState({
     user: { id: 'admin', email: 'a@x', display_name: 'Admin', role: 'admin', status: 'active' },
     isAuthenticated: true,
   });
-  useApprovalsStore.setState({ pendingCount: 7, stale: false });
+  useApprovalsStore.getState().setItems(Array.from({ length: 7 }, (_, id) => ({
+    id: `blocked:known-${id}`, type: 'blocked', status: 'needs_human', title: '', urgency: 0, actionable: true,
+  })));
+  useApprovalsStore.setState({ stale: false });
   useTasksStore.setState({ tasks: [], error: null });
 });
 afterEach(() => {
@@ -74,11 +81,11 @@ describe('live event invalidation', () => {
       await vi.advanceTimersByTimeAsync(100);
     }
     expect(call.mock.calls.filter(([method]) => method === 'approvals.list')).toHaveLength(3);
-    expect(call.mock.calls.filter(([method]) => method === 'agents.list')).toHaveLength(3);
+    expect(call.mock.calls.filter(([method]) => method === 'agents.list')).toHaveLength(6);
     expect(call.mock.calls.filter(([method, params]) => method === 'tasks.list' && !params.status)).toHaveLength(3);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(call.mock.calls.filter(([method]) => method === 'approvals.list')).toHaveLength(4);
-    expect(call.mock.calls.filter(([method]) => method === 'agents.list')).toHaveLength(4);
+    expect(call.mock.calls.filter(([method]) => method === 'agents.list')).toHaveLength(8);
     expect(useApprovalsStore.getState().stale).toBe(false);
   });
 
@@ -88,7 +95,7 @@ describe('live event invalidation', () => {
       if (method === 'tasks.list' && params.status === 'blocked') {
         return new Promise((resolve) => { finish = resolve; });
       }
-      return Promise.resolve({ tasks: [], incidents: [], approvals: [], count: 2 });
+      return Promise.resolve({ tasks: [], incidents: [], approvals: [], requests: [], agents: [] });
     });
     const count = () => call.mock.calls.filter(([method]) => method === 'approvals.list').length;
     emit('approval.created');
@@ -120,22 +127,22 @@ describe('live event invalidation', () => {
     invalidateAll();
     await vi.advanceTimersByTimeAsync(2_000);
     expect(count('approvals.list')).toBe(2);
-    expect(count('agents.list')).toBe(2);
+    expect(count('agents.list')).toBe(4);
     invalidateAll();
     await vi.advanceTimersByTimeAsync(3_999);
     expect(count('approvals.list')).toBe(2);
-    expect(count('agents.list')).toBe(2);
+    expect(count('agents.list')).toBe(4);
     expect(count('tasks.list')).toBe(6);
-    call.mockResolvedValue({ tasks: [], agents: [], approvals: [], incidents: [] });
+    call.mockResolvedValue({ tasks: [], agents: [], approvals: [], incidents: [], requests: [] });
     await vi.advanceTimersByTimeAsync(1);
     expect(count('approvals.list')).toBe(3);
-    expect(count('agents.list')).toBe(3);
+    expect(count('agents.list')).toBe(6);
     invalidateAll();
     await vi.advanceTimersByTimeAsync(1_999);
     expect(count('approvals.list')).toBe(3);
     await vi.advanceTimersByTimeAsync(1);
     expect(count('approvals.list')).toBe(4);
-    expect(count('agents.list')).toBe(4);
+    expect(count('agents.list')).toBe(8);
     expect(useApprovalsStore.getState().stale).toBe(false);
   });
 
@@ -182,7 +189,9 @@ describe('live event invalidation', () => {
     useAgentsStore.setState({ agents: [] });
     const boardReads = () => call.mock.calls.filter(([method, params]) =>
       method === 'tasks.list' && params.agent_id === 'employee' && !params.status).length;
-    const rosterReads = () => call.mock.calls.filter(([method]) => method === 'agents.list').length;
+    // The roster and unified inbox each read agents with their own parameters.
+    const rosterReads = () => call.mock.calls.filter(([method, params]) =>
+      method === 'agents.list' && params.include_archived === true).length;
     emit('events_lost');
     await vi.advanceTimersByTimeAsync(0);
     expect(boardReads()).toBe(1);
@@ -203,20 +212,20 @@ describe('live event invalidation', () => {
   });
 
   it('refetches again when an invalidation arrives during a read', async () => {
-    let finish!: (value: { count: number; approvals: never[] }) => void;
+    let finish!: (value: { count: number; approvals: { id: string }[] }) => void;
     let reads = 0;
     call.mockImplementation((method: string) => {
       if (method === 'approvals.list') {
         reads += 1;
         if (reads === 1) return new Promise((resolve) => { finish = resolve; });
-        return Promise.resolve({ approvals: [], count: 4 });
+        return Promise.resolve({ approvals: pendingApprovals(4), count: 99 });
       }
-      return Promise.resolve({ tasks: [], incidents: [] });
+      return Promise.resolve({ tasks: [], incidents: [], requests: [], agents: [] });
     });
     emit('approval.created');
     await vi.advanceTimersByTimeAsync(100);
     emit('approval.decided');
-    finish({ count: 1, approvals: [] });
+    finish({ count: 99, approvals: pendingApprovals(1) });
     await vi.advanceTimersByTimeAsync(100);
     expect(reads).toBe(1);
     expect(useApprovalsStore.getState().stale).toBe(true);
@@ -233,10 +242,10 @@ describe('live event invalidation', () => {
   });
 
   it('an older in-flight response cannot clear a newer invalidation', async () => {
-    let finish!: (value: { count: number; approvals: never[] }) => void;
+    let finish!: (value: { count: number; approvals: { id: string }[] }) => void;
     call.mockImplementation((method: string) => {
       if (method === 'approvals.list') return new Promise((resolve) => { finish = resolve; });
-      return Promise.resolve({ tasks: [], incidents: [] });
+      return Promise.resolve({ tasks: [], incidents: [], requests: [], agents: [] });
     });
     const read = useApprovalsStore.getState().fetchCount();
     emit('connection.stale');

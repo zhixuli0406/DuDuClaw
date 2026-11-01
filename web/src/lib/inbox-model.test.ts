@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   sortInbox,
+  actionableInboxItems,
+  canArchiveInboxItem,
   inboxSourcesDeniedFor,
   filterByTab,
   filterByCategory,
@@ -45,7 +47,7 @@ describe('inbox-model sorting (§5.2)', () => {
       mk({ id: 'f', type: 'failed_run', urgency: TYPE_URGENCY.failed_run }),
       mk({ id: 'k', type: 'blocked', urgency: TYPE_URGENCY.blocked }),
     ];
-    expect(sortInbox(items, 'urgency').map((i) => i.id)).toEqual(['b', 'f', 'k', 'a', 'd']);
+    expect(sortInbox(items, 'urgency').map((i) => i.id)).toEqual(['d', 'b', 'f', 'k', 'a']);
   });
 
   it('time sort ranks newest first, undated last', () => {
@@ -133,7 +135,7 @@ describe('inbox-model grouping', () => {
   it('missing agent/channel fall back to em-dash bucket', () => {
     const it = mk({ agentId: undefined, channel: undefined });
     expect(groupKeyOf(it, 'agent')).toBe('—');
-    expect(groupKeyOf(it, 'channel')).toBe('—');
+    expect(groupKeyOf(it, 'channel')).toBe('type:approval');
   });
 });
 
@@ -214,7 +216,7 @@ describe('inbox-model statusLabelKey (§C.2/§C.3)', () => {
     expect(statusLabelKey('awaiting_admin')).toBe('inbox.status.awaitingAdmin');
   });
   it('unmapped tokens (open-ended business values) return null — caller falls back to the raw string', () => {
-    expect(statusLabelKey('critical')).toBeNull();
+    expect(statusLabelKey('critical')).toBe('inbox.status.other');
     expect(statusLabelKey('some_future_status')).toBeNull();
   });
 });
@@ -309,5 +311,28 @@ describe('inboxSourcesDeniedFor (L2 role-expected denials)', () => {
   it('admin and unknown roles skip nothing', () => {
     expect(inboxSourcesDeniedFor('admin').size).toBe(0);
     expect(inboxSourcesDeniedFor(undefined).size).toBe(0);
+  });
+});
+
+describe('inbox safety and priority', () => {
+  it('prioritizes expiry, then high risk, decisions, budget, and the rest', () => {
+    const items = [mk({ id: 'rest' }), mk({ id: 'budget', type: 'budget' }), mk({ id: 'waiting', type: 'blocked', status: 'needs_human' }), mk({ id: 'risk', risk: 'high' }), mk({ id: 'later', expiresAt: 200 }), mk({ id: 'soon', expiresAt: 100 })];
+    expect(sortInbox(items, 'urgency').map((i) => i.id)).toEqual(['soon', 'later', 'risk', 'waiting', 'budget', 'rest']);
+  });
+  it('counts only actionable, unresolved, unarchived items across every type', () => {
+    const items = [mk({ id: 'a' }), mk({ id: 'i', type: 'install' }), mk({ id: 'd', type: 'decision' }), mk({ id: 'h', type: 'blocked', status: 'needs_human' }), mk({ id: 'f', type: 'failed_run', actionable: false })];
+    expect(actionableInboxItems(items, new Set(['a']), new Set(['d'])).map((i) => i.id)).toEqual(['i', 'h']);
+  });
+  it('protects live approvals, installs and waiting tasks, but permits completed or failed work', () => {
+    expect(canArchiveInboxItem(mk({}))).toBe(false);
+    expect(canArchiveInboxItem(mk({ type: 'install' }))).toBe(false);
+    expect(canArchiveInboxItem(mk({ type: 'blocked', status: 'needs_human' }))).toBe(false);
+    expect(canArchiveInboxItem(mk({}), true)).toBe(true);
+    expect(canArchiveInboxItem(mk({ type: 'failed_run' }))).toBe(true);
+  });
+  it('long-waiting tab contains only actionable items older than a day', () => {
+    const nowMs = Date.now();
+    const items = [mk({ id: 'old', timestamp: new Date(nowMs - 25 * 3600000).toISOString() }), mk({ id: 'new', timestamp: new Date(nowMs).toISOString() }), mk({ id: 'passive', actionable: false, timestamp: new Date(nowMs - 25 * 3600000).toISOString() })];
+    expect(filterByTab(items, 'blocked', { nowMs, readIds: new Set() }).map((i) => i.id)).toEqual(['old']);
   });
 });

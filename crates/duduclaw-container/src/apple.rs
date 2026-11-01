@@ -26,8 +26,9 @@ impl AppleContainerRuntime {
     pub fn is_available() -> bool {
         #[cfg(target_os = "macos")]
         {
-            std::process::Command::new("container")
-                .arg("--version")
+            let mut cmd = std::process::Command::new("container");
+            duduclaw_core::spawn_env::apply_agent_cli_env_allowlist_std(&mut cmd);
+            cmd.arg("--version")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -47,8 +48,11 @@ impl AppleContainerRuntime {
 
     /// Run a command via the `container` CLI.
     async fn run_cmd(&self, args: &[&str]) -> Result<String> {
-        let output = tokio::process::Command::new(&self.binary)
-            .args(args)
+        let mut cmd = tokio::process::Command::new(&self.binary);
+        if args == ["--version"] {
+            duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+        }
+        let output = cmd.args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()

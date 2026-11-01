@@ -345,6 +345,8 @@ const ARTIFACT_EXTS: &[&str] = &[
 /// extension is in [`ARTIFACT_EXTS`]. Exact match (coding convention 2).
 const INTERNAL_NAMES: &[&str] = &[
     "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
     "INSTRUCTIONS.md",
     "CLAUDE.md",
     "AGENTS.md",

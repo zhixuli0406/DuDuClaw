@@ -40,6 +40,9 @@ pub(crate) fn principal_permits_with_team(
     right: HumanRight,
     team_enabled: bool,
 ) -> Result<bool, String> {
+    if crate::machine_employee::check_target(home, target, Some(&principal.to_string())).is_err() {
+        return Ok(false);
+    }
     match principal {
         HumanPrincipal::Unmapped { .. } => Ok(right == HumanRight::Call && is_public_trigger(home, target)),
         HumanPrincipal::User(user_id) => {
@@ -117,4 +120,61 @@ pub fn check(
             Err(deny())
         }
     }
+}
+
+/// Missing or empty stores are exempt; a sole owner must be an active Admin
+/// who has completed the first password change. All accounts count toward size.
+fn identity_store_has_single_owner(home: &Path) -> bool {
+    let path = home.join("users.db");
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+        Ok(_) => {}
+    }
+    let Ok(db) = crate::review_evidence::audience::readonly_db(&path) else { return false; };
+    // Inactive accounts still prove this was a multi-account deployment.
+    // Never initialize or migrate an identity store on a read authorization.
+    let Ok(mut stmt) = db.prepare(
+        "SELECT id, email, display_name, role, status, created_at, updated_at,
+         last_login, must_change_password, department, manager_user_id FROM users LIMIT 2",
+    ) else { return false; };
+    let Ok(rows) = stmt.query_map([], |row| {
+        // Preserve list_users' full-row validation: corrupt metadata must
+        // not turn an unreadable account into evidence of a sole owner.
+        for index in [0, 1, 2, 5, 6] { let _: String = row.get(index)?; }
+        for index in [7, 9, 10] { let _: Option<String> = row.get(index)?; }
+        Ok((row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(8)?))
+    }) else { return false; };
+    let Ok(users) = rows.collect::<Result<Vec<_>, _>>() else { return false; };
+    users.is_empty() || (users.len() == 1
+        && users[0].0.parse::<duduclaw_auth::UserRole>().ok() == Some(duduclaw_auth::UserRole::Admin)
+        && users[0].1.parse::<duduclaw_auth::models::UserStatus>().ok() == Some(duduclaw_auth::models::UserStatus::Active)
+        && users[0].2 == 0)
+}
+
+/// Only Personal installs whose identity store proves a single owner are
+/// exempt. Unknown editions and unreadable stores never widen machine access.
+pub(crate) fn system_operation_requires_admin(home: &Path) -> bool {
+    !crate::team_edition::is_personal(home) || !identity_store_has_single_owner(home)
+}
+
+/// Unless Personal and the identity store proves a single owner, machine tools
+/// require the live human administrator, independently of delegation mode.
+/// `None` is allowed only after the caller proves a gateway-registered
+/// background context at the signed authority route.
+pub(crate) fn system_operation_permitted(home: &Path, principal: Option<&str>) -> bool {
+    if !system_operation_requires_admin(home) {
+        return true;
+    }
+    let id = match super::PrincipalState::from_wire(principal) {
+        super::PrincipalState::Background => return true,
+        super::PrincipalState::Human(HumanPrincipal::User(id)) => id,
+        super::PrincipalState::Human(_) | super::PrincipalState::Unknown => return false,
+    };
+    let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return false; };
+    db.get_user(&id).ok().flatten().is_some_and(|u| {
+        u.role == duduclaw_auth::UserRole::Admin
+            && matches!(u.status, duduclaw_auth::models::UserStatus::Active)
+            && !u.must_change_password
+    })
 }

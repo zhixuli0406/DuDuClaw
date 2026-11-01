@@ -1,3 +1,5 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api';
@@ -116,6 +118,7 @@ export function useAvailableModels(): AvailableModelsResult {
   }, []);
 
   const refresh = useCallback(async () => {
+    if (!hasMinRole(useAuthStore.getState().user?.role, 'manager')) return;
     setRefreshing(true);
     try {
       const snap = await refreshModels();

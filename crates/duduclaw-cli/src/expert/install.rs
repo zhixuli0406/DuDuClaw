@@ -20,6 +20,7 @@ use super::{
 pub(super) struct InstallCtx {
     pub home: PathBuf,
     pub dry_run: bool,
+    pub confirm_profile: Option<String>,
     pub rename: bool,
     /// Explicit operator grant for pack hooks (`--trust-hooks`). Without it
     /// hooks land disabled behind an ApprovalBroker request (fail-closed).
@@ -44,6 +45,7 @@ pub(super) struct InstallCtx {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PipelineOpts {
     pub dry_run: bool,
+    pub confirm_profile: Option<String>,
     pub rename: bool,
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
@@ -89,7 +91,7 @@ pub async fn cmd_install(
         attach_under,
         ..Default::default()
     };
-    cmd_install_with(home, source, opts).await
+    super::agent_config::preview::confirmed_install(home, source, opts).await
 }
 
 /// Set once the gateway asked this run to stop (see [`listen_for_stop`]).
@@ -139,6 +141,7 @@ async fn terminated() {
 /// dashboard can always show what happened. The file must be a new `.json`
 /// path: an existing file is never overwritten.
 pub(crate) async fn cmd_install_with(home: &Path, source: &str, opts: PipelineOpts) -> Result<()> {
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     let mut report_file = match &opts.report_json {
         Some(p) => Some(super::report::open_report_file(p)?),
         None => None,
@@ -253,6 +256,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     let ctx = InstallCtx {
         home: home.to_path_buf(),
         dry_run,
+        confirm_profile: opts.confirm_profile.clone(),
         rename: opts.rename || opts.reimport == super::reimport::ReimportMode::Copy,
         trust_hooks: opts.trust_hooks,
         attach_under,
@@ -351,10 +355,17 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
             format_label(format)
         );
     } else {
-        println!(
-            "  {} 以上為 --dry-run 計畫，未寫入任何檔案；移除該旗標即實際安裝。\n",
-            style("ℹ").cyan()
-        );
+        if let Some(code) = report.to_json(true)["details"]["profile_confirmation"].as_str() {
+            println!(
+                "  {} 以上為 --dry-run 計畫，未寫入任何檔案；確認內容後移除 --dry-run，並加上 --confirm-profile {code} 即可實際安裝。\n",
+                style("ℹ").cyan()
+            );
+        } else {
+            println!(
+                "  {} 以上為 --dry-run 計畫，未寫入任何檔案；移除該旗標即實際安裝。\n",
+                style("ℹ").cyan()
+            );
+        }
     }
 
     drop(cleanup);
@@ -386,15 +397,44 @@ async fn install_native(
             e.name.escape_debug()
         )));
     }
+    let mut profiles = BTreeMap::new();
+    for agent in &e.agents {
+        if !crate::is_valid_agent_id(&agent.name) || duduclaw_core::is_reserved_agent_id(&agent.name) {
+            return Err(cfg_err("專家包員工代號無效，不能用於路徑".into()));
+        }
+        let root = dir.join("agents").join(&agent.name);
+        let read_doc = |file: &str| -> Result<Option<super::agent_config::ir::Doc>> {
+            let path = root.join(file);
+            match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(cfg_err(format!("無法讀取專家包區段 {file}：{e}"))),
+                Ok(meta) if !meta.is_file() => return Err(cfg_err(format!("專家包區段 {file} 不是一般檔案"))),
+                Ok(_) => {}
+            }
+            let text = super::agent_config::md::read_text(&path)
+                .ok_or_else(|| cfg_err(format!("無法讀取專家包區段 {file}")))?;
+            Ok(Some(super::agent_config::ir::Doc::new(file, text)))
+        };
+        let settings = match read_doc("agent.partial.toml")? {
+            Some(doc) => toml::from_str(&doc.text).map_err(|_| cfg_err("專家包設定格式不正確".into()))?,
+            None => toml::Table::new(),
+        };
+        super::agent_config::preview::reject_mcp_settings(&settings)?;
+        profiles.insert(agent.name.clone(), super::agent_config::ir::AgentDraft {
+            id_hint: agent.name.clone(), display_name: if agent.display_name.is_empty() { agent.name.clone() } else { agent.display_name.clone() },
+            description: format!("role: {}\nreports_to: {}\ndepartment: {}\nrank: {}\ntrigger: {}\nskills: {}",
+                agent.role, agent.reports_to, agent.department, agent.rank, agent.trigger, agent.skills.join("\n")),
+            soul: read_doc("soul.md")?, contract: read_doc("CONTRACT.toml")?,
+            settings, ..Default::default()
+        });
+    }
+    for profile in profiles.values_mut() {
+        super::agent_config::credentials::sanitize_draft(profile)?;
+    }
+    if profiles.len() != e.agents.len() {
+        return Err(cfg_err("專家包含重複員工代號".into()));
+    }
     let slug = ctx.claim_slug(&e.name)?;
-    let adding = e
-        .agents
-        .iter()
-        .filter(|a| crate::is_valid_agent_id(&crate::sanitize_agent_id(&a.name)))
-        .count();
-    ctx.ensure_quota(adding).await?;
-    ctx.begin_writes()?;
-
     let mut record = InstallRecord {
         slug: slug.clone(),
         kind: PackKind::Native,
@@ -467,55 +507,123 @@ async fn install_native(
     // channel routing calls `@display` and `@id`, so no new member may
     // share one.
     let mut book = ctx.name_book();
+    let mut final_ids = std::collections::BTreeSet::new();
+    for agent in &e.agents {
+        let id = crate::sanitize_agent_id(&format!("{}{suffix}", agent.name));
+        if !final_ids.insert(id.clone()) { return Err(cfg_err("解析後的員工代號重複".into())); }
+        book.reserve(&id);
+    }
 
     // in-pack name → final (possibly renamed) agent id.
     let mut id_map: BTreeMap<String, String> = BTreeMap::new();
     let by_name: BTreeMap<&str, &manifest::ExpertAgent> =
         e.agents.iter().map(|a| (a.name.as_str(), a)).collect();
 
+    let mut agents = Vec::new();
     for name in &order {
-        if ctx.stopping() {
-            break;
-        }
-        let Some(agent) = by_name.get(name.as_str()) else {
-            continue;
-        };
+        let agent = by_name.get(name.as_str())
+            .ok_or_else(|| cfg_err("找不到計畫中的員工".into()))?;
         let parent_final = if agent.reports_to.trim().is_empty() {
-            // Pack root — attach under the operator-chosen supervisor (already
-            // validated to exist), or stay a root as before.
             ctx.attach_under.clone().unwrap_or_default()
         } else {
-            id_map
-                .get(agent.reports_to.trim())
-                .cloned()
-                .unwrap_or_default()
+            id_map.get(agent.reports_to.trim()).cloned().unwrap_or_default()
         };
-        let placement = Placement {
-            reports_to: &parent_final,
-            suffix: &suffix,
+        let placement = Placement { reports_to: &parent_final, suffix: &suffix };
+        let planned = plan_native_agent(ctx, dir, agent, &profiles[&agent.name], &placement, &mut book, report)?;
+        id_map.insert(name.clone(), planned.scaffold.name.clone());
+        agents.push(planned);
+    }
+    record.agent_ids = id_map;
+    let mut wiki = snapshot_native_tree(&dir.join("wiki"))?;
+    wiki.retain(|rel, bytes| {
+        if ctx.home.join("shared/wiki").join(rel).exists() {
+            report.conflict("wiki", rel, "已存在同名頁面，不覆蓋");
+            return false;
+        }
+        let Ok(content) = std::str::from_utf8(bytes) else {
+            report.skipped("wiki", rel, "不是 UTF-8 文字");
+            return false;
         };
-        if let Some(final_id) =
-            install_one_agent(ctx, dir, agent, &placement, &mut book, report, &mut record).await?
-        {
-            id_map.insert(name.clone(), final_id);
-        } else if e.agents.iter().any(|a| a.reports_to.trim() == name.as_str()) {
-            report.warning(
-                "agents",
-                name,
-                "這位沒有安裝，原本向他回報的成員會變成最上層",
-            );
+        if let ScanVerdict::Blocked(reason) = scan_external(content) {
+            report.skipped("wiki", rel, format!("security: {reason}"));
+            return false;
+        }
+        true
+    });
+    let hooks = snapshot_native_tree(&dir.join("hooks"))?;
+    let planned_bytes = agents.iter().flat_map(|a| a.files.values())
+        .chain(wiki.values()).chain(hooks.values())
+        .fold(0u64, |total, bytes| total.saturating_add(bytes.len() as u64));
+    if planned_bytes > safe_zip::MAX_UNPACK_BYTES {
+        return Err(cfg_err("安裝計畫檔案超過上限".into()));
+    }
+    let bundle = super::agent_config::ir::ImportBundle {
+        format_code: "native-pack", agents: agents.iter().map(|a| a.profile.clone()).collect(), ..Default::default()
+    };
+    let effects = serde_json::json!({
+        "slug": slug, "display_name": record.display_name, "version": record.version,
+        "description": record.description, "agent_ids": record.agent_ids,
+        "agents": agents.iter().map(|a| serde_json::json!({
+            "id": a.scaffold.name, "department": a.department,
+            "files": native_file_hashes(&format!("agents/{}", a.scaffold.name), &a.files),
+            "skills": a.skills,
+        })).collect::<Vec<_>>(),
+        "wiki_files": native_file_hashes("shared/wiki", &wiki),
+        "hooks": {"files": native_file_hashes(&format!("experts/{slug}/hooks-disabled"), &hooks),
+            "enabled_files": if ctx.trust_hooks { native_file_hashes(&format!("experts/{slug}/hooks"), &hooks) } else { Vec::new() },
+            "trust_hooks": ctx.trust_hooks},
+    });
+    let effects = super::agent_config::preview::bind_context(ctx, effects)?;
+    super::agent_config::preview::require_plan_confirmation(
+        &bundle, effects, ctx.dry_run, ctx.confirm_profile.as_deref(), report,
+    )?;
+    ctx.ensure_quota(agents.len()).await?;
+    ctx.begin_writes()?;
+    if !ctx.dry_run && !hooks.is_empty() {
+        for dest in [super::hooks::disabled_dir(&ctx.home, &slug), super::hooks::enabled_dir(&ctx.home, &slug)] {
+            match std::fs::symlink_metadata(dest) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(cfg_err("Hooks 安裝目的地已存在或無法檢查，未寫入".into())),
+            }
         }
     }
-    record.agent_ids = id_map.clone();
-
-    // ── wiki ──
-    let wiki_dir = dir.join("wiki");
-    if wiki_dir.is_dir() {
-        install_wiki_tree(ctx, &wiki_dir, report, &mut record);
+    for planned in agents {
+        if ctx.stopping() { return Err(interrupted()); }
+        let id = &planned.scaffold.name;
+        if !ctx.dry_run {
+            ctx.note_agent(id);
+            crate::scaffold_planned_agent_dir(&ctx.home, &planned.scaffold, &planned.files).await?;
+            duduclaw_core::org_store::upsert(&ctx.home, id,
+                duduclaw_core::OrgEntry::new(&planned.scaffold.reports_to, &planned.department))
+                .map_err(|e| cfg_err(format!("組織資料寫入失敗：{e}")))?;
+            if !planned.department.is_empty() {
+                std::fs::create_dir_all(ctx.home.join("shared/wiki")
+                    .join(duduclaw_core::DEPARTMENTS_NAMESPACE).join(&planned.department))
+                    .map_err(|e| cfg_err(format!("部門 wiki 目錄建立失敗：{e}")))?;
+            }
+        }
+        report.imported("agent", id);
+        record.agents.push(id.clone());
+        record.agent_skills.extend(planned.skills.iter().map(|skill| format!("{id}/{skill}")));
     }
-
-    // ── hooks/ → quarantined; enablement is ApprovalBroker-gated ──
-    super::hooks::import_hooks(ctx, dir, &slug, report).await;
+    for (rel, bytes) in wiki {
+        if !ctx.dry_run {
+            let dest = ctx.home.join("shared/wiki").join(&rel);
+            ctx.note_path(&dest);
+            write_planned_file(&ctx.home, &format!("shared/wiki/{rel}"), &bytes)?;
+        }
+        report.imported("wiki", &rel);
+        record.wiki_files.push(rel);
+    }
+    // The hooks lifecycle consumes only the reviewed snapshot. Approval ids and
+    // timestamps are execution records; hook bytes and enablement are bound above.
+    if !hooks.is_empty() {
+        let stage = tempfile::tempdir().map_err(|e| cfg_err(e.to_string()))?;
+        for (rel, bytes) in hooks {
+            write_planned_file(stage.path(), &format!("hooks/{rel}"), &bytes)?;
+        }
+        super::hooks::import_hooks(ctx, stage.path(), &slug, report).await;
+    }
 
     Ok(record)
 }
@@ -539,10 +647,11 @@ fn team_id_suffix(
         .map(|a| crate::sanitize_agent_id(&a.name))
         .filter(|b| crate::is_valid_agent_id(b))
         .collect();
+    let book = ctx.name_book();
     let free = |suffix: &str| {
         bases.iter().all(|b| {
             let id = crate::sanitize_agent_id(&format!("{b}{suffix}"));
-            crate::is_valid_agent_id(&id) && !ctx.agent_taken(&id)
+            crate::is_valid_agent_id(&id) && !ctx.agent_taken(&id) && !book.is_taken(&id)
         })
     };
     if free("") {
@@ -564,40 +673,37 @@ fn team_id_suffix(
     String::new() // nothing free: per-member conflicts are reported below
 }
 
-/// Scaffold one native pack agent (soul + partial merge + skills).
-async fn install_one_agent(
+struct NativeAgentPlan {
+    scaffold: crate::AgentScaffold,
+    profile: super::agent_config::ir::AgentDraft,
+    files: BTreeMap<String, Vec<u8>>,
+    department: String,
+    skills: Vec<String>,
+}
+
+/// Resolve every destination and render every employee file before confirmation.
+fn plan_native_agent(
     ctx: &InstallCtx,
     pack_dir: &Path,
     agent: &manifest::ExpertAgent,
+    profile: &super::agent_config::ir::AgentDraft,
     placement: &Placement<'_>,
     book: &mut duduclaw_core::agent_names::NameBook,
     report: &mut Report,
-    record: &mut InstallRecord,
-) -> Result<Option<String>> {
+) -> Result<NativeAgentPlan> {
     let reports_to_final = placement.reports_to;
     let base = crate::sanitize_agent_id(&agent.name);
     if !crate::is_valid_agent_id(&base) {
         report.skipped("agent", &agent.name, "無法轉為合法 agent id");
-        return Ok(None);
+        return Err(cfg_err("員工代號無效或已被使用，請重新預覽".into()));
     }
     let final_id = crate::sanitize_agent_id(&format!("{base}{}", placement.suffix));
     if !crate::is_valid_agent_id(&final_id) || ctx.agent_taken(&final_id) {
         report.conflict("agent", &final_id, "代號已被使用，這位沒有安裝");
-        return Ok(None);
+        return Err(cfg_err("員工代號無效或已被使用，請重新預覽".into()));
     }
 
-    // Persona (DATA) → scan.
-    let soul_path = pack_dir.join("agents").join(&agent.name).join("soul.md");
-    let soul_body = match std::fs::read_to_string(&soul_path) {
-        Ok(s) => {
-            if let ScanVerdict::Blocked(reason) = scan_external(&s) {
-                report.skipped("agent", &base, format!("security: {reason}"));
-                return Ok(None);
-            }
-            Some(s)
-        }
-        Err(_) => None, // no soul → scaffold default persona
-    };
+    let soul_body = profile.soul.as_ref().map(|doc| doc.text.clone());
 
     let wanted_display = if agent.display_name.trim().is_empty() {
         agent.name.clone()
@@ -606,7 +712,13 @@ async fn install_one_agent(
     };
     // `@display` and `@id` both route: never reuse a name another employee
     // answers to.
-    let (display, renamed) = book.unique_display(&wanted_display, &final_id);
+    let display = [wanted_display.clone(), format!("{wanted_display}（{final_id}）"),
+        format!("{wanted_display}-{final_id}"), final_id.clone()]
+        .into_iter().find(|name| duduclaw_core::agent_names::norm(name) == duduclaw_core::agent_names::norm(&final_id) || !book.is_taken(name))
+        .ok_or_else(|| cfg_err("員工名稱衝突，請重新預覽".into()))?;
+    let renamed = display != wanted_display;
+    book.reserve(&display);
+    book.reserve(&final_id);
     if renamed {
         report.warning(
             "agent-name",
@@ -651,281 +763,204 @@ async fn install_one_agent(
     };
     book.reserve(&trigger);
 
-    if ctx.dry_run {
-        report.imported("agent", &final_id);
-        if !agent.department.trim().is_empty() {
-            report.imported(
-                "agent-department",
-                &format!("{final_id} → {}", agent.department.trim()),
-            );
-        }
-        // Report referenced skills in plan mode too.
-        plan_agent_skills(pack_dir, agent, report);
-        if pack_dir
-            .join("agents")
-            .join(&agent.name)
-            .join("CONTRACT.toml")
-            .is_file()
-        {
-            report.imported("contract", &final_id);
-        }
-        return Ok(Some(final_id));
-    }
-
-    let scaffold = crate::AgentScaffold {
-        name: final_id.clone(),
-        display_name: display,
-        role,
-        reports_to: reports_to_final.to_string(),
-        icon: "🐾".to_string(),
-        trigger,
+    super::agent_config::preview::validate_section_limits(profile)?;
+    let mut scaffold = crate::AgentScaffold {
+        name: final_id.clone(), display_name: display, role,
+        reports_to: reports_to_final.to_string(), icon: "🐾".into(), trigger,
         provider: duduclaw_core::types::RuntimeType::Claude,
-        model_preferred: None,
-        soul_body,
+        model_preferred: None, soul_body,
     };
-    ctx.note_agent(&final_id);
-    crate::scaffold_agent_dir(&ctx.home, &scaffold).await?;
-    report.imported("agent", &final_id);
-    record.agents.push(final_id.clone());
-
-    // ── Org placement: `[agent] department` + its shared-wiki space. ──
-    // Invalid names warn-and-skip (the rest of the agent still installs);
-    // `expert pack` already rejects them at authoring time.
+    let mut files = crate::scaffold_agent_files(&scaffold)?;
+    let mut settings: toml::Table = std::str::from_utf8(&files["agent.toml"])
+        .map_err(|e| cfg_err(e.to_string()))?.parse().map_err(|e| cfg_err(format!("員工設定格式不正確：{e}")))?;
     let department = agent.department.trim();
-    if !department.is_empty() {
-        if duduclaw_core::is_valid_department(department) {
-            let dept = department.to_string();
-            super::patch_agent_toml(&ctx.home, &final_id, |t| {
-                if let Some(a) = t.get_mut("agent").and_then(|v| v.as_table_mut()) {
-                    a.insert("department".into(), toml::Value::String(dept.clone()));
+    if !department.is_empty() && duduclaw_core::is_valid_department(department) {
+        settings.get_mut("agent").and_then(toml::Value::as_table_mut).unwrap()
+            .insert("department".into(), toml::Value::String(department.into()));
+    } else if !department.is_empty() {
+        report.warning("agent-department", &final_id, "非合法部門名，略過");
+    }
+    merge_toml(&mut settings, &profile.settings);
+    if let Some(capabilities) = settings.get("capabilities") {
+        let table = capabilities.as_table().ok_or_else(|| cfg_err("工具設定不是表格".into()))?;
+        for key in ["allowed_tools", "denied_tools"] {
+            if let Some(value) = table.get(key) {
+                let list = value.as_array().ok_or_else(|| cfg_err(format!("{key} 必須是字串清單")))?;
+                if list.iter().any(|tool| tool.as_str().is_none_or(|name| name.trim().is_empty())) {
+                    return Err(cfg_err(format!("{key} 含無效工具名稱")));
                 }
-            })?;
-            let wiki_dir = ctx
-                .home
-                .join("shared")
-                .join("wiki")
-                .join(duduclaw_core::DEPARTMENTS_NAMESPACE)
-                .join(department);
-            if let Err(e) = std::fs::create_dir_all(&wiki_dir) {
-                report.warning(
-                    "agent-department",
-                    &final_id,
-                    format!("部門 wiki 目錄建立失敗: {e}"),
-                );
-            }
-            report.imported("agent-department", &format!("{final_id} → {department}"));
-        } else {
-            report.warning(
-                "agent-department",
-                &final_id,
-                format!(
-                    "department '{}' 非合法部門名，略過",
-                    department.escape_debug()
-                ),
-            );
-        }
-    }
-
-    // Merge agent.partial.toml onto the scaffolded agent.toml.
-    let partial_path = pack_dir
-        .join("agents")
-        .join(&agent.name)
-        .join("agent.partial.toml");
-    if let Ok(partial_src) = std::fs::read_to_string(&partial_path) {
-        match partial_src.parse::<toml::Table>() {
-            Ok(overlay) => {
-                super::patch_agent_toml(&ctx.home, &final_id, |t| merge_toml(t, &overlay))?;
-                report.imported("agent-settings", &final_id);
-            }
-            Err(err) => {
-                report.warning(
-                    "agent-settings",
-                    &final_id,
-                    format!("partial 解析失敗: {err}"),
-                );
             }
         }
     }
-
-    // WP22 T1 — re-record the authoritative org placement from the finished
-    // `agent.toml`. `scaffold_agent_dir` already stored `reports_to`, but two
-    // later steps can still move this agent: the `[agent] department` patch
-    // above, and the `agent.partial.toml` overlay (which is *not* section-
-    // filtered on the install side, so a pack may legitimately carry org
-    // fields). Adopting the final mirror once, here, is the only way the store
-    // and the file agree at the end of a pack install — otherwise `duduclaw
-    // doctor` would report drift on every freshly installed pack.
-    if let Some(entry) = duduclaw_core::org_store::read_mirror(
-        &ctx.home.join("agents").join(&final_id).join("agent.toml"),
-    ) {
-        if let Err(e) = duduclaw_core::org_store::upsert(&ctx.home, &final_id, entry) {
-            report.warning(
-                "agent-department",
-                &final_id,
-                format!("組織資料寫入失敗: {e}"),
-            );
-        }
+    let config: duduclaw_core::types::AgentConfig = toml::Value::Table(settings.clone()).try_into()
+        .map_err(|e| cfg_err(format!("員工設定型別不正確：{e}")))?;
+    // A partial cannot rename a resolved destination or bypass name collision checks.
+    if config.agent.name != final_id || config.agent.display_name != scaffold.display_name
+        || config.agent.trigger != scaffold.trigger {
+        return Err(cfg_err("專家包設定不能覆寫已解析的員工代號、名稱或呼叫詞".into()));
     }
-
-    // Merge the pack's per-agent .mcp.json servers into the scaffolded file.
-    // The scaffold already wrote `.mcp.json` with the wired `duduclaw` server;
-    // pack-declared servers (e.g. a Photoshop MCP) are folded in alongside it
-    // (duduclaw entry is never overwritten). Without this the pack's servers
-    // would be silently dropped.
-    let pack_mcp = pack_dir.join("agents").join(&agent.name).join(".mcp.json");
-    if let Some(servers) = super::read_mcp_servers(&pack_mcp)
-        && !servers.is_empty()
-    {
-        match super::merge_agent_mcp(&ctx.home, &final_id, &servers) {
-            Ok(written) if written > 0 => {
-                report.imported("mcp-servers", &format!("{written} → {final_id}"));
-            }
-            Ok(_) => {}
-            Err(err) => report.warning("mcp-servers", &final_id, format!("併入失敗: {err}")),
-        }
+    scaffold.reports_to = config.agent.reports_to.clone();
+    let department = settings.get("agent").and_then(toml::Value::as_table)
+        .and_then(|a| a.get("department")).and_then(toml::Value::as_str).unwrap_or("").trim().to_string();
+    if !department.is_empty() && !duduclaw_core::is_valid_department(&department) {
+        return Err(cfg_err("專家包設定的部門名稱無效".into()));
     }
-
-    // Install referenced skills into this agent's SKILLS/.
-    install_agent_skills(ctx, pack_dir, agent, &final_id, report, record).await;
-
-    // CONTRACT.toml (behavioural red lines).
-    install_agent_contract(ctx, pack_dir, agent, &final_id, report);
-
-    Ok(Some(final_id))
-}
-
-/// Install a pack agent's `CONTRACT.toml`: scanned like any pack text, parsed
-/// with the runtime parser, and re-rendered so only `[boundaries]` lands
-/// (unknown sections are dropped rather than carried). A freshly scaffolded
-/// agent has no contract, so an existing file is a conflict, never
-/// overwritten.
-fn install_agent_contract(
-    ctx: &InstallCtx,
-    pack_dir: &Path,
-    agent: &manifest::ExpertAgent,
-    final_id: &str,
-    report: &mut Report,
-) {
-    let src = pack_dir
-        .join("agents")
-        .join(&agent.name)
-        .join("CONTRACT.toml");
-    let Ok(raw) = std::fs::read_to_string(&src) else {
-        return; // no contract in the pack — nothing to do
-    };
-    if let ScanVerdict::Blocked(reason) = scan_external(&raw) {
-        report.skipped("contract", final_id, format!("security: {reason}"));
-        return;
-    }
-    let parsed: duduclaw_agent::contract::Contract = match toml::from_str(&raw) {
-        Ok(c) => c,
-        Err(e) => {
-            report.skipped("contract", final_id, format!("解析失敗: {e}"));
-            return;
+    files.insert("agent.toml".into(), toml::to_string_pretty(&settings)
+        .map_err(|e| cfg_err(e.to_string()))?.into_bytes());
+    let mut preview = profile.clone();
+    preview.id_hint = final_id.clone();
+    preview.display_name = config.agent.display_name;
+    preview.reports_to = Some(scaffold.reports_to.clone());
+    preview.model = Some(config.model.preferred);
+    preview.tools = Some(config.capabilities.allowed_tools);
+    preview.disallowed_tools = config.capabilities.denied_tools;
+    preview.settings = settings;
+    if let Some(doc) = &profile.contract {
+        if let ScanVerdict::Blocked(reason) = scan_external(&doc.text) {
+            return Err(cfg_err(format!("契約未通過內容安全檢查：{reason}")));
         }
-    };
-    // Same sanitizer as AI-generated teams: `must_not` also blocks channel
-    // replies verbatim, so wildcard / keyword rules and rules that repeat the
-    // employee's own handoff wording are dropped — and reported, not silent.
-    let soul = std::fs::read_to_string(pack_dir.join("agents").join(&agent.name).join("soul.md")).ok();
-    let sanitized =
-        duduclaw_agent::contract_sanitize::sanitize_boundaries(&parsed.boundaries, soul.as_deref());
-    if !sanitized.dropped.is_empty() {
-        let list: Vec<String> = sanitized
-            .dropped
-            .iter()
-            .map(|(rule, why)| format!("「{}」（{}）", truncate(rule, 40), why.zh()))
-            .collect();
-        report.warning(
-            "contract",
-            final_id,
-            format!("略過 {} 條紅線：{}", list.len(), list.join("、")),
+        let table: toml::Table = doc.text.parse().map_err(|e| cfg_err(format!("契約格式不正確：{e}")))?;
+        if table.keys().any(|key| key != "boundaries") || table.get("boundaries")
+            .and_then(toml::Value::as_table).map(|b| b.keys().any(|key|
+                !matches!(key.as_str(), "must_not" | "must_always" | "max_tool_calls_per_turn"))).unwrap_or(false) {
+            return Err(cfg_err("契約包含未知欄位".into()));
+        }
+        let parsed: duduclaw_agent::contract::Contract = toml::from_str(&doc.text)
+            .map_err(|e| cfg_err(format!("契約格式不正確：{e}")))?;
+        let sanitized = duduclaw_agent::contract_sanitize::sanitize_boundaries(
+            &parsed.boundaries, profile.soul.as_ref().map(|d| d.text.as_str()),
         );
-    }
-    let contract = duduclaw_agent::contract::Contract {
-        boundaries: sanitized.boundaries,
-    };
-    if contract.boundaries.must_not.is_empty() && contract.boundaries.must_always.is_empty() {
-        report.skipped("contract", final_id, "整理後沒有可用的紅線");
-        return;
-    }
-    let body = match toml::to_string_pretty(&contract) {
-        Ok(b) => b,
-        Err(e) => {
-            report.skipped("contract", final_id, format!("序列化失敗: {e}"));
-            return;
+        for (rule, why) in &sanitized.dropped {
+            report.warning("contract", &final_id, format!("略過紅線「{}」（{}）", truncate(rule, 40), why.zh()));
         }
-    };
-    let dest = ctx
-        .home
-        .join("agents")
-        .join(final_id)
-        .join("CONTRACT.toml");
-    if dest.exists() {
-        report.conflict("contract", final_id, "已有 CONTRACT.toml，不覆蓋");
-        return;
-    }
-    match std::fs::write(&dest, format!("# Installed from an expert pack.\n{body}")) {
-        Ok(()) => report.imported("contract", final_id),
-        Err(e) => report.skipped("contract", final_id, format!("寫入失敗: {e}")),
-    }
-}
-
-/// Copy each referenced pack skill into `<home>/agents/<id>/SKILLS/<name>`
-/// after scanning it. External (non-pack) references are noted, not fetched.
-async fn install_agent_skills(
-    ctx: &InstallCtx,
-    pack_dir: &Path,
-    agent: &manifest::ExpertAgent,
-    final_id: &str,
-    report: &mut Report,
-    record: &mut InstallRecord,
-) {
-    for skill in &agent.skills {
-        let src = pack_dir.join("skills").join(skill);
-        if !src.join("SKILL.md").is_file() {
-            report.ignored("skill", skill, "非包內技能（假設已安裝）");
-            continue;
-        }
-        if !duduclaw_agent::skill_loader::is_safe_skill_name(skill) {
-            report.skipped("skill", skill, "非安全技能名稱");
-            continue;
-        }
-        let content = std::fs::read_to_string(src.join("SKILL.md")).unwrap_or_default();
-        if let ScanVerdict::Blocked(reason) = scan_external(&content) {
-            report.skipped("skill", skill, format!("security: {reason}"));
-            continue;
-        }
-        let dest = ctx
-            .home
-            .join("agents")
-            .join(final_id)
-            .join("SKILLS")
-            .join(skill);
-        match copy_dir(&src, &dest) {
-            Ok(()) => {
-                report.imported("skill", &format!("{skill} → {final_id}"));
-                record.agent_skills.push(format!("{final_id}/{skill}"));
-            }
-            Err(err) => report.skipped("skill", skill, format!("複製失敗: {err}")),
-        }
-    }
-}
-
-/// Dry-run reporting of referenced skills.
-fn plan_agent_skills(pack_dir: &Path, agent: &manifest::ExpertAgent, report: &mut Report) {
-    for skill in &agent.skills {
-        if pack_dir
-            .join("skills")
-            .join(skill)
-            .join("SKILL.md")
-            .is_file()
-        {
-            report.imported("skill", &format!("{skill} → {}", agent.name));
+        let contract = duduclaw_agent::contract::Contract { boundaries: sanitized.boundaries };
+        if !contract.boundaries.must_not.is_empty() || !contract.boundaries.must_always.is_empty() {
+            let body = format!("# Installed from an expert pack.\n{}", toml::to_string_pretty(&contract)
+                .map_err(|e| cfg_err(e.to_string()))?);
+            files.insert("CONTRACT.toml".into(), body.as_bytes().to_vec());
+            preview.contract = Some(super::agent_config::ir::Doc::new("CONTRACT.toml", body));
         } else {
-            report.ignored("skill", skill, "非包內技能（假設已安裝）");
+            preview.contract = None;
         }
     }
+    let mut skills = Vec::new();
+    for skill in &agent.skills {
+        if !duduclaw_agent::skill_loader::is_safe_skill_name(skill) {
+            return Err(cfg_err("非安全技能名稱".into()));
+        }
+        let tree = snapshot_native_tree(&pack_dir.join("skills").join(skill))?;
+        let Some(body) = tree.get("SKILL.md") else {
+            report.ignored("skill", skill, "非包內技能（假設已安裝）");
+            continue;
+        };
+        let body = std::str::from_utf8(body).map_err(|e| cfg_err(e.to_string()))?;
+        if let ScanVerdict::Blocked(reason) = scan_external(body) {
+            return Err(cfg_err(format!("技能未通過內容安全檢查：{reason}")));
+        }
+        for (rel, bytes) in tree {
+            files.insert(format!("SKILLS/{skill}/{rel}"), bytes);
+        }
+        report.imported("skill", &format!("{skill} → {final_id}"));
+        skills.push(skill.clone());
+    }
+    Ok(NativeAgentPlan { scaffold, profile: preview, files, department, skills })
+}
+
+fn native_file_hashes(prefix: &str, files: &BTreeMap<String, Vec<u8>>) -> Vec<serde_json::Value> {
+    files.iter().map(|(rel, bytes)| serde_json::json!({
+        "path": format!("{prefix}/{rel}"), "sha256": super::registry::sha256_hex(bytes),
+    })).collect()
+}
+
+/// Bound, regular-file-only snapshots. No source path is consulted after review.
+fn snapshot_native_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    fn visit(base: &Path, path: &Path, out: &mut BTreeMap<String, Vec<u8>>, total: &mut u64) -> Result<()> {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| cfg_err(e.to_string()))?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(path).map_err(|e| cfg_err(e.to_string()))? {
+                let entry = entry.map_err(|e| cfg_err(e.to_string()))?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| cfg_err("來源檔案名稱不是 UTF-8".into()))?;
+                if name.contains('\\') {
+                    return Err(cfg_err("來源檔案名稱含不安全的分隔符號".into()));
+                }
+                visit(base, &entry.path(), out, total)?;
+            }
+        } else if meta.is_file() {
+            *total = total.saturating_add(meta.len());
+            if *total > safe_zip::MAX_UNPACK_BYTES || out.len() >= 10_000 {
+                return Err(cfg_err("安裝計畫檔案超過上限".into()));
+            }
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = options.open(path).map_err(|e| cfg_err(e.to_string()))?;
+            if !file.metadata().map_err(|e| cfg_err(e.to_string()))?.is_file() {
+                return Err(cfg_err("來源不是一般檔案".into()));
+            }
+            file.take(meta.len().saturating_add(1)).read_to_end(&mut bytes).map_err(|e| cfg_err(e.to_string()))?;
+            if bytes.len() as u64 != meta.len() { return Err(cfg_err("來源檔案讀取期間變更".into())); }
+            let bytes = super::agent_config::credentials::mask_bytes(bytes)?;
+            let relative = path.strip_prefix(base).map_err(|e| cfg_err(e.to_string()))?;
+            let mut parts = Vec::new();
+            for part in relative.components() {
+                let std::path::Component::Normal(name) = part else {
+                    return Err(cfg_err("來源檔案名稱無效".into()));
+                };
+                let name = name.to_str().ok_or_else(|| cfg_err("來源檔案名稱不是 UTF-8".into()))?;
+                if name.contains('\\') { return Err(cfg_err("來源檔案名稱含不安全的分隔符號".into())); }
+                parts.push(name);
+            }
+            let rel = parts.join("/");
+            if out.insert(rel, bytes).is_some() { return Err(cfg_err("來源檔案路徑重複".into())); }
+        } else {
+            return Err(cfg_err("安裝來源含捷徑或特殊檔案".into()));
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::new();
+    match std::fs::symlink_metadata(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(cfg_err(e.to_string())),
+        Ok(meta) if !meta.is_dir() => return Err(cfg_err("安裝來源不是一般目錄".into())),
+        Ok(_) => {}
+    }
+    visit(root, root, &mut out, &mut 0)?;
+    Ok(out)
+}
+
+pub(super) fn write_planned_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if rel.contains('\\') || rel.split('/').any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || Path::new(rel).components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        return Err(cfg_err("無效安裝路徑".into()));
+    }
+    let root_meta = std::fs::symlink_metadata(root).map_err(|e| cfg_err(e.to_string()))?;
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+        return Err(cfg_err("安裝根目錄不是一般目錄".into()));
+    }
+    let mut dest = root.to_path_buf();
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        dest.push(part);
+        if parts.peek().is_none() { break; }
+        match std::fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&dest).map_err(|e| cfg_err(format!("無法建立安裝目錄：{e}")))?;
+            }
+            _ => return Err(cfg_err("安裝路徑含捷徑、特殊檔案或無法檢查的目錄".into())),
+        }
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest)
+        .map_err(|e| cfg_err(format!("安裝目的地已變更或無法寫入：{e}")))?;
+    file.write_all(bytes).map_err(|e| cfg_err(e.to_string()))
 }
 
 // ─────────────────── Shared skill / wiki install primitives ───────────────────
@@ -973,71 +1008,6 @@ pub(super) fn install_skill_global(
             record.global_skills.push(name.to_string());
         }
         Err(err) => report.skipped("skill", name, format!("複製失敗: {err}")),
-    }
-}
-
-/// Install a wiki tree into `<home>/shared/wiki/<rel>`, scanning each page.
-/// Never overwrites an existing page (→ CONFLICT). Records written paths.
-pub(super) fn install_wiki_tree(
-    ctx: &InstallCtx,
-    wiki_src: &Path,
-    report: &mut Report,
-    record: &mut InstallRecord,
-) {
-    let mut files = Vec::new();
-    collect_rel_files(wiki_src, wiki_src, &mut files);
-    let wiki_root = ctx.home.join("shared").join("wiki");
-    for rel in files {
-        if ctx.stopping() {
-            break;
-        }
-        let src = wiki_src.join(&rel);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        let content = std::fs::read_to_string(&src).unwrap_or_default();
-        if let ScanVerdict::Blocked(reason) = scan_external(&content) {
-            report.skipped("wiki", &rel_str, format!("security: {reason}"));
-            continue;
-        }
-        let dest = wiki_root.join(&rel);
-        if dest.exists() {
-            report.conflict("wiki", &rel_str, "已存在同名頁面，不覆蓋");
-            continue;
-        }
-        if ctx.dry_run {
-            report.imported("wiki", &rel_str);
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        ctx.note_path(&dest);
-        match std::fs::copy(&src, &dest) {
-            Ok(_) => {
-                report.imported("wiki", &rel_str);
-                record.wiki_files.push(rel_str);
-            }
-            Err(err) => report.skipped("wiki", &rel_str, format!("複製失敗: {err}")),
-        }
-    }
-}
-
-/// Collect regular files under `dir` as paths relative to `base` (skips links).
-fn collect_rel_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if ft.is_dir() {
-                collect_rel_files(base, &path, out);
-            } else if ft.is_file()
-                && let Ok(rel) = path.strip_prefix(base)
-            {
-                out.push(rel.to_path_buf());
-            }
-        }
     }
 }
 
@@ -1241,5 +1211,141 @@ mod frontmatter_direction_tests {
         assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(tools, vec!["Bash".to_string(), "Read".to_string()]);
         assert_eq!(disallowed, vec!["WebFetch".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod native_plan_tests {
+    use super::*;
+
+    fn ctx(home: &Path) -> InstallCtx {
+        InstallCtx {
+            home: home.to_path_buf(), dry_run: true, confirm_profile: None,
+            rename: false, trust_hooks: false, attach_under: None,
+            reimport: Default::default(), replace: None, agent_cap: None,
+            replace_state: Default::default(),
+        }
+    }
+
+    fn source(root: &Path) {
+        std::fs::create_dir_all(root.join("agents/helper")).unwrap();
+        std::fs::create_dir_all(root.join("skills/review")).unwrap();
+        std::fs::write(root.join("expert.toml"),
+            "[expert]\nname = \"plan-test\"\n[[expert.agents]]\nname = \"helper\"\nskills = [\"review\"]\n").unwrap();
+        std::fs::write(root.join("agents/helper/soul.md"), "Helpful employee.").unwrap();
+        std::fs::write(root.join("agents/helper/agent.partial.toml"),
+            "[capabilities]\ndenied_tools = [\"Bash\"]\n").unwrap();
+        std::fs::write(root.join("skills/review/SKILL.md"), "Review the supplied material.").unwrap();
+    }
+
+    async fn preview(ctx: &InstallCtx, root: &Path) -> serde_json::Value {
+        let mut report = Report::default();
+        install_native(ctx, root, &mut report).await.unwrap();
+        report.to_json(true)["details"].clone()
+    }
+
+    // Not run in this security-fix session: the owner prohibited builds/tests.
+    #[tokio::test]
+    async fn native_confirmation_rejects_changed_tools_skill_and_collision_plan() {
+        for change in ["tools", "skill", "collision", "parent", "model"] {
+            let home = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            source(root.path());
+            let mut context = ctx(home.path());
+            let old = preview(&context, root.path()).await;
+            match change {
+                "tools" => std::fs::write(root.path().join("agents/helper/agent.partial.toml"),
+                    "[capabilities]\ndenied_tools = []\n").unwrap(),
+                "skill" => std::fs::write(root.path().join("skills/review/SKILL.md"),
+                    "Review the amended material.").unwrap(),
+                "collision" => {
+                    std::fs::create_dir_all(home.path().join("agents/helper")).unwrap();
+                    std::fs::write(home.path().join("agents/helper/agent.toml"),
+                        "[agent]\nname = \"helper\"\n").unwrap();
+                }
+                "parent" => context.attach_under = Some("supervisor".into()),
+                _ => std::fs::write(root.path().join("agents/helper/agent.partial.toml"),
+                    "[model]\npreferred = \"claude-opus-4-5\"\n").unwrap(),
+            }
+            let new = preview(&context, root.path()).await;
+            assert_ne!(old["profile_confirmation"], new["profile_confirmation"], "{change}");
+            context.dry_run = false;
+            context.confirm_profile = old["profile_confirmation"].as_str().map(str::to_string);
+            assert!(install_native(&context, root.path(), &mut Report::default()).await.is_err(), "{change}");
+            assert!(!home.path().join("agents/helper/SOUL.md").exists(), "{change}");
+            assert!(!home.path().join("agents/helper-2").exists(), "{change}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_confirmation_writes_exact_reviewed_files() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        source(root.path());
+        let mut context = ctx(home.path());
+        let reviewed = preview(&context, root.path()).await;
+        context.dry_run = false;
+        context.confirm_profile = reviewed["profile_confirmation"].as_str().map(str::to_string);
+        install_native(&context, root.path(), &mut Report::default()).await.unwrap();
+        for file in reviewed["profile_install_plan"]["agents"][0]["files"].as_array().unwrap() {
+            let bytes = std::fs::read(home.path().join(file["path"].as_str().unwrap())).unwrap();
+            assert_eq!(super::super::registry::sha256_hex(&bytes), file["sha256"].as_str().unwrap());
+        }
+        assert_eq!(reviewed["profile_preview"][0]["disallowed_tools"], serde_json::json!(["Bash"]));
+    }
+
+    #[tokio::test]
+    async fn native_pack_import_rejects_unknown_contract_fields() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        source(root.path());
+        std::fs::write(root.path().join("agents/helper/CONTRACT.toml"),
+            "[boundaries]\nmust_always = [\"State uncertainty\"]\nunknown = true\n").unwrap();
+        assert!(install_native(&ctx(home.path()), root.path(), &mut Report::default()).await.is_err());
+        assert!(!home.path().join("agents").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_plan_refuses_linked_skill_files() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(other.path(), root.path().join("SKILL.md")).unwrap();
+        assert!(snapshot_native_tree(root.path()).is_err());
+    }
+
+    // NOT RUN: builds and tests were prohibited during this security fix.
+    #[cfg(unix)]
+    #[test]
+    fn native_snapshot_refuses_backslash_traversal_files_and_directories() {
+        for directory in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("..\\..\\outside.md");
+            if directory { std::fs::create_dir(path).unwrap(); }
+            else { std::fs::write(path, "outside").unwrap(); }
+            assert!(snapshot_native_tree(root.path()).is_err());
+        }
+    }
+
+    // NOT RUN: builds and tests were prohibited during this security fix.
+    #[test]
+    fn native_writer_refuses_non_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["../outside.md", "..\\outside.md", "/outside.md", "wiki/../../outside.md", "wiki/./page.md"] {
+            assert!(write_planned_file(root.path(), path, b"outside").is_err(), "{path}");
+        }
+        assert!(!root.path().join("wiki").exists());
+    }
+
+    // NOT RUN: builds and tests were prohibited during this security fix.
+    #[cfg(unix)]
+    #[test]
+    fn native_writer_refuses_symlinked_parent_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("shared")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("shared/wiki")).unwrap();
+        assert!(write_planned_file(root.path(), "shared/wiki/outside.md", b"outside").is_err());
+        assert!(!outside.path().join("outside.md").exists());
     }
 }

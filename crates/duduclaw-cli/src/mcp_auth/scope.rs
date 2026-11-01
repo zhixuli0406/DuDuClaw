@@ -388,7 +388,7 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "github_issue_comment" => Some(Scope::GithubWrite),
         // W19-P1 M4: Audit Trail 查詢 API — admin-only，與 WebSocket 路徑
         // `require_admin!()` 保持對等訪問控制。
-        "audit_trail_query" => Some(Scope::Admin),
+        "credential_declare" | "audit_trail_query" => Some(Scope::Admin),
         // W20-P0: Reliability Dashboard — admin-only，敏感指標資料。
         "reliability_summary" => Some(Scope::Admin),
         // R4 review: WebSocket dashboard requires manager+ for these via

@@ -338,6 +338,10 @@ impl LicenseRuntime {
             license.as_ref().map(|l| l.subscription_id.as_str()),
         );
 
+        crate::distributor_brand::runtime::load_cached(
+            &home_dir, &registry, license.as_ref().map(|l| l.subscription_id.as_str()),
+        );
+
         Self {
             state: Arc::new(RwLock::new(LicenseRuntimeInner {
                 license,
@@ -357,7 +361,8 @@ impl LicenseRuntime {
         let phone_home = tokio::spawn(phone_home_loop(self.clone()));
         let crl_poll = tokio::spawn(crl_loop(self.clone()));
         let notice_poll = tokio::spawn(crate::distributor_notice::runtime::poll_loop(self.clone()));
-        vec![phone_home, crl_poll, notice_poll]
+        let brand_poll = tokio::spawn(crate::distributor_brand::runtime::poll_loop(self.clone()));
+        vec![phone_home, crl_poll, notice_poll, brand_poll]
     }
 
     /// `(subscription_id, machine_fingerprint)` of the installed license, for
@@ -384,14 +389,22 @@ impl LicenseRuntime {
 
     /// Currently-active tier. Always returns `OpenSource` when no license
     /// is installed or the installed license has been downgraded by the
-    /// runtime (e.g. revoked, grace exceeded).
+    /// runtime (e.g. revoked, grace exceeded). Time-dependent validity is
+    /// checked on every read, even if all background refreshes fail.
     pub async fn current_tier(&self) -> LicenseTier {
         let inner = self.state.read().await;
-        inner
-            .license
-            .as_ref()
-            .map(|l| l.tier)
-            .unwrap_or(LicenseTier::OpenSource)
+        self.live_tier(inner.license.as_ref())
+    }
+
+    fn live_tier(&self, license: Option<&License>) -> LicenseTier {
+        let Some(license) = license else { return LicenseTier::OpenSource; };
+        let grace = self.gate.grace_period_days(license.tier);
+        // Match License::validate: zero grace disables the offline check.
+        if license.is_expired() || (grace > 0 && license.grace_period_exceeded(grace)) {
+            LicenseTier::OpenSource
+        } else {
+            license.tier
+        }
     }
 
     /// Returns `true` if the active tier unlocks the named feature.
@@ -437,8 +450,8 @@ impl LicenseRuntime {
     /// Snapshot of the current license, if any. Returned by reference
     /// for read-only inspection (dashboard `license.status` RPC, etc.).
     pub async fn snapshot(&self) -> LicenseSnapshot {
-        let tier = self.current_tier().await;
         let inner = self.state.read().await;
+        let tier = self.live_tier(inner.license.as_ref());
         LicenseSnapshot::from_state(inner.license.as_ref(), tier)
     }
 
@@ -523,6 +536,7 @@ impl LicenseRuntime {
         // A notice cached for the previous license no longer applies; the
         // next fetch brings the new subscription's.
         crate::distributor_notice::runtime::reset(&self.home_dir);
+        crate::distributor_brand::runtime::reset(&self.home_dir);
         {
             let mut inner = self.state.write().await;
             inner.license = validated;
@@ -534,6 +548,7 @@ impl LicenseRuntime {
             );
         }
         crate::distributor_notice::runtime::spawn_fetch_now(self.clone());
+        crate::distributor_brand::runtime::spawn_fetch_now(self.clone());
         Ok(self.snapshot().await)
     }
 }
@@ -1133,6 +1148,7 @@ impl LicenseRuntime {
         let mut inner = self.state.write().await;
         inner.license = None;
         crate::distributor_notice::runtime::reset(&self.home_dir);
+        crate::distributor_brand::runtime::reset(&self.home_dir);
         // Best-effort: remove the local file so subsequent restarts don't
         // reload a known-bad license.
         if let Err(e) = storage::delete_default() {
@@ -1461,6 +1477,77 @@ mod tests {
         assert!(snap.installed);
         assert_eq!(snap.customer_id.as_deref(), Some("cus_test"));
         assert!(snap.days_until_expiry.unwrap() >= 29);
+    }
+
+    #[tokio::test]
+    async fn brand_reads_recheck_expiry_and_offline_grace_without_a_refresh() {
+        use futures_util::FutureExt;
+        use crate::distributor_brand::{Brand, ORIGINAL_PRODUCT_NAME, effective_for};
+
+        let home = tempfile::tempdir().unwrap();
+        let runtime = LicenseRuntime {
+            state: Arc::new(RwLock::new(LicenseRuntimeInner {
+                license: Some(fake_license(LicenseTier::Oem, "fp_brand")),
+                last_seen_crl_at: None,
+            })),
+            gate: Arc::new(FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap()),
+            registry: Arc::new(PublicKeyRegistry::new()),
+            home_dir: home.path().into(),
+            control_url: "https://control.invalid".into(),
+        };
+        let accepted = crate::distributor_brand::runtime::Accepted {
+            subscription_id: "sub_test".into(),
+            distributor_id: "dist_test".into(),
+            version: 1,
+            brand: Brand {
+                product_name: "Distributor".into(),
+                logo_light: "data:image/png;base64,iVBORw0KGgo=".into(),
+                logo_dark: None,
+            },
+        };
+        for tier in [LicenseTier::Hobby, LicenseTier::Solo, LicenseTier::Studio,
+            LicenseTier::Business, LicenseTier::Partner, LicenseTier::PersonalProSelfHost,
+            LicenseTier::SelfHostPro, LicenseTier::Oem] {
+            {
+                let mut inner = runtime.state.write().await;
+                inner.license = Some(fake_license(tier, "fp_brand"));
+            }
+            // Both brand poll entry points use notice_identity, independently
+            // of the customer's tier issued through the distributor console.
+            assert_eq!(runtime.notice_identity().await,
+                Some(("sub_test".into(), "fp_brand".into())), "{tier:?}");
+            let grace = runtime.gate.grace_period_days(tier);
+            assert!(grace > 0);
+
+            // Keep the same installed license and accepted brand. Only advance
+            // stored times to model a long-running gateway with failed polls.
+            for (expires_in_days, offline_days, expected) in [
+                (30, 0, "Distributor"),
+                (30, grace - 1, "Distributor"),
+                (-1, 0, ORIGINAL_PRODUCT_NAME),
+                (-1, grace + 1, ORIGINAL_PRODUCT_NAME),
+                (30, grace + 1, ORIGINAL_PRODUCT_NAME),
+                (30, 0, "Distributor"),
+            ] {
+                {
+                    let mut inner = runtime.state.write().await;
+                    let license = inner.license.as_mut().unwrap();
+                    license.expires_at = Utc::now() + ChronoDuration::days(expires_in_days);
+                    license.last_phone_home = Utc::now() - ChronoDuration::days(offline_days);
+                }
+                // Synchronous brand renderers use this same nonblocking read.
+                let snapshot = runtime.snapshot().now_or_never().unwrap();
+                assert_eq!(runtime.current_tier().await, snapshot.tier);
+                let name = effective_for(snapshot.tier, snapshot.subscription_id.as_deref(), &accepted)
+                    .map(|brand| brand.product_name)
+                    .unwrap_or_else(|| ORIGINAL_PRODUCT_NAME.into());
+                assert_eq!(name, expected, "{tier:?}: expiry={expires_in_days}, offline={offline_days}");
+            }
+        }
+        runtime.state.write().await.license = None;
+        assert_eq!(runtime.notice_identity().await, None);
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(effective_for(snapshot.tier, snapshot.subscription_id.as_deref(), &accepted), None);
     }
 
     /// Helper that exercises the env-var parser without touching the

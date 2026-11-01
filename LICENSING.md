@@ -54,9 +54,9 @@ Apache 2.0 授權條款本身不限制使用方式。以下是執行檔依授權
 | 項目 | 行為 |
 |------|------|
 | `premium_templates` | 安裝付費產業包與付費團隊劇本。studio、business、partner、personal_pro_self_host、self_host_pro、oem 方案可用 |
-| `white_label` | 修改產品名稱、logo 等品牌設定。只有 oem 方案可用 |
+| 總經銷品牌 | 總經銷的客戶不限方案，只要品牌文件驗簽通過、訂閱與目前授權完全一致，而且授權通過期限與離線寬限檢查，就套用產品名稱與 Logo；開源版與未啟用授權的安裝沒有訂閱，不會取得品牌。沒有客戶端修改入口。舊的 `white_label` 功能旗標不會啟用它，原廠標示不能改 |
 | `industry_evolution_params` | 列在方案功能表中（business、partner、self_host_pro、oem）；本 repo 的程式碼沒有功能檢查這一項 |
-| 通道回覆尾註 | opensource 與 hobby 方案（以及沒有授權檔的安裝）在外部通道的回覆後附上「— Powered by DuDuClaw」；其他方案可用 `config.toml [branding] reply_footer = false` 關閉 |
+| 通道回覆尾註 | opensource 與 hobby 方案（以及沒有授權檔的安裝）在外部通道的回覆後附上「— Powered by DuDuClaw」；其他方案不強制附加；總經銷品牌有效時，尾註中的產品名稱使用驗證過的名稱 |
 | AI 員工數上限 | 雲端方案（hobby、solo 各 1 個，studio 3 個）在雲端部署時生效；授權金鑰若帶有簽章的 `max_agents`，自架部署也會套用。其他情況不限數量 |
 
 方案功能表中的其他布林值（客服管道、修補時效等服務承諾）只用於顯示，不會開關任何程式功能。
@@ -79,7 +79,7 @@ Apache 2.0 授權條款本身不限制使用方式。以下是執行檔依授權
 
 ### 我 Fork 後改名字商業化，可以嗎？
 
-**可以。** Apache 2.0 允許衍生作品，但需保留原始授權聲明和版權通知。
+**可以。** Apache 2.0 允許衍生作品，但需保留原始授權聲明和版權通知。官方執行檔也支援總經銷透過授權主控台發布簽章名稱與 Logo，讓其客戶在任何有效訂閱方案下使用；這不會改掉關於頁固定的原廠標示，詳見 [總經銷品牌](docs/guides/zh-TW/white-label.md)。
 
 ### 教育 / 研究用途呢？
 

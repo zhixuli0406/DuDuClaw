@@ -19,10 +19,12 @@ export interface InboxItem {
   readonly type: InboxItemType;
   /** One-line human title. */
   readonly title: string;
+  readonly question?: boolean;
   /** Originating AI staff id, when the item belongs to one. */
   readonly agentId?: string;
   /** Channel of origin, when applicable (failed runs). Drives group-by channel. */
   readonly channel?: string;
+  readonly runId?: string;
   /** ISO timestamp for `timeAgo` + time/stuck sort. */
   readonly timestamp?: string;
   /** Higher = more urgent; drives the "urgency" sort. */
@@ -87,8 +89,12 @@ export function sortInbox(items: readonly InboxItem[], by: InboxSortBy): InboxIt
     // "卡最久" — oldest first; undated sink to the bottom.
     return copy.sort((a, b) => (tsMs(a) ?? Infinity) - (tsMs(b) ?? Infinity));
   }
-  // urgency: type weight, tie-broken by newest.
-  return copy.sort((a, b) => b.urgency - a.urgency || (tsMs(b) ?? -Infinity) - (tsMs(a) ?? -Infinity));
+  // Deadlines come first, then risk and the owner's waiting decisions.
+  const rank = (i: InboxItem) => i.risk === 'high' ? 3 : i.status === 'needs_human' || i.type === 'decision' ? 2 : i.type === 'budget' ? 1 : 0;
+  return copy.sort((a, b) => {
+    const expiryOrder = (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity);
+    return (Number.isNaN(expiryOrder) ? 0 : expiryOrder) || rank(b) - rank(a) || b.urgency - a.urgency || (tsMs(b) ?? -Infinity) - (tsMs(a) ?? -Infinity);
+  });
 }
 
 // ── Tab filtering ────────────────────────────────────────────────────────────
@@ -125,7 +131,7 @@ export function filterByTab(items: readonly InboxItem[], tab: InboxTab, ctx: Inb
       // current source set that is all types; the value of this tab is the
       // tri-bucket re-organisation (blockedBucket) + stuck-sort, not a narrower
       // population.
-      return [...items];
+      return items.filter((i) => i.actionable && tsMs(i) != null && (ctx.nowMs ?? Date.now()) - tsMs(i)! >= 24 * 60 * 60 * 1000);
     case 'all':
       return [...items];
   }
@@ -207,7 +213,7 @@ export function groupKeyOf(item: InboxItem, by: InboxGroupBy): string {
     case 'agent':
       return item.agentId ?? '—';
     case 'channel':
-      return item.channel ?? '—';
+      return item.channel ?? `type:${item.type}`;
   }
 }
 
@@ -290,6 +296,11 @@ export function sinkProcessed(items: readonly InboxItem[], processed: ReadonlySe
  */
 export const STATUS_LABEL_KEYS: Readonly<Record<string, string>> = {
   pending: 'inbox.status.pending',
+  pending_approval: 'inbox.status.pending',
+  open: 'inbox.type.question',
+  critical: 'inbox.status.other',
+  warning: 'inbox.status.other',
+  info: 'inbox.status.other',
   needs_human: 'inbox.status.pending',
   approved: 'inbox.status.approved',
   denied: 'inbox.status.denied',
@@ -307,7 +318,7 @@ export const STATUS_LABEL_KEYS: Readonly<Record<string, string>> = {
 };
 
 /** i18n message id for a raw status token, or `null` when there is no
- *  §C-aligned mapping — the caller should fall back to the raw token. */
+ *  §C-aligned mapping — the caller should use a plain-language fallback. */
 export function statusLabelKey(status: string): string | null {
   return STATUS_LABEL_KEYS[status] ?? null;
 }
@@ -429,4 +440,14 @@ export function inboxSourcesDeniedFor(role: string | undefined): ReadonlySet<Inb
   if (role === 'employee') return new Set(['approvals', 'budget', 'failedRuns', 'installs']);
   if (role === 'manager') return new Set(['failedRuns']);
   return new Set();
+}
+
+/** One actionable population for every inbox counter. */
+export function actionableInboxItems(items: readonly InboxItem[], processed: ReadonlySet<string> = loadIdSet(PROCESSED_KEY), archived: ReadonlySet<string> = loadIdSet(ARCHIVED_KEY)): InboxItem[] {
+  return items.filter((item) => item.actionable && !processed.has(item.id) && !archived.has(item.id));
+}
+
+/** Hiding a live decision would leave the employee waiting or let it expire. */
+export function canArchiveInboxItem(item: InboxItem, processed = false): boolean {
+  return processed || !((item.type === 'approval' || item.type === 'install') || item.status === 'needs_human');
 }

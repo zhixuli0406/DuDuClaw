@@ -14,6 +14,10 @@
 > そのため2026-07-30に、製品面は完全にネイティブツール経路とし、本マウントは
 > 自社利用と自ら申請する意思のある上級ユーザーにのみ提供する、と決定されました。
 
+## 2026-11-11 からのクライアント要件
+
+2026-11-11 から Google Workspace MCP サーバーは AI agent として指定されていないクライアントを拒否します。Google Auth platform → Clients で、この上級用途専用のクライアントを作り “Use this client for an AI-powered agent” を選択してください。REST 専用アプリは対象外で、DuDuClaw のネイティブ Google ツールは REST を使います。2026-10-30 の調査に基づく記述で、Console 画面を再度ライブ確認していません。
+
 ## 8サービスのカバレッジ状況
 
 | サービス | ネイティブツール(**出荷経路**、資格制限なし) | 公式MCP(preview、自社利用限定) |
@@ -36,7 +40,7 @@ FormsとTasksの「公式なし」は検証済みの事実であり、推測で�
 `formsmcp.googleapis.com` / `tasksmcp.googleapis.com`は実測で404が返り、
 GoogleのMCPドキュメントにもこの2サービスへの言及は一切ありません
 (coming soonとしてすら記載がない)。また公式にはChat
-(`preset = "google:chat"`、利用可能)とPeople(エンドポイント名が異なり、
+(`preset = "google:chat"`)とPeople(エンドポイント名が異なり、
 presetには未収録)もありますが——この2つは現時点でネイティブツール側の
 対応がありません。
 
@@ -125,8 +129,7 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 
 - previewステージであり、rate limitは公開ドキュメント化されていません
   (GCP Consoleのquotaページで確認可能)。
-- OAuthはインタラクティブのみ——**サービスアカウント/ヘッドレス認可経路は
-  ありません**。
+- 通常の OAuth はブラウザー同意が必要です。リモートやヘッドレス環境は [Google の接続](google-setup.md#リモートホストと-docker)の SSH 転送を使えます。ネイティブのサービスアカウント委任は対応済みで、各公式リモート MCP が委任トークンを受け付けるかは別途検証が必要です。
 - Gmailに送信ツールはありません。公式リファレンスページのツール数は
   実際のエンドポイントと食い違っています(リファレンスは10個と記載、
   実際のエンドポイントは13個)——実測の`tools/list`を信頼してください。
@@ -138,3 +141,5 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 [Gmail MCP reference](https://developers.google.com/workspace/gmail/api/reference/mcp)、
 [Calendar MCP reference](https://developers.google.com/workspace/calendar/api/v3/reference/mcp)、
 [Developer Preview Program](https://developers.google.com/workspace/preview)。
+
+`google:chat` プリセットは Chat スコープを追加しません。ネイティブ Workspace のスコープ一覧には Chat がないため、別途適切な認可が必要です。Google Chat チャネルは `chat.bot` を使う別接続です。

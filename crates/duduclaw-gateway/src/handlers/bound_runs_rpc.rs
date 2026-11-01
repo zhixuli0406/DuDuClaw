@@ -65,6 +65,7 @@ impl MethodHandler {
         let mut rows: Vec<_> = rows.into_iter().map(|(r, _, _)| r).collect();
         rows.sort_by(|a, b| (&a.session_id, a.rowid).cmp(&(&b.session_id, b.rowid)));
         let mut runs = fold_session_runs(&rows, Utc::now());
+        apply_channel_run_failures(&self.home_dir, &mut runs);
         runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         runs.truncate(limit);
         let mut out = vec![];
@@ -137,9 +138,12 @@ impl MethodHandler {
         let first = transcript.messages.first().ok_or("Run not found")?;
         let last = transcript.messages.iter().find(|r| r.role == "assistant");
         let events:Vec<_>=transcript.messages.iter().map(|m|json!({"kind":"text","role":m.role,"ts":m.timestamp,"preview":crate::history_privacy::plain_parts(&m.parts)})).collect();
+        let failed_end = crate::run_steps::shared_store(&self.home_dir).and_then(|s| s.channel_failure_end(sid, row));
+        let ended_at = failed_end.as_deref().or_else(|| last.map(|m| m.timestamp.as_str()));
+        let status = if failed_end.is_some() { "failed" } else if last.is_some() { "completed" } else { "no_reply" };
         self.bound_history_recheck(ctx, agent, Mode::Filtered)?;
         Ok(
-            json!({"run":{"id":handles::issue_run(&self.home_dir,&ctx.user_id,run_id)?,"session_id":handles::issue(&self.home_dir,&ctx.user_id,sid)?,"agent_id":agent,"channel":channel,"started_at":first.timestamp,"ended_at":last.map(|m|&m.timestamp),"status":if last.is_some(){"completed"}else{"no_reply"}},"events":events,"event_sources":{"text":"conversation history"},"not_persisted":["thinking_summaries"],"omitted":["tool_steps"],"read_only":true,"privacy_mode":if external {"masked"}else{"own"},"ner":transcript.ner}),
+            json!({"run":{"id":handles::issue_run(&self.home_dir,&ctx.user_id,run_id)?,"session_id":handles::issue(&self.home_dir,&ctx.user_id,sid)?,"agent_id":agent,"channel":channel,"started_at":first.timestamp,"ended_at":ended_at,"status":status},"events":events,"event_sources":{"text":"conversation history"},"not_persisted":["thinking_summaries"],"omitted":["tool_steps"],"read_only":true,"privacy_mode":if external {"masked"}else{"own"},"ner":transcript.ner}),
         )
     }
 }

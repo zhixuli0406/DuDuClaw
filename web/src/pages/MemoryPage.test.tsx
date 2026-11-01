@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -17,6 +18,7 @@ function setEdition(profile: 'personal' | 'enterprise') {
 }
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never });
   vi.clearAllMocks();
   mockWsClient.call.mockResolvedValue({});
   setEdition('enterprise');
@@ -274,4 +276,11 @@ describe('MemoryPage — search term as URL (W3-3)', () => {
       expect(screen.getByTestId('search-probe')).not.toHaveTextContent('q=');
     });
   });
+});
+
+it('hides manager-only learning from an employee', () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  renderWithProviders(<MemoryPage />);
+  expect(screen.queryByRole('radio', { name: 'Self-Improvement' })).not.toBeInTheDocument();
+  expect(mockWsClient.call.mock.calls.some(([m]) => String(m).startsWith('evolution.'))).toBe(false);
 });

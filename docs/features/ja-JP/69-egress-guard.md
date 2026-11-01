@@ -40,19 +40,34 @@ Store は存続中に `<home>/egress_leases.lock` の排他ファイルロック
 
 登録履歴はスタッフごとの容量固定 Bloom filter に保持し、同じ gateway プロセスの存続中は消去しません。削除済み・期限切れのターンを再登録してもクリーンには戻りません。ハッシュ衝突や filter の飽和により、そのスタッフの新しいターンを保守的に読み取り済みと判定する場合があります。最大 1,024 スタッフ、各 32 KiB、合計 32 MiB です。上限を超えるスタッフのターンは常に読み取り済みとします。履歴は再起動後には保持されません。
 
+## 観測レポート
+
+管理者はセキュリティページで過去 7 日または 30 日の UTC 日付の観測を確認できます。承認件数は確認が必要になる呼び出しを一度だけ数え、事前確認と送信直前の再確認は同じ呼び出し ID を共有します。拒否の観測は内訳に含めますが、承認件数には加算しません。スタッフ、ツール、固定の非公開情報源クラス、日付、CLI 組み込み／MCP 入口別に表示します。空の結果は保存された記録がないことを示し、安全の証明ではありません。記録の失敗はガードの判定に影響せず、レポートが不完全になる場合があります。
+
+件数は各スタッフ自身の活動に基づく推定値です。呼び出しを繰り返すと水増しでき、Bash を使えるスタッフは shadow データベースファイルも変更できます。保存上限はスタッフごとに一日 10,000 件、全体で 1,000,000 件です。超過分はスタッフと日付ごとに集計するため、上限に達した件数は表示値以上を意味します。
+
+`<home>/egress_shadow.db` は SQLite WAL、Unix 0600 で 35 日間保持し、書き込み時の削除は一時間に一度までです。内容・宛先・自由記述の情報源名は保存しません。RPC `security.egress_shadow_report` は Admin 専用で、`days: 7` または `days: 30` だけを受け付けます。
+
+レポートの対象は MCP 送信ゲート評価、コンピューター操作、gateway の hook 検査です。読み取り予約の競合、未対応 runtime の起動警告、ローカル hook の通信失敗はツール監査ログに残り、この呼び出し件数には含まれません。
+
 ## 復旧
 
-Gateway ログの `egress lease store unavailable; private reads fenced` と `error` フィールドを確認してください。容量超過は `egress agent lease store over capacity` または `egress lease store over capacity`、不正な行は `invalid egress lease row` と表示されます。SQLite ファイルの破損ではデータベースエラーが出る場合があります。五秒ごとに再試行し、ログは一分に一回までです。`ask`／`block` では非公開読み取りと新規送信が拒否されます。Gateway の拒否理由は「外送防護紀錄無法讀取，暫停私人讀取及對外動作；請稍後重試。」ですが、呼び出し元では一般的な再試行メッセージになる場合もあります。現在、ダッシュボードと `doctor` に lease ストア専用の健全性表示はありません。
+`duduclaw doctor` は lease 件数、最古の経過時間、読み取り可否を表示します。異常時は gateway ログの `egress lease store unavailable; private reads fenced` と `error` を確認してください。読み取り不能の場合、`ask`／`block` は非公開読み取りと新規送信を拒否します。
 
-送信アクション（sink）が実行中の可能性がある間は、データベースを削除しないでください。並行する非公開読み取りを防ぐ唯一の fence が、その行に残っている場合があります。復元できない場合は、次の手順をオフラインで行います。
+削除前に、この home を使うすべての gateway と自動再起動を停止し、スタッフ CLI と MCP／ツールの子プロセスの送信が終了したことを確認します。実行中の可能性が残る場合は保護を維持して調査します。
 
-1. この home を使うすべての gateway を停止し、自動再起動も停止します。
-2. 既存の `<home>/egress_leases.db*` を WAL／SHM sidecar とともに非公開の場所へバックアップし、権限を保持します。
-3. スタッフの CLI プロセスと MCP／ツールの子プロセスがすべて停止し、送信アクションも終了したことを確認します。確認できなければ gateway を停止したままにし、ストアをリセットしないでください。
-4. データベースと対応するすべての sidecar をまとめて別の場所へ移動し、バックアップを保持します。`egress_leases.lock` は削除しません。
-5. Gateway を起動すると空の lease ストアが作成されます。**以前の送信 fence はすべて失われます。** 古いアクションが生き残っていると並行読み取りに対する保護がなくなるため、手順 3 の確認後にのみ再起動してください。ログのエラーが消え、読み取りと送信の許可判定が正常に動くことを確認します。
+```sh
+duduclaw egress-leases list --json
+duduclaw egress-leases clear --all --confirm <list-token>
+# 一件だけの場合は、その lease の token を使用します:
+duduclaw egress-leases clear --lease <id> --confirm <lease-token>
+```
 
-サポート対象のオフライン復旧コマンドを今後提供する予定です。本リリースには復旧 CLI はありません。
+操作者自身のターミナルで実行します。AI セッションは拒否されます。両コマンドとも gateway の停止と lease ロックの取得が必要です。gateway ロックを読めない場合も拒否します。`clear` は排他 lease ロックを保持し、現在の lease を読み、時刻付きの非公開データベースバックアップを作成してから、選択した ID をソートした集合の token を確認し、一つのトランザクションで削除してセキュリティ監査を記録します。集合が変われば token は無効です。バックアップを保持し、`egress_leases.lock` は削除しないでください。
+
+`egress-leases` は操作者向けツールです。AI セッションの確認は環境マーカーに依存し、同じ OS アカウントで動く FullAccess シェルなら回避できます。Windows では lease ストアのハードリンク検査を適用しません。
+
+lease の削除は並行する非公開読み取りを防ぐ保護を解除します。対応する送信が終了したと確認してから再起動し、doctor と gateway の動作を確認します。このコマンドは破損・読み取り不能のデータベースを修復しません。拒否をデータベースやロックファイルの削除で回避しないでください。ダッシュボード承認には実行中の gateway が必要で停止要件と両立しないため、復旧にはローカルのオフライン確認を使います。
 
 ## 承認する前に
 
@@ -60,15 +75,38 @@ Gateway ログの `egress lease store unavailable; private reads fenced` と `er
 
 アクションルールによる承認には、一致したツールまたは効果のルールを表示します。読み取り・下書きツールも対象です。Purchase と Delete に常設の機能付与やワークフロー付与を新規作成することはできません。既存の付与は記録を変更せず無視します。ほかの検査と個別承認は引き続き必要です。
 
+## CLI 組み込みツール
+
+Claude と Grok に `PreToolUse` hook を追加し、`WebFetch`、`WebSearch`、Bash のリテラルなネットワークコマンドを検査します。Grok の別名は `Fetch`、`Shell`、`web_fetch`、`web_search`、`run_terminal_command` です。DuDuClaw は、Grok の matcher と環境変数の引き継ぎが実 CLI と一致することを保証しません。通常の非ネットワーク Bash は gateway に接続せず許可します。対象は `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp` と `git push/fetch/clone/pull/ls-remote`。Shell `-c`、`eval`、echo/printf 引数は最大二段、各 64 KiB まで再解析します。echo/printf のコマンド風データも保守的に対象になる場合があります。
+
+| モード | 未読のターン | 非公開データを読み取り済み | 台帳を読めない／不明なターン |
+|---|---|---|---|
+| `off` | 許可 | 許可 | 許可 |
+| `shadow` | 許可 | 許可し `would_ask` | 許可し `would_refuse_ledger_unavailable` |
+| `ask` | 許可 | 承認カードを作成し再試行まで拒否 | 拒否 |
+| `block` | 許可 | 拒否 | 拒否 |
+
+Hook は元の引数を `/api/internal/egress-guard/hook-check` に送り、gateway が正規化、ハッシュ計算、カード生成を行います。クライアントの digest や要約は受け付けません。要求と応答に署名し、ポートは `config.toml` から読みます。Hook 専用のスタッフごと毎分 120 回の枠を使用します。依頼者は gateway に登録済みの実行コンテキストから復元し、確認できなければ承認を作成しません。
+
+`ask` は先にカードを作成して拒否します。現在の Admin がダッシュボードで承認した後、同じターンで完全に同じ引数を再試行してください。スタッフ、ターン、ツール、全引数、読み取り元を紐付け、`WebFetch` はクエリを含む完全な URL を対象とします。同じ保留要求はカードを再利用し、読み取り元が増えたら旧カードを失効させます。承認は一回限りです。Bash の承認は直接実行する単純な一コマンド、一ネットワーク動詞のみ。展開、置換、パイプ、リダイレクト、`@file`、ラッパー、インタープリターは承認対象外で、理由を示して拒否します。紐付くのは文字列で、DNS、実行ファイル、設定ファイル、symlink の実体ではありません。
+
+`ask`／`block` では捕捉できる hook エラーと panic は exit 2、インストール失敗はアカウント／runtime を切り替えず起動を停止します。`shadow` は警告して続行します。Claude の強制モードは `--setting-sources "" --settings <file>` で身分の `.claude/settings.json` だけを読み、他の project/local/user 設定を併合しません。cwd が別でも同じです。強制モードでは hook を省略する `cli_bare_mode` を拒否します。Grok は `--disable-web-search` を追加します。強制モードでは共有・借用 cwd や他スタッフの guard が残った hook ディレクトリを拒否します。独立したスタッフディレクトリ、または Claude/Codex を使用してください。
+
+Codex の強制モードは `-c sandbox_workspace_write.network_access=false -c web_search="disabled"` を追加し、FullAccess を WorkspaceWrite に制限します。ReadOnly と MCP 自動承認器は保持します。個別コマンドの承認ではなく起動時の制限です。汎用 CLI は対象外のまま `would_refuse_unsupported_runtime` を記録します。OpenAI 互換のツールループは既存の MCP 検査を使います。
+
+Cron、dispatch、reminder、mail、heartbeat、ephemeral はチャネル requester と独立して host ターンを登録し、`DUDUCLAW_TURN_ID` を渡します。`default` の実際のスタッフ名も登録します。既存の読み取り済み状態は消さず、不明なクライアントターンは読み取り済みのままです。
+
+**Bash hook は減速帯とテレメトリであり、隔離境界ではありません。** 組み込み `Read` と Bash のファイル読み取りは情報源を記録しません。インタープリター、スクリプト、別名、改名バイナリ、`/dev/tcp`、動的コマンドは検出を回避できます。hook が存在しない、終了させられた、タイムアウトした場合、上流 CLI が無視する可能性があります。同一 OS ユーザーの hook・鍵・環境へのアクセスは署名では隔離できません。ネイティブ事前検査は実行完了まで MCP sink lease を保持せず、検査後の並行読み取りも止めません。隔離が必要なら Bash を許可しないか、委任タスクの sandbox を使ってください。sandbox は全チャネル／CLI を覆うものではありません。Security ページは強制モードで Bash がありタスク sandbox が無効なスタッフを表示します。
+
+
 ## 既知の制限
 
 API ツールループへ `[[mcp.external]]` で直接登録したツール（stdio、HTTP、Google の閉じたブリッジ）も検査します。この経路のツール登録には MCP annotations が保持されないため、すべて保守的に **Modify** として扱います。サーバーが読み取り専用と説明していても、非公開データを読んだ後は送信承認が必要になり得ます。完全一致のツール別アクションルールは引き続き適用されます。MCP プロキシとリモートブリッジは annotations と `trusted_read_hint_servers` による既存の判定を使います。
 
-情報源はターン単位で追跡し、実行中の送信 fence はスタッフ単位で適用します。この MCP 検査はネットワークサンドボックスを提供しません。Claude CLI のネイティブツール（`WebFetch`、`Bash` での `curl`）および他ランタイムのネイティブツールは対象外です。プロンプト内のデータや対象外の経路で読んだ情報は自動分類されません。新しいターンには新しいキーを使い、ターンをまたぐコピーは追跡しません。ターンの情報源は gateway 再起動後に保持されませんが、保存された送信 lease は復元します。記録のみのモードでは送信は許可されます。
+情報源はターン単位で追跡し、実行中の送信 fence はスタッフ単位で適用します。この MCP 検査はネットワークサンドボックスを提供しません。CLI の検査もありますが、runtime 全体のネットワーク隔離は提供しません。プロンプト内のデータや対象外の経路で読んだ情報は自動分類されません。新しいターンには新しいキーを使い、ターンをまたぐコピーは追跡しません。ターンの情報源は gateway 再起動後に保持されませんが、保存された送信 lease は復元します。記録のみのモードでは送信は許可されます。
 
 [セキュリティ防御](05-security-defense.md)と[ダッシュボード設定](../../guides/dashboard-settings.md)も参照してください。
 
-検証範囲：自動テストは分類、ゲート、承認の動作を対象とします。実際のスタッフと外部サービスを使ったエンドツーエンド検証は未実施です。
 
 直接接続する外部 scoped／closed 操作は、承認カードより先に期限切れになる場合があります。その後の承認で呼び出しが再実行されることはありません。新しい呼び出しが必要です。古いカードは表示された期限まで承認待ちのまま残る場合があります。
 
@@ -81,3 +119,40 @@ API ツールループへ `[[mcp.external]]` で直接登録したツール（st
 組み込みツールの完了は、確認済みのハンドラー契約を完全一致の名前一覧で判定します。ローカルのメール下書き、タスク・スタッフキュー、提案は永続化の完了を指し、後続作業の終了は意味しません。エラーでは保守的に fence を保持します。`model_search`、`model_download`、`skill_search`、`codrive_run`、`browser_record_start`、`os_open` は見かけ上成功してもlease の期限まで保持します。集約レポート、代替ダウンロード、バックグラウンド処理では、すべての送信の終了を確認できないためです。
 
 リモートブリッジは呼び出しごとの generation wire ID を使用し、期限切れ応答を破棄します。元の ID が再利用されても、古い応答が新しい送信 lease を終了させることはありません。呼び出し側が予約済みの `duduclaw-egress:` ID 名前空間を使うと、明示的に拒否します。
+
+## サーバーが管理する送信先
+
+送信先の保護は、個人情報を読んだかどうかとは独立しています。`config.toml [security] recipient_guard` は `off`、`shadow`（既定）、`ask` に対応し、不明な値は警告して `ask` として扱います。従業員の `[capabilities] recipient_guard` は全体設定を厳しくする場合だけ有効です（`off < shadow < ask`）。Security の Outgoing data guard から全体設定を変更し、Admin は従業員の編集画面で追加の送信先を管理します。
+
+```toml
+# config.toml
+[security]
+recipient_guard = "shadow"
+
+# agents/<id>/agent.toml
+[capabilities]
+recipient_guard = "ask"
+recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+```
+
+許可されるのは、このターンの会話、確認済みの所有者、従業員の許可リストです。チャネルのターンが元の送信先を提供するのは、サーバーに登録された `ChannelUser` に確認済みの紐付け（`user_id: Some(_)`）がある場合だけです。未紐付けの LINE、Telegram、公開 Web の訪問者は、副作用ツールの元の送信先を提供しません。`ask` では、公開スタッフが未紐付けの訪問者に `send_message` を使うと Admin の承認が必要です。確認済みの所有者または設定済みの宛先として別途許可されている場合を除きます。通常の返信経路は影響を受けません。gateway が自身のターン表から会話を解決し、MCP は署名付き内部ルートに不透明なターン ID だけを送ります。不明なターンには元の会話がありません。`DUDUCLAW_REPLY_CHANNEL` は送信許可を与えません。`parse_origin` と同じ規則で従業員の接尾辞とスレッドを除去し、正確に照合します。
+
+所有者は **`users.db` の `AccessLevel::Owner` バインディングのみ**から取得し、gateway が確認したチャネルの識別情報に解決します。従業員が編集できる `[proactive]` の通知先は所有者になりません。必要なら Admin が `[capabilities] recipients` に追加します。capabilities テーブル全体が従業員による編集から保護されており、新しい二つのキーも対象です。
+
+| モード | 許可リスト内の送信先 | 許可リスト外の送信先 |
+|---|---|---|
+| `off` | 許可 | 許可 |
+| `shadow` | 許可 | 許可し、`tool_calls.jsonl` に `recipient_guard: "would_ask"` を記録 |
+| `ask` | 許可 | Admin による一回限りの承認が必要 |
+
+承認カードには、宛先が現在の会話でも許可リストの送信先でもないことを表示します。データ外送の保護も承認を求める場合は、一枚のカードに両方の理由を表示します。ActionGrant は従業員、ツール、完全な引数を結び付けるため、宛先や内容を変えれば再承認が必要です。shadow は宛先を理由に実行を止めません。
+
+対象は `send_message`、`send_photo`、`send_sticker`、`create_reminder`、`mail_send`、および `tasks_create`／`update_cron_task` の `notify_channel`、`notify_chat_id`、`notify_thread_id` です。`calendar_create_event` の attendees はメール宛先として検査します。スケジュール通知は作成時と実行時に現在の設定で検査し、実行時は元の会話を持たないため、確認済みの所有者と設定済みリストだけが承認なしで許可されます。
+
+`responsibility_ask` の承認先はサーバーが決定し、`os_notify` はローカル通知です。`github_issue_comment` は会話の宛先ではなく issue を指定するため、データ外送とアクションポリシーが引き続き適用されます。`send_to_agent`、`spawn_agent`、`team_handoff` は委任ポリシーを維持します。送信先 adapter のない第三者 MCP は、Send、Publish とその他の外送可能な効果に対して、非公開データの読み取りとは独立して `ask` で Admin の承認を求めます。第三者ゲートは Modify、Delete、Purchase、Admin も保守的に対象とし、信頼できる Read と Draft は除外します。不明なツールには信頼できる宛先解析がないため fail closed とします。`shadow` は `recipient_would_ask`（`recipient_guard: "would_ask"`）を記録し、`off` は送信先承認を追加しません。`to` という引数名だけでは信頼できる adapter になりません。
+
+実際の送信先で会話の接尾辞を使って許可済みの宛先を装うことはできません。Discord の通知スレッドは親チャンネルと併せて確認します。`update_cron_task` の通知先変更では `notify_channel` と `notify_chat_id` を同時に指定し、空の組で通知先を解除できます。タスクと通知先は原子的に保存します。他の承認待ちの後にも宛先権限を再確認します。一時アシスタントは親の宛先モードと設定リストを継承し、検証済み所有者の紐付けは従業員ごとに判定します。
+
+この保護は製品の経路に適用されます。同じ OS ユーザーの無制限なファイル・ネットワーク操作を隔離する機能ではありません。
+
+無制限の Bash を持つスタッフは同じ OS ユーザーとして実行され、ローカルポリシーを変更したり MCP の送信経路を迂回したりできます。送信先の保護では防止できません。`egress_guard` が off または shadow でも、有効な `recipient_guard` が `ask` なら、Security ページは Bash を使えてタスクサンドボックスが無効なスタッフを表示します。

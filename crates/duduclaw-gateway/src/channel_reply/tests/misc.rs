@@ -15,7 +15,7 @@ mod product_footer_tests {
     }
 
     #[test]
-    fn footer_is_fixed_and_skips_empty_and_internal_replies() {
+    fn default_footer_is_byte_identical_and_skips_empty_and_internal_replies() {
         let out = append_product_footer("好的，已完成".into(), "line:U1");
         assert!(out.ends_with(PRODUCT_FOOTER));
         // Plain-text attribution; the retired 🐾 brand glyph is not appended.
@@ -23,6 +23,15 @@ mod product_footer_tests {
         assert_eq!(out, "好的，已完成\n\n— Powered by DuDuClaw");
         assert!(append_product_footer(String::new(), "line:U1").is_empty());
         assert_eq!(append_product_footer("hi".into(), "webchat:c#a"), "hi");
+    }
+
+    #[test]
+    fn distributor_footer_escapes_channel_markup() {
+        assert_eq!(
+            product_footer_for("A&B *brand* [link](x) <@everyone>"),
+            "— Powered by A\\&B \\*brand\\* \\[link\\]\\(x\\) \\<@\u{200b}everyone\\>"
+        );
+        assert_eq!(product_footer_for("DuDuClaw"), PRODUCT_FOOTER);
     }
 }
 

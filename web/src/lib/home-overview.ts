@@ -15,6 +15,8 @@
  * `audit.unified_log` (channel_failure source) for K. No backend change; the
  * component that calls these functions owns the actual RPCs.
  */
+import type { IntlShape } from 'react-intl';
+import type { RiskLevel } from './approval-risk';
 import { TYPE_URGENCY, sortInbox, type InboxItem } from './inbox-model';
 
 /**
@@ -79,6 +81,38 @@ export interface ChannelFailureAuditEvent {
   // structurally assignable from `UnifiedAuditEvent` — `channel_failure`'s
   // shape is checked at runtime in `channelFailureChannel` below instead.
   details?: Record<string, unknown>;
+}
+
+/** Failure payloads contain diagnostic JSON, never a user-facing sentence. */
+export function failedRunTitle(event: Pick<ChannelFailureAuditEvent, 'agent_id'>, formatMessage: IntlShape['formatMessage'], agentName = event.agent_id): string {
+  return formatMessage({ id: 'inbox.failedRun.title' }, { agent: agentName });
+}
+
+/** Share the same run destination across Inbox and Home. */
+export function failedRunHref(item: { runId?: string; agentId?: string }): string {
+  return item.runId ? `/runs?run=${encodeURIComponent(item.runId)}`
+    : item.agentId ? `/runs?agent=${encodeURIComponent(item.agentId)}` : '/runs';
+}
+
+export function failureRunId(event: ChannelFailureAuditEvent): string | undefined {
+  const inner = event.details?.channel_failure;
+  const nested = inner && typeof inner === 'object' ? (inner as Record<string, unknown>).run_id : undefined;
+  const id = event.details?.run_id ?? nested;
+  return typeof id === 'string' && id ? id : undefined;
+}
+
+/** Legacy failure records stored a display name rather than the roster id. */
+export function resolveFailureAgentId(value: string, agents: ReadonlyArray<{ name: string; display_name?: string }>): string | undefined {
+  if (agents.some((agent) => agent.name === value)) return value;
+  const matches = agents.filter((agent) => agent.display_name === value);
+  return matches.length === 1 ? matches[0].name : undefined;
+}
+
+/** Unified-log summaries share the same plain words as the Inbox. */
+export function auditEventSummary(event: ChannelFailureAuditEvent & { source: string }, formatMessage: IntlShape['formatMessage'], agentName = event.agent_id): string {
+  return event.source === 'channel_failure' && /^[\s]*[\[{]/.test(event.summary) && !isChannelRecoveredEvent(event.event_type)
+    ? failedRunTitle(event, formatMessage, agentName)
+    : event.summary;
 }
 
 /**
@@ -149,9 +183,12 @@ export interface AttentionSourceRow {
   title: string;
   agentId?: string;
   timestamp?: string;
+  expiresAt?: number | null;
+  risk?: RiskLevel;
   /** failed_run rows only — best-effort, see `HealthOverview.tsx` for why
    *  this is usually absent (backend gap, not this module's doing). */
   channel?: string;
+  runId?: string;
 }
 
 /**
@@ -176,6 +213,8 @@ export function buildAttentionItems(
         urgency: TYPE_URGENCY.approval,
         actionable: true,
         status: 'pending',
+        expiresAt: a.expiresAt,
+        risk: a.risk,
       }),
     ),
     ...needsHumanTasks.map(
@@ -197,6 +236,7 @@ export function buildAttentionItems(
         title: fr.title,
         agentId: fr.agentId,
         channel: fr.channel,
+        runId: fr.runId,
         timestamp: fr.timestamp,
         urgency: TYPE_URGENCY.failed_run,
         actionable: false,

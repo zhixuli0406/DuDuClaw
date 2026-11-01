@@ -1,6 +1,6 @@
 //! Baselines for every prompt-bearing profile file, not only SOUL.md.
 //!
-//! `INSTRUCTIONS.md` is injected into every prompt like `SOUL.md`, so it gets
+//! `IDENTITY.md`, `USER.md` and `INSTRUCTIONS.md` are injected into every prompt like `SOUL.md`, so it gets
 //! the same protection: a SHA-256 baseline outside the agent directory
 //! (`<home>/soul_hashes/<agent>.instructions.hash`), an "established" marker
 //! that makes a deleted hash suspicious (HS11), drift detection, and an
@@ -16,6 +16,8 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtectedDoc {
     Soul,
+    Identity,
+    User,
     Instructions,
 }
 
@@ -24,6 +26,8 @@ impl ProtectedDoc {
     pub fn file_name(self) -> &'static str {
         match self {
             Self::Soul => "SOUL.md",
+            Self::Identity => "IDENTITY.md",
+            Self::User => "USER.md",
             Self::Instructions => "INSTRUCTIONS.md",
         }
     }
@@ -31,6 +35,8 @@ impl ProtectedDoc {
     fn hash_ext(self) -> &'static str {
         match self {
             Self::Soul => "hash",
+            Self::Identity => "identity.hash",
+            Self::User => "user.hash",
             Self::Instructions => "instructions.hash",
         }
     }
@@ -38,6 +44,8 @@ impl ProtectedDoc {
     fn marker_ext(self) -> &'static str {
         match self {
             Self::Soul => "established",
+            Self::Identity => "identity.established",
+            Self::User => "user.established",
             Self::Instructions => "instructions.established",
         }
     }
@@ -83,7 +91,7 @@ pub fn hash_bytes(data: &[u8]) -> String {
 pub fn fingerprint_doc(doc: ProtectedDoc, agent_dir: &Path) -> Option<String> {
     match doc {
         ProtectedDoc::Soul => super::fingerprint_soul(agent_dir),
-        ProtectedDoc::Instructions => {
+        ProtectedDoc::Instructions | ProtectedDoc::Identity | ProtectedDoc::User => {
             let content = std::fs::read(agent_dir.join(doc.file_name())).ok()?;
             Some(super::sha256_hex(&content))
         }
@@ -94,7 +102,7 @@ pub fn fingerprint_doc(doc: ProtectedDoc, agent_dir: &Path) -> Option<String> {
 pub fn read_doc_hash(doc: ProtectedDoc, agent_dir: &Path) -> Option<String> {
     match doc {
         ProtectedDoc::Soul => super::read_stored_hash(agent_dir),
-        ProtectedDoc::Instructions => {
+        ProtectedDoc::Instructions | ProtectedDoc::Identity | ProtectedDoc::User => {
             std::fs::read_to_string(super::hash_path_with(agent_dir, doc.hash_ext()))
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -114,7 +122,7 @@ fn established(doc: ProtectedDoc, agent_dir: &Path) -> bool {
 fn store_doc_hash(doc: ProtectedDoc, agent_dir: &Path, hash: &str) -> std::io::Result<()> {
     match doc {
         ProtectedDoc::Soul => super::store_hash(agent_dir, hash),
-        ProtectedDoc::Instructions => {
+        ProtectedDoc::Instructions | ProtectedDoc::Identity | ProtectedDoc::User => {
             std::fs::write(super::hash_path_with(agent_dir, doc.hash_ext()), hash)
         }
     }
@@ -278,6 +286,23 @@ mod tests {
         let dir = root.join("home").join("agents").join(name);
         fs::create_dir_all(&dir).unwrap();
         (TmpDir(root), dir)
+    }
+
+    #[test]
+    fn user_and_identity_have_independent_baselines() {
+        let (_t, dir) = agent("profile");
+        for doc in [ProtectedDoc::Identity, ProtectedDoc::User] {
+            fs::write(dir.join(doc.file_name()), "v1").unwrap();
+            assert!(check_doc_integrity(doc, "profile", &dir).intact);
+            fs::write(dir.join(doc.file_name()), "unreviewed edit").unwrap();
+            assert_eq!(doc_drift(doc, &dir), DocDrift::Drifted);
+            assert!(!check_doc_integrity(doc, "profile", &dir).intact);
+            accept_doc_change(doc, "profile", &dir).unwrap();
+            assert_eq!(doc_drift(doc, &dir), DocDrift::Intact);
+        }
+        fs::write(dir.join("USER.md"), "user changed again").unwrap();
+        assert_eq!(doc_drift(ProtectedDoc::User, &dir), DocDrift::Drifted);
+        assert_eq!(doc_drift(ProtectedDoc::Identity, &dir), DocDrift::Intact);
     }
 
     #[test]

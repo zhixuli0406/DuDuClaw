@@ -427,6 +427,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         }
 
         let delegation = DelegationEnv {
+            credential_source: format!("message_queue:{}", msg.id),
             depth: msg.delegation_depth as u8,
             origin: msg.origin_agent.clone().unwrap_or_default(),
             sender: msg.sender_agent.clone().unwrap_or_else(|| msg.sender.clone()),
@@ -532,9 +533,13 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                 missing,
             );
         }
-        let dispatch_fut =
+        // Keep the runtime off the stack before moving it through the scopes
+        // below. In debug builds those moves inflate this poll frame enough
+        // to overflow a 2 MiB worker during the nested spawn budget check.
+        let dispatch_fut = Box::pin(
             dispatch_to_agent_outcome(home_dir, registry, &msg.target, &msg.payload, &delegation,
-                msg.id.starts_with("goal:").then_some(msg.id.as_str()));
+                msg.id.starts_with("goal:").then_some(msg.id.as_str())),
+        );
         // v1.10: scope wiki RL trust feedback context so the sub-agent's
         // wiki RAG citations land in the same tracker bucket as the
         // originating turn. Pulled from `message_queue.{turn_id, session_id}`
@@ -787,6 +792,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
 /// Why a dispatch failed, as the two delegation reply paths need it.
 #[derive(Debug)]
 enum DispatchError {
+    Budget(String),
     /// Admission was deferred; no runtime started and no failure is charged.
     AutonomyPaused(String),
     /// The task sandbox refused or failed the task. Its `message` is built
@@ -799,18 +805,30 @@ enum DispatchError {
 }
 
 impl DispatchError {
+    fn from_string(error: String) -> Self {
+        Self::from_runtime(error)
+    }
+
     fn from_runtime(error: String) -> Self {
         if !crate::autonomous_runtime::was_handed_off()
             && (crate::autonomous_runtime::was_denied() || error.starts_with("AUTONOMY_PAUSED:")) {
             Self::AutonomyPaused(error)
+        } else if let Some(message) = crate::budget::budget_refusal_message(&error) {
+            Self::Budget(message.to_owned())
         } else {
             Self::Other(error)
         }
     }
 
     fn from_sandbox(error: crate::task_sandbox::SandboxFailure) -> Self {
-        if !crate::autonomous_runtime::was_handed_off() && crate::autonomous_runtime::was_denied() {
+        if !crate::autonomous_runtime::was_handed_off()
+            && (crate::autonomous_runtime::was_denied() || error.message.starts_with("AUTONOMY_PAUSED:")) {
             Self::AutonomyPaused("AUTONOMY_PAUSED: sandbox handoff refused".into())
+        } else if error.code == "budget_refused" {
+            Self::Budget(crate::budget::budget_refusal_message(&error.message)
+                .unwrap_or(&error.message).to_owned())
+        } else if let Some(message) = crate::budget::budget_refusal_message(&error.message) {
+            Self::Budget(message.to_owned())
         } else {
             Self::Sandbox(error)
         }
@@ -819,6 +837,8 @@ impl DispatchError {
     /// Full text for host-local records (logs, the queue row).
     fn host_text(&self) -> String {
         match self {
+            Self::Budget(message) => format!("{}{message}", crate::budget::BUDGET_REFUSAL_PREFIX),
+            Self::Sandbox(failure) if failure.code == "budget_refused" => format!("{}{}", crate::budget::BUDGET_REFUSAL_PREFIX, failure.message),
             Self::Sandbox(failure) => failure.host_text(),
             Self::AutonomyPaused(e) | Self::Other(e) => e.clone(),
         }
@@ -832,6 +852,7 @@ impl DispatchError {
 /// classified, non-leaking fallback: the raw text never leaves the host.
 fn dispatch_failure_reply(error: &DispatchError) -> String {
     match error {
+        DispatchError::Budget(message) => message.clone(),
         DispatchError::AutonomyPaused(_) => "自主工作已暫停，恢復後再執行。".into(),
         DispatchError::Sandbox(failure) if failure.unavailable => {
             format!("⚠️ 子任務未執行（任務沙箱）：{}", failure.message)
@@ -1211,6 +1232,7 @@ async fn poll_and_dispatch(
         handles.push(tokio::spawn(async move {
             let dispatch_start = Utc::now().to_rfc3339();
             let delegation_env = DelegationEnv {
+                credential_source: format!("bus:{}", msg.message_id),
                 depth: msg.delegation_depth,
                 origin: msg.origin_agent.clone().unwrap_or_default(),
                 sender: msg.sender_agent.clone().unwrap_or_default(),
@@ -1229,7 +1251,10 @@ async fn poll_and_dispatch(
             // "Stop blocks late spawns" analog). See the invalidation call
             // after this dispatch resolves.
             let turn_id_for_admission_invalidate = turn_id_for_scope.clone();
-            let dispatch_fut = dispatch_to_agent_outcome(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env, None);
+            // The legacy queue needs the same boundary as the SQLite queue.
+            let dispatch_fut = Box::pin(dispatch_to_agent_outcome(
+                &home, &reg, &msg.agent_id, &msg.payload, &delegation_env, None,
+            ));
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
@@ -1509,6 +1534,7 @@ async fn poll_and_dispatch(
 /// The MCP server reads these to track depth without relying on spoofable tool params.
 #[derive(Debug, Clone)]
 struct DelegationEnv {
+    credential_source: String,
     depth: u8,
     origin: String,
     sender: String,
@@ -1604,6 +1630,18 @@ async fn dispatch_to_agent_outcome(
     }
     crate::autonomous_runtime::round_scope(home_dir, round_message_id,
     crate::autonomous_runtime::scope(home_dir, agent_id, &callers, async {
+        {
+            let reg = registry.read().await;
+            if let Some(agent) = reg.get(agent_id) {
+                crate::machine_employee::check_loaded(
+                    home_dir, agent, crate::on_behalf_of::current().as_deref(),
+                ).map_err(DispatchError::Other)?;
+            }
+        }
+        let credential_prompt = crate::credential_ledger::process_message(
+            home_dir, prompt, &delegation.credential_source, &delegation.sender, agent_id, "dispatch",
+        ).await;
+        let prompt = credential_prompt.as_str();
         #[cfg(test)]
         {
             if crate::model_call_probe::dry_run() {
@@ -1629,10 +1667,11 @@ async fn dispatch_to_agent_outcome(
             return crate::claude_runner::DELEGATION_ENV
                 .scope(
                     env_map,
-                    crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt),
+                    crate::credential_ledger::DISPATCH_SCANNED.scope(true,
+                        crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt)),
                 )
                 .await
-                .map_err(DispatchError::from_runtime);
+                .map_err(DispatchError::from_string);
         }
         // Read isolation flags from agent config.
         let use_sandbox = {
@@ -1653,7 +1692,7 @@ async fn dispatch_to_agent_outcome(
         let env_map = delegation.to_env_map();
 
         crate::claude_runner::DELEGATION_ENV
-            .scope(env_map, async {
+            .scope(env_map, crate::credential_ledger::DISPATCH_SCANNED.scope(true, async {
                 if use_sandbox {
                     info!(agent = agent_id, "Dispatching via task sandbox");
                     // The sandbox start transport owns the admission lease.
@@ -1674,7 +1713,7 @@ async fn dispatch_to_agent_outcome(
                 )
                 .await
                 .map_err(DispatchError::from_runtime)
-            })
+            }))
             .await
     })).await
 }
@@ -1918,6 +1957,7 @@ pub async fn dispatch_taskspec(
 
         // Dispatch to agent
         let delegation = DelegationEnv {
+            credential_source: format!("task:{}:step:{step_index}", spec.task_id),
             depth: 0,
             origin: spec.agent_id.clone(),
             sender: spec.agent_id.clone(),
@@ -2003,6 +2043,13 @@ async fn handle_step_failure(
 ) -> Result<(), String> {
     use crate::task_spec::*;
 
+    if crate::budget::budget_refusal_message(error).is_some() {
+        spec.steps[step_index].status = StepStatus::Failed;
+        spec.status = TaskStatus::Failed;
+        spec.save(agent_dir).ok();
+        return Err(error.to_owned());
+    }
+
     let action = spec.mark_failed(step_index, error);
     spec.save(agent_dir).ok();
 
@@ -2046,6 +2093,7 @@ async fn handle_step_failure(
             );
 
             let delegation = DelegationEnv {
+                credential_source: format!("task:{}:replan:{failed_step}", spec.task_id),
                 depth: 0,
                 origin: spec.agent_id.clone(),
                 sender: spec.agent_id.clone(),
@@ -6110,3 +6158,22 @@ bot_token = "{token}"
         }
     }
 }
+
+#[cfg(test)]
+mod budget_refusal_tests {
+    #[test]
+    fn budget_402_refusal_bypasses_cli_failure_classification() {
+        let text = crate::budget::BudgetRefusal(crate::budget::BudgetVerdict::Deny {
+            scope: "daily", spent_cents: 40200, cap_cents: 40200,
+        }).legacy_message();
+        let error = super::DispatchError::from_string(text);
+        assert!(matches!(error, super::DispatchError::Budget(_)));
+        let reply = super::dispatch_failure_reply(&error);
+        assert!(reply.contains("402.00") && reply.contains("花費達上限"));
+        assert!(!reply.contains("請稍後再試"));
+    }
+}
+
+#[cfg(test)]
+#[path = "dispatcher_stack_tests.rs"]
+mod dispatch_stack_tests;

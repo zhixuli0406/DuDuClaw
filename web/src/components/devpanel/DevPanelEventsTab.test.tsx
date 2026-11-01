@@ -5,6 +5,7 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { DevPanelEventsTab } from './DevPanelEventsTab';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
 
 function LocationProbe() {
   const location = useLocation();
@@ -29,6 +30,7 @@ const ONE_EVENT = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useAgentsStore.setState({ agents: [] });
   useConnectionStore.setState({ state: 'authenticated' as never, error: null } as never);
   mockWsClient.call.mockResolvedValue({
     events: [],
@@ -68,14 +70,16 @@ describe('DevPanelEventsTab', () => {
   });
 
   it('clicking the agent id navigates to the agent detail page', async () => {
-    mockWsClient.call.mockResolvedValue(ONE_EVENT);
+    useAgentsStore.setState({ agents: [{ name: 'nova', display_name: 'Nova Worker' }] as never });
+    mockWsClient.call.mockResolvedValue({ ...ONE_EVENT, events: [{ ...ONE_EVENT.events[0], summary: '{"origin":"Codex"}' }] });
     renderWithProviders(
       <>
         <DevPanelEventsTab />
         <LocationProbe />
       </>,
     );
-    fireEvent.click(await screen.findByText('nova'));
+    expect(await screen.findByText("Nova Worker's work did not finish")).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Nova Worker'));
 
     await waitFor(() =>
       expect(screen.getByTestId('location-probe')).toHaveTextContent('/agents/nova'),

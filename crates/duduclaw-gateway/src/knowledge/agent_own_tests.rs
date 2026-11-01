@@ -80,7 +80,7 @@ fn default_readers_follow_bindings_and_skip_inactive_accounts() {
     db.bind_agent(&v, "a1", AccessLevel::Viewer).unwrap();
     db.bind_agent(&gone, "a1", AccessLevel::Owner).unwrap();
     db.set_user_status(&gone, UserStatus::Suspended).unwrap();
-    let got = default_readers(Some(&db), "a1", false);
+    let got = default_readers(dir.path(), Some(&db), "a1", false);
     let mut want = vec![
         (PrincipalKind::User, o.clone(), Role::Owner),
         (PrincipalKind::User, op.clone(), Role::Viewer),
@@ -89,9 +89,29 @@ fn default_readers_follow_bindings_and_skip_inactive_accounts() {
     want.sort_by(|a, b| a.1.cmp(&b.1));
     assert_eq!(got, want);
     assert!(
-        default_readers(Some(&db), "a1", true).is_empty(),
+        default_readers(dir.path(), Some(&db), "a1", true).is_empty(),
         "Personal: no people"
     );
-    assert!(default_readers(None, "a1", false).is_empty());
-    assert!(default_readers(Some(&db), "a2", false).is_empty());
+    assert!(default_readers(dir.path(), None, "a1", false).is_empty());
+    assert!(default_readers(dir.path(), Some(&db), "a2", false).is_empty());
+}
+
+#[test]
+fn restricted_default_readers_include_only_active_admins_without_changing_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = dir.path();
+    std::fs::create_dir_all(h.join("agents/sales")).unwrap();
+    let db = Arc::new(UserDb::new(&h.join("users.db")).unwrap());
+    let admin = db.create_user("admin@test.invalid", "Admin", "fixture-password", duduclaw_auth::UserRole::Admin).unwrap();
+    let employee = db.create_user("owner@test.invalid", "Owner", "fixture-password", duduclaw_auth::UserRole::Employee).unwrap();
+    db.bind_agent(&admin.id, "sales", AccessLevel::Owner).unwrap();
+    db.bind_agent(&employee.id, "sales", AccessLevel::Owner).unwrap();
+    let old = default_readers(h, Some(&db), "sales", false);
+    assert_eq!(old.len(), 2);
+    duduclaw_core::preset::install_system_operator_preset(h, false).unwrap();
+    duduclaw_core::preset::bind(h, "sales", &h.join("agents/sales"), "system-operator", "test", "test").unwrap();
+    assert_eq!(default_readers(h, Some(&db), "sales", false), vec![(PrincipalKind::User, admin.id, Role::Owner)]);
+    assert_eq!(db.get_agent_users("sales").unwrap().len(), 2);
+    duduclaw_core::preset::unbind(h, "sales", "test", "test").unwrap();
+    assert_eq!(default_readers(h, Some(&db), "sales", false), old);
 }

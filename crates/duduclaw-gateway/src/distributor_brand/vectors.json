@@ -1,0 +1,71 @@
+{
+  "comment": "Shared brand contract vectors. Signing seed is 32 bytes of 0x07; never use this fixture key in production. Canonical JSON uses UTF-8, ordered fields and null for absent logo_dark.",
+  "signed_vectors": [
+    {
+      "document": {
+        "kind": "duduclaw.distributor_brand.v1",
+        "subscription_id": "sub_1",
+        "distributor_id": "dist_1",
+        "version": 1,
+        "product_name": "範例 Brand",
+        "logo_light": "data:image/png;base64,iVBORw0KGgo=",
+        "logo_dark": null,
+        "issued_at": "2026-10-31T00:00:00Z",
+        "nonce": "n1",
+        "public_key_id": "v1",
+        "signature": "hLcRU24GAEvYFESJzpCBfWQCAU/atzOSAnNlt7SZK+0c0RzBn2XhixKs2vcqfQV5dBqm69CKY1A9yWaWVUCZAQ=="
+      },
+      "canonical": "{\"kind\":\"duduclaw.distributor_brand.v1\",\"subscription_id\":\"sub_1\",\"distributor_id\":\"dist_1\",\"version\":1,\"product_name\":\"範例 Brand\",\"logo_light\":\"data:image/png;base64,iVBORw0KGgo=\",\"logo_dark\":null,\"issued_at\":\"2026-10-31T00:00:00Z\",\"nonce\":\"n1\",\"public_key_id\":\"v1\"}"
+    },
+    {
+      "document": {
+        "kind": "duduclaw.distributor_brand.v1",
+        "subscription_id": "sub_1",
+        "distributor_id": "dist_1",
+        "version": 1,
+        "product_name": "範例 Brand",
+        "logo_light": "data:image/png;base64,iVBORw0KGgo=",
+        "logo_dark": "data:image/webp;base64,UklGRhoAAABXRUJQVlA4IA==",
+        "issued_at": "2026-10-31T00:00:00Z",
+        "nonce": "n1",
+        "public_key_id": "v1",
+        "signature": "IwndEJipk8TOpW5WUhQqpj0OZ/GPZWY2bO+xJdt3jFu2iMHKI2pRDmUBxCVc2N4imPeHE2f4oLLen8Mq9GAkBA=="
+      },
+      "canonical": "{\"kind\":\"duduclaw.distributor_brand.v1\",\"subscription_id\":\"sub_1\",\"distributor_id\":\"dist_1\",\"version\":1,\"product_name\":\"範例 Brand\",\"logo_light\":\"data:image/png;base64,iVBORw0KGgo=\",\"logo_dark\":\"data:image/webp;base64,UklGRhoAAABXRUJQVlA4IA==\",\"issued_at\":\"2026-10-31T00:00:00Z\",\"nonce\":\"n1\",\"public_key_id\":\"v1\"}"
+    }
+  ],
+  "name_vectors": [
+    {
+      "input": "DuDuClaw",
+      "valid": true
+    },
+    {
+      "input": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+      "valid": true
+    },
+    {
+      "input": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+      "valid": false
+    },
+    {
+      "input": "",
+      "valid": false
+    },
+    {
+      "input": "<b>",
+      "valid": false
+    },
+    {
+      "input": "https://example.com",
+      "valid": false
+    },
+    {
+      "input": "a\nb",
+      "valid": false
+    },
+    {
+      "input": "www.example.com",
+      "valid": false
+    }
+  ]
+}

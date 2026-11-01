@@ -267,9 +267,9 @@ fn render_rule_trials(stats: &DigestStats) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("、"))
 }
 
-/// Millicents → a human amount. 100_000 millicents = US$1.00.
+/// Stored telemetry cents → a human amount; the field is historically misnamed.
 fn format_millicents(mc: u64) -> String {
-    let dollars = mc as f64 / 100_000.0;
+    let dollars = mc as f64 / 100.0;
     if dollars < 0.01 {
         "< US$0.01".to_string()
     } else {
@@ -771,14 +771,14 @@ mod tests {
 
     #[test]
     fn cost_is_formatted_as_money_not_millicents() {
-        assert_eq!(format_millicents(100_000), "US$1.00");
-        assert_eq!(format_millicents(250_000), "US$2.50");
-        assert_eq!(format_millicents(500), "< US$0.01");
+        assert_eq!(format_millicents(100), "US$1.00");
+        assert_eq!(format_millicents(250), "US$2.50");
+        assert_eq!(format_millicents(500), "US$5.00");
         let stats = DigestStats {
             cost_millicents: 123_456,
             ..Default::default()
         };
-        assert!(render(&stats, None).unwrap().contains("US$1.23"));
+        assert!(render(&stats, None).unwrap().contains("US$1234.56"));
     }
 
     // ── learning-event classification ────────────────────────────

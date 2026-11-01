@@ -464,9 +464,15 @@ pub async fn decrypt_config_field_async(
     home_dir: &Path,
 ) -> Option<Secret> {
     let sm_cfg = secret_manager_config_from_table(table);
-    let raw = config_secret_ref(table, section, field_base)
-        .resolve(&sm_cfg, home_dir)
-        .await?;
+    let reference = config_secret_ref(table, section, field_base);
+    let raw = match reference.resolve_local(home_dir) {
+        duduclaw_security::secret_ref::LocalOutcome::Resolved(secret) => secret,
+        duduclaw_security::secret_ref::LocalOutcome::Unset => return None,
+        duduclaw_security::secret_ref::LocalOutcome::NeedsBackend(_) => {
+            crate::egress_client::builtin_dispatch_started();
+            reference.resolve(&sm_cfg, home_dir).await?
+        }
+    };
     Some(apply_field_repairs(field_base, raw))
 }
 
@@ -521,9 +527,15 @@ pub async fn read_agent_channel_token(
     channel: &str,
     sm_cfg: &SecretManagerConfig,
 ) -> Option<Secret> {
-    agent_channel_token_ref(home_dir, agent_id, channel)?
-        .resolve(sm_cfg, home_dir)
-        .await
+    let reference = agent_channel_token_ref(home_dir, agent_id, channel)?;
+    match reference.resolve_local(home_dir) {
+        duduclaw_security::secret_ref::LocalOutcome::Resolved(secret) => Some(secret),
+        duduclaw_security::secret_ref::LocalOutcome::Unset => None,
+        duduclaw_security::secret_ref::LocalOutcome::NeedsBackend(_) => {
+            crate::egress_client::builtin_dispatch_started();
+            reference.resolve(sm_cfg, home_dir).await
+        }
+    }
 }
 
 /// The [`SecretRef`] for one agent's `[channels.<channel>] bot_token(_enc)`.

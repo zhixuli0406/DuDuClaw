@@ -180,7 +180,7 @@ pub fn creator_right(home: &Path, user_id: &str, agent: &str) -> Result<CreatorR
     if access.role == duduclaw_auth::UserRole::Admin {
         return Ok(CreatorRight::Allowed { is_admin: true });
     }
-    Ok(if access.may_assign(agent) {
+    Ok(if !crate::machine_employee::requires_admin_for_id(home, agent) && access.may_assign(agent) {
         CreatorRight::Allowed { is_admin: false }
     } else {
         CreatorRight::Lost

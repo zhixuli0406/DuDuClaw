@@ -23,12 +23,14 @@ pub(crate) async fn spawn_agent_with_ctx(
         .unwrap_or("");
 
     if agent_id.is_empty() || task.is_empty() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: agent_id and task are required"}],
             "isError": true
         });
     }
     if !is_valid_agent_id(agent_id) {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: agent_id must be lowercase alphanumeric with hyphens"}],
             "isError": true
@@ -38,6 +40,7 @@ pub(crate) async fn spawn_agent_with_ctx(
     // Verify agent exists
     let agent_dir = home_dir.join("agents").join(agent_id);
     if !agent_dir.join("agent.toml").exists() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
             "isError": true
@@ -52,6 +55,7 @@ pub(crate) async fn spawn_agent_with_ctx(
         && !status.is_operational()
     {
         let status_str = format!("{status:?}").to_lowercase();
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Error: agent '{agent_id}' is not operational (status: {status_str}); \
@@ -63,6 +67,7 @@ pub(crate) async fn spawn_agent_with_ctx(
 
     // ── WP21 C2: department × hierarchy delegation gate ────────
     if let Err(reason) = check_delegation_allowed(home_dir, caller, agent_id, "spawn_agent").await {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: {reason}")}],
             "isError": true
@@ -74,6 +79,7 @@ pub(crate) async fn spawn_agent_with_ctx(
     let outgoing_depth = incoming_depth.saturating_add(1);
 
     if outgoing_depth >= duduclaw_core::MAX_DELEGATION_DEPTH {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Error: delegation depth limit ({}) would be exceeded. \

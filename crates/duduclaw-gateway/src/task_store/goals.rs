@@ -30,8 +30,8 @@ impl TaskStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 row.id,
-                row.title,
-                row.description,
+                mask_derived_text(&row.title),
+                mask_derived_text(&row.description),
                 row.parent_goal_id,
                 row.status,
                 row.created_at,
@@ -107,7 +107,9 @@ impl TaskStore {
             let mut binds: Vec<String> = Vec::new();
             for key in ["title", "description", "status", "parent_goal_id"] {
                 if let Some(v) = fields.get(key).and_then(|v| v.as_str()) {
-                    binds.push(v.to_string());
+                    binds.push(if matches!(key, "title" | "description") {
+                        mask_derived_text(v)
+                    } else { v.to_string() });
                     sets.push(format!("{key} = ?{}", binds.len()));
                 }
             }

@@ -51,7 +51,8 @@ pub(crate) async fn handle_tools_call(
     // `wiki_write` with `scope="shared"` (authorship-extras record).
     let is_state_changing = matches!(
         tool_name,
-        "create_agent"
+        "credential_declare"
+            | "create_agent"
             | "agent_remove"
             | "agent_update"
             | "agent_update_soul"
@@ -485,6 +486,7 @@ pub(crate) async fn handle_tools_call(
         "tasks_complete" => handle_tasks_complete(&arguments, home_dir, record_actor).await,
         "tasks_block" => handle_tasks_block(&arguments, home_dir, record_actor).await,
         // P2-A continuous responsibilities (employee side)
+        "credential_declare" => credential_declare::handle_credential_declare(&arguments, home_dir, record_actor).await,
         "responsibility_get" => handle_responsibility_get(&arguments, home_dir, record_actor).await,
         "responsibility_followup" => {
             handle_responsibility_followup(&arguments, home_dir, record_actor).await
@@ -711,11 +713,11 @@ pub(crate) async fn handle_tools_call(
                 }
             }
         }
-        // Google Workspace native tools (Gmail + Calendar). Scope gates
+        // Native tools cover eight Google Workspace services. Scope gates
         // (google:read / google:write) are enforced upstream in mcp_dispatch;
-        // these handlers consume the OAuth vault token directly.
+        // the identity route selects the authorized credential source.
         // Whole group sits behind the integration gate (hidden from tools/list
-        // too) until Dudu Technology Ltd.'s OAuth app clears Google verification.
+        // too); saving the user's chosen credentials enables it.
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name)
             && !duduclaw_gateway::google_workspace::integration_enabled(home_dir) =>
         {
@@ -802,7 +804,7 @@ pub(crate) async fn handle_tools_call(
     };
 
     let result = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
-        google_caller.finish(home_dir, default_agent, tool_name, result)
+        google_caller.finish(home_dir, default_agent, tool_name, result).await
     } else {
         result
     };
@@ -849,6 +851,7 @@ pub(crate) async fn handle_tools_call(
         // P2-C: workspace answers carry file paths and file content; the
         // audit row keeps only the argument summary (no result text).
         let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name)
+            || tool_name == "credential_declare"
             || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
         {
             None

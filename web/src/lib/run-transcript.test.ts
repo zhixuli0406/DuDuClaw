@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   cardsForEvents,
+  displayRunText,
   isRunLive,
   parseThinkingPreview,
   relativeParts,
@@ -144,4 +145,19 @@ describe('runDurationSecs', () => {
       runDurationSecs({ started_at: '2026-07-11T09:00:00Z', ended_at: '2026-07-11T08:00:00Z' }),
     ).toBeNull();
   });
+});
+
+
+it('removes sender routing metadata from run previews and transcript prose', () => {
+  const preview = '[sender_id: webchat:private-session]\nPlease help';
+  expect(displayRunText(preview)).toBe('Please help');
+  expect(cardsForEvents([{ kind: 'text', role: 'user', ts: 'now', preview }])).toEqual([
+    { type: 'prose', role: 'user', ts: 'now', text: 'Please help' },
+  ]);
+  expect(displayRunText('Keep [normal text]')).toBe('Keep [normal text]');
+});
+
+it('shows failed runs as ended failures rather than active or unanswered', () => {
+  expect(isRunLive({ status: 'failed' })).toBe(false);
+  expect(runStatusMeta('failed').labelId).toBe('runs.status.failed');
 });

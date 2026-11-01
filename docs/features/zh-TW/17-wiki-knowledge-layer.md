@@ -249,6 +249,8 @@ mode         = "operator_only"
 
 ### 部門級讀取可見範圍（`visible_to_departments`）
 
+儀表板帳號的 `shared_wiki.pages`、`.read`、`.search`、`.stats` 與共享 Wiki 匯出也使用相同的部門規則。部門來自 `users.db` 中人類帳號的 `users.department`，不採用 AI 員工的部門或 token 內的資料。非管理員若沒有部門，只能讀公司頁面；管理員可讀全部。儀表板讀取遇到無法讀取或損壞的可見範圍設定時會拒絕；沒有 `.scope.toml` 時仍可讀公司頁面。分享頁面仍需要來源員工的 Owner 綁定或管理員權限。
+
 上面的 `mode` 管的是「誰能寫入」一個命名空間。要管「誰能在**部門**層級讀取」，在同一個 `[namespaces."x"]` 表格底下加一個 `visible_to_departments` 陣列。只有 `[agent] department` 落在清單上的 Agent 才看得到那個命名空間，不論是**prompt 注入**（自動注入的 L0/L1 頁面），還是透過 **`wiki_search` / `wiki_read` / `wiki_ls`（`scope="shared"`）**。
 
 ```toml

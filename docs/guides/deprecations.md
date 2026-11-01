@@ -1,5 +1,14 @@
 # Deprecations and removals
 
+## Legacy employee memory file
+
+`MEMORY.md` is a legacy employee file. The interactive agent runner and the
+`claude_runner` path still inject it; channel, minimal and task-sandbox prompts
+do not. It is never part of an Agent File export. Use the native `USER.md` slot for a human-maintained user
+introduction, and the existing memory tools for learned facts. Existing files
+are neither moved nor deleted, and no removal version is scheduled.
+
+
 This page lists renamed or merged public names, which of them have been
 removed, and which are still on their way out.
 

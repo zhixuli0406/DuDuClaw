@@ -8,10 +8,14 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { LogsPage } from './LogsPage';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
+import { useLogsStore } from '@/stores/logs-store';
 
 beforeEach(() => {
   vi.clearAllMocks();
   useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  useAgentsStore.setState({ agents: [], loaded: false });
+  useLogsStore.setState({ entries: [], paused: false, filter: { level: null, agentId: null, keyword: '' } });
   mockWsClient.call.mockResolvedValue({
     events: [],
     source_counts: { security: 0, tool_call: 0, channel_failure: 0, feedback: 0 },
@@ -23,6 +27,36 @@ describe('LogsPage', () => {
     // Default tab is history — no realtime WS subscribe on load.
     renderWithProviders(<LogsPage />);
     expect(screen.getByText('Audit Logs')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['worker', 'Actual Worker'],
+    ['Actual Worker', 'Actual Worker'],
+    ['unknown-worker', 'unknown-worker'],
+  ])('resolves the audit agent %s to a human name when known', async (agentId, label) => {
+    const event = {
+      timestamp: '2026-10-31T00:00:00Z', source: 'channel_failure',
+      event_type: 'channel.AuthFailed', agent_id: agentId, severity: 'warning',
+      summary: '{"origin":"Codex"}', details: { channel_failure: { agent: agentId } },
+    };
+    mockWsClient.call.mockImplementation(async (method: string) => method === 'agents.list'
+      ? { agents: [{ name: 'worker', display_name: 'Actual Worker' }] }
+      : { events: [event] });
+    renderWithProviders(<LogsPage />);
+
+    expect(await screen.findByText(`${label}'s work did not finish`)).toBeInTheDocument();
+    expect(screen.getByText(label)).toBeInTheDocument();
+    expect(event.agent_id).toBe(agentId);
+  });
+
+  it('resolves realtime agent labels without changing their stored ids', async () => {
+    useLogsStore.setState({ entries: [{ timestamp: '2026-10-31T00:00:00Z', level: 'warn', target: 'channel_reply', agent_id: 'worker', message: 'Reply failed' }] });
+    mockWsClient.call.mockImplementation(async (method: string) => method === 'agents.list'
+      ? { agents: [{ name: 'worker', display_name: 'Actual Worker' }] }
+      : {});
+    renderAt('/manage/logs?tab=realtime');
+    expect(await screen.findByText('Actual Worker')).toBeInTheDocument();
+    expect(useLogsStore.getState().entries[0].agent_id).toBe('worker');
   });
 });
 

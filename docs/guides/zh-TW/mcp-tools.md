@@ -11,7 +11,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 `tools/list` 只列出呼叫端**當下真的叫得動**的工具。下面每一道過濾，都對應派工層本來就會擋的同一道閘，所以「AI 員工讀到的清單」與「伺服器會接受的呼叫」永遠是同一組。
 
-這既是正確性問題，也是成本問題。工具 schema 是**每次開機都要付的固定 prompt 成本**：CLI 每個 session 讀一次 `tools/list`，整包在第一個使用者 token 之前就進了模型的上下文。一個註定被拒的工具 schema 等於付兩次錢——token 付一次，模型繞著一個用不了的工具規劃再付一次。
+這既是正確性問題，也是成本問題。工具 schema 是**每次開機都要付的固定 prompt 成本**：CLI 每個 session 讀一次 `tools/list`，整包在第一個使用者 token 之前就進了模型的上下文。一個註定被拒的工具 schema 等於付兩次錢，token 付一次，模型繞著一個用不了的工具規劃再付一次。
 
 隱藏工具**不是**授權決定。呼叫未列出的工具仍然會打到真正的閘，仍然會被拒絕，而且回的是閘自己的訊息。
 
@@ -21,7 +21,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 |---|---|---|
 | 外部用戶端白名單 | `principal.is_external` | 只列 7 個舊白名單工具加上明確授予 scope 的工具，接著再套下一列的 scope 規則 |
 | 非員工呼叫者的 scope | `principal.scopes`，適用於不持有 `admin`、也不是 AI 員工的金鑰（不是 gateway 內部金鑰、不是單一員工金鑰、也不是 gateway 為員工啟動的行程） | 只列金鑰持有其最低 scope 的工具；替行程本身的 agent 動作的工具（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` 與三個整併狀態查詢等）不列，對所有外部金鑰也不列；呼叫時 dispatch 閘依同一條規則拒絕（`process_agent_tool`）。見 [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | 隱藏 19 個 Google 工具 |
+| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 19 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
 | Google 身分（v1.76.0） | `agent.toml [google] identity`，沒寫時看 `config.toml [integrations.google_identity] default_identity` | `none` 隱藏同樣 19 個工具，呼叫也被拒。其他值都照常列出；用不了的呼叫會回原因。`google_status` 改為先講員工目前代表誰 |
 | GitHub | `config.toml [integrations] github` | 隱藏 5 個 `github_*` |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 被拒的隱藏；允許清單非空時其餘全隱藏。清單項目完全相同才算，或用結尾的 `*` 比對：`*`、`mcp__duduclaw__*`（全部 DuDuClaw 工具）、`mcp__duduclaw__odoo_*`／`memory_*`（從開頭比對的前綴）。`mcp__<其他伺服器>__…` 不會對到 DuDuClaw 工具；其他位置的 `*` 只是一般字元。三份審批清單與 `scoped_tools` 用同一套規則 |
@@ -36,11 +36,13 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `[responsibilities] enabled` | `config.toml` | 隱藏 3 個 `responsibility_*`（見下方[持續任務工具](#responsibility_get--responsibility_followup--responsibility_ask持續任務工具)） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有效授權 | 在階段性授權生效前一律隱藏 |
 
+機器操作主控台（`/console`）只開放給管理員。`system_operator` 員工執行機器操作工具時，伺服器也會確認交辦人仍是啟用中的管理員；其他 AI 員工的一般對話仍依原有授權使用。
+
 新建的 AI 員工以上全部都沒開，這正是重點：預設部署只為自己用得到的工具付費。
 
 ### 中途變更如何傳到 AI 員工
 
-以前隱藏工具等於永久拿不到，因為 MCP 用戶端只在開場讀一次 `tools/list`。現在伺服器在 `initialize` 回應中宣告 `tools.listChanged`，並在呼叫端的可見集合**真的改變**時送出 `notifications/tools/list_changed`——比較的是集合，所以只是碰了設定檔但內容沒變，不會送出任何通知。
+以前隱藏工具等於永久拿不到，因為 MCP 用戶端只在開場讀一次 `tools/list`。現在伺服器在 `initialize` 回應中宣告 `tools.listChanged`，並在呼叫端的可見集合**真的改變**時送出 `notifications/tools/list_changed`，比較的是集合，所以只是碰了設定檔但內容沒變，不會送出任何通知。
 
 所以這串流程不需要重啟：
 
@@ -53,7 +55,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 ### 注意：AI 員工無法自行發現 `scoped_tools` 的名稱
 
-列在 `scoped_tools` 裡的工具在授權生效前是隱藏的，所以 AI 員工沒辦法從 `tools/list` 讀到名稱再去申請。請用別的方式告訴它——寫進 `SOUL.md`、寫成 playbook 規則，或在目標開工時用 `grant:<tool>` 標籤直接鑄出授權。這是裁剪唯一有代價的地方，而且是刻意的：宣告一個當下就會被拒的工具，正是上面那條規則要消滅的失敗模式。
+列在 `scoped_tools` 裡的工具在授權生效前是隱藏的，所以 AI 員工沒辦法從 `tools/list` 讀到名稱再去申請。請用別的方式告訴它，寫進 `SOUL.md`、寫成 playbook 規則，或在目標開工時用 `grant:<tool>` 標籤直接鑄出授權。這是裁剪唯一有代價的地方，而且是刻意的：宣告一個當下就會被拒的工具，正是上面那條規則要消滅的失敗模式。
 
 ### v1.68.0 起的例外：列出但會拒絕
 
@@ -81,12 +83,12 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 新增或修改工具時的兩個結果：
 
-- **寫「做什麼」與「什麼會被拒」。** 安全關鍵句——「這不會寄出」「這是公開可見的」「超限整筆拒絕、絕不截斷」——留在說明裡。設計理由、範例、內部代號不留。
+- **寫「做什麼」與「什麼會被拒」。** 安全關鍵句，「這不會寄出」「這是公開可見的」「超限整筆拒絕、絕不截斷」，留在說明裡。設計理由、範例、內部代號不留。
 - **長版寫在這一頁。** 從說明連到這頁的段落，或該工具自己的規格頁。
 
 ### 唯一的例外
 
-`team_handoff` 的 `packet` 參數帶著完整的 TaskPacket 形狀（上限 1,024 bytes）。`build_tool_schema` 除了 `PARAM_TYPES` 這份短清單列出的整數、數字、布林與字串陣列之外，參數一律宣告成裸 JSON-Schema 字串，所以 TaskPacket 這種物件只能在參數說明裡寫出真實形狀——而 TaskPacket 是整筆拒絕不截斷的，看不到形狀的 AI 員工就產不出合法的封包。完整規格在 [../../spec/task-packet.md](../../spec/task-packet.md)。
+`team_handoff` 的 `packet` 參數帶著完整的 TaskPacket 形狀（上限 1,024 bytes）。`build_tool_schema` 除了 `PARAM_TYPES` 這份短清單列出的整數、數字、布林與字串陣列之外，參數一律宣告成裸 JSON-Schema 字串，所以 TaskPacket 這種物件只能在參數說明裡寫出真實形狀，而 TaskPacket 是整筆拒絕不截斷的，看不到形狀的 AI 員工就產不出合法的封包。完整規格在 [../../spec/task-packet.md](../../spec/task-packet.md)。
 
 所有例外集中在一份清單（`PARAM_CAP_EXEMPTIONS`），並有測試在例外不再必要時失敗。
 
@@ -122,9 +124,9 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 每個步驟依序嘗試三段，能用高的就用高的：
 
-- **C-L2 — `api_action`。** 在碰 GUI 之前，先呼叫 `target_app` 已登錄的第三方原生 API/CLI/D-Bus 動作。只要你要的 app＋動作有登錄就優先用它。`action` 是該 app 的短登錄識別字（chromium 的 `open_url`、networkmanager 的 `state`…），`params` 是該動作的 payload，派送時對該動作自己的 schema 驗證。登錄查無或執行失敗會落回該步驟的 `action` 欄位——所以即使設了 `api_action`，`action` 仍然必填。
-- **C-L3 — `locate`。** 用 `(role, name)` 在 `target_app` 的 AT-SPI2 無障礙樹查出 `move`/`click` 的座標，取代手猜像素。對版面、解析度、佈景變動的耐受度高得多。對 `text` / `key_name` / `wait` / `take_over` 無效。查無則落回字面 `x`/`y`。
-- **C-L1 — 字面 `x`/`y`。** 前兩段缺席或失敗時的最後手段。
+- **C-L2： `api_action`。** 在碰 GUI 之前，先呼叫 `target_app` 已登錄的第三方原生 API/CLI/D-Bus 動作。只要你要的 app＋動作有登錄就優先用它。`action` 是該 app 的短登錄識別字（chromium 的 `open_url`、networkmanager 的 `state`…），`params` 是該動作的 payload，派送時對該動作自己的 schema 驗證。登錄查無或執行失敗會落回該步驟的 `action` 欄位，所以即使設了 `api_action`，`action` 仍然必填。
+- **C-L3： `locate`。** 用 `(role, name)` 在 `target_app` 的 AT-SPI2 無障礙樹查出 `move`/`click` 的座標，取代手猜像素。對版面、解析度、佈景變動的耐受度高得多。對 `text` / `key_name` / `wait` / `take_over` 無效。查無則落回字面 `x`/`y`。
+- **C-L1： 字面 `x`/`y`。** 前兩段缺席或失敗時的最後手段。
 
 其他腳本層規則：
 
@@ -145,7 +147,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
   - `complete` — 必須有 `evidence`，且 `blocker` 與 `next_steps` 都不得存在。沒有證據的自稱完成、或還留著下一步的完成，一律拒絕：「我做完了」不是證據。
   - `blocked` — 必須有具體的 `blocker`。
 
-  合併後的內容由 `config.toml [memory] working_state_handoff_max_bytes`（預設 16384，CJK 安全位元組計算）限制。超過**整筆拒絕**，絕不靜默截斷——因為截掉的可能正是讓這份交接成為權威的證據。
+  合併後的內容由 `config.toml [memory] working_state_handoff_max_bytes`（預設 16384，CJK 安全位元組計算）限制。超過**整筆拒絕**，絕不靜默截斷，因為截掉的可能正是讓這份交接成為權威的證據。
 
 ### `skill_search` — 怎麼挑 source
 
@@ -249,7 +251,7 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 ## 已棄用的別名仍會列出
 
-已棄用的工具名稱仍會出現在 `tools/list`，說明前面加 `[deprecated → …]` 前綴——因為隱藏它等於讓它叫不動，那和棄用緩衝期的用意正好相反。完整的舊 → 新對照表在 [deprecations.md](../deprecations.md)。目前沒有任何 MCP 工具處於棄用狀態：v1.66.0 那一批別名已在 v1.69.0 移除。
+已棄用的工具名稱仍會出現在 `tools/list`，說明前面加 `[deprecated → …]` 前綴，因為隱藏它等於讓它叫不動，那和棄用緩衝期的用意正好相反。完整的舊 → 新對照表在 [deprecations.md](../deprecations.md)。目前沒有任何 MCP 工具處於棄用狀態：v1.66.0 那一批別名已在 v1.69.0 移除。
 
 ## 相關文件
 
@@ -258,3 +260,7 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 - [remote-mcp.md](../remote-mcp.md) — HTTP/OAuth 傳輸
 - [../../spec/task-packet.md](../../spec/task-packet.md) — TaskPacket 規格
 - [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md) — `duduclaw_ccr_*` 工具，由直連 API 的 tool loop 注入，不經 MCP server 派送
+
+## 宣告憑證用途
+
+`credential_declare` 接受 `credential_id` 與 `service`，拒絕員工備註；服務必須符合 `^[a-z0-9][a-z0-9._-]{0,63}$` 並通過憑證偵測。只有通過身分驗證且持有該憑證的員工，才能經過簽章的 gateway loopback 路由宣告；員工不能覆蓋 Admin 設定的服務。這個工具只註記既有稽核資料，不取出秘密、不授權新持有者，也不把真值代入工具呼叫。Admin 可到「安全 → 憑證稽核」查閱與更正。詳見[憑證稽核](../../features/zh-TW/70-credential-audit.md)。

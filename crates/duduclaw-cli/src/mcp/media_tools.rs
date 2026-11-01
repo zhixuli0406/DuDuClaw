@@ -5,13 +5,13 @@ pub(crate) async fn handle_transcribe_audio(args: &Value) -> Value {
 
     let audio_b64 = match args.get("audio_base64").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return tool_error("Missing required parameter: audio_base64"),
+        None => return super::egress_gate::pre_dispatch_error("Missing required parameter: audio_base64"),
     };
 
     // Limit input size: 34MB base64 ≈ 25MB decoded
     const MAX_B64_LEN: usize = 34 * 1024 * 1024;
     if audio_b64.len() > MAX_B64_LEN {
-        return tool_error(&format!(
+        return super::egress_gate::pre_dispatch_error(&format!(
             "Audio too large: {} bytes (max 25MB)",
             audio_b64.len() * 3 / 4
         ));
@@ -24,7 +24,7 @@ pub(crate) async fn handle_transcribe_audio(args: &Value) -> Value {
 
     let audio_bytes = match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
         Ok(b) => b,
-        Err(e) => return tool_error(&format!("Invalid base64: {e}")),
+        Err(e) => return super::egress_gate::pre_dispatch_error(&format!("Invalid base64: {e}")),
     };
 
     // Transcribe via Whisper API (sends raw audio bytes, format auto-detected)
@@ -46,7 +46,7 @@ pub(crate) async fn handle_synthesize_speech(args: &Value) -> Value {
 
     let text = match args.get("text").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
-        _ => return tool_error("Missing required parameter: text"),
+        _ => return super::egress_gate::pre_dispatch_error("Missing required parameter: text"),
     };
     let voice = args.get("voice").and_then(|v| v.as_str()).unwrap_or("");
 

@@ -262,6 +262,12 @@ fn write_file(home: &Path, file: &StoreFile) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
+    for record in &file.servers {
+        if record.status != ConnStatus::NotConnected {
+            crate::disconnect_forget::connections::mark_connecting(home,
+                &format!("remote_mcp:{}/{}", record.agent_id, record.server))?;
+        }
+    }
     let json = serde_json::to_string_pretty(file).map_err(|e| format!("serialize: {e}"))?;
     duduclaw_agent::mcp_template::write_mcp_config_atomic(&path, json.as_bytes())
 }

@@ -32,7 +32,7 @@ External API-key and HTTP MCP callers also use the global policy. They have no g
 
 For authenticated employees, missing or unknown turn IDs still go through the gateway. In `ask`/`block`, any active sink lease belonging to that employee refuses a private read, including reads using another, forged or missing turn ID. When the lease store is readable and no active lease exists, these reads proceed without a reservation and audit their source. Standalone `duduclaw mcp init` and external API-key callers keep their separate external identity and can still read. Their outgoing calls remain tainted and require approval in `ask` or are refused in `block`. An unreachable gateway or an unverifiable reply refuses employee reads in enforcing modes even without a turn ID; `shadow` allows and audits the failure.
 
-Active sink leases are written to the gateway-owned `<home>/egress_leases.db` before admission (SQLite WAL, synchronous FULL; database and sidecars are 0600 on Unix). Rows contain the lease ID, authenticated employee ID, turn ID, phase and UTC acquisition time. The durable phase is armed as `Dispatched` before granting the lease, because the receiving process may dispatch immediately; the transport retains its local not-dispatched state for safe cancellation. Release deletes the row before removing the in-memory fence. Insert failure refuses the sink in `ask`/`block`; `shadow` allows and audits. Delete failure retains the fence.
+Active sink leases are written to the gateway-owned `<home>/egress_leases.db` before admission (SQLite WAL, synchronous FULL; database and sidecars are 0600 on Unix). Rows contain the lease ID, authenticated employee ID, turn ID, phase and UTC acquisition time. The durable phase is armed as `Dispatched` before granting the lease, because the receiving process may dispatch immediately; the transport retains its local not-dispatched state for safe cancellation. Built-in handlers explicitly attest an immediate pre-dispatch rejection (missing configuration, invalid parameters, unknown targets, or an unconnected local connector); this finishes the lease as `NotDispatched`. This attestation is host-owned and scoped to the call, never inferred from error text or tool response fields. A timeout, cancellation, transport error, or failure after a request starts keeps `Dispatched`. `credential_declare` updates local credential metadata and is not a sink. Release deletes the row before removing the in-memory fence. Insert failure refuses the sink in `ask`/`block`; `shadow` allows and audits. Delete failure retains the fence.
 
 Before exposing loopback routes, the gateway restores every well-formed row as dispatched with an unknown terminal outcome. These restored leases can only expire, even if a surviving old process sends a release. Each restart starts a fresh six-hour monotonic fence for every restored row, regardless of its UTC timestamp or clock jumps. Rows are deleted only after a confirmed terminal release for a live lease or monotonic expiry during continuous uptime. Repeated restarts can extend the fence; the per-employee and global caps still apply. HTTP admission and periodic store maintenance run in the blocking pool under the same ledger mutex, sharing a limit of 64 queued/running jobs. Non-loopback peers are rejected before scheduling blocking work; saturated admission returns HTTP 503 immediately, which enforcing callers refuse. If opening, reading or migrating the store fails, all employees' private reads (tracked and untracked) and new sinks are refused in `ask`/`block`; `shadow` allows and audits. Opening is retried every five seconds, with errors logged at most once per minute. There is no fixed 300-second restart window. Turn taint itself remains in memory and is lost on restart; unknown turns remain tainted.
 
@@ -40,19 +40,34 @@ The store holds an exclusive `<home>/egress_leases.lock` file lock for its lifet
 
 Registration history uses a separate bounded Bloom filter per employee and is never cleared during that gateway process, so re-registering an evicted or expired turn cannot make it clean. Hash collisions or a saturated filter can conservatively taint a new turn for that employee. History holds at most 1,024 employees (32 KiB each, 32 MiB total); turns for additional employees are always treated as tainted. History is not persisted across restart.
 
+## Observation report
+
+The Admin-only Security report compares the last 7 or 30 UTC days. The approval estimate counts distinct calls that would ask; pre-check and dispatch confirmation share a call ID. Refusal observations appear in the breakdowns but are not approval tickets. Breakdowns show employee, tool, closed private-source class, date and CLI built-in versus MCP entry point. An empty result means no recorded observations, not proof of safe sending. Collection failures do not change gate decisions and can leave the report incomplete.
+
+Counts are estimates based on each employee's own activity. Repeated calls can inflate them, and an employee with Bash can alter the shadow database file. Storage is capped at 10,000 detail rows per employee per day and 1,000,000 detail rows overall; overflow is counted per employee and day, so capped totals mean at least the displayed amount.
+
+`<home>/egress_shadow.db` uses SQLite WAL and Unix 0600 permissions, retains 35 days, and prunes on writes at most hourly. It stores no content, recipients or free-text source names. Built-in recipient gates also record `recipient_would_ask` using the same call ID as the outgoing-data gate. Each `(call_id, kind)` is counted once; `by_kind` separates the observations and `ticket_total` counts distinct calls across both ask kinds. Existing tool-call audit rotation does not limit this report. `security.egress_shadow_report` accepts only `days: 7` or `days: 30` and requires Admin access.
+
+The report covers MCP outgoing gate evaluations, computer actions and gateway hook checks. Read-reservation conflicts, unsupported-runtime spawn warnings and local hook transport failures remain in the tool audit log and are not included in these call counts.
+
 ## Recovery
 
-Check gateway logs for `egress lease store unavailable; private reads fenced` and its `error` field. An over-cap store reports `egress agent lease store over capacity` or `egress lease store over capacity`; malformed rows report `invalid egress lease row`, and a corrupt SQLite file may report a database error. The gateway retries every five seconds and logs at most once per minute. In `ask`/`block`, private reads and new outgoing actions are refused. The gateway refusal reason is “外送防護紀錄無法讀取，暫停私人讀取及對外動作；請稍後重試。”; callers may instead show a general retry message. There is currently no dedicated lease-store health indicator in the dashboard or `doctor`.
+`duduclaw doctor` reports lease count, oldest age and whether the store is readable. Check gateway logs for `egress lease store unavailable; private reads fenced` and its `error` field when the store is unhealthy. In `ask`/`block`, an unreadable store refuses private reads and new outgoing actions.
 
-Do not delete the database while outgoing actions (sinks) may still be running: its rows may be the only surviving fences preventing concurrent private reads. If the store cannot recover, use this offline procedure:
+Before clearing leases, stop every gateway using this home, disable automatic restart, and confirm that employee CLI processes and their MCP/tool children have stopped their outgoing actions. If an old action may still be running, keep its fence and investigate first.
 
-1. Stop every gateway using this home and prevent automatic restart.
-2. Back up all existing `<home>/egress_leases.db*` files together, including WAL/SHM sidecars, to a private location; preserve their permissions.
-3. Confirm that no employee CLI processes or their MCP/tool child processes are still running and that their outgoing actions have stopped. If this cannot be confirmed, keep the gateway stopped and do not reset the store.
-4. Move the database and every matching sidecar aside together; keep the backup. Do not delete `egress_leases.lock`.
-5. Start the gateway. It creates an empty lease store. **All prior sink fences are dropped.** Any surviving old action would therefore lose its protection against concurrent private reads; only restart after step 3 is confirmed. Verify the log error no longer appears and private reads/outgoing admission work as expected.
+```sh
+duduclaw egress-leases list --json
+duduclaw egress-leases clear --all --confirm <token-from-list>
+# To clear one lease, use that lease's token from list:
+duduclaw egress-leases clear --lease <id> --confirm <lease-token>
+```
 
-A supported offline recovery command is planned; this release has no recovery CLI.
+`egress-leases` is an operator tool. Its AI-session check relies on environment markers; a FullAccess shell running as the same OS account can get past that check. On Windows, the lease store's hard-link check is not applied.
+
+Run these commands from the operator's terminal; AI sessions are refused. Both commands require the gateway to be stopped and the lease lock to be available. An unreadable gateway lock is a refusal, not evidence of a stopped gateway. `clear` holds the exclusive lease lock, lists the current leases, creates a timestamped private database backup, checks the token against the sorted selected lease IDs, deletes in one transaction and writes a security audit event. A changed set invalidates the token. Keep the backup and never unlink `egress_leases.lock`.
+
+Clearing a lease removes its protection against concurrent private reads. Restart only after confirming the associated outgoing actions have stopped, then check doctor and gateway behavior. The command does not repair a corrupt or unreadable database; a refusal must be investigated rather than bypassed by deleting database or lock files. Recovery uses local offline confirmation because dashboard approval requires a running gateway.
 
 ## Review before approving
 
@@ -60,15 +75,73 @@ Only a current Admin may decide an outgoing-data approval, including requests wi
 
 Action-rule approvals show the matching tool or effect rule, including for read and draft calls. Purchase and Delete actions cannot receive new standing capability or workflow grants; grants saved before this feature are ignored without changing the stored records. Other gates and explicit approvals still apply.
 
+## CLI built-in tools
+
+Claude and Grok receive a `PreToolUse` hook for `WebFetch`, `WebSearch` and literal Bash network commands. Grok aliases include `Fetch`, `Shell`, `web_fetch`, `web_search` and `run_terminal_command`; their actual matcher and environment behavior still need live acceptance. Ordinary non-network Bash returns locally without contacting the gateway. Detection recognizes `curl wget nc ncat netcat socat ssh scp sftp rsync ftp telnet http httpie aria2c lftp`, and `git push/fetch/clone/pull/ls-remote`. Shell `-c`, `eval` and echo/printf arguments use bounded reparsing (two levels, 64 KiB per payload). Echo/printf command-shaped data can conservatively match even when not executed.
+
+| Mode | Clean turn | Private data read | Ledger unavailable or unknown turn |
+|---|---|---|---|
+| `off` | Allow | Allow | Allow |
+| `shadow` | Allow | Allow, audit `would_ask` | Allow, audit `would_refuse_ledger_unavailable` |
+| `ask` | Allow | File approval, refuse until retry | Refuse |
+| `block` | Allow | Refuse | Refuse |
+
+The hook posts raw tool arguments to `/api/internal/egress-guard/hook-check`. The gateway canonicalizes and hashes them and builds the card; client digests and summaries are rejected. Requests and responses are signed; the port comes from `config.toml`, not an inherited port variable. Hook checks have their own per-employee 120/minute bucket. The live host principal context supplies the requester for self-approval checks; an unavailable context cannot create an ask ticket.
+
+In `ask`, retry the exact same arguments in the same turn after a current Admin approves in the dashboard. The ticket binds employee, turn, tool, complete arguments and covered sources; `WebFetch` includes the full URL and query. Identical pending requests reuse one ticket. New sources invalidate the previous ticket. Consumption is single-use, so a second retry needs another approval. Bash tickets require one direct simple command and one network verb: no expansion, substitution, pipes, redirects, `@file`, wrappers or interpreters. Unsupported shapes are refused with an explanation when approval would be required. This binds text, not DNS results, executable contents, configuration files or symlink targets.
+
+In `ask`/`block`, handled hook errors and panics exit 2, and hook installation failure stops the spawn without account/runtime rotation. `shadow` logs and continues. In enforcing modes Claude loads only the identity owner's `.claude/settings.json` via `--setting-sources "" --settings <file>`, even when cwd differs (ambient project/local/user settings are excluded); `cli_bare_mode` is refused in enforcing modes because it skips hooks. Grok adds `--disable-web-search`; enforcing modes currently refuse borrowed/shared work roots or another employee's guard file in the same hook directory. Use an independent employee directory or Claude/Codex for these runs.
+
+Codex `ask`/`block` spawns add `-c sandbox_workspace_write.network_access=false -c web_search="disabled"`; FullAccess is reduced to WorkspaceWrite, while ReadOnly stays narrower and the MCP approver is retained. This is a spawn restriction, not per-command approval. Generic CLI runtimes remain unsupported and audit `would_refuse_unsupported_runtime` in enforcing modes. OpenAI-compatible tool loops retain their MCP gate.
+
+Cron, dispatch, reminder, mail, heartbeat and ephemeral execution entry points now register a host turn and propagate `DUDUCLAW_TURN_ID` independently of channel requester identity, including the resolved employee behind `default`. Existing taint is never cleared; unknown client turns remain tainted.
+
+**Bash hooks are a speed bump and telemetry, not a containment boundary.** Native `Read` and Bash file reads do not mark taint. Interpreters, scripts, aliases, renamed binaries, `/dev/tcp` and dynamic command assembly can bypass lexical detection. A missing/killed/timed-out hook may be ignored by the upstream CLI. Same-OS-user access to hook files, keys or process environment is not isolated by request signatures. Native preflight does not hold the MCP sink lease through execution or prevent concurrent reads after the check. Deny Bash or use the task sandbox for containment; the task sandbox covers delegated tasks, not every channel/CLI run. The Security page lists enforcing-mode employees with Bash and no enabled task sandbox.
+
+DuDuClaw does not guarantee that Grok alias matching or environment propagation matches the real CLI. Generic CLI native tools remain outside this guard.
+
+## Server-bound recipients
+
+Recipient protection is independent of whether private data was read. Set `config.toml [security] recipient_guard` to `off`, `shadow` (default), or `ask`. An unknown value warns and behaves as `ask`. An employee's `[capabilities] recipient_guard` can only tighten the global setting (`off < shadow < ask`). In the dashboard, use Security → Outgoing data guard → Recipient guard; an Admin edits additional recipients under the employee's Tools & permissions → Allowed recipients.
+
+```toml
+# config.toml
+[security]
+recipient_guard = "shadow"
+
+# agents/<id>/agent.toml
+[capabilities]
+recipient_guard = "ask"
+recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+```
+
+The allowed set is the current turn's source conversation, verified owners and the employee's configured recipients. A channel turn contributes a source recipient only when its server-registered `ChannelUser` has a verified binding (`user_id: Some(_)`). Unbound LINE, Telegram and public web visitors contribute no source recipient for side-effect tools. In `ask` mode, a public employee's `send_message` to an unbound visitor requires Admin approval unless the recipient is independently allowed as a verified owner or configured recipient. The normal reply path is unaffected. The gateway resolves the source from its own turn table; MCP supplies only the opaque turn ID over a signed internal route. An unknown turn has no source conversation. `DUDUCLAW_REPLY_CHANNEL` does not grant recipient permission. Channel identities are normalized using the same conversation rules as `parse_origin` (employee suffixes and threads removed) and compared exactly.
+
+Owners come **only** from `users.db` bindings with `AccessLevel::Owner`, resolved to gateway-verified channel identities. `[proactive]` notification targets are employee-editable and never count as owners. An Admin who wants to allow one adds it to `[capabilities] recipients`. The entire capabilities table is already frozen against employee edits; that protection includes both new keys.
+
+| Mode | Target in the allowed set | Target outside the allowed set |
+|---|---|---|
+| `off` | Allow | Allow |
+| `shadow` | Allow | Allow and record `recipient_guard: "would_ask"` in `tool_calls.jsonl` |
+| `ask` | Allow | Require an Admin's single-use approval |
+
+The approval says that the target is neither the source conversation nor on the allowed list. When the outgoing-data guard also asks, one card lists both reasons. Its ActionGrant binds the employee, tool and complete arguments; changing the destination or content requires a new approval. Shadow mode never blocks a call because of its recipient.
+
+Covered targets: `send_message`, `send_photo`, `send_sticker`, `create_reminder`, `mail_send`, and `tasks_create` / `update_cron_task` notification fields (`notify_channel`, `notify_chat_id`, `notify_thread_id`). `calendar_create_event` attendees are checked as mail recipients. Scheduled notifications are checked at creation and again when firing against current settings; a scheduled fire has an empty source set, so only verified owners and the configured list qualify without approval.
+
+`responsibility_ask` addresses a server-routed approval, not a model-selected recipient. `os_notify` displays locally. `github_issue_comment` selects an issue resource rather than a channel recipient and remains subject to outgoing-data and action policies. `send_to_agent`, `spawn_agent` and `team_handoff` retain delegation policy. Third-party MCP tools without a recipient adapter require Admin approval in `ask` mode for Send, Publish and other effects that can send data out, independently of private reads. The third-party gate conservatively includes Modify, Delete, Purchase and Admin; trusted Read and Draft are exempt. Unknown tools have no trusted recipient extraction and fail closed. `shadow` records `recipient_would_ask` (`recipient_guard: "would_ask"`); `off` does not add a recipient approval. A parameter named `to` is not a trusted adapter.
+
+Raw send targets cannot use conversation suffixes to impersonate a permitted recipient. Discord notification threads are checked as actual destinations in addition to the parent channel. When changing `update_cron_task` routing, supply `notify_channel` and `notify_chat_id` together; an empty pair clears routing. Changes to the task and routing are saved atomically. The guard rechecks permission after other approval waits. Ephemeral helpers inherit the parent's recipient mode and configured list; verified owner bindings remain employee-specific.
+
+This guard protects product paths; it does not isolate a process with unrestricted same-user filesystem or network access.
+
 ## Known limitations
 
 Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard. Their tool registry does not retain MCP annotations, so these calls are conservatively classified as **Modify**, even when the server describes them as read-only; exact per-tool action rules still apply. The MCP proxy and remote bridge retain their annotation-based decisions with `trusted_read_hint_servers`. A tainted direct-mounted read can therefore require outgoing approval.
 
-Taint is tracked per turn; active sink fences apply per employee. This MCP guard does not provide a network sandbox. Claude CLI built-in tools such as `WebFetch` and `Bash` running `curl`, and non-Claude native tools, are not covered. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
+Taint is tracked per turn; active sink fences apply per employee. This guard does not provide a network sandbox or a runtime-wide network boundary. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
 
 See [Security defense](05-security-defense.md) and [Dashboard settings](../guides/dashboard-settings.md).
-
-Verification scope: automated tests cover classification, gate and approval behavior. End-to-end behavior on a live employee and real outgoing service has not yet been verified.
 
 For direct external scoped/closed connections, the existing operation deadline can expire before the approval card. A later approval does not restart the expired call; submit a new call. The old card may remain pending until its displayed expiry.
 
@@ -81,3 +154,5 @@ The remote bridge uses generation-specific wire IDs and discards expired respons
 The proxy also bounds response-redaction contexts to 512 entries for five minutes, refuses duplicate IDs without replacing their context, and removes locally refused calls. Forwarded calls use unique wire IDs so late responses cannot use a newer call's redaction rules; expired responses are withheld. Completed call tasks are reaped continuously, with at most 512 active tasks.
 
 Built-in completion uses an exact list of checked handler contracts. Local mail drafts, task/agent queues and proposals complete when their durable admission finishes. Errors retain the fence conservatively. `model_search`, `model_download`, `skill_search`, `codrive_run`, `browser_record_start` and `os_open` also retain it until the lease TTL even after an apparent success: their reports, fallback attempts or background work do not confirm every outgoing action has ended.
+
+An employee with unrestricted Bash runs as the same OS user and can alter local policy or bypass the MCP send path. Recipient guard does not prevent this. The Security page also lists employees with Bash and no task sandbox when their effective `recipient_guard` is `ask`, even if `egress_guard` is off or shadow.

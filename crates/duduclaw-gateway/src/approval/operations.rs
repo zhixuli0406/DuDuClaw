@@ -80,6 +80,7 @@ impl ApprovalBroker {
             return Err("invalid step key".into());
         }
         let rec = self.get(approval_id).await?.ok_or("request not found")?;
+        require_credential_free_payload(&rec.payload)?;
         if rec.request_kind != RequestKind::Approval {
             return Err("question cannot prepare an action".into());
         }
@@ -407,8 +408,8 @@ impl ApprovalBroker {
                     AND lease_until>?9",
                 params![
                     state.as_str(),
-                    receipt.map(|v| v.to_string()),
-                    error,
+                    receipt.map(|v| masked_approval_value(&v).to_string()),
+                    error.map(duduclaw_security::credential_detect::mask),
                     Utc::now().to_rfc3339(),
                     claim.operation_id,
                     claim.token,
@@ -566,6 +567,8 @@ impl ApprovalBroker {
         if actor.is_empty() || reason.trim().is_empty() || receipt.is_null() {
             return Err("reconciliation needs actor, reason and evidence".into());
         }
+        let receipt = masked_approval_value(&receipt);
+        let reason = duduclaw_security::credential_detect::mask(reason);
         let conn = self.store.conn.lock().await;
         let decision = serde_json::json!({
             "actor": actor,

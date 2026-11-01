@@ -29,6 +29,7 @@ mod compat_windows_vm; // CP-2/B3: `duduclaw compat windows-vm` — self-package
 mod data_migrate; // H3g: `duduclaw migrate data` — /data forward-only settings migrator CLI front door
 mod decision_cmd; // Local, read-only support-decision replay
 mod docs_cmd; // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
+mod egress_hook;
 mod eval; // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
 mod eval_scaffold; // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
 mod knowledge_eval_cmd; // `duduclaw knowledge eval` — retrieval Recall@k on a throw-away knowledge.db
@@ -95,8 +96,11 @@ mod tui_cmd;
 mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
+mod agent_export_cmd;
 mod agent_control_cmd; // Operator-only pause/resume/freeze/unfreeze
 mod mcp_init_cmd; // standalone MCP profile: `duduclaw mcp init`
+mod egress_leases_cmd;
+mod doctor_egress_leases;
 mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
 #[cfg(test)]
 mod namespace_unification_tests;
@@ -163,8 +167,12 @@ pub(crate) mod test_support {
 fn detect_claude_auth() -> (bool, Option<String>) {
     // Strategy 1: Try `claude auth status --json` command
     if let Some(claude) = duduclaw_core::which_claude() {
-        let output = duduclaw_core::platform::command_for(&claude)
-            .args(["auth", "status", "--json"])
+        let mut cmd = duduclaw_core::platform::command_for(&claude);
+        duduclaw_core::spawn_env::apply_agent_cli_env_allowlist_std(&mut cmd);
+        for key in ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"] {
+            if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
+        }
+        let output = cmd.args(["auth", "status", "--json"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output();
@@ -422,7 +430,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 開啟唯讀控制室，查看待處理事項與員工狀態
+    /// Inspect or recover egress leases while the gateway is stopped.
+    EgressLeases {
+        #[command(subcommand)]
+        command: egress_leases_cmd::EgressLeasesCommands,
+    },
+    /// 開啟終端控制室，查看待處理事項與員工狀態，並處理決策
     Tui {
         #[command(subcommand)]
         command: Option<tui_cmd::TuiCommands>,
@@ -2681,6 +2694,13 @@ enum MaintenanceCommands {
 
 #[derive(Subcommand)]
 enum HookCommands {
+    /// Guard built-in web tools and literal Bash network commands.
+    EgressGuard {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        home: PathBuf,
+    },
     /// Guard Write/Edit/MultiEdit against creating agent-structure files
     /// outside the canonical `<home>/agents/<name>/` tree.
     ///
@@ -2789,6 +2809,17 @@ enum AgentCommands {
         /// `duduclaw preset bind`.
         #[arg(long)]
         preset: Option<String>,
+    },
+
+    /// Export a portable profile (operator terminal only).
+    Export {
+        agent: String,
+        #[arg(long, default_value = "duduclaw")]
+        format: String,
+        #[arg(long)]
+        out: std::path::PathBuf,
+        #[arg(long)]
+        include_user: bool,
     },
 
     /// Inspect agent details
@@ -3578,6 +3609,9 @@ enum MigrateCommands {
         /// Actually write the imported data (default is a dry-run plan).
         #[arg(long)]
         apply: bool,
+        /// Confirmation digest from the profile preview.
+        #[arg(long)]
+        confirm_profile: Option<String>,
         /// On a name clash with an existing agent, import under a
         /// `-imported` suffix instead of skipping.
         #[arg(long)]
@@ -4200,6 +4234,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                     preset,
                 )
                 .await
+            }
+            Some(AgentCommands::Export { agent, format, out, include_user }) => {
+                agent_export_cmd::run(&duduclaw_home(), &agent, &format, &out, include_user)
             }
             Some(AgentCommands::Inspect { agent }) => cmd_agent_inspect(&agent).await,
             Some(AgentCommands::Pause { agent }) => cmd_agent_set_status(&agent, "paused").await,
@@ -5278,6 +5315,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             acl,
             artifact,
         }) => causal_cmd::clear_revocation_fence(&db, &tenant, &acl, &artifact),
+        Commands::EgressLeases { command } => egress_leases_cmd::run(&duduclaw_home(), command),
         Commands::MfaOps { command: users_mfa_cmd::MfaOpsCommands::Users { command } } => users_mfa_cmd::run(&duduclaw_home(), command),
         Commands::Ops(OpsCommands::Doctor { fix_residue }) => cmd_doctor(fix_residue).await,
         Commands::Ops(OpsCommands::Responsibility { command }) => {
@@ -5371,7 +5409,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 json,
                 agent,
                 no_redact,
-            }) => migrate_from::run(&platform, source, apply, rename, json, agent, no_redact).await,
+                confirm_profile,
+            }) => migrate_from::run(&platform, source, apply, rename, json, agent, no_redact, confirm_profile).await,
             Some(MigrateCommands::Data {
                 pending,
                 check,
@@ -5711,6 +5750,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             key,
             default_provider,
         }) => proxy::run(&bind, key, default_provider).await,
+        Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::EgressGuard { agent, home })) => {
+            std::process::exit(egress_hook::run(&home, &agent).await);
+        }
         Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::AgentFileGuard { agent, home })) => {
             cmd_hook_agent_file_guard(agent.as_deref(), home.as_deref()).await
         }
@@ -6372,6 +6414,27 @@ fn agent_file_guard_decision(
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
     let decision = match tool_name {
+        "Read" => {
+            let Some(raw) = envelope.pointer("/tool_input/file_path").and_then(|v| v.as_str()) else {
+                return Some(duduclaw_core::GuardDecision::BlockedUnresolvablePath {
+                    attempted_path: PathBuf::new(), reason: "讀取路徑無法確認".into(),
+                });
+            };
+            let path = PathBuf::from(raw);
+            let path = if path.is_absolute() { path } else {
+                let base = cwd.clone().or_else(|| match caller {
+                    duduclaw_core::HookCaller::Agent(id) | duduclaw_core::HookCaller::Untrusted(id) => agent_dir_of(&home, id),
+                    duduclaw_core::HookCaller::Absent => None,
+                });
+                let Some(base) = base else {
+                    return Some(duduclaw_core::GuardDecision::BlockedUnresolvablePath {
+                        attempted_path: path, reason: "相對讀取路徑沒有工作目錄".into(),
+                    });
+                };
+                base.join(path)
+            };
+            duduclaw_core::agent_guard::check_credential_read(&path, &home)
+        }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             // NotebookEdit names its target `notebook_path`.
             let Some(file_path_str) = envelope
@@ -6494,6 +6557,9 @@ fn agent_file_guard_decision(
                             agent_control_cmd::bash_agent_control_decision(command, &caller)
                         })
                         .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, egress_leases_cmd::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(
                                 command,
                                 &caller,
@@ -6504,7 +6570,7 @@ fn agent_file_guard_decision(
                 }
             }
         }
-        // Other tool calls (Read, Grep, WebSearch, etc.) are none of our business.
+        // Other tool calls (Grep, WebSearch, etc.) are none of our business.
         _ => return None,
     };
     Some(decision)
@@ -8906,8 +8972,16 @@ fn verify_argon2_admin_default(hash_phc: &str) -> bool {
 async fn cmd_agent_interactive(agent_name: Option<&str>) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
-    let runner = AgentRunner::new(home).await?;
-    runner.run_interactive(agent_name).await
+    let runner = AgentRunner::new(home.clone()).await?;
+    runner.run_interactive_with_gate(agent_name, |agent| {
+        let home = home.clone();
+        let dir = agent.dir.clone();
+        let id = agent.config.agent.name.clone();
+        async move {
+            duduclaw_gateway::budget::gate_before_spawn(&home, Some(&dir), &id, "agent_run")
+                .await.map_err(|e| duduclaw_core::error::DuDuClawError::Agent(e.to_string()))
+        }
+    }).await
 }
 
 /// `duduclaw agent list [--json]`
@@ -9502,6 +9576,18 @@ fn gateway_instance_check(home: &std::path::Path) -> (String, CheckStatus, Strin
 /// employee or acceptance judge runs on a runtime that may not report token
 /// usage. Such a run is charged its full per-run cap for every unmeasured
 /// round. Advisory: Warn, never Fail. Reads `tasks.db` only when it exists.
+fn credential_audit_chain_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let (status, detail) = match duduclaw_gateway::security_posture::verify_security_audit(home) {
+        Ok(value) => match value["status"].as_str() {
+            Some("current_segment_consistent") => (CheckStatus::Pass, format!("目前區段內部一致（{} 筆鏈結）；輪替後僅驗證目前區段，不涵蓋封存區段，也無法證明尾端未遭刪除。", value["lines_checked"])),
+            Some("broken") => (CheckStatus::Fail, format!("第 {} 行的稽核鏈結不一致。", value["line_number"])),
+            _ => (CheckStatus::Warn, "尚無可驗證的稽核鏈結。".into()),
+        },
+        Err(_) => (CheckStatus::Fail, "稽核鏈無法讀取，尚未驗證完整性。".into()),
+    };
+    ("憑證稽核鏈".into(), status, detail)
+}
+
 async fn responsibility_usage_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let name = "持續任務的用量回報".to_string();
     let db = home.join("tasks.db");
@@ -10124,8 +10210,15 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     match duduclaw_core::which_claude() {
         Some(path) => {
             // Try `claude auth status --json` to verify auth
-            match duduclaw_core::platform::async_command_for(&path)
-                .args(["auth", "status", "--json"])
+            let mut cmd = duduclaw_core::platform::async_command_for(&path);
+            duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+            if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+            }
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                cmd.env("ANTHROPIC_API_KEY", key);
+            }
+            match cmd.args(["auth", "status", "--json"])
                 .env_remove("CLAUDECODE")
                 .stdin(std::process::Stdio::null())
                 .output()
@@ -10233,9 +10326,11 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4e: MCP servers in employees' .mcp.json that DuDuClaw did not
     // write (they run as the operator's OS user at every spawn).
     checks.push(doctor_mcp_servers::mcp_servers_check(&home));
+    checks.push(doctor_egress_leases::check(&home));
 
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);
+    checks.push(credential_audit_chain_check(&home));
 
     // Print results
     let mut has_failure = false;
@@ -10297,11 +10392,12 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
     };
     println!("  binary : {path}");
 
+    let mut version_cmd = duduclaw_core::platform::async_command_for(&path);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut version_cmd);
     // Version (5s cap).
     match tokio::time::timeout(
         Duration::from_secs(5),
-        duduclaw_core::platform::async_command_for(&path)
-            .arg("--version")
+        version_cmd.arg("--version")
             .stdin(Stdio::null())
             .output(),
     )
@@ -10347,6 +10443,10 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
     println!("  活體試跑：grok -p \"ping\"（15s 上限）");
     let args = ["-p".to_string(), "ping".to_string()];
     let mut cmd = duduclaw_core::platform::async_command_for(&path);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
+    if let Ok(key) = std::env::var("XAI_API_KEY") {
+        cmd.env("XAI_API_KEY", key);
+    }
     cmd.args(&args).stdin(Stdio::null());
     for (k, v) in &home_env {
         cmd.env(k, v);
@@ -10399,7 +10499,10 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
     if empty_exit0 && !is_auth {
         println!();
         println!("  PTY 一次性重試（真 TTY 下重跑 grok -p \"ping\"，30s 上限）");
-        let mut env: std::collections::HashMap<String, String> = home_env.iter().cloned().collect();
+        let mut env: std::collections::HashMap<String, String> =
+            duduclaw_core::spawn_env::agent_cli_spawn_env_pairs().into_iter()
+                .map(|(key, value)| (key.to_string(), value)).collect();
+        env.extend(home_env.iter().cloned());
         if api_key_set {
             if let Ok(k) = std::env::var("XAI_API_KEY") {
                 env.insert("XAI_API_KEY".to_string(), k);
@@ -10411,11 +10514,8 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
             env,
             None,
             Duration::from_secs(30),
-            // WP-8B added the `clear_env` param to `invoke_oneshot`; this
-            // call site is an operator-run `duduclaw doctor`-style
-            // diagnostic (not the gateway's automated dispatch path), so it
-            // keeps `false` — byte-identical prior behavior.
-            false,
+            // Keep the retry on the same allowlisted base as the pipe probe.
+            true,
         )
         .await
         {
@@ -10613,6 +10713,172 @@ pub(crate) fn reserved_agent_name_error(name: &str) -> Option<DuDuClawError> {
     })
 }
 
+/// Render import scaffolding once; confirmation hashes these exact bytes.
+pub(crate) fn scaffold_agent_files(
+    s: &AgentScaffold,
+) -> duduclaw_core::error::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    let AgentScaffold { name: agent_name, display_name, role, soul_body, provider, .. } = s;
+    let role_str = role.as_str();
+    let mut files = std::collections::BTreeMap::new();
+    files.insert("agent.toml".into(), scaffold_agent_toml(s).into_bytes());
+    let soul = soul_body.clone().unwrap_or_else(|| {
+        format!(
+            "# {display_name}\n\nI am {display_name}, a {role_str} AI agent powered by DuDuClaw.\n\n\
+             ## Core Values\n\n- Helpful and precise\n- Clear in communication\n\
+             - Focused on the task at hand\n\n\
+             ## Tool Use\n\n\
+             - To create sub-agents, call the `create_agent` MCP tool. Never fabricate \
+             agent creation in plain text.\n\
+             - To delegate work, use `send_to_agent` or `spawn_agent`.\n\
+             - When uncertain about state, call `list_agents` first.\n"
+        )
+    });
+    let wiki_guide = include_str!("../../../templates/wiki/CLAUDE_WIKI.md");
+    let context_md = format!(
+        "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n\n{}\n",
+        duduclaw_gateway::updater::current_version(),
+        wiki_guide,
+    );
+    let mcp_bin = duduclaw_core::resolve_duduclaw_bin()
+        .to_string_lossy()
+        .into_owned();
+    // DUDUCLAW_AGENT_ID lets the MCP subprocess self-identify; without it
+    // every call falls back to `default_agent` and supervisor-relation
+    // authorization breaks (mirrors mcp_template::ensure_duduclaw_absolute_path).
+    // `DUDUCLAW_AGENT_TOKEN` (WP21 debt ⑧) rides along when the install has an
+    // `identity.key`, so the id is provable rather than merely asserted.
+    let mcp_env: serde_json::Map<String, serde_json::Value> =
+        duduclaw_core::agent_identity_env_vars_default(agent_name)
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+    let mcp_json = serde_json::json!({
+        "mcpServers": {
+            "duduclaw": {
+                "command": mcp_bin,
+                "args": ["mcp-server"],
+                "env": mcp_env
+            }
+        }
+    });
+    let mcp_content = serde_json::to_string_pretty(&mcp_json)
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to serialise .mcp.json: {e}")))?;
+    files.insert("SOUL.md".into(), soul.into_bytes());
+    files.insert(".mcp.json".into(), mcp_content.into_bytes());
+    for filename in provider_context_filenames(*provider) {
+        files.insert(filename.to_string(), context_md.as_bytes().to_vec());
+    }
+    for (name, body) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
+        files.insert(format!("SKILLS/{name}/SKILL.md"), body.as_bytes().to_vec());
+    }
+    for (name, entries) in duduclaw_agent::builtin_skills::BUILTIN_SKILL_FILES {
+        for (rel, body) in *entries {
+            files.insert(format!("SKILLS/{name}/{rel}"), body.as_bytes().to_vec());
+        }
+    }
+    Ok(files)
+}
+
+/// Import-only writer: no rendering, re-resolution, or source reads after review.
+pub(crate) async fn scaffold_planned_agent_dir(
+    home: &std::path::Path,
+    s: &AgentScaffold,
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> duduclaw_core::error::Result<std::path::PathBuf> {
+    if !is_valid_agent_id(&s.name) {
+        return Err(DuDuClawError::Agent("Invalid planned agent id".into()));
+    }
+    if let Some(e) = reserved_agent_name_error(&s.name) { return Err(e); }
+    let agent_dir = home.join("agents").join(&s.name);
+    let config = files.get("agent.toml").ok_or_else(|| DuDuClawError::Agent("Missing planned settings".into()))?;
+    let config = std::str::from_utf8(config).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    duduclaw_gateway::product_policy::validate_write(home, &agent_dir.join("agent.toml"), "", config)
+        .map_err(DuDuClawError::Agent)?;
+    std::fs::create_dir_all(home.join("agents"))
+        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    // Exclusive directory creation refuses a destination created after planning.
+    std::fs::create_dir(&agent_dir).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    for dir in ["SKILLS", "memory", ".claude"] {
+        std::fs::create_dir_all(agent_dir.join(dir))
+            .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    }
+    for (rel, bytes) in files {
+        if std::path::Path::new(rel).components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+            return Err(DuDuClawError::Agent("Invalid planned file path".into()));
+        }
+        use duduclaw_gateway::agent_files::external::{self, ExternalFile, ExternalBaseline};
+        let key = match rel.as_str() {
+            "SOUL.md" => Some(ExternalFile::Soul),
+            "IDENTITY.md" => Some(ExternalFile::Identity),
+            "USER.md" => Some(ExternalFile::User),
+            "INSTRUCTIONS.md" => Some(ExternalFile::Instructions),
+            "CONTRACT.toml" => Some(ExternalFile::Contract),
+            "agent.toml" => Some(ExternalFile::AgentToml),
+            _ => None,
+        };
+        if key == Some(ExternalFile::AgentToml) {
+            // The locked editor requires agent.toml to exist. Claim it
+            // exclusively, then let that editor establish history and policy.
+            let path = agent_dir.join(rel);
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+                .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+            duduclaw_core::platform::set_owner_only(&path)
+                .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+        }
+        if let Some(key) = key {
+            let text = std::str::from_utf8(bytes).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+            external::write_file(home, &s.name, key, "import", "本機匯入（身分未驗證）",
+                ExternalBaseline::Accept, |current| {
+                    if !current.is_empty() { return Err("Planned file appeared before installation".into()); }
+                    Ok(text.to_string())
+                }).map_err(DuDuClawError::Agent)?;
+            continue;
+        }
+        let dest = agent_dir.join(rel);
+        std::fs::create_dir_all(dest.parent().unwrap())
+            .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest)
+            .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+        duduclaw_core::platform::set_owner_only(&dest)
+            .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+        file.write_all(bytes).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    }
+    duduclaw_core::org_store::upsert(home, &s.name, duduclaw_core::OrgEntry::new(&s.reports_to, ""))
+        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    Ok(agent_dir)
+}
+
+#[cfg(test)]
+mod planned_scaffold_tests {
+    // NOT RUN: this change was made with builds and tests explicitly disabled.
+    #[tokio::test]
+    async fn planned_files_are_exact_and_protected_baselines_are_established() {
+        let home = tempfile::tempdir().unwrap();
+        let scaffold = super::AgentScaffold {
+            name: "planned".into(), display_name: "Planned".into(), role: "worker".into(),
+            reports_to: String::new(), icon: "🐾".into(), trigger: "@Planned".into(),
+            provider: duduclaw_core::types::RuntimeType::Claude, model_preferred: None,
+            soul_body: Some("Approved persona".into()),
+        };
+        let mut files = super::scaffold_agent_files(&scaffold).unwrap();
+        for (name, content) in [("IDENTITY.md", "Approved identity"), ("USER.md", "User data"),
+            ("INSTRUCTIONS.md", "Approved rules"), ("CONTRACT.toml", "[boundaries]\nmust_not = ['refund']\n")] {
+            files.insert(name.into(), content.as_bytes().to_vec());
+        }
+        let dir = super::scaffold_planned_agent_dir(home.path(), &scaffold, &files).await.unwrap();
+        for (name, bytes) in &files {
+            assert_eq!(&std::fs::read(dir.join(name)).unwrap(), bytes, "{name}");
+        }
+        use duduclaw_security::soul_guard::{ProtectedDoc, DocDrift, doc_drift};
+        for doc in [ProtectedDoc::Soul, ProtectedDoc::Identity, ProtectedDoc::User, ProtectedDoc::Instructions] {
+            assert_eq!(doc_drift(doc, &dir), DocDrift::Intact);
+        }
+        assert!(std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap().contains("agent_file_changed"));
+        assert!(super::scaffold_planned_agent_dir(home.path(), &scaffold, &files).await.is_err());
+    }
+}
+
 pub(crate) async fn scaffold_agent_dir(
     home: &std::path::Path,
     s: &AgentScaffold,
@@ -10670,72 +10936,15 @@ pub(crate) async fn scaffold_agent_dir(
         display_name,
         role,
         reports_to,
-        icon,
-        trigger,
+        icon: _,
+        trigger: _,
         provider,
-        model_preferred,
+        model_preferred: _,
         soul_body,
     } = s;
     let role_str = role.as_str();
 
-    // `[runtime]` section: only written when the operator chose a non-default
-    // provider — default (Claude) scaffolds stay byte-identical to before.
-    let runtime_section = if *provider == duduclaw_core::types::RuntimeType::Claude {
-        String::new()
-    } else {
-        format!("\n[runtime]\nprovider = \"{}\"\n", provider.as_str())
-    };
-
-    let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
-
-    // agent.toml
-    let agent_toml = format!(
-        r#"[agent]
-name = "{agent_name}"
-display_name = "{display_name}"
-role = "{role_str}"
-status = "active"
-trigger = "{trigger}"
-reports_to = "{reports_to}"
-icon = "{icon}"
-{runtime_section}
-[model]
-preferred = "{preferred}"
-fallback = "claude-haiku-4-5"
-account_pool = []
-api_mode = "auto"
-
-[container]
-timeout_ms = 1800000
-max_concurrent = 1
-readonly_project = true
-additional_mounts = []
-
-[heartbeat]
-enabled = false
-interval_seconds = 3600
-max_concurrent_runs = 1
-cron = ""
-
-[budget]
-monthly_limit_cents = 5000
-warn_threshold_percent = 80
-hard_stop = true
-
-[permissions]
-can_create_agents = true
-can_send_cross_agent = true
-can_modify_own_skills = true
-can_modify_own_soul = false
-can_schedule_tasks = true
-allowed_channels = ["*"]
-permissions_enforced_since = "1.68.0"
-
-[evolution]
-skill_auto_activate = false
-skill_security_scan = true
-"#
-    );
+    let agent_toml = scaffold_agent_toml(s);
     tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml)
         .await
         .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
@@ -10768,6 +10977,7 @@ skill_security_scan = true
              - To create sub-agents, call the `create_agent` MCP tool. Never fabricate \
              agent creation in plain text.\n\
              - To delegate work, use `send_to_agent` or `spawn_agent`.\n\
+             - For a gateway-supplied credential id you hold, use `credential_declare` to label its service; never supply the value.\n\
              - When uncertain about state, call `list_agents` first.\n"
         )
     });
@@ -14656,4 +14866,117 @@ mod removed_name_hook_tests {
     }
 }
 
+#[cfg(test)]
+mod credential_read_lane_tests {
+    use super::*;
+
+    #[test]
+    fn native_read_cannot_read_credential_ledger() {
+        let home = std::path::Path::new("/tmp/credential-read-lane-test");
+        let envelope = serde_json::json!({"tool_input":{"file_path":home.join("credentials/ledger.db")}});
+        let decision = agent_file_guard_decision("Read", &envelope, home,
+            &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
+        assert!(!decision.is_allowed());
+    }
+}
+
+fn scaffold_agent_toml(s: &AgentScaffold) -> String {
+    let AgentScaffold { name: agent_name, display_name, role, reports_to, icon, trigger,
+        provider, model_preferred, .. } = s;
+    let role_str = role.as_str();
+    // `[runtime]` section: only written when the operator chose a non-default
+    // provider — default (Claude) scaffolds stay byte-identical to before.
+    let runtime_section = if *provider == duduclaw_core::types::RuntimeType::Claude {
+        String::new()
+    } else {
+        format!("\n[runtime]\nprovider = \"{}\"\n", provider.as_str())
+    };
+
+    let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
+
+    // agent.toml
+    format!(
+        r#"[agent]
+name = "{agent_name}"
+display_name = "{display_name}"
+role = "{role_str}"
+status = "active"
+trigger = "{trigger}"
+reports_to = "{reports_to}"
+icon = "{icon}"
+{runtime_section}
+[model]
+preferred = "{preferred}"
+fallback = "claude-haiku-4-5"
+account_pool = []
+api_mode = "auto"
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = true
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = ["*"]
+permissions_enforced_since = "1.68.0"
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+"#
+    )
+}
+
+#[cfg(all(test, unix))]
+mod doctor_probe_env_tests {
+    #[tokio::test]
+    async fn grok_pipe_and_pty_probes_drop_ambient_secrets() {
+        if let Ok(home) = std::env::var("DUDUCLAW_TEST_GROK_DIAGNOSTIC_HOME") {
+            super::grok_cli_diagnostic(std::path::Path::new(&home)).await;
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("grok");
+        std::fs::write(&script, r#"#!/bin/sh
+if [ "${CLAUDE_CODE_MESSAGING_TOKEN+x}" = x ] || [ "${ANTHROPIC_API_KEY+x}" = x ]; then printf 'ambient-secret-leaked' >&2; exit 71; fi
+if [ "$1" = --version ]; then printf 'fixture-version'; exit 0; fi
+if [ "$XAI_API_KEY" != fixture-xai ] || [ "$GROK_HOME" != "$HOME/grok-config" ] || [ "$USERPROFILE" != "$HOME" ]; then printf 'explicit-env-missing' >&2; exit 72; fi
+if [ -t 1 ]; then printf 'pty-probe-ok'; fi
+"#).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "doctor_probe_env_tests::grok_pipe_and_pty_probes_drop_ambient_secrets", "--nocapture"])
+            .env("DUDUCLAW_TEST_GROK_DIAGNOSTIC_HOME", root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).env("HOME", root.path())
+            .env("GROK_HOME", root.path().join("grok-config"))
+            .env("XAI_API_KEY", "fixture-xai")
+            .env("CLAUDE_CODE_MESSAGING_TOKEN", "fixture-messaging")
+            .env("ANTHROPIC_API_KEY", "fixture-anthropic")
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("fixture-version"), "{stdout}");
+        assert!(stdout.contains("PTY 重試回傳"), "{stdout}");
+        assert!(!stdout.contains("ambient-secret-leaked"), "{stdout}");
+        assert!(!stdout.contains("explicit-env-missing"), "{stdout}");
+    }
+}
 mod users_mfa_cmd;

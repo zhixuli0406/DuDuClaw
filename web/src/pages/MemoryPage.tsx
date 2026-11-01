@@ -1,3 +1,5 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import type { IntlShape } from 'react-intl';
@@ -93,7 +95,9 @@ export function MemoryPage() {
   const errorText = useErrorMessage();
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const [params, setParams] = useSearchParams();
-  const view = parseView(params.get('tab'));
+  const canReadEvolution = hasMinRole(useAuthStore(s => s.user?.role), 'manager');
+  const requestedView = parseView(params.get('tab'));
+  const view = requestedView === 'evolution' && !canReadEvolution ? 'memories' : requestedView;
   const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
   // W3-3 (state-as-URL): the memories search term starts from `?q=` so a
@@ -143,10 +147,10 @@ export function MemoryPage() {
     });
     opts.push(
       { value: 'insights', label: intl.formatMessage({ id: 'memory.tab.insights' }) },
-      { value: 'evolution', label: intl.formatMessage({ id: 'memory.tab.evolution' }) },
+      ...(canReadEvolution ? [{ value: 'evolution' as const, label: intl.formatMessage({ id: 'memory.tab.evolution' }) }] : []),
     );
     return opts;
-  }, [intl, isPersonal]);
+  }, [intl, isPersonal, canReadEvolution]);
 
   // The wiki views bring their own agent picker; the shared wiki is not
   // agent-scoped at all. Evolution's overview cards are all-agent, but the

@@ -27,7 +27,7 @@ pub(crate) async fn handle_decision_resolve(
 
     // P2-B: the agent's choice is recorded with its MCP turn as the source
     // (the engine adds the decision rows as parents).
-    let provenance = match crate::mcp_memory_handlers::mcp_write_provenance(agent_id) {
+    let provenance = match crate::mcp_memory_handlers::mcp_stamped_provenance(agent_id).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "decision_resolve refused: malformed host env");

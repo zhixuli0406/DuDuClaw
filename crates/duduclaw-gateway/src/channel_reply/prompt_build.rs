@@ -136,7 +136,7 @@ pub(super) fn build_system_prompt(
     // `crate::prompt_identity` for the rationale. `None` preserves the
     // pre-existing "follow the user's input language" behaviour.
     default_language: Option<&str>,
-) -> String {
+) -> std::io::Result<String> {
     // #11 (2026-05-12) — Minimal mode: short-circuit to the lean assembler.
     // Agents opt in via `agent.toml [prompt] mode = "minimal"`. See
     // commercial/docs/plans/TODO-runtime-health-fixes-202605.md #11.
@@ -183,33 +183,12 @@ pub(super) fn build_system_prompt(
     }
 
     if let Some(a) = agent {
-        if let Some(soul) = &a.soul {
-            audit.push(crate::prompt_audit::PromptSection::new("soul", soul));
-            parts.push(soul.clone());
-        }
-        if let Some(identity) = &a.identity {
-            audit.push(crate::prompt_audit::PromptSection::new(
-                "identity", identity,
-            ));
-            parts.push(identity.clone());
-        }
-        if let Some(s) = duduclaw_agent::instructions::render_section(a.instructions.as_deref()) {
-            audit.push(crate::prompt_audit::PromptSection::new("instructions", &s));
-            parts.push(s);
-        }
-
-        // RFC-22 P1-9a / P1-8: inject CONTRACT.toml boundaries (must_not /
-        // must_always) into the channel system prompt. runner.rs already
-        // injects this for sub-agent dispatch but channel_reply did not,
-        // which is why 5/5 agnes hallucinated a PM section after pm spawn
-        // failed — there was no rule visible to LLM forbidding proxy authoring.
-        let contract_prompt = duduclaw_agent::contract::contract_to_prompt(&a.contract);
-        if !contract_prompt.is_empty() {
-            audit.push(crate::prompt_audit::PromptSection::new(
-                "contract",
-                &contract_prompt,
-            ));
-            parts.push(contract_prompt);
+        let mut profile = duduclaw_core::profile_sections::ProfileSections::load(&a.dir)?;
+        // The caller already inserted the authoritative name/language directive.
+        profile.set_identity_directive(None);
+        for section in profile.rendered(Default::default()) {
+            audit.push(crate::prompt_audit::PromptSection::new(section.kind.label(), &section.content));
+            parts.push(section.content);
         }
 
         // WP1.3 hardening (2026-07-28): the 📎DELIVER protocol used to live
@@ -466,11 +445,11 @@ pub(super) fn build_system_prompt(
         crate::prompt_audit::DEFAULT_EMIT_THRESHOLD_BYTES,
     );
 
-    if parts.is_empty() {
+    Ok(if parts.is_empty() {
         "You are DuDuClaw, a helpful AI assistant. Reply concisely in the user's language."
             .to_string()
     } else {
         parts.join("\n\n---\n\n")
-    }
+    })
 }
 

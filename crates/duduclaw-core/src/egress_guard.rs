@@ -80,8 +80,8 @@ pub fn effective_mode_checked(home: &Path, agent_dir: Option<&Path>) -> Result<M
     Ok(global.max(employee))
 }
 
-/// Host-only turn alias for runtimes whose persistent env map must contain
-/// a reference even when no turn exists. Memory lineage does not read it.
+/// Host-only execution turn, separate from inherited memory provenance.
+/// Takes precedence over the provenance turn. Memory lineage does not read it.
 pub const ENV_TURN_ALIAS: &str = "DUDUCLAW_EGRESS_TURN_ID";
 
 /// Response MACs use a domain outside the numeric request timestamp space.

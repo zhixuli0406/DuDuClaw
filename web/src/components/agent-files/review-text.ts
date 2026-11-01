@@ -15,7 +15,7 @@ import type {
  * ever rendered as React text nodes.
  */
 
-export const AGENT_FILE_KEYS: ReadonlyArray<AgentFileFixedKey> = ['soul', 'identity', 'instructions', 'contract', 'agent_toml'];
+export const AGENT_FILE_KEYS: ReadonlyArray<AgentFileFixedKey> = ['soul', 'identity', 'user', 'instructions', 'contract', 'agent_toml'];
 
 const SKILL_PREFIX = 'skill:';
 
@@ -23,6 +23,7 @@ const SKILL_PREFIX = 'skill:';
 export const AGENT_FILE_NAMES: Readonly<Record<AgentFileFixedKey, string>> = {
   soul: 'SOUL.md',
   identity: 'IDENTITY.md',
+  user: 'USER.md',
   instructions: 'INSTRUCTIONS.md',
   contract: 'CONTRACT.toml',
   agent_toml: 'agent.toml',

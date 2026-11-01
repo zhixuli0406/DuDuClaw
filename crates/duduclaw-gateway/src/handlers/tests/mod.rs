@@ -17,6 +17,7 @@ mod team_history_rpc_tests;
 mod computer_team_rpc_tests;
 mod computer_watch_link_tests;
 mod team_rpc_tests;
+mod dashboard_reports_tests;
 mod assign_schedule_rpc_tests;
 mod skill_assign_rpc_tests;
 mod data_file_guard_field_tests;
@@ -94,3 +95,5 @@ mod google_identity_rpc_tests;
 mod google_personal_rpc_tests;
 
 mod runtime_model_alignment_tests;
+
+mod egress_shadow_rpc_tests;

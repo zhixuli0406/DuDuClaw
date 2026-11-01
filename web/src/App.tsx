@@ -77,6 +77,7 @@ const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'Local
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
+const AccountPage = lazyPage(() => import('./pages/AccountPage'), 'AccountPage');
 const MyConnectionsPage = lazyPage(() => import('./pages/MyConnectionsPage'), 'MyConnectionsPage');
 const MyHistoryViewsPage = lazyPage(() => import('./pages/MyHistoryViewsPage'), 'MyHistoryViewsPage');
 const TeamHistoryPage = lazyPage(() => import('./pages/TeamHistoryPage'), 'TeamHistoryPage');
@@ -131,23 +132,13 @@ function PageFallback() {
  * appliance (§6 O-5: nothing native is removed, only the default first door
  * changes).
  *
- * R2 (2026-08): every authenticated role gets this redirect, not just admin.
- * The original gate reused `useIsAppliance(hasMinRole(role, 'admin'))` — the
- * same pattern `AppSidebar`/`CommandPalette` use for their `/device` nav
- * probe — because that hook used to read the admin-only `device.status` RPC
- * (`require_admin!()` in `handlers.rs`), so a manager/employee viewer could
- * never learn whether the box was an appliance and silently stayed on
- * `HomePage`. `useIsAppliance` now reads the non-admin `is_appliance` field
- * on `system.status` instead, so this route no longer needs a role gate at
- * all — `HomeLanding` only renders once `AuthGuard` has already confirmed
- * the caller is signed in, and `/console` itself is open to every role
- * (see its route below). `AppSidebar`/`CommandPalette` keep their own
- * `hasMinRole(role, 'admin')` argument unchanged — that gate is about
- * showing the admin-only `/device` page, a separate concern from this one.
+ * The machine-operation console is for administrators. Other appliance users
+ * keep their dashboard and ordinary chat, without machine-operation wording.
  */
 function HomeLanding() {
   const isAppliance = useIsAppliance(true);
-  if (isAppliance) return <Navigate to="/console" replace />;
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  if (isAppliance && isAdmin) return <Navigate to="/console" replace />;
   return <HomePage />;
 }
 
@@ -246,10 +237,8 @@ export function App() {
               {/* v2 (T1.5): /webchat renamed to /chat; old path redirects. */}
               <Route path="chat" element={<WebChatPage />} />
               <Route path="webchat" element={<Navigate to="/chat" replace />} />
-              {/* O-2 (§6.3) — the operator console scaffold. Open to every
-                  authenticated role, like `/chat`: the capability gating that
-                  matters lives at the tool layer (O-0), not the nav entry. */}
-              <Route path="console" element={<OperatorConsolePage />} />
+              {/* Machine operation entry; the server also checks the live human role. */}
+              <Route element={<RoleGuard minRole="admin" />}><Route path="console" element={<OperatorConsolePage />} /></Route>
               {/* Full conversation history (2026-08-04, D17) — the sidebar zone
                   lists the newest five and links here for the rest. */}
               <Route path="conversations" element={<ConversationsPage />} />
@@ -274,11 +263,8 @@ export function App() {
               <Route path="runs" element={<RunsPage />} />
               <Route path="canvas" element={<CanvasPage />} />
               <Route path="files" element={<FilesPage />} />
-              {/* D7 (09-edition-split-features.md §4): dropped out of the
-                  manager+ RoleGuard block below — a cron schedule for one's own
-                  agent is the same "own scope" as /plans and /runs above, not a
-                  manager-level concern. */}
-              <Route path="routines" element={<RoutinesPage />} />
+              {/* cron.* is admin-only, including read operations. */}
+              <Route element={<RoleGuard minRole="admin" />}><Route path="routines" element={<RoutinesPage />} /></Route>
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
@@ -353,6 +339,7 @@ export function App() {
                 </Route>
               </Route>
 
+              <Route path="me/account" element={<AccountPage />} />
               <Route element={<EditionGuard enterprise />}><Route path="me/connections" element={<MyConnectionsPage />} /></Route>
               {/* Self-only receipts are available to every Enterprise account. */}
               <Route element={<EditionGuard enterprise />}>
@@ -407,7 +394,7 @@ export function App() {
                   {/* 授權 relocated to `/app/system/license` (N-3). */}
                   <Route path="license" element={<LegacyRouteRedirect to="/app/system/license" />} />
                   <Route path="migrate" element={<MigratePage />} />
-                  <Route path="logs" element={<LogsPage />} />
+                  <Route element={<RoleGuard minRole="admin" />}><Route path="logs" element={<LogsPage />} /></Route>
                   {/* 安全審計（secaudit dashboard）— manager+, not admin-only:
                       reviewing a finding is closer to analytics.* than the
                       admin-gated credential-rotation surfaces below. */}
@@ -494,7 +481,7 @@ export function App() {
                     license management); it now lands on the same
                     canonical `LicenseShell` every other license route does. */}
                 <Route path="license" element={<LegacyRouteRedirect to="/app/system/license" />} />
-                <Route path="logs" element={<LogsPage />} />
+                <Route element={<RoleGuard minRole="admin" />}><Route path="logs" element={<LogsPage />} /></Route>
               </Route>
               <Route element={<RoleGuard minRole="admin" />}>
                 <Route path="channels" element={<Navigate to="/manage/channels" replace />} />

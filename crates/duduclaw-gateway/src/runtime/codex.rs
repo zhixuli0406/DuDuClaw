@@ -78,6 +78,47 @@ fn sandbox_args_for(caps: Option<&CapabilitiesConfig>, explore: bool) -> Vec<Str
     }
 }
 
+// Enforcing egress downgrades FullAccess before choosing employee permissions.
+fn egress_sandbox_caps(caps: Option<&CapabilitiesConfig>, mode: duduclaw_core::egress_guard::Mode) -> Option<&CapabilitiesConfig> {
+    if mode >= duduclaw_core::egress_guard::Mode::Ask
+        && sandbox_level_for(caps) == duduclaw_core::types::SandboxLevel::FullAccess
+    {
+        None // The default is WorkspaceWrite.
+    } else {
+        caps
+    }
+}
+
+fn egress_network_args(mode: duduclaw_core::egress_guard::Mode) -> Vec<String> {
+    if mode >= duduclaw_core::egress_guard::Mode::Ask {
+        ["-c", "sandbox_workspace_write.network_access=false", "-c", "web_search=\"disabled\""]
+            .into_iter().map(str::to_string).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn egress_sandbox_args(caps: Option<&CapabilitiesConfig>, explore: bool, mode: duduclaw_core::egress_guard::Mode) -> Vec<String> {
+    let mut args = sandbox_args_for(egress_sandbox_caps(caps, mode), explore);
+    args.extend(egress_network_args(mode));
+    args
+}
+
+#[cfg(unix)]
+fn employee_egress_sandbox_args(
+    caps: Option<&CapabilitiesConfig>,
+    explore: bool,
+    mode: duduclaw_core::egress_guard::Mode,
+    agent_dir: Option<&std::path::Path>,
+    work_root: Option<&std::path::Path>,
+    supports_permissions: bool,
+) -> Result<Vec<String>, String> {
+    let mut args = employee_sandbox_args(egress_sandbox_caps(caps, mode), explore, agent_dir, work_root, supports_permissions)?;
+    args.extend(egress_network_args(mode));
+    Ok(args)
+}
+
 fn sandbox_args(caps: Option<&CapabilitiesConfig>) -> Vec<String> {
     let level = sandbox_level_for(caps);
     // Live-verified on Codex 0.156.1 (2026-09-24, eight variants):
@@ -665,6 +706,7 @@ static CODEX_SUPPORT: std::sync::OnceLock<CodexSupportCache> =
 /// required employee permission profile refuses WorkspaceWrite spawns.
 pub(crate) async fn probe_codex_version_output(bin: &str) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
     cmd.arg("--version");
     let out = crate::process_group::output(
         &mut cmd, None, std::time::Duration::from_secs(5),
@@ -1428,6 +1470,8 @@ impl AgentRuntime for CodexRuntime {
         let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
 
         let mut cmd = tokio::process::Command::new(&self.codex_path);
+        // This token belongs to the Claude host session and must not reach Codex.
+        cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
         cmd.arg("exec").arg("--json");
         // Agent directories are not git repositories. Codex 0.156.x refuses to
         // run outside a trusted (git) directory unless told otherwise —
@@ -1435,19 +1479,21 @@ impl AgentRuntime for CodexRuntime {
         // --skip-git-repo-check was not specified." (exit 1). Reproduced in a
         // plain temp dir; the same invocation succeeds with the flag.
         cmd.arg("--skip-git-repo-check");
+        let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
+        let effective_caps = egress_sandbox_caps(caps, egress_mode);
         #[cfg(unix)]
         {
             let needs_permissions = !explore
-                && sandbox_level_for(caps) == duduclaw_core::types::SandboxLevel::WorkspaceWrite;
+                && sandbox_level_for(effective_caps) == duduclaw_core::types::SandboxLevel::WorkspaceWrite;
             let supports_permissions = needs_permissions
                 && codex_supports_employee_permissions(&self.codex_path).await;
-            let args = employee_sandbox_args(caps, explore, context.agent_dir.as_deref(), work_root.as_deref(), supports_permissions)
+            let args = employee_egress_sandbox_args(caps, explore, egress_mode, context.agent_dir.as_deref(), work_root.as_deref(), supports_permissions)
                 .map_err(|error| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&error))?;
             cmd.args(args);
         }
         // Windows control-file permission profiles are unverified.
         #[cfg(not(unix))]
-        cmd.args(sandbox_args_for(caps, explore));
+        cmd.args(egress_sandbox_args(effective_caps, explore, egress_mode));
         cmd.args(effort_args(context.effort));
         // Thinking display: ask for reasoning summaries only when this
         // reply turn's viewer reads thinking text; otherwise nothing is
@@ -2342,6 +2388,61 @@ mod tests {
             allowed_tools: allowed.iter().map(|s| s.to_string()).collect(),
             denied_tools: denied.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn egress_codex_args_only_narrow_and_preserve_mcp_approver() {
+        use duduclaw_core::egress_guard::Mode;
+        let full = caps(true, true, &[], &[]);
+        let read_only = caps(false, false, &["Read"], &[]);
+        for mode in [Mode::Off, Mode::Shadow, Mode::Ask, Mode::Block] {
+            for caps in [None, Some(&full), Some(&read_only)] {
+                let args = egress_sandbox_args(caps, false, mode);
+                if mode < Mode::Ask {
+                    assert_eq!(args, sandbox_args(caps));
+                } else {
+                    assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+                    assert!(args.iter().any(|a| a == "sandbox_workspace_write.network_access=false"));
+                    assert!(args.iter().any(|a| a == "web_search=\"disabled\""));
+                    if sandbox_level_for(caps) != duduclaw_core::types::SandboxLevel::ReadOnly {
+                        assert!(args.iter().any(|a| a == "--approve-for-me"));
+                        assert!(!args.iter().any(|a| a == "-s"));
+                        assert_eq!(declared_sandbox(&args).as_deref(), Some("workspace-write"));
+                    } else {
+                        assert_eq!(declared_sandbox(&args).as_deref(), Some("read-only"));
+                    }
+                }
+            }
+            let explore = egress_sandbox_args(Some(&full), true, mode);
+            assert_eq!(declared_sandbox(&explore).as_deref(), Some("read-only"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn egress_employee_permissions_compose_after_full_access_downgrade() {
+        use duduclaw_core::egress_guard::Mode;
+        let full = caps(true, true, &[], &[]);
+        let read_only = caps(false, false, &["Read"], &[]);
+        let agent = std::path::Path::new("/agents/member");
+        let root = std::path::Path::new("/agents/parent");
+        for mode in [Mode::Ask, Mode::Block] {
+            for caps in [None, Some(&full)] {
+                let args = employee_egress_sandbox_args(caps, false, mode, Some(agent), Some(root), true).unwrap();
+                let mut expected = sandbox_args(None);
+                expected.extend(employee_permission_args(agent, Some(root)).unwrap());
+                expected.extend(egress_network_args(mode));
+                assert_eq!(args, expected);
+                assert!(!args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox" || arg == "-s"));
+                assert!(employee_egress_sandbox_args(caps, false, mode, Some(agent), Some(root), false).unwrap_err().contains("0.164.0"));
+                assert!(employee_egress_sandbox_args(caps, false, mode, None, Some(root), true).is_err());
+            }
+            assert_eq!(employee_egress_sandbox_args(Some(&read_only), false, mode, None, None, false).unwrap(), egress_sandbox_args(Some(&read_only), false, mode));
+            assert_eq!(employee_egress_sandbox_args(Some(&full), true, mode, None, None, false).unwrap(), egress_sandbox_args(Some(&full), true, mode));
+        }
+        for mode in [Mode::Off, Mode::Shadow] {
+            assert_eq!(employee_egress_sandbox_args(Some(&full), false, mode, None, None, false).unwrap(), sandbox_args(Some(&full)));
         }
     }
 
@@ -3298,6 +3399,22 @@ mod tests {
         }
         for writable in ["MEMORY.md", "CLAUDE.md", "AGENTS.md", "wiki/page.md", "note.txt"] {
             assert!(!fs.contains_key(dir.join(writable).to_str().unwrap()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn employee_permissions_protect_missing_identity_and_user_files() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("employee");
+        std::fs::create_dir(&dir).unwrap();
+        for path in ["IDENTITY.md", "USER.md"] { assert!(!dir.join(path).exists()); }
+        let args = employee_permission_args(&dir, None).unwrap();
+        let (_, value) = args.last().unwrap().split_once('=').unwrap();
+        let parsed: toml::Value = format!("value={value}").parse().unwrap();
+        for path in ["IDENTITY.md", "USER.md"] {
+            assert_eq!(parsed["value"][dir.join(path).to_str().unwrap()].as_str(), Some("read"));
+            assert!(!dir.join(path).exists());
         }
     }
 

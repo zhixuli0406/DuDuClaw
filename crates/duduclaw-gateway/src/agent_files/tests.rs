@@ -207,3 +207,58 @@ fn a_skill_folder_swapped_for_a_symlink_while_saving_is_not_followed() {
     assert_eq!(std::fs::read_to_string(elsewhere.join("SKILL.md")).unwrap(), "v0", "nothing written through the link");
     assert!(!elsewhere.join("SKILL.md.tmp").exists());
 }
+
+// Added regression test; not run in this change.
+#[tokio::test]
+async fn agent_channel_write_fences_disconnect_and_refuses_unreadable_memory() {
+    let (_dir, home) = home_with_agent();
+    let engine = duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db")).unwrap();
+    engine.record_connector_disconnect("channel:telegram:a1").await.unwrap();
+    let next = "[agent]\nname='a1'\n[channels.telegram]\nbot_token='test-token'\n";
+    commit_locked(&commit(&home, FileKey::AgentToml, None), |_| Ok(next.into()), || Ok(())).unwrap();
+    assert!(engine.disconnected_connector_refs().await.unwrap().is_empty());
+    let (_bad_dir, bad_home) = home_with_agent();
+    let path = bad_home.join("agents/a1/agent.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(bad_home.join("memory.db"), "not a database").unwrap();
+    let result = commit_locked(&commit(&bad_home, FileKey::AgentToml, None), |_| Ok(next.into()), || Ok(()));
+    assert!(matches!(result, Err(CommitError::Refused(_))));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+}
+
+#[test]
+fn user_character_limit_and_profile_baselines() {
+    let (_d, home) = home_with_agent();
+    for key in [FileKey::User, FileKey::Identity] {
+        let content = "字".repeat(MAX_USER_CHARS);
+        let out = commit_locked(&commit(&home, key.clone(), None), |_| Ok(content.clone()), || Ok(())).unwrap();
+        assert!(!out.unchanged);
+        let doc = key.protected_doc().expect("profile files have baselines");
+        assert_eq!(duduclaw_security::soul_guard::doc_drift(doc, &home.join("agents/a1")), duduclaw_security::soul_guard::DocDrift::Intact);
+    }
+    let before = std::fs::read_to_string(home.join("agents/a1/USER.md")).unwrap();
+    let result = commit_locked(&commit(&home, FileKey::User, None), |_| Ok("字".repeat(MAX_USER_CHARS + 1)), || Ok(()));
+    assert!(matches!(result, Err(CommitError::Refused(_))));
+    assert_eq!(std::fs::read_to_string(home.join("agents/a1/USER.md")).unwrap(), before);
+}
+
+#[test]
+fn user_writes_mask_before_hash_history_disk_and_baseline() {
+    let (_d, home) = home_with_agent();
+    let raw = "password: hunter2";
+    let masked = duduclaw_security::credential_detect::mask_document(raw).unwrap();
+    let result = commit_locked(&commit(&home, FileKey::User, None), |_| Ok(raw.into()), || Ok(())).unwrap();
+    assert_eq!(result.after, masked);
+    assert_eq!(result.hash, hash_of(&masked));
+    assert_eq!(std::fs::read_to_string(home.join("agents/a1/USER.md")).unwrap(), masked);
+    assert_eq!(duduclaw_security::soul_guard::doc_drift(
+        duduclaw_security::soul_guard::ProtectedDoc::User, &home.join("agents/a1")),
+        duduclaw_security::soul_guard::DocDrift::Intact);
+    let versions = history::list(&home, "a1", &FileKey::User);
+    for version in versions {
+        let content = history::read_version(&home, "a1", &FileKey::User, &version.version_id).unwrap();
+        assert!(!content.contains("hunter2"));
+    }
+    let again = commit_locked(&commit(&home, FileKey::User, None), |_| Ok(raw.into()), || Ok(())).unwrap();
+    assert!(again.unchanged);
+}

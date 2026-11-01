@@ -97,7 +97,7 @@ impl TrajectoryExporter {
         std::fs::create_dir_all(&dir)?;
 
         let path = dir.join(format!("{}.jsonl", trajectory.trajectory_id));
-        let json = serde_json::to_string(trajectory)
+        let json = masked_trajectory_json(trajectory)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(&path, format!("{}\n", json))?;
 
@@ -135,6 +135,14 @@ impl TrajectoryExporter {
     pub fn export_dir(&self) -> &Path {
         &self.export_dir
     }
+}
+
+/// Both export sinks sanitize the full structured row, including tool arguments,
+/// results and metadata, so callers cannot accidentally persist session secrets.
+pub(super) fn masked_trajectory_json(trajectory: &RLTrajectory) -> serde_json::Result<String> {
+    let mut value = serde_json::to_value(trajectory)?;
+    duduclaw_security::credential_detect::mask_json(&mut value);
+    serde_json::to_string(&value)
 }
 
 /// Statistics about exported trajectories.

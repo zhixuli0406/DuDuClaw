@@ -106,6 +106,7 @@ export function migrateApplyArgs(
   platform: MigratePlatform,
   source?: string,
   rename?: boolean,
+  profileConfirmation?: string,
 ): Record<string, unknown> {
-  return { ...migrateScanArgs(platform, source), ...(rename ? { rename: true } : {}) };
+  return { ...migrateScanArgs(platform, source), ...(rename ? { rename: true } : {}), ...(profileConfirmation ? { confirm_profile: profileConfirmation } : {}) };
 }

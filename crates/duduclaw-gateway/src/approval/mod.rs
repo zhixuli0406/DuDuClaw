@@ -70,9 +70,32 @@ const SELF_NOTIFYING_KINDS: &[&str] = &[
 /// caller that is filing the approval.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Approval payloads may later be executed against an exact authority hash.
+/// Refuse credentials instead of mutating the authorized action at rest.
+fn require_credential_free_payload(value: &Value) -> Result<(), String> {
+    match value {
+        Value::String(text) => {
+            match duduclaw_security::credential_detect::contains_strict_credential(text) {
+                Ok(false) => Ok(()),
+                Ok(true) | Err(_) => Err("credentials are not accepted in approval payloads".into()),
+            }
+        }
+        Value::Array(values) => values.iter().try_for_each(require_credential_free_payload),
+        Value::Object(values) => values.values().try_for_each(require_credential_free_payload),
+        _ => Ok(()),
+    }
+}
+
+fn masked_approval_value(value: &Value) -> Value {
+    let mut masked = value.clone();
+    duduclaw_security::credential_detect::mask_json(&mut masked);
+    masked
+}
+
 // ── Types ───────────────────────────────────────────────────
 
 pub mod action_grant;
+pub(crate) mod cli_egress;
 mod action_guard;
 mod binding;
 mod fixture_decision;

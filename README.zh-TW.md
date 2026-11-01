@@ -59,7 +59,7 @@ duduclaw run                  # 接著打開 http://localhost:18889
 | 多 LLM 容錯切換 | 手動重啟 | 4 種輪替策略 + 跨供應商 failover |
 | 換 LLM 時保留上下文 | 遺失 | 完整保留 |
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
-| 工具跨 LLM 共用 | 每家重寫 | 247 個 MCP 工具寫一次,Claude、Codex、Gemini、Grok 與 OpenAI 相容 runtime 都能呼叫 |
+| 工具跨 LLM 共用 | 每家重寫 | 253 個 MCP 工具寫一次,Claude、Codex、Grok 與 OpenAI 相容 runtime 都能呼叫 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
 | 交給客戶的整台值班機 | 自己裝 Linux,更新與防竄改自己管 | DuDuClaw OS 映像:A/B 更新回滾 + 唯讀 root,插電即用;人機共用桌面,不影響日常使用 |
 
@@ -79,7 +79,7 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 11 個 runtime id(10 種 CLI + OpenAI-compat),自動偵測,per-agent 設定
   ├─ Session Memory — 原生 --resume + 時態記憶 + key-fact 累積 + 分層 wiki
-  ├─ MCP Server — 247 個工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
+  ├─ MCP Server — 253 個工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
   ├─ Evolution Engine — 預測驅動 + AEE playbook 進化(v3 預設) + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS 沙箱 + redaction vault
   ├─ Inference Engine — OpenAI 相容本地伺服器(llama-server / Ollama / vLLM)/ llamafile
@@ -194,7 +194,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 通訊通道 | 11 通道(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板;Telegram 語音訊息經 OpenAI Whisper API 轉文字。Discord 語音頻道是非預設的編譯選項,發行版 binary 不含 | [docs/features](docs/features/README.md) |
 | Multi-Runtime | 11 個 runtime id:Claude Code / Codex / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode 加上 OpenAI-compat;自動偵測、per-agent 設定、換後端保留上下文 | [docs/features/13](docs/features/zh-TW/13-multi-runtime.md) |
 | 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP Server | 247 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport;外部客戶端的 key 預設只能用 7 個基本工具,操作者可另外授與記憶、wiki 或訊息類 scope,連接器、執行類與管理類工具一律不對外 | [docs/api](docs/api/README.md) |
+| MCP Server | 253 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport;外部客戶端的 key 預設只能用 7 個基本工具,操作者可另外授與記憶、wiki 或訊息類 scope,連接器、執行類與管理類工具一律不對外 | [docs/api](docs/api/README.md) |
 | 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
 | 自我進化 | 預測驅動(設計上多數對話不需呼叫 LLM)、AEE playbook 進化(SOUL.md 對 agent 唯讀;學到的是一條條連結 eval 案例的小規則,不輸目前的 playbook 才提交,24 小時後逐條結算,退步只撤那一條)、MistakeNotebook 跨回合記憶 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱(逐 agent 開啟,預設關)、容器沙箱(任務沙箱只支援 Docker,預設關;腳本沙箱用 Docker,Windows 先試 WSL2)、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
@@ -273,7 +273,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 語言 | Rust | TypeScript | Rust | Python |
 | 通道 | 11 | 25+ | 8 | 0(API)|
 | Multi-Runtime | 11 個 runtime id(10 種 CLI + OpenAI-compat) | 單一 | 單一 | 多 LLM |
-| MCP Server | 247 個工具 | 無 | 無 | 無 |
+| MCP Server | 253 個工具 | 無 | 無 | 無 |
 | 自我進化引擎 | AEE playbook 規則(預測驅動) | 無 | 無 | 無 |
 | 本地推論 | OpenAI 相容本地伺服器 / llamafile + 信心路由 | 無 | 無 | 無 |
 | 行為契約 | CONTRACT.toml + 紅隊 | 無 | WASM 沙箱 | 無 |

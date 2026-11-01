@@ -54,15 +54,18 @@ export function CredentialHygienePanel({
   const [loading, setLoading] = useState(true);
   const [findings, setFindings] = useState<CredentialFinding[] | null>(null);
   const [loadError, setLoadError] = useState<unknown>(null);
+  const [plaintextCount, setPlaintextCount] = useState(0);
   const [cleaning, setCleaning] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
     setLoadError(null);
-    api.security
-      .credentialHygiene()
-      .then((res) => setFindings(res.findings))
+    Promise.all([api.security.credentialHygiene(), api.security.credentialInventory()])
+      .then(([res, inventory]) => {
+        setFindings(res.findings);
+        setPlaintextCount(inventory.entries.filter((entry) => entry.source === 'legacy' || entry.residue).length);
+      })
       .catch((e) => {
         setLoadError(e);
         setFindings(null);
@@ -101,7 +104,7 @@ export function CredentialHygienePanel({
     }
   };
 
-  const clean = findings != null && findings.length === 0;
+  const clean = findings != null && findings.length === 0 && plaintextCount === 0;
 
   return (
     <Card>
@@ -137,8 +140,8 @@ export function CredentialHygienePanel({
             <div className="flex items-center gap-2 rounded-lg bg-warning/10 px-3 py-2.5 text-sm text-warning">
               <ShieldAlert className="size-4 shrink-0" />
               {intl.formatMessage(
-                { id: 'security.credentialHygiene.foundSummary' },
-                { count: findings?.length ?? 0 },
+                { id: plaintextCount > 0 ? 'security.credentialHygiene.plaintextSummary' : 'security.credentialHygiene.foundSummary' },
+                { count: plaintextCount > 0 ? plaintextCount : findings?.length ?? 0 },
               )}
             </div>
 
@@ -156,6 +159,9 @@ export function CredentialHygienePanel({
               </div>
             )}
 
+            {plaintextCount > 0 && manualOnly.length === 0 && <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'security.credentialHygiene.manualHint' })}
+            </p>}
             {manualOnly.length > 0 && (
               <div className="space-y-2">
                 <p className="text-xs font-medium text-muted-foreground">

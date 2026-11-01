@@ -317,7 +317,10 @@ fn persist(state_dir: &Path, state: &WorkingState) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let path = state_file(state_dir);
     let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(state)
+    let mut masked = serde_json::to_value(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    duduclaw_security::credential_detect::mask_json(&mut masked);
+    let json = serde_json::to_string_pretty(&masked)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)
@@ -327,7 +330,9 @@ fn persist(state_dir: &Path, state: &WorkingState) -> std::io::Result<()> {
 /// failure never fails the mutation that already persisted.
 fn append_history(state_dir: &Path, record: &serde_json::Value) {
     let path = history_file(state_dir);
-    let line = record.to_string();
+    let mut masked = record.clone();
+    duduclaw_security::credential_detect::mask_json(&mut masked);
+    let line = masked.to_string();
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -856,6 +861,17 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[test]
+    fn state_and_history_mask_at_persistence() {
+        let home = mk_home("worker");
+        set_entry(home.path(), "worker", "status", "password: fixture-state", "token: fixture-reason", None, None).unwrap();
+        let stored = read_full(home.path(), "worker", 10).unwrap().to_string();
+        assert!(!stored.contains("fixture-state"));
+        assert!(!stored.contains("fixture-reason"));
+    }
+
 
     fn mk_home(agent: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

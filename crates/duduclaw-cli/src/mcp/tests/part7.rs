@@ -98,11 +98,11 @@ async fn a_system_sender_name_is_refused_as_a_principal() {
     let params = serde_json::json!({ "agent_id": "worker", "prompt": "x" });
     let result = send_to_agent_with_ctx(&params, home, "main", ctx()).await;
     assert!(result.get("isError").is_none(), "{result}");
-    assert_eq!(
-        queued_principal(home),
-        vec![None],
-        "a rejected value is never written"
-    );
+    use duduclaw_gateway::on_behalf_of::PrincipalState;
+    let carried = queued_principal(home);
+    assert_eq!(carried, vec![PrincipalState::Unknown.to_wire()], "a rejected principal stays unknown, never background work");
+    assert_eq!(PrincipalState::from_wire(carried[0].as_deref()), PrincipalState::Unknown);
+    assert_eq!(duduclaw_core::host_principal_checked().unwrap_err().reason, "system_sender");
     assert!(duduclaw_core::host_principal().is_none());
 }
 

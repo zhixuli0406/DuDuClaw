@@ -63,14 +63,21 @@ pub(super) fn should_autodetect_anthropic_oauth(loaded: &[Account]) -> bool {
 /// the scrub intends — credentials travel as data, not as ambient state.
 pub(super) fn detect_default_oauth_session() -> Option<Account> {
     let claude = duduclaw_core::which_claude()?;
-    let claude_dir = dirs::home_dir()?.join(".claude");
+    let host_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty());
+    let claude_dir = host_config_dir.as_ref().map(|dir| PathBuf::from(dir.as_os_str()))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))?;
     // Captured before the probe so a token-derived session is never mistaken
     // for a keychain one.
     let env_token = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty());
 
-    let output = duduclaw_core::platform::command_for(&claude)
+    let mut cmd = oauth_status_command(&claude);
+    if let Some(dir) = &host_config_dir { cmd.env("CLAUDE_CONFIG_DIR", dir); }
+    if let Some(token) = &env_token {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+    }
+    let output = cmd
         .args(["auth", "status"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -135,6 +142,33 @@ pub(super) fn detect_default_oauth_session() -> Option<Account> {
         next_probe_at: None,
         probe_failures: 0,
     })
+}
+
+/// Start from the shared allowlist; callers add only the selected account's auth.
+pub(super) fn oauth_status_command(binary: &str) -> std::process::Command {
+    let mut cmd = duduclaw_core::platform::command_for(binary);
+    duduclaw_core::spawn_env::apply_agent_cli_env_allowlist_std(&mut cmd);
+    cmd
+}
+
+#[cfg(test)]
+mod oauth_status_env_tests {
+    use super::*;
+
+    #[test]
+    fn status_probe_scrubs_ambient_secrets_and_keeps_explicit_account_auth() {
+        let mut cmd = duduclaw_core::platform::command_for("fixture-never-spawned");
+        cmd.env("CLAUDE_CODE_MESSAGING_TOKEN", "fixture-messaging");
+        cmd.env("ANTHROPIC_API_KEY", "fixture-unrelated-key");
+        duduclaw_core::spawn_env::apply_agent_cli_env_allowlist_std(&mut cmd);
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "fixture-selected-token");
+        cmd.env("CLAUDE_CONFIG_DIR", "/fixture/selected-profile");
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert!(!env.contains_key(std::ffi::OsStr::new("CLAUDE_CODE_MESSAGING_TOKEN")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("ANTHROPIC_API_KEY")));
+        assert_eq!(env[std::ffi::OsStr::new("CLAUDE_CODE_OAUTH_TOKEN")], Some(std::ffi::OsStr::new("fixture-selected-token")));
+        assert_eq!(env[std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")], Some(std::ffi::OsStr::new("/fixture/selected-profile")));
+    }
 }
 
 /// Resolve OAuth credentials directory for a named profile.

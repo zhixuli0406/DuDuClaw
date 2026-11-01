@@ -5,6 +5,7 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { DevPanelNotificationsTab } from './DevPanelNotificationsTab';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
 
 function LocationProbe() {
   const location = useLocation();
@@ -33,6 +34,7 @@ function mockRpc(overrides: Partial<Record<string, unknown>> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useAgentsStore.setState({ agents: [] });
   useConnectionStore.setState({ state: 'authenticated' as never, error: null } as never);
   mockRpc();
 });
@@ -84,6 +86,7 @@ describe('DevPanelNotificationsTab — channel failures list', () => {
   });
 
   it('renders console_url / doc_url as real links, and lets the agent id navigate', async () => {
+    useAgentsStore.setState({ agents: [{ name: 'nova', display_name: 'Nova Worker' }] as never });
     mockRpc({
       'audit.unified_log': {
         events: [
@@ -124,7 +127,7 @@ describe('DevPanelNotificationsTab — channel failures list', () => {
       'https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/features/zh-TW/07-account-rotation.md',
     );
 
-    fireEvent.click(screen.getByText('nova'));
+    fireEvent.click(screen.getByText('Nova Worker'));
     await waitFor(() =>
       expect(screen.getByTestId('location-probe')).toHaveTextContent('/agents/nova'),
     );

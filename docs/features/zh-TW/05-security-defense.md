@@ -6,6 +6,16 @@
 
 ---
 
+## 機器操作與下指令的人
+
+給 AI 員工 Bash 或機器操作工具，就代表綁定這位員工的人可以指揮它使用這些工具。請只綁定應該有這份權限的人。管理員授予一般 AI 員工的原生工具仍可照常使用。
+
+使用 `system-operator` 預設組的員工只供管理員使用。伺服器依解析後的預設組綁定識別，不採信客戶端旗標。非管理員不能綁定、聊天、建立交辦任務或目標，也不能以自己的身分派工給這位員工；`agents.callable` 不會列出它。既有綁定不刪除，但使用時會拒絕。非管理員即使保留 `system-operator` 員工的舊綁定或團隊授權，也讀不到它的對話紀錄、任務、記憶、檔案、自有知識集合與匯出，也收不到即時更新、執行步驟或審批卡片；綁定紀錄保留。非管理員先前建立的交辦排程不再為這位員工建立任務或目標，觸發時自動暫停，恢復時會拒絕。外送審批卡片（CLI 內建工具與 MCP 工具都算）僅供管理員查看，主管不再看到遮罩後的卡片。通道與 Mini App 僅顯示純文字通知，不再顯示外送審批卡片、摘要或操作按鈕。管理員與已授權的無人值守工作維持原有行為。Personal 只有在帳號資料庫不存在、沒有帳號，或僅有一個已完成首次密碼變更的啟用中 Admin 帳號時才適用單一擁有者豁免；停權與離職帳號也計入總數。多帳號部署即使因付費授權到期而回到 Personal，仍須有效管理員身分；帳號資料庫無法讀取時也一樣。
+
+工作的委託人分為 Human、Background、Unknown 三種狀態。已儲存但無法解析的委託人是 Unknown，不能授權機器操作工具；舊資料完全沒有委託人時仍是 Background，既有 cron 排程與自主工作可繼續執行。
+
+每次讀取有效品牌時都會重查授權期限與離線寬限。授權過期或超過離線寬限就顯示原本的 DuDuClaw 品牌，即使主控台持續連不上、閘道尚未重新啟動也一樣。
+
 ## 歷史說明
 
 2026-09 之前，本頁描述的是一套三階段 shell 腳本防禦：確定性黑名單、混淆／外洩掃描器、Haiku AI 判讀，全部放在 `.claude/hooks/`，由 GREEN／YELLOW／RED 威脅等級狀態機協調。
@@ -22,7 +32,7 @@
 
 Grok 員工的這兩個守門來自另一個檔案。DuDuClaw 啟動 Grok 時會關掉 Grok 的 Claude 相容 hook 讀取（作業系統使用者自己 `~/.claude/settings.json` 的 hook 因此不會在員工的回合裡執行），Grok 也就不再讀 `<agent_dir>/.claude/settings.json`。所以每次啟動 Grok 前，gateway 會把 `agent-file-guard` 與 `data-file-guard` 兩個條目原樣寫進 Grok 的專案 hook 目錄 `<cwd>/.grok/hooks/duduclaw-guards-<員工>.json`；Grok 會把 matcher 裡的 Claude 工具名稱對應到自己的工具，並以 Claude 的 `tool_name`／`tool_input` 欄位把輸入交給 hook。每位員工各一個檔，共用借用工作目錄的團隊成員不會互相蓋掉身分；每位成員都會載入那裡所有的檔，任何一個拒絕就擋下。有員工目錄而檔案寫不進去的那次啟動會被拒絕。在員工自己的目錄裡，`.grok/` 屬於凍結的 runtime 設定目錄，員工改不了；員工目錄之外借用的工作目錄沒有凍結，員工若在那裡有寫入權限，可以自己加 hook 檔。
 
-安裝的指令帶著 agent id（`--agent`），v1.68.1 之後的版本也帶著 DuDuClaw 資料目錄（`--home "<路徑>"`）。Gateway 啟動員工的 CLI 時會清空環境變數，白名單裡沒有 `DUDUCLAW_HOME`，所以先前 hook 一律退回 `$HOME/.duduclaw` 判斷；資料目錄不在預設位置的部署，真正資料目錄裡的每個路徑都被當成「資料目錄之外」。安裝器對每個 `<資料目錄>/agents/<id>`（或 `<資料目錄>/agents/.ephemeral/<id>`）形式的員工目錄都寫入 `--home`，路徑含 shell 特殊字元時改用單引號包起來。既有的安裝會在下一次啟動員工或 gateway 開機時就地改寫。
+安裝的指令帶著 agent id（`--agent`），v1.68.1 之後的版本也帶著 DuDuClaw 資料目錄（`--home "<路徑>"`）。Claude CLI 的環境變數沒有 `DUDUCLAW_HOME`，所以先前 hook 一律退回 `$HOME/.duduclaw` 判斷；資料目錄不在預設位置的部署，真正資料目錄裡的每個路徑都被當成「資料目錄之外」。安裝器對每個 `<資料目錄>/agents/<id>`（或 `<資料目錄>/agents/.ephemeral/<id>`）形式的員工目錄都寫入 `--home`，路徑含 shell 特殊字元時改用單引號包起來。既有的安裝會在下一次啟動員工或 gateway 開機時就地改寫。
 
 Hook 依序從這些地方取得資料目錄：`--home`（只認絕對路徑）；沒有員工身分的呼叫者（hook 指令沒帶 `--agent`、環境裡也沒有 `DUDUCLAW_AGENT_ID`）照舊用預設位置；hook 環境裡明確設定的絕對路徑 `DUDUCLAW_HOME`。不會從工作目錄推回資料目錄。全部都推不出來時，該員工的每一次 `Write`／`Edit`／`MultiEdit`／`NotebookEdit`／`Bash` 呼叫都拒絕，不會拿猜測的位置判斷。`NotebookEdit` 也在同一次加入 matcher，它的 `notebook_path` 比照 `Write` 的目標判斷。Hook 子命令只在 stderr 回覆，不再寫日誌檔。
 
@@ -64,7 +74,7 @@ Live fork（`fork_run`）從另一側守住同一批檔案：分支可以讀 age
 
 除非 gateway 在 spawn 時設 `DUDUCLAW_DATA_FILE_GUARD`，否則它完全不作用；而 gateway 只在該 agent 的去識別化真的生效時才會設。去識別化關閉的部署，行為與這道守衛存在之前逐位相同。
 
-H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard.sh` 的 POSIX shell 腳本，而且在 `PATH` 上沒有 bash 的 Windows 主機上**完全不作用**——hook 指令執行失敗，而 Claude Code 把非 2 的結束碼（包含「command not found」）當成*放行*，守門就在最沒人會發現的地方消失。安裝器現在會在升級時刪掉殘留的舊腳本，避免有人把它誤認成現役守衛。
+舊版中，這是放在 `<agent_dir>/.claude/hooks/data-file-guard.sh` 的 POSIX shell 腳本，而且在 `PATH` 上沒有 bash 的 Windows 主機上**完全不作用**。Hook 指令執行失敗，而 Claude Code 把非 2 的結束碼（包含「command not found」）當成*放行*，守門就在最沒人會發現的地方消失。安裝器現在會在升級時刪掉殘留的舊腳本，避免有人把它誤認成現役守衛。
 
 **明講限制**：`Bash` 那道檢查比對的是檔名。動態組路徑的指令（`python -c "open(chr(99)+…)"`）照樣走得過去。真正的保護是 MCP 工具面，這道守衛只是降低模型走上未設防路徑的機率。它是啟發式，不是沙箱。
 
@@ -97,7 +107,7 @@ H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard
 
 **已知誤判。** 這條規則看句型比對，所以一般句子只要在同一個短子句裡有覆寫動詞、範圍詞和指示類名詞，也會被擋，例如「請忽略之前寄的指示，以新版為準」「請忽略以上規則中的第三條，已經取消」「忘記之前的規則了，可以再說一次嗎」（測試 `known_benign_shapes_that_do_match` 固定了這個行為）。提到「越獄模式」也會被擋。解法是不用覆寫動詞換個說法，例如「之前的指示作廢，以新版為準」；相近的「之前的報價單請作廢，以新的指示為準」在「不可比對」的測試清單裡。這個掃描器是片語規則，不是分類模型，也沒有用真實對話資料量測過。
 
-`termination_manipulation`（LoopTrap，arXiv:2605.05846）刻意不設成單條即擋：權重 30 低於門檻，單次命中只警告並留稽核，不阻斷——這樣一般的「請繼續」不會被誤殺。
+`termination_manipulation`（LoopTrap，arXiv:2605.05846）刻意不設成單條即擋：權重 30 低於門檻，單次命中只警告並留稽核，不阻斷，避免一般的「請繼續」不會被誤殺。
 
 **句型家族（v1.68.0）。** 紅隊帳本量出四種針對 AI 員工的技法原本是零分。現在每一種都有一組英文與一組繁體中文的錨定正則：
 
@@ -122,17 +132,17 @@ H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard
 
 A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[agent] reports_to`／`department`／`name` 與 `config.toml` 的 `[delegation]`、`[acp]` 決定誰能命令誰。這兩個都是普通檔案：一個手上有 `Edit` 的 agent 可以把自己的 `reports_to` 改指向受害者，再宣稱「下屬 → 上級」那條規則。被審判的一方握有證據。
 
-`org_field_guard` 跑在同一個 `agent-file-guard` hook 裡，把重建出來的**寫入後內容**逐欄位與磁碟上的現況比對，受保護欄位或區段有變動就拒絕。`[capabilities]` 是**整張表**凍結而不是列一份鍵名清單——這樣未來版本新增的 capability 鍵，落地當天就受保護，而不是等誰想起來去補清單。
+`org_field_guard` 跑在同一個 `agent-file-guard` hook 裡，把重建出來的**寫入後內容**逐欄位與磁碟上的現況比對，受保護欄位或區段有變動就拒絕。`[capabilities]` 會凍結**整張表**，未來版本新增的 capability 鍵也會在加入時受保護。
 
 **員工自己的安全設定。** 對帶員工身分（或身分無法驗證）的呼叫者，它自己 `agent.toml` 的其餘部分以允許清單凍結：只有可編輯的區段能改，其他區段一律受保護，日後版本新增的區段也預設受保護。可編輯的區段是 `[agent]`、`[model]`、`[prompt]`、`[heartbeat]`、`[proactive]`、`[research]`、`[goal_intent]`、`[memory]`、`[skills]`、`[sticker]`、`[cultural_context]`、`[preset]` 與 `[planner]`。這些區段裡，`[agent] role`、`[prompt] cli_bare_mode`（它會讓 Claude CLI 略過 hook）與 `[model] account_pool` 仍凍結，組織欄位 `[agent] reports_to`／`department`／`name` 也一樣；`[capabilities]` 整張表凍結。這份允許清單適用於所有帶員工身分的呼叫者，包括在員工目錄裡手動執行 `claude` 的操作者（見 Guard 1）；較早的組織欄位與 `[capabilities]` 規則照舊對所有呼叫者生效。操作者要改這些區段，請用儀表板，或直接用編輯器改。
 
-**員工自己的 `.mcp.json` 與 CLI 設定。** 帶員工身分（或身分無法驗證）的呼叫者，完全不能寫自己目錄裡任何一層的 `.mcp.json`（Write、Edit、MultiEdit、NotebookEdit；最上層那一個 Bash 規則本來就擋）。gateway 啟動 Claude CLI 時會帶這個檔，CLI 會把裡面列的每一個伺服器都啟動起來，所以只要多加一個指令是直譯器的項目，下一次啟動就能以管理者的系統身分執行任意指令，不需要 Bash 權限。所有已出貨的版本都有這個問題：以前員工可以自己新增「無關的」伺服器。現在新增 MCP 伺服器要走儀表板、在儀表板提出的 MCP 安裝申請（`mcp.install_request`，管理者核准後自動安裝）、expert pack，或由管理者直接編輯，這些都不經過 hook。同樣的呼叫者也不能寫自己目錄裡的 CLI 設定：任何一層的 `.claude/` 底下（設定、hook、自訂斜線指令、子代理、skill）與名為 `.claude.json` 的檔案，以及最上層的 Codex、Grok 設定目錄（`.codex/`、`.gemini/`、`.grok/`、`.agents/`），以及 `.cursor/`（Grok 會自己讀工作目錄的 `.cursor/mcp.json`，2026-10-20 起）。檔名比對不分大小寫。行為變更：複製到員工目錄裡的專案也是 CLI 會啟動的地方，所以員工可以讀那個專案的 `.claude/`，但不能寫。管理者維持舊規則（`.mcp.json` 只凍結身分鍵）。gateway 也會在每次把員工的 `.mcp.json` 交給 Claude CLI 之前（通道回覆、派工、heartbeat 主動檢查、`duduclaw eval` 的 live 模式、live fork 複製分支之前的上層目錄）與開機時，整筆重新產生 DuDuClaw 項目（指令、參數、環境變數），其他項目原樣保留；檔案無法確認（不是一般檔、讀不到、不是合法 JSON，或 duduclaw 執行檔路徑不是絕對路徑）時這次不啟動，並寫一筆稽核（`mcp_config_unverified`）。這種拒絕是檔案的問題，不是帳號的問題：帳號不會因此進入冷卻，也不會換下一個帳號重試，通道回覆不會改由本地模型或 Direct API 代答，使用者看到的是說明哪位員工設定無法確認的訊息。所有寫 `.mcp.json` 的程式共用的鎖放在 `<home>/locks/`，不在員工目錄裡，員工在那裡建立的檔案或目錄擋不住它。升級前就加入的項目會保留：`duduclaw doctor` 會列出每一個不是 DuDuClaw 寫入的項目（只顯示名稱與指令的檔名，不顯示參數、環境變數或網址），讓管理者逐一確認或移除。把 live fork 分支採用回員工目錄時，不會帶回 `.claude.json`、`.agents/`、`.codex/`、`.gemini/`、`.grok/`、`.cursor/`，也不會帶回任何一層的 `.claude/`、`.claude.json`、`.mcp.json`。限制：這是 hook，能任意執行 Bash 的員工仍可改檔；Codex 另有下述控制檔鎖，與這個 hook 分開。Grok、其他 CLI runtime 與 Windows 不在該鎖的涵蓋範圍。未以真實 CLI 驗證：Claude Code 會不會讀員工目錄裡的 `.claude.json`（反正已一併凍結）。
+**員工自己的 `.mcp.json` 與 CLI 設定。** 帶員工身分（或身分無法驗證）的呼叫者，完全不能寫自己目錄裡任何一層的 `.mcp.json`（Write、Edit、MultiEdit、NotebookEdit；最上層那一個 Bash 規則本來就擋）。gateway 啟動 Claude CLI 時會帶這個檔，CLI 會把裡面列的每一個伺服器都啟動起來，所以只要多加一個指令是直譯器的項目，下一次啟動就能以管理者的系統身分執行任意指令，不需要 Bash 權限。所有已出貨的版本都有這個問題：以前員工可以自己新增「無關的」伺服器。現在新增 MCP 伺服器要走儀表板、在儀表板提出的 MCP 安裝申請（`mcp.install_request`，管理者核准後自動安裝）、expert pack，或由管理者直接編輯，這些都不經過 hook。同樣的呼叫者也不能寫自己目錄裡的 CLI 設定：任何一層的 `.claude/` 底下（設定、hook、自訂斜線指令、子代理、skill）與名為 `.claude.json` 的檔案，以及最上層的 Codex、Grok 設定目錄（`.codex/`、`.gemini/`、`.grok/`、`.agents/`），以及 `.cursor/`（Grok 會自己讀工作目錄的 `.cursor/mcp.json`，2026-10-20 起）。檔名比對不分大小寫。行為變更：複製到員工目錄裡的專案也是 CLI 會啟動的地方，所以員工可以讀那個專案的 `.claude/`，但不能寫。管理者維持舊規則（`.mcp.json` 只凍結身分鍵）。gateway 也會在每次把員工的 `.mcp.json` 交給 Claude CLI 之前（通道回覆、派工、heartbeat 主動檢查、`duduclaw eval` 的 live 模式、live fork 複製分支之前的上層目錄）與開機時，整筆重新產生 DuDuClaw 項目（指令、參數、環境變數），其他項目原樣保留；檔案無法確認（不是一般檔、讀不到、不是合法 JSON，或 duduclaw 執行檔路徑不是絕對路徑）時這次不啟動，並寫一筆稽核（`mcp_config_unverified`）。這種拒絕是檔案的問題，不是帳號的問題：帳號不會因此進入冷卻，也不會換下一個帳號重試，通道回覆不會改由本地模型或 Direct API 代答，使用者看到的是說明哪位員工設定無法確認的訊息。所有寫 `.mcp.json` 的程式共用的鎖放在 `<home>/locks/`，不在員工目錄裡，員工在那裡建立的檔案或目錄擋不住它。升級前就加入的項目會保留：`duduclaw doctor` 會列出每一個不是 DuDuClaw 寫入的項目（只顯示名稱與指令的檔名，不顯示參數、環境變數或網址），讓管理者逐一確認或移除。把 live fork 分支採用回員工目錄時，不會帶回 `.claude.json`、`.agents/`、`.codex/`、`.gemini/`、`.grok/`、`.cursor/`，也不會帶回任何一層的 `.claude/`、`.claude.json`、`.mcp.json`。限制：這是 hook，能任意執行 Bash 的員工仍可改檔；Codex 另有下述控制檔鎖，與這個 hook 分開。Grok、其他 CLI runtime 與 Windows 不在該鎖的涵蓋範圍。Claude Code 可能會讀取員工目錄裡的 `.claude.json`，該檔案禁止寫入。
 
 依建構方式 fail-closed：新內容無法解析、既有內容無法解析、寫入意圖無法重建，三者全部拒絕。既有的 `agent.toml`、`config.toml` 或 `.mcp.json` 讀不到時也拒絕（以前當成新檔放行）。檔案還不存在則放行，因為建立走的是 `create_agent`，那裡有自己的閘。
 
 合法變更的既有路徑全部保留：MCP `agent_update` 工具與儀表板 `agents.update` RPC，兩者都不經過這個 hook。
 
-**Codex 員工控制檔（Unix、WorkspaceWrite）。** 一般員工執行時，除了既有沙箱模式，還會套用 `duduclaw-employee` 權限 profile，將員工目錄最上層的 `agent.toml`、`SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、`.mcp.json`、`.codex/`、`.grok/`、`.claude/`、`.agents/` 設為唯讀，尚未存在的路徑也不能建立。保護項目使用員工目錄的絕對路徑，工作根目錄被覆寫時仍有效。`MEMORY.md`、`CLAUDE.md`、一般工作檔與暫存檔維持可寫。需要 Codex CLI 0.164.0 以上；版本過舊、無法確認版本或缺少員工目錄時，拒絕啟動。版本探測以執行檔路徑快取。版本過舊或無法確認時，儀表板向 Admin 顯示一鍵更新提示；透過此按鈕更新後會清除支援快取並重新探測，不必重啟 gateway。若優先找到的仍是舊執行檔，會顯示其路徑，不會報成成功。設定仍可透過 `agent_update` 與儀表板修改。ReadOnly、明確授予的 FullAccess、探索與輔助路徑維持原有參數。這項控制檔鎖不涵蓋 Grok、其他 CLI runtime 與 Windows（未驗證）；其他 CLI runtime 除非開啟 `native_sandbox`，否則沒有 OS 沙箱。權限 profile 已在 macOS、Codex CLI 0.164.0 實測，原生 Linux 驗收尚未執行。
+**Codex 員工控制檔（Unix、WorkspaceWrite）。** 一般員工執行時，除了既有沙箱模式，還會套用 `duduclaw-employee` 權限 profile，將員工目錄最上層的 `agent.toml`、`SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、`.mcp.json`、`.codex/`、`.grok/`、`.claude/`、`.agents/` 設為唯讀，尚未存在的路徑也不能建立。保護項目使用員工目錄的絕對路徑，工作根目錄被覆寫時仍有效。`MEMORY.md`、`CLAUDE.md`、一般工作檔與暫存檔維持可寫。需要 Codex CLI 0.164.0 以上；版本過舊、無法確認版本或缺少員工目錄時，拒絕啟動。版本探測以執行檔路徑快取。版本過舊或無法確認時，儀表板向 Admin 顯示一鍵更新提示；透過此按鈕更新後會清除支援快取並重新探測，不必重啟 gateway。若優先找到的仍是舊執行檔，會顯示其路徑，不會報成成功。設定仍可透過 `agent_update` 與儀表板修改。ReadOnly、明確授予的 FullAccess、探索與輔助路徑維持原有參數。這項控制檔鎖不涵蓋 Grok、其他 CLI runtime 與 Windows（未驗證）；其他 CLI runtime 除非開啟 `native_sandbox`，否則沒有 OS 沙箱。
 
 ---
 
@@ -187,15 +197,15 @@ action_rules = [
 
 **受限輔助執行。** Claude 輔助呼叫使用 CLI 可用憑證，不進入帳號輪替；一般對話維持輪替。Claude 停用工具，OpenAI 相容 API 只送一次不帶工具的請求。Codex 輔助呼叫使用 `--sandbox read-only`、`--ignore-user-config`（認證仍使用 `CODEX_HOME`）、`--ephemeral`、`--ignore-rules`（只略過 execpolicy `.rules`）、`--skip-git-repo-check` 及 `-c approval_policy=never`。不注入平台 MCP 設定，每次在新建、只有擁有者能存取的空白暫存目錄執行，成功、錯誤與逾時後均刪除。系統提示放進 prompt，從不寫入 `AGENTS.md`。行程只接收 spawn-env 允許清單及 Codex 認證必要資訊，不帶員工 token；員工開啟原生 OS 沙箱時，也以暫存目錄和唯讀權限套用。明確指定 Codex 的 judge 與 verifier 使用同一模式。Grok 與通用 CLI 員工改用支援的全域輔助模式；不支援的全域後端或明確指定會被拒絕。
 
-輔助與其他內部 runtime 呼叫拒收逾時的部分輸出，提前輸出的 `PASS` 不會成為評審結果；只有頻道回覆可顯示已完成的部分文字。Claude 輔助行程套用共用環境白名單及既有 Anthropic 憑證查詢，不繼承其他廠商金鑰或平台員工／MCP token。Windows 受管理 CLI 在暫停的子行程繼續執行前加入 Job Object，主行程退出後仍保有整樹清理能力；Windows 原生執行尚未驗證。
+輔助與其他內部 runtime 呼叫拒收逾時的部分輸出，提前輸出的 `PASS` 不會成為評審結果；只有頻道回覆可顯示已完成的部分文字。Claude 輔助行程套用共用環境白名單及既有 Anthropic 憑證查詢，不繼承其他廠商金鑰或平台員工／MCP token。Windows 受管理 CLI 在暫停的子行程繼續執行前加入 Job Object，主行程退出後仍保有整樹清理能力；Windows 原生執行行為沒有保證。
 
-**Codex 剩餘風險。** 此模式不能證明所有內建工具都已移除。內建讀取工具可能仍存在，因此遭提示注入的輔助呼叫可能讀取 OS 使用者有權讀取的本機檔案，並將內容寫進輸出。Codex 原始碼的唯讀政策停用工具指令網路；供應商模型請求另計，原生 OS 強制效果尚未實機驗證。`--ignore-user-config` 略過使用者設定，空白工作目錄避開員工專案設定，但系統或組織管理設定仍可能載入 MCP server，尚不能保證排除。CLI help 與原始碼查核不等於原生平台或客戶驗收。 查證來源: [tool registry](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/tools/spec_plan.rs#L1425-L1428), [read-only network policy](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/protocol/src/protocol.rs#L1315-L1319), [system config loader](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/config/src/loader/mod.rs#L274-L293).
+**Codex 剩餘風險。** 此模式不能證明所有內建工具都已移除。內建讀取工具可能仍存在，因此遭提示注入的輔助呼叫可能讀取 OS 使用者有權讀取的本機檔案，並將內容寫進輸出。Codex 原始碼的唯讀政策停用工具指令網路；供應商模型請求另計，原生 OS 強制效果沒有保證。`--ignore-user-config` 略過使用者設定，空白工作目錄避開員工專案設定，但系統或組織管理設定仍可能載入 MCP server，尚不能保證排除。 查證來源: [tool registry](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/tools/spec_plan.rs#L1425-L1428), [read-only network policy](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/protocol/src/protocol.rs#L1315-L1319), [system config loader](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/config/src/loader/mod.rs#L274-L293).
 
 **動作審查。** `config.toml [action_review] mode = "off" | "shadow" | "enforce"`，預設 `off`，每次呼叫都重讀（`system.update_config` 接受 `action_review.mode`，變更記為受保護鍵）。只在所有靜態閘門都判定可自動執行、且工具有副作用時才審查。審查者是 utility 模型，透過封閉選項的 `decide()`（`duduclaw-gateway/src/decide.rs`）：回覆必須剛好是 `{"choice":"allow"|"ask"|"block"}` 並符合嚴格 JSON 契約，其他一律視為沒有判定。輸入只有結構化資料：工具名稱、類型、參數的鍵（不像識別字的鍵只計數）、ActionGuard 的封閉 finding token，以及員工 `CONTRACT.toml` 的 `must_not`。參數值不會進入提示。`shadow` 不改變結果，只在 `tool_calls.jsonl` 寫一列，`action_review` 欄位是判定或 `unavailable`。`enforce` 遇到 `block` 拒絕，遇到 `ask` 或沒有判定時透過 ApprovalBroker 問人。不認得的 mode 值，或 `config.toml` 存在但讀不到、無法解析時，視為 `enforce`。2026-10-08 收尾起，審查也會對 OS 動作工具（情境分類器放行之後）、`skill_hub_install`（在它安全掃描後的安裝核准之前），以及 gateway 電腦操作路由中沒有被任何核准清單送去問人的 `computer_*`、`computer_workspace_*` 工具執行；其餘不變（只有結構化輸入、`shadow` 只記錄、`enforce` 遇到 `block` 拒絕，其他問人）。有一個 dispatcher 測試以固定的審查回答（block、ask 後核准、ask 後拒絕、沒有判定）對真實的行程內核准資料庫跑完整流程。
 
 **第三方 MCP 工具（2026-10-08）。** 員工其他 MCP 伺服器的工具，在 DuDuClaw 位於其路徑上的地方分類：`duduclaw mcp-proxy`（`.mcp.json` 啟動的伺服器）與 `duduclaw mcp-remote-bridge`（遠端伺服器），兩者都經 `duduclaw-gateway/src/third_party_tools.rs`。類型取自伺服器 `tools/list` 中的 `annotations`：`destructiveHint: true` ⇒ `delete`；`readOnlyHint: true` 只有在伺服器列入 `[capabilities] trusted_read_hint_servers` 時才是 `read`，否則 `modify`；其他情況（包括沒有標記）⇒ `modify`。伺服器可以對自己的工具任意宣稱，所以唯讀宣稱只依管理員逐一指定的伺服器採信：若採信，說謊伺服器的刪除工具會通過所有 `read` 規則與探索通道；若不採信，未列入伺服器中真正唯讀的工具會被當成修改。`action_rules` 與 DuDuClaw 自己的工具同樣適用（工具規則寫 `<伺服器>.<工具>`、`mcp__<伺服器>__<工具>` 或 `<伺服器>.*`）：`block` 會從員工看到的清單隱藏該工具，呼叫在送到伺服器前以 `-32003` 回覆（稽核 `third_party_tool_refused`）；`ask` 讓呼叫等待 ApprovalBroker 決定，核准系統無法使用、請求失敗、被拒或逾時都會拒絕（稽核 `third_party_tool_approval`）。探索通道中只列出、只能呼叫 `read` 工具。啟動時的改寫在遮蔽啟用、員工有 `action_rules` 鍵、或處於探索通道（心跳主動檢查與 MCP Events 啟動的工作）時，讓 stdio 伺服器經過 proxy；遠端伺服器一律經過橋接，由橋接自行管制。只有 Claude CLI 會啟動 `.mcp.json` 的伺服器，所以只牽涉它；CLI 直接連線的 `url`／`type` 項目不涵蓋。儀表板（`mcp.tool_effects`）依目前設定重新計算，顯示每個伺服器最近一次列出的工具與類型、決定。說明：`docs/guides/mcp-ecosystem.md` 第 4 節。
 
-**未涵蓋與未驗證。** 其他 MCP server 的工具只經 proxy 與橋接分類（見上）。內建工具的規則只在以 DuDuClaw 工具旗標啟動 Claude CLI 的地方生效；其他 runtime 沒有 Claude Code 內建工具。分類以工具名稱為準，所以效果隨參數改變的工具一律取較嚴格的類型。這幾層都還沒在真的 gateway 與真的模型上跑過，目前只有單元測試與 dispatcher 層級的測試。
+**涵蓋範圍。** 其他 MCP server 的工具只經 proxy 與橋接分類（見上）。內建工具的規則只在以 DuDuClaw 工具旗標啟動 Claude CLI 的地方生效；其他 runtime 沒有 Claude Code 內建工具。分類以工具名稱為準，所以效果隨參數改變的工具一律取較嚴格的類型。這幾層都還沒在真的 gateway 與真的模型上跑過，目前只有單元測試與 dispatcher 層級的測試。
 
 ## 員工動作的單次核准（ActionGrant）
 
@@ -222,7 +232,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 ## 工作替誰做（`on_behalf_of`，v1.76.0）
 
-由真人發起的工作（一輪對話、`/交辦`、dashboard 建的任務），gateway 現在會把「這是替誰做的」一路帶下去：員工的 runtime 會拿到 `DUDUCLAW_ON_BEHALF_OF`（所有 runtime，不只 Claude）；`send_to_agent`／`spawn_agent` 把它寫進佇列（`message_queue.on_behalf_of`、`bus_queue.jsonl` 欄位），派工器再套到接手的那一輪；目標任務的每一輪與 heartbeat 喚醒從任務列（`tasks.on_behalf_of`）抄過來；`tasks_create` 建的新任務會記上；這一輪提出的核可也會存（`approvals.on_behalf_of`）。值是 `user:<帳號 id>`（WebChat 帳號或已驗證的通道身分），或 `unmapped:<通道>:<摘要>`（沒有帳號的發話者，用的是 `@` 路由稽核同一把金鑰的 HMAC，不會出現平台原始 id）。來源只有 gateway 寫的東西：spawn 時設定的環境變數，以及 gateway 或 MCP server（依該環境變數）寫的資料列，絕不讀工具參數。系統發送者名稱（`dashboard`、`cron` 等）、保留 id、格式不對的值一律拒收，並記為 `on_behalf_of_rejected`；第一個寫入的值為準，下游不覆寫。gateway 自己的環境變數不會傳下去：spawn 白名單不含這個變數，各 runtime 在設定本輪的值之前會先移除繼承來的值。
+由真人發起的工作（一輪對話、`/交辦`、dashboard 建的任務），gateway 現在會把「這是替誰做的」一路帶下去：員工的 runtime 會拿到 `DUDUCLAW_ON_BEHALF_OF`（所有 runtime，不只 Claude）；`send_to_agent`／`spawn_agent` 把它寫進佇列（`message_queue.on_behalf_of`、`bus_queue.jsonl` 欄位），派工器再套到接手的那一輪；目標任務的每一輪與 heartbeat 喚醒從任務列（`tasks.on_behalf_of`）抄過來；`tasks_create` 建的新任務會記上；這一輪提出的核可也會存（`approvals.on_behalf_of`）。值是 `user:<帳號 id>`（WebChat 帳號或已驗證的通道身分），或 `unmapped:<通道>:<摘要>`（沒有帳號的發話者，用的是 `@` 路由稽核同一把金鑰的 HMAC，不會出現平台原始 id）。來源只有 gateway 寫的東西：spawn 時設定的環境變數，以及 gateway 或 MCP server（依該環境變數）寫的資料列，絕不讀工具參數。系統發送者名稱（`dashboard`、`cron` 等）、保留 id、格式不對的值一律拒收，並記為 `on_behalf_of_rejected`；第一個寫入的值為準，下游不覆寫。各 runtime 設定本次執行的值之前，會先移除繼承來的值。
 
 這一版的作用：
 
@@ -235,11 +245,13 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 電腦操作 start／action 的核可，依已驗證的員工與 `turn_id`，從主機登記的進行中對話取出真人。請求參數不能指定真人，也不能借用另一位員工的對話。沒有或查不到 turn 時不記真人，因此無法在這些請求辨認自批者；沒有 turn 的工作區、截圖與停止請求也不記真人。
 
-真人檢查只會收窄員工權限。記錄模式仍依賴主機帶入的標記，不強制權限；強制模式下，單改真人環境變數不能改變 gateway context 登記的人。這不是作業系統隔離：同一個 OS 帳號下、有不受限 Bash 的員工，仍可能讀取程序憑證或改寫本機資料庫。用 `tasks_create` 建的排程，之後每次執行不會帶上這個人。`spawn_ephemeral` 及其延後准入佇列也還沒傳遞真人身分。Grok 與已棄用的 Gemini CLI 是否把 spawn 環境轉交 MCP 子程序，尚未驗證。
+真人檢查只會收窄員工權限。記錄模式仍依賴主機帶入的標記，不強制權限；強制模式下，單改真人環境變數不能改變 gateway context 登記的人。這不是作業系統隔離：同一個 OS 帳號下、有不受限 Bash 的員工，仍可能讀取程序憑證或改寫本機資料庫。用 `tasks_create` 建的排程，之後每次執行不會帶上這個人。`spawn_ephemeral` 及其延後准入佇列也還沒傳遞真人身分。Grok 與已棄用的 Gemini CLI 不保證會把 spawn 環境轉交給 MCP 子程序。
 
 本機已驗證：關閉 dashboard feature 的後端單元、整合與文件測試；原 dispatcher 回歸在預設堆疊通過；以及真實 stdio MCP 子程序呼叫簽名內部路由。native fixture 使用臨時測試 issuer 簽署的 license，涵蓋 Enterprise AND 條件、團隊 Manager 交辦、Viewer 只能呼叫、即時撤權／停權、明確背景 None 與缺少／跨員工／失效／不一致 context。這不代表正式 issuer、真模型呼叫 `send_to_agent` 或實機通道驗收；預設 dashboard feature 另由 CI 檢查。
 
 ## 支撐層
+
+**員工預算。** `[budget] daily_cap_cents` 與 `monthly_limit_cents` 分別比對最近 24 小時與 30 天的已記錄花費，`hard_stop = true` 時達上限就拒絕下一次模型呼叫；0 代表不限額，執行中的呼叫仍可能超過上限。檢查涵蓋 Claude 與其他員工後端、派工與排程、提醒、郵件、心跳、輔助工作及 CLI 分支／評測。短期員工的已記錄花費也算進父員工，先以千分之一美分加總，再換算美分。員工設定檔可讀時，`[budget] when_unavailable = "allow"`（未填時的預設值）會在費用資料庫或查詢讀不到時留下明確警告與稽核紀錄並繼續；設成 `"deny"` 則在模型呼叫前拒絕。設定檔本身讀不到或無法解析時，無法確認這項政策，一律拒絕。未知政策值按 `"deny"` 處理並警告。無法檢查會顯示自己的原因與稽核事件，不會說成「花費達上限」，也不會發出斷路器開關通知。預算拒絕不觸發帳號輪替或備援。沒有員工 id 的呼叫不適用此政策。 指定員工目錄的輔助呼叫，以有效設定的 `[agent].name` 檢查預算並記錄後續花費，即使呼叫端原本使用作業名稱。舊有只記在作業名稱下的費用，無法可靠回填到各員工。
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。
 
@@ -253,7 +265,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 **緊急停止門檻（v1.68.0）** — `KILLSWITCH.toml [triggers]` 的四個門檻以前沒有讀取端。現在只有寫在檔案裡且數值在範圍內的鍵才生效，安全設定頁每個門檻多了一個勾選框（取消勾選會送 `null`，把它移除）。檔案改動後會重讀。`cost_limit_usd` 比對所有員工 24 小時的花費，達到時把全域 failsafe 等級降為受限，直到 failsafe 自行恢復或有人送 `!RESUME`；`max_replies_per_minute` 依對話計算，超出的訊息靜默丟棄；`max_consecutive_errors` 與 `error_rate_threshold`（最近 20 次、至少 10 次）讓該對話的 failsafe 升一級。每次觸發記稽核 `killswitch_trigger`。`KILLSWITCH.toml` 的 `[audit]` 區段不再讀取。
 
-**回覆斷路器與分好幾則傳訊息的人（B10）** — 每個通道回覆前、依對話計算的斷路器（`KILLSWITCH.toml [circuit_breaker]`）以前在三種很平常的情況會靜默丟掉訊息：上一則回覆比最近幾則長很多之後的下一則訊息（`token_explosion_multiplier`，這是我們自己輸出的特性）、連續三則相似的訊息（例如等回覆時傳的「在嗎？」）、`frequency_window_secs` 內超過 `frequency_max_replies` 則訊息。斷路之後整個對話在 `cooldown_secs` 內都不回，failsafe 等級還會升一級，反覆斷路最後變成受限回覆或靜音。現在回覆過長只記紀錄；少於 20 個字的訊息不算重複；超過頻率上限的訊息會等到視窗有空位再回答；等了 30 秒仍沒有空位（大量灌訊息）的那則不回答，但仍會計數，發話者每分鐘最多收到一次說明。仍會斷路的有三種：完全照抄我們上一則回覆的訊息、連續三則長而幾乎相同的訊息，以及新增的硬上限：同一個對話在 `hard_window_secs`（預設 60 秒）內超過 `hard_max_messages`（預設 30）則，用來擋兩個機器人互傳短而不同的訊息。通道標示為機器人的發話者（Telegram `is_bot`）維持舊的嚴格規則，短時間窗超過頻率就斷路。原有設定的名稱與範圍不變。管理員可在安全設定頁的緊急停止卡（進階：斷路器門檻）修改這兩個新值；`killswitch.update` 改用共用的設定寫入流程寫 `KILLSWITCH.toml`（檔案鎖、讀取後檔案被改過或無法解析就拒絕、保留註解）。
+**回覆斷路器與分好幾則傳訊息的人** — 每個通道回覆前、依對話計算的斷路器（`KILLSWITCH.toml [circuit_breaker]`）以前在三種很平常的情況會靜默丟掉訊息：上一則回覆比最近幾則長很多之後的下一則訊息（`token_explosion_multiplier`，這是我們自己輸出的特性）、連續三則相似的訊息（例如等回覆時傳的「在嗎？」）、`frequency_window_secs` 內超過 `frequency_max_replies` 則訊息。斷路之後整個對話在 `cooldown_secs` 內都不回，failsafe 等級還會升一級，反覆斷路最後變成受限回覆或靜音。現在回覆過長只記紀錄；少於 20 個字的訊息不算重複；超過頻率上限的訊息會等到視窗有空位再回答；等了 30 秒仍沒有空位（大量灌訊息）的那則不回答，但仍會計數，發話者每分鐘最多收到一次說明。仍會斷路的有三種：完全照抄我們上一則回覆的訊息、連續三則長而幾乎相同的訊息，以及新增的硬上限：同一個對話在 `hard_window_secs`（預設 60 秒）內超過 `hard_max_messages`（預設 30）則，用來擋兩個機器人互傳短而不同的訊息。通道標示為機器人的發話者（Telegram `is_bot`）維持舊的嚴格規則，短時間窗超過頻率就斷路。原有設定的名稱與範圍不變。管理員可在安全設定頁的緊急停止卡（進階：斷路器門檻）修改這兩個新值；`killswitch.update` 改用共用的設定寫入流程寫 `KILLSWITCH.toml`（檔案鎖、讀取後檔案被改過或無法解析就拒絕、保留註解）。
 
 **去識別化的資料來源保護（v1.68.0）** — 「隱私 / 去識別化」分頁的「資料來源保護」開關開始生效：`user_input` 在通道訊息送進 AI 前遮蔽，`system_prompt` 遮蔽組好的提示（預設只套用標了 `apply_to_system_prompt` 的規則），`cron_context` 遮蔽條件腳本的觸發訊息。出錯時停止這一輪，不送出未遮蔽的內容。`sub_agent`（在同一個分頁或 `config.toml [redaction.sources]` 設定）負責受委派員工的回覆被 gateway 寫進委派方對話紀錄的那條路（`send_to_agent`、`spawn_agent`、`spawn_ephemeral` 的回覆，包含轉寫給發起整條委派鏈那位員工的副本）。設為 `on` 時，回覆先用接收方員工的規則遮蔽再存進紀錄，等那位員工回覆使用者時再還原。預設 `inherit` 照原樣寫入，因為子代理本來就在同一套 `[redaction]` 規則下執行。遮蔽出錯時改存一段固定的提示文字，不寫入原文。不涵蓋：送到使用者通道的那份回覆（那是使用者自己看的）、員工用 `check_responses` 自己去取的回覆（屬於工具結果，依 `tool_results` 處理）、團隊角色之間的交接、Agent Mail。`purge_after_expire_days` 現在決定保管庫清理的天數。
 
@@ -303,7 +315,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 ## 代表同事使用 Google 帳號（v1.76.0）
 
-公司授權代表（B2a）讓 AI 員工以一位指定同事的身分使用 Google。各道守門都在失敗時拒絕：
+公司授權代表讓 AI 員工以一位指定同事的身分使用 Google。各道守門都在失敗時拒絕：
 
 - **只認已證明的員工。** 身分只依 `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` 證明的員工決定，絕不看工具參數。宣稱某位員工卻證明不了的行程，只能用公司預設；宣稱的員工若設成其他身分，連預設也不給。
 - **只有 gateway 簽發。** MCP 伺服器向 `POST /api/internal/google-token` 要權杖（本機、簽章身分、一次性 nonce、限流，和知識庫路由同一套驗證）。gateway 自己讀員工的 `[google]`、用自己的登錄查這個 turn 是為誰做的，並且只在 `person_identity_gate()` 通過後（憑證保護達到最低等級；Linux 與 Docker 一律拒絕）才解開委派金鑰。權杖只留在 MCP 伺服器這個 turn 的記憶體裡。
@@ -312,7 +324,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 - **每次重讀人員狀態。** 同事的 DuDuClaw 帳號停權或離職後，下一次呼叫就拒絕。
 - **設定只有管理員能改。** `[google]` 對員工自己的 Write/Edit 是凍結的（員工檔案守衛），也是權限欄位：非管理員的擁有者只能改得更窄。
 
-限制：`gmail.compose` 讓拿到權杖的人能寄信；有不受限 shell 的員工可以拿自己那位同事的權杖直接呼叫 Google，而且和 gateway 是同一個作業系統帳號。這個版本對代表同事的員工會跳過外掛的 Google MCP 伺服器（`oauth://google`）。見[每位 AI 員工用不同的 Google 帳號](../../guides/zh-TW/google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
+限制：`gmail.compose` 讓拿到權杖的人能寄信；有不受限 shell 的員工可以拿自己那位同事的權杖直接呼叫 Google，而且和 gateway 是同一個作業系統帳號。HTTP Google MCP 掛載（`oauth://google`）會使用員工選定帳號，每次呼叫重查發問者權限；個人帳號的 stdio 掛載會拒絕。設定見[連接 Google](../../guides/zh-TW/google-setup.md)。見[每位 AI 員工用不同的 Google 帳號](../../guides/zh-TW/google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 
 ## 這些守衛擋不住什麼
 
@@ -326,9 +338,9 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 - **系統金鑰圈分不開員工與 gateway。** 兩者是同一個作業系統帳號。macOS 上保護金鑰擋得住其他程式讀取，擋不住被換掉；Windows 上同帳號的任何程式都讀得到。見[指定人的憑證放系統金鑰圈](#指定人的憑證放系統金鑰圈v1760)。
 - **這些 hook 與 Codex 控制檔鎖是分開的保護。** Unix Codex WorkspaceWrite 會套用上述權限 profile。Grok、其他 CLI runtime 與 Windows 不受該鎖保護；其他 CLI runtime 除非開啟 `native_sandbox`，否則沒有 OS 沙箱。
 - **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
-- **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）
+- **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（目前 Windows 也會以 Rust 子命令執行。）
 - **沒有威脅等級狀態機。** `~/.duduclaw/threat_level` 還在，作為 computer use 協調器會輪詢的操作者 kill switch（`RED` 中止、`YELLOW` 暫停），但工作區內已沒有任何東西會寫它。檔案不存在才視為 `GREEN`；檔案存在卻讀不到，或內容不是 `GREEN`／`YELLOW`／`RED` 其中之一，間隔 50 毫秒再讀兩次後仍是如此，就視為 `RED`（fail closed）；開頭的 UTF-8 BOM 與前後空白會略過。
-- *（2026-09 移除。）* 本節原本註明 PTY session pool 不在去識別化改寫的涵蓋範圍內。該連線池已不存在——每次 Claude spawn 都是單次 spawn，正好就是改寫掛鉤的地方。
+- *（2026-09 移除。）* 本節原本註明 PTY session pool 不在去識別化改寫的涵蓋範圍內。該連線池已不存在。每次 Claude spawn 都會使用單次 spawn，資料改寫 hook 會在這條路徑執行。
 
 ---
 
@@ -351,11 +363,41 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 ## 資料外送防護的重啟保護（v1.77.0）
 
-回合污點只存在記憶體；外送 lease 則先存入 `<home>/egress_leases.db`（SQLite WAL，Unix 0600）才授予呼叫端。Gateway 開放 loopback 路由前會復原，並在每次重啟後以單調時鐘重新保護同一員工所有回合的私人讀取完整六小時，不依 UTC 年齡或時鐘跳動縮短。舊回覆不能釋放復原的 lease。資料庫無法讀取時，`ask`／`block` 暫停所有員工的私人讀取與新外送，`shadow` 允許並稽核；每五秒重試、每分鐘最多記錄一次錯誤。新增失敗拒絕強制模式外送，刪除失敗保留保護。CLI 原生工具與跨輪資訊複製仍不在防護範圍，詳見[資料外送防護](69-egress-guard.md)。
+回合污點只存在記憶體；外送 lease 則先存入 `<home>/egress_leases.db`（SQLite WAL，Unix 0600）才授予呼叫端。Gateway 開放 loopback 路由前會復原，並在每次重啟後以單調時鐘重新保護同一員工所有回合的私人讀取完整六小時，不依 UTC 年齡或時鐘跳動縮短。舊回覆不能釋放復原的 lease。資料庫無法讀取時，`ask`／`block` 暫停所有員工的私人讀取與新外送，`shadow` 允許並稽核；每五秒重試、每分鐘最多記錄一次錯誤。新增失敗拒絕強制模式外送，刪除失敗保留保護。此處持久 lease 仍只涵蓋 MCP 呼叫；CLI 事前檢查見下方 說明，跨輪資訊複製不在範圍內，詳見[資料外送防護](69-egress-guard.md)。
 
 Store 在存續期間持有 `<home>/egress_leases.lock` 獨占檔案鎖（Unix 0600）。使用同一 home 的第二個 gateway 會拒絕讀取與新外送並重試，取得鎖後先恢復所有 lease 才接受讀取；`shadow` 仍允許並稽核。Gateway 執行中不可刪除鎖檔。重複的有效 lease ID 會在寫入前拒絕，不會連帶阻擋其他員工。
 
-## 雙因素登入（phase 1，尚未發版）
+
+## CLI 外送檢查
+
+Claude/Grok 網頁工具與 Bash 字面網路指令新增由 gateway 判定的審批 hook；Codex 強制模式在啟動時限制網路與搜尋。背景執行登錄 host 回合。安全頁列出有 Bash、使用 ask/block 且未啟用任務沙箱的員工。Bash 只提供減速帶與遙測：原生讀檔不標記污染、同 OS 使用者的改寫不受此機制隔離，事前檢查也不持有執行全程的 MCP lease。強制模式拒絕 Claude bare mode 與 Grok 共用工作目錄。通用 CLI 原生工具仍未涵蓋。模式表、單次核准重試與限制見[資料外送防護](69-egress-guard.md)。
+
+## 斷開連線的刪除審批與收據
+
+斷開連線後，記憶遺忘計畫合成一個七天有效的批次，只開一張限管理員在儀表板核准的卡片。卡片顯示逐員工筆數，不帶記憶內容。規劃失敗不影響已完成的斷開。`[memory] forget_source` 關閉、設定讀不到或值無效時，不建立新計畫，也不套用。
+
+回合帳本在既有污染來源旁記錄連線參照，不改變資料外送政策。通道與 Remote MCP 橋接的參照由 gateway 產生；MCP 伺服器內的原生工具則先宣告，再由 gateway 確認連線存在且已授權給通過驗證的員工。未知參照會丟棄並計數，不會存成連線標記。Google 個人憑證依實際選用的使用者記為 `google:person:<user_id>`。帳本讀不到時，記憶寫入 `unknown` 標記，不猜測連線。
+
+**殘餘風險：**有 Bash 的員工可偽造自己已獲授權連線的標記，影響限於自己的記憶；刪除仍需管理員核准，卡片列出每位員工的筆數。連線標記不提供同一作業系統使用者之間的隔離。
+
+刪除不在審批結果持久化之前同步執行。核准後由帶租約的持久工作列交給背景 worker，失敗重試、開機恢復。套用前重新規劃：純縮小可套用，範圍擴大要重新核准。記憶引擎仍在立即交易中檢查資料庫實例、epoch、有效期與 hash，並阻止已刪列重新寫入。全部成功後才產生收據，並寫入安全稽核事件。
+
+移除全域通道時排除員工專屬 bot 的 `#agent:` 對話；移除某員工 bot 時只選該 bot。系統來源紀錄保留；沒有標記的舊資料、回合帳本讀不到的資料列為無法歸屬。收據按員工與儲存區列出實際刪除數、保留的系統紀錄與歸屬缺口。**不在範圍內：**對話原文、`tool_calls.jsonl`、wiki、備份。還原舊備份可能恢復已刪記憶，並失去較新的刪除墓碑。管理員可透過 `memory.forget_receipts_list`／`memory.forget_receipts_get` 或安全頁查看及下載 JSON。
+
+舊式 dedicated Google 執行若沒有回傳實際選定帳號的紀錄，且委派可能改用備援帳號，會記為 `unknown`。若連線宣告抵達時連線或授權已移除，也會拒絕該參照並計入未知。連線標記會保留回合開始時間，避免已忘記回合的延後擷取重新寫入可歸屬記憶。
+
+連線來源標記會保留來源與角色；單純佐證不會取得刪除所有權。另一個仍連線的來源也提供過同一筆記憶時，該記憶會保留，計畫、管理員核准卡與收據以 `retained_shared` 逐員工列出數量。只有全部擁有來源的連線都已斷開，且沒有其他仍有效的直接來源，才會刪除；因此第二個連線斷開時，才可能選入先前保留的共享記憶。歸屬不明的記憶（包含無法還原角色的舊標記）保留並計入無法歸屬。衍生記憶也逐筆檢查來源。規劃與套用前會重新核對連線狀態；透過平台重新連線時，會先撤銷舊的斷線證據再發布連線。
+
+核准會綁定排序後的孤兒實體向量識別值，不只綁定數量；即使數量相同，替換成其他實體也必須重新核准。未完成工作會持久保存嘗試次數與下次執行時間，以 60／120／240／480 秒退避，並公平選取已到期工作。連續五次失敗或執行中斷後會隔離；管理員可在「資料刪除收據」查看不含記憶內容的失敗原因並按「重試」。重試沿用既有核准並重查範圍，擴大時仍須重新核准。
+
+每筆斷線紀錄都有獨立版本，建立時尚未驗證；連線狀態核對只驗證當時讀到的同一版本，延遲到達的舊斷線通知不能沿用先前的核對結果。
+
+
+## 對話憑證稽核
+
+[憑證稽核](70-credential-audit.md)只登錄偵測結果的中繼資料。密碼、連線字串不算指紋；高熵類型只有在憑證保護可用時才算帶金鑰的指紋。帳號只保留首字元與網域。每則訊息最多 5 筆、每位寄件者每小時 50 筆、總列數 100,000，超額合併為節流事件。兩種模式都遮罩衍生儲存中偵測到的值；預設 `audit` 仍保留對話明文，`mask` 在交付前遮罩新訊息。沒有語境的單獨密碼不會偵測，真值代換仍在規劃、不承諾版本。Admin 專用 RPC 與 doctor 可檢查稽核鏈；Read 檔案守門也拒絕讀取憑證登錄目錄。
+
+## 雙因素登入
 
 Gateway 支援 [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238) SHA-1 TOTP：160 位元隨機密鑰、6 位數、30 秒週期、前後各一個週期與交易內防重播。密鑰使用通道憑證相同的 AES-256-GCM 與主機 `.keyfile`，金鑰不放入 `users.db`。10 組單次備援碼只顯示一次、以 Argon2 雜湊保存；驗證備援碼不需要解密 TOTP。只要還有啟用或待註冊資料，金鑰遺失就拒絕建立替代金鑰；請還原原金鑰或走主機救援。金鑰輪替不在本階段範圍。
 
@@ -367,7 +409,7 @@ Enterprise 強制期間，首次註冊還需獨立證明。只有已記錄且早
 
 已註冊者的密碼與通道 OTP 登入只回傳 `mfa_required` 與 `challenge_id`。`/api/mfa/verify` 接受 challenge 及 `code`／`recovery_code` 二擇一。Challenge 綁定帳號與第一因素，持久保存、單次成功、5 分鐘有效、最多 5 次嘗試。`mfa.status` 查本人狀態；`mfa.recovery_regenerate {code}` 替換全部備援碼；`mfa.disable {code,password}` 需要目前密碼（與註冊密碼驗證共用限流）及新的 TOTP 或未使用備援碼，強制期間不能停用。每帳號因素驗證錯誤最多 5 次／15 分鐘。
 
-分階段啟用：先保持 `[auth] mfa_enforced=false`，讓帳號自願註冊；備妥支援新回應的客戶端、確認通道送達與主機救援，再由目前 Admin 查看 `mfa.overview`，透過 `system.update_config` 或設定檔編輯器啟用強制。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
+分階段啟用：先保持 `[auth] mfa_enforced=false`，讓帳號自願註冊；備妥支援新回應的客戶端、確認通道送達與主機救援，再由目前 Admin 查看 `mfa.overview`，在「使用者 → 雙因素登入管理」用專用開關啟用強制。`system.update_config`、設定檔編輯器與匯入都不能變更有效值。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
 
 單純開啟強制不立即撤銷帳號 access token；未註冊者不能 refresh，原 token 自然到期（預設 30 分鐘）。Enterprise MFA WebSocket 在到期後的下一次心跳關閉，最多延後 30 秒，不取消執行中工作。強制期間拒絕舊共用 token 的 `/ws` 登入及 RPC；已建立的共用 token 連線在下一次心跳關閉，停止推播訂閱。註冊、停用、重設會增加該帳號的 credential epoch，之後變更／重設密碼也會增加；舊 access／refresh token 失效，既有 dashboard 連線於下一次即時身分檢查拒絕，沿用 ACL 快取失效機制。沒有 claim 的 token 視為 epoch 0；從未註冊者即使變更密碼仍維持 0，以保持既有客戶行為。任何密碼變更都會作廢待註冊 challenge。
 

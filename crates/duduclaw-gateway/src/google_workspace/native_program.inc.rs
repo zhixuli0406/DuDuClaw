@@ -1439,12 +1439,18 @@ pub(super) fn extract_api_message(body: &str) -> String {
 }
 
 pub(super) fn scope_guidance(api_error_body: &str) -> String {
-    let reason = duduclaw_core::truncate_chars(&extract_api_message(api_error_body), 200);
-    format!(
-        "Google denied the request (403): {reason}. The authorization is missing required scopes. \
-         Reconnect Google from the dashboard Integrations → Google page to grant: {}.",
-        REQUIRED_SCOPES.join(", ")
-    )
+    let (reason, enable_url) = crate::google_workspace::permission_failure(api_error_body);
+    match reason.as_str() {
+        "SERVICE_DISABLED" | "accessNotConfigured" => match enable_url {
+            Some(url) => format!("Google API is disabled ({reason}). Enable this API: {url}"),
+            None => format!("Google API is disabled ({reason}). Enable it in Google Cloud Console > APIs & services > Library."),
+        },
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT" | "insufficientPermissions" | "insufficient_scope" => format!(
+            "Google denied the request (403): insufficient authentication scopes. Reconnect Google from the dashboard Integrations → Google page to grant: {}.",
+            REQUIRED_SCOPES.join(", ")
+        ),
+        _ => format!("Google denied the request (403): {reason}."),
+    }
 }
 
 pub(super) enum Outcome {

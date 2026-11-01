@@ -25,6 +25,18 @@ pub trait OtpDeliverer: Send + Sync {
     async fn deliver(&self, channel: &str, chat_id: &str, text: &str) -> Result<(), String>;
 }
 
+/// The shared sender uses legacy Markdown for Telegram, Markdown for Discord,
+/// mrkdwn for Slack and literal text for LINE. Escape at that boundary.
+pub(crate) fn message(channel: &str, product: &str, code: &str) -> String {
+    let product = match channel {
+        "telegram" | "discord" => crate::distributor_brand::escape_channel_name(product),
+        "slack" => product.replace('&', "&amp;").replace('<', "&lt;")
+            .replace('>', "&gt;").replace('@', "@\u{200b}"),
+        _ => product.to_string(),
+    };
+    format!("{product} 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。")
+}
+
 /// Maps a channel to its global `[channels]` bot-token config field. Only the
 /// 1:1-DM-capable channels are supported for OTP; anything else is rejected.
 /// Also reused by `install_notify` (same "DM a linked dashboard user" shape).
@@ -97,6 +109,18 @@ impl OtpDeliverer for ConfigOtpDeliverer {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn brand_punctuation_is_escaped_for_the_otp_transport() {
+        for channel in ["telegram", "discord"] {
+            assert!(message(channel, "*_[", "123456").starts_with("\\*\\_\\[ 登入驗證碼：123456\n"));
+            assert!(message(channel, "DuDuClaw", "123456").starts_with("DuDuClaw 登入驗證碼："));
+        }
+        for channel in ["line", "slack"] {
+            assert!(message(channel, "*_[", "123456").starts_with("*_[ 登入驗證碼：123456\n"));
+        }
+        assert!(message("slack", "@everyone &", "123456").starts_with("@\u{200b}everyone &amp;"));
+    }
 
     /// A test deliverer that records what it was asked to send.
     #[derive(Default)]

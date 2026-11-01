@@ -215,6 +215,14 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_tasks_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if !ctx.is_admin() {
+            let target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("").trim();
+            if let Err(refusal) = crate::machine_employee::check_target(
+                &self.home_dir, target, Some(&format!("user:{}", ctx.user_id)),
+            ) {
+                return WsFrame::error_response("", &refusal);
+            }
+        }
         match params.get("kind").and_then(Value::as_str).unwrap_or("task").trim().to_ascii_lowercase().as_str() {
             "discovery" => return self.handle_discovery_create(params, ctx).await,
             "goal" => return self.handle_tasks_goal_create(params, ctx).await,

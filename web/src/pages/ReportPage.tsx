@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -151,6 +152,7 @@ function ReportCard({
  * the surface moved onto MDS. The SVG/CSS charts are recolored, not rebuilt.
  */
 export function ReportPage() {
+  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
   // P11 (state-as-URL): the reporting window is the page's main control, so a
@@ -251,7 +253,7 @@ export function ReportPage() {
         )}
 
         {/* Cost & cache efficiency (CostTelemetry). */}
-        <CostEfficiencySection hours={PERIOD_HOURS[period]} />
+        {isAdmin && <CostEfficiencySection hours={PERIOD_HOURS[period]} />}
 
         {/* Zero-cost ratio. */}
         {summary && (

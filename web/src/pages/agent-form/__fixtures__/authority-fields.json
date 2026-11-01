@@ -31,6 +31,7 @@
     { "key": "model.account_pool", "form_paths": ["adv.account_pool"], "kind": "change" },
     { "key": "budget.monthly_limit_cents", "form_paths": ["form.monthly_limit_cents"], "kind": "loosen" },
     { "key": "budget.daily_cap_cents", "form_paths": ["v.daily_cap_cents"], "kind": "loosen" },
+    { "key": "budget.when_unavailable", "form_paths": ["form.when_unavailable"], "kind": "loosen" },
     { "key": "budget.hard_stop", "form_paths": ["form.hard_stop"], "kind": "loosen" },
     { "key": "google", "form_paths": ["form.google."], "kind": "google_narrow" }
   ],

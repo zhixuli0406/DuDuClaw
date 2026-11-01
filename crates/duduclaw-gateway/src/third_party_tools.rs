@@ -388,6 +388,7 @@ impl ThirdPartyGate {
     /// Atomic gateway query-and-reserve precedes approval and upstream execution.
     /// The snapshot excludes only this call's own reservation.
     pub async fn begin_call(&self, id: &Value, tool: &str, args: &Value) -> Result<PendingCall, String> {
+        let call_id = uuid::Uuid::new_v4().to_string();
         let mut call = self.claim_call(id)?;
         let label = format!("{}.{tool}", self.server);
         let source = duduclaw_core::truncate_bytes(&label, 256);
@@ -407,7 +408,7 @@ impl ThirdPartyGate {
                 crate::egress_guard::Taint::unknown()
             }
         };
-        let approved = match self.check_call_with_taint(tool, args, taint).await {
+        let approved = match self.check_call_with_taint_and_id(tool, args, taint, &call_id).await {
             Ok(approved) => approved,
             Err(reason) => {
                 call.finish_empty().await;
@@ -420,7 +421,7 @@ impl ThirdPartyGate {
             match crate::egress_client::SinkLease::acquire_id(&self.home, &self.agent_id, own_read.as_deref()).await {
                 Ok((lease, taint)) => {
                     call.sink = Some(Arc::new(lease));
-                    if let Err(reason) = crate::egress_gate::confirm_dispatch(&self.home, &self.agent_id, &label, true, taint, approved.as_ref()) {
+                    if let Err(reason) = crate::egress_gate::confirm_dispatch_with_call(&self.home, &self.agent_id, &label, true, taint, approved.as_ref(), &call_id) {
                         call.finish_empty().await;
                         return Err(reason);
                     }
@@ -430,14 +431,20 @@ impl ThirdPartyGate {
                         call.finish_empty().await;
                         return Err(message);
                     }
-                    if let Err(message) = crate::egress_gate::confirm_dispatch(
-                        &self.home, &self.agent_id, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(),
+                    if let Err(message) = crate::egress_gate::confirm_dispatch_with_call(
+                        &self.home, &self.agent_id, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(), &call_id,
                     ) {
                         call.finish_empty().await;
                         return Err(message);
                     }
                 }
             }
+        }
+        if let Err(reason) = crate::recipient_guard::confirm_unadapted_effect(
+            &self.home, &self.agent_id, &label, self.decide(tool).0, approved.as_ref(),
+        ) {
+            call.finish_empty().await;
+            return Err(reason);
         }
         if Instant::now() >= call.deadline {
             call.finish_empty().await;
@@ -499,6 +506,13 @@ impl ThirdPartyGate {
                     }});
                 }
             }
+            if self.seen_by == "bridge" {
+                if let Err(reason) = crate::egress_client::mark_remote(
+                    &self.home, &self.agent_id, &entry.source, &self.server,
+                ).await {
+                    tracing::warn!(%reason, "Remote MCP connection attribution unavailable");
+                }
+            }
             let _ = entry.done.send(());
         }
     }
@@ -511,7 +525,8 @@ impl ThirdPartyGate {
                 .unwrap_or_else(|| "Tool policy changed; retry the call.".into()));
         }
         let label = format!("{}.{tool}", self.server);
-        let egress = crate::egress_gate::check(&self.home, &self.agent_id, &label, effect != ToolEffect::Read).await?;
+        let mut egress = crate::egress_gate::check(&self.home, &self.agent_id, &label, effect != ToolEffect::Read).await?;
+        crate::recipient_guard::merge_unadapted_effect(&self.home, &self.agent_id, &label, effect, &mut egress);
         if decision == ThirdPartyDecision::Ask || egress.is_some() {
             self.ask_bound(tool, effect, args, egress).await
         } else { Ok(()) }
@@ -520,13 +535,20 @@ impl ThirdPartyGate {
     pub(crate) async fn check_call_with_taint(
         &self, tool: &str, args: &Value, taint: crate::egress_guard::Taint,
     ) -> Result<Option<Value>, String> {
+        self.check_call_with_taint_and_id(tool, args, taint, &uuid::Uuid::new_v4().to_string()).await
+    }
+
+    pub(crate) async fn check_call_with_taint_and_id(
+        &self, tool: &str, args: &Value, taint: crate::egress_guard::Taint, call_id: &str,
+    ) -> Result<Option<Value>, String> {
         let (effect, decision) = self.decide(tool);
         if matches!(decision, ThirdPartyDecision::Block(_)) {
             return Err(self.check_call(tool).await.err()
                 .unwrap_or_else(|| "Tool policy changed; retry the call.".into()));
         }
         let label = format!("{}.{tool}", self.server);
-        let egress = crate::egress_gate::evaluate(&self.home, &self.agent_id, &label, effect != ToolEffect::Read, taint)?;
+        let mut egress = crate::egress_gate::evaluate_with_call(&self.home, &self.agent_id, &label, effect != ToolEffect::Read, taint, call_id)?;
+        crate::recipient_guard::merge_unadapted_effect(&self.home, &self.agent_id, &label, effect, &mut egress);
         if decision == ThirdPartyDecision::Ask || egress.is_some() {
             self.ask_bound(tool, effect, args, egress.clone()).await?;
         }
@@ -543,7 +565,7 @@ impl ThirdPartyGate {
             "third_party": true, "arguments": args,
             "reason": if egress.is_some() { "egress_guard" } else { "action_rule" }
         }), duduclaw_core::host_task_id().as_deref());
-        if let Some(reason) = egress { payload["egress_guard"] = reason; }
+        if let Some(reason) = egress.as_ref() { payload["egress_guard"] = reason.clone(); }
         payload["action_rule_matches"] = json!(self.policy().rules.approval_matches_for_call(
             &duduclaw_core::tool_effect::third_party_tool_ref(&self.server, tool), effect, args,
         ));
@@ -553,8 +575,13 @@ impl ThirdPartyGate {
         let summary = format!("工具「{label}」需要管理員確認完整內容與目的地（{}）。", payload["reason"].as_str().unwrap_or("action_rule"));
         let id = broker.request(&self.agent_id, "mcp_call", &summary, payload, APPROVAL_TTL_SECONDS).await?;
         match broker.await_decision(&id, APPROVAL_POLL).await {
-            Ok(ApprovalStatus::Approved) => verify_and_consume(&broker, &id, &grant).await
-                .map_err(|e| format!("Approval binding refused: {e:?}")),
+            Ok(ApprovalStatus::Approved) => {
+                crate::recipient_guard::confirm_unadapted_effect(
+                    &self.home, &self.agent_id, &label, self.decide(tool).0, egress.as_ref(),
+                )?;
+                verify_and_consume(&broker, &id, &grant).await
+                    .map_err(|e| format!("Approval binding refused: {e:?}"))
+            }
             _ => Err(format!("工具「{label}」未獲核准，已拒絕。")),
         }
     }
@@ -768,6 +795,19 @@ mod tests {
         d
     }
 
+    #[tokio::test]
+    async fn third_party_precheck_and_confirm_share_one_shadow_call() {
+        let home = home_with_rules("");
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        let gate = ThirdPartyGate::new(home.path(), "a1", "crm", "proxy");
+        let call = uuid::Uuid::new_v4().to_string();
+        let taint = crate::egress_guard::Taint { tainted: true, sources: vec!["memory_search".into()], ..crate::egress_guard::Taint::unknown() };
+        let approved = gate.check_call_with_taint_and_id("put", &json!({}), taint.clone(), &call).await.unwrap();
+        crate::egress_gate::confirm_dispatch_with_call(home.path(), "a1", "crm.put", true, taint, approved.as_ref(), &call).unwrap();
+        let report = crate::egress_shadow::report(home.path(),7).unwrap();
+        assert_eq!((report.total,report.ticket_total),(1,1));
+    }
+
     fn listing() -> Value {
         json!({ "tools": [
             { "name": "get", "annotations": { "readOnlyHint": true } },
@@ -778,6 +818,53 @@ mod tests {
 
     fn names(v: &Value) -> Vec<&str> {
         v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect()
+    }
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[tokio::test]
+    async fn third_party_recipient_shadow_records_and_off_adds_no_approval() {
+        let home = home_with_rules("[capabilities]\n");
+        let gate = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "bridge", ProcessLane::Normal);
+        for mode in ["off", "shadow"] {
+            std::fs::write(home.path().join("config.toml"), format!("[security]\negress_guard='off'\nrecipient_guard='{mode}'\n")).unwrap();
+            assert!(gate.check_call_with_taint("unknown_send", &json!({"to":"line:visitor"}),
+                crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None }).await.unwrap().is_none());
+            assert!(!home.path().join("approvals.db").exists());
+            assert_eq!(home.path().join("tool_calls.jsonl").exists(), mode == "shadow");
+        }
+        let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(row["recipient_guard"], "would_ask");
+    }
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[tokio::test]
+    async fn recipient_guard_requires_admin_for_clean_third_party_effects() {
+        use crate::approval::ApprovalBroker;
+        let home = home_with_rules("[capabilities]\ntrusted_read_hint_servers=['crm']\n");
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\nrecipient_guard='ask'\n").unwrap();
+        let gate = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "proxy", ProcessLane::Normal);
+        gate.filter_list_result(&mut listing());
+        assert!(gate.check_call_with_taint("get", &json!({}), crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None }).await.unwrap().is_none());
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let args = json!({"to":"line:visitor", "body":"hello"});
+        let call = gate.check_call_with_taint("put", &args, crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None });
+        let decision = async {
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(request) = broker.list_pending(Some("a1")).await.unwrap().into_iter().next() {
+                        break request;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            assert_eq!(request.payload["arguments"], args);
+            assert!(request.payload["egress_guard"]["recipient_guard"].is_object());
+            assert!(broker.decide(&request.id, true, "channel:admin").await.is_err());
+            broker.decide_egress_dashboard(&request.id, &duduclaw_auth::UserContext::admin_fallback(), true).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(call, decision);
+        assert!(result.unwrap().unwrap()["recipient_guard"].is_object());
     }
 
     #[tokio::test]

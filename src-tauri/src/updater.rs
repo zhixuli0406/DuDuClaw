@@ -179,7 +179,7 @@ pub async fn check_and_stage(app: &AppHandle) -> Result<Option<String>, String> 
     let _ = app
         .notification()
         .builder()
-        .title("DuDuClaw 更新已就緒")
+        .title(format!("{} 更新已就緒", crate::distributor_brand::product_name(app)))
         .body(relation.ready_notice(&version))
         .show();
 
@@ -280,7 +280,7 @@ pub fn on_tray_check_update(app: &AppHandle) {
                 let _ = app
                     .notification()
                     .builder()
-                    .title("DuDuClaw")
+                    .title(crate::distributor_brand::product_name(&app))
                     .body("目前已是最新版本。")
                     .show();
             }
@@ -289,7 +289,7 @@ pub fn on_tray_check_update(app: &AppHandle) {
                 let _ = app
                     .notification()
                     .builder()
-                    .title("DuDuClaw")
+                    .title(crate::distributor_brand::product_name(&app))
                     .body("檢查更新失敗，請稍後再試或到 GitHub Releases 手動下載。")
                     .show();
             }

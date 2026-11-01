@@ -487,6 +487,7 @@ struct ApprovalDetail {
     trajectory: Option<String>,
     status: String,
     settled: bool,
+    decided_in_dashboard_only: bool,
     expires_at_epoch: Option<i64>,
     ttl_seconds: i64,
 }
@@ -707,13 +708,14 @@ async fn detail_handler(
         // R-L2: a dashboard-only kind carries a claim and a protected value
         // in its summary; the Mini App shows only the plain notice.
         summary: detail_summary(&rec),
-        trajectory: if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+        trajectory: if crate::approval_notify::is_dashboard_only_record(&rec) {
             None
         } else {
             trajectory
         },
         status: rec.status.as_str().to_string(),
         settled: rec.status.is_terminal(),
+        decided_in_dashboard_only: crate::approval_notify::is_dashboard_only_record(&rec),
         expires_at_epoch: rec.expires_at_epoch(),
         ttl_seconds: rec.ttl_seconds,
     };
@@ -724,7 +726,7 @@ async fn detail_handler(
 /// claim and a protected value in its summary, so only the plain notice (the
 /// same text the channel gets) is returned for it.
 fn detail_summary(rec: &crate::approval::ApprovalRecord) -> String {
-    if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+    if crate::approval_notify::is_dashboard_only_record(rec) {
         crate::approval_notify::dashboard_only_notice_body(rec, false)
     } else {
         duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS)
@@ -846,7 +848,7 @@ button:disabled{opacity:.5;cursor:default}
     <div class="block"><h2>內容</h2><p id="summary" class="pre"></p></div>
     <div class="block hide" id="simwrap"><h2>如果同意，接下來會發生什麼</h2><p id="sim" class="pre"></p></div>
     <p class="note">剩餘時間：<span id="countdown" class="countdown">—</span>；逾時未回覆會自動拒絕。</p>
-    <div class="actions">
+    <div class="actions" id="actions">
       <button class="ok" id="approve" type="button">同意這個動作</button>
       <button class="no" id="deny" type="button">拒絕這個動作</button>
     </div>
@@ -949,6 +951,12 @@ button:disabled{opacity:.5;cursor:default}
     if (a.expires_at_epoch) { deadline = a.expires_at_epoch; tickCountdown(); setInterval(tickCountdown, 1000); }
     else { $("countdown").textContent = "—"; }
     $("body").className = "";
+    if (a.decided_in_dashboard_only) {
+      $("actions").className = "hide";
+      $("approve").disabled = true;
+      $("deny").disabled = true;
+      return;
+    }
     if (a.settled) {
       $("approve").disabled = true;
       $("deny").disabled = true;
@@ -1443,6 +1451,13 @@ mod tests {
         let s = detail_summary(&rec);
         assert!(!s.contains("永久退款") && !s.contains("七天"), "{s}");
         assert!(s.contains("儀表板"));
+        rec.action_kind = crate::approval::cli_egress::KIND.into();
+        rec.payload = serde_json::json!({});
+        assert!(!detail_summary(&rec).contains("永久退款"));
+        rec.action_kind = "mcp_call".into();
+        rec.payload = serde_json::json!({"egress_guard":null});
+        assert!(!detail_summary(&rec).contains("永久退款"));
+        rec.payload = serde_json::json!({});
         rec.action_kind = "mcp_install".into();
         assert!(detail_summary(&rec).contains("永久退款"));
     }

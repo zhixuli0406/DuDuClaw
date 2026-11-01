@@ -89,10 +89,15 @@ impl MethodHandler {
                     if params.get("confirm").and_then(Value::as_bool) != Some(true) {
                         return Err("請確認要中斷 Google 連線。".into());
                     }
+                    let display_name = db.get_user(target)?.map(|u| format!("Google · {}", u.display_name))
+                        .unwrap_or_else(|| "Google".into());
                     let revoked =
                         lifecycle::disconnect(&self.home_dir, &db, target, &ctx.user_id, false)
                             .await?;
-                    Ok(json!({"disconnected":true,"provider_revoked":revoked,"provider_note":if revoked {None} else {Some("已中斷本機連線。為保護其他共用授權，或因 Google 尚未確認撤銷，沒有確認 Google 端已撤銷；請到 Google 已連結應用程式檢查。")}}))
+                    let forget_memories = crate::disconnect_forget::after_disconnect(&self.home_dir,
+                        &format!("google:person:{target}"), &display_name,
+                        params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await;
+                    Ok(json!({"disconnected":true,"forget_memories":forget_memories,"provider_revoked":revoked,"provider_note":if revoked {None} else {Some("已中斷本機連線。為保護其他共用授權，或因 Google 尚未確認撤銷，沒有確認 Google 端已撤銷；請到 Google 已連結應用程式檢查。")}}))
                 }
                 "me.google.consents.set" => {
                     let agent = params

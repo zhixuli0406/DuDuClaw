@@ -84,7 +84,8 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    if SINGLE_FILE_EXTS.contains(&ext.as_str()) {
+    let native_profile = super::agent_config::detect::has_native_header(&path);
+    if SINGLE_FILE_EXTS.contains(&ext.as_str()) || native_profile {
         return stage_single_file(&path, staging);
     }
     // A file → must be a zip.

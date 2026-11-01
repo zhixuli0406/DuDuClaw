@@ -65,6 +65,21 @@ impl GoalLoopDriver {
             debug!(task = %task_id, "goal loop: durable round fenced by the dispatcher — slot released");
             return Ok(false);
         }
+        // Admission may change after enqueue but before the runtime handoff.
+        // These refusals are not infrastructure failures and must not enter
+        // the failure counter/backoff ladder or spend another dispatch round.
+        let refusal = crate::budget::budget_refusal_message(error)
+            .map(|message| (message, crate::pause_reason::PauseReason::BlockedNeedsDecision))
+            .or_else(|| error.starts_with("AUTONOMY_PAUSED:")
+                .then_some((error, crate::pause_reason::PauseReason::OperatorPaused)));
+        if let Some((message, pause)) = refusal {
+            self.dispatch_failures.lock().await.remove(task_id);
+            let Some(task) = self.store.get_task(task_id).await? else {
+                return Ok(false);
+            };
+            self.escalate(inflight, &task, message, pause).await?;
+            return Ok(true);
+        }
         let now = Utc::now();
         let failures = {
             let mut map = self.dispatch_failures.lock().await;

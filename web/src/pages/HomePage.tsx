@@ -20,8 +20,7 @@ import {
   DropdownMenuItem,
 } from '@/components/mds';
 import { ActivityFeed } from '@/components/ActivityFeed';
-import { type InboxItem, TYPE_URGENCY } from '@/lib/inbox-model';
-import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
+import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { NeedsMeRow } from '@/components/home/NeedsMeRow';
 import { LiveCards } from '@/components/home/LiveCards';
 import { RecentTasks } from '@/components/home/RecentTasks';
@@ -47,7 +46,6 @@ import {
   Bot,
 } from 'lucide-react';
 import { hasMinRole } from '@/lib/roles';
-import { approvalListTitle } from '@/components/inbox/knowledge-quarantine';
 
 /** Default widget order for a fresh user (server catalog order also matches). */
 const DEFAULT_ORDER = ['needs_me', 'my_agents', 'recent_activity', 'my_tasks', 'channel_health'];
@@ -115,11 +113,12 @@ export function HomePage() {
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   // Data-scoped: an employee sees only their own AI staff (§3.4 WP11-T11.3).
-  const agents = useVisibleAgents();
+  const agents = useVisibleAgents(false);
   const connectionState = useConnectionStore((s) => s.state);
   const authed = connectionState === 'authenticated';
 
-  const [needsMe, setNeedsMe] = useState<InboxItem[]>([]);
+  const inboxCount = useApprovalsStore(selectInboxCount);
+  const fetchInboxCount = useApprovalsStore((s) => s.fetchCount);
 
   // ── widget layout state ──
   const [catalog, setCatalog] = useState<string[]>([]);
@@ -131,11 +130,12 @@ export function HomePage() {
   const [customWidgets, setCustomWidgets] = useState<CustomWidgetSummary[]>([]);
 
   // ── Read-only subordinate view (view-as, manager+). `?view_as=<user_id>`
-  // renders THAT user's layout + data scope; editing is disabled and there is
-  // no write path for someone else's layout (structural, not just hidden UI).
+  // Widget APIs still use the viewer's identity, so show an unavailable state
+  // until those APIs can return target-scoped data. Never substitute viewer data.
   const [searchParams, setSearchParams] = useSearchParams();
   const viewAs = searchParams.get('view_as') ?? '';
   const [viewTarget, setViewTarget] = useState<{
+    userId: string;
     name: string;
     role: string;
     layout: DashboardLayoutWidget[];
@@ -166,6 +166,7 @@ export function HomePage() {
           ? [...savedWidgets, ...ids.filter((id) => !known.has(id)).map((id) => ({ id, hidden: false }))]
           : DEFAULT_ORDER.filter((id) => ids.includes(id)).map((id) => ({ id, hidden: false }));
         setViewTarget({
+          userId: viewAs,
           name: r.user.display_name,
           role: r.user.role,
           layout: ordered,
@@ -174,6 +175,7 @@ export function HomePage() {
         });
       })
       .catch((e) => {
+        if (!alive) return;
         toast.error(formatError(e));
         setSearchParams({}, { replace: true });
       });
@@ -196,7 +198,7 @@ export function HomePage() {
   }, [authed, isManagerUp]);
 
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || viewAs) return;
     let alive = true;
     Promise.all([
       api.dashboard.widgetsCatalog().catch(() => ({ widgets: [] as Array<{ id: string }> })),
@@ -225,56 +227,14 @@ export function HomePage() {
     return () => {
       alive = false;
     };
-  }, [authed]);
+  }, [authed, viewAs]);
 
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || viewAs) return;
     fetchAgents();
 
-    const nameOf = (id: string) => {
-      const a = agents.find((x) => x.name === id);
-      return a?.display_name || id;
-    };
-
-    // "需要我" merged stream — five cheap sources (approvals / blocked /
-    // needs_human / budget / failed run). Each is best-effort: a
-    // manager-gated source that errors for this viewer contributes nothing
-    // (fail-safe, not fail-loud).
-    //
-    // W2-5: `blocked` and `needs_human` are two DISTINCT `TaskInfo.status`
-    // values (`task_store.rs`) — a goal-loop task escalated to `needs_human`
-    // never carries `status: 'blocked'`, so it was silently absent from this
-    // widget even though it is exactly the kind of "等你決定" item the strip
-    // exists for (the same gap `InboxPage`/`HealthOverview` already close via
-    // their own `needs_human` fetch).
-    Promise.all([
-      api.approvals.list().catch(() => null),
-      api.budget.incidents().catch(() => null),
-      api.tasks.list({ status: 'blocked' }).catch(() => null),
-      api.tasks.list({ status: 'needs_human' }).catch(() => null),
-      api.audit.unifiedLog({ sources: ['channel_failure'], limit: 20 }).catch(() => null),
-    ]).then(([approvals, budget, blocked, needsHuman, failed]) => {
-      const items: InboxItem[] = [];
-      for (const a of approvals?.approvals ?? []) {
-        items.push({ id: `approval:${a.id}`, type: 'approval', title: approvalListTitle(a, intl.formatMessage), agentId: a.agent_id, timestamp: a.created_at, urgency: TYPE_URGENCY.approval, actionable: true, status: 'pending' });
-      }
-      for (const t of [...(blocked?.tasks ?? []), ...(needsHuman?.tasks ?? [])]) {
-        items.push({ id: `blocked:${t.id}`, type: 'blocked', title: t.title, agentId: t.assigned_to || undefined, timestamp: t.updated_at, urgency: TYPE_URGENCY.blocked, actionable: true, status: t.status });
-      }
-      for (const inc of budget?.incidents ?? []) {
-        items.push({ id: `budget:${inc.agent_id}:${inc.ts}`, type: 'budget', title: intl.formatMessage({ id: 'inbox.budget.title' }, { agent: nameOf(inc.agent_id), scope: inc.scope }), agentId: inc.agent_id, timestamp: inc.ts, urgency: TYPE_URGENCY.budget, actionable: true, status: inc.event });
-      }
-      // W2-8: exclude `channel_recovered` rows and any failure a later
-      // recovery already resolved for the same channel (`lib/home-overview.ts`).
-      for (const ev of excludeRecoveredChannelFailures(failed?.events ?? [])) {
-        items.push({ id: `failed_run:${ev.agent_id}:${ev.timestamp}`, type: 'failed_run', title: ev.summary || intl.formatMessage({ id: 'inbox.failedRun.title' }, { agent: nameOf(ev.agent_id) }), agentId: ev.agent_id || undefined, channel: channelFailureChannel(ev), timestamp: ev.timestamp, urgency: TYPE_URGENCY.failed_run, actionable: false, status: ev.severity });
-      }
-      setNeedsMe(items);
-    }).catch(() => { /* silent — an empty strip is honest */ });
-    // agents intentionally excluded from deps: the name map is a display nicety
-    // resolved at fetch time; re-running on every agent tick would spam the RPCs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authed, fetchAgents, intl]);
+    void fetchInboxCount();
+  }, [authed, viewAs, fetchAgents, fetchInboxCount]);
 
 
   // ── edit actions ──
@@ -311,10 +271,34 @@ export function HomePage() {
     return agents.filter((a) => bound.has(a.name));
   }, [agents, viewing, viewTarget]);
 
+  if (viewAs) {
+    const target = viewTarget?.userId === viewAs ? viewTarget : null;
+    return (
+      <div className="mx-auto w-full max-w-6xl space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-warning/40 bg-warning/10 px-4 py-2.5">
+          <span className="flex items-center gap-2 text-sm text-foreground">
+            <Eye className="size-4 shrink-0 text-warning" />
+            {target
+              ? intl.formatMessage({ id: 'home.viewAs.banner' }, { name: target.name })
+              : intl.formatMessage({ id: 'common.loading' })}
+          </span>
+          <Button variant="secondary" size="sm" onClick={() => setSearchParams({}, { replace: true })}>
+            <X />{intl.formatMessage({ id: 'home.viewAs.exit' })}
+          </Button>
+        </div>
+        {target && (
+          <p role="status" className="text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'home.viewAs.unavailable' })}
+          </p>
+        )}
+      </div>
+    );
+  }
+
   const renderWidget = (id: string): ReactNode => {
     switch (id) {
       case 'needs_me':
-        return <NeedsMeRow total={needsMe.length} />;
+        return <NeedsMeRow total={inboxCount} />;
       case 'my_agents':
         return <LiveCards agents={scopedAgents} enabled={authed} />;
       case 'recent_activity':
@@ -387,7 +371,7 @@ export function HomePage() {
     .filter((w) => !w.hidden)
     // 拍板: the "需要我" strip is silent when empty (except in edit mode, where
     // every widget must stay reorderable/unhideable).
-    .filter((w) => !(w.id === 'needs_me' && !editing && needsMe.length === 0));
+    .filter((w) => !(w.id === 'needs_me' && !editing && inboxCount === 0));
   const hiddenWidgets = layout.filter((w) => w.hidden);
 
   const greeting = intl.formatMessage(
@@ -419,7 +403,7 @@ export function HomePage() {
           進主控台的入口". Hidden in view-as mode, same rule as the two blocks
           below: this reads as the VIEWER's own action, not the impersonated
           user's. */}
-      {!viewing && (
+      {!viewing && user?.role === 'admin' && (
         <button
           type="button"
           onClick={() => navigate('/console')}
@@ -449,7 +433,7 @@ export function HomePage() {
       )}
 
       {/* Fixed 用量摘要 KPI strip (§5.5) — details-on-demand, below the fold. */}
-      <UsageSummary enabled={authed} />
+      {user?.role === 'admin' && <UsageSummary enabled={authed} />}
 
       {/* Read-only view-as banner (§view-as: look, never touch). */}
       {viewing && viewTarget && (

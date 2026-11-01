@@ -106,7 +106,7 @@ CLI 連線至 `127.0.0.1`，連接埠依序取自 `DUDUCLAW_PORT`、`<home>/conf
 
 自主排程區顯示已啟用與已暫停的 cron（Admin），以及心跳狀態（Manager／Admin）。排程 `p` 暫停／恢復、`n` 執行一次；心跳 `n` 立即觸發。排程立即執行附上新的 `request_id`。目前 `cron.list` 沒有下次時間、`heartbeat.status` 沒有上次結果，會顯示「閘道未提供」，不自行推算或視為成功。詳情顯示排程規則、時區與可用的上次執行／結果。
 
-選取員工按 `p`，透過 `agents.pause`／`agents.resume` 暫停或恢復狀態，需要 Manager 與 Operator／Owner 綁定；Admin 依閘道的管理員存取規則處理。本分支沒有 `autonomy.pause`，卡片會標明這是員工狀態暫停，不是全面自主性暫停，也不提供全域暫停。
+選取員工按 `p`，透過 `agents.pause`／`agents.resume` 暫停或恢復狀態，需要 Manager 與 Operator／Owner 綁定；Admin 依閘道的管理員存取規則處理。卡片會標明這是員工狀態暫停，不是全面自主性暫停；控制室不提供全域暫停，自主工作暫停由 `autonomy.pause` RPC 控制。
 
 新增的控制都透過獨立決策卡：開卡後一秒內忽略按鍵、核對完整請求、輸入新的兩位確認碼；資料過期或目標內容改變就拒絕送出。不自動重送請求。接受、拒絕與衝突都重新讀取；停止被接受仍可能是 `cancel_pending`，畫面不提前顯示成功。受限沙箱內的 socket 假閘道、真實閘道與原生終端驗收為 NOT RUN；程序內假 RPC 測試涵蓋請求欄位與確認狀態機。
 
@@ -159,7 +159,6 @@ default_layout = "single"         # "vertical" / "horizontal"
 | `poll_interval_seconds` | 5～3600 的整數 | `15`；權威清單重新核對間隔；執行／任務／日誌區塊維持每五秒核對 |
 | `notifications` | 布林值 | `false`，SSH 亦同；明確開啟後提供固定文字背景通知 |
 | `default_layout` | `"single"`、`"vertical"`、`"horizontal"` | `"single"`；一個詳情區塊、左右兩個詳情區塊、上下兩個詳情區塊；初始焦點為區塊 1 |
-| `pty.command` | 非空字串陣列，最多 64 個參數 | 操作者本機命令；未設定用 `$SHELL` 或 `/bin/sh`，詳見上方 M4 |
 
 操作中的版面變更不會寫回設定。這些設定不能變更連線、認證、權限、確認或任何安全規則。框線一律使用 ASCII。兩個檔案都受既有 agent-file-guard 家目錄政策保護，員工不能寫入。
 

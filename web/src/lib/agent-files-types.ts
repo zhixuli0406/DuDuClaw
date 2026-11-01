@@ -6,7 +6,7 @@
  */
 
 /** The fixed files. `agent_toml` is read-only here (edit it on the edit page). */
-export type AgentFileFixedKey = 'soul' | 'identity' | 'instructions' | 'contract' | 'agent_toml';
+export type AgentFileFixedKey = 'soul' | 'identity' | 'user' | 'instructions' | 'contract' | 'agent_toml';
 
 /** One of the employee's own skill files: `skill:<path inside SKILLS/>`. */
 export type AgentFileSkillKey = `skill:${string}`;
@@ -14,7 +14,7 @@ export type AgentFileSkillKey = `skill:${string}`;
 /** Which file. */
 export type AgentFileKey = AgentFileFixedKey | AgentFileSkillKey;
 
-/** How the file compares with the last approved version (SOUL / INSTRUCTIONS only). */
+/** How the file compares with the last approved version (SOUL / IDENTITY / USER / INSTRUCTIONS only). */
 export type AgentFileDrift = 'intact' | 'drifted' | 'none';
 
 export type AgentFileVerdict = 'pass' | 'warn' | 'block';
@@ -125,7 +125,7 @@ export interface AgentFileListEntry {
 
 export interface AgentFileListResponse {
   agent_id: string;
-  /** The five fixed files first, then the employee's skill files. */
+  /** The six fixed files first, then the employee's skill files. */
   files: AgentFileListEntry[];
   /** Byte limits per fixed file key, plus `skill` for every skill file. */
   limits: Record<string, number>;

@@ -164,6 +164,9 @@ pub(super) async fn call_with_handover(
                     .and_then(|claims| {
                         let session = claims.jti.clone()?;
                         let new_ctx = UserContext::from_claims(&claims, ctx.must_change_password).ok()?;
+                        let new_ctx = crate::machine_employee::without_restricted_access(
+                            state.handler.home_dir(), new_ctx,
+                        );
                         Some(MfaSessionHandover { ctx: new_ctx, session, expires: claims.exp })
                     })
             }

@@ -216,7 +216,12 @@ function InventoryRow({ entry }: { entry: CredentialEntry }) {
       <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
         {entry.path}
       </code>
-      <div className="flex shrink-0 items-center gap-1.5">
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+        {entry.source_kind === 'config' && (
+          <Badge variant="secondary">{intl.formatMessage({ id: 'security.credentialAudit.source.config' })}</Badge>
+        )}
+        {entry.service && <span className="text-xs text-muted-foreground">{entry.service}</span>}
+        {entry.holder && <span className="text-xs text-muted-foreground">{entry.holder}</span>}
         {entry.residue && (
           <Badge variant="secondary" className="bg-destructive/10 text-destructive">
             {intl.formatMessage({ id: 'security.credentialInventory.badge.residue' })}

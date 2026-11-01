@@ -174,6 +174,11 @@ pub fn assign_right(
     else {
         return AssignRight::Denied;
     };
+    if crate::machine_employee::requires_admin(loaded)
+        && !matches!(access.sender, Sender::Admin { .. })
+    {
+        return AssignRight::Denied;
+    }
     match &access.sender {
         Sender::Admin { .. } => AssignRight::Allowed(GrantSource::Admin),
         Sender::Account { access: ea, .. } => match ea.level(agent) {

@@ -1,4 +1,6 @@
-/** Fixed software identity shared by the dashboard and local chat state. */
+import { useBrandStore } from '@/stores/brand-store';
+
+/** Original product identity used whenever no verified distributor brand is effective. */
 export const PRODUCT_NAME = 'DuDuClaw';
 
 /**
@@ -8,5 +10,5 @@ export const PRODUCT_NAME = 'DuDuClaw';
  */
 export const DEFAULT_AGENT_GLYPH = '🐾';
 
-export function effectiveName(): string { return PRODUCT_NAME; }
-export function useEffectiveName(): string { return PRODUCT_NAME; }
+export function effectiveName(): string { return useBrandStore.getState().brand?.product_name ?? PRODUCT_NAME; }
+export function useEffectiveName(): string { return useBrandStore((state) => state.brand?.product_name ?? PRODUCT_NAME); }

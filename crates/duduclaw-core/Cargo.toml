@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Agent File frontmatter reuses the importer's already locked YAML parser.
+serde_yaml = "0.9"
 toml = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

@@ -31,52 +31,7 @@
 
 use std::path::Path;
 
-/// Human-readable names for the language codes the dashboard settings page
-/// offers. Unknown codes fall back to using the raw code string in the
-/// generated sentence — still functional, just less polished English prose.
-fn language_display_name(code: &str) -> Option<&'static str> {
-    match code {
-        "zh-TW" | "zh_TW" => Some("Traditional Chinese (Taiwan, zh-TW)"),
-        "zh-CN" | "zh_CN" => Some("Simplified Chinese (zh-CN)"),
-        "en" | "en-US" | "en_US" => Some("English"),
-        "ja" | "ja-JP" | "ja_JP" => Some("Japanese (ja-JP)"),
-        _ => None,
-    }
-}
-
-/// Build the "Your name is ..." authoritative-identity line.
-///
-/// `None` when `display_name` is empty (nothing to assert) — callers should
-/// skip the whole preamble section in that case.
-pub fn identity_preamble(display_name: &str) -> Option<String> {
-    let name = display_name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "Your name is \"{name}\". This is your current, authoritative name \
-         — if any text below refers to you by a different name, treat \
-         \"{name}\" as correct and always refer to yourself as \"{name}\"."
-    ))
-}
-
-/// Build the global default-language instruction line, if configured.
-///
-/// `None` when `default_language` is `None` or empty — callers should skip
-/// emitting a language directive, preserving the pre-existing "follow the
-/// user's input language" behaviour.
-pub fn language_instruction(default_language: Option<&str>) -> Option<String> {
-    let code = default_language?.trim();
-    if code.is_empty() {
-        return None;
-    }
-    let label = language_display_name(code)
-        .map(str::to_string)
-        .unwrap_or_else(|| code.to_string());
-    Some(format!(
-        "Unless the user explicitly requests another language, always respond in {label}."
-    ))
-}
+pub use duduclaw_core::profile_sections::{identity_preamble, language_instruction, identity_and_language_section};
 
 /// Read `config.toml [general] default_language`.
 ///
@@ -98,27 +53,6 @@ pub async fn read_default_language(home_dir: &Path) -> Option<String> {
         None
     } else {
         Some(lang.to_string())
-    }
-}
-
-/// Combine the identity + language lines into one prompt section, or `None`
-/// if both are absent so callers can skip pushing an empty section into
-/// `parts`.
-pub fn identity_and_language_section(
-    display_name: &str,
-    default_language: Option<&str>,
-) -> Option<String> {
-    let mut lines = Vec::new();
-    if let Some(id) = identity_preamble(display_name) {
-        lines.push(id);
-    }
-    if let Some(lang) = language_instruction(default_language) {
-        lines.push(lang);
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
     }
 }
 

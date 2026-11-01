@@ -205,7 +205,8 @@ pub async fn handle_upload(
                 let (h, u, cid) = (home.to_path_buf(), user.clone(), id.clone());
                 let allowed = blocking(move || {
                     let conn = duduclaw_knowledge::schema::open_home(&h)?;
-                    duduclaw_knowledge::acl::require_role(
+                    super::principals::require_role(
+                        &h,
                         &conn,
                         &cid,
                         &u.user_id,
@@ -309,7 +310,8 @@ pub async fn handle_original(
         let conn = duduclaw_knowledge::schema::open_home(&h)?;
         let src = duduclaw_knowledge::sources::get_source(&conn, &sid)?
             .ok_or(duduclaw_knowledge::KbError::PermissionDenied)?;
-        let allowed = duduclaw_knowledge::acl::effective_collections(
+        let allowed = super::principals::effective_collections(
+            &h,
             &conn,
             &super::dashboard_human(&user),
             None,

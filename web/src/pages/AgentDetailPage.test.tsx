@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -212,4 +213,11 @@ describe('AgentDetailPage', () => {
     // The raw thrown message never reaches the page body.
     expect(screen.queryByText(/nope/)).not.toBeInTheDocument();
   });
+});
+
+it('shows a team read-only message before any private loader mounts', () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
+  renderAt('team-agent');
+  expect(screen.getByRole('note')).toHaveTextContent('Memory and settings require direct access');
+  expect(mockWsClient.call).not.toHaveBeenCalled();
 });

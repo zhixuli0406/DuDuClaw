@@ -21,7 +21,6 @@ import {
   requiredEnvPayload,
   unmaskedEnv,
 } from '@/components/shared/RequiredEnvFields';
-import { OAUTH_REDIRECT_URI } from '@/components/IntegrationConnectPanel';
 import {
   Button,
   Badge,
@@ -1194,21 +1193,24 @@ function ConfigureOAuthDialog({
             />
           </div>
 
-          {/* The exact callback address to register in the provider's console.
-              Registering a different one is what silently dead-ends the consent
-              flow, so it is shown here (server-derived — the built-in default is
-              only right on the default port) rather than left to be guessed. */}
+          {/* Show only the callback address reported by the gateway. */}
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'mcp.oauth.redirectUri' })}
             </label>
-            <Input
-              type="text"
-              value={provider.redirect_uri || OAUTH_REDIRECT_URI}
-              readOnly
-              onFocus={(e) => e.currentTarget.select()}
-              className="bg-muted/50 font-mono text-xs"
-            />
+            {provider.redirect_uri ? (
+              <Input
+                type="text"
+                value={provider.redirect_uri}
+                readOnly
+                onFocus={(e) => e.currentTarget.select()}
+                className="bg-muted/50 font-mono text-xs"
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({ id: 'google.wizard.redirectUnavailable' })}
+              </p>
+            )}
           </div>
 
           <div className="space-y-1.5">

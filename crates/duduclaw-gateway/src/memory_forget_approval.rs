@@ -80,6 +80,9 @@ pub async fn request_for_plan(
 }
 
 /// Who filed a forget request, when it was not the local command line.
+pub const ORIGIN_DISCONNECT: &str = "connector_disconnect";
+pub const DISCONNECT_ORIGIN_NOTICE: &str = "這筆請求在中斷連線後自動建立。請檢查逐員工筆數；核准後由背景工作刪除，完成後可到安全頁下載收據。";
+
 pub const ORIGIN_KNOWLEDGE_DELETE: &str = "knowledge_source_delete";
 
 /// Fixed text on a forget card filed while deleting a knowledge source in
@@ -173,6 +176,8 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
             == Some(ORIGIN_KNOWLEDGE_DELETE)
         {
             KNOWLEDGE_ORIGIN_NOTICE
+        } else if rec.payload.get("origin").and_then(|v| v.as_str()) == Some(ORIGIN_DISCONNECT) {
+            DISCONNECT_ORIGIN_NOTICE
         } else {
             ORIGIN_NOTICE
         },

@@ -458,7 +458,7 @@ async fn receive_webhook(
 
                     info!(
                         "📩 WhatsApp [{sender}]: {}",
-                        truncate_bytes(&input_text, 80)
+                        truncate_bytes(&duduclaw_security::credential_detect::mask(&input_text), 80)
                     );
 
                     // Chat commands
@@ -666,7 +666,7 @@ async fn send_text(
             let text = resp.text().await.unwrap_or_default();
             error!(
                 "WhatsApp send failed ({status}): {}",
-                truncate_bytes(&text, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 200)
             );
         }
         Err(e) => error!("WhatsApp send error: {e}"),

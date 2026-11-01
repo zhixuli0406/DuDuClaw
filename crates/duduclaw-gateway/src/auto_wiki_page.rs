@@ -88,6 +88,8 @@ pub const MAX_HELD_CLAIMS_PER_DAY: u32 = 20;
 /// Byte cap on the verbatim原文 block (P6 = A: keep the source text, but
 /// bounded). `WikiStore::write_page` itself caps the whole page at 512 KB.
 const MAX_ORIGINAL_BYTES: usize = 64 * 1024;
+/// Match the wiki store's page bound for complete-document credential scans.
+const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 
 /// Cap on the summary rendered into the page header.
 const MAX_SUMMARY_CHARS: usize = 400;
@@ -379,10 +381,17 @@ pub fn try_consume_quota_detail(home_dir: &Path, agent_id: &str, kind: QuotaKind
 /// log). Deterministic for identical inputs — no timestamps — so re-pasting
 /// the same document is a no-op (§5.3(b) idempotency).
 fn render_content_part(req: &AutoPageRequest) -> String {
-    let summary = truncate_chars(req.summary.trim(), MAX_SUMMARY_CHARS);
-    let original_raw = req.original.trim();
+    let masked_summary = duduclaw_security::credential_detect::mask(&req.summary);
+    let summary = truncate_chars(masked_summary.trim(), MAX_SUMMARY_CHARS);
+    let masked_original = if req.original.len() <= MAX_DOCUMENT_BYTES {
+        duduclaw_security::credential_detect::mask_document(&req.original)
+            .unwrap_or_else(|_| duduclaw_security::credential_detect::UNAVAILABLE_MASK.into())
+    } else {
+        duduclaw_security::credential_detect::UNAVAILABLE_MASK.into()
+    };
+    let original_raw = masked_original.trim();
     let original = truncate_bytes(original_raw, MAX_ORIGINAL_BYTES);
-    let truncated = original.len() < original_raw.len();
+    let truncated = original.len() < original_raw.len() || req.original.len() > MAX_DOCUMENT_BYTES;
 
     let mut body = String::with_capacity(original.len() + 512);
     body.push_str(DATA_BANNER);
@@ -405,7 +414,7 @@ fn render_content_part(req: &AutoPageRequest) -> String {
 
 /// Strip newlines / markdown blockquote breakers from a one-line field.
 fn sanitize_inline(s: &str) -> String {
-    truncate_chars(&s.replace(['\n', '\r'], " "), 120)
+    truncate_chars(&duduclaw_security::credential_detect::mask(s).replace(['\n', '\r'], " "), 120)
 }
 
 /// Compose one revision-log line.
@@ -550,7 +559,7 @@ pub fn write_auto_page(
 
     let page = WikiPage {
         path: path.clone(),
-        title: truncate_chars(req.title.trim(), 120),
+        title: truncate_chars(duduclaw_security::credential_detect::mask(&req.title).trim(), 120),
         created,
         updated: now,
         tags: vec![
@@ -576,8 +585,14 @@ pub fn write_auto_page(
         body,
     };
 
+    let serialized = serialize_page(&page);
+    if serialized.len() > MAX_DOCUMENT_BYTES {
+        return Err(AutoPageError::Write("auto page exceeds 512 KiB".into()));
+    }
+    let serialized = duduclaw_security::credential_detect::mask_document(&serialized)
+        .map_err(|_| AutoPageError::Write("credential detection unavailable".into()))?;
     store
-        .write_page(&path, &serialize_page(&page))
+        .write_page(&path, &serialized)
         .map_err(|e| AutoPageError::Write(e.to_string()))?;
 
     Ok(if existing.is_some() {
@@ -701,6 +716,18 @@ pub fn pointer_subject(page_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security regression; not run (owner forbids builds).
+    #[test]
+    fn auto_page_sink_masks_direct_request() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        write_auto_page(&store, tmp.path(), "agnes", &req("password: fixture-title", "密碼：fixture-body")).unwrap();
+        let stored = std::fs::read_to_string(store.wiki_dir().join("auto/charter/company-charter.md")).unwrap();
+        assert!(!stored.contains("fixture-title"));
+        assert!(!stored.contains("fixture-body"));
+    }
+
     use tempfile::TempDir;
 
     fn store_in(tmp: &TempDir) -> WikiStore {

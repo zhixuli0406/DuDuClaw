@@ -370,7 +370,8 @@ pub fn build_sft_lines(
             DatasetFormat::ShareGpt => sharegpt_row_from_conversation(c),
             DatasetFormat::Alpaca => alpaca_row_from_conversation(c),
         };
-        if let Some(v) = row {
+        if let Some(mut v) = row {
+            duduclaw_security::credential_detect::mask_json(&mut v);
             lines.push(v.to_string());
         }
     }
@@ -379,7 +380,8 @@ pub fn build_sft_lines(
             DatasetFormat::ShareGpt => sharegpt_row_from_task(t),
             DatasetFormat::Alpaca => alpaca_row_from_task(t),
         };
-        if let Some(v) = row {
+        if let Some(mut v) = row {
+            duduclaw_security::credential_detect::mask_json(&mut v);
             lines.push(v.to_string());
         }
     }
@@ -391,7 +393,10 @@ pub fn build_preference_lines(pairs: &[PreferencePair], format: DatasetFormat) -
     pairs
         .iter()
         .filter_map(|p| preference_row(p, format))
-        .map(|v| v.to_string())
+        .map(|mut v| {
+            duduclaw_security::credential_detect::mask_json(&mut v);
+            v.to_string()
+        })
         .collect()
 }
 
@@ -1023,6 +1028,27 @@ mod tests {
             result_summary: result.into(),
             assigned_to: "finance".into(),
             completed_at: "2026-09-02T00:00:00Z".into(),
+        }
+    }
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[test]
+    fn training_line_sinks_mask_conversations_tasks_and_preferences() {
+        let conversation = conv(&[("user", "password: fixture-user"),
+            ("assistant", "password: fixture-reply")]);
+        let task = task("task", "password: fixture-task");
+        let pair = PreferencePair {
+            source: "approval".into(), prompt: "password: fixture-prompt".into(),
+            chosen: "password: fixture-chosen".into(), rejected: "password: fixture-rejected".into(),
+        };
+        for format in [DatasetFormat::ShareGpt, DatasetFormat::Alpaca] {
+            let mut lines = build_sft_lines(&[conversation.clone()], &[task.clone()], format);
+            lines.extend(build_preference_lines(&[pair.clone()], format));
+            assert_eq!(lines.len(), 3);
+            for line in lines {
+                assert!(!line.contains("fixture-"));
+                assert!(serde_json::from_str::<Value>(&line).is_ok());
+            }
         }
     }
 

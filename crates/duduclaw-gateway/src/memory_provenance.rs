@@ -150,6 +150,9 @@ pub fn turn_source_env_pairs() -> Vec<(String, String)> {
             ));
         }
     }
+    if let Some(turn) = crate::runtime_turn::current() {
+        out.push((duduclaw_core::egress_guard::ENV_TURN_ALIAS.to_string(), turn));
+    }
     // The person the turn or run is for (`crate::on_behalf_of`).
     out.extend(crate::on_behalf_of::env_pairs());
     out
@@ -279,9 +282,16 @@ impl TurnSources {
     }
 }
 
+tokio::task_local! {
+    /// Snapshot captured before the caller spawns asynchronous distillation.
+    pub(crate) static CONNECTOR_STAMPS: crate::egress_guard::ConnectorSnapshot;
+}
+
 /// `Sources(sources)` or `None` for an empty list (never a fabricated source).
 pub fn provenance_of(sources: &[SourceRef]) -> Option<Provenance> {
-    (!sources.is_empty()).then(|| Provenance::Sources(sources.to_vec()))
+    (!sources.is_empty()).then(|| CONNECTOR_STAMPS.try_with(Clone::clone)
+        .unwrap_or_else(|_| crate::egress_guard::ConnectorSnapshot::unknown())
+        .stamp(Provenance::Sources(sources.to_vec())))
 }
 
 /// The fence reason and source digest of an error, when the error is a fence

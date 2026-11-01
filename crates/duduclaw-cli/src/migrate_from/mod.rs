@@ -50,10 +50,12 @@ impl Platform {
 }
 
 /// Shared run context threaded through every platform importer.
+#[derive(Clone)]
 pub(crate) struct Ctx {
     pub home: PathBuf,
     pub platform: Platform,
     pub apply: bool,
+    pub confirm_profile: Option<String>,
     pub rename: bool,
     /// Target agent id (`--agent`). Required for `claude-code`, which imports
     /// into an existing agent rather than scaffolding a new one (WP-9A §8
@@ -92,7 +94,9 @@ pub async fn run(
     json: bool,
     agent: Option<String>,
     no_redact: bool,
+    confirm_profile: Option<String>,
 ) -> Result<()> {
+    crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     let plat = match platform.trim().to_ascii_lowercase().as_str() {
         "openclaw" | "moltbot" | "clawdbot" => Platform::OpenClaw,
         "hermes" => Platform::Hermes,
@@ -133,6 +137,7 @@ pub async fn run(
         home,
         platform: plat,
         apply,
+        confirm_profile,
         rename,
         agent,
         redact: !no_redact,
@@ -173,6 +178,10 @@ pub async fn run(
         return Ok(());
     }
 
+    if !report.profile_preview.is_null() {
+        println!("{}", serde_json::to_string_pretty(&report.profile_preview)?);
+        if let Some(hash) = &report.profile_confirmation { println!("確認內容後加 --confirm-profile {hash}"); }
+    }
     report.render_console();
 
     if let Some(path) = report_path {
@@ -424,4 +433,34 @@ pub(super) fn sanitize_agent_id(raw: &str) -> String {
     }
     let s = s.trim_matches('-').to_string();
     duduclaw_core::truncate_chars(&s, 64)
+}
+
+/// Require human review before any migration side effects.
+fn review_profiles(ctx: &Ctx, report: &mut Report, agents: &[crate::expert::agent_config::ir::AgentDraft]) -> Result<()> {
+    use crate::expert::agent_config::preview::{sections, digest};
+    let preview = sections(agents)?;
+    let hash = digest(&preview);
+    report.profile_preview = preview.clone();
+    report.profile_confirmation = Some(hash.clone());
+    if !ctx.apply { return Ok(()); }
+    if ctx.confirm_profile.as_deref() != Some(hash.as_str()) {
+        eprintln!("{}", serde_json::to_string_pretty(&preview).unwrap_or_default());
+        return Err(DuDuClawError::Config(format!("請先檢視四個區段與安全掃描結果，再加 --confirm-profile {hash} 確認匯入")));
+    }
+    if preview.as_array().into_iter().flatten().any(|agent|
+        agent["input_guard"].as_array().into_iter().flatten().any(|scan| scan["blocked"] == true)) {
+        return Err(DuDuClawError::Config("匯入內容或中繼資料未通過輸入安全掃描".into()));
+    }
+    for draft in agents {
+        crate::expert::agent_config::preview::validate_section_limits(draft)?;
+        if draft.user_profile.as_ref().map(|doc| doc.text.chars().count() > 4_000).unwrap_or(false) {
+            return Err(DuDuClawError::Config("服務對象資料超過 4,000 字".into()));
+        }
+        for doc in [&draft.soul, &draft.identity, &draft.user_profile, &draft.instructions, &draft.contract].into_iter().flatten() {
+            if let crate::expert::ScanVerdict::Blocked(reason) = crate::expert::scan_external(&doc.text) {
+                return Err(DuDuClawError::Config(format!("匯入內容未通過安全掃描：{reason}")));
+            }
+        }
+    }
+    Ok(())
 }

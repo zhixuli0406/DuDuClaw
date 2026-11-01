@@ -169,17 +169,24 @@ async fn a_spawn_drops_an_inherited_value_and_sets_the_scoped_one() {
 }
 
 #[test]
-fn a_malformed_stored_value_is_dropped_and_audited() {
+fn stored_provenance_distinguishes_human_background_and_unknown_and_audits() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     assert_eq!(from_stored(h, Some("user:u-1"), "sales", "message_queue").as_deref(), Some("user:u-1"));
     assert!(from_stored(h, None, "sales", "message_queue").is_none());
-    assert!(from_stored(h, Some("  "), "sales", "message_queue").is_none());
     assert!(audit_rows(h, AUDIT_REJECTED).is_empty());
-    assert!(from_stored(h, Some("user:dashboard"), "sales", "message_queue").is_none());
-    assert!(from_stored(h, Some("admin"), "sales", "bus_queue").is_none());
+    for raw in ["user:dashboard", "admin", "", "  "] {
+        let source = if raw == "user:dashboard" { "message_queue" } else { "bus_queue" };
+        let carried = from_stored(h, Some(raw), "sales", source);
+        assert!(carried.is_some(), "rejected stored provenance must stay present");
+        assert_eq!(PrincipalState::from_wire(carried.as_deref()), PrincipalState::Unknown);
+        assert!(!access::system_operation_permitted(h, carried.as_deref()));
+    }
+    assert_eq!(PrincipalState::from_wire(None), PrincipalState::Background);
+    assert!(access::system_operation_permitted(h, None), "old rows keep background work");
+    assert_eq!(PrincipalState::from_wire(Some("user:u-1")), PrincipalState::Human(user("u-1")));
     let rows = audit_rows(h, AUDIT_REJECTED);
-    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows.len(), 4, "{rows:?}");
     assert_eq!(rows[0]["details"]["reason"], "system_sender");
     assert_eq!(rows[1]["details"]["reason"], "missing_prefix");
     assert_eq!(rows[1]["details"]["source"], "bus_queue");

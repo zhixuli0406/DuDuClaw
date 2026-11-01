@@ -213,7 +213,7 @@ export const dailyItems: NavItem[] = [
   // declaration — no separate Personal wiring to forget. On the appliance
   // image this is the default landing page (see `App.tsx`'s `HomeLanding`);
   // on every other install it's one click away, same as 新對話/首頁.
-  { to: '/console', icon: Bot, label: 'nav.console', desc: 'nav.console.desc', ownScope: true, newIn: '1.62.0' },
+  { to: '/console', icon: Bot, label: 'nav.console', desc: 'nav.console.desc', minRole: 'admin', ownScope: true, newIn: '1.62.0' },
   // 收件匣 left the standing navigation on 2026-08-04 (D17). The page and its
   // route stay — the entry point is now the footer notification bell, which
   // lights up only when something actually needs a decision. See
@@ -288,13 +288,8 @@ export const navGroups: NavGroup[] = [
       // 進階 on Personal; last row of this group on Enterprise, where no 進階
       // group exists). Nothing was removed — the board keeps its route, the Home
       // task-summary cards, the mobile ＋交辦 action, and ⌘K.
-      // D7 (09-edition-split-features.md §4): `minRole: 'manager'` used to gate
-      // this row, which was never a real access-control question on Personal
-      // (single owner = always admin) but reads oddly for a future `employee`
-      // role — a cron schedule for one's own agent is the same "own scope" as
-      // /plans (no gate) and /runs (no gate), so it drops to `ownScope` here.
-      // — daily rows (一般層, frequency order).
-      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', ownScope: true },
+      // cron.* is admin-only, including listing and templates.
+      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'admin' },
       // U4 co-edited plans — shared step lists between the user and an AI employee.
       { to: '/plans', icon: ListChecks, label: 'nav.plans', desc: 'nav.plans.desc', ownScope: true },
       // Goal-loop console (2026-08-14) — assign autonomous goals and intervene
@@ -408,7 +403,7 @@ export const navGroups: NavGroup[] = [
       // click into a prefilled 交辦 panel. Sits right after 「AI 團隊」: the two
       // are a pair (install a team → see what it can do), and both are the
       // 低頻 tail of this group.
-      { to: '/gallery', icon: Images, label: 'nav.gallery', desc: 'nav.gallery.desc', newIn: '1.60.0' },
+      { to: '/gallery', icon: Images, label: 'nav.gallery', desc: 'nav.gallery.desc', minRole: 'admin', newIn: '1.60.0' },
       // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
       // 桌寵工作室 — photo → interactive desktop pet. Desktop app only
@@ -420,6 +415,7 @@ export const navGroups: NavGroup[] = [
     // 設定 — management shell entry + brand/about page.
     label: 'navGroup.settings',
     items: [
+      { to: '/me/account', icon: KeyRound, label: 'nav.account', desc: 'nav.account.desc', ownScope: true, newIn: '1.78.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
@@ -704,7 +700,7 @@ export const manageAdvancedNav: NavItem[] = [
   // ── 3. 維運（低頻・低重要：日誌 → 可靠性 → 模型用量 → 資料搬家）
   // D9: no longer `personalHidden` — a single operator needs to see what
   // happened too; it stays folded under 進階設定 same as every other row here.
-  { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager' },
+  { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'admin' },
   { to: '/manage/reliability', icon: Activity, label: 'manage.reliability', desc: 'manage.reliability.desc', minRole: 'admin', personalHidden: true },
   { to: '/manage/inference', icon: Cpu, label: 'manage.inference', desc: 'manage.inference.desc', minRole: 'admin' },
   // 本地模型市集 — intent + hardware-fit HF picker with one-click install

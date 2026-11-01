@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import type { ExpertImportItem, ExpertImportReport, ExpertReimport } from '@/lib/api';
+import { AgentProfilePreview } from './AgentProfilePreview';
 import { EditsList } from './EditsList';
 import { ImportErrorPanel, type ImportFailure } from './ImportErrorPanel';
 import { ReimportChoice } from './ReimportChoice';
@@ -26,7 +27,7 @@ const SECTIONS: { id: string; kinds: string[] }[] = [
   { id: 'skills', kinds: ['skill', 'skill-disabled', 'skill-needs', 'skill-name', 'skill-files'] },
 ];
 
-const KNOWN_FORMATS = ['doubao', 'openclaw', 'hermes', 'dify', 'workspace', 'subagent', 'instructions'];
+const KNOWN_FORMATS = ['doubao', 'openclaw', 'hermes', 'dify', 'workspace', 'subagent', 'instructions', 'duduclaw'];
 
 function sectionOf(item: ExpertImportItem): string {
   return SECTIONS.find((s) => s.kinds.includes(item.kind))?.id ?? 'notes';
@@ -120,6 +121,8 @@ export function ImportReportDialog({
     failure ?? (error ? { code: report?.error?.code ?? 'import.unknown', params: report?.error?.params, text: error } : null);
   const failed = shownFailure !== null;
   const replaceInfo = report?.details?.replace ?? null;
+  const profilePreview = report?.details?.profile_preview;
+  const profilePlan = report?.details?.profile_install_plan;
   const needsEditConsent = phase === 'plan' && !failed && reimport?.mode === 'replace' && Boolean(replaceInfo?.edited);
   const [confirmingEdits, setConfirmingEdits] = useState(false);
   useEffect(() => {
@@ -153,6 +156,13 @@ export function ImportReportDialog({
               : t(phase === 'plan' ? 'experts.report.planDesc' : 'experts.report.doneDesc', { format: formatLabel })}
           </DialogDescription>
         </DialogHeader>
+
+        {phase === 'plan' && !failed && (profilePreview || profilePlan) && (
+          <AgentProfilePreview
+            profiles={profilePreview ?? []}
+            plan={profilePlan}
+          />
+        )}
 
         {shownFailure && (
           <ImportErrorPanel failure={shownFailure}>
@@ -259,7 +269,7 @@ export function ImportReportDialog({
                 variant="brand"
                 size="sm"
                 onClick={() => (needsEditConsent ? setConfirmingEdits(true) : onConfirm())}
-                disabled={busy || report === null}
+                disabled={busy || report === null || (!!(profilePreview || profilePlan) && !report.details?.profile_confirmation)}
               >
                 {busy && <Spinner className="size-3.5" />}
                 {reimport?.mode === 'replace' ? t('experts.reimport.confirmReplace') : t('experts.report.confirm')}

@@ -244,15 +244,23 @@ impl TriggerMonitor {
     /// spend cap, not an authorization gate; the per-agent budget gate is the
     /// fail-closed one).
     pub async fn cost_limit_reached(&self, home: &Path) -> Option<(f64, f64)> {
+        self.triggers(home).cost_limit_usd?;
+        self.cost_limit_reached_from(home, crate::cost_telemetry::get_telemetry()?).await
+    }
+
+    async fn cost_limit_reached_from(
+        &self,
+        home: &Path,
+        telemetry: &crate::cost_telemetry::CostTelemetry,
+    ) -> Option<(f64, f64)> {
         let limit = self.triggers(home).cost_limit_usd?;
         let cached = *self.cost.lock().unwrap_or_else(|e| e.into_inner());
         let spent = match cached {
             Some((at, usd)) if at.elapsed() < COST_CACHE_TTL => usd,
             _ => {
-                let telemetry = crate::cost_telemetry::get_telemetry()?;
                 let summary = telemetry.summary_global(24).await.ok()?;
-                // millicents → USD
-                let usd = summary.total_cost_millicents as f64 / 100_000.0;
+                // Stored cents → USD (the telemetry field is historically misnamed).
+                let usd = summary.total_cost_millicents as f64 / 100.0;
                 *self.cost.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), usd));
                 usd
             }
@@ -355,6 +363,27 @@ mod tests {
         assert_eq!(m.triggers(dir.path()).max_replies_per_minute, Some(1));
         assert!(m.admit_reply(dir.path(), "s"));
         assert!(!m.admit_reply(dir.path(), "s"));
+    }
+
+    #[tokio::test]
+    async fn cost_limit_uses_stored_cents_at_five_dollars() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("KILLSWITCH.toml"), "[triggers]\ncost_limit_usd = 5\n").unwrap();
+        let db = dir.path().join("cost.db");
+        let telemetry = crate::cost_telemetry::CostTelemetry::new(&db).unwrap();
+        telemetry.record("employee", crate::cost_telemetry::RequestType::Chat, "unknown",
+            &crate::cost_telemetry::TokenUsage { input_tokens: 1, output_tokens: 0,
+                cache_read_tokens: 0, cache_creation_tokens: 0 }).await;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (stored, expected) in [(499, None), (500, Some((5.0, 5.0)))] {
+            conn.execute("UPDATE token_usage SET cost_millicents = ?1", [stored]).unwrap();
+            let monitor = TriggerMonitor {
+                state: Mutex::new(TriggerState::default()),
+                config: Mutex::new(None),
+                cost: Mutex::new(None),
+            };
+            assert_eq!(monitor.cost_limit_reached_from(dir.path(), &telemetry).await, expected);
+        }
     }
 
     #[tokio::test]

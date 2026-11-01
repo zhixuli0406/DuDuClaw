@@ -215,6 +215,10 @@ fn modify<T>(
         answer = Some((|| {
             let mut store = read(home)?;
             let out = update(&mut store)?;
+            for record in &store.records {
+                crate::disconnect_forget::connections::mark_connecting(home,
+                    &format!("google:person:{}", record.metadata.owner_id))?;
+            }
             let bytes = serde_json::to_vec_pretty(&store).map_err(|_| UNREADABLE)?;
             if bytes.len() as u64 > MAX_STORE_BYTES {
                 return Err("個人連線紀錄已達容量上限。".into());

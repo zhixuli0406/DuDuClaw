@@ -10,13 +10,10 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { formatError } from '@/lib/toast';
 import { openExternal } from '@/lib/external-link';
 import { Card, CardHeader, CardTitle, CardContent, Button, Badge, Input } from '@/components/mds';
 import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
-
-/** The OAuth redirect URI the gateway serves — users must register this exact
- *  value in each provider's OAuth app. Mirrors `handle_mcp_oauth_callback`. */
-export const OAUTH_REDIRECT_URI = 'http://localhost:3000/api/mcp/oauth/callback';
 
 type ConnState = 'loading' | 'unconfigured' | 'configured' | 'connected';
 
@@ -24,12 +21,7 @@ interface PanelState {
   conn: ConnState;
   scopes: string[];
   expiresAt: string | null;
-  /**
-   * The redirect URI the user must register, as reported by the gateway. The
-   * module constant below is only a fallback for older gateways — it is wrong
-   * whenever `DUDUCLAW_PORT` differs, which is exactly the mistake that made
-   * every consent flow dead-end before this was derived server-side.
-   */
+  /** The exact redirect URI reported by the gateway; empty when unavailable. */
   redirectUri: string;
   /** The saved OAuth client id (public value, shown in full). */
   savedClientId: string;
@@ -59,6 +51,11 @@ export interface IntegrationConnectPanelProps {
   /** Extra setup steps inserted after step 1 — full i18n keys, in order. */
   extraSetupSteps?: readonly string[];
   /** Optional transform for a granted-scope badge label (Google strips its URL prefix). */
+  /** Notify the host wizard after fresh authorization. */
+  onConnected?: () => void;
+  /** The wizard renders the same URI above every step. */
+  hideRedirect?: boolean;
+  testing?: boolean;
   formatScope?: (scope: string) => string;
 }
 
@@ -84,6 +81,9 @@ export function IntegrationConnectPanel({
   capabilities,
   extraSetupSteps = [],
   formatScope,
+  onConnected,
+  testing,
+  hideRedirect = false,
 }: IntegrationConnectPanelProps) {
   const intl = useIntl();
   const t = useCallback((suffix: string) => intl.formatMessage({ id: `${prefix}.${suffix}` }), [intl, prefix]);
@@ -91,7 +91,7 @@ export function IntegrationConnectPanel({
     conn: 'loading',
     scopes: [],
     expiresAt: null,
-    redirectUri: OAUTH_REDIRECT_URI,
+    redirectUri: '',
     savedClientId: '',
     hasSecret: false,
     secretMasked: '',
@@ -130,11 +130,16 @@ export function IntegrationConnectPanel({
       const configured = provider?.configured ?? false;
       const scopes = status.scopes ?? provider?.scopes ?? [];
       const savedClientId = provider?.client_id ?? '';
+      if (providerId === 'google') {
+        if (status.needs_reconnect) setNotice({ kind: 'error', text: intl.formatMessage({ id: 'google.oauth.needsReconnect' }) });
+        else if (status.error_code) setNotice({ kind: 'error', text: intl.formatMessage({ id: `google.oauth.${status.error_code}` }) });
+        else if (status.testing_warning) setNotice({ kind: 'info', text: intl.formatMessage({ id: 'google.oauth.testingWarning' }) });
+      }
       setState({
-        conn: status.authenticated ? 'connected' : configured ? 'configured' : 'unconfigured',
+        conn: status.authenticated && !status.needs_reconnect ? 'connected' : configured ? 'configured' : 'unconfigured',
         scopes,
         expiresAt: status.expires_at,
-        redirectUri: provider?.redirect_uri || OAUTH_REDIRECT_URI,
+        redirectUri: provider?.redirect_uri || '',
         savedClientId,
         hasSecret: provider?.has_client_secret ?? false,
         secretMasked: provider?.client_secret_masked ?? '',
@@ -145,9 +150,10 @@ export function IntegrationConnectPanel({
       // Google credentials had disappeared.
       if (!clientIdTouched.current && savedClientId) setClientId(savedClientId);
     } catch {
+      setState(current => ({ ...current, redirectUri: '' }));
       setNotice({ kind: 'error', text: t('error.load') });
     }
-  }, [providerId, t]);
+  }, [providerId, t, intl]);
 
   useEffect(() => {
     refresh();
@@ -156,53 +162,61 @@ export function IntegrationConnectPanel({
     };
   }, [refresh]);
 
-  /**
-   * Poll auth status after opening the consent window.
-   *
-   * `baseline` is the expiry recorded before consent opened — polling only
-   * declares success once the stored token moves past it (or a live access
-   * token appears), so re-authorizing an existing connection cannot report
-   * success off the old token that was already on file.
-   */
-  const startPolling = useCallback((baseline: string | null) => {
+  /** Google must observe a fresh callback; an old or refreshed token is insufficient. */
+  const startPolling = useCallback((baseline: string | null, connectedBaseline?: string | null) => {
     if (pollRef.current) clearInterval(pollRef.current);
     let attempts = 0;
     pollRef.current = setInterval(async () => {
       attempts += 1;
       if (attempts > 100) {
         if (pollRef.current) clearInterval(pollRef.current);
+        setEditing(true);
+        setNotice({ kind: 'error', text: intl.formatMessage({ id: 'integration.oauth.timeout' }) });
         return;
       }
       try {
         const status = await api.mcp.oauthStatus(providerId);
-        // `authenticated` is now true for a stale-but-refreshable token, so it
-        // would report success the instant polling starts when the user is
-        // re-authorizing an already-connected provider. Success means a token
-        // that is actually new: a live access token, or an expiry that moved
-        // past where it stood when the consent window opened.
-        const fresh =
-          status.access_token_valid === true ||
-          (status.access_token_valid === undefined && status.authenticated) ||
+        if (status.error_code) {
+          if (pollRef.current) clearInterval(pollRef.current);
+          setNotice({ kind: 'error', text: intl.formatMessage({ id: `google.oauth.${status.error_code}` }) });
+          return;
+        }
+        const fresh = providerId === 'google'
+          ? status.authenticated && !!status.connected_at && status.connected_at !== connectedBaseline
+          : (!baseline && (status.access_token_valid === true || (status.access_token_valid === undefined && status.authenticated))) ||
           (!!status.expires_at && !!baseline && status.expires_at > baseline);
         if (fresh) {
           if (pollRef.current) clearInterval(pollRef.current);
           setAuthUrl(null);
           setNotice({ kind: 'info', text: t('connected.toast') });
           await refresh();
+          onConnected?.();
         }
       } catch {
         /* keep polling until timeout */
       }
     }, 3000);
-  }, [providerId, refresh, t]);
+  }, [providerId, refresh, t, intl, onConnected]);
 
   /** Returns whether the consent window was actually opened. */
   const openConsent = useCallback(
     async (id?: string, secret?: string): Promise<boolean> => {
       if (providerId === 'google' && !googleDataConfirmed) return false;
+      if (providerId === 'google') {
+        try {
+          const current = await api.googleCredentials.get();
+          const replacing = ['service_account', 'apps_script'].includes(current.effective);
+          if (replacing && !confirm(intl.formatMessage({ id: 'google.cred.oauthReplaceConfirm' }))) return false;
+          await api.googleCredentials.set({ mode: 'oauth', ...(testing === undefined ? {} : { testing }), ...(replacing ? { replace_confirmed: true } : {}) });
+        } catch (e) {
+          setNotice({ kind: 'error', text: formatError(e) });
+          return false;
+        }
+      }
       setBusy(true);
       setNotice(null);
       try {
+        const connectedBaseline = providerId === 'google' ? (await api.mcp.oauthStatus(providerId)).connected_at : undefined;
         const { auth_url } = await api.mcp.oauthStart(
           providerId,
           id,
@@ -214,16 +228,16 @@ export function IntegrationConnectPanel({
         openExternal(auth_url);
         setAuthUrl(auth_url);
         setNotice({ kind: 'info', text: t('waiting') });
-        startPolling(state.expiresAt);
+        startPolling(state.expiresAt, connectedBaseline);
         return true;
       } catch (e) {
-        setNotice({ kind: 'error', text: String(e) });
+        setNotice({ kind: 'error', text: formatError(e) });
         return false;
       } finally {
         setBusy(false);
       }
     },
-    [googleDataConfirmed, providerId, startPolling, state.expiresAt, t],
+    [googleDataConfirmed, providerId, startPolling, state.expiresAt, t, testing, intl],
   );
 
   const handleSaveAndConnect = async () => {
@@ -325,6 +339,16 @@ export function IntegrationConnectPanel({
         </div>
       )}
 
+      {providerId === 'google' && !hideRedirect && (
+        <div className="space-y-1 rounded-lg border border-surface-border p-3 text-xs">
+          <p>{intl.formatMessage({ id: 'google.wizard.redirect' })}</p>
+          <code className="block select-all break-all">{state.redirectUri || intl.formatMessage({ id: 'google.wizard.redirectUnavailable' })}</code>
+          <Button variant="outline" size="sm" disabled={!state.redirectUri} onClick={() => { void navigator.clipboard.writeText(state.redirectUri).catch(() => setNotice({ kind: 'error', text: intl.formatMessage({ id: 'google.wizard.copyFailed' }) })); }}>
+            {intl.formatMessage({ id: 'common.copy' })}
+          </Button>
+        </div>
+      )}
+
       {/* Manual fallback while an authorization is in flight — if no consent
           window appeared, the URL itself completes the flow in any browser. */}
       {authUrl && (
@@ -343,8 +367,8 @@ export function IntegrationConnectPanel({
         </div>
       )}
 
-      {/* Capabilities — always shown so users know what they're enabling. */}
-      {state.conn !== 'loading' && (
+      {/* Explain the available capabilities without rendering an empty card. */}
+      {state.conn !== 'loading' && capabilities.length > 0 && (
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">{t('capabilities.title')}</CardTitle>
@@ -398,10 +422,10 @@ export function IntegrationConnectPanel({
               ))}
               <li>{t('setup.step2')}</li>
               <li>
-                {t('setup.step3')}
-                <code className="ml-1 select-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground">
-                  {state.redirectUri}
-                </code>
+                {providerId === 'google' && !hideRedirect ? t('setup.step3Above') : <>
+                  {t('setup.step3')}{' '}
+                  <code className="break-all select-all">{state.redirectUri || intl.formatMessage({ id: 'google.wizard.redirectUnavailable' })}</code>
+                </>}
               </li>
               <li>{t('setup.step4')}</li>
             </ol>
@@ -444,10 +468,13 @@ export function IntegrationConnectPanel({
             </div>
 
             {providerId === 'google' && (
-              <GoogleDataDisclosure
-                confirmed={googleDataConfirmed}
-                onConfirmedChange={setGoogleDataConfirmed}
-              />
+              <div className="space-y-3">
+                <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'google.wizard.consentHint' })}</p>
+                <GoogleDataDisclosure
+                  confirmed={googleDataConfirmed}
+                  onConfirmedChange={setGoogleDataConfirmed}
+                />
+              </div>
             )}
 
             <div className="flex flex-wrap gap-2">
@@ -474,10 +501,13 @@ export function IntegrationConnectPanel({
             <p className="text-sm text-muted-foreground">{t('configured.hint')}</p>
             {savedSummary}
             {providerId === 'google' && (
-              <GoogleDataDisclosure
-                confirmed={googleDataConfirmed}
-                onConfirmedChange={setGoogleDataConfirmed}
-              />
+              <div className="space-y-3">
+                <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'google.wizard.consentHint' })}</p>
+                <GoogleDataDisclosure
+                  confirmed={googleDataConfirmed}
+                  onConfirmedChange={setGoogleDataConfirmed}
+                />
+              </div>
             )}
             <div className="flex gap-2">
               <Button variant="brand" onClick={() => openConsent()} disabled={busy || (providerId === 'google' && !googleDataConfirmed)}>

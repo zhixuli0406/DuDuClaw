@@ -57,7 +57,7 @@ pub fn scaffold(home_dir: &Path, spec: &EphemeralSpawnSpec) -> Result<ScaffoldRe
     )
 }
 
-/// The parent employee's `agent.toml`, as raw text and as a parsed
+/// The parent employee's resolved configuration, as raw text and as a parsed
 /// `AgentConfig` — the single read [`scaffold_with`] bases both the verbatim
 /// section copy and the capability containment check on.
 ///
@@ -71,7 +71,13 @@ fn read_parent_config(
     home_dir: &Path,
     parent: &str,
 ) -> Result<(String, duduclaw_core::types::AgentConfig), String> {
-    let path = home_dir.join("agents").join(parent).join("agent.toml");
+    let resolved = duduclaw_core::preset::agent_resolved_path(home_dir, parent);
+    let path = match std::fs::symlink_metadata(&resolved) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            home_dir.join("agents").join(parent).join("agent.toml")
+        }
+        _ => resolved,
+    };
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read parent agent '{parent}': {e} (fail-closed)"))?;
     let config: duduclaw_core::types::AgentConfig = toml::from_str(&raw)
@@ -344,6 +350,13 @@ pub(super) fn scaffold_with(
                 .collect(),
         ),
     );
+    // A helper keeps the parent's recipient boundary, including invalid raw
+    // values that must continue to fail closed in the recipient guard.
+    for key in ["recipient_guard", "recipients"] {
+        if let Some(value) = parent_value.get("capabilities").and_then(|caps| caps.get(key)) {
+            caps_tbl.insert(key.into(), value.clone());
+        }
+    }
     table.insert("capabilities".into(), toml::Value::Table(caps_tbl));
 
     let mut perm_tbl = toml::Table::new();

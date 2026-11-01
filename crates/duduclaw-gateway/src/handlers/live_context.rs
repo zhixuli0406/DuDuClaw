@@ -236,12 +236,17 @@ pub(crate) fn read_failure_stats() -> (u64, u64) {
 
 impl MethodHandler {
     pub(crate) async fn socket_context(&self, ctx: &UserContext, heartbeat: bool) -> Result<UserContext, SocketValidity> {
-        if ctx.user_id == "system" { return Ok(ctx.clone()); }
-        let Some(db) = self.user_db.read().await.clone() else { return Ok(ctx.clone()); };
+        if ctx.user_id == "system" {
+            return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()));
+        }
+        let Some(db) = self.user_db.read().await.clone() else {
+            return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()));
+        };
         let cache = self.live_ctx_cache.clone();
         let ctx = ctx.clone();
         match tokio::task::spawn_blocking(move || resolve_socket_context(&db, &cache, &ctx, heartbeat)).await {
-            Ok(Ok(live)) => Ok(live),
+            // Keep the shared cache raw; preset changes must narrow every return.
+            Ok(Ok(live)) => Ok(crate::machine_employee::without_restricted_access(&self.home_dir, live)),
             Ok(Err(e)) => Err(SocketValidity::from_error(&e)),
             Err(_) => Err(SocketValidity::Unavailable),
         }
@@ -250,10 +255,10 @@ impl MethodHandler {
     /// The context this RPC runs under. See the module docs.
     pub(crate) async fn live_context(&self, ctx: &UserContext) -> Result<UserContext, WsFrame> {
         if ctx.user_id == "system" {
-            return Ok(ctx.clone());
+            return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()));
         }
         let Some(db) = self.user_db.read().await.clone() else {
-            return Ok(ctx.clone());
+            return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()));
         };
         // SQLite reads are blocking; keep them off the runtime workers.
         let cache = self.live_ctx_cache.clone();
@@ -267,7 +272,9 @@ impl MethodHandler {
                 if !live.team_access.is_empty() && self.resolve_edition_profile().await.is_personal() {
                     live.team_access.clear();
                 }
-                Ok(live)
+                // Preset bindings do not bump users.db's generation. Narrow
+                // every returned snapshot, after the raw cache lookup.
+                Ok(crate::machine_employee::without_restricted_access(&self.home_dir, live))
             }
             Ok(Err(e)) => Err(WsFrame::error_response("", &e)),
             Err(join) => {

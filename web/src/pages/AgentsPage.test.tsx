@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -7,8 +8,10 @@ import { renderWithProviders } from '@/test/render';
 import { toastBus, type ToastInput } from '@/lib/toast';
 import { AgentsPage } from './AgentsPage';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useTasksStore } from '@/stores/tasks-store';
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [] });
   vi.clearAllMocks();
   // Default: the API returns empty agents list
   mockWsClient.call.mockResolvedValue({ agents: [] });
@@ -164,4 +167,19 @@ describe('AgentsPage', () => {
     });
     expect(screen.queryByText('detail-page-probe')).not.toBeInTheDocument();
   });
+});
+
+
+it('shows unavailable task counts for team AI staff rather than zero', async () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
+  useTasksStore.setState({ tasks: [], error: null, tasksPartialError: null, loading: false });
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'agents.callable'
+    ? { agents: [{ name: 'team-bot', display_name: 'Team Bot', via: 'team', via_user_name: 'Report', status: 'active', role: 'worker' }] }
+    : method === 'agents.list' ? { agents: [] } : { tasks: [] }));
+  renderWithProviders(<AgentsPage />);
+  expect(await screen.findByText('Team Bot')).toBeInTheDocument();
+  expect(screen.getByText('Unavailable')).toBeInTheDocument();
+  expect(screen.getByText('Report’s AI employee')).toHaveAttribute('title', expect.stringContaining('assign work and view its status'));
+  expect(screen.getByText('Report’s AI employee')).toHaveAttribute('title', expect.stringContaining('Memory and settings require direct access'));
+  expect(screen.queryByText('0')).not.toBeInTheDocument();
 });

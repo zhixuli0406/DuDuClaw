@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -135,6 +136,7 @@ function PhoneHomeIndicator({
 }
 
 export function LicensePage() {
+  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const intl = useIntl();
   const contact = useCommercialContact();
   const connectionState = useConnectionStore((s) => s.state);
@@ -294,7 +296,7 @@ export function LicensePage() {
           </div>
 
           {/* ── Activate — prominent while on OpenSource ── */}
-          {!snapshot.installed && (
+          {isAdmin && !snapshot.installed && (
             <ActivateLicenseCard collapsed={false} onActivated={() => void load()} />
           )}
 
@@ -363,7 +365,7 @@ export function LicensePage() {
           )}
 
           {/* ── Replace / re-activate — collapsed once licensed ── */}
-          {snapshot.installed && (
+          {isAdmin && snapshot.installed && (
             <ActivateLicenseCard collapsed onActivated={() => void load()} />
           )}
 

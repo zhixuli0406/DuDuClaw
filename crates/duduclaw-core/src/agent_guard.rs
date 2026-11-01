@@ -25,6 +25,8 @@ pub const INSTRUCTIONS_FILE: &str = "INSTRUCTIONS.md";
 pub const AGENT_STRUCTURE_FILES: &[&str] = &[
     "agent.toml",
     "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
     "CLAUDE.md",
     "MEMORY.md",
     ".mcp.json",
@@ -39,7 +41,7 @@ pub const AGENT_STRUCTURE_FILES: &[&str] = &[
 /// CLI sandboxes freeze authority and runtime configuration to prevent self-escalation.
 /// MEMORY.md and CLAUDE.md remain writable employee working files.
 pub fn employee_control_paths() -> impl Iterator<Item = &'static str> {
-    ["agent.toml", "SOUL.md", "CONTRACT.toml", "INSTRUCTIONS.md", ".mcp.json"]
+    ["agent.toml", "SOUL.md", "IDENTITY.md", "USER.md", "CONTRACT.toml", "INSTRUCTIONS.md", ".mcp.json"]
         .into_iter()
         .chain(crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_DIRS)
         .chain(crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_FILES)
@@ -228,6 +230,8 @@ pub enum GuardDecision {
         attempted_path: PathBuf,
         changed: Vec<String>,
     },
+    /// Credential ledger metadata is not exposed to employee Read calls.
+    BlockedCredentialRead { attempted_path: PathBuf },
     /// G1 round 3: where the write would really land could not be
     /// established — a dangling or looping symbolic link, an unreadable
     /// parent directory, a relative path with no known working directory, or
@@ -369,7 +373,7 @@ impl GuardDecision {
                 caller
             )),
             Self::BlockedOwnInstructionsWrite { caller, attempted_path } => Some(format!(
-                "已封鎖：INSTRUCTIONS.md 是管理者為 AI 員工設定的工作規則，AI 員工不可直接改寫（即使是自己的）。\n\
+                "已封鎖：這份身分、服務對象或工作規則設定由管理者維護，AI 員工不可直接改寫（即使是自己的）。\n\
                  檔案：{}\n\
                  你的身分：{}\n\
                  如果需要調整工作規則，請告知管理者，由管理者處理。",
@@ -415,6 +419,7 @@ impl GuardDecision {
                     _ => "這項操作請由管理者處理。",
                 }
             )),
+            Self::BlockedCredentialRead { .. } => Some("憑證稽核資料僅供管理員查閱，AI 員工不可直接讀取。".into()),
             Self::BlockedUnresolvablePath { attempted_path, reason } => Some(format!(
                 "已封鎖：無法確認這次寫入實際會落在哪裡，為避免繞過資料夾保護一律拒絕。\n\
                  檔案：{}\n\
@@ -624,6 +629,9 @@ mod tests {
     #[test]
     fn employee_control_paths_include_every_runtime_config_path() {
         let paths: Vec<_> = employee_control_paths().collect();
+        for path in ["IDENTITY.md", "USER.md"] {
+            assert!(paths.contains(&path), "missing control path: {path}");
+        }
         for path in crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_DIRS
             .into_iter().chain(crate::org_field_guard::rules::AGENT_RUNTIME_CONFIG_FILES) {
             assert!(paths.contains(&path), "missing control path: {path}");
@@ -919,4 +927,47 @@ mod tests {
             GuardDecision::BlockedOutsideHome { .. }
         ));
     }
+}
+
+/// Credential audit state is never exposed through the native Read lane.
+/// Compare components on both literal and resolved paths, never substrings.
+pub fn check_credential_read(path: &Path, home: &Path) -> GuardDecision {
+    let blocked = |path: &Path, home: &Path| {
+        let path = lexical_normalize(path);
+        let root = lexical_normalize(home).join("credentials");
+        strip_prefix_ci(&path, &root).is_some()
+    };
+    let denied = || GuardDecision::BlockedCredentialRead { attempted_path: path.to_path_buf() };
+    if blocked(path, home) { return denied(); }
+    match (crate::resolve_real_path(path), crate::resolve_real_path(home)) {
+        (Ok(path), Ok(home)) if blocked(&path, &home) => denied(),
+        (Ok(_), Ok(_)) => GuardDecision::NotAgentFile,
+        _ => GuardDecision::BlockedUnresolvablePath {
+            attempted_path: path.to_path_buf(), reason: "無法確認憑證資料讀取範圍".into(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod credential_read_tests {
+    use super::*;
+
+    #[test]
+    fn read_guard_blocks_only_credential_directory_components() {
+        let home = Path::new("/tmp/duduclaw-credential-guard-test");
+        assert!(!check_credential_read(&home.join("credentials/ledger.db"), home).is_allowed());
+        assert!(!check_credential_read(&home.join("Credentials/ledger.db"), home).is_allowed());
+        assert!(check_credential_read(&home.join("credentials-notes/a.md"), home).is_allowed());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn read_guard_follows_symlink_into_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("credentials")).unwrap();
+        std::fs::write(home.path().join("credentials/ledger.db"), b"fixture").unwrap();
+        let alias = home.path().join("notes");
+        std::os::unix::fs::symlink(home.path().join("credentials"), &alias).unwrap();
+        assert!(!check_credential_read(&alias.join("ledger.db"), home.path()).is_allowed());
+    }
+
 }

@@ -598,3 +598,10 @@ describe('EditAgentPage', () => {
 
 // This suite exercises the standard installation catalog.
 beforeEach(setStandardProductPolicyFixture);
+
+it('does not load settings for an AI employee accessed through a team member', () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
+  renderAt('/agents/team-agent/edit');
+  expect(screen.getByRole('note')).toHaveTextContent('Memory and settings require direct access');
+  expect(mockWsClient.call).not.toHaveBeenCalled();
+});

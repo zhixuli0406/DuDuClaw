@@ -1,3 +1,4 @@
+import { cn } from '@/lib/utils';
 import { ProductPolicyNotice } from '@/components/ProductPolicyNotice';
 import { Suspense, useEffect } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router';
@@ -24,7 +25,7 @@ import {
 } from '@/components/mds';
 import { ArrowUpCircle, Bell, X } from 'lucide-react';
 import { useIntl } from 'react-intl';
-import { useApprovalsStore } from '@/stores/approvals-store';
+import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { useTourStore } from '@/stores/tour-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useEffectiveName } from '@/lib/product-identity';
@@ -33,14 +34,11 @@ import { useNavProgressStore } from '@/stores/nav-progress-store';
 import { useUpdateStore } from '@/stores/update-store';
 
 /**
- * Mobile inbox bell (2026-08-04, D17). Silent while nothing is pending — an
- * always-on icon in a 12px-tall bar is just furniture; one that appears when
- * there is a decision waiting is a signal.
+ * Mobile inbox entry remains reachable even when there is no pending work.
  */
 function MobileInboxBell() {
   const intl = useIntl();
-  const count = useApprovalsStore((s) => s.pendingCount);
-  if (count <= 0) return null;
+  const count = useApprovalsStore(selectInboxCount);
   const label = intl.formatMessage({ id: 'nav.inbox.pending' }, { count });
   return (
     <NavLink
@@ -50,9 +48,9 @@ function MobileInboxBell() {
       className="relative ml-auto grid size-8 shrink-0 place-items-center rounded-md text-brand outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50"
     >
       <Bell className="size-4" />
-      <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[9px] font-medium leading-none tabular-nums text-brand-foreground">
+      {count > 0 && <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[9px] font-medium leading-none tabular-nums text-brand-foreground">
         {count > 99 ? '99+' : count}
-      </span>
+      </span>}
     </NavLink>
   );
 }
@@ -130,6 +128,7 @@ function AppShell() {
   const { content } = usePanel();
   const navActive = useNavProgressStore((s) => s.active);
   const brandName = useEffectiveName();
+  const isInbox = location.pathname === '/inbox';
 
   return (
     <SidebarProvider>
@@ -151,7 +150,7 @@ function AppShell() {
           <MobileInboxBell />
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        <div className={cn('flex min-h-0 flex-1 flex-col', isInbox ? 'overflow-hidden' : 'overflow-y-auto')}>
           <div className="empty:hidden [&>*+*]:mt-2 [&:not(:empty)]:px-4 [&:not(:empty)]:pt-3 md:[&:not(:empty)]:px-6">
             <ProductPolicyNotice />
             <SoftLimitBanner />
@@ -160,7 +159,7 @@ function AppShell() {
             <UpdateBanner />
           </div>
           {/* Re-key on route change to replay the entrance reveal */}
-          <div key={location.pathname} className="page-enter flex flex-1 flex-col p-4 pb-20 md:p-6 md:pb-6">
+          <div key={location.pathname} className={cn('page-enter flex flex-1 flex-col', isInbox ? 'min-h-0 overflow-hidden pb-20 md:pb-0' : 'p-4 pb-20 md:p-6 md:pb-6')}>
             <RouteErrorBoundary resetKey={location.pathname}>
               <Suspense fallback={<RouteFallback />}>
                 <Outlet />

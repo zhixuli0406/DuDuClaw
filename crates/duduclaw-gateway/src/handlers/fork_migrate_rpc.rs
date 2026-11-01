@@ -356,6 +356,13 @@ impl MethodHandler {
         }
         if apply {
             cmd.arg("--apply");
+            if matches!(platform.as_str(), "openclaw" | "hermes" | "paperclip") {
+                let Some(digest) = params.get("confirm_profile").and_then(|v| v.as_str())
+                    .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())) else {
+                    return WsFrame::error_response("", "請先預覽設定檔，再確認匯入");
+                };
+                cmd.arg("--confirm-profile").arg(digest);
+            }
         }
         if rename {
             cmd.arg("--rename");

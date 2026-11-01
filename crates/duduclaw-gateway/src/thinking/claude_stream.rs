@@ -57,9 +57,9 @@ pub fn is_stream_event(event: &Value) -> bool {
     event.get("type").and_then(Value::as_str) == Some("stream_event")
 }
 
-/// The line to write to `claude_stream.log` (`DUDUCLAW_STREAM_DEBUG=1`):
-/// a `thinking_delta` line is replaced by a marker, every other line is
-/// written as it came.
+/// The line to write to `claude_stream.log` (`DUDUCLAW_STREAM_DEBUG=1`).
+/// Partial blocks are elided because credential context may span deltas;
+/// complete messages go through the same masking as failure diagnostics.
 pub fn debug_log_line<'a>(line: &'a str, parsed: Option<&Value>) -> Cow<'a, str> {
     let is_thinking_delta = parsed.is_some_and(|e| {
         is_stream_event(e)
@@ -67,28 +67,21 @@ pub fn debug_log_line<'a>(line: &'a str, parsed: Option<&Value>) -> Cow<'a, str>
     });
     if is_thinking_delta {
         Cow::Borrowed(r#"{"type":"stream_event","elided":"thinking_delta"}"#)
+    } else if parsed.is_some_and(is_stream_event) {
+        Cow::Borrowed(r#"{"type":"stream_event","elided":"partial_message"}"#)
     } else {
-        Cow::Borrowed(line)
+        Cow::Owned(diagnostic_line(line, parsed).unwrap_or_default())
     }
 }
 
-/// The text a failure diagnostic may keep for this line, or `None` to keep
-/// nothing: partial `stream_event` lines are dropped, and an `assistant`
-/// line's `thinking` / `redacted_thinking` blocks are reduced to their type
-/// before the line is kept, so thinking text never reaches an error message.
+/// Failure diagnostics never retain partial message deltas or thinking blocks.
+/// Mask complete structured values before serializing or truncating them.
 pub fn diagnostic_line(line: &str, parsed: Option<&Value>) -> Option<String> {
     let Some(event) = parsed else {
-        return Some(line.to_string());
+        return Some(duduclaw_security::credential_detect::mask(line));
     };
     if is_stream_event(event) {
         return None;
-    }
-    let has_thinking = event
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .is_some_and(|c| c.iter().any(is_thinking_block));
-    if !has_thinking {
-        return Some(line.to_string());
     }
     let mut cleaned = event.clone();
     if let Some(content) = cleaned
@@ -100,7 +93,8 @@ pub fn diagnostic_line(line: &str, parsed: Option<&Value>) -> Option<String> {
             *block = serde_json::json!({"type": kind, "elided": true});
         }
     }
-    Some(cleaned.to_string())
+    duduclaw_security::credential_detect::mask_json(&mut cleaned);
+    Some(if cleaned == *event { line.to_string() } else { cleaned.to_string() })
 }
 
 fn is_thinking_block(block: &Value) -> bool {

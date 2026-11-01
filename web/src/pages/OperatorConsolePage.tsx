@@ -14,7 +14,7 @@ import {
   splitTurnMessages,
   useChatFace,
 } from '@/components/chat';
-import { DuDu } from '@/components/mascot';
+import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
 import { ChatArtifactCard } from '@/components/console';
 
 /**

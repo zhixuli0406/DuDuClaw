@@ -17,10 +17,8 @@ impl RegistryBoundary {
             home: home.into(),
             agent: agent.into(),
             server: server.into(),
-            turn: duduclaw_memory::feedback::CURRENT_TURN_ID
-                .try_with(Clone::clone)
-                .ok()
-                .flatten(),
+            turn: crate::runtime_turn::current().or_else(||
+                duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten()),
             // This registry's public schemas do not retain MCP annotations.
             // The existing decision therefore uses the conservative Modify
             // class, while exact tool action rules remain effective.
@@ -54,13 +52,19 @@ impl ClientCallBoundary for RegistryBoundary {
             }
         };
         let read_id = reserved.then_some(id.as_str());
-        let approved = match self.gate.check_call_with_taint(tool, args, taint).await {
+        let approved = match self.gate.check_call_with_taint_and_id(tool, args, taint, &id).await {
             Ok(approved) => approved,
             Err(reason) => {
                 if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
                 return Err(reason);
             }
         };
+        if let Err(reason) = crate::recipient_guard::confirm_unadapted_effect(
+            &self.home, &self.agent, &label, duduclaw_core::ToolEffect::Modify, approved.as_ref(),
+        ) {
+            if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
+            return Err(reason);
+        }
         // Registry schemas do not retain annotations: every call is both a
         // private read and a conservative sink. Recheck after any approval wait.
         let (lease, taint) = match crate::egress_client::SinkLease::direct(
@@ -70,18 +74,20 @@ impl ClientCallBoundary for RegistryBoundary {
             Err(reason) => {
                 if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
                 crate::egress_client::reservation_failure(&self.home, &self.agent, tool, &reason)?;
-                crate::egress_gate::confirm_dispatch(
-                    &self.home, &self.agent, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(),
+                crate::egress_gate::confirm_dispatch_with_call(
+                    &self.home, &self.agent, &label, true, crate::egress_guard::Taint::unknown(), approved.as_ref(), &id,
                 )?;
+                crate::credential_declaration::observe_arguments(&self.home, &self.agent, args).await;
                 return Ok((None, None));
             }
         };
-        if let Err(reason) = crate::egress_gate::confirm_dispatch(
-            &self.home, &self.agent, &label, true, taint, approved.as_ref(),
+        if let Err(reason) = crate::egress_gate::confirm_dispatch_with_call(
+            &self.home, &self.agent, &label, true, taint, approved.as_ref(), &id,
         ) {
             if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
             return Err(reason);
         }
+        crate::credential_declaration::observe_arguments(&self.home, &self.agent, args).await;
         Ok((reserved.then_some(id), Some(Box::new(lease))))
     }
 

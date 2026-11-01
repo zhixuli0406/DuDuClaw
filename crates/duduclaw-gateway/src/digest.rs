@@ -421,14 +421,8 @@ pub async fn assemble(
         }
         if let Some(t) = telemetry {
             let days = (now - since).num_days().clamp(1, MAX_WINDOW_DAYS) as u64 + 1;
-            d.spend_usd = t.daily_cost_series(&agent, days).await.ok().map(|series| {
-                series
-                    .iter()
-                    .filter(|(day, _)| day.as_str() >= since_day.as_str())
-                    .map(|(_, mc)| *mc as f64)
-                    .sum::<f64>()
-                    / 100_000.0
-            });
+            d.spend_usd = t.daily_cost_series(&agent, days).await.ok()
+                .map(|series| spend_usd_since(&series, &since_day));
         }
         if !d.is_empty() {
             agents.push(d);
@@ -1141,6 +1135,14 @@ pub fn feedback_by_item(home: &Path) -> std::collections::HashMap<String, String
     out
 }
 
+// The daily telemetry series is stored in cents despite its historical API name.
+fn spend_usd_since(series: &[(String, u64)], since_day: &str) -> f64 {
+    series.iter()
+        .filter(|(day, _)| day.as_str() >= since_day)
+        .map(|(_, cents)| *cents as f64)
+        .sum::<f64>() / 100.0
+}
+
 #[cfg(test)]
 mod digest_tests {
     use super::*;
@@ -1150,6 +1152,14 @@ mod digest_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), cfg).unwrap();
         dir
+    }
+
+    #[test]
+    fn spend_window_sums_stored_cents_as_dollars() {
+        let series = vec![("2026-10-28".into(), 100_000),
+            ("2026-10-29".into(), 499), ("2026-10-30".into(), 1)];
+        assert_eq!(spend_usd_since(&series, "2026-10-29"), 5.0);
+        assert_eq!(spend_usd_since(&series, "2026-10-31"), 0.0);
     }
 
     #[test]

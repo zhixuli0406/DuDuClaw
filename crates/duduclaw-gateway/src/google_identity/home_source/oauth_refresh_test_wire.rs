@@ -225,6 +225,9 @@ impl Wire {
                     continue;
                 }
                 let mut payload=body.clone().unwrap_or_else(||serde_json::json!({"access_token":"owned-access","refresh_token":"owned-refresh","token_type":"Bearer","expires_in":3600}));
+                if scenario == "invalid_grant" {
+                    payload = serde_json::json!({"error":"invalid_grant","error_description":"secret-provider-description"});
+                }
                 if scenario == "partial_scope" {
                     payload["scope"] = serde_json::json!("scope-a");
                 }
@@ -240,6 +243,8 @@ impl Wire {
                     "307 Temporary Redirect"
                 } else if scenario == "redirect308" {
                     "308 Permanent Redirect"
+                } else if scenario == "invalid_grant" {
+                    "400 Bad Request"
                 } else if scenario == "rejected" {
                     "403 Forbidden"
                 } else {

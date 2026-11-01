@@ -201,3 +201,24 @@ describe('RunsPage restricted history',()=>{
     expect(screen.queryByText('PREVIOUS ACCOUNT PRIVATE RUN')).not.toBeInTheDocument();
   });
 });
+
+it('explains a metadata-only team run without requiring a session id', async () => {
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'runs.get' ? {
+    run: { id: 'team:opaque', agent_id: 'team-agent', channel: 'other', started_at: '2026-10-24T00:00:00Z', ended_at: '2026-10-24T00:01:00Z', status: 'completed' },
+    events: [], read_only: true, omitted: ['conversation_content', 'tool_steps'],
+  } : { runs: [], agents: AGENTS }));
+  renderAt('/runs?run=team:opaque');
+  expect(await screen.findByText(/Conversation content and tool steps are not shared/)).toBeInTheDocument();
+  expect(screen.queryByText('No transcript events recorded')).not.toBeInTheDocument();
+});
+
+
+it('hides sender ids in list previews and shows failed run status', async () => {
+  const run = { id: 'failed-run', agent_id: 'nova', channel: 'webchat', started_at: '2026-10-31T00:00:00Z', ended_at: '2026-10-31T00:00:01Z', status: 'failed', step_count: 0, preview: '[sender_id: webchat:private-session] Please help' };
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'runs.list'
+    ? { runs: [run] } : method === 'runs.get' ? { run, events: [] } : { agents: AGENTS }));
+  renderAt('/runs?run=failed-run');
+  expect(await screen.findByText('Please help')).toBeInTheDocument();
+  expect(await screen.findByText('Failed')).toBeInTheDocument();
+  expect(screen.queryByText(/sender_id|private-session/)).not.toBeInTheDocument();
+});

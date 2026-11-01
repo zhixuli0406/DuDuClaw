@@ -1,6 +1,6 @@
 # Multi-Runtime Agent 執行
 
-> 一個平台，十二個 runtime id：十一個 CLI 後端（Claude、Codex、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode），加上以 HTTP 連接任何 OpenAI 相容端點的 `openai_compat`。
+> 一個平台，十一個 runtime id：十個 CLI 後端（Claude、Codex、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode），加上以 HTTP 連接任何 OpenAI 相容端點的 `openai_compat`。
 
 ## 執行失敗與明確備援
 

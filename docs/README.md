@@ -69,7 +69,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/57-ucci-calibrated-cascade.md](features/57-ucci-calibrated-cascade.md) | UCCI calibrated cascade — experimental, opt-in local-routing tier: an isotonic-calibrated router (top-2 token margin uncertainty) can replace the legacy post-hoc `g = sigmoid(α·p̄+β)` gate for LocalFast/LocalStrong; fitted offline by `scripts/ucci_fit.py`/`ucci_pair.py`, off by default |
 | [features/58-night-engine.md](features/58-night-engine.md) | Night engine — idle-window memory tidy-up (N1 sleep-time compute / N2 prefetch on the utility model, N3 schema induction / N4 recurrence-gated consolidation deterministic); per-agent enablement, plus global `[night] llm_enabled` for N1/N2, per-pass spend cap + daily circuit breaker; productive passes appear in Activity Feed |
 | [features/59-local-proxy.md](features/59-local-proxy.md) | `duduclaw proxy` — OpenAI-compatible localhost endpoint lending the account pool to Aider / Cline / Codex; Bearer key mandatory, loopback default, per-IP rate limit, OAuth subscription seats explicitly not forwardable |
-| [features/60-discovery.md](features/60-discovery.md) | Discovery — approved workspace IDs, approval, tree/cost evidence, verified downloads and zero-LLM held-out replay (integration validation in progress); [繁體中文](features/zh-TW/60-discovery.md) / [日本語](features/ja-JP/60-discovery.md) |
+| [features/60-discovery.md](features/60-discovery.md) | Discovery — approved workspace IDs, approval, tree/cost evidence, verified downloads and zero-LLM held-out replay; [繁體中文](features/zh-TW/60-discovery.md) / [日本語](features/ja-JP/60-discovery.md) |
 | [features/61-odoo-livechat.md](features/61-odoo-livechat.md) | Odoo website live chat — AI employees answer visitors as a Live Chat operator, audience rules (分眾) pick the employee, Odoo-native human takeover and handoff; [繁體中文](features/zh-TW/61-odoo-livechat.md) / [日本語](features/ja-JP/61-odoo-livechat.md) |
 | [features/62-calling-ai-staff.md](features/62-calling-ai-staff.md) | Calling AI staff with `@` — per-message routing limited to the employees the sender may call, `@` list (WebChat popup, LINE quick replies, Telegram buttons), one-shot call, mention-only groups, `[channels] public_trigger`; [繁體中文](features/zh-TW/62-calling-ai-staff.md) / [日本語](features/ja-JP/62-calling-ai-staff.md) |
 | [features/63-knowledge-base.md](features/63-knowledge-base.md) | Document knowledge base — collections with per-collection permissions, sandboxed document extraction, keyword and meaning-based (vector) search with page / row locations, pinned local embedding models and opt-in cloud embeddings, read-only `knowledge_*` MCP tools, `duduclaw knowledge eval`; [繁體中文](features/zh-TW/63-knowledge-base.md) / [日本語](features/ja-JP/63-knowledge-base.md) |
@@ -79,7 +79,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/67-assigning-tasks.md](features/67-assigning-tasks.md) | Assigning tasks from a chat — `/交辦 @employee task` (`/assign`, `／交辦`) creates a goal task with `on_behalf_of`, who may assign to whom, the one-message wait after `/交辦 @name`, `/交辦 狀態`, progress back to the chat, "Assigned by me" on the Goals page, scheduled and recurring assignments (`|| 時間:每週一 9:00`, `/交辦 排程`, re-checked at every run), the dashboard 交辦任務 page (`/assign`, `tasks.skill_assign`, attachments), audit events; [繁體中文](features/zh-TW/67-assigning-tasks.md) / [日本語](features/ja-JP/67-assigning-tasks.md) |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/68-manager-team-history.md](features/68-manager-team-history.md) | Read-only team conversations — Enterprise backend API (v1.76.0), live reporting-line checks, masked external conversations, activation window, mandatory audit and limits; [繁體中文](features/zh-TW/68-manager-team-history.md) / [日本語](features/ja-JP/68-manager-team-history.md) |
-| [features/69-egress-guard.md](features/69-egress-guard.md) | Unreleased: per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
+| [features/69-egress-guard.md](features/69-egress-guard.md) | per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
+| [features/70-credential-audit.md](features/70-credential-audit.md) | conversation credential metadata and masking; [繁體中文](features/zh-TW/70-credential-audit.md) / [日本語](features/ja-JP/70-credential-audit.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---
@@ -90,6 +91,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description | Status |
 |----------|-------------|--------|
+| [spec/agent-file-spec.md](spec/agent-file-spec.md) | DuDuClaw Agent File v1: schema, portability, preview, export and privacy | Draft |
 | [spec/soul-md-spec.md](spec/soul-md-spec.md) | SOUL.md agent identity format v1.0 | Draft |
 | [spec/contract-toml-spec.md](spec/contract-toml-spec.md) | CONTRACT.toml behavioral boundary format v1.0 | Draft |
 | [spec/contract-toml-schema.json](spec/contract-toml-schema.json) | CONTRACT.toml JSON Schema | Draft |
@@ -134,7 +136,6 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [todo/TODO-client-ws-protocol-mismatch.md](todo/TODO-client-ws-protocol-mismatch.md) | 🟠 VS Code / Chrome / Stream Deck send JSON-RPC 2.0 frames the gateway's `WsFrame` protocol rejects — every dashboard RPC dies as a misleading "connection closed" |
 | [todo/TODO-agent-toml-silent-skip.md](todo/TODO-agent-toml-silent-skip.md) | 🟠 One missing `agent.toml` field drops the whole agent with a single WARN — `agents.list` goes empty and `FirstRunGate` shows a working install as brand-new |
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
-| [todo/TODO-H1-ISO-x86-installer.md](todo/TODO-H1-ISO-x86-installer.md) | H1-ISO：mkosi 線第一次真烤 x86-64 安裝媒介＋QEMU 安裝鏈驗證（歷史紀錄；該線已凍結並移至 DuDuClaw-OS） |
 | [todo/TODO-agent-cross-invocation-continuity.md](todo/TODO-agent-cross-invocation-continuity.md) | Agent 跨 invocation 行動連續性（否認/遺忘自己排程時的行動）修復 |
 | [todo/TODO-dispatch-run-visibility.md](todo/TODO-dispatch-run-visibility.md) | 排程／派工執行紀錄可觀測性——cron 路徑不落 run 紀錄，RunsPage 只看得到頻道對話 |
 | [todo/TODO-skill-extraction-cron-path.md](todo/TODO-skill-extraction-cron-path.md) | 技能萃取的排程路徑——cron 場景無使用者回饋，成功訊號分級（判官 accept/成功 run）替代方案已定向 |
@@ -180,13 +181,12 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/mcp-tools.md](guides/mcp-tools.md) | `tools/list` 宣告面（O7）：依呼叫者能力裁剪的規則表、`notifications/tools/list_changed`、200-byte 說明預算與唯一例外，以及從說明搬出的長版細節（`codrive_run` 三段階梯、`working_state_handoff` 結構化模式、`skill_search` source、`evolution_toggle` 停滯子欄位） | Current |
 | [guides/mcp-ecosystem.md](guides/mcp-ecosystem.md) | More MCP tools: official MCP Registry search and install, native remote MCP servers with OAuth 2.1 / bearer sign-in (`duduclaw mcp-remote-bridge`, encrypted token store, replaces `npx mcp-remote`), Zapier / Composio aggregator cards (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/mcp-bridge.md](guides/mcp-bridge.md) | Mounting external MCP servers (`[[mcp.external]]`, stdio + Streamable HTTP `url` mounts) + `secret://`/`bearer_token` credentials + per-SaaS recipes (Gmail/Plane/Chatwoot/Invoice Ninja/WooCommerce) | Current |
-| [guides/google-workspace-integration.md](guides/google-workspace-integration.md) | Google Workspace 設定指南（選路徑導覽：自建 OAuth client／服務帳號網域委派／Apps Script 橋接三選一，逐步操作 + 11 個 scope 用途一覽 + 設定頁按鈕對照，D5：不預埋官方憑證） | Current |
+| [guides/google-setup.md](guides/google-setup.md) · [繁中](guides/zh-TW/google-setup.md) · [日本語](guides/ja-JP/google-setup.md) | Google 連線權威 SOP：四種情況、三條路徑、精靈、逐服務驗證、Testing 到期與遠端 SSH 轉送 | Current |
 | [guides/google-mcp.md](guides/google-mcp.md) | Google 官方 remote MCP 掛載（**進階選項**：`preset = "google:<svc>"`、preview 資格與不可出貨條款、與原生工具的覆蓋對照） | Current |
 | [guides/docuseal.md](guides/docuseal.md) | DocuSeal 簽署工作流（掛載 DocuSeal 官方 MCP server、cloud 走 REST、webhook 驗簽） | Current |
 | [guides/professional-software.md](guides/professional-software.md) | 專業軟體整合（Photoshop / AutoCAD 社群 MCP）：支援矩陣、per-agent `.mcp.json` 安裝、capability 治理、ezdxf 降級、RCE 風險聲明 | Current |
-| [guides/google-workspace.md](guides/google-workspace.md) | Native Google Workspace integration — all eight services (Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks), nineteen MCP tools, GA APIs only (no preview gate), OAuth setup, draft-only + append-only safety | Current |
+| [guides/google-workspace.md](guides/google-workspace.md) · [繁中](guides/zh-TW/google-workspace.md) · [日本語](guides/ja-JP/google-workspace.md) | Google 八服務、十九工具的參考與安全模型，含公司委派與 OS 原生信件實測 | Current |
 | [guides/google-personal-connections.md](guides/google-personal-connections.md) · [繁中](guides/zh-TW/google-personal-connections.md) · [日本語](guides/ja-JP/google-personal-connections.md) | Enterprise personal Google connections, self-consent, primary Owner, protected storage, exact-session completion and safe disconnect | Current (v1.76.0) |
-| [guides/google-no-oauth-client.md](guides/google-no-oauth-client.md) | Google 兩條免自建 OAuth client 的路徑（服務帳號網域委派、Apps Script 橋接），含覆蓋度差異、安全性質與已排除方案的實測數據 | Current |
 | [guides/notion.md](guides/notion.md) | Native Notion integration (search / page read / page append, four MCP tools, OAuth setup, external-knowledge-source boundary) | Current |
 | [guides/github.md](guides/github.md) | Native GitHub integration (issue/PR search + read + comment, five MCP tools, OAuth App setup, public-comment safety) | Current |
 | [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU/AEE yardstick (`--case`/`--exclude-dir`/`--report`) | Current |
@@ -196,7 +196,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/durable-line-ingress.md](guides/durable-line-ingress.md) | LINE durable ingress — acknowledge only after the event is stored, per-conversation order, `line_late_reply` (Push or fail), event states and alerts, operator actions in the dashboard and `duduclaw channel-ingress` (dashboard-approved), the stop switch, relay limits (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/task-sandbox.md](guides/task-sandbox.md) | Task sandbox how-to — run an agent's delegated tasks in a locked-down Docker container: prerequisites, `[container.sandbox]` settings, credentials per runtime, fail-closed behaviour, `duduclaw doctor` check (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/computer-workspaces.md](guides/computer-workspaces.md) | Computer-use workspaces how-to — keep an AI employee's files across computer-use sessions: `[computer_use.workspaces]` settings, the three `computer_workspace_*` tools, quotas and retention, the one-session lease, `duduclaw computer-workspaces` and its dashboard approval, `duduclaw doctor` row, known limitations (also in `zh-TW/` and `ja-JP/`) | Current |
-| [guides/browser-login-state.md](guides/browser-login-state.md) | Optional encrypted container login snapshots, reset, ownership changes and validation boundaries (also in `zh-TW/` and `ja-JP/`) | Current (v1.76.0); validation pending |
+| [guides/browser-login-state.md](guides/browser-login-state.md) | Optional encrypted container login snapshots, reset, ownership changes and validation boundaries (also in `zh-TW/` and `ja-JP/`) | Current (v1.76.0) |
 | [guides/continuous-responsibilities.md](guides/continuous-responsibilities.md) | Continuous responsibilities (an AI employee wakes on a schedule or an event for bounded runs), mid-run directions and stopping a task: `[responsibilities]` / `[goal_loop] steering_enabled` switches, the `duduclaw responsibility` CLI with dashboard approval, spend and run limits, what `cancel_pending` / `stopped` / `stopped_uncertain` mean, security model and known limits (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/multi-instance.md](guides/multi-instance.md) | Running multiple instances on one machine (DUDUCLAW_HOME / PORT / INSTANCE) | Current |
 | [guides/isolated-validation.md](guides/isolated-validation.md) | 驗證帳號來源限制：停用主機 OAuth 自偵測與環境金鑰備援；三語指南與隔離邊界 | Current |
@@ -205,7 +205,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
 | [guides/per-employee-channels.md](guides/per-employee-channels.md) | 讓 AI 員工有自己的 Telegram Bot 與 Google Chat 應用程式（設定步驟、權限、驗證方式；另有 [zh-TW](guides/zh-TW/per-employee-channels.md)、[ja-JP](guides/ja-JP/per-employee-channels.md)） | Current |
 | [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate from`，預設 dry-run） | Current |
-| [guides/white-label.md](guides/white-label.md) | Distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`); notes that white-label branding was removed in 1.72.2 (also in `zh-TW/` and `ja-JP/`) | Current |
+| [guides/white-label.md](guides/white-label.md) | v1.78.0 distributor branding: automatic name/logo updates, fixed vendor information, compile-time desktop installer assets and read-only integration (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/distributor-notice.md](guides/distributor-notice.md) | Distributor information on the About page — kept by the distributor in the license console, delivered as a signed runtime copy every 6 hours and compiled into the distributor build (`DUDUCLAW_DISTRIBUTOR_NOTICE_PATH`), the HTML allowlist, the sandboxed iframe, how to check `about.get` (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/recording-to-skill.md](guides/recording-to-skill.md) | 錄製 → 技能：瀏覽器/桌面示範錄製、HAR 脫敏、蒸餾成 SKILL.md 草稿＋審批安裝（`[capabilities] recording`） | Current |
 | [guides/feedback-page.md](guides/feedback-page.md) | 問題回報與建議網頁（GitHub Pages 表單 → issue 預填 → Actions + Haiku 自動分類/格式化/上標籤） | Current |
@@ -226,7 +226,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 ```
 docs/                                  # L1 PUBLIC — product & developer documentation
 ├── README.md                          # This index
-├── assets/brand/                      # C1 brand mark, icons, banner (© Dudu Technology Ltd.; see its README)
+├── assets/brand/                      # Brand mark, icons, banner (© Dudu Technology Ltd.; see its README)
 ├── assets/screenshots/                # Dashboard screenshots shown in the READMEs (demo data)
 ├── architecture/                      # System architecture & engine design (+ ja-JP, zh-TW)
 │   ├── overview.md                    #   Architecture overview
@@ -252,6 +252,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── feature-inventory.md
 │   └── 01-…-57-…                      #   57 feature deep-dives
 ├── spec/                              # Open format specifications
+│   ├── agent-file-spec.md             #   Agent File interchange v1
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0
 │   ├── contract-toml-schema.json

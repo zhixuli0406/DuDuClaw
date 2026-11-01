@@ -650,7 +650,9 @@ pub fn anomaly_record(
 /// caller can log-and-continue; a failure here must never break a reply.
 pub fn append_anomaly(home_dir: &Path, record: &serde_json::Value) -> std::io::Result<()> {
     let path = home_dir.join("channel_failures.jsonl");
-    let line = format!("{record}\n");
+    let mut masked = record.clone();
+    duduclaw_security::credential_detect::mask_json(&mut masked);
+    let line = format!("{masked}\n");
     duduclaw_core::with_file_lock(&path, || {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -1246,6 +1248,18 @@ mod tests {
         };
         let rec = anomaly_record("a", "s", &sig, false);
         assert_eq!(rec["mast"], "unclassified");
+    }
+
+    // Written for F1; not run (the review task prohibits builds/tests).
+    #[test]
+    fn anomaly_sink_masks_nested_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"evidence":"password: fixture-evidence",
+            "nested":{"password":"fixture-nested"}});
+        append_anomaly(dir.path(), &record).unwrap();
+        let stored = std::fs::read_to_string(dir.path().join("channel_failures.jsonl")).unwrap();
+        assert!(!stored.contains("fixture-"));
+        assert!(serde_json::from_str::<serde_json::Value>(stored.trim()).is_ok());
     }
 
     #[test]

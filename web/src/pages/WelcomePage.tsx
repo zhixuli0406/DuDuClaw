@@ -17,7 +17,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useTourStore } from '@/stores/tour-store';
 import { Card, Button, Badge, Input, Textarea } from '@/components/mds';
 import { Field, CompletionBadge, RuntimeSetupCard } from '@/components/onboarding';
-import { DuDu } from '@/components/mascot';
+import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
 import { SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
 import type { DuduFace } from '@/components/mascot/faces';
 import {

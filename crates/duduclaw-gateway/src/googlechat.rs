@@ -289,7 +289,7 @@ impl GoogleChatCreds {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!(
                 "token status {status}: {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             ));
         }
         let body: serde_json::Value = resp.json().await.map_err(|e| format!("token parse: {e}"))?;
@@ -551,7 +551,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         .unwrap_or("unknown")
         .to_string();
 
-    info!("📩 Google Chat [{sender}]: {}", truncate_bytes(&text, 80));
+    info!("📩 Google Chat [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     // ── Inbound attachments (WP1.3 parity with the other 8 channels) ──
     // Uploaded-to-Chat files are fetched through the media API with the
@@ -962,7 +962,7 @@ async fn post_message(
             let body = resp.text().await.unwrap_or_default();
             error!(
                 "Google Chat send failed ({status}): {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             );
             Err(Some(status.as_u16()))
         }
@@ -1116,7 +1116,7 @@ async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str)
             let body = resp.text().await.unwrap_or_default();
             warn!(
                 "Google Chat update failed ({status}): {}",
-                truncate_bytes(&body, 200)
+                truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             );
         }
         Err(e) => warn!("Google Chat update error: {e}"),

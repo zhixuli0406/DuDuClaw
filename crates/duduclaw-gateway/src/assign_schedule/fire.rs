@@ -179,6 +179,10 @@ async fn fire_one(
         )
         .await;
     }
+    // Defense shared by Task and Goal, immediately before any run creation.
+    if via != "admin" && crate::machine_employee::requires_admin_for_id(home, &row.agent_id) {
+        return auto_pause(home, store, row, &slot_s, "access_lost").await;
+    }
     let task_id = task_id_for_slot(&row.id, &slot_s);
     let created = match store.get_task(&task_id).await {
         // Recovery for a run written by an older gateway before its slot

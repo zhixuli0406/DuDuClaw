@@ -4,6 +4,27 @@
 use super::*;
 
 impl MethodHandler {
+    pub(crate) async fn handle_security_egress_shadow_report(&self, params: Value) -> WsFrame {
+        let days = match params.get("days").and_then(Value::as_u64) {
+            Some(7) => 7,
+            Some(30) => 30,
+            _ => return WsFrame::error_response("", "days must be 7 or 30"),
+        };
+        let home = self.home_dir.clone();
+        match tokio::task::spawn_blocking(move || crate::egress_shadow::report(&home, days)).await {
+            Ok(Ok(report)) => WsFrame::ok_response("", json!(report)),
+            _ => WsFrame::error_response("", "外送防護統計目前無法讀取，請稍後重試。"),
+        }
+    }
+
+    pub(crate) async fn handle_security_audit_verify(&self) -> WsFrame {
+        let home = self.home_dir.clone();
+        match tokio::task::spawn_blocking(move || crate::security_posture::verify_security_audit(&home)).await {
+            Ok(Ok(result)) => WsFrame::ok_response("", result),
+            _ => WsFrame::error_response("", "稽核鏈無法讀取，尚未驗證完整性。"),
+        }
+    }
+
     /// Live security system status — replaces static placeholder panels.
     pub(crate) async fn handle_security_status(&self) -> WsFrame {
         let reg = self.registry.read().await;
@@ -29,6 +50,18 @@ impl MethodHandler {
                 "shell_exec": !duduclaw_core::tool_catalog::tool_list_matches(&cfg.capabilities.denied_tools, "Bash"),
                 "delegate": delegate,
             })
+        }).collect();
+
+        let egress_bash_exposure: Vec<Value> = agents.iter().filter_map(|a| {
+            let cfg = &a.config;
+            let agent_dir = self.home_dir.join("agents").join(&cfg.agent.name);
+            let mode = duduclaw_core::egress_guard::effective_mode(&self.home_dir, Some(&agent_dir));
+            let recipient = duduclaw_core::recipient_policy::load(&self.home_dir, Some(&agent_dir));
+            let mode = bash_notice_mode(mode, recipient.mode);
+            egress_bash_exposed(mode, &cfg.capabilities, cfg.container.sandbox_enabled).then(|| json!({
+                "agent_id": cfg.agent.name,
+                "mode": if mode == duduclaw_core::egress_guard::Mode::Ask { "ask" } else { "block" },
+            }))
         }).collect();
 
         // Rate limiter: read from config
@@ -93,6 +126,7 @@ impl MethodHandler {
                 // — and "rules" was the first agent's container mount list
                 // rendered as if it were a global policy.
                 "rbac": rbac_entries,
+                "egress_bash_exposure": egress_bash_exposure,
                 "rate_limiter": rate_limit,
                 "soul_drift": soul_status,
             }),
@@ -170,7 +204,7 @@ impl MethodHandler {
                 .map(|a| a.config.agent.name.clone())
                 .collect()
         };
-        for agent_id in agent_ids {
+        for agent_id in &agent_ids {
             for channel in crate::channel_settings::VALID_CHANNEL_TYPES {
                 let Some(status) = crate::config_crypto::agent_channel_token_ref(
                     &self.home_dir,
@@ -190,8 +224,17 @@ impl MethodHandler {
                     source_label: status.source_label,
                     writable: status.writable,
                     residue: status.residue,
+                    source_kind: "config".into(),
+                    holder: Some(format!("agent:{agent_id}")),
+                    service: Some((*channel).into()),
+                    kind: Some("token".into()),
                 });
             }
+        }
+
+        match crate::security_posture::additional_credential_inventory(&self.home_dir, &table, &agent_ids) {
+            Ok(extra) => entries.extend(extra),
+            Err(_) => return WsFrame::error_response("", "部分系統憑證清單無法讀取，請稍後重試。"),
         }
 
         let configured = entries.iter().filter(|e| e.configured).count();
@@ -442,5 +485,88 @@ impl MethodHandler {
             Ok(Err(e)) => WsFrame::error_response("", &e),
             Err(e) => WsFrame::error_response("", &format!("secaudit.finding_status: {e}")),
         }
+    }
+}
+
+fn bash_notice_mode(
+    mode: duduclaw_core::egress_guard::Mode,
+    recipient_mode: duduclaw_core::recipient_policy::Mode,
+) -> duduclaw_core::egress_guard::Mode {
+    use duduclaw_core::egress_guard::Mode;
+    if recipient_mode == duduclaw_core::recipient_policy::Mode::Ask && !matches!(mode, Mode::Ask | Mode::Block) {
+        Mode::Ask
+    } else { mode }
+}
+
+fn egress_bash_exposed(
+    mode: duduclaw_core::egress_guard::Mode,
+    capabilities: &duduclaw_core::types::CapabilitiesConfig,
+    sandbox_enabled: bool,
+) -> bool {
+    use duduclaw_core::egress_guard::Mode;
+    use duduclaw_core::tool_catalog::tool_entry_matches;
+    let native_bash = |entry: &str| {
+        !entry.trim().starts_with("mcp__") && tool_entry_matches(entry, "Bash")
+    };
+    let denied = capabilities.disallowed_tools();
+    let allowed = capabilities.allowed_tools();
+    // A command-scoped denial still leaves other Bash commands available.
+    // MCP wildcards grant MCP tools, never the CLI's native Bash tool.
+    let bash_denied = denied.iter().any(|entry| {
+        entry.split_once('(').is_none() && native_bash(entry)
+    });
+    let bash_allowed = allowed.is_empty() || allowed.iter().any(|entry| native_bash(entry));
+    matches!(mode, Mode::Ask | Mode::Block) && !sandbox_enabled && bash_allowed && !bash_denied
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use duduclaw_core::egress_guard::Mode;
+    use duduclaw_core::types::CapabilitiesConfig;
+
+    // Not run: builds and tests are prohibited on the memory-constrained host.
+    #[test]
+    fn recipient_ask_also_lists_bash_exposure() {
+        use duduclaw_core::recipient_policy::Mode as RecipientMode;
+        let mut caps = CapabilitiesConfig::default();
+        for mode in [Mode::Off, Mode::Shadow, Mode::Ask, Mode::Block] {
+            let notice = bash_notice_mode(mode, RecipientMode::Ask);
+            assert!(egress_bash_exposed(notice, &caps, false));
+            assert!(!egress_bash_exposed(notice, &caps, true));
+            for recipient in [RecipientMode::Off, RecipientMode::Shadow] {
+                assert_eq!(bash_notice_mode(mode, recipient), mode);
+            }
+        }
+        caps.denied_tools = vec!["Bash".into()];
+        assert!(!egress_bash_exposed(bash_notice_mode(Mode::Off, RecipientMode::Ask), &caps, false));
+    }
+
+    #[test]
+    fn egress_notice_uses_effective_mode_sandbox_and_capabilities() {
+        let mut caps = CapabilitiesConfig::default();
+        for mode in [Mode::Off, Mode::Shadow, Mode::Ask, Mode::Block] {
+            assert_eq!(egress_bash_exposed(mode, &caps, false), matches!(mode, Mode::Ask | Mode::Block));
+            assert!(!egress_bash_exposed(mode, &caps, true));
+        }
+        caps.allowed_tools = vec!["Read".into()];
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.allowed_tools = vec!["B*".into()];
+        assert!(egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.denied_tools = vec!["Bash".into()];
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.denied_tools = vec!["NotBash".into()];
+        assert!(egress_bash_exposed(Mode::Block, &caps, false));
+        caps.denied_tools = vec!["Bash(curl:*)".into()];
+        assert!(egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.allowed_tools = vec!["mcp__duduclaw__*".into()];
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.allowed_tools = vec!["Bash(curl:*)".into()];
+        caps.denied_tools.clear();
+        assert!(egress_bash_exposed(Mode::Ask, &caps, false));
+        caps.action_rules = serde_json::from_value(json!([
+            { "tool": "Bash", "verdict": "block" },
+        ])).unwrap();
+        assert!(!egress_bash_exposed(Mode::Ask, &caps, false));
     }
 }

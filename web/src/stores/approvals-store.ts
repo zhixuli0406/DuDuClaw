@@ -2,22 +2,25 @@ import { create } from 'zustand';
 import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
 import { INBOX_INVALIDATIONS, subscribeInvalidations } from '@/lib/live-events';
-import { inboxSourcesDeniedFor } from '@/lib/inbox-model';
-import { useAuthStore } from '@/stores/auth-store';
+import { useAuthStore } from './auth-store';
+import { actionableInboxItems, inboxSourcesDeniedFor, type InboxItem } from '@/lib/inbox-model';
 
-/** The sidebar's aggregate count. A failed refresh preserves the last count
- * and marks it stale, so a lost connection never looks like an empty inbox. */
 interface ApprovalsStore {
   readonly pendingCount: number;
   readonly stale: boolean;
+  readonly items: readonly InboxItem[];
   fetchCount: () => Promise<boolean>;
   setPendingCount: (n: number) => void;
+  setItems: (items: readonly InboxItem[]) => void;
 }
 
+export const selectInboxCount = (state: ApprovalsStore) => state.pendingCount;
+
+/** All four surfaces use the same population, including locally resolved items. */
 export const useApprovalsStore = create<ApprovalsStore>((set, get) => {
-  let requestSeq = 0;
+  let requestVersion = 0;
   const invalidate = () => {
-    ++requestSeq; // A response started before this event is no longer current.
+    ++requestVersion; // A response started before this event is no longer current.
     set({ stale: true });
   };
   subscribeInvalidations(INBOX_INVALIDATIONS, () => get().fetchCount(), invalidate);
@@ -26,32 +29,56 @@ export const useApprovalsStore = create<ApprovalsStore>((set, get) => {
   return {
     pendingCount: 0,
     stale: true,
+    items: [],
     fetchCount: async () => {
-      const seq = ++requestSeq;
+      const version = ++requestVersion;
       const denied = inboxSourcesDeniedFor(useAuthStore.getState().user?.role);
-      try {
-        const [approvals, budget, blocked, needsHuman] = await Promise.all([
-          denied.has('approvals') ? Promise.resolve(null) : api.approvals.list(),
-          denied.has('budget') ? Promise.resolve(null) : api.budget.incidents(),
-          api.tasks.list({ status: 'blocked' }),
-          api.tasks.list({ status: 'needs_human' }),
-        ]);
-        const complete = blocked?.partial_error == null && needsHuman?.partial_error == null;
-        if (seq !== requestSeq) return complete;
-        if (!complete) {
-          set({ stale: true });
-          return false;
-        }
-        const approvalsN = approvals?.count ?? approvals?.approvals?.length ?? 0;
-        const budgetN = budget?.incidents?.length ?? 0;
-        const tasksN = (blocked?.tasks?.length ?? 0) + (needsHuman?.tasks?.length ?? 0);
-        set({ pendingCount: Math.max(0, approvalsN + budgetN + tasksN), stale: false });
-        return true;
-      } catch {
-        if (seq === requestSeq) set({ stale: true });
-        return false;
+      const results = await Promise.all([
+        denied.has('approvals') ? null : api.approvals.list().catch(() => null),
+        denied.has('budget') ? null : api.budget.incidents().catch(() => null),
+        api.tasks.list({ status: 'blocked' }).catch(() => null),
+        api.tasks.list({ status: 'needs_human' }).catch(() => null),
+        denied.has('installs') ? null : api.installRequests.list().catch(() => null),
+        api.agents.list().catch(() => null),
+      ]);
+      const [approvals, budget, blocked, needsHuman, installs, agents] = results;
+      const items: InboxItem[] = [];
+      const add = (id: string, type: InboxItem['type'], status?: string) => items.push({ id, type, status, title: '', urgency: 0, actionable: true });
+      for (const a of approvals?.approvals ?? []) add(`approval:${a.id}`, 'approval', 'pending');
+      for (const i of budget?.incidents ?? []) add(`budget:${i.agent_id}:${i.ts}`, 'budget', i.event);
+      for (const t of [...(blocked?.tasks ?? []), ...(needsHuman?.tasks ?? [])]) add(`blocked:${t.id}`, 'blocked', t.status);
+      for (const i of installs?.requests ?? []) add(`install:${i.id}`, 'install', i.stage);
+      // Same visible coverage as the Inbox; bounded waves avoid an RPC burst.
+      const agentIds = (agents?.agents ?? []).slice(0, 12).map((a) => a.name);
+      const failedDecisionAgents = new Set<string>();
+      for (let offset = 0; offset < agentIds.length; offset += 4) {
+        await Promise.all(agentIds.slice(offset, offset + 4).map(async (id) => {
+          const result = await api.decisions.list(id, 10).catch(() => { failedDecisionAgents.add(id); return null; });
+          for (const d of result?.decisions ?? []) add(`decision:${id}:${d.id}`, 'decision', 'open');
+        }));
       }
+      // A failed source must not erase previously known pending work.
+      const failedTypes = new Set<InboxItem['type']>();
+      if (!approvals && !denied.has('approvals')) failedTypes.add('approval');
+      if (!budget && !denied.has('budget')) failedTypes.add('budget');
+      if (!blocked || !needsHuman || blocked.partial_error || needsHuman.partial_error) failedTypes.add('blocked');
+      if (!installs && !denied.has('installs')) failedTypes.add('install');
+      if (!agents) failedTypes.add('decision');
+      const complete = failedTypes.size === 0 && failedDecisionAgents.size === 0;
+      if (version !== requestVersion) return complete;
+      for (const old of get().items) {
+        if (failedTypes.has(old.type) || (old.type === 'decision' && [...failedDecisionAgents].some((id) => old.id.startsWith(`decision:${id}:`)))) {
+          if (!items.some((item) => item.id === old.id)) items.push(old);
+        }
+      }
+      set({ items, pendingCount: actionableInboxItems(items).length, stale: !complete });
+      return complete;
     },
-    setPendingCount: (n: number) => set({ pendingCount: Math.max(0, n) }),
+    setItems: (items) => {
+      ++requestVersion;
+      set({ items, pendingCount: actionableInboxItems(items).length });
+    },
+    // Retained for existing consumers; new code supplies item identities instead.
+    setPendingCount: (n) => set({ pendingCount: Math.max(0, n) }),
   };
 });

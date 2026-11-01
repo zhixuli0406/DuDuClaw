@@ -201,6 +201,13 @@ impl RunStepStore {
              CREATE INDEX IF NOT EXISTS idx_run_steps_agent   ON run_steps(agent_id, id);
              CREATE INDEX IF NOT EXISTS idx_run_steps_ts      ON run_steps(ts);
 
+             CREATE TABLE IF NOT EXISTS channel_run_failures (
+                 session_key TEXT NOT NULL,
+                 user_message_id INTEGER NOT NULL,
+                 ended_at TEXT NOT NULL,
+                 PRIMARY KEY(session_key, user_message_id)
+             );
+
              CREATE TABLE IF NOT EXISTS dispatch_runs (
                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
                  agent_id    TEXT NOT NULL,
@@ -378,6 +385,22 @@ impl RunStepStore {
         }
     }
 
+    /// Record the terminal failure of one exact conversation turn. A failed
+    /// spawn has no assistant row, so session folding alone cannot close it.
+    pub(crate) fn record_channel_failure(&self, session: &str, message_id: i64) -> Result<(), String> {
+        self.lock().execute(
+            "INSERT OR IGNORE INTO channel_run_failures(session_key,user_message_id,ended_at) VALUES(?1,?2,?3)",
+            params![session, message_id, chrono::Utc::now().to_rfc3339()],
+        ).map(|_| ()).map_err(|e| format!("record channel run failure: {e}"))
+    }
+
+    pub(crate) fn channel_failure_end(&self, session: &str, message_id: i64) -> Option<String> {
+        self.lock().query_row(
+            "SELECT ended_at FROM channel_run_failures WHERE session_key=?1 AND user_message_id=?2",
+            params![session, message_id], |r| r.get(0),
+        ).ok()
+    }
+
     /// Record one finished cron/dispatch invocation (LWM D4 observability
     /// gap: 202 intraday cron runs, zero rows anywhere the dashboard could
     /// read). Inserts the run row, then one `tool_step` per collected native
@@ -541,6 +564,7 @@ impl RunStepStore {
             "DELETE FROM dispatch_runs WHERE started_at < ?1",
             params![cutoff],
         );
+        let _ = conn.execute("DELETE FROM channel_run_failures WHERE ended_at < ?1", params![cutoff]);
         Ok(by_age + by_cap)
     }
 
@@ -667,6 +691,35 @@ const SECRETISH_KEYS: &[&str] = &[
 /// `curl -H "Authorization: Bearer sk-…"`). Values end at whitespace or a
 /// closing quote. Pure, allocation-light, no regex dependency.
 pub(crate) fn mask_secretish(s: &str) -> String {
+    if s.len() > duduclaw_security::credential_detect::MAX_SCAN_BYTES {
+        return duduclaw_security::credential_detect::UNAVAILABLE_MASK.into();
+    }
+    let Ok(findings) = duduclaw_security::credential_detect::detect(s) else {
+        return duduclaw_security::credential_detect::UNAVAILABLE_MASK.into();
+    };
+    // Mask complete structures before the key scanner can split their values.
+    // Existing display markers are excluded by detect and stay byte-identical.
+    let mut masked = String::with_capacity(s.len());
+    let mut cursor = 0;
+    for finding in findings {
+        masked.push_str(&s[cursor..finding.span.start]);
+        masked.push_str("[REDACTED]");
+        cursor = finding.span.end;
+    }
+    masked.push_str(&s[cursor..]);
+    let s = masked.as_str();
+    let mut out = String::with_capacity(s.len());
+    let mut end = 0;
+    for span in duduclaw_core::secret_redact::redaction_placeholder_ranges(s) {
+        out.push_str(&mask_secretish_values(&s[end..span.start]));
+        out.push_str(&s[span.clone()]);
+        end = span.end;
+    }
+    out.push_str(&mask_secretish_values(&s[end..]));
+    duduclaw_security::credential_detect::mask(&out)
+}
+
+fn mask_secretish_values(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while !rest.is_empty() {
@@ -730,6 +783,18 @@ pub(crate) fn mask_secretish(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_channel_turn_has_one_stable_end_and_does_not_close_another_turn() {
+        let store = RunStepStore::open_in_memory().unwrap();
+        store.record_channel_failure("webchat:visitor", 42).unwrap();
+        let end = store.channel_failure_end("webchat:visitor", 42).unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&end).is_ok());
+        store.record_channel_failure("webchat:visitor", 42).unwrap();
+        assert_eq!(store.channel_failure_end("webchat:visitor", 42), Some(end));
+        assert!(store.channel_failure_end("webchat:visitor", 43).is_none());
+        assert!(store.channel_failure_end("webchat:other", 42).is_none());
+    }
 
     #[test]
     fn host_browser_step_preserves_signed_context_and_joins_only_its_run() {
@@ -1012,6 +1077,24 @@ mod tests {
         let only_a = store.recent_tool_step_meta("a", 100).unwrap();
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].0, "s:1");
+    }
+
+    #[test]
+    fn mask_secretish_preserves_layered_placeholders() {
+        for marker in ["[REDACTED]", "[已遮罩的 API key cred_test]", "[已遮罩的密碼]", "〔已遮蔽·secret〕"] {
+            let text = format!("api_key={marker} --verbose");
+            assert_eq!(mask_secretish(&text), text);
+            assert_eq!(mask_secretish(&duduclaw_security::credential_detect::mask(&text)), text);
+        }
+        let connection = "postgres://alice:prefixsecretTAIL@localhost/db";
+        assert_eq!(mask_secretish(connection), "[REDACTED]");
+        let forged = format!("〔已遮蔽·AKIA{}〕", "A".repeat(16));
+        assert!(!mask_secretish(&forged).contains(&"A".repeat(16)));
+        let text = "api_key=sk-live-99 --verbose";
+        let once = mask_secretish(text);
+        assert_eq!(once, "api_key=[REDACTED] --verbose");
+        assert_eq!(mask_secretish(&once), once);
+        assert_eq!(duduclaw_security::credential_detect::mask(&once), once);
     }
 
     #[test]

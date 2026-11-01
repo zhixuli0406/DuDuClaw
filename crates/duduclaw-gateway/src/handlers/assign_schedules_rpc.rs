@@ -140,6 +140,13 @@ impl MethodHandler {
         if !is_valid_agent_id(agent_id) || !ctx.can_assign_to(agent_id) {
             return WsFrame::error_response("", PERMISSION_DENIED);
         }
+        if !ctx.is_admin() {
+            if let Err(refusal) = crate::machine_employee::check_target(
+                &self.home_dir, agent_id, Some(&format!("user:{}", ctx.user_id)),
+            ) {
+                return WsFrame::error_response("", &refusal);
+            }
+        }
         let timezone = params
             .get("schedule_timezone")
             .and_then(Value::as_str)

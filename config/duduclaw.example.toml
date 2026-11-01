@@ -26,6 +26,21 @@ strategy = "priority"  # round_robin | least_cost | failover | priority
 health_check_interval_seconds = 60
 cooldown_after_rate_limit_seconds = 120
 
+[security]
+# audit keeps the original conversation; mask hides detected credentials from
+# the current prompt and conversation history. Derived stores are always masked.
+# Unknown values fail closed to mask. Bare passwords without context are not detected.
+chat_credentials = "audit"
+# Recipient checks are independent of private-data reads.
+# Unknown values use ask; employee overrides can only tighten this setting.
+recipient_guard = "shadow" # off | shadow | ask
+# Owners come only from verified users.db Owner bindings, never [proactive].
+# Additional targets belong in agents/<id>/agent.toml (Admin-only):
+# [capabilities]
+# recipient_guard = "ask"
+# recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
+# Scheduled fires have no source conversation and recheck this list.
+
 [gateway]
 bind = "127.0.0.1"
 port = 18889
@@ -989,4 +1004,6 @@ port = 18889
 #   [model]         agents/<id>/agent.toml — that agent's model, effort, account pool
 #   [router]        inference.toml — local-inference cascade routing
 #   [voice] TTS     inference.toml — text-to-speech; only STT lives in this file
-#   [branding]      ~/.duduclaw/branding.json, written by the dashboard only
+#   Distributor brand: signed <home>/distributor_brand.json, Oem only.
+#   No [branding] section or customer-side setter; old branding.json is ignored.
+#   See docs/guides/white-label.md for the signed name/logo contract.

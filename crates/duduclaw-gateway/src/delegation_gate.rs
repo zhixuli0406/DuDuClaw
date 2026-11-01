@@ -326,6 +326,26 @@ pub(crate) async fn gate_bus_dispatch(
     path_kind: &str,
     on_behalf_of: Option<&str>,
 ) -> GateOutcome {
+    // This restriction is independent of delegation mode and sender type:
+    // old bindings and queued goal/heartbeat work must be checked at use.
+    let machine_access = {
+        let guard = registry.read().await;
+        let target_id = DispatchOrgView::new(home_dir, Some(&guard)).canonical_id(target);
+        match guard.get(&target_id) {
+            Some(agent) => crate::machine_employee::check_loaded(home_dir, agent, on_behalf_of),
+            None => crate::machine_employee::check_target(home_dir, &target_id, on_behalf_of),
+        }
+    };
+    if machine_access.is_err() {
+        let denied = DelegationDenied {
+            sender: sender_agent.or(origin_agent).unwrap_or("system").to_string(),
+            target: target.to_string(),
+            policy: duduclaw_core::delegation_policy_from_home(home_dir),
+            reason: duduclaw_core::DelegationDenyReason::HumanPrincipalNotPermitted,
+        };
+        audit_denial(home_dir, &denied, task_id, path_kind, on_behalf_of);
+        return GateOutcome::Deny(denied);
+    }
     let Some(sender) = resolve_sender(sender_agent, origin_agent) else {
         // v1.52 transitional window — see the module docs. Loud, not silent:
         // this line is the inventory of producers that must be fixed before

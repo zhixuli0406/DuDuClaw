@@ -2,12 +2,25 @@ import { describe, it, expect } from 'vitest';
 import {
   navGroups,
   personalPrimaryItems,
+  manageAdvancedNav,
   personalAdvancedGroup,
   navGroupsForEdition,
   primaryItemsForEdition,
 } from './nav-model';
 import { isVisible } from '@/lib/nav-visibility';
 import { crumbsFor } from './nav-model';
+
+describe('machine console visibility', () => {
+  it('shows the machine entry only to administrators in both editions', () => {
+    const entry = primaryItemsForEdition(false).find(i => i.to === '/console')!;
+    expect(entry).toBeDefined();
+    for (const personal of [false, true]) {
+      expect(isVisible(entry, 'employee', personal)).toBe(false);
+      expect(isVisible(entry, 'manager', personal)).toBe(false);
+      expect(isVisible(entry, 'admin', personal)).toBe(true);
+    }
+  });
+});
 
 describe('own conversation-view receipts', () => {
   it('is reachable by an enterprise employee and hidden on Personal', () => {
@@ -228,5 +241,35 @@ describe('nav-model — page titles for the people pages', () => {
     expect(crumbsFor('/team').at(-1)?.labelId).toBe('nav.myTeam');
     expect(crumbsFor('/manage/users').at(-1)?.labelId).toBe('manage.users');
     expect(crumbsFor('/users').at(-1)?.labelId).toBe('manage.users');
+  });
+});
+
+
+describe('nav RPC role alignment', () => {
+  it('cron and unified audit pages require admin in both editions', () => {
+    const routines = navGroups.flatMap(g => g.items).find(i => i.to === '/routines')!;
+    expect(routines.minRole).toBe('admin');
+    expect(manageAdvancedNav.find(i => i.to === '/manage/logs')?.minRole).toBe('admin');
+    expect(navGroups.flatMap(g => g.items).find(i => i.to === '/gallery')?.minRole).toBe('admin');
+    expect(isVisible(routines, 'employee', false)).toBe(false);
+    expect(isVisible(routines, 'manager', false)).toBe(false);
+    expect(isVisible(routines, 'admin', false)).toBe(true);
+  });
+});
+
+describe('self-service account navigation', () => {
+  it('appears once in both editions with a version badge and no role gate', () => {
+    for (const personal of [false, true]) {
+      const items = [...primaryItemsForEdition(personal), ...navGroupsForEdition(personal).flatMap(g => g.items)];
+      const entries = items.filter(i => i.to === '/me/account');
+      expect(entries).toHaveLength(1);
+      expect(entries[0].newIn).toBe('1.78.0');
+      expect(entries[0].minRole).toBeUndefined();
+      expect(entries[0].enterprise).toBeUndefined();
+      for (const role of ['admin', 'manager', 'employee'] as const) {
+        expect(isVisible(entries[0], role, personal)).toBe(true);
+      }
+    }
+    expect(crumbsFor('/me/account')).toEqual([{ labelId: 'nav.account' }]);
   });
 });

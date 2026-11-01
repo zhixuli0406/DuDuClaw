@@ -243,7 +243,7 @@ fn rate_limiter_trips_after_max() {
 }
 
 #[tokio::test]
-async fn branding_sign_endpoint_is_removed_even_from_issuer_instances() {
+async fn local_branding_sign_endpoint_stays_removed_with_read_only_distributor_brand() {
     use axum::{body::Body, http::{Request, StatusCode}};
     use tower::ServiceExt;
     let home = tempfile::tempdir().unwrap();

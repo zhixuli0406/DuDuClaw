@@ -10,7 +10,7 @@
 //! | body                               | INSTRUCTIONS.md                        |
 //! | `model`                            | `[model] preferred` (Claude ids only)  |
 //! | `tools` / `disallowedTools`        | tool lists — narrowing only            |
-//! | `mcpServers` / `mcp-servers`       | per-employee `.mcp.json` (no secrets)  |
+//! | `mcpServers` / `mcp-servers`       | report only, never imported            |
 //! | `hooks`, `permissionMode`, `handoffs`, `skills`, … | reported, not applied  |
 
 use std::path::Path;

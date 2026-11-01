@@ -10,6 +10,10 @@ pub async fn check(
     tool: &str,
     sink: bool,
 ) -> Result<Option<Value>, String> {
+    check_with_call(home, agent, tool, sink, &uuid::Uuid::new_v4().to_string()).await
+}
+
+pub async fn check_with_call(home: &Path, agent: &str, tool: &str, sink: bool, call_id: &str) -> Result<Option<Value>, String> {
     if !sink {
         return Ok(None);
     }
@@ -19,7 +23,7 @@ pub async fn check(
         return Ok(None);
     }
     let taint = crate::egress_client::query(home, agent).await;
-    evaluate(home, agent, tool, sink, taint)
+    evaluate_with_call(home, agent, tool, sink, taint, call_id)
 }
 
 pub fn evaluate(
@@ -29,13 +33,17 @@ pub fn evaluate(
     sink: bool,
     taint: crate::egress_guard::Taint,
 ) -> Result<Option<Value>, String> {
+    evaluate_with_call(home, agent, tool, sink, taint, &uuid::Uuid::new_v4().to_string())
+}
+
+pub fn evaluate_with_call(home: &Path, agent: &str, tool: &str, sink: bool, taint: crate::egress_guard::Taint, call_id: &str) -> Result<Option<Value>, String> {
     if !sink {
         return Ok(None);
     }
     let dir = crate::ephemeral::resolve_agent_dir(home, agent)
         .unwrap_or_else(|| home.join("agents").join(agent));
     let mode = effective_mode_checked(home, Some(&dir))?;
-    evaluate_mode(home, agent, tool, mode, taint)
+    evaluate_mode(home, agent, tool, mode, taint, call_id)
 }
 
 pub(crate) fn mode(home: &Path, agent: &str) -> Result<Mode, String> {
@@ -50,7 +58,13 @@ pub fn confirm_dispatch(
     home: &Path, agent: &str, tool: &str, sink: bool,
     taint: crate::egress_guard::Taint, approved: Option<&Value>,
 ) -> Result<(), String> {
-    if let Some(required) = evaluate(home, agent, tool, sink, taint)? {
+    confirm_dispatch_with_call(home, agent, tool, sink, taint, approved, &uuid::Uuid::new_v4().to_string())
+}
+
+pub fn confirm_dispatch_with_call(home: &Path, agent: &str, tool: &str, sink: bool,
+    taint: crate::egress_guard::Taint, approved: Option<&Value>, call_id: &str,
+) -> Result<(), String> {
+    if let Some(required) = evaluate_with_call(home, agent, tool, sink, taint, call_id)? {
         let covered = required["sources"].as_array().is_some_and(|sources| {
             approved.and_then(|a| a["sources"].as_array())
                 .is_some_and(|old| sources.iter().all(|source| old.contains(source)))
@@ -68,7 +82,7 @@ pub fn check_external(home: &Path, client: &str, tool: &str, sink: bool) -> Resu
     if !sink {
         return Ok(None);
     }
-    evaluate_mode(home, client, tool, effective_mode_checked(home, None)?, crate::egress_guard::Taint::unknown())
+    evaluate_mode(home, client, tool, effective_mode_checked(home, None)?, crate::egress_guard::Taint::unknown(), &uuid::Uuid::new_v4().to_string())
 }
 
 /// An authenticated employee API key still has no host-owned runtime turn.
@@ -83,6 +97,7 @@ fn evaluate_mode(
     tool: &str,
     mode: Mode,
     taint: crate::egress_guard::Taint,
+    call_id: &str,
 ) -> Result<Option<Value>, String> {
     if mode == Mode::Off {
         return Ok(None);
@@ -93,17 +108,23 @@ fn evaluate_mode(
     match mode {
         Mode::Off => Ok(None),
         Mode::Shadow => {
-            duduclaw_security::audit::append_tool_call_with_extras(
-                home,
-                agent,
-                tool,
-                "egress_guard: would ask before sending private data",
-                true,
-                &[
-                    ("egress_guard", json!("would_ask")),
-                    ("sources", json!(taint.sources)),
-                ],
-            );
+            let kind = if taint.sources.iter().any(|s| s == "turn_state_unavailable") {
+                "would_refuse_ledger_unavailable"
+            } else { "would_ask" };
+            if crate::egress_shadow::record(home, agent, tool, kind, &taint.sources, call_id, crate::egress_shadow::Transport::Mcp) {
+                duduclaw_security::audit::append_tool_call_with_extras(
+                    home,
+                    agent,
+                    tool,
+                    "egress_guard: would ask before sending private data",
+                    true,
+                    &[
+                        ("egress_guard", json!(kind)),
+                        ("call_id", json!(call_id)),
+                        ("sources", json!(taint.sources)),
+                    ],
+                );
+            }
             Ok(None)
         }
         Mode::Ask => Ok(Some(
@@ -119,6 +140,30 @@ fn evaluate_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precheck_and_confirm_share_one_shadow_row_and_tool_log() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        let taint = crate::egress_guard::Taint { tainted: true, sources: vec!["memory_search".into()], ..crate::egress_guard::Taint::unknown() };
+        let call_id = uuid::Uuid::new_v4().to_string();
+        evaluate_with_call(home.path(), "bot", "send_message", true, taint.clone(), &call_id).unwrap();
+        confirm_dispatch_with_call(home.path(), "bot", "send_message", true, taint, None, &call_id).unwrap();
+        let report = crate::egress_shadow::report(home.path(),7).unwrap();
+        assert_eq!((report.total,report.ticket_total),(1,1));
+        let log = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        assert_eq!(log.lines().count(),1);
+        let row: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(row["call_id"],call_id);
+    }
+
+    #[test]
+    fn shadow_storage_failure_does_not_change_gate_decision() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='shadow'\n").unwrap();
+        std::fs::create_dir(home.path().join("egress_shadow.db")).unwrap();
+        assert!(evaluate(home.path(), "bot", "send_message", true, crate::egress_guard::Taint::unknown()).unwrap().is_none());
+    }
 
     #[test]
     fn egress_turn_lost_during_approval_requires_unknown_source_approval() {
@@ -140,7 +185,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent.toml"), "").unwrap();
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='typo'").unwrap();
-        assert!(evaluate(tmp.path(), "bot", "send_message", true, crate::egress_guard::Taint { tainted: false, sources: vec![] }).is_err());
+        assert!(evaluate(tmp.path(), "bot", "send_message", true, crate::egress_guard::Taint { connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None, tainted: false, sources: vec![] }).is_err());
         assert!(check_external(tmp.path(), "external", "send_message", true).is_err());
     }
 
@@ -197,7 +242,7 @@ mod tests {
             .is_err());
         let rows = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap();
         let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
-        assert_eq!(row["egress_guard"], "would_ask");
+        assert_eq!(row["egress_guard"], "would_refuse_ledger_unavailable");
         assert!(!row["sources"].as_array().unwrap().is_empty());
     }
 }

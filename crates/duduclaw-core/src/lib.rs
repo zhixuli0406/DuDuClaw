@@ -2,6 +2,7 @@ pub mod autonomy_gate;
 pub mod autonomy_handoff;
 pub mod agent_guard;
 pub mod agent_names;
+pub mod agent_profile;
 pub mod agent_rename;
 pub mod agent_trash;
 pub mod agent_toml;
@@ -44,10 +45,12 @@ pub mod org_store;
 pub mod pack;
 pub mod platform;
 pub mod preset;
+pub mod profile_sections;
 pub mod protected_section;
 pub mod provider_env;
 pub mod product_profile;
 pub mod relay_protocol;
+pub mod recipient_policy;
 pub mod runtime_catalog;
 pub mod sandbox_image;
 // Credential redaction shared by the gateway and duduclaw-maint-helper
@@ -128,7 +131,7 @@ pub use org_field_guard::{
     check_bash_protected_write, check_bash_protected_write_in, check_caller_scope,
     check_identity_surface_write, check_identity_surface_write_as, resolve_real_path,
     bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
-    MCP_KEY_COMMANDS, check_own_contract_write, check_own_instructions_write, check_own_soul_write, check_protected_toml_write,
+    MCP_KEY_COMMANDS, EGRESS_LEASE_COMMANDS, check_own_contract_write, check_own_instructions_write, check_own_soul_write, check_protected_toml_write,
     check_protected_toml_write_as, classify_identity_surface,
     classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,
     AGENT_CAPABILITY_SECTION, AGENT_EDITABLE_SECTIONS, AGENT_ORG_FIELDS, AGENT_SECURITY_KEYS,
@@ -666,8 +669,9 @@ fn parse_semver_triple(s: &str) -> Option<(u64, u64, u64)> {
 /// Run `<path> --version` with a 2s poll-timeout; a wedged binary is killed
 /// and treated as unversioned rather than hanging gateway startup.
 fn probe_binary_version(path: &str) -> Option<(u64, u64, u64)> {
-    let mut child = std::process::Command::new(path)
-        .arg("--version")
+    let mut cmd = std::process::Command::new(path);
+    spawn_env::apply_agent_cli_env_allowlist_std(&mut cmd);
+    let mut child = cmd.arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

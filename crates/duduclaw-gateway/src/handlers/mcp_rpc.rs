@@ -209,7 +209,10 @@ impl MethodHandler {
                                 );
                             });
                         }
-                        WsFrame::ok_response("", json!({ "success": true }))
+                        let forget_memories = crate::disconnect_forget::after_disconnect(&self.home_dir,
+                            &format!("remote_mcp:{agent_id}/{server_name}"), server_name,
+                            params.get("forget_memories").and_then(Value::as_bool).unwrap_or(true)).await;
+                        WsFrame::ok_response("", json!({ "success": true, "forget_memories":forget_memories }))
                     }
                     Ok(Err(e)) => WsFrame::error_response("", &e),
                     Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),

@@ -640,7 +640,7 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
             // (`request_with_simulation`) so the D2 channel push can render
             // the "若核准，接下來預計" forward-trajectory line.
             let mut summary = if egress_ask {
-                format!("工具「{tool_name}」將在讀取私人資料後向外傳送資料，需確認完整內容與目的地（egress_guard）。")
+                super::recipient_gate::approval_summary(tool_name, &payload)
             } else if asked_by_review {
                 format!(
                     "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）要求人工確認，需經管理員核可後才能執行"

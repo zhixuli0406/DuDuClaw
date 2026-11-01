@@ -4,6 +4,7 @@ import { ArrowRight, ChevronRight, ClipboardCheck, Ban, AlertTriangle, CheckCirc
 import type { InboxItem, InboxItemType } from '@/lib/inbox-model';
 import { Card, CardHeader, CardTitle, CardAction, ActorAvatar, Empty } from '@/components/mds';
 import { timeAgo } from '@/lib/format';
+import { failedRunHref } from '@/lib/home-overview';
 
 /**
  * NeedsAttentionList — the "需要你處理" list under the Home health summary
@@ -17,8 +18,7 @@ import { timeAgo } from '@/lib/format';
  * ("等你決定") open the unified Inbox — deep-linked to the specific row via
  * `?item=<id>` (W2-5 H5) so it's already selected and scrolled into view,
  * not just "somewhere in the list"; undelivered channel sends ("沒送出
- * 去") open Channels management — there is nothing to decide about a failed
- * send inside the Inbox itself, the fix lives in channel config.
+ * 去") open the same run inspector as the Inbox.
  *
  * Read-only: it never mutates anything; acting happens on the destination
  * page.
@@ -30,7 +30,7 @@ const TYPE_ICON: Partial<Record<InboxItemType, React.ComponentType<{ className?:
 };
 
 function rowHref(item: InboxItem): string {
-  if (item.type === 'failed_run') return '/manage/channels';
+  if (item.type === 'failed_run') return failedRunHref(item);
   return `/inbox?item=${encodeURIComponent(item.id)}`;
 }
 

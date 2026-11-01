@@ -105,6 +105,7 @@ pub fn import(home: &Path, key: &ProtectedKey, raw_json: &str) -> Result<KeyInfo
         sealed,
     };
     let body = serde_json::to_vec_pretty(&record).map_err(|e| format!("encode: {e}"))?;
+    crate::disconnect_forget::connections::mark_connecting(home, "google:delegation")?;
     write_owner_only_atomic(home, &body)?;
     info(home)?.ok_or_else(|| "寫入後讀不回封存紀錄".into())
 }

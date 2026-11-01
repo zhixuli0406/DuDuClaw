@@ -9,7 +9,10 @@ async fn begun_mode(master: bool) -> (tempfile::TempDir, String, flow::GoogleHom
     let d = tempfile::tempdir().unwrap();
     std::fs::write(
         d.path().join("config.toml"),
-        format!("[integrations]\ngoogle_workspace={master}\n[general]\nlog_level='debug'\n"),
+        format!(
+            "[integrations]\ngoogle_workspace = {master}\n{}[general]\nlog_level='debug'\n",
+            if master { "google_credential_path = \"oauth\"\n" } else { "" },
+        ),
     )
     .unwrap();
     std::fs::write(d.path().join(".keyfile"), [7u8; 32]).unwrap();
@@ -52,7 +55,11 @@ async fn callback_same_ticket_three_points_enables_master_and_preserves_unrelate
     let row: Value = serde_json::from_slice(&bytes(d.path())).unwrap();
     assert_eq!(row[0]["google_home"]["state"], "ready");
     assert!(row[0]["google_home"]["active_connect"].is_null());
-    assert_eq!(row[0]["scopes"].as_array().unwrap().len(), 11);
+    assert_eq!(row[0]["scopes"].as_array().unwrap().len(), 12);
+    assert!(row[0]["scopes"].as_array().unwrap().contains(&json!(
+        "https://www.googleapis.com/auth/userinfo.email"
+    )));
+    assert_eq!(cfg["integrations"]["google_credential_path"].as_str(), Some("oauth"));
     assert!(!d.path().join(GATE_FILE).exists());
 }
 
@@ -410,7 +417,7 @@ async fn callback_precrypto_internal_whitespace_capacity_and_postcrypto_winner_a
     }
 }
 #[tokio::test(flavor = "current_thread")]
-async fn already_enabled_home_needs_no_config_payload_and_ordinary_callback_succeeds() {
+async fn already_enabled_oauth_home_needs_no_config_payload_and_ordinary_callback_succeeds() {
     let _clock = publication::ClockGuard::fixed_if_unset(NOW);
     let (d, state, pending) = begun_mode(true).await;
     let before = std::fs::read(d.path().join("config.toml")).unwrap();

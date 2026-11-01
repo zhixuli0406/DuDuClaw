@@ -1,3 +1,5 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -58,6 +60,7 @@ export function reportHasActivity(r: DailyReport): boolean {
  * open can still surface it.
  */
 export function DailyReportCard() {
+  const canReadReport = hasMinRole(useAuthStore(s => s.user?.role), 'manager');
   const intl = useIntl();
   const navigate = useNavigate();
   const authed = useConnectionStore((s) => s.state === 'authenticated');
@@ -65,7 +68,7 @@ export function DailyReportCard() {
   const [report, setReport] = useState<DailyReport | null>(null);
 
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || !canReadReport) return;
     const today = localDayKey();
     let last: string | null = null;
     try {
@@ -106,9 +109,9 @@ export function DailyReportCard() {
     return () => {
       alive = false;
     };
-  }, [authed]);
+  }, [authed, canReadReport]);
 
-  if (!report) return null;
+  if (!report || !canReadReport) return null;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>

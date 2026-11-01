@@ -188,7 +188,10 @@ pub async fn handle_db_tables(arguments: &Value, home_dir: &Path, agent_id: &str
         .unwrap_or("");
     let entry = match resolve_granted(home_dir, agent_id, source).await {
         Ok(e) => e,
-        Err(msg) => return db_error(&msg),
+        Err(msg) => {
+            duduclaw_gateway::egress_client::builtin_not_dispatched();
+            return db_error(&msg);
+        },
     };
     let src = match open_source(&entry, home_dir).await {
         Ok(s) => s,
@@ -236,7 +239,10 @@ pub async fn handle_db_select(arguments: &Value, home_dir: &Path, agent_id: &str
         .unwrap_or("");
     let entry = match resolve_granted(home_dir, agent_id, source).await {
         Ok(e) => e,
-        Err(msg) => return db_error(&msg),
+        Err(msg) => {
+            duduclaw_gateway::egress_client::builtin_not_dispatched();
+            return db_error(&msg);
+        },
     };
     let table = arguments
         .get("table")
@@ -245,15 +251,22 @@ pub async fn handle_db_select(arguments: &Value, home_dir: &Path, agent_id: &str
         .trim()
         .to_string();
     if table.is_empty() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return db_error("缺少 table 參數（資料表名稱）。先呼叫 db_tables 取得可用清單。");
     }
     let columns = match parse_string_array(arguments.get("columns")) {
         Ok(c) => c,
-        Err(msg) => return db_error(&msg),
+        Err(msg) => {
+            duduclaw_gateway::egress_client::builtin_not_dispatched();
+            return db_error(&msg);
+        },
     };
     let filter = match parse_filters(arguments.get("filter")) {
         Ok(f) => f,
-        Err(msg) => return db_error(&msg),
+        Err(msg) => {
+            duduclaw_gateway::egress_client::builtin_not_dispatched();
+            return db_error(&msg);
+        },
     };
     let order_by = arguments
         .get("order_by")
@@ -326,7 +339,10 @@ pub async fn handle_db_query(arguments: &Value, home_dir: &Path, agent_id: &str)
         .unwrap_or("");
     let entry = match resolve_granted(home_dir, agent_id, source).await {
         Ok(e) => e,
-        Err(msg) => return db_error(&msg),
+        Err(msg) => {
+            duduclaw_gateway::egress_client::builtin_not_dispatched();
+            return db_error(&msg);
+        },
     };
     // Fail-closed BEFORE a connection is opened: a source with a real table
     // allowlist cannot have that allowlist enforced against arbitrary SQL, so
@@ -334,6 +350,7 @@ pub async fn handle_db_query(arguments: &Value, home_dir: &Path, agent_id: &str)
     // it. Decided per call, which is why `db_query` still appears in
     // `tools/list` — one granted source may permit it and another may not.
     if !entry.allows_all_tables() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return db_error(
             &DbError::FreeSqlNotAllowed {
                 source_name: entry.name.clone(),
@@ -343,6 +360,7 @@ pub async fn handle_db_query(arguments: &Value, home_dir: &Path, agent_id: &str)
     }
     let sql = arguments.get("sql").and_then(|v| v.as_str()).unwrap_or("");
     if sql.trim().is_empty() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
         return db_error("缺少 sql 參數（唯讀查詢語句，必須以 SELECT 或 WITH 開頭）。");
     }
     let limit = parse_limit(arguments.get("limit"));

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import en from '@/i18n/en.json';
 import { renderWithProviders } from '@/test/render';
@@ -62,12 +62,13 @@ function mockGateway({ editable = true, soul = {}, noInstructions = false, runti
           files: [
             entry('soul', { editable_by_me: editable, ...soul }),
             entry('identity', { editable_by_me: editable }),
+            entry('user', { editable_by_me: editable }),
             entry('instructions', { editable_by_me: editable, exists: !noInstructions, size: noInstructions ? 0 : 10 }),
             entry('contract', { editable_by_me: editable }),
             entry('agent_toml', { editable_by_me: false }),
             entry('skill:quote/SKILL.md', { editable_by_me: editable, skill_name: 'quote', path: 'SKILLS/quote/SKILL.md' }),
           ],
-          limits: { soul: 65536, identity: 65536, instructions: 65536, contract: 32768, agent_toml: 262144, skill: 65536 },
+          limits: { soul: 65536, identity: 65536, user: 16000, instructions: 65536, contract: 32768, agent_toml: 262144, skill: 65536 },
         };
       case 'agent_files.get':
         return {
@@ -126,7 +127,7 @@ describe('<AgentFilesTab>', () => {
     mockGateway();
     await openTab();
     const nav = screen.getByRole('navigation', { name: en['agentFiles.list.label'] });
-    for (const id of ['soul', 'identity', 'contract', 'agent_toml'] as const) {
+    for (const id of ['soul', 'identity', 'user', 'contract', 'agent_toml'] as const) {
       expect(within(nav).getByText(en[`agentFiles.file.${id}`])).toBeInTheDocument();
     }
     // Work rules carry the industry names people search for.
@@ -137,6 +138,20 @@ describe('<AgentFilesTab>', () => {
     expect(within(nav).getByText('SKILLS/quote/SKILL.md')).toBeInTheDocument();
     expect(within(nav).getByText(en['agentFiles.badge.readOnly'])).toBeInTheDocument();
     expect(screen.getByTestId('agent-file-content')).toHaveTextContent(SOUL);
+  });
+
+  it('edits user introduction with a Unicode character limit', async () => {
+    loginAs('owner');
+    mockGateway();
+    await openTab();
+    await userEvent.click(screen.getByTestId('agent-file-user'));
+    await screen.findByText(en['agentFiles.help.user']);
+    await userEvent.click(screen.getByRole('button', { name: en['agentFiles.editor.edit'] }));
+    const box = screen.getByRole('textbox', { name: 'Edit User' });
+    fireEvent.change(box, { target: { value: '字'.repeat(4_000) } });
+    expect(screen.getByRole('button', { name: en['agentFiles.editor.saveAndCheck'] })).not.toBeDisabled();
+    fireEvent.change(box, { target: { value: '字'.repeat(4_001) } });
+    expect(screen.getByRole('button', { name: en['agentFiles.editor.saveAndCheck'] })).toBeDisabled();
   });
 
   it('a viewer sees the text, the hint and no edit or history buttons', async () => {

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 mod team_history_rpc;
+mod team_visibility;
 mod my_history_views_rpc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -91,6 +92,7 @@ mod memory_rpc;
 mod memory_history_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
+pub(crate) use shared_wiki_rpc::SharedWikiReader;
 mod search_rpc;
 mod skills_rpc;
 mod skills_list_rpc;
@@ -110,6 +112,7 @@ mod experts_import_rpc;
 mod system_config_rpc;
 mod audit_rpc;
 mod security_rpc;
+mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
@@ -197,6 +200,8 @@ mod maintenance_rpc;
 mod device_backup;
 mod agent_channels_gchat_rpc;
 mod agent_channels_rpc;
+mod boxed_frame;
+use boxed_frame::boxed_frame;
 mod dispatch_core;
 mod dispatch_kb;
 mod dispatch_kb_agent;
@@ -537,14 +542,16 @@ impl MethodHandler {
         {
             return frame;
         }
-        if let Some(frame) = self.dispatch_kb(method, &params, ctx).await {
+        if let Some(frame) = boxed_frame(|| self.dispatch_kb(method, &params, ctx)).await {
             return frame;
         }
-        if let Some(frame) = self.dispatch_agent_channels(method, &params, ctx).await {
+        if let Some(frame) = boxed_frame(|| self.dispatch_agent_channels(method, &params, ctx)).await {
             return frame;
         }
-        // Box each dispatcher hop to avoid stacking whole dispatcher futures in unoptimized builds.
-        Box::pin(self.dispatch_core(method, params, ctx, conn)).await
+        // Each dispatch layer must own only its handlers, not the futures of
+        // every later layer. Even an approvals call otherwise reserves the
+        // stack used by unrelated runtime/spawn handlers along the fallthrough.
+        boxed_frame(|| self.dispatch_core(method, params, ctx, conn)).await
     }
 }
 

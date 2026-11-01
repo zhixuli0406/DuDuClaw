@@ -231,7 +231,7 @@ fn exact_nonconnect_recovery_only_syncs_same_target_and_never_replays_a_mutation
 
 #[test]
 fn final_ready_without_ticket_still_retains_connect_proof_and_refuses_generic_recovery() {
-    let d = fixture();
+    let d = oauth_fixture();
     let t = ticket(d.path());
     let claim = run(d.path(), |g, s| {
         publication_transaction(g, |r| r.claim(&t, s, NOW))
@@ -279,7 +279,7 @@ fn final_ready_without_ticket_still_retains_connect_proof_and_refuses_generic_re
 
 #[test]
 fn fresh_host_expiry_after_durable_ready_keeps_gate_and_requires_fresh_revoked_abort() {
-    let d = fixture();
+    let d = oauth_fixture();
     let t = ticket(d.path());
     let claim = run(d.path(), |g, s| {
         publication_transaction(g, |r| r.claim(&t, s, NOW))

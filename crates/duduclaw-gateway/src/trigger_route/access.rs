@@ -83,6 +83,11 @@ impl SenderAccess {
     /// employee is `fallback`, or `None` when they may not. A binding or a
     /// team grant is reported before the "open to everyone" sources.
     pub fn grant(&self, agent: &LoadedAgent, fallback: Option<&str>) -> Option<GrantSource> {
+        if crate::machine_employee::requires_admin(agent)
+            && !matches!(self.sender, Sender::Admin { .. })
+        {
+            return None;
+        }
         let id = agent.config.agent.name.as_str();
         let open_here = || {
             if fallback == Some(id) {

@@ -181,6 +181,8 @@ impl TaskStore {
         new: &NewSteering<'_>,
         now: DateTime<Utc>,
     ) -> Result<SteeringSubmit, String> {
+        // The caller binds body_hash to the exact steering text.
+        require_safe_contract(new.body)?;
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
         let tx = conn
@@ -254,7 +256,7 @@ impl TaskStore {
                 seq,
                 new.body,
                 new.body_hash,
-                new.guard_flags_json,
+                mask_derived_text(new.guard_flags_json),
                 new.submitted_by,
                 authority_revision,
                 new.client_request_id,

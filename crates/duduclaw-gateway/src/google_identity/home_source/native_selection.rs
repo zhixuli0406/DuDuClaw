@@ -100,10 +100,10 @@ pub(crate) fn prepare_home_native_selection(
         return Err(Error::Invalid);
     }
     with_metadata(home, |g, source| {
-        if !source.master {
+        if !source.master || source.disabled_path {
             return Err(Error::NotReady);
         }
-        if source.sa_present {
+        if source.sa_present || source.bridge_present {
             return Err(Error::PendingWiring);
         }
         let (receipt, purpose) = if tool == "google_status" {

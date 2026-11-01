@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
@@ -74,4 +75,12 @@ describe('ReportPage notification effectiveness (W2-8, notify.stats)', () => {
     expect(screen.getByText('evolution.stagnation')).toBeInTheDocument();
     expect(screen.getByText('FYI only, nothing actionable')).toBeInTheDocument();
   });
+});
+
+it('does not load admin cost telemetry for a manager', async () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never });
+  useConnectionStore.setState({ state: 'authenticated' as never });
+  mockWsClient.call.mockResolvedValue(null);
+  renderWithProviders(<ReportPage />);
+  expect(mockWsClient.call.mock.calls.some(([m]) => String(m).startsWith('cost.'))).toBe(false);
 });

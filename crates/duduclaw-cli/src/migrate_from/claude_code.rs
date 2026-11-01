@@ -732,6 +732,7 @@ mod tests {
             rename: false,
             agent: Some(agent.to_string()),
             redact: true,
+            confirm_profile: None,
         }
     }
 

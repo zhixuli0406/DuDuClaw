@@ -1570,10 +1570,40 @@ pub struct HeartbeatConfig {
     pub cron_timezone: String,
 }
 
+/// Policy for a budget check whose configuration or spend cannot be read.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetWhenUnavailable {
+    #[default]
+    Allow,
+    Deny,
+}
+
+impl<'de> Deserialize<'de> for BudgetWhenUnavailable {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input { Text(String), Other(serde::de::IgnoredAny) }
+        match Input::deserialize(deserializer)? {
+            Input::Text(value) if value == "allow" => Ok(Self::Allow),
+            Input::Text(value) if value == "deny" => Ok(Self::Deny),
+            _ => {
+                static UNKNOWN_POLICY_WARNING: std::sync::Once = std::sync::Once::new();
+                UNKNOWN_POLICY_WARNING.call_once(|| {
+                    tracing::warn!("budget.when_unavailable must be allow or deny; using deny");
+                });
+                Ok(Self::Deny)
+            }
+        }
+    }
+}
+
 /// Budget limits and warnings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BudgetConfig {
+    #[serde(default)]
+    pub when_unavailable: BudgetWhenUnavailable,
     pub monthly_limit_cents: u64,
     pub warn_threshold_percent: u8,
     pub hard_stop: bool,
@@ -1842,6 +1872,14 @@ pub struct CapabilitiesConfig {
     /// Optional narrowing of the global egress guard; raw values survive round trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_guard: Option<toml::Value>,
+
+    /// Optional narrowing of the global recipient guard; preserve malformed values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_guard: Option<toml::Value>,
+
+    /// Extra channel recipients. Raw values keep invalid policy fail-closed on reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipients: Option<toml::Value>,
 
     /// Third-party MCP servers (`.mcp.json` keys) whose `readOnlyHint`
     /// annotation is believed (2026-10-08). For any other server a tool that
@@ -2129,6 +2167,8 @@ impl Default for CapabilitiesConfig {
             auto_approve_install: None,
             action_rules: crate::tool_effect::ActionRules::default(),
             egress_guard: None,
+            recipient_guard: None,
+            recipients: None,
             trusted_read_hint_servers: Vec::new(),
         }
     }

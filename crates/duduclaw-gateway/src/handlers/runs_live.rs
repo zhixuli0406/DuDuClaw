@@ -55,6 +55,9 @@ impl MethodHandler {
                     if !fresh.has_agent_access(&agent_check, AccessLevel::Viewer) {
                         return Err("permission denied".into());
                     }
+                    if !fresh.is_admin() && crate::machine_employee::requires_admin_for_id(&home, &agent_check) {
+                        return Err("permission denied".into());
+                    }
                     Ok(())
                 }
             })
@@ -109,6 +112,9 @@ fn load_dispatch_live(
     if !live.has_agent_access(&run.agent_id, AccessLevel::Viewer) {
         return Err("permission denied".into());
     }
+    if !live.is_admin() && crate::machine_employee::requires_admin_for_id(home, &run.agent_id) {
+        return Err("permission denied".into());
+    }
     Ok((run.agent_id, run.task_id, live))
 }
 
@@ -138,8 +144,16 @@ fn confirm_session_run(home: &Path, ctx: &UserContext, session: &str, row: i64) 
     if !live.has_agent_access(&agent, AccessLevel::Viewer) {
         return Err("permission denied".into());
     }
+    if !live.is_admin() && crate::machine_employee::requires_admin_for_id(home, &agent) {
+        return Err("permission denied".into());
+    }
     // Same outcome as bound_history_recheck when the first mode was Full.
     let fresh = super::bound_history_rpc::live_bound_reader(home, &live)?;
+    if !fresh.has_agent_access(&agent, AccessLevel::Viewer)
+        || (!fresh.is_admin() && crate::machine_employee::requires_admin_for_id(home, &agent))
+    {
+        return Err("permission denied".into());
+    }
     let current = crate::history_privacy::mode(home, &fresh, &agent).map_err(|_| "session not found")?;
     if current != crate::history_privacy::Mode::Full {
         return Err("history authority changed; refresh".into());
@@ -161,6 +175,59 @@ mod tests {
         ).unwrap();
         assert_eq!(store.get_dispatch_run(id).unwrap().unwrap().task_id.as_deref(), Some(task_id));
         RunStep { agent_id: "sales".into(), run_id: format!("dispatch:{id}"), tool: "Read".into(), phase: "finished" }
+    }
+
+    #[tokio::test]
+    async fn machine_runs_recheck_old_viewer_binding_at_subscription_and_delivery() {
+        let f = fixture().await;
+        let root = crate::handlers::task_privacy_tests::admin(&f);
+        f.db.bind_agent(&f.bob.user_id, "sales", AccessLevel::Viewer).unwrap();
+        let step = dispatch_step(&f.home, OPEN);
+        assert!(ok(&f.handler.handle_runs_subscription(json!({"run_id":step.run_id}), &f.bob).await));
+        assert!(f.handler.may_push_run_step(&step, &f.bob).await);
+        duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+        duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+            "system-operator", "test", "test").unwrap();
+        for _ in 0..2 {
+            assert!(!ok(&f.handler.handle_runs_subscription(json!({"run_id":step.run_id}), &f.bob).await));
+            assert!(!f.handler.may_push_run_step(&step, &f.bob).await);
+            assert!(ok(&f.handler.handle_runs_subscription(json!({"run_id":step.run_id}), &root).await));
+            assert!(f.handler.may_push_run_step(&step, &root).await);
+            // A binding whose preset no longer resolves stays restricted.
+            let _ = std::fs::remove_file(f.home.join("presets/system-operator/preset.toml"));
+        }
+        let path = duduclaw_core::preset::bindings_path(&f.home);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(!ok(&f.handler.handle_runs_subscription(json!({"run_id":step.run_id}), &f.bob).await));
+        assert!(!f.handler.may_push_run_step(&step, &f.bob).await);
+        assert!(f.handler.may_push_run_step(&step, &root).await);
+    }
+
+    #[tokio::test]
+    async fn machine_session_run_requires_admin_even_with_full_history_binding() {
+        let f = fixture().await;
+        let root = crate::handlers::task_privacy_tests::admin(&f);
+        f.db.bind_agent(&f.bob.user_id, "sales", AccessLevel::Owner).unwrap();
+        let sessions = crate::session::SessionManager::new(&f.home.join("sessions.db")).unwrap();
+        let row = {
+            let conn = sessions.acquire().await;
+            conn.execute("INSERT INTO sessions(id,agent_id,last_active,created_at)
+                VALUES ('machine-live','sales','2026-10-29T00:00:00Z','2026-10-29T00:00:00Z')", []).unwrap();
+            conn.execute("INSERT INTO session_messages(session_id,role,content,timestamp)
+                VALUES ('machine-live','user','prompt','2026-10-29T00:00:00Z')", []).unwrap();
+            conn.last_insert_rowid()
+        };
+        let step = RunStep { agent_id: "sales".into(), run_id: format!("machine-live#{row}"), tool: "Read".into(), phase: "started".into() };
+        assert!(ok(&f.handler.handle_runs_subscription(json!({"run_id":step.run_id}), &f.bob).await));
+        assert!(f.handler.may_push_run_step(&step, &f.bob).await);
+        duduclaw_core::preset::install_system_operator_preset(&f.home, false).unwrap();
+        duduclaw_core::preset::bind(&f.home, "sales", &f.home.join("agents/sales"),
+            "system-operator", "test", "test").unwrap();
+        assert!(!ok(&f.handler.handle_runs_subscription(json!({"run_id":step.run_id}), &f.bob).await));
+        assert!(!f.handler.may_push_run_step(&step, &f.bob).await);
+        assert!(ok(&f.handler.handle_runs_subscription(json!({"run_id":step.run_id}), &root).await));
+        assert!(f.handler.may_push_run_step(&step, &root).await);
     }
 
     #[tokio::test]

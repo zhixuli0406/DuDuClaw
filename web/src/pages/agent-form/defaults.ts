@@ -103,6 +103,8 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   maybe_irreversible_tools: [],
   scoped_tools: [],
   action_rules: [],
+  recipient_guard: 'off',
+  recipients: [],
   native_sandbox: false,
   policy: [],
   os_native: false,

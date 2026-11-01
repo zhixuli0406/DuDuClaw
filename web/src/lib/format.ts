@@ -17,9 +17,8 @@ export function formatCents(cents: number | null | undefined): string {
 }
 
 /**
- * Format a millicent integer as `$0.01234`. 1 cent = 1000 millicents, so
- * dollars = millicents / 100_000. Sub-cent amounts keep enough precision to
- * stay non-zero; larger amounts round to cents. Safe on null/NaN.
+ * Format stored telemetry cents under the historical millicents field name.
+ * Dollars = cents / 100. Larger amounts round to cents. Safe on null/NaN.
  */
 export function formatMillicents(millicents: number | null | undefined): string {
   // NOTE: despite the `millicents` name, the backend cost telemetry stores and

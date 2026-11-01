@@ -13,6 +13,10 @@ use serde_json::json;
 
 pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] = &[
     duduclaw_core::OperatorCommand {
+        name: "duduclaw agent export",
+        path: &["agent", "export"],
+    },
+    duduclaw_core::OperatorCommand {
         name: "duduclaw agent pause",
         path: &["agent", "pause"],
     },

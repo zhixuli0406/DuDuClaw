@@ -239,18 +239,13 @@ impl GoalLoopDriver {
         let Some((occ, resp)) = &info.occurrence else {
             return OccurrenceCost::Within;
         };
-        // H-2(c): the Claude CLI dispatch path does not consult the employee's
-        // budget breaker (the multi-runtime path does); an occurrence round
-        // checks it here, so every runtime meets the same outermost limit.
+        // Check before reserving an occurrence round; spawn paths also gate
+        // the employee budget immediately before execution.
         let agent_dir = self.home_dir.join("agents").join(&task.assigned_to);
-        let budget = crate::budget::check_agent_budget(
-            &self.home_dir,
-            Some(agent_dir.as_path()),
-            &task.assigned_to,
-        )
-        .await;
-        if budget.is_denied() {
-            return OccurrenceCost::AgentBudget(budget.user_message());
+        if let Err(refusal) = crate::budget::gate_before_spawn(
+            &self.home_dir, Some(agent_dir.as_path()), &task.assigned_to, "goal_occurrence",
+        ).await {
+            return OccurrenceCost::AgentBudget(refusal.to_string());
         }
         let cost = self.cost_source();
         match crate::responsibility::cost::tree_spent(

@@ -105,7 +105,7 @@ fn every_config_payload_durability_fault_blocks_google_and_keeps_uncertain_pendi
 }
 #[test]
 fn config_fence_cannot_erase_unresolved_connect_finish_even_after_expiry() {
-    let d = fixture();
+    let d = oauth_fixture();
     let t = ticket(d.path());
     let claim = run(d.path(), |g, s| {
         publication_transaction(g, |r| r.claim(&t, s, NOW))
