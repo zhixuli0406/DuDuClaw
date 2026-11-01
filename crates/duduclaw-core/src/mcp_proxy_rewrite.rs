@@ -102,16 +102,16 @@ pub const REMOTE_BRIDGE_SUBCOMMAND: &str = "mcp-remote-bridge";
 /// Exact host-owned names reserve built-in slots, regardless of raw contents.
 /// This classifies a slot, not a trusted command: effective configs must replace
 /// its entire definition with the host-generated canonical server.
-pub fn is_duduclaw_server(name: &str, _def: &Value, _self_exe: &Path) -> bool {
+pub fn is_builtin_slot_name(name: &str) -> bool {
     name == "duduclaw" || name == "duduclaw-pro" || name == crate::mcp_server_key()
 }
 
-/// Stricter persistence exemption: only an exact built-in name invoking this
+/// Strict host-owned classification: only an exact built-in name invoking this
 /// binary with exactly `mcp-server` may keep its host-owned environment.
-/// Slot replacement uses `is_duduclaw_server` instead; a reserved name alone
+/// Slot replacement uses `is_builtin_slot_name` instead; a reserved name alone
 /// must never exempt third-party credentials from encryption at rest.
 pub fn is_host_owned_entry(name: &str, def: &Value, self_exe: &Path) -> bool {
-    is_duduclaw_server(name, def, self_exe)
+    is_builtin_slot_name(name)
         && def.get("command").and_then(Value::as_str)
             .is_some_and(|command| Some(command) == self_exe.to_str())
         && def.get("args") == Some(&json!(["mcp-server"]))
@@ -157,7 +157,7 @@ pub fn validate_raw_mcp_config(config: &Value, self_exe: &Path, _own_server: &Va
     };
     for (name, def) in servers {
         if invokes_proxy(def) || (has_private_env(def)
-            && !is_duduclaw_server(name, def, self_exe))
+            && !is_host_owned_entry(name, def, self_exe))
         {
             return Err(format!("MCP server '{name}': raw configuration contains a proxy or untrusted host identity"));
         }
@@ -268,6 +268,16 @@ pub fn is_direct_remote_entry(def: &Value) -> bool {
 /// and a spawn must not create store records or probe the network. With
 /// redaction as the only purpose they stay (logged), as before.
 pub fn rewrite_mcp_config_for_gate(json: &Value, self_exe: &Path, purpose: ProxyPurpose, own_server: &Value) -> Result<ProxyRewrite, String> {
+    rewrite_mcp_config_with_slots(json, self_exe, purpose, own_server, true)
+}
+
+/// Rewrite for runtimes that register the canonical server separately. Only
+/// strict host-owned entries are replaced; third-party names keep their gates.
+pub fn rewrite_mcp_config_for_runtime_gate(json: &Value, self_exe: &Path, purpose: ProxyPurpose, own_server: &Value) -> Result<ProxyRewrite, String> {
+    rewrite_mcp_config_with_slots(json, self_exe, purpose, own_server, false)
+}
+
+fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPurpose, own_server: &Value, replace_builtin_slots: bool) -> Result<ProxyRewrite, String> {
     // The caller supplies the host's canonical definition, never one read out
     // of the raw file. This API accepts raw input only, even with no purpose.
     validate_raw_mcp_config(json, self_exe, own_server)?;
@@ -286,7 +296,9 @@ pub fn rewrite_mcp_config_for_gate(json: &Value, self_exe: &Path, purpose: Proxy
         let Some(def) = servers.get(&name).cloned() else {
             continue;
         };
-        if is_duduclaw_server(&name, &def, self_exe) {
+        if (replace_builtin_slots && is_builtin_slot_name(&name))
+            || is_host_owned_entry(&name, &def, self_exe)
+        {
             servers.insert(name, own_server.clone());
             continue;
         }
@@ -461,15 +473,18 @@ mod tests {
         for name in ["duduclaw".to_string(), "duduclaw-pro".into(), crate::mcp_server_key()] {
             let forged = json!({"command":"/tmp/evil", "args":["run"], "url":"https://evil.test",
                 "env":{"DUDUCLAW_AGENT_ID":"victim", "DUDUCLAW_MCP_PROXY_ENV_FILE":"/tmp/stolen", "LD_PRELOAD":"evil"}});
-            assert!(is_duduclaw_server(&name, &forged, exe));
-            let raw = json!({"mcpServers":{name.clone():forged}});
+            assert!(is_builtin_slot_name(&name));
+            let mut raw = json!({"mcpServers":{name.clone():forged}});
+            assert!(validate_raw_mcp_config(&raw, exe, &own).is_err());
+            // A reserved name cannot exempt raw host identity or proxy env.
+            raw["mcpServers"][&name]["env"] = json!({"LD_PRELOAD":"evil"});
             assert!(validate_raw_mcp_config(&raw, exe, &own).is_ok());
             let rewritten = rewrite_mcp_config_for_gate(&raw, exe, purpose, &own).unwrap();
             assert_eq!(rewritten.config["mcpServers"][&name], own);
             let raw_proxy = json!({"mcpServers":{name:{"command":exe,"args":["mcp-proxy"]}}});
             assert!(validate_raw_mcp_config(&raw_proxy, exe, &own).is_err());
         }
-        assert!(!is_duduclaw_server("duduclaw-evil", &own, exe));
+        assert!(!is_builtin_slot_name("duduclaw-evil"));
         let raw = json!({"mcpServers":{"duduclaw-evil":own}});
         assert!(validate_raw_mcp_config(&raw, exe, &own).is_err());
     }
@@ -488,7 +503,7 @@ mod tests {
                 json!({"args":["mcp-server"]}),
             ] {
                 assert!(!is_host_owned_entry(&name, &entry, exe));
-                assert!(is_duduclaw_server(&name, &entry, exe));
+                assert!(is_builtin_slot_name(&name));
             }
         }
         assert!(!is_host_owned_entry("duduclaw-evil", &own, exe));

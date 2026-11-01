@@ -386,7 +386,7 @@ pub fn gated_mcp_config_with_names(
         .get_mut("mcpServers")
         .and_then(|s| s.as_object_mut())
         .expect("read_mcp_json_for_runtime normalises mcpServers to an object");
-    servers.retain(|name, def| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(name, def, self_exe));
+    servers.retain(|name, def| !duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(name, def, self_exe));
     servers.insert("duduclaw".to_string(), own_server.clone());
 
     let purpose = ProxyPurpose {
@@ -394,7 +394,7 @@ pub fn gated_mcp_config_with_names(
         secret_env: duduclaw_core::mcp_proxy_rewrite::has_mcp_secret_refs(&parsed),
         tool_gate: true,
     };
-    let rewrite = rewrite_mcp_config_for_gate(&parsed, self_exe, purpose, own_server)
+    let rewrite = duduclaw_core::mcp_proxy_rewrite::rewrite_mcp_config_for_runtime_gate(&parsed, self_exe, purpose, own_server)
         .map_err(|e| refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane))?;
     require_resolvable_config(&rewrite.config)
         .map_err(|e| refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane))?;
@@ -420,7 +420,7 @@ pub fn mcp_json_lists_third_party_servers(
     };
     Ok(parsed["mcpServers"]
         .as_object()
-        .is_some_and(|m| m.iter().any(|(n, def)| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(n, def, &duduclaw_core::resolve_duduclaw_bin()))))
+        .is_some_and(|m| m.iter().any(|(n, def)| !duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(n, def, &duduclaw_core::resolve_duduclaw_bin()))))
 }
 
 /// Every server name the `.mcp.json` at `mcp_json` lists, DuDuClaw's own
@@ -584,7 +584,7 @@ fn write_gated_mcp_config_value(
     // has already been replaced with the canonical host definition.
     let third_party = parsed.get("mcpServers").and_then(Value::as_object)
         .is_some_and(|servers| servers.iter().any(|(name, def)|
-            !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(name, def, self_exe)));
+            !duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(name, def, self_exe)));
     if (preserve_cli_discovery && (purpose.none() || !third_party)) || &rewrite.config == parsed {
         debug!("mcp-proxy: nothing to proxy in this .mcp.json");
         return Ok((None, Vec::new()));

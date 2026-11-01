@@ -34,7 +34,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use duduclaw_core::mcp_proxy_rewrite::{
-    PROXY_CARRY_ENV, PROXY_SPAWN_SCOPED_FLAG, PROXY_UPSTREAM_ENV_VAR, is_duduclaw_server,
+    PROXY_CARRY_ENV, PROXY_SPAWN_SCOPED_FLAG, PROXY_UPSTREAM_ENV_VAR, is_host_owned_entry,
     is_portable_server_name, is_proxy_private_env_key, is_remote_bridge_invocation,
 };
 
@@ -215,7 +215,7 @@ fn extract_gated(
     };
     let exe = self_exe.to_string_lossy();
     for (name, def) in servers {
-        if is_duduclaw_server(name, def, self_exe) {
+        if is_host_owned_entry(name, def, self_exe) {
             continue;
         }
         if !is_portable_server_name(name) {
