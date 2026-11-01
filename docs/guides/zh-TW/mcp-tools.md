@@ -264,3 +264,16 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 ## 宣告憑證用途
 
 `credential_declare` 接受 `credential_id` 與 `service`，拒絕員工備註；服務必須符合 `^[a-z0-9][a-z0-9._-]{0,63}$` 並通過憑證偵測。只有通過身分驗證且持有該憑證的員工，才能經過簽章的 gateway loopback 路由宣告；員工不能覆蓋 Admin 設定的服務。這個工具只註記既有稽核資料，不取出秘密、不授權新持有者，也不把真值代入工具呼叫。Admin 可到「安全 → 憑證稽核」查閱與更正。詳見[憑證稽核](../../features/zh-TW/70-credential-audit.md)。
+
+
+## 第三方 MCP 環境變數憑證
+
+第三方 MCP 金鑰會移出員工的設定檔。`.mcp.json` 只保留 `secret://mcp/<server>/<ENV_NAME>` 參照，實際值使用既有 `.keyfile` 加密，存於 `<home>/secrets/mcp/<agent_id>.enc`。第三方伺服器的所有 `env` 項目都存入憑證庫，例外只有 `PATH`、`HOME`、`NODE_ENV`、`LOG_LEVEL` 與既有 `secret://` 參照。DuDuClaw 自身的伺服器項目與其中的 `DUDUCLAW_*` 變數維持不變。
+
+只有精確名稱 `duduclaw`、`duduclaw-pro` 或目前 instance 的 key，且 command 與 args 符合主程式產生的內容，才算內建伺服器；`duduclaw-evil` 仍視為第三方。啟動時拒絕原始設定中的 proxy 項目及 proxy 私有環境變數；帶有員工身分的內建項目必須與主程式產生的完整設定一致。讀取秘密必須有對應憑證庫擁有者的有效 `DUDUCLAW_AGENT_TOKEN` HMAC，即使 delegation 使用寬鬆設定也不能省略，且不會以預設員工身分代替。
+
+Proxy 只解析自己所屬員工的參照，並在啟動上游伺服器前才取得實際值。參照不存在、不合法或無法解密時，該伺服器不會啟動；錯誤只指出伺服器與變數名稱，不含值。需要解析秘密的設定若無法改寫為 proxy 路徑，Claude／Grok 不會退回直接載入原檔。匯出時只留下環境變數名稱與空白佔位值，匯入者必須重新輸入。
+
+Gateway 啟動時會遷移舊有明文 env：先將原檔加密備份至 `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc`，寫入並讀回驗證憑證庫後，才以原子操作替換設定檔。依金鑰、加密備份、憑證庫、設定檔的順序，每一步都須完成父目錄 fsync 才繼續。任一步失敗即停止該員工的遷移；若替換設定後同步失敗，會還原原始明文。還原也失敗時會明確報錯並保留已持久化的加密備份供復原，然後繼續處理其他員工；清理後每位員工最多保留三份遷移備份；清理若因 I/O 錯誤失敗會記錄，並於下次掃描重試。刪除伺服器或員工會移除對應的憑證庫項目，復原已刪除員工後須重新輸入金鑰。
+
+Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員工與 gateway 使用相同 OS 使用者執行時，有 Bash 仍可讀取 gateway 檔案，包括 `.keyfile`；真正隔離需要不授予 Bash，或使用任務沙箱。這項功能只涵蓋 `env`，不涵蓋 `args`／`url` 裡的金鑰，也不涵蓋工具結果回傳的金鑰。既有明文匯出與備份不會被追溯清除。

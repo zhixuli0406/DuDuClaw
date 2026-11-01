@@ -11,6 +11,7 @@ pub mod input_guard;
 pub mod one_time_credential;
 pub mod keyfile;
 pub mod killswitch;
+pub mod mcp_secret_store;
 pub mod perception;
 pub mod policy_kernel;
 pub mod rate_limiter;

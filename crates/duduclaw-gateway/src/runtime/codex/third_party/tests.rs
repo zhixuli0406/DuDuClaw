@@ -205,18 +205,24 @@ fn a_server_named_like_duduclaw_cannot_override_it() {
     let (home, dir) = employee(Some(body.as_str()));
     let own = own_server(home.path());
     let servers = gated_servers(&dir, home.path(), &own, false).unwrap();
-    assert!(servers.is_empty(), "{servers:?}");
+    assert!(!servers.contains_key("duduclaw"));
+    assert_eq!(servers.len(), 2);
+    for (name, command) in [("duduclaw-pro", "/tmp/evil2"), ("duduclaw-staging", "/tmp/evil3")] {
+        let server = &servers[name];
+        assert_eq!(server.command, EXE);
+        assert_eq!(server.args, vec!["mcp-proxy", "--server", name, "--", command]);
+    }
 
     CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap();
     let cfg = config_toml(&dir);
     let table = cfg["mcp_servers"].as_table().unwrap();
-    assert_eq!(table.len(), 1);
+    assert_eq!(table.len(), 3);
     assert_eq!(table["duduclaw"]["command"].as_str(), Some(EXE));
-    assert!(
-        !std::fs::read_to_string(dir.join(".codex").join("config.toml"))
-            .unwrap()
-            .contains("/tmp/evil")
-    );
+    assert_eq!(table["duduclaw"]["args"][0].as_str(), Some("mcp-server"));
+    for name in ["duduclaw-pro", "duduclaw-staging"] {
+        assert_eq!(table[name]["command"].as_str(), Some(EXE));
+        assert_eq!(table[name]["args"][0].as_str(), Some("mcp-proxy"));
+    }
 }
 
 #[test]
@@ -348,20 +354,26 @@ fn file_bytes(dir: &Path) -> Option<Vec<u8>> {
 
 #[tokio::test]
 async fn no_third_party_server_means_no_gate_and_no_write() {
-    let only_own =
-        json!({ "mcpServers": { "duduclaw": { "command": "relative-duduclaw", "args": [] } } })
-            .to_string();
-    for body in [None, Some(only_own), Some("{}".to_string())] {
-        let (home, dir) = employee(body.as_deref());
+    for shape in ["missing", "canonical", "empty"] {
+        let (home, dir) = employee(None);
+        let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+            home.path(), "trader", &duduclaw_core::resolve_duduclaw_bin(),
+        );
+        match shape {
+            "canonical" => std::fs::write(dir.join(".mcp.json"),
+                json!({"mcpServers":{"duduclaw":own}}).to_string()).unwrap(),
+            "empty" => std::fs::write(dir.join(".mcp.json"), "{}").unwrap(),
+            _ => {}
+        }
         let before = file_bytes(&dir);
-        let servers = gated_servers_for_spawn(&dir, home.path(), &own_server(home.path()), false)
+        let servers = gated_servers_for_spawn(&dir, home.path(), &own, false)
             .await
             .unwrap();
-        assert!(servers.is_empty(), "{body:?}");
+        assert!(servers.is_empty(), "{shape}");
         assert_eq!(
             file_bytes(&dir),
             before,
-            "no gate ran, nothing was written: {body:?}"
+            "no gate ran, nothing was written: {shape}"
         );
     }
 }
@@ -377,9 +389,10 @@ async fn an_unplaceable_directory_only_fails_when_it_lists_third_party_servers()
     std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"judge\"\n").unwrap();
     let own = own_server(home.path());
 
-    let only_own =
-        json!({ "mcpServers": { "duduclaw": { "command": EXE, "args": ["mcp-server"] } } })
-            .to_string();
+    let canonical = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+        home.path(), "judge", &duduclaw_core::resolve_duduclaw_bin(),
+    );
+    let only_own = json!({"mcpServers":{"duduclaw":canonical}}).to_string();
     std::fs::write(dir.join(".mcp.json"), &only_own).unwrap();
     assert!(
         gated_servers_for_spawn(&dir, home.path(), &own, false)

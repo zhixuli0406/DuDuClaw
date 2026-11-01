@@ -254,7 +254,7 @@ pub(crate) fn apply_capabilities_to_table(
         for (i, v) in arr.iter().enumerate() {
             let name = v.as_str().map(str::trim).unwrap_or("");
             if !crate::mcp_scan::is_valid_mcp_server_name(name)
-                || duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(name)
+                || (name == "duduclaw" || name == "duduclaw-pro" || name == duduclaw_core::mcp_server_key())
             {
                 return Err(format!(
                     "capabilities.trusted_read_hint_servers[{i}] must be a third-party MCP server name"
