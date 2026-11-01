@@ -9489,5 +9489,11 @@
   "mfa.issue": "核發註冊代碼",
   "mfa.issued": "一次性註冊代碼",
   "mfa.expires": "自核發起 {seconds} 秒內有效",
-  "mfa.enforcedAt": "強制啟用時間"
+  "mfa.enforcedAt": "強制啟用時間",
+  "webchat.queued": "排隊中，這一輪結束後處理",
+  "webchat.cancelQueued": "取消排隊",
+  "webchat.turnLimit": "同時處理的訊息已達上限，請等目前的回覆完成",
+  "webchat.send": "送出",
+  "webchat.stop": "停止",
+  "webchat.resend": "重新填入輸入框"
 }

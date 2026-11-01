@@ -9489,5 +9489,11 @@
   "mfa.issue": "登録コードを発行",
   "mfa.issued": "ワンタイム登録コード",
   "mfa.expires": "発行から {seconds} 秒間有効",
-  "mfa.enforcedAt": "必須化開始日時"
+  "mfa.enforcedAt": "必須化開始日時",
+  "webchat.queued": "待機中 — 現在の返信が終わってから処理します",
+  "webchat.cancelQueued": "待機中のメッセージをキャンセル",
+  "webchat.turnLimit": "同時に処理できるメッセージの上限に達しました。現在の返信が終わるまでお待ちください。",
+  "webchat.send": "送信",
+  "webchat.stop": "停止",
+  "webchat.resend": "入力欄に戻す"
 }
