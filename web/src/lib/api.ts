@@ -4944,6 +4944,16 @@ export interface RedactionProfileImportResult {
 // because the model's install/download state changes on its own clock (a
 // background download), not on the config-save cycle.
 
+export interface KokoroModelStatus {
+  installed: boolean;
+  size_bytes: number;
+  missing_files: string[];
+  ort_ok: boolean;
+  state: 'absent' | 'downloading' | 'ready' | 'error';
+  progress: { done_bytes: number; total_bytes: number; file: string } | null;
+  error: string | null;
+}
+
 export type RedactionModelState = 'absent' | 'downloading' | 'ready' | 'loaded' | 'error';
 
 /** Present only while `state === 'downloading'`. */
@@ -8543,6 +8553,10 @@ export const api = {
     /** Admins: what an `agent_file_change` approval asks for. */
     pendingGet: (approvalId: string) =>
       client.call('agent_files.pending_get', { approval_id: approvalId }) as Promise<AgentFilePendingResponse>,
+  },
+  voice: {
+    kokoroStatus: () => client.call('voice.kokoro_status') as Promise<KokoroModelStatus>,
+    kokoroInstall: () => client.call('voice.kokoro_install') as Promise<{ started: boolean }>,
   },
   redaction: {
     get: () => client.call('redaction.get') as Promise<RedactionConfig>,

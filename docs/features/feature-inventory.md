@@ -253,15 +253,17 @@
 
 ## Voice Pipeline
 
-See [14-voice-pipeline.md](14-voice-pipeline.md). The HTTP endpoints and the Telegram voice handler are wired separately.
+See [14-voice-pipeline.md](14-voice-pipeline.md). HTTP, Telegram and MCP synthesis share the configured TTS router.
 
 | Feature | Description |
 |---------|-------------|
 | HTTP endpoints | `POST /api/stt` (OpenAI-compatible transcription API or a local command template; returns 501 when `[voice]` has no STT provider), `POST /api/tts`, `GET`/`POST /api/voice/config` |
-| TTS providers | Piper (local ONNX voices) / Edge TTS / MiniMax T2A (picks a CJK or Latin voice) / OpenAI TTS, behind one router |
-| Telegram voice | Voice messages are transcribed with the OpenAI Whisper API; `/voice` replies use Edge TTS. Both are hardcoded, so the dashboard voice settings do not affect Telegram |
+| TTS providers | Piper (local ONNX voices) / Kokoro / Azure / MiniMax T2A (picks a CJK or Latin voice) / OpenAI TTS, behind one router |
+| Telegram voice | Voice messages use the configured STT provider (Whisper fallback when unconfigured); `/voice` replies use the shared configured TTS router, with a text fallback |
 | Not in release binaries | In-process Whisper (`whisper` feature of `duduclaw-inference`), ONNX embedding (`onnx` feature) and Discord voice channels (`discord-voice` feature) compile only when you build with those features |
 | Never implemented | SenseVoice, Deepgram, Silero VAD, `symphonia` decoding and LiveKit voice rooms were listed here before; none of them has code |
+
+Local Kokoro-82M v1.1-zh (Apache-2.0; download about 134 MB from Settings → Voice) replaces the optional CLI. Auto routing: installed Piper → installed Kokoro → MiniMax → OpenAI → Azure. Kokoro Chinese has a mainland accent and can misread polyphonic words. Azure AI Speech REST offers Taiwanese Mandarin voices; it sends text to Microsoft and requires `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION`. Telegram receives local Kokoro audio as WAV (`sendAudio`).
 
 ## Security
 

@@ -4113,7 +4113,7 @@ pub async fn entry_point() {
         return;
     }
     // Install ring as the default rustls CryptoProvider (required for TLS WebSocket connections).
-    // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
+    // Must be called before any TLS connection is attempted (Discord, Azure Speech, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Build a layered subscriber: fmt (terminal) + file appender + BroadcastLayer (WebSocket).
@@ -9344,6 +9344,27 @@ async fn computer_use_check(home: &std::path::Path) -> (String, CheckStatus, Str
     ("電腦操作".to_string(), status, message)
 }
 
+/// Inspect configured speech providers locally without a synthesis/network probe.
+fn voice_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let router = duduclaw_gateway::tts::TtsRouter::for_home(home);
+    let providers = router.available_providers();
+    let command_configured = std::fs::read_to_string(home.join("inference.toml"))
+        .ok().and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("voice").and_then(|v| v.get("tts_provider")).and_then(|v| v.as_str()).map(str::to_string))
+        .is_some_and(|provider| provider == "command")
+        && !providers.contains(&"command");
+    let (status, message) = if providers.is_empty() {
+        (
+            CheckStatus::Warn,
+            if command_configured { "TTS 指令未設定或缺少 {output}；請至儀表板「設定 → 語音」修正。".into() }
+            else { "尚未設定可用的語音服務；請至儀表板「設定 → 語音」下載 Kokoro 本機模型，或設定雲端供應商。".into() },
+        )
+    } else {
+        (CheckStatus::Pass, format!("可用供應商：{}（未連線驗證）", providers.join("、")))
+    };
+    ("語音回覆".into(), status, message)
+}
+
 /// `duduclaw doctor` row 「電腦操作工作區」 (P2-C design §8.5).
 async fn computer_workspaces_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let (status, message) = duduclaw_gateway::computer_workspaces::doctor::check(home).await;
@@ -10451,6 +10472,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);
     checks.push(credential_audit_chain_check(&home));
+    checks.push(voice_check(&home));
 
     // Print results
     let mut has_failure = false;

@@ -40,7 +40,7 @@ pub(crate) async fn handle_transcribe_audio(args: &Value) -> Value {
     }
 }
 
-pub(crate) async fn handle_synthesize_speech(args: &Value) -> Value {
+pub(crate) async fn handle_synthesize_speech(args: &Value, home_dir: &Path) -> Value {
     use base64::Engine;
     use duduclaw_gateway::tts::TtsProvider;
 
@@ -50,8 +50,12 @@ pub(crate) async fn handle_synthesize_speech(args: &Value) -> Value {
     };
     let voice = args.get("voice").and_then(|v| v.as_str()).unwrap_or("");
 
-    let provider = duduclaw_gateway::tts::EdgeTtsProvider::new();
-    match provider.synthesize(text, voice).await {
+    let router = duduclaw_gateway::tts::TtsRouter::for_home(home_dir);
+    if !router.is_available() {
+        return tool_error("Speech synthesis is not available in this process; paid TTS keys are only held by the gateway.");
+    }
+    let text = duduclaw_gateway::markdown_render::to_line_plain(text);
+    match router.synthesize(&text, voice).await {
         Ok(audio_bytes) => {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
             serde_json::json!({

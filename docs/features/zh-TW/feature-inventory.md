@@ -249,15 +249,17 @@
 
 ## 語音管線
 
-見 [14-voice-pipeline.md](14-voice-pipeline.md)。HTTP 端點與 Telegram 語音處理是分開接線的。
+見 [14-voice-pipeline.md](14-voice-pipeline.md)。HTTP、Telegram 與 MCP 語音合成共用設定的 TTS router。
 
 | 功能 | 說明 |
 |------|------|
 | HTTP 端點 | `POST /api/stt`（OpenAI 相容轉錄 API 或本機指令範本；`[voice]` 沒有 STT provider 時回 501）、`POST /api/tts`、`GET`/`POST /api/voice/config` |
-| TTS provider | Piper（本機 ONNX 語音）／Edge TTS／MiniMax T2A（自動挑 CJK 或拉丁語系語音）／OpenAI TTS，由同一個 router 分派 |
-| Telegram 語音 | 語音訊息以 OpenAI Whisper API 轉錄；`/voice` 回覆使用 Edge TTS。兩者都寫死在程式碼中，儀表板的語音設定不影響 Telegram |
+| TTS provider | Piper（本機 ONNX 語音）／Kokoro / Azure／MiniMax T2A（自動挑 CJK 或拉丁語系語音）／OpenAI TTS，由同一個 router 分派 |
+| Telegram 語音 | 語音訊息使用設定的 STT 供應商（未設定時以 Whisper 備援）；`/voice` 回覆使用共用且遵循設定的 TTS router，失敗時退回文字 |
 | 不在 release binary 中 | 行程內 Whisper（`duduclaw-inference` 的 `whisper` feature）、ONNX embedding（`onnx` feature）與 Discord 語音頻道（`discord-voice` feature）只有在建置時啟用這些 feature 才會編譯 |
 | 從未實作 | 先前這裡列過 SenseVoice、Deepgram、Silero VAD、`symphonia` 解碼與 LiveKit 語音房，這些都沒有任何程式碼 |
+
+本機 Kokoro-82M v1.1-zh（Apache-2.0；從「設定 → 語音」下載，約 134 MB）取代原本的選用 CLI。自動順序：已安裝 Piper → 已安裝 Kokoro → MiniMax → OpenAI → Azure。Kokoro 中文帶有中國大陸口音，多音字可能誤讀。官方 Azure AI Speech REST 提供台灣國語聲音，會將文字傳送至 Microsoft，需設定 `AZURE_SPEECH_KEY`／`AZURE_SPEECH_REGION`。Telegram 以 WAV 接收本機 Kokoro 音訊（`sendAudio`）。
 
 ## 安全層
 
