@@ -43,6 +43,7 @@ fn empty() -> Model {
     m.inbox = fresh(vec![]);
     m.employees = fresh(vec![]);
     m.schedules = fresh(vec![]);
+    m.autonomy = fresh(vec![crate::autonomy::Status::default()]);
     m
 }
 fn populated() -> Model {
@@ -53,7 +54,8 @@ fn populated() -> Model {
     m.inbox = fresh(vec![
         approval("a1", "adu", "確認資料匯出", "tool", "approval"),
         InboxItem::Task(task),
-        approval("a2", "adu", "預算已達上限", "budget_breaker", "approval"),
+        InboxItem::Breaker(crate::state::Breaker { key: "budget.breaker_open:adu".into(), autopilot: false,
+            subject: TerminalText::new("adu".into()), agent: TerminalText::new("adu".into()), title: TerminalText::new(strings::BREAKER_EVENT.into()) }),
         approval("a3", "adu", "請選擇時段", "tool", "question"),
     ]);
     m.employees = fresh(vec![
@@ -79,7 +81,6 @@ fn populated() -> Model {
         source: ScheduleSource::Heartbeat,
         detail: json!({}),
     }]);
-    m.autonomy = Some(TerminalText::new("執行中".into()));
     m
 }
 fn connection() -> ConnectionState {
@@ -89,7 +90,6 @@ fn connection() -> ConnectionState {
         role: Role::Admin,
         boot_id: None,
         version: Some(TerminalText::new("1.77.0".into())),
-        autonomy: None,
     })
 }
 fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16) -> String {
@@ -289,6 +289,7 @@ fn badges_priority_done_receipts_and_identity_not_display_normalization() {
             working: true,
             error: true,
             completed_id: Some("run:r1".into()),
+            ..Default::default()
         },
     );
     assert_eq!(employee_status(e, &m, &read), EmployeeStatus::Awaiting);
@@ -513,6 +514,7 @@ fn input_focus_ime_paste_and_list_actions() {
     assert_eq!(app.input, "你好qrs12注音提交");
     let Action::Chat(sent) = app.key(key(KeyCode::Enter), &model) else { panic!("expected send"); };
     assert_eq!(sent.agent, "adu"); assert_eq!(sent.content, app.input);
+    app.input.clear();
     app.key(key(KeyCode::Esc), &model);
     assert_eq!(app.focus, Focus::List);
     app.key(key(KeyCode::Char('1')), &model);
@@ -685,31 +687,6 @@ fn m2_blocks_and_four_way_snapshots_in_both_width_modes() {
     }
 }
 #[test]
-fn m2_employee_pause_needs_binding_and_manager_role() {
-    let (mut m,mut a)=m2_task_app(); a.blocks.open(crate::blocks::Block::Detail,None);
-    let key=KeyEvent::new(KeyCode::Char('p'),KeyModifiers::NONE);
-    m.role=Some(Role::Employee); a.key(key,&m); assert!(a.control_card.is_none());
-    m.role=Some(Role::Manager); m.goal_operators.clear(); a.key(key,&m); assert!(a.control_card.is_none());
-    m.goal_operators.insert("adu".into()); a.key(key,&m);
-    assert!(matches!(a.control_card.as_ref().unwrap().control,crate::controls::Control::Employee { resume:false, .. }));
-}
-#[test]
-fn pause_and_next_keys_are_ignored_when_non_detail_block_has_focus() {
-    let (mut m, mut a) = m2_task_app();
-    m.role = Some(Role::Admin);
-    a.focus = crate::chat::Focus::List;
-    a.selected = Some(Selection::Employee("adu".into()));
-    for kind in [crate::blocks::Block::Run, crate::blocks::Block::Log] {
-        a.blocks.open(kind, Some("adu".into()));
-        a.focus = crate::chat::Focus::List;
-        for c in ['p', 'n'] {
-            a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &m);
-            assert!(a.control_card.is_none());
-            assert_eq!(a.notice.as_deref(), Some(strings::CONTROL_KEY_FOCUS));
-        }
-    }
-}
-#[test]
 fn m2_steering_edit_does_not_send_before_second_confirmation_and_resize() {
     let (m,mut a)=m2_task_app(); let now=std::time::Instant::now(); let later=now+std::time::Duration::from_secs(2);
     a.key_at(KeyEvent::new(KeyCode::Char('e'),KeyModifiers::NONE),&m,now,0);
@@ -828,13 +805,17 @@ fn m3_help_only_covers_focused_block_and_keeps_chat() {
     app.blocks.add(Split::Vertical);
     app.blocks.add(Split::Horizontal); app.blocks.open(Block::Chat, None);
     app.chat.append(strings::CHAT_ASSISTANT, "chat-kept-visible");
-    app.blocks.select(0); app.help = true;
+    // Use the operator path so the departing chat is saved into its pane.
+    app.key(ordinary_key('1'), &model); app.help = true;
     let output = screen(&model, &app, &Settings::default(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
     assert!(output.contains("chat-kept-visible"));
     assert!(output.contains("目前身分沒有此決策權限"));
     insta::assert_snapshot!("m3_help_focused_only", output);
-    app.blocks.select(2);
+    app.key(ordinary_key('?'), &model);
+    app.key(ordinary_key('3'), &model);
+    assert_eq!(app.blocks.focused, 2);
+    app.key(ordinary_key('?'), &model);
     let output = screen(&model, &app, &Settings::default(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
     assert!(!output.contains("chat-kept-visible"));
@@ -1157,4 +1138,468 @@ fn downstream_prompt_snapshots_preserve_focus_and_hide_reference() {
     insta::assert_snapshot!("downstream_prompt_input", output);
     app.focus = crate::chat::Focus::List;
     insta::assert_snapshot!("downstream_prompt_list", screen(&empty(), &app, &Settings::default(), 240, 24));
+}
+
+fn autonomy_model(value: serde_json::Value) -> Model {
+    let mut m = empty();
+    m.autonomy = fresh(vec![crate::autonomy::Status::parse(value).unwrap()]);
+    m.employees = fresh(vec![employee("adu", "阿嘟", "active")]);
+    m.goal_operators.insert("adu".into());
+    m
+}
+fn pause_entry() -> serde_json::Value { json!({"reason":"operator", "who":"u1", "at":"2026-11-02T00:00:00Z"}) }
+fn ordinary_key(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE) }
+
+fn assert_autonomy_unconfirmed(m: &Model) {
+    let read = ReadState::default();
+    let mut without_approvals = m.clone();
+    without_approvals.inbox = fresh(vec![]);
+    for status in ["active", "working"] {
+        assert_eq!(employee_status(&employee("adu", "阿嘟", status), &without_approvals, &read), EmployeeStatus::AutonomyUnknown);
+    }
+    let line = crate::autonomy::status_line(m).unwrap().plain();
+    assert!(line.contains(strings::AUTONOMY_UNKNOWN));
+    assert!(!line.contains(strings::AUTONOMY_PAUSED));
+    assert!(!line.contains(strings::AUTONOMY_ALL));
+    let output = screen(m, &App::default(), &Settings::default(), 180, 24);
+    assert!(output.contains(strings::AUTONOMY_ROW_UNKNOWN));
+    assert!(!output.contains(strings::AUTONOMY_ROW_PAUSED));
+}
+
+#[test]
+fn autonomy_resume_then_invalidation_and_failed_refetch_hide_cached_pause() {
+    let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause_entry()},"state_error":null}));
+    assert_eq!(employee_status(&m.employees.items[0], &m, &ReadState::default()), EmployeeStatus::AutonomyPaused);
+    m.event(&crate::client::ServerEvent {
+        name: "autonomy.changed".into(),
+        payload: json!({"agent_id":"adu","all":false,"paused":false}),
+        seq: Some(1), boot_id: None,
+    });
+    assert!(m.autonomy.paused("adu"));
+    assert_autonomy_unconfirmed(&m);
+    // A failed status refetch retains the old items and invalidation flags.
+    m.autonomy.error = Some(crate::Error::Network);
+    assert_autonomy_unconfirmed(&m);
+    m.inbox = fresh(vec![approval("pending", "adu", "review", "tool", "approval")]);
+    assert_autonomy_unconfirmed(&m);
+}
+
+#[test]
+fn autonomy_pause_then_invalidation_never_displays_confirmed_state() {
+    for value in [
+        json!({"global":null,"agents":{},"state_error":null}),
+        json!({"global":null,"agents":{"adu":pause_entry()},"state_error":null}),
+        json!({"global":pause_entry(),"agents":{},"state_error":null}),
+    ] {
+        let mut m = autonomy_model(value);
+        m.event(&crate::client::ServerEvent {
+            name: "autonomy.changed".into(),
+            payload: json!({"agent_id":"adu","all":false,"paused":true}),
+            seq: Some(1), boot_id: None,
+        });
+        assert_autonomy_unconfirmed(&m);
+        // Either flag alone must hide cached pauses, including priority badges.
+        for (stale, pending) in [(true, false), (false, true)] {
+            m.autonomy.stale = stale;
+            m.autonomy.refetch_pending = pending;
+            for status in ["active", "awaiting", "error", "paused", "stopped"] {
+                m.employees.items[0] = employee("adu", "阿嘟", status);
+                assert_autonomy_unconfirmed(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn autonomy_status_line_snapshots_and_hostile_names() {
+    let pause = pause_entry();
+    for (name, value) in [
+        ("one", json!({"global":null,"agents":{"adu":pause},"state_error":null})),
+        ("several", json!({"global":null,"agents":{"adu":pause,"b":pause,"c":pause,"d":pause},"state_error":null})),
+        ("all", json!({"global":pause,"agents":{},"state_error":null})),
+        ("none", json!({"global":null,"agents":{},"state_error":null})),
+        ("state_error", json!({"global":null,"agents":{},"state_error":"unreadable"})),
+    ] {
+        let m = autonomy_model(value);
+        let rendered = screen(&m, &App::default(), &Settings::default(), 120, 16);
+        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().nth(2).unwrap().trim_end());
+    }
+    let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause},"state_error":null}));
+    m.autonomy.error = Some(crate::Error::Timeout); m.autonomy.stale = true;
+    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end());
+    m.autonomy = Default::default();
+    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end());
+    m.autonomy = fresh(vec![crate::autonomy::Status::parse(json!({"global":null,"agents":{"adu":pause},"state_error":null})).unwrap()]);
+    m.employees.items[0].display_name = TerminalText::new("阿\u{1b}[2K\u{202e}\u{200b}嘟\nhostile".into());
+    let line = crate::autonomy::status_line(&m).unwrap().plain();
+    assert!(!line.chars().any(crate::sanitize::forbidden));
+    assert!(!line.contains('\n'));
+    insta::assert_snapshot!("autonomy_hostile", line);
+}
+
+#[tokio::test]
+async fn autonomy_keys_send_exact_requests_immediately_without_optimism() {
+    use crate::{blocks::fetch::Gateway, client::RpcReply, controls::Control};
+    struct Fake(std::sync::Mutex<Vec<(String, serde_json::Value)>>, bool);
+    #[async_trait::async_trait]
+    impl Gateway for Fake {
+        async fn request(&self, method: &str, params: serde_json::Value) -> crate::Result<RpcReply> {
+            self.0.lock().unwrap().push((method.into(), params.clone()));
+            if self.1 { return Ok(RpcReply::Rejected { message: TerminalText::new("permission denied".into()), digest_mismatch: false }); }
+            let paused = method == "autonomy.pause";
+            Ok(RpcReply::Accepted(json!({"agent_id":params["agent_id"],"all":false,"paused":paused,
+                "pause":if paused { pause_entry() } else { serde_json::Value::Null },"applied":true})))
+        }
+    }
+    let m = autonomy_model(json!({"global":null,"agents":{},"state_error":null}));
+    let gateway = Fake(Default::default(), false);
+    for kind in [crate::blocks::Block::Detail, crate::blocks::Block::Run, crate::blocks::Block::Log, crate::blocks::Block::Chat, crate::blocks::Block::Task] {
+        let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+        app.blocks.open(kind, Some("adu".into()));
+        // Even an outstanding unrelated refetch cannot delay the emergency key.
+        app.waiting_refresh = Some(0);
+        for (c, method) in [('p', "autonomy.pause"), ('u', "autonomy.resume")] {
+            let Action::Control(control @ Control::Autonomy { .. }) = app.key(ordinary_key(c), &m) else { panic!("immediate control expected"); };
+            assert!(app.control_card.is_none()); assert!(app.card.is_none());
+            let outcome = crate::controls::send(&gateway, &control).await;
+            assert!(matches!(outcome, crate::decide::Outcome::Notice(_)));
+            app.decision_finished(outcome);
+            assert_eq!(gateway.0.lock().unwrap().last().unwrap(), &(method.into(), json!({"agent_id":"adu"})));
+            assert!(!m.autonomy.paused("adu"));
+        }
+        app.key(ordinary_key('i'), &m);
+        for c in ['p','u','n'] { assert_eq!(app.key(ordinary_key(c), &m), Action::None); }
+        assert_eq!(app.input, "pun"); assert!(app.control_card.is_none());
+    }
+    let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+    let Action::Control(control) = app.key(ordinary_key('p'), &m) else { panic!() };
+    let refused = Fake(Default::default(), true);
+    app.decision_finished(crate::controls::send(&refused, &control).await);
+    assert!(app.notice.as_ref().unwrap().contains("權限不足"));
+    assert!(!app.notice.as_ref().unwrap().contains(strings::AUTONOMY_APPLIED));
+    assert!(!m.autonomy.paused("adu"));
+}
+
+#[test]
+fn autonomy_palette_permissions_all_shape_and_employee_status_cards() {
+    let mut m = autonomy_model(json!({"global":null,"agents":{},"state_error":null}));
+    let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+    for role in [Role::Employee, Role::Manager] {
+        m.role = Some(role);
+        assert!(!app.commands(&m).iter().any(|c| c.label == strings::AUTONOMY_PAUSE_ALL || c.label == strings::AUTONOMY_RESUME_ALL));
+    }
+    m.role = Some(Role::Admin);
+    for (label, method) in [(strings::AUTONOMY_PAUSE_ALL,"autonomy.pause"),(strings::AUTONOMY_RESUME_ALL,"autonomy.resume")] {
+        app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m);
+        app.paste(label);
+        let Action::Control(control) = app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m) else { panic!() };
+        assert_eq!(control.request(),(method,json!({"all":true})));
+        assert!(app.control_card.is_none());
+    }
+    for label in [strings::EMPLOYEE_PAUSE,strings::EMPLOYEE_RESUME] {
+        app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m); app.paste(label);
+        assert_eq!(app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m),Action::None);
+        assert!(matches!(app.control_card.as_ref().unwrap().control,crate::controls::Control::Employee { .. }));
+        app.control_card = None;
+    }
+    m.role = Some(Role::Employee);
+    assert_eq!(app.key(ordinary_key('p'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: false }));
+    m.role = Some(Role::Manager); m.goal_operators.clear();
+    assert_eq!(app.key(ordinary_key('p'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: false }));
+    assert_eq!(app.key(ordinary_key('u'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: true }));
+    // Ctrl-P opens the palette; exercise the all-agent permission gate directly.
+    for role in [Some(Role::Admin), None] {
+        m.role = role;
+        for resume in [false, true] {
+            assert_eq!(app.autonomy_control(None,resume,&m),Action::Control(crate::controls::Control::Autonomy { agent: None, resume }));
+        }
+    }
+    for role in [Role::Employee, Role::Manager] {
+        m.role = Some(role);
+        for resume in [false, true] {
+            assert_eq!(app.autonomy_control(None,resume,&m),Action::None);
+        }
+    }
+    // Ctrl-P is the palette even before users.me resolves; it never pauses all.
+    for role in [None, Some(Role::Manager)] {
+        m.role = role;
+        assert_eq!(app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m),Action::None);
+        assert!(app.palette.is_some());
+        assert!(!app.palette_commands(&m).iter().any(|c| c.label == strings::AUTONOMY_PAUSE_ALL || c.label == strings::AUTONOMY_RESUME_ALL));
+        app.key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),&m);
+    }
+}
+
+#[test]
+fn autonomy_employee_states_are_distinct() {
+    let pause = pause_entry();
+    let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause},"state_error":null}));
+    let read = ReadState::default();
+    for status in ["active","working"] {
+        assert_eq!(employee_status(&employee("adu","阿嘟",status),&m,&read), EmployeeStatus::AutonomyPaused);
+    }
+    m.inbox = fresh(vec![approval("pending", "adu", "review", "tool", "approval")]);
+    assert!(screen(&m,&App::default(),&Settings::default(),180,24).contains("待回覆 · 自主已暫停"));
+    m.inbox = fresh(vec![]);
+    assert_eq!(employee_status(&employee("adu","阿嘟","paused"),&m,&read),EmployeeStatus::Paused);
+    assert_eq!(employee_status(&employee("adu","阿嘟","stopped"),&m,&read),EmployeeStatus::Ended);
+    m.autonomy.items[0].global = Some(serde_json::from_value(pause).unwrap());
+    assert_eq!(employee_status(&employee("other","其他","active"),&m,&read),EmployeeStatus::AutonomyPaused);
+    m.autonomy.error = Some(crate::Error::Network);
+    assert_eq!(employee_status(&m.employees.items[0],&m,&read),EmployeeStatus::AutonomyUnknown);
+}
+
+#[test]
+fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
+    let (mut m, base) = m2_task_app(); m.role = Some(Role::Admin);
+    let mut app = base.clone();
+    app.blocks.panes[0].responsibilities = true;
+    app.blocks.panes[0].data.selected = json!({"responsibility_id":"resp1","control_epoch":4,"owner_agent_id":"adu"});
+    assert_eq!(app.key(ordinary_key('p'),&m),Action::None);
+    assert_eq!(app.control_card.as_ref().unwrap().control.request(),("responsibilities.pause",json!({"responsibility_id":"resp1","expected_control_epoch":4})));
+    for block in [crate::blocks::Block::Detail,crate::blocks::Block::Run,crate::blocks::Block::Log] {
+        for (source,key,enabled,method) in [
+            (ScheduleSource::Cron,'p',true,"cron.pause"),
+            (ScheduleSource::Cron,'p',false,"cron.resume"),
+            (ScheduleSource::Cron,'n',true,"cron.run_now"),
+            (ScheduleSource::Heartbeat,'n',true,"heartbeat.trigger"),
+        ] {
+            let mut app = base.clone(); app.blocks.open(block,None);
+            m.schedules = fresh(vec![ScheduledRun { id:"schedule".into(), agent:TerminalText::new("adu".into()), next_run:TerminalText::new("10:00".into()), source,
+                detail:json!({"id":"cron1","agent_id":"adu","enabled":enabled}) }]);
+            app.selected = Some(Selection::Schedule("schedule".into()));
+            let original_pane = app.blocks.focused;
+            app.key(ordinary_key('i'), &m);
+            assert_eq!(app.key(ordinary_key(key),&m),Action::None);
+            assert_eq!(app.input, key.to_string()); assert!(app.control_card.is_none());
+            app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &m);
+            app.key(ordinary_key(char::from(b'1' + original_pane as u8)), &m);
+            assert_eq!(app.key(ordinary_key(key),&m),Action::None);
+            let (actual,params) = app.control_card.as_ref().unwrap().control.request();
+            assert_eq!(actual,method);
+            if method.starts_with("cron.") { assert_eq!(params["id"],"cron1"); assert!(params["request_id"].as_str().unwrap().starts_with("tui-")); }
+            else { assert_eq!(params,json!({"agent_id":"adu"})); }
+        }
+    }
+}
+
+#[test]
+fn header_cost_refusal_footer_selection_and_run_round_are_visible() {
+    let mut model=empty(); model.employees=fresh(vec![employee("adu","阿嘟","active")]);
+    let mut app=App::default(); app.selected=Some(Selection::Employee("adu".into()));
+    app.blocks.open(crate::blocks::Block::Run,Some("adu".into()));
+    app.blocks.panes[0].data=crate::blocks::Data { stale:false,total:1,selected:json!({"id":"dispatch:1","agent_id":"adu","channel":"goal","round":2,"status":"running"}), ..Default::default() };
+    model.cost_millicents=Some(123_000);
+    let output=screen(&model,&app,&Settings::default(),140,30);
+    assert!(output.contains("$1.2300")); assert!(output.contains("近 24 小時"));
+    assert!(output.contains("goal · 回合 2")); assert!(output.contains("阿嘟"));
+    assert!(output.contains("Ctrl-P")); assert!(output.contains("q 離開"));
+    insta::assert_snapshot!("autonomy_header_cost",output);
+    model.cost_millicents=None;
+    let output=screen(&model,&app,&Settings::default(),140,30);
+    assert!(!output.contains('$'));
+    insta::assert_snapshot!("autonomy_header_cost_hidden",output);
+}
+
+#[test]
+fn heartbeat_uses_last_run_and_cron_uses_gateway_next_run_without_prediction() {
+    let mut model=empty();
+    model.schedules=fresh(vec![
+        ScheduledRun { id:"heartbeat:adu".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new("2026-11-03T01:00:00Z".into()),source:ScheduleSource::Heartbeat,detail:json!({"last_run":"2026-11-02T01:00:00Z"}) },
+        ScheduledRun { id:"cron:c1".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new(strings::NOT_SCHEDULED.into()),source:ScheduleSource::Cron,detail:json!({"next_run":null,"last_status":"success"}) },
+    ]);
+    let app=App::default();
+    let output=screen(&model,&app,&Settings::default(),200,40);
+    assert!(output.contains("上次執行: 2026-11-02T01:00:00Z"));
+    assert!(output.contains("2026-11-03T01:00:00Z")); assert!(output.contains(strings::NOT_SCHEDULED));
+    insta::assert_snapshot!("autonomy_schedule_times",output);
+}
+
+#[test]
+fn concurrent_chat_real_keys_keep_drafts_scrollback_cancel_and_prompt_in_own_pane() {
+    use crate::chat::{ChatRooms, Focus, Frame};
+    let model = populated();
+    let mut app = App::default();
+    let mut rooms = ChatRooms::default();
+    rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+    let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.key(key('C'), &model);
+    app.sync_chats(&rooms);
+    app.key(key('i'), &model); app.paste("first");
+    let Action::Chat(input) = app.key(enter, &model) else { panic!("first submission"); };
+    let a_id = app.blocks.panes[0].id.clone();
+    let a = serde_json::to_value(rooms.room(&a_id).unwrap().prepare(input).unwrap()).unwrap();
+    app.input = "draft A".into(); app.chat_scroll = 7;
+    app.key(esc, &model);
+    app.selected = Some(Selection::Employee("worker".into()));
+    app.key(key('C'), &model);
+    app.sync_chats(&rooms);
+    assert!(app.input.is_empty());
+    app.key(key('i'), &model); app.paste("second");
+    let Action::Chat(input) = app.key(enter, &model) else { panic!("second submission"); };
+    assert_eq!(input.agent, "worker");
+    let b_id = app.blocks.panes[1].id.clone();
+    let b = serde_json::to_value(rooms.room(&b_id).unwrap().prepare(input).unwrap()).unwrap();
+    app.input = "draft B".into();
+    app.key(esc, &model);
+    for (sent, content) in [(&a, "A working"), (&b, "B working")] {
+        rooms.apply(Frame::parse(&json!({"type":"progress","conv":sent["conv"],"msg_id":sent["msg_id"],"content":content}).to_string()).unwrap());
+    }
+    app.sync_chats(&rooms);
+    assert_eq!(app.blocks.focused, 1);
+    app.key(key('1'), &model);
+    assert_eq!(app.input, "draft A"); assert_eq!(app.chat_scroll, 7);
+    assert_eq!(app.key(key('X'), &model), Action::CancelChat);
+    rooms.apply(Frame::parse(&json!({"type":"error","code":"cancelled","conv":a["conv"],"msg_id":a["msg_id"],"downstream_ref":"private-reference","downstream_running":2}).to_string()).unwrap());
+    app.sync_chats(&rooms);
+    assert_eq!(app.blocks.focused, 0);
+    assert!(app.downstream_prompt(std::time::Instant::now()).is_some());
+    app.key(key('2'), &model);
+    assert_eq!(app.input, "draft B"); assert!(app.chat.running);
+    assert!(app.downstream_prompt(std::time::Instant::now()).is_none());
+    assert_eq!(app.key(key('y'), &model), Action::None);
+    let output = screen(&model, &app, &Settings::default(), 140, 36);
+    assert!(!output.contains("private-reference"));
+    insta::assert_snapshot!("two_chat_interleaved", output);
+    app.key(key('1'), &model); app.key(key('i'), &model);
+    assert_eq!(app.focus, Focus::Input);
+    assert_eq!(app.key(key('y'), &model), Action::None);
+    assert_eq!(app.input, "draft Ay");
+    app.key(esc, &model);
+    assert_eq!(app.key(key('y'), &model), Action::CancelDownstream("private-reference".into()));
+    app.key(key('C'), &model); app.key(key('C'), &model); app.key(key('C'), &model);
+    assert_eq!(app.blocks.panes.len(), 4);
+}
+
+#[test]
+fn navigation_hints_are_passive_and_only_accept_known_inbox_paths() {
+    let model = populated();
+    let mut app = App::default();
+    let original = Some(Selection::Employee("adu".into()));
+    app.selected = original.clone();
+    for path in ["//evil", "/inbox?item=unknown", "/inbox?item=a1&execute=yes", "/inbox?item=a1\u{1b}]52;bad", "/agents/adu/../worker", "/agents/worker", "/agents/adu", "/inbox?item=%61%31"] {
+        app.navigate_hint(&json!({"path":path}), &model);
+        assert_eq!(app.selected, original);
+        assert!(app.notice.is_none());
+    }
+    app.focus = crate::chat::Focus::Input;
+    app.input = "draft".into();
+    app.navigate_hint(&json!({"path":"/inbox?item=a1"}), &model);
+    assert_eq!(app.selected, original); assert_eq!(app.input, "draft");
+    assert!(app.notice.is_none());
+    app.focus = crate::chat::Focus::List;
+    app.detail_scroll = 7;
+    app.navigate_hint(&json!({"path":"/inbox?item=a1", "command":"approve", "focus":true}), &model);
+    assert_eq!(app.selected, original);
+    assert_eq!(app.notice.as_deref(), Some(strings::NAVIGATE_INBOX_HINT));
+    assert_eq!(app.detail_scroll, 7);
+    assert_eq!(app.focus, crate::chat::Focus::List);
+    assert!(app.card.is_none());
+}
+
+#[test]
+fn queued_navigation_cannot_retarget_pause_or_resume() {
+    let mut model = autonomy_model(json!({"global":null,"agents":{},"state_error":null}));
+    model.employees.items.push(employee("worker", "Worker", "active"));
+    model.goal_operators.insert("worker".into());
+    model.inbox = populated().inbox;
+    for path in ["/agents/worker", "/inbox?item=a1", "/inbox?item=approval:a1"] {
+        for (key, resume) in [('p', false), ('u', true)] {
+            let mut app = App::default();
+            app.selected = Some(Selection::Employee("adu".into()));
+            // The event queue is drained immediately before the queued key.
+            app.navigate_hint(&json!({"path":path,"agent_id":"worker","focus":true}), &model);
+            app.refresh(&model);
+            assert_eq!(app.key(ordinary_key(key), &model), Action::Control(
+                crate::controls::Control::Autonomy { agent: Some("adu".into()), resume }
+            ));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_mouse_uses_focused_viewport_and_never_focuses_another_pane() {
+    use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
+    use std::sync::{Arc, Mutex};
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut app = App::default();
+    app.blocks.open(crate::blocks::Block::Pty, None);
+    let pty = app.blocks.panes[0].pty.clone().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut parser = vt100::Parser::new(4, 20, 0);
+    parser.process("\x1b[?1000;1006h界x".as_bytes());
+    { let mut session = pty.lock().unwrap(); session.set_screen_for_test(parser.screen()); session.set_writer_for_test(Capture(captured.clone())); }
+    app.blocks.panes[0].pty_area = ratatui::layout::Rect::new(40, 10, 20, 4);
+    let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 42, row: 11, modifiers: KeyModifiers::NONE };
+    app.mouse(click, &Settings::default());
+    assert!(captured.lock().unwrap().is_empty());
+    app.pty_focus = true;
+    app.mouse(MouseEvent { column: 39, ..click }, &Settings::default());
+    app.mouse(MouseEvent { row: 14, ..click }, &Settings::default());
+    assert!(captured.lock().unwrap().is_empty());
+    app.mouse(click, &Settings::default());
+    for column in [40, 41, 42] {
+        app.mouse(MouseEvent { column, row: 10, ..click }, &Settings::default());
+    }
+    let expected = b"\x1b[<0;3;2M\x1b[<0;1;1M\x1b[<0;2;1M\x1b[<0;3;1M";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while captured.lock().unwrap().len() < expected.len() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(*captured.lock().unwrap(), expected);
+    assert_eq!(app.blocks.focused, 0);
+    app.pty_focus = false;
+    app.blocks.add(crate::blocks::Split::Vertical);
+    app.mouse(click, &Settings::default());
+    assert_eq!(app.blocks.focused, 1);
+    assert_eq!(*captured.lock().unwrap(), expected);
+}
+
+#[test]
+fn input_focus_cannot_send_or_paste_into_a_non_chat_pane() {
+    let mut app = App::default();
+    app.focus = crate::chat::Focus::Input;
+    app.chat.connected = true;
+    app.input_agent = Some("adu".into());
+    app.paste("must not enter another pane");
+    assert!(app.input.is_empty());
+    app.input = "stale draft".into();
+    assert_eq!(app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &empty()), Action::None);
+    assert_eq!(app.focus, crate::chat::Focus::List);
+}
+
+#[test]
+fn downstream_prompt_keeps_answer_keys_and_count_in_narrow_chat() {
+    for width in [18, 24, 32, 48] {
+        let mut app = downstream_app(std::time::Instant::now());
+        let backend = ratatui::backend::TestBackend::new(width, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            super::chat_render::draw(frame, frame.area(), &mut app, &Settings::default(), strings::CHAT_ASSISTANT);
+        }).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for row in 0..12 {
+            let mut column = 0;
+            while column < width {
+                let cell = &buffer[(column, row)];
+                output.push_str(cell.symbol());
+                column += cell.cell_width().max(1);
+            }
+            output.push('\n');
+        }
+        assert!(output.contains("y 停止"), "{width}: {output}");
+        assert!(output.contains("n 繼續"), "{width}: {output}");
+        assert!(output.contains('2'), "{width}: {output}");
+        assert!(!output.contains("opaque-never-render"));
+    }
 }

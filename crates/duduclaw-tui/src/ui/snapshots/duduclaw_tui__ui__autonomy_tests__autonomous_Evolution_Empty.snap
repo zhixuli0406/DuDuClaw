@@ -1,0 +1,15 @@
+---
+source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
+assertion_line: 108
+expression: body
+---
+唯讀；完整內容請到儀表板查看
+啟用: false
+模式: prediction_driven
+累計回合: 4
+已套用回合: 2
+此範圍沒有可見資料；不代表系統沒有異常
+停滯訊號
+此範圍沒有可見資料；不代表系統沒有異常
+經驗條目
+此範圍沒有可見資料；不代表系統沒有異常

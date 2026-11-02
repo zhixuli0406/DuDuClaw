@@ -1,0 +1,6 @@
+---
+source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
+assertion_line: 108
+expression: body
+---
+此範圍沒有可見資料；不代表系統沒有異常

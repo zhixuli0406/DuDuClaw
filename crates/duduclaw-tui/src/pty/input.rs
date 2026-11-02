@@ -95,3 +95,78 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
         text.into_bytes()
     }
 }
+
+/// Child encoding modes are independent; the parser filter retains every set bit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MouseEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Urxvt,
+    Sgr,
+    SgrPixels,
+}
+impl From<vt100::MouseProtocolEncoding> for MouseEncoding {
+    fn from(encoding: vt100::MouseProtocolEncoding) -> Self {
+        match encoding {
+            vt100::MouseProtocolEncoding::Utf8 => Self::Utf8,
+            vt100::MouseProtocolEncoding::Sgr => Self::Sgr,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// Estimate the top-left pixel of the host cell, relative to the pane.
+/// Mouse events have no subcell geometry; absent host dimensions use 8x16 cells.
+pub fn mouse_pixels(event: crossterm::event::MouseEvent, area: ratatui::layout::Rect,
+    window: Option<crossterm::terminal::WindowSize>) -> Option<(u32, u32)> {
+    if !area.contains(ratatui::layout::Position::new(event.column, event.row)) { return None; }
+    let (width, height) = window.and_then(|size| {
+        if size.columns == 0 || size.rows == 0 { return None; }
+        let cell = (size.width / size.columns, size.height / size.rows);
+        (cell.0 > 0 && cell.1 > 0).then_some(cell)
+    }).unwrap_or((8, 16));
+    let axis = |offset: u16, cells: u16, pixels: u16| {
+        (u32::from(offset) * u32::from(pixels) + 1)
+            .clamp(1, u32::from(cells) * u32::from(pixels))
+    };
+    Some((axis(event.column - area.x, area.width, width),
+        axis(event.row - area.y, area.height, height)))
+}
+
+/// Encode only host mouse input for the child. Coordinates are one-based cells, or pane pixels for SGR-Pixels.
+pub fn mouse_bytes(event: crossterm::event::MouseEvent, x: u32, y: u32,
+    mode: vt100::MouseProtocolMode, encoding: impl Into<MouseEncoding>) -> Vec<u8> {
+    use crossterm::event::{MouseButton as B, MouseEventKind as K};
+    use vt100::MouseProtocolMode as Mode;
+    use MouseEncoding as Encoding;
+    let encoding = encoding.into();
+    let sgr = matches!(encoding, Encoding::Sgr | Encoding::SgrPixels);
+    if mode == Mode::None || x == 0 || y == 0 { return vec![]; }
+    let button = |b| match b { B::Left => 0u16, B::Middle => 1, B::Right => 2 };
+    let release = matches!(event.kind, K::Up(_));
+    let mut code = match event.kind {
+        K::Down(b) => button(b),
+        K::Up(b) if mode != Mode::Press => if sgr { button(b) } else { 3 },
+        K::Drag(b) if matches!(mode, Mode::ButtonMotion | Mode::AnyMotion) => 32 + button(b),
+        K::Moved if mode == Mode::AnyMotion => 35,
+        K::ScrollUp => 64, K::ScrollDown => 65, K::ScrollLeft => 66, K::ScrollRight => 67,
+        _ => return vec![],
+    };
+    if mode != Mode::Press {
+        if event.modifiers.contains(M::SHIFT) { code += 4; }
+        if event.modifiers.contains(M::ALT) { code += 8; }
+        if event.modifiers.contains(M::CONTROL) { code += 16; }
+    }
+    match encoding {
+        Encoding::Sgr | Encoding::SgrPixels => format!("\x1b[<{code};{x};{y}{}", if release { 'm' } else { 'M' }).into_bytes(),
+        Encoding::Urxvt => format!("\x1b[{};{x};{y}M", code + 32).into_bytes(),
+        Encoding::Default if x <= 223 && y <= 223 => vec![27, b'[', b'M', (code + 32) as u8, (x + 32) as u8, (y + 32) as u8],
+        Encoding::Utf8 if x <= 2015 && y <= 2015 => {
+            let mut out = String::from("\x1b[M");
+            for n in [u32::from(code) + 32, x + 32, y + 32] { out.push(char::from_u32(n).unwrap()); }
+            out.into_bytes()
+        }
+        _ => vec![],
+    }
+}

@@ -1,10 +1,11 @@
-//! Confirmation for reversible controls, separate from all gateway content.
+//! Confirmation for explicit controls, separate from all gateway content.
 use crate::{controls::Control, sanitize::TerminalText, strings};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 #[derive(Clone)]
 pub enum Source {
     Employee(String),
+    Goal(String),
     Schedule(String),
     Pane(usize),
 }
@@ -31,7 +32,7 @@ impl ControlCard {
         code: String,
         now: Instant,
     ) -> Self {
-        let editing = matches!(control, Control::Steer { .. });
+        let editing = matches!(control, Control::Steer { .. } | Control::GoalCreate { .. });
         Self {
             control,
             source,
@@ -51,6 +52,11 @@ impl ControlCard {
         now.saturating_duration_since(self.opened) >= Duration::from_secs(1)
     }
     pub fn body(&self) -> TerminalText {
+        if let Control::GoalCreate { agent, body, plan_first } = &self.control {
+            return TerminalText::new(format!("{}\n{}: {}\n{}: {}\n{}\n{}", strings::GOAL_CREATE,
+                strings::field_label("agent_id"), agent, strings::PLAN_FIRST,
+                if *plan_first { strings::YES } else { strings::NO }, body, strings::CONTROL_SCOPE));
+        }
         TerminalText::new(format!(
             "{}\n{}\n{}",
             self.control.label(),
@@ -73,7 +79,7 @@ impl ControlCard {
     }
     pub fn paste(&mut self, text: &str) {
         if self.editing
-            && let Control::Steer { body, .. } = &mut self.control
+            && let Some(body) = self.control.edit_body()
         {
             let remaining = 4000usize.saturating_sub(body.chars().count());
             body.extend(
@@ -94,13 +100,16 @@ impl ControlCard {
         }
         if self.editing {
             match key.code {
+                KeyCode::Tab => {
+                    if let Control::GoalCreate { plan_first, .. } = &mut self.control { *plan_first = !*plan_first; }
+                }
                 KeyCode::Char(c) => self.paste(&c.to_string()),
                 KeyCode::Backspace => {
-                    if let Control::Steer { body, .. } = &mut self.control {
+                    if let Some(body) = self.control.edit_body() {
                         body.pop();
                     }
                 }
-                KeyCode::Enter if matches!(&self.control, Control::Steer { body, .. } if !body.trim().is_empty()) =>
+                KeyCode::Enter if self.control.edit_body().is_some_and(|body| !body.trim().is_empty()) =>
                 {
                     self.editing = false;
                     self.opened = now;
@@ -117,7 +126,7 @@ impl ControlCard {
             }
             KeyCode::PageUp | KeyCode::Up => self.scroll = self.scroll.saturating_sub(self.page),
             KeyCode::Char(c) if c.is_ascii_digit() && self.bottom && fresh && !self.blocked => {
-                if self.input.len() < 2 {
+                if self.input.len() < 3 {
                     self.input.push(c);
                 }
             }
@@ -139,7 +148,7 @@ impl ControlCard {
         } else if !fresh {
             strings::STALE.into()
         } else if self.editing {
-            strings::STEER_EDIT.into()
+            if matches!(self.control, Control::GoalCreate { .. }) { strings::GOAL_EDIT.into() } else { strings::STEER_EDIT.into() }
         } else if !self.bottom {
             strings::CONTROL_SCROLL.into()
         } else {

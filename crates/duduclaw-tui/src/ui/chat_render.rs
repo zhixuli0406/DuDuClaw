@@ -56,7 +56,12 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
     } else {
         ""
     };
-    let downstream = app.downstream_prompt(std::time::Instant::now());
+    let now = std::time::Instant::now();
+    let downstream = app.downstream_prompt(now).map(|prompt| {
+        if super::text::columns(&prompt.plain(), settings.ambiguous_width) > usize::from(inside.width) {
+            app.downstream_prompt_compact(now).unwrap_or(prompt)
+        } else { prompt }
+    });
     text(
         frame,
         Rect::new(inside.x, inside.y, inside.width, 1),
@@ -72,9 +77,14 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
         app.chat.stale,
         false,
     );
-    let prompt_rows = u16::from(downstream.is_some() && inside.height > 1);
+    let prompt_rows = downstream.as_ref().map_or(0, |prompt| {
+        super::text::wrapped_lines(prompt, inside.width, settings.ambiguous_width)
+            .min(usize::from(inside.height.saturating_sub(1))) as u16
+    });
     if let Some(prompt) = downstream && prompt_rows > 0 {
-        text(frame, Rect::new(inside.x, inside.y + 1, inside.width, 1), prompt, settings, false, false);
+        frame.render_widget(SafeText { text: &prompt, width: settings.ambiguous_width,
+            visible: false, wrap: true, scroll: 0, style: style(false) },
+            Rect::new(inside.x, inside.y + 1, inside.width, prompt_rows));
     }
     let body = Rect::new(
         inside.x,

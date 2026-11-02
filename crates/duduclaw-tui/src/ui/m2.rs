@@ -38,6 +38,7 @@ impl App {
     }
     pub(super) fn control_subject(&self, source: &Source, model: &Model) -> Option<Value> {
         match source {
+            Source::Goal(id) if operator(model, Some(id)) => Some(json!({"agent_id":id})),
             Source::Employee(id) if manager(model) && operator(model, Some(id)) => model
                 .employees
                 .items
@@ -58,6 +59,11 @@ impl App {
             Source::Pane(i) => {
                 let p = self.blocks.panes.get(*i)?;
                 let row = &p.data.selected;
+                if p.kind == Block::Workflow {
+                    return (!p.data.stale && p.data.error.is_none() && manager(model)
+                        && operator(model, row["_tui_owner"].as_str())
+                        && row["run_id"].as_str().is_some()).then(|| row.clone());
+                }
                 let agent = if p.responsibilities {
                     row["owner_agent_id"].as_str()
                 } else {
@@ -97,13 +103,52 @@ impl App {
             now,
         ));
     }
+    pub(super) fn context_hints(&self, model: &Model) -> &'static str {
+        let pane = &self.blocks.panes[self.blocks.focused];
+        if pane.kind == Block::Task && pane.responsibilities { return strings::RESP_KEYS; }
+        if let Some(Selection::Schedule(id)) = &self.selected
+            && let Some(schedule) = model.schedules.items.iter().find(|s| &s.id == id) {
+            return match schedule.source {
+                crate::state_extra::ScheduleSource::Cron => strings::CRON_KEYS,
+                crate::state_extra::ScheduleSource::Heartbeat => strings::HEARTBEAT_KEYS,
+            };
+        }
+        strings::LIST_KEY_HINTS
+    }
+    pub(super) fn autonomy_control(&mut self, agent: Option<String>, resume: bool, model: &Model) -> Action {
+        // An emergency request does not wait for a snapshot or another decision.
+        // Single-employee emergency controls always reach the gateway; cached
+        // capabilities may be stale or not loaded yet. The gateway reauthorizes.
+        let allowed = match agent.as_deref() {
+            None => model.role.is_none_or(|role| role == Role::Admin),
+            Some(_) => true,
+        };
+        if !allowed {
+            self.notice = Some(strings::CARD_NO_PERMISSION.into());
+            return Action::None;
+        }
+        self.notice = Some(strings::DECISION_SENDING.into());
+        Action::Control(Control::Autonomy { agent, resume })
+    }
     pub(super) fn m2_key(&mut self, c: char, model: &Model, now: Instant) -> Option<Action> {
         let i = self.blocks.focused;
-        if matches!(c, 'p' | 'n') && self.blocks.active != Block::Detail {
-            self.notice = Some(strings::CONTROL_KEY_FOCUS.into());
-            return Some(Action::None);
-        }
         match c {
+            'N' => {
+                if let Some(agent) = self.block_agent(model).or_else(|| self.blocks.panes[i].agent.clone()) {
+                    self.open_control(Control::GoalCreate { agent: agent.clone(), body: String::new(), plan_first: true }, Source::Goal(agent), model, now);
+                } else { self.notice = Some(strings::SELECT_EMPLOYEE.into()); }
+            }
+            's' if self.blocks.active == Block::Workflow => {
+                if let Some(run) = self.blocks.panes[i].data.selected["run_id"].as_str() {
+                    self.open_control(Control::WorkflowCancel { run: run.into() }, Source::Pane(i), model, now);
+                }
+            }
+            'c' if self.blocks.active == Block::Task && !self.blocks.panes[i].responsibilities => {
+                if let Some(item) = self.blocks.panes[i].data.task() {
+                    let mut card = super::card::Card::open(item, model, now, &mut self.codes);
+                    if card.start_continue() { self.card = Some(card); self.task_card = true; }
+                }
+            }
             'v' | 'x' => {
                 self.blocks.add(if c == 'v' {
                     crate::blocks::Split::Vertical
@@ -113,11 +158,17 @@ impl App {
             }
             'P' => { self.blocks.open(Block::Pty, None); self.pty_focus = crate::pty::SUPPORTED; self.focus = crate::chat::Focus::List; },
             'D' => self.blocks.open(Block::Detail, None),
-            'C' => self.blocks.chat(),
+            'C' => { self.blocks.new_chat(); if self.blocks.active == Block::Chat && self.blocks.panes[self.blocks.focused].agent.is_none() { self.blocks.panes[self.blocks.focused].agent = self.block_agent(model); } },
             'R' | 'T' => {
                 if let Some(agent) = self.block_agent(model) {
                     self.blocks
                         .open(if c == 'R' { Block::Run } else { Block::Task }, Some(agent));
+                    if c == 'T' && let Some(Selection::Employee(id)) = &self.selected {
+                        self.blocks.panes[i].task_id = model.activity.get(id).and_then(|a| a.task_id.clone());
+                        if model.activity.get(id).is_some_and(|a| a.working && a.task_id.is_none()) {
+                            self.notice = Some(strings::WORKING_TASK_UNKNOWN.into());
+                        }
+                    }
                     if c == 'T'
                         && let Some(Selection::Inbox(id)) = &self.selected
                     {
@@ -138,6 +189,25 @@ impl App {
                     self.notice = Some(strings::SELECT_EMPLOYEE.into());
                 }
             }
+            'W' | 'A' | 'E' | 'B' | 'G' => {
+                let pane = &self.blocks.panes[i];
+                let task = match pane.kind {
+                    Block::Task if !pane.responsibilities => pane.data.selected["id"].as_str().map(str::to_owned),
+                    Block::Run => pane.data.selected["task_id"].as_str().map(str::to_owned),
+                    Block::Workflow => pane.task_id.clone(),
+                    _ => None,
+                }.or_else(|| match &self.selected {
+                        Some(Selection::Inbox(id)) => model.inbox.items.iter().find(|item| item.key() == *id).and_then(|item| match item {
+                            crate::state::InboxItem::Task(task) => Some(task.id().to_owned()), _ => None,
+                        }),
+                        Some(Selection::Employee(id)) => model.activity.get(id).and_then(|a| a.task_id.clone()),
+                        _ => None,
+                    });
+                let agent = self.block_agent(model).or_else(|| self.blocks.panes[i].agent.clone());
+                let kind = match c { 'W' => Block::Workflow, 'A' => Block::Autopilot, 'E' => Block::Evolution, 'B' => Block::Budget, _ => Block::Digest };
+                self.blocks.open(kind, agent);
+                if kind == Block::Workflow { self.blocks.panes[i].task_id = task; }
+            }
             'L' => self.blocks.open(Block::Log, None),
             'o' if self.blocks.active == Block::Task && self.blocks.panes[i].responsibilities => {
                 let p = &mut self.blocks.panes[i];
@@ -151,7 +221,7 @@ impl App {
                 p.data = crate::blocks::Data::default();
                 self.blocks.revision += 1;
             }
-            '[' | ']' if matches!(self.blocks.active, Block::Run | Block::Task) => {
+            '[' | ']' if matches!(self.blocks.active, Block::Run | Block::Task | Block::Workflow) => {
                 let p = &mut self.blocks.panes[i];
                 p.index = if c == '[' {
                     p.index.saturating_sub(1)
@@ -159,7 +229,7 @@ impl App {
                     (p.index + 1).min(p.data.total.saturating_sub(1))
                 };
                 p.scroll = 0;
-                p.task_id = None;
+                if p.kind != Block::Workflow { p.task_id = None; }
                 p.data = crate::blocks::Data::default();
                 self.blocks.revision += 1;
             }
@@ -225,25 +295,11 @@ impl App {
                     self.open_control(control, Source::Pane(i), model, now);
                 }
             }
-            'p' | 'n' => match self.selected.clone() {
-                Some(Selection::Employee(id)) if c == 'p' => {
-                    let resume = model
-                        .employees
-                        .items
-                        .iter()
-                        .find(|e| e.id() == id)
-                        .is_some_and(|e| e.status.is("paused"));
-                    self.open_control(
-                        Control::Employee {
-                            agent: id.clone(),
-                            resume,
-                        },
-                        Source::Employee(id),
-                        model,
-                        now,
-                    );
+            'p' | 'u' | 'n' => match self.selected.clone() {
+                Some(Selection::Employee(id)) if matches!(c, 'p' | 'u') => {
+                    return Some(self.autonomy_control(Some(id), c == 'u', model));
                 }
-                Some(Selection::Schedule(id)) => {
+                Some(Selection::Schedule(id)) if c != 'u' => {
                     if let Some(s) = model.schedules.items.iter().find(|s| s.id == id) {
                         let r = &s.detail;
                         let control = match s.source {

@@ -14,6 +14,22 @@ fn color(color: vt100::Color) -> Color {
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
+/// Map rendered host columns to one-based VT columns, including wide-cell tails.
+pub(super) fn host_to_vt_columns(screen: &crate::pty::Screen, row: u16, columns: u16, settings: &Settings) -> Vec<u16> {
+    let mut mapping = Vec::new();
+    for col in 0..screen.size().1 {
+        let Some(cell) = screen.cell(row, col) else { break; };
+        if cell.is_wide_continuation() { continue; }
+        let safe = TerminalText::new(cell.contents().to_owned()).plain().replace('\n', "");
+        let width = super::text::columns(if safe.is_empty() { " " } else { &safe }, settings.ambiguous_width);
+        if mapping.len() + width > usize::from(columns) { break; }
+        let vt_tail = u16::from(screen.cell(row, col + 1).is_some_and(|next| next.is_wide_continuation()));
+        // Ambiguous-width expansion may use two host cells for one VT cell.
+        mapping.extend((0..width).map(|offset| col + 1 + (offset as u16).min(vt_tail)));
+    }
+    mapping
+}
+
 pub(super) fn cells(
     screen: &crate::pty::Screen,
     area: Rect,
@@ -72,12 +88,15 @@ pub(super) fn cells(
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
-    pane: &Pane,
+    pane: &mut Pane,
     settings: &Settings,
     title: &str,
     focused: bool,
 ) {
-    let inner = super::widgets::panel(frame, area, title, settings, false);
+    pane.pty_area = Rect::default();
+    let waiting = pane.pty.as_ref().is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).waiting());
+    let title = if waiting { format!("{title} · {}", crate::strings::PTY_WAITING) } else { title.into() };
+    let inner = super::widgets::panel(frame, area, &title, settings, false);
     if inner.is_empty() {
         return;
     }
@@ -91,6 +110,7 @@ pub(super) fn draw(
         inner.width,
         inner.height.saturating_sub(1),
     );
+    pane.pty_area = screen_area;
     if !screen_area.is_empty() {
         pty.resize(screen_area.height, screen_area.width);
         cells(

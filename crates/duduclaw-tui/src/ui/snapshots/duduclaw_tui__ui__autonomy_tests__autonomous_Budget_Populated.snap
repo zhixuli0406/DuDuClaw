@@ -1,0 +1,8 @@
+---
+source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
+assertion_line: 108
+expression: body
+---
+唯讀；完整內容請到儀表板查看
+時間 · 員工 · 事件 · 範圍 · 支出（美分） · 上限（美分）
+2026-11-02T08:00:00Z · 每週報告 · budget_breaker_open · daily · 100 · 100

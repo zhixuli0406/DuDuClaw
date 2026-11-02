@@ -23,12 +23,19 @@ impl SnapshotBudget {
             .get(field)
             .and_then(Value::as_array)
             .ok_or(Error::Protocol)?;
-        self.ensure_items(rows.len() as u64)?;
+        self.charge_items(response, rows.len())
+    }
+    pub fn charge_map(&mut self, response: &Value, field: &str) -> Result<()> {
+        let rows = response.get(field).and_then(Value::as_object).ok_or(Error::Protocol)?;
+        self.charge_items(response, rows.len())
+    }
+    fn charge_items(&mut self, response: &Value, count: usize) -> Result<()> {
+        self.ensure_items(count as u64)?;
         // Count the entire encoded response (including fields we do not use)
         // without allocating a second JSON buffer. Wire size bounds content;
         // decoded nodes/typed rows/detail copies have additional bounded overhead.
         serde_json::to_writer(&mut *self, response).map_err(|_| Error::SnapshotBudget)?;
-        self.items += rows.len();
+        self.items += count;
         Ok(())
     }
 }

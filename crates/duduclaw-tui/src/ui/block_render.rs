@@ -15,13 +15,20 @@ use ratatui::{Frame, layout::Rect};
 pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail) -> TerminalText {
     let d = &pane.data;
     let mut lines = Vec::new();
-    if d.stale {
-        lines.push(strings::STALE.into());
-    }
-    if let Some(error) = &d.error {
-        lines.push(error.plain());
+    if !pane.kind.autonomy() {
+        if d.stale { lines.push(strings::STALE.into()); }
+        if let Some(error) = &d.error { lines.push(error.plain()); }
     }
     match pane.kind {
+        kind if kind.autonomy() => {
+            let allowed = match kind {
+                Block::Autopilot => model.role == Some(crate::auth::Role::Admin),
+                Block::Evolution | Block::Budget => super::m2::manager(model),
+                _ => true,
+            };
+            if allowed { lines.extend(crate::blocks::autonomy::content(pane)); }
+            else { lines.push(if kind == Block::Autopilot { strings::ADMIN_ONLY } else { strings::MANAGER_ONLY }.into()); }
+        }
         Block::Run => {
             lines.push(
                 if d.subscribed {
@@ -122,6 +129,10 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
             }
         }
         Block::Task => {
+            if d.selected.is_null() && !d.stale {
+                lines.push(strings::VIEW_EMPTY.into());
+                return TerminalText::new(lines.join("\n"));
+            }
             lines.push(strings::TASK_KEYS.into());
             lines.push(if d.stale {
                 "?".into()
@@ -163,6 +174,23 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
             } else {
                 lines.push(strings::CARD_NO_PERMISSION.into());
             }
+            if d.selected["plan_pending"].as_str().is_some_and(|s| !s.is_empty()) {
+                lines.push(strings::PLAN_APPROVE.into());
+                lines.push(crate::blocks::autonomy::short(&d.selected, "plan_pending"));
+            }
+            if d.selected["goal_mode"] == true && matches!(d.selected["status"].as_str(), Some("done" | "failed" | "cancelled")) {
+                lines.push(strings::CONTINUE_OPEN.into());
+            }
+            lines.push(strings::CRITERIA.into());
+            let ledger = &d.section("timeline")["criteria_ledger"];
+            if ledger.is_null() { lines.push(strings::NOT_PROVIDED.into()); }
+            else {
+                crate::blocks::autonomy::fields(&mut lines, ledger, &["mode","last_report_round","invalid_reports"]);
+                crate::blocks::autonomy::table(&mut lines, ledger["units"].as_array(), &["handle","text","status","evidence","unresolved","updated_round"]);
+            }
+            lines.push(strings::ROLES.into());
+            if let Some(error) = d.section("roles_error").as_str() { lines.push(error.into()); }
+            else { crate::blocks::autonomy::table(&mut lines, d.section("roles")["turns"].as_array(), &["round","role","runtime","provider","outcome","timestamp"]); }
             lines.push(strings::ITERATIONS.into());
             if let Some(rows) = d.section("iterations")["iterations"].as_array() {
                 for row in rows {
@@ -217,6 +245,7 @@ pub(super) fn draw(
     settings: &Settings,
     detail_stale: bool,
 ) {
+    for pane in &mut app.blocks.panes { pane.pty_area = Rect::default(); }
     let (regions, hidden) = app.blocks.areas(area);
     let content_area = if hidden > 0 {
         text(
@@ -243,7 +272,7 @@ pub(super) fn draw(
     };
     for (index, region) in regions {
         let kind = app.blocks.panes[index].kind;
-        let title = format!(
+        let mut title = format!(
             "{}{} {}",
             if index == app.blocks.focused {
                 "> "
@@ -253,12 +282,34 @@ pub(super) fn draw(
             index + 1,
             kind.label()
         );
+        let pane = &app.blocks.panes[index];
+        let row = &pane.data.selected;
+        let detail = match kind {
+            Block::Chat => pane.agent.as_ref().map(|agent| TerminalText::new(agent.clone()).plain().replace('\n', " ")).unwrap_or_default(),
+            Block::Run if !row.is_null() => {
+                if let Some(round) = row["round"].as_i64() {
+                    strings::run_round_title(&crate::blocks::autonomy::short(row, "channel"), round)
+                } else { crate::blocks::autonomy::short(row, "channel") }
+            }
+            Block::Task if !row.is_null() => crate::blocks::autonomy::short(row, if pane.responsibilities { "objective" } else { "title" }),
+            Block::Workflow if !row.is_null() => crate::blocks::autonomy::short(row, "workflow_id"),
+            _ => String::new(),
+        };
+        if !detail.is_empty() { title.push_str(&format!(" · {detail}")); }
         if kind == Block::Chat && !(app.help && index == app.blocks.focused) {
-            super::chat_render::draw(frame, region, app, settings, &title);
+            if index == app.blocks.focused {
+                super::chat_render::draw(frame, region, app, settings, &title);
+            } else {
+                let current = app.chat_view();
+                app.set_chat_view(app.blocks.panes[index].chat_view.clone());
+                super::chat_render::draw(frame, region, app, settings, &title);
+                app.blocks.panes[index].chat_view = app.chat_view();
+                app.set_chat_view(current);
+            }
             continue;
         }
         if kind == Block::Pty && !(app.help && index == app.blocks.focused) {
-            super::pty_render::draw(frame, region, &app.blocks.panes[index], settings, &title, app.pty_focus && index == app.blocks.focused);
+            super::pty_render::draw(frame, region, &mut app.blocks.panes[index], settings, &title, app.pty_focus && index == app.blocks.focused);
             continue;
         }
         let pane = &app.blocks.panes[index];
