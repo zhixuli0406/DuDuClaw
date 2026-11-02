@@ -12,7 +12,17 @@ export function useSetupChecklist(enabled = true) {
     let active = true;
     setResult(null);
     if (allowed && enabled && user) {
-      void loadSetupData().then(data => { if (active) setResult({ userId: user.id, data }); });
+      void loadSetupData((key, value) => {
+        if (!active) return;
+        setResult(current => {
+          const data = current?.userId === user.id ? current.data : {
+            company: undefined, knowledge: undefined, runtime: undefined, accounts: undefined,
+            google: undefined, odoo: undefined, agents: undefined, users: undefined,
+            channels: undefined, skills: undefined, routines: undefined, tasks: undefined,
+          };
+          return { userId: user.id, data: { ...data, [key]: value } };
+        });
+      });
     }
     return () => { active = false; };
   }, [allowed, enabled, user?.id]);

@@ -24,9 +24,25 @@ describe('setup read authorization', () => {
     expect(state.load).not.toHaveBeenCalled();
   });
   it('reads only for an enabled Enterprise Admin', async () => {
+    state.load.mockImplementation((onProgress: (key: 'tasks', value: number) => void) => {
+      onProgress('tasks', 0);
+      return Promise.resolve({ tasks: 0 });
+    });
     const { result } = renderHook(() => useSetupChecklist());
-    await waitFor(() => expect(result.current.data).toEqual({ tasks: 0 }));
+    await waitFor(() => expect(result.current.data?.tasks).toBe(0));
     expect(state.load).toHaveBeenCalledTimes(1);
+  });
+  it('merges per-row progress and ignores late progress after cleanup', async () => {
+    let progress: ((key: 'tasks', value: number) => void) | undefined;
+    state.load.mockImplementation((onProgress: typeof progress) => { progress = onProgress; return new Promise(() => {}); });
+    const { result, unmount } = renderHook(() => useSetupChecklist());
+    await waitFor(() => expect(state.load).toHaveBeenCalled());
+    progress?.('tasks', 2);
+    await waitFor(() => expect(result.current.data?.tasks).toBe(2));
+    expect(result.current.data?.accounts).toBeUndefined();
+    unmount();
+    progress?.('tasks', 3);
+    expect(result.current.data?.tasks).toBe(2);
   });
   it('does not read for a dismissed card', () => {
     renderHook(() => useSetupChecklist(false));

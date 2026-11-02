@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('@/lib/ws-client', () => ({ client: { call: vi.fn(), subscribe: vi.fn() } }));
-import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
-import { knowledgeApi } from '@/lib/knowledge-api';
 import { loadSetupData, setupItems, setupProgress, type SetupData } from './setup-checklist';
 
 const empty: SetupData = {
@@ -21,10 +19,10 @@ describe('setup checklist table', () => {
     expect(item.check(empty)).toBe(item.id === 'permissions');
     expect(item.check(filled)).toBe(true);
   });
-  it('accepts either runtime readiness or an account', () => {
+  it('uses accounts alone for account readiness', () => {
     const item = setupItems.find(i => i.id === 'accounts')!;
-    expect(item.check({ ...empty, runtime: true })).toBe(true);
     expect(item.check({ ...empty, accounts: 1 })).toBe(true);
+    expect(item.check({ ...empty, runtime: true, accounts: 0 })).toBe(false);
     expect(item.check({ ...filled, accounts: null })).toBeNull();
   });
   it('requires two active users and all employee bindings', () => {
@@ -43,23 +41,23 @@ describe('setup checklist table', () => {
   });
   it('reports every failed read as unknown', async () => {
     const fail = () => Promise.reject(new Error('offline'));
-    const spies = [
-      vi.spyOn(api.system, 'config').mockImplementation(fail),
-      vi.spyOn(knowledgeApi, 'listCollections').mockImplementation(fail),
-      vi.spyOn(api.runtime, 'detect').mockImplementation(fail),
-      vi.spyOn(api.accounts, 'list').mockImplementation(fail),
-      vi.spyOn(api.googleIdentity, 'delegation').mockImplementation(fail),
-      vi.spyOn(api.odoo, 'status').mockImplementation(fail),
-      vi.spyOn(api.agents, 'list').mockImplementation(fail),
-      vi.spyOn(api.users, 'list').mockImplementation(fail),
-      vi.spyOn(api.channels, 'status').mockImplementation(fail),
-      vi.spyOn(api.skills, 'listAll').mockImplementation(fail),
-      vi.spyOn(api.cron, 'list').mockImplementation(fail),
-      vi.spyOn(api.tasks, 'list').mockImplementation(fail),
-    ];
+    vi.mocked(client.call).mockImplementation(fail);
     const data = await loadSetupData();
     for (const item of setupItems) expect(item.check(data)).toBeNull();
     expect(setupProgress(data)).toEqual({ done: 0, total: 9 });
-    spies.forEach(spy => spy.mockRestore());
+  });
+  it('publishes each row as it resolves and uses 10 second timeouts', async () => {
+    const pending = new Map<string, (value: unknown) => void>();
+    vi.mocked(client.call).mockImplementation((method, _params, _skip, timeout) => {
+      expect(timeout).toBe(10_000);
+      return new Promise(resolve => pending.set(method, resolve));
+    });
+    const updates: Array<[keyof SetupData, unknown]> = [];
+    const loading = loadSetupData((key, value) => updates.push([key, value]));
+    pending.get('accounts.list')!({ accounts: [{}] });
+    await vi.waitFor(() => expect(updates).toContainEqual(['accounts', 1]));
+    expect(updates).toHaveLength(1);
+    for (const resolve of pending.values()) resolve({});
+    await loading;
   });
 });
