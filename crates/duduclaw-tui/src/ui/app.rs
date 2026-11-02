@@ -15,6 +15,8 @@ pub enum EmployeeStatus {
     Done,
     Idle,
     Paused,
+    AutonomyPaused,
+    AutonomyUnknown,
     Ended,
 }
 impl EmployeeStatus {
@@ -26,6 +28,8 @@ impl EmployeeStatus {
             Self::Done => strings::DONE,
             Self::Idle => strings::IDLE,
             Self::Paused => strings::PAUSED,
+            Self::AutonomyPaused => strings::AUTONOMY_ROW_PAUSED,
+            Self::AutonomyUnknown => strings::AUTONOMY_ROW_UNKNOWN,
             Self::Ended => strings::ENDED,
         }
     }
@@ -36,14 +40,14 @@ impl EmployeeStatus {
             (Glyphs::Ascii, Self::Error) => "!",
             (Glyphs::Ascii, Self::Done) => "+",
             (Glyphs::Ascii, Self::Idle) => ".",
-            (Glyphs::Ascii, Self::Paused) => "-",
+            (Glyphs::Ascii, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "-",
             (Glyphs::Ascii, Self::Ended) => "x",
             (Glyphs::Unicode, Self::Working) => "●",
             (Glyphs::Unicode, Self::Awaiting) => "◇",
             (Glyphs::Unicode, Self::Error) => "!",
             (Glyphs::Unicode, Self::Done) => "✓",
             (Glyphs::Unicode, Self::Idle) => "·",
-            (Glyphs::Unicode, Self::Paused) => "Ⅱ",
+            (Glyphs::Unicode, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "Ⅱ",
             (Glyphs::Unicode, Self::Ended) => "×",
         }
     }
@@ -69,17 +73,20 @@ pub fn employee_status(employee: &Employee, model: &Model, read: &ReadState) -> 
     {
         return EmployeeStatus::Error;
     }
+    if employee.archived || employee.status.is("stopped") || employee.status.is("ended") || employee.status.is("terminated") {
+        return EmployeeStatus::Ended;
+    }
+    if employee.status.is("paused") {
+        return EmployeeStatus::Paused;
+    }
+    if model.autonomy.unreadable() { return EmployeeStatus::AutonomyUnknown; }
+    if model.autonomy.paused(employee.id()) { return EmployeeStatus::AutonomyPaused; }
+    if model.autonomy.stale || model.autonomy.refetch_pending { return EmployeeStatus::AutonomyUnknown; }
     if completion_ids(model, employee.id()).any(|id| !read.contains(id)) {
         return EmployeeStatus::Done;
     }
     if activity.is_some_and(|a| a.working) || employee.status.is("working") {
         return EmployeeStatus::Working;
-    }
-    if employee.archived || employee.status.is("ended") || employee.status.is("terminated") {
-        return EmployeeStatus::Ended;
-    }
-    if employee.status.is("paused") {
-        return EmployeeStatus::Paused;
     }
     EmployeeStatus::Idle
 }

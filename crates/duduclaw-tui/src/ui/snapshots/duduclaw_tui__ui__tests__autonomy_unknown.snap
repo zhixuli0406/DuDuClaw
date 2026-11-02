@@ -1,0 +1,6 @@
+---
+source: crates/duduclaw-tui/src/ui/tests.rs
+assertion_line: 1164
+expression: "screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end()"
+---
+自主: 資料可能過期

@@ -97,12 +97,35 @@ impl App {
             now,
         ));
     }
+    pub(super) fn context_hints(&self, model: &Model) -> &'static str {
+        let pane = &self.blocks.panes[self.blocks.focused];
+        if pane.kind == Block::Task && pane.responsibilities { return strings::RESP_KEYS; }
+        if let Some(Selection::Schedule(id)) = &self.selected
+            && let Some(schedule) = model.schedules.items.iter().find(|s| &s.id == id) {
+            return match schedule.source {
+                crate::state_extra::ScheduleSource::Cron => strings::CRON_KEYS,
+                crate::state_extra::ScheduleSource::Heartbeat => strings::HEARTBEAT_KEYS,
+            };
+        }
+        strings::LIST_KEY_HINTS
+    }
+    pub(super) fn autonomy_control(&mut self, agent: Option<String>, resume: bool, model: &Model) -> Action {
+        // An emergency request does not wait for a snapshot or another decision.
+        // Single-employee emergency controls always reach the gateway; cached
+        // capabilities may be stale or not loaded yet. The gateway reauthorizes.
+        let allowed = match agent.as_deref() {
+            None => model.role.is_none_or(|role| role == Role::Admin),
+            Some(_) => true,
+        };
+        if !allowed {
+            self.notice = Some(strings::CARD_NO_PERMISSION.into());
+            return Action::None;
+        }
+        self.notice = Some(strings::DECISION_SENDING.into());
+        Action::Control(Control::Autonomy { agent, resume })
+    }
     pub(super) fn m2_key(&mut self, c: char, model: &Model, now: Instant) -> Option<Action> {
         let i = self.blocks.focused;
-        if matches!(c, 'p' | 'n') && self.blocks.active != Block::Detail {
-            self.notice = Some(strings::CONTROL_KEY_FOCUS.into());
-            return Some(Action::None);
-        }
         match c {
             'v' | 'x' => {
                 self.blocks.add(if c == 'v' {
@@ -225,25 +248,11 @@ impl App {
                     self.open_control(control, Source::Pane(i), model, now);
                 }
             }
-            'p' | 'n' => match self.selected.clone() {
-                Some(Selection::Employee(id)) if c == 'p' => {
-                    let resume = model
-                        .employees
-                        .items
-                        .iter()
-                        .find(|e| e.id() == id)
-                        .is_some_and(|e| e.status.is("paused"));
-                    self.open_control(
-                        Control::Employee {
-                            agent: id.clone(),
-                            resume,
-                        },
-                        Source::Employee(id),
-                        model,
-                        now,
-                    );
+            'p' | 'u' | 'n' => match self.selected.clone() {
+                Some(Selection::Employee(id)) if matches!(c, 'p' | 'u') => {
+                    return Some(self.autonomy_control(Some(id), c == 'u', model));
                 }
-                Some(Selection::Schedule(id)) => {
+                Some(Selection::Schedule(id)) if c != 'u' => {
                     if let Some(s) = model.schedules.items.iter().find(|s| s.id == id) {
                         let r = &s.detail;
                         let control = match s.source {

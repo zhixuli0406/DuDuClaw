@@ -43,6 +43,7 @@ fn empty() -> Model {
     m.inbox = fresh(vec![]);
     m.employees = fresh(vec![]);
     m.schedules = fresh(vec![]);
+    m.autonomy = fresh(vec![crate::autonomy::Status::default()]);
     m
 }
 fn populated() -> Model {
@@ -79,7 +80,6 @@ fn populated() -> Model {
         source: ScheduleSource::Heartbeat,
         detail: json!({}),
     }]);
-    m.autonomy = Some(TerminalText::new("執行中".into()));
     m
 }
 fn connection() -> ConnectionState {
@@ -89,7 +89,6 @@ fn connection() -> ConnectionState {
         role: Role::Admin,
         boot_id: None,
         version: Some(TerminalText::new("1.77.0".into())),
-        autonomy: None,
     })
 }
 fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16) -> String {
@@ -685,31 +684,6 @@ fn m2_blocks_and_four_way_snapshots_in_both_width_modes() {
     }
 }
 #[test]
-fn m2_employee_pause_needs_binding_and_manager_role() {
-    let (mut m,mut a)=m2_task_app(); a.blocks.open(crate::blocks::Block::Detail,None);
-    let key=KeyEvent::new(KeyCode::Char('p'),KeyModifiers::NONE);
-    m.role=Some(Role::Employee); a.key(key,&m); assert!(a.control_card.is_none());
-    m.role=Some(Role::Manager); m.goal_operators.clear(); a.key(key,&m); assert!(a.control_card.is_none());
-    m.goal_operators.insert("adu".into()); a.key(key,&m);
-    assert!(matches!(a.control_card.as_ref().unwrap().control,crate::controls::Control::Employee { resume:false, .. }));
-}
-#[test]
-fn pause_and_next_keys_are_ignored_when_non_detail_block_has_focus() {
-    let (mut m, mut a) = m2_task_app();
-    m.role = Some(Role::Admin);
-    a.focus = crate::chat::Focus::List;
-    a.selected = Some(Selection::Employee("adu".into()));
-    for kind in [crate::blocks::Block::Run, crate::blocks::Block::Log] {
-        a.blocks.open(kind, Some("adu".into()));
-        a.focus = crate::chat::Focus::List;
-        for c in ['p', 'n'] {
-            a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &m);
-            assert!(a.control_card.is_none());
-            assert_eq!(a.notice.as_deref(), Some(strings::CONTROL_KEY_FOCUS));
-        }
-    }
-}
-#[test]
 fn m2_steering_edit_does_not_send_before_second_confirmation_and_resize() {
     let (m,mut a)=m2_task_app(); let now=std::time::Instant::now(); let later=now+std::time::Duration::from_secs(2);
     a.key_at(KeyEvent::new(KeyCode::Char('e'),KeyModifiers::NONE),&m,now,0);
@@ -1157,4 +1131,168 @@ fn downstream_prompt_snapshots_preserve_focus_and_hide_reference() {
     insta::assert_snapshot!("downstream_prompt_input", output);
     app.focus = crate::chat::Focus::List;
     insta::assert_snapshot!("downstream_prompt_list", screen(&empty(), &app, &Settings::default(), 240, 24));
+}
+
+fn autonomy_model(value: serde_json::Value) -> Model {
+    let mut m = empty();
+    m.autonomy = fresh(vec![crate::autonomy::Status::parse(value).unwrap()]);
+    m.employees = fresh(vec![employee("adu", "阿嘟", "active")]);
+    m.goal_operators.insert("adu".into());
+    m
+}
+fn pause_entry() -> serde_json::Value { json!({"reason":"operator", "who":"u1", "at":"2026-11-02T00:00:00Z"}) }
+fn ordinary_key(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE) }
+
+#[test]
+fn autonomy_status_line_snapshots_and_hostile_names() {
+    let pause = pause_entry();
+    for (name, value) in [
+        ("one", json!({"global":null,"agents":{"adu":pause},"state_error":null})),
+        ("several", json!({"global":null,"agents":{"adu":pause,"b":pause,"c":pause,"d":pause},"state_error":null})),
+        ("all", json!({"global":pause,"agents":{},"state_error":null})),
+        ("none", json!({"global":null,"agents":{},"state_error":null})),
+        ("state_error", json!({"global":null,"agents":{},"state_error":"unreadable"})),
+    ] {
+        let m = autonomy_model(value);
+        let rendered = screen(&m, &App::default(), &Settings::default(), 120, 16);
+        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().nth(2).unwrap().trim_end());
+    }
+    let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause},"state_error":null}));
+    m.autonomy.error = Some(crate::Error::Timeout); m.autonomy.stale = true;
+    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end());
+    m.autonomy = Default::default();
+    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end());
+    m.autonomy = fresh(vec![crate::autonomy::Status::parse(json!({"global":null,"agents":{"adu":pause},"state_error":null})).unwrap()]);
+    m.employees.items[0].display_name = TerminalText::new("阿\u{1b}[2K\u{202e}\u{200b}嘟\nhostile".into());
+    let line = crate::autonomy::status_line(&m).unwrap().plain();
+    assert!(!line.chars().any(crate::sanitize::forbidden));
+    assert!(!line.contains('\n'));
+    insta::assert_snapshot!("autonomy_hostile", line);
+}
+
+#[tokio::test]
+async fn autonomy_keys_send_exact_requests_immediately_without_optimism() {
+    use crate::{blocks::fetch::Gateway, client::RpcReply, controls::Control};
+    struct Fake(std::sync::Mutex<Vec<(String, serde_json::Value)>>, bool);
+    #[async_trait::async_trait]
+    impl Gateway for Fake {
+        async fn request(&self, method: &str, params: serde_json::Value) -> crate::Result<RpcReply> {
+            self.0.lock().unwrap().push((method.into(), params.clone()));
+            if self.1 { return Ok(RpcReply::Rejected { message: TerminalText::new("permission denied".into()), digest_mismatch: false }); }
+            let paused = method == "autonomy.pause";
+            Ok(RpcReply::Accepted(json!({"agent_id":params["agent_id"],"all":false,"paused":paused,
+                "pause":if paused { pause_entry() } else { serde_json::Value::Null },"applied":true})))
+        }
+    }
+    let m = autonomy_model(json!({"global":null,"agents":{},"state_error":null}));
+    let gateway = Fake(Default::default(), false);
+    for kind in [crate::blocks::Block::Detail, crate::blocks::Block::Run, crate::blocks::Block::Log, crate::blocks::Block::Chat, crate::blocks::Block::Task] {
+        let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+        app.blocks.open(kind, Some("adu".into()));
+        // Even an outstanding unrelated refetch cannot delay the emergency key.
+        app.waiting_refresh = Some(0);
+        for (c, method) in [('p', "autonomy.pause"), ('u', "autonomy.resume")] {
+            let Action::Control(control @ Control::Autonomy { .. }) = app.key(ordinary_key(c), &m) else { panic!("immediate control expected"); };
+            assert!(app.control_card.is_none()); assert!(app.card.is_none());
+            let outcome = crate::controls::send(&gateway, &control).await;
+            assert!(matches!(outcome, crate::decide::Outcome::Notice(_)));
+            app.decision_finished(outcome);
+            assert_eq!(gateway.0.lock().unwrap().last().unwrap(), &(method.into(), json!({"agent_id":"adu"})));
+            assert!(!m.autonomy.paused("adu"));
+        }
+        app.focus = crate::chat::Focus::Input;
+        for c in ['p','u','n'] { assert_eq!(app.key(ordinary_key(c), &m), Action::None); }
+        assert_eq!(app.input, "pun"); assert!(app.control_card.is_none());
+    }
+    let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+    let Action::Control(control) = app.key(ordinary_key('p'), &m) else { panic!() };
+    let refused = Fake(Default::default(), true);
+    app.decision_finished(crate::controls::send(&refused, &control).await);
+    assert!(app.notice.as_ref().unwrap().contains("權限不足"));
+    assert!(!app.notice.as_ref().unwrap().contains(strings::AUTONOMY_APPLIED));
+    assert!(!m.autonomy.paused("adu"));
+}
+
+#[test]
+fn autonomy_palette_permissions_all_shape_and_employee_status_cards() {
+    let mut m = autonomy_model(json!({"global":null,"agents":{},"state_error":null}));
+    let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+    for role in [Role::Employee, Role::Manager] {
+        m.role = Some(role);
+        assert!(!app.commands(&m).iter().any(|c| c.label == strings::AUTONOMY_PAUSE_ALL || c.label == strings::AUTONOMY_RESUME_ALL));
+    }
+    m.role = Some(Role::Admin);
+    for (label, method) in [(strings::AUTONOMY_PAUSE_ALL,"autonomy.pause"),(strings::AUTONOMY_RESUME_ALL,"autonomy.resume")] {
+        app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m);
+        app.paste(label);
+        let Action::Control(control) = app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m) else { panic!() };
+        assert_eq!(control.request(),(method,json!({"all":true})));
+        assert!(app.control_card.is_none());
+    }
+    for label in [strings::EMPLOYEE_PAUSE,strings::EMPLOYEE_RESUME] {
+        app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m); app.paste(label);
+        assert_eq!(app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m),Action::None);
+        assert!(matches!(app.control_card.as_ref().unwrap().control,crate::controls::Control::Employee { .. }));
+        app.control_card = None;
+    }
+    m.role = Some(Role::Employee);
+    assert_eq!(app.key(ordinary_key('p'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: false }));
+    m.role = Some(Role::Manager); m.goal_operators.clear();
+    assert_eq!(app.key(ordinary_key('p'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: false }));
+    assert_eq!(app.key(ordinary_key('u'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: true }));
+    m.role = None;
+    assert_eq!(app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m),Action::Control(crate::controls::Control::Autonomy { agent: None, resume: false }));
+    m.role = Some(Role::Manager);
+    assert_eq!(app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m),Action::None);
+}
+
+#[test]
+fn autonomy_employee_states_are_distinct() {
+    let pause = pause_entry();
+    let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause},"state_error":null}));
+    let read = ReadState::default();
+    for status in ["active","working"] {
+        assert_eq!(employee_status(&employee("adu","阿嘟",status),&m,&read), EmployeeStatus::AutonomyPaused);
+    }
+    m.inbox = fresh(vec![approval("pending", "adu", "review", "tool", "approval")]);
+    assert!(screen(&m,&App::default(),&Settings::default(),180,24).contains("待回覆 · 自主已暫停"));
+    m.inbox = fresh(vec![]);
+    assert_eq!(employee_status(&employee("adu","阿嘟","paused"),&m,&read),EmployeeStatus::Paused);
+    assert_eq!(employee_status(&employee("adu","阿嘟","stopped"),&m,&read),EmployeeStatus::Ended);
+    m.autonomy.items[0].global = Some(serde_json::from_value(pause).unwrap());
+    assert_eq!(employee_status(&employee("other","其他","active"),&m,&read),EmployeeStatus::AutonomyPaused);
+    m.autonomy.error = Some(crate::Error::Network);
+    assert_eq!(employee_status(&m.employees.items[0],&m,&read),EmployeeStatus::AutonomyUnknown);
+}
+
+#[test]
+fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
+    let (mut m, base) = m2_task_app(); m.role = Some(Role::Admin);
+    let mut app = base.clone();
+    app.blocks.panes[0].responsibilities = true;
+    app.blocks.panes[0].data.selected = json!({"responsibility_id":"resp1","control_epoch":4,"owner_agent_id":"adu"});
+    assert_eq!(app.key(ordinary_key('p'),&m),Action::None);
+    assert_eq!(app.control_card.as_ref().unwrap().control.request(),("responsibilities.pause",json!({"responsibility_id":"resp1","expected_control_epoch":4})));
+    for block in [crate::blocks::Block::Detail,crate::blocks::Block::Run,crate::blocks::Block::Log] {
+        for (source,key,enabled,method) in [
+            (ScheduleSource::Cron,'p',true,"cron.pause"),
+            (ScheduleSource::Cron,'p',false,"cron.resume"),
+            (ScheduleSource::Cron,'n',true,"cron.run_now"),
+            (ScheduleSource::Heartbeat,'n',true,"heartbeat.trigger"),
+        ] {
+            let mut app = base.clone(); app.blocks.open(block,None);
+            m.schedules = fresh(vec![ScheduledRun { id:"schedule".into(), agent:TerminalText::new("adu".into()), next_run:TerminalText::new("10:00".into()), source,
+                detail:json!({"id":"cron1","agent_id":"adu","enabled":enabled}) }]);
+            app.selected = Some(Selection::Schedule("schedule".into()));
+            app.focus = crate::chat::Focus::Input;
+            assert_eq!(app.key(ordinary_key(key),&m),Action::None);
+            assert_eq!(app.input, key.to_string()); assert!(app.control_card.is_none());
+            app.focus = crate::chat::Focus::List;
+            assert_eq!(app.key(ordinary_key(key),&m),Action::None);
+            let (actual,params) = app.control_card.as_ref().unwrap().control.request();
+            assert_eq!(actual,method);
+            if method.starts_with("cron.") { assert_eq!(params["id"],"cron1"); assert!(params["request_id"].as_str().unwrap().starts_with("tui-")); }
+            else { assert_eq!(params,json!({"agent_id":"adu"})); }
+        }
+    }
 }

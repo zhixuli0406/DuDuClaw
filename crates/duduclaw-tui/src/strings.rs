@@ -59,11 +59,30 @@ pub const CONNECTING: &str = "連線中";
 pub const CONNECTED: &str = "已連線";
 pub const DISCONNECTED: &str = "已斷線";
 pub const GATEWAY: &str = "閘道";
-pub const AUTONOMY: &str = "自主狀態";
+pub const AUTONOMY: &str = "自主";
+pub const AUTONOMY_PAUSED: &str = "已暫停";
+pub const AUTONOMY_ALL: &str = "全部暫停";
+pub const AUTONOMY_UNREADABLE: &str = "狀態無法讀取，自主工作視為已暫停";
+pub const AUTONOMY_ROW_PAUSED: &str = "自主已暫停";
+pub const AUTONOMY_ROW_UNKNOWN: &str = "自主狀態待確認";
+pub const AUTONOMY_PAUSE: &str = "暫停此員工自主工作";
+pub const AUTONOMY_RESUME: &str = "恢復此員工自主工作";
+pub const AUTONOMY_PAUSE_ALL: &str = "暫停全部自主工作";
+pub const AUTONOMY_RESUME_ALL: &str = "恢復全部自主工作";
+pub const AUTONOMY_APPLIED: &str = "閘道已套用，正在重讀狀態";
+pub const AUTONOMY_WARNING: &str = "；保存或稽核尚未確認，請檢查閘道";
+pub const AUTONOMY_UNCONFIRMED: &str = "自主工作操作結果未確認，請重讀狀態後再決定是否重試";
+pub fn autonomy_refusal(reason: &str) -> String {
+    let explanation = if reason.contains("permission denied") { "權限不足，需要 Manager 與員工操作權限；全部操作需要 Admin" }
+        else if reason.contains("audit unavailable") { "稽核紀錄無法寫入，狀態未變更" }
+        else if reason.contains("state unchanged") { "暫停狀態無法寫入，狀態未變更" }
+        else if reason.contains("outcome unknown") { return AUTONOMY_UNCONFIRMED.into(); }
+        else { "閘道拒絕操作，請確認權限與狀態" };
+    format!("自主工作操作遭拒：{explanation}（{reason}）")
+}
 pub const LIST_FOCUS: &str = "焦點：清單";
-pub const CONTROL_KEY_FOCUS: &str = "p / n 僅在詳情區塊或清單焦點可用";
-pub const LIST_KEY_HINTS: &str = "j/k 選取  1–4 焦點  v/x 分割  Ctrl-W 關閉  ? 說明";
-pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任；p：員工或排程暫停\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
+pub const LIST_KEY_HINTS: &str = "j/k 選取  p/u 自主暫停/恢復  Ctrl-P 命令  ? 說明";
+pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任\np/u：立即暫停／恢復選取員工的自主工作\np：責任或 cron 暫停；n：cron／心跳執行（確認卡）\nCtrl-P：全部自主工作暫停／恢復（Admin）；員工狀態操作（確認卡）\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";
 pub const READ_STATE_NOTICE: &str = "已讀紀錄無法讀取，從空白紀錄開始";
 pub const SAVED: &str = "已標為已讀";
@@ -190,8 +209,8 @@ pub const BLOCK_TRUNCATED: &str = "部分資料已省略，請到儀表板查看
 pub const LOG_GAP: &str = "僅保留最近 256 行；較早或遺失的日誌無法重播";
 pub const STEER: &str = "補充任務方向";
 pub const STOP: &str = "停止任務與子任務";
-pub const EMPLOYEE_PAUSE: &str = "暫停員工狀態（agents.pause，非自主性全面暫停）";
-pub const EMPLOYEE_RESUME: &str = "恢復員工狀態（agents.resume）";
+pub const EMPLOYEE_PAUSE: &str = "暫停員工狀態（需確認）";
+pub const EMPLOYEE_RESUME: &str = "恢復員工狀態（需確認）";
 pub const CRON_PAUSE: &str = "暫停排程";
 pub const CRON_RESUME: &str = "恢復排程";
 pub const RUN_NOW: &str = "立即執行一次";
@@ -201,7 +220,7 @@ pub const CONTROL_SCOPE: &str = "請核對操作與目標；送出後會重新�
 pub const CONTROL_SCROLL: &str = "請先捲到底部核對完整內容。Esc 取消。";
 pub const CONTROL_CONFIRM: &str = "輸入兩位確認碼後按 Enter；Esc 取消。";
 pub const STEER_EDIT: &str = "輸入方向（最多 4000 字）；Enter 進入確認；Esc 取消。";
-pub const EMPLOYEE_KEYS: &str = "p 暫停／恢復員工狀態（非全面自主暫停，需確認）";
+pub const EMPLOYEE_KEYS: &str = "p 暫停自主工作；u 恢復自主工作（立即送出）；員工狀態操作在 Ctrl-P";
 pub const HEARTBEAT_KEYS: &str = "n 觸發心跳（需確認）；上次結果：閘道未提供";
 pub const CRON_KEYS: &str = "p 暫停／恢復；n 立即執行（需確認）";
 pub fn hidden_blocks(count: usize) -> String { format!("另有 {count} 個區塊隱藏；1–4 切換焦點") }

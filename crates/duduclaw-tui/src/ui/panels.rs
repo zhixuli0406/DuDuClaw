@@ -115,17 +115,22 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 .iter()
                 .map(|e| {
                     let s = employee_status(e, model, &app.read);
+                    // Keep the priority badge (awaiting/error) while also showing the pause.
+                    let autonomy = if model.autonomy.paused(e.id()) && !model.autonomy.unreadable()
+                        && s != super::app::EmployeeStatus::AutonomyPaused {
+                        format!(" · {}", strings::AUTONOMY_ROW_PAUSED)
+                    } else { String::new() };
                     Row {
                         selection: Selection::Employee(e.id().into()),
                         text: TerminalText::new(format!(
-                            "{} {} {}",
+                            "{} {} {}{}",
                             s.glyph(settings.glyphs),
                             if e.display_name.plain().is_empty() {
                                 e.name_text().plain()
                             } else {
                                 e.display_name.plain()
                             },
-                            s.label()
+                            s.label(), autonomy
                         )),
                     }
                 })
