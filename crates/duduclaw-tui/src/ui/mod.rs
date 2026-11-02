@@ -189,7 +189,6 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     Event::Mouse(mouse) => { app.mouse(mouse, &settings); continue; }
                     Event::Paste(text) => { app.paste(&text); continue; }
                     Event::Key(key) => key,
-                    _ => continue,
                 };
                 let before = app.read.clone();
                 let previous_pane = app.blocks.panes[app.blocks.focused].id.clone();

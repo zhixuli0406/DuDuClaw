@@ -17,16 +17,15 @@ pub struct Screen {
     application_cursor: bool,
     bracketed_paste: bool,
     pub mouse_mode: vt100::MouseProtocolMode,
-    pub mouse_encoding: vt100::MouseProtocolEncoding,
+    pub mouse_encoding: super::input::MouseEncoding,
     pub waiting_seq: u64,
-    pub mouse_supported: bool,
 }
 impl Screen {
     pub(crate) fn capture(screen: &vt100::Screen) -> Self {
         let (rows, cols) = screen.size();
         Self {
             size: (rows, cols),
-            mouse_mode: screen.mouse_protocol_mode(), mouse_encoding: screen.mouse_protocol_encoding(), waiting_seq: 0, mouse_supported: true,
+            mouse_mode: screen.mouse_protocol_mode(), mouse_encoding: screen.mouse_protocol_encoding().into(), waiting_seq: 0,
             cells: (0..rows).flat_map(|row| (0..cols).map(move |col| screen.cell(row, col).unwrap().clone())).collect(),
             scrollback: screen.scrollback(), cursor: screen.cursor_position(), hidden: screen.hide_cursor(),
             application_cursor: screen.application_cursor(), bracketed_paste: screen.bracketed_paste(),
@@ -93,7 +92,7 @@ impl ParserWorker {
                 if dirty && (disconnected || last_publish.elapsed() >= Duration::from_millis(33)) {
                     let mut screen = Screen::capture(parser.screen());
                     screen.waiting_seq = filter.waiting_seq;
-                    screen.mouse_supported = filter.unsupported_mouse == 0;
+                    screen.mouse_encoding = filter.mouse_encoding();
                     let screen = Arc::new(screen);
                     // Swap pointers only. Build and destroy snapshots outside this lock.
                     let previous = published.lock().unwrap_or_else(|e| e.into_inner()).replace(screen);
@@ -120,6 +119,28 @@ impl Drop for ParserWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn published_mouse_encoding_tracks_filter_precedence_and_fallback() {
+        use super::super::input::MouseEncoding as E;
+        let (tx, rx) = mpsc::channel();
+        let worker = ParserWorker::spawn(rx, 24, 80).unwrap();
+        for (bytes, expected, mode) in [
+            (b"\x1b[?1000;1016;1006;1015;1005h".as_slice(), E::SgrPixels, vt100::MouseProtocolMode::PressRelease),
+            (b"\x1b[?1016l", E::Sgr, vt100::MouseProtocolMode::PressRelease),
+            (b"\x1b[?1006l", E::Urxvt, vt100::MouseProtocolMode::PressRelease),
+            (b"\x1b[?1015l", E::Utf8, vt100::MouseProtocolMode::PressRelease),
+            (b"\x1bc", E::Default, vt100::MouseProtocolMode::None),
+        ] {
+            tx.send(bytes.to_vec()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if worker.screen().is_some_and(|screen| screen.mouse_encoding == expected && screen.mouse_mode == mode) { break; }
+                assert!(Instant::now() < deadline, "mouse mode was not published: {expected:?}");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     #[test]
     fn ui_snapshot_read_never_waits_for_publication_lock() {
         let (_tx, rx) = mpsc::sync_channel(16);
