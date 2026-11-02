@@ -23,6 +23,7 @@ PREFLIGHT = block(
     "# --- Enterprise release preflight", "# --- End enterprise release preflight ---"
 )
 FETCH = block("# Fetch the distributor notice once", 'if [[ "$PRO_RELEASE" == "1" && -x "$PRO_IMAGE_SCRIPT"')
+PRIVATE_COMMIT = block("# Commit the private locks before tags", 'echo "Creating git commit and tag..."')
 GATE = block("# --- Enterprise release gate ---", 'echo " Release v$NEW_VERSION prepared successfully!"')
 
 
@@ -135,10 +136,13 @@ class ReleaseProGateTests(unittest.TestCase):
     def test_gate_commits_the_reresolved_lock_instead_of_failing(self):
         lock = self.make_commercial_repo("chore/release")
         lock.write_text('version = "9.9.9"\n')
+        cp_lock = self.root / "commercial/cloud-control-plane/Cargo.lock"
+        cp_lock.parent.mkdir()
+        cp_lock.write_text('version = "9.9.9"\n')
         result = self.run_bash(
             "NEW_VERSION=9.9.9\nPRO_RELEASE=1\nPRO_GAPS=()\n"
             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid "
-            "GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid\n" + GATE
+            "GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid\n" + PRIVATE_COMMIT
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Committed in commercial (chore/release)", result.stdout)
@@ -146,6 +150,21 @@ class ReleaseProGateTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(self.root / "commercial"), "status", "--porcelain"],
                                 capture_output=True, text=True).stdout
         self.assertEqual(status, "")
+
+    def test_control_plane_lock_resolution_and_failure(self):
+        (self.root / "commercial/cloud-control-plane").mkdir(parents=True)
+        sync = block("# The control plane has a separate workspace", "# The desktop app (src-tauri)")
+        self.fake_tool("cargo", 'echo "$*" >> cargo-calls')
+        result = self.run_bash("PRO_RELEASE=1\n" + sync)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = (self.root / "cargo-calls").read_text()
+        self.assertEqual(calls.count("--manifest-path commercial/cloud-control-plane/Cargo.toml"), 2)
+        self.assertIn("--locked", calls)
+        self.fake_tool("cargo", "exit 1")
+        result = self.run_bash("PRO_RELEASE=1\n" + sync)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not align commercial/cloud-control-plane/Cargo.lock", result.stdout)
+        self.assertNotIn("REACHED_NEXT_STAGE", result.stdout)
 
     def run_fetch(self, fetch_body: str):
         gw = self.root / "commercial/duduclaw-pro-gateway"
@@ -207,9 +226,13 @@ class ReleaseProGateTests(unittest.TestCase):
     def test_blocks_sit_in_the_right_places(self):
         self.assertLess(RELEASE.index(PREFLIGHT), RELEASE.index("# --- Mandatory delivery review"))
         self.assertLess(RELEASE.index(PREFLIGHT), RELEASE.index("# --- Bump every platform manifest"))
-        self.assertLess(RELEASE.index("DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS}"), RELEASE.index(GATE))
+        self.assertLess(RELEASE.index(PRIVATE_COMMIT), RELEASE.index('git tag "v$NEW_VERSION"'))
+        self.assertIn("cloud-control-plane/Cargo.lock", PRIVATE_COMMIT)
+        bump = RELEASE[RELEASE.index("# --- Enterprise pro-image (commercial checkout only)"):]
+        self.assertNotIn("gcloud run services update", bump)
+        self.assertIn("allowlist activation belongs to ship", bump)
         # Every opt-out of an enterprise step is recorded as a gap, never silent.
-        for skip in ("DUDUCLAW_SKIP_PRO_IMAGE=1)", "DUDUCLAW_SKIP_PRO_BIN=1)", "DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1)"):
+        for skip in ("DUDUCLAW_SKIP_PRO_IMAGE=1)", "DUDUCLAW_SKIP_PRO_BIN=1)"):
             self.assertIn(skip, RELEASE)
             self.assertIn("PRO_GAPS+=(", RELEASE[RELEASE.index(skip) - 400:RELEASE.index(skip) + 200])
 

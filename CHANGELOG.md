@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- 發版工具新增 `release.sh ship <version>`：可接續推送分支、建立 PR、等待檢查、合併、發布標籤與確認交付；只有明確指定 `--admin` 才略過等待檢查。
+
+### Fixed
+
+- 發版驗證補查 GitHub Release 與桌面更新索引，PyPI／npm 尚在同步時最多等待五分鐘；同步企業控制面的 Cargo.lock，版本允許清單改在 bump 合併後才啟用。
+
 ## [1.79.0] - 2026-11-02 — 本機語音、金鑰與登入保護、一般同仁側欄與設定清單
 
 ### Added

@@ -4,6 +4,8 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import shutil
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -315,6 +317,339 @@ class DeliveryTests(unittest.TestCase):
         (folder / "v1.2.4.sig").symlink_to(outside)
         with self.assertRaises(ValueError): delivery.install_assertion(self.root, "1.2.4", raw, sig)
         self.assertFalse(outside.exists())
+
+
+
+class ShipShellTests(unittest.TestCase):
+    """Exercise the real shell entry point with local Git remotes and fake services."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        (self.root / "scripts").mkdir()
+        shutil.copyfile(ROOT / "scripts/release.sh", self.root / "scripts/release.sh")
+        (self.root / "scripts/release_delivery.py").write_text(
+            'import os,sys\nfrom pathlib import Path\n'
+            'Path("delivery-args").write_text(" ".join(sys.argv[1:]))\n'
+            'sys.exit(int(os.environ.get("DELIVERY_FAIL", "0")))\n')
+        (self.root / "Cargo.toml").write_text('[workspace.package]\nversion = "1.2.4"\n')
+        self.git("init", "-b", "main")
+        self.git("config", "user.name", "Fixture")
+        self.git("config", "user.email", "fixture@example.invalid")
+        self.git("add", "Cargo.toml")
+        self.git("commit", "-m", "base")
+        self.git("init", "--bare", str(self.root / "origin.git"))
+        self.git("remote", "add", "origin", str(self.root / "origin.git"))
+        self.git("push", "origin", "main")
+        self.git("checkout", "-b", "chore/release")
+        self.git("commit", "--allow-empty", "-m", "bump")
+        for tag in ("v1.2.4", "desktop-v1.2.4"):
+            self.git("tag", tag)
+        self.settings = dict(exists=True, version="1.2.4", latest="v1.2.4", draft=False,
+                             prerelease=False, assets=40, desktop="1.2.4", platforms=9,
+                             pypi="1.2.4", npm="1.2.4", pr=False, watch_fail=False,
+                             run_missing=False, run_state="in_progress:")
+        self.tool("gh", r'''import json,os,subprocess,sys
+from pathlib import Path
+args=sys.argv[1:]; s=json.loads(Path("settings.json").read_text())
+with Path("calls").open("a") as f: f.write("gh " + " ".join(args) + "\\n")
+if args[:2] == ["release", "view"]:
+    if "v1.2.4" in args:
+        if not s["exists"]: sys.exit(1)
+        print(json.dumps(dict(tagName="v"+s["version"], isDraft=s["draft"], isPrerelease=s["prerelease"], assets=[{}]*s["assets"])))
+    else: print(s["latest"])
+elif args[:2] == ["release", "download"]:
+    print(json.dumps(dict(version=s["desktop"], platforms={str(i):{} for i in range(s["platforms"])})))
+elif args[:2] == ["pr", "list"]: print("42" if s["pr"] else "")
+elif args[:2] == ["pr", "create"]:
+    s["pr"]=True; Path("settings.json").write_text(json.dumps(s))
+elif args[:2] == ["pr", "checks"]:
+    if "--json" in args and "--jq" in args:
+        count=Path("required-check-polls"); polls=int(count.read_text()) if count.exists() else 0
+        count.write_text(str(polls+1))
+        # Existing PRs have required checks immediately; tests can opt into
+        # delayed reporting to exercise the bounded wait.
+        if s.get("checks_appear"):
+            print("1" if polls >= 1 else "0")
+        else:
+            print(str(s.get("required_checks", 1)))
+    else: sys.exit(int(os.environ.get("CHECKS_FAIL", "0")))
+elif args[:2] == ["pr", "merge"]:
+    subprocess.run(["git", "push", "origin", "HEAD:main"], check=True, capture_output=True)
+elif args[:2] == ["run", "list"]: print("" if s["run_missing"] else "100")
+elif args[:2] == ["run", "view"]: print(s["run_state"])
+elif args[:2] == ["run", "watch"]: sys.exit(1 if s["watch_fail"] else 0)
+elif args[:2] == ["variable", "get"]: print("fake-public-key")
+else: sys.exit("unexpected gh call: " + repr(args))
+'''.replace('\\n', '\n'))
+        self.tool("curl", r'''import json,sys
+from pathlib import Path
+s=json.loads(Path("settings.json").read_text()); row="pypi" if "pypi.org" in sys.argv[-1] else "npm"
+with Path("calls").open("a") as f: f.write("curl " + row + "\\n")
+print(json.dumps({"info": {"version": s[row]}} if row == "pypi" else {"version": s[row]}))
+'''.replace('\\n', '\n'))
+        self.tool("date", 'import sys\nfrom pathlib import Path\nprint(Path("clock").read_text() if sys.argv[-1] == "+%s" else "2026-11-03T00:00:00Z")\n')
+        self.tool("sleep", 'import sys\nfrom pathlib import Path\np=Path("clock"); p.write_text(str(int(p.read_text())+int(sys.argv[1])))\n')
+        (self.root / "clock").write_text("0")
+        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                        DUDUCLAW_RELEASE_WITHOUT_PRO="1", RELEASE_DELIVERY_PUBLIC_KEY_PEM="test-key")
+        self.env.pop("DUDUCLAW_VERIFY_NO_WAIT", None)
+
+    def tool(self, name, body):
+        path = self.bin / name
+        path.write_text("#!" + sys.executable + "\n" + body)
+        path.chmod(0o755)
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-C", str(self.root), *args], stderr=subprocess.DEVNULL).decode().strip()
+
+    def run_release(self, *args, **overrides):
+        (self.root / "settings.json").write_text(json.dumps(self.settings))
+        return subprocess.run(["bash", "scripts/release.sh", *args], cwd=self.root,
+                              env=dict(self.env, **overrides), capture_output=True, text=True, timeout=30)
+
+    def calls(self):
+        path = self.root / "calls"
+        return path.read_text() if path.exists() else ""
+
+    def test_ship_argument_errors_do_not_contact_services(self):
+        for args in (("ship",), ("ship", "v1.2.4"), ("ship", "1.2.4", "--oops")):
+            with self.subTest(args=args):
+                result = self.run_release(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Error:", result.stdout)
+                self.assertEqual(self.calls(), "")
+
+    def test_ship_refuses_main_detached_missing_or_moved_tags(self):
+        self.git("checkout", "main")
+        result = self.run_release("ship", "1.2.4")
+        self.assertIn("non-main branch", result.stdout)
+        self.git("checkout", "--detach", "chore/release")
+        self.assertIn("non-main branch", self.run_release("ship", "1.2.4").stdout)
+        self.git("checkout", "chore/release")
+        self.git("tag", "-d", "desktop-v1.2.4")
+        self.assertIn("missing or does not point", self.run_release("ship", "1.2.4").stdout)
+        self.git("tag", "desktop-v1.2.4", "HEAD^")
+        self.assertIn("missing or does not point", self.run_release("ship", "1.2.4").stdout)
+        self.assertEqual(self.calls(), "")
+
+    def test_ship_refuses_merge_parent(self):
+        self.git("checkout", "-b", "other", "HEAD^")
+        self.git("commit", "--allow-empty", "-m", "other")
+        self.git("checkout", "chore/release")
+        self.git("merge", "--no-ff", "other", "-m", "bad bump")
+        for tag in ("v1.2.4", "desktop-v1.2.4"):
+            self.git("tag", "-f", tag)
+        result = self.run_release("ship", "1.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one parent", result.stdout)
+
+    def test_no_merge_waits_then_prints_command_without_publishing_tags(self):
+        result = self.run_release("ship", "1.2.4", "--no-merge")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("gh pr merge 42 --merge", result.stdout)
+        self.assertIn("gh pr checks 42 --required --watch", self.calls())
+        self.assertNotIn("gh pr merge", self.calls())
+        self.assertEqual(self.git("ls-remote", "origin", "refs/tags/*"), "")
+
+    def test_ship_waits_for_required_checks_to_be_reported(self):
+        self.settings["checks_appear"] = True
+        result = self.run_release("ship", "1.2.4", "--no-merge")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Waiting for required checks to be reported on PR #42", result.stdout)
+        self.assertEqual((self.root / "required-check-polls").read_text(), "2")
+        self.assertIn("gh pr checks 42 --required --watch", self.calls())
+
+    def test_admin_warns_skips_checks_and_requires_explicit_flag(self):
+        result = self.run_release("ship", "1.2.4", "--admin")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("WARNING: --admin skips", result.stdout)
+        self.assertNotIn("gh pr checks", self.calls())
+        self.assertIn("gh pr merge 42 --merge --admin", self.calls())
+
+    def test_ship_pipeline_and_rerun_skip_merged_steps(self):
+        result = self.run_release("ship", "1.2.4")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("--admin", self.calls())
+        self.assertEqual(self.calls().count("gh run watch 100 --exit-status"), 4)
+        self.assertIn("--version 1.2.4 --release-ref v1.2.4 --require-main", (self.root / "delivery-args").read_text())
+        for tag in ("v1.2.4", "desktop-v1.2.4"):
+            self.assertIn("refs/tags/" + tag, self.git("ls-remote", "origin", "refs/tags/*"))
+        (self.root / "calls").write_text("")
+        self.settings["run_state"] = "completed:success"
+        result = self.run_release("ship", "1.2.4")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("already on origin/main", result.stdout)
+        self.assertNotIn("gh pr ", self.calls())
+        self.assertNotIn("gh run watch", self.calls())
+
+    def test_checks_and_signature_failure_do_not_push_tags(self):
+        for env in ({"CHECKS_FAIL": "1"}, {"DELIVERY_FAIL": "1"}):
+            with self.subTest(env=env):
+                result = self.run_release("ship", "1.2.4", **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.git("ls-remote", "origin", "refs/tags/*"), "")
+                self.assertNotIn("gh run watch", self.calls())
+
+    def test_workflow_failure_stops_with_run_id(self):
+        self.settings["watch_fail"] = True
+        result = self.run_release("ship", "1.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run 100 failed", result.stdout)
+        self.assertEqual(self.calls().count("gh run watch"), 1)
+        self.assertNotIn("gh release view", self.calls())
+
+    def test_missing_workflow_discovery_is_bounded(self):
+        self.settings["run_missing"] = True
+        result = self.run_release("ship", "1.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("after 5 minutes", result.stdout)
+        self.assertEqual((self.root / "clock").read_text(), "300")
+
+    def test_verify_new_rows_and_failure_details(self):
+        result = self.run_release("verify", "1.2.4")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GitHub Release", result.stdout)
+        self.assertIn("desktop latest.json", result.stdout)
+        for key, value, row in (("assets", 39, "GitHub Release"), ("draft", True, "GitHub Release"),
+                                ("prerelease", True, "GitHub Release"), ("latest", "v1.2.3", "GitHub Release"),
+                                ("exists", False, "GitHub Release"), ("version", "1.2.3", "GitHub Release"),
+                                ("platforms", 8, "desktop latest.json"), ("desktop", "1.2.3", "desktop latest.json")):
+            old = self.settings[key]
+            self.settings[key] = value
+            with self.subTest(key=key):
+                result = self.run_release("verify", "1.2.4")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(row + " MISMATCH", result.stdout)
+            self.settings[key] = old
+
+    def test_registry_retry_is_bounded_and_row_specific(self):
+        self.settings["pypi"] = "1.2.3"
+        result = self.run_release("verify", "1.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PyPI waiting", result.stdout)
+        self.assertRegex(result.stdout, r"PyPI\s+1\.2\.3\s+MISMATCH")
+        self.assertRegex(result.stdout, r"npm\s+1\.2\.4\s+OK")
+        self.assertEqual((self.root / "clock").read_text(), "300")
+        self.assertLessEqual(self.calls().count("curl pypi"), 16)
+
+    def test_registry_no_wait_when_disabled_or_release_absent(self):
+        self.settings.update(pypi="1.2.3", npm="1.2.3")
+        for absent in (False, True):
+            self.settings["exists"] = not absent
+            result = self.run_release("verify", "1.2.4", **({} if absent else {"DUDUCLAW_VERIFY_NO_WAIT": ""}))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("waiting for registry", result.stdout)
+            self.assertEqual((self.root / "clock").read_text(), "0")
+
+    def prepare_sync(self):
+        folder = self.root / "commercial/duduclaw-pro-gateway"
+        folder.mkdir(parents=True)
+        (folder / "delivery_manifest.py").write_text(
+            'import argparse,json\np=argparse.ArgumentParser()\n'
+            'for x in ("offered", "current", "add"): p.add_argument("--"+x)\n'
+            'a=p.parse_args()\nif a.current: json.loads(a.current)\n'
+            'print(json.dumps({"version":a.add}))\n')
+        sha = self.root / "tar-sha"
+        sha.write_text("v1.2.4 " + "a" * 64 + "\n")
+        self.manifest = json.dumps({"version": "v1.2.4=" + "a" * 64})
+        env = [{"name": "DUDUCLAW_PRO_VERSIONS", "value": "v1.2.4"},
+               {"name": "DUDUCLAW_GENERAL_DELIVERY_MANIFEST", "value": self.manifest}]
+        self.cp_state = dict(template=env, serving=env, traffic="ready")
+        self.tool("gcloud", r'''import json,sys
+from pathlib import Path
+a=sys.argv[1:]; p=Path("cp-state"); s=json.loads(p.read_text())
+with Path("calls").open("a") as f: f.write("gcloud " + " ".join(a) + "\n")
+if a[:3] == ["run","services","describe"]:
+    print(json.dumps({"spec":{"template":{"spec":{"containers":[{"env":s["template"]}]}}},
+                      "status":{"traffic":[{"revisionName":s["traffic"],"percent":100}], "latestReadyRevisionName":"ready"}}))
+elif a[:3] == ["run","revisions","describe"]:
+    print(json.dumps({"spec":{"containers":[{"env":s["serving"] if a[3] == "old" else s["template"]}]}}))
+elif a[:3] == ["run","services","update-traffic"]:
+    s["traffic"]="ready"; p.write_text(json.dumps(s))
+elif a[:3] == ["run","services","update"]:
+    raw=a[a.index("--update-env-vars")+1][3:]
+    s["template"]=[dict(zip(("name","value"), pair.split("=",1))) for pair in raw.split("|")]
+    p.write_text(json.dumps(s))
+else: sys.exit(1)
+''')
+
+    def run_sync(self):
+        (self.root / "cp-state").write_text(json.dumps(self.cp_state))
+        prefix = (ROOT / "scripts/release.sh").read_text().split("# --- Arg parsing / sub-commands ---")[0]
+        return subprocess.run(["bash", "-c", prefix + '\nsync_control_plane 1.2.4 tar-sha\n'],
+                              cwd=self.root, env=dict(self.env, DUDUCLAW_GCP_PROJECT="test"),
+                              capture_output=True, text=True, timeout=30)
+
+    def test_control_plane_requires_merge_and_preserves_ready_live_state(self):
+        self.prepare_sync()
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("gcloud ", self.calls())
+        self.git("push", "origin", "HEAD:main")
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("serving on ready", result.stdout)
+        self.assertNotIn("services update", self.calls())
+
+    def test_control_plane_updates_and_reads_back_pinned_traffic(self):
+        self.prepare_sync()
+        self.git("push", "origin", "HEAD:main")
+        self.cp_state.update(template=[], serving=[], traffic="old")
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("services update ", self.calls())
+        self.assertIn("services update-traffic", self.calls())
+        self.assertIn("serving on ready", result.stdout)
+
+    def test_control_plane_refuses_wrong_builder_record_and_bad_live_manifest(self):
+        self.prepare_sync()
+        self.git("push", "origin", "HEAD:main")
+        (self.root / "tar-sha").write_text("v1.2.3 " + "a" * 64 + "\n")
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("gcloud ", self.calls())
+        (self.root / "tar-sha").write_text("v1.2.4 " + "a" * 64 + "\n")
+        self.cp_state["template"][1]["value"] = "invalid json"
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("services update", self.calls())
+
+    def test_registry_eventually_converges(self):
+        self.tool("curl", r'''import json,sys
+from pathlib import Path
+print(json.dumps({"version":"1.2.4" if int(Path("clock").read_text()) >= 60 else "1.2.3"}))
+''')
+        result = self.run_release("verify", "1.2.4")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "clock").read_text(), "60")
+
+    def test_commercial_push_and_pr_are_resumed_without_duplicate(self):
+        private = self.root / "commercial"
+        private.mkdir()
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(private), *args], stderr=subprocess.DEVNULL).decode().strip()
+        git("init", "-b", "main")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        git("commit", "--allow-empty", "-m", "base")
+        git("init", "--bare", str(self.root / "private.git"))
+        git("remote", "add", "origin", str(self.root / "private.git"))
+        git("push", "origin", "main")
+        git("checkout", "-b", "chore/private-release")
+        git("commit", "--allow-empty", "-m", "locks")
+        # Private stub maintains its own PR state, exactly as the public stub does.
+        (private / "settings.json").write_text(json.dumps(self.settings))
+        result = self.run_release("ship", "1.2.4", "--no-merge")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("refs/heads/chore/private-release", git("ls-remote", "origin"))
+        calls = (private / "calls").read_text()
+        self.assertEqual(calls.count("gh pr create"), 1)
+        result = self.run_release("ship", "1.2.4", "--no-merge")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((private / "calls").read_text().count("gh pr create"), 1)
 
 
 if __name__ == "__main__":
