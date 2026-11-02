@@ -6,6 +6,7 @@ mod control_card;
 mod block_render;
 mod pty_render;
 mod m2;
+mod navigate;
 mod palette;
 mod exit_summary;
 mod card_render;
@@ -71,7 +72,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let client = options.client.clone();
         let chat = client.chat();
         let mut chat_state = chat.state();
-        app.chat = chat_state.borrow_and_update().clone();
+        app.sync_chats(&chat_state.borrow_and_update());
         let route = if settings.notifications { crate::notifications::route().await } else { crate::notifications::Route::Skip };
         let mut notifications = crate::notifications::Notifications::new(settings.notifications, route);
         let started = std::time::Instant::now();
@@ -93,9 +94,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             }
             let mut model = feed.receiver.borrow().clone();
             model.inbox.items.retain(|item| !app.read.hidden(item, crate::snooze::epoch_now()));
-            if let Some(error) = model.login_required {
-                return Err(error);
-            }
+
             let info = connection.borrow().clone();
             let generation = match info { crate::client::ConnectionState::Connected(ref info) => Some(info.generation), _ => None };
             if generation != block_generation {
@@ -114,6 +113,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 match event.name.as_str() {
                     "logs.entry" if m2::manager(&model) && app.blocks.panes.iter().any(|p| p.kind == crate::blocks::Block::Log) => app.logs.push(&event.payload),
                     "events_lost" => { app.blocks.invalidate(); app.logs.lost = true; },
+                    "dashboard.navigate" => app.navigate_hint(&event.payload, &model),
                     "run.step" => app.blocks.run_step(&event.payload),
                     "agent.turn_finished" | "agent.status_changed" | "task.updated" | "task.created" | "budget.breaker_open" | "autopilot.breaker_open" => app.blocks.invalidate(),
                     _ => {},
@@ -142,15 +142,21 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 }
             }
             app.refresh(&model);
+            chat.retain(app.blocks.panes.iter().filter(|p| p.kind == crate::blocks::Block::Chat).map(|p| p.id.clone()).collect());
             if chat_state.has_changed().unwrap_or(false) {
-                app.chat = chat_state.borrow_and_update().clone();
+                app.sync_chats(&chat_state.borrow_and_update());
             }
             app.spinner = (started.elapsed().as_millis() / 150) as usize;
-            if let Some(sequence) = notifications.update(model.inbox.actionable_count(), std::time::Instant::now()) {
+            let now = std::time::Instant::now();
+            let failed = model.login_required.is_some() || matches!(info, crate::client::ConnectionState::Disconnected);
+            let sequence = notifications.connection_error(failed, now)
+                .or_else(|| notifications.update(model.inbox.actionable_count(), now));
+            if let Some(sequence) = sequence {
                 use std::io::Write;
                 std::io::stdout().write_all(sequence.as_bytes()).map_err(|_| Error::Output)?;
                 std::io::stdout().flush().map_err(|_| Error::Output)?;
             }
+            if let Some(error) = model.login_required { return Err(error); }
             terminal
                 .draw(|frame| {
                     render::draw(
@@ -180,12 +186,16 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     }
                     Event::FocusGained => { notifications.focus(true); continue; }
                     Event::FocusLost => { notifications.focus(false); continue; }
+                    Event::Mouse(mouse) => { app.mouse(mouse, &settings); continue; }
                     Event::Paste(text) => { app.paste(&text); continue; }
                     Event::Key(key) => key,
                     _ => continue,
                 };
                 let before = app.read.clone();
-                match app.key(key, &model) {
+                let previous_pane = app.blocks.panes[app.blocks.focused].id.clone();
+                let action = app.key(key, &model);
+                if app.blocks.panes[app.blocks.focused].id != previous_pane { app.sync_chats(&chat_state.borrow()); }
+                match action {
                     Action::Quit => {
                         let mut final_model = feed.receiver.borrow().clone();
                         if !matches!(*connection.borrow(), crate::client::ConnectionState::Connected(_)) {
@@ -221,16 +231,24 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                             decision = Some(Box::pin(async move { crate::controls::send(&client, &request).await }));
                         }
                     }
-                    Action::Chat(input) => match chat.send(input) {
-                        Ok(()) => { app.input.clear(); app.chat_scroll = 0; app.notice = None; app.chat.running = true; }
-                        Err(error) => app.notice = Some(error.to_string()),
+                    Action::Chat(input) => {
+                        let agent = input.agent.clone();
+                        let active = app.blocks.panes.iter().filter(|p| p.kind == crate::blocks::Block::Chat).map(|p| p.id.clone()).collect();
+                        match chat.send(&app.blocks.panes[app.blocks.focused].id, input, active) {
+                            Ok(()) => {
+                                app.input.clear(); app.chat_scroll = 0; app.notice = None; app.chat.running = true;
+                                app.input_agent = Some(agent.clone());
+                                app.blocks.panes[app.blocks.focused].agent = Some(agent);
+                            }
+                            Err(error) => app.notice = Some(error.to_string()),
+                        }
                     },
-                    Action::CancelChat => if let Err(error) = chat.cancel() { app.notice = Some(error.to_string()); },
-                    Action::CancelDownstream(reference) => if let Err(error) = chat.cancel_downstream(reference) {
+                    Action::CancelChat => if let Err(error) = chat.cancel(&app.blocks.panes[app.blocks.focused].id) { app.notice = Some(error.to_string()); },
+                    Action::CancelDownstream(reference) => if let Err(error) = chat.cancel_downstream(&app.blocks.panes[app.blocks.focused].id, reference) {
                         app.answered_downstream = None;
                         app.notice = Some(error.to_string());
                     },
-                    Action::DismissDownstream(reference) => chat.dismiss_downstream(reference),
+                    Action::DismissDownstream(reference) => chat.dismiss_downstream(&app.blocks.panes[app.blocks.focused].id, reference),
                     Action::None => {}
                 }
             }

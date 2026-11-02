@@ -305,3 +305,69 @@ fn writer_failure_is_visible_without_another_keypress() {
     session.poll();
     assert_eq!(session.status, strings::PTY_INPUT_FAILED);
 }
+
+#[test]
+fn mouse_encodings_modes_and_bounds_are_child_only() {
+    use crossterm::event::{MouseEvent, MouseEventKind as K, MouseButton as B, KeyModifiers as M};
+    use vt100::{MouseProtocolMode as Mode, MouseProtocolEncoding as Encoding};
+    let event = |kind| MouseEvent { kind, column: 40, row: 20, modifiers: M::NONE };
+    assert_eq!(mouse_bytes(event(K::Down(B::Left)), 3, 4, Mode::PressRelease, Encoding::Sgr), b"\x1b[<0;3;4M");
+    assert_eq!(mouse_bytes(event(K::Up(B::Right)), 3, 4, Mode::PressRelease, Encoding::Sgr), b"\x1b[<2;3;4m");
+    assert_eq!(mouse_bytes(event(K::Down(B::Left)), 3, 4, Mode::PressRelease, Encoding::Default), vec![27,91,77,32,35,36]);
+    assert_eq!(mouse_bytes(event(K::Up(B::Right)), 3, 4, Mode::PressRelease, Encoding::Default), vec![27,91,77,35,35,36]);
+    assert_eq!(mouse_bytes(event(K::Drag(B::Left)), 300, 4, Mode::ButtonMotion, Encoding::Utf8), "\x1b[M@Ō$".as_bytes());
+    assert_eq!(mouse_bytes(event(K::Moved), 3, 4, Mode::AnyMotion, Encoding::Sgr), b"\x1b[<35;3;4M");
+    for (kind, mode) in [(K::Moved, Mode::ButtonMotion), (K::Drag(B::Left), Mode::PressRelease), (K::Up(B::Left), Mode::Press), (K::Down(B::Left), Mode::None)] {
+        assert!(mouse_bytes(event(kind), 3, 4, mode, Encoding::Sgr).is_empty());
+    }
+    assert!(mouse_bytes(event(K::Down(B::Left)), 224, 4, Mode::PressRelease, Encoding::Default).is_empty());
+    assert!(mouse_bytes(event(K::Down(B::Left)), 0, 4, Mode::PressRelease, Encoding::Sgr).is_empty());
+    let mut modified = event(K::ScrollDown); modified.modifiers = M::CONTROL | M::SHIFT;
+    assert_eq!(mouse_bytes(modified, 3, 4, Mode::PressRelease, Encoding::Sgr), b"\x1b[<85;3;4M");
+}
+
+#[test]
+fn waiting_signals_are_bounded_display_only_and_hostile_strings_never_escape() {
+    for sequence in [b"\x1b]9;waiting\x07".as_slice(), b"\x1b]777;notify;child;needs input\x1b\\", b"\x1b]2;Waiting for you\x07"] {
+        for split in 0..=sequence.len() {
+            let mut filter = filter::Filter::default();
+            let mut safe = Vec::new();
+            filter.process(&sequence[..split], 24, 80, |b| safe.extend_from_slice(b));
+            filter.process(&sequence[split..], 24, 80, |b| safe.extend_from_slice(b));
+            assert_eq!(filter.waiting_seq, 1);
+            // Preserve the existing harmless ST whitelist behavior; never OSC content.
+            assert_eq!(safe, if sequence.ends_with(b"\x1b\\") { b"\x1b\\".to_vec() } else { Vec::new() });
+        }
+    }
+    for sequence in [
+        b"\x1b]52;c;bad\x07".to_vec(), b"\x1b]2;approve all\x07".to_vec(),
+        b"\x1b]777;notify;bad\x07".to_vec(), b"\x1b]9;\x18cancel\x07".to_vec(),
+        b"\x1b]9;bad\x1b]52;c;secret\x07".to_vec(), b"\x1b]2;Waiting for you\x1b[?1006h".to_vec(),
+        [b"\x1b]9;".as_slice(), &vec![b'a'; 1024], b"\x07"].concat(),
+    ] {
+        let mut filter = filter::Filter::default();
+        let mut safe = Vec::new();
+        filter.process(&sequence, 24, 80, |b| safe.extend_from_slice(b));
+        assert_eq!(filter.waiting_seq, 0);
+        assert!(!safe.windows(2).any(|b| b == b"\x1b]"));
+    }
+    let mut filter = filter::Filter::default();
+    let mut parser = vt100::Parser::new(24, 80, 0);
+    filter.process(b"\x1b]52;c;\x1b[?1000;1006h\x1b]777;notify;child;question\x07", 24, 80, |b| parser.process(b));
+    assert_eq!(parser.screen().mouse_protocol_mode(), vt100::MouseProtocolMode::PressRelease);
+    assert_eq!(parser.screen().mouse_protocol_encoding(), vt100::MouseProtocolEncoding::Sgr);
+    assert_eq!(filter.waiting_seq, 1);
+}
+
+#[test]
+fn unsupported_mouse_encodings_are_suppressed_until_reset() {
+    let mut filter = filter::Filter::default();
+    for mode in [b"1015".as_slice(), b"1016"] {
+        let set = [b"\x1b[?".as_slice(), mode, b"h"].concat();
+        let reset = [b"\x1b[?".as_slice(), mode, b"l"].concat();
+        filter.process(&set, 24, 80, |_| {});
+        assert_ne!(filter.unsupported_mouse, 0);
+        filter.process(&reset, 24, 80, |_| {});
+        assert_eq!(filter.unsupported_mouse, 0);
+    }
+}

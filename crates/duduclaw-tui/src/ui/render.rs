@@ -73,7 +73,7 @@ pub fn draw(
             version.replace('\n', " "),
             status,
             strings::working_runs(model.observed_working()),
-            model.cost_millicents.map(|cost| format!(" | {}", strings::cost_window(cost))).unwrap_or_default()
+            model.cost_millicents.map(|cost| format!(" | {}", if model.cost_today { strings::cost_today(cost) } else { strings::cost_window(cost) })).unwrap_or_default()
         )),
         settings,
         false,

@@ -244,6 +244,7 @@ async fn exercise(mut fixture: Fixture) {
     let sid_b = format!("{base}#conv:b");
     let (mut second, info) = fixture.connect(&alice).await;
     assert_eq!(info["type"], "session_info");
+    let sid_c = format!("{}#conv:c", info["session_id"].as_str().unwrap());
     let (mut foreign, info) = fixture.connect(&bob).await;
     assert_eq!(info["type"], "session_info");
 
@@ -264,7 +265,9 @@ async fn exercise(mut fixture: Fixture) {
     assert_eq!(limited["type"], "error");
     assert_eq!(limited["code"], "turn_limit");
     assert_eq!(limited["request_id"], "c1");
-    assert!(limited.get("msg_id").is_none());
+    assert_eq!(limited["msg_id"], "c1");
+    assert_eq!(limited["conv"], "c");
+    assert_eq!(limited["session_id"], sid_c);
     send(
         &mut foreign,
         json!({"type":"cancel", "session_id":sid_a, "msg_id":"a1"}),

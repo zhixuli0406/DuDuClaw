@@ -158,7 +158,7 @@ impl App {
             }
             'P' => { self.blocks.open(Block::Pty, None); self.pty_focus = crate::pty::SUPPORTED; self.focus = crate::chat::Focus::List; },
             'D' => self.blocks.open(Block::Detail, None),
-            'C' => self.blocks.chat(),
+            'C' => { self.blocks.new_chat(); if self.blocks.active == Block::Chat && self.blocks.panes[self.blocks.focused].agent.is_none() { self.blocks.panes[self.blocks.focused].agent = self.block_agent(model); } },
             'R' | 'T' => {
                 if let Some(agent) = self.block_agent(model) {
                     self.blocks

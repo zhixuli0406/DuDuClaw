@@ -10,6 +10,8 @@
 //!
 //! Reference: <https://cablate.com/articles/reverse-engineer-claude-agent-sdk-hidden-token-cost/>
 
+pub const RETENTION_DAYS: u64 = 30;
+
 use duduclaw_llm::{ModelRegistry, NormalizedUsage};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -930,8 +932,13 @@ impl CostTelemetry {
     ///
     /// `hours_ago`: how far back to look (e.g., 1 = last hour, 24 = last day).
     pub async fn summary_global(&self, hours_ago: u64) -> Result<CostSummary, String> {
-        let cutoff = cutoff_time(hours_ago);
-        let period = format!("last_{hours_ago}h");
+        self.summary_global_cutoff(cutoff_time(hours_ago), format!("last_{hours_ago}h")).await
+    }
+    /// Exact inclusive UTC boundary, using the same aggregation as hourly totals.
+    pub async fn summary_global_since(&self, since: chrono::DateTime<chrono::Utc>) -> Result<CostSummary, String> {
+        self.summary_global_cutoff(since.to_rfc3339(), format!("since:{}", since.to_rfc3339())).await
+    }
+    async fn summary_global_cutoff(&self, cutoff: String, period: String) -> Result<CostSummary, String> {
         let conn = self.conn.lock().await;
 
         conn.query_row(
@@ -1773,7 +1780,7 @@ pub async fn adaptive_routing_check(home_dir: &std::path::Path) {
     }
 
     // Also clean up old telemetry records (keep 30 days)
-    if let Err(e) = telemetry.cleanup_old_records(30).await {
+    if let Err(e) = telemetry.cleanup_old_records(RETENTION_DAYS).await {
         warn!(error = %e, "Telemetry cleanup failed");
     }
 
@@ -1830,6 +1837,27 @@ pub fn check_price_cliff(system_prompt: &str, user_prompt: &str) -> Option<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cost_since_exact_local_midnight_excludes_previous_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("cost.db")).unwrap();
+        for agent in ["before", "at", "after"] {
+            telemetry.record(agent, RequestType::Chat, "claude-sonnet-4-6", &TokenUsage { input_tokens: 100, ..Default::default() }).await;
+        }
+        {
+            let conn = telemetry.conn.lock().await;
+            for (agent, ts) in [("before", "2026-11-01T15:59:59+00:00"), ("at", "2026-11-01T16:00:00+00:00"), ("after", "2026-11-01T16:00:00.001+00:00")] {
+                conn.execute("UPDATE token_usage SET created_at=?1 WHERE agent_id=?2", params![ts, agent]).unwrap();
+            }
+        }
+        let midnight = chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00+08:00").unwrap().with_timezone(&chrono::Utc);
+        let summary = telemetry.summary_global_since(midnight).await.unwrap();
+        assert_eq!(summary.total_requests, 2);
+        assert_eq!(summary.total_input_tokens, 200);
+        let later = telemetry.summary_global_since(midnight + chrono::Duration::milliseconds(1)).await.unwrap();
+        assert_eq!(later.total_requests, 1);
+    }
 
     #[test]
     fn test_cache_efficiency_zero_tokens() {

@@ -514,6 +514,7 @@ fn input_focus_ime_paste_and_list_actions() {
     assert_eq!(app.input, "你好qrs12注音提交");
     let Action::Chat(sent) = app.key(key(KeyCode::Enter), &model) else { panic!("expected send"); };
     assert_eq!(sent.agent, "adu"); assert_eq!(sent.content, app.input);
+    app.input.clear();
     app.key(key(KeyCode::Esc), &model);
     assert_eq!(app.focus, Focus::List);
     app.key(key(KeyCode::Char('1')), &model);
@@ -804,13 +805,17 @@ fn m3_help_only_covers_focused_block_and_keeps_chat() {
     app.blocks.add(Split::Vertical);
     app.blocks.add(Split::Horizontal); app.blocks.open(Block::Chat, None);
     app.chat.append(strings::CHAT_ASSISTANT, "chat-kept-visible");
-    app.blocks.select(0); app.help = true;
+    // Use the operator path so the departing chat is saved into its pane.
+    app.key(ordinary_key('1'), &model); app.help = true;
     let output = screen(&model, &app, &Settings::default(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
     assert!(output.contains("chat-kept-visible"));
     assert!(output.contains("目前身分沒有此決策權限"));
     insta::assert_snapshot!("m3_help_focused_only", output);
-    app.blocks.select(2);
+    app.key(ordinary_key('?'), &model);
+    app.key(ordinary_key('3'), &model);
+    assert_eq!(app.blocks.focused, 2);
+    app.key(ordinary_key('?'), &model);
     let output = screen(&model, &app, &Settings::default(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
     assert!(!output.contains("chat-kept-visible"));
@@ -1262,7 +1267,7 @@ async fn autonomy_keys_send_exact_requests_immediately_without_optimism() {
             assert_eq!(gateway.0.lock().unwrap().last().unwrap(), &(method.into(), json!({"agent_id":"adu"})));
             assert!(!m.autonomy.paused("adu"));
         }
-        app.focus = crate::chat::Focus::Input;
+        app.key(ordinary_key('i'), &m);
         for c in ['p','u','n'] { assert_eq!(app.key(ordinary_key(c), &m), Action::None); }
         assert_eq!(app.input, "pun"); assert!(app.control_card.is_none());
     }
@@ -1363,10 +1368,12 @@ fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
             m.schedules = fresh(vec![ScheduledRun { id:"schedule".into(), agent:TerminalText::new("adu".into()), next_run:TerminalText::new("10:00".into()), source,
                 detail:json!({"id":"cron1","agent_id":"adu","enabled":enabled}) }]);
             app.selected = Some(Selection::Schedule("schedule".into()));
-            app.focus = crate::chat::Focus::Input;
+            let original_pane = app.blocks.focused;
+            app.key(ordinary_key('i'), &m);
             assert_eq!(app.key(ordinary_key(key),&m),Action::None);
             assert_eq!(app.input, key.to_string()); assert!(app.control_card.is_none());
-            app.focus = crate::chat::Focus::List;
+            app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &m);
+            app.key(ordinary_key(char::from(b'1' + original_pane as u8)), &m);
             assert_eq!(app.key(ordinary_key(key),&m),Action::None);
             let (actual,params) = app.control_card.as_ref().unwrap().control.request();
             assert_eq!(actual,method);
@@ -1406,4 +1413,193 @@ fn heartbeat_uses_last_run_and_cron_uses_gateway_next_run_without_prediction() {
     assert!(output.contains("上次執行: 2026-11-02T01:00:00Z"));
     assert!(output.contains("2026-11-03T01:00:00Z")); assert!(output.contains(strings::NOT_SCHEDULED));
     insta::assert_snapshot!("autonomy_schedule_times",output);
+}
+
+#[test]
+fn concurrent_chat_real_keys_keep_drafts_scrollback_cancel_and_prompt_in_own_pane() {
+    use crate::chat::{ChatRooms, Focus, Frame};
+    let model = populated();
+    let mut app = App::default();
+    let mut rooms = ChatRooms::default();
+    rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+    let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.key(key('C'), &model);
+    app.sync_chats(&rooms);
+    app.key(key('i'), &model); app.paste("first");
+    let Action::Chat(input) = app.key(enter, &model) else { panic!("first submission"); };
+    let a_id = app.blocks.panes[0].id.clone();
+    let a = serde_json::to_value(rooms.room(&a_id).unwrap().prepare(input).unwrap()).unwrap();
+    app.input = "draft A".into(); app.chat_scroll = 7;
+    app.key(esc, &model);
+    app.selected = Some(Selection::Employee("worker".into()));
+    app.key(key('C'), &model);
+    app.sync_chats(&rooms);
+    assert!(app.input.is_empty());
+    app.key(key('i'), &model); app.paste("second");
+    let Action::Chat(input) = app.key(enter, &model) else { panic!("second submission"); };
+    assert_eq!(input.agent, "worker");
+    let b_id = app.blocks.panes[1].id.clone();
+    let b = serde_json::to_value(rooms.room(&b_id).unwrap().prepare(input).unwrap()).unwrap();
+    app.input = "draft B".into();
+    app.key(esc, &model);
+    for (sent, content) in [(&a, "A working"), (&b, "B working")] {
+        rooms.apply(Frame::parse(&json!({"type":"progress","conv":sent["conv"],"msg_id":sent["msg_id"],"content":content}).to_string()).unwrap());
+    }
+    app.sync_chats(&rooms);
+    assert_eq!(app.blocks.focused, 1);
+    app.key(key('1'), &model);
+    assert_eq!(app.input, "draft A"); assert_eq!(app.chat_scroll, 7);
+    assert_eq!(app.key(key('X'), &model), Action::CancelChat);
+    rooms.apply(Frame::parse(&json!({"type":"error","code":"cancelled","conv":a["conv"],"msg_id":a["msg_id"],"downstream_ref":"private-reference","downstream_running":2}).to_string()).unwrap());
+    app.sync_chats(&rooms);
+    assert_eq!(app.blocks.focused, 0);
+    assert!(app.downstream_prompt(std::time::Instant::now()).is_some());
+    app.key(key('2'), &model);
+    assert_eq!(app.input, "draft B"); assert!(app.chat.running);
+    assert!(app.downstream_prompt(std::time::Instant::now()).is_none());
+    assert_eq!(app.key(key('y'), &model), Action::None);
+    let output = screen(&model, &app, &Settings::default(), 140, 36);
+    assert!(!output.contains("private-reference"));
+    insta::assert_snapshot!("two_chat_interleaved", output);
+    app.key(key('1'), &model); app.key(key('i'), &model);
+    assert_eq!(app.focus, Focus::Input);
+    assert_eq!(app.key(key('y'), &model), Action::None);
+    assert_eq!(app.input, "draft Ay");
+    app.key(esc, &model);
+    assert_eq!(app.key(key('y'), &model), Action::CancelDownstream("private-reference".into()));
+    app.key(key('C'), &model); app.key(key('C'), &model); app.key(key('C'), &model);
+    assert_eq!(app.blocks.panes.len(), 4);
+}
+
+#[test]
+fn navigation_hints_are_passive_and_only_accept_known_inbox_paths() {
+    let model = populated();
+    let mut app = App::default();
+    let original = Some(Selection::Employee("adu".into()));
+    app.selected = original.clone();
+    for path in ["//evil", "/inbox?item=unknown", "/inbox?item=a1&execute=yes", "/inbox?item=a1\u{1b}]52;bad", "/agents/adu/../worker", "/agents/worker", "/agents/adu", "/inbox?item=%61%31"] {
+        app.navigate_hint(&json!({"path":path}), &model);
+        assert_eq!(app.selected, original);
+        assert!(app.notice.is_none());
+    }
+    app.focus = crate::chat::Focus::Input;
+    app.input = "draft".into();
+    app.navigate_hint(&json!({"path":"/inbox?item=a1"}), &model);
+    assert_eq!(app.selected, original); assert_eq!(app.input, "draft");
+    assert!(app.notice.is_none());
+    app.focus = crate::chat::Focus::List;
+    app.detail_scroll = 7;
+    app.navigate_hint(&json!({"path":"/inbox?item=a1", "command":"approve", "focus":true}), &model);
+    assert_eq!(app.selected, original);
+    assert_eq!(app.notice.as_deref(), Some(strings::NAVIGATE_INBOX_HINT));
+    assert_eq!(app.detail_scroll, 7);
+    assert_eq!(app.focus, crate::chat::Focus::List);
+    assert!(app.card.is_none());
+}
+
+#[test]
+fn queued_navigation_cannot_retarget_pause_or_resume() {
+    let mut model = autonomy_model(json!({"global":null,"agents":{},"state_error":null}));
+    model.employees.items.push(employee("worker", "Worker", "active"));
+    model.goal_operators.insert("worker".into());
+    model.inbox = populated().inbox;
+    for path in ["/agents/worker", "/inbox?item=a1", "/inbox?item=approval:a1"] {
+        for (key, resume) in [('p', false), ('u', true)] {
+            let mut app = App::default();
+            app.selected = Some(Selection::Employee("adu".into()));
+            // The event queue is drained immediately before the queued key.
+            app.navigate_hint(&json!({"path":path,"agent_id":"worker","focus":true}), &model);
+            app.refresh(&model);
+            assert_eq!(app.key(ordinary_key(key), &model), Action::Control(
+                crate::controls::Control::Autonomy { agent: Some("adu".into()), resume }
+            ));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_mouse_uses_focused_viewport_and_never_focuses_another_pane() {
+    use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
+    use std::sync::{Arc, Mutex};
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut app = App::default();
+    app.blocks.open(crate::blocks::Block::Pty, None);
+    let pty = app.blocks.panes[0].pty.clone().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut parser = vt100::Parser::new(4, 20, 0);
+    parser.process("\x1b[?1000;1006h界x".as_bytes());
+    { let mut session = pty.lock().unwrap(); session.set_screen_for_test(parser.screen()); session.set_writer_for_test(Capture(captured.clone())); }
+    app.blocks.panes[0].pty_area = ratatui::layout::Rect::new(40, 10, 20, 4);
+    let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 42, row: 11, modifiers: KeyModifiers::NONE };
+    app.mouse(click, &Settings::default());
+    assert!(captured.lock().unwrap().is_empty());
+    app.pty_focus = true;
+    app.mouse(MouseEvent { column: 39, ..click }, &Settings::default());
+    app.mouse(MouseEvent { row: 14, ..click }, &Settings::default());
+    assert!(captured.lock().unwrap().is_empty());
+    app.mouse(click, &Settings::default());
+    for column in [40, 41, 42] {
+        app.mouse(MouseEvent { column, row: 10, ..click }, &Settings::default());
+    }
+    let expected = b"\x1b[<0;3;2M\x1b[<0;1;1M\x1b[<0;2;1M\x1b[<0;3;1M";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while captured.lock().unwrap().len() < expected.len() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(*captured.lock().unwrap(), expected);
+    assert_eq!(app.blocks.focused, 0);
+    app.pty_focus = false;
+    app.blocks.add(crate::blocks::Split::Vertical);
+    app.mouse(click, &Settings::default());
+    assert_eq!(app.blocks.focused, 1);
+    assert_eq!(*captured.lock().unwrap(), expected);
+}
+
+#[test]
+fn input_focus_cannot_send_or_paste_into_a_non_chat_pane() {
+    let mut app = App::default();
+    app.focus = crate::chat::Focus::Input;
+    app.chat.connected = true;
+    app.input_agent = Some("adu".into());
+    app.paste("must not enter another pane");
+    assert!(app.input.is_empty());
+    app.input = "stale draft".into();
+    assert_eq!(app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &empty()), Action::None);
+    assert_eq!(app.focus, crate::chat::Focus::List);
+}
+
+#[test]
+fn downstream_prompt_keeps_answer_keys_and_count_in_narrow_chat() {
+    for width in [18, 24, 32, 48] {
+        let mut app = downstream_app(std::time::Instant::now());
+        let backend = ratatui::backend::TestBackend::new(width, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            super::chat_render::draw(frame, frame.area(), &mut app, &Settings::default(), strings::CHAT_ASSISTANT);
+        }).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for row in 0..12 {
+            let mut column = 0;
+            while column < width {
+                let cell = &buffer[(column, row)];
+                output.push_str(cell.symbol());
+                column += cell.cell_width().max(1);
+            }
+            output.push('\n');
+        }
+        assert!(output.contains("y 停止"), "{width}: {output}");
+        assert!(output.contains("n 繼續"), "{width}: {output}");
+        assert!(output.contains('2'), "{width}: {output}");
+        assert!(!output.contains("opaque-never-render"));
+    }
 }

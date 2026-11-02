@@ -245,6 +245,7 @@ pub(super) fn draw(
     settings: &Settings,
     detail_stale: bool,
 ) {
+    for pane in &mut app.blocks.panes { pane.pty_area = Rect::default(); }
     let (regions, hidden) = app.blocks.areas(area);
     let content_area = if hidden > 0 {
         text(
@@ -284,6 +285,7 @@ pub(super) fn draw(
         let pane = &app.blocks.panes[index];
         let row = &pane.data.selected;
         let detail = match kind {
+            Block::Chat => pane.agent.as_ref().map(|agent| TerminalText::new(agent.clone()).plain().replace('\n', " ")).unwrap_or_default(),
             Block::Run if !row.is_null() => {
                 if let Some(round) = row["round"].as_i64() {
                     strings::run_round_title(&crate::blocks::autonomy::short(row, "channel"), round)
@@ -295,11 +297,19 @@ pub(super) fn draw(
         };
         if !detail.is_empty() { title.push_str(&format!(" · {detail}")); }
         if kind == Block::Chat && !(app.help && index == app.blocks.focused) {
-            super::chat_render::draw(frame, region, app, settings, &title);
+            if index == app.blocks.focused {
+                super::chat_render::draw(frame, region, app, settings, &title);
+            } else {
+                let current = app.chat_view();
+                app.set_chat_view(app.blocks.panes[index].chat_view.clone());
+                super::chat_render::draw(frame, region, app, settings, &title);
+                app.blocks.panes[index].chat_view = app.chat_view();
+                app.set_chat_view(current);
+            }
             continue;
         }
         if kind == Block::Pty && !(app.help && index == app.blocks.focused) {
-            super::pty_render::draw(frame, region, &app.blocks.panes[index], settings, &title, app.pty_focus && index == app.blocks.focused);
+            super::pty_render::draw(frame, region, &mut app.blocks.panes[index], settings, &title, app.pty_focus && index == app.blocks.focused);
             continue;
         }
         let pane = &app.blocks.panes[index];

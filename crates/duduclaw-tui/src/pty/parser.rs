@@ -16,12 +16,17 @@ pub struct Screen {
     hidden: bool,
     application_cursor: bool,
     bracketed_paste: bool,
+    pub mouse_mode: vt100::MouseProtocolMode,
+    pub mouse_encoding: vt100::MouseProtocolEncoding,
+    pub waiting_seq: u64,
+    pub mouse_supported: bool,
 }
 impl Screen {
     pub(crate) fn capture(screen: &vt100::Screen) -> Self {
         let (rows, cols) = screen.size();
         Self {
             size: (rows, cols),
+            mouse_mode: screen.mouse_protocol_mode(), mouse_encoding: screen.mouse_protocol_encoding(), waiting_seq: 0, mouse_supported: true,
             cells: (0..rows).flat_map(|row| (0..cols).map(move |col| screen.cell(row, col).unwrap().clone())).collect(),
             scrollback: screen.scrollback(), cursor: screen.cursor_position(), hidden: screen.hide_cursor(),
             application_cursor: screen.application_cursor(), bracketed_paste: screen.bracketed_paste(),
@@ -86,7 +91,10 @@ impl ParserWorker {
                     Err(mpsc::RecvTimeoutError::Timeout) => {},
                 }
                 if dirty && (disconnected || last_publish.elapsed() >= Duration::from_millis(33)) {
-                    let screen = Arc::new(Screen::capture(parser.screen()));
+                    let mut screen = Screen::capture(parser.screen());
+                    screen.waiting_seq = filter.waiting_seq;
+                    screen.mouse_supported = filter.unsupported_mouse == 0;
+                    let screen = Arc::new(screen);
                     // Swap pointers only. Build and destroy snapshots outside this lock.
                     let previous = published.lock().unwrap_or_else(|e| e.into_inner()).replace(screen);
                     drop(previous);

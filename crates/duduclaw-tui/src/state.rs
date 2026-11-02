@@ -150,6 +150,7 @@ impl<T> Snapshot<T> {
 pub struct Model {
     pub schedules: Snapshot<ScheduledRun>,
     pub cost_millicents: Option<u64>,
+    pub cost_today: bool,
     pub breakers: Vec<Breaker>,
     pub autonomy: Snapshot<crate::autonomy::Status>,
     pub activity: HashMap<String, Activity>,
@@ -268,6 +269,7 @@ impl Model {
                 }
                 self.role = lists.role;
                 self.cost_millicents = lists.cost_millicents;
+                self.cost_today = lists.cost_today;
                 if self.role != Some(Role::Admin) { self.breakers.clear(); }
                 self.goal_operators = lists.goal_operators;
                 self.employees.replace(lists.employees);
@@ -299,6 +301,7 @@ impl Model {
 }
 struct Lists {
     cost_millicents: Option<u64>,
+    cost_today: bool,
     autonomy: Result<crate::autonomy::Status>,
     role: Option<Role>,
     goal_operators: HashSet<String>,
@@ -343,9 +346,9 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
         }
     }
     let role = live_role.unwrap_or(role);
-    let cost_millicents = if role == Role::Admin {
+    let (cost_millicents, cost_today) = if role == Role::Admin {
         crate::state_extra::cost_summary(client).await
-    } else { None };
+    } else { (None, false) };
     // approvals.list requires Manager, whereas goal_decide accepts an
     // employee's Operator binding. Do not fail the whole employee inbox by
     // making an RPC that its role cannot call.
@@ -422,6 +425,7 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     if matches!(schedules, Err(Error::SnapshotBudget)) { return Err(Error::SnapshotBudget); }
     Ok(Lists {
         cost_millicents,
+        cost_today,
         autonomy,
         role: live_role,
         goal_operators,
@@ -574,7 +578,7 @@ mod tests {
                 let requests = requests.clone();
                 Box::pin(async move { let (reply, rx) = oneshot::channel(); requests.send(reply).unwrap(); rx.await.unwrap() })
             }));
-        let complete = || Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin), goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()),
+        let complete = || Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin), goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()),
             schedules: Ok(vec![]), employees: vec![], inbox: vec![] });
         tokio::time::timeout(Duration::from_secs(2), async {
             calls.recv().await.unwrap().send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
@@ -593,7 +597,7 @@ mod tests {
         let mut m = Model::default();
         assert!(m.apply(
             0,
-            Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+            Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -631,7 +635,7 @@ mod tests {
                 result.await.unwrap()
             })
         }));
-        let complete = || Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+        let complete = || Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
@@ -741,7 +745,7 @@ mod tests {
         m.invalidate_all();
         assert!(!m.apply(
             old_revision,
-            Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+            Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -754,7 +758,7 @@ mod tests {
         assert_eq!(m.inbox.count(), None);
         assert!(m.apply(
             m.revision,
-            Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+            Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -794,7 +798,7 @@ mod tests {
         }
         assert!(model.activity.is_empty());
         model.activity.insert("removed".into(), Activity::default());
-        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
@@ -805,7 +809,7 @@ mod tests {
     #[test]
     fn unavailable_history_does_not_claim_fresh_employee_state() {
         let mut model = fresh();
-        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Err(Error::RpcRejected),
             schedules: Ok(vec![]), employees: vec![], inbox: vec![],
@@ -829,7 +833,7 @@ mod tests {
         assert!(model.autonomy.stale && model.autonomy.refetch_pending);
         assert!(crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_UNKNOWN));
         assert!(!crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_PAUSED));
-        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, autonomy: Err(Error::Network), role: Some(Role::Admin),
+        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Err(Error::Network), role: Some(Role::Admin),
             goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]), employees: vec![], inbox: vec![] })));
         assert!(model.autonomy.paused("adu"));
         assert!(model.autonomy.unreadable());
@@ -862,7 +866,7 @@ mod tests {
                 }
                 let pending = calls.recv().await.unwrap();
                 assert!(models.borrow().autonomy.stale);
-                pending.send(Ok(Lists { cost_millicents: None, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+                pending.send(Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
                     goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]), employees: vec![], inbox: vec![] })).unwrap_or_else(|_| panic!("fetch dropped"));
                 loop { models.changed().await.unwrap(); if !models.borrow().autonomy.stale { break; } }
             }

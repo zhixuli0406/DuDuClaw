@@ -61,7 +61,10 @@ pub enum Split {
 }
 #[derive(Clone)]
 pub struct Pane {
+    pub id: String,
+    pub chat_view: crate::ui::app::ChatView,
     pub pty: Option<crate::pty::Shared>,
+    pub pty_area: Rect,
     pub kind: Block,
     pub agent: Option<String>,
     pub task_id: Option<String>,
@@ -74,6 +77,9 @@ pub struct Pane {
 impl Pane {
     fn new(kind: Block) -> Self {
         Self {
+            id: crate::chat::nonce(),
+            pty_area: Rect::default(),
+            chat_view: crate::ui::app::ChatView::default(),
             pty: (kind == Block::Pty).then(crate::pty::Session::shared),
             kind,
             agent: None,
@@ -120,12 +126,15 @@ impl Blocks {
         self.revision += 1;
     }
     pub fn chat(&mut self) {
-        if let Some(i) = self.panes.iter().position(|p| p.kind == Block::Chat) {
-            self.select(i);
-        } else {
-            if self.panes.len() < 4 {
-                self.add(Split::Vertical);
-            }
+        if self.active == Block::Chat { return; }
+        if let Some(i) = self.panes.iter().position(|p| p.kind == Block::Chat) { self.select(i); }
+        else if self.panes.len() < 4 { self.add(Split::Vertical); self.open(Block::Chat, None); }
+    }
+    pub fn new_chat(&mut self) {
+        if self.active == Block::Detail {
+            self.open(Block::Chat, None);
+        } else if self.panes.len() < 4 {
+            self.add(Split::Vertical);
             self.open(Block::Chat, None);
         }
     }

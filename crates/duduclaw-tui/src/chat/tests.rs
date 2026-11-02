@@ -275,3 +275,101 @@ fn stale_downstream_busy_preserves_running_turn_and_status() {
         assert_eq!(s.lines.len(), line_count);
     }
 }
+
+#[test]
+fn rooms_route_interleaved_frames_and_reject_unknown_or_conflicting_identity() {
+    let mut rooms = ChatRooms::default();
+    rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
+    let a = rooms.room("pane-a").unwrap().prepare(submission("one", Some("adu")).unwrap()).unwrap();
+    let b = rooms.room("pane-b").unwrap().prepare(submission("two", Some("worker")).unwrap()).unwrap();
+    for value in [
+        json!({"type":"progress","conv":a.conv,"msg_id":a.msg_id,"content":"A working"}),
+        json!({"type":"progress","conv":b.conv,"msg_id":b.msg_id,"content":"B working"}),
+        json!({"type":"assistant_done","conv":"unknown","content":"foreign"}),
+        json!({"type":"assistant_done","conv":a.conv,"msg_id":b.msg_id,"content":"conflict"}),
+        json!({"type":"assistant_done","session_id":"unknown","conv":a.conv,"content":"foreign session"}),
+        json!({"type":"assistant_done","content":"uncorrelated"}),
+    ] { rooms.apply(frame(value)); }
+    assert!(rooms.rooms["pane-a"].status.is("A working"));
+    assert!(rooms.rooms["pane-b"].status.is("B working"));
+    let cancel = rooms.rooms["pane-a"].cancel_frame().unwrap();
+    assert_eq!(cancel["msg_id"], a.msg_id);
+    rooms.apply(frame(json!({"type":"error","code":"cancelled","conv":a.conv,"msg_id":a.msg_id,
+        "downstream_running":2,"downstream_ref":"opaque-a"})));
+    assert!(!rooms.rooms["pane-a"].running);
+    assert!(rooms.rooms["pane-b"].running);
+    assert!(rooms.rooms["pane-a"].downstream_prompt(Instant::now()).is_some());
+    assert!(rooms.rooms["pane-b"].downstream_prompt(Instant::now()).is_none());
+    rooms.apply(frame(json!({"type":"error","code":"turn_limit","conv":b.conv,"msg_id":b.msg_id})));
+    assert!(rooms.rooms["pane-b"].status.is(strings::CHAT_TURN_LIMIT));
+    for id in ["pane-c", "pane-d"] { assert!(rooms.room(id).is_some()); }
+    assert!(rooms.room("pane-e").is_none());
+    rooms.retain(&["pane-b".into()]);
+    rooms.apply(frame(json!({"type":"assistant_done","conv":a.conv,"msg_id":a.msg_id,"content":"closed"})));
+    assert_eq!(rooms.rooms.len(), 1);
+}
+
+#[test]
+fn rooms_admission_errors_end_only_the_matching_turn_on_new_and_old_gateways() {
+    for code in ["turn_limit", "duplicate_message"] {
+        for legacy in [false, true] {
+            let mut rooms = ChatRooms::default();
+            rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
+            let a = rooms.room("pane-a").unwrap().prepare(submission("one", Some("adu")).unwrap()).unwrap();
+            rooms.room("pane-b").unwrap().prepare(submission("two", Some("worker")).unwrap()).unwrap();
+            // Exact production admission frame, including the old gateway shape.
+            let mut error = json!({"type":"error", "code":code,
+                "message":"Turn admission limit reached or duplicate message id",
+                "request_id":a.msg_id});
+            if !legacy {
+                error["session_id"] = json!(format!("base#agent:adu#conv:{}", a.conv));
+                error["conv"] = json!(a.conv);
+                error["msg_id"] = json!(a.msg_id);
+            }
+            rooms.apply(frame(error));
+            assert!(!rooms.rooms["pane-a"].running, "{code}, legacy={legacy}");
+            assert!(rooms.rooms["pane-b"].running);
+            let expected = if code == "turn_limit" { strings::CHAT_TURN_LIMIT }
+                else { "Turn admission limit reached or duplicate message id" };
+            assert!(rooms.rooms["pane-a"].status.is(expected));
+            let retry = rooms.room("pane-a").unwrap().prepare(submission("retry", Some("adu")).unwrap()).unwrap();
+            assert!(retry.session_id.is_none(), "a rejected first turn must not become a resume request");
+        }
+    }
+}
+
+#[test]
+fn rooms_reject_conflicting_stale_and_ambiguous_admission_requests() {
+    let mut rooms = ChatRooms::default();
+    rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
+    let a = rooms.room("pane-a").unwrap().prepare(submission("one", Some("adu")).unwrap()).unwrap();
+    let b = rooms.room("pane-b").unwrap().prepare(submission("two", Some("worker")).unwrap()).unwrap();
+    for identity in [
+        json!({"request_id":a.msg_id, "conv":b.conv}),
+        json!({"request_id":a.msg_id, "msg_id":b.msg_id}),
+        json!({"request_id":a.msg_id, "session_id":format!("base#agent:worker#conv:{}", b.conv)}),
+        json!({"request_id":"stale", "conv":a.conv, "msg_id":a.msg_id}),
+    ] {
+        let mut error = identity;
+        error["type"] = json!("error");
+        error["code"] = json!("turn_limit");
+        rooms.apply(frame(error));
+        assert!(rooms.rooms["pane-a"].running);
+        assert!(rooms.rooms["pane-b"].running);
+    }
+    rooms.room("pane-b").unwrap().msg_id = Some(a.msg_id.clone());
+    rooms.apply(frame(json!({"type":"error", "code":"duplicate_message", "request_id":a.msg_id})));
+    assert!(rooms.rooms["pane-a"].running);
+    assert!(rooms.rooms["pane-b"].running);
+}
+
+#[test]
+fn rooms_cancel_outcome_can_use_a_server_generated_request_id() {
+    let mut rooms = ChatRooms::default();
+    rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
+    let a = rooms.room("pane-a").unwrap().prepare(submission("one", Some("adu")).unwrap()).unwrap();
+    rooms.apply(frame(json!({"type":"error", "code":"cancelled", "request_id":"server-generated-cancel",
+        "session_id":format!("base#agent:adu#conv:{}", a.conv), "conv":a.conv, "msg_id":a.msg_id})));
+    assert!(!rooms.rooms["pane-a"].running);
+    assert!(rooms.rooms["pane-a"].status.is(strings::CHAT_CANCELLED));
+}

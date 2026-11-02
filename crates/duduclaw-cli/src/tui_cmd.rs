@@ -15,7 +15,10 @@ pub enum TuiCommands {
     /// Follow one employee without an alternate screen.
     #[command(about = duduclaw_tui::strings::WATCH_HELP)]
     Watch {
-        agent: String,
+        #[arg(required_unless_present = "run", conflicts_with = "run")]
+        agent: Option<String>,
+        #[arg(long, conflicts_with = "agent", help = duduclaw_tui::strings::WATCH_RUN_HELP)]
+        run: Option<String>,
         #[arg(long, help = duduclaw_tui::strings::WATCH_CONTENT_HELP)]
         content: bool,
     },
@@ -68,7 +71,7 @@ async fn run_with_markers(
                 })
                 .await
             }
-            Some(TuiCommands::Watch { agent, content }) => run_watch(WatchOptions { client, agent: agent.clone(), content: *content }).await,
+            Some(TuiCommands::Watch { agent, run, content }) => run_watch(WatchOptions { client, agent: agent.clone().unwrap_or_default(), run: run.clone(), content: *content }).await,
             Some(TuiCommands::Inbox { follow, json }) => {
                 run_inbox(InboxOptions {
                     client,
@@ -185,7 +188,8 @@ mod tests {
             let markers = crate::ai_session_guard::markers_with(&|key| key == *name);
             for command in [
                 None,
-                Some(TuiCommands::Watch { agent: "adu".into(), content: false }),
+                Some(TuiCommands::Watch { agent: Some("adu".into()), run: None, content: false }),
+                Some(TuiCommands::Watch { agent: None, run: Some("run-1".into()), content: false }),
                 Some(TuiCommands::Inbox {
                     follow: false,
                     json: true,
@@ -206,5 +210,22 @@ mod tests {
                 assert!(!missing.exists());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod watch_argument_tests {
+    use super::*;
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Args { #[command(subcommand)] command: TuiCommands }
+    #[test]
+    fn watch_run_is_explicit_and_positional_stays_agent() {
+        assert!(matches!(Args::try_parse_from(["tui", "watch", "adu"]).unwrap().command,
+            TuiCommands::Watch { agent: Some(_), run: None, .. }));
+        assert!(matches!(Args::try_parse_from(["tui", "watch", "--run", "run-1"]).unwrap().command,
+            TuiCommands::Watch { agent: None, run: Some(_), .. }));
+        assert!(Args::try_parse_from(["tui", "watch"]).is_err());
+        assert!(Args::try_parse_from(["tui", "watch", "adu", "--run", "run-1"]).is_err());
     }
 }

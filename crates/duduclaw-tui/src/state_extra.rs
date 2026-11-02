@@ -57,9 +57,26 @@ pub(crate) fn activity_event(map: &mut HashMap<String, Activity>, name: &str, pa
         _ => {}
     }
 }
-pub(crate) async fn cost_summary(gateway: &impl crate::blocks::fetch::Gateway) -> Option<u64> {
-    crate::blocks::autonomy::read(gateway, "cost.summary", json!({"hours":24})).await.ok()
-        .as_ref().and_then(crate::state::cost_amount)
+pub(crate) fn local_midnight<T: chrono::TimeZone>(now: chrono::DateTime<T>) -> Option<chrono::DateTime<T>> {
+    let date = now.date_naive();
+    // Some zones advance at midnight; use the first real minute of this date.
+    // On a repeated midnight choose the earlier instant, never now's offset.
+    for minute in 0..1440 {
+        let local = date.and_hms_opt(minute / 60, minute % 60, 0)?;
+        if let Some(start) = now.timezone().from_local_datetime(&local).earliest() { return Some(start); }
+    }
+    None
+}
+pub(crate) async fn cost_summary(gateway: &impl crate::blocks::fetch::Gateway) -> (Option<u64>, bool) {
+    if let Some(since) = local_midnight(chrono::Local::now()) {
+        let result = crate::blocks::autonomy::read(gateway, "cost.summary", json!({"since":since.to_rfc3339()})).await;
+        if let Ok(value) = result
+            && value["since"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).is_some_and(|s| s == since)
+            && let Some(cost) = crate::state::cost_amount(&value)
+        { return (Some(cost), true); }
+    }
+    (crate::blocks::autonomy::read(gateway, "cost.summary", json!({"hours":24})).await.ok()
+        .as_ref().and_then(crate::state::cost_amount), false)
 }
 
 pub(crate) async fn schedules(client: &Client, role: crate::auth::Role, budget: &mut crate::budget::SnapshotBudget) -> Result<Vec<ScheduledRun>> {
@@ -173,5 +190,46 @@ mod tests {
         );
         assert!(!map["adu"].working);
         assert!(map["adu"].completed_id.is_none());
+    }
+}
+
+#[cfg(test)]
+mod today_tests {
+    use super::*;
+    use chrono::TimeZone;
+    #[test]
+    fn midnight_uses_timezone_at_midnight_across_dst_and_utc_date_boundary() {
+        let taipei = chrono_tz::Asia::Taipei.with_ymd_and_hms(2026, 11, 2, 1, 30, 0).unwrap();
+        assert_eq!(local_midnight(taipei).unwrap().with_timezone(&chrono::Utc).to_rfc3339(), "2026-11-01T16:00:00+00:00");
+        let ny = chrono_tz::America::New_York;
+        let spring = ny.with_ymd_and_hms(2026, 3, 8, 23, 0, 0).unwrap();
+        let fall = ny.with_ymd_and_hms(2026, 11, 1, 23, 0, 0).unwrap();
+        assert_eq!(local_midnight(spring).unwrap().to_rfc3339(), "2026-03-08T00:00:00-05:00");
+        assert_eq!(local_midnight(fall).unwrap().to_rfc3339(), "2026-11-01T00:00:00-04:00");
+        // A historically skipped midnight starts this calendar day at 01:00.
+        let skipped = chrono_tz::America::Sao_Paulo.with_ymd_and_hms(2018, 11, 4, 12, 0, 0).unwrap();
+        assert_eq!(local_midnight(skipped).unwrap().to_rfc3339(), "2018-11-04T01:00:00-02:00");
+    }
+    struct FakeGateway { exact: bool, calls: std::sync::Mutex<Vec<Value>> }
+    #[async_trait::async_trait]
+    impl crate::blocks::fetch::Gateway for FakeGateway {
+        async fn request(&self, method: &str, params: Value) -> Result<crate::client::RpcReply> {
+            assert_eq!(method, "cost.summary");
+            self.calls.lock().unwrap().push(params.clone());
+            let mut response = json!({"available":true,"total_cost_millicents":100});
+            if self.exact { response["since"] = params["since"].clone(); }
+            Ok(crate::client::RpcReply::Accepted(response))
+        }
+    }
+    #[tokio::test]
+    async fn today_requires_boundary_acknowledgment_old_gateway_falls_back() {
+        for exact in [true, false] {
+            let fake = FakeGateway { exact, calls: Default::default() };
+            assert_eq!(cost_summary(&fake).await, (Some(100), exact));
+            let calls = fake.calls.lock().unwrap();
+            assert!(calls[0]["since"].is_string());
+            assert_eq!(calls.len(), if exact { 1 } else { 2 });
+            if !exact { assert_eq!(calls[1], json!({"hours":24})); }
+        }
     }
 }

@@ -166,19 +166,24 @@ pub const CMD_DOWNSTREAM_DISMISS: &str = "讓下游工作跑完";
 pub fn downstream_prompt(count: u64) -> String {
     format!("還有 {count} 位員工的工作還在跑，要一起停嗎？ y 停止／n 讓它們跑完")
 }
+pub fn downstream_prompt_compact(count: u64) -> String {
+    format!("y 停止／n 繼續：{count} 位員工在跑")
+}
 pub fn downstream_stopped(stopped: u64, still_stopping: u64) -> String {
     let mut text = format!("已停止 {stopped} 項");
     if still_stopping > 0 { text.push_str(&format!("，{still_stopping} 項還在收尾")); }
     text
 }
 pub const CHAT_INTERRUPTED: &str = "連線中斷，回覆結果未確認；不會自動重送訊息";
+pub const NAVIGATE_INBOX_HINT: &str = "收件匣有待處理項目，請選取查看";
+pub const WATCH_AGENT_POLLING: &str = "輪詢模式：每五秒更新員工執行紀錄";
 pub const WATCH_POLLING: &str = "輪詢模式：閘道未提供即時訂閱，每五秒更新";
 pub const WATCH_SUBSCRIBED: &str = "已訂閱員工執行事件";
 pub const WATCH_GAP: &str = "事件可能遺失，正在重新取得執行紀錄";
 pub const WATCH_RUN_MISMATCH: &str = "警告：執行紀錄與目標不符，已略過";
 pub fn notification(count: usize) -> String { format!("DuDuClaw：{count} 項需要你處理") }
 
-pub const WATCH_HELP: &str = "持續查看一位員工的執行紀錄";
+pub const WATCH_HELP: &str = "持續查看員工或 --run 指定的執行紀錄";
 
 pub const WATCH_TRUNCATED: &str = "較早事件已省略，每次執行僅顯示最近 256 筆";
 pub const CHAT_DONE: &str = "回覆完成";
@@ -359,5 +364,9 @@ pub const NO: &str = "否";
 
 pub const WORKING_TASK_UNKNOWN: &str = "此次執行的任務未知；以下是員工的任務清單，並非執行連結";
 
+pub const WATCH_RUN_HELP: &str = "追蹤指定執行紀錄；不可與員工名稱同時使用";
+pub const NOTIFY_CONNECTION_ERROR: &str = "DuDuClaw：連線中斷，請檢查控制室";
+pub const PTY_WAITING: &str = "? 等待你的輸入（僅提示）";
+pub fn cost_today(millicents: u64) -> String { format!("今日 ${:.4}", millicents as f64 / 100_000.0) }
 pub const CONTINUE_REVIEW: &str = "核對接續訊息（全文）；捲動到底後輸入確認碼，再按 Enter 送出";
 pub fn inbox_information(count: usize) -> String { format!("資訊 {count}") }

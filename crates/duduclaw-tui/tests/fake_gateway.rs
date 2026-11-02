@@ -70,6 +70,8 @@ struct Fixture {
     short_token: bool,
     flood: AtomicUsize,
     task_calls: AtomicUsize,
+    run_subscriptions: std::sync::Mutex<Vec<Value>>,
+    run_subscription_supported: AtomicBool,
     decisions: std::sync::Mutex<Vec<(String, Value)>>,
     digest_mismatch: AtomicBool,
     employee_role: AtomicBool,
@@ -124,6 +126,8 @@ impl Gateway {
             short_token,
             flood: AtomicUsize::new(0),
             task_calls: AtomicUsize::new(0),
+            run_subscriptions: std::sync::Mutex::new(Vec::new()),
+            run_subscription_supported: AtomicBool::new(false),
             decisions: std::sync::Mutex::new(Vec::new()),
             digest_mismatch: AtomicBool::new(false),
             employee_role: AtomicBool::new(false),
@@ -355,8 +359,14 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                 }
                             }
                             "runs.subscribe" => {
-                                if !send(&mut socket, WsFrame::error_response(&id, "Unknown method: runs.subscribe")).await { return; }
-                                continue;
+                                f.run_subscriptions.lock().unwrap().push(params.clone());
+                                assert!(params.get("run_id").and_then(Value::as_str).is_some());
+                                assert!(params.get("agent_id").is_none());
+                                if !f.run_subscription_supported.load(Ordering::SeqCst) {
+                                    if !send(&mut socket, WsFrame::error_response(&id, "Unknown method: runs.subscribe")).await { return; }
+                                    continue;
+                                }
+                                json!({"subscribed":true,"run_id":params["run_id"]})
                             }
                             "runs.get" => json!({"run":{"id":"r1","agent_id":"adu"},"events":[{"kind":"text","label":"assistant","ts":"09:00","preview":"done"}]}),
                             "runs.list" => {
