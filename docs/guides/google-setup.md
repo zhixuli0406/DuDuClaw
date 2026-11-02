@@ -1,5 +1,7 @@
 # Connect Google
 
+Gmail search and read mask login links and nearby one-time codes in returned mail text before an AI employee receives it. This does not cover third-party MCP, Remote MCP or Bash.
+
 Use this guide with the setup wizard to connect your Google account.
 
 | Your situation | Choose | Main limit |

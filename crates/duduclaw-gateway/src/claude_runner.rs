@@ -5602,7 +5602,10 @@ mod redaction_proxy_cli_args_tests {
             assert_eq!(args[2], "--strict-mcp-config");
             let body: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&args[1]).unwrap()).unwrap();
             assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], "mcp-proxy");
-            assert_eq!(body["mcpServers"]["duduclaw"], serde_json::from_str::<serde_json::Value>(&original).unwrap()["mcpServers"]["duduclaw"]);
+            assert_eq!(body["mcpServers"]["duduclaw"],
+                duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+                    tmp.path(), "agnes", &duduclaw_core::resolve_duduclaw_bin(),
+                ));
             assert_eq!(std::fs::read_to_string(dir.join(".mcp.json")).unwrap(), original);
         }
     }
@@ -5729,14 +5732,14 @@ mod redaction_proxy_cli_args_tests {
 
         let body: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&guard).unwrap()).unwrap();
-        // The built-in server is untouched — it already redacts.
+        // The built-in slot is regenerated from the current host context.
         assert_eq!(
             body["mcpServers"]["duduclaw"]["args"],
             json!(["mcp-server"])
         );
         assert_eq!(
             body["mcpServers"]["duduclaw"]["command"],
-            json!("/opt/duduclaw/bin/duduclaw")
+            json!(duduclaw_core::resolve_duduclaw_bin())
         );
         // The third-party one now launches through the proxy.
         let pg = &body["mcpServers"]["crm_pg"];

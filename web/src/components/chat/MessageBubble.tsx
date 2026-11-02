@@ -2,11 +2,12 @@ import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
-import type { ChatMessage } from '@/stores/chat-store';
+import { useChatStore, type ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
 import { AssignedTaskCard } from './AssignedTaskCard';
-import { CitedText, CitationSourceList } from './CitationChips';
+import { CitationSourceList } from './CitationChips';
+import { MarkdownContent } from './MarkdownContent';
 import { PassageDrawer } from '@/components/knowledge/PassageDrawer';
 
 /** A single chat turn rendered as a left/right-aligned bubble (Multica plain
@@ -18,14 +19,17 @@ export function MessageBubble({
   message,
   leading,
   label,
+  onRetry,
 }: {
   message: ChatMessage;
   leading?: ReactNode;
   /** Small caption above an assistant bubble, e.g. who answered when a
    *  message called another AI staff member by `@`. */
   label?: string;
+  onRetry?: () => void;
 }) {
   const intl = useIntl();
+  const cancel = useChatStore(s => s.cancel);
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
   const citations = !isUser && !isSystem ? message.citations : undefined;
@@ -37,7 +41,7 @@ export function MessageBubble({
       {!isUser && leading && <div className="mb-0.5 shrink-0">{leading}</div>}
       <div
         className={cn(
-          'max-w-[80%] rounded-xl px-3.5 py-2 text-sm leading-relaxed',
+          'min-w-0 max-w-[80%] rounded-xl px-3.5 py-2 text-sm leading-relaxed',
           isUser
             ? 'bg-secondary text-secondary-foreground'
             : isSystem
@@ -53,20 +57,28 @@ export function MessageBubble({
             ))}
           </div>
         )}
-        {message.content && (
+        {message.content && (message.role === 'assistant' ? (
+          <MarkdownContent text={message.content} citations={citations} onOpen={(chunkId) => setOpenChunk(chunkId)} />
+        ) : (
           <div className={cn('whitespace-pre-wrap break-words', isSystem && 'flex items-start gap-1.5')}>
             {isSystem && <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />}
-            <span>
-              {hasCitations ? (
-                <CitedText
-                  text={message.content}
-                  citations={citations}
-                  onOpen={(chunkId) => setOpenChunk(chunkId)}
-                />
-              ) : (
-                message.content
-              )}
-            </span>
+            <span>{message.content}</span>
+          </div>
+        ))}
+        {isUser && message.delivery === 'queued' && (
+          <div className="mt-2 text-xs" role="status">
+            {intl.formatMessage({ id: 'webchat.queued' })}
+            <button type="button" className="ml-2 underline" onClick={() => cancel(message.turnId)}>
+              {intl.formatMessage({ id: 'webchat.cancelQueued' })}
+            </button>
+          </div>
+        )}
+        {isUser && message.deliveryError && (
+          <div className="mt-2 text-xs" role="status">
+            {message.deliveryError}
+            {message.delivery === 'failed' && onRetry && <button type="button" className="ml-2 underline" onClick={onRetry}>
+              {intl.formatMessage({ id: 'webchat.resend' })}
+            </button>}
           </div>
         )}
         {message.task && !isUser && <AssignedTaskCard task={message.task} />}

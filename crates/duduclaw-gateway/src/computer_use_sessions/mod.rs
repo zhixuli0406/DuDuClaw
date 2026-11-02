@@ -46,6 +46,7 @@ mod backend;
 pub mod gates;
 pub mod http;
 pub mod keepalive;
+pub(crate) mod login;
 pub(crate) mod live_ops;
 pub mod live_view;
 pub mod navigation;
@@ -461,6 +462,10 @@ pub(crate) struct SessionShared {
     pub(crate) workspace: workspace::WorkspaceSlot,
     /// Keep-alive, dashboard viewers, takeover and the injection hold (P8).
     pub(crate) live: live_view::LiveState,
+    pub(crate) login_running: std::sync::atomic::AtomicBool,
+    pub(crate) login_masked: std::sync::atomic::AtomicBool,
+    pub(crate) login_epoch: AtomicU32,
+    pub(crate) login_view_gate: tokio::sync::RwLock<()>,
     profile_result: std::sync::Mutex<Option<String>>,
     discard_profile: std::sync::atomic::AtomicBool,
     keep_held_login: std::sync::atomic::AtomicBool,
@@ -1273,6 +1278,7 @@ impl ComputerUseSessions {
         body["ok"] = json!(true);
         body["keep_alive_minutes"] = json!(session.config.keep_alive_minutes);
         body["confirmation_channel"] = json!(confirmation_channel);
+        body["available_credentials"] = json!(self.login_labels(agent_id));
         body["network"] = json!(if nav_hosts.is_empty() {
             "none"
         } else {
@@ -1340,12 +1346,13 @@ impl ComputerUseSessions {
         // P8: the page's visible text goes through the input guard. A hit
         // (now or earlier, until a human resumes) or a page that could not
         // be read hides the whole picture: fail closed.
-        let scan = self.scan_page(&session).await;
-        let extra_mask = match scan {
+        let login_masked = session.shared.login_masked.load(Ordering::Acquire);
+        let scan = if login_masked { PageScan::Unscanned } else { self.scan_page(&session).await };
+        let extra_mask = if login_masked { Some("login_uncleared") } else { match scan {
             PageScan::Held => Some("injection_suspected"),
             PageScan::Unscanned if !fully_masked => Some("text_unscanned"),
             PageScan::Unscanned | PageScan::Clean => None,
-        };
+        }};
         if let Some(reason) = extra_mask {
             b64 = crate::computer_use::mask_screenshot_regions(
                 &b64,
@@ -1451,13 +1458,14 @@ impl ComputerUseSessions {
     }
 
     /// Egress identity is separate from the turn used for attended approval.
-    pub(crate) async fn action_with_egress(
+    pub(super) async fn action_with_egress_inner(
         &self,
         agent_id: &str,
         session_id: Option<&str>,
         turn_id: Option<&str>,
         egress_turn_id: Option<&str>,
         req: &ActionRequest,
+        login_credential: Option<&crate::website_credentials::Metadata>,
     ) -> Result<Value, OpError> {
         let tool = action_tool(req);
         // `navigate`: the URL is checked against this session's pinned hosts
@@ -1503,15 +1511,21 @@ impl ComputerUseSessions {
             crate::approval::policy_revision(&self.home, agent_id).map_err(|_| {
                 OpError::new(ErrorCode::Forbidden, "無法核對目前操作政策，已拒絕執行。")
             })?;
+        if session.shared.login_masked.load(Ordering::Acquire) {
+            return Err(OpError::new(ErrorCode::Blocked, "登入欄位尚未確認清除，請結束並啟動新的工作階段。"));
+        }
         if let ActionRequest::Navigate { url } = req {
             return self.navigate(&mut session, url, &policy_revision).await;
         }
-        // 1. Parameters.
-        let action = actions::to_action(
+        // Login uses the same typing risk/contract/session gates, with a
+        // secret-free surrogate. Only its own backend path may execute it.
+        let action = if matches!(req, ActionRequest::Login { .. }) {
+            ComputerAction::Type { text: String::new() }
+        } else { actions::to_action(
             req,
             session.config.display_width,
             session.config.display_height,
-        )?;
+        )? };
         // 2. Action budget.
         action_budget(&session)?;
         // 3. Risk + contract. An unreadable title fails closed.
@@ -1528,13 +1542,15 @@ impl ComputerUseSessions {
         let ctx = ActionContext {
             action: action.clone(),
             model_reasoning: None,
-            targets_sensitive_input: action_targets_input(&action)
-                && window_is_sensitive(Some(&title)),
+            targets_sensitive_input: matches!(req, ActionRequest::Login { .. })
+                || (action_targets_input(&action) && window_is_sensitive(Some(&title))),
             active_window_title: Some(title.clone()),
         };
         let risk = risk_detector::assess_risk(&ctx, &session.config);
         let contract_hit =
-            contract_must_not_violated(&session.config.contract_must_not, &action, &None);
+            contract_must_not_violated(&session.config.contract_must_not, &action, &None)
+            || (matches!(req, ActionRequest::Login { .. }) && contract_must_not_matches(
+                &session.config.contract_must_not, "computer_login website login submit", &None));
         // The confirmation target comes from the gateway's own record of this
         // employee's live turns, never from the request.
         let confirmer = match turn_id {
@@ -1553,7 +1569,9 @@ impl ComputerUseSessions {
             session.config.auto_confirm_trusted,
             confirmer.is_some(),
         );
-        let summary = actions::describe(&action);
+        let summary = if matches!(req, ActionRequest::Login { .. }) {
+            "使用已授權憑證登入網站".to_string()
+        } else { actions::describe(&action) };
         let mut durable_execution = None;
         let observed_screen_hash: String;
         match gate {
@@ -1578,7 +1596,9 @@ impl ComputerUseSessions {
                 return Err(err);
             }
             Gate::Confirm => {
-                let prompt = actions::confirmation_prompt(agent_id, &action, &title);
+                let prompt = if let Some(credential) = login_credential {
+                    format!("AI 員工 {agent_id} 要使用儀表板保存的憑證登入網站 {}，是否同意？", credential.origin)
+                } else { actions::confirmation_prompt(agent_id, &action, &title) };
                 let shot = session.backend.screenshot().await.map_err(|_| {
                     OpError::new(
                         ErrorCode::ScreenshotFailed,
@@ -1758,7 +1778,13 @@ impl ComputerUseSessions {
             .live
             .actions_used
             .store(session.actions_used, Ordering::Release);
-        let result = session.backend.execute(&action).await;
+        let mut login_status = None;
+        let result = if let Some(expected) = login_credential {
+            match self.execute_login(&mut session, expected, &policy_revision, &title, &observed_screen_hash).await {
+                Ok(status) => { login_status = Some(status); Ok(()) }
+                Err(_) => Err(ComputerUseError::ApiError("login credential changed or unavailable".into())),
+            }
+        } else { session.backend.execute(&action).await };
         session.last_activity = Instant::now();
         if let Some((broker, claim, _)) = &execution_claim {
             let (state, receipt, error) = match &result {
@@ -1806,6 +1832,13 @@ impl ComputerUseSessions {
                 ErrorCode::ExecutionFailed,
                 format!("操作執行失敗：{summary}。"),
             ));
+        }
+        if let Some(status) = login_status {
+            if status == login::LoginStatus::FailedUncleared {
+                return Err(OpError::new(ErrorCode::SessionEnded,
+                    "無法確認登入欄位已清除，已停止並移除工作階段；請啟動新的工作階段。"));
+            }
+            return Ok(status.response());
         }
         let now = Instant::now();
         let mut body = session.counters(now);
@@ -1994,6 +2027,7 @@ impl ComputerUseSessions {
                 ),
             ));
         }
+        *session.shared.snapshot.lock().unwrap_or_else(|p| p.into_inner()) = None;
         // The final host comes from the page; only an exact hostname is shown.
         let host = outcome
             .host
@@ -2164,12 +2198,13 @@ impl ComputerUseSessions {
     }
 
     pub async fn status(&self, agent_id: &str) -> Value {
+        let labels = self.login_labels(agent_id);
         let Some(entry) = self.lookup(agent_id) else {
-            return json!({"ok": true, "active": false});
+            return json!({"ok": true, "active": false, "available_credentials": labels});
         };
         let mut session = entry.lock().await;
         if session.agent_id != agent_id || self.check_alive(&mut session).await.is_err() {
-            return json!({"ok": true, "active": false});
+            return json!({"ok": true, "active": false, "available_credentials": labels});
         }
         let now = Instant::now();
         let activity = session
@@ -2178,6 +2213,7 @@ impl ComputerUseSessions {
         let mut body = session.counters(now);
         body["ok"] = json!(true);
         body["active"] = json!(true);
+        body["available_credentials"] = json!(labels);
         body["human_has_control"] = json!(session.shared.live.active_takeover(now).is_some());
         body["injection_hold"] = json!(session.shared.live.hold().is_some());
         body["idle_seconds_left"] = json!(
@@ -2421,6 +2457,7 @@ fn action_tool(req: &ActionRequest) -> &'static str {
     match req {
         ActionRequest::Click { .. } => gates::TOOL_CLICK,
         ActionRequest::Type { .. } => gates::TOOL_TYPE,
+        ActionRequest::Login { .. } => gates::TOOL_LOGIN,
         ActionRequest::Key { .. } => gates::TOOL_KEY,
         ActionRequest::Scroll { .. } => gates::TOOL_SCROLL,
         ActionRequest::Navigate { .. } => gates::TOOL_NAVIGATE,
@@ -2434,6 +2471,7 @@ fn approval_detail(req: &ActionRequest) -> String {
     match req {
         ActionRequest::Type { text } => format!("（輸入 {} 個字元）", text.chars().count()),
         ActionRequest::Navigate { .. } => "（開啟網頁）".to_string(),
+        ActionRequest::Login { .. } => "（使用儀表板保存的憑證登入網站）".to_string(),
         _ => String::new(),
     }
 }

@@ -42,6 +42,9 @@ recipient_guard = "shadow" # off | shadow | ask
 # Scheduled fires have no source conversation and recheck this list.
 
 [gateway]
+# Public invitation link base URL. Required unless an Admin supplies public_url.
+# Never inferred from request Host or Origin headers.
+# public_url = "https://ai.example.com"
 bind = "127.0.0.1"
 port = 18889
 # auto_update = true  # Pro default: true (auto-download + install + restart)
@@ -75,10 +78,19 @@ port = 18889
 # inference_mode = "hybrid"    # local | claude | hybrid — whether local models run at all
 # name = "DuDuClaw"            # Device name broadcast over mDNS on the LAN
 
+# ── Dashboard navigation ────────────────────────────────────
+# Employee task navigation is hidden by default on non-Personal editions.
+# This affects dashboard navigation only; routes and RPC permissions stay unchanged.
+# [dashboard]
+# employee_tasks = false
+
 # ── Autonomous goal loop ────────────────────────────────────
 # The outer loop behind `/goal`: dispatch → judge → redispatch until done or
 # escalated. Full reference: docs/features/34-goal-loop.md, docs/guides/goal-loop.md
 # [goal_loop]
+# Independent document-only plan review: "off" (default) or "goldfish".
+# System utility spending (goal-plan-review), not employee budget; up to 45s.
+# plan_review = "off"
 # iteration_cap = 5            # Dispatches a complex goal gets before needs_human
 # iteration_cap_simple = 3     # Same cap for goals graded simple
 # soft_cap = 3                 # Marks diminishing returns; does not block
@@ -1004,6 +1016,6 @@ port = 18889
 #   [model]         agents/<id>/agent.toml — that agent's model, effort, account pool
 #   [router]        inference.toml — local-inference cascade routing
 #   [voice] TTS     inference.toml — text-to-speech; only STT lives in this file
-#   Distributor brand: signed <home>/distributor_brand.json, Oem only.
+#   Distributor brand: signed <home>/distributor_brand.json; any tier except OpenSource with a matching signed subscription.
 #   No [branding] section or customer-side setter; old branding.json is ignored.
 #   See docs/guides/white-label.md for the signed name/logo contract.

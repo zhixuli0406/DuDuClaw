@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import '@/test/mocks';
+import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { SidebarProvider } from '@/components/mds';
 import { AppSidebar } from './AppSidebar';
@@ -10,6 +10,8 @@ import { useSystemStore } from '@/stores/system-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
+import { api } from '@/lib/api';
+import { useBrandStore } from '@/stores/brand-store';
 import { ORG_CHART_MIN_AGENTS } from '@/lib/nav-visibility';
 
 /** Minimal agent fixtures — just enough for `agents.length` (D6 org-chart gate). */
@@ -37,6 +39,7 @@ function precedes(a: Element, b: Element): boolean {
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
+  useBrandStore.setState({ brand: null });
   useAuthStore.setState({
     user: { display_name: 'Boss', role: 'admin' } as never,
     bindings: [],
@@ -93,8 +96,9 @@ describe('AppSidebar (Multica shell)', () => {
     }
     // …while open surfaces stay.
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /About/i })).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /Routines/i })).not.toBeInTheDocument();
+    if (role === 'manager') expect(screen.getByRole('link', { name: /About/i })).toBeInTheDocument();
+    else expect(screen.queryByRole('link', { name: /About/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Automations/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Gallery/i })).not.toBeInTheDocument();
   });
 
@@ -133,7 +137,7 @@ describe('AppSidebar (Multica shell)', () => {
     expect(chat).not.toHaveAttribute('aria-current', 'page');
   });
 
-  // Personal IA (2026-07-29 client feedback): flat 主區 (daily + Routines /
+  // Personal IA (2026-07-29 client feedback): flat 主區 (daily + Automations /
   // World / Skills / Memory), no 工作/公司 groups, no staff zone; 設定 and
   // 進階 close the rail collapsed. Roster/org/pet-studio hidden (pet studio is
   // desktop-only and jsdom is not Tauri). 2026-07-30: the knowledge base
@@ -144,7 +148,7 @@ describe('AppSidebar (Multica shell)', () => {
     renderSidebar();
 
     // 主區 flat items are present.
-    expect(screen.getByRole('link', { name: /Routines/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Automations/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Memory/i })).toBeInTheDocument();
     // Enterprise group labels are gone; 進階 exists but starts collapsed.
     expect(screen.queryByText(/^Work$/)).not.toBeInTheDocument();
@@ -163,7 +167,7 @@ describe('AppSidebar (Multica shell)', () => {
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())
       .filter(Boolean) as string[];
-    const seq = ['New chat', 'Routines', 'Skills', 'Memory', 'Agents', 'World'];
+    const seq = ['New chat', 'Automations', 'Skills', 'Memory', 'Agents', 'Virtual office'];
     const positions = seq.map((l) => order.indexOf(l));
     // Every one of the six must actually be on the rail — otherwise a -1 would
     // let this assertion pass while the row was missing entirely.
@@ -172,7 +176,7 @@ describe('AppSidebar (Multica shell)', () => {
     // WP18-B: 對話紀錄 sits AFTER 世界 and BEFORE 設定 — never in front of the
     // six primary surfaces, which is where it used to be.
     const conversations = screen.getByText(/^Conversations$/);
-    expect(precedes(screen.getByRole('link', { name: /World/i }), conversations)).toBe(true);
+    expect(precedes(screen.getByRole('link', { name: /Virtual office/i }), conversations)).toBe(true);
     expect(precedes(conversations, screen.getByText(/^Settings$/))).toBe(true);
     // Still hidden on Personal: pet studio (desktop-only, and jsdom is not Tauri).
     expect(screen.queryByRole('link', { name: /Pet studio/i })).not.toBeInTheDocument();
@@ -222,16 +226,16 @@ describe('AppSidebar (Multica shell)', () => {
     // WP-NAV (2026-08-12) inserts 成長 between 世界 and the 低頻 tail: the
     // matrix grades it 高頻・低重要, so it sits with the daily surfaces but
     // still below the four the client annotated.
-    const seq = ['Skills', 'Memory', 'Agents', 'World', 'Growth', 'Team'];
+    const seq = ['Skills', 'Memory', 'Agents', 'Virtual office', 'Growth', 'Team'];
     const positions = seq.map((l) => order.indexOf(l));
     // -1 guard: a missing row would otherwise sneak through as "sorted".
     expect(positions.every((i) => i >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
     // 例行工作 leads 工作 and 任務看板 closes it — the Enterprise stand-in for
     // folding the board into 進階.
-    expect(order.indexOf('Routines')).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Routines'));
-    expect(order.indexOf('Routines')).toBeLessThan(order.indexOf('Reports'));
+    expect(order.indexOf('Automations')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Automations'));
+    expect(order.indexOf('Automations')).toBeLessThan(order.indexOf('Reports'));
     expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Reports'));
     // WP-NAV: the occasional rows sink below the oversight pair (時間軸 / 用量)
     // and stay above the deliberately-demoted board. `/forks` is
@@ -244,7 +248,7 @@ describe('AppSidebar (Multica shell)', () => {
     // these two assertions fails.
     const conversations = screen.getByText(/^Conversations$/);
     expect(precedes(screen.getByText(/^Company$/), conversations)).toBe(true);
-    expect(precedes(screen.getByRole('link', { name: /World/i }), conversations)).toBe(true);
+    expect(precedes(screen.getByRole('link', { name: /Virtual office/i }), conversations)).toBe(true);
     expect(precedes(conversations, screen.getByText(/^Settings$/))).toBe(true);
   });
 
@@ -304,4 +308,124 @@ describe('isNewFeature (新功能 chip expiry)', () => {
     expect(isNewFeature('1.58.0', null)).toBe(true);
     expect(isNewFeature('garbage', '1.57.0')).toBe(false);
   });
+});
+
+
+describe('employee sidebar', () => {
+  beforeEach(() => {
+    useSystemStore.setState({ status: { edition_profile: 'enterprise', version: '1.79.0' } as never });
+    useAuthStore.setState({ user: { id: 'employee', display_name: 'Alice', role: 'employee', email: 'alice@example.com', department: 'Sales' } as never });
+    useBrandStore.setState({ brand: null });
+    vi.spyOn(api.personalGoogle, 'status').mockRejectedValue(new Error('offline'));
+  });
+
+  it('has an inline inbox and no footer bell, edition card or clickable brand', async () => {
+    renderSidebar();
+    expect(document.querySelector('svg.lucide-bell')).toBeNull();
+    expect(screen.queryByTitle('Enterprise')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Inbox/i })).toHaveAttribute('href', '/inbox');
+    expect(screen.queryByRole('button', { name: /Workspace/i })).not.toBeInTheDocument();
+    expect(screen.getByText('Sales')).toBeInTheDocument();
+    expect(screen.getAllByRole('link').slice(0, 5).map(link => link.getAttribute('href'))).toEqual(['/', '/inbox', '/skills', '/memory', '/world']);
+    expect(precedes(screen.getByRole('button', { name: /Command palette/i }), screen.getByRole('button', { name: /New task/i }))).toBe(true);
+    expect(screen.queryByRole('link', { name: /Task Board/i })).not.toBeInTheDocument();
+    await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(1));
+  });
+
+  it('opens the account menu by keyboard and quietly handles a failed connection probe', async () => {
+    const user = userEvent.setup();
+    renderSidebar();
+    const trigger = screen.getByRole('button', { name: 'Alice' });
+    trigger.focus();
+    await user.keyboard('{Enter}');
+    expect(await screen.findByText('alice@example.com')).toBeInTheDocument();
+    for (const name of ['My connections', 'Settings', 'Appearance', 'Get help']) {
+      expect(screen.getByRole('menuitem', { name: new RegExp(name, 'i') })).toBeInTheDocument();
+    }
+    expect(screen.getByText('Switch language')).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /Sign Out/i })).toBeInTheDocument();
+    await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole('img', { name: 'Connection needed' })).not.toBeInTheDocument();
+    await user.keyboard('{Escape}');
+    await user.click(trigger);
+    await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(3));
+  });
+
+  it('preserves the admin and Personal footer bell', () => {
+    useAuthStore.setState({ user: { display_name: 'Boss', role: 'admin' } as never });
+    const first = renderSidebar();
+    expect(document.querySelector('svg.lucide-bell')).not.toBeNull();
+    first.unmount();
+    useAuthStore.setState({ user: { display_name: 'Alice', role: 'employee' } as never });
+    useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+    renderSidebar();
+    expect(document.querySelector('svg.lucide-bell')).not.toBeNull();
+  });
+
+  it('marks and sorts the primary employee before an Owner binding', () => {
+    useAgentsStore.setState({ agents: makeAgents(2) as never });
+    useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'agent-1' } as never,
+      bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'viewer' }] as never });
+    renderSidebar();
+    const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
+    expect(links.map(link => link.getAttribute('href'))).toEqual(['/agents/agent-1', '/agents/agent-0']);
+    expect(links[0]).toHaveTextContent('Primary');
+    expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(2);
+  });
+
+  it('sets the primary from the row menu and refreshes the current user before updating staff', async () => {
+    const user = userEvent.setup();
+    const bindings = [
+      { agent_name: 'agent-0', access_level: 'owner' },
+      { agent_name: 'agent-1', access_level: 'viewer' },
+    ];
+    const currentUser = { id: 'employee', role: 'employee', display_name: 'Alice', primary_agent_id: 'agent-0' };
+    useAgentsStore.setState({ agents: makeAgents(2) as never });
+    useAuthStore.setState({ user: currentUser as never, bindings: bindings as never });
+    let finishRefresh!: (value: unknown) => void;
+    const refreshing = new Promise(resolve => { finishRefresh = resolve; });
+    const me = vi.spyOn(api.users, 'me').mockImplementation(() => refreshing as ReturnType<typeof api.users.me>);
+    renderSidebar();
+    const staffLinks = () => screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
+    expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0');
+    await user.click(screen.getAllByRole('button', { name: 'Set as primary' })[1]);
+    await user.click(await screen.findByRole('menuitem', { name: 'Set as primary' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('users.set_primary_agent', { agent_id: 'agent-1' }));
+    await waitFor(() => expect(me).toHaveBeenCalledOnce());
+    // The mutation alone does not invent a new local current-user state.
+    expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0');
+    finishRefresh({ user: { ...currentUser, primary_agent_id: 'agent-1' }, bindings });
+    await waitFor(() => {
+      expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-1');
+      expect(staffLinks()[0]).toHaveTextContent('Primary');
+      expect(staffLinks()[1]).not.toHaveTextContent('Primary');
+    });
+    expect(useAuthStore.getState().user?.primary_agent_id).toBe('agent-1');
+    me.mockRestore();
+  });
+
+  it('sorts bound staff by owner, operator, viewer and limits the list to eight', () => {
+    const agents = makeAgents(10);
+    useAgentsStore.setState({ agents: agents as never });
+    useAuthStore.setState({ bindings: agents.map((a, index) => ({ agent_name: a.name, access_level: index === 9 ? 'owner' : index === 8 ? 'operator' : 'viewer' })) as never });
+    renderSidebar();
+    const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
+    expect(links).toHaveLength(8);
+    expect(links.slice(0, 2).map(link => link.getAttribute('href'))).toEqual(['/agents/agent-9', '/agents/agent-8']);
+    expect(screen.getByRole('link', { name: /View all/i })).toHaveAttribute('href', '/agents');
+  });
+});
+
+
+it('shows the connection dot and hides help for an active distributor brand', async () => {
+  useAuthStore.setState({ user: { display_name: 'Alice', role: 'employee' } as never });
+  useBrandStore.setState({ brand: { product_name: 'Partner', logo_light: '' } });
+  vi.spyOn(api.personalGoogle, 'status').mockResolvedValue({
+    connection: null, requests: [], integration_enabled: true, requires_login: false,
+  } as never);
+  const user = userEvent.setup();
+  renderSidebar();
+  await user.click(screen.getByRole('button', { name: 'Alice' }));
+  expect(await screen.findByRole('img', { name: 'Connection needed' })).toBeInTheDocument();
+  expect(screen.queryByRole('menuitem', { name: 'Get help' })).not.toBeInTheDocument();
 });

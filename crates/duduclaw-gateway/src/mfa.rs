@@ -84,9 +84,17 @@ fn parse_policy(text: &str) -> Result<bool, String> {
 
 /// Restore must preserve the live policy; an unreadable policy defaults to strict.
 pub(crate) fn restore_policy(home: &Path) -> bool {
-    std::fs::read_to_string(home.join("config.toml"))
-        .ok().and_then(|text| parse_policy(&text).ok())
-        .unwrap_or(true)
+    crate::handlers::config_commit::read_regular_config(&home.join("config.toml"))
+        .ok().and_then(|text| {
+            let table: toml::Table = text.parse().ok()?;
+            if table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() {
+                if policy_store_is_absent(home) {
+                    Some(false)
+                } else {
+                    read_policy_state(home).ok()
+                }
+            } else { parse_policy(&text).ok() }
+        }).unwrap_or(true)
 }
 
 pub(crate) fn restore_policy_differs(home: &Path, text: &str) -> bool {
@@ -179,12 +187,78 @@ fn record_policy(home: &Path, value: bool) -> Result<Option<i64>, String> {
     }
 }
 
+/// Read the durable boundary without creating/migrating the identity store.
+/// This reader is strict; boot_policy separately handles a genuinely absent store.
+fn read_policy_state(home: &Path) -> Result<bool, String> {
+    use rusqlite::OptionalExtension;
+    let db = rusqlite::Connection::open_with_flags(
+        home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).map_err(|e| e.to_string())?;
+    db.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0))
+        .optional().map(|v| v.unwrap_or(false)).map_err(|e| e.to_string())
+}
+
+pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
+    // Only an absent directory entry means no policy has ever been recorded.
+    // A dangling symlink or any other existing but unreadable store must fail closed.
+    if policy_store_is_absent(home) {
+        return Ok(false);
+    }
+    match read_policy_state(home) {
+        Ok(value) => Ok(value),
+        Err(_) if personal => Ok(false),
+        Err(error) => {
+            POLICY.write().unwrap_or_else(|e| e.into_inner())
+                .entry(home.to_path_buf()).or_default().degraded = true;
+            Err(format!("MFA policy state unavailable; refusing config provisioning: {error}"))
+        }
+    }
+}
+
+fn policy_store_is_absent(home: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(home.join("users.db")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// A missing auth key is not permission for an ordinary writer to disable
+/// the durable policy by adding false. Only the Admin MFA adapter may do so.
+pub(crate) fn refuse_policy_change_at(home: &Path, before: &str, after: &str) -> Result<(), String> {
+    refuse_policy_change(before, after)?;
+    let before_table: toml::Table = before.parse().map_err(|_| "登入設定格式不正確。")?;
+    let after_table: toml::Table = after.parse().map_err(|_| "登入設定格式不正確。")?;
+    if before_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none()
+        && after_table.get("auth").and_then(|a| a.get("mfa_enforced")).and_then(|v| v.as_bool()) == Some(false)
+        && read_policy_state(home)?
+    {
+        return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更。".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn audit_policy_restored(home: &Path) {
+    crate::security_autopilot::audit_and_emit(home,
+        &duduclaw_security::audit::AuditEvent::new(
+            "mfa.policy_restored_from_state", "gateway_boot",
+            duduclaw_security::audit::Severity::Warning,
+            json!({"mfa_enforced":true,"source":"mfa_policy_state"}),
+        ));
+}
+
 /// Boot and configuration reload only. A failed reload never discards a good snapshot.
 pub(crate) fn reload_policy(home: &Path) {
     // Serialize reloads so an older disk read cannot overwrite a newer snapshot.
     let mut snapshots = POLICY.write().unwrap_or_else(|e|e.into_inner());
-    let result = std::fs::read_to_string(home.join("config.toml"))
-        .map_err(|e|e.to_string()).and_then(|s|parse_policy(&s))
+    let result = crate::handlers::config_commit::read_regular_config(&home.join("config.toml"))
+        .map_err(|e|e.to_string()).and_then(|s| {
+            let table: toml::Table = s.parse().map_err(|_| "登入設定格式不正確。".to_string())?;
+            // Only an explicit boolean false can reconcile an Admin disable.
+            // An absent auth table/key must preserve the durable boundary.
+            if table.get("auth").is_none_or(|a| a.as_table().is_some_and(|a| !a.contains_key("mfa_enforced"))) {
+                read_policy_state(home)
+            } else {
+                parse_policy(&s)
+            }
+        })
         .and_then(|value| {
             let since = record_policy(home, value)?;
             Ok((value,since))
@@ -246,6 +320,21 @@ mod tests {
         assert!(restore_policy(home.path()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mfa_restore_missing_store_is_false_but_existing_unreadable_store_is_strict() {
+        let home = tempfile::tempdir().unwrap();
+        let config = "[gateway]\nport = 18789\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        assert!(!restore_policy(home.path()));
+        assert!(!restore_policy_differs(home.path(), config));
+
+        let db = home.path().join("users.db");
+        std::fs::write(&db, b"not a sqlite database").unwrap();
+        std::fs::set_permissions(&db, std::os::unix::fs::PermissionsExt::from_mode(0)).unwrap();
+        assert!(restore_policy(home.path()));
+    }
+
     #[test]
     fn mfa_restore_rewrites_only_key_in_inline_auth_table() {
         let before = "auth = { mfa_enforced = false, other = 'keep' } # comment\n";
@@ -298,6 +387,52 @@ mod tests {
         reload_policy(home.path());
         assert!(enforced(home.path(),false).unwrap());
     }
+    #[test]
+    fn missing_auth_preserves_durable_enforcement_and_unreadable_state_degrades() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        for text in ["[gateway]\nport=18789\n", "[auth]\n"] {
+            std::fs::write(home.path().join("config.toml"), text).unwrap();
+            reload_policy(home.path());
+            assert!(enforced(home.path(), false).unwrap());
+            assert!(restore_policy(home.path()));
+            assert_eq!(policy_status(home.path())["enforced_at"], 123);
+            assert!(refuse_policy_change_at(home.path(), text, "[auth]\nmfa_enforced=false").is_err());
+        }
+        conn.execute_batch("DROP TABLE mfa_policy_state").unwrap();
+        reload_policy(home.path());
+        assert_eq!(policy_status(home.path())["degraded"], true);
+        assert!(enforced(home.path(), false).unwrap());
+        let fresh = tempfile::tempdir().unwrap();
+        std::fs::write(fresh.path().join("config.toml"), "# no auth\n").unwrap();
+        reload_policy(fresh.path());
+        assert_eq!(policy_status(fresh.path())["degraded"], true);
+        assert!(enforced(fresh.path(), false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_false_cannot_disable_policy_on_reload() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true").unwrap();
+        reload_policy(home.path());
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+        let target = home.path().join("false.toml");
+        std::fs::write(&target, "[auth]\nmfa_enforced=false").unwrap();
+        std::os::unix::fs::symlink(target, home.path().join("config.toml")).unwrap();
+        reload_policy(home.path());
+        assert!(enforced(home.path(), false).unwrap());
+        assert!(restore_policy(home.path()));
+        assert_eq!(policy_status(home.path())["degraded"], true);
+        let durable: bool = conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert!(durable);
+    }
+
     #[test]
     fn mfa_missing_key_with_rows_never_generates_replacement() {
         let home=tempfile::tempdir().unwrap();

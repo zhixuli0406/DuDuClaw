@@ -323,10 +323,9 @@ fn call_capacity(held: &mut tokio::task::JoinSet<()>) -> bool {
 /// [`PROXY_PRIVATE_ENV`], with the JSON map from [`PROXY_UPSTREAM_ENV_VAR`]
 /// layered on top.
 ///
-/// A malformed / absent blob simply contributes nothing — it can never abort
-/// the spawn, because the upstream's own `.mcp.json` env is a convenience,
-/// not a security control (the security control is what the *proxy* does to
-/// the payloads).
+/// This is only a merge helper, not a security control. Production calls it
+/// only after `resolve_declared_env` has strictly parsed and resolved the
+/// declared map, and checks the merged result before spawning.
 pub fn upstream_env(
     inherited: impl IntoIterator<Item = (String, String)>,
     encoded: Option<&str>,
@@ -357,26 +356,39 @@ pub fn upstream_env(
 
 /// The upstream env blob: the inline [`PROXY_UPSTREAM_ENV_VAR`] value when
 /// set, otherwise the contents of the file [`PROXY_UPSTREAM_ENV_FILE_VAR`]
-/// names. An unreadable file contributes nothing (logged), like a malformed
-/// blob in [`upstream_env`].
+/// names. An unreadable file refuses startup: it may contain required refs.
 pub fn upstream_env_blob(
     inline: Option<String>,
     file: Option<String>,
     server: &str,
-) -> Option<String> {
+) -> std::result::Result<Option<String>, String> {
     if inline.is_some() {
-        return inline;
+        return Ok(inline);
     }
-    let path = file.filter(|p| !p.trim().is_empty())?;
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => Some(raw),
-        Err(e) => {
-            tracing::warn!(
-                server = %server,
-                error = %e,
-                "mcp-proxy: upstream env file unreadable — the upstream starts without its declared env"
-            );
-            None
+    let Some(path) = file else { return Ok(None) };
+    if path.trim().is_empty() {
+        return Err(format!("MCP server '{server}': upstream env file is missing"));
+    }
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|_| format!("MCP server '{server}': upstream env file is unreadable"))
+}
+
+/// Answer the client's first request with a real MCP error on startup failure.
+/// The message is constructed from server/env names only, never credential data.
+async fn startup_error_frame<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    input: R, output: &mut W, message: &str,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut input = BufReader::new(input.take(65536));
+    let mut line = String::new();
+    if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), input.read_line(&mut line)).await {
+        if let Ok(frame) = serde_json::from_str::<Value>(&line) {
+            if let Some(id) = frame.get("id") {
+                let error = serde_json::json!({"jsonrpc":"2.0", "id":id,
+                    "error":{"code":-32001,"message":message}});
+                let _ = write_line(output, &error.to_string()).await;
+            }
         }
     }
 }
@@ -868,6 +880,46 @@ pub async fn run_mcp_proxy_scoped(
         ));
     }
 
+    // Authenticate secret-store reads before initializing other per-agent
+    // services. No fallback/default identity may authorize secret resolution.
+    let env_blob = match scoped_blob {
+        Some(blob) => Ok(Some(blob)),
+        None => upstream_env_blob(
+            std::env::var(PROXY_UPSTREAM_ENV_VAR).ok(),
+            std::env::var(PROXY_UPSTREAM_ENV_FILE_VAR).ok(),
+            server,
+        ),
+    };
+    // A spawn-scoped proxy runs under a CLI (Grok) that hands
+    // its MCP children its own environment, vendor keys included
+    // (`XAI_API_KEY`, `GEMINI_API_KEY`). Its upstream starts from the
+    // agent-CLI allowlist instead (PATH, HOME, locale, proxy, temp dir; never
+    // a secret-shaped name) plus the declared env, the same base a server
+    // gets under the Claude CLI or the tool loop.
+    let inherited: Vec<(String, String)> = if spawn_scoped {
+        scoped_inherited_env()
+    } else {
+        std::env::vars().collect()
+    };
+    let explicit_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
+    let explicit_token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).ok();
+    let resolved = env_blob.and_then(|blob| {
+        crate::mcp_proxy_spawn_env::resolve_declared_env(
+            home_dir, explicit_agent.as_deref(), explicit_token.as_deref(), server, blob.as_deref(),
+        )
+    }).and_then(|blob| {
+        let pairs = upstream_env(inherited, blob.as_deref());
+        crate::mcp_proxy_spawn_env::reject_unresolved_env(server, &pairs)?;
+        Ok(pairs)
+    });
+    let env_pairs = match resolved {
+        Ok(pairs) => pairs,
+        Err(message) => {
+            startup_error_frame(tokio::io::stdin(), &mut tokio::io::stdout(), &message).await;
+            return Err(DuDuClawError::Gateway(message));
+        }
+    };
+
     let default_agent = crate::mcp::get_default_agent(home_dir).await;
 
     // Same three outcomes as `mcp-server` (§10.2): disabled ⇒ pass-through,
@@ -910,27 +962,6 @@ pub async fn run_mcp_proxy_scoped(
     let gate = (!upstream_is_bridge).then(|| {
         Arc::new(ThirdPartyGate::new(home_dir, &default_agent, server, "proxy"))
     });
-
-    let env_blob = match scoped_blob {
-        Some(blob) => Some(blob),
-        None => upstream_env_blob(
-            std::env::var(PROXY_UPSTREAM_ENV_VAR).ok(),
-            std::env::var(PROXY_UPSTREAM_ENV_FILE_VAR).ok(),
-            server,
-        ),
-    };
-    // A spawn-scoped proxy runs under a CLI (Grok) that hands
-    // its MCP children its own environment, vendor keys included
-    // (`XAI_API_KEY`, `GEMINI_API_KEY`). Its upstream starts from the
-    // agent-CLI allowlist instead (PATH, HOME, locale, proxy, temp dir; never
-    // a secret-shaped name) plus the declared env, the same base a server
-    // gets under the Claude CLI or the tool loop.
-    let inherited: Vec<(String, String)> = if spawn_scoped {
-        scoped_inherited_env()
-    } else {
-        std::env::vars().collect()
-    };
-    let env_pairs = upstream_env(inherited, env_blob.as_deref());
 
     let mut cmd = duduclaw_core::platform::async_command_for(command);
     cmd.args(args);
@@ -1351,6 +1382,20 @@ mod tests {
         assert!(!marker.exists(), "the upstream must not have been started");
     }
 
+    #[tokio::test]
+    async fn unresolved_startup_answers_with_an_mcp_error() {
+        let request = br#"{"jsonrpc":"2.0","id":17,"method":"initialize"}
+"#;
+        let mut output = Vec::new();
+        startup_error_frame(request.as_slice(), &mut output,
+            "MCP server 'server': unresolved env 'API_KEY'; upstream was not started").await;
+        let frame: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(frame["id"], 17);
+        assert_eq!(frame["error"]["code"], -32001);
+        assert!(frame["error"]["message"].as_str().unwrap().contains("API_KEY"));
+        assert!(!String::from_utf8(output).unwrap().contains("secret://"));
+    }
+
     // ── upstream env file (Codex, 2026-10-19) ───────────────────────
 
     #[test]
@@ -1363,7 +1408,7 @@ mod tests {
             Some(file.to_string_lossy().into_owned()),
             "s",
         );
-        assert_eq!(got.as_deref(), Some(r#"{"A":"inline"}"#));
+        assert_eq!(got.unwrap().as_deref(), Some(r#"{"A":"inline"}"#));
     }
 
     #[test]
@@ -1371,12 +1416,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("env.json");
         std::fs::write(&file, r#"{"PGPASSWORD":"from-file"}"#).unwrap();
-        let blob = upstream_env_blob(None, Some(file.to_string_lossy().into_owned()), "s");
+        let blob = upstream_env_blob(None, Some(file.to_string_lossy().into_owned()), "s").unwrap();
         let map: HashMap<_, _> = upstream_env(Vec::new(), blob.as_deref()).into_iter().collect();
         assert_eq!(map.get("PGPASSWORD").map(String::as_str), Some("from-file"));
-        // A missing file contributes nothing rather than aborting.
-        assert!(upstream_env_blob(None, Some("/nonexistent/x.json".into()), "s").is_none());
-        assert!(upstream_env_blob(None, None, "s").is_none());
+        // A missing declared file refuses startup rather than losing references.
+        assert!(upstream_env_blob(None, Some("/nonexistent/x.json".into()), "s").is_err());
+        assert!(upstream_env_blob(None, None, "s").unwrap().is_none());
     }
 
     #[test]

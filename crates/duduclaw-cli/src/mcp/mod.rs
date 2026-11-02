@@ -16,17 +16,7 @@ use tracing::{info, warn};
 
 // ── Tool definitions ─────────────────────────────────────────
 
-pub(crate) struct ToolDef {
-    name: &'static str,
-    description: &'static str,
-    params: &'static [ParamDef],
-}
-
-pub(crate) struct ParamDef {
-    name: &'static str,
-    description: &'static str,
-    required: bool,
-}
+pub(crate) use duduclaw_core::mcp_tool_defs::{ParamDef, ToolDef};
 
 /// Outcome of an install-class approval gate.
 ///
@@ -350,3 +340,6 @@ mod task_audience_mcp_tests;
 
 pub(crate) mod egress_gate;
 pub(crate) mod recipient_gate;
+
+#[cfg(test)]
+mod tool_pruning_tests;

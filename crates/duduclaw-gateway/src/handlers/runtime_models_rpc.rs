@@ -50,12 +50,23 @@ impl MethodHandler {
         }
         let (claude_oauth, claude_subscription) = detect_claude_oauth(claude_bin.as_deref()).await;
 
+        // Use the same cache accessor as accounts_basic::cached_rotator, but
+        // fail closed instead of using its best-effort fallback on read errors.
+        let claude_account_ready = match crate::claude_runner::get_rotator_cached(&self.home_dir).await {
+            Ok(rotator) => any_usable_claude_oauth(&rotator.status().await),
+            Err(_) => false,
+        };
+
         // Legacy key kept verbatim: the dashboard onboarding wizard and the
         // OOBE shell both read `claude_cli`, and renaming it would break both
         // for zero gain. Every other runtime is keyed by its catalog id
         // (`codex`, `grok`, … ) exactly as before.
         flags.insert("claude_cli".to_string(), Value::Bool(claude_bin.is_some()));
         flags.insert("claude_oauth".to_string(), Value::Bool(claude_oauth));
+        flags.insert(
+            "claude_account_ready".to_string(),
+            Value::Bool(claude_account_ready),
+        );
         flags.insert(
             "claude_subscription".to_string(),
             claude_subscription
@@ -231,4 +242,94 @@ pub(crate) fn runtime_detect_row(
         "replacement": dep.map(|d| d.replacement),
         "remove_in": dep.map(|d| d.remove_in),
     })
+}
+
+/// Subscription readiness is independent of CLI login and API-key accounts.
+fn any_usable_claude_oauth(rows: &[duduclaw_agent::account_rotator::AccountStatus]) -> bool {
+    rows.iter().any(|row| {
+        row.provider == "anthropic"
+            && row.auth_method == "oauth"
+            && row.is_healthy
+            && row.auth_dead_strikes == 0
+            && row.probe_failures == 0
+    })
+}
+
+#[cfg(test)]
+mod claude_account_ready_tests {
+    use super::any_usable_claude_oauth;
+    use duduclaw_agent::account_rotator::AccountStatus;
+
+    fn healthy_oauth() -> AccountStatus {
+        AccountStatus {
+            provider: "anthropic".into(),
+            auth_method: "oauth".into(),
+            is_healthy: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn healthy_oauth_is_ready() {
+        assert!(any_usable_claude_oauth(&[healthy_oauth()]));
+    }
+
+    #[test]
+    fn auth_dead_is_not_ready() {
+        let row = AccountStatus {
+            auth_dead_strikes: 1,
+            ..healthy_oauth()
+        };
+        assert!(!any_usable_claude_oauth(&[row]));
+    }
+
+    #[test]
+    fn probe_failure_is_not_ready() {
+        let row = AccountStatus {
+            probe_failures: 1,
+            ..healthy_oauth()
+        };
+        assert!(!any_usable_claude_oauth(&[row]));
+    }
+
+    #[test]
+    fn unhealthy_is_not_ready() {
+        let row = AccountStatus {
+            is_healthy: false,
+            ..healthy_oauth()
+        };
+        assert!(!any_usable_claude_oauth(&[row]));
+    }
+
+    #[test]
+    fn api_key_is_not_ready() {
+        let row = AccountStatus {
+            auth_method: "apikey".into(),
+            ..healthy_oauth()
+        };
+        assert!(!any_usable_claude_oauth(&[row]));
+    }
+
+    #[test]
+    fn other_provider_oauth_is_not_ready() {
+        let row = AccountStatus {
+            provider: "openai".into(),
+            ..healthy_oauth()
+        };
+        assert!(!any_usable_claude_oauth(&[row]));
+    }
+
+    #[test]
+    fn empty_pool_is_not_ready() {
+        assert!(!any_usable_claude_oauth(&[]));
+    }
+
+    #[test]
+    fn one_usable_account_is_enough() {
+        let unhealthy = AccountStatus {
+            is_healthy: false,
+            ..healthy_oauth()
+        };
+        assert!(any_usable_claude_oauth(&[unhealthy, healthy_oauth()]));
+    }
 }

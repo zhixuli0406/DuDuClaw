@@ -13,7 +13,9 @@
 //!   mcp-proxy` for a stdio server, DuDuClaw's bridge for a remote one; a
 //!   direct URL entry is removed (audited). The proxy's env (identity
 //!   with its per-spawn MAC, the MCP credential, the upstream env inline in
-//!   `DUDUCLAW_MCP_PROXY_ENV`) is handed to the child process only; nothing
+//!   `DUDUCLAW_MCP_PROXY_ENV`) is handed to the child process only. Secret
+//!   references stay references here; only the proxy resolves them immediately
+//!   before starting the upstream. Nothing
 //!   is written to disk. The child starts from the agent-CLI allowlisted
 //!   environment (`McpClient::connect_scrubbed`), not the gateway's.
 //! - Explore lane: mounted, with `DUDUCLAW_LANE=explore` in each child's
@@ -188,6 +190,20 @@ mod tests {
         )
         .unwrap();
         (home, dir)
+    }
+
+    #[tokio::test]
+    async fn secret_refs_reach_only_the_proxy_for_resolution() {
+        let (home, dir) = employee_with_broker();
+        let path = dir.join(".mcp.json");
+        let raw = std::fs::read_to_string(&path).unwrap().replace("\"pw\"", "\"secret://mcp/masterlink/ML_PASSWORD\"");
+        std::fs::write(path, raw).unwrap();
+        let servers = servers_for_tool_loop("trader", home.path(), &dir, &[]).await.unwrap();
+        assert_eq!(servers[0].args[0], "mcp-proxy");
+        let blob = servers[0].env.iter().find(|(key, _)| key == duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_VAR).unwrap();
+        let env: serde_json::Value = serde_json::from_str(&blob.1).unwrap();
+        assert_eq!(env["ML_PASSWORD"], "secret://mcp/masterlink/ML_PASSWORD");
+        assert!(!servers[0].args.iter().any(|arg| arg.contains("secret://")));
     }
 
     /// The read-only lane reaches the proxy's environment, so it lists and

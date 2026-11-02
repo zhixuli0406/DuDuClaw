@@ -144,18 +144,33 @@ impl UserDb {
     /// transaction: a manager that fails the [`Self::set_manager`] checks
     /// means no account is created at all.
     pub fn create_user_with(&self, new: &NewUser<'_>) -> Result<User, UserWriteError> {
+        self.create_user_with_credentials(new, false)
+    }
+
+    /// Create an invitation-only account. An empty stored hash is not a valid
+    /// Argon2 hash, so no password (including an empty one) can authenticate.
+    /// The supplied `NewUser.password` is deliberately ignored.
+    pub fn create_invited_user_with(&self, new: &NewUser<'_>) -> Result<User, UserWriteError> {
+        self.create_user_with_credentials(new, true)
+    }
+
+    fn create_user_with_credentials(&self, new: &NewUser<'_>, invite: bool) -> Result<User, UserWriteError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let password_hash = hash_password(new.password).map_err(UserWriteError::Other)?;
+        let password_hash = if invite {
+            String::new()
+        } else {
+            hash_password(new.password).map_err(UserWriteError::Other)?
+        };
         let department = clean_department(new.department);
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(other)?;
         tx.execute(
-            "INSERT INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at, department)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)",
-            params![id, new.email, new.display_name, password_hash, new.role.to_string(), now, department],
+            "INSERT INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at, department, must_change_password)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7, ?8)",
+            params![id, new.email, new.display_name, password_hash, new.role.to_string(), now, department, invite],
         )
         .map_err(|e| UserWriteError::Other(format!("failed to create user: {e}")))?;
         if let Some(m) = new.manager {

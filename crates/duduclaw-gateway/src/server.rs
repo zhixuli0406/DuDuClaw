@@ -1,4 +1,6 @@
 mod data_exports_http;
+#[path = "server_invites.rs"]
+mod server_invites;
 #[cfg(test)]
 mod data_exports_http_tests;
 #[cfg(test)]
@@ -188,6 +190,66 @@ struct AppState {
     home_dir: std::path::PathBuf,
 }
 
+/// Check any existing identity-store entry before schema initialization can
+/// create a symlink target and obscure the original unreadable policy state.
+fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<(), String> {
+    match std::fs::symlink_metadata(home.join("users.db")) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            crate::mfa::boot_policy(home, personal).map(|_| ())
+        }
+        Ok(_) => Err("MFA policy state unavailable: users.db must be a regular file, not a symlink or special file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_policy_precheck_tests {
+    use super::precheck_identity_policy;
+
+    #[test]
+    fn dangling_identity_symlink_refuses_before_database_initialization() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("missing-users.db");
+        let link = home.path().join("users.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        for personal in [false, true] {
+            let error = precheck_identity_policy(home.path(), personal).unwrap_err();
+            assert!(error.contains("MFA policy state unavailable"), "{error}");
+        }
+        assert!(!target.exists(), "precheck must not create the symlink target");
+        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn absent_identity_store_allows_fresh_install_without_creating_database() {
+        let home = tempfile::tempdir().unwrap();
+        for personal in [false, true] {
+            precheck_identity_policy(home.path(), personal).unwrap();
+        }
+        assert!(!home.path().join("users.db").exists());
+    }
+
+    #[test]
+    fn identity_directory_and_existing_symlink_refuse_in_all_editions() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("users.db");
+        std::fs::create_dir(&path).unwrap();
+        for personal in [false, true] {
+            assert!(precheck_identity_policy(home.path(), personal).is_err());
+        }
+        std::fs::remove_dir(&path).unwrap();
+        let target = home.path().join("existing-users.db");
+        std::fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        for personal in [false, true] {
+            assert!(precheck_identity_policy(home.path(), personal).is_err());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+    }
+}
+
 /// Start the WebSocket RPC gateway and block until it shuts down.
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
     // Initialise the log broadcast channel (must happen before subscribers connect).
@@ -214,6 +276,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
 
     let home_dir = config.home_dir.clone();
+    // Resolve once, before config provisioning; persist and bind this same
+    // validated address instead of interpolating environment strings into TOML.
+    if config.port == 0 {
+        return Err(duduclaw_core::error::DuDuClawError::Gateway(
+            "gateway port must be between 1 and 65535".into(),
+        ));
+    }
+    let listener_addr = tokio::net::lookup_host((config.bind.as_str(), config.port))
+        .await
+        .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?
+        .next()
+        .ok_or_else(|| duduclaw_core::error::DuDuClawError::Gateway("gateway bind resolved to no address".into()))?;
+
 
     // ── B5 (OS security line P0): boot event ──────────────────────────────
     // One `os_boot` row per gateway process start, chained (B1) into
@@ -378,46 +453,37 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let extension = config.extension.clone();
     let edition_override = config.edition;
-    {
-        // Startup-time best-effort resolution for the boot log (license tier
-        // may not be loaded yet; the live value is resolved per-request in
-        // `MethodHandler::resolve_edition_profile`).
-        let boot_edition = duduclaw_core::EditionProfile::resolve(
-            std::env::var("DUDUCLAW_EDITION").ok().as_deref(),
-            edition_override.map(|e| e.as_str()),
-            None,
-        );
-        info!("edition_profile={}", boot_edition.as_str());
-    }
-
-    // Provision the internal MCP API key as early as possible (before any
-    // child spawn) and record it via `set_internal_mcp_api_key`, from where
-    // `mcp_forward_env_vars()` folds it into every MCP env assembly point
-    // (per-runtime MCP config writers, `.mcp.json` template, tool-loop
-    // client). Without this, the M6 fail-closed `mcp-server` auth (v1.31)
-    // kills the tool surface of every runtime whose CLI spawns MCP children
-    // with a sanitized env (the Grok "查 odoo 不行" incident). An
-    // operator-provided env key always wins; provisioning failure is
-    // warn-not-fatal (status quo: no key).
-    if std::env::var(duduclaw_core::ENV_MCP_API_KEY)
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
-        match crate::mcp_internal_key::ensure_internal_mcp_key(&home_dir) {
-            Ok(key) => {
-                duduclaw_core::set_internal_mcp_api_key(key);
-                info!(
-                    "internal MCP API key active for this gateway (spawned MCP children authenticate)"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "internal MCP key provisioning failed — CLI-spawned duduclaw \
-                     mcp-server children will fail auth unless DUDUCLAW_MCP_API_KEY \
-                     is provided in the environment"
-                );
-            }
+    let boot_edition = duduclaw_core::EditionProfile::resolve(
+        std::env::var("DUDUCLAW_EDITION").ok().as_deref(),
+        edition_override.map(|e| e.as_str()),
+        None,
+    );
+    info!("edition_profile={}", boot_edition.as_str());
+    // Do not let schema initialization hide an unreadable/missing policy
+    // table in an existing non-Personal identity store.
+    precheck_identity_policy(&home_dir, boot_edition.is_personal())
+        .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
+    // Initialize the identity schema before reading its durable MFA boundary.
+    // This also makes a fresh non-Personal install distinguishable from an
+    // existing unreadable identity store; initialization failures abort boot.
+    let user_db_path = home_dir.join("users.db");
+    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!(
+            "Failed to initialize user database: {e}"
+        ))
+    })?);
+    let env_key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).ok();
+    match crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+        &home_dir, listener_addr, boot_edition.is_personal(), env_key.as_deref(),
+    ) {
+        Ok(key) => {
+            duduclaw_core::set_internal_mcp_api_key(key);
+            info!("internal MCP API key registered for this gateway");
+        }
+        Err(error) => {
+            // No fallback config write. MFA reload remains degraded if its
+            // durable boundary/config cannot be read.
+            tracing::warn!(%error, "internal MCP key provisioning failed");
         }
     }
 
@@ -835,12 +901,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     computer_use_sessions.spawn_background();
 
     // ── Initialize user database & JWT ───────────────────────
-    let user_db_path = home_dir.join("users.db");
-    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
-        duduclaw_core::error::DuDuClawError::Gateway(format!(
-            "Failed to initialize user database: {e}"
-        ))
-    })?);
     crate::mfa::reload_policy(&home_dir);
     // Establish the non-retroactive window before any channel accepts turns.
     handler.resolve_edition_profile().await;
@@ -1575,7 +1635,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // 3. Non-existent binary (e.g., stale `duduclaw-pro`) → fixes it
     {
         let agents_dir = home_dir.join("agents");
-        let fixed = duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all(&agents_dir);
+        // Backup and seal legacy third-party env before any config repair.
+        let migrated = duduclaw_agent::mcp_secret_migration::migrate_all(&home_dir);
+        if migrated.migrated > 0 {
+            info!(count = migrated.migrated, "Moved third-party MCP env into encrypted employee stores");
+        }
+        let fixed = if migrated.scan_complete {
+            duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all_except(&agents_dir, &migrated.failed)
+        } else {
+            // No second sweep may rewrite a config the migration could not inspect.
+            0
+        };
         if fixed > 0 {
             info!(
                 count = fixed,
@@ -2417,6 +2487,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // ── REST API endpoints for authentication ────────────────
     let auth_router = Router::new()
         .route("/api/login", post(handle_login))
+        .route("/api/invite/check", post(server_invites::check_invite))
+        .route("/api/invite/redeem", post(server_invites::post_invite))
         .route("/api/otp/request", post(handle_otp_request))
         .route("/api/otp/verify", post(handle_otp_verify))
         .route("/api/mfa/verify", post(server_mfa::verify))
@@ -3029,7 +3101,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::decision_gate::decision_surface_gate,
     ));
 
-    let addr = format!("{}:{}", config.bind, config.port);
+    let addr = listener_addr;
     info!("boot: all background subsystems wired — binding HTTP");
     info!("Gateway starting on {}", addr);
 
@@ -3868,6 +3940,13 @@ async fn handle_me(
     };
 
     let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
+    let primary = match state.user_db.primary_agent(&user.id) {
+        Ok(value) => value,
+        Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "unable to read user preference"}))).into_response(),
+    };
+    let mut user = serde_json::json!(user);
+    user["primary_agent_id"] = serde_json::json!(primary);
 
     Json(serde_json::json!({
         "user": user,
@@ -15531,6 +15610,45 @@ async fn handle_stt(
     }
 }
 
+/// Bounded sliding windows: at most 10,000 users and 30 timestamps per user.
+#[derive(Default)]
+struct TtsRateLimiter {
+    users: HashMap<String, std::collections::VecDeque<Instant>>,
+}
+
+impl TtsRateLimiter {
+    fn take(&mut self, user_id: &str, now: Instant) -> bool {
+        let window = std::time::Duration::from_secs(60);
+        self.users.retain(|_, requests| {
+            while requests.front().is_some_and(|at| now.duration_since(*at) >= window) {
+                requests.pop_front();
+            }
+            !requests.is_empty()
+        });
+        if self.users.len() >= 10_000 && !self.users.contains_key(user_id) { return false; }
+        let requests = self.users.entry(user_id.to_string()).or_default();
+        if requests.len() >= 30 { return false; }
+        requests.push_back(now);
+        true
+    }
+}
+
+static TTS_RATE_LIMITER: std::sync::LazyLock<Mutex<TtsRateLimiter>> =
+    std::sync::LazyLock::new(|| Mutex::new(TtsRateLimiter::default()));
+static TTS_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+fn check_tts_rate_limit(user_id: &str) -> bool {
+    TTS_RATE_LIMITER.lock().map(|mut limiter| limiter.take(user_id, Instant::now())).unwrap_or(false)
+}
+
+fn tts_busy_response() -> axum::response::Response {
+    (
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "60")],
+        Json(serde_json::json!({ "error": "語音合成請求過多，請稍後再試。" })),
+    ).into_response()
+}
+
 #[derive(serde::Deserialize)]
 struct TtsRequestBody {
     text: String,
@@ -15540,7 +15658,7 @@ struct TtsRequestBody {
 
 /// POST /api/tts — synthesize speech for `text`, returning audio bytes.
 ///
-/// Reuses `tts.rs` (edge-tts / MiniMax / OpenAI / Piper). The provider strategy
+/// Reuses `tts.rs` (Kokoro / Azure / MiniMax / OpenAI / Piper). The provider strategy
 /// follows `inference.toml [voice] tts_provider`. When TTS is explicitly
 /// disabled (or no provider is available) this returns HTTP 501 so the client
 /// can quietly turn its play toggle off.
@@ -15549,11 +15667,13 @@ async fn handle_tts(
     headers: axum::http::HeaderMap,
     Json(req): Json<TtsRequestBody>,
 ) -> axum::response::Response {
-    use crate::tts::{TtsProvider, TtsRouter, TtsStrategy};
+    use crate::tts::{TtsProvider, TtsRouter};
 
-    if let Err(resp) = require_bearer(&state, &headers) {
-        return resp;
-    }
+    let caller = match knowledge_caller(&state, &headers) {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    if !check_tts_rate_limit(&caller.user_id) { return tts_busy_response(); }
 
     let text = req.text.trim();
     if text.is_empty() {
@@ -15564,63 +15684,29 @@ async fn handle_tts(
             .into_response();
     }
 
-    // Read [voice] tts_provider / tts_voice from inference.toml (where the
-    // dashboard Voice tab persists them).
-    let (tts_provider, cfg_voice) = {
-        let path = state.home_dir.join("inference.toml");
-        let table: toml::Table = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .and_then(|c| c.parse().ok())
-            .unwrap_or_default();
-        let voice = table
-            .get("voice")
-            .and_then(|v| v.as_table())
-            .cloned()
-            .unwrap_or_default();
-        (
-            voice
-                .get("tts_provider")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase(),
-            voice
-                .get("tts_voice")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        )
+    if req.text.chars().count() > crate::tts::MAX_TTS_TEXT_CHARS {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "TTS text exceeds the 5000 characters limit" })),
+        ).into_response();
+    }
+    let _slot = match tokio::time::timeout(std::time::Duration::from_secs(10), TTS_SLOTS.acquire()).await {
+        Ok(Ok(slot)) => slot,
+        _ => return tts_busy_response(),
     };
 
-    // Explicit opt-out → 501 (client closes its play toggle).
-    if matches!(tts_provider.as_str(), "none" | "off" | "disabled") {
+    let router = TtsRouter::for_home(&state.home_dir);
+    if !router.is_available() {
         return (
             axum::http::StatusCode::NOT_IMPLEMENTED,
             Json(serde_json::json!({
                 "error": "尚未啟用語音朗讀（TTS）。請至「設定 → 語音」選擇語音供應商後再試。"
             })),
-        )
-            .into_response();
+        ).into_response();
     }
-
-    let strategy = match tts_provider.as_str() {
-        "edge-tts" | "edge" => TtsStrategy::EdgeOnly,
-        "minimax" | "openai-tts" | "openai" => TtsStrategy::CloudBest,
-        _ => TtsStrategy::LocalFirst,
-    };
-
-    let models_dir = state.home_dir.join("models");
-    let router = TtsRouter::auto_detect_for_home(&state.home_dir, &models_dir, strategy);
-
-    let voice = if req.voice.trim().is_empty() {
-        cfg_voice
-    } else {
-        req.voice.trim().to_string()
-    };
-
-    match router.synthesize(text, &voice).await {
+    let voice = req.voice.trim();
+    let text = crate::markdown_render::to_line_plain(text);
+    match router.synthesize(&text, voice).await {
         Ok(audio) if !audio.is_empty() => {
             // Sniff the container so the browser <audio> element decodes it.
             let ct = if audio.starts_with(b"RIFF") {
@@ -18918,3 +19004,28 @@ mod live_events_socket_tests {
 
 #[path = "server_mfa.rs"]
 mod server_mfa;
+
+#[cfg(test)]
+mod tts_limit_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_31st_request_and_keeps_users_independent() {
+        let mut limiter = TtsRateLimiter::default();
+        let now = Instant::now();
+        for _ in 0..30 { assert!(limiter.take("user-a", now)); }
+        assert!(!limiter.take("user-a", now));
+        assert!(limiter.take("user-b", now));
+        assert!(limiter.take("user-a", now + std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn limiter_refuses_new_keys_at_capacity_without_evicting_active_users() {
+        let mut limiter = TtsRateLimiter::default();
+        let now = Instant::now();
+        for id in 0..10_000 { assert!(limiter.take(&format!("user-{id}"), now)); }
+        assert!(!limiter.take("extra", now));
+        assert!(limiter.take("user-0", now));
+        assert!(limiter.take("extra", now + std::time::Duration::from_secs(60)));
+    }
+}

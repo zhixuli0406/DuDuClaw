@@ -17,6 +17,9 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/mds';
+import { toast } from '@/lib/toast';
+import type { UserInviteResult } from '@/lib/api';
+import { InviteEmailPreview } from './InviteControls';
 import { ManagerSelect } from './ManagerSelect';
 import { DialogField, DepartmentInput, roleOptions, useDepartmentNames, userWriteError } from './dialog-common';
 
@@ -27,12 +30,13 @@ export function CreateUserDialog({
 }: {
   users: UserDetail[];
   onClose: () => void;
-  onCreated: () => void;
+  onCreated: (invite?: UserInviteResult) => void;
 }) {
   const intl = useIntl();
   const [email, setEmail] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
+  const [invite, setInvite] = useState(false);
   const [userRole, setUserRole] = useState('employee');
   const [department, setDepartment] = useState('');
   const [managerId, setManagerId] = useState('');
@@ -51,18 +55,19 @@ export function CreateUserDialog({
       setError(intl.formatMessage({ id: 'users.error.invalidEmail' }));
       return;
     }
-    if (password.length < 8) {
+    if (!invite && password.length < 8) {
       setError(intl.formatMessage({ id: 'users.error.passwordTooShort' }));
       return;
     }
     setSubmitting(true);
     try {
-      await api.users.create({
-        email, display_name: displayName, password, role: userRole,
+      const result = await api.users.create({
+        email, display_name: displayName, ...(invite ? { invite: true, public_url: window.location.origin } : { password }), role: userRole,
         ...(department.trim() ? { department: department.trim() } : {}),
         ...(managerId ? { manager_user_id: managerId } : {}),
       });
-      onCreated();
+      if (invite) toast[result.invite?.sent ? 'success' : 'info'](intl.formatMessage({ id: result.invite?.sent ? 'users.invite.sent' : 'users.invite.notSent' }));
+      onCreated(result.invite);
     } catch (e) {
       setError(userWriteError(e, intl));
     } finally {
@@ -95,14 +100,16 @@ export function CreateUserDialog({
               onChange={(e) => setDisplayName(e.target.value)}
             />
           </DialogField>
-          <DialogField label={intl.formatMessage({ id: 'users.field.password' })}>
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={invite} onChange={e => { setInvite(e.target.checked); setPassword(''); }} />{intl.formatMessage({ id: 'users.invite.send' })}</label>
+          {invite && <InviteEmailPreview email={email} />}
+          {!invite && <DialogField label={intl.formatMessage({ id: 'users.field.password' })}>
             <Input
               type="password"
               placeholder={intl.formatMessage({ id: 'users.field.password' })}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
             />
-          </DialogField>
+          </DialogField>}
           <DialogField label={intl.formatMessage({ id: 'users.col.role' })}>
             <Select value={userRole} onValueChange={(v) => setUserRole(String(v))}>
               <SelectTrigger className="w-full">
@@ -135,7 +142,7 @@ export function CreateUserDialog({
           <Button
             variant="brand"
             onClick={handleSubmit}
-            disabled={submitting || !email || !displayName || !password}
+            disabled={submitting || !email || !displayName || (!invite && !password)}
           >
             {intl.formatMessage({ id: 'common.create' })}
           </Button>

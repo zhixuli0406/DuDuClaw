@@ -17,6 +17,7 @@ use super::{io_err, safe_zip};
 pub(crate) struct ResolvedSource {
     pub dir: PathBuf,
     pub zip: Option<safe_zip::ExtractSummary>,
+    pub original_dir: Option<PathBuf>,
 }
 
 /// Resolve `source` to a directory containing the pack. Handles a plain
@@ -35,7 +36,8 @@ pub(crate) async fn resolve_source(source: &str, staging: &Path) -> Result<PathB
 const SINGLE_FILE_EXTS: &[&str] = &["md", "yml", "yaml"];
 
 pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<ResolvedSource> {
-    let unpacked = |dir: PathBuf, zip: safe_zip::ExtractSummary| ResolvedSource { dir, zip: Some(zip) };
+    private_staging(staging)?;
+    let unpacked = |dir: PathBuf, zip: safe_zip::ExtractSummary| ResolvedSource { dir, zip: Some(zip), original_dir: None };
     // WP2.5: BRAT-style side door — `github:user/repo[@branch]` installs the
     // repo's default-branch archive directly. Unregistered and unreviewed;
     // say so honestly, then let the normal fences (zip fence, content scan,
@@ -55,12 +57,18 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
     // WP2.2 R2/R3: `registry:<slug>` — resolve via the pack registry with
     // client-side sha256 (always) + minisign (code lane) verification.
     if let Some(slug) = source.strip_prefix("registry:") {
-        let (_entry, archive) = super::registry::fetch_verified_archive(slug.trim()).await?;
+        let (mut entry, archive, signature) = super::registry::fetch_verified_archive(slug.trim()).await?;
         std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
         let zip_path = staging.join("download.zip");
         std::fs::write(&zip_path, &archive).map_err(|e| io_err(format!("寫入下載檔失敗: {e}")))?;
         let unpack = staging.join("unpacked");
         let z = safe_zip::extract_to(&zip_path, &unpack)?;
+        // A compromised index cannot hide code by clearing its contains flags.
+        if super::registry::extracted_code_lane(&unpack)? {
+            entry.contains.skills = true;
+            super::registry::verify_registry_signature(&entry, &archive, signature.as_deref(),
+                &duduclaw_core::publishers::TrustStore::load(&crate::duduclaw_home()).map_err(super::bad_content)?)?;
+        }
         return Ok(unpacked(unpack, z));
     }
     if source.starts_with("http://") || source.starts_with("https://") {
@@ -77,7 +85,14 @@ pub(crate) async fn resolve_source_full(source: &str, staging: &Path) -> Result<
         return Err(import_err("import.source_missing", json!({}), format!("來源不存在: {source}")));
     }
     if path.is_dir() {
-        return Ok(ResolvedSource { dir: path, zip: None });
+        if std::fs::symlink_metadata(&path).map_err(|e| io_err(e.to_string()))?.file_type().is_symlink() {
+            return Err(super::cfg_err("pack source contains a symlink".into()));
+        }
+        let path = path.canonicalize().map_err(|e| io_err(e.to_string()))?;
+        let basename = path.file_name().ok_or_else(|| super::cfg_err("pack source needs a directory name".into()))?;
+        let snapshot = staging.join("snapshot").join(basename);
+        snapshot_directory(&path, &snapshot)?;
+        return Ok(ResolvedSource { dir: snapshot, zip: None, original_dir: Some(path) });
     }
     let ext = path
         .extension()
@@ -126,7 +141,7 @@ fn stage_single_file(path: &Path, staging: &Path) -> Result<ResolvedSource> {
     let dir = staging.join("unpacked");
     std::fs::create_dir_all(&dir).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
     std::fs::copy(path, dir.join(&name)).map_err(|e| io_err(format!("複製來源檔失敗: {e}")))?;
-    Ok(ResolvedSource { dir, zip: None })
+    Ok(ResolvedSource { dir, zip: None, original_dir: None })
 }
 
 /// Download a URL to `dest`, capped at [`safe_zip::MAX_UNPACK_BYTES`].
@@ -153,3 +168,86 @@ async fn download_zip(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+
+
+/// Keep the verified bytes independent of later edits to the caller's source tree.
+fn private_staging(staging: &Path) -> Result<()> {
+    std::fs::create_dir_all(staging).map_err(|e| io_err(e.to_string()))?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o700)).map_err(|e| io_err(e.to_string()))?;
+    }
+    Ok(())
+}
+fn snapshot_directory(source: &Path, destination: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+    fn copy(source: &Path, dest: &Path, total: &mut u64, count: &mut usize, depth: usize) -> Result<()> {
+        if depth > 64 { return Err(super::cfg_err("pack source nesting exceeds limit".into())); }
+        let meta = std::fs::symlink_metadata(source).map_err(|e| io_err(e.to_string()))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() { return Err(super::cfg_err("pack source contains a symlink or special directory".into())); }
+        std::fs::create_dir_all(dest).map_err(|e| io_err(e.to_string()))?;
+        for entry in std::fs::read_dir(source).map_err(|e| io_err(e.to_string()))? {
+            let entry = entry.map_err(|e| io_err(e.to_string()))?;
+            *count += 1;
+            if *count > 10_000 { return Err(super::cfg_err("pack source exceeds file limit".into())); }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| io_err(e.to_string()))?;
+            if meta.file_type().is_symlink() { return Err(super::cfg_err("pack source contains a symlink".into())); }
+            let target = dest.join(entry.file_name());
+            if meta.is_dir() { copy(&path, &target, total, count, depth + 1)?; continue; }
+            if !meta.is_file() { return Err(super::cfg_err("pack source contains a special file".into())); }
+            let remaining = safe_zip::MAX_UNPACK_BYTES.saturating_sub(*total);
+            if meta.len() > remaining { return Err(super::cfg_err("pack source exceeds size limit".into())); }
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)] {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let file = options.open(&path).map_err(|e| io_err(e.to_string()))?;
+            if !file.metadata().map_err(|e| io_err(e.to_string()))?.is_file() { return Err(super::cfg_err("pack source changed file type".into())); }
+            let mut bytes = Vec::new();
+            file.take(remaining + 1).read_to_end(&mut bytes).map_err(|e| io_err(e.to_string()))?;
+            if bytes.len() as u64 > remaining { return Err(super::cfg_err("pack source exceeds size limit".into())); }
+            *total += bytes.len() as u64;
+            let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(target).map_err(|e| io_err(e.to_string()))?;
+            output.write_all(&bytes).map_err(|e| io_err(e.to_string()))?;
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                // Preserve ordinary script permissions, never privileged mode bits.
+                output.set_permissions(std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777))
+                    .map_err(|e| io_err(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+    copy(source, destination, &mut 0, &mut 0, 0)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    #[tokio::test]
+    async fn local_pack_snapshot_survives_source_changes() {
+        let source = tempfile::tempdir().unwrap();
+        let staging_parent = tempfile::tempdir().unwrap();
+        let staging = staging_parent.path().join("private");
+        std::fs::write(source.path().join("pack.toml"), "original").unwrap();
+        let resolved = resolve_source_full(source.path().to_str().unwrap(), &staging).await.unwrap();
+        std::fs::write(source.path().join("pack.toml"), "changed after verification").unwrap();
+        assert_eq!(std::fs::read_to_string(resolved.dir.join("pack.toml")).unwrap(), "original");
+        assert_eq!(resolved.original_dir, Some(source.path().canonicalize().unwrap()));
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_symlinks() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", source.path().join("link")).unwrap();
+        assert!(snapshot_directory(source.path(), &destination.path().join("copy")).is_err());
+    }
+}

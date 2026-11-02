@@ -126,6 +126,9 @@ fn read_recent_rows(home_dir: &Path, agent_id: &str, max: usize) -> Vec<ActionRo
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if v.get("usage_only").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
         if v.get("agent_id").and_then(|x| x.as_str()) != Some(agent_id) {
             continue;
         }

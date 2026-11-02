@@ -89,6 +89,7 @@ mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
 mod computer_profiles_cmd;
+mod publishers_cmd;
 mod computer_workspaces_cmd; // P2-C: `duduclaw computer-workspaces` (operator-only)
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
@@ -2592,6 +2593,12 @@ enum MaintenanceCommands {
         command: pack_cmd::PackCommands,
     },
 
+    /// Manage pinned publisher keys. Changes require dashboard Admin approval.
+    Publishers {
+        #[command(subcommand)]
+        command: publishers_cmd::PublisherCommands,
+    },
+
     /// Manage expert packs: portable bundles of a team (agents + hierarchy),
     /// skills, wiki SOPs, prompts and channel hints. Install native
     /// `expert.toml` packs or import Claude Code plugins / Agent Skills.
@@ -3564,6 +3571,9 @@ enum ServiceCommands {
     /// Stop the background service
     Stop,
 
+    /// Restart the background service
+    Restart,
+
     /// Show service status
     Status,
 
@@ -4113,7 +4123,7 @@ pub async fn entry_point() {
         return;
     }
     // Install ring as the default rustls CryptoProvider (required for TLS WebSocket connections).
-    // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
+    // Must be called before any TLS connection is attempted (Discord, Azure Speech, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Build a layered subscriber: fmt (terminal) + file appender + BroadcastLayer (WebSocket).
@@ -5454,6 +5464,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
+            ServiceCommands::Restart => service::handle_service(service::ServiceAction::Restart).await,
             ServiceCommands::Status => {
                 service::handle_service(service::ServiceAction::Status).await
             }
@@ -5832,6 +5843,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Maintenance(MaintenanceCommands::License(license_cmd)) => license::run(license_cmd).await,
         Commands::Maintenance(MaintenanceCommands::Pack { command }) => pack_cmd::run(command).await,
+        Commands::Maintenance(MaintenanceCommands::Publishers { command }) => publishers_cmd::run(&duduclaw_home(), command).await,
         Commands::Maintenance(MaintenanceCommands::Expert { command }) => expert::run(command).await,
         Commands::Maintenance(MaintenanceCommands::WeeklyReport {
             days,
@@ -6611,6 +6623,9 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            publishers_cmd::bash_publishers_decision(command, &caller)
                         })
                         .or_else(|| {
                             computer_workspaces_cmd::bash_workspace_ops_decision(command, &caller)
@@ -9344,6 +9359,27 @@ async fn computer_use_check(home: &std::path::Path) -> (String, CheckStatus, Str
     ("電腦操作".to_string(), status, message)
 }
 
+/// Inspect configured speech providers locally without a synthesis/network probe.
+fn voice_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let router = duduclaw_gateway::tts::TtsRouter::for_home(home);
+    let providers = router.available_providers();
+    let command_configured = std::fs::read_to_string(home.join("inference.toml"))
+        .ok().and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("voice").and_then(|v| v.get("tts_provider")).and_then(|v| v.as_str()).map(str::to_string))
+        .is_some_and(|provider| provider == "command")
+        && !providers.contains(&"command");
+    let (status, message) = if providers.is_empty() {
+        (
+            CheckStatus::Warn,
+            if command_configured { "TTS 指令未設定或缺少 {output}；請至儀表板「設定 → 語音」修正。".into() }
+            else { "尚未設定可用的語音服務；請至儀表板「設定 → 語音」下載 Kokoro 本機模型，或設定雲端供應商。".into() },
+        )
+    } else {
+        (CheckStatus::Pass, format!("可用供應商：{}（未連線驗證）", providers.join("、")))
+    };
+    ("語音回覆".into(), status, message)
+}
+
 /// `duduclaw doctor` row 「電腦操作工作區」 (P2-C design §8.5).
 async fn computer_workspaces_check(home: &std::path::Path) -> (String, CheckStatus, String) {
     let (status, message) = duduclaw_gateway::computer_workspaces::doctor::check(home).await;
@@ -10451,6 +10487,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);
     checks.push(credential_audit_chain_check(&home));
+    checks.push(voice_check(&home));
 
     // Print results
     let mut has_failure = false;
@@ -12786,6 +12823,9 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
         println!("  {}", result.message);
         if result.needs_restart {
             println!("\n  Please restart DuDuClaw to use the new version.");
+        }
+        if let Some(hint) = result.restart_hint {
+            println!("  Restart hint: {hint}");
         }
         Ok(())
     } else {

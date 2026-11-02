@@ -157,6 +157,10 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_users_list()).await
             }
+            "users.invite" | "users.invite_status" => {
+                require_admin!();
+                boxed_frame(|| self.handle_user_invites(method, params, ctx)).await
+            }
             "users.create" => {
                 require_admin!();
                 boxed_frame(|| self.handle_users_create(params, ctx)).await
@@ -181,6 +185,7 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_users_offboard(params, ctx)).await
             }
+            "users.set_primary_agent" => boxed_frame(|| self.handle_users_set_primary_agent(params, ctx)).await,
             "users.me" => boxed_frame(|| self.handle_users_me(ctx)).await,
             // Self-service: any logged-in user changes their OWN password. Not
             // admin-gated on purpose — it only ever mutates the caller's account,

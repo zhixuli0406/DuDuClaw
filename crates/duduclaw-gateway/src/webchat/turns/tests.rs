@@ -173,6 +173,8 @@ async fn cancel_kills_process_records_session_and_withdraws_own_approval() {
         panic!("expected text")
     };
     let terminal: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(sessions.webchat_history("session").await.unwrap().iter()
+        .all(|m| m.notice_kind.is_none()));
     assert_eq!(terminal["code"], "cancelled");
     assert_eq!(terminal["delegations_cancelled"], 1);
     assert_eq!(terminal, serde_json::json!({"type":"error", "code":"cancelled", "message":"Turn cancelled",
@@ -291,15 +293,38 @@ async fn stalled_socket_ack_and_writer_are_bounded() {
 async fn panic_emits_correlated_terminal_frame_after_cleanup() {
     let (tx, mut rx) = outbound_channel();
     let sink = TurnSink::new(tx, "s", Some("conv".into()), "m");
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let sessions = crate::session::SessionManager::new(file.path()).unwrap();
+    sessions.get_or_create("s", "bot").await.unwrap();
     supervise(&sink, async {
         crate::channel_reply::with_delivery_cleanup(async { panic!("injected turn panic") }).await;
-    }).await;
+    }, || persist_failure(&sessions, "s", "Internal turn error")).await;
+    let stored = sessions.webchat_history("s").await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].notice_kind.as_deref(), Some("turn_failure"));
+    assert_eq!(stored[0].message.content, "Internal turn error");
     let Message::Text(text) = rx.recv().await.unwrap().message else { panic!("text") };
     let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(frame["code"], "internal_error");
     assert_eq!(frame["session_id"], "s");
     assert_eq!(frame["conv"], "conv");
     assert_eq!(frame["msg_id"], "m");
+}
+
+#[tokio::test]
+async fn panic_frame_survives_failure_notice_write_error() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let sessions = crate::session::SessionManager::new(file.path()).unwrap();
+    let conn = rusqlite::Connection::open(file.path()).unwrap();
+    conn.execute("DROP TABLE session_messages", []).unwrap();
+    let (tx, mut rx) = outbound_channel();
+    let sink = TurnSink::new(tx, "s", None, "m");
+    supervise(&sink, async { panic!("injected panic") },
+        || persist_failure(&sessions, "s", "Internal turn error")).await;
+    let Message::Text(text) = rx.recv().await.unwrap().message else { panic!("text") };
+    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(frame["code"], "internal_error");
+    assert_eq!(frame["message"], "Internal turn error");
 }
 
 #[tokio::test]

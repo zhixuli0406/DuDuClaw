@@ -17,6 +17,10 @@ impl MethodHandler {
                 let mut result: Vec<Value> = Vec::new();
                 for u in &users {
                     let bindings = db.get_user_agents(&u.id).unwrap_or_default();
+                    let invite_eligible = match db.user_invite_eligible(&u.id) {
+                        Ok(eligible) => eligible,
+                        Err(_) => return super::user_invites_rpc::invite_error("invite_unavailable"),
+                    };
                     result.push(json!({
                         "id": u.id,
                         "email": u.email,
@@ -28,6 +32,7 @@ impl MethodHandler {
                         "created_at": u.created_at,
                         "updated_at": u.updated_at,
                         "last_login": u.last_login,
+                        "invite_eligible": invite_eligible,
                         "bindings": bindings,
                     }));
                 }
@@ -43,6 +48,21 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user system not initialized"),
         };
 
+        let invite = match params.get("invite") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return WsFrame::error_response("", "invite must be a boolean"),
+        };
+        let invite_base = if invite {
+            if !super::user_invites_rpc::live_admin(&db, ctx) {
+                return WsFrame::error_response("", "permission denied");
+            }
+            match self.invitation_base(&params).await {
+                Ok(base) => Some(base),
+                Err(frame) => return frame,
+            }
+        } else { None };
+
         let email = params.get("email").and_then(|v| v.as_str()).unwrap_or("");
         let display_name = params
             .get("display_name")
@@ -57,7 +77,7 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("employee");
 
-        if email.is_empty() || display_name.is_empty() || password.is_empty() {
+        if email.is_empty() || display_name.is_empty() || (!invite && password.is_empty()) {
             return WsFrame::error_response("", "email, display_name, and password are required");
         }
         // Email format validation (MEDIUM fix)
@@ -68,10 +88,10 @@ impl MethodHandler {
         if display_name.len() > 200 {
             return WsFrame::error_response("", "display_name too long (max 200 chars)");
         }
-        if password.len() < 8 {
+        if !invite && password.len() < 8 {
             return WsFrame::error_response("", "password must be at least 8 characters");
         }
-        if password.len() > 1024 {
+        if !invite && password.len() > 1024 {
             return WsFrame::error_response("", "password too long");
         }
 
@@ -110,14 +130,16 @@ impl MethodHandler {
                 (email.to_string(), display_name.to_string(), password.to_string());
             let (department, manager) = (department.map(str::to_string), manager.clone());
             tokio::task::spawn_blocking(move || {
-                db.create_user_with(&duduclaw_auth::NewUser {
+                let new = duduclaw_auth::NewUser {
                     email: &email,
                     display_name: &display_name,
                     password: &password,
                     role,
                     department: department.as_deref(),
                     manager: manager.as_deref(),
-                })
+                };
+                if invite { db.create_invited_user_with(&new) }
+                else { db.create_user_with(&new) }
             })
             .await
         };
@@ -139,7 +161,14 @@ impl MethodHandler {
                     Some(&format!("email={email}")),
                     None,
                 );
-                WsFrame::ok_response("", json!({ "user": user }))
+                if let Some(base) = invite_base {
+                    match self.create_and_send_invitation(&db, &user.id, ctx, &base).await {
+                        Ok(invite) => WsFrame::ok_response("", json!({ "user": user, "invite": invite })),
+                        Err(frame) => frame,
+                    }
+                } else {
+                    WsFrame::ok_response("", json!({ "user": user }))
+                }
             }
             Ok(Err(duduclaw_auth::UserWriteError::Org(e))) => org_error_frame(&e),
             Ok(Err(duduclaw_auth::UserWriteError::Other(e))) => WsFrame::error_response("", &e),
@@ -453,6 +482,22 @@ impl MethodHandler {
         )
     }
 
+    pub(crate) async fn handle_users_set_primary_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let agent = match params.get("agent_id") {
+            Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() && id.len() <= 256 => Some(id.as_str()),
+            _ => return WsFrame::error_response("", "agent_id must be a string or null"),
+        };
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+        match db.set_primary_agent(&ctx.user_id, agent) {
+            Ok(()) => WsFrame::ok_response("", json!({ "primary_agent_id": agent })),
+            Err(_) => WsFrame::error_response("", "agent is not bound to current user"),
+        }
+    }
+
     pub(crate) async fn handle_users_me(&self, ctx: &UserContext) -> WsFrame {
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
@@ -463,6 +508,7 @@ impl MethodHandler {
                     json!({
                         "user": {
                             "id": ctx.user_id,
+                            "primary_agent_id": null,
                             "email": ctx.email,
                             "role": ctx.role.to_string(),
                         },
@@ -475,7 +521,13 @@ impl MethodHandler {
         match db.get_user(&ctx.user_id) {
             Ok(Some(user)) => {
                 let bindings = db.get_user_agents(&user.id).unwrap_or_default();
+                let primary = match db.primary_agent(&user.id) {
+                    Ok(value) => value,
+                    Err(_) => return WsFrame::error_response("", "unable to read user preference"),
+                };
                 let setup = self.email_setup_state(&db, &user).await;
+                let mut user = json!(user);
+                user["primary_agent_id"] = json!(primary);
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -493,6 +545,7 @@ impl MethodHandler {
                 json!({
                     "user": {
                         "id": ctx.user_id,
+                            "primary_agent_id": null,
                         "email": ctx.email,
                         "role": ctx.role.to_string(),
                     },

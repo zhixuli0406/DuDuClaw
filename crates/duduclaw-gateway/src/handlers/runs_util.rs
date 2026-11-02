@@ -297,8 +297,8 @@ pub(crate) fn run_summary_to_json(r: &RunSummary, step_count: usize) -> Value {
 }
 
 /// Fetch the most recent user/assistant turns (joined to their owning agent),
-/// newest-first up to `cap`, honouring the hide/undo tombstones when those
-/// columns exist (pre-migration databases fall back to the plain query).
+/// newest-first up to `cap`. Hidden filtering is mandatory; databases without
+/// undone_at use the hidden-filtered fallback.
 pub(crate) fn query_run_msg_rows(
     conn: &rusqlite::Connection,
     agent_filter: &str,
@@ -315,12 +315,12 @@ pub(crate) fn query_run_msg_rows(
         "SELECT m.id, m.session_id, s.agent_id, m.role, substr(m.content, 1, 400), m.timestamp
          FROM session_messages m JOIN sessions s ON s.id = m.session_id
          WHERE m.role IN ('user','assistant')
-           AND (?1 = '' OR s.agent_id = ?1)
+           AND (?1 = '' OR s.agent_id = ?1) AND COALESCE(m.hidden, 0) = 0
          ORDER BY m.id DESC LIMIT ?2";
 
     let mut stmt = match conn.prepare(WITH_TOMBSTONES) {
         Ok(s) => s,
-        // Older DB without the hidden/undone_at columns.
+        // Older DB without undone_at; hidden remains mandatory.
         Err(_) => conn.prepare(PLAIN)?,
     };
     let rows = stmt.query_map(params![agent_filter, cap as i64], |row| {

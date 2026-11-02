@@ -11,11 +11,47 @@ If you are adding a tool, read
 declaration surface, not the implementation. To run the server on its own,
 without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
-## The rule: discoverable ⇔ callable
+
+## MCP credential boundaries
+
+`DUDUCLAW_` environment variables remain unchanged when MCP credentials are
+moved into the encrypted store, regardless of the server name. This does not
+make a `duduclaw-*` server trusted: only exact host-owned names reserve built-in
+slots. Effective rewritten configs replace those slots wholesale with the current
+host-generated command, arguments and env; stale keys or a different executable
+in raw JSON are never used. Raw `mcp-proxy` invocations are always refused, as are
+proxy-private env fields on third-party entries. Forked copies use the original
+employee's host-known identity and policy directory, even when the copied file
+lives elsewhere.
+
+## Local text to speech
+
+`synthesize_speech` uses providers available in the MCP process: installed local
+Kokoro or Piper models. Paid TTS keys are held only by the gateway and are not
+available to this process. Audio is returned as base64, in MP3 or WAV format
+according to the provider.
+
+## Per-employee tool list pruning
+
+In an employee's overview, Admins can open **Tool list pruning** to select a mode, inspect unused tools and estimated token savings, or restore the list while pruning is on. The selector uses the existing employee update path. The status and restore RPCs are Admin-only: `agents.tool_pruning_status {agent_id}` and `agents.tool_pruning_restore {agent_id}`. Estimates use each candidate tool's serialized definition length divided by four; they are not tokenizer measurements or measured provider savings.
+
+```toml
+# agent.toml
+[capabilities]
+tool_pruning = "shadow" # "off" | "shadow" | "on"
+```
+
+The default is `shadow`: observe and report, with the same `tools/list` response as `off`. Unknown or malformed values behave as `off` and warn once. Only `on` hides eligible tools, after all existing discovery filters. This never grants or revokes permission: a hidden tool remains callable through the existing dispatch gates. A successful hidden-tool call makes it visible again through `notifications/tools/list_changed`.
+
+The calculation reads at most the last 5 MB of `tool_calls.jsonl`. Missing or unreadable logs, and fewer than ten recorded turns, leave the list intact. A candidate must be unused across at least ten turns spanning two sessions, or five sessions. Memory, tasks, working state, messaging, approvals, wiki reads, tool discovery, Admin/unknown-effect tools and tools with active scoped task grants stay visible. A turn is a distinct host-stamped `(session_id, turn_id)` pair, not a log line. Channel calls use the conversation session and turn; dispatched work uses its own dispatch session and run (one run is one turn). Older rows without these identities do not establish turn samples, but a successful use still resets that tool’s unused window. Thresholds count the turns and sessions since each tool’s last successful use. Results are cached per process for five minutes. Restore writes an employee-specific reset marker; usage before that marker no longer contributes, so the full eligible list returns. Existing permission filters still apply.
+
+Claude CLI `minimal_context` uses `--tools` for built-in CLI tools; it does not prune MCP definitions. Its behavior is unchanged.
+
+## The rule: discovery follows authorization
 
 `tools/list` only lists the tools the calling agent can actually call right now.
-Every filter below mirrors a gate the dispatcher already enforces, so the list
-an agent reads and the calls the server accepts describe the same set.
+Authorization filters mirror the dispatcher gates. Optional per-employee pruning
+then narrows discovery only: an authorized tool can be callable while hidden.
 
 This matters for cost as much as correctness. The tool schemas are a *fixed*
 prompt cost paid on every spawn: the CLI reads `tools/list` once per session and
@@ -24,7 +60,7 @@ schema for a tool the gate would reject is paid for twice — the tokens, and th
 model planning around something it cannot use.
 
 Hiding a tool is **not** an authorization decision. Calling an unlisted tool
-still reaches the real gate and is still refused, with the gate's own message.
+still reaches the real gates, which accept or refuse it under the existing rules.
 
 ### What is filtered
 
@@ -322,7 +358,7 @@ container.
 
 ### `computer_*` — sessions run by the gateway
 
-The eight tools drive one computer-use session per employee: an isolated
+The nine tools drive one computer-use session per employee: an isolated
 container with a virtual display and a kiosk browser. The MCP server only
 forwards each call to the gateway over loopback
 (`POST /api/internal/computer-use`, signed per request); the gateway owns the
@@ -335,13 +371,18 @@ container and runs every check, so the gateway must be running. Hidden unless
 | `computer_screenshot` | none | MCP image block (PNG, masked) followed by a text block with actions used and time left. A fully masked picture is reported as such in the text, with the reason (several windows, sensitive or unreadable front window, detection failure) and the next step |
 | `computer_click` | `x`, `y` integers (required); `button` string `left`/`right`; `double` boolean | `double` is left button only |
 | `computer_type` | `text` string (required), 1–2,000 characters | Audited as a character count only |
+| `computer_login` | `credential` (required label string) | Gateway fills and submits a saved login for an allowed employee; only status and a sentence are returned |
 | `computer_key` | `key` string (required): letters, digits, `+`, `-`, `_` | e.g. `Return`, `ctrl+s` |
 | `computer_scroll` | `x`, `y` integers (required); `direction` string `up`/`down` (default `down`); `amount` integer 1–20 (default 3) | |
 | `computer_navigate` | `url` string (required) | `https://` only, host exactly on the employee's `[capabilities.computer_use_config] allowed_domains` and resolved at session start, port absent or 443, no user name or password, at most 2,000 bytes. With no allowlist the session has no network and the call is refused |
 | `computer_session_stop` | `session_id` string, optional | Removes the container |
 
+`computer_login` is the ninth session tool. An Admin creates the labeled login in **System → Security → Website login credentials**, with an HTTPS `login_url` and a non-empty allowed-employee list; passwords go in that form, never chat. Optional `allowed_paths` defaults to none and only permits exact same-origin second-step paths with a visible password input after the helper submits step one. The gateway first navigates to the saved URL through the existing navigation checks; this navigation and the login each consume one session action. The helper checks the exact origin/path and effective POST, including the selected submitter's `formmethod` in native `requestSubmit` and fallback paths and rechecks after submit handlers. It intercepts every request and redirect hop to refuse other origins, rejects non-POST queries containing a complete credential value and bypasses service workers. The MCP request carries only the label. Session start and status responses expose the caller's available labels, never usernames. Use the existing takeover flow when the result is `needs_takeover`; no OTP tool is provided. `logged_in` only means the password field disappeared. Failed cleanup (`failed_uncleared`) stops and removes the session and container and returns an error requiring a new session; navigation cannot restore it. Before removing interception, the helper tracks `Network.requestWillBeSent`, `Network.loadingFinished` and `Network.loadingFailed` to confirm requests have ended. It waits for at most three seconds and requires two quiet command barriers with no pending requests. If completion cannot be confirmed, it returns `failed_uncleared` and calls `Browser.close` while the Fetch fence is still active; the gateway then removes the session and container. Screenshots are suppressed during the call.
+
+Login is restricted to the saved origin (scheme, host, port), and form submission must use the same origin. HTTPS is required, including for localhost. Same-origin page JavaScript can read filled fields. 2FA requires a person. Rebuild the computer-use image for the new helper before use.
+
 Integer and boolean parameters also accept numeric and `"true"`/`"false"`
-strings. Click, type, key, scroll and navigate each count as one action
+strings. Click, type, login, key, scroll and navigate each count as one action
 against `max_actions` (default 50). Limits, the approval and confirmation
 rules, the network allowlist and its residual risks are in
 [Browser automation](../features/08-browser-automation.md).
@@ -522,3 +563,16 @@ new table is [deprecations.md](deprecations.md). No MCP tool is deprecated at th
 ## Declare a credential's service
 
 `credential_declare` accepts `credential_id` and `service` only. Employee notes are rejected; the service must match `^[a-z0-9][a-z0-9._-]{0,63}$` and pass credential detection. Only an authenticated employee holding that credential may declare it, through the signed gateway loopback route. An employee cannot override an Admin-set service. This tool annotates existing audit metadata; it does not retrieve a secret, grant another holder access or substitute a value into a tool call. Use **Security → Credential audit** as an Admin to review and correct records. See [Credential audit](../features/70-credential-audit.md).
+
+
+## Third-party MCP environment credentials
+
+Third-party MCP keys leave the employee's config files. `.mcp.json` stores `secret://mcp/<server>/<ENV_NAME>` references; values are encrypted in `<home>/secrets/mcp/<agent_id>.enc` with the existing `.keyfile`. All third-party `env` entries use the store except `PATH`, `HOME`, `NODE_ENV`, `LOG_LEVEL` and existing `secret://` references. DuDuClaw's own server entry and its `DUDUCLAW_*` variables are unchanged.
+
+A built-in slot must use exactly `duduclaw`, `duduclaw-pro` or the current instance key; `duduclaw-evil` is a third-party server. Rewriting replaces the entire built-in definition with the host's current canonical entry, including after MCP key rotation or an executable change. A forged built-in command cannot survive into that effective config. Raw proxy invocations remain forbidden under every name, and third-party entries cannot carry proxy-private env. Claude's existing no-flags behavior remains when no proxy purpose is active or the file contains only built-in slots; the ordinary built-in preparation path still owns their repair. Copied fork configs always regenerate built-in slots, including when gates are off, because a source project may not have passed employee preparation. Secret reads require a valid `DUDUCLAW_AGENT_TOKEN` HMAC for the store owner, even with lenient delegation settings; a default agent cannot authorize a read.
+
+The proxy resolves references for its own employee only, immediately before starting the upstream server. Missing, invalid or undecryptable references prevent that server from starting; the error names the server and variable, never the value. A config requiring secret resolution cannot fall back to direct Claude/Grok loading if proxy rewriting fails. Exports retain environment names with empty placeholders, so the importer must enter values again.
+
+At gateway boot, legacy literal env values are migrated after an encrypted backup is saved to `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc`. The encrypted store is written and read back before the config is replaced atomically. Every stage waits for a parent-directory fsync barrier in this order: key, encrypted backup, store, config. A failed stage aborts that employee; failure after config replacement restores the original bytes. If restoration also fails, the error is reported and the durable encrypted backup is retained for recovery. Migration continues with other employees; at most three migration backups are retained per employee after cleanup; an I/O failure is logged and cleanup is retried on the next sweep. Deleting a server or employee removes its store entries. Restoring a deleted employee requires re-entering its keys.
+
+The Read guard denies `<home>/secrets`. This is not isolation from Bash: an employee running under the same OS user can still read gateway files, including `.keyfile`; real isolation requires no Bash or the task sandbox. Only `env` is covered: keys in `args` or `url`, and tool results that echo a key, are not covered. Existing plaintext exports and backups are not retroactively cleaned.

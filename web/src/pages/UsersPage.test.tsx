@@ -6,6 +6,7 @@ import { renderWithProviders } from '@/test/render';
 import { UsersPage } from './UsersPage';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -165,6 +166,40 @@ describe('UsersPage — reporting lines', () => {
       expect(within(cards[2] as HTMLElement).getByRole('button', { name: 'More' })).toBeInTheDocument();
     } finally {
       window.matchMedia = original;
+    }
+  });
+});
+
+
+describe('UsersPage — invitation eligibility', () => {
+  it.each(['active', 'suspended'])('offers an initial invitation only for an active eligible user (%s)', async (status) => {
+    const previousUser = useAuthStore.getState().user;
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'users.list') return { users: [{
+        id: 'new-person', email: 'person@example.com', display_name: 'New Person',
+        role: 'employee', status, invite_eligible: true, bindings: [],
+        created_at: '', updated_at: '',
+      }] };
+      if (method === 'users.invite_status') return { statuses: { 'new-person': 'none' } };
+      return { users: [], departments: [], agents: [], identities: [] };
+    });
+    try {
+      const user = userEvent.setup();
+      renderWithProviders(<UsersPage />);
+      await screen.findByText('New Person');
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await screen.findByRole('menuitem', { name: 'Edit' });
+      if (status === 'active') {
+        const invite = await screen.findByRole('menuitem', { name: 'Resend invitation' });
+        expect(invite).toBeInTheDocument();
+        await user.click(invite);
+        expect(await screen.findByText('Email preview (sent in Traditional Chinese)')).toBeInTheDocument();
+      } else {
+        expect(screen.queryByRole('menuitem', { name: 'Resend invitation' })).not.toBeInTheDocument();
+      }
+    } finally {
+      useAuthStore.setState({ user: previousUser });
     }
   });
 });

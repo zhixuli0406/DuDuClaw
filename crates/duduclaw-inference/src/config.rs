@@ -51,8 +51,9 @@ pub struct InferenceConfig {
 ///
 /// ```toml
 /// [voice]
-/// tts_provider = "auto"       # "auto" | "edge-tts" | "minimax" | "openai-tts" | "piper"
+/// tts_provider = "auto"       # "auto" | "kokoro" | "azure" | "minimax" | "openai-tts" | "piper" | "off"
 /// tts_voice = ""              # Empty = auto-detect from text content
+/// tts_command = ""            # Required when tts_provider = "command"; {input} and {output} are argv paths
 /// ```
 ///
 /// v1.68 removed `asr_provider` / `asr_language` / `voice_reply_enabled`:
@@ -61,10 +62,12 @@ pub struct InferenceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
-    /// TTS provider selection: "auto", "edge-tts", "minimax", "openai-tts", "piper"
+    /// TTS provider selection: auto, kokoro, azure, minimax, openai-tts, piper, command, off.
     pub tts_provider: String,
     /// Default TTS voice name (empty = auto-detect from text content)
     pub tts_voice: String,
+    /// Admin-configured external synthesis command template.
+    pub tts_command: String,
 }
 
 impl Default for VoiceConfig {
@@ -72,13 +75,14 @@ impl Default for VoiceConfig {
         Self {
             tts_provider: "auto".into(),
             tts_voice: String::new(),
+            tts_command: String::new(),
         }
     }
 }
 
 impl VoiceConfig {
     /// Allowed TTS provider values.
-    const VALID_TTS_PROVIDERS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
+    const VALID_TTS_PROVIDERS: &[&str] = &["auto", "kokoro", "azure", "minimax", "openai-tts", "openai", "piper", "command", "off", "none", "disabled", "edge-tts", "edge"];
 
     /// Validate and normalize config values, falling back to "auto" for unknown providers.
     pub fn validate(&mut self) {
@@ -632,7 +636,7 @@ model = "bge-small-zh"
 asr_provider = "whisper-api"
 asr_language = "zh"
 voice_reply_enabled = true
-tts_provider = "edge-tts"
+tts_provider = "kokoro"
 "#;
         let table: toml::Table = text.parse().unwrap();
         let cfg: InferenceConfig = toml::Value::Table(table).try_into().expect("old file loads");
@@ -640,6 +644,6 @@ tts_provider = "edge-tts"
         assert_eq!(cfg.default_model.as_deref(), Some("m"));
         assert_eq!(cfg.generation.max_tokens, 512);
         assert!(cfg.generation.capture_logprobs);
-        assert_eq!(cfg.voice.unwrap().tts_provider, "edge-tts");
+        assert_eq!(cfg.voice.unwrap().tts_provider, "kokoro");
     }
 }

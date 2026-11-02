@@ -91,6 +91,7 @@ export const DEFAULT_EVOLUTION_ADVANCED: {
 export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_use_config'>> & {
   computer_use_config: Required<ComputerUseConfig>;
 } = {
+  tool_pruning: 'shadow',
   computer_use: false,
   computer_use_mode: 'container',
   browser_via_bash: false,

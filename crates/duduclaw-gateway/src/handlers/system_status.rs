@@ -3,6 +3,31 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Presentation preference only: routes and RPC authorization remain unchanged.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct DashboardConfig {
+    employee_tasks: bool,
+}
+
+impl DashboardConfig {
+    fn from_home(home: &std::path::Path) -> Self {
+        std::fs::read_to_string(home.join("config.toml"))
+            .ok()
+            .map(|content| Self::from_content(&content))
+            .unwrap_or_default()
+    }
+
+    fn from_content(content: &str) -> Self {
+        content
+            .parse::<toml::Table>()
+            .ok()
+            .and_then(|table| table.get("dashboard").cloned())
+            .and_then(|section| section.try_into().ok())
+            .unwrap_or_default()
+    }
+}
+
 impl MethodHandler {
     // ── System ───────────────────────────────────────────────
 
@@ -58,6 +83,9 @@ impl MethodHandler {
             // Absent on older gateways ⇒ the web treats it as `true`, i.e.
             // byte-identical to the behaviour before this field existed.
             "decision_enabled": crate::decision_gate::DecisionConfig::from_home(&self.home_dir).enabled,
+            // Read-only employee navigation preference. Unreadable or malformed
+            // config keeps task surfaces hidden; this never gates an RPC.
+            "employee_tasks": DashboardConfig::from_home(&self.home_dir).employee_tasks,
             // v1.68: whether this binary was built with the `otel` feature.
             // Without it `[telemetry] otlp_endpoint` is accepted and saved but
             // exports nothing, so the settings page says so next to the field.
@@ -99,5 +127,44 @@ impl MethodHandler {
                 "repair_hints": repair_hints,
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod dashboard_config_tests {
+    use super::DashboardConfig;
+
+    #[test]
+    fn employee_tasks_requires_explicit_boolean_true() {
+        assert!(DashboardConfig::from_content("[dashboard]\nemployee_tasks = true").employee_tasks);
+        for content in [
+            "",
+            "[dashboard]",
+            "[dashboard]\nemployee_tasks = false",
+            "[dashboard]\nemployee_tasks = \"true\"",
+            "[dashboard]\nemployee_tasks = 1",
+            "dashboard = true",
+            "[dashboard",
+        ] {
+            assert!(!DashboardConfig::from_content(content).employee_tasks, "{content}");
+        }
+    }
+
+    #[test]
+    fn employee_tasks_defaults_false_when_config_cannot_be_read() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!DashboardConfig::from_home(home.path()).employee_tasks);
+        std::fs::create_dir(home.path().join("config.toml")).unwrap();
+        assert!(!DashboardConfig::from_home(home.path()).employee_tasks);
+    }
+
+    #[test]
+    fn employee_tasks_reloads_the_config_without_changing_other_preferences() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "[dashboard]\nemployee_tasks = true\nother = true").unwrap();
+        assert!(DashboardConfig::from_home(home.path()).employee_tasks);
+        std::fs::write(&path, "[dashboard]\nemployee_tasks = false").unwrap();
+        assert!(!DashboardConfig::from_home(home.path()).employee_tasks);
     }
 }

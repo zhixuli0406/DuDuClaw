@@ -37,6 +37,7 @@ const CONTENT_FIELDS: &[(&str, fn() -> Value)] = &[
     ("goal_state", || Value::Null),
     ("risk_boundary", || Value::Null),
     ("plan_pending", || Value::Null),
+    ("plan_review", || Value::Null),
     ("message_id", || Value::Null),
     // Who a task was assigned for (`user:<account id>`) and from where.
     ("on_behalf_of", || Value::Null),

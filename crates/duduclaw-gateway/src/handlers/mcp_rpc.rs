@@ -30,8 +30,8 @@ impl MethodHandler {
                     .mcp_servers
                     .iter()
                     .map(|(k, v)| {
-                        // Env values may be literal secrets (marketplace
-                        // installs write them that way): answer with
+                        // Legacy env may still be literal; new installs store
+                        // references. Answer with
                         // set / not_set / reference per name, never the value.
                         json!({
                             "name": k,
@@ -121,7 +121,7 @@ impl MethodHandler {
                     return WsFrame::error_response("", &e);
                 }
                 // A catalogue server installed under its catalogue id must carry
-                // literal values for every required env name (see
+                // supplied values or stored references for every required env name (see
                 // `apply_required_env`); refuse with the missing names.
                 let def = match self
                     .full_marketplace_catalog()

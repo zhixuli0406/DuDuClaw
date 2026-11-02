@@ -31,6 +31,10 @@ pub(crate) trait SessionBackend: Send + Sync {
     async fn window_title(&self) -> Result<String, String>;
     /// Execute one already-validated action.
     async fn execute(&self, action: &ComputerAction) -> Result<(), ComputerUseError>;
+    /// One stdin-only helper operation; the default fails closed.
+    async fn fill_login(&self, _input: &[u8]) -> super::login::LoginStatus {
+        super::login::LoginStatus::FailedUncleared
+    }
     /// Open an already-validated `https://` URL in the container's browser.
     async fn navigate(&self, _url: &str) -> Result<NavigateOutcome, ComputerUseError> {
         Err(ComputerUseError::ApiError("navigation not supported".into()))
@@ -113,6 +117,10 @@ impl SessionBackend for OrchestratorBackend {
 
     async fn execute(&self, action: &ComputerAction) -> Result<(), ComputerUseError> {
         self.inner.execute_action(action).await
+    }
+
+    async fn fill_login(&self, input: &[u8]) -> super::login::LoginStatus {
+        self.inner.fill_login(input).await
     }
 
     async fn navigate(&self, url: &str) -> Result<NavigateOutcome, ComputerUseError> {
