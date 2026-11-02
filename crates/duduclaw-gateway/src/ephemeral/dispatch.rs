@@ -178,6 +178,17 @@ pub async fn dispatch_with(
     );
 
     check_autonomy(home_dir, agent_id)?;
+    // Cancellation also ends this ephemeral execution. A refused admission
+    // keeps its scaffold eligible for resume and does not start the GC clock.
+    struct Completed<'a>(&'a Path, bool);
+    impl Drop for Completed<'_> {
+        fn drop(&mut self) {
+            if self.1 && crate::autonomous_runtime::was_handed_off() {
+                let _ = std::fs::write(self.0.join(".completed"), chrono::Utc::now().to_rfc3339());
+            }
+        }
+    }
+    let mut completion = Completed(&dir, true);
     let result = crate::claude_runner::call_claude_for_agent_preloaded_with(
         home_dir,
         registry,
@@ -193,6 +204,7 @@ pub async fn dispatch_with(
         && (crate::autonomous_runtime::was_denied() || result.as_ref().err().is_some_and(|e| e.starts_with("AUTONOMY_PAUSED:"))) {
         return result;
     }
+    completion.1 = false;
     // Mark completed (success OR failure) so the GC grace clock starts.
     let marker = dir.join(".completed");
     if let Err(e) = std::fs::write(&marker, chrono::Utc::now().to_rfc3339()) {

@@ -138,6 +138,19 @@ pub const CHAT_CANCEL_UNAVAILABLE: &str = "此閘道尚未確認支援取消，�
 pub const CHAT_CANCEL_HINT: &str = "X 取消這次回覆";
 pub const CHAT_CANCELLING: &str = "已接受取消，等待停止確認";
 pub const CHAT_CANCELLED: &str = "回覆已取消";
+pub const DOWNSTREAM_INPUT_HINT: &str = "Esc 返回清單後以 y／n 回答；輸入區的 y／n 只會輸入文字";
+pub const DOWNSTREAM_STOPPING: &str = "正在停止下游工作";
+pub const DOWNSTREAM_UNKNOWN: &str = "這個詢問已失效，下游工作不受影響";
+pub const CMD_DOWNSTREAM_STOP: &str = "一起停止這次回覆的下游工作";
+pub const CMD_DOWNSTREAM_DISMISS: &str = "讓下游工作跑完";
+pub fn downstream_prompt(count: u64) -> String {
+    format!("還有 {count} 位員工的工作還在跑，要一起停嗎？ y 停止／n 讓它們跑完")
+}
+pub fn downstream_stopped(stopped: u64, still_stopping: u64) -> String {
+    let mut text = format!("已停止 {stopped} 項");
+    if still_stopping > 0 { text.push_str(&format!("，{still_stopping} 項還在收尾")); }
+    text
+}
 pub const CHAT_INTERRUPTED: &str = "連線中斷，回覆結果未確認；不會自動重送訊息";
 pub const WATCH_POLLING: &str = "輪詢模式：閘道未提供即時訂閱，每五秒更新";
 pub const WATCH_SUBSCRIBED: &str = "已訂閱員工執行事件";

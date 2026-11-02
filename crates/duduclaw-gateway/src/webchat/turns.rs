@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 mod run;
 mod progress;
 mod identity;
+pub(super) mod downstream;
 pub(super) use identity::IdentityUnavailable;
 #[cfg(test)]
 mod tests;
@@ -21,9 +22,13 @@ tokio::task_local! {
 #[derive(Default)]
 pub(super) struct Registry {
     entries: Mutex<HashMap<String, Entry>>,
+    offers: Mutex<downstream::Offers>,
     #[cfg(test)]
     quota_reads: std::sync::atomic::AtomicUsize,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancelCause { Person, CredentialRevoked, CredentialUnavailable }
 
 struct Entry {
     user: String,
@@ -32,6 +37,7 @@ struct Entry {
     msg_id: String,
     cancel: CancellationToken,
     cancel_request_id: Option<String>,
+    cancel_cause: CancelCause,
     delivering: bool,
     admitted: bool,
     active: bool,
@@ -43,6 +49,7 @@ pub(super) struct Ticket {
     pub id: String,
     pub cancel: CancellationToken,
     principal: String,
+    lineage_principal: Option<String>,
     started: AtomicBool,
     predecessor: Option<oneshot::Receiver<()>>,
     finished: Option<oneshot::Sender<()>>,
@@ -85,6 +92,7 @@ impl Registry {
                 msg_id: msg_id.into(),
                 cancel: cancel.clone(),
                 cancel_request_id: None,
+                cancel_cause: CancelCause::Person,
                 delivering: false,
                 admitted: false,
                 active: false,
@@ -96,6 +104,7 @@ impl Registry {
             id,
             cancel,
             principal: format!("user:{user}"),
+            lineage_principal: None,
             started: AtomicBool::new(false),
             predecessor: None,
             finished: None,
@@ -174,14 +183,13 @@ impl Ticket {
         entry.tail = Some(tail);
     }
 
-    /// Serialize credential cancellation with the delivery fence. Once delivery
-    /// starts, its awaited validity checks own refusal and archive rollback.
-    fn cancel_unless_delivering(&self) -> bool {
-        let entries = self.registry.entries.lock().unwrap();
-        let entry = entries.get(&self.id).unwrap();
+    fn cancel_for_cause(&self, cause: CancelCause) -> bool {
+        let mut entries = self.registry.entries.lock().unwrap();
+        let entry = entries.get_mut(&self.id).unwrap();
         if entry.delivering {
             return false;
         }
+        entry.cancel_cause = cause;
         entry.cancel.cancel();
         true
     }
@@ -270,9 +278,13 @@ where
     let mut recovery = crate::handlers::live_context::SocketRecovery::default();
     loop {
         interval.tick().await;
-        recovery.observe(check().await, true);
+        let validity = check().await;
+        recovery.observe(validity, true);
         if recovery.closed() {
-            if ticket.cancel_unless_delivering() {
+            let cause = if validity == crate::handlers::live_context::SocketValidity::Revoked {
+                CancelCause::CredentialRevoked
+            } else { CancelCause::CredentialUnavailable };
+            if ticket.cancel_for_cause(cause) {
                 return;
             }
             // Returning would win credential_watched's select and drop delivery.
@@ -455,6 +467,7 @@ where
 }
 
 async fn execute_inner(input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
+    ticket.lineage_principal = Some(downstream::lineage_principal(&input.state.ctx.home_dir, &input.auth_user, &input.sid));
     // Even a cancelled waiter keeps its FIFO link until its predecessor ends.
     if let Some(previous) = ticket.predecessor.take() {
         let _ = previous.await;
@@ -595,12 +608,31 @@ async fn finish_cancel(
         Err(error) => Err(error),
     };
     let result = sessions.record_webchat_cancel(sid, agent, &ticket.id, &sink.msg_id).await;
-    let request_id = ticket.registry.entries.lock().unwrap()
-        .get(&ticket.id).and_then(|entry| entry.cancel_request_id.clone());
+    let (request_id, cause, user) = {
+        let entries = ticket.registry.entries.lock().unwrap();
+        let entry = entries.get(&ticket.id).unwrap();
+        (entry.cancel_request_id.clone(), entry.cancel_cause, entry.user.clone())
+    };
+    let lineage_principal = ticket.lineage_principal.clone()
+        .unwrap_or_else(|| downstream::lineage_principal(home, &user, sid));
+    let offer = if cause == CancelCause::CredentialRevoked {
+        crate::downstream_runs::stop(home, sid, &ticket.id, &lineage_principal,
+            crate::downstream_runs::STOP_WAIT, "credential_revoked").await;
+        None
+    } else if cause == CancelCause::Person && !is_widget_visitor(&user) {
+        let count = crate::downstream_runs::count(home, sid, &ticket.id, &lineage_principal);
+        (count > 0).then(|| ticket.registry.offer(&user, &lineage_principal, sid, &ticket.id)
+            .map(|reference| (count, reference))).flatten()
+    } else { None };
     match (result, withdrawal, cleanup) {
         (Ok(()), Ok((withdrawal, delegations_cancelled)), Ok(())) => {
-            sink.value(serde_json::json!({"type":"error", "message":"Turn cancelled", "code":"cancelled",
-                "approved_before_cancel":withdrawal, "delegations_cancelled":delegations_cancelled, "request_id":request_id})).await;
+            let mut frame = serde_json::json!({"type":"error", "message":"Turn cancelled", "code":"cancelled",
+                "approved_before_cancel":withdrawal, "delegations_cancelled":delegations_cancelled, "request_id":request_id});
+            if let Some((count, reference)) = offer {
+                frame["downstream_running"] = count.into();
+                frame["downstream_ref"] = reference.into();
+            }
+            sink.value(frame).await;
         }
         (result, withdrawal, cleanup) => {
             warn!(

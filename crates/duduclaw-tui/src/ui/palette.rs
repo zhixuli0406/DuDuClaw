@@ -100,6 +100,10 @@ impl App {
         if self.help {
             return commands;
         }
+        if self.blocks.active == Block::Chat && self.downstream_reference(Instant::now()).is_some() {
+            add(KeyCode::Char('y'), none, strings::CMD_DOWNSTREAM_STOP, "y", "stop downstream");
+            add(KeyCode::Char('n'), none, strings::CMD_DOWNSTREAM_DISMISS, "n / Esc", "continue downstream dismiss");
+        }
         add(KeyCode::Char('P'), none, strings::CMD_PTY, "P", "pty terminal shell");
         add(KeyCode::Char('D'), none, strings::CMD_DETAIL, "D", "detail");
         add(KeyCode::Char('C'), none, strings::CMD_CHAT, "C", "chat");

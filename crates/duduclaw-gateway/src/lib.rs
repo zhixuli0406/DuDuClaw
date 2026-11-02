@@ -228,6 +228,7 @@ pub mod discord_voice;
 /// B0-1 exploration-tree ledger, replay simulator and policy protocol (offline only).
 pub mod discovery;
 pub mod dispatcher;
+pub(crate) mod downstream_runs;
 /// WP-4G — resource ceilings applied to inbound office / compressed documents
 /// before any parser (LibreOffice, the bundled Python skills) is handed them.
 pub mod document_limits;

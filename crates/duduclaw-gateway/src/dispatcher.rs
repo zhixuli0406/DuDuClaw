@@ -76,6 +76,9 @@ struct BusMessage {
     /// P2-B: the sender dropped a half upstream turn identity.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     upstream_unknown: bool,
+    /// Host-written spawn origin; completing a child never concludes its owner turn.
+    #[serde(default)]
+    spawned: bool,
     /// Lane of the run that wrote this delegation (`explore` ⇒ the receiving
     /// run is read-only too, like `message_queue.lane`; any other present
     /// value is read as explore as well). Absent ⇒ normal.
@@ -638,9 +641,14 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         };
         // Recheck immediately before polling the runtime: an MCP enqueue may
         // have raced the cancellation's pending-row cleanup.
+        let mut downstream = crate::downstream_runs::register(
+            home_dir, msg.session_id.as_deref(), msg.turn_id.as_deref(), msg.on_behalf_of.as_deref(),
+        )?;
+        crate::responsibility::test_hooks::pause_point("downstream_registered", &msg.id).await;
         if fence_cancelled_turn(home_dir, queue, &msg).await? {
             continue;
         }
+        let dispatch_fut = cancellable_dispatch(downstream.as_ref(), dispatch_fut);
         let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
             (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -678,6 +686,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             },
         };
         drop(typing_guard);
+        if !matches!(&result, Err(DispatchError::OriginStopped)) { drop(downstream.take()); }
         if matches!(&result, Err(DispatchError::AutonomyPaused(_))) {
             queue.defer_to_pending(&msg.id).await?;
             continue;
@@ -716,6 +725,14 @@ pub(crate) async fn poll_and_dispatch_sqlite(
                     );
                 }
             }
+        }
+
+        if matches!(&result, Err(DispatchError::OriginStopped)) {
+            if let Err(error) = queue.fail(&msg.id, crate::downstream_runs::STOPPED).await {
+                if let Some(guard) = &downstream { guard.uncertain(); }
+                return Err(error);
+            }
+            continue;
         }
 
         // WP-A4/A5/T10: bridge whatever the collector accumulated over to
@@ -792,6 +809,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
 /// Why a dispatch failed, as the two delegation reply paths need it.
 #[derive(Debug)]
 enum DispatchError {
+    OriginStopped,
     Budget(String),
     /// Admission was deferred; no runtime started and no failure is charged.
     AutonomyPaused(String),
@@ -837,6 +855,7 @@ impl DispatchError {
     /// Full text for host-local records (logs, the queue row).
     fn host_text(&self) -> String {
         match self {
+            Self::OriginStopped => crate::downstream_runs::STOPPED.into(),
             Self::Budget(message) => format!("{}{message}", crate::budget::BUDGET_REFUSAL_PREFIX),
             Self::Sandbox(failure) if failure.code == "budget_refused" => format!("{}{}", crate::budget::BUDGET_REFUSAL_PREFIX, failure.message),
             Self::Sandbox(failure) => failure.host_text(),
@@ -852,6 +871,7 @@ impl DispatchError {
 /// classified, non-leaking fallback: the raw text never leaves the host.
 fn dispatch_failure_reply(error: &DispatchError) -> String {
     match error {
+        DispatchError::OriginStopped => String::new(),
         DispatchError::Budget(message) => message.clone(),
         DispatchError::AutonomyPaused(_) => "自主工作已暫停，恢復後再執行。".into(),
         DispatchError::Sandbox(failure) if failure.unavailable => {
@@ -1020,6 +1040,7 @@ async fn poll_and_dispatch(
                         turn_id: msg.turn_id.clone(),
                         session_id: msg.session_id.clone(),
                         upstream_unknown: false,
+                        spawned: false,
                         lane: None,
                         on_behalf_of: msg.on_behalf_of.clone(),
                     };
@@ -1089,6 +1110,7 @@ async fn poll_and_dispatch(
             turn_id: msg.turn_id.clone(),
             session_id: msg.session_id.clone(),
             upstream_unknown: false,
+            spawned: false,
             lane: None,
             on_behalf_of: msg.on_behalf_of.clone(),
         };
@@ -1245,16 +1267,38 @@ async fn poll_and_dispatch(
                 &home, &msg.message_id, msg.origin_agent.as_deref(),
             ).await;
 
-            // H19: captured before the move below — the turn that is about
-            // to conclude is the natural "session end" boundary for any
-            // ephemeral spawn requests it queued while over capacity (Grok's
-            // "Stop blocks late spawns" analog). See the invalidation call
-            // after this dispatch resolves.
-            let turn_id_for_admission_invalidate = turn_id_for_scope.clone();
+            // H19 applies only to the concluding owner, never to a spawned
+            // child carrying that owner's lineage (including admission replay).
+            // Legacy rows without the host marker retain their old behavior.
+            let turn_id_for_admission_invalidate = if msg.spawned { None } else { turn_id_for_scope.clone() };
             // The legacy queue needs the same boundary as the SQLite queue.
-            let dispatch_fut = Box::pin(dispatch_to_agent_outcome(
-                &home, &reg, &msg.agent_id, &msg.payload, &delegation_env, None,
-            ));
+            let (mut downstream, admission_error) = match crate::downstream_runs::register(
+                &home, msg.session_id.as_deref(), msg.turn_id.as_deref(), msg.on_behalf_of.as_deref(),
+            ) {
+                Ok(guard) => (guard, None),
+                Err(error) => {
+                    warn!(%error, "bus downstream admission refused");
+                    (None, Some(DispatchError::Other("Downstream run admission unavailable".into())))
+                }
+            };
+            let dispatch_fut = Box::pin(async {
+                if let Some(error) = admission_error { return Err(error); }
+                if let (Some(session), Some(turn)) = (&msg.session_id, &msg.turn_id) {
+                    match crate::approval::is_turn_cancelled(
+                        &home, session, turn,
+                    ).await {
+                        Ok(false) => {},
+                        Ok(true) => return Err(DispatchError::OriginStopped),
+                        Err(error) => {
+                            warn!(%error, "bus cancellation fence unavailable");
+                            return Err(DispatchError::Other("Origin turn cancellation check unavailable".into()));
+                        }
+                    }
+                }
+                dispatch_to_agent_outcome(
+                    &home, &reg, &msg.agent_id, &msg.payload, &delegation_env, None,
+                ).await
+            });
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
@@ -1272,14 +1316,18 @@ async fn poll_and_dispatch(
             // `spawn_agent` / `spawn_ephemeral`): the receiving run stays
             // read-only too, or is refused when the employee cannot carry
             // the lane (fail closed, same rule as `message_queue.lane`).
-            let result = match resolve_dispatch_lane(&home, &msg.agent_id, Ok(false), msg.lane.as_deref()) {
-                Ok(lane) => crate::explore_lane::EXPLORE.scope(lane, dispatch_fut).await,
-                Err(reason) => {
-                    warn!(id = %msg.message_id, agent = %msg.agent_id, reason = %reason, "bus queue: explore-lane run refused");
-                    Err(DispatchError::Other(reason))
+            let dispatch_fut = async {
+                match resolve_dispatch_lane(&home, &msg.agent_id, Ok(false), msg.lane.as_deref()) {
+                    Ok(lane) => crate::explore_lane::EXPLORE.scope(lane, dispatch_fut).await,
+                    Err(reason) => {
+                        warn!(id = %msg.message_id, agent = %msg.agent_id, reason = %reason, "bus queue: explore-lane run refused");
+                        Err(DispatchError::Other(reason))
+                    }
                 }
             };
+            let result = cancellable_dispatch(downstream.as_ref(), dispatch_fut).await;
 
+            if !matches!(&result, Err(DispatchError::OriginStopped)) { drop(downstream.take()); }
             if matches!(&result, Err(DispatchError::AutonomyPaused(_))) {
                 for original in originals {
                     match serde_json::to_string(&original) {
@@ -1327,6 +1375,11 @@ async fn poll_and_dispatch(
                 }
             }
             drop(typing_guard);
+            // The original JSONL entries were durably removed before dispatch.
+            // Do not write a response/retry line or consume any callback.
+            if matches!(&result, Err(DispatchError::OriginStopped)) {
+                return;
+            }
 
             let mut response_text = match &result {
                 Ok(text) => text.clone(),
@@ -1476,6 +1529,7 @@ async fn poll_and_dispatch(
                 turn_id: msg.turn_id.clone(),
                 session_id: msg.session_id.clone(),
                 upstream_unknown: false,
+            spawned: false,
                 lane: None,
                 on_behalf_of: msg.on_behalf_of.clone(),
             };
@@ -1552,6 +1606,15 @@ impl DelegationEnv {
         map.insert(ENV_DELEGATION_SENDER.to_string(), self.sender.clone());
         map.insert(ENV_HOP_DEPTH.to_string(), self.hop_depth.to_string());
         map
+    }
+}
+
+async fn cancellable_dispatch<F: std::future::Future<Output = Result<String, DispatchError>>>(
+    guard: Option<&crate::downstream_runs::Guard>, future: F,
+) -> Result<String, DispatchError> {
+    match guard {
+        Some(guard) => guard.run(future).await.map_err(|()| DispatchError::OriginStopped)?,
+        None => future.await,
     }
 }
 
@@ -1653,6 +1716,8 @@ async fn dispatch_to_agent_outcome(
                     crate::runtime::round_task_env().map(|(_, v)| v),
                 );
                 crate::model_call_probe::set_last_lane(crate::explore_lane::in_explore());
+                crate::model_call_probe::capture_bus_delegation(home_dir, prompt, agent_id).await;
+                crate::responsibility::test_hooks::pause_point("downstream_runtime", prompt).await;
                 return Ok("model-call-probe dry run".to_string());
             }
         }
@@ -2144,19 +2209,17 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
     use std::collections::HashMap;
 
     // Group by agent_id, preserving insertion order via Vec
-    let mut groups: HashMap<String, Vec<BusMessage>> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<_, Vec<BusMessage>> = HashMap::new();
+    let mut order = Vec::new();
 
     for msg in messages {
         // A read-only (lane) delegation is never merged with an ordinary one:
         // the merged run would take the lane of whichever came first.
         // Nor is work for one person merged with work for another (or for
         // nobody): the merged run would act for whoever came first.
-        let key = format!(
-            "{}\u{0}{}\u{0}{}",
-            msg.agent_id,
-            if msg.lane.is_some() { "L" } else { "" },
-            msg.on_behalf_of.as_deref().unwrap_or("")
+        let key = (
+            msg.agent_id.clone(), msg.lane.clone(), msg.on_behalf_of.clone(),
+            msg.session_id.clone(), msg.turn_id.clone(), msg.spawned,
         );
         let entry = groups.entry(key.clone()).or_default();
         if entry.is_empty() {
@@ -2231,6 +2294,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 turn_id: first.turn_id.clone(),
                 session_id: first.session_id.clone(),
                 upstream_unknown: first.upstream_unknown,
+                spawned: first.spawned,
                 lane: first.lane.clone(),
                 on_behalf_of: first.on_behalf_of.clone(),
             });
@@ -4691,6 +4755,7 @@ mod tests {
             turn_id: None,
             session_id: None,
             upstream_unknown: false,
+            spawned: false,
             lane: None,
             on_behalf_of: None,
         };
@@ -5205,6 +5270,7 @@ mod tests {
                 turn_id: None,
                 session_id: None,
                 upstream_unknown: false,
+            spawned: false,
                 lane: None,
                 on_behalf_of: None,
             },
@@ -5224,6 +5290,7 @@ mod tests {
                 turn_id: None,
                 session_id: None,
                 upstream_unknown: false,
+            spawned: false,
                 lane: None,
                 on_behalf_of: None,
             },

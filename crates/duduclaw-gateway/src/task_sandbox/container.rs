@@ -584,6 +584,8 @@ pub(super) enum LaunchError {
 /// container of that exact name is listed afterwards.
 struct Cleanup {
     name: String,
+    downstream: Option<crate::downstream_runs::CleanupHold>,
+    create_finished: bool,
     result: Option<Result<(), String>>,
 }
 
@@ -697,6 +699,7 @@ impl Cleanup {
         let result = tokio::task::spawn_blocking(move || commands.run())
             .await
             .unwrap_or_else(|_| Err("sandbox cleanup task failed".into()));
+        if let Some(hold) = self.downstream.take() { hold.finish(result.is_ok()); }
         self.result = Some(result.clone());
         result
     }
@@ -711,8 +714,15 @@ impl Drop for Cleanup {
         }
         let commands = RemoveCommands::new(&self.name);
         let name = self.name.clone();
+        let downstream = self.downstream.take();
+        let create_finished = self.create_finished;
         let run = move || {
-            if let Err(error) = commands.run() {
+            let result = commands.run();
+            // A create request interrupted before its reply can still be
+            // committing at the daemon. An empty name lookup is not proof
+            // that this in-flight creation will never appear afterwards.
+            if let Some(hold) = downstream { hold.finish(create_finished && result.is_ok()); }
+            if let Err(error) = result {
                 tracing::warn!(container = %name, %error, "task sandbox container could not be removed after cancellation");
             }
         };
@@ -734,8 +744,9 @@ pub(super) async fn launch(
     on_event: impl FnMut(&[u8]) -> bool + Send,
 ) -> Result<ProcessOutput, LaunchError> {
     let started = Instant::now();
-    let mut cleanup = Cleanup { name, result: None };
+    let mut cleanup = Cleanup { name, result: None, downstream: crate::downstream_runs::cleanup_hold(), create_finished: false };
     let created = process::run(create, b"", timeout, 1024, |_| true).await;
+    cleanup.create_finished = true;
     let created = match created {
         Ok(output) => output,
         Err(error) => {

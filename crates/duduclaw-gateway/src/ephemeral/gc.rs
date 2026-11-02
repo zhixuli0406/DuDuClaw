@@ -410,6 +410,32 @@ pub(super) fn replay_queued_ephemeral(
         "origin_agent": origin,
         "sender_agent": parent,
     });
+    let mut entry = entry;
+    entry["spawned"] = serde_json::json!(true);
+    // Admission replay preserves the original host identity, never the
+    // sweeper's environment. Older tickets without lineage remain untracked.
+    let (turn, session, missing) = crate::memory_provenance::complete_upstream_pair(
+        p.get("turn_id").and_then(|v| v.as_str()).map(str::to_owned),
+        p.get("session_id").and_then(|v| v.as_str()).map(str::to_owned),
+    );
+    if let (Some(turn), Some(session)) = (turn, session) {
+        entry["turn_id"] = serde_json::json!(turn);
+        entry["session_id"] = serde_json::json!(session);
+    }
+    if let Some(missing) = missing {
+        crate::memory_provenance::audit_upstream_identity(
+            home_dir, crate::memory_provenance::AUDIT_UPSTREAM_DROPPED,
+            &parent, &task_id, missing,
+        );
+    }
+    if missing.is_some() || p.get("upstream_unknown").and_then(|v| v.as_bool()) == Some(true) {
+        entry["upstream_unknown"] = serde_json::json!(true);
+    }
+    for key in ["on_behalf_of", "lane"] {
+        if let Some(value) = p.get(key).and_then(|v| v.as_str()) {
+            entry[key] = serde_json::json!(value);
+        }
+    }
     let entry_str = entry.to_string();
     const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB (same cap as the live path)
     let write_result = duduclaw_core::with_file_lock(&queue_path, || {
