@@ -1,9 +1,10 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
+assertion_line: 550
 expression: "screen(&empty(), &app, &Settings::default(), 100, 24)"
 ---
 DuDuClaw 控制室 | /home/使用者/.duduclaw
-閘道 1.77.0 | 已連線
+閘道 1.77.0 | 已連線 | 執行中 ? 次（已觀測）
 
 +-收件匣 (0)-----------------------------------++-> 1 對話-----------------------------------------+
 |目前沒有待處理事項                            || 回覆完成                                         |

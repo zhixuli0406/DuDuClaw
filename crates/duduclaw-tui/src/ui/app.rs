@@ -58,7 +58,7 @@ pub fn employee_status(employee: &Employee, model: &Model, read: &ReadState) -> 
         .inbox
         .items
         .iter()
-        .any(|i| i.agent().is(employee.id()))
+        .any(|i| !matches!(i, crate::state::InboxItem::Breaker(_)) && i.agent().is(employee.id()))
         || employee.status.is("awaiting")
     {
         return EmployeeStatus::Awaiting;
@@ -371,7 +371,7 @@ impl App {
         }
         let replaces = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w')
             || !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                && matches!(key.code, KeyCode::Char('D' | 'C' | 'R' | 'T' | 'L' | '/')) && !self.help;
+                && matches!(key.code, KeyCode::Char('D' | 'C' | 'R' | 'T' | 'L' | 'W' | 'A' | 'E' | 'B' | 'G' | '/')) && !self.help;
         if replaces && self.blocks.panes[self.blocks.focused].pty.as_ref().is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).pending_or_running()) {
             self.pty_confirm = Some(key); self.notice = Some(strings::PTY_CONFIRM.into());
             return Action::None;
@@ -432,6 +432,10 @@ impl App {
                 if let Some(Selection::Inbox(id)) = &self.selected
                     && let Some(item) = model.inbox.items.iter().find(|i| i.key() == *id)
                 {
+                    if let crate::state::InboxItem::Breaker(b) = item {
+                        self.blocks.open(if b.autopilot { crate::blocks::Block::Autopilot } else { crate::blocks::Block::Budget }, None);
+                        return Action::None;
+                    }
                     self.card = Some(super::card::Card::open(item.clone(), model, now, &mut self.codes));
                     if self.read.resurfaced(item, epoch) {
                         self.card.as_mut().expect("just opened").hint = Some(strings::RESURFACED);
@@ -447,10 +451,10 @@ impl App {
             KeyCode::PageUp if self.help => self.help_scroll = self.help_scroll.saturating_sub(5),
             KeyCode::PageDown if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_sub(5),
             KeyCode::PageUp if self.blocks.active == crate::chat::Block::Chat && !self.help => self.chat_scroll = self.chat_scroll.saturating_add(5),
-            KeyCode::PageDown if matches!(self.blocks.active, crate::blocks::Block::Run | crate::blocks::Block::Task | crate::blocks::Block::Log) => {
+            KeyCode::PageDown if self.blocks.active.remote() => {
                 let p = &mut self.blocks.panes[self.blocks.focused]; p.scroll = p.scroll.saturating_add(5);
             }
-            KeyCode::PageUp if matches!(self.blocks.active, crate::blocks::Block::Run | crate::blocks::Block::Task | crate::blocks::Block::Log) => {
+            KeyCode::PageUp if self.blocks.active.remote() => {
                 let p = &mut self.blocks.panes[self.blocks.focused]; p.scroll = p.scroll.saturating_sub(5);
             }
             KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
@@ -500,6 +504,7 @@ impl App {
         }
         if let Some(palette) = &mut self.palette { palette.paste(text); return; }
         if let Some(card) = &mut self.control_card { card.paste(text); return; }
+        if let Some(card) = &mut self.card { card.paste(text); return; }
         if self.focus != crate::chat::Focus::Input || self.card.is_some() { return; }
         let remaining = crate::chat::MAX_INPUT_CHARS.saturating_sub(self.input.chars().count());
         self.input.extend(text.chars().filter(|c| !crate::sanitize::forbidden(*c))

@@ -24,7 +24,9 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
     let inside = panel(
         frame,
         left[0],
-        &title(strings::INBOX, model.inbox.count()),
+        &format!("{}{}", title(strings::INBOX, model.inbox.actionable_count()),
+            model.inbox.informational_count().filter(|n| *n > 0)
+                .map(|n| format!(" · {}", strings::inbox_information(n))).unwrap_or_default()),
         settings,
         stale_inbox,
     );
@@ -55,8 +57,9 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 .map(|i| Row {
                     selection: Selection::Inbox(i.key()),
                     text: TerminalText::new(format!(
-                        "[{}] {}{}{}",
+                        "[{}] {} · {}{}{}",
                         i.source_label(),
+                        i.context(),
                         i.title().plain(),
                         if app.read.contains(&i.key()) {
                             format!(" ({})", strings::READ)
@@ -195,8 +198,8 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                             ScheduleSource::Cron => strings::CRON,
                         },
                         s.agent.plain(),
-                        s.next_run.plain(), strings::LAST_RESULT,
-                        crate::blocks::field(&s.detail, "last_status")
+                        s.next_run.plain(), match s.source { ScheduleSource::Heartbeat => strings::field_label("last_run"), ScheduleSource::Cron => strings::LAST_RESULT },
+                        crate::blocks::field(&s.detail, match s.source { ScheduleSource::Heartbeat => "last_run", ScheduleSource::Cron => "last_status" })
                     )),
                 })
                 .collect(),

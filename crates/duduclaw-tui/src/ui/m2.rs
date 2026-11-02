@@ -38,6 +38,7 @@ impl App {
     }
     pub(super) fn control_subject(&self, source: &Source, model: &Model) -> Option<Value> {
         match source {
+            Source::Goal(id) if operator(model, Some(id)) => Some(json!({"agent_id":id})),
             Source::Employee(id) if manager(model) && operator(model, Some(id)) => model
                 .employees
                 .items
@@ -58,6 +59,11 @@ impl App {
             Source::Pane(i) => {
                 let p = self.blocks.panes.get(*i)?;
                 let row = &p.data.selected;
+                if p.kind == Block::Workflow {
+                    return (!p.data.stale && p.data.error.is_none() && manager(model)
+                        && operator(model, row["_tui_owner"].as_str())
+                        && row["run_id"].as_str().is_some()).then(|| row.clone());
+                }
                 let agent = if p.responsibilities {
                     row["owner_agent_id"].as_str()
                 } else {
@@ -127,6 +133,22 @@ impl App {
     pub(super) fn m2_key(&mut self, c: char, model: &Model, now: Instant) -> Option<Action> {
         let i = self.blocks.focused;
         match c {
+            'N' => {
+                if let Some(agent) = self.block_agent(model).or_else(|| self.blocks.panes[i].agent.clone()) {
+                    self.open_control(Control::GoalCreate { agent: agent.clone(), body: String::new(), plan_first: true }, Source::Goal(agent), model, now);
+                } else { self.notice = Some(strings::SELECT_EMPLOYEE.into()); }
+            }
+            's' if self.blocks.active == Block::Workflow => {
+                if let Some(run) = self.blocks.panes[i].data.selected["run_id"].as_str() {
+                    self.open_control(Control::WorkflowCancel { run: run.into() }, Source::Pane(i), model, now);
+                }
+            }
+            'c' if self.blocks.active == Block::Task && !self.blocks.panes[i].responsibilities => {
+                if let Some(item) = self.blocks.panes[i].data.task() {
+                    let mut card = super::card::Card::open(item, model, now, &mut self.codes);
+                    if card.start_continue() { self.card = Some(card); self.task_card = true; }
+                }
+            }
             'v' | 'x' => {
                 self.blocks.add(if c == 'v' {
                     crate::blocks::Split::Vertical
@@ -141,6 +163,12 @@ impl App {
                 if let Some(agent) = self.block_agent(model) {
                     self.blocks
                         .open(if c == 'R' { Block::Run } else { Block::Task }, Some(agent));
+                    if c == 'T' && let Some(Selection::Employee(id)) = &self.selected {
+                        self.blocks.panes[i].task_id = model.activity.get(id).and_then(|a| a.task_id.clone());
+                        if model.activity.get(id).is_some_and(|a| a.working && a.task_id.is_none()) {
+                            self.notice = Some(strings::WORKING_TASK_UNKNOWN.into());
+                        }
+                    }
                     if c == 'T'
                         && let Some(Selection::Inbox(id)) = &self.selected
                     {
@@ -161,6 +189,25 @@ impl App {
                     self.notice = Some(strings::SELECT_EMPLOYEE.into());
                 }
             }
+            'W' | 'A' | 'E' | 'B' | 'G' => {
+                let pane = &self.blocks.panes[i];
+                let task = match pane.kind {
+                    Block::Task if !pane.responsibilities => pane.data.selected["id"].as_str().map(str::to_owned),
+                    Block::Run => pane.data.selected["task_id"].as_str().map(str::to_owned),
+                    Block::Workflow => pane.task_id.clone(),
+                    _ => None,
+                }.or_else(|| match &self.selected {
+                        Some(Selection::Inbox(id)) => model.inbox.items.iter().find(|item| item.key() == *id).and_then(|item| match item {
+                            crate::state::InboxItem::Task(task) => Some(task.id().to_owned()), _ => None,
+                        }),
+                        Some(Selection::Employee(id)) => model.activity.get(id).and_then(|a| a.task_id.clone()),
+                        _ => None,
+                    });
+                let agent = self.block_agent(model).or_else(|| self.blocks.panes[i].agent.clone());
+                let kind = match c { 'W' => Block::Workflow, 'A' => Block::Autopilot, 'E' => Block::Evolution, 'B' => Block::Budget, _ => Block::Digest };
+                self.blocks.open(kind, agent);
+                if kind == Block::Workflow { self.blocks.panes[i].task_id = task; }
+            }
             'L' => self.blocks.open(Block::Log, None),
             'o' if self.blocks.active == Block::Task && self.blocks.panes[i].responsibilities => {
                 let p = &mut self.blocks.panes[i];
@@ -174,7 +221,7 @@ impl App {
                 p.data = crate::blocks::Data::default();
                 self.blocks.revision += 1;
             }
-            '[' | ']' if matches!(self.blocks.active, Block::Run | Block::Task) => {
+            '[' | ']' if matches!(self.blocks.active, Block::Run | Block::Task | Block::Workflow) => {
                 let p = &mut self.blocks.panes[i];
                 p.index = if c == '[' {
                     p.index.saturating_sub(1)
@@ -182,7 +229,7 @@ impl App {
                     (p.index + 1).min(p.data.total.saturating_sub(1))
                 };
                 p.scroll = 0;
-                p.task_id = None;
+                if p.kind != Block::Workflow { p.task_id = None; }
                 p.data = crate::blocks::Data::default();
                 self.blocks.revision += 1;
             }

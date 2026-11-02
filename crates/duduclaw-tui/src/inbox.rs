@@ -23,18 +23,21 @@ impl InboxItem {
         match self {
             Self::Approval(a) => format!("approval:{}", a.id()),
             Self::Task(t) => format!("task:{}", t.id()),
+            Self::Breaker(b) => b.key.clone(),
         }
     }
     pub fn title(&self) -> &TerminalText {
         match self {
             Self::Approval(a) => &a.summary,
             Self::Task(t) => &t.title,
+            Self::Breaker(b) => &b.title,
         }
     }
     pub fn agent(&self) -> &TerminalText {
         match self {
             Self::Approval(a) => &a.agent_id,
             Self::Task(t) => &t.assigned_to,
+            Self::Breaker(b) => &b.agent,
         }
     }
     pub fn data(&self) -> Value {
@@ -42,7 +45,15 @@ impl InboxItem {
         match self {
             Self::Approval(a) => a.detail.json_value().unwrap_or_else(|| json!(a)),
             Self::Task(t) => t.detail.json_value().unwrap_or_else(|| json!(t)),
+            Self::Breaker(b) => json!({"informational":true,"subject":b.subject.plain(),"autopilot":b.autopilot}),
         }
+    }
+    pub fn context(&self) -> String {
+        match self {
+            Self::Approval(a) => format!("{} · {}", a.agent_id.plain(), a.kind.plain()),
+            Self::Task(t) => format!("{} · {}", t.assigned_to.plain(), t.pause_reason.as_ref().map(TerminalText::plain).unwrap_or_else(|| strings::NOT_PROVIDED.into())),
+            Self::Breaker(b) => format!("{} · {}", if b.autopilot { strings::AUTOPILOT_BLOCK } else { strings::BUDGET_BLOCK }, b.subject.plain()),
+        }.replace('\n', " ")
     }
     pub fn detail_text(&self) -> TerminalText {
         crate::sanitize::visible_json(&self.data())
