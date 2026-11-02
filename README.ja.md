@@ -215,7 +215,8 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 ```
 duduclaw onboard             # 初回セットアップ;通常はブラウザのウィザードで完了、ヘッドレス/スクリプト向け(--yes でプロンプトをスキップ)
 duduclaw run                 # まとめて起動(gateway + channels + heartbeat + cron + dispatcher)
-duduclaw agent               # ターミナルで対話。サブコマンド create / list / inspect / pause / resume / run
+duduclaw agent list          # エージェント一覧。create / inspect / pause / resume / export / freeze / unfreeze も利用可能
+duduclaw tui                 # 対話型コントロールルームとチャット
 duduclaw wizard              # 業種テンプレートでセットアップ
 duduclaw status              # システムヘルスのスナップショット
 duduclaw doctor              # ヘルス診断

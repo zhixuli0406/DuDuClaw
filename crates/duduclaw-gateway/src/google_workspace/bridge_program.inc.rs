@@ -32,10 +32,10 @@ pub(super) async fn gmail_search(
                     // bridge returns the first message of each; there is
                     // no separate thread id to report.
                     thread_id: String::new(),
-                    from: bs(m, "from"),
-                    subject: bs(m, "subject"),
+                    from: duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(m, "from")).text,
+                    subject: duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(m, "subject")).text,
                     date: bs(m, "date"),
-                    snippet: bs(m, "snippet"),
+                    snippet: duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(m, "snippet")).text,
                 })
                 .collect()
         })
@@ -61,19 +61,19 @@ pub(super) async fn gmail_read(
         .map(|arr| {
             arr.iter()
                 .map(|a| GmailAttachment {
-                    filename: bs(a, "name"),
+                    filename: duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(a, "name")).text,
                     size: bu(a, "size"),
                 })
                 .collect()
         })
         .unwrap_or_default();
-    let body = bs(&v, "body");
+    let body = duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(&v, "body")).text;
     Ok(GmailReadResult {
         id: bs(&v, "message_id"),
         thread_id: String::new(),
-        from: bs(&v, "from"),
-        to: bs(&v, "to"),
-        subject: bs(&v, "subject"),
+        from: duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(&v, "from")).text,
+        to: duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(&v, "to")).text,
+        subject: duduclaw_security::one_time_credential::strip_one_time_credentials(&bs(&v, "subject")).text,
         date: bs(&v, "date"),
         // The bridge has no separate snippet concept; the first line of
         // the body is the honest equivalent rather than a fabricated one.
@@ -110,7 +110,7 @@ pub(super) async fn gmail_create_draft(
         draft_id: bs(&v, "draft_id"),
         message_id: bs(&v, "message_id"),
         to: to.to_string(),
-        subject: subject.to_string(),
+        subject: duduclaw_security::one_time_credential::strip_one_time_credentials(subject).text,
     })
 }
 pub(super) async fn calendar_list_events(
@@ -279,5 +279,79 @@ pub(super) fn bridge_err(e: crate::google_apps_script::BridgeError) -> GoogleApi
     GoogleApiError::Api {
         status: 502,
         message: e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod credential_stripping_tests {
+    use super::*;
+
+    const LOGIN_LINK: &str = "https://example.test/magic/AbCdEf0123456789";
+    const CODE: &str = "482913";
+
+    struct FakeIo;
+    #[async_trait::async_trait]
+    impl LocalIo for FakeIo {
+        async fn call(
+            &mut self,
+            action: google_apps_script::BridgeAction,
+            params: Value,
+        ) -> Result<Value, GoogleApiError> {
+            let text = format!("驗證碼 {CODE} {LOGIN_LINK} 中文 😀");
+            let message = json!({
+                "message_id": "m123", "from": text, "to": text,
+                "subject": text, "snippet": text, "body": text,
+                "attachments": [{"name": text, "size": 12}],
+            });
+            match action {
+                google_apps_script::BridgeAction::GmailSearch => Ok(json!({"messages": [message]})),
+                google_apps_script::BridgeAction::GmailRead => Ok(message),
+                google_apps_script::BridgeAction::GmailCreateDraft => {
+                    assert_eq!(params["subject"], text);
+                    assert_eq!(params["body"], "body");
+                    Ok(json!({"draft_id": "d123", "message_id": "m123"}))
+                }
+                _ => panic!("unexpected bridge action"),
+            }
+        }
+    }
+
+    fn assert_stripped(text: &str) {
+        assert!(!text.contains(CODE), "{text}");
+        assert!(!text.contains(LOGIN_LINK), "{text}");
+        assert!(text.contains("[已移除 1 組驗證碼]"), "{text}");
+        assert!(text.contains("[已移除 1 個登入連結]"), "{text}");
+        assert!(text.contains("中文 😀"));
+    }
+
+    #[tokio::test]
+    async fn bridge_gmail_draft_strips_returned_subject() {
+        let subject = format!("驗證碼 {CODE} {LOGIN_LINK} 中文 😀");
+        let result = gmail_create_draft(&mut FakeIo, "me@example.test", &subject, "body", None).await.unwrap();
+        assert_eq!(result.draft_id, "d123");
+        assert_stripped(&result.subject);
+    }
+
+    #[tokio::test]
+    async fn bridge_gmail_search_strips_subject_and_snippet() {
+        let result = gmail_search(&mut FakeIo, "in:inbox", 1).await.unwrap();
+        assert_eq!(result.count, 1);
+        assert_eq!(result.messages[0].id, "m123");
+        assert_stripped(&result.messages[0].from);
+        assert_stripped(&result.messages[0].subject);
+        assert_stripped(&result.messages[0].snippet);
+    }
+
+    #[tokio::test]
+    async fn bridge_gmail_read_strips_subject_body_and_derived_snippet() {
+        let result = gmail_read(&mut FakeIo, "m123").await.unwrap();
+        assert_eq!(result.id, "m123");
+        assert_stripped(&result.from);
+        assert_stripped(&result.to);
+        assert_stripped(&result.attachments[0].filename);
+        assert_stripped(&result.subject);
+        assert_stripped(&result.body);
+        assert_stripped(&result.snippet);
+        assert_eq!(result.snippet, duduclaw_core::truncate_chars(result.body.lines().next().unwrap(), 200));
     }
 }
