@@ -44,7 +44,7 @@ export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: Login
   </>;
   return <form onSubmit={verify} className="space-y-4">
     <h2 className="font-medium">{t('mfa.login.title')}</h2>
-    <p className="text-sm text-muted-foreground">{t('mfa.login.hint')}</p>
+    <p className="text-sm text-muted-foreground">{t(recovery ? 'mfa.login.hintRecovery' : 'mfa.login.hint')}</p>
     {error && <p role="alert" className="text-destructive">{error}</p>}
     <label className="block space-y-2">{t(recovery ? 'mfa.recovery.code' : 'mfa.code')}
       <Input value={code} onChange={e => setCode(recovery ? e.target.value : e.target.value.replace(/\D/g, '').slice(0, 6))} required autoComplete={recovery ? 'off' : 'one-time-code'} inputMode={recovery ? 'text' : 'numeric'} />

@@ -10,6 +10,19 @@ const challenge = { mfa_required: true as const, challenge_id: 'challenge' };
 const tokens = { access_token: 'access', refresh_token: 'refresh' };
 
 describe('MFA login', () => {
+  it('shows the hint for the selected authenticator or recovery code mode', () => {
+    renderWithProviders(<LoginMfa challenge={challenge} onComplete={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.getByText('Enter a code from your authenticator. This sign-in request expires in 5 minutes and allows up to 5 attempts.')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use a recovery code' }));
+    expect(screen.getByText('Enter an unused recovery code. This sign-in request expires in 5 minutes and allows up to 5 attempts.')).toBeInTheDocument();
+    expect(screen.queryByText('Enter a code from your authenticator. This sign-in request expires in 5 minutes and allows up to 5 attempts.')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use an authenticator code' }));
+    expect(screen.getByText('Enter a code from your authenticator. This sign-in request expires in 5 minutes and allows up to 5 attempts.')).toBeInTheDocument();
+    expect(screen.queryByText('Enter an unused recovery code. This sign-in request expires in 5 minutes and allows up to 5 attempts.')).not.toBeInTheDocument();
+  });
+
   it.each([false, true])('verifies the selected factor (recovery=%s) before establishing a session', async recovery => {
     const verify = vi.spyOn(mfaApi, 'verify').mockResolvedValue(tokens);
     const establishSession = vi.fn().mockResolvedValue(undefined);
