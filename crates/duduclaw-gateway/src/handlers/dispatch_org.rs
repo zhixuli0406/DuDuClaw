@@ -780,6 +780,10 @@ impl MethodHandler {
             }
 
             // ── Autopilot (admin only) ──────────────────────
+            "autopilot.breakers" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_breakers()).await
+            }
             "autopilot.list" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_list()).await

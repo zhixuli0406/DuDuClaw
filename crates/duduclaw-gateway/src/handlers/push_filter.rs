@@ -106,6 +106,19 @@ impl PreparedPush {
         let mut task = None;
         let mut approval = None;
         match classify(event) {
+            PushRule::Agent if matches!(event, "agent.turn_started" | "agent.turn_finished")
+                && payload.get("task_id").is_some() => {
+                if let Some(id) = payload.get("task_id").and_then(Value::as_str)
+                    .filter(|id| duduclaw_core::is_valid_agent_id(id))
+                {
+                    let owner = crate::task_store::TaskStore::live_metadata(home, id)
+                        .ok().flatten().map(|(owner, _)| owner)
+                        .filter(|owner| duduclaw_core::is_valid_agent_id(owner));
+                    let audience = if owner.is_some() { task_audience(home, id) }
+                        else { TaskAudience::Unreadable };
+                    task = Some((id.to_owned(), owner, audience));
+                }
+            }
             PushRule::Task => {
                 let id = if matches!(event, "task.created" | "task.updated") {
                     payload.get("id")
@@ -216,7 +229,7 @@ impl PushGate {
 
     /// The frame to send for `line`, a redacted frame, or `None`.
     pub fn filter(&mut self, line: &str) -> Option<String> {
-        let Ok(Value::Object(frame)) = serde_json::from_str::<Value>(line) else {
+        let Ok(Value::Object(mut frame)) = serde_json::from_str::<Value>(line) else {
             return self.drop_event("unparsable", "not a JSON object");
         };
         let event = frame
@@ -289,7 +302,29 @@ impl PushGate {
                     }
                     None if matches!(event.as_str(), "agent.turn_started" | "agent.turn_finished" | "agent.status_changed") => self.drop_event(&event, "employee event without employee"),
                     None if !live.is_admin() => self.drop_event(&event, "unscoped employee event"),
-                    _ => Some(line.to_string()),
+                    _ => {
+                        if matches!(event.as_str(), "agent.turn_started" | "agent.turn_finished")
+                            && payload.get("task_id").is_some()
+                        {
+                            // Employee visibility is independent of task visibility.
+                            let may_read_task = payload.get("task_id").and_then(Value::as_str)
+                                .filter(|id| duduclaw_core::is_valid_agent_id(id))
+                                .is_some_and(|id| {
+                                    let (owner, audience) = self.task(id);
+                                    owner.filter(|owner| duduclaw_core::is_valid_agent_id(owner))
+                                        .is_some_and(|owner| {
+                                            live.has_agent_access(&owner, AccessLevel::Viewer)
+                                                && (live.is_admin() || !crate::machine_employee::requires_admin_for_id(&self.home, &owner))
+                                                && dashboard_may_read_task(&live, &audience)
+                                        })
+                                });
+                            if !may_read_task {
+                                frame.get_mut("payload")?.as_object_mut()?.remove("task_id");
+                                return serde_json::to_string(&Value::Object(frame)).ok();
+                            }
+                        }
+                        Some(line.to_string())
+                    }
                 }
             }
             PushRule::Autonomy => {
@@ -412,6 +447,83 @@ pub fn filter_push_event(home: &Path, ctx: &UserContext, line: &str) -> Option<S
 #[cfg(test)]
 mod live_event_tests {
     use super::*;
+    #[tokio::test]
+    async fn turn_task_ids_require_audience_and_live_employee_access() {
+        use crate::handlers::task_privacy_tests::{admin, fixture, OPEN, PRIVATE};
+        let f = fixture().await;
+        let root = admin(&f);
+        for event in ["agent.turn_started", "agent.turn_finished"] {
+            for (task, visible) in [(PRIVATE, false), (OPEN, true), ("missing", false), ("../bad", false)] {
+                for event_key in ["event", "type"] {
+                    let mut original = json!({"payload":{
+                        "agent_id":"sales", "task_id":task, "source":"goal", "runtime":"codex"
+                    }, "seq":17, "state_version":23, "boot_id":"boot", "extra":{"keep":true}});
+                    original[event_key] = json!(event);
+                    let line = original.to_string();
+                    let mut expected = original.clone();
+                    if !visible { expected["payload"].as_object_mut().unwrap().remove("task_id"); }
+                    let mut bob = PushGate::new(&f.home, &f.bob, false);
+                    for output in [filter_push_event(&f.home, &f.bob, &line),
+                        bob.filter_live(&line, &f.handler).await]
+                    {
+                        let output = output.expect("employee event remains visible");
+                        assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), expected);
+                        if !visible {
+                            assert!(!output.contains("task_id"));
+                            assert!(!output.contains(task));
+                        }
+                    }
+                    if task == PRIVATE {
+                        let mut alice = PushGate::new(&f.home, &f.alice, false);
+                        for output in [filter_push_event(&f.home, &f.alice, &line),
+                            filter_push_event(&f.home, &root, &line),
+                            alice.filter_live(&line, &f.handler).await]
+                        {
+                            assert_eq!(serde_json::from_str::<Value>(&output.unwrap()).unwrap(), original);
+                        }
+                    }
+                }
+            }
+            for task_id in [Value::Null, json!(42), json!("")] {
+                let line = serde_json::to_string(&WsFrame::event(event,
+                    json!({"agent_id":"sales", "task_id":task_id}))).unwrap();
+                let mut alice = PushGate::new(&f.home, &f.alice, false);
+                for output in [filter_push_event(&f.home, &f.alice, &line),
+                    alice.filter_live(&line, &f.handler).await]
+                {
+                    let output = output.unwrap();
+                    assert!(!output.contains("task_id"));
+                    assert_eq!(serde_json::from_str::<Value>(&output).unwrap()["payload"],
+                        json!({"agent_id":"sales"}));
+                }
+            }
+            let legacy = serde_json::to_string(&WsFrame::event(event, json!({"agent_id":"sales"}))).unwrap();
+            assert!(filter_push_event(&f.home, &f.bob, &legacy).is_some());
+        }
+        // An unreadable metadata database must hide the id, not employee activity.
+        let metadata = rusqlite::Connection::open(f.home.join("tasks.db")).unwrap();
+        metadata.execute("ALTER TABLE tasks RENAME TO unreadable_tasks", []).unwrap();
+        let line = serde_json::to_string(&WsFrame::event("agent.turn_started",
+            json!({"agent_id":"sales", "task_id":OPEN}))).unwrap();
+        let mut bob = PushGate::new(&f.home, &f.bob, false);
+        for output in [filter_push_event(&f.home, &f.bob, &line),
+            bob.filter_live(&line, &f.handler).await]
+        {
+            let output = output.unwrap();
+            assert!(!output.contains("task_id"));
+            assert!(!output.contains(OPEN));
+        }
+        metadata.execute("ALTER TABLE unreadable_tasks RENAME TO tasks", []).unwrap();
+        assert!(filter_push_event(&f.home, &f.bob, "{invalid").is_none());
+        assert!(bob.filter_live("{invalid", &f.handler).await.is_none());
+        let line = serde_json::to_string(&WsFrame::event("agent.turn_finished",
+            json!({"agent_id":"sales", "task_id":PRIVATE}))).unwrap();
+        f.db.unbind_agent(&f.alice.user_id, "sales").unwrap();
+        assert!(filter_push_event(&f.home, &f.alice, &line).is_none());
+        let mut alice = PushGate::new(&f.home, &f.alice, false);
+        assert!(alice.filter_live(&line, &f.handler).await.is_none());
+    }
+
     #[tokio::test]
     async fn machine_employee_frames_refuse_old_viewer_bindings_per_reader() {
         use crate::handlers::task_privacy_tests::{admin, fixture, OPEN};

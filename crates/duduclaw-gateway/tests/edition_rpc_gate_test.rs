@@ -144,6 +144,7 @@ async fn personal_edition_keeps_ordinary_methods_working() {
         "plans.list",
         "evolution.status",
         "autopilot.list",
+        "autopilot.breakers",
         "system.status",
         "ping",
     ] {
