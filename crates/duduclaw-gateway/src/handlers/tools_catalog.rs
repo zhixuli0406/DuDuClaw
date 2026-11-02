@@ -70,6 +70,8 @@ impl MethodHandler {
                     { "name": "cost.recent", "description": "Recent per-request cost records" },
                     { "name": "cost.by_model", "description": "Per-model cost rollup (requests / tokens / cost per model, costliest first)" },
                     { "name": "cost.by_role", "description": "Measured team-role cost rollup (optionally for one task)" },
+                    { "name": "autopilot.list", "description": "List autopilot rules (read-only, admin)" },
+                    { "name": "autopilot.breakers", "description": "List autopilot breaker states (read-only, admin)" },
                     { "name": "wiki.pages", "description": "List wiki pages for an agent" },
                     { "name": "wiki.read", "description": "Read a wiki page" },
                     { "name": "wiki.auto_pages", "description": "List auto-filed knowledge pages with their source chain (WP5c)" },
