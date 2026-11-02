@@ -208,6 +208,41 @@ mod identity_policy_precheck_tests {
     use super::precheck_identity_policy;
 
     #[test]
+    fn legacy_identity_store_passes_without_initializing_mfa_tables() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute_batch("CREATE TABLE users(id TEXT)").unwrap();
+        precheck_identity_policy(home.path(), false).unwrap();
+        assert!(!crate::mfa::boot_policy(home.path(), false).unwrap());
+        let tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name GLOB 'mfa_*'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(tables, 0);
+    }
+
+    #[test]
+    fn partial_mfa_identity_store_refuses_before_initialization() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute_batch("CREATE TABLE users(id TEXT); CREATE TABLE mfa_credentials(id TEXT);").unwrap();
+        assert!(precheck_identity_policy(home.path(), false).is_err());
+        assert!(conn.prepare("SELECT enforced FROM mfa_policy_state").is_err());
+        assert_eq!(crate::mfa::policy_status(home.path())["degraded"], true);
+    }
+
+    #[test]
+    fn empty_and_non_sqlite_identity_stores_refuse() {
+        for bytes in [b"".as_slice(), b"not a sqlite database".as_slice()] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("users.db");
+            std::fs::write(&path, bytes).unwrap();
+            assert!(precheck_identity_policy(home.path(), false).is_err());
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn dangling_identity_symlink_refuses_before_database_initialization() {
         let home = tempfile::tempdir().unwrap();
         let target = home.path().join("missing-users.db");
@@ -459,8 +494,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         None,
     );
     info!("edition_profile={}", boot_edition.as_str());
-    // Do not let schema initialization hide an unreadable/missing policy
-    // table in an existing non-Personal identity store.
+    // Allow an old store with no MFA tables; refuse a partial MFA schema or
+    // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())
         .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
     // Initialize the identity schema before reading its durable MFA boundary.
