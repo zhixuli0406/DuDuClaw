@@ -1,0 +1,6 @@
+---
+source: crates/duduclaw-tui/src/ui/tests.rs
+assertion_line: 1158
+expression: rendered.lines().nth(2).unwrap().trim_end()
+---
+

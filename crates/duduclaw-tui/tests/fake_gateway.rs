@@ -63,10 +63,15 @@ struct Fixture {
     reject_upgrade: AtomicBool,
     fail_version: AtomicBool,
     list_calls: AtomicUsize,
+    autonomy_calls: AtomicUsize,
+    autonomy_paused: AtomicBool,
+    autonomy_refused: AtomicBool,
     list_delay_ms: AtomicU64,
     short_token: bool,
     flood: AtomicUsize,
     task_calls: AtomicUsize,
+    run_subscriptions: std::sync::Mutex<Vec<Value>>,
+    run_subscription_supported: AtomicBool,
     decisions: std::sync::Mutex<Vec<(String, Value)>>,
     digest_mismatch: AtomicBool,
     employee_role: AtomicBool,
@@ -114,10 +119,15 @@ impl Gateway {
             reject_upgrade: AtomicBool::new(false),
             fail_version: AtomicBool::new(false),
             list_calls: AtomicUsize::new(0),
+            autonomy_calls: AtomicUsize::new(0),
+            autonomy_paused: AtomicBool::new(false),
+            autonomy_refused: AtomicBool::new(false),
             list_delay_ms: AtomicU64::new(0),
             short_token,
             flood: AtomicUsize::new(0),
             task_calls: AtomicUsize::new(0),
+            run_subscriptions: std::sync::Mutex::new(Vec::new()),
+            run_subscription_supported: AtomicBool::new(false),
             decisions: std::sync::Mutex::new(Vec::new()),
             digest_mismatch: AtomicBool::new(false),
             employee_role: AtomicBool::new(false),
@@ -267,6 +277,26 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                 }
                                 json!({"version":"fixture","edition":"community","auto_update":false})
                             },
+                            "autonomy.status" => {
+                                assert_eq!(params, json!({}));
+                                f.autonomy_calls.fetch_add(1, Ordering::SeqCst);
+                                let agents = if f.autonomy_paused.load(Ordering::SeqCst) {
+                                    json!({"adu":{"reason":"operator","who":"u1","at":"2026-11-02T00:00:00Z"}})
+                                } else { json!({}) };
+                                json!({"global":null,"agents":agents,"state_error":null})
+                            }
+                            "autonomy.pause" | "autonomy.resume" => {
+                                f.decisions.lock().unwrap().push((method.clone(), params.clone()));
+                                if f.autonomy_refused.load(Ordering::SeqCst) || params["all"] == true {
+                                    if !send(&mut socket, WsFrame::error_response(&id, "permission denied")).await { return; }
+                                    continue;
+                                }
+                                assert_eq!(params, json!({"agent_id":"adu"}));
+                                let paused = method == "autonomy.pause";
+                                f.autonomy_paused.store(paused, Ordering::SeqCst);
+                                json!({"agent_id":"adu","all":false,"paused":paused,"applied":true,
+                                    "pause":if paused { json!({"reason":"operator","who":"u1","at":"2026-11-02T00:00:00Z"}) } else { Value::Null }})
+                            }
                             "users.me" => json!({"user":{"id":"u1","role":f.role()},"bindings":[{"agent_name":"adu","access_level":"operator"}]}),
                             "approvals.decide" | "tasks.goal_decide" => {
                                 f.decisions.lock().unwrap().push((method.clone(), params.clone()));
@@ -329,8 +359,14 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                 }
                             }
                             "runs.subscribe" => {
-                                if !send(&mut socket, WsFrame::error_response(&id, "Unknown method: runs.subscribe")).await { return; }
-                                continue;
+                                f.run_subscriptions.lock().unwrap().push(params.clone());
+                                assert!(params.get("run_id").and_then(Value::as_str).is_some());
+                                assert!(params.get("agent_id").is_none());
+                                if !f.run_subscription_supported.load(Ordering::SeqCst) {
+                                    if !send(&mut socket, WsFrame::error_response(&id, "Unknown method: runs.subscribe")).await { return; }
+                                    continue;
+                                }
+                                json!({"subscribed":true,"run_id":params["run_id"]})
                             }
                             "runs.get" => json!({"run":{"id":"r1","agent_id":"adu"},"events":[{"kind":"text","label":"assistant","ts":"09:00","preview":"done"}]}),
                             "runs.list" => {

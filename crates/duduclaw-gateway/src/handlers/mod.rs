@@ -306,6 +306,7 @@ pub struct MethodHandler {
     task_store: RwLock<Option<Arc<TaskStore>>>,
     /// SQLite-backed autopilot rule store. Injected after gateway starts.
     autopilot_store: RwLock<Option<Arc<AutopilotStore>>>,
+    autopilot_breakers: RwLock<Option<crate::autopilot_engine::BreakerReader>>,
     /// Event broadcast sender for real-time task/activity events.
     event_tx: RwLock<Option<tokio::sync::broadcast::Sender<String>>>,
     /// Typed event broadcast sender consumed by `AutopilotEngine`.

@@ -74,9 +74,18 @@ impl HumanTask {
     }
 }
 #[derive(Clone, Debug)]
+pub struct Breaker {
+    pub key: String,
+    pub autopilot: bool,
+    pub subject: TerminalText,
+    pub agent: TerminalText,
+    pub title: TerminalText,
+}
+#[derive(Clone, Debug)]
 pub enum InboxItem {
     Approval(Approval),
     Task(HumanTask),
+    Breaker(Breaker),
 }
 impl InboxItem {
     pub fn source_label(&self) -> &'static str {
@@ -88,7 +97,7 @@ impl InboxItem {
             {
                 strings::SOURCE_QUESTION
             }
-            Self::Approval(a) if a.kind.is("budget_breaker") || a.kind.is("autopilot_breaker") => strings::SOURCE_BREAKER,
+            Self::Breaker(_) => strings::SOURCE_BREAKER,
             Self::Approval(_) => strings::SOURCE_APPROVAL,
             Self::Task(_) => strings::SOURCE_GOAL,
         }
@@ -113,6 +122,14 @@ impl<T> Default for Snapshot<T> {
         }
     }
 }
+impl Snapshot<InboxItem> {
+    pub fn actionable_count(&self) -> Option<usize> {
+        self.count().map(|_| self.items.iter().filter(|item| matches!(item, InboxItem::Approval(_) | InboxItem::Task(_))).count())
+    }
+    pub fn informational_count(&self) -> Option<usize> {
+        self.count().map(|_| self.items.iter().filter(|item| matches!(item, InboxItem::Breaker(_))).count())
+    }
+}
 impl<T> Snapshot<T> {
     pub fn count(&self) -> Option<usize> {
         (!self.stale && !self.refetch_pending).then_some(self.items.len())
@@ -132,7 +149,10 @@ impl<T> Snapshot<T> {
 #[derive(Clone, Debug, Default)]
 pub struct Model {
     pub schedules: Snapshot<ScheduledRun>,
-    pub autonomy: Option<TerminalText>,
+    pub cost_millicents: Option<u64>,
+    pub cost_today: bool,
+    pub breakers: Vec<Breaker>,
+    pub autonomy: Snapshot<crate::autonomy::Status>,
     pub activity: HashMap<String, Activity>,
     pub recent_activity: HashMap<String, Activity>,
     pub inbox: Snapshot<InboxItem>,
@@ -147,15 +167,25 @@ pub struct Model {
     revision: u64,
 }
 impl Model {
+    pub fn observed_working(&self) -> Option<usize> {
+        if self.employees.count().is_none() || self.activity.is_empty()
+            || self.employees.items.iter().any(|e| e.status.is("working") && self.activity.get(e.id()).is_none_or(|a| a.turns.is_empty())) {
+            return None;
+        }
+        Some(self.activity.values().map(|a| a.turns.len()).sum())
+    }
     pub fn invalidate_all(&mut self) {
+        self.cost_millicents = None;
+        self.autonomy.invalidate();
         self.inbox.invalidate();
         self.employees.invalidate();
         self.schedules.invalidate();
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn connected(&mut self, info: &ConnectionInfo) {
+        self.breakers.clear();
+        self.inbox.items.retain(|i| !matches!(i, InboxItem::Breaker(_)));
         self.activity.clear();
-        self.autonomy = info.autonomy.clone();
         self.generation = info.generation;
         self.role = Some(info.role);
         self.boot_id = info.boot_id.clone();
@@ -176,6 +206,7 @@ impl Model {
             self.seq = None;
             self.invalidate_all();
         }
+        if !boot_changed && event.seq.is_some() && event.seq == self.seq { return; }
         let regressed = event.seq.zip(self.seq).is_some_and(|(new, old)| new < old);
         if let Some(seq) = event.seq {
             // A gap or a regression invalidates; exact duplicates are harmless.
@@ -194,12 +225,23 @@ impl Model {
             .is_some_and(|id| self.employees.items.iter().any(|e| e.id() == id)) {
             crate::state_extra::activity_event(&mut self.activity, &event.name, &event.payload);
         }
-        if event.name == "autonomy.changed" {
-            self.autonomy = event.payload.get("state").or_else(|| event.payload.get("autonomy"))
-                .filter(|value| !value.is_null())
-                .map(|value| TerminalText::new(value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())));
-        }
         match event.name.as_str() {
+            "budget.breaker_open" | "autopilot.breaker_open" if !regressed && self.role == Some(Role::Admin) => {
+                let autopilot = event.name == "autopilot.breaker_open";
+                let field = if autopilot { "rule_id" } else { "agent_id" };
+                if let Some(id) = event.payload[field].as_str().filter(|id| !id.is_empty() && id.len() <= 1024) {
+                    let breaker = Breaker { key: format!("{}:{id}", event.name), autopilot,
+                        subject: TerminalText::new(id.into()),
+                        agent: TerminalText::new(if autopilot { String::new() } else { id.into() }),
+                        title: TerminalText::new(strings::BREAKER_EVENT.into()) };
+                    self.breakers.retain(|b| b.key != breaker.key);
+                    if self.breakers.len() == 128 { self.breakers.remove(0); }
+                    self.breakers.push(breaker);
+                    self.inbox.items.retain(|i| !matches!(i, InboxItem::Breaker(_)));
+                    self.inbox.items.extend(self.breakers.iter().cloned().map(InboxItem::Breaker));
+                }
+            }
+
             "events_lost" => { self.activity.clear(); self.invalidate_all(); },
             "approval.created" | "approval.decided" | "approval.expired" => {
                 self.inbox.invalidate();
@@ -221,11 +263,19 @@ impl Model {
         }
         match result {
             Ok(lists) => {
+                match lists.autonomy {
+                    Ok(status) => self.autonomy.replace(vec![status]),
+                    Err(error) => { self.autonomy.invalidate(); self.autonomy.error = Some(error); }
+                }
                 self.role = lists.role;
+                self.cost_millicents = lists.cost_millicents;
+                self.cost_today = lists.cost_today;
+                if self.role != Some(Role::Admin) { self.breakers.clear(); }
                 self.goal_operators = lists.goal_operators;
                 self.employees.replace(lists.employees);
                 self.activity.retain(|id, _| self.employees.items.iter().any(|e| e.id() == id));
                 self.inbox.replace(lists.inbox);
+                self.inbox.items.extend(self.breakers.iter().cloned().map(InboxItem::Breaker));
                 match lists.recent_activity {
                     Ok(activity) => self.recent_activity = activity,
                     Err(error) => { self.employees.invalidate(); self.employees.error = Some(error); }
@@ -236,6 +286,9 @@ impl Model {
                 }
             }
             Err(error) => {
+                self.cost_millicents = None;
+                self.autonomy.invalidate();
+                self.autonomy.error = Some(error);
                 self.inbox.invalidate();
                 self.employees.invalidate();
                 self.schedules.invalidate();
@@ -247,6 +300,9 @@ impl Model {
     }
 }
 struct Lists {
+    cost_millicents: Option<u64>,
+    cost_today: bool,
+    autonomy: Result<crate::autonomy::Status>,
     role: Option<Role>,
     goal_operators: HashSet<String>,
     recent_activity: Result<HashMap<String, Activity>>,
@@ -254,12 +310,24 @@ struct Lists {
     employees: Vec<Employee>,
     inbox: Vec<InboxItem>,
 }
+pub(crate) fn cost_amount(value: &Value) -> Option<u64> {
+    (value["available"] == true).then(|| value["total_cost_millicents"].as_u64()).flatten()
+}
+
+fn parse_autonomy(value: Value, budget: &mut crate::budget::SnapshotBudget) -> Result<crate::autonomy::Status> {
+    budget.charge_map(&value, "agents")?;
+    crate::autonomy::Status::parse(value)
+}
 async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     #[derive(Deserialize)]
     struct Agents {
         agents: Vec<Employee>,
     }
     let mut budget = crate::budget::SnapshotBudget::default();
+    let autonomy = match client.call("autonomy.status", json!({}), RPC_TIMEOUT).await {
+        Ok(value) => parse_autonomy(value, &mut budget),
+        Err(error) => Err(error),
+    };
     let response = client.call("agents.list", json!({}), RPC_TIMEOUT).await?;
     budget.charge(&response, "agents")?;
     let agents: Agents = serde_json::from_value(response).map_err(|_| Error::Protocol)?;
@@ -278,6 +346,9 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
         }
     }
     let role = live_role.unwrap_or(role);
+    let (cost_millicents, cost_today) = if role == Role::Admin {
+        crate::state_extra::cost_summary(client).await
+    } else { (None, false) };
     // approvals.list requires Manager, whereas goal_decide accepts an
     // employee's Operator binding. Do not fail the whole employee inbox by
     // making an RPC that its role cannot call.
@@ -353,6 +424,9 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     let schedules = if matches!(role, Role::Admin | Role::Manager) { crate::state_extra::schedules(client, role, &mut budget).await } else { Ok(Vec::new()) };
     if matches!(schedules, Err(Error::SnapshotBudget)) { return Err(Error::SnapshotBudget); }
     Ok(Lists {
+        cost_millicents,
+        cost_today,
+        autonomy,
         role: live_role,
         goal_operators,
         recent_activity,
@@ -476,12 +550,24 @@ async fn run_with_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn autonomy_wire_shape_uses_shared_item_and_byte_budget() {
+        let mut budget = crate::budget::SnapshotBudget::default();
+        for agents in [json!({}), json!({"adu":{"reason":"operator","who":"u1","at":"now"}})] {
+            let status = parse_autonomy(json!({"global":null,"agents":agents,"state_error":null}), &mut budget).unwrap();
+            assert_eq!(status.agents.len(), agents.as_object().unwrap().len());
+        }
+        assert_eq!(budget.ensure_items(2_000), Err(Error::SnapshotBudget));
+        let oversized = json!({"global":null,"agents":{},"state_error":"x".repeat(4 * 1024 * 1024)});
+        assert!(matches!(parse_autonomy(oversized, &mut budget), Err(Error::SnapshotBudget)));
+        assert!(matches!(parse_autonomy(json!({"global":null,"agents":[],"state_error":null}), &mut Default::default()), Err(Error::Protocol)));
+    }
     #[tokio::test]
     async fn explicit_decision_refetch_invalidates_and_waits_for_authoritative_lists() {
         use tokio::sync::{mpsc, oneshot};
         let (_conn_tx, connection) = watch::channel(ConnectionState::Connected(ConnectionInfo {
             generation: 1, user_id: "u1".into(), role: Role::Admin,
-            boot_id: Some("boot".into()), version: None, autonomy: None,
+            boot_id: Some("boot".into()), version: None,
         }));
         let (_events, event_rx) = broadcast::channel(16);
         let refresh = std::sync::Arc::new(Notify::new());
@@ -492,7 +578,7 @@ mod tests {
                 let requests = requests.clone();
                 Box::pin(async move { let (reply, rx) = oneshot::channel(); requests.send(reply).unwrap(); rx.await.unwrap() })
             }));
-        let complete = || Ok(Lists { role: Some(Role::Admin), goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()),
+        let complete = || Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin), goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()),
             schedules: Ok(vec![]), employees: vec![], inbox: vec![] });
         tokio::time::timeout(Duration::from_secs(2), async {
             calls.recv().await.unwrap().send(complete()).unwrap_or_else(|_| panic!("fetch dropped"));
@@ -511,7 +597,7 @@ mod tests {
         let mut m = Model::default();
         assert!(m.apply(
             0,
-            Ok(Lists { role: Some(Role::Admin),
+            Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -536,7 +622,7 @@ mod tests {
 
         let (_connection, connection) = watch::channel(ConnectionState::Connected(ConnectionInfo {
             generation: 1, user_id: "u1".into(), role: Role::Admin,
-            boot_id: Some("boot-a".into()), version: None, autonomy: None,
+            boot_id: Some("boot-a".into()), version: None,
         }));
         let (events, event_rx) = broadcast::channel(32);
         let (tx, mut models) = watch::channel(Model::default());
@@ -549,7 +635,7 @@ mod tests {
                 result.await.unwrap()
             })
         }));
-        let complete = || Ok(Lists { role: Some(Role::Admin),
+        let complete = || Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
@@ -641,7 +727,6 @@ mod tests {
             role: Role::Admin,
             boot_id: None,
             version: None,
-            autonomy: None,
         });
         assert_eq!(m.inbox.count(), None);
     }
@@ -660,7 +745,7 @@ mod tests {
         m.invalidate_all();
         assert!(!m.apply(
             old_revision,
-            Ok(Lists { role: Some(Role::Admin),
+            Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -673,7 +758,7 @@ mod tests {
         assert_eq!(m.inbox.count(), None);
         assert!(m.apply(
             m.revision,
-            Ok(Lists { role: Some(Role::Admin),
+            Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
                 goal_operators: HashSet::new(),
                 recent_activity: Ok(HashMap::new()),
                 schedules: Ok(vec![]),
@@ -713,7 +798,7 @@ mod tests {
         }
         assert!(model.activity.is_empty());
         model.activity.insert("removed".into(), Activity::default());
-        assert!(model.apply(model.revision, Ok(Lists { role: Some(Role::Admin),
+        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]),
             employees: vec![], inbox: vec![],
@@ -724,7 +809,7 @@ mod tests {
     #[test]
     fn unavailable_history_does_not_claim_fresh_employee_state() {
         let mut model = fresh();
-        assert!(model.apply(model.revision, Ok(Lists { role: Some(Role::Admin),
+        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
             goal_operators: HashSet::new(),
             recent_activity: Err(Error::RpcRejected),
             schedules: Ok(vec![]), employees: vec![], inbox: vec![],
@@ -732,6 +817,61 @@ mod tests {
         assert_eq!(model.inbox.count(), Some(0));
         assert_eq!(model.employees.count(), None);
         assert_eq!(model.employees.error, Some(Error::RpcRejected));
+    }
+
+    #[test]
+    fn autonomy_resume_invalidation_and_failed_refetch_never_display_cached_pause() {
+        let mut model = fresh();
+        let status = crate::autonomy::Status::parse(json!({"global":null,
+            "agents":{"adu":{"reason":"operator","who":"u1","at":"now"}},"state_error":null})).unwrap();
+        model.autonomy.replace(vec![status]);
+        assert!(crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_PAUSED));
+        let mut changed = event("autonomy.changed", Some(1), Some("boot"));
+        changed.payload = json!({"agent_id":"adu","all":false,"paused":false,"at":"now"});
+        model.event(&changed);
+        assert!(model.autonomy.paused("adu"));
+        assert!(model.autonomy.stale && model.autonomy.refetch_pending);
+        assert!(crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_UNKNOWN));
+        assert!(!crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_PAUSED));
+        assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Err(Error::Network), role: Some(Role::Admin),
+            goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]), employees: vec![], inbox: vec![] })));
+        assert!(model.autonomy.paused("adu"));
+        assert!(model.autonomy.unreadable());
+        let line = crate::autonomy::status_line(&model).unwrap().plain();
+        assert!(line.contains(strings::AUTONOMY_UNKNOWN));
+        assert!(!line.contains(strings::AUTONOMY_PAUSED));
+    }
+
+    #[tokio::test]
+    async fn autonomy_refetches_on_connect_reconnect_loss_and_each_change() {
+        use tokio::sync::{mpsc, oneshot};
+        let info = ConnectionInfo { generation: 1, user_id: "u1".into(), role: Role::Admin,
+            boot_id: Some("boot".into()), version: None };
+        let (conn_tx, connection) = watch::channel(ConnectionState::Connected(info.clone()));
+        let (events, event_rx) = broadcast::channel(16);
+        let (tx, mut models) = watch::channel(Model::default());
+        let (requests, mut calls) = mpsc::unbounded_channel::<oneshot::Sender<Result<Lists>>>();
+        let task = tokio::spawn(run_with_sources(connection, event_rx, tx, Duration::from_secs(3600),
+            std::sync::Arc::new(Notify::new()), move |_| {
+                let requests = requests.clone();
+                Box::pin(async move { let (reply, rx) = oneshot::channel(); requests.send(reply).unwrap(); rx.await.unwrap() })
+            }));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for step in 0..5 {
+                match step {
+                    1 => { conn_tx.send_replace(ConnectionState::Connected(ConnectionInfo { generation: 2, ..info.clone() })); }
+                    2 => { assert!(events.send(event("events_lost", Some(1), Some("boot"))).is_ok()); }
+                    3 | 4 => { assert!(events.send(event("autonomy.changed", Some(step), Some("boot"))).is_ok()); }
+                    _ => {}
+                }
+                let pending = calls.recv().await.unwrap();
+                assert!(models.borrow().autonomy.stale);
+                pending.send(Ok(Lists { cost_millicents: None, cost_today: false, autonomy: Ok(crate::autonomy::Status::default()), role: Some(Role::Admin),
+                    goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]), employees: vec![], inbox: vec![] })).unwrap_or_else(|_| panic!("fetch dropped"));
+                loop { models.changed().await.unwrap(); if !models.borrow().autonomy.stale { break; } }
+            }
+        }).await.unwrap();
+        task.abort();
     }
 
 }
