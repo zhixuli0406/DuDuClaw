@@ -79,9 +79,8 @@ pub fn employee_status(employee: &Employee, model: &Model, read: &ReadState) -> 
     if employee.status.is("paused") {
         return EmployeeStatus::Paused;
     }
-    if model.autonomy.unreadable() { return EmployeeStatus::AutonomyUnknown; }
+    if model.autonomy.unconfirmed() { return EmployeeStatus::AutonomyUnknown; }
     if model.autonomy.paused(employee.id()) { return EmployeeStatus::AutonomyPaused; }
-    if model.autonomy.stale || model.autonomy.refetch_pending { return EmployeeStatus::AutonomyUnknown; }
     if completion_ids(model, employee.id()).any(|id| !read.contains(id)) {
         return EmployeeStatus::Done;
     }
