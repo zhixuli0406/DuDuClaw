@@ -49,8 +49,7 @@ async fn load(gateway: &impl Gateway, pane: &Pane) -> ReadResult<Data> {
                 let run_rows = rows(&runs, "runs")?;
                 truncated |= run_rows.len() >= 20;
                 for mut run in run_rows.into_iter().take(20) {
-                    // Fixture runs cannot be read/cancelled through workflow_runs.get.
-                    if run["activation_id"].as_str().is_none() { continue; }
+                    run["activation_id"].as_str().ok_or_else(protocol)?;
                     run["_tui_owner"] = draft["owner"].clone();
                     data.rows.push(run);
                 }

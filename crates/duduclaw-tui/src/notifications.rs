@@ -27,8 +27,9 @@ impl Notifications {
     pub fn focus(&mut self, focused: bool) {
         self.focused = focused;
     }
-    pub fn update(&mut self, count: Option<usize>, now: Instant) -> Option<String> {
-        let count = count?;
+    /// Callers supply only actionable approvals and tasks, excluding informational rows.
+    pub fn update(&mut self, actionable_count: Option<usize>, now: Instant) -> Option<String> {
+        let count = actionable_count?;
         let rises = count > self.previous;
         self.previous = count;
         if !self.enabled

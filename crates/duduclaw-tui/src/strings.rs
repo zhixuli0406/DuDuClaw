@@ -112,7 +112,7 @@ pub const CARD_WAIT: &str = "卡片剛開啟，請稍候一秒再操作";
 pub const CARD_CODE: &str = "核准確認碼：";
 pub const CARD_APPROVAL_KEYS: &str = "輸入確認碼後按 Enter 核准；n 拒絕";
 pub const CARD_GOAL_KEYS: &str = "r 重試；a 中止 / d 完成 / t 接手（同鍵再按一次）";
-pub const CARD_CONTINUE_KEYS: &str = "c 輸入接續訊息；已有訊息時 c 送出；i 修改";
+pub const CARD_CONTINUE_KEYS: &str = "c 輸入接續訊息";
 pub const CARD_NAV: &str = "↑↓ / PgUp PgDn 捲動；s 稍後；Esc 關卡";
 pub const CARD_NAV_NO_SNOOZE: &str = "↑↓ / PgUp PgDn 捲動；Esc 關卡";
 pub const CARD_SCROLL: &str = "高風險操作：請先捲動完整內容到底部；n 可拒絕";
@@ -345,7 +345,7 @@ pub const PLAN_FIRST: &str = "先擬計畫";
 pub const PLAN_APPROVE: &str = "核准計畫";
 pub const PLAN_KEYS: &str = "核准計畫：捲到底部，輸入確認碼後按 Enter；a 中止（連按兩次）";
 pub const CONTINUE_OPEN: &str = "c 輸入接續訊息";
-pub const CONTINUE_EDIT: &str = "輸入接續訊息；Enter 核對；Esc 返回";
+pub const CONTINUE_EDIT: &str = "輸入接續訊息；Enter 核對；Esc 清除並關閉";
 pub const BREAKER_EVENT: &str = "曾收到斷路器開啟事件；Enter 查看目前資料（非決策卡）";
 pub fn working_runs(count: Option<usize>) -> String {
     format!("執行中 {} 次（已觀測）", count.map(|n| n.to_string()).unwrap_or_else(|| "?".into()))
@@ -358,3 +358,6 @@ pub const YES: &str = "是";
 pub const NO: &str = "否";
 
 pub const WORKING_TASK_UNKNOWN: &str = "此次執行的任務未知；以下是員工的任務清單，並非執行連結";
+
+pub const CONTINUE_REVIEW: &str = "核對接續訊息（全文）；捲動到底後輸入確認碼，再按 Enter 送出";
+pub fn inbox_information(count: usize) -> String { format!("資訊 {count}") }

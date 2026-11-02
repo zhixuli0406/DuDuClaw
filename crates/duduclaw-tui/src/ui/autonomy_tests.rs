@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::{sync::Mutex, time::{Duration, Instant}};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Fixture { Populated, Empty, Refused, Unavailable, Hostile }
+enum Fixture { Populated, Empty, Refused, Unavailable, Hostile, MissingActivation, InvalidActivation }
 struct FakeGateway { state: Fixture, fail_at: Option<&'static str>, task_present: bool, calls: Mutex<Vec<(String, Value)>> }
 impl FakeGateway {
     fn new(state: Fixture) -> Self { Self { state, fail_at: None, task_present: false, calls: Mutex::new(vec![]) } }
@@ -28,7 +28,9 @@ impl Gateway for FakeGateway {
         let empty = self.state == Fixture::Empty;
         let name = if self.state == Fixture::Hostile { format!("惡意\u{1b}]52;clipboard\u{7}\u{202e}{}", "長".repeat(300)) } else { "每週報告".into() };
         let list = |value: Value| if empty { json!([]) } else { json!([value]) };
-        let run = json!({"run_id":"w1","workflow_id":name,"revision":2,"activation_id":"a1","status":"running","error_code":null,"created_at":"2026-11-02T08:00:00Z","deadline_at":"2026-11-03T08:00:00Z","steps":[{"step_id":name,"status":"pending","error_code":null}]});
+        let mut run = json!({"run_id":"w1","workflow_id":name,"revision":2,"activation_id":"a1","status":"running","error_code":null,"created_at":"2026-11-02T08:00:00Z","deadline_at":"2026-11-03T08:00:00Z","steps":[{"step_id":name,"status":"pending","error_code":null}]});
+        if self.state == Fixture::MissingActivation { run.as_object_mut().unwrap().remove("activation_id"); }
+        if self.state == Fixture::InvalidActivation { run["activation_id"] = json!(42); }
         let value = match method {
             "workflow_drafts.list" => {
                 assert_eq!(params, json!({"task_id":"t1"}));
@@ -186,7 +188,12 @@ fn finished_goal_single_c_focuses_required_message_no_empty_send() {
     app.paste("下一步\u{1b}");
     let ready=now+Duration::from_secs(2);
     app.key_at(key(KeyCode::Enter),&model,ready,1000);
-    let Action::Decide(Decision::Goal { action:GoalAction::Continue,message,.. })=press(&mut app,'c',&model,ready) else { panic!("continue message"); };
+    assert_eq!(press(&mut app,'c',&model,ready),Action::None);
+    app.card.as_mut().unwrap().viewport(1,20);
+    let code=app.card.as_ref().unwrap().code.clone();
+    let ready=ready+Duration::from_secs(1);
+    for ch in code.chars() { press(&mut app,ch,&model,ready); }
+    let Action::Decide(Decision::Goal { action:GoalAction::Continue,message,.. })=app.key_at(key(KeyCode::Enter),&model,ready,1000) else { panic!("continue message"); };
     assert_eq!(message,"下一步");
 }
 #[test]
@@ -334,4 +341,38 @@ fn workflow_cancel_extra_digit_does_not_confirm() {
     for c in "420".chars() { press(&mut app,c,&model,ready); }
     assert_eq!(app.key_at(key(KeyCode::Enter),&model,ready,1000),Action::None);
     assert!(app.control_card.is_some());
+}
+
+#[tokio::test]
+async fn malformed_workflow_activation_is_a_protocol_error_not_empty_data() {
+    for state in [Fixture::MissingActivation,Fixture::InvalidActivation] {
+        let fake=FakeGateway::new(state); let mut app=app(Block::Workflow);
+        app.blocks.panes[0].task_id=Some("t1".into());
+        let data=fetch::pane(&fake,&app.blocks.panes[0],true).await.unwrap();
+        assert!(data.stale); assert!(data.rows.is_empty());
+        assert_eq!(data.error.unwrap().plain(),crate::Error::Protocol.to_string());
+        assert!(fake.calls.lock().unwrap().iter().all(|(method,_)| method != "workflow_runs.get"));
+    }
+}
+#[test]
+fn breaker_flood_does_not_consume_approval_notification_throttle() {
+    let now=Instant::now(); let mut model=model();
+    let mut notifications=crate::notifications::Notifications::new(true,crate::notifications::Route::Direct);
+    model.inbox.items.clear();
+    for i in 0..200 {
+        model.event(&crate::client::ServerEvent { name:"autopilot.breaker_open".into(),payload:json!({"rule_id":format!("r{i}")}),seq:None,boot_id:None });
+        assert!(notifications.update(model.inbox.actionable_count(),now).is_none());
+    }
+    assert_eq!(model.inbox.actionable_count(),Some(0));
+    assert_eq!(model.inbox.informational_count(),Some(128));
+    let approval=serde_json::from_value(json!({"id":"a1","agent_id":"adu","kind":"tool","summary":"approval","status":"pending","decided_in_dashboard_only":false})).unwrap();
+    model.inbox.items.push(crate::state::InboxItem::Approval(approval));
+    assert_eq!(model.inbox.actionable_count(),Some(1));
+    assert!(notifications.update(model.inbox.actionable_count(),now+Duration::from_secs(1)).is_some());
+    model.inbox.items.push(crate::state::InboxItem::Task(serde_json::from_value(task()).unwrap()));
+    assert_eq!(model.inbox.actionable_count(),Some(2));
+    assert_eq!(model.inbox.informational_count(),Some(128));
+    model.inbox.stale=true;
+    assert_eq!(model.inbox.actionable_count(),None);
+    assert_eq!(model.inbox.informational_count(),None);
 }

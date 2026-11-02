@@ -1,12 +1,11 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
-assertion_line: 193
 expression: "screen(&m, &a, &Settings::default(), 60, 32)"
 ---
 DuDuClaw 控制室 | /home/使用者/.duduclaw
 閘道 1.77.0 | 已連線 | 執行中 ? 次（已觀測）
 
-+-收件匣 (4)----------------++-> 1 詳情--------------------+
++-收件匣 (3) · 資訊 1-------++-> 1 詳情--------------------+
 |> [審核] adu · tool · 確認 ||{                            |
 |  [目標任務] writer · 需要 ||  "agent_id": "adu",         |
 |  [斷路器] 預算事件 · adu ·||  "decided_in_dashboard_only"|

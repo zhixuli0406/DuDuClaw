@@ -146,7 +146,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 app.chat = chat_state.borrow_and_update().clone();
             }
             app.spinner = (started.elapsed().as_millis() / 150) as usize;
-            if let Some(sequence) = notifications.update(model.inbox.count(), std::time::Instant::now()) {
+            if let Some(sequence) = notifications.update(model.inbox.actionable_count(), std::time::Instant::now()) {
                 use std::io::Write;
                 std::io::stdout().write_all(sequence.as_bytes()).map_err(|_| Error::Output)?;
                 std::io::stdout().flush().map_err(|_| Error::Output)?;

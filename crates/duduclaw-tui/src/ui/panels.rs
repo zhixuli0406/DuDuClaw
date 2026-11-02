@@ -24,7 +24,9 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
     let inside = panel(
         frame,
         left[0],
-        &title(strings::INBOX, model.inbox.count()),
+        &format!("{}{}", title(strings::INBOX, model.inbox.actionable_count()),
+            model.inbox.informational_count().filter(|n| *n > 0)
+                .map(|n| format!(" · {}", strings::inbox_information(n))).unwrap_or_default()),
         settings,
         stale_inbox,
     );
