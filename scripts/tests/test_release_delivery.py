@@ -358,15 +358,23 @@ with Path("calls").open("a") as f: f.write("gh " + " ".join(args) + "\\n")
 if args[:2] == ["release", "view"]:
     if "v1.2.4" in args:
         if not s["exists"]: sys.exit(1)
-        print(json.dumps(dict(tagName="v"+s["version"], isDraft=s["draft"], isPrerelease=s["prerelease"], assets=[{}]*s["assets"])))
+        print(json.dumps(dict(tagName="v"+s["version"], isDraft=s["draft"], isPrerelease=s["prerelease"], assets=[{"name":"replacement" if n == s.get("missing_asset") else n} for n in ([base+suffix for base in ("duduclaw-darwin-arm64.tar.gz", "duduclaw-darwin-x64.tar.gz", "duduclaw-linux-arm64.tar.gz", "duduclaw-linux-x64.tar.gz", "duduclaw-windows-x64.zip") for suffix in ("", ".sha256", ".minisig")] + ["extra"]*25)[:s["assets"]]])))
     else: print(s["latest"])
 elif args[:2] == ["release", "download"]:
-    print(json.dumps(dict(version=s["desktop"], platforms={str(i):{} for i in range(s["platforms"])})))
+    keys=["darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"]+[str(i) for i in range(5)]
+    print(json.dumps(dict(version=s["desktop"], platforms={("replacement" if k == s.get("missing_platform") else k):{"url":s.get("desktop_url", "https://example/desktop-v1.2.4/file")} for k in keys[:s["platforms"]]})))
+elif args[0] == "api": print("42")
 elif args[:2] == ["pr", "list"]: print("42" if s["pr"] else "")
 elif args[:2] == ["pr", "create"]:
     s["pr"]=True; Path("settings.json").write_text(json.dumps(s))
 elif args[:2] == ["pr", "checks"]:
-    if "--json" in args and "--jq" in args:
+    if "name,bucket" in args:
+        p=Path("rust-polls"); n=int(p.read_text()) if p.exists() else 0; p.write_text(str(n+1))
+        buckets=s.get("rust_buckets", ["pass"])
+        bucket=buckets[min(n,len(buckets)-1)]
+        print(json.dumps([{"name":"Rust ubuntu-latest", "bucket":bucket}]))
+        sys.exit(8 if bucket == "pending" else 1 if bucket in ("fail", "cancel") else 0)
+    elif "--json" in args and "--jq" in args:
         count=Path("required-check-polls"); polls=int(count.read_text()) if count.exists() else 0
         count.write_text(str(polls+1))
         # Existing PRs have required checks immediately; tests can opt into
@@ -449,7 +457,7 @@ print(json.dumps({"info": {"version": s[row]}} if row == "pypi" else {"version":
     def test_no_merge_waits_then_prints_command_without_publishing_tags(self):
         result = self.run_release("ship", "1.2.4", "--no-merge")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("gh pr merge 42 --merge", result.stdout)
+        self.assertIn('gh pr merge 42 --merge --match-head-commit "'+self.git("rev-parse", "HEAD")+'"', result.stdout)
         self.assertIn("gh pr checks 42 --required --watch", self.calls())
         self.assertNotIn("gh pr merge", self.calls())
         self.assertEqual(self.git("ls-remote", "origin", "refs/tags/*"), "")
@@ -462,11 +470,13 @@ print(json.dumps({"info": {"version": s[row]}} if row == "pypi" else {"version":
         self.assertEqual((self.root / "required-check-polls").read_text(), "2")
         self.assertIn("gh pr checks 42 --required --watch", self.calls())
 
-    def test_admin_warns_skips_checks_and_requires_explicit_flag(self):
+    def test_admin_warns_waits_for_rust(self):
+        self.settings["rust_buckets"] = ["pending", "pass"]
         result = self.run_release("ship", "1.2.4", "--admin")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("WARNING: --admin skips", result.stdout)
-        self.assertNotIn("gh pr checks", self.calls())
+        self.assertIn("gh pr checks 42 --json name,bucket", self.calls())
+        self.assertEqual((self.root / "rust-polls").read_text(), "2")
         self.assertIn("gh pr merge 42 --merge --admin", self.calls())
 
     def test_ship_pipeline_and_rerun_skip_merged_steps(self):
@@ -482,7 +492,7 @@ print(json.dumps({"info": {"version": s[row]}} if row == "pypi" else {"version":
         result = self.run_release("ship", "1.2.4")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("already on origin/main", result.stdout)
-        self.assertNotIn("gh pr ", self.calls())
+        self.assertIn("gh pr checks 42 --required", self.calls())
         self.assertNotIn("gh run watch", self.calls())
 
     def test_checks_and_signature_failure_do_not_push_tags(self):
@@ -551,22 +561,26 @@ print(json.dumps({"info": {"version": s[row]}} if row == "pypi" else {"version":
             'import argparse,json\np=argparse.ArgumentParser()\n'
             'for x in ("offered", "current", "add"): p.add_argument("--"+x)\n'
             'a=p.parse_args()\nif a.current: json.loads(a.current)\n'
-            'print(json.dumps({"version":a.add}))\n')
+            'v,sha=a.add.split("=")\n'
+            'print(json.dumps({"schema_version":1,"profile":"general-distributor","platform":"linux/amd64","artifacts":[{"version":v,"sha256":sha}]}))\n')
         sha = self.root / "tar-sha"
         sha.write_text("v1.2.4 " + "a" * 64 + "\n")
-        self.manifest = json.dumps({"version": "v1.2.4=" + "a" * 64})
+        self.manifest = json.dumps({"schema_version": 1, "profile": "general-distributor", "platform": "linux/amd64", "artifacts": [{"version": "v1.2.4", "sha256": "a" * 64}]})
         env = [{"name": "DUDUCLAW_PRO_VERSIONS", "value": "v1.2.4"},
                {"name": "DUDUCLAW_GENERAL_DELIVERY_MANIFEST", "value": self.manifest}]
         self.cp_state = dict(template=env, serving=env, traffic="ready")
+        self.git("push", "origin", "v1.2.4")
         self.tool("gcloud", r'''import json,sys
 from pathlib import Path
 a=sys.argv[1:]; p=Path("cp-state"); s=json.loads(p.read_text())
 with Path("calls").open("a") as f: f.write("gcloud " + " ".join(a) + "\n")
-if a[:3] == ["run","services","describe"]:
-    print(json.dumps({"spec":{"template":{"spec":{"containers":[{"env":s["template"]}]}}},
-                      "status":{"traffic":[{"revisionName":s["traffic"],"percent":100}], "latestReadyRevisionName":"ready"}}))
+if a[:2] == ["storage","cat"]: print(s.get("remote_sha", "a"*64)+"  duduclaw-pro-v1.2.4.tar")
+elif a[:3] == ["artifacts","docker","images"] or a[:3] == ["storage","objects","describe"]: pass
+elif a[:3] == ["run","services","describe"]:
+    print(json.dumps({"spec":{"template":{"spec":{"containers":[{"image":"image:original", "env":s["template"]}]}}},
+                      "status":{"traffic":[{"revisionName":s["traffic"],"percent":100}], "latestCreatedRevisionName":s.get("created", "ready"), "latestReadyRevisionName":"ready"}}))
 elif a[:3] == ["run","revisions","describe"]:
-    print(json.dumps({"spec":{"containers":[{"env":s["serving"] if a[3] == "old" else s["template"]}]}}))
+    print(json.dumps({"spec":{"containers":[{"image":s.get("image", "image:original"), "env":s["serving"] if a[3] == "old" else s["template"]}]}}))
 elif a[:3] == ["run","services","update-traffic"]:
     s["traffic"]="ready"; p.write_text(json.dumps(s))
 elif a[:3] == ["run","services","update"]:
@@ -616,6 +630,87 @@ else: sys.exit(1)
         result = self.run_sync()
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("services update", self.calls())
+
+    def test_already_merged_checks_fail_closed(self):
+        self.git("push", "origin", "HEAD:main")
+        result = self.run_release("ship", "1.2.4", CHECKS_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("merged bump PR required checks", result.stdout)
+        self.assertNotIn("gh run list", self.calls())
+
+    def test_already_merged_admin_warns(self):
+        self.git("push", "origin", "HEAD:main")
+        result = self.run_release("ship", "1.2.4", "--admin", CHECKS_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("WARNING: --admin", result.stdout)
+        self.assertNotIn("gh pr checks", self.calls())
+
+    def test_no_checks_skips_all_checks(self):
+        result = self.run_release("ship", "1.2.4", "--admin", "--no-checks", CHECKS_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SKIPS ALL CHECKS", result.stdout)
+        self.assertNotIn("gh pr checks", self.calls())
+
+    def test_admin_rust_failure_and_timeout_refuse_merge(self):
+        for buckets in (["fail"], ["cancel"], ["pending"]):
+            with self.subTest(buckets=buckets):
+                self.settings["rust_buckets"] = buckets
+                if buckets == ["pending"]:
+                    self.tool("sleep", 'from pathlib import Path\np=Path("clock"); p.write_text(str(int(p.read_text())+5400))\n')
+                result = self.run_release("ship", "1.2.4", "--admin")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("gh pr merge", self.calls())
+
+    def test_stale_sha_handoff_refused(self):
+        self.prepare_sync()
+        self.git("push", "origin", "HEAD:main")
+        self.cp_state["remote_sha"] = "b" * 64
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differs from remote sidecar", result.stdout)
+        self.assertNotIn("services update", self.calls())
+
+    def test_concurrent_revision_refused(self):
+        self.prepare_sync()
+        self.git("push", "origin", "HEAD:main")
+        for change in ({"created": "concurrent"}, {"image": "image:concurrent"}):
+            with self.subTest(change=change):
+                self.cp_state = dict(template=[], serving=[], traffic="old", **change)
+                result = self.run_sync()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("concurrent deploy detected", result.stdout)
+                self.assertNotIn("services update-traffic", self.calls())
+
+    def test_stray_local_tag_excluded(self):
+        self.prepare_sync()
+        self.git("push", "origin", "HEAD:main")
+        self.git("tag", "v99.0.0")
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("v99.0.0", self.calls())
+
+    def test_verify_named_assets_platform_keys_and_urls(self):
+        for key, value, row in (("missing_asset", "duduclaw-linux-x64.tar.gz.minisig", "GitHub Release"),
+                                ("missing_platform", "darwin-aarch64", "desktop latest.json"),
+                                ("desktop_url", "https://example/desktop-v1.2.3/file", "desktop latest.json")):
+            with self.subTest(key=key):
+                self.settings[key] = value
+                result = self.run_release("verify", "1.2.4")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(row + " MISMATCH", result.stdout)
+                del self.settings[key]
+
+    def test_verify_manifest_sha_matches_sidecar(self):
+        self.prepare_sync()
+        self.tool("rustc", 'print("host: unknown")')
+        build = self.root / "commercial/duduclaw-pro-gateway/build-image.sh"
+        build.write_text("#!/bin/sh\n"); build.chmod(0o755)
+        for sha, expected in (("a" * 64, 0), ("b" * 64, 1)):
+            self.cp_state["remote_sha"] = sha
+            (self.root / "cp-state").write_text(json.dumps(self.cp_state))
+            result = self.run_release("verify", "1.2.4", DUDUCLAW_GCP_PROJECT="test", DUDUCLAW_RELEASE_WITHOUT_PRO="0")
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            self.assertIn("pro-manifest", result.stdout)
 
     def test_registry_eventually_converges(self):
         self.tool("curl", r'''import json,sys

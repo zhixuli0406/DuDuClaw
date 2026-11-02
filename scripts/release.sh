@@ -3,7 +3,7 @@
 # Usage:
 #   ./scripts/release.sh <hotfix|minor|major> [--title "<theme>"] [--dry-run]
 #                                                          # bump + sync all platforms
-#   ./scripts/release.sh ship <version> [--no-merge] [--admin] # resume PR → tags → verify
+#   ./scripts/release.sh ship <version> [--no-merge] [--admin] [--no-checks] # resume PR → tags → verify
 #   ./scripts/release.sh audit                              # show every platform's version + drift
 #   ./scripts/release.sh verify [version]                  # confirm registries published <version>
 #
@@ -39,8 +39,9 @@
 # ship may start once the bump commit and both tags exist, while enterprise
 # assets are still building in the first process: tag workflows do not depend
 # on them. Final verify needs those assets to have finished; rerun ship if early.
-# All lanes wait for required checks by default; only explicit --admin skips
-# that wait and permits an administrator merge. --no-merge stops before merging.
+# All lanes wait for required checks by default; --admin waits only for Rust
+# ubuntu-latest before administrator merge. Only --no-checks skips all checks
+# (with a loud warning). --no-merge stops before merging.
 #
 # Runtime note (2026-09-08 incident): a full bump run takes roughly 20-45
 # minutes end to end — `cargo check --workspace` right after the version
@@ -217,7 +218,9 @@ r=json.load(sys.stdin); sys.exit(r.get("tagName") != "v"+sys.argv[1])' "$want" 2
     if $release_exists && [[ "$latest_tag" == "v$want" ]] &&
         printf '%s' "$release_json" | python3 -c 'import json,sys
 r=json.load(sys.stdin)
-sys.exit(not (r["isDraft"] is False and r["isPrerelease"] is False and len(r["assets"]) >= int(sys.argv[1])))' "$GITHUB_RELEASE_MIN_ASSETS" 2>/dev/null; then
+names={a.get("name") for a in r["assets"]}
+required={base+suffix for base in ("duduclaw-darwin-arm64.tar.gz", "duduclaw-darwin-x64.tar.gz", "duduclaw-linux-arm64.tar.gz", "duduclaw-linux-x64.tar.gz", "duduclaw-windows-x64.zip") for suffix in ("", ".sha256", ".minisig")}
+sys.exit(not (required <= names and r["isDraft"] is False and r["isPrerelease"] is False and len(r["assets"]) >= int(sys.argv[1])))' "$GITHUB_RELEASE_MIN_ASSETS" 2>/dev/null; then
         printf "  %-16s %-10s OK (latest, >=%s assets)\n" "GitHub Release" "v$want" "$GITHUB_RELEASE_MIN_ASSETS"
     else
         echo "  GitHub Release MISMATCH (expected v$want, published, stable, latest, >=$GITHUB_RELEASE_MIN_ASSETS assets)"
@@ -226,7 +229,8 @@ sys.exit(not (r["isDraft"] is False and r["isPrerelease"] is False and len(r["as
     desktop_json="$(gh release download "desktop-v$want" --pattern latest.json --output - 2>/dev/null || true)"
     if printf '%s' "$desktop_json" | python3 -c 'import json,sys
 r=json.load(sys.stdin)
-sys.exit(not (r["version"] == sys.argv[1] and isinstance(r["platforms"], dict) and len(r["platforms"]) >= int(sys.argv[2])))' "$want" "$DESKTOP_MIN_PLATFORMS" 2>/dev/null; then
+required={"darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"}
+sys.exit(not (required <= r["platforms"].keys() and all("desktop-v"+sys.argv[1] in p.get("url", "") for p in r["platforms"].values()) and r["version"] == sys.argv[1] and isinstance(r["platforms"], dict) and len(r["platforms"]) >= int(sys.argv[2])))' "$want" "$DESKTOP_MIN_PLATFORMS" 2>/dev/null; then
         printf "  %-16s %-10s OK (>= %s platforms)\n" "desktop latest.json" "$want" "$DESKTOP_MIN_PLATFORMS"
     else
         echo "  desktop latest.json MISMATCH (expected $want and >=$DESKTOP_MIN_PLATFORMS platforms)"
@@ -324,7 +328,7 @@ r=json.load(sys.stdin); print(r.get("info", r).get("version", ""))' 2>/dev/null 
 
             # The control plane offers a version only when it is in the
             # allowlist of the revision that actually serves traffic.
-            local cp_service cp_rev cp_versions
+            local cp_service cp_rev cp_versions cp_live remote_sha
             cp_service="${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}"
             cp_rev="$(gcloud run services describe "$cp_service" --project "$proj" --region "$region" \
                 --format=json 2>/dev/null | python3 -c 'import json, sys
@@ -332,8 +336,8 @@ live = [t["revisionName"] for t in json.load(sys.stdin)["status"].get("traffic",
 print(live[0] if len(live) == 1 else "")' 2>/dev/null || true)"
             cp_versions=""
             if [[ -n "$cp_rev" ]]; then
-                cp_versions="$(gcloud run revisions describe "$cp_rev" --project "$proj" --region "$region" \
-                    --format=json 2>/dev/null | python3 -c 'import json, sys
+                cp_live="$(gcloud run revisions describe "$cp_rev" --project "$proj" --region "$region" --format=json 2>/dev/null || true)"
+                cp_versions="$(printf '%s' "$cp_live" | python3 -c 'import json, sys
 env = json.load(sys.stdin)["spec"]["containers"][0].get("env", [])
 print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIONS"), ""))' 2>/dev/null || true)"
             fi
@@ -342,6 +346,17 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIO
             else
                 printf "  %-10s %-10s MISSING — serving revision '%s' offers '%s'\n" \
                     "pro-offer" "v$want" "${cp_rev:-unknown}" "${cp_versions:-unknown}"
+                rc=1
+            fi
+            remote_sha="$(gcloud storage cat "gs://${bucket}/duduclaw-pro/duduclaw-pro-v${want}.tar.gz.sha256" 2>/dev/null | awk '{print $1}' || true)"
+            if printf '%s' "${cp_live:-}" | python3 -c 'import json,re,sys
+r=json.load(sys.stdin)
+env=r["spec"]["containers"][0].get("env", [])
+m=json.loads(next(e["value"] for e in env if e["name"] == "DUDUCLAW_GENERAL_DELIVERY_MANIFEST"))
+sys.exit(not (re.fullmatch("[0-9a-f]{64}", sys.argv[2]) and any(a.get("version") == "v"+sys.argv[1] and a.get("sha256") == sys.argv[2] for a in m["artifacts"])))' "$want" "$remote_sha" 2>/dev/null; then
+                printf "  %-10s %-10s OK (%s)\n" "pro-manifest" "v$want" "$cp_rev"
+            else
+                echo "  pro-manifest MISMATCH (serving manifest must match v$want OEM sidecar SHA)"
                 rc=1
             fi
         else
@@ -368,7 +383,7 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_PRO_VERSIO
 # Activate only after merge. The tar SHA remains a local builder output,
 # never reconstructed from a bucket sidecar. Subshell keeps CP state isolated.
 sync_control_plane() (
-    local version="$1" sha_file="$2" tar_version tar_sha
+    local version="$1" sha_file="$2" tar_version tar_sha remote_sha remote_tags image updated=false created ready
     local service region project versions current manifest serving revision live current_manifest current_versions target
     git fetch origin +refs/heads/main:refs/remotes/origin/main
     git merge-base --is-ancestor "v$version" origin/main
@@ -385,12 +400,19 @@ sync_control_plane() (
         echo "Error: enterprise tar SHA record does not match v$version."
         exit 1
     fi
+    remote_sha="$(gcloud storage cat "gs://${DUDUCLAW_IMAGE_TAR_BUCKET:-duduclaw-oem-images}/duduclaw-pro/duduclaw-pro-v${version}.tar.gz.sha256" | awk '{print $1}')"
+    if [[ "$remote_sha" != "$tar_sha" ]]; then
+        echo "Error: enterprise tar SHA handoff differs from remote sidecar; rebuild before ship."
+        exit 1
+    fi
     service="${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}"
     region="${DUDUCLAW_GCP_REGION:-asia-east1}"
     project="${DUDUCLAW_GCP_PROJECT:-$(gcloud config get-value project)}"
     [[ -n "$project" && "$project" != "(unset)" ]] || { echo "Error: no GCP project."; exit 1; }
+    remote_tags="$(git ls-remote --tags origin | awk '$2 !~ /\^\{\}$/ {sub(/^refs\/tags\//, "", $2); print $2}')"
     versions="$(git tag --merged origin/main --list 'v*' --sort=-v:refname \
-        | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ {if (++n <= 3) print}' | paste -sd, -)"
+        | awk -v remote="$remote_tags" 'BEGIN {split(remote, tags, "\n"); for (i in tags) allowed[tags[i]]=1} /^v[0-9]+\.[0-9]+\.[0-9]+$/ && allowed[$0] {if (++n <= 3) print}' | paste -sd, -)"
+    [[ "${versions%%,*}" == "v$version" ]] || { echo "Error: newest merged remote tag must be v$version."; exit 1; }
     current="$(gcloud run services describe "$service" --project "$project" --region "$region" --format=json)"
     cp_env() {
         python3 -c 'import json,sys
@@ -398,6 +420,7 @@ r=json.load(sys.stdin)
 env=(r["spec"]["template"]["spec"] if sys.argv[1] == "service" else r["spec"])["containers"][0].get("env", [])
 print(next((e.get("value", "") for e in env if e["name"] == sys.argv[2]), ""))' "$@"
     }
+    image="$(printf '%s' "$current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0]["image"])')"
     current_manifest="$(printf '%s' "$current" | cp_env service DUDUCLAW_GENERAL_DELIVERY_MANIFEST)"
     current_versions="$(printf '%s' "$current" | cp_env service DUDUCLAW_PRO_VERSIONS)"
     manifest="$(python3 -I commercial/duduclaw-pro-gateway/delivery_manifest.py --offered "$versions" \
@@ -407,6 +430,7 @@ print(next((e.get("value", "") for e in env if e["name"] == sys.argv[2]), ""))' 
         "$current_manifest" != "$manifest" ]]; then
         gcloud run services update "$service" --project "$project" --region "$region" \
             --update-env-vars "^|^DUDUCLAW_PRO_VERSIONS=$versions|DUDUCLAW_GENERAL_DELIVERY_MANIFEST=$manifest" --quiet
+        updated=true
     fi
     serving_env() {
         serving="$(gcloud run services describe "$service" --project "$project" --region "$region" --format=json)"
@@ -423,16 +447,21 @@ print(live[0] if len(live) == 1 else "")')"
             "$(printf '%s' "$live" | cp_env revision DUDUCLAW_GENERAL_DELIVERY_MANIFEST)" == "$manifest" ]]
     }
     serving_env
-    if ! carries_delivery; then
-        target="$(printf '%s' "$serving" | python3 -c 'import json,sys
-print(json.load(sys.stdin)["status"]["latestReadyRevisionName"])')"
+    if $updated; then
+        read -r created ready <<< "$(printf '%s' "$serving" | python3 -c 'import json,sys
+s=json.load(sys.stdin)["status"]; print(s["latestCreatedRevisionName"], s["latestReadyRevisionName"])')"
+        target="$created"
+        [[ -n "$target" && "$created" == "$ready" ]] || { echo "Error: concurrent deploy detected (created/ready revision mismatch)."; exit 1; }
         live="$(gcloud run revisions describe "$target" --project "$project" --region "$region" --format=json)"
-        carries_delivery || { echo "Error: target revision $target does not carry the reviewed delivery."; exit 1; }
+        if ! carries_delivery || [[ "$(printf '%s' "$live" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"]["containers"][0]["image"])')" != "$image" ]]; then
+            echo "Error: concurrent deploy detected (target image or delivery mismatch)."
+            exit 1
+        fi
         gcloud run services update-traffic "$service" --project "$project" --region "$region" --to-revisions "$target=100" --quiet
         serving_env
     fi
     if ! carries_delivery; then
-        echo "Error: control-plane allowlist/delivery manifest not serving on '${revision:-unknown}'."
+        echo "Error: concurrent deploy detected; control-plane allowlist/delivery manifest not serving on '${revision:-unknown}'."
         exit 1
     fi
     ship_log "Control-plane allowlist and delivery manifest serving on $revision"
@@ -442,7 +471,7 @@ print(json.load(sys.stdin)["status"]["latestReadyRevisionName"])')"
 ship_log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
 run_ship() {
-    local version="${1:-}" admin=false no_merge=false branch head tag pr state remote workflow run attempt deadline required_count
+    local version="${1:-}" admin=false no_merge=false no_checks=false branch head tag pr state remote workflow run attempt deadline required_count checks check_rc
     if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "Error: ship requires a version (X.Y.Z)."
         return 1
@@ -451,6 +480,7 @@ run_ship() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --admin) admin=true ;;
+            --no-checks) no_checks=true ;;
             --no-merge) no_merge=true ;;
             *) echo "Error: unknown ship option '$1'"; return 1 ;;
         esac
@@ -476,6 +506,10 @@ run_ship() {
     fi
     if $admin; then
         ship_log "WARNING: --admin skips waiting for required checks and permits administrator merge."
+    fi
+
+    if $no_checks; then
+        ship_log "WARNING: --no-checks SKIPS ALL CHECKS; explicit unsafe override."
     fi
 
     ship_log "Publish commercial branch/PR if needed"
@@ -514,7 +548,29 @@ run_ship() {
             pr="$(gh pr list --base main --head "$branch" --state open --json number --jq '.[0].number // empty')"
         fi
         [[ "$pr" =~ ^[0-9]+$ ]] || { echo "Error: could not locate bump PR."; return 1; }
-        if ! $admin; then
+        if $no_checks; then
+            :
+        elif $admin; then
+            ship_log "Wait for Rust ubuntu-latest on PR #$pr (up to 90 minutes)"
+            deadline=$(( $(date +%s) + 5400 ))
+            while :; do
+                check_rc=0
+                checks="$(gh pr checks "$pr" --json name,bucket)" || check_rc=$?
+                if [[ "$check_rc" != "0" && "$check_rc" != "1" && "$check_rc" != "8" ]]; then
+                    echo "Error: could not query PR checks."
+                    return 1
+                fi
+                state="$(printf '%s' "$checks" | python3 -c 'import json,sys
+checks=[c["bucket"] for c in json.load(sys.stdin) if c["name"] == "Rust ubuntu-latest"]
+print("fail" if any(c in ("fail", "cancel") for c in checks) else "pass" if checks and all(c == "pass" for c in checks) else "pending")')" || return 1
+                [[ "$state" != "pass" ]] || break
+                if [[ "$state" == "fail" ]] || (( $(date +%s) >= deadline )); then
+                    echo "Error: Rust ubuntu-latest failed/cancelled or did not succeed within 90 minutes."
+                    return 1
+                fi
+                sleep 20
+            done
+        else
             deadline=$(( $(date +%s) + 300 ))
             required_count=0
             while :; do
@@ -535,7 +591,7 @@ run_ship() {
             gh pr checks "$pr" --required --watch
         fi
         if $no_merge; then
-            ship_log "Stopped before merge (--no-merge). Run: gh pr merge $pr --merge$( $admin && printf ' --admin' || true )"
+            ship_log "Stopped before merge (--no-merge). Run: gh pr merge $pr --merge --match-head-commit \"$head\"$( $admin && printf ' --admin' || true )"
             return 0
         fi
         ship_log "Merge PR #$pr"
@@ -546,6 +602,13 @@ run_ship() {
         fi
     else
         ship_log "Bump is already on origin/main; skip branch push, PR and merge"
+        if ! $admin && ! $no_checks; then
+            pr="$(gh api "repos/zhixuli0406/DuDuClaw/commits/$head/pulls" --jq '[.[] | select(.merged_at != null and .base.ref == "main")][0].number // empty')"
+            if [[ ! "$pr" =~ ^[0-9]+$ ]] || ! gh pr checks "$pr" --required; then
+                echo "Error: merged bump PR required checks have not all succeeded."
+                return 1
+            fi
+        fi
     fi
     ship_log "Confirm merged ancestry and signed delivery"
     git fetch origin +refs/heads/main:refs/remotes/origin/main
@@ -591,7 +654,7 @@ if [[ $# -lt 1 ]]; then
     echo "Usage:"
     echo "  $0 <hotfix|minor|major> [--title \"<theme>\"] [--dry-run]"
     echo "                                       bump + sync every platform manifest"
-    echo "  $0 ship <version> [--no-merge] [--admin]  resume PR, merge, tags and verification"
+    echo "  $0 ship <version> [--no-merge] [--admin] [--no-checks]  resume PR, merge, tags and verification"
     echo "  $0 audit                             show each platform's version + drift"
     echo "  $0 verify [version]                  confirm published release and enterprise assets"
     exit 1
@@ -1156,6 +1219,7 @@ if [[ "$PRO_RELEASE" == "1" && "${DUDUCLAW_DISTRIBUTOR_NOTICE:-fetch}" == "fetch
 fi
 if [[ "$PRO_RELEASE" == "1" && -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
     echo ""
+    rm -f "commercial/artifacts/release-ship/v$NEW_VERSION.tar-sha"
     echo "Building + pushing enterprise duduclaw-pro:v$NEW_VERSION image..."
     if DUDUCLAW_CONTROL_ADMIN_TOKEN="${PRO_NOTICE_TOKEN:-}" DUDUCLAW_PRO_TAR_SHA_FILE="$PRO_TAR_SHA_FILE" \
         "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
@@ -1387,7 +1451,7 @@ echo "  ./scripts/release.sh ship $NEW_VERSION"
 echo "Manual fallback (after pushing commercial and opening its PR):"
 echo "  git push -u origin $RELEASE_BRANCH"
 echo "  gh pr create --base main --head $RELEASE_BRANCH --title 'chore: bump v$NEW_VERSION' --body 'Prepare release v$NEW_VERSION'"
-echo "  gh pr checks <n> --required --watch && gh pr merge <n> --merge"
+echo "  gh pr checks <n> --required --watch && gh pr merge <n> --merge --match-head-commit <head-sha>"
 echo "  git fetch origin main && git merge-base --is-ancestor v$NEW_VERSION origin/main"
 echo "  # Validate signed delivery with --require-main before pushing tags."
 echo "  git push origin v$NEW_VERSION desktop-v$NEW_VERSION"

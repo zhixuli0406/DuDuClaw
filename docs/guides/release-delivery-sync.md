@@ -185,7 +185,9 @@ directory, so a shared `CARGO_TARGET_DIR` works. Asset failures and explicit
 `DUDUCLAW_SKIP_PRO_*` opt-outs remain failures. After image upload succeeds,
 the builder's tar SHA is atomically saved to the local private
 `commercial/artifacts/release-ship/vVERSION.tar-sha` handoff file. Keep that
-file when resuming; it is not reconstructed from a bucket sidecar. The bump
+file when resuming; it is not reconstructed from a bucket sidecar. Each image
+build removes the preceding handoff before starting. Activation requires its SHA
+to match the uploaded OEM tar `.sha256` sidecar. The bump
 leaves online allowlist activation to `ship`, after the public bump has merged.
 
 ## Merge, then publish with ship
@@ -211,8 +213,14 @@ run, so rerunning the same command resumes after interruption:
 3. Wait with `gh pr checks --required --watch`, then merge with `--merge`, binding
    the merge to the validated HEAD. `--no-merge` stops after checks and prints
    the merge command. All lanes wait for required checks by default.
-   Only an explicit `--admin` skips that wait and uses administrator merge;
-   it prints a warning. The historical hotfix owner override is never inferred.
+   `--admin` prints a warning, uses administrator merge, and waits up to 90 minutes
+   for `Rust ubuntu-latest` to succeed; failure or cancellation stops it. Hotfix
+   bump PRs use this owner-approved admin path only after Rust succeeds.
+   Only the explicit `--no-checks` flag skips all checks and prints a loud warning.
+   The printed merge command includes `--match-head-commit "<head-sha>"`.
+   When HEAD is already on main, the merged PR is found through the commit pulls
+   API and its required checks must succeed, unless `--admin` or `--no-checks`
+   was explicitly passed.
 4. Fetch origin/main, prove `vNEXT` is its ancestor, and rerun
    `release_delivery.py --version NEXT --release-ref vNEXT --require-main` with
    the existing environment/repository public-key configuration. The signed
@@ -222,9 +230,12 @@ run, so rerunning the same command resumes after interruption:
    Successful runs are skipped on rerun; the first failure stops with its run ID.
    Run discovery polls for at most five minutes per workflow.
 6. Activate the merged enterprise version and delivery manifest using the local
-   builder SHA. Only merged version tags enter the allowlist. Read back the
-   serving revision; an already matching deployment is left alone. If traffic
-   needs changing, inspect the target revision before routing traffic to it.
+   builder SHA, checked against the remote OEM sidecar. Only merged version tags
+   also present on origin enter the top-three allowlist; the newest must be vNEXT.
+   Read back the serving revision; an already matching deployment is left alone.
+   After an update, created and ready revision names must agree, and the target
+   must carry the captured pre-update image and delivery before traffic switches.
+   A mismatch refuses activation as a concurrent deployment.
 7. Run `verify NEXT` and preserve any failure it reports.
 
 `ship` may run while the original bump process is still building enterprise
@@ -240,7 +251,9 @@ Only push exact release tags after the bump has merged and the signed gate passe
 
 ```bash
 git push origin YOUR_RELEASE_BRANCH
-# Create the bump PR, wait for required checks, and merge it with --merge.
+# Create the bump PR, then bind the merge to its reviewed HEAD.
+gh pr checks <n> --required --watch
+gh pr merge <n> --merge --match-head-commit "<head-sha>"
 git fetch origin main
 git merge-base --is-ancestor vNEXT origin/main
 # Export RELEASE_DELIVERY_PUBLIC_KEY_PEM from the environment/repository variable.
@@ -269,16 +282,23 @@ of `ship`). The public rows check:
 
 - **GitHub Release**: `vVERSION` exists, is published (not draft), is stable (not
   prerelease), is the latest release, and has at least `GITHUB_RELEASE_MIN_ASSETS`
-  assets (currently 40).
+  assets (currently 40), including `duduclaw-darwin-arm64.tar.gz`,
+  `duduclaw-darwin-x64.tar.gz`, `duduclaw-linux-arm64.tar.gz`,
+  `duduclaw-linux-x64.tar.gz` and `duduclaw-windows-x64.zip`, each with its
+  `.sha256` and `.minisig` assets.
 - **desktop latest.json**: downloaded from `desktop-vVERSION`, its version equals
-  VERSION and it contains at least `DESKTOP_MIN_PLATFORMS` platforms (currently 9).
+  VERSION and it contains at least `DESKTOP_MIN_PLATFORMS` platforms (currently 9),
+  including `darwin-aarch64`, `darwin-x86_64`, `linux-x86_64` and `windows-x86_64`.
+  Every platform URL must contain `desktop-vVERSION`.
 - **PyPI and npm**: their published versions equal VERSION. When that exact GitHub
   Release exists, a mismatching row polls every 20 seconds for up to five minutes
   per row. Set `DUDUCLAW_VERIFY_NO_WAIT` (even to an empty value) to disable waiting.
   Without the matching release, verification fails immediately for stale registries.
 
 Private image, OEM tar, Pro binaries and the serving control-plane offer retain
-their existing checks. Every failed row keeps its own MISMATCH/MISSING detail;
+their existing checks. The `pro-manifest` row also requires the serving revision's
+`DUDUCLAW_GENERAL_DELIVERY_MANIFEST` artifact for vVERSION to match the remote
+OEM tar sidecar SHA. Every failed row keeps its own MISMATCH/MISSING detail;
 publication or a green workflow alone does not establish successful verification.
 Keep this guide, any translated copies, the script header, usage and named
 minimums consistent when changing release behavior.
