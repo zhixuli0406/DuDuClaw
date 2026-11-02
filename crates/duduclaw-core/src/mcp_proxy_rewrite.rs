@@ -122,7 +122,11 @@ pub fn is_host_owned_entry(name: &str, def: &Value, self_exe: &Path) -> bool {
                 let forwarded = crate::mcp_forward_env_vars();
                 env.iter().all(|(key, value)| {
                     value.is_string()
-                        && (key.to_ascii_uppercase().starts_with("DUDUCLAW_")
+                        // Never let a raw entry redirect host binary resolution,
+                        // even if this name is added to the forward list later.
+                        && !key.eq_ignore_ascii_case("DUDUCLAW_BIN")
+                        && ([crate::ENV_AGENT_ID, crate::identity_token::ENV_AGENT_TOKEN, "DUDUCLAW_HOME"]
+                            .iter().any(|allowed| key.eq_ignore_ascii_case(allowed))
                             || forwarded.iter().any(|(allowed, _)| key.eq_ignore_ascii_case(allowed)))
                 })
             }
@@ -563,7 +567,8 @@ mod tests {
     fn host_owned_entry_rejects_execution_overrides() {
         let exe = Path::new("/opt/duduclaw");
         let own = json!({"command":exe, "args":["mcp-server"]});
-        for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "ld_preload"] {
+        for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "ld_preload",
+            "DUDUCLAW_BIN", "duduclaw_bin", "DuDuClAw_BiN", "DUDUCLAW_UNKNOWN"] {
             let mut entry = own.clone();
             entry["env"] = json!({key:"/tmp/evil"});
             assert!(!is_host_owned_entry("duduclaw-pro", &entry, exe), "{key}");

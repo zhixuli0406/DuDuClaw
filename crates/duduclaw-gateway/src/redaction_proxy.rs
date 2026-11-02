@@ -417,9 +417,20 @@ pub fn mcp_json_lists_third_party_servers(
     let Some(parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
         return Ok(false);
     };
-    Ok(parsed["mcpServers"]
-        .as_object()
-        .is_some_and(|m| m.iter().any(|(n, def)| !duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(n, def, &duduclaw_core::resolve_duduclaw_bin()))))
+    let agent_id = agent_id_of(mcp_json);
+    if agent_id == "unknown" {
+        return Ok(true);
+    }
+    let exe = duduclaw_core::resolve_duduclaw_bin();
+    let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home_dir, &agent_id, &exe);
+    // Grok loads the raw file on the shortcut path. Only the complete current
+    // host definition is safe there; stale credentials take the managed path
+    // so the runtime can replace/shadow them without refusing the spawn.
+    Ok(parsed["mcpServers"].as_object().is_none_or(|servers| {
+        servers.iter().any(|(name, def)| {
+            !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name) || def != &own
+        })
+    }))
 }
 
 /// Every server name the `.mcp.json` at `mcp_json` lists, DuDuClaw's own
@@ -1193,6 +1204,30 @@ mod mcp_config_proxy_tests {
         assert!(!mcp_json_lists_third_party_servers(home.path(), &path, false).unwrap());
         assert!(maybe_proxy_mcp_config(home.path(), &path).unwrap().is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    #[test]
+    fn only_complete_current_employee_definition_can_skip_managed_path() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let path = agent_mcp_path(home.path());
+        let own = canonical_builtin(home.path());
+        for change in ["bin", "lower_bin", "home", "lower_home", "agent", "token", "missing_env", "extra_field"] {
+            let mut entry = own.clone();
+            match change {
+                "bin" => entry["env"]["DUDUCLAW_BIN"] = json!("/tmp/evil"),
+                "lower_bin" => entry["env"]["duduclaw_bin"] = json!("/tmp/evil"),
+                "home" => entry["env"]["DUDUCLAW_HOME"] = json!("/tmp/wrong-home"),
+                "lower_home" => entry["env"]["duduclaw_home"] = json!("/tmp/wrong-home"),
+                "agent" => entry["env"]["DUDUCLAW_AGENT_ID"] = json!("bob"),
+                "token" => entry["env"]["DUDUCLAW_AGENT_TOKEN"] = json!("stale-token"),
+                "missing_env" => { entry.as_object_mut().unwrap().remove("env"); }
+                "extra_field" => entry["timeout"] = json!(10),
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, json!({"mcpServers":{"duduclaw":entry}}).to_string()).unwrap();
+            assert!(mcp_json_lists_third_party_servers(home.path(), &path, false).unwrap(), "{change}");
+        }
     }
 
     #[test]

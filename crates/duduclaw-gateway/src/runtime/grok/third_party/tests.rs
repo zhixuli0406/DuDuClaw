@@ -39,10 +39,14 @@ async fn prepare_for(dir: &Path, home: &Path) -> Result<Prepared, String> {
 
 #[tokio::test]
 async fn no_mcp_json_or_only_duduclaw_is_the_old_spawn() {
-    let only_own =
-        json!({ "mcpServers": { "duduclaw": { "command": duduclaw_core::resolve_duduclaw_bin(), "args": ["mcp-server"] } } }).to_string();
-    for body in [None, Some(only_own), Some("{}".to_string())] {
-        let (home, dir) = employee(body.as_deref());
+    for body in [None, Some("canonical"), Some("{}")] {
+        let (home, dir) = employee(body.filter(|b| *b != "canonical"));
+        if body == Some("canonical") {
+            let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+                home.path(), "trader", &duduclaw_core::resolve_duduclaw_bin(),
+            );
+            std::fs::write(dir.join(".mcp.json"), json!({"mcpServers":{"duduclaw":own}}).to_string()).unwrap();
+        }
         let before = std::fs::read(dir.join(".mcp.json")).ok();
         let p = prepare_for(&dir, home.path()).await.unwrap();
         assert!(!p.managed && p.env_dir.is_none(), "{body:?}");
@@ -627,7 +631,8 @@ async fn a_reference_that_cannot_be_proxied_refuses_grok_spawn() {
 
 #[tokio::test]
 async fn injected_builtin_env_uses_managed_spawn_and_disabled_shadow() {
-    for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS"] {
+    for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS",
+        "DUDUCLAW_BIN", "duduclaw_bin", "DUDUCLAW_HOME", "duduclaw_home"] {
         let body = json!({"mcpServers":{"duduclaw-pro":{
             "command": duduclaw_core::resolve_duduclaw_bin(),
             "args":["mcp-server"],
@@ -653,4 +658,60 @@ fn production_mcp_template_entry_is_host_owned() {
     assert!(duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(
         "duduclaw-pro", entry, &duduclaw_core::resolve_duduclaw_bin(),
     ));
+    assert!(!crate::redaction_proxy::mcp_json_lists_third_party_servers(
+        home.path(), &dir.join(".mcp.json"), false,
+    ).unwrap());
+}
+
+/// Isolate ambient credentials in subprocesses: the write and spawn use the
+/// same binary and identity key, so only MCP key rotation changes the entry.
+#[tokio::test]
+async fn rotated_production_entry_takes_managed_spawn_with_shadow() {
+    const TEST: &str = "runtime::grok::third_party::tests::rotated_production_entry_takes_managed_spawn_with_shadow";
+    const OLD_KEY: &str = "ddc_prod_11111111111111111111111111111111";
+    const NEW_KEY: &str = "ddc_prod_22222222222222222222222222222222";
+    if let Ok(stage) = std::env::var("DDC_TEST_GROK_ROTATION_STAGE") {
+        let home = PathBuf::from(std::env::var_os("DDC_TEST_GROK_ROTATION_HOME").unwrap());
+        let dir = home.join("agents/trader");
+        let path = dir.join(".mcp.json");
+        if stage == "write" {
+            std::fs::create_dir_all(&dir).unwrap();
+            duduclaw_core::ensure_identity_key(&home).unwrap();
+            std::fs::write(&path, r#"{"mcpServers":{"duduclaw-pro":{}}}"#).unwrap();
+            duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path(&dir).unwrap();
+            assert!(!crate::redaction_proxy::mcp_json_lists_third_party_servers(&home, &path, false).unwrap());
+        } else {
+            assert_eq!(stage, "spawn");
+            let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+                &home, "trader", &duduclaw_core::resolve_duduclaw_bin(),
+            );
+            assert_eq!(raw["mcpServers"]["duduclaw-pro"]["command"], own["command"]);
+            assert_eq!(raw["mcpServers"]["duduclaw-pro"]["env"]["DUDUCLAW_MCP_API_KEY"], OLD_KEY);
+            assert_eq!(own["env"]["DUDUCLAW_MCP_API_KEY"], NEW_KEY);
+            assert!(crate::redaction_proxy::mcp_json_lists_third_party_servers(&home, &path, false).unwrap());
+            let prepared = prepare_for(&dir, &home).await.expect("rotation must not refuse spawn preparation");
+            assert!(prepared.managed);
+            let (_, cfg) = config(&dir);
+            assert_eq!(cfg["mcp_servers"]["duduclaw-pro"]["enabled"].as_bool(), Some(false));
+            assert_eq!(cfg["mcp_servers"]["duduclaw"]["env"]["DUDUCLAW_MCP_API_KEY"].as_str(), Some(NEW_KEY));
+            std::fs::write(home.join("rotation-verified"), b"ok").unwrap();
+        }
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    for (stage, key) in [("write", OLD_KEY), ("spawn", NEW_KEY)] {
+        let output = std::process::Command::new(&exe)
+            .args(["--exact", TEST, "--nocapture"])
+            .env("DDC_TEST_GROK_ROTATION_STAGE", stage)
+            .env("DDC_TEST_GROK_ROTATION_HOME", home.path())
+            .env("DUDUCLAW_BIN", &exe)
+            .env(duduclaw_core::ENV_MCP_API_KEY, key)
+            .env_remove("DUDUCLAW_INSTANCE")
+            .output().unwrap();
+        assert!(output.status.success(), "{stage}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+    assert!(home.path().join("rotation-verified").exists(), "child test must actually run");
 }

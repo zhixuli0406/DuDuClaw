@@ -194,7 +194,10 @@ struct AppState {
 /// create a symlink target and obscure the original unreadable policy state.
 fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<(), String> {
     match std::fs::symlink_metadata(home.join("users.db")) {
-        Ok(_) => crate::mfa::boot_policy(home, personal).map(|_| ()),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            crate::mfa::boot_policy(home, personal).map(|_| ())
+        }
+        Ok(_) => Err("MFA policy state unavailable: users.db must be a regular file, not a symlink or special file".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
@@ -211,8 +214,10 @@ mod identity_policy_precheck_tests {
         let link = home.path().join("users.db");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let error = precheck_identity_policy(home.path(), false).unwrap_err();
-        assert!(error.contains("MFA policy state unavailable"), "{error}");
+        for personal in [false, true] {
+            let error = precheck_identity_policy(home.path(), personal).unwrap_err();
+            assert!(error.contains("MFA policy state unavailable"), "{error}");
+        }
         assert!(!target.exists(), "precheck must not create the symlink target");
         assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
     }
@@ -220,8 +225,28 @@ mod identity_policy_precheck_tests {
     #[test]
     fn absent_identity_store_allows_fresh_install_without_creating_database() {
         let home = tempfile::tempdir().unwrap();
-        precheck_identity_policy(home.path(), false).unwrap();
+        for personal in [false, true] {
+            precheck_identity_policy(home.path(), personal).unwrap();
+        }
         assert!(!home.path().join("users.db").exists());
+    }
+
+    #[test]
+    fn identity_directory_and_existing_symlink_refuse_in_all_editions() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("users.db");
+        std::fs::create_dir(&path).unwrap();
+        for personal in [false, true] {
+            assert!(precheck_identity_policy(home.path(), personal).is_err());
+        }
+        std::fs::remove_dir(&path).unwrap();
+        let target = home.path().join("existing-users.db");
+        std::fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        for personal in [false, true] {
+            assert!(precheck_identity_policy(home.path(), personal).is_err());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
     }
 }
 

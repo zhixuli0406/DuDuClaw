@@ -207,22 +207,27 @@ pub async fn install_gated(
     gated: &GatedManifest,
     scope: &str,
 ) -> Result<HubInstallReport, String> {
-    // One cross-process lock spans the final check, loader write and history commit.
+    // Fixed cross-process lock order: trust store, then signature history.
+    // Hold both through the final check, loader write and history commit so
+    // publisher revocation/rotation cannot race the verified installation.
     // Run blocking flock away from Tokio workers; Handle::block_on drives the loader's async I/O.
     let home = home_dir.to_path_buf();
     let gated = gated.clone();
     let scope = scope.to_string();
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
+        let trust_path = home.join(duduclaw_core::publishers::TRUST_STORE_FILE);
         let path = home.join(duduclaw_agent::skill_hub::SKILL_SIGNATURE_HISTORY_FILE);
-        duduclaw_core::with_file_lock(&path, || {
-            runtime.block_on(install_gated_locked(&home, &gated, &scope))
-                .map_err(std::io::Error::other)
-        }).map_err(|e| format!("{}: hub install refused: {e}", path.display()))
+        duduclaw_core::with_file_lock(&trust_path, || {
+            duduclaw_core::with_file_lock(&path, || {
+                runtime.block_on(install_gated_locked(&home, &gated, &scope))
+                    .map_err(std::io::Error::other)
+            }).map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))
+        }).map_err(|e| format!("{}: hub install refused: {e}", trust_path.display()))
     }).await.map_err(|e| format!("hub install worker failed: {e}"))?
 }
 
-/// Caller holds the cross-process signature-history lock throughout this operation.
+/// Caller holds the trust-store lock, then the signature-history lock throughout.
 async fn install_gated_locked(
     home_dir: &Path, gated: &GatedManifest, scope: &str,
 ) -> Result<HubInstallReport, String> {
@@ -446,6 +451,7 @@ mod tests {
         // Precreate the sidecar so acquiring the lock itself remains possible.
         std::fs::write(&path, "{}").unwrap();
         std::fs::write(path.with_extension("json.lock"), "").unwrap();
+        std::fs::write(home.path().join("trusted_publishers.toml.lock"), "").unwrap();
         std::fs::write(home.path().join("trusted_publishers.toml"),
             format!("[publishers.fixture]\nkeys = [\"{TEST_KEY}\"]\n")).unwrap();
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -538,6 +544,46 @@ mod tests {
             signature_status, risk_level: format!("{:?}", scan.risk_level), findings: scan.findings.len(),
             trust_floor: source.trust_floor, source_verdict: source.source_verdict.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn install_locks_trust_before_waiting_for_history() {
+        use fs2::FileExt;
+        use std::time::Duration;
+
+        let home = pinned_home();
+        let gated = gated_source(&home, &manifest(CLEAN, Some(CLEAN_SIG), "fixture"));
+        let history_lock = std::fs::OpenOptions::new().create(true).read(true).write(true)
+            .open(home.join(format!("{}.lock", duduclaw_agent::skill_hub::SKILL_SIGNATURE_HISTORY_FILE))).unwrap();
+        history_lock.lock_exclusive().unwrap();
+        let trust_lock = std::fs::OpenOptions::new().create(true).read(true).write(true)
+            .open(home.join("trusted_publishers.toml.lock")).unwrap();
+        let install_home = home.clone();
+        let install = tokio::spawn(async move { install_gated(&install_home, &gated, "global").await });
+
+        // A trust-store writer must be excluded even while the installer is
+        // waiting for history. Reverse acquisition would leave trust unlocked.
+        let held = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match trust_lock.try_lock_exclusive() {
+                    Ok(()) => FileExt::unlock(&trust_lock).unwrap(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("unexpected trust lock error: {error}"),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await;
+        let pending = !install.is_finished();
+        let no_history = !home.join(duduclaw_agent::skill_hub::SKILL_SIGNATURE_HISTORY_FILE).exists();
+        FileExt::unlock(&history_lock).unwrap();
+        let result = install.await.unwrap();
+        assert!(held.is_ok(), "installer must hold trust before acquiring history");
+        assert!(pending && no_history, "no install may commit while history is locked");
+        result.unwrap();
+        trust_lock.try_lock_exclusive().unwrap();
+        FileExt::unlock(&trust_lock).unwrap();
+        drop((trust_lock, history_lock));
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]
