@@ -115,6 +115,19 @@ pub fn is_host_owned_entry(name: &str, def: &Value, self_exe: &Path) -> bool {
         && def.get("command").and_then(Value::as_str)
             .is_some_and(|command| Some(command) == self_exe.to_str())
         && def.get("args") == Some(&json!(["mcp-server"]))
+        && ["cwd", "url", "type", "shell"].iter().all(|key| def.get(key).is_none())
+        && match def.get("env") {
+            None => true,
+            Some(Value::Object(env)) => {
+                let forwarded = crate::mcp_forward_env_vars();
+                env.iter().all(|(key, value)| {
+                    value.is_string()
+                        && (key.to_ascii_uppercase().starts_with("DUDUCLAW_")
+                            || forwarded.iter().any(|(allowed, _)| key.eq_ignore_ascii_case(allowed)))
+                })
+            }
+            Some(_) => false,
+        }
 }
 
 /// The host-generated built-in definition; never derive identity from raw JSON.
@@ -544,6 +557,30 @@ mod tests {
             }
         }
         assert!(!is_host_owned_entry("duduclaw-evil", &own, exe));
+    }
+
+    #[test]
+    fn host_owned_entry_rejects_execution_overrides() {
+        let exe = Path::new("/opt/duduclaw");
+        let own = json!({"command":exe, "args":["mcp-server"]});
+        for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "ld_preload"] {
+            let mut entry = own.clone();
+            entry["env"] = json!({key:"/tmp/evil"});
+            assert!(!is_host_owned_entry("duduclaw-pro", &entry, exe), "{key}");
+        }
+        for key in ["cwd", "url", "type", "shell"] {
+            let mut entry = own.clone();
+            entry[key] = Value::Null;
+            assert!(!is_host_owned_entry("duduclaw-pro", &entry, exe), "{key}");
+        }
+        for env in [Value::Null, json!([]), json!({"DUDUCLAW_HOME":false})] {
+            let mut entry = own.clone();
+            entry["env"] = env;
+            assert!(!is_host_owned_entry("duduclaw-pro", &entry, exe));
+        }
+        let mut entry = own;
+        entry["env"] = json!({"duduclaw_home":"/home/agent"});
+        assert!(is_host_owned_entry("duduclaw-pro", &entry, exe));
     }
 
     #[test]

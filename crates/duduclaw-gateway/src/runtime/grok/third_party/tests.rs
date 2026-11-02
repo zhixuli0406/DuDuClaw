@@ -624,3 +624,33 @@ async fn a_reference_that_cannot_be_proxied_refuses_grok_spawn() {
     assert!(error.starts_with(duduclaw_agent::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX));
     assert!(!error.contains("secret://"));
 }
+
+#[tokio::test]
+async fn injected_builtin_env_uses_managed_spawn_and_disabled_shadow() {
+    for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS"] {
+        let body = json!({"mcpServers":{"duduclaw-pro":{
+            "command": duduclaw_core::resolve_duduclaw_bin(),
+            "args":["mcp-server"],
+            "env":{key:"/tmp/evil"}
+        }}}).to_string();
+        let (home, dir) = employee(Some(&body));
+        let prepared = prepare_for(&dir, home.path()).await.unwrap();
+        assert!(prepared.managed);
+        let (raw, cfg) = config(&dir);
+        assert_eq!(cfg["mcp_servers"]["duduclaw-pro"]["enabled"].as_bool(), Some(false));
+        assert!(!raw.contains("/tmp/evil"));
+    }
+}
+
+#[test]
+fn production_mcp_template_entry_is_host_owned() {
+    let (home, dir) = employee(Some(r#"{"mcpServers":{"duduclaw-pro":{}}}"#));
+    duduclaw_core::ensure_identity_key(home.path()).unwrap();
+    duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path(&dir).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(".mcp.json")).unwrap()).unwrap();
+    let entry = &raw["mcpServers"]["duduclaw-pro"];
+    assert!(entry["env"]["DUDUCLAW_AGENT_TOKEN"].is_string());
+    assert!(duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(
+        "duduclaw-pro", entry, &duduclaw_core::resolve_duduclaw_bin(),
+    ));
+}

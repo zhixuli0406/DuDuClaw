@@ -315,6 +315,20 @@ pub fn check_frontmatter(content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve the actual install filename using the loader parser, never presentation defaults.
+pub fn install_skill_name(content: &str, name_hint: &str) -> Result<String, String> {
+    if !is_safe_skill_name(name_hint) {
+        return Err("install DENIED: unsafe skill name hint".into());
+    }
+    check_frontmatter(content).map_err(|error| format!("install DENIED: {error}"))?;
+    let path = std::path::PathBuf::from(format!("{name_hint}.md"));
+    let (meta, _) = parse_frontmatter(content, &path)?;
+    if !is_safe_skill_name(&meta.name) {
+        return Err("install DENIED: unsafe installed skill name".into());
+    }
+    Ok(meta.name)
+}
+
 /// Scan a directory for tool scripts (.js, .ts, .py).
 fn scan_tool_scripts(dir: &Path) -> Vec<String> {
     let mut scripts = Vec::new();
@@ -368,7 +382,16 @@ pub async fn install_skill(
     agent_skills_dir: &Path,
     quarantine_dir: &Path,
 ) -> Result<ParsedSkill, String> {
-    let parsed = parse_skill_file(skill_path)?;
+    let content = tokio::fs::read_to_string(skill_path)
+        .await
+        .map_err(|e| format!("Failed to read skill: {e}"))?;
+    check_frontmatter(&content).map_err(|error| format!("install DENIED: {error}"))?;
+    let (meta, body) = parse_frontmatter(&content, skill_path)?;
+    let parsed = ParsedSkill {
+        meta,
+        content: body,
+        tool_scripts: skill_path.parent().map(scan_tool_scripts).unwrap_or_default(),
+    };
 
     if !is_safe_skill_name(&parsed.meta.name) {
         return Err(format!(
@@ -390,10 +413,6 @@ pub async fn install_skill(
     let dest = agent_skills_dir.join(&filename);
 
     // Copy skill content
-    let content = tokio::fs::read_to_string(skill_path)
-        .await
-        .map_err(|e| format!("Failed to read skill: {e}"))?;
-
     tokio::fs::write(&dest, &content)
         .await
         .map_err(|e| format!("Failed to write skill: {e}"))?;
@@ -586,6 +605,19 @@ mod install_safety_tests {
         assert!(skills_dir.join("notes.md").is_file());
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn invalid_frontmatter_cannot_fall_back_and_overwrite_an_existing_skill() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("notes.md");
+        let skills = home.path().join("skills");
+        std::fs::create_dir(&skills).unwrap();
+        std::fs::write(skills.join("notes.md"), "original").unwrap();
+        std::fs::write(&source, "---\nname: [bad, type]\n---\nreplacement").unwrap();
+        let error = install_skill(&source, &skills, &home.path().join("quarantine")).await.unwrap_err();
+        assert!(error.contains("DENIED"), "{error}");
+        assert_eq!(std::fs::read_to_string(skills.join("notes.md")).unwrap(), "original");
     }
 
     #[tokio::test]

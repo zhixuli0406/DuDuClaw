@@ -190,6 +190,41 @@ struct AppState {
     home_dir: std::path::PathBuf,
 }
 
+/// Check any existing identity-store entry before schema initialization can
+/// create a symlink target and obscure the original unreadable policy state.
+fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<(), String> {
+    match std::fs::symlink_metadata(home.join("users.db")) {
+        Ok(_) => crate::mfa::boot_policy(home, personal).map(|_| ()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_policy_precheck_tests {
+    use super::precheck_identity_policy;
+
+    #[test]
+    fn dangling_identity_symlink_refuses_before_database_initialization() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("missing-users.db");
+        let link = home.path().join("users.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = precheck_identity_policy(home.path(), false).unwrap_err();
+        assert!(error.contains("MFA policy state unavailable"), "{error}");
+        assert!(!target.exists(), "precheck must not create the symlink target");
+        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn absent_identity_store_allows_fresh_install_without_creating_database() {
+        let home = tempfile::tempdir().unwrap();
+        precheck_identity_policy(home.path(), false).unwrap();
+        assert!(!home.path().join("users.db").exists());
+    }
+}
+
 /// Start the WebSocket RPC gateway and block until it shuts down.
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
     // Initialise the log broadcast channel (must happen before subscribers connect).
@@ -401,12 +436,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     info!("edition_profile={}", boot_edition.as_str());
     // Do not let schema initialization hide an unreadable/missing policy
     // table in an existing non-Personal identity store.
-    if home_dir.join("users.db").try_exists().map_err(|e|
-        duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?
-    {
-        crate::mfa::boot_policy(&home_dir, boot_edition.is_personal())
-            .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
-    }
+    precheck_identity_policy(&home_dir, boot_edition.is_personal())
+        .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
     // Initialize the identity schema before reading its durable MFA boundary.
     // This also makes a fresh non-Personal install distinguishable from an
     // existing unreadable identity store; initialization failures abort boot.

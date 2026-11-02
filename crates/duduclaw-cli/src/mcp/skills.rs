@@ -617,6 +617,7 @@ mod skill_list_b8_tests {
         use duduclaw_core::publishers::{SignatureState, SignatureStatus};
         let gated = duduclaw_gateway::skill_lifecycle::hub_install::GatedManifest {
             hub: "hub".into(), skill_name: "notes".into(), content: "exact bytes\r\n".into(),
+            manifest_name: "notes".into(), publisher: Some("alice".into()), signature: Some("fixture".into()),
             risk_level: "Low".into(), findings: 0,
             signature_status: SignatureStatus { state: SignatureState::Verified, publisher: Some("alice".into()) },
             trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None,

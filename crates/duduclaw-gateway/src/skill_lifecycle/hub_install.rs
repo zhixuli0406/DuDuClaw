@@ -72,13 +72,17 @@ pub fn gate_hub_content(
 #[derive(Debug, Clone)]
 pub struct GatedManifest {
     pub hub: String,
-    /// The requested slug (not necessarily the frontmatter `name`).
+    /// Requested slug; must match the manifest and installed frontmatter name.
     pub skill_name: String,
     /// Scanned-and-passed skill content (never empty — the gate rejects blank).
     pub content: String,
+    pub manifest_name: String,
+    pub publisher: Option<String>,
+    pub signature: Option<String>,
     /// Debug-rendered `RiskLevel` (`"Low"`, `"Medium"`, …) — for summaries.
     pub risk_level: String,
     pub findings: usize,
+    /// Fetch-time evidence for approval only; reverified under the install lock.
     pub signature_status: SignatureStatus,
     /// Trust floor of the originating hub (WP2.6 §3 layer-4). Non-`Official`
     /// sources should be sandbox-TTL trialled before graduation.
@@ -93,6 +97,17 @@ impl GatedManifest {
     pub fn requires_sandbox_trial(&self) -> bool {
         self.trust_floor != duduclaw_agent::trust_tier::TrustTier::Official
     }
+}
+
+/// Resolve exactly the filename the loader will write before consulting history.
+fn installed_skill_name(slug: &str, manifest_name: &str, content: &str) -> Result<String, String> {
+    let name = duduclaw_agent::skill_loader::install_skill_name(content, slug)?;
+    if !duduclaw_agent::skill_loader::is_safe_skill_name(&name)
+        || slug != manifest_name || slug != name
+    {
+        return Err("hub install DENIED: requested slug, manifest name and installed skill name must match".into());
+    }
+    Ok(name)
 }
 
 /// Verify origin and integrity before scanning; a valid signature never bypasses the scan.
@@ -121,7 +136,8 @@ fn gate_hub_manifest(
         manifest.publisher.as_deref(), manifest.signature.as_deref(), content.as_bytes(),
     )?;
 
-    duduclaw_agent::skill_hub::check_signature_history(home_dir, hub_id, skill_name, &signature_status)?;
+    let installed_name = installed_skill_name(skill_name, &manifest.name, &content)?;
+    duduclaw_agent::skill_hub::check_signature_history(home_dir, hub_id, &installed_name, &signature_status)?;
 
     // ── Layers 2+3: SKILL.md as DATA through the 6-category scanner ─
     // (secrets / prompt-injection / exfiltration / code-exec / size / contract);
@@ -171,6 +187,9 @@ pub async fn fetch_and_gate(
         hub: hub_id.to_string(),
         skill_name: skill_name.to_string(),
         content,
+        manifest_name: manifest.name.clone(),
+        publisher: manifest.publisher.clone(),
+        signature: manifest.signature.clone(),
         risk_level: format!("{:?}", scan.risk_level),
         findings: scan.findings.len(),
         signature_status,
@@ -207,18 +226,23 @@ pub async fn install_gated(
 async fn install_gated_locked(
     home_dir: &Path, gated: &GatedManifest, scope: &str,
 ) -> Result<HubInstallReport, String> {
-    // Approval can outlive the trust-store snapshot used by fetch_and_gate.
-    // Refuse a newly unreadable or invalid store before any history or loader writes.
-    TrustStore::load(home_dir)?;
+    let installed_name = installed_skill_name(&gated.skill_name, &gated.manifest_name, &gated.content)?;
+    // Approval evidence is not install authority: reverify exact bytes with current keys.
+    let signature_status = TrustStore::load(home_dir)?.verify_content(
+        gated.publisher.as_deref(), gated.signature.as_deref(), gated.content.as_bytes(),
+    )?;
+    if signature_status != gated.signature_status {
+        return Err("hub install DENIED: publisher or signature trust changed after approval".into());
+    }
     duduclaw_agent::skill_hub::check_signature_history(
-        home_dir, &gated.hub, &gated.skill_name, &gated.signature_status,
+        home_dir, &gated.hub, &installed_name, &signature_status,
     )?;
     let hub_id = gated.hub.as_str();
     let skill_name = gated.skill_name.as_str();
     let content = gated.content.as_str();
     // Persist the trust commitment before exposing content to a loader. A failed install
     // deliberately retains this conservative pin; disk failures must not permit a downgrade.
-    record_verified_signature(home_dir, hub_id, skill_name, &gated.signature_status)?;
+    record_verified_signature(home_dir, hub_id, &installed_name, &signature_status)?;
 
     // Write to a per-call unique temp dir under the duduclaw home and reuse
     // the shared install primitives. NOT the shared world-writable /tmp: a
@@ -273,7 +297,7 @@ async fn install_gated_locked(
             )
             .await?;
         store.record_hub_signature(
-            &parsed.meta.name, &curation_scope, &gated.signature_status,
+            &parsed.meta.name, &curation_scope, &signature_status,
             &duduclaw_agent::skill_hub::sha256_hex(content),
         ).await?;
     }
@@ -292,7 +316,7 @@ async fn install_gated_locked(
         scope: scope.to_string(),
         risk_level: gated.risk_level.clone(),
         findings: gated.findings,
-        signature_status: gated.signature_status.clone(),
+        signature_status,
         content_sha256: duduclaw_agent::skill_hub::sha256_hex(content),
     })
 }
@@ -388,7 +412,9 @@ mod tests {
     fn verified_origin_still_runs_scanner() {
         let home = pinned_home();
         TrustStore::load(&home).unwrap().verify_content(Some("fixture"), Some(MALICIOUS_SIG), MALICIOUS.as_bytes()).unwrap();
-        let err = gate_hub_manifest(&home, "clawhub", "evil", &manifest(MALICIOUS, Some(MALICIOUS_SIG), "fixture")).unwrap_err();
+        let mut source = manifest(MALICIOUS, Some(MALICIOUS_SIG), "fixture");
+        source.name = "evil".into();
+        let err = gate_hub_manifest(&home, "clawhub", "evil", &source).unwrap_err();
         assert!(err.contains("security scan DENIED"), "{err}");
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -420,6 +446,8 @@ mod tests {
         // Precreate the sidecar so acquiring the lock itself remains possible.
         std::fs::write(&path, "{}").unwrap();
         std::fs::write(path.with_extension("json.lock"), "").unwrap();
+        std::fs::write(home.path().join("trusted_publishers.toml"),
+            format!("[publishers.fixture]\nkeys = [\"{TEST_KEY}\"]\n")).unwrap();
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         // Privileged test runners can bypass directory permissions.
         if let Ok(probe) = tempfile::NamedTempFile::new_in(home.path()) {
@@ -429,10 +457,14 @@ mod tests {
         }
         let gated = GatedManifest {
             hub: "clawhub".into(), skill_name: "notes".into(), content: CLEAN.into(),
+            manifest_name: "notes".into(), publisher: None, signature: None,
             risk_level: "Low".into(), findings: 0,
             signature_status: SignatureStatus { state: duduclaw_core::publishers::SignatureState::Verified, publisher: Some("fixture".into()) },
             trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None,
         };
+        let mut gated = gated;
+        gated.publisher = Some("fixture".into());
+        gated.signature = Some(CLEAN_SIG.into());
         let result = install_gated(home.path(), &gated, "global").await;
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = result.unwrap_err();
@@ -448,6 +480,7 @@ mod tests {
         let (_, signature_status) = gate_hub_manifest(home.path(), "clawhub", "notes", &source).unwrap();
         let gated = GatedManifest {
             hub: "clawhub".into(), skill_name: "notes".into(), content: CLEAN.into(),
+            manifest_name: "notes".into(), publisher: Some("unknown".into()), signature: None,
             risk_level: "Low".into(), findings: 0, signature_status,
             trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None,
         };
@@ -463,12 +496,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let gated = GatedManifest {
             hub: "clawhub".into(), skill_name: "notes".into(), content: CLEAN.into(),
+            manifest_name: "notes".into(), publisher: None, signature: None,
             risk_level: "Low".into(), findings: 0,
             signature_status: SignatureStatus { state: duduclaw_core::publishers::SignatureState::Verified, publisher: None },
             trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None,
         };
         let error = install_gated(home.path(), &gated, "global").await.unwrap_err();
-        assert!(error.contains("missing its publisher"), "{error}");
+        assert!(error.contains("publisher or signature trust changed"), "{error}");
         assert!(!home.path().join("tmp").exists());
     }
 
@@ -479,12 +513,94 @@ mod tests {
             r#"{"clawhub":{"notes":"fixture"}}"#).unwrap();
         let gated = GatedManifest {
             hub: "clawhub".into(), skill_name: "notes".into(), content: CLEAN.into(),
+            manifest_name: "notes".into(), publisher: None, signature: None,
             risk_level: "Low".into(), findings: 0, signature_status: SignatureStatus::unsigned(None),
             trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None,
         };
         let error = install_gated(home.path(), &gated, "global").await.unwrap_err();
         assert!(error.contains("signature downgrade"), "{error}");
         assert!(!home.path().join("tmp").exists(), "refused before staging or loader writes");
+    }
+
+    #[test]
+    fn whitespace_frontmatter_name_cannot_redirect_install_target() {
+        let content = "---\nname: ' '\n---\nNotes";
+        assert!(installed_skill_name("notes", "notes", content).is_err());
+        assert_eq!(duduclaw_agent::skill_loader::install_skill_name(content, "notes").unwrap(), " ");
+    }
+
+    fn gated_source(home: &Path, source: &HubManifest) -> GatedManifest {
+        let (scan, signature_status) = gate_hub_manifest(home, "clawhub", "notes", source).unwrap();
+        GatedManifest {
+            hub: "clawhub".into(), skill_name: "notes".into(),
+            manifest_name: source.name.clone(), content: source.content.clone().unwrap(),
+            publisher: source.publisher.clone(), signature: source.signature.clone(),
+            signature_status, risk_level: format!("{:?}", scan.risk_level), findings: scan.findings.len(),
+            trust_floor: source.trust_floor, source_verdict: source.source_verdict.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_trust_or_content_refuses_before_history_and_loader_writes() {
+        for change in ["removed", "rotated", "content", "publisher"] {
+            let home = pinned_home();
+            let mut gated = gated_source(&home, &manifest(CLEAN, Some(CLEAN_SIG), "fixture"));
+            match change {
+                "removed" => std::fs::write(home.join("trusted_publishers.toml"), "").unwrap(),
+                "rotated" => std::fs::write(home.join("trusted_publishers.toml"),
+                    format!("[publishers.fixture]\nkeys = [\"{}\"]\n", duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY)).unwrap(),
+                "content" => gated.content.push_str("\nChanged after approval."),
+                "publisher" => gated.publisher = Some("other".into()),
+                _ => unreachable!(),
+            }
+            assert!(install_gated(&home, &gated, "global").await.is_err(), "{change}");
+            assert!(!home.join("skills").exists(), "{change}");
+            assert!(!home.join("tmp").exists(), "{change}");
+            assert!(!home.join(duduclaw_agent::skill_hub::SKILL_SIGNATURE_HISTORY_FILE).exists(), "{change}");
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_verified_content_installs_and_pins_installed_name() {
+        let home = pinned_home();
+        let gated = gated_source(&home, &manifest(CLEAN, Some(CLEAN_SIG), "fixture"));
+        let report = install_gated(&home, &gated, "global").await.unwrap();
+        assert_eq!(report.signature_status, gated.signature_status);
+        assert_eq!(std::fs::read_to_string(home.join("skills/notes.md")).unwrap(), CLEAN);
+        let history = duduclaw_agent::skill_hub::load_signature_history(&home).unwrap();
+        assert_eq!(history["clawhub"]["notes"], "fixture");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsigned_alias_cannot_overwrite_a_signed_target() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("skills")).unwrap();
+        std::fs::write(home.path().join("skills/notes.md"), CLEAN).unwrap();
+        let history = r#"{"clawhub":{"notes":"fixture"}}"#;
+        let history_path = home.path().join(duduclaw_agent::skill_hub::SKILL_SIGNATURE_HISTORY_FILE);
+        std::fs::write(&history_path, history).unwrap();
+        let source = manifest(CLEAN, None, "unknown");
+        // Both manifest aliases and frontmatter aliases are rejected at fetch.
+        assert!(gate_hub_manifest(home.path(), "clawhub", "fresh-slug", &source).is_err());
+        let mut alias = source.clone();
+        alias.name = "fresh-slug".into();
+        assert!(gate_hub_manifest(home.path(), "clawhub", "fresh-slug", &alias).is_err());
+        let mut gated = GatedManifest {
+            hub: "clawhub".into(), skill_name: "fresh-slug".into(),
+            manifest_name: "fresh-slug".into(), content: CLEAN.into(),
+            publisher: None, signature: None, signature_status: SignatureStatus::unsigned(None),
+            risk_level: "Low".into(), findings: 0,
+            trust_floor: duduclaw_agent::trust_tier::TrustTier::Active, source_verdict: None,
+        };
+        // Recheck after approval too, before staging, pinning or overwriting.
+        assert!(install_gated(home.path(), &gated, "global").await.unwrap_err().contains("must match"));
+        gated.skill_name = "notes".into();
+        assert!(install_gated(home.path(), &gated, "global").await.unwrap_err().contains("must match"));
+        assert_eq!(std::fs::read_to_string(home.path().join("skills/notes.md")).unwrap(), CLEAN);
+        assert_eq!(std::fs::read_to_string(history_path).unwrap(), history);
+        assert!(!home.path().join("tmp").exists());
     }
 
     // ── Fail-closed #1: absent content can never install ────
@@ -533,6 +649,7 @@ mod tests {
             hub: "clawhub".into(),
             skill_name: "s".into(),
             content: "x".into(),
+            manifest_name: "s".into(), publisher: None, signature: None,
             risk_level: "Low".into(),
             findings: 0,
             signature_status: SignatureStatus::unsigned(None),
