@@ -744,34 +744,45 @@ mod tests {
         assert!(list_records(h).is_empty());
     }
 
-    #[tokio::test]
-    async fn remove_pack_waits_for_inflight_admission() {
-        let home = tempfile::tempdir().unwrap();
-        let agent_dir = home.path().join("agents/pack-agent");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
-        let mut rec = record("demo");
-        rec.agents = vec!["pack-agent".into()];
-        write_record(home.path(), &rec).unwrap();
-        let held = duduclaw_core::autonomy_gate::admit(
-            home.path(), "pack-agent", duduclaw_core::autonomy_gate::AutonomyPath::Background,
-        ).await.unwrap();
-        let (release, released) = tokio::sync::oneshot::channel::<()>();
-        let holder = tokio::task::spawn_blocking(move || {
-            let _held = held;
-            released.blocking_recv().unwrap();
-        });
-        let removing_home = home.path().to_path_buf();
-        let mut removing = tokio::spawn(async move { remove_pack(&removing_home, "demo").await });
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut removing).await.is_err());
-        assert!(agent_dir.join("agent.toml").is_file());
-        assert!(read_record(home.path(), "demo").is_some());
-        release.send(()).unwrap();
-        holder.await.unwrap();
-        let items = tokio::time::timeout(std::time::Duration::from_secs(5), removing)
-            .await.unwrap().unwrap().unwrap();
-        assert!(items.iter().any(|item| item.kind == "agent" && item.status == "removed"));
-        assert!(!agent_dir.exists());
+    #[test]
+    fn remove_pack_waits_for_inflight_admission() {
+        // Removal must work with only one blocking worker. Keep its prerequisite
+        // (releasing the admission) on the test task, never queued in that pool.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let home = tempfile::tempdir().unwrap();
+                let agent_dir = home.path().join("agents/pack-agent");
+                std::fs::create_dir_all(&agent_dir).unwrap();
+                std::fs::write(agent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
+                let mut rec = record("demo");
+                rec.agents = vec!["pack-agent".into()];
+                write_record(home.path(), &rec).unwrap();
+                let held = duduclaw_core::autonomy_gate::admit(
+                    home.path(), "pack-agent", duduclaw_core::autonomy_gate::AutonomyPath::Background,
+                ).await.unwrap();
+                let (_observer, waiting) =
+                    duduclaw_core::autonomy_gate::admission_test_hooks::observe_wait(home.path());
+                let removing_home = home.path().to_path_buf();
+                let removing = tokio::spawn(async move { remove_pack(&removing_home, "demo").await });
+                // Observe a real failed lock attempt, not an elapsed scheduling window.
+                // Timeouts are watchdogs only; they do not establish that removal waits.
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                    .await.expect("removal did not contend on the held admission")
+                    .expect("admission wait observer disconnected");
+                assert!(!removing.is_finished(), "removal must wait for the admission");
+                assert!(agent_dir.join("agent.toml").is_file());
+                assert!(read_record(home.path(), "demo").is_some());
+                drop(held);
+                let items = tokio::time::timeout(std::time::Duration::from_secs(5), removing)
+                    .await.unwrap().unwrap().unwrap();
+                assert!(items.iter().any(|item| item.kind == "agent" && item.status == "removed"));
+                assert!(!agent_dir.exists());
+                assert!(read_record(home.path(), "demo").is_none());
+            });
     }
 
     #[tokio::test]

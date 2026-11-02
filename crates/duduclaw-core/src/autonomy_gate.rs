@@ -23,6 +23,10 @@ pub const MAX_REASON_CHARS: usize = 1000;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PENDING_CHANGE_RECEIPTS: usize = 4096;
 
+#[cfg(any(test, feature = "autonomy-gate-test-hooks"))]
+#[doc(hidden)]
+pub mod admission_test_hooks;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutonomyPath {
     GoalLoop,
@@ -615,7 +619,10 @@ fn lock_admission(
             }
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                #[cfg(any(test, feature = "autonomy-gate-test-hooks"))]
+                admission_test_hooks::notify_wait(home);
+            }
             Err(error) => return Err(error),
         }
         if std::time::Instant::now() >= deadline {
