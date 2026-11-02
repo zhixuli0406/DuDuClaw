@@ -42,6 +42,7 @@
 ### Fixed
 
 - 測試：Home OAuth 撤銷存在性測試改用各自的 client ID，避免平行 callback 的 provider 計數被算到另一個測試；新增固定順序的隔離回歸測試。
+- 派出去的員工完成工作時，同一回合排隊中的臨時員工不再被清掉
 - 語音設定在 Telegram 與 MCP 工具上沒有生效，都寫死 Edge；現在都依設定。MCP 工具只能用本機語音，付費金鑰只留在 gateway。沒有可用語音服務時，Telegram 不顯示 Voice Toggle 按鈕，合成失敗時會告知一次並改傳文字。`/voice` 在不支援的通道會直接說明。
 - 「— Powered by DuDuClaw」原本所有方案都會附加，與授權說明不符；現在只有 opensource、hobby 與沒有授權的安裝才附加，LINE Flex 頁尾比照。
 - 用儀表板連接 Claude 訂閱後，畫面仍顯示未連線。帳號池有可用的訂閱帳號現在算已連線。
@@ -100,6 +101,7 @@
 ### Deprecated
 
 - `MEMORY.md` 標為舊格式：互動式 runner 與 `claude_runner` 路徑仍會讀取，通道、精簡模式與任務沙箱不讀。
+- `duduclaw agent`（不帶子指令）與 `duduclaw agent run <name>` 的互動工作階段已棄用，因為它會繞過 gateway；仍可使用，預計於 v1.81.0 移除。互動操作請改用 `duduclaw tui`。其他 `duduclaw agent` 子指令不受影響。
 
 ### Removed
 
