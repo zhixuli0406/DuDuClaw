@@ -567,7 +567,14 @@ mod tests {
             loop {
                 match trust_lock.try_lock_exclusive() {
                     Ok(()) => FileExt::unlock(&trust_lock).unwrap(),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.raw_os_error().is_some_and(|code| {
+                                Some(code) == fs2::lock_contended_error().raw_os_error()
+                            }) =>
+                    {
+                        break;
+                    }
                     Err(error) => panic!("unexpected trust lock error: {error}"),
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
