@@ -116,8 +116,10 @@ struct FakeState {
     starts: AtomicU32,
     title: Mutex<Option<Result<String, String>>>,
     fail_start: AtomicBool,
-    /// How long `stop` takes, in milliseconds.
+    /// How long `stop` takes, in milliseconds (workspace lease fixtures).
     stop_delay_ms: std::sync::atomic::AtomicU64,
+    /// Hold a backend stop until the test has cancelled its request waiter.
+    stop_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// URLs handed to `navigate`.
     navigated: Mutex<Vec<String>>,
     /// Make `navigate` report a browser error.
@@ -192,6 +194,11 @@ impl SessionBackend for FakeBackend {
         let delay = self.state.stop_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        let pause = self.state.stop_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
         }
         self.state.stops.fetch_add(1, Ordering::SeqCst);
     }
@@ -1618,17 +1625,17 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
             }
         })
         .await
-        .expect("the real pending approval must appear within the fixture TTL")
+        .unwrap_or_else(|_| panic!("pending approval for {tool} did not appear within 30 s"))
     }
 
     let tmp = home();
     let h = tmp.path();
     let state = Arc::new(FakeState::default());
-    // Shared fixture budget includes SQLite IO, reaper scheduling and expiry
-    // on loaded Windows runners; this does not change production timing.
-    const FIXTURE_WAIT: Duration = Duration::from_secs(10);
-    let mut mgr = manager(h, &state, Duration::from_millis(100));
-    mgr.approval_ttl_secs = FIXTURE_WAIT.as_secs() as i64;
+    // Approval validity is independent of the harness watchdog. Only the
+    // final phase tests expiry; the human-decision phases use the real TTL.
+    const FIXTURE_WAIT: Duration = Duration::from_secs(30);
+    let mut mgr = manager(h, &state, IDLE_TIMEOUT);
+    mgr.approval_ttl_secs = gates::APPROVAL_TTL_SECS;
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     write_agent(
         h,
@@ -1636,9 +1643,7 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         "[capabilities]\ncomputer_use = true\napproval_required_tools = [\"computer_click\"]\n\
          irreversible_tools = [\"computer_type\"]\nmaybe_irreversible_tools = [\"computer_key\"]\n",
     );
-    assert_eq!(mgr.approval_ttl_secs, 10);
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(u64::try_from(mgr.approval_ttl_secs).unwrap());
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
 
     // These borrowed futures have no background tasks. On failure or expiry,
     // dropping the shared fixture scope cancels every pending waiter.
@@ -1650,7 +1655,6 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         let rec = pending_for(&broker, "computer_click", deadline).await;
         assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 1);
         pending_tx.send(()).expect("the reaper is still waiting");
-        tokio::time::sleep(Duration::from_millis(250)).await;
         reaped_rx.await.expect("the pending session passed its reaper check");
         broker.decide(&rec.id, true, "test-operator").await.unwrap();
         rec.summary
@@ -1660,10 +1664,17 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 1);
         assert!(entry.session.try_lock().is_ok(), "approval holds no session lock");
         assert!(state.executed.lock().unwrap().is_empty());
-        tokio::time::sleep(Duration::from_millis(200)).await;
         {
-            let session = entry.session.try_lock().expect("pending wait stays unlocked");
-            assert!(session.last_activity.elapsed() >= Duration::from_millis(100));
+            let mut session = entry.session.try_lock().expect("pending wait stays unlocked");
+            // Make the idle condition true without racing the scheduler or
+            // shortening the post-approval idle grace period.
+            session.last_activity = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+            assert_eq!(
+                end_reason(Instant::now(), session.deadline, session.last_activity,
+                    IDLE_TIMEOUT, false, ThreatLevel::Green),
+                Some(EndReason::Idle),
+                "without the pending approval this session must be idle",
+            );
             assert!(!session.ended);
             assert_eq!(session.actions_used, 0);
         }
@@ -1688,17 +1699,21 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         )
     })
     .await
-    .expect("the approval and reaper must finish within the original fixture TTL");
+    .unwrap_or_else(|_| panic!(
+        "approval/reaper handshake timed out: waiting={}, executed={}",
+        entry.shared.approvals_waiting.load(Ordering::Acquire),
+        state.executed.lock().unwrap().len(),
+    ));
     assert_eq!(reaped, 0, "a pending approval is not idleness");
     assert_eq!(done.unwrap()["actions_used"], 1);
     assert!(summary.contains("computer_click"), "{summary}");
     assert_eq!(entry.shared.approvals_waiting.load(Ordering::Acquire), 0);
 
     // Denied: refused, nothing runs. Typed text never reaches the summary.
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
     let decider = async {
         let broker = crate::approval::ApprovalBroker::open(h).unwrap();
         let rec = pending_for(&broker, "computer_type", deadline).await;
-        tokio::time::sleep(Duration::ZERO).await;
         broker.decide(&rec.id, false, "test-operator").await.unwrap();
         rec.summary
     };
@@ -1707,7 +1722,7 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         tokio::join!(mgr.action("alice", None, None, &request), decider)
     })
     .await
-    .expect("the denial must finish within the original fixture TTL");
+    .expect("the denial did not finish within its independent 30 s watchdog");
     let err = denied.unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalDenied);
     assert!(
@@ -1719,8 +1734,8 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
     let mut quick = manager(h, &state, IDLE_TIMEOUT);
     quick.approval_ttl_secs = 1;
     insert_session(&quick, &state, "alice", ComputerUseConfig::default());
-    let err = tokio::time::timeout_at(
-        deadline,
+    let err = tokio::time::timeout(
+        FIXTURE_WAIT,
         quick.action(
             "alice",
             None,
@@ -1729,7 +1744,7 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         ),
     )
     .await
-    .expect("the original one-second expiry must finish within the fixture TTL")
+    .expect("the one-second approval expiry did not finish within its independent 30 s watchdog")
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalDenied);
     assert_eq!(
@@ -1844,14 +1859,20 @@ async fn a_stop_or_threat_change_during_a_confirmation_wins_over_the_answer() {
 async fn a_stop_dropped_mid_way_still_removes_the_session_and_the_container() {
     let tmp = home();
     let state = Arc::new(FakeState::default());
-    state.stop_delay_ms.store(300, Ordering::SeqCst);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *state.stop_pause.lock().unwrap() = Some((entered.clone(), release.clone()));
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
-    let dropped = tokio::time::timeout(Duration::from_millis(50), mgr.stop("alice", None)).await;
-    assert!(
-        dropped.is_err(),
-        "the request was dropped while the container was stopping"
-    );
+    let mut stopping = Box::pin(mgr.stop("alice", None));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut stopping => panic!("stop returned before the backend was released: {result:?}"),
+            _ = entered.notified() => {},
+        }
+    }).await.expect("backend stop did not start within 30 s");
+    assert_eq!(state.stops.load(Ordering::SeqCst), 0, "backend stop is still held");
+    drop(stopping);
     // The entry is gone at once: a new start is not refused as "exists".
     assert!(mgr.is_empty());
     assert_eq!(
@@ -1859,10 +1880,17 @@ async fn a_stop_dropped_mid_way_still_removes_the_session_and_the_container() {
         ErrorCode::NotFound
     );
     assert_eq!(mgr.status("alice").await["active"], false);
-    // The container stop finished on its own.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Release only after dropping the request: cleanup must outlive it.
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while state.stops.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap_or_else(|_| panic!(
+        "detached backend cleanup did not finish: stops={}, sessions={}",
+        state.stops.load(Ordering::SeqCst), mgr.len(),
+    ));
     assert_eq!(state.stops.load(Ordering::SeqCst), 1);
-    state.stop_delay_ms.store(0, Ordering::SeqCst);
     assert!(mgr.start("alice", StartRequest::default()).await.is_ok());
 }
 
