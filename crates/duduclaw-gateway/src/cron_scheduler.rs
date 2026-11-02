@@ -307,9 +307,8 @@ impl CronScheduler {
                 Ok(None) => (),
                 Err(error) => { warn!(id=%task.id, "cron binding unavailable: {error}"); continue; }
             }
-            let expr = normalise_cron(&task.cron);
-            match expr.parse::<Schedule>() {
-                Ok(schedule) => {
+            match parse_task_schedule(&task) {
+                Ok((schedule, cron_tz)) => {
                     // Start from whichever is newer: in-memory cache, or the DB's persisted last_run_at.
                     let db_last_run = task
                         .last_run_at
@@ -321,7 +320,6 @@ impl CronScheduler {
                         (Some(mem), None) => Some(mem),
                         (None, db) => db,
                     };
-                    let cron_tz = resolve_task_cron_tz(&task);
                     new_live.push(LiveTask {
                         task,
                         schedule,
@@ -1207,6 +1205,23 @@ fn cron_reply_channel_string(task: &CronTaskRow) -> Option<String> {
     }
 }
 
+/// Shared parsing for live cron loading and read-only cadence projections.
+fn parse_task_schedule(task: &CronTaskRow) -> Result<(Schedule, Option<chrono_tz::Tz>), String> {
+    let schedule = normalise_cron(&task.cron).parse::<Schedule>().map_err(|e| e.to_string())?;
+    Ok((schedule, resolve_task_cron_tz(task)))
+}
+
+/// Next future cadence slot, not a guarantee that condition/admission gates pass.
+/// Disabled jobs and invalid schedules have no next run. No state is changed.
+pub(crate) fn next_run(task: &CronTaskRow, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if !task.enabled { return None; }
+    let (schedule, timezone) = parse_task_schedule(task).ok()?;
+    let after = task.last_run_at.as_deref()
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| now.max(at.with_timezone(&Utc))).unwrap_or(now);
+    duduclaw_core::cron_tz::next_run_in_tz(&schedule, after, timezone)
+}
+
 /// Parse a task's `cron_timezone` column. Returns `None` for absent /
 /// empty values (UTC / legacy behaviour) and for unknown IANA names —
 /// the latter also emits a warn log once, at load time, so a typo is
@@ -1366,6 +1381,33 @@ mod routine_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cron_next_run_matches_scheduler_in_taipei_and_new_york() {
+        use chrono::TimeZone;
+        let mut task = CronTaskRow::new("next".into(), "next".into(), "worker".into(),
+            "0 9 * * 1-5".into(), "test".into());
+        for (timezone, expected_hour) in [("Asia/Taipei", 1), ("America/New_York", 14)] {
+            task.cron_timezone = Some(timezone.into());
+            let now = Utc.with_ymd_and_hms(2026, 11, 2, 0, 0, 0).unwrap();
+            let expected = Utc.with_ymd_and_hms(2026, 11, 2, expected_hour, 0, 0).unwrap();
+            assert_eq!(next_run(&task, now), Some(expected));
+            let (schedule, tz) = parse_task_schedule(&task).unwrap();
+            assert!(!duduclaw_core::should_fire_in_tz(&schedule, Some(now), expected - chrono::Duration::seconds(1), tz));
+            assert!(duduclaw_core::should_fire_in_tz(&schedule, Some(now), expected, tz));
+            task.last_run_at = Some(expected.to_rfc3339());
+            assert!(next_run(&task, now).unwrap() > expected);
+            task.last_run_at = None;
+        }
+        task.enabled = false;
+        assert!(next_run(&task, Utc::now()).is_none());
+        assert!(crate::handlers::MethodHandler::cron_row_to_json(&task)["next_run"].is_null());
+        task.enabled = true;
+        task.cron = "invalid".into();
+        assert!(next_run(&task, Utc::now()).is_none());
+        assert!(crate::handlers::MethodHandler::cron_row_to_json(&task)["next_run"].is_null());
+    }
+
     use std::sync::Mutex as StdMutex;
 
     /// Records every `(agent_id, prompt)` it is asked to invoke and returns a
