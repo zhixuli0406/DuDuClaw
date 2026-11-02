@@ -198,13 +198,39 @@ fn read_policy_state(home: &Path) -> Result<bool, String> {
         .optional().map(|v| v.unwrap_or(false)).map_err(|e| e.to_string())
 }
 
+fn read_boot_policy_state(home: &Path) -> Result<bool, String> {
+    use rusqlite::OptionalExtension;
+    let path = home.join("users.db");
+    if !std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?.file_type().is_file() {
+        return Err("users.db must be a regular file".into());
+    }
+    let db = rusqlite::Connection::open_with_flags(
+        path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).map_err(|e| e.to_string())?;
+    match db.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).optional() {
+        Ok(value) => Ok(value.unwrap_or(false)),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
+            if message == "no such table: mfa_policy_state" => {
+            // Only a wholly pre-MFA schema may pass without a recorded policy.
+            let legacy: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND lower(name)='users')
+                 AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND lower(name) GLOB 'mfa_*')",
+                [], |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            if legacy { Ok(false) } else { Err(message.clone()) }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
-    // Only an absent directory entry means no policy has ever been recorded.
+    // An absent directory entry needs no policy read.
     // A dangling symlink or any other existing but unreadable store must fail closed.
     if policy_store_is_absent(home) {
         return Ok(false);
     }
-    match read_policy_state(home) {
+    let policy = if personal { read_policy_state(home) } else { read_boot_policy_state(home) };
+    match policy {
         Ok(value) => Ok(value),
         Err(_) if personal => Ok(false),
         Err(error) => {
@@ -312,6 +338,73 @@ pub(crate) fn replacement_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn boot_policy_legacy_store_allows_migration_then_reads_durable_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("users.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE users (
+            id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'employee',
+            status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, last_login TEXT);").unwrap();
+        assert!(!boot_policy(home.path(), false).unwrap());
+        assert!(read_policy_state(home.path()).is_err());
+        assert!(refuse_policy_change_at(home.path(), "", "[auth]\nmfa_enforced=false").is_err());
+        let _db = UserDb::new(&path).unwrap();
+        assert!(!read_policy_state(home.path()).unwrap());
+        assert!(!boot_policy(home.path(), false).unwrap());
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        assert!(boot_policy(home.path(), false).unwrap());
+        conn.execute_batch("DROP TABLE mfa_policy_state").unwrap();
+        assert!(boot_policy(home.path(), false).is_err());
+        assert_eq!(policy_status(home.path())["degraded"], true);
+    }
+
+    #[test]
+    fn boot_policy_partial_or_invalid_store_refuses_and_degrades() {
+        for schema in [
+            "CREATE TABLE users(id TEXT); CREATE TABLE mfa_credentials(id TEXT);",
+            "CREATE TABLE users(id TEXT); CREATE TABLE mfa_custom(id TEXT);",
+            "CREATE TABLE unrelated(id TEXT);",
+            "CREATE TABLE users(id TEXT); CREATE TABLE mfa_policy_state(id INTEGER);",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            conn.execute_batch(schema).unwrap();
+            assert!(boot_policy(home.path(), false).is_err(), "{schema}");
+            assert_eq!(policy_status(home.path())["degraded"], true);
+        }
+        for bytes in [b"".as_slice(), b"not a sqlite database".as_slice()] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("users.db"), bytes).unwrap();
+            assert!(boot_policy(home.path(), false).is_err());
+            assert_eq!(policy_status(home.path())["degraded"], true);
+            assert!(!boot_policy(home.path(), true).unwrap());
+        }
+    }
+
+    #[test]
+    fn boot_policy_refuses_legacy_users_schema_with_mfa_view() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute_batch("CREATE TABLE users(id TEXT); CREATE VIEW mfa_x AS SELECT id FROM users;").unwrap();
+        assert!(boot_policy(home.path(), false).is_err());
+        assert_eq!(policy_status(home.path())["degraded"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_policy_symlink_to_legacy_store_refuses() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("legacy.db");
+        let conn = rusqlite::Connection::open(&target).unwrap();
+        conn.execute_batch("CREATE TABLE users(id TEXT)").unwrap();
+        std::os::unix::fs::symlink(target, home.path().join("users.db")).unwrap();
+        assert!(boot_policy(home.path(), false).is_err());
+        assert_eq!(policy_status(home.path())["degraded"], true);
+    }
+
     #[test]
     fn mfa_restore_policy_defaults_strict_when_unreadable() {
         let home = tempfile::tempdir().unwrap();

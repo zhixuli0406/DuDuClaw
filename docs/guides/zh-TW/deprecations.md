@@ -166,6 +166,13 @@ CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 
 ## 仍在棄用期
 
+### 舊版互動式 agent 工作階段
+
+不帶子指令的 `duduclaw agent` 與 `duduclaw agent run <name>` 會啟動會繞過
+gateway 的舊版互動工作階段。棄用期間兩種寫法仍可使用，並會在 stderr 顯示提示。
+互動操作請改用 `duduclaw tui`。`run` 子指令仍可解析，但不顯示在說明中；其他
+`duduclaw agent` 子指令不受影響。預計於 **v1.81.0** 移除。
+
 ### 板模包的舊格式
 
 板模包的舊 manifest `expert.toml`、`team.toml` 與產業包目錄結構已棄用。v1.69.0 仍然
@@ -214,4 +221,6 @@ MFA 第一階段為 `/api/login` 與 `/api/otp/verify` 新增條件式回應。�
 
 ## 第三方 MCP 環境變數憑證
 
-MCP env 遷移後若要降版，必須備妥加密遷移備份並重新輸入金鑰；舊版可能把 `secret://` 參照當成憑證字串傳出。請保留原始 `.keyfile`，以解密 `<home>/backups/mcp-migrate/*.enc`；啟動舊版前先還原相容設定並重新輸入金鑰。
+舊版可能把 `secret://` 參照當成憑證字串傳出，已遷移的員工不能直接換回舊版。升級前請複製整個 `<home>`；要降版時停止 gateway，還原這份複本。沒有複本時，啟動舊版前要把 `.mcp.json` 裡的參照逐一換回實際金鑰。目前沒有指令能解密 `<home>/backups/mcp-migrate/*.enc`，這些檔案只供人工復原，沒有原本的 `.keyfile` 就讀不出來。
+
+`.keyfile` 遺失時，憑證庫讀不出來；只要 `<home>/secrets/mcp` 或 `<home>/backups/mcp-migrate` 裡還有 `.enc` 檔，系統也不會建立新金鑰。請把這些檔案搬出 `<home>`，再重新輸入第三方金鑰。

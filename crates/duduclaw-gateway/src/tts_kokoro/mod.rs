@@ -21,13 +21,11 @@ impl TtsProvider for KokoroTtsProvider {
     fn name(&self) -> &str { "kokoro" }
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
         let text = duduclaw_core::truncate_chars(text, 2000).to_string();
-        let voice = if voice.is_empty() {
-            if g2p::is_pure_english(&text) { "af_maple" } else { "zf_001" }
-        } else { voice };
-        if !manifest::VOICES.contains(&voice) {
-            return Err(format!("Kokoro 不支援語音：{voice}"));
+        let selected_voice = select_voice(&text, voice);
+        if !voice.is_empty() && selected_voice != voice {
+            tracing::warn!(configured_voice = %duduclaw_core::truncate_chars(voice, 80), fallback_voice = selected_voice, "Unknown Kokoro voice; using default");
         }
-        let voice = voice.to_string();
+        let voice = selected_voice.to_string();
         let home = self.home.clone();
         tokio::task::spawn_blocking(move || {
             let lib = duduclaw_onnx::manifest::ort_lib_path(&home.join("lib/onnxruntime"))
@@ -35,6 +33,10 @@ impl TtsProvider for KokoroTtsProvider {
             synthesize_local(&install::model_dir(&home), &lib, &text, &voice)
         }).await.map_err(|e| format!("Kokoro 工作失敗：{e}"))?
     }
+}
+fn select_voice<'a>(text: &str, voice: &'a str) -> &'a str {
+    if manifest::VOICES.contains(&voice) { return voice; }
+    if g2p::is_pure_english(text) { "af_maple" } else { "zf_001" }
 }
 fn parse_voice(bytes: &[u8]) -> Result<Vec<f32>, String> {
     if bytes.len() != 510 * 256 * 4 { return Err("Kokoro voice 檔案大小不符（預期 522240 bytes）".into()); }
@@ -91,6 +93,18 @@ fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voice_selection_defaults_by_language_and_preserves_valid_voices() {
+        for voice in ["", "zh-TW-HsiaoChenNeural", "unknown"] {
+            assert_eq!(select_voice("Hello world", voice), "af_maple");
+            assert_eq!(select_voice("你好世界", voice), "zf_001");
+            assert_eq!(select_voice("Hello 你好", voice), "zf_001");
+        }
+        for voice in manifest::VOICES {
+            assert_eq!(select_voice("Hello world", voice), *voice);
+            assert_eq!(select_voice("你好世界", voice), *voice);
+        }
+    }
     #[test]
     fn short_tokens_are_padded_to_minimum() {
         assert_eq!(pad_short_tokens(vec![1, 2], 99), [1, 2, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99]);

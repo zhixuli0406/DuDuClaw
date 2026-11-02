@@ -25,7 +25,7 @@ fn code_regex() -> &'static Regex {
 
 fn keyword_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)驗證碼|認證碼|確認碼|動態密碼|一次性|安全碼|\bOTP\b|passcode|verification\s+code|security\s+code|login\s+code|your\s+code|one-time").expect("valid keyword regex"))
+    RE.get_or_init(|| Regex::new(r"(?i)驗證碼|認證碼|確認碼|登入碼|登入代碼|登錄碼|PIN\s*碼|\bPIN\b|動態密碼|一次性|安全碼|\bOTP\b|passcode|verification\s+code|security\s+code|login\s+code|your\s+code|one-time").expect("valid keyword regex"))
 }
 
 fn is_token_char(c: char) -> bool {
@@ -110,6 +110,19 @@ pub fn strip_one_time_credentials(text: &str) -> Stripped {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masks_login_codes_and_pin_without_matching_ordinary_words_or_numbers() {
+        for text in ["PIN 4821", "pin 4821", "PIN碼 4821", "登入碼 482913", "您的登入代碼是 482913", "登錄碼 482913"] {
+            let result = strip_one_time_credentials(text);
+            assert_eq!(result.codes, 1, "{text}");
+            assert!(!result.text.contains("4821"));
+            assert!(!result.text.contains("482913"));
+        }
+        for text in ["Pinned item 482913", "訂單 482913 已出貨"] {
+            assert_eq!(strip_one_time_credentials(text).text, text);
+        }
+    }
 
     #[test]
     fn masks_code_near_chinese_keyword_same_line_and_three_lines_above_blank_line() {

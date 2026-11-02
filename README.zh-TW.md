@@ -216,7 +216,8 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 ```
 duduclaw onboard             # 首次設定;瀏覽器引導已涵蓋,此為無頭/腳本場景用(--yes 跳過互動)
 duduclaw run                 # 一鍵啟動(gateway + channels + heartbeat + cron + dispatcher)
-duduclaw agent               # CLI 互動式對話;子指令 create / list / inspect / pause / resume / run
+duduclaw agent list          # 列出 agent；另有 create / inspect / pause / resume / export / freeze / unfreeze
+duduclaw tui                 # 互動式控制室與對話
 duduclaw wizard              # 產業模板互動式設定
 duduclaw status              # 系統健康快照
 duduclaw doctor              # 健康診斷
