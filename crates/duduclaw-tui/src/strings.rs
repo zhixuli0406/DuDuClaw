@@ -178,7 +178,7 @@ pub const WATCH_GAP: &str = "事件可能遺失，正在重新取得執行紀錄
 pub const WATCH_RUN_MISMATCH: &str = "警告：執行紀錄與目標不符，已略過";
 pub fn notification(count: usize) -> String { format!("DuDuClaw：{count} 項需要你處理") }
 
-pub const WATCH_HELP: &str = "持續查看一位員工的執行紀錄";
+pub const WATCH_HELP: &str = "持續查看員工或 --run 指定的執行紀錄";
 
 pub const WATCH_TRUNCATED: &str = "較早事件已省略，每次執行僅顯示最近 256 筆";
 pub const CHAT_DONE: &str = "回覆完成";
@@ -358,3 +358,8 @@ pub const YES: &str = "是";
 pub const NO: &str = "否";
 
 pub const WORKING_TASK_UNKNOWN: &str = "此次執行的任務未知；以下是員工的任務清單，並非執行連結";
+
+pub const WATCH_RUN_HELP: &str = "追蹤指定執行紀錄；不可與員工名稱同時使用";
+pub const NOTIFY_CONNECTION_ERROR: &str = "DuDuClaw：連線中斷，請檢查控制室";
+pub const PTY_WAITING: &str = "? 等待你的輸入（僅提示）";
+pub fn cost_today(millicents: u64) -> String { format!("今日 ${:.4}", millicents as f64 / 100_000.0) }

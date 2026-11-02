@@ -42,7 +42,7 @@ async fn serve_chat(mut socket: WebSocket, f: Arc<Fixture>) {
                     let mut frames = Vec::new();
                     if value["type"] == "user_message" {
                         frames.push(json!({"type":"step","phase":"start","tool":"Read","summary":"file","depth":0,"ts":1,
-                            "conv":value["conv"],"msg_id":value["msg_id"],"session_id":"webchat:webchat:owner:effective"}));
+                            "conv":value["conv"],"msg_id":value["msg_id"],"session_id":value["session_id"].as_str().map(str::to_owned).unwrap_or_else(|| format!("webchat:webchat:owner:{generation}#agent:{}#conv:{}", value["agent"].as_str().unwrap(), value["conv"].as_str().unwrap()))}));
                         if value["content"] != "hold" {
                             frames.push(json!({"type":"assistant_done","content":"reply\u{1b}]52;c;bad\u{7}","tokens_used":1,
                                 "conv":value["conv"],"msg_id":value["msg_id"]}));
@@ -63,8 +63,8 @@ async fn serve_chat(mut socket: WebSocket, f: Arc<Fixture>) {
     }
 }
 async fn chat_until(
-    state: &mut watch::Receiver<duduclaw_tui::chat::ChatState>,
-    predicate: impl Fn(&duduclaw_tui::chat::ChatState) -> bool,
+    state: &mut watch::Receiver<duduclaw_tui::chat::ChatRooms>,
+    predicate: impl Fn(&duduclaw_tui::chat::ChatRooms) -> bool,
 ) {
     timeout(Duration::from_secs(6), async {
         loop {
@@ -89,12 +89,12 @@ async fn one_chat_socket_reconnect_refresh_cancel_and_no_replay() {
     let mut state = chat.state();
     chat_until(&mut state, |s| s.connected).await;
     assert!(other.state().borrow().connected);
-    chat.send(duduclaw_tui::chat::submission("hold", Some("adu")).unwrap())
+    chat.send("test", duduclaw_tui::chat::submission("hold", Some("adu")).unwrap(), vec!["test".into()])
         .unwrap();
-    chat_until(&mut state, |s| s.can_cancel()).await;
-    chat.cancel().unwrap();
+    chat_until(&mut state, |s| s.rooms.get("test").is_some_and(|r| r.can_cancel())).await;
+    chat.cancel("test").unwrap();
     chat_until(&mut state, |s| {
-        !s.running && s.status.is(duduclaw_tui::strings::CHAT_CANCELLED)
+        s.rooms.get("test").is_some_and(|r| !r.running && r.status.is(duduclaw_tui::strings::CHAT_CANCELLED))
     })
     .await;
     gateway.fixture.events.send(Control::Close).unwrap();
@@ -123,17 +123,17 @@ async fn one_chat_socket_reconnect_refresh_cancel_and_no_replay() {
     .await
     .unwrap();
     chat_until(&mut state, |s| s.connected).await;
-    chat.send(duduclaw_tui::chat::submission("你好", Some("adu")).unwrap())
+    chat.send("test", duduclaw_tui::chat::submission("你好", Some("adu")).unwrap(), vec!["test".into()])
         .unwrap();
     chat_until(&mut state, |s| {
-        !s.running && s.lines.iter().any(|line| line.plain().contains("reply"))
+        s.rooms.get("test").is_some_and(|r| !r.running && r.lines.iter().any(|line| line.plain().contains("reply")))
     })
     .await;
     assert_eq!(gateway.fixture.chat_max_active.load(Ordering::SeqCst), 1);
     assert!(
         state
             .borrow()
-            .lines
+            .rooms["test"].lines
             .iter()
             .all(|line| !line.plain().contains('\x1b'))
     );
@@ -150,6 +150,7 @@ async fn watch_falls_back_to_real_poll_shapes_without_screen_control() {
         Duration::from_millis(250),
         duduclaw_tui::watch::run_watch_to(
             duduclaw_tui::WatchOptions {
+                run: None,
                 client,
                 agent: "adu".into(),
                 content: false,

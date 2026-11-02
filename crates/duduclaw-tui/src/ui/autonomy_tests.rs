@@ -48,7 +48,7 @@ impl Gateway for FakeGateway {
             }
             "playbook.list" => { assert_eq!(params,json!({"agent_id":"adu"})); json!({"agent_id":"adu","entries":list(json!({"id":"p1","state":"active","category":"repair","content":name}))}) }
             "budget.incidents" => { assert_eq!(params,json!({"limit":50})); json!({"incidents":list(json!({"ts":"2026-11-02T08:00:00Z","agent_id":name,"event":"budget_breaker_open","scope":"daily","spent_cents":100,"cap_cents":100})),"by_agent":[]}) }
-            "cost.summary" => { assert_eq!(params,json!({"hours":24})); json!({"available":!empty,"total_cost_millicents":123_000}) }
+            "cost.summary" => { assert!(params.get("since").is_some() || params == json!({"hours":24})); json!({"available":!empty,"total_cost_millicents":123_000}) }
             "digest.latest" => json!({"enabled":true,"digest":if empty { Value::Null } else { json!({"date":"2026-11-02","since":"2026-11-01T00:00:00Z","generated_at":"2026-11-02T08:00:00Z","agents":[{"agent_id":"adu","finished_total":1,"pending_approvals":1,"runs_done":1,"runs_not_done":2,"spend_usd":null,"finished":[{"title":name,"completed_at":"2026-11-02T08:00:00Z"}],"artifacts":[]}]}) },"feedback":{}}),
             "tasks.list_page" => json!({"tasks":if self.task_present { json!([task()]) } else { list(task()) },"total":if empty && !self.task_present {0} else {1}}),
             "tasks.timeline" => { assert_eq!(params,json!({"task_id":"t1"})); json!({"task":task(),"activity":[],"runs":[],"criteria_ledger":{"mode":"enforce","last_report_round":2,"invalid_reports":0,"units":list(json!({"handle":"C1","text":name,"status":"confirmed","evidence":name,"unresolved":null,"updated_round":2}))}}) }
@@ -258,9 +258,9 @@ fn plan_stale_changed_missing_revision_and_long_payload_cannot_authorize() {
 
 #[tokio::test]
 async fn cost_refused_or_unavailable_is_hidden_never_zero() {
-    assert_eq!(crate::state_extra::cost_summary(&FakeGateway::new(Fixture::Populated)).await,Some(123_000));
+    assert_eq!(crate::state_extra::cost_summary(&FakeGateway::new(Fixture::Populated)).await,(Some(123_000), false));
     for fixture in [Fixture::Refused,Fixture::Unavailable,Fixture::Empty] {
-        assert_eq!(crate::state_extra::cost_summary(&FakeGateway::new(fixture)).await,None);
+        assert_eq!(crate::state_extra::cost_summary(&FakeGateway::new(fixture)).await,(None, false));
     }
     for malformed in [json!({}),json!({"available":true}),json!({"available":true,"total_cost_millicents":-1}),json!({"available":false,"total_cost_millicents":0})] {
         assert_eq!(crate::state::cost_amount(&malformed),None);

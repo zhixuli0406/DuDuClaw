@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 pub enum Route {
     Direct,
     Tmux,
+    Direct777,
+    Tmux777,
     Skip,
 }
 pub struct Notifications {
@@ -11,6 +13,7 @@ pub struct Notifications {
     route: Route,
     focused: bool,
     previous: usize,
+    connection_error: bool,
     last: Option<Instant>,
 }
 impl Notifications {
@@ -21,6 +24,7 @@ impl Notifications {
             route,
             focused: false,
             previous: 0,
+            connection_error: false,
             last: None,
         }
     }
@@ -31,9 +35,18 @@ impl Notifications {
         let count = count?;
         let rises = count > self.previous;
         self.previous = count;
+        if !rises { return None; }
+        self.emit(&crate::strings::notification(count), now)
+    }
+    pub fn connection_error(&mut self, failed: bool, now: Instant) -> Option<String> {
+        let rises = failed && !self.connection_error;
+        self.connection_error = failed;
+        if !rises { return None; }
+        self.emit(crate::strings::NOTIFY_CONNECTION_ERROR, now)
+    }
+    fn emit(&mut self, fixed: &str, now: Instant) -> Option<String> {
         if !self.enabled
             || self.focused
-            || !rises
             || self.route == Route::Skip
             || self
                 .last
@@ -42,17 +55,21 @@ impl Notifications {
             return None;
         }
         self.last = Some(now);
-        let osc = format!("\x1b]9;{}\x07", crate::strings::notification(count));
+        let osc = if matches!(self.route, Route::Direct777 | Route::Tmux777) {
+            format!("\x1b]777;notify;DuDuClaw;{fixed}\x07")
+        } else { format!("\x1b]9;{fixed}\x07") };
         Some(match self.route {
-            Route::Direct => osc,
-            Route::Tmux => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
+            Route::Direct | Route::Direct777 => osc,
+            Route::Tmux | Route::Tmux777 => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
             Route::Skip => unreachable!(),
         })
     }
 }
 pub async fn route() -> Route {
+    let osc777 = std::env::var_os("VTE_VERSION").is_some()
+        || matches!(std::env::var("TERM").as_deref(), Ok("rxvt-unicode" | "rxvt-unicode-256color"));
     if std::env::var_os("TMUX").is_none() {
-        return Route::Direct;
+        return if osc777 { Route::Direct777 } else { Route::Direct };
     }
     let result = tokio::time::timeout(
         Duration::from_millis(500),
@@ -67,7 +84,7 @@ pub async fn route() -> Route {
             if output.status.success()
                 && matches!(output.stdout.as_slice(), b"on\n" | b"all\n") =>
         {
-            Route::Tmux
+            if osc777 { Route::Tmux777 } else { Route::Tmux }
         }
         _ => Route::Skip,
     }
@@ -109,5 +126,32 @@ mod tests {
                     .is_none()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+    #[test]
+    fn osc777_and_connection_errors_share_fixed_text_focus_and_rate_limit() {
+        let now = Instant::now();
+        for route in [Route::Direct777, Route::Tmux777] {
+            let mut n = Notifications::new(true, route);
+            let sequence = n.connection_error(true, now).unwrap();
+            assert!(sequence.contains("]777;notify;DuDuClaw;DuDuClaw：連線中斷，請檢查控制室"));
+            assert!(!sequence.contains("private"));
+            assert!(n.update(Some(1), now).is_none());
+            assert!(n.connection_error(true, now + Duration::from_secs(61)).is_none());
+            n.connection_error(false, now + Duration::from_secs(61));
+            n.focus(true);
+            assert!(n.connection_error(true, now + Duration::from_secs(61)).is_none());
+            n.focus(false);
+            let hostile = serde_json::json!({"name":"private\u{1b}]52;c;bad\u{7}","error":"private password"});
+            let rows = [hostile.clone(), hostile];
+            let sequence = n.update(Some(rows.len()), now + Duration::from_secs(62)).unwrap();
+            assert!(sequence.contains("DuDuClaw：2 項需要你處理"));
+            assert!(!sequence.contains("private") && !sequence.contains("]52"));
+        }
+        assert!(Notifications::new(false, Route::Direct777).connection_error(true, now).is_none());
     }
 }

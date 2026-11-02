@@ -16,7 +16,19 @@ const BUDGET: Duration = Duration::from_secs(15);
 pub struct WatchOptions {
     pub client: Client,
     pub agent: String,
+    pub run: Option<String>,
     pub content: bool,
+}
+impl WatchOptions {
+    fn target(&self) -> Value {
+        match &self.run { Some(id) => json!({"run_id":id}), None => json!({"agent_id":self.agent}) }
+    }
+    fn matches(&self, payload: &Value) -> bool {
+        watch_matches(self.run.as_deref(), &self.agent, payload)
+    }
+}
+fn watch_matches(run: Option<&str>, agent: &str, payload: &Value) -> bool {
+    match run { Some(id) => payload["run_id"].as_str() == Some(id), None => payload["agent_id"].as_str() == Some(agent) }
 }
 #[derive(Default)]
 struct Tail {
@@ -44,14 +56,17 @@ impl Tail {
         true
     }
     async fn poll<W: Write>(&mut self, options: &WatchOptions, output: &mut W) -> Result<()> {
-        let value = options
+        let direct = if let Some(id) = &options.run {
+            Some(options.client.call("runs.get", json!({"run_id":id}), BUDGET).await?)
+        } else { None };
+        let value = if let Some(detail) = &direct { json!({"runs":[detail["run"].clone()]}) } else { options
             .client
             .call(
                 "runs.list",
                 json!({"agent_id":options.agent,"limit":4}),
                 BUDGET,
             )
-            .await?;
+            .await? };
         let runs = value
             .get("runs")
             .and_then(Value::as_array)
@@ -61,11 +76,14 @@ impl Tail {
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or(Error::Protocol)?;
-            let detail = options
+            let detail = if let Some(detail) = &direct { detail.clone() } else { options
                 .client
                 .call("runs.get", json!({"run_id":id}), BUDGET)
-                .await?;
-            if !crate::blocks::run_matches(run, &detail, &options.agent, id) {
+                .await? };
+            let matches = if let Some(wanted) = &options.run {
+                id == wanted && detail["run"]["id"].as_str() == Some(wanted.as_str())
+            } else { crate::blocks::run_matches(run, &detail, &options.agent, id) };
+            if !matches {
                 write_line(output, strings::WATCH_RUN_MISMATCH)?;
                 continue;
             }
@@ -169,7 +187,7 @@ async fn watch_loop<W: Write>(options: &WatchOptions, output: &mut W) -> Result<
                 if generation != Some(info.generation) {
                     let subscription = options
                         .client
-                        .call_detailed("runs.subscribe", json!({"agent_id":options.agent}), BUDGET)
+                        .call_detailed("runs.subscribe", options.target(), BUDGET)
                         .await;
                     match subscription {
                         Err(Error::Disconnected | Error::Timeout) => {
@@ -212,7 +230,7 @@ async fn watch_loop<W: Write>(options: &WatchOptions, output: &mut W) -> Result<
             }
             event = events.recv() => match event {
                 Ok(event) if event.name == "run.step" && subscribed => {
-                    if event.payload.get("agent_id").and_then(Value::as_str) == Some(options.agent.as_str()) {
+                    if options.matches(&event.payload) {
                         write_line(output, &format_subscription(&event.name, &event.payload, options.content))?;
                     }
                 }
@@ -286,4 +304,16 @@ mod tests {
         assert!(!crate::blocks::run_matches(&row, &json!({"run":{"id":"r1","agent_id":"other"}}), "adu", "r1"));
         assert!(crate::blocks::run_matches(&row, &json!({"run":{"id":"r1","agent_id":"adu"}}), "adu", "r1"));
     }
+    #[test]
+    fn explicit_run_subscription_ignores_other_runs_and_sanitizes_output() {
+        let matching = json!({"run_id":"r1","agent_id":"adu","kind":"text","preview":"hostile\u{1b}]52;c;bad\u{7}"});
+        assert!(watch_matches(Some("r1"), "", &matching));
+        assert!(!watch_matches(Some("r2"), "adu", &matching));
+        assert!(!watch_matches(Some("r1"), "", &json!({"agent_id":"adu"})));
+        assert!(watch_matches(None, "adu", &matching));
+        let mut bytes = Vec::new();
+        write_line(&mut bytes, &format_subscription("run.step", &matching, true)).unwrap();
+        assert!(!String::from_utf8(bytes).unwrap().chars().any(crate::sanitize::forbidden));
+    }
+
 }

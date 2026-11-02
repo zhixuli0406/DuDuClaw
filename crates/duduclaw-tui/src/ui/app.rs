@@ -136,6 +136,15 @@ impl Selection {
     }
 }
 #[derive(Default, Clone)]
+pub struct ChatView {
+    pub state: crate::chat::ChatState,
+    pub input: String,
+    pub agent: Option<String>,
+    pub scroll: usize,
+    pub answered: Option<String>,
+    cache: super::chat_render::TranscriptCache,
+}
+#[derive(Default, Clone)]
 pub struct App {
     pub pty_focus: bool,
     pub(super) pty_confirm: Option<KeyEvent>,
@@ -180,6 +189,50 @@ pub enum Action {
     Control(crate::controls::Control),
 }
 impl App {
+    pub(super) fn mouse(&mut self, event: crossterm::event::MouseEvent, settings: &crate::settings::Settings) {
+        if !self.pty_focus || !crate::pty::SUPPORTED { return; }
+        let pane = &self.blocks.panes[self.blocks.focused];
+        let area = pane.pty_area;
+        if !area.contains(ratatui::layout::Position::new(event.column, event.row)) { return; }
+        let Some(pty) = &pane.pty else { return; };
+        let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
+        if pty.screen().scrollback() != 0 || !pty.screen().mouse_supported { return; }
+        let row = event.row - area.y;
+        let mut host_col = 0;
+        let mut child_col = None;
+        for col in 0..pty.screen().size().1 {
+            let Some(cell) = pty.screen().cell(row, col) else { break; };
+            if cell.is_wide_continuation() { continue; }
+            let safe = TerminalText::new(cell.contents().to_owned()).plain().replace('\n', "");
+            let width = super::text::columns(if safe.is_empty() { " " } else { &safe }, settings.ambiguous_width) as u16;
+            if event.column - area.x >= host_col && event.column - area.x < host_col + width { child_col = Some(col + 1); break; }
+            host_col += width;
+        }
+        if let Some(col) = child_col {
+            let bytes = crate::pty::mouse_bytes(event, col, row + 1, pty.screen().mouse_mode, pty.screen().mouse_encoding);
+            pty.send(bytes);
+        }
+    }
+    pub(super) fn chat_view(&self) -> ChatView {
+        ChatView { state: self.chat.clone(), input: self.input.clone(), agent: self.input_agent.clone(), scroll: self.chat_scroll, answered: self.answered_downstream.clone(), cache: self.chat_cache.clone() }
+    }
+    pub(super) fn set_chat_view(&mut self, view: ChatView) {
+        self.chat = view.state; self.input = view.input; self.input_agent = view.agent;
+        self.chat_scroll = view.scroll; self.answered_downstream = view.answered;
+        self.chat_cache = view.cache;
+    }
+    pub(super) fn sync_chats(&mut self, rooms: &crate::chat::ChatRooms) {
+        for (i, pane) in self.blocks.panes.iter_mut().enumerate() {
+            if pane.kind != crate::blocks::Block::Chat { continue; }
+            let state = rooms.rooms.get(&pane.id).cloned().unwrap_or_else(|| {
+                let mut state = pane.chat_view.state.clone();
+                state.connected = rooms.connected; state.stale = !rooms.connected; state
+            });
+            pane.chat_view.state = state.clone();
+            if i == self.blocks.focused { self.chat = state; }
+        }
+    }
+
     pub(super) fn downstream_reference(&self, now: std::time::Instant) -> Option<&str> {
         self.chat.downstream_reference(now)
             .filter(|reference| self.answered_downstream.as_deref() != Some(*reference))
@@ -246,6 +299,26 @@ impl App {
         self.key_at(key, model, std::time::Instant::now(), crate::snooze::epoch_now())
     }
     pub fn key_at(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant, epoch: i64) -> Action {
+        // Text and PTY keys cannot switch panes; avoid copying scrollback per character.
+        if (self.focus == crate::chat::Focus::Input || self.pty_focus) && self.palette.is_none() && self.pty_confirm.is_none() {
+            return self.key_at_inner(key, model, now, epoch);
+        }
+        let id = self.blocks.panes[self.blocks.focused].id.clone();
+        let previous = self.chat_view();
+        let action = self.key_at_inner(key, model, now, epoch);
+        if self.blocks.panes[self.blocks.focused].id != id {
+            let connected = previous.state.connected;
+            if let Some(pane) = self.blocks.panes.iter_mut().find(|p| p.id == id) { pane.chat_view = previous; }
+            let mut view = self.blocks.panes[self.blocks.focused].chat_view.clone();
+            if view.agent.is_none() { view.agent = self.blocks.panes[self.blocks.focused].agent.clone(); }
+            view.state.connected = connected;
+            view.state.stale = !connected;
+            if key.code == KeyCode::Char('/') && self.focus == crate::chat::Focus::Input && view.input.is_empty() { view.input.push('/'); }
+            self.set_chat_view(view);
+        }
+        action
+    }
+    fn key_at_inner(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant, epoch: i64) -> Action {
         if self.pty_focus {
             if crate::pty::escape(key) {
                 if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty {
@@ -327,6 +400,7 @@ impl App {
             };
         }
         if self.focus == crate::chat::Focus::Input {
+            if self.blocks.active != crate::blocks::Block::Chat { self.focus = crate::chat::Focus::List; return Action::None; }
             if key.kind == KeyEventKind::Release { return Action::None; }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { return Action::Quit; }
             if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) { return Action::None; }
@@ -405,10 +479,11 @@ impl App {
             KeyCode::Char('i' | '/') if !self.help => {
                 self.focus = crate::chat::Focus::Input;
                 self.blocks.chat();
-                self.input_agent = match &self.selected {
-                    Some(Selection::Employee(id)) => Some(id.clone()),
-                    _ => None,
-                };
+                if self.blocks.active != crate::blocks::Block::Chat { self.focus = crate::chat::Focus::List; return Action::None; }
+                if self.input_agent.is_none() { self.input_agent = self.block_agent(model); }
+                if self.blocks.panes[self.blocks.focused].agent.is_none() {
+                    self.blocks.panes[self.blocks.focused].agent = self.block_agent(model);
+                }
                 if key.code == KeyCode::Char('/') && self.input.is_empty() { self.input.push('/'); }
             }
             KeyCode::Char(c @ '1'..='4') if !self.help => self.blocks.select((c as u8 - b'1') as usize),
@@ -505,7 +580,7 @@ impl App {
         if let Some(palette) = &mut self.palette { palette.paste(text); return; }
         if let Some(card) = &mut self.control_card { card.paste(text); return; }
         if let Some(card) = &mut self.card { card.paste(text); return; }
-        if self.focus != crate::chat::Focus::Input || self.card.is_some() { return; }
+        if self.focus != crate::chat::Focus::Input || self.blocks.active != crate::blocks::Block::Chat || self.card.is_some() { return; }
         let remaining = crate::chat::MAX_INPUT_CHARS.saturating_sub(self.input.chars().count());
         self.input.extend(text.chars().filter(|c| !crate::sanitize::forbidden(*c))
             .map(|c| if c == '\n' { ' ' } else { c }).take(remaining));

@@ -95,3 +95,36 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
         text.into_bytes()
     }
 }
+
+/// Encode only host mouse input for the child. Coordinates are one-based VT cells.
+pub fn mouse_bytes(event: crossterm::event::MouseEvent, x: u16, y: u16,
+    mode: vt100::MouseProtocolMode, encoding: vt100::MouseProtocolEncoding) -> Vec<u8> {
+    use crossterm::event::{MouseButton as B, MouseEventKind as K};
+    use vt100::{MouseProtocolMode as Mode, MouseProtocolEncoding as Encoding};
+    if mode == Mode::None || x == 0 || y == 0 { return vec![]; }
+    let button = |b| match b { B::Left => 0u16, B::Middle => 1, B::Right => 2 };
+    let release = matches!(event.kind, K::Up(_));
+    let mut code = match event.kind {
+        K::Down(b) => button(b),
+        K::Up(b) if mode != Mode::Press => if encoding == Encoding::Sgr { button(b) } else { 3 },
+        K::Drag(b) if matches!(mode, Mode::ButtonMotion | Mode::AnyMotion) => 32 + button(b),
+        K::Moved if mode == Mode::AnyMotion => 35,
+        K::ScrollUp => 64, K::ScrollDown => 65, K::ScrollLeft => 66, K::ScrollRight => 67,
+        _ => return vec![],
+    };
+    if mode != Mode::Press {
+        if event.modifiers.contains(M::SHIFT) { code += 4; }
+        if event.modifiers.contains(M::ALT) { code += 8; }
+        if event.modifiers.contains(M::CONTROL) { code += 16; }
+    }
+    match encoding {
+        Encoding::Sgr => format!("\x1b[<{code};{x};{y}{}", if release { 'm' } else { 'M' }).into_bytes(),
+        Encoding::Default if x <= 223 && y <= 223 => vec![27, b'[', b'M', (code + 32) as u8, (x + 32) as u8, (y + 32) as u8],
+        Encoding::Utf8 if x <= 2015 && y <= 2015 => {
+            let mut out = String::from("\x1b[M");
+            for n in [code + 32, x + 32, y + 32] { out.push(char::from_u32(u32::from(n)).unwrap()); }
+            out.into_bytes()
+        }
+        _ => vec![],
+    }
+}

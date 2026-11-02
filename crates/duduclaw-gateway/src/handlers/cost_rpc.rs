@@ -33,11 +33,19 @@ impl MethodHandler {
     /// derived 200K price-cliff status block. `hours` defaults to 24.
     pub(crate) async fn handle_cost_summary(&self, params: Value) -> WsFrame {
         let hours = params.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
+        let since = match cost_since(&params, chrono::Utc::now()) {
+            Ok(since) => since,
+            Err(message) => return WsFrame::error_response("", message),
+        };
         let Some(tel) = self.cost_telemetry() else {
             return WsFrame::ok_response("", json!({ "available": false }));
         };
 
-        let summary = match tel.summary_global(hours).await {
+        let result = match since {
+            Some(since) => tel.summary_global_since(since).await,
+            None => tel.summary_global(hours).await,
+        };
+        let summary = match result {
             Ok(s) => s,
             Err(e) => return WsFrame::error_response("", &format!("Cost summary failed: {e}")),
         };
@@ -70,6 +78,7 @@ impl MethodHandler {
             json!({
                 "available": true,
                 "period": summary.period,
+                "since": since.map(|value| value.to_rfc3339()),
                 "total_requests": summary.total_requests,
                 "total_input_tokens": summary.total_input_tokens,
                 "total_cache_read_tokens": summary.total_cache_read_tokens,
@@ -240,5 +249,29 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &format!("Cost recent failed: {e}")),
         }
+    }
+}
+
+/// A supplied boundary takes precedence over hours and must fit retained data.
+fn cost_since(params: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<Option<chrono::DateTime<chrono::Utc>>, &'static str> {
+    let Some(value) = params.get("since") else { return Ok(None); };
+    let text = value.as_str().filter(|s| s.len() <= 64).ok_or("since must be RFC3339")?;
+    let since = chrono::DateTime::parse_from_rfc3339(text).map_err(|_| "since must be RFC3339")?.with_timezone(&chrono::Utc);
+    let days = crate::cost_telemetry::RETENTION_DAYS.min(31) as i64;
+    if since > now || since < now - chrono::Duration::days(days) { return Err("since is outside telemetry retention"); }
+    Ok(Some(since))
+}
+#[cfg(test)]
+mod cost_since_tests {
+    use super::*;
+    #[test]
+    fn cost_since_validates_type_format_future_and_retention() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for bad in [json!(null), json!(12), json!("bad"), json!("2026-11-03T00:00:00Z"), json!("2026-10-01T00:00:00Z")] {
+            assert!(cost_since(&json!({"since":bad}), now).is_err());
+        }
+        assert_eq!(cost_since(&json!({}), now), Ok(None));
+        let since = cost_since(&json!({"since":"2026-11-02T00:00:00+08:00"}), now).unwrap().unwrap();
+        assert_eq!(since.to_rfc3339(), "2026-11-01T16:00:00+00:00");
     }
 }

@@ -2,6 +2,8 @@
 #[cfg(test)]
 mod tests;
 mod transport;
+mod rooms;
+pub use rooms::ChatRooms;
 use crate::{sanitize::TerminalText, strings};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -142,7 +144,7 @@ impl Default for ChatState {
         }
     }
 }
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     format!("tui-{:016x}", rand::random::<u64>())
 }
 impl ChatState {
@@ -289,9 +291,7 @@ impl ChatState {
             return;
         }
 
-        if frame.msg_id.as_ref().is_some_and(|s| !s.is_empty()) {
-            self.cancel_supported = true;
-        }
+
         if frame.conv.as_ref().is_some_and(|c| c != &self.conv) {
             return;
         }
@@ -302,6 +302,8 @@ impl ChatState {
         {
             return;
         }
+        if frame.session_id.as_ref().is_some_and(|id| self.session_id.as_ref().is_some_and(|known| known != id)) { return; }
+        if frame.msg_id.as_ref().is_some_and(|s| !s.is_empty()) { self.cancel_supported = true; }
         if frame.kind == "session_info" {
             if !frame.refresh {
                 if !self.connected {

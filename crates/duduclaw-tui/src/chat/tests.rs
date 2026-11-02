@@ -275,3 +275,36 @@ fn stale_downstream_busy_preserves_running_turn_and_status() {
         assert_eq!(s.lines.len(), line_count);
     }
 }
+
+#[test]
+fn rooms_route_interleaved_frames_and_reject_unknown_or_conflicting_identity() {
+    let mut rooms = ChatRooms::default();
+    rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
+    let a = rooms.room("pane-a").unwrap().prepare(submission("one", Some("adu")).unwrap()).unwrap();
+    let b = rooms.room("pane-b").unwrap().prepare(submission("two", Some("worker")).unwrap()).unwrap();
+    for value in [
+        json!({"type":"progress","conv":a.conv,"msg_id":a.msg_id,"content":"A working"}),
+        json!({"type":"progress","conv":b.conv,"msg_id":b.msg_id,"content":"B working"}),
+        json!({"type":"assistant_done","conv":"unknown","content":"foreign"}),
+        json!({"type":"assistant_done","conv":a.conv,"msg_id":b.msg_id,"content":"conflict"}),
+        json!({"type":"assistant_done","session_id":"unknown","conv":a.conv,"content":"foreign session"}),
+        json!({"type":"assistant_done","content":"uncorrelated"}),
+    ] { rooms.apply(frame(value)); }
+    assert!(rooms.rooms["pane-a"].status.is("A working"));
+    assert!(rooms.rooms["pane-b"].status.is("B working"));
+    let cancel = rooms.rooms["pane-a"].cancel_frame().unwrap();
+    assert_eq!(cancel["msg_id"], a.msg_id);
+    rooms.apply(frame(json!({"type":"error","code":"cancelled","conv":a.conv,"msg_id":a.msg_id,
+        "downstream_running":2,"downstream_ref":"opaque-a"})));
+    assert!(!rooms.rooms["pane-a"].running);
+    assert!(rooms.rooms["pane-b"].running);
+    assert!(rooms.rooms["pane-a"].downstream_prompt(Instant::now()).is_some());
+    assert!(rooms.rooms["pane-b"].downstream_prompt(Instant::now()).is_none());
+    rooms.apply(frame(json!({"type":"error","code":"turn_limit","conv":b.conv,"msg_id":b.msg_id})));
+    assert!(rooms.rooms["pane-b"].status.is(strings::CHAT_TURN_LIMIT));
+    for id in ["pane-c", "pane-d"] { assert!(rooms.room(id).is_some()); }
+    assert!(rooms.room("pane-e").is_none());
+    rooms.retain(&["pane-b".into()]);
+    rooms.apply(frame(json!({"type":"assistant_done","conv":a.conv,"msg_id":a.msg_id,"content":"closed"})));
+    assert_eq!(rooms.rooms.len(), 1);
+}
