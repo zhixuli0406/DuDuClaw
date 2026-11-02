@@ -45,7 +45,7 @@ info:
     task.created, task.updated, task.needs_human, goal.round_started,
     goal.round_finished, goal.done, goal.failed, approval.created,
     approval.decided, approval.expired, budget.breaker_open, autopilot.breaker_open.
-    Agent events require employee access, task/goal events require task audience,
+    Agent events require employee access; task/goal events require task audience,
     approval events require Manager plus the per-kind card audience
     (knowledge_add_source: Admin or a collection editor/owner; operator-CLI,
     workflow activation, agent file, support pilot and board kinds: Admin;
@@ -54,8 +54,10 @@ info:
     an explicitly subscribed connection queue and the runs.get content gates.
     Payloads are identifiers, enums and compact labels, not prompts/tool arguments.
     agent.turn_started/finished payloads contain agent_id, source and runtime,
-    plus task_id when known. Task-scoped turn events also require task audience
-    and task-owner access; otherwise the whole event is withheld. They do not
+    plus task_id when known. Employee access determines whether these turn
+    events are delivered; task audience and task-owner access determine only
+    whether task_id is retained. Receiving the event does not imply task
+    visibility. They do not
     include session_id or a generated run_id. The Drop emitter cannot determine
     success/failure/cancellation, so finished status is omitted. source is one of channel, goal, cron,
     heartbeat, responsibility, assign or autopilot.

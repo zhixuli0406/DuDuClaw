@@ -104,6 +104,20 @@ async fn tools_catalog_lists_search_query() {
     );
 }
 
+#[tokio::test]
+async fn tools_catalog_lists_autopilot_read_methods() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let frame = handler.handle_tools_catalog(json!({}));
+    assert!(frame_ok(&frame), "{frame:?}");
+    let data = frame_data(&frame);
+    let tools = data["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for name in ["autopilot.list", "autopilot.breakers"] {
+        assert!(names.contains(&name), "{name} must be listed in tools.catalog: {names:?}");
+    }
+}
+
 // ── #3: mail.decide's optional `note` reaches the ledger ───────────
 async fn drafted_mail(home: &std::path::Path) -> (crate::approval::ApprovalBroker, String) {
     let broker = crate::approval::ApprovalBroker::open(home).unwrap();
