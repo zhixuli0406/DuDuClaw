@@ -805,13 +805,17 @@ fn m3_help_only_covers_focused_block_and_keeps_chat() {
     app.blocks.add(Split::Vertical);
     app.blocks.add(Split::Horizontal); app.blocks.open(Block::Chat, None);
     app.chat.append(strings::CHAT_ASSISTANT, "chat-kept-visible");
-    app.blocks.select(0); app.help = true;
+    // Use the operator path so the departing chat is saved into its pane.
+    app.key(ordinary_key('1'), &model); app.help = true;
     let output = screen(&model, &app, &Settings::default(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
     assert!(output.contains("chat-kept-visible"));
     assert!(output.contains("目前身分沒有此決策權限"));
     insta::assert_snapshot!("m3_help_focused_only", output);
-    app.blocks.select(2);
+    app.key(ordinary_key('?'), &model);
+    app.key(ordinary_key('3'), &model);
+    assert_eq!(app.blocks.focused, 2);
+    app.key(ordinary_key('?'), &model);
     let output = screen(&model, &app, &Settings::default(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
     assert!(!output.contains("chat-kept-visible"));
@@ -1471,26 +1475,49 @@ fn concurrent_chat_real_keys_keep_drafts_scrollback_cancel_and_prompt_in_own_pan
 }
 
 #[test]
-fn navigation_hints_never_interrupt_input_cards_or_open_unknown_targets() {
+fn navigation_hints_are_passive_and_only_accept_known_inbox_paths() {
     let model = populated();
     let mut app = App::default();
     let original = Some(Selection::Employee("adu".into()));
     app.selected = original.clone();
-    for path in ["//evil", "/inbox?item=unknown", "/inbox?item=a1&execute=yes", "/inbox?item=a1\u{1b}]52;bad", "/agents/adu/../worker", "/inbox?item=%61%31"] {
+    for path in ["//evil", "/inbox?item=unknown", "/inbox?item=a1&execute=yes", "/inbox?item=a1\u{1b}]52;bad", "/agents/adu/../worker", "/agents/worker", "/agents/adu", "/inbox?item=%61%31"] {
         app.navigate_hint(&json!({"path":path}), &model);
         assert_eq!(app.selected, original);
+        assert!(app.notice.is_none());
     }
     app.focus = crate::chat::Focus::Input;
     app.input = "draft".into();
     app.navigate_hint(&json!({"path":"/inbox?item=a1"}), &model);
     assert_eq!(app.selected, original); assert_eq!(app.input, "draft");
+    assert!(app.notice.is_none());
     app.focus = crate::chat::Focus::List;
+    app.detail_scroll = 7;
     app.navigate_hint(&json!({"path":"/inbox?item=a1", "command":"approve", "focus":true}), &model);
-    assert_eq!(app.selected, Some(Selection::Inbox("approval:a1".into())));
+    assert_eq!(app.selected, original);
+    assert_eq!(app.notice.as_deref(), Some(strings::NAVIGATE_INBOX_HINT));
+    assert_eq!(app.detail_scroll, 7);
+    assert_eq!(app.focus, crate::chat::Focus::List);
     assert!(app.card.is_none());
-    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &model);
-    app.navigate_hint(&json!({"path":"/agents/worker"}), &model);
-    assert_eq!(app.selected, Some(Selection::Inbox("approval:a1".into())));
+}
+
+#[test]
+fn queued_navigation_cannot_retarget_pause_or_resume() {
+    let mut model = autonomy_model(json!({"global":null,"agents":{},"state_error":null}));
+    model.employees.items.push(employee("worker", "Worker", "active"));
+    model.goal_operators.insert("worker".into());
+    model.inbox = populated().inbox;
+    for path in ["/agents/worker", "/inbox?item=a1", "/inbox?item=approval:a1"] {
+        for (key, resume) in [('p', false), ('u', true)] {
+            let mut app = App::default();
+            app.selected = Some(Selection::Employee("adu".into()));
+            // The event queue is drained immediately before the queued key.
+            app.navigate_hint(&json!({"path":path,"agent_id":"worker","focus":true}), &model);
+            app.refresh(&model);
+            assert_eq!(app.key(ordinary_key(key), &model), Action::Control(
+                crate::controls::Control::Autonomy { agent: Some("adu".into()), resume }
+            ));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1519,18 +1546,22 @@ fn pty_mouse_uses_focused_viewport_and_never_focuses_another_pane() {
     app.mouse(MouseEvent { row: 14, ..click }, &Settings::default());
     assert!(captured.lock().unwrap().is_empty());
     app.mouse(click, &Settings::default());
+    for column in [40, 41, 42] {
+        app.mouse(MouseEvent { column, row: 10, ..click }, &Settings::default());
+    }
+    let expected = b"\x1b[<0;3;2M\x1b[<0;1;1M\x1b[<0;2;1M\x1b[<0;3;1M";
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while captured.lock().unwrap().is_empty() {
+    while captured.lock().unwrap().len() < expected.len() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert_eq!(*captured.lock().unwrap(), b"\x1b[<0;3;2M");
+    assert_eq!(*captured.lock().unwrap(), expected);
     assert_eq!(app.blocks.focused, 0);
     app.pty_focus = false;
     app.blocks.add(crate::blocks::Split::Vertical);
     app.mouse(click, &Settings::default());
     assert_eq!(app.blocks.focused, 1);
-    assert_eq!(*captured.lock().unwrap(), b"\x1b[<0;3;2M");
+    assert_eq!(*captured.lock().unwrap(), expected);
 }
 
 #[test]
@@ -1544,4 +1575,31 @@ fn input_focus_cannot_send_or_paste_into_a_non_chat_pane() {
     app.input = "stale draft".into();
     assert_eq!(app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &empty()), Action::None);
     assert_eq!(app.focus, crate::chat::Focus::List);
+}
+
+#[test]
+fn downstream_prompt_keeps_answer_keys_and_count_in_narrow_chat() {
+    for width in [18, 24, 32, 48] {
+        let mut app = downstream_app(std::time::Instant::now());
+        let backend = ratatui::backend::TestBackend::new(width, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            super::chat_render::draw(frame, frame.area(), &mut app, &Settings::default(), strings::CHAT_ASSISTANT);
+        }).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for row in 0..12 {
+            let mut column = 0;
+            while column < width {
+                let cell = &buffer[(column, row)];
+                output.push_str(cell.symbol());
+                column += cell.cell_width().max(1);
+            }
+            output.push('\n');
+        }
+        assert!(output.contains("y 停止"), "{width}: {output}");
+        assert!(output.contains("n 繼續"), "{width}: {output}");
+        assert!(output.contains('2'), "{width}: {output}");
+        assert!(!output.contains("opaque-never-render"));
+    }
 }

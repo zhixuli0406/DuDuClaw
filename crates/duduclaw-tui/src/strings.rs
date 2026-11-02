@@ -166,12 +166,17 @@ pub const CMD_DOWNSTREAM_DISMISS: &str = "讓下游工作跑完";
 pub fn downstream_prompt(count: u64) -> String {
     format!("還有 {count} 位員工的工作還在跑，要一起停嗎？ y 停止／n 讓它們跑完")
 }
+pub fn downstream_prompt_compact(count: u64) -> String {
+    format!("y 停止／n 繼續：{count} 位員工在跑")
+}
 pub fn downstream_stopped(stopped: u64, still_stopping: u64) -> String {
     let mut text = format!("已停止 {stopped} 項");
     if still_stopping > 0 { text.push_str(&format!("，{still_stopping} 項還在收尾")); }
     text
 }
 pub const CHAT_INTERRUPTED: &str = "連線中斷，回覆結果未確認；不會自動重送訊息";
+pub const NAVIGATE_INBOX_HINT: &str = "收件匣有待處理項目，請選取查看";
+pub const WATCH_AGENT_POLLING: &str = "輪詢模式：每五秒更新員工執行紀錄";
 pub const WATCH_POLLING: &str = "輪詢模式：閘道未提供即時訂閱，每五秒更新";
 pub const WATCH_SUBSCRIBED: &str = "已訂閱員工執行事件";
 pub const WATCH_GAP: &str = "事件可能遺失，正在重新取得執行紀錄";

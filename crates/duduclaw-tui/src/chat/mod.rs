@@ -238,6 +238,10 @@ impl ChatState {
         self.downstream_reference(now)?;
         self.downstream.as_ref().map(|offer| TerminalText::new(strings::downstream_prompt(offer.count)))
     }
+    pub(crate) fn downstream_prompt_compact(&self, now: Instant) -> Option<TerminalText> {
+        self.downstream_reference(now)?;
+        self.downstream.as_ref().map(|offer| TerminalText::new(strings::downstream_prompt_compact(offer.count)))
+    }
     pub(crate) fn dismiss_downstream(&mut self, reference: &str) {
         if self.downstream.as_ref().is_some_and(|offer| offer.reference == reference) {
             self.downstream = None;
@@ -322,7 +326,12 @@ impl ChatState {
         if !self.running {
             return;
         }
-        if let Some(sid) = frame.session_id {
+        // Admission failure does not prove a resumable session was created.
+        // Preserve an existing session, but do not turn a rejected first send
+        // into a resume request for a session that does not exist yet.
+        let admission_error = frame.kind == "error"
+            && matches!(frame.code.as_deref(), Some("turn_limit" | "duplicate_message"));
+        if !admission_error && let Some(sid) = frame.session_id {
             self.session_id = Some(sid);
         }
         match frame.kind.as_str() {

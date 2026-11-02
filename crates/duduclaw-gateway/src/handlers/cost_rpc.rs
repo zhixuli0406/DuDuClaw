@@ -53,25 +53,10 @@ impl MethodHandler {
         // Price-cliff status: reuse `near_price_cliff_for` (registry-derived
         // per-model threshold, 180K fallback) over recent per-request records —
         // no new pricing math. This is a status signal, not the aggregate cost.
-        let mut requests_near_cliff = 0u64;
-        let mut max_input_tokens = 0u64;
-        if let Ok(records) = tel.recent_records(500).await {
-            for r in &records {
-                let usage = crate::cost_telemetry::TokenUsage {
-                    input_tokens: r.input_tokens,
-                    cache_read_tokens: r.cache_read_tokens,
-                    cache_creation_tokens: r.cache_creation_tokens,
-                    output_tokens: r.output_tokens,
-                };
-                let total_in = usage.total_input();
-                if total_in > max_input_tokens {
-                    max_input_tokens = total_in;
-                }
-                if crate::cost_telemetry::near_price_cliff_for(&r.model, &usage) {
-                    requests_near_cliff += 1;
-                }
-            }
-        }
+        let (requests_near_cliff, max_input_tokens) = match tel.recent_records(500).await {
+            Ok(records) => price_cliff_status(&records, since),
+            Err(_) => (0, 0),
+        };
 
         WsFrame::ok_response(
             "",
@@ -252,6 +237,33 @@ impl MethodHandler {
     }
 }
 
+fn price_cliff_status(
+    records: &[crate::cost_telemetry::CostRecord],
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> (u64, u64) {
+    let mut requests_near_cliff = 0;
+    let mut max_input_tokens = 0;
+    for record in records {
+        if let Some(since) = since {
+            // Compare instants in UTC, including the boundary itself. Malformed
+            // timestamps cannot establish membership in the requested window.
+            let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(&record.created_at) else { continue; };
+            if created_at.with_timezone(&chrono::Utc) < since { continue; }
+        }
+        let usage = crate::cost_telemetry::TokenUsage {
+            input_tokens: record.input_tokens,
+            cache_read_tokens: record.cache_read_tokens,
+            cache_creation_tokens: record.cache_creation_tokens,
+            output_tokens: record.output_tokens,
+        };
+        max_input_tokens = max_input_tokens.max(usage.total_input());
+        if crate::cost_telemetry::near_price_cliff_for(&record.model, &usage) {
+            requests_near_cliff += 1;
+        }
+    }
+    (requests_near_cliff, max_input_tokens)
+}
+
 /// A supplied boundary takes precedence over hours and must fit retained data.
 fn cost_since(params: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<Option<chrono::DateTime<chrono::Utc>>, &'static str> {
     let Some(value) = params.get("since") else { return Ok(None); };
@@ -273,5 +285,27 @@ mod cost_since_tests {
         assert_eq!(cost_since(&json!({}), now), Ok(None));
         let since = cost_since(&json!({"since":"2026-11-02T00:00:00+08:00"}), now).unwrap().unwrap();
         assert_eq!(since.to_rfc3339(), "2026-11-01T16:00:00+00:00");
+    }
+    #[test]
+    fn price_cliff_uses_the_same_inclusive_utc_since_boundary() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let since = cost_since(&json!({"since":"2026-11-02T00:00:00+08:00"}), now).unwrap();
+        let record = |created_at: &str, input_tokens| crate::cost_telemetry::CostRecord {
+            agent_id: "adu".into(), request_type: "chat".into(), model: "unknown-model".into(),
+            input_tokens, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0,
+            cache_efficiency: 0.0, cost_millicents: 0, cache_hit_rate: 0.0,
+            cache_savings_millicents: 0, created_at: created_at.into(),
+            compressed: false, compression_stages: String::new(),
+        };
+        let records = [
+            record("2026-11-01T15:59:59.999Z", 300_000),
+            record("2026-11-01T16:00:00Z", 190_000),
+            record("2026-11-02T00:00:00.001+08:00", 200_000),
+            record("invalid", 400_000),
+        ];
+        assert_eq!(price_cliff_status(&records, since), (2, 200_000));
+        assert_eq!(price_cliff_status(&records, since.map(|time| time + chrono::Duration::milliseconds(1))), (1, 200_000));
+        assert_eq!(price_cliff_status(&records[..1], since), (0, 0));
+        assert_eq!(price_cliff_status(&records[..3], None), (3, 300_000));
     }
 }

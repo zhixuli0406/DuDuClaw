@@ -20,9 +20,6 @@ pub struct WatchOptions {
     pub content: bool,
 }
 impl WatchOptions {
-    fn target(&self) -> Value {
-        match &self.run { Some(id) => json!({"run_id":id}), None => json!({"agent_id":self.agent}) }
-    }
     fn matches(&self, payload: &Value) -> bool {
         watch_matches(self.run.as_deref(), &self.agent, payload)
     }
@@ -185,28 +182,33 @@ async fn watch_loop<W: Write>(options: &WatchOptions, output: &mut W) -> Result<
             ConnectionState::LoginRequired(error) => return Err(error),
             ConnectionState::Connected(info) => {
                 if generation != Some(info.generation) {
-                    let subscription = options
-                        .client
-                        .call_detailed("runs.subscribe", options.target(), BUDGET)
-                        .await;
-                    match subscription {
-                        Err(Error::Disconnected | Error::Timeout) => {
-                            write_line(output, strings::STALE)?;
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
+                    if let Some(run_id) = &options.run {
+                        let subscription = options
+                            .client
+                            .call_detailed("runs.subscribe", json!({"run_id":run_id}), BUDGET)
+                            .await;
+                        match subscription {
+                            Err(Error::Disconnected | Error::Timeout) => {
+                                write_line(output, strings::STALE)?;
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                            Ok(RpcReply::Accepted(_)) => {
+                                subscribed = true;
+                                write_line(output, strings::WATCH_SUBSCRIBED)?;
+                            }
+                            Ok(RpcReply::Rejected { message, .. })
+                                if message.is("Unknown method: runs.subscribe") =>
+                            {
+                                subscribed = false;
+                                write_line(output, strings::WATCH_POLLING)?;
+                            }
+                            Ok(RpcReply::Rejected { .. }) => return Err(Error::RpcRejected),
                         }
-                        Err(error) => return Err(error),
-                        Ok(RpcReply::Accepted(_)) => {
-                            subscribed = true;
-                            write_line(output, strings::WATCH_SUBSCRIBED)?;
-                        }
-                        Ok(RpcReply::Rejected { message, .. })
-                            if message.is("Unknown method: runs.subscribe") =>
-                        {
-                            subscribed = false;
-                            write_line(output, strings::WATCH_POLLING)?;
-                        }
-                        Ok(RpcReply::Rejected { .. }) => return Err(Error::RpcRejected),
+                    } else {
+                        subscribed = false;
+                        write_line(output, strings::WATCH_AGENT_POLLING)?;
                     }
                     generation = Some(info.generation);
                     reconcile(&mut tail, options, output).await?;

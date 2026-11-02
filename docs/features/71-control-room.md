@@ -12,7 +12,7 @@ Employees work on goals, schedules and responsibilities without anyone asking. T
 
 | Question | Where |
 |---|---|
-| What needs me? | The inbox: approvals, goals waiting for a reply, breaker notices. Each row says who raised it and why. |
+| What needs me? | The inbox: approvals and goals waiting for a reply, each saying who raised it and why. Breaker notices appear there as information; they do not count as needing you and do not trigger a notification. |
 | What is running? | Employee list, run and task blocks, next scheduled runs, `duduclaw tui watch`. |
 | How do I stop it? | `p` pauses autonomous work for the selected employee, `u` resumes. Admin can pause everyone from the palette. |
 

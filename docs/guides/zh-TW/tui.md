@@ -142,7 +142,7 @@ Admin 可在 `Ctrl-P` 選擇「暫停全部自主工作」或「恢復全部自�
 
 ## 查看單一員工紀錄
 
-`duduclaw tui watch adu` 輸出清理過的純文字行，適合窄分割視窗，不切換 alternate screen。先嘗試 `runs.subscribe { agent_id }`；閘道已實作訂閱，僅舊版回應未知方法時才明示「輪詢模式」，每五秒讀取 `runs.list` 與 `runs.get`，取最近四次執行、每次最近 256 筆事件，並限制去重紀錄大小。支援訂閱的閘道另接收 `run.step`，仍定期核對已保存紀錄。`Ctrl-C` 離開；同樣拒絕 AI 工作階段，沿用帳號登入。
+`duduclaw tui watch adu` 輸出清理過的純文字行，適合窄分割視窗，不切換 alternate screen。員工模式明示「輪詢模式」，每五秒讀取 `runs.list` 與 `runs.get`；閘道訂閱需要唯一的 `run_id`，因此員工模式不發送訂閱請求。取最近四次執行、每次最近 256 筆事件，並限制去重紀錄大小。使用 `--run` 可訂閱單次執行；舊版閘道回應未知方法時，才顯示提示並改為每五秒輪詢。`Ctrl-C` 離開；同樣拒絕 AI 工作階段，沿用帳號登入。
 
 預設只輸出時間、狀態、員工、步驟類型或工具名稱，不顯示使用者與助理文字或工具參數。使用 `duduclaw tui watch adu --content` 才會顯示內容預覽，並在 stderr 警告內容未經機密遮蔽。兩種模式遇到未知事件格式都只顯示名稱，絕不輸出 JSON payload。
 
@@ -209,6 +209,6 @@ AI 工作階段拒絕與 Bash 命令守門都是減少誤用的措施。與操�
 
 `duduclaw tui watch --run <run-id>` 以 `runs.get` 與 `runs.subscribe {run_id}` 追蹤單一執行；原本的位置參數仍是員工名稱，不可與 `--run` 同時使用。沿用內容顯示選項、文字清理與 AI 工作階段拒絕。
 
-`dashboard.navigate` 只選取目前已載入的待處理事項或員工；輸入中、PTY 輸入中、說明或確認卡開啟時不移動任何選取。未知目標與惡意路徑會被忽略，不開啟決策卡，也不執行動作。
+`dashboard.navigate` 僅接受 `/inbox?item=` 指向已載入收件匣項目的被動提示，不更動選取、焦點、卡片或 `p`／`u` 的員工目標。`/agents/...`、其他路徑、未知項目與惡意路徑一律忽略；輸入中、PTY 輸入中、說明或確認卡開啟時也不處理提示。
 
 子行程的 OSC 9、OSC 777 `notify` 通知，或 OSC 0／2 標題恰為 `waiting for you`、`waiting for input`、`needs input`（不分大小寫），會顯示固定等待標記，本機輸入後清除。標記僅供查看，不授權、不回答、不呼叫閘道，也不發出主終端通知。過長或格式錯誤的字串會被忽略。

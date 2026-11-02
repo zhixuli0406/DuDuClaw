@@ -198,17 +198,8 @@ impl App {
         let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
         if pty.screen().scrollback() != 0 || !pty.screen().mouse_supported { return; }
         let row = event.row - area.y;
-        let mut host_col = 0;
-        let mut child_col = None;
-        for col in 0..pty.screen().size().1 {
-            let Some(cell) = pty.screen().cell(row, col) else { break; };
-            if cell.is_wide_continuation() { continue; }
-            let safe = TerminalText::new(cell.contents().to_owned()).plain().replace('\n', "");
-            let width = super::text::columns(if safe.is_empty() { " " } else { &safe }, settings.ambiguous_width) as u16;
-            if event.column - area.x >= host_col && event.column - area.x < host_col + width { child_col = Some(col + 1); break; }
-            host_col += width;
-        }
-        if let Some(col) = child_col {
+        let columns = super::pty_render::host_to_vt_columns(pty.screen(), row, area.width, settings);
+        if let Some(&col) = columns.get(usize::from(event.column - area.x)) {
             let bytes = crate::pty::mouse_bytes(event, col, row + 1, pty.screen().mouse_mode, pty.screen().mouse_encoding);
             pty.send(bytes);
         }
@@ -240,6 +231,10 @@ impl App {
     pub(super) fn downstream_prompt(&self, now: std::time::Instant) -> Option<TerminalText> {
         self.downstream_reference(now)?;
         self.chat.downstream_prompt(now)
+    }
+    pub(super) fn downstream_prompt_compact(&self, now: std::time::Instant) -> Option<TerminalText> {
+        self.downstream_reference(now)?;
+        self.chat.downstream_prompt_compact(now)
     }
     pub fn focus_label(&self) -> &'static str {
         if self.pty_confirm.is_some() { strings::PTY_CONFIRM_FOCUS }

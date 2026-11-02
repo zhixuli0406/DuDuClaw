@@ -139,7 +139,7 @@ async fn one_chat_socket_reconnect_refresh_cancel_and_no_replay() {
     );
 }
 #[tokio::test]
-async fn watch_falls_back_to_real_poll_shapes_without_screen_control() {
+async fn employee_watch_polls_without_requesting_a_subscription() {
     let Some(gateway) = Gateway::start(false).await else {
         return;
     };
@@ -161,7 +161,40 @@ async fn watch_falls_back_to_real_poll_shapes_without_screen_control() {
     .await;
     assert!(result.is_err());
     let text = String::from_utf8(output).unwrap();
-    assert!(text.contains(duduclaw_tui::strings::WATCH_POLLING));
+    assert!(text.contains(duduclaw_tui::strings::WATCH_AGENT_POLLING));
+    assert!(gateway.fixture.run_subscriptions.lock().unwrap().is_empty());
+    assert!(text.contains("[completed] adu"), "employee mode reads runs.list and runs.get");
     assert!(!text.contains("done"));
     assert!(!text.contains('\x1b'));
+}
+
+#[tokio::test]
+async fn explicit_run_watch_subscribes_and_older_gateways_fall_back() {
+    for supported in [true, false] {
+        let Some(gateway) = Gateway::start(false).await else {
+            return;
+        };
+        gateway.fixture.run_subscription_supported.store(supported, Ordering::SeqCst);
+        let client = gateway.client().await;
+        connected(&client, 1).await;
+        let mut output = Vec::new();
+        let result = timeout(
+            Duration::from_millis(250),
+            duduclaw_tui::watch::run_watch_to(
+                duduclaw_tui::WatchOptions {
+                    run: Some("r1".into()),
+                    client,
+                    agent: String::new(),
+                    content: false,
+                },
+                &mut output,
+            ),
+        ).await;
+        assert!(result.is_err());
+        assert_eq!(*gateway.fixture.run_subscriptions.lock().unwrap(), vec![json!({"run_id":"r1"})]);
+        let text = String::from_utf8(output).unwrap();
+        let notice = if supported { duduclaw_tui::strings::WATCH_SUBSCRIBED } else { duduclaw_tui::strings::WATCH_POLLING };
+        assert!(text.contains(notice));
+        assert!(!text.contains(duduclaw_tui::strings::WATCH_AGENT_POLLING));
+    }
 }
