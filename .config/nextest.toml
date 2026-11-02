@@ -7,6 +7,11 @@ final-status-level = "flaky"
 [profile.ci.junit]
 path = "junit.xml"
 
+# Nested PowerShell startup needs the runner's full CPU budget.
+[[profile.ci.overrides]]
+filter = 'package(duduclaw-fork) & test(/^test_runner::tests::windows::/)'
+threads-required = "num-cpus"
+
 [profile.ci-native]
 inherits = "ci"
 retries = 1

@@ -326,9 +326,19 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(docs[1][8:], ["--"] + [arg for name in E2E_FILTERS
                          for arg in ("--skip", name.removeprefix("workflow::"))])
 
+    def test_windows_process_tree_tests_reserve_all_cpus(self):
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
+        self.assertEqual(config["profile"]["ci"]["overrides"], [{
+            "filter": "package(duduclaw-fork) & test(/^test_runner::tests::windows::/)",
+            "threads-required": "num-cpus",
+        }])
+        # Nextest follows the profile chain when resolving per-test overrides.
+        self.assertEqual(config["profile"]["ci-native"]["inherits"], "ci")
+
     def test_nextest_profiles_and_reports(self):
         config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
-        self.assertEqual(config["profile"]["ci"], {
+        self.assertEqual({key: value for key, value in config["profile"]["ci"].items()
+                          if key != "overrides"}, {
             "retries": 0, "fail-fast": False,
             "slow-timeout": {"period": "60s", "terminate-after": 10},
             "final-status-level": "flaky", "junit": {"path": "junit.xml"},
