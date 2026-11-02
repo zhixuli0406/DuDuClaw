@@ -1985,6 +1985,9 @@ pub(crate) mod test_probe {
             }
         }
     }
+    /// Unlike crypto counters, provider attribution uses the captured client ID.
+    /// Fixtures observing different homes must use distinct IDs: the generic
+    /// exchange entry point has no home argument, and this visits every match.
     pub(crate) fn provider(client: &str) {
         for c in probes().lock().unwrap().values() {
             if c.client == client {
