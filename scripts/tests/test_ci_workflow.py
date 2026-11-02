@@ -40,6 +40,11 @@ class CiWorkflowTests(unittest.TestCase):
             if line.strip().startswith("cargo ")
         ]
 
+    def test_ci_permissions_are_read_only(self):
+        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        for job in self.jobs.values():
+            self.assertNotIn("permissions", job)
+
     def test_latest_runs_do_not_cancel_other_prs_or_main(self):
         concurrency = self.workflow["concurrency"]
         group = concurrency["group"]
@@ -346,6 +351,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(artifact["uses"], "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
         self.assertIn("always()", artifact["if"])
         self.assertEqual(artifact["with"]["path"], "target/nextest/reports/*.xml")
+        self.assertEqual(artifact["with"]["retention-days"], "7")
         self.assertIn("-p 'test_ci*.py'", str(self.jobs["python"]))
 
     def test_classifier_uses_base_and_publishes_only_successful_outputs(self):
@@ -417,6 +423,13 @@ class CiWorkflowTests(unittest.TestCase):
                     if uses := step.get("uses"):
                         if uses != "dtolnay/rust-toolchain@stable":
                             self.assertRegex(uses, r"^[\w-]+/[\w-]+@[a-f0-9]{40}$")
+            if name in {"desktop-release", "release-cache-warm"}:
+                installs = [shlex.split(line) for job in workflow["jobs"].values()
+                            for step in job.get("steps", [])
+                            for line in step.get("run", "").splitlines()
+                            if line.strip().startswith("cargo install tauri-cli")]
+                self.assertEqual(installs, [["cargo", "install", "tauri-cli", "--version",
+                                             "=2.12.4", "--locked"]])
             if name == "release":
                 self.assertEqual(workflow["jobs"]["build"]["strategy"]["fail-fast"], "false")
             if name == "computer-use-image":

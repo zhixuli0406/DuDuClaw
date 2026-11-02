@@ -9,10 +9,9 @@ import tomllib
 
 
 FULL = dict(rust_mode="full", dashboard="run", discord_voice="true", app_compat="true")
-SEMVER = re.compile(r"(?<![\d.])\d+\.\d+\.\d+(?![\d.])")
 VERSION_FILES = {
     "Cargo.toml", "Cargo.lock", "pyproject.toml", "python/duduclaw/__init__.py",
-    "README.md", "README.zh-TW.md", "README.ja.md", "scripts/install.sh",
+    "scripts/install.sh",
     "scripts/install.ps1", "src-tauri/tauri.conf.json", "src-tauri/Cargo.lock",
     "distribution/registries/mcp/server.json",
 }
@@ -43,7 +42,8 @@ def version_path(path: str) -> bool:
             or re.fullmatch(r"crates/[^/]+/Cargo\.toml|npm/[^/]+/package\.json", path) is not None)
 
 
-def lock_versions_only(old: str, new: str) -> bool:
+def lock_versions_only(old: str, new: str, old_version: str | None = None,
+                       new_version: str | None = None) -> bool:
     """Mask only workspace package version fields; preserve every other byte."""
     def masked(text: str) -> str:
         tomllib.loads(text)
@@ -54,7 +54,16 @@ def lock_versions_only(old: str, new: str) -> bool:
                 blocks[index] = re.sub(r'^version = "\d+\.\d+\.\d+"$',
                                        'version = "<VERSION>"', block, flags=re.MULTILINE)
         return "[[package]]".join(blocks)
-    return masked(old) == masked(new)
+    if masked(old) != masked(new):
+        return False
+    if old_version is not None:
+        before = tomllib.loads(old).get("package", [])
+        after = tomllib.loads(new).get("package", [])
+        for left, right in zip(before, after):
+            if left.get("version") != right.get("version"):
+                if (left.get("version"), right.get("version")) != (old_version, new_version):
+                    return False
+    return True
 
 
 def text_at(sha: str, path: str) -> str:
@@ -62,9 +71,21 @@ def text_at(sha: str, path: str) -> str:
 
 
 def bump_only(base: str, head: str, changes: list[tuple[str, str]]) -> bool:
+    def workspace_version(sha: str) -> str:
+        version = tomllib.loads(text_at(sha, "Cargo.toml"))["workspace"]["package"]["version"]
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            raise ValueError("expected a numeric workspace version")
+        return version
+
+    old_version, new_version = workspace_version(base), workspace_version(head)
+    if tuple(map(int, new_version.split("."))) <= tuple(map(int, old_version.split("."))):
+        return False
+    delivery = {f"distribution/release-delivery/v{new_version}.{ext}" for ext in ("json", "sig")}
+    if {path for status, path in changes if status == "A"} != delivery:
+        return False
     has_version = False
     for status, path in changes:
-        if status == "A" and re.fullmatch(r"distribution/release-delivery/v[^/]+\.(json|sig)", path):
+        if status == "A" and path in delivery:
             continue
         if status != "M":
             return False
@@ -75,18 +96,27 @@ def bump_only(base: str, head: str, changes: list[tuple[str, str]]) -> bool:
             return False
         old, new = text_at(base, path), text_at(head, path)
         if path == "CHANGELOG.md":
+            header = re.compile(r"^## \[" + re.escape(new_version) + r"\](?:[ \t].*)?$", re.MULTILINE)
+            if not header.search(new) or header.search(old):
+                return False
             def content(text: str) -> list[str]:
                 return [line for line in text.splitlines(keepends=True)
                         if line.strip() and not re.match(r"^## \[[^\]\n]+\]", line)]
             if content(old) != content(new):
                 return False
+        elif path in {"README.md", "README.zh-TW.md", "README.ja.md"}:
+            continue
         elif version_path(path):
             has_version = True
             if path.endswith("Cargo.lock"):
-                if not lock_versions_only(old, new):
+                if not lock_versions_only(old, new, old_version, new_version):
                     return False
-            elif SEMVER.sub("<VERSION>", old) != SEMVER.sub("<VERSION>", new):
-                return False
+            else:
+                old_lines, new_lines = old.splitlines(keepends=True), new.splitlines(keepends=True)
+                if len(old_lines) != len(new_lines) or any(
+                        left != right and left.replace(old_version, new_version) != right
+                        for left, right in zip(old_lines, new_lines)):
+                    return False
         else:
             return False
     return has_version and ("M", "CHANGELOG.md") in changes
@@ -121,7 +151,7 @@ def classify(event: str, base: str, head: str) -> dict[str, str]:
                                and "compat" in p for p in paths)
         return dict(rust_mode="full", dashboard="run", discord_voice=str(voice).lower(),
                     app_compat=str(compat).lower())
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+    except (OSError, ValueError, IndexError, KeyError, TypeError, subprocess.SubprocessError):
         return FULL.copy()
 
 

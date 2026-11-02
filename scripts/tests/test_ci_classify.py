@@ -66,6 +66,8 @@ class CiClassifyTests(unittest.TestCase):
         return ci_classify.classify("pull_request", self.base, self.commit())
 
     def bump(self):
+        self.write("distribution/release-delivery/v1.79.1.json", "{}\n")
+        self.write("distribution/release-delivery/v1.79.1.sig", "signature\n")
         self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.1"\n')
         self.write("Cargo.lock", LOCK.replace('version = "1.79.0"', 'version = "1.79.1"'))
         self.write("src-tauri/Cargo.lock", LOCK.replace('version = "1.79.0"', 'version = "1.79.1"'))
@@ -96,22 +98,41 @@ class CiClassifyTests(unittest.TestCase):
                 result = self.classify()
                 self.assertEqual((result["rust_mode"], result["dashboard"]), ("full", "run"))
 
-    def test_real_bump_checks(self):
-        files = ("crates/duduclaw-core/Cargo.toml", "pyproject.toml",
-                 "python/duduclaw/__init__.py", "npm/duduclaw/package.json",
-                 "README.md", "README.zh-TW.md", "README.ja.md",
-                 "scripts/install.sh", "scripts/install.ps1", "src-tauri/tauri.conf.json",
-                 "distribution/registries/mcp/server.json")
-        for path in files:
-            self.write(path, 'version = "1.79.0"\n')
+    def test_real_bump_file_set_and_shape_checks(self):
+        # Replay the 21-file shape of the actual v1.79.0 release bump.
+        files = {
+            "pyproject.toml": '[project]\nversion = "1.79.0"\n',
+            "python/duduclaw/__init__.py": '__version__ = "1.79.0"\n',
+            "npm/duduclaw/package.json": '{"version":"1.79.0",\n"optionalDependencies":{'
+                + ','.join(f'"@duduclaw/{platform}":"1.79.0"' for platform in
+                           ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-x64"))
+                + '}}\n',
+            "scripts/install.sh": 'FALLBACK_VERSION="1.79.0"\n',
+            "scripts/install.ps1": '$FallbackVersion = "1.79.0"\n',
+            "src-tauri/tauri.conf.json": '{"version":"1.79.0"}\n',
+            "distribution/registries/mcp/server.json":
+                '{"version":"1.79.0","packages":[{"version":"1.79.0"}]}\n',
+        }
+        for platform in ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-x64"):
+            files[f"npm/{platform}/package.json"] = '{"version":"1.79.0"}\n'
+        for path in ("README.md", "README.zh-TW.md", "README.ja.md"):
+            files[path] = "Version badge: 1.79.0\n"
+        # The desktop lockfile can retain local packages at older versions.
+        desktop_lock = LOCK + '\n[[package]]\nname = "duduclaw-desktop"\nversion = "1.0.0"\n'
+        self.write("src-tauri/Cargo.lock", desktop_lock)
+        for path, text in files.items():
+            self.write(path, text)
         self.base = self.commit()
         self.bump()
-        for path in files:
-            self.write(path, 'version = "1.79.1"\n')
-        self.write("distribution/release-delivery/v1.79.1.json", '{}\n')
-        self.write("distribution/release-delivery/v1.79.1.json.sig", "signature\n")
-        self.assertEqual(self.classify(), dict(rust_mode="check", dashboard="skip",
-                                              discord_voice="false", app_compat="false"))
+        self.write("src-tauri/Cargo.lock", desktop_lock.replace('version = "1.79.0"', 'version = "1.79.1"'))
+        for path, text in files.items():
+            self.write(path, text.replace("1.79.0", "1.79.1"))
+        head = self.commit()
+        paths = self.git("diff", "--name-only", self.base, head).splitlines()
+        self.assertEqual(len(paths), 21)
+        self.assertEqual(ci_classify.classify("pull_request", self.base, head),
+                         dict(rust_mode="check", dashboard="skip",
+                              discord_voice="false", app_compat="false"))
 
     def test_version_change_without_changelog_forces_full(self):
         self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.1"\n')
@@ -124,13 +145,93 @@ class CiClassifyTests(unittest.TestCase):
         self.assertEqual(ci_classify.classify("pull_request", self.base, head), ci_classify.FULL)
         self.assertTrue(ci_warm_needed.warm_needed("push", head))
 
-    def test_v_prefixed_versions_and_urls_are_version_only(self):
+    def test_tags_and_urls_must_use_exact_workspace_bump(self):
         self.write("scripts/install.sh", 'TAG="v1.79.0"\n')
         self.write("README.md", "Download https://example.invalid/v1.79.0/file\n")
         self.base = self.commit()
         self.bump()
         self.write("scripts/install.sh", 'TAG="v1.79.1"\n')
         self.write("README.md", "Download https://example.invalid/v1.79.1/file\n")
+        self.assertEqual(self.classify()["rust_mode"], "check")
+
+    def test_unrelated_semver_edits_force_full(self):
+        original_base = self.base
+        for path, old, new in (
+            ("scripts/install.sh", 'FALLBACK_VERSION="1.79.0"\n', 'FALLBACK_VERSION="0.0.0"\n'),
+            ("Cargo.toml", '[workspace.package]\nversion = "1.79.0"\n'
+             '[workspace.dependencies]\nserde = "1.0.200"\n',
+             '[workspace.package]\nversion = "1.79.1"\n'
+             '[workspace.dependencies]\nserde = "1.0.201"\n'),
+            ("crates/duduclaw-core/Cargo.toml", '[dependencies]\nserde = "1.0.200"\n',
+             '[dependencies]\nserde = "1.0.201"\n'),
+            ("npm/duduclaw/package.json", '{"version":"1.79.0","optionalDependencies":{"pkg":"1.79.0"}}\n',
+             '{"version":"1.79.1","optionalDependencies":{"pkg":"1.80.0"}}\n'),
+            ("scripts/install.sh", 'TAG="v1.79.0"\nURL="https://example.invalid/v1.79.0/file"\n',
+             'TAG="v1.79.1"\nURL="https://example.invalid/v1.80.0/file"\n'),
+        ):
+            with self.subTest(path=path):
+                self.base = original_base
+                self.git("checkout", "--detach", self.base)
+                self.write(path, old)
+                self.base = self.commit()
+                self.bump()
+                self.write(path, new)
+                self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_lower_or_unchanged_workspace_version_forces_full(self):
+        for version in ("1.78.9", "1.79.0"):
+            with self.subTest(version=version):
+                self.bump()
+                self.write("Cargo.toml", f'[workspace.package]\nversion = "{version}"\n')
+                self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_numeric_version_order(self):
+        self.bump()
+        for path in ("Cargo.toml", "Cargo.lock", "src-tauri/Cargo.lock", "CHANGELOG.md"):
+            target = self.repo / path
+            target.write_text(target.read_text().replace("1.79.1", "1.100.0"))
+        for ext in ("json", "sig"):
+            (self.repo / f"distribution/release-delivery/v1.79.1.{ext}").rename(
+                self.repo / f"distribution/release-delivery/v1.100.0.{ext}")
+        self.assertEqual(self.classify()["rust_mode"], "check")
+
+    def test_missing_or_incorrect_delivery_files_force_full(self):
+        for missing in (("json",), ("sig",), ("json", "sig")):
+            with self.subTest(missing=missing):
+                self.bump()
+                for ext in missing:
+                    (self.repo / f"distribution/release-delivery/v1.79.1.{ext}").unlink()
+                self.assertEqual(self.classify()["rust_mode"], "full")
+        self.bump()
+        (self.repo / "distribution/release-delivery/v1.79.1.sig").rename(
+            self.repo / "distribution/release-delivery/v1.79.1.json.sig")
+        self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_changelog_requires_new_matching_header(self):
+        self.bump()
+        self.write("CHANGELOG.md", (self.repo / "CHANGELOG.md").read_text().replace("[1.79.1]", "[1.80.0]"))
+        self.assertEqual(self.classify()["rust_mode"], "full")
+        self.git("checkout", "--detach", self.base)
+        self.write("CHANGELOG.md", (self.repo / "CHANGELOG.md").read_text() + "\n## [1.79.1]\n")
+        self.base = self.commit()
+        self.bump()
+        self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_lock_workspace_versions_must_be_exact_old_to_new(self):
+        for path in ("Cargo.lock", "src-tauri/Cargo.lock"):
+            for version in ("0.0.0", "1.80.0"):
+                with self.subTest(path=path, version=version):
+                    self.bump()
+                    self.write(path, LOCK.replace("1.79.0", version))
+                    self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_readmes_allow_documentation_changes_during_bump(self):
+        for path in ("README.md", "README.zh-TW.md", "README.ja.md"):
+            self.write(path, "Old documentation\n")
+        self.base = self.commit()
+        self.bump()
+        for path in ("README.md", "README.zh-TW.md", "README.ja.md"):
+            self.write(path, "New documentation\nwith another line\n")
         self.assertEqual(self.classify()["rust_mode"], "check")
 
     def test_third_party_lock_change_forces_full(self):

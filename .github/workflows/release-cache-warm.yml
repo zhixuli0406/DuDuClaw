@@ -154,7 +154,7 @@ jobs:
       - name: Generate app icons
         shell: bash
         run: |
-          cargo install tauri-cli --version "^2" --locked
+          cargo install tauri-cli --version "=2.12.4" --locked
           cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 
       - name: Build & stage gateway sidecar

@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -233,6 +236,7 @@ jobs:
         with:
           name: nextest-${{ matrix.os }}
           path: target/nextest/reports/*.xml
+          retention-days: 7
           if-no-files-found: warn
 
   dashboard:
