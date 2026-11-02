@@ -3,4 +3,4 @@ source: crates/duduclaw-tui/src/ui/tests.rs
 assertion_line: 1162
 expression: "screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end()"
 ---
-自主: 狀態無法讀取，自主工作視為已暫停 · 資料可能過期
+自主: 狀態無法讀取，待確認

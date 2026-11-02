@@ -1145,6 +1145,66 @@ fn autonomy_model(value: serde_json::Value) -> Model {
 fn pause_entry() -> serde_json::Value { json!({"reason":"operator", "who":"u1", "at":"2026-11-02T00:00:00Z"}) }
 fn ordinary_key(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE) }
 
+fn assert_autonomy_unconfirmed(m: &Model) {
+    let read = ReadState::default();
+    let mut without_approvals = m.clone();
+    without_approvals.inbox = fresh(vec![]);
+    for status in ["active", "working"] {
+        assert_eq!(employee_status(&employee("adu", "阿嘟", status), &without_approvals, &read), EmployeeStatus::AutonomyUnknown);
+    }
+    let line = crate::autonomy::status_line(m).unwrap().plain();
+    assert!(line.contains(strings::AUTONOMY_UNKNOWN));
+    assert!(!line.contains(strings::AUTONOMY_PAUSED));
+    assert!(!line.contains(strings::AUTONOMY_ALL));
+    let output = screen(m, &App::default(), &Settings::default(), 180, 24);
+    assert!(output.contains(strings::AUTONOMY_ROW_UNKNOWN));
+    assert!(!output.contains(strings::AUTONOMY_ROW_PAUSED));
+}
+
+#[test]
+fn autonomy_resume_then_invalidation_and_failed_refetch_hide_cached_pause() {
+    let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause_entry()},"state_error":null}));
+    assert_eq!(employee_status(&m.employees.items[0], &m, &ReadState::default()), EmployeeStatus::AutonomyPaused);
+    m.event(&crate::client::ServerEvent {
+        name: "autonomy.changed".into(),
+        payload: json!({"agent_id":"adu","all":false,"paused":false}),
+        seq: Some(1), boot_id: None,
+    });
+    assert!(m.autonomy.paused("adu"));
+    assert_autonomy_unconfirmed(&m);
+    // A failed status refetch retains the old items and invalidation flags.
+    m.autonomy.error = Some(crate::Error::Network);
+    assert_autonomy_unconfirmed(&m);
+    m.inbox = fresh(vec![approval("pending", "adu", "review", "tool", "approval")]);
+    assert_autonomy_unconfirmed(&m);
+}
+
+#[test]
+fn autonomy_pause_then_invalidation_never_displays_confirmed_state() {
+    for value in [
+        json!({"global":null,"agents":{},"state_error":null}),
+        json!({"global":null,"agents":{"adu":pause_entry()},"state_error":null}),
+        json!({"global":pause_entry(),"agents":{},"state_error":null}),
+    ] {
+        let mut m = autonomy_model(value);
+        m.event(&crate::client::ServerEvent {
+            name: "autonomy.changed".into(),
+            payload: json!({"agent_id":"adu","all":false,"paused":true}),
+            seq: Some(1), boot_id: None,
+        });
+        assert_autonomy_unconfirmed(&m);
+        // Either flag alone must hide cached pauses, including priority badges.
+        for (stale, pending) in [(true, false), (false, true)] {
+            m.autonomy.stale = stale;
+            m.autonomy.refetch_pending = pending;
+            for status in ["active", "awaiting", "error", "paused", "stopped"] {
+                m.employees.items[0] = employee("adu", "阿嘟", status);
+                assert_autonomy_unconfirmed(&m);
+            }
+        }
+    }
+}
+
 #[test]
 fn autonomy_status_line_snapshots_and_hostile_names() {
     let pause = pause_entry();
@@ -1242,6 +1302,19 @@ fn autonomy_palette_permissions_all_shape_and_employee_status_cards() {
     m.role = Some(Role::Manager); m.goal_operators.clear();
     assert_eq!(app.key(ordinary_key('p'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: false }));
     assert_eq!(app.key(ordinary_key('u'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: true }));
+    // Ctrl-P opens the palette; exercise the all-agent permission gate directly.
+    for role in [Some(Role::Admin), None] {
+        m.role = role;
+        for resume in [false, true] {
+            assert_eq!(app.autonomy_control(None,resume,&m),Action::Control(crate::controls::Control::Autonomy { agent: None, resume }));
+        }
+    }
+    for role in [Role::Employee, Role::Manager] {
+        m.role = Some(role);
+        for resume in [false, true] {
+            assert_eq!(app.autonomy_control(None,resume,&m),Action::None);
+        }
+    }
     // Ctrl-P is the palette even before users.me resolves; it never pauses all.
     for role in [None, Some(Role::Manager)] {
         m.role = role;

@@ -32,11 +32,16 @@ impl Snapshot<Status> {
     pub fn unreadable(&self) -> bool {
         self.error.is_some() || self.items.first().is_some_and(|s| s.state_error.is_some())
     }
+    pub fn unconfirmed(&self) -> bool {
+        self.unreadable() || self.stale || self.refetch_pending || self.items.is_empty()
+    }
 }
 pub fn status_line(model: &Model) -> Option<TerminalText> {
     let snapshot = &model.autonomy;
     let text = if snapshot.unreadable() {
         strings::AUTONOMY_UNREADABLE.to_owned()
+    } else if snapshot.unconfirmed() {
+        strings::AUTONOMY_UNKNOWN.to_owned()
     } else if let Some(status) = snapshot.items.first() {
         if status.global.is_some() {
             strings::AUTONOMY_ALL.to_owned()
@@ -52,14 +57,9 @@ pub fn status_line(model: &Model) -> Option<TerminalText> {
             let remaining = status.agents.len().saturating_sub(names.len());
             let extra = if remaining > 0 { format!(" +{remaining}") } else { String::new() };
             format!("{}（{}{extra}）", strings::AUTONOMY_PAUSED, names.join("、"))
-        } else if snapshot.stale || snapshot.refetch_pending {
-            strings::STALE.to_owned()
         } else { return None; }
-    } else { strings::STALE.to_owned() };
-    let stale = if (snapshot.stale || snapshot.refetch_pending) && text != strings::STALE {
-        format!(" · {}", strings::STALE)
-    } else { String::new() };
-    Some(TerminalText::new(format!("{}: {text}{stale}", strings::AUTONOMY)))
+    } else { strings::AUTONOMY_UNKNOWN.to_owned() };
+    Some(TerminalText::new(format!("{}: {text}", strings::AUTONOMY)))
 }
 
 #[cfg(test)]

@@ -302,6 +302,11 @@ struct Lists {
 pub(crate) fn cost_amount(value: &Value) -> Option<u64> {
     (value["available"] == true).then(|| value["total_cost_millicents"].as_u64()).flatten()
 }
+
+fn parse_autonomy(value: Value, budget: &mut crate::budget::SnapshotBudget) -> Result<crate::autonomy::Status> {
+    budget.charge_map(&value, "agents")?;
+    crate::autonomy::Status::parse(value)
+}
 async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     #[derive(Deserialize)]
     struct Agents {
@@ -309,7 +314,7 @@ async fn fetch(client: &Client, role: Role) -> Result<Lists> {
     }
     let mut budget = crate::budget::SnapshotBudget::default();
     let autonomy = match client.call("autonomy.status", json!({}), RPC_TIMEOUT).await {
-        Ok(value) => budget.charge(&value, "autonomy").and_then(|_| crate::autonomy::Status::parse(value)),
+        Ok(value) => parse_autonomy(value, &mut budget),
         Err(error) => Err(error),
     };
     let response = client.call("agents.list", json!({}), RPC_TIMEOUT).await?;
@@ -533,6 +538,18 @@ async fn run_with_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn autonomy_wire_shape_uses_shared_item_and_byte_budget() {
+        let mut budget = crate::budget::SnapshotBudget::default();
+        for agents in [json!({}), json!({"adu":{"reason":"operator","who":"u1","at":"now"}})] {
+            let status = parse_autonomy(json!({"global":null,"agents":agents,"state_error":null}), &mut budget).unwrap();
+            assert_eq!(status.agents.len(), agents.as_object().unwrap().len());
+        }
+        assert_eq!(budget.ensure_items(2_000), Err(Error::SnapshotBudget));
+        let oversized = json!({"global":null,"agents":{},"state_error":"x".repeat(4 * 1024 * 1024)});
+        assert!(matches!(parse_autonomy(oversized, &mut budget), Err(Error::SnapshotBudget)));
+        assert!(matches!(parse_autonomy(json!({"global":null,"agents":[],"state_error":null}), &mut Default::default()), Err(Error::Protocol)));
+    }
     #[tokio::test]
     async fn explicit_decision_refetch_invalidates_and_waits_for_authoritative_lists() {
         use tokio::sync::{mpsc, oneshot};
@@ -791,20 +808,26 @@ mod tests {
     }
 
     #[test]
-    fn autonomy_invalidation_preserves_confirmed_state_and_read_errors_fail_closed() {
+    fn autonomy_resume_invalidation_and_failed_refetch_never_display_cached_pause() {
         let mut model = fresh();
         let status = crate::autonomy::Status::parse(json!({"global":null,
             "agents":{"adu":{"reason":"operator","who":"u1","at":"now"}},"state_error":null})).unwrap();
         model.autonomy.replace(vec![status]);
+        assert!(crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_PAUSED));
         let mut changed = event("autonomy.changed", Some(1), Some("boot"));
         changed.payload = json!({"agent_id":"adu","all":false,"paused":false,"at":"now"});
         model.event(&changed);
         assert!(model.autonomy.paused("adu"));
         assert!(model.autonomy.stale && model.autonomy.refetch_pending);
+        assert!(crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_UNKNOWN));
+        assert!(!crate::autonomy::status_line(&model).unwrap().plain().contains(strings::AUTONOMY_PAUSED));
         assert!(model.apply(model.revision, Ok(Lists { cost_millicents: None, autonomy: Err(Error::Network), role: Some(Role::Admin),
             goal_operators: HashSet::new(), recent_activity: Ok(HashMap::new()), schedules: Ok(vec![]), employees: vec![], inbox: vec![] })));
         assert!(model.autonomy.paused("adu"));
         assert!(model.autonomy.unreadable());
+        let line = crate::autonomy::status_line(&model).unwrap().plain();
+        assert!(line.contains(strings::AUTONOMY_UNKNOWN));
+        assert!(!line.contains(strings::AUTONOMY_PAUSED));
     }
 
     #[tokio::test]

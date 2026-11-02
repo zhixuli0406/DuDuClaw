@@ -116,8 +116,11 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 .iter()
                 .map(|e| {
                     let s = employee_status(e, model, &app.read);
-                    // Keep the priority badge (awaiting/error) while also showing the pause.
-                    let autonomy = if model.autonomy.paused(e.id()) && !model.autonomy.unreadable()
+                    // Keep the priority badge while showing only confirmed autonomy state.
+                    let autonomy = if model.autonomy.unconfirmed()
+                        && s != super::app::EmployeeStatus::AutonomyUnknown {
+                        format!(" · {}", strings::AUTONOMY_ROW_UNKNOWN)
+                    } else if !model.autonomy.unconfirmed() && model.autonomy.paused(e.id())
                         && s != super::app::EmployeeStatus::AutonomyPaused {
                         format!(" · {}", strings::AUTONOMY_ROW_PAUSED)
                     } else { String::new() };
