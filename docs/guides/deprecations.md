@@ -258,4 +258,6 @@ MFA phase 1 adds conditional response shapes to `/api/login` and `/api/otp/verif
 
 ## Third-party MCP environment credentials
 
-Downgrading to an older binary after MCP env migration requires the encrypted migration backup and re-entry of keys: older binaries may pass `secret://` references as literal credentials. Keep the original `.keyfile` to decrypt `<home>/backups/mcp-migrate/*.enc`; restore a compatible config and enter keys before starting an older version.
+Older binaries may pass `secret://` references as literal credentials, so migrated employees cannot simply run on an older version. Copy the whole `<home>` before upgrading; to downgrade, stop the gateway and restore that copy. Without a copy, replace each reference in `.mcp.json` with the real key before starting the older version. No command decrypts `<home>/backups/mcp-migrate/*.enc`. Those files exist for manual recovery and are unreadable without the original `.keyfile`.
+
+If `.keyfile` is lost, the store cannot be read and a new key is refused while `.enc` files remain in `<home>/secrets/mcp` or `<home>/backups/mcp-migrate`. Move those files out of `<home>`, then enter the third-party keys again.

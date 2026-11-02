@@ -214,4 +214,6 @@ MFA 第一階段為 `/api/login` 與 `/api/otp/verify` 新增條件式回應。�
 
 ## 第三方 MCP 環境變數憑證
 
-MCP env 遷移後若要降版，必須備妥加密遷移備份並重新輸入金鑰；舊版可能把 `secret://` 參照當成憑證字串傳出。請保留原始 `.keyfile`，以解密 `<home>/backups/mcp-migrate/*.enc`；啟動舊版前先還原相容設定並重新輸入金鑰。
+舊版可能把 `secret://` 參照當成憑證字串傳出，已遷移的員工不能直接換回舊版。升級前請複製整個 `<home>`；要降版時停止 gateway，還原這份複本。沒有複本時，啟動舊版前要把 `.mcp.json` 裡的參照逐一換回實際金鑰。目前沒有指令能解密 `<home>/backups/mcp-migrate/*.enc`，這些檔案只供人工復原，沒有原本的 `.keyfile` 就讀不出來。
+
+`.keyfile` 遺失時，憑證庫讀不出來；只要 `<home>/secrets/mcp` 或 `<home>/backups/mcp-migrate` 裡還有 `.enc` 檔，系統也不會建立新金鑰。請把這些檔案搬出 `<home>`，再重新輸入第三方金鑰。
