@@ -783,9 +783,10 @@ mod tests {
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         timeline.mark("spawn holder");
         let holder_timeline = timeline.clone();
-        let holder = tokio::task::spawn_blocking(move || {
+        // The holder must not depend on the blocking pool the removal is waiting in.
+        let holder = tokio::spawn(async move {
             holder_timeline.mark("holder task started");
-            released.blocking_recv().unwrap();
+            released.await.unwrap();
             drop(held);
             holder_timeline.mark("release done");
         });

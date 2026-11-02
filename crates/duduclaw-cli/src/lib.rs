@@ -9,6 +9,14 @@ use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 use removed_spelling::RemovedSpelling;
+
+const AGENT_INTERACTIVE_REMOVAL_VERSION: &str = "v1.81.0";
+fn agent_interactive_notice() -> String {
+    format!(
+        "The interactive agent session bypasses the gateway and is deprecated; it will be removed in {AGENT_INTERACTIVE_REMOVAL_VERSION}. Use `duduclaw tui` instead."
+    )
+}
+
 mod acp;
 mod onboard_config;
 mod causal_cmd; // Explicit synthetic causal curation fixture
@@ -455,7 +463,7 @@ enum Commands {
         yes: bool,
     },
 
-    /// Manage agents (or start interactive session with no subcommand)
+    /// Manage agents (bare interactive session is deprecated; use `duduclaw tui`)
     Agent {
         #[command(subcommand)]
         command: Option<AgentCommands>,
@@ -2870,7 +2878,8 @@ enum AgentCommands {
         agent: String,
     },
 
-    /// Start interactive session with a specific agent
+    /// Start interactive session with a specific agent (deprecated; use `duduclaw tui`)
+    #[command(hide = true)]
     Run {
         /// Agent name
         name: String,
@@ -3197,6 +3206,57 @@ mod os_drive_help_never_executes_tests {
             );
         };
         assert_eq!(timezone, "--help");
+    }
+}
+
+#[cfg(test)]
+mod agent_interactive_deprecation_tests {
+    use super::*;
+    use clap::CommandFactory;
+    use crate::test_support::run_on_big_stack;
+
+    #[test]
+    fn interactive_forms_remain_parsed_and_notice_recommends_tui() {
+        run_on_big_stack(|| {
+            for args in [
+                vec!["duduclaw", "agent"],
+                vec!["duduclaw", "agent", "run", "x"],
+            ] {
+                let cli = Cli::try_parse_from(args).unwrap();
+                match cli.command {
+                    Commands::Agent { command: None }
+                    | Commands::Agent { command: Some(AgentCommands::Run { .. }) } => {}
+                    _ => panic!("expected the interactive agent path"),
+                }
+            }
+
+            let notice = agent_interactive_notice();
+            assert!(notice.contains("duduclaw tui"));
+            assert!(notice.contains("v1.81.0"));
+
+            let cli = Cli::try_parse_from(["duduclaw", "agent", "list"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Agent { command: Some(AgentCommands::List { .. }) }
+            ));
+        });
+    }
+
+    #[test]
+    fn agent_help_hides_only_run() {
+        run_on_big_stack(|| {
+            let mut root = Cli::command();
+            let agent = root.find_subcommand_mut("agent").expect("agent command");
+            let visible: Vec<_> = agent
+                .get_subcommands()
+                .filter(|command| !command.is_hide_set())
+                .map(|command| command.get_name().to_owned())
+                .collect();
+            assert!(visible.contains(&"list".to_owned()));
+            assert!(visible.contains(&"create".to_owned()));
+            assert!(!visible.contains(&"run".to_owned()));
+            assert!(agent.get_subcommands().any(|command| command.get_name() == "run"));
+        });
     }
 }
 
@@ -9090,6 +9150,7 @@ fn verify_argon2_admin_default(hash_phc: &str) -> bool {
 
 /// `duduclaw agent` or `duduclaw agent run <name>` - Interactive session.
 async fn cmd_agent_interactive(agent_name: Option<&str>) -> duduclaw_core::error::Result<()> {
+    eprintln!("{}", agent_interactive_notice());
     let home = duduclaw_home();
 
     let runner = AgentRunner::new(home.clone()).await?;

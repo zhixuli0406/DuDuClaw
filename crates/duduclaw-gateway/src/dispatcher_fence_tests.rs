@@ -1297,6 +1297,53 @@ async fn downstream_real_two_hop_inherits_scopes_and_stops_both_rails() {
 }
 
 #[tokio::test]
+async fn downstream_sqlite_child_completion_keeps_queued_origin_tickets() {
+    use crate::ephemeral::EPHEMERAL_ADMISSION_CLASS as CLASS;
+    use duduclaw_core::spawn_admission::{self, AdmissionConfig};
+    let rig = Rig::new().await;
+    let home = rig.dir.path();
+    crate::trigger_route::tests::write_agent(&home.join("agents"), "alice", "Parent", "@alice", "main", "");
+    crate::trigger_route::tests::write_agent(&home.join("agents"), "bob", "Child", "@bob", "specialist", "");
+    let child_config = home.join("agents/bob/agent.toml");
+    let config = std::fs::read_to_string(&child_config).unwrap().replace("reports_to = \"\"", "reports_to = \"alice\"");
+    std::fs::write(child_config, config).unwrap();
+    rig.registry.write().await.scan().await.unwrap();
+    let cfg = AdmissionConfig::from_home(home);
+    let mut ticket_ids = Vec::new();
+    for i in 0..2 {
+        let outcome = spawn_admission::enqueue(home, CLASS, &cfg, Some("origin-turn"),
+            serde_json::json!({"parent":"alice", "instruction":"Read report", "context":format!("queued-{i}"),
+                "tools":["Read"], "tier":"cheap", "origin":"alice", "outgoing_depth":1,
+                "turn_id":"origin-turn", "session_id":"origin-session", "on_behalf_of":"user:owner",
+                "spawned":true})).unwrap();
+        let spawn_admission::EnqueueOutcome::Queued { ticket_id, .. } = outcome else {
+            panic!("origin work must be queued");
+        };
+        ticket_ids.push(ticket_id);
+    }
+    assert_eq!(spawn_admission::queue_depth(home, CLASS), 2);
+    let origin_guard = crate::downstream_runs::register(home, Some("origin-session"), Some("origin-turn"), Some("user:owner")).unwrap();
+    // send_to_agent stamps the origin's identity on its SQLite child row.
+    let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,delegation_depth,origin_agent,sender_agent,session_id,turn_id,on_behalf_of)
+        VALUES ('sqlite-child','alice','bob','child work',datetime('now'),1,'alice','alice','origin-session','origin-turn','user:owner')", []).unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    rig.poll().await;
+    model_call_probe::set_dry_run(false);
+    assert_eq!(model_call_probe::calls(), before + 1);
+    assert_eq!(rig.queue.get_by_id("sqlite-child").await.unwrap().unwrap().status, MessageStatus::Done);
+    assert_eq!(crate::downstream_runs::count(home, "origin-session", "origin-turn", "user:owner"), 1);
+    assert_eq!(spawn_admission::queue_depth(home, CLASS), 2, "a SQLite child's completion must preserve its live origin's tickets");
+    for ticket_id in ticket_ids {
+        let ticket = spawn_admission::dequeue_next(home, CLASS).ticket.unwrap();
+        assert_eq!(ticket.ticket_id, ticket_id);
+        assert_eq!(ticket.payload["turn_id"], "origin-turn");
+    }
+    drop(origin_guard);
+}
+
+#[tokio::test]
 async fn downstream_ephemeral_child_completion_keeps_two_queued_owner_tickets_and_replay_fences_cancel() {
     use crate::ephemeral::{self, EphemeralSpawnSpec, EPHEMERAL_ADMISSION_CLASS as CLASS};
     use duduclaw_core::spawn_admission::{self, AdmissionConfig};
