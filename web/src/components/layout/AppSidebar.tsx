@@ -13,8 +13,13 @@ import {
   Bell,
   Languages,
   ArrowRight,
+  MoreHorizontal,
 } from 'lucide-react';
+import { EmployeeAccountMenu } from './EmployeeAccountMenu';
 import { cn } from '@/lib/utils';
+import { api } from '@/lib/api';
+import { toast, formatError } from '@/lib/toast';
+import { sortPrimaryStaff } from '@/lib/primary-agent';
 import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
@@ -55,6 +60,8 @@ import {
 } from '@/components/mds';
 import {
   dailyItems,
+  employeeNavItems,
+  isEmployeeSidebar,
   inboxEntry,
   navGroups,
   personalAdvancedGroup,
@@ -223,23 +230,43 @@ function StaffZone({
   collapsed,
   sectionCollapsed,
   onToggle,
+  employee = false,
 }: {
   collapsed: boolean;
   sectionCollapsed: boolean;
   onToggle: () => void;
+  employee?: boolean;
 }) {
   const intl = useIntl();
   const agents = useVisibleAgents();
+  const bindings = useAuthStore((s) => s.bindings);
+  const primaryAgent = useAuthStore((s) => s.user?.primary_agent_id);
+  const [settingPrimary, setSettingPrimary] = useState(false);
+  const setPrimary = async (agent: string) => {
+    setSettingPrimary(true);
+    const subject = useAuthStore.getState().user?.id;
+    try {
+      await api.users.setPrimaryAgent(agent);
+      const me = await api.users.me();
+      if (subject && useAuthStore.getState().user?.id === subject) {
+        useAuthStore.getState().setUser(me.user, me.bindings);
+      }
+    } catch (error) { toast.error(formatError(error)); }
+    finally { setSettingPrimary(false); }
+  };
   const navClass = useNavClass(collapsed);
 
   const shown = useMemo(() => {
+    if (employee) {
+      return sortPrimaryStaff(agents, bindings, primaryAgent).slice(0, 8);
+    }
     const active = agents.filter((a) => a.status === 'active');
     if (active.length > 0) return active.slice(0, LIVE_LIMIT);
     return agents.slice(0, RECENT_LIMIT);
-  }, [agents]);
+  }, [agents, bindings, employee, primaryAgent]);
 
   if (collapsed) {
-    if (shown.length === 0) return null;
+    if (shown.length === 0 && !employee) return null;
     return (
       <SidebarGroup>
         <SidebarMenu>
@@ -260,6 +287,13 @@ function StaffZone({
               </NavLink>
             </SidebarMenuItem>
           ))}
+          {employee && <SidebarMenuItem>
+            <NavLink to={staffEntry.to} className={navClass}
+              title={intl.formatMessage({ id: 'sidebar.employeeAllStaff' })}
+              aria-label={intl.formatMessage({ id: 'sidebar.employeeAllStaff' })}>
+              <ArrowRight className="size-4" />
+            </NavLink>
+          </SidebarMenuItem>}
         </SidebarMenu>
       </SidebarGroup>
     );
@@ -287,7 +321,7 @@ function StaffZone({
               <SidebarMenuItem key={a.name}>
                 <NavLink
                   to={`/agents/${encodeURIComponent(a.name)}`}
-                  className={navClass}
+                  className={({ isActive }) => cn(navClass({ isActive }), employee && "pr-9")}
                 >
                   <ActorAvatar
                     actorType="agent"
@@ -297,7 +331,18 @@ function StaffZone({
                     status={AGENT_STATUS_DOT[a.status] ?? 'offline'}
                   />
                   <span className="min-w-0 flex-1 truncate">{a.display_name}{a.readOnly && <span className="block text-[10px] text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span>}</span>
+                  {employee && a.name === primaryAgent && <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'sidebar.primaryAgent' })}</span>}
                 </NavLink>
+                {employee && <DropdownMenu>
+                  <DropdownMenuTrigger render={<Button variant="ghost" size="icon" className="absolute right-1 top-1 size-6" aria-label={intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })} />}>
+                    <MoreHorizontal className="size-4" />
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent>
+                    <DropdownMenuItem disabled={settingPrimary || a.name === primaryAgent} onClick={() => void setPrimary(a.name)}>
+                      {intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>}
               </SidebarMenuItem>
             ))
           )}
@@ -307,7 +352,7 @@ function StaffZone({
               data-tour={`nav:${staffEntry.to}`}
               className={cn(sidebarMenuButtonVariants({ size: 'sm' }), 'px-2 text-brand hover:text-brand')}
             >
-              <span className="flex-1 truncate">{intl.formatMessage({ id: 'sidebar.allStaff' })}</span>
+              <span className="flex-1 truncate">{intl.formatMessage({ id: employee ? 'sidebar.employeeAllStaff' : 'sidebar.allStaff' })}</span>
               <ArrowRight className="size-3.5" />
             </NavLink>
           </SidebarMenuItem>
@@ -318,7 +363,7 @@ function StaffZone({
 }
 
 /** Company / workspace switcher (spec §5.1 header). */
-function CompanySwitcher({ collapsed }: { collapsed: boolean }) {
+function CompanySwitcher({ collapsed, employee = false }: { collapsed: boolean; employee?: boolean }) {
   const intl = useIntl();
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
@@ -333,6 +378,13 @@ function CompanySwitcher({ collapsed }: { collapsed: boolean }) {
 
   // C1 mark at nav size (28 px); no chip behind it (logo usage rules).
   const logoNode = <ProductLogo size={28} title={brandName} />;
+
+  if (employee) return (
+    <div className={cn("flex items-center gap-2 p-1.5", collapsed && "justify-center")} >
+      {logoNode}
+      {!collapsed && <span className="truncate text-sm font-medium">{brandName}</span>}
+    </div>
+  );
 
   return (
     <DropdownMenu>
@@ -477,6 +529,8 @@ export function AppSidebar() {
 
   const user = useAuthStore((s) => s.user);
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
+  const employee = isEmployeeSidebar(user?.role, isPersonal);
+  const employeeTasks = useSystemStore((s) => s.status?.employee_tasks) === true;
   const bindings = useAuthStore((s) => s.bindings);
   const hasOperatorAccess = bindings.some(
     (b) => b.access_level === 'owner' || b.access_level === 'operator',
@@ -530,7 +584,7 @@ export function AppSidebar() {
   const orgItems = filterVisible(navGroups[3].items, user?.role, isPersonal, ctx);
   // The daily row is shared by both editions; Personal adds a second flat row
   // BELOW the 對話紀錄 zone so the zone lands where 對話 used to sit.
-  const dailyRow = filterVisible(dailyItems, user?.role, isPersonal, ctx);
+  const dailyRow = filterVisible(employee ? employeeNavItems(employeeTasks) : dailyItems, user?.role, isPersonal, ctx);
   const personalRow = filterVisible(personalPrimaryItems, user?.role, isPersonal, ctx);
   const advancedItems = filterVisible(personalAdvancedGroup.items, user?.role, isPersonal, ctx);
 
@@ -559,7 +613,8 @@ export function AppSidebar() {
   return (
     <>
       <SidebarHeader>
-        <CompanySwitcher collapsed={collapsed} />
+        <CompanySwitcher collapsed={collapsed} employee={employee} />
+        {employee && <SearchTrigger collapsed={collapsed} />}
         {/* UX plan I-1a: the primary action is 交辦任務 and it belongs to BOTH
             editions. The 2026-07-29 "hide work-management chrome on Personal"
             round took this button down with the task board, which left the
@@ -595,7 +650,7 @@ export function AppSidebar() {
             {intl.formatMessage({ id: 'sidebar.newTask' })}
           </Button>
         )}
-        <SearchTrigger collapsed={collapsed} />
+        {!employee && <SearchTrigger collapsed={collapsed} />}
       </SidebarHeader>
 
       <SidebarContent>
@@ -622,7 +677,7 @@ export function AppSidebar() {
 
         {/* Enterprise working area — 工作 / LIVE 員工 / 公司. Personal has no
             equivalent: its six primary surfaces are the flat row above. */}
-        {!isPersonal && (
+        {!isPersonal && !employee && (
           <>
             <NavGroupSection
               label={navGroups[0].label}
@@ -661,6 +716,10 @@ export function AppSidebar() {
           </>
         )}
 
+        {employee && <StaffZone employee collapsed={collapsed}
+          sectionCollapsed={isSectionCollapsed('navGroup.staff')}
+          onToggle={() => toggleSection('navGroup.staff')} />}
+
         {/* 對話紀錄 — moved out from under 新對話 to just above 設定 on
             2026-08-04 (WP18-B client feedback). Leading the rail with a list of
             past conversation titles pushed the six annotated primary surfaces
@@ -674,14 +733,14 @@ export function AppSidebar() {
         />
 
         {/* 設定 closes the rail on both editions… */}
-        <NavGroupSection
+        {!employee && <NavGroupSection
           label={navGroups[2].label}
           items={settingsItems}
           badgeFor={badgeFor}
           collapsed={collapsed}
           sectionCollapsed={isSectionCollapsed(navGroups[2].label)}
           onToggle={() => toggleSection(navGroups[2].label)}
-        />
+        />}
 
         {/* …with Personal's collapsed 進階 group after it (2026-07-29 IA). */}
         {isPersonal && (
@@ -697,6 +756,7 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter>
+        {employee ? <EmployeeAccountMenu key={user?.id} collapsed={collapsed} /> : <>
         {!collapsed && <EditionCard />}
         <div className={cn('flex items-center gap-1', collapsed && 'flex-col')}>
           {/* Notification bell — the only standing entry to 收件匣 since it left
@@ -752,6 +812,7 @@ export function AppSidebar() {
             />
           </span>
         </div>
+        </>}
       </SidebarFooter>
 
       <SidebarRail />

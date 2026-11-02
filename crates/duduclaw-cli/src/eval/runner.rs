@@ -330,9 +330,10 @@ impl Drop for TempPromptFile {
 /// home — a live eval run would then write tasks/memory/audit into
 /// production data even though the operator asked for an isolated run.
 ///
-/// This rewrites the duduclaw entries (identified by an `mcp-server` arg) to
-/// `DUDUCLAW_HOME = <eval home>` and returns the rewritten JSON. Non-duduclaw
-/// servers (playwright, …) are untouched. `None` ⇒ nothing needed rewriting
+/// This rewrites the duduclaw entries (identified by an `mcp-server` arg)
+/// and this executable's proxy entries to `DUDUCLAW_HOME = <eval home>`.
+/// The proxy must resolve references from the eval home, never production.
+/// External upstream servers (playwright, …) are untouched. `None` ⇒ nothing needed rewriting
 /// (already correct, or no duduclaw entry) — caller passes the original file.
 /// A parse failure also returns `None`: degrading to today's behavior beats
 /// refusing to run over a hand-edited config.
@@ -346,7 +347,12 @@ pub fn rewrite_mcp_home(raw: &str, home: &Path) -> Option<String> {
             .get("args")
             .and_then(|a| a.as_array())
             .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("mcp-server")));
-        if !is_duduclaw {
+        let is_proxy = server.get("args").and_then(|a| a.as_array())
+            .and_then(|a| a.first()).and_then(|a| a.as_str()) == Some("mcp-proxy")
+            && server.get("command").and_then(|c| c.as_str()).is_some_and(|command| {
+                std::env::current_exe().is_ok_and(|exe| Path::new(command) == exe)
+            });
+        if !is_duduclaw && !is_proxy {
             continue;
         }
         let obj = server.as_object_mut()?;
@@ -402,6 +408,36 @@ impl Drop for TempMcpFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Guards for both proxy routing and eval-home isolation, held until child exit.
+struct PreparedEvalMcp {
+    path: Option<PathBuf>,
+    _home_override: Option<TempMcpFile>,
+    _proxy: Option<tempfile::TempPath>,
+}
+
+fn prepare_eval_mcp(home: &Path, original: &Path) -> Result<PreparedEvalMcp, String> {
+    // Inspect the employee's original directory first, so action_rules and
+    // secret refs choose the same mandatory gate as a regular Claude spawn.
+    let proxy = duduclaw_gateway::redaction_proxy::maybe_proxy_mcp_config(home, original)?;
+    let source = proxy.as_ref().map(|path| path.as_ref()).unwrap_or(original);
+    let raw = match std::fs::read_to_string(source) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && proxy.is_none() => {
+            return Ok(PreparedEvalMcp { path: None, _home_override: None, _proxy: None });
+        }
+        Err(_) => return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+            "無法讀取評估使用的 MCP 代理設定，已拒絕啟動。",
+        )),
+    };
+    let home_override = rewrite_mcp_home(&raw, home)
+        .map(|rewritten| TempMcpFile::create(&rewritten))
+        .transpose()
+        .map_err(|error| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&error))?;
+    let path = home_override.as_ref().map(|guard| guard.0.clone())
+        .unwrap_or_else(|| source.to_path_buf());
+    Ok(PreparedEvalMcp { path: Some(path), _home_override: home_override, _proxy: proxy })
 }
 
 /// Spawn `claude` for the case's agent and return raw stream-json stdout.
@@ -468,34 +504,17 @@ async fn run_live(
         }
     }
     let mcp_original = agent_dir.join(".mcp.json");
-    let mut mcp_temp: Option<TempMcpFile> = None;
-    let mcp_path: Option<PathBuf> = if mcp_original.exists() {
-        match std::fs::read_to_string(&mcp_original) {
-            Ok(raw) => match rewrite_mcp_home(&raw, home) {
-                Some(rewritten) => {
-                    let guard = TempMcpFile::create(&rewritten)?;
-                    let p = guard.0.clone();
-                    mcp_temp = Some(guard);
-                    Some(p)
-                }
-                None => Some(mcp_original.clone()),
-            },
-            Err(_) => Some(mcp_original.clone()),
-        }
-    } else {
-        None
-    };
+    let mcp_config = prepare_eval_mcp(home, &mcp_original)?;
 
     let capabilities = duduclaw_gateway::runtime::load_agent_capabilities(&agent_dir);
     let args = build_eval_cli_args(
         case,
         model,
         capabilities.as_ref(),
-        mcp_path.as_deref(),
+        mcp_config.path.as_deref(),
         sys_file.as_ref().map(|f| f.0.as_path()),
         duduclaw_core::agent_toml::resolve_minimal_context(Some(&agent_dir)),
     );
-    let _keep_alive = &mcp_temp;
 
     let mut cmd = tokio::process::Command::new(&claude);
     cmd.args(&args)
@@ -520,6 +539,7 @@ async fn run_live(
         })?
         .map_err(|e| format!("claude CLI wait failed: {e}"))?;
 
+    drop(mcp_config); // Both config guards survive through wait_with_output.
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.status.success() && stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1038,6 +1058,60 @@ mod tests {
         assert!(joined.contains("--mcp-config"));
         assert!(joined.contains("--strict-mcp-config"));
         assert!(joined.contains("--system-prompt-file"));
+    }
+
+    #[test]
+    fn eval_secret_refs_are_proxied_and_resolve_only_from_eval_home() {
+        let home = tempfile::tempdir().unwrap();
+        let production = tempfile::tempdir().unwrap();
+        let secret_env = serde_json::json!({"API_KEY":"third-party-production-key"});
+        duduclaw_security::mcp_secret_store::store_mcp_env(
+            production.path(), "alice", "vendor", secret_env.as_object().unwrap(),
+        ).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let agent_dir = home.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let original = agent_dir.join(".mcp.json");
+        let identity_key = duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        let token = duduclaw_core::identity_token::mint_token(&identity_key, "alice");
+        let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+            home.path(), "alice", &duduclaw_core::resolve_duduclaw_bin(),
+        );
+        let source = serde_json::json!({"mcpServers": {
+            "duduclaw":own,
+            "vendor":{"command":"vendor-mcp", "env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}
+        }}).to_string();
+        std::fs::write(&original, &source).unwrap();
+        let prepared = prepare_eval_mcp(home.path(), &original).unwrap();
+        let final_path = prepared.path.clone().unwrap();
+        let proxy_path = prepared._proxy.as_ref().unwrap().to_path_buf();
+        let raw = std::fs::read_to_string(&final_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(config["mcpServers"]["vendor"]["args"][0], "mcp-proxy");
+        for server in ["vendor", "duduclaw"] {
+            assert_eq!(config["mcpServers"][server]["env"]["DUDUCLAW_HOME"], home.path().to_string_lossy().as_ref());
+        }
+        assert!(!raw.contains("production-sentinel"));
+        assert!(!raw.contains("third-party-production-key"));
+        let blob = config["mcpServers"]["vendor"]["env"][duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_VAR].as_str().unwrap();
+        assert!(crate::mcp_proxy_spawn_env::resolve_declared_env(
+            home.path(), Some("alice"), Some(&token), "vendor", Some(blob),
+        ).is_err(), "a valid identity with no eval secrets must never fall back to production");
+        assert!(raw.contains("secret://mcp/vendor/API_KEY"));
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), source);
+        drop(prepared);
+        assert!(!final_path.exists() && !proxy_path.exists());
+    }
+
+    #[test]
+    fn eval_secret_rewrite_failure_refuses_original_config_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{"vendor":{"env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}}}"#).unwrap();
+        let result = prepare_eval_mcp(home.path(), &path);
+        let error = result.err().expect("rewrite must refuse");
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+        assert!(!error.contains("secret://"));
     }
 
     // ── WP2.1 side-effect fix: DUDUCLAW_HOME rewrite ─────────────────

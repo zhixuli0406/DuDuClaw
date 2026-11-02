@@ -1,6 +1,6 @@
 # ブラウザ自動化と Computer Use
 
-> 素の HTTP フェッチから仮想デスクトップまで：組み込みの取得ツール 2 つ、任意の外部ブラウザサーバー、そして隔離されたコンテナ内の Computer Use セッションです。セッションはスタッフが 8 つの `computer_*` MCP ツールで駆動します。自動ルーターは存在しません。
+> 素の HTTP フェッチから仮想デスクトップまで：組み込みの取得ツール 2 つ、任意の外部ブラウザサーバー、そして隔離されたコンテナ内の Computer Use セッションです。セッションはスタッフが 9 つの `computer_*` MCP ツールで駆動します。自動ルーターは存在しません。
 
 ---
 
@@ -58,7 +58,7 @@ DuDuClaw のバイナリには含まれず、L2 からここへのフォール�
 
 ### L5 — Computer Use
 
-Computer Use の経路は 1 つです：スタッフが 8 つの `computer_*` MCP ツールを呼び出し、各ステップを自分で決めます。スタッフに `[capabilities] computer_use = true` が必要です。DuDuClaw の MCP ツールを受け取る CLI を持つランタイムであれば、どれからでも動きます（[マルチランタイム](13-multi-runtime.md)を参照）。Anthropic API キーは使いません。
+Computer Use の経路は 1 つです：スタッフが 9 つの `computer_*` MCP ツールを呼び出し、各ステップを自分で決めます。スタッフに `[capabilities] computer_use = true` が必要です。DuDuClaw の MCP ツールを受け取る CLI を持つランタイムであれば、どれからでも動きます（[マルチランタイム](13-multi-runtime.md)を参照）。Anthropic API キーは使いません。
 
 | ツール | パラメータ | 動作 |
 |---|---|---|
@@ -66,6 +66,7 @@ Computer Use の経路は 1 つです：スタッフが 8 つの `computer_*` MC
 | `computer_screenshot` | なし | マスク済みの画面を MCP の画像ブロック（PNG）で返し、使用済みアクション数と残り時間のテキスト行を付ける。画像全体を隠す必要があった場合、テキストにその旨、理由、次にすべきことが書かれる。アクションはスクリーンショットを返さないため、結果の確認にはこれを呼ぶ |
 | `computer_click` | `x`、`y`（整数、スクリーンショットのピクセル、0 始まり）、`button`（`left` が既定、または `right`）、`double`（真偽値、左ボタンのみ） | クリック 1 回 |
 | `computer_type` | `text`（文字列、1–2,000 文字） | フォーカス中の要素に入力する |
+| `computer_login` | `credential`（必須、認証情報のラベル文字列） | 許可されたスタッフのログインを gateway が入力・送信し、状態と説明だけを返す |
 | `computer_key` | `key`（文字列、英字・数字・`+`・`-`・`_`、最大 64 文字。例：`Return`、`ctrl+s`） | キーまたは組み合わせを押す。無効なキーは拒否され、別のキーに置き換えられることはない |
 | `computer_scroll` | `x`、`y`（整数）、`direction`（`up` または `down`、既定 `down`）、`amount`（整数 1–20、既定 3） | そのピクセル位置にポインタを置いてスクロールする |
 | `computer_navigate` | `url`（文字列） | コンテナ内のブラウザでページを開く。ブラウザはアドレスバーのないキオスクモードで動くため、ページを開く手段はこれだけ |
@@ -77,7 +78,7 @@ Computer Use の経路は 1 つです：スタッフが 8 つの `computer_*` MC
 
 - **スタッフごとにセッションは 1 つ。** セッションが生きている間の 2 回目の `computer_session_start` は拒否され、生きているセッションが示されます。そのスタッフだけがそれを見て駆動できます。
 - **gateway 全体で同時に 5 セッション。**
-- **上限。** セッションは `max_session_minutes`（既定 10）の経過、操作が 2 分間ないこと（承認待ち、ダッシュボードでの視聴中、人による引き継ぎ中はアイドルに数えません。`keep_alive_minutes` を設定すると代わりにコンテナを一時停止します。[アイドル保持・ライブ表示・引き継ぎ](#アイドル保持ライブ表示引き継ぎ)を参照）、または `computer_session_stop` で終了します。クリック、入力、キー、スクロール、ナビゲートの各操作は `max_actions`（既定 50）に数えられ、スクリーンショットは数えられません。予算を使い切った後も、セッションはスクリーンショットと停止だけは行えます。
+- **上限。** セッションは `max_session_minutes`（既定 10）の経過、操作が 2 分間ないこと（承認待ち、ダッシュボードでの視聴中、人による引き継ぎ中はアイドルに数えません。`keep_alive_minutes` を設定すると代わりにコンテナを一時停止します。[アイドル保持・ライブ表示・引き継ぎ](#アイドル保持ライブ表示引き継ぎ)を参照）、または `computer_session_stop` で終了します。クリック、入力、ログイン、キー、スクロール、ナビゲートの各操作は `max_actions`（既定 50）に数えられ、スクリーンショットは数えられません。予算を使い切った後も、セッションはスクリーンショットと停止だけは行えます。
 - **拒否される呼び出し元とモード。** エフェメラルエージェント（親のケイパビリティをコピーする Team-as-Agent のロールメンバーを含む）はセッションを開始できません。`[capabilities] computer_use_mode` が `"native"` のスタッフは、エラーコード `native_unsupported` と、このモードは削除されたのでキーを削除するか `"container"` に設定するよう伝えるメッセージで拒否されます。コンテナへの暗黙のフォールバックはありません。`"auto"` またはキーなしは `"container"` と同じ動作です。
 - **脅威レベル。** 新しいセッションは `~/.duduclaw/threat_level` が GREEN（または存在しない）の間だけ開始されます。YELLOW ではスクリーンショットと停止のみ、RED ではすべてのセッションが終了します。緊急停止ワード（`停止`、`stop`、`abort`、`やめて` など）そのものであるチャットメッセージは、すべての Computer Use セッションを終了させます。
 - **クリーンアップ。** リーパーが 15 秒ごとに、期限切れまたはアイドル上限を超えたセッションを確認します。コンテナには所有する DuDuClaw ホストを示すラベルと期限ラベルが付きます。gateway 起動時とその後 10 分ごとのスイープが、このホストのコンテナのうち、終了済みのもの、または期限を 10 分以上過ぎたものを削除し、Docker を一覧できない場合は何も削除しません。
@@ -86,7 +87,7 @@ Computer Use の経路は 1 つです：スタッフが 8 つの `computer_*` MC
 gateway 自身が適用するゲート。この経路は MCP ディスパッチャを通らずに到達できるためです：
 
 - `[capabilities] denied_tools` / `allowed_tools` と `scoped_tools`（リストにあるツールは有効なタスクスコープのグラントが必要）は、ツール自身の名前で、すべての操作についてチェックされます。
-- `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools` に挙げられたツールは、ApprovalBroker を通じて人間の判断を待ちます（最大 300 秒。回答がなければ拒否として扱う）。maybe-irreversible の `computer_*` ツールは常に確認され、ここにモデルによる判定はありません。承認テキストにはツール名が書かれ、`computer_type` では文字数だけ、`computer_navigate` では検証済みのホストだけ（パスもクエリもなし）が書かれます。`computer_navigate` の URL は何かを尋ねる前に検証されるため、拒否される URL が承認リクエストを作ることはありません。MCP 側の承認ゲートはこの 8 つのツールをスキップするので、二重に確認されることはありません。
+- `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools` に挙げられたツールは、ApprovalBroker を通じて人間の判断を待ちます（最大 300 秒。回答がなければ拒否として扱う）。maybe-irreversible の `computer_*` ツールは常に確認され、ここにモデルによる判定はありません。承認テキストにはツール名が書かれ、`computer_type` では文字数だけ、`computer_navigate` では検証済みのホストだけ（パスもクエリもなし）が書かれます。`computer_navigate` の URL は何かを尋ねる前に検証されるため、拒否される URL が承認リクエストを作ることはありません。MCP 側の承認ゲートはこの 9 つのツールをスキップするので、二重に確認されることはありません。
 - すべてのアクションは、固定のルール（`risk_detector.rs`）でリスク評価されます。フォーカス中のウィンドウのタイトルが `blocked_actions`（既定 `delete_file`、`terminal`、`system_preferences`）に一致する場合、`CONTRACT.toml` の `[must_not] rules` の項目に一致する場合、またはフォーカス中のウィンドウのタイトルを読み取れない場合、アクションは拒否されます。高リスクのアクション（機密フィールドに向けた入力、認証情報に見えるテキストの入力、空でない `allowed_apps` の外にあるウィンドウ）は、ツール呼び出しがチャネルの会話に返信しているターンから来ている場合、会話のチャネルで人が 60 秒以内に確認する必要があります。gateway はそのチャネルを、リクエストからではなく、スタッフの実行中ターンについての自身の記録から見つけます。確認を求めるチャネルがない場合（スケジュール実行、委任されたタスク）、高リスクのアクションは拒否されます。`auto_confirm_trusted = true` は確認を省略します。
 
 #### チャットで起動するループはどうなったか
@@ -165,13 +166,27 @@ allowed_domains = ["example.com", "docs.example.com"]
 
 ---
 
+## パスワードをモデルに渡さないサイトログイン
+
+管理者は **システム → セキュリティ → Web サイトのログイン情報** で、ラベル、HTTPS ログイン URL（`login_url`）、ユーザー名、パスワード、使用を許可する 1 人以上の AI スタッフを保存します。Gateway は URL を正規化し、そこからオリジンと正確なパスを保存します。ユーザー情報、クエリ、フラグメントは使えません。任意の `allowed_paths` は同じオリジン内の二段階目用の正確なパスで、既定値は空のリストです。パスワードはこのフォームにのみ入力し、チャットには貼らないでください。保存したパスワードがフォームに戻ることはなく、編集時も再入力が必要です。使用前に Computer Use コンテナイメージを再ビルドし、更新した `duduclaw-fill-login` ヘルパーを含めてください。
+
+スタッフは `computer_login` に `{"credential":"仕事用アカウント"}` だけを渡します。Gateway は検証済みのスタッフ ID を `allowed_agents` と照合し、独立した `computer_login` 名でセッション、ツール、スコープ、承認のチェックを行います。セッションの開始・状態レスポンスには、そのスタッフが使えるラベルだけが表示され、ユーザー名は含まれません。Gateway は既存のナビゲーション検査を通して保存済みの `login_url` を開き（ナビゲーションとログインはそれぞれ 1 アクションを消費します）、派生した `origin`、`login_path`、任意の `allowed_paths` と認証情報を stdin で 1 つのコンテナヘルパーに送ります。同じ呼び出しで入力と送信を行い、モデルが間に操作を挟むことはできません。最初の入力は正確なオリジンとログインパスが一致する場合だけです。二段階目はヘルパーが最初のフォームを送信した後に到達した同じオリジンのページで、表示されたパスワード欄があり、パスが `login_path` または `allowed_paths` と一致する場合に限ります。追加パスで最初の入力はできません。
+
+ヘルパーは入力前と同期 input/change イベント後に、フォームが認証情報と同じ正確なオリジンへ POST で送信することを確認します。ネイティブの `requestSubmit` と代替経路の両方で、選択した送信ボタンの `formmethod` を検査し、同期 submit ハンドラーの後にも送信方法を再確認します。ネットワーク側でも、デコードしたクエリ値が完全なユーザー名またはパスワードと一致する非 POST リクエストを拒否します。submit ハンドラーが POST を GET に変更した場合も対象です。GET または既定の GET フォームには入力しません。処理中は CDP Fetch で各リクエストとリダイレクトの各段階を検査し、別オリジンへのリクエストを中止して `failed` を返します。サービスワーカーも迂回します。別のオリジンがネットワーク許可リストにあっても、307/308 で POST 本文を転送できません。
+
+インターセプトを解除する前に、ヘルパーは `Network.requestWillBeSent`、`Network.loadingFinished`、`Network.loadingFailed` を追跡し、リクエストの終了を確認します。最大 3 秒待機し、保留リクエストも新しい活動もないコマンド往復が 2 回連続することを要求します。完了を確認できない場合は `failed_uncleared` とし、Fetch の制限を維持したまま `Browser.close` を呼び出して、その後 Gateway がセッションとコンテナを削除します。
+
+ツールが返すのは状態と短い説明だけで、パスワードやスクリーンショットは返しません。`logged_in` はパスワード欄が消えたことを表し、サーバー上のアカウント状態を別途検証したという意味ではありません。`needs_takeover` は二要素認証や CAPTCHA のために人が既存の引き継ぎ機能を使う必要があることを表します。モデル用の OTP 入力経路はありません。失敗または引き継ぎ時には、ユーザー名とパスワードを消去します。消去を確認できない場合（`failed_uncleared`）、Gateway はセッションとコンテナを停止・削除し、新しいセッションの開始を求めるエラーを返します。ナビゲーションでそのセッションを再利用することはできません。ログイン処理中はスクリーンショットを抑止します。ページのオリジン、パス、フォームのオリジンが違えばログインを拒否します。
+
+保存したオリジン（スキーム、ホスト、ポート）だけが対象で、スタッフのネットワーク許可リストは拡大しません。localhost を含め HTTPS が必要です。**信頼するログインページの JavaScript は入力済みの欄を読み取れます。** Gateway はパスワードをモデルへ直接渡しませんが、信頼できないサイトを安全にするものではありません。信頼できるサイトのログイン情報だけを保存してください。
+
 ## セキュリティ：デフォルト拒否
 
 L2 より上のすべての層は `agent.toml` での明示的な承認を必要とします：
 
 ```toml
 [capabilities]
-computer_use = false        # Computer Use セッションと 8 つの computer_* ツール
+computer_use = false        # Computer Use セッションと 9 つの computer_* ツール
 browser_via_bash = false    # Bash ツール呼び出しからのブラウザ起動
 allowed_tools = [...]       # 許可リスト
 denied_tools = [...]        # 拒否リスト
@@ -180,7 +195,7 @@ denied_tools = [...]        # 拒否リスト
 allowed_domains = []        # computer_navigate が開けるサイト。空 = ネットワークなし
 ```
 
-- `computer_use = false`（既定）では、gateway はそのスタッフの Computer Use セッションを開始せず、8 つの `computer_*` ツールは `tools/list` から隠され、直接の呼び出しは拒否されます。判定は fail-closed で、ファイル不在・TOML 破損・キーの型違いはいずれも拒否です。gateway はセッション中もこの設定を読み直し、オフにするとセッションは次の操作で終了します。
+- `computer_use = false`（既定）では、gateway はそのスタッフの Computer Use セッションを開始せず、9 つの `computer_*` ツールは `tools/list` から隠され、直接の呼び出しは拒否されます。判定は fail-closed で、ファイル不在・TOML 破損・キーの型違いはいずれも拒否です。gateway はセッション中もこの設定を読み直し、オフにするとセッションは次の操作で終了します。
 - `denied_tools` は CLI に `--disallowedTools` として渡されると**同時に** MCP ディスパッチャのフロントドアでも強制されます。
 - `browser_via_bash` はもう環境フラグを設定しません。`DUDUCLAW_BROWSER_VIA_BASH` を読んでいた `bash-gate.sh` の許可リストは、他のシェルフックとともに `ba015a48` で削除されました。ケイパビリティ自体は有効で、`disallowed_tools()` と `CapabilitiesConfig::sandbox_level()` に供給されます。後者は codex / gemini ランタイムが `ReadOnly` と `WorkspaceWrite` のどちらのサンドボックスにするかを決める根拠です。
 - 死んだルーターのフィールドとしてのみ存在した制限ノブ（信頼／ブロックドメイン、セッションあたりのページ上限）は、その形では実装されませんでした。代わりに存在するのは、スタッフ単位のサイト許可リスト（上の `allowed_domains`）、セッションのアクション予算、チャットでの高リスク確認、そして `ApprovalBroker` と `agent.toml [capabilities] approval_required_tools` / `irreversible_tools` / `maybe_irreversible_tools` による承認ゲートで、これは他のツールと同様に `computer_*` ツールにも適用されます。スクリーンショット監査は切り替えではありません：常に書き込まれます（下の監査ログの項を参照）。
@@ -205,7 +220,7 @@ L1 で答えが出る問いに L5 を持ち出すのが最も高くつく間違�
 - **コンテナ分離** — L5 は専用の Docker コンテナ（既定イメージ `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway のバージョン>`、自動 pull なし）で動きます。読み取り専用ルートファイルシステム、256 MB の tmpfs `/tmp`、CPU 1、メモリ 512 MB、プロセス 512（Chromium のスレッドもこの上限に数えられます）。セッションが許可リストのホストを解決できた場合を除き `--network=none` で、その場合は `--network bridge`、ピン留めされたホスト、ドメインフィルタ用の `NET_ADMIN` が追加されます（上のネットワークの段落を参照）。すべての Computer Use コンテナは `--security-opt no-new-privileges` 付きで動きます。このコンテナは `computer_use_orchestrator` が起動するもので、エージェント単位のタスクサンドボックスとは別物です（[タスクサンドボックスガイド](../../guides/ja-JP/task-sandbox.md)を参照）。
 - **セキュリティ防御** — ケイパビリティの強制と監査証跡は [05-security-defense.md](05-security-defense.md) を参照。
 - **常駐センシング** — `http_poll` / `websocket` のティックソースは L1 と同じ SSRF ゲートを共有します。[41-resident-sensing.md](41-resident-sensing.md) を参照。
-- **監査ログ** — 8 つの `computer_*` ツールはすべて `tool_calls.jsonl` に記録され、入力は縮約されます：`computer_type` は文字数のみ、`computer_navigate` はホストとパスの長さ（クエリ文字列なし）、`computer_screenshot` は画像なしです。`web_fetch_cached` と `web_extract` は読み取り専用のため記録されません。セッションは、ハッシュチェーン付きの行（tier `L5a`）を `~/.duduclaw/audit/browser/audit.jsonl` にも追記し（セッションの開始と終了、`fully_masked` と `mask_reason` を持つ各スクリーンショット、リスク評価付きの各アクション、ホストとパスを持つ各ナビゲーション（クエリなし）、各拒否。入力したテキストはここでも文字数のみ）、マスク済みのスクリーンショットを `~/.duduclaw/audit/browser/screenshots/<agent_id>/` に保存します。スクリーンショットはスタッフごとに 7 日間、最大 500 ファイルまたは 200 MiB まで保持され、古いものから削除されます。`audit.jsonl` は 16 MiB を超えると `audit.jsonl.old` にローテーションされます。詳細は[開発ガイド第 5 節](../../guides/ja-JP/development-guide.md#5-監査とモニタリング)を参照してください。
+- **監査ログ** — 9 つの `computer_*` ツールはすべて `tool_calls.jsonl` に記録され、入力は縮約されます：`computer_type` は文字数のみ、`computer_navigate` はホストとパスの長さ（クエリ文字列なし）、`computer_screenshot` は画像なしです。`web_fetch_cached` と `web_extract` は読み取り専用のため記録されません。セッションは、ハッシュチェーン付きの行（tier `L5a`）を `~/.duduclaw/audit/browser/audit.jsonl` にも追記し（セッションの開始と終了、`fully_masked` と `mask_reason` を持つ各スクリーンショット、リスク評価付きの各アクション、ホストとパスを持つ各ナビゲーション（クエリなし）、各拒否。入力したテキストはここでも文字数のみ）、マスク済みのスクリーンショットを `~/.duduclaw/audit/browser/screenshots/<agent_id>/` に保存します。スクリーンショットはスタッフごとに 7 日間、最大 500 ファイルまたは 200 MiB まで保持され、古いものから削除されます。`audit.jsonl` は 16 MiB を超えると `audit.jsonl.old` にローテーションされます。詳細は[開発ガイド第 5 節](../../guides/ja-JP/development-guide.md#5-監査とモニタリング)を参照してください。
 
 ---
 
@@ -258,7 +273,7 @@ gateway は視聴側のプロトコル（RFB 3.7/3.8）を読みます：キー�
 
 「引き継ぐ」を押すと、そのアカウントがセッションの引き継ぎ権を持ちます。保持中は：
 
-- 従業員の `computer_click`、`computer_type`、`computer_key`、`computer_scroll`、`computer_navigate`、`computer_workspace_write` はすべて `human_has_control` で拒否され、待つよう伝えられます。スクリーンショット、状態確認、終了は従来どおりで、スクリーンショットのマスクも従来どおりです。
+- 従業員の `computer_click`、`computer_type`、`computer_login`、`computer_key`、`computer_scroll`、`computer_navigate`、`computer_workspace_write` はすべて `human_has_control` で拒否され、待つよう伝えられます。スクリーンショット、状態確認、終了は従来どおりで、スクリーンショットのマスクも従来どおりです。
 - ストリームは入力モードと新しいパスワードで再起動し、保持者のキーボードとマウスだけが画面に届きます。
 - セッションはアイドルで終了も一時停止もしません。
 

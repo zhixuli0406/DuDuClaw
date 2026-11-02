@@ -642,7 +642,7 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 
 ### タスクサンドボックスが起動しない
 
-これは `agent.toml [container] sandbox_enabled = true` の社員にのみ該当します。公式イメージは、コンテナ内の gateway からのタスクサンドボックスに対応していません。イメージに Docker client がなく、既定の compose も `docker.sock` をマウントしません。タスクサンドボックスが必要な場合は、gateway をホストにインストールしてください（[task-sandbox.md](task-sandbox.md) を参照）。
+これは `agent.toml [container] sandbox_enabled = true` の社員にのみ該当します。公式イメージは、コンテナ内の gateway からのタスクサンドボックスに対応していません。イメージには `docker.io` クライアントが含まれますが、既定の compose は `docker.sock` をマウントしません。タスクサンドボックスが必要な場合は、gateway をホストにインストールしてください（[task-sandbox.md](task-sandbox.md) を参照）。
 
 ### Codex 社員のシェルコマンドが実行できない
 

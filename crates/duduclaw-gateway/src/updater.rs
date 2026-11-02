@@ -33,8 +33,8 @@ const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
 /// Every release asset must ship a `<asset>.minisig` signed by the matching
 /// secret key (CI `MINISIGN_SECRET_KEY` secret / `~/.minisign/duduclaw-release.key`).
 /// Rotating the key requires shipping a release signed by the OLD key that
-/// contains the NEW key here.
-pub(crate) const UPDATE_PUBKEY: &str = "RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh";
+/// contains the NEW shared `OFFICIAL_PUBLISHER_KEY` constant.
+pub(crate) const UPDATE_PUBKEY: &str = duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY;
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
 /// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
 pub fn current_version() -> &'static str {
@@ -224,6 +224,16 @@ pub struct ApplyResult {
     pub success: bool,
     pub message: String,
     pub needs_restart: bool,
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "serialize_macos_restart_hint")]
+    pub restart_hint: Option<&'static str>,
+}
+
+fn serialize_macos_restart_hint<S>(hint: &Option<&'static str>, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    #[cfg(target_os = "macos")]
+    { serde::Serialize::serialize(hint, serializer) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = hint; serde::Serialize::serialize(&Option::<&str>::None, serializer) }
 }
 
 /// Progress signal emitted while an update is being applied, so the dashboard
@@ -814,6 +824,7 @@ pub async fn apply_update_with_progress(
                       keep receiving updates."
                 .to_string(),
             needs_restart: false,
+            restart_hint: None,
         });
     }
 
@@ -1212,7 +1223,30 @@ async fn apply_update_inner(
         success: true,
         message: "Update installed. The service will restart automatically.".into(),
         needs_restart: true,
+        restart_hint: macos_launchd_restart_hint(),
     })
+}
+
+pub fn macos_launchd_restart_hint() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().unwrap_or_default();
+        let registered = std::env::var_os("XPC_SERVICE_NAME").is_some()
+            || [duduclaw_core::autostart::LAUNCHD_LABEL, duduclaw_core::autostart::LEGACY_LAUNCHD_LABEL]
+                .iter().any(|label| duduclaw_core::autostart::launchd_plist_path_in(&home, label).exists());
+        return registered.then_some("duduclaw service restart");
+    }
+    #[cfg(not(target_os = "macos"))]
+    { None }
+}
+
+#[cfg(test)]
+mod restart_hint_tests {
+    #[test]
+    fn restart_hint_is_absent_off_macos() {
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(super::macos_launchd_restart_hint(), None);
+    }
 }
 
 /// Claim the update slot for a restart onto the on-disk binary. Never

@@ -364,7 +364,7 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
             }
         }
         if mfa_actor.is_none() && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
-            if let Err(error) = crate::mfa::refuse_policy_change(&current, &new_content) {
+            if let Err(error) = crate::mfa::refuse_policy_change_at(path.parent().unwrap_or(Path::new(".")), &current, &new_content) {
                 return Ok(Err(error));
             }
         }
@@ -410,6 +410,82 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
         },
         Err(e) => Err(format!("failed to write {}: {e}", path.display())),
     }
+}
+
+/// Read only a regular config, refusing links even when the target is missing.
+/// O_NOFOLLOW closes the metadata-to-open symlink window on Unix.
+pub(crate) fn read_regular_config(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("config.toml must be a regular file"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Early boot adapter: source lock then config lock, before dashboard services
+/// exist. The caller may only provision gateway metadata and restore MFA state.
+/// Ordinary commit adapters reject the absent-auth -> enforced repair.
+pub(crate) fn commit_boot_config<T>(
+    home: &Path,
+    render: impl FnOnce(&str, bool) -> Result<(T, Option<String>), String>,
+) -> Result<T, String> {
+    std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+    crate::google_identity::home_source::with_source_guard(home, |_| {
+        Ok(duduclaw_core::with_file_lock(&home.join("config.toml"), || {
+            let path = home.join("config.toml");
+            let check = || -> std::io::Result<()> {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(m) if !m.is_file() || m.file_type().is_symlink() =>
+                        Err(std::io::Error::other("config.toml must be a regular file")),
+                    Ok(_) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                }
+            };
+            check()?;
+            let (current, missing) = match read_regular_config(&path) {
+                Ok(text) => (text, false),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
+                Err(e) => return Err(e),
+            };
+            let (result, rendered) = render(&current, missing).map_err(std::io::Error::other)?;
+            if let Some(rendered) = rendered {
+                use std::io::Write;
+                let tmp = home.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                }
+                let mut file = opts.open(&tmp)?;
+                let write = (|| {
+                    file.write_all(rendered.as_bytes())?;
+                    file.sync_all()?;
+                    check()?;
+                    std::fs::rename(&tmp, &path)?;
+                    #[cfg(unix)]
+                    std::fs::File::open(home)?.sync_all()?;
+                    Ok::<_, std::io::Error>(())
+                })();
+                if write.is_err() { let _ = std::fs::remove_file(&tmp); }
+                write?;
+            }
+            Ok(result)
+        }).map_err(|e| format!("boot config commit failed: {e}")))
+    }).map_err(|e| e.to_string())?
 }
 
 fn changed_on_disk(path: &Path) -> String {
@@ -1029,6 +1105,25 @@ mod mfa_guard_tests {
         commit_text_locked(&path, &content_hash(original),
             "[auth]\nmfa_enforced=true\n[general]\nlog_level='debug'\n").unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("log_level"));
+    }
+
+    #[test]
+    fn admin_can_explicitly_disable_after_auth_table_is_lost() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "[gateway]\nport=18789\n";
+        std::fs::write(&path, original).unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        crate::mfa::reload_policy(home.path());
+        let next: toml::Table = "[gateway]\nport=18789\n[auth]\nmfa_enforced=false\n".parse().unwrap();
+        assert!(commit_text_locked(&path, &content_hash(original), &toml::to_string(&next).unwrap()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        commit_mfa_table_inner(&path, &content_hash(original), &next, "test-admin", || Ok(())).unwrap();
+        crate::mfa::reload_policy(home.path());
+        assert!(!policy_value(home.path()));
+        assert!(!crate::mfa::enforced(home.path(), false).unwrap());
     }
 
     #[test]

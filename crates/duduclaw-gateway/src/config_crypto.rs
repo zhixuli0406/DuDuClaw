@@ -178,51 +178,57 @@ fn load_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
 /// stay read-only via [`load_keyfile`] so a missing keyfile never silently
 /// destroys an existing ciphertext.
 ///
-/// Returns `None` only when keyfile creation itself fails (RNG failure,
-/// disk full, permission denied) — those cases are logged at `error!`.
+/// Returns `None` on creation/read failure, an invalid existing key, or a
+/// missing key with existing MCP ciphertext. Never replaces such a key.
 fn load_or_create_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
-    if let Some(key) = load_keyfile(home_dir) {
-        return Some(key);
-    }
-
-    // Ensure home_dir exists so the write below can succeed on a fresh install.
-    if !home_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(home_dir) {
-            tracing::error!(
-                path = %home_dir.display(),
-                "Failed to create DuDuClaw home dir for keyfile: {e}"
-            );
-            return None;
+    use std::io::Write;
+    let path = home_dir.join(".keyfile");
+    // Share the key-init lock with the MCP secret store. Re-read under the
+    // lock so a simultaneous first credential write never rotates its key.
+    let result = duduclaw_core::with_file_lock(&path, || {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                return load_keyfile(home_dir).ok_or_else(|| std::io::Error::other("invalid machine key"));
+            }
+            Ok(_) => return Err(std::io::Error::other("machine key is not a regular file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-    }
-
-    let key = match duduclaw_security::crypto::CryptoEngine::generate_key() {
-        Ok(k) => k,
+        for dir in [home_dir.join("secrets/mcp"), home_dir.join("backups/mcp-migrate")] {
+            match std::fs::read_dir(dir) {
+                Ok(files) => {
+                    for file in files {
+                        if file?.path().extension().is_some_and(|ext| ext == "enc") {
+                            return Err(std::io::Error::other("machine key missing for existing MCP secrets"));
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let key = duduclaw_security::crypto::CryptoEngine::generate_key()
+            .map_err(|_| std::io::Error::other("machine key generation failed"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        duduclaw_core::platform::set_owner_only(&path)?;
+        file.write_all(&key)?;
+        file.sync_all()?;
+        Ok(key)
+    });
+    match result {
+        Ok(key) => Some(key),
         Err(e) => {
-            tracing::error!("Failed to generate AES-256 keyfile (RNG failure): {e}");
-            return None;
+            tracing::error!("Cannot load or create machine encryption key: {e}");
+            None
         }
-    };
-
-    let keyfile = home_dir.join(".keyfile");
-    if let Err(e) = std::fs::write(&keyfile, key) {
-        tracing::error!(
-            path = %keyfile.display(),
-            "Failed to write new keyfile: {e}"
-        );
-        return None;
     }
-
-    // Tighten permissions to owner-only — best-effort, don't fail the write.
-    if let Err(e) = duduclaw_core::platform::set_owner_only(&keyfile) {
-        tracing::warn!(
-            path = %keyfile.display(),
-            "Could not tighten keyfile permissions to owner-only: {e}"
-        );
-    }
-
-    tracing::info!(path = %keyfile.display(), "Generated new AES-256 keyfile");
-    Some(key)
 }
 
 /// Decrypt a base64-encoded encrypted value using the per-machine keyfile.
@@ -1130,6 +1136,40 @@ mod tests {
         assert!(keyfile.exists(), "keyfile should now exist on disk");
         let bytes = std::fs::read(&keyfile).unwrap();
         assert_eq!(bytes.len(), 32, "keyfile must be a 32-byte AES-256 key");
+    }
+
+    #[test]
+    fn encrypted_config_and_mcp_first_writes_share_one_machine_key() {
+        let home = TempHome::new();
+        let path = home.path().to_owned();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other_barrier = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            other_barrier.wait();
+            let env = serde_json::json!({"TOKEN":"mcp-secret"}).as_object().unwrap().clone();
+            duduclaw_security::mcp_secret_store::store_mcp_env(&path, "alice", "vendor", &env).unwrap()
+        });
+        barrier.wait();
+        let encrypted = encrypt_value("config-secret", home.path()).unwrap();
+        let references = writer.join().unwrap();
+        assert_eq!(decrypt_value(&encrypted, home.path()).as_deref(), Some("config-secret"));
+        assert_eq!(duduclaw_security::mcp_secret_store::resolve_mcp_env(
+            home.path(), "alice", "vendor", &references,
+        ).unwrap()["TOKEN"], "mcp-secret");
+    }
+
+    #[test]
+    fn config_write_does_not_replace_invalid_or_lost_mcp_key() {
+        let home = TempHome::new();
+        let keyfile = home.path().join(".keyfile");
+        std::fs::write(&keyfile, b"invalid").unwrap();
+        assert!(encrypt_value("config-secret", home.path()).is_none());
+        assert_eq!(std::fs::read(&keyfile).unwrap(), b"invalid");
+        std::fs::remove_file(&keyfile).unwrap();
+        std::fs::create_dir_all(home.path().join("secrets/mcp")).unwrap();
+        std::fs::write(home.path().join("secrets/mcp/alice.enc"), "encrypted-store").unwrap();
+        assert!(encrypt_value("config-secret", home.path()).is_none());
+        assert!(!keyfile.exists());
     }
 
     #[test]

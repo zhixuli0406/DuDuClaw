@@ -88,7 +88,7 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
     if method.split('.').take(2).eq(["me", "google"]) || method == "agents.primary_owner_set" { return true; }
     // ── Self-service carve-outs inside an otherwise Enterprise family ──────
     // Checked first so the family rule below cannot swallow them.
-    if matches!(method, "users.me" | "users.change_password" | "users.change_email") {
+    if matches!(method, "users.me" | "users.change_password" | "users.change_email" | "users.set_primary_agent") {
         return false;
     }
 

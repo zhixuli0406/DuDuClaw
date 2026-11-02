@@ -103,6 +103,16 @@ describe('buildUserMessageFrame (L1 per-agent routing)', () => {
 });
 
 describe('historyToMessages (WP3 resume)', () => {
+  it('maps persisted turn failures to warning messages', () => {
+    const [failure, normal] = historyToMessages([
+      { role: 'assistant', content: 'Turn failed', timestamp: '2026-11-01T00:00:00Z', notice_kind: 'turn_failure', id: 42 },
+      { role: 'assistant', content: 'answer', timestamp: '2026-11-01T00:00:01Z', notice_kind: null },
+    ]);
+    expect(failure.role).toBe('system');
+    expect(failure.content).toBe('Turn failed');
+    expect(failure.historyId).toBe(42);
+    expect(normal.role).toBe('assistant');
+  });
   it('maps roles, timestamps and tokens from the history wire shape', () => {
     const msgs = historyToMessages([
       { role: 'user', content: 'hi', timestamp: '2026-07-12T00:00:00Z' },

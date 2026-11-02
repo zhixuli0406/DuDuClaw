@@ -127,7 +127,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   useAgentsStore.setState({ agents: ROSTER as never, loaded: true });
   useSystemStore.setState({ status: { edition_profile: 'personal', channels_connected: 0 } as never });
-  useAuthStore.setState({ jwt: 'test-jwt' } as never);
+  useAuthStore.setState({ jwt: 'test-jwt', user: { role: 'admin', display_name: 'Boss' } as never });
   mockRpc();
   fetchMock.mockResolvedValue({
     ok: true,
@@ -138,6 +138,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  window.localStorage.removeItem('assign.recentSkills');
   vi.unstubAllGlobals();
 });
 
@@ -227,6 +228,50 @@ describe('一般 tab', () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(mockNavigate).toHaveBeenCalledWith('/goals?task=gt-9');
     expect(toastSuccess).toHaveBeenCalled();
+  });
+
+  it('inserts and toggles recent skill chips in the note', async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['quote', 'beta']));
+    renderAt('/assign');
+    const quote = await screen.findByRole('button', { name: /Quote.*Make a quote/ });
+    expect(quote).toHaveAttribute('aria-pressed', 'false');
+    await user.click(quote);
+    expect(screen.getByLabelText('Anything to add? (optional)')).toHaveValue('/quote ');
+    expect(quote).toHaveAttribute('aria-pressed', 'true');
+    await user.click(quote);
+    expect(screen.getByLabelText('Anything to add? (optional)')).toHaveValue('');
+    expect(quote).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('supports multiple selected chips and submits the first chip skill', async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['quote', 'beta']));
+    renderAt('/assign');
+    await user.click(await screen.findByRole('button', { name: /Quote.*Make a quote/ }));
+    await user.click(screen.getByRole('button', { name: /Beta skill.*Never run/ }));
+    await user.type(screen.getByLabelText('Anything to add? (optional)'), 'more detail');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.skill_assign', {
+      skill_name: 'quote', note: '/quote /beta more detail',
+    }));
+  });
+
+  it('drops recent names missing from the available skill list', async () => {
+    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['removed', 'quote']));
+    renderAt('/assign');
+    expect(await screen.findByRole('button', { name: /Quote.*Make a quote/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /removed/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps successful assignment working when localStorage writes fail', async () => {
+    const user = userEvent.setup();
+    renderAt('/assign');
+    await user.click(await screen.findByRole('radio', { name: /Quote/ }));
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('blocked'); });
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/goals?task=gt-9'));
+    setItem.mockRestore();
   });
 
   it('sends files over HTTP with the request', async () => {
@@ -408,6 +453,23 @@ describe('複雜任務 tab', () => {
     });
   });
 
+  it('defaults to the primary employee without replacing an entry-point selection', async () => {
+    useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    const user = userEvent.setup();
+    openComplex();
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Use my primary');
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ agent_id: 'nova' })));
+  });
+
+  it('keeps the explicit employee when the primary differs', async () => {
+    useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    const user = userEvent.setup();
+    renderAt({ pathname: '/assign', state: { assignPrefill: { agentId: 'scout', description: 'Explicit selection' } } });
+    await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ agent_id: 'scout' })));
+  });
+
   it('想一想 mode sends plan_first and still lands on the created task', async () => {
     const user = userEvent.setup();
     openComplex();
@@ -469,5 +531,28 @@ describe('複雜任務 tab', () => {
     ]);
     expect(takeChatAttachments(opts.state.attachmentsKey)).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('employee task navigation preference', () => {
+  it.each([undefined, false])('hides the complex tab for enterprise employees when employee_tasks=%s', employeeTasks => {
+    useAuthStore.setState({ user: { role: 'employee' } as never });
+    useSystemStore.setState({ status: { edition_profile: 'enterprise', employee_tasks: employeeTasks } as never });
+    renderAt('/assign?tab=complex');
+    expect(screen.queryByRole('tab', { name: en['assign.tab.complex'] })).not.toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: en['assign.tab.general'] })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it.each([
+    ['employee', 'enterprise', true],
+    ['admin', 'enterprise', false],
+    ['manager', 'enterprise', false],
+    ['employee', 'personal', false],
+  ] as const)('keeps the complex tab for %s on %s with employee_tasks=%s', (role, edition, employeeTasks) => {
+    useAuthStore.setState({ user: { role } as never });
+    useSystemStore.setState({ status: { edition_profile: edition, employee_tasks: employeeTasks } as never });
+    renderAt('/assign?tab=complex');
+    expect(screen.getByRole('tab', { name: en['assign.tab.complex'] })).toHaveAttribute('aria-selected', 'true');
   });
 });

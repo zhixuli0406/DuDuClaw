@@ -1354,6 +1354,12 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "computer",
     ),
     (
+        "computer_login",
+        "Log in using a dashboard-saved credential label",
+        "admin",
+        "computer",
+    ),
+    (
         "computer_key",
         "Press a key combination",
         "admin",

@@ -69,6 +69,12 @@ export function InstalledSkillRow({
   const enabled = isEnabled(skill);
   const holders = skill.holders;
   const label = skill.display_name || skill.name;
+  const verifiedPublisher = skill.signature_status?.state === 'verified'
+    ? skill.signature_status.publisher
+    : undefined;
+  const sourceLabel = verifiedPublisher
+    ? intl.formatMessage({ id: 'skills.my.source.verified' }, { publisher: verifiedPublisher })
+    : intl.formatMessage({ id: 'skills.my.source.unsigned' });
   return (
     <ListGridRow className={cn('cursor-default', !enabled && 'opacity-70')}>
       <ListGridCell className="gap-2">
@@ -93,6 +99,9 @@ export function InstalledSkillRow({
               {skill.description}
             </p>
           )}
+          <p className="truncate text-xs text-muted-foreground" title={sourceLabel}>
+            {sourceLabel}
+          </p>
         </div>
       </ListGridCell>
       <ListGridCell className="gap-2">

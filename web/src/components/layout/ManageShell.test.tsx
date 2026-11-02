@@ -53,8 +53,8 @@ beforeEach(() => {
   useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
 });
 
-describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
-  it('renders the five primary entries in the client-decided order', () => {
+describe('ManageShell management rail', () => {
+  it('renders management entries with the Enterprise setup checklist', () => {
     renderManage('/manage/channels');
     const links = screen
       .getAllByRole('link')
@@ -65,6 +65,7 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
       en['manage.integrations'],
       en['manage.accounts'],
       en['manage.updates'],
+      en['setup.title'],
       en['manage.advanced'],
     ]);
     // The former group labels are gone with the grouping itself.
@@ -84,7 +85,7 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
     expect(parent.className).toContain('bg-surface-selected');
   });
 
-  it('keeps the rail five rows tall outside the 進階設定 subtree', () => {
+  it('keeps advanced entries folded outside the 進階設定 subtree', () => {
     renderManage('/manage/channels');
     expect(screen.queryByRole('link', { name: en['manage.billing'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.system'] })).not.toBeInTheDocument();
@@ -182,7 +183,7 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())
       .filter(Boolean) as string[];
-    // Drop the five primary rows; what follows 進階設定 is the sub-list.
+    // Drop the primary rows; what follows 進階設定 is the sub-list.
     const sub = labels.slice(labels.indexOf(en['manage.advanced']) + 1);
     expect(sub).toEqual([
       // 錢 — client order invariant (2026-08-04 WP14).

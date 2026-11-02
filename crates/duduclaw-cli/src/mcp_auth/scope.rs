@@ -492,6 +492,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // scope) rather than plain memory:write.
         "memory_invalidate_by_origin"
         | "execute_program"
+        // Gateway-owned credential fill; same scope as computer_type.
+        | "computer_login"
         | "create_agent"
         | "spawn_agent"
         // O2 ephemeral synthesis: same blast radius as spawn_agent (agent

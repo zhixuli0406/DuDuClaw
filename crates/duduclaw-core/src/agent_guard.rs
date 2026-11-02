@@ -934,8 +934,9 @@ mod tests {
 pub fn check_credential_read(path: &Path, home: &Path) -> GuardDecision {
     let blocked = |path: &Path, home: &Path| {
         let path = lexical_normalize(path);
-        let root = lexical_normalize(home).join("credentials");
-        strip_prefix_ci(&path, &root).is_some()
+        let home = lexical_normalize(home);
+        ["credentials", "secrets"].iter()
+            .any(|dir| strip_prefix_ci(&path, &home.join(dir)).is_some())
     };
     let denied = || GuardDecision::BlockedCredentialRead { attempted_path: path.to_path_buf() };
     if blocked(path, home) { return denied(); }
@@ -957,6 +958,9 @@ mod credential_read_tests {
         let home = Path::new("/tmp/duduclaw-credential-guard-test");
         assert!(!check_credential_read(&home.join("credentials/ledger.db"), home).is_allowed());
         assert!(!check_credential_read(&home.join("Credentials/ledger.db"), home).is_allowed());
+        assert!(!check_credential_read(&home.join("secrets/mcp/alice.enc"), home).is_allowed());
+        assert!(!check_credential_read(&home.join("Secrets/mcp/alice.enc"), home).is_allowed());
+        assert!(check_credential_read(&home.join("secrets-notes/a.md"), home).is_allowed());
         assert!(check_credential_read(&home.join("credentials-notes/a.md"), home).is_allowed());
     }
     #[cfg(unix)]
@@ -968,6 +972,17 @@ mod credential_read_tests {
         let alias = home.path().join("notes");
         std::os::unix::fs::symlink(home.path().join("credentials"), &alias).unwrap();
         assert!(!check_credential_read(&alias.join("ledger.db"), home.path()).is_allowed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_guard_follows_symlink_into_secrets() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("secrets/mcp")).unwrap();
+        std::fs::write(home.path().join("secrets/mcp/alice.enc"), b"fixture").unwrap();
+        let alias = home.path().join("notes");
+        std::os::unix::fs::symlink(home.path().join("secrets"), &alias).unwrap();
+        assert!(!check_credential_read(&alias.join("mcp/alice.enc"), home.path()).is_allowed());
     }
 
 }

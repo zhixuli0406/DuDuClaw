@@ -746,6 +746,29 @@ mod tests {
 
     #[tokio::test]
     async fn remove_pack_waits_for_inflight_admission() {
+        #[derive(Clone)]
+        struct Timeline {
+            start: std::time::Instant,
+            events: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, std::time::Duration)>>>,
+        }
+        impl Timeline {
+            fn mark(&self, step: &'static str) {
+                self.events.lock().unwrap().push((step, self.start.elapsed()));
+            }
+        }
+        struct PrintOnFailure(Timeline);
+        impl Drop for PrintOnFailure {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    eprintln!("admission test timeline: {:?}", self.0.events.lock().unwrap());
+                }
+            }
+        }
+        let timeline = Timeline {
+            start: std::time::Instant::now(),
+            events: Default::default(),
+        };
+        let _diagnostics = PrintOnFailure(timeline.clone());
         let home = tempfile::tempdir().unwrap();
         let agent_dir = home.path().join("agents/pack-agent");
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -756,16 +779,28 @@ mod tests {
         let held = duduclaw_core::autonomy_gate::admit(
             home.path(), "pack-agent", duduclaw_core::autonomy_gate::AutonomyPath::Background,
         ).await.unwrap();
+        timeline.mark("holder acquired");
         let (release, released) = tokio::sync::oneshot::channel::<()>();
+        timeline.mark("spawn holder");
+        let holder_timeline = timeline.clone();
         let holder = tokio::task::spawn_blocking(move || {
-            let _held = held;
+            holder_timeline.mark("holder task started");
             released.blocking_recv().unwrap();
+            drop(held);
+            holder_timeline.mark("release done");
         });
         let removing_home = home.path().to_path_buf();
-        let mut removing = tokio::spawn(async move { remove_pack(&removing_home, "demo").await });
+        let removing_timeline = timeline.clone();
+        let mut removing = tokio::spawn(async move {
+            removing_timeline.mark("removal start");
+            let result = remove_pack(&removing_home, "demo").await;
+            removing_timeline.mark("removal done");
+            result
+        });
         assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut removing).await.is_err());
         assert!(agent_dir.join("agent.toml").is_file());
         assert!(read_record(home.path(), "demo").is_some());
+        timeline.mark("release signal");
         release.send(()).unwrap();
         holder.await.unwrap();
         let items = tokio::time::timeout(std::time::Duration::from_secs(5), removing)

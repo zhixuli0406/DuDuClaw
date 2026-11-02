@@ -50,6 +50,13 @@ pub struct SessionMessage {
     pub timestamp: String,
 }
 
+/// Display-only WebChat row. Never use this type to build model context.
+pub(crate) struct WebChatHistoryMessage {
+    pub id: i64,
+    pub message: SessionMessage,
+    pub notice_kind: Option<String>,
+}
+
 /// One row of `list_title_candidates` — a session the background auto-titler
 /// may need to (re)title.
 pub struct TitleCandidate {
@@ -202,6 +209,12 @@ impl SessionManager {
         // Phase 4: Add hidden column for hide/restore mechanism (Sculptor, arXiv 2508.04664)
         let _ = conn.execute(
             "ALTER TABLE session_messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        // Display-only failures stay hidden from all context readers.
+        let _ = conn.execute(
+            "ALTER TABLE session_messages ADD COLUMN notice_kind TEXT NULL",
             [],
         );
 
@@ -542,6 +555,39 @@ impl SessionManager {
         self.acquire().await.query_row(
             "SELECT COALESCE(summary, '') FROM sessions WHERE id=?1", [session_id], |r| r.get(0),
         ).optional().map(|v| v.unwrap_or_default())
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))
+    }
+
+    /// Persist a display-only failure without affecting context or token totals.
+    pub(crate) async fn record_webchat_failure(&self, session_id: &str, text: &str) -> Result<()> {
+        let masked = duduclaw_security::credential_detect::mask(text);
+        let text = duduclaw_core::truncate_chars(&masked, 2000);
+        let conn = self.acquire().await;
+        conn.execute(
+            "INSERT INTO session_messages
+             (session_id, role, content, tokens, timestamp, hidden, notice_kind)
+             VALUES (?1, 'assistant', ?2, 0, ?3, 1, 'turn_failure')",
+            params![session_id, text, chrono::Utc::now().to_rfc3339()],
+        ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Only the WebChat history display may read hidden failure notices.
+    pub(crate) async fn webchat_history(&self, session_id: &str) -> Result<Vec<WebChatHistoryMessage>> {
+        let conn = self.acquire().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, tokens, timestamp, notice_kind FROM session_messages
+             WHERE session_id = ?1 AND undone_at IS NULL
+               AND (hidden = 0 OR notice_kind = 'turn_failure') ORDER BY id ASC",
+        ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = stmt.query_map([session_id], |row| Ok(WebChatHistoryMessage {
+            id: row.get(0)?,
+            message: SessionMessage {
+                role: row.get(1)?, content: row.get(2)?, tokens: row.get(3)?, timestamp: row.get(4)?,
+            },
+            notice_kind: row.get(5)?,
+        })).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))
     }
 
@@ -1047,7 +1093,7 @@ impl SessionManager {
         let mut stmt = conn
             .prepare(
                 "SELECT s.id, s.agent_id,
-                        (SELECT COUNT(*) FROM session_messages m WHERE m.session_id = s.id) AS turn_count,
+                        (SELECT COUNT(*) FROM session_messages m WHERE m.session_id = s.id AND m.hidden = 0 AND m.undone_at IS NULL) AS turn_count,
                         COALESCE(s.summarized_through_turn, 0) AS summarized_through_turn,
                         s.last_summarized_at
                  FROM sessions s",
@@ -1272,7 +1318,7 @@ impl SessionManager {
         let conn = self.acquire().await;
         let rows = conn
             .execute(
-                "UPDATE session_messages SET hidden = 0 WHERE id = ?1 AND session_id = ?2",
+                "UPDATE session_messages SET hidden = 0 WHERE id = ?1 AND session_id = ?2 AND notice_kind IS NULL",
                 params![message_id, session_id],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -1299,7 +1345,7 @@ impl SessionManager {
             .prepare(
                 "SELECT id, role, content, tokens, timestamp
                  FROM session_messages
-                 WHERE session_id = ?1 AND hidden = 1 AND undone_at IS NULL
+                 WHERE session_id = ?1 AND hidden = 1 AND undone_at IS NULL AND notice_kind IS NULL
                    AND content LIKE ?2 ESCAPE '\\'
                  ORDER BY id DESC
                  LIMIT ?3",
@@ -1848,6 +1894,75 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].1.content.contains("search result"));
+    }
+
+    #[tokio::test]
+    async fn webchat_notice_migration_preserves_legacy_messages() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL, tokens INTEGER DEFAULT 0,
+                timestamp TEXT NOT NULL, hidden INTEGER NOT NULL DEFAULT 0, undone_at TEXT
+             );
+             INSERT INTO session_messages(session_id, role, content, timestamp)
+             VALUES ('legacy', 'user', 'old question', '2026-11-01T00:00:00Z');",
+        ).unwrap();
+        drop(conn);
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("legacy", "agent").await.unwrap();
+        let old = mgr.webchat_history("legacy").await.unwrap();
+        assert_eq!(old.len(), 1);
+        assert!(old[0].notice_kind.is_none());
+        assert_eq!(old[0].message.content, "old question");
+        mgr.record_webchat_failure("legacy", "failed").await.unwrap();
+        assert_eq!(mgr.get_messages("legacy").await.unwrap().len(), 1);
+        assert_eq!(mgr.webchat_history("legacy").await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn webchat_failures_are_display_only_and_cannot_be_restored() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("s1", "agent").await.unwrap();
+        mgr.append_message("s1", "user", "question", 5).await.unwrap();
+        let hidden = mgr.append_message_with_id("s1", "assistant", "ordinary hidden", 5).await.unwrap();
+        mgr.hide_message("s1", hidden).await.unwrap();
+        let redacted = mgr.append_message_with_id("s1", "assistant", "redacted", 5).await.unwrap();
+        mgr.revoke_message("s1", redacted, "redacted").await.unwrap();
+        mgr.record_webchat_failure("s1", "failure password: fixture-secret").await.unwrap();
+        let display = mgr.webchat_history("s1").await.unwrap();
+        assert_eq!(display.len(), 2);
+        assert_eq!(display[0].message.content, "question");
+        assert_eq!(display[1].notice_kind.as_deref(), Some("turn_failure"));
+        assert!(!display[1].message.content.contains("fixture-secret"));
+        let failure_id = display[1].id;
+        let conn = mgr.acquire().await;
+        let flags: (i64, String) = conn.query_row(
+            "SELECT hidden, notice_kind FROM session_messages WHERE id=?1", [failure_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(flags, (1, "turn_failure".into()));
+        drop(conn);
+        assert!(!mgr.restore_message("s1", failure_id).await.unwrap());
+        assert!(mgr.search_hidden_messages("s1", "failure", 10).await.unwrap().is_empty());
+        assert_eq!(mgr.get_messages("s1").await.unwrap().len(), 1);
+        assert_eq!(mgr.get_message_ids("s1").await.unwrap().len(), 1);
+        assert_eq!(mgr.read_first_n_turns("s1", 100).await.unwrap(),
+            vec![("user".to_string(), "question".to_string())]);
+        assert_eq!(mgr.read_first_n_turns_text("s1", 100).await.unwrap(), "user: question\n");
+        assert_eq!(mgr.read_last_n_turns_text("s1", 100).await.unwrap(), "user: question\n");
+        assert_eq!(mgr.list_summary_candidates().await.unwrap()[0].turn_count, 1);
+        mgr.record_webchat_failure("s1", &"錯".repeat(2100)).await.unwrap();
+        let display = mgr.webchat_history("s1").await.unwrap();
+        assert_eq!(display.last().unwrap().message.content.chars().count(), 2000);
+        // Undo/redaction still hides a notice from the display.
+        mgr.revoke_message("s1", failure_id, "redacted").await.unwrap();
+        assert!(mgr.webchat_history("s1").await.unwrap().iter().all(|m| m.id != failure_id));
+        drop(mgr);
+        let reopened = SessionManager::new(tmp.path()).unwrap();
+        assert_eq!(reopened.webchat_history("s1").await.unwrap().len(), 2);
     }
 
     #[tokio::test]

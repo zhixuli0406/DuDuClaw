@@ -127,12 +127,12 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
         const hist = await api.chatSessions.history(sessionId);
         if (!stillCurrent() || !hist || hist.session_id !== sessionId || hist.read_only
           || !Array.isArray(hist.messages)) return;
-        // Require the unanswered row and a later assistant row. A stale or
+        // Require the unanswered row and a later reply or failure notice. A stale or
         // truncated snapshot must not replace a newer transcript.
         const anchor = hist.messages.findLastIndex(row => last.historyId !== undefined
           ? row.id === last.historyId && row.role === 'user'
           : row.role === 'user' && row.content === last.content && Date.parse(row.timestamp) === last.timestamp);
-        if (anchor < 0 || !hist.messages.slice(anchor + 1).some(row => row.role === 'assistant')) return;
+        if (anchor < 0 || !hist.messages.slice(anchor + 1).some(row => row.role === 'assistant' || row.notice_kind === 'turn_failure')) return;
         const updated = historyToMessages(hist.messages);
         useChatStore.setState({ messages: updated });
         void fetchSessionCitations(sessionId).then(rows => {

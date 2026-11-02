@@ -37,6 +37,25 @@ duduclaw pack install <src>        # 依 kind 分流;付費內容只在一處檢
 
 **`expert.toml`、`team.toml`、`preset.toml` 仍然讀取。** 磁碟上一個字都不改。`expert.toml`、`team.toml` 與產業包目錄結構已棄用，會跟改寫後的付費板模一起在之後的版本移除，目前沒有訂版號。原因是 `pack.toml` 的團隊包與產業包目前還不能安裝：安裝程式只接受 `pack.toml` 的職務 preset。`preset.toml` 是職務 preset 的儲存格式，不在棄用範圍。`duduclaw pack inspect <dir> --emit-canonical` 會印出舊包對應的 `pack.toml`,讓你自己審過再遷移，而不是讓機器去改寫由你負責的內容。
 
+## 發行者簽章
+
+Pack 與 hub 技能使用 minisign（Ed25519）簽章。簽章只證明哪個已釘選的發行者簽過這份內容；內容仍須通過掃描、hook 隔離、沙箱試用及核准。
+
+本機信任庫位於 `<home>/trusted_publishers.toml`：
+
+```toml
+[publishers.example]
+keys = ["<minisign base64 public key>"]
+```
+
+官方發行者 `duduclaw` 使用程式內嵌的 release 公鑰。registry 下載來源不能提供受信任的金鑰。信任庫無法讀取或格式錯誤時會顯示警告，該檔案不會授予任何信任。
+
+以 `duduclaw publishers list` 查看信任設定。`duduclaw publishers add <id> <pubkey>` 與 `duduclaw publishers remove <id>` 必須經儀表板 Admin 核准，且拒絕在 AI 工作階段內執行。加入金鑰前，應透過獨立且可信的管道確認發行者公鑰。
+
+`pack install` 預覽會顯示 `verified`、`unsigned` 或 `invalid`。無效的 pack 拒絕安裝；未簽章的 pack 會警告，並照原有關卡安裝。已釘選發行者若缺少簽章，視為無效。簽章狀態納入 profile 確認摘要，狀態改變就須重新確認。職務預設也須先預覽並以 `--confirm-profile` 確認；確認會綁定簽章狀態、內容及安裝目的地。registry 的程式碼類 pack（含技能或 hook）必須有已釘選發行者的有效簽章。`github:` 入口仍為未簽章，維持既有安裝流程。
+
+Hub manifest 可提供 `publisher` 與 `signature`，minisign 簽署的是原始內容位元組。已釘選發行者若缺少簽章或簽章無效，拒絕安裝；未知發行者即使附有簽章，仍視為未簽章。已安裝技能會顯示「已驗證來源：發行者」或「未簽章」；缺少狀態欄位時也顯示未簽章。
+
 ## 安裝管線
 
 每次安裝(包括儀表板一鍵安裝與 LLM 生成的草稿)都跑同一套流程:

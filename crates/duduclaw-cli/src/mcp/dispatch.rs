@@ -87,7 +87,7 @@ pub(crate) async fn handle_tools_call(
             // block never reaches `extract_tool_result_text`).
             | "computer_screenshot"
             | "computer_click"
-            | "computer_type"
+            | "computer_type" | "computer_login"
             | "computer_key"
             | "computer_scroll"
             | "computer_session_start"
@@ -400,7 +400,7 @@ pub(crate) async fn handle_tools_call(
         "cost_multi_vs_single" => handle_cost_multi_vs_single(&arguments, home_dir).await,
         // Voice / ASR / TTS tools
         "transcribe_audio" => handle_transcribe_audio(&arguments).await,
-        "synthesize_speech" => handle_synthesize_speech(&arguments).await,
+        "synthesize_speech" => handle_synthesize_speech(&arguments, home_dir).await,
         // Wiki Knowledge Base tools — use wiki_agent (namespace-aware) instead of
         // default_agent so external clients stay isolated in their own namespace.
         // T5/O3 — one `wiki_*` entry point with a `scope` parameter
@@ -869,6 +869,23 @@ pub(crate) async fn handle_tools_call(
             Some(&audit_arguments),
             result_text_for_grounding.as_deref(),
         );
+    }
+
+    // Read-only tools need usage evidence too. Do not retain arguments or
+    // results here; state-changing calls already have their canonical audit.
+    let pruning_success = !result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    if pruning_success {
+        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
+        let pruning_agent = acting_agent_id(caller_client_id, default_agent);
+        if !is_state_changing || actual_agent != pruning_agent {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir, pruning_agent, tool_name, "usage", true,
+                &[("usage_only", Value::Bool(true))],
+            );
+        }
+        // The existing tools/list_changed watcher now observes this restored
+        // name immediately, without waiting for the five-minute cache TTL.
+        duduclaw_core::tool_pruning::note_success(home_dir, pruning_agent, tool_name);
     }
 
     // ── WP6: channel-action → dashboard live feedback ──────────

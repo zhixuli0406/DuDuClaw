@@ -110,7 +110,9 @@ pub(crate) async fn prepare(
         )?
         .unwrap_or_default();
         let names = sources::other_source_names(dir).map_err(|e| refuse(&e))?;
-        any_third_party |= own_names.iter().chain(&names).any(|n| n != "duduclaw");
+        any_third_party |= crate::redaction_proxy::mcp_json_lists_third_party_servers(
+            home_dir, &dir.join(".mcp.json"), explore,
+        )? || names.iter().any(|n| n != "duduclaw");
         other.push((dir.clone(), own_names, names));
     }
     if !any_third_party {

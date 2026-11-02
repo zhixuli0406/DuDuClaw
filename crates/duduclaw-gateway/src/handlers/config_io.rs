@@ -142,6 +142,11 @@ impl MethodHandler {
             checks.push(crate::os_ops::doctor_mcp_check(status, &message, true));
         }
 
+        #[cfg(target_os = "macos")]
+        if let Some(message) = crate::doctor_probes::launchd_restart_warning().await {
+            checks.push(json!({"name": "launchd_restart", "status": "warn", "message": message, "can_repair": false}));
+        }
+
         // Live dashboard permissions (`live_context.rs`): shown only after a
         // read of the account store failed, which refused that call. Silence
         // here means every check since start-up read the store fine.

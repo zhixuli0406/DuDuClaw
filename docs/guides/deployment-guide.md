@@ -317,6 +317,7 @@ duduclaw service install
 # Management
 duduclaw service start
 duduclaw service stop
+duduclaw service restart
 duduclaw service status
 duduclaw service logs --lines 50
 duduclaw service uninstall
@@ -331,6 +332,10 @@ on its final step.
 ### macOS (launchd)
 
 Creates `~/Library/LaunchAgents/com.duduclaw.gateway.plist`
+
+After updating a macOS LaunchAgent, use `duduclaw service restart` to unload
+and bootstrap the job against its plist. If `duduclaw doctor` reports launchd
+exit code 78, run that command to re-register the job with the updated binary.
 
 ### Linux (systemd)
 

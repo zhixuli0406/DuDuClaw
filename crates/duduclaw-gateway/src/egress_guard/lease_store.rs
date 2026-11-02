@@ -1,5 +1,6 @@
 //! Write-ahead sink fences. Only the gateway opens this database.
 use std::path::{Path, PathBuf};
+use duduclaw_core::owner_lock::OwnerLock;
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use super::{MAX_SINK_LEASES, MAX_TOTAL_SINK_LEASES};
 
@@ -7,23 +8,6 @@ pub(super) struct Store {
     pub(super) conn: Connection,
     // Drop the connection before releasing exclusive ledger ownership.
     _owner: OwnerLock,
-}
-
-struct OwnerLock {
-    file: std::fs::File,
-    pid: u32,
-}
-
-impl Drop for OwnerLock {
-    fn drop(&mut self) {
-        // A concurrent fork can retain this descriptor until exec even with
-        // CLOEXEC. Closing only our copy would then leave an abandoned owner
-        // lock behind. Store drops its connection before reaching this guard.
-        // A forked child must never unlock its parent's still-active owner.
-        if self.pid == std::process::id() {
-            let _ = fs2::FileExt::unlock(&self.file);
-        }
-    }
 }
 
 pub(super) struct Row {
@@ -158,7 +142,7 @@ fn owner_lock(path: &Path) -> Result<OwnerLock, String> {
     }
     fs2::FileExt::try_lock_exclusive(&file).map_err(|e| format!("egress lease owner unavailable: {e}"))?;
     // Never unlink this file: another owner must lock the same inode.
-    Ok(OwnerLock { file, pid: std::process::id() })
+    Ok(OwnerLock::new(file))
 }
 
 pub(super) fn private_files(path: &Path) -> Result<(), String> {

@@ -25,7 +25,8 @@
 //! stays empty.
 use fs2::FileExt;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
+use crate::owner_lock::OwnerLock;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -33,8 +34,8 @@ const LOCK_FILE: &str = "gateway.lock";
 const HOLDER_FILE: &str = "gateway.lock.holder";
 const REFUSED_FILE: &str = "gateway.lock.refused";
 
-fn held_locks() -> &'static Mutex<HashMap<PathBuf, File>> {
-    static HELD: OnceLock<Mutex<HashMap<PathBuf, File>>> = OnceLock::new();
+fn held_locks() -> &'static Mutex<HashMap<PathBuf, OwnerLock>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, OwnerLock>>> = OnceLock::new();
     HELD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -66,7 +67,7 @@ pub fn acquire(home: &Path) -> Result<(), String> {
     if held.contains_key(&key) {
         return Ok(());
     }
-    let result = (|| -> Result<File, String> {
+    let result = (|| -> Result<std::fs::File, String> {
         std::fs::create_dir_all(home.join("locks")).map_err(|e| e.to_string())?;
         let file = OpenOptions::new()
             .create(true)
@@ -98,7 +99,7 @@ pub fn acquire(home: &Path) -> Result<(), String> {
     match result {
         Ok(file) => {
             let _ = std::fs::remove_file(refused_marker_path(home));
-            held.insert(key, file);
+            held.insert(key, OwnerLock::new(file));
             Ok(())
         }
         Err(error) => {

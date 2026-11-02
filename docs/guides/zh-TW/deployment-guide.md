@@ -297,6 +297,7 @@ duduclaw service install
 # Management
 duduclaw service start
 duduclaw service stop
+duduclaw service restart
 duduclaw service status
 duduclaw service logs --lines 50
 duduclaw service uninstall
@@ -309,6 +310,10 @@ duduclaw service uninstall
 ### macOS（launchd）
 
 會建立 `~/Library/LaunchAgents/com.duduclaw.gateway.plist`
+
+macOS LaunchAgent 更新後，請執行 `duduclaw service restart`，讓 launchd
+依 plist 卸載並重新載入工作。若 `duduclaw doctor` 顯示 launchd exit code 78，
+也請執行此命令，讓新版 binary 重新註冊。
 
 ### Linux（systemd）
 

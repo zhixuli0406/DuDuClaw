@@ -142,7 +142,9 @@ impl super::ComputerUseSessions {
         let threat = super::read_threat_level(&self.home).await;
         // All shared proofs are checked after the asynchronous read as well
         // as on entry. None waits for the employee's session mutex.
-        if threat == super::ThreatLevel::Red
+        if entry.shared.login_running.load(std::sync::atomic::Ordering::Acquire)
+            || entry.shared.login_masked.load(std::sync::atomic::Ordering::Acquire)
+            || threat == super::ThreatLevel::Red
             || entry
                 .control
                 .stopped

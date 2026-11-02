@@ -1,6 +1,6 @@
 # Browser Automation and Computer Use
 
-> From a plain HTTP fetch to a full virtual desktop: two built-in fetch tools, an optional external browser server, and computer-use sessions in an isolated container, driven by the employee through eight `computer_*` MCP tools. There is no automatic router.
+> From a plain HTTP fetch to a full virtual desktop: two built-in fetch tools, an optional external browser server, and computer-use sessions in an isolated container, driven by the employee through nine `computer_*` MCP tools. There is no automatic router.
 
 ---
 
@@ -58,7 +58,7 @@ It is not part of the DuDuClaw binary and there is no fallback from L2 into it. 
 
 ### L5 — Computer Use
 
-Computer use is one path: the employee calls eight `computer_*` MCP tools and decides every step itself. It needs `[capabilities] computer_use = true` on the employee. This works from any runtime whose CLI gets the DuDuClaw MCP tools (see [Multi-runtime](13-multi-runtime.md)). No Anthropic API key is involved.
+Computer use is one path: the employee calls nine `computer_*` MCP tools and decides every step itself. It needs `[capabilities] computer_use = true` on the employee. This works from any runtime whose CLI gets the DuDuClaw MCP tools (see [Multi-runtime](13-multi-runtime.md)). No Anthropic API key is involved.
 
 | Tool | Parameters | What it does |
 |---|---|---|
@@ -66,6 +66,7 @@ Computer use is one path: the employee calls eight `computer_*` MCP tools and de
 | `computer_screenshot` | none | Returns the masked screen as an MCP image block (PNG) plus a text line with actions used and time left. When the whole picture had to be hidden, the text says so, why, and what to do next. Actions never return a screenshot, so the agent calls this to check a result |
 | `computer_click` | `x`, `y` (integers, screenshot pixels from 0), `button` (`left` default or `right`), `double` (boolean, left button only) | One click |
 | `computer_type` | `text` (string, 1–2,000 characters) | Types into the focused element |
+| `computer_login` | `credential` (required label string) | Gateway fills and submits a saved login for an allowed employee; only status and a sentence are returned |
 | `computer_key` | `key` (string, letters, digits, `+`, `-`, `_`, at most 64 characters, for example `Return`, `ctrl+s`) | Presses a key or combination; an invalid key is refused, never replaced |
 | `computer_scroll` | `x`, `y` (integers), `direction` (`up` or `down`, default `down`), `amount` (integer 1–20, default 3) | Scrolls with the pointer at that pixel |
 | `computer_navigate` | `url` (string) | Opens a page in the container's browser. The browser runs in kiosk mode with no address bar, so this is the only way to open a page |
@@ -77,7 +78,7 @@ Session rules:
 
 - **One session per employee.** A second `computer_session_start` while one is live is refused and names the live session. Only that employee can see or drive it.
 - **Five sessions at once across the gateway.**
-- **Limits.** A session ends after `max_session_minutes` (default 10), after 2 minutes without any operation (time spent waiting for an approval, an open dashboard viewer or a human takeover do not count as idle; with `keep_alive_minutes` the container is paused instead, see [Keep-alive, live view and takeover](#keep-alive-live-view-and-takeover)), or on `computer_session_stop`. Each click, type, key, scroll and navigate counts against `max_actions` (default 50); screenshots do not. After the budget is spent the session can still take screenshots and stop.
+- **Limits.** A session ends after `max_session_minutes` (default 10), after 2 minutes without any operation (time spent waiting for an approval, an open dashboard viewer or a human takeover do not count as idle; with `keep_alive_minutes` the container is paused instead, see [Keep-alive, live view and takeover](#keep-alive-live-view-and-takeover)), or on `computer_session_stop`. Each click, type, login, key, scroll and navigate counts against `max_actions` (default 50); screenshots do not. After the budget is spent the session can still take screenshots and stop.
 - **Refused callers and modes.** Ephemeral agents (including Team-as-Agent role members, which copy their parent's capabilities) cannot start a session. An employee whose `[capabilities] computer_use_mode` is `"native"` is refused with error code `native_unsupported` and a message saying the mode was removed and to delete the key or set it to `"container"`; there is no silent fallback to a container. `"auto"` or no key behaves as `"container"`.
 - **Threat level.** A new session starts only while `~/.duduclaw/threat_level` is GREEN (or absent). YELLOW allows only screenshots and stop; RED ends every session. A chat message that is exactly an emergency-stop word (`停止`, `stop`, `abort`, `やめて`, …) ends every computer-use session.
 - **Cleanup.** A reaper checks every 15 seconds for sessions past their deadline or idle limit. Containers carry a label naming the owning DuDuClaw home and a deadline label; a sweep at gateway start and every 10 minutes removes this home's containers that have exited or are more than 10 minutes past their deadline, and removes nothing when Docker cannot be listed.
@@ -86,7 +87,7 @@ Session rules:
 Gates the gateway applies itself, because the route can be reached without going through the MCP dispatcher:
 
 - `[capabilities] denied_tools` / `allowed_tools` and `scoped_tools` (a listed tool needs an active task-scoped grant) are checked for every operation, under the tool's own name.
-- A tool listed in `approval_required_tools`, `irreversible_tools` or `maybe_irreversible_tools` waits for a human decision through the ApprovalBroker (up to 300 seconds; no answer counts as a refusal). A maybe-irreversible `computer_*` tool is always asked about; there is no model judge here. The approval text names the tool; for `computer_type` it gives only the number of characters, and for `computer_navigate` only the validated host (no path or query). A `computer_navigate` URL is validated before anything is asked, so a URL that would be refused never creates an approval request. The MCP-side approval gate skips these eight tools so nobody is asked twice.
+- A tool listed in `approval_required_tools`, `irreversible_tools` or `maybe_irreversible_tools` waits for a human decision through the ApprovalBroker (up to 300 seconds; no answer counts as a refusal). A maybe-irreversible `computer_*` tool is always asked about; there is no model judge here. The approval text names the tool; for `computer_type` it gives only the number of characters, and for `computer_navigate` only the validated host (no path or query). A `computer_navigate` URL is validated before anything is asked, so a URL that would be refused never creates an approval request. The MCP-side approval gate skips these nine tools so nobody is asked twice.
 - Every action is risk-rated by fixed rules (`risk_detector.rs`). An action is refused when the focused window's title matches `blocked_actions` (default `delete_file`, `terminal`, `system_preferences`), when it matches a `CONTRACT.toml` `[must_not] rules` entry, or when the focused window's title cannot be read. A high-risk action (input aimed at a sensitive field, typed text that looks like a credential, or a window outside a non-empty `allowed_apps`) needs a person to confirm it in the conversation's channel within 60 seconds when the tool call comes from a turn that is answering a channel conversation; the gateway finds that channel from its own record of the employee's live turns, never from the request. With no channel to ask (a scheduled run, a delegated task) the high-risk action is refused. `auto_confirm_trusted = true` skips the confirmation.
 
 #### What happened to the chat-triggered loop
@@ -165,13 +166,27 @@ Use it for: anything a person sitting at a computer could do — logins, drag-an
 
 ---
 
+## Website login without sending the password to the model
+
+An administrator saves a label, HTTPS login URL (`login_url`), username, password and a non-empty list of allowed AI staff in **System → Security → Website login credentials**. The gateway canonicalizes the URL and stores its derived origin and exact path. Userinfo, query strings and fragments are rejected. Optional `allowed_paths` contains exact same-origin paths for a second login step and defaults to an empty list. Passwords are entered only in that dashboard form, never in chat, and are never read back into the form. Editing requires entering the password again. Rebuild the computer-use container image before using this feature; it needs the updated `duduclaw-fill-login` helper.
+
+The employee calls `computer_login` with only `{"credential":"Work account"}`. The gateway checks the verified employee against `allowed_agents` and applies the session, tool, scope and approval gates under the distinct `computer_login` name. Session start and status responses list only the labels available to that employee, without usernames. The gateway first opens the saved `login_url` through the existing navigation checks (navigation and login each consume one action from the session budget), then sends the derived `origin`, `login_path`, optional `allowed_paths` and credentials to one container helper on stdin. Filling and submitting happen in the same helper call, with no model action in between. The first fill requires the exact origin and login path. A second fill requires the same origin, a visible password input, and a page reached after the helper submitted step one; its path must equal `login_path` or one of `allowed_paths`. An allowlisted path cannot receive an initial fill.
+
+Before filling and again after synchronous input/change events, the helper checks that the form submits to the exact credential origin using POST, including the selected submitter's `formmethod` on both native `requestSubmit` and fallback paths. It checks the method again after synchronous submit handlers. The network guard rejects non-POST requests whose decoded query values equal the complete username or password, including when a submit handler changes POST to GET. GET and default-GET forms fail without filling. During the helper call, CDP Fetch interception checks every request and redirect hop against that exact origin, aborts any other origin and returns `failed`; service workers are bypassed. This also blocks a 307/308 redirect from forwarding the POST body to another otherwise allowlisted origin.
+
+Before removing interception, the helper tracks `Network.requestWillBeSent`, `Network.loadingFinished` and `Network.loadingFailed` to confirm requests have ended. It waits for at most three seconds and requires two quiet command barriers with no pending requests. If completion cannot be confirmed, it returns `failed_uncleared` and calls `Browser.close` while the Fetch fence is still active; the gateway then removes the session and container.
+
+The tool returns a status and a short sentence, never a password or screenshot. `logged_in` means the password field has disappeared, not that the server's account state has been independently verified. `needs_takeover` means a person must use the existing takeover flow for 2FA or a captcha; there is no model OTP entry path. On failure or takeover, the helper clears username and password fields. If cleanup cannot be confirmed (`failed_uncleared`), the gateway stops and removes the session and container and returns an error asking the employee to start a new session. Navigation cannot release that failed session. Screenshots are suppressed while the login call runs. Origin, path and form-origin mismatches refuse the login.
+
+Only the saved origin (scheme, host and port) is allowed; this does not widen the employee's network allowlist. HTTPS is required, including for localhost. **JavaScript on the trusted login page can read fields after they are filled.** The gateway keeps credentials away from the model; it cannot make an untrusted website safe. Only save logins for sites you trust.
+
 ## Security: deny by default
 
 Every tier past L2 needs explicit authorization in `agent.toml`:
 
 ```toml
 [capabilities]
-computer_use = false        # computer-use sessions and the eight computer_* tools
+computer_use = false        # computer-use sessions and the nine computer_* tools
 browser_via_bash = false    # launching a browser from a Bash tool call
 allowed_tools = [...]       # allowlist
 denied_tools = [...]        # denylist
@@ -180,7 +195,7 @@ denied_tools = [...]        # denylist
 allowed_domains = []        # sites computer_navigate may open; empty = no network
 ```
 
-- `computer_use = false` (the default) means the gateway never starts a computer-use session for that employee, the eight `computer_*` tools are hidden from `tools/list`, and a direct call is refused, checked fail-closed: an absent file, malformed TOML, or a wrong-typed key all deny. The gateway re-reads the setting during a session; turning it off ends the session at its next operation.
+- `computer_use = false` (the default) means the gateway never starts a computer-use session for that employee, the nine `computer_*` tools are hidden from `tools/list`, and a direct call is refused, checked fail-closed: an absent file, malformed TOML, or a wrong-typed key all deny. The gateway re-reads the setting during a session; turning it off ends the session at its next operation.
 - `denied_tools` is passed to the CLI as `--disallowedTools` and is *also* enforced at the MCP dispatcher front door.
 - `browser_via_bash` no longer sets an environment flag. The `bash-gate.sh` allowlist that used to read `DUDUCLAW_BROWSER_VIA_BASH` was removed with the rest of the shell hooks in `ba015a48`. The capability still takes effect: it feeds `disallowed_tools()` and `CapabilitiesConfig::sandbox_level()`, which is how a runtime can select between `ReadOnly` and `WorkspaceWrite` sandboxes.
 - The restriction knobs that only ever existed as fields on the dead router (trusted/blocked domains, per-session page caps) were never implemented in that form. What exists instead: the per-employee site allowlist (`allowed_domains` above), the session action budget, the high-risk confirmation in the chat, and approval gating through `ApprovalBroker` and `agent.toml [capabilities] approval_required_tools` / `irreversible_tools` / `maybe_irreversible_tools`, which applies to the `computer_*` tools like any other tool. Screenshot audit is not a switch: it is always written (see the audit bullet below).
@@ -205,7 +220,7 @@ Reaching for L5 when L1 would answer the question is the expensive mistake, and 
 - **Container isolation** — L5 runs in its own Docker container (default image `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway version>`, never pulled automatically): read-only root filesystem, a 256 MB tmpfs `/tmp`, 1 CPU, 512 MB memory, 512 processes (Chromium's threads count against this limit), and `--network=none` unless the session has resolved allowlist hosts, in which case `--network bridge`, the pinned hosts and `NET_ADMIN` are added for the domain filter (see the network paragraphs above). Every computer-use container runs with `--security-opt no-new-privileges`. This is launched by `computer_use_orchestrator` and is separate from the per-agent task sandbox (see the [Task sandbox guide](../guides/task-sandbox.md)).
 - **Security defense** — capability enforcement and the audit trail are described in [05-security-defense.md](05-security-defense.md).
 - **Resident sensing** — `http_poll` / `websocket` tick sources share L1's SSRF gate. See [41-resident-sensing.md](41-resident-sensing.md).
-- **Audit log** — all eight `computer_*` tools are recorded in `tool_calls.jsonl`, with a reduced input: `computer_type` as its character count only, `computer_navigate` as host and path length (no query string), `computer_screenshot` without the image. `web_fetch_cached` and `web_extract` are read-only and are not. Sessions also append hash-chained rows (tier `L5a`) to `~/.duduclaw/audit/browser/audit.jsonl` (session start and end, each screenshot with `fully_masked` and `mask_reason`, each action with its risk rating, each navigation with host and path but no query, each refusal; typed text again only as a character count) and save masked screenshots under `~/.duduclaw/audit/browser/screenshots/<agent_id>/`. Screenshots are kept for 7 days and at most 500 files or 200 MiB per employee, oldest deleted first; `audit.jsonl` rotates to `audit.jsonl.old` past 16 MiB. Details: [Development guide, section 5](../guides/development-guide.md#5-audit-and-monitoring).
+- **Audit log** — all nine `computer_*` tools are recorded in `tool_calls.jsonl`, with a reduced input: `computer_type` as its character count only, `computer_navigate` as host and path length (no query string), `computer_screenshot` without the image. `web_fetch_cached` and `web_extract` are read-only and are not. Sessions also append hash-chained rows (tier `L5a`) to `~/.duduclaw/audit/browser/audit.jsonl` (session start and end, each screenshot with `fully_masked` and `mask_reason`, each action with its risk rating, each navigation with host and path but no query, each refusal; typed text again only as a character count) and save masked screenshots under `~/.duduclaw/audit/browser/screenshots/<agent_id>/`. Screenshots are kept for 7 days and at most 500 files or 200 MiB per employee, oldest deleted first; `audit.jsonl` rotates to `audit.jsonl.old` past 16 MiB. Details: [Development guide, section 5](../guides/development-guide.md#5-audit-and-monitoring).
 
 ---
 
@@ -258,7 +273,7 @@ The gateway reads the viewer's side of the protocol (RFB 3.7/3.8): keyboard, mou
 
 **Take over** gives the account a lease on the session. While the lease is held:
 
-- every `computer_click`, `computer_type`, `computer_key`, `computer_scroll`, `computer_navigate` and `computer_workspace_write` of the employee is refused with `human_has_control` and a message telling it to wait; screenshots, status and stop still work, and screenshots are masked as always;
+- every `computer_click`, `computer_type`, `computer_login`, `computer_key`, `computer_scroll`, `computer_navigate` and `computer_workspace_write` of the employee is refused with `human_has_control` and a message telling it to wait; screenshots, status and stop still work, and screenshots are masked as always;
 - the stream restarts in input mode with a new password, and only the holder's keyboard and mouse reach the screen;
 - the session does not idle out or pause.
 

@@ -26,6 +26,22 @@ mod product_footer_tests {
     }
 
     #[test]
+    fn footer_policy_is_explicit_for_every_tier() {
+        use duduclaw_license::LicenseTier::*;
+        for tier in [OpenSource, Hobby] {
+            assert!(footer_required_for_tier(tier), "{tier:?}");
+        }
+        for tier in [Solo, Studio, Business, Partner, PersonalProSelfHost, SelfHostPro, Oem] {
+            assert!(!footer_required_for_tier(tier), "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn non_required_footer_leaves_reply_unchanged() {
+        assert_eq!(append_product_footer_if_required("hi".into(), "line:U1", false), "hi");
+    }
+
+    #[test]
     fn distributor_footer_escapes_channel_markup() {
         assert_eq!(
             product_footer_for("A&B *brand* [link](x) <@everyone>"),

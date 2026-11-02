@@ -1,5 +1,6 @@
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
+import type { SkillSignatureStatus } from './api-custom-skills';
 import { notifyDisconnectForget } from './forget-receipts';
 import { callTaskRpc, type TaskAttachmentInput } from './task-rpc';
 // v1.68 W2 — dashboard-switches RPC wire types.
@@ -183,6 +184,7 @@ export interface AgentDetail extends AgentInfo {
 
 
 export interface VoiceSettings {
+  tts_command?: string;
   tts_provider: string;
   tts_voice: string;
 }
@@ -367,6 +369,8 @@ export interface SystemStatus {
    * gateway's own 404 middleware). Read through `useDecisionEnabled`.
    */
   decision_enabled?: boolean;
+  /** Employee task navigation preference; absent means false. UX only. */
+  employee_tasks?: boolean;
   /** v1.68 W2: whether this build was compiled with OpenTelemetry tracing
    *  (`otel` cargo feature). Absent on older gateways → treat as `false`. */
   otel_compiled?: boolean;
@@ -576,6 +580,8 @@ export interface SkillInfo {
   /** Which layer the skill came from: company-wide / department / this staffer. */
   scope?: 'global' | 'department' | 'agent';
   security_status?: 'pass' | 'warn' | 'fail';
+  /** Absent on older gateways and locally authored skills: show as unsigned. */
+  signature_status?: SkillSignatureStatus;
   /** B8: localised name / description and tags from the frontmatter (search). */
   display_name?: string;
   description?: string;
@@ -1045,6 +1051,8 @@ export interface TaskInfo {
    *  after the first dispatch that follows approval, and scopes it to
    *  `needs_human` the same defensive way as `pause_reason`. */
   plan_pending?: string | null;
+  /** Independent, display-only review JSON; never execution instructions. */
+  plan_review?: string | null;
   parent_task_id?: string;
   tags: string[];
   message_id?: string;
@@ -2355,6 +2363,7 @@ export interface LicenseSnapshot {
 // ── User management types ────────────────────────────────────
 
 export interface UserInfo {
+  primary_agent_id?: string | null;
   id: string;
   email: string;
   display_name: string;
@@ -2385,6 +2394,8 @@ export interface UserAgentBinding {
 }
 
 export interface UserDetail extends UserInfo {
+  /** Server-computed eligibility; the invite RPC rechecks before issuing. */
+  invite_eligible?: boolean;
   bindings: UserAgentBinding[];
 }
 
@@ -3414,6 +3425,8 @@ export interface RuntimeDetect {
   /** Present since the R4 Grok runtime; older gateways omit it. */
   grok?: boolean;
   claude_oauth: boolean;
+  /** A usable Claude subscription account in the gateway account pool. */
+  claude_account_ready?: boolean;
   claude_subscription: string | null;
   /** Per-runtime rows; deprecation fields are absent on older gateways. */
   runtimes?: Array<{
@@ -4365,7 +4378,18 @@ export type AutonomyLevel = 'operator' | 'collaborator' | 'consultant' | 'approv
 
 /** The `capabilities` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present (partial update). */
+export type ToolPruningMode = 'off' | 'shadow' | 'on';
+
+export interface ToolPruningStatus {
+  mode: ToolPruningMode;
+  listed_count: number;
+  prunable_names: string[];
+  estimated_tokens: number;
+  estimate: true;
+}
+
 export interface AgentCapabilities {
+  tool_pruning?: ToolPruningMode;
   recipient_guard?: 'off' | 'shadow' | 'ask';
   recipients?: string[];
   computer_use?: boolean;
@@ -4941,6 +4965,16 @@ export interface RedactionProfileImportResult {
 // model's lifecycle — separate from `RedactionConfig`/`redaction.get`
 // because the model's install/download state changes on its own clock (a
 // background download), not on the config-save cycle.
+
+export interface KokoroModelStatus {
+  installed: boolean;
+  size_bytes: number;
+  missing_files: string[];
+  ort_ok: boolean;
+  state: 'absent' | 'downloading' | 'ready' | 'error';
+  progress: { done_bytes: number; total_bytes: number; file: string } | null;
+  error: string | null;
+}
 
 export type RedactionModelState = 'absent' | 'downloading' | 'ready' | 'loaded' | 'error';
 
@@ -5827,6 +5861,13 @@ export interface GoogleIdentitySetInput {
   confirm_shared_access?: boolean;
 }
 
+export interface UserInviteResult {
+  sent: boolean;
+  reason?: string;
+  link?: string;
+}
+export type UserInviteState = 'none' | 'pending' | 'expired' | 'used';
+
 export interface PersonalGoogleStatus {
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;
@@ -5866,6 +5907,7 @@ export interface ChatSessionSummary {
 }
 
 export interface ChatSessionMessage {
+  notice_kind?: string | null;
   sender_label?: string;
   parts?: TeamHistoryPart[];
   artifact?: unknown;
@@ -6262,6 +6304,10 @@ export const api = {
       client.call('agents.pause', { agent_id: agentId }) as Promise<{ success: boolean }>,
     resume: (agentId: string) =>
       client.call('agents.resume', { agent_id: agentId }) as Promise<{ success: boolean }>,
+    toolPruningStatus: (agentId: string) =>
+      client.call('agents.tool_pruning_status', { agent_id: agentId }) as Promise<ToolPruningStatus>,
+    toolPruningRestore: (agentId: string) =>
+      client.call('agents.tool_pruning_restore', { agent_id: agentId }) as Promise<ToolPruningStatus>,
     inspect: (agentId: string) =>
       client.call('agents.inspect', { agent_id: agentId }) as Promise<AgentDetail>,
     /** E1 — lightweight avatar-only fetch. Unlike `inspect` this does NOT run a
@@ -7433,6 +7479,7 @@ export const api = {
         success: boolean;
         message: string;
         needs_restart: boolean;
+        restart_hint?: string | null;
       }>,
     /**
      * Restart onto the binary already on disk (`restart_pending_version`).
@@ -8542,6 +8589,10 @@ export const api = {
     pendingGet: (approvalId: string) =>
       client.call('agent_files.pending_get', { approval_id: approvalId }) as Promise<AgentFilePendingResponse>,
   },
+  voice: {
+    kokoroStatus: () => client.call('voice.kokoro_status') as Promise<KokoroModelStatus>,
+    kokoroInstall: () => client.call('voice.kokoro_install') as Promise<{ started: boolean }>,
+  },
   redaction: {
     get: () => client.call('redaction.get') as Promise<RedactionConfig>,
     update: (fields: RedactionUpdate) =>
@@ -8754,6 +8805,10 @@ export const api = {
       ) as Promise<MigrateResult>,
   },
   users: {
+    invite: (userId: string, publicUrl: string) =>
+      client.call('users.invite', { user_id: userId, public_url: publicUrl }) as Promise<UserInviteResult>,
+    inviteStatus: () =>
+      client.call('users.invite_status') as Promise<{ statuses: Record<string, UserInviteState> }>,
     list: () =>
       client.call('users.list') as Promise<{ users: UserDetail[] }>,
     /** Active users strictly below the caller's rank (manager+). Minimal
@@ -8765,13 +8820,15 @@ export const api = {
     create: (params: {
       email: string;
       display_name: string;
-      password: string;
+      password?: string;
+      invite?: boolean;
+      public_url?: string;
       role?: string;
       department?: string;
       /** Direct manager; omit for none. */
       manager_user_id?: string;
     }) =>
-      client.call('users.create', params) as Promise<{ user: UserInfo }>,
+      client.call('users.create', params) as Promise<{ user: UserInfo; invite?: UserInviteResult }>,
     /** `department: ''` clears the user's department; omit to leave unchanged.
      *  `manager_user_id: null` (or `''`) clears the direct manager; omit to
      *  leave it unchanged. The gateway validates the reporting line and
@@ -8815,6 +8872,8 @@ export const api = {
         status: string;
         transferred_agents: string[];
       }>,
+    setPrimaryAgent: (agentId: string | null) =>
+      client.call('users.set_primary_agent', { agent_id: agentId }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>
       client.call('users.me') as Promise<{
         user: UserInfo;

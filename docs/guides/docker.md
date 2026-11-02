@@ -609,7 +609,7 @@ After a restart, the startup log prints the extra origins that took effect. See
 
 ### Task sandbox can't start
 
-This applies only to employees with `agent.toml [container] sandbox_enabled = true`. The official image does not support the task sandbox for a gateway running in a container: the image has no Docker client and the default compose files do not mount `docker.sock`. If you need the task sandbox, install the gateway on the host (see [task-sandbox.md](task-sandbox.md)).
+This applies only to employees with `agent.toml [container] sandbox_enabled = true`. The official image does not support the task sandbox for a gateway running in a container: the image includes the `docker.io` client, but the default compose files do not mount `docker.sock`. If you need the task sandbox, install the gateway on the host (see [task-sandbox.md](task-sandbox.md)).
 
 ### Codex employees can't run shell commands
 

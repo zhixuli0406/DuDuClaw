@@ -456,7 +456,7 @@ mod tests {
 
     fn ctx(home: &Path) -> InstallCtx {
         InstallCtx {
-            home: home.to_path_buf(), dry_run: true, confirm_profile: None,
+            home: home.to_path_buf(), dry_run: true, confirm_profile: None, signature_status: None,
             rename: false, trust_hooks: false, attach_under: None,
             reimport: super::super::reimport::ReimportMode::Fresh, replace: None,
             agent_cap: None, replace_state: Default::default(),

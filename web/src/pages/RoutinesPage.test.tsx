@@ -23,9 +23,9 @@ beforeEach(() => {
 describe('RoutinesPage', () => {
   it('renders the collection header with the create action', () => {
     renderWithProviders(<RoutinesPage />);
-    expect(screen.getByRole('heading', { name: 'Routines' })).toBeInTheDocument();
-    // Primary "new routine" CTA (routines.add).
-    expect(screen.getAllByText('New routine').length).toBeGreaterThan(0);
+    expect(screen.getByRole('heading', { name: 'Automations' })).toBeInTheDocument();
+    // Primary create CTA (routines.add).
+    expect(screen.getAllByText('New automation').length).toBeGreaterThan(0);
   });
 
   // ── WP6: channel-action → dashboard live feedback ──────────────────────
