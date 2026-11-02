@@ -13,7 +13,7 @@ fn home() -> tempfile::TempDir {
         d.path(),
         super::super::McpOAuthClientConfig {
             provider_id: "google".into(),
-            client_id: "presence-fixture".into(),
+            client_id: format!("presence-fixture-{}", uuid::Uuid::new_v4()),
             client_secret: String::new(),
             auth_url: crate::google_personal::oauth::AUTHORIZE.into(),
             token_url: crate::google_personal::oauth::TOKEN.into(),
@@ -35,7 +35,7 @@ fn edit(home: &Path, change: impl FnOnce(&mut Value)) {
 fn pending(home: &Path) {
     let desired = super::super::McpOAuthConfig {
         provider_id: "google".into(),
-        client_id: "presence-fixture".into(),
+        client_id: super::super::get_client_config(home, "google").unwrap().client_id,
         client_secret: String::new(),
         auth_url: crate::google_personal::oauth::AUTHORIZE.into(),
         token_url: crate::google_personal::oauth::TOKEN.into(),
@@ -209,7 +209,7 @@ async fn malformed_control_legacy_missing_token_and_residual_payload_never_prove
             "{kind}"
         );
         assert_eq!(raw(d.path()), before, "{kind}");
-        assert_eq!(probe.counts(), [0, 0]);
+        assert_eq!(probe.counts(), [0, 0], "{kind}: presence inspection must not decrypt or contact a provider");
         assert!(!d.path().join(".keyfile").exists());
     }
 }
