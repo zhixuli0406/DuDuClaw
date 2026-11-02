@@ -168,7 +168,7 @@ pub(super) async fn gmail_search<I: LocalIo>(
         messages.push(GmailMessageMeta {
             id,
             thread_id,
-            from: header_value(&headers, "From").unwrap_or_default(),
+            from: duduclaw_security::one_time_credential::strip_one_time_credentials(&header_value(&headers, "From").unwrap_or_default()).text,
             subject: duduclaw_security::one_time_credential::strip_one_time_credentials(&header_value(&headers, "Subject").unwrap_or_default()).text,
             date: header_value(&headers, "Date").unwrap_or_default(),
             snippet: meta
@@ -219,8 +219,8 @@ pub(super) async fn gmail_read<I: LocalIo>(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        from: header_value(&headers, "From").unwrap_or_default(),
-        to: header_value(&headers, "To").unwrap_or_default(),
+        from: duduclaw_security::one_time_credential::strip_one_time_credentials(&header_value(&headers, "From").unwrap_or_default()).text,
+        to: duduclaw_security::one_time_credential::strip_one_time_credentials(&header_value(&headers, "To").unwrap_or_default()).text,
         subject: duduclaw_security::one_time_credential::strip_one_time_credentials(&header_value(&headers, "Subject").unwrap_or_default()).text,
         date: header_value(&headers, "Date").unwrap_or_default(),
         snippet: duduclaw_security::one_time_credential::strip_one_time_credentials(&msg
@@ -269,7 +269,7 @@ pub(super) async fn gmail_create_draft<I: LocalIo>(
             .unwrap_or("")
             .to_string(),
         to: to.to_string(),
-        subject: subject.to_string(),
+        subject: duduclaw_security::one_time_credential::strip_one_time_credentials(subject).text,
     })
 }
 
@@ -1352,7 +1352,7 @@ pub(super) fn collect_attachments_rec(node: &Value, out: &mut Vec<GmailAttachmen
             .and_then(|s| s.as_u64())
             .unwrap_or(0);
         out.push(GmailAttachment {
-            filename: filename.to_string(),
+            filename: duduclaw_security::one_time_credential::strip_one_time_credentials(filename).text,
             size,
         });
     }
