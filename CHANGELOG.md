@@ -41,6 +41,7 @@
 
 ### Fixed
 
+- 測試：Home OAuth 撤銷存在性測試改用各自的 client ID，避免平行 callback 的 provider 計數被算到另一個測試；新增固定順序的隔離回歸測試。
 - 語音設定在 Telegram 與 MCP 工具上沒有生效，都寫死 Edge；現在都依設定。MCP 工具只能用本機語音，付費金鑰只留在 gateway。沒有可用語音服務時，Telegram 不顯示 Voice Toggle 按鈕，合成失敗時會告知一次並改傳文字。`/voice` 在不支援的通道會直接說明。
 - 「— Powered by DuDuClaw」原本所有方案都會附加，與授權說明不符；現在只有 opensource、hobby 與沒有授權的安裝才附加，LINE Flex 頁尾比照。
 - 用儀表板連接 Claude 訂閱後，畫面仍顯示未連線。帳號池有可用的訂閱帳號現在算已連線。
