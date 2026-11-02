@@ -204,6 +204,15 @@ on disk; the operator may clean them up manually.
 
 ## Still deprecated
 
+### Legacy interactive agent session
+
+The bare `duduclaw agent` form and `duduclaw agent run <name>` start the
+legacy interactive session, which bypasses the gateway. Both forms remain
+available during the deprecation window and print a notice to stderr. Use
+`duduclaw tui` for interactive sessions. The `run` subcommand is hidden from
+help but remains parsed. Other `duduclaw agent` subcommands are unaffected.
+Removal is scheduled for **v1.81.0**.
+
 ### Pack legacy formats
 
 The legacy pack manifests `expert.toml`, `team.toml` and the industry pack

@@ -54,6 +54,7 @@
 ### Deprecated
 
 - `MEMORY.md` 標為舊格式：互動式 runner 與 `claude_runner` 路徑仍會讀取，通道、精簡模式與任務沙箱不讀。
+- `duduclaw agent`（不帶子指令）與 `duduclaw agent run <name>` 的互動工作階段已棄用，因為它會繞過 gateway；仍可使用，預計於 v1.81.0 移除。互動操作請改用 `duduclaw tui`。其他 `duduclaw agent` 子指令不受影響。
 
 ### Removed
 
