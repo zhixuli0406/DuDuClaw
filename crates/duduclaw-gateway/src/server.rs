@@ -1904,6 +1904,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .with_proactive_gate(proactive_gate)
         .with_tick_hub(tick_hub);
+        handler.set_autopilot_breakers(engine.breaker_reader()).await;
         bg_handles.push(tokio::spawn(async move { engine.run().await }));
         info!("Autopilot trigger engine started");
     } else {

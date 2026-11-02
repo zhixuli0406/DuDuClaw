@@ -4,6 +4,26 @@
 use super::*;
 
 impl MethodHandler {
+    pub(crate) async fn handle_autopilot_breakers(&self) -> WsFrame {
+        let unavailable = || WsFrame::error_response("", "Autopilot engine unavailable");
+        let Some(reader) = self.autopilot_breakers.read().await.clone() else {
+            return unavailable();
+        };
+        let store = match self.ap_store().await {
+            Ok(store) => store,
+            Err(frame) => return frame,
+        };
+        let rules = match store.list_rules().await {
+            Ok(rules) => rules,
+            Err(error) => return WsFrame::error_response("", &format!("list autopilot: {error}")),
+        };
+        let ids: Vec<String> = rules.into_iter().map(|rule| rule.id).collect();
+        match reader.snapshot(&ids).await {
+            Some(breakers) => WsFrame::ok_response("", json!({"breakers": breakers})),
+            None => unavailable(),
+        }
+    }
+
     pub(crate) async fn handle_autopilot_list(&self) -> WsFrame {
         let store = match self.ap_store().await {
             Ok(s) => s,
@@ -178,5 +198,57 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &format!("autopilot history: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn autopilot_breakers_require_admin_and_report_unavailable() {
+        use crate::handlers::task_privacy_tests::{admin, fixture};
+        let f = fixture().await;
+        let root = admin(&f);
+        for role in [UserRole::Employee, UserRole::Manager] {
+            f.db.update_user(&f.bob.user_id, None, Some(role), None).unwrap();
+            for method in ["autopilot.list", "autopilot.breakers"] {
+                let frame = f.handler.handle(method, json!({}), &f.bob).await;
+                assert!(matches!(frame, WsFrame::Response {ok:false, error:Some(ref e), ..}
+                    if e.as_str().is_some_and(|s| s.contains("permission denied"))), "{frame:?}");
+            }
+        }
+        for edition in [duduclaw_core::EditionProfile::Personal, duduclaw_core::EditionProfile::Enterprise] {
+            f.handler.set_edition_override(Some(edition)).await;
+            let frame = f.handler.handle("autopilot.breakers", json!({}), &root).await;
+            assert!(matches!(frame, WsFrame::Response {ok:false, error:Some(ref e), ..}
+                if e == "Autopilot engine unavailable"), "{frame:?}");
+        }
+        let store = Arc::new(AutopilotStore::open(&f.home).unwrap());
+        f.handler.set_autopilot_store(store.clone()).await;
+        let created = f.handler.handle_autopilot_create(json!({"name":"test", "action":{"type":"notify", "channel":"webchat", "chat_id":"test", "text":"test"}})).await;
+        let rule_id = match created {
+            WsFrame::Response {ok:true, payload:Some(p), ..} => p["rule"]["id"].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+        let tasks = Arc::new(TaskStore::open(&f.home).unwrap());
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let engine = crate::autopilot_engine::AutopilotEngine::new(f.home.clone(), store, tasks, None, rx);
+        let reader = engine.breaker_reader();
+        f.handler.set_autopilot_breakers(reader.clone()).await;
+        let handle = tokio::spawn(engine.run());
+        // Wait only for run() to publish its availability, never for a fire.
+        for _ in 0..100 {
+            if reader.snapshot(&[]).await.is_some() { break; }
+            tokio::task::yield_now().await;
+        }
+        let frame = f.handler.handle("autopilot.breakers", json!({}), &root).await;
+        assert!(matches!(frame, WsFrame::Response {ok:true, payload:Some(ref p), ..}
+            if p == &json!({"breakers":[{"rule_id":rule_id,"state":"closed","opened_at":null}]})), "{frame:?}");
+        handle.abort();
+        let _ = handle.await;
+        let frame = f.handler.handle("autopilot.breakers", json!({}), &root).await;
+        assert!(matches!(frame, WsFrame::Response {ok:false, error:Some(ref e), ..}
+            if e == "Autopilot engine unavailable"));
     }
 }

@@ -166,27 +166,20 @@ pub fn should_fire_in_tz(
     now_utc: DateTime<Utc>,
     timezone: Option<chrono_tz::Tz>,
 ) -> bool {
+    let anchor = last_run_utc.unwrap_or_else(|| now_utc - Duration::hours(1));
+    next_run_in_tz(schedule, anchor, timezone).is_some_and(|next| next <= now_utc)
+}
+
+/// Next cadence slot strictly after an instant, using the firing iterator.
+pub fn next_run_in_tz(
+    schedule: &Schedule,
+    after_utc: DateTime<Utc>,
+    timezone: Option<chrono_tz::Tz>,
+) -> Option<DateTime<Utc>> {
     match timezone {
-        Some(tz) => {
-            let now_tz = now_utc.with_timezone(&tz);
-            let anchor = last_run_utc
-                .map(|t| t.with_timezone(&tz))
-                .unwrap_or_else(|| now_tz - Duration::hours(1));
-            schedule
-                .after(&anchor)
-                .next()
-                .map(|next| next <= now_tz)
-                .unwrap_or(false)
-        }
-        None => {
-            let anchor =
-                last_run_utc.unwrap_or_else(|| now_utc - Duration::hours(1));
-            schedule
-                .after(&anchor)
-                .next()
-                .map(|next| next <= now_utc)
-                .unwrap_or(false)
-        }
+        Some(tz) => schedule.after(&after_utc.with_timezone(&tz)).next()
+            .map(|next| next.with_timezone(&Utc)),
+        None => schedule.after(&after_utc).next(),
     }
 }
 
