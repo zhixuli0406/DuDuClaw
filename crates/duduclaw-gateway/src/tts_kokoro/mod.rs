@@ -9,6 +9,9 @@ mod tone_sandhi;
 mod english;
 pub use install::is_installed;
 
+// The quantized model can produce non-finite audio for shorter inputs.
+const MIN_KOKORO_TOKENS: usize = 12;
+
 pub struct KokoroTtsProvider { home: PathBuf }
 impl KokoroTtsProvider {
     pub fn new(home: PathBuf) -> Self { Self { home } }
@@ -44,6 +47,12 @@ fn style_row(values: &[f32], token_count: usize) -> &[f32] {
     let start = token_count.min(509) * 256;
     &values[start..start + 256]
 }
+fn pad_short_tokens(mut tokens: Vec<i64>, pause_id: i64) -> Vec<i64> {
+    if tokens.len() < MIN_KOKORO_TOKENS {
+        tokens.resize(MIN_KOKORO_TOKENS, pause_id);
+    }
+    tokens
+}
 fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<Vec<u8>, String> {
     let chunks = g2p::chunks(text, dir)?;
     if chunks.is_empty() { return Err("沒有可合成的文字".into()); }
@@ -61,6 +70,9 @@ fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<V
     for (index, chunk) in chunks.into_iter().enumerate() {
         if chunk.len() > 500 { return Err("Kokoro 文字分段超出 token 限制".into()); }
         if index > 0 { pcm.resize(pcm.len() + 3600 * 2, 0); }
+        let pause_id = *g2p::vocabulary().get(&'…')
+            .ok_or("Kokoro 詞彙表缺少省略號停頓 token")?;
+        let chunk = pad_short_tokens(chunk, pause_id);
         let count = chunk.len();
         let ids: Vec<i64> = std::iter::once(0).chain(chunk).chain(std::iter::once(0)).collect();
         let ids = Tensor::from_array((vec![1i64, ids.len() as i64], ids)).map_err(|e| e.to_string())?;
@@ -79,6 +91,19 @@ fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn short_tokens_are_padded_to_minimum() {
+        assert_eq!(pad_short_tokens(vec![1, 2], 99), [1, 2, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99]);
+    }
+    #[test]
+    fn long_tokens_are_unchanged() {
+        let tokens: Vec<i64> = (0..MIN_KOKORO_TOKENS + 1).map(|n| n as i64).collect();
+        assert_eq!(pad_short_tokens(tokens.clone(), 99), tokens);
+    }
+    #[test]
+    fn empty_tokens_are_padded() {
+        assert_eq!(pad_short_tokens(Vec::new(), 99), vec![99; MIN_KOKORO_TOKENS]);
+    }
     #[test]
     fn voice_shape_and_style_clamp() {
         assert!(parse_voice(&[0; 4]).is_err());
