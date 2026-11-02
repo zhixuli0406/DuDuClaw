@@ -9,7 +9,7 @@ mod process;
 #[cfg(test)]
 mod tests;
 use crate::strings;
-pub use input::{escape, key_bytes, paste_bytes, mouse_bytes};
+pub use input::{escape, key_bytes, paste_bytes, mouse_bytes, mouse_pixels, MouseEncoding};
 use portable_pty::{CommandBuilder, PtySize};
 use std::{
     ffi::OsString,

@@ -196,11 +196,16 @@ impl App {
         if !area.contains(ratatui::layout::Position::new(event.column, event.row)) { return; }
         let Some(pty) = &pane.pty else { return; };
         let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
-        if pty.screen().scrollback() != 0 || !pty.screen().mouse_supported { return; }
+        if pty.screen().scrollback() != 0 { return; }
         let row = event.row - area.y;
         let columns = super::pty_render::host_to_vt_columns(pty.screen(), row, area.width, settings);
         if let Some(&col) = columns.get(usize::from(event.column - area.x)) {
-            let bytes = crate::pty::mouse_bytes(event, col, row + 1, pty.screen().mouse_mode, pty.screen().mouse_encoding);
+            let encoding = pty.screen().mouse_encoding;
+            let (x, y) = if encoding == crate::pty::MouseEncoding::SgrPixels {
+                let Some(position) = crate::pty::mouse_pixels(event, area, crossterm::terminal::window_size().ok()) else { return; };
+                position
+            } else { (u32::from(col), u32::from(row) + 1) };
+            let bytes = crate::pty::mouse_bytes(event, x, y, pty.screen().mouse_mode, encoding);
             pty.send(bytes);
         }
     }

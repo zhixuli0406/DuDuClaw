@@ -360,14 +360,151 @@ fn waiting_signals_are_bounded_display_only_and_hostile_strings_never_escape() {
 }
 
 #[test]
-fn unsupported_mouse_encodings_are_suppressed_until_reset() {
+fn urxvt_and_sgr_pixels_exact_mouse_bytes() {
+    use crossterm::event::{MouseEvent, MouseEventKind as K, MouseButton as B};
+    use vt100::MouseProtocolMode as Mode;
+    use MouseEncoding as E;
+    let cases: &[(K, M, &[u8], &[u8])] = &[
+        (K::Down(B::Left), M::NONE, b"\x1b[32;17;33M", b"\x1b[<0;17;33M"),
+        (K::Down(B::Middle), M::NONE, b"\x1b[33;17;33M", b"\x1b[<1;17;33M"),
+        (K::Down(B::Right), M::NONE, b"\x1b[34;17;33M", b"\x1b[<2;17;33M"),
+        (K::Up(B::Left), M::NONE, b"\x1b[35;17;33M", b"\x1b[<0;17;33m"),
+        (K::Up(B::Right), M::NONE, b"\x1b[35;17;33M", b"\x1b[<2;17;33m"),
+        (K::ScrollUp, M::NONE, b"\x1b[96;17;33M", b"\x1b[<64;17;33M"),
+        (K::ScrollDown, M::NONE, b"\x1b[97;17;33M", b"\x1b[<65;17;33M"),
+        (K::ScrollLeft, M::NONE, b"\x1b[98;17;33M", b"\x1b[<66;17;33M"),
+        (K::ScrollRight, M::NONE, b"\x1b[99;17;33M", b"\x1b[<67;17;33M"),
+        (K::Down(B::Left), M::SHIFT, b"\x1b[36;17;33M", b"\x1b[<4;17;33M"),
+        (K::Down(B::Left), M::ALT, b"\x1b[40;17;33M", b"\x1b[<8;17;33M"),
+        (K::Down(B::Left), M::CONTROL, b"\x1b[48;17;33M", b"\x1b[<16;17;33M"),
+        (K::Up(B::Right), M::SHIFT | M::ALT | M::CONTROL, b"\x1b[63;17;33M", b"\x1b[<30;17;33m"),
+        (K::ScrollDown, M::SHIFT | M::ALT | M::CONTROL, b"\x1b[125;17;33M", b"\x1b[<93;17;33M"),
+    ];
+    for &(kind, modifiers, urxvt, pixels) in cases {
+        let event = MouseEvent { kind, column: 65535, row: 65535, modifiers };
+        assert_eq!(mouse_bytes(event, 17, 33, Mode::PressRelease, E::Urxvt), urxvt);
+        assert_eq!(mouse_bytes(event, 17, 33, Mode::PressRelease, E::SgrPixels), pixels);
+        for encoding in [E::Urxvt, E::SgrPixels] {
+            assert!(mouse_bytes(event, 17, 33, Mode::None, encoding).is_empty());
+            assert!(mouse_bytes(event, 0, 33, Mode::PressRelease, encoding).is_empty());
+            assert!(mouse_bytes(event, 17, 0, Mode::PressRelease, encoding).is_empty());
+        }
+    }
+    let event = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: M::NONE };
+    for encoding in [E::Urxvt, E::SgrPixels] {
+        assert!(mouse_bytes(event(K::Up(B::Left)), 1, 1, Mode::Press, encoding).is_empty());
+        assert!(mouse_bytes(event(K::Drag(B::Left)), 1, 1, Mode::PressRelease, encoding).is_empty());
+        assert!(mouse_bytes(event(K::Moved), 1, 1, Mode::ButtonMotion, encoding).is_empty());
+    }
+    assert_eq!(mouse_bytes(event(K::Drag(B::Left)), 500, 200, Mode::ButtonMotion, E::Urxvt), b"\x1b[64;500;200M");
+    assert_eq!(mouse_bytes(event(K::Moved), 4000, 3200, Mode::AnyMotion, E::SgrPixels), b"\x1b[<35;4000;3200M");
+    assert_eq!(mouse_bytes(event(K::Down(B::Left)), 1, 1, Mode::PressRelease, E::Urxvt), b"\x1b[32;1;1M");
+    assert_eq!(mouse_bytes(event(K::Down(B::Left)), u32::MAX, u32::MAX, Mode::PressRelease, E::SgrPixels), b"\x1b[<0;4294967295;4294967295M");
+}
+
+#[test]
+fn pixel_coordinates_use_host_geometry_or_fallback_and_stay_inside_pane() {
+    use crossterm::{event::{MouseEvent, MouseEventKind, MouseButton}, terminal::WindowSize};
+    use ratatui::layout::Rect;
+    let area = Rect::new(40, 10, 20, 4);
+    let event = |column, row| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: M::NONE };
+    for (column, row, expected) in [(40, 10, (1, 1)), (59, 10, (153, 1)), (40, 13, (1, 49)), (59, 13, (153, 49))] {
+        let position = mouse_pixels(event(column, row), area, None).unwrap();
+        assert_eq!(position, expected);
+        assert!(position.0 <= 160 && position.1 <= 64);
+    }
+    let host = || Some(WindowSize { columns: 80, rows: 24, width: 800, height: 480 });
+    assert_eq!(mouse_pixels(event(59, 13), area, host()), Some((191, 61)));
+    assert_eq!(mouse_pixels(event(40, 10), area, host()), Some((1, 1)));
+    let (x, y) = mouse_pixels(event(59, 13), area, host()).unwrap();
+    assert_eq!(mouse_bytes(event(59, 13), x, y, vt100::MouseProtocolMode::PressRelease, MouseEncoding::SgrPixels), b"\x1b[<0;191;61M");
+    for (column, row) in [(39, 10), (60, 10), (40, 9), (40, 14), (u16::MAX, u16::MAX)] {
+        assert_eq!(mouse_pixels(event(column, row), area, host()), None);
+    }
+    assert_eq!(mouse_pixels(event(40, 10), Rect::new(40, 10, 0, 4), None), None);
+    assert_eq!(mouse_pixels(event(40, 10), Rect::new(40, 10, 20, 0), None), None);
+    for size in [
+        WindowSize { columns: 0, rows: 0, width: 800, height: 480 },
+        WindowSize { columns: 80, rows: 24, width: 0, height: 0 },
+        WindowSize { columns: 80, rows: 24, width: 1, height: 1 },
+        WindowSize { columns: 80, rows: 24, width: 800, height: 0 },
+    ] {
+        assert_eq!(mouse_pixels(event(59, 13), area, Some(size)), Some((153, 49)));
+    }
+    let huge = Some(WindowSize { columns: 1, rows: 1, width: u16::MAX, height: u16::MAX });
+    assert_eq!(mouse_pixels(event(65534, 65534), Rect::new(0, 0, 65535, 65535), huge), Some((4294770691, 4294770691)));
+}
+
+#[test]
+fn mouse_encoding_precedence_survives_every_mode_subset_and_reset_order() {
+    use MouseEncoding as E;
+    let modes = [1005, 1015, 1006, 1016];
+    let encodings = [E::Utf8, E::Urxvt, E::Sgr, E::SgrPixels];
+    for mask in 0..16 {
+        for reverse in [false, true] {
+            let mut filter = filter::Filter::default();
+            for i in 0..4 {
+                let i = if reverse { 3 - i } else { i };
+                if mask & (1 << i) != 0 {
+                    filter.process(format!("\x1b[?{}h", modes[i]).as_bytes(), 24, 80, |_| {});
+                }
+            }
+            let mut remaining = mask;
+            for i in (0..4).rev() {
+                let expected = (0..4).rev().find(|bit| remaining & (1 << bit) != 0).map(|bit| encodings[bit]).unwrap_or(E::Default);
+                assert_eq!(filter.mouse_encoding(), expected);
+                filter.process(format!("\x1b[?{}l", modes[i]).as_bytes(), 24, 80, |_| {});
+                remaining &= !(1 << i);
+            }
+            assert_eq!(filter.mouse_encoding(), E::Default);
+        }
+    }
+}
+
+#[test]
+fn hostile_child_mouse_toggles_are_streaming_atomic_and_reporting_stays_required() {
+    use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
+    use vt100::MouseProtocolMode as Mode;
+    use MouseEncoding as E;
     let mut filter = filter::Filter::default();
-    for mode in [b"1015".as_slice(), b"1016"] {
-        let set = [b"\x1b[?".as_slice(), mode, b"h"].concat();
-        let reset = [b"\x1b[?".as_slice(), mode, b"l"].concat();
-        filter.process(&set, 24, 80, |_| {});
-        assert_ne!(filter.unsupported_mouse, 0);
-        filter.process(&reset, 24, 80, |_| {});
-        assert_eq!(filter.unsupported_mouse, 0);
+    let mut parser = vt100::Parser::new(24, 80, 0);
+    let event = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 40, row: 10, modifiers: M::NONE };
+    let steps: &[(&[u8], E, Mode, &[u8])] = &[
+        (b"\x1b[?1016h", E::SgrPixels, Mode::None, b""),
+        (b"\x1b[?1000h", E::SgrPixels, Mode::PressRelease, b"\x1b[<0;1;1M"),
+        (b"\x1b[?1005;1015;1006h", E::SgrPixels, Mode::PressRelease, b"\x1b[<0;1;1M"),
+        (b"\x1b[?1016", E::SgrPixels, Mode::PressRelease, b"\x1b[<0;1;1M"),
+        (b"l", E::Sgr, Mode::PressRelease, b"\x1b[<0;1;1M"),
+        (b"\x1b[?1006l", E::Urxvt, Mode::PressRelease, b"\x1b[32;1;1M"),
+        (b"\x1b]2;\x1b[?1016\x18", E::Urxvt, Mode::PressRelease, b"\x1b[32;1;1M"),
+        (b"\x1b[?1016:1h\x1b[?1016 h", E::Urxvt, Mode::PressRelease, b"\x1b[32;1;1M"),
+        (b"\x1b[?0001016h", E::SgrPixels, Mode::PressRelease, b"\x1b[<0;1;1M"),
+        (b"\x1b[?1016;1015l", E::Utf8, Mode::PressRelease, b"\x1b[M !!"),
+        (b"\x1b[?1005l", E::Default, Mode::PressRelease, b"\x1b[M !!"),
+        (b"\x1b[?1015h\x1b[?1000l", E::Urxvt, Mode::None, b""),
+        (b"\x1bc", E::Default, Mode::None, b""),
+    ];
+    for &(bytes, encoding, mode, expected) in steps {
+        for byte in bytes { filter.process(&[*byte], 24, 80, |safe| parser.process(safe)); }
+        assert_eq!(filter.mouse_encoding(), encoding);
+        assert_eq!(parser.screen().mouse_protocol_mode(), mode);
+        assert_eq!(mouse_bytes(event, 1, 1, mode, encoding), expected);
+    }
+    // Overlong sequences, excess parameters and OSC text cannot set a mode.
+    for bytes in [
+        [b"\x1b[?".as_slice(), &[b'0'; 128], b"1016h"].concat(),
+        [b"\x1b[?".as_slice(), b"1;".repeat(32).as_slice(), b"1016h"].concat(),
+        b"\x1b]2;?1016h\x07".to_vec(),
+        b"\x1b[?9999999999999999991016h".to_vec(),
+        b"\x1b[?1006 ;1016h".to_vec(),
+        b"\x1b[?1016;1 h".to_vec(),
+        b"\x1b[?1006:1;1016h".to_vec(),
+    ] {
+        for split in 0..=bytes.len() {
+            let mut filter = filter::Filter::default();
+            filter.process(&bytes[..split], 24, 80, |_| {});
+            filter.process(&bytes[split..], 24, 80, |_| {});
+            assert_eq!(filter.mouse_encoding(), E::Default);
+        }
     }
 }

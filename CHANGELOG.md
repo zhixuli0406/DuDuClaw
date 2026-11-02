@@ -4,6 +4,8 @@
 
 ### Added
 
+- PTY mouse forwarding adds urxvt (1015) and SGR-Pixels (1016), with explicit encoding precedence and pane-relative pixel estimates from host cell dimensions (8×16 fallback).
+
 - 終端控制室補上同一連線的多聊天室：各自保留員工、對話、草稿、歷史、捲動與取消後的下游停止詢問，最多四個區塊。`tui watch --run <id>` 可追蹤指定執行，位置參數仍為員工名稱。導覽事件僅選取已知目標，輸入或確認中不搶焦點。
 - 終端通知新增 OSC 777 與連線錯誤固定文字，維持預設關閉、失焦與每分鐘一次限制。PTY 加入焦點內的滑鼠回報與僅顯示用途的等待標記，不轉送子行程通知內容、不代為回答或授權；Windows PTY 仍停用。
 - `cost.summary` 新增受保留期限制的 RFC3339 `since`；控制室確認閘道接受本機午夜後才標「今日」，舊閘道仍顯示「近 24 小時」。新增隔離 home 的 `scripts/live-test/tui-control-room.sh`，檢查真實 inbox 與自主暫停／恢復 RPC；本次沙箱尚未執行活測。

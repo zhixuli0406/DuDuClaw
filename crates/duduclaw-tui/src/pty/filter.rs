@@ -19,7 +19,7 @@ pub(super) struct Filter {
     osc_invalid: bool,
     osc_escape: bool,
     pub waiting_seq: u64,
-    pub unsupported_mouse: u8,
+    mouse_encodings: u8,
     csi: [u8; MAX_CSI],
     len: usize,
     params: usize,
@@ -31,11 +31,21 @@ pub(super) struct Filter {
 }
 impl Default for Filter {
     fn default() -> Self {
-        Self { state: State::Ground, osc: Vec::new(), osc_invalid: false, osc_escape: false, waiting_seq: 0, unsupported_mouse: 0, csi: [0; MAX_CSI], len: 0, params: 1,
+        Self { state: State::Ground, osc: Vec::new(), osc_invalid: false, osc_escape: false, waiting_seq: 0, mouse_encodings: 0, csi: [0; MAX_CSI], len: 0, params: 1,
             utf8: [0; 4], utf8_len: 0, utf8_left: 0, utf8_min: 0x80, utf8_max: 0xbf }
     }
 }
 impl Filter {
+    pub fn mouse_encoding(&self) -> super::input::MouseEncoding {
+        use super::input::MouseEncoding as E;
+        // Explicit precedence is independent of set/reset order in the byte stream.
+        if self.mouse_encodings & 8 != 0 { E::SgrPixels }
+        else if self.mouse_encodings & 4 != 0 { E::Sgr }
+        else if self.mouse_encodings & 2 != 0 { E::Urxvt }
+        else if self.mouse_encodings & 1 != 0 { E::Utf8 }
+        else { E::Default }
+    }
+
     fn finish_osc(&mut self) {
         if !self.osc_invalid && let Ok(text) = std::str::from_utf8(&self.osc)
             && !text.chars().any(crate::sanitize::forbidden)
@@ -140,7 +150,7 @@ impl Filter {
                     // the remaining listed VT escapes also finish vte's Escape.
                     b'7' | b'8' | b'=' | b'>' | b'c' | b'D' | b'E' | b'H' |
                     b'M' | b'Z' | b'\\' | b'g' => {
-                        if byte == b'c' { self.unsupported_mouse = 0; }
+                        if byte == b'c' { self.mouse_encodings = 0; }
                         push(0x1b); push(byte); self.state = State::Ground;
                     }
                     _ => {
@@ -192,12 +202,18 @@ impl Filter {
         if used > 0 { emit(&output[..used]); }
     }
     fn emit_csi(&mut self, rows: u16, cols: u16, push: &mut impl FnMut(u8)) {
-        // Never answer an unsupported mouse encoding with a different one.
-        if self.csi[0] == b'?' && matches!(self.csi[self.len - 1], b'h' | b'l') {
+        // Track independent DECSET/DECRST bits, rather than vt100's last-set encoding.
+        if self.csi[0] == b'?' && matches!(self.csi[self.len - 1], b'h' | b'l')
+            && self.csi[1..self.len - 1].iter().all(|byte| byte.is_ascii_digit() || *byte == b';')
+        {
             let enabled = self.csi[self.len - 1] == b'h';
             for mode in self.csi[1..self.len - 1].split(|b| *b == b';') {
-                let bit = match mode { b"1015" => 1, b"1016" => 2, _ => 0 };
-                if enabled { self.unsupported_mouse |= bit; } else { self.unsupported_mouse &= !bit; }
+                let value = mode.iter().try_fold(0u16, |value, byte| {
+                    if !byte.is_ascii_digit() { return None; }
+                    value.checked_mul(10)?.checked_add(u16::from(*byte - b'0'))
+                });
+                let bit = match value { Some(1005) => 1, Some(1015) => 2, Some(1006) => 4, Some(1016) => 8, _ => 0 };
+                if enabled { self.mouse_encodings |= bit; } else { self.mouse_encodings &= !bit; }
             }
         }
         push(0x1b);

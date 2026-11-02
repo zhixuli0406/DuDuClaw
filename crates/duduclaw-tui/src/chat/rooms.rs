@@ -14,10 +14,12 @@ impl ChatRooms {
     pub(crate) fn room(&mut self, id: &str) -> Option<&mut ChatState> {
         if !self.rooms.contains_key(id) {
             if self.rooms.len() >= 4 { return None; }
-            let mut state = ChatState::default();
-            state.connected = self.connected;
-            state.stale = !self.connected;
-            state.base_session = self.base_session.clone();
+            let state = ChatState {
+                connected: self.connected,
+                stale: !self.connected,
+                base_session: self.base_session.clone(),
+                ..ChatState::default()
+            };
             self.rooms.insert(id.into(), state);
         }
         self.rooms.get_mut(id)
