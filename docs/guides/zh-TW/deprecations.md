@@ -166,6 +166,13 @@ CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 
 ## 仍在棄用期
 
+### 舊版互動式 agent 工作階段
+
+不帶子指令的 `duduclaw agent` 與 `duduclaw agent run <name>` 會啟動會繞過
+gateway 的舊版互動工作階段。棄用期間兩種寫法仍可使用，並會在 stderr 顯示提示。
+互動操作請改用 `duduclaw tui`。`run` 子指令仍可解析，但不顯示在說明中；其他
+`duduclaw agent` 子指令不受影響。預計於 **v1.81.0** 移除。
+
 ### 板模包的舊格式
 
 板模包的舊 manifest `expert.toml`、`team.toml` 與產業包目錄結構已棄用。v1.69.0 仍然

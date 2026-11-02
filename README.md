@@ -215,7 +215,8 @@ Full feature list in [docs/features/feature-inventory.md](docs/features/feature-
 ```
 duduclaw onboard             # first-run setup; the browser wizard covers this now, use for headless/scripted setups (--yes to skip prompts)
 duduclaw run                 # start everything (gateway + channels + heartbeat + cron + dispatcher)
-duduclaw agent               # interactive chat; subcommands create / list / inspect / pause / resume / run
+duduclaw agent list          # list agents; subcommands create / inspect / pause / resume / export / freeze / unfreeze
+duduclaw tui                 # interactive control room and chat
 duduclaw wizard              # industry-template setup
 duduclaw status              # system health snapshot
 duduclaw doctor              # diagnostics

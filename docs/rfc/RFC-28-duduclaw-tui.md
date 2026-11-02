@@ -268,7 +268,7 @@ The control room is a dashboard client and has exactly the dashboard's authority
 
 Each milestone ships with: the five required CI checks green, a local Windows cross-compile, a live run against an isolated home, and CHANGELOG plus three-language docs in the same pull request.
 
-Separately, the legacy interactive mode of `duduclaw agent` (no subcommand), which bypasses the gateway, will be deprecated under the normal two-minor-version policy once the control room ships.
+Separately, the legacy interactive mode of `duduclaw agent` (no subcommand), which bypasses the gateway, entered deprecation in v1.79.0 now that the control room shipped in v1.78.0. Removal is scheduled for v1.81.0 under the normal two-minor-version policy; `duduclaw agent run <name>` reaches the same deprecated session.
 
 ---
 
