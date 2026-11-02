@@ -245,8 +245,18 @@ pub(crate) mod tests {
     /// conflicts across descriptions even within one process).
     pub(crate) fn hold_lock(log: &AuditLog) -> std::fs::File {
         let f = open_verified(&log.lock_path(), libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC, log.owner_uid).unwrap();
-        // SAFETY: valid descriptor.
-        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: valid descriptor.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if Instant::now() >= deadline {
+                panic!("failed to acquire audit lock within 5 seconds: {error}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         f
     }
 

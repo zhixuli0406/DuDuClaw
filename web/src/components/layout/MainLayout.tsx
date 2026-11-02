@@ -4,6 +4,8 @@ import { Suspense, useEffect } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import { AppSidebar } from './AppSidebar';
 import { RouteErrorBoundary } from './RouteErrorBoundary';
+import { useAuthStore } from '@/stores/auth-store';
+import { isEmployeeSidebar } from './nav-model';
 import { crumbsFor } from './nav-model';
 import { MobileBottomNav } from './MobileBottomNav';
 import { GuidedTour } from '@/components/tour/GuidedTour';
@@ -128,6 +130,9 @@ function AppShell() {
   const { content } = usePanel();
   const navActive = useNavProgressStore((s) => s.active);
   const brandName = useEffectiveName();
+  const role = useAuthStore(s => s.user?.role);
+  const status = useSystemStore(s => s.status);
+  const employee = isEmployeeSidebar(role, status?.edition_profile === 'personal');
   const isInbox = location.pathname === '/inbox';
 
   return (
@@ -147,7 +152,7 @@ function AppShell() {
           {/* 收件匣 left the bottom bar on 2026-08-04 (D17). On a phone the
               drawer's bell is two taps away, so the signal lives here instead —
               and only appears when something is actually waiting. */}
-          <MobileInboxBell />
+          {!employee && <MobileInboxBell />}
         </div>
 
         <div className={cn('flex min-h-0 flex-1 flex-col', isInbox ? 'overflow-hidden' : 'overflow-y-auto')}>
@@ -167,6 +172,7 @@ function AppShell() {
             </RouteErrorBoundary>
           </div>
         </div>
+        {employee && status?.version && <p className="shrink-0 px-4 pb-16 text-right font-mono text-[10px] text-muted-foreground md:pb-2">v{status.version}</p>}
       </SidebarInset>
 
       {/* Right column — mounts only when a page supplies panel content. */}

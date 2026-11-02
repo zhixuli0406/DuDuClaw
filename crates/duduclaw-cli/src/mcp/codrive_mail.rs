@@ -195,10 +195,11 @@ pub(crate) async fn handle_mail_list(args: &Value, home_dir: &Path, default_agen
             let rows: Vec<Value> = items
                 .iter()
                 .map(|m| {
+                    let subject = duduclaw_security::one_time_credential::strip_one_time_credentials(&m.subject);
                     serde_json::json!({
                         "mail_id": m.mail_id,
                         "from": m.from,
-                        "subject": m.subject,
+                        "subject": subject.text,
                         "received_at": m.received_at,
                         "source": m.source,
                         "read": m.read,
@@ -254,7 +255,7 @@ pub(crate) async fn handle_mail_read(args: &Value, home_dir: &Path, default_agen
             &serde_json::json!({
                 "mail_id": item.mail_id,
                 "from": item.from,
-                "subject": item.subject,
+                "subject": duduclaw_security::one_time_credential::strip_one_time_credentials(&item.subject).text,
                 "received_at": item.received_at,
                 "source": item.source,
                 "flagged": item.suspicious,

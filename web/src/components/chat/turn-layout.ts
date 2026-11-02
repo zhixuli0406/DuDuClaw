@@ -13,15 +13,23 @@ import type { ChatMessage } from '@/stores/chat-store';
 export function splitTurnMessages(
   messages: readonly ChatMessage[],
   isStreaming: boolean,
+  activeMessageId?: string | null,
 ): {
   prior: readonly ChatMessage[];
+  following: readonly ChatMessage[];
   streamingAssistant: ChatMessage | null;
   turnReply: ChatMessage | null;
 } {
-  const last = messages[messages.length - 1];
+  const userIndex = activeMessageId ? messages.findIndex(m => m.role === 'user' && m.turnId === activeMessageId) : -1;
+  const end = userIndex >= 0
+    ? (messages[userIndex + 1]?.role === 'assistant' && messages[userIndex + 1]?.turnId === activeMessageId ? userIndex + 2 : userIndex + 1)
+    : messages.findIndex(m => m.role === 'user' && m.delivery === 'queued');
+  const visible = end >= 0 ? messages.slice(0, end) : messages;
+  const following = end >= 0 ? messages.slice(end) : [];
+  const last = visible[visible.length - 1];
   const isAssistant = last?.role === 'assistant';
-  const streamingAssistant = isStreaming && isAssistant && last.tokens == null ? last : null;
+  const streamingAssistant = isStreaming && isAssistant && last.tokens == null && (!last.turnId || last.turnId === activeMessageId) ? last : null;
   const turnReply = !isStreaming && isAssistant && last.thinking ? last : null;
-  const prior = streamingAssistant || turnReply ? messages.slice(0, -1) : messages;
-  return { prior, streamingAssistant, turnReply };
+  const prior = streamingAssistant || turnReply ? visible.slice(0, -1) : visible;
+  return { prior, following, streamingAssistant, turnReply };
 }

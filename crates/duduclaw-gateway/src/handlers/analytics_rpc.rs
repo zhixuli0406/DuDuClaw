@@ -42,8 +42,8 @@ impl MethodHandler {
                         .unwrap_or(0);
                     // 2026-07 MED: exclude hide/undo tombstones so the
                     // dashboard counts match runs.list / runs.get. Older
-                    // DBs without the columns fall back to plain counts
-                    // (never silently 0).
+                    // DBs without undone_at fall back to hidden-filtered counts;
+                    // unreadable visibility fails closed.
                     let msgs: i64 = conn
                         .query_row(
                             "SELECT COUNT(*) FROM session_messages sm
@@ -57,7 +57,7 @@ impl MethodHandler {
                             rusqlite::Error::SqliteFailure(..) => conn.query_row(
                                 "SELECT COUNT(*) FROM session_messages sm
                                  JOIN sessions s ON sm.session_id = s.id
-                                 WHERE s.last_active >= ?1",
+                                 WHERE s.last_active >= ?1 AND COALESCE(sm.hidden, 0) = 0",
                                 params![cutoff],
                                 |r| r.get(0),
                             ),
@@ -78,7 +78,7 @@ impl MethodHandler {
                             rusqlite::Error::SqliteFailure(..) => conn.query_row(
                                 "SELECT COUNT(*) FROM session_messages sm
                                  JOIN sessions s ON sm.session_id = s.id
-                                 WHERE s.last_active >= ?1 AND sm.role = 'assistant'",
+                                 WHERE s.last_active >= ?1 AND sm.role = 'assistant' AND COALESCE(sm.hidden, 0) = 0",
                                 params![cutoff],
                                 |r| r.get(0),
                             ),

@@ -8,6 +8,7 @@ pub mod org_write;
 pub mod team_history;
 pub mod otp;
 pub mod user_update;
+pub mod user_invites;
 mod user_row;
 
 pub use acl::UserContext;

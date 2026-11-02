@@ -294,8 +294,8 @@ impl MethodHandler {
         // 2026-07 MED: honour the /undo //rollback tombstones like runs.list
         // does (`query_run_msg_rows`) — runs.get is the user-facing transcript
         // view, not an audit surface, so undone turns must not resolve.
-        // Pre-migration DBs (no hidden/undone_at columns) fall back to the
-        // plain query, mirroring `query_run_msg_rows`.
+        // DBs without undone_at use a hidden-filtered fallback, mirroring
+        // `query_run_msg_rows`; missing hidden fails closed.
         let head_row = |row: &rusqlite::Row<'_>| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -314,11 +314,11 @@ impl MethodHandler {
                 head_row,
             )
             .or_else(|e| match e {
-                // Older DB without the tombstone columns → plain query.
+                // Older DB without undone_at; hidden remains mandatory.
                 rusqlite::Error::SqliteFailure(..) => conn.query_row(
                     "SELECT s.agent_id, m.role, m.content, m.timestamp
                      FROM session_messages m JOIN sessions s ON s.id = m.session_id
-                     WHERE m.id = ?1 AND m.session_id = ?2",
+                     WHERE m.id = ?1 AND m.session_id = ?2 AND COALESCE(m.hidden, 0) = 0",
                     params![rowid, session_id],
                     head_row,
                 ),
@@ -353,7 +353,7 @@ impl MethodHandler {
             .or_else(|e| match e {
                 rusqlite::Error::SqliteFailure(..) => conn.query_row(
                     "SELECT id, timestamp FROM session_messages
-                     WHERE session_id = ?1 AND id > ?2 AND role = 'user'
+                     WHERE session_id = ?1 AND id > ?2 AND role = 'user' AND COALESCE(hidden, 0) = 0
                      ORDER BY id LIMIT 1",
                     params![session_id, rowid],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
@@ -374,7 +374,7 @@ impl MethodHandler {
             .or_else(|e| match e {
                 rusqlite::Error::SqliteFailure(..) => conn.query_row(
                     "SELECT content, timestamp FROM session_messages
-                     WHERE session_id = ?1 AND id > ?2 AND id < ?3 AND role = 'assistant'
+                     WHERE session_id = ?1 AND id > ?2 AND id < ?3 AND role = 'assistant' AND COALESCE(hidden, 0) = 0
                      ORDER BY id LIMIT 1",
                     params![session_id, rowid, bound_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),

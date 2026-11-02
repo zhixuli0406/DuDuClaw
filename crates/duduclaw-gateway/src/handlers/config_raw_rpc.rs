@@ -631,6 +631,7 @@ const RAW_INFERENCE_SENSITIVE_KEYS: &[&str] = &[
     "llamafile.extra_args",
     "llamafile.host",
     "router.ucci_observations",
+    "voice.tts_command",
 ];
 
 /// `(key, before, after)` for every sensitive key that changed; `Err` for a

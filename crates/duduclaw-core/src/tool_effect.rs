@@ -214,7 +214,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         "activity_post" | "belief_settle" | "belief_submit" | "browser_record_start"
         | "browser_record_stop" | "canvas_clear" | "computer_click" | "computer_key"
         | "computer_navigate" | "computer_scroll" | "computer_session_start"
-        | "computer_session_stop" | "computer_type" | "credential_declare" | "computer_workspace_write"
+        | "computer_session_stop" | "computer_type" | "computer_login" | "credential_declare" | "computer_workspace_write"
         | "create_task" | "decision_resolve" | "desktop_record_start" | "desktop_record_stop"
         | "docs_append" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "memory_alias_add" | "memory_store" | "merge_or_select" | "notion_page_append"
@@ -296,7 +296,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "belief_submit" | "browser_record_start" | "browser_record_stop"
         | "calendar_create_event" | "cancel_reminder" | "canvas_clear" | "canvas_push"
         | "capability_request" | "computer_click" | "computer_key" | "computer_navigate"
-        | "computer_scroll" | "computer_session_stop" | "computer_type"
+        | "computer_scroll" | "computer_session_stop" | "computer_type" | "computer_login"
         | "credential_declare" | "computer_workspace_write" | "create_agent" | "create_reminder" | "create_task"
         | "delete_cron_task" | "desktop_record_start" | "desktop_record_stop"
         | "discovery_cancel" | "docs_append" | "evolution_toggle" | "github_issue_comment"
@@ -332,6 +332,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "codrive_run",
     "computer_navigate",
     "computer_type",
+    "computer_login",
     "db_query",
     "db_select",
     "db_tables",

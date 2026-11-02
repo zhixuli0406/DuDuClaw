@@ -643,7 +643,7 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 
 ### 任務沙箱無法啟動
 
-這只適用於 `agent.toml [container] sandbox_enabled = true` 的員工。官方映像不支援在容器裡的 gateway 使用任務沙箱：映像沒有 Docker client，預設 compose 也不掛載 `docker.sock`。需要任務沙箱時，請把 gateway 裝在宿主機上（見 [task-sandbox.md](task-sandbox.md)）。
+這只適用於 `agent.toml [container] sandbox_enabled = true` 的員工。官方映像不支援在容器裡的 gateway 使用任務沙箱：映像包含 `docker.io` 用戶端，但預設 compose 不掛載 `docker.sock`。需要任務沙箱時，請把 gateway 裝在宿主機上（見 [task-sandbox.md](task-sandbox.md)）。
 
 ### Codex 員工的 shell 指令無法執行
 

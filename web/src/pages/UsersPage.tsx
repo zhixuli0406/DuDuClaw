@@ -1,8 +1,10 @@
 import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type UserDetail } from '@/lib/api';
+import { api, type UserDetail, type UserInviteState } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
+import { InviteEmailPreview, InviteLinkDialog, InviteStatusChip } from './users/InviteControls';
+import { useAuthStore } from '@/stores/auth-store';
 import { OrgChartView } from './users/OrgChartView';
 import { OrgHistorySettings } from './users/OrgHistorySettings';
 import { CreateUserDialog, EditUserDialog } from './users/UserFormDialogs';
@@ -19,6 +21,7 @@ import {
 } from './users/UserRowParts';
 import { listChannelIdentities, type ChannelIdentity } from '@/lib/channel-identity-api';
 import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
   Button,
   ListGridContainer,
   ListGridHeader,
@@ -40,6 +43,11 @@ export function UsersPage() {
   const intl = useIntl();
   const isMobile = useIsMobile();
   const agentName = useAgentDisplayName();
+  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
+  const [inviteStates, setInviteStates] = useState<Record<string, UserInviteState>>({});
+  const [inviteLink, setInviteLink] = useState<string | null>(null);
+  const [inviteUser, setInviteUser] = useState<UserDetail | null>(null);
+  const [inviting, setInviting] = useState(false);
   const [users, setUsers] = useState<UserDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -57,6 +65,7 @@ export function UsersPage() {
   const nameOf = (id?: string | null) => (id ? users.find((u) => u.id === id)?.display_name : undefined);
   const actionsFor = (user: UserDetail) => ({
     onEdit: () => setShowEdit(user),
+    ...(isAdmin && user.status === 'active' && (user.invite_eligible === true || inviteStates[user.id] === 'pending' || inviteStates[user.id] === 'expired') ? { onInvite: () => setInviteUser(user) } : {}),
     onBind: () => setShowBind(user.id),
     onOffboard: () => setShowOffboard(user),
     onRemove: () => setShowRemove(user),
@@ -67,12 +76,16 @@ export function UsersPage() {
       setFetchError(null);
       const { users: data } = await api.users.list();
       setUsers(data);
+      if (isAdmin) {
+        try { const result = await api.users.inviteStatus(); setInviteStates(result.statuses ?? {}); }
+        catch { setInviteStates({}); }
+      }
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : 'Failed to load users');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     fetchUsers();
@@ -103,6 +116,19 @@ export function UsersPage() {
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
   }, [intl, fetchUsers]);
+
+  const sendInvite = async () => {
+    if (!inviteUser || inviting) return;
+    setInviting(true);
+    try {
+      const result = await api.users.invite(inviteUser.id, window.location.origin);
+      toast[result.sent ? 'success' : 'info'](intl.formatMessage({ id: result.sent ? 'users.invite.sent' : 'users.invite.notSent' }));
+      setInviteUser(null);
+      if (!result.sent && result.link) setInviteLink(result.link);
+      void fetchUsers();
+    } catch { toast.error(intl.formatMessage({ id: 'users.invite.failed' })); }
+    finally { setInviting(false); }
+  };
 
   return (
     <div className="mx-auto w-full max-w-[1200px] space-y-6">
@@ -171,6 +197,7 @@ export function UsersPage() {
                 <div className="flex flex-wrap items-center gap-1.5">
                   <RoleBadge role={user.role} />
                   <StatusBadge status={user.status} />
+                  <InviteStatusChip state={inviteStates[user.id]} />
                 </div>
                 <div className="flex flex-col gap-0.5">
                   <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
@@ -229,8 +256,9 @@ export function UsersPage() {
                 <ListGridCell className="flex-wrap gap-1 py-1.5">
                   <IdentityChips state={identities[user.id]} onAdd={() => setShowIdentityBind(user.id)} />
                 </ListGridCell>
-                <ListGridCell>
+                <ListGridCell className="flex-col items-start gap-1">
                   <StatusBadge status={user.status} />
+                  <InviteStatusChip state={inviteStates[user.id]} />
                 </ListGridCell>
                 <ListGridCell className="justify-end">
                   <UserActions user={user} {...actionsFor(user)} />
@@ -242,13 +270,21 @@ export function UsersPage() {
         )
       )}
 
+      {inviteLink && <InviteLinkDialog link={inviteLink} onClose={() => setInviteLink(null)} />}
+      {inviteUser && <Dialog open onOpenChange={open => !open && !inviting && setInviteUser(null)}>
+        <DialogContent><DialogHeader><DialogTitle>{intl.formatMessage({ id: 'users.invite.resend' })}</DialogTitle></DialogHeader>
+          <InviteEmailPreview email={inviteUser.email} />
+          <DialogFooter><Button variant="outline" disabled={inviting} onClick={() => setInviteUser(null)}>{intl.formatMessage({ id: 'common.cancel' })}</Button><Button disabled={inviting} onClick={() => void sendInvite()}>{intl.formatMessage({ id: 'users.invite.send' })}</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>}
       {/* Create User Dialog */}
       {showCreate && (
         <CreateUserDialog
           users={users}
           onClose={() => setShowCreate(false)}
-          onCreated={() => {
+          onCreated={(result) => {
             setShowCreate(false);
+            if (result && !result.sent && result.link) setInviteLink(result.link);
             fetchUsers();
           }}
         />

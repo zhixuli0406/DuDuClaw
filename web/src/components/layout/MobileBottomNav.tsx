@@ -4,7 +4,9 @@ import { Plus } from 'lucide-react';
 import { useOpenAssign } from '@/hooks/useOpenAssign';
 import { ASSIGN_PATH } from '@/lib/assign-entry';
 import { cn } from '@/lib/utils';
-import { mobileNavItems, type NavItem } from './nav-model';
+import { mobileNavItemsForRole, type NavItem } from './nav-model';
+import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
 
 /**
  * MobileBottomNav — Zone A quick access on small screens (§4.3). Slots:
@@ -44,6 +46,10 @@ export function MobileBottomNav() {
   // 2026-07-29 "hide task-board chrome" round).
   const openAssign = useOpenAssign();
   const onAssign = useLocation().pathname === ASSIGN_PATH;
+  const role = useAuthStore((s) => s.user?.role);
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
+  const employeeTasks = useSystemStore((s) => s.status?.employee_tasks) === true;
+  const mobileNavItems = mobileNavItemsForRole(role, isPersonal, employeeTasks);
 
   // Split the side items around the center ＋交辦 action. The center is a
   // fixed-width slot flanked by two equal-flex groups, so the raised ＋ button

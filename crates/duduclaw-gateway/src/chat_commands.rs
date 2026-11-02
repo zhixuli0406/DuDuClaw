@@ -631,14 +631,22 @@ pub async fn handle_command(
         ChatCommand::Model(name) => handle_model(ctx, agent_id, name.as_deref()).await,
         ChatCommand::Pair(code) => handle_pair(ctx, session_id, code).await,
         ChatCommand::Voice => {
+            let (channel, chat_id) = source_from_session(session_id);
             let mut voice_set = ctx.voice_sessions.lock().await;
-            let key = session_id.to_string();
-            if voice_set.contains(&key) {
-                voice_set.remove(&key);
-                "🔇 Voice mode OFF — replies will be sent as text.".to_string()
+            if channel != "telegram" {
+                voice_set.remove(session_id);
+                "這個通道目前不支援語音回覆".to_string()
             } else {
-                voice_set.insert(key);
-                "🔊 Voice mode ON — next replies will be sent as audio.".to_string()
+                let key = format!("telegram:{chat_id}");
+                if !crate::tts::TtsRouter::for_home(&ctx.home_dir).is_available() {
+                    voice_set.remove(&key);
+                    "尚未設定語音服務，請管理員到設定啟用".to_string()
+                } else if voice_set.remove(&key) {
+                    "🔇 已關閉語音回覆模式".to_string()
+                } else {
+                    voice_set.insert(key);
+                    "🎤 已開啟語音回覆模式".to_string()
+                }
             }
         }
         ChatCommand::Screenshot => {
@@ -746,7 +754,10 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
 
 async fn handle_new(ctx: &ReplyContext, session_id: &str) -> String {
     match ctx.session_manager.delete_session(session_id).await {
-        Ok(()) => "✅ Session cleared. Starting fresh!".to_string(),
+        Ok(()) => {
+            ctx.voice_failure_notices.lock().await.remove(session_id);
+            "✅ Session cleared. Starting fresh!".to_string()
+        }
         Err(e) => {
             warn!(session_id, error = %e, "Failed to clear session");
             format!("⚠️ Failed to clear session: {e}")
@@ -1329,12 +1340,13 @@ pub(crate) async fn handle_goal_create(
     // branch exactly (same two functions, same field semantics).
     if plan_first {
         let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
-        let plan_result = crate::autonomous_runtime::human_interactive(&ctx.home_dir,
-            crate::goal_plan::generate_plan_first(
+        let (plan_result, plan_review) = crate::autonomous_runtime::human_interactive(
             &ctx.home_dir,
-            &task.description,
-            criteria_for_plan,
-        )
+            crate::goal_loop::plan_review::generate_plan_first_reviewed(
+                &ctx.home_dir,
+                &task.description,
+                criteria_for_plan,
+            ),
         )
         .await;
         if let Err(e) = &plan_result {
@@ -1345,14 +1357,16 @@ pub(crate) async fn handle_goal_create(
             );
         }
         crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
+        task.plan_review = plan_review;
 
         if let Err(e) = store.insert_task(&task).await {
             warn!(error = %e, "goal: insert plan-first task failed");
             return format!("⚠️ 無法建立目標任務：{e}");
         }
+        let review_hint = crate::goal_loop::plan_review::channel_hint(task.plan_review.as_deref());
         return match &task.plan_pending {
             Some(plan) => format!(
-                "🧭 已建立目標任務 #{short}，並產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n請到 /goals 儀表板核准或修改。"
+                "🧭 已建立目標任務 #{short}，並產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n{review_hint}請到 /goals 儀表板核准或修改。"
             ),
             None => format!(
                 "⚠️ 已建立目標任務 #{short}，但計畫生成失敗，已標記為待你決定，請到 /goals 儀表板處理。"
@@ -2998,6 +3012,20 @@ mod goal_contract_tests {
             std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         ReplyContext::new(registry, home.to_path_buf(), sessions, status, tx)
+    }
+
+    #[tokio::test]
+    async fn voice_on_unsupported_channels_does_not_enable_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        for session in ["line:123", "discord:123", "slack:123", "webchat:123"] {
+            ctx.voice_sessions.lock().await.insert(session.to_string());
+            let reply = handle_command(
+                &ChatCommand::Voice, &ctx, session, "agent-a", false, "",
+            ).await;
+            assert_eq!(reply, "這個通道目前不支援語音回覆");
+            assert!(!ctx.voice_sessions.lock().await.contains(session));
+        }
     }
 
     #[tokio::test]

@@ -205,3 +205,13 @@ CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 ## MFA
 
 MFA 第一階段為 `/api/login` 與 `/api/otp/verify` 新增條件式回應。未註冊且未強制時仍維持 `access_token`、`refresh_token`、`user` 原格式；已註冊者只回 `mfa_required`、`challenge_id`；強制期間未註冊者只回 `mfa_enrollment_required`、`enrollment_token`。客戶端必須先完成 `/api/mfa/verify` 或 `/api/mfa/enroll/*`，才能視為登入成功。沒有移除原端點，Dashboard 支援留待下一階段。
+
+## 語音供應商設定棄用
+
+| 棄用值 | 起始版本 | 移除版本 | 行為與替代方式 |
+|---|---|---|---|
+| `edge-tts`、`edge` | v1.79.0 | v1.81.0 | 仍接受設定值，但改採 `auto`，每個行程警告一次；舊實作已移除。請選用本機 Kokoro 或官方 Azure AI Speech REST。 |
+
+## 第三方 MCP 環境變數憑證
+
+MCP env 遷移後若要降版，必須備妥加密遷移備份並重新輸入金鑰；舊版可能把 `secret://` 參照當成憑證字串傳出。請保留原始 `.keyfile`，以解密 `<home>/backups/mcp-migrate/*.enc`；啟動舊版前先還原相容設定並重新輸入金鑰。

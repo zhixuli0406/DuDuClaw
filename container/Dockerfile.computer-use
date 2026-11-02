@@ -69,6 +69,7 @@ COPY container/scripts/computer-use-entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY container/scripts/domain-filter.sh /usr/local/bin/domain-filter.sh
 COPY container/scripts/duduclaw-eval-dom /usr/local/bin/duduclaw-eval-dom
 COPY container/scripts/duduclaw-navigate /usr/local/bin/duduclaw-navigate
+COPY container/scripts/duduclaw-fill-login /usr/local/bin/duduclaw-fill-login
 COPY container/scripts/duduclaw_cdp.py /usr/local/bin/duduclaw_cdp.py
 COPY container/scripts/duduclaw-profile /usr/local/bin/duduclaw-profile
 COPY container/scripts/duduclaw_profile.py /usr/local/bin/duduclaw_profile.py
@@ -79,6 +80,7 @@ COPY container/scripts/duduclaw-vnc /usr/local/bin/duduclaw-vnc
 COPY container/scripts/duduclaw-vnc-relay /usr/local/bin/duduclaw-vnc-relay
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/domain-filter.sh \
         /usr/local/bin/duduclaw-eval-dom /usr/local/bin/duduclaw-navigate \
+        /usr/local/bin/duduclaw-fill-login \
         /usr/local/bin/duduclaw-vnc /usr/local/bin/duduclaw-vnc-relay \
         /usr/local/bin/duduclaw-profile \
     && chmod 0644 /usr/local/bin/duduclaw_cdp.py /usr/local/bin/duduclaw_profile.py

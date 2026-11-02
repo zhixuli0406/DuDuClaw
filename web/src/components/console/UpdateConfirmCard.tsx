@@ -56,6 +56,7 @@ export function UpdateConfirmCard({ payload }: { payload: UpdateConfirmArtifact[
   const [detail, setDetail] = useState<string | null>(null);
   /** `target === 'system'` only — `DeviceOpResult` has no such field. */
   const [needsRestart, setNeedsRestart] = useState(false);
+  const [restartHint, setRestartHint] = useState<string | null>(null);
 
   const title = t(`console.artifact.updateConfirm.title.${target}`);
   // `target: 'device'` is the appliance OS image (duduclaw-sysd) — DevicePage
@@ -94,6 +95,7 @@ export function UpdateConfirmCard({ payload }: { payload: UpdateConfirmArtifact[
           setSuccess(true);
           setDetail(res.message || null);
           setNeedsRestart(res.needs_restart === true);
+          setRestartHint(res.restart_hint ?? null);
           toast.success(t('device.update.applyDone'));
           setStatus('done');
         } else {
@@ -129,6 +131,7 @@ export function UpdateConfirmCard({ payload }: { payload: UpdateConfirmArtifact[
           >
             <RotateCcw className="size-3.5 shrink-0" aria-hidden="true" />
             {t('console.artifact.updateConfirm.needsRestart')}
+            {restartHint && <> {t('console.artifact.updateConfirm.restartHint', { command: restartHint })}</>}
           </p>
         )}
       </ArtifactShell>

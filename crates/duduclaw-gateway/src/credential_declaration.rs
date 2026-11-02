@@ -110,7 +110,7 @@ mod tests {
         use crate::computer_use_sessions::auth::{AGENT_ID_HEADER, NONCE_HEADER};
         let home = tempfile::tempdir().unwrap();
         let identity = duduclaw_core::ensure_identity_key(home.path()).unwrap();
-        let key = crate::mcp_internal_key::ensure_internal_mcp_key(home.path()).unwrap();
+        let key = crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(home.path(), "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         let token = duduclaw_core::mint_identity_token(&identity, "bot");
         let state = RouteState { home: home.path().into(), rate: RateLimiter::default(), replay: ReplayGuard::default(), capacity: Arc::new(tokio::sync::Semaphore::new(1)) };
         let nonce = uuid::Uuid::new_v4().simple().to_string();

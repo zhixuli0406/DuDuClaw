@@ -259,3 +259,32 @@ async fn password_change_still_needs_current_password_elsewhere() {
         .await;
     assert_eq!(ok_payload(&frame)["status"], json!("changed"));
 }
+
+#[tokio::test]
+async fn primary_agent_is_self_only_and_uses_live_bindings() {
+    let f = fixture(false).await;
+    f.db.bind_agent(&f.owner.user_id, "first", duduclaw_auth::AccessLevel::Owner).unwrap();
+    f.db.bind_agent(&f.owner.user_id, "chosen", duduclaw_auth::AccessLevel::Viewer).unwrap();
+    let other = f.db.create_user("primary-other@example.com", "Other", "password123", UserRole::Employee).unwrap();
+    f.db.bind_agent(&other.id, "other-only", duduclaw_auth::AccessLevel::Owner).unwrap();
+    let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": "other-only", "user_id": other.id}), &f.owner).await;
+    assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+    ok_payload(&f.handler.handle("users.set_primary_agent", json!({"agent_id": "chosen", "user_id": other.id}), &f.owner).await);
+    assert_eq!(f.db.primary_agent(&other.id).unwrap(), None);
+    let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
+    assert_eq!(me["user"]["primary_agent_id"], "chosen");
+    f.db.unbind_agent(&f.owner.user_id, "chosen").unwrap();
+    let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
+    assert_eq!(me["user"]["primary_agent_id"], "first");
+    ok_payload(&f.handler.handle("users.set_primary_agent", json!({"agent_id": null}), &f.owner).await);
+    let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
+    assert!(me["user"]["primary_agent_id"].is_null());
+    let mut employee = f.owner.clone();
+    employee.user_id = other.id.clone();
+    employee.email = other.email.clone();
+    employee.role = UserRole::Employee;
+    ok_payload(&f.handler.handle("users.set_primary_agent", json!({"agent_id": "other-only"}), &employee).await);
+    assert_eq!(f.db.primary_agent(&other.id).unwrap().as_deref(), Some("other-only"));
+    assert!(!is_enterprise_only_method("users.set_primary_agent"));
+    assert!(!is_password_change_allowlisted("users.set_primary_agent"));
+}

@@ -78,6 +78,9 @@ function InteractiveWebChatPage() {
     stepTree,
     thinking,
     isStreaming,
+    activeMessageId,
+    lastCompletedReplyId,
+    cancel,
     phase,
     viseme,
     agentName,
@@ -289,9 +292,25 @@ function InteractiveWebChatPage() {
         )
       : undefined;
 
+  const renderMessage = (msg: (typeof messages)[number]) => (
+    <div key={msg.id} className="space-y-1">
+      {msg.role === 'assistant' && msg.thinking && (
+        <div className="pl-[34px]">
+          <ThinkingSection thinking={msg.thinking} compact />
+        </div>
+      )}
+      <MessageBubble
+        message={msg}
+        onRetry={() => { setInput(msg.content); inputRef.current?.focus(); }}
+        leading={msg.role === 'assistant' ? assistantAvatar(msg) : undefined}
+        label={answeredByLabel(msg)}
+      />
+    </div>
+  );
+
   // Split off the current turn's reply (still streaming, or just finished with
   // its thinking) so the step tree and thinking line can sit above it.
-  const { prior: priorMessages, streamingAssistant, turnReply } = splitTurnMessages(messages, isStreaming);
+  const { prior: priorMessages, following, streamingAssistant, turnReply } = splitTurnMessages(messages, isStreaming, activeMessageId);
   const insightsVisible = stepTree.length > 0 || steps.length > 0 || turnReply !== null;
   const empty = messages.length === 0;
 
@@ -337,7 +356,7 @@ function InteractiveWebChatPage() {
 
   const handleSend = () => {
     const text = input.trim();
-    if ((!text && attachments.length === 0) || isStreaming) return;
+    if ((!text && attachments.length === 0) || connectionState !== 'connected') return;
     send(text, attachments);
     setInput('');
     setAttachments([]);
@@ -412,10 +431,11 @@ function InteractiveWebChatPage() {
 
   // Reply playback: when the toggle is on, speak each freshly-completed reply.
   const lastSpokenRef = useRef<string | null>(null);
+  const completedReply = messages.find(message => message.id === lastCompletedReplyId);
   useEffect(() => {
-    if (!ttsEnabled || phase !== 'done') return;
+    if (!ttsEnabled) return;
     if (talk.active) return;
-    const latest = messages[messages.length - 1];
+    const latest = completedReply;
     if (!latest || latest.role !== 'assistant' || !latest.content.trim()) return;
     if (lastSpokenRef.current === latest.id) return;
     lastSpokenRef.current = latest.id;
@@ -445,7 +465,7 @@ function InteractiveWebChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [phase, ttsEnabled, messages, setTtsEnabled, intl, talk.active]);
+  }, [ttsEnabled, completedReply, setTtsEnabled, intl, talk.active]);
 
   const handleFilesSelected = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
@@ -469,7 +489,7 @@ function InteractiveWebChatPage() {
   };
 
   const canSend =
-    (input.trim().length > 0 || attachments.length > 0) && !isStreaming && connectionState === 'connected';
+    (input.trim().length > 0 || attachments.length > 0) && connectionState === 'connected';
 
   const suggestions = useMemo(
     () => [
@@ -586,20 +606,7 @@ function InteractiveWebChatPage() {
             </div>
           ) : (
             <>
-              {priorMessages.map((msg) => (
-                <div key={msg.id} className="space-y-1">
-                  {msg.role === 'assistant' && msg.thinking && (
-                    <div className="pl-[34px]">
-                      <ThinkingSection thinking={msg.thinking} compact />
-                    </div>
-                  )}
-                  <MessageBubble
-                    message={msg}
-                    leading={msg.role === 'assistant' ? assistantAvatar(msg) : undefined}
-                    label={answeredByLabel(msg)}
-                  />
-                </div>
-              ))}
+              {priorMessages.map(renderMessage)}
 
               {insightsVisible && (
                 <TaskInsights
@@ -620,7 +627,8 @@ function InteractiveWebChatPage() {
                 />
               )}
 
-              {isStreaming && !streamingAssistant && <ThinkingStatus thinking={thinking} stepTree={stepTree} />}
+              {isStreaming && activeMessageId && !streamingAssistant && <ThinkingStatus thinking={thinking} stepTree={stepTree} />}
+              {following.map(renderMessage)}
             </>
           )}
 
@@ -735,8 +743,15 @@ function InteractiveWebChatPage() {
               disabled={connectionState !== 'connected'}
             />
             </div>
+            {isStreaming && activeMessageId && <SubmitButton
+              state="streaming"
+              aria-label={intl.formatMessage({ id: 'webchat.stop' })}
+              onClick={() => cancel()}
+              disabled={connectionState !== 'connected'}
+            />}
             <SubmitButton
-              state={isStreaming ? 'submitting' : 'idle'}
+              state="idle"
+              aria-label={intl.formatMessage({ id: 'webchat.send' })}
               onClick={handleSend}
               disabled={!canSend}
               title={intl.formatMessage({ id: 'webchat.hint', defaultMessage: 'Enter to send, Shift+Enter for newline' })}

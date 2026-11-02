@@ -1,6 +1,6 @@
-//! `tools/list` — the declaration surface, kept equal to the callable surface.
+//! `tools/list` — authorized declarations, optionally narrowed by usage.
 //!
-//! ## The rule this file enforces: discoverable ⇔ callable
+//! ## Authorization filters precede optional discovery pruning
 //!
 //! Every schema advertised here is a fixed per-spawn prompt cost, and every
 //! schema advertised here that the dispatch gate would then *reject* is a pure
@@ -500,6 +500,20 @@ pub(crate) async fn visible_tools_in_lane(
     let actor = super::record_actor_for(home_dir, &principal.client_id, default_agent);
     let background_allowed = super::check_background_caller(home_dir, actor, "tools/list").is_ok();
 
+    let agent_dir = caller_agent_dir(home_dir, effective_agent);
+    let pruning_mode = if !principal.is_external && !effective_agent.is_empty() {
+        duduclaw_core::tool_pruning::read_mode(&agent_dir)
+    } else {
+        duduclaw_core::tool_pruning::Mode::Off
+    };
+    let pruning_names: Vec<_> = tools().map(|t| t.name).collect();
+    let prunable = if pruning_mode != duduclaw_core::tool_pruning::Mode::Off {
+        duduclaw_core::tool_pruning::candidates_from_files(home_dir, &agent_dir, effective_agent, &pruning_names)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
+
     tools()
         .filter(|t| background_allowed || !super::creates_background_work(t.name))
         .filter(|t| {
@@ -549,6 +563,12 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| {
             !process_agent_tool_refused(t.name, principal, client_is_agent, employee_process)
         })
+        // Discovery only, LAST: neither grants nor authorization are changed.
+        // An active scoped task grant always remains discoverable.
+        .filter(|t| pruning_mode != duduclaw_core::tool_pruning::Mode::On
+            || !prunable.contains(t.name)
+            || (duduclaw_gateway::capability_grants::set_contains_tool(&scoped, t.name)
+                && !scoped_without_grant.contains(t.name)))
         .collect()
 }
 

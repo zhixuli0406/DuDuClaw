@@ -115,8 +115,33 @@ fn a_bridge_is_wrapped_and_gets_its_env_through_the_spawn_file() {
         upstream["DUDUCLAW_HOME"], "/h",
         "the bridge's own declared env"
     );
-    assert_eq!(upstream["DUDUCLAW_AGENT_ID"], "trader");
-    assert!(upstream.get("DUDUCLAW_AGENT_TOKEN").is_none());
+    assert!(upstream.as_object().unwrap().keys().all(|key| !is_proxy_private_env_key(key)));
+    assert_eq!(zap.proxy_env.get("DUDUCLAW_AGENT_ID").map(String::as_str), Some("trader"));
+    assert_eq!(zap.proxy_env.get("DUDUCLAW_HOME").map(String::as_str), Some("/h"));
+}
+
+#[test]
+fn spawn_scoped_bridge_keeps_host_identity_out_of_the_upstream_blob() {
+    let bridge = GatedServer {
+        command: EXE.into(),
+        args: ["mcp-remote-bridge", "--agent", "trader", "--server", "zap"]
+            .iter().map(|arg| arg.to_string()).collect(),
+        env: BTreeMap::from([
+            ("DUDUCLAW_AGENT_ID".into(), "trader".into()),
+            ("DUDUCLAW_AGENT_TOKEN".into(), "host-mac".into()),
+            ("DUDUCLAW_ON_BEHALF_OF".into(), "trader".into()),
+            ("DUDUCLAW_MCP_PROXY_ENV_FILE".into(), "/host/private.json".into()),
+            ("DUDUCLAW_HOME".into(), "/host".into()),
+            ("VENDOR_OPTION".into(), "keep".into()),
+        ]),
+    };
+    let scoped = scope_one("zap", &bridge);
+    let upstream: Value = serde_json::from_str(&scoped.upstream_env).unwrap();
+    assert_eq!(upstream, json!({"DUDUCLAW_HOME":"/host", "VENDOR_OPTION":"keep"}));
+    assert_eq!(scoped.proxy_env.get("DUDUCLAW_AGENT_ID").map(String::as_str), Some("trader"));
+    assert_eq!(scoped.proxy_env.get("DUDUCLAW_HOME").map(String::as_str), Some("/host"));
+    // The identity MAC is added by the host per spawn, never persisted.
+    assert!(!scoped.proxy_env.contains_key("DUDUCLAW_AGENT_TOKEN"));
 }
 
 #[test]
