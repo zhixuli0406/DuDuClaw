@@ -9,11 +9,11 @@ on:
   schedule:
     - cron: "0 18 * * *"
 
-# Superseded revisions do not need to finish their full suite. Separate event
-# groups keep a manual run from cancelling PR or post-merge verification.
+# Cancel superseded PR revisions; main runs must finish for release preflight.
+# Separate event groups keep manual runs independent.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,10 +26,36 @@ jobs:
   settle:
     name: Await latest revision
     runs-on: ubuntu-latest
+    outputs:
+      rust_mode: ${{ steps.classify.outputs.rust_mode }}
+      dashboard: ${{ steps.classify.outputs.dashboard }}
+      discord_voice: ${{ steps.classify.outputs.discord_voice }}
+      app_compat: ${{ steps.classify.outputs.app_compat }}
     steps:
       - name: Allow consecutive PR pushes to settle
         if: github.event_name == 'pull_request'
         run: sleep 60
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changes using the trusted base
+        id: classify
+        continue-on-error: true
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            printf 'rust_mode=full\ndashboard=run\ndiscord_voice=true\napp_compat=true\n' >> "$GITHUB_OUTPUT"
+          elif git show "$BASE_SHA:scripts/ci_classify.py" > "$RUNNER_TEMP/ci_classify.py"; then
+            # Publish outputs only after success; missing/failed classifiers run full CI.
+            output="$RUNNER_TEMP/ci-classify-output"
+            : > "$output"
+            GITHUB_OUTPUT="$output" python3 -I "$RUNNER_TEMP/ci_classify.py"
+            cat "$output" >> "$GITHUB_OUTPUT"
+          fi
 
   rust:
     needs: settle
@@ -44,20 +70,29 @@ jobs:
         # PRs keep the required Linux check; native platform coverage runs
         # after merge, nightly and on demand for the release preflight.
         os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+    env:
+      NEXTEST_PROFILE: ${{ (github.event_name == 'pull_request' || matrix.os == 'ubuntu-latest') && 'ci' || 'ci-native' }}
     steps:
+      - name: Skip Rust for documentation and web-only changes
+        if: ${{ needs.settle.outputs.rust_mode == 'skip' }}
+        run: echo "Only allowlisted documentation or web paths changed; Rust is skipped."
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' }}
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' }}
         # NOTE: dtolnay/rust-toolchain is maintained by a trusted Rust community
         # member and does not follow SHA-pinning conventions upstream. Pinning
         # by tag is accepted here as a documented trust decision.
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' }}
         with:
+          shared-key: ci-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)
         # duduclaw-gateway pulls `xcap` (screenshot for computer-use), which on
         # Linux builds `wayland-sys`/`gbm` via pkg-config and needs these -dev
         # headers. Ubuntu-only; macOS/Windows use their native capture backends.
-        if: runner.os == 'Linux'
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && (runner.os == 'Linux') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -66,6 +101,7 @@ jobs:
             libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev \
             libxdo-dev libopus-dev
       - name: Stub dashboard assets for compile
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' }}
         # `duduclaw-cli` has `default = ["dashboard"]`, so the workspace build
         # compiles `duduclaw-dashboard` (via cli) even though it's `--exclude`d
         # as a top-level target. Its `#[derive(RustEmbed)] #[folder="dist/"]`
@@ -76,9 +112,19 @@ jobs:
         run: |
           mkdir -p crates/duduclaw-dashboard/dist
           printf '<!doctype html><title>ci-stub</title>' > crates/duduclaw-dashboard/dist/index.html
+      - name: Check release version bump
+        if: ${{ needs.settle.outputs.rust_mode == 'check' }}
+        run: cargo check --locked --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard
+      - name: Install nextest
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+        with:
+          tool: nextest@0.9.150
       - name: Build core crates (no dashboard)
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
         run: cargo build --locked --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Build gateway (no dashboard)
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
         run: cargo build --locked -p duduclaw-gateway --no-default-features
       # H7: `otel.rs` (883 LOC) sits behind a default-off cargo feature that no
       # build in this repo had ever turned on, so its `gen_ai.*` span code could
@@ -96,9 +142,10 @@ jobs:
       - name: Test gateway Discord voice TLS transport
         # Songbird is an existing Linux-only dependency. Exercise its Serenity
         # bridge so the security transport backport cannot silently rot.
-        if: runner.os == 'Linux'
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && needs.settle.outputs.discord_voice != 'false' && (runner.os == 'Linux') }}
         run: cargo test --locked -p duduclaw-gateway --no-default-features --features discord-voice --lib discord_voice
       - name: Check gateway with OpenTelemetry feature
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
         run: cargo check --locked -p duduclaw-gateway --no-default-features --features otel
       # S16 (2026-09-29): the `duduclaw compat` family is OS-only — DuDuClaw
       # OS's shell spawns `duduclaw compat windows-vm app`, no platform install
@@ -108,13 +155,24 @@ jobs:
       # duduclaw-core `compat_runners`, 37 in duduclaw-cli `compat_*`) that
       # would otherwise never run anywhere but an OS bake.
       - name: Test cli with app-compat feature (OS-only surface)
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && needs.settle.outputs.app_compat != 'false' }}
         run: |
           cargo test --locked -p duduclaw-core --lib --features app-compat -- compat_runners
           cargo test --locked -p duduclaw-cli --lib --features app-compat -- compat
       - name: Test (no dashboard)
-        run: cargo test --locked --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+        id: nextest_workspace
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        run: cargo nextest run --locked --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+      - name: Summarize nextest workspace
+        if: ${{ always() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        shell: bash
+        run: python3 scripts/ci_nextest_summary.py "target/nextest/$NEXTEST_PROFILE/junit.xml" "target/nextest/reports/workspace.xml"
+      - name: Test workspace doctests
+        # Preserve cargo test --no-fail-fast: doctests still run after suite failures.
+        if: ${{ !cancelled() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (steps.nextest_workspace.outcome == 'success' || steps.nextest_workspace.outcome == 'failure') }}
+        run: cargo test --locked --doc --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Run every required Windows case on the native host
-        if: runner.os == 'Windows'
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (runner.os == 'Windows') }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -142,12 +200,22 @@ jobs:
       # The reviewable-workflow end-to-end tests drive a real stdio CLI and
       # pause it at test checkpoints; they run in their own step below.
       - name: Test gateway
-        run: cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features -- --skip three_page_pilot_ --skip security_race_tests --skip resume_tests --skip f1b_e2e_tests --skip f5a_e2e_tests
+        id: nextest_gateway
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        run: cargo nextest run --locked --no-fail-fast -p duduclaw-gateway --no-default-features -E 'not (test(three_page_pilot_) or test(security_race_tests) or test(resume_tests) or test(f1b_e2e_tests) or test(f5a_e2e_tests))'
+      - name: Summarize nextest gateway
+        if: ${{ always() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        shell: bash
+        run: python3 scripts/ci_nextest_summary.py "target/nextest/$NEXTEST_PROFILE/junit.xml" "target/nextest/reports/gateway.xml"
+      - name: Test gateway doctests
+        # Preserve cargo test --no-fail-fast: doctests still run after suite failures.
+        if: ${{ !cancelled() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (steps.nextest_gateway.outcome == 'success' || steps.nextest_gateway.outcome == 'failure') }}
+        run: cargo test --locked --doc --no-fail-fast -p duduclaw-gateway --no-default-features -- --skip three_page_pilot_ --skip security_race_tests --skip resume_tests --skip f1b_e2e_tests --skip f5a_e2e_tests
       - name: Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (matrix.os == 'ubuntu-latest') }}
         run: cargo test --locked --no-fail-fast -p duduclaw-cli --test workflow_stdio --features workflow-test-checkpoints
       - name: Test workflow end to end (pilot, races, resume, F1b, F5-A) against the built CLI
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (matrix.os == 'ubuntu-latest') }}
         env:
           DUDUCLAW_P1_PILOT_EVIDENCE_DIR: ${{ runner.temp }}/pilot-evidence
         run: |
@@ -159,12 +227,19 @@ jobs:
           cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::resume_tests -- --test-threads=1
           cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::f1b_e2e_tests -- --test-threads=1
           cargo test --locked --no-fail-fast -p duduclaw-gateway --no-default-features --lib workflow::f5a_e2e_tests -- --test-threads=1
+      - name: Upload nextest JUnit reports
+        if: ${{ always() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nextest-${{ matrix.os }}
+          path: target/nextest/reports/*.xml
+          if-no-files-found: warn
 
   dashboard:
     needs: settle
     # A failed settle job must still run every required check; only workflow
     # cancellation should prevent these jobs from starting.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.settle.outputs.dashboard != 'skip' }}
     name: Dashboard
     runs-on: ubuntu-latest
     steps:
@@ -180,7 +255,9 @@ jobs:
         # by tag is accepted here as a documented trust decision.
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # The Linux Rust job is the sole writer of this shared cache.
+          shared-key: ci-ubuntu-latest
+          save-if: false
       - name: Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)
         run: |
           sudo apt-get update
@@ -227,7 +304,7 @@ jobs:
           fi
       - name: Test CI coverage contract
         run: |
-          python3 -m unittest discover -s scripts/tests -p test_ci_workflow.py -v
+          python3 -m unittest discover -s scripts/tests -p 'test_ci*.py' -v
           python3 -m unittest scripts.tests.test_server_entrypoint -v
       - name: Test distributor release tooling
         run: |
@@ -247,7 +324,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+        with:
+          tool: cargo-audit@0.22.2
       - name: Run cargo audit
         run: |
           cargo audit \

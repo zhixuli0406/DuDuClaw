@@ -1,0 +1,278 @@
+"""Exercise conservative CI decisions against real Git histories."""
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS))
+import ci_classify
+import ci_warm_needed
+
+
+LOCK = '''version = 4
+
+[[package]]
+name = "duduclaw-core"
+version = "1.79.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "unchanged"
+'''
+
+
+class CiClassifyTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.previous = Path.cwd()
+        self.repo = Path(self.temporary.name)
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, self.previous)
+        self.git("init", "-q")
+        self.git("config", "user.name", "CI Test")
+        self.git("config", "user.email", "ci@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.0"\n')
+        self.write("Cargo.lock", LOCK)
+        self.write("src-tauri/Cargo.lock", LOCK)
+        self.write("CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Existing fix.\n")
+        self.base = self.commit()
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], check=True, capture_output=True,
+                              encoding="utf-8").stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def commit(self):
+        self.git("add", ".")
+        self.git("commit", "-qm", "fixture")
+        return self.git("rev-parse", "HEAD")
+
+    def classify(self):
+        return ci_classify.classify("pull_request", self.base, self.commit())
+
+    def bump(self):
+        self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.1"\n')
+        self.write("Cargo.lock", LOCK.replace('version = "1.79.0"', 'version = "1.79.1"'))
+        self.write("src-tauri/Cargo.lock", LOCK.replace('version = "1.79.0"', 'version = "1.79.1"'))
+        self.write("CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n\n## [1.79.1] - 2026-11-03\n\n### Fixed\n\n- Existing fix.\n")
+
+    def test_docs_only_skip(self):
+        for path in ("docs/guide.md", "wiki/start.md", "marketing/copy.txt", "team/plan.txt", "NOTES.md"):
+            self.write(path, "Documentation\n")
+        self.assertEqual(self.classify(), dict(rust_mode="skip", dashboard="skip",
+                                              discord_voice="false", app_compat="false"))
+
+    def test_web_only_runs_dashboard(self):
+        self.write("web/src/main.ts", "export {};\n")
+        self.assertEqual(self.classify(), dict(rust_mode="skip", dashboard="run",
+                                              discord_voice="false", app_compat="false"))
+
+    def test_mixed_web_and_docs_runs_dashboard(self):
+        self.write("web/src/main.ts", "export {};\n")
+        self.write("docs/guide.md", "Documentation\n")
+        result = self.classify()
+        self.assertEqual((result["rust_mode"], result["dashboard"]), ("skip", "run"))
+
+    def test_rust_consumed_docs_force_full(self):
+        for path in ("docs/README.md", "docs/assets/example.json"):
+            with self.subTest(path=path):
+                self.git("checkout", "--detach", self.base)
+                self.write(path, "Required fixture\n")
+                result = self.classify()
+                self.assertEqual((result["rust_mode"], result["dashboard"]), ("full", "run"))
+
+    def test_real_bump_checks(self):
+        files = ("crates/duduclaw-core/Cargo.toml", "pyproject.toml",
+                 "python/duduclaw/__init__.py", "npm/duduclaw/package.json",
+                 "README.md", "README.zh-TW.md", "README.ja.md",
+                 "scripts/install.sh", "scripts/install.ps1", "src-tauri/tauri.conf.json",
+                 "distribution/registries/mcp/server.json")
+        for path in files:
+            self.write(path, 'version = "1.79.0"\n')
+        self.base = self.commit()
+        self.bump()
+        for path in files:
+            self.write(path, 'version = "1.79.1"\n')
+        self.write("distribution/release-delivery/v1.79.1.json", '{}\n')
+        self.write("distribution/release-delivery/v1.79.1.json.sig", "signature\n")
+        self.assertEqual(self.classify(), dict(rust_mode="check", dashboard="skip",
+                                              discord_voice="false", app_compat="false"))
+
+    def test_version_change_without_changelog_forces_full(self):
+        self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.1"\n')
+        self.assertEqual(self.classify(), ci_classify.FULL)
+
+    def test_malformed_lock_forces_full_and_warming(self):
+        self.bump()
+        self.write("Cargo.lock", LOCK.replace('version = "1.79.0"', 'version = "1.79.1'))
+        head = self.commit()
+        self.assertEqual(ci_classify.classify("pull_request", self.base, head), ci_classify.FULL)
+        self.assertTrue(ci_warm_needed.warm_needed("push", head))
+
+    def test_v_prefixed_versions_and_urls_are_version_only(self):
+        self.write("scripts/install.sh", 'TAG="v1.79.0"\n')
+        self.write("README.md", "Download https://example.invalid/v1.79.0/file\n")
+        self.base = self.commit()
+        self.bump()
+        self.write("scripts/install.sh", 'TAG="v1.79.1"\n')
+        self.write("README.md", "Download https://example.invalid/v1.79.1/file\n")
+        self.assertEqual(self.classify()["rust_mode"], "check")
+
+    def test_third_party_lock_change_forces_full(self):
+        self.bump()
+        self.write("Cargo.lock", LOCK.replace("1.0.200", "1.0.201"))
+        self.assertEqual(self.classify(), ci_classify.FULL)
+
+    def test_code_change_disguised_as_version_edit_forces_full(self):
+        self.write("python/duduclaw/__init__.py", '__version__ = "1.79.0"\n')
+        self.base = self.commit()
+        self.bump()
+        self.write("python/duduclaw/__init__.py", '__version__ = "1.79.1"\nprint("new code")\n')
+        self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_changelog_body_change_forces_full(self):
+        self.bump()
+        self.write("CHANGELOG.md", "## [1.79.1]\n\n- New behavior.\n")
+        self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_bump_file_addition_or_deletion_forces_full(self):
+        self.bump()
+        self.write("scripts/install.sh", 'VERSION="1.79.1"\n')
+        self.assertEqual(self.classify()["rust_mode"], "full")
+        (self.repo / "Cargo.toml").unlink()
+        self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_version_file_mode_change_forces_full(self):
+        self.bump()
+        self.git("add", "Cargo.toml")
+        self.git("update-index", "--chmod=+x", "Cargo.toml")
+        self.git("commit", "-qm", "mode change")
+        head = self.git("rev-parse", "HEAD")
+        self.assertEqual(ci_classify.classify("pull_request", self.base, head)["rust_mode"], "full")
+
+    def test_sensitive_roots_force_full(self):
+        for path in ("scripts/check.py", ".github/actions/example/action.yml",
+                     "vendor/example/lib.rs", "src-tauri/src/main.rs"):
+            with self.subTest(path=path):
+                self.git("checkout", "--detach", self.base)
+                self.write(path, "Changed behavior\n")
+                self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_unknown_path_fails_toward_all_coverage(self):
+        self.write("new-root/unknown.txt", "Unknown\n")
+        self.assertEqual(self.classify(), ci_classify.FULL)
+
+    def test_missing_or_invalid_commit_fails_toward_all_coverage(self):
+        for base, head in (("", self.base), (self.base, ""),
+                           ("--help", self.base), (self.base, "0" * 40)):
+            with self.subTest(base=base, head=head):
+                self.assertEqual(ci_classify.classify("pull_request", base, head), ci_classify.FULL)
+        with patch.object(ci_classify, "git", side_effect=OSError("git unavailable")):
+            self.assertEqual(ci_classify.classify("pull_request", self.base, self.base), ci_classify.FULL)
+
+    def test_empty_diff_fails_toward_all_coverage(self):
+        self.assertEqual(ci_classify.classify("pull_request", self.base, self.base), ci_classify.FULL)
+
+    def test_non_pr_events_always_run_full(self):
+        self.write("docs/guide.md", "Documentation\n")
+        head = self.commit()
+        for event in ("push", "schedule", "workflow_dispatch", ""):
+            with self.subTest(event=event):
+                self.assertEqual(ci_classify.classify(event, self.base, head), ci_classify.FULL)
+
+    def test_rename_cannot_hide_rust_deletion(self):
+        self.write("crates/duduclaw-core/src/example.rs", "// Example\n")
+        self.base = self.commit()
+        self.git("mv", "crates/duduclaw-core/src/example.rs", "EXAMPLE.md")
+        self.assertEqual(self.classify()["rust_mode"], "full")
+
+    def test_merge_base_ignores_base_branch_only_changes(self):
+        self.git("checkout", "-qb", "pr")
+        self.write("docs/guide.md", "Documentation\n")
+        head = self.commit()
+        self.git("checkout", "--detach", self.base)
+        self.write("crates/duduclaw-core/src/example.rs", "// Base-only change\n")
+        base = self.commit()
+        result = ci_classify.classify("pull_request", base, head)
+        self.assertEqual((result["rust_mode"], result["dashboard"]), ("skip", "skip"))
+
+    def test_optional_feature_path_filters(self):
+        for path, voice, compat in (
+            ("crates/duduclaw-gateway/src/discord.rs", "true", "false"),
+            ("crates/duduclaw-gateway/src/voice.rs", "true", "false"),
+            ("crates/duduclaw-core/src/compat.rs", "false", "true"),
+            ("crates/duduclaw-cli/src/compat.rs", "false", "true"),
+            ("crates/duduclaw-core/src/normal.rs", "false", "false"),
+            ("Cargo.toml", "true", "true"),
+            ("Cargo.lock", "true", "true"),
+            ("crates/duduclaw-gateway/Cargo.toml", "true", "true"),
+            ("vendor/example/lib.rs", "true", "true"),
+            (".github/workflows/ci.yml", "true", "true"),
+        ):
+            with self.subTest(path=path):
+                self.git("checkout", "--detach", self.base)
+                self.write(path, "Changed behavior\n")
+                result = self.classify()
+                self.assertEqual((result["rust_mode"], result["discord_voice"], result["app_compat"]),
+                                 ("full", voice, compat))
+
+    def test_cli_writes_github_output_with_env_shas(self):
+        self.write("docs/guide.md", "Documentation\n")
+        head = self.commit()
+        output = self.repo / "outputs"
+        subprocess.run([sys.executable, str(SCRIPTS / "ci_classify.py")], check=True,
+                       env={**os.environ, "GITHUB_EVENT_NAME": "pull_request",
+                            "BASE_SHA": self.base, "HEAD_SHA": head, "GITHUB_OUTPUT": str(output)})
+        self.assertEqual(dict(line.split("=", 1) for line in output.read_text().splitlines()),
+                         dict(rust_mode="skip", dashboard="skip", discord_voice="false", app_compat="false"))
+
+    def test_warm_runs_for_manifest_change_without_lock_diff(self):
+        self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.0"\n\n[profile.release]\nopt-level = 2\n')
+        self.assertTrue(ci_warm_needed.warm_needed("push", self.commit()))
+
+    def test_warm_skips_workspace_version_only_bump(self):
+        self.bump()
+        self.assertFalse(ci_warm_needed.warm_needed("push", self.commit()))
+
+    def test_warm_runs_for_dependency_changes_in_either_lock(self):
+        for path in ("Cargo.lock", "src-tauri/Cargo.lock"):
+            with self.subTest(path=path):
+                self.write(path, LOCK.replace("1.0.200", "1.0.201"))
+                self.assertTrue(ci_warm_needed.warm_needed("push", self.commit()))
+
+    def test_warm_always_runs_for_non_push_and_errors(self):
+        for event in ("schedule", "workflow_dispatch", "pull_request", ""):
+            self.assertTrue(ci_warm_needed.warm_needed(event, self.base))
+        for head in (self.base, "", "0" * 40):
+            self.assertTrue(ci_warm_needed.warm_needed("push", head))
+        self.bump()
+        (self.repo / "src-tauri/Cargo.lock").unlink()
+        self.assertTrue(ci_warm_needed.warm_needed("push", self.commit()))
+
+    def test_lock_source_and_non_version_fields_are_not_masked(self):
+        for new in (LOCK.replace('checksum = "unchanged"', 'checksum = "changed"'),
+                    LOCK.replace('dependencies = ["serde"]', 'dependencies = []'),
+                    LOCK.replace('name = "duduclaw-core"', 'name = "other"')):
+            self.assertFalse(ci_classify.lock_versions_only(LOCK, new))
+        registry = LOCK.replace('name = "duduclaw-core"',
+                                'name = "duduclaw-core"\nsource = "registry+example"')
+        self.assertFalse(ci_classify.lock_versions_only(registry, registry.replace("1.79.0", "1.79.1")))
+
+
+if __name__ == "__main__":
+    unittest.main()

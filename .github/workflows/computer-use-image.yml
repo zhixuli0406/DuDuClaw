@@ -65,15 +65,15 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.delivery-gate.outputs.commit }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -81,9 +81,10 @@ jobs:
 
       # Build into the local Docker image store first, so the smoke test runs
       # the exact layers that are pushed next.
-      # Smoke and push share this run's GHA cache; mode=min limits its size.
+      # Smoke and push share the builder's local cache. Only main exports GHA
+      # cache entries; tag-scoped blobs cannot be reused by the next release.
       - name: Build for smoke test (load)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           context: .
           file: container/Dockerfile.computer-use
@@ -93,7 +94,7 @@ jobs:
           cache-from: type=gha,scope=computer-use-${{ matrix.arch }}
           # The GHA cache export has failed after a fully successful build
           # before (v1.42.0 and v1.43.0); it must never fail the publish.
-          cache-to: type=gha,mode=min,scope=computer-use-${{ matrix.arch }},ignore-error=true
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=min,scope=computer-use-{0},ignore-error=true', matrix.arch) || '' }}
 
       # Mirrors the orchestrator's no-network `docker run` argv and its
       # readiness probe (`xdotool getactivewindow`), then exercises the
@@ -172,14 +173,14 @@ jobs:
       # inputs as the smoke build, so every layer is a cache hit.
       - name: Build and push (by digest)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           context: .
           file: container/Dockerfile.computer-use
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=computer-use-${{ matrix.arch }}
-          cache-to: type=gha,mode=min,scope=computer-use-${{ matrix.arch }},ignore-error=true
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=min,scope=computer-use-{0},ignore-error=true', matrix.arch) || '' }}
 
       - name: Export digest
         run: |
@@ -188,7 +189,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: computer-use-digest-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -209,17 +210,17 @@ jobs:
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           path: ${{ runner.temp }}/digests
           pattern: computer-use-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
