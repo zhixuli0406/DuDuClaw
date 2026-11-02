@@ -856,7 +856,15 @@ async fn revoke_waits_for_inflight_other_person_exchange_then_preserves_its_shar
     let user = f.alice.id.clone();
     let a =
         tokio::spawn(async move { lifecycle::disconnect(&home, &db, &user, &user, false).await });
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if vault::get(&f.home, &f.alice.id).unwrap().is_none() {
+                break;
+            }
+            assert!(!a.is_finished(), "disconnect finished without deleting Alice's credential");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("disconnect did not delete Alice's credential within 30 s");
     assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none());
     assert!(!a.is_finished());
     delay.exchange_release.notify_one();

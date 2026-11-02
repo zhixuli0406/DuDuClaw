@@ -4936,11 +4936,14 @@ skill_security_scan = false
         let first = crate::ephemeral::scaffold_role_member(home, &spec).unwrap();
         let wait = admit_and_wait_role_member(home, &spec);
         let release = async {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert_eq!(
-                duduclaw_core::spawn_admission::role_member_queue_depth(home),
-                1
-            );
+            loop {
+                let depth = duduclaw_core::spawn_admission::role_member_queue_depth(home);
+                assert!(depth <= 1, "expected exactly one admission waiter, observed {depth}");
+                if depth == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             crate::ephemeral::finish_role_member(
                 home,
                 &first.agent_id,
@@ -4948,11 +4951,14 @@ skill_security_scan = false
             )
             .unwrap();
         };
-        let (member, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (member, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             tokio::join!(wait, release)
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!(
+            "admission did not queue and scaffold after release within 30 s; queue depth={}",
+            duduclaw_core::spawn_admission::role_member_queue_depth(home)
+        ));
         let member = member.unwrap();
         assert_ne!(member.agent_id, first.agent_id);
         assert_eq!(
