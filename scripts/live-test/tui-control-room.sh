@@ -9,8 +9,12 @@ TUI_TEST_BIN="${DUDUCLAW_BIN:-$(command -v duduclaw || true)}"
 [ -n "$TUI_TEST_BIN" ] && [ -x "$TUI_TEST_BIN" ] || { echo 'Set DUDUCLAW_BIN to an executable build' >&2; exit 2; }
 case "$TUI_TEST_BIN" in /*) ;; *) TUI_TEST_BIN="$PWD/$TUI_TEST_BIN" ;; esac
 TUI_TEST_PATH='/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin'
-TUI_TEST_NODE="$(PATH="$TUI_TEST_PATH" command -v node || true)"
+TUI_TEST_NODE="$(command -v node || true)"
 [ -n "$TUI_TEST_NODE" ] || { echo 'Node 22+ required' >&2; exit 2; }
+case "$TUI_TEST_NODE" in /*) ;; *) TUI_TEST_NODE="$(cd "$(dirname "$TUI_TEST_NODE")" && pwd)/$(basename "$TUI_TEST_NODE")" ;; esac
+TUI_TEST_NODE_MAJOR="$("$TUI_TEST_NODE" --version | sed 's/^v//' | cut -d. -f1)"
+case "$TUI_TEST_NODE_MAJOR" in ''|*[!0-9]*) echo 'Node 22+ required' >&2; exit 2 ;; esac
+[ "$TUI_TEST_NODE_MAJOR" -ge 22 ] || { echo 'Node 22+ required' >&2; exit 2; }
 # Refuse an already occupied port before starting or contacting a gateway.
 /usr/bin/env -i PATH="$TUI_TEST_PATH" HOME="$HOME" LANG=C LC_ALL=C "$TUI_TEST_NODE" --input-type=module - "$TUI_TEST_PORT" <<'JS'
 import net from 'node:net';
@@ -22,7 +26,7 @@ await new Promise((resolve, reject) => {
   server.listen(port, '127.0.0.1', () => server.close(resolve));
 });
 JS
-TUI_TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/duduclaw-tui-live.XXXXXX")"
+TUI_TEST_HOME="$(mktemp -d "/tmp/duduclaw-tui-live.XXXXXX")"
 /usr/bin/env -i PATH="$TUI_TEST_PATH" HOME="$HOME" LANG=C LC_ALL=C /bin/bash "$SCRIPT_DIR/make-home.sh" "$TUI_TEST_HOME" --port "$TUI_TEST_PORT" > "$TUI_TEST_HOME.setup.log"
 # The instance endpoint is owned by this fixture, never inherited from the caller.
 cat > "$TUI_TEST_HOME/config.toml" <<TOML
@@ -72,18 +76,34 @@ cleanup() {
 trap cleanup EXIT
 /usr/bin/env -i PATH="$TUI_TEST_PATH" HOME="$TUI_TEST_HOME/os-home" DUDUCLAW_HOME="$TUI_TEST_HOME" LANG=C LC_ALL=C "$TUI_TEST_NODE" --input-type=module - "$TUI_TEST_BIN" "$TUI_TEST_HOME" "$TUI_TEST_PORT" "$TUI_TEST_PID" <<'JS'
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 const [binary, home, port, gatewayPid] = process.argv.slice(2);
 const canary = readFileSync(`${home}/instance-canary`, 'utf8');
 function assertChildAlive() {
   process.kill(Number(gatewayPid), 0);
 }
+const startDeadline = Date.now() + 120 * 500;
+async function assertChildOwnsListener() {
+  while (true) {
+    assertChildAlive();
+    const result = spawnSync('lsof', ['-nP', `-iTCP@127.0.0.1:${port}`, '-sTCP:LISTEN', '-t'], {encoding:'utf8'});
+    assert.equal(result.error, undefined, 'lsof is required to verify the gateway listener owner');
+    if (result.status === 0) {
+      const listenerPids = result.stdout.trim().split(/\s+/).filter(Boolean);
+      assert.deepEqual(listenerPids, [gatewayPid], `listener on 127.0.0.1:${port} does not belong to the started gateway (expected PID ${gatewayPid}, found ${listenerPids.join(', ') || 'none'})`);
+      return;
+    }
+    assert.equal(result.status, 1, `lsof failed while checking listener on 127.0.0.1:${port}`);
+    assert(Date.now() < startDeadline, `gateway did not bind 127.0.0.1:${port} before the startup deadline`);
+    await delay(200);
+  }
+}
 const base = `http://127.0.0.1:${port}`;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 let token;
 for (let i = 0; i < 120; i++) {
-  assertChildAlive();
+  await assertChildOwnsListener();
   try {
     const response = await fetch(`${base}/api/session/local`, {
       method: 'POST', headers: {'x-duduclaw-local':'1', 'content-type':'application/json'},
@@ -155,7 +175,7 @@ try {
   await confirmInstance();
   const output = await new Promise((resolve, reject) => {
     assertChildAlive();
-    const child = spawn('/usr/bin/env', ['-i', `PATH=${process.env.PATH}`, `HOME=${home}/os-home`,
+    const child = spawn('/usr/bin/env', ['-i', `PATH=${'/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin'}`, `HOME=${home}/os-home`,
       `DUDUCLAW_HOME=${home}`, 'LANG=C', 'LC_ALL=C', binary, 'tui', 'inbox', '--json'], {
       cwd:`${home}/os-home`, env:{}, stdio:['ignore','pipe','pipe'],
     });
