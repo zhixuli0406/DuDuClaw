@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.79.0] - 2026-11-02 — 本機語音、金鑰與登入保護、一般同仁側欄與設定清單
+
 ### Added
 
 - 本機語音：新增 Kokoro 中文語音模型（Apache-2.0），在「設定 → 語音」下載後即可使用。選 `kokoro` 時文字不離開機器；`auto` 在本機失敗時可能改用已設定的雲端服務。Kokoro 的中文是中國口音，破音字準確度也有限。要台灣口音可改用新增的 Azure AI Speech，由你自備金鑰（`AZURE_SPEECH_KEY`、`AZURE_SPEECH_REGION`），文字會送到微軟。Telegram 上，本機語音以 WAV 檔送出，雲端語音以 MP3 送出。語音文字上限 5,000 字，Kokoro 只念前 2,000 字。`tts_voice` 留著 Edge 語音名稱時，Kokoro 改用預設語音並記錄警告。
