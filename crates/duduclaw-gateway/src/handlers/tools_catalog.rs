@@ -9,6 +9,8 @@ impl MethodHandler {
             "",
             json!({
                 "tools": [
+                    { "name": "users.invite", "description": "Issue and deliver a one-time teammate invitation (Admin only)" },
+                    { "name": "users.invite_status", "description": "List per-user invitation states without links or tokens (Admin only)" },
                     { "name": "agents.list", "description": "List all registered agents" },
                     { "name": "agents.status", "description": "Get agent status" },
                     { "name": "presets.list", "description": "WP-6F: list agent presets (\"職務組合\") under ~/.duduclaw/presets/" },
@@ -25,6 +27,8 @@ impl MethodHandler {
                     { "name": "agents.set_avatar", "description": "Upload an agent avatar image (data URI)" },
                     { "name": "agents.clear_avatar", "description": "Remove an agent's uploaded avatar" },
                     { "name": "agents.export_profile", "description": "Export an AI employee profile (Manager and visible employee; user introduction excluded unless requested)" },
+                    { "name": "agents.tool_pruning_status", "description": "Admin: inspect employee tool pruning estimates" },
+                    { "name": "agents.tool_pruning_restore", "description": "Admin: reset employee tool pruning observation window" },
                     { "name": "agents.inspect", "description": "Inspect agent details" },
                     { "name": "agents.avatar", "description": "Fetch an agent's uploaded avatar as a data URI (lightweight)" },
                     { "name": "agent_files.list", "description": "List an AI employee's profile files (persona, introduction, work rules, boundaries, basic settings)" },

@@ -30,7 +30,7 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// A held lock; released on drop.
 #[derive(Debug)]
 pub struct WorkspaceLock {
-    _file: std::fs::File,
+    _file: duduclaw_core::owner_lock::OwnerLock,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -84,7 +84,7 @@ pub fn lock_workspace(home: &Path, id: &str, wait: Duration) -> io::Result<Optio
     let deadline = Instant::now() + wait;
     loop {
         if try_flock(&file)? {
-            return Ok(Some(WorkspaceLock { _file: file }));
+            return Ok(Some(WorkspaceLock { _file: duduclaw_core::owner_lock::OwnerLock::new(file) }));
         }
         if Instant::now() >= deadline {
             return Ok(None);
@@ -117,7 +117,7 @@ pub fn lock_registry_init(home: &Path) -> io::Result<WorkspaceLock> {
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
         if try_flock(&file)? {
-            return Ok(WorkspaceLock { _file: file });
+            return Ok(WorkspaceLock { _file: duduclaw_core::owner_lock::OwnerLock::new(file) });
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(

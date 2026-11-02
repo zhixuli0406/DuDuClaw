@@ -133,6 +133,7 @@ pub mod mcp_internal_key;
 pub mod msteams;
 pub mod notion_workspace;
 pub mod person_credentials;
+pub mod website_credentials;
 pub mod rate_limit_watch;
 pub mod redaction_sources;
 pub(crate) mod synthetic_connector_adapter;
@@ -415,6 +416,7 @@ pub mod stt;
 pub mod task_spec;
 pub mod telegram;
 pub mod tts;
+pub mod tts_kokoro;
 pub mod uki_patch;
 pub mod updater;
 pub mod web_extract;
@@ -643,3 +645,5 @@ pub mod credential_declaration;
 mod egress_registry;
 
 pub(crate) mod live_events;
+
+pub(crate) mod user_invites;

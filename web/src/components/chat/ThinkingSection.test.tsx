@@ -139,3 +139,21 @@ describe('splitTurnMessages', () => {
     expect(r.turnReply).toBeNull();
   });
 });
+
+
+it('keeps queued users after the active streaming bubble in the layout split', () => {
+  const messages: ChatMessage[] = [
+    { id: 'u1', turnId: 'm1', role: 'user', content: 'one', timestamp: T0, delivery: 'running' },
+    { id: 'a1', turnId: 'm1', role: 'assistant', content: 'part', timestamp: T0 },
+    { id: 'u2', turnId: 'm2', role: 'user', content: 'two', timestamp: T0, delivery: 'queued' },
+    { id: 'u3', turnId: 'm3', role: 'user', content: 'three', timestamp: T0, delivery: 'queued' },
+  ];
+  const result = splitTurnMessages(messages, true, 'm1');
+  expect(result.prior).toEqual([messages[0]]);
+  expect(result.streamingAssistant).toBe(messages[1]);
+  expect(result.following).toEqual(messages.slice(2));
+  const waiting = splitTurnMessages([messages[0], ...messages.slice(2)], true, 'm1');
+  expect(waiting.prior).toEqual([messages[0]]);
+  expect(waiting.streamingAssistant).toBeNull();
+  expect(waiting.following).toEqual(messages.slice(2));
+});

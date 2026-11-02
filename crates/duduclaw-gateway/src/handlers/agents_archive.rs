@@ -5,7 +5,7 @@ use super::*;
 
 impl MethodHandler {
     /// Soft-delete an agent (WP4). Marks `status = "deleted"` and halts the
-    /// heartbeat/evolution kill-switch. **No data is removed** — the agent
+    /// heartbeat/evolution kill-switch. MCP credentials are removed; the agent
     /// directory and its `memory.db` stay on disk; the agent simply disappears
     /// from every list/route. Refuses the main agent (name kept `remove` for
     /// front-end compatibility, but the semantics are now soft, not hard).
@@ -39,6 +39,10 @@ impl MethodHandler {
 
         if let Err(e) = self.offboard_agent_toml(&agent_id, "deleted").await {
             return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
+        }
+        if let Err(e) = duduclaw_security::mcp_secret_store::remove_agent(&self.home_dir, &agent_id) {
+            warn!(agent = %agent_id, error = %e, "MCP credential cleanup failed after soft-delete");
+            return WsFrame::error_response("", "Employee deleted, but encrypted MCP credential cleanup failed");
         }
         // The profile file history goes to `agent_file_history/_trash/`
         // (kept, like the rest of the folder; archive keeps it in place).

@@ -137,6 +137,18 @@ async fn non_editable_platforms_get_a_footer() {
 }
 
 #[tokio::test]
+async fn non_editable_footer_keeps_reply_intact_when_product_footer_is_absent() {
+    let p = ChannelThinking::new("whatsapp", false, Lang::ZhTw, None);
+    p.set_show(ShowThinking::Summary);
+    p.observe(&ev("t0", ThinkingPhase::End, Some("先想一下")));
+    let footer = p.finish().await.expect("footer");
+    assert_eq!(
+        super::with_footer_and_product_suffix("答案".into(), Some(&footer), ""),
+        "答案\n\n💭 思考了 1 秒\n先想一下"
+    );
+}
+
+#[tokio::test]
 async fn redacted_blocks_and_turn_usage_add_no_text() {
     let p = ChannelThinking::new("line", false, Lang::ZhTw, None);
     p.set_show(ShowThinking::Summary);

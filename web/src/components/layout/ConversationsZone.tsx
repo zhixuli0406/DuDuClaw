@@ -131,7 +131,7 @@ export function ConversationsZone({
                     onClick={() => void open(s)}
                     title={`${title} · ${channel ? `${channel.label} · ` : ''}${timeAgo(s.last_active)}`}
                     className={cn(
-                      sidebarMenuButtonVariants({ size: 'sm' }),
+                      sidebarMenuButtonVariants({ size: 'default' }),
                       'px-2 text-left',
                       s.session_id === activeSessionId &&
                         'bg-sidebar-accent font-medium text-sidebar-accent-foreground',
@@ -159,7 +159,7 @@ export function ConversationsZone({
             <NavLink
               to={conversationsEntry.to}
               data-tour={`nav:${conversationsEntry.to}`}
-              className={cn(sidebarMenuButtonVariants({ size: 'sm' }), 'px-2 text-brand hover:text-brand')}
+              className={cn(sidebarMenuButtonVariants({ size: 'default' }), 'px-2 text-brand hover:text-brand')}
             >
               <span className="flex-1 truncate">{intl.formatMessage({ id: 'sidebar.allConversations' })}</span>
               <ArrowRight className="size-3.5" />

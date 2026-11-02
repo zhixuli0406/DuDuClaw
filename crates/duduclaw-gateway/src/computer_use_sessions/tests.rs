@@ -138,6 +138,9 @@ struct FakeState {
     fail_vnc: AtomicBool,
     owner_changed: AtomicBool,
     login_discarded: AtomicBool,
+    login_calls: AtomicU32,
+    login_outcome: Mutex<Option<login::LoginStatus>>,
+    login_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 /// The fake container access a viewer gets.
@@ -211,6 +214,22 @@ impl SessionBackend for FakeBackend {
         self.state.observed_action_turn.lock().unwrap().push(attended_call::current_turn("alice"));
         self.state.executed.lock().unwrap().push(action.clone());
         Ok(())
+    }
+    async fn fill_login(&self, input: &[u8]) -> login::LoginStatus {
+        // Prove that only the helper receives the secret; don't retain it.
+        let body: Value = serde_json::from_slice(input).unwrap();
+        assert_eq!(body["password"], "LOGIN-PASSWORD-CANARY");
+        assert_eq!(body["origin"], "https://example.com");
+        assert_eq!(body["login_path"], "/login");
+        assert_eq!(body["allowed_paths"], json!(["/password"]));
+        assert_eq!(self.state.navigated.lock().unwrap().last().map(String::as_str), Some("https://example.com/login"));
+        self.state.login_calls.fetch_add(1, Ordering::SeqCst);
+        let pause = self.state.login_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.state.login_outcome.lock().unwrap().unwrap_or(login::LoginStatus::LoggedIn)
     }
     async fn navigate(
         &self,
@@ -1605,7 +1624,11 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
     let tmp = home();
     let h = tmp.path();
     let state = Arc::new(FakeState::default());
-    let mgr = manager(h, &state, Duration::from_millis(100));
+    // Shared fixture budget includes SQLite IO, reaper scheduling and expiry
+    // on loaded Windows runners; this does not change production timing.
+    const FIXTURE_WAIT: Duration = Duration::from_secs(10);
+    let mut mgr = manager(h, &state, Duration::from_millis(100));
+    mgr.approval_ttl_secs = FIXTURE_WAIT.as_secs() as i64;
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     write_agent(
         h,
@@ -1613,12 +1636,12 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         "[capabilities]\ncomputer_use = true\napproval_required_tools = [\"computer_click\"]\n\
          irreversible_tools = [\"computer_type\"]\nmaybe_irreversible_tools = [\"computer_key\"]\n",
     );
-    assert_eq!(mgr.approval_ttl_secs, 5);
+    assert_eq!(mgr.approval_ttl_secs, 10);
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(u64::try_from(mgr.approval_ttl_secs).unwrap());
 
     // These borrowed futures have no background tasks. On failure or expiry,
-    // dropping the shared five-second scope cancels every pending waiter.
+    // dropping the shared fixture scope cancels every pending waiter.
     let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
     let (reaped_tx, reaped_rx) = tokio::sync::oneshot::channel();
     let entry = mgr.entry("alice").unwrap();
@@ -2717,3 +2740,6 @@ async fn action_rules_block_and_ask_computer_tools_like_the_mcp_gate() {
     // No rules: unchanged.
     assert!(!gates::approval_required(tmp.path(), "bob", gates::TOOL_TYPE));
 }
+
+#[path = "tests/login_cases.rs"]
+mod login_cases;

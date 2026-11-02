@@ -10,6 +10,7 @@ pub mod heartbeat;
 pub mod instructions;
 pub mod ipc;
 pub mod mcp_spawn_gate;
+pub mod mcp_secret_migration;
 pub mod mcp_template;
 pub mod proactive;
 pub mod proactive_timing;

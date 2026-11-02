@@ -147,7 +147,7 @@ impl Pilot {
             format!("[workflow]\nfixture_environment='staging'\nallowed_origins=['http://1.1.1.1']\nstaging_proxy='{proxy_url}'\n")
         )
         .unwrap();
-        crate::mcp_internal_key::ensure_internal_mcp_key(root).unwrap();
+        crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(root, "127.0.0.1:18789".parse().unwrap(), true, None).unwrap();
         duduclaw_core::ensure_identity_key(root).unwrap();
         let users = duduclaw_auth::UserDb::new(&root.join("users.db")).unwrap();
         let user = users

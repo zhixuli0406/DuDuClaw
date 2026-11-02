@@ -1607,11 +1607,16 @@ async fn process_telegram_message(
     // Check voice mode
     let session_key = format!("telegram:{chat_id}");
     let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
-    let markup = conversation_markup(&own_bot_session(&session_id, agent_name.as_deref()), &reply);
+    let tts_router = crate::tts::TtsRouter::for_home(&ctx.home_dir);
+    let markup = conversation_markup(
+        &own_bot_session(&session_id, agent_name.as_deref()),
+        &reply,
+        tts_router.is_available(),
+    );
 
     if voice_enabled {
-        let tts_provider = crate::tts::EdgeTtsProvider::new();
-        match tts_provider.synthesize(&reply, "").await {
+        let plain_reply = crate::markdown_render::to_line_plain(&reply);
+        match tts_router.synthesize(&plain_reply, "").await {
             Ok(audio_bytes) => {
                 if crate::channel_reply::guard_lost(guarded.as_ref()).await {
                     return;
@@ -1659,11 +1664,18 @@ async fn process_telegram_message(
             }
             Err(e) => {
                 warn!("TTS synthesis failed, falling back to text: {e}");
+                let first_failure = ctx.voice_failure_notices.lock().await
+                    .insert(own_bot_session(&session_id, agent_name.as_deref()));
+                let fallback_reply = if first_failure {
+                    format!("{reply}\n\n語音暫時無法使用，先以文字回覆")
+                } else {
+                    reply.clone()
+                };
                 send_reply_markdown(
                     &client,
                     &api_base,
                     chat_id,
-                    &reply,
+                    &fallback_reply,
                     thread_id,
                     msg_id,
                     Some(markup.clone()),
@@ -1927,25 +1939,44 @@ async fn handle_callback_query(
             };
             let session_id = own_bot_session(&conversation, agent_name);
             match ctx.session_manager.delete_session(&session_id).await {
-                Ok(()) => "✅ 已開啟新的對話".to_string(),
+                Ok(()) => {
+                    ctx.voice_failure_notices.lock().await.remove(&session_id);
+                    "✅ 已開啟新的對話".to_string()
+                }
                 Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
             }
         }
         "duduclaw:voice_toggle" => {
-            let session_key = format!("telegram:{chat_id}");
-            let mut sessions = ctx.voice_sessions.lock().await;
-            if sessions.contains(&session_key) {
-                sessions.remove(&session_key);
-                "🔇 已關閉語音回覆模式".to_string()
-            } else {
-                sessions.insert(session_key);
-                "🎤 已開啟語音回覆模式".to_string()
-            }
+            toggle_voice(ctx, chat_id).await.to_string()
         }
         _ => "未知的按鈕動作".to_string(),
     };
 
     answer_callback_query(client, api_base, &cb.id, &answer).await;
+}
+
+/// Toggle only when a configured, policy-allowed provider is installed.
+async fn toggle_voice(ctx: &ReplyContext, chat_id: i64) -> &'static str {
+    let available = crate::tts::TtsRouter::for_home(&ctx.home_dir).is_available();
+    let session_key = format!("telegram:{chat_id}");
+    let mut sessions = ctx.voice_sessions.lock().await;
+    toggle_voice_state(&mut sessions, session_key, available)
+}
+
+fn toggle_voice_state(
+    sessions: &mut std::collections::HashSet<String>,
+    session_key: String,
+    available: bool,
+) -> &'static str {
+    if !available {
+        sessions.remove(&session_key);
+        "尚未設定語音服務，請管理員到設定啟用"
+    } else if sessions.remove(&session_key) {
+        "🔇 已關閉語音回覆模式"
+    } else {
+        sessions.insert(session_key);
+        "🎤 已開啟語音回覆模式"
+    }
 }
 
 /// Acknowledge a callback query (clears the client-side loading spinner).
@@ -2160,7 +2191,11 @@ async fn handle_command(
                 &reply,
                 thread_id,
                 None,
-                Some(conversation_markup(&own_bot_session(&session_id, agent_name), &reply)),
+                Some(conversation_markup(
+                    &own_bot_session(&session_id, agent_name),
+                    &reply,
+                    crate::tts::TtsRouter::for_home(&ctx.home_dir).is_available(),
+                )),
                 &ctx.home_dir,
                 guarded.as_ref(),
             )
@@ -2192,15 +2227,7 @@ async fn handle_command(
             send_reply(client, api_base, chat_id, &status, thread_id, None, None).await;
         }
         "/voice" => {
-            let session_key = format!("telegram:{chat_id}");
-            let mut sessions = ctx.voice_sessions.lock().await;
-            let msg = if sessions.contains(&session_key) {
-                sessions.remove(&session_key);
-                "🔇 已關閉語音回覆模式"
-            } else {
-                sessions.insert(session_key);
-                "🎤 已開啟語音回覆模式"
-            };
+            let msg = toggle_voice(ctx, chat_id).await;
             send_reply(client, api_base, chat_id, msg, thread_id, None, None).await;
         }
         "/reset" => {
@@ -2211,7 +2238,10 @@ async fn handle_command(
             };
             let session_id = own_bot_session(&conversation, agent_name);
             let msg = match ctx.session_manager.delete_session(&session_id).await {
-                Ok(()) => format!("✅ 已清除工作階段 `{session_id}`。"),
+                Ok(()) => {
+                    ctx.voice_failure_notices.lock().await.remove(&session_id);
+                    format!("✅ 已清除工作階段 `{session_id}`。")
+                }
                 Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
             };
             send_reply(client, api_base, chat_id, &msg, thread_id, None, None).await;
@@ -2876,9 +2906,14 @@ async fn send_voice(
     chat_id: i64,
     audio_data: Vec<u8>,
 ) -> bool {
+    let (filename, mime) = if audio_data.starts_with(b"RIFF") {
+        ("reply.wav", "audio/wav")
+    } else {
+        ("reply.mp3", "audio/mpeg")
+    };
     let part = match reqwest::multipart::Part::bytes(audio_data)
-        .file_name("reply.mp3")
-        .mime_str("audio/mpeg")
+        .file_name(filename)
+        .mime_str(mime)
     {
         Ok(p) => p,
         Err(e) => {
@@ -2973,13 +3008,23 @@ const TG_MARKDOWN_CHUNK: usize = 3400;
 /// — e.g. a fast `1`/`2`/`3` text reply already beat this send) degrades to
 /// the ordinary buttons; the text menu embedded in `reply` still works fine
 /// on its own.
-fn conversation_markup(session_id: &str, reply: &str) -> serde_json::Value {
+fn conversation_markup(session_id: &str, reply: &str, voice_available: bool) -> serde_json::Value {
     if crate::goal_intent::reply_has_confirmation_menu(reply) {
         if let Some(nonce) = crate::goal_intent::pending_button_nonce(session_id) {
             return channel_format::telegram_gintent_buttons(&nonce);
         }
     }
-    channel_format::telegram_conversation_buttons()
+    let mut markup = channel_format::telegram_conversation_buttons();
+    if !voice_available {
+        if let Some(rows) = markup["inline_keyboard"].as_array_mut() {
+            for row in rows {
+                if let Some(buttons) = row.as_array_mut() {
+                    buttons.retain(|button| button["callback_data"] != "duduclaw:voice_toggle");
+                }
+            }
+        }
+    }
+    markup
 }
 
 /// Send an AI reply: markdown → Telegram HTML (tables → <pre>, code fences
@@ -3271,6 +3316,33 @@ mod send_retry_tests {
 #[cfg(test)]
 mod callback_tests {
     use super::*;
+
+    #[test]
+    fn voice_toggle_requires_an_available_provider() {
+        let mut sessions = std::collections::HashSet::new();
+        let key = "telegram:42".to_string();
+        assert_eq!(
+            toggle_voice_state(&mut sessions, key.clone(), false),
+            "尚未設定語音服務，請管理員到設定啟用",
+        );
+        assert!(sessions.is_empty());
+        assert_eq!(
+            toggle_voice_state(&mut sessions, key.clone(), true),
+            "🎤 已開啟語音回覆模式",
+        );
+        assert!(sessions.contains(&key));
+        toggle_voice_state(&mut sessions, key, false);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn unavailable_voice_button_is_hidden() {
+        let without_voice = conversation_markup("telegram:42", "hello", false);
+        assert!(!without_voice.to_string().contains("duduclaw:voice_toggle"));
+        assert!(without_voice.to_string().contains("duduclaw:new_session"));
+        let with_voice = conversation_markup("telegram:42", "hello", true);
+        assert!(with_voice.to_string().contains("duduclaw:voice_toggle"));
+    }
 
     #[test]
     fn parses_callback_query_update() {

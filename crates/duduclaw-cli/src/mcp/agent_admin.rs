@@ -93,6 +93,11 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
         tracing::warn!(agent = %agent_id, error = %e, "org.toml removal failed on agent_remove");
     }
 
+    if let Err(e) = duduclaw_security::mcp_secret_store::remove_agent(home_dir, agent_id) {
+        tracing::warn!(agent = %agent_id, error = %e, "MCP credential cleanup failed after agent removal");
+        return tool_error("Employee removed, but encrypted MCP credential cleanup failed");
+    }
+
     duduclaw_security::audit::log_agent_removed(home_dir, caller, agent_id);
 
     // The reader of this text is the calling AI employee (every MCP caller is

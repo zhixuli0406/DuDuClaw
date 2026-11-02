@@ -79,7 +79,8 @@ describe('concurrent WebChat frame attribution', () => {
     expect(useChatStore.getState().messages.at(-1)?.content).toBe('second');
     expect(useChatStore.getState().isStreaming).toBe(true);
     deliver({ type: 'error', code: 'turn_limit', message: 'limit', conv: second.conv, msg_id: second.msg_id });
-    expect(useChatStore.getState().messages.at(-1)?.content).toBe('limit');
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('second');
+    expect(useChatStore.getState().messages.at(-1)?.deliveryError).toBe(lookupMessage('webchat.turnLimit'));
     expect(useChatStore.getState().isStreaming).toBe(false);
   });
 
@@ -104,7 +105,8 @@ describe('concurrent WebChat frame attribution', () => {
       expect(useChatStore.getState().isStreaming).toBe(true);
     }
     deliver({ type: 'error', code: 'turn_limit', message: 'own limit', request_id: turn.msg_id, conv: turn.conv });
-    expect(useChatStore.getState().messages.at(-1)?.content).toBe('own limit');
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('first');
+    expect(useChatStore.getState().messages.at(-1)?.deliveryError).toBe(lookupMessage('webchat.turnLimit'));
     expect(useChatStore.getState().activeMessageId).toBeNull();
   });
 
@@ -234,4 +236,105 @@ describe('identity outage before session ownership checks', () => {
       }
     }
   });
+});
+
+
+describe('messages queued behind a running WebChat turn', () => {
+  const frame = (turn: Record<string, unknown>, type: string, extra = {}) =>
+    deliver({ type, conv: turn.conv, msg_id: turn.msg_id, ...extra });
+
+  it('keeps live thinking and steps until the queued turn starts producing frames', () => {
+    const first = send('first');
+    frame(first, 'step', { phase: 'start', tool: 'Read' });
+    const thinking = useChatStore.getState().thinking;
+    const steps = useChatStore.getState().stepTree;
+    const second = send('second');
+    expect(useChatStore.getState().activeMessageId).toBe(first.msg_id);
+    expect(useChatStore.getState().thinking).toBe(thinking);
+    expect(useChatStore.getState().stepTree).toBe(steps);
+    expect(useChatStore.getState().messages.at(-1)?.delivery).toBe('queued');
+    frame(second, 'session_info', { session_id: 'webchat:own' });
+    expect(useChatStore.getState().messages.at(-1)?.delivery).toBe('queued');
+    frame(first, 'assistant_done', { content: 'first reply', tokens_used: 1 });
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(useChatStore.getState().activeMessageId).toBeNull();
+    frame(second, 'progress', { content: 'working' });
+    expect(useChatStore.getState().activeMessageId).toBe(second.msg_id);
+    expect(useChatStore.getState().messages.at(-1)?.delivery).toBe('running');
+    expect(useChatStore.getState().stepTree).toEqual([]);
+    frame(second, 'assistant_done', { content: 'second reply', tokens_used: 1 });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('cancels the exact queued msg_id without ending the running turn', () => {
+    const first = send('first');
+    const second = send('second');
+    useChatStore.getState().cancel(second.msg_id as string);
+    const request = JSON.parse(FakeSocket.last.sent.at(-1)!);
+    expect(request).toMatchObject({ type: 'cancel', conv: second.conv, msg_id: second.msg_id });
+    expect(request.request_id).toBeTruthy();
+    deliver({ type: 'cancel_accepted', request_id: request.request_id });
+    expect(useChatStore.getState().messages.at(-1)?.delivery).toBe('queued');
+    frame(second, 'error', { code: 'cancelled', message: 'cancelled' });
+    expect(useChatStore.getState().messages.find(m => m.turnId === second.msg_id)?.delivery).toBe('cancelled');
+    expect(useChatStore.getState().activeMessageId).toBe(first.msg_id);
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    frame(second, 'assistant_chunk', { content: 'late' });
+    expect(useChatStore.getState().messages.some(m => m.content === 'late')).toBe(false);
+  });
+
+  it.each(['msg_id', 'request_id'])('keeps rejected text and the running reply on turn_limit via %s', field => {
+    const first = send('first');
+    const rejected = send('please keep this text');
+    deliver({ type: 'error', code: 'turn_limit', conv: rejected.conv, [field]: rejected.msg_id, message: 'server limit' });
+    const message = useChatStore.getState().messages.find(m => m.turnId === rejected.msg_id)!;
+    expect(message).toMatchObject({ content: 'please keep this text', delivery: 'failed', deliveryError: lookupMessage('webchat.turnLimit') });
+    expect(useChatStore.getState().activeMessageId).toBe(first.msg_id);
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    frame(first, 'assistant_done', { content: 'first reply', tokens_used: 1 });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().messages.map(m => m.content)).toEqual(['first', 'first reply', 'please keep this text']);
+  });
+
+  it('places every streaming reply after its user with two later queued messages', () => {
+    const first = send('one');
+    frame(first, 'assistant_chunk', { content: 'a' });
+    const second = send('two');
+    const third = send('three');
+    frame(first, 'assistant_chunk', { content: 'b' });
+    expect(useChatStore.getState().messages.map(m => m.content)).toEqual(['one', 'ab', 'two', 'three']);
+    frame(first, 'assistant_done', { content: 'ab', tokens_used: 1 });
+    frame(second, 'assistant_chunk', { content: 'c' });
+    frame(second, 'assistant_chunk', { content: 'd' });
+    expect(useChatStore.getState().messages.map(m => m.content)).toEqual(['one', 'ab', 'two', 'cd', 'three']);
+    frame(second, 'assistant_done', { content: 'cd', tokens_used: 2 });
+    // A runtime can return a final reply with no intermediate frames.
+    frame(third, 'assistant_done', { content: 'ef', tokens_used: 3 });
+    expect(useChatStore.getState().messages.map(m => m.content)).toEqual(['one', 'ab', 'two', 'cd', 'three', 'ef']);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    frame(first, 'assistant_chunk', { content: 'late' });
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('ef');
+  });
+});
+
+
+it('preserves independent @ routed turns when their frames interleave', () => {
+  const first = send('first');
+  deliver({ type: 'step', phase: 'start', tool: 'Read', conv: first.conv, msg_id: first.msg_id });
+  const firstThinking = useChatStore.getState().thinking;
+  const second = send('@other second');
+  deliver({ type: 'assistant_chunk', content: 'B', conv: second.conv, msg_id: second.msg_id });
+  expect(useChatStore.getState().activeMessageId).toBe(second.msg_id);
+  deliver({ type: 'assistant_chunk', content: 'A', conv: first.conv, msg_id: first.msg_id });
+  expect(useChatStore.getState().thinking).toBe(firstThinking);
+  expect(useChatStore.getState().stepTree[0]?.tool).toBe('Read');
+  deliver({ type: 'assistant_done', content: 'B done', tokens_used: 1, conv: second.conv, msg_id: second.msg_id });
+  expect(useChatStore.getState().activeMessageId).toBe(first.msg_id);
+  expect(useChatStore.getState().isStreaming).toBe(true);
+  expect(useChatStore.getState().thinking).toBe(firstThinking);
+  expect(useChatStore.getState().messages.map(m => m.content)).toEqual(['first', 'A', '@other second', 'B done']);
+  expect(useChatStore.getState().messages.find(m => m.id === useChatStore.getState().lastCompletedReplyId)?.content).toBe('B done');
+  deliver({ type: 'assistant_done', content: 'A done', tokens_used: 1, conv: first.conv, msg_id: first.msg_id });
+  expect(useChatStore.getState().isStreaming).toBe(false);
+  expect(useChatStore.getState().messages.find(m => m.id === useChatStore.getState().lastCompletedReplyId)?.content).toBe('A done');
 });

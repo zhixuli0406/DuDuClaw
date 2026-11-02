@@ -412,6 +412,10 @@ impl Drop for ChannelThinking {
 /// Add the thinking footer to a non-editable platform's reply, above the
 /// product footer when there is one.
 pub fn with_footer(reply: String, footer: Option<&Footer>) -> String {
+    with_footer_and_product_suffix(reply, footer, &crate::channel_reply::product_footer_suffix())
+}
+
+fn with_footer_and_product_suffix(reply: String, footer: Option<&Footer>, product: &str) -> String {
     let Some(footer) = footer else {
         return reply;
     };
@@ -419,8 +423,7 @@ pub fn with_footer(reply: String, footer: Option<&Footer>) -> String {
         return reply;
     }
     let line = footer.text();
-    let product = crate::channel_reply::product_footer_suffix();
-    match reply.strip_suffix(product.as_str()) {
+    match reply.strip_suffix(product) {
         Some(body) => format!("{}\n\n{line}{product}", body.trim_end()),
         None => format!("{reply}\n\n{line}"),
     }

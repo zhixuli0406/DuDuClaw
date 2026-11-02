@@ -1,7 +1,7 @@
 import { useProductPolicy } from '@/lib/product-policy';
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
-import { api } from '@/lib/api';
+import { api, type KokoroModelStatus } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -45,6 +45,7 @@ export function VoiceTab() {
   const [config, setConfig] = useState({
     tts_provider: 'auto',
     tts_voice: '',
+    tts_command: '',
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -61,8 +62,9 @@ export function VoiceTab() {
     api.system.config().then((res) => {
       if (res?.voice) {
         setConfig((prev) => ({
-          tts_provider: res.voice?.tts_provider ?? prev.tts_provider,
+          tts_provider: ['edge-tts', 'edge'].includes(res.voice?.tts_provider ?? '') ? 'auto' : res.voice?.tts_provider ?? prev.tts_provider,
           tts_voice: res.voice?.tts_voice ?? prev.tts_voice,
+          tts_command: res.voice?.tts_command ?? prev.tts_command,
         }));
       }
     }).catch((e) => {
@@ -90,10 +92,13 @@ export function VoiceTab() {
 
   const ttsOptions: SelectOption[] = [
     { value: 'auto', label: intl.formatMessage({ id: 'voice.provider.auto' }), raw: 'auto' },
-    { value: 'edge-tts', label: intl.formatMessage({ id: 'voice.provider.edgeTts' }), raw: 'edge-tts' },
+    { value: 'kokoro', label: intl.formatMessage({ id: 'voice.provider.kokoro' }), raw: 'kokoro' },
+    { value: 'azure', label: intl.formatMessage({ id: 'voice.provider.azure' }), raw: 'azure' },
     ...(policy.allows('providers', 'minimax') ? [{ value: 'minimax', label: intl.formatMessage({ id: 'voice.provider.minimax' }), raw: 'minimax' }] : []),
     { value: 'openai-tts', label: intl.formatMessage({ id: 'voice.provider.openaiTts' }), raw: 'openai-tts' },
     { value: 'piper', label: intl.formatMessage({ id: 'voice.provider.piper' }), raw: 'piper' },
+    { value: 'command', label: intl.formatMessage({ id: 'voice.provider.command' }), raw: 'command' },
+    { value: 'off', label: intl.formatMessage({ id: 'voice.provider.off' }), raw: 'off' },
   ];
 
   return (
@@ -117,6 +122,26 @@ export function VoiceTab() {
             options={ttsOptions}
           />
         </SettingsCard>
+        {(config.tts_provider === 'kokoro' || config.tts_provider === 'auto') && <KokoroDownloadCard />}
+        {config.tts_provider === 'azure' && (
+          <SettingsCard>
+            <p className="p-4 text-sm text-muted-foreground">{intl.formatMessage({ id: 'voice.azure.note' })}</p>
+          </SettingsCard>
+        )}
+        {config.tts_provider === 'command' && (
+          <FieldBlock
+            label={intl.formatMessage({ id: 'voice.tts.command' })}
+            description={intl.formatMessage({ id: 'voice.tts.commandHint' })}
+          >
+            <Input
+              type="text"
+              value={config.tts_command}
+              onChange={(e) => setConfig({ ...config, tts_command: e.target.value })}
+              placeholder="/path/to/my-tts --in {input} --out {output}"
+            />
+            <AutonomyNote id="voiceTtsCommand" className="mt-2" />
+          </FieldBlock>
+        )}
         {saveError != null && (
           <ErrorState
             variant="inline"
@@ -142,6 +167,60 @@ export function VoiceTab() {
         <SttConfigCard />
       </AdvancedSection>
     </div>
+  );
+}
+
+function KokoroDownloadCard() {
+  const intl = useIntl();
+  const [status, setStatus] = useState<KokoroModelStatus | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [busy, setBusy] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await api.voice.kokoroStatus());
+      setError(null);
+    } catch (e) { setError(e); }
+  }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (status?.state !== 'downloading') return;
+    const timer = setInterval(() => void refresh(), 2000);
+    return () => clearInterval(timer);
+  }, [status?.state, refresh]);
+  const install = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.voice.kokoroInstall();
+      await refresh();
+    } catch (e) { setError(e); }
+    finally { setBusy(false); }
+  };
+  const progress = status?.progress;
+  const percent = progress && progress.total_bytes > 0
+    ? Math.min(100, Math.round(100 * progress.done_bytes / progress.total_bytes)) : null;
+  return (
+    <SettingsCard>
+      <div className="space-y-3 p-4">
+        <p className="text-sm font-medium">Kokoro-82M v1.1-zh · 139 MB · Apache-2.0</p>
+        <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'voice.kokoro.note' })}</p>
+        {status?.installed && <p className="text-sm">{intl.formatMessage({ id: 'voice.kokoro.ready' })}</p>}
+        {status?.state === 'downloading' && (
+          <div role="status" className="text-sm">
+            {intl.formatMessage({ id: 'voice.kokoro.downloading' })}{percent != null ? ` ${percent}%` : ''}
+            {percent != null && <progress aria-label={intl.formatMessage({ id: 'voice.kokoro.downloading' })} max={100} value={percent} className="mt-2 block w-full" />}
+          </div>
+        )}
+        {(error != null || status?.error) && (
+          <ErrorState variant="inline" error={error ?? status?.error}
+            title={intl.formatMessage({ id: 'voice.kokoro.error' })} onRetry={() => void refresh()} />
+        )}
+        <Button variant="brand" size="sm" onClick={() => void install()}
+          disabled={busy || status == null || status.state === 'downloading'}>
+          {intl.formatMessage({ id: status?.installed ? 'voice.kokoro.reinstall' : 'voice.kokoro.download' })}
+        </Button>
+      </div>
+    </SettingsCard>
   );
 }
 

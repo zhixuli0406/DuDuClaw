@@ -7,13 +7,30 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 要新增工具請先看 [custom-mcp-tool.md](../custom-mcp-tool.md)；這頁講的是宣告面，不是實作。不裝 gateway、單獨使用 MCP server，見 [mcp-standalone.md](mcp-standalone.md)。
 
-## 規則：看得到 ⇔ 叫得動
 
-`tools/list` 只列出呼叫端**當下真的叫得動**的工具。下面每一道過濾，都對應派工層本來就會擋的同一道閘，所以「AI 員工讀到的清單」與「伺服器會接受的呼叫」永遠是同一組。
+## 每位員工的工具清單精簡
+
+管理員可在員工總覽的「工具清單精簡」卡片選擇模式、展開未使用工具與查看預估節省量；啟用時可還原清單。模式選單沿用既有員工更新流程。`agents.tool_pruning_status {agent_id}` 與 `agents.tool_pruning_restore {agent_id}` 都限 Admin。估算方式是各候選工具定義序列化後的長度除以四，不是 tokenizer 的實際結果，也不代表供應商實測省下的用量。
+
+```toml
+# agent.toml
+[capabilities]
+tool_pruning = "shadow" # "off" | "shadow" | "on"
+```
+
+預設 `shadow` 僅觀察與回報，`tools/list` 回覆與 `off` 完全相同。未知或格式錯誤的值視為 `off`，並警告一次。只有 `on` 會在所有既有清單篩選之後隱藏符合條件的工具。這不會授予或撤銷權限：隱藏工具仍可通過原有 dispatch 閘呼叫；成功呼叫後，工具會經 `notifications/tools/list_changed` 重新出現在清單。
+
+計算只讀取 `tool_calls.jsonl` 最後 5 MB。紀錄不存在、無法讀取或不足十個已記錄回合時，不精簡任何工具。工具至少連續十個回合未使用且跨兩個 session，或跨五個 session 未使用，才符合條件。記憶、任務、工作狀態、訊息、核准、wiki 讀取、工具探索、Admin／未知效果類別工具，以及有有效任務範圍授權的工具都保留。回合以主機寫入的 `(session_id, turn_id)` 唯一組合計算，不是 log 行數。頻道呼叫使用對話 session 與 turn；派工作業使用自身的 dispatch session 與 run，一次 run 算一回合。舊紀錄缺少這些欄位時，不建立回合樣本，但成功使用仍會重設該工具的未使用期間。門檻從各工具最後一次成功使用之後開始計算。每個行程快取五分鐘。還原會寫入該員工的重設標記，不再採計標記時間之前的使用紀錄，讓符合既有權限的完整清單回來；原有權限篩選仍適用。
+
+Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不影響 MCP 工具定義；此流程維持原樣。
+
+## 規則：清單遵循授權，精簡只影響探索
+
+`tools/list` 只列出呼叫端**當下真的叫得動**的工具。授權過濾對應派工層原有的閘；選用的員工工具精簡則進一步縮小探索清單，已授權工具可能未列出但仍可呼叫。
 
 這既是正確性問題，也是成本問題。工具 schema 是**每次開機都要付的固定 prompt 成本**：CLI 每個 session 讀一次 `tools/list`，整包在第一個使用者 token 之前就進了模型的上下文。一個註定被拒的工具 schema 等於付兩次錢，token 付一次，模型繞著一個用不了的工具規劃再付一次。
 
-隱藏工具**不是**授權決定。呼叫未列出的工具仍然會打到真正的閘，仍然會被拒絕，而且回的是閘自己的訊息。
+隱藏工具**不是**授權決定。呼叫未列出的工具仍然會打到真正的閘，依原有規則接受或拒絕呼叫。
 
 ### 被過濾的項目
 
@@ -29,7 +46,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `recording` | `agent.toml [capabilities]` | 隱藏 5 個錄製工具 |
 | `system_operator` | `agent.toml [capabilities]` | 隱藏 19 個值班機操作工具 |
 | `codrive` | `agent.toml [capabilities]` | 隱藏 `codrive_run` / `codrive_status` |
-| `computer_use` | `agent.toml [capabilities]` | 隱藏 8 個 `computer_*`（見下方 [`computer_*`](#computer_由-gateway-執行的-session)） |
+| `computer_use` | `agent.toml [capabilities]` | 隱藏 9 個 `computer_*`（見下方 [`computer_*`](#computer_由-gateway-執行的-session)） |
 | `db_sources` | `agent.toml [capabilities]` | 隱藏 4 個 `db_*` |
 | `[fork] enabled` | `agent.toml` | 隱藏 6 個分支工具 |
 | `[knowledge] enabled` 加集合授權 | `config.toml`／`knowledge.db`／`agent.toml [knowledge] collections` | 除非知識庫啟用、且至少有一個集合授權給員工或其部門（經 `[knowledge] collections` 縮小後），否則隱藏 4 個 `knowledge_*`；授權變更會送出 `list_changed`（見下方 [`knowledge_*`](#knowledge_文件知識庫)） |
@@ -174,7 +191,7 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 
 ### `computer_*`：由 gateway 執行的 session
 
-這八個工具為每位 AI 員工驅動一個電腦操作 session：一個帶虛擬顯示器與 kiosk 瀏覽器的隔離容器。MCP server 只負責把每次呼叫透過 loopback 轉給 gateway（`POST /api/internal/computer-use`，每個請求各自簽章）；容器由 gateway 持有，所有檢查也由 gateway 執行，所以 gateway 必須在執行中。除非 `agent.toml [capabilities] computer_use = true`，否則這些工具是隱藏的。
+這九個工具為每位 AI 員工驅動一個電腦操作 session：一個帶虛擬顯示器與 kiosk 瀏覽器的隔離容器。MCP server 只負責把每次呼叫透過 loopback 轉給 gateway（`POST /api/internal/computer-use`，每個請求各自簽章）；容器由 gateway 持有，所有檢查也由 gateway 執行，所以 gateway 必須在執行中。除非 `agent.toml [capabilities] computer_use = true`，否則這些工具是隱藏的。
 
 | 工具 | 參數 | 備註 |
 |---|---|---|
@@ -182,12 +199,17 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 | `computer_screenshot` | 無 | MCP 圖片區塊（PNG，已遮罩），後面接一個文字區塊，寫已用動作數與剩餘時間。整張圖被遮掉時，文字會如實說明，並寫出原因（多個視窗、焦點視窗敏感或讀不到、偵測失敗）與下一步 |
 | `computer_click` | `x`、`y` 整數（必填）；`button` 字串 `left`/`right`；`double` 布林 | `double` 只限左鍵 |
 | `computer_type` | `text` 字串（必填），1–2,000 字元 | 稽核只記字元數 |
+| `computer_login` | `credential`（必填，憑證標籤字串） | Gateway 代允許的員工填入並送出登入，只回傳狀態與一句說明 |
 | `computer_key` | `key` 字串（必填）：字母、數字、`+`、`-`、`_` | 例如 `Return`、`ctrl+s` |
 | `computer_scroll` | `x`、`y` 整數（必填）；`direction` 字串 `up`/`down`（預設 `down`）；`amount` 整數 1–20（預設 3） | |
 | `computer_navigate` | `url` 字串（必填） | 只接受 `https://`，主機必須剛好在該員工的 `[capabilities.computer_use_config] allowed_domains` 上且在 session 啟動時解析成功，連接埠不寫或為 443，不得帶使用者名稱或密碼，最長 2,000 位元組。沒有白名單時 session 沒有網路，呼叫會被拒絕 |
 | `computer_session_stop` | `session_id` 字串，選填 | 移除容器 |
 
-整數與布林參數也接受數字字串與 `"true"`/`"false"` 字串。點擊、輸入、按鍵、捲動與導覽各算一個動作，計入 `max_actions`（預設 50）。各項上限、審批與確認規則、網路白名單及其殘留風險，見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)。
+`computer_login` 是第九個 session 工具。管理員在 **系統 → 安全 → 網站登入憑證** 建立帶標籤、HTTPS `login_url` 的登入資料，並指定至少一位允許的員工；密碼只輸入該表單，不貼到聊天。選填的 `allowed_paths` 預設為空，只允許 helper 送出第一步後到達、含可見密碼欄位的相同來源第二步確切路徑。Gateway 先透過既有導覽檢查開啟保存的網址；導覽與登入各消耗一次 session 動作額度。Helper 檢查確切來源、路徑及 POST 提交方式，包含原生 `requestSubmit` 與備援路徑實際選用送出按鈕的 `formmethod`，submit 事件後也會重查；攔截每個請求與轉址以拒絕其他來源，拒絕查詢參數含完整帳號或密碼值的非 POST 請求，並略過 service worker。MCP 請求只帶標籤，session 啟動與狀態回應只顯示呼叫員工可用的標籤，不含使用者名稱。收到 `needs_takeover` 時請人員使用既有接手流程，沒有 OTP 輸入工具。`logged_in` 只表示密碼欄位消失；若清除失敗（`failed_uncleared`），Gateway 會停止並移除 session 與容器，回傳錯誤要求啟動新 session，不能靠導覽恢復。解除攔截前，helper 會追蹤 `Network.requestWillBeSent`、`Network.loadingFinished` 與 `Network.loadingFailed`，確認請求已結束。最多等待 3 秒，且須連續兩次命令往返都沒有新請求活動或待完成請求。若無法確認完成，回傳 `failed_uncleared`，在 Fetch 攔截仍啟用時呼叫 `Browser.close`，再由 Gateway 移除 session 與容器。登入執行期間暫停截圖。
+
+登入僅限保存的來源（協定、主機、連接埠），表單送出也必須同源。所有網址都必須使用 HTTPS，localhost 也不例外。同源網頁 JavaScript 能讀取已填入的欄位；雙因素驗證須由人員處理。使用前須重建電腦操作容器映像，加入新的 helper。
+
+整數與布林參數也接受數字字串與 `"true"`/`"false"` 字串。點擊、輸入、登入、按鍵、捲動與導覽各算一個動作，計入 `max_actions`（預設 50）。各項上限、審批與確認規則、網路白名單及其殘留風險，見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)。
 
 ### `os_*`：DuDuClaw OS 上的裝置操作
 
@@ -264,3 +286,16 @@ AI 員工只能調整自己或下屬的設定，採用與 `agent_update` 相同�
 ## 宣告憑證用途
 
 `credential_declare` 接受 `credential_id` 與 `service`，拒絕員工備註；服務必須符合 `^[a-z0-9][a-z0-9._-]{0,63}$` 並通過憑證偵測。只有通過身分驗證且持有該憑證的員工，才能經過簽章的 gateway loopback 路由宣告；員工不能覆蓋 Admin 設定的服務。這個工具只註記既有稽核資料，不取出秘密、不授權新持有者，也不把真值代入工具呼叫。Admin 可到「安全 → 憑證稽核」查閱與更正。詳見[憑證稽核](../../features/zh-TW/70-credential-audit.md)。
+
+
+## 第三方 MCP 環境變數憑證
+
+第三方 MCP 金鑰會移出員工的設定檔。`.mcp.json` 只保留 `secret://mcp/<server>/<ENV_NAME>` 參照，實際值使用既有 `.keyfile` 加密，存於 `<home>/secrets/mcp/<agent_id>.enc`。第三方伺服器的所有 `env` 項目都存入憑證庫，例外只有 `PATH`、`HOME`、`NODE_ENV`、`LOG_LEVEL` 與既有 `secret://` 參照。DuDuClaw 自身的伺服器項目與其中的 `DUDUCLAW_*` 變數維持不變。
+
+只有精確名稱 `duduclaw`、`duduclaw-pro` 或目前 instance 的 key 才是內建欄位；`duduclaw-evil` 仍視為第三方。產生有效設定時，內建欄位的 command、args、env 整筆換成主程式當次產生的 canonical 設定，因此金鑰輪替、執行檔改名或偽造 command 都不會沿用原始值。任何名稱的 raw `mcp-proxy` 呼叫仍被拒絕，第三方也不能攜帶 proxy 私有環境變數。Claude 在沒有代理用途或只有內建伺服器時維持不加旗標；內建設定仍由原本的啟動準備流程修復。Fork 複本的來源可能是未經員工準備流程的一般專案，因此即使 gate 關閉，複本仍會重建內建欄位。讀取秘密必須有對應憑證庫擁有者的有效 `DUDUCLAW_AGENT_TOKEN` HMAC，即使 delegation 使用寬鬆設定也不能省略，且不會以預設員工身分代替。
+
+Proxy 只解析自己所屬員工的參照，並在啟動上游伺服器前才取得實際值。參照不存在、不合法或無法解密時，該伺服器不會啟動；錯誤只指出伺服器與變數名稱，不含值。需要解析秘密的設定若無法改寫為 proxy 路徑，Claude／Grok 不會退回直接載入原檔。匯出時只留下環境變數名稱與空白佔位值，匯入者必須重新輸入。
+
+Gateway 啟動時會遷移舊有明文 env：先將原檔加密備份至 `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc`，寫入並讀回驗證憑證庫後，才以原子操作替換設定檔。依金鑰、加密備份、憑證庫、設定檔的順序，每一步都須完成父目錄 fsync 才繼續。任一步失敗即停止該員工的遷移；若替換設定後同步失敗，會還原原始明文。還原也失敗時會明確報錯並保留已持久化的加密備份供復原，然後繼續處理其他員工；清理後每位員工最多保留三份遷移備份；清理若因 I/O 錯誤失敗會記錄，並於下次掃描重試。刪除伺服器或員工會移除對應的憑證庫項目，復原已刪除員工後須重新輸入金鑰。
+
+Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員工與 gateway 使用相同 OS 使用者執行時，有 Bash 仍可讀取 gateway 檔案，包括 `.keyfile`；真正隔離需要不授予 Bash，或使用任務沙箱。這項功能只涵蓋 `env`，不涵蓋 `args`／`url` 裡的金鑰，也不涵蓋工具結果回傳的金鑰。既有明文匯出與備份不會被追溯清除。

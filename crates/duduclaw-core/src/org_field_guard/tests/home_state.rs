@@ -58,6 +58,8 @@ const PROTECTED_HOME_PATHS: &[&str] = &[
     "jwt_secret",
     ".keyfile",
     "inference.toml",
+    "skill_signature_history.json",
+    "skill_signature_history.json.lock",
     // shared surfaces whose only legitimate writer is a gated MCP tool or
     // the gateway itself
     "shared/wiki/policies/x.md",

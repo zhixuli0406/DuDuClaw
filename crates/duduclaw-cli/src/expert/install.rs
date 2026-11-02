@@ -21,6 +21,7 @@ pub(super) struct InstallCtx {
     pub home: PathBuf,
     pub dry_run: bool,
     pub confirm_profile: Option<String>,
+    pub signature_status: Option<duduclaw_core::publishers::SignatureStatus>,
     pub rename: bool,
     /// Explicit operator grant for pack hooks (`--trust-hooks`). Without it
     /// hooks land disabled behind an ApprovalBroker request (fail-closed).
@@ -46,6 +47,7 @@ pub(super) struct InstallCtx {
 pub(crate) struct PipelineOpts {
     pub dry_run: bool,
     pub confirm_profile: Option<String>,
+    pub signature_status: Option<duduclaw_core::publishers::SignatureStatus>,
     pub rename: bool,
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
@@ -207,7 +209,10 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
     let staging = std::env::temp_dir().join(format!("duduclaw-expert-{}", uuid::Uuid::new_v4()));
     let cleanup = Cleanup(staging.clone());
 
-    let resolved = super::source::resolve_source_full(source, &staging).await?;
+    let resolved = if opts.extract_root.is_some() {
+        // The front door verified this private snapshot; never re-read its original source.
+        super::source::ResolvedSource { dir: PathBuf::from(source), zip: None, original_dir: None }
+    } else { super::source::resolve_source_full(source, &staging).await? };
     let (root, extract_root) = match &opts.extract_root {
         Some(er) => (resolved.dir.clone(), er.clone()),
         None => (detect::resolve_root(&resolved.dir), resolved.dir.clone()),
@@ -257,6 +262,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         home: home.to_path_buf(),
         dry_run,
         confirm_profile: opts.confirm_profile.clone(),
+        signature_status: opts.signature_status.clone(),
         rename: opts.rename || opts.reimport == super::reimport::ReimportMode::Copy,
         trust_hooks: opts.trust_hooks,
         attach_under,
@@ -1082,8 +1088,9 @@ pub async fn cmd_export(home: &Path, slug: &str, format: &str, out: Option<&Path
         exported += 1;
 
         if let Some(servers) = super::read_mcp_servers(&agent_dir.join(".mcp.json")) {
-            for (k, v) in servers {
-                if k != "duduclaw" {
+            for (k, mut v) in servers {
+                if k != "duduclaw" && k != "duduclaw-pro" && k != duduclaw_core::mcp_server_key() {
+                    placeholder_export_env(&mut v);
                     plugin_servers.entry(k).or_insert(v);
                 }
             }
@@ -1107,6 +1114,31 @@ pub async fn cmd_export(home: &Path, slug: &str, format: &str, out: Option<&Path
         out_dir.display()
     );
     Ok(())
+}
+
+/// Exports carry variable names, never local references or stored values.
+/// Empty strings require the importer/operator to enter credentials again.
+fn placeholder_export_env(def: &mut serde_json::Value) {
+    if let Some(env) = def.get_mut("env").and_then(serde_json::Value::as_object_mut) {
+        for value in env.values_mut() {
+            *value = serde_json::Value::String(String::new());
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_export_secret_tests {
+    #[test]
+    fn export_preserves_names_only() {
+        let mut def = serde_json::json!({"command":"npx","args":["example"],"env":{
+            "API_KEY":"secret://mcp/example/API_KEY", "LEGACY_KEY":"sk-live-private", "HOME":"/private/home"
+        }});
+        super::placeholder_export_env(&mut def);
+        let text = def.to_string();
+        assert!(!text.contains("secret://") && !text.contains("sk-live-private") && !text.contains("/private/home"));
+        assert_eq!(def["env"], serde_json::json!({"API_KEY":"", "LEGACY_KEY":"", "HOME":""}));
+        assert_eq!(def["args"], serde_json::json!(["example"]));
+    }
 }
 
 /// Pull `[model] preferred` + `[capabilities] allowed/denied_tools` back out
@@ -1220,7 +1252,7 @@ mod native_plan_tests {
 
     fn ctx(home: &Path) -> InstallCtx {
         InstallCtx {
-            home: home.to_path_buf(), dry_run: true, confirm_profile: None,
+            home: home.to_path_buf(), dry_run: true, confirm_profile: None, signature_status: None,
             rename: false, trust_hooks: false, attach_under: None,
             reimport: Default::default(), replace: None, agent_cap: None,
             replace_state: Default::default(),
@@ -1247,7 +1279,7 @@ mod native_plan_tests {
     // Not run in this security-fix session: the owner prohibited builds/tests.
     #[tokio::test]
     async fn native_confirmation_rejects_changed_tools_skill_and_collision_plan() {
-        for change in ["tools", "skill", "collision", "parent", "model"] {
+        for change in ["tools", "skill", "collision", "parent", "model", "signature"] {
             let home = tempfile::tempdir().unwrap();
             let root = tempfile::tempdir().unwrap();
             source(root.path());
@@ -1264,6 +1296,9 @@ mod native_plan_tests {
                         "[agent]\nname = \"helper\"\n").unwrap();
                 }
                 "parent" => context.attach_under = Some("supervisor".into()),
+                "signature" => context.signature_status = Some(duduclaw_core::publishers::SignatureStatus {
+                    state: duduclaw_core::publishers::SignatureState::Verified, publisher: Some("fixture".into()),
+                }),
                 _ => std::fs::write(root.path().join("agents/helper/agent.partial.toml"),
                     "[model]\npreferred = \"claude-opus-4-5\"\n").unwrap(),
             }

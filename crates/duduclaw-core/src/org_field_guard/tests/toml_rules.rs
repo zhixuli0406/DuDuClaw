@@ -597,3 +597,14 @@ fn bash_unrelated_command_is_allowed() {
     );
 }
 
+
+#[test]
+fn tool_pruning_is_frozen_with_the_capabilities_section() {
+    let new = BASE_WITH_CAPS.replace("os_native = false", "os_native = false\ntool_pruning = 'off'");
+    let decision = check_protected_toml_write(&agent_toml(), &home(), Some(BASE_WITH_CAPS), &new);
+    assert!(!decision.is_allowed());
+    match decision {
+        GuardDecision::BlockedProtectedField { changed, .. } => assert!(changed.iter().any(|key| key.contains("tool_pruning"))),
+        other => panic!("expected frozen capability, got {other:?}"),
+    }
+}

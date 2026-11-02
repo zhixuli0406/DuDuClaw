@@ -37,6 +37,15 @@ const UI_LOCALE: &str = "zh-TW";
 
 #[derive(Subcommand)]
 pub enum PackCommands {
+    /// Write MANIFEST.sha256; sign it separately with minisign -Sm MANIFEST.sha256.
+    Manifest {
+        dir: PathBuf,
+        #[arg(long)]
+        publisher: String,
+    },
+    /// Print verified, unsigned or invalid origin state without installing.
+    Verify { dir: PathBuf },
+
     /// List packs — installed ones first, then what is available to install
     /// from the built-in catalog and the local preset store.
     List {
@@ -114,6 +123,20 @@ pub enum PackCommands {
 pub async fn run(cmd: PackCommands) -> Result<()> {
     let home = crate::duduclaw_home();
     match cmd {
+        PackCommands::Manifest { dir, publisher } => {
+            let pack = load_pack_dir(&dir).map_err(|e| crate::expert::bad_content(e.to_string()))?;
+            duduclaw_core::pack::signatures::write_manifest(&dir, &pack, &publisher).map_err(crate::expert::bad_content)?;
+            println!("已寫入 MANIFEST.sha256；請在 pack 目錄執行 minisign -Sm MANIFEST.sha256");
+            Ok(())
+        }
+        PackCommands::Verify { dir } => {
+            let pack = load_pack_dir(&dir).map_err(|e| crate::expert::bad_content(e.to_string()))?;
+            let (status, reason) = duduclaw_core::pack::signatures::verify(&dir, &pack, &duduclaw_core::publishers::TrustStore::load(&home).map_err(crate::expert::bad_content)?);
+            println!("{}", serde_json::to_string(&status).map_err(|e| crate::expert::bad_content(e.to_string()))?);
+            if let Some(reason) = reason { return Err(crate::expert::bad_content(reason)); }
+            Ok(())
+        }
+
         PackCommands::List { json } => cmd_list(&home, json),
         PackCommands::Inspect {
             source,
@@ -209,14 +232,17 @@ pub(crate) async fn install_pack(home: &Path, source: &str, opts: InstallOptions
 
 async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) -> Result<()> {
     refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
+    let trust_store = duduclaw_core::publishers::TrustStore::load(home).map_err(crate::expert::bad_content)?;
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
     let resolved = crate::expert::resolve_pack_source_full(source, &staging).await?;
     let root = crate::expert::resolve_pack_root(&resolved.dir);
-    let pipeline = crate::expert::PipelineOpts {
+    let source_premium = resolved.original_dir.as_deref().is_some_and(path_is_under_premium_tree);
+    let mut pipeline = crate::expert::PipelineOpts {
         dry_run: opts.dry_run,
         confirm_profile: opts.confirm_profile.clone(),
+        signature_status: None,
         rename: opts.rename,
         trust_hooks: opts.trust_hooks,
         attach_under: opts.attach_under.clone(),
@@ -232,13 +258,27 @@ async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) ->
     };
 
     match load_pack_dir(&root) {
-        Ok(pack) => {
+        Ok(mut pack) => {
+            if source_premium { pack.tier = PackTier::Premium; }
+            let status = if source.starts_with("github:") {
+                duduclaw_core::publishers::SignatureStatus::unsigned(None)
+            } else {
+                let (status, reason) = duduclaw_core::pack::signatures::verify(&root, &pack, &trust_store);
+                if let Some(reason) = reason { return Err(crate::expert::bad_content(format!("pack 簽章狀態 invalid：{reason}"))); }
+                status
+            };
+            println!("來源簽章：{}", serde_json::to_string(&status).map_err(|e| crate::expert::bad_content(e.to_string()))?);
+            if status.state == duduclaw_core::publishers::SignatureState::Unsigned {
+                eprintln!("⚠ 未簽章：無法證明發布者來源；安全掃描、隔離與核准照常執行");
+            }
+            pipeline.signature_status = Some(status.clone());
             tier_gate(&pack, premium_unlocked())?;
             for problem in pack.lint() {
                 eprintln!("  {} {problem}", style("⚠").yellow());
             }
             match pack.kind {
                 PackKind::Preset => {
+                    confirm_preset(home, &pack, &root, opts, &status)?;
                     install_preset_pack(home, &pack, Some(&root), opts.force, opts.dry_run)
                 }
                 PackKind::Team | PackKind::Template => {
@@ -278,6 +318,60 @@ pub(crate) fn refuse_in_ai_session(markers: &[&str]) -> Result<()> {
     ))
 }
 
+fn preset_body(pack: &Pack, src_dir: Option<&Path>) -> Result<String> {
+    let verbatim = src_dir
+        .map(|d| d.join(duduclaw_core::pack::LEGACY_PRESET_FILE))
+        .filter(|p| p.is_file())
+        .and_then(|p| std::fs::read_to_string(&p).ok());
+    let body = match verbatim {
+        Some(text) => text,
+        None => match pack.to_legacy_preset_toml() {
+            Some(b) => b,
+            None => return Err(cfg_err("無法輸出 preset.toml 內容".into())),
+        },
+    };
+    Ok(body)
+}
+
+/// Presets use the same explicit content review token as roster imports.
+fn confirm_preset(home: &Path, pack: &Pack, root: &Path, opts: &InstallOptions, status: &duduclaw_core::publishers::SignatureStatus) -> Result<()> {
+    let body = preset_body(pack, Some(root))?;
+    let dest = duduclaw_core::preset::preset_file_path(home, pack.id.trim());
+    let prior = match std::fs::read(&dest) {
+        Ok(bytes) => Some(crate::expert::registry::sha256_hex(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io_err(e.to_string())),
+    };
+    let plan = serde_json::json!({
+        "version": 1, "signature": status,
+        "destination": crate::expert::registry::sha256_hex(dest.as_os_str().as_encoded_bytes()),
+        "body_sha256": crate::expert::registry::sha256_hex(body.as_bytes()),
+        "prior_sha256": prior, "force": opts.force,
+        "product_policy": duduclaw_core::product_profile::load(home).map_err(cfg_err)?,
+    });
+    let digest = crate::expert::registry::sha256_hex(plan.to_string().as_bytes());
+    let needs_confirmation = !opts.dry_run && !(dest.is_file() && !opts.force)
+        && opts.confirm_profile.as_deref() != Some(digest.as_str());
+    let confirmation_error = needs_confirmation.then(|| cfg_err("請先預覽職務組合，再使用 --confirm-profile 確認；來源簽章狀態或內容改變後須重新預覽".into()));
+    let report = serde_json::json!({"dry_run": opts.dry_run,
+        "meta": {"format": "preset", "slug": pack.id},
+        "error": confirmation_error.as_ref().map(crate::expert::import_error_json),
+        "counts": {"imported": 0, "skipped": 0, "conflict": 0, "warning": 0, "ignored": 0}, "items": [],
+        "details": {
+        "profile_preview": [], "profile_install_plan": plan,
+        "profile_confirmation": digest, "signature": status,
+    }});
+    if let Some(path) = &opts.report_json {
+        use std::io::Write;
+        let mut file = crate::expert::open_import_report(path)?;
+        file.write_all(&serde_json::to_vec_pretty(&report).map_err(|e| cfg_err(e.to_string()))?).map_err(|e| io_err(e.to_string()))?;
+    }
+    eprintln!("{}", serde_json::to_string_pretty(&report).map_err(|e| cfg_err(e.to_string()))?);
+    eprintln!("確認上述職務組合與來源狀態後，使用 --confirm-profile {digest}");
+    if let Some(error) = confirmation_error { return Err(error); }
+    Ok(())
+}
+
 /// Install a job preset into `<home>/presets/<id>/preset.toml`.
 ///
 /// A legacy `preset.toml` source is copied **verbatim** when `src_dir` is
@@ -305,17 +399,7 @@ fn install_preset_pack(
             id.escape_debug()
         )));
     }
-    let verbatim = src_dir
-        .map(|d| d.join(duduclaw_core::pack::LEGACY_PRESET_FILE))
-        .filter(|p| p.is_file())
-        .and_then(|p| std::fs::read_to_string(&p).ok());
-    let body = match verbatim {
-        Some(text) => text,
-        None => match pack.to_legacy_preset_toml() {
-            Some(b) => b,
-            None => return Err(cfg_err("無法輸出 preset.toml 內容".into())),
-        },
-    };
+    let body = preset_body(pack, src_dir)?;
     let dest = duduclaw_core::preset::preset_file_path(home, id);
     if dest.is_file() && !force {
         println!(
@@ -415,9 +499,10 @@ async fn cmd_inspect(source: &str, json: bool, emit_canonical: bool) -> Result<(
     let staging = std::env::temp_dir().join(format!("duduclaw-pack-{}", uuid::Uuid::new_v4()));
     let _cleanup = StagingCleanup(staging.clone());
 
-    let dir = crate::expert::resolve_pack_source(source, &staging).await?;
-    let root = crate::expert::resolve_pack_root(&dir);
-    let pack = load_pack_dir(&root).map_err(|e| cfg_err(e.to_string()))?;
+    let resolved = crate::expert::resolve_pack_source_full(source, &staging).await?;
+    let root = crate::expert::resolve_pack_root(&resolved.dir);
+    let mut pack = load_pack_dir(&root).map_err(|e| cfg_err(e.to_string()))?;
+    if resolved.original_dir.as_deref().is_some_and(path_is_under_premium_tree) { pack.tier = PackTier::Premium; }
 
     if emit_canonical {
         println!("{}", canonical_toml(&pack));
@@ -547,6 +632,7 @@ fn canonical_toml(pack: &Pack) -> String {
     p.insert("kind".into(), s(pack.kind.as_str()));
     p.insert("tier".into(), s(pack.tier.as_str()));
     p.insert("version".into(), s(pack.version_or_zero()));
+    if !pack.publisher.is_empty() { p.insert("publisher".into(), s(&pack.publisher)); }
     p.insert("description".into(), s(&pack.description));
     if !pack.author.is_empty() {
         p.insert("author".into(), s(&pack.author));
@@ -685,6 +771,7 @@ fn pack_json(pack: &Pack, installed: bool) -> serde_json::Value {
         "kind": pack.kind.as_str(),
         "tier": pack.tier.as_str(),
         "version": pack.version_or_zero(),
+        "publisher": pack.publisher,
         "display_name": pack.display(UI_LOCALE),
         "description": pack.description,
         "category": pack.category,
@@ -1069,6 +1156,43 @@ preferred = "claude-haiku-4-5"
         assert!(checked >= 2, "expected at least two premium packs, saw {checked}");
     }
 
+    #[test]
+    fn preset_confirmation_binds_origin_state() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let report = root.path().join("preview.json");
+        let mut pack = Pack::default();
+        pack.id = "preset-fixture".into();
+        pack.kind = PackKind::Preset;
+        let unsigned = duduclaw_core::publishers::SignatureStatus::unsigned(Some("fixture"));
+        confirm_preset(home.path(), &pack, root.path(), &InstallOptions {
+            dry_run: true, report_json: Some(report.clone()), ..Default::default()
+        }, &unsigned).unwrap();
+        let preview: serde_json::Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        let opts = InstallOptions {
+            confirm_profile: preview["details"]["profile_confirmation"].as_str().map(str::to_string), ..Default::default()
+        };
+        assert!(confirm_preset(home.path(), &pack, root.path(), &opts, &unsigned).is_ok());
+        let verified = duduclaw_core::publishers::SignatureStatus {
+            state: duduclaw_core::publishers::SignatureState::Verified, publisher: Some("fixture".into()),
+        };
+        let failure_path = root.path().join("failure.json");
+        let changed_opts = InstallOptions { report_json: Some(failure_path.clone()), ..opts };
+        assert!(confirm_preset(home.path(), &pack, root.path(), &changed_opts, &verified).is_err());
+        let failure: serde_json::Value = serde_json::from_slice(&std::fs::read(failure_path).unwrap()).unwrap();
+        assert!(!failure["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn invalid_publisher_store_refuses_all_pack_sources_before_resolution() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(duduclaw_core::publishers::TRUST_STORE_FILE), "[broken").unwrap();
+        for source in ["github:example/pack", "registry:example", "/missing-local-pack"] {
+            let err = install_pack_inner(home.path(), source, &InstallOptions::default()).await.unwrap_err();
+            assert!(err.to_string().contains("trusted_publishers.toml"), "{err}");
+        }
+    }
+
     #[tokio::test]
     async fn install_pack_copies_a_legacy_preset_verbatim() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1083,10 +1207,15 @@ preferred = "claude-haiku-4-5"
         std::fs::write(src.join("preset.toml"), body).unwrap();
 
         let home = tempfile::tempdir().unwrap();
+        let preview_path = tmp.path().join("preview.json");
+        install_pack(home.path(), src.to_str().unwrap(), InstallOptions {
+            dry_run: true, report_json: Some(preview_path.clone()), ..Default::default()
+        }).await.expect("legacy preset previews");
+        let preview: serde_json::Value = serde_json::from_slice(&std::fs::read(preview_path).unwrap()).unwrap();
         install_pack(
             home.path(),
             src.to_str().unwrap(),
-            InstallOptions::default(),
+            InstallOptions { confirm_profile: preview["details"]["profile_confirmation"].as_str().map(str::to_string), ..Default::default() },
         )
         .await
         .expect("legacy preset installs");

@@ -1,6 +1,6 @@
 # 音声パイプライン
 
-> 音声を入れて音声を出す——設定をまだ共有していない2つの経路と、このページがかつて主張していたがコードの無い4つのコンポーネント。
+> HTTP と Telegram の音声認識・音声合成で、プロバイダー設定を共有します。
 
 ---
 
@@ -14,16 +14,16 @@
 
 ---
 
-## 2つの経路、2つの設定
+## 共通の音声設定
 
-最も重要な点：**HTTP の音声エンドポイントと Telegram の音声ハンドラは別々に配線されています。** v1.68.0 から音声認識（`config.toml [voice] stt_*`）は両方に届き、LINE の音声メッセージにも使われます。音声合成（`inference.toml [voice] tts_*`）は引き続き HTTP エンドポイントにだけ効きます。
+HTTP と Telegram の音声認識は `config.toml [voice] stt_*` を使用します。HTTP、Telegram の音声返信と `synthesize_speech` MCP ツールは `TtsRouter::for_home` を共有し、`inference.toml [voice] tts_provider` / `tts_voice` に従って音声を合成します。
 
 ### 経路1 — HTTP エンドポイント（ダッシュボード、WebChat）
 
 | エンドポイント | 認証 | 挙動 |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | ボディ上限 10 MiB。ボディに触れる**前に** `config.toml [voice]` からプロバイダを解決し、未設定なら **501 で fail-closed**——推測も文字起こしの捏造もしません |
-| `POST /api/tts` | Bearer JWT | リクエストごとに `inference.toml [voice] tts_provider` / `tts_voice` を読み、`TtsRouter` の戦略を選びます（`edge-tts` → edge のみ、`minimax` / `openai-tts` → クラウド優先、それ以外 → ローカル優先）。`none` / `off` / `disabled` のときは 501 を返します |
+| `POST /api/tts` | Bearer JWT | 共通ルーターを使用。`kokoro`、`azure`、`piper`、`minimax`、`openai-tts` は指定したプロバイダーのみ、それ以外の有効な設定はローカル優先。`none` / `off` / `disabled` は 501 を返します |
 | `GET`／`POST /api/voice/config` | Bearer JWT | `[voice]` の STT 設定を読み書き |
 
 **STT プロバイダ**（`stt.rs`、実装は2つ）：
@@ -40,24 +40,33 @@ stt_model     = "whisper-1"
 stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --no-prints"
 ```
 
-**TTS プロバイダ**（`tts.rs`、1つの `TtsProvider` トレイトの下に4実装）：
+**TTS**
 
-| プロバイダ | 場所 | 備考 |
+| プロバイダー | 場所 | 説明 |
 |---|---|---|
-| `PiperTtsProvider` | ローカル | モデルディレクトリの ONNX ボイス |
-| `EdgeTtsProvider` | クラウド | 無料、API キー不要 |
-| `MiniMaxTts` | クラウド | T2A v2。テキストを解析して CJK かラテン系のボイスを選択 |
-| `OpenAiTtsProvider` | クラウド | 文字単位課金 |
+| `PiperTtsProvider` | ローカル | インストール済み ONNX 音声 |
+| `KokoroTtsProvider` | ローカル | Kokoro-82M v1.1-zh、Apache-2.0、必要時にダウンロード |
+| `MiniMaxTts` | クラウド | T2A v2、CJK またはラテン文字の音声を選択 |
+| `OpenAiTtsProvider` | クラウド | OpenAI TTS |
+| `AzureTts` | クラウド | 公式 Azure AI Speech REST、台湾の中国語音声 |
 
-`TtsRouter` は3つの戦略のいずれかで振り分けます：`LocalFirst`（ローカル → edge → MiniMax → OpenAI）、`EdgeOnly`、`CloudBest`。
+`auto` はインストール済み Piper → インストール済み Kokoro → MiniMax → OpenAI → Azure の順に試し、製品ポリシーを適用します。プロバイダーを指定した場合はそのプロバイダーのみ使用し、`off` は音声合成を無効にします。`duduclaw doctor` は合成リクエストを送らずに利用可能なプロバイダーを表示します。
+
+`command` プロバイダーは Admin が設定した外部プログラムを実行します。DuDuClaw に合成プログラムは同梱されません。「設定 → 音声」で `tts_provider = "command"` と `tts_command = "/path/to/my-tts --in {input} --out {output}"` を設定してください。コマンド文字列は空白で argv に分割し、shell は使いません。`{input}` と `{output}` はそれぞれ1つの argv 項目としてパスに置換されます。テキストはプライベートな一時ディレクトリの `input.txt` に書き込まれ、プログラムは音声バイト列を `output.audio` に書き込みます。タイムアウトは60秒で、環境変数は `PATH`、`HOME`、`USERPROFILE`、`TEMP`、`TMP`、`SYSTEMROOT` のみです。`auto` では既存の他プロバイダーの後に試します。
+
+**設定 → 音声** から Kokoro をダウンロードします（約 134 MB、Apache-2.0）。インストール時にファイルと共有 ONNX Runtime を検証し、中断したダウンロードは再開できます。モデルの重みはバイナリに含まれません。保存先は `<home>/models/kokoro-zh/`。既定音声は `zf_001`、ほかに `zm_010` と英語専用の `af_maple` を選べます。中国語は中国大陸のアクセントで、多音字を誤読する場合があります。繁体字と数値を正規化しますが、すべての単語の発音を網羅するものではありません。入力上限は 2,000 文字、各チャンクは最大 500 tokens、間に 150 ms の無音を追加します。Kokoro は 24 kHz WAV を出力し、Telegram には `sendAudio` で `reply.wav` を送ります。
+
+Azure はテキストを Microsoft に送信します。gateway 環境に `AZURE_SPEECH_KEY` と `AZURE_SPEECH_REGION` を設定してください。中国語の既定音声は `zh-TW-HsiaoChenNeural`、英語は `en-US-AriaNeural` で、MP3 を返します。`tts_voice` でプロバイダーの対応音声を指定できます。
+
+Admin 専用 RPC：`voice.kokoro_status` はインストール、欠落ファイル、サイズ、ランタイム、進捗、エラーを返します。`voice.kokoro_install` は冪等なバックグラウンドインストールを開始します。音声のダウンロードカードは状態をポーリングし、エラーを表示します。
 
 ### 経路2 — Telegram の音声メッセージ
 
 音声または音声ファイルのメッセージは `transcribe_voice` を起動します：bot が `getFile` を呼び、返ってきた `file_path` をトラバーサル検証（`..`、絶対パス、NUL、許可外文字）し、`content_length` と実バイト数の両方でサイズ上限を確認してダウンロードし、文字起こしします。
 
-**v1.68.0 からは `stt::transcribe_channel_audio` を呼び、ダッシュボードの音声認識設定（`config.toml [voice] stt_*`、`/api/stt` と同じプロバイダ）を使います。** 音声認識プロバイダが未設定の場合だけ、環境変数 `OPENAI_API_KEY` の OpenAI Whisper にフォールバックします。設定済みのプロバイダが失敗した場合はエラーになり、フォールバックしません。言語は引き続き `zh` 固定です。LINE の音声メッセージも同じ経路です。v1.68.0 より前は、どちらのチャネルも常に環境変数キーの Whisper を使っていました。 音声返信（チャットごとに `/voice` で切替）は `EdgeTtsProvider` を直接構築します。これもハードコードで、音声アップロードが失敗したらテキストにフォールバックします。
+**v1.68.0 からは `stt::transcribe_channel_audio` を呼び、ダッシュボードの音声認識設定（`config.toml [voice] stt_*`、`/api/stt` と同じプロバイダ）を使います。** 音声認識プロバイダが未設定の場合だけ、環境変数 `OPENAI_API_KEY` の OpenAI Whisper にフォールバックします。設定済みのプロバイダが失敗した場合はエラーになり、フォールバックしません。言語は引き続き `zh` 固定です。LINE の音声メッセージも同じ経路です。v1.68.0 より前は、どちらのチャネルも常に環境変数キーの Whisper を使っていました。
 
-つまりダッシュボードの「語音」タブが書き込む `inference.toml [voice] tts_provider` / `tts_voice` は `POST /api/tts` にだけ効き、**現状 Telegram 経路には影響しません**。UI で変えても Telegram の音声メッセージの挙動は変わりません。既知のギャップとして、運用者が自分でぶつかる前にここに明記します。
+Telegram の音声返信（チャットごとに `/voice` で切替）は共通 TTS ルーターにプレーンテキストを渡します。利用可能なプロバイダーがなければボタンを非表示にし、`/voice` はオフのままです。合成失敗時はテキストに戻し、セッション内の初回失敗だけ短い通知を添えます。音声アップロード失敗時のテキスト返信も維持します。
 
 v1.67.1 から、「語音」タブには「語音回覆模式」（音声返信モード）、「語音辨識」（音声認識）、「語言」（言語）の3項目が表示されません。これらが書き込んでいた `voice_reply_enabled`、`asr_provider`、`asr_language` を gateway で読むコードはありません。`inference.toml` に既にある値はそのまま残り、タブの保存ではこれらのキーを送りません。v1.68.0 からは設定構造からもこれらのフィールドが削除され、`system.update_config` は受け取っても無視します。`/api/stt` の音声認識は同じタブの詳細カード（`config.toml [voice] stt_*`）で設定します。
 
@@ -92,4 +101,4 @@ v1.67.1 から、「語音」タブには「語音回覆模式」（音声返信
 
 ## まとめ
 
-音声が動くのは2か所で、正直版はそれをそのまま言います：ダッシュボードが設定する fail-closed な HTTP のペアと、音声返信のプロバイダがまだハードコードされた Telegram ハンドラ（文字起こしは v1.68.0 からダッシュボード設定に従います）。2つ目を名指しするほうが、一度も書かれなかった VAD の図より役に立ちます。
+HTTP、Telegram の音声返信と MCP 合成ツールは TTS 設定を共有します。プロバイダーの検出はエンドポイントへの接続確認ではありません。Telegram では合成に失敗するとテキストに戻ります。

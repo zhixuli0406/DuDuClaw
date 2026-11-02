@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router';
 import { ChevronRight } from 'lucide-react';
 
 import { api } from '@/lib/api';
+import { defaultAssignAgent } from '@/lib/primary-agent';
 import type { AssignMode, AssignPrefill } from '@/lib/assign-entry';
 import { WHEN_NOW, scheduleErrorText, toScheduleInput, viewerTimezone, type WhenValue } from '@/lib/assign-schedule';
 import { stashChatAttachments } from '@/lib/chat-handoff';
@@ -99,9 +100,10 @@ export function ComplexAssignTab({
     if (!loaded) fetchAgents();
   }, [loaded, fetchAgents]);
 
+  const primaryAgent = useAuthStore((s) => s.user?.primary_agent_id);
   const defaultAgentId = useMemo(
-    () => agents.find((a) => a.role === 'main')?.name ?? agents[0]?.name ?? '',
-    [agents],
+    () => defaultAssignAgent(agents, primaryAgent),
+    [agents, primaryAgent],
   );
 
   // The roster can arrive after the page opened; adopt the default then,

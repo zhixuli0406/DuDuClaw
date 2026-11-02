@@ -81,8 +81,9 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - The earlier Meta-Token (LTSC) / LLMLingua-2 / StreamingLLM compressor and its `compress_text` / `decompress_text` tools were removed in v1.33.
 
 ### Voice Pipeline
-- **HTTP endpoints**: `POST /api/stt` (an OpenAI-compatible transcription API or a local command template; 501 when no STT provider is configured), `POST /api/tts` over Piper (local) / Edge TTS / MiniMax T2A / OpenAI TTS.
-- **Telegram voice**: transcription through the OpenAI Whisper API and Edge TTS replies, both hardcoded; the dashboard voice settings do not reach this path.
+- **HTTP endpoints**: `POST /api/stt` (an OpenAI-compatible transcription API or a local command template; 501 when no STT provider is configured), `POST /api/tts` over Piper (local) / Kokoro / Azure / MiniMax T2A / OpenAI TTS.
+- **Telegram voice**: transcription follows the configured STT provider (with the existing Whisper fallback when unconfigured); spoken replies use the shared TTS router and dashboard TTS settings, with a text fallback.
+- Local Kokoro-82M v1.1-zh (Apache-2.0; download about 134 MB from Settings → Voice) replaces the optional CLI. Auto routing: installed Piper → installed Kokoro → MiniMax → OpenAI → Azure. Kokoro Chinese has a mainland accent and can misread polyphonic words. Azure AI Speech REST offers Taiwanese Mandarin voices; it sends text to Microsoft and requires `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION`. Telegram receives local Kokoro audio as WAV (`sendAudio`).
 - **Not in release binaries**: in-process Whisper (`whisper` feature), ONNX embedding (`onnx` feature) and Discord voice (`discord-voice` feature).
 - SenseVoice, Deepgram, Silero VAD, `symphonia` decoding and LiveKit voice rooms were listed here before; none of them has code. See [`docs/features/14-voice-pipeline.md`](../features/14-voice-pipeline.md).
 

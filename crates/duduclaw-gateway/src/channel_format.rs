@@ -271,6 +271,31 @@ pub fn to_line_flex_message(text: &str, agent_name: Option<&str>) -> Value {
     to_line_flex_message_styled(text, agent_name, false)
 }
 
+fn footer_label(product: &str, agent: Option<&str>, attribution: bool) -> Option<String> {
+    match (attribution, agent.filter(|name| !name.is_empty())) {
+        (true, Some(agent)) => Some(format!("{product} \u{00b7} {agent}")),
+        (true, None) => Some(product.to_string()),
+        (false, Some(agent)) => Some(agent.to_string()),
+        (false, None) => None,
+    }
+}
+
+fn line_flex_footer(label: Option<&str>, error: bool) -> Option<Value> {
+    label.map(|text| {
+        json!({
+            "type": "box",
+            "layout": "vertical",
+            "contents": [{
+                "type": "text",
+                "text": text,
+                "size": "xxs",
+                "color": if error { LINE_ERROR_ACCENT } else { "#999999" },
+                "align": "end"
+            }]
+        })
+    })
+}
+
 /// Dark code-panel colors for LINE Flex code blocks (LINE has no monospace
 /// font control, so a dark panel visually separates code from prose).
 const LINE_CODE_BG: &str = "#1E293B";
@@ -302,13 +327,60 @@ fn split_code_segments(text: &str) -> Vec<(bool, String)> {
     segments
 }
 
+/// Find up to three safe HTTPS destinations in prose, preserving first-seen order.
+pub fn extract_https_links(text: &str) -> Vec<String> {
+    const TRAILING: &[char] = &[
+        '。', '，', '、', '」', '）', '』', '》', '.', ',', ';', ':', '!', '?', ')', ']',
+    ];
+    const REJECT: &[char] = &['"', '\'', '<', '>'];
+
+    let mut links = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        // Iterate at UTF-8 character boundaries; every slice below starts at an
+        // index produced by char_indices (or at the end of a collected URL).
+        let mut start = 0;
+        while let Some(offset) = line[start..].find("https://") {
+            let url_start = start + offset;
+            let tail = &line[url_start..];
+            let end = tail
+                .char_indices()
+                .find(|(_, ch)| ch.is_whitespace() || REJECT.contains(ch))
+                .map(|(i, _)| i)
+                .unwrap_or(tail.len());
+            let candidate = tail[..end].trim_end_matches(TRAILING);
+            if !candidate.is_empty()
+                && candidate.chars().count() <= 1000
+                && !links.iter().any(|link| link == candidate)
+                && let Ok(parsed) = url::Url::parse(candidate)
+                && parsed.scheme() == "https"
+                && parsed.host_str().is_some()
+            {
+                links.push(candidate.to_string());
+                if links.len() == 3 {
+                    return links;
+                }
+            }
+            start = url_start + "https://".len();
+        }
+    }
+    links
+}
+
 /// Like [`to_line_flex_message`] with error styling: error replies render as
 /// a red-accented bubble, and fenced code blocks render as dark code panels.
 pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: bool) -> Value {
     let product = crate::distributor_brand::product_name();
-    let footer_text = agent_name
-        .map(|n| format!("{product} \u{00b7} {n}"))
-        .unwrap_or_else(|| product.clone());
+    let attribution = crate::channel_reply::product_footer_required();
+    let footer_text = footer_label(&product, agent_name, attribution);
 
     // Short prose replies → plain text (errors always get the styled bubble).
     if !error && text.len() < 200 && !text.contains("```") {
@@ -362,6 +434,23 @@ pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: 
             }));
         }
     }
+    if !error {
+        let buttons: Vec<Value> = extract_https_links(text)
+            .into_iter()
+            .filter_map(|url| {
+                let host = url::Url::parse(&url).ok()?.host_str()?.to_string();
+                Some(json!({
+                    "type": "button",
+                    "style": "link",
+                    "height": "sm",
+                    "action": { "type": "uri", "label": duduclaw_core::truncate_chars(&host, 20), "uri": url }
+                }))
+            })
+            .collect();
+        if !buttons.is_empty() {
+            body_contents.push(json!({ "type": "box", "layout": "vertical", "contents": buttons }));
+        }
+    }
     // LINE rejects an empty body box — fall back to a single text component.
     if body_contents.is_empty() {
         body_contents.push(json!({
@@ -379,19 +468,11 @@ pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: 
             "type": "box",
             "layout": "vertical",
             "contents": body_contents
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [{
-                "type": "text",
-                "text": footer_text,
-                "size": "xxs",
-                "color": if error { LINE_ERROR_ACCENT } else { "#999999" },
-                "align": "end"
-            }]
         }
     });
+    if let Some(footer) = line_flex_footer(footer_text.as_deref(), error) {
+        bubble["footer"] = footer;
+    }
     if error {
         bubble["styles"] = json!({ "body": { "backgroundColor": "#FFF5F5" } });
     }
@@ -1274,6 +1355,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn line_link_extraction_handles_markdown_punctuation_dedupe_and_cap() {
+        assert_eq!(
+            extract_https_links("See https://one.example/a。 and [two](https://two.example/b)"),
+            vec!["https://one.example/a", "https://two.example/b"]
+        );
+        assert_eq!(
+            extract_https_links("https://same.example/a https://same.example/a"),
+            vec!["https://same.example/a"]
+        );
+        assert_eq!(
+            extract_https_links(
+                "https://a.example https://b.example https://c.example https://d.example"
+            ),
+            vec![
+                "https://a.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
+    }
+
+    #[test]
+    fn line_link_extraction_skips_unsafe_and_code_urls() {
+        let text =
+            "http://plain.example\n```\nhttps://hidden.example\n```\nhttps://visible.example";
+        assert_eq!(extract_https_links(text), vec!["https://visible.example"]);
+        let too_long = format!("https://example.com/{}", "a".repeat(1000));
+        assert!(extract_https_links(&too_long).is_empty());
+    }
+
+    #[test]
+    fn line_flex_adds_uri_buttons_and_keeps_short_reply_plain() {
+        let message = to_line_flex_message_styled(
+            &format!(
+                "{} https://{}.example/path",
+                "prose ".repeat(35),
+                "a".repeat(24)
+            ),
+            Some("agent"),
+            false,
+        );
+        assert_eq!(message["type"], "flex");
+        let body = &message["contents"]["body"]["contents"];
+        let buttons = body.as_array().unwrap().last().unwrap()["contents"]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons[0]["action"]["type"], "uri");
+        assert_eq!(
+            buttons[0]["action"]["label"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            20
+        );
+        assert_eq!(
+            buttons[0]["action"]["uri"],
+            format!("https://{}.example/path", "a".repeat(24))
+        );
+        assert_eq!(
+            message["contents"]["footer"]["contents"][0]["text"],
+            format!("{} · agent", crate::distributor_brand::product_name())
+        );
+
+        let short = to_line_flex_message_styled("short https://example.com", None, false);
+        assert_eq!(short["type"], "text");
+    }
+
+    #[test]
     fn install_buttons_carry_the_unified_decision_id() {
         let kb = telegram_approval_buttons("req-123");
         let row = &kb["inline_keyboard"][0];
@@ -1548,6 +1698,34 @@ mod tests {
     }
 
     // ── LINE Flex styling ──────────────────────────────────────────
+
+    #[test]
+    fn footer_label_covers_attribution_and_agent_combinations() {
+        assert_eq!(
+            footer_label("Product", Some("Agent"), true).as_deref(),
+            Some("Product · Agent")
+        );
+        assert_eq!(footer_label("Product", None, true).as_deref(), Some("Product"));
+        assert_eq!(
+            footer_label("Product", Some("Agent"), false).as_deref(),
+            Some("Agent")
+        );
+        assert_eq!(footer_label("Product", None, false), None);
+    }
+
+    #[test]
+    fn line_flex_footer_without_label_has_no_empty_text_or_footer_box() {
+        assert!(line_flex_footer(None, false).is_none());
+
+        let encoded = serde_json::to_string(&line_flex_footer(None, false)).unwrap();
+        assert!(!encoded.contains("\"text\":\"\""));
+    }
+
+    #[test]
+    fn line_flex_footer_with_label_keeps_footer_text() {
+        let footer = line_flex_footer(Some("Product · Agent"), false).unwrap();
+        assert_eq!(footer["contents"][0]["text"], "Product · Agent");
+    }
 
     #[test]
     fn test_split_code_segments() {

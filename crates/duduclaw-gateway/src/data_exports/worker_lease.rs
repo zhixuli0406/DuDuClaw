@@ -14,7 +14,7 @@ pub(super) fn is_lock_contention(error: &std::io::Error) -> bool {
 pub(super) struct WorkerLease {
     pub id: String,
     home: PathBuf,
-    _file: std::fs::File,
+    _file: duduclaw_core::owner_lock::OwnerLock,
     active: bool,
 }
 impl WorkerLease {
@@ -64,7 +64,7 @@ fn lease(home: &Path, id: &str, create: bool) -> ExportResult<Option<WorkerLease
         Ok(()) => Ok(Some(WorkerLease {
             id: id.into(),
             home: home.into(),
-            _file: file,
+            _file: duduclaw_core::owner_lock::OwnerLock::new(file),
             active: false,
         })),
         Err(e) if is_lock_contention(&e) => Ok(None),

@@ -97,7 +97,7 @@ pub struct ProfileState {
 /// Context captured at start and checked again before saving. A handover,
 /// employee replacement or disabled capability cannot preserve old cookies.
 pub(crate) struct ProfileSession {
-    _lock: std::fs::File,
+    _lock: duduclaw_core::owner_lock::OwnerLock,
     home: PathBuf,
     agent: String,
     identity: Identity,
@@ -105,7 +105,23 @@ pub(crate) struct ProfileSession {
     config: ProfilesConfig,
 }
 
-fn failure(_: impl std::fmt::Display) -> String {
+#[track_caller]
+fn failure(error: impl std::fmt::Display + std::any::Any) -> String {
+    let cause = &error as &dyn std::any::Any;
+    // Error Display strings can contain paths, SQL values or decrypted input.
+    // Record typed diagnostics and static invariant labels instead.
+    let detail = if let Some(error) = cause.downcast_ref::<io::Error>() {
+        format!("io kind={:?} os={:?}", error.kind(), error.raw_os_error())
+    } else if let Some(error) = cause.downcast_ref::<rusqlite::Error>() {
+        format!("sqlite code={:?}", error.sqlite_error())
+    } else if let Some(error) = cause.downcast_ref::<serde_json::Error>() {
+        format!("json category={:?} line={} column={}", error.classify(), error.line(), error.column())
+    } else if let Some(label) = cause.downcast_ref::<&'static str>() {
+        (*label).to_owned()
+    } else {
+        std::any::type_name_of_val(&error).to_owned()
+    };
+    tracing::warn!(cause = %detail, line = std::panic::Location::caller().line(), "browser login state unavailable");
     "browser login state unavailable".into()
 }
 fn now() -> i64 {
@@ -113,7 +129,7 @@ fn now() -> i64 {
 }
 
 #[cfg(unix)]
-fn lock_profile(home: &Path, agent: &str) -> Result<std::fs::File, String> {
+fn lock_profile(home: &Path, agent: &str) -> Result<duduclaw_core::owner_lock::OwnerLock, String> {
     use std::os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -146,13 +162,13 @@ fn lock_profile(home: &Path, agent: &str) -> Result<std::fs::File, String> {
     // SAFETY: file owns a valid descriptor. A nonblocking lock avoids
     // holding up gateway threads while another process owns this profile.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(failure("profile busy"));
+        return Err(failure(io::Error::last_os_error()));
     }
-    Ok(file)
+    Ok(duduclaw_core::owner_lock::OwnerLock::new(file))
 }
 
 #[cfg(not(unix))]
-fn lock_profile(_home: &Path, _agent: &str) -> Result<std::fs::File, String> {
+fn lock_profile(_home: &Path, _agent: &str) -> Result<duduclaw_core::owner_lock::OwnerLock, String> {
     Err("browser login persistence is unavailable on this platform".into())
 }
 
