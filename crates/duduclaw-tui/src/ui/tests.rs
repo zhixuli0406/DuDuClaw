@@ -14,7 +14,7 @@ use crate::{
     strings,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{Terminal, backend::TestBackend, buffer::CellWidth, style::Color};
+use ratatui::{Terminal, backend::TestBackend, buffer::CellWidth, style::{Color, Modifier}};
 use serde_json::json;
 use unicode_width::UnicodeWidthStr;
 
@@ -164,6 +164,40 @@ fn stale_screen() {
             .any(|c| c.fg == Color::DarkGray)
     );
     assert!(m.inbox.count().is_none());
+}
+
+#[test]
+fn selected_employee_row_uses_white_bold_text() {
+    let mut m = empty();
+    m.employees = fresh(vec![employee("adu", "阿嘟", "active")]);
+    let mut a = App::default();
+    a.refresh(&m);
+    a.selected = Some(Selection::Employee("adu".into()));
+    let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    t.draw(|f| render::draw(f, &m, &connection(), &TerminalText::new("home".into()), &mut a, &Settings::default())).unwrap();
+    let buffer = t.backend().buffer();
+    let (name_y, _) = (0..buffer.area.height)
+        .find_map(|y| {
+            (0..buffer.area.width)
+                .find(|&x| buffer[(x, y)].symbol() == "阿")
+                .map(|x| (y, x))
+        })
+        .unwrap();
+    let marker = (1..buffer.area.width)
+        .map(|x| &buffer[(x, name_y)])
+        .find(|cell| cell.symbol() == ">")
+        .unwrap();
+    assert_ne!(marker.fg, Color::Yellow);
+    assert_eq!(marker.fg, Color::White);
+    assert!(marker.modifier.contains(Modifier::BOLD));
+    assert_eq!(marker.bg, Color::DarkGray);
+
+    let name = (0..buffer.area.width)
+        .map(|x| &buffer[(x, name_y)])
+        .find(|cell| cell.symbol() == "阿")
+        .unwrap();
+    assert_eq!(name.fg, Color::White);
+    assert!(name.modifier.contains(Modifier::BOLD));
 }
 #[test]
 fn populated_inbox_and_employees() {

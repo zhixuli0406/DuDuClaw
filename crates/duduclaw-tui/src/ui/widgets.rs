@@ -6,7 +6,7 @@ use crate::{sanitize::TerminalText, settings::Settings, strings};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
 };
 pub(super) fn style(stale: bool) -> Style {
     Style::default().fg(if stale { Color::DarkGray } else { Color::White })
@@ -114,8 +114,8 @@ pub(super) fn rows(
                     style(stale).bg(Color::DarkGray).fg(if stale {
                         Color::Gray
                     } else {
-                        Color::Yellow
-                    })
+                        Color::White
+                    }).add_modifier(if stale { Modifier::empty() } else { Modifier::BOLD })
                 } else {
                     style(stale)
                 },
