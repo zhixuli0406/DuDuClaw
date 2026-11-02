@@ -13,11 +13,22 @@ import {
 } from '@/lib/skill-assign';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
-import { Input, Skeleton } from '@/components/mds';
+import { Button, Input, Skeleton } from '@/components/mds';
 
 import { AssignFooter } from './AssignFooter';
 import { AttachmentChips, AttachmentDropZone, toAttachmentInput, useTaskAttachments } from './TaskAttachments';
 import { announceGoalCreated, assignErrorText, createdGoalPath } from './announce';
+
+const RECENT_SKILLS_KEY = 'assign.recentSkills';
+
+function readRecentSkillNames(): string[] {
+  try {
+    const value: unknown = JSON.parse(window.localStorage.getItem(RECENT_SKILLS_KEY) ?? 'null');
+    return Array.isArray(value) ? value.filter((name): name is string => typeof name === 'string') : [];
+  } catch {
+    return [];
+  }
+}
 
 /**
  * 一般 — pick a skill, optionally add one line and some files, hand it over.
@@ -127,6 +138,8 @@ export function SkillAssignTab({ onCancel }: { onCancel: () => void }) {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
   const [note, setNote] = useState('');
+  const [recentSkillNames, setRecentSkillNames] = useState<string[]>([]);
+  const [selectedChips, setSelectedChips] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const attach = useTaskAttachments();
 
@@ -145,21 +158,45 @@ export function SkillAssignTab({ onCancel }: { onCancel: () => void }) {
     };
   }, []);
 
+  useEffect(() => setRecentSkillNames(readRecentSkillNames()), []);
+
   const groups = useMemo(
     () => groupSkills((skills ?? []).filter((s) => matchesSkill(s, query)), intl.locale),
     [skills, query, intl.locale],
   );
-  const chosen = skills?.find((s) => s.name === selected) ?? null;
+  const activeChosen = skills?.find((skill) => skill.name === (selectedChips[0] ?? selected)) ?? null;
+  const recentSkills = useMemo(() => {
+    const byName = new Map((skills ?? []).map((skill) => [skill.name, skill]));
+    return recentSkillNames.filter((name, index) => byName.has(name) && recentSkillNames.indexOf(name) === index)
+      .slice(0, 5).map((name) => byName.get(name)!);
+  }, [recentSkillNames, skills]);
+
+  const toggleRecentSkill = (name: string) => {
+    const isSelected = selectedChips.includes(name);
+    setSelectedChips((current) => isSelected ? current.filter((item) => item !== name) : [...current, name]);
+    setNote((current) => {
+      const token = `/${name} `;
+      if (!isSelected) return `${current}${current && !/\s$/.test(current) ? ' ' : ''}${token}`;
+      return current.replace(token, '').replace(/ {2,}/g, ' ');
+    });
+  };
 
   const submit = async () => {
-    if (!chosen || submitting) return;
+    const assignedSkill = skills?.find((skill) => skill.name === (selectedChips[0] ?? selected)) ?? null;
+    if (!assignedSkill || submitting) return;
     setSubmitting(true);
     try {
       const result = await api.tasks.skillAssign({
-        skill_name: chosen.name,
+        skill_name: assignedSkill.name,
         note: note.trim() || undefined,
         attachments: toAttachmentInput(attach.files),
       });
+      try {
+        const recent = readRecentSkillNames().filter((name) => name !== assignedSkill.name);
+        window.localStorage.setItem(RECENT_SKILLS_KEY, JSON.stringify([assignedSkill.name, ...recent].slice(0, 20)));
+      } catch {
+        // Storage is optional; assignment success must not depend on it.
+      }
       announceGoalCreated(intl, result);
       navigate(createdGoalPath(result));
     } catch (e) {
@@ -169,10 +206,10 @@ export function SkillAssignTab({ onCancel }: { onCancel: () => void }) {
     }
   };
 
-  const runnerLine = chosen
+  const runnerLine = activeChosen
     ? intl.formatMessage(
-        { id: chosen.runner.lastUsedAt ? 'assign.skill.runner' : 'assign.skill.runnerFirst' },
-        { name: <strong className="font-medium text-foreground">{chosen.runner.displayName}</strong> },
+        { id: activeChosen.runner.lastUsedAt ? 'assign.skill.runner' : 'assign.skill.runnerFirst' },
+        { name: <strong className="font-medium text-foreground">{activeChosen.runner.displayName}</strong> },
       )
     : intl.formatMessage({ id: 'assign.skill.pickFirst' });
 
@@ -247,6 +284,21 @@ export function SkillAssignTab({ onCancel }: { onCancel: () => void }) {
 
         {!noneAvailable && (
           <>
+            {recentSkills.length > 0 && (
+              <section aria-label={intl.formatMessage({ id: 'assign.skill.recentUsed' })} className="space-y-2">
+                <h3 className="text-xs font-medium text-muted-foreground">{intl.formatMessage({ id: 'assign.skill.recentUsed' })}</h3>
+                <div className="flex flex-wrap gap-2">
+                  {recentSkills.map((skill) => {
+                    const active = selectedChips.includes(skill.name);
+                    return (
+                      <Button key={skill.name} type="button" variant={active ? 'secondary' : 'outline'} size="sm" aria-pressed={active} onClick={() => toggleRecentSkill(skill.name)} className="h-auto max-w-full items-start whitespace-normal py-2 text-left">
+                        <span className="min-w-0"><span className="block truncate">{skill.displayName}</span>{skill.description && <span className="block truncate text-xs text-muted-foreground">{skill.description}</span>}</span>
+                      </Button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
             <div className="space-y-1.5">
               <label htmlFor="assign-skill-note" className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'assign.skill.note' })}
@@ -282,7 +334,7 @@ export function SkillAssignTab({ onCancel }: { onCancel: () => void }) {
         submitLabel={intl.formatMessage({ id: 'assign.submit' })}
         onCancel={onCancel}
         onSubmit={() => void submit()}
-        canSubmit={chosen !== null}
+        canSubmit={activeChosen !== null}
         submitting={submitting}
       />
     </div>

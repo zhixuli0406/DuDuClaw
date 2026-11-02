@@ -362,6 +362,7 @@ impl TaskStore {
             // overwrites `judge_feedback`) so the approved plan reaches the
             // first execution round.
             ("plan_pending", "plan_pending TEXT"),
+            ("plan_review", "plan_review TEXT"),
             // I-3b task list operations (dashboard-ux-workbuddy 2026-08):
             // archive/pin flags for the `/goals` board. `archived` is
             // filtered out of the default list queries; `pinned` sorts

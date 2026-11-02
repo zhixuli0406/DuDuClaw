@@ -73,6 +73,7 @@ pub(crate) fn task_row_to_json(r: &TaskRow) -> Value {
         // `needs_human` the same defensive way as `pause_reason` above — the
         // store already clears it after the first post-approval dispatch, but
         // a stale value must never render on a task that is no longer paused.
+        "plan_review": r.plan_review,
         "plan_pending": (r.status == "needs_human").then(|| r.plan_pending.clone()).flatten(),
         // I-3b: archive/pin flags for the `/goals` board (task_store.rs).
         "archived": r.archived,

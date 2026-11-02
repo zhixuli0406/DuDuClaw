@@ -1,3 +1,4 @@
+import { PlanReview } from '@/components/task/PlanReview';
 import { TaskWorkflowReview } from '@/components/workflow/TaskWorkflowReview';
 import { TaskAudienceNotice } from '@/components/task/TaskAudienceNotice';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -508,6 +509,7 @@ export function TaskDetailPage() {
                 </p>
               )
             )}
+            <PlanReview review={task.plan_review} />
             <div className="flex flex-wrap items-center gap-2">
               <NeedsHumanActions taskId={task.id} onResolved={fetchTasks} />
               {task.goal_mode && <GoalTakeoverButton taskId={task.id} onDecided={fetchTasks} />}

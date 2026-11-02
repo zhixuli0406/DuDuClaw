@@ -3,3 +3,5 @@
 /src-tauri/vendor/tauri-plugin-updater/** -text
 # Byte-pinned (SHA-256) test vectors shared with the license console; keep LF on every checkout.
 /crates/duduclaw-gateway/src/distributor_notice/vectors.json -text
+# Signed pack fixture bytes are covered by the manifest and signature.
+/crates/duduclaw-core/src/pack/fixtures/signed-pack/** -text

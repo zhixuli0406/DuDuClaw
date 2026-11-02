@@ -515,6 +515,7 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("(未提供原因)");
+    let review_line = crate::goal_loop::plan_review::channel_hint(task.plan_review.as_deref());
     let trajectory_block = trajectory.map(|t| format!("\n{t}\n")).unwrap_or_default();
     // WP-G2: which criteria are still open (blocked / never reported /
     // awaiting confirmation) and what is unresolved. Only when the goal has a
@@ -537,7 +538,7 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
          目標：{goal}\n\
          類型：{pause}\n\
          卡住原因：{reason}\n\
-         {ledger_line}\
+         {ledger_line}{review_line}\
          編號：{id}\n\
          {trajectory_block}\n\
          {choices}",

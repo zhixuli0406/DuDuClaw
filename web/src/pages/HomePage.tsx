@@ -1,3 +1,4 @@
+import { SetupChecklistCard } from '@/components/home/SetupChecklistCard';
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
@@ -29,6 +30,7 @@ import { UsageSummary } from '@/components/home/UsageSummary';
 import { CustomWidgetFrame } from '@/components/home/CustomWidgetFrame';
 import { HealthOverview } from '@/components/home/HealthOverview';
 import { SinceLastVisit } from '@/components/home/SinceLastVisit';
+import { ConnectionsChecklist } from '@/components/home/ConnectionsChecklist';
 import { EmployeeDigestCard } from '@/components/home/EmployeeDigestCard';
 import {
   LayoutGrid,
@@ -387,6 +389,7 @@ export function HomePage() {
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-5">
+      {!viewing && authed && <SetupChecklistCard />}
       {/* Plain greeting line (§5.2 reading container — no HUD). */}
       <div className="min-w-0">
         <h1 className="truncate text-base font-medium text-foreground">{greeting}</h1>
@@ -426,6 +429,7 @@ export function HomePage() {
           someone else's dashboard" would be misleading. */}
       {!viewing && (
         <>
+          <ConnectionsChecklist enabled={authed} />
           <HealthOverview agents={agents} enabled={authed} />
           <SinceLastVisit enabled={authed} />
           <EmployeeDigestCard enabled={authed} />

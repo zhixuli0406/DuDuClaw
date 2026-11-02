@@ -52,6 +52,8 @@ pub struct ReplyContext {
     pub sandbox_store: Arc<tokio::sync::Mutex<SandboxStore>>,
     /// Sessions with voice reply mode enabled (toggled by /voice command).
     pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Sessions already notified of a voice synthesis failure.
+    pub voice_failure_notices: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-channel, per-scope settings (mention_only, whitelist, auto_thread, etc.).
     pub channel_settings: Arc<ChannelSettingsManager>,
     /// User-level access control: allowlist / blocklist / pairing codes.
@@ -142,6 +144,7 @@ impl ReplyContext {
             gap_accumulator: Arc::new(tokio::sync::Mutex::new(GapAccumulator::new(3, 24))),
             sandbox_store: Arc::new(tokio::sync::Mutex::new(SandboxStore::new())),
             voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            voice_failure_notices: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             access_control,
             agent_binding,
             channel_settings: Arc::new(channel_settings),

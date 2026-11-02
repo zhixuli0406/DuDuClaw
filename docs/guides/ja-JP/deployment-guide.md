@@ -320,6 +320,7 @@ duduclaw service install
 # Management
 duduclaw service start
 duduclaw service stop
+duduclaw service restart
 duduclaw service status
 duduclaw service logs --lines 50
 duduclaw service uninstall
@@ -334,6 +335,10 @@ duduclaw service uninstall
 ### macOS（launchd）
 
 `~/Library/LaunchAgents/com.duduclaw.gateway.plist` を作成します。
+
+macOS の LaunchAgent を更新した後は `duduclaw service restart` を実行し、
+plist に従ってジョブを再登録してください。`duduclaw doctor` が launchd の
+終了コード 78 を報告した場合も、このコマンドで新しい binary を登録します。
 
 ### Linux（systemd）
 

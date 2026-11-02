@@ -249,15 +249,17 @@
 
 ## 語音管線
 
-見 [14-voice-pipeline.md](14-voice-pipeline.md)。HTTP 端點與 Telegram 語音處理是分開接線的。
+見 [14-voice-pipeline.md](14-voice-pipeline.md)。HTTP、Telegram 與 MCP 語音合成共用設定的 TTS router。
 
 | 功能 | 說明 |
 |------|------|
 | HTTP 端點 | `POST /api/stt`（OpenAI 相容轉錄 API 或本機指令範本；`[voice]` 沒有 STT provider 時回 501）、`POST /api/tts`、`GET`/`POST /api/voice/config` |
-| TTS provider | Piper（本機 ONNX 語音）／Edge TTS／MiniMax T2A（自動挑 CJK 或拉丁語系語音）／OpenAI TTS，由同一個 router 分派 |
-| Telegram 語音 | 語音訊息以 OpenAI Whisper API 轉錄；`/voice` 回覆使用 Edge TTS。兩者都寫死在程式碼中，儀表板的語音設定不影響 Telegram |
+| TTS provider | Piper（本機 ONNX 語音）／Kokoro / Azure／MiniMax T2A（自動挑 CJK 或拉丁語系語音）／OpenAI TTS，由同一個 router 分派 |
+| Telegram 語音 | 語音訊息使用設定的 STT 供應商（未設定時以 Whisper 備援）；`/voice` 回覆使用共用且遵循設定的 TTS router，失敗時退回文字 |
 | 不在 release binary 中 | 行程內 Whisper（`duduclaw-inference` 的 `whisper` feature）、ONNX embedding（`onnx` feature）與 Discord 語音頻道（`discord-voice` feature）只有在建置時啟用這些 feature 才會編譯 |
 | 從未實作 | 先前這裡列過 SenseVoice、Deepgram、Silero VAD、`symphonia` 解碼與 LiveKit 語音房，這些都沒有任何程式碼 |
+
+本機 Kokoro-82M v1.1-zh（Apache-2.0；從「設定 → 語音」下載，約 134 MB）取代原本的選用 CLI。自動順序：已安裝 Piper → 已安裝 Kokoro → MiniMax → OpenAI → Azure。Kokoro 中文帶有中國大陸口音，多音字可能誤讀。官方 Azure AI Speech REST 提供台灣國語聲音，會將文字傳送至 Microsoft，需設定 `AZURE_SPEECH_KEY`／`AZURE_SPEECH_REGION`。Telegram 以 WAV 接收本機 Kokoro 音訊（`sendAudio`）。
 
 ## 安全層
 
@@ -322,7 +324,7 @@
 | L1 `web_fetch_cached` | 經 SSRF 閘、帶磁碟快取的 HTTP GET（body 截斷在 6 萬字元） |
 | L2 `web_extract` | 同一條抓取路徑＋CSS 選擇器擷取（`text`／`html`／`json`） |
 | L3 headless（可選，外部） | 在該 agent 的 `.mcp.json` 註冊 Playwright 或 Browserbase MCP server；不在 binary 內，也不會自動降級過去 |
-| L5 Computer Use | 由 `computer_use_orchestrator` 啟動的容器虛擬顯示器（映像 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>`，不會自動下載），由 AI 員工透過八個 `computer_*` MCP 工具驅動（`session_start`／`screenshot`／`click`／`type`／`key`／`scroll`／`navigate`／`session_stop`；session 由 gateway 持有，透過簽章的 loopback 路由連線，每位員工一個，不需要 API 金鑰，網路只通到 `[capabilities.computer_use_config] allowed_domains` 列出的主機）。聊天觸發的 gateway 迴圈與 `native` 主機桌面模式已移除 |
+| L5 Computer Use | 由 `computer_use_orchestrator` 啟動的容器虛擬顯示器（映像 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>`，不會自動下載），由 AI 員工透過九個 `computer_*` MCP 工具驅動（`session_start`／`screenshot`／`click`／`type`／`login`／`key`／`scroll`／`navigate`／`session_stop`；session 由 gateway 持有，透過簽章的 loopback 路由連線，每位員工一個，不需要 API 金鑰，網路只通到 `[capabilities.computer_use_config] allowed_domains` 列出的主機）。聊天觸發的 gateway 迴圈與 `native` 主機桌面模式已移除 |
 | 能力閘門 | `agent.toml [capabilities]` 預設拒絕（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）；`denied_tools` 同時以 `--disallowedTools` 與 MCP 分派總門兩處強制 |
 
 ## 容器沙盒

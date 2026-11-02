@@ -441,6 +441,8 @@ mod tests {
             "GOOGLE_API_KEY",
             "DEEPSEEK_API_KEY",
             "MINIMAX_API_KEY",
+            "AZURE_SPEECH_KEY",
+            "AZURE_SPEECH_REGION",
             "GROQ_API_KEY",
             "TOGETHER_API_KEY",
             "MISTRAL_API_KEY",

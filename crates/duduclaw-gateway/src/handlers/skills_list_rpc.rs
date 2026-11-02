@@ -38,6 +38,7 @@ pub(crate) fn verdict_layer_for_install_scope(scope: &str) -> String {
 struct ListCtx<'a> {
     verdicts: &'a serde_json::Map<String, Value>,
     usage: &'a SkillUsageMap,
+    signatures: &'a HashMap<(String, String), (String, Value)>,
 }
 
 /// The JSON entry for one composed skill of one employee.
@@ -71,6 +72,11 @@ fn skill_entry(
     if let Some(v) = lc.verdicts.get(&verdict_key(verdict_layer, &s.name)) {
         obj["security_status"] = v.clone();
     }
+    if let Some((hash, status)) = lc.signatures.get(&(verdict_layer.to_string(), s.name.clone())) {
+        if *hash == duduclaw_agent::skill_hub::sha256_hex(&s.content) {
+            obj["signature_status"] = status.clone();
+        }
+    }
     obj
 }
 
@@ -82,6 +88,13 @@ fn state_json(state: &DisabledSkills) -> Value {
 }
 
 impl MethodHandler {
+    async fn hub_signature_map(&self) -> HashMap<(String, String), (String, Value)> {
+        match crate::custom_skills::CustomSkillStore::open(&self.home_dir) {
+            Ok(store) => store.hub_signatures().await.unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
     /// One entry of the `scanned` diagnostic block returned by `skills.list`:
     /// the exact directories walked plus their per-layer counts, so an empty
     /// list can be told apart from "the folder I expected does not exist".
@@ -156,7 +169,8 @@ impl MethodHandler {
         let verdicts = self.load_skill_scan_verdicts();
         let (summary, usage_error) = self.skill_usage_map().await;
         let usage_truncated = summary.truncated;
-        let lc = ListCtx { verdicts: &verdicts, usage: &summary.usage };
+        let signatures = self.hub_signature_map().await;
+        let lc = ListCtx { verdicts: &verdicts, usage: &summary.usage, signatures: &signatures };
         let reg = self.registry.read().await;
 
         if let Some(id) = params.get("agent_id").and_then(|v| v.as_str()) {
@@ -255,7 +269,9 @@ impl MethodHandler {
         let global_skills = AgentRegistry::load_skills(&self.home_dir.join("skills")).await;
         let verdicts = self.load_skill_scan_verdicts();
         let (summary, usage_error) = self.skill_usage_map().await;
+        let signatures = self.hub_signature_map().await;
         let lc = ListCtx {
+            signatures: &signatures,
             verdicts: &verdicts,
             usage: &summary.usage,
         };
@@ -305,4 +321,33 @@ fn global_entry(s: &SkillFile, holders: Vec<Value>, lc: &ListCtx<'_>) -> Value {
     obj["enabled_count"] = json!(enabled_count);
     obj["holders"] = json!(holders);
     obj
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    #[test]
+    fn origin_badge_requires_same_layer_and_content() {
+        let mut skill = SkillFile {
+            name: "notes".into(),
+            content: "---\nname: notes\n---\nTake notes.".into(),
+            modified_unix: None,
+        };
+        let signatures = HashMap::from([(("global".into(), "notes".into()), (
+            duduclaw_agent::skill_hub::sha256_hex(&skill.content),
+            json!({"state": "verified", "publisher": "fixture"}),
+        ))]);
+        let verdicts = serde_json::Map::new();
+        let usage = SkillUsageMap::new();
+        let lc = ListCtx { verdicts: &verdicts, usage: &usage, signatures: &signatures };
+        let state = DisabledSkills::none();
+        let row = skill_entry(&skill, "global", "global", "alice", &state, &lc);
+        assert_eq!(row["signature_status"]["state"], "verified");
+        let row = skill_entry(&skill, "agent", "agent:alice", "alice", &state, &lc);
+        assert!(row.get("signature_status").is_none(), "another layer cannot inherit origin evidence");
+        skill.content.push_str("\nChanged after install");
+        let row = skill_entry(&skill, "global", "global", "alice", &state, &lc);
+        assert!(row.get("signature_status").is_none(), "edited content cannot inherit origin evidence");
+    }
 }

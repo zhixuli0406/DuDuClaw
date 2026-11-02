@@ -150,7 +150,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             let now = std::time::Instant::now();
             let failed = model.login_required.is_some() || matches!(info, crate::client::ConnectionState::Disconnected);
             let sequence = notifications.connection_error(failed, now)
-                .or_else(|| notifications.update(model.inbox.count(), now));
+                .or_else(|| notifications.update(model.inbox.actionable_count(), now));
             if let Some(sequence) = sequence {
                 use std::io::Write;
                 std::io::stdout().write_all(sequence.as_bytes()).map_err(|_| Error::Output)?;

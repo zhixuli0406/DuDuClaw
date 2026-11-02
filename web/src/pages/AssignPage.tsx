@@ -1,3 +1,6 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
+import { isEmployeeSidebar } from '@/components/layout/nav-model';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
@@ -28,7 +31,11 @@ export function AssignPage() {
     key: location.key,
     tab: initialAssignTab(prefill, searchParams.get('tab')),
   }));
-  const tab = tabFor.key === location.key ? tabFor.tab : initialAssignTab(prefill, searchParams.get('tab'));
+  const role = useAuthStore(s => s.user?.role);
+  const status = useSystemStore(s => s.status);
+  const hideTasks = isEmployeeSidebar(role, status?.edition_profile === 'personal') && status?.employee_tasks !== true;
+  const requestedTab = tabFor.key === location.key ? tabFor.tab : initialAssignTab(prefill, searchParams.get('tab'));
+  const tab = hideTasks ? 'general' : requestedTab;
   const setTab = (next: AssignTab) => setTabFor({ key: location.key, tab: next });
 
   // Back to wherever the person came from; straight to the home page when
@@ -53,17 +60,17 @@ export function AssignPage() {
           <TabsTab value="general" className="min-h-[44px] px-1 sm:min-h-9">
             {intl.formatMessage({ id: 'assign.tab.general' })}
           </TabsTab>
-          <TabsTab value="complex" className="min-h-[44px] px-1 sm:min-h-9">
+          {!hideTasks && <TabsTab value="complex" className="min-h-[44px] px-1 sm:min-h-9">
             {intl.formatMessage({ id: 'assign.tab.complex' })}
-          </TabsTab>
+          </TabsTab>}
         </TabsList>
         {/* Both panels stay mounted so switching tabs keeps what was typed. */}
         <TabsPanel value="general" keepMounted className="pt-4">
           <SkillAssignTab key={`g-${location.key}`} onCancel={cancel} />
         </TabsPanel>
-        <TabsPanel value="complex" keepMounted className="pt-4">
+        {!hideTasks && <TabsPanel value="complex" keepMounted className="pt-4">
           <ComplexAssignTab key={`c-${location.key}`} prefill={prefill} onCancel={cancel} />
-        </TabsPanel>
+        </TabsPanel>}
       </Tabs>
     </div>
   );

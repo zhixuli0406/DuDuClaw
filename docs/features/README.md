@@ -15,7 +15,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 4 | [File-Based IPC Message Bus](04-file-based-ipc.md) | Structured inter-agent delegation with TaskSpec workflows |
 | 5 | [Security Defense](05-security-defense.md) | Four live guards, where each runs, and what none of them covers |
 | 7 | [Multi-Account Rotation](07-account-rotation.md) | Cross-provider credential scheduling with failover |
-| 8 | [Browser Automation and Computer Use](08-browser-automation.md) | Two fetch tools and an optional browser server the agent picks between, plus computer-use sessions driven through eight `computer_*` MCP tools; no auto-router |
+| 8 | [Browser Automation and Computer Use](08-browser-automation.md) | Two fetch tools and an optional browser server the agent picks between, plus computer-use sessions driven through nine `computer_*` MCP tools; no auto-router |
 | 9 | [Behavioral Contracts & Red-Team Testing](09-behavioral-contracts.md) | Machine-enforceable agent boundaries |
 | 10 | [Cognitive Memory System](10-cognitive-memory.md) | Human-inspired memory with forgetting curves |
 | 11 | [Prompt Budget Enforcement](11-token-compression.md) | Estimate the prompt, walk three stages, or refuse the request |

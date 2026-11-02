@@ -25,6 +25,7 @@ pub struct Card {
     sending: bool,
     message: String,
     editing: bool,
+    reviewing: bool,
 }
 /// Each control room owns its opening sequence; concurrent clients/tests cannot
 /// replace its previous code between two openings.
@@ -50,7 +51,7 @@ impl Card {
         }
         Self { item, body, high_risk, scroll: 0, code: codes.next(), input: String::new(),
             blocked, hint: None, opened: now, bottom_seen: false, max_scroll: 0, page: 1, viewport_ready: false,
-            armed: None, sending: false, message: String::new(), editing: false }
+            armed: None, sending: false, message: String::new(), editing: false, reviewing: false }
     }
     /// Called after rendering the full, visibly sanitized body. Resize re-locks
     /// input until the newly wrapped bottom is visible (or explicitly scrolled).
@@ -64,7 +65,6 @@ impl Card {
     }
     pub fn invalidate_viewport(&mut self) {
         self.input.clear();
-        self.message.clear();
         self.armed = None;
         self.bottom_seen = false;
         self.viewport_ready = false;
@@ -84,14 +84,14 @@ impl Card {
             && self.item.data()["plan_pending"].as_str().is_some_and(|s| !s.is_empty())
     }
     pub(super) fn start_continue(&mut self) -> bool {
-        if self.continuing() && self.blocked.is_none() {
+        if self.continuing() && self.blocked.is_none() && !self.reviewing {
             self.editing = true;
             true
         } else { false }
     }
     pub(super) fn paste(&mut self, text: &str) {
         if self.editing {
-            let remaining = 2000usize.saturating_sub(self.message.chars().count());
+            let remaining = 16_001usize.saturating_sub(self.message.chars().count());
             self.message.extend(text.chars().filter(|c| !crate::sanitize::forbidden(*c)).take(remaining));
         }
     }
@@ -109,13 +109,28 @@ impl Card {
             return Effect::None;
         }
         if key.code == KeyCode::Esc {
-            if self.editing { self.editing = false; return Effect::None; }
+            if self.editing { self.editing = false; self.message.clear(); return Effect::Close; }
             return Effect::Close;
         }
         if self.editing {
             match key.code {
                 KeyCode::Char(c) => self.paste(&c.to_string()),
-                KeyCode::Enter if !self.message.trim().is_empty() => { self.editing = false; self.hint = None; },
+                KeyCode::Enter if !self.message.trim().is_empty() => {
+                    self.editing = false;
+                    self.reviewing = true;
+                    self.message = self.message.trim().to_owned();
+                    self.body = TerminalText::new(format!("{}\n\n{}\n{}", self.item.detail_text().visible(), strings::CONTINUE_REVIEW, self.message));
+                    if self.body.plain().chars().count() > 16_000 {
+                        self.blocked = Some(TerminalText::new(strings::CARD_DASHBOARD.into()));
+                        self.body = TerminalText::new(strings::CARD_DASHBOARD.into());
+                    }
+                    let mut codes = Codes { previous: self.code.parse().ok() };
+                    self.code = codes.next();
+                    self.opened = now;
+                    self.scroll = 0;
+                    self.invalidate_viewport();
+                    self.hint = None;
+                },
                 KeyCode::Backspace => { self.message.pop(); },
                 _ => {}
             }
@@ -143,7 +158,8 @@ impl Card {
         if !fresh { self.armed = None; self.input.clear(); self.hint = Some(strings::STALE); return Effect::None; }
         if self.blocked.is_some() { return Effect::None; }
         let plan_pending = self.plan_pending();
-        if plan_pending && !matches!(key.code, KeyCode::Char('0'..='9') | KeyCode::Backspace | KeyCode::Enter) {
+        let code_required = plan_pending || self.reviewing;
+        if code_required && !matches!(key.code, KeyCode::Char('0'..='9') | KeyCode::Backspace | KeyCode::Enter) {
             self.input.clear();
         }
         let decision = match &self.item {
@@ -171,24 +187,23 @@ impl Card {
             }
             InboxItem::Task(t) => {
                 let action = match key.code {
-                    KeyCode::Char(c) if c.is_ascii_digit() && plan_pending => {
+                    KeyCode::Char(c) if c.is_ascii_digit() && code_required => {
                         if !self.bottom_seen { self.hint = Some(strings::CARD_SCROLL); return Effect::None; }
                         if self.input.len() < 3 { self.input.push(c); }
                         return Effect::None;
                     }
-                    KeyCode::Backspace if plan_pending => { self.input.pop(); return Effect::None; }
-                    KeyCode::Enter if plan_pending => {
+                    KeyCode::Backspace if code_required => { self.input.pop(); return Effect::None; }
+                    KeyCode::Enter if code_required => {
                         if !self.bottom_seen { self.hint = Some(strings::CARD_SCROLL); return Effect::None; }
                         if self.input != self.code { self.input.clear(); self.hint = Some(strings::CARD_WRONG_CODE); return Effect::None; }
-                        Some(GoalAction::Retry)
+                        Some(if self.reviewing { GoalAction::Continue } else { GoalAction::Retry })
                     }
                     KeyCode::Char('r') if t.status.is("needs_human") && !plan_pending => Some(GoalAction::Retry),
                     KeyCode::Char('a') if t.status.is("needs_human") => Some(GoalAction::Abort),
                     KeyCode::Char('d') if t.status.is("needs_human") => Some(GoalAction::Done),
                     KeyCode::Char('t') if t.status.is("needs_human") => Some(GoalAction::Takeover),
-                    KeyCode::Char('i') if self.continuing() => { self.editing = true; None },
-                    KeyCode::Char('c') if self.continuing() && self.message.trim().is_empty() => { self.editing = true; None },
-                    KeyCode::Char('c') if self.continuing() && !self.message.trim().is_empty() => Some(GoalAction::Continue),
+                    KeyCode::Char('i') if self.continuing() && !self.reviewing => { self.editing = true; None },
+                    KeyCode::Char('c') if self.continuing() && !self.reviewing => { self.editing = true; None },
                     _ => None,
                 };
                 if let Some(action) = action {
@@ -220,6 +235,7 @@ impl Card {
                 InboxItem::Approval(_) if self.high_risk && !self.bottom_seen => strings::CARD_SCROLL.into(),
                 InboxItem::Approval(_) => format!("{} {}  [{}]\n{}", strings::CARD_CODE, self.code, self.input, strings::CARD_APPROVAL_KEYS),
                 InboxItem::Task(_) if self.plan_pending() => format!("{}\n{} {} [{}]", strings::PLAN_KEYS, strings::CARD_CODE, self.code, self.input),
+                InboxItem::Task(_) if self.reviewing => format!("{} {} [{}]", strings::CARD_CODE, self.code, self.input),
                 InboxItem::Task(_) if self.editing => format!("{}\n{}", strings::CONTINUE_EDIT, TerminalText::new(self.message.clone()).visible()),
                 InboxItem::Task(_) if self.continuing() => format!("{}\n{}", strings::CARD_CONTINUE_KEYS, TerminalText::new(self.message.clone()).visible()),
                 InboxItem::Task(t) if t.status.is("needs_human") => strings::CARD_GOAL_KEYS.into(),

@@ -278,6 +278,7 @@ pub(crate) fn extract_tool_result_text(result: &Value) -> Option<String> {
 pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
     match tool_name {
         "credential_declare" => serde_json::json!({"redacted":true}),
+        "computer_login" => serde_json::json!({"credential": args.get("credential").and_then(Value::as_str)}),
         "computer_type" => {
             let chars = args.get("text").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
             serde_json::json!({ "chars": chars })
@@ -334,6 +335,7 @@ pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
             let n = |k: &str| args.get(k).map(|v| v.to_string()).unwrap_or_default();
             format!("x={} y={}", n("x"), n("y"))
         }
+        "computer_login" => "dashboard credential login".to_string(),
         "computer_type" => {
             let chars = args.get("text").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
             format!("chars={chars}")

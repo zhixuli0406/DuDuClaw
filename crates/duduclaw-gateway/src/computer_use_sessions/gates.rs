@@ -11,7 +11,7 @@
 //! - `approval_required_tools`, `irreversible_tools` and
 //!   `maybe_irreversible_tools` — a human decision through the
 //!   [`ApprovalBroker`] (no LLM judge here: a maybe-irreversible computer
-//!   tool is always asked about). The MCP-side approval gate skips the eight
+//!   tool is always asked about). The MCP-side approval gate skips the nine
 //!   `computer_*` tools so nobody is asked twice;
 //! - `[capabilities] action_rules` (2026-10) — the same resolution the MCP
 //!   gate uses ([`duduclaw_core::ActionRules::resolve`] over
@@ -41,6 +41,8 @@ pub const TOOL_SCREENSHOT: &str = "computer_screenshot";
 pub const TOOL_CLICK: &str = "computer_click";
 /// `computer_type`.
 pub const TOOL_TYPE: &str = "computer_type";
+/// A separate policy operation; never aliases `computer_type`.
+pub const TOOL_LOGIN: &str = "computer_login";
 /// `computer_key`.
 pub const TOOL_KEY: &str = "computer_key";
 /// `computer_scroll`.
@@ -155,7 +157,7 @@ pub(super) fn egress_check(home: &Path, agent: &str, tool: &str, turn: Option<&s
 
 pub(super) fn egress_check_with_call(home: &Path, agent: &str, tool: &str, turn: Option<&str>, call_id: &str) -> Result<Option<serde_json::Value>, OpError> {
     use duduclaw_core::egress_guard::{effective_mode_checked, Mode};
-    if !matches!(tool, TOOL_NAVIGATE | TOOL_TYPE) { return Ok(None); }
+    if !matches!(tool, TOOL_NAVIGATE | TOOL_TYPE | TOOL_LOGIN) { return Ok(None); }
     let mode = effective_mode_checked(home, Some(&agent_dir(home, agent))).map_err(forbidden)?;
     if mode == Mode::Off { return Ok(None); }
     let taint = crate::egress_guard::query_turn(agent, turn);

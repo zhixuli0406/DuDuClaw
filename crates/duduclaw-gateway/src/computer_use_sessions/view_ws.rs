@@ -191,6 +191,9 @@ async fn bridge(socket: WebSocket, sessions: Arc<ComputerUseSessions>, admitted:
 
 /// The byte pump. Returns how many input messages were forwarded.
 async fn run_bridge(socket: WebSocket, sessions: &ComputerUseSessions, admitted: &Admitted) -> u64 {
+    let shared = &admitted.entry.shared;
+    let epoch = shared.login_epoch.load(Ordering::Acquire);
+    if shared.login_running.load(Ordering::Acquire) || shared.login_masked.load(Ordering::Acquire) { return 0; }
     let Some(access) = admitted.entry.shared.live.access() else {
         return 0;
     };
@@ -218,6 +221,10 @@ async fn run_bridge(socket: WebSocket, sessions: &ComputerUseSessions, admitted:
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     _ => break,
                 };
+                let _view = shared.login_view_gate.read().await;
+                if shared.login_epoch.load(Ordering::Acquire) != epoch
+                    || shared.login_running.load(Ordering::Acquire)
+                    || shared.login_masked.load(Ordering::Acquire) { break; }
                 let (bytes, inputs) = match filter_viewer_bytes(&mut filter, live, &admitted.user_id, Instant::now(), &data) {
                     Ok(v) => v,
                     Err(e) => {
@@ -226,21 +233,30 @@ async fn run_bridge(socket: WebSocket, sessions: &ComputerUseSessions, admitted:
                     }
                 };
                 forwarded += inputs;
-                if !bytes.is_empty() && relay_tx.write_all(&bytes).await.is_err() {
-                    break;
-                }
+                if !bytes.is_empty() && !matches!(tokio::time::timeout(Duration::from_secs(2),
+                    relay_tx.write_all(&bytes)).await, Ok(Ok(()))) { break; }
             }
             n = relay_rx.read(&mut buf) => {
                 match n {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if ws_tx.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        // Never forward buffered login frames, even after a
+                        // successful login has released the exclusive gate.
+                        let _view = shared.login_view_gate.read().await;
+                        if shared.login_epoch.load(Ordering::Acquire) != epoch
+                            || shared.login_running.load(Ordering::Acquire)
+                            || shared.login_masked.load(Ordering::Acquire) { break; }
+                        if !matches!(tokio::time::timeout(Duration::from_secs(2),
+                            ws_tx.send(Message::Binary(buf[..n].to_vec().into()))).await, Ok(Ok(()))) {
                             break;
                         }
                     }
                 }
             }
             _ = ticks.tick() => {
+                if shared.login_epoch.load(Ordering::Acquire) != epoch
+                    || shared.login_running.load(Ordering::Acquire)
+                    || shared.login_masked.load(Ordering::Acquire) { break; }
                 if sessions
                     .live_entry(&admitted.ticket.agent_id, Some(&admitted.ticket.session_id))
                     .is_none()

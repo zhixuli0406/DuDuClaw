@@ -326,7 +326,7 @@ pub async fn detect_sensitive_regions(
 // ---------------------------------------------------------------------------
 
 /// An action on the virtual display (the `computer_*` tools translate into it).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "action")]
 pub enum ComputerAction {
     #[serde(rename = "screenshot")]
@@ -353,6 +353,24 @@ pub enum ComputerAction {
     Wait { duration: u32 },
     #[serde(rename = "zoom")]
     Zoom { coordinate: [u32; 4] },
+}
+
+// Debug is used by execution diagnostics; it must never contain typed text.
+impl std::fmt::Debug for ComputerAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Type { .. } => f.write_str("Type { text: [REDACTED] }"),
+            Self::Key { .. } => f.write_str("Key { text: [REDACTED] }"),
+            Self::Screenshot => f.write_str("Screenshot"),
+            Self::LeftClick { coordinate } => f.debug_tuple("LeftClick").field(coordinate).finish(),
+            Self::RightClick { coordinate } => f.debug_tuple("RightClick").field(coordinate).finish(),
+            Self::DoubleClick { coordinate } => f.debug_tuple("DoubleClick").field(coordinate).finish(),
+            Self::Scroll { coordinate, direction, amount } => f.debug_tuple("Scroll").field(coordinate).field(direction).field(amount).finish(),
+            Self::MouseMove { coordinate } => f.debug_tuple("MouseMove").field(coordinate).finish(),
+            Self::Wait { duration } => f.debug_tuple("Wait").field(duration).finish(),
+            Self::Zoom { coordinate } => f.debug_tuple("Zoom").field(coordinate).finish(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

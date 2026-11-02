@@ -91,7 +91,7 @@ fn pinned(image:&str)->bool {
 
 /// Shares the exact sidecar used by workspace copy and retention, with a
 /// bounded wait that is part of the attempt's wall deadline.
-pub(crate) fn quota_lock(root:&Path, deadline:Instant)->io::Result<std::fs::File> {
+pub(crate) fn quota_lock(root:&Path, deadline:Instant)->io::Result<duduclaw_core::owner_lock::OwnerLock> {
     #[cfg(not(unix))]
     { let _=(root,deadline);Err(io::Error::other("quota locking unavailable")) }
     #[cfg(unix)]
@@ -107,7 +107,7 @@ pub(crate) fn quota_lock(root:&Path, deadline:Instant)->io::Result<std::fs::File
         let until=deadline.min(Instant::now()+Duration::from_millis(500));
         loop {
             if Instant::now()>=until {return Err(io::Error::new(io::ErrorKind::TimedOut,"quota lock deadline"));}
-            if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0 {return Ok(file);}
+            if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0 {return Ok(duduclaw_core::owner_lock::OwnerLock::new(file));}
             let error=io::Error::last_os_error();
             if error.kind()!=io::ErrorKind::WouldBlock && error.kind()!=io::ErrorKind::Interrupted {return Err(error);}
             std::thread::sleep(Duration::from_millis(5));

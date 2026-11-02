@@ -111,6 +111,12 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 若規劃器呼叫本身失敗(逾時、傳輸錯誤、空回覆),任務照樣 fail-closed 停在 `needs_human`,但分類改成 `infra` 而非 `blocked_needs_decision`,且不帶 `plan_pending`,核准動作永遠不會在沒有計畫的情況下悄悄開始執行。
 
+### 選用的獨立計畫審查
+
+在 `config.toml [goal_loop]` 設定 `plan_review = "goldfish"`，即可在計畫生成成功後、顯示給人核准前加入獨立審查。預設為 `"off"`；未設定或格式錯誤也視為關閉。三次全新的呼叫在目前任務內並行，各有 45 秒逾時，最多增加 45 秒：重述目標並找出不清楚的地方、刪減不必要的工作、檢查執行所需的決策、權限與資料。每位審查者只收到經 XML 跳脫的目標、驗收標準與計畫，這些內容都視為資料；不帶入對話、記憶、SOUL 或員工身分。回覆要求繁體中文、最多五個條列，每個視角保留最多 400 字元。
+
+呼叫以 `goal-plan-review` 記為系統工具用量，沿用系統的供應商解析方式，不傳入員工目錄，**不計入員工預算**。具版本的 `plan_review` JSON 只供人閱讀，不改寫 `plan_pending` 或 `judge_feedback`，不放進執行或驗收提示，也不取代人工核准。失敗、空白或逾時都顯示「未執行」；即使三者全部失敗，任務仍停在 `needs_human`。任務詳情與收件匣會顯示預設收合的「獨立審查意見（未看過對話）」。通道只顯示已完成視角數量與儀表板提示，不帶審查文字；該數字是完成的視角數，並非逐條意見數。
+
 ## 自主等級
 
 每個 agent 的韁繩長度就是一顆旋鈕:`agent.toml [capabilities] autonomy_level`。缺席或無法解析時,預設為保守的 `approver`。

@@ -63,6 +63,9 @@ pub(crate) fn filter_tool_activity(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if v.get("usage_only").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
         if v.get("agent_id").and_then(|a| a.as_str()) != Some(agent_id) {
             continue;
         }

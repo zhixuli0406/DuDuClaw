@@ -437,9 +437,34 @@ pub(super) fn product_footer_for(name: &str) -> String {
     format!("— Powered by {}", crate::distributor_brand::escape_channel_name(name))
 }
 
+pub(super) fn footer_required_for_tier(tier: duduclaw_license::LicenseTier) -> bool {
+    use duduclaw_license::LicenseTier;
+    match tier {
+        LicenseTier::OpenSource | LicenseTier::Hobby => true,
+        LicenseTier::Solo
+        | LicenseTier::Studio
+        | LicenseTier::Business
+        | LicenseTier::Partner
+        | LicenseTier::PersonalProSelfHost
+        | LicenseTier::SelfHostPro
+        | LicenseTier::Oem => false,
+    }
+}
+
+pub(crate) fn product_footer_required() -> bool {
+    use futures_util::FutureExt;
+    crate::license_runtime::global()
+        .and_then(|runtime| runtime.snapshot().now_or_never())
+        .map(|snapshot| footer_required_for_tier(snapshot.tier))
+        .unwrap_or(true)
+}
+
 /// The text [`append_product_footer`] adds to a reply (for channels that
 /// insert more lines above it).
 pub(crate) fn product_footer_suffix() -> String {
+    if !product_footer_required() {
+        return String::new();
+    }
     format!("\n\n{}", product_footer_for(&crate::distributor_brand::product_name()))
 }
 
@@ -472,10 +497,14 @@ pub fn is_messaging_session(session_id: &str) -> bool {
 }
 
 pub(super) fn append_product_footer(reply: String, session_id: &str) -> String {
-    if reply.is_empty() || !footer_applies_to_session(session_id) {
+    append_product_footer_if_required(reply, session_id, product_footer_required())
+}
+
+pub(super) fn append_product_footer_if_required(reply: String, session_id: &str, required: bool) -> String {
+    if reply.is_empty() || !required || !footer_applies_to_session(session_id) {
         return reply;
     }
-    format!("{reply}{}", product_footer_suffix())
+    format!("{reply}\n\n{}", product_footer_for(&crate::distributor_brand::product_name()))
 }
 
 /// The employee and session a reply's secrets are restored and its contract

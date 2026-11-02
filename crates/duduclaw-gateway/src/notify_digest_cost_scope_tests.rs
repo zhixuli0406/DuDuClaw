@@ -83,6 +83,9 @@ async fn assert_home_scoped_costs() {
 
 #[test]
 fn digest_costs_stay_with_the_requested_home_when_global_telemetry_is_elsewhere() {
+    // Includes process startup and SQLite IO on heavily loaded Windows CI;
+    // this watchdog is test-only, unrelated to digest production timing.
+    const CHILD_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
     const CHILD: &str = "DUDU_TEST_DIGEST_COST_SCOPE_CHILD";
     if let Some(flag) = std::env::var_os(CHILD) {
         assert_eq!(flag, std::ffi::OsStr::new("isolated"));
@@ -137,7 +140,7 @@ fn digest_costs_stay_with_the_requested_home_when_global_telemetry_is_elsewhere(
         }
     }
     let mut child = command.spawn().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + CHILD_WAIT;
     let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -156,7 +159,7 @@ fn digest_costs_stay_with_the_requested_home_when_global_telemetry_is_elsewhere(
     let stderr = std::fs::read_to_string(stderr_path).unwrap();
     assert!(
         !timed_out,
-        "isolated digest scope exceeded 20s: {stdout} {stderr}"
+        "isolated digest scope exceeded {CHILD_WAIT:?}: {stdout} {stderr}"
     );
     assert!(
         stdout.lines().any(|line| line == "running 1 test"),

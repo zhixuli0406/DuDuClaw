@@ -341,9 +341,9 @@ async fn create_goal_task_inner(
         let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
         let callers: Vec<String> = crate::autonomous_runtime::task_caller(home_dir, &task)
             .into_iter().collect();
-        let plan_result = crate::autonomous_runtime::scope(
+        let (plan_result, plan_review) = crate::autonomous_runtime::scope(
             home_dir, &task.assigned_to, &callers,
-            crate::goal_plan::generate_plan_first(home_dir, &task.description, criteria_for_plan),
+            crate::goal_loop::plan_review::generate_plan_first_reviewed(home_dir, &task.description, criteria_for_plan),
         ).await;
         if let Err(e) = &plan_result {
             warn!(
@@ -353,6 +353,7 @@ async fn create_goal_task_inner(
             );
         }
         crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
+        task.plan_review = plan_review;
     }
 
     let admission = match admission {

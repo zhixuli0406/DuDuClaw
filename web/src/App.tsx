@@ -21,6 +21,7 @@ import { useIsAppliance } from './hooks/useIsAppliance';
 const lazyPage = <K extends string>(loader: () => Promise<Record<K, React.ComponentType>>, key: K) =>
   lazy(() => loader().then((m) => ({ default: m[key] })));
 
+const SetupChecklistPage = lazyPage(() => import('./pages/SetupChecklistPage'), 'SetupChecklistPage');
 const HomePage = lazyPage(() => import('./pages/HomePage'), 'HomePage');
 const InboxPage = lazyPage(() => import('./pages/InboxPage'), 'InboxPage');
 const RoutinesPage = lazyPage(() => import('./pages/RoutinesPage'), 'RoutinesPage');
@@ -75,6 +76,7 @@ const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPag
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
 const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'LocalModelsPage');
 const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
+const InvitePage = lazyPage(() => import('./pages/InvitePage'), 'InvitePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
 const AccountPage = lazyPage(() => import('./pages/AccountPage'), 'AccountPage');
@@ -195,6 +197,7 @@ export function App() {
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route path="login" element={<LoginPage />} />
+          <Route path="invite" element={<InvitePage />} />
           {/* `/wizard` was a second, older first-run wizard that nothing linked
               to and `FirstRunGate` never sent anyone to (§2-13). Its component
               is gone; the path redirects so any stale bookmark lands on the one
@@ -251,6 +254,7 @@ export function App() {
                   board, /goals, agent cards, gallery) lands here. Not a nav
                   row; the sidebar's primary button is its entry. */}
               <Route path="assign" element={<AssignPage />} />
+              <Route element={<RoleGuard minRole="admin" />}><Route element={<EditionGuard enterprise />}><Route path="setup" element={<SetupChecklistPage />} /></Route></Route>
               {/* P5 持續任務 — every `responsibilities.*` RPC re-checks the
                   caller's binding to the owner employee server-side. */}
               <Route path="responsibilities" element={<ResponsibilitiesPage />} />

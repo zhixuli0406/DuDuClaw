@@ -122,6 +122,14 @@ impl<T> Default for Snapshot<T> {
         }
     }
 }
+impl Snapshot<InboxItem> {
+    pub fn actionable_count(&self) -> Option<usize> {
+        self.count().map(|_| self.items.iter().filter(|item| matches!(item, InboxItem::Approval(_) | InboxItem::Task(_))).count())
+    }
+    pub fn informational_count(&self) -> Option<usize> {
+        self.count().map(|_| self.items.iter().filter(|item| matches!(item, InboxItem::Breaker(_))).count())
+    }
+}
 impl<T> Snapshot<T> {
     pub fn count(&self) -> Option<usize> {
         (!self.stale && !self.refetch_pending).then_some(self.items.len())

@@ -81,6 +81,7 @@ mod agents_avatar;
 mod agents_callable_rpc;
 mod assign_schedules_rpc;
 mod agents_inspect;
+mod agents_tool_pruning;
 mod channels_status;
 mod channels_add;
 mod channels_test;
@@ -114,6 +115,7 @@ mod audit_rpc;
 mod security_rpc;
 mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
+mod website_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
 mod playbook_rpc;
@@ -135,6 +137,7 @@ mod dashboard_layout;
 mod widgets_custom;
 mod departments_rpc;
 mod users_rpc;
+mod user_invites_rpc;
 mod users_org;
 mod team_rpc;
 pub(crate) mod live_context;
@@ -532,6 +535,29 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return self.dispatch_org(method, params, ctx, conn).await;
+        }
+
+        // Invitations are gateway-owned authentication methods. An extension
+        // must never replace their Admin checks or inspect a returned link.
+        if let Some(role) = user_invites_rpc::minimum_role(method) {
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
+        }
+
+        if method == "users.create" && params.get("invite").and_then(Value::as_bool) == Some(true) {
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
+        }
+
+        // Website passwords belong only to the gateway. Route before plugin
+        // dispatch so no extension receives a clone of credential values.
+        if method.split('.').next() == Some("website_credentials") {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                website_credentials_rpc::audit(&self.home_dir, method, &ctx.user_id, None, "refused");
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
         }
 
         // ── Plugin extension dispatch ──────
