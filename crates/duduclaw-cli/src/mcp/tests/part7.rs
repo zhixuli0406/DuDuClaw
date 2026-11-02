@@ -226,3 +226,39 @@ async fn enforce_requires_host_context_even_after_binding_while_record_does_not(
     assert_eq!(refused["isError"], true, "{refused}");
     assert!(audit_events(home, "on_behalf_of_rejected").is_empty());
 }
+
+#[tokio::test]
+async fn spawn_ephemeral_carries_host_principal_through_admission_replay() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    create_test_agent_with_caps(&home.join("agents"), "main", &["Read"]);
+    fs::write(home.join("config.toml"), "[dispatch]\nephemeral_max_active = 1\n").unwrap();
+    let args = serde_json::json!({
+        "instruction": "Read the report.", "context": "Review the report.", "tools": ["Read"],
+        "on_behalf_of": "user:forged",
+    });
+    {
+        let _host = HostPrincipal::set("user:owner");
+        for _ in 0..2 {
+            let result = spawn_ephemeral_with_ctx_and_upstream(
+                &args, home, "main", ctx(),
+                (Some("origin-turn".into()), Some("webchat:owner#agent:main".into())),
+            ).await;
+            assert_ne!(result["isError"], true, "{result}");
+        }
+    }
+    let bus = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+    let first: serde_json::Value = serde_json::from_str(bus.trim()).unwrap();
+    assert_eq!(first["on_behalf_of"], "user:owner");
+    let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(
+        home, first["agent_id"].as_str().unwrap(),
+    ).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(duduclaw_gateway::ephemeral::drain_admission_queue(home).await.admitted, 1);
+    let bus = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+    let replayed: serde_json::Value = serde_json::from_str(bus.lines().last().unwrap()).unwrap();
+    assert_eq!(replayed["on_behalf_of"], "user:owner", "the sweeper has no host principal");
+    assert_eq!(replayed["turn_id"], "origin-turn");
+    assert_eq!(replayed["session_id"], "webchat:owner#agent:main");
+}

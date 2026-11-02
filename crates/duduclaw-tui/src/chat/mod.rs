@@ -5,6 +5,7 @@ mod transport;
 use crate::{sanitize::TerminalText, strings};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 pub use transport::ChatClient;
 pub(crate) use transport::Credentials;
 
@@ -12,6 +13,8 @@ pub const MAX_LINES: usize = 2_000;
 pub const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
 const MAX_LINE_CHARS: usize = 512;
 pub const MAX_INPUT_CHARS: usize = 8_000;
+pub(crate) const DOWNSTREAM_TTL: Duration = Duration::from_secs(600);
+const MAX_DOWNSTREAM_COUNT: u64 = 10_000;
 
 /// Additive fields deliberately do not require the unmerged concurrency PR.
 #[derive(Clone, Debug, Deserialize)]
@@ -21,6 +24,11 @@ pub struct Frame {
     pub content: Option<String>,
     pub message: Option<String>,
     pub code: Option<String>,
+    pub request_id: Option<String>,
+    pub downstream_ref: Option<String>,
+    pub downstream_running: Option<serde_json::Value>,
+    pub stopped: Option<serde_json::Value>,
+    pub still_stopping: Option<serde_json::Value>,
     pub phase: Option<String>,
     pub tool: Option<String>,
     pub summary: Option<String>,
@@ -87,6 +95,13 @@ pub(crate) struct SendFrame {
     session_id: Option<String>,
 }
 #[derive(Clone)]
+struct DownstreamOffer {
+    reference: String,
+    count: u64,
+    expires: Instant,
+}
+
+#[derive(Clone)]
 pub struct ChatState {
     pub lines: VecDeque<TerminalText>,
     pub(crate) revision: u64,
@@ -102,6 +117,8 @@ pub struct ChatState {
     session_id: Option<String>,
     base_session: Option<String>,
     counter: u64,
+    downstream: Option<DownstreamOffer>,
+    downstream_request: Option<String>,
 }
 impl Default for ChatState {
     fn default() -> Self {
@@ -120,6 +137,8 @@ impl Default for ChatState {
             session_id: None,
             base_session: None,
             counter: 0,
+            downstream: None,
+            downstream_request: None,
         }
     }
 }
@@ -165,6 +184,8 @@ impl ChatState {
         self.running = false;
         self.cancel_supported = false;
         self.msg_id = None;
+        self.downstream = None;
+        self.downstream_request = None;
         self.status = TerminalText::new(strings::DISCONNECTED.into());
     }
     pub(crate) fn prepare(&mut self, input: Submission) -> crate::Result<SendFrame> {
@@ -206,7 +227,68 @@ impl ChatState {
             "conv":self.conv, "session_id":self.session_id})
         })
     }
+    pub(crate) fn downstream_reference(&self, now: Instant) -> Option<&str> {
+        self.downstream.as_ref()
+            .filter(|offer| self.connected && now < offer.expires)
+            .map(|offer| offer.reference.as_str())
+    }
+    pub(crate) fn downstream_prompt(&self, now: Instant) -> Option<TerminalText> {
+        self.downstream_reference(now)?;
+        self.downstream.as_ref().map(|offer| TerminalText::new(strings::downstream_prompt(offer.count)))
+    }
+    pub(crate) fn dismiss_downstream(&mut self, reference: &str) {
+        if self.downstream.as_ref().is_some_and(|offer| offer.reference == reference) {
+            self.downstream = None;
+        }
+    }
+    pub(crate) fn downstream_frame(&mut self, reference: &str, now: Instant) -> Option<serde_json::Value> {
+        if self.downstream_reference(now) != Some(reference) { return None; }
+        // Consume before transport send. Never replay an uncertain stop request.
+        self.downstream = None;
+        let request_id = nonce();
+        self.downstream_request = Some(request_id.clone());
+        self.status = TerminalText::new(strings::DOWNSTREAM_STOPPING.into());
+        Some(serde_json::json!({"type":"cancel_downstream", "downstream_ref":reference, "request_id":request_id}))
+    }
     pub fn apply(&mut self, frame: Frame) {
+        self.apply_at(frame, Instant::now());
+    }
+    pub(crate) fn apply_at(&mut self, frame: Frame, now: Instant) {
+        // These replies belong to a separate stop request, possibly after a new
+        // chat turn has started. They must never terminate that newer turn.
+        if frame.kind == "error" && frame.code.as_deref() == Some("downstream_stop_busy") {
+            if frame.request_id.is_some() && frame.request_id == self.downstream_request {
+                let message = frame.message.as_deref().unwrap_or("下游停止請求處理中，請稍後再試。");
+                self.append(strings::CHAT_SYSTEM, message);
+            }
+            return;
+        }
+        if frame.kind == "downstream_stopped"
+            || (frame.kind == "error" && frame.code.as_deref() == Some("downstream_ref_unknown"))
+        {
+            if frame.request_id.is_none() || frame.request_id != self.downstream_request {
+                return;
+            }
+            self.downstream_request = None;
+            let message = if frame.kind == "downstream_stopped" {
+                strings::downstream_stopped(count(frame.stopped.as_ref()), count(frame.still_stopping.as_ref()))
+            } else {
+                strings::DOWNSTREAM_UNKNOWN.into()
+            };
+            self.append(strings::CHAT_SYSTEM, &message);
+            self.status = safe_status(&message);
+            return;
+        }
+        if frame.kind == "error" && self.downstream_request.is_some()
+            && frame.request_id == self.downstream_request
+        {
+            self.downstream_request = None;
+            let message = frame.message.as_deref().unwrap_or(strings::CHAT_ERROR);
+            self.append(strings::CHAT_SYSTEM, message);
+            self.status = safe_status(message);
+            return;
+        }
+
         if frame.msg_id.as_ref().is_some_and(|s| !s.is_empty()) {
             self.cancel_supported = true;
         }
@@ -272,7 +354,13 @@ impl ChatState {
                 }
             }
             "error" => {
-                let message = if frame.code.as_deref() == Some("turn_limit") {
+                let message = if frame.code.as_deref() == Some("cancelled") {
+                    let running = count(frame.downstream_running.as_ref());
+                    if running > 0 && let Some(reference) = frame.downstream_ref.filter(|s| !s.is_empty() && s.len() <= 128) {
+                        self.downstream = Some(DownstreamOffer { reference, count: running, expires: now + DOWNSTREAM_TTL });
+                    }
+                    strings::CHAT_CANCELLED
+                } else if frame.code.as_deref() == Some("turn_limit") {
                     strings::CHAT_TURN_LIMIT
                 } else {
                     frame.message.as_deref().unwrap_or(strings::CHAT_ERROR)
@@ -296,4 +384,10 @@ fn safe_status(text: &str) -> TerminalText {
             .plain()
             .replace('\n', " "),
     )
+}
+
+fn count(value: Option<&serde_json::Value>) -> u64 {
+    value.and_then(serde_json::Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| n.min(MAX_DOWNSTREAM_COUNT as f64) as u64).unwrap_or(0)
 }

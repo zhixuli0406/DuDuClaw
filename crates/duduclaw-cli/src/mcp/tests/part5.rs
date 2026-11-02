@@ -496,3 +496,114 @@ fn is_agent_id_shape_rejects_obvious_bad() {
     assert!(!is_agent_id_shape("../etc/passwd"));
     assert!(!is_agent_id_shape("123")); // no alphabetic
 }
+
+/// Exercise both real enqueue paths with a host pair instead of global env.
+#[tokio::test]
+async fn spawn_downstream_lineage_is_complete_or_dropped_and_audited() {
+    for ephemeral in [false, true] {
+        for (turn, session, missing) in [
+            (Some("origin-turn"), Some("webchat:person#agent:boss"), None),
+            (Some("origin-turn"), None, Some("session_id")),
+            (None, Some("webchat:person#agent:boss"), Some("turn_id")),
+            (None, None, None),
+        ] {
+            let tmp = TempDir::new();
+            let home = tmp.path();
+            let agents = home.join("agents");
+            fs::create_dir_all(&agents).unwrap();
+            create_test_agent_with_caps(&agents, "boss", &["Read"]);
+            create_test_agent(&agents, "worker", "boss");
+            let upstream = (turn.map(str::to_owned), session.map(str::to_owned));
+            let ctx = DelegationContext { depth: 0, origin: None };
+            let args = if ephemeral {
+                serde_json::json!({
+                    "instruction": "Read the report.", "context": "Review the report.",
+                    "tools": ["Read"], "turn_id": "forged", "session_id": "forged",
+                })
+            } else {
+                serde_json::json!({
+                    "agent_id": "worker", "task": "Read the report.",
+                    "turn_id": "forged", "session_id": "forged",
+                })
+            };
+            let result = if ephemeral {
+                spawn_ephemeral_with_ctx_and_upstream(&args, home, "boss", ctx, upstream).await
+            } else {
+                spawn_agent_with_ctx_and_upstream(&args, home, "boss", ctx, upstream).await
+            };
+            assert_ne!(result["isError"], true, "ephemeral={ephemeral}: {result}");
+            let lines = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+            let row: serde_json::Value = serde_json::from_str(lines.trim()).unwrap();
+            assert_eq!(row["spawned"], true);
+            if turn.is_some() && session.is_some() {
+                assert_eq!(row["turn_id"], turn.unwrap());
+                assert_eq!(row["session_id"], session.unwrap());
+            } else {
+                assert!(row.get("turn_id").is_none(), "{row}");
+                assert!(row.get("session_id").is_none(), "{row}");
+            }
+            assert_eq!(row["upstream_unknown"].as_bool().unwrap_or(false), missing.is_some());
+            let audits: Vec<serde_json::Value> = fs::read_to_string(home.join("security_audit.jsonl"))
+                .unwrap_or_default().lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|row| row["event_type"] == "bus_upstream_identity_dropped")
+                .collect();
+            assert_eq!(audits.len(), usize::from(missing.is_some()));
+            if let Some(missing) = missing {
+                assert_eq!(audits[0]["details"]["missing"], missing);
+                assert_eq!(audits[0]["details"]["message_id"], row["message_id"]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn spawn_downstream_lineage_survives_ephemeral_admission_replay() {
+    for (turn, session, unknown) in [
+        (Some("origin-turn"), Some("webchat:person#agent:boss"), false),
+        (Some("origin-turn"), None, true),
+    ] {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        create_test_agent_with_caps(&home.join("agents"), "boss", &["Read"]);
+        fs::write(home.join("config.toml"), "[dispatch]\nephemeral_max_active = 1\n").unwrap();
+        let args = serde_json::json!({
+            "instruction": "Read the report.", "context": "Review the report.", "tools": ["Read"],
+        });
+        let ctx = || DelegationContext { depth: 0, origin: None };
+        let first = spawn_ephemeral_with_ctx_and_upstream(
+            &args, home, "boss", ctx(), (None, None),
+        ).await;
+        assert_ne!(first["isError"], true, "{first}");
+        let result = spawn_ephemeral_with_ctx_and_upstream(
+            &args, home, "boss", ctx(), (turn.map(str::to_owned), session.map(str::to_owned)),
+        ).await;
+        assert_ne!(result["isError"], true, "{result}");
+        let class = duduclaw_gateway::ephemeral::EPHEMERAL_ADMISSION_CLASS;
+        let ticket = duduclaw_core::spawn_admission::dequeue_next_matching(home, class, |_| true)
+            .ticket.unwrap();
+        assert_eq!(ticket.owner_key.as_deref(), turn, "H19 owner scope is unchanged");
+        assert_eq!(ticket.payload["upstream_unknown"].as_bool().unwrap_or(false), unknown);
+        assert!(duduclaw_core::spawn_admission::restore_dequeued(home, &ticket).unwrap());
+        let first_bus = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+        let first_row: serde_json::Value = serde_json::from_str(first_bus.trim()).unwrap();
+        let first_dir = duduclaw_gateway::ephemeral::resolve_agent_dir(
+            home, first_row["agent_id"].as_str().unwrap(),
+        ).unwrap();
+        fs::remove_dir_all(first_dir).unwrap();
+        assert_eq!(duduclaw_gateway::ephemeral::drain_admission_queue(home).await.admitted, 1);
+        let bus = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+        let replayed: serde_json::Value = serde_json::from_str(bus.lines().last().unwrap()).unwrap();
+        assert_eq!(replayed["spawned"], true);
+        if unknown {
+            assert!(replayed.get("turn_id").is_none());
+            assert!(replayed.get("session_id").is_none());
+        } else {
+            assert_eq!(replayed["turn_id"], turn.unwrap());
+            assert_eq!(replayed["session_id"], session.unwrap());
+        }
+        assert_eq!(replayed["upstream_unknown"].as_bool().unwrap_or(false), unknown);
+        let events = fs::read_to_string(home.join("security_audit.jsonl")).unwrap_or_default();
+        assert_eq!(events.lines().filter(|line| line.contains("bus_upstream_identity_dropped")).count(), usize::from(unknown));
+    }
+}

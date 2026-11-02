@@ -140,6 +140,7 @@ pub struct App {
     pub blocks: crate::chat::Blocks,
     pub chat: crate::chat::ChatState,
     pub chat_scroll: usize,
+    pub(super) answered_downstream: Option<String>,
     pub(super) chat_cache: super::chat_render::TranscriptCache,
     pub spinner: usize,
     pub detail_open: bool,
@@ -168,9 +169,19 @@ pub enum Action {
     Decide(crate::decide::Decision),
     Chat(crate::chat::Submission),
     CancelChat,
+    CancelDownstream(String),
+    DismissDownstream(String),
     Control(crate::controls::Control),
 }
 impl App {
+    pub(super) fn downstream_reference(&self, now: std::time::Instant) -> Option<&str> {
+        self.chat.downstream_reference(now)
+            .filter(|reference| self.answered_downstream.as_deref() != Some(*reference))
+    }
+    pub(super) fn downstream_prompt(&self, now: std::time::Instant) -> Option<TerminalText> {
+        self.downstream_reference(now)?;
+        self.chat.downstream_prompt(now)
+    }
     pub fn focus_label(&self) -> &'static str {
         if self.pty_confirm.is_some() { strings::PTY_CONFIRM_FOCUS }
         else if self.pty_focus { strings::PTY_FOCUS }
@@ -336,6 +347,21 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        if !self.help && self.blocks.active == crate::chat::Block::Chat && key.modifiers.is_empty()
+            && let Some(reference) = self.downstream_reference(now).map(str::to_owned)
+        {
+            match key.code {
+                KeyCode::Char('y') => {
+                    self.answered_downstream = Some(reference.clone());
+                    return Action::CancelDownstream(reference);
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.answered_downstream = Some(reference.clone());
+                    return Action::DismissDownstream(reference);
+                }
+                _ => {}
+            }
         }
         let replaces = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w')
             || !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)

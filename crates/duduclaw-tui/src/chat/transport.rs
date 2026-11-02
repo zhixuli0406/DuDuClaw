@@ -22,6 +22,8 @@ pub(crate) struct Credentials {
 enum Command {
     Send(Submission),
     Cancel,
+    CancelDownstream(String),
+    DismissDownstream(String),
 }
 struct Inner {
     commands: mpsc::Sender<Command>,
@@ -94,6 +96,15 @@ impl ChatClient {
             .commands
             .try_send(Command::Send(input))
             .map_err(|_| Error::Busy)
+    }
+    pub(crate) fn cancel_downstream(&self, reference: String) -> Result<()> {
+        if self.inner.state.borrow().downstream_reference(std::time::Instant::now()) != Some(reference.as_str()) {
+            return Err(Error::RpcRejected);
+        }
+        self.inner.commands.try_send(Command::CancelDownstream(reference)).map_err(|_| Error::Busy)
+    }
+    pub(crate) fn dismiss_downstream(&self, reference: String) {
+        let _ = self.inner.commands.try_send(Command::DismissDownstream(reference));
     }
     pub fn cancel(&self) -> Result<()> {
         if !self.inner.state.borrow().can_cancel() {
@@ -234,6 +245,8 @@ impl Actor {
                             Err(error) => { self.model.status = crate::sanitize::TerminalText::new(error.to_string()); None }
                         },
                         Some(Command::Cancel) => self.model.cancel_frame(),
+                        Some(Command::CancelDownstream(reference)) => self.model.downstream_frame(&reference, std::time::Instant::now()),
+                        Some(Command::DismissDownstream(reference)) => { self.model.dismiss_downstream(&reference); None },
                         None => return,
                     };
                     self.publish();
@@ -297,6 +310,48 @@ mod tests {
             WebSocketStream::from_raw_socket(a, Role::Client, None),
             WebSocketStream::from_raw_socket(b, Role::Server, None)
         )
+    }
+    #[tokio::test]
+    async fn downstream_stop_is_sent_once_and_dismiss_has_no_wire_frame() {
+        let credentials = Arc::new(Credentials {
+            token: Zeroizing::new("downstream-test-token".into()), generation: 1,
+        });
+        let (_credential_tx, credential_rx) = watch::channel(Some(credentials.clone()));
+        let (refresh_tx, _) = mpsc::channel(1);
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (state_tx, mut state_rx) = watch::channel(ChatState::default());
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let mut model = ChatState { connected: true, running: true, ..ChatState::default() };
+        model.apply(Frame::parse(r#"{"type":"error","code":"cancelled","downstream_running":2,"downstream_ref":"opaque"}"#).unwrap());
+        let mut actor = Actor {
+            shutdown, target: GatewayUrl::parse("http://127.0.0.1").unwrap(),
+            credentials: credential_rx, refresh: refresh_tx,
+            options: ClientOptions::default(), commands: command_rx,
+            state: state_tx, model, refresh_attempted: false,
+        };
+        let (mut client, mut server) = pair().await;
+        let fake = async {
+            let _ = server.next().await.unwrap().unwrap();
+            server.send(Message::Text(json!({"type":"session_info"}).to_string().into())).await.unwrap();
+            loop {
+                if state_rx.borrow_and_update().connected { break; }
+                state_rx.changed().await.unwrap();
+            }
+            command_tx.send(Command::CancelDownstream("opaque".into())).await.unwrap();
+            let Some(Ok(Message::Text(wire))) = server.next().await else { panic!("missing stop frame"); };
+            let frame: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(frame["type"], "cancel_downstream");
+            assert_eq!(frame["downstream_ref"], "opaque");
+            assert!(frame["request_id"].as_str().is_some());
+            command_tx.send(Command::CancelDownstream("opaque".into())).await.unwrap();
+            command_tx.send(Command::DismissDownstream("opaque".into())).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(50), server.next()).await.is_err());
+            server.send(Message::Close(None)).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(actor.serve(&mut client, &credentials), fake);
+        }).await.unwrap();
+        assert!(actor.model.downstream_reference(std::time::Instant::now()).is_none());
     }
     #[tokio::test]
     async fn only_authentication_closes_request_refresh() {

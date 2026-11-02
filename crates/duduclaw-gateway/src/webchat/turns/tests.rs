@@ -175,6 +175,9 @@ async fn cancel_kills_process_records_session_and_withdraws_own_approval() {
     let terminal: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(terminal["code"], "cancelled");
     assert_eq!(terminal["delegations_cancelled"], 1);
+    assert_eq!(terminal, serde_json::json!({"type":"error", "code":"cancelled", "message":"Turn cancelled",
+        "approved_before_cancel":[], "delegations_cancelled":1, "request_id":null,
+        "session_id":"session", "conv":null, "msg_id":"message", "progress_dropped":0}));
     assert!(queue.pending_messages(10).await.unwrap().is_empty());
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -790,7 +793,7 @@ fn credential_cancellation_and_delivery_cannot_both_win() {
         let (cancelled, delivering) = std::thread::scope(|scope| {
             let cancel = scope.spawn(|| {
                 barrier.wait();
-                ticket.cancel_unless_delivering()
+                ticket.cancel_for_cause(CancelCause::CredentialRevoked)
             });
             barrier.wait();
             let delivering = ticket.begin_delivery();
@@ -843,3 +846,141 @@ async fn execute_revoked_running_credential_withdraws_and_refuses_card() {
 
 #[path = "identity_tests.rs"]
 mod identity_tests;
+
+#[tokio::test]
+async fn webchat_revocation_stops_downstream_without_offer_and_audits_cause() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+    sessions.get_or_create("s", "bot").await.unwrap();
+    let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+    let registry = Arc::new(Registry::default());
+    let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+    ticket.started.store(true, Ordering::Release);
+    let guard = crate::downstream_runs::register(home.path(), Some("s"), Some(&ticket.id), Some("user:alice")).unwrap().unwrap();
+    let worker = tokio::spawn(async move { guard.run(std::future::pending::<()>()).await });
+    assert!(ticket.cancel_for_cause(CancelCause::CredentialRevoked));
+    let (tx, mut rx) = outbound_channel();
+    let sink = TurnSink::new(tx, "s", None, "m");
+    finish_cancel(home.path(), Some(&broker), &sessions, "s", "bot", &ticket, &sink, Ok(())).await;
+    worker.await.unwrap().unwrap_err();
+    let Message::Text(text) = rx.recv().await.unwrap().message else { panic!() };
+    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(frame["code"], "cancelled");
+    assert!(frame.get("downstream_ref").is_none());
+    let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+    assert!(audit.contains("credential_revoked"));
+    assert!(audit.contains("downstream_stop"));
+    assert!(audit.contains("user:alice"));
+}
+
+#[tokio::test]
+async fn webchat_unavailable_cancel_preserves_downstream_but_revocation_stops_it() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+    sessions.get_or_create("s", "bot").await.unwrap();
+    let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+    let registry = Arc::new(Registry::default());
+    let unavailable = registry.admit("alice", "s", None, "unavailable", 3, 10).unwrap();
+    unavailable.started.store(true, Ordering::Release);
+    let unavailable_guard = crate::downstream_runs::register(home.path(), Some("s"), Some(&unavailable.id), Some("user:alice")).unwrap().unwrap();
+    assert!(unavailable.cancel_for_cause(CancelCause::CredentialUnavailable));
+    let (tx, mut rx) = outbound_channel();
+    finish_cancel(home.path(), Some(&broker), &sessions, "s", "bot", &unavailable,
+        &TurnSink::new(tx, "s", None, "unavailable"), Ok(())).await;
+    assert_eq!(unavailable_guard.run(async { "still running" }).await.unwrap(), "still running");
+    let Message::Text(text) = rx.recv().await.unwrap().message else { panic!() };
+    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(frame["code"], "cancelled");
+    assert!(frame.get("downstream_ref").is_none());
+    assert!(!home.path().join("tool_calls.jsonl").exists());
+
+    let revoked = registry.admit("alice", "s", None, "revoked", 3, 10).unwrap();
+    revoked.started.store(true, Ordering::Release);
+    let revoked_guard = crate::downstream_runs::register(home.path(), Some("s"), Some(&revoked.id), Some("user:alice")).unwrap().unwrap();
+    let worker = tokio::spawn(async move { revoked_guard.run(std::future::pending::<()>()).await });
+    assert!(revoked.cancel_for_cause(CancelCause::CredentialRevoked));
+    let (tx, mut rx) = outbound_channel();
+    finish_cancel(home.path(), Some(&broker), &sessions, "s", "bot", &revoked,
+        &TurnSink::new(tx, "s", None, "revoked"), Ok(())).await;
+    worker.await.unwrap().unwrap_err();
+    let Message::Text(text) = rx.recv().await.unwrap().message else { panic!() };
+    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(frame["code"], "cancelled");
+    assert!(frame.get("downstream_ref").is_none());
+    assert!(std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap().contains("credential_revoked"));
+}
+
+#[tokio::test]
+async fn webchat_person_cancel_offers_count_but_leaves_run_alive() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+    sessions.get_or_create("s", "bot").await.unwrap();
+    let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+    let registry = Arc::new(Registry::default());
+    let ticket = registry.admit("alice", "s", None, "m", 3, 10).unwrap();
+    ticket.started.store(true, Ordering::Release);
+    let guard = crate::downstream_runs::register(home.path(), Some("s"), Some(&ticket.id), Some("user:alice")).unwrap().unwrap();
+    let foreign = crate::downstream_runs::register(home.path(), Some("s"), Some(&ticket.id), Some("user:bob")).unwrap().unwrap();
+    registry.cancel("alice", Some("s"), None, Some("m"), None).unwrap();
+    let (tx, mut rx) = outbound_channel();
+    let sink = TurnSink::new(tx, "s", None, "m");
+    finish_cancel(home.path(), Some(&broker), &sessions, "s", "bot", &ticket, &sink, Ok(())).await;
+    let Message::Text(text) = rx.recv().await.unwrap().message else { panic!() };
+    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(frame["downstream_running"], 1);
+    assert!(uuid::Uuid::parse_str(frame["downstream_ref"].as_str().unwrap()).is_ok());
+    assert_eq!(guard.run(async { "still running" }).await.unwrap(), "still running");
+    assert_eq!(foreign.run(async { "still running" }).await.unwrap(), "still running");
+}
+
+#[tokio::test]
+async fn webchat_downstream_outage_notice_is_content_free_and_retryable() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let writer = futures_util::sink::unfold(captured.clone(), |captured, message: Message| async {
+        captured.lock().unwrap().push(message);
+        Ok::<_, ()>(captured)
+    });
+    let mut sink = BoundedSocketSink(Box::pin(writer));
+    let notice = IdentityUnavailable::downstream(Some("request".into()));
+    let frame = Outbound { message: Message::Text("secret content must never escape".into()),
+        ack: None, deadline: None, identity_notice: Some(notice) };
+    frame.deliver_authorized(crate::handlers::live_context::SocketValidity::Unavailable,
+        &mut crate::handlers::live_context::SocketRecovery::default(), &mut sink).await.unwrap();
+    let frames = captured.lock().unwrap();
+    let Message::Text(text) = &frames[0] else { panic!() };
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["code"], "credential_check_unavailable");
+    assert_eq!(value["retryable"], true);
+    assert_eq!(value["request_id"], "request");
+    assert!(!text.contains("secret"));
+}
+
+#[tokio::test]
+async fn webchat_widget_credential_cancel_uses_real_lineage_not_ip_quota() {
+    let home = tempfile::tempdir().unwrap();
+    let user = "widget-visitor:real-visitor";
+    let sessions = crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap();
+    sessions.get_or_create("s", "bot").await.unwrap();
+    let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+    let registry = Arc::new(Registry::default());
+    let mut ticket = registry.admit_persistent(Some(&broker), "ip:192.0.2.1", user, "s", None, "m", 3, 10).await.unwrap();
+    ticket.lineage_principal = Some(downstream::lineage_principal(home.path(), user, "s"));
+    let requester = crate::knowledge::requester_map::map_requester("s", user, Some(user), |_, _| None);
+    let row_principal = crate::on_behalf_of::principal_for_requester(home.path(), &requester).unwrap();
+    assert!(row_principal.starts_with("unmapped:widget:"));
+    assert_eq!(ticket.lineage_principal.as_deref(), Some(row_principal.as_str()));
+    assert_eq!(ticket.principal, "ip:192.0.2.1");
+    assert_eq!(downstream::lineage_principal(home.path(), "", "s"), "lineage-unavailable");
+    ticket.started.store(true, Ordering::Release);
+    let guard = crate::downstream_runs::register(home.path(), Some("s"), Some(&ticket.id), Some(&row_principal)).unwrap().unwrap();
+    let worker = tokio::spawn(async move { guard.run(std::future::pending::<()>()).await });
+    assert!(ticket.cancel_for_cause(CancelCause::CredentialRevoked));
+    let (tx, mut rx) = outbound_channel();
+    finish_cancel(home.path(), Some(&broker), &sessions, "s", "bot", &ticket,
+        &TurnSink::new(tx, "s", None, "m"), Ok(())).await;
+    worker.await.unwrap().unwrap_err();
+    let Message::Text(text) = rx.recv().await.unwrap().message else { panic!() };
+    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(frame["code"], "cancelled");
+    assert!(frame.get("downstream_ref").is_none());
+}

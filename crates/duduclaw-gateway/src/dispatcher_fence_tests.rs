@@ -1065,3 +1065,318 @@ async fn cancelled_webchat_pending_delegation_never_dispatches_other_turn_does()
 async fn cancelled_webchat_racing_enqueue_is_dropped_before_dispatch() {
     cancelled_webchat_delegation_dispatch(true).await;
 }
+
+#[tokio::test]
+async fn downstream_sqlite_running_stop_is_terminal_and_callback_is_untouched() {
+    let rig = Rig::new().await;
+    let key = uuid::Uuid::new_v4().to_string();
+    let conn = rusqlite::Connection::open(rig.dir.path().join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
+        VALUES (?1,'alice','alice',?1,datetime('now'),'s','t','user:owner')", [&key]).unwrap();
+    conn.execute("INSERT INTO delegation_callbacks(message_id,agent_id,channel_type,channel_id,created_at)
+        VALUES (?1,'alice','webchat','s',datetime('now'))", [&key]).unwrap();
+    let gate = test_hooks::install("downstream_runtime", &key);
+    model_call_probe::set_dry_run(true);
+    let dispatch = rig.poll();
+    let stop = async {
+        gate.arrived.wait().await;
+        assert_eq!(crate::downstream_runs::count(rig.dir.path(), "s", "t", "user:owner"), 1);
+        let result = crate::downstream_runs::stop(rig.dir.path(), "s", "t", "user:owner",
+            std::time::Duration::from_secs(2), "test").await;
+        assert_eq!(result.stopped, 1);
+        assert_eq!(result.still_stopping, 0);
+    };
+    tokio::join!(dispatch, stop);
+    model_call_probe::set_dry_run(false);
+    let row = rig.queue.get_by_id(&key).await.unwrap().unwrap();
+    assert_eq!(row.status, MessageStatus::Failed);
+    assert_eq!(row.error.as_deref(), Some(crate::downstream_runs::STOPPED));
+    assert!(row.response.is_none());
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1", [&key], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    rig.queue.reset_to_pending(&key).await.unwrap();
+    sweep_stale_messages(&rig.queue).await.unwrap();
+    assert_eq!(rig.queue.get_by_id(&key).await.unwrap().unwrap().status, MessageStatus::Failed);
+}
+
+#[tokio::test]
+async fn downstream_register_before_fence_closes_cancel_race() {
+    let rig = Rig::new().await;
+    let key = uuid::Uuid::new_v4().to_string();
+    let conn = rusqlite::Connection::open(rig.dir.path().join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id)
+        VALUES (?1,'alice','alice','work',datetime('now'),'s','t')", [&key]).unwrap();
+    let gate = test_hooks::install("downstream_registered", &key);
+    let broker = crate::approval::ApprovalBroker::open(rig.dir.path()).unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    tokio::join!(rig.poll(), async {
+        gate.arrived.wait().await;
+        assert_eq!(crate::downstream_runs::count(rig.dir.path(), "s", "t", "user:owner"), 1);
+        broker.withdraw_turn_for_principal("s", "t", Some("user:owner")).await.unwrap();
+        gate.release.wait().await;
+    });
+    assert_eq!(model_call_probe::calls(), before);
+    model_call_probe::set_dry_run(false);
+    assert_eq!(rig.queue.get_by_id(&key).await.unwrap().unwrap().status, MessageStatus::Failed);
+}
+
+#[tokio::test]
+async fn downstream_bus_stop_writes_no_response_or_retry_and_preserves_callback() {
+    let rig = Rig::new().await;
+    let key = uuid::Uuid::new_v4().to_string();
+    let conn = rusqlite::Connection::open(rig.dir.path().join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO delegation_callbacks(message_id,agent_id,channel_type,channel_id,created_at)
+        VALUES (?1,'alice','webchat','s',datetime('now'))", [&key]).unwrap();
+    let message = serde_json::json!({"type":"agent_message", "message_id":key, "agent_id":"alice",
+        "payload":key, "timestamp":Utc::now().to_rfc3339(), "sender_agent":"cron", "origin_agent":null,
+        "session_id":"s", "turn_id":"t", "on_behalf_of":"user:owner"});
+    std::fs::write(rig.dir.path().join("bus_queue.jsonl"), format!("{message}\n")).unwrap();
+    let gate = test_hooks::install("downstream_runtime", &key);
+    model_call_probe::set_dry_run(true);
+    tokio::join!(async { poll_and_dispatch(rig.dir.path(), &rig.registry, None, None).await.unwrap(); }, async {
+        gate.arrived.wait().await;
+        let result = crate::downstream_runs::stop(rig.dir.path(), "s", "t", "user:owner",
+            std::time::Duration::from_secs(2), "test").await;
+        assert_eq!(result.stopped, 1);
+    });
+    model_call_probe::set_dry_run(false);
+    assert!(std::fs::read_to_string(rig.dir.path().join("bus_queue.jsonl")).unwrap().trim().is_empty());
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1", [&key], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    poll_and_dispatch(rig.dir.path(), &rig.registry, None, None).await.unwrap();
+    assert!(std::fs::read_to_string(rig.dir.path().join("bus_queue.jsonl")).unwrap().trim().is_empty());
+}
+
+#[test]
+fn downstream_coalescing_never_crosses_origin_pairs() {
+    let base = serde_json::json!({"type":"agent_message", "message_id":"a", "agent_id":"alice",
+        "payload":"work", "timestamp":"now", "session_id":"s", "turn_id":"t"});
+    let a: BusMessage = serde_json::from_value(base).unwrap();
+    let mut b = a.clone(); b.message_id = "b".into(); b.turn_id = Some("other".into());
+    let mut c = a.clone(); c.message_id = "c".into(); c.session_id = Some("other".into());
+    assert_eq!(coalesce_messages(vec![a, b, c]).len(), 3);
+}
+
+#[tokio::test]
+async fn downstream_bus_fence_stops_foreign_principal_after_restart() {
+    let rig = Rig::new().await;
+    let broker = crate::approval::ApprovalBroker::open(rig.dir.path()).unwrap();
+    broker.withdraw_turn_for_principal("s", "t", Some("user:owner")).await.unwrap();
+    drop(broker);
+    let lines = ["user:owner", "user:other", "garbage", ""].into_iter().map(|principal| {
+        serde_json::json!({"type":"agent_message", "message_id":uuid::Uuid::new_v4().to_string(),
+            "agent_id":"alice", "payload":"work", "timestamp":Utc::now().to_rfc3339(),
+            "sender_agent":"cron", "origin_agent":null, "session_id":"s", "turn_id":"t",
+            "on_behalf_of":principal}).to_string()
+    }).collect::<Vec<_>>().join("\n");
+    std::fs::write(rig.dir.path().join("bus_queue.jsonl"), lines).unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    poll_and_dispatch(rig.dir.path(), &rig.registry, None, None).await.unwrap();
+    assert_eq!(model_call_probe::calls(), before);
+    model_call_probe::set_dry_run(false);
+    let output = std::fs::read_to_string(rig.dir.path().join("bus_queue.jsonl")).unwrap();
+    assert!(output.trim().is_empty());
+}
+
+#[tokio::test]
+async fn downstream_bus_admission_and_fence_errors_reply_instead_of_disappearing() {
+    for registration_failure in [false, true] {
+        let rig = Rig::new().await;
+        let home = rig.dir.path();
+        if registration_failure {
+            model_call_probe::fail_downstream_registration(Some(home));
+        } else {
+            std::fs::write(home.join("approvals.db"), "not a database").unwrap();
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = serde_json::json!({"type":"agent_message", "message_id":id, "agent_id":"alice",
+            "payload":"work", "timestamp":"now", "sender_agent":"cron", "session_id":"s", "turn_id":"t",
+            "spawned":true});
+        std::fs::write(home.join("bus_queue.jsonl"), format!("{row}\n")).unwrap();
+        let before = model_call_probe::calls();
+        model_call_probe::set_dry_run(true);
+        poll_and_dispatch(home, &rig.registry, None, None).await.unwrap();
+        model_call_probe::set_dry_run(false);
+        model_call_probe::fail_downstream_registration(None);
+        assert_eq!(model_call_probe::calls(), before);
+        let bus = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+        let reply: BusMessage = serde_json::from_str(bus.trim()).unwrap();
+        assert_eq!(reply.msg_type, "agent_response");
+        assert_eq!(reply.in_reply_to.as_deref(), Some(id.as_str()));
+        let error = DispatchError::Other(if registration_failure {
+            "Downstream run admission unavailable"
+        } else { "Origin turn cancellation check unavailable" }.into());
+        assert_eq!(reply.payload, dispatch_failure_reply(&error));
+        assert!(!reply.payload.is_empty(), "ordinary failures must reach the requester");
+        assert!(!reply.payload.contains("not a database"));
+        assert_eq!(crate::downstream_runs::count(home, "s", "t", "user:owner"), 0);
+    }
+}
+
+#[tokio::test]
+async fn downstream_dispatch_panic_unwinds_and_deregisters() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().to_owned();
+    let task = tokio::spawn(async move {
+        let guard = crate::downstream_runs::register(&path, Some("s"), Some("t"), None).unwrap();
+        cancellable_dispatch(guard.as_ref(), async { panic!("runtime panic") }).await
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert_eq!(crate::downstream_runs::count(home.path(), "s", "t", "user:owner"), 0);
+}
+
+#[tokio::test]
+async fn downstream_fence_and_pending_cleanup_ignore_unsigned_principals() {
+    let rig = Rig::new().await;
+    let home = rig.dir.path();
+    let broker = crate::approval::ApprovalBroker::open(home).unwrap();
+    broker.withdraw_turn_for_principal("s", "t", Some("user:owner")).await.unwrap();
+    let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+    for (id, principal) in [
+        ("background", None), ("same", Some("user:owner")),
+        ("foreign", Some("user:other")), ("garbage", Some("garbage")),
+    ] {
+        conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
+            VALUES (?1,'alice','alice','work',datetime('now'),'s','t',?2)",
+            rusqlite::params![id, principal]).unwrap();
+        let msg = rig.queue.get_by_id(id).await.unwrap().unwrap();
+        assert!(fence_cancelled_turn(home, &rig.queue, &msg).await.unwrap(), "{id}");
+    }
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
+        VALUES ('pending-foreign','alice','alice','work',datetime('now'),'s','t','user:other')", []).unwrap();
+    assert_eq!(rig.queue.cancel_pending_turn("s", "t").await.unwrap(), 1);
+    assert!(rig.queue.pending_messages(10).await.unwrap().is_empty());
+    assert_eq!(rig.queue.get_by_id("pending-foreign").await.unwrap().unwrap().status, MessageStatus::Failed);
+}
+
+#[tokio::test]
+async fn downstream_real_two_hop_inherits_scopes_and_stops_both_rails() {
+    let rig = Rig::new().await;
+    let home = rig.dir.path();
+    crate::trigger_route::tests::write_agent(&home.join("agents"), "alice", "Parent", "@alice", "main", "");
+    crate::trigger_route::tests::write_agent(&home.join("agents"), "bob", "Child", "@bob", "specialist", "");
+    let child_config = home.join("agents/bob/agent.toml");
+    let config = std::fs::read_to_string(&child_config).unwrap().replace("reports_to = \"\"", "reports_to = \"alice\"");
+    std::fs::write(child_config, config).unwrap();
+    rig.registry.write().await.scan().await.unwrap();
+    let b = uuid::Uuid::new_v4().to_string();
+    let c = uuid::Uuid::new_v4().to_string();
+    let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
+        VALUES (?1,'alice','alice',?1,datetime('now'),'origin-session','origin-turn','user:owner')", [&b]).unwrap();
+    let bgate = test_hooks::install("downstream_runtime", &b);
+    let cgate = test_hooks::install("downstream_runtime", &c);
+    model_call_probe::set_dry_run(true);
+    model_call_probe::delegate_on_run(&b, &c, "bob");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::join!(rig.poll(), async {
+        bgate.arrived.wait().await;
+        // C was created inside B's real dispatch scopes, without supplying
+        // a new scope or a pair from the test.
+        let bus = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+        let child: BusMessage = serde_json::from_str(bus.trim()).unwrap();
+        assert_eq!(child.message_id, c);
+        assert_eq!(child.agent_id, "bob");
+        assert_eq!(child.session_id.as_deref(), Some("origin-session"));
+        assert_eq!(child.turn_id.as_deref(), Some("origin-turn"));
+        assert_eq!(child.on_behalf_of.as_deref(), Some("user:owner"));
+        tokio::join!(async { poll_and_dispatch(home, &rig.registry, None, None).await.unwrap(); }, async {
+            cgate.arrived.wait().await;
+            assert_eq!(crate::downstream_runs::count(home, "origin-session", "origin-turn", "user:owner"), 2);
+            let result = crate::downstream_runs::stop(home, "origin-session", "origin-turn", "user:owner",
+                std::time::Duration::from_secs(2), "test").await;
+            assert_eq!(result, crate::downstream_runs::StopResult { stopped: 2, still_stopping: 0 });
+        });
+    });
+    }).await.expect("both real rails must enter and stop");
+    model_call_probe::set_dry_run(false);
+    let row = rig.queue.get_by_id(&b).await.unwrap().unwrap();
+    assert_eq!(row.status, MessageStatus::Failed);
+    assert_eq!(row.error.as_deref(), Some(crate::downstream_runs::STOPPED));
+    assert!(std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap().trim().is_empty());
+}
+
+#[tokio::test]
+async fn downstream_ephemeral_child_completion_keeps_two_queued_owner_tickets_and_replay_fences_cancel() {
+    use crate::ephemeral::{self, EphemeralSpawnSpec, EPHEMERAL_ADMISSION_CLASS as CLASS};
+    use duduclaw_core::spawn_admission::{self, AdmissionConfig};
+    let rig = Rig::new().await;
+    let home = rig.dir.path();
+    std::fs::write(home.join("config.toml"), "[dispatch]\nenabled = true\nephemeral_max_active = 3\n").unwrap();
+    crate::trigger_route::tests::write_agent(&home.join("agents"), "alice", "Parent", "@alice", "main",
+        "[capabilities]\nallowed_tools = [\"Read\"]\n");
+    rig.registry.write().await.scan().await.unwrap();
+    let cfg = AdmissionConfig::from_home(home);
+    let spec = EphemeralSpawnSpec { parent: "alice".into(), instruction: "Read report".into(),
+        tools: vec!["Read".into()], tier: "cheap".into() };
+    let mut children = Vec::new();
+    // The same admission boundaries as spawn_ephemeral: three admitted
+    // scaffolds followed by two capacity-refused requests in the real queue.
+    for i in 0..5 {
+        match ephemeral::scaffold(home, &spec) {
+            Ok(child) => children.push(child),
+            Err(error) => {
+                assert!(error.starts_with(ephemeral::EPHEMERAL_CAPACITY_ERROR_PREFIX), "{error}");
+                let outcome = spawn_admission::enqueue(home, CLASS, &cfg, Some("origin-turn"),
+                    serde_json::json!({"parent":"alice", "instruction":"Read report", "context":format!("queued-{i}"),
+                        "tools":["Read"], "tier":"cheap", "origin":"alice", "outgoing_depth":1,
+                        "turn_id":"origin-turn", "session_id":"origin-session", "on_behalf_of":"user:owner",
+                        "spawned":true})).unwrap();
+                assert!(matches!(outcome, spawn_admission::EnqueueOutcome::Queued { .. }));
+            }
+        }
+    }
+    assert_eq!(children.len(), 3);
+    assert_eq!(spawn_admission::queue_depth(home, CLASS), 2);
+    let origin_guard = crate::downstream_runs::register(home, Some("origin-session"), Some("origin-turn"), Some("user:owner")).unwrap();
+    let child = serde_json::json!({"type":"agent_message", "message_id":"first-child", "agent_id":children[0].agent_id,
+        "payload":"child work", "timestamp":"now", "sender_agent":"alice", "origin_agent":"alice",
+        "session_id":"origin-session", "turn_id":"origin-turn", "spawned":true, "on_behalf_of":"user:owner"});
+    std::fs::write(home.join("bus_queue.jsonl"), format!("{child}\n")).unwrap();
+    model_call_probe::set_dry_run(true);
+    let before = model_call_probe::calls();
+    poll_and_dispatch(home, &rig.registry, None, None).await.unwrap();
+    assert_eq!(model_call_probe::calls(), before + 1);
+    assert_eq!(spawn_admission::queue_depth(home, CLASS), 2, "a child's completion must not purge its live origin's queued work");
+    assert_eq!(crate::downstream_runs::count(home, "origin-session", "origin-turn", "user:owner"), 1);
+    // A replayed child also cannot conclude its owner. Release exactly one
+    // slot so there is still one queued ticket when that replay completes.
+    std::fs::remove_dir_all(children.remove(0).dir).unwrap();
+    assert_eq!(ephemeral::drain_admission_queue(home).await.admitted, 1);
+    assert_eq!(spawn_admission::queue_depth(home, CLASS), 1);
+    poll_and_dispatch(home, &rig.registry, None, None).await.unwrap();
+    assert_eq!(model_call_probe::calls(), before + 2);
+    assert_eq!(spawn_admission::queue_depth(home, CLASS), 1, "a replayed child's completion must preserve its owner's remaining ticket");
+    let broker = crate::approval::ApprovalBroker::open(home).unwrap();
+    broker.withdraw_turn_for_principal("origin-session", "origin-turn", Some("user:owner")).await.unwrap();
+    // Free capacity as GC would, then replay the remaining cancelled ticket.
+    for child in children { std::fs::remove_dir_all(child.dir).unwrap(); }
+    assert_eq!(ephemeral::drain_admission_queue(home).await.admitted, 1);
+    let bus = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+    let replayed = bus.lines().map(|line| serde_json::from_str::<BusMessage>(line).unwrap())
+        .filter(|m| m.msg_type == "agent_message").collect::<Vec<_>>();
+    assert_eq!(replayed.len(), 1);
+    assert!(replayed.iter().all(|m| m.spawned));
+    poll_and_dispatch(home, &rig.registry, None, None).await.unwrap();
+    assert_eq!(model_call_probe::calls(), before + 2, "cancelled queued tickets must be fenced on replay");
+    let bus = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+    assert_eq!(bus.lines().count(), 2, "only the completed children's responses remain");
+    assert_eq!(spawn_admission::queue_depth(home, CLASS), 0);
+    model_call_probe::set_dry_run(false);
+    drop(origin_guard);
+}
+
+#[test]
+fn downstream_spawn_marker_survives_coalescing_without_changing_legacy_rows() {
+    let a: BusMessage = serde_json::from_value(serde_json::json!({"type":"agent_message",
+        "message_id":"legacy", "agent_id":"alice", "payload":"work", "timestamp":"now",
+        "session_id":"s", "turn_id":"t"})).unwrap();
+    assert!(!a.spawned);
+    let mut b = a.clone(); b.spawned = true; b.message_id = "child-1".into();
+    let mut c = b.clone(); c.message_id = "child-2".into();
+    let merged = coalesce_messages(vec![a, b, c]);
+    assert_eq!(merged.len(), 2);
+    assert!(!merged[0].spawned);
+    assert!(merged[1].spawned);
+    assert_eq!(merged[1].coalesced_ids, vec!["child-2"]);
+}

@@ -472,3 +472,39 @@ fn paused_parent_cannot_create_scaffold_or_capacity_ticket() {
     duduclaw_core::autonomy_gate::set_pause(home, Some("boss"), "test", "operator").unwrap();
     assert!(check_parent_autonomy(home, &member.agent_id).is_err());
 }
+
+#[tokio::test]
+async fn downstream_admission_replay_preserves_principal_lane_and_drops_half_pair() {
+    for half in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_parent(home, "boss", "");
+        let cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home);
+        let mut payload = queued_ephemeral_payload("boss", "helper", "context");
+        payload["turn_id"] = serde_json::json!("origin-turn");
+        if !half {
+            payload["session_id"] = serde_json::json!("webchat:person#agent:boss");
+        }
+        payload["on_behalf_of"] = serde_json::json!("user:owner");
+        payload["lane"] = serde_json::json!("explore");
+        duduclaw_core::spawn_admission::enqueue(
+            home, EPHEMERAL_ADMISSION_CLASS, &cfg, Some("origin-turn"), payload,
+        ).unwrap();
+        assert_eq!(drain_admission_queue(home).await.admitted, 1);
+        let bus = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+        let row: serde_json::Value = serde_json::from_str(bus.trim()).unwrap();
+        assert_eq!(row["on_behalf_of"], "user:owner");
+        assert_eq!(row["lane"], "explore");
+        assert_eq!(row["upstream_unknown"].as_bool().unwrap_or(false), half);
+        if half {
+            assert!(row.get("turn_id").is_none());
+            assert!(row.get("session_id").is_none());
+            let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+            assert!(audit.contains("bus_upstream_identity_dropped"));
+            assert!(audit.contains("session_id"));
+        } else {
+            assert_eq!(row["turn_id"], "origin-turn");
+            assert_eq!(row["session_id"], "webchat:person#agent:boss");
+        }
+    }
+}

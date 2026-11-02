@@ -49,3 +49,37 @@ pub(crate) fn record(_site: &'static str) {
 pub(crate) fn calls() -> usize {
     CALLS.with(Cell::get)
 }
+
+thread_local! {
+    static BUS_DELEGATION: RefCell<Option<(String, String, String)>> = const { RefCell::new(None) };
+    static REGISTRATION_FAILURE: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn fail_downstream_registration(home: Option<&std::path::Path>) {
+    REGISTRATION_FAILURE.with(|h| *h.borrow_mut() = home.map(std::path::Path::to_path_buf));
+}
+pub(crate) fn downstream_registration_fails(home: &std::path::Path) -> bool {
+    REGISTRATION_FAILURE.with(|h| h.borrow().as_deref() == Some(home))
+}
+
+/// One dry-run runtime emits a delegation using its actual host scopes.
+pub(crate) fn delegate_on_run(parent_prompt: &str, child_id: &str, target: &str) {
+    BUS_DELEGATION.with(|d| *d.borrow_mut() = Some((parent_prompt.into(), child_id.into(), target.into())));
+}
+pub(crate) async fn capture_bus_delegation(home: &std::path::Path, prompt: &str, agent: &str) {
+    let child = BUS_DELEGATION.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.as_ref().is_some_and(|(p, _, _)| p == prompt) { d.take().map(|(_, id, target)| (id, target)) } else { None }
+    });
+    let Some((id, target)) = child else { return; };
+    let (turn, session, missing) = crate::memory_provenance::complete_upstream_pair(
+        duduclaw_memory::feedback::CURRENT_TURN_ID.with(Clone::clone),
+        duduclaw_memory::feedback::CURRENT_SESSION_ID.with(Clone::clone),
+    );
+    assert!(missing.is_none());
+    let row = serde_json::json!({"type":"agent_message", "message_id":id, "agent_id":target,
+        "payload":id, "timestamp":chrono::Utc::now().to_rfc3339(), "sender_agent":agent,
+        "origin_agent":agent, "session_id":session, "turn_id":turn,
+        "on_behalf_of":crate::on_behalf_of::current()});
+    crate::dispatcher::append_line(&home.join("bus_queue.jsonl"), &row.to_string()).await.unwrap();
+}

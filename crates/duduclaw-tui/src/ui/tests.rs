@@ -1086,3 +1086,75 @@ fn full_stalled_child_queue_still_reads_escape_resize_and_quit() {
         release.send(()).unwrap();
     }
 }
+
+
+fn downstream_app(now: std::time::Instant) -> App {
+    let mut app = App::default();
+    app.blocks.open(crate::chat::Block::Chat, None);
+    app.chat.connected = true;
+    app.chat.stale = false;
+    app.chat.running = true;
+    app.chat.apply_at(crate::chat::Frame::parse(
+        r#"{"type":"error","code":"cancelled","downstream_running":2,"downstream_ref":"opaque-never-render"}"#
+    ).unwrap(), now);
+    app
+}
+
+#[test]
+fn downstream_answer_requires_list_focus_and_is_single_use() {
+    use crate::chat::Focus;
+    let now = std::time::Instant::now();
+    let model = empty();
+    let mut app = downstream_app(now);
+    app.focus = Focus::Input;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    for c in ['y', 'n'] {
+        assert_eq!(app.key_at(key(KeyCode::Char(c)), &model, now, 0), Action::None);
+    }
+    assert_eq!(app.input, "yn");
+    assert!(app.downstream_prompt(now).is_some());
+    assert!(!app.commands(&model).iter().any(|c| c.key.code == KeyCode::Char('y')));
+    app.key_at(key(KeyCode::Esc), &model, now, 0);
+    assert_eq!(app.focus, Focus::List);
+    assert!(app.commands(&model).iter().any(|c| c.key.code == KeyCode::Char('y')));
+    assert_eq!(app.key_at(key(KeyCode::Char('y')), &model, now, 0), Action::CancelDownstream("opaque-never-render".into()));
+    assert!(app.downstream_prompt(now).is_none());
+    // A watch update can still contain the offer while the command is queued.
+    app.chat = downstream_app(now).chat;
+    assert_eq!(app.key_at(key(KeyCode::Char('y')), &model, now, 0), Action::None);
+    assert!(app.downstream_prompt(now).is_none());
+}
+
+#[test]
+fn downstream_decline_escape_expiry_and_disconnect_send_no_stop() {
+    let now = std::time::Instant::now();
+    let model = empty();
+    for code in [KeyCode::Char('n'), KeyCode::Esc] {
+        let mut app = downstream_app(now);
+        assert_eq!(app.key_at(KeyEvent::new(code, KeyModifiers::NONE), &model, now, 0),
+            Action::DismissDownstream("opaque-never-render".into()));
+        assert!(app.downstream_prompt(now).is_none());
+    }
+    let mut app = downstream_app(now);
+    let expired = now + crate::chat::DOWNSTREAM_TTL;
+    assert_eq!(app.key_at(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &model, expired, 0), Action::None);
+    assert!(app.downstream_prompt(expired).is_none());
+    app.chat.disconnected();
+    assert_eq!(app.key_at(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &model, now, 0), Action::None);
+}
+
+#[test]
+fn downstream_prompt_snapshots_preserve_focus_and_hide_reference() {
+    let now = std::time::Instant::now();
+    let mut app = downstream_app(now);
+    app.focus = crate::chat::Focus::Input;
+    assert!(app.downstream_prompt(now).is_some());
+    let output = screen(&empty(), &app, &Settings::default(), 240, 24);
+    assert!(output.contains(strings::DOWNSTREAM_INPUT_HINT));
+    assert!(output.contains(&strings::downstream_prompt(2)));
+    assert!(!output.contains("opaque-never-render"));
+    assert_eq!(app.focus, crate::chat::Focus::Input);
+    insta::assert_snapshot!("downstream_prompt_input", output);
+    app.focus = crate::chat::Focus::List;
+    insta::assert_snapshot!("downstream_prompt_list", screen(&empty(), &app, &Settings::default(), 240, 24));
+}

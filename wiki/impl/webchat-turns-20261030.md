@@ -2,7 +2,7 @@
 
 > 原始日誌只留在本機 `artifacts/`，未進 repo；內文指向 `round*-logs/` 的連結不會解析。
 
-日期：2026-10-30。以下先保留第一輪歷史紀錄（當時狀態 PARTIAL）；最新修正與驗證請見下方 **Round 6**。
+日期：2026-10-30。以下先保留第一輪歷史紀錄（當時狀態 PARTIAL）；後續修正與驗證見各輪紀錄；2026-11-02 新增的下游停止協定見文末，與歷史測試結果分開記錄。
 
 分支 `feat/webchat-concurrent-turns-20261030`，HEAD `8d30a212`。未 commit、push、stash、切分支、發版或移除使用者提供的 worktree。
 
@@ -524,8 +524,8 @@ warning: `duduclaw-gateway` (lib test) generated 54 warnings (48 duplicates)
 
 ### 首輪驗證與 fixture 修正
 
-- `CARGO_INCREMENTAL=0 cargo check -j 3 -p duduclaw-gateway --tests` 首輪 exit 0（2m 36s），reader recovery 更新後再跑 exit 0（2m 26s）。原始日誌：`/private/tmp/duduclaw-credential-check.log`、`/private/tmp/duduclaw-credential-check-final.log`。
-- 固定 `DUDUCLAW_P1_PILOT_BINARY=/Users/lizhixu/Project/DuDuClaw-wt-merge/target/debug/duduclaw`，執行 `CARGO_INCREMENTAL=0 cargo test -j 3 -p duduclaw-gateway --lib -- --test-threads=4 webchat approval --nocapture`。建置 6m 08s，exit 101：`test result: FAILED. 471 passed; 13 failed; 0 ignored; 0 measured; 10111 filtered out; finished in 14.64s`。日誌：`/private/tmp/duduclaw-credential-tests.log`。
+- `CARGO_INCREMENTAL=0 cargo check -j 3 -p duduclaw-gateway --tests` 首輪 exit 0（2m 36s），reader recovery 更新後再跑 exit 0（2m 26s）。
+- 固定 `DUDUCLAW_P1_PILOT_BINARY=/Users/lizhixu/Project/DuDuClaw-wt-merge/target/debug/duduclaw`，執行 `CARGO_INCREMENTAL=0 cargo test -j 3 -p duduclaw-gateway --lib -- --test-threads=4 webchat approval --nocapture`。建置 6m 08s，exit 101：`test result: FAILED. 471 passed; 13 failed; 0 ignored; 0 measured; 10111 filtered out; finished in 14.64s`。
 - 其中一項是本輪新增 fixture 錯誤：`credential_revocation_drops_work_and_fences_even_without_socket` 在 `reply_ctx` 掃描前沒有建立 `agents` 目錄，尚未進入憑證測試本體。已在 `credential_fixture` 補 `create_dir_all`；產品程式沒有再修改。修正後重新跑 check 與完整指定測試，結果另記。
 - 另外 12 個 harness failure 都在 socket bind 時收到 `PermissionDenied: Operation not permitted`，情境列 NOT RUN。WebChat TCP 案例雖顯示 ok，實際輸出 `NOT RUN: WebChat TCP integration: loopback bind denied by sandbox: Operation not permitted (os error 1)`，同樣列 NOT RUN。首輪其餘六個新增測試通過，沒有將首輪 fixture failure 混成環境問題。
 
@@ -558,7 +558,7 @@ warning: `duduclaw-gateway` (lib test) generated 54 warnings (48 duplicates)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 32s
 ```
 
-日誌：`/private/tmp/duduclaw-credential-check-fixed.log`。指定測試完整重跑的日誌為 `/private/tmp/duduclaw-credential-tests-fixed.log`，命令與 exit／耗時保存在 `/private/tmp/duduclaw-credential-fixed-results.json`。
+指定測試完整重跑的日誌由 reviewer 保存。
 
 共用主機上，以 `lsof -a -c cargo -d cwd` 觀察到 `DuDuClaw-wt-v178-integ` 也有 Cargo 在執行。本 session 自己的 Cargo 全部串行、`-j 3`、`CARGO_INCREMENTAL=0`，沒有干預其他工作樹，不宣稱整台主機全程只有一個 Cargo。
 
@@ -575,3 +575,46 @@ test result: FAILED. 472 passed; 12 failed; 0 ignored; 0 measured; 10111 filtere
 最終狀態為 **PARTIAL（程式與可執行測試通過，13 項 socket 行為待 Claude 沙箱外驗收；TUI 原始碼不在 checkout）**。最後測試後只更新本紀錄，沒有再修改程式。分支維持 `feat/webchat-concurrent-turns-20261030`；未提交、推送、stash、切分支、執行 workspace fmt／clippy 或啟動子代理；`git diff --check` exit 0。本 session 沒有建立 worktree，保留交付的工作樹。
 
 - 交付與憑證撤銷取消共用 registry 鎖：取消先取得鎖便拒絕 begin_delivery；交付先取得鎖便停止憑證輪詢並保持監看 future pending，讓 send_terminal 以最新憑證檢查完成拒絕與封存回復；補交付優先、取消優先、競態及真實 execute 入口核准撤回測試；cargo check --tests 通過，指定 webchat 測試回報 167 passed／0 failed（實際通過 166 項，另 1 項 TCP bind 遭沙箱拒絕，列 NOT RUN），新增四項皆通過。
+
+
+## 2026-11-02：取消後詢問是否停止下游交辦
+
+本節記錄 `feat/cancel-propagation-20261102` 的新增協定與邊界；上述歷史測試數字不代表本次變更的驗證結果。本次的實際測試、socket NOT RUN 與 runtime 清理限制由交付報告逐項列出。
+
+### 協定與 TUI
+
+真人 `cancel` 仍先停止原回合、提交取消 tombstone、撤回 pending approvals 並終結 pending queue rows。`cancel_accepted` 維持 best effort，不保證早於終態；真正終態是 `type: error, code: cancelled`，不是獨立的 `type: cancelled`。原有 `approved_before_cancel`、`delegations_cancelled`、`request_id` 保留。只有可停止的下游執行數大於零時，才加上 `downstream_running` 及 opaque UUID `downstream_ref`；沒有工作時省略兩欄，保留原有訊框形狀。不把員工名稱、工作內容或 message id 傳給用戶端。
+
+Offer 保存在 TurnRegistry 記憶體中，綁定 user、principal、sid、turn、expiry；TTL 10 分鐘、單次使用、每人及全域有上限，滿時逐出最舊項目。gateway 重啟後 offer 消失，既有持久 tombstone 保留。未知、外人、過期及已消耗的 ref 回相同 `downstream_ref_unknown` body，避免探測存在性。Widget 不取得 offer，也不能要求停止員工工作。
+
+新請求為 `{"type":"cancel_downstream","downstream_ref":"<opaque uuid>","request_id":"<optional id>"}`。依 admission 規則重查 live credential；Revoked 仍消耗符合的 offer 並停止其執行，無論 ref 是否存在均回相同 `credential_revoked` 錯誤；Unavailable 回可重試的 `credential_check_unavailable`，不把查詢失敗當成撤銷。先嚴格解析 UUID，無效時不查憑證、不 spawn，回相同 unknown 錯誤。每條 socket 最多一個進行中的停止請求，以 RAII permit 在完成或 panic 時釋放；忙碌時回可重試 `downstream_stop_busy`，TUI 顯示普通訊息並保留未完成的請求。停止放在 spawned task，socket read loop 不等待；最多等 15 秒後回 `{"type":"downstream_stopped","request_id":"<id>","stopped":N,"still_stopping":M}`。取消原因明確區分真人與 credential revocation；後者在回合仍執行中，或撤銷後收到停止請求時停止可追溯的下游執行，留下稽核。已完成回合的工作，以及無人回答的 offer，不會自動停止。
+
+TUI 從 `error`／`cancelled` 接受 offer，顯示「還有 N 位員工的工作還在跑，要一起停嗎？ y 停止／n 讓它們跑完」，ref 不進畫面。只在清單焦點接受 `y` 並只送一個停止訊框；`n`／`Esc` 關閉，不發 decline。輸入焦點的 `y`／`n` 是普通文字，狀態列提示回答方式；新輸出不改焦點。10 分鐘到期或斷線清除詢問。數量以數值解析並夾限，所有顯示文字走 `TerminalText`。結果為「已停止 N 項」，必要時加「M 項還在收尾」；unknown ref 顯示「這個詢問已失效，下游工作不受影響」。
+
+### 派工與身分邊界
+
+新增 in-process `downstream_runs` registry 以精確 `(session, turn)` 記錄執行、取消 token 與完成訊號；RAII guard 在正常結束、drop 及 unwind 時釋放。SQLite 與 JSONL 兩條 rail 均須先 register，再檢查最後的取消 fence，並以取消優先的 select drop dispatch future。停止後保留 H19 等 turn-end cleanup，但不消耗／轉送 callback、不產生錯誤替代回覆、prediction、session reply 或重試。queue 使用 failed 終態與 `stopped with origin turn` 原因。JSONL 不寫 response／retry line。完成訊號必須代表停止已確認；仍無法確認的工作只能計為 `still_stopping`。
+
+WebChat 有 `on_behalf_of`：`run.rs` 帶入已驗證帳號，`channel_reply/guarded.rs` 經 `requester_for_reply` 得到 `DashboardUser`，再由 `on_behalf_of::principal_for_requester` 寫成 `user:<auth_user>`。dispatcher 讀取已存值時使用相同的 `HumanPrincipal` 表示；只有 Human 且歸屬不同人的工作才不計數、不停止並稽核；Unknown（含 malformed）與 Background 都可停止。principal 比對只適用於停止已執行工作，絕不用於 fence 或 pending cleanup；tombstone 命中一律封鎖，不採信未簽章的 `on_behalf_of` 放行。Widget 的 lineage principal 透過相同 `map_requester` 與 `principal_for_requester` 產生 `unmapped:widget:<digest>`，與 admission／核准撤回沿用的 IP 配額鍵分開。無法計算時採不匹配任何 Human 的值。來源環境變數未簽章，因此比對只縮小可停止範圍，不能作為對抗同 UID、不受限 Bash 的隔離。
+
+WebChat 在 admission 前用 `compose_session_id` 決定 `#agent`／`#conv`，ticket 與 `TurnInput` 共用同一字串，`run.rs` 再交給 reply builder。`inner.rs` 只有 `via_trigger || own_bot` 才額外呼叫 `called_session`；WebChat 已處理 routing，並未設定 `as_called_turn`，因此選取具名員工的現有路徑不應多接一次 suffix。新增 `webchat_named_employee_ticket_and_delegation_share_exact_session_and_turn`，透過 MemoryListener 的真 auth／admission／reply pipeline 同時覆蓋 explicit agent 與 `@` 路由；model seam 從相同的 host lineage scope 寫入實際 MessageQueue，再比對 ticket、queue row、取消終態及 tombstone。測試不綁定 socket；執行結果由本次交付報告列出。
+
+`spawn_agent`、`spawn_ephemeral` 與 `send_to_agent` 一樣，經 `complete_upstream_pair` 攜帶完整來源；半對來源丟棄並稽核，保持 `upstream_unknown` 記憶來源語意。spawn 與 admission replay 工作帶 host 寫入的 `spawned` 標記，子執行結束不會觸發來源回合的 H19 `invalidate_owner`。coalesce key 包含 session／turn 與 spawned，避免跨來源或執行類型合併。
+
+每次停止請求使用 `append_tool_call_with_extras` 記錄 principal、turn、count、cause，不記工作內容或秘密。公開 dashboard 沒有取消按鈕，此次協定由 TUI 使用，未新增 web UI。
+
+### Runtime 清理確認與目前限制
+
+`duduclaw_core::process_tree` 新增 cleanup observer，讓下游 registry 的完成回報能同時等待 future drop 與子行程清理。在 Unix，送出 kill 不算完成，會觀察整個 process group 是否消失；正常回收 leader 也不等於其 descendants 都已離開。「已停止」表示受管理的行程群組與使用中的任務沙箱容器已消失；刻意以 `setsid` 離開群組的程序不在檢查範圍，除非員工在任務沙箱內執行。15 秒回覆期限內仍未確認時列 `still_stopping`。task sandbox 另外等待容器清理確認，不能把 Docker client 結束當成容器已停止。
+
+Windows 的現有 `WindowsJob` API 在要求 terminate／關閉 handle 後沒有可用的 active-process-count 查詢，無法證明整棵程序樹已退出。因此遭取消的子行程 run 即使已要求終止，仍保守回報 `still_stopping`，不計為 `stopped`。此限制需後續 Windows 原生清理確認機制處理；不以 kill request 或 handle close 宣稱成功。
+
+Claude、Codex、Grok 與 OpenAI-compat 是現存 runtime；本次需逐條確認各自的程序／MCP 清理。Gemini CLI 已於 v1.75.0 移除、Antigravity runtime 已於 v1.77.1 移除，沒有 `dispatch_to_agent_outcome` 可走的 runtime 路徑；Gemini API provider 仍在。遠端 HTTP／工具動作已送出時，停止本機 future 不能撤回提供者已接收或已執行的動作。
+
+Discovery 子行程改走 core guarded spawn，讓取消使用相同的程序樹 guard 與 cleanup observer。Ephemeral dispatch 的 completion marker 改由 RAII 在 handoff 被取消／drop 時也留下，避免正常 await 後才寫 marker 所造成的漏記。這些變更是清理與回報機制，不能直接推稱 Linux、macOS、Windows、Docker 或真 provider 的實機驗收通過；各項實際測試結果另列於交付報告。
+
+### 不回答時及不追蹤項目
+
+不回答、按 `n` 或關閉詢問會讓正在執行的交辦繼續；既有 tombstone 有效期間，帶有該取消回合來源的資料列會被 fence 封鎖，不能再交辦或新增核准。刻意丟棄或偽造 lineage 的執行不會被追蹤。已執行的外部動作無法追回。任務板任務及目標沒有這條回合來源鏈，不追蹤、不變更 task-board stop。遺失 lineage 的執行找不到；其他回合、其他 session、歸屬他人的工作不受影響。Offer 只有 10 分鐘，且不跨 gateway 重啟保存。各 runtime、程序樹、task-sandbox container 的停止結果須分開驗證，不能由 future drop 或單元測試直接推稱原生／provider 驗收完成。
+
+若取消發生在 Docker create 尚未回覆時，即使事後按名稱查不到容器，仍可能有尚在 daemon 端提交的建立請求；此情況保守列為 `still_stopping`，不宣稱已停止。現有 task-sandbox deadline／殘留回收機制仍保留。

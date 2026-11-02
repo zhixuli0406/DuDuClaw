@@ -12,6 +12,21 @@ pub(crate) async fn spawn_agent_with_ctx(
     caller: &str,
     ctx: DelegationContext,
 ) -> Value {
+    spawn_agent_with_ctx_and_upstream(
+        params, home_dir, caller, ctx,
+        (std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+         std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
+    ).await
+}
+
+/// Inject the host upstream identity without process-global environment mutation.
+pub(crate) async fn spawn_agent_with_ctx_and_upstream(
+    params: &Value,
+    home_dir: &Path,
+    caller: &str,
+    ctx: DelegationContext,
+    upstream: (Option<String>, Option<String>),
+) -> Value {
     let agent_id = params
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -116,6 +131,7 @@ pub(crate) async fn spawn_agent_with_ctx(
         "sender_agent": caller,
     });
     let mut entry = entry;
+    stamp_spawn_upstream(&mut entry, home_dir, caller, &task_id, upstream);
     // A run in the explore lane hands read-only work on: the dispatcher
     // reads this like `message_queue.lane`.
     if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
@@ -234,6 +250,21 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
     caller: &str,
     ctx: DelegationContext,
 ) -> Value {
+    spawn_ephemeral_with_ctx_and_upstream(
+        params, home_dir, caller, ctx,
+        (std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+         std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
+    ).await
+}
+
+/// Inject the host upstream identity without process-global environment mutation.
+pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
+    params: &Value,
+    home_dir: &Path,
+    caller: &str,
+    ctx: DelegationContext,
+    upstream: (Option<String>, Option<String>),
+) -> Value {
     let instruction = params
         .get("instruction")
         .and_then(|v| v.as_str())
@@ -304,6 +335,7 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
     }
     let origin = ctx.origin.as_deref().unwrap_or(caller).to_string();
 
+    let task_id = uuid::Uuid::new_v4().to_string();
     // ── Scaffold (fail-closed capability subsetting inside) ─────────────
     let spec = duduclaw_gateway::ephemeral::EphemeralSpawnSpec {
         parent: parent.clone(),
@@ -354,10 +386,8 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
             // already read), absent for dispatch kinds that don't carry one
             // (cron/heartbeat/goal-loop) — those queued tickets are simply
             // never touched by turn-based invalidation, only by TTL.
-            let owner_key = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID)
-                .ok()
-                .filter(|s| !s.is_empty());
-            let payload = serde_json::json!({
+            let owner_key = upstream.0.clone().filter(|s| !s.is_empty());
+            let mut payload = serde_json::json!({
                 "parent": spec_for_admission_queue.parent,
                 "instruction": spec_for_admission_queue.instruction,
                 "tools": spec_for_admission_queue.tools,
@@ -367,6 +397,13 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
                 "outgoing_depth": outgoing_depth,
                 "incoming_hop": incoming_hop_for_admission_queue,
             });
+            stamp_spawn_upstream(&mut payload, home_dir, caller, &task_id, upstream);
+            if let Some(principal) = host_on_behalf_of(home_dir, caller) {
+                payload["on_behalf_of"] = serde_json::json!(principal);
+            }
+            if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+                payload["lane"] = serde_json::json!(lane);
+            }
             let _admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
                 Ok(guard) => guard,
                 Err(reason) => return tool_error(&reason),
@@ -449,7 +486,6 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
     };
 
     // ── Enqueue on the bus — identical shape to spawn_agent ─────────────
-    let task_id = uuid::Uuid::new_v4().to_string();
     let queue_path = home_dir.join("bus_queue.jsonl");
     let entry = serde_json::json!({
         "type": "agent_message",
@@ -465,6 +501,10 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
         "sender_agent": parent,
     });
     let mut entry = entry;
+    stamp_spawn_upstream(&mut entry, home_dir, caller, &task_id, upstream);
+    if let Some(principal) = host_on_behalf_of(home_dir, caller) {
+        entry["on_behalf_of"] = serde_json::json!(principal);
+    }
     if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
         entry["lane"] = serde_json::json!(lane);
     }
@@ -537,5 +577,32 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
                 "isError": true
             })
         }
+    }
+}
+
+/// Bus lineage is host-owned and all-or-nothing, matching send_to_agent.
+fn stamp_spawn_upstream(
+    entry: &mut Value,
+    home: &Path,
+    caller: &str,
+    message_id: &str,
+    upstream: (Option<String>, Option<String>),
+) {
+    entry["spawned"] = serde_json::json!(true);
+    let (turn, session, missing) =
+        duduclaw_gateway::memory_provenance::complete_upstream_pair(upstream.0, upstream.1);
+    if let (Some(turn), Some(session)) = (turn, session) {
+        entry["turn_id"] = serde_json::json!(turn);
+        entry["session_id"] = serde_json::json!(session);
+    }
+    if let Some(missing) = missing {
+        entry["upstream_unknown"] = serde_json::json!(true);
+        duduclaw_gateway::memory_provenance::audit_upstream_identity(
+            home,
+            duduclaw_gateway::memory_provenance::AUDIT_UPSTREAM_DROPPED,
+            caller,
+            message_id,
+            missing,
+        );
     }
 }

@@ -592,3 +592,167 @@ async fn webchat_memory_socket_human_turn_remains_available_during_autonomy_paus
     fixture.turn_count(0).await;
     socket.close(None).await.unwrap();
 }
+
+#[tokio::test]
+async fn webchat_named_employee_ticket_and_delegation_share_exact_session_and_turn() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    crate::trigger_route::tests::write_agent(
+        &fixture._home.path().join("agents"),
+        "sales-rep", "Sales", "@sales-rep", "specialist", "",
+    );
+    fixture.state.ctx.registry.write().await.scan().await.unwrap();
+    fixture.gate.capture_delegations();
+    let token = fixture.user("lineage-owner");
+    let (mut socket, info) = fixture.connect(&token).await;
+    assert_eq!(info["type"], "session_info");
+    let base = info["session_id"].as_str().unwrap().to_owned();
+    let queue = crate::message_queue::MessageQueue::open(fixture._home.path()).unwrap();
+
+    // Exercise both explicit selection (the TUI route) and the gateway's
+    // @ route through real authentication, admission and the reply pipeline.
+    for (conv, content, selected) in [
+        ("selected", "Hello", Some("sales-rep")),
+        ("mentioned", "@sales-rep Hello", None),
+    ] {
+        send(&mut socket, json!({"type":"user_message", "content":content,
+            "agent":selected, "conv":conv, "msg_id":conv})).await;
+        let running = fixture.entered().await;
+        let expected_sid = format!("{base}#agent:sales-rep#conv:{conv}");
+        let (ticket_id, ticket_sid, user) = {
+            let entries = fixture.state.turns.entries.lock().unwrap();
+            let (id, entry) = entries.iter().find(|(_, entry)| entry.msg_id == conv)
+                .expect("the real socket admitted this turn");
+            (id.clone(), entry.sid.clone(), entry.user.clone())
+        };
+        let delegation_id = running.delegation_id.as_deref().expect("captured delegation");
+        let row = queue.get_by_id(delegation_id).await.unwrap().unwrap();
+        assert_eq!(ticket_sid, expected_sid);
+        assert_eq!(running.session_id, ticket_sid);
+        assert_eq!(row.session_id.as_deref(), Some(ticket_sid.as_str()));
+        assert_eq!(row.turn_id.as_deref(), Some(ticket_id.as_str()));
+        assert_eq!(row.on_behalf_of, Some(format!("user:{user}")));
+        assert_eq!(row.sender_agent.as_deref(), Some("sales-rep"));
+
+        send(&mut socket, json!({"type":"cancel", "session_id":ticket_sid,
+            "msg_id":conv, "request_id":format!("cancel-{conv}")})).await;
+        let frames = [frame(&mut socket).await, frame(&mut socket).await];
+        let cancelled = frames.iter().find(|value| value["code"] == "cancelled")
+            .expect("the real cancellation pipeline completed");
+        assert_eq!(cancelled["session_id"], expected_sid);
+        assert_eq!(cancelled["delegations_cancelled"], 1);
+        assert!(cancelled.get("downstream_running").is_none());
+        assert!(cancelled.get("downstream_ref").is_none());
+        let row = queue.get_by_id(delegation_id).await.unwrap().unwrap();
+        assert_eq!(row.status, crate::message_queue::MessageStatus::Failed);
+        assert_eq!(row.error.as_deref(), Some("origin turn cancelled"));
+        assert!(crate::approval::is_turn_cancelled(
+            fixture._home.path(), &expected_sid, &ticket_id,
+        ).await.unwrap());
+        assert!(running.release.send(()).is_err(), "cancel drops the held model turn");
+        fixture.turn_count(0).await;
+    }
+    socket.close(None).await.unwrap();
+    drop(socket);
+    wait_connections_closed(&fixture).await;
+}
+
+#[tokio::test]
+async fn webchat_downstream_running_offer_stops_real_dispatch_or_can_be_left_alone() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    crate::trigger_route::tests::write_agent(&fixture._home.path().join("agents"),
+        "downstream-fixture", "Worker", "@downstream-fixture", "specialist", "");
+    let worker_config = fixture._home.path().join("agents/downstream-fixture/agent.toml");
+    let config = std::fs::read_to_string(&worker_config).unwrap().replace("reports_to = \"\"", "reports_to = \"dudu\"");
+    std::fs::write(worker_config, config).unwrap();
+    fixture.state.ctx.registry.write().await.scan().await.unwrap();
+    fixture.gate.capture_delegations();
+    let token = fixture.user("downstream-owner");
+    let (mut socket, info) = fixture.connect(&token).await;
+    assert_eq!(info["type"], "session_info");
+    let home = fixture._home.path().to_owned();
+    let queue = Arc::new(crate::message_queue::MessageQueue::open(&home).unwrap());
+    let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+    crate::model_call_probe::set_dry_run(true);
+    for stop in [true, false] {
+        let msg = if stop { "stop-child" } else { "leave-child" };
+        message(&mut socket, msg, msg).await;
+        let running = fixture.entered().await;
+        let id = running.delegation_id.as_deref().unwrap().to_owned();
+        let row = queue.get_by_id(&id).await.unwrap().unwrap();
+        conn.execute("INSERT INTO delegation_callbacks(message_id,agent_id,channel_type,channel_id,created_at)
+            VALUES (?1,'dudu','webchat',?2,datetime('now'))", rusqlite::params![id, running.session_id]).unwrap();
+        let gate = crate::responsibility::test_hooks::install("downstream_runtime", &row.payload);
+        let dispatch = crate::dispatcher::poll_and_dispatch_sqlite(
+            &queue, &home, &fixture.state.ctx.registry, None, None);
+        let action = async {
+            gate.arrived.wait().await;
+            assert_eq!(queue.get_by_id(&id).await.unwrap().unwrap().status, crate::message_queue::MessageStatus::Acked);
+            send(&mut socket, json!({"type":"cancel", "conv":msg, "msg_id":msg})).await;
+            let frames = [frame(&mut socket).await, frame(&mut socket).await];
+            let cancelled = frames.iter().find(|f| f["code"] == "cancelled").expect("cancelled frame");
+            assert_eq!(cancelled["downstream_running"], 1, "{cancelled}");
+            let reference = cancelled["downstream_ref"].as_str().expect("opaque downstream reference");
+            assert!(!reference.is_empty());
+            if stop {
+                send(&mut socket, json!({"type":"cancel_downstream", "downstream_ref":reference, "request_id":"stop-request"})).await;
+                let outcome = frame(&mut socket).await;
+                assert_eq!(outcome["type"], "downstream_stopped", "{outcome}");
+                assert_eq!(outcome["stopped"], 1);
+                assert_eq!(outcome["still_stopping"], 0);
+                assert_eq!(outcome["request_id"], "stop-request");
+                send(&mut socket, json!({"type":"cancel_downstream", "downstream_ref":reference})).await;
+                assert_eq!(frame(&mut socket).await["code"], "downstream_ref_unknown");
+            } else {
+                gate.release.wait().await;
+            }
+        };
+        let (result, ()) = tokio::join!(dispatch, action);
+        result.unwrap();
+        assert!(running.release.send(()).is_err(), "origin model future was cancelled");
+        let row = queue.get_by_id(&id).await.unwrap().unwrap();
+        if stop {
+            assert_eq!(row.status, crate::message_queue::MessageStatus::Failed);
+            assert_eq!(row.error.as_deref(), Some("stopped with origin turn"));
+            assert!(row.response.is_none());
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1", [&id],
+                |r| r.get::<_, i64>(0)).unwrap(), 1, "stopped callback must remain unconsumed");
+        } else {
+            assert_eq!(row.status, crate::message_queue::MessageStatus::Done);
+            assert_eq!(row.response.as_deref(), Some("model-call-probe dry run"));
+        }
+        fixture.turn_count(0).await;
+    }
+    crate::model_call_probe::set_dry_run(false);
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn webchat_downstream_memory_socket_rejects_invalid_and_concurrent_stop_frames() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let fixture = Fixture::start(true).await.unwrap();
+    let token = fixture.user("stop-admission");
+    let user = fixture.state.jwt_config.verify_access_token(&token).unwrap().sub;
+    let principal = format!("user:{user}");
+    let reference = fixture.state.turns.offer(&user, &principal, "s", "t").unwrap();
+    // Holding the registered run keeps the first request in its cleanup wait.
+    let guard = crate::downstream_runs::register(fixture._home.path(), Some("s"), Some("t"), Some(&principal)).unwrap().unwrap();
+    let (mut socket, _) = fixture.connect(&token).await;
+    send(&mut socket, json!({"type":"cancel_downstream","downstream_ref":"invalid","request_id":"invalid"})).await;
+    assert_eq!(frame(&mut socket).await["code"], "downstream_ref_unknown");
+    send(&mut socket, json!({"type":"cancel_downstream","downstream_ref":reference,"request_id":"first"})).await;
+    send(&mut socket, json!({"type":"cancel_downstream","downstream_ref":reference,"request_id":"second"})).await;
+    let busy = frame(&mut socket).await;
+    assert_eq!(busy, json!({"type":"error","code":"downstream_stop_busy","retryable":true,"request_id":"second"}));
+    send(&mut socket, json!({"type":"cancel_downstream","downstream_ref":"invalid","request_id":"invalid-again"})).await;
+    assert_eq!(frame(&mut socket).await["code"], "downstream_ref_unknown");
+    drop(guard);
+    let stopped = frame(&mut socket).await;
+    assert_eq!(stopped["type"], "downstream_stopped");
+    assert_eq!(stopped["request_id"], "first");
+    assert_eq!(stopped["stopped"], 1);
+    send(&mut socket, json!({"type":"cancel_downstream","downstream_ref":reference,"request_id":"after"})).await;
+    assert_eq!(frame(&mut socket).await["code"], "downstream_ref_unknown");
+    socket.close(None).await.unwrap();
+}

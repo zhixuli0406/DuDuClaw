@@ -56,24 +56,31 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
     } else {
         ""
     };
+    let downstream = app.downstream_prompt(std::time::Instant::now());
     text(
         frame,
         Rect::new(inside.x, inside.y, inside.width, 1),
         TerminalText::new(format!(
             "{} {} {}",
             spinner,
-            app.chat.status.plain(),
+            if downstream.is_some() && app.focus == crate::chat::Focus::Input {
+                strings::DOWNSTREAM_INPUT_HINT.into()
+            } else { app.chat.status.plain() },
             if app.chat.stale { strings::STALE } else { "" }
         )),
         settings,
         app.chat.stale,
         false,
     );
+    let prompt_rows = u16::from(downstream.is_some() && inside.height > 1);
+    if let Some(prompt) = downstream && prompt_rows > 0 {
+        text(frame, Rect::new(inside.x, inside.y + 1, inside.width, 1), prompt, settings, false, false);
+    }
     let body = Rect::new(
         inside.x,
-        inside.y + 1,
+        inside.y + 1 + prompt_rows,
         inside.width,
-        inside.height.saturating_sub(2),
+        inside.height.saturating_sub(2 + prompt_rows),
     );
     // Reserve real terminal columns for the gutter; content never renders there,
     // including continuation lines and text that imitates a decision card.
