@@ -115,19 +115,19 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     "logs.entry" if m2::manager(&model) && app.blocks.panes.iter().any(|p| p.kind == crate::blocks::Block::Log) => app.logs.push(&event.payload),
                     "events_lost" => { app.blocks.invalidate(); app.logs.lost = true; },
                     "run.step" => app.blocks.run_step(&event.payload),
-                    "agent.turn_finished" | "agent.status_changed" | "task.updated" | "task.created" => app.blocks.invalidate(),
+                    "agent.turn_finished" | "agent.status_changed" | "task.updated" | "task.created" | "budget.breaker_open" | "autopilot.breaker_open" => app.blocks.invalidate(),
                     _ => {},
                 }
             }
             if generation.is_some() && decision.is_none() && block_fetch.is_none()
                 && (fetched_revision != app.blocks.revision || block_poll.elapsed() >= Duration::from_secs(5)) {
                 let revision = app.blocks.revision;
-                let panes = app.blocks.panes.clone(); let gateway = client.clone(); let manager = m2::manager(&model);
+                let panes = app.blocks.panes.clone(); let gateway = client.clone(); let role = model.role;
                 block_fetch = Some(Box::pin(async move {
                     let mut results = Vec::new();
                     for (i, pane) in panes.iter().enumerate() {
-                        if matches!(pane.kind, crate::blocks::Block::Run | crate::blocks::Block::Task | crate::blocks::Block::Log) {
-                            results.push((i, crate::blocks::fetch::pane(&gateway, pane, manager).await));
+                        if pane.kind.remote() {
+                            results.push((i, crate::blocks::fetch::pane_for_role(&gateway, pane, role).await));
                         }
                     }
                     (revision, results)
@@ -309,3 +309,6 @@ fn read_host_event(app: &mut App, read: impl FnOnce() -> Result<Option<Event>>) 
     }
     Ok(event)
 }
+
+#[cfg(test)]
+mod autonomy_tests;

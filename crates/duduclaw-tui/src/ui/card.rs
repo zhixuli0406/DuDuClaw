@@ -41,9 +41,13 @@ impl Codes {
 }
 impl Card {
     pub fn open(item: InboxItem, model: &Model, now: Instant, codes: &mut Codes) -> Self {
-        let blocked = super::card_data::blocked(&item, model);
+        let mut blocked = super::card_data::blocked(&item, model);
         let high_risk = matches!(&item, InboxItem::Approval(_)) && super::card_data::high_risk(&item.data());
-        let body = item.detail_text();
+        let mut body = item.detail_text();
+        if matches!(item, InboxItem::Task(_)) && body.plain().chars().count() > 16_000 {
+            blocked = Some(TerminalText::new(strings::CARD_DASHBOARD.into()));
+            body = TerminalText::new(format!("{}\n{}", body.visible().chars().take(16_000).collect::<String>(), strings::BLOCK_TRUNCATED));
+        }
         Self { item, body, high_risk, scroll: 0, code: codes.next(), input: String::new(),
             blocked, hint: None, opened: now, bottom_seen: false, max_scroll: 0, page: 1, viewport_ready: false,
             armed: None, sending: false, message: String::new(), editing: false }
@@ -75,6 +79,22 @@ impl Card {
     fn approval_live(&self, epoch: i64) -> bool {
         matches!(&self.item, InboxItem::Approval(a) if a.status.is("pending") && a.expires_at.is_some_and(|e| epoch < e))
     }
+    fn plan_pending(&self) -> bool {
+        matches!(&self.item, InboxItem::Task(t) if t.status.is("needs_human"))
+            && self.item.data()["plan_pending"].as_str().is_some_and(|s| !s.is_empty())
+    }
+    pub(super) fn start_continue(&mut self) -> bool {
+        if self.continuing() && self.blocked.is_none() {
+            self.editing = true;
+            true
+        } else { false }
+    }
+    pub(super) fn paste(&mut self, text: &str) {
+        if self.editing {
+            let remaining = 2000usize.saturating_sub(self.message.chars().count());
+            self.message.extend(text.chars().filter(|c| !crate::sanitize::forbidden(*c)).take(remaining));
+        }
+    }
     fn continuing(&self) -> bool {
         matches!(&self.item, InboxItem::Task(t) if t.status.is("done") || t.status.is("failed") || t.status.is("cancelled"))
     }
@@ -94,7 +114,8 @@ impl Card {
         }
         if self.editing {
             match key.code {
-                KeyCode::Char(c) if self.message.chars().count() < 2000 => self.message.push(c),
+                KeyCode::Char(c) => self.paste(&c.to_string()),
+                KeyCode::Enter if !self.message.trim().is_empty() => { self.editing = false; self.hint = None; },
                 KeyCode::Backspace => { self.message.pop(); },
                 _ => {}
             }
@@ -121,6 +142,10 @@ impl Card {
         }
         if !fresh { self.armed = None; self.input.clear(); self.hint = Some(strings::STALE); return Effect::None; }
         if self.blocked.is_some() { return Effect::None; }
+        let plan_pending = self.plan_pending();
+        if plan_pending && !matches!(key.code, KeyCode::Char('0'..='9') | KeyCode::Backspace | KeyCode::Enter) {
+            self.input.clear();
+        }
         let decision = match &self.item {
             InboxItem::Approval(a) if self.approval_live(epoch) => {
                 if self.digest().is_none() && key.code != KeyCode::Char('n') {
@@ -146,11 +171,23 @@ impl Card {
             }
             InboxItem::Task(t) => {
                 let action = match key.code {
-                    KeyCode::Char('r') if t.status.is("needs_human") => Some(GoalAction::Retry),
+                    KeyCode::Char(c) if c.is_ascii_digit() && plan_pending => {
+                        if !self.bottom_seen { self.hint = Some(strings::CARD_SCROLL); return Effect::None; }
+                        if self.input.len() < 3 { self.input.push(c); }
+                        return Effect::None;
+                    }
+                    KeyCode::Backspace if plan_pending => { self.input.pop(); return Effect::None; }
+                    KeyCode::Enter if plan_pending => {
+                        if !self.bottom_seen { self.hint = Some(strings::CARD_SCROLL); return Effect::None; }
+                        if self.input != self.code { self.input.clear(); self.hint = Some(strings::CARD_WRONG_CODE); return Effect::None; }
+                        Some(GoalAction::Retry)
+                    }
+                    KeyCode::Char('r') if t.status.is("needs_human") && !plan_pending => Some(GoalAction::Retry),
                     KeyCode::Char('a') if t.status.is("needs_human") => Some(GoalAction::Abort),
                     KeyCode::Char('d') if t.status.is("needs_human") => Some(GoalAction::Done),
                     KeyCode::Char('t') if t.status.is("needs_human") => Some(GoalAction::Takeover),
                     KeyCode::Char('i') if self.continuing() => { self.editing = true; None },
+                    KeyCode::Char('c') if self.continuing() && self.message.trim().is_empty() => { self.editing = true; None },
                     KeyCode::Char('c') if self.continuing() && !self.message.trim().is_empty() => Some(GoalAction::Continue),
                     _ => None,
                 };
@@ -182,6 +219,8 @@ impl Card {
                 InboxItem::Approval(_) if self.digest().is_none() => strings::CARD_DENY_KEY.into(),
                 InboxItem::Approval(_) if self.high_risk && !self.bottom_seen => strings::CARD_SCROLL.into(),
                 InboxItem::Approval(_) => format!("{} {}  [{}]\n{}", strings::CARD_CODE, self.code, self.input, strings::CARD_APPROVAL_KEYS),
+                InboxItem::Task(_) if self.plan_pending() => format!("{}\n{} {} [{}]", strings::PLAN_KEYS, strings::CARD_CODE, self.code, self.input),
+                InboxItem::Task(_) if self.editing => format!("{}\n{}", strings::CONTINUE_EDIT, TerminalText::new(self.message.clone()).visible()),
                 InboxItem::Task(_) if self.continuing() => format!("{}\n{}", strings::CARD_CONTINUE_KEYS, TerminalText::new(self.message.clone()).visible()),
                 InboxItem::Task(t) if t.status.is("needs_human") => strings::CARD_GOAL_KEYS.into(),
                 _ => strings::CARD_NOT_PENDING.into(),

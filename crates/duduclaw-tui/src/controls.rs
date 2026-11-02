@@ -5,6 +5,8 @@ use crate::{
 use serde_json::{Value, json};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Control {
+    WorkflowCancel { run: String },
+    GoalCreate { agent: String, body: String, plan_first: bool },
     Autonomy { agent: Option<String>, resume: bool },
     Steer {
         task: String,
@@ -42,6 +44,8 @@ pub enum CronAction {
 impl Control {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::WorkflowCancel { .. } => strings::WORKFLOW_CANCEL,
+            Self::GoalCreate { .. } => strings::GOAL_CREATE,
             Self::Autonomy { agent: None, resume: false } => strings::AUTONOMY_PAUSE_ALL,
             Self::Autonomy { agent: None, resume: true } => strings::AUTONOMY_RESUME_ALL,
             Self::Autonomy { resume: false, .. } => strings::AUTONOMY_PAUSE,
@@ -63,8 +67,13 @@ impl Control {
             Self::Responsibility { .. } => strings::RESP_PAUSE,
         }
     }
+    pub fn edit_body(&mut self) -> Option<&mut String> {
+        match self { Self::Steer { body, .. } | Self::GoalCreate { body, .. } => Some(body), _ => None }
+    }
     pub fn request(&self) -> (&'static str, Value) {
         match self {
+            Self::WorkflowCancel { run } => ("workflow_runs.cancel", json!({"run_id":run})),
+            Self::GoalCreate { agent, body, plan_first } => ("tasks.goal_create", json!({"agent_id":agent,"description":body,"plan_first":plan_first})),
             Self::Autonomy { agent, resume } => (
                 if *resume { "autonomy.resume" } else { "autonomy.pause" },
                 agent.as_ref().map_or_else(|| json!({"all":true}), |id| json!({"agent_id":id})),

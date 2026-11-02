@@ -21,36 +21,47 @@ pub enum ScheduleSource {
 #[derive(Clone, Debug, Default)]
 pub struct Activity {
     pub working: bool,
+    pub task_id: Option<String>,
+    pub turns: Vec<Turn>,
     pub error: bool,
     pub completed_id: Option<String>,
 }
-/// Only explicit, identified turn events can create a durable completion badge.
+/// Turn events have no run ID or outcome. Preserve only currently observed turns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Turn {
+    source: String,
+    runtime: String,
+    task_id: Option<String>,
+}
 pub(crate) fn activity_event(map: &mut HashMap<String, Activity>, name: &str, payload: &Value) {
-    let Some(agent) = payload.get("agent_id").and_then(Value::as_str) else {
-        return;
-    };
-    // Live hints never retain arbitrarily large identifiers from push events.
-    if agent.len() > 1024 || payload.get("run_id").and_then(Value::as_str).is_some_and(|id| id.len() > 1024) { return; }
+    let Some(agent) = payload["agent_id"].as_str().filter(|id| id.len() <= 1024) else { return; };
+    let source = payload["source"].as_str().unwrap_or("");
+    let runtime = payload["runtime"].as_str().unwrap_or("");
+    if source.len() > 128 || runtime.len() > 128 { return; }
+    let task_id = payload["task_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 1024).map(str::to_owned);
+    let turn = Turn { source: source.into(), runtime: runtime.into(), task_id };
     match name {
         "agent.turn_started" => {
-            map.entry(agent.into()).or_default().working = true;
+            let a = map.entry(agent.into()).or_default();
+            if a.turns.len() < 256 { a.turns.push(turn); }
+            a.working = true;
+            a.task_id = a.turns.last().and_then(|t| t.task_id.clone());
         }
         "agent.turn_finished" => {
             let a = map.entry(agent.into()).or_default();
-            a.working = false;
-            a.error = payload
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|s| matches!(s, "failed" | "error"));
-            if !a.error
-                && let Some(id) = payload.get("run_id").and_then(Value::as_str)
-            {
-                a.completed_id = Some(format!("run:{agent}:{id}"));
-            }
+            if let Some(i) = a.turns.iter().position(|t| t == &turn) { a.turns.remove(i); }
+            a.working = !a.turns.is_empty();
+            a.task_id = a.turns.last().and_then(|t| t.task_id.clone());
+            // Completion/error comes only from the authoritative runs history.
         }
         _ => {}
     }
 }
+pub(crate) async fn cost_summary(gateway: &impl crate::blocks::fetch::Gateway) -> Option<u64> {
+    crate::blocks::autonomy::read(gateway, "cost.summary", json!({"hours":24})).await.ok()
+        .as_ref().and_then(crate::state::cost_amount)
+}
+
 pub(crate) async fn schedules(client: &Client, role: crate::auth::Role, budget: &mut crate::budget::SnapshotBudget) -> Result<Vec<ScheduledRun>> {
     let mut result = Vec::new();
     // Cron is Admin-only; heartbeat is Manager+. No prediction from a cron expression:
@@ -75,7 +86,7 @@ fn schedule_rows(response: &Value, method: &str, field: &str, source: ScheduleSo
     rows.iter().map(|row| {
         let agent = row["agent_id"].as_str().ok_or(Error::Protocol)?;
         let id = match source { ScheduleSource::Cron => row["id"].as_str().ok_or(Error::Protocol)?, ScheduleSource::Heartbeat => agent };
-        let next = row["next_run"].as_str().unwrap_or(crate::strings::NOT_PROVIDED);
+        let next = row["next_run"].as_str().unwrap_or(crate::strings::NOT_SCHEDULED);
         Ok(ScheduledRun { id: format!("{method}:{id}"), agent: TerminalText::new(agent.into()),
             next_run: TerminalText::new(next.into()), source, detail: row.clone() })
     }).collect()
@@ -133,7 +144,7 @@ mod tests {
     fn real_schedule_shapes_keep_paused_jobs_and_missing_fields_explicit() {
         let cron = json!({"tasks":[{"id":"c1","name":"weekly","agent_id":"adu","cron":"0 9 * * 1","cron_timezone":"Asia/Taipei","enabled":false,"last_run_at":"2026-10-30","last_status":"success"}]});
         let rows = schedule_rows(&cron,"cron.list","tasks",ScheduleSource::Cron).unwrap();
-        assert_eq!(rows.len(),1); assert!(rows[0].next_run.is(crate::strings::NOT_PROVIDED));
+        assert_eq!(rows.len(),1); assert!(rows[0].next_run.is(crate::strings::NOT_SCHEDULED));
         assert_eq!(rows[0].detail["enabled"],false); assert_eq!(rows[0].detail["last_status"],"success");
         let heartbeat=json!({"heartbeats":[{"agent_id":"adu","enabled":true,"interval_seconds":3600,"cron":"0 * * * *","cron_timezone":"UTC","last_run":"09:00","next_run":"10:00","total_runs":4,"active_runs":0,"max_concurrent":1}]});
         let rows=schedule_rows(&heartbeat,"heartbeat.status","heartbeats",ScheduleSource::Heartbeat).unwrap();
@@ -161,6 +172,6 @@ mod tests {
             &json!({"agent_id":"adu","run_id":"r1","status":"completed"}),
         );
         assert!(!map["adu"].working);
-        assert_eq!(map["adu"].completed_id.as_deref(), Some("run:adu:r1"));
+        assert!(map["adu"].completed_id.is_none());
     }
 }

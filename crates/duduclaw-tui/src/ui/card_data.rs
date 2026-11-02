@@ -9,6 +9,7 @@ pub(super) fn blocked(item: &InboxItem, model: &Model) -> Option<TerminalText> {
             .or_else(|| data.get("invalidated_reason"))
             .and_then(Value::as_str).unwrap_or(strings::CARD_NO_PERMISSION)));
     match item {
+        InboxItem::Breaker(_) => return Some(TerminalText::new(strings::CARD_READ_ONLY.into())),
         InboxItem::Approval(a) => {
             if a.decided_in_dashboard_only { return Some(TerminalText::new(strings::CARD_DASHBOARD.into())); }
             if data.get("may_decide").and_then(Value::as_bool) != Some(true)

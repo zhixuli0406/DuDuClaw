@@ -1,5 +1,6 @@
 //! Local tiles and bounded, authoritative gateway snapshots.
 pub mod fetch;
+pub mod autonomy;
 #[cfg(test)]
 mod tests;
 use crate::{Error, Result, sanitize::TerminalText, strings};
@@ -23,8 +24,19 @@ pub enum Block {
     Task,
     Log,
     Pty,
+    Workflow,
+    Autopilot,
+    Evolution,
+    Budget,
+    Digest,
 }
 impl Block {
+    pub fn remote(self) -> bool {
+        !matches!(self, Self::Detail | Self::Chat | Self::Pty)
+    }
+    pub fn autonomy(self) -> bool {
+        matches!(self, Self::Workflow | Self::Autopilot | Self::Evolution | Self::Budget | Self::Digest)
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Detail => strings::DETAIL,
@@ -33,6 +45,11 @@ impl Block {
             Self::Task => strings::TASK_BLOCK,
             Self::Log => strings::LOG_BLOCK,
             Self::Pty => strings::PTY_BLOCK,
+            Self::Workflow => strings::WORKFLOW_BLOCK,
+            Self::Autopilot => strings::AUTOPILOT_BLOCK,
+            Self::Evolution => strings::EVOLUTION_BLOCK,
+            Self::Budget => strings::BUDGET_BLOCK,
+            Self::Digest => strings::DIGEST_BLOCK,
         }
     }
 }

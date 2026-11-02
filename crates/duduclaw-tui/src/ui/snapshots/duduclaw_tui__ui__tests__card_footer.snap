@@ -1,16 +1,16 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
-assertion_line: 484
+assertion_line: 486
 expression: "screen(&m,&app,&Settings::default(),100,36)"
 ---
 DuDuClaw 控制室 | /home/使用者/.duduclaw
-閘道 1.77.0 | 已連線
+閘道 1.77.0 | 已連線 | 執行中 ? 次（已觀測）
 
 +-收件匣 (4)-----------------------------------+==決策卡============================================
-|> [審核] 確認資料匯出                         ||{                                                 |
-|  [目標任務] 週報待確認                       ||  "agent_id": "adu",                              |
-|  [斷路器] 預算已達上限                       ||  "decided_in_dashboard_only": true,              |
-|  [員工提問] 請選擇時段                       ||  "id": "a1",                                     |
+|> [審核] adu · tool · 確認資料匯出            ||{                                                 |
+|  [目標任務] writer · 需要補充資料 · 週報待確 ||  "agent_id": "adu",                              |
+|  [斷路器] 預算事件 · adu · 曾收到斷路器開啟事||  "decided_in_dashboard_only": true,              |
+|  [員工提問] adu · tool · 請選擇時段          ||  "id": "a1",                                     |
 |                                              ||  "kind": "tool",                                 |
 |                                              ||  "request_kind": "approval",                     |
 |                                              ||  "status": "pending",                            |
@@ -29,7 +29,7 @@ DuDuClaw 控制室 | /home/使用者/.duduclaw
 |                                              ||內容未綁定：這張卡無法確認你看到的就是實際內容，請|
 +----------------------------------------------+|到儀表板決定                                      |
 +-下次自主執行---------------------------------+|此事項只能在儀表板處理，請自行開啟儀表板          |
-|  心跳 阿嘟 11:00 / 上次結果: 閘道未提供      ||                                                  |
+|  心跳 阿嘟 11:00 / 上次執行: 閘道未提供      ||                                                  |
 |                                              ||↑↓ / PgUp PgDn 捲動；Esc 關卡                     |
 |                                              ||                                                  |
 |                                              ||                                                  |

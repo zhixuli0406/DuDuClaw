@@ -54,7 +54,8 @@ fn populated() -> Model {
     m.inbox = fresh(vec![
         approval("a1", "adu", "確認資料匯出", "tool", "approval"),
         InboxItem::Task(task),
-        approval("a2", "adu", "預算已達上限", "budget_breaker", "approval"),
+        InboxItem::Breaker(crate::state::Breaker { key: "budget.breaker_open:adu".into(), autopilot: false,
+            subject: TerminalText::new("adu".into()), agent: TerminalText::new("adu".into()), title: TerminalText::new(strings::BREAKER_EVENT.into()) }),
         approval("a3", "adu", "請選擇時段", "tool", "question"),
     ]);
     m.employees = fresh(vec![
@@ -288,6 +289,7 @@ fn badges_priority_done_receipts_and_identity_not_display_normalization() {
             working: true,
             error: true,
             completed_id: Some("run:r1".into()),
+            ..Default::default()
         },
     );
     assert_eq!(employee_status(e, &m, &read), EmployeeStatus::Awaiting);
@@ -1240,10 +1242,14 @@ fn autonomy_palette_permissions_all_shape_and_employee_status_cards() {
     m.role = Some(Role::Manager); m.goal_operators.clear();
     assert_eq!(app.key(ordinary_key('p'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: false }));
     assert_eq!(app.key(ordinary_key('u'),&m),Action::Control(crate::controls::Control::Autonomy { agent: Some("adu".into()), resume: true }));
-    m.role = None;
-    assert_eq!(app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m),Action::Control(crate::controls::Control::Autonomy { agent: None, resume: false }));
-    m.role = Some(Role::Manager);
-    assert_eq!(app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m),Action::None);
+    // Ctrl-P is the palette even before users.me resolves; it never pauses all.
+    for role in [None, Some(Role::Manager)] {
+        m.role = role;
+        assert_eq!(app.key(KeyEvent::new(KeyCode::Char('p'),KeyModifiers::CONTROL),&m),Action::None);
+        assert!(app.palette.is_some());
+        assert!(!app.palette_commands(&m).iter().any(|c| c.label == strings::AUTONOMY_PAUSE_ALL || c.label == strings::AUTONOMY_RESUME_ALL));
+        app.key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),&m);
+    }
 }
 
 #[test]
@@ -1295,4 +1301,36 @@ fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
             else { assert_eq!(params,json!({"agent_id":"adu"})); }
         }
     }
+}
+
+#[test]
+fn header_cost_refusal_footer_selection_and_run_round_are_visible() {
+    let mut model=empty(); model.employees=fresh(vec![employee("adu","阿嘟","active")]);
+    let mut app=App::default(); app.selected=Some(Selection::Employee("adu".into()));
+    app.blocks.open(crate::blocks::Block::Run,Some("adu".into()));
+    app.blocks.panes[0].data=crate::blocks::Data { stale:false,total:1,selected:json!({"id":"dispatch:1","agent_id":"adu","channel":"goal","round":2,"status":"running"}), ..Default::default() };
+    model.cost_millicents=Some(123_000);
+    let output=screen(&model,&app,&Settings::default(),140,30);
+    assert!(output.contains("$1.2300")); assert!(output.contains("近 24 小時"));
+    assert!(output.contains("goal · 回合 2")); assert!(output.contains("阿嘟"));
+    assert!(output.contains("Ctrl-P")); assert!(output.contains("q 離開"));
+    insta::assert_snapshot!("autonomy_header_cost",output);
+    model.cost_millicents=None;
+    let output=screen(&model,&app,&Settings::default(),140,30);
+    assert!(!output.contains('$'));
+    insta::assert_snapshot!("autonomy_header_cost_hidden",output);
+}
+
+#[test]
+fn heartbeat_uses_last_run_and_cron_uses_gateway_next_run_without_prediction() {
+    let mut model=empty();
+    model.schedules=fresh(vec![
+        ScheduledRun { id:"heartbeat:adu".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new("2026-11-03T01:00:00Z".into()),source:ScheduleSource::Heartbeat,detail:json!({"last_run":"2026-11-02T01:00:00Z"}) },
+        ScheduledRun { id:"cron:c1".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new(strings::NOT_SCHEDULED.into()),source:ScheduleSource::Cron,detail:json!({"next_run":null,"last_status":"success"}) },
+    ]);
+    let app=App::default();
+    let output=screen(&model,&app,&Settings::default(),200,40);
+    assert!(output.contains("上次執行: 2026-11-02T01:00:00Z"));
+    assert!(output.contains("2026-11-03T01:00:00Z")); assert!(output.contains(strings::NOT_SCHEDULED));
+    insta::assert_snapshot!("autonomy_schedule_times",output);
 }

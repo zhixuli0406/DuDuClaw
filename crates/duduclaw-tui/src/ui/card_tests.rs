@@ -96,7 +96,7 @@ fn terminal_actions_require_consecutive_distinct_presses_without_countdown() {
 fn continue_requires_finished_goal_and_explicit_message_as_real_handler_does() {
     let now = Instant::now(); let mut c = open(goal("done"), &model(), now);
     assert_eq!(press(&mut c,key('c'),now),Effect::None);
-    press(&mut c,key('i'),now); for ch in "繼續下一項".chars() { press(&mut c,key(ch),now); }
+    for ch in "繼續下一項".chars() { press(&mut c,key(ch),now); }
     press(&mut c,KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),now);
     assert_eq!(press(&mut c,key('c'),now),Effect::Send(Decision::Goal{task_id:"t1".into(),action:GoalAction::Continue,message:"繼續下一項".into(),expected_updated_at:"revision".into()}));
 }
