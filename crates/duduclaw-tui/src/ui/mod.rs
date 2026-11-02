@@ -32,7 +32,7 @@ use crate::{
 };
 use app::{Action, App};
 use crossterm::event::{self, Event};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use ratatui::Terminal;
 use std::{path::PathBuf, time::Duration};
 
@@ -83,6 +83,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let mut block_generation = None;
         let feed = StateFeed::start(options.client, settings.poll_interval);
         let mut decision: Option<futures_util::future::BoxFuture<'_, crate::decide::Outcome>> = None;
+        let mut autonomy_requests = futures_util::stream::FuturesUnordered::<futures_util::future::BoxFuture<'static, crate::decide::Outcome>>::new();
         let home_text = TerminalText::new(home.to_string_lossy().into_owned());
         let shutdown = terminal::shutdown_signal();
         tokio::pin!(shutdown);
@@ -206,7 +207,19 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     }
                     Action::Control(request) => {
                         let client = client.clone();
-                        decision = Some(Box::pin(async move { crate::controls::send(&client, &request).await }));
+                        if matches!(request, crate::controls::Control::Autonomy { .. }) {
+                            // Poll once now: Client::call_detailed enqueues before its first await.
+                            // Later keys cannot replace an unsent request, and replies stay independent.
+                            let mut pending = async move { crate::controls::send(&client, &request).await }.boxed();
+                            if let Some(outcome) = pending.as_mut().now_or_never() {
+                                app.notice = Some(outcome.notice());
+                                feed.refetch();
+                            } else {
+                                autonomy_requests.push(pending);
+                            }
+                        } else {
+                            decision = Some(Box::pin(async move { crate::controls::send(&client, &request).await }));
+                        }
                     }
                     Action::Chat(input) => match chat.send(input) {
                         Ok(()) => { app.input.clear(); app.chat_scroll = 0; app.notice = None; app.chat.running = true; }
@@ -227,6 +240,10 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 }
             }
             tokio::select! {
+                Some(outcome) = autonomy_requests.next(), if !autonomy_requests.is_empty() => {
+                    app.notice = Some(outcome.notice());
+                    feed.refetch();
+                }
                 outcome = async { decision.as_mut().expect("guarded decision").await }, if decision.is_some() => {
                     decision = None;
                     app.decision_finished(outcome);

@@ -37,6 +37,8 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
             }
             "system.version" => json!({"version":"canary-fixture"}),
             "agents.list" => json!({"agents":[]}),
+            "autonomy.status" => json!({"global":null,"agents":{},"state_error":null}),
+            "cost.summary" => json!({"available":false}),
             "users.me" => json!({"user":user(),"bindings":[]}),
             "approvals.list" => json!({"approvals":[],"count":0}),
             "tasks.list_page" => json!({"tasks":[],"total":0,"limit":200,"offset":0}),

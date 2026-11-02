@@ -63,6 +63,9 @@ struct Fixture {
     reject_upgrade: AtomicBool,
     fail_version: AtomicBool,
     list_calls: AtomicUsize,
+    autonomy_calls: AtomicUsize,
+    autonomy_paused: AtomicBool,
+    autonomy_refused: AtomicBool,
     list_delay_ms: AtomicU64,
     short_token: bool,
     flood: AtomicUsize,
@@ -114,6 +117,9 @@ impl Gateway {
             reject_upgrade: AtomicBool::new(false),
             fail_version: AtomicBool::new(false),
             list_calls: AtomicUsize::new(0),
+            autonomy_calls: AtomicUsize::new(0),
+            autonomy_paused: AtomicBool::new(false),
+            autonomy_refused: AtomicBool::new(false),
             list_delay_ms: AtomicU64::new(0),
             short_token,
             flood: AtomicUsize::new(0),
@@ -267,6 +273,26 @@ async fn serve(mut socket: WebSocket, f: Arc<Fixture>) {
                                 }
                                 json!({"version":"fixture","edition":"community","auto_update":false})
                             },
+                            "autonomy.status" => {
+                                assert_eq!(params, json!({}));
+                                f.autonomy_calls.fetch_add(1, Ordering::SeqCst);
+                                let agents = if f.autonomy_paused.load(Ordering::SeqCst) {
+                                    json!({"adu":{"reason":"operator","who":"u1","at":"2026-11-02T00:00:00Z"}})
+                                } else { json!({}) };
+                                json!({"global":null,"agents":agents,"state_error":null})
+                            }
+                            "autonomy.pause" | "autonomy.resume" => {
+                                f.decisions.lock().unwrap().push((method.clone(), params.clone()));
+                                if f.autonomy_refused.load(Ordering::SeqCst) || params["all"] == true {
+                                    if !send(&mut socket, WsFrame::error_response(&id, "permission denied")).await { return; }
+                                    continue;
+                                }
+                                assert_eq!(params, json!({"agent_id":"adu"}));
+                                let paused = method == "autonomy.pause";
+                                f.autonomy_paused.store(paused, Ordering::SeqCst);
+                                json!({"agent_id":"adu","all":false,"paused":paused,"applied":true,
+                                    "pause":if paused { json!({"reason":"operator","who":"u1","at":"2026-11-02T00:00:00Z"}) } else { Value::Null }})
+                            }
                             "users.me" => json!({"user":{"id":"u1","role":f.role()},"bindings":[{"agent_name":"adu","access_level":"operator"}]}),
                             "approvals.decide" | "tasks.goal_decide" => {
                                 f.decisions.lock().unwrap().push((method.clone(), params.clone()));

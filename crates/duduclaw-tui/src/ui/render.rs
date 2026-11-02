@@ -77,19 +77,9 @@ pub fn draw(
         false,
         false,
     );
-    if let Some(autonomy) = &model.autonomy {
-        text(
-            frame,
-            Rect::new(parts[0].x, parts[0].y + 2, parts[0].width, 1),
-            TerminalText::new(format!(
-                "{}: {}",
-                strings::AUTONOMY,
-                autonomy.plain().replace('\n', " ")
-            )),
-            settings,
-            model.employees.count().is_none(),
-            false,
-        );
+    if let Some(autonomy) = crate::autonomy::status_line(model) {
+        text(frame, Rect::new(parts[0].x, parts[0].y + 2, parts[0].width, 1),
+            autonomy, settings, model.autonomy.stale || model.autonomy.refetch_pending, false);
     }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -146,7 +136,7 @@ pub fn draw(
     text(
         frame,
         Rect::new(footer.x, footer.y + 1, footer.width, footer.height.saturating_sub(if app.notice.is_some() { 3 } else { 1 }).min(2)),
-        TerminalText::new((if app.pty_confirm.is_some() { strings::PTY_CONFIRM } else if app.pty_focus { strings::PTY_KEYS } else if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else if app.blocks.active == crate::blocks::Block::Pty { strings::PTY_LIST_KEYS } else { strings::LIST_KEY_HINTS }).into()),
+        TerminalText::new((if app.pty_confirm.is_some() { strings::PTY_CONFIRM } else if app.pty_focus { strings::PTY_KEYS } else if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else if app.blocks.active == crate::blocks::Block::Pty { strings::PTY_LIST_KEYS } else { app.context_hints(model) }).into()),
         settings,
         false,
         true,

@@ -1,10 +1,11 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
+assertion_line: 484
 expression: "screen(&m,&app,&Settings::default(),100,36)"
 ---
 DuDuClaw 控制室 | /home/使用者/.duduclaw
 閘道 1.77.0 | 已連線
-自主狀態: 執行中
+
 +-收件匣 (4)-----------------------------------+==決策卡============================================
 |> [審核] 確認資料匯出                         ||{                                                 |
 |  [目標任務] 週報待確認                       ||  "agent_id": "adu",                              |
