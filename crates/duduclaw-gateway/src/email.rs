@@ -153,10 +153,30 @@ pub async fn send_email(
     subject: &str,
     body: &str,
 ) -> Result<()> {
+    let email = build_message(&cfg.from_addr, to, subject, body)?;
+    send_message(cfg, email).await
+}
+
+/// Transactional system mail uses the same transport and credentials as the mailbox.
+pub async fn send_email_alternative(
+    cfg: &EmailChannelConfig,
+    to: &str,
+    subject: &str,
+    plain: &str,
+    html: &str,
+) -> Result<()> {
+    let email = lettre::Message::builder()
+        .from(cfg.from_addr.parse().map_err(|_| DuDuClawError::Channel("invalid sender".into()))?)
+        .to(to.parse().map_err(|_| DuDuClawError::Channel("invalid recipient".into()))?)
+        .subject(subject)
+        .multipart(lettre::message::MultiPart::alternative_plain_html(plain.to_owned(), html.to_owned()))
+        .map_err(|_| DuDuClawError::Channel("cannot build system mail".into()))?;
+    send_message(cfg, email).await
+}
+
+async fn send_message(cfg: &EmailChannelConfig, email: lettre::Message) -> Result<()> {
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-
-    let email = build_message(&cfg.from_addr, to, subject, body)?;
 
     let builder = match cfg.smtp_tls {
         SmtpTls::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.smtp_host),

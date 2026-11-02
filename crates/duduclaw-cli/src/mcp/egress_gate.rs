@@ -40,7 +40,7 @@ pub(crate) fn confirmed_sink_completion(tool: &str, response: &Value) -> bool {
         | "mail_send" | "wiki_write" | "wiki_share" | "shared_skill_share"
         | "tasks_create" | "update_cron_task" | "create_reminder"
         | "send_to_agent" | "spawn_agent" | "team_handoff" | "responsibility_ask"
-        | "skill_hub_install" | "knowledge_add_source" | "computer_navigate" | "computer_type" | "os_notify"
+        | "skill_hub_install" | "knowledge_add_source" | "computer_navigate" | "computer_type" | "computer_login" | "os_notify"
     );
     terminal_contract && response.get("error").is_none()
         && response.get("result").is_some_and(|result| {

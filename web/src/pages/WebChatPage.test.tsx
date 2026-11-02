@@ -92,13 +92,17 @@ describe('WebChatPage', () => {
     expect(screen.getByText('Hi! How can I help?')).toBeInTheDocument();
   });
 
-  it('shows a busy indicator while the assistant is streaming', () => {
-    useChatStore.setState({ isStreaming: true });
-
+  it('shows the employee working status while the assistant is streaming', () => {
     renderWithProviders(<WebChatPage />);
+    act(() => useChatStore.setState({
+      connectionState: 'connected' as never,
+      isStreaming: true,
+      activeMessageId: 'turn-1',
+      messages: [{ id: 'user-1', role: 'user', content: 'Hello', timestamp: Date.now(), turnId: 'turn-1', delivery: 'running' }],
+    }));
 
-    const animated = document.querySelectorAll('[class*="animate"]');
-    expect(animated.length).toBeGreaterThan(0);
+    expect(screen.getByRole('status')).toHaveTextContent(/Thinking/);
+    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
   });
 
   it('does not send on Enter while a CJK IME is composing, but sends on a plain Enter', () => {
@@ -324,4 +328,40 @@ it('preserves the composer draft during history refresh and window focus', async
     resumeView.mockRestore();
     useChatStore.getState().reset();
   }
+});
+
+
+it('keeps the composer and Send enabled during streaming, with a separate Stop control', () => {
+  const send = vi.fn();
+  const cancel = vi.fn();
+  useChatStore.setState({ send, cancel, isStreaming: true, activeMessageId: 'running', connectionState: 'connected' });
+  renderWithProviders(<WebChatPage />);
+  const input = screen.getByPlaceholderText(/message/i);
+  expect(input).toBeEnabled();
+  fireEvent.change(input, { target: { value: 'follow-up' } });
+  expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+  expect(cancel).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  expect(send).toHaveBeenCalledWith('follow-up', []);
+  expect(input).toHaveValue('');
+  fireEvent.change(input, { target: { value: 'another' } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+  expect(send).toHaveBeenLastCalledWith('another', []);
+});
+
+it('shows queued cancellation and restores rejected text to the composer', () => {
+  const cancel = vi.fn();
+  useChatStore.setState({ cancel, isStreaming: true, activeMessageId: 'running', messages: [
+    { id: 'one', turnId: 'running', role: 'user', content: 'first', timestamp: 1, delivery: 'running' },
+    { id: 'two', turnId: 'queued', role: 'user', content: 'second', timestamp: 2, delivery: 'queued' },
+    { id: 'three', turnId: 'rejected', role: 'user', content: 'keep this', timestamp: 3, delivery: 'failed', deliveryError: en['webchat.turnLimit'] },
+  ] });
+  renderWithProviders(<WebChatPage />);
+  expect(screen.getByText(en['webchat.queued'])).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: en['webchat.cancelQueued'] }));
+  expect(cancel).toHaveBeenCalledWith('queued');
+  expect(screen.getAllByText(en['webchat.turnLimit'])).toHaveLength(1);
+  fireEvent.click(screen.getByRole('button', { name: en['webchat.resend'] }));
+  expect(screen.getByPlaceholderText(/message/i)).toHaveValue('keep this');
 });

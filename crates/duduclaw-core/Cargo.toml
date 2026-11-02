@@ -29,6 +29,7 @@ base64 = { workspace = true }
 # once, to mint `~/.duduclaw/identity.key`.
 hmac = "0.12"
 sha2 = "0.10"
+minisign-verify = "0.2"
 getrandom = "0.3"
 # llm_contract (LLM output contract primitives): RFC 3986 encoding of canonical
 # coverage refs and NFC normalization before encoding. Both already in Cargo.lock.

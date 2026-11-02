@@ -223,6 +223,12 @@ pub fn write_record(home: &Path, rec: &InstallRecord) -> Result<()> {
     duduclaw_gateway::expert_admin::write_record(home, rec).map_err(cfg_err)
 }
 
+pub(crate) use import_error::error_json as import_error_json;
+
+pub(crate) fn open_import_report(path: &std::path::Path) -> Result<std::fs::File> {
+    report::open_report_file(path)
+}
+
 mod report;
 use report::Report;
 
@@ -393,6 +399,7 @@ pub(super) fn merge_agent_mcp(
             return Err(format!("{} 不是 JSON 物件，未合併", path.display()));
         }
         let written = merge_mcp_servers(&mut doc, extra);
+        duduclaw_agent::mcp_template::protect_mcp_config_env(home, agent_id, &mut doc)?;
         let out = serde_json::to_string_pretty(&doc)
             .map_err(|e| format!("序列化 .mcp.json 失敗: {e}"))?;
         duduclaw_agent::mcp_template::write_mcp_config_atomic(&path, out.as_bytes())
@@ -714,7 +721,7 @@ mod unit_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".mcp.json");
         let mut extra = serde_json::Map::new();
-        extra.insert("pw".into(), serde_json::json!({ "command": "npx" }));
+        extra.insert("pw".into(), serde_json::json!({ "command": "npx", "env": {"API_KEY":"sk-pack-private"} }));
 
         std::fs::write(&path, "{not json").unwrap();
         assert!(merge_agent_mcp(home.path(), "agnes", &extra).is_err());
@@ -726,5 +733,7 @@ mod unit_tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(doc["mcpServers"]["duduclaw"].is_object());
         assert!(doc["mcpServers"]["pw"].is_object());
+        assert_eq!(doc["mcpServers"]["pw"]["env"]["API_KEY"], "secret://mcp/pw/API_KEY");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-pack-private"));
     }
 }

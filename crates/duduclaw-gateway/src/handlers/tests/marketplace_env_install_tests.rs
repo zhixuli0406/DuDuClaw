@@ -1,5 +1,4 @@
-//! Marketplace installs write required env as literal values (the allowlisted
-//! spawn env cannot resolve `${NAME}` references) and `mcp.list` masks them.
+//! Marketplace, update and manifest imports persist only encrypted-store references.
 
 use super::MethodHandler;
 use crate::protocol::WsFrame;
@@ -25,7 +24,7 @@ fn error_text(frame: WsFrame) -> String {
 }
 
 #[tokio::test]
-async fn browserbase_install_writes_literals_and_list_masks_them() {
+async fn browserbase_install_writes_references_and_list_masks_them() {
     let home = tempfile::tempdir().unwrap();
     let h = handler_with_agent(home.path()).await;
 
@@ -45,9 +44,13 @@ async fn browserbase_install_writes_literals_and_list_masks_them() {
     let agent_dir = home.path().join("agents").join("alice");
     let cfg = duduclaw_agent::mcp_template::read_mcp_config(&agent_dir).unwrap();
     let env = &cfg.mcp_servers["browserbase"].env;
-    assert_eq!(env["BROWSERBASE_API_KEY"], "bb-secret-1");
-    assert_eq!(env["BROWSERBASE_PROJECT_ID"], "proj-2");
-    assert_eq!(env["GEMINI_API_KEY"], "gm-secret-3");
+    assert_eq!(env["BROWSERBASE_API_KEY"], "secret://mcp/browserbase/BROWSERBASE_API_KEY");
+    assert_eq!(env["BROWSERBASE_PROJECT_ID"], "secret://mcp/browserbase/BROWSERBASE_PROJECT_ID");
+    assert_eq!(env["GEMINI_API_KEY"], "secret://mcp/browserbase/GEMINI_API_KEY");
+    let config_text = std::fs::read_to_string(agent_dir.join(".mcp.json")).unwrap();
+    for secret in ["bb-secret-1", "proj-2", "gm-secret-3"] {
+        assert!(!config_text.contains(secret));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -127,14 +130,20 @@ async fn mcp_update_refuses_catalog_server_with_env_references() {
                 "command": "npx",
                 "args": ["-y", "@browserbasehq/mcp"],
                 "env": {
-                    "BROWSERBASE_API_KEY": "k",
-                    "BROWSERBASE_PROJECT_ID": "p",
-                    "GEMINI_API_KEY": "g"
+                    "BROWSERBASE_API_KEY": "sk-update-browserbase",
+                    "BROWSERBASE_PROJECT_ID": "project-update-private",
+                    "GEMINI_API_KEY": "sk-update-gemini"
                 }
             }
         }))
         .await,
     );
+    let raw = std::fs::read_to_string(home.path().join("agents/alice/.mcp.json")).unwrap();
+    for value in ["sk-update-browserbase", "project-update-private", "sk-update-gemini"] {
+        assert!(!raw.contains(value));
+    }
+    assert!(raw.contains("secret://mcp/browserbase/GEMINI_API_KEY"));
+
 }
 
 #[tokio::test]
@@ -142,4 +151,21 @@ async fn playwright_install_needs_no_env() {
     let home = tempfile::tempdir().unwrap();
     let h = handler_with_agent(home.path()).await;
     payload(h.handle_marketplace_install(json!({"id": "playwright", "agent_id": "alice"})).await);
+}
+
+#[tokio::test]
+async fn manifest_import_install_stores_only_env_references() {
+    let home = tempfile::tempdir().unwrap();
+    let h = handler_with_agent(home.path()).await;
+    let manifest = r#"{"mcpServers":{"example":{"command":"npx","args":["-y","@modelcontextprotocol/server-memory"],"env":{"API_KEY":"sk-import-private","LOG_LEVEL":"info"}}}}"#;
+    let parsed = MethodHandler::parse_mcp_manifest(manifest, "fallback").unwrap();
+    let (name, def, _) = &parsed[0];
+    payload(h.handle_mcp_import_install(json!({
+        "agent_id":"alice", "server_name": name, "server_def": def
+    })).await);
+    let raw = std::fs::read_to_string(home.path().join("agents/alice/.mcp.json")).unwrap();
+    assert!(!raw.contains("sk-import-private"));
+    assert!(raw.contains("secret://mcp/example/API_KEY"));
+    let doc: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(doc["mcpServers"]["example"]["env"]["LOG_LEVEL"], "info");
 }

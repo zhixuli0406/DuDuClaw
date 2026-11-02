@@ -34,7 +34,7 @@ pub(super) fn retained_capacity(
 /// A cross-process file lock held by the HTTP response body.
 #[derive(Debug)]
 pub struct DownloadPermit {
-    _file: std::fs::File,
+    _file: duduclaw_core::owner_lock::OwnerLock,
 }
 pub(super) fn download_permit(home: &Path) -> ExportResult<DownloadPermit> {
     let root = private_directory(&home.join("data_exports"))?;
@@ -51,7 +51,7 @@ pub(super) fn download_permit(home: &Path) -> ExportResult<DownloadPermit> {
             .open(locks.join(format!("download-{slot}")))
             .map_err(|_| "EXPORT_IO".to_string())?;
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(DownloadPermit { _file: file }),
+            Ok(()) => return Ok(DownloadPermit { _file: duduclaw_core::owner_lock::OwnerLock::new(file) }),
             Err(e) if worker_lease::is_lock_contention(&e) => {}
             Err(_) => return Err("EXPORT_IO".into()),
         }

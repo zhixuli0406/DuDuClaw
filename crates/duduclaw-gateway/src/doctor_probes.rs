@@ -17,6 +17,37 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+pub fn launchd_exit_78(output: &str) -> bool {
+    output.lines().any(|line| line.trim() == "last exit code = 78")
+}
+
+#[cfg(target_os = "macos")]
+pub async fn launchd_restart_warning() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let home = dirs::home_dir().unwrap_or_default();
+    for label in [duduclaw_core::autostart::LAUNCHD_LABEL, duduclaw_core::autostart::LEGACY_LAUNCHD_LABEL] {
+        let plist = duduclaw_core::autostart::launchd_plist_path_in(&home, label);
+        if !plist.exists() { continue; }
+        let target = format!("gui/{uid}/{label}");
+        if let Ok(output) = tokio::process::Command::new("/bin/launchctl").args(["print", &target]).output().await {
+            if output.status.success() && launchd_exit_78(&String::from_utf8_lossy(&output.stdout)) {
+                return Some(format!("launchd reports exit code 78. Restart the service with `{}`.", "duduclaw service restart"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod launchd_tests {
+    use super::launchd_exit_78;
+    #[test]
+    fn parses_launchd_last_exit_78() {
+        assert!(launchd_exit_78("gui/501/com.duduclaw.gateway = {\n state = waiting\n last exit code = 78\n}"));
+        assert!(!launchd_exit_78("state = running\nlast exit code = 0"));
+    }
+}
+
 // ── MCP server cold-start ───────────────────────────────────────
 
 /// Outcome of spawning `duduclaw mcp-server` with a runtime-shaped env.
@@ -100,14 +131,10 @@ pub fn mcp_cold_start_status_and_message(
     }
 }
 
-/// Run the same internal-key provisioning the gateway does at startup, then
-/// spawn one `mcp-server` child and classify its cold-start behavior.
-/// Idempotent and side-effect-light: provisioning reuses the existing
-/// `gateway-internal` key (or mints it on a fresh home, exactly like a first
-/// gateway boot would). Same age rules as boot — a key past
-/// `mcp_internal_key::ROTATE_AFTER_DAYS` is rotated here too, so running
-/// `duduclaw doctor` on an install whose key expired both reports and repairs
-/// it.
+/// Rotate/provision a key in an existing config, then probe an MCP child.
+/// Without the running gateway's validated listener and edition this probe
+/// refuses to create a missing config. It also refuses an unreadable MFA
+/// policy store; start the gateway to initialize a fresh installation.
 pub async fn mcp_cold_start_probe(home: &Path) -> McpColdStartReport {
     let bin = duduclaw_core::resolve_duduclaw_bin();
     if !bin.is_absolute() {

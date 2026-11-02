@@ -37,3 +37,12 @@ it('refreshes metadata safely and uses current staff names without a false regex
   fireEvent.click(screen.getByRole('button',{name:'Refresh'}));
   expect(refresh).toHaveBeenCalledOnce();
 });
+
+it('formats assistant text parts while retaining masks and hiding raw content and attachment names', () => {
+  useConversationsStore.setState({readOnlyView:{...data,messages:[{...data.messages[0],role:'assistant',parts:[{t:'text',v:'**Formatted**\n\n| a |\n| --- |\n| b |'},{t:'mask',cat:'PHONE',n:1},{t:'attachment',kind:'file',name:'PRIVATE-FILENAME.pdf'}]}]}} as never);
+  const {container}=renderWithProviders(<ReadOnlyHistoryView/>);
+  expect(container.querySelector('strong')).toHaveTextContent('Formatted');
+  expect(screen.getByRole('table')).toBeInTheDocument();
+  expect(screen.getByText('Phone 1')).toBeInTheDocument();
+  expect(screen.queryByText(/PRIVATE-FILENAME|UNSAFE FALLBACK/)).not.toBeInTheDocument();
+});

@@ -98,3 +98,25 @@ duduclaw expert remove my-first-pack
 - [ ] `requires`が前提条件を正直に列挙している
 - [ ] evalケースを添付している(`duduclaw eval-scaffold`でSOULから草案を作成可能)——evalのあるパックは評価が一段高くなる
 - [ ] CHANGELOG形式のバージョン説明(どのバージョンで何が変わったか)がある
+
+## 6. minisign でパックに署名する
+
+`pack.toml` に発行元を設定し、すべてのファイルを完成させてからマニフェストを生成して署名します。
+
+```bash
+duduclaw pack manifest ./my-first-pack --publisher example
+cd my-first-pack
+minisign -Sm MANIFEST.sha256
+cd ..
+duduclaw pack verify ./my-first-pack
+```
+
+minisign の秘密鍵は別途管理してください。DuDuClaw は署名用秘密鍵を作成・保存しません。検証前に、インストールする側が `duduclaw publishers add example <pubkey>` を実行し、ダッシュボードで Admin 承認を受けて公開鍵を固定します。パックと同じ場所に公開鍵を置くだけでは信頼されません。
+
+`MANIFEST.sha256` は `name: <name>`、`version: <version>`、`publisher: <id>` の3行に続き、ソート済みの `<sha256>  <relative path>` を列挙します。`MANIFEST.sha256` と `MANIFEST.sha256.minisig` を除く全ファイルが対象です。配布時はこの2つのファイルも含めます。名前とバージョンは `pack.toml` と一致する必要があり、古いマニフェストのバージョンが異なれば拒否します。欠落・追加・変更されたファイル、絶対パス、パストラバーサル、シンボリックリンクはパックを無効にします。編集後は必ず再生成して署名してください。
+
+パックはアーカイブで配布するか、署名対象ファイルの改行コードを正確に保ってください。
+
+`pack verify` は発行元の状態を表示します。ジョブプリセットのインストールにもプレビューと `--confirm-profile` による確認が必要です。確認は署名状態、内容、インストール先に紐づくため、変更時には再確認が必要です。有効な署名は発行元だけを証明し、インストール時のスキャン、フック隔離、承認は省略しません。鍵を固定した発行元の署名欠落は無効で、未固定の未署名パックは警告して続行します。
+
+署名は、過去に署名された古いバージョンのパック全体のリプレイを防ぎません。署名が有効でも、インストールするバージョンを確認してください。

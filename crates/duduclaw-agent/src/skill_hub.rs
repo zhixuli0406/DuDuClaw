@@ -87,6 +87,11 @@ pub struct HubManifest {
     /// `None` means the hub is discovery-only for this skill — the install
     /// gate must then DENY (fail-closed), never guess.
     pub content: Option<String>,
+    /// Optional publisher identity and detached minisign signature over exact content bytes.
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
     /// Human-facing URL for the skill.
     pub url: String,
     /// SHA-256 (lowercase hex) of `content` when present — the hash of exactly
@@ -116,6 +121,49 @@ impl HubManifest {
         self.content_hash = self.content.as_deref().map(sha256_hex);
         self
     }
+}
+
+/// Gateway-owned pin history. A nested map keeps arbitrary hub/skill pairs unambiguous.
+pub const SKILL_SIGNATURE_HISTORY_FILE: &str = "skill_signature_history.json";
+pub type SkillSignatureHistory = std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+
+/// Missing history is a new install; any existing unreadable/invalid history refuses installation.
+pub fn load_signature_history(home: &Path) -> Result<SkillSignatureHistory, String> {
+    let path = home.join(SKILL_SIGNATURE_HISTORY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+                _ => return Err(format!("{}: signature history exists but is unreadable; install DENIED: {e}", path.display())),
+            }
+        }
+        Err(e) => return Err(format!("{}: signature history unreadable; install DENIED: {e}", path.display())),
+    };
+    let history: SkillSignatureHistory = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{}: invalid signature history; install DENIED: {e}", path.display()))?;
+    for skills in history.values() {
+        for publisher in skills.values() {
+            duduclaw_core::publishers::validate_publisher_id(publisher)
+                .map_err(|e| format!("{}: invalid signature history; install DENIED: {e}", path.display()))?;
+        }
+    }
+    Ok(history)
+}
+
+/// Read-only preliminary check. The gateway repeats this while holding the install/history lock.
+pub fn check_signature_history(
+    home: &Path, hub: &str, skill: &str,
+    signature: &duduclaw_core::publishers::SignatureStatus,
+) -> Result<(), String> {
+    let history = load_signature_history(home)?;
+    if let Some(publisher) = history.get(hub).and_then(|skills| skills.get(skill)) {
+        if signature.state != duduclaw_core::publishers::SignatureState::Verified
+            || signature.publisher.as_ref() != Some(publisher) {
+            return Err(format!("signature downgrade DENIED for '{hub}/{skill}': previously verified publisher '{publisher}'; a Verified signature from the same publisher is required"));
+        }
+    }
+    Ok(())
 }
 
 /// Lowercase-hex SHA-256 of a string — the WP2.6 content-hash primitive.
@@ -376,6 +424,8 @@ impl SkillHub for GitHubHub {
                 .iter()
                 .find(|s| s.name == name)
                 .map(|s| HubManifest {
+                    publisher: None,
+                    signature: None,
                     hub: HUB_GITHUB.to_string(),
                     name: s.name.clone(),
                     // GitHub search results are repo links — no inline SKILL.md.
@@ -611,6 +661,8 @@ impl SkillHub for ClawHubHub {
             };
             Ok(Some(
                 HubManifest {
+                    publisher: body["skill"]["publisher"].as_str().map(str::to_string),
+                    signature: body["skill"]["signature"].as_str().map(str::to_string),
                     hub: HUB_CLAWHUB.to_string(),
                     name: slug.to_string(),
                     content,
@@ -845,6 +897,8 @@ impl SkillHub for LobeHubHub {
                 .map_err(|e| format!("lobehub manifest body: {e}"))?;
             Ok(Some(
                 HubManifest {
+                    publisher: None,
+                    signature: None,
                     hub: HUB_LOBEHUB.to_string(),
                     name: name.to_string(),
                     content: Some(text),
@@ -1122,6 +1176,8 @@ impl SkillHub for AnthropicSkillsHub {
                 .map_err(|e| format!("anthropic-skills raw body: {e}"))?;
             Ok(Some(
                 HubManifest {
+                    publisher: None,
+                    signature: None,
                     hub: HUB_ANTHROPIC.to_string(),
                     name: name.to_string(),
                     content: Some(text),
@@ -1528,6 +1584,8 @@ mod tests {
                     .iter()
                     .find(|e| e.name == name)
                     .map(|e| HubManifest {
+                        publisher: None,
+                        signature: None,
                         hub: self.id.to_string(),
                         name: e.name.clone(),
                         content: Some(format!("# {}", e.name)),
@@ -1620,6 +1678,63 @@ mod tests {
             .await;
         assert_eq!(res.hits.len(), 1);
         assert_eq!(res.hits[0].hub, "hub");
+    }
+
+    #[test]
+    fn signature_history_refuses_downgrades_and_publisher_changes() {
+        use duduclaw_core::publishers::{SignatureState, SignatureStatus};
+        let home = tempfile::tempdir().unwrap();
+        let verified = SignatureStatus { state: SignatureState::Verified, publisher: Some("alice".into()) };
+        assert!(check_signature_history(home.path(), "hub", "notes", &verified).is_ok());
+        std::fs::write(home.path().join(SKILL_SIGNATURE_HISTORY_FILE),
+            r#"{"hub":{"notes":"alice"}}"#).unwrap();
+        assert!(check_signature_history(home.path(), "hub", "notes", &verified).is_ok());
+        for status in [SignatureStatus::unsigned(Some("alice")),
+            SignatureStatus { state: SignatureState::Invalid, publisher: Some("alice".into()) },
+            SignatureStatus { state: SignatureState::Verified, publisher: None },
+            SignatureStatus { state: SignatureState::Verified, publisher: Some("bob".into()) }] {
+            let err = check_signature_history(home.path(), "hub", "notes", &status).unwrap_err();
+            assert!(err.contains("signature downgrade"), "{err}");
+        }
+        assert!(check_signature_history(home.path(), "other", "notes", &SignatureStatus::unsigned(None)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_signature_history_is_not_missing() {
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(home.path().join("missing"), home.path().join(SKILL_SIGNATURE_HISTORY_FILE)).unwrap();
+        assert!(load_signature_history(home.path()).unwrap_err().contains(SKILL_SIGNATURE_HISTORY_FILE));
+    }
+
+    #[test]
+    fn unreadable_or_invalid_signature_history_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(SKILL_SIGNATURE_HISTORY_FILE);
+        for invalid in ["garbage", r#"{"hub":{"notes":42}}"#, r#"{"hub":{"notes":""}}"#] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(check_signature_history(home.path(), "hub", "notes",
+                &duduclaw_core::publishers::SignatureStatus::unsigned(None)).unwrap_err().contains(SKILL_SIGNATURE_HISTORY_FILE));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(check_signature_history(home.path(), "hub", "notes",
+            &duduclaw_core::publishers::SignatureStatus::unsigned(None)).is_err());
+    }
+
+    #[test]
+    fn optional_origin_fields_preserve_exact_content() {
+        let bytes = "---\r\nname: notes\r\n---\r\nBody  \n";
+        let mut value = serde_json::json!({"hub": "clawhub", "name": "notes", "content": bytes, "url": "https://example.test"});
+        let unsigned: HubManifest = serde_json::from_value(value.clone()).unwrap();
+        assert!(unsigned.publisher.is_none());
+        assert!(unsigned.signature.is_none());
+        value["publisher"] = serde_json::json!("fixture");
+        value["signature"] = serde_json::json!("detached signature text");
+        let manifest: HubManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(manifest.content.as_deref().unwrap().as_bytes(), bytes.as_bytes());
+        assert_eq!(manifest.publisher.as_deref(), Some("fixture"));
+        assert_eq!(manifest.signature.as_deref(), Some("detached signature text"));
     }
 
     #[test]

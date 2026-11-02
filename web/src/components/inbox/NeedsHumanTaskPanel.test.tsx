@@ -33,6 +33,21 @@ describe('<NeedsHumanTaskPanel> WP-F changes tab', () => {
     expect(mockWsClient.call).not.toHaveBeenCalledWith('tasks.changes', expect.anything());
   });
 
+  it('shows independent review failures without changing the plan', () => {
+    const reviewed = { ...task, plan_pending: '- Draft the notes', plan_review: JSON.stringify({ version: 1, lenses: [
+      { lens: 'restate', status: 'completed', text: 'Define the audience' },
+      { lens: 'simplify', status: 'not_run', text: '' },
+      { lens: 'ready', status: 'not_run', text: '' },
+    ] }) };
+    renderWithProviders(
+      <NeedsHumanTaskPanel task={reviewed} typeLabel="Awaiting you" onResolved={() => {}} />,
+    );
+    expect(screen.getByText('Independent review (without conversation context)')).toBeInTheDocument();
+    expect(screen.getByText('- Draft the notes')).toBeInTheDocument();
+    expect(screen.getByText('Define the audience')).toBeInTheDocument();
+    expect(screen.getAllByText('Not run')).toHaveLength(2);
+  });
+
   it('loads and renders the recorded file changes once the 變更 tab is opened', async () => {
     mockWsClient.call.mockImplementation((method: string) => {
       if (method === 'tasks.changes') {

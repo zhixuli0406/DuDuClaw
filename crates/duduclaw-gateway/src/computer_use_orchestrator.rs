@@ -730,6 +730,35 @@ impl ComputerUseOrchestrator {
         })
     }
 
+    /// Secrets enter the container only on stdin. Neither output pipe is logged.
+    pub(crate) async fn fill_login(&self, input: &[u8]) -> crate::computer_use_sessions::login::LoginStatus {
+        use crate::computer_use_sessions::login::LoginStatus;
+        let Some(container) = self.container_id.as_deref() else {
+            return LoginStatus::FailedUncleared;
+        };
+        match docker_output_with_stdin(
+            &["exec", "-i", container, "duduclaw-fill-login"],
+            input, Duration::from_secs(30), "Website login",
+        ).await {
+            Ok(mut output) => {
+                let status = if output.status.success() {
+                    LoginStatus::parse(&output.stdout)
+                } else { LoginStatus::FailedUncleared };
+                use zeroize::Zeroize;
+                output.stdout.zeroize();
+                output.stderr.zeroize();
+                status
+            }
+            Err(_) => {
+                // Killing docker exec does not prove the in-container child ended.
+                self.control_handle()
+                    .stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                LoginStatus::FailedUncleared
+            }
+        }
+    }
+
     /// The container's name once it was started (`duduclaw-cu-<32 hex>`).
     pub fn container_name(&self) -> Option<&str> {
         self.container_id.as_deref()
@@ -1248,11 +1277,9 @@ impl ComputerUseOrchestrator {
         let output = docker_output(&args, ACTION_EXEC_TIMEOUT, "Action execution").await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(action = ?action, stderr = %stderr, "xdotool command failed");
-            return Err(ComputerUseError::ApiError(format!(
-                "xdotool failed: {stderr}"
-            )));
+            // Child diagnostics may echo typed input. Never log or return them.
+            warn!(action = ?action, "xdotool command failed");
+            return Err(ComputerUseError::ApiError("xdotool failed".into()));
         }
         Ok(())
     }

@@ -30,6 +30,8 @@ pub mod dispatch_guard;
 pub mod docker_probe;
 pub mod error;
 pub mod fs_lock;
+#[doc(hidden)]
+pub mod owner_lock;
 pub mod grounding;
 pub mod identity_token;
 pub mod keychain;
@@ -43,6 +45,7 @@ pub mod org;
 pub mod org_field_guard;
 pub mod org_store;
 pub mod pack;
+pub mod publishers;
 pub mod platform;
 pub mod preset;
 pub mod profile_sections;
@@ -1470,3 +1473,7 @@ pub mod egress_guard;
 
 /// Cancellation-safe ownership of spawned process trees.
 pub mod process_tree;
+
+pub mod mcp_tool_defs;
+
+pub mod tool_pruning;

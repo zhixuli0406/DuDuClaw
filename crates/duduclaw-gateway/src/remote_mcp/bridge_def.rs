@@ -227,7 +227,8 @@ mod tests {
         assert!(crate::mcp_scan::scan_mcp_server_def("zap", &def).passed);
         let exe = std::path::Path::new("/opt/duduclaw/bin/duduclaw");
         let cfg = serde_json::json!({ "mcpServers": { "zap": def } });
-        let out = crate::redaction_proxy::rewrite_mcp_config_for_proxy(&cfg, exe);
+        let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(dir.path(), "a1", exe);
+        let out = crate::redaction_proxy::rewrite_mcp_config_for_proxy(&cfg, exe, &own).unwrap();
         let args: Vec<String> = serde_json::from_value(out["mcpServers"]["zap"]["args"].clone()).unwrap();
         assert_eq!(args[0], "mcp-proxy");
         assert!(args.iter().any(|a| a == BRIDGE_SUBCOMMAND), "{args:?}");

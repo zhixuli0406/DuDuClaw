@@ -868,7 +868,7 @@ impl MethodHandler {
         // them); speech-to-text lives in `config.toml [voice] stt_*`.
         let config_toml_changes = changes.len();
         if let Some(voice) = params.get("voice").and_then(|v| v.as_object()) {
-            const VALID_TTS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
+            const VALID_TTS: &[&str] = &["auto", "kokoro", "azure", "minimax", "openai-tts", "openai", "piper", "command", "off", "none", "disabled", "edge-tts", "edge"];
 
             let inference_path = self.home_dir.join("inference.toml");
             let mut inf_table = self.read_config_table(&inference_path).await;
@@ -893,6 +893,13 @@ impl MethodHandler {
                 }
                 if let Some(v) = voice.get("tts_voice").and_then(|v| v.as_str()) {
                     voice_table.insert("tts_voice".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("tts_command").and_then(|v| v.as_str()) {
+                    if v.split_whitespace().next().is_some() && !v.split_whitespace().any(|arg| arg.contains("{output}")) {
+                        return WsFrame::error_response("", "voice.tts_command must contain the {output} placeholder");
+                    }
+                    voice_table.insert("tts_command".into(), toml::Value::String(v.trim().into()));
                     voice_dirty = true;
                 }
             }

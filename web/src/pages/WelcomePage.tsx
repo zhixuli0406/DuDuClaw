@@ -294,7 +294,7 @@ export function WelcomePage() {
       .catch(() => {/* keep whatever we had; badges degrade, not crash */})
       .finally(() => setDetecting(false));
     // Sign-in state for the non-Claude CLIs is the presence of their own
-    // credential file (Claude's comes from `detect.claude_oauth`). Manager-only
+    // credential file (Claude uses CLI OAuth or a usable pool account). Manager-only
     // RPC — a non-admin viewer just doesn't get the "未登入" prompt.
     api.accounts
       .cliCredentials()
@@ -774,7 +774,7 @@ export function WelcomePage() {
               {/* Claude subscription — install + sign in without leaving the
                   wizard (D16). Already signed in ⇒ just confirm the plan. */}
               {state.backend === 'claudeSub' && detect && (
-                detect.claude_cli && detect.claude_oauth ? (
+                detect.claude_cli && (detect.claude_oauth || detect.claude_account_ready) ? (
                   <Card className="gap-2 p-4">
                     <p className="text-sm text-muted-foreground">
                       {intl.formatMessage(
@@ -790,7 +790,7 @@ export function WelcomePage() {
                   <RuntimeSetupCard
                     provider="claude"
                     installed={detect.claude_cli}
-                    loggedIn={detect.claude_oauth}
+                    loggedIn={Boolean(detect.claude_oauth || detect.claude_account_ready)}
                     onDetect={refreshDetect}
                     detecting={detecting}
                   />

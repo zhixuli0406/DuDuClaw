@@ -365,6 +365,14 @@ impl CustomSkillStore {
              );
              CREATE INDEX IF NOT EXISTS idx_skill_curation_status ON skill_curation(status);
 
+             CREATE TABLE IF NOT EXISTS hub_skill_signatures (
+                 skill_name TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 signature_status TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 PRIMARY KEY (skill_name, scope)
+             );
+
              CREATE TABLE IF NOT EXISTS curator_meta (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -519,6 +527,44 @@ impl CustomSkillStore {
             )
             .map_err(|e| format!("curation upsert: {e}"))?;
         Ok(n > 0)
+    }
+
+    /// Install-time origin evidence is stored beside the hub's curator metadata.
+    /// The content hash prevents a later local edit/reinstall from inheriting a badge.
+    pub async fn record_hub_signature(
+        &self,
+        skill_name: &str,
+        scope: &str,
+        status: &duduclaw_core::publishers::SignatureStatus,
+        content_hash: &str,
+    ) -> Result<(), String> {
+        let status = serde_json::to_string(status).map_err(|e| e.to_string())?;
+        self.conn.lock().await.execute(
+            "INSERT OR REPLACE INTO hub_skill_signatures
+             (skill_name, scope, signature_status, content_hash) VALUES (?1, ?2, ?3, ?4)",
+            params![skill_name, scope, status, content_hash],
+        ).map_err(|e| format!("record hub signature: {e}"))?;
+        Ok(())
+    }
+
+    /// Read origin evidence keyed by the exact layer and installed content hash.
+    pub async fn hub_signatures(&self) -> Result<std::collections::HashMap<(String, String), (String, serde_json::Value)>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT skill_name, scope, content_hash, signature_status FROM hub_skill_signatures"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?, r.get::<_, String>(3)?,
+        ))).map_err(|e| e.to_string())?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (name, scope, hash, status) = row.map_err(|e| e.to_string())?;
+            if let Ok(status) = serde_json::from_str::<duduclaw_core::publishers::SignatureStatus>(&status) {
+                out.insert((scope, name), (hash, serde_json::to_value(status).map_err(|e| e.to_string())?));
+            }
+        }
+        Ok(out)
     }
 
     /// Full-row upsert — used by tests (synthetic timestamps) and by the
@@ -888,6 +934,22 @@ fn months_since(approved_at: Option<&str>, now: DateTime<Utc>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hub_signature_metadata_is_scoped_and_replaced() {
+        use duduclaw_core::publishers::{SignatureState, SignatureStatus};
+        let store = CustomSkillStore::open_in_memory().unwrap();
+        let verified = SignatureStatus { state: SignatureState::Verified, publisher: Some("fixture".into()) };
+        store.record_hub_signature("notes", "global", &verified, "hash-a").await.unwrap();
+        store.record_hub_signature("notes", "agent:alice", &SignatureStatus::unsigned(None), "hash-b").await.unwrap();
+        let rows = store.hub_signatures().await.unwrap();
+        assert_eq!(rows[&("global".into(), "notes".into())].1["state"], "verified");
+        assert_eq!(rows[&("agent:alice".into(), "notes".into())].1["state"], "unsigned");
+        store.record_hub_signature("notes", "global", &SignatureStatus::unsigned(None), "hash-c").await.unwrap();
+        let rows = store.hub_signatures().await.unwrap();
+        assert_eq!(rows[&("global".into(), "notes".into())].0, "hash-c");
+        assert_eq!(rows[&("global".into(), "notes".into())].1["state"], "unsigned");
+    }
 
     fn rec(id: &str, creator: &str) -> CustomSkillRecord {
         let now = Utc::now().to_rfc3339();

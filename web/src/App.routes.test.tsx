@@ -396,3 +396,18 @@ describe('App routes — self-service account access', () => {
     expect(screen.queryByText(en['settings.account.signedInAs'])).not.toBeInTheDocument();
   });
 });
+
+
+describe('admin enterprise setup route', () => {
+  it('redirects employees away from setup', async () => {
+    setRole('employee');
+    setEdition('enterprise');
+    await expectLandsOn('/setup', '/');
+    expect(screen.getByTestId('loc').textContent).toBe('/');
+  });
+  it('redirects Personal administrators away from setup', async () => {
+    setEdition('personal');
+    await expectLandsOn('/setup', '/');
+    expect(screen.getByTestId('loc').textContent).toBe('/');
+  });
+});

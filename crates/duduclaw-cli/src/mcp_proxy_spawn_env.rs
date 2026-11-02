@@ -51,9 +51,152 @@ pub fn scoped_env_blob(dir: Option<OsString>, server: &str) -> Result<String, St
     std::fs::read_to_string(&path).map_err(|e| format!("the server's env file is unreadable: {e}"))
 }
 
+/// Resolve declared env before the permissive environment-merging helper runs.
+/// No reference is ever handed to the upstream, including malformed schemes.
+/// Resolving a key requires an explicit employee identity and its host-issued
+/// HMAC. The delegation soft-mode policy and default agent never authorize it.
+pub fn resolve_declared_env(
+    home: &Path,
+    agent: Option<&str>,
+    token: Option<&str>,
+    server: &str,
+    encoded: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(encoded) = encoded else { return Ok(None) };
+    let env: serde_json::Map<String, serde_json::Value> = serde_json::from_str(encoded)
+        .map_err(|_| format!("MCP server '{server}': invalid upstream env map"))?;
+    if let Some((name, _)) = env.iter().find(|(_, value)| !value.is_string()) {
+        return Err(format!("MCP server '{server}': env '{name}' must be a string"));
+    }
+    if let Some(name) = env.keys().find(|name| {
+        duduclaw_core::mcp_proxy_rewrite::is_proxy_private_env_key(name)
+    }) {
+        return Err(format!("MCP server '{server}': upstream env '{name}' is reserved for the host"));
+    }
+    let reference = env.iter().find(|(_, value)| {
+        value.as_str().is_some_and(|v| v.starts_with("secret://"))
+    });
+    if let Some((name, _)) = reference {
+        let agent = agent.filter(|id| {
+            duduclaw_core::is_valid_agent_id(id)
+                && !duduclaw_core::is_reserved_agent_id(id)
+                && duduclaw_core::identity_token::verify_claim(
+                    home, id, token.unwrap_or_default(), true,
+                ) == duduclaw_core::IdentityVerdict::Verified
+        }).ok_or_else(|| {
+            format!("MCP server '{server}': cannot resolve env '{name}' without a verified employee identity")
+        })?;
+        let resolved = duduclaw_security::mcp_secret_store::resolve_mcp_env(home, agent, server, &env)
+            .map_err(|e| e.to_string())?;
+        return Ok(Some(serde_json::Value::Object(resolved).to_string()));
+    }
+    Ok(Some(encoded.to_string()))
+}
+
+/// Final check also covers references inherited from the launching CLI.
+pub fn reject_unresolved_env(server: &str, env: &[(String, String)]) -> Result<(), String> {
+    if let Some((name, _)) = env.iter().find(|(_, value)| value.starts_with("secret://")) {
+        return Err(format!("MCP server '{server}': unresolved env '{name}'; upstream was not started"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_references_fail_without_exposing_the_reference() {
+        let home = tempfile::tempdir().unwrap();
+        for value in ["secret://mcp/server/API_KEY", "secret://mcp/other/API_KEY", "secret://mcp/other-agent/server/API_KEY", "secret://unknown/key"] {
+            let raw = serde_json::json!({"API_KEY":value}).to_string();
+            for agent in [None, Some("employee")] {
+                let error = resolve_declared_env(home.path(), agent, None, "server", Some(&raw)).unwrap_err();
+                assert!(error.contains("API_KEY"));
+                assert!(!error.contains("secret://"));
+            }
+        }
+    }
+
+    #[test]
+    fn declared_refs_resolve_only_from_this_employees_store() {
+        let home = tempfile::tempdir().unwrap();
+        let env = serde_json::json!({"API_KEY":"sentinel-key"}).as_object().unwrap().clone();
+        let refs = duduclaw_security::mcp_secret_store::store_mcp_env(home.path(), "alice", "server", &env).unwrap();
+        let raw = serde_json::Value::Object(refs).to_string();
+        let key = duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        let alice_token = duduclaw_core::identity_token::mint_token(&key, "alice");
+        let bob_token = duduclaw_core::identity_token::mint_token(&key, "bob");
+        let alice = resolve_declared_env(home.path(), Some("alice"), Some(&alice_token), "server", Some(&raw)).unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&alice).unwrap()["API_KEY"], "sentinel-key");
+        let bob = resolve_declared_env(home.path(), Some("bob"), Some(&bob_token), "server", Some(&raw)).unwrap_err();
+        assert!(!bob.contains("sentinel-key") && !bob.contains("secret://"));
+        for reference in ["secret://mcp/bob/server/API_KEY", "secret://mcp/other/API_KEY"] {
+            let raw = serde_json::json!({"API_KEY":reference}).to_string();
+            let error = resolve_declared_env(home.path(), Some("alice"), Some(&alice_token), "server", Some(&raw)).unwrap_err();
+            assert!(!error.contains("sentinel-key") && !error.contains("secret://"));
+        }
+    }
+
+    #[test]
+    fn malformed_maps_and_inherited_references_are_refused() {
+        let home = tempfile::tempdir().unwrap();
+        for raw in ["not json", "[]", r#"{"API_KEY":123}"#] {
+            assert!(resolve_declared_env(home.path(), None, None, "server", Some(raw)).is_err());
+        }
+        let env = vec![("API_KEY".into(), "secret://mcp/server/API_KEY".into())];
+        let error = reject_unresolved_env("server", &env).unwrap_err();
+        assert!(error.contains("API_KEY") && !error.contains("secret://"));
+        assert!(resolve_declared_env(home.path(), None, None, "server", Some(r#"{"PATH":"/bin"}"#)).is_ok());
+    }
+
+    #[test]
+    fn secret_resolution_requires_a_valid_host_token_even_in_soft_mode() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\n[general]\ndefault_agent = 'alice'\n").unwrap();
+        let env = serde_json::json!({"API_KEY":"sentinel-key"}).as_object().unwrap().clone();
+        let refs = duduclaw_security::mcp_secret_store::store_mcp_env(home.path(), "alice", "server", &env).unwrap();
+        let raw = serde_json::Value::Object(refs).to_string();
+        // No identity key is not a feature-off authorization to decrypt.
+        assert!(resolve_declared_env(home.path(), Some("alice"), Some("00"), "server", Some(&raw)).is_err());
+        let key = duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        let alice_token = duduclaw_core::identity_token::mint_token(&key, "alice");
+        let bob_token = duduclaw_core::identity_token::mint_token(&key, "bob");
+        for (agent, token) in [
+            (None, Some(alice_token.as_str())),
+            (Some("alice"), None),
+            (Some("alice"), Some("")),
+            (Some("alice"), Some("00")),
+            (Some("alice"), Some(bob_token.as_str())),
+            (Some("bob"), Some(alice_token.as_str())),
+        ] {
+            let error = resolve_declared_env(home.path(), agent, token, "server", Some(&raw)).unwrap_err();
+            assert!(error.contains("verified employee identity"));
+            assert!(!error.contains("sentinel-key") && !error.contains("secret://"));
+        }
+        for agent in ["__untrusted__", "dashboard", "../alice"] {
+            let token = duduclaw_core::identity_token::mint_token(&key, agent);
+            assert!(resolve_declared_env(home.path(), Some(agent), Some(&token), "server", Some(&raw)).is_err());
+        }
+    }
+
+    #[test]
+    fn nested_proxy_env_and_owner_overrides_are_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let key = duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        let token = duduclaw_core::identity_token::mint_token(&key, "alice");
+        for name in ["DUDUCLAW_MCP_PROXY_ENV", "DUDUCLAW_MCP_PROXY_ENV_FILE",
+            "DUDUCLAW_MCP_PROXY_ENV_DIR", "DUDUCLAW_AGENT_ID", "DUDUCLAW_AGENT_TOKEN"]
+        {
+            let raw = serde_json::json!({(name):
+                serde_json::json!({"API_KEY":"secret://mcp/bob/server/API_KEY"}).to_string()
+            }).to_string();
+            let error = resolve_declared_env(home.path(), Some("alice"), Some(&token), "server", Some(&raw)).unwrap_err();
+            assert!(error.contains(name) && error.contains("reserved for the host"));
+            assert!(!error.contains("secret://"));
+        }
+    }
 
     fn dir_with(server: &str, body: &str) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();

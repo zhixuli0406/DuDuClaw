@@ -11,6 +11,12 @@
  */
 import { client } from './ws-client';
 
+/** Source signature status; independent of security scanning and approval. */
+export interface SkillSignatureStatus {
+  state: 'verified' | 'unsigned' | 'invalid';
+  publisher?: string | null;
+}
+
 /** Lifecycle status — mirrors `CustomSkillStatus` (snake_case). */
 export type CustomSkillStatus =
   | 'draft'

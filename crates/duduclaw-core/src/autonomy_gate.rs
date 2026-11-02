@@ -559,7 +559,7 @@ fn operational(path: &Path) -> Result<(), String> {
 /// across awaits. Drop immediately after the process spawn or request handoff.
 #[derive(Debug)]
 pub struct AdmissionGuard {
-    _file: std::fs::File,
+    _file: crate::owner_lock::OwnerLock,
     holder: Option<u64>,
 }
 
@@ -613,7 +613,7 @@ fn lock_admission(
         match result {
             Ok(()) => {
                 return Ok(AdmissionGuard {
-                    _file: file,
+                    _file: crate::owner_lock::OwnerLock::new(file),
                     holder: None,
                 });
             }

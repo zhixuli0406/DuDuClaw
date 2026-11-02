@@ -319,7 +319,7 @@ pub fn load_interaction_history(
     let mut sql = String::from(
         "SELECT m.timestamp FROM session_messages m \
          JOIN sessions s ON m.session_id = s.id \
-         WHERE s.agent_id = ?1 AND m.role = 'user' AND m.undone_at IS NULL \
+         WHERE s.agent_id = ?1 AND m.role = 'user' AND m.hidden = 0 AND m.undone_at IS NULL \
            AND m.timestamp >= ?2",
     );
     let channel_prefix = channel.map(|c| format!("{c}:%"));
@@ -776,6 +776,7 @@ mod tests {
                  content TEXT NOT NULL,
                  tokens INTEGER DEFAULT 0,
                  timestamp TEXT NOT NULL,
+                 hidden INTEGER NOT NULL DEFAULT 0,
                  undone_at TEXT
              );",
         )

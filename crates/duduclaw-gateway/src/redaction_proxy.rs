@@ -7,7 +7,7 @@
 //!    agent's turn has redaction active, the per-spawn `--mcp-config` no
 //!    longer points at the agent's raw `.mcp.json`: every third-party stdio
 //!    server in it is rewritten to launch through `duduclaw mcp-proxy`
-//!    ([`rewrite_mcp_config_for_proxy`]), which applies the same egress /
+//!    (`duduclaw_core::mcp_proxy_rewrite`), which applies the same egress /
 //!    result redaction the built-in choke point applies. The explore lane,
 //!    action rules and active egress guard also require the third-party gate.
 //!    With no third-party servers, or with all these purposes off, nothing
@@ -42,7 +42,7 @@ use duduclaw_redaction::{EgressDecision, RedactionManager};
 /// `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_VAR`** (checked by
 /// `proxy_env_var_name_is_the_documented_contract` in `duduclaw-cli`).
 pub use duduclaw_core::mcp_proxy_rewrite::{PROXY_CARRY_ENV, PROXY_UPSTREAM_ENV_VAR};
-use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_gate, rewrite_mcp_config_for_proxy_with};
+use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_gate};
 
 /// Placeholder substituted for a tool result the pipeline could not redact.
 /// Mirrors `duduclaw_cli::mcp_redaction::REDACTION_FAILED_PLACEHOLDER`.
@@ -54,11 +54,13 @@ pub const REDACTION_FAILED_PLACEHOLDER: &str = "[redaction failed — value with
 /// `duduclaw mcp-proxy` for redaction (remote bridges included). The pure
 /// rewrite lives in `duduclaw_core::mcp_proxy_rewrite`, shared with the
 /// heartbeat explore-lane spawn and the third-party tool gate.
-pub fn rewrite_mcp_config_for_proxy(json: &Value, self_exe: &Path) -> Value {
-    rewrite_mcp_config_for_proxy_with(
+#[cfg(test)]
+pub fn rewrite_mcp_config_for_proxy(json: &Value, self_exe: &Path, own_server: &Value) -> Result<Value, String> {
+    duduclaw_core::mcp_proxy_rewrite::rewrite_mcp_config_for_proxy_with(
         json,
         self_exe,
-        ProxyPurpose { redaction: true, tool_gate: false },
+        ProxyPurpose { redaction: true, tool_gate: false, secret_env: false },
+        own_server,
     )
 }
 
@@ -162,9 +164,10 @@ pub fn data_file_guard_env_for_spawn(home_dir: &Path) -> Option<String> {
 
 /// Produce the `--mcp-config` path this spawn should use.
 ///
-/// `Ok(None)` ⇒ use the agent's `.mcp.json` unchanged (neither redaction nor the
-/// third-party tool gate needs the proxy, no `.mcp.json`, a config we cannot
-/// read/parse, or a config with nothing to proxy). `Some(temp)` ⇒ pass
+/// `Ok(None)` ⇒ use the agent's `.mcp.json` unchanged (no proxy purpose,
+/// no `.mcp.json`, or nothing to rewrite). Unreadable configs and secret-reference
+/// failures refuse the spawn. Malformed JSON retains Claude's legacy fallback
+/// only when the tool gate is off and no secret reference is present. `Some(temp)` ⇒ pass
 /// `temp`'s path; the returned [`tempfile::TempPath`] deletes the file when
 /// dropped, so callers hold it until the child has exited — the same
 /// lifetime discipline the `--system-prompt-file` guard uses at the same
@@ -195,39 +198,81 @@ pub fn maybe_proxy_mcp_config(
 /// path to this binary, temp file not written). The caller must refuse the
 /// spawn; the message carries `mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX` and
 /// an audit row `third_party_gate_config_unavailable` is written. When only
-/// redaction asked for the proxy, the old fallback stays: `Ok(None)` (use
-/// the original file, logged).
+/// redaction asked for the proxy, a temp-file failure keeps the old fallback:
+/// `Ok(None)`. Secret references always require the proxy and never fall back.
 pub fn maybe_proxy_mcp_config_in_lane(
     home_dir: &Path,
     mcp_json: &Path,
     explore_lane: bool,
 ) -> Result<Option<tempfile::TempPath>, String> {
-    let agent_dir = mcp_json.parent();
+    maybe_proxy_mcp_config_with_agent_dir(home_dir, mcp_json, mcp_json.parent(), explore_lane, true)
+}
+
+/// Rewrite a copied config using its host-known employee, not the copy's path
+/// or identity claimed by raw JSON. Policy checks use the original employee too.
+/// Unlike an employee directory, a copied project may never have run built-in
+/// repair, so it must publish canonical slots even with no third-party servers.
+pub fn maybe_proxy_mcp_config_for_agent(
+    home_dir: &Path,
+    mcp_json: &Path,
+    agent_dir: &Path,
+) -> Result<Option<tempfile::TempPath>, String> {
+    maybe_proxy_mcp_config_with_agent_dir(home_dir, mcp_json, Some(agent_dir), false, false)
+}
+
+fn maybe_proxy_mcp_config_with_agent_dir(
+    home_dir: &Path,
+    mcp_json: &Path,
+    agent_dir: Option<&Path>,
+    explore_lane: bool,
+    preserve_cli_discovery: bool,
+) -> Result<Option<tempfile::TempPath>, String> {
+    let agent_id = agent_dir.and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str()).unwrap_or("unknown").to_string();
+    let tool_gate = agent_dir.is_some_and(|dir| {
+        duduclaw_core::agent_toml::third_party_gate_needed(dir, explore_lane)
+            || duduclaw_core::egress_guard::effective_mode(home_dir, Some(dir))
+                != duduclaw_core::egress_guard::Mode::Off
+    });
+    // Only Claude's ungated, malformed-file path keeps its legacy fallback.
+    // Valid raw input still undergoes identity validation, even with gates off.
+    let Some(parsed) = read_mcp_json_for_spawn(
+        home_dir, mcp_json, explore_lane, &agent_id, preserve_cli_discovery && !tool_gate,
+    )? else {
+        return Ok(None);
+    };
     let purpose = ProxyPurpose {
         redaction: redaction_active_for_spawn(home_dir),
-        tool_gate: agent_dir.is_some_and(|dir| {
-            duduclaw_core::agent_toml::third_party_gate_needed(dir, explore_lane)
-                || duduclaw_core::egress_guard::effective_mode(home_dir, Some(dir))
-                    != duduclaw_core::egress_guard::Mode::Off
-        }),
+        secret_env: duduclaw_core::mcp_proxy_rewrite::has_mcp_secret_refs(&parsed),
+        tool_gate,
     };
-    if purpose.none() {
+    // Secret ownership comes from a host-known employee directory, never
+    // from the basename of an arbitrary copied workspace or its raw built-in.
+    if purpose.secret_env && !agent_dir.is_some_and(|dir| {
+        duduclaw_core::is_valid_agent_id(&agent_id)
+            && (dir == home_dir.join("agents").join(&agent_id)
+                || dir == home_dir.join("agents/.ephemeral").join(&agent_id))
+    }) {
+        return Err(refuse_gate_config_unavailable(
+            home_dir, &agent_id, "cannot verify MCP secret owner outside an employee directory", explore_lane,
+        ));
+    }
+    if purpose.none() && preserve_cli_discovery {
         return Ok(None);
     }
-    let agent_id = agent_dir
-        .and_then(|d| d.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let produced = std::env::current_exe()
-        .map_err(|e| format!("cannot locate the duduclaw binary: {e}"))
-        .and_then(|exe| write_gated_mcp_config(mcp_json, &exe, purpose));
+    let self_exe = duduclaw_core::resolve_duduclaw_bin();
+    let own_server = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+        home_dir, &agent_id, &self_exe,
+    );
+    let produced = write_gated_mcp_config_value(
+        &parsed, &self_exe, purpose, &own_server, preserve_cli_discovery,
+    );
     match produced {
         Ok((guard, dropped)) => {
             audit_dropped_remote_entries(home_dir, &agent_id, &dropped, explore_lane);
             Ok(guard)
         }
-        Err(e) if purpose.tool_gate => {
+        Err(e) if purpose.tool_gate || purpose.secret_env || !preserve_cli_discovery => {
             Err(refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane))
         }
         Err(e) => {
@@ -278,7 +323,7 @@ fn refuse_gate_config_unavailable(
         serde_json::json!({ "error": duduclaw_core::truncate_bytes(error, 300), "explore_lane": explore_lane }),
     );
     duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
-        "這次工作需要過濾第三方 MCP 工具，但無法產生過濾後的設定（{}），所以沒有啟動。",
+        "這次工作需要第三方 MCP 代理，但無法產生代理設定（{}），所以沒有啟動。",
         duduclaw_core::truncate_bytes(error, 200)
     ))
 }
@@ -295,8 +340,8 @@ fn refuse_gate_config_unavailable(
 /// remote bridges come back unchanged (they gate themselves), and direct
 /// `url` / `type` entries are removed and audited.
 ///
-/// `own_server` replaces every DuDuClaw entry of the file (`duduclaw`,
-/// `duduclaw-pro`, `duduclaw-<instance>`) under the key `duduclaw` before the
+/// `own_server` replaces the exact host-owned names (`duduclaw`,
+/// `duduclaw-pro`, this instance's `duduclaw-<instance>`) under the key `duduclaw` before the
 /// rewrite, so a third-party entry can never take that name and the proxies
 /// carry the identity and home this spawn actually uses.
 ///
@@ -333,22 +378,25 @@ pub fn gated_mcp_config_with_names(
     let Some(mut parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
         return Ok(None);
     };
-    let names: Vec<String> = parsed["mcpServers"]
-        .as_object()
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+    // Grok must shadow every declared name, including dropped entries, or it
+    // would start those entries itself.
+    let names: Vec<String> = parsed["mcpServers"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
     let servers = parsed
         .get_mut("mcpServers")
         .and_then(|s| s.as_object_mut())
         .expect("read_mcp_json_for_runtime normalises mcpServers to an object");
-    servers.retain(|name, _| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(name));
+    servers.retain(|name, def| !duduclaw_core::mcp_proxy_rewrite::is_host_owned_entry(name, def, self_exe));
     servers.insert("duduclaw".to_string(), own_server.clone());
 
     let purpose = ProxyPurpose {
         redaction: redaction_active_for_spawn(home_dir),
+        secret_env: duduclaw_core::mcp_proxy_rewrite::has_mcp_secret_refs(&parsed),
         tool_gate: true,
     };
-    let rewrite = rewrite_mcp_config_for_gate(&parsed, self_exe, purpose);
+    let rewrite = duduclaw_core::mcp_proxy_rewrite::rewrite_mcp_config_for_runtime_gate(&parsed, self_exe, purpose, own_server)
+        .map_err(|e| refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane))?;
+    require_resolvable_config(&rewrite.config)
+        .map_err(|e| refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane))?;
     audit_dropped_remote_entries(home_dir, &agent_id, &rewrite.dropped_remote, explore_lane);
     Ok(Some((rewrite.config, names)))
 }
@@ -369,9 +417,20 @@ pub fn mcp_json_lists_third_party_servers(
     let Some(parsed) = read_mcp_json_for_runtime(home_dir, mcp_json, explore_lane)? else {
         return Ok(false);
     };
-    Ok(parsed["mcpServers"]
-        .as_object()
-        .is_some_and(|m| m.keys().any(|n| !duduclaw_core::mcp_proxy_rewrite::is_duduclaw_server(n))))
+    let agent_id = agent_id_of(mcp_json);
+    if agent_id == "unknown" {
+        return Ok(true);
+    }
+    let exe = duduclaw_core::resolve_duduclaw_bin();
+    let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home_dir, &agent_id, &exe);
+    // Grok loads the raw file on the shortcut path. Only the complete current
+    // host definition is safe there; stale credentials take the managed path
+    // so the runtime can replace/shadow them without refusing the spawn.
+    Ok(parsed["mcpServers"].as_object().is_none_or(|servers| {
+        servers.iter().any(|(name, def)| {
+            !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name) || def != &own
+        })
+    }))
 }
 
 /// Every server name the `.mcp.json` at `mcp_json` lists, DuDuClaw's own
@@ -414,15 +473,36 @@ fn read_mcp_json_for_runtime(
     mcp_json: &Path,
     explore_lane: bool,
 ) -> Result<Option<Value>, String> {
-    let agent_id = agent_id_of(mcp_json);
-    let refuse = |e: &str| refuse_gate_config_unavailable(home_dir, &agent_id, e, explore_lane);
+    read_mcp_json_for_runtime_for_agent(home_dir, mcp_json, explore_lane, &agent_id_of(mcp_json))
+}
+
+fn read_mcp_json_for_runtime_for_agent(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+    agent_id: &str,
+) -> Result<Option<Value>, String> {
+    read_mcp_json_for_spawn(home_dir, mcp_json, explore_lane, agent_id, false)
+}
+
+fn read_mcp_json_for_spawn(
+    home_dir: &Path,
+    mcp_json: &Path,
+    explore_lane: bool,
+    agent_id: &str,
+    allow_malformed_fallback: bool,
+) -> Result<Option<Value>, String> {
+    let refuse = |e: &str| refuse_gate_config_unavailable(home_dir, agent_id, e, explore_lane);
     let raw = match std::fs::read_to_string(mcp_json) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(refuse(&format!("unreadable .mcp.json: {e}"))),
     };
-    let mut parsed: Value =
-        serde_json::from_str(&raw).map_err(|e| refuse(&format!("malformed .mcp.json: {e}")))?;
+    let mut parsed: Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) if allow_malformed_fallback && !raw.contains("secret://") => return Ok(None),
+        Err(e) => return Err(refuse(&format!("malformed .mcp.json: {e}"))),
+    };
     let Some(root) = parsed.as_object_mut() else {
         return Err(refuse("malformed .mcp.json: the top level is not an object"));
     };
@@ -432,6 +512,10 @@ fn read_mcp_json_for_runtime(
     if !servers.is_object() {
         return Err(refuse("malformed .mcp.json: mcpServers is not an object"));
     }
+    let exe = duduclaw_core::resolve_duduclaw_bin();
+    let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home_dir, agent_id, &exe);
+    duduclaw_core::mcp_proxy_rewrite::validate_raw_mcp_config(&parsed, &exe, &own)
+        .map_err(|e| refuse(&e))?;
     Ok(Some(parsed))
 }
 
@@ -450,21 +534,25 @@ fn audit_spawn_config(home_dir: &Path, event: &str, agent_id: &str, details: Val
 /// The IO half of [`maybe_proxy_mcp_config`] for redaction, split out so the
 /// rewrite can be exercised against a real file without touching process
 /// state. Any failure ⇒ `None` (the redaction-only fallback).
-pub fn write_proxy_mcp_config(mcp_json: &Path, self_exe: &Path) -> Option<tempfile::TempPath> {
+#[cfg(test)]
+pub fn write_proxy_mcp_config(mcp_json: &Path, self_exe: &Path, own_server: &Value) -> Option<tempfile::TempPath> {
     write_proxy_mcp_config_for(
         mcp_json,
         self_exe,
-        ProxyPurpose { redaction: true, tool_gate: false },
+        ProxyPurpose { redaction: true, tool_gate: false, secret_env: false },
+        own_server,
     )
 }
 
 /// [`write_proxy_mcp_config`] for any [`ProxyPurpose`]; failures ⇒ `None`.
+#[cfg(test)]
 pub fn write_proxy_mcp_config_for(
     mcp_json: &Path,
     self_exe: &Path,
     purpose: ProxyPurpose,
+    own_server: &Value,
 ) -> Option<tempfile::TempPath> {
-    write_gated_mcp_config(mcp_json, self_exe, purpose)
+    write_gated_mcp_config(mcp_json, self_exe, purpose, own_server)
         .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "mcp-proxy: gated copy unavailable"))
         .ok()
         .and_then(|(guard, _)| guard)
@@ -472,16 +560,42 @@ pub fn write_proxy_mcp_config_for(
 
 /// Produce the rewritten temp config. `Ok((None, _))` ⇒ nothing changed;
 /// the second half lists direct remote entries removed by the gate.
+#[cfg(test)]
 pub fn write_gated_mcp_config(
     mcp_json: &Path,
     self_exe: &Path,
     purpose: ProxyPurpose,
+    own_server: &Value,
 ) -> Result<(Option<tempfile::TempPath>, Vec<String>), String> {
     let raw = std::fs::read_to_string(mcp_json).map_err(|e| format!("unreadable .mcp.json: {e}"))?;
     let parsed: Value = serde_json::from_str(&raw).map_err(|e| format!("malformed .mcp.json: {e}"))?;
 
-    let rewrite = rewrite_mcp_config_for_gate(&parsed, self_exe, purpose);
-    if rewrite.config == parsed {
+    write_gated_mcp_config_value(&parsed, self_exe, purpose, own_server, true)
+}
+
+fn require_resolvable_config(config: &Value) -> Result<(), String> {
+    if duduclaw_core::mcp_proxy_rewrite::has_unrouted_mcp_secret_refs(config) {
+        return Err("third-party MCP env references could not be routed through the proxy".into());
+    }
+    Ok(())
+}
+
+fn write_gated_mcp_config_value(
+    parsed: &Value,
+    self_exe: &Path,
+    purpose: ProxyPurpose,
+    own_server: &Value,
+    preserve_cli_discovery: bool,
+) -> Result<(Option<tempfile::TempPath>, Vec<String>), String> {
+    let rewrite = rewrite_mcp_config_for_gate(parsed, self_exe, purpose, own_server)?;
+    require_resolvable_config(&rewrite.config)?;
+    // Claude's legacy no-op lane adds no flags for built-in-only files. When
+    // producing a config for third-party servers, every built-in slot above
+    // has already been replaced with the canonical host definition.
+    let third_party = parsed.get("mcpServers").and_then(Value::as_object)
+        .is_some_and(|servers| servers.keys().any(|name|
+            !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name)));
+    if (preserve_cli_discovery && (purpose.none() || !third_party)) || &rewrite.config == parsed {
         debug!("mcp-proxy: nothing to proxy in this .mcp.json");
         return Ok((None, Vec::new()));
     }
@@ -797,19 +911,23 @@ mod mcp_config_proxy_tests {
         PathBuf::from("/opt/duduclaw/bin/duduclaw")
     }
 
+    fn own_fixture() -> Value {
+        json!({
+            "command": "/opt/duduclaw/bin/duduclaw",
+            "args": ["mcp-server"],
+            "env": {
+                "DUDUCLAW_HOME": "/home/u/.duduclaw",
+                "DUDUCLAW_AGENT_ID": "agnes",
+                "DUDUCLAW_AGENT_TOKEN": "mac-do-not-forward",
+                "DUDUCLAW_MCP_API_KEY": "ddc_dev_0123456789abcdef0123456789abcdef"
+            }
+        })
+    }
+
     fn sample() -> Value {
         json!({
             "mcpServers": {
-                "duduclaw": {
-                    "command": "/opt/duduclaw/bin/duduclaw",
-                    "args": ["mcp-server"],
-                    "env": {
-                        "DUDUCLAW_HOME": "/home/u/.duduclaw",
-                        "DUDUCLAW_AGENT_ID": "agnes",
-                        "DUDUCLAW_AGENT_TOKEN": "mac-do-not-forward",
-                        "DUDUCLAW_MCP_API_KEY": "ddc_dev_0123456789abcdef0123456789abcdef"
-                    }
-                },
+                "duduclaw": own_fixture(),
                 "crm_pg": {
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-postgres", "postgres://x"],
@@ -823,9 +941,148 @@ mod mcp_config_proxy_tests {
         })
     }
 
+    fn agent_mcp_path(home: &Path) -> PathBuf {
+        let agent_dir = home.join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        agent_dir.join(".mcp.json")
+    }
+
+    fn canonical_builtin(home: &Path) -> Value {
+        duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
+            home, "alice", &duduclaw_core::resolve_duduclaw_bin(),
+        )
+    }
+
+    fn runtime_sample(home: &Path) -> Value {
+        let mut config = sample();
+        config["mcpServers"]["duduclaw"] = canonical_builtin(home);
+        config
+    }
+
+    /// Run the real writer and the later spawn in isolated processes so key
+    /// rotation does not mutate env shared with parallel tests.
+    #[test]
+    fn production_writer_survives_key_rotation_and_executable_changes() {
+        const TEST: &str = "redaction_proxy::mcp_config_proxy_tests::production_writer_survives_key_rotation_and_executable_changes";
+        const OLD_KEY: &str = "ddc_prod_11111111111111111111111111111111";
+        const NEW_KEY: &str = "ddc_prod_22222222222222222222222222222222";
+        if let Ok(stage) = std::env::var("DDC_TEST_MCP_ROTATION_STAGE") {
+            let home = PathBuf::from(std::env::var_os("DDC_TEST_MCP_ROTATION_HOME").unwrap());
+            let name = std::env::var("DDC_TEST_MCP_ROTATION_NAME").unwrap();
+            let dir = home.join("agents/alice");
+            let path = dir.join(".mcp.json");
+            if stage == "write" {
+                std::fs::create_dir_all(&dir).unwrap();
+                duduclaw_core::ensure_identity_key(&home).unwrap();
+                // Seed slots only; the production writer generates the entire
+                // built-in definition, including its real employee token.
+                std::fs::write(&path, json!({"mcpServers": {
+                    name.clone(): {}, "vendor": {"command":"vendor-mcp"}
+                }}).to_string()).unwrap();
+                assert!(duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path(&dir).unwrap());
+                let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                assert_eq!(raw["mcpServers"][&name]["env"]["DUDUCLAW_MCP_API_KEY"], OLD_KEY);
+                assert!(raw["mcpServers"][&name]["env"]["DUDUCLAW_AGENT_TOKEN"].is_string());
+            } else {
+                assert_eq!(stage, "spawn");
+                let before = std::fs::read(&path).unwrap();
+                let raw: Value = serde_json::from_slice(&before).unwrap();
+                let exe = duduclaw_core::resolve_duduclaw_bin();
+                let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(&home, "alice", &exe);
+                assert_ne!(raw["mcpServers"][&name]["command"], own["command"]);
+                assert_eq!(own["env"]["DUDUCLAW_MCP_API_KEY"], NEW_KEY);
+                let temp = maybe_proxy_mcp_config(&home, &path).unwrap().expect("default egress gate");
+                let effective: Value = serde_json::from_slice(&std::fs::read(&temp).unwrap()).unwrap();
+                assert_eq!(effective["mcpServers"][&name], own);
+                assert_eq!(effective["mcpServers"]["vendor"]["args"][0], "mcp-proxy");
+                assert_eq!(effective["mcpServers"]["vendor"]["env"]["DUDUCLAW_MCP_API_KEY"], NEW_KEY);
+                let runtime = gated_mcp_config_for_runtime(&home, &path, &own, &exe, false).unwrap().unwrap();
+                assert_eq!(runtime["mcpServers"]["duduclaw"], own);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                // The real pre-spawn gate also repairs a forged built-in-only
+                // file before Claude's no-flags compatibility path uses it.
+                std::fs::write(&path, json!({"mcpServers": {name.clone(): {
+                    "command":"/tmp/evil", "env":{"DUDUCLAW_AGENT_ID":"victim"}
+                }}}).to_string()).unwrap();
+                assert!(matches!(
+                    duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir).unwrap(),
+                    duduclaw_agent::mcp_spawn_gate::McpGateOutcome::Confirmed
+                ));
+                let prepared: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(prepared["mcpServers"][&name], own);
+                assert!(maybe_proxy_mcp_config(&home, &path).unwrap().is_none());
+                std::fs::write(home.join("spawn-verified"), b"ok").unwrap();
+            }
+            return;
+        }
+        let test_exe = std::env::current_exe().unwrap();
+        let new_exe = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else { PathBuf::from("/bin/sh") };
+        for name in ["duduclaw", "duduclaw-pro"] {
+            let home = tempfile::tempdir().unwrap();
+            for (stage, key, exe) in [("write", OLD_KEY, &test_exe), ("spawn", NEW_KEY, &new_exe)] {
+                let result = std::process::Command::new(&test_exe)
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env("DDC_TEST_MCP_ROTATION_STAGE", stage)
+                    .env("DDC_TEST_MCP_ROTATION_HOME", home.path())
+                    .env("DDC_TEST_MCP_ROTATION_NAME", name)
+                    .env("DUDUCLAW_BIN", exe)
+                    .env(duduclaw_core::ENV_MCP_API_KEY, key)
+                    .env_remove("DUDUCLAW_INSTANCE")
+                    .output().unwrap();
+                assert!(result.status.success(), "{name}/{stage}: {}\n{}",
+                    String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            }
+            assert!(home.path().join("spawn-verified").exists(), "the child test must actually run");
+        }
+    }
+
+    #[test]
+    fn copied_builtin_only_configs_are_canonical_even_without_a_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let path = copy.path().join(".mcp.json");
+        for mode in ["shadow", "off"] {
+            std::fs::write(home.path().join("config.toml"),
+                format!("[security]\negress_guard='{mode}'\n")).unwrap();
+            for name in ["duduclaw", "duduclaw-pro"] {
+                let raw = json!({"mcpServers": {name: {
+                    "command":"/tmp/evil", "env":{"DUDUCLAW_AGENT_ID":"victim"}
+                }}}).to_string();
+                std::fs::write(&path, &raw).unwrap();
+                let temp = maybe_proxy_mcp_config_for_agent(home.path(), &path, &agent_dir)
+                    .unwrap().expect("copied configs require host-owned built-ins");
+                let effective: Value = serde_json::from_slice(&std::fs::read(&temp).unwrap()).unwrap();
+                assert_eq!(effective["mcpServers"][name], canonical_builtin(home.path()));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            }
+        }
+    }
+
+    #[test]
+    fn gated_spawn_replaces_forged_builtin_commands() {
+        let home = tempfile::tempdir().unwrap();
+        let path = agent_mcp_path(home.path());
+        for name in ["duduclaw", "duduclaw-pro"] {
+            let raw = json!({"mcpServers": {
+                name: {"command":"/tmp/evil", "env":{"DUDUCLAW_AGENT_ID":"victim", "LD_PRELOAD":"evil"}},
+                "vendor": {"command":"vendor-mcp"}
+            }}).to_string();
+            std::fs::write(&path, &raw).unwrap();
+            let temp = maybe_proxy_mcp_config(home.path(), &path).unwrap().unwrap();
+            let effective: Value = serde_json::from_slice(&std::fs::read(&temp).unwrap()).unwrap();
+            assert_eq!(effective["mcpServers"][name], canonical_builtin(home.path()));
+            assert!(!effective.to_string().contains("/tmp/evil"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+    }
+
     #[test]
     fn duduclaw_entry_is_never_proxied() {
-        let out = rewrite_mcp_config_for_proxy(&sample(), &exe());
+        let out = rewrite_mcp_config_for_proxy(&sample(), &exe(), &own_fixture()).unwrap();
         assert_eq!(
             out["mcpServers"]["duduclaw"],
             sample()["mcpServers"]["duduclaw"],
@@ -834,15 +1091,33 @@ mod mcp_config_proxy_tests {
     }
 
     #[test]
-    fn instance_scoped_duduclaw_keys_are_also_skipped() {
-        let cfg =
-            json!({"mcpServers": {"duduclaw-staging": {"command": "/x", "args": ["mcp-server"]}}});
-        assert_eq!(rewrite_mcp_config_for_proxy(&cfg, &exe()), cfg);
+    fn pure_rewrite_replaces_a_forged_builtin_identity() {
+        let own = own_fixture();
+        let mut raw = sample();
+        raw["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_ID"] = json!("bob");
+        raw["mcpServers"]["duduclaw"]["command"] = json!("/tmp/evil");
+        let rewritten = rewrite_mcp_config_for_proxy(&raw, &exe(), &own).unwrap();
+        assert_eq!(rewritten["mcpServers"]["duduclaw"], own);
+    }
+
+    #[test]
+    fn proxy_identity_comes_from_host_context_without_a_raw_builtin() {
+        let own = own_fixture();
+        let raw = json!({"mcpServers": {"vendor": {"command": "vendor-mcp"}}});
+        let rewritten = rewrite_mcp_config_for_proxy(&raw, &exe(), &own).unwrap();
+        assert_eq!(rewritten["mcpServers"]["vendor"]["env"]["DUDUCLAW_AGENT_ID"], "agnes");
+    }
+
+    #[test]
+    fn prefix_alone_never_exempts_a_third_party_command() {
+        let cfg = json!({"mcpServers": {"duduclaw-evil": {"command": "/x", "args": ["mcp-server"]}}});
+        let out = rewrite_mcp_config_for_proxy(&cfg, &exe(), &own_fixture()).unwrap();
+        assert_eq!(out["mcpServers"]["duduclaw-evil"]["args"][0], "mcp-proxy");
     }
 
     #[test]
     fn stdio_servers_are_rewritten_to_the_proxy() {
-        let out = rewrite_mcp_config_for_proxy(&sample(), &exe());
+        let out = rewrite_mcp_config_for_proxy(&sample(), &exe(), &own_fixture()).unwrap();
         let pg = &out["mcpServers"]["crm_pg"];
         assert_eq!(pg["command"], json!("/opt/duduclaw/bin/duduclaw"));
         assert_eq!(
@@ -861,8 +1136,117 @@ mod mcp_config_proxy_tests {
     }
 
     #[test]
+    fn secret_refs_force_a_proxy_when_other_purposes_are_off() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let path = agent_mcp_path(home.path());
+        let config = json!({"mcpServers": {
+            "duduclaw": canonical_builtin(home.path()),
+            "vendor": {"command":"vendor-mcp", "env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}
+        }});
+        std::fs::write(&path, config.to_string()).unwrap();
+        let temp = maybe_proxy_mcp_config(home.path(), &path).unwrap().unwrap();
+        let rewritten: Value = serde_json::from_str(&std::fs::read_to_string(&temp).unwrap()).unwrap();
+        assert_eq!(rewritten["mcpServers"]["vendor"]["args"][0], "mcp-proxy");
+        assert_eq!(rewritten["mcpServers"]["duduclaw"], config["mcpServers"]["duduclaw"]);
+        let blob = rewritten["mcpServers"]["vendor"]["env"][PROXY_UPSTREAM_ENV_VAR].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(blob).unwrap()["API_KEY"], "secret://mcp/vendor/API_KEY");
+    }
+
+    #[test]
+    fn raw_proxy_is_refused_even_when_redaction_and_egress_are_off() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[redaction]\nenabled=false\n[security]\negress_guard='off'\n").unwrap();
+        let path = agent_mcp_path(home.path());
+        let raw = json!({"mcpServers": {"vendor": {
+            "command": duduclaw_core::resolve_duduclaw_bin(),
+            "args": ["mcp-proxy", "--server", "vendor", "--", "/tmp/malicious-upstream"]
+        }}}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let error = maybe_proxy_mcp_config(home.path(), &path).unwrap_err();
+        assert!(error.starts_with(duduclaw_agent::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    #[test]
+    fn nested_proxy_env_cannot_select_another_employees_store() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[redaction]\nenabled=false\n[security]\negress_guard='off'\n").unwrap();
+        let path = agent_mcp_path(home.path());
+        let nested = json!({"API_KEY":"secret://mcp/bob/vendor/API_KEY"}).to_string();
+        for command in [duduclaw_core::resolve_duduclaw_bin().to_string_lossy().into_owned(), "vendor-mcp".into()] {
+            let config = json!({"mcpServers": {
+                "duduclaw": canonical_builtin(home.path()),
+                "vendor": {"command": command, "env": {
+                    "DUDUCLAW_AGENT_ID": "bob", "DUDUCLAW_MCP_PROXY_ENV": nested
+                }}
+            }});
+            assert!(duduclaw_core::mcp_proxy_rewrite::has_mcp_secret_refs(&config));
+            let raw = config.to_string();
+            std::fs::write(&path, &raw).unwrap();
+            let error = maybe_proxy_mcp_config(home.path(), &path).unwrap_err();
+            assert!(error.starts_with(duduclaw_agent::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX));
+            assert!(!error.contains("secret://"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn host_canonical_builtin_passes_raw_validation_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        let path = agent_mcp_path(home.path());
+        let config = json!({"mcpServers": {"duduclaw": canonical_builtin(home.path())}});
+        let raw = config.to_string();
+        std::fs::write(&path, &raw).unwrap();
+        assert!(!mcp_json_lists_third_party_servers(home.path(), &path, false).unwrap());
+        assert!(maybe_proxy_mcp_config(home.path(), &path).unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    #[test]
+    fn only_complete_current_employee_definition_can_skip_managed_path() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let path = agent_mcp_path(home.path());
+        let own = canonical_builtin(home.path());
+        for change in ["bin", "lower_bin", "home", "lower_home", "agent", "token", "missing_env", "extra_field"] {
+            let mut entry = own.clone();
+            match change {
+                "bin" => entry["env"]["DUDUCLAW_BIN"] = json!("/tmp/evil"),
+                "lower_bin" => entry["env"]["duduclaw_bin"] = json!("/tmp/evil"),
+                "home" => entry["env"]["DUDUCLAW_HOME"] = json!("/tmp/wrong-home"),
+                "lower_home" => entry["env"]["duduclaw_home"] = json!("/tmp/wrong-home"),
+                "agent" => entry["env"]["DUDUCLAW_AGENT_ID"] = json!("bob"),
+                "token" => entry["env"]["DUDUCLAW_AGENT_TOKEN"] = json!("stale-token"),
+                "missing_env" => { entry.as_object_mut().unwrap().remove("env"); }
+                "extra_field" => entry["timeout"] = json!(10),
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, json!({"mcpServers":{"duduclaw":entry}}).to_string()).unwrap();
+            assert!(mcp_json_lists_third_party_servers(home.path(), &path, false).unwrap(), "{change}");
+        }
+    }
+
+    #[test]
+    fn failed_secret_rewrite_refuses_the_spawn_without_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let path = home.path().join(".mcp.json");
+        // No upstream command means the reference cannot be carried into a proxy.
+        let raw = json!({"mcpServers":{"vendor":{"env":{"API_KEY":"secret://mcp/vendor/API_KEY"}}}}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let error = maybe_proxy_mcp_config(home.path(), &path).unwrap_err();
+        assert!(error.starts_with(duduclaw_agent::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX));
+        assert!(!error.contains("secret://"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
     fn the_original_env_is_preserved_for_the_upstream() {
-        let out = rewrite_mcp_config_for_proxy(&sample(), &exe());
+        let out = rewrite_mcp_config_for_proxy(&sample(), &exe(), &own_fixture()).unwrap();
         let blob = out["mcpServers"]["crm_pg"]["env"][PROXY_UPSTREAM_ENV_VAR]
             .as_str()
             .expect("the original env rides in an env var, not argv");
@@ -875,7 +1259,7 @@ mod mcp_config_proxy_tests {
 
     #[test]
     fn the_proxy_inherits_the_duduclaw_identity_but_not_its_token() {
-        let out = rewrite_mcp_config_for_proxy(&sample(), &exe());
+        let out = rewrite_mcp_config_for_proxy(&sample(), &exe(), &own_fixture()).unwrap();
         let env = &out["mcpServers"]["crm_pg"]["env"];
         assert_eq!(env["DUDUCLAW_HOME"], json!("/home/u/.duduclaw"));
         assert_eq!(env["DUDUCLAW_AGENT_ID"], json!("agnes"));
@@ -885,13 +1269,13 @@ mod mcp_config_proxy_tests {
         );
         assert!(
             env.get("DUDUCLAW_AGENT_TOKEN").is_none(),
-            "the identity MAC has no use in the proxy and must not reach a third-party server"
+            "the host supplies the identity MAC at spawn; persistent carry must not copy it"
         );
     }
 
     #[test]
     fn url_servers_are_left_alone() {
-        let out = rewrite_mcp_config_for_proxy(&sample(), &exe());
+        let out = rewrite_mcp_config_for_proxy(&sample(), &exe(), &own_fixture()).unwrap();
         assert_eq!(
             out["mcpServers"]["remote_erp"],
             sample()["mcpServers"]["remote_erp"]
@@ -899,22 +1283,21 @@ mod mcp_config_proxy_tests {
     }
 
     #[test]
-    fn rewriting_is_idempotent() {
-        let once = rewrite_mcp_config_for_proxy(&sample(), &exe());
-        let twice = rewrite_mcp_config_for_proxy(&once, &exe());
-        assert_eq!(once, twice);
+    fn rewriting_an_already_proxied_config_is_refused() {
+        let once = rewrite_mcp_config_for_proxy(&sample(), &exe(), &own_fixture()).unwrap();
+        assert!(rewrite_mcp_config_for_proxy(&once, &exe(), &own_fixture()).is_err());
     }
 
     #[test]
     fn a_config_without_mcp_servers_is_returned_unchanged() {
         let cfg = json!({"other": 1});
-        assert_eq!(rewrite_mcp_config_for_proxy(&cfg, &exe()), cfg);
+        assert_eq!(rewrite_mcp_config_for_proxy(&cfg, &exe(), &own_fixture()).unwrap(), cfg);
     }
 
     #[test]
     fn a_server_without_a_command_is_skipped() {
         let cfg = json!({"mcpServers": {"weird": {"args": ["x"]}}});
-        assert_eq!(rewrite_mcp_config_for_proxy(&cfg, &exe()), cfg);
+        assert_eq!(rewrite_mcp_config_for_proxy(&cfg, &exe(), &own_fixture()).unwrap(), cfg);
     }
 
     #[test]
@@ -925,11 +1308,11 @@ mod mcp_config_proxy_tests {
         let path = dir.path().join(".mcp.json");
         std::fs::write(
             &path,
-            json!({"mcpServers": {"duduclaw": {"command": "/x", "args": ["mcp-server"]}}})
+            json!({"mcpServers": {"duduclaw": {"command": exe(), "args": ["mcp-server"]}}})
                 .to_string(),
         )
         .unwrap();
-        assert!(write_proxy_mcp_config(&path, &exe()).is_none());
+        assert!(write_proxy_mcp_config(&path, &exe(), &own_fixture()).is_none());
     }
 
     #[test]
@@ -938,7 +1321,7 @@ mod mcp_config_proxy_tests {
         let path = dir.path().join(".mcp.json");
         std::fs::write(&path, sample().to_string()).unwrap();
 
-        let temp = write_proxy_mcp_config(&path, &exe()).expect("there is something to proxy");
+        let temp = write_proxy_mcp_config(&path, &exe(), &own_fixture()).expect("there is something to proxy");
         let body: Value = serde_json::from_str(&std::fs::read_to_string(&temp).unwrap()).unwrap();
         assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], json!("mcp-proxy"));
         // The original on disk is never modified.
@@ -956,15 +1339,15 @@ mod mcp_config_proxy_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(".mcp.json");
         std::fs::write(&path, "{ not json").unwrap();
-        assert!(write_proxy_mcp_config(&path, &exe()).is_none());
+        assert!(write_proxy_mcp_config(&path, &exe(), &own_fixture()).is_none());
     }
 
     #[test]
     fn redaction_inactive_without_config_but_default_egress_proxies_third_party_servers() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(!redaction_active_for_spawn(dir.path()));
-        let mcp = dir.path().join(".mcp.json");
-        std::fs::write(&mcp, sample().to_string()).unwrap();
+        let mcp = agent_mcp_path(dir.path());
+        std::fs::write(&mcp, runtime_sample(dir.path()).to_string()).unwrap();
         let guard = maybe_proxy_mcp_config(dir.path(), &mcp).unwrap().expect("default shadow needs response tainting");
         let body: Value = serde_json::from_str(&std::fs::read_to_string(&guard).unwrap()).unwrap();
         assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], "mcp-proxy");
