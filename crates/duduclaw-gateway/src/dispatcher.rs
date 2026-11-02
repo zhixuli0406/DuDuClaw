@@ -699,33 +699,9 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         }
 
 
-        // H19: same turn-end invalidation as the JSONL bus rail above — this
-        // turn concluded, so any ephemeral spawn tickets it queued while over
-        // capacity are moot. Best-effort, fail-open no-op when absent.
-        if let Some(tid) = msg.turn_id.as_deref() {
-            let removed = duduclaw_core::spawn_admission::invalidate_owner(
-                home_dir,
-                crate::ephemeral::EPHEMERAL_ADMISSION_CLASS,
-                tid,
-            );
-            if !removed.is_empty() {
-                info!(
-                    turn = tid,
-                    count = removed.len(),
-                    "H19: turn ended — invalidated its queued ephemeral spawn ticket(s)"
-                );
-                for t in &removed {
-                    duduclaw_security::audit::append_tool_call_with_extras(
-                        home_dir,
-                        "system",
-                        "ephemeral_admission_invalidated",
-                        &format!("ticket_id={} turn_id={tid}", t.ticket_id),
-                        true,
-                        &[("ticket_id", serde_json::Value::String(t.ticket_id.clone()))],
-                    );
-                }
-            }
-        }
+        // SQLite turn IDs belong to the origin of a delegated child, so its
+        // completion must not invalidate the origin's ephemeral tickets.
+        // Tickets still expire by TTL; cancelled turns are fenced on replay.
 
         if matches!(&result, Err(DispatchError::OriginStopped)) {
             if let Err(error) = queue.fail(&msg.id, crate::downstream_runs::STOPPED).await {

@@ -164,7 +164,7 @@ async fn gmail_fanout_preserves_repeated_query_fields_and_curated_output() {
     let mut io = RecordingIo {
         json: VecDeque::from([
             json!({"messages":[{"id":"abc","threadId":"thread"}]}),
-            json!({"payload":{"headers":[{"name":"From","value":"Alice"},{"name":"Subject","value":"驗證碼 123456"},{"name":"Date","value":"Today"}]},"snippet":"請使用 654321 OTP","ignored":"not returned"}),
+            json!({"payload":{"headers":[{"name":"From","value":"驗證碼 482913 https://example.test/magic/AbCdEf0123456789"},{"name":"Subject","value":"驗證碼 123456"},{"name":"Date","value":"Today"}]},"snippet":"請使用 654321 OTP","ignored":"not returned"}),
         ]),
         ..Default::default()
     };
@@ -190,8 +190,36 @@ async fn gmail_fanout_preserves_repeated_query_fields_and_curated_output() {
         serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(
         decoded,
-        json!({"count":1,"messages":[{"id":"abc","thread_id":"thread","from":"Alice","subject":"驗證碼 [已移除 1 組驗證碼]","date":"Today","snippet":"請使用 [已移除 1 組驗證碼] OTP"}]})
+        json!({"count":1,"messages":[{"id":"abc","thread_id":"thread","from":"驗證碼 [已移除 1 組驗證碼] [已移除 1 個登入連結]","subject":"驗證碼 [已移除 1 組驗證碼]","date":"Today","snippet":"請使用 [已移除 1 組驗證碼] OTP"}]})
     );
+}
+
+#[tokio::test]
+async fn gmail_draft_masks_returned_subject_without_changing_draft_content() {
+    use base64::Engine;
+
+    let subject = "驗證碼 482913 https://example.test/magic/AbCdEf0123456789";
+    let mut io = RecordingIo {
+        json: VecDeque::from([json!({"id":"draft123","message":{"id":"m123"}})]),
+        ..Default::default()
+    };
+    let template = NativeCallTemplate::prepare(
+        "gmail_create_draft",
+        &json!({"to":"me@example.test","subject":subject,"body":"body"}),
+    )
+    .unwrap();
+    let result = gmail_create_draft(&mut io, &template, "me@example.test", subject, "body", None).await.unwrap();
+    assert!(!result.subject.contains("482913"));
+    assert!(!result.subject.contains("https://example.test/magic/AbCdEf0123456789"));
+    assert!(result.subject.contains("[已移除 1 組驗證碼]"));
+    assert!(result.subject.contains("[已移除 1 個登入連結]"));
+    let raw = io.wire[0].3.as_ref().unwrap()["message"]["raw"].as_str().unwrap();
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw).unwrap();
+    let message = String::from_utf8(decoded).unwrap();
+    let encoded_subject = message.lines().find_map(|line| line.strip_prefix("Subject: =?UTF-8?B?"))
+        .unwrap().strip_suffix("?=").unwrap();
+    let decoded_subject = base64::engine::general_purpose::STANDARD.decode(encoded_subject).unwrap();
+    assert_eq!(String::from_utf8(decoded_subject).unwrap(), subject);
 }
 
 #[tokio::test]
@@ -205,11 +233,14 @@ async fn gmail_read_masks_body_subject_and_snippet_but_keeps_message_identifiers
             "threadId":"thread123",
             "snippet":"OTP 123456",
             "payload":{"headers":[
-                {"name":"From","value":"Alice"},
-                {"name":"To","value":"Bob"},
+                {"name":"From","value":"驗證碼 482913 https://example.test/magic/AbCdEf0123456789"},
+                {"name":"To","value":"驗證碼 482913 https://example.test/magic/AbCdEf0123456789"},
                 {"name":"Subject","value":"驗證碼 654321"},
                 {"name":"Date","value":"2026-11-01T10:00:00Z"}
-            ],"mimeType":"text/plain","body":{"data":body}}
+            ],"mimeType":"multipart/mixed","parts":[
+                {"filename":"驗證碼 482913 https://example.test/magic/AbCdEf0123456789","body":{"size":12}},
+                {"mimeType":"text/plain","body":{"data":body}}
+            ]}
         })]),
         ..Default::default()
     };
@@ -218,6 +249,15 @@ async fn gmail_read_masks_body_subject_and_snippet_but_keeps_message_identifiers
     assert_eq!(decoded["id"], "m123");
     assert_eq!(decoded["thread_id"], "thread123");
     assert_eq!(decoded["date"], "2026-11-01T10:00:00Z");
+    for field in ["from", "to"] {
+        assert!(!decoded[field].as_str().unwrap().contains("482913"));
+        assert!(!decoded[field].as_str().unwrap().contains("https://example.test/magic/AbCdEf0123456789"));
+        assert!(decoded[field].as_str().unwrap().contains("[已移除 1 個登入連結]"));
+    }
+    assert!(!decoded["attachments"][0]["filename"].as_str().unwrap().contains("482913"));
+    assert!(!decoded["attachments"][0]["filename"].as_str().unwrap().contains("https://example.test/magic/AbCdEf0123456789"));
+    assert!(decoded["attachments"][0]["filename"].as_str().unwrap().contains("[已移除 1 組驗證碼]"));
+    assert!(decoded["attachments"][0]["filename"].as_str().unwrap().contains("[已移除 1 個登入連結]"));
     assert_eq!(decoded["subject"], "驗證碼 [已移除 1 組驗證碼]");
     assert_eq!(decoded["snippet"], "OTP [已移除 1 組驗證碼]");
     assert_eq!(decoded["body"], "安全碼 [已移除 1 組驗證碼]");
