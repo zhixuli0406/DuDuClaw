@@ -40,6 +40,8 @@ unicode-normalization = "0.1.25"
 default = []
 # Synthetic policy for dependent-crate debug tests; ineffective in release libraries/binaries.
 installation-policy-test-hooks = []
+# Observe actual admission contention in dependent-crate tests only.
+autonomy-gate-test-hooks = []
 # `compat.d` declarative app-compatibility runner registry (src/compat_runners.rs).
 # OS-only: only DuDuClaw OS ships the `compat.d` layer and the shell that spawns
 # its runners, so the platform binary does not compile it. The OS recipe turns it
