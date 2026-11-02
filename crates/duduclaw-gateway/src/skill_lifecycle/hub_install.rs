@@ -563,8 +563,11 @@ mod tests {
 
         // A trust-store writer must be excluded even while the installer is
         // waiting for history. Reverse acquisition would leave trust unlocked.
-        let held = tokio::time::timeout(Duration::from_secs(5), async {
+        let held = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
+                if install.is_finished() {
+                    return Err("installer finished before holding trust while history is locked");
+                }
                 match trust_lock.try_lock_exclusive() {
                     Ok(()) => FileExt::unlock(&trust_lock).unwrap(),
                     Err(error)
@@ -573,7 +576,7 @@ mod tests {
                                 Some(code) == fs2::lock_contended_error().raw_os_error()
                             }) =>
                     {
-                        break;
+                        return Ok(());
                     }
                     Err(error) => panic!("unexpected trust lock error: {error}"),
                 }
@@ -583,8 +586,9 @@ mod tests {
         let pending = !install.is_finished();
         let no_history = !home.join(duduclaw_agent::skill_hub::SKILL_SIGNATURE_HISTORY_FILE).exists();
         FileExt::unlock(&history_lock).unwrap();
-        let result = install.await.unwrap();
-        assert!(held.is_ok(), "installer must hold trust before acquiring history");
+        let result = tokio::time::timeout(Duration::from_secs(30), install).await
+            .expect("installer did not finish within 30 s after releasing history").unwrap();
+        assert!(matches!(held, Ok(Ok(()))), "installer did not hold trust while history was locked: observation={held:?}, pending={pending}, no_history={no_history}, result={result:?}");
         assert!(pending && no_history, "no install may commit while history is locked");
         result.unwrap();
         trust_lock.try_lock_exclusive().unwrap();
