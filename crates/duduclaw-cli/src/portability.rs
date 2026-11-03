@@ -266,6 +266,36 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
     #[test]
+    fn mfa_personal_import_succeeds_after_empty_home_restore() {
+        let root = unique_tmp("personal-after-restore");
+        let target = root.join("target");
+        let staging = duduclaw_gateway::backup_restore::staging_dir(&target);
+        write(&staging.join("config.toml"), "[auth]\nmfa_enforced=false\n");
+        drop(duduclaw_auth::UserDb::new(&staging.join("users.db")).unwrap());
+        duduclaw_gateway::backup_restore::write_marker(&target, &duduclaw_gateway::backup_restore::RestoreMarker {
+            staged_at: chrono::Utc::now(), source_filename: "normal.tar.gz".into(),
+        }).unwrap();
+        duduclaw_gateway::backup_restore::perform_pending_restore_swap(&target, "personal").unwrap().unwrap();
+        duduclaw_gateway::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+            &target, "127.0.0.1:18789".parse().unwrap(), true, None,
+        ).unwrap();
+        let config: toml::Table = fs::read_to_string(target.join("config.toml")).unwrap().parse().unwrap();
+        assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(false));
+        let conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
+        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+        drop(conn);
+        let source = root.join("source");
+        write(&source.join("config.toml"), "[gateway]\nport=18789\n");
+        write(&source.join("agents/imported/SOUL.md"), "imported");
+        drop(duduclaw_auth::UserDb::new(&source.join("users.db")).unwrap());
+        let archive = root.join("normal.tar.gz");
+        export_home(&source, &archive).unwrap();
+        import_archive(&archive, &target, true, true).unwrap();
+        assert_eq!(fs::read_to_string(target.join("agents/imported/SOUL.md")).unwrap(), "imported");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn mfa_import_cannot_change_policy_before_moving_agents() {
         let root = unique_tmp("mfa-policy");
         let source = root.join("source");
@@ -366,6 +396,38 @@ mod tests {
         assert!(!target.join("agents.pre-import").exists());
         assert_eq!(fs::read_to_string(target.join("users.db")).unwrap(), "not a database");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mfa_import_refuses_unseeded_and_invalid_policy_before_migration() {
+        for (index, rows) in ["", "(1,0),(1,0)", "(1,2)", "(1,'false')", "(1,NULL)", "(2,0)"].iter().enumerate() {
+            let root = unique_tmp(&format!("mfa-invalid-policy-{index}"));
+            let source = root.join("source");
+            let target = root.join("target");
+            let config = "[auth]\nmfa_enforced=false\n";
+            write(&source.join("config.toml"), config);
+            write(&source.join("agents/new/SOUL.md"), "new");
+            write(&target.join("config.toml"), config);
+            write(&target.join("agents/kept/SOUL.md"), "keep");
+            let conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
+            conn.execute_batch("CREATE TABLE users(id TEXT); CREATE TABLE mfa_policy_state(id, enforced);").unwrap();
+            if !rows.is_empty() {
+                conn.execute_batch(&format!("INSERT INTO mfa_policy_state VALUES {rows}")).unwrap();
+            }
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get(0)).unwrap();
+            let archive = root.join("input.tar.gz");
+            export_home(&source, &archive).unwrap();
+            for personal in [false, true] {
+                let error = import_archive(&archive, &target, true, personal).unwrap_err().to_string();
+                assert!(error.contains("MFA policy") || error.contains("Invalid column type"), "{rows}: {error}");
+                assert!(!target.join("agents.pre-import").exists());
+                assert!(!target.join("agents/new").exists());
+                assert_eq!(fs::read_to_string(target.join("agents/kept/SOUL.md")).unwrap(), "keep");
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), count);
+            }
+            drop(conn);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

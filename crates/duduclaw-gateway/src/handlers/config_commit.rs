@@ -798,6 +798,22 @@ mod tests {
     }
 
     #[test]
+    fn mfa_missing_singleton_refuses_config_commit_without_repair() {
+        for before in ["", "[auth]\nmfa_enforced=false\n", "[auth]\nmfa_enforced=true\n"] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("config.toml");
+            std::fs::write(&path, before).unwrap();
+            drop(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            conn.execute("DELETE FROM mfa_policy_state", []).unwrap();
+            let after = format!("{before}\n[general]\nlog_level='debug'\n");
+            assert!(commit_text_locked(&path, &content_hash(before), &after).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+    }
+
+    #[test]
     fn connecting_config_refuses_publication_when_memory_fence_is_unreadable() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("memory.db"), "not a database").unwrap();

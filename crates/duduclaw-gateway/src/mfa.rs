@@ -85,7 +85,7 @@ fn parse_policy(text: &str) -> Result<bool, String> {
 /// Restore must preserve the live policy; an unreadable policy defaults to strict.
 pub(crate) fn restore_policy(home: &Path) -> bool {
     // No Admin could have disabled enforcement without an identity store.
-    // Personal still ignores this policy at every enforcement entry point.
+    // Verified Personal provisioning later normalizes config and durable state.
     if policy_store_is_absent(home) { return true; }
     crate::handlers::config_commit::read_regular_config(&home.join("config.toml"))
         .ok().and_then(|text| {
@@ -189,16 +189,13 @@ fn record_policy(home: &Path, value: bool) -> Result<Option<i64>, String> {
 /// Read the durable boundary without creating/migrating the identity store.
 /// This reader is strict; boot_policy separately handles a genuinely absent store.
 fn read_policy_state(home: &Path) -> Result<bool, String> {
-    use rusqlite::OptionalExtension;
     let db = rusqlite::Connection::open_with_flags(
         home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ).map_err(|e| e.to_string())?;
-    db.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0))
-        .optional().map(|v| v.unwrap_or(false)).map_err(|e| e.to_string())
+    duduclaw_auth::mfa::read_enforcement(&db)
 }
 
 fn read_boot_policy_state(home: &Path) -> Result<bool, String> {
-    use rusqlite::OptionalExtension;
     let path = home.join("users.db");
     if !std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?.file_type().is_file() {
         return Err("users.db must be a regular file".into());
@@ -206,10 +203,9 @@ fn read_boot_policy_state(home: &Path) -> Result<bool, String> {
     let db = rusqlite::Connection::open_with_flags(
         path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ).map_err(|e| e.to_string())?;
-    match db.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).optional() {
-        Ok(value) => Ok(value.unwrap_or(false)),
-        Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
-            if message == "no such table: mfa_policy_state" => {
+    match duduclaw_auth::mfa::read_enforcement(&db) {
+        Ok(value) => Ok(value),
+        Err(message) if message == "no such table: mfa_policy_state" => {
             // Only a wholly pre-MFA schema may pass without a recorded policy.
             let legacy: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND lower(name)='users')
@@ -220,6 +216,29 @@ fn read_boot_policy_state(home: &Path) -> Result<bool, String> {
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Boot precheck runs before UserDb migration. Accept only the released
+/// unseeded state here, without weakening readers used by config/import gates.
+pub(crate) fn precheck_boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
+    if matches!(read_boot_policy_state(home), Err(error) if error == "MFA policy singleton missing") {
+        let db = rusqlite::Connection::open_with_flags(
+            home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).map_err(|e| e.to_string())?;
+        // Project both columns so an empty but malformed table is still refused.
+        let mut statement = db.prepare("SELECT id, enforced FROM mfa_policy_state")
+            .map_err(|e| e.to_string())?;
+        let empty = statement.query([]).map_err(|e| e.to_string())?
+            .next().map_err(|e| e.to_string())?.is_none();
+        let legacy: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND lower(name)='users')
+             AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND lower(name)='mfa_policy_state')",
+            [], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if empty && legacy { return Ok(false); }
+        return Err("MFA policy state is not a legacy unseeded store".into());
+    }
+    boot_policy(home, personal)
 }
 
 pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
@@ -249,6 +268,9 @@ pub(crate) fn policy_store_is_absent(home: &Path) -> bool {
 /// the durable policy by adding false. Only the Admin MFA adapter may do so.
 pub(crate) fn refuse_policy_change_at(home: &Path, before: &str, after: &str) -> Result<(), String> {
     refuse_policy_change(before, after)?;
+    // Even an unchanged explicit key must not let an ordinary save repair
+    // a corrupt store via the subsequent policy reload.
+    if !policy_store_is_absent(home) { read_boot_policy_state(home)?; }
     let before_table: toml::Table = before.parse().map_err(|_| "登入設定格式不正確。")?;
     let after_table: toml::Table = after.parse().map_err(|_| "登入設定格式不正確。")?;
     if before_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none()
@@ -391,6 +413,50 @@ mod tests {
         conn.execute_batch("DROP TABLE mfa_policy_state").unwrap();
         assert!(boot_policy(home.path(), false).is_err());
         assert_eq!(policy_status(home.path())["degraded"], true);
+    }
+
+    #[test]
+    fn mfa_explicit_false_reload_cannot_repair_missing_singleton() {
+        let home = tempfile::tempdir().unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+        reload_policy(home.path());
+        assert!(enforced(home.path(), false).unwrap());
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute("DELETE FROM mfa_policy_state", []).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        // This is a live-store deletion after initialization, not an upgrade.
+        // Reload must not run migration or repair it, even with explicit false.
+        assert!(read_policy_state(home.path()).is_err());
+        assert!(read_boot_policy_state(home.path()).is_err());
+        assert!(refuse_policy_change_at(home.path(), "[auth]\nmfa_enforced=false", "[auth]\nmfa_enforced=false").is_err());
+        assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=false", false, true).is_err());
+        reload_policy(home.path());
+        assert!(enforced(home.path(), false).unwrap());
+        assert_eq!(policy_status(home.path())["degraded"], true);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn mfa_invalid_singleton_refuses_boot_and_config_write() {
+        for rows in ["", "(1,0),(1,0)", "(1,2)", "(1,'false')", "(1,NULL)", "(2,0)"] {
+            let home = tempfile::tempdir().unwrap();
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            conn.execute_batch("CREATE TABLE users(id TEXT); CREATE TABLE mfa_policy_state(id, enforced);").unwrap();
+            if !rows.is_empty() {
+                conn.execute_batch(&format!("INSERT INTO mfa_policy_state VALUES {rows}")).unwrap();
+            }
+            if rows.is_empty() {
+                assert!(!precheck_boot_policy(home.path(), false).unwrap());
+            } else {
+                assert!(precheck_boot_policy(home.path(), false).is_err(), "{rows}");
+            }
+            assert!(read_policy_state(home.path()).is_err(), "{rows}");
+            assert!(read_boot_policy_state(home.path()).is_err(), "{rows}");
+            assert!(boot_policy(home.path(), false).is_err(), "{rows}");
+            assert_eq!(policy_status(home.path())["degraded"], true);
+            assert!(refuse_policy_change_at(home.path(), "", "[auth]\nmfa_enforced=false").is_err(), "{rows}");
+        }
     }
 
     #[test]

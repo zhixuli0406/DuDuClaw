@@ -1064,6 +1064,34 @@ mod tests {
     }
 
     #[test]
+    fn mfa_empty_home_restore_normalizes_only_after_verified_personal_provisioning() {
+        for personal in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+            drop(duduclaw_auth::UserDb::new(&staging.join("users.db")).unwrap());
+            // Include a dormant true in the archived store to check both outputs.
+            let mut conn = rusqlite::Connection::open(staging.join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+            drop(conn);
+            write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename: "normal.tar.gz".into() }).unwrap();
+            perform_pending_restore_swap(home, "empty-mfa").unwrap().unwrap();
+            let read_config = || std::fs::read_to_string(home.join("config.toml")).unwrap().parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool().unwrap();
+            assert!(read_config()); // Edition is still unknown.
+            crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+                home, "127.0.0.1:18789".parse().unwrap(), personal, None,
+            ).unwrap();
+            crate::mfa::reload_policy(home);
+            assert_eq!(read_config(), !personal);
+            assert_eq!(crate::mfa::boot_policy(home, false).unwrap(), !personal);
+            let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+            assert_eq!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap(), !personal);
+        }
+    }
+
+    #[test]
     fn mfa_restore_before_first_boot_cannot_import_a_disabled_policy() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
@@ -1082,8 +1110,8 @@ mod tests {
         crate::mfa::reload_policy(home);
         assert!(crate::mfa::enforced(home, false).unwrap());
         assert!(crate::mfa::boot_policy(home, false).unwrap());
-        // Restore is edition-agnostic and writes strict config even for an
-        // empty Personal home; Personal must still ignore it at enforcement.
+        // Restore remains strict until the edition is verified; a verified
+        // Personal boot normalizes this during MCP provisioning.
         let config: toml::Table = std::fs::read_to_string(home.join("config.toml")).unwrap().parse().unwrap();
         assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(true));
         assert!(!crate::mfa::enforced(home, true).unwrap());

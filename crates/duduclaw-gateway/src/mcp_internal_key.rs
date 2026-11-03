@@ -171,11 +171,20 @@ fn provision_internal_mcp_key(
         // Without an identity store, false cannot have come from an Admin toggle.
         // Persist the new default before creating users.db, so interrupted boot
         // still has a strict config from which reload can reconcile the store.
-        if fresh_team || (enforced && auth_missing) {
+        if fresh_team || (personal != Some(true) && enforced && auth_missing) {
             let auth = table.entry("auth").or_insert_with(|| toml::Value::Table(toml::Table::new()));
             auth.as_table_mut().ok_or("config.toml [auth] is not a table")?
                 .insert("mfa_enforced".into(), toml::Value::Boolean(true));
             restored = true;
+        }
+        let mut personal_normalized = false;
+        // Restore runs before license verification and conservatively keeps true.
+        // Once Personal is verified, persist its effective policy, including on
+        // retries after a config write succeeded but the durable write failed.
+        if personal == Some(true) && table.get("auth").and_then(|a| a.get("mfa_enforced")) == Some(&toml::Value::Boolean(true)) {
+            table.get_mut("auth").and_then(|a| a.as_table_mut()).ok_or("invalid auth table")?
+                .insert("mfa_enforced".into(), toml::Value::Boolean(false));
+            personal_normalized = true;
         }
         let now = Utc::now();
 
@@ -261,7 +270,7 @@ fn provision_internal_mcp_key(
         };
 
         // Steady state: a young key and nothing to prune ⇒ no write at all.
-        if !minted && prune.is_empty() && !restored && !missing {
+        if !minted && prune.is_empty() && !restored && !missing && !personal_normalized {
             return Ok(((key, false, false), None));
         }
 
@@ -314,8 +323,25 @@ fn provision_internal_mcp_key(
         }
         Ok(((key, restored, fresh_team), Some(rendered)))
     }, |(_, _, fresh_team)| {
+        if personal == Some(true) {
+            if !crate::mfa::policy_store_is_absent(home_dir) {
+                let mut conn = rusqlite::Connection::open_with_flags(
+                    home_dir.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+                ).map_err(|e| e.to_string())?;
+                let has_policy: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE lower(name)='mfa_policy_state')",
+                    [], |r| r.get(0),
+                ).map_err(|e| e.to_string())?;
+                // A pre-MFA store gets false from migration. A present but
+                // incomplete table must not be silently repaired to false.
+                if has_policy && duduclaw_auth::mfa::read_enforcement(&conn)? {
+                    duduclaw_auth::mfa::record_enforcement(&mut conn, false, Utc::now().timestamp_micros())?;
+                }
+            }
+            return Ok(());
+        }
         if !fresh_team { return Ok(()); }
-        let _db = duduclaw_auth::UserDb::new(&home_dir.join("users.db"))?;
+        let _db = duduclaw_auth::UserDb::new_with_mfa_default(&home_dir.join("users.db"), true)?;
         let mut conn = rusqlite::Connection::open_with_flags(
             home_dir.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         ).map_err(|e| e.to_string())?;
@@ -474,6 +500,28 @@ mod tests {
 
     fn provision(home: &Path, personal: bool, env: Option<&str>) -> Result<String, String> {
         ensure_internal_mcp_key_for_gateway(home, "127.0.0.1:18888".parse().unwrap(), personal, env)
+    }
+
+    #[test]
+    fn mfa_verified_personal_normalization_keeps_legacy_and_corrupt_states_distinct() {
+        for corrupt in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            conn.execute_batch("CREATE TABLE users(id TEXT)").unwrap();
+            if corrupt {
+                conn.execute_batch("CREATE TABLE mfa_policy_state(id INTEGER PRIMARY KEY, enforced INTEGER, enforced_at INTEGER)").unwrap();
+            }
+            let result = ensure_internal_mcp_key_for_gateway(
+                home.path(), "127.0.0.1:18789".parse().unwrap(), true, None,
+            );
+            assert_eq!(result.is_err(), corrupt, "{result:?}");
+            if corrupt {
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            } else {
+                assert!(conn.prepare("SELECT * FROM mfa_policy_state").is_err());
+            }
+        }
     }
 
     #[test]

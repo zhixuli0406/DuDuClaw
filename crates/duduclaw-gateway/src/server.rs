@@ -195,7 +195,7 @@ struct AppState {
 fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<(), String> {
     match std::fs::symlink_metadata(home.join("users.db")) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            crate::mfa::boot_policy(home, personal).map(|_| ())
+            crate::mfa::precheck_boot_policy(home, personal).map(|_| ())
         }
         Ok(_) => Err("MFA policy state unavailable: users.db must be a regular file, not a symlink or special file".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -206,6 +206,75 @@ fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<()
 #[cfg(all(test, unix))]
 mod identity_policy_precheck_tests {
     use super::precheck_identity_policy;
+
+    #[test]
+    fn mfa_legacy_unseeded_policy_passes_boot_precheck_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute("DELETE FROM mfa_policy_state", []).unwrap();
+        for personal in [false, true] {
+            precheck_identity_policy(home.path(), personal).unwrap();
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        drop(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
+        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+    }
+
+    // Match the released users and unseeded policy schema, without invoking
+    // the new migration to build the fixture (which would hide the regression).
+    fn v1792_unseeded_store(home: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+        conn.execute_batch("CREATE TABLE users (
+            id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'employee',
+            status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, last_login TEXT,
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            bootstrap_owner INTEGER NOT NULL DEFAULT 0, credential_epoch INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE mfa_policy_state (
+            id INTEGER PRIMARY KEY CHECK(id=1), enforced INTEGER NOT NULL, enforced_at INTEGER
+        );").unwrap();
+        conn
+    }
+
+    #[test]
+    fn mfa_v1792_unseeded_upgrade_without_config_key_stays_false() {
+        for personal in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let conn = v1792_unseeded_store(home.path());
+            std::fs::write(home.path().join("config.toml"), "[gateway]\nport=18789\n").unwrap();
+            precheck_identity_policy(home.path(), personal).unwrap();
+            // The read-only precheck leaves seeding to UserDb, as on real boot.
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+            crate::mfa::reload_policy(home.path());
+            assert!(!crate::mfa::enforced(home.path(), personal).unwrap());
+            assert_eq!(crate::mfa::policy_status(home.path())["degraded"], false);
+            let rows = conn.prepare("SELECT id, enforced FROM mfa_policy_state").unwrap()
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap()
+                .collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(rows, vec![(1, 0)]);
+        }
+    }
+
+    #[test]
+    fn mfa_v1792_unseeded_upgrade_with_explicit_true_enforces_after_reload() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = v1792_unseeded_store(home.path());
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+        precheck_identity_policy(home.path(), false).unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+        crate::mfa::reload_policy(home.path());
+        assert!(crate::mfa::enforced(home.path(), false).unwrap());
+        assert_eq!(crate::mfa::policy_status(home.path())["degraded"], false);
+        let rows = conn.prepare("SELECT id, enforced FROM mfa_policy_state").unwrap()
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows, vec![(1, 1)]);
+    }
 
     #[test]
     fn legacy_identity_store_passes_without_initializing_mfa_tables() {
