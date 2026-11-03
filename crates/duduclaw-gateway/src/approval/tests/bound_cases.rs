@@ -34,6 +34,7 @@ fn seed_fixture_run(home: &Path, binding: &ExecutionBinding) {
         request_id: binding.run_id.clone(),
     };
     let run = WorkflowRun {
+        on_behalf_of: None,
         run_id: binding.run_id.clone(),
         trigger_key: trigger.key("bound-case", 1).unwrap(),
         trigger,

@@ -28,6 +28,7 @@ pub(super) async fn seed_run(
         request_id: id.into(),
     };
     let run = WorkflowRun {
+        on_behalf_of: None,
         run_id: id.into(),
         trigger_key: trigger.key("wf", 1).unwrap(),
         trigger,

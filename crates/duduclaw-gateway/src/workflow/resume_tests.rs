@@ -257,7 +257,11 @@ impl Resume {
         let service = self.pilot.reopen();
         let report = Box::pin(service.sweep()).await;
         assert!(report.errors.is_empty(), "{report:?}");
-        assert_eq!(self.message(&id).await.status, MessageStatus::Pending);
+        let message = self.message(&id).await;
+        assert_eq!(message.status, MessageStatus::Pending);
+        assert_eq!(message.sender, "workflow");
+        assert_eq!(message.sender_agent.as_deref(), Some("workflow"));
+        assert_eq!(message.origin_agent.as_deref(), Some("workflow"));
         id
     }
 

@@ -524,6 +524,9 @@ async fn enqueue_routine_trigger(
 ) -> Result<String, String> {
     let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
     if !task.enabled { return Err("workflow cron disabled".into()); }
+    if !cron_principal_allowed(home_dir, store, registry, &task).await {
+        return Err("workflow cron principal refused".into());
+    }
     cron_autonomy_check(home_dir, registry, &task.agent_id).await?;
     let (activation_id, material_hash) = store.workflow_binding(task_id).await?.ok_or("workflow cron binding missing")?;
     let owned;
@@ -572,7 +575,12 @@ async fn enqueue_routine_trigger(
             return Err("scheduled trigger is not a routine occurrence".into());
         }
     }
-    service.enqueue_trigger(&activation_id, trigger, serde_json::json!({})).await
+    let principal = crate::on_behalf_of::from_stored(
+        home_dir, task.on_behalf_of.as_deref(), &task.agent_id, "cron_workflow",
+    );
+    crate::on_behalf_of::scope_first(principal,
+        service.enqueue_trigger(&activation_id, trigger, serde_json::json!({})),
+    ).await
 }
 
 /// Route a due cron task through its trigger gate (G3), then execute it if the
@@ -599,6 +607,21 @@ async fn dispatch_cron_task_with_slot(
     home_dir:&std::path::Path,store:&Arc<CronStore>,registry:&Arc<RwLock<AgentRegistry>>,
     task:&CronTaskRow,invoker:&dyn AgentInvoker,slot:Option<String>,
 ) {
+    // Cached schedules must not run an older prompt without a newly stored origin.
+    let task = match store.get(&task.id).await {
+        // A paused cached occurrence must not run; explicit manual runs may
+        // start from a row that was already disabled when the caller read it.
+        Ok(Some(row)) if task.enabled && !row.enabled => return,
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(id = %task.id, %error, "cron row could not be refreshed before firing");
+            return;
+        }
+    };
+    let principal = crate::on_behalf_of::from_stored(
+        home_dir, task.on_behalf_of.as_deref(), &task.agent_id, "cron_task",
+    );
     // Bind the legacy alias to the same concrete employee the runner resolves.
     // Pass that ID onward so a later registry main-role change cannot retarget
     // a fire after its autonomy check.
@@ -612,16 +635,19 @@ async fn dispatch_cron_task_with_slot(
             return;
         }
     }
-    crate::autonomous_runtime::scope(
+    crate::on_behalf_of::scope_first(principal, crate::autonomous_runtime::scope(
         home_dir, &effective_task.agent_id, &[],
         dispatch_effective_cron_task(home_dir, store, registry, &effective_task, invoker, slot),
-    ).await;
+    )).await;
 }
 
 async fn dispatch_effective_cron_task(
     home_dir: &Path, store: &Arc<CronStore>, registry: &Arc<RwLock<AgentRegistry>>,
     task: &CronTaskRow, invoker: &dyn AgentInvoker, slot: Option<String>,
 ) {
+    if !cron_principal_allowed(home_dir, store, registry, task).await {
+        return;
+    }
     // Check the initiating caller as well as the effective target before
     // trigger evaluation or runtime setup; final transport admission remains.
     if let Err(reason) = crate::autonomous_runtime::check_current().await {
@@ -798,6 +824,42 @@ async fn record_autonomy_skip(home: &Path, store: &CronStore, task: &CronTaskRow
     true
 }
 
+/// Recheck live roles/accounts at fire time, including a manual initiator and
+/// the stored origin. A changed target is paused, never detached as background.
+async fn cron_principal_allowed(
+    home: &Path, store: &CronStore, registry: &Arc<RwLock<AgentRegistry>>, task: &CronTaskRow,
+) -> bool {
+    let current = crate::on_behalf_of::current();
+    let registry = registry.read().await;
+    for principal in [current.as_deref(), task.on_behalf_of.as_deref()] {
+        let result = match crate::on_behalf_of::access::requires_main_restriction(home, principal) {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                let agent = if task.agent_id == "default" {
+                    registry.main_agent()
+                } else {
+                    registry.get(&task.agent_id)
+                };
+                match agent {
+                    Some(agent) => crate::on_behalf_of::access::check_loaded_main_target(home, principal, agent).await,
+                    None => Err("cron target unavailable".to_string()),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(reason) = result {
+            if let Err(error) = store.set_enabled(&task.id, false).await {
+                warn!(id = %task.id, %error, "cron principal refusal could not pause task");
+            }
+            if let Err(error) = store.record_autonomy_skip(&task.id, &reason).await {
+                warn!(id = %task.id, %error, "cron principal refusal could not be recorded");
+            }
+            return false;
+        }
+    }
+    true
+}
+
 async fn execute_cron_task(
     home_dir: &std::path::Path,
     store: &Arc<CronStore>,
@@ -818,6 +880,9 @@ async fn execute_cron_task(
         }
     };
     let task = &resolved_task;
+    if !cron_principal_allowed(home_dir, store, registry, task).await {
+        return;
+    }
     if record_autonomy_skip(home_dir, store, task).await {
         return;
     }
@@ -1377,6 +1442,10 @@ async fn run_cron_task_now_with(
 #[cfg(test)]
 #[path = "cron_routine_tests.rs"]
 mod routine_tests;
+
+#[cfg(test)]
+#[path = "cron_principal_tests.rs"]
+mod principal_tests;
 
 #[cfg(test)]
 mod tests {

@@ -105,18 +105,18 @@ async fn the_default_employee_is_the_sole_bound_non_main_employee() {
     assert_eq!(r.agent.as_deref(), Some("finance"));
     assert!(!r.switched);
     let refused = route(&f, "@嘟嘟總機 你好", Some("finance")).await.unwrap_err();
-    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert_eq!(code(&refused), Some("agent_unavailable"));
 }
 
 #[tokio::test]
 async fn calling_another_employee_needs_a_binding() {
     let f = fixture().await;
     let refused = route(&f, "@sales-rep 報價", None).await.unwrap_err();
-    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert_eq!(code(&refused), Some("agent_unavailable"));
     let refused = route(&f, "@sales-rep 報價", Some("finance"))
         .await
         .unwrap_err();
-    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert_eq!(code(&refused), Some("agent_unavailable"));
     let r = route(&f, "@財務小幫手 幫我算帳", None).await.unwrap();
     assert_eq!(r.agent.as_deref(), Some("finance"));
     assert!(r.switched, "answers in finance's own session bucket");
@@ -154,7 +154,7 @@ async fn a_suspended_account_loses_its_bindings() {
         .set_user_status(&f.emp, UserStatus::Suspended)
         .unwrap();
     let refused = route(&f, "@財務小幫手 幫我算帳", None).await.unwrap_err();
-    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert_eq!(code(&refused), Some("agent_unavailable"));
 }
 
 async fn route_as(f: &Fixture, user: &str, text: &str) -> Result<WebRoute, Box<ChatMessage>> {
@@ -184,7 +184,7 @@ async fn a_manager_calls_a_reports_employee_but_not_a_peers() {
     assert_eq!(r.agent.as_deref(), Some("sales-rep"));
     assert!(r.switched);
     let refused = route_as(&f, &mgr, "@財務小幫手 幫我算帳").await.unwrap_err();
-    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert_eq!(code(&refused), Some("agent_unavailable"));
     match *route_as(&f, &mgr, "@").await.unwrap_err() {
         ChatMessage::Error { choices, .. } => assert_eq!(
             choices.unwrap(),
@@ -205,7 +205,7 @@ async fn cutting_the_reporting_line_takes_effect_on_the_next_message() {
     assert!(route_as(&f, &mgr, "@sales-rep 報價").await.is_ok());
     f.state.user_db.set_manager(&lead, None).unwrap();
     let refused = route_as(&f, &mgr, "@sales-rep 報價").await.unwrap_err();
-    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert_eq!(code(&refused), Some("agent_unavailable"));
     assert!(!f.state.agent_access_allowed(&mgr, "sales-rep").await);
 }
 
@@ -215,7 +215,7 @@ async fn personal_edition_ignores_leftover_reporting_lines_in_webchat() {
     let (mgr, _lead) = team(&f);
     crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal);
     let refused = route_as(&f, &mgr, "@sales-rep 報價").await.unwrap_err();
-    assert_eq!(code(&refused), Some(AGENT_FORBIDDEN_CODE));
+    assert_eq!(code(&refused), Some("agent_unavailable"));
     assert!(!f.state.agent_access_allowed(&mgr, "sales-rep").await);
 }
 
@@ -288,7 +288,7 @@ async fn primary_selection_never_guesses_among_multiple_or_stale_bindings() {
     db.set_primary_agent(&f.emp, Some("dudu")).unwrap();
     assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("multiple_agents"));
     let frame = f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err();
-    assert_eq!(code(&frame), Some("main_agent_admin_only"));
+    assert_eq!(code(&frame), Some("agent_unavailable"));
     db.unbind_agent(&f.emp, "dudu").unwrap();
     // A stale primary must not select the remaining Owner automatically.
     assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("multiple_agents"));
@@ -302,10 +302,10 @@ async fn primary_selection_never_guesses_among_multiple_or_stale_bindings() {
 async fn configured_default_and_all_main_roles_are_denied_even_when_bound() {
     let f = fixture().await;
     std::fs::write(f._dir.path().join("config.toml"), "[general]\ndefault_agent = \"finance\"\n").unwrap();
-    assert_eq!(code(&f.state.authorize_target(&f.emp, "finance", false).await.unwrap_err()), Some("main_agent_admin_only"));
+    assert_eq!(code(&f.state.authorize_target(&f.emp, "finance", false).await.unwrap_err()), Some("agent_unavailable"));
     assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("no_agents"));
     f.state.user_db.bind_agent(&f.emp, "dudu", AccessLevel::Owner).unwrap();
-    assert_eq!(code(&f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err()), Some("main_agent_admin_only"));
+    assert_eq!(code(&f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err()), Some("agent_unavailable"));
 }
 
 #[tokio::test]
@@ -393,7 +393,7 @@ async fn every_main_role_is_blocked_not_only_the_registrys_first_main() {
     write_agent(&f._dir.path().join("agents"), "second-main", "Other main", "@other-main", "main", "");
     f.state.ctx.registry.write().await.scan().await.unwrap();
     f.state.user_db.bind_agent(&f.emp, "second-main", AccessLevel::Owner).unwrap();
-    assert_eq!(code(&f.state.authorize_target(&f.emp, "second-main", false).await.unwrap_err()), Some("main_agent_admin_only"));
+    assert_eq!(code(&f.state.authorize_target(&f.emp, "second-main", false).await.unwrap_err()), Some("agent_unavailable"));
     assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("finance"));
 }
 
@@ -458,8 +458,8 @@ async fn personal_non_admin_cannot_use_main_default_explicit_resume_or_session_i
     f.state.user_db.bind_agent(&f.emp, "dudu", AccessLevel::Operator).unwrap();
     assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("finance"));
     assert_eq!(route(&f, "Hello", None).await.unwrap().agent.as_deref(), Some("finance"));
-    assert_eq!(code(&route(&f, "Hello", Some("dudu")).await.unwrap_err()), Some("main_agent_admin_only"));
-    assert_eq!(code(&f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err()), Some("main_agent_admin_only"));
+    assert_eq!(code(&route(&f, "Hello", Some("dudu")).await.unwrap_err()), Some("agent_unavailable"));
+    assert_eq!(code(&f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err()), Some("agent_unavailable"));
     assert!(!f.state.may_resume_into(&f.emp, "dudu", "webchat:x", "webchat:u").await);
     assert!(!f.state.agent_access_allowed(&f.emp, "dudu").await);
     assert!(route(&f, "@嘟嘟總機 Hello", None).await.is_err());
@@ -468,4 +468,173 @@ async fn personal_non_admin_cannot_use_main_default_explicit_resume_or_session_i
     let actual = serde_json::to_value(actual).unwrap();
     assert_eq!(actual["resolved_agent"], serde_json::Value::Null);
     assert_eq!(actual["assignment_error"]["reason"], "unavailable");
+}
+
+#[tokio::test]
+async fn non_admin_target_and_mention_refusals_are_identical() {
+    let f = fixture().await;
+    let expected = serde_json::to_value(crate::webchat::access::agent_unavailable()).unwrap();
+    for target in ["does-not-exist", "sales-rep", "dudu"] {
+        let frame = f.state.authorize_target(&f.emp, target, false).await.unwrap_err();
+        assert_eq!(serde_json::to_value(frame).unwrap(), expected, "target {target}");
+    }
+    for text in ["@does-not-exist hello", "@sales-rep hello", "@嘟嘟總機 hello"] {
+        let frame = route(&f, text, Some("finance")).await.unwrap_err();
+        assert_eq!(serde_json::to_value(frame).unwrap(), expected, "mention {text}");
+    }
+    // Composite list requests must not reveal whether an inaccessible name
+    // exists either. Both expose only the caller's allowed employees.
+    for suffix in [" @", " @財"] {
+        let absent = route(&f, &format!("@does-not-exist{suffix}"), Some("finance")).await.unwrap_err();
+        let forbidden = route(&f, &format!("@sales-rep{suffix}"), Some("finance")).await.unwrap_err();
+        assert_eq!(serde_json::to_value(absent).unwrap(), serde_json::to_value(forbidden).unwrap());
+    }
+    assert!(route(&f, "Contact ann@example.com", Some("finance")).await.is_ok());
+    assert!(route(&f, "meet @ 5pm", Some("finance")).await.is_ok());
+    for target in ["does-not-exist", "sales-rep", "dudu"] {
+        let frame = f.state.authorize_resume_target(&f.emp, target).await.unwrap_err();
+        assert_eq!(serde_json::to_value(frame).unwrap(), expected, "resume {target}");
+    }
+}
+
+#[tokio::test]
+async fn admin_target_errors_and_unknown_mentions_keep_legacy_responses() {
+    let f = fixture().await;
+    let admin = f.state.user_db.create_user("admin-target@test.local", "Admin", "EmpPass-12345", UserRole::Admin).unwrap();
+    let detailed = ChatMessage::error("unknown agent: absent");
+    let expected = serde_json::to_value(&detailed).unwrap();
+    assert_eq!(serde_json::to_value(f.state.target_error(&admin.id, detailed).await).unwrap(), expected);
+    assert_eq!(route_as(&f, &admin.id, "@does-not-exist hello").await.unwrap().agent, None);
+    assert!(f.state.authorize_target(&admin.id, "dudu", false).await.is_ok());
+    let access = f.state.sender_access(&admin.id).await;
+    let reg = f.state.ctx.registry.read().await;
+    let frame = route_outcome(&f.state, &reg, &access, &admin.id, "dudu",
+        TriggerRoute::Forbidden { agent: "sales-rep".into() }).unwrap_err();
+    assert_eq!(code(&frame), Some(AGENT_FORBIDDEN_CODE));
+}
+
+#[tokio::test]
+async fn reply_builder_rechecks_final_agent_after_role_or_default_changes() {
+    for change in ["role", "default", "removed"] {
+        let f = fixture().await;
+        assert!(f.state.authorize_target(&f.emp, "finance", false).await.is_ok());
+        let path = f._dir.path().join("agents/finance/agent.toml");
+        match change {
+            "role" => {
+                let raw = std::fs::read_to_string(&path).unwrap().replace("role = \"specialist\"", "role = \"main\"");
+                std::fs::write(&path, raw).unwrap();
+                f.state.ctx.registry.write().await.scan().await.unwrap();
+            }
+            "default" => std::fs::write(f._dir.path().join("config.toml"), "[general]\ndefault_agent = \"finance\"\n").unwrap(),
+            _ => {
+                std::fs::remove_file(path).unwrap();
+                let mut reg = duduclaw_agent::AgentRegistry::new(f._dir.path().join("agents"));
+                reg.scan().await.unwrap();
+                *f.state.ctx.registry.write().await = reg;
+            }
+        }
+        let mut model = crate::agent_channels::e2e_seam::arm_waiting(f._dir.path());
+        // Bypass the earlier WebChat gate deliberately, just as a turn that
+        // passed it immediately before an administrator changed the target.
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5),
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.emp.clone(),
+                crate::channel_reply::build_reply_for_agent("Hello", &f.state.ctx,
+                    "finance", "webchat:final-agent-race", "webchat:user", None)),
+        ).await.expect("refusal must return before the model seam");
+        let expected = if change == "removed" {
+            crate::channel_reply::SELECTED_AGENT_UNAVAILABLE
+        } else {
+            crate::webchat::access::AGENT_UNAVAILABLE_TEXT
+        };
+        assert_eq!(reply, expected, "change {change}");
+        assert!(model.entered.try_recv().is_err(), "no model invocation for {change}");
+        assert!(f.state.ctx.session_manager.get_messages("webchat:final-agent-race").await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn final_reply_main_gate_preserves_admin_token_admin_and_widget() {
+    for kind in ["admin", "token-admin", "widget"] {
+        let f = fixture().await;
+        let admin = f.state.user_db.create_user("final-admin@test.local", "Admin", "EmpPass-12345", UserRole::Admin).unwrap();
+        let principal = match kind {
+            "admin" => admin.id,
+            "token-admin" => "system".into(),
+            _ => "widget-visitor:main-gate".into(),
+        };
+        let mut model = crate::agent_channels::e2e_seam::arm_waiting(f._dir.path());
+        let (reply, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(principal,
+                    crate::channel_reply::build_reply_for_agent("Hello", &f.state.ctx,
+                        "dudu", "webchat:main-unchanged", "webchat:user", None)),
+                async {
+                    let entered = model.entered.recv().await.expect("main model seam reached");
+                    entered.release.send(()).unwrap();
+                },
+            )
+        }).await.expect("privileged/widget main route must reach the seam");
+        assert!(reply.contains("OWN_BOT_REPLY agent=dudu"), "{kind}: {reply}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_and_forbidden_mentions_never_become_an_armed_assignment_body() {
+    use crate::trigger_route::pending::{self, PendingKey, PendingKind};
+    let f = fixture().await;
+    for text in ["@missing-employee Hello", "@sales-rep Hello", "@嘟嘟總機 Hello"] {
+        let sid = format!("webchat:pending-mention:{}", uuid::Uuid::new_v4());
+        let key = PendingKey::new("webchat", &sid, &f.emp);
+        pending::arm_kind(&key, "finance", PendingKind::Assign, "arm", pending::next_seq());
+        let frame = pending_assign_reply(&f.state, &f.emp, text, Some("finance"),
+            "dudu", &sid, "webchat:user", None, Some("body"), pending::next_seq()).await;
+        assert!(frame.is_none());
+        assert_eq!(code(&route(&f, text, Some("finance")).await.unwrap_err()), Some("agent_unavailable"));
+        assert!(!f._dir.path().join("tasks.db").exists());
+    }
+}
+
+#[tokio::test]
+async fn assignment_commands_hide_unavailable_names_and_private_exact_matches() {
+    use crate::trigger_route::assign::{self, AssignCaller, AssignCommand, Plan};
+    use crate::trigger_route::texts::Lang;
+    let f = fixture().await;
+    let expected = serde_json::to_value(crate::webchat::access::agent_unavailable()).unwrap();
+    for text in ["@missing work", "@sales-rep work", "@dudu work"] {
+        let mut cmd = crate::chat_commands::ChatCommand::Assign(AssignCommand::Text(text.into()));
+        let denied = f.state.authorize_command(&f.emp, &mut cmd).await.unwrap_err();
+        assert_eq!(serde_json::to_value(denied).unwrap(), expected);
+    }
+    write_agent(&f._dir.path().join("agents"), "fin", "Private", "@fin", "specialist", "");
+    f.state.ctx.registry.write().await.scan().await.unwrap();
+    let mut cmd = crate::chat_commands::ChatCommand::Assign(AssignCommand::Text("@fin work".into()));
+    f.state.authorize_command(&f.emp, &mut cmd).await.unwrap();
+    let access = f.state.sender_access(&f.emp).await;
+    let caller = AssignCaller {
+        home: f._dir.path(), channel: "webchat", conversation: "webchat:assign-private",
+        sender: &f.emp, event: None, seq: 0, fallback: Some("finance"), access,
+    };
+    let command = AssignCommand::Text("@fin work".into());
+    let with_hidden = {
+        let reg = f.state.ctx.registry.read().await;
+        let private = assign::plan(&reg, Lang::ZhTw, &command, &caller);
+        assert!(matches!(&private, Plan::Reply(reply) if reply.list.as_ref().is_some_and(|list| list.len() == 1)));
+        let channel = AssignCaller { channel: "line", ..caller.clone() };
+        assert_ne!(assign::plan(&reg, Lang::ZhTw, &command, &channel), private,
+            "other channels keep their existing exact private-name refusal");
+        private
+    };
+    let admin = f.state.user_db.create_user("assign-admin@test.local", "Admin", "EmpPass-12345", UserRole::Admin).unwrap();
+    f.state.authorize_command(&admin.id, &mut cmd).await.unwrap();
+    let admin_caller = AssignCaller { access: f.state.sender_access(&admin.id).await, ..caller.clone() };
+    {
+        let reg = f.state.ctx.registry.read().await;
+        assert!(matches!(assign::plan(&reg, Lang::ZhTw, &command, &admin_caller),
+            Plan::Create(spec) if spec.agent == "fin"), "Admin keeps the exact target");
+    }
+    std::fs::remove_file(f._dir.path().join("agents/fin/agent.toml")).unwrap();
+    f.state.ctx.registry.write().await.scan().await.unwrap();
+    let reg = f.state.ctx.registry.read().await;
+    assert_eq!(assign::plan(&reg, Lang::ZhTw, &command, &caller), with_hidden,
+        "a private exact match must not shadow the visible partial match");
 }

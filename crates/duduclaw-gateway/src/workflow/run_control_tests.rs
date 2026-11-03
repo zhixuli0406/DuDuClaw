@@ -13,6 +13,7 @@ fn run(id: &str, status: RunStatus, class: Option<&str>, created_at: &str) -> Wo
         request_id: id.into(),
     };
     WorkflowRun {
+        on_behalf_of: None,
         run_id: id.into(),
         trigger_key: trigger.key("wf", 1).unwrap(),
         trigger,
@@ -243,4 +244,62 @@ async fn cancelled_run_is_final_for_every_writer() {
     fixture.activation_id = None;
     insert(&store, &fixture).await;
     assert!(service.cancel_run("f", "dashboard:op").await.is_err());
+}
+
+#[tokio::test]
+async fn workflow_origin_survives_json_restart_and_queue_handoff() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(WorkflowStore::open(home.path()).unwrap());
+    let mut carried = run("principal", RunStatus::Pending, None, &Utc::now().to_rfc3339());
+    let old_json = serde_json::to_value(&carried).unwrap();
+    assert!(old_json.get("on_behalf_of").is_none());
+    assert_eq!(serde_json::from_value::<WorkflowRun>(old_json).unwrap().on_behalf_of, None);
+    carried.on_behalf_of = Some("user:employee".into());
+    insert(&store, &carried).await;
+    drop(store);
+    let reopened = Arc::new(WorkflowStore::open(home.path()).unwrap());
+    let restored = reopened.get_run("principal").await.unwrap().unwrap();
+    assert_eq!(restored.on_behalf_of, carried.on_behalf_of);
+    let broker = Arc::new(crate::approval::ApprovalBroker::open(home.path()).unwrap());
+    let service = WorkflowService::new(home.path().into(), std::env::current_exe().unwrap(), reopened, broker).unwrap();
+    let message_id = enqueue_outbox_id(&restored.run_id);
+    service.deliver_handoff(&message_id, &restored, "{}".into()).await.unwrap();
+    let queue = crate::message_queue::MessageQueue::open(home.path()).unwrap();
+    assert_eq!(queue.get_by_id(&message_id).await.unwrap().unwrap().on_behalf_of, carried.on_behalf_of);
+}
+
+#[tokio::test]
+async fn workflow_principal_is_immutable_after_additive_trigger_migration() {
+    let home = tempfile::tempdir().unwrap();
+    let store = WorkflowStore::open(home.path()).unwrap();
+    let mut carried = run("immutable-principal", RunStatus::Pending, None, &Utc::now().to_rfc3339());
+    carried.on_behalf_of = Some("user:employee".into());
+    insert(&store, &carried).await;
+    let legacy = run("legacy-principal", RunStatus::Pending, None, &Utc::now().to_rfc3339());
+    insert(&store, &legacy).await;
+    // Model a pre-upgrade database: the existing authority trigger remains,
+    // while the newly introduced principal trigger does not exist yet.
+    store.with_connection(|conn| conn.execute_batch(
+        "DROP TRIGGER workflow_run_principal_immutable"
+    ).map_err(|e| e.to_string())).await.unwrap();
+    drop(store);
+    let reopened = Arc::new(WorkflowStore::open(home.path()).unwrap());
+    for sql in [
+        "UPDATE workflow_runs SET record_json=json_remove(record_json,'$.on_behalf_of') WHERE run_id='immutable-principal'",
+        "UPDATE workflow_runs SET record_json=json_set(record_json,'$.on_behalf_of','user:admin') WHERE run_id='immutable-principal'",
+        "UPDATE workflow_runs SET record_json=json_set(record_json,'$.on_behalf_of','user:admin') WHERE run_id='legacy-principal'",
+    ] {
+        let error = reopened.with_connection(|conn| conn.execute(sql, [])
+            .map_err(|e| e.to_string())).await.unwrap_err();
+        assert!(error.contains("workflow run principal immutable"), "{error}");
+    }
+    let broker = Arc::new(crate::approval::ApprovalBroker::open(home.path()).unwrap());
+    let service = WorkflowService::new(home.path().into(), std::env::current_exe().unwrap(), reopened, broker).unwrap();
+    let mut changed = carried.clone();
+    changed.on_behalf_of = None;
+    assert!(service.runner.save_run(&changed).await.unwrap_err().contains("workflow run principal immutable"));
+    carried.status = RunStatus::Running;
+    service.runner.save_run(&carried).await.unwrap();
+    assert_eq!(service.store.get_run(&carried.run_id).await.unwrap().unwrap().on_behalf_of,
+        carried.on_behalf_of);
 }

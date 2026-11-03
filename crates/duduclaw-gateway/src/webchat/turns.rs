@@ -508,7 +508,9 @@ async fn execute_inner(input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
         state.may_resume_into(&input.auth_user, &agent, &sid, &input.user_id),
     ).await;
     if !ticket.cancel.is_cancelled() && !allowed {
-        sink.frame(ChatMessage::error_coded("你已無法與此 AI 員工對話，請開啟新對話或聯絡管理員。", "agent_forbidden")).await;
+        sink.frame(state.target_error(&auth_user, ChatMessage::error_coded(
+            "你已無法與此 AI 員工對話，請開啟新對話或聯絡管理員。", "agent_forbidden",
+        )).await).await;
         return;
     }
     // Keep the large model/reply future out of the nested cancellation state

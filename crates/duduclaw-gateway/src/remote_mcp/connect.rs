@@ -28,6 +28,8 @@ struct PendingConnect {
     mcp_url: String,
     redirect_uri: String,
     redirect_origin: String,
+    /// Validated, same-origin dashboard base captured before authorization.
+    dashboard_base: String,
     /// `true` when the browser cannot be sent back to the dashboard and the
     /// operator pastes the callback URL instead ([`RedirectPlan::Paste`]).
     paste: bool,
@@ -191,6 +193,33 @@ pub fn plan_redirect(raw: &str, allowed: &[String]) -> Result<RedirectPlan, Stri
         origin,
         redirect_uri,
     })
+}
+
+/// Resolve callback and landing base together at start. The origin remains the
+/// validated browser origin; only Direct plans may use the configured prefix.
+pub(crate) fn dashboard_redirect_plan(
+    home: &Path,
+    raw: &str,
+    allowed: &[String],
+    callback_path: &str,
+) -> Result<(RedirectPlan, String), String> {
+    let mut plan = plan_redirect(raw, allowed)?;
+    let base = match &mut plan {
+        RedirectPlan::Direct { origin, redirect_uri } => {
+            let base = crate::deep_link::oauth_dashboard_base(home, origin);
+            *redirect_uri = format!("{base}{callback_path}");
+            base
+        }
+        RedirectPlan::Paste { origin, redirect_uri } => {
+            if callback_path != CALLBACK_PATH {
+                let mut redirect = Url::parse(redirect_uri).map_err(|e| e.to_string())?;
+                redirect.set_path(callback_path);
+                *redirect_uri = redirect.to_string();
+            }
+            origin.clone()
+        }
+    };
+    Ok((plan, base))
 }
 
 /// How the dashboard should wait for a started sign-in.
@@ -474,9 +503,11 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
             Ok(ConnectOutcome::Connected)
         }
         AuthKind::Oauth => {
-            let plan = plan_redirect(
+            let (plan, dashboard_base) = dashboard_redirect_plan(
+                home,
                 req.redirect_origin.as_deref().unwrap_or(""),
                 &req.allowed_origins,
+                CALLBACK_PATH,
             )?;
             let (origin, redirect_uri, paste) = match plan {
                 RedirectPlan::Direct {
@@ -579,6 +610,7 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                 mcp_url: url.to_string(),
                 redirect_uri: redirect_uri.clone(),
                 redirect_origin: origin,
+                dashboard_base,
                 paste,
                 code_verifier: verifier,
                 token_endpoint: disc.metadata.token_endpoint.clone(),
@@ -666,15 +698,18 @@ pub struct Completed {
     pub agent_id: String,
     pub server: String,
     pub redirect_origin: String,
+    /// Stored landing base, including any validated public path prefix.
+    pub dashboard_base: String,
 }
 
 /// Abandon a pending sign-in (the authorization server answered with an
-/// error). Returns the origin to send the browser back to.
+/// error). Returns the stored dashboard base and original browser origin.
 pub fn cancel_pending(state: &str) -> Option<Completed> {
     take_pending(state).map(|p| Completed {
         agent_id: p.agent_id,
         server: p.server,
         redirect_origin: p.redirect_origin,
+        dashboard_base: p.dashboard_base,
     })
 }
 
@@ -786,6 +821,7 @@ async fn complete_inner(
         agent_id: p.agent_id,
         server: p.server,
         redirect_origin: p.redirect_origin,
+        dashboard_base: p.dashboard_base,
     })
 }
 
@@ -1286,6 +1322,40 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_prefix_plans_cover_both_oauth_callbacks_and_preserve_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = "https://dash.example.com";
+        let allowed = vec!["dash.example.com".into()];
+        for callback in [CALLBACK_PATH, crate::google_personal::flow::CALLBACK_PATH] {
+            for (configured, expected) in [
+                (None, origin),
+                (Some("https://dash.example.com/agents/"), "https://dash.example.com/agents"),
+                (Some("https://other.example.com/agents"), origin),
+                (Some("https://dash.example.com/agents/../escape"), origin),
+                (Some("https://dash.example.com/agents/%2e%2e/escape"), origin),
+                (Some("https://dash.example.com/agents?q=1"), origin),
+                (Some("https://dash.example.com/agents#fragment"), origin),
+                (Some("https://user@dash.example.com/agents"), origin),
+                (Some("/agents"), origin),
+            ] {
+                let config = configured.map(|url| format!("[dashboard]\npublic_url = {url:?}\n"))
+                    .unwrap_or_default();
+                std::fs::write(dir.path().join("config.toml"), config).unwrap();
+                let (plan, base) = dashboard_redirect_plan(dir.path(), origin, &allowed, callback).unwrap();
+                assert_eq!(base, expected, "{configured:?}");
+                assert_eq!(plan.redirect_uri(), format!("{expected}{callback}"));
+                assert!(matches!(plan, RedirectPlan::Direct { origin: stored, .. } if stored == origin));
+            }
+            std::fs::write(dir.path().join("config.toml"),
+                "[dashboard]\npublic_url = \"http://192.168.1.20:18889/agents\"\n").unwrap();
+            let (plan, base) = dashboard_redirect_plan(dir.path(), "http://192.168.1.20:18889", &[], callback).unwrap();
+            assert_eq!(base, "http://192.168.1.20:18889");
+            assert_eq!(plan.redirect_uri(), format!("http://127.0.0.1:18889{callback}"));
+            assert!(matches!(plan, RedirectPlan::Paste { .. }));
+        }
+    }
+
+    #[test]
     fn pasted_callback_parsing() {
         assert_eq!(
             parse_pasted_callback(
@@ -1330,6 +1400,7 @@ mod tests {
                     mcp_url: "https://mcp.example.com/mcp".into(),
                     redirect_uri: "http://127.0.0.1:18889/oauth/mcp/callback".into(),
                     redirect_origin: "http://192.168.1.20:18889".into(),
+                    dashboard_base: "http://192.168.1.20:18889".into(),
                     paste,
                     code_verifier: "v".into(),
                     token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),
@@ -1380,6 +1451,44 @@ mod tests {
         assert!(take_pending("st-denied").is_none());
     }
 
+    #[test]
+    fn cancelled_callback_keeps_the_base_captured_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = "https://dash.example.com";
+        std::fs::write(dir.path().join("config.toml"),
+            "[dashboard]\npublic_url = \"https://dash.example.com/agents/\"\n").unwrap();
+        let (plan, base) = dashboard_redirect_plan(dir.path(), origin,
+            &["dash.example.com".into()], CALLBACK_PATH).unwrap();
+        let state = uuid::Uuid::new_v4().to_string();
+        pending().lock().unwrap().insert(state.clone(), PendingConnect {
+            agent_id: "a1".into(),
+            server: "s".into(),
+            mcp_url: "https://mcp.example.com/mcp".into(),
+            redirect_uri: plan.redirect_uri().into(),
+            redirect_origin: origin.into(),
+            dashboard_base: base,
+            paste: false,
+            code_verifier: "v".into(),
+            token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),
+            issuer: "https://auth.example.com".into(),
+            creds: ClientCredentials {
+                client_id: "c".into(), client_secret: None, token_endpoint_auth: "none".into(),
+            },
+            resource: "https://mcp.example.com/mcp".into(),
+            scope: None,
+            revocation_endpoint: None,
+            headers: vec![],
+            server_stream: false,
+            created: Instant::now(),
+        });
+        std::fs::write(dir.path().join("config.toml"),
+            "[dashboard]\npublic_url = \"https://different.example/changed\"\n").unwrap();
+        let done = cancel_pending(&state).unwrap();
+        assert_eq!(done.redirect_origin, origin);
+        assert_eq!(done.dashboard_base, "https://dash.example.com/agents");
+        assert!(cancel_pending(&state).is_none());
+    }
+
     #[tokio::test]
     async fn callback_state_is_single_use_and_unknown_state_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -1396,6 +1505,7 @@ mod tests {
                     mcp_url: "https://mcp.example.com/mcp".into(),
                     redirect_uri: "http://localhost:1/oauth/mcp/callback".into(),
                     redirect_origin: "http://localhost:1".into(),
+                    dashboard_base: "http://localhost:1".into(),
                     paste: false,
                     code_verifier: "v".into(),
                     token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),

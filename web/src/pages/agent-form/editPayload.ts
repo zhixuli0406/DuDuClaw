@@ -1,3 +1,4 @@
+import { normalizeActions } from '@/components/odoo/permissions';
 import type {
   AgentCapabilities,
   AgentEffort,
@@ -346,6 +347,7 @@ export function buildUpdatePayload(
     for (const k of ['profile', 'allowed_models', 'unblock_models', 'allowed_actions', 'url', 'db', 'username'] as const) {
       if (has(dirty, `odoo.${k}`)) (o as Record<string, unknown>)[k] = s.odoo[k];
     }
+    if (has(dirty, 'odoo.allowed_actions')) o.allowed_actions = normalizeActions(s.odoo.allowed_actions);
     if (has(dirty, 'odoo.company_ids')) {
       o.company_ids = s.odoo.company_ids
         .split(',')

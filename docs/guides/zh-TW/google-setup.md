@@ -1,5 +1,7 @@
 # 連接 Google
 
+儀表板放在路徑前綴下時，請在 `config.toml` 設定 `[dashboard] public_url = "https://host/agents"`，網址必須包含路徑。nginx 範例：`location /agents/ { proxy_pass http://127.0.0.1:18889/; }`；Google Cloud 請登記 `https://host/agents/api/me/google/callback`（遠端 MCP 使用 `https://host/agents/oauth/mcp/callback`）。只有公開網址與瀏覽器已驗證的儀表板 origin 相同時，OAuth 才會套用這個前綴；區網存取與貼回網址流程維持原行為。升級至包含此修正的版本並更新已登記的回呼網址後，可移除 v1.79.1 為無前綴 `/api/me/google/callback` 與 `/me/connections` 加上的 nginx 暫時規則。
+
 Gmail 搜尋與讀信會在郵件文字交給 AI 員工前遮罩登入連結及附近的一次性驗證碼；第三方 MCP、Remote MCP 與 Bash 不在涵蓋範圍。
 
 依照這份指南和設定精靈，選擇一種方式連接你的 Google 帳號。

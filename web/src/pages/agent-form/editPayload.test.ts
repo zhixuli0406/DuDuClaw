@@ -171,6 +171,11 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(r.payload).toEqual({ odoo: { allowed_models: ['crm.lead'] } });
   });
 
+  it('normalizes edited read/search rules and retains unknown entries exactly', () => {
+    const s = state({ odoo: { ...DEFAULT_ODOO, allowed_actions: ['read', 'search:hr.employee', 'action:crm.lead', ' odd '], unblock_models: [], clear_api_key: false, clear_password: false } });
+    expect(buildUpdatePayload(s, new Set(['odoo.allowed_actions']), CTX).payload).toEqual({ odoo: { allowed_actions: ['read', 'search', 'read:hr.employee', 'search:hr.employee', 'action:crm.lead', ' odd '] } });
+  });
+
   it('does not send untouched empty Odoo lists and sends an intentional clear', () => {
     const s = state({ odoo: { ...DEFAULT_ODOO, unblock_models: [], clear_api_key: false, clear_password: false } });
     expect(buildUpdatePayload(s, new Set(['odoo.username']), CTX).payload).toEqual({ odoo: { username: '' } });

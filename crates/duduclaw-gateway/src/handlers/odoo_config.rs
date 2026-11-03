@@ -106,11 +106,11 @@ pub(crate) fn render_odoo_schema_details(report: &duduclaw_odoo::SchemaReport) -
 // ── P2 ODO helpers (per-agent [odoo] override) ────────────────────────────────
 
 /// Validate a per-agent Odoo `allowed_actions` entry. Accepts a bare verb
-/// (`read`/`write`/`create`/`unlink`/`execute`) or a qualified `verb:model`
+/// (`read`/`search`/`write`/`create`/`unlink`/`action`/`execute`) or a qualified `verb:model`
 /// form (e.g. `write:crm.lead`). The model part is validated like an Odoo model
 /// name (alphanumeric + `.` + `_`).
 pub(crate) fn odo_valid_action(action: &str) -> bool {
-    const VERBS: &[&str] = &["read", "write", "create", "unlink", "execute"];
+    const VERBS: &[&str] = &["read", "search", "write", "create", "unlink", "action", "execute"];
     let (verb, model) = match action.split_once(':') {
         Some((v, m)) => (v, Some(m)),
         None => (action, None),
@@ -212,12 +212,18 @@ pub(crate) fn apply_odoo_to_table(
 
     // allowed_actions[] (bare verb or verb:model)
     if let Some(arr) = odoo_in.get("allowed_actions").and_then(|v| v.as_array()) {
+        // Legacy entries remain removable without preventing unrelated edits.
+        // Only exact entries already on disk bypass validation; new rules must
+        // still use supported verbs and valid model names.
+        let existing = section.get("allowed_actions").and_then(|v| v.as_array());
         let mut out: Vec<toml::Value> = Vec::new();
         for item in arr {
-            let a = item.as_str().unwrap_or("").trim();
-            if a.is_empty() {
+            let raw = item.as_str().ok_or("odoo allowed_actions entries must be strings")?;
+            if existing.is_some_and(|values| values.iter().any(|v| v.as_str() == Some(raw))) {
+                out.push(toml::Value::String(raw.into()));
                 continue;
             }
+            let a = raw.trim();
             if !odo_valid_action(a) {
                 return Err(format!(
                     "Invalid odoo allowed_actions entry '{a}' (expected verb or verb:model, \

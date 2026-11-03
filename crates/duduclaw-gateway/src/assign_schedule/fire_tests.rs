@@ -547,3 +547,35 @@ async fn autonomy_pause_assign_schedule_skips_slot_and_resumes_next_slot() {
     let resumed = tick(dir.path(), &reg, at("2026-11-02T01:00:20Z")).await.unwrap();
     assert_eq!(resumed.created.len(), 1);
 }
+
+
+#[tokio::test]
+async fn scheduled_non_admin_work_pauses_when_target_becomes_main_or_default() {
+    for use_default in [false, true] {
+        for kind in [AssignKind::Task, AssignKind::Goal] {
+            let (dir, registry) = home().await;
+            let o = org(dir.path());
+            let store = TaskStore::open(dir.path()).unwrap();
+            let creator = Creator::new(&o.mgr, false).unwrap();
+            let mut request = weekly_goal("protected scheduled work");
+            request.kind = kind;
+            request.payload.title = "protected scheduled work".into();
+            let row = create(dir.path(), &store, &creator, request, now()).await.unwrap();
+            if use_default {
+                std::fs::write(dir.path().join("config.toml"),
+                    "[general]\ndefault_agent = \"sales-rep\"\n").unwrap();
+            } else {
+                crate::trigger_route::tests::write_agent(
+                    &dir.path().join("agents"), "sales-rep", "Sales", "@sales-rep", "main", "",
+                );
+                registry.write().await.scan().await.unwrap();
+            }
+            tick(dir.path(), &registry, at(MONDAY)).await.unwrap();
+            let saved = store.get_assign_schedule(&row.id).await.unwrap().unwrap();
+            assert_eq!(saved.status, "paused");
+            assert_eq!(saved.pause_reason.as_deref(), Some("agent_unavailable"));
+            assert_eq!(saved.fire_count, 0);
+            assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+        }
+    }
+}

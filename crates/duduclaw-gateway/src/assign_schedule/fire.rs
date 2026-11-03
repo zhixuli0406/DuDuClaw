@@ -159,6 +159,21 @@ async fn fire_one(
             if is_admin { "admin" } else { "schedule" }
         }
     };
+    // The creator remains the authority even though the cron tick is a
+    // system sender. Recheck role/default changes before creating any work.
+    let principal = format!("user:{}", row.creator_user_id);
+    let main_access = {
+        let registry = registry.read().await;
+        match registry.get(&row.agent_id) {
+            Some(agent) => crate::on_behalf_of::access::check_loaded_main_target(
+                home, Some(&principal), agent,
+            ).await,
+            None => Err("agent unavailable".into()),
+        }
+    };
+    if main_access.is_err() {
+        return auto_pause(home, store, row, &slot_s, "agent_unavailable").await;
+    }
     if !agent_operational(registry, &row.agent_id).await {
         return auto_pause(home, store, row, &slot_s, "agent_unavailable").await;
     }

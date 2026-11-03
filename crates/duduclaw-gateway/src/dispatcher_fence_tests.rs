@@ -18,6 +18,14 @@ struct Rig {
 impl Rig {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        // These fixtures carry user:owner across real admission gates. Give
+        // that identity a live account rather than relying on record mode to
+        // accept an unresolvable principal.
+        let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let owner = db.create_user("owner@test.invalid", "owner", "isolated-test-password",
+            duduclaw_auth::UserRole::Admin).unwrap();
+        rusqlite::Connection::open(dir.path().join("users.db")).unwrap()
+            .execute("UPDATE users SET id = 'owner' WHERE id = ?1", [&owner.id]).unwrap();
         let agent_dir = dir.path().join("agents/alice");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("agent.toml"),
@@ -286,8 +294,8 @@ async fn queued_message_with_intent_still_intended_runs_exactly_once() {
         status: MessageStatus::Pending,
         retry_count: 0,
         delegation_depth: 0,
-        origin_agent: None,
-        sender_agent: None,
+        origin_agent: Some("goal-loop-driver".into()),
+        sender_agent: Some("goal-loop-driver".into()),
         error: None,
         response: None,
         created_at: Utc::now().to_rfc3339(),
@@ -339,8 +347,8 @@ fn plain_goal_message(id: &str, task_id: &str) -> QueueMessage {
         status: MessageStatus::Pending,
         retry_count: 0,
         delegation_depth: 0,
-        origin_agent: None,
-        sender_agent: None,
+        origin_agent: Some("goal-loop-driver".into()),
+        sender_agent: Some("goal-loop-driver".into()),
         error: None,
         response: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1028,12 +1036,12 @@ async fn cancelled_webchat_delegation_dispatch(racing_enqueue: bool) {
     let rig = Rig::new().await;
     let broker = crate::approval::ApprovalBroker::open(rig.dir.path()).unwrap();
     let conn = rusqlite::Connection::open(rig.dir.path().join("message_queue.db")).unwrap();
-    // The source is a real employee so the autonomy source gate can admit
-    // the unaffected turn; an unknown sender is correctly deferred.
+    // Model the initial dashboard request, with the sender metadata stamped
+    // by that producer, so the unaffected turn reaches the cancellation fence.
     let insert = |id: &str, turn: &str| {
         conn.execute(
-            "INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id)
-             VALUES (?1,'alice','alice','work',datetime('now'),'session',?2)",
+            "INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,sender_agent,origin_agent)
+             VALUES (?1,'dashboard','alice','work',datetime('now'),'session',?2,'dashboard','dashboard')",
             rusqlite::params![id, turn],
         ).unwrap();
     };
@@ -1071,8 +1079,8 @@ async fn downstream_sqlite_running_stop_is_terminal_and_callback_is_untouched() 
     let rig = Rig::new().await;
     let key = uuid::Uuid::new_v4().to_string();
     let conn = rusqlite::Connection::open(rig.dir.path().join("message_queue.db")).unwrap();
-    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
-        VALUES (?1,'alice','alice',?1,datetime('now'),'s','t','user:owner')", [&key]).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of,sender_agent,origin_agent)
+        VALUES (?1,'dashboard','alice',?1,datetime('now'),'s','t','user:owner','dashboard','dashboard')", [&key]).unwrap();
     conn.execute("INSERT INTO delegation_callbacks(message_id,agent_id,channel_type,channel_id,created_at)
         VALUES (?1,'alice','webchat','s',datetime('now'))", [&key]).unwrap();
     let gate = test_hooks::install("downstream_runtime", &key);
@@ -1103,8 +1111,8 @@ async fn downstream_register_before_fence_closes_cancel_race() {
     let rig = Rig::new().await;
     let key = uuid::Uuid::new_v4().to_string();
     let conn = rusqlite::Connection::open(rig.dir.path().join("message_queue.db")).unwrap();
-    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id)
-        VALUES (?1,'alice','alice','work',datetime('now'),'s','t')", [&key]).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,sender_agent,origin_agent)
+        VALUES (?1,'dashboard','alice','work',datetime('now'),'s','t','dashboard','dashboard')", [&key]).unwrap();
     let gate = test_hooks::install("downstream_registered", &key);
     let broker = crate::approval::ApprovalBroker::open(rig.dir.path()).unwrap();
     model_call_probe::set_dry_run(true);
@@ -1236,14 +1244,14 @@ async fn downstream_fence_and_pending_cleanup_ignore_unsigned_principals() {
         ("background", None), ("same", Some("user:owner")),
         ("foreign", Some("user:other")), ("garbage", Some("garbage")),
     ] {
-        conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
-            VALUES (?1,'alice','alice','work',datetime('now'),'s','t',?2)",
+        conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of,sender_agent,origin_agent)
+            VALUES (?1,'dashboard','alice','work',datetime('now'),'s','t',?2,'dashboard','dashboard')",
             rusqlite::params![id, principal]).unwrap();
         let msg = rig.queue.get_by_id(id).await.unwrap().unwrap();
         assert!(fence_cancelled_turn(home, &rig.queue, &msg).await.unwrap(), "{id}");
     }
-    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
-        VALUES ('pending-foreign','alice','alice','work',datetime('now'),'s','t','user:other')", []).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of,sender_agent,origin_agent)
+        VALUES ('pending-foreign','dashboard','alice','work',datetime('now'),'s','t','user:other','dashboard','dashboard')", []).unwrap();
     assert_eq!(rig.queue.cancel_pending_turn("s", "t").await.unwrap(), 1);
     assert!(rig.queue.pending_messages(10).await.unwrap().is_empty());
     assert_eq!(rig.queue.get_by_id("pending-foreign").await.unwrap().unwrap().status, MessageStatus::Failed);
@@ -1262,8 +1270,8 @@ async fn downstream_real_two_hop_inherits_scopes_and_stops_both_rails() {
     let b = uuid::Uuid::new_v4().to_string();
     let c = uuid::Uuid::new_v4().to_string();
     let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
-    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of)
-        VALUES (?1,'alice','alice',?1,datetime('now'),'origin-session','origin-turn','user:owner')", [&b]).unwrap();
+    conn.execute("INSERT INTO message_queue(id,sender,target,payload,created_at,session_id,turn_id,on_behalf_of,sender_agent,origin_agent)
+        VALUES (?1,'dashboard','alice',?1,datetime('now'),'origin-session','origin-turn','user:owner','dashboard','dashboard')", [&b]).unwrap();
     let bgate = test_hooks::install("downstream_runtime", &b);
     let cgate = test_hooks::install("downstream_runtime", &c);
     model_call_probe::set_dry_run(true);

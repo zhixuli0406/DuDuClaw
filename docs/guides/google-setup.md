@@ -1,5 +1,7 @@
 # Connect Google
 
+When serving the dashboard under a path prefix, set `config.toml` `[dashboard] public_url = "https://host/agents"`, including the path. For nginx, use `location /agents/ { proxy_pass http://127.0.0.1:18889/; }` and register `https://host/agents/api/me/google/callback` in Google Cloud (remote MCP uses `https://host/agents/oauth/mcp/callback`). OAuth uses this base only when its origin matches the browser’s validated dashboard origin; LAN access and paste-back flows keep their existing behavior. After upgrading with this fix and updating the registered callback, remove the v1.79.1 workaround rules for unprefixed `/api/me/google/callback` and `/me/connections`.
+
 Gmail search and read mask login links and nearby one-time codes in returned mail text before an AI employee receives it. This does not cover third-party MCP, Remote MCP or Bash.
 
 Use this guide with the setup wizard to connect your Google account.

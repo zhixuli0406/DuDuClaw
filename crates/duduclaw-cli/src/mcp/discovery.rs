@@ -8,6 +8,15 @@ fn caller(home: &Path, agent: &str) -> std::result::Result<TrustedCaller,String>
     TrustedCaller::from_signed_agent(home,&claim,token.as_deref())
 }
 pub(crate) async fn handle_discovery_create(args: &Value, home: &Path, agent: &str) -> Value {
+    // Preserve the existing signed-agent/operator admission and approval flow.
+    // Only the protected execution target is newly restricted here.
+    let principal = host_on_behalf_of(home, agent);
+    let target = args.get("assigned_to").and_then(Value::as_str).unwrap_or(agent);
+    if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
+        home, principal.as_deref(), target,
+    ).await {
+        return tool_error(&reason);
+    }
     let caller=match caller(home,agent) {Ok(caller)=>caller,Err(error)=>return tool_error(&error)};
     let store=match duduclaw_gateway::task_store::TaskStore::open(home) {Ok(store)=>store,Err(error)=>return tool_error(&error)};
     let broker=match duduclaw_gateway::approval::ApprovalBroker::open(home) {Ok(broker)=>broker,Err(error)=>return tool_error(&error)};

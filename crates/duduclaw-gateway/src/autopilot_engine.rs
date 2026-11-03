@@ -3814,9 +3814,8 @@ mod tests {
     //
     // `action_delegate` → `enqueue_prompt` is the autopilot `delegate` action's
     // only path onto `message_queue.db`, gated by `dispatcher::gate_bus_dispatch`
-    // (the "sqlite_queue" rail). Before the v1.53 legacy-window flip
-    // (`GateOutcome::LegacyNoSender` → DENY, see `delegation_gate.rs`), every
-    // producer's sender stamp must be pinned so a future refactor here can't
+    // (the "sqlite_queue" rail). The sender-required gate refuses unstamped
+    // rows, so every producer's sender stamp must be pinned: a refactor cannot
     // silently drop it and make every autopilot delegation invisible. Must be
     // the exact `duduclaw_core::SYSTEM_SENDERS` spelling ("autopilot"), not a
     // near-miss like "autopilot-engine" or "autopilot_rule".

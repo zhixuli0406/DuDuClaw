@@ -830,6 +830,10 @@ async fn call_claude_for_agent_impl(
         }
     };
 
+    crate::on_behalf_of::access::check_loaded_main_target(
+        home_dir, crate::on_behalf_of::current().as_deref(), agent,
+    ).await?;
+
     // Sub-agents inherit a turn id from the dispatch chain via tokio
     // task_local — set by `channel_reply` before invoking the dispatcher.
     // When None (top-level callers, tests), skip citation tracking; we can't

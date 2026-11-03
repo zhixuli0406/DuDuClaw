@@ -620,6 +620,10 @@ async fn credential_fixture(home: &std::path::Path) -> Arc<WebChatState> {
     std::fs::create_dir_all(home.join("agents")).unwrap();
     let db = UserDb::new(&home.join("users.db")).unwrap();
     db.create_user("credential-admin@test.invalid", "Credential Admin", "Test-Password-12345", duduclaw_auth::UserRole::Admin).unwrap();
+    // Enterprise credentials require a successfully loaded policy, as at boot.
+    std::fs::write(home.join("config.toml"), "").unwrap();
+    crate::mfa::reload_policy(home);
+    assert!(!crate::mfa::enforced(home, false).unwrap());
     Arc::new(WebChatState::new(
         crate::agent_channels::e2e_tests::reply_ctx(home).await,
         Arc::new(JwtConfig::new(b"turn-credential-test-key")),
@@ -836,7 +840,7 @@ fn credential_cancellation_and_delivery_cannot_both_win() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn execute_revoked_running_credential_withdraws_and_refuses_card() {
     let home = tempfile::tempdir().unwrap();
     crate::trigger_route::tests::write_agent(&home.path().join("agents"), "dudu", "Main", "@dudu", "main", "");
@@ -844,6 +848,8 @@ async fn execute_revoked_running_credential_withdraws_and_refuses_card() {
     let user = state.user_db.create_user("alice@test.invalid", "Alice", "Test-Password-12345", duduclaw_auth::UserRole::Admin).unwrap();
     let token = state.jwt_config.issue_access_token(&user, &[]).unwrap();
     let claims = state.jwt_config.verify_access_token(&token).unwrap();
+    assert_eq!(state.credential_validity(Some(&claims), true).await,
+        crate::handlers::live_context::SocketValidity::Valid);
     let mut gate = crate::agent_channels::e2e_seam::arm_waiting(home.path());
     let ticket = state.turns.admit(&user.id, "session", None, "m", 3, 10).unwrap();
     let turn_id = ticket.id.clone();
@@ -851,15 +857,22 @@ async fn execute_revoked_running_credential_withdraws_and_refuses_card() {
     input.auth_user = user.id.clone();
     input.credential = Some(claims);
     let (tx, mut rx) = outbound_channel();
-    let task = tokio::spawn(execute(input, TurnSink::new(tx, "session", None, "m"), ticket));
-    let entered = gate.entered.recv().await.unwrap();
+    let mut task = tokio::spawn(execute(input, TurnSink::new(tx, "session", None, "m"), ticket));
+    // The seam sender stays alive even if admission refuses the turn. Observe
+    // that exit as well as a deadline instead of waiting forever for the model.
+    let entered = tokio::select! {
+        result = &mut task => panic!("turn ended before the model started: {result:?}"),
+        entered = tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.recv()) =>
+            entered.expect("model admission timed out").expect("model seam closed"),
+    };
     let broker = state.approvals.as_ref().unwrap();
     // Simulate a tool's card while the real execute pipeline is inside the model.
     let id = crate::approval::scope_turn("session", &turn_id,
         broker.request("dudu", "test", "pending", serde_json::Value::Null, 600),
     ).await.unwrap();
     state.user_db.mfa_operator_reset("alice@test.invalid").unwrap();
-    task.await.unwrap();
+    tokio::time::timeout(CREDENTIAL_CHECK_INTERVAL * 4, task).await
+        .expect("revocation must finish the turn").unwrap();
     assert!(entered.release.is_closed(), "the running model future must be dropped");
     assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
     assert!(broker.decide(&id, true, "human:test").await.is_err());

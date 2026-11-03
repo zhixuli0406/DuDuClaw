@@ -594,6 +594,9 @@ pub enum Trigger {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowRun {
+    /// Host-owned human origin, persisted inside the run JSON across outbox retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
     pub run_id: String,
     pub trigger_key: String,
     pub trigger: Trigger,

@@ -15,6 +15,13 @@ pub(crate) struct Org {
 }
 
 pub(crate) fn org(home: &Path) -> Org {
+    // Creation now checks the actual target, so store-only fixtures also
+    // need the ordinary employee that the creator is allowed to assign.
+    if !home.join("agents/sales-rep/agent.toml").exists() {
+        crate::trigger_route::tests::write_agent(
+            &home.join("agents"), "sales-rep", "Sales", "@sales-rep", "specialist", "",
+        );
+    }
     crate::team_edition::record(home, duduclaw_core::EditionProfile::Enterprise);
     let db = UserDb::new(&home.join("users.db")).unwrap();
     let mk = |name: &str, role| {

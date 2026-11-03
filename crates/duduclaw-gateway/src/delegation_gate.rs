@@ -14,34 +14,12 @@
 //! and the effective policy — plus the DENY consequences: fail the task, write
 //! the reason back, record an audit event, never spawn.
 //!
-//! ## Sender resolution and the v1.52 legacy window
+//! ## Sender resolution
 //!
-//! The sender is `sender_agent`, falling back to `origin_agent`. A task
-//! carrying *neither* predates this field pair (or came from a producer that
-//! never stamped it); it is logged with a WARN and **allowed** for one release
-//! so an upgrade does not strand in-flight work.
-//!
-//! **v1.53 (planned): the legacy branch becomes a DENY.** As of v1.52 every
-//! in-tree producer stamps a sender, so the flip is unblocked — the branch now
-//! only covers rows written before the upgrade and hand-written queue lines.
-//! Inventory (re-verified in the v1.52 debt-wave review):
-//!
-//! - `mcp.rs` `send_to_agent` / `spawn_agent` — caller / parent agent id.
-//! - `acp/message_send.rs` — [`duduclaw_core::ACP_CLIENT_SENDER`].
-//! - `handlers.rs` (dashboard) / `webhook.rs` / `autopilot_engine.rs` /
-//!   `goal_loop.rs` — the matching [`duduclaw_core::SYSTEM_SENDERS`] spelling.
-//! - `dispatcher.rs` re-queues — the originating agent, or
-//!   `__deferred_gvu__` ([`GATEWAY_INTERNAL_SENDERS`]).
-//! - `duduclaw-agent/src/heartbeat.rs` `poll_assigned_tasks` — **fixed**: both
-//!   INSERTs now stamp `sender_agent`/`origin_agent = "heartbeat"` (the
-//!   `SYSTEM_SENDERS` spelling; the `sender` column keeps its legacy
-//!   `heartbeat-scheduler` value for existing queries/UI).
-//!
-//! Before flipping, re-run that inventory (`rg 'sender_agent'` over the
-//! producers) — a new producer added after this note would otherwise start
-//! being denied. Until it flips, note what the branch costs: a hand-written
-//! `bus_queue.jsonl` line that simply *omits* `sender_agent` is allowed. The
-//! gate stops forged senders, not absent ones.
+//! `sender_agent`, falling back to `origin_agent`, is required on both queue
+//! rails. Missing or blank senders are refused and audited. Principal-free
+//! work targeting Main/default additionally requires an established system
+//! sender; employee delegation cannot manufacture Background authority.
 //!
 //! ## Why the org view is registry-first, then lazy file reads
 //!
@@ -80,6 +58,11 @@ use duduclaw_security::audit::{AuditEvent, Severity};
 /// [`can_delegate_ext`] keeps the core predicate unchanged (design doc §2.3
 /// leaves the constant set closed).
 const GATEWAY_INTERNAL_SENDERS: [&str; 1] = ["__deferred_gvu__"];
+
+pub(crate) fn is_background_system_sender(sender: &str) -> bool {
+    duduclaw_core::is_system_sender(sender)
+        || GATEWAY_INTERNAL_SENDERS.contains(&sender.trim())
+}
 
 /// Read + parse `<home>/config.toml` once.
 ///
@@ -155,9 +138,6 @@ fn acp_trusted_from_table(table: &toml::Table) -> bool {
 pub(crate) enum GateOutcome {
     /// Cleared — dispatch as usual.
     Allow,
-    /// No `sender_agent` and no `origin_agent` (v1.52 transitional): allowed,
-    /// already logged. Becomes a DENY in v1.53.
-    LegacyNoSender,
     /// Refused. The caller must fail the task, write the reason back, and not
     /// spawn anything. The audit event has already been recorded.
     Deny(DelegationDenied),
@@ -296,7 +276,7 @@ impl OrgView for DispatchOrgView<'_> {
 // ── The gate ────────────────────────────────────────────────────────────────
 
 /// Pick the sender to judge: `sender_agent`, else `origin_agent`, else nothing.
-fn resolve_sender<'a>(
+pub(crate) fn resolve_sender<'a>(
     sender_agent: Option<&'a str>,
     origin_agent: Option<&'a str>,
 ) -> Option<&'a str> {
@@ -326,19 +306,40 @@ pub(crate) async fn gate_bus_dispatch(
     path_kind: &str,
     on_behalf_of: Option<&str>,
 ) -> GateOutcome {
+    let Some(sender) = resolve_sender(sender_agent, origin_agent) else {
+        let denied = DelegationDenied {
+            sender: String::new(),
+            target: target.to_string(),
+            policy: duduclaw_core::delegation_policy_from_home(home_dir),
+            reason: duduclaw_core::DelegationDenyReason::InvalidAgentId,
+        };
+        warn!(task_id = %truncate_chars(task_id, 64), path_kind,
+            "Queue task without a sender refused");
+        audit_denial(home_dir, &denied, task_id, path_kind, on_behalf_of);
+        return GateOutcome::Deny(denied);
+    };
+    // Residual: queue files have no authenticated admission signature. A same-UID
+    // writer can forge a system sender; gateway-signed admission is v1.80 work.
+    let background_system = is_background_system_sender(sender);
     // This restriction is independent of delegation mode and sender type:
     // old bindings and queued goal/heartbeat work must be checked at use.
     let machine_access = {
         let guard = registry.read().await;
         let target_id = DispatchOrgView::new(home_dir, Some(&guard)).canonical_id(target);
         match guard.get(&target_id) {
-            Some(agent) => crate::machine_employee::check_loaded(home_dir, agent, on_behalf_of),
-            None => crate::machine_employee::check_target(home_dir, &target_id, on_behalf_of),
+            Some(agent) => {
+                crate::on_behalf_of::access::check_loaded_queue_main_target(home_dir, on_behalf_of, agent, background_system)
+                    .await.and_then(|()| crate::machine_employee::check_loaded(home_dir, agent, on_behalf_of))
+            }
+            None => {
+                crate::on_behalf_of::access::check_queue_main_target(home_dir, on_behalf_of, &target_id, background_system)
+                    .await.and_then(|()| crate::machine_employee::check_target(home_dir, &target_id, on_behalf_of))
+            }
         }
     };
     if machine_access.is_err() {
         let denied = DelegationDenied {
-            sender: sender_agent.or(origin_agent).unwrap_or("system").to_string(),
+            sender: sender.to_string(),
             target: target.to_string(),
             policy: duduclaw_core::delegation_policy_from_home(home_dir),
             reason: duduclaw_core::DelegationDenyReason::HumanPrincipalNotPermitted,
@@ -346,20 +347,6 @@ pub(crate) async fn gate_bus_dispatch(
         audit_denial(home_dir, &denied, task_id, path_kind, on_behalf_of);
         return GateOutcome::Deny(denied);
     }
-    let Some(sender) = resolve_sender(sender_agent, origin_agent) else {
-        // v1.52 transitional window — see the module docs. Loud, not silent:
-        // this line is the inventory of producers that must be fixed before
-        // the branch turns into a DENY.
-        warn!(
-            task_id = %truncate_chars(task_id, 64),
-            target = %truncate_chars(target, 64),
-            path_kind,
-            "Bus task carries neither sender_agent nor origin_agent — delegation \
-             check skipped (legacy task, allowed in v1.52; will be DENIED from v1.53)"
-        );
-        return GateOutcome::LegacyNoSender;
-    };
-
     // WP21 欠帳⑤: one read + one parse of config.toml serves both extractors
     // below — previously `delegation_rules_from_home` and
     // `acp_trusted_from_home` each re-read and re-parsed the whole file.
@@ -508,16 +495,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agents = tmp.path().join("agents");
         let write = |name: &str, reports_to: &str, department: &str| {
-            let dir = agents.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("agent.toml"),
-                format!(
-                    "[agent]\nname = \"{name}\"\nrole = \"worker\"\n\
-                     reports_to = \"{reports_to}\"\ndepartment = \"{department}\"\n"
-                ),
-            )
-            .unwrap();
+            write_agent(&agents, name, reports_to, department);
         };
         write("ceo", "", "");
         write("sales_lead", "ceo", "業務");
@@ -526,6 +504,14 @@ mod tests {
         write("mkt_lead", "ceo", "行銷");
         write("mkt_rep", "mkt_lead", "行銷");
         tmp
+    }
+
+    fn write_agent(root: &Path, name: &str, reports_to: &str, department: &str) {
+        crate::trigger_route::tests::write_agent(root, name, name, "", "worker", "");
+        let path = root.join(name).join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, raw.replace("reports_to = \"\"",
+            &format!("reports_to = \"{reports_to}\"\ndepartment = \"{department}\""))).unwrap();
     }
 
     fn registry_for(home: &Path) -> Arc<RwLock<AgentRegistry>> {
@@ -583,12 +569,7 @@ mod tests {
         let home = tmp.path();
         duduclaw_core::org_store::seed_if_absent(home).unwrap();
 
-        std::fs::write(
-            home.join("agents").join("sales_rep").join("agent.toml"),
-            "[agent]\nname = \"sales_rep\"\nrole = \"worker\"\n\
-             reports_to = \"mkt_lead\"\ndepartment = \"行銷\"\n",
-        )
-        .unwrap();
+        write_agent(&home.join("agents"), "sales_rep", "mkt_lead", "行銷");
 
         assert!(
             !allows_dispatch(&gate(home, Some("sales_rep"), "mkt_rep").await),
@@ -767,13 +748,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_task_without_sender_warns_and_passes() {
+    async fn missing_sender_is_refused_and_audited() {
         let tmp = seed_home();
         let home = tmp.path();
 
         assert!(matches!(
             gate(home, None, "mkt_rep").await,
-            GateOutcome::LegacyNoSender
+            GateOutcome::Deny(DelegationDenied { reason: DelegationDenyReason::InvalidAgentId, .. })
         ));
         // Blank strings count as absent, not as an unknown agent.
         assert!(matches!(
@@ -788,10 +769,11 @@ mod tests {
                 None,
             )
             .await,
-            GateOutcome::LegacyNoSender
+            GateOutcome::Deny(DelegationDenied { reason: DelegationDenyReason::InvalidAgentId, .. })
         ));
-        // A legacy pass is not a denial, so nothing is audited.
-        assert!(audit_lines(home).is_empty());
+        let events = audit_lines(home);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e["details"]["reason"] == "invalid_agent_id"));
         // ...but origin_agent alone is enough to be judged.
         let outcome = gate_bus_dispatch(
             home,
@@ -846,18 +828,8 @@ mod tests {
         let tmp = seed_home();
         let home = tmp.path();
         let eph_id = "eph-abc123def456";
-        let dir = home
-            .join("agents")
-            .join(crate::ephemeral::EPHEMERAL_DIR_NAME)
-            .join(eph_id);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("agent.toml"),
-            format!(
-                "[agent]\nname = \"{eph_id}\"\nrole = \"worker\"\nreports_to = \"sales_rep\"\n"
-            ),
-        )
-        .unwrap();
+        write_agent(&home.join("agents").join(crate::ephemeral::EPHEMERAL_DIR_NAME),
+            eph_id, "sales_rep", "");
 
         // Parent spawning its own ephemeral worker: allowed.
         assert!(allows_dispatch(

@@ -17,7 +17,8 @@ pub struct Pending {
     pub user_id: String,
     pub session_ref: String,
     pub redirect_uri: String,
-    pub dashboard_origin: String,
+    /// Validated same-origin base (including a public path), frozen at start.
+    pub dashboard_base: String,
     pub paste: bool,
     pub code_verifier: String,
     pub client_id: String,
@@ -80,7 +81,7 @@ pub fn receive_code(home: &Path, state: &str, code: &str) -> Result<(String, boo
         return Err(REFUSED.into());
     }
     pending.code = Some(code.into());
-    Ok((pending.dashboard_origin.clone(), pending.paste))
+    Ok((pending.dashboard_base.clone(), pending.paste))
 }
 
 /// Identity mismatches do not consume somebody else's valid state. Once

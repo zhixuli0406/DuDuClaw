@@ -465,6 +465,10 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_odoo_config()).await
             }
+            "odoo.permission_options" => {
+                require_admin!();
+                boxed_frame(|| self.handle_odoo_permission_options()).await
+            }
             "odoo.configure" => {
                 require_admin!();
                 boxed_frame(|| self.handle_odoo_configure(params)).await

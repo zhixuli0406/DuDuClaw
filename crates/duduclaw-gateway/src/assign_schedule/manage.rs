@@ -84,6 +84,9 @@ pub async fn create(
     req: NewSchedule,
     now: DateTime<Utc>,
 ) -> Result<AssignScheduleRow, CreateError> {
+    crate::on_behalf_of::access::check_main_target(
+        home, Some(&creator.principal()), &req.agent_id,
+    ).await.map_err(CreateError::Store)?;
     if let Some(cap) = req.payload.cost_cap_cents {
         if req.kind != AssignKind::Goal || cap == 0 || cap > i64::MAX as u64 {
             return Err(CreateError::Store("cost_cap_cents must be a positive integer for a goal".into()));

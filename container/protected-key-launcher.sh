@@ -7,12 +7,13 @@ set -eu
 umask 077
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
-unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GCONV_PATH DOCKER_HOST DUDUCLAW_ROOT_KEY_FD
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GCONV_PATH DUDUCLAW_ROOT_KEY_FD
 # First-run preparation must never inherit a key descriptor.
 exec 3<&-
 
 fail() { echo "Protected-key startup refused: $*" >&2; exit 1; }
 
+[ "${DOCKER_HOST+x}" != x ] || fail "DOCKER_HOST must be unset (even an empty value is refused)"
 [ "$(id -u)" = 0 ] || fail "the launcher must run as root"
 [ "$$" -eq 1 ] || fail "the launcher must be the container's PID 1 (do not use init: true or pid: host)"
 [ "$#" -gt 0 ] || fail "no command was supplied"

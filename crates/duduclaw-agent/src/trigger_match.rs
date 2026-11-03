@@ -183,6 +183,15 @@ pub fn scan_mentions(
     partial.unwrap_or(MentionScan::None)
 }
 
+/// Whether text contains a nonempty mention token, including an unknown
+/// employee. Uses the same boundaries as routing so email addresses and
+/// prose such as `meet @ 5pm` are not treated as target selection.
+pub fn has_named_mention(text: &str) -> bool {
+    mention_starts(text).into_iter().any(|at| {
+        !partial_token(&text[at + at_len(text, at)..]).is_empty()
+    })
+}
+
 /// The text with the mention at `hit` removed, trimmed of whitespace and of
 /// the separators people type after a name (`,` `:` `，` `：` …). Empty means
 /// the message only called the employee and carries no task.

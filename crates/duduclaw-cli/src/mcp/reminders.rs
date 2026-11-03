@@ -62,6 +62,15 @@ pub(crate) async fn handle_create_reminder(
         _ => ReminderMode::Direct,
     };
 
+    let principal = host_on_behalf_of(home_dir, actor.id());
+    if mode == ReminderMode::AgentCallback {
+        if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
+            home_dir, principal.as_deref(), agent_id,
+        ).await {
+            return tool_error(&reason);
+        }
+    }
+
     // Validate: direct mode needs message, agent_callback needs prompt
     if mode == ReminderMode::Direct && message.is_empty() {
         return serde_json::json!({
@@ -173,6 +182,7 @@ pub(crate) async fn handle_create_reminder(
         // B11: set in a conversation that came through an employee's own
         // bot / app ⇒ delivered through the same one.
         sender_agent: duduclaw_gateway::claude_runner::reply_sender_for(channel, chat_id),
+        on_behalf_of: principal,
     };
 
     let id = reminder.id.clone();

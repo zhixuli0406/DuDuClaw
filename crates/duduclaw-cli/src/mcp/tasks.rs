@@ -722,6 +722,28 @@ pub(crate) async fn handle_tasks_update(
         Ok(None) => return tool_error(&format!("task not found: {task_id}")),
         Err(e) => return tool_error(&format!("update task: {e}")),
     };
+    // Updating work must not erase the current non-Admin human origin by
+    // editing a background/other person's row. The model cannot overwrite
+    // the task's authority carrier; require the same origin instead.
+    let principal = host_on_behalf_of(home_dir, caller);
+    match duduclaw_gateway::on_behalf_of::access::requires_main_restriction(
+        home_dir, principal.as_deref(),
+    ) {
+        Ok(true) if current.on_behalf_of != principal => {
+            return tool_error("無法保留這項變更的交辦人權限，請建立新的任務交辦。");
+        }
+        Err(reason) => return tool_error(&reason),
+        _ => {}
+    }
+    let target = args.get("assigned_to").and_then(|v| v.as_str())
+        .map(str::trim).unwrap_or(&current.assigned_to);
+    for authority in [principal.as_deref(), current.on_behalf_of.as_deref()] {
+        if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
+            home_dir, authority, target,
+        ).await {
+            return tool_error(&reason);
+        }
+    }
     // ── H9-G goal contract freeze (harness-borrowings 2026-08 WP-D) ──────
     // An agent-identity caller may never modify the acceptance criteria of a
     // goal_mode task through this MCP tool — the contract is frozen into

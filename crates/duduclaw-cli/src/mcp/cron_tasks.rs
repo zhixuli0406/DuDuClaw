@@ -16,6 +16,7 @@ pub(crate) async fn handle_schedule_task_for_actor(
     actor: RecordActor<'_>,
 ) -> Value {
     let caller = actor.id();
+    let principal = host_on_behalf_of(home_dir, caller);
     use duduclaw_gateway::cron_store::{CronStore, CronTaskRow};
 
     let agent_id = params
@@ -62,6 +63,11 @@ pub(crate) async fn handle_schedule_task_for_actor(
     } else {
         agent_id.to_string()
     };
+    if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
+        home_dir, principal.as_deref(), &scheduled_target,
+    ).await {
+        return tool_error(&reason);
+    }
     if scheduled_target != caller {
         if let Err(reason) =
             check_delegation_allowed(home_dir, caller, &scheduled_target, "tasks_create_schedule")
@@ -157,6 +163,7 @@ pub(crate) async fn handle_schedule_task_for_actor(
         cron.to_string(),
         task.to_string(),
     );
+    row.on_behalf_of = principal;
     row.notify_channel = notify_channel;
     row.notify_chat_id = notify_chat_id;
     row.notify_thread_id = notify_thread_id;
@@ -339,6 +346,14 @@ pub(crate) async fn resolve_owned_cron_row(
         }
     };
     let owner = cron_row_owner(home_dir, &row).await;
+    if matches!(tool, "update_cron_task" | "run_cron_task") {
+        let principal = host_on_behalf_of(home_dir, actor.id());
+        for origin in [principal.as_deref(), row.on_behalf_of.as_deref()] {
+            duduclaw_gateway::on_behalf_of::access::check_main_target(
+                home_dir, origin, &owner,
+            ).await.map_err(|reason| tool_error(&reason))?;
+        }
+    }
     check_record_change_allowed(home_dir, actor, &owner, tool, RecordKind::Cron)
         .await
         .map_err(|reason| tool_error(&reason))?;
@@ -499,16 +514,11 @@ pub(crate) async fn handle_update_cron_task(
         Err(reason) => return tool_error(&reason),
     };
     super::workflow_operation::effect_start();
-    let updated = if let Some((channel, chat, thread)) = notify {
-        store.update_fields_with_notify(
-            &existing.id, new_name, &existing.agent_id, new_cron, new_task,
-            existing.enabled, channel, chat, thread,
-        ).await
-    } else {
-        store.update_fields(
-            &existing.id, new_name, &existing.agent_id, new_cron, new_task, existing.enabled,
-        ).await
-    };
+    let principal = host_on_behalf_of(home_dir, actor.id());
+    let updated = store.update_fields_with_principal(
+        &existing.id, new_name, &existing.agent_id, new_cron, new_task, existing.enabled,
+        notify, principal.as_deref(),
+    ).await;
     match updated {
         Ok(true) => {
             if let Ok(Some(row)) = store.get(&existing.id).await {
@@ -517,6 +527,7 @@ pub(crate) async fn handle_update_cron_task(
                     && row.task == new_task
                     && row.agent_id == existing.agent_id
                     && row.enabled == existing.enabled
+                    && row.on_behalf_of.as_deref() == principal.as_deref().or(existing.on_behalf_of.as_deref())
                     && notify.is_none_or(|(channel, chat, thread)| {
                         row.notify_channel.as_deref() == channel
                             && row.notify_chat_id.as_deref() == chat
@@ -661,12 +672,23 @@ pub(crate) async fn handle_pause_cron_task(
     };
     let key = if !id.is_empty() { id } else { name };
 
+    let principal = if enabled { host_on_behalf_of(home_dir, actor.id()) } else { None };
+    if enabled {
+        let owner = cron_row_owner(home_dir, &row).await;
+        for origin in [principal.as_deref(), row.on_behalf_of.as_deref()] {
+            if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
+                home_dir, origin, &owner,
+            ).await {
+                return tool_error(&reason);
+            }
+        }
+    }
     let action = if enabled { "resumed" } else { "paused" };
     let _admission = match admit_background_caller(home_dir, actor, "pause_cron_task").await {
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
-    match store.set_enabled(&row.id, enabled).await {
+    match store.set_enabled_with_principal(&row.id, enabled, principal.as_deref()).await {
         Ok(true) => serde_json::json!({
             "content": [{"type": "text", "text": format!("Cron task '{key}' {action}.")}]
         }),
@@ -706,8 +728,11 @@ pub(crate) async fn handle_run_cron_task(
         Ok(guard) => drop(guard),
         Err(reason) => return tool_error(&reason),
     }
-    match duduclaw_gateway::cron_scheduler::run_cron_task_now_for_caller(
-        home_dir, &row.id, actor.agent(),
+    let principal = host_on_behalf_of(home_dir, actor.id());
+    match duduclaw_gateway::on_behalf_of::scope_first(principal,
+        duduclaw_gateway::cron_scheduler::run_cron_task_now_for_caller(
+            home_dir, &row.id, actor.agent(),
+        ),
     ).await {
         Ok(summary) => serde_json::json!({
             "content": [{"type": "text", "text": summary}]

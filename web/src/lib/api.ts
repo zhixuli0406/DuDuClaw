@@ -2626,7 +2626,23 @@ export interface OdooDiscoverSchemaResult {
   wiki_note?: string;
 }
 
+export interface OdooModelAccess {
+  read: boolean | null;
+  create: boolean | null;
+  write: boolean | null;
+  unlink: boolean | null;
+  checked_at: string;
+}
+export interface OdooPermissionOptions {
+  models: { model: string; name: string; access?: OdooModelAccess | null }[];
+  blocked_models: string[];
+  read_only_models: string[];
+  scan_available: boolean;
+}
+
 export interface OdooConfig {
+  blocked_models?: string[];
+  read_only_models?: string[];
   url: string;
   db: string;
   protocol: string;
@@ -3401,6 +3417,8 @@ export interface AgentDetailV168 {
   };
   container?: { timeout_ms?: number };
 
+  odoo_api_key_set?: boolean;
+  odoo_password_set?: boolean;
   odoo?: {
     profile?: string;
     allowed_models?: string[];
@@ -7831,6 +7849,7 @@ export const api = {
       }) as Promise<{ success: boolean; agent_id: string }>,
   },
   odoo: {
+    permissionOptions: () => client.call('odoo.permission_options') as Promise<OdooPermissionOptions>,
     // Gateway bounds connect + scan at 240s; leave time for the final response.
     scanSchema: () => client.call('odoo.schema_scan', {}, false, 300000) as Promise<OdooSchemaScanResult>,
     status: () =>

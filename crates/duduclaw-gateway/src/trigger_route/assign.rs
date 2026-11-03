@@ -208,6 +208,18 @@ pub fn assignable_ids(
         .collect()
 }
 
+/// For non-admin WebChat accounts, invisible names must not influence exact,
+/// partial or ambiguous assignment matching. Other channels keep their policy.
+pub(crate) fn assignment_mention_targets(
+    reg: &AgentRegistry, access: &SenderAccess, channel: &str, fallback: Option<&str>,
+) -> Vec<duduclaw_agent::trigger_match::MentionTarget> {
+    let mut targets = super::mention_targets(reg);
+    if channel == "webchat" && matches!(access.sender, Sender::Account { .. }) {
+        targets.retain(|target| matches!(assign_right(reg, access, &target.id, fallback), AssignRight::Allowed(_)));
+    }
+    targets
+}
+
 /// What to do, decided under the registry lock (no I/O except the
 /// identity data already in `caller.access`).
 #[derive(Debug, Clone, PartialEq)]
@@ -245,7 +257,7 @@ pub(crate) fn plan(reg: &AgentRegistry, lang: Lang, cmd: &AssignCommand, caller:
 }
 
 fn plan_text(reg: &AgentRegistry, lang: Lang, text: &str, caller: &AssignCaller<'_>) -> Plan {
-    let targets = super::mention_targets(reg);
+    let targets = assignment_mention_targets(reg, &caller.access, caller.channel, caller.fallback);
     let allowed =
         |id: &str| matches!(assign_right(reg, &caller.access, id, caller.fallback), AssignRight::Allowed(_));
     match trigger_match::scan_mentions(text, &targets, &allowed) {
@@ -394,7 +406,7 @@ pub fn arm_on_admission(reg: &AgentRegistry, text: &str, caller: &AssignCaller<'
     if caller.sender.is_empty() || matches!(caller.access.sender, Sender::Unmapped) {
         return;
     }
-    let targets = super::mention_targets(reg);
+    let targets = assignment_mention_targets(reg, &caller.access, caller.channel, caller.fallback);
     let allowed =
         |id: &str| matches!(assign_right(reg, &caller.access, id, caller.fallback), AssignRight::Allowed(_));
     if let MentionScan::Hit(hit) = trigger_match::scan_mentions(&rest, &targets, &allowed) {

@@ -40,15 +40,11 @@ pub async fn start(
     if client.client_id.is_empty() {
         return Err("Google 應用程式設定不完整，請聯絡管理員。".into());
     }
-    let plan = crate::remote_mcp::connect::plan_redirect(origin, allowed)?;
-    let (dashboard_origin, paste) = match &plan {
-        crate::remote_mcp::connect::RedirectPlan::Direct { origin, .. } => (origin.clone(), false),
-        crate::remote_mcp::connect::RedirectPlan::Paste { origin, .. } => (origin.clone(), true),
-    };
-    let mut redirect =
-        url::Url::parse(plan.redirect_uri()).map_err(|_| "無法建立 Google 回呼網址。")?;
-    redirect.set_path(CALLBACK_PATH);
-    let redirect_uri = redirect.to_string();
+    let (plan, dashboard_base) = crate::remote_mcp::connect::dashboard_redirect_plan(
+        home, origin, allowed, CALLBACK_PATH,
+    )?;
+    let paste = matches!(&plan, crate::remote_mcp::connect::RedirectPlan::Paste { .. });
+    let redirect_uri = plan.redirect_uri().to_string();
     let verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let epoch = vault::begin_connection(home, user)?;
@@ -59,7 +55,7 @@ pub async fn start(
         user_id: user.into(),
         session_ref: session.into(),
         redirect_uri: redirect_uri.clone(),
-        dashboard_origin,
+        dashboard_base,
         paste,
         code_verifier: verifier,
         client_id: client.client_id.clone(),

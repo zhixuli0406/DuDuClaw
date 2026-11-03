@@ -1,5 +1,7 @@
 # Google を接続する
 
+ダッシュボードをパスのプレフィックス配下で公開する場合は、`config.toml` に `[dashboard] public_url = "https://host/agents"` を設定し、パスも含めてください。nginx の例：`location /agents/ { proxy_pass http://127.0.0.1:18889/; }`。Google Cloud には `https://host/agents/api/me/google/callback` を登録します（リモート MCP は `https://host/agents/oauth/mcp/callback`）。公開 URL とブラウザーの検証済みダッシュボード origin が一致する場合だけ、このプレフィックスを OAuth に使用します。LAN アクセスと URL の貼り付けフローの動作は変わりません。修正を含むバージョンへの更新と登録済みコールバック URL の変更後は、v1.79.1 用に追加したプレフィックスなしの `/api/me/google/callback` と `/me/connections` の nginx 回避ルールを削除できます。
+
 Gmail の検索と読取では、AI 従業員に渡す前にログインリンクと近くのワンタイムコードをマスクします。サードパーティ MCP、Remote MCP、Bash は対象外です。
 
 このガイドと設定ウィザードに沿って、Google アカウントを接続します。

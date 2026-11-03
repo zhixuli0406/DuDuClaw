@@ -53,9 +53,9 @@ async fn rig() -> Rig {
          [goal_loop]\nsteering_enabled = true\n",
     )
     .unwrap();
-    let agent = dir.path().join("agents").join("alice");
-    std::fs::create_dir_all(&agent).unwrap();
-    std::fs::write(agent.join("agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
+    crate::trigger_route::tests::write_agent(
+        &dir.path().join("agents"), "alice", "Alice", "@alice", "specialist", "",
+    );
     let handler = MethodHandler::new(dir.path().to_path_buf()).await;
     handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     let store = Arc::new(TaskStore::open(dir.path()).unwrap());
@@ -535,9 +535,10 @@ async fn main_work_admission_is_shared_by_responsibility_mutations() {
                     ).unwrap();
                 }
                 let before = r.store.get_responsibility(&r.resp_id).await.unwrap().unwrap();
-                std::fs::write(home.join("agents/alice/agent.toml"), format!(
-                    "[agent]\nname = \"alice\"\nrole = \"{}\"\n", if mode == "role" { "main" } else { "specialist" }
-                )).unwrap();
+                crate::trigger_route::tests::write_agent(
+                    &home.join("agents"), "alice", "Alice", "@alice",
+                    if mode == "role" { "main" } else { "specialist" }, "",
+                );
                 r.handler.registry.write().await.scan().await.unwrap();
                 if mode == "default" {
                     std::fs::write(&path, format!("{config}\n[general]\ndefault_agent = \"alice\"\n")).unwrap();
@@ -599,7 +600,9 @@ async fn responsibility_main_gate_fails_closed_on_config_errors_without_row_chan
     for unreadable in [true, false] {
         let r = rig().await;
         let manager = user_ctx(&r, "alice", AccessLevel::Operator, UserRole::Manager);
-        std::fs::write(r._dir.path().join("agents/alice/agent.toml"), "[agent]\nname = \"alice\"\nrole = \"specialist\"\n").unwrap();
+        crate::trigger_route::tests::write_agent(
+            &r._dir.path().join("agents"), "alice", "Alice", "@alice", "specialist", "",
+        );
         r.handler.registry.write().await.scan().await.unwrap();
         assert!(r.handler.deny_main_for_non_admin(&manager, "alice").await.is_ok());
         let path = r._dir.path().join("config.toml");

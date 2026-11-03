@@ -306,6 +306,7 @@ async fn seed_shaped(
     };
     #[allow(unused_mut)]
     let mut run = WorkflowRun {
+        on_behalf_of: None,
         run_id: run_id.clone(),
         trigger_key: run_id.clone(),
         trigger: Trigger::Fixture {

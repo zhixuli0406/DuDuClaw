@@ -104,6 +104,52 @@ pub(crate) fn dashboard_base_url(home_dir: &Path) -> Option<String> {
     Some(format!("http://localhost:{port}"))
 }
 
+/// OAuth-only base resolution. `origin` must already have passed the redirect
+/// origin allowlist. Never use the localhost fallback for a browser redirect.
+pub(crate) fn oauth_dashboard_base(home: &Path, origin: &str) -> String {
+    let configured = std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("dashboard")?.get("public_url").cloned());
+    let Some(configured) = configured else { return origin.into(); };
+    let base = configured.as_str().and_then(valid_oauth_public_base);
+    match base {
+        Some((configured_origin, base)) if configured_origin == origin => base,
+        Some(_) => origin.into(),
+        None => {
+            // Do not log a malformed URL: it may contain credentials or a query.
+            tracing::warn!("invalid [dashboard] public_url; OAuth uses the dashboard origin without a path prefix");
+            origin.into()
+        }
+    }
+}
+
+fn valid_oauth_public_base(raw: &str) -> Option<(String, String)> {
+    let raw = raw.trim();
+    if raw.chars().any(char::is_control) || raw.contains('\\') {
+        return None;
+    }
+    // Check before URL parsing, which normalizes literal and encoded dot segments.
+    let (_, rest) = raw.split_once("://")?;
+    let authority_end = rest.find(|c| matches!(c, '/' | '?' | '#')).unwrap_or(rest.len());
+    if rest[..authority_end].contains('@') { return None; }
+    let path = &rest[authority_end..];
+    let dots = path.to_ascii_lowercase().replace("%2e", ".");
+    if (!path.is_empty() && !path.starts_with('/'))
+        || dots.contains("..") || dots.contains("%2f") || dots.contains("%5c")
+    {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none()
+        || !url.username().is_empty() || url.password().is_some()
+        || url.query().is_some() || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some((url.origin().ascii_serialization(), url.as_str().trim_end_matches('/').into()))
+}
+
 /// Build a full, clickable deep link landing on the page that shows `id`, or
 /// `None` when no dashboard base URL is resolvable — callers must keep their
 /// existing link-less text unchanged in that case, never emit
@@ -135,6 +181,41 @@ mod tests {
 
     fn write_config(dir: &Path, content: &str) {
         std::fs::write(dir.join("config.toml"), content).unwrap();
+    }
+
+    #[test]
+    fn invalid_oauth_public_urls_warn_and_keep_the_origin() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let origin = "https://dash.example";
+        for raw in [
+            "https://dash.example/a/../b", "https://dash.example/a/%2e%2e/b",
+            "https://dash.example/a?query=private", "https://dash.example/a#fragment",
+            "https://user:secret@dash.example/a", "https://@dash.example/a", "/relative",
+            "https://dash.example/a%2fb", "https://dash.example/a%5cb",
+        ] {
+            write_config(dir.path(), &format!("[dashboard]\npublic_url = {raw:?}\n"));
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let writer = Capture(output.clone());
+            let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+                .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+            tracing::subscriber::with_default(subscriber, || {
+                assert_eq!(oauth_dashboard_base(dir.path(), origin), origin);
+            });
+            let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(log.contains("invalid [dashboard] public_url"), "{raw}: {log}");
+            assert!(!log.contains(raw));
+        }
     }
 
     #[test]

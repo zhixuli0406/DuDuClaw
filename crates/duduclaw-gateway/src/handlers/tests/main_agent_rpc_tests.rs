@@ -113,7 +113,15 @@ async fn admin_and_legacy_token_keep_main_work_admission() {
         let fallback = UserContext::admin_fallback();
         for ctx in [&f.admin, &fallback] {
             for (method, params) in requests("a1") {
-                ok(f.handler.handle(method, params, ctx).await);
+                let scheduled = params.get("schedule").is_some();
+                let frame = f.handler.handle(method, params, ctx).await;
+                if ctx.user_id == "system" && scheduled {
+                    // Token auth has no account to revalidate at fire time.
+                    assert!(matches!(frame, WsFrame::Response { ok: false, error: Some(ref e), .. }
+                        if e.as_str() == Some("account_required: a scheduled assignment needs a signed-in account")));
+                } else {
+                    ok(frame);
+                }
             }
             let result = ok(f.handler.handle("tasks.skill_assign", json!({"skill_name": SKILL}), ctx).await);
             assert_eq!(result["runner"]["agent_id"], "a1");
@@ -205,15 +213,32 @@ async fn resuming_an_existing_main_schedule_is_refused() {
             // Model a schedule saved before this hotfix. RPC admission must
             // reject resuming it even though its creator remains Operator.
             let row = manage::create(&f.home, &store, &creator, NewSchedule {
-                agent_id: agent.into(), kind: AssignKind::Task,
+                agent_id: "z1".into(), kind: AssignKind::Task,
                 payload: AssignPayload { title: "Scheduled work".into(), ..Default::default() },
                 spec: ScheduleSpec::Daily { hour: 9, minute: 0 },
                 timezone: Some("Asia/Taipei".into()), created_via: "dashboard".into(), source: None,
             }, Utc::now()).await.unwrap();
+            // Seed the legacy target directly: current creation correctly
+            // refuses a non-Admin main schedule before it can be persisted.
+            rusqlite::Connection::open(store.db_path()).unwrap().execute(
+                "UPDATE assign_schedules SET agent_id=?1 WHERE id=?2",
+                rusqlite::params![agent, row.id],
+            ).unwrap();
             ok(f.handler.handle("assign_schedules.pause", json!({"id": row.id}), &f.employee).await);
             let resumed = f.handler.handle("assign_schedules.resume", json!({"id": row.id}), &f.employee).await;
-            if agent == "a1" { refused(resumed); } else { ok(resumed); }
+            if agent == "a1" {
+                refused(resumed);
+                assert_eq!(store.get_assign_schedule(&row.id).await.unwrap().unwrap().status, "paused");
+            } else {
+                ok(resumed);
+                assert_eq!(store.get_assign_schedule(&row.id).await.unwrap().unwrap().status, "active");
+                // Resume is a paused -> active transition, not an idempotent
+                // operation. Give the Admin check its own paused schedule.
+                ok(f.handler.handle("assign_schedules.pause", json!({"id": row.id}), &f.employee).await);
+            }
+            assert_eq!(store.get_assign_schedule(&row.id).await.unwrap().unwrap().status, "paused");
             ok(f.handler.handle("assign_schedules.resume", json!({"id": row.id}), &f.admin).await);
+            assert_eq!(store.get_assign_schedule(&row.id).await.unwrap().unwrap().status, "active");
             let config_path = f.home.join("config.toml");
             let config = std::fs::read_to_string(&config_path).unwrap();
             for unreadable in [true, false] {
@@ -382,4 +407,14 @@ async fn bound_approval_decisions_gate_main_before_the_early_return() {
             assert_eq!(broker.get(&id).await.unwrap().unwrap().status, if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied });
         }
     }
+}
+
+#[tokio::test]
+async fn unavailable_identity_precedes_main_target_refusal() {
+    let f = fixture(true).await;
+    let db = UserDb::new(&f.home.join("users.db")).unwrap();
+    db.set_user_status(&f.admin.user_id, duduclaw_auth::UserStatus::Suspended).unwrap();
+    let frame = f.handler.deny_main_for_non_admin(&f.admin, "a1").await.unwrap_err();
+    assert!(matches!(frame, WsFrame::Response { ok: false, error: Some(ref e), .. }
+        if e.as_str() == Some("permission denied")));
 }

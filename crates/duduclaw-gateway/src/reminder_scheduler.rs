@@ -121,6 +121,9 @@ pub struct Reminder {
     /// shared bot / app (and every reminder created before this field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_agent: Option<String>,
+    /// Host-carried human origin; absent legacy records remain background work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
 }
 
 fn default_agent() -> String {
@@ -880,6 +883,26 @@ where
     F: FnOnce(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
+    let principal = crate::on_behalf_of::from_stored(
+        home_dir, reminder.on_behalf_of.as_deref(), &reminder.agent_id, "reminder",
+    );
+    crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
+        home_dir, http, registry, sem, reminder, invoke,
+    )).await
+}
+
+async fn deliver_reminder_scoped<F, Fut>(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    sem: &Arc<tokio::sync::Semaphore>,
+    reminder: &Reminder,
+    invoke: F,
+) -> Result<(), String>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
     let mut resolved_reminder = reminder.clone();
     resolved_reminder.agent_id = crate::recipient_guard::scheduled_agent(registry, &reminder.agent_id).await?;
     let reminder = &resolved_reminder;
@@ -892,6 +915,17 @@ where
             .clone()
             .unwrap_or_else(|| "(empty reminder)".to_string()),
         ReminderMode::AgentCallback => {
+            // Re-read the account and final target at fire time. A forbidden
+            // callback fails permanently; it must never retry as background.
+            let principal = crate::on_behalf_of::current();
+            if crate::on_behalf_of::access::requires_main_restriction(home_dir, principal.as_deref())? {
+                let reg = registry.read().await;
+                let agent = reg.get(&reminder.agent_id)
+                    .ok_or_else(|| "提醒的員工不存在，無法確認交辦人權限。".to_owned())?;
+                crate::on_behalf_of::access::check_loaded_main_target(
+                    home_dir, principal.as_deref(), agent,
+                ).await?;
+            }
             let prompt = reminder.prompt.as_deref().unwrap_or("(no prompt provided)");
 
             // Scan prompt for injection before sending to Claude
@@ -1065,6 +1099,112 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ddc-reminder-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    async fn principal_fixture() -> (tempfile::TempDir, Arc<RwLock<AgentRegistry>>, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let employee = db.create_user("employee@test.invalid", "Employee", "fixture-password",
+            duduclaw_auth::UserRole::Employee).unwrap();
+        let admin = db.create_user("admin@test.invalid", "Admin", "fixture-password",
+            duduclaw_auth::UserRole::Admin).unwrap();
+        for (name, role) in [("worker", "worker"), ("main", "main"), ("configured", "worker")] {
+            crate::trigger_route::tests::write_agent(&dir.path().join("agents"),
+                name, name, "", role, "");
+            db.bind_agent(&employee.id, name, duduclaw_auth::AccessLevel::Owner).unwrap();
+        }
+        std::fs::write(dir.path().join("config.toml"),
+            "[general]\ndefault_agent = 'configured'\n[delegation]\nhuman_principal = 'record'\n").unwrap();
+        let mut registry = AgentRegistry::new(dir.path().join("agents"));
+        registry.scan().await.unwrap();
+        assert_eq!(registry.list().len(), 3, "principal fixtures must load");
+        (dir, Arc::new(RwLock::new(registry)), format!("user:{}", employee.id), format!("user:{}", admin.id))
+    }
+
+    fn callback_reminder(agent: &str, principal: Option<&str>) -> Reminder {
+        serde_json::from_value(serde_json::json!({
+            "id": "principal-reminder", "agent_id": agent, "trigger_at": Utc::now(),
+            "channel": "test", "chat_id": "chat", "mode": "agent_callback", "prompt": "work",
+            "on_behalf_of": principal,
+        })).unwrap()
+    }
+
+    #[test]
+    fn reminder_principal_round_trips_and_old_json_remains_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let carried = callback_reminder("worker", Some("user:fixture"));
+        save_reminders_sync(dir.path(), &[carried]).unwrap();
+        assert_eq!(load_reminders_sync(dir.path())[0].on_behalf_of.as_deref(), Some("user:fixture"));
+        let mut legacy = serde_json::to_value(callback_reminder("main", None)).unwrap();
+        legacy.as_object_mut().unwrap().remove("on_behalf_of");
+        std::fs::write(dir.path().join("reminders.jsonl"), format!("{legacy}\n")).unwrap();
+        assert!(load_reminders_sync(dir.path())[0].on_behalf_of.is_none());
+        legacy["on_behalf_of"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Reminder>(legacy).unwrap().on_behalf_of.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_restores_principal_and_keeps_admin_and_legacy_background() {
+        let (dir, registry, employee, admin) = principal_fixture().await;
+        let http = reqwest::Client::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        for (target, principal) in [("worker", Some(employee.as_str())),
+            ("main", Some(admin.as_str())), ("default", None)] {
+            let reminder = callback_reminder(target, principal);
+            let invoked = std::cell::Cell::new(false);
+            let invoked_ref = &invoked;
+            let registry_ref = &registry;
+            let home = dir.path();
+            let employee_principal = employee.as_str();
+            let error = deliver_reminder_with(dir.path(), &http, &registry, &sem, &reminder,
+                |agent, _prompt| async move {
+                    invoked_ref.set(true);
+                    assert_eq!(crate::on_behalf_of::current().as_deref(), principal);
+                    let pairs = crate::on_behalf_of::env_pairs();
+                    assert_eq!(pairs.iter().find(|(key, _)| key == duduclaw_core::ENV_ON_BEHALF_OF)
+                        .map(|(_, value)| value.as_str()), principal);
+                    if principal == Some(employee_principal) {
+                        let outcome = crate::delegation_gate::gate_bus_dispatch(
+                            home, registry_ref, Some(&agent), None, "main", "reminder-child", "sqlite_queue",
+                            crate::on_behalf_of::current().as_deref(),
+                        ).await;
+                        assert!(matches!(outcome, crate::delegation_gate::GateOutcome::Deny(_)));
+                    }
+                    Ok("callback output".to_string())
+                }).await.unwrap_err();
+            assert!(invoked.get());
+            // Unsupported channel is a deterministic boundary after the model seam.
+            assert!(error.starts_with("Delivery failed after retry"), "{error}");
+            assert!(crate::on_behalf_of::current().is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_fire_rechecks_main_default_and_changed_role() {
+        let (dir, registry, employee, _admin) = principal_fixture().await;
+        let http = reqwest::Client::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        for target in ["main", "configured", "default"] {
+            let reminder = callback_reminder(target, Some(&employee));
+            let error = deliver_reminder_with(dir.path(), &http, &registry, &sem, &reminder,
+                |_, _| async { panic!("forbidden callback must not run") }).await.unwrap_err();
+            assert!(error.contains("主代理"), "{target}: {error}");
+        }
+        // A previously ordinary employee can become Main after creation.
+        let reminder = callback_reminder("worker", Some(&employee));
+        save_reminders_sync(dir.path(), &[reminder]).unwrap();
+        crate::trigger_route::tests::write_agent(&dir.path().join("agents"),
+            "worker", "Worker", "", "main", "");
+        registry.write().await.scan().await.unwrap();
+        assert_eq!(registry.read().await.get("worker").unwrap().config.agent.role,
+            duduclaw_core::types::AgentRole::Main);
+        let scheduler = ReminderScheduler::new(dir.path().to_path_buf(), registry);
+        scheduler.reload().await;
+        scheduler.fire_due_reminders().await;
+        let stored = load_reminders_sync(dir.path());
+        assert_eq!(stored[0].status, ReminderStatus::Failed);
+        assert_eq!(stored[0].on_behalf_of.as_deref(), Some(employee.as_str()));
+        assert!(stored[0].error.as_deref().unwrap().contains("主代理"));
     }
 
     #[tokio::test(start_paused = true)]

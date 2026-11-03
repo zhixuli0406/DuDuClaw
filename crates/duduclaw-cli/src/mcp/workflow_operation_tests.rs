@@ -96,6 +96,7 @@ async fn execute_call(staged_ids: &[&str]) -> (tempfile::TempDir, WorkflowCall) 
         expires_at: expiry.clone(),
     };
     let run = WorkflowRun {
+        on_behalf_of: None,
         run_id: "run".into(),
         trigger_key: "run".into(),
         trigger: Trigger::Fixture {

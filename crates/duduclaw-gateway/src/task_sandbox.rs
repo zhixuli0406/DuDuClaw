@@ -425,6 +425,13 @@ pub async fn dispatch(
             failure.log(agent_id);
             return SandboxDispatch::Completed(Err(failure));
         };
+        if let Err(reason) = crate::on_behalf_of::access::check_loaded_main_target(
+            home, crate::on_behalf_of::current().as_deref(), agent,
+        ).await {
+            return SandboxDispatch::Completed(Err(SandboxFailure::failed(
+                failure_code::PRODUCT_POLICY_REFUSED, reason,
+            )));
+        }
         TaskSpec {
             agent_id: if agent_id == "default" {
                 agent.config.agent.name.clone()

@@ -193,15 +193,30 @@ impl MethodHandler {
         let home = self.home_dir.clone();
         let agent = agent_id.to_string();
         let session = session.cloned();
-        let guard = move || match &session {
-            Some(s) => crate::agent_files::flow::require_live_agent_access(&home, s, &agent, AccessLevel::Owner).map(|_| ()),
-            None => Ok(()),
+        let caller_for_guard = caller.cloned();
+        let guard = move || {
+            let live = match &session {
+                Some(s) => Some(crate::agent_files::flow::require_live_agent_access(
+                    &home, s, &agent, AccessLevel::Owner,
+                )?),
+                None if source == "agents.update" => caller_for_guard.as_ref()
+                    .map(|ctx| live_reader_context(&home, ctx)
+                        .map_err(|_| "permission denied".to_owned()))
+                    .transpose()?,
+                None => None,
+            };
+            if source == "agents.update" {
+                require_non_main_commit_target(&home, live.as_ref(), &agent)?;
+            }
+            Ok(())
         };
         let edit = crate::channel_reply::AgentTomlEdit {
             source,
             user_id: caller.map(|c| c.user_id.as_str()).unwrap_or("system"),
             guard,
         };
+        #[cfg(test)]
+        main_commit_test_seam::reached(&self.home_dir);
         crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, mutate).await
     }
 
@@ -222,9 +237,15 @@ impl MethodHandler {
                 let live = crate::agent_files::flow::require_live_agent_access(
                     &self.home_dir, ctx, agent_id, AccessLevel::Operator,
                 )?;
-                acl::require_role(&live, UserRole::Manager)
+                acl::require_role(&live, UserRole::Manager)?;
+                if source == "agents.resume" {
+                    require_non_main_commit_target(&self.home_dir, Some(&live), agent_id)?;
+                }
+                Ok(())
             },
         };
+        #[cfg(test)]
+        main_commit_test_seam::reached(&self.home_dir);
         crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, move |table| {
             let agent_section = table
                 .get_mut("agent")
@@ -265,5 +286,68 @@ impl MethodHandler {
             .await?;
         }
         Ok(())
+    }
+}
+
+/// Called only by the writer's commit guard while agent.toml is locked, after
+/// any lifecycle drain. Registry snapshots and the request's early check may
+/// predate a promotion; use the live caller and the still-unmodified file.
+fn require_non_main_commit_target(
+    home: &Path,
+    live: Option<&UserContext>,
+    agent_id: &str,
+) -> Result<(), String> {
+    if live.is_some_and(UserContext::is_admin) { return Ok(()); }
+    let refuse = || "主代理僅管理員可以使用。".to_owned();
+    let raw = std::fs::read_to_string(home.join("agents").join(agent_id).join("agent.toml"))
+        .map_err(|_| refuse())?;
+    // Only authorization fields belong in this gate. Unrelated optional or
+    // repairable configuration must not turn an ordinary target into Main.
+    #[derive(serde::Deserialize)]
+    struct LockedTarget { agent: LockedIdentity }
+    #[derive(serde::Deserialize)]
+    struct LockedIdentity { name: String, role: duduclaw_core::types::AgentRole }
+    let agent: LockedTarget = toml::from_str(&raw).map_err(|_| refuse())?;
+    let raw = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err(refuse()),
+    };
+    let config: toml::Value = raw.parse().map_err(|_| refuse())?;
+    let default = match config.get("general") {
+        None => None,
+        Some(general) => match general.as_table().ok_or_else(refuse)?.get("default_agent") {
+            None => None,
+            Some(value) => Some(value.as_str().ok_or_else(refuse)?),
+        },
+    };
+    if agent.agent.role == duduclaw_core::types::AgentRole::Main
+        || default.is_some_and(|id| id == agent_id || id == agent.agent.name)
+    {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) mod main_commit_test_seam {
+    use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Mutex, OnceLock}};
+    use tokio::sync::oneshot;
+
+    fn waiters() -> &'static Mutex<HashMap<PathBuf, oneshot::Sender<()>>> {
+        static WAITERS: OnceLock<Mutex<HashMap<PathBuf, oneshot::Sender<()>>>> = OnceLock::new();
+        WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn arm(home: &Path) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        assert!(waiters().lock().unwrap().insert(home.to_path_buf(), tx).is_none());
+        rx
+    }
+
+    pub(super) fn reached(home: &Path) {
+        if let Some(tx) = waiters().lock().unwrap().remove(home) {
+            let _ = tx.send(());
+        }
     }
 }

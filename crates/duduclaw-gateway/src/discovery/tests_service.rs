@@ -28,8 +28,9 @@ fn fixture() -> (tempfile::TempDir, PublicDiscoverySpec, ApprovalBroker) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
     register_accounts(&home);
-    std::fs::create_dir_all(home.join("agents/worker")).unwrap();
-    std::fs::write(home.join("agents/worker/agent.toml"), "[agent]\nname='worker'\n").unwrap();
+    crate::trigger_route::tests::write_agent(
+        &home.join("agents"), "worker", "Worker", "@worker", "specialist", "",
+    );
     let root = home.join("approved"); std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("solution.txt"),"baseline").unwrap();
     workspace::create_private_directory(&home.join("discovery")).unwrap();
@@ -913,7 +914,9 @@ async fn dashboard_cannot_approve_legacy_main_discovery_work() {
             let path = home.join("config.toml");
             let config = std::fs::read_to_string(&path).unwrap();
             if mode == "role" {
-                std::fs::write(home.join("agents/worker/agent.toml"), "[agent]\nname='worker'\nrole='main'\n").unwrap();
+                crate::trigger_route::tests::write_agent(
+                    &home.join("agents"), "worker", "Worker", "@worker", "main", "",
+                );
             } else if mode == "default" {
                 std::fs::write(&path, format!("{config}\n[general]\ndefault_agent='worker'\n")).unwrap();
             }

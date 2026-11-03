@@ -40,7 +40,8 @@ fn audit_rejection_once(
 }
 
 /// Enforce-mode check for `sender → target` on `path_kind` (call it after
-/// the employee tree allowed the delegation). Record mode always passes.
+/// the employee tree allowed the delegation). The main-agent boundary also
+/// applies in record mode.
 /// A refusal writes a `delegation_denied` row (which carries the principal)
 /// and returns the zh-TW reason.
 pub(crate) async fn check_human_principal(
@@ -54,6 +55,16 @@ pub(crate) async fn check_human_principal(
     let principal = duduclaw_core::host_principal_checked();
     if let Err(rejection) = &principal {
         audit_rejection_once(home_dir, sender, rejection);
+    }
+    // Main-agent work is a product boundary, independent of the optional
+    // human-rights enforcement mode. This is only an early refusal; the
+    // gateway dispatcher repeats it against its live registry.
+    if matches!(path_kind, "send_to_agent" | "spawn_agent" | "tasks_create" | "tasks_update"
+        | "tasks_create_schedule" | "create_task" | "run_cron_task" | "update_cron_task") {
+        let wire = principal_wire(principal.clone());
+        duduclaw_gateway::on_behalf_of::access::check_main_target(
+            home_dir, wire.as_deref(), target,
+        ).await?;
     }
     if mode == duduclaw_core::HumanPrincipalMode::Record {
         return Ok(());

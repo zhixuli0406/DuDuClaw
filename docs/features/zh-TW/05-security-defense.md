@@ -14,6 +14,8 @@
 
 工作的委託人分為 Human、Background、Unknown 三種狀態。已儲存但無法解析的委託人是 Unknown，不能授權機器操作工具；舊資料完全沒有委託人時仍是 Background，既有 cron 排程與自主工作可繼續執行。
 
+MCP cron 排程、agent_callback 提醒與 TaskSpec 計畫會保存主機帶入的 `on_behalf_of`，觸發時還原身分，後續委派也會繼承。非 Admin 可以替一般員工建立排程；Main 角色與設定的預設員工在建立時拒絕，執行時再檢查。cron 未通過會暫停，callback 提醒則標記失敗。舊資料沒有委託人時仍當背景工作。Discovery 保留既有已驗證員工／Operator 權限與審批流程；MCP 建立時檢查受保護目標，但獨立 runner 尚未還原真人身分。
+
 每次讀取有效品牌時都會重查授權期限與離線寬限。授權過期或超過離線寬限就顯示原本的 DuDuClaw 品牌，即使主控台持續連不上、閘道尚未重新啟動也一樣。
 
 ## 歷史說明
@@ -237,7 +239,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 這一版的作用：
 
 - **記錄**（預設，`[delegation] human_principal = "record"`）：該輪的每一筆 `tool_calls.jsonl`、每一筆 `delegation_denied`、每一張核可都帶著它，通道核可卡片顯示「由 ○○ 交辦」（優先顯示名稱，找不到時用帳號短碼）。不會因此拒絕任何事。
-- **強制**（`human_principal = "enforce"`，需自行開啟；值無法辨識或 `config.toml` 讀不到也視為強制）：員工組織樹允許一次委派之後，還要真人也有權限。`send_to_agent`／`spawn_agent` 與派工器的委派閘門要求這個人能呼叫目標（Admin；直接綁定或主管的團隊推導，任何等級；或 `public_trigger` 員工）；`tasks_create`（員工指派給自己也算）、`create_task`、排程、看別人信箱與修改別人的任務要求 Operator 以上。未對應帳號的發話者只能到 `public_trigger` 員工，且不能交辦。帳號不存在或停用、值格式不對、`users.db` 讀不到，一律拒絕（`human_principal_not_permitted`）。目標任務每一輪、heartbeat 喚醒與 cron 在派工時不再依真人重檢，它們在建立任務時已經檢查過。
+- **強制**（`human_principal = "enforce"`，需自行開啟；值無法辨識或 `config.toml` 讀不到也視為強制）：員工組織樹允許一次委派之後，還要真人也有權限。`send_to_agent`／`spawn_agent` 與派工器的委派閘門要求這個人能呼叫目標（Admin；直接綁定或主管的團隊推導，任何等級；或 `public_trigger` 員工）；`tasks_create`（員工指派給自己也算）、`create_task`、排程、看別人信箱與修改別人的任務要求 Operator 以上。未對應帳號的發話者只能到 `public_trigger` 員工，且不能交辦。帳號不存在或停用、值格式不對、`users.db` 讀不到，一律拒絕（`human_principal_not_permitted`）。目標任務每一輪、heartbeat 喚醒與 cron 沿用建立時的委派授權；main/default 目標限制仍會在執行時檢查。
 
 強制模式下，獨立 MCP 程序會向正在執行的 gateway 查驗真人權限。它只送主機建立、綁定員工與 home 的不透明參照；gateway 以當下帳號資料驗權；團隊授權必須同時有已驗簽的 Enterprise license，且該 home 的 gateway 已解析為 Enterprise。任一條件為 Personal 或未知就不給團隊授權，不接受本文指定的真人或 Enterprise 環境變數當作證明。背景工作也必須有主機明確登記的 None context：缺少、跨員工／home、過期或已釋放的參照都會拒絕；主機紀錄與 MCP 的身分標記不一致也會拒絕。參照在 runtime 返回或 24 小時後失效，同時最多保留 4096 筆。預設記錄模式不需要此路由。這份 context 與知識庫 requester 分開，不會增加文件存取權。
 
@@ -301,12 +303,12 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 ## 指定人的憑證放系統金鑰圈（v1.76.0）
 
-讓 AI 員工代表某一個人（例如同事的 Google 帳號）之後，憑證被偷的代價變高，所以這類憑證另外用一把金鑰。這把「保護金鑰」是 32 bytes 的 AES-256 金鑰，只存在作業系統的憑證儲存區，代表特定人的憑證用它封存（`pk:v1:<金鑰代號>:…`）。全 home 共用的憑證（`.keyfile` 與它解密的 `*_enc` 值）不變。
+讓 AI 員工代表某一個人（例如同事的 Google 帳號）之後，憑證被偷的代價變高，所以這類憑證另外用一把金鑰。這把「保護金鑰」是 32 bytes 的 AES-256 金鑰；支援的桌面系統放在作業系統的憑證儲存區，選擇啟用的 Docker 模式則放在獨立的 root 專用磁碟區。代表特定人的憑證用它封存（`pk:v1:<金鑰代號>:…`）。全 home 共用的憑證（`.keyfile` 與它解密的 `*_enc` 值）不變。
 
 - **預設關閉。** 管理員在「安全」頁的「憑證保護」卡片開啟（RPC `security.credential_protection_enable`）；`duduclaw credentials status` 印出同一行狀態。關閉時其他功能都不變，需要代表特定人的功能則拒絕執行。
 - **macOS：** 項目放在登入金鑰圈，解密權限只信任建立它的 `duduclaw` 執行檔（以程式碼雜湊識別）。用 Claude 的 `Read`、`cat`、備份、`security` 或 Python 讀這把金鑰都會失敗；有人在 Mac 前面時，macOS 會先跳出詢問。gateway 自己讀取時不會跳對話框。注入 `duduclaw` 行程的程式碼也算 `duduclaw`：測試中把程式碼注入 ad-hoc 簽章的建立者，可以不經詢問讀到金鑰，開了 hardened runtime 就擋下。所以只有執行中的執行檔開了 hardened runtime，卡片才顯示「只有 DuDuClaw 程式讀得到」；目前發布的 CLI 還沒開，會顯示「同一個帳號的程式讀得到」並說明可被注入。升級後新的執行檔雜湊不同，個人帳號會暫停，直到有人在這台 Mac 上執行 `duduclaw credentials authorize` 並允許一次；其他功能照常。
 - **Windows：** 金鑰放在認證管理員，不會出現在檔案或備份裡，但同一個 Windows 帳號下的任何程式都讀得到，包括能執行指令的 AI 員工。儀表板照實顯示。
-- **一般的 Docker 與 Linux：** 一般安裝找不到 AI 員工讀不到的地方放金鑰，所以代表特定人的功能維持拒絕。卡片顯示「檔案（此處無法使用個人帳號）」，並指向下面的 Docker 模式。原生 Linux 目前沒有支援的模式。在容器的終端機執行 `duduclaw credentials status` 也會顯示這個狀態，因為金鑰只交給 gateway 行程；實際狀態以儀表板為準。
+- **一般的 Docker 與原生 Linux：** 一般安裝找不到 AI 員工讀不到的地方放金鑰，所以代表特定人的功能維持拒絕。卡片顯示「檔案（此處無法使用個人帳號）」，並指向下面的 Docker 模式。原生 Linux 目前沒有支援的模式。在容器的終端機執行 `duduclaw credentials status` 也會顯示這個狀態，因為金鑰只交給 gateway 行程；實際狀態以儀表板為準。
 - **Docker 加上 person-credentials 疊加設定：** 用 `docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d` 啟動（步驟見 [Docker 指南](../../guides/zh-TW/docker.md#74-個人帳號person-credentials-疊加設定)）。容器改以 root 啟動，在 `cap_drop: ALL` 之外只加回 `SETUID`、`SETGID`、`SETPCAP`。一支很短的啟動程式（`container/protected-key-launcher.sh`）把 32 bytes 的根金鑰放在只有 root 讀得到的磁碟區 `/var/lib/duduclaw-protected`，先以 `duduclaw` 身分跑首次設定，再殺掉首次設定留下的所有行程，然後在檔案描述元 3 開啟金鑰，以 `duduclaw` 身分、所有權限集合清空並設 `no_new_privs` 啟動 gateway。gateway 是 PID 1，它一停，容器裡其他行程全部跟著結束。它先把自己設為 non-dumpable 才讀金鑰，讀完關掉描述元，接著檢查：PID 1、使用者與群組都不是 root、所有權限集合是空的、`NoNewPrivs`、non-dumpable、自己打不開金鑰路徑、沒有 Docker 或 Podman socket、沒有 `DOCKER_HOST`。任一項不符就丟掉金鑰，個人帳號維持停用，卡片寫出原因。保護金鑰在 home 裡只以根金鑰包裝後的形式存在（`protected/container-wrapped-key.json`）；包裝檔被改動或來自別處，會顯示「保護金鑰被更換」。卡片顯示「獨立金鑰（AI 員工讀不到）」。
   - 實測環境是 Docker Desktop 7.0（arm64，沒有 Yama）。在同一個容器裡以 uid 1000 測試，也在 `unshare -Ur` 裡重測：開啟金鑰檔、`/proc/1/mem`、`environ`、`fd`、`root`、`maps`、`ptrace`、`process_vm_readv` 全部被拒；從容器內送 SIGKILL、SIGSTOP 停不了 PID 1。掛載 Docker socket、`--init`、少了 `SETPCAP` 都會被拒。還沒實測：完整的伺服器映像、Windows 上的 Docker Desktop、Podman 與 rootless Docker。
   - 代價：持有金鑰期間，gateway 不在自己的行程裡載入 ONNX 模型，因為員工改得到這些模型檔，而模型檔會進到原生的解析程式碼。AI 隱私偵測（NER）去識別化、本機知識庫向量與 Kokoro 語音會停止，知識庫搜尋改用關鍵字。**這時 NER 去識別化規則的行為和沒裝模型一樣：文字不會被這些規則遮蔽。**一定要 NER 去識別化的環境，請改用正規表示式規則，或不要開這個模式。
@@ -324,7 +326,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 公司授權代表讓 AI 員工以一位指定同事的身分使用 Google。各道守門都在失敗時拒絕：
 
 - **只認已證明的員工。** 身分只依 `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` 證明的員工決定，絕不看工具參數。宣稱某位員工卻證明不了的行程，只能用公司預設；宣稱的員工若設成其他身分，連預設也不給。
-- **只有 gateway 簽發。** MCP 伺服器向 `POST /api/internal/google-token` 要權杖（本機、簽章身分、一次性 nonce、限流，和知識庫路由同一套驗證）。gateway 自己讀員工的 `[google]`、用自己的登錄查這個 turn 是為誰做的，並且只在 `person_identity_gate()` 通過後（憑證保護達到最低等級；一般的 Linux 與 Docker 安裝一律拒絕，Docker 加上 person-credentials 疊加設定則可通過）才解開委派金鑰。權杖只留在 MCP 伺服器這個 turn 的記憶體裡。
+- **只有 gateway 簽發。** MCP 伺服器向 `POST /api/internal/google-token` 要權杖（本機、簽章身分、一次性 nonce、限流，和知識庫路由同一套驗證）。gateway 自己讀員工的 `[google]`、用自己的登錄查這個 turn 是為誰做的，並且只在 `person_identity_gate()` 通過後（憑證保護達到最低等級；原生 Linux 與一般 Docker 安裝一律拒絕，Docker 加上 person-credentials 疊加設定則可通過）才解開委派金鑰。權杖只留在 MCP 伺服器這個 turn 的記憶體裡。
 - **金鑰是封存的。** 服務帳號金鑰只以保護金鑰封存的 `pk:v1` 形式保存。用目前的保護金鑰解不開，就當成金鑰被換掉：委派停止、寫一次 `google_delegation_key_unreadable`（Critical），由管理員重設憑證保護後重新匯入。舊紀錄不會被悄悄覆蓋。
 - **誰在要求。** 預設只有綁定這位員工的人、管理員和系統工作能用那位同事的帳號；公開訪客在任何設定下都不行。發問者被拒或設定錯誤絕不改用公司共用帳號；其他失敗只有員工設了 `fallback = "home"` 才改用，回覆會說明。
 - **每次重讀人員狀態。** 同事的 DuDuClaw 帳號停權或離職後，下一次呼叫就拒絕。

@@ -6681,6 +6681,7 @@ fn agent_file_guard_decision(
                         .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(command, &caller, tui_cmd::OPERATOR_COMMANDS)
                         })
+                        .or_else(|| license::bash_license_decision(command, &caller))
                         .or_else(|| {
                             channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
                         })

@@ -162,6 +162,15 @@ impl WorkflowStore {
             CREATE TRIGGER IF NOT EXISTS workflow_cost_retained BEFORE DELETE ON workflow_cost_entries
             BEGIN SELECT RAISE(ABORT,'workflow cost entry retained'); END;")
             .map_err(|e| e.to_string())?;
+        // Additive authority migration: a separate trigger also upgrades homes
+        // whose original authority trigger already exists. Missing old fields
+        // compare as NULL and stay background; a persisted origin is immutable.
+        tx.execute_batch("CREATE TRIGGER IF NOT EXISTS workflow_run_principal_immutable
+            BEFORE UPDATE OF record_json ON workflow_runs
+            WHEN json_extract(NEW.record_json,'$.on_behalf_of') IS NOT
+                 json_extract(OLD.record_json,'$.on_behalf_of')
+            BEGIN SELECT RAISE(ABORT,'workflow run principal immutable'); END;")
+            .map_err(|e| e.to_string())?;
         let version: i64 = tx
             .query_row(
                 "SELECT version FROM workflow_schema_meta WHERE owner='foundation'",

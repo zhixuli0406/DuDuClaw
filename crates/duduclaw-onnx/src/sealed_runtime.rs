@@ -55,9 +55,14 @@ fn io_error(e: std::io::Error) -> String {
 }
 
 fn seal_and_verify(source: impl Read, (size, hash): (u64, &str)) -> Result<File, String> {
-    // SAFETY: a static NUL-terminated name and defined memfd flags.
+    // SAFETY: a static NUL-terminated name and defined memfd flags. Calling
+    // the syscall directly avoids the glibc 2.27 memfd_create wrapper.
     let fd = unsafe {
-        libc::memfd_create(c"duduclaw-onnx".as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC)
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"duduclaw-onnx".as_ptr(),
+            libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC,
+        ) as libc::c_int
     };
     if fd < 0 {
         return Err(io_error(std::io::Error::last_os_error()));

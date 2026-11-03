@@ -23,3 +23,5 @@ pub use events::{OdooEvent, PollTracker};
 
 /// Versioned, bounded metadata snapshots and automatic scan scheduling.
 pub mod schema;
+/// Bounded account-rights metadata probes.
+pub mod permissions;

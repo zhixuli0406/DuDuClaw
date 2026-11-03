@@ -133,7 +133,12 @@ impl WorkflowRunner {
         };
         let segment = Utc::now() + chrono::Duration::seconds(EXECUTION_SEGMENT_SECONDS);
         // Boxed: the step state machine is large; keep it off the caller's stack.
-        let result = Box::pin(self.execute_claimed(&mut run, &revision, &token, segment)).await;
+        let principal = crate::on_behalf_of::from_stored(
+            &self.home, run.on_behalf_of.as_deref(), &run.actor, "workflow_run",
+        );
+        let result = crate::on_behalf_of::scope_first(principal,
+            Box::pin(self.execute_claimed(&mut run, &revision, &token, segment)),
+        ).await;
         drop(heartbeat);
         let release = self
             .store

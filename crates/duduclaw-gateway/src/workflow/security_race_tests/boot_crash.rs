@@ -57,12 +57,20 @@ impl Drop for Crashed {
 
 /// Runs the child and requires that it died by abort, not by finishing.
 async fn crash_at(scenario: &str) -> Crashed {
+    // Check the shared E2E prerequisite before spawning: a child panic here
+    // is not evidence that the selected durable abort checkpoint regressed.
+    let binary = std::env::var_os("DUDUCLAW_P1_PILOT_BINARY")
+        .expect("boot-crash prerequisite: set DUDUCLAW_P1_PILOT_BINARY to the verified default-feature stdio CLI");
+    let binary = std::fs::canonicalize(binary)
+        .expect("boot-crash prerequisite: DUDUCLAW_P1_PILOT_BINARY must exist");
+    assert!(binary.is_file(), "boot-crash prerequisite: pilot CLI must be a file");
     let dir = tempfile::tempdir().unwrap();
     let report = dir.path().join("home");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD, "--nocapture", "--test-threads=1"])
         .env(SCENARIO_ENV, scenario)
         .env(REPORT_ENV, &report)
+        .env("DUDUCLAW_P1_PILOT_BINARY", &binary)
         .env_remove(CRASH_AT_ENV)
         .status()
         .unwrap();
@@ -77,7 +85,6 @@ async fn crash_at(scenario: &str) -> Crashed {
         Ok(id) => id,
         Err(_) => only_activation(&home),
     };
-    let binary = std::fs::canonicalize(std::env::var_os("DUDUCLAW_P1_PILOT_BINARY").unwrap()).unwrap();
     let service = WorkflowService::new(
         home.clone(),
         binary,

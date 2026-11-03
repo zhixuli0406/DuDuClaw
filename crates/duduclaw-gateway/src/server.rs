@@ -17310,11 +17310,11 @@ fn personal_google_callback_response(
     let result =
         crate::google_personal::pending::callback_values(query).and_then(|(nonce, code)| {
             crate::google_personal::pending::receive_code(home, &nonce, &code)
-                .map(|(origin, _)| (nonce, origin))
+                .map(|(base, _)| (nonce, base))
         });
     let mut response = match result {
-        Ok((nonce, origin)) => {
-            let target = format!("{origin}/me/connections?google_state={nonce}");
+        Ok((nonce, base)) => {
+            let target = format!("{base}/me/connections?google_state={nonce}");
             axum::response::Redirect::to(&target).into_response()
         }
         Err(message) => axum::response::Html(format!(
@@ -17344,6 +17344,40 @@ mod personal_google_callback_tests {
     use super::*;
 
     #[tokio::test]
+    async fn callbacks_use_saved_dashboard_bases_after_config_changes() {
+        let home = tempfile::tempdir().unwrap();
+        for base in ["https://dashboard.example", "https://dashboard.example/agents"] {
+            let nonce = crate::google_personal::pending::insert(crate::google_personal::pending::Pending {
+                home: home.path().into(),
+                user_id: "alice".into(),
+                session_ref: uuid::Uuid::new_v4().to_string(),
+                redirect_uri: format!("{base}/api/me/google/callback"),
+                dashboard_base: base.into(),
+                paste: false,
+                code_verifier: "verifier".into(),
+                client_id: "fixture".into(),
+                client_secret: "secret".into(),
+                epoch: 1,
+                google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
+                created: std::time::Instant::now(),
+                code: None,
+            });
+            std::fs::write(home.path().join("config.toml"),
+                "[dashboard]\npublic_url = \"https://different.example/changed\"\n").unwrap();
+            let response = personal_google_callback_response(home.path(), &format!("state={nonce}&code=fixture"));
+            assert_eq!(response.headers()[axum::http::header::LOCATION],
+                format!("{base}/me/connections?google_state={nonce}"));
+            for ok in [true, false] {
+                let response = remote_mcp_result_page(ok, "fixture", Some(base));
+                let body = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+                let html = String::from_utf8(body.to_vec()).unwrap();
+                assert!(html.contains(&format!("href=\"{base}/manage/integrations?tab=mcp&amp;mcp_tab=remote\"")));
+                assert!(!html.contains("different.example"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn callback_has_no_store_no_referrer_and_redirects_without_code() {
         let home = tempfile::tempdir().unwrap();
         let nonce =
@@ -17352,7 +17386,7 @@ mod personal_google_callback_tests {
                 user_id: "alice".into(),
                 session_ref: uuid::Uuid::new_v4().to_string(),
                 redirect_uri: "https://dashboard.example/api/me/google/callback".into(),
-                dashboard_origin: "https://dashboard.example".into(),
+                dashboard_base: "https://dashboard.example".into(),
                 paste: false,
                 code_verifier: "VERIFIER_MUST_NOT_LEAK".into(),
                 client_id: "fixture".into(),
@@ -17416,10 +17450,10 @@ fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::
         "Sign-in did not complete"
     };
     let link = match back {
-        Some(origin) => format!(
+        Some(base) => format!(
             "<p><a href=\"{}\" style=\"color:#8A5A10\">Back to the dashboard</a></p>",
             html_escape(&format!(
-                "{origin}/manage/integrations?tab=mcp&mcp_tab=remote"
+                "{base}/manage/integrations?tab=mcp&mcp_tab=remote"
             ))
         ),
         None => "<p style=\"color:#5B6470\">You can close this window.</p>".to_string(),
@@ -17457,7 +17491,7 @@ async fn handle_remote_mcp_oauth_callback(
     let st = params.get("state").map(String::as_str).unwrap_or("");
     if let Some(err) = params.get("error") {
         let pending = remote_mcp::connect::cancel_pending(st);
-        let back = pending.as_ref().map(|p| p.redirect_origin.clone());
+        let back = pending.as_ref().map(|p| p.dashboard_base.clone());
         if let Some(p) = &pending {
             remote_mcp::audit(
                 &home,
@@ -17487,13 +17521,13 @@ async fn handle_remote_mcp_oauth_callback(
                         "{} is connected for {}. Return to the dashboard.",
                         done.server, done.agent_id
                     ),
-                    Some(&done.redirect_origin),
+                    Some(&done.dashboard_base),
                 )
             }
             Err(e) => remote_mcp_result_page(
                 false,
                 &format!("Signed in, but the employee's MCP settings could not be updated: {e}"),
-                Some(&done.redirect_origin),
+                Some(&done.dashboard_base),
             ),
         },
         Err(e) => {

@@ -49,6 +49,28 @@ async fn pre_admission_notice_survives_unavailable_but_never_revoked_writer() {
 }
 
 #[tokio::test]
+async fn queued_refusal_preserves_terminal_on_identity_outage_without_disclosing_target() {
+    for validity in [SocketValidity::Valid, SocketValidity::Unavailable, SocketValidity::Revoked] {
+        let (tx, mut rx) = outbound_channel();
+        let sink = TurnSink::new(tx, "session", Some("c".into()), "m");
+        sink.frame(ChatMessage::error_coded("PRIVATE_TARGET", "agent_forbidden")).await;
+        let sent = write_frame(rx.recv().await.unwrap(), validity).await;
+        assert_eq!(sent.len(), 1);
+        match validity {
+            SocketValidity::Valid => {
+                let Message::Text(text) = &sent[0] else { panic!("expected refusal") };
+                let frame: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(frame["code"], "agent_forbidden");
+                assert_eq!(frame["message"], "PRIVATE_TARGET");
+                assert_eq!(frame["msg_id"], "m");
+            }
+            SocketValidity::Unavailable => notice(&sent[0], false),
+            SocketValidity::Revoked => assert!(matches!(sent[0], Message::Close(_))),
+        }
+    }
+}
+
+#[tokio::test]
 async fn writer_refusal_rejects_reply_ack_and_only_emits_fixed_notice() {
     for validity in [SocketValidity::Unavailable, SocketValidity::Revoked] {
         let (tx, mut rx) = outbound_channel();

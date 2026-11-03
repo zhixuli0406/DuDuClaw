@@ -65,7 +65,7 @@ pub struct AgentOdooConfig {
     /// Whitelist of action verbs this agent may perform.
     ///
     /// Granular forms: `"read"`, `"search"`, `"create"`, `"write"`,
-    /// `"execute"`. Per-model qualification: `"write:crm.lead"` allows
+    /// `"unlink"`, `"action"`, `"execute"`. Per-model qualification: `"write:crm.lead"` allows
     /// only `write` on `crm.lead`. Empty / absent ⇒ no action restriction.
     pub allowed_actions: Vec<String>,
     /// Multi-company scope. When non-empty, queries are narrowed to these

@@ -65,7 +65,16 @@ fn odoo_denial_messages_name_gate_and_operator_setting() {
     ] {
         let text = super::odoo::blocklist_denial_message("res.partner", denial);
         assert!(text.contains("block list gate"));
-        assert!(text.contains("unblock_models"));
+        match denial {
+            duduclaw_odoo::BlockDenial::SecurityDefault => {
+                assert!(text.contains("confirming sensitive access"));
+                assert!(text.contains("員工 → 編輯 → 整合 → Odoo"));
+                assert!(!text.contains("解鎖的 Models"));
+            }
+            duduclaw_odoo::BlockDenial::SystemReadOnly => {
+                assert!(text.contains("writing or deleting is always refused"));
+            }
+        }
         assert!(!text.contains("agent.toml"));
     }
     let text = super::odoo::method_denial_message("unlink");
