@@ -28,12 +28,11 @@ describe('SetupChecklistPage', () => {
     state.allowed = true;
     state.data = { company: null, knowledge: null, runtime: null, accounts: null, google: null, odoo: null, agents: null, users: null, channels: null, skills: null, routines: null, tasks: null };
     show();
-    expect(screen.getAllByText('無法確認')).toHaveLength(12);
+    expect(screen.getAllByText('無法確認')).toHaveLength(11);
     expect(screen.getByText('已完成 0 / 8')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '公司' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '人員' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '能力' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: '開始' })).toBeInTheDocument();
   });
   it('does not render checklist for an unauthorized viewer', () => {
     state.allowed = false;

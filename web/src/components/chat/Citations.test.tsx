@@ -16,7 +16,10 @@ async function failWith() {
   throw e;
 }
 vi.mock('@/lib/ws-client', () => ({
-  client: { call: (m: string, p: unknown) => (m === 'knowledge.passage.get' ? (failNext.err ? failWith() : passageGet(p)) : Promise.reject(new Error('x'))) },
+  client: {
+    call: (m: string, p: unknown) => (m === 'knowledge.passage.get' ? (failNext.err ? failWith() : passageGet(p)) : Promise.reject(new Error('x'))),
+    subscribe: vi.fn().mockReturnValue(vi.fn()),
+  },
 }));
 
 const cite = (o: Partial<ChatCitation> & { n: number }): ChatCitation => ({

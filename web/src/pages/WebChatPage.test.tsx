@@ -291,7 +291,7 @@ describe('WebChatPage', () => {
     });
     renderWithProviders(<WebChatPage />);
     expect(screen.getByText('Task #1a2b3c4d assigned')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'View progress' })).toHaveAttribute('href', '/goals?assigned=me');
+    expect(screen.getByRole('link', { name: 'View progress' })).toHaveAttribute('href', '/tasks/1a2b3c4d-0000-5000-8000-000000000000');
   });
 
   it('labels a reply that another AI staff member answered', () => {
