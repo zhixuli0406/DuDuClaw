@@ -49,10 +49,11 @@
 
 | 終端機 | 狀態 |
 |---|---|
-| macOS 上的 tmux | 全螢幕已在真實 gateway 測過。tmux 允許時，通知走 tmux passthrough。 |
+| macOS 上的 tmux | 全螢幕已在真實 gateway 測過，包含本機真實模型的回覆、回覆途中取消，以及滑鼠輸入送達終端區塊內的程式（X10、SGR、urxvt、SGR-Pixels 四種編碼與 `vim`）。tmux 允許時，通知走 tmux passthrough。 |
+| macOS 上的 Terminal.app | 全螢幕已在真實 gateway 測過：繪製、中日韓字寬、`p` 與 `u`、中文與 emoji 輸入、終端區塊、正常退出。按鍵由測試程式送入，不是實體鍵盤。 |
 | 自動測試中的 macOS、Linux 虛擬終端 | 畫面由快照涵蓋，寬度 60 欄以上，高度到 12 列。 |
 | Windows，透過 SSH 執行 `tui inbox` | 已在原生 Windows 機器測過。 |
-| Windows 全螢幕 | 未驗證，SSH 無法測到。 |
+| Windows 11 全螢幕，於 ConPTY 下 | 已在原生 Windows 機器的真實 gateway 測過，由測試程式驅動真實 Pseudo Console：繪製、調整大小、視窗過小提示、`p` 與 `u` 在 gateway 端確認生效、中文輸入、正常退出。尚未在 Windows Terminal 本身操作。 |
 | 實體機 Ubuntu 22.04，於 PTY 下全螢幕 | 已在真實 gateway 測過：繪製、調整大小、視窗過小提示、`p` 與 `u` 在 gateway 端確認生效、正常退出並還原終端。尚未在實體終端機程式上操作。 |
 
 控制室至少需要 24 欄、12 列，視窗太小時會直接告訴你。狀態符號預設為 ASCII，字型支援的話可在 `tui.toml` 設 `glyphs = 'unicode'`。控制室處理了中日韓字寬和整字提交，但輸入法還沒有人工實測。

@@ -222,7 +222,13 @@ impl App {
             if pane.kind != crate::blocks::Block::Chat { continue; }
             let state = rooms.rooms.get(&pane.id).cloned().unwrap_or_else(|| {
                 let mut state = pane.chat_view.state.clone();
-                state.connected = rooms.connected; state.stale = !rooms.connected; state
+                state.connected = rooms.connected; state.stale = !rooms.connected;
+                if !state.running {
+                    state.status = TerminalText::new(
+                        if rooms.connected { strings::CONNECTED } else { strings::CONNECTING }.into(),
+                    );
+                }
+                state
             });
             pane.chat_view.state = state.clone();
             if i == self.blocks.focused { self.chat = state; }

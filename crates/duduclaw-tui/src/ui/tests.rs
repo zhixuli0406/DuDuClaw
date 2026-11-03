@@ -1450,6 +1450,35 @@ fn heartbeat_uses_last_run_and_cron_uses_gateway_next_run_without_prediction() {
 }
 
 #[test]
+fn chat_block_without_a_room_shows_connected_after_the_handshake() {
+    use crate::chat::{ChatRooms, Frame};
+
+    let model = populated();
+    let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE), &model);
+    let pane_id = app.blocks.panes[app.blocks.focused].id.clone();
+    let mut rooms = ChatRooms::default();
+
+    app.sync_chats(&rooms);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTING);
+    assert!(!rooms.rooms.contains_key(&pane_id));
+
+    rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+    app.sync_chats(&rooms);
+
+    assert!(app.chat.connected);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+    assert!(!rooms.rooms.contains_key(&pane_id));
+
+    rooms.disconnected();
+    app.sync_chats(&rooms);
+
+    assert!(!app.chat.connected);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTING);
+}
+
+#[test]
 fn concurrent_chat_real_keys_keep_drafts_scrollback_cancel_and_prompt_in_own_pane() {
     use crate::chat::{ChatRooms, Focus, Frame};
     let model = populated();
