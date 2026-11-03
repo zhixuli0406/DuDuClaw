@@ -292,6 +292,7 @@ impl NerEngine {
     /// `[redaction.ner]` takes effect on the next reload; an edit made while a
     /// long request still holds the old engine lands one reload later.
     pub fn open(dirs: &InstallDirs, config: &NerConfig) -> Result<Self> {
+        duduclaw_onnx::refuse_in_process_models().map_err(RedactionError::config)?;
         if let Some(problem) = install::installed_problem(dirs) {
             return Err(RedactionError::config(problem));
         }
@@ -410,7 +411,10 @@ impl NerEngine {
     }
 
     fn load(&self) -> Result<Loaded> {
+        duduclaw_onnx::refuse_in_process_models().map_err(RedactionError::config)?;
         let t0 = Instant::now();
+        #[cfg(test)]
+        tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         init_ort(&self.inner.ort_lib_path).map_err(RedactionError::config)?;
 
         let dir = &self.inner.model_dir;
@@ -442,6 +446,8 @@ impl NerEngine {
         let threads = self.inner.threads;
         let graph = dir.join("onnx").join("model_q4.onnx");
         let build = || -> std::result::Result<Session, String> {
+            #[cfg(test)]
+            tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let b = Session::builder().map_err(|e| e.to_string())?;
             let b = b
                 .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -614,6 +620,46 @@ fn infer_chunk(loaded: &mut Loaded, text: &str) -> Result<Vec<RawSpan>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) static ORT_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn root_key_refuses_models_before_ort() {
+        // OnceLock cannot be reset: run only this test in a fresh process.
+        const CHILD: &str = "DUDUCLAW_ONNX_REFUSAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ner::runtime::tests::root_key_refuses_models_before_ort", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "child must run exactly this test");
+            return;
+        }
+        duduclaw_core::root_key::test_hold_root_key();
+        assert!(duduclaw_core::root_key::is_held());
+        let expected = "獨立金鑰模式下不在主程式內載入 ONNX 模型（隱私偵測、本機知識庫向量、Kokoro 語音暫停使用）";
+        let home = tempfile::tempdir().unwrap();
+        let dirs = InstallDirs::under_home(home.path());
+        let err = NerEngine::open(&dirs, &NerConfig::default()).unwrap_err();
+        assert!(matches!(err, RedactionError::Config(ref message) if message == expected));
+        // Exercise the lazy reload separately, without needing an installed model.
+        let engine = NerEngine { inner: Arc::new(EngineInner {
+            model_dir: dirs.model_dir,
+            ort_lib_path: home.path().join("missing-runtime"),
+            threads: 1,
+            idle_unload: None,
+            loaded: Mutex::new(None),
+            cache: Mutex::new(Lru::new(1)),
+            stats: Arc::new(NerStats::default()),
+            watchdog: AtomicBool::new(false),
+        }) };
+        let err = engine.load().err().expect("held root key must refuse lazy loading");
+        assert!(matches!(err, RedactionError::Config(ref message) if message == expected));
+        assert_eq!(ORT_ENTRIES.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "neither ORT initialization nor its session builder may be reached");
+    }
 
     #[test]
     fn stats_start_empty_and_round_to_one_decimal() {

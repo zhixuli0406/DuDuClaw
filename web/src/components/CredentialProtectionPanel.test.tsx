@@ -188,6 +188,37 @@ describe('container credential protection', () => {
     expect(screen.queryByText(/untrusted diagnostic/)).toBeNull();
   });
 
+  it.each([
+    ['en', en],
+    ['zh-TW', zhTW],
+    ['ja-JP', jaJP],
+  ] as const)('warns about restoring old folders when replacing or resetting a container key in %s', async (locale, messages) => {
+    mockProtection(CONTAINER_READY, CONTAINER_READY);
+    renderWithProviders(
+      <IntlProvider locale={locale} messages={messages}>
+        <CredentialProtectionPanel />
+      </IntlProvider>,
+    );
+    await userEvent.click(await screen.findByRole('button', {
+      name: messages['security.credentialProtection.rotate'],
+    }));
+    const warning = messages['security.credentialProtection.confirm.reset.message_container'];
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(warning).not.toBe(messages['security.credentialProtection.confirm.reset.message']);
+    const buttons = screen.getAllByRole('button', {
+      name: messages['security.credentialProtection.reset'],
+    });
+    await userEvent.click(buttons[buttons.length - 1]);
+    expect(mockWsClient.call).toHaveBeenCalledWith('security.credential_protection_enable', { reset: true });
+  });
+
+  it('uses the same container warning when re-enabling after a changed key', async () => {
+    mockProtection(status({ ...CONTAINER_READY, state: 'key_changed' }), CONTAINER_READY);
+    renderWithProviders(<CredentialProtectionPanel />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Re-enable' }));
+    expect(screen.getByText(en['security.credentialProtection.confirm.reset.message_container'])).toBeInTheDocument();
+  });
+
   it('explains that disabling removes the wrapped key and retains the startup volume', async () => {
     mockProtection(CONTAINER_READY);
     renderWithProviders(<CredentialProtectionPanel />);

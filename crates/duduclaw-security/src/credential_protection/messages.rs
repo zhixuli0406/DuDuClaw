@@ -31,7 +31,7 @@ pub fn state_text(
         let text = match state {
             ProtectionState::NotEnabled => Some((level_label(ProtectionLevel::File), "個人帳號的憑證保護尚未開啟。請到「安全」頁開啟憑證保護，再讓 AI 員工使用個人的 Google 帳號。".to_string())),
             ProtectionState::Missing => Some(("保護金鑰不見了", "找不到加密保存的保護金鑰，可能被刪除了。已保存的個人帳號憑證不能再用。請重新啟用，並請已連結的人重新連結。".to_string())),
-            ProtectionState::KeyChanged => Some(("保護金鑰被更換", "加密保存的保護金鑰無法驗證，可能被改動；金鑰磁碟區遺失或被更換也會造成這個狀況。個人帳號已停用。請先檢查容器和金鑰磁碟區，再重新啟用並請大家重新連結。".to_string())),
+            ProtectionState::KeyChanged => Some(("保護金鑰被更換", "加密保存的保護金鑰無法驗證，可能被改動；金鑰磁碟區遺失或被更換也會造成這個狀況。個人帳號已停用。請先檢查容器和金鑰磁碟區，再重新啟用並請大家重新連結。懷疑金鑰外洩時，請依部署指南更換金鑰磁碟區裡的根金鑰；只在儀表板更換保護金鑰，擋不住有人還原舊的資料夾內容。".to_string())),
             ProtectionState::Unavailable => Some(("獨立金鑰無法使用", with_extra("無法使用容器的獨立金鑰。個人帳號暫停使用；其他功能不受影響。", refusal_text(extra).unwrap_or(extra)))),
             _ => None,
         };
@@ -72,7 +72,7 @@ pub fn state_text(
 
 fn ready_detail(level: ProtectionLevel, backend: BackendKind) -> &'static str {
     match (level, backend) {
-        (ProtectionLevel::ProcessIsolated, _) => "個人帳號的憑證以獨立金鑰保護，只有容器的啟動步驟（root）能讀取根金鑰，並在啟動時交給 DuDuClaw 主程式一次。能執行指令的 AI 員工無法讀取或替換根金鑰，但仍能在允許的範圍內要求 DuDuClaw 代用 Google、讀取該回合取得的存取權杖，也能讓 DuDuClaw 停止運作。控制 Docker 主機或金鑰磁碟區的人能讀取根金鑰。",
+        (ProtectionLevel::ProcessIsolated, _) => "個人帳號的憑證以獨立金鑰保護，只有容器的啟動步驟（root）能讀取根金鑰，並在啟動時交給 DuDuClaw 主程式一次。能執行指令的 AI 員工無法讀取或替換根金鑰，但仍能在允許的範圍內要求 DuDuClaw 代用 Google、讀取該回合取得的存取權杖，也能讓 DuDuClaw 停止運作。控制 Docker 主機或金鑰磁碟區的人能讀取根金鑰。懷疑金鑰外洩時，請依部署指南更換金鑰磁碟區裡的根金鑰；只在儀表板更換保護金鑰，擋不住有人還原舊的資料夾內容。",
         (ProtectionLevel::AppBound, _) => "個人帳號的憑證用一把只存在這台 Mac 金鑰圈的金鑰加密，其他程式要讀時 macOS 會擋下。能執行指令的 AI 員工仍可能換掉這把金鑰；gateway 執行期間換掉、或舊的封存資料對不上時，DuDuClaw 會停用個人帳號。",
         (ProtectionLevel::UserStore, BackendKind::MacosKeychain) => "個人帳號的憑證用一把只存在這台 Mac 金鑰圈的金鑰加密，一般程式讀不到。但這個 DuDuClaw 執行檔沒有開啟 hardened runtime，能執行指令的 AI 員工可以把程式碼注入 DuDuClaw 後讀到這把金鑰。",
         (ProtectionLevel::UserStore, _) => "個人帳號的憑證用一把存在 Windows 認證管理員的金鑰加密，不會出現在檔案或備份裡。同一個 Windows 帳號下的程式（包括能執行指令的 AI 員工）仍讀得到。",

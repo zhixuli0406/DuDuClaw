@@ -53,8 +53,12 @@ fi
     --inh-caps=-all --bounding-set=-all --no-new-privs \
     /bin/sh -c 'kill -9 -1 2>/dev/null; exit 0'
 for status in /proc/[0-9]*/status; do
-    real_uid=$(awk '$1 == "Uid:" { print $2; exit }' "$status" 2>/dev/null) || continue
-    [ -z "$real_uid" ] || [ "$real_uid" = 0 ] || fail "an unprivileged process remains before hand-off"
+    process_identity=$(awk '
+        $1 == "State:" { zombie = ($2 ~ /^Z/) }
+        $1 == "Uid:" { uid = $2 }
+        END { if (!zombie && uid != "") print uid }
+    ' "$status" 2>/dev/null) || continue
+    [ -z "$process_identity" ] || [ "$process_identity" = 0 ] || fail "an unprivileged process remains before hand-off"
 done
 exec 3<"$KEY"
 HOME=/home/duduclaw USER=duduclaw LOGNAME=duduclaw DUDUCLAW_ROOT_KEY_FD=3 \

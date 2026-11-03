@@ -85,7 +85,10 @@ impl LocalOnnxEmbedder {
     }
 
     fn load(&self) -> Result<Loaded, EmbedError> {
+        duduclaw_onnx::refuse_in_process_models().map_err(EmbedError::Unavailable)?;
         let t0 = Instant::now();
+        #[cfg(test)]
+        tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         duduclaw_onnx::runtime::init_ort(&self.ort_lib).map_err(EmbedError::Unavailable)?;
         let mut tokenizer = Tokenizer::from_file(self.model_dir.join(&self.spec.tokenizer_file))
             .map_err(|e| EmbedError::Unavailable(format!("載入向量模型的 tokenizer 失敗：{e}")))?;
@@ -99,6 +102,8 @@ impl LocalOnnxEmbedder {
         let graph = self.model_dir.join(&self.spec.model_file);
         let threads = self.threads;
         let build = || -> Result<Session, String> {
+            #[cfg(test)]
+            tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let b = Session::builder().map_err(|e| e.to_string())?;
             let b = b
                 .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -321,6 +326,35 @@ impl Embedder for LocalOnnxEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) static ORT_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn root_key_refuses_models_before_ort() {
+        // OnceLock cannot be reset: run only this test in a fresh process.
+        const CHILD: &str = "DUDUCLAW_ONNX_REFUSAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "embed::local_onnx::tests::root_key_refuses_models_before_ort", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "child must run exactly this test");
+            return;
+        }
+        duduclaw_core::root_key::test_hold_root_key();
+        assert!(duduclaw_core::root_key::is_held());
+        let expected = "獨立金鑰模式下不在主程式內載入 ONNX 模型（隱私偵測、本機知識庫向量、Kokoro 語音暫停使用）";
+        let home = tempfile::tempdir().unwrap();
+        let spec = super::super::catalog::find(super::super::catalog::DEFAULT_MODEL).unwrap();
+        let engine = LocalOnnxEmbedder::new(spec, home.path(), home.path().join("missing-runtime"), 1, 4);
+        let err = engine.embed_query("特休").unwrap_err();
+        assert!(matches!(err, EmbedError::Unavailable(ref message) if message == expected));
+        assert!(!engine.is_loaded());
+        assert_eq!(ORT_ENTRIES.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "neither ORT initialization nor its session builder may be reached");
+    }
 
     #[test]
     fn position_ids_count_real_tokens_only() {

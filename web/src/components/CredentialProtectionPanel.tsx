@@ -220,7 +220,7 @@ export function CredentialProtectionPanel() {
           if (action) void run(action);
         }}
         title={intl.formatMessage({ id: `security.credentialProtection.confirm.${confirm ?? 'disable'}.title` })}
-        message={intl.formatMessage({ id: `security.credentialProtection.confirm.${confirm ?? 'disable'}.message${container && confirm !== 'reset' ? '_container' : ''}` })}
+        message={intl.formatMessage({ id: `security.credentialProtection.confirm.${confirm ?? 'disable'}.message${container ? '_container' : ''}` })}
         confirmLabel={intl.formatMessage({
           id: confirm === 'reset' ? 'security.credentialProtection.reset' : 'security.credentialProtection.disable',
         })}

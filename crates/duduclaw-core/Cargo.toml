@@ -39,6 +39,8 @@ unicode-normalization = "0.1.25"
 
 [features]
 default = []
+# Synthetic root-key intake for dependent-crate debug tests only.
+test-root-key = []
 # Synthetic policy for dependent-crate debug tests; ineffective in release libraries/binaries.
 installation-policy-test-hooks = []
 # `compat.d` declarative app-compatibility runner registry (src/compat_runners.rs).

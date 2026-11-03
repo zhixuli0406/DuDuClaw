@@ -33,6 +33,14 @@ pub fn refused_reason() -> Option<&'static str> {
 
 pub fn is_held() -> bool { state_kind() == StateKind::Held }
 
+/// Install a synthetic key in an isolated test process. Never available in release builds.
+#[cfg(all(feature = "test-root-key", debug_assertions))]
+#[doc(hidden)]
+pub fn test_hold_root_key() {
+    assert!(STATE.set(State::Held(Box::new(Zeroizing::new([0u8; 32])))).is_ok(),
+        "root-key test requires a fresh process");
+}
+
 /// Borrow the key for one operation; the storage itself is never handed out.
 pub fn with_key<T>(f: impl FnOnce(&[u8; 32]) -> T) -> Option<T> {
     match STATE.get() { Some(State::Held(key)) => Some(f(key)), _ => None }
