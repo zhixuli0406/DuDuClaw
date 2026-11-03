@@ -80,6 +80,8 @@ pub struct InstalledModule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaSnapshot {
     pub schema_version: u32,
+    #[serde(default)]
+    pub access_rights: BTreeMap<String, crate::permissions::ModelAccess>,
     pub scanned_at: String,
     pub server_version: String,
     pub connection_identity: String,
@@ -355,8 +357,10 @@ fn prioritize_models(rows: &[Value], cap: usize) -> (Vec<Value>, usize) {
 }
 impl OdooConnector {
     /// Only common.version, installed-module metadata, ir.model metadata and
-    /// fields_get are read. Binary fields are described, never downloaded.
+    /// fields_get and account ACL metadata are read. Binary fields are
+    /// described, never downloaded.
     pub async fn scan_schema(&self) -> Result<SchemaSnapshot, String> {
+        *self.access_method.lock().await = None;
         let started = Instant::now();
         let version = tokio::time::timeout(SCAN_BUDGET, self.version())
             .await
@@ -473,6 +477,7 @@ impl OdooConnector {
         models.sort_by(|a, b| a.model.cmp(&b.model));
         let mut snapshot = SchemaSnapshot {
             schema_version: 1,
+            access_rights: BTreeMap::new(),
             scanned_at: Utc::now().to_rfc3339(),
             server_version,
             connection_identity: self.connection_identity(),
@@ -485,6 +490,7 @@ impl OdooConnector {
             truncation_reasons: reasons,
         };
         sanitize_snapshot(&mut snapshot);
+        snapshot.access_rights = self.probe_model_access(snapshot.models.iter().map(|m| m.model.clone()).collect()).await;
         Ok(snapshot)
     }
 }
@@ -791,8 +797,8 @@ pub fn spawn_auto_scan(conn: Arc<OdooConnector>, home: PathBuf, profile: String)
     tokio::spawn(async move {
         let needed = match load_snapshot(&home, &profile) {
             Ok(Some(s)) => {
-                s.connection_identity == conn.connection_identity()
-                    && s.version_mismatch(&conn.status().version)
+                s.connection_identity != conn.connection_identity()
+                    || s.version_mismatch(&conn.status().version) || s.access_rights.is_empty()
             }
             Ok(None) => true,
             Err(_) => true,
@@ -877,6 +883,7 @@ mod tests {
     fn snapshot(version: &str) -> SchemaSnapshot {
         SchemaSnapshot {
             schema_version: 1,
+            access_rights: BTreeMap::new(),
             scanned_at: Utc::now().to_rfc3339(),
             server_version: version.into(),
             connection_identity: "test".into(),
@@ -1135,6 +1142,25 @@ mod tests {
             Some("unknown")
         );
     }
+    #[test]
+    fn rights_and_timestamp_round_trip_and_rescan_replace_old_cells() {
+        let home = test_home();
+        let mut first = snapshot("19.0");
+        first.access_rights.insert("crm.lead".into(), crate::permissions::ModelAccess {
+            read: Some(true), create: Some(false), write: None, unlink: Some(false),
+            checked_at: "2026-11-03T00:00:00Z".into(),
+        });
+        save_snapshot(&home, "default", &first).unwrap();
+        let cached = load_snapshot(&home, "default").unwrap().unwrap();
+        assert_eq!(cached.access_rights["crm.lead"].create, Some(false));
+        assert_eq!(cached.access_rights["crm.lead"].write, None);
+        assert_eq!(cached.access_rights["crm.lead"].checked_at, "2026-11-03T00:00:00Z");
+        first.access_rights.get_mut("crm.lead").unwrap().create = Some(true);
+        save_snapshot(&home, "default", &first).unwrap();
+        assert_eq!(load_snapshot(&home, "default").unwrap().unwrap().access_rights["crm.lead"].create, Some(true));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn profile_and_snapshot_identity_isolation_fail_closed() {
         let a = crate::connector::mocked_connector(Vec::new());

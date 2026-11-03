@@ -6,6 +6,13 @@
 /// `tests/edition_rpc_gate_test.rs`, which runs in its own process.
 use super::*;
 
+#[test]
+fn odoo_permission_metadata_has_the_schema_scan_edition_gate() {
+    for method in ["odoo.schema_scan", "odoo.permission_options"] {
+        assert!(!is_enterprise_only_method(method));
+    }
+}
+
 /// Every ➖ (Personal-hidden) unit in 09-edition-split-features.md §1 that
 /// owns a dashboard RPC is gated.
 #[test]

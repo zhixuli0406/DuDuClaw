@@ -230,8 +230,10 @@ agent's key again for the new server. The whole `[odoo]` table is admin-only.
 
 `allowed_actions` accepts:
 
-- **Bare verbs** — `"read"`, `"search"`, `"create"`, `"write"`, `"execute"`. The verb applies to all models.
+- **Bare verbs** — `"read"`, `"search"`, `"create"`, `"write"`, `"unlink"`, `"action"`, `"execute"`. The verb applies to all models.
 - **Qualified verbs** — `"write:crm.lead"`, `"execute:sale.order"`. The verb applies *only* to that model.
+
+`action` / `action:model` cover generic `odoo_execute` calls to `action_*`, `button_*` and `toggle_*` methods. This runtime verb is separate from `execute`. The dashboard keeps existing `action` rules under **Other settings**; its **Execute actions** checkbox continues to save `execute`.
 
 Mix freely:
 
@@ -246,6 +248,8 @@ allowed_actions = [
 
 Empty `allowed_actions` ⇒ no action restriction (defer to Odoo ACL).
 Empty `allowed_models` ⇒ no model restriction.
+
+The dashboard groups rules by table. **Query and read** writes both `read` and `search`; a legacy single verb is marked partial and normalized on save. Selecting a sensitive table such as `hr.employee` requires confirmation and automatically adds the per-employee `unblock_models` exception. Removing its last use removes the exception. `ir.model`, `ir.model.fields` and `ir.attachment` remain read-only. Unknown legacy action entries remain read-only and are preserved until explicitly removed. See [Dashboard employee permissions](../guides/dashboard-settings.md#integrations--odoo--employee-permissions).
 
 ### Mint per-agent API keys with the right scopes
 

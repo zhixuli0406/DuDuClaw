@@ -62,6 +62,8 @@ async fn odoo_config_reports_stored_credentials_without_returning_them() {
     assert_eq!(body["has_api_key"], json!(true));
     assert_eq!(body["has_password"], json!(true));
     assert_eq!(body["has_webhook_secret"], json!(true));
+    assert_eq!(body["blocked_models"], json!(duduclaw_odoo::connector::BLOCKED_MODELS));
+    assert_eq!(body["read_only_models"], json!(duduclaw_odoo::connector::READ_ONLY_WHEN_UNBLOCKED));
 
     // Whole-payload scan: no credential, in plaintext or ciphertext, in any
     // field. The encrypted forms are checked too — they are still the
@@ -205,4 +207,20 @@ async fn odoo_schema_wiki_never_persists_instruction_labels_or_invalid_identifie
             assert!(!text.contains("\n## example"));
         }
     }
+}
+
+#[tokio::test]
+async fn odoo_permission_options_require_admin_and_return_policy_without_connection() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let mut employee = UserContext::admin_fallback();
+    employee.role = UserRole::Employee;
+    let denied = handler.handle("odoo.permission_options", json!({}), &employee).await;
+    assert!(matches!(denied, WsFrame::Response { ok: false, .. }));
+    let body = payload(handler.handle("odoo.permission_options", json!({}),
+        &UserContext::admin_fallback()).await);
+    assert_eq!(body["blocked_models"], json!(duduclaw_odoo::connector::BLOCKED_MODELS));
+    assert_eq!(body["read_only_models"], json!(duduclaw_odoo::connector::READ_ONLY_WHEN_UNBLOCKED));
+    assert_eq!(body["scan_available"], false);
+    assert_eq!(body["models"], json!([]));
 }

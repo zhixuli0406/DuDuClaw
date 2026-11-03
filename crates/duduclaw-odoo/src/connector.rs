@@ -16,7 +16,7 @@ use crate::rpc;
 
 /// Sensitive models that are never allowed via generic search/execute.
 /// Covers system internals, PII-heavy tables, financial records, and communications.
-const BLOCKED_MODELS: &[&str] = &[
+pub const BLOCKED_MODELS: &[&str] = &[
     // System internals & schema
     "ir.config_parameter",
     "ir.cron",
@@ -71,7 +71,7 @@ pub const PARTNER_SEARCH_FIELDS: &[&str] = &[
 /// `ir.model` / `ir.model.fields`; attachments may be *read* for context — but a
 /// generic `write`/`unlink`/`create` against these is refused unconditionally
 /// (fail closed). Unblocking never grants mutation of Odoo's own metadata tables.
-const READ_ONLY_WHEN_UNBLOCKED: &[&str] = &[
+pub const READ_ONLY_WHEN_UNBLOCKED: &[&str] = &[
     "ir.model",
     "ir.model.fields",
     "ir.attachment",
@@ -211,6 +211,9 @@ pub struct OdooConnector {
     field_cache: Mutex<BTreeMap<String, HashSet<String>>>,
     missing_fields: std::sync::Mutex<HashSet<(String, String)>>,
     observed_server_version: std::sync::Mutex<Option<String>>,
+    pub(crate) access_method: Mutex<Option<crate::permissions::AccessMethod>>,
+    pub(crate) access_unblocks: Vec<String>,
+    access_connection_options: String,
     #[cfg(test)]
     mock_rpc: Option<MockRpc>,
 }
@@ -353,6 +356,9 @@ impl OdooConnector {
             field_cache: Mutex::new(BTreeMap::new()),
             missing_fields: std::sync::Mutex::new(HashSet::new()),
             observed_server_version: std::sync::Mutex::new(None),
+            access_method: Mutex::new(None),
+            access_unblocks: config.unblock_models.clone(),
+            access_connection_options: json!([config.username, config.auth_method, config.protocol, config.allow_private_network]).to_string(),
             #[cfg(test)]
             mock_rpc: None,
         };
@@ -439,6 +445,10 @@ impl OdooConnector {
         #[cfg(test)]
         if let Some(mock) = &self.mock_rpc {
             mock.requests.lock().unwrap().push((model.into(), method.into(), args, kwargs));
+            let active = mock.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            mock.max_active.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            let _flight = MockFlight(&mock.active);
+            if !mock.delay.is_zero() { tokio::time::sleep(mock.delay).await; }
             return mock.responses.lock().unwrap().pop_front().expect("mock RPC response");
         }
         let uid = self.uid.ok_or("Not authenticated")?;
@@ -478,6 +488,7 @@ impl OdooConnector {
     /// Re-resolve live type metadata before the next built-in business read.
     pub async fn invalidate_compatible_fields(&self) {
         self.field_cache.lock().await.clear();
+        *self.access_method.lock().await = None;
     }
 
     /// Snapshot key isolates server, database, authenticated Odoo user and
@@ -490,7 +501,12 @@ impl OdooConnector {
     }
 
     pub fn connection_identity(&self) -> String {
-        json!([self.url, self.db, self.uid, self.company_ids]).to_string()
+        {
+            use sha2::{Digest, Sha256};
+            // A credential or read-policy change must never reuse old rights.
+            let credential_hash = format!("{:x}", Sha256::digest(self.credential.as_bytes()));
+            json!([self.url, self.db, self.uid, self.company_ids, credential_hash, self.access_unblocks, self.access_connection_options]).to_string()
+        }
     }
 
     /// Convenience: search_read with domain, fields, limit.
@@ -761,8 +777,18 @@ impl OdooConnector {
 
 #[cfg(test)]
 struct MockRpc {
+    delay: std::time::Duration,
+    active: std::sync::atomic::AtomicUsize,
+    max_active: std::sync::atomic::AtomicUsize,
     responses: std::sync::Mutex<std::collections::VecDeque<Result<Value, String>>>,
     requests: std::sync::Mutex<Vec<(String, String, Vec<Value>, Value)>>,
+}
+
+#[cfg(test)]
+struct MockFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+#[cfg(test)]
+impl Drop for MockFlight<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
 }
 
 #[cfg(test)]
@@ -772,13 +798,60 @@ pub(crate) fn mocked_connector(responses: Vec<Result<Value, String>>) -> OdooCon
         edition_gate: EditionGate::unknown(), http: reqwest::Client::new(), company_ids: Vec::new(),
         field_cache: Mutex::new(BTreeMap::new()), missing_fields: std::sync::Mutex::new(HashSet::new()),
         observed_server_version: std::sync::Mutex::new(None),
-        mock_rpc: Some(MockRpc {responses: std::sync::Mutex::new(responses.into()), requests: std::sync::Mutex::new(Vec::new())}),
+        access_method: Mutex::new(None), access_unblocks: Vec::new(), access_connection_options: String::new(),
+        mock_rpc: Some(MockRpc { delay: std::time::Duration::ZERO,
+            active: std::sync::atomic::AtomicUsize::new(0), max_active: std::sync::atomic::AtomicUsize::new(0), responses: std::sync::Mutex::new(responses.into()), requests: std::sync::Mutex::new(Vec::new())}),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn permission_probe_timeouts_stay_unknown_and_release_requests() {
+        use std::sync::atomic::Ordering;
+        let mut conn = mocked_connector(vec![]);
+        conn.mock_rpc.as_mut().unwrap().delay = std::time::Duration::from_secs(5);
+        *conn.access_method.lock().await = Some(crate::permissions::AccessMethod::Modern);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3),
+            conn.probe_model_access(vec!["crm.lead".into()])).await.unwrap();
+        assert_eq!(result["crm.lead"].read, None);
+        assert_eq!(result["crm.lead"].create, None);
+        assert_eq!(result["crm.lead"].write, None);
+        assert_eq!(result["crm.lead"].unlink, None);
+        let mock = conn.mock_rpc.as_ref().unwrap();
+        assert_eq!(mock.requests.lock().unwrap().len(), 4);
+        assert_eq!(mock.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn permission_probe_concurrency_is_bounded_and_cancellation_leaves_no_tasks() {
+        use std::sync::atomic::Ordering;
+        let mut conn = mocked_connector(vec![]);
+        conn.mock_rpc.as_mut().unwrap().delay = std::time::Duration::from_secs(5);
+        *conn.access_method.lock().await = Some(crate::permissions::AccessMethod::Modern);
+        let models = (0..20).map(|i| format!("x_model_{i}")).collect();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), conn.probe_model_access(models)).await.is_err());
+        let mock = conn.mock_rpc.as_ref().unwrap();
+        assert_eq!(mock.max_active.load(Ordering::SeqCst), crate::permissions::ACCESS_CONCURRENCY);
+        assert_eq!(mock.active.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.requests.lock().unwrap().len(), crate::permissions::ACCESS_CONCURRENCY);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(mock.requests.lock().unwrap().len(), crate::permissions::ACCESS_CONCURRENCY);
+    }
+
+    #[test]
+    fn permission_snapshot_key_changes_with_credential_or_read_policy() {
+        let first = mocked_connector(vec![]);
+        let mut changed = mocked_connector(vec![]);
+        changed.credential = "other-secret".into();
+        assert_ne!(first.schema_profile("default"), changed.schema_profile("default"));
+        changed.credential = first.credential.clone();
+        changed.access_unblocks.push("res.partner".into());
+        assert_ne!(first.schema_profile("default"), changed.schema_profile("default"));
+        assert!(!changed.connection_identity().contains("other-secret"));
+    }
 
     #[tokio::test]
     async fn malformed_mutation_and_count_results_never_echo_remote_values() {

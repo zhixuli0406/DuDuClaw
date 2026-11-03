@@ -7,6 +7,10 @@ use super::*;
 #[test]
 pub(super) fn odo_action_accepts_bare_and_qualified() {
     assert!(odo_valid_action("read"));
+    assert!(odo_valid_action("search"));
+    assert!(odo_valid_action("search:hr.employee"));
+    assert!(odo_valid_action("action"));
+    assert!(odo_valid_action("action:sale.order"));
     assert!(odo_valid_action("write"));
     assert!(odo_valid_action("write:crm.lead"));
     assert!(odo_valid_action("execute:sale.order"));
@@ -16,6 +20,11 @@ pub(super) fn odo_action_accepts_bare_and_qualified() {
 pub(super) fn odo_action_rejects_bad_verb_and_model() {
     assert!(!odo_valid_action("destroy"));
     assert!(!odo_valid_action("write:"));
+    assert!(!odo_valid_action("search:"));
+    assert!(!odo_valid_action("search:hr.employee:other"));
+    assert!(!odo_valid_action("search:bad model!"));
+    assert!(!odo_valid_action("action:"));
+    assert!(!odo_valid_action("action:bad model!"));
     assert!(!odo_valid_action("write:bad model!"));
     assert!(!odo_valid_action(""));
 }
@@ -798,4 +807,32 @@ pub(super) fn cap_computer_use_keep_alive_and_takeover_are_validated() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn odo_actions_roundtrip_runtime_verbs_and_preserve_exact_legacy_entries() {
+    let mut table: toml::Table = "[odoo]\nallowed_actions = ['future:crm.lead', 'read:bad model!', ' read ', '']\n"
+        .parse().unwrap();
+    let mut actions = vec!["future:crm.lead", "read:bad model!", " read ", ""].into_iter()
+        .map(str::to_owned).collect::<Vec<_>>();
+    for verb in ["read", "search", "create", "write", "unlink", "action", "execute"] {
+        actions.push(verb.to_owned());
+        actions.push(format!("{verb}:hr.employee"));
+    }
+    apply_odoo_to_table(&mut table, &json!({ "odoo": { "allowed_actions": actions } }),
+        &std::env::temp_dir()).unwrap();
+    let stored = table["odoo"]["allowed_actions"].as_array().unwrap().iter()
+        .map(|v| v.as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    assert_eq!(stored, actions);
+    let config = duduclaw_odoo::AgentOdooConfig::from_table(&table).unwrap().unwrap();
+    assert!(config.permits("search", "hr.employee"));
+    assert!(config.permits("action", "hr.employee"));
+    for invalid in ["other:crm.lead", "read:another invalid model!"] {
+        assert!(apply_odoo_to_table(&mut table,
+            &json!({ "odoo": { "allowed_actions": [invalid] } }),
+            &std::env::temp_dir()).is_err());
+    }
+    apply_odoo_to_table(&mut table, &json!({ "odoo": { "allowed_actions": [] } }),
+        &std::env::temp_dir()).unwrap();
+    assert!(table["odoo"]["allowed_actions"].as_array().unwrap().is_empty());
 }

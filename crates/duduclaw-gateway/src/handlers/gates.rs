@@ -85,6 +85,9 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 /// - `topology.*` (組織架構) — D6 turned it into progressive disclosure
 ///   (`requiresData`), visible in **both** editions once ≥3 agents exist.
 pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
+    // Account-rights metadata follows schema scanning in both editions.
+    // dispatch_system separately requires Admin for both RPCs.
+    if matches!(method, "odoo.schema_scan" | "odoo.permission_options") { return false; }
     if method.split('.').take(2).eq(["me", "google"]) || method == "agents.primary_owner_set" { return true; }
     // ── Self-service carve-outs inside an otherwise Enterprise family ──────
     // Checked first so the family rule below cannot swallow them.

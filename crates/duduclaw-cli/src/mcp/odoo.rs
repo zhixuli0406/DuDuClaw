@@ -701,7 +701,7 @@ pub(crate) fn blocklist_denial_message(model: &str, denial: duduclaw_odoo::Block
     match denial {
         duduclaw_odoo::BlockDenial::SecurityDefault => format!(
             "Odoo block list gate: model '{model}' is blocked by a security default. An admin can unlock it by adding \
-             it to unblock_models in the agent's Odoo settings (dashboard: Odoo → 解鎖的 Models)."
+             it to the employee's allowed tables and confirming sensitive access (dashboard: 員工 → 編輯 → 整合 → Odoo)."
         ),
         duduclaw_odoo::BlockDenial::SystemReadOnly => format!(
             "Odoo block list gate (system read-only): model '{model}' may be read with unblock_models in the agent's Odoo settings; writing or deleting is always refused, even when unblocked."
@@ -717,8 +717,8 @@ pub(crate) fn method_denial_message(method: &str) -> String {
 
 /// Map an Odoo ORM `method` name to the coarse verb used by the per-agent
 /// `allowed_actions` filter. CRUD methods map to `read`/`create`/`write`/
-/// `unlink`; `action_*` / `button_*` workflow methods map to the qualified
-/// `action_<name>` form (so `allowed_actions` can name them explicitly);
+/// `unlink`; `action_*` / `button_*` / `toggle_*` workflow methods map to
+/// `action` (or a model-qualified `action:model` permission);
 /// everything else is treated as a generic `execute`.
 pub(crate) fn odoo_method_to_verb(method: &str) -> &'static str {
     match method {
@@ -729,7 +729,7 @@ pub(crate) fn odoo_method_to_verb(method: &str) -> &'static str {
         "unlink" => "unlink",
         // Workflow / archive / state-change buttons are the dangerous ones the
         // reviewer flagged (e.g. action_archive). Classify them under the
-        // qualified `action_*` family so they don't slip through as `execute`.
+        // `action` family so they don't slip through as `execute`.
         m if m.starts_with("action_") || m.starts_with("button_") || m.starts_with("toggle_") => {
             "action"
         }

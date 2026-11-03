@@ -69,7 +69,10 @@ beforeEach(() => {
   useAuthStore.setState({
     user: { id: 'u-admin', email: 'a@b.c', display_name: 'Admin', role: 'admin', status: 'active' },
   } as never);
-  mockWsClient.call.mockResolvedValue({ ...DETAIL });
+  mockWsClient.call.mockImplementation((method: string) => {
+    if (method === 'odoo.permission_options' || method === 'odoo.config') return Promise.resolve({ models: [], blocked_models: ['res.partner'], read_only_models: [], scan_available: false });
+    return Promise.resolve({ ...DETAIL });
+  });
   useAgentsStore.setState({
     agents: [],
     loading: false,
@@ -238,15 +241,15 @@ describe('EditAgentPage', () => {
   // ported here now — same `agents.update` `odoo` payload this tab already
   // writes through (single-writer), not a second RPC.
   describe('Odoo integration tab — unblock_models + clear stored secret', () => {
-    it('renders the unblock_models field and a clear-secret switch for each credential', async () => {
+    it('renders table selection and a clear-secret switch for each credential', async () => {
       renderAt('/agents/my-bot/edit?tab=integration');
 
       await waitFor(() => {
         expect(screen.getByRole('heading', { name: 'Integrations', level: 2 })).toBeInTheDocument();
       });
 
-      expect(screen.getByText('Unblocked Models')).toBeInTheDocument();
-      expect(screen.getByPlaceholderText('res.partner')).toBeInTheDocument();
+      expect(await screen.findByRole('checkbox', { name: 'res.partner · Sensitive' })).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText('res.partner')).not.toBeInTheDocument();
 
       // One "Clear stored secret" switch under API Key, one under Password.
       const clearSwitches = screen.getAllByRole('switch', { name: 'Clear stored secret' });
@@ -267,10 +270,9 @@ describe('EditAgentPage', () => {
         expect(screen.getByRole('heading', { name: 'Integrations', level: 2 })).toBeInTheDocument();
       });
 
-      // Add one unblock_models chip.
-      const unblockInput = screen.getByPlaceholderText('res.partner');
-      await user.type(unblockInput, 'res.partner{Enter}');
-      expect(screen.getByText('res.partner')).toBeInTheDocument();
+      // Selecting a sensitive table confirms and updates both permission lists.
+      await user.click(await screen.findByRole('checkbox', { name: 'res.partner · Sensitive' }));
+      await user.click(screen.getByRole('button', { name: 'Allow access' }));
 
       // Tick the API key's clear-secret switch (first of the two).
       const [clearApiKeySwitch] = screen.getAllByRole('switch', { name: 'Clear stored secret' });

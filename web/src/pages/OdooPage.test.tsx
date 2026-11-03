@@ -257,3 +257,45 @@ describe('OdooPage schema snapshot', () => {
     expect(screen.queryByRole('button', { name: 'Re-scan Odoo structure' })).not.toBeInTheDocument();
   });
 });
+
+describe('OdooPage permission choices and summary', () => {
+  beforeEach(() => {
+    useAuthStore.setState({ user: { id: 'admin', email: 'admin@test', display_name: 'Admin', role: 'admin', status: 'active' } });
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.config') return Promise.resolve({ url: 'https://erp.example.com', db: 'prod', blocked_models: ['hr.employee', 'ir.model'], read_only_models: ['ir.model'], unblock_models: [] });
+      if (method === 'agents.list') return Promise.resolve({ agents: [{ name: 'bot-1', display_name: 'Bot One' }] });
+      if (method === 'odoo.agent_config_get') return Promise.resolve({ configured: true, allowed_actions: ['read:hr.employee', 'search:hr.employee', 'write:hr.employee', 'read', 'action:crm.lead'], allowed_models: [] });
+      return Promise.resolve({ connected: false });
+    });
+  });
+  it('renders model/action summary with a partial legacy note and unknown settings', async () => {
+    renderWithProviders(<OdooPage />);
+    expect(await screen.findByText('hr.employee：Search and read、Update')).toBeInTheDocument();
+    expect(screen.getByText('All tables：Search and read (Partial only)')).toBeInTheDocument();
+    expect(screen.getByText('Other settings：action:crm.lead')).toBeInTheDocument();
+  });
+  it('confirms global sensitive selection before saving and allows removal', async () => {
+    const user = (await import('@testing-library/user-event')).default.setup();
+    renderWithProviders(<OdooPage />);
+    const checkbox = await screen.findByRole('checkbox', { name: /hr\.employee.*Sensitive/ });
+    await user.click(checkbox);
+    expect(checkbox).not.toBeChecked();
+    expect(screen.getByRole('dialog')).toHaveTextContent('employees using global permissions');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(checkbox).not.toBeChecked();
+    await user.click(checkbox);
+    await user.click(screen.getByRole('button', { name: 'Allow access' }));
+    expect(checkbox).toBeChecked();
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('odoo.configure', expect.objectContaining({ unblock_models: ['hr.employee'] })));
+  });
+  it('offers the policy list even before a connection is configured', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.config') return Promise.resolve(null);
+      if (method === 'odoo.permission_options') return Promise.resolve({ models: [], blocked_models: ['hr.employee'], read_only_models: [], scan_available: false });
+      return Promise.resolve({ connected: false, agents: [] });
+    });
+    renderWithProviders(<OdooPage />);
+    expect(await screen.findByRole('checkbox', { name: /hr\.employee.*Sensitive/ })).toBeInTheDocument();
+  });
+});

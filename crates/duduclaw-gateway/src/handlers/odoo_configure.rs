@@ -278,6 +278,21 @@ impl MethodHandler {
             return WsFrame::error_response("",&format!("Failed to write config: {e}"));
         }
 
+        // New credentials/policy produce a different snapshot key. Start the
+        // bounded background scan after the saved configuration is committed.
+        let cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+        if let Some(credential) = self.resolve_odoo_credential(&table).filter(|s| !s.is_empty()) {
+            let home = self.home_dir.clone();
+            tokio::spawn(async move {
+                if let Ok(Ok(conn)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    duduclaw_odoo::OdooConnector::connect(&cfg, &credential),
+                ).await {
+                    let profile = conn.schema_profile("default");
+                    duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), home, profile);
+                }
+            });
+        }
         info!("odoo.configure completed");
         WsFrame::ok_response("", json!({ "success": true }))
     }

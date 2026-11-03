@@ -1,3 +1,5 @@
+import { SensitiveModelPicker } from '@/components/odoo/SensitiveModelPicker';
+import { OdooPermissionSummary } from '@/components/odoo/OdooPermissionSummary';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
@@ -33,7 +35,7 @@ import {
   CrossLink,
 } from '@/components/mds';
 import { RowText, RowSecret, RowNumber, RowSwitch, RowSelect } from '@/pages/agent-form/form-rows';
-import { DangerZone, ConfirmDialog, type SelectOption } from '@/components/settings/controls';
+import { DangerZone, type SelectOption } from '@/components/settings/controls';
 import { OdooLivechatSection } from '@/pages/odoo-livechat/OdooLivechatSection';
 
 const FEATURE_MODULES = ['crm', 'sale', 'inventory', 'accounting', 'project', 'hr'] as const;
@@ -83,16 +85,10 @@ export function OdooPage() {
   const [pollModels, setPollModels] = useState('crm.lead,sale.order');
   const [webhookEnabled, setWebhookEnabled] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
-  const [globalUnblockModels, setGlobalUnblockModels] = useState('');
+  const [globalUnblockModels, setGlobalUnblockModels] = useState<string[]>([]);
+  const [blockedModels, setBlockedModels] = useState<string[]>([]);
+  const [readOnlyModels, setReadOnlyModels] = useState<string[]>([]);
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
-  // Last-saved value of the global unblock list — used to detect when Save is
-  // about to *expand* which sensitive models every AI employee can reach, so
-  // that expansion (not unrelated saves) is what triggers the extra confirm
-  // step below (phase4 audit C07/C11 Blocker).
-  const [unblockModelsBaseline, setUnblockModelsBaseline] = useState('');
-  // Newly-added models pending confirmation before Save actually runs.
-  const [confirmUnblock, setConfirmUnblock] = useState<string[] | null>(null);
-
   // Feature toggles
   const [features, setFeatures] = useState<Record<FeatureKey, boolean>>({
     crm: true,
@@ -153,8 +149,9 @@ export function OdooPage() {
           password: configRes.has_password ?? false,
           webhookSecret: configRes.has_webhook_secret ?? false,
         });
-        setGlobalUnblockModels((configRes.unblock_models ?? []).join(', '));
-        setUnblockModelsBaseline((configRes.unblock_models ?? []).join(', '));
+        setGlobalUnblockModels(configRes.unblock_models ?? []);
+        setBlockedModels(configRes.blocked_models ?? []);
+        setReadOnlyModels(configRes.read_only_models ?? []);
         setFeatures({
           crm: configRes.features_crm ?? true,
           sale: configRes.features_sale ?? true,
@@ -163,6 +160,13 @@ export function OdooPage() {
           project: configRes.features_project ?? false,
           hr: configRes.features_hr ?? false,
         });
+      }
+      if (!configRes?.blocked_models) {
+        // An unconfigured connection still needs the server-owned policy list.
+        void api.odoo.permissionOptions().then((options) => {
+          setBlockedModels(options.blocked_models ?? []);
+          setReadOnlyModels(options.read_only_models ?? []);
+        }).catch(() => setError(t('odoo.permissions.policyUnavailable')));
       }
       // Not configured yet (null) is a valid, loaded state: the form starts blank.
       setConfigLoaded(true);
@@ -186,30 +190,7 @@ export function OdooPage() {
     };
   }, [loadConfig]);
 
-  const parseUnblockModels = (raw: string) =>
-    raw
-      .split(/[,\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-  /**
-   * The global unblock list is one field in a page-wide Save — clicking Save
-   * used to activate it for every AI employee with no preview of which models
-   * were newly exposed (phase4 audit C07/C11 Blocker). Only interrupt Save
-   * when the list actually *grows* relative to what's on file; shrinking it
-   * (or an unrelated field change) saves immediately, so the confirm step
-   * doesn't turn into noise on every unrelated edit.
-   */
-  const requestSave = () => {
-    if (!configLoaded) return;
-    const before = new Set(parseUnblockModels(unblockModelsBaseline));
-    const added = parseUnblockModels(globalUnblockModels).filter((m) => !before.has(m));
-    if (added.length > 0) {
-      setConfirmUnblock(added);
-      return;
-    }
-    void handleSave();
-  };
+  const requestSave = () => { if (configLoaded) void handleSave(); };
 
   const handleSave = async () => {
     setSaving(true);
@@ -229,7 +210,7 @@ export function OdooPage() {
         poll_models: pollModels.split(',').map((s) => s.trim()).filter(Boolean),
         webhook_enabled: webhookEnabled,
         webhook_secret: webhookSecret || undefined,
-        unblock_models: parseUnblockModels(globalUnblockModels),
+        unblock_models: globalUnblockModels,
         allow_private_network: allowPrivateNetwork,
         features_crm: features.crm,
         features_sale: features.sale,
@@ -624,25 +605,15 @@ export function OdooPage() {
         </SettingsCard>
       </SettingsSection>
 
-      {/* Global model access (security unblock list) — a permission-expansion
-          setting: any model listed here becomes readable/writable by every AI
-          employee, with no per-employee review (phase4 audit C07/C11
-          Blocker). Isolated in a DangerZone and gated by a pre-save impact
-          confirmation (see `requestSave` above). */}
+      {/* Each global sensitive table is confirmed before selection. */}
       <SettingsSection title={t('odoo.access')}>
         <DangerZone
           title={t('odoo.access.dangerTitle')}
           description={t('odoo.access.dangerDesc')}
         >
           <SettingsCard>
-            <RowText
-              label={t('odoo.unblockModels')}
-              description={t('odoo.unblockModelsHint')}
-              value={globalUnblockModels}
-              onChange={setGlobalUnblockModels}
-              placeholder="res.partner, x_custom_model"
-              tier="text"
-            />
+            <SensitiveModelPicker models={blockedModels} readOnlyModels={readOnlyModels}
+              value={globalUnblockModels} onChange={setGlobalUnblockModels} disabled={!configLoaded || saving || !isAdmin} />
           </SettingsCard>
         </DangerZone>
       </SettingsSection>
@@ -653,23 +624,7 @@ export function OdooPage() {
       {/* Website Live Chat: AI employees answer as an Odoo operator */}
       <OdooLivechatSection />
 
-      {confirmUnblock && (
-        <ConfirmDialog
-          open
-          title={t('odoo.access.dangerTitle')}
-          message={intl.formatMessage(
-            { id: 'confirm.odoo.unblockModels.message' },
-            { models: confirmUnblock.join(', '), count: confirmUnblock.length },
-          )}
-          confirmLabel={t('common.save')}
-          busy={saving}
-          onConfirm={() => {
-            setConfirmUnblock(null);
-            void handleSave();
-          }}
-          onClose={() => setConfirmUnblock(null)}
-        />
-      )}
+
     </div>
   );
 }
@@ -804,12 +759,12 @@ function AgentOdooOverride({ pickedModels }: { pickedModels?: string[] }) {
                   label={t('odoo.password')}
                   value={cfg?.password_set ? t('odoo.agent.secretSetReadOnly') : t('odoo.agent.secretNotSetReadOnly')}
                 />
-                <ReadOnlyRow label={t('agents.odoo.allowedModels')} value={listOrDash(cfg?.allowed_models)} />
+                <ReadOnlyRow label={t('agents.odoo.allowedModels')} value={cfg?.allowed_models?.length ? listOrDash(cfg.allowed_models) : t('odoo.permissions.modelsUnrestricted')} />
                 <ReadOnlyRow
                   label={t('agents.odoo.unblockModels')}
                   value={listOrDash(cfg?.unblock_models)}
                 />
-                <ReadOnlyRow label={t('agents.odoo.allowedActions')} value={listOrDash(cfg?.allowed_actions)} />
+                <div className="space-y-1 px-4 py-3 text-sm"><p className="text-muted-foreground">{t('agents.odoo.allowedActions')}</p><OdooPermissionSummary actions={cfg?.allowed_actions ?? []} /></div>
                 <ReadOnlyRow
                   label={t('agents.odoo.companyIds')}
                   value={listOrDash((cfg?.company_ids ?? []).map(String))}

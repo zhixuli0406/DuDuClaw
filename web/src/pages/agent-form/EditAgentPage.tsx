@@ -23,6 +23,8 @@ import {
 import { AddChannelDialog } from '@/components/channels/AddChannelDialog';
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
+import { normalizeActions } from '@/components/odoo/permissions';
+import { OdooPermissionsEditor } from '@/components/odoo/OdooPermissionsEditor';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { AccountPoolSelect } from '@/components/shared/AccountPoolSelect';
 import { SubscriptionRiskNote } from '@/components/SubscriptionRiskDisclosure';
@@ -896,6 +898,11 @@ function EditAgentPageContent() {
         // navigates away — the header SettingsSaveState is the only feedback.
         const res = await updateAgent(agent.name, payload as AgentUpdateParams);
         sectionsSaved = true;
+        if (res?.success && payload.odoo?.allowed_actions) {
+          const sentActions = payload.odoo.allowed_actions;
+          setOdoo((current) => JSON.stringify(current.allowed_actions) === JSON.stringify(odoo.allowed_actions)
+            ? { ...current, allowed_actions: sentActions } : current);
+        }
         if (payload.runtime && Object.hasOwn(payload.runtime, 'timeout_secs')) {
           savedRuntimeTimeoutRef.current = effectiveRuntimeTimeout(payload.runtime.timeout_secs);
           setSavedRuntimeTimeout(savedRuntimeTimeoutRef.current);
@@ -1611,15 +1618,23 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowText label={t('agents.odoo.profile')} description={t('agents.odoo.profile.hint')} value={odoo.profile} placeholder="default" onChange={(v) => updateOdoo('profile', v)} />
             </SettingsCard>
-            <FieldBlock label={t('agents.odoo.allowedModels')} description={t('agents.odoo.allowedModels.hint')}>
-              <ChipEditor values={odoo.allowed_models} onChange={(v) => updateOdoo('allowed_models', v)} placeholder="crm.lead" addLabel={t('common.add')} />
-            </FieldBlock>
-            <FieldBlock label={t('agents.odoo.unblockModels')} description={t('agents.odoo.unblockModels.hint')}>
-              <ChipEditor values={odoo.unblock_models} onChange={(v) => updateOdoo('unblock_models', v)} placeholder="res.partner" addLabel={t('common.add')} />
-            </FieldBlock>
-            <FieldBlock label={t('agents.odoo.allowedActions')} description={t('agents.odoo.allowedActions.hint')}>
-              <ChipEditor values={odoo.allowed_actions} onChange={(v) => updateOdoo('allowed_actions', v)} placeholder="write:crm.lead" addLabel={t('common.add')} />
-            </FieldBlock>
+            <OdooPermissionsEditor key={agent.name} value={odoo}
+              defaultAccount={!odoo.url && !odoo.db && !odoo.username && !odoo.company_ids
+                && !odoo.api_key && !odoo.password && !agent.odoo_api_key_set && !agent.odoo_password_set
+                && (!odoo.profile || odoo.profile === 'default')}
+              disabled={['allowed_models', 'allowed_actions', 'unblock_models'].some((key) => lockedPath(`odoo.${key}`))}
+              onChange={(next) => {
+                const changed = ['allowed_models', 'allowed_actions', 'unblock_models'].some((key) =>
+                  JSON.stringify(next[key as keyof typeof next]) !== JSON.stringify(odoo[key as keyof typeof next]));
+                if (!changed) return;
+                // Permission saves normalize legacy read/search pairs together.
+                if (JSON.stringify(normalizeActions(next.allowed_actions)) !== JSON.stringify(next.allowed_actions)) {
+                  updateOdoo('allowed_actions', next.allowed_actions);
+                }
+                for (const key of ['allowed_models', 'allowed_actions', 'unblock_models'] as const) {
+                  if (JSON.stringify(next[key]) !== JSON.stringify(odoo[key])) updateOdoo(key, next[key]);
+                }
+              }} />
             <SettingsCard>
               <RowText label={t('agents.odoo.companyIds')} description={t('agents.odoo.companyIds.hint')} value={odoo.company_ids} placeholder="1, 2" onChange={(v) => updateOdoo('company_ids', v)} />
               <RowText label="URL" value={odoo.url} placeholder="https://erp.example.com" onChange={(v) => updateOdoo('url', v)} />
