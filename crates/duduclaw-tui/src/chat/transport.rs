@@ -1,5 +1,5 @@
 //! Credentials arrive only from the RPC actor's existing refresh lifecycle.
-use super::{ChatState, Frame, Submission};
+use super::{ChatRooms, Frame, Submission};
 use crate::{
     Error, Result,
     client::{ClientOptions, MAX_FRAME_BYTES},
@@ -20,14 +20,15 @@ pub(crate) struct Credentials {
     pub generation: u64,
 }
 enum Command {
-    Send(Submission),
-    Cancel,
-    CancelDownstream(String),
-    DismissDownstream(String),
+    Retain(Vec<String>),
+    Send(String, Submission, Vec<String>),
+    Cancel(String),
+    CancelDownstream(String, String),
+    DismissDownstream(String, String),
 }
 struct Inner {
     commands: mpsc::Sender<Command>,
-    state: watch::Receiver<ChatState>,
+    state: watch::Receiver<ChatRooms>,
     shutdown: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
 }
@@ -47,8 +48,8 @@ impl ChatClient {
         refresh: mpsc::Sender<bool>,
         options: ClientOptions,
     ) -> Self {
-        let (commands, rx) = mpsc::channel(1);
-        let (state, receiver) = watch::channel(ChatState::default());
+        let (commands, rx) = mpsc::channel(16);
+        let (state, receiver) = watch::channel(ChatRooms::default());
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (finished_tx, finished) = watch::channel(false);
         tokio::spawn(crate::without_tracing(async move {
@@ -60,7 +61,7 @@ impl ChatClient {
                 options,
                 commands: rx,
                 state,
-                model: ChatState::default(),
+                model: ChatRooms::default(),
                 refresh_attempted: false,
             }
             .run().await;
@@ -81,39 +82,28 @@ impl ChatClient {
             while !*finished.borrow_and_update() { if finished.changed().await.is_err() { break; } }
         }).await;
     }
-    pub fn state(&self) -> watch::Receiver<ChatState> {
+    pub fn state(&self) -> watch::Receiver<ChatRooms> {
         self.inner.state.clone()
     }
-    pub fn send(&self, input: Submission) -> Result<()> {
+    pub fn retain(&self, ids: Vec<String>) {
+        let _ = self.inner.commands.try_send(Command::Retain(ids));
+    }
+    pub fn send(&self, id: &str, input: Submission, active: Vec<String>) -> Result<()> {
+        if active.len() > 4 || !active.iter().any(|key| key == id) { return Err(Error::Busy); }
         let state = self.inner.state.borrow();
-        if !state.connected {
-            return Err(Error::Disconnected);
-        }
-        if state.running {
-            return Err(Error::Busy);
-        }
-        self.inner
-            .commands
-            .try_send(Command::Send(input))
-            .map_err(|_| Error::Busy)
+        if !state.connected { return Err(Error::Disconnected); }
+        if state.rooms.get(id).is_some_and(|room| room.running) { return Err(Error::Busy); }
+        self.inner.commands.try_send(Command::Send(id.into(), input, active)).map_err(|_| Error::Busy)
     }
-    pub(crate) fn cancel_downstream(&self, reference: String) -> Result<()> {
-        if self.inner.state.borrow().downstream_reference(std::time::Instant::now()) != Some(reference.as_str()) {
-            return Err(Error::RpcRejected);
-        }
-        self.inner.commands.try_send(Command::CancelDownstream(reference)).map_err(|_| Error::Busy)
+    pub(crate) fn cancel_downstream(&self, id: &str, reference: String) -> Result<()> {
+        self.inner.commands.try_send(Command::CancelDownstream(id.into(), reference)).map_err(|_| Error::Busy)
     }
-    pub(crate) fn dismiss_downstream(&self, reference: String) {
-        let _ = self.inner.commands.try_send(Command::DismissDownstream(reference));
+    pub(crate) fn dismiss_downstream(&self, id: &str, reference: String) {
+        let _ = self.inner.commands.try_send(Command::DismissDownstream(id.into(), reference));
     }
-    pub fn cancel(&self) -> Result<()> {
-        if !self.inner.state.borrow().can_cancel() {
-            return Err(Error::RpcRejected);
-        }
-        self.inner
-            .commands
-            .try_send(Command::Cancel)
-            .map_err(|_| Error::Busy)
+    pub fn cancel(&self, id: &str) -> Result<()> {
+        if !self.inner.state.borrow().rooms.get(id).is_some_and(|room| room.can_cancel()) { return Err(Error::RpcRejected); }
+        self.inner.commands.try_send(Command::Cancel(id.into())).map_err(|_| Error::Busy)
     }
 }
 struct Actor {
@@ -123,8 +113,8 @@ struct Actor {
     refresh: mpsc::Sender<bool>,
     options: ClientOptions,
     commands: mpsc::Receiver<Command>,
-    state: watch::Sender<ChatState>,
-    model: ChatState,
+    state: watch::Sender<ChatRooms>,
+    model: ChatRooms,
     refresh_attempted: bool,
 }
 impl Actor {
@@ -240,13 +230,22 @@ impl Actor {
                 }
                 command = self.commands.recv(), if authenticated => {
                     let value = match command {
-                        Some(Command::Send(input)) => match self.model.prepare(input) {
-                            Ok(frame) => serde_json::to_value(frame).ok(),
-                            Err(error) => { self.model.status = crate::sanitize::TerminalText::new(error.to_string()); None }
+                        Some(Command::Retain(ids)) => {
+                            let previous = self.model.rooms.len();
+                            self.model.retain(&ids);
+                            if previous != self.model.rooms.len() { self.publish(); }
+                            continue;
                         },
-                        Some(Command::Cancel) => self.model.cancel_frame(),
-                        Some(Command::CancelDownstream(reference)) => self.model.downstream_frame(&reference, std::time::Instant::now()),
-                        Some(Command::DismissDownstream(reference)) => { self.model.dismiss_downstream(&reference); None },
+                        Some(Command::Send(id, input, active)) => {
+                            self.model.retain(&active);
+                            self.model.room(&id).and_then(|room| match room.prepare(input) {
+                                Ok(frame) => serde_json::to_value(frame).ok(),
+                                Err(error) => { room.status = crate::sanitize::TerminalText::new(error.to_string()); None }
+                            })
+                        },
+                        Some(Command::Cancel(id)) => self.model.rooms.get(&id).and_then(|room| room.cancel_frame()),
+                        Some(Command::CancelDownstream(id, reference)) => self.model.rooms.get_mut(&id).and_then(|room| room.downstream_frame(&reference, std::time::Instant::now())),
+                        Some(Command::DismissDownstream(id, reference)) => { if let Some(room) = self.model.rooms.get_mut(&id) { room.dismiss_downstream(&reference); } None },
                         None => return,
                     };
                     self.publish();
@@ -319,10 +318,12 @@ mod tests {
         let (_credential_tx, credential_rx) = watch::channel(Some(credentials.clone()));
         let (refresh_tx, _) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::channel(4);
-        let (state_tx, mut state_rx) = watch::channel(ChatState::default());
+        let (state_tx, mut state_rx) = watch::channel(ChatRooms::default());
         let (_shutdown_tx, shutdown) = watch::channel(false);
-        let mut model = ChatState { connected: true, running: true, ..ChatState::default() };
-        model.apply(Frame::parse(r#"{"type":"error","code":"cancelled","downstream_running":2,"downstream_ref":"opaque"}"#).unwrap());
+        let mut model = ChatRooms::default();
+        let room = model.room("test").unwrap();
+        room.connected = true; room.running = true;
+        room.apply(Frame::parse(r#"{"type":"error","code":"cancelled","downstream_running":2,"downstream_ref":"opaque"}"#).unwrap());
         let mut actor = Actor {
             shutdown, target: GatewayUrl::parse("http://127.0.0.1").unwrap(),
             credentials: credential_rx, refresh: refresh_tx,
@@ -337,21 +338,21 @@ mod tests {
                 if state_rx.borrow_and_update().connected { break; }
                 state_rx.changed().await.unwrap();
             }
-            command_tx.send(Command::CancelDownstream("opaque".into())).await.unwrap();
+            command_tx.send(Command::CancelDownstream("test".into(), "opaque".into())).await.unwrap();
             let Some(Ok(Message::Text(wire))) = server.next().await else { panic!("missing stop frame"); };
             let frame: serde_json::Value = serde_json::from_str(&wire).unwrap();
             assert_eq!(frame["type"], "cancel_downstream");
             assert_eq!(frame["downstream_ref"], "opaque");
             assert!(frame["request_id"].as_str().is_some());
-            command_tx.send(Command::CancelDownstream("opaque".into())).await.unwrap();
-            command_tx.send(Command::DismissDownstream("opaque".into())).await.unwrap();
+            command_tx.send(Command::CancelDownstream("test".into(), "opaque".into())).await.unwrap();
+            command_tx.send(Command::DismissDownstream("test".into(), "opaque".into())).await.unwrap();
             assert!(tokio::time::timeout(Duration::from_millis(50), server.next()).await.is_err());
             server.send(Message::Close(None)).await.unwrap();
         };
         tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(actor.serve(&mut client, &credentials), fake);
         }).await.unwrap();
-        assert!(actor.model.downstream_reference(std::time::Instant::now()).is_none());
+        assert!(actor.model.rooms["test"].downstream_reference(std::time::Instant::now()).is_none());
     }
     #[tokio::test]
     async fn only_authentication_closes_request_refresh() {
@@ -364,13 +365,13 @@ mod tests {
                 let (_credential_tx, credential_rx) = watch::channel(Some(credentials.clone()));
                 let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
                 let (_command_tx, command_rx) = mpsc::channel(1);
-                let (state_tx, _) = watch::channel(ChatState::default());
+                let (state_tx, _) = watch::channel(ChatRooms::default());
                 let (_shutdown_tx, shutdown) = watch::channel(false);
                 let mut actor = Actor {
                     shutdown, target: GatewayUrl::parse("http://127.0.0.1").unwrap(),
                     credentials: credential_rx, refresh: refresh_tx,
                     options: ClientOptions::default(), commands: command_rx,
-                    state: state_tx, model: ChatState::default(), refresh_attempted: false,
+                    state: state_tx, model: ChatRooms::default(), refresh_attempted: false,
                 };
                 let (mut client, mut server) = pair().await;
                 let fake = async {
@@ -410,8 +411,8 @@ mod tests {
         });
         let (credential_tx, credential_rx) = watch::channel(Some(credentials.clone()));
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
-        let (_command_tx, command_rx) = mpsc::channel(1);
-        let (state_tx, mut state_rx) = watch::channel(ChatState::default());
+        let (_command_tx, command_rx) = mpsc::channel(16);
+        let (state_tx, mut state_rx) = watch::channel(ChatRooms::default());
         let (_shutdown_tx, shutdown) = watch::channel(false);
         let mut actor = Actor {
             shutdown,
@@ -421,7 +422,7 @@ mod tests {
             options: ClientOptions::default(),
             commands: command_rx,
             state: state_tx,
-            model: ChatState::default(),
+            model: ChatRooms::default(),
             refresh_attempted: false,
         };
         // Failed authentication asks the existing owner to refresh once, then
@@ -485,4 +486,57 @@ mod tests {
             .await
             .unwrap();
     }
+    #[tokio::test]
+    async fn fake_gateway_interleaves_two_conversations_on_one_socket() {
+        let credential = Arc::new(Credentials { token: Zeroizing::new("fixture".into()), generation: 1 });
+        let (_credentials_tx, credentials) = watch::channel(Some(credential.clone()));
+        let (refresh, _) = mpsc::channel(1);
+        let (commands, command_rx) = mpsc::channel(8);
+        let (state, mut state_rx) = watch::channel(ChatRooms::default());
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let mut actor = Actor { shutdown, target: GatewayUrl::parse("http://127.0.0.1").unwrap(),
+            credentials, refresh, options: ClientOptions::default(), commands: command_rx, state,
+            model: ChatRooms::default(), refresh_attempted: false };
+        let (mut client, mut server) = pair().await;
+        let fake = async {
+            let _ = server.next().await.unwrap().unwrap();
+            server.send(Message::Text(json!({"type":"session_info","session_id":"base"}).to_string().into())).await.unwrap();
+            commands.send(Command::Send("a".into(), super::super::submission("one", Some("adu")).unwrap(), vec!["a".into(), "b".into()])).await.unwrap();
+            commands.send(Command::Send("b".into(), super::super::submission("two", Some("worker")).unwrap(), vec!["a".into(), "b".into()])).await.unwrap();
+            let mut sent = Vec::new();
+            for _ in 0..2 {
+                let Some(Ok(Message::Text(wire))) = server.next().await else { panic!("user frame"); };
+                sent.push(serde_json::from_str::<serde_json::Value>(&wire).unwrap());
+            }
+            for index in [1, 0] {
+                server.send(Message::Text(json!({"type":"progress","content":"working","conv":sent[index]["conv"],"msg_id":sent[index]["msg_id"]}).to_string().into())).await.unwrap();
+            }
+            loop {
+                if state_rx.borrow_and_update().rooms.get("a").is_some_and(|r| r.can_cancel()) { break; }
+                state_rx.changed().await.unwrap();
+            }
+            commands.send(Command::Cancel("a".into())).await.unwrap();
+            let Some(Ok(Message::Text(wire))) = server.next().await else { panic!("cancel"); };
+            let cancel: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(cancel["msg_id"], sent[0]["msg_id"]);
+            server.send(Message::Text(json!({"type":"error","code":"cancelled","conv":sent[0]["conv"],"msg_id":sent[0]["msg_id"],"downstream_ref":"offer-a","downstream_running":1}).to_string().into())).await.unwrap();
+            loop {
+                let finished = { let state = state_rx.borrow_and_update();
+                    state.rooms["a"].downstream_reference(std::time::Instant::now()).is_some() };
+                if finished { break; }
+                state_rx.changed().await.unwrap();
+            }
+            assert!(state_rx.borrow().rooms["b"].running);
+            assert!(state_rx.borrow().rooms["b"].downstream_reference(std::time::Instant::now()).is_none());
+            server.send(Message::Text(json!({"type":"assistant_done","conv":sent[1]["conv"],"msg_id":sent[1]["msg_id"],"content":"second finished"}).to_string().into())).await.unwrap();
+            loop {
+                if !state_rx.borrow_and_update().rooms["b"].running { break; }
+                state_rx.changed().await.unwrap();
+            }
+            server.send(Message::Close(None)).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(actor.serve(&mut client, &credential), fake); }).await.unwrap();
+        assert!(actor.model.rooms["b"].lines.back().unwrap().plain().contains("second finished"));
+    }
+
 }

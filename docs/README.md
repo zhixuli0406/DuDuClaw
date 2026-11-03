@@ -81,6 +81,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/68-manager-team-history.md](features/68-manager-team-history.md) | Read-only team conversations — Enterprise backend API (v1.76.0), live reporting-line checks, masked external conversations, activation window, mandatory audit and limits; [繁體中文](features/zh-TW/68-manager-team-history.md) / [日本語](features/ja-JP/68-manager-team-history.md) |
 | [features/69-egress-guard.md](features/69-egress-guard.md) | per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
 | [features/70-credential-audit.md](features/70-credential-audit.md) | conversation credential metadata and masking; [繁體中文](features/zh-TW/70-credential-audit.md) / [日本語](features/ja-JP/70-credential-audit.md) |
+| [features/71-control-room.md](features/71-control-room.md) | Terminal control room — what `duduclaw tui` is for, the three ways to stop work, trust boundaries, verified terminals |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---

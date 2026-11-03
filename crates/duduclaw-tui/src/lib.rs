@@ -2,6 +2,7 @@
 pub mod blocks;
 pub mod pty;
 pub mod controls;
+pub mod autonomy;
 pub mod decide;
 pub mod snooze;
 pub mod auth;

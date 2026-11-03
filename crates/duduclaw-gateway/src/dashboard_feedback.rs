@@ -304,7 +304,10 @@ impl LiveTurn {
         home: &Path, agent_id: &str, task_id: Option<&str>,
         source: &str, runtime: &str,
     ) -> Self {
-        let payload = json!({ "agent_id": agent_id, "source": source, "runtime": runtime });
+        let mut payload = json!({ "agent_id": agent_id, "source": source, "runtime": runtime });
+        if let Some(task_id) = task_id {
+            payload["task_id"] = json!(task_id);
+        }
         emit_live(home, "agent.turn_started", payload.clone());
         let goal_round = if matches!(source, "goal" | "responsibility")
             && !crate::goal_loop::TEAM_LIVE_ROUND.try_with(|active| *active).unwrap_or(false)
@@ -350,6 +353,7 @@ impl LiveTurn {
 
 impl Drop for LiveTurn {
     fn drop(&mut self) {
+        // Drop also runs on cancellation/unwind; no outcome is known here.
         emit_live(&self.home, "agent.turn_finished", self.payload.clone());
     }
 }
@@ -666,6 +670,7 @@ mod tests {
                     LiveTurn::dispatch(home.path(), "worker", crate::cost_telemetry::RequestType::Dispatch, runtime)
                 ).await;
                 let start: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+                assert!(start["payload"].get("task_id").is_none());
                 assert_eq!(start["payload"]["source"], expected);
                 assert_eq!(start["payload"]["runtime"], runtime);
                 drop(turn);
@@ -692,9 +697,11 @@ mod tests {
         let last: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(last["event"], "agent.turn_finished");
         assert_eq!(first["payload"], last["payload"]);
-        assert_eq!(first["payload"].as_object().unwrap().len(), 3);
+        assert_eq!(first["payload"].as_object().unwrap().len(), 4);
         assert!(first["payload"].get("session_id").is_none());
-        assert!(first["payload"].get("task_id").is_none());
+        assert_eq!(first["payload"]["task_id"], "private-task");
+        assert!(last["payload"].get("status").is_none());
+        assert!(last["payload"].get("run_id").is_none());
         assert!(!home.path().join("events.db").exists());
     }
 

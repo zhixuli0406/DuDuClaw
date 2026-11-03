@@ -1,4 +1,4 @@
-//! Presentation-only commands dispatch through the ordinary key handler.
+//! Palette actions share the key handler and authorized control builders.
 use super::{
     app::{Action, App, Selection},
     m2,
@@ -34,6 +34,7 @@ pub(super) struct Command {
     pub key: KeyEvent,
     pub hint: String,
     aliases: &'static str,
+    control: Option<crate::controls::Control>,
 }
 fn fuzzy(query: &str, text: &str) -> bool {
     let text = text.to_lowercase();
@@ -56,6 +57,7 @@ impl App {
                 key: KeyEvent::new(code, modifiers),
                 hint: hint.into(),
                 aliases,
+                control: None,
             })
         };
         let none = KeyModifiers::NONE;
@@ -104,6 +106,9 @@ impl App {
             add(KeyCode::Char('y'), none, strings::CMD_DOWNSTREAM_STOP, "y", "stop downstream");
             add(KeyCode::Char('n'), none, strings::CMD_DOWNSTREAM_DISMISS, "n / Esc", "continue downstream dismiss");
         }
+        for (c, label, alias) in [('W', strings::WORKFLOW_BLOCK, "workflow"), ('A', strings::AUTOPILOT_BLOCK, "autopilot"), ('E', strings::EVOLUTION_BLOCK, "evolution playbook"), ('B', strings::BUDGET_BLOCK, "budget"), ('G', strings::DIGEST_BLOCK, "digest")] {
+            add(KeyCode::Char(c), none, label, &c.to_string(), alias);
+        }
         add(KeyCode::Char('P'), none, strings::CMD_PTY, "P", "pty terminal shell");
         add(KeyCode::Char('D'), none, strings::CMD_DETAIL, "D", "detail");
         add(KeyCode::Char('C'), none, strings::CMD_CHAT, "C", "chat");
@@ -114,6 +119,9 @@ impl App {
             "i / /",
             "input chat",
         );
+        if m2::operator(model, self.block_agent(model).as_deref().or(self.blocks.panes[self.blocks.focused].agent.as_deref())) {
+            add(KeyCode::Char('N'), none, strings::GOAL_CREATE, "N", "goal create plan");
+        }
         if self.block_agent(model).is_some() {
             add(KeyCode::Char('R'), none, strings::CMD_RUN, "R", "run");
             add(KeyCode::Char('T'), none, strings::CMD_TASK, "T", "task");
@@ -154,7 +162,7 @@ impl App {
             );
         }
         let pane = &self.blocks.panes[self.blocks.focused];
-        if matches!(pane.kind, Block::Run | Block::Task) {
+        if matches!(pane.kind, Block::Run | Block::Task | Block::Workflow) {
             if pane.index > 0 {
                 add(
                     KeyCode::Char('['),
@@ -172,6 +180,14 @@ impl App {
                     "]",
                     "next record",
                 );
+            }
+        }
+        if pane.kind == Block::Task && !pane.responsibilities && pane.data.selected["goal_mode"] == true {
+            if pane.data.selected["plan_pending"].as_str().is_some_and(|s| !s.is_empty()) {
+                add(KeyCode::Enter, none, strings::PLAN_APPROVE, "Enter", "approve plan");
+            }
+            if matches!(pane.data.selected["status"].as_str(), Some("done" | "failed" | "cancelled")) {
+                add(KeyCode::Char('c'), none, strings::CONTINUE_OPEN, "c", "continue goal");
             }
         }
         if pane.kind == Block::Task {
@@ -256,7 +272,7 @@ impl App {
         // opens an authorized confirmation card; no RPC is sent here.
         for (c, label, aliases) in [
             ('e', strings::CMD_STEER, "steer"),
-            ('s', strings::CMD_STOP, "stop"),
+            ('s', if pane.kind == Block::Workflow { strings::WORKFLOW_CANCEL } else { strings::CMD_STOP }, "stop cancel workflow"),
             ('p', strings::CMD_PAUSE, "pause resume"),
             ('d', strings::CMD_DISABLE, "disable"),
             ('n', strings::CMD_NOW, "run now heartbeat"),
@@ -268,6 +284,35 @@ impl App {
                 add(KeyCode::Char(c), none, label, &c.to_string(), aliases);
             }
         }
+        let mut controls = Vec::new();
+        if model.role == Some(crate::auth::Role::Admin) {
+            for resume in [false, true] {
+                controls.push(crate::controls::Control::Autonomy { agent: None, resume });
+            }
+        }
+        if let Some(Selection::Employee(id)) = &self.selected
+            && m2::manager(model) && model.goal_operators.contains(id) {
+            for resume in [false, true] {
+                controls.push(crate::controls::Control::Autonomy { agent: Some(id.clone()), resume });
+            }
+            if self.control_subject(&super::control_card::Source::Employee(id.clone()), model).is_some() {
+                for resume in [false, true] {
+                    controls.push(crate::controls::Control::Employee { agent: id.clone(), resume });
+                }
+            }
+        }
+        for control in controls {
+            let aliases = match &control {
+                crate::controls::Control::Autonomy { agent: None, resume: false } => "all autonomy pause",
+                crate::controls::Control::Autonomy { agent: None, resume: true } => "all autonomy resume",
+                crate::controls::Control::Autonomy { resume: false, .. } => "autonomy pause",
+                crate::controls::Control::Autonomy { resume: true, .. } => "autonomy resume",
+                crate::controls::Control::Employee { resume: false, .. } => "employee pause",
+                _ => "employee resume",
+            };
+            commands.push(Command { label: control.label(), key: KeyEvent::new(KeyCode::Null, none),
+                hint: "Enter".into(), aliases, control: Some(control) });
+        }
         commands
     }
     pub(super) fn palette_commands(&self, model: &Model) -> Vec<Command> {
@@ -278,7 +323,7 @@ impl App {
             .unwrap_or("");
         self.commands(model)
             .into_iter()
-            .filter(|c| fuzzy(query, &format!("{} {} {}", c.label, c.aliases, c.hint)))
+            .filter(|c| fuzzy(query, c.label) || fuzzy(query, c.aliases) || fuzzy(query, &c.hint))
             .collect()
     }
     pub(super) fn palette_key(
@@ -314,7 +359,17 @@ impl App {
                 let command = commands.get(palette.selected).cloned();
                 self.palette = None;
                 if let Some(command) = command {
-                    return self.key_at(command.key, model, now, epoch);
+                    match command.control {
+                        Some(crate::controls::Control::Autonomy { agent, resume }) => return self.autonomy_control(agent, resume, model),
+                        Some(control @ crate::controls::Control::Employee { .. }) => {
+                            if let crate::controls::Control::Employee { agent, .. } = &control {
+                                let source = super::control_card::Source::Employee(agent.clone());
+                                self.open_control(control, source, model, now);
+                            }
+                            return Action::None;
+                        }
+                        _ => return self.key_at(command.key, model, now, epoch),
+                    }
                 }
             }
             KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),

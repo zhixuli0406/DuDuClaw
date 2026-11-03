@@ -21,6 +21,7 @@ impl Snooze {
         let expires_at = match item {
             InboxItem::Approval(a) => Some(a.expires_at?),
             InboxItem::Task(_) => None,
+            InboxItem::Breaker(_) => return None,
         };
         let (cap, resurface_at) = if let Some(expiry) = expires_at {
             let remaining = expiry.saturating_sub(now);

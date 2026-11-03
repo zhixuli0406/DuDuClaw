@@ -22,6 +22,7 @@ zeroize.workspace = true
 url = "2"
 rand = "0.8"
 toml.workspace = true
+chrono.workspace = true
 tempfile = "3"
 unicode-width = "0.2.2"
 unicode-segmentation = "1"
@@ -33,6 +34,7 @@ vt100 = "0.16"
 libc = "0.2"
 
 [dev-dependencies]
+chrono-tz.workspace = true
 vte = "0.15"
 insta.workspace = true
 axum.workspace = true

@@ -123,6 +123,7 @@ fn personal_surfaces_are_untouched() {
         "plans.list",
         "evolution.status",
         "autopilot.list",
+        "autopilot.breakers",
         "channels.add",
         "system.status",
         "connect",
