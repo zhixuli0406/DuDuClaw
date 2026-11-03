@@ -21,6 +21,8 @@ use duduclaw_core::error::{DuDuClawError, Result};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use unicode_normalization::UnicodeNormalization;
+use duduclaw_gateway::backup_restore::RestoreLimits;
 
 /// Top-level directory names skipped during export (heavy or ephemeral).
 const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target", "computer_profiles"];
@@ -117,6 +119,53 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) 
 // Bound the compressed snapshot using the existing restore total-size ceiling (8 GiB).
 const MAX_IMPORT_ARCHIVE_BYTES: u64 = duduclaw_gateway::backup_restore::DEFAULT_MAX_RESTORE_TOTAL_BYTES;
 
+/// Apply the restore defaults in both passes, including entries skipped at unpack.
+#[derive(Default)]
+struct ImportBudget {
+    entries: u64,
+    bytes: u64,
+}
+
+impl ImportBudget {
+    fn check<R: Read>(&mut self, entry: &tar::Entry<'_, R>, limits: &RestoreLimits) -> Result<()> {
+        self.entries += 1;
+        if self.entries > u64::from(limits.max_entries) {
+            return Err(io_err("import limits", "備份項目數超過匯入安全上限"));
+        }
+        let size = entry.size();
+        if size > limits.max_entry_bytes {
+            return Err(io_err("import limits", "備份單一項目超過匯入大小上限"));
+        }
+        self.bytes = self.bytes.checked_add(size)
+            .ok_or_else(|| io_err("import limits", "備份解壓總量超過匯入大小上限"))?;
+        if self.bytes > limits.max_total_bytes {
+            return Err(io_err("import limits", "備份解壓總量超過匯入大小上限"));
+        }
+        Ok(())
+    }
+}
+
+// tar expands GNU/PAX metadata before yielding logical entries. Bound those
+// physical entries first, so its internal read_all cannot bypass our budget.
+const MAX_IMPORT_METADATA_BYTES: u64 = 1024 * 1024;
+
+fn validate_import_tar_headers(snapshot: &mut File, limits: &RestoreLimits) -> Result<()> {
+    snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))?;
+    let mut archive = tar::Archive::new(GzDecoder::new(&mut *snapshot));
+    let mut budget = ImportBudget::default();
+    for entry in archive.entries().map_err(|e| io_err("import headers", e))?.raw(true) {
+        let entry = entry.map_err(|e| io_err("import headers", e))?;
+        budget.check(&entry, limits)?;
+        let kind = entry.header().entry_type();
+        if (kind.is_gnu_longname() || kind.is_gnu_longlink()
+            || kind.is_pax_local_extensions() || kind.is_pax_global_extensions())
+            && entry.size() > MAX_IMPORT_METADATA_BYTES {
+            return Err(io_err("import limits", "備份路徑中繼資料超過匯入大小上限"));
+        }
+    }
+    snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))
+}
+
 fn snapshot_archive(archive: &Path, home: &Path, max_bytes: u64) -> Result<File> {
     let source = File::open(archive).map_err(|e| io_err("import open", e))?;
     if !source.metadata().map_err(|e| io_err("import snapshot", e))?.is_file() {
@@ -201,33 +250,49 @@ fn apply_import_snapshot(
     decision: &ImportDecision,
     mut after_unpack: impl FnMut(&Path) -> Result<()>,
 ) -> Result<()> {
+    apply_import_snapshot_with_limits(snapshot, home, force, decision, &RestoreLimits::default(), &mut after_unpack)
+}
+
+fn apply_import_snapshot_with_limits(
+    snapshot: &mut File,
+    home: &Path,
+    force: bool,
+    decision: &ImportDecision,
+    limits: &RestoreLimits,
+    mut after_unpack: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    validate_import_tar_headers(snapshot, limits)?;
     let existing_agents = home.join("agents");
-    if existing_agents.exists() {
-        if !force {
-            return Err(io_err(
-                "import",
-                format!(
-                    "home already has agents at {} — pass --force to import (existing data is preserved as agents.pre-import)",
-                    existing_agents.display()
-                ),
-            ));
-        }
+    let has_agents = existing_agents.exists();
+    if has_agents && !force {
+        return Err(io_err(
+            "import",
+            format!(
+                "home already has agents at {} — pass --force to import (existing data is preserved as agents.pre-import)",
+                existing_agents.display()
+            ),
+        ));
+    }
+    snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))?;
+    let mut ar = tar::Archive::new(GzDecoder::new(snapshot));
+    let entries = ar.entries().map_err(|e| io_err("import unpack", e))?;
+    // Validation and every policy refusal have already completed. Publish strict
+    // policy durably before moving agents or replacing any identity data.
+    if decision.publish_before_unpack {
+        publish_import_config(home, &decision.prepared_config)?;
+    }
+    if has_agents {
         let backup = home.join("agents.pre-import");
         if backup.exists() {
             fs::remove_dir_all(&backup).map_err(|e| io_err("import clear old backup", e))?;
         }
         fs::rename(&existing_agents, &backup).map_err(|e| io_err("import backup agents", e))?;
     }
-    // Always publish strict policy before replacing identity, even if the
-    // prepared text is identical to the archived text. Tar order is untrusted.
-    if decision.publish_before_unpack {
-        publish_import_config(home, &decision.prepared_config)?;
-    }
-    snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))?;
-    let mut ar = tar::Archive::new(GzDecoder::new(snapshot));
     let mut targets = HashSet::new();
-    for entry in ar.entries().map_err(|e| io_err("import unpack", e))? {
+    let mut budget = ImportBudget::default();
+    for entry in entries {
         let mut entry = entry.map_err(|e| io_err("import unpack", e))?;
+        budget.check(&entry, limits)?;
         let path = checked_import_entry(&entry, &mut targets)?;
         if is_live_lock(&path) || (decision.publish_before_unpack && path == Path::new("config.toml")) {
             continue;
@@ -278,6 +343,159 @@ mod tests {
             builder.append(&header, *data).unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn import_limits_are_enforced_in_validation_and_unpack() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let archive = root.path().join("input.tar.gz");
+        ordered_archive(&archive, &[("first", b"123"), ("second", b"456")]);
+        let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        for (limits, message) in [
+            (RestoreLimits { max_entries: 1, ..RestoreLimits::default() }, "項目數"),
+            (RestoreLimits { max_total_bytes: 5, ..RestoreLimits::default() }, "解壓總量"),
+            (RestoreLimits { max_entry_bytes: 2, ..RestoreLimits::default() }, "單一項目"),
+        ] {
+            let error = validate_import_policy_with_limits(&mut snapshot, &home, true, &limits).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(fs::read_dir(&home).unwrap().count(), 0, "validation must not unpack anything");
+            let unpack_home = tempfile::tempdir().unwrap();
+            let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+            let error = apply_import_snapshot_with_limits(&mut snapshot, unpack_home.path(), false, &decision, &limits, |_| Ok(())).unwrap_err();
+            assert!(error.to_string().contains(message), "unpack: {error}");
+            assert!(!unpack_home.path().join("second").exists());
+        }
+    }
+
+    #[test]
+    fn import_rejects_oversized_declared_entry_before_reading_body() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let archive = root.path().join("input.tar.gz");
+        let mut header = tar::Header::new_gnu();
+        header.set_path("huge").unwrap();
+        header.set_mode(0o600);
+        header.set_size(RestoreLimits::default().max_entry_bytes + 1);
+        header.set_cksum();
+        let mut gzip = GzEncoder::new(File::create(&archive).unwrap(), Compression::default());
+        gzip.write_all(header.as_bytes()).unwrap();
+        gzip.finish().unwrap();
+        let error = import_archive(&archive, &home, false, true).unwrap_err();
+        assert!(error.to_string().contains("單一項目"), "{error}");
+        assert!(!home.join("huge").exists());
+    }
+
+    #[test]
+    fn import_limits_reject_gnu_metadata_before_decoding_it() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let archive = root.path().join("input.tar.gz");
+        let mut header = tar::Header::new_gnu();
+        header.set_path("././@LongLink").unwrap();
+        header.set_entry_type(tar::EntryType::GNULongName);
+        header.set_size(MAX_IMPORT_METADATA_BYTES + 1);
+        header.set_cksum();
+        let mut gzip = GzEncoder::new(File::create(&archive).unwrap(), Compression::default());
+        gzip.write_all(header.as_bytes()).unwrap();
+        gzip.finish().unwrap();
+        let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        let error = validate_import_policy(&mut snapshot, &home, true).unwrap_err();
+        assert!(error.to_string().contains("中繼資料"), "{error}");
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+        let error = apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("中繼資料"), "{error}");
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn import_budget_counts_pax_effective_size() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("input.tar.gz");
+        let mut builder = tar::Builder::new(GzEncoder::new(File::create(&archive).unwrap(), Compression::default()));
+        builder.append_pax_extensions([("size", &b"100"[..])]).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder.append_data(&mut header, "payload", std::io::empty()).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        let mut archive = tar::Archive::new(GzDecoder::new(File::open(&archive).unwrap()));
+        let entry = archive.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(entry.header().size().unwrap(), 0);
+        assert_eq!(entry.size(), 100);
+        let limits = RestoreLimits { max_total_bytes: 99, ..RestoreLimits::default() };
+        let error = ImportBudget::default().check(&entry, &limits).unwrap_err();
+        assert!(error.to_string().contains("解壓總量"), "{error}");
+    }
+
+    #[test]
+    fn export_import_round_trips_gnu_long_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        let name = format!("notes/{}/{}", "a".repeat(80), "b".repeat(80));
+        write(&source.join(&name), "long path");
+        let archive = root.path().join("input.tar.gz");
+        export_home(&source, &archive).unwrap();
+        import_archive(&archive, &target, false, true).unwrap();
+        assert_eq!(fs::read(target.join(name)).unwrap(), b"long path");
+    }
+
+    #[test]
+    fn import_nfc_duplicate_is_refused_but_fullwidth_is_not_nfkc_folded() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let archive = root.path().join("input.tar.gz");
+        ordered_archive(&archive, &[("notes/café", b"one"), ("notes/cafe\u{301}", b"two")]);
+        let error = import_archive(&archive, &home, false, true).unwrap_err();
+        assert!(error.to_string().contains("duplicate archive target"), "{error}");
+        assert!(!home.join("notes").exists());
+        assert_eq!(canonical_import_path(Path::new("ｃｏｎｆｉｇ.toml")).unwrap(), Path::new("ｃｏｎｆｉｇ.toml"));
+        ordered_archive(&archive, &[("ｃｏｎｆｉｇ.toml", b"ordinary file")]);
+        import_archive(&archive, &home, false, true).unwrap();
+        assert_eq!(fs::read(home.join("ｃｏｎｆｉｇ.toml")).unwrap(), b"ordinary file");
+    }
+
+    #[test]
+    fn import_force_config_publication_failure_keeps_agents_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        write(&home.join("agents/kept/SOUL.md"), "keep");
+        write(&home.join("agents.pre-import/older/SOUL.md"), "older");
+        let archive = root.path().join("input.tar.gz");
+        ordered_archive(&archive, &[("first", b"must not land")]);
+        let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        let mut decision = validate_import_policy(&mut snapshot, &home, true).unwrap();
+        decision.publish_before_unpack = true;
+        decision.prepared_config = "[auth]\nmfa_enforced=true\n".to_owned();
+        // A directory at the destination deterministically fails atomic publication.
+        fs::create_dir(home.join("config.toml")).unwrap();
+        let error = apply_import_snapshot(&mut snapshot, &home, true, &decision, |_| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("preserve MFA policy"), "{error}");
+        assert_eq!(fs::read(home.join("agents/kept/SOUL.md")).unwrap(), b"keep");
+        assert_eq!(fs::read(home.join("agents.pre-import/older/SOUL.md")).unwrap(), b"older");
+        assert!(!home.join("first").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_export_import_round_trips_colons_and_dos_names() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        for name in ["notes/2026-11-04T07:00", "aux/note", "CONFIG~1.TOM"] {
+            write(&source.join(name), "keep");
+        }
+        let archive = root.path().join("input.tar.gz");
+        export_home(&source, &archive).unwrap();
+        import_archive(&archive, &target, false, true).unwrap();
+        for name in ["notes/2026-11-04T07:00", "aux/note", "CONFIG~1.TOM"] {
+            assert_eq!(fs::read(target.join(name)).unwrap(), b"keep");
+        }
     }
 
     #[test]
@@ -333,6 +551,7 @@ mod tests {
         for protected in ["config.toml", "users.db", "users.db-wal", "users.db-shm", "users.db-journal", "license.json"] {
             for alias in [format!("{protected}."), format!("{protected} "), format!("{protected}. "),
                 format!("{protected}:stream"), protected.to_uppercase(), format!("{protected}./child")] {
+                if !cfg!(windows) && alias.contains(':') { continue; }
                 ordered_archive(&archive, &[("first.txt", b"must not land"), (&alias, b"")]);
                 assert!(import_archive(&archive, &home, true, false).is_err(), "{alias}");
                 assert!(!home.join("first.txt").exists(), "{alias}");
@@ -353,7 +572,7 @@ mod tests {
         for number in 1..=9 {
             reserved.extend([format!("COM{number}"), format!("LPT{number}")]);
         }
-        for name in reserved {
+        for name in reserved.into_iter().filter(|_| cfg!(windows)) {
             for component in [name.clone(), format!("{name}.txt"), format!("{name}. ")] {
                 let path = format!("nested/{component}/file");
                 ordered_archive(&archive, &[(&path, b"")]);
@@ -362,6 +581,7 @@ mod tests {
         }
         for path in ["nested/file:stream", "nested:stream/file", "nested/.../file", "nested/   /file", "nested\\file",
             "CONFIG~1.TOM", "USERS~1.DB-", "nested/AGENTS~1/file"] {
+            if !cfg!(windows) && (path.contains(':') || path.contains('~')) { continue; }
             ordered_archive(&archive, &[(path, b"")]);
             assert!(import_archive(&archive, &home, false, true).is_err(), "{path}");
         }
@@ -380,6 +600,7 @@ mod tests {
         let archive = root.path().join("input.tar.gz");
         let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
         for name in ["config.toml.", "users.db:stream", "nested/NUL.txt"] {
+            if !cfg!(windows) && name != "config.toml." { continue; }
             ordered_archive(&archive, &[(name, b"")]);
             let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
             assert!(apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).is_err());
@@ -948,29 +1169,29 @@ const IDENTITY_FILES: &[&str] = &["users.db", "users.db-wal", "users.db-shm", "u
 fn canonical_import_path(path: &Path) -> Result<PathBuf> {
     let mut canonical = PathBuf::new();
     for component in path.components() {
-        if matches!(component, std::path::Component::CurDir) { continue; }
         let std::path::Component::Normal(value) = component else {
             return Err(io_err("import policy", "invalid archive path"));
         };
         let name = value.to_str().ok_or_else(|| io_err("import policy", "non-UTF-8 archive path"))?;
-        if name.contains([':', '\\']) {
+        if name.contains('\\') || (cfg!(windows) && name.contains(':')) {
             return Err(io_err("import policy", "non-portable archive path"));
         }
         // Uppercase first also catches ASCII aliases such as dotless i and
         // long s used by Windows' ordinal uppercase comparison. Lowercase
         // keeps the comparison keys aligned with our protected-name constants.
-        let name = name.trim_end_matches(['.', ' ']).to_uppercase().to_lowercase();
+        // NFC preserves compatibility characters (e.g. fullwidth letters); do not use NFKC.
+        let name = name.trim_end_matches(['.', ' ']).nfc().collect::<String>().to_uppercase().to_lowercase();
         let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
         let device_number = stem.strip_prefix("com").or_else(|| stem.strip_prefix("lpt"));
-        if name.is_empty() || matches!(stem, "con" | "nul" | "aux" | "prn")
-            || matches!(device_number, Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")) {
+        if name.is_empty() || (cfg!(windows) && (matches!(stem, "con" | "nul" | "aux" | "prn")
+            || matches!(device_number, Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")))) {
             return Err(io_err("import policy", "reserved archive path component"));
         }
         // Existing Windows files may also be reachable through generated 8.3
         // names. Their mappings depend on the destination volume, so refuse
         // the short-name spelling instead of trying to resolve it during unpack.
         let (short_stem, extension) = name.rsplit_once('.').unwrap_or((&name, ""));
-        if short_stem.chars().count() <= 8 && !short_stem.contains('.') && extension.chars().count() <= 3
+        if cfg!(windows) && short_stem.chars().count() <= 8 && !short_stem.contains('.') && extension.chars().count() <= 3
             && short_stem.rsplit_once('~').is_some_and(|(prefix, digits)|
                 !prefix.is_empty() && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) {
             return Err(io_err("import policy", "DOS short-name archive alias"));
@@ -985,7 +1206,7 @@ fn canonical_import_path(path: &Path) -> Result<PathBuf> {
 
 fn checked_import_entry<R: Read>(entry: &tar::Entry<'_, R>, targets: &mut HashSet<PathBuf>) -> Result<PathBuf> {
     // Check the wire spelling before Windows Path components consume backslashes.
-    if entry.path_bytes().iter().any(|byte| matches!(byte, b':' | b'\\')) {
+    if entry.path_bytes().iter().any(|byte| *byte == b'\\' || (cfg!(windows) && *byte == b':')) {
         return Err(io_err("import policy", "non-portable archive path"));
     }
     let raw = entry.path().map_err(|e| io_err("import policy", e))?;
@@ -1010,10 +1231,18 @@ fn checked_import_entry<R: Read>(entry: &tar::Entry<'_, R>, targets: &mut HashSe
 }
 
 fn validate_import_policy(snapshot: &mut File, home: &Path, personal: bool) -> Result<ImportDecision> {
+    validate_import_policy_with_limits(snapshot, home, personal, &RestoreLimits::default())
+}
+
+fn validate_import_policy_with_limits(
+    snapshot: &mut File, home: &Path, personal: bool, limits: &RestoreLimits,
+) -> Result<ImportDecision> {
+    validate_import_tar_headers(snapshot, limits)?;
     let policy = duduclaw_core::product_profile::load(home).map_err(DuDuClawError::Config)?;
     snapshot.rewind().map_err(|e| io_err("import policy", e))?;
     let mut archive = tar::Archive::new(GzDecoder::new(snapshot));
     let mut targets = HashSet::new();
+    let mut budget = ImportBudget::default();
     let mut restored_config = None;
     let mut replaces_identity = false;
     let mut personal = personal;
@@ -1022,13 +1251,14 @@ fn validate_import_policy(snapshot: &mut File, home: &Path, personal: bool) -> R
         Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     for entry in archive.entries().map_err(|e| io_err("import policy", e))? {
         let mut entry = entry.map_err(|e| io_err("import policy", e))?;
+        budget.check(&entry, limits)?;
         let path = checked_import_entry(&entry, &mut targets)?;
         if is_live_lock(&path) { continue; }
         if path.to_str().is_some_and(|name| IDENTITY_FILES.contains(&name)) {
             replaces_identity = true;
         }
         if path == Path::new("license.json") {
-            if license_seen || entry.header().size().unwrap_or(u64::MAX) > 1024 * 1024 {
+            if license_seen || entry.size() > 1024 * 1024 {
                 return Err(io_err("import policy", "duplicate or oversized license entry"));
             }
             license_seen = true;
@@ -1044,7 +1274,7 @@ fn validate_import_policy(snapshot: &mut File, home: &Path, personal: bool) -> R
             }
         }
         if path == Path::new("config.toml") || path.file_name().and_then(|v| v.to_str()) == Some("agent.toml") {
-            if !entry.header().entry_type().is_file() || entry.header().size().unwrap_or(u64::MAX) > 1024 * 1024 {
+            if !entry.header().entry_type().is_file() || entry.size() > 1024 * 1024 {
                 return Err(io_err("import policy", "invalid or oversized configuration entry"));
             }
             let mut text = String::new();

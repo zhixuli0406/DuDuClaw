@@ -209,9 +209,9 @@ pub struct RestoreExtractReport {
 }
 
 /// Extract `archive_path` (a `.tar.gz`) into `dest_dir`, enforcing
-/// [`RestoreLimits`]. `dest_dir` is created if absent. On ANY violation the
-/// whole extraction is rolled back (`dest_dir`'s contents removed) — never a
-/// partial tree left on disk.
+/// [`RestoreLimits`]. `dest_dir` must not exist; its parent must exist. On
+/// any extraction violation only this newly created directory is removed.
+/// Existing directories are refused and never changed.
 ///
 /// ### Why checking the tar header's declared size is sufficient
 ///
@@ -248,7 +248,9 @@ pub fn extract_tar_gz_safely(
     }
     drop(f);
 
-    std::fs::create_dir_all(dest_dir).map_err(|e| RestoreViolation::Io(e.to_string()))?;
+    // This function owns only a directory it created itself. Never roll
+    // back another request's published staging (even for direct callers).
+    std::fs::create_dir(dest_dir).map_err(|e| RestoreViolation::Io(e.to_string()))?;
 
     let result = extract_inner(archive_path, dest_dir, limits);
     if result.is_err() {
@@ -461,6 +463,74 @@ pub struct RestoreMarker {
     pub source_filename: String,
 }
 
+#[derive(Debug)]
+pub struct RestoreStageReport {
+    pub extraction: RestoreExtractReport,
+    pub mfa_notice: bool,
+}
+
+/// Serialize staging and boot swaps on a stable inode under the live locks/.
+fn with_restore_lock<T>(home: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
+    duduclaw_core::with_file_lock(&home.join("locks/restore"), || Ok(f()))
+}
+
+fn path_occupied(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Stage one restore without ever extracting into, or cleaning, published data.
+/// A marker, including an unreadable or malformed one, blocks all later stages.
+/// The request's private temp directory is removed on every pre-publication
+/// failure; a published directory is retained if marker publication fails.
+pub fn stage_restore(home: &Path, source: &Path) -> Result<RestoreStageReport, String> {
+    with_restore_lock(home, || stage_restore_locked(home, source))
+        .map_err(|e| format!("無法鎖定還原作業：{e}"))?
+}
+
+fn stage_restore_locked(home: &Path, source: &Path) -> Result<RestoreStageReport, String> {
+    if path_occupied(&marker_path(home)).map_err(|e| e.to_string())? {
+        return Err("已有待套用的還原，請先重新啟動閘道套用，再上傳新的還原。".into());
+    }
+    let request = tempfile::Builder::new().prefix(".restore-request-")
+        .tempdir_in(home).map_err(|e| format!("建立還原暫存目錄失敗：{e}"))?;
+    let extracted = request.path().join("data");
+    let extraction = extract_tar_gz_safely(source, &extracted, &RestoreLimits::from_home(home))
+        .map_err(|e| e.to_string())?;
+    let root = resolve_restore_root(&extracted, home);
+    let read_config = |path: &Path| -> Result<String, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("無法讀取還原設定：{e}")),
+        }
+    };
+    let restored_config = read_config(&root.join("config.toml"))?;
+    let current_config = home.join("config.toml");
+    crate::product_policy::validate_write(
+        home, &current_config, &read_config(&current_config)?, &restored_config,
+    )?;
+    let mfa_notice = crate::mfa::restore_policy_differs(home, &restored_config);
+    if mfa_notice {
+        // Validate policy preservation here; boot rechecks against the live policy.
+        crate::mfa::preserve_restore_policy(&restored_config, crate::mfa::restore_policy(home))?;
+    }
+    let staging = staging_dir(home);
+    if path_occupied(&staging).map_err(|e| e.to_string())? {
+        return Err("已有未完成的還原暫存資料，為保留資料已拒絕覆寫；請由管理員檢查。".into());
+    }
+    std::fs::rename(&extracted, &staging).map_err(|e| format!("發布還原暫存資料失敗：{e}"))?;
+    let marker = RestoreMarker {
+        staged_at: Utc::now(),
+        source_filename: source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+    };
+    write_marker(home, &marker).map_err(|e| format!("寫入還原標記失敗（已保留暫存資料）：{e}"))?;
+    Ok(RestoreStageReport { extraction, mfa_notice })
+}
+
 /// Atomic (temp + rename) write. Called only after [`extract_tar_gz_safely`]
 /// has already succeeded — the marker's presence is the sole signal
 /// `perform_pending_restore_swap` acts on, so it must never be written
@@ -469,11 +539,11 @@ pub fn write_marker(home_dir: &Path, marker: &RestoreMarker) -> std::io::Result<
     let path = marker_path(home_dir);
     let body = serde_json::to_string_pretty(marker)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body.as_bytes())?;
-    std::fs::rename(&tmp, &path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    let mut tmp = tempfile::Builder::new().prefix(".restore-marker-").tempfile_in(home_dir)?;
+    std::io::Write::write_all(&mut tmp, body.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 pub fn read_marker(home_dir: &Path) -> Option<RestoreMarker> {
@@ -582,6 +652,17 @@ pub fn perform_pending_restore_swap(
         ))
     })?;
 
+    with_restore_lock(home_dir, || perform_pending_restore_swap_locked(home_dir, now_tag))
+        .map_err(|e| RestoreSwapError::Io(e.to_string()))?
+}
+
+fn perform_pending_restore_swap_locked(
+    home_dir: &Path,
+    now_tag: &str,
+) -> Result<Option<RestoreSwapReport>, RestoreSwapError> {
+    if read_marker(home_dir).is_none() {
+        return Ok(None);
+    }
     let staging = staging_dir(home_dir);
     let restore_root = resolve_restore_root(&staging, home_dir);
     let has_content = std::fs::read_dir(&restore_root)
@@ -954,6 +1035,126 @@ mod tests {
             matches!(err, RestoreViolation::TooManyEntries { max: 5, .. }),
             "{err:?}"
         );
+    }
+
+    fn assert_no_request_residue(home: &Path) {
+        for entry in std::fs::read_dir(home).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(!name.to_string_lossy().starts_with(".restore-request-"), "{name:?}");
+            assert!(!name.to_string_lossy().starts_with(".restore-marker-"), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn staging_second_request_refuses_pending_and_keeps_first_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let a = write_archive(tmp.path(), "a.tar.gz", &build_tar_gz(&[("kept.txt", b"A")]));
+        let b = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("new.txt", b"B")]));
+        stage_restore(&home, &a).unwrap();
+        let marker = std::fs::read(marker_path(&home)).unwrap();
+        let error = stage_restore(&home, &b).unwrap_err();
+        assert!(error.contains("已有待套用的還原"), "{error}");
+        assert_eq!(std::fs::read(staging_dir(&home).join("kept.txt")).unwrap(), b"A");
+        assert!(!staging_dir(&home).join("new.txt").exists());
+        assert_eq!(std::fs::read(marker_path(&home)).unwrap(), marker);
+        assert_no_request_residue(&home);
+    }
+
+    #[test]
+    fn staging_failure_cleans_own_partial_tree_and_preserves_existing_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "[backup]\nmax_restore_entries=1\n").unwrap();
+        let archive = write_archive(tmp.path(), "bad.tar.gz", &build_tar_gz(&[
+            ("first.txt", b"partial"), ("second.txt", b"rejected"),
+        ]));
+        // Check both a fresh stage and a previous publication without a marker.
+        for existing in [false, true] {
+            if existing {
+                std::fs::create_dir(staging_dir(&home)).unwrap();
+                std::fs::write(staging_dir(&home).join("kept.txt"), b"A").unwrap();
+            }
+            let error = stage_restore(&home, &archive).unwrap_err();
+            assert!(error.contains("超過安全上限"), "{error}");
+            assert!(!marker_path(&home).exists());
+            assert!(!staging_dir(&home).join("first.txt").exists());
+            assert_no_request_residue(&home);
+            if existing {
+                assert_eq!(std::fs::read(staging_dir(&home).join("kept.txt")).unwrap(), b"A");
+            } else {
+                assert!(!staging_dir(&home).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn staging_refuses_existing_unmarked_publication_without_overwriting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(staging_dir(&home)).unwrap();
+        std::fs::write(staging_dir(&home).join("kept.txt"), b"A").unwrap();
+        let archive = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("new.txt", b"B")]));
+        let error = stage_restore(&home, &archive).unwrap_err();
+        assert!(error.contains("拒絕覆寫"), "{error}");
+        assert_eq!(std::fs::read(staging_dir(&home).join("kept.txt")).unwrap(), b"A");
+        assert!(!staging_dir(&home).join("new.txt").exists());
+        assert!(!marker_path(&home).exists());
+        assert_no_request_residue(&home);
+    }
+
+    #[test]
+    fn staging_refuses_malformed_pending_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(marker_path(tmp.path()), b"broken marker").unwrap();
+        let error = stage_restore(tmp.path(), &tmp.path().join("unused.tar.gz")).unwrap_err();
+        assert!(error.contains("已有待套用的還原"), "{error}");
+        assert_eq!(std::fs::read(marker_path(tmp.path())).unwrap(), b"broken marker");
+        assert_no_request_residue(tmp.path());
+    }
+
+    #[test]
+    fn extraction_never_cleans_an_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("staging");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("kept.txt"), b"A").unwrap();
+        let archive = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("new.txt", b"B")]));
+        assert!(extract_tar_gz_safely(&archive, &dest, &RestoreLimits::default()).is_err());
+        assert_eq!(std::fs::read(dest.join("kept.txt")).unwrap(), b"A");
+        assert!(!dest.join("new.txt").exists());
+    }
+
+    #[test]
+    fn concurrent_staging_publishes_exactly_one_complete_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let a = write_archive(tmp.path(), "a.tar.gz", &build_tar_gz(&[("a.txt", b"A")]));
+        let b = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("b.txt", b"B")]));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [a, b].into_iter().map(|source| {
+            let home = home.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                stage_restore(&home, &source)
+            })
+        }).collect();
+        let successes = handles.into_iter()
+            .map(|handle| handle.join().unwrap()).filter(Result::is_ok).count();
+        assert_eq!(successes, 1);
+        let marker = read_marker(&home).unwrap();
+        let (kept, absent, bytes) = if marker.source_filename == "a.tar.gz" {
+            ("a.txt", "b.txt", b"A")
+        } else {
+            ("b.txt", "a.txt", b"B")
+        };
+        assert_eq!(std::fs::read(staging_dir(&home).join(kept)).unwrap(), bytes);
+        assert!(!staging_dir(&home).join(absent).exists());
+        assert_no_request_residue(&home);
     }
 
     // ── upload staging ────────────────────────────────────────────
