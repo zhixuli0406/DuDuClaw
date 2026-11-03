@@ -29,7 +29,7 @@ fn each_attestation_failure_is_closed_and_specific() {
         ("dumpable", |i| i.dumpable = 1),
         ("dumpable", |i| i.dumpable = -1),
         ("key_path_accessible", |i| i.key_path_denied = false),
-        ("docker_socket", |i| i.sockets_absent = false),
+        ("engine_socket", |i| i.sockets_absent = false),
         ("docker_host", |i| i.docker_host_absent = false),
     ];
     for (reason, mutate) in cases {
@@ -138,4 +138,184 @@ fn mountinfo_unreadable_malformed_or_uninspectable_is_refused() {
     for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::NotFound] {
         assert!(!mountinfo_sockets_absent(Some(&mount_line("/custom/control")), |_| Err(kind.into())));
     }
+}
+
+// Existing parser/point checks use a no-op walker to keep their synthetic paths.
+fn mountinfo_sockets_absent(
+    input: Option<&str>,
+    mut is_socket: impl FnMut(&std::path::Path) -> std::io::Result<bool>,
+) -> bool {
+    check_mountinfo(input, |path| is_socket(path).map(|socket| (socket, true)), |_, _| Ok(())).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn scan_tree(input: &str, cap: usize) -> Result<(), &'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut remaining = cap;
+    check_mountinfo(Some(input), |path| {
+        std::fs::symlink_metadata(path).map(|metadata| (metadata.file_type().is_socket(), metadata.is_dir()))
+    }, |path, mounts| scan_mount_directory(path, mounts, &mut remaining))
+}
+
+#[cfg(target_os = "linux")]
+fn tree_mount(path: &std::path::Path) -> String {
+    mount_line(&path.to_str().unwrap().replace('\\', "\\134").replace(' ', "\\040"))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mounted_directory_refuses_nested_engine_sockets_but_allows_runtime_sockets() {
+    use std::os::unix::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("one/two");
+    std::fs::create_dir_all(&nested).unwrap();
+    let input = tree_mount(dir.path());
+    let _gateway = UnixListener::bind(nested.join("gateway.sock")).unwrap();
+    let _view = UnixListener::bind(nested.join("live-view.sock")).unwrap();
+    assert_eq!(scan_tree(&input, MOUNT_SCAN_ENTRIES), Ok(()));
+    for name in ["podman.sock", "docker.sock", "containerd.sock", "buildkitd.sock",
+        "crio.sock", "dockershim.sock", "my-docker-api.sock", "my-podman.sock"] {
+        let path = nested.join(name);
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(scan_tree(&input, MOUNT_SCAN_ENTRIES), Err("engine_socket"), "{name}");
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+    for engine in ["docker", "podman", "containerd"] {
+        let path = nested.join(engine);
+        std::fs::create_dir(&path).unwrap();
+        let listener = UnixListener::bind(path.join("control")).unwrap();
+        assert_eq!(scan_tree(&input, MOUNT_SCAN_ENTRIES), Err("engine_socket"));
+        drop(listener);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mounted_directory_does_not_follow_socket_or_directory_symlinks() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let _listener = UnixListener::bind(outside.path().join("podman.sock")).unwrap();
+    symlink(outside.path().join("podman.sock"), dir.path().join("podman.sock")).unwrap();
+    symlink(outside.path(), dir.path().join("linked-directory")).unwrap();
+    assert_eq!(scan_tree(&tree_mount(dir.path()), MOUNT_SCAN_ENTRIES), Ok(()));
+}
+
+// These filesystem-walk tests exercise the Linux-only protected-key mount scan.
+#[cfg(target_os = "linux")]
+#[test]
+fn mounted_directory_caps_entries_across_mounts_and_fails_closed_at_depth() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for dir in [first.path(), second.path()] {
+        std::fs::write(dir.join("entry"), b"").unwrap();
+    }
+    let input = format!("{}{}", tree_mount(first.path()), tree_mount(second.path()));
+    assert_eq!(scan_tree(&input, 2), Ok(()));
+    assert_eq!(scan_tree(&input, 1), Err("mount_scan_incomplete"));
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a/b/c/d")).unwrap();
+    assert_eq!(scan_tree(&tree_mount(dir.path()), MOUNT_SCAN_ENTRIES), Ok(()));
+    std::fs::write(dir.path().join("a/b/c/d/too-deep"), b"").unwrap();
+    assert_eq!(scan_tree(&tree_mount(dir.path()), MOUNT_SCAN_ENTRIES), Err("mount_scan_incomplete"));
+}
+
+#[cfg(unix)]
+#[test]
+fn mounted_directory_unreadable_fails_closed_even_under_root_test_runner() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("unreadable");
+    std::fs::create_dir(&nested).unwrap();
+    let mut remaining = MOUNT_SCAN_ENTRIES;
+    let mut reads = 0;
+    // Inject EACCES at read_dir, so this also exercises the failure under root.
+    assert_eq!(walk_mount_directory(dir.path(), &[],
+        std::fs::symlink_metadata(dir.path()).unwrap().dev(), 0, &mut remaining,
+        &mut |path| {
+            reads += 1;
+            if reads == 2 { Err(std::io::ErrorKind::PermissionDenied.into()) }
+            else { std::fs::read_dir(path) }
+        }), Err("mount_scan_incomplete"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nested_same_device_mount_is_scanned_separately() {
+    use std::os::unix::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let _listener = UnixListener::bind(nested.join("podman.sock")).unwrap();
+    let mut remaining = MOUNT_SCAN_ENTRIES;
+    assert_eq!(scan_mount_directory(dir.path(), &[nested.clone()], &mut remaining), Ok(()));
+    assert_eq!(scan_tree(&format!("{}{}", tree_mount(dir.path()), tree_mount(&nested)),
+        MOUNT_SCAN_ENTRIES), Err("engine_socket"));
+}
+
+#[test]
+fn mountinfo_refuses_engine_source_root_and_source_device() {
+    for input in [
+        "42 21 8:1 /run/docker /control rw - ext4 /dev/sda1 rw",
+        "42 21 8:1 /run/user/1000/podman /control rw - ext4 /dev/sda1 rw",
+        "42 21 8:1 / /control rw - ext4 /run/docker rw",
+    ] {
+        assert_eq!(check_mountinfo(Some(input), |_| Ok((false, true)), |_, _| Ok(())), Err("engine_socket"));
+    }
+}
+
+#[test]
+fn normal_container_overlay_and_standard_system_mounts_are_not_walked() {
+    let input = "29 1 0:25 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/ABC,upperdir=/var/lib/docker/overlay2/123/diff,workdir=/var/lib/docker/overlay2/123/work
+30 29 0:26 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+31 29 0:27 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+32 31 0:28 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666
+33 29 0:29 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro
+34 33 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw
+35 31 0:31 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw
+36 31 0:32 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k
+38 29 8:1 /var/lib/docker/volumes/duduclaw-data/_data /app/data rw,relatime - ext4 /dev/sda1 rw
+39 29 8:1 /var/lib/docker/volumes/duduclaw-protected-key/_data /var/lib/duduclaw-protected rw,relatime - ext4 /dev/sda1 rw
+37 29 8:1 /var/lib/docker/containers/abc/hostname /etc/hostname rw,relatime - ext4 /dev/sda1 rw
+";
+    let mut walked = Vec::new();
+    assert_eq!(check_mountinfo(Some(input), |path| {
+        Ok((false, path != std::path::Path::new("/etc/hostname")))
+    }, |path, _| {
+        walked.push(path.to_path_buf());
+        Ok(())
+    }), Ok(()));
+    assert_eq!(walked, ["/app/data", "/etc/hostname"].map(std::path::PathBuf::from));
+}
+
+#[cfg(unix)]
+#[test]
+fn protected_key_mount_is_skipped_exactly_and_other_unreadable_mounts_fail_closed() {
+    let protected = format!("{}{}", mount_line("/var/lib/duduclaw-protected"), mount_line("/app/data"));
+    let mut scanned = Vec::new();
+    assert_eq!(check_mountinfo(Some(&protected), |_| Ok((false, true)), |path, _| {
+        scanned.push(path.to_path_buf());
+        if path == std::path::Path::new("/app/data") { Ok(()) }
+        else { Err("mount_scan_incomplete") }
+    }), Ok(()));
+    assert_eq!(scanned, [std::path::PathBuf::from("/app/data")]);
+
+    for path in ["/var/lib/duduclaw-protected-extra", "/var/lib/duduclaw-protected/sub", "/other/unreadable"] {
+        let input = mount_line(path);
+        assert_eq!(check_mountinfo(Some(&input), |_| Ok((false, true)), |_, _| {
+            Err("mount_scan_incomplete")
+        }), Err("mount_scan_incomplete"), "{path}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mounted_directory_refuses_the_production_entry_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..=MOUNT_SCAN_ENTRIES {
+        std::fs::write(dir.path().join(format!("entry-{n}")), b"").unwrap();
+    }
+    assert_eq!(scan_tree(&tree_mount(dir.path()), MOUNT_SCAN_ENTRIES), Err("mount_scan_incomplete"));
 }
