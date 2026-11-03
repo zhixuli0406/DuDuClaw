@@ -145,6 +145,12 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
             .map_err(|e| io_err("import preserve MFA policy", e))?;
         pending.persist(home.join("config.toml"))
             .map_err(|e| io_err("import preserve MFA policy", e))?;
+        #[cfg(unix)]
+        File::open(home).and_then(|directory| directory.sync_all())
+            .map_err(|e| io_err("import preserve MFA policy directory sync", e))?;
+        #[cfg(not(unix))]
+        // Rename durability is best effort on non-Unix platforms.
+        let _ = home;
     }
     let file = File::open(archive).map_err(|e| io_err("import open", e))?;
     let dec = GzDecoder::new(file);

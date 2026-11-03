@@ -297,7 +297,7 @@ pub(crate) fn refuse_import_policy_change(home: &Path, after: &str, personal: bo
     let fallback = if absent { !personal } else { read_boot_policy_state(home)? };
     let current = if (absent && !personal)
         || table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() { fallback }
-        else { configured };
+        else { configured || (!absent && fallback) };
     let parsed_after = parse_policy(after)?;
     let after_table: toml::Table = after.parse().map_err(|_| "登入設定格式不正確。")?;
     let missing_key = after_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none();
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn mfa_keyless_agent_only_import_keeps_existing_policy_comparison() {
+    fn mfa_keyless_agent_only_import_allows_policy_increase_only() {
         for configured in [true, false] {
             let home = tempfile::tempdir().unwrap();
             std::fs::write(home.path().join("config.toml"), format!("[auth]\nmfa_enforced={configured}\n")).unwrap();
@@ -436,7 +436,15 @@ mod tests {
             let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
             duduclaw_auth::mfa::record_enforcement(&mut conn, !configured, 123).unwrap();
             for personal in [true, false] {
-                assert!(refuse_import_policy_change(home.path(), "", personal, false).is_err());
+                let result = refuse_import_policy_change(home.path(), "", personal, false);
+                if configured {
+                    assert!(result.is_err());
+                } else {
+                    let prepared = result.unwrap();
+                    if personal {
+                        assert!(parse_policy(&prepared).unwrap());
+                    }
+                }
             }
         }
     }
@@ -456,6 +464,29 @@ mod tests {
         let prepared = refuse_import_policy_change(home.path(), "", true, true).unwrap();
         assert!(parse_policy(&prepared).unwrap());
         assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+    }
+
+    #[test]
+    fn mfa_import_degraded_config_false_durable_true_uses_durable_floor() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+
+        for personal in [true, false] {
+            for replaces_identity in [true, false] {
+                assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=true\n", personal, replaces_identity).is_ok());
+                assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=false\n", personal, replaces_identity).is_err());
+            }
+        }
+        // Keyless imports follow the pre-existing table: identity replacement
+        // preserves the durable policy for personal imports; other imports refuse.
+        assert!(parse_policy(&refuse_import_policy_change(home.path(), "", true, true).unwrap()).unwrap());
+        let prepared = refuse_import_policy_change(home.path(), "", true, false).unwrap();
+        assert!(parse_policy(&prepared).unwrap());
+        assert!(refuse_import_policy_change(home.path(), "", false, true).is_err());
+        assert!(refuse_import_policy_change(home.path(), "", false, false).is_ok());
     }
 
     #[test]
