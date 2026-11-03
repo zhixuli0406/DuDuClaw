@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn downstream_guard_drop_panic_and_exact_two_hop_stop() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
@@ -27,16 +27,26 @@ async fn downstream_guard_drop_panic_and_exact_two_hop_stop() {
     assert_eq!(count(h, "s", "panic", "user:alice"), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn downstream_cleanup_must_confirm_before_stopped() {
     let home = tempfile::tempdir().unwrap();
     for confirmed in [true, false] {
         let guard = register(home.path(), Some("s"), Some("t"), None).unwrap().unwrap();
         let completion = guard.completion.clone();
         let hold = COMPLETION.scope(completion.clone(), async { cleanup_hold().unwrap() }).await;
+        let cancelled = guard.token.clone();
+        let cleanup = completion.clone();
         let task = tokio::spawn(async move { guard.run(std::future::pending::<()>()).await });
         let finish = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            // Resolve cleanup only after stop has requested cancellation.
+            // Virtual time preserves the 100 ms stop budget under host load.
+            cancelled.cancelled().await;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !cleanup.dropped.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("cancelled run did not drop its guard");
+            assert!(!cleanup.complete(), "unresolved cleanup was reported complete");
             hold.finish(confirmed);
         });
         let result = stop(home.path(), "s", "t", "user:a", Duration::from_millis(100), "test").await;

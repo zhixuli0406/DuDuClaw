@@ -1510,7 +1510,82 @@ impl D1Reply {
         }
     }
 }
+async fn assert_peer_closed(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let closed = stream.read(&mut [0u8; 1]).await;
+    assert!(
+        matches!(&closed, Ok(0)) || matches!(&closed, Err(error)
+            if matches!(error.kind(), std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted)),
+        "cancelled request must close its socket, got {closed:?}"
+    );
+}
+
+async fn cancel_after_wire<F: std::future::Future>(
+    call: F,
+    home: &std::path::Path,
+    hits: &std::sync::atomic::AtomicUsize,
+    cancelled: &std::sync::atomic::AtomicUsize,
+    stub: &tokio::task::JoinHandle<()>,
+    expected: usize,
+) {
+    let mut call = Box::pin(call);
+    let reached_wire = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let hits = hits.load(std::sync::atomic::Ordering::SeqCst);
+            if hits >= expected {
+                break;
+            }
+            assert!(!stub.is_finished(), "wire stub exited before expected HTTP request; hits={hits}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+    tokio::select! {
+        biased;
+        _ = &mut call => panic!("call completed before cancellation; expected request {expected}"),
+        ready = reached_wire => ready.unwrap_or_else(|_| panic!(
+            "expected HTTP request never reached wire; hits={}",
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+        )),
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expected);
+    // Freeze the operation's own 30 s deadline before dropping it. Otherwise
+    // a detached request could expire naturally and falsely prove cancellation.
+    tokio::time::pause();
+    let frozen = tokio::time::Instant::now();
+    // Drop the actual owned future (not just a pinned reference to it).
+    drop(call);
+    let cleanup = async {
+        while cancelled.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(!stub.is_finished(), "wire stub failed while observing cancellation");
+            tokio::task::yield_now().await;
+        }
+        crate::google_personal::grants::acquire(home).await
+    };
+    let wall_watchdog = async {
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(30) {
+            // Keep the runtime runnable so paused Tokio time cannot auto-advance.
+            tokio::task::yield_now().await;
+        }
+    };
+    let lease = tokio::select! {
+        result = cleanup => result.expect("effect lease acquisition failed after cancellation"),
+        _ = wall_watchdog => panic!(
+            "cancelled sender did not close its HTTP request and release its lease; hits={}, closed={}",
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        ),
+    };
+    assert_eq!(tokio::time::Instant::now(), frozen, "cancellation must not rely on deadline expiry");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expected,
+        "cancelled sender issued another HTTP request");
+    drop(lease);
+}
+
 struct D1Wire {
+    hold_until_cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<std::sync::atomic::AtomicUsize>,
     headers: Arc<std::sync::Mutex<Vec<String>>>,
     endpoint: String,
     hits: Arc<std::sync::atomic::AtomicUsize>,
@@ -1524,6 +1599,10 @@ impl Drop for D1Wire {
 }
 async fn d1_wire(respond: impl Fn(usize, &str) -> D1Reply + Send + Sync + 'static) -> D1Wire {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hold_until_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hold = hold_until_cancel.clone();
+    let cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer_closed = cancelled.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/", listener.local_addr().unwrap());
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1584,6 +1663,11 @@ async fn d1_wire(respond: impl Fn(usize, &str) -> D1Reply + Send + Sync + 'stati
                 String::from_utf8_lossy(&bytes[header_end..]).into_owned(),
             ));
             let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if hold.load(std::sync::atomic::Ordering::SeqCst) {
+                assert_peer_closed(&mut stream).await;
+                peer_closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
             let reply = respond(index, &target);
             if reply.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(reply.delay_ms)).await;
@@ -1608,6 +1692,8 @@ async fn d1_wire(respond: impl Fn(usize, &str) -> D1Reply + Send + Sync + 'stati
         }
     });
     D1Wire {
+        hold_until_cancel,
+        cancelled,
         headers,
         endpoint,
         hits,
@@ -1971,35 +2057,16 @@ async fn d1_invalid_args_and_missing_owned_fixture_never_resolve_material() {
 #[tokio::test]
 async fn d1_cancellation_drops_the_only_effect_lease_without_a_detached_sender() {
     let f = d1_fixture(false);
-    let wire = d1_wire(|_, _| D1Reply {
-        status: 200,
-        body: "{}".into(),
-        location: None,
-        delay_ms: 10000,
-        disconnect: false,
-    })
-    .await;
+    let wire = d1_wire(|_, _| D1Reply::json(serde_json::json!({}))).await;
+    wire.hold_until_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     let _fixture =
         crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
     let args = serde_json::json!({"message_id":"abc"});
     let pending = d1_pending(&f, "gmail_read", &args);
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            pending.execute_native(args)
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let lease = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        crate::google_personal::grants::acquire(f.home.path()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    drop(lease);
+    cancel_after_wire(
+        pending.execute_native(args),
+        f.home.path(), &wire.hits, &wire.cancelled, &wire.task, 1,
+    ).await;
     assert!(crate::google_workspace::native_call::testing::observations(f.home.path()).is_empty());
 }
 
@@ -2676,6 +2743,7 @@ async fn m1_changed_parsed_config_never_executes_or_switches_source() {
 
 struct M1Wire {
     endpoint: String,
+    cancelled: Arc<std::sync::atomic::AtomicUsize>,
     hits: Arc<std::sync::atomic::AtomicUsize>,
     requests: Arc<std::sync::Mutex<Vec<String>>>,
     mode: Arc<std::sync::atomic::AtomicUsize>,
@@ -2690,6 +2758,8 @@ impl Drop for M1Wire {
 }
 async fn m1_wire(sse: bool) -> M1Wire {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer_closed = cancelled.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2742,7 +2812,11 @@ async fn m1_wire(sse: bool) -> M1Wire {
             let method = frame["method"].as_str().unwrap();
             let mode = behavior.load(std::sync::atomic::Ordering::SeqCst);
             if mode == 3 {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // Keep the POST in flight until the caller drops it. A sleep
+                // could finish before a heavily loaded test gets to cancel.
+                assert_peer_closed(&mut stream).await;
+                peer_closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
             }
             let (status, body) = if mode == 1 {
                 (503, "{}".to_owned())
@@ -2835,6 +2909,7 @@ async fn m1_wire(sse: bool) -> M1Wire {
     });
     M1Wire {
         endpoint,
+        cancelled,
         hits,
         requests,
         mode,
@@ -2971,23 +3046,10 @@ async fn m1_cancelled_sender_drops_effect_lease_without_detached_http() {
     let wire = m1_wire(false).await;
     let registry = m1_registry(&f, &wire).await;
     wire.mode.store(3, std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            duduclaw_llm::ToolExecutor::call(&registry, "remote_tool", serde_json::json!({}))
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 4);
-    let lease = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        crate::google_personal::grants::acquire(f.home.path()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    drop(lease);
+    cancel_after_wire(
+        duduclaw_llm::ToolExecutor::call(&registry, "remote_tool", serde_json::json!({})),
+        f.home.path(), &wire.hits, &wire.cancelled, &wire.task, 4,
+    ).await;
 }
 #[tokio::test]
 async fn m1_owned_proxy_child() {

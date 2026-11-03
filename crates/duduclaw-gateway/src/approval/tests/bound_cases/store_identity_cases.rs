@@ -44,13 +44,50 @@ async fn legacy_schema_additive_migration_does_not_create_binding_or_execution()
     assert!(b.list_operations().await.unwrap().is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn begin_execution_waiting_for_sqlite_lock_cannot_cross_binding_ttl() {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+    use crate::approval::workflow_grants::authority_test_clock;
+
+    // SQLite's callback proves BEGIN IMMEDIATE actually encountered the writer.
+    // Advance only this run's authority clock there, then release the real lock.
+    // No expiry budget is consumed by fixture setup or scheduler delays.
+    type BlockedWriter = (Connection, Arc<Mutex<DateTime<Utc>>>, DateTime<Utc>);
+    thread_local! {
+        static WRITER: RefCell<Option<BlockedWriter>> = const { RefCell::new(None) };
+        static RELEASE: RefCell<Option<Result<(), String>>> = const { RefCell::new(None) };
+    }
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            WRITER.with(|slot| slot.borrow_mut().take());
+            RELEASE.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    fn expire_and_release(_attempt: i32) -> bool {
+        let Some((blocker, clock, expired)) = WRITER.with(|slot| slot.borrow_mut().take()) else {
+            return false;
+        };
+        // Never unwind through SQLite's C callback.
+        let result = clock.lock().map_err(|e| e.to_string()).and_then(|mut now| {
+            *now = expired;
+            blocker.execute_batch("ROLLBACK").map_err(|e| e.to_string())
+        });
+        let retry = result.is_ok();
+        RELEASE.with(|slot| *slot.borrow_mut() = Some(result));
+        retry
+    }
+
+    let _cleanup = Cleanup;
     let home = fixture();
     let payload = json!({"side_effect":"once"});
     let broker = ApprovalBroker::open(home.path()).unwrap();
     let mut bound = binding(home.path(), &payload, "workflow_v1");
-    bound.expires_at = (Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+    let now = Utc::now();
+    let expiry = now + chrono::Duration::hours(1);
+    bound.expires_at = expiry.to_rfc3339();
+    let clock = authority_test_clock::Guard::at(&bound.run_id, now);
     let id = broker
         .request_bound(
             RequestKind::Approval,
@@ -64,17 +101,18 @@ async fn begin_execution_waiting_for_sqlite_lock_cannot_cross_binding_ttl() {
     let operation = broker.prepare_operation(&id, "send", None).await.unwrap();
     broker.decide_bound(&id, &context(), true).await.unwrap();
     let claim = broker
-        .claim_operation(&operation, &bound, "runner", 30)
+        .claim_operation(&operation, &bound, "runner", 300)
         .await
         .unwrap();
     let blocker = Connection::open(home.path().join("approvals.db")).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(2300));
-        blocker.execute_batch("ROLLBACK").unwrap();
-    });
-    assert!(broker.begin_execution(&claim, &bound).await.is_err());
-    release.join().unwrap();
+    WRITER.with(|slot| *slot.borrow_mut() = Some((blocker, clock.clock.clone(), expiry)));
+    broker.store.conn.lock().await.busy_handler(Some(expire_and_release)).unwrap();
+    let result = broker.begin_execution(&claim, &bound).await;
+    broker.store.conn.lock().await.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let released = RELEASE.with(|slot| slot.borrow_mut().take());
+    assert_eq!(released, Some(Ok(())), "execution must hit the real SQLite writer lock before expiry: {result:?}");
+    assert_eq!(result.unwrap_err(), "human operation authority revoked or expired");
     assert_eq!(
         broker.list_operations().await.unwrap()[0].state,
         OperationState::Prepared

@@ -4154,8 +4154,10 @@ mod tests {
         duduclaw_core::autonomy_gate::resume(&tmp, Some("a1")).unwrap();
         engine.create_os_watch_goal("a1", "work", None).await.unwrap();
         assert_eq!(engine.task_store.list_tasks(None, None, None).await.unwrap().len(), 1);
+        // Windows refuses cleanup while the engine's SQLite handles are open.
         drop(engine);
-        std::fs::remove_dir_all(&tmp).unwrap();
+        std::fs::remove_dir_all(&tmp)
+            .unwrap_or_else(|error| panic!("cleanup after dropping OS-goal engine at {tmp:?}: {error}"));
     }
 
     #[tokio::test]
@@ -4180,7 +4182,8 @@ mod tests {
         drop(engine);
         drop(screener);
         drop(mq);
-        std::fs::remove_dir_all(&tmp).unwrap();
+        std::fs::remove_dir_all(&tmp)
+            .unwrap_or_else(|error| panic!("cleanup after dropping rule engine and queue at {tmp:?}: {error}"));
     }
 
     #[tokio::test]
@@ -4199,7 +4202,7 @@ mod tests {
                     who: "operator".into(),
                     at: chrono::Utc::now().to_rfc3339(),
                 })).await;
-                assert!(matches!(outcome, MutationOutcome::Applied(_)));
+                assert!(matches!(outcome, MutationOutcome::Applied(_)), "pause failed before handoff: {outcome:?}");
                 duduclaw_core::autonomy_handoff::admit().await?.handed_off();
                 self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok("YES".into())
@@ -4228,7 +4231,8 @@ mod tests {
             drop(engine);
             drop(screener);
             drop(_queue);
-            std::fs::remove_dir_all(&tmp).unwrap();
+            std::fs::remove_dir_all(&tmp)
+                .unwrap_or_else(|error| panic!("cleanup after dropping screen engine and queue at {tmp:?}, paused={paused:?}: {error}"));
         }
     }
 

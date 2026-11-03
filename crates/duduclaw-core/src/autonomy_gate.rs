@@ -593,6 +593,40 @@ fn admission_timeout(home: &Path) -> io::Error {
     )
 }
 
+#[cfg(feature = "autonomy-gate-test-hooks")]
+static CONTENTION_OBSERVERS: OnceLock<Mutex<HashMap<PathBuf, std::sync::mpsc::Sender<()>>>> = OnceLock::new();
+
+/// One-shot, home-scoped observation of an exclusive lock's actual contention.
+/// This does not change the lock result, retry interval, or production deadline.
+#[cfg(feature = "autonomy-gate-test-hooks")]
+pub struct AdmissionContentionObserver {
+    home: PathBuf,
+    receiver: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(feature = "autonomy-gate-test-hooks")]
+impl AdmissionContentionObserver {
+    pub fn try_recv(&self) -> Result<(), std::sync::mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+#[cfg(feature = "autonomy-gate-test-hooks")]
+impl Drop for AdmissionContentionObserver {
+    fn drop(&mut self) {
+        CONTENTION_OBSERVERS.get_or_init(Default::default).lock().unwrap().remove(&self.home);
+    }
+}
+
+#[cfg(feature = "autonomy-gate-test-hooks")]
+pub fn observe_admission_contention_for_test(home: &Path) -> AdmissionContentionObserver {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let previous = CONTENTION_OBSERVERS.get_or_init(Default::default).lock().unwrap()
+        .insert(home.to_path_buf(), sender);
+    assert!(previous.is_none(), "duplicate admission observer for {home:?}");
+    AdmissionContentionObserver { home: home.to_path_buf(), receiver }
+}
+
 fn lock_admission(
     home: &Path,
     exclusive: bool,
@@ -617,6 +651,12 @@ fn lock_admission(
                 if error.kind() == io::ErrorKind::WouldBlock
                     || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
             Err(error) => return Err(error),
+        }
+        #[cfg(feature = "autonomy-gate-test-hooks")]
+        if exclusive {
+            if let Some(observer) = CONTENTION_OBSERVERS.get_or_init(Default::default).lock().unwrap().remove(home) {
+                let _ = observer.send(());
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Err(admission_timeout(home));

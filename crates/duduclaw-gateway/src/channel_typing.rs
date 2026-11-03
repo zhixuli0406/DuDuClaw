@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn guard_fires_and_stops_on_drop() {
         let count = Arc::new(AtomicU32::new(0));
         let c = count.clone();
@@ -220,7 +220,13 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         });
-        tokio::time::sleep(Duration::from_millis(35)).await;
+        // Observe actual refreshes while Tokio advances its virtual clock.
+        // A wall-clock sleep does not guarantee the task was scheduled.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while count.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("typing loop never produced two refreshes");
         drop(guard);
         let at_drop = count.load(Ordering::SeqCst);
         assert!(at_drop >= 2, "expected ≥2 refreshes, got {at_drop}");

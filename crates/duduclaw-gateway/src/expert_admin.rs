@@ -780,32 +780,40 @@ mod tests {
             home.path(), "pack-agent", duduclaw_core::autonomy_gate::AutonomyPath::Background,
         ).await.unwrap();
         timeline.mark("holder acquired");
-        let (release, released) = tokio::sync::oneshot::channel::<()>();
-        timeline.mark("spawn holder");
-        let holder_timeline = timeline.clone();
-        // The holder must not depend on the blocking pool the removal is waiting in.
-        let holder = tokio::spawn(async move {
-            holder_timeline.mark("holder task started");
-            released.await.unwrap();
-            drop(held);
-            holder_timeline.mark("release done");
-        });
+        let contention = duduclaw_core::autonomy_gate::observe_admission_contention_for_test(home.path());
         let removing_home = home.path().to_path_buf();
         let removing_timeline = timeline.clone();
-        let mut removing = tokio::spawn(async move {
+        let removing = tokio::spawn(async move {
             removing_timeline.mark("removal start");
             let result = remove_pack(&removing_home, "demo").await;
             removing_timeline.mark("removal done");
             result
         });
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut removing).await.is_err());
+        // A pending JoinHandle alone could mean the blocking worker never ran.
+        // Wait until the real barrier has tried, and failed, to take its lock.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match contention.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(error) => panic!("admission contention observer disconnected: {error}"),
+            }
+            assert!(!removing.is_finished(), "removal completed before observing admission contention");
+            assert!(tokio::time::Instant::now() < deadline, "removal never reached its admission barrier within 30s");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        timeline.mark("removal barrier contended");
+        assert!(!removing.is_finished(), "removal completed while the admission was still held");
         assert!(agent_dir.join("agent.toml").is_file());
         assert!(read_record(home.path(), "demo").is_some());
-        timeline.mark("release signal");
-        release.send(()).unwrap();
-        holder.await.unwrap();
-        let items = tokio::time::timeout(std::time::Duration::from_secs(5), removing)
-            .await.unwrap().unwrap().unwrap();
+        // Release synchronously: neither a Tokio task nor its blocking pool
+        // needs to be scheduled before the waiter can make progress.
+        drop(held);
+        timeline.mark("release done");
+        let items = tokio::time::timeout(std::time::Duration::from_secs(30), removing)
+            .await.expect("removal did not finish within 30s after admission release")
+            .expect("removal task panicked")
+            .expect("removal failed after admission release");
         assert!(items.iter().any(|item| item.kind == "agent" && item.status == "removed"));
         assert!(!agent_dir.exists());
     }

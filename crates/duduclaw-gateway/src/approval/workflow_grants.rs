@@ -522,6 +522,9 @@ impl ApprovalBroker {
             "bound_human_approval"
                 if !approval.is_empty() && grant.is_none() && epoch.is_none() && hash.is_none() =>
             {
+                let now = Utc::now();
+                #[cfg(test)]
+                let now = authority_test_clock::now(&binding.run_id).unwrap_or(now);
                 let valid: bool = tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM main.approvals WHERE id=?1 AND request_kind='approval'
@@ -531,7 +534,7 @@ impl ApprovalBroker {
                         params![
                             approval,
                             serde_json::to_string(binding).map_err(|e| e.to_string())?,
-                            Utc::now().to_rfc3339()
+                            now.to_rfc3339()
                         ],
                         |r| r.get(0)
                     )
@@ -650,3 +653,37 @@ impl ApprovalBroker {
 }
 
 mod revision_grants;
+
+// A run-scoped clock for observing expiry at the real transaction boundary.
+// Only test builds can register one; unrelated concurrent tests keep real time.
+#[cfg(test)]
+pub(super) mod authority_test_clock {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use chrono::{DateTime, Utc};
+
+    type Clock = Arc<Mutex<DateTime<Utc>>>;
+    fn clocks() -> &'static Mutex<HashMap<String, Clock>> {
+        static CLOCKS: OnceLock<Mutex<HashMap<String, Clock>>> = OnceLock::new();
+        CLOCKS.get_or_init(Default::default)
+    }
+    pub(in crate::approval) struct Guard {
+        run_id: String,
+        pub(in crate::approval) clock: Clock,
+    }
+    impl Guard {
+        pub(in crate::approval) fn at(run_id: &str, now: DateTime<Utc>) -> Self {
+            let clock = Arc::new(Mutex::new(now));
+            assert!(clocks().lock().unwrap().insert(run_id.into(), clock.clone()).is_none());
+            Self { run_id: run_id.into(), clock }
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            clocks().lock().unwrap().remove(&self.run_id);
+        }
+    }
+    pub(super) fn now(run_id: &str) -> Option<DateTime<Utc>> {
+        clocks().lock().unwrap().get(run_id).map(|clock| *clock.lock().unwrap())
+    }
+}

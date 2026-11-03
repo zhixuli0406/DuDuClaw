@@ -37,6 +37,7 @@ async fn seed_stored_cost(home: &Path, telemetry: &CostTelemetry, cost: u64) {
 }
 
 async fn assert_home_scoped_costs() {
+    eprintln!("digest scope: child entered owned fixture");
     let root = tempfile::tempdir().unwrap();
     let a = root.path().join("global-a");
     let b = root.path().join("資料乙");
@@ -44,24 +45,31 @@ async fn assert_home_scoped_costs() {
     for home in [&a, &b, &bad] {
         std::fs::create_dir(home).unwrap();
     }
+    eprintln!("digest scope: initializing global telemetry in A");
     crate::cost_telemetry::init_telemetry(&a).unwrap();
     let global_a = crate::cost_telemetry::get_telemetry().unwrap();
+    eprintln!("digest scope: seeding A");
     seed_stored_cost(&a, global_a, 17).await;
     let now = Utc::now();
     let since = now - chrono::Duration::hours(24);
 
+    eprintln!("digest scope: collecting A");
     assert_eq!(collect(&a, since, now).await.cost_millicents, 17);
     let missing_cost = b.join("cost_telemetry.db");
     assert!(!missing_cost.exists());
+    eprintln!("digest scope: collecting missing B");
     assert!(collect(&b, since, now).await.is_empty());
     assert!(
         !missing_cost.exists(),
         "digest reads must not create an absent cost database"
     );
 
+    eprintln!("digest scope: initializing and seeding B");
     let own_b = CostTelemetry::new(&missing_cost).unwrap();
     seed_stored_cost(&b, &own_b, 43).await;
+    eprintln!("digest scope: collecting populated B");
     assert_eq!(collect(&b, since, now).await.cost_millicents, 43);
+    eprintln!("digest scope: collecting A");
     assert_eq!(collect(&a, since, now).await.cost_millicents, 17);
     assert_eq!(
         crate::cost_telemetry::get_telemetry()
@@ -77,8 +85,10 @@ async fn assert_home_scoped_costs() {
     let bad_path = bad.join("cost_telemetry.db");
     let original = b"owned malformed ledger";
     std::fs::write(&bad_path, original).unwrap();
+    eprintln!("digest scope: collecting malformed ledger");
     assert_eq!(collect(&bad, since, now).await.cost_millicents, 0);
     assert_eq!(std::fs::read(&bad_path).unwrap(), original);
+    eprintln!("digest scope: all assertions completed");
 }
 
 #[test]
@@ -140,6 +150,7 @@ fn digest_costs_stay_with_the_requested_home_when_global_telemetry_is_elsewhere(
         }
     }
     let mut child = command.spawn().unwrap();
+    let child_id = child.id();
     let deadline = std::time::Instant::now() + CHILD_WAIT;
     let mut timed_out = false;
     let status = loop {
@@ -159,7 +170,7 @@ fn digest_costs_stay_with_the_requested_home_when_global_telemetry_is_elsewhere(
     let stderr = std::fs::read_to_string(stderr_path).unwrap();
     assert!(
         !timed_out,
-        "isolated digest scope exceeded {CHILD_WAIT:?}: {stdout} {stderr}"
+        "isolated digest scope child {child_id} exceeded {CHILD_WAIT:?}: {stdout} {stderr}"
     );
     assert!(
         stdout.lines().any(|line| line == "running 1 test"),

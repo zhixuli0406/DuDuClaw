@@ -231,7 +231,7 @@ async fn malformed_control_legacy_missing_token_and_residual_payload_never_prove
             "{kind}"
         );
         assert_eq!(raw(d.path()), before, "{kind}");
-        assert_eq!(probe.counts(), [0, 0]);
+        assert_eq!(probe.counts(), [0, 0], "{kind}: presence inspection must not decrypt or contact a provider");
         assert!(!d.path().join(".keyfile").exists());
     }
 }
