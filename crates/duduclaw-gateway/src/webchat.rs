@@ -1096,49 +1096,64 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     .filter(|s| !s.is_empty());
                                 let requested_agent: Option<String> = match requested_agent {
                                     Some(name) => {
-                                        let exists = {
-                                            let reg = state.ctx.registry.read().await;
-                                            reg.get(name).is_some()
-                                        };
-                                        if !exists {
-                                            let err = ChatMessage::error(format!("unknown agent: {name}"));
-                                            if let Ok(json) = serde_json::to_string(&err) {
-                                                let _ = sink.send(Message::Text(json.into())).await;
+                                        // For an owned old conversation, first resolve its stored
+                                        // partner below. Only that verified partner may disclose
+                                        // the main-specific refusal, even if the client names it.
+                                        let owned_resume = custom_session.as_deref()
+                                            .map(str::trim)
+                                            .filter(|sid| !sid.is_empty() && *sid != session_id)
+                                            .is_some_and(|sid| owns_webchat_session(sid, &owner_tag));
+                                        let defer_to_stored_partner = owned_resume
+                                            && !is_widget_visitor(&auth_user)
+                                            && !matches!(state.acl_snapshot(&auth_user).await,
+                                                Ok(s) if s.role() == duduclaw_auth::UserRole::Admin);
+                                        if !defer_to_stored_partner {
+                                            let exists = {
+                                                let reg = state.ctx.registry.read().await;
+                                                reg.get(name).is_some()
+                                            };
+                                            if !exists {
+                                                warn!(user = %auth_user, agent = %name, "WebChat target unavailable: unknown agent");
+                                                let err = state.target_error(&auth_user,
+                                                    ChatMessage::error(format!("unknown agent: {name}"))).await;
+                                                if let Ok(json) = serde_json::to_string(&err) {
+                                                    let _ = sink.send(Message::Text(json.into())).await;
+                                                }
+                                                continue;
                                             }
-                                            continue;
-                                        }
-                                        // ── C-ACL (P0-S1, 2026-08 audit): explicit
-                                        // agent selection was previously gated on
-                                        // NOTHING beyond "does this agent exist" —
-                                        // any logged-in user (employee, manager)
-                                        // could address any agent by name. Admins
-                                        // pass unconditionally; everyone else must
-                                        // hold a binding (any access level — see
-                                        // `acl_allows_agent`). Checked per-message
-                                        // (every `user_message` frame re-resolves
-                                        // it), which is also what bounds the
-                                        // "unbind but JWT keeps stale
-                                        // access_levels" staleness window to
-                                        // `ACL_CACHE_TTL` instead of the JWT's full
-                                        // lifetime. The default path below resolves
-                                        // non-admins from their current assignment.
-                                        if let Err(frame) = state.authorize_target(&auth_user, name, false).await {
-                                            sink.frame(frame).await;
-                                            continue;
-                                        }
-                                        if !state.agent_access_allowed(&auth_user, name).await {
-                                            warn!(
-                                                user = %auth_user, agent = %name,
-                                                "WebChat agent selection denied: not admin and not bound"
-                                            );
-                                            let err = ChatMessage::error_coded(
-                                                "你沒有與此 AI 員工對話的權限，請聯絡管理員",
-                                                "agent_forbidden",
-                                            );
-                                            if let Ok(json) = serde_json::to_string(&err) {
-                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            // ── C-ACL (P0-S1, 2026-08 audit): explicit
+                                            // agent selection was previously gated on
+                                            // NOTHING beyond "does this agent exist" —
+                                            // any logged-in user (employee, manager)
+                                            // could address any agent by name. Admins
+                                            // pass unconditionally; everyone else must
+                                            // hold a binding (any access level — see
+                                            // `acl_allows_agent`). Checked per-message
+                                            // (every `user_message` frame re-resolves
+                                            // it), which is also what bounds the
+                                            // "unbind but JWT keeps stale
+                                            // access_levels" staleness window to
+                                            // `ACL_CACHE_TTL` instead of the JWT's full
+                                            // lifetime. The default path below resolves
+                                            // non-admins from their current assignment.
+                                            if let Err(frame) = state.authorize_target(&auth_user, name, false).await {
+                                                sink.frame(frame).await;
+                                                continue;
                                             }
-                                            continue;
+                                            if !state.agent_access_allowed(&auth_user, name).await {
+                                                warn!(
+                                                    user = %auth_user, agent = %name,
+                                                    "WebChat agent selection denied: not admin and not bound"
+                                                );
+                                                let err = state.target_error(&auth_user, ChatMessage::error_coded(
+                                                    "你沒有與此 AI 員工對話的權限，請聯絡管理員",
+                                                    "agent_forbidden",
+                                                )).await;
+                                                if let Ok(json) = serde_json::to_string(&err) {
+                                                    let _ = sink.send(Message::Text(json.into())).await;
+                                                }
+                                                continue;
+                                            }
                                         }
                                         Some(name.to_string())
                                     }
@@ -1216,7 +1231,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                                     match state.ctx.session_manager.session_agent(&want).await {
                                         Ok(Some(stored_agent)) => {
-                                            if let Err(frame) = state.authorize_target(&auth_user, &stored_agent, true).await {
+                                            if let Err(frame) = state.authorize_resume_target(&auth_user, &stored_agent).await {
                                                 sink.frame(frame).await;
                                                 continue;
                                             }
@@ -1232,6 +1247,16 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                     }
                                                     continue;
                                                 }
+                                            }
+                                            if requested_agent.is_some()
+                                                && !state.agent_access_allowed(&auth_user, &stored_agent).await
+                                            {
+                                                warn!(user = %auth_user, agent = %stored_agent,
+                                                    "WebChat resume explicit selection denied");
+                                                sink.frame(state.target_error(&auth_user, ChatMessage::error_coded(
+                                                    "你沒有與此 AI 員工對話的權限，請聯絡管理員", "agent_forbidden",
+                                                )).await).await;
+                                                continue;
                                             }
                                             // Route to the session's true owner. The
                                             // main/default agent keeps the
@@ -1264,10 +1289,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                         user = %auth_user, agent = %stored_agent,
                                                         "WebChat resume denied: agent binding revoked since session was stored"
                                                     );
-                                                    let err = ChatMessage::error_coded(
+                                                    let err = state.target_error(&auth_user, ChatMessage::error_coded(
                                                         "你沒有與此 AI 員工對話的權限，請聯絡管理員",
                                                         "agent_forbidden",
-                                                    );
+                                                    )).await;
                                                     if let Ok(json) = serde_json::to_string(&err) {
                                                         let _ = sink.send(Message::Text(json.into())).await;
                                                     }

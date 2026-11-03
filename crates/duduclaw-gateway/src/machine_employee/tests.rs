@@ -152,11 +152,12 @@ async fn queued_work_rechecks_even_internal_senders_and_record_mode() {
         f.home.path(), &f.registry, None, None, "default", "alias-row", "sqlite_queue", Some(&principal),
     );
     assert!(matches!(gate_default().await, crate::delegation_gate::GateOutcome::Deny(_)));
-    // Same main-role alias after unbinding the machine preset is normal work.
+    // Unbinding the machine preset does not lift the independent main-role
+    // restriction for a non-Admin dashboard principal.
     let bindings = f.home.path().join("preset_bindings.toml");
     std::fs::write(bindings, "schema = 1\n").unwrap();
     f.registry.write().await.scan().await.unwrap();
-    assert!(!matches!(gate_default().await, crate::delegation_gate::GateOutcome::Deny(_)));
+    assert!(matches!(gate_default().await, crate::delegation_gate::GateOutcome::Deny(_)));
     assert!(check_target(f.home.path(), "eph-normal", Some(&principal)).is_ok(),
         "ordinary ephemeral targets keep the existing admission and identity checks");
 }

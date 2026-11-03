@@ -32,6 +32,12 @@ fn home_with_queue() -> TempDir {
     tmp
 }
 
+fn account_principal(home: &std::path::Path, name: &str, role: duduclaw_auth::UserRole) -> String {
+    let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+    let user = db.create_user(&format!("{name}@test.local"), name, "TeamPass-12345", role).unwrap();
+    format!("user:{}", user.id)
+}
+
 fn queued_principal(home: &std::path::Path) -> Vec<Option<String>> {
     let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
     let mut stmt = conn
@@ -64,7 +70,8 @@ async fn send_to_agent_stamps_the_host_principal_and_ignores_arguments() {
     let _lock = OBO_LOCK.lock().await;
     let tmp = home_with_queue();
     let home = tmp.path();
-    let _host = HostPrincipal::set("user:u-emp1");
+    let principal = account_principal(home, "employee", duduclaw_auth::UserRole::Employee);
+    let _host = HostPrincipal::set(&principal);
     let params = serde_json::json!({
         "agent_id": "worker",
         "prompt": "整理報價單",
@@ -74,7 +81,7 @@ async fn send_to_agent_stamps_the_host_principal_and_ignores_arguments() {
     assert!(result.get("isError").is_none(), "{result}");
     assert_eq!(
         queued_principal(home),
-        vec![Some("user:u-emp1".to_string())]
+        vec![Some(principal)]
     );
 }
 
@@ -97,11 +104,8 @@ async fn a_system_sender_name_is_refused_as_a_principal() {
     let _host = HostPrincipal::set("user:dashboard");
     let params = serde_json::json!({ "agent_id": "worker", "prompt": "x" });
     let result = send_to_agent_with_ctx(&params, home, "main", ctx()).await;
-    assert!(result.get("isError").is_none(), "{result}");
-    use duduclaw_gateway::on_behalf_of::PrincipalState;
-    let carried = queued_principal(home);
-    assert_eq!(carried, vec![PrincipalState::Unknown.to_wire()], "a rejected principal stays unknown, never background work");
-    assert_eq!(PrincipalState::from_wire(carried[0].as_deref()), PrincipalState::Unknown);
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(queued_principal(home).is_empty(), "unknown authority is refused before queueing");
     assert_eq!(duduclaw_core::host_principal_checked().unwrap_err().reason, "system_sender");
     assert!(duduclaw_core::host_principal().is_none());
 }
@@ -127,7 +131,8 @@ async fn tasks_create_records_the_principal_from_the_host_only() {
     let tmp = TempDir::new();
     let home = tmp.path();
     create_test_agent(&home.join("agents"), "agnes", "");
-    let _host = HostPrincipal::set("user:u-mgr");
+    let principal = account_principal(home, "manager", duduclaw_auth::UserRole::Manager);
+    let _host = HostPrincipal::set(&principal);
     let args = serde_json::json!({
         "title": "追款",
         "assigned_to": "agnes",
@@ -138,7 +143,7 @@ async fn tasks_create_records_the_principal_from_the_host_only() {
     assert!(result.get("isError").is_none(), "{result}");
     let store = duduclaw_gateway::task_store::TaskStore::open(home).unwrap();
     let rows = store
-        .list_by_principal("user:u-mgr", false, 10)
+        .list_by_principal(&principal, false, 10)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1, "{result}");
@@ -238,8 +243,9 @@ async fn spawn_ephemeral_carries_host_principal_through_admission_replay() {
         "instruction": "Read the report.", "context": "Review the report.", "tools": ["Read"],
         "on_behalf_of": "user:forged",
     });
+    let principal = account_principal(home, "owner", duduclaw_auth::UserRole::Admin);
     {
-        let _host = HostPrincipal::set("user:owner");
+        let _host = HostPrincipal::set(&principal);
         for _ in 0..2 {
             let result = spawn_ephemeral_with_ctx_and_upstream(
                 &args, home, "main", ctx(),
@@ -250,7 +256,7 @@ async fn spawn_ephemeral_carries_host_principal_through_admission_replay() {
     }
     let bus = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
     let first: serde_json::Value = serde_json::from_str(bus.trim()).unwrap();
-    assert_eq!(first["on_behalf_of"], "user:owner");
+    assert_eq!(first["on_behalf_of"], principal);
     let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(
         home, first["agent_id"].as_str().unwrap(),
     ).unwrap();
@@ -258,7 +264,220 @@ async fn spawn_ephemeral_carries_host_principal_through_admission_replay() {
     assert_eq!(duduclaw_gateway::ephemeral::drain_admission_queue(home).await.admitted, 1);
     let bus = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
     let replayed: serde_json::Value = serde_json::from_str(bus.lines().last().unwrap()).unwrap();
-    assert_eq!(replayed["on_behalf_of"], "user:owner", "the sweeper has no host principal");
+    assert_eq!(replayed["on_behalf_of"], principal, "the sweeper has no host principal");
     assert_eq!(replayed["turn_id"], "origin-turn");
     assert_eq!(replayed["session_id"], "webchat:owner#agent:main");
+}
+
+
+#[tokio::test]
+async fn non_admin_scheduled_work_preserves_host_principal_and_only_refuses_main_targets() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    create_test_agent(&home.join("agents"), "configured", "main");
+    let path = home.join("agents/main/agent.toml");
+    fs::write(&path, fs::read_to_string(&path).unwrap().replace("role = \"specialist\"", "role = \"main\"")).unwrap();
+    fs::write(home.join("config.toml"), "[general]\ndefault_agent = \"configured\"\n[delegation]\nhuman_principal = \"record\"\n").unwrap();
+    let principal = account_principal(home, "employee", duduclaw_auth::UserRole::Employee);
+    let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+    for target in ["worker", "main", "configured"] {
+        db.bind_agent(principal.strip_prefix("user:").unwrap(), target, duduclaw_auth::AccessLevel::Owner).unwrap();
+    }
+    let _host = HostPrincipal::set(&principal);
+    let cron = handle_schedule_task(&serde_json::json!({
+        "agent_id":"worker", "cron":"0 9 * * *", "task":"daily report",
+        "on_behalf_of":"user:forged"
+    }), home, "worker").await;
+    assert_ne!(cron["isError"], true, "{cron}");
+    let rows = duduclaw_gateway::cron_store::CronStore::open(home).unwrap().list_all().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].on_behalf_of.as_deref(), Some(principal.as_str()));
+    let reminder = handle_create_reminder(&serde_json::json!({
+        "agent_id":"worker", "mode":"agent_callback", "prompt":"daily report",
+        "time":"1h", "channel":"line", "chat_id":"test-chat", "on_behalf_of":"user:forged"
+    }), home, RecordActor::Agent("worker")).await;
+    assert_ne!(reminder["isError"], true, "{reminder}");
+    let rows = duduclaw_gateway::reminder_scheduler::list_reminders(home, None, Some("worker")).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].on_behalf_of.as_deref(), Some(principal.as_str()));
+    let spec = handle_create_task(&serde_json::json!({
+        "goal":"daily report", "steps":[{"description":"do work"}], "on_behalf_of":"user:forged"
+    }), home, "worker").await;
+    assert_ne!(spec["isError"], true, "{spec}");
+    let dir = home.join("agents/worker");
+    let ids = duduclaw_gateway::task_spec::TaskSpec::list(&dir);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(duduclaw_gateway::task_spec::TaskSpec::load(&dir, &ids[0]).unwrap().on_behalf_of.as_deref(), Some(principal.as_str()));
+    for target in ["main", "configured", "default"] {
+        for kind in ["task", "goal"] {
+            let result = crate::mcp::caller_shims::handle_tasks_create(
+                &serde_json::json!({"title":"refuse main work","kind":kind,"assigned_to":target}), home, "worker",
+            ).await;
+            assert_eq!(result["isError"], true, "{target} {kind}: {result}");
+        }
+        let cron = handle_schedule_task(&serde_json::json!({
+            "agent_id":target, "cron":"0 9 * * *", "task":"main work"
+        }), home, "worker").await;
+        assert_eq!(cron["isError"], true, "{target}: {cron}");
+        let reminder = handle_create_reminder(&serde_json::json!({
+            "agent_id":target, "mode":"agent_callback", "prompt":"main work",
+            "time":"1h", "channel":"line", "chat_id":"test-chat"
+        }), home, RecordActor::Agent(target)).await;
+        assert_eq!(reminder["isError"], true, "{target}: {reminder}");
+        let spec = handle_create_task(&serde_json::json!({
+            "goal":"main work", "steps":[{"description":"do work", "agent":target}]
+        }), home, "worker").await;
+        assert_eq!(spec["isError"], true, "{target}: {spec}");
+        let discovery = handle_discovery_create(
+            &serde_json::json!({"title":"discovery", "assigned_to":target}), home, "worker",
+        ).await;
+        assert_eq!(discovery["isError"], true, "{target}: {discovery}");
+        assert!(discovery["content"][0]["text"].as_str().unwrap().contains("主代理"));
+    }
+    // Ordinary targets reach the unchanged signed-caller gate, not a blanket refusal.
+    for discovery in [
+        handle_discovery_create(&serde_json::json!({"title":"discovery"}), home, "worker").await,
+        crate::mcp::caller_shims::handle_tasks_create(
+            &serde_json::json!({"kind":"discovery", "title":"discovery"}), home, "worker",
+        ).await,
+    ] {
+        assert_eq!(discovery["isError"], true, "{discovery}");
+        assert!(discovery["content"][0]["text"].as_str().unwrap().contains("identity"), "{discovery}");
+    }
+}
+
+#[tokio::test]
+async fn detached_target_gate_preserves_background_admin_and_unmapped_semantics() {
+    use duduclaw_gateway::on_behalf_of::access::check_main_target;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    fs::write(home.join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    assert!(check_main_target(home, None, "main").await.is_ok());
+    assert!(check_main_target(home, Some("unmapped:line:0123456789abcdef"), "main").await.is_ok());
+    let admin = account_principal(home, "owner", duduclaw_auth::UserRole::Admin);
+    assert!(check_main_target(home, Some(&admin), "main").await.is_ok());
+    let employee = account_principal(home, "employee", duduclaw_auth::UserRole::Employee);
+    assert!(check_main_target(home, Some(&employee), "main").await.is_err());
+    assert!(check_main_target(home, Some(&employee), "worker").await.is_ok());
+}
+
+
+#[tokio::test]
+async fn non_admin_task_update_cannot_retarget_or_erase_the_human_origin() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    fs::write(home.join("config.toml"), "[general]\ndefault_agent = \"main\"\n").unwrap();
+    let principal = account_principal(home, "employee", duduclaw_auth::UserRole::Employee);
+    let store = duduclaw_gateway::task_store::TaskStore::open(home).unwrap();
+    for (id, authority) in [("own", Some(principal.clone())), ("background", None)] {
+        let mut row = duduclaw_gateway::task_store::TaskRow::new(
+            id.into(), "work".into(), "original".into(), "medium".into(), "worker".into(), "worker".into(),
+        );
+        row.on_behalf_of = authority;
+        store.insert_task(&row).await.unwrap();
+    }
+    let _host = HostPrincipal::set(&principal);
+    for args in [
+        serde_json::json!({"task_id":"own", "assigned_to":"main"}),
+        serde_json::json!({"task_id":"background", "description":"delegate to main"}),
+    ] {
+        let result = handle_tasks_update(&args, home, RecordActor::Agent("worker")).await;
+        assert_eq!(result["isError"], true, "{result}");
+    }
+    assert_eq!(store.get_task("own").await.unwrap().unwrap().assigned_to, "worker");
+    assert_eq!(store.get_task("background").await.unwrap().unwrap().description, "original");
+    let result = handle_tasks_update(&serde_json::json!({"task_id":"own", "description":"ordinary update"}),
+        home, RecordActor::Agent("worker")).await;
+    assert_ne!(result["isError"], true, "{result}");
+    assert_eq!(store.get_task("own").await.unwrap().unwrap().on_behalf_of, Some(principal));
+}
+
+
+#[tokio::test]
+async fn non_admin_can_resume_legacy_worker_cron_and_records_the_host_principal() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+    let row = duduclaw_gateway::cron_store::CronTaskRow::new(
+        "legacy".into(), "old routine".into(), "worker".into(), "0 9 * * *".into(), "work".into(),
+    );
+    store.insert(&row).await.unwrap();
+    let principal = account_principal(home, "employee", duduclaw_auth::UserRole::Employee);
+    let _host = HostPrincipal::set(&principal);
+    let paused = handle_pause_cron_task(&serde_json::json!({"id":"legacy", "enabled":false}),
+        home, RecordActor::Agent("worker")).await;
+    assert_ne!(paused["isError"], true, "{paused}");
+    assert!(!store.get("legacy").await.unwrap().unwrap().enabled);
+    for enabled in [serde_json::json!(true), serde_json::json!("true")] {
+        let resumed = handle_pause_cron_task(&serde_json::json!({"id":"legacy", "enabled":enabled}),
+            home, RecordActor::Agent("worker")).await;
+        assert_ne!(resumed["isError"], true, "{resumed}");
+        let row = store.get("legacy").await.unwrap().unwrap();
+        assert!(row.enabled);
+        assert_eq!(row.on_behalf_of.as_deref(), Some(principal.as_str()));
+    }
+    let removed = handle_delete_cron_task(&serde_json::json!({"id":"legacy"}),
+        home, RecordActor::Agent("worker")).await;
+    assert_ne!(removed["isError"], true, "{removed}");
+    assert!(store.get("legacy").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn admin_can_still_create_main_cron_callback_and_taskspec() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    fs::write(home.join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    let principal = account_principal(home, "admin", duduclaw_auth::UserRole::Admin);
+    let _host = HostPrincipal::set(&principal);
+    let cron = handle_schedule_task(&serde_json::json!({
+        "agent_id":"main", "cron":"0 9 * * *", "task":"daily report"
+    }), home, "main").await;
+    assert_ne!(cron["isError"], true, "{cron}");
+    let rows = duduclaw_gateway::cron_store::CronStore::open(home).unwrap().list_all().await.unwrap();
+    assert_eq!(rows[0].on_behalf_of.as_deref(), Some(principal.as_str()));
+    let reminder = handle_create_reminder(&serde_json::json!({
+        "agent_id":"main", "mode":"agent_callback", "prompt":"daily report",
+        "time":"1h", "channel":"line", "chat_id":"test-chat"
+    }), home, RecordActor::Agent("main")).await;
+    assert_ne!(reminder["isError"], true, "{reminder}");
+    let rows = duduclaw_gateway::reminder_scheduler::list_reminders(home, None, Some("main")).await;
+    assert_eq!(rows[0].on_behalf_of.as_deref(), Some(principal.as_str()));
+    let spec = handle_create_task(&serde_json::json!({
+        "goal":"daily report", "steps":[{"description":"do work"}]
+    }), home, "main").await;
+    assert_ne!(spec["isError"], true, "{spec}");
+    let dir = home.join("agents/main");
+    let ids = duduclaw_gateway::task_spec::TaskSpec::list(&dir);
+    assert_eq!(duduclaw_gateway::task_spec::TaskSpec::load(&dir, &ids[0]).unwrap().on_behalf_of.as_deref(), Some(principal.as_str()));
+}
+
+#[tokio::test]
+async fn cron_update_stamps_host_origin_and_background_edits_do_not_erase_it() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+    let row = duduclaw_gateway::cron_store::CronTaskRow::new(
+        "legacy-update".into(), "report".into(), "worker".into(), "0 9 * * *".into(), "old".into(),
+    );
+    store.insert(&row).await.unwrap();
+    let principal = account_principal(home, "employee", duduclaw_auth::UserRole::Employee);
+    {
+        let _host = HostPrincipal::set(&principal);
+        let result = handle_update_cron_task(&serde_json::json!({
+            "id":row.id, "task":"new", "on_behalf_of":"user:forged"
+        }), home, RecordActor::Agent("worker")).await;
+        assert_ne!(result["isError"], true, "{result}");
+        let stored = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(stored.task, "new");
+        assert_eq!(stored.on_behalf_of.as_deref(), Some(principal.as_str()));
+    }
+    let result = handle_update_cron_task(&serde_json::json!({"id":row.id, "task":"background edit"}),
+        home, RecordActor::Agent("worker")).await;
+    assert_ne!(result["isError"], true, "{result}");
+    assert_eq!(store.get(&row.id).await.unwrap().unwrap().on_behalf_of.as_deref(), Some(principal.as_str()));
 }

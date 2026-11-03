@@ -332,8 +332,14 @@ pub(crate) async fn gate_bus_dispatch(
         let guard = registry.read().await;
         let target_id = DispatchOrgView::new(home_dir, Some(&guard)).canonical_id(target);
         match guard.get(&target_id) {
-            Some(agent) => crate::machine_employee::check_loaded(home_dir, agent, on_behalf_of),
-            None => crate::machine_employee::check_target(home_dir, &target_id, on_behalf_of),
+            Some(agent) => {
+                crate::on_behalf_of::access::check_loaded_main_target(home_dir, on_behalf_of, agent)
+                    .await.and_then(|()| crate::machine_employee::check_loaded(home_dir, agent, on_behalf_of))
+            }
+            None => {
+                crate::on_behalf_of::access::check_main_target(home_dir, on_behalf_of, &target_id)
+                    .await.and_then(|()| crate::machine_employee::check_target(home_dir, &target_id, on_behalf_of))
+            }
         }
     };
     if machine_access.is_err() {

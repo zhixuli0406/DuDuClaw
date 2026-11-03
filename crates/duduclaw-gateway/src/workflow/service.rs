@@ -78,6 +78,7 @@ impl WorkflowService {
             return Err("workflow run input byte bound exceeded".into());
         }
         let run = WorkflowRun {
+            on_behalf_of: crate::on_behalf_of::current(),
             run_id: uuid::Uuid::new_v4().to_string(),
             trigger_key: trigger.key(&spec.workflow_id, spec.workflow_revision)?,
             trigger,
@@ -291,6 +292,7 @@ impl WorkflowService {
             execution_creator_grant.allowed_tools.remove(tool);
         }
         let run = WorkflowRun {
+            on_behalf_of: crate::on_behalf_of::current(),
             run_id: run_id.clone(),
             trigger_key: trigger.key(&request.definition.workflow_id, request.revision)?,
             trigger,

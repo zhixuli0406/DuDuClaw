@@ -1672,6 +1672,9 @@ async fn dispatch_to_agent_outcome(
         {
             let reg = registry.read().await;
             if let Some(agent) = reg.get(agent_id) {
+                crate::on_behalf_of::access::check_loaded_main_target(
+                    home_dir, crate::on_behalf_of::current().as_deref(), agent,
+                ).await.map_err(DispatchError::Other)?;
                 crate::machine_employee::check_loaded(
                     home_dir, agent, crate::on_behalf_of::current().as_deref(),
                 ).map_err(DispatchError::Other)?;
@@ -1888,6 +1891,19 @@ pub async fn dispatch_taskspec(
     spec: &mut crate::task_spec::TaskSpec,
     agent_dir: &Path,
 ) -> Result<(), String> {
+    let principal = crate::on_behalf_of::from_stored(
+        home_dir, spec.on_behalf_of.as_deref(), &spec.agent_id, "task_spec",
+    );
+    crate::on_behalf_of::scope_first(principal,
+        dispatch_taskspec_inner(home_dir, registry, spec, agent_dir)).await
+}
+
+async fn dispatch_taskspec_inner(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    spec: &mut crate::task_spec::TaskSpec,
+    agent_dir: &Path,
+) -> Result<(), String> {
     use crate::task_spec::*;
 
     info!(
@@ -1944,6 +1960,16 @@ pub async fn dispatch_taskspec(
             &step_desc,
         );
 
+        // Check self-target steps too, including a role/default change since creation.
+        if let Err(reason) = crate::on_behalf_of::access::check_main_target(
+            home_dir, crate::on_behalf_of::current().as_deref(), &target_agent,
+        ).await {
+            spec.steps[step_index].status = StepStatus::Failed;
+            spec.status = TaskStatus::Failed;
+            spec.save(agent_dir).map_err(|e| format!("Save refused TaskSpec: {e}"))?;
+            return Err(reason);
+        }
+
         // ── WP21 C1 (TaskSpec rail) ──────────────────────────────────────
         // A `create_task` step may name ANY agent, and this executor reaches
         // `dispatch_to_agent` without ever touching `bus_queue.jsonl` or the
@@ -1962,7 +1988,7 @@ pub async fn dispatch_taskspec(
                     &target_agent,
                     &spec.task_id,
                     "task_spec",
-                    None,
+                    crate::on_behalf_of::current().as_deref(),
                 )
                 .await
             {
@@ -6220,3 +6246,7 @@ mod budget_refusal_tests {
 #[cfg(test)]
 #[path = "dispatcher_stack_tests.rs"]
 mod dispatch_stack_tests;
+
+#[cfg(test)]
+#[path = "dispatcher_main_agent_tests.rs"]
+mod main_agent_tests;

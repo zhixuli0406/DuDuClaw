@@ -1,5 +1,7 @@
 # Dashboard settings map (v1.68.0)
 
+When serving the dashboard under a path prefix, set `config.toml` `[dashboard] public_url = "https://host/agents"`, including the path. For nginx, use `location /agents/ { proxy_pass http://127.0.0.1:18889/; }` and register `https://host/agents/api/me/google/callback` in Google Cloud (remote MCP uses `https://host/agents/oauth/mcp/callback`). OAuth uses this base only when its origin matches the browser’s validated dashboard origin; LAN access and paste-back flows keep their existing behavior. After upgrading with this fix and updating the registered callback, remove the v1.79.1 workaround rules for unprefixed `/api/me/google/callback` and `/me/connections`.
+
 This page lists what can be set from the dashboard as of v1.68.0: which page, which configuration key it writes, and whether the gateway needs a restart afterwards. The last section covers the Advanced config editor, which edits keys that have no dedicated control.
 
 Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-JP/dashboard-settings.md)

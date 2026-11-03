@@ -81,6 +81,9 @@ impl WorkflowRunner {
         run: &WorkflowRun,
         point: &GuardPoint<'_>,
     ) -> Result<(), String> {
+        crate::on_behalf_of::access::check_main_target(
+            &self.home, run.on_behalf_of.as_deref(), &run.actor,
+        ).await?;
         duduclaw_core::autonomy_gate::check(
             &self.home, &run.actor, duduclaw_core::autonomy_gate::AutonomyPath::Workflow,
         ).map_err(|_| super::WORKFLOW_AUTONOMY_PAUSED.to_string())?;

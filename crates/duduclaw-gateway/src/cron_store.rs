@@ -77,6 +77,9 @@ pub struct CronTaskRow {
     /// `None` for non-`on_exit` tasks.
     #[serde(default)]
     pub watch_command: Option<String>,
+    /// Host-carried human origin. Legacy NULL rows remain background work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
 }
 
 /// serde default for [`CronTaskRow::trigger_kind`].
@@ -110,6 +113,7 @@ impl CronTaskRow {
             condition_script: None,
             condition_state: None,
             watch_command: None,
+            on_behalf_of: None,
         }
     }
 
@@ -332,6 +336,7 @@ impl CronStore {
             "condition_script",
             "condition_state",
             "watch_command",
+            "on_behalf_of",
         ] {
             let sql = format!("ALTER TABLE cron_tasks ADD COLUMN {col} TEXT");
             if let Err(e) = conn.execute(&sql, []) {
@@ -355,7 +360,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
                  FROM cron_tasks
                  ORDER BY created_at ASC",
             )
@@ -377,7 +382,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
                  FROM cron_tasks
                  WHERE enabled = 1
                  ORDER BY created_at ASC",
@@ -400,7 +405,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
                  FROM cron_tasks WHERE id = ?1",
                 params![id],
                 row_to_cron_task,
@@ -419,7 +424,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
                  FROM cron_tasks WHERE name = ?1 LIMIT 1",
                 params![name],
                 row_to_cron_task,
@@ -441,9 +446,9 @@ impl CronStore {
                  run_count, failure_count,
                  notify_channel, notify_chat_id, notify_thread_id,
                  cron_timezone,
-                 trigger_kind, condition_script, condition_state, watch_command)
+                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 row.id,
                 row.name,
@@ -466,6 +471,7 @@ impl CronStore {
                 row.condition_script,
                 row.condition_state,
                 row.watch_command,
+                row.on_behalf_of,
             ],
         )
         .map_err(|e| format!("insert cron task: {e}"))?;
@@ -519,6 +525,39 @@ impl CronStore {
             params![id, name, agent_id, cron, task, if enabled { 1 } else { 0 },
                 notify_channel, notify_chat_id, notify_thread_id, now],
         ).map_err(|e| format!("update cron task and notification: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// MCP edits atomically stamp the host origin with the changed prompt/routing.
+    /// An absent host retains a stored human origin instead of erasing it.
+    pub async fn update_fields_with_principal(
+        &self, id: &str, name: &str, agent_id: &str, cron: &str, task: &str, enabled: bool,
+        notify: Option<(Option<&str>, Option<&str>, Option<&str>)>, principal: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let (channel, chat, thread) = notify.unwrap_or((None, None, None));
+        let changed = conn.execute(
+            "UPDATE cron_tasks SET name=?2,agent_id=?3,cron=?4,task=?5,enabled=?6,
+             updated_at=?7,on_behalf_of=COALESCE(?8,on_behalf_of),
+             notify_channel=CASE WHEN ?9 THEN ?10 ELSE notify_channel END,
+             notify_chat_id=CASE WHEN ?9 THEN ?11 ELSE notify_chat_id END,
+             notify_thread_id=CASE WHEN ?9 THEN ?12 ELSE notify_thread_id END WHERE id=?1",
+            params![id,name,agent_id,cron,task,enabled,Utc::now().to_rfc3339(),principal,
+                notify.is_some(),channel,chat,thread],
+        ).map_err(|e| format!("update cron task with principal: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Resume a legacy job under the host principal in the same SQLite write.
+    pub async fn set_enabled_with_principal(
+        &self, id: &str, enabled: bool, principal: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE cron_tasks SET enabled=?2,updated_at=?3,
+             on_behalf_of=COALESCE(?4,on_behalf_of) WHERE id=?1",
+            params![id,enabled,Utc::now().to_rfc3339(),principal],
+        ).map_err(|e| format!("set_enabled_with_principal: {e}"))?;
         Ok(changed > 0)
     }
 
@@ -810,6 +849,7 @@ impl CronStore {
                 notify_chat_id,
                 notify_thread_id,
                 cron_timezone,
+                on_behalf_of: None,
                 trigger_kind: value
                     .get("trigger_kind")
                     .and_then(|v| v.as_str())
@@ -883,6 +923,7 @@ fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
         condition_script: row.get(18)?,
         condition_state: row.get(19)?,
         watch_command: row.get(20)?,
+        on_behalf_of: row.get(21)?,
     })
 }
 
@@ -890,6 +931,43 @@ fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn principal_migration_preserves_old_rows_and_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("cron_tasks.db")).unwrap();
+        // The oldest supported table, before any additive migrations.
+        conn.execute_batch("CREATE TABLE cron_tasks (
+            id TEXT PRIMARY KEY,name TEXT NOT NULL,agent_id TEXT NOT NULL DEFAULT 'default',
+            cron TEXT NOT NULL,task TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_run_at TEXT,last_status TEXT,
+            last_error TEXT,run_count INTEGER NOT NULL DEFAULT 0,failure_count INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO cron_tasks(id,name,cron,task,created_at,updated_at)
+            VALUES('legacy','legacy','0 9 * * *','work','old','old');").unwrap();
+        drop(conn);
+        let store = CronStore::open(dir.path()).unwrap();
+        assert_eq!(store.get("legacy").await.unwrap().unwrap().on_behalf_of, None);
+        let mut row = CronTaskRow::new("carried".into(), "carried".into(), "worker".into(),
+            "0 9 * * *".into(), "report".into());
+        row.on_behalf_of = Some("user:employee".into());
+        store.insert(&row).await.unwrap();
+        store.update_fields_with_principal("legacy", "new", "worker", &row.cron, "new", true,
+            Some((Some("telegram"), Some("chat"), None)), Some("user:employee")).await.unwrap();
+        // A background writer cannot clear the human origin.
+        store.update_fields_with_principal("legacy", "newer", "worker", &row.cron, "newer", false,
+            None, None).await.unwrap();
+        store.set_enabled_with_principal("legacy", true, None).await.unwrap();
+        drop(store);
+        let reopened = CronStore::open(dir.path()).unwrap();
+        for row in reopened.list_all().await.unwrap() {
+            assert_eq!(row.on_behalf_of.as_deref(), Some("user:employee"));
+        }
+        let row = reopened.get_by_name("newer").await.unwrap().unwrap();
+        assert_eq!(row.notify_channel.as_deref(), Some("telegram"));
+        assert_eq!(row.notify_chat_id.as_deref(), Some("chat"));
+        assert!(row.enabled);
+        assert_eq!(reopened.list_enabled().await.unwrap().len(), 2);
+    }
 
     #[tokio::test]
     async fn insert_list_update_delete_roundtrip() {

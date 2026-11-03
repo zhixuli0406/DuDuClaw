@@ -98,6 +98,11 @@ pub enum LicenseCommands {
 // ── Public entry point ────────────────────────────────────────
 
 pub async fn run(cmd: LicenseCommands) -> Result<()> {
+    if should_refuse_in_ai_session(&cmd, &crate::ai_session_guard::command_markers()) {
+        return Err(DuDuClawError::Agent(
+            "這個指令不能在 AI 員工的工作階段中執行；請由管理者在自己的終端機執行。".into(),
+        ));
+    }
     match cmd {
         LicenseCommands::Activate { key } => cmd_activate(&key).await,
         LicenseCommands::Status => cmd_status().await,
@@ -109,6 +114,47 @@ pub async fn run(cmd: LicenseCommands) -> Result<()> {
         LicenseCommands::Subscriptions => cmd_subscriptions().await,
         LicenseCommands::Fingerprint { all } => cmd_fingerprint(all).await,
     }
+}
+
+fn should_refuse_in_ai_session(cmd: &LicenseCommands, markers: &[&str]) -> bool {
+    command_writes_state(cmd) && !markers.is_empty()
+}
+
+fn command_writes_state(cmd: &LicenseCommands) -> bool {
+    matches!(
+        cmd,
+        LicenseCommands::Activate { .. }
+            | LicenseCommands::Refresh
+            | LicenseCommands::Import { .. }
+            | LicenseCommands::Deactivate
+            | LicenseCommands::Rebind
+    )
+}
+
+/// Commands blocked by the agent-file-guard Bash lane. Read-only license
+/// inspection remains available to employees.
+pub const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] = &[duduclaw_core::OperatorCommand {
+    name: "duduclaw license state change",
+    path: &["license", "activate"],
+}, duduclaw_core::OperatorCommand {
+    name: "duduclaw license state change",
+    path: &["license", "refresh"],
+}, duduclaw_core::OperatorCommand {
+    name: "duduclaw license state change",
+    path: &["license", "import"],
+}, duduclaw_core::OperatorCommand {
+    name: "duduclaw license state change",
+    path: &["license", "deactivate"],
+}, duduclaw_core::OperatorCommand {
+    name: "duduclaw license state change",
+    path: &["license", "rebind"],
+}];
+
+pub fn bash_license_decision(
+    command: &str,
+    caller: &duduclaw_core::HookCaller,
+) -> Option<duduclaw_core::GuardDecision> {
+    duduclaw_core::bash_operator_command_decision(command, caller, OPERATOR_COMMANDS)
 }
 
 /// Resolve the control-plane base URL (override with `DUDUCLAW_CONTROL_URL`).
@@ -840,5 +886,61 @@ mod tests {
         let all = fingerprint_candidates();
         assert!(!all.is_empty());
         assert_eq!(all[0], generate_fingerprint());
+    }
+
+    #[test]
+    fn only_license_state_changes_are_operator_only() {
+        assert!(command_writes_state(&LicenseCommands::Activate { key: "x".into() }));
+        assert!(command_writes_state(&LicenseCommands::Refresh));
+        assert!(command_writes_state(&LicenseCommands::Import { path: PathBuf::from("license.json") }));
+        assert!(command_writes_state(&LicenseCommands::Deactivate));
+        assert!(command_writes_state(&LicenseCommands::Rebind));
+        assert!(!command_writes_state(&LicenseCommands::Status));
+        assert!(!command_writes_state(&LicenseCommands::Export { base64: false }));
+        assert!(!command_writes_state(&LicenseCommands::Subscriptions));
+        assert!(!command_writes_state(&LicenseCommands::Fingerprint { all: false }));
+    }
+
+    #[test]
+    fn ai_session_markers_refuse_license_writes_but_not_reads() {
+        let marker = [duduclaw_core::ENV_AGENT_ID];
+        assert!(should_refuse_in_ai_session(
+            &LicenseCommands::Deactivate,
+            &marker,
+        ));
+        assert!(should_refuse_in_ai_session(
+            &LicenseCommands::Rebind,
+            &marker,
+        ));
+        assert!(!should_refuse_in_ai_session(
+            &LicenseCommands::Status,
+            &marker,
+        ));
+        assert!(!should_refuse_in_ai_session(
+            &LicenseCommands::Deactivate,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn bash_lane_blocks_license_writes_but_allows_reads() {
+        let caller = duduclaw_core::HookCaller::Agent("worker".into());
+        for command in [
+            "duduclaw license activate abc",
+            "duduclaw license refresh",
+            "duduclaw license import ./license.json",
+            "duduclaw license deactivate",
+            "duduclaw license rebind",
+        ] {
+            assert!(bash_license_decision(command, &caller).is_some(), "{command}");
+        }
+        for command in [
+            "duduclaw license status",
+            "duduclaw license export",
+            "duduclaw license fingerprint",
+            "duduclaw license subscriptions",
+        ] {
+            assert!(bash_license_decision(command, &caller).is_none(), "{command}");
+        }
     }
 }

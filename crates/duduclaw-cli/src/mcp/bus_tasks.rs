@@ -95,6 +95,12 @@ pub(crate) async fn handle_check_responses(params: &Value, home_dir: &Path) -> V
 /// The task is persisted as a TaskSpec JSON file; the gateway dispatcher picks it
 /// up on its next poll cycle and executes steps sequentially with retry/replan.
 pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    let principal = host_on_behalf_of(home_dir, caller);
+    if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
+        home_dir, principal.as_deref(), caller,
+    ).await {
+        return mcp_error(&reason);
+    }
     // The TaskSpec dispatcher scans registered agents only. An ephemeral
     // member's task file would never be picked up, so refuse it explicitly;
     // team role work crosses stages through team_handoff instead.
@@ -163,6 +169,13 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
             }
         }
 
+        let target = if agent.is_empty() { caller } else { &agent };
+        if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
+            home_dir, principal.as_deref(), target,
+        ).await {
+            return mcp_error(&format!("step {i}: {reason}"));
+        }
+
         let depends_on: Vec<u8> = raw
             .get("depends_on")
             .and_then(|v| v.as_array())
@@ -204,7 +217,8 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
 
     // Create TaskSpec and persist it.
     use duduclaw_gateway::task_spec::TaskSpec;
-    let spec = TaskSpec::new(caller, goal, steps);
+    let mut spec = TaskSpec::new(caller, goal, steps);
+    spec.on_behalf_of = principal;
     let task_id = spec.task_id.clone();
     let step_count = spec.steps.len();
 

@@ -304,3 +304,13 @@ fn multibyte_text_never_panics() {
         let _ = scan_mentions(s, &t, &all);
     }
 }
+
+#[test]
+fn named_mention_detection_uses_the_routing_boundaries() {
+    for text in ["@missing hello", "請問 ＠不存在 你好", "問問 @known"] {
+        assert!(has_named_mention(text), "{text}");
+    }
+    for text in ["ann@example.com", "meet @ 5pm", "@", "no mention"] {
+        assert!(!has_named_mention(text), "{text}");
+    }
+}

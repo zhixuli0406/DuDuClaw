@@ -867,7 +867,8 @@ async fn webchat_personal_non_admin_cannot_reach_main_default_explicit_or_resume
             assert_eq!(refusal["code"], "no_assigned_agent");
             assert_eq!(refusal["reason"], "no_agents");
         } else {
-            assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
+            assert_eq!(frame(&mut socket).await["code"],
+                if mode == "resume" { "main_agent_admin_only" } else { "agent_unavailable" });
         }
         assert_eq!(fixture.session_count(), if mode == "resume" { 1 } else { 0 });
         assert!(fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().is_empty());
@@ -884,11 +885,14 @@ async fn webchat_bound_main_explicit_and_stored_resume_are_refused_without_rerou
     let (_, token) = fixture.employee("main-bound", &["dudu", "finance"], Some("finance")).await;
     let (mut socket, info) = fixture.connect(&token).await;
     send(&mut socket, json!({"type":"user_message", "content":"Hello", "agent":"dudu", "msg_id":"explicit"})).await;
-    assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
+    assert_eq!(frame(&mut socket).await["code"], "agent_unavailable");
     assert_eq!(fixture.session_count(), 0);
     let old = format!("{}#conv:old", info["session_id"].as_str().unwrap());
     fixture.state.ctx.session_manager.get_or_create(&old, "dudu").await.unwrap();
     send(&mut socket, json!({"type":"user_message", "content":"Hello", "session_id":old, "msg_id":"resume"})).await;
+    assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
+    send(&mut socket, json!({"type":"user_message", "content":"Hello", "agent":"dudu",
+        "session_id":old, "msg_id":"resume-explicit"})).await;
     assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
     assert_eq!(fixture.session_count(), 1);
     assert!(fixture.state.ctx.session_manager.get_messages(&old).await.unwrap().is_empty());
@@ -914,7 +918,7 @@ async fn webchat_fifo_waiter_rechecks_revoked_non_admin_binding() {
     first.release.send(()).unwrap();
     done(&mut socket, "fifo", "first", &sid).await;
     let denied = frame(&mut socket).await;
-    assert_eq!(denied["code"], "agent_forbidden");
+    assert_eq!(denied["code"], "agent_unavailable");
     assert_eq!(denied["msg_id"], "second");
     fixture.turn_count(0).await;
     assert!(fixture.gate.entered.try_recv().is_err());
@@ -930,6 +934,11 @@ async fn webchat_schedule_command_cannot_resume_a_bound_main_schedule() {
     let store = crate::task_store::TaskStore::open(fixture._home.path()).unwrap();
     let creator = Creator::new(&user, false).unwrap();
     let now = chrono::Utc::now();
+    // The schedule was valid when created; an administrator promoted its
+    // employee to Main afterwards. Do not bypass the new creation gate.
+    crate::trigger_route::tests::write_agent(&fixture._home.path().join("agents"),
+        "dudu", "Main", "@dudu", "specialist", "");
+    fixture.state.ctx.registry.write().await.scan().await.unwrap();
     let row = manage::create(fixture._home.path(), &store, &creator, NewSchedule {
         agent_id: "dudu".into(), kind: AssignKind::Goal,
         payload: AssignPayload { description: "Old main schedule".into(), ..Default::default() },
@@ -937,16 +946,98 @@ async fn webchat_schedule_command_cannot_resume_a_bound_main_schedule() {
         timezone: Some("Asia/Taipei".into()), created_via: "dashboard".into(), source: None,
     }, now).await.unwrap();
     manage::manage(fixture._home.path(), &store, &creator, &row.id, ManageAction::Pause, now).await.unwrap();
+    crate::trigger_route::tests::write_agent(&fixture._home.path().join("agents"),
+        "dudu", "Main", "@dudu", "main", "");
+    fixture.state.ctx.registry.write().await.scan().await.unwrap();
     let (mut socket, _) = fixture.connect(&token).await;
     send(&mut socket, json!({"type":"user_message",
         "content":format!("/交辦 排程 恢復 {}", duduclaw_core::truncate_chars(&row.id, 8)),
         "conv":"schedule", "msg_id":"resume-main-schedule"})).await;
     assert_eq!(frame(&mut socket).await["type"], "session_info");
-    assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
+    assert_eq!(frame(&mut socket).await["code"], "agent_unavailable");
     fixture.turn_count(0).await;
     let rows = store.list_assign_schedules(Some(&user), 200).await.unwrap();
     assert_eq!(rows[0].status, "paused");
     assert_eq!(fixture.session_count(), 0);
+    assert!(fixture.gate.entered.try_recv().is_err());
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn non_admin_socket_target_failures_have_identical_frames() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    let (_, token) = fixture.employee("uniform-target", &["finance"], None).await;
+    crate::trigger_route::tests::write_agent(&fixture._home.path().join("agents"),
+        "sales-rep", "Sales", "@sales-rep", "specialist", "");
+    fixture.state.ctx.registry.write().await.scan().await.unwrap();
+    let (mut socket, _) = fixture.connect(&token).await;
+    let mut expected = None;
+    for (target, content) in [
+        (Some("missing-employee"), "Hello"),
+        (Some("dudu"), "Hello"),
+        (Some("sales-rep"), "Hello"),
+        (None, "@missing-employee Hello"),
+        (None, "@dudu Hello"),
+        (None, "@sales-rep Hello"),
+    ] {
+        send(&mut socket, json!({"type":"user_message", "content":content,
+            "agent":target, "msg_id":"uniform-target"})).await;
+        let mut denied = frame(&mut socket).await;
+        if denied["type"] == "session_info" { denied = frame(&mut socket).await; }
+        assert_eq!(denied["code"], "agent_unavailable");
+        assert_eq!(denied["message"], crate::webchat::access::AGENT_UNAVAILABLE_TEXT);
+        if let Some(ref expected) = expected {
+            assert_eq!(&denied, expected, "target {target:?}, content {content}");
+        } else {
+            expected = Some(denied);
+        }
+    }
+    assert_eq!(fixture.session_count(), 0);
+    fixture.turn_count(0).await;
+    assert!(fixture.gate.entered.try_recv().is_err());
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_socket_unknown_target_retains_legacy_detail() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    let token = fixture.user("admin-unknown-target");
+    let (mut socket, _) = fixture.connect(&token).await;
+    send(&mut socket, json!({"type":"user_message", "content":"Hello",
+        "agent":"missing-employee", "msg_id":"admin-unknown"})).await;
+    let denied = frame(&mut socket).await;
+    assert_eq!(denied["message"], "unknown agent: missing-employee");
+    assert!(denied.get("code").is_none_or(Value::is_null));
+    assert_eq!(fixture.session_count(), 0);
+    assert!(fixture.gate.entered.try_recv().is_err());
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn non_admin_assignment_socket_failures_have_identical_frames() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    let (_, token) = fixture.employee("uniform-assignment", &["finance"], None).await;
+    crate::trigger_route::tests::write_agent(&fixture._home.path().join("agents"),
+        "sales-rep", "Sales", "@sales-rep", "specialist", "");
+    fixture.state.ctx.registry.write().await.scan().await.unwrap();
+    let (mut socket, _) = fixture.connect(&token).await;
+    let mut expected = None;
+    for target in ["missing-employee", "sales-rep", "dudu"] {
+        send(&mut socket, json!({"type":"user_message", "content":format!("/交辦 @{target} work"),
+            "msg_id":"uniform-assignment"})).await;
+        let mut denied = frame(&mut socket).await;
+        if denied["type"] == "session_info" { denied = frame(&mut socket).await; }
+        assert_eq!(denied["code"], "agent_unavailable");
+        assert_eq!(denied["message"], crate::webchat::access::AGENT_UNAVAILABLE_TEXT);
+        if let Some(ref expected) = expected { assert_eq!(&denied, expected); }
+        else { expected = Some(denied); }
+        fixture.turn_count(0).await;
+    }
+    assert_eq!(fixture.session_count(), 0);
+    assert!(!fixture._home.path().join("tasks.db").exists());
     assert!(fixture.gate.entered.try_recv().is_err());
     socket.close(None).await.unwrap();
 }

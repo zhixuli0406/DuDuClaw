@@ -1,5 +1,7 @@
 # ダッシュボード設定の対応表（v1.68.0）
 
+ダッシュボードをパスのプレフィックス配下で公開する場合は、`config.toml` に `[dashboard] public_url = "https://host/agents"` を設定し、パスも含めてください。nginx の例：`location /agents/ { proxy_pass http://127.0.0.1:18889/; }`。Google Cloud には `https://host/agents/api/me/google/callback` を登録します（リモート MCP は `https://host/agents/oauth/mcp/callback`）。公開 URL とブラウザーの検証済みダッシュボード origin が一致する場合だけ、このプレフィックスを OAuth に使用します。LAN アクセスと URL の貼り付けフローの動作は変わりません。修正を含むバージョンへの更新と登録済みコールバック URL の変更後は、v1.79.1 用に追加したプレフィックスなしの `/api/me/google/callback` と `/me/connections` の nginx 回避ルールを削除できます。
+
 Enterprise設定（v1.76.0、ユーザー管理 → 組織の設定）：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。有効にする前に職員へ通知してください。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。
 
 v1.68.0 からダッシュボードで設定できる項目について、どのページにあるか、どの設定キーに書き込むか、保存後に gateway の再起動が必要かをまとめます。最後の節では、専用のコントロールがないキーを編集する「設定ファイルの詳細編集」を説明します。

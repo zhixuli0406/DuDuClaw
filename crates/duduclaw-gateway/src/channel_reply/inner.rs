@@ -226,6 +226,23 @@ pub(super) async fn build_reply_with_session_inner(
         }
     };
     if let Some(a) = agent {
+        // Revalidate the actual LoadedAgent, not the earlier selected name.
+        // The authenticated account is host-owned task-local state; a model
+        // or a client-supplied message cannot replace it. This runs before
+        // any model seam/runtime and while the registry read lock is held.
+        if let Ok(user) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
+            // "system" is the already-authenticated legacy token Admin.
+            if user != "system" && !crate::webchat::is_widget_visitor(&user) {
+                let wire = format!("user:{user}");
+                if let Err(reason) = crate::on_behalf_of::access::check_loaded_main_target(
+                    &ctx.home_dir, Some(&wire), a,
+                ).await {
+                    tracing::warn!(user, agent = %a.config.agent.name, reason,
+                        "WebChat final reply target unavailable");
+                    return crate::webchat::access::AGENT_UNAVAILABLE_TEXT.into();
+                }
+            }
+        }
         let principal = crate::on_behalf_of::current();
         // A failed requester lookup must not look like unattended work.
         let unknown = matches!(

@@ -18,6 +18,14 @@ struct Rig {
 impl Rig {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        // These fixtures carry user:owner across real admission gates. Give
+        // that identity a live account rather than relying on record mode to
+        // accept an unresolvable principal.
+        let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+        let owner = db.create_user("owner@test.invalid", "owner", "isolated-test-password",
+            duduclaw_auth::UserRole::Admin).unwrap();
+        rusqlite::Connection::open(dir.path().join("users.db")).unwrap()
+            .execute("UPDATE users SET id = 'owner' WHERE id = ?1", [&owner.id]).unwrap();
         let agent_dir = dir.path().join("agents/alice");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("agent.toml"),

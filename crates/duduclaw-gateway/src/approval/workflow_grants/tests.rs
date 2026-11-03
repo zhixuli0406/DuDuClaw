@@ -416,6 +416,7 @@ async fn fixture() -> (
         request_id: uuid::Uuid::new_v4().to_string(),
     };
     let run = WorkflowRun {
+        on_behalf_of: None,
         run_id: uuid::Uuid::new_v4().to_string(),
         trigger_key: trigger.key("weekly", 1).unwrap(),
         trigger,

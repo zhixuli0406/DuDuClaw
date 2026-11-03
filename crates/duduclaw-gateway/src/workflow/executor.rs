@@ -19,6 +19,7 @@ pub struct WorkflowExecutor {
     binary: PathBuf,
 }
 pub struct WorkflowSession {
+    _principal_context: crate::on_behalf_of::context::ContextGuard,
     client: McpClient,
     secret: Vec<u8>,
     session_id: String,
@@ -50,6 +51,14 @@ impl WorkflowExecutor {
     pub async fn connect(&self, actor: &str) -> Result<WorkflowSession, String> {
         let environment = self.environment(actor)?;
         let mut envs = duduclaw_core::agent_identity_env_vars(&self.home, actor);
+        let principal_context = crate::on_behalf_of::context::register(&self.home, actor)
+            .ok_or("workflow principal context unavailable")?;
+        // A workflow session has its own lifetime and actor, never reuse an
+        // enclosing runtime's opaque context reference.
+        envs.extend(crate::on_behalf_of::env_pairs().into_iter()
+            .filter(|(key, _)| key != crate::on_behalf_of::context::ENV_CONTEXT));
+        envs.push((crate::on_behalf_of::context::ENV_CONTEXT.into(),
+            principal_context.reference().into()));
         if !envs.iter().any(|(k, _)| k == "DUDUCLAW_AGENT_TOKEN") {
             return Err("verified workflow identity unavailable".into());
         }
@@ -117,6 +126,7 @@ impl WorkflowExecutor {
         .await
         .map_err(|e| format!("workflow stdio unavailable: {e}"))?;
         Ok(WorkflowSession {
+            _principal_context: principal_context,
             client,
             secret,
             session_id,

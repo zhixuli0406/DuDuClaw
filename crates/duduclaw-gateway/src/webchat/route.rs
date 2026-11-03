@@ -162,7 +162,7 @@ pub(super) async fn decide_webchat_route(
     let current: String = selected
         .map(str::to_string)
         .unwrap_or_else(|| default_id.clone());
-    let route = trigger_route::decide(&reg, text, &access, Some(&default_id));
+    let route = decide_private_webchat_route(&reg, text, &access, &default_id);
     let outcome = match route_outcome(state, &reg, &access, auth_user, &default_id, route)? {
             None => WebRoute {
                 agent: selected
@@ -191,6 +191,40 @@ pub(super) async fn decide_webchat_route(
     Ok(outcome)
 }
 
+/// Hide inaccessible names from matching itself, not only from the error
+/// string. Otherwise `@private @` and `@missing @` differ (refusal vs list),
+/// and an armed assignment may consume an unknown mention as its task body.
+fn decide_private_webchat_route(
+    reg: &duduclaw_agent::registry::AgentRegistry,
+    text: &str,
+    access: &SenderAccess,
+    default_id: &str,
+) -> TriggerRoute {
+    if matches!(access.sender, trigger_route::Sender::Admin { .. })
+        || crate::chat_commands::is_command(text)
+    {
+        return trigger_route::decide(reg, text, access, Some(default_id));
+    }
+    use duduclaw_agent::trigger_match::{self, MentionScan};
+    let targets: Vec<_> = trigger_route::mention_targets(reg).into_iter()
+        .filter(|target| reg.get(&target.id).is_some_and(|a| access.may_call(a, Some(default_id))))
+        .collect();
+    match trigger_match::scan_mentions(text, &targets, &|_| true) {
+        MentionScan::Hit(hit) => TriggerRoute::Routed {
+            bare: trigger_match::task_text_without(text, &hit).is_empty(), agent: hit.id,
+        },
+        MentionScan::Partial { token, candidates } => TriggerRoute::List { token, candidates },
+        _ if trigger_match::has_named_mention(text) => {
+            // Retain an exact matched reason only in the server-side audit.
+            match trigger_route::decide(reg, text, access, Some(default_id)) {
+                refused @ TriggerRoute::Forbidden { .. } => refused,
+                _ => TriggerRoute::Forbidden { agent: "<unknown>".into() },
+            }
+        }
+        _ => TriggerRoute::None,
+    }
+}
+
 /// `Ok(None)` = calls nobody; `Ok(Some(id))` = calls `id` (allowed);
 /// `Err(frame)` = refusal or list.
 fn route_outcome(
@@ -211,10 +245,11 @@ fn route_outcome(
         }
         TriggerRoute::Forbidden { agent } => {
             trigger_route::audit(home, "webchat", access, auth_user, &agent, "refused", None);
-            Err(Box::new(ChatMessage::error_coded(
-                trigger_route::FORBIDDEN_TEXT,
-                AGENT_FORBIDDEN_CODE,
-            )))
+            Err(Box::new(if matches!(access.sender, trigger_route::Sender::Admin { .. }) {
+                ChatMessage::error_coded(trigger_route::FORBIDDEN_TEXT, AGENT_FORBIDDEN_CODE)
+            } else {
+                super::access::agent_unavailable()
+            }))
         }
         TriggerRoute::List { candidates, .. } => {
             let agents = trigger_route::list::callable_agents(reg, &candidates);
@@ -261,7 +296,7 @@ pub(super) async fn pending_assign_reply(
             .await
             .map(|a| a.config.agent.name.clone())
             .unwrap_or_else(|| main_id.to_string());
-        (trigger_route::decide(&reg, text, &access, Some(&default_id)), default_id)
+        (decide_private_webchat_route(&reg, text, &access, &default_id), default_id)
     };
     if route != TriggerRoute::None {
         pending::cancel(&key, &event, seq);

@@ -179,7 +179,7 @@ impl WorkflowService {
             // A workflow step has no upstream channel turn to lose.
             upstream_unknown: false,
             lane: None,
-            on_behalf_of: None,
+            on_behalf_of: run.on_behalf_of.clone(),
         };
         if queue.get_by_id(message_id).await?.is_none() {
             queue.enqueue(&message).await?;
@@ -238,6 +238,7 @@ impl WorkflowService {
             .ok_or("workflow run missing")?;
         if message.sender != "workflow"
             || message.target != run.actor
+            || message.on_behalf_of != run.on_behalf_of
             || payload != message.payload
             || run.grant.is_none()
             || self

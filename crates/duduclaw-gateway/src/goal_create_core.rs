@@ -205,6 +205,9 @@ async fn create_goal_task_inner(
     admission: Option<duduclaw_core::autonomy_handoff::AdmissionFuture>,
 ) -> Result<GoalCreated, String> {
     crate::machine_employee::check_target(home_dir, &req.agent_id, req.on_behalf_of.as_deref())?;
+    crate::on_behalf_of::access::check_main_target(
+        home_dir, req.on_behalf_of.as_deref(), &req.agent_id,
+    ).await?;
     let description = req.description.trim();
     if description.is_empty() {
         return Err("description is required".to_string());
@@ -435,6 +438,32 @@ mod tests {
 
     async fn store_in(home: &Path) -> TaskStore {
         TaskStore::open(home).expect("open task store")
+    }
+
+    #[tokio::test]
+    async fn goal_creation_refuses_non_admin_main_despite_record_mode_and_binding() {
+        let home = tempfile::tempdir().unwrap();
+        let agents = home.path().join("agents");
+        for (id, role) in [("main", "main"), ("configured", "specialist"), ("sales", "specialist")] {
+            crate::trigger_route::tests::write_agent(&agents, id, id, &format!("@{id}"), role, "");
+        }
+        std::fs::write(home.path().join("config.toml"),
+            "[general]\ndefault_agent = \"configured\"\n[delegation]\nhuman_principal = \"record\"\n").unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let employee = db.create_user("employee@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
+        let principal = format!("user:{}", employee.id);
+        let store = store_in(home.path()).await;
+        for target in ["main", "configured", "default"] {
+            db.bind_agent(&employee.id, target, duduclaw_auth::AccessLevel::Owner).unwrap();
+            let mut request = req(target);
+            request.on_behalf_of = Some(principal.clone());
+            assert!(create_goal_task(home.path(), &store, request).await.is_err(), "{target}");
+        }
+        assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+        let mut request = req("sales");
+        request.on_behalf_of = Some(principal.clone());
+        let created = create_goal_task(home.path(), &store, request).await.unwrap();
+        assert_eq!(created.task.on_behalf_of, Some(principal));
     }
 
     #[tokio::test]

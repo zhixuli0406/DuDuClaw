@@ -33,6 +33,9 @@ pub struct TaskSpec {
     pub task_id: String,
     /// Agent that owns this task (orchestrator or direct executor).
     pub agent_id: String,
+    /// Host-carried human origin. Absent on legacy background tasks.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
     /// Original goal / user request.
     pub goal: String,
     /// Ordered list of steps to execute.
@@ -180,6 +183,7 @@ impl TaskSpec {
         Self {
             task_id: Uuid::new_v4().to_string(),
             agent_id: agent_id.to_string(),
+            on_behalf_of: None,
             goal: goal.to_string(),
             steps,
             current_step: 0,
@@ -961,6 +965,18 @@ mod tests {
         spec.mark_failed(0, "err2");
         let action = spec.mark_failed(0, "err3");
         assert!(matches!(action, FailureAction::Abandon { .. }));
+    }
+
+    #[test]
+    fn principal_round_trips_and_legacy_tasks_remain_background() {
+        let mut spec = TaskSpec::new("worker", "Daily report", sample_steps());
+        spec.on_behalf_of = Some("user:employee".into());
+        let mut json = serde_json::to_value(&spec).unwrap();
+        let carried: TaskSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(carried.on_behalf_of, spec.on_behalf_of);
+        json.as_object_mut().unwrap().remove("on_behalf_of");
+        let legacy: TaskSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.on_behalf_of, None);
     }
 
     #[test]
