@@ -1,5 +1,6 @@
 //! Conversation routing on the single authenticated WebChat connection.
 use super::{ChatState, Frame};
+use crate::{sanitize::TerminalText, strings};
 use std::collections::BTreeMap;
 #[derive(Default, Clone)]
 pub struct ChatRooms {
@@ -17,6 +18,7 @@ impl ChatRooms {
             let state = ChatState {
                 connected: self.connected,
                 stale: !self.connected,
+                status: TerminalText::new(if self.connected { strings::CONNECTED } else { strings::CONNECTING }.into()),
                 base_session: self.base_session.clone(),
                 ..ChatState::default()
             };
@@ -36,6 +38,7 @@ impl ChatRooms {
             self.base_session = frame.session_id.clone();
             for room in self.rooms.values_mut() {
                 room.connected = true; room.stale = false;
+                if !room.running { room.status = TerminalText::new(strings::CONNECTED.into()); }
                 room.base_session = self.base_session.clone();
             }
             return;

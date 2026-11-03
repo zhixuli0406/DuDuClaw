@@ -5,6 +5,10 @@ import json
 import re
 import shlex
 import unittest
+import os
+import subprocess
+import tempfile
+import tomllib
 
 import yaml
 
@@ -36,6 +40,11 @@ class CiWorkflowTests(unittest.TestCase):
             if line.strip().startswith("cargo ")
         ]
 
+    def test_ci_permissions_are_read_only(self):
+        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        for job in self.jobs.values():
+            self.assertNotIn("permissions", job)
+
     def test_latest_runs_do_not_cancel_other_prs_or_main(self):
         concurrency = self.workflow["concurrency"]
         group = concurrency["group"]
@@ -43,7 +52,8 @@ class CiWorkflowTests(unittest.TestCase):
                         "github.event.pull_request.number", "github.ref"):
             self.assertIn(context, group)
         self.assertNotIn("github.run_id", group)
-        self.assertEqual(concurrency["cancel-in-progress"], "true")
+        self.assertEqual(concurrency["cancel-in-progress"],
+                         "${{ github.event_name == 'pull_request' }}")
         for event in ("push", "pull_request"):
             trigger = self.workflow["on"][event]
             self.assertEqual(trigger["branches"], ["main"])
@@ -58,7 +68,9 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertEqual(self.jobs[job]["name"], name)
                 self.assertIn(self.jobs[job]["needs"], ("settle", ["settle"]))
                 # A status function avoids GitHub's implicit success() guard.
-                self.assertEqual(self.jobs[job]["if"], "${{ !cancelled() }}")
+                expected = ("${{ !cancelled() && needs.settle.outputs.dashboard != 'skip' }}"
+                            if job == "dashboard" else "${{ !cancelled() }}")
+                self.assertEqual(self.jobs[job]["if"], expected)
 
     def test_prs_run_linux_and_main_nightly_manual_run_all_platforms(self):
         matrix = self.jobs["rust"]["strategy"]["matrix"]["os"]
@@ -83,11 +95,13 @@ class CiWorkflowTests(unittest.TestCase):
             if step.get("uses", "").startswith("Swatinem/rust-cache@")
         ]
         self.assertEqual(len(rust_caches), 2)
-        for step in rust_caches:
-            self.assertEqual(
-                step["with"]["save-if"],
-                "${{ github.ref == 'refs/heads/main' }}",
-            )
+        self.assertEqual(rust_caches[0]["with"], {
+            "shared-key": "ci-${{ matrix.os }}",
+            "save-if": "${{ github.ref == 'refs/heads/main' }}",
+        })
+        self.assertEqual(rust_caches[1]["with"], {
+            "shared-key": "ci-ubuntu-latest", "save-if": "false",
+        })
 
         docker_path = ROOT / ".github/workflows/docker-image.yml"
         docker_text = docker_path.read_text()
@@ -109,7 +123,7 @@ class CiWorkflowTests(unittest.TestCase):
         # keep the named Windows acceptance cases visible and serialized.
         step = next(s for s in self.jobs["rust"]["steps"]
                     if s.get("name") == "Run every required Windows case on the native host")
-        self.assertEqual(step["if"], "runner.os == 'Windows'")
+        self.assertIn("runner.os == 'Windows'", step["if"])
         self.assertEqual(step["shell"], "pwsh")
         for case in (
             "publication::windows::tests::protected_owner_mutex_and_private_recovery_directory_are_validated",
@@ -145,7 +159,10 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertEqual(configured["with"]["save-if"], "false")
             self.assertNotIn("key", configured["with"])
             warm_options = dict(warm_cache["with"])
-            self.assertEqual(warm_options.pop("save-if"), "${{ github.ref == 'refs/heads/main' }}")
+            expected_save = ("${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' }}"
+                             if name == "desktop-release"
+                             else "${{ github.ref == 'refs/heads/main' }}")
+            self.assertEqual(warm_options.pop("save-if"), expected_save)
             self.assertEqual(warm_options,
                              {k: v for k, v in configured["with"].items() if k != "save-if"})
             self.assertEqual(warmed["runs-on"], workflow["jobs"]["build"]["runs-on"])
@@ -194,9 +211,13 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(warm["on"]["schedule"], [{"cron": "0 18 * * 0"}])
         self.assertEqual(warm["permissions"], {"contents": "read"})
         self.assertNotIn("secrets", body.lower())
-        self.assertEqual(set(warm["jobs"]), {"release", "desktop-release"})
+        self.assertEqual(set(warm["jobs"]), {"decide", "release", "desktop-release"})
         for job in warm["jobs"].values():
-            self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+            if job is warm["jobs"]["decide"]:
+                self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+            else:
+                self.assertEqual(job["needs"], "decide")
+                self.assertEqual(job["if"], "${{ !cancelled() && github.ref == 'refs/heads/main' && needs.decide.outputs.run != 'false' }}")
             self.assertNotIn("permissions", job)
             checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
             self.assertEqual(checkout["with"]["persist-credentials"], "false")
@@ -213,26 +234,58 @@ class CiWorkflowTests(unittest.TestCase):
                              for key in env))
 
     def test_execution_guards_preserve_blocking_coverage(self):
-        conditional_steps = {
-            "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)":
-                "runner.os == 'Linux'",
+        full = "needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check'"
+        active = "needs.settle.outputs.rust_mode != 'skip'"
+        setup = {
+            "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)",
+            "Stub dashboard assets for compile",
+        }
+        platform = {
+            "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)": "runner.os == 'Linux'",
             "Test gateway Discord voice TLS transport": "runner.os == 'Linux'",
             "Run every required Windows case on the native host": "runner.os == 'Windows'",
-            "Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)":
-                "matrix.os == 'ubuntu-latest'",
-            "Test workflow end to end (pilot, races, resume, F1b, F5-A) against the built CLI":
-                "matrix.os == 'ubuntu-latest'",
+            "Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)": "matrix.os == 'ubuntu-latest'",
+            "Test workflow end to end (pilot, races, resume, F1b, F5-A) against the built CLI": "matrix.os == 'ubuntu-latest'",
         }
         self.assertEqual(self.jobs["rust"]["strategy"]["fail-fast"], "false")
         for job in ("rust", "dashboard", "python", "security"):
             self.assertNotIn("continue-on-error", self.jobs[job])
             for step in self.jobs[job]["steps"]:
-                name = step.get("name", step.get("uses"))
-                with self.subTest(job=job, step=name):
-                    expected = conditional_steps.get(name) if job == "rust" else None
+                name = step.get("name", "")
+                uses = step.get("uses", "")
+                expected = None
+                if job == "rust":
+                    gate = active if name in setup or uses.startswith((
+                        "actions/checkout@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@"
+                    )) else full
+                    if name == "Skip Rust for documentation and web-only changes":
+                        gate = "needs.settle.outputs.rust_mode == 'skip'"
+                    elif name == "Check release version bump":
+                        gate = "needs.settle.outputs.rust_mode == 'check'"
+                        self.assertEqual(step["run"], "cargo check --locked --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard")
+                    elif name == "Test gateway Discord voice TLS transport":
+                        gate += " && needs.settle.outputs.discord_voice != 'false'"
+                    elif name == "Test cli with app-compat feature (OS-only surface)":
+                        gate += " && needs.settle.outputs.app_compat != 'false'"
+                    if name in ("Test workspace doctests", "Test gateway doctests"):
+                        suite = name.split()[1]
+                        gate = "!cancelled() && " + gate + (
+                            f" && (steps.nextest_{suite}.outcome == 'success'"
+                            f" || steps.nextest_{suite}.outcome == 'failure')")
+                    if name in platform:
+                        gate += " && (" + platform[name] + ")"
+                    if name.startswith(("Summarize nextest", "Upload nextest")):
+                        gate = "always() && " + gate
+                    expected = "${{ " + gate + " }}"
+                with self.subTest(job=job, step=name or uses):
                     self.assertEqual(step.get("if"), expected)
                     self.assertNotIn("continue-on-error", step)
                     self.assertNotIn("clippy", step.get("run", ""))
+        # Empty/unknown outputs satisfy both negative comparisons and run full CI.
+        for mode in ("", "full", "unexpected"):
+            self.assertTrue(mode != "skip" and mode != "check")
+        for command in self.commands("rust"):
+            self.assertIn("--locked", command)
 
     def test_settle_only_delays_pr_runs(self):
         settle = self.jobs["settle"]
@@ -243,11 +296,13 @@ class CiWorkflowTests(unittest.TestCase):
 
     def test_default_and_optional_feature_coverage_remains(self):
         commands = self.commands("rust")
-        workspace = next(c for c in commands if c[:2] == ["cargo", "test"]
+        workspace = next(c for c in commands if c[:3] == ["cargo", "nextest", "run"]
                          and "--workspace" in c)
+        exclusions = [workspace[i + 1] for i, arg in enumerate(workspace) if arg == "--exclude"]
+        self.assertEqual(exclusions, ["duduclaw-bridge", "duduclaw-dashboard", "duduclaw-gateway"])
         self.assertNotIn("--no-default-features", workspace)
         self.assertIn("--no-fail-fast", workspace)
-        for selector in ("--lib", "--tests", "--bins", "--doc"):
+        for selector in ("--lib", "--tests", "--bins", "--doc", "-E", "--filter-expr"):
             self.assertNotIn(selector, workspace)
         for package, feature, target in (
             ("duduclaw-core", "app-compat", "test"),
@@ -258,17 +313,152 @@ class CiWorkflowTests(unittest.TestCase):
         ):
             with self.subTest(feature=feature, package=package):
                 self.assertTrue(any(c[:2] == ["cargo", target]
-                                    and package in c and feature in c
-                                    for c in commands))
-        gateway = next(c for c in commands if c[:2] == ["cargo", "test"]
-                       and "duduclaw-gateway" in c and "--skip" in c)
-        self.assertNotIn("--lib", gateway)  # Integration and doctests stay.
-        self.assertIn("--no-default-features", gateway)
+                                    and package in c and feature in c for c in commands))
+        gateway = next(c for c in commands if c[:3] == ["cargo", "nextest", "run"]
+                       and "-p" in c and "duduclaw-gateway" in c)
+        self.assertEqual(gateway[3:], ["--locked", "--no-fail-fast", "-p", "duduclaw-gateway",
+            "--no-default-features", "-E", "not (test(three_page_pilot_) or test(security_race_tests) or test(resume_tests) or test(f1b_e2e_tests) or test(f5a_e2e_tests))"])
+        docs = [c for c in commands if c[:2] == ["cargo", "test"] and "--doc" in c]
+        self.assertEqual(len(docs), 2)
+        self.assertEqual(docs[0], ["cargo", "test", "--locked", "--doc", "--no-fail-fast"] + workspace[5:])
+        self.assertEqual(docs[1][:8], ["cargo", "test", "--locked", "--doc", "--no-fail-fast",
+                                     "-p", "duduclaw-gateway", "--no-default-features"])
+        self.assertEqual(docs[1][8:], ["--"] + [arg for name in E2E_FILTERS
+                         for arg in ("--skip", name.removeprefix("workflow::"))])
+
+    def test_windows_process_tree_tests_reserve_all_cpus(self):
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
+        self.assertEqual(config["profile"]["ci"]["overrides"], [{
+            "filter": "package(duduclaw-fork) & test(/^test_runner::tests::windows::/)",
+            "threads-required": "num-cpus",
+        }])
+        # Nextest follows the profile chain when resolving per-test overrides.
+        self.assertEqual(config["profile"]["ci-native"]["inherits"], "ci")
+
+    def test_nextest_profiles_and_reports(self):
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
+        self.assertEqual({key: value for key, value in config["profile"]["ci"].items()
+                          if key != "overrides"}, {
+            "retries": 0, "fail-fast": False,
+            "slow-timeout": {"period": "60s", "terminate-after": 10},
+            "final-status-level": "flaky", "junit": {"path": "junit.xml"},
+        })
+        self.assertEqual(config["profile"]["ci-native"], {"inherits": "ci", "retries": 1})
+        self.assertEqual(self.jobs["rust"]["env"]["NEXTEST_PROFILE"],
+            "${{ (github.event_name == 'pull_request' || matrix.os == 'ubuntu-latest') && 'ci' || 'ci-native' }}")
+        steps = self.jobs["rust"]["steps"]
+        install = next(s for s in steps if s.get("name") == "Install nextest")
+        self.assertEqual(install["uses"], "taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b")
+        self.assertEqual(install["with"]["tool"], "nextest@0.9.150")
+        for suite, name in (("workspace", "Test (no dashboard)"), ("gateway", "Test gateway")):
+            index = next(i for i, step in enumerate(steps) if step.get("name") == name)
+            self.assertEqual(steps[index]["id"], f"nextest_{suite}")
+            summary = steps[index + 1]
+            self.assertIn("always()", summary["if"])
+            self.assertIn('"target/nextest/$NEXTEST_PROFILE/junit.xml"', summary["run"])
+            self.assertIn(f'"target/nextest/reports/{suite}.xml"', summary["run"])
+        artifact = steps[-1]
+        self.assertEqual(artifact["uses"], "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
+        self.assertIn("always()", artifact["if"])
+        self.assertEqual(artifact["with"]["path"], "target/nextest/reports/*.xml")
+        self.assertEqual(artifact["with"]["retention-days"], "7")
+        self.assertIn("-p 'test_ci*.py'", str(self.jobs["python"]))
+
+    def test_classifier_uses_base_and_publishes_only_successful_outputs(self):
+        settle = self.jobs["settle"]
+        checkout = settle["steps"][1]
+        self.assertEqual(checkout["with"], {"fetch-depth": "0", "persist-credentials": "false"})
+        step = settle["steps"][2]
+        self.assertEqual(step["env"], {"BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+                                        "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"})
+        self.assertNotIn("${{", step["run"])
+        self.assertIn('git show "$BASE_SHA:scripts/ci_classify.py"', step["run"])
+        self.assertIn('python3 -I "$RUNNER_TEMP/ci_classify.py"', step["run"])
+        self.assertEqual(step["continue-on-error"], "true")
+        self.assertEqual(set(settle["outputs"]), {"rust_mode", "dashboard", "discord_voice", "app_compat"})
+        for key in settle["outputs"]:
+            self.assertEqual(settle["outputs"][key], "${{ steps.classify.outputs." + key + " }}")
+        # Execute the actual workflow shell for non-PR and first-rollout failure cases.
+        for event in ("push", "schedule", "workflow_dispatch", "pull_request"):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                output.touch()
+                env = dict(os.environ, GITHUB_EVENT_NAME=event, BASE_SHA="0" * 40,
+                           HEAD_SHA="1" * 40, RUNNER_TEMP=directory, GITHUB_OUTPUT=str(output))
+                subprocess.run(["bash", "-e", "-c", step["run"]], cwd=ROOT,
+                               env=env, check=True, capture_output=True)
+                expected = ("" if event == "pull_request" else
+                            "rust_mode=full\ndashboard=run\ndiscord_voice=true\napp_compat=true\n")
+                self.assertEqual(output.read_text(), expected)
+
+    def test_classifier_failure_cannot_publish_partial_skip_outputs(self):
+        shell = self.jobs["settle"]["steps"][2]["run"]
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+            git("init", "-q")
+            git("config", "user.name", "CI test")
+            git("config", "user.email", "ci@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            script = repo / "scripts/ci_classify.py"
+            script.parent.mkdir()
+            script.write_text('import os\nfrom pathlib import Path\n'
+                              'Path(os.environ["GITHUB_OUTPUT"]).write_text("rust_mode=skip\\n")\n'
+                              'raise RuntimeError("classification failed")\n')
+            git("add", ".")
+            git("commit", "-qm", "base classifier")
+            base = git("rev-parse", "HEAD")
+            script.write_text('raise AssertionError("must not execute head script")\n')
+            git("add", ".")
+            git("commit", "-qm", "untrusted head")
+            output = repo / "output"
+            output.touch()
+            env = dict(os.environ, GITHUB_EVENT_NAME="pull_request", BASE_SHA=base,
+                       HEAD_SHA=git("rev-parse", "HEAD"), RUNNER_TEMP=directory,
+                       GITHUB_OUTPUT=str(output))
+            result = subprocess.run(["bash", "-e", "-c", shell], cwd=repo,
+                                    env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("classification failed", result.stderr)
+            self.assertNotIn("must not execute head script", result.stderr)
+            self.assertEqual(output.read_text(), "")
+
+    def test_release_action_pins_and_cache_write_limits(self):
+        for name in ("release", "desktop-release", "docker-image", "computer-use-image", "release-cache-warm"):
+            text = (ROOT / f".github/workflows/{name}.yml").read_text()
+            workflow = yaml.load(text, Loader=yaml.BaseLoader)
+            for job in workflow["jobs"].values():
+                for step in job.get("steps", []):
+                    if uses := step.get("uses"):
+                        if uses != "dtolnay/rust-toolchain@stable":
+                            self.assertRegex(uses, r"^[\w-]+/[\w-]+@[a-f0-9]{40}$")
+            if name in {"desktop-release", "release-cache-warm"}:
+                installs = [shlex.split(line) for job in workflow["jobs"].values()
+                            for step in job.get("steps", [])
+                            for line in step.get("run", "").splitlines()
+                            if line.strip().startswith("cargo install tauri-cli")]
+                self.assertEqual(installs, [["cargo", "install", "tauri-cli", "--version",
+                                             "=2.12.4", "--locked"]])
+            if name == "release":
+                self.assertEqual(workflow["jobs"]["build"]["strategy"]["fail-fast"], "false")
+            if name == "computer-use-image":
+                builds = [step for step in workflow["jobs"]["build"]["steps"]
+                          if step.get("uses", "").startswith("docker/build-push-action@")]
+                self.assertEqual(len(builds), 2)
+                for step in builds:
+                    self.assertEqual(step["with"]["cache-from"], "type=gha,scope=computer-use-${{ matrix.arch }}")
+                    self.assertIn("github.ref == 'refs/heads/main'", step["with"]["cache-to"])
+                    self.assertTrue(step["with"]["cache-to"].endswith("|| '' }}"))
+        install = next(s for s in self.jobs["security"]["steps"]
+                       if s.get("name") == "Install cargo-audit")
+        self.assertEqual(install["uses"], "taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b")
+        self.assertEqual(install["with"]["tool"], "cargo-audit@0.22.2")
 
     def test_serial_e2e_uses_restored_production_cli(self):
         step = next(s for s in self.jobs["rust"]["steps"]
                     if "DUDUCLAW_P1_PILOT_EVIDENCE_DIR" in s.get("env", {}))
-        self.assertEqual(step["if"], "matrix.os == 'ubuntu-latest'")
+        self.assertIn("matrix.os == 'ubuntu-latest'", step["if"])
         lines = [shlex.split(line) for line in step["run"].splitlines()
                  if line.strip().startswith("cargo ")]
         self.assertEqual(lines[0][:2], ["cargo", "build"])

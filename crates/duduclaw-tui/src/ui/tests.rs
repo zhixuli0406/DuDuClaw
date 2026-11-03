@@ -14,7 +14,7 @@ use crate::{
     strings,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{Terminal, backend::TestBackend, buffer::CellWidth, style::Color};
+use ratatui::{Terminal, backend::TestBackend, buffer::CellWidth, style::{Color, Modifier}};
 use serde_json::json;
 use unicode_width::UnicodeWidthStr;
 
@@ -164,6 +164,40 @@ fn stale_screen() {
             .any(|c| c.fg == Color::DarkGray)
     );
     assert!(m.inbox.count().is_none());
+}
+
+#[test]
+fn selected_employee_row_uses_white_bold_text() {
+    let mut m = empty();
+    m.employees = fresh(vec![employee("adu", "阿嘟", "active")]);
+    let mut a = App::default();
+    a.refresh(&m);
+    a.selected = Some(Selection::Employee("adu".into()));
+    let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    t.draw(|f| render::draw(f, &m, &connection(), &TerminalText::new("home".into()), &mut a, &Settings::default())).unwrap();
+    let buffer = t.backend().buffer();
+    let (name_y, _) = (0..buffer.area.height)
+        .find_map(|y| {
+            (0..buffer.area.width)
+                .find(|&x| buffer[(x, y)].symbol() == "阿")
+                .map(|x| (y, x))
+        })
+        .unwrap();
+    let marker = (1..buffer.area.width)
+        .map(|x| &buffer[(x, name_y)])
+        .find(|cell| cell.symbol() == ">")
+        .unwrap();
+    assert_ne!(marker.fg, Color::Yellow);
+    assert_eq!(marker.fg, Color::White);
+    assert!(marker.modifier.contains(Modifier::BOLD));
+    assert_eq!(marker.bg, Color::DarkGray);
+
+    let name = (0..buffer.area.width)
+        .map(|x| &buffer[(x, name_y)])
+        .find(|cell| cell.symbol() == "阿")
+        .unwrap();
+    assert_eq!(name.fg, Color::White);
+    assert!(name.modifier.contains(Modifier::BOLD));
 }
 #[test]
 fn populated_inbox_and_employees() {
@@ -1413,6 +1447,35 @@ fn heartbeat_uses_last_run_and_cron_uses_gateway_next_run_without_prediction() {
     assert!(output.contains("上次執行: 2026-11-02T01:00:00Z"));
     assert!(output.contains("2026-11-03T01:00:00Z")); assert!(output.contains(strings::NOT_SCHEDULED));
     insta::assert_snapshot!("autonomy_schedule_times",output);
+}
+
+#[test]
+fn chat_block_without_a_room_shows_connected_after_the_handshake() {
+    use crate::chat::{ChatRooms, Frame};
+
+    let model = populated();
+    let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE), &model);
+    let pane_id = app.blocks.panes[app.blocks.focused].id.clone();
+    let mut rooms = ChatRooms::default();
+
+    app.sync_chats(&rooms);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTING);
+    assert!(!rooms.rooms.contains_key(&pane_id));
+
+    rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+    app.sync_chats(&rooms);
+
+    assert!(app.chat.connected);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+    assert!(!rooms.rooms.contains_key(&pane_id));
+
+    rooms.disconnected();
+    app.sync_chats(&rooms);
+
+    assert!(!app.chat.connected);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTING);
 }
 
 #[test]

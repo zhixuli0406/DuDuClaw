@@ -8,7 +8,8 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message as WireMessage};
 trait TestIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TestIo for T {}
 type Socket = WebSocketStream<Box<dyn TestIo>>;
-const DEADLINE: Duration = Duration::from_secs(5);
+// Bounds a hang; it is not a latency assertion because loaded Windows runners run these tests in separate processes.
+const DEADLINE: Duration = Duration::from_secs(30);
 static SOCKET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 enum Transport {
