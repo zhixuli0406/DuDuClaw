@@ -415,6 +415,34 @@ sudo chown -R 1000:1000 data/
 
 ---
 
+### 7.4 個人帳號：person-credentials 疊加設定
+
+讓 AI 員工代表某一位同事的功能（「我的連線」、公司授權代表）需要一把 AI 員工讀不到的金鑰。一般的 Docker 安裝沒有這種地方，所以「安全」頁會顯示「檔案（此處無法使用個人帳號）」，這些功能維持停用。疊加設定 `docker-compose.person-credentials.yml` 補上這個位置：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d
+```
+
+疊加設定改了什麼：容器以 root 啟動，只加回 `SETUID`、`SETGID`、`SETPCAP`；掛上只有 root 讀得到的磁碟區 `duduclaw-protected-key`（`/var/lib/duduclaw-protected`）；啟動程式先把金鑰交給 gateway、降為 `duduclaw` 使用者，之後才執行其他程式。啟動後到「安全 → 憑證保護」開啟，卡片應顯示「獨立金鑰（AI 員工讀不到）」。設計與限制見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)。
+
+使用前請確認：
+
+- 映像裡要有啟動程式。用 `docker compose run --rm --no-deps --entrypoint ls duduclaw /usr/local/lib/duduclaw/` 檢查，清單裡要有 `protected-key-launcher.sh`。
+- 保留基本設定檔的 `cap_drop: ALL` 與 `no-new-privileges`。不要加 `init: true`、`pid: host` 或掛載 Docker socket，否則 gateway 會拒收金鑰，卡片會寫出原因。
+- 持有金鑰期間，AI 隱私偵測（NER）去識別化、本機知識庫向量與 Kokoro 語音會關閉。這時 NER 去識別化規則不會遮蔽任何內容；需要去識別化的環境請用正規表示式規則。
+- `docker exec` 預設改為 root。執行 DuDuClaw 指令請用 `docker exec -u duduclaw …`，home 裡的檔案才會維持屬於 `duduclaw`。
+- `duduclaw-protected-key` 要和 `duduclaw-data` 分開備份。少了它，已保存的個人連線解不開，每個人都要重新連結。同時含兩個磁碟區的備份，就有解開憑證所需的一切，請照這個等級保管。
+
+更換根金鑰（懷疑外洩，或還原了不可信的資料磁碟區副本時）。儀表板的「換一把新金鑰」做不到這件事，因為根金鑰不變：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml run --rm --no-deps \
+  --entrypoint rm duduclaw /var/lib/duduclaw-protected/root.key
+docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d --force-recreate duduclaw
+```
+
+之後卡片會顯示「保護金鑰被更換」。按「重新啟用」，已保存的個人連線全部失效，每個人重新連結。原生 Linux 目前沒有對應的模式。
+
 ## 8. 健康檢查與觀測
 
 ### 8.1 三條 health endpoint

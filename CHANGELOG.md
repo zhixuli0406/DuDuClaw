@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Docker 可以開啟「我的連線」與公司授權代表了。用 `docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d` 啟動：容器先以 root 啟動（只加回 `SETUID`、`SETGID`、`SETPCAP`），啟動程式把只有 root 讀得到的磁碟區 `duduclaw-protected-key` 裡的根金鑰交給 gateway，先清掉首次設定留下的行程，再降為 `duduclaw` 使用者、清空所有權限啟動 gateway。gateway 必須是 PID 1，讀金鑰前先設成 non-dumpable，並檢查權限、PID、Docker socket 等條件，任一項不符就不收金鑰、卡片寫出原因。「安全 → 憑證保護」顯示新等級「獨立金鑰（AI 員工讀不到）」，按鈕是「開啟憑證保護」。在 Docker Desktop 實測：同容器的 uid 1000 行程（含 `unshare -Ur`）讀不到金鑰檔、`/proc/1/mem`、`environ`、`fd`，`ptrace` 也被拒。完整伺服器映像、Windows 上的 Docker Desktop、Podman、rootless Docker 尚未實測。步驟見 `docs/guides/docker.md` §7.4。
+
+### Changed
+
+- 獨立金鑰模式下，gateway 不在自己的行程載入 ONNX 模型，因為員工改得到模型檔。**AI 隱私偵測（NER）去識別化、本機知識庫向量與 Kokoro 語音會停用；NER 規則這時不會遮蔽任何內容，和沒裝模型時一樣。**需要去識別化的環境請改用正規表示式規則，或不要開這個模式。ONNX Runtime 函式庫改從密封、驗過雜湊的記憶體副本載入。
+- 這個模式擋不住：員工仍可在權限內透過 gateway 使用 Google、讀到自己這一輪的存取權杖、讓 gateway 停止，或在重新啟動後放回較舊的資料夾內容。儀表板的「換一把新金鑰」不換根金鑰；懷疑外洩時請照 Docker 指南更換金鑰磁碟區裡的根金鑰。能進入 Docker 主機或金鑰磁碟區的人讀得到根金鑰。
+- 一般的 Docker 安裝與原生 Linux 照舊拒絕代表特定人，卡片文字改成「檔案（此處無法使用個人帳號）」並指向 Docker 模式。開啟這個模式後 `docker exec` 預設是 root，執行 DuDuClaw 指令請加 `-u duduclaw`。
+
 ## [1.79.0] - 2026-11-02 — 本機語音、金鑰與登入保護、一般同仁側欄與設定清單
 
 ### Added

@@ -81,9 +81,10 @@ delegation serves all of them; each employee names the colleague it acts as.
 - Credential protection in the system keychain (Security page, see
   [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760)).
   The service-account key is sealed with that protection key, so it is never
-  a file an AI employee can read. macOS and Windows qualify. On Linux and in
-  Docker there is no supported keychain yet, and acting as a colleague is
-  refused.
+  a file an AI employee can read. macOS and Windows qualify, and so does
+  Docker started with the person-credentials overlay
+  ([Docker guide](docker.md#74-personal-accounts-person-credentials-overlay)).
+  A plain Docker install and bare-metal Linux refuse acting as a colleague.
 
 ### Set it up
 

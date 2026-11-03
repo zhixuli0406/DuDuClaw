@@ -413,7 +413,16 @@ says.
 
 - **Move to system keychain** (`security.credential_protection_enable`)
   creates the protected key in the macOS keychain or Windows Credential
-  Manager. Linux and Docker show "this platform has no supported system keychain" and no button.
+  Manager. A plain Docker or Linux install shows "Files (personal accounts
+  unavailable here)" and no button.
+- **Enable credential protection** appears instead in Docker started with the
+  person-credentials overlay ([Docker guide](docker.md#74-personal-accounts-person-credentials-overlay)).
+  The key is then the separate root key handed to the gateway at start-up, and
+  the line reads "Separate key (AI employees cannot read it)". If the start-up
+  checks fail, the card shows "Separate key unavailable" with the reason (for
+  example a mounted Docker socket) and offers no button. While this key is held,
+  NER redaction, local knowledge-base embeddings and Kokoro voice are off.
+  **Replace key** there does not replace the root key; see the Docker guide for that.
 - **Needs re-authorization** appears on macOS after an upgrade or while the
   keychain is locked. Run `duduclaw credentials authorize` in Terminal on that
   Mac and allow the dialog once.
