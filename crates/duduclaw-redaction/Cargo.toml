@@ -97,5 +97,6 @@ ner = [
 ]
 
 [dev-dependencies]
+duduclaw-core = { workspace = true, features = ["test-root-key"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }

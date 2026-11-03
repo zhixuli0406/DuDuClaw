@@ -4,8 +4,10 @@ import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
-import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
+import { useChatStore, chatAccessMessageKey, type PendingAttachment } from '@/stores/chat-store';
 import { takeChatAttachments } from '@/lib/chat-handoff';
+import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { cn } from '@/lib/utils';
@@ -72,6 +74,9 @@ export function WebChatPage() {
 
 function InteractiveWebChatPage() {
   const intl = useIntl();
+  const user = useAuthStore(s => s.user);
+  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
+  const assignedOnly = user !== null && user.role !== 'admin' && !isPersonal;
   const {
     messages,
     steps,
@@ -86,6 +91,9 @@ function InteractiveWebChatPage() {
     agentName,
     agentIcon,
     selectedAgentId,
+    resumedExplicitly,
+    resolvedAgent,
+    assignmentError,
     supportsVision,
     model,
     connectionState,
@@ -128,7 +136,7 @@ function InteractiveWebChatPage() {
     if (connectionState === 'disconnected') connect();
     if (!agentsLoaded) fetchAgents();
     const preselect = searchParams.get('agent');
-    if (preselect) selectAgent(preselect);
+    if (preselect && !assignedOnly) selectAgent(preselect);
     // Keep the session alive across unmounts — no disconnect here.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -198,7 +206,20 @@ function InteractiveWebChatPage() {
     () => agents.find((a) => a.role === 'main')?.name ?? callable?.find((a) => a.role === 'main')?.name ?? null,
     [agents, callable],
   );
-  const historyAgentId = selectedAgentId ?? mainAgentId;
+  const historyAgentId = assignedOnly ? resolvedAgent?.id ?? null : selectedAgentId ?? mainAgentId;
+  const assignmentBlocked = assignedOnly && (!resolvedAgent || assignmentError !== null);
+  const assignmentMessageKey = assignmentError
+    ? chatAccessMessageKey(assignmentError.code, assignmentError.reason) ?? 'webchat.assignment.none'
+    : resolvedAgent === undefined ? 'webchat.assignment.loading' : 'webchat.assignment.none';
+  const assignmentMessage = intl.formatMessage({ id: assignmentMessageKey });
+
+  useEffect(() => {
+    if (!assignedOnly) return;
+    const requested = searchParams.get('agent');
+    if (requested && (requested !== resolvedAgent?.id || !callable?.some(a => a.name === requested))) {
+      setAgentParam(null);
+    }
+  }, [assignedOnly, searchParams, resolvedAgent?.id, callable, setAgentParam]);
 
   // The main agent is already represented by the leading DuDu chip (which routes
   // to it), so it gets no duplicate employee chip in the row. Only staff the
@@ -234,8 +255,8 @@ function InteractiveWebChatPage() {
   // agent, whose chip no longer exists — normalize it back to DuDu so the
   // highlighted entry is always present (and the URL follows).
   useEffect(() => {
-    if (mainAgentId && selectedAgentId === mainAgentId) handleSelectAgent(null);
-  }, [mainAgentId, selectedAgentId, handleSelectAgent]);
+    if (!assignedOnly && mainAgentId && selectedAgentId === mainAgentId) handleSelectAgent(null);
+  }, [assignedOnly, mainAgentId, selectedAgentId, handleSelectAgent]);
 
   // ── Conversation history ────────────────────────────────────────────────────
   //
@@ -260,14 +281,20 @@ function InteractiveWebChatPage() {
   }, [sessionsRevision]);
 
   const productName = useEffectiveName();
-  const partnerName = partner?.display_name ?? (agentName === PRODUCT_NAME ? productName : agentName);
+  const partnerName = assignedOnly && resumedExplicitly
+    ? partner?.display_name ?? selectedAgentId ?? agentName
+    : assignedOnly
+    ? resolvedAgent?.name ?? intl.formatMessage({ id: 'webchat.assignment.title' })
+    : partner?.display_name ?? (agentName === PRODUCT_NAME ? productName : agentName);
+
+  const avatarAgentId = assignedOnly && !resumedExplicitly ? resolvedAgent?.id ?? null : selectedAgentId;
 
   // Recording drives the `listening` face just like typing does.
   const face = useChatFace(phase, input.trim().length > 0 || isRecording, messages.length > 0);
 
   // Leading avatar for assistant bubbles — the partner's identity.
-  const leadingAvatar = selectedAgentId ? (
-    <CharacterAvatar agentId={selectedAgentId} name={partnerName} size={26} variant="avatar" animated={false} />
+  const leadingAvatar = avatarAgentId ? (
+    <CharacterAvatar agentId={avatarAgentId} name={partnerName} size={26} variant="avatar" animated={false} />
   ) : (
     <DuDu face="idle" size={24} animated={false} label="DuDu" />
   );
@@ -330,9 +357,9 @@ function InteractiveWebChatPage() {
   // task; the gateway checks the right again when the command arrives.
   const assigning = isAssignCommand(input);
   const mentionSource = useMemo<readonly MentionAgent[]>(() => {
-    const all = (callable ?? agents) as readonly MentionAgent[];
+    const all = (callable ?? (assignedOnly ? [] : agents)) as readonly MentionAgent[];
     return assigning ? assignableAgents(all) : all;
-  }, [callable, agents, assigning]);
+  }, [callable, agents, assigning, assignedOnly]);
   const mentionCandidates = useMemo(
     () => (activeMention ? orderMentionCandidates(filterMentionCandidates(mentionSource, activeMention.query)) : []),
     [activeMention, mentionSource],
@@ -356,7 +383,7 @@ function InteractiveWebChatPage() {
 
   const handleSend = () => {
     const text = input.trim();
-    if ((!text && attachments.length === 0) || connectionState !== 'connected') return;
+    if ((!text && attachments.length === 0) || connectionState !== 'connected' || assignmentBlocked) return;
     send(text, attachments);
     setInput('');
     setAttachments([]);
@@ -489,13 +516,13 @@ function InteractiveWebChatPage() {
   };
 
   const canSend =
-    (input.trim().length > 0 || attachments.length > 0) && connectionState === 'connected';
+    (input.trim().length > 0 || attachments.length > 0) && connectionState === 'connected' && !assignmentBlocked;
 
   const suggestions = useMemo(
     () => [
       intl.formatMessage({ id: 'webchat.suggest.1', defaultMessage: '今天有哪些待辦？' }),
       intl.formatMessage({ id: 'webchat.suggest.2', defaultMessage: '幫我整理這週的重點' }),
-      intl.formatMessage({ id: 'webchat.suggest.3', defaultMessage: '交辦一個任務給員工' }),
+      intl.formatMessage({ id: 'webchat.suggest.3', defaultMessage: '幫我想想下一步' }),
     ],
     [intl],
   );
@@ -515,8 +542,8 @@ function InteractiveWebChatPage() {
     <div className="flex h-full min-h-0 flex-col">
       {/* Session header — partner identity + status + companion + actions. */}
       <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-3">
-        {selectedAgentId ? (
-          <CharacterAvatar agentId={selectedAgentId} name={partnerName} size={26} variant="avatar" animated={false} />
+        {avatarAgentId ? (
+          <CharacterAvatar agentId={avatarAgentId} name={partnerName} size={26} variant="avatar" animated={false} />
         ) : agentIcon?.trim() ? (
           <AgentGlyph
             icon={agentIcon}
@@ -538,7 +565,7 @@ function InteractiveWebChatPage() {
           <span className="hidden sm:inline">{statusText}</span>
         </span>
         <div className="ml-auto flex items-center gap-0.5">
-          <DataExportButton dataset="conversations" agentId={selectedAgentId ?? undefined} />
+          {!assignmentBlocked && <DataExportButton dataset="conversations" agentId={(assignedOnly ? historyAgentId : selectedAgentId) ?? undefined} />}
           <VoicePlayToggle />
           {/* 對話紀錄 lives in the sidebar (newest five) and on its own page —
               the page-local duplicate list was removed 2026-08-04 (D17), so
@@ -566,30 +593,32 @@ function InteractiveWebChatPage() {
 
       {/* Staff strip — pick who you are talking to. Previously the top of the
           removed left column; it is conversation chrome, not history chrome. */}
-      {staffAgents.length > 0 && (
+      {!assignedOnly && staffAgents.length > 0 && (
         <div className="shrink-0 border-b border-surface-border">
           <EmployeeRow agents={staffAgents} selectedId={selectedAgentId} onSelect={handleSelectAgent} defaultManagerMayRead={callable?.find(a => a.name === mainAgentId)?.manager_may_read === true} />
         </div>
       )}
+
+      {assignmentBlocked && !empty && <p role="alert" className="px-4 py-3 text-sm text-muted-foreground">{assignmentMessage}</p>}
 
       {/* Conversation */}
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto max-w-3xl space-y-3">
           {empty ? (
             <div className="flex flex-col items-center justify-center gap-4 py-12 text-center">
-              {selectedAgentId ? (
-                <CharacterAvatar agentId={selectedAgentId} name={partnerName} size={88} variant="bust" />
+              {avatarAgentId ? (
+                <CharacterAvatar agentId={avatarAgentId} name={partnerName} size={88} variant="bust" />
               ) : (
                 <DuDu face={face} viseme={viseme} size={80} label={`DuDu, ${face}`} />
               )}
               <div>
                 <h3 className="text-base font-medium text-foreground">{partnerName}</h3>
                 <p className="mt-0.5 text-sm text-muted-foreground">
-                  {intl.formatMessage({ id: 'webchat.welcome', defaultMessage: 'Hi! How can I help you today?' })}
+                  {assignmentBlocked ? assignmentMessage : intl.formatMessage({ id: 'webchat.welcome', defaultMessage: 'Hi! How can I help you today?' })}
                 </p>
               </div>
               <div className="flex flex-wrap justify-center gap-2">
-                {suggestions.map((s) => (
+                {!assignmentBlocked && suggestions.map((s) => (
                   <button
                     key={s}
                     type="button"
@@ -683,7 +712,7 @@ function InteractiveWebChatPage() {
               variant="ghost"
               size="icon"
               onClick={() => fileInputRef.current?.click()}
-              disabled={connectionState !== 'connected'}
+              disabled={connectionState !== 'connected' || assignmentBlocked}
               title={intl.formatMessage({ id: 'webchat.attach', defaultMessage: '上傳檔案' })}
               aria-label={intl.formatMessage({ id: 'webchat.attach', defaultMessage: '上傳檔案' })}
             >
@@ -691,10 +720,10 @@ function InteractiveWebChatPage() {
             </Button>
             <MicButton
               onTranscript={handleTranscript}
-              disabled={connectionState !== 'connected' || talk.active}
+              disabled={connectionState !== 'connected' || talk.active || assignmentBlocked}
               onCapturingChange={setPttCapturing}
             />
-            <TalkModeButton handle={talk} disabled={connectionState !== 'connected' || pttCapturing} />
+            <TalkModeButton handle={talk} disabled={connectionState !== 'connected' || pttCapturing || assignmentBlocked} />
             <div className="relative flex-1">
             {mentionOpen && (
               <MentionPopup
@@ -740,14 +769,14 @@ function InteractiveWebChatPage() {
                 'placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
                 'dark:bg-input/30',
               )}
-              disabled={connectionState !== 'connected'}
+              disabled={connectionState !== 'connected' || assignmentBlocked}
             />
             </div>
             {isStreaming && activeMessageId && <SubmitButton
               state="streaming"
               aria-label={intl.formatMessage({ id: 'webchat.stop' })}
               onClick={() => cancel()}
-              disabled={connectionState !== 'connected'}
+              disabled={connectionState !== 'connected' || assignmentBlocked}
             />}
             <SubmitButton
               state="idle"

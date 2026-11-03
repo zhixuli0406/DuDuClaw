@@ -62,6 +62,7 @@ pub mod secret_redact;
 pub mod sensitivity;
 pub mod spawn_admission;
 pub mod ns_guard;
+pub mod root_key;
 pub mod spawn_env;
 pub mod subscription_risk;
 pub mod takeover_state;

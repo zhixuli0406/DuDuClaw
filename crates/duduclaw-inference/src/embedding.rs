@@ -108,6 +108,13 @@ mod onnx_impl {
         ///     tokenizer.json
         /// ```
         pub fn load(model_dir: &Path, model_name: &str) -> Result<Self, InferenceError> {
+            // This legacy provider has no explicit, pinned runtime init path.
+            // Never let Session::builder implicitly load ORT beside a root key.
+            if duduclaw_core::root_key::is_held() {
+                return Err(InferenceError::Other(
+                    "獨立金鑰模式不允許未經安全初始化的 ONNX 向量模型".into(),
+                ));
+            }
             // Validate path (no traversal)
             let dir_str = model_dir.to_string_lossy();
             if dir_str.contains("..") || dir_str.contains('\0') {

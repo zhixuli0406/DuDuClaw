@@ -29,6 +29,7 @@ jobs:
       contents: write
       id-token: write   # cosign keyless (Sigstore OIDC) signing
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
@@ -54,11 +55,11 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.delivery-gate.outputs.commit }}
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "22"
 
@@ -74,11 +75,13 @@ jobs:
           save-if: false
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
 
       - name: Install cross (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b  # v2
+        with:
+          tool: cross
 
       - name: Build frontend
         run: cd web && npm ci --legacy-peer-deps && npm run build
@@ -139,7 +142,7 @@ jobs:
             --output-certificate ${{ matrix.artifact }}.zip.pem `
             ${{ matrix.artifact }}.zip
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -153,7 +156,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
           merge-multiple: true
 
@@ -181,7 +184,7 @@ jobs:
           ls -l duduclaw-*.minisig
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
@@ -204,7 +207,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.delivery-gate.outputs.commit }}
 
@@ -240,16 +243,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.delivery-gate.outputs.commit }}
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
           merge-multiple: true
           path: artifacts
@@ -273,11 +276,11 @@ jobs:
       contents: read
       id-token: write  # Required for PyPI Trusted Publisher (OIDC)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.delivery-gate.outputs.commit }}
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: "3.12"
 
@@ -288,7 +291,7 @@ jobs:
 
       - name: Publish to PyPI (Trusted Publisher)
         if: env.HAS_PYPI == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1
         # Uses OIDC Trusted Publisher — no API token needed.
         # Set up at: https://pypi.org/manage/project/duduclaw/settings/publishing/
         # Add GitHub publisher: zhixuli0406/DuDuClaw, workflow: release.yml, environment: (blank)
@@ -297,7 +300,7 @@ jobs:
 
       - name: Publish to PyPI (token fallback)
         if: env.HAS_PYPI != 'true' && env.HAS_TOKEN == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}
           skip-existing: true

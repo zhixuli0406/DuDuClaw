@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import type { WorldObjectId } from './types';
 
 /**
@@ -26,7 +27,7 @@ export function worldObjectRoute(
     case 'bulletin':
       return '/inbox';
     case 'whiteboard':
-      return '/tasks';
+      return TASK_ENTRY_POINTS_HIDDEN ? null : '/tasks';
     case 'door':
       return ctx.isManager ? '/manage/channels' : null;
     case 'vault':

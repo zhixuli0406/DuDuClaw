@@ -134,7 +134,7 @@ fn overwritten_key_is_detected_and_refused() {
     assert_eq!(cp.status().state, ProtectionState::KeyChanged);
 
     // And a record sealed under the old key reports key_changed, not garbage.
-    let forged_key = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new(forged), key_id: m.key_id.clone() };
+    let forged_key = ProtectedKey { backend: BackendKind::MacosKeychain, level: ProtectionLevel::AppBound, key: Zeroizing::new(forged), key_id: m.key_id.clone() };
     assert_eq!(forged_key.unseal(&sealed).unwrap_err().code, "key_changed");
 }
 
@@ -293,4 +293,82 @@ fn account_is_derived_from_the_home_path() {
 
 pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn protection_levels_and_backend_use_stable_serde_names() {
+    for (level, name) in [
+        (ProtectionLevel::File, "file"),
+        (ProtectionLevel::UserStore, "user_store"),
+        (ProtectionLevel::ProcessIsolated, "process_isolated"),
+        (ProtectionLevel::AppBound, "app_bound"),
+    ] {
+        assert_eq!(serde_json::to_value(level).unwrap(), name);
+        assert_eq!(serde_json::from_value::<ProtectionLevel>(serde_json::json!(name)).unwrap(), level);
+    }
+    assert!(ProtectionLevel::UserStore < ProtectionLevel::ProcessIsolated);
+    assert!(ProtectionLevel::ProcessIsolated < ProtectionLevel::AppBound);
+    for (backend, name) in [
+        (BackendKind::MacosKeychain, "macos_keychain"),
+        (BackendKind::WindowsCredentialManager, "windows_credential_manager"),
+        (BackendKind::ContainerRootKey, "container_root_key"),
+        (BackendKind::None, "none"),
+    ] {
+        assert_eq!(serde_json::to_value(backend).unwrap(), name);
+        assert_eq!(serde_json::from_value::<BackendKind>(serde_json::json!(name)).unwrap(), backend);
+    }
+    let home = TempHome::new("container-status-serde");
+    let store = MemoryKeyStore::new(BackendKind::ContainerRootKey, ProtectionLevel::ProcessIsolated);
+    let cp = CredentialProtection::with_store(home.path(), Box::new(store));
+    let status = serde_json::to_value(cp.enable(false).unwrap()).unwrap();
+    assert_eq!(status["level"], "process_isolated");
+    assert_eq!(status["platform_level"], "process_isolated");
+    assert_eq!(status["backend"], "container_root_key");
+    assert_eq!(status["person_identity_allowed"], true);
+}
+
+#[test]
+fn state_messages_describe_the_actual_backend() {
+    for state in [ProtectionState::NotEnabled, ProtectionState::Missing,
+        ProtectionState::KeyChanged, ProtectionState::Unavailable] {
+        let (summary, detail) = messages::state_text(state, ProtectionLevel::File, BackendKind::ContainerRootKey, "docker_socket");
+        assert!(!summary.contains("系統金鑰圈"));
+        assert!(!detail.contains("系統金鑰圈"));
+        assert!(!detail.contains("docker_socket"));
+        match state {
+            ProtectionState::NotEnabled => assert!(detail.contains("「安全」頁")),
+            ProtectionState::KeyChanged => assert!(detail.contains("金鑰磁碟區遺失或被更換")),
+            ProtectionState::Unavailable => assert!(detail.contains("Docker 控制介面")),
+            _ => (),
+        }
+        for backend in [BackendKind::MacosKeychain, BackendKind::WindowsCredentialManager] {
+            let (_, detail) = messages::state_text(state, ProtectionLevel::File, backend, "");
+            assert!(detail.contains("系統金鑰圈"));
+        }
+    }
+    let (summary, detail) = messages::state_text(ProtectionState::Ready, ProtectionLevel::ProcessIsolated, BackendKind::ContainerRootKey, "");
+    assert!(summary.contains("獨立金鑰（AI 員工讀不到）"));
+    for limit in ["啟動步驟（root）", "Google", "存取權杖", "停止運作", "Docker 主機", "金鑰磁碟區"] {
+        assert!(detail.contains(limit), "missing truthful limitation: {limit}");
+    }
+    let (_, detail) = messages::state_text(ProtectionState::Unsupported, ProtectionLevel::File, BackendKind::None, "");
+    for text in ["一般 Docker 或 Linux", "部署指南", "原生 Linux 尚未支援", "儀表板"] {
+        assert!(detail.contains(text));
+    }
+}
+
+#[test]
+fn every_root_refusal_has_plain_chinese_text() {
+    for code in ["inactive", "fd_contract", "fd_stat", "fd_type", "fd_owner", "fd_mode",
+        "fd_links", "fd_size", "fd_read", "not_pid_one", "user_ids", "group_ids", "proc_status",
+        "no_new_privs", "cap_inh", "cap_prm", "cap_eff", "cap_bnd", "cap_amb", "dumpable",
+        "key_path_accessible", "docker_socket", "docker_host"] {
+        let text = messages::refusal_text(code).unwrap();
+        assert!(!text.is_ascii());
+        assert!(!text.contains(code));
+        let error = ProtectionError::from_state(ProtectionState::Unavailable, BackendKind::ContainerRootKey, code);
+        assert!(error.message_zh.contains(text));
+        assert!(!error.message_zh.contains(code));
+    }
+    assert!(messages::refusal_text("unknown").is_none());
 }

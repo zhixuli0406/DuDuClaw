@@ -8,7 +8,7 @@ import { sessionChannel } from '@/lib/session-channel';
 import type { ChatSessionSummary } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useChatStore } from '@/stores/chat-store';
+import { useChatStore, requiresAssignedChatAgent } from '@/stores/chat-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import {
@@ -59,10 +59,10 @@ export function ConversationsZone({
   // Scope inputs: the listing RPC is agent-scoped for non-admins, so a partner
   // switch changes the result set. `sessionsRevision` bumps once per completed
   // turn, which is what makes a just-started conversation appear here. The main
-  // agent is the fallback scope, so a late roster load has to re-trigger the
-  // fetch — otherwise a non-admin's first (unscoped) attempt returns empty and
-  // nothing would ever ask again.
+  // agent remains the admin fallback; non-admin scopes come from the server
+  // assignment, so its arrival must also refresh the list.
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
+  const resolvedAgentId = useChatStore((s) => s.resolvedAgent?.id);
   const sessionsRevision = useChatStore((s) => s.sessionsRevision);
   const activeSessionId = useChatStore((s) => s.sessionId);
   const mainAgentId = useAgentsStore((s) => s.agents.find((a) => a.role === 'main')?.name ?? null);
@@ -72,8 +72,11 @@ export function ConversationsZone({
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
+    if (requiresAssignedChatAgent() && useChatStore.getState().resolvedAgent === undefined) {
+      useChatStore.getState().connect();
+    }
     void fetchSessions();
-  }, [connectionState, selectedAgentId, mainAgentId, sessionsRevision, fetchSessions]);
+  }, [connectionState, selectedAgentId, resolvedAgentId, mainAgentId, sessionsRevision, fetchSessions]);
 
   const shown = sessions.slice(0, RAIL_LIMIT);
 

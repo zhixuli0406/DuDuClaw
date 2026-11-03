@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { NavLink, useLocation } from 'react-router';
 import { useIntl } from 'react-intl';
 import { Plus } from 'lucide-react';
@@ -8,17 +9,7 @@ import { mobileNavItemsForRole, type NavItem } from './nav-model';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 
-/**
- * MobileBottomNav — Zone A quick access on small screens (§4.3). Slots:
- * 儀表板 / 對話 / ＋交辦（center raised action, opens the /assign page） /
- * 對話紀錄 / 任務. Hidden at md+ (the sidebar takes over). Two balanced
- * side groups (2 left / 2 right) flank the centre ＋交辦; the ＋ remains the quick
- * create entry.
- *
- * 2026-08-04 (D17): 收件匣 left this bar, taking the only badge with it. The
- * pending count now shows as a bell in the mobile top bar (`MainLayout`) that
- * appears only when something is actually waiting.
- */
+/** Mobile quick access with a centred new-conversation action. */
 function BottomNavLink({ item }: { item: NavItem }) {
   const intl = useIntl();
   const Icon = item.icon;
@@ -41,17 +32,15 @@ function BottomNavLink({ item }: { item: NavItem }) {
 
 export function MobileBottomNav() {
   const intl = useIntl();
-  // UX plan I-1a: 交辦 is the primary action of both editions, so the centre ＋
-  // is no longer hidden on Personal (it was collateral damage of the
-  // 2026-07-29 "hide task-board chrome" round).
   const openAssign = useOpenAssign();
-  const onAssign = useLocation().pathname === ASSIGN_PATH;
+  const pathname = useLocation().pathname;
+  const onAssign = !TASK_ENTRY_POINTS_HIDDEN && pathname === ASSIGN_PATH;
   const role = useAuthStore((s) => s.user?.role);
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const employeeTasks = useSystemStore((s) => s.status?.employee_tasks) === true;
   const mobileNavItems = mobileNavItemsForRole(role, isPersonal, employeeTasks);
 
-  // Split the side items around the center ＋交辦 action. The center is a
+  // Split the side items around the center new-conversation action. The center is a
   // fixed-width slot flanked by two equal-flex groups, so the raised ＋ button
   // stays dead-centre horizontally. With 4 items the split is a balanced 2/2,
   // giving every tab the same width.
@@ -70,18 +59,14 @@ export function MobileBottomNav() {
         ))}
       </div>
 
-      {/* Center raised action: ＋交辦 — a fixed-width slot kept horizontally
-          centred by the equal-flex groups on either side. Opens the 交辦任務
-          page (UX plan I-1a); it used to route to the task board's
-          `?new=1` create-a-card intent, which the code itself flagged as a
-          placeholder and which never started the autonomous loop. */}
+      {/* Equal-flex side groups keep the new-conversation button centred. */}
       <div className="flex w-16 shrink-0 items-center justify-center">
         <button
           type="button"
           onClick={() => openAssign()}
           aria-current={onAssign ? 'page' : undefined}
-          aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
-          title={intl.formatMessage({ id: 'sidebar.newTask' })}
+          aria-label={intl.formatMessage({ id: chatEntryLabel('sidebar.newTask') })}
+          title={intl.formatMessage({ id: chatEntryLabel('sidebar.newTask') })}
           className="-mt-6 grid size-14 place-items-center rounded-full bg-brand text-brand-foreground shadow-[var(--menu-shadow)] ring-4 ring-sidebar transition-transform active:translate-y-px active:scale-95"
         >
           <Plus className="size-6" />

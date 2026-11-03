@@ -57,6 +57,7 @@ async fn rig() -> Rig {
     std::fs::create_dir_all(&agent).unwrap();
     std::fs::write(agent.join("agent.toml"), "[agent]\nname = \"alice\"\n").unwrap();
     let handler = MethodHandler::new(dir.path().to_path_buf()).await;
+    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     let store = Arc::new(TaskStore::open(dir.path()).unwrap());
     handler.set_task_store(Arc::clone(&store)).await;
     handler
@@ -493,4 +494,125 @@ async fn create_with_explore_lane_records_it() {
     input["lane"] = json!("write");
     let f = r.call("responsibilities.create", input, &op).await;
     assert!(!is_ok(&f), "{f:?}");
+}
+
+#[tokio::test]
+async fn main_work_admission_is_shared_by_responsibility_mutations() {
+    use crate::responsibility::service;
+    use crate::task_store::RespCas;
+
+    for mode in ["role", "default", "normal"] {
+        for method in ["responsibilities.create", "responsibilities.update_contract", "responsibilities.resume", "responsibilities.enable", "responsibilities.clear_failures"] {
+            for actor in ["manager", "admin", "fallback"] {
+                // Each case owns its row, epoch and contract revision. A
+                // previous mutation cannot turn success into a CAS conflict.
+                let r = rig().await;
+                let ctx = match actor {
+                    "manager" => user_ctx(&r, "alice", AccessLevel::Operator, UserRole::Manager),
+                    "admin" => user_ctx(&r, "alice", AccessLevel::Operator, UserRole::Admin),
+                    _ => UserContext::admin_fallback(),
+                };
+                let home = r._dir.path();
+                let path = home.join("config.toml");
+                let config = std::fs::read_to_string(&path).unwrap();
+                let input = json!({
+                    "owner_agent_id": "alice", "objective": "整理信件", "acceptance_template": "摘要",
+                    "source_refs": [], "schedule": {"cron": "0 0 9 * * *", "timezone": "Asia/Taipei"},
+                    "event_subscriptions": [], "occurrence_hours": 4, "occurrence_cost_cap_cents": 100,
+                    "budget_period": "day", "budget_timezone": "Asia/Taipei", "period_cost_limit_cents": 1000,
+                    "period_occurrence_limit": 5, "min_wake_interval_secs": 300,
+                    "max_consecutive_failures": 3, "stop_at": (Utc::now() + chrono::Duration::days(5)).to_rfc3339()
+                });
+                if method == "responsibilities.resume" {
+                    assert!(matches!(service::pause(&r.store, &r.resp_id, r.epoch, "fixture", "prepare resume", Utc::now()).await.unwrap(), RespCas::Applied(_)));
+                } else if method == "responsibilities.enable" {
+                    assert!(matches!(service::disable(&r.store, &r.resp_id, r.epoch, "fixture", "prepare enable", Utc::now()).await.unwrap(), RespCas::Applied(_)));
+                } else if method == "responsibilities.clear_failures" {
+                    // Isolate the state normally produced by failed runs.
+                    rusqlite::Connection::open(r.store.db_path()).unwrap().execute(
+                        "UPDATE responsibilities SET state='failure_paused', consecutive_failures=3 WHERE responsibility_id=?1",
+                        rusqlite::params![r.resp_id],
+                    ).unwrap();
+                }
+                let before = r.store.get_responsibility(&r.resp_id).await.unwrap().unwrap();
+                std::fs::write(home.join("agents/alice/agent.toml"), format!(
+                    "[agent]\nname = \"alice\"\nrole = \"{}\"\n", if mode == "role" { "main" } else { "specialist" }
+                )).unwrap();
+                r.handler.registry.write().await.scan().await.unwrap();
+                if mode == "default" {
+                    std::fs::write(&path, format!("{config}\n[general]\ndefault_agent = \"alice\"\n")).unwrap();
+                }
+                let params = if method == "responsibilities.create" { input.clone() } else {
+                    json!({"responsibility_id": r.resp_id, "expected_control_epoch": before.control_epoch,
+                        "expected_contract_revision": before.contract_revision, "contract": input})
+                };
+                let frame = r.call(method, params, &ctx).await;
+                if actor == "manager" && mode != "normal" {
+                    assert!(matches!(&frame, WsFrame::Response { ok: false, error: Some(e), .. }
+                        if e.as_str() == Some("主代理僅管理員可以使用。")), "{method}/{mode}: {frame:?}");
+                    let after = r.store.get_responsibility(&r.resp_id).await.unwrap().unwrap();
+                    assert_eq!(after.control_epoch, before.control_epoch);
+                    assert_eq!(after.contract_revision, before.contract_revision);
+                    assert_eq!(after.state, before.state);
+                } else {
+                    let WsFrame::Response { ok: true, payload: Some(payload), .. } = &frame else {
+                        panic!("{method}/{mode}/{actor}: {frame:?}");
+                    };
+                    assert_ne!(payload.get("conflict"), Some(&json!(true)), "{method}/{mode}/{actor}: {frame:?}");
+                    let row = &payload["responsibility"];
+                    assert_eq!(row["owner_agent_id"], "alice");
+                    assert_eq!(row["state"], "active");
+                    if method == "responsibilities.create" {
+                        assert_ne!(row["responsibility_id"].as_str(), Some(r.resp_id.as_str()));
+                    } else if method == "responsibilities.update_contract" {
+                        assert_eq!(row["contract_revision"], before.contract_revision + 1);
+                        assert_eq!(row["objective"], "整理信件");
+                    } else if method == "responsibilities.clear_failures" {
+                        assert_eq!(row["consecutive_failures"], 0);
+                    } else {
+                        assert_ne!(row["state"].as_str(), Some(before.state.as_str()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Exercise the gate itself: broken config also disables responsibilities,
+/// so a refusal from the outer RPC cannot prove admission was checked.
+#[tokio::test]
+async fn responsibility_main_gate_fails_closed_on_config_errors_without_row_changes() {
+    fn rows(path: &std::path::Path) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        let db = rusqlite::Connection::open(path).unwrap();
+        let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap();
+        let names = names.query_map([], |r| r.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        names.into_iter().map(|name| {
+            let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+            let mut stmt = db.prepare(&sql).unwrap();
+            let columns = stmt.column_count();
+            let values = stmt.query_map([], |r| (0..columns).map(|i| r.get(i)).collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()).unwrap()
+                .collect::<Result<Vec<_>, _>>().unwrap();
+            (name, values)
+        }).collect()
+    }
+    for unreadable in [true, false] {
+        let r = rig().await;
+        let manager = user_ctx(&r, "alice", AccessLevel::Operator, UserRole::Manager);
+        std::fs::write(r._dir.path().join("agents/alice/agent.toml"), "[agent]\nname = \"alice\"\nrole = \"specialist\"\n").unwrap();
+        r.handler.registry.write().await.scan().await.unwrap();
+        assert!(r.handler.deny_main_for_non_admin(&manager, "alice").await.is_ok());
+        let path = r._dir.path().join("config.toml");
+        if unreadable {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        } else {
+            std::fs::write(&path, "[broken").unwrap();
+        }
+        let before = rows(r.store.db_path());
+        let frame = r.handler.deny_main_for_non_admin(&manager, "alice").await.unwrap_err();
+        assert!(matches!(&frame, WsFrame::Response { ok: false, error: Some(e), .. }
+            if e.as_str() == Some("主代理僅管理員可以使用。")), "{frame:?}");
+        assert_eq!(rows(r.store.db_path()), before, "the gate must not change any tasks.db rows");
+    }
 }

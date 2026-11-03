@@ -131,6 +131,7 @@ impl MethodHandler {
         params: &Value,
         ctx: &UserContext,
     ) -> WsFrame {
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
         let Some(creator) = Creator::new(&ctx.user_id, ctx.is_admin()) else {
             return WsFrame::error_response(
                 "",
@@ -268,6 +269,13 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
+        if matches!(action, ManageAction::Resume) {
+            let row = match store.get_assign_schedule(id).await {
+                Ok(Some(row)) if actor.is_admin || row.creator_user_id == actor.user_id => row,
+                _ => return WsFrame::error_response("", "not_found"),
+            };
+            if let Err(frame) = self.deny_main_for_non_admin(ctx, &row.agent_id).await { return frame; }
+        }
         match manage::manage(&self.home_dir, &store, &actor, id, action, Utc::now()).await {
             Ok(row) => {
                 self.broadcast_event("assign_schedule.changed", json!({}))

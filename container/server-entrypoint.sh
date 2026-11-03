@@ -1,4 +1,12 @@
 #!/bin/bash
+# The protected-key launcher performs onboarding separately after dropping UID.
+if [ "${DUDUCLAW_PROTECTED_KEY_MODE:-}" = root-launcher ]; then
+    if [ "$(/usr/bin/id -u)" = 0 ]; then
+        exec /usr/local/lib/duduclaw/protected-key-launcher.sh "$@"
+    else
+        echo "WARNING: protected-key mode needs the person-credentials Compose overlay to start as root; personal accounts remain unavailable." >&2
+    fi
+fi
 set -e
 
 echo "DuDuClaw Server Starting..."

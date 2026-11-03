@@ -33,8 +33,8 @@ function cardTitle(example: string): string {
  * GalleryPage (`/gallery`, P2-b MVP) — "靈感畫廊": curated showcase cards, one
  * per team task example (`gallery.list`, a straight fan-out of the same
  * `team.toml` data `/experts` reads — no new storage). Each card's "做同款"
- * action opens the 交辦任務 page (`useOpenAssign`, 複雜任務 tab) prefilled with an
- * editable description + an outcome-style acceptance criterion, so trying an
+ * action opens a new chat with an editable description and acceptance
+ * criterion in the composer draft, so trying an
  * idea costs one click instead of a blank page.
  *
  * Deliberately out of scope for this wave (tracked in

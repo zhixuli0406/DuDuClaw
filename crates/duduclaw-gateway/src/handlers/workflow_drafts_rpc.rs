@@ -460,6 +460,7 @@ impl MethodHandler {
             Ok(d) => d,
             Err(f) => return f,
         };
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, &draft.owner).await { return frame; }
         if params.get("draft_hash").and_then(Value::as_str) != Some(draft.draft_hash.as_str()) {
             return WsFrame::error_response("", "fixed draft hash mismatch");
         }
@@ -544,6 +545,7 @@ impl MethodHandler {
             Ok(d) => d,
             Err(f) => return f,
         };
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, &draft.owner).await { return frame; }
         if params.get("draft_hash").and_then(Value::as_str) != Some(draft.draft_hash.as_str()) {
             return WsFrame::error_response("", "fixed draft hash mismatch");
         }
@@ -726,6 +728,9 @@ impl MethodHandler {
             Ok(d) => d,
             Err(f) => return f,
         };
+        if !revoke {
+            if let Err(frame) = self.deny_main_for_non_admin(ctx, &draft.owner).await { return frame; }
+        }
         if params.get("draft_hash").and_then(Value::as_str) != Some(draft.draft_hash.as_str()) {
             return WsFrame::error_response("", "fixed draft hash mismatch");
         }

@@ -168,3 +168,16 @@ describe('HomePage greeting name (WP18-C)', () => {
     expect(screen.getByRole('heading', { level: 1 }).textContent).toContain('小李');
   });
 });
+
+
+it('does not advertise recent tasks even when the saved dashboard layout includes them', async () => {
+  useAuthStore.setState({ user: { id: 'u1', display_name: 'Alice', role: 'admin' } as never });
+  mockWsClient.call.mockResolvedValue({
+    widgets: [{ id: 'my_tasks' }], layout: { widgets: [{ id: 'my_tasks', hidden: false }] },
+    tasks: [], approvals: [], incidents: [], events: [], channels: [], users: [], available: false,
+  });
+  const { container } = renderWithProviders(<HomePage />);
+  await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('dashboard.layout.get'));
+  expect(screen.queryByText('Recent tasks')).not.toBeInTheDocument();
+  expect(container.querySelector('a[href="/tasks"]')).toBeNull();
+});

@@ -1,15 +1,14 @@
-/**
- * The single "交辦任務" entry point.
- *
- * Every "give an AI employee something to do" button (sidebar, mobile ＋,
- * task board, `/goals`, agent cards, the gallery) navigates to the `/assign`
- * page. A seed (employee, goal text, criteria, mode) travels in router state,
- * never in the URL — a goal paragraph does not belong in a query string, a
- * bookmark or a server log. A seeded entry opens the 「複雜任務」 tab; a plain
- * one opens 「一般」. `?tab=complex` also selects the second tab.
- */
+/** Legacy assignment-page state remains available while entry points open chat. */
 
 export const ASSIGN_PATH = '/assign';
+
+/** Carry supplied text into the new chat composer without submitting it. */
+export function chatDraftState(prefill?: AssignPrefill): { draft: string } | undefined {
+  const draft = [prefill?.description, prefill?.acceptanceCriteria]
+    .filter((text): text is string => typeof text === 'string' && text.trim().length > 0)
+    .join('\n\n');
+  return draft ? { draft } : undefined;
+}
 
 /** Which of the three execution paths the 複雜任務 form submits to. */
 export type AssignMode =

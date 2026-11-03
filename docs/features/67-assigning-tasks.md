@@ -58,7 +58,7 @@ When the employee works the task, its work prompt names the person who assigned 
 
 The task id is derived from the incoming message where the platform gives it a stable id: the webhook event id on LINE, the message id on Telegram, and a per-send client id in WebChat. A redelivered webhook or update, a message the LINE durable ingress runs again, or the same WebChat frame sent twice never creates a second task. Discord, Slack and the webhook channels have no such id yet.
 
-In the dashboard, the risk-boundary field of the goal form is shown to Admins only, and `tasks.goal_create` refuses a non-blank `risk_boundary` from anyone else: a task's own boundary replaces `[goal_defaults] baseline_boundary`.
+The hidden dashboard goal form restricts its risk-boundary field to Admins, and `tasks.goal_create` still refuses a non-blank `risk_boundary` from anyone else: a task's own boundary replaces `[goal_defaults] baseline_boundary`.
 
 ## Following up
 
@@ -78,15 +78,11 @@ chat_assign_max_open = 30     # unfinished tasks assigned from chats, 0..1000
 
 A missing or out-of-range value uses the default.
 
-## In the dashboard: the 交辦任務 page
+## Dashboard entry points
 
-The **New task** button (sidebar, and the centre ＋ on a phone) and every other "give this to an AI employee" entry open the `/assign` page in both editions. It replaced the earlier pop-up form and has two tabs.
+The sidebar’s **New chat** button and the mobile centre ＋ start a new conversation. Other former assignment entry points also open `/chat`, with any prefilled text saved as an unsent draft. `/assign` redirects there. Task board and Goals are hidden from navigation for every role; existing task cards, notifications and direct URLs to `/tasks`, `/tasks/:id` and `/goals` remain usable under their existing permissions.
 
-**Standard** hands over a skill. The list shows the skills at least one AI employee you can see has switched on: **Recently run** first (newest first, with the time and who ran it), then **Other skills** by name. Pick one, optionally add one line (up to 500 characters) and files, and press **Assign task**. The gateway decides who runs it, the same way the footer line predicts: among the employees holding the skill with it switched on (a copy that failed the install scan is skipped), the one who ran it most recently; if nobody has run it yet, the first by employee id. You need the same right on that employee as for any assignment (Admin, an Owner or Operator binding, or a team grant that derived Operator); otherwise the request is refused rather than sent to someone else. The goal's description starts with the skill, your line and the file paths, followed by the skill's full text (when the text does not fit, the opening part is included and the full text is saved as a file next to the attachments). Its acceptance criteria are the skill's own description plus your line. RPC: `tasks.skill_assign` (`skill_name`, optional `note`, optional `attachments`).
-
-**Complex task** is the full form: 問一問 / 交辦 / 想一想, the employee and data-scope chips, **When**, what done looks like, the output format and more settings. Entries that already know the employee or the goal (an employee card, a gallery card) open this tab filled in. With 問一問, the draft and any files go to the chat page as an unsent message.
-
-**Files.** Both tabs take up to 10 files, each up to 20 MB and 50 MB together. They are saved into the running employee's own file area (`agents/<id>/attachments/`) and their full paths are added to the task description under 附件 so the employee can open them. A file that is not valid or is over a limit refuses the whole request before anything is created. A scheduled assignment saves its files once, when you create the schedule; every run points at those copies. Because the dashboard's live connection refuses messages over 1 MB, a request with files goes to `POST /api/tasks/rpc` (signed-in session only), which runs the same checks as the live connection.
+The assignment page remains in the source code, but its Standard and Complex task forms are not exposed by the dashboard route. Task data, assignment schedules and RPCs, including `tasks.skill_assign`, `tasks.create` and `tasks.goal_create`, are unchanged. Chat assignment commands described on this page still work. In WebChat, non-Admins cannot assign to the main-role or gateway-default employee, even with a binding.
 
 ## Scheduling an assignment
 
@@ -109,7 +105,7 @@ A repeat without a time means 09:00, and a date without a year that has already 
 - `/交辦 排程` (`/assign schedules`) lists your schedules with their number, employee, timing and state.
 - `/交辦 排程 暫停 <number>`, `恢復 <number>`, `刪除 <number>` (`pause`, `resume`, `remove`) control one of yours. The number is the 8-character `#…` from the list.
 
-**In the dashboard**, the 交辦任務 page's **Complex task** tab has **When**: now (the default), once at a date and time, every day, weekdays, weekly on chosen days, every hour, or (Admins) a custom cron expression. Times are read in your browser's time zone. **Goals → Assigned by me** shows a **Scheduled** section with the next and last run and **Pause / Resume / Remove**; an Admin can switch it to everyone's schedules. Over RPC, `tasks.goal_create` and `tasks.create` accept `schedule` (`{kind:"once", at}`, `{kind:"daily"|"weekdays", time}`, `{kind:"weekly", days:[1..7], time}`, `{kind:"hourly", minute}`, `{kind:"cron", expr}`, or a phrase such as `"每週一 9:00"`) and `schedule_timezone` (IANA); `assign_schedules.list` (`scope: "mine" | "all"`), `.pause`, `.resume` and `.remove` (`id`) manage them.
+**In the dashboard**, open `/goals` directly and use **Assigned by me**. It shows a **Scheduled** section with the next and last run and **Pause / Resume / Remove**; an Admin can switch it to everyone's schedules. Over RPC, `tasks.goal_create` and `tasks.create` accept `schedule` (`{kind:"once", at}`, `{kind:"daily"|"weekdays", time}`, `{kind:"weekly", days:[1..7], time}`, `{kind:"hourly", minute}`, `{kind:"cron", expr}`, or a phrase such as `"每週一 9:00"`) and `schedule_timezone` (IANA); `assign_schedules.list` (`scope: "mine" | "all"`), `.pause`, `.resume` and `.remove` (`id`) manage them.
 
 **Your right is checked again at every run.** Creating a schedule needs the same right as assigning now. Before each run the gateway re-reads your account: if it was suspended or offboarded, the binding was removed, or the report you reached the employee through moved out of your team (or an Admin who set a cron schedule or a risk boundary is no longer Admin), the run is skipped, the schedule is paused with the reason, and you get a message on your linked channels. An employee that is disabled or deleted pauses the schedule the same way. Resume re-checks the creator's right (an Admin resuming someone else's schedule does not lend it their own rights). Only the creator and Admins can see or control a schedule; other people's numbers read as not found.
 

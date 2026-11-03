@@ -87,6 +87,14 @@ impl MethodHandler {
         if !authorize(&live, agent, action) {
             return Box::pin(self.handle_computer_team(method, params, ctx)).await;
         }
+        // Sessions are indexed by this validated employee id; the live
+        // operations below use the same key, never a caller-supplied session
+        // owner. Refuse before removing a hold or releasing a takeover lease.
+        if matches!(method, "computer_sessions.resume" | "computer_sessions.hand_back") {
+            if let Err(frame) = self.deny_main_for_non_admin(&live, agent).await {
+                return frame;
+            }
+        }
         let sessions = admin_sessions(&self.home_dir);
         let result = match method {
             "computer_sessions.status" => {
@@ -184,5 +192,50 @@ mod tests {
             .handle("computer_sessions.view", json!({"agent_id": "alice"}), &admin)
             .await;
         assert!(failed(&view), "no session to watch");
+    }
+
+    #[tokio::test]
+    async fn computer_resume_and_hand_back_gate_main_before_session_operations() {
+        for main_role in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().canonicalize().unwrap();
+            let handler = MethodHandler::new(home.clone()).await;
+            let fallback = UserContext::admin_fallback();
+            for (id, role) in [("main-target", if main_role { "main" } else { "specialist" }), ("normal-target", "specialist")] {
+                let frame = handler.handle_agents_create_as(json!({"name": id, "role": role}), Some(&fallback)).await;
+                assert!(!failed(&frame), "{frame:?}");
+            }
+            std::fs::write(home.join("config.toml"), if main_role { "" } else { "[general]\ndefault_agent = \"main-target\"\n" }).unwrap();
+            let db = UserDb::new(&home.join("users.db")).unwrap();
+            let manager = db.create_user("computer-manager@test.invalid", "Manager", "isolated-test-password", UserRole::Manager).unwrap();
+            for agent in ["main-target", "normal-target"] {
+                db.bind_agent(&manager.id, agent, AccessLevel::Operator).unwrap();
+            }
+            let manager = db.live_user_context(&manager.id).unwrap().unwrap();
+            let admin = db.create_user("computer-admin@test.invalid", "Admin", "isolated-test-password", UserRole::Admin).unwrap();
+            let admin = db.live_user_context(&admin.id).unwrap().unwrap();
+            for edition in [duduclaw_core::EditionProfile::Enterprise, duduclaw_core::EditionProfile::Personal] {
+                handler.set_edition_override(Some(edition)).await;
+                for method in ["computer_sessions.resume", "computer_sessions.hand_back"] {
+                    let frame = handler.handle(method, json!({"agent_id": "main-target"}), &manager).await;
+                    assert!(matches!(&frame, WsFrame::Response { ok: false, error: Some(e), .. }
+                        if e.as_str() == Some("主代理僅管理員可以使用。")), "{method}: {frame:?}");
+                    // There is deliberately no active container: this exact
+                    // error proves the allowed identities reach the session
+                    // operation rather than failing at the admission gate.
+                    for (agent, ctx) in [("normal-target", &manager), ("main-target", &admin), ("main-target", &fallback)] {
+                        let frame = handler.handle(method, json!({"agent_id": agent}), ctx).await;
+                        assert!(matches!(&frame, WsFrame::Response { ok: false, error: Some(e), .. }
+                            if e.as_str() == Some("這位員工目前沒有進行中的電腦操作 session。")), "{method}/{agent}: {frame:?}");
+                    }
+                }
+                // Status and stop retain their existing permissions for main.
+                let frame = handler.handle("computer_sessions.status", json!({"agent_id": "main-target"}), &manager).await;
+                assert!(!failed(&frame), "{frame:?}");
+                let frame = handler.handle("computer_sessions.stop", json!({"agent_id": "main-target"}), &manager).await;
+                assert!(!matches!(&frame, WsFrame::Response { error: Some(e), .. }
+                    if e.as_str() == Some("主代理僅管理員可以使用。")), "{frame:?}");
+            }
+        }
     }
 }

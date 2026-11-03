@@ -36,3 +36,12 @@ impl OnnxError {
 
 /// Result alias.
 pub type OnnxResult<T> = Result<T, OnnxError>;
+
+/// Refuse employee-writable native models while the gateway holds the root key.
+/// Call before opening model files or entering any ORT API.
+pub fn refuse_in_process_models() -> Result<(), String> {
+    if duduclaw_core::root_key::is_held() {
+        return Err("獨立金鑰模式下不在主程式內載入 ONNX 模型（隱私偵測、本機知識庫向量、Kokoro 語音暫停使用）".into());
+    }
+    Ok(())
+}

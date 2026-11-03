@@ -60,7 +60,7 @@ describe('AppSidebar (Multica shell)', () => {
     // Flat daily items (no group header), plus the footer Inbox bell shortcut.
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: /Inbox/i }).length).toBeGreaterThan(0);
-    expect(screen.getByRole('link', { name: /New chat/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /New chat/i })).toBeInTheDocument();
     // 對話紀錄 zone (moved above 設定 on 2026-08-04, WP18-B).
     expect(screen.getByText(/^Conversations$/)).toBeInTheDocument();
     // The three group labels.
@@ -68,7 +68,7 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.getByText(/^Company$/)).toBeInTheDocument();
     expect(screen.getByText(/^Settings$/)).toBeInTheDocument();
     // The primary 交辦 action + the ⌘K search trigger.
-    expect(screen.getByRole('button', { name: /New task/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /New chat/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Command palette/i })).toBeInTheDocument();
   });
 
@@ -133,7 +133,7 @@ describe('AppSidebar (Multica shell)', () => {
     expect(home).toHaveAttribute('aria-current', 'page');
     expect(home.className).toContain('bg-sidebar-accent');
     // A non-active item carries neither.
-    const chat = screen.getByRole('link', { name: /New chat/i });
+    const chat = screen.getByRole('button', { name: /New chat/i });
     expect(chat).not.toHaveAttribute('aria-current', 'page');
   });
 
@@ -167,7 +167,8 @@ describe('AppSidebar (Multica shell)', () => {
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())
       .filter(Boolean) as string[];
-    const seq = ['New chat', 'Automations', 'Skills', 'Memory', 'Agents', 'Virtual office'];
+    expect(precedes(screen.getByRole('button', { name: /New chat/i }), screen.getByRole('link', { name: /Automations/i }))).toBe(true);
+    const seq = ['Automations', 'Skills', 'Memory', 'Agents', 'Virtual office'];
     const positions = seq.map((l) => order.indexOf(l));
     // Every one of the six must actually be on the rail — otherwise a -1 would
     // let this assertion pass while the row was missing entirely.
@@ -188,7 +189,7 @@ describe('AppSidebar (Multica shell)', () => {
 
     // Expanding 進階 reveals the folded work surfaces.
     await user.click(screen.getByText(/^Advanced$/));
-    expect(screen.getByRole('link', { name: /Task Board/i })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Task Board/i })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Reports/i })).toBeInTheDocument();
     // AI Teams must NOT also appear in the expanded 進階 section — it left
     // `personalAdvancedGroup` for `personalPrimaryItems` (P2-a-nav).
@@ -202,7 +203,7 @@ describe('AppSidebar (Multica shell)', () => {
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())
       .filter(Boolean) as string[];
-    const advSeq = ['Task Board', 'Reports', 'OS', 'Growth', 'Widget Studio'];
+    const advSeq = ['Reports', 'OS', 'Growth', 'Widget Studio'];
     const advPos = advSeq.map((l) => advanced.indexOf(l));
     expect(advPos.every((i) => i >= 0)).toBe(true);
     expect(advPos).toEqual([...advPos].sort((a, b) => a - b));
@@ -234,15 +235,13 @@ describe('AppSidebar (Multica shell)', () => {
     // 例行工作 leads 工作 and 任務看板 closes it — the Enterprise stand-in for
     // folding the board into 進階.
     expect(order.indexOf('Automations')).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Automations'));
+    expect(order).not.toContain('Task Board');
     expect(order.indexOf('Automations')).toBeLessThan(order.indexOf('Reports'));
-    expect(order.indexOf('Task Board')).toBeGreaterThan(order.indexOf('Reports'));
     // WP-NAV: the occasional rows sink below the oversight pair (時間軸 / 用量)
     // and stay above the deliberately-demoted board. `/forks` is
     // progressive-disclosure (no fork records in this fixture) so OS is the one
     // occasional row rendered here.
     expect(order.indexOf('OS')).toBeGreaterThan(order.indexOf('Reports'));
-    expect(order.indexOf('OS')).toBeLessThan(order.indexOf('Task Board'));
     // WP18-B: the 對話紀錄 slot is identical on Enterprise — after the 公司
     // group's last row, before 設定. If the two editions ever fork here, one of
     // these two assertions fails.
@@ -327,7 +326,7 @@ describe('employee sidebar', () => {
     expect(screen.queryByRole('button', { name: /Workspace/i })).not.toBeInTheDocument();
     expect(screen.getByText('Sales')).toBeInTheDocument();
     expect(screen.getAllByRole('link').slice(0, 5).map(link => link.getAttribute('href'))).toEqual(['/', '/inbox', '/skills', '/memory', '/world']);
-    expect(precedes(screen.getByRole('button', { name: /Command palette/i }), screen.getByRole('button', { name: /New task/i }))).toBe(true);
+    expect(precedes(screen.getByRole('button', { name: /Command palette/i }), screen.getByRole('button', { name: /New chat/i }))).toBe(true);
     expect(screen.queryByRole('link', { name: /Task Board/i })).not.toBeInTheDocument();
     await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(1));
   });
@@ -428,4 +427,16 @@ it('shows the connection dot and hides help for an active distributor brand', as
   await user.click(screen.getByRole('button', { name: 'Alice' }));
   expect(await screen.findByRole('img', { name: 'Connection needed' })).toBeInTheDocument();
   expect(screen.queryByRole('menuitem', { name: 'Get help' })).not.toBeInTheDocument();
+});
+
+
+describe('single desktop new-conversation entry', () => {
+  it.each(['admin', 'manager', 'employee'] as const)('shows one entry and no task links for %s, regardless of employee_tasks', role => {
+    useAuthStore.setState({ user: { id: 'u1', role } as never });
+    useSystemStore.setState({ status: { edition_profile: 'enterprise', employee_tasks: true } as never });
+    const { container } = renderSidebar();
+    expect(screen.getAllByRole('button', { name: 'New chat' })).toHaveLength(1);
+    expect(screen.queryByRole('link', { name: 'New chat' })).not.toBeInTheDocument();
+    expect(container.querySelector('a[href="/tasks"], a[href="/goals"], a[href="/assign"]')).toBeNull();
+  });
 });

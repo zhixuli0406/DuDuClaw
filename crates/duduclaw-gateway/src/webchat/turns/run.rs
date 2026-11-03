@@ -41,6 +41,10 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     }
     let sid = sid.as_str();
     let effective_agent_id = effective_agent.as_deref().unwrap_or(&agent_id);
+    if let Err(frame) = state.authorize_target(&auth_user, effective_agent_id, true).await {
+        sink.frame(frame).await;
+        return;
+    }
     // Persist any uploaded files and append path references
     // to the prompt — the agent (Claude CLI) reads them from
     // disk, exactly as channel attachments are handled.
@@ -71,7 +75,11 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         if !ticket.begin_delivery() {
             return;
         }
-        if let Some(cmd) = crate::chat_commands::parse_command(&content, None) {
+        if let Some(mut cmd) = crate::chat_commands::parse_command(&content, None) {
+            if let Err(frame) = state.authorize_command(&auth_user, &mut cmd).await {
+                sink.frame(frame).await;
+                return;
+            }
             // WebChat carries no addressable per-sender channel
             // identity (no `agent_binding`-style account to bind
             // in the dashboard), so `/rules off` can never resolve

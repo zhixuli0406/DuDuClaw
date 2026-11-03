@@ -27,8 +27,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  release:
+  decide:
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check whether release dependencies changed
+        id: decide
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: python3 scripts/ci_warm_needed.py
+
+  release:
+    needs: decide
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.decide.outputs.run != 'false' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,11 +62,11 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "22"
 
@@ -65,7 +82,9 @@ jobs:
 
       - name: Install cross (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b  # v2
+        with:
+          tool: cross
 
       - name: Build frontend
         run: cd web && npm ci --legacy-peer-deps && npm run build
@@ -85,7 +104,8 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
 
   desktop-release:
-    if: github.ref == 'refs/heads/main'
+    needs: decide
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.decide.outputs.run != 'false' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -100,7 +120,7 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
 
@@ -115,7 +135,8 @@ jobs:
           workspaces: |
             . -> target
             src-tauri -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Preserve scarce macOS cache space; Linux/Windows restore without saving.
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' }}
 
       - name: Linux deps (WebKitGTK)
         if: matrix.os == 'ubuntu-22.04'
@@ -123,7 +144,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: 20
 
@@ -133,7 +154,7 @@ jobs:
       - name: Generate app icons
         shell: bash
         run: |
-          cargo install tauri-cli --version "^2" --locked
+          cargo install tauri-cli --version "=2.12.4" --locked
           cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 
       - name: Build & stage gateway sidecar

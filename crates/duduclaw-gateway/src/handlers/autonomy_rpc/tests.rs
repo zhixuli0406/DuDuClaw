@@ -37,7 +37,11 @@ async fn fixture() -> Fixture {
         ctx.email = user.email.clone();
         ctx
     };
+    crate::trigger_route::tests::write_agent(
+        &home.join("agents"), "sales", "Sales", "@sales", "specialist", "",
+    );
     let handler = MethodHandler::new(home.clone()).await;
+    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     Fixture {
         _dir: dir,
         home,

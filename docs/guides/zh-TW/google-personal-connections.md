@@ -5,7 +5,7 @@
 ## 準備安裝環境
 
 1. 在「管理 → 整合 → Google」設定 Google 應用程式，開啟 Google Workspace 整合。個人連線不會自行開啟全機總開關。
-2. 在「安全性 → 憑證保護」改用系統鑰匙圈。個人連線需要支援的 macOS 或 Windows 鑰匙圈。只有密碼保護、鑰匙圈不可用或憑證讀不到，都會拒絕使用。Linux 和 Docker 目前不支援這種個人連線模式。
+2. 在「安全性 → 憑證保護」改用系統鑰匙圈。個人連線需要支援的 macOS 或 Windows 鑰匙圈，或用 person-credentials 疊加設定啟動的 Docker（見 [Docker 指南](docker.md#74-個人帳號person-credentials-疊加設定)）。只有密碼保護、鑰匙圈或獨立金鑰不可用、或憑證讀不到，都會拒絕使用。一般的 Docker 安裝與原生 Linux 不支援這種個人連線模式。
 3. 把「我的連線」顯示的完整返回網址註冊到 Google 用戶端。個人返回路徑是 `/api/me/google/callback`，共用連線精靈則使用 `/api/mcp/oauth/callback`，請依實際流程註冊。核准的 HTTPS 儀表板使用該站網址，其他來源使用本機 HTTP，並提供返回網址貼上欄位。主機、埠、路徑必須完全相符，不要為了排除錯誤而公開本機回呼。
 4. 依[設定指南](google-setup.md)檢查帳號和應用程式限制。External＋Testing 每七天需要重新授權；正式使用受限制的 Gmail 權限前，可能還需要 Google 驗證與安全評估。
 5. 閱讀 Google 資料使用說明，核對 AI 供應商條款。Google Workspace 資料不得用來訓練或改善通用模型。無法確認供應商符合規定時，改用適當的本機模型，或維持 Google 未連線。

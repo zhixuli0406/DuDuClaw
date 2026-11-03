@@ -67,7 +67,7 @@ RUN pip install --no-cache-dir anthropic==0.50.0
 # Install docker.io (includes the Docker client), Node.js 22, AI CLIs, and curl.
 # The runtime inherits this client via FROM cli-tools; no daemon/socket is started here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    docker.io ca-certificates curl gnupg && \
+    docker.io ca-certificates curl gnupg util-linux && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     npm install -g \
@@ -125,6 +125,10 @@ ENV PYTHONPATH=/opt/duduclaw
 # Copy entrypoint
 COPY container/server-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+COPY --chown=0:0 --chmod=0755 container/protected-key-launcher.sh /usr/local/lib/duduclaw/protected-key-launcher.sh
+RUN mkdir -p /var/lib/duduclaw-protected && \
+    chown root:root /var/lib/duduclaw-protected && \
+    chmod 0700 /var/lib/duduclaw-protected
 
 RUN mkdir -p \
         /home/duduclaw/.duduclaw \

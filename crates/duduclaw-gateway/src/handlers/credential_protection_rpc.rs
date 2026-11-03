@@ -45,6 +45,7 @@ pub(crate) fn status_json(s: &ProtectionStatus) -> Value {
         "person_identity_allowed": s.person_identity_allowed,
         "summary": s.summary_zh,
         "detail": s.detail_zh,
+        "refusal_reason": s.refusal_reason,
     })
 }
 

@@ -49,10 +49,11 @@ The list below records what has actually been run. A terminal missing from it ma
 
 | Terminal | Status |
 |---|---|
-| tmux on macOS | Full screen tested on a real gateway. Notifications use tmux passthrough where tmux allows it. |
+| tmux on macOS | Full screen tested on a real gateway, including a reply from a real local model, a mid-reply cancel, and mouse input reaching programs in the terminal block (X10, SGR, urxvt and SGR-Pixels encodings, and `vim`). Notifications use tmux passthrough where tmux allows it. |
+| Terminal.app on macOS | Full screen tested on a real gateway: drawing, CJK width, `p` and `u`, CJK and emoji input, the terminal block, clean exit. Keys came from a test program, not a physical keyboard. |
 | macOS and Linux terminals over a pseudo-terminal in automated tests | Rendering covered by snapshots at 60 columns and wider, down to 12 rows. |
 | Windows, `tui inbox` over SSH | Tested on a native Windows machine. |
-| Windows full screen | Not verified. SSH cannot exercise it. |
+| Windows 11 full screen under ConPTY | Tested on a real gateway on a native Windows machine, with a test program driving a real Pseudo Console: drawing, resize, too-small message, `p` and `u` confirmed in the gateway, CJK input, clean exit. Windows Terminal itself has not been used. |
 | Ubuntu 22.04 on real hardware, full screen under a PTY | Tested on a real gateway: drawing, resize, too-small message, `p` and `u` confirmed in the gateway, clean exit and terminal restore. A physical terminal emulator has not been used. |
 
 The room needs at least 24 columns and 12 rows, and says so when the window is smaller. Status glyphs are ASCII by default; set `glyphs = 'unicode'` in `tui.toml` if your font has them. The room handles CJK width and whole committed characters, but an input method has not been tested by hand.
