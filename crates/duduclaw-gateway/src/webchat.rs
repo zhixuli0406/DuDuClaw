@@ -1452,9 +1452,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         tokio::spawn(turns::execute(input, turn_sink, ticket));
                                     }
                                     Err(code) => {
-                                        let value = serde_json::json!({"type":"error", "code":code,
-                                            "message":"Turn admission limit reached or duplicate message id",
-                                            "request_id":msg_id});
+                                        let value = turn_admission_error(code, sid, conv_nonce.as_deref(), &msg_id);
                                         let _ = out_tx.send(turns::Outbound { identity_notice: None, message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
                                     }
                                 }
@@ -1809,10 +1807,27 @@ fn assign_event_id(msg_id: Option<&str>) -> Option<String> {
         .map(|m| format!("web:{m}"))
 }
 
+fn turn_admission_error(code: &str, session_id: &str, conv: Option<&str>, msg_id: &str) -> serde_json::Value {
+    serde_json::json!({"type":"error", "code":code,
+        "message":"Turn admission limit reached or duplicate message id",
+        "request_id":msg_id, "session_id":session_id, "conv":conv, "msg_id":msg_id})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use duduclaw_auth::{AccessLevel, JwtConfig, UserDb, UserRole, UserStatus};
+
+    #[test]
+    fn admission_errors_identify_the_rejected_turn() {
+        for code in ["turn_limit", "duplicate_message"] {
+            assert_eq!(turn_admission_error(code, "session", Some("conversation"), "message"),
+                serde_json::json!({"type":"error", "code":code,
+                    "message":"Turn admission limit reached or duplicate message id",
+                    "request_id":"message", "session_id":"session", "conv":"conversation", "msg_id":"message"}));
+        }
+        assert!(turn_admission_error("turn_limit", "session", None, "message")["conv"].is_null());
+    }
 
     #[tokio::test]
     async fn revoked_credential_rolls_back_archives_before_blocking_final_reply() {

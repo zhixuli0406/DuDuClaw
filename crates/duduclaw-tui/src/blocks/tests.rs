@@ -95,6 +95,7 @@ impl Gateway for Fake {
             "tasks.changes" => {
                 json!({"changes":[{"path":"src/中文.rs","op":"write","tool_name":"Write","timestamp":"09:00","success":true,"snippet":"private-source"}],"distinct_paths":1,"truncated":false})
             }
+            "tasks.role_turns" => json!({"turns":[]}),
             "tasks.stop_status" => json!({"stop":null,"authority_revision":7}),
             "responsibilities.list" => {
                 json!({"responsibilities":[{"responsibility_id":"r1","owner_agent_id":"adu","objective":"檢查狀態","state":"active","control_epoch":2}]})

@@ -1,0 +1,25 @@
+---
+source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
+assertion_line: 298
+expression: body
+---
+[ / ] 切換；b 任務／責任；Enter 查看目標卡
+1/1
+標題: 目標
+狀態: needs_human
+員工: adu
+暫停原因: 閘道未提供
+更新時間: revision
+e 補充方向（需確認）
+s 停止（需確認）
+驗收條件紀錄
+模式: enforce
+最近回報回合: 2
+無效回報: 0
+條件 · 內容 · 狀態 · 證據 · 未解決 · 更新回合
+C1 · 每週報告 · confirmed · 每週報告 · 閘道未提供 · 2
+團隊角色回合
+閘道連線已中斷，資料可能過期
+回合
+時間軸
+檔案變更

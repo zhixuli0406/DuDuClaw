@@ -792,15 +792,50 @@ enum CircuitState {
     /// Normal operation. `fires` tracks timestamps within the sliding window.
     Closed { fires: Vec<std::time::Instant> },
     /// Tripped; all requests blocked until `opened_at + CIRCUIT_OPEN_COOLDOWN`.
-    Open { opened_at: std::time::Instant },
+    Open { opened_at: std::time::Instant, opened_at_utc: Option<chrono::DateTime<chrono::Utc>> },
     /// Probe state after cooldown. One probe was allowed at `probed_at`;
     /// subsequent fires within `CIRCUIT_HALF_OPEN_PROBE_WINDOW` re-trip.
-    HalfOpen { probed_at: std::time::Instant },
+    HalfOpen { probed_at: std::time::Instant, opened_at_utc: Option<chrono::DateTime<chrono::Utc>> },
 }
 
 impl CircuitState {
     fn new_closed() -> Self {
         Self::Closed { fires: Vec::new() }
+    }
+}
+
+/// A weak, read-only view that cannot keep a stopped engine alive.
+#[derive(Clone)]
+pub(crate) struct BreakerReader {
+    circuit: std::sync::Weak<tokio::sync::Mutex<HashMap<String, CircuitState>>>,
+    running: std::sync::Weak<std::sync::atomic::AtomicBool>,
+}
+
+impl BreakerReader {
+    /// Snapshot stored states without admitting a fire or advancing cooldowns.
+    pub(crate) async fn snapshot(&self, rule_ids: &[String]) -> Option<Vec<Value>> {
+        let running = self.running.upgrade()?;
+        if !running.load(std::sync::atomic::Ordering::Acquire) { return None; }
+        let circuit = self.circuit.upgrade()?;
+        let states = circuit.lock().await;
+        if !running.load(std::sync::atomic::Ordering::Acquire) { return None; }
+        Some(rule_ids.iter().map(|id| {
+            let (state, opened_at) = match states.get(id) {
+                None | Some(CircuitState::Closed { .. }) => ("closed", None),
+                Some(CircuitState::Open { opened_at_utc, .. }) => ("open", *opened_at_utc),
+                Some(CircuitState::HalfOpen { opened_at_utc, .. }) => ("half_open", *opened_at_utc),
+            };
+            serde_json::json!({"rule_id": id, "state": state,
+                "opened_at": opened_at.map(|at| at.to_rfc3339())})
+        }).collect())
+    }
+}
+
+/// Reset availability on normal exit, cancellation and panic.
+struct EngineRunning(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for EngineRunning {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -812,7 +847,8 @@ pub struct AutopilotEngine {
     event_rx: broadcast::Receiver<AutopilotEvent>,
     /// Per-rule circuit breaker state.
     /// Mutex never held across `.await` (pure in-memory map operations).
-    circuit: tokio::sync::Mutex<std::collections::HashMap<String, CircuitState>>,
+    circuit: Arc<tokio::sync::Mutex<HashMap<String, CircuitState>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
     /// Optional HITL approval broker. When present, a rule whose action
     /// JSON carries `require_approval = true` requests human approval and
     /// SKIPS immediate execution (fail-closed). Defaults to `None` — the
@@ -875,13 +911,21 @@ impl AutopilotEngine {
             task_store,
             message_queue,
             event_rx,
-            circuit: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            circuit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_broker: None,
             proactive_gate: None,
             os_goal_debounce: tokio::sync::Mutex::new(HashMap::new()),
             tick_hub: None,
             screener,
             screen_default: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn breaker_reader(&self) -> BreakerReader {
+        BreakerReader {
+            circuit: Arc::downgrade(&self.circuit),
+            running: Arc::downgrade(&self.running),
         }
     }
 
@@ -956,22 +1000,22 @@ impl AutopilotEngine {
             CircuitState::Closed { fires } => {
                 fires.retain(|t| now.duration_since(*t) < CIRCUIT_WINDOW);
                 if fires.len() >= CIRCUIT_MAX_FIRES {
-                    *state = CircuitState::Open { opened_at: now };
+                    *state = CircuitState::Open { opened_at: now, opened_at_utc: Some(chrono::Utc::now()) };
                     return (false, Some("open"));
                 }
                 fires.push(now);
                 (true, None)
             }
-            CircuitState::Open { opened_at } => {
+            CircuitState::Open { opened_at, opened_at_utc } => {
                 if now.duration_since(*opened_at) < CIRCUIT_OPEN_COOLDOWN {
                     (false, None)
                 } else {
                     // Cooldown elapsed → enter HalfOpen and allow one probe.
-                    *state = CircuitState::HalfOpen { probed_at: now };
+                    *state = CircuitState::HalfOpen { probed_at: now, opened_at_utc: *opened_at_utc };
                     (true, Some("half_open"))
                 }
             }
-            CircuitState::HalfOpen { probed_at } => {
+            CircuitState::HalfOpen { probed_at, .. } => {
                 if now.duration_since(*probed_at) < CIRCUIT_HALF_OPEN_PROBE_WINDOW {
                     // Any fire within the probe window → re-trip to Open.
                     // Tagged distinctly from a fresh Closed→Open trip
@@ -979,7 +1023,7 @@ impl AutopilotEngine {
                     // notification can dedup: a probe re-trip continues the
                     // SAME open episode and must never push a second notice
                     // for it — see `autopilot_notify` module docs.
-                    *state = CircuitState::Open { opened_at: now };
+                    *state = CircuitState::Open { opened_at: now, opened_at_utc: Some(chrono::Utc::now()) };
                     (false, Some("open_retrip"))
                 } else {
                     // Probe window elapsed without re-trip → reset to Closed
@@ -992,6 +1036,8 @@ impl AutopilotEngine {
     }
 
     pub async fn run(mut self) {
+        self.running.store(true, std::sync::atomic::Ordering::Release);
+        let _running = EngineRunning(self.running.clone());
         info!("AutopilotEngine started");
         loop {
             match self.event_rx.recv().await {
@@ -3371,6 +3417,42 @@ mod tests {
         (engine, tmp_dir)
     }
 
+    #[tokio::test]
+    async fn breaker_snapshot_is_read_only_and_tracks_engine_lifetime() {
+        let (engine, tmp) = make_engine().await;
+        let reader = engine.breaker_reader();
+        let ids = vec!["new-rule".into(), "open-rule".into(), "probe-rule".into()];
+        assert!(reader.snapshot(&ids).await.is_none());
+        let opened_at = chrono::Utc::now();
+        {
+            let mut states = engine.circuit.lock().await;
+            states.insert("open-rule".into(), CircuitState::Open {
+                opened_at: Instant::now() - CIRCUIT_OPEN_COOLDOWN - Duration::from_secs(1),
+                opened_at_utc: Some(opened_at),
+            });
+            states.insert("probe-rule".into(), CircuitState::HalfOpen {
+                probed_at: Instant::now() - CIRCUIT_HALF_OPEN_PROBE_WINDOW - Duration::from_secs(1),
+                opened_at_utc: Some(opened_at),
+            });
+        }
+        engine.running.store(true, std::sync::atomic::Ordering::Release);
+        let running = EngineRunning(engine.running.clone());
+        let first = reader.snapshot(&ids).await.unwrap();
+        assert_eq!(first[0], serde_json::json!({"rule_id":"new-rule", "state":"closed", "opened_at":null}));
+        assert_eq!(first[1]["state"], "open");
+        assert_eq!(first[1]["opened_at"], opened_at.to_rfc3339());
+        assert_eq!(first[2]["state"], "half_open");
+        assert_eq!(first, reader.snapshot(&ids).await.unwrap());
+        assert_eq!(engine.circuit.lock().await.len(), 2);
+        assert_eq!(engine.circuit_check("open-rule").await.1, Some("half_open"));
+        assert_eq!(engine.circuit_check("probe-rule").await.1, Some("closed"));
+        drop(running);
+        assert!(reader.snapshot(&ids).await.is_none());
+        drop(engine);
+        assert!(reader.snapshot(&ids).await.is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn circuit_closed_to_open_on_burst() {
         let (engine, tmp) = make_engine().await;
@@ -3407,6 +3489,7 @@ mod tests {
             map.insert(
                 "rule-z".into(),
                 CircuitState::Open {
+                    opened_at_utc: None,
                     opened_at: std::time::Instant::now()
                         - CIRCUIT_OPEN_COOLDOWN
                         - Duration::from_secs(1),
@@ -3429,6 +3512,7 @@ mod tests {
             map.insert(
                 "rule-w".into(),
                 CircuitState::HalfOpen {
+                    opened_at_utc: None,
                     probed_at: std::time::Instant::now(),
                 },
             );
@@ -3451,6 +3535,7 @@ mod tests {
             map.insert(
                 "rule-q".into(),
                 CircuitState::HalfOpen {
+                    opened_at_utc: None,
                     probed_at: std::time::Instant::now()
                         - CIRCUIT_HALF_OPEN_PROBE_WINDOW
                         - Duration::from_secs(1),

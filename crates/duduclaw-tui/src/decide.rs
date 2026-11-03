@@ -36,13 +36,13 @@ impl Decision {
     }
 }
 #[derive(Debug)]
-pub enum Outcome { Refetch, Changed, Error(TerminalText) }
+pub enum Outcome { Notice(TerminalText), Refetch, Changed, Error(TerminalText) }
 impl Outcome {
     pub fn notice(&self) -> String {
         match self {
             Self::Refetch => strings::DECISION_REFETCH.into(),
             Self::Changed => strings::CARD_CHANGED.into(),
-            Self::Error(text) => text.visible(),
+            Self::Error(text) | Self::Notice(text) => text.visible(),
         }
     }
 }

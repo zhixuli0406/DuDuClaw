@@ -15,6 +15,11 @@ enum State {
 
 pub(super) struct Filter {
     state: State,
+    osc: Vec<u8>,
+    osc_invalid: bool,
+    osc_escape: bool,
+    pub waiting_seq: u64,
+    mouse_encodings: u8,
     csi: [u8; MAX_CSI],
     len: usize,
     params: usize,
@@ -26,11 +31,37 @@ pub(super) struct Filter {
 }
 impl Default for Filter {
     fn default() -> Self {
-        Self { state: State::Ground, csi: [0; MAX_CSI], len: 0, params: 1,
+        Self { state: State::Ground, osc: Vec::new(), osc_invalid: false, osc_escape: false, waiting_seq: 0, mouse_encodings: 0, csi: [0; MAX_CSI], len: 0, params: 1,
             utf8: [0; 4], utf8_len: 0, utf8_left: 0, utf8_min: 0x80, utf8_max: 0xbf }
     }
 }
 impl Filter {
+    pub fn mouse_encoding(&self) -> super::input::MouseEncoding {
+        use super::input::MouseEncoding as E;
+        // Explicit precedence is independent of set/reset order in the byte stream.
+        if self.mouse_encodings & 8 != 0 { E::SgrPixels }
+        else if self.mouse_encodings & 4 != 0 { E::Sgr }
+        else if self.mouse_encodings & 2 != 0 { E::Urxvt }
+        else if self.mouse_encodings & 1 != 0 { E::Utf8 }
+        else { E::Default }
+    }
+
+    fn finish_osc(&mut self) {
+        if !self.osc_invalid && let Ok(text) = std::str::from_utf8(&self.osc)
+            && !text.chars().any(crate::sanitize::forbidden)
+            && let Some((kind, body)) = text.split_once(';')
+        {
+            let waiting = match kind {
+                "9" => !body.is_empty() && !body.starts_with("4;"),
+                "777" => body.strip_prefix("notify;").is_some_and(|v| v.split_once(';').is_some()),
+                "0" | "2" => matches!(body.trim().to_ascii_lowercase().as_str(), "waiting for you" | "waiting for input" | "needs input"),
+                _ => false,
+            };
+            if waiting { self.waiting_seq = self.waiting_seq.saturating_add(1); }
+        }
+        self.osc.clear(); self.osc_escape = false;
+    }
+
     // Buffer a whole scalar before emitting it. Overlong encodings, surrogates,
     // out-of-range scalars and stray continuation/C1 bytes never reach vte.
     fn ground(&mut self, byte: u8, push: &mut impl FnMut(u8)) {
@@ -91,13 +122,18 @@ impl Filter {
             if used == output.len() { emit(&output); used = 0; }
         };
         for &byte in bytes {
+            if self.osc_escape {
+                self.osc_escape = false;
+                if byte == b'\\' { self.finish_osc(); push(0x1b); push(b'\\'); self.state = State::Ground; continue; }
+                self.osc.clear();
+            }
             // vte cancels every non-ground state on CAN/SUB and enters Escape
             // on ESC (including inside OSC, DCS, SOS, PM and APC). No partial
             // sequence has been emitted, so the downstream parser stays Ground.
             if !matches!(self.state, State::Ground) {
                 match byte {
-                    0x18 | 0x1a => { self.state = State::Ground; push(byte); continue; }
-                    0x1b => { self.state = State::Escape; continue; }
+                    0x18 | 0x1a => { self.osc.clear(); self.state = State::Ground; push(byte); continue; }
+                    0x1b => { self.osc_escape = matches!(self.state, State::String { osc: true, .. }); self.state = State::Escape; continue; }
                     _ => {},
                 }
             }
@@ -105,6 +141,7 @@ impl Filter {
                 State::Ground => self.ground(byte, &mut push),
                 State::Escape => match byte {
                     b']' | b'P' | b'_' | b'^' | b'X' => {
+                        self.osc.clear(); self.osc_invalid = false;
                         self.state = State::String { osc: byte == b']', dcs: byte == b'P' };
                     }
                     b'[' => self.start_csi(),
@@ -113,6 +150,7 @@ impl Filter {
                     // the remaining listed VT escapes also finish vte's Escape.
                     b'7' | b'8' | b'=' | b'>' | b'c' | b'D' | b'E' | b'H' |
                     b'M' | b'Z' | b'\\' | b'g' => {
+                        if byte == b'c' { self.mouse_encodings = 0; }
                         push(0x1b); push(byte); self.state = State::Ground;
                     }
                     _ => {
@@ -130,7 +168,10 @@ impl Filter {
                 }
                 State::String { osc, dcs } => {
                     if (osc && byte == 7) || (dcs && byte == 0x9c) {
+                        if osc { self.finish_osc(); }
                         self.state = State::Ground;
+                    } else if osc {
+                        if self.osc.len() < 256 { self.osc.push(byte); } else { self.osc_invalid = true; }
                     }
                 }
                 State::Csi => {
@@ -160,7 +201,21 @@ impl Filter {
         }
         if used > 0 { emit(&output[..used]); }
     }
-    fn emit_csi(&self, rows: u16, cols: u16, push: &mut impl FnMut(u8)) {
+    fn emit_csi(&mut self, rows: u16, cols: u16, push: &mut impl FnMut(u8)) {
+        // Track independent DECSET/DECRST bits, rather than vt100's last-set encoding.
+        if self.csi[0] == b'?' && matches!(self.csi[self.len - 1], b'h' | b'l')
+            && self.csi[1..self.len - 1].iter().all(|byte| byte.is_ascii_digit() || *byte == b';')
+        {
+            let enabled = self.csi[self.len - 1] == b'h';
+            for mode in self.csi[1..self.len - 1].split(|b| *b == b';') {
+                let value = mode.iter().try_fold(0u16, |value, byte| {
+                    if !byte.is_ascii_digit() { return None; }
+                    value.checked_mul(10)?.checked_add(u16::from(*byte - b'0'))
+                });
+                let bit = match value { Some(1005) => 1, Some(1015) => 2, Some(1006) => 4, Some(1016) => 8, _ => 0 };
+                if enabled { self.mouse_encodings |= bit; } else { self.mouse_encodings &= !bit; }
+            }
+        }
         push(0x1b);
         push(b'[');
         // Only count/position commands are bounded. Mode identifiers, SGR

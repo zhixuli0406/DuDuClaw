@@ -93,12 +93,48 @@ fn terminal_actions_require_consecutive_distinct_presses_without_countdown() {
     assert!(matches!(press(&mut c,key('r'),now),Effect::Send(Decision::Goal{action:GoalAction::Retry,..})));
 }
 #[test]
-fn continue_requires_finished_goal_and_explicit_message_as_real_handler_does() {
+fn continue_escape_clears_and_closes_without_a_send() {
     let now = Instant::now(); let mut c = open(goal("done"), &model(), now);
-    assert_eq!(press(&mut c,key('c'),now),Effect::None);
-    press(&mut c,key('i'),now); for ch in "繼續下一項".chars() { press(&mut c,key(ch),now); }
-    press(&mut c,KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),now);
-    assert_eq!(press(&mut c,key('c'),now),Effect::Send(Decision::Goal{task_id:"t1".into(),action:GoalAction::Continue,message:"繼續下一項".into(),expected_updated_at:"revision".into()}));
+    press(&mut c,key('c'),now); c.paste("discard this");
+    assert_eq!(press(&mut c,KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),now),Effect::Close);
+    press(&mut c,key('c'),now);
+    assert_eq!(enter(&mut c,now),Effect::None);
+    assert!(!c.controls(now+Duration::from_secs(1),1000,true).plain().contains("discard this"));
+}
+#[test]
+fn continue_review_requires_new_guard_scroll_and_exact_code_and_binds_request() {
+    let now = Instant::now(); let mut c = open(goal("done"), &model(), now);
+    let old_code = c.code.clone();
+    press(&mut c,key('c'),now); c.paste("next step");
+    assert_eq!(enter(&mut c,now),Effect::None);
+    assert_ne!(c.code,old_code);
+    assert!(c.body.plain().contains("t1")); assert!(c.body.plain().contains("next step"));
+    c.viewport(100,5);
+    for ch in c.code.clone().chars() {
+        assert_eq!(c.key(key(ch),now+Duration::from_millis(1999),1000,true),Effect::None);
+    }
+    assert!(c.input.is_empty());
+    let ready = now+Duration::from_secs(1);
+    assert_eq!(press(&mut c,key('c'),ready),Effect::None);
+    type_code(&mut c,ready); assert!(c.input.is_empty());
+    assert_eq!(enter(&mut c,ready),Effect::None);
+    for _ in 0..20 { press(&mut c,KeyEvent::new(KeyCode::PageDown,KeyModifiers::NONE),ready); }
+    assert_eq!(enter(&mut c,ready),Effect::None);
+    assert_eq!(c.hint,Some(strings::CARD_WRONG_CODE));
+    let wrong = if c.code == "99" { "98" } else { "99" };
+    for ch in wrong.chars() { press(&mut c,key(ch),ready); }
+    assert_eq!(enter(&mut c,ready),Effect::None);
+    assert_eq!(c.hint,Some(strings::CARD_WRONG_CODE));
+    type_code(&mut c,ready);
+    assert_eq!(enter(&mut c,ready),Effect::Send(Decision::Goal { task_id:"t1".into(),action:GoalAction::Continue,message:"next step".into(),expected_updated_at:"revision".into() }));
+}
+#[test]
+fn continue_overlong_review_requires_dashboard() {
+    let now=Instant::now(); let mut c=open(goal("done"),&model(),now);
+    press(&mut c,key('c'),now); c.paste(&"x".repeat(16_001)); enter(&mut c,now);
+    assert_eq!(c.blocked.as_ref().unwrap().plain(),strings::CARD_DASHBOARD);
+    c.viewport(1,20); let ready=now+Duration::from_secs(1);
+    type_code(&mut c,ready); assert_eq!(enter(&mut c,ready),Effect::None);
 }
 #[test]
 fn read_only_dashboard_expired_missing_ttl_and_stale_never_send() {

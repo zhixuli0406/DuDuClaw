@@ -9,7 +9,7 @@ mod process;
 #[cfg(test)]
 mod tests;
 use crate::strings;
-pub use input::{escape, key_bytes, paste_bytes};
+pub use input::{escape, key_bytes, paste_bytes, mouse_bytes, mouse_pixels, MouseEncoding};
 use portable_pty::{CommandBuilder, PtySize};
 use std::{
     ffi::OsString,
@@ -28,6 +28,7 @@ pub struct Session {
     parser: Option<parser::ParserWorker>,
     dimensions: (u16, u16),
     scroll_offset: usize,
+    acknowledged_wait: u64,
     pub status: String,
     #[cfg(unix)]
     process: Option<process::Process>,
@@ -45,6 +46,7 @@ impl Default for Session {
             parser: None,
             dimensions: (24, 80),
             scroll_offset: 0,
+            acknowledged_wait: 0,
             status: strings::PTY_STARTING.into(),
             #[cfg(unix)]
             process: None,
@@ -159,6 +161,7 @@ impl Session {
     }
     pub fn send(&mut self, bytes: Vec<u8>) {
         if bytes.is_empty() { return; }
+        self.acknowledged_wait = self.screen.waiting_seq;
         let Some(input) = &self.input else {
             self.status = strings::PTY_INPUT_FAILED.into();
             return;
@@ -171,6 +174,7 @@ impl Session {
             self.status = strings::PTY_INPUT_FAILED.into();
         }
     }
+    pub fn waiting(&self) -> bool { self.screen.waiting_seq > self.acknowledged_wait }
     pub fn screen(&self) -> &Screen { &self.screen }
     pub fn reset_scroll(&mut self) {
         self.scroll_offset = 0;

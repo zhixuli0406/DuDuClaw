@@ -13,6 +13,7 @@ fn home() -> tempfile::TempDir {
         d.path(),
         super::super::McpOAuthClientConfig {
             provider_id: "google".into(),
+            // Provider probes attribute by client ID, not by the home map key.
             client_id: format!("presence-fixture-{}", uuid::Uuid::new_v4()),
             client_secret: String::new(),
             auth_url: crate::google_personal::oauth::AUTHORIZE.into(),
@@ -27,6 +28,13 @@ fn home() -> tempfile::TempDir {
 fn raw(home: &Path) -> Vec<u8> {
     std::fs::read(home.join(TOKEN_FILE)).unwrap()
 }
+fn saved_client_id(home: &Path) -> String {
+    let clients: Value = serde_json::from_slice(
+        &std::fs::read(home.join(super::super::CLIENT_CONFIG_FILE)).unwrap(),
+    )
+    .unwrap();
+    clients[0]["client_id"].as_str().unwrap().to_owned()
+}
 fn edit(home: &Path, change: impl FnOnce(&mut Value)) {
     let mut rows: Value = serde_json::from_slice(&raw(home)).unwrap();
     change(&mut rows[0]);
@@ -35,7 +43,7 @@ fn edit(home: &Path, change: impl FnOnce(&mut Value)) {
 fn pending(home: &Path) {
     let desired = super::super::McpOAuthConfig {
         provider_id: "google".into(),
-        client_id: super::super::get_client_config(home, "google").unwrap().client_id,
+        client_id: saved_client_id(home),
         client_secret: String::new(),
         auth_url: crate::google_personal::oauth::AUTHORIZE.into(),
         token_url: crate::google_personal::oauth::TOKEN.into(),
@@ -49,6 +57,20 @@ fn pending(home: &Path) {
         NOW + 500,
     )
     .unwrap();
+}
+#[test]
+fn provider_probe_isolated_between_presence_homes() {
+    let observed = home();
+    let exchanging = home();
+    let observed_probe = test_probe::Guard::install(observed.path());
+    let exchanging_probe = test_probe::Guard::install(exchanging.path());
+
+    // Reproduce the interleaving directly at the real provider observer:
+    // another home's callback reaches this boundary while our probe is live.
+    // No network request or token decryption is needed to expose attribution.
+    test_probe::provider(&saved_client_id(exchanging.path()));
+    assert_eq!(observed_probe.counts(), [0, 0]);
+    assert_eq!(exchanging_probe.counts(), [0, 1]);
 }
 #[tokio::test(flavor = "current_thread")]
 async fn actual_saved_google_client_with_personal_only_and_disabled_master_has_no_home_credential()

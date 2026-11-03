@@ -106,6 +106,7 @@ impl MethodHandler {
             mcp_oauth_pending: RwLock::new(std::collections::HashMap::new()),
             task_store: RwLock::new(None),
             autopilot_store: RwLock::new(None),
+            autopilot_breakers: RwLock::new(None),
             event_tx: RwLock::new(None),
             autopilot_event_tx: RwLock::new(None),
             redaction_manager: RwLock::new(None),
@@ -252,6 +253,10 @@ impl MethodHandler {
     /// Inject the SQLite-backed task board store (called once after gateway start).
     pub async fn set_task_store(&self, store: Arc<TaskStore>) {
         *self.task_store.write().await = Some(store);
+    }
+
+    pub(crate) async fn set_autopilot_breakers(&self, reader: crate::autopilot_engine::BreakerReader) {
+        *self.autopilot_breakers.write().await = Some(reader);
     }
 
     /// Inject the SQLite-backed autopilot rule store (called once after gateway start).

@@ -28,7 +28,18 @@ impl Gateway for Client {
             .await
     }
 }
+pub async fn pane_for_role(gateway: &impl Gateway, pane: &Pane, role: Option<crate::auth::Role>) -> Result<Data> {
+    use crate::auth::Role;
+    let refusal = match pane.kind {
+        Block::Autopilot if role != Some(Role::Admin) => Some(crate::strings::ADMIN_ONLY),
+        Block::Evolution | Block::Budget if !matches!(role, Some(Role::Admin | Role::Manager)) => Some(crate::strings::MANAGER_ONLY),
+        _ => None,
+    };
+    if let Some(reason) = refusal { return Ok(Data { error:Some(TerminalText::new(reason.into())), ..Data::default() }); }
+    self::pane(gateway, pane, matches!(role, Some(Role::Admin | Role::Manager))).await
+}
 pub async fn pane(gateway: &impl Gateway, pane: &Pane, manager: bool) -> Result<Data> {
+    if pane.kind.autonomy() { return Ok(super::autonomy::fetch(gateway, pane).await); }
     let mut data = Data::default();
     match pane.kind {
         Block::Run => {
@@ -48,6 +59,10 @@ pub async fn pane(gateway: &impl Gateway, pane: &Pane, manager: bool) -> Result<
                     return Err(Error::Protocol);
                 }
                 data.selected = detail["run"].clone();
+                // runs.get omits task/round; runs.list is their authoritative source.
+                for key in ["task_id", "round"] {
+                    if let Some(value) = run.get(key) { data.selected[key] = value.clone(); }
+                }
                 let events = array(&detail, "events")?;
                 data.sections.push((
                     "events",
@@ -144,6 +159,11 @@ pub async fn pane(gateway: &impl Gateway, pane: &Pane, manager: bool) -> Result<
                     .await?;
                 array(&changes, "changes")?;
                 data.sections.push(("changes", changes));
+                let roles = super::autonomy::read(gateway, "tasks.role_turns", params.clone()).await;
+                match roles {
+                    Ok(roles) => { array(&roles, "turns")?; data.sections.push(("roles", roles)); }
+                    Err(error) => data.sections.push(("roles_error", json!(error.plain()))),
+                }
                 let stop = gateway.read("tasks.stop_status", params).await?;
                 data.sections.push(("stop", stop));
             }
