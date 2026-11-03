@@ -114,7 +114,7 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) 
 }
 
 fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: bool) -> Result<()> {
-    validate_import_policy(archive, home, personal)?;
+    let prepared_config = validate_import_policy(archive, home, personal)?;
     let existing_agents = home.join("agents");
     if existing_agents.exists() {
         if !force {
@@ -134,6 +134,18 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
     }
     fs::create_dir_all(home).map_err(|e| io_err("import mkdir home", e))?;
 
+    // Persist the carried policy before an archived users.db can replace it.
+    if let Some(config) = &prepared_config {
+        use std::io::Write;
+        // NamedTempFile creates owner-only files on Unix; publish atomically
+        // so an interrupted write cannot discard the live policy or secrets.
+        let mut pending = tempfile::NamedTempFile::new_in(home)
+            .map_err(|e| io_err("import preserve MFA policy", e))?;
+        pending.write_all(config.as_bytes()).and_then(|_| pending.as_file().sync_all())
+            .map_err(|e| io_err("import preserve MFA policy", e))?;
+        pending.persist(home.join("config.toml"))
+            .map_err(|e| io_err("import preserve MFA policy", e))?;
+    }
     let file = File::open(archive).map_err(|e| io_err("import open", e))?;
     let dec = GzDecoder::new(file);
     let mut ar = tar::Archive::new(dec);
@@ -144,7 +156,7 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
             .filter(|component| !matches!(component, std::path::Component::CurDir))
             .collect();
         // Restoring a lock file would replace the inode carrying our lease.
-        if is_live_lock(&path) {
+        if is_live_lock(&path) || (prepared_config.is_some() && path == Path::new("config.toml")) {
             continue;
         }
         entry.unpack_in(home).map_err(|e| io_err("import unpack", e))?;
@@ -272,6 +284,9 @@ mod tests {
         let staging = duduclaw_gateway::backup_restore::staging_dir(&target);
         write(&staging.join("config.toml"), "[auth]\nmfa_enforced=false\n");
         drop(duduclaw_auth::UserDb::new(&staging.join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(staging.join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        drop(conn);
         duduclaw_gateway::backup_restore::write_marker(&target, &duduclaw_gateway::backup_restore::RestoreMarker {
             staged_at: chrono::Utc::now(), source_filename: "normal.tar.gz".into(),
         }).unwrap();
@@ -280,39 +295,102 @@ mod tests {
             &target, "127.0.0.1:18789".parse().unwrap(), true, None,
         ).unwrap();
         let config: toml::Table = fs::read_to_string(target.join("config.toml")).unwrap().parse().unwrap();
-        assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(false));
+        assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(true));
         let conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
-        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+        assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
         drop(conn);
         let source = root.join("source");
         write(&source.join("config.toml"), "[gateway]\nport=18789\n");
         write(&source.join("agents/imported/SOUL.md"), "imported");
         drop(duduclaw_auth::UserDb::new(&source.join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(source.join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, false, 456).unwrap();
+        drop(conn);
         let archive = root.join("normal.tar.gz");
         export_home(&source, &archive).unwrap();
         import_archive(&archive, &target, true, true).unwrap();
         assert_eq!(fs::read_to_string(target.join("agents/imported/SOUL.md")).unwrap(), "imported");
+        let config = fs::read_to_string(target.join("config.toml")).unwrap();
+        let table: toml::Table = config.parse().unwrap();
+        assert_eq!(table["auth"]["mfa_enforced"].as_bool(), Some(true));
+        assert_eq!(table["gateway"]["port"].as_integer(), Some(18789));
+        let conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
+        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+        drop(conn);
+        // An ordinary config commit runs the real gateway reload_policy path.
+        use sha2::{Digest, Sha256};
+        let hash = hex::encode(Sha256::digest(config.as_bytes()));
+        duduclaw_gateway::commit_config_rendered(&target, &hash, |current| {
+            Ok(format!("{current}\n# Reload imported policy\n"))
+        }).unwrap();
+        let conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
+        assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+        drop(conn);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn mfa_import_cannot_change_policy_before_moving_agents() {
-        let root = unique_tmp("mfa-policy");
-        let source = root.join("source");
-        let target = root.join("target");
-        let original = "[auth]\nmfa_enforced=true\n";
-        write(&target.join("config.toml"), original);
-        write(&target.join("agents/kept/SOUL.md"), "keep");
-        for restored in ["", "[auth]\nmfa_enforced=false\n"] {
+        for (personal, restored) in [
+            (true, "[auth]\nmfa_enforced=false\n"),
+            (false, ""),
+            (false, "[auth]\nmfa_enforced=false\n"),
+        ] {
+            let root = unique_tmp("mfa-policy");
+            let source = root.join("source");
+            let target = root.join("target");
+            let original = "[auth]\nmfa_enforced=true\n";
+            write(&target.join("config.toml"), original);
+            write(&target.join("agents/kept/SOUL.md"), "keep");
+            write(&source.join("agents/new/SOUL.md"), "new");
+            drop(duduclaw_auth::UserDb::new(&source.join("users.db")).unwrap());
+            let mut conn = rusqlite::Connection::open(source.join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, false, 456).unwrap();
+            drop(conn);
+            drop(duduclaw_auth::UserDb::new(&target.join("users.db")).unwrap());
+            let mut conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+            drop(conn);
             write(&source.join("config.toml"), restored);
             let archive = root.join("input.tar.gz");
             export_home(&source, &archive).unwrap();
-            let error = import_archive(&archive, &target, true, true).unwrap_err();
+            let error = import_archive(&archive, &target, true, personal).unwrap_err();
             assert!(error.to_string().contains("system.update_config"));
             assert_eq!(fs::read_to_string(target.join("config.toml")).unwrap(), original);
             assert_eq!(fs::read_to_string(target.join("agents/kept/SOUL.md")).unwrap(), "keep");
             assert!(!target.join("agents.pre-import").exists());
+            assert!(!target.join("agents/new").exists());
+            let conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
+            assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+            drop(conn);
+            fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn mfa_personal_keyless_import_preserves_durable_policy_without_live_config() {
+        let root = unique_tmp("personal-missing-config");
+        let source = root.join("source");
+        let target = root.join("target");
+        write(&target.join("agents/kept/SOUL.md"), "keep");
+        drop(duduclaw_auth::UserDb::new(&target.join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(target.join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        drop(conn);
+        write(&source.join("config.toml"), "[gateway]\nport=18789\n");
+        drop(duduclaw_auth::UserDb::new(&source.join("users.db")).unwrap());
+        let archive = root.join("input.tar.gz");
+        export_home(&source, &archive).unwrap();
+        import_archive(&archive, &target, true, true).unwrap();
+        let config: toml::Table = fs::read_to_string(target.join("config.toml")).unwrap().parse().unwrap();
+        assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(true));
+        assert_eq!(config["gateway"]["port"].as_integer(), Some(18789));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(target.join("config.toml")).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -322,6 +400,7 @@ mod tests {
             ("fresh-team", false, None, "", Some("[auth]\nmfa_enforced=false\n"), false),
             ("existing-false", false, Some(false), "[auth]\nmfa_enforced=false\n", Some("[auth]\nmfa_enforced=false\n"), true),
             ("durable-true", false, Some(true), "# missing auth\n", Some("[auth]\nmfa_enforced=false\n"), false),
+            ("personal-durable-true", true, Some(true), "# missing auth\n", Some("[auth]\nmfa_enforced=false\n"), false),
             ("missing-config", false, Some(true), "# missing auth\n", None, false),
             ("missing-false-key", false, Some(false), "# missing auth\n", None, false),
         ] {
@@ -586,7 +665,7 @@ fn is_live_lock(path: &Path) -> bool {
 
 const IDENTITY_FILES: &[&str] = &["users.db", "users.db-wal", "users.db-shm", "users.db-journal"];
 
-fn validate_import_policy(archive: &Path, home: &Path, personal: bool) -> Result<()> {
+fn validate_import_policy(archive: &Path, home: &Path, personal: bool) -> Result<Option<String>> {
     use std::io::Read;
     let policy = duduclaw_core::product_profile::load(home).map_err(DuDuClawError::Config)?;
     let file = File::open(archive).map_err(|e| io_err("import policy", e))?;
@@ -666,7 +745,8 @@ fn validate_import_policy(archive: &Path, home: &Path, personal: bool) -> Result
             Err(error) => return Err(io_err("import policy", error)),
         },
     };
-    duduclaw_gateway::validate_mfa_import_policy(home, &retained, personal, replaces_identity)
+    // Personal may omit the key, but may never lower the persisted policy.
+    let prepared = duduclaw_gateway::validate_mfa_import_policy(home, &retained, personal, replaces_identity)
         .map_err(DuDuClawError::Config)?;
     if replaces_identity && !personal {
         let table: toml::Table = retained.parse().map_err(|_| io_err("import policy", "invalid configuration"))?;
@@ -676,5 +756,5 @@ fn validate_import_policy(archive: &Path, home: &Path, personal: bool) -> Result
             return Err(io_err("import policy", "匯入帳號資料庫時，設定檔必須明確保留目前的 auth.mfa_enforced；變更政策請使用 system.update_config 專用開關。"));
         }
     }
-    Ok(())
+    Ok((prepared != retained).then_some(prepared))
 }

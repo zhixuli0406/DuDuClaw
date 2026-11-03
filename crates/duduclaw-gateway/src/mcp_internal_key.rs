@@ -177,15 +177,6 @@ fn provision_internal_mcp_key(
                 .insert("mfa_enforced".into(), toml::Value::Boolean(true));
             restored = true;
         }
-        let mut personal_normalized = false;
-        // Restore runs before license verification and conservatively keeps true.
-        // Once Personal is verified, persist its effective policy, including on
-        // retries after a config write succeeded but the durable write failed.
-        if personal == Some(true) && table.get("auth").and_then(|a| a.get("mfa_enforced")) == Some(&toml::Value::Boolean(true)) {
-            table.get_mut("auth").and_then(|a| a.as_table_mut()).ok_or("invalid auth table")?
-                .insert("mfa_enforced".into(), toml::Value::Boolean(false));
-            personal_normalized = true;
-        }
         let now = Utc::now();
 
         // Survey every existing `gateway-internal` entry.
@@ -270,7 +261,7 @@ fn provision_internal_mcp_key(
         };
 
         // Steady state: a young key and nothing to prune ⇒ no write at all.
-        if !minted && prune.is_empty() && !restored && !missing && !personal_normalized {
+        if !minted && prune.is_empty() && !restored && !missing {
             return Ok(((key, false, false), None));
         }
 
@@ -323,23 +314,6 @@ fn provision_internal_mcp_key(
         }
         Ok(((key, restored, fresh_team), Some(rendered)))
     }, |(_, _, fresh_team)| {
-        if personal == Some(true) {
-            if !crate::mfa::policy_store_is_absent(home_dir) {
-                let mut conn = rusqlite::Connection::open_with_flags(
-                    home_dir.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-                ).map_err(|e| e.to_string())?;
-                let has_policy: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE lower(name)='mfa_policy_state')",
-                    [], |r| r.get(0),
-                ).map_err(|e| e.to_string())?;
-                // A pre-MFA store gets false from migration. A present but
-                // incomplete table must not be silently repaired to false.
-                if has_policy && duduclaw_auth::mfa::read_enforcement(&conn)? {
-                    duduclaw_auth::mfa::record_enforcement(&mut conn, false, Utc::now().timestamp_micros())?;
-                }
-            }
-            return Ok(());
-        }
         if !fresh_team { return Ok(()); }
         let _db = duduclaw_auth::UserDb::new_with_mfa_default(&home_dir.join("users.db"), true)?;
         let mut conn = rusqlite::Connection::open_with_flags(
@@ -503,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn mfa_verified_personal_normalization_keeps_legacy_and_corrupt_states_distinct() {
+    fn mfa_personal_provisioning_leaves_legacy_and_corrupt_policy_stores_untouched() {
         for corrupt in [false, true] {
             let home = tempfile::tempdir().unwrap();
             std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
@@ -515,12 +489,41 @@ mod tests {
             let result = ensure_internal_mcp_key_for_gateway(
                 home.path(), "127.0.0.1:18789".parse().unwrap(), true, None,
             );
-            assert_eq!(result.is_err(), corrupt, "{result:?}");
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(config_text(home.path()).parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
             if corrupt {
                 assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
             } else {
                 assert!(conn.prepare("SELECT * FROM mfa_policy_state").is_err());
             }
+        }
+    }
+
+    #[test]
+    fn mfa_personal_boot_preserves_team_policy_for_license_recovery() {
+        // License fallback and an explicit DUDUCLAW_EDITION=personal override
+        // both feed the same provisioning path without mutating process env.
+        for edition in [
+            duduclaw_core::EditionProfile::resolve(None, None, Some("open_source")),
+            duduclaw_core::EditionProfile::resolve(Some("personal"), None, Some("oem")),
+        ] {
+            assert!(edition.is_personal());
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            drop(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
+            let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+            for _ in 0..2 {
+                provision(home.path(), edition.is_personal(), None).unwrap();
+                crate::mfa::reload_policy(home.path());
+                assert_eq!(config_text(home.path()).parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
+                assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+                assert_eq!(conn.query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 123);
+                assert!(!crate::mfa::enforced(home.path(), true).unwrap());
+            }
+            provision(home.path(), false, None).unwrap();
+            crate::mfa::reload_policy(home.path());
+            assert!(crate::mfa::enforced(home.path(), false).unwrap());
         }
     }
 

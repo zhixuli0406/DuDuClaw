@@ -53,8 +53,9 @@ pub fn validate_mfa_config_unchanged(before: &str, after: &str) -> Result<(), St
     mfa::refuse_policy_change(before, after)
 }
 
-/// Edition-aware import boundary, including durable policy when config lacks the key.
-pub fn validate_mfa_import_policy(home: &std::path::Path, after: &str, personal: bool, replaces_identity: bool) -> Result<(), String> {
+/// Validate before extraction and carry the live policy into keyless Personal configs.
+/// The caller must install the returned config before replacing identity data.
+pub fn validate_mfa_import_policy(home: &std::path::Path, after: &str, personal: bool, replaces_identity: bool) -> Result<String, String> {
     mfa::refuse_import_policy_change(home, after, personal, replaces_identity)
 }
 

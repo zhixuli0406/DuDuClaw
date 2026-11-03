@@ -85,7 +85,7 @@ fn parse_policy(text: &str) -> Result<bool, String> {
 /// Restore must preserve the live policy; an unreadable policy defaults to strict.
 pub(crate) fn restore_policy(home: &Path) -> bool {
     // No Admin could have disabled enforcement without an identity store.
-    // Verified Personal provisioning later normalizes config and durable state.
+    // Personal runtime exemption never changes the persisted policy.
     if policy_store_is_absent(home) { return true; }
     crate::handlers::config_commit::read_regular_config(&home.join("config.toml"))
         .ok().and_then(|text| {
@@ -283,8 +283,8 @@ pub(crate) fn refuse_policy_change_at(home: &Path, before: &str, after: &str) ->
 }
 
 /// Imports reject policy changes before replacing any data, including users.db.
-/// Unlike restore, the caller supplies the verified edition for a fresh home.
-pub(crate) fn refuse_import_policy_change(home: &Path, after: &str, personal: bool, replaces_identity: bool) -> Result<(), String> {
+/// Unlike restore, the caller supplies the verified edition.
+pub(crate) fn refuse_import_policy_change(home: &Path, after: &str, personal: bool, replaces_identity: bool) -> Result<String, String> {
     let before = match crate::handlers::config_commit::read_regular_config(&home.join("config.toml")) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -300,13 +300,26 @@ pub(crate) fn refuse_import_policy_change(home: &Path, after: &str, personal: bo
         else { configured };
     let parsed_after = parse_policy(after)?;
     let after_table: toml::Table = after.parse().map_err(|_| "登入設定格式不正確。")?;
-    let next = if !replaces_identity
-        && after_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() { fallback }
+    let missing_key = after_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none();
+    if !missing_key && !parsed_after && fallback {
+        return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更（system.update_config，需 expected_state）；請保留目前設定。".into());
+    }
+    // Personal may replace identity without an explicit key, but the imported
+    // config must carry the live policy so reload cannot trust the archived DB.
+    if personal && replaces_identity && missing_key {
+        return if current || fallback { preserve_restore_policy(after, true) }
+            else { Ok(after.to_owned()) };
+    }
+    let next = if !replaces_identity && missing_key { fallback }
         else { parsed_after };
     if current != next {
         return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更（system.update_config，需 expected_state）；請保留目前設定。".into());
     }
-    Ok(())
+    if personal && missing_key && current {
+        preserve_restore_policy(after, true)
+    } else {
+        Ok(after.to_owned())
+    }
 }
 
 pub(crate) fn audit_policy_restored(home: &Path) {
@@ -386,6 +399,65 @@ pub(crate) fn replacement_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mfa_import_preserves_persisted_policy_across_edition_identity_and_archive_key() {
+        let home = tempfile::tempdir().unwrap();
+        let config = "[auth]\nmfa_enforced=true\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        for personal in [true, false] {
+            for replaces_identity in [false, true] {
+                for key in [None, Some(true), Some(false)] {
+                    let after = key.map(|value| format!("[auth]\nmfa_enforced={value}\n")).unwrap_or_default();
+                    let result = refuse_import_policy_change(home.path(), &after, personal, replaces_identity);
+                    let allowed = key == Some(true) || (key.is_none() && (personal || !replaces_identity));
+                    assert_eq!(result.is_ok(), allowed, "personal={personal}, replaces_identity={replaces_identity}, key={key:?}: {result:?}");
+                    if let Ok(prepared) = result {
+                        if personal && key.is_none() {
+                            assert!(parse_policy(&prepared).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced='false'", true, true).is_err());
+        assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), config);
+        assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+    }
+
+    #[test]
+    fn mfa_keyless_agent_only_import_keeps_existing_policy_comparison() {
+        for configured in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), format!("[auth]\nmfa_enforced={configured}\n")).unwrap();
+            drop(UserDb::new(&home.path().join("users.db")).unwrap());
+            let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, !configured, 123).unwrap();
+            for personal in [true, false] {
+                assert!(refuse_import_policy_change(home.path(), "", personal, false).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn mfa_import_never_lowers_durable_true_even_with_explicit_live_false() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        for personal in [true, false] {
+            for replaces_identity in [true, false] {
+                assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=false\n", personal, replaces_identity).is_err());
+            }
+        }
+        let prepared = refuse_import_policy_change(home.path(), "", true, true).unwrap();
+        assert!(parse_policy(&prepared).unwrap());
+        assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+    }
+
     #[test]
     fn boot_policy_legacy_store_allows_migration_then_reads_durable_policy() {
         let home = tempfile::tempdir().unwrap();
