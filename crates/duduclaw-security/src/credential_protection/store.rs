@@ -21,6 +21,8 @@ use super::{BackendKind, ProtectionLevel};
 pub enum StoreError {
     /// The store answered: there is no item for this account.
     NotFound,
+    /// The wrapped blob cannot be authenticated or has an invalid shape.
+    Tampered,
     /// The store needs a person: the keychain is locked, or (macOS) the item
     /// no longer trusts this executable — typically after an upgrade changed
     /// the binary's code hash. Reads never prompt, so this is what a prompt
@@ -35,6 +37,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::NotFound => f.write_str("no protected key item in the credential store"),
+            StoreError::Tampered => f.write_str("protected key blob was changed or cannot be authenticated"),
             StoreError::InteractionRequired => {
                 f.write_str("the credential store needs a person to unlock or re-authorize it")
             }
@@ -54,6 +57,8 @@ pub trait KeyStore: Send + Sync {
     fn backend(&self) -> BackendKind;
     /// The protection level this backend gives against a same-user process.
     fn level(&self) -> ProtectionLevel;
+    /// A closed startup attestation reason, never arbitrary diagnostic text.
+    fn refusal_reason(&self) -> Option<&'static str> { None }
     /// Read the key bytes for `account` without any user interaction.
     fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, StoreError>;
     /// Read allowing the OS to ask the person at the machine. Defaults to
@@ -78,6 +83,7 @@ impl<T: KeyStore + ?Sized> KeyStore for std::sync::Arc<T> {
     fn level(&self) -> ProtectionLevel {
         (**self).level()
     }
+    fn refusal_reason(&self) -> Option<&'static str> { (**self).refusal_reason() }
     fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         (**self).read(account)
     }

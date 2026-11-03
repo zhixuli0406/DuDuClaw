@@ -22,14 +22,40 @@ import { toast, formatError } from '@/lib/toast';
 
 /**
  * CredentialProtectionPanel (B2c) — one line: where the credentials that let
- * an AI employee act as a specific person are protected (OS keychain or
- * file), plus the Admin actions to move them into the keychain or back.
+ * an AI employee act as a specific person are protected, plus the Admin
+ * actions to enable, rotate or remove that protection.
  *
  * Text is rendered from `state` + `level` through the locale catalogue, not
  * from the backend's zh-TW summary, so every locale reads its own language.
  * The payload never carries key material (only a key id).
  */
 const BROKEN: readonly CredentialProtectionState[] = ['missing', 'key_changed', 'invalid'];
+// Only closed startup diagnostics become locale IDs; unknown codes use a safe fallback.
+const ROOT_KEY_REFUSALS = new Set([
+  'inactive',
+  'fd_contract',
+  'fd_stat',
+  'fd_type',
+  'fd_owner',
+  'fd_mode',
+  'fd_links',
+  'fd_size',
+  'fd_read',
+  'not_pid_one',
+  'user_ids',
+  'group_ids',
+  'proc_status',
+  'no_new_privs',
+  'cap_inh',
+  'cap_prm',
+  'cap_eff',
+  'cap_bnd',
+  'cap_amb',
+  'dumpable',
+  'key_path_accessible',
+  'docker_socket',
+  'docker_host',
+]);
 
 export function CredentialProtectionPanel() {
   const intl = useIntl();
@@ -69,7 +95,9 @@ export function CredentialProtectionPanel() {
           intl.formatMessage({
             id: action === 'disable'
               ? 'security.credentialProtection.toast.disabled'
-              : 'security.credentialProtection.toast.enabled',
+              : next.backend === 'container_root_key'
+                ? 'security.credentialProtection.toast.enabled_container'
+                : 'security.credentialProtection.toast.enabled',
           }),
         );
       } catch (e) {
@@ -83,10 +111,12 @@ export function CredentialProtectionPanel() {
 
   const state = status?.state;
   const ready = state === 'ready';
+  const container = status?.backend === 'container_root_key';
+  const containerState = container && ['not_enabled', 'missing', 'key_changed', 'unavailable'].includes(state ?? '');
   const label = status
     ? state === 'ready' || state === 'not_enabled'
       ? intl.formatMessage({ id: `security.credentialProtection.level.${status.level}` })
-      : intl.formatMessage({ id: `security.credentialProtection.state.${state}` })
+      : intl.formatMessage({ id: `security.credentialProtection.state.${state}${container && state === 'unavailable' ? '_container' : ''}` })
     : '';
 
   return (
@@ -101,7 +131,7 @@ export function CredentialProtectionPanel() {
           {intl.formatMessage({ id: 'security.credentialProtection.title' })}
         </CardTitle>
         <CardDescription>
-          {intl.formatMessage({ id: 'security.credentialProtection.desc' })}
+          {intl.formatMessage({ id: `security.credentialProtection.desc${container ? '_container' : ''}` })}
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -125,9 +155,18 @@ export function CredentialProtectionPanel() {
                   ? `security.credentialProtection.detail.ready.${status.level}${
                       status.level === 'user_store' && status.backend === 'macos_keychain' ? '_macos' : ''
                     }`
-                  : `security.credentialProtection.detail.${state}`,
+                  : `security.credentialProtection.detail.${state}${containerState ? '_container' : ''}`,
               })}
             </p>
+            {container && state === 'unavailable' && status.refusal_reason && (
+              <p className="text-sm text-muted-foreground" data-testid="credential-protection-refusal">
+                {intl.formatMessage({
+                  id: `security.credentialProtection.refusal.${
+                    ROOT_KEY_REFUSALS.has(status.refusal_reason) ? status.refusal_reason : 'unknown'
+                  }`,
+                })}
+              </p>
+            )}
             {state === 'needs_authorization' && (
               <code className="block rounded-md bg-secondary px-3 py-2 font-mono text-xs">
                 duduclaw credentials authorize
@@ -146,7 +185,7 @@ export function CredentialProtectionPanel() {
             <div className="flex flex-wrap justify-end gap-2 border-t border-surface-border pt-3">
               {state === 'not_enabled' && (
                 <Button size="sm" onClick={() => void run('enable')} disabled={busy}>
-                  {intl.formatMessage({ id: 'security.credentialProtection.enable' })}
+                  {intl.formatMessage({ id: `security.credentialProtection.enable${container ? '_container' : ''}` })}
                 </Button>
               )}
               {ready && (
@@ -181,7 +220,7 @@ export function CredentialProtectionPanel() {
           if (action) void run(action);
         }}
         title={intl.formatMessage({ id: `security.credentialProtection.confirm.${confirm ?? 'disable'}.title` })}
-        message={intl.formatMessage({ id: `security.credentialProtection.confirm.${confirm ?? 'disable'}.message` })}
+        message={intl.formatMessage({ id: `security.credentialProtection.confirm.${confirm ?? 'disable'}.message${container && confirm !== 'reset' ? '_container' : ''}` })}
         confirmLabel={intl.formatMessage({
           id: confirm === 'reset' ? 'security.credentialProtection.reset' : 'security.credentialProtection.disable',
         })}

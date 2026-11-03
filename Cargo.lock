@@ -1915,6 +1915,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -2264,6 +2265,7 @@ dependencies = [
  "duduclaw-core",
  "flate2",
  "futures-util",
+ "libc",
  "ort",
  "reqwest",
  "serde_json",
@@ -2386,6 +2388,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "duduclaw-core",
  "keyring",
+ "libc",
  "regex",
  "reqwest",
  "ring",

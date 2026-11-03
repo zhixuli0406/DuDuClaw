@@ -1,10 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
+import { IntlProvider } from 'react-intl';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { CredentialProtectionPanel } from './CredentialProtectionPanel';
 import type { CredentialProtectionStatus } from '@/lib/api';
+import en from '@/i18n/en.json';
+import zhTW from '@/i18n/zh-TW.json';
+import jaJP from '@/i18n/ja-JP.json';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -32,10 +36,10 @@ const READY = status({
   person_identity_allowed: true,
 });
 
-function mockProtection(initial: CredentialProtectionStatus) {
+function mockProtection(initial: CredentialProtectionStatus, enabled = READY) {
   mockWsClient.call.mockImplementation((method: string) => {
     if (method === 'security.credential_protection') return Promise.resolve(initial);
-    if (method === 'security.credential_protection_enable') return Promise.resolve(READY);
+    if (method === 'security.credential_protection_enable') return Promise.resolve(enabled);
     if (method === 'security.credential_protection_disable') return Promise.resolve(status({}));
     return Promise.resolve({});
   });
@@ -103,9 +107,96 @@ describe('<CredentialProtectionPanel>', () => {
     mockProtection(status({ state: 'unsupported', backend: 'none', platform_level: 'file' }));
     renderWithProviders(<CredentialProtectionPanel />);
     expect((await screen.findByTestId('credential-protection-line')).textContent).toBe(
-      'Credential protection: Files (this platform has no supported system keychain)',
+      'Credential protection: Files (personal accounts unavailable here)',
     );
     expect(screen.queryByRole('button', { name: 'Move to system keychain' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Turn off' })).toBeNull();
+    expect(screen.getByText(/separate-key startup mode described in the deployment guide/)).toHaveTextContent(
+      'the dashboard shows the actual gateway state',
+    );
+  });
+});
+
+
+const CONTAINER_READY = status({
+  backend: 'container_root_key',
+  platform_level: 'process_isolated',
+  level: 'process_isolated',
+  state: 'ready',
+  person_identity_allowed: true,
+});
+
+describe('container credential protection', () => {
+  it('enables the separate key without asking to move into a system keychain', async () => {
+    mockProtection(status({ backend: 'container_root_key', platform_level: 'process_isolated' }), CONTAINER_READY);
+    renderWithProviders(<CredentialProtectionPanel />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Enable credential protection' }));
+    expect(mockWsClient.call).toHaveBeenCalledWith('security.credential_protection_enable', { reset: false });
+    expect((await screen.findByTestId('credential-protection-line')).textContent).toBe(
+      'Credential protection: Separate key (AI employees cannot read it)',
+    );
+    expect(screen.queryByText(/system keychain/i)).toBeNull();
+    expect(screen.getByText(/only the container’s startup step/)).toHaveTextContent(
+      'read the token issued for its turn, and make DuDuClaw stop',
+    );
+    expect(screen.getByText(/only the container’s startup step/)).toHaveTextContent(
+      'Anyone who controls the Docker host or the key volume can read the key',
+    );
+  });
+
+  it.each([
+    ['missing', /cannot find the protected key saved for this data folder/],
+    ['key_changed', /Losing or replacing the key volume also causes this/],
+  ] as const)('explains container %s without keychain instructions', async (state, text) => {
+    mockProtection(status({ backend: 'container_root_key', platform_level: 'process_isolated', state }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    expect(await screen.findByText(text)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Re-enable' })).toBeInTheDocument();
+    expect(screen.queryByText(/system keychain/i)).toBeNull();
+  });
+
+  it.each([
+    ['en', en],
+    ['zh-TW', zhTW],
+    ['ja-JP', jaJP],
+  ] as const)('shows a translated startup refusal in %s', async (locale, messages) => {
+    mockProtection(status({
+      backend: 'container_root_key',
+      platform_level: 'process_isolated',
+      state: 'unavailable',
+      refusal_reason: 'docker_socket',
+    }));
+    renderWithProviders(
+      <IntlProvider locale={locale} messages={messages}>
+        <CredentialProtectionPanel />
+      </IntlProvider>,
+    );
+    expect((await screen.findByTestId('credential-protection-refusal')).textContent).toBe(
+      messages['security.credentialProtection.refusal.docker_socket'],
+    );
+    expect(screen.getByTestId('credential-protection-line')).toHaveTextContent(
+      messages['security.credentialProtection.state.unavailable_container'],
+    );
+  });
+
+  it('does not expose an unknown startup diagnostic as a locale ID or raw message', async () => {
+    mockProtection(status({ backend: 'container_root_key', state: 'unavailable', refusal_reason: 'untrusted diagnostic' }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    expect((await screen.findByTestId('credential-protection-refusal')).textContent).toBe(
+      'The separate-key startup checks failed. Check the deployment settings.',
+    );
+    expect(screen.queryByText(/untrusted diagnostic/)).toBeNull();
+  });
+
+  it('explains that disabling removes the wrapped key and retains the startup volume', async () => {
+    mockProtection(CONTAINER_READY);
+    renderWithProviders(<CredentialProtectionPanel />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Turn off' }));
+    expect(screen.getByText(/The encrypted copy of the protected key will be deleted/)).toHaveTextContent(
+      'The startup key volume remains',
+    );
+    expect(screen.queryByText(/system keychain/i)).toBeNull();
+    const buttons = screen.getAllByRole('button', { name: 'Turn off' });
+    expect(buttons[buttons.length - 1]).toBeDisabled();
   });
 });

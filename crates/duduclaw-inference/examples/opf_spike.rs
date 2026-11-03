@@ -708,6 +708,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---- session ----
+    // This standalone diagnostic deliberately has no protected runtime loader.
+    if duduclaw_core::root_key::is_held() {
+        return Err("獨立金鑰模式不允許未經安全初始化的 ONNX 測試程式".into());
+    }
     let threads = std::thread::available_parallelism().map(|n| n.get().min(4)).unwrap_or(2);
     let rss_before = rss_kb();
     let load_t0 = Instant::now();
