@@ -12,7 +12,9 @@
 //! (local GGUF models, logs, prior backups) so the export stays small and
 //! portable.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
@@ -101,7 +103,6 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) 
             format!("archive not found: {}", archive.display()),
         ));
     }
-    validate_import_policy(archive, home, personal)?;
     // Create only the empty root before locking; no employee data is written.
     fs::create_dir_all(home).map_err(|e| io_err("import mkdir home", e))?;
     let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home)
@@ -113,8 +114,93 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) 
     }).map_err(|error| io_err("import config lock", error))?
 }
 
+// Bound the compressed snapshot using the existing restore total-size ceiling (8 GiB).
+const MAX_IMPORT_ARCHIVE_BYTES: u64 = duduclaw_gateway::backup_restore::DEFAULT_MAX_RESTORE_TOTAL_BYTES;
+
+fn snapshot_archive(archive: &Path, home: &Path, max_bytes: u64) -> Result<File> {
+    let source = File::open(archive).map_err(|e| io_err("import open", e))?;
+    if !source.metadata().map_err(|e| io_err("import snapshot", e))?.is_file() {
+        return Err(io_err("import snapshot", "archive must be a regular file"));
+    }
+    // Into_file removes the temporary name; later archive entries cannot replace
+    // this private inode. Both passes read this same handle, never a pathname.
+    let mut snapshot = tempfile::NamedTempFile::new_in(home)
+        .map_err(|e| io_err("import snapshot", e))?.into_file();
+    let copied = std::io::copy(&mut source.take(max_bytes + 1), &mut snapshot)
+        .map_err(|e| io_err("import snapshot", e))?;
+    if copied > max_bytes {
+        return Err(io_err("import snapshot", format!("壓縮備份超過匯入大小上限 {max_bytes} bytes")));
+    }
+    snapshot.rewind().map_err(|e| io_err("import snapshot", e))?;
+    Ok(snapshot)
+}
+
 fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: bool) -> Result<()> {
-    let prepared_config = validate_import_policy(archive, home, personal)?;
+    let mut snapshot = snapshot_archive(archive, home, MAX_IMPORT_ARCHIVE_BYTES)?;
+    let decision = validate_import_policy(&mut snapshot, home, personal)?;
+    apply_import_snapshot(&mut snapshot, home, force, &decision, |_| Ok(()))
+}
+
+#[derive(Debug)]
+struct ImportDecision {
+    prepared_config: String,
+    publish_before_unpack: bool,
+}
+
+fn publish_import_config(home: &Path, config: &str) -> Result<()> {
+    let mut pending = tempfile::NamedTempFile::new_in(home)
+        .map_err(|e| io_err("import preserve MFA policy", e))?;
+    pending.write_all(config.as_bytes()).and_then(|_| pending.as_file().sync_all())
+        .map_err(|e| io_err("import preserve MFA policy", e))?;
+    durable_publish(pending, &home.join("config.toml"))
+        .map_err(|e| io_err("import preserve MFA policy", e))?;
+    Ok(())
+}
+
+fn durable_publish(pending: tempfile::NamedTempFile, destination: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+        let wide = |path: &Path| -> std::io::Result<Vec<u16>> {
+            let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if value.contains(&0) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in config path"));
+            }
+            value.push(0);
+            Ok(value)
+        };
+        // Close the flushed file before moving; TempPath still cleans up on failure.
+        let source = pending.into_temp_path();
+        let from = wide(&source)?;
+        let to = wide(destination)?;
+        // SAFETY: both paths are NUL-terminated UTF-16 buffers alive for the call.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        pending.persist(destination).map_err(|error| error.error)?;
+        File::open(destination.parent().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "config has no parent",
+        ))?)?.sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pending, destination);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "durable config publication unavailable"))
+    }
+}
+
+fn apply_import_snapshot(
+    snapshot: &mut File,
+    home: &Path,
+    force: bool,
+    decision: &ImportDecision,
+    mut after_unpack: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
     let existing_agents = home.join("agents");
     if existing_agents.exists() {
         if !force {
@@ -132,40 +218,24 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
         }
         fs::rename(&existing_agents, &backup).map_err(|e| io_err("import backup agents", e))?;
     }
-    fs::create_dir_all(home).map_err(|e| io_err("import mkdir home", e))?;
-
-    // Persist the carried policy before an archived users.db can replace it.
-    if let Some(config) = &prepared_config {
-        use std::io::Write;
-        // NamedTempFile creates owner-only files on Unix; publish atomically
-        // so an interrupted write cannot discard the live policy or secrets.
-        let mut pending = tempfile::NamedTempFile::new_in(home)
-            .map_err(|e| io_err("import preserve MFA policy", e))?;
-        pending.write_all(config.as_bytes()).and_then(|_| pending.as_file().sync_all())
-            .map_err(|e| io_err("import preserve MFA policy", e))?;
-        pending.persist(home.join("config.toml"))
-            .map_err(|e| io_err("import preserve MFA policy", e))?;
-        #[cfg(unix)]
-        File::open(home).and_then(|directory| directory.sync_all())
-            .map_err(|e| io_err("import preserve MFA policy directory sync", e))?;
-        #[cfg(not(unix))]
-        // Rename durability is best effort on non-Unix platforms.
-        let _ = home;
+    // Always publish strict policy before replacing identity, even if the
+    // prepared text is identical to the archived text. Tar order is untrusted.
+    if decision.publish_before_unpack {
+        publish_import_config(home, &decision.prepared_config)?;
     }
-    let file = File::open(archive).map_err(|e| io_err("import open", e))?;
-    let dec = GzDecoder::new(file);
-    let mut ar = tar::Archive::new(dec);
+    snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))?;
+    let mut ar = tar::Archive::new(GzDecoder::new(snapshot));
+    let mut targets = HashSet::new();
     for entry in ar.entries().map_err(|e| io_err("import unpack", e))? {
         let mut entry = entry.map_err(|e| io_err("import unpack", e))?;
-        let path: PathBuf = entry.path().map_err(|e| io_err("import unpack", e))?
-            .components()
-            .filter(|component| !matches!(component, std::path::Component::CurDir))
-            .collect();
-        // Restoring a lock file would replace the inode carrying our lease.
-        if is_live_lock(&path) || (prepared_config.is_some() && path == Path::new("config.toml")) {
+        let path = checked_import_entry(&entry, &mut targets)?;
+        if is_live_lock(&path) || (decision.publish_before_unpack && path == Path::new("config.toml")) {
             continue;
         }
-        entry.unpack_in(home).map_err(|e| io_err("import unpack", e))?;
+        if !entry.unpack_in(home).map_err(|e| io_err("import unpack", e))? {
+            return Err(io_err("import unpack", "archive entry escaped home"));
+        }
+        after_unpack(&path)?;
     }
     Ok(())
 }
@@ -193,6 +263,209 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(p, contents).unwrap();
+    }
+
+    fn ordered_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut builder = tar::Builder::new(GzEncoder::new(File::create(path).unwrap(), Compression::default()));
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_size(data.len() as u64);
+            // Preserve hostile Windows spelling in fixtures on every host.
+            let bytes = name.as_bytes();
+            header.as_old_mut().name[..bytes.len()].copy_from_slice(bytes);
+            header.set_cksum();
+            builder.append(&header, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn import_snapshot_survives_original_archive_replacement_after_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let archive = root.path().join("input.tar.gz");
+        ordered_archive(&archive, &[("config.toml", b"[auth]\nmfa_enforced=true\n"), ("safe.txt", b"validated")]);
+        let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = snapshot.metadata().unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 0, "snapshot must have no replaceable pathname");
+        }
+        let decision = validate_import_policy(&mut snapshot, &home, false).unwrap();
+        let replacement = root.path().join("replacement.tar.gz");
+        ordered_archive(&replacement, &[("config.toml", b"[auth]\nmfa_enforced=false\n"), ("evil.txt", b"unvalidated")]);
+        fs::remove_file(&archive).unwrap();
+        fs::rename(replacement, &archive).unwrap();
+        apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).unwrap();
+        assert_eq!(fs::read(home.join("safe.txt")).unwrap(), b"validated");
+        assert!(!home.join("evil.txt").exists());
+        let config: toml::Table = fs::read_to_string(home.join("config.toml")).unwrap().parse().unwrap();
+        assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn import_snapshot_copy_has_a_hard_byte_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("input");
+        fs::write(&archive, [0; 33]).unwrap();
+        assert!(snapshot_archive(&archive, root.path(), 32).unwrap_err().to_string().contains("大小上限"));
+        fs::write(&archive, [0; 32]).unwrap();
+        assert_eq!(snapshot_archive(&archive, root.path(), 32).unwrap().metadata().unwrap().len(), 32);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1, "snapshot names must not survive");
+    }
+
+    #[test]
+    fn import_refuses_protected_windows_aliases_before_any_data_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        write(&home.join("config.toml"), "[auth]\nmfa_enforced=true\n");
+        write(&home.join("agents/kept/SOUL.md"), "keep");
+        let archive = root.path().join("input.tar.gz");
+        for alias in ["confıg.toml", "uſers.db", "uſers.db-wal", "uſers.db-shm"] {
+            ordered_archive(&archive, &[(alias, b"")]);
+            assert!(import_archive(&archive, &home, true, false).is_err(), "{alias}");
+            assert!(!home.join("agents.pre-import").exists());
+        }
+        for protected in ["config.toml", "users.db", "users.db-wal", "users.db-shm", "users.db-journal", "license.json"] {
+            for alias in [format!("{protected}."), format!("{protected} "), format!("{protected}. "),
+                format!("{protected}:stream"), protected.to_uppercase(), format!("{protected}./child")] {
+                ordered_archive(&archive, &[("first.txt", b"must not land"), (&alias, b"")]);
+                assert!(import_archive(&archive, &home, true, false).is_err(), "{alias}");
+                assert!(!home.join("first.txt").exists(), "{alias}");
+                assert!(!home.join("agents.pre-import").exists(), "{alias}");
+                assert_eq!(fs::read_to_string(home.join("agents/kept/SOUL.md")).unwrap(), "keep");
+            }
+        }
+    }
+
+    #[test]
+    fn import_refuses_dos_names_ads_and_duplicate_portable_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let archive = root.path().join("input.tar.gz");
+        let mut reserved: Vec<String> = ["CON", "NUL", "AUX", "PRN", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"]
+            .into_iter().map(str::to_owned).collect();
+        for number in 1..=9 {
+            reserved.extend([format!("COM{number}"), format!("LPT{number}")]);
+        }
+        for name in reserved {
+            for component in [name.clone(), format!("{name}.txt"), format!("{name}. ")] {
+                let path = format!("nested/{component}/file");
+                ordered_archive(&archive, &[(&path, b"")]);
+                assert!(import_archive(&archive, &home, false, true).is_err(), "{path}");
+            }
+        }
+        for path in ["nested/file:stream", "nested:stream/file", "nested/.../file", "nested/   /file", "nested\\file",
+            "CONFIG~1.TOM", "USERS~1.DB-", "nested/AGENTS~1/file"] {
+            ordered_archive(&archive, &[(path, b"")]);
+            assert!(import_archive(&archive, &home, false, true).is_err(), "{path}");
+        }
+        for (first, second) in [("Dir/File", "dir/file"), ("dir./file ", "DIR/file"), ("a", "a."), ("nested/uſer", "nested/user")] {
+            ordered_archive(&archive, &[(first, b"one"), (second, b"two")]);
+            let err = import_archive(&archive, &home, false, true).unwrap_err();
+            assert!(err.to_string().contains("duplicate archive target"), "{err}");
+        }
+    }
+
+    #[test]
+    fn import_unpack_rechecks_paths_types_and_protected_names() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let archive = root.path().join("input.tar.gz");
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+        for name in ["config.toml.", "users.db:stream", "nested/NUL.txt"] {
+            ordered_archive(&archive, &[(name, b"")]);
+            let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+            assert!(apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).is_err());
+        }
+        for kind in [tar::EntryType::Symlink, tar::EntryType::Link, tar::EntryType::Fifo] {
+            let mut builder = tar::Builder::new(GzEncoder::new(File::create(&archive).unwrap(), Compression::default()));
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(0);
+            header.set_link_name("config.toml").unwrap();
+            header.set_cksum();
+            builder.append_data(&mut header, "alias", std::io::empty()).unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+            let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+            assert!(apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).is_err());
+        }
+    }
+
+    #[test]
+    fn import_skips_live_lock_aliases_in_both_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        write(&home.join("config.toml.lock"), "live");
+        write(&home.join("locks/gateway.lock"), "live gateway");
+        let archive = root.path().join("input.tar.gz");
+        ordered_archive(&archive, &[("CONFIG.TOML.LOCK. ", b"archive"), ("LOCKS. /Gateway.lock ", b"archive")]);
+        import_archive(&archive, &home, false, true).unwrap();
+        assert_eq!(fs::read_to_string(home.join("config.toml.lock")).unwrap(), "live");
+        assert_eq!(fs::read_to_string(home.join("locks/gateway.lock")).unwrap(), "live gateway");
+        assert!(!home.join("CONFIG.TOML.LOCK. ").exists());
+        assert!(!home.join("LOCKS. ").exists());
+        ordered_archive(&archive, &[("lockſ/gateway.lock", b"archive")]);
+        import_archive(&archive, &home, false, true).unwrap();
+        assert_eq!(fs::read_to_string(home.join("locks/gateway.lock")).unwrap(), "live gateway");
+    }
+
+    #[test]
+    fn mfa_import_publishes_unchanged_strict_config_before_identity_and_survives_failure() {
+        for personal in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            write(&home.join("config.toml"), "# Policy currently lives in users.db\n");
+            drop(duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap());
+            let mut conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+            drop(conn);
+            let archived_db = root.path().join("archived.db");
+            drop(duduclaw_auth::UserDb::new(&archived_db).unwrap());
+            let db_bytes = fs::read(archived_db).unwrap();
+            let strict = "[auth]\nmfa_enforced=true\n";
+            let archive = root.path().join("input.tar.gz");
+            // The identity database is deliberately before the config.
+            ordered_archive(&archive, &[("users.db", &db_bytes), ("config.toml", strict.as_bytes()), ("later.txt", b"later")]);
+            let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+            let decision = validate_import_policy(&mut snapshot, &home, personal).unwrap();
+            assert_eq!(decision.prepared_config, strict, "regression: unchanged prepared text");
+            assert!(decision.publish_before_unpack);
+            let error = apply_import_snapshot(&mut snapshot, &home, false, &decision, |path| {
+                if path == Path::new("users.db") { return Err(io_err("injected failure", "after users.db")); }
+                Ok(())
+            }).unwrap_err();
+            assert!(error.to_string().contains("injected failure"));
+            assert_eq!(fs::read(home.join("users.db")).unwrap(), db_bytes);
+            let config: toml::Table = fs::read_to_string(home.join("config.toml")).unwrap().parse().unwrap();
+            assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(true));
+            assert!(!home.join("later.txt").exists());
+            let mut unpacked = Vec::new();
+            apply_import_snapshot(&mut snapshot, &home, false, &decision, |path| {
+                unpacked.push(path.to_owned()); Ok(())
+            }).unwrap();
+            assert!(!unpacked.contains(&PathBuf::from("config.toml")), "archive config must always be skipped");
+        }
+    }
+
+    #[test]
+    fn mfa_import_sidecar_replacement_always_prepublishes_strict_config() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        write(&home.join("config.toml"), "[auth]\nmfa_enforced=true\n");
+        let archive = root.path().join("input.tar.gz");
+        for name in ["users.db-wal", "users.db-shm", "users.db-journal"] {
+            ordered_archive(&archive, &[(name, b"")]);
+            let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+            let decision = validate_import_policy(&mut snapshot, &home, false).unwrap();
+            assert!(decision.publish_before_unpack, "{name}");
+        }
     }
 
     #[test]
@@ -608,7 +881,7 @@ mod tests {
         for name in ["config.toml.lock", ".google-home-source.lock"] {
             assert_eq!(fs::read_to_string(target.join(name)).unwrap(), "live lock");
         }
-        validate_import_policy(&archive, &target, false).unwrap();
+        validate_import_policy(&mut File::open(&archive).unwrap(), &target, false).unwrap();
         // Model an Admin toggle after preflight but before the final lock.
         duduclaw_core::with_file_lock(&target.join("config.toml"), || {
             fs::write(target.join("config.toml"), "[auth]\nmfa_enforced=true\n")?;
@@ -664,18 +937,83 @@ mod tests {
 
 fn is_live_lock(path: &Path) -> bool {
     path.components().next().and_then(|part| part.as_os_str().to_str()).is_some_and(|name| {
-        [duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE, "config.toml.lock", ".google-home-source.lock"]
+        [duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE, "config.toml.lock", ".google-home-source.lock", "locks"]
             .iter().any(|lock| name.eq_ignore_ascii_case(lock))
     })
 }
 
 const IDENTITY_FILES: &[&str] = &["users.db", "users.db-wal", "users.db-shm", "users.db-journal"];
 
-fn validate_import_policy(archive: &Path, home: &Path, personal: bool) -> Result<Option<String>> {
-    use std::io::Read;
+/// Portable comparison key, independent of the host filesystem's aliases.
+fn canonical_import_path(path: &Path) -> Result<PathBuf> {
+    let mut canonical = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, std::path::Component::CurDir) { continue; }
+        let std::path::Component::Normal(value) = component else {
+            return Err(io_err("import policy", "invalid archive path"));
+        };
+        let name = value.to_str().ok_or_else(|| io_err("import policy", "non-UTF-8 archive path"))?;
+        if name.contains([':', '\\']) {
+            return Err(io_err("import policy", "non-portable archive path"));
+        }
+        // Uppercase first also catches ASCII aliases such as dotless i and
+        // long s used by Windows' ordinal uppercase comparison. Lowercase
+        // keeps the comparison keys aligned with our protected-name constants.
+        let name = name.trim_end_matches(['.', ' ']).to_uppercase().to_lowercase();
+        let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+        let device_number = stem.strip_prefix("com").or_else(|| stem.strip_prefix("lpt"));
+        if name.is_empty() || matches!(stem, "con" | "nul" | "aux" | "prn")
+            || matches!(device_number, Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")) {
+            return Err(io_err("import policy", "reserved archive path component"));
+        }
+        // Existing Windows files may also be reachable through generated 8.3
+        // names. Their mappings depend on the destination volume, so refuse
+        // the short-name spelling instead of trying to resolve it during unpack.
+        let (short_stem, extension) = name.rsplit_once('.').unwrap_or((&name, ""));
+        if short_stem.chars().count() <= 8 && !short_stem.contains('.') && extension.chars().count() <= 3
+            && short_stem.rsplit_once('~').is_some_and(|(prefix, digits)|
+                !prefix.is_empty() && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) {
+            return Err(io_err("import policy", "DOS short-name archive alias"));
+        }
+        canonical.push(name);
+    }
+    if canonical.as_os_str().is_empty() {
+        return Err(io_err("import policy", "empty archive path"));
+    }
+    Ok(canonical)
+}
+
+fn checked_import_entry<R: Read>(entry: &tar::Entry<'_, R>, targets: &mut HashSet<PathBuf>) -> Result<PathBuf> {
+    // Check the wire spelling before Windows Path components consume backslashes.
+    if entry.path_bytes().iter().any(|byte| matches!(byte, b':' | b'\\')) {
+        return Err(io_err("import policy", "non-portable archive path"));
+    }
+    let raw = entry.path().map_err(|e| io_err("import policy", e))?;
+    let path = canonical_import_path(&raw)?;
+    let kind = entry.header().entry_type();
+    if !matches!(kind, tar::EntryType::Regular | tar::EntryType::Directory) {
+        return Err(io_err("import policy", "invalid archive entry type"));
+    }
+    if !targets.insert(path.clone()) {
+        return Err(io_err("import policy", "duplicate archive target"));
+    }
+    if is_live_lock(&path) { return Ok(path); }
+    let name = path.components().next().and_then(|part| part.as_os_str().to_str()).unwrap();
+    if IDENTITY_FILES.contains(&name) || matches!(name, "config.toml" | "license.json") {
+        let normalized_raw: PathBuf = raw.components()
+            .filter(|part| !matches!(part, std::path::Component::CurDir)).collect();
+        if normalized_raw != path || path.components().count() != 1 || !kind.is_file() {
+            return Err(io_err("import policy", "invalid protected file entry"));
+        }
+    }
+    Ok(path)
+}
+
+fn validate_import_policy(snapshot: &mut File, home: &Path, personal: bool) -> Result<ImportDecision> {
     let policy = duduclaw_core::product_profile::load(home).map_err(DuDuClawError::Config)?;
-    let file = File::open(archive).map_err(|e| io_err("import policy", e))?;
-    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    snapshot.rewind().map_err(|e| io_err("import policy", e))?;
+    let mut archive = tar::Archive::new(GzDecoder::new(snapshot));
+    let mut targets = HashSet::new();
     let mut restored_config = None;
     let mut replaces_identity = false;
     let mut personal = personal;
@@ -684,25 +1022,10 @@ fn validate_import_policy(archive: &Path, home: &Path, personal: bool) -> Result
         Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     for entry in archive.entries().map_err(|e| io_err("import policy", e))? {
         let mut entry = entry.map_err(|e| io_err("import policy", e))?;
-        let path: PathBuf = entry.path().map_err(|e| io_err("import policy", e))?.components()
-            .filter(|component| !matches!(component, std::path::Component::CurDir)).collect();
-        // Export emits only regular files/directories. Links and special files
-        // could alias a protected config/database under an unrelated name.
-        let kind = entry.header().entry_type();
-        if (!kind.is_file() && !kind.is_dir()) || path.components().any(|part|
-            !matches!(part, std::path::Component::Normal(_))) {
-            return Err(io_err("import policy", "invalid archive entry"));
-        }
+        let path = checked_import_entry(&entry, &mut targets)?;
         if is_live_lock(&path) { continue; }
-        if let Some(name) = path.components().next().and_then(|part| part.as_os_str().to_str()) {
-            for protected in IDENTITY_FILES.iter().copied().chain(["config.toml", "license.json"]) {
-                if name.eq_ignore_ascii_case(protected) {
-                    if name != protected || path.components().count() != 1 || !kind.is_file() {
-                        return Err(io_err("import policy", "invalid protected file entry"));
-                    }
-                    if IDENTITY_FILES.contains(&protected) { replaces_identity = true; }
-                }
-            }
+        if path.to_str().is_some_and(|name| IDENTITY_FILES.contains(&name)) {
+            replaces_identity = true;
         }
         if path == Path::new("license.json") {
             if license_seen || entry.header().size().unwrap_or(u64::MAX) > 1024 * 1024 {
@@ -762,5 +1085,14 @@ fn validate_import_policy(archive: &Path, home: &Path, personal: bool) -> Result
             return Err(io_err("import policy", "匯入帳號資料庫時，設定檔必須明確保留目前的 auth.mfa_enforced；變更政策請使用 system.update_config 專用開關。"));
         }
     }
-    Ok((prepared != retained).then_some(prepared))
+    // The unchanged MFA rule guarantees that an accepted identity replacement
+    // carries true in the prepared text whenever the current policy is strict.
+    let prepared_table: toml::Table = prepared.parse()
+        .map_err(|_| io_err("import policy", "invalid prepared configuration"))?;
+    let strict = prepared_table.get("auth").and_then(|auth| auth.get("mfa_enforced"))
+        .and_then(|value| value.as_bool()) == Some(true);
+    Ok(ImportDecision {
+        publish_before_unpack: prepared != retained || (replaces_identity && strict),
+        prepared_config: prepared,
+    })
 }

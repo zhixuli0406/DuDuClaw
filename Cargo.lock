@@ -1856,6 +1856,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
  "zip",
 ]

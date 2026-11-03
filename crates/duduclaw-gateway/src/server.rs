@@ -354,6 +354,42 @@ mod identity_policy_precheck_tests {
     }
 }
 
+// Keep lock contention non-fatal, without touching a pending restore.
+fn backup_restore_boot_allowed(
+    pending: bool,
+    acquire: impl FnOnce() -> Result<(), String>,
+) -> bool {
+    if !pending {
+        return true;
+    }
+    match acquire() {
+        Ok(()) => true,
+        Err(error) => {
+            error!(
+                error = %error,
+                "pending backup restore deferred: another gateway may hold this data directory; marker and staged data are unchanged; gateway continues booting with singleton-gated work disabled while the lock is held"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod backup_restore_boot_tests {
+    use super::backup_restore_boot_allowed;
+
+    #[test]
+    fn no_pending_restore_keeps_original_boot_without_early_lock() {
+        assert!(backup_restore_boot_allowed(false, || panic!("must not acquire early")));
+    }
+
+    #[test]
+    fn pending_restore_requires_ownership_but_contention_is_nonfatal() {
+        assert!(backup_restore_boot_allowed(true, || Ok(())));
+        assert!(!backup_restore_boot_allowed(true, || Err("held by another gateway".into())));
+    }
+}
+
 /// Start the WebSocket RPC gateway and block until it shuts down.
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
     // Initialise the log broadcast channel (must happen before subscribers connect).
@@ -394,6 +430,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .ok_or_else(|| duduclaw_core::error::DuDuClawError::Gateway("gateway bind resolved to no address".into()))?;
 
 
+    // Only a pending restore needs early ownership. Ordinary boots keep the
+    // original, non-fatal singleton acquisition and recovery ordering below.
+    let apply_pending_restore = backup_restore_boot_allowed(
+        crate::backup_restore::read_marker(&home_dir).is_some(),
+        || duduclaw_core::gateway_instance::acquire_for_restore(&home_dir),
+    );
+
     // ── B5 (OS security line P0): boot event ──────────────────────────────
     // One `os_boot` row per gateway process start, chained (B1) into
     // `security_audit.jsonl` — the durable "when did this box last come up,
@@ -418,27 +461,29 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // a non-appliance install or an appliance box that never ran
     // `device.backup_restore`. See `backup_restore.rs`'s module doc for the
     // full ordering guarantee (old data is always preserved, never deleted).
-    match crate::backup_restore::perform_pending_restore_swap(
-        &home_dir,
-        &chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string(),
-    ) {
-        Ok(Some(report)) => {
-            crate::metrics::global_metrics().backup_restore_swap_ok();
-            info!(
-                preserved = %report.preserved_dir.display(),
-                entries = report.entries_swapped,
-                "device migration restore applied at boot — previous data preserved"
-            );
-        }
-        Ok(None) => {}
-        Err(e) => {
-            crate::metrics::global_metrics().backup_restore_swap_fail();
-            tracing::error!(
-                error = ?e,
-                "device migration restore failed at boot — gateway continues with whatever \
-                 state is on disk; if old data was already preserved it is under a \
-                 restore-backup-<timestamp> directory in the home dir"
-            );
+    if apply_pending_restore {
+        match crate::backup_restore::perform_pending_restore_swap(
+            &home_dir,
+            &chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string(),
+        ) {
+            Ok(Some(report)) => {
+                crate::metrics::global_metrics().backup_restore_swap_ok();
+                info!(
+                    preserved = %report.preserved_dir.display(),
+                    entries = report.entries_swapped,
+                    "device migration restore applied at boot — previous data preserved"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::global_metrics().backup_restore_swap_fail();
+                tracing::error!(
+                    error = ?e,
+                    "device migration restore failed at boot — gateway continues with whatever \
+                     state is on disk; if old data was already preserved it is under a \
+                     restore-backup-<timestamp> directory in the home dir"
+                );
+            }
         }
     }
 

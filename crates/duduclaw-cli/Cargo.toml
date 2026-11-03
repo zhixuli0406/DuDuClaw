@@ -98,6 +98,9 @@ calamine = { version = "=0.36.1", default-features = false, features = ["dates"]
 duduclaw-knowledge = { workspace = true }
 tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks"] }
 # P2-B: `Provenance::test_only` exists only with this feature (never in a

@@ -526,7 +526,17 @@ pub enum RestoreSwapError {
     /// gateway does not retry the same broken swap forever) but nothing is
     /// touched — fail-closed, no data movement on an already-suspect state.
     StagingMissingOrEmpty,
+    GatewayRunning(String),
     Io(String),
+}
+
+// The singleton inode must stay at its original path on every platform.
+// Ignore Windows aliases too, even when this restore runs on Unix.
+fn is_gateway_lock_directory(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.split(':').next().unwrap_or(name)
+            .trim_end_matches(['.', ' ']).to_uppercase().to_lowercase() == "locks"
+    })
 }
 
 /// Detect and apply a pending restore. `Ok(None)` — the overwhelming common
@@ -539,10 +549,11 @@ pub enum RestoreSwapError {
 ///
 /// ## Ordering (why this can never destroy data)
 ///
-/// 1. Resolve the restore root; bail (marker cleared, no move) if it is
+/// 1. Acquire the gateway singleton lock before any restore mutation, then
+///    resolve the restore root; bail (marker cleared, no move) if it is
 ///    missing or has nothing in it.
 /// 2. Move every CURRENT top-level entry of `home_dir` (except the staging
-///    dir and the marker itself) into a fresh `restore-backup-<now_tag>/`
+///    dir, markers and live `locks/` directory) into a fresh `restore-backup-<now_tag>/`
 ///    subdirectory. This step ONLY ever moves data into a new, empty
 ///    directory — it cannot lose anything.
 /// 3. Only after step 2 fully succeeds: move every entry from the restore
@@ -562,6 +573,14 @@ pub fn perform_pending_restore_swap(
     if read_marker(home_dir).is_none() {
         return Ok(None);
     }
+
+    // Hold through policy reads, staging rewrites, the entire swap and boot.
+    // A second gateway must not complete an Admin toggle during this window.
+    duduclaw_core::gateway_instance::acquire_for_restore(home_dir).map_err(|error| {
+        RestoreSwapError::GatewayRunning(format!(
+            "無法還原：其他閘道程序正在使用此資料目錄，請先停止該程序後再重試。{error}"
+        ))
+    })?;
 
     let staging = staging_dir(home_dir);
     let restore_root = resolve_restore_root(&staging, home_dir);
@@ -627,6 +646,7 @@ pub fn perform_pending_restore_swap(
         if name == RESTORE_STAGING_DIRNAME
             || name == RESTORE_MARKER_FILE
             || name == crate::channel_ingress::RESTORE_MARKER
+            || is_gateway_lock_directory(&name)
             || Some(&name) == preserved_name.as_ref()
         {
             continue;
@@ -640,6 +660,9 @@ pub fn perform_pending_restore_swap(
         std::fs::read_dir(&restore_root).map_err(|e| RestoreSwapError::Io(e.to_string()))?
     {
         let entry = entry.map_err(|e| RestoreSwapError::Io(e.to_string()))?;
+        if is_gateway_lock_directory(&entry.file_name()) {
+            continue;
+        }
         let dest = home_dir.join(entry.file_name());
         std::fs::rename(entry.path(), &dest).map_err(|e| RestoreSwapError::Io(e.to_string()))?;
         swapped += 1;
@@ -1021,6 +1044,101 @@ mod tests {
     }
 
     // ── perform_pending_restore_swap ────────────────────────────
+
+    #[test]
+    fn restore_refuses_a_live_gateway_without_changing_any_files() {
+        use fs2::FileExt;
+
+        fn snapshot(root: &Path, dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut files = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    files.insert(relative, None);
+                    files.extend(snapshot(root, &path));
+                } else {
+                    // Windows forbids reading the locked byte range through
+                    // another handle; the empty lock itself is never written.
+                    let content = if relative == Path::new("locks/gateway.lock") {
+                        Vec::new()
+                    } else {
+                        std::fs::read(&path).unwrap()
+                    };
+                    files.insert(relative, Some(content));
+                }
+            }
+            files
+        }
+
+        for with_staging in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            std::fs::create_dir_all(home.join("locks")).unwrap();
+            let holder = std::fs::OpenOptions::new().create(true).truncate(false)
+                .read(true).write(true)
+                .open(duduclaw_core::gateway_instance::lock_path(home)).unwrap();
+            holder.try_lock_exclusive().unwrap();
+            std::fs::write(home.join("locks/gateway.lock.holder"), "other gateway").unwrap();
+            std::fs::write(home.join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            std::fs::write(home.join("users.db"), "live identity").unwrap();
+            if with_staging {
+                let staging = staging_dir(home);
+                std::fs::create_dir(&staging).unwrap();
+                std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+                std::fs::write(staging.join("users.db"), "archived identity").unwrap();
+            }
+            write_marker(home, &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "pending.tar.gz".into(),
+            }).unwrap();
+            let before = snapshot(home, home);
+            let error = perform_pending_restore_swap(home, "blocked").unwrap_err();
+            assert!(matches!(error, RestoreSwapError::GatewayRunning(ref text)
+                if text.contains("其他閘道程序正在使用此資料目錄")));
+            assert_eq!(snapshot(home, home), before);
+            assert!(!duduclaw_core::gateway_instance::held(home));
+        }
+    }
+
+    #[test]
+    fn restore_preserves_the_singleton_inode_and_skips_archived_lock_aliases() {
+        use fs2::FileExt;
+
+        assert!(is_gateway_lock_directory(std::ffi::OsStr::new("locks::$INDEX_ALLOCATION")));
+        for archived_name in ["locks", "LOCKS", "locks.", "locks ", "lockſ", "locKs"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            duduclaw_core::gateway_instance::acquire_for_restore(home).unwrap();
+            let lock = duduclaw_core::gateway_instance::lock_path(home);
+            #[cfg(unix)]
+            let original_inode = {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(&lock).unwrap().ino()
+            };
+            let holder_before = std::fs::read(duduclaw_core::gateway_instance::holder_path(home)).unwrap();
+            std::fs::write(home.join("locks/keep"), b"live lock data").unwrap();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(staging.join(archived_name)).unwrap();
+            std::fs::write(staging.join(archived_name).join("gateway.lock"), b"archived lock").unwrap();
+            std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            write_marker(home, &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "locks.tar.gz".into(),
+            }).unwrap();
+
+            let report = perform_pending_restore_swap(home, "stable-lock").unwrap().unwrap();
+            assert!(!report.preserved_dir.join("locks").exists());
+            assert_eq!(std::fs::read(home.join("locks/keep")).unwrap(), b"live lock data");
+            assert_eq!(std::fs::read(duduclaw_core::gateway_instance::holder_path(home)).unwrap(), holder_before);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(std::fs::metadata(&lock).unwrap().ino(), original_inode);
+            }
+            let other = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+            assert!(other.try_lock_exclusive().is_err(), "a second gateway must remain excluded");
+            assert!(duduclaw_core::gateway_instance::held(home));
+        }
+    }
 
     #[test]
     fn mfa_restore_keeps_current_policy_and_restores_all_data_once() {

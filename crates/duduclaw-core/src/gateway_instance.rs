@@ -60,6 +60,22 @@ pub fn holder_path(home: &Path) -> PathBuf {
 /// process now holds it (or already did); `Err` names why not, and leaves the
 /// refusal marker for `duduclaw doctor`.
 pub fn acquire(home: &Path) -> Result<(), String> {
+    acquire_inner(home, true)
+}
+
+/// Take the same process-lifetime singleton lock before applying a restore.
+/// A competing holder must leave the pending restore and live home untouched,
+/// including the diagnostic refusal marker. The restore must retain `locks/`
+/// in place so this handle continues to exclude later gateway starts.
+pub fn acquire_for_restore(home: &Path) -> Result<(), String> {
+    acquire_inner(home, false)
+}
+
+fn acquire_inner(home: &Path, record_refusal: bool) -> Result<(), String> {
+    // Canonicalize only after creation. A missing home under a relative or
+    // symlinked parent otherwise gets a different registry key after locking,
+    // so held()/the next acquire would fail to recognize our own handle.
+    std::fs::create_dir_all(home.join("locks")).map_err(|e| e.to_string())?;
     let key = key(home);
     let mut held = held_locks()
         .lock()
@@ -68,7 +84,6 @@ pub fn acquire(home: &Path) -> Result<(), String> {
         return Ok(());
     }
     let result = (|| -> Result<std::fs::File, String> {
-        std::fs::create_dir_all(home.join("locks")).map_err(|e| e.to_string())?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -103,15 +118,17 @@ pub fn acquire(home: &Path) -> Result<(), String> {
             Ok(())
         }
         Err(error) => {
-            let _ = std::fs::create_dir_all(home.join("locks"));
-            let _ = std::fs::write(
-                refused_marker_path(home),
-                format!(
-                    "pid={} at={} reason={error}\n",
-                    std::process::id(),
-                    chrono::Utc::now().to_rfc3339()
-                ),
-            );
+            if record_refusal {
+                let _ = std::fs::create_dir_all(home.join("locks"));
+                let _ = std::fs::write(
+                    refused_marker_path(home),
+                    format!(
+                        "pid={} at={} reason={error}\n",
+                        std::process::id(),
+                        chrono::Utc::now().to_rfc3339()
+                    ),
+                );
+            }
             Err(error)
         }
     }
@@ -160,6 +177,32 @@ pub fn status(home: &Path) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_home_is_registered_under_its_created_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("new-home");
+        acquire_for_restore(&home).unwrap();
+        assert!(held(&home));
+        let canonical = std::fs::canonicalize(&home).unwrap();
+        assert!(held(&canonical));
+        acquire(&canonical).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_home_under_a_symlink_keeps_one_registry_key() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        let alias = parent.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let home = alias.join("new-home");
+        acquire_for_restore(&home).unwrap();
+        assert!(held(&home));
+        assert!(held(&real.join("new-home")));
+        acquire(&real.join("new-home")).unwrap();
+    }
 
     #[test]
     fn one_holder_per_home_and_homes_do_not_block_each_other() {
