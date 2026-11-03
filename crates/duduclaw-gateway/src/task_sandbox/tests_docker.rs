@@ -162,6 +162,63 @@ async fn real_agent_dir_is_read_only_and_nothing_is_left() {
     assert_eq!(std::fs::read_dir(h.home.join("sandbox/runs")).unwrap().count(), 0);
 }
 
+#[tokio::test]
+#[ignore = "requires Docker and DUDU_TASK_SANDBOX_IMAGE"]
+async fn real_cancelled_launch_removes_the_running_container() {
+    let agent = format!("rt-cancel-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let h = home(&agent);
+    let s = SandboxSettings { workspace_bytes: 1024 * 1024, ..settings() };
+    let mut dir = super::container::TaskDir::create(&h.home).unwrap();
+    super::container::write_config(&dir.config, 3, &[]).unwrap();
+    let agent_dir = h.agent_dir.canonicalize().unwrap();
+    let agent_files = super::container::agent_mounts(&agent_dir).unwrap();
+    let argv = vec!["-c".to_string(), "sleep 300".to_string()];
+    let env = BTreeMap::new();
+    let home_label = super::container::home_label(&h.home.canonicalize().unwrap());
+    let timeout = Duration::from_secs(120);
+    let plan = super::container::ContainerPlan {
+        image: &s.image, executable: Path::new("/bin/sh"), argv: &argv, env: &env, agent_files: &agent_files,
+        config_dir: &dir.config, memory_bytes: s.memory_bytes, pids: s.pids,
+        cpu_millis: s.cpu_millis, tmp_bytes: s.tmp_bytes, workspace_bytes: s.workspace_bytes, home_label: &home_label,
+        uid: unsafe { libc::geteuid() }, gid: unsafe { libc::getegid() },
+        run_id: &dir.run_id, agent_id: &agent, timeout,
+    };
+    let (create, name) = super::container::build_create(&plan).unwrap();
+    let task = tokio::spawn(async move {
+        super::container::launch(create, name, b"", timeout, |_| true).await
+    });
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let running = loop {
+        let ids = docker(&[
+            "ps", "-q", "--filter", &format!("label=com.duduclaw.task-sandbox.agent={agent}"),
+            "--filter", "status=running",
+        ]);
+        if !ids.trim().is_empty() {
+            break true;
+        }
+        if std::time::Instant::now() >= until {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    task.abort();
+    let joined = task.await;
+    // Cancellation schedules removal on a blocking thread; wait for its result in Docker.
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let remaining = loop {
+        let ids = leftovers(&agent);
+        if ids.trim().is_empty() || std::time::Instant::now() >= until {
+            break ids;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    dir.remove().unwrap();
+    assert!(running, "sandbox container for {agent} never became running within 30 seconds: {joined:?}");
+    assert!(joined.unwrap_err().is_cancelled(), "launch task was not cancelled");
+    assert!(remaining.trim().is_empty(), "sandbox container for {agent} still exists 30 seconds after cancellation: {remaining}");
+    assert_eq!(std::fs::read_dir(h.home.join("sandbox/runs")).unwrap().count(), 0);
+}
+
 /// A2 against real Docker: a container of this home past its deadline is
 /// swept at boot; one within its deadline is kept.
 #[tokio::test]
