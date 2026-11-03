@@ -364,6 +364,30 @@ fn rooms_reject_conflicting_stale_and_ambiguous_admission_requests() {
 }
 
 #[test]
+fn rooms_handshake_sets_connected_status_for_new_existing_and_reconnected_rooms() {
+    let mut rooms = ChatRooms::default();
+    rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
+    let room = rooms.room("after").unwrap();
+    assert!(room.connected);
+    assert!(room.status.is(strings::CONNECTED));
+
+    let mut rooms = ChatRooms::default();
+    let before = rooms.room("before").unwrap();
+    assert!(before.status.is(strings::CONNECTING));
+    rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
+    assert!(rooms.rooms["before"].connected);
+    assert!(rooms.rooms["before"].status.is(strings::CONNECTED));
+
+    rooms.disconnected();
+    rooms.room("reconnected").unwrap();
+    rooms.rooms.get_mut("reconnected").unwrap().running = true;
+    rooms.apply(frame(json!({"type":"session_info","session_id":"base-2"})));
+    assert!(rooms.rooms["reconnected"].connected);
+    assert!(rooms.rooms["reconnected"].running);
+    assert!(rooms.rooms["reconnected"].status.is(strings::CONNECTING));
+}
+
+#[test]
 fn rooms_cancel_outcome_can_use_a_server_generated_request_id() {
     let mut rooms = ChatRooms::default();
     rooms.apply(frame(json!({"type":"session_info","session_id":"base"})));
