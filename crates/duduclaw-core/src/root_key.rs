@@ -5,7 +5,6 @@ use std::sync::OnceLock;
 use zeroize::Zeroizing;
 
 pub const KEY_PATH: &str = "/var/lib/duduclaw-protected/root.key";
-const KEY_DIR: &str = "/var/lib/duduclaw-protected";
 const FD_ENV: &str = "DUDUCLAW_ROOT_KEY_FD";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +100,7 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
             Ok(key) => State::Held(key),
             Err(reason) => {
                 if reason == "mount_scan_incomplete" {
-                    tracing::warn!("Mount scan incomplete: remove extra mounts or mount only the data directories");
+                    tracing::warn!("Mount table or mount points could not be inspected");
                 }
                 tracing::warn!(reason, "Container root key refused; personal accounts remain disabled");
                 State::Refused(reason)
@@ -113,15 +112,15 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
 /// Mountinfo escapes whitespace and backslashes in path fields with octal codes.
 /// Inspect the source root (bind mounts retain it) and the source after `-` as
 /// well as the destination. Abstract Unix sockets have no filesystem entry and
-/// cannot be detected here. This synchronous check runs once at key intake.
+/// cannot be detected here, nor can sockets inside mounted directories. This
+/// synchronous check runs once at key intake.
 #[cfg(any(target_os = "linux", test))]
 fn check_mountinfo(
     mountinfo: Option<&str>,
     mut inspect: impl FnMut(&std::path::Path) -> std::io::Result<(bool, bool)>,
-    mut scan: impl FnMut(&std::path::Path, &[std::path::PathBuf]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
     let mountinfo = mountinfo.ok_or("mount_scan_incomplete")?;
-    let mut mounts = Vec::new();
+    let mut has_mount = false;
     for line in mountinfo.lines() {
         let fields: Vec<_> = line.split_ascii_whitespace().collect();
         let separator = fields.iter().position(|field| *field == "-")
@@ -150,23 +149,9 @@ fn check_mountinfo(
             Ok((false, _)) => (),
             Err(_) => return Err("mount_scan_incomplete"),
         }
-        mounts.push((std::path::PathBuf::from(path), fields[separator + 1]));
+        has_mount = true;
     }
-    if mounts.is_empty() { return Err("mount_scan_incomplete"); }
-    let points: Vec<_> = mounts.iter().map(|(path, _)| path.clone()).collect();
-    for (path, fs) in &mounts {
-        // Skip only the container root (including overlay), kernel pseudo fs,
-        // and the standard device tmpfs. Other tmpfs and non-root overlays are
-        // scanned: their names alone do not establish that they are safe.
-        if path == std::path::Path::new("/")
-            || path == std::path::Path::new(KEY_DIR)
-            || matches!(*fs, "proc" | "sysfs" | "cgroup" | "cgroup2" | "devpts" | "mqueue")
-            || (*fs == "tmpfs" && (path == std::path::Path::new("/dev")
-                || path == std::path::Path::new("/dev/shm"))) {
-            continue;
-        }
-        scan(path, &points)?;
-    }
+    if !has_mount { return Err("mount_scan_incomplete"); }
     Ok(())
 }
 
@@ -181,93 +166,13 @@ fn engine_directory(path: &str) -> bool {
 }
 
 // Docker-managed data volumes and container configuration files are not engine
-// control directories. Their contents are still scanned at the destination.
+// control directories. Only the remaining source components are checked.
 #[cfg(any(target_os = "linux", test))]
 fn engine_source_directory(path: &str) -> bool {
     let path = path.strip_prefix("/var/lib/docker/volumes/")
         .or_else(|| path.strip_prefix("/var/lib/docker/containers/"))
         .unwrap_or(path);
     engine_directory(path)
-}
-
-#[cfg(all(unix, any(target_os = "linux", test)))]
-const MOUNT_SCAN_ENTRIES: usize = 20_000;
-
-#[cfg(all(unix, any(target_os = "linux", test)))]
-fn scan_mount_directory(
-    path: &std::path::Path,
-    mounts: &[std::path::PathBuf],
-    remaining: &mut usize,
-) -> Result<(), &'static str> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| "mount_scan_incomplete")?;
-    if !metadata.is_dir() { return Ok(()); }
-    walk_mount_directory(path, mounts, metadata.dev(), 0, remaining, &mut |dir| {
-        std::fs::read_dir(dir)
-    })
-}
-
-#[cfg(all(unix, any(target_os = "linux", test)))]
-fn walk_mount_directory(
-    path: &std::path::Path,
-    mounts: &[std::path::PathBuf],
-    device: u64,
-    depth: usize,
-    remaining: &mut usize,
-    read_dir: &mut impl FnMut(&std::path::Path) -> std::io::Result<std::fs::ReadDir>,
-) -> Result<(), &'static str> {
-    walk_open_mount_directory(path, path, mounts, device, depth, remaining, read_dir)
-}
-
-#[cfg(all(unix, any(target_os = "linux", test)))]
-fn walk_open_mount_directory(
-    path: &std::path::Path,
-    access_path: &std::path::Path,
-    mounts: &[std::path::PathBuf],
-    device: u64,
-    depth: usize,
-    remaining: &mut usize,
-    read_dir: &mut impl FnMut(&std::path::Path) -> std::io::Result<std::fs::ReadDir>,
-) -> Result<(), &'static str> {
-    use std::os::{fd::AsRawFd, unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt}};
-    // Pin every directory before enumerating it. Descendants are accessed via
-    // the held parent descriptor, so rename/symlink replacement cannot redirect
-    // the walk. O_NOFOLLOW refuses a last-component symlink raced after lstat.
-    let directory = std::fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(access_path).map_err(|_| "mount_scan_incomplete")?;
-    let opened = directory.metadata().map_err(|_| "mount_scan_incomplete")?;
-    if opened.dev() != device { return Err("mount_scan_incomplete"); }
-    #[cfg(target_os = "linux")]
-    let fd_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    #[cfg(not(target_os = "linux"))]
-    let fd_path = std::path::PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()));
-    let entries = read_dir(&fd_path).map_err(|_| "mount_scan_incomplete")?;
-    for entry in entries {
-        let entry = entry.map_err(|_| "mount_scan_incomplete")?;
-        if *remaining == 0 || depth == 4 { return Err("mount_scan_incomplete"); }
-        *remaining -= 1;
-        let path = path.join(entry.file_name());
-        // lstat: never follow a symlink. Explicit mount boundaries also cover
-        // bind mounts on the same device; each is scanned separately above.
-        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| "mount_scan_incomplete")?;
-        if metadata.file_type().is_symlink() || metadata.dev() != device
-            || mounts.contains(&path) { continue; }
-        if metadata.file_type().is_socket() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let named_engine = matches!(name.as_ref(), "docker.sock" | "podman.sock"
-                | "containerd.sock" | "buildkitd.sock" | "crio.sock" | "dockershim.sock")
-                || (name.ends_with(".sock") && (name.contains("docker") || name.contains("podman")));
-            if named_engine || path.components().any(|part| {
-                matches!(part.as_os_str().to_str(), Some("docker" | "podman" | "containerd"))
-            }) { return Err("engine_socket"); }
-        }
-        if metadata.is_dir() {
-            walk_open_mount_directory(&path, &entry.path(), mounts, device, depth + 1, remaining, read_dir)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -352,11 +257,9 @@ mod linux {
             .is_some_and(|e| e.raw_os_error() == Some(libc::EACCES));
         let sockets_absent = ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]
             .iter().all(|p| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound));
-        let mut remaining = MOUNT_SCAN_ENTRIES;
         check_mountinfo(
             std::fs::read_to_string("/proc/self/mountinfo").ok().as_deref(),
             |path| std::fs::symlink_metadata(path).map(|metadata| (metadata.file_type().is_socket(), metadata.is_dir())),
-            |path, mounts| scan_mount_directory(path, mounts, &mut remaining),
         )?;
         Ok(AttestationInputs {
             pid: unsafe { libc::getpid() } as u32,
