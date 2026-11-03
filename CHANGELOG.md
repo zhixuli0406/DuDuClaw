@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.79.1] - 2026-11-03 — 非管理員不能使用主代理、任務入口改成新對話、Docker 可連個人 Google 帳號
+
 ### Added
 
 - Docker 可以開啟「我的連線」與公司授權代表了。用 `docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d` 啟動：容器先以 root 啟動（只加回 `SETUID`、`SETGID`、`SETPCAP`），啟動程式把只有 root 讀得到的磁碟區 `duduclaw-protected-key` 裡的根金鑰交給 gateway，先清掉首次設定留下的行程，再降為 `duduclaw` 使用者、清空所有權限啟動 gateway。gateway 必須是 PID 1，讀金鑰前先設成 non-dumpable，並檢查權限、PID、Docker socket 等條件，任一項不符就不收金鑰、卡片寫出原因。「安全 → 憑證保護」顯示新等級「獨立金鑰（AI 員工讀不到）」，按鈕是「開啟憑證保護」。在 Docker Desktop 實測：同容器的 uid 1000 行程（含 `unshare -Ur`）讀不到金鑰檔、`/proc/1/mem`、`environ`、`fd`，`ptrace` 也被拒。完整伺服器映像、Windows 上的 Docker Desktop、Podman、rootless Docker 尚未實測。步驟見 `docs/guides/docker.md` §7.4。
