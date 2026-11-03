@@ -419,12 +419,12 @@ AI 社員が特定の同僚として動く機能（「マイ接続」、会社�
 docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d
 ```
 
-オーバーレイで変わること：コンテナは root で起動し、`SETUID`、`SETGID`、`SETPCAP` だけを戻します。root だけが読めるボリューム `duduclaw-protected-key` を `/var/lib/duduclaw-protected` にマウントします。起動スクリプトはキーを gateway に渡して `duduclaw` ユーザーに切り替えてから、ほかのものを実行します。起動後に **セキュリティ → 認証情報の保護** で有効にします。カードには「独立した鍵（AI 社員は読み取れません）」と表示されるはずです。設計と限界は[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置くv1760)を参照してください。
+オーバーレイで変わること：コンテナは root で起動し、`SETUID`、`SETGID`、`SETPCAP` だけを戻します。root だけが読めるボリューム `duduclaw-protected-key` を `/var/lib/duduclaw-protected` にマウントします。起動スクリプトはまずキーなしで `duduclaw` として初回セットアップを実行し、残ったプロセスを終了させてから、キーを開いて `duduclaw` として gateway を起動します。起動後に **セキュリティ → 認証情報の保護** で有効にします。カードには「独立した鍵（AI 社員は読み取れません）」と表示されるはずです。設計と限界は[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置くv1760)を参照してください。
 
 使う前に確認すること：
 
 - イメージに起動スクリプトが含まれている必要があります。`docker compose run --rm --no-deps --entrypoint ls duduclaw /usr/local/lib/duduclaw/` で確認し、`protected-key-launcher.sh` が表示されることを確かめます。
-- 基本ファイルの `cap_drop: ALL` と `no-new-privileges` は残してください。`init: true`、`pid: host`、Docker ソケットのマウントを加えると、gateway はキーを拒否し、カードに理由を表示します。
+- 基本ファイルの `cap_drop: ALL` と `no-new-privileges` は残してください。`init: true` や Docker ソケットのマウントを加えると、gateway はキーを拒否し、カードに理由を表示します。**`pid: host` とは絶対に組み合わせないでください：**起動スクリプトは gateway が PID 1 か確認する前に、見えるすべての `duduclaw` ユーザーのプロセスを終了させるため、ホストのプロセス名前空間を共有するとコンテナ外の同じユーザーのプロセスまで終了させます。
 - キーを持っている間、AI プライバシー検出（NER）による匿名化、ローカルのナレッジベース埋め込み、Kokoro 音声は止まります。このとき NER の匿名化ルールは何も伏せません。匿名化が必要な環境では正規表現ルールを使ってください。
 - `docker exec` は既定で root になります。DuDuClaw のコマンドは `docker exec -u duduclaw …` で実行し、home のファイルの所有者を `duduclaw` のままにしてください。
 - `duduclaw-protected-key` は `duduclaw-data` と分けてバックアップします。これがないと保存済みの個人接続を開けず、全員が接続し直すことになります。両方のボリュームを含むバックアップには認証情報を開くのに必要なものがすべて入っているので、その前提で保管してください。

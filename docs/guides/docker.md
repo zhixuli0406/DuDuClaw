@@ -405,12 +405,12 @@ Features that let an AI employee act as one specific colleague (**My connections
 docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d
 ```
 
-What the overlay changes: the container starts as root with only `SETUID`, `SETGID` and `SETPCAP` added back, a root-only volume `duduclaw-protected-key` is mounted at `/var/lib/duduclaw-protected`, and the start-up script hands the key to the gateway and drops to the `duduclaw` user before anything else runs. Then open **Security → Credential protection** and turn it on. The card should read "Separate key (AI employees cannot read it)". The design and its limits are in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
+What the overlay changes: the container starts as root with only `SETUID`, `SETGID` and `SETPCAP` added back, a root-only volume `duduclaw-protected-key` is mounted at `/var/lib/duduclaw-protected`, and the start-up script first runs first-run setup as `duduclaw` without the key, kills whatever that left behind, and only then opens the key and starts the gateway as `duduclaw`. Then open **Security → Credential protection** and turn it on. The card should read "Separate key (AI employees cannot read it)". The design and its limits are in [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
 
 Before you use it:
 
 - The image must contain the start-up script. Check with `docker compose run --rm --no-deps --entrypoint ls duduclaw /usr/local/lib/duduclaw/`; it must list `protected-key-launcher.sh`.
-- Keep `cap_drop: ALL` and `no-new-privileges` from the base file. Do not add `init: true`, `pid: host` or a mounted Docker socket: the gateway then refuses the key, and the card names the reason.
+- Keep `cap_drop: ALL` and `no-new-privileges` from the base file. Do not add `init: true` or a mounted Docker socket: the gateway then refuses the key, and the card names the reason. **Never combine the overlay with `pid: host`:** the start-up script kills every `duduclaw`-user process it can see before the gateway checks that it is PID 1, so with the host's process namespace it would kill same-user processes outside the container.
 - While the key is held, AI privacy detection (NER) redaction, local knowledge-base embeddings and Kokoro voice are turned off. NER redaction rules then do not redact anything; use regex rules where redaction is required.
 - `docker exec` now starts as root by default. Use `docker exec -u duduclaw …` for DuDuClaw commands, so files in the home stay owned by `duduclaw`.
 - Back up `duduclaw-protected-key` separately from `duduclaw-data`. Without it, saved personal connections cannot be opened and everyone reconnects. A backup that holds both volumes holds everything needed to open them, so store it accordingly.
