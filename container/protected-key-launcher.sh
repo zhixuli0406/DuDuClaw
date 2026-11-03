@@ -14,6 +14,7 @@ exec 3<&-
 fail() { echo "Protected-key startup refused: $*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || fail "the launcher must run as root"
+[ "$$" -eq 1 ] || fail "the launcher must be the container's PID 1 (do not use init: true or pid: host)"
 [ "$#" -gt 0 ] || fail "no command was supplied"
 DROP_UID=$(id -u duduclaw) || fail "cannot resolve duduclaw uid"
 DROP_GID=$(id -g duduclaw) || fail "cannot resolve duduclaw gid"
