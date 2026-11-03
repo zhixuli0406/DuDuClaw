@@ -9541,6 +9541,7 @@
   "mfa.error.attempts": "Too many attempts. Wait before trying again; you may need to restart sign-in.",
   "mfa.login.title": "Verify your sign-in",
   "mfa.login.hint": "Enter a code from your authenticator. This sign-in request expires in 5 minutes and allows up to 5 attempts.",
+  "mfa.login.hintRecovery": "Enter an unused recovery code. This sign-in request expires in 5 minutes and allows up to 5 attempts.",
   "mfa.verify": "Verify & sign in",
   "mfa.useRecovery": "Use a recovery code",
   "mfa.useTotp": "Use an authenticator code",

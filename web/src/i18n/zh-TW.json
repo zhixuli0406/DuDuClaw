@@ -9541,6 +9541,7 @@
   "mfa.error.attempts": "嘗試次數過多，請稍後再試，必要時重新登入。",
   "mfa.login.title": "驗證登入身分",
   "mfa.login.hint": "請輸入驗證器代碼。這次登入要求 5 分鐘內有效，最多可嘗試 5 次。",
+  "mfa.login.hintRecovery": "請輸入一組未使用的復原碼。這次登入要求 5 分鐘內有效，最多可嘗試 5 次。",
   "mfa.verify": "驗證並登入",
   "mfa.useRecovery": "使用復原碼",
   "mfa.useTotp": "使用驗證器代碼",
