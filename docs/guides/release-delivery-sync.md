@@ -171,29 +171,102 @@ optional output cannot satisfy either mandatory full-manual item.
 
 `scripts/release.sh` checks the enterprise prerequisites before it changes anything: the private enterprise checkout, the Pro signing key, `minisign`, `gcloud` and `docker` on `PATH`, a running Docker daemon, an active gcloud account, the token that fetches the distributor notice (read from Secret Manager when `DUDUCLAW_CONTROL_ADMIN_TOKEN` is unset; `DUDUCLAW_DISTRIBUTOR_NOTICE=skip` builds without fetching) and the enterprise checkout on its own branch. A missing one stops the run. A deliberate CE-only release sets `DUDUCLAW_RELEASE_WITHOUT_PRO=1` and is announced as such.
 
-After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision) must all succeed. The script commits the re-resolved enterprise `Cargo.lock` and (minor/major only) the distributor brief on the enterprise checkout's branch and prints the push command; only a failed commit is a gap. The darwin binary is taken from cargo's actual target directory, so a shared `CARGO_TARGET_DIR` works. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks that the serving control-plane revision offers the version (`pro-offer`) and fails, instead of staying silent, when it runs without the enterprise checkout.
+Before preparing the public tags, the bump aligns both private workspace locks:
+`commercial/duduclaw-pro-gateway/Cargo.lock` and
+`commercial/cloud-control-plane/Cargo.lock`. The control plane resolves its own
+workspace and checks it again with `--locked`, including its path dependency
+chain to `crates/duduclaw-license`. Both locks and the distributor brief
+(minor/major only) enter one private commit. A resolution or commit failure
+stops before public tags exist.
 
-Added after v1.76.2: the distributor-notice token and enterprise-branch preflight checks, the automatic enterprise commit, and reading the darwin binary from cargo's target directory.
+After local tags exist, the bump builds the Pro image, offline tar and darwin
+and linux-x64 binaries. The darwin binary comes from cargo's actual target
+directory, so a shared `CARGO_TARGET_DIR` works. Asset failures and explicit
+`DUDUCLAW_SKIP_PRO_*` opt-outs remain failures. After image upload succeeds,
+the builder's tar SHA is atomically saved to the local private
+`commercial/artifacts/release-ship/vVERSION.tar-sha` handoff file. Keep that
+file when resuming; it is not reconstructed from a bucket sidecar. Each image
+build removes the preceding handoff before starting. Activation requires its SHA
+to match the uploaded OEM tar `.sha256` sidecar. The bump
+leaves online allowlist activation to `ship`, after the public bump has merged.
 
-## Merge, then publish
+## Merge, then publish with ship
 
-Push the release branch, open its PR and obtain the owner's merge approval.
-Minor/major waits for `Rust ubuntu-latest`, `Dashboard`, `Python` and
-`Security Audit`. For hotfix fixes and the hotfix bump PR, the owner waits only
-for `Rust ubuntu-latest`, then uses `gh pr merge --admin <n> --merge`. Local tags prepared by the script are not permission to publish.
-Only push the exact release tags after the bump commit has merged into
-`origin/main`. A tag may point to the bump commit itself, or to its normal PR
-merge commit when the merge tree exactly equals the reviewed bump tree. If main
-advanced and the merged tree contains additional changes, prepare a new review
-against that source rather than reusing the old assertion.
+Once the bump commit and both local tags exist, the owner can start:
+
+```bash
+nohup ./scripts/release.sh ship NEXT > release-ship.log 2>&1 &
+```
+
+`NEXT` is the numeric version, such as `1.79.0`. Run from the original release
+branch with both `vNEXT` and `desktop-vNEXT` pointing at HEAD. The bump must have
+exactly one parent. Main, master, detached HEAD, missing tags and tags on another
+commit are refused. Starting `ship` authorizes its merge and publication actions;
+local tags alone do not authorize publication.
+
+Each step prints a UTC timestamp. The command reads Git/GitHub state on every
+run, so rerunning the same command resumes after interruption:
+
+1. Push the nested commercial branch when necessary and open its PR if absent.
+   The private PR is left for its normal review/merge process.
+2. Push the release branch and create its main-targeting bump PR if absent.
+3. Wait with `gh pr checks --required --watch`, then merge with `--merge`, binding
+   the merge to the validated HEAD. `--no-merge` stops after checks and prints
+   the merge command. All lanes wait for required checks by default.
+   `--admin` prints a warning, uses administrator merge, and waits up to 90 minutes
+   for `Rust ubuntu-latest` to succeed; failure or cancellation stops it. Hotfix
+   bump PRs use this owner-approved admin path only after Rust succeeds.
+   Only the explicit `--no-checks` flag skips all checks and prints a loud warning.
+   The printed merge command includes `--match-head-commit "<head-sha>"`.
+   When HEAD is already on main, the merged PR is found through the commit pulls
+   API and its required checks must succeed, unless `--admin` or `--no-checks`
+   was explicitly passed.
+4. Fetch origin/main, prove `vNEXT` is its ancestor, and rerun
+   `release_delivery.py --version NEXT --release-ref vNEXT --require-main` with
+   the existing environment/repository public-key configuration. The signed
+   delivery rules are unchanged. A failed gate prevents tag publication.
+5. Push both tags, find the matching tag-push runs for Release, desktop-release,
+   Docker image and Computer-use image, and watch each with `--exit-status`.
+   Successful runs are skipped on rerun; the first failure stops with its run ID.
+   Run discovery polls for at most five minutes per workflow.
+6. Activate the merged enterprise version and delivery manifest using the local
+   builder SHA, checked against the remote OEM sidecar. Only merged version tags
+   also present on origin enter the top-three allowlist; the newest must be vNEXT.
+   Read back the serving revision; an already matching deployment is left alone.
+   After an update, created and ready revision names must agree, and the target
+   must carry the captured pre-update image and delivery before traffic switches.
+   A mismatch refuses activation as a concurrent deployment.
+7. Run `verify NEXT` and preserve any failure it reports.
+
+`ship` may run while the original bump process is still building enterprise
+assets: the four tag workflows do not depend on those assets. Final activation
+and verification need the assets to be finished. If the builder SHA is not ready
+or verification reports a missing enterprise asset, finish/fix that build and
+rerun `ship NEXT`. Use the same explicit `DUDUCLAW_RELEASE_WITHOUT_PRO=1` in both
+processes only for a deliberate CE-only release.
+
+Manual fallback: push commercial and open its PR, then push the public branch,
+open the bump PR, wait for required checks and obtain the owner-approved merge.
+Only push exact release tags after the bump has merged and the signed gate passes:
 
 ```bash
 git push origin YOUR_RELEASE_BRANCH
-# After the PR checks and owner-approved merge:
+# Create the bump PR, then bind the merge to its reviewed HEAD.
+gh pr checks <n> --required --watch
+gh pr merge <n> --merge --match-head-commit "<head-sha>"
 git fetch origin main
 git merge-base --is-ancestor vNEXT origin/main
+# Export RELEASE_DELIVERY_PUBLIC_KEY_PEM from the environment/repository variable.
+python3 scripts/release_delivery.py --version NEXT --release-ref vNEXT --require-main
 git push origin vNEXT desktop-vNEXT
+# Watch the four workflows; rerun ship for activation and final verification.
 ```
+
+A tag may point to the bump commit itself, or a normal PR merge commit whose tree
+exactly equals the reviewed bump tree (the signed validator accepts both).
+`ship` specifically requires the original single-parent bump at HEAD. If main
+advanced and the release tree needs changing, prepare a new review against that
+source rather than reusing the old assertion.
 
 Core release, desktop release, server image and computer-use image workflows all
 run the same mandatory delivery gate before build/publish. Direct tag pushes and
@@ -202,7 +275,34 @@ into `origin/main`; every build and registry package checkout uses the verified
 commit, including manual dispatch from a different workflow branch. Manual inputs
 must be exact version tags; core and desktop tag families are distinct.
 
-After publication, verify registries with `scripts/release.sh verify VERSION`.
+## Verify published delivery
+
+After publication, run `scripts/release.sh verify VERSION` (also the final step
+of `ship`). The public rows check:
+
+- **GitHub Release**: `vVERSION` exists, is published (not draft), is stable (not
+  prerelease), is the latest release, and has at least `GITHUB_RELEASE_MIN_ASSETS`
+  assets (currently 40), including `duduclaw-darwin-arm64.tar.gz`,
+  `duduclaw-darwin-x64.tar.gz`, `duduclaw-linux-arm64.tar.gz`,
+  `duduclaw-linux-x64.tar.gz` and `duduclaw-windows-x64.zip`, each with its
+  `.sha256` and `.minisig` assets.
+- **desktop latest.json**: downloaded from `desktop-vVERSION`, its version equals
+  VERSION and it contains at least `DESKTOP_MIN_PLATFORMS` platforms (currently 9),
+  including `darwin-aarch64`, `darwin-x86_64`, `linux-x86_64` and `windows-x86_64`.
+  Every platform URL must contain `desktop-vVERSION`.
+- **PyPI and npm**: their published versions equal VERSION. When that exact GitHub
+  Release exists, a mismatching row polls every 20 seconds for up to five minutes
+  per row. Set `DUDUCLAW_VERIFY_NO_WAIT` (even to an empty value) to disable waiting.
+  Without the matching release, verification fails immediately for stale registries.
+
+Private image, OEM tar, Pro binaries and the serving control-plane offer retain
+their existing checks. The `pro-manifest` row also requires the serving revision's
+`DUDUCLAW_GENERAL_DELIVERY_MANIFEST` artifact for vVERSION to match the remote
+OEM tar sidecar SHA. Every failed row keeps its own MISMATCH/MISSING detail;
+publication or a green workflow alone does not establish successful verification.
+Keep this guide, any translated copies, the script header, usage and named
+minimums consistent when changing release behavior.
+
 For minor/major, deploy reviewed website builds through each site's existing deployment procedure
 and verify live pages, headers, assets and browser behavior. Keep private manuals
 in the private delivery channel. A build passing does not prove deployment.
