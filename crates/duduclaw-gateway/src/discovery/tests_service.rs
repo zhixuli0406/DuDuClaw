@@ -896,3 +896,46 @@ async fn refused_mcp_admission_creates_no_discovery_task_or_approval() {
     assert!(broker.list_pending(None).await.unwrap().is_empty());
     assert!(store.discovery_active_tasks().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery requires Unix workspace isolation")]
+async fn dashboard_cannot_approve_legacy_main_discovery_work() {
+    for mode in ["role", "default", "unreadable", "malformed", "normal"] {
+        for admin in [false, true] {
+            let (dir, spec, _) = fixture();
+            let home = dir.path().canonicalize().unwrap();
+            let broker = ApprovalBroker::open(&home).unwrap();
+            let store = Arc::new(TaskStore::open(&home).unwrap());
+            // Create the pre-hotfix request before changing which employee is main.
+            let created = create(&home, &store, &broker, &user("employee", UserRole::Employee),
+                "worker", "Legacy discovery", "Improve fixture", spec).await.unwrap();
+            let id = created.approval_id.as_deref().unwrap();
+            let path = home.join("config.toml");
+            let config = std::fs::read_to_string(&path).unwrap();
+            if mode == "role" {
+                std::fs::write(home.join("agents/worker/agent.toml"), "[agent]\nname='worker'\nrole='main'\n").unwrap();
+            } else if mode == "default" {
+                std::fs::write(&path, format!("{config}\n[general]\ndefault_agent='worker'\n")).unwrap();
+            }
+            let handler = crate::handlers::MethodHandler::new(home.clone()).await;
+            handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+            handler.set_task_store(store.clone()).await;
+            if mode == "unreadable" {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            } else if mode == "malformed" {
+                std::fs::write(&path, "[broken").unwrap();
+            }
+            let ctx = if admin { UserContext::admin_fallback() } else { context("manager", UserRole::Manager) };
+            let frame = handler.handle("approvals.decide", json!({"id":id,"approve":true}), &ctx).await;
+            if !admin && mode != "normal" {
+                assert!(matches!(frame, crate::protocol::WsFrame::Response { ok: false, ref error, .. }
+                    if error.as_ref().and_then(Value::as_str) == Some("主代理僅管理員可以使用。")), "{mode}: {frame:?}");
+                assert_eq!(store.get_task(&created.task_id).await.unwrap().unwrap().status, "pending_approval");
+            } else if !matches!(mode, "unreadable" | "malformed") {
+                rpc_payload(frame);
+                assert_eq!(store.get_task(&created.task_id).await.unwrap().unwrap().status, "queued");
+            }
+        }
+    }
+}

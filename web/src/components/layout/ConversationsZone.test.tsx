@@ -105,3 +105,12 @@ describe('ConversationsZone (sidebar 對話紀錄)', () => {
     expect(container.querySelector('[data-slot="sidebar-group"]')).toBeNull();
   });
 });
+
+it('lists only the server-resolved agent for a non-admin even when main remains selected', async () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useChatStore.setState({ selectedAgentId: 'main', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' } });
+  const list = vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: [] });
+  renderZone();
+  await waitFor(() => expect(list).toHaveBeenCalledWith({ agent_id: 'sales', limit: 50 }));
+  expect(list).not.toHaveBeenCalledWith(expect.objectContaining({ agent_id: 'main' }));
+});

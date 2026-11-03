@@ -5,7 +5,7 @@ import { isConversationSession } from '@/lib/session-channel';
 import { hasMinRole } from '@/lib/roles';
 import { useAgentsStore } from './agents-store';
 import { useAuthStore } from './auth-store';
-import { useChatStore, historyToMessages } from './chat-store';
+import { useChatStore, historyToMessages, requiresAssignedChatAgent } from './chat-store';
 import { fetchSessionCitations } from '@/lib/knowledge-citations';
 
 const ADMIN_LIMIT = 100;
@@ -37,8 +37,12 @@ export function conversationIdentityKey(state = useAuthStore.getState()): string
   const { user, bindings } = state;
   return JSON.stringify([user?.id, user?.role, user?.status, bindings.map(b => [b.agent_name, b.access_level]).sort()]);
 }
+function historyAgentId(): string | null {
+  const chat = useChatStore.getState();
+  return requiresAssignedChatAgent() ? chat.resolvedAgent?.id ?? null : chat.selectedAgentId ?? mainAgentId();
+}
 function scopeKey(): string {
-  return JSON.stringify([conversationIdentityKey(), useChatStore.getState().selectedAgentId ?? mainAgentId()]);
+  return JSON.stringify([conversationIdentityKey(), historyAgentId()]);
 }
 function validExternal(history: ChatSessionHistory): boolean {
   if (history.privacy_mode !== 'masked' || typeof history.ner !== 'boolean' || !history.channel || history.channel==='webchat' || !isConversationSession(history.session_id,history.channel)) return false;
@@ -60,7 +64,7 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
       const ticket = ++fetchEpoch;
       const request = (async () => {
         const canListAll = hasMinRole(useAuthStore.getState().user?.role, 'admin');
-        const agentId = useChatStore.getState().selectedAgentId ?? mainAgentId();
+        const agentId = historyAgentId();
         set({ sessions: [], status: 'loading' });
         if (!canListAll && !agentId) { set({ status: 'ready' }); return; }
         try {
@@ -88,7 +92,19 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
         if (hist.session_id !== session.session_id && !ownAlias && (!hist.read_only || !opaque || session.session_id.startsWith('view:'))) throw new Error('invalid history');
         const owner = hist.agent_id;
         selectingForResume = true;
-        try { useChatStore.getState().selectAgent(owner === mainAgentId() ? null : owner); }
+        try {
+          useChatStore.getState().selectAgent(!requiresAssignedChatAgent() && owner === mainAgentId() ? null : owner);
+          if (requiresAssignedChatAgent() && !hist.read_only) {
+            const agent = useAgentsStore.getState().agents.find(a => a.name === owner);
+            useChatStore.setState({
+              resolvedAgent: { id: owner, name: agent?.display_name ?? owner, icon: agent?.icon ?? '' },
+              agentName: agent?.display_name ?? owner,
+              agentIcon: agent?.icon ?? '',
+              assignmentError: agent?.role === 'main'
+                ? { code: 'main_agent_admin_only', message: '' } : null,
+            });
+          }
+        }
         finally { selectingForResume = false; }
         if (hist.read_only === true) {
           if (!opaque || !validExternal(hist)) throw new Error('invalid masked history');
@@ -151,7 +167,15 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
       ++resumeEpoch; lastTarget = null;
       if (get().viewOnly) useChatStore.getState().discardHistory();
       set({ ...emptyView });
+      const previousChat = useChatStore.getState();
       useChatStore.getState().reset();
+      const chat = useChatStore.getState();
+      if (requiresAssignedChatAgent() && (!chat.resolvedAgent || chat.assignmentError
+        || (previousChat.resumedExplicitly && !previousChat.isStreaming))
+        && chat.connectionState !== 'disconnected') {
+        useChatStore.getState().disconnect();
+        useChatStore.getState().connect();
+      }
       void get().fetch();
     },
   };
@@ -177,5 +201,5 @@ useAuthStore.subscribe((next, previous) => {
   invalidateViews();
 });
 useChatStore.subscribe((next, previous) => {
-  if (next.selectedAgentId !== previous.selectedAgentId && !selectingForResume) invalidateViews();
+  if ((next.selectedAgentId !== previous.selectedAgentId || next.resolvedAgent?.id !== previous.resolvedAgent?.id) && !selectingForResume) invalidateViews();
 });

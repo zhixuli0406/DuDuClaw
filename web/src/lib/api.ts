@@ -702,7 +702,7 @@ export interface CredentialCleanupResult {
 // `security.credential_protection*`: where the credentials that let an AI
 // employee act as a specific person are protected. Never carries a key —
 // only a non-secret key id.
-export type CredentialProtectionLevel = 'file' | 'user_store' | 'app_bound';
+export type CredentialProtectionLevel = 'file' | 'user_store' | 'process_isolated' | 'app_bound';
 export type CredentialProtectionState =
   | 'not_enabled'
   | 'ready'
@@ -717,11 +717,13 @@ export interface CredentialProtectionStatus {
   level: CredentialProtectionLevel;
   /** What this platform's credential store gives once enabled. */
   platform_level: CredentialProtectionLevel;
-  backend: 'macos_keychain' | 'windows_credential_manager' | 'none';
+  backend: 'macos_keychain' | 'windows_credential_manager' | 'container_root_key' | 'none';
   state: CredentialProtectionState;
   key_id: string | null;
   enabled_at: string | null;
   person_identity_allowed: boolean;
+  /** Closed startup refusal code; never contains key material. */
+  refusal_reason?: string | null;
   /** zh-TW one-liner from the gateway (CLI uses the same text). */
   summary: string;
   detail: string;

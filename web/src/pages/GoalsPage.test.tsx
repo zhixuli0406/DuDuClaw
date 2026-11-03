@@ -70,13 +70,11 @@ beforeEach(() => {
 });
 
 describe('GoalsPage', () => {
-  it('renders the header and an assign action', async () => {
+  it('renders the header and a new chat action', async () => {
     renderWithProviders(<GoalsPage />);
     expect(screen.getByRole('heading', { name: 'Goals' })).toBeInTheDocument();
-    // One verb across the app (UX plan I-1a): this button used to say
-    // "Assign goal" and open a page-local seven-field dialog; it now opens the
-    // shared /assign page.
-    expect(screen.getAllByRole('button', { name: /Assign task/ }).length).toBeGreaterThan(0);
+    // Existing task pages remain readable; their primary action opens chat.
+    expect(screen.getAllByRole('button', { name: /New chat/ }).length).toBeGreaterThan(0);
   });
 
   it('lists only goal_mode tasks, grouped into the needs-you section', async () => {

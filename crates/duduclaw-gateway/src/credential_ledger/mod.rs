@@ -106,7 +106,7 @@ fn open_at(home: &Path, now: i64) -> Result<Connection, String> {
     db.busy_timeout(std::time::Duration::from_millis(100)).map_err(|_| UNAVAILABLE)?;
     db.execute_batch(include_str!("schema.sql")).map_err(|_| UNAVAILABLE)?;
     migrate(&db)?;
-    if duduclaw_security::credential_protection::platform_store().level()
+    if duduclaw_security::credential_protection::platform_store(home).level()
         != duduclaw_security::credential_protection::ProtectionLevel::AppBound
     {
         db.execute("UPDATE credentials SET fingerprint=NULL WHERE fingerprint IS NOT NULL", []).map_err(|_| UNAVAILABLE)?;

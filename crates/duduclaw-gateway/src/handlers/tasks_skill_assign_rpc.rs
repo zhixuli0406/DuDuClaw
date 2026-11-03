@@ -10,7 +10,7 @@
 //!    department and own layers, per-employee switches, usage index), over the
 //!    employees the caller may see there (Viewer or above);
 //! 2. holders that have it switched off, or whose copy failed the install
-//!    scan, are out;
+//!    scan, are out; non-Admins also exclude main/default employees;
 //! 3. the runner is the remaining holder with the latest `last_used_at`; if
 //!    none of them ever ran it, the first one by employee id (the order
 //!    `skills.list` returns).
@@ -192,6 +192,19 @@ impl MethodHandler {
                 "",
                 "skill_not_found: no AI employee you can see has this skill",
             );
+        }
+        let mut holdings = holdings;
+        if !fresh.is_admin() {
+            let mut eligible = Vec::new();
+            for holding in holdings {
+                if self.deny_main_for_non_admin(&fresh, &holding.agent_id).await.is_ok() {
+                    eligible.push(holding);
+                }
+            }
+            if eligible.is_empty() {
+                return WsFrame::error_response("", "主代理僅管理員可以使用。");
+            }
+            holdings = eligible;
         }
         let Some(runner) = pick_skill_runner(&holdings).cloned() else {
             return WsFrame::error_response(

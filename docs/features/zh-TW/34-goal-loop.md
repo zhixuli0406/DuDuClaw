@@ -81,7 +81,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 目標費用上限與重複呼叫暫停
 
-透過 `tasks_create`、`kind="goal"` 設定正整數 `cost_cap_cents`，或在儀表板「交辦任務 → 複雜任務 → 更多設定 → 費用上限（美分）」為目標填入上限。例如 `500` 代表 5 美元。既有目標不會自動寫入上限；沒有個別上限時，使用 `[goal_loop] default_cost_cap_cents`，預設 `0` 代表不限額。
+透過 `tasks_create`、`kind="goal"` 設定正整數 `cost_cap_cents`；儀表板的交辦表單目前隱藏。例如 `500` 代表 5 美元。既有目標不會自動寫入上限；沒有個別上限時，使用 `[goal_loop] default_cost_cap_cents`，預設 `0` 代表不限額。
 
 每輪開始前，驅動器會透過持續職責共用的費用來源，讀取目標與已記錄子任務的費用總額。達到或超過上限就暫停為 `needs_human`／`budget_exhausted`，原因文字會列出已用金額與上限。費用讀不到時會跳過這輪派工。任務樹有用量紀錄卻沒有 token 數時，會暫停為 `needs_human`／`blocked_needs_decision`，明確顯示 runtime 未回報用量、無法套用花費上限；只提高上限不會解決未知花費。一般目標沒有持續職責的預留額度替代計算；未知用量不會估算，也不能當作零元。這是回合之間的防護，不是帳單保證：執行中的回合與同時執行的子任務仍可能超支，沒有回報的費用也不會變成已量測費用；目標費用上限與員工預算分開設定。
 
@@ -91,7 +91,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 目標的單次執行時限
 
-每次 CLI 執行（Codex、Grok、其他 CLI）和每次 OpenAI 相容 API 請求，都受員工的「單次執行時間上限」限制（`agent.toml [runtime] timeout_secs`，預設 300 秒，範圍 30～3600 秒）。比較複雜的目標可以另外給時限，不必改員工設定：「交辦任務 → 複雜任務 → 更多設定 → 單次執行時限（分鐘）」（1～60），或在 `tasks_create`、`kind="goal"` 帶 `timeout_secs`（30～3600）。這個目標的每一輪都用它；開了任務沙箱的員工，沙箱逾時也改用它。Claude 員工維持固定的 30 分鐘上限，不套用。
+每次 CLI 執行（Codex、Grok、其他 CLI）和每次 OpenAI 相容 API 請求，都受員工的「單次執行時間上限」限制（`agent.toml [runtime] timeout_secs`，預設 300 秒，範圍 30～3600 秒）。比較複雜的目標可以另外給時限，不必改員工設定：在 `tasks_create`、`kind="goal"` 帶 `timeout_secs`（30～3600）。這個目標的每一輪都用它；開了任務沙箱的員工，沙箱逾時也改用它。Claude 員工維持固定的 30 分鐘上限，不套用。
 
 只有管理員可以設得比員工本身的上限更長，跟在員工編輯頁調高上限的規則一樣。儀表板 Operator、所有 MCP 呼叫者，以及建立者已不是管理員的排程交辦，最多只能用員工本身的上限（排程每次觸發都重新套用）。時限在目標建立時就固定，`tasks_update` 會拒絕修改。目標改派給其他員工時（任何改派方式）會清除時限，新負責人改用自己的上限。任務詳情頁會以標籤顯示。
 
@@ -105,7 +105,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 「想一想」計畫模式(I-1c)
 
-儀表板交辦任務頁「複雜任務」分頁的第三種模式,與「問一問」「交辦」並列。選它時 `tasks.goal_create` 帶 `plan_first: true`:後端不會立刻派工,而是先同步呼叫工具用 LLM,依目標描述與驗收標準產出一份簡短(3-8 條、純文字)的執行計畫,任務直接誕生在 `needs_human`(沿用既有的 `blocked_needs_decision` 分類,沒有新增分類),核准前不會進入驅動器的派工候選查詢,連一輪都不會跑。
+透過 `tasks.goal_create` 帶 `plan_first: true`，或聊天交辦指令加上 `|| 想一想` 使用；儀表板的交辦表單目前隱藏：後端不會立刻派工,而是先同步呼叫工具用 LLM,依目標描述與驗收標準產出一份簡短(3-8 條、純文字)的執行計畫,任務直接誕生在 `needs_human`(沿用既有的 `blocked_needs_decision` 分類,沒有新增分類),核准前不會進入驅動器的派工候選查詢,連一輪都不會跑。
 
 計畫存在獨立欄位 `plan_pending`,刻意與 `judge_feedback` 分開:任何 `needs_human` 任務用來恢復執行的「重試」動作會用你的核准備註覆寫 `judge_feedback`,若共用同一欄位,核准當下計畫就會被自己的核准動作洗掉、永遠傳不到第一輪派工。核准就是既有的「重試」按鈕,沒有新增按鈕種類。核准後的第一輪派工會把 `plan_pending` 的內容包成 `<execution_plan>` 區塊注入工作提示,注入後立刻清空,後續輪次不再重複貼。計畫是指引,不是免驗收憑證;執行結果仍要通過與其他目標任務相同的兩段式驗收裁決／MAV 判官團。
 

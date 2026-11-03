@@ -81,7 +81,7 @@ All under `[goal_loop]` / `[dispatch_guard]` / `[dispatch]` in `config.toml`, wi
 
 ## Goal cost cap and repeated-call pause
 
-Set `cost_cap_cents` to a positive integer in `tasks_create` with `kind="goal"`, or in the dashboard's **Assign task → Complex task → More settings → Cost cap (US cents)**. For example, `500` means US$5.00. Existing goals have no explicit cap. When no cap is stored, `[goal_loop] default_cost_cap_cents` applies (`0`, the default, means no cap).
+Set `cost_cap_cents` to a positive integer in `tasks_create` with `kind="goal"`. The dashboard assignment form is currently hidden. For example, `500` means US$5.00. Existing goals have no explicit cap. When no cap is stored, `[goal_loop] default_cost_cap_cents` applies (`0`, the default, means no cap).
 
 Before every round, the driver reads measured spend across the goal's recorded task tree through the shared responsibility cost source. At or above the ceiling it pauses as `needs_human` / `budget_exhausted`; the detail includes the cap and spend. An unreadable cost source skips dispatch for that round. A recorded usage row with zero token counts anywhere in the tree pauses the goal as `needs_human` / `blocked_needs_decision`, with a visible explanation that the runtime did not report usage; raising the ceiling alone does not resolve unknown spend. An ordinary capped goal has no reservation fallback: unknown usage is neither estimated nor counted as zero. This is a between-round guard, not a billing guarantee: a running round and concurrent child tasks may exceed the ceiling, and unreported costs are not measured spend. The goal ceiling and employee budget are configured separately.
 
@@ -91,7 +91,7 @@ Before every round, the driver reads measured spend across the goal's recorded t
 
 ## Per-goal run limit
 
-Each CLI run (Codex, Grok and other CLIs) and each OpenAI-compatible request is bounded by the employee's **Run limit** (`agent.toml [runtime] timeout_secs`, default 300 s, 30–3600 s). A complex goal can be given its own limit without changing the employee: **Assign task → Complex task → More settings → Run limit (minutes)** (1–60), or `timeout_secs` (30–3600) in `tasks_create` with `kind="goal"`. Every round of that goal uses it; an employee with the task sandbox on uses it as the sandbox timeout too. Claude employees keep their fixed 30-minute limit and ignore it.
+Each CLI run (Codex, Grok and other CLIs) and each OpenAI-compatible request is bounded by the employee's **Run limit** (`agent.toml [runtime] timeout_secs`, default 300 s, 30–3600 s). A complex goal can be given its own limit without changing the employee: `timeout_secs` (30–3600) in `tasks_create` with `kind="goal"`. Every round of that goal uses it; an employee with the task sandbox on uses it as the sandbox timeout too. Claude employees keep their fixed 30-minute limit and ignore it.
 
 Only an Admin may set more than the employee's own limit, the same rule as raising that limit on the employee's edit page. A dashboard Operator, any MCP caller and a scheduled assignment whose creator is no longer an Admin get at most the employee's own limit (a scheduled run is capped at each fire). The value is fixed when the goal is created; `tasks_update` refuses it. Handing the goal to another employee (any reassignment) clears it, so the new assignee runs under its own limit. The task detail page shows it as a badge.
 
@@ -105,7 +105,7 @@ Decisions are idempotent and fail-closed: retry/mark-done/abort only transition 
 
 ## Plan-First Mode ("想一想", I-1c)
 
-The third mode of the dashboard 交辦任務 page (**Complex task** tab), alongside 問一問 (ask) and 交辦 (assign). Selecting it sends `tasks.goal_create` with `plan_first: true`: instead of dispatching, the gateway synchronously calls the utility LLM to draft a short (3–8 bullet, plain-text) execution plan from the goal + acceptance criteria, and the task is born directly in `needs_human` — under the existing `blocked_needs_decision` pause reason, no new class added — so it never reaches the driver's dispatch-candidate query until a human approves.
+Use `tasks.goal_create` with `plan_first: true` (or the chat assignment command with `|| plan`); the dashboard assignment form is hidden: instead of dispatching, the gateway synchronously calls the utility LLM to draft a short (3–8 bullet, plain-text) execution plan from the goal + acceptance criteria, and the task is born directly in `needs_human` — under the existing `blocked_needs_decision` pause reason, no new class added — so it never reaches the driver's dispatch-candidate query until a human approves.
 
 The plan lives in a dedicated `plan_pending` column, kept separate from `judge_feedback` on purpose: the "重試" (retry) action any `needs_human` task uses to resume overwrites `judge_feedback` with the human's own approval note, which would otherwise erase the plan before it was ever read. Approving is that same existing retry action — no new button kind was added. Once approved, the very first dispatch round injects the plan as an `<execution_plan>` block into the work prompt, then clears `plan_pending` so later rounds don't repeat it. The plan is guidance, not an exemption — the executed work still goes through the same two-stage/MAV acceptance judging as any other goal task.
 

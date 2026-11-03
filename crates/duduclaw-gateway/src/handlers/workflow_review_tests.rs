@@ -46,6 +46,7 @@ async fn fx() -> Fx {
     db.bind_agent(&viewer.id, "sales", AccessLevel::Viewer)
         .unwrap();
     let handler = MethodHandler::new(home.clone()).await;
+    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     let tasks = Arc::new(TaskStore::open(&home).unwrap());
     handler.set_task_store(tasks.clone()).await;
     handler
@@ -182,4 +183,106 @@ async fn capture_and_accept_need_an_operator_binding() {
         .await;
     assert!(matches!(read, WsFrame::Response { ok: true, .. }));
     let _ = &f.home;
+}
+
+// These admission tests deliberately stop at the fixed-hash check. The SQL
+// fixture is readable draft material, not evidence of a runnable workflow.
+async fn workflow_admission_fx(role: &str, configured_default: bool) -> (Fx, UserContext) {
+    let f = fx().await;
+    let system = UserContext::admin_fallback();
+    let created = f.handler.handle_agents_create_as(
+        json!({"name": "runner", "role": role}), Some(&system),
+    ).await;
+    assert!(matches!(created, WsFrame::Response { ok: true, .. }), "{created:?}");
+    std::fs::write(f.home.join("config.toml"), if configured_default {
+        "[general]\ndefault_agent = \"runner\"\n"
+    } else { "" }).unwrap();
+    let db = UserDb::new(&f.home.join("users.db")).unwrap();
+    db.bind_agent(&f.operator.user_id, "runner", AccessLevel::Operator).unwrap();
+    let admin = db.create_user(
+        "workflow-admin@test.invalid", "Admin", "isolated-test-password", UserRole::Admin,
+    ).unwrap();
+    let admin = db.live_user_context(&admin.id).unwrap().unwrap();
+    let raw = json!({
+        "schema_version": 1, "draft_id": "admission", "revision": 1,
+        "owner": "runner", "source_task": "task", "skill_id": "skill",
+        "source_snapshot_id": "snapshot", "source_evidence_hash": "source",
+        "revision_hash": "revision",
+        "definition": {
+            "schema_version": 1, "workflow_id": "admission", "revision": 1,
+            "skill_revision_hash": "skillhash", "input_schema": {"type":"null"},
+            "output_schema": {"type":"null"}, "required_capabilities": [], "steps": []
+        },
+        "source_data": [], "fixtures": [],
+        "creator_grant": {"actor":"runner", "allowed_tools":[], "policy_revision":"policy"},
+        "effect_templates": {}, "audience": [],
+        "budget": {"per_run_micros":1, "monthly_micros":1, "max_consecutive_failures":1},
+        "input_max_age_seconds": 1, "timezone": "Asia/Taipei", "routine": null,
+        "created_at": "2026-11-03T00:00:00Z", "disabled": true,
+        "review_status": "draft", "draft_hash": "fixed-hash"
+    });
+    f.handler.workflow_store().await.unwrap().with_transaction(|tx| {
+        tx.execute(
+            "INSERT INTO workflow_drafts VALUES('admission',1,'runner','fixed-hash',1,?1)",
+            [raw.to_string()],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }).await.unwrap();
+    (f, admin)
+}
+
+async fn workflow_admission_errors(f: &Fx, ctx: &UserContext) -> Vec<String> {
+    let mut errors = Vec::new();
+    let params = json!({"draft_id":"admission", "revision":1, "draft_hash":"wrong-hash"});
+    for frame in [
+        f.handler.handle_workflow_drafts_run_fixture(params.clone(), ctx).await,
+        f.handler.handle_workflow_drafts_request_activation(params.clone(), ctx).await,
+        f.handler.handle_workflow_drafts_commit_activation(params, ctx).await,
+    ] {
+        errors.push(error_text(&frame));
+    }
+    errors
+}
+
+#[tokio::test]
+async fn workflow_work_admission_refuses_operator_on_main_role_and_configured_default() {
+    for (role, default) in [("main", false), ("specialist", true)] {
+        let (f, _) = workflow_admission_fx(role, default).await;
+        assert_eq!(workflow_admission_errors(&f, &f.operator).await,
+            vec!["主代理僅管理員可以使用。"; 3]);
+    }
+}
+
+#[tokio::test]
+async fn workflow_work_admission_refuses_unreadable_or_malformed_configuration() {
+    for unreadable in [true, false] {
+        let (f, _) = workflow_admission_fx("specialist", false).await;
+        if unreadable {
+            std::fs::remove_file(f.home.join("config.toml")).unwrap();
+            std::fs::create_dir(f.home.join("config.toml")).unwrap();
+        } else {
+            std::fs::write(f.home.join("config.toml"), "[general\ndefault_agent = ").unwrap();
+        }
+        assert_eq!(workflow_admission_errors(&f, &f.operator).await,
+            vec!["主代理僅管理員可以使用。"; 3]);
+    }
+}
+
+#[tokio::test]
+async fn workflow_work_admission_keeps_normal_employee_and_admin_routes() {
+    let (f, _) = workflow_admission_fx("specialist", false).await;
+    assert_eq!(workflow_admission_errors(&f, &f.operator).await,
+        vec!["fixed draft hash mismatch"; 3]);
+    for (role, default) in [("main", false), ("specialist", true)] {
+        let (f, admin) = workflow_admission_fx(role, default).await;
+        assert_eq!(workflow_admission_errors(&f, &admin).await,
+            vec!["fixed draft hash mismatch"; 3]);
+        // The legacy internal Admin context also bypasses config lookup.
+        std::fs::remove_file(f.home.join("config.toml")).unwrap();
+        std::fs::create_dir(f.home.join("config.toml")).unwrap();
+        assert_eq!(workflow_admission_errors(&f, &admin).await,
+            vec!["fixed draft hash mismatch"; 3]);
+        assert_eq!(workflow_admission_errors(&f, &UserContext::admin_fallback()).await,
+            vec!["fixed draft hash mismatch"; 3]);
+    }
 }

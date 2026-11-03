@@ -1,3 +1,4 @@
+import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
@@ -336,11 +337,7 @@ export function GoalsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const errorText = useErrorMessage();
-  // UX plan I-1a: 交辦 opens the one shared surface, the `/assign` page. The
-  // seven-field `CreateGoalDialog` that used to live here was the only form
-  // that actually drove `tasks.goal_create` and nothing in the app linked to
-  // it; the page's 複雜任務 tab carries every one of its fields (the advanced
-  // four behind 更多設定) and is reachable from every entry point.
+  // Entry policy keeps the legacy assignment surface available for restoration.
   const openAssign = useOpenAssign();
   const connState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents, loaded: agentsLoaded } = useAgentsStore();
@@ -628,7 +625,7 @@ export function GoalsPage() {
           </Select>
           <Button variant="brand" size="sm" onClick={() => openAssign()}>
             <Plus />
-            <span className="hidden sm:inline">{intl.formatMessage({ id: 'goals.assign' })}</span>
+            <span className="hidden sm:inline">{intl.formatMessage({ id: chatEntryLabel('goals.assign') })}</span>
           </Button>
         </div>
       </div>

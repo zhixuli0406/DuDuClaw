@@ -1,3 +1,4 @@
+import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useVisibleAgents, type VisibleAgent } from '@/lib/data-scope';
 import { useAuthStore } from '@/stores/auth-store';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -106,11 +107,6 @@ export function AgentsPage() {
   const { tasks, fetchTasks, error: tasksError, tasksPartialError, loading: tasksLoading } = useTasksStore();
 
   const [scope, setScope] = useState<Scope>('active');
-  // UX plan I-1a: "交辦任務" on an employee card opens the one shared panel with
-  // that employee preselected. It used to open a local free-text dialog posting
-  // to `agents.delegate` — a fourth create surface behind the same verb, whose
-  // fire-and-forget bus message left no task to follow and never met the
-  // acceptance judge.
   const openAssign = useOpenAssign();
   const [offboardTarget, setOffboardTarget] = useState<AgentDetail | null>(null);
 
@@ -398,7 +394,7 @@ function AgentRow({
             {!archived && (
               <DropdownMenuItem onClick={onDelegate}>
                 <Send />
-                {intl.formatMessage({ id: 'agents.delegate' })}
+                {intl.formatMessage({ id: chatEntryLabel('agents.delegate') })}
               </DropdownMenuItem>
             )}
             {archived ? (

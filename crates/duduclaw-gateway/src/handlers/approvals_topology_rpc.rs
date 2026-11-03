@@ -371,13 +371,13 @@ mod live_event_tests {
         ).await;
         assert!(matches!(expired_admin, WsFrame::Response { error: Some(error), .. }
             if error == json!("approval expired")));
-        // Fresh-context failure also refuses without comparing a candidate.
+        // Reject a revoked identity before expiry or digest checks.
         f.db.set_user_status(&root.user_id, duduclaw_auth::UserStatus::Suspended).unwrap();
         let result = f.handler.handle_approvals_decide(
             json!({"id": id.as_str(), "approve": true, "expected_digest": "0".repeat(64)}), &root,
         ).await;
         assert!(matches!(result, WsFrame::Response { error: Some(error), .. }
-            if error == json!("expected_digest is not accepted for this approval")));
+            if error == json!(PERMISSION_DENIED)));
     }
 
     #[tokio::test]

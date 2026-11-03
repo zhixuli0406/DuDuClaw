@@ -143,7 +143,7 @@ afterEach(() => {
 });
 
 describe('entry points', () => {
-  it('the sidebar and the mobile ＋ both open the /assign page (Personal included)', async () => {
+  it('the sidebar and the mobile ＋ both start a chat (Personal included)', async () => {
     const user = userEvent.setup();
     renderWithProviders(
       <SidebarProvider>
@@ -151,12 +151,12 @@ describe('entry points', () => {
         <MobileBottomNav />
       </SidebarProvider>,
     );
-    const triggers = await screen.findAllByRole('button', { name: 'New task' });
+    const triggers = await screen.findAllByRole('button', { name: 'New chat' });
     expect(triggers.length).toBeGreaterThanOrEqual(2);
     await user.click(triggers[0]);
     await user.click(triggers[1]);
-    expect(mockNavigate).toHaveBeenNthCalledWith(1, '/assign', undefined);
-    expect(mockNavigate).toHaveBeenNthCalledWith(2, '/assign', undefined);
+    expect(mockNavigate).toHaveBeenNthCalledWith(1, '/chat', undefined);
+    expect(mockNavigate).toHaveBeenNthCalledWith(2, '/chat', undefined);
   });
 });
 

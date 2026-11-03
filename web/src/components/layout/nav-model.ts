@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import {
   Home,
   Inbox,
@@ -287,7 +288,8 @@ export const navGroups: NavGroup[] = [
       // → 記憶 → AI 員工 → 世界, and 任務看板 is explicitly demoted (folded into
       // 進階 on Personal; last row of this group on Enterprise, where no 進階
       // group exists). Nothing was removed — the board keeps its route, the Home
-      // task-summary cards, the mobile ＋交辦 action, and ⌘K.
+      // task-summary cards, the mobile action, and ⌘K. The shared visibility
+      // policy now hides task destinations while preserving their definitions.
       // cron.* is admin-only, including listing and templates.
       { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'admin' },
       // U4 co-edited plans — shared step lists between the user and an AI employee.
@@ -803,9 +805,8 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
 }
 
 /**
- * Zone A quick-access routes for the mobile bottom nav (§4.3). The `+ 交辦任務`
- * center action is injected by MobileBottomNav itself (and links to the task
- * board's create intent). Side slots: 儀表板 / 對話 | ＋ | 對話紀錄 / 任務.
+ * Mobile quick-access routes. MobileBottomNav injects the new-chat action;
+ * task entry hiding replaces the board slot with the skills library.
  *
  * 2026-08-04 (D17): 收件匣 gave up its slot to 對話紀錄. Its count now shows as a
  * bell in the mobile top bar (`MainLayout`), which only appears when something
@@ -818,9 +819,10 @@ export const mobileNavItems: NavItem[] = [
   // slot so the full conversation list is one tap away on a phone too. The
   // inbox is still reachable from the drawer's notification bell.
   { to: '/conversations', icon: MessagesSquare, label: 'nav.conversations', desc: 'nav.conversations.desc' },
-  // Task board restored as a primary nav item (R2); keeps the two side groups
-  // balanced 2/2 around the centre ＋交辦 action.
-  { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc' },
+  // Keep four side slots while task entry points are hidden.
+  ...(TASK_ENTRY_POINTS_HIDDEN
+    ? [{ to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' }]
+    : [{ to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc' }]),
 ];
 
 /** Mobile retains the previous four slots outside the employee enterprise shell. */

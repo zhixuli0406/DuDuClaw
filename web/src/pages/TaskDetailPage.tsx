@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import { PlanReview } from '@/components/task/PlanReview';
 import { TaskWorkflowReview } from '@/components/workflow/TaskWorkflowReview';
 import { TaskAudienceNotice } from '@/components/task/TaskAudienceNotice';
@@ -240,7 +241,7 @@ export function TaskDetailPage() {
       return;
     }
     setConfirmRemove(false);
-    navigate('/tasks');
+    navigate(TASK_ENTRY_POINTS_HIDDEN ? '/chat' : '/tasks');
   }, [task, removeTask, navigate, clearError, intl]);
 
   // I-3b: pin/archive from the detail page too — the same actions the
@@ -277,7 +278,7 @@ export function TaskDetailPage() {
       <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
         <BreadcrumbHeader
           hideTrigger
-          segments={[{ label: intl.formatMessage({ id: 'nav.tasks' }), onClick: () => navigate('/tasks') }]}
+          segments={[{ label: intl.formatMessage({ id: TASK_ENTRY_POINTS_HIDDEN ? 'nav.chat' : 'nav.tasks' }), onClick: () => navigate(TASK_ENTRY_POINTS_HIDDEN ? '/chat' : '/tasks') }]}
         />
         {error != null && !loading ? (
           // "Couldn't load" and "this task doesn't exist" are different answers
@@ -290,9 +291,9 @@ export function TaskDetailPage() {
               void fetchTasks();
             }}
             action={
-              <Button variant="outline" size="sm" onClick={() => navigate('/tasks')}>
+              <Button variant="outline" size="sm" onClick={() => navigate(TASK_ENTRY_POINTS_HIDDEN ? '/chat' : '/tasks')}>
                 <ArrowLeft />
-                {intl.formatMessage({ id: 'tasks.detail.backToBoard' })}
+                {intl.formatMessage({ id: TASK_ENTRY_POINTS_HIDDEN ? 'nav.chat' : 'tasks.detail.backToBoard' })}
               </Button>
             }
           />
@@ -301,9 +302,9 @@ export function TaskDetailPage() {
             icon={ClipboardList}
             title={intl.formatMessage({ id: loading ? 'common.loading' : 'tasks.detail.notFound' })}
             action={
-              <Button variant="outline" size="sm" onClick={() => navigate('/tasks')}>
+              <Button variant="outline" size="sm" onClick={() => navigate(TASK_ENTRY_POINTS_HIDDEN ? '/chat' : '/tasks')}>
                 <ArrowLeft />
-                {intl.formatMessage({ id: 'tasks.detail.backToBoard' })}
+                {intl.formatMessage({ id: TASK_ENTRY_POINTS_HIDDEN ? 'nav.chat' : 'tasks.detail.backToBoard' })}
               </Button>
             }
           />
@@ -320,7 +321,7 @@ export function TaskDetailPage() {
   const showLive = assigneeAgent?.status === 'active' && !isDone;
 
   const segments: BreadcrumbSegment[] = [
-    { label: intl.formatMessage({ id: 'nav.tasks' }), onClick: () => navigate('/tasks') },
+    { label: intl.formatMessage({ id: TASK_ENTRY_POINTS_HIDDEN ? 'nav.chat' : 'nav.tasks' }), onClick: () => navigate(TASK_ENTRY_POINTS_HIDDEN ? '/chat' : '/tasks') },
     { label: `${task.id.slice(0, 8)} · ${task.title}` },
   ];
 
@@ -432,9 +433,9 @@ export function TaskDetailPage() {
           {lifecycleLocked && (
             <p role="note" className="flex flex-wrap items-center gap-x-2 px-1.5 text-xs text-muted-foreground">
               <span>{intl.formatMessage({ id: 'tasks.discovery.locked' })}</span>
-              <Link to="/goals" className="font-medium text-brand underline-offset-2 hover:underline">
+              {!TASK_ENTRY_POINTS_HIDDEN && <Link to="/goals" className="font-medium text-brand underline-offset-2 hover:underline">
                 {intl.formatMessage({ id: 'tasks.discovery.locked.action' })}
-              </Link>
+              </Link>}
             </p>
           )}
           {/* Meta row: status glyph + source + live */}

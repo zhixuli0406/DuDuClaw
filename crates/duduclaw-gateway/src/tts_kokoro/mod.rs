@@ -20,6 +20,7 @@ impl KokoroTtsProvider {
 impl TtsProvider for KokoroTtsProvider {
     fn name(&self) -> &str { "kokoro" }
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
+        duduclaw_onnx::refuse_in_process_models()?;
         let text = duduclaw_core::truncate_chars(text, 2000).to_string();
         let selected_voice = select_voice(&text, voice);
         if !voice.is_empty() && selected_voice != voice {
@@ -56,10 +57,15 @@ fn pad_short_tokens(mut tokens: Vec<i64>, pause_id: i64) -> Vec<i64> {
     tokens
 }
 fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<Vec<u8>, String> {
+    duduclaw_onnx::refuse_in_process_models()?;
     let chunks = g2p::chunks(text, dir)?;
     if chunks.is_empty() { return Err("沒有可合成的文字".into()); }
+    #[cfg(test)]
+    tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     duduclaw_onnx::runtime::init_ort(lib)?;
     let style = parse_voice(&std::fs::read(dir.join(format!("voices/{voice}.bin"))).map_err(|e| e.to_string())?)?;
+    #[cfg(test)]
+    tests::ORT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut session = Session::builder().map_err(|e| e.to_string())?
         .with_intra_threads(4).map_err(|e| e.to_string())?
         .commit_from_file(dir.join("onnx/model_uint8.onnx")).map_err(|e| format!("Kokoro session：{e}"))?;
@@ -93,6 +99,36 @@ fn synthesize_local(dir: &Path, lib: &Path, text: &str, voice: &str) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) static ORT_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn root_key_refuses_models_before_ort() {
+        // OnceLock cannot be reset: run only this test in a fresh process.
+        const CHILD: &str = "DUDUCLAW_ONNX_REFUSAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tts_kokoro::tests::root_key_refuses_models_before_ort", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "child must run exactly this test");
+            return;
+        }
+        duduclaw_core::root_key::test_hold_root_key();
+        assert!(duduclaw_core::root_key::is_held());
+        let expected = "獨立金鑰模式下不在主程式內載入 ONNX 模型（隱私偵測、本機知識庫向量、Kokoro 語音暫停使用）";
+        let home = tempfile::tempdir().unwrap();
+        let err = synthesize_local(home.path(), &home.path().join("missing-runtime"), "你好", "zf_001").unwrap_err();
+        assert_eq!(err, expected);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let err = runtime.block_on(KokoroTtsProvider::new(home.path().to_path_buf()).synthesize("Hello", "af_maple")).unwrap_err();
+        assert_eq!(err, expected);
+        assert_eq!(ORT_ENTRIES.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "neither ORT initialization nor its session builder may be reached");
+    }
+
     #[test]
     fn voice_selection_defaults_by_language_and_preserves_valid_voices() {
         for voice in ["", "zh-TW-HsiaoChenNeural", "unknown"] {

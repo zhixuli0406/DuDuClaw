@@ -1,21 +1,6 @@
-//! `@` routing for one WebChat message (owner decision D6).
-//!
-//! WebChat decides the route itself, before the reply pipeline, because it
-//! knows the dashboard account and must tell the browser who answers:
-//! - a message that calls an employee the account may call goes to that
-//!   employee for this message only, even when another employee is selected;
-//! - calling an employee the account may not call is refused (error frame,
-//!   no model call, audited);
-//! - a message that calls nobody goes to the selected employee, else the
-//!   default one (reachable by every signed-in account, as before);
-//! - a lone `@` or a partial name answers with the callable list.
-//!
-//! A public web-widget visitor is treated like an unmapped messaging-app
-//! sender: the default employee plus `[channels] public_trigger` employees.
-//!
-//! "May call" for an account is its live effective access (direct bindings
-//! and, for a Manager, team grants through `users.manager_user_id`), the
-//! same set the `agents.callable` RPC lists for the `@` popup.
+//! WebChat routing: dashboard accounts may call their authorized non-main
+//! employees; admins keep the default path. Anonymous widgets keep their
+//! server-selected conversation partner and cannot choose an employee.
 
 use crate::trigger_route::{self, SenderAccess, TriggerRoute};
 
@@ -87,14 +72,15 @@ impl WebChatState {
 
     /// Who may this connection call?
     pub(super) async fn sender_access(&self, auth_user: &str) -> SenderAccess {
-        if auth_user.starts_with("widget-visitor:") {
+        if super::is_widget_visitor(auth_user) {
             return SenderAccess::unmapped();
         }
         match self.acl_snapshot(auth_user).await {
-            Ok(s) => SenderAccess::from_effective(s.access),
+            Ok(s) => SenderAccess::from_effective(s.access)
+                .for_webchat(super::access::gateway_default_id(&self.ctx.home_dir).await),
             Err(e) => {
-                tracing::warn!(user = %auth_user, "WebChat ACL lookup failed — only the default employee is callable: {e}");
-                SenderAccess::no_bindings(auth_user)
+                tracing::warn!(user = %auth_user, "WebChat ACL lookup failed — denying calls: {e}");
+                SenderAccess::no_bindings(auth_user).for_webchat(Err(e))
             }
         }
     }
@@ -105,8 +91,8 @@ impl WebChatState {
     /// `stored_agent`? The same `SenderAccess::may_call` the `@` route and
     /// `agents.callable` use, with the session's own default employee, so a
     /// conversation started by `@` with a public or default employee resumes
-    /// like one with a bound or team employee. Fails closed to "only what
-    /// everyone may call" when the account cannot be read.
+    /// like one with a bound or team employee. An unreadable account or a
+    /// non-admin main-agent target is refused before considering public grants.
     pub(super) async fn may_resume_into(
         &self,
         auth_user: &str,
@@ -114,6 +100,9 @@ impl WebChatState {
         sid: &str,
         user_id: &str,
     ) -> bool {
+        if self.authorize_target(auth_user, stored_agent, true).await.is_err() {
+            return false;
+        }
         let access = self.sender_access(auth_user).await;
         let reg = self.ctx.registry.read().await;
         let default_id = crate::channel_reply::resolve_fallback_agent(&self.ctx, &reg, sid, user_id)
@@ -143,9 +132,8 @@ pub(super) struct WebRoute {
 /// conversation's real default employee, which may be a channel-bound or
 /// `allowed_channels` employee rather than the main one).
 ///
-/// The default employee stays reachable by every signed-in account, exactly
-/// as before `@` routing (the C-ACL decision on `resume_needs_acl_check`);
-/// only calling *another* employee by `@` needs a binding.
+/// Non-admin default selection on every edition is resolved from the account, never main.
+/// The same WebChat-scoped grants filter mentions and assignment commands.
 /// `agent: None` = the default path (the main employee, nothing selected);
 /// `agent: Some(id)` = answer as `id`; `Err(frame)` = send that frame and
 /// stop (no model call).
@@ -164,12 +152,18 @@ pub(super) async fn decide_webchat_route(
         .await
         .map(|a| a.config.agent.name.clone())
         .unwrap_or_else(|| main_id.to_string());
+    if super::is_widget_visitor(auth_user) {
+        return Ok(WebRoute {
+            agent: (default_id != main_id).then_some(default_id),
+            switched: false,
+            called: false,
+        });
+    }
     let current: String = selected
         .map(str::to_string)
         .unwrap_or_else(|| default_id.clone());
     let route = trigger_route::decide(&reg, text, &access, Some(&default_id));
-    Ok(
-        match route_outcome(state, &reg, &access, auth_user, &default_id, route)? {
+    let outcome = match route_outcome(state, &reg, &access, auth_user, &default_id, route)? {
             None => WebRoute {
                 agent: selected
                     .map(str::to_string)
@@ -182,8 +176,19 @@ pub(super) async fn decide_webchat_route(
                 called: true,
                 agent: (selected.is_some() || id != main_id).then_some(id),
             },
-        },
-    )
+        };
+    drop(reg);
+    let mut outcome = outcome;
+    if outcome.agent.is_none() && !outcome.called {
+        match state.resolve_new_agent(auth_user).await {
+            Ok(Some(id)) => outcome.agent = Some(id),
+            Ok(None) => {},
+            Err(reason) => return Err(Box::new(super::access::assignment_error(reason))),
+        }
+    }
+    state.authorize_target(auth_user, outcome.agent.as_deref().unwrap_or(main_id), true)
+        .await.map_err(Box::new)?;
+    Ok(outcome)
 }
 
 /// `Ok(None)` = calls nobody; `Ok(Some(id))` = calls `id` (allowed);

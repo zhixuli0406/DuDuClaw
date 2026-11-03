@@ -68,7 +68,7 @@ describe('CommandPalette — ID direct-jump (W3-3)', () => {
     expect(screen.getByPlaceholderText(/Paste an ID/i)).toBeInTheDocument();
   });
 
-  it('jumps straight to a task detail when the pasted id matches a task (RPC fan-out, not the local store)', async () => {
+  it('does not offer or jump to a task when task entry points are hidden', async () => {
     mockIdLookupCalls({
       'tasks.list': {
         tasks: [
@@ -92,11 +92,12 @@ describe('CommandPalette — ID direct-jump (W3-3)', () => {
     fireEvent.change(input, { target: { value: 'qzx_7231_vwnp' } });
 
     await waitFor(
-      () => expect(screen.getByTestId('location-probe')).toHaveTextContent('/tasks/qzx_7231_vwnp'),
+      () => expect(screen.getByText('No match for "qzx_7231_vwnp"')).toBeInTheDocument(),
       { timeout: 3000 },
     );
-    // The palette closes itself on a hit.
-    expect(useCommandPaletteStore.getState().open).toBe(false);
+    expect(screen.getByTestId('location-probe')).toHaveTextContent('/');
+    expect(useCommandPaletteStore.getState().open).toBe(true);
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.list')).toBe(false);
   });
 
   it('jumps to /inbox?item=<id> when the pasted id matches an approval', async () => {
@@ -306,4 +307,24 @@ describe('CommandPalette restricted conversation results',()=>{
     await waitFor(()=>expect(screen.getByTestId('location-probe')).toHaveTextContent('/chat'));
   });
 
+});
+
+
+it('does not expose task board, goal navigation, or local task results', () => {
+  useTasksStore.setState({ tasks: [{ id: 'local-task', title: 'Hidden assignment' }] as never });
+  renderPalette();
+  const input = screen.getByPlaceholderText(/Paste an ID/i);
+  for (const query of ['Task Board', 'Goals', 'Hidden assignment']) {
+    fireEvent.change(input, { target: { value: query } });
+    expect(screen.queryByRole('option', { name: new RegExp(query) })).not.toBeInTheDocument();
+  }
+});
+
+
+it('does not use the hidden task board as the Personal advanced-group shortcut', () => {
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  renderPalette();
+  fireEvent.change(screen.getByPlaceholderText(/Paste an ID/i), { target: { value: 'Files' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Advanced' }));
+  expect(screen.getByTestId('location-probe')).toHaveTextContent('/plans');
 });

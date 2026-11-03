@@ -218,6 +218,18 @@ impl UserDb {
             .map_err(|e| format!("read primary agent: {e}"))
     }
 
+    /// The explicitly selected primary employee, only while still bound.
+    /// WebChat must not guess another owner when that preference becomes stale.
+    pub fn bound_primary_agent(&self, user_id: &str) -> Result<Option<String>, String> {
+        self.conn().query_row(
+            "SELECT primary_agent_id FROM users WHERE id = ?1 AND status = 'active'
+             AND EXISTS(SELECT 1 FROM user_agent_bindings b
+                 WHERE b.user_id = users.id AND b.agent_name = primary_agent_id)",
+            [user_id], |row| row.get(0),
+        ).optional().map(|value| value.flatten())
+            .map_err(|e| format!("read bound primary agent: {e}"))
+    }
+
     /// Set (or clear with `None`) a user's department. Empty string clears.
     pub fn set_department(&self, user_id: &str, department: Option<&str>) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
@@ -936,8 +948,10 @@ mod tests {
         db.bind_agent(&user.id, "chosen", AccessLevel::Viewer).unwrap();
         db.set_primary_agent(&user.id, Some("chosen")).unwrap();
         assert_eq!(db.primary_agent(&user.id).unwrap().as_deref(), Some("chosen"));
+        assert_eq!(db.bound_primary_agent(&user.id).unwrap().as_deref(), Some("chosen"));
         db.unbind_agent(&user.id, "chosen").unwrap();
         assert_eq!(db.primary_agent(&user.id).unwrap().as_deref(), Some("owner"));
+        assert_eq!(db.bound_primary_agent(&user.id).unwrap(), None);
         db.set_primary_agent(&user.id, None).unwrap();
         assert_eq!(db.primary_agent(&user.id).unwrap(), None);
         db.set_primary_agent(&user.id, Some("owner")).unwrap();

@@ -24,8 +24,9 @@
 //!   callers must surface (design §6).
 //! - **Windows** (`UserStore`): Credential Manager is per user; any same-user
 //!   program can read it. Stops file reads and backups only.
-//! - **Everything else** (Linux, Docker): no supported store; `File` level,
-//!   person identities are refused.
+//! - **Opt-in Docker**: an attested root launcher key wraps the protected key
+//!   on disk; only the non-dumpable, unprivileged PID 1 holds the root key.
+//! - **Other Linux installs**: no supported store; person identities refused.
 //!
 //! Only the process holding `<home>/locks/gateway.lock` may unseal
 //! ([`CredentialProtection::load_key_for_gateway`]); the MCP server and CLI
@@ -33,6 +34,7 @@
 
 pub mod marker;
 mod messages;
+pub mod container_root;
 mod store;
 
 #[cfg(target_os = "macos")]
@@ -42,6 +44,8 @@ mod windows;
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, unix))]
+mod container_root_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests;
 
@@ -76,6 +80,8 @@ pub enum ProtectionLevel {
     File,
     /// OS per-user store without per-program access control (Windows).
     UserStore,
+    /// Root launcher key held only by the non-dumpable container PID 1.
+    ProcessIsolated,
     /// OS store whose item only the `duduclaw` executable may read (macOS).
     AppBound,
 }
@@ -92,6 +98,7 @@ pub const PERSON_IDENTITY_MIN_LEVEL: ProtectionLevel = ProtectionLevel::UserStor
 pub enum BackendKind {
     MacosKeychain,
     WindowsCredentialManager,
+    ContainerRootKey,
     None,
 }
 
@@ -140,6 +147,8 @@ pub struct ProtectionStatus {
     pub summary_zh: String,
     /// What it means / what to do.
     pub detail_zh: String,
+    /// Closed startup refusal code for localized dashboard diagnostics.
+    pub refusal_reason: Option<&'static str>,
 }
 
 /// A refused operation. `code` is a closed set; `message_zh` is user-facing.
@@ -154,8 +163,8 @@ impl ProtectionError {
         Self { code, message_zh: message_zh.into() }
     }
 
-    fn from_state(state: ProtectionState, extra: &str) -> Self {
-        let (summary, detail) = messages::state_text(state, ProtectionLevel::File, BackendKind::None, extra);
+    fn from_state(state: ProtectionState, backend: BackendKind, extra: &str) -> Self {
+        let (summary, detail) = messages::state_text(state, ProtectionLevel::File, backend, extra);
         Self::new(state.code(), format!("{summary}。{detail}"))
     }
 }
@@ -180,6 +189,7 @@ pub struct Enabled {
 
 /// The unwrapped protected key. Only obtainable inside the gateway process.
 pub struct ProtectedKey {
+    backend: BackendKind,
     level: ProtectionLevel,
     key: Zeroizing<[u8; KEY_LEN]>,
     key_id: String,
@@ -229,7 +239,7 @@ impl ProtectedKey {
     pub fn unseal(&self, sealed: &str) -> Result<Zeroizing<Vec<u8>>, ProtectionError> {
         let (kid, body) = parse_sealed(sealed)?;
         if kid != self.key_id {
-            return Err(ProtectionError::from_state(ProtectionState::KeyChanged, ""));
+            return Err(ProtectionError::from_state(ProtectionState::KeyChanged, self.backend, ""));
         }
         let bytes = BASE64
             .decode(body)
@@ -280,9 +290,9 @@ fn pin_reset(account: &str) {
     pins().lock().unwrap_or_else(|p| p.into_inner()).remove(account);
 }
 
-/// The store this platform uses. Chosen by `cfg` only — never by config or
-/// environment, so nothing an employee writes can redirect it.
-pub fn platform_store() -> Box<dyn KeyStore> {
+/// Selection uses the OS and attested startup state, never a configurable
+/// backend or key path that an employee could redirect.
+pub fn platform_store(_home: &Path) -> Box<dyn KeyStore> {
     #[cfg(target_os = "macos")]
     {
         Box::new(MacKeychainStore::default_keychain())
@@ -291,7 +301,18 @@ pub fn platform_store() -> Box<dyn KeyStore> {
     {
         Box::new(WindowsCredentialStore)
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    {
+        use container_root::{ContainerRootStore, RefusedRootStore};
+        if let Some(store) = duduclaw_core::root_key::with_key(|key| ContainerRootStore::new(_home, key)) {
+            return Box::new(store);
+        }
+        if let Some(reason) = duduclaw_core::root_key::refused_reason() {
+            return Box::new(RefusedRootStore(reason));
+        }
+        Box::new(UnsupportedStore)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         Box::new(UnsupportedStore)
     }
@@ -305,7 +326,7 @@ pub struct CredentialProtection {
 
 impl CredentialProtection {
     pub fn platform(home: &Path) -> Self {
-        Self::with_store(home, platform_store())
+        Self::with_store(home, platform_store(home))
     }
 
     pub fn with_store(home: &Path, store: Box<dyn KeyStore>) -> Self {
@@ -341,6 +362,7 @@ impl CredentialProtection {
                 && level >= PERSON_IDENTITY_MIN_LEVEL,
             summary_zh,
             detail_zh,
+            refusal_reason: self.store.refusal_reason(),
         }
     }
 
@@ -355,8 +377,11 @@ impl CredentialProtection {
 
     /// [`CredentialProtection::enable`] plus what it replaced, for the audit.
     pub fn enable_detailed(&self, reset: bool) -> Result<Enabled, ProtectionError> {
+        if let Some(reason) = self.store.refusal_reason() {
+            return Err(ProtectionError::from_state(ProtectionState::Unavailable, self.store.backend(), reason));
+        }
         if self.store.backend() == BackendKind::None {
-            return Err(ProtectionError::from_state(ProtectionState::Unsupported, ""));
+            return Err(ProtectionError::from_state(ProtectionState::Unsupported, self.store.backend(), ""));
         }
         self.with_op_lock(|| {
             let current = self.status();
@@ -385,7 +410,7 @@ impl CredentialProtection {
         let canary = marker::make_canary(&engine).map_err(|e| ProtectionError::new("crypto_failed", e))?;
         self.store
             .write_new(&account, &key[..])
-            .map_err(|e| store_error(&e))?;
+            .map_err(|e| store_error(&e, self.store.backend()))?;
         let m = marker::new_marker(self.store.backend(), account.clone(), marker::key_id(&key[..]), canary);
         if let Err(e) = marker::write_marker(&self.home, &m) {
             let _ = self.store.delete(&account);
@@ -399,7 +424,7 @@ impl CredentialProtection {
             pin_reset(&account);
             return Err(ProtectionError::new(
                 "verify_failed",
-                format!("寫入系統金鑰圈後讀不回來，已還原：{}", status.detail_zh),
+                format!("寫入保護金鑰後讀不回來，已還原：{}", status.detail_zh),
             ));
         }
         Ok(status)
@@ -410,7 +435,7 @@ impl CredentialProtection {
     pub fn disable(&self) -> Result<(), ProtectionError> {
         self.with_op_lock(|| {
             let account = self.account();
-            self.store.delete(&account).map_err(|e| store_error(&e))?;
+            self.store.delete(&account).map_err(|e| store_error(&e, self.store.backend()))?;
             marker::remove_marker(&self.home).map_err(|e| ProtectionError::new("marker_write_failed", e))?;
             pin_reset(&account);
             Ok(())
@@ -430,10 +455,10 @@ impl CredentialProtection {
         self.with_op_lock(|| {
             let account = self.account();
             let m = read_marker_for(&self.home, self.store.as_ref(), &account)
-                .map_err(|(state, extra)| ProtectionError::from_state(state, &extra))?;
-            let bytes = self.store.read_interactive(&account).map_err(|e| store_error(&e))?;
-            let key = verify_bytes(&bytes, &m).map_err(|(state, extra)| ProtectionError::from_state(state, &extra))?;
-            self.store.write_new(&account, key.as_ref()).map_err(|e| store_error(&e))?;
+                .map_err(|(state, extra)| ProtectionError::from_state(state, self.store.backend(), &extra))?;
+            let bytes = self.store.read_interactive(&account).map_err(|e| store_error(&e, self.store.backend()))?;
+            let key = verify_bytes(&bytes, &m).map_err(|(state, extra)| ProtectionError::from_state(state, self.store.backend(), &extra))?;
+            self.store.write_new(&account, key.as_ref()).map_err(|e| store_error(&e, self.store.backend()))?;
             let status = self.status();
             if status.state == ProtectionState::Ready {
                 Ok(status)
@@ -460,11 +485,11 @@ impl CredentialProtection {
             ));
         }
         let m = read_marker_for(&self.home, self.store.as_ref(), &self.account())
-            .map_err(|(state, extra)| ProtectionError::from_state(state, &extra))?;
+            .map_err(|(state, extra)| ProtectionError::from_state(state, self.store.backend(), &extra))?;
         let key = self
             .load_verified(&m)
-            .map_err(|(state, extra)| ProtectionError::from_state(state, &extra))?;
-        Ok(ProtectedKey { level: self.store.level(), key: key.key, key_id: key.key_id })
+            .map_err(|(state, extra)| ProtectionError::from_state(state, self.store.backend(), &extra))?;
+        Ok(ProtectedKey { backend: self.store.backend(), level: self.store.level(), key: key.key, key_id: key.key_id })
     }
 
     /// Ledger fingerprints require an application-bound key. User stores can
@@ -527,6 +552,9 @@ fn read_marker_for(home: &Path, store: &dyn KeyStore, account: &str) -> Result<M
     if store.backend() == BackendKind::None {
         return Err((ProtectionState::Unsupported, String::new()));
     }
+    if let Some(reason) = store.refusal_reason() {
+        return Err((ProtectionState::Unavailable, reason.into()));
+    }
     match marker::read_marker(home) {
         MarkerRead::Absent => Err((ProtectionState::NotEnabled, String::new())),
         MarkerRead::Invalid(why) => Err((ProtectionState::Invalid, why)),
@@ -541,14 +569,15 @@ fn read_marker_for(home: &Path, store: &dyn KeyStore, account: &str) -> Result<M
 fn state_of(e: &StoreError) -> (ProtectionState, String) {
     match e {
         StoreError::NotFound => (ProtectionState::Missing, String::new()),
+        StoreError::Tampered => (ProtectionState::KeyChanged, String::new()),
         StoreError::InteractionRequired => (ProtectionState::NeedsAuthorization, String::new()),
         StoreError::Unavailable(why) => (ProtectionState::Unavailable, why.clone()),
     }
 }
 
-fn store_error(e: &StoreError) -> ProtectionError {
+fn store_error(e: &StoreError, backend: BackendKind) -> ProtectionError {
     let (state, extra) = state_of(e);
-    ProtectionError::from_state(state, &extra)
+    ProtectionError::from_state(state, backend, &extra)
 }
 
 /// Current protection for `home` on this platform's store.
@@ -567,7 +596,7 @@ mod ledger_fingerprint_tests {
 
     #[test]
     fn low_entropy_kinds_refuse_even_with_a_protected_key() {
-        let key = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+        let key = ProtectedKey { backend: BackendKind::MacosKeychain, level: ProtectionLevel::AppBound, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
         for kind in ["password", "connection_string", "other", "cookie"] {
             assert!(key.credential_fingerprint(kind, &[b'x'; 80]).is_none());
         }
@@ -575,8 +604,8 @@ mod ledger_fingerprint_tests {
 
     #[test]
     fn high_entropy_fingerprints_are_keyed_stable_and_domain_separated() {
-        let first = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
-        let second = ProtectedKey { level: ProtectionLevel::AppBound, key: Zeroizing::new([8; KEY_LEN]), key_id: "fixture".into() };
+        let first = ProtectedKey { backend: BackendKind::MacosKeychain, level: ProtectionLevel::AppBound, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+        let second = ProtectedKey { backend: BackendKind::MacosKeychain, level: ProtectionLevel::AppBound, key: Zeroizing::new([8; KEY_LEN]), key_id: "fixture".into() };
         let value = format!("sk-{}", "x".repeat(40)).into_bytes();
         let digest = first.credential_fingerprint("api_key", &value).unwrap();
         assert_eq!(Some(digest.clone()), first.credential_fingerprint("api_key", &value));
@@ -595,8 +624,8 @@ mod fingerprint_protection_tests {
     #[test]
     fn fingerprints_require_app_bound_protection_even_for_provider_shapes() {
         let value = format!("sk-{}", "x".repeat(40));
-        for level in [ProtectionLevel::File, ProtectionLevel::UserStore, ProtectionLevel::AppBound] {
-            let key = ProtectedKey { level, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
+        for level in [ProtectionLevel::File, ProtectionLevel::UserStore, ProtectionLevel::ProcessIsolated, ProtectionLevel::AppBound] {
+            let key = ProtectedKey { backend: BackendKind::MacosKeychain, level, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
             assert_eq!(key.credential_fingerprint("api_key", value.as_bytes()).is_some(), level == ProtectionLevel::AppBound);
             assert!(key.credential_fingerprint("api_key", "guessable".repeat(8).as_bytes()).is_none());
         }

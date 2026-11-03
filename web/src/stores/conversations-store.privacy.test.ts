@@ -11,7 +11,7 @@ const history = { session_id: handle, agent_id: 'sales',channel:'whatsapp',priva
 beforeEach(() => {
   vi.clearAllMocks();
   useAuthStore.setState({ user: { id: 'me', email: 'me@test.invalid', display_name: 'Me', role: 'employee', status: 'active' }, bindings: [{ user_id: 'me', agent_name: 'sales', access_level: 'viewer', bound_at: '' }] });
-  useChatStore.setState({ selectedAgentId: 'sales', sessionId: 'webchat:own', ownSessionId: 'webchat:own', messages: [], resumedExplicitly: false });
+  useChatStore.setState({ selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' }, assignmentError: null, sessionId: 'webchat:own', ownSessionId: 'webchat:own', messages: [], resumedExplicitly: false });
   useConversationsStore.setState({ sessions: [], status: 'idle' });
   mockWsClient.call.mockImplementation((method: string) => method === 'chat.sessions.list' ? Promise.resolve({ sessions: [row], privacy_mode: 'filtered' }) : method === 'chat.sessions.history' ? Promise.resolve(history) : Promise.resolve(null));
 });
@@ -130,5 +130,13 @@ it('rejects a delayed list from an earlier account-status generation', async () 
   useAuthStore.setState({ user: { ...user, status: 'active' } });
   resolve({ sessions: [row] });
   await pending;
+  expect(useConversationsStore.getState().sessions).toEqual([]);
+});
+
+it('does not fall back to a selected main agent when no server assignment exists', async () => {
+  useChatStore.setState({ selectedAgentId: 'main', resolvedAgent: null });
+  mockWsClient.call.mockClear();
+  await useConversationsStore.getState().fetch();
+  expect(mockWsClient.call).not.toHaveBeenCalled();
   expect(useConversationsStore.getState().sessions).toEqual([]);
 });

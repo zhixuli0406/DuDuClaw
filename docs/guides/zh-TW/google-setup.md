@@ -51,7 +51,7 @@ DuDuClaw 要求的權限範圍中，`gmail.readonly`、`gmail.compose` 和 `driv
 2. 請持有 Google Cloud 專案的人在該專案啟用 OAuth 步驟列出的八項 API。進入「IAM & Admin → Service Accounts」建立服務帳號，再開啟該帳號，選「Keys → Add key → Create new key → JSON」並下載。數字 Client ID 就是 JSON 裡的 `client_id` 欄位。
 3. 把 Client ID 和儀表板完整權限範圍清單交給超級管理員。管理員進入「Admin console → Security → Access and data control → API controls → Manage Domain Wide Delegation → Add new」，貼上兩者並授權。Google 最多需要 24 小時傳播設定。
 4. 全公司共用一個帳號時，在精靈選「公司 Workspace，有超級管理員」。將 JSON 放在 DuDuClaw 主機，只開放檔案擁有者讀取，填入絕對路徑，例如 DuDuClaw 家目錄下的 `/Users/alex/.duduclaw/keys/google-sa.json`，請換成主機上的實際路徑。不要用 `~`，程式不會展開它。填入要代表的 Workspace 使用者信箱後儲存，請填真人帳號。
-5. 每位 AI 員工要代表不同同事時，先到「安全 → 憑證保護 → 改放系統金鑰圈」，再到「整合 → Google → 進階設定 → 公司授權代表 → 匯入金鑰檔」。這條獨立流程會保護金鑰，需要支援的 macOS 或 Windows 鑰匙圈；Linux 和 Docker 尚不能使用。設定允許網域，再於員工的連線分頁選同事。詳見[帳號安全與設定](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
+5. 每位 AI 員工要代表不同同事時，先到「安全 → 憑證保護 → 改放系統金鑰圈」，再到「整合 → Google → 進階設定 → 公司授權代表 → 匯入金鑰檔」。這條獨立流程會保護金鑰，需要支援的 macOS 或 Windows 鑰匙圈，或用 person-credentials 疊加設定啟動的 Docker（見 [Docker 指南](docker.md#74-個人帳號person-credentials-疊加設定)，按鈕名稱是「開啟憑證保護」）；一般的 Docker 安裝與原生 Linux 不能使用。設定允許網域，再於員工的連線分頁選同事。詳見[帳號安全與設定](google-workspace.md#每位-ai-員工用不同的-google-帳號公司授權代表v1760)。
 6. 執行服務檢查，確認選定帳號及各服務的結果。取得授權不代表已成功讀取資料。
 
 公司授權代表的設定可限制同事信箱的網域；Enterprise 個人連線則有獨立的帳號網域限制。設定方式見 [Google Workspace 參考](google-workspace.md)。

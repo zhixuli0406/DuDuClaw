@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import { useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -83,7 +84,7 @@ export function RecentTasks({ agents, enabled }: RecentTasksProps) {
               </Link>
             ))}
           </div>
-          <CardFooter className="justify-end p-0">
+          {!TASK_ENTRY_POINTS_HIDDEN && <CardFooter className="justify-end p-0">
             <Link
               to="/tasks"
               className="flex items-center gap-1 px-4 py-3 text-xs text-muted-foreground transition-colors hover:text-foreground"
@@ -91,7 +92,7 @@ export function RecentTasks({ agents, enabled }: RecentTasksProps) {
               {intl.formatMessage({ id: 'home.recentTasks.viewAll' })}
               <ArrowRight className="size-3" />
             </Link>
-          </CardFooter>
+          </CardFooter>}
         </>
       )}
     </Card>

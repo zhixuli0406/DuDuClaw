@@ -1,3 +1,4 @@
+import { isTaskEntryVisible } from '@/lib/task-entry-visibility';
 import type { UserRole } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
 
@@ -25,6 +26,7 @@ import { hasMinRole } from '@/lib/roles';
  * (WP11-T11.6, fail-closed). Never rely on `isVisible` for security.
  */
 export interface Gated {
+  readonly to?: string;
   readonly minRole?: UserRole;
   readonly enterprise?: boolean;
   /**
@@ -111,6 +113,7 @@ export function isVisible(
   isPersonal: boolean,
   ctx?: VisibilityContext,
 ): boolean {
+  if (item.to && !isTaskEntryVisible(item.to)) return false;
   if (!hasMinRole(userRole, item.minRole)) return false;
   if (isPersonal && item.enterprise) return false;
   if (isPersonal && item.personalHidden) return false;

@@ -341,7 +341,7 @@ impl MethodHandler {
             }
             "heartbeat.trigger" => {
                 require_manager!();
-                boxed_frame(|| self.handle_heartbeat_trigger(params)).await
+                boxed_frame(|| self.handle_heartbeat_trigger(params, ctx)).await
             }
 
             // ── Evolution (manager+, H3 fix) ─────────────────

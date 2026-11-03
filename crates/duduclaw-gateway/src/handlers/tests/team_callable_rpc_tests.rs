@@ -163,7 +163,7 @@ fn names(map: &HashMap<String, Value>) -> Vec<String> {
 async fn the_list_differs_per_user_and_says_where_each_right_comes_from() {
     let f = fixture().await;
     let mgr = callable(&f, &jwt_ctx(&f.mgr, UserRole::Manager)).await;
-    assert_eq!(names(&mgr), vec!["faq", "hr", "main", "sales"]);
+    assert_eq!(names(&mgr), vec!["faq", "hr", "sales"]);
     assert_eq!(mgr["sales"]["via"], "team");
     assert_eq!(mgr["sales"]["via_user"], json!(f.emp1));
     assert_eq!(mgr["sales"]["via_user_name"], "emp1");
@@ -173,25 +173,24 @@ async fn the_list_differs_per_user_and_says_where_each_right_comes_from() {
     assert_eq!(mgr["sales"]["selectable"], true);
     assert_eq!(mgr["hr"]["level"], "viewer");
     assert_eq!(mgr["hr"]["assignable"], false, "a Viewer-derived grant only talks");
-    assert_eq!(mgr["main"]["via"], "default");
-    assert_eq!(mgr["main"]["selectable"], false);
+    assert!(!mgr.contains_key("main"));
     assert_eq!(mgr["faq"]["via"], "public");
     assert_eq!(mgr["faq"]["assignable"], false);
     assert_eq!(mgr["sales"]["call_text"], "@業務專員");
 
     let other = callable(&f, &jwt_ctx(&f.other, UserRole::Employee)).await;
-    assert_eq!(names(&other), vec!["faq", "finance", "main"]);
+    assert_eq!(names(&other), vec!["faq", "finance"]);
     assert_eq!(other["finance"]["via"], "binding");
     assert_eq!(other["finance"]["level"], "owner");
     assert_eq!(other["finance"]["assignable"], true);
 
     let lead = callable(&f, &jwt_ctx(&f.lead, UserRole::Manager)).await;
-    assert_eq!(names(&lead), vec!["faq", "main", "sales"]);
+    assert_eq!(names(&lead), vec!["faq", "sales"]);
     assert_eq!(lead["sales"]["depth"], 1);
 
     // An Employee never gets a team, even with someone below them on file.
     let emp2 = callable(&f, &jwt_ctx(&f.emp2, UserRole::Employee)).await;
-    assert_eq!(names(&emp2), vec!["faq", "hr", "main"]);
+    assert_eq!(names(&emp2), vec!["faq", "hr"]);
 
     let admin = callable(&f, &jwt_ctx(&f.admin, UserRole::Admin)).await;
     assert_eq!(names(&admin), vec!["faq", "finance", "hr", "main", "sales"]);
@@ -318,13 +317,15 @@ async fn agents_callable_is_not_enterprise_gated() {
 #[tokio::test]
 async fn personal_edition_ignores_leftover_reporting_lines() {
     let f = fixture().await;
+    let ctx = jwt_ctx(&f.mgr, UserRole::Manager);
+    assert!(!callable(&f, &ctx).await.contains_key("main"));
     // Enterprise → Personal downgrade: the users.db rows stay behind.
     f.handler
         .set_edition_override(Some(duduclaw_core::EditionProfile::Personal))
         .await;
-    let ctx = jwt_ctx(&f.mgr, UserRole::Manager);
     let mgr = callable(&f, &ctx).await;
-    assert_eq!(names(&mgr), vec!["faq", "main"], "no team grants in personal");
+    // Personal ignores leftover team grants; main stays Admin-only.
+    assert_eq!(names(&mgr), vec!["faq"], "no team grants or non-Admin main access in Personal");
     let create = f
         .handler
         .handle("tasks.create", json!({ "title": "報價", "assigned_to": "sales" }), &ctx)
@@ -338,6 +339,18 @@ async fn personal_edition_ignores_leftover_reporting_lines() {
     // The read-only task identity follows the recorded edition too.
     let live = crate::review_evidence::audience::trusted_dashboard_principal(f._home.path(), &f.mgr).unwrap();
     assert!(live.team_access.is_empty());
+}
+
+#[tokio::test]
+async fn callable_main_stays_admin_only_across_edition_overrides() {
+    let f = fixture().await;
+    let ctx = jwt_ctx(&f.other, UserRole::Employee);
+    assert!(!callable(&f, &ctx).await.contains_key("main"));
+    f.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Personal)).await;
+    let personal = callable(&f, &ctx).await;
+    assert_eq!(names(&personal), vec!["faq", "finance"]);
+    f.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    assert!(!callable(&f, &ctx).await.contains_key("main"));
 }
 
 #[tokio::test]
@@ -389,7 +402,7 @@ async fn the_default_employee_follows_the_callers_conversation() {
     f.handler.registry.write().await.scan().await.unwrap();
     let ctx = jwt_ctx(&f.other, UserRole::Employee);
     let fresh = ok_payload(&f.handler.handle("agents.callable", json!({}), &ctx).await);
-    assert_eq!(fresh["default_agent"], "main");
+    assert_eq!(fresh["default_agent"], Value::Null);
     assert!(fresh["agents"].as_array().unwrap().iter().all(|a| a["name"] != "desk"));
     let bound = ok_payload(
         &f.handler
@@ -405,7 +418,7 @@ async fn the_default_employee_follows_the_callers_conversation() {
             .handle("agents.callable", json!({ "session_id": "discord:thread:T1" }), &ctx)
             .await,
     );
-    assert_eq!(other["default_agent"], "main");
+    assert_eq!(other["default_agent"], Value::Null);
 }
 
 #[tokio::test]
@@ -594,4 +607,17 @@ async fn only_an_admin_gives_a_goal_more_than_the_employee_run_limit() {
     let id = wider["task"]["id"].as_str().unwrap();
     let update = f.handler.handle("tasks.update", json!({ "task_id": id, "timeout_secs": 600 }), &admin).await;
     assert!(matches!(update, WsFrame::Response { ok: false, .. }), "{update:?}");
+}
+
+#[tokio::test]
+async fn callable_hides_bound_main_and_configured_default_only_from_non_admins() {
+    let f = fixture().await;
+    f.db.bind_agent(&f.other, "main", AccessLevel::Owner).unwrap();
+    std::fs::write(f._home.path().join("config.toml"), "[general]\ndefault_agent = \"finance\"\n").unwrap();
+    let employees = callable(&f, &jwt_ctx(&f.other, UserRole::Employee)).await;
+    assert!(!employees.contains_key("main"));
+    assert!(!employees.contains_key("finance"));
+    let admin = callable(&f, &jwt_ctx(&f.admin, UserRole::Admin)).await;
+    assert_eq!(admin["main"]["assignable"], true);
+    assert_eq!(admin["finance"]["assignable"], true);
 }

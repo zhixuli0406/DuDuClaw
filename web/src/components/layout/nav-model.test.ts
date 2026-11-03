@@ -291,9 +291,9 @@ describe('enterprise employee navigation', () => {
     expect(employeeNavItems().find((item) => item.to === '/inbox')?.badge).toBe('inbox');
   });
 
-  it('restores task rows only when enabled, retaining the manager-only foresight gate', () => {
+  it('keeps task rows hidden when enabled, retaining responsibility and foresight gates', () => {
     expect(employeeNavItems(true).map((item) => item.to)).toEqual([
-      '/', '/inbox', '/skills', '/memory', '/world', '/tasks', '/goals', '/responsibilities',
+      '/', '/inbox', '/skills', '/memory', '/world', '/responsibilities',
     ]);
     expect(employeeNavItems(true).some((item) => item.to === '/routines' || item.to === '/org')).toBe(false);
     expect(employeeNavItems(true).every((item) => item.newIn === undefined)).toBe(true);
@@ -312,12 +312,12 @@ describe('enterprise employee navigation', () => {
       const mobile = mobileNavItemsForRole('employee', false, enabled).map((item) => item.to);
       expect(mobile.every((path) => allowed.includes(path))).toBe(true);
       expect(mobile.includes('/chat')).toBe(false);
-      expect(mobile.includes('/tasks')).toBe(enabled);
+      expect(mobile.includes('/tasks')).toBe(false);
     }
   });
 
   it('preserves the previous mobile array for admins, managers and Personal', () => {
-    expect(mobileNavItems.map((item) => item.to)).toEqual(['/', '/chat', '/conversations', '/tasks']);
+    expect(mobileNavItems.map((item) => item.to)).toEqual(['/', '/chat', '/conversations', '/skills']);
     for (const role of ['admin', 'manager', 'employee'] as const) {
       for (const personal of [false, true]) {
         if (isEmployeeSidebar(role, personal)) continue;
@@ -329,7 +329,7 @@ describe('enterprise employee navigation', () => {
   });
 });
 
-// Fixed route snapshots captured from the arrays before the employee shell change.
+// Expected visible routes, including the task-entry hiding policy.
 // All progressive-disclosure facts are enabled to make every prior entry observable.
 const previousNavigation = {
   "admin:enterprise": {
@@ -342,7 +342,6 @@ const previousNavigation = {
       [
         "/routines",
         "/plans",
-        "/goals",
         "/responsibilities",
         "/runs",
         "/canvas",
@@ -355,7 +354,6 @@ const previousNavigation = {
         "/os",
         "/presets",
         "/app/system/device",
-        "/tasks"
       ],
       [
         "/skills",
@@ -389,7 +387,6 @@ const previousNavigation = {
       "/",
       "/console",
       "/routines",
-      "/goals",
       "/responsibilities",
       "/foresight",
       "/skills",
@@ -408,7 +405,6 @@ const previousNavigation = {
         "/about"
       ],
       [
-        "/tasks",
         "/plans",
         "/runs",
         "/canvas",
@@ -434,7 +430,6 @@ const previousNavigation = {
     "groups": [
       [
         "/plans",
-        "/goals",
         "/responsibilities",
         "/runs",
         "/canvas",
@@ -444,7 +439,6 @@ const previousNavigation = {
         "/reports",
         "/foresight",
         "/forks",
-        "/tasks"
       ],
       [
         "/skills",
@@ -475,7 +469,6 @@ const previousNavigation = {
     "primary": [
       "/chat",
       "/",
-      "/goals",
       "/responsibilities",
       "/foresight",
       "/skills",
@@ -493,7 +486,6 @@ const previousNavigation = {
         "/about"
       ],
       [
-        "/tasks",
         "/plans",
         "/runs",
         "/canvas",
@@ -512,7 +504,6 @@ const previousNavigation = {
     "primary": [
       "/chat",
       "/",
-      "/goals",
       "/responsibilities",
       "/skills",
       "/memory",
@@ -528,7 +519,6 @@ const previousNavigation = {
         "/about"
       ],
       [
-        "/tasks",
         "/plans",
         "/runs",
         "/canvas",
@@ -567,5 +557,19 @@ describe('admin setup checklist navigation', () => {
     }
     expect(isVisible(entry, 'admin', true)).toBe(false);
     expect(crumbsFor('/setup')).toEqual([{ labelId: 'nav.manage', to: '/manage' }, { labelId: 'setup.title' }]);
+  });
+});
+
+
+describe('task navigation hidden for all roles and editions', () => {
+  it.each(['admin', 'manager', 'employee'] as const)('hides task entries for %s without removing responsibilities or foresight', role => {
+    const taskEntries = navGroups.flatMap(group => group.items).filter(item => ['/tasks', '/goals'].includes(item.to));
+    expect(taskEntries).toHaveLength(2);
+    for (const personal of [false, true]) {
+      for (const entry of taskEntries) expect(isVisible(entry, role, personal)).toBe(false);
+      expect(mobileNavItemsForRole(role, personal, true).some(item => ['/tasks', '/goals', '/assign'].includes(item.to))).toBe(false);
+    }
+    expect(navGroups.flatMap(group => group.items).some(item => item.to === '/responsibilities')).toBe(true);
+    expect(navGroups.flatMap(group => group.items).some(item => item.to === '/foresight')).toBe(true);
   });
 });

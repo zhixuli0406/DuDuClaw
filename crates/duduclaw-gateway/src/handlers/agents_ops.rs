@@ -7,7 +7,7 @@ impl MethodHandler {
     /// Dashboard-initiated delegation.  Supervisor pattern is NOT enforced here
     /// because this RPC is an operator-level action (depth always starts at 0).
     /// Agent-to-agent delegation goes through MCP `send_to_agent` which IS enforced.
-    pub(crate) async fn handle_agents_delegate(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_agents_delegate(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_id = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -52,6 +52,8 @@ impl MethodHandler {
         }
         let model = agent.config.model.preferred.clone();
         drop(reg);
+
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
 
         let message_id = uuid::Uuid::new_v4().to_string();
 
@@ -139,6 +141,7 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         info!(agent_id, "agents.resume requested");
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
 
         if let Err(e) = self.update_agent_status_as(agent_id, "active", "agents.resume", ctx).await {
             return WsFrame::error_response("", &format!("Failed to resume agent: {e}"));
