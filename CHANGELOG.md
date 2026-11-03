@@ -12,6 +12,10 @@
 - `cost.summary` 新增受保留期限制的 RFC3339 `since`；控制室確認閘道接受本機午夜後才標「今日」，舊閘道仍顯示「近 24 小時」。新增隔離 home 的 `scripts/live-test/tui-control-room.sh`，檢查真實 inbox 與自主暫停／恢復 RPC；本次沙箱尚未執行活測。
 - PTY 區塊支援 urxvt（1015）與 SGR-Pixels（1016）滑鼠編碼：只在子程式要求時轉送，優先序為 1016、1006、1015、1005、傳統模式；像素座標使用主機回報的字元格大小，沒有回報時以 8×16 計算。
 
+### Changed
+
+- CI 依 PR 變更範圍選擇完整測試、版本編譯檢查或略過 Rust；主分支完整驗證不再被後續合併取消。改用 nextest 並保留 doctest 與 E2E，原生 macOS／Windows 重試結果另列於摘要；版本更新不再搶占發版快取預熱資源。
+
 ### Fixed
 
 - 測試：Home OAuth 撤銷存在性測試改用各自的 client ID，避免平行 callback 的 provider 計數被算到另一個測試；新增固定順序的隔離回歸測試。

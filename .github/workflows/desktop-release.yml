@@ -65,7 +65,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           [[ "$RELEASE_TAG" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           ref: ${{ needs.build-source.outputs.commit }}
 
@@ -89,7 +89,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: 20
 
@@ -103,7 +103,7 @@ jobs:
       - name: Generate app icons
         shell: bash
         run: |
-          cargo install tauri-cli --version "^2" --locked
+          cargo install tauri-cli --version "=2.12.4" --locked
           cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 
       - name: Build & stage gateway sidecar
@@ -117,13 +117,13 @@ jobs:
 
       - name: Import Apple certificate
         if: matrix.os == 'macos-latest'
-        uses: apple-actions/import-codesign-certs@v3
+        uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d  # v3
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
       - name: Build, sign & release (tauri-action)
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5  # v0
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -148,7 +148,7 @@ jobs:
       # no hardware token). See docs/guides/desktop-unblock.md 關卡 C 路徑 1.
       - name: Sign Windows installer (Azure Trusted Signing)
         if: matrix.os == 'windows-latest' && vars.WINDOWS_SIGN_METHOD == 'azure'
-        uses: azure/trusted-signing-action@v0
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293  # v0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}

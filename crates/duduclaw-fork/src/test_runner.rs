@@ -447,20 +447,28 @@ mod tests {
             std::fs::write(dir.path().join("tree.ps1"), r#"
     param([int]$Depth)
     $ErrorActionPreference = 'Stop'
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
     [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot "pid-$Depth"), [string]$PID)
-    while (-not (Test-Path (Join-Path $PSScriptRoot "go-$Depth"))) { Start-Sleep -Milliseconds 25 }
+    while (-not (Test-Path (Join-Path $PSScriptRoot "go-$Depth"))) {
+        if ([DateTime]::UtcNow -ge $deadline -or -not (Test-Path $PSScriptRoot)) { exit 3 }
+        Start-Sleep -Milliseconds 25
+    }
     if ($Depth -lt 2) {
         $executable = (Get-Process -Id $PID).Path
         $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $PSCommandPath + '"'), '-Depth', [string]($Depth + 1))
         Start-Process -FilePath $executable -ArgumentList $arguments -NoNewWindow -PassThru | Out-Null
     }
-    Start-Sleep -Seconds 120
+    # Outlive the 20s timeout and 5s survivor check, but release pipes after a panic.
+    while ([DateTime]::UtcNow -lt $deadline -and (Test-Path $PSScriptRoot)) {
+        Start-Sleep -Milliseconds 25
+    }
     "#).unwrap();
             let command = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tree.ps1 -Depth 0";
             let execution = run_test(dir.path(), Some(command), 20);
             tokio::pin!(execution);
             let mut processes = Vec::new();
-            let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+            // Leave 5s before run_test's 20s timeout, even with exclusive CI slots.
+            let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             for depth in 0..3 {
                 let pid_file = dir.path().join(format!("pid-{depth}"));
                 let pid = loop {
