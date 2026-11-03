@@ -10,8 +10,8 @@
 //! - for a Manager, an employee bound to someone below them in the
 //!   reporting tree (`via: "team"`, at most Operator, with the report it
 //!   comes through);
-//! - WebChat's default employee (`via: "default"`) and `[channels]
-//!   public_trigger` employees (`via: "public"`), open to every account.
+//! - non-main public employees (`via: "public"`) and channel defaults;
+//! - main-role and gateway-default employees are Admin-only, even if bound.
 //!
 //! `ctx` is the live context `dispatch` rebuilt from users.db for this call,
 //! so a binding, role or manager change shows up without a re-login.
@@ -124,7 +124,9 @@ fn report_names(db: Option<&UserDb>, grants: &[(String, GrantSource)]) -> HashMa
 impl MethodHandler {
     pub(crate) async fn handle_agents_callable(&self, ctx: &UserContext, params: Value) -> WsFrame {
         let access = Arc::new(effective_of(ctx));
-        let sender = SenderAccess::from_effective(access.clone());
+        let sender = SenderAccess::from_effective(access.clone()).for_webchat(
+            crate::webchat::access::gateway_default_id(&self.home_dir).await,
+        );
         let reg = self.registry.read().await;
         let session = session_for(&params);
         let default_id = crate::channel_reply::resolve_fallback_agent_in(

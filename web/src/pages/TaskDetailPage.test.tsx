@@ -48,8 +48,9 @@ beforeEach(() => {
 describe('TaskDetailPage', () => {
   it('renders the breadcrumb header and inline-editable title', () => {
     renderAt('task-aaaa1111');
-    // Breadcrumb root segment back to the board.
-    expect(screen.getByText('Task Board')).toBeInTheDocument();
+    // Keep direct task links working without advertising the board.
+    expect(screen.getByText('Chat')).toBeInTheDocument();
+    expect(screen.queryByText('Task Board')).not.toBeInTheDocument();
     // Title renders as the inline-editor resting button.
     expect(screen.getByRole('button', { name: 'Task title' })).toHaveTextContent('Draft the launch plan');
   });
@@ -448,10 +449,10 @@ describe('TaskDetailPage — discovery task (L2 round 5)', () => {
     useTasksStore.setState({ tasks: [DISCOVERY], comments: {}, activities: [], loading: false });
   });
 
-  it('shows the lifecycle hint with a link to /goals and no writers', () => {
+  it('shows the lifecycle hint without advertising goals or exposing writers', () => {
     renderAt('task-disc0001');
     expect(screen.getByText(LOCK_HINT)).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Open Goals' })).toHaveAttribute('href', '/goals');
+    expect(screen.queryByRole('link', { name: 'Open Goals' })).not.toBeInTheDocument();
     // No header quick-complete, no inline title editor, no status picker.
     expect(screen.queryByRole('button', { name: 'Mark complete' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Task title' })).toBeNull();

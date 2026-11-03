@@ -5512,7 +5512,7 @@
   "channelLink.openIn": "{channel} で開く",
   "webchat.suggest.1": "今日のタスクは？",
   "webchat.suggest.2": "今週のハイライトをまとめて",
-  "webchat.suggest.3": "スタッフにタスクを割り当てる",
+  "webchat.suggest.3": "次の一歩を一緒に考えて",
   "console.advancedAria": "アプリと設定を開く",
   "console.hero.title": "ひとことでこのマシンを操作",
   "console.hero.subtitle": "状態確認、AI スタッフの追加、タスクの割り当て——話しかけるだけ",
@@ -9605,5 +9605,12 @@
   "setup.section.capabilities": "機能",
   "setup.section.start": "開始",
   "sidebar.primaryAgent": "メイン",
-  "sidebar.setPrimaryAgent": "メインに設定"
+  "sidebar.setPrimaryAgent": "メインに設定",
+  "webchat.assignment.title": "会話相手が未設定です",
+  "webchat.assignment.loading": "利用できる AI スタッフを確認しています…",
+  "webchat.assignment.none": "利用できる AI スタッフがいません。管理者に割り当てを依頼してください。",
+  "webchat.assignment.multiple": "複数の AI スタッフを利用できます。サイドバーの「AI スタッフ」で ⋯ メニューから「メインに設定」を選び、新しい会話を始めてください。この項目がない場合は管理者にお問い合わせください。",
+  "webchat.assignment.mainAdminOnly": "この会話は管理者専用の AI アシスタントとの会話のため、続行できません。新しい会話を開き、割り当てられた AI スタッフと話してください。",
+  "webchat.assignment.forbidden": "この AI スタッフとは現在会話できません。新しい会話を始めるか、管理者に割り当てを確認してください。",
+  "webchat.assignment.unavailable": "現在、利用できる AI スタッフを確認できません。しばらくしてから新しい会話を開いて再試行してください。解決しない場合は管理者にお問い合わせください。"
 }

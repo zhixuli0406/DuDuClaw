@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import { SetupChecklistCard } from '@/components/home/SetupChecklistCard';
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -370,11 +371,11 @@ export function HomePage() {
 
   const activeLayout = viewing && viewTarget ? viewTarget.layout : layout;
   const visible = activeLayout
-    .filter((w) => !w.hidden)
+    .filter((w) => !w.hidden && (!TASK_ENTRY_POINTS_HIDDEN || w.id !== 'my_tasks'))
     // 拍板: the "需要我" strip is silent when empty (except in edit mode, where
     // every widget must stay reorderable/unhideable).
     .filter((w) => !(w.id === 'needs_me' && !editing && inboxCount === 0));
-  const hiddenWidgets = layout.filter((w) => w.hidden);
+  const hiddenWidgets = layout.filter((w) => w.hidden && (!TASK_ENTRY_POINTS_HIDDEN || w.id !== 'my_tasks'));
 
   const greeting = intl.formatMessage(
     { id: `home.greeting.${greetingBucket(new Date().getHours())}` },

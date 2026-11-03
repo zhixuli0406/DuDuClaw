@@ -12,12 +12,16 @@ import { render } from '@testing-library/react';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import en from '@/i18n/en.json';
+import { useSystemStore } from '@/stores/system-store';
 import { useBrandStore } from '@/stores/brand-store';
 import { stashChatAttachments } from '@/lib/chat-handoff';
 
 beforeEach(() => {
   vi.clearAllMocks();
   useBrandStore.getState().setBrand(null);
+  useAuthStore.setState({ user: { id: 'admin', display_name: 'Boss', role: 'admin' } as never, bindings: [] });
+  useSystemStore.setState({ status: null });
+  useConversationsStore.setState({ viewOnly: false });
   useChatStore.setState({
     messages: [],
     isStreaming: false,
@@ -26,6 +30,9 @@ beforeEach(() => {
     connectionState: 'connected' as never,
     agentName: 'DuDuClaw',
     agentIcon: '',
+    resolvedAgent: undefined,
+    assignmentError: null,
+    resumedExplicitly: false,
   });
 });
 
@@ -364,4 +371,77 @@ it('shows queued cancellation and restores rejected text to the composer', () =>
   expect(screen.getAllByText(en['webchat.turnLimit'])).toHaveLength(1);
   fireEvent.click(screen.getByRole('button', { name: en['webchat.resend'] }));
   expect(screen.getByPlaceholderText(/message/i)).toHaveValue('keep this');
+});
+
+
+describe('server-resolved non-admin chat', () => {
+  const sales = { name: 'sales', display_name: 'Sales', role: 'specialist', status: 'active', call_text: '@Sales', via: 'binding', level: 'operator', selectable: true, assignable: true };
+  function assigned(role: 'employee' | 'manager' = 'employee') {
+    useAuthStore.setState({ user: { id: 'viewer', display_name: 'Viewer', role } as never });
+    useAgentsStore.setState({ loaded: true, agents: [{ name: 'main', display_name: 'Main', role: 'main' }, sales] as never });
+    useChatStore.setState({ selectedAgentId: 'main', resolvedAgent: { id: 'sales', name: 'Sales', icon: '🐦' }, connectionState: 'connected' });
+    vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [sales], default_agent: null } as never);
+  }
+  it.each(['employee', 'manager'] as const)('hides all partner chips for %s and scopes history to the server assignment', async role => {
+    assigned(role);
+    const list = vi.spyOn(api.chatSessions, 'list').mockResolvedValue({ sessions: [] });
+    renderWithProviders(<WebChatPage />);
+    await waitFor(() => expect(list).toHaveBeenCalledWith({ agent_id: 'sales', limit: 50 }));
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Sales' })).toBeInTheDocument();
+  });
+  it('preserves the partner chips for admins', async () => {
+    assigned();
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+    renderWithProviders(<WebChatPage />);
+    expect(await screen.findByRole('radio', { name: /Sales/ })).toBeInTheDocument();
+  });
+  it('preserves Personal edition partner chips', async () => {
+    assigned();
+    useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+    renderWithProviders(<WebChatPage />);
+    expect(await screen.findByRole('radio', { name: /Sales/ })).toBeInTheDocument();
+  });
+  it('shows an actionable unassigned state and disables the composer', () => {
+    assigned();
+    useChatStore.setState({ resolvedAgent: null, assignmentError: { code: 'no_assigned_agent', message: '', reason: 'no_agents' } });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByText(en['webchat.assignment.none'])).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/message/i)).toBeDisabled();
+    expect(screen.queryByText('no_assigned_agent')).not.toBeInTheDocument();
+  });
+  it('explains how to choose a primary staff member when several are available', () => {
+    assigned();
+    useChatStore.setState({ resolvedAgent: null, assignmentError: { code: 'no_assigned_agent', message: '', reason: 'multiple_agents' } });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByText(en['webchat.assignment.multiple'])).toBeInTheDocument();
+  });
+  it('distinguishes an unavailable assignment lookup from having no staff', () => {
+    assigned();
+    useChatStore.setState({ resolvedAgent: null, assignmentError: { code: 'no_assigned_agent', message: '', reason: 'unavailable' } });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByText(en['webchat.assignment.unavailable'])).toBeInTheDocument();
+    expect(screen.queryByText(en['webchat.assignment.none'])).not.toBeInTheDocument();
+  });
+  it('keeps the historical main identity in the header instead of the current primary', () => {
+    assigned();
+    useChatStore.setState({ resumedExplicitly: true, selectedAgentId: 'main', agentName: 'Main' });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByRole('heading', { name: 'Main' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Sales' })).not.toBeInTheDocument();
+  });
+  it('ignores a main-agent URL preselection', () => {
+    assigned();
+    const select = vi.spyOn(useChatStore.getState(), 'selectAgent');
+    render(<IntlProvider messages={en} locale="en"><MemoryRouter initialEntries={['/chat?agent=main']}><WebChatPage /></MemoryRouter></IntlProvider>);
+    expect(select).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: 'Sales' })).toBeInTheDocument();
+  });
+  it('explains why a historical main-agent conversation cannot continue', () => {
+    assigned();
+    useChatStore.setState({ resumedExplicitly: true, messages: [{ id: 'old', role: 'user', content: 'Earlier question', timestamp: 0 }], assignmentError: { code: 'main_agent_admin_only', message: '' } });
+    renderWithProviders(<WebChatPage />);
+    expect(screen.getByRole('alert')).toHaveTextContent(en['webchat.assignment.mainAdminOnly']);
+    expect(screen.getByPlaceholderText(/message/i)).toBeDisabled();
+  });
 });

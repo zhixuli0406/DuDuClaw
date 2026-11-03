@@ -130,11 +130,11 @@ describe('App routes — machine console access', () => {
 
 describe('App routes — the 交辦任務 page', () => {
   for (const edition of ['personal', 'enterprise'] as const) {
-    it(`/assign renders on ${edition}`, async () => {
+    it(`/assign redirects to chat on ${edition}`, async () => {
       setEdition(edition);
       renderAppAt('/assign');
-      expect(await screen.findByRole('heading', { name: 'Assign task', level: 1 })).toBeInTheDocument();
-      expect(screen.getByTestId('loc')).toHaveTextContent('/assign');
+      await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/chat'));
+      expect(screen.queryByRole('heading', { name: 'Assign task', level: 1 })).not.toBeInTheDocument();
     });
   }
 });

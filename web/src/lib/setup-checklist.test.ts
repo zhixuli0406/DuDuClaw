@@ -30,21 +30,21 @@ describe('setup checklist table', () => {
     expect(setupItems.find(i => i.id === 'permissions')!.check({ ...filled, users: [...filled.users!, { role: 'employee', status: 'active', bindings: [] }] })).toBe(false);
   });
   it('excludes optional items from progress and unknown items from completion', () => {
-    expect(setupProgress({ ...filled, google: false, odoo: null, routines: 0 })).toEqual({ done: 9, total: 9 });
-    expect(setupProgress({ ...filled, tasks: null })).toEqual({ done: 8, total: 9 });
+    expect(setupProgress({ ...filled, google: false, odoo: null, routines: 0 })).toEqual({ done: 8, total: 8 });
+    expect(setupProgress({ ...filled, tasks: null })).toEqual({ done: 8, total: 8 });
   });
   it('turns malformed responses into unknown rather than rejecting the load', async () => {
     vi.mocked(client.call).mockResolvedValue({});
     const data = await loadSetupData();
     for (const item of setupItems) expect(item.check(data)).toBeNull();
-    expect(setupProgress(data)).toEqual({ done: 0, total: 9 });
+    expect(setupProgress(data)).toEqual({ done: 0, total: 8 });
   });
   it('reports every failed read as unknown', async () => {
     const fail = () => Promise.reject(new Error('offline'));
     vi.mocked(client.call).mockImplementation(fail);
     const data = await loadSetupData();
     for (const item of setupItems) expect(item.check(data)).toBeNull();
-    expect(setupProgress(data)).toEqual({ done: 0, total: 9 });
+    expect(setupProgress(data)).toEqual({ done: 0, total: 8 });
   });
   it('publishes each row as it resolves and uses 10 second timeouts', async () => {
     const pending = new Map<string, (value: unknown) => void>();
@@ -60,4 +60,11 @@ describe('setup checklist table', () => {
     for (const resolve of pending.values()) resolve({});
     await loading;
   });
+});
+
+
+it('has no hidden task requirement or task destination', () => {
+  expect(setupItems.some(item => item.id === 'tasks')).toBe(false);
+  expect(setupItems.some(item => ['/tasks', '/goals', '/assign'].includes(item.to))).toBe(false);
+  expect(setupProgress({ ...filled, tasks: 0 })).toEqual({ done: 8, total: 8 });
 });

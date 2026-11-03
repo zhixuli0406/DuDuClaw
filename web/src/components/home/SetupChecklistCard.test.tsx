@@ -16,10 +16,10 @@ function show() {
   return render(<IntlProvider locale="zh-TW" messages={{ 'setup.title': '設定清單', 'setup.progress': '已完成 {done} / {total}', 'setup.dismiss': '暫時隱藏', 'setup.open': '開啟清單' }}><MemoryRouter><SetupChecklistCard /></MemoryRouter></IntlProvider>);
 }
 describe('SetupChecklistCard', () => {
-  beforeEach(() => { vi.restoreAllMocks(); localStorage.clear(); state.allowed = true; state.data = { ...complete, tasks: 0 }; state.enabled.mockClear(); });
+  beforeEach(() => { vi.restoreAllMocks(); localStorage.clear(); state.allowed = true; state.data = { ...complete, skills: 0 }; state.enabled.mockClear(); });
   it('shows an unfinished checklist entry', () => {
     show();
-    expect(screen.getByText('已完成 8 / 9')).toBeInTheDocument();
+    expect(screen.getByText('已完成 7 / 8')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '開啟清單' })).toHaveAttribute('href', '/setup');
   });
   it('hides a completed checklist even when optional items are unfinished', () => {

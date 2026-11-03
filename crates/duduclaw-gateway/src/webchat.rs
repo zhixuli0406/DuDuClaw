@@ -249,6 +249,8 @@ pub enum ChatMessage {
         /// `mention_choices` only: the `@name` texts the user can pick.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         choices: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Server → Client: session info (sent on connect).
     #[serde(rename = "session_info")]
@@ -268,6 +270,11 @@ pub enum ChatMessage {
         /// leaves its session state untouched.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         refresh: bool,
+        /// Present only for dashboard users whose conversation partner is server-resolved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_agent: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assignment_error: Option<serde_json::Value>,
     },
 }
 
@@ -280,6 +287,7 @@ impl ChatMessage {
             message: message.into(),
             code: None,
             choices: None,
+            reason: None,
         }
     }
 
@@ -291,6 +299,7 @@ impl ChatMessage {
             message: message.into(),
             code: Some(code.to_string()),
             choices: None,
+            reason: None,
         }
     }
 
@@ -300,6 +309,7 @@ impl ChatMessage {
             message: message.into(),
             code: Some(code.to_string()),
             choices: Some(choices),
+            reason: None,
         }
     }
 }
@@ -316,6 +326,7 @@ const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一
 /// Machine code of [`NO_REPLY_TEXT`] for clients that word it themselves.
 const NO_REPLY_CODE: &str = "no_reply";
 mod route;
+pub(crate) mod access;
 
 /// A file attachment uploaded through the WebChat socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,24 +393,8 @@ fn resolve_agent_acl(snapshot: &Result<AclSnapshot, String>, agent_name: &str) -
     }
 }
 
-/// C-ACL resume gap (P0-S2, 2026-08 audit follow-up): wave one (`acl_allows_agent`
-/// above) only gated an EXPLICIT `agent` field on a `user_message`. Resuming a
-/// stored session — a `session_id` naming a past session, with no `agent`
-/// field (or one that already matches, per the identity guard) on that turn —
-/// adopted the session's stored agent straight from `SessionManager` with no
-/// re-check at all: a user unbound from a non-default agent could keep
-/// talking to it forever through an old session id, because the 60s
-/// `ACL_CACHE_TTL` staleness bound wave one relies on was never consulted on
-/// this path.
-///
-/// This predicate answers "does resuming into `stored_agent` need the same
-/// `agent_access_allowed` check wave one already applies to explicit
-/// selection?" Session storage has no "the user explicitly chose this agent"
-/// flag, so the criterion is the best available proxy: `stored_agent !=
-/// default_agent`. The main/default-agent resume path (`stored_agent ==
-/// default_agent`) is wave one's byte-compatible scope and MUST stay
-/// ungated here — widening the check to the default agent is explicitly out
-/// of scope for this fix.
+/// Additional legacy resume check. Dashboard non-admins always pass through
+/// `authorize_target` first, including the default/main session branch.
 fn resume_needs_acl_check(stored_agent: &str, default_agent: &str) -> bool {
     stored_agent != default_agent
 }
@@ -898,10 +893,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
             .unwrap_or_default()
     };
 
-    // Send session info on connect — the same frame the WP3 resume path echoes
-    // (`agent = None` ⇒ the main/default agent), so the two stay byte-identical.
+    // Admin/widget hello keeps the legacy frame; other dashboard accounts
+    // receive their resolved partner without creating a session.
     let session_id = format!("webchat:{user_id}");
-    let info_msg = build_session_info_frame(&state, &session_id, None).await;
+    let info_msg = access::user_session_info(&state, &session_id, None, &auth_user).await;
     if let Ok(json) = serde_json::to_string(&info_msg) {
         let _ = sink.send(Message::Text(json.into())).await;
     }
@@ -971,8 +966,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                         if recovery.closed() { let _ = sink.send(Message::Close(None)).await; break; }
                         continue;
                     }
-                    let mut info = build_session_info_frame(
-                        &state, &announced_sid, announced_agent.as_deref(),
+                    let mut info = access::user_session_info(
+                        &state, &announced_sid, announced_agent.as_deref(), &auth_user,
                     ).await;
                     if let ChatMessage::SessionInfo { ref mut refresh, .. } = info {
                         *refresh = true;
@@ -1125,8 +1120,12 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         // "unbind but JWT keeps stale
                                         // access_levels" staleness window to
                                         // `ACL_CACHE_TTL` instead of the JWT's full
-                                        // lifetime. The default (no `agent` field)
-                                        // path below is untouched — out of scope.
+                                        // lifetime. The default path below resolves
+                                        // non-admins from their current assignment.
+                                        if let Err(frame) = state.authorize_target(&auth_user, name, false).await {
+                                            sink.frame(frame).await;
+                                            continue;
+                                        }
                                         if !state.agent_access_allowed(&auth_user, name).await {
                                             warn!(
                                                 user = %auth_user, agent = %name,
@@ -1217,6 +1216,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                                     match state.ctx.session_manager.session_agent(&want).await {
                                         Ok(Some(stored_agent)) => {
+                                            if let Err(frame) = state.authorize_target(&auth_user, &stored_agent, true).await {
+                                                sink.frame(frame).await;
+                                                continue;
+                                            }
                                             // Identity guard: a named agent must own
                                             // the resumed session.
                                             if let Some(a) = &requested_agent {
@@ -1250,26 +1253,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                     }
                                                     continue;
                                                 }
-                                                // ── C-ACL resume gap (P0-S2, 2026-08
-                                                // audit follow-up): wave one only
-                                                // gated an EXPLICIT `agent` field —
-                                                // adopting a stored session's
-                                                // non-default agent on resume never
-                                                // ran `agent_access_allowed` at all,
-                                                // so a since-unbound user could keep
-                                                // talking to it forever through an
-                                                // old session id. Re-run the same
-                                                // fail-closed, 60s-cached check here
-                                                // (`resume_needs_acl_check` scopes it
-                                                // to non-default agents only — the
-                                                // default/main agent branch above is
-                                                // untouched, matching wave one).
-                                                // Same predicate as the `@` list
-                                                // (`agents.callable`): an employee the
-                                                // account may still call by `@` — a
-                                                // binding, a team grant, this
-                                                // conversation's default employee or a
-                                                // public one — resumes.
+                                                // Non-admin main/default targets were refused above;
+                                                // retain the existing extra resume check for other agents.
                                                 if resume_needs_acl_check(&stored_agent, &agent_id)
                                                     && !state
                                                         .may_resume_into(&auth_user, &stored_agent, &want, &user_id)
@@ -1298,8 +1283,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             // Echo the effective session so the
                                             // client can confirm the resume took and
                                             // refresh the header to the owning agent.
-                                            let info = build_session_info_frame(
-                                                &state, sid, effective_agent.as_deref(),
+                                            let info = access::user_session_info(
+                                                &state, sid, effective_agent.as_deref(), &auth_user,
                                             )
                                             .await;
                                             if let Ok(json) = serde_json::to_string(&info) {
@@ -1325,6 +1310,16 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         }
                                     }
                                 } else {
+                                    if effective_agent.is_none() {
+                                        match state.resolve_new_agent(&auth_user).await {
+                                            Ok(agent) => effective_agent = agent,
+                                            Err(reason) => {
+                                                sink.frame(access::user_session_info(&state, &session_id, None, &auth_user).await).await;
+                                                sink.frame(access::assignment_error(reason)).await;
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     // New / continue the current connection's
                                     // session. Compose the per-agent, per-conversation
                                     // session id — this id IS the isolation boundary
@@ -1341,7 +1336,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // employee the account may use, for this message
                                 // only; a forbidden call is refused here, before
                                 // any model call. The
-                                // default employee stays reachable by everyone.
+                                // main employee remains Admin-only.
                                 // Chat commands keep the selected employee.
                                 // The message an armed `/交辦 @name` was waiting
                                 // for becomes that task (rights checked again).
@@ -1395,6 +1390,21 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     sid
                                 };
                                 let effective_agent: Option<String> = routed.agent;
+                                if let Err(frame) = state.authorize_target(
+                                    &auth_user, effective_agent.as_deref().unwrap_or(&agent_id), true,
+                                ).await {
+                                    sink.frame(frame).await;
+                                    continue;
+                                }
+                                if !is_widget_visitor(&auth_user)
+                                    && !matches!(state.acl_snapshot(&auth_user).await, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin)
+                                {
+                                    let mut info = access::user_session_info(&state, sid, effective_agent.as_deref(), &auth_user).await;
+                                    if let ChatMessage::SessionInfo { refresh, .. } = &mut info { *refresh = true; }
+                                    sink.frame(info).await;
+                                    announced_sid = sid.to_owned();
+                                    announced_agent = effective_agent.clone();
+                                }
 
                                 // The agent id used for chat-command handling /
                                 // contract enforcement — the routed agent when one
@@ -1560,6 +1570,8 @@ async fn build_session_info_frame(
         supports_vision,
         model: model_id,
         refresh: false,
+        resolved_agent: None,
+        assignment_error: None,
     }
 }
 

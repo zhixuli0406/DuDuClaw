@@ -5512,7 +5512,7 @@
   "channelLink.openIn": "在 {channel} 中開啟",
   "webchat.suggest.1": "今天有哪些待辦？",
   "webchat.suggest.2": "幫我整理這週的重點",
-  "webchat.suggest.3": "交辦一個任務給員工",
+  "webchat.suggest.3": "幫我想想下一步",
   "console.advancedAria": "前往應用程式與設定",
   "console.hero.title": "用一句話操作這台機器",
   "console.hero.subtitle": "查狀態、建員工、交辦任務——通通用說的就可以",
@@ -9605,5 +9605,12 @@
   "setup.section.capabilities": "能力",
   "setup.section.start": "開始",
   "sidebar.primaryAgent": "主要",
-  "sidebar.setPrimaryAgent": "設為主要"
+  "sidebar.setPrimaryAgent": "設為主要",
+  "webchat.assignment.title": "對話對象尚未設定",
+  "webchat.assignment.loading": "正在確認可以為你服務的 AI 員工…",
+  "webchat.assignment.none": "目前沒有可使用的 AI 員工，請聯絡管理員指派。",
+  "webchat.assignment.multiple": "你可以使用多位 AI 員工，請先在側欄「AI 員工」的 ⋯ 選單選擇「設為主要」，再開啟新對話。如果找不到此選項，請聯絡管理員。",
+  "webchat.assignment.mainAdminOnly": "這個對話屬於管理員專用的 AI 助理，無法繼續。請開啟新對話，與指派給你的 AI 員工交談。",
+  "webchat.assignment.forbidden": "你目前無法與這位 AI 員工交談。請開啟新對話，或聯絡管理員確認指派。",
+  "webchat.assignment.unavailable": "目前無法確認可用的 AI 員工，請稍後開啟新對話重試；如果持續發生，請聯絡管理員。"
 }

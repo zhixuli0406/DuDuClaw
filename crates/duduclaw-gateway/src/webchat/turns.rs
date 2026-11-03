@@ -497,6 +497,9 @@ async fn execute_inner(input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
         &ticket.cancel,
         input.resume_acl,
         async {
+            if state.authorize_target(&input.auth_user, &agent, true).await.is_err() {
+                return false;
+            }
             match &input.requested_agent {
                 Some(agent) => state.agent_access_allowed(&input.auth_user, agent).await,
                 None => true,
@@ -505,7 +508,7 @@ async fn execute_inner(input: TurnInput, sink: TurnSink, ticket: &mut Ticket) {
         state.may_resume_into(&input.auth_user, &agent, &sid, &input.user_id),
     ).await;
     if !ticket.cancel.is_cancelled() && !allowed {
-        sink.frame(ChatMessage::error_coded("Agent access revoked", "agent_forbidden")).await;
+        sink.frame(ChatMessage::error_coded("你已無法與此 AI 員工對話，請開啟新對話或聯絡管理員。", "agent_forbidden")).await;
         return;
     }
     // Keep the large model/reply future out of the nested cancellation state

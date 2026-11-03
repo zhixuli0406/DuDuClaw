@@ -6,14 +6,14 @@ import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { GalleryPage } from './GalleryPage';
-import { readAssignPrefill, type AssignPrefill } from '@/lib/assign-entry';
+
 import type { GalleryCard } from '@/lib/api';
 
-/** What the /assign page received as its seed. */
-let landedPrefill: AssignPrefill | null = null;
-function AssignProbe() {
-  landedPrefill = readAssignPrefill(useLocation().state);
-  return <div>assign-page-probe</div>;
+/** Text delivered to the new chat composer. */
+let landedDraft: string | undefined;
+function ChatProbe() {
+  landedDraft = (useLocation().state as { draft?: string } | null)?.draft;
+  return <div>chat-page-probe</div>;
 }
 
 function renderPage() {
@@ -23,7 +23,7 @@ function renderPage() {
         <Routes>
           <Route path="/gallery" element={<GalleryPage />} />
           <Route path="/experts" element={<div>experts-page-probe</div>} />
-          <Route path="/assign" element={<AssignProbe />} />
+          <Route path="/chat" element={<ChatProbe />} />
         </Routes>
       </MemoryRouter>
     </IntlProvider>,
@@ -72,7 +72,7 @@ function mockGallery(res: {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  landedPrefill = null;
+  landedDraft = undefined;
 });
 
 describe('GalleryPage — curated inspiration gallery (P2-b MVP)', () => {
@@ -105,7 +105,7 @@ describe('GalleryPage — curated inspiration gallery (P2-b MVP)', () => {
     expect(await screen.findByText('experts-page-probe')).toBeInTheDocument();
   });
 
-  it('opens the 交辦任務 page prefilled from the example when the team is already installed', async () => {
+  it('opens a new chat draft from the example when the team is already installed', async () => {
     mockGallery({ deployed: true, unlocked: true, present_but_locked: false, cards: [installedCard] });
     renderPage();
     const user = userEvent.setup();
@@ -113,16 +113,11 @@ describe('GalleryPage — curated inspiration gallery (P2-b MVP)', () => {
     const remakeButton = await screen.findByRole('button', { name: /Make my own version/i });
     await user.click(remakeButton);
 
-    expect(await screen.findByText('assign-page-probe')).toBeInTheDocument();
-    const prefill = landedPrefill;
-    expect(prefill?.agentId).toBe('clinic-assistant');
-    expect(prefill?.mode).toBe('assign');
-    // Description is the example rewritten into an editable template, not the
-    // bare example string verbatim.
-    expect(prefill?.description).toContain('產出本月自費請款通知，逐筆核對系統金額');
-    expect(prefill?.description).not.toBe(installedCard.example);
-    // Acceptance criteria is outcome-shaped and references the same example.
-    expect(prefill?.acceptanceCriteria).toContain('產出本月自費請款通知，逐筆核對系統金額');
+    expect(await screen.findByText('chat-page-probe')).toBeInTheDocument();
+    expect(landedDraft).toContain('產出本月自費請款通知，逐筆核對系統金額');
+    expect(landedDraft).not.toBe(installedCard.example);
+    expect(landedDraft).toBe([en['gallery.remake.description'], en['gallery.remake.acceptance']]
+      .map(text => text.replace('{example}', installedCard.example)).join('\n\n'));
   });
 
   it('shows the license upsell message when the gallery is deployed but locked', async () => {

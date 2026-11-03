@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router';
@@ -523,7 +524,8 @@ export function AppSidebar() {
   const intl = useIntl();
   const openAssign = useOpenAssign();
   // On the 交辦任務 page the primary button reads as the current page.
-  const onAssign = useLocation().pathname === ASSIGN_PATH;
+  const pathname = useLocation().pathname;
+  const onAssign = !TASK_ENTRY_POINTS_HIDDEN && pathname === ASSIGN_PATH;
   const { state, isMobile } = useSidebar();
   const collapsed = state === 'collapsed' && !isMobile;
 
@@ -584,7 +586,8 @@ export function AppSidebar() {
   const orgItems = filterVisible(navGroups[3].items, user?.role, isPersonal, ctx);
   // The daily row is shared by both editions; Personal adds a second flat row
   // BELOW the 對話紀錄 zone so the zone lands where 對話 used to sit.
-  const dailyRow = filterVisible(employee ? employeeNavItems(employeeTasks) : dailyItems, user?.role, isPersonal, ctx);
+  const dailyRow = filterVisible(employee ? employeeNavItems(employeeTasks) : dailyItems, user?.role, isPersonal, ctx)
+    .filter((item) => !TASK_ENTRY_POINTS_HIDDEN || item.action !== 'newConversation');
   const personalRow = filterVisible(personalPrimaryItems, user?.role, isPersonal, ctx);
   const advancedItems = filterVisible(personalAdvancedGroup.items, user?.role, isPersonal, ctx);
 
@@ -615,27 +618,17 @@ export function AppSidebar() {
       <SidebarHeader>
         <CompanySwitcher collapsed={collapsed} employee={employee} />
         {employee && <SearchTrigger collapsed={collapsed} />}
-        {/* UX plan I-1a: the primary action is 交辦任務 and it belongs to BOTH
-            editions. The 2026-07-29 "hide work-management chrome on Personal"
-            round took this button down with the task board, which left the
-            edition aimed at non-technical users with no primary action at all;
-            it also used to route to the board's `?new=1` create-a-card intent,
-            which never starts the autonomous loop. It now opens the 交辦任務
-            page (`/assign`). The search trigger USED to be Personal-hidden — I-5
-            (2026-08-16) restores it: ⌘K still worked via the global keyboard
-            shortcut on Personal, but there was no discoverable entry point
-            for a mouse/touch user, which is precisely the "個人版恢復搜尋觸發
-            器" gap the I-5 design brief called out. Same component, both
-            editions now. */}
+        {/* The primary button owns the single new-conversation entry. */}
         {collapsed ? (
           <Button
             variant="brand"
             size="icon"
             className={cn('mx-auto', onAssign && 'ring-2 ring-brand/40 ring-offset-1 ring-offset-sidebar')}
+            data-tour="nav:/chat"
             onClick={() => openAssign()}
             aria-current={onAssign ? 'page' : undefined}
-            title={intl.formatMessage({ id: 'sidebar.newTask' })}
-            aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
+            title={intl.formatMessage({ id: chatEntryLabel('sidebar.newTask') })}
+            aria-label={intl.formatMessage({ id: chatEntryLabel('sidebar.newTask') })}
           >
             <Plus />
           </Button>
@@ -643,11 +636,12 @@ export function AppSidebar() {
           <Button
             variant="brand"
             className={cn('w-full', onAssign && 'ring-2 ring-brand/40 ring-offset-1 ring-offset-sidebar')}
+            data-tour="nav:/chat"
             onClick={() => openAssign()}
             aria-current={onAssign ? 'page' : undefined}
           >
             <Plus />
-            {intl.formatMessage({ id: 'sidebar.newTask' })}
+            {intl.formatMessage({ id: chatEntryLabel('sidebar.newTask') })}
           </Button>
         )}
         {!employee && <SearchTrigger collapsed={collapsed} />}

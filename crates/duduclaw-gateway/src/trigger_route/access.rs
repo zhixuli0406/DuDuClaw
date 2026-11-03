@@ -42,6 +42,14 @@ pub enum Sender {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderAccess {
     pub sender: Sender,
+    /// Set only by WebChat; other channels retain their existing policy.
+    pub webchat_scope: Option<WebChatScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebChatScope {
+    pub default_agent: String,
+    pub available: bool,
 }
 
 impl SenderAccess {
@@ -49,6 +57,7 @@ impl SenderAccess {
     pub fn unmapped() -> Self {
         Self {
             sender: Sender::Unmapped,
+            webchat_scope: None,
         }
     }
 
@@ -65,7 +74,7 @@ impl SenderAccess {
                 access,
             }
         };
-        Self { sender }
+        Self { sender, webchat_scope: None }
     }
 
     /// An account that may call only what everyone may (unknown, inactive
@@ -76,13 +85,36 @@ impl SenderAccess {
                 user_id: user_id.to_string(),
                 access: Arc::new(empty_access(user_id, 0)),
             },
+            webchat_scope: None,
         }
+    }
+
+    pub(crate) fn for_webchat(mut self, default_agent: Result<String, String>) -> Self {
+        self.webchat_scope = Some(WebChatScope {
+            available: default_agent.is_ok(),
+            default_agent: default_agent.unwrap_or_default(),
+        });
+        self
+    }
+
+    pub(crate) fn webchat_allows(&self, agent: &LoadedAgent) -> bool {
+        if matches!(self.sender, Sender::Admin { .. }) {
+            return true;
+        }
+        self.webchat_scope.as_ref().is_none_or(|scope| {
+            scope.available
+                && agent.config.agent.role != duduclaw_core::types::AgentRole::Main
+                && agent.config.agent.name != scope.default_agent
+        })
     }
 
     /// Why this sender may call `agent` in a conversation whose default
     /// employee is `fallback`, or `None` when they may not. A binding or a
     /// team grant is reported before the "open to everyone" sources.
     pub fn grant(&self, agent: &LoadedAgent, fallback: Option<&str>) -> Option<GrantSource> {
+        if !self.webchat_allows(agent) {
+            return None;
+        }
         if crate::machine_employee::requires_admin(agent)
             && !matches!(self.sender, Sender::Admin { .. })
         {

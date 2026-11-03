@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import { client } from '@/lib/ws-client';
 import { parseTomlSubset, tomlStr } from '@/lib/config-toml';
 
@@ -42,9 +43,9 @@ export const setupItems: readonly SetupItem[] = [
   { id: 'permissions', label: 'setup.permissions', to: '/manage/users', section: 'people', check: d => d.users == null ? d.users : d.users.filter(u => u.role === 'employee').every(u => u.bindings.length > 0) },
   { id: 'skills', label: 'setup.skills', to: '/skills', section: 'capabilities', check: d => positive(d.skills) },
   { id: 'routines', label: 'setup.routines', to: '/routines', section: 'capabilities', optional: true, check: d => positive(d.routines) },
-  { id: 'tasks', label: 'setup.tasks', to: '/assign', section: 'start', check: d => positive(d.tasks) },
+  ...(!TASK_ENTRY_POINTS_HIDDEN ? [{ id: 'tasks', label: 'setup.tasks', to: '/assign', section: 'start' as const, check: (d: SetupData) => positive(d.tasks) }] : []),
 ];
-export const setupSections: readonly SetupSection[] = ['company', 'people', 'capabilities', 'start'];
+export const setupSections: readonly SetupSection[] = ['company', 'people', 'capabilities', ...(!TASK_ENTRY_POINTS_HIDDEN ? ['start' as const] : [])];
 export function setupProgress(data: SetupData) {
   const required = setupItems.filter(item => !item.optional);
   return { done: required.filter(item => item.check(data) === true).length, total: required.length };

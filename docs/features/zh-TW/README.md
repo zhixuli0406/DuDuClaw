@@ -71,7 +71,7 @@
 | 64 | [思考過程顯示](64-thinking-display.md) | WebChat 對每個 runtime 都顯示即時思考計時；登入的 dashboard 使用者可看遮蔽、截短後的思考摘要；通訊軟體永遠收不到 |
 | 65 | [思考內容從哪裡來](65-thinking-sources.md) | 哪些 runtime 會回報思考（Claude CLI、Codex、OpenAI 相容 API、Anthropic Direct API）、各顯示什麼、請求什麼時候會改 |
 | 66 | [通訊軟體的思考顯示](66-thinking-in-messaging-apps.md) | Telegram、Discord、Slack、Teams、LINE 等平台上的計時與遮蔽後摘要；`[thinking] channel_audience`／`channel_group_display` |
-| 67 | [在聊天裡交辦任務](67-assigning-tasks.md) | `/交辦 @員工 任務`（`/assign`）以發話者名義建立目標任務，只能交辦給有權限的員工；進度回到原對話；`/交辦 狀態`；「目標」頁的「我交辦的」；dashboard 交辦任務頁（`/assign`：交辦技能或完整表單，可附檔） |
+| 67 | [在聊天裡交辦任務](67-assigning-tasks.md) | `/交辦 @員工 任務`（`/assign`）以發話者名義建立目標任務，只能交辦給有權限的員工；進度回到原對話；`/交辦 狀態`；「目標」頁的「我交辦的」；dashboard 交辦入口改開新對話，任務頁仍可透過直接連結開啟 |
 | 69 | [資料外送防護](69-egress-guard.md) | v1.77.0：每回合 MCP 私人讀取紀錄、外送核准與常設授權限制 |
 | 70 | [對話憑證稽核](70-credential-audit.md) | 憑證中繼資料、依路由登錄持有者、遮罩與 Admin 查閱 |
 

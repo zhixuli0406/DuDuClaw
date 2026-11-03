@@ -1,3 +1,4 @@
+import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Radar, Target, ArrowRight } from 'lucide-react';
@@ -829,11 +830,9 @@ export function ForesightPage() {
               ))}
             </SelectContent>
           </Select>
-          {/* UX plan I-1a: same verb, same panel. This used to only hop to
-              /goals and leave the user to find the assign button there. */}
           <Button variant="outline" size="sm" onClick={() => openAssign()}>
             <Target className="size-3.5" />
-            {intl.formatMessage({ id: 'foresight.assignGoal' })}
+            {intl.formatMessage({ id: chatEntryLabel('foresight.assignGoal') })}
           </Button>
         </div>
       </div>

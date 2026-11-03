@@ -5512,7 +5512,7 @@
   "channelLink.openIn": "Open in {channel}",
   "webchat.suggest.1": "What's on my plate today?",
   "webchat.suggest.2": "Summarize this week's highlights",
-  "webchat.suggest.3": "Assign a task to a staff member",
+  "webchat.suggest.3": "Help me plan my next step",
   "console.advancedAria": "Open apps & settings",
   "console.hero.title": "Run this machine with a single sentence",
   "console.hero.subtitle": "Check status, hire AI staff, hand off tasks — just say it",
@@ -9605,5 +9605,12 @@
   "setup.section.capabilities": "Capabilities",
   "setup.section.start": "Start",
   "sidebar.primaryAgent": "Primary",
-  "sidebar.setPrimaryAgent": "Set as primary"
+  "sidebar.setPrimaryAgent": "Set as primary",
+  "webchat.assignment.title": "Choose a primary AI staff member",
+  "webchat.assignment.loading": "Checking which AI staff member can help you…",
+  "webchat.assignment.none": "No AI staff member is available to you. Ask an administrator to assign one.",
+  "webchat.assignment.multiple": "You have access to several AI staff members. In the sidebar’s AI staff section, open a staff member’s ⋯ menu and choose Set as primary, then start a new conversation. If that option is unavailable, contact an administrator.",
+  "webchat.assignment.mainAdminOnly": "This conversation belongs to the administrator-only AI assistant and cannot be continued. Start a new conversation with your assigned AI staff member.",
+  "webchat.assignment.forbidden": "You can no longer chat with this AI staff member. Start a new conversation or ask an administrator to check your assignment.",
+  "webchat.assignment.unavailable": "We cannot check your available AI staff right now. Start a new conversation to retry shortly, or contact an administrator if this continues."
 }

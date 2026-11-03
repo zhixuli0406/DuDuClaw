@@ -1,3 +1,4 @@
+import { isTaskEntryVisible } from '@/lib/task-entry-visibility';
 import type { UserRole } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
 
@@ -36,5 +37,5 @@ const STEPS: ReadonlyArray<TourStep> = [
 
 /** The tour stops the given role can actually reach, in order. */
 export function visibleTourSteps(role: UserRole | undefined): TourStep[] {
-  return STEPS.filter((s) => hasMinRole(role, s.minRole));
+  return STEPS.filter((s) => isTaskEntryVisible(s.route) && hasMinRole(role, s.minRole));
 }

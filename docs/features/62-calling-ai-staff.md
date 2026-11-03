@@ -51,9 +51,11 @@ A dashboard account (signed in to WebChat, or a messaging-app sender linked to o
 
 **In a group chat everyone sees the answer.** A linked member who calls an employee bound to their account in a LINE or Telegram group gets the answer in the group, where every member can read it. Bind restricted employees to people with that in mind, or have them use a one-to-one chat.
 
+Website WebChat widget visitors keep the server-selected default employee. They cannot switch employees through `@` or trigger words; this restriction does not change Odoo Live Chat or other messaging channels.
+
 ## The `@` list
 
-- **WebChat**: typing `@` in the message box opens a list of the employees you may call (avatar, name, department). The list comes from `agents.callable`, the same rule every message is checked against; when it has more than one source it is split into **My AI staff**, **My team: <name>'s AI staff** and **Public AI staff**. The staff strip above the conversation includes team employees too. It filters as you type; arrow keys move, Enter or Tab inserts `@name `, Escape closes it. Each reply from an employee other than the one you are talking to is labelled with who answered.
+- **WebChat**: typing `@` in the message box opens a list of the employees you may call (avatar, name, department). The list comes from `agents.callable`, the same rule every message is checked against; when it has more than one source it is split into **My AI staff**, **My team: <name>'s AI staff** and **Public AI staff**. The staff strip remains available to Admins; non-Admins do not see it, and their callable list excludes the main-role and gateway-default employees. New conversations use the server-resolved primary or sole callable non-main employee. It filters as you type; arrow keys move, Enter or Tab inserts `@name `, Escape closes it. Each reply from an employee other than the one you are talking to is labelled with who answered.
 - **LINE**: send `@` alone (or `@` with part of a name) and the bot answers with the list as quick-reply buttons, at most 13 at a time; a longer list ends with a "more" button for the next page. Tapping a name sends `@name`.
 - **Telegram** (shared bot): the same list comes as inline buttons, or as text when no button fits.
 - Other channels answer with a text list.

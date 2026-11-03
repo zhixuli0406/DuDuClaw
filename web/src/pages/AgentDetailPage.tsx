@@ -1,3 +1,4 @@
+import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useParams } from 'react-router';
@@ -439,18 +440,13 @@ function AgentDetailPageContent() {
                 <MessageSquare />
                 {intl.formatMessage({ id: 'agentDetail.action.chat' })}
               </Button>
-              {/* UX plan I-1a: 交辦任務 on an employee opens the one shared
-                  panel with that employee preselected. It used to route to the
-                  board's create-a-card intent, so the most explicit "give this
-                  employee work" button in the app produced a passive card that
-                  never dispatched. */}
               <Button
                 variant="brand"
                 size="sm"
                 onClick={() => openAssign({ agentId: id })}
               >
                 <Plus />
-                {intl.formatMessage({ id: 'agentDetail.action.delegate' })}
+                {intl.formatMessage({ id: chatEntryLabel('agentDetail.action.delegate') })}
               </Button>
               <input
                 ref={avatarFileRef}
