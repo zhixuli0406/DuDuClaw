@@ -143,7 +143,7 @@ async fn queued_work_rechecks_even_internal_senders_and_record_mode() {
     }
     for principal in [None, Some(format!("user:{}", f.admin.user_id))] {
         let outcome = crate::delegation_gate::gate_bus_dispatch(
-            f.home.path(), &f.registry, None, None, "operator", "old-row", "bus_queue", principal.as_deref(),
+            f.home.path(), &f.registry, Some("cron"), None, "operator", "system-row", "bus_queue", principal.as_deref(),
         ).await;
         assert!(!matches!(outcome, crate::delegation_gate::GateOutcome::Deny(_)));
     }
@@ -394,4 +394,19 @@ async fn request_local_lookup_matches_individual_checks_and_parses_once() {
     std::fs::write(preset::bindings_path(f.home.path()), "schema = 1").unwrap();
     assert!(lookup.requires_admin("ordinary"));
     assert!(!requires_admin_for_id(f.home.path(), "ordinary"));
+}
+
+#[tokio::test]
+async fn specific_machine_refusal_requires_live_visibility() {
+    let f = fixture().await;
+    for user in [&f.employee, &f.manager] {
+        assert_eq!(refusal_for_known_target(f.home.path(), &user.user_id, "operator"), Some(REFUSAL));
+        assert_eq!(refusal_for_known_target(f.home.path(), &user.user_id, "ordinary"), None);
+        assert_eq!(refusal_for_known_target(f.home.path(), &user.user_id, "missing"), None);
+    }
+    assert_eq!(refusal_for_known_target(f.home.path(), &f.admin.user_id, "operator"), None);
+    let stranger = f.db.create_user("stranger@test.invalid", "Stranger", "Test-password-123!", UserRole::Employee).unwrap();
+    assert_eq!(refusal_for_known_target(f.home.path(), &stranger.id, "operator"), None);
+    f.db.unbind_agent(&f.employee.user_id, "operator").unwrap();
+    assert_eq!(refusal_for_known_target(f.home.path(), &f.employee.user_id, "operator"), None);
 }

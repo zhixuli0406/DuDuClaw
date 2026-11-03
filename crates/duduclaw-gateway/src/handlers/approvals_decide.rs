@@ -66,6 +66,45 @@ impl MethodHandler {
                 Ok(live) => live,
                 Err(_) => return WsFrame::error_response("", PERMISSION_DENIED),
             };
+            // Preserve the existing per-kind refusal before the general main
+            // gate. Identity revocation above still takes precedence.
+            let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
+            // List, get and live push use the same per-kind split:
+            // `approval_visibility::dashboard_only_reader`.
+            // U5: a request filed from an operator terminal (LINE inbox,
+            // continuous responsibilities, forget by source, computer
+            // workspaces) is decided only by a current Admin (role re-read
+            // from users.db, not the cached context). The kinds and their
+            // refusal texts come from one registry.
+            if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&r.action_kind) {
+                if crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
+                    .is_err()
+                {
+                    return WsFrame::error_response("", spec.admin_refusal);
+                }
+            }
+            // Decision Lab is admin-only. A manager who cannot inspect the
+            // exact synthetic run must not mint its human-inspection receipt.
+            // Role is re-read from users.db, same as list/get/push, not the
+            // handshake snapshot.
+            if r.action_kind == "support_pilot_review"
+                && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
+                    .is_err()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "synthetic pilot review requires an admin who can inspect Decision Lab",
+                );
+            }
+            if kind.requires_board()
+                && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
+                    .is_err()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "this approval kind requires board (admin) rights to decide",
+                );
+            }
             if !live.is_admin() {
                 // agent_id is NOT NULL, but legacy/unbound requests may store
                 // an empty string. Only a durable task owner can recover that
@@ -210,46 +249,6 @@ impl MethodHandler {
                 return self
                     .decide_knowledge_quarantine(&broker, &approval_id, rec, approve, ctx)
                     .await;
-            }
-        }
-        // Board-kind gate (WP17 invariant).
-        if let Some(rec) = &record {
-            let kind = crate::governance::ApprovalKind::parse(&rec.action_kind);
-            // List, get and live push use the same per-kind split:
-            // `approval_visibility::dashboard_only_reader`.
-            // U5: a request filed from an operator terminal (LINE inbox,
-            // continuous responsibilities, forget by source, computer
-            // workspaces) is decided only by a current Admin (role re-read
-            // from users.db, not the cached context). The kinds and their
-            // refusal texts come from one registry.
-            if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&rec.action_kind) {
-                if crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
-                    .is_err()
-                {
-                    return WsFrame::error_response("", spec.admin_refusal);
-                }
-            }
-            // Decision Lab is admin-only. A manager who cannot inspect the
-            // exact synthetic run must not mint its human-inspection receipt.
-            // Role is re-read from users.db, same as list/get/push, not the
-            // handshake snapshot.
-            if rec.action_kind == "support_pilot_review"
-                && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
-                    .is_err()
-            {
-                return WsFrame::error_response(
-                    "",
-                    "synthetic pilot review requires an admin who can inspect Decision Lab",
-                );
-            }
-            if kind.requires_board()
-                && crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
-                    .is_err()
-            {
-                return WsFrame::error_response(
-                    "",
-                    "this approval kind requires board (admin) rights to decide",
-                );
             }
         }
         // L1: a knowledge review past its deadline is a denial (TTL = DENY),
@@ -933,9 +932,10 @@ mod tests {
         let user = db
             .create_user("ada@example.com", "Ada", "fixture-password-only", UserRole::Admin)
             .unwrap();
-        let agent = home.path().join("agents/sales");
-        std::fs::create_dir_all(&agent).unwrap();
-        std::fs::write(agent.join("agent.toml"), "[agent]\nname = \"sales\"\nrole = \"specialist\"\n").unwrap();
+        // Both restrictions apply: board/pilot wording precedes main refusal.
+        crate::trigger_route::tests::write_agent(
+            &home.path().join("agents"), "sales", "Sales", "@sales", "main", "",
+        );
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         let ctx = claiming_admin(&user);
         let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();

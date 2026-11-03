@@ -4,10 +4,12 @@ fn ok(frame: &WsFrame) -> bool {
     matches!(frame, WsFrame::Response { ok: true, .. })
 }
 
-fn caller() -> UserContext {
-    let mut c = UserContext::admin_fallback();
-    c.user_id = "user-42".into();
-    c
+fn caller(home: &std::path::Path) -> UserContext {
+    let db = UserDb::new(&home.join("users.db")).unwrap();
+    let user = db.create_user(
+        "runtime-admin@test.invalid", "Runtime Admin", "isolated-test-password", UserRole::Admin,
+    ).unwrap();
+    db.live_user_context(&user.id).unwrap().unwrap()
 }
 
 fn provider_on_disk(home: &std::path::Path, agent: &str) -> Option<String> {
@@ -23,13 +25,14 @@ fn provider_on_disk(home: &std::path::Path, agent: &str) -> Option<String> {
 async fn create_rejects_removed_runtimes() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let ctx = caller(home.path());
     for removed in duduclaw_core::runtime_catalog::REMOVED_RUNTIMES {
         for field in ["provider", "fallback"] {
             let mut runtime = json!({"provider": "claude"});
             runtime[field] = json!(removed.id);
             let frame = handler.handle_agents_create_as(
                 json!({"name": "removed-agent", "display_name": "Removed", "runtime": runtime}),
-                Some(&caller()),
+                Some(&ctx),
             ).await;
             assert!(!ok(&frame), "{frame:?}");
             assert!(format!("{frame:?}").contains(removed.removed_in), "{frame:?}");
@@ -42,7 +45,7 @@ async fn create_rejects_removed_runtimes() {
 async fn update_rejects_removed_runtimes_without_rewriting_config() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    let ctx = caller();
+    let ctx = caller(home.path());
     assert!(ok(&handler.handle_agents_create_as(
         json!({"name": "upd", "display_name": "Upd", "runtime": {"provider": "claude"}}),
         Some(&ctx),
@@ -84,7 +87,7 @@ fn runtime_catalog_and_detect_rows_exclude_removed_clis() {
 async fn gemini_model_id_does_not_auto_align_to_a_cli() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    let ctx = caller();
+    let ctx = caller(home.path());
     assert!(ok(&handler.handle_agents_create_as(
         json!({"name": "claude-agent", "display_name": "C", "runtime": {"provider": "claude"}}),
         Some(&ctx),

@@ -25,17 +25,19 @@ impl Fixture {
             ("main", "main", ""), ("sales", "worker", "main"),
             ("configured", "worker", "main"),
         ] {
-            let dir = home.path().join("agents").join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("agent.toml"), format!(
-                "[agent]\nname = '{name}'\nrole = '{role}'\nstatus = 'active'\nreports_to = '{reports_to}'\ndepartment = 'sales'\n",
-            )).unwrap();
+            crate::trigger_route::tests::write_agent(&home.path().join("agents"),
+                name, name, "", role, "");
+            let path = home.path().join("agents").join(name).join("agent.toml");
+            let raw = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(path, raw.replace("reports_to = \"\"",
+                &format!("reports_to = \"{reports_to}\"\ndepartment = \"sales\""))).unwrap();
         }
         std::fs::write(home.path().join("config.toml"), format!(
             "[general]\ndefault_agent = 'configured'\n[dispatch]\nenabled = true\n[delegation]\npolicy = 'department'\nhuman_principal = '{mode}'\n",
         )).unwrap();
         let mut registry = AgentRegistry::new(home.path().join("agents"));
         registry.scan().await.unwrap();
+        assert_eq!(registry.list().len(), 3, "principal fixtures must load");
         Self { home, registry: Arc::new(RwLock::new(registry)),
             employee: format!("user:{employee}"), admin: format!("user:{admin}") }
     }
@@ -135,12 +137,9 @@ async fn mapped_channel_accounts_obey_main_gate_unmapped_senders_keep_existing_p
 async fn delegation_rechecks_role_after_queue_authorization_before_runtime() {
     let f = Fixture::new("record").await;
     let target = format!("sales-race-{}", uuid::Uuid::new_v4().simple());
-    let dir = f.home.path().join("agents").join(&target);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("agent.toml");
-    std::fs::write(&path, format!(
-        "[agent]\nname = '{target}'\nrole = 'worker'\nstatus = 'active'\n",
-    )).unwrap();
+    crate::trigger_route::tests::write_agent(&f.home.path().join("agents"),
+        &target, &target, "", "worker", "");
+    let path = f.home.path().join("agents").join(&target).join("agent.toml");
     f.registry.write().await.scan().await.unwrap();
     let queue = Arc::new(MessageQueue::open(f.home.path()).unwrap());
     let row = f.message(Some(&f.employee), &target, "cron");
@@ -153,7 +152,7 @@ async fn delegation_rechecks_role_after_queue_authorization_before_runtime() {
     }, async {
         barrier.arrived.wait().await;
         let raw = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(path, raw.replace("role = 'worker'", "role = 'main'")).unwrap();
+        std::fs::write(path, raw.replace("role = \"worker\"", "role = \"main\"")).unwrap();
         f.registry.write().await.scan().await.unwrap();
         barrier.release.wait().await;
     });
@@ -219,4 +218,127 @@ async fn taskspec_restores_principal_for_every_step_and_keeps_legacy_background(
         assert_eq!(spec.status, TaskStatus::Completed);
     }
     crate::model_call_probe::set_dry_run(false);
+}
+
+#[tokio::test]
+async fn handwritten_queues_without_sender_or_principal_are_refused_and_audited() {
+    for mode in ["record", "enforce"] {
+        let f = Fixture::new(mode).await;
+        let queue = Arc::new(MessageQueue::open(f.home.path()).unwrap());
+        crate::model_call_probe::set_dry_run(true);
+        let before = crate::model_call_probe::calls();
+        for target in ["main", "configured", "default"] {
+            for blank in [false, true] {
+                let id = uuid::Uuid::new_v4().to_string();
+                // Deliberately bypass every producer and enqueue API. SQLite's
+                // legacy sender column is NOT NULL, so the absent identity is "".
+                let conn = rusqlite::Connection::open(f.home.path().join("message_queue.db")).unwrap();
+                conn.execute(
+                    "INSERT INTO message_queue(id,sender,target,payload,created_at,sender_agent,origin_agent)
+                     VALUES (?1,'',?2,'work',?3,?4,?4)",
+                    rusqlite::params![id, target, Utc::now().to_rfc3339(), blank.then_some("  ")],
+                ).unwrap();
+                drop(conn);
+                poll_and_dispatch_sqlite(&queue, f.home.path(), &f.registry, None, None).await.unwrap();
+                assert_eq!(queue.get_by_id(&id).await.unwrap().unwrap().status, MessageStatus::Failed);
+                let mut bus = serde_json::json!({"type":"agent_message", "message_id":id,
+                    "agent_id":target, "payload":"work", "timestamp":Utc::now().to_rfc3339()});
+                if blank {
+                    bus["sender_agent"] = serde_json::json!("  ");
+                    bus["origin_agent"] = serde_json::json!("");
+                }
+                std::fs::write(f.home.path().join("bus_queue.jsonl"), format!("{bus}\n")).unwrap();
+                poll_and_dispatch(f.home.path(), &f.registry, None, None).await.unwrap();
+                let output = std::fs::read_to_string(f.home.path().join("bus_queue.jsonl")).unwrap();
+                let response: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+                assert_eq!(response["type"], "agent_response");
+                assert_eq!(response["in_reply_to"], id);
+            }
+        }
+        assert_eq!(crate::model_call_probe::calls(), before, "handwritten rows must never reach runtime");
+        crate::model_call_probe::set_dry_run(false);
+        let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
+        let denied: Vec<serde_json::Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["event_type"] == "delegation_denied").collect();
+        assert_eq!(denied.len(), 12);
+        assert!(denied.iter().all(|event| event["details"]["reason"] == "invalid_agent_id"));
+        for rail in ["bus_dispatch", "sqlite_queue"] {
+            assert_eq!(denied.iter().filter(|e| e["details"]["path_kind"] == rail).count(), 6);
+        }
+    }
+}
+
+#[tokio::test]
+async fn employee_sender_without_principal_cannot_borrow_system_origin_for_main() {
+    for mode in ["record", "enforce"] {
+        let f = Fixture::new(mode).await;
+        for policy in ["open", "department", "hierarchy"] {
+            let config = format!("[general]\ndefault_agent = 'configured'\n[delegation]\npolicy = '{policy}'\nhuman_principal = '{mode}'\n");
+            std::fs::write(f.home.path().join("config.toml"), config).unwrap();
+            for target in ["main", "configured", "default"] {
+                for (sender, origin) in [(Some("sales"), None), (Some("sales"), Some("cron")),
+                    (None, Some("sales")), (Some("  "), Some("sales")), (Some("a2a-client"), None)] {
+                    let result = crate::delegation_gate::gate_bus_dispatch(
+                        f.home.path(), &f.registry, sender, origin, target,
+                        "principal-free", "bus_dispatch", None,
+                    ).await;
+                    assert!(matches!(result, crate::delegation_gate::GateOutcome::Deny(_)),
+                        "{mode} {policy} {target} {sender:?} {origin:?}: {result:?}");
+                }
+                for sender in duduclaw_core::SYSTEM_SENDERS {
+                    let result = crate::delegation_gate::gate_bus_dispatch(
+                        f.home.path(), &f.registry, Some(sender), None, target,
+                        "system-background", "sqlite_queue", None,
+                    ).await;
+                    assert!(matches!(result, crate::delegation_gate::GateOutcome::Allow),
+                        "established system sender {sender}: {result:?}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn origin_only_background_queue_cannot_gain_system_authority_after_promotion() {
+    for promote_default in [false, true] {
+        let f = Fixture::new("record").await;
+        let target = format!("origin-race-{}", uuid::Uuid::new_v4().simple());
+        crate::trigger_route::tests::write_agent(&f.home.path().join("agents"),
+            &target, &target, "", "worker", "");
+        let path = f.home.path().join("agents").join(&target).join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace("reports_to = \"\"",
+            "reports_to = \"sales\"\ndepartment = \"sales\"")).unwrap();
+        f.registry.write().await.scan().await.unwrap();
+        let queue = Arc::new(MessageQueue::open(f.home.path()).unwrap());
+        let mut row = f.message(None, &target, "sales");
+        row.sender_agent = None;
+        // The generic sender column is not the delegation identity. It must
+        // not replace the admitted origin when the final runtime gate runs.
+        row.sender = "cron".into();
+        queue.enqueue(&row).await.unwrap();
+        let barrier = crate::responsibility::test_hooks::install("autonomy_dispatch_handoff", &target);
+        crate::model_call_probe::set_dry_run(true);
+        let before = crate::model_call_probe::calls();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(async {
+                poll_and_dispatch_sqlite(&queue, f.home.path(), &f.registry, None, None).await.unwrap();
+            }, async {
+                barrier.arrived.wait().await;
+                if promote_default {
+                    std::fs::write(f.home.path().join("config.toml"), format!(
+                        "[general]\ndefault_agent = '{target}'\n[dispatch]\nenabled = true\n",
+                    )).unwrap();
+                } else {
+                    let raw = std::fs::read_to_string(&path).unwrap();
+                    std::fs::write(&path, raw.replace("role = \"worker\"", "role = \"main\"")).unwrap();
+                    f.registry.write().await.scan().await.unwrap();
+                }
+                barrier.release.wait().await;
+            });
+        }).await.expect("admitted employee-origin row must reach the promotion seam");
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert_eq!(queue.get_by_id(&row.id).await.unwrap().unwrap().status, MessageStatus::Failed);
+        crate::model_call_probe::set_dry_run(false);
+    }
 }

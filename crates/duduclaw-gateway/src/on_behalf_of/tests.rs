@@ -267,13 +267,12 @@ fn public_trigger_reads_only_a_valid_agent_toml() {
 
 fn tree(home: &Path, policy: &str, mode: &str) -> std::sync::Arc<tokio::sync::RwLock<duduclaw_agent::registry::AgentRegistry>> {
     for (name, reports_to) in [("lead-bot", ""), ("sales", "lead-bot"), ("finance", "lead-bot")] {
-        let dir = home.join("agents").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("agent.toml"),
-            format!("[agent]\nname = \"{name}\"\nrole = \"worker\"\nreports_to = \"{reports_to}\"\ndepartment = \"ops\"\n"),
-        )
-        .unwrap();
+        crate::trigger_route::tests::write_agent(&home.join("agents"),
+            name, name, "", "worker", "");
+        let path = home.join("agents").join(name).join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, raw.replace("reports_to = \"\"",
+            &format!("reports_to = \"{reports_to}\"\ndepartment = \"ops\""))).unwrap();
     }
     std::fs::write(
         home.join("config.toml"),

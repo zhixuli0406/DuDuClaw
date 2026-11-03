@@ -234,6 +234,7 @@ async fn check_dispatch_sources(
     sender: Option<&str>, origin: Option<&str>,
 ) -> Result<(), String> {
     for source in [sender, origin].into_iter().flatten() {
+        let source = source.trim();
         if source.is_empty() || duduclaw_core::is_system_sender(source)
             || duduclaw_core::is_reserved_queue_sender(source) { continue; }
         check_autonomous_dispatch(home, registry, source).await?;
@@ -433,7 +434,9 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             credential_source: format!("message_queue:{}", msg.id),
             depth: msg.delegation_depth as u8,
             origin: msg.origin_agent.clone().unwrap_or_default(),
-            sender: msg.sender_agent.clone().unwrap_or_else(|| msg.sender.clone()),
+            sender: crate::delegation_gate::resolve_sender(
+                msg.sender_agent.as_deref(), msg.origin_agent.as_deref(),
+            ).unwrap_or_default().to_owned(),
             // SQLite queue rows do not carry hop_depth (no schema column); the
             // JSONL bus is the hop_depth-bearing rail. Seed from delegation_depth
             // so a SQLite-dispatched chain still inherits a non-resetting depth.
@@ -971,6 +974,17 @@ async fn poll_and_dispatch(
                     consumed_without_dispatch += 1;
                     continue;
                 }
+                // A stopped origin is terminal even if its carried identity is
+                // now revoked or malformed. Consume it before any admission
+                // refusal can create a reply to the already withdrawn turn.
+                // Keep the runtime fence below for cancellation after this read;
+                // unreadable fences still follow the existing error-reply path.
+                if let (Some(session), Some(turn)) = (&msg.session_id, &msg.turn_id) {
+                    if matches!(crate::approval::is_turn_cancelled(home_dir, session, turn).await, Ok(true)) {
+                        consumed_without_dispatch += 1;
+                        continue;
+                    }
+                }
                 if check_autonomous_dispatch(home_dir, registry, &msg.agent_id).await.is_err()
                     || check_dispatch_sources(home_dir, registry,
                         msg.sender_agent.as_deref(), msg.origin_agent.as_deref()).await.is_err() {
@@ -1233,7 +1247,9 @@ async fn poll_and_dispatch(
                 credential_source: format!("bus:{}", msg.message_id),
                 depth: msg.delegation_depth,
                 origin: msg.origin_agent.clone().unwrap_or_default(),
-                sender: msg.sender_agent.clone().unwrap_or_default(),
+                sender: crate::delegation_gate::resolve_sender(
+                    msg.sender_agent.as_deref(), msg.origin_agent.as_deref(),
+                ).unwrap_or_default().to_owned(),
                 hop_depth: msg.hop_depth,
             };
             // Best-effort typing indicator for the duration of the CLI run —
@@ -1672,9 +1688,21 @@ async fn dispatch_to_agent_outcome(
         {
             let reg = registry.read().await;
             if let Some(agent) = reg.get(agent_id) {
-                crate::on_behalf_of::access::check_loaded_main_target(
-                    home_dir, crate::on_behalf_of::current().as_deref(), agent,
-                ).await.map_err(DispatchError::Other)?;
+                if delegation.credential_source.starts_with("message_queue:")
+                    || delegation.credential_source.starts_with("bus:")
+                {
+                    let sender = crate::delegation_gate::resolve_sender(
+                        Some(&delegation.sender), Some(&delegation.origin),
+                    ).unwrap_or_default();
+                    crate::on_behalf_of::access::check_loaded_queue_main_target(
+                        home_dir, crate::on_behalf_of::current().as_deref(), agent,
+                        crate::delegation_gate::is_background_system_sender(sender),
+                    ).await.map_err(DispatchError::Other)?;
+                } else {
+                    crate::on_behalf_of::access::check_loaded_main_target(
+                        home_dir, crate::on_behalf_of::current().as_deref(), agent,
+                    ).await.map_err(DispatchError::Other)?;
+                }
                 crate::machine_employee::check_loaded(
                     home_dir, agent, crate::on_behalf_of::current().as_deref(),
                 ).map_err(DispatchError::Other)?;
@@ -4464,16 +4492,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agents = tmp.path().join("agents");
         for (name, department) in [("sales_rep", "業務"), ("mkt_rep", "行銷")] {
-            let dir = agents.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("agent.toml"),
-                format!(
-                    "[agent]\nname = \"{name}\"\nstatus = \"active\"\nrole = \"worker\"\n\
-                     reports_to = \"\"\ndepartment = \"{department}\"\n"
-                ),
-            )
-            .unwrap();
+            crate::trigger_route::tests::write_agent(&agents, name, name, "", "worker", "");
+            let path = agents.join(name).join("agent.toml");
+            let raw = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(path, raw.replace("reports_to = \"\"",
+                &format!("reports_to = \"\"\ndepartment = \"{department}\""))).unwrap();
         }
         tmp
     }
@@ -4580,6 +4603,7 @@ mod tests {
             let mut v = serde_json::json!({
                 "type": "agent_message", "message_id": id, "agent_id": agent, "payload": "look",
                 "timestamp": "2026-10-08T00:00:00Z", "delegation_depth": 0,
+                "sender_agent": "dashboard", "origin_agent": "dashboard",
             });
             if let Some(l) = lane {
                 v["lane"] = serde_json::json!(l);

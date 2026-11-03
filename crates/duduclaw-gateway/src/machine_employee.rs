@@ -125,6 +125,18 @@ pub(crate) fn check_loaded(home: &Path, agent: &LoadedAgent, principal: Option<&
     }
 }
 
+/// Preserve the machine-specific explanation only for an employee the live
+/// account can already see. Unknown targets retain the non-enumerating refusal.
+pub(crate) fn refusal_for_known_target(home: &Path, user_id: &str, target: &str) -> Option<&'static str> {
+    let principal = format!("user:{user_id}");
+    if check_target(home, target, Some(&principal)).is_ok() { return None; }
+    let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
+    let mut access = db.effective_access(user_id).ok().flatten()?;
+    if access.role == duduclaw_auth::UserRole::Admin { return None; }
+    if !crate::team_edition::team_grants_enabled(home) { access.team.clear(); }
+    access.may_call(target).then_some(REFUSAL)
+}
+
 /// Shared creation-time check for paths without an in-memory registry.
 /// Resolve exactly as AgentRegistry does, without trusting `[preset]` in agent.toml.
 pub(crate) fn check_target(home: &Path, target: &str, principal: Option<&str>) -> Result<(), String> {

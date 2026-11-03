@@ -37,10 +37,6 @@ pub(super) fn agent_unavailable() -> ChatMessage {
     ChatMessage::error_coded(AGENT_UNAVAILABLE_TEXT, "agent_unavailable")
 }
 
-fn main_refusal() -> ChatMessage {
-    ChatMessage::error_coded("此對話由主代理處理，僅管理員可以使用。請開啟新對話，與指派給你的 AI 員工交談。", "main_agent_admin_only")
-}
-
 impl WebChatState {
     /// None preserves the existing admin/widget default path byte for byte.
     pub(super) async fn resolve_new_agent(&self, user: &str) -> Result<Option<String>, &'static str> {
@@ -128,18 +124,18 @@ impl WebChatState {
     }
 
     /// Only call after ownership and the stored conversation partner were
-    /// verified. That known partner may retain the main-specific explanation.
+    /// verified. Stored partners use the same non-enumerating refusal.
     pub(super) async fn authorize_resume_target(&self, user: &str, agent: &str) -> Result<(), ChatMessage> {
-        self.authorize_target_inner(user, agent, true, true).await
+        self.authorize_target_inner(user, agent, true).await
     }
 
     /// Repeated before admission and after FIFO waiting. No default/public grant
     /// can turn a main agent into a callable dashboard target.
     pub(super) async fn authorize_target(&self, user: &str, agent: &str, public: bool) -> Result<(), ChatMessage> {
-        self.authorize_target_inner(user, agent, public, false).await
+        self.authorize_target_inner(user, agent, public).await
     }
 
-    async fn authorize_target_inner(&self, user: &str, agent: &str, public: bool, known_partner: bool) -> Result<(), ChatMessage> {
+    async fn authorize_target_inner(&self, user: &str, agent: &str, public: bool) -> Result<(), ChatMessage> {
         let denied = |reason: &str| {
             tracing::warn!(user, agent, reason, "WebChat target unavailable");
             agent_unavailable()
@@ -152,8 +148,7 @@ impl WebChatState {
         let reg = self.ctx.registry.read().await;
         let loaded = reg.get(agent).ok_or_else(|| denied("unknown_agent"))?;
         if !sender.webchat_allows(loaded) {
-            let frame = denied("main_agent_admin_only");
-            return Err(if known_partner { main_refusal() } else { frame });
+            return Err(denied("main_agent_admin_only"));
         }
         if !loaded.config.agent.status.is_operational()
             || !sender.may_call(loaded, None)

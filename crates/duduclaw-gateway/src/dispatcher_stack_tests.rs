@@ -136,7 +136,7 @@ async fn run_queued_wakes() {
             id: marker.into(), sender: crate::responsibility::HEARTBEAT_SENDER.into(),
             target: "prod-shaped".into(), payload: format!("[{marker} task_id={marker}] continue"),
             status: MessageStatus::Pending, retry_count: 0, delegation_depth: 0,
-            origin_agent: None, sender_agent: None, error: None, response: None,
+            origin_agent: Some("heartbeat".into()), sender_agent: Some("heartbeat".into()), error: None, response: None,
             created_at: Utc::now().to_rfc3339(), acked_at: None, completed_at: None,
             reply_channel: None, turn_id: None, session_id: None, upstream_unknown: false,
             lane: None, on_behalf_of: None,

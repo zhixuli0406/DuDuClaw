@@ -48,16 +48,17 @@ async fn fixture() -> (tempfile::TempDir, Arc<RwLock<AgentRegistry>>, String, St
         duduclaw_auth::UserRole::Admin).unwrap();
     users.bind_agent(&employee.id, "worker", duduclaw_auth::AccessLevel::Owner).unwrap();
     for (name, role) in [("main", "main"), ("worker", "worker"), ("configured", "worker")] {
-        let dir = home.path().join("agents").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), format!(
-            "[agent]\nname = '{name}'\nrole = '{role}'\nstatus = 'active'\nreports_to = 'main'\n"
-        )).unwrap();
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"),
+            name, name, "", role, "");
+        let path = home.path().join("agents").join(name).join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, raw.replace("reports_to = \"\"", "reports_to = \"main\"")).unwrap();
     }
     std::fs::write(home.path().join("config.toml"),
         "[general]\ndefault_agent = 'configured'\n[delegation]\nhuman_principal = 'record'\n").unwrap();
     let mut registry = AgentRegistry::new(home.path().join("agents"));
     registry.scan().await.unwrap();
+    assert_eq!(registry.list().len(), 3, "principal fixtures must load");
     (home, Arc::new(RwLock::new(registry)), format!("user:{}", employee.id), format!("user:{}", admin.id))
 }
 
@@ -87,9 +88,11 @@ async fn cron_pauses_non_admin_main_default_and_newly_promoted_targets() {
         row.on_behalf_of = Some(employee.clone());
         store.insert(&row).await.unwrap();
         if target == "worker" {
-            std::fs::write(home.path().join("agents/worker/agent.toml"),
-                "[agent]\nname = 'worker'\nrole = 'main'\nstatus = 'active'\n").unwrap();
+            crate::trigger_route::tests::write_agent(&home.path().join("agents"),
+                "worker", "Worker", "", "main", "");
             registry.write().await.scan().await.unwrap();
+            assert_eq!(registry.read().await.get("worker").unwrap().config.agent.role,
+                duduclaw_core::types::AgentRole::Main);
         }
         dispatch_cron_task(home.path(), &store, &registry, &row, &invoker).await;
         let stored = store.get(&row.id).await.unwrap().unwrap();

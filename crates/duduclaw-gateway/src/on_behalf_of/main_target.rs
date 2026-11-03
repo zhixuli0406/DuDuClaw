@@ -30,10 +30,16 @@ pub async fn check_loaded_main_target(
     home: &Path, principal: Option<&str>, agent: &LoadedAgent,
 ) -> Result<(), String> {
     if !requires_main_restriction(home, principal)? { return Ok(()); }
+    check_loaded_restricted_target(home, agent).await
+}
+
+async fn check_loaded_restricted_target(home: &Path, agent: &LoadedAgent) -> Result<(), String> {
     let default = crate::webchat::access::gateway_default_id(home).await
         .map_err(|_| REFUSAL.to_owned())?;
-    if agent.config.agent.role == AgentRole::Main || agent.config.agent.name == default {
-        tracing::warn!(agent = %agent.config.agent.name, principal, "non-admin main-agent admission refused");
+    if agent.config.agent.role == AgentRole::Main || agent.config.agent.name == default
+        || agent.dir.file_name().and_then(|name| name.to_str()) == Some(default.as_str())
+    {
+        tracing::warn!(agent = %agent.config.agent.name, "non-admin main-agent admission refused");
         return Err(REFUSAL.into());
     }
     Ok(())
@@ -45,21 +51,50 @@ pub async fn check_main_target(
     home: &Path, principal: Option<&str>, target: &str,
 ) -> Result<(), String> {
     if !requires_main_restriction(home, principal)? { return Ok(()); }
+    check_restricted_target(home, target).await
+}
+
+/// Queue Background is authorized only for established system senders.
+/// Absence of a principal alone does not establish authority for Main.
+pub(crate) async fn check_loaded_queue_main_target(
+    home: &Path, principal: Option<&str>, agent: &LoadedAgent, background_system: bool,
+) -> Result<(), String> {
+    if principal.is_none() && !background_system {
+        check_loaded_restricted_target(home, agent).await
+    } else {
+        check_loaded_main_target(home, principal, agent).await
+    }
+}
+
+pub(crate) async fn check_queue_main_target(
+    home: &Path, principal: Option<&str>, target: &str, background_system: bool,
+) -> Result<(), String> {
+    if principal.is_none() && !background_system {
+        check_restricted_target(home, target).await
+    } else {
+        check_main_target(home, principal, target).await
+    }
+}
+
+async fn check_restricted_target(home: &Path, target: &str) -> Result<(), String> {
     // Registry loading has a large future even when this path is not taken.
     // Keep it off the queue consumer's bounded poll frame.
     Box::pin(async move {
         let mut registry = AgentRegistry::new(home.join("agents"));
         registry.scan().await.map_err(|_| REFUSAL.to_owned())?;
-        let agent = if target == "default" { registry.main_agent() } else { registry.get(target) };
+        let agent = if target == "default" { registry.main_agent() } else {
+            registry.get(target).or_else(|| registry.list().into_iter().find(|agent|
+                agent.dir.file_name().and_then(|name| name.to_str()) == Some(target)))
+        };
         if let Some(agent) = agent {
-            return check_loaded_main_target(home, principal, agent).await;
+            return check_loaded_restricted_target(home, agent).await;
         }
         // Ephemeral children are absent from the registry, but have a host-created
         // config. Do not infer that a registry miss means an ordinary employee.
         if crate::ephemeral::is_ephemeral_id(target) {
             let agent = AgentRegistry::load_agent(&home.join("agents/.ephemeral").join(target))
                 .await.map_err(|_| REFUSAL.to_owned())?;
-            return check_loaded_main_target(home, principal, &agent).await;
+            return check_loaded_restricted_target(home, &agent).await;
         }
         Err(REFUSAL.into())
     }).await

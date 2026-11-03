@@ -234,6 +234,11 @@ pub(super) async fn build_reply_with_session_inner(
             // "system" is the already-authenticated legacy token Admin.
             if user != "system" && !crate::webchat::is_widget_visitor(&user) {
                 let wire = format!("user:{user}");
+                if let Some(refusal) = crate::machine_employee::refusal_for_known_target(
+                    &ctx.home_dir, &user, &a.config.agent.name,
+                ) {
+                    return refusal.into();
+                }
                 if let Err(reason) = crate::on_behalf_of::access::check_loaded_main_target(
                     &ctx.home_dir, Some(&wire), a,
                 ).await {

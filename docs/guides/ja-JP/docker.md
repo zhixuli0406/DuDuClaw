@@ -424,7 +424,7 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up
 使う前に確認すること：
 
 - イメージに起動スクリプトが含まれている必要があります。`docker compose run --rm --no-deps --entrypoint ls duduclaw /usr/local/lib/duduclaw/` で確認し、`protected-key-launcher.sh` が表示されることを確かめます。
-- 基本ファイルの `cap_drop: ALL` と `no-new-privileges` は残してください。`init: true` や Docker ソケットのマウントを加えると、gateway はキーを拒否し、カードに理由を表示します。**`pid: host` とは絶対に組み合わせないでください：**起動スクリプトは gateway が PID 1 か確認する前に、見えるすべての `duduclaw` ユーザーのプロセスを終了させるため、ホストのプロセス名前空間を共有するとコンテナ外の同じユーザーのプロセスまで終了させます。
+- 基本ファイルの `cap_drop: ALL` と `no-new-privileges` は残してください。`init: true` または `DOCKER_HOST` の設定（空の値でも）により、ランチャーは起動を拒否します。カスタムパスを含むコンテナエンジンのソケットをマウントすると、gateway はキーを拒否します。gateway は `/proc/self/mountinfo` を調べ、マウントされた Unix ソケット、`.sock` で終わるパス、Docker／Podman／containerd の名前を拒否します。マウント表やマウントポイントを確認できない場合も拒否します。**`pid: host` とは絶対に組み合わせないでください：**起動スクリプトは gateway が PID 1 か確認する前に、見えるすべての `duduclaw` ユーザーのプロセスを終了させるため、ホストのプロセス名前空間を共有するとコンテナ外の同じユーザーのプロセスまで終了させます。
 - キーを持っている間、AI プライバシー検出（NER）による匿名化、ローカルのナレッジベース埋め込み、Kokoro 音声は止まります。このとき NER の匿名化ルールは何も伏せません。匿名化が必要な環境では正規表現ルールを使ってください。
 - `docker exec` は既定で root になります。DuDuClaw のコマンドは `docker exec -u duduclaw …` で実行し、home のファイルの所有者を `duduclaw` のままにしてください。
 - `duduclaw-protected-key` は `duduclaw-data` と分けてバックアップします。これがないと保存済みの個人接続を開けず、全員が接続し直すことになります。両方のボリュームを含むバックアップには認証情報を開くのに必要なものがすべて入っているので、その前提で保管してください。

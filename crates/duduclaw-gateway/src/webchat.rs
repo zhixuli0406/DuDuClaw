@@ -566,7 +566,17 @@ impl WebChatState {
         if let Err(e) = &lookup {
             warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
         }
-        resolve_agent_acl(&lookup, agent_name)
+        if !resolve_agent_acl(&lookup, agent_name) { return false; }
+        if matches!(&lookup, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {
+            return true;
+        }
+        // This helper checks the named grant, not operational status (the
+        // execution/resume gate checks that separately). A binding never grants
+        // dashboard access to Main or the configured gateway default.
+        let sender = crate::trigger_route::SenderAccess::no_bindings(user_id)
+            .for_webchat(access::gateway_default_id(&self.ctx.home_dir).await);
+        self.ctx.registry.read().await.get(agent_name)
+            .is_some_and(|agent| sender.webchat_allows(agent))
     }
 
     async fn acquire_connection(&self, user_id: &str) -> bool {
@@ -1097,8 +1107,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let requested_agent: Option<String> = match requested_agent {
                                     Some(name) => {
                                         // For an owned old conversation, first resolve its stored
-                                        // partner below. Only that verified partner may disclose
-                                        // the main-specific refusal, even if the client names it.
+                                        // partner below before checking target access, even if the
+                                        // client names it. Refusals use the uniform target error.
                                         let owned_resume = custom_session.as_deref()
                                             .map(str::trim)
                                             .filter(|sid| !sid.is_empty() && *sid != session_id)

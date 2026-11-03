@@ -241,8 +241,13 @@ impl TurnSink {
 
     pub(in crate::webchat) async fn value(&self, value: serde_json::Value) {
         let terminal = is_terminal(&value);
-        let _ = self.tx.send_owned(Outbound { identity_notice: None,
-            message: self.envelope(value), ack: None, deadline: None,
+        // Refusals and cleanup also hold the FIFO ticket. A saturated writer
+        // must not keep them waiting indefinitely or discard their only terminal
+        // when identity becomes temporarily unavailable before delivery.
+        let _ = self.tx.send_owned(Outbound {
+            identity_notice: terminal.then(|| IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, false)),
+            message: self.envelope(value), ack: None,
+            deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT),
         }, Some(self.progress_dropped.clone()), terminal).await;
     }
 
@@ -274,8 +279,10 @@ impl TurnSink {
             }
             let terminal = is_terminal(&value);
             if !self.wait_ack || is_redaction(&value) {
-                return self.tx.send_owned(Outbound { identity_notice: None,
-                    message: self.envelope(value), ack: None, deadline: None,
+                return self.tx.send_owned(Outbound {
+                    identity_notice: terminal.then(|| IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, false)),
+                    message: self.envelope(value), ack: None,
+                    deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT),
                 }, Some(self.progress_dropped.clone()), terminal).await;
             }
             let (ack, received) = oneshot::channel();
@@ -294,6 +301,38 @@ impl TurnSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn saturated_terminal_lane_cannot_hold_a_refused_turns_fifo_ticket() {
+        for use_send in [false, true] {
+            let (tx, _rx) = outbound_channel();
+            let other = TurnSink::new(tx.clone(), "other", None, "other");
+            for _ in 0..TERMINAL_CAPACITY {
+                other.frame(ChatMessage::error_coded("refused", "agent_forbidden")).await;
+            }
+            assert_eq!(tx.terminal_slots.available_permits(), 0);
+            let registry = Arc::new(Registry::default());
+            let ticket = registry.admit("alice", "s", None, "first", 3, 10).unwrap();
+            let mut next = registry.admit("alice", "s", None, "next", 3, 10).unwrap();
+            let mut sink = TurnSink::new(tx, "s", None, "first");
+            let started = tokio::time::Instant::now();
+            let task = tokio::spawn(async move {
+                let _ticket = ticket;
+                if use_send {
+                    assert!(sink.send(Message::Text(r#"{"type":"error","code":"agent_forbidden"}"#.into())).await.is_err());
+                } else {
+                    sink.frame(ChatMessage::error_coded("refused", "agent_forbidden")).await;
+                }
+            });
+            tokio::time::timeout(SEND_TIMEOUT * 2, async {
+                next.predecessor.take().unwrap().await.unwrap();
+                task.await.unwrap();
+            }).await.expect("refusal must release FIFO even when the writer cannot drain");
+            assert_eq!(tokio::time::Instant::now() - started, SEND_TIMEOUT);
+            drop(next);
+            assert!(registry.entries.lock().unwrap().is_empty());
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn progress_flood_is_bounded_and_terminal_has_priority_after_reader_resumes() {

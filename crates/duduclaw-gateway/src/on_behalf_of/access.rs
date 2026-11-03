@@ -22,6 +22,7 @@ use duduclaw_core::{
 
 #[path = "main_target.rs"]
 mod main_target;
+pub(crate) use main_target::{check_loaded_queue_main_target, check_queue_main_target};
 pub use main_target::{check_loaded_main_target, check_main_target, requires_main_restriction};
 
 /// May `principal` have work of kind `right` handed to `target`?

@@ -1109,17 +1109,15 @@ mod tests {
         let admin = db.create_user("admin@test.invalid", "Admin", "fixture-password",
             duduclaw_auth::UserRole::Admin).unwrap();
         for (name, role) in [("worker", "worker"), ("main", "main"), ("configured", "worker")] {
-            let agent_dir = dir.path().join("agents").join(name);
-            std::fs::create_dir_all(&agent_dir).unwrap();
-            std::fs::write(agent_dir.join("agent.toml"), format!(
-                "[agent]\nname = '{name}'\nrole = '{role}'\nstatus = 'active'\n",
-            )).unwrap();
+            crate::trigger_route::tests::write_agent(&dir.path().join("agents"),
+                name, name, "", role, "");
             db.bind_agent(&employee.id, name, duduclaw_auth::AccessLevel::Owner).unwrap();
         }
         std::fs::write(dir.path().join("config.toml"),
             "[general]\ndefault_agent = 'configured'\n[delegation]\nhuman_principal = 'record'\n").unwrap();
         let mut registry = AgentRegistry::new(dir.path().join("agents"));
         registry.scan().await.unwrap();
+        assert_eq!(registry.list().len(), 3, "principal fixtures must load");
         (dir, Arc::new(RwLock::new(registry)), format!("user:{}", employee.id), format!("user:{}", admin.id))
     }
 
@@ -1195,9 +1193,11 @@ mod tests {
         // A previously ordinary employee can become Main after creation.
         let reminder = callback_reminder("worker", Some(&employee));
         save_reminders_sync(dir.path(), &[reminder]).unwrap();
-        std::fs::write(dir.path().join("agents/worker/agent.toml"),
-            "[agent]\nname = 'worker'\nrole = 'main'\nstatus = 'active'\n").unwrap();
+        crate::trigger_route::tests::write_agent(&dir.path().join("agents"),
+            "worker", "Worker", "", "main", "");
         registry.write().await.scan().await.unwrap();
+        assert_eq!(registry.read().await.get("worker").unwrap().config.agent.role,
+            duduclaw_core::types::AgentRole::Main);
         let scheduler = ReminderScheduler::new(dir.path().to_path_buf(), registry);
         scheduler.reload().await;
         scheduler.fire_due_reminders().await;

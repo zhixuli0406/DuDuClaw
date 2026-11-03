@@ -57,9 +57,9 @@ pub struct AttestationInputs {
     pub capabilities: [Option<u64>; 5],
     pub dumpable: i32,
     pub key_path_denied: bool,
-    /// False also means the socket paths could not be inspected.
+    /// False also means the socket paths or mount table could not be inspected.
     pub sockets_absent: bool,
-    pub docker_host_empty: bool,
+    pub docker_host_absent: bool,
 }
 
 pub fn attest(i: &AttestationInputs) -> Result<(), &'static str> {
@@ -79,7 +79,7 @@ pub fn attest(i: &AttestationInputs) -> Result<(), &'static str> {
     if i.dumpable != 0 { return Err("dumpable"); }
     if !i.key_path_denied { return Err("key_path_accessible"); }
     if !i.sockets_absent { return Err("docker_socket"); }
-    if !i.docker_host_empty { return Err("docker_host"); }
+    if !i.docker_host_absent { return Err("docker_host"); }
     Ok(())
 }
 
@@ -106,10 +106,65 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
     });
 }
 
+/// Mountinfo escapes whitespace and backslashes in path fields with octal codes.
+/// Refuse malformed/unreadable input and metadata failures rather than assuming
+/// a custom-path engine socket is absent. This deliberately rejects all mounted
+/// Unix sockets, even those unrelated to container engines.
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_sockets_absent(
+    mountinfo: Option<&str>,
+    mut is_socket: impl FnMut(&std::path::Path) -> std::io::Result<bool>,
+) -> bool {
+    let Some(mountinfo) = mountinfo else { return false; };
+    let mut seen_mount = false;
+    for line in mountinfo.lines() {
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        let Some(separator) = fields.iter().position(|field| *field == "-") else { return false; };
+        if separator < 6 || fields.len() != separator + 4 { return false; }
+        if fields[0].parse::<u64>().is_err() || fields[1].parse::<u64>().is_err() {
+            return false;
+        }
+        let Some(path) = mountinfo_path(fields[4]) else { return false; };
+        if !path.starts_with('/') { return false; }
+        let suspicious_name = path.ends_with(".sock") || path.split('/').any(|part| {
+            ["docker", "podman", "containerd"].iter().any(|engine| {
+                part == *engine || part.strip_prefix(*engine)
+                    .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('-'))
+            })
+        });
+        if suspicious_name || !matches!(is_socket(std::path::Path::new(&path)), Ok(false)) {
+            return false;
+        }
+        seen_mount = true;
+    }
+    seen_mount
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_path(field: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut bytes = field.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            if byte == 0 { return None; }
+            decoded.push(byte);
+            continue;
+        }
+        decoded.push(match [bytes.next()?, bytes.next()?, bytes.next()?] {
+            [b'0', b'4', b'0'] => b' ',
+            [b'0', b'1', b'1'] => b'\t',
+            [b'0', b'1', b'2'] => b'\n',
+            [b'1', b'3', b'4'] => b'\\',
+            _ => return None,
+        });
+    }
+    String::from_utf8(decoded).ok()
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::{ffi::OsStr, io};
+    use std::{ffi::OsStr, io, os::unix::fs::FileTypeExt};
 
     // Never retry close on Linux: the descriptor may already have been reused.
     struct CloseOffer;
@@ -166,7 +221,11 @@ mod linux {
         let key_path_denied = std::fs::File::open(KEY_PATH).err()
             .is_some_and(|e| e.raw_os_error() == Some(libc::EACCES));
         let sockets_absent = ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]
-            .iter().all(|p| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound));
+            .iter().all(|p| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound))
+            && mountinfo_sockets_absent(
+                std::fs::read_to_string("/proc/self/mountinfo").ok().as_deref(),
+                |path| std::fs::metadata(path).map(|metadata| metadata.file_type().is_socket()),
+            );
         AttestationInputs {
             pid: unsafe { libc::getpid() } as u32,
             uids, gids,
@@ -174,7 +233,7 @@ mod linux {
             capabilities: ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"].map(|name| field(name, 16)),
             dumpable: unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
             key_path_denied, sockets_absent,
-            docker_host_empty: std::env::var_os("DOCKER_HOST").is_none_or(|v| v.is_empty()),
+            docker_host_absent: std::env::var_os("DOCKER_HOST").is_none(),
         }
     }
 }

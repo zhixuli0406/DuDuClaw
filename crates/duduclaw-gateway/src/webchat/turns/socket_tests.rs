@@ -76,6 +76,10 @@ impl Fixture {
             Arc::new(JwtConfig::new(b"webchat-socket-integration-test-key")),
             Arc::new(UserDb::new(&home.path().join("users.db")).unwrap()),
         ));
+        // Match gateway boot before exercising authenticated socket traffic.
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        crate::mfa::reload_policy(home.path());
+        assert!(!crate::mfa::enforced(home.path(), false).unwrap());
         let app = axum::Router::new()
             .route("/ws/chat", axum::routing::get(ws_chat_handler))
             .with_state(state.clone());
@@ -867,8 +871,9 @@ async fn webchat_personal_non_admin_cannot_reach_main_default_explicit_or_resume
             assert_eq!(refusal["code"], "no_assigned_agent");
             assert_eq!(refusal["reason"], "no_agents");
         } else {
-            assert_eq!(frame(&mut socket).await["code"],
-                if mode == "resume" { "main_agent_admin_only" } else { "agent_unavailable" });
+            let refusal = frame(&mut socket).await;
+            assert_eq!(refusal["code"], "agent_unavailable");
+            assert_eq!(refusal["message"], crate::webchat::access::AGENT_UNAVAILABLE_TEXT);
         }
         assert_eq!(fixture.session_count(), if mode == "resume" { 1 } else { 0 });
         assert!(fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().is_empty());
@@ -890,10 +895,14 @@ async fn webchat_bound_main_explicit_and_stored_resume_are_refused_without_rerou
     let old = format!("{}#conv:old", info["session_id"].as_str().unwrap());
     fixture.state.ctx.session_manager.get_or_create(&old, "dudu").await.unwrap();
     send(&mut socket, json!({"type":"user_message", "content":"Hello", "session_id":old, "msg_id":"resume"})).await;
-    assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
+    let refusal = frame(&mut socket).await;
+    assert_eq!(refusal["code"], "agent_unavailable");
+    assert_eq!(refusal["message"], crate::webchat::access::AGENT_UNAVAILABLE_TEXT);
     send(&mut socket, json!({"type":"user_message", "content":"Hello", "agent":"dudu",
         "session_id":old, "msg_id":"resume-explicit"})).await;
-    assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
+    let refusal = frame(&mut socket).await;
+    assert_eq!(refusal["code"], "agent_unavailable");
+    assert_eq!(refusal["message"], crate::webchat::access::AGENT_UNAVAILABLE_TEXT);
     assert_eq!(fixture.session_count(), 1);
     assert!(fixture.state.ctx.session_manager.get_messages(&old).await.unwrap().is_empty());
     fixture.turn_count(0).await;

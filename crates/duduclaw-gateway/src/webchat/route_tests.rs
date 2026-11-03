@@ -491,8 +491,10 @@ async fn non_admin_target_and_mention_refusals_are_identical() {
     }
     assert!(route(&f, "Contact ann@example.com", Some("finance")).await.is_ok());
     assert!(route(&f, "meet @ 5pm", Some("finance")).await.is_ok());
-    assert_eq!(code(&f.state.authorize_resume_target(&f.emp, "dudu").await.unwrap_err()),
-        Some("main_agent_admin_only"));
+    for target in ["does-not-exist", "sales-rep", "dudu"] {
+        let frame = f.state.authorize_resume_target(&f.emp, target).await.unwrap_err();
+        assert_eq!(serde_json::to_value(frame).unwrap(), expected, "resume {target}");
+    }
 }
 
 #[tokio::test]

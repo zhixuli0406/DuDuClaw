@@ -428,7 +428,7 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up
 使用前請確認：
 
 - 映像裡要有啟動程式。用 `docker compose run --rm --no-deps --entrypoint ls duduclaw /usr/local/lib/duduclaw/` 檢查，清單裡要有 `protected-key-launcher.sh`。
-- 保留基本設定檔的 `cap_drop: ALL` 與 `no-new-privileges`。不要加 `init: true` 或掛載 Docker socket，否則 gateway 會拒收金鑰，卡片會寫出原因。**絕對不要和 `pid: host` 一起用：**啟動程式會在 gateway 檢查自己是不是 PID 1 之前，先殺掉看得到的所有 `duduclaw` 使用者行程；共用主機的行程命名空間時，會殺到容器外同一個使用者的行程。
+- 保留基本設定檔的 `cap_drop: ALL` 與 `no-new-privileges`。加上 `init: true` 或設定 `DOCKER_HOST`（即使是空值），啟動程式都會拒絕啟動。掛載任何容器引擎 socket，包括自訂路徑，都會讓 gateway 拒收金鑰。gateway 會檢查 `/proc/self/mountinfo`，拒絕掛載的 Unix socket、以 `.sock` 結尾的路徑，以及 Docker／Podman／containerd 名稱；掛載表或掛載點無法檢查時也會拒絕。**絕對不要和 `pid: host` 一起用：**啟動程式會在 gateway 檢查自己是不是 PID 1 之前，先殺掉看得到的所有 `duduclaw` 使用者行程；共用主機的行程命名空間時，會殺到容器外同一個使用者的行程。
 - 持有金鑰期間，AI 隱私偵測（NER）去識別化、本機知識庫向量與 Kokoro 語音會關閉。這時 NER 去識別化規則不會遮蔽任何內容；需要去識別化的環境請用正規表示式規則。
 - `docker exec` 預設改為 root。執行 DuDuClaw 指令請用 `docker exec -u duduclaw …`，home 裡的檔案才會維持屬於 `duduclaw`。
 - `duduclaw-protected-key` 要和 `duduclaw-data` 分開備份。少了它，已保存的個人連線解不開，每個人都要重新連結。同時含兩個磁碟區的備份，就有解開憑證所需的一切，請照這個等級保管。

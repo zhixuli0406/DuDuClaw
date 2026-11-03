@@ -46,7 +46,8 @@ pub const AUDIT_REJECTED: &str = "on_behalf_of_rejected";
 /// This deliberately is not a valid `HumanPrincipal` wire form.
 const UNKNOWN_WIRE: &str = "unknown:rejected-principal";
 
-/// Provenance at an authority boundary. Only an absent carrier is Background.
+/// Carrier classification, not admission authority. Only an absent carrier is
+/// Background; queue admission separately requires a sender and limits Main.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrincipalState {
     Human(HumanPrincipal),
