@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import { useEffect, lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router';
 import { onPetOpenStudio } from './lib/pet';
@@ -229,9 +230,7 @@ export function App() {
               {/* ── Zone A 每日 — open to all authenticated users ──
                   Home is the single spine: a read-only overview (the former
                   workspace mode was collapsed into it, so `/workspace` renders
-                  the same page). It carries no composer — 交辦 has its own
-                  page, `/assign` (below); this comment used to claim a
-                  "launcher hero" that no version of HomePage ever rendered. */}
+                  the same page). New conversations open the chat composer. */}
               {/* O-2: appliance lands on the conversational console; every
                   other install still lands on HomePage (see `HomeLanding`). */}
               <Route index element={<HomeLanding />} />
@@ -250,10 +249,8 @@ export function App() {
               <Route path="tasks" element={<TaskBoardPage />} />
               <Route path="tasks/:id" element={<TaskDetailPage />} />
               <Route path="goals" element={<GoalsPage />} />
-              {/* 交辦任務 — both editions, every entry point (sidebar, mobile ＋,
-                  board, /goals, agent cards, gallery) lands here. Not a nav
-                  row; the sidebar's primary button is its entry. */}
-              <Route path="assign" element={<AssignPage />} />
+              {/* Keep assignment bookmarks usable while task entry points are hidden. */}
+              <Route path="assign" element={TASK_ENTRY_POINTS_HIDDEN ? <Navigate to="/chat" replace /> : <AssignPage />} />
               <Route element={<RoleGuard minRole="admin" />}><Route element={<EditionGuard enterprise />}><Route path="setup" element={<SetupChecklistPage />} /></Route></Route>
               {/* P5 持續任務 — every `responsibilities.*` RPC re-checks the
                   caller's binding to the owner employee server-side. */}

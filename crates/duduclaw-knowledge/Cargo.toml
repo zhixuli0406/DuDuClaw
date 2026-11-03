@@ -57,6 +57,7 @@ minisign-verify = "0.2"
 tar = "0.4"
 
 [dev-dependencies]
+duduclaw-core = { workspace = true, features = ["test-root-key"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
 minisign = { version = "0.7", default-features = false }

@@ -70,7 +70,7 @@
 ### 需要什麼
 
 - 一個 Google Workspace 網域，以及一位能授權用戶端 ID 的超級管理員（Google 管理控制台 → 安全性 → 存取權與資料控管 → API 控制項 → 管理全網域委派），授權的權限清單要和儀表板顯示的完全一致。
-- 憑證保護已改放系統金鑰圈（「安全」頁，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)）。服務帳號金鑰用這把保護金鑰封存，AI 員工讀不到它的檔案。macOS 與 Windows 可以用；Linux 與 Docker 目前沒有支援的金鑰圈，代表同事一律拒絕。
+- 憑證保護已改放系統金鑰圈（「安全」頁，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)）。服務帳號金鑰用這把保護金鑰封存，AI 員工讀不到它的檔案。macOS、Windows，以及用 person-credentials 疊加設定啟動的 Docker（見 [Docker 指南](docker.md#74-個人帳號person-credentials-疊加設定)）可以用；一般的 Docker 安裝與原生 Linux 一律拒絕代表同事。
 
 ### 設定步驟
 

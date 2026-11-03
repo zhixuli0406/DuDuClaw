@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { useAuthStore } from './auth-store';
+import { useSystemStore } from './system-store';
 import type { VisemeShape } from '@/components/mascot';
 import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
@@ -22,6 +23,33 @@ import { IN_TURN_FRAME_TYPES, parseChatArtifact, parseComputerWatch, shouldRende
 
 export * from './chat-thinking';
 export * from './chat-frames';
+
+export interface ResolvedChatAgent {
+  readonly id: string;
+  readonly name: string;
+  readonly icon: string;
+}
+export interface ChatAssignmentError {
+  readonly code: string;
+  readonly message: string;
+  readonly reason?: string;
+}
+
+/** Personal and legacy admin connections retain their existing partner selection. */
+export function requiresAssignedChatAgent(): boolean {
+  const user = useAuthStore.getState().user;
+  return user !== null && user.role !== 'admin'
+    && useSystemStore.getState().status?.edition_profile !== 'personal';
+}
+
+export function chatAccessMessageKey(code: string, reason?: string): string | null {
+  if (code === 'agent_forbidden') return 'webchat.assignment.forbidden';
+  if (code === 'main_agent_admin_only') return 'webchat.assignment.mainAdminOnly';
+  if (code === 'no_assigned_agent' && reason === 'unavailable') return 'webchat.assignment.unavailable';
+  if (code === 'no_assigned_agent') return reason === 'multiple_agents'
+    ? 'webchat.assignment.multiple' : 'webchat.assignment.none';
+  return null;
+}
 
 export interface ChatAttachmentMeta {
   readonly name: string;
@@ -257,6 +285,9 @@ interface ChatStore {
    *  for the default office assistant (DuDu). Visual selection (T7.2); the
    *  backend socket still routes to the main agent. */
   readonly selectedAgentId: string | null;
+  /** Undefined until the server announces the authenticated user's assignment. */
+  readonly resolvedAgent: ResolvedChatAgent | null | undefined;
+  readonly assignmentError: ChatAssignmentError | null;
   /** Whether the agent's model can interpret uploaded images (from session_info). */
   readonly supportsVision: boolean;
   /** The agent's preferred model id (from session_info). */
@@ -526,7 +557,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // A fresh connection re-derives its own server session id, so start a fresh
     // conversation nonce too (the previous connection's buckets are unreachable
     // once the server mints a new suffix).
-    set({ connectionState: 'connecting', ownSessionId: null, activeMessageId: null, lastCompletedReplyId: null, convId: nextConvId() });
+    set(state => ({ connectionState: 'connecting', ...(!state.resumedExplicitly ? { resolvedAgent: undefined, assignmentError: null } : {}), ownSessionId: null, activeMessageId: null, lastCompletedReplyId: null, convId: nextConvId() }));
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/chat`;
@@ -594,44 +625,46 @@ export const useChatStore = create<ChatStore>((set, get) => {
           set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
         }
         switch (data.type) {
-          case 'session_info':
-            // `refresh: true` marks a server-initiated re-announcement after an
-            // agent-config change (name/icon/model edited in the dashboard).
-            // Update only the agent metadata — the session state (sessionId /
-            // ownSessionId) belongs to this client's navigation and must not
-            // be clobbered mid-conversation.
+          case 'session_info': {
+            // A connection hello describes the default partner, not a history
+            // session opened before the socket connected.
+            const preserveResumedPartner = requiresAssignedChatAgent() && get().resumedExplicitly
+              && data.session_id !== get().sessionId;
+            const metadata = preserveResumedPartner ? {} : {
+              agentName: data.agent_name,
+              agentIcon: data.agent_icon,
+              supportsVision: data.supports_vision ?? false,
+              model: data.model ?? '',
+            };
+            if ('resolved_agent' in data && !preserveResumedPartner) {
+              const candidate = data.resolved_agent;
+              const resolvedAgent = candidate && typeof candidate.id === 'string'
+                && typeof candidate.name === 'string' && typeof candidate.icon === 'string'
+                ? candidate as ResolvedChatAgent : null;
+              set({ resolvedAgent, assignmentError: data.assignment_error ?? null,
+                selectedAgentId: resolvedAgent?.id ?? null });
+            }
+            // Both configuration refreshes and per-message assignment metadata
+            // leave the base session id intact. Only resume confirmations adopt
+            // a persisted session id.
             if (data.refresh) {
-              set({
-                agentName: data.agent_name,
-                agentIcon: data.agent_icon,
-                supportsVision: data.supports_vision ?? false,
-                model: data.model ?? '',
-              });
+              set(metadata);
               break;
             }
-            // The first session_info after a fresh connect is this connection's
-            // own session — remember it so a later resume miss / new-conversation
-            // / partner-switch can fall back to it. Resume-confirmation frames (a
-            // different session_id) must not overwrite this baseline.
             set((state) => ({
               ownSessionId:
                 state.ownSessionId === null && typeof data.session_id === 'string'
                   ? data.session_id
                   : state.ownSessionId,
-              // A conversation resumed before/while the socket came up keeps its
-              // own id — the connection's base id is recorded as `ownSessionId`
-              // above and is what `reset` / `selectAgent` fall back to.
               sessionId: sessionIdAfterHello(
                 state.sessionId,
                 state.resumedExplicitly,
                 data.session_id,
               ),
-              agentName: data.agent_name,
-              agentIcon: data.agent_icon,
-              supportsVision: data.supports_vision ?? false,
-              model: data.model ?? '',
+              ...metadata,
             }));
             break;
+          }
 
           case 'assistant_chunk':
             // Streaming chunk — append beside the matching user message.
@@ -797,9 +830,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
           }
 
           case 'error':
+            if (chatAccessMessageKey(data.code, data.reason) && (data.code === 'no_assigned_agent' || get().resumedExplicitly)) {
+              set({ assignmentError: { code: data.code, message: data.message, reason: data.reason } });
+            }
             if (targetTurnId && !isResumeNotFound(data.message)) {
               set(state => {
-                const error = data.code === 'turn_limit' ? lookupMessage('webchat.turnLimit') : mentionErrorText(data) ?? data.message;
+                const accessKey = chatAccessMessageKey(data.code, data.reason);
+                const error = data.code === 'turn_limit' ? lookupMessage('webchat.turnLimit')
+                  : accessKey ? lookupMessage(accessKey) : mentionErrorText(data) ?? data.message;
                 const messages = finishMessage(state.messages, targetTurnId, data.code === 'cancelled' ? 'cancelled' : 'failed')
                   .map(m => m.role === 'user' && m.turnId === targetTurnId ? { ...m, ...(data.code === 'turn_limit' ? { deliveryError: error } : {}) } : m);
                 // Admission errors are shown on the retained user bubble. Other
@@ -851,7 +889,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   role: 'system',
                   // `@` refusals and choices arrive as codes and are worded
                   // in the viewer's language here.
-                  content: mentionErrorText(data) ?? data.message,
+                  content: (chatAccessMessageKey(data.code, data.reason)
+                    ? lookupMessage(chatAccessMessageKey(data.code, data.reason)!) : null)
+                    ?? mentionErrorText(data) ?? data.message,
                   timestamp: Date.now(),
                 },
               ],
@@ -903,6 +943,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // product mark (<BrandMark>), not the per-agent 🐾 placeholder.
     agentIcon: '',
     selectedAgentId: null,
+    resolvedAgent: undefined,
+    assignmentError: null,
     supportsVision: false,
     model: '',
     connectionState: 'disconnected',
@@ -962,7 +1004,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         messages: [], lastCompletedReplyId: null, steps: [], stepTree: [], thinking: null, isStreaming: false, activeMessageId: null,
         phase: 'idle', viseme: REST_VISEME, resumedExplicitly: false, convId: nextConvId(),
         sessionId: identityChanged ? null : state.ownSessionId,
-        ...(identityChanged ? { ownSessionId: null, selectedAgentId: null } : {}),
+        ...(identityChanged ? { ownSessionId: null, selectedAgentId: null, resolvedAgent: undefined, assignmentError: null } : {}),
       }));
     },
 
@@ -1004,6 +1046,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
     send: (text: string, attachments?: readonly PendingAttachment[]) => {
       if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return;
+      if (requiresAssignedChatAgent() && (!get().resolvedAgent || get().assignmentError)) return;
 
       const atts = attachments ?? [];
       const msgId = newClientMessageId();
@@ -1042,7 +1085,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
           buildUserMessageFrame({
             content: text,
             sessionId: get().sessionId,
-            agentId: get().selectedAgentId,
+            agentId: requiresAssignedChatAgent() && !get().resumedExplicitly ? null : get().selectedAgentId,
             attachments: atts,
             convId: get().convId,
             msgId,

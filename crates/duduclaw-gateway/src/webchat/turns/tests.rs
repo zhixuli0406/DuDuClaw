@@ -616,11 +616,14 @@ async fn credential_watcher_three_failures_reset_and_ends_with_turn() {
 }
 
 async fn credential_fixture(home: &std::path::Path) -> Arc<WebChatState> {
+    crate::team_edition::record(home, duduclaw_core::EditionProfile::Enterprise);
     std::fs::create_dir_all(home.join("agents")).unwrap();
+    let db = UserDb::new(&home.join("users.db")).unwrap();
+    db.create_user("credential-admin@test.invalid", "Credential Admin", "Test-Password-12345", duduclaw_auth::UserRole::Admin).unwrap();
     Arc::new(WebChatState::new(
         crate::agent_channels::e2e_tests::reply_ctx(home).await,
         Arc::new(JwtConfig::new(b"turn-credential-test-key")),
-        Arc::new(UserDb::new(&home.join("users.db")).unwrap()),
+        Arc::new(db),
     ))
 }
 
@@ -703,8 +706,9 @@ async fn plain_disconnect_and_recovered_credential_do_not_cancel_work() {
 }
 
 fn credential_input(state: Arc<WebChatState>) -> TurnInput {
+    let user = state.user_db.get_user_by_email("credential-admin@test.invalid").unwrap().unwrap();
     TurnInput {
-        state, auth_user: "widget:test".into(), credential: None,
+        state, auth_user: user.id, credential: None,
         user_id: "alice".into(), agent_id: "dudu".into(), requested_agent: None,
         effective_agent: None, sid: "session".into(), conv_nonce: None,
         content: "Hello".into(), attachments: Vec::new(), assign_event: None,
@@ -719,6 +723,9 @@ async fn unavailable_at_each_start_gate_is_terminal_and_releases_fifo_without_mo
         let home = tempfile::tempdir().unwrap();
         crate::trigger_route::tests::write_agent(&home.path().join("agents"), "dudu", "Main", "@dudu", "main", "");
         let state = credential_fixture(home.path()).await;
+        let input = credential_input(state.clone());
+        assert!(state.authorize_target(&input.auth_user, "dudu", false).await.is_ok(),
+            "credential tests must pass agent admission before testing identity failures");
         let mut gate = crate::agent_channels::e2e_seam::arm_waiting(home.path());
         let first = state.turns.admit("alice", "session", None, "first", 3, 10).unwrap();
         let next = state.turns.admit("alice", "session", None, "next", 3, 10).unwrap();

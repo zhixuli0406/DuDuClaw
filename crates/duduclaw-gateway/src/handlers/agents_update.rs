@@ -50,6 +50,21 @@ impl MethodHandler {
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
         };
 
+        // Every update can change proactive behavior; check main-agent access
+        // before parsing fields or performing any side effect.
+        if let Some(ctx) = caller {
+            let stored_id = {
+                let reg = self.registry.read().await;
+                reg.get(&agent_id).map(|agent| agent.config.agent.name.clone())
+            };
+            let Some(stored_id) = stored_id else {
+                return WsFrame::error_response("", "Agent not found");
+            };
+            if let Err(frame) = self.deny_main_for_non_admin(ctx, &stored_id).await {
+                return frame;
+            }
+        }
+
         // ── OS-native quota gate (write side) ────────────────────────────
         // Setting this agent's os_native capability to true must not exceed
         // the edition quota (Personal = 1 OS-native seat). Fail-closed before

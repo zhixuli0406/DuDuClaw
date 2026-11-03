@@ -26,9 +26,14 @@ pub fn harden_gateway_process() -> io::Result<()> {
     if is_active() {
         // SAFETY: PR_SET_DUMPABLE takes an integer and no pointers.
         if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            crate::root_key::intake(Some("dumpable"));
+            return Err(error);
         }
+        crate::root_key::intake(None);
+        return Ok(());
     }
+    crate::root_key::intake(Some("inactive"));
     Ok(())
 }
 

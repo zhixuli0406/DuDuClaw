@@ -84,7 +84,7 @@ impl MethodHandler {
             "agents.delegate" => {
                 // H1 fix: delegate is high-risk — requires operator-level access
                 let _ = check_agent!(AccessLevel::Operator);
-                boxed_frame(|| self.handle_agents_delegate(params)).await
+                boxed_frame(|| self.handle_agents_delegate(params, ctx)).await
             }
             "autonomy.pause" | "autonomy.resume" | "autonomy.status" => {
                 boxed_frame(|| self.handle_autonomy_rpc(method, params, ctx)).await

@@ -1,3 +1,5 @@
+import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
+import { useOpenAssign } from '@/hooks/useOpenAssign';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -50,6 +52,7 @@ export function nestTeam(members: TeamMember[], managerId: string | null): TeamN
 export function TeamPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const openAssign = useOpenAssign();
   const [team, setTeam] = useState<MyTeam | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -128,7 +131,9 @@ export function TeamPage() {
                 <TeamBranch
                   node={node}
                   onChat={openChat}
-                  onAssign={(agent, report) => setAssigning({ agent, report })}
+                  onAssign={(agent, report) => TASK_ENTRY_POINTS_HIDDEN
+                    ? openAssign({ description: `${agent.call_text} ` })
+                    : setAssigning({ agent, report })}
                   onHistory={(agent, report) => navigate(`/team/conversations?${new URLSearchParams({ agent: agent.name, report })}`)}
                 />
               </li>
@@ -137,7 +142,7 @@ export function TeamPage() {
         </>
       ) : null}
 
-      {assigning && (
+      {!TASK_ENTRY_POINTS_HIDDEN && assigning && (
         <TeamAssignDialog
           agent={assigning.agent}
           reportName={assigning.report}
@@ -272,9 +277,9 @@ function AgentRow({
           <MessageCircle />
           {intl.formatMessage({ id: 'team.action.chat' })}
         </Button>
-        <Button variant="brand" size="sm" onClick={onAssign} disabled={!agent.assignable}>
+        <Button variant="brand" size="sm" onClick={onAssign} disabled={TASK_ENTRY_POINTS_HIDDEN ? !agent.operational : !agent.assignable}>
           <Send />
-          {intl.formatMessage({ id: 'team.action.assign' })}
+          {intl.formatMessage({ id: chatEntryLabel('team.action.assign') })}
         </Button>
       </div>
     </div>

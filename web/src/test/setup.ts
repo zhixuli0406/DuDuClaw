@@ -29,13 +29,15 @@ HTMLDialogElement.prototype.close = vi.fn(function (this: HTMLDialogElement) {
 // Mock WebSocket globally
 vi.stubGlobal(
   'WebSocket',
-  vi.fn(() => ({
+  vi.fn(function WebSocketMock() {
+    return {
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
     close: vi.fn(),
     send: vi.fn(),
     readyState: 1,
-  }))
+    };
+  })
 );
 
 // This jsdom build exposes a `localStorage` whose methods are absent/throwing,

@@ -42,9 +42,9 @@ describe('worldObjectRoute (T8.4)', () => {
   const mgr = { isManager: true };
   const emp = { isManager: false };
 
-  it('bulletin → inbox, whiteboard → tasks (any role)', () => {
+  it('bulletin opens inbox; the task whiteboard has no entry action', () => {
     expect(worldObjectRoute('bulletin', emp)).toBe('/inbox');
-    expect(worldObjectRoute('whiteboard', emp)).toBe('/tasks');
+    expect(worldObjectRoute('whiteboard', emp)).toBeNull();
   });
 
   it('door/vault are manager-gated', () => {

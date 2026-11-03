@@ -327,7 +327,7 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_heartbeat_trigger(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_heartbeat_trigger(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_id = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -336,6 +336,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "agent_id is required");
         }
 
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
         let hb = self.heartbeat.read().await;
         match hb.as_ref() {
             Some(scheduler) => {

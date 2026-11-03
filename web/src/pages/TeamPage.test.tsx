@@ -1,3 +1,9 @@
+const entryPolicy = vi.hoisted(() => ({ hidden: true }));
+vi.mock('@/lib/task-entry-visibility', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/task-entry-visibility')>(),
+  get TASK_ENTRY_POINTS_HIDDEN() { return entryPolicy.hidden; },
+  chatEntryLabel: (previous: string) => entryPolicy.hidden ? 'nav.newChat' : previous,
+}));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -85,6 +91,7 @@ function answer(team: MyTeam) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  entryPolicy.hidden = true;
   answer(TEAM);
 });
 
@@ -131,7 +138,7 @@ describe('TeamPage', () => {
     expect(within(wang).getByText('Suspended')).toBeInTheDocument();
     expect(within(wang).getByText('2 open tasks')).toBeInTheDocument();
     const [chatSales, chatPaused] = within(wang).getAllByRole('button', { name: 'Chat' });
-    const [assignSales, assignPaused] = within(wang).getAllByRole('button', { name: 'Assign' });
+    const [assignSales, assignPaused] = within(wang).getAllByRole('button', { name: 'New chat' });
     expect(chatSales).toBeEnabled();
     expect(assignSales).toBeEnabled();
     expect(chatPaused).toBeDisabled();
@@ -140,7 +147,7 @@ describe('TeamPage', () => {
 
     const lee = screen.getByRole('region', { name: 'Lee' });
     expect(within(lee).getByText('Chat only')).toBeInTheDocument();
-    expect(within(lee).getByRole('button', { name: 'Assign' })).toBeDisabled();
+    expect(within(lee).getByRole('button', { name: 'New chat' })).toBeEnabled();
     expect(within(lee).getByRole('button', { name: 'Chat' })).toBeEnabled();
 
     const lin = screen.getByRole('region', { name: 'Lin' });
@@ -155,7 +162,8 @@ describe('TeamPage', () => {
     expect(navigate).toHaveBeenCalledWith('/chat', { state: { draft: '@HR Helper ' } });
   });
 
-  it('assigns a goal with tasks.create kind=goal and stays on the team page', async () => {
+  it('retains the legacy goal form when task entries are restored', async () => {
+    entryPolicy.hidden = false;
     const user = userEvent.setup();
     renderWithProviders(<TeamPage />);
     const wang = await screen.findByRole('region', { name: 'Wang' });
@@ -193,7 +201,8 @@ describe('TeamPage', () => {
     expect(screen.queryByText('No one reports to you yet')).not.toBeInTheDocument();
   });
 
-  it('clears the team it showed when a reload is refused', async () => {
+  it('clears the legacy team form when a reload is refused', async () => {
+    entryPolicy.hidden = false;
     const user = userEvent.setup();
     const { container } = renderWithProviders(<TeamPage />);
     const wang = await screen.findByRole('region', { name: 'Wang' });
@@ -206,4 +215,15 @@ describe('TeamPage', () => {
     expect(screen.queryByText('Wang')).not.toBeInTheDocument();
     expect(screen.queryByText('Sales Rep')).not.toBeInTheDocument();
   });
+});
+
+
+it('replaces team assignment with a new chat draft and never creates a task', async () => {
+  const user = userEvent.setup();
+  renderWithProviders(<TeamPage />);
+  const lee = await screen.findByRole('region', { name: 'Lee' });
+  await user.click(within(lee).getByRole('button', { name: 'New chat' }));
+  expect(navigate).toHaveBeenCalledWith('/chat', { state: { draft: '@HR Helper ' } });
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.create')).toBe(false);
 });

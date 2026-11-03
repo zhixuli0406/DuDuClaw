@@ -121,6 +121,7 @@ impl MethodHandler {
                 {
                     return WsFrame::error_response("", &e);
                 }
+                if let Err(frame) = self.deny_main_for_non_admin(ctx, &input.owner_agent_id).await { return frame; }
                 match service::create(&store, &self.home_dir, &input, &actor(ctx), now).await {
                     Ok(r) => {
                         self.responsibility_audit(
@@ -231,6 +232,9 @@ impl MethodHandler {
                     Ok(r) => r,
                     Err(f) => return f,
                 };
+                if !narrowing {
+                    if let Err(frame) = self.deny_main_for_non_admin(ctx, &before.owner_agent_id).await { return frame; }
+                }
                 let who = actor(ctx);
                 let reason = str_param(&params, "reason").unwrap_or("operator");
                 let result = if method == "responsibilities.update_contract" {
@@ -306,6 +310,9 @@ impl MethodHandler {
                     Ok((t, _)) => t,
                     Err(f) => return f,
                 };
+                if method == "tasks.steer" {
+                    if let Err(frame) = self.deny_main_for_non_admin(ctx, &task.assigned_to).await { return frame; }
+                }
                 self.handle_task_control(method, &params, ctx, &store, &task, now)
                     .await
             }

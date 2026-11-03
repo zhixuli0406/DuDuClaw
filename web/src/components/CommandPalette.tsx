@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN, isTaskEntryVisible } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useLocation } from 'react-router';
@@ -202,8 +203,10 @@ interface ScoredCommand extends Command {
  */
 function groupLandingRoute(rawGroupLabel: string): string | undefined {
   if (rawGroupLabel === 'navGroup.daily') return '/';
-  if (rawGroupLabel === personalAdvancedGroup.label) return personalAdvancedGroup.items[0]?.to;
-  return navGroups.find((g) => g.label === rawGroupLabel)?.items[0]?.to;
+  const items = rawGroupLabel === personalAdvancedGroup.label
+    ? personalAdvancedGroup.items
+    : navGroups.find((g) => g.label === rawGroupLabel)?.items;
+  return items?.find((item) => isTaskEntryVisible(item.to))?.to;
 }
 
 /** Score a command against the query across label + keywords; keep label hits for highlight. */
@@ -431,7 +434,7 @@ export function CommandPalette() {
 
     // Entity search (T1.5) — jump to a task detail by fuzzy title (CJK-safe via
     // the shared `fuzzyMatch`). Sourced from whatever the tasks store holds.
-    const taskCommands: Command[] = tasks.map((task) => ({
+    const taskCommands: Command[] = (TASK_ENTRY_POINTS_HIDDEN ? [] : tasks).map((task) => ({
       id: `entity:task:${task.id}`,
       groupLabel: t('cmdk.group.tasks'),
       groupRoute: '/tasks',
@@ -549,7 +552,7 @@ export function CommandPalette() {
     const q = query.trim();
     const timer = setTimeout(() => {
       Promise.all([
-        api.tasks.list().catch(() => null),
+        TASK_ENTRY_POINTS_HIDDEN ? Promise.resolve(null) : api.tasks.list().catch(() => null),
         api.approvals.list().catch(() => null),
         api.installRequests.list().catch(() => null),
         useConversationsStore

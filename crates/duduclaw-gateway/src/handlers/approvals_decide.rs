@@ -60,6 +60,30 @@ impl MethodHandler {
             Err(response) => return response,
         };
         if let Some(r) = &record {
+            // Both approval and denial can wake work. Gate every kind before
+            // specialized paths, expiry polling, or any broker decision.
+            let live = match live_reader_context(&self.home_dir, ctx) {
+                Ok(live) => live,
+                Err(_) => return WsFrame::error_response("", PERMISSION_DENIED),
+            };
+            if !live.is_admin() {
+                // agent_id is NOT NULL, but legacy/unbound requests may store
+                // an empty string. Only a durable task owner can recover that
+                // attribution; arbitrary payload agent labels are not authority.
+                let agent_id = if r.agent_id.trim().is_empty() {
+                    r.binding.as_ref().and_then(|b| b.task_id.clone())
+                        .or_else(|| approval_task_ref(&r.payload))
+                        .and_then(|task| task_owner_readonly(&self.home_dir, &task))
+                } else {
+                    Some(r.agent_id.clone())
+                };
+                let Some(agent_id) = agent_id else {
+                    return WsFrame::error_response("", PERMISSION_DENIED);
+                };
+                if let Err(frame) = self.deny_main_for_non_admin(&live, &agent_id).await {
+                    return frame;
+                }
+            }
             if let Err(error) = self.authorize_egress_decider(r, ctx) {
                 return WsFrame::error_response("", &error);
             }
@@ -909,6 +933,9 @@ mod tests {
         let user = db
             .create_user("ada@example.com", "Ada", "fixture-password-only", UserRole::Admin)
             .unwrap();
+        let agent = home.path().join("agents/sales");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname = \"sales\"\nrole = \"specialist\"\n").unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         let ctx = claiming_admin(&user);
         let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
@@ -950,11 +977,10 @@ mod tests {
         let pilot_frame = handler
             .handle_approvals_decide(json!({"id": pilot.as_str(), "approve": true}), &ctx)
             .await;
-        assert_eq!(refusal(&board_frame), "expected_digest is not accepted for this approval");
-        assert_eq!(
-            refusal(&pilot_frame),
-            "synthetic pilot review requires an admin who can inspect Decision Lab"
-        );
+        // Central admission rejects the revoked identity before consulting
+        // specialized kinds or the candidate digest.
+        assert_eq!(refusal(&board_frame), PERMISSION_DENIED);
+        assert_eq!(refusal(&pilot_frame), PERMISSION_DENIED);
         assert_eq!(
             broker.get(&board).await.unwrap().unwrap().status,
             crate::approval::ApprovalStatus::Pending

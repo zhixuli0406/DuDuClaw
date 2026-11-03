@@ -174,6 +174,9 @@ pub fn assign_right(
     else {
         return AssignRight::Denied;
     };
+    if !access.webchat_allows(loaded) {
+        return AssignRight::Denied;
+    }
     if crate::machine_employee::requires_admin(loaded)
         && !matches!(access.sender, Sender::Admin { .. })
     {

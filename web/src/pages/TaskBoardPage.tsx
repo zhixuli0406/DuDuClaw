@@ -1,3 +1,4 @@
+import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import { useIntl } from 'react-intl';
@@ -871,7 +872,7 @@ export function TaskBoardPage() {
     (task: TaskInfo): boolean => {
       if (!isDiscoveryTask(task)) return false;
       toast.info(intl.formatMessage({ id: 'tasks.discovery.locked' }), {
-        action: {
+        action: TASK_ENTRY_POINTS_HIDDEN ? undefined : {
           label: intl.formatMessage({ id: 'tasks.discovery.locked.action' }),
           onClick: () => navigate('/goals'),
         },
@@ -971,7 +972,7 @@ export function TaskBoardPage() {
     (count: number) => {
       if (count === 0) return;
       toast.info(intl.formatMessage({ id: 'tasks.batch.discoverySkipped' }, { count }), {
-        action: {
+        action: TASK_ENTRY_POINTS_HIDDEN ? undefined : {
           label: intl.formatMessage({ id: 'tasks.discovery.locked.action' }),
           onClick: () => navigate('/goals'),
         },
@@ -1119,7 +1120,7 @@ export function TaskBoardPage() {
           </Button>
           <Button variant="brand" size="sm" onClick={() => openAssign()}>
             <UserRoundPlus />
-            <span className="hidden sm:inline">{intl.formatMessage({ id: 'assign.submit' })}</span>
+            <span className="hidden sm:inline">{intl.formatMessage({ id: chatEntryLabel('assign.submit') })}</span>
           </Button>
         </div>
       </PageHeader>
@@ -1200,7 +1201,7 @@ export function TaskBoardPage() {
               // something to an AI employee, not file a card for yourself.
               <Button variant="brand" size="sm" onClick={() => openAssign()}>
                 <UserRoundPlus />
-                {intl.formatMessage({ id: 'assign.submit' })}
+                {intl.formatMessage({ id: chatEntryLabel('assign.submit') })}
               </Button>
             }
           />
