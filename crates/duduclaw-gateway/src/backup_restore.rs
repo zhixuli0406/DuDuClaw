@@ -1032,6 +1032,8 @@ mod tests {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let home = tmp.path();
+            // These cases represent an existing install, including an Admin disable.
+            drop(duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap());
             std::fs::write(home.join("config.toml"), current).unwrap();
             std::fs::write(home.join("old.txt"), "old").unwrap();
             let staging = staging_dir(home);
@@ -1059,6 +1061,56 @@ mod tests {
             assert!(!home.join("restore-backup-second-boot").exists());
             assert_eq!(std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap(), audit);
         }
+    }
+
+    #[test]
+    fn mfa_restore_before_first_boot_cannot_import_a_disabled_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(home.join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        assert!(!home.join("users.db").exists());
+        let staging = staging_dir(home);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        {
+            let _db = duduclaw_auth::UserDb::new(&staging.join("users.db")).unwrap();
+            let mut conn = rusqlite::Connection::open(staging.join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, false, 123).unwrap();
+        }
+        write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename: "old.tar.gz".into() }).unwrap();
+        perform_pending_restore_swap(home, "before-first-boot").unwrap().unwrap();
+        crate::mfa::reload_policy(home);
+        assert!(crate::mfa::enforced(home, false).unwrap());
+        assert!(crate::mfa::boot_policy(home, false).unwrap());
+        // Restore is edition-agnostic and writes strict config even for an
+        // empty Personal home; Personal must still ignore it at enforcement.
+        let config: toml::Table = std::fs::read_to_string(home.join("config.toml")).unwrap().parse().unwrap();
+        assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(true));
+        assert!(!crate::mfa::enforced(home, true).unwrap());
+    }
+
+    #[test]
+    fn mfa_restore_preserves_fresh_team_default_over_archived_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+            home, "127.0.0.1:18789".parse().unwrap(), false, None,
+        ).unwrap();
+        let staging = staging_dir(home);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        {
+            let _db = duduclaw_auth::UserDb::new(&staging.join("users.db")).unwrap();
+            let mut conn = rusqlite::Connection::open(staging.join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, false, 123).unwrap();
+        }
+        write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename: "fresh-test.tar.gz".into() }).unwrap();
+        perform_pending_restore_swap(home, "fresh-mfa-test").unwrap().unwrap();
+        crate::mfa::reload_policy(home);
+        assert!(crate::mfa::enforced(home, false).unwrap());
+        assert!(crate::mfa::boot_policy(home, false).unwrap());
+        assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap()
+            .parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
     }
 
     #[test]
@@ -1126,6 +1178,8 @@ mod tests {
     fn swap_preserves_old_data_and_moves_staged_content_into_place() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
+        // This is an existing installation; keep the byte-preservation assertion.
+        drop(duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap());
         // Old (current) data.
         std::fs::write(home.join("config.toml"), b"# old-config\n").unwrap();
         std::fs::create_dir_all(home.join("agents/kiki")).unwrap();
@@ -1218,6 +1272,8 @@ mod tests {
     fn swap_falls_back_to_the_staging_root_when_not_nested() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
+        // This is an existing installation, not the strict empty-home restore.
+        drop(duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap());
         std::fs::write(home.join("config.toml"), b"# old\n").unwrap();
 
         let staging = staging_dir(home);

@@ -488,25 +488,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let extension = config.extension.clone();
     let edition_override = config.edition;
-    let boot_edition = duduclaw_core::EditionProfile::resolve(
-        std::env::var("DUDUCLAW_EDITION").ok().as_deref(),
-        edition_override.map(|e| e.as_str()),
-        None,
-    );
+    // Verify/seed the license before choosing defaults: a fresh licensed team
+    // must not be mistaken for Personal until the later service startup.
+    let (_license_runtime, boot_edition) = crate::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home_dir.clone(), edition_override,
+    ).await;
     info!("edition_profile={}", boot_edition.as_str());
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())
         .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
-    // Initialize the identity schema before reading its durable MFA boundary.
-    // This also makes a fresh non-Personal install distinguishable from an
-    // existing unreadable identity store; initialization failures abort boot.
-    let user_db_path = home_dir.join("users.db");
-    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
-        duduclaw_core::error::DuDuClawError::Gateway(format!(
-            "Failed to initialize user database: {e}"
-        ))
-    })?);
+    // Provision before UserDb::new consumes the only fresh-install signal.
+    let fresh_team = !boot_edition.is_personal() && crate::mfa::policy_store_is_absent(&home_dir);
     let env_key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).ok();
     match crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
         &home_dir, listener_addr, boot_edition.is_personal(), env_key.as_deref(),
@@ -515,12 +508,26 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             duduclaw_core::set_internal_mcp_api_key(key);
             info!("internal MCP API key registered for this gateway");
         }
+        Err(error) if fresh_team => {
+            // Continuing could create users.db with the legacy false default
+            // and consume the fresh-install signal. Keep first boot retryable
+            // until strict config and durable policy have both been recorded.
+            return Err(duduclaw_core::error::DuDuClawError::Gateway(error));
+        }
         Err(error) => {
             // No fallback config write. MFA reload remains degraded if its
             // durable boundary/config cannot be read.
             tracing::warn!(%error, "internal MCP key provisioning failed");
         }
     }
+
+    // Existing/legacy stores still migrate without changing their MFA policy.
+    let user_db_path = home_dir.join("users.db");
+    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!(
+            "Failed to initialize user database: {e}"
+        ))
+    })?);
 
     // WP21 debt ⑧ — mint `<home>/identity.key` if absent, before any MCP env
     // block is assembled, so every `.mcp.json` / runtime config written later
@@ -754,52 +761,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
-    // ── First-run license seeding (E2, enterprise Docker distribution) ──
-    //
-    // When this binary ships
-    // co-located with a signed OEM `license.json` (its path in the
-    // `DUDUCLAW_LICENSE_FILE` env var — the compose pack mounts it read-only at
-    // `/opt/license.json`), verify it against the baked issuer registry and copy
-    // it into `~/.duduclaw/license.json` *before* the license runtime loads it,
-    // so a customer `docker compose up` gets the baked license with zero
-    // `duduclaw license activate`. Idempotent (never overwrites an existing
-    // license) and fail-closed (an unverifiable candidate is skipped). The call
-    // logs its own outcome; the return value is only for tests.
-    let _ = crate::license_seed::seed_license_if_absent(&home_dir);
-
-    // ── License runtime bootstrap ───────────────────────────────
-    //
-    // Loads ~/.duduclaw/license.json (when present), verifies its Ed25519
-    // signature against trusted issuer public keys collected from
-    // `DUDUCLAW_LICENSE_PUBKEY_<ID>` env vars, and spawns two background
-    // tasks: a phone-home loop (refreshes the license on the cadence
-    // dictated by features.toml) and a CRL poll (downgrades on emergency
-    // revocations).
-    //
-    // Failure modes never crash the gateway: a missing license, an
-    // empty key registry, signature mismatch, expired license, or
-    // grace-period exceeded all collapse to OpenSource mode.
-    let _license_runtime = {
-        // Baked production issuer key (v2; v1 retired) + any operator env
-        // overrides, so a stock binary verifies a DuDuClaw-issued license.json
-        // with no extra setup — the enterprise upgrade path is "drop in
-        // license.json → restart". Env-only + OpenSource until the v2 pubkey is
-        // baked (see license_runtime::PROD_ISSUER_PUBKEY_HEX).
-        let registry = crate::license_runtime::production_registry();
-        let runtime =
-            crate::license_runtime::LicenseRuntime::bootstrap(home_dir.clone(), registry).await;
-        // Publish the runtime to the process-global slot so dashboard
-        // RPCs and other gateway services can read the current tier
-        // without having to thread a handle through the entire
-        // initialisation chain.
-        crate::license_runtime::set_global(runtime.clone());
-        // Spawn the background phone-home + CRL polling tasks. The
-        // returned JoinHandles are deliberately dropped — the tasks are
-        // long-lived and use cooperative cancellation via the runtime
-        // state itself, not handle abortion.
-        let _tasks = runtime.spawn_background_tasks();
-        runtime
-    };
+    // License verification already ran before MFA provisioning. Start remote
+    // refresh/CRL work here, after the rest of the early service initialization.
+    crate::license_runtime::set_global(_license_runtime.clone());
+    let _license_tasks = _license_runtime.spawn_background_tasks();
 
     // Initialize wiki trust store (Phase 2 of wiki RL trust feedback).
     // Best-effort: if open fails, the rest of the system still works — RAG

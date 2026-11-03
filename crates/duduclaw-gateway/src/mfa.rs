@@ -84,15 +84,14 @@ fn parse_policy(text: &str) -> Result<bool, String> {
 
 /// Restore must preserve the live policy; an unreadable policy defaults to strict.
 pub(crate) fn restore_policy(home: &Path) -> bool {
+    // No Admin could have disabled enforcement without an identity store.
+    // Personal still ignores this policy at every enforcement entry point.
+    if policy_store_is_absent(home) { return true; }
     crate::handlers::config_commit::read_regular_config(&home.join("config.toml"))
         .ok().and_then(|text| {
             let table: toml::Table = text.parse().ok()?;
             if table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() {
-                if policy_store_is_absent(home) {
-                    Some(false)
-                } else {
-                    read_policy_state(home).ok()
-                }
+                read_policy_state(home).ok()
             } else { parse_policy(&text).ok() }
         }).unwrap_or(true)
 }
@@ -227,7 +226,7 @@ pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
     // An absent directory entry needs no policy read.
     // A dangling symlink or any other existing but unreadable store must fail closed.
     if policy_store_is_absent(home) {
-        return Ok(false);
+        return Ok(!personal);
     }
     let policy = if personal { read_policy_state(home) } else { read_boot_policy_state(home) };
     match policy {
@@ -241,7 +240,7 @@ pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
     }
 }
 
-fn policy_store_is_absent(home: &Path) -> bool {
+pub(crate) fn policy_store_is_absent(home: &Path) -> bool {
     matches!(std::fs::symlink_metadata(home.join("users.db")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
@@ -257,6 +256,33 @@ pub(crate) fn refuse_policy_change_at(home: &Path, before: &str, after: &str) ->
         && read_policy_state(home)?
     {
         return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更。".into());
+    }
+    Ok(())
+}
+
+/// Imports reject policy changes before replacing any data, including users.db.
+/// Unlike restore, the caller supplies the verified edition for a fresh home.
+pub(crate) fn refuse_import_policy_change(home: &Path, after: &str, personal: bool, replaces_identity: bool) -> Result<(), String> {
+    let before = match crate::handlers::config_commit::read_regular_config(&home.join("config.toml")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let configured = parse_policy(&before)?;
+    let table: toml::Table = before.parse().map_err(|_| "登入設定格式不正確。")?;
+    let absent = policy_store_is_absent(home);
+    // Always validate an existing store, even with an explicit false key.
+    let fallback = if absent { !personal } else { read_boot_policy_state(home)? };
+    let current = if (absent && !personal)
+        || table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() { fallback }
+        else { configured };
+    let parsed_after = parse_policy(after)?;
+    let after_table: toml::Table = after.parse().map_err(|_| "登入設定格式不正確。")?;
+    let next = if !replaces_identity
+        && after_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() { fallback }
+        else { parsed_after };
+    if current != next {
+        return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更（system.update_config，需 expected_state）；請保留目前設定。".into());
     }
     Ok(())
 }
@@ -351,8 +377,14 @@ mod tests {
         assert!(!boot_policy(home.path(), false).unwrap());
         assert!(read_policy_state(home.path()).is_err());
         assert!(refuse_policy_change_at(home.path(), "", "[auth]\nmfa_enforced=false").is_err());
+        crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+            home.path(), "127.0.0.1:18789".parse().unwrap(), false, None,
+        ).unwrap();
+        assert!(read_policy_state(home.path()).is_err());
         let _db = UserDb::new(&path).unwrap();
+        reload_policy(home.path());
         assert!(!read_policy_state(home.path()).unwrap());
+        assert!(!conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, bool>(0)).unwrap());
         assert!(!boot_policy(home.path(), false).unwrap());
         duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
         assert!(boot_policy(home.path(), false).unwrap());
@@ -415,12 +447,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mfa_restore_missing_store_is_false_but_existing_unreadable_store_is_strict() {
+    fn mfa_restore_missing_or_unreadable_store_is_strict() {
         let home = tempfile::tempdir().unwrap();
         let config = "[gateway]\nport = 18789\n";
         std::fs::write(home.path().join("config.toml"), config).unwrap();
-        assert!(!restore_policy(home.path()));
-        assert!(!restore_policy_differs(home.path(), config));
+        assert!(restore_policy(home.path()));
+        assert!(restore_policy_differs(home.path(), config));
 
         let db = home.path().join("users.db");
         std::fs::write(&db, b"not a sqlite database").unwrap();
