@@ -3,6 +3,10 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
+#[path = "sealed_runtime.rs"]
+mod sealed_runtime;
+
 /// Load `libonnxruntime` from the installed path, once per process.
 ///
 /// With ort's `load-dynamic` feature the binary carries no ONNX Runtime; the
@@ -15,6 +19,10 @@ use std::sync::OnceLock;
 /// A library that is not there yet is reported without being memoised, so
 /// installing it later in the same process still works.
 pub fn init_ort(lib_path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if duduclaw_core::root_key::is_held() {
+        return sealed_runtime::init(lib_path);
+    }
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     if INIT.get().is_none() {
         if !lib_path.exists() {

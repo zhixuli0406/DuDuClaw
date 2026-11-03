@@ -306,7 +306,11 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 - **預設關閉。** 管理員在「安全」頁的「憑證保護」卡片開啟（RPC `security.credential_protection_enable`）；`duduclaw credentials status` 印出同一行狀態。關閉時其他功能都不變，需要代表特定人的功能則拒絕執行。
 - **macOS：** 項目放在登入金鑰圈，解密權限只信任建立它的 `duduclaw` 執行檔（以程式碼雜湊識別）。用 Claude 的 `Read`、`cat`、備份、`security` 或 Python 讀這把金鑰都會失敗；有人在 Mac 前面時，macOS 會先跳出詢問。gateway 自己讀取時不會跳對話框。注入 `duduclaw` 行程的程式碼也算 `duduclaw`：測試中把程式碼注入 ad-hoc 簽章的建立者，可以不經詢問讀到金鑰，開了 hardened runtime 就擋下。所以只有執行中的執行檔開了 hardened runtime，卡片才顯示「只有 DuDuClaw 程式讀得到」；目前發布的 CLI 還沒開，會顯示「同一個帳號的程式讀得到」並說明可被注入。升級後新的執行檔雜湊不同，個人帳號會暫停，直到有人在這台 Mac 上執行 `duduclaw credentials authorize` 並允許一次；其他功能照常。
 - **Windows：** 金鑰放在認證管理員，不會出現在檔案或備份裡，但同一個 Windows 帳號下的任何程式都讀得到，包括能執行指令的 AI 員工。儀表板照實顯示。
-- **Linux 與 Docker：** 還沒有支援的儲存區。卡片顯示「檔案（這個平台不支援系統金鑰圈）」，代表特定人的功能維持拒絕。
+- **一般的 Docker 與 Linux：** 一般安裝找不到 AI 員工讀不到的地方放金鑰，所以代表特定人的功能維持拒絕。卡片顯示「檔案（此處無法使用個人帳號）」，並指向下面的 Docker 模式。原生 Linux 目前沒有支援的模式。在容器的終端機執行 `duduclaw credentials status` 也會顯示這個狀態，因為金鑰只交給 gateway 行程；實際狀態以儀表板為準。
+- **Docker 加上 person-credentials 疊加設定：** 用 `docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d` 啟動（步驟見 [Docker 指南](../../guides/zh-TW/docker.md#74-個人帳號person-credentials-疊加設定)）。容器改以 root 啟動，在 `cap_drop: ALL` 之外只加回 `SETUID`、`SETGID`、`SETPCAP`。一支很短的啟動程式（`container/protected-key-launcher.sh`）把 32 bytes 的根金鑰放在只有 root 讀得到的磁碟區 `/var/lib/duduclaw-protected`，先以 `duduclaw` 身分跑首次設定，再殺掉首次設定留下的所有行程，然後在檔案描述元 3 開啟金鑰，以 `duduclaw` 身分、所有權限集合清空並設 `no_new_privs` 啟動 gateway。gateway 是 PID 1，它一停，容器裡其他行程全部跟著結束。它先把自己設為 non-dumpable 才讀金鑰，讀完關掉描述元，接著檢查：PID 1、使用者與群組都不是 root、所有權限集合是空的、`NoNewPrivs`、non-dumpable、自己打不開金鑰路徑、沒有 Docker 或 Podman socket、沒有 `DOCKER_HOST`。任一項不符就丟掉金鑰，個人帳號維持停用，卡片寫出原因。保護金鑰在 home 裡只以根金鑰包裝後的形式存在（`protected/container-wrapped-key.json`）；包裝檔被改動或來自別處，會顯示「保護金鑰被更換」。卡片顯示「獨立金鑰（AI 員工讀不到）」。
+  - 實測環境是 Docker Desktop 7.0（arm64，沒有 Yama）。在同一個容器裡以 uid 1000 測試，也在 `unshare -Ur` 裡重測：開啟金鑰檔、`/proc/1/mem`、`environ`、`fd`、`root`、`maps`、`ptrace`、`process_vm_readv` 全部被拒；從容器內送 SIGKILL、SIGSTOP 停不了 PID 1。掛載 Docker socket、`--init`、少了 `SETPCAP` 都會被拒。還沒實測：完整的伺服器映像、Windows 上的 Docker Desktop、Podman 與 rootless Docker。
+  - 代價：持有金鑰期間，gateway 不在自己的行程裡載入 ONNX 模型，因為員工改得到這些模型檔，而模型檔會進到原生的解析程式碼。AI 隱私偵測（NER）去識別化、本機知識庫向量與 Kokoro 語音會停止，知識庫搜尋改用關鍵字。**這時 NER 去識別化規則的行為和沒裝模型一樣：文字不會被這些規則遮蔽。**一定要 NER 去識別化的環境，請改用正規表示式規則，或不要開這個模式。
+  - 擋不住：能執行指令的員工仍可以在權限內透過 gateway 使用 Google、讀到自己這一輪拿到的存取權杖、讓 gateway 停止，或在重新啟動後放回較舊的 home 檔案。最後這一項，儀表板的「換一把新金鑰」擋不住，因為根金鑰沒有變。懷疑外洩時，請更換金鑰磁碟區裡的根金鑰（見 Docker 指南）。能進入 Docker 主機或金鑰磁碟區的人讀得到根金鑰；同時備份了金鑰磁碟區與資料磁碟區的備份，就有解開憑證所需的一切。
 - **金鑰被換掉就拒絕，不會拿來用。** macOS 上同一個使用者的任何程式都能不經詢問改寫或刪除金鑰圈項目（以暫存金鑰圈實測）。所以 gateway 會用啟用時記下的金鑰代號與加密的檢查值核對金鑰，行程第一次載入的金鑰會被釘住直到結束，封存值帶的金鑰代號不同也算金鑰被換。任一種情況都會停用個人帳號並顯示「保護金鑰被更換」。如果金鑰和記錄一起被換掉，再讓 gateway 重新啟動，前兩項檢查會通過，只剩舊的封存值對不上會露出來。「換一把新金鑰」（一切正常時也可以按）會產生新金鑰，大家要重新連結。
 - **只有 gateway 解封。** 只有持有 `<home>/locks/gateway.lock` 的行程拿得到金鑰，MCP server 與 CLI 子命令拿不到。
 - **稽核：** `security_audit.jsonl` 記 `credential_protection_enabled`（含先前狀態，重新換金鑰為 Critical）、`credential_protection_enable_failed`、`credential_protection_disabled`，以及 gateway 第一次看到金鑰不見、被換或記錄損壞時的 `credential_protection_broken`。每列記狀態、等級、後端與金鑰代號，不記金鑰。
@@ -320,7 +324,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 公司授權代表讓 AI 員工以一位指定同事的身分使用 Google。各道守門都在失敗時拒絕：
 
 - **只認已證明的員工。** 身分只依 `DUDUCLAW_AGENT_ID` + `DUDUCLAW_AGENT_TOKEN` 證明的員工決定，絕不看工具參數。宣稱某位員工卻證明不了的行程，只能用公司預設；宣稱的員工若設成其他身分，連預設也不給。
-- **只有 gateway 簽發。** MCP 伺服器向 `POST /api/internal/google-token` 要權杖（本機、簽章身分、一次性 nonce、限流，和知識庫路由同一套驗證）。gateway 自己讀員工的 `[google]`、用自己的登錄查這個 turn 是為誰做的，並且只在 `person_identity_gate()` 通過後（憑證保護達到最低等級；Linux 與 Docker 一律拒絕）才解開委派金鑰。權杖只留在 MCP 伺服器這個 turn 的記憶體裡。
+- **只有 gateway 簽發。** MCP 伺服器向 `POST /api/internal/google-token` 要權杖（本機、簽章身分、一次性 nonce、限流，和知識庫路由同一套驗證）。gateway 自己讀員工的 `[google]`、用自己的登錄查這個 turn 是為誰做的，並且只在 `person_identity_gate()` 通過後（憑證保護達到最低等級；一般的 Linux 與 Docker 安裝一律拒絕，Docker 加上 person-credentials 疊加設定則可通過）才解開委派金鑰。權杖只留在 MCP 伺服器這個 turn 的記憶體裡。
 - **金鑰是封存的。** 服務帳號金鑰只以保護金鑰封存的 `pk:v1` 形式保存。用目前的保護金鑰解不開，就當成金鑰被換掉：委派停止、寫一次 `google_delegation_key_unreadable`（Critical），由管理員重設憑證保護後重新匯入。舊紀錄不會被悄悄覆蓋。
 - **誰在要求。** 預設只有綁定這位員工的人、管理員和系統工作能用那位同事的帳號；公開訪客在任何設定下都不行。發問者被拒或設定錯誤絕不改用公司共用帳號；其他失敗只有員工設了 `fallback = "home"` 才改用，回覆會說明。
 - **每次重讀人員狀態。** 同事的 DuDuClaw 帳號停權或離職後，下一次呼叫就拒絕。
@@ -337,7 +341,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 - **Bash 通道也會誤擋一些無害的指令。** 受檢位置上的路徑解析失敗時一律拒絕，即使路徑在資料目錄以外；懸空的符號連結即使指向資料目錄以外也會被拒絕。
 - **只限操作者的記憶指令靠減速帶與核准把關，不是沙箱。** `memory forget-source` 與 `memory migrate-namespace` 的 Bash 規則擋不住子指令前的全域選項、用指令替換組出的執行檔名稱與經管線傳入的指令，AI session 判斷也能靠 unset 變數繞過。真正的關卡是儀表板核准，見[依來源忘記需要管理員核准](#依來源忘記需要管理員核准)。
 - **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
-- **系統金鑰圈分不開員工與 gateway。** 兩者是同一個作業系統帳號。macOS 上保護金鑰擋得住其他程式讀取，擋不住被換掉；Windows 上同帳號的任何程式都讀得到。見[指定人的憑證放系統金鑰圈](#指定人的憑證放系統金鑰圈v1760)。
+- **系統金鑰圈分不開員工與 gateway。** 兩者是同一個作業系統帳號。macOS 上保護金鑰擋得住其他程式讀取，擋不住被換掉；Windows 上同帳號的任何程式都讀得到。Docker 的 person-credentials 模式裡，根金鑰只在 gateway 行程手上，但 gateway 仍是員工的作業系統帳號：員工可以在權限內請它代辦，也可以讓它停止。見[指定人的憑證放系統金鑰圈](#指定人的憑證放系統金鑰圈v1760)。
 - **這些 hook 與 Codex 控制檔鎖是分開的保護。** Unix Codex WorkspaceWrite 會套用上述權限 profile。Grok、其他 CLI runtime 與 Windows 不受該鎖保護；其他 CLI runtime 除非開啟 `native_sandbox`，否則沒有 OS 沙箱。
 - **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、`INSTRUCTIONS.md`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
 - **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（目前 Windows 也會以 Rust 子命令執行。）

@@ -410,8 +410,14 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 的憑證；不論卡片顯示什麼，其他設定都照舊運作。
 
 - **改放系統金鑰圈**（`security.credential_protection_enable`）在 macOS 金鑰圈
-  或 Windows 認證管理員建立保護金鑰。Linux 與 Docker 顯示「這個平台不支援系統
-  金鑰圈」，沒有按鈕。
+  或 Windows 認證管理員建立保護金鑰。一般的 Docker 或 Linux 安裝顯示「檔案
+  （此處無法使用個人帳號）」，沒有按鈕。
+- **開啟憑證保護**：用 person-credentials 疊加設定啟動的 Docker 會顯示這個按鈕
+  （見 [Docker 指南](docker.md#74-個人帳號person-credentials-疊加設定)）。金鑰是
+  啟動時交給 gateway 的獨立根金鑰，那一行顯示「獨立金鑰（AI 員工讀不到）」。
+  啟動檢查沒過時，卡片顯示「獨立金鑰無法使用」與原因（例如掛載了 Docker
+  socket），不提供按鈕。持有這把金鑰期間，NER 去識別化、本機知識庫向量與
+  Kokoro 語音會關閉。這裡的「換一把新金鑰」不會換掉根金鑰，換根金鑰見 Docker 指南。
 - **需要重新授權**：macOS 升級後或金鑰圈鎖著時出現。在那台 Mac 的終端機執行
   `duduclaw credentials authorize`，允許一次對話框即可。
 - **保護金鑰不見了／被更換／設定錯誤**：個人帳號停用。按**重新啟用**

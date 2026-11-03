@@ -3300,6 +3300,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // the PID on Unix, so launchd/systemd supervision is undisturbed; it
     // also covers unsupervised foreground runs (npm wrapper, `duduclaw run`).
     if duduclaw_core::platform::restart_requested() {
+        if duduclaw_core::root_key::is_held() {
+            // Re-exec would reset dumpability and lose the one-shot key. PID 1
+            // exit kills every container child; Docker restarts the root stage.
+            info!("Protected root key held — exiting PID 1 for a full container restart");
+            std::process::exit(0);
+        }
         info!("Update installed — re-executing new binary...");
         let err = duduclaw_core::platform::self_restart();
         // self_restart only returns on failure.

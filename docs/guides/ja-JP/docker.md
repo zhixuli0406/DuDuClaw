@@ -411,6 +411,34 @@ sudo chown -R 1000:1000 data/
 
 ---
 
+### 7.4 個人アカウント：person-credentials オーバーレイ
+
+AI 社員が特定の同僚として動く機能（「マイ接続」、会社の委任）には、AI 社員が読めないキーが必要です。通常の Docker インストールにはそうした置き場所がないため、「セキュリティ」ページには「ファイル（ここでは個人アカウントを利用できません）」と表示され、これらの機能は無効のままです。オーバーレイ `docker-compose.person-credentials.yml` がその置き場所を用意します：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d
+```
+
+オーバーレイで変わること：コンテナは root で起動し、`SETUID`、`SETGID`、`SETPCAP` だけを戻します。root だけが読めるボリューム `duduclaw-protected-key` を `/var/lib/duduclaw-protected` にマウントします。起動スクリプトはキーを gateway に渡して `duduclaw` ユーザーに切り替えてから、ほかのものを実行します。起動後に **セキュリティ → 認証情報の保護** で有効にします。カードには「独立した鍵（AI 社員は読み取れません）」と表示されるはずです。設計と限界は[セキュリティ防御](../../features/ja-JP/05-security-defense.md#特定の人の認証情報をシステムのキーチェーンに置くv1760)を参照してください。
+
+使う前に確認すること：
+
+- イメージに起動スクリプトが含まれている必要があります。`docker compose run --rm --no-deps --entrypoint ls duduclaw /usr/local/lib/duduclaw/` で確認し、`protected-key-launcher.sh` が表示されることを確かめます。
+- 基本ファイルの `cap_drop: ALL` と `no-new-privileges` は残してください。`init: true`、`pid: host`、Docker ソケットのマウントを加えると、gateway はキーを拒否し、カードに理由を表示します。
+- キーを持っている間、AI プライバシー検出（NER）による匿名化、ローカルのナレッジベース埋め込み、Kokoro 音声は止まります。このとき NER の匿名化ルールは何も伏せません。匿名化が必要な環境では正規表現ルールを使ってください。
+- `docker exec` は既定で root になります。DuDuClaw のコマンドは `docker exec -u duduclaw …` で実行し、home のファイルの所有者を `duduclaw` のままにしてください。
+- `duduclaw-protected-key` は `duduclaw-data` と分けてバックアップします。これがないと保存済みの個人接続を開けず、全員が接続し直すことになります。両方のボリュームを含むバックアップには認証情報を開くのに必要なものがすべて入っているので、その前提で保管してください。
+
+ルートキーの交換（漏えいが疑われるとき、または信頼できないデータボリュームのコピーを戻したとき）。ダッシュボードの「キーを新しくする」ではルートキーが変わらないため、これはできません：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml run --rm --no-deps \
+  --entrypoint rm duduclaw /var/lib/duduclaw-protected/root.key
+docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d --force-recreate duduclaw
+```
+
+その後カードに「保護キーが置き換えられました」と表示されます。「再度有効にする」を選ぶと、保存済みの個人接続はすべて使えなくなり、各自が接続し直します。ネイティブの Linux には同等のモードがまだありません。
+
 ## 8. ヘルスチェックと可観測性
 
 ### 8.1 3つのhealth endpoint

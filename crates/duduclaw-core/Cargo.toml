@@ -17,6 +17,7 @@ cron = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 fs2 = "0.4"
 # relay_protocol.rs (WP-E2): base64-encodes/decodes HookFrame.body_b64 — the
 # wire type shared verbatim with duduclaw-relay, which already depends on
@@ -38,6 +39,8 @@ unicode-normalization = "0.1.25"
 
 [features]
 default = []
+# Synthetic root-key intake for dependent-crate debug tests only.
+test-root-key = []
 # Synthetic policy for dependent-crate debug tests; ineffective in release libraries/binaries.
 installation-policy-test-hooks = []
 # `compat.d` declarative app-compatibility runner registry (src/compat_runners.rs).

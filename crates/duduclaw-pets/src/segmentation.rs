@@ -197,6 +197,13 @@ mod onnx_impl {
         /// Load a model from `~/.duduclaw/models/`. Errors (with the download URL)
         /// when the file is missing so the caller can prompt/download.
         pub fn load(spec: &ModelSpec) -> Result<Self> {
+            // This desktop-only loader has no pinned runtime init path. Refuse
+            // before any ort API can fall back to ORT_DYLIB_PATH or dlopen search.
+            if duduclaw_core::root_key::is_held() {
+                return Err(PetError::Inference(
+                    "獨立金鑰模式不允許未經安全初始化的 ONNX 去背模型".into(),
+                ));
+            }
             let path = spec.local_path();
             if !path.is_file() {
                 return Err(PetError::ModelUnavailable(format!(
