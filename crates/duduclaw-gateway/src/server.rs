@@ -195,7 +195,7 @@ struct AppState {
 fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<(), String> {
     match std::fs::symlink_metadata(home.join("users.db")) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            crate::mfa::boot_policy(home, personal).map(|_| ())
+            crate::mfa::precheck_boot_policy(home, personal).map(|_| ())
         }
         Ok(_) => Err("MFA policy state unavailable: users.db must be a regular file, not a symlink or special file".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -206,6 +206,75 @@ fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<()
 #[cfg(all(test, unix))]
 mod identity_policy_precheck_tests {
     use super::precheck_identity_policy;
+
+    #[test]
+    fn mfa_legacy_unseeded_policy_passes_boot_precheck_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute("DELETE FROM mfa_policy_state", []).unwrap();
+        for personal in [false, true] {
+            precheck_identity_policy(home.path(), personal).unwrap();
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        drop(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
+        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+    }
+
+    // Match the released users and unseeded policy schema, without invoking
+    // the new migration to build the fixture (which would hide the regression).
+    fn v1792_unseeded_store(home: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+        conn.execute_batch("CREATE TABLE users (
+            id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'employee',
+            status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, last_login TEXT,
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            bootstrap_owner INTEGER NOT NULL DEFAULT 0, credential_epoch INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE mfa_policy_state (
+            id INTEGER PRIMARY KEY CHECK(id=1), enforced INTEGER NOT NULL, enforced_at INTEGER
+        );").unwrap();
+        conn
+    }
+
+    #[test]
+    fn mfa_v1792_unseeded_upgrade_without_config_key_stays_false() {
+        for personal in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let conn = v1792_unseeded_store(home.path());
+            std::fs::write(home.path().join("config.toml"), "[gateway]\nport=18789\n").unwrap();
+            precheck_identity_policy(home.path(), personal).unwrap();
+            // The read-only precheck leaves seeding to UserDb, as on real boot.
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+            crate::mfa::reload_policy(home.path());
+            assert!(!crate::mfa::enforced(home.path(), personal).unwrap());
+            assert_eq!(crate::mfa::policy_status(home.path())["degraded"], false);
+            let rows = conn.prepare("SELECT id, enforced FROM mfa_policy_state").unwrap()
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap()
+                .collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(rows, vec![(1, 0)]);
+        }
+    }
+
+    #[test]
+    fn mfa_v1792_unseeded_upgrade_with_explicit_true_enforces_after_reload() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = v1792_unseeded_store(home.path());
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+        precheck_identity_policy(home.path(), false).unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+        crate::mfa::reload_policy(home.path());
+        assert!(crate::mfa::enforced(home.path(), false).unwrap());
+        assert_eq!(crate::mfa::policy_status(home.path())["degraded"], false);
+        let rows = conn.prepare("SELECT id, enforced FROM mfa_policy_state").unwrap()
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows, vec![(1, 1)]);
+    }
 
     #[test]
     fn legacy_identity_store_passes_without_initializing_mfa_tables() {
@@ -488,25 +557,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let extension = config.extension.clone();
     let edition_override = config.edition;
-    let boot_edition = duduclaw_core::EditionProfile::resolve(
-        std::env::var("DUDUCLAW_EDITION").ok().as_deref(),
-        edition_override.map(|e| e.as_str()),
-        None,
-    );
+    // Verify/seed the license before choosing defaults: a fresh licensed team
+    // must not be mistaken for Personal until the later service startup.
+    let (_license_runtime, boot_edition) = crate::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home_dir.clone(), edition_override,
+    ).await;
     info!("edition_profile={}", boot_edition.as_str());
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())
         .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
-    // Initialize the identity schema before reading its durable MFA boundary.
-    // This also makes a fresh non-Personal install distinguishable from an
-    // existing unreadable identity store; initialization failures abort boot.
-    let user_db_path = home_dir.join("users.db");
-    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
-        duduclaw_core::error::DuDuClawError::Gateway(format!(
-            "Failed to initialize user database: {e}"
-        ))
-    })?);
+    // Provision before UserDb::new consumes the only fresh-install signal.
+    let fresh_team = !boot_edition.is_personal() && crate::mfa::policy_store_is_absent(&home_dir);
     let env_key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).ok();
     match crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
         &home_dir, listener_addr, boot_edition.is_personal(), env_key.as_deref(),
@@ -515,12 +577,26 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             duduclaw_core::set_internal_mcp_api_key(key);
             info!("internal MCP API key registered for this gateway");
         }
+        Err(error) if fresh_team => {
+            // Continuing could create users.db with the legacy false default
+            // and consume the fresh-install signal. Keep first boot retryable
+            // until strict config and durable policy have both been recorded.
+            return Err(duduclaw_core::error::DuDuClawError::Gateway(error));
+        }
         Err(error) => {
             // No fallback config write. MFA reload remains degraded if its
             // durable boundary/config cannot be read.
             tracing::warn!(%error, "internal MCP key provisioning failed");
         }
     }
+
+    // Existing/legacy stores still migrate without changing their MFA policy.
+    let user_db_path = home_dir.join("users.db");
+    let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!(
+            "Failed to initialize user database: {e}"
+        ))
+    })?);
 
     // WP21 debt ⑧ — mint `<home>/identity.key` if absent, before any MCP env
     // block is assembled, so every `.mcp.json` / runtime config written later
@@ -754,52 +830,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
-    // ── First-run license seeding (E2, enterprise Docker distribution) ──
-    //
-    // When this binary ships
-    // co-located with a signed OEM `license.json` (its path in the
-    // `DUDUCLAW_LICENSE_FILE` env var — the compose pack mounts it read-only at
-    // `/opt/license.json`), verify it against the baked issuer registry and copy
-    // it into `~/.duduclaw/license.json` *before* the license runtime loads it,
-    // so a customer `docker compose up` gets the baked license with zero
-    // `duduclaw license activate`. Idempotent (never overwrites an existing
-    // license) and fail-closed (an unverifiable candidate is skipped). The call
-    // logs its own outcome; the return value is only for tests.
-    let _ = crate::license_seed::seed_license_if_absent(&home_dir);
-
-    // ── License runtime bootstrap ───────────────────────────────
-    //
-    // Loads ~/.duduclaw/license.json (when present), verifies its Ed25519
-    // signature against trusted issuer public keys collected from
-    // `DUDUCLAW_LICENSE_PUBKEY_<ID>` env vars, and spawns two background
-    // tasks: a phone-home loop (refreshes the license on the cadence
-    // dictated by features.toml) and a CRL poll (downgrades on emergency
-    // revocations).
-    //
-    // Failure modes never crash the gateway: a missing license, an
-    // empty key registry, signature mismatch, expired license, or
-    // grace-period exceeded all collapse to OpenSource mode.
-    let _license_runtime = {
-        // Baked production issuer key (v2; v1 retired) + any operator env
-        // overrides, so a stock binary verifies a DuDuClaw-issued license.json
-        // with no extra setup — the enterprise upgrade path is "drop in
-        // license.json → restart". Env-only + OpenSource until the v2 pubkey is
-        // baked (see license_runtime::PROD_ISSUER_PUBKEY_HEX).
-        let registry = crate::license_runtime::production_registry();
-        let runtime =
-            crate::license_runtime::LicenseRuntime::bootstrap(home_dir.clone(), registry).await;
-        // Publish the runtime to the process-global slot so dashboard
-        // RPCs and other gateway services can read the current tier
-        // without having to thread a handle through the entire
-        // initialisation chain.
-        crate::license_runtime::set_global(runtime.clone());
-        // Spawn the background phone-home + CRL polling tasks. The
-        // returned JoinHandles are deliberately dropped — the tasks are
-        // long-lived and use cooperative cancellation via the runtime
-        // state itself, not handle abortion.
-        let _tasks = runtime.spawn_background_tasks();
-        runtime
-    };
+    // License verification already ran before MFA provisioning. Start remote
+    // refresh/CRL work here, after the rest of the early service initialization.
+    crate::license_runtime::set_global(_license_runtime.clone());
+    let _license_tasks = _license_runtime.spawn_background_tasks();
 
     // Initialize wiki trust store (Phase 2 of wiki RL trust feedback).
     // Best-effort: if open fails, the rest of the system still works — RAG

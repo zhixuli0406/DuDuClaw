@@ -25,6 +25,12 @@ const POOL_SIZE: usize = 2;
 impl UserDb {
     /// Open (or create) the user database at the given path.
     pub fn new(db_path: &Path) -> Result<Self, String> {
+        Self::new_with_mfa_default(db_path, false)
+    }
+
+    /// Seed a newly created MFA policy table atomically with the verified
+    /// installation default. Existing policy values are never overwritten.
+    pub fn new_with_mfa_default(db_path: &Path, enforced: bool) -> Result<Self, String> {
         let mut pool = Vec::with_capacity(POOL_SIZE);
         for _ in 0..POOL_SIZE {
             let conn = Connection::open(db_path)
@@ -34,7 +40,7 @@ impl UserDb {
             pool.push(Mutex::new(conn));
         }
         let db = Self { pool };
-        db.init_tables()?;
+        db.init_tables(enforced)?;
         Ok(db)
     }
 
@@ -50,7 +56,7 @@ impl UserDb {
         self.pool[0].lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn init_tables(&self) -> Result<(), String> {
+    fn init_tables(&self, enforced: bool) -> Result<(), String> {
         let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
@@ -128,7 +134,7 @@ impl UserDb {
         .map_err(|e| format!("failed to create auth tables: {e}"))?;
 
         crate::google_identity::migrate(&conn)?;
-        crate::mfa::migrate(&conn)?;
+        crate::mfa::migrate(&conn, enforced)?;
         crate::user_invites::migrate(&conn)?;
 
         // Idempotent migrations: ADD COLUMN errors if the column is already

@@ -439,6 +439,7 @@ pub(crate) fn read_regular_config(path: &Path) -> std::io::Result<String> {
 pub(crate) fn commit_boot_config<T>(
     home: &Path,
     render: impl FnOnce(&str, bool) -> Result<(T, Option<String>), String>,
+    after_write: impl FnOnce(&T) -> Result<(), String>,
 ) -> Result<T, String> {
     std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
     crate::google_identity::home_source::with_source_guard(home, |_| {
@@ -483,6 +484,10 @@ pub(crate) fn commit_boot_config<T>(
                 if write.is_err() { let _ = std::fs::remove_file(&tmp); }
                 write?;
             }
+            // The fresh policy seed shares the Admin toggle's config lock.
+            // Config lands first, but no other writer may disable it between
+            // that write and the durable identity-store initialization.
+            after_write(&result).map_err(std::io::Error::other)?;
             Ok(result)
         }).map_err(|e| format!("boot config commit failed: {e}")))
     }).map_err(|e| e.to_string())?
@@ -793,6 +798,22 @@ mod tests {
     }
 
     #[test]
+    fn mfa_missing_singleton_refuses_config_commit_without_repair() {
+        for before in ["", "[auth]\nmfa_enforced=false\n", "[auth]\nmfa_enforced=true\n"] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("config.toml");
+            std::fs::write(&path, before).unwrap();
+            drop(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            conn.execute("DELETE FROM mfa_policy_state", []).unwrap();
+            let after = format!("{before}\n[general]\nlog_level='debug'\n");
+            assert!(commit_text_locked(&path, &content_hash(before), &after).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+    }
+
+    #[test]
     fn connecting_config_refuses_publication_when_memory_fence_is_unreadable() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("memory.db"), "not a database").unwrap();
@@ -1087,6 +1108,35 @@ mod mfa_guard_tests {
     fn policy_value(home: &Path) -> bool {
         rusqlite::Connection::open(home.join("users.db")).unwrap()
             .query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn mfa_boot_seed_holds_config_lock_after_durable_config_write() {
+        let home = tempfile::tempdir().unwrap();
+        let strict = "[auth]\nmfa_enforced=true\n";
+        commit_boot_config(home.path(), |_, _| Ok(((), Some(strict.into()))), |_| {
+            assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), strict);
+            let lock = std::fs::OpenOptions::new().read(true).write(true)
+                .open(home.path().join("config.toml.lock")).unwrap();
+            assert_eq!(fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().raw_os_error(), fs2::lock_contended_error().raw_os_error());
+            let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db"))?;
+            let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123)?;
+            Ok(())
+        }).unwrap();
+        assert!(crate::mfa::boot_policy(home.path(), false).unwrap());
+    }
+
+    #[test]
+    fn mfa_boot_seed_failure_leaves_strict_config_for_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let strict = "[auth]\nmfa_enforced=true\n";
+        assert!(commit_boot_config(home.path(), |_, _| Ok(((), Some(strict.into()))),
+            |_| Err("identity initialization failed".into())).is_err());
+        assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), strict);
+        assert!(!home.path().join("users.db").exists());
+        crate::mcp_internal_key::ensure_internal_mcp_key_for_existing_config(home.path(), false).unwrap();
+        assert!(crate::mfa::boot_policy(home.path(), false).unwrap());
     }
 
     #[test]

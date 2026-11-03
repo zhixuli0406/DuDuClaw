@@ -492,14 +492,14 @@ Admin 可在「系統 → 安全 → 憑證稽核」查看中繼資料、篩選�
 
 ```toml
 [auth]
-mfa_enforced = false
+mfa_enforced = true
 ```
 
-先保持關閉，讓使用者以目前密碼自願註冊。Admin 查看 `mfa.overview`，確認綁定通道能收碼，或安排另一位 Admin 核發一次性註冊碼；測試主機救援並備妥支援 MFA 的客戶端後才開啟強制。兩種 dashboard 設定寫入都要求目前有效的 Admin。註冊及後續憑證變更透過帳號 epoch 作廢舊 JWT；單純切換強制則讓既有 access token 自然到期，拒絕未註冊者 refresh。強制時拒絕舊共用 token WebSocket 登入。
+新的團隊安裝預設強制 MFA；既有安裝保留目前政策，尚無 MFA 政策紀錄的舊版也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」的專用開關啟用或停用強制。新團隊的第一位 Admin 以密碼登入後，需由主機操作員執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再完成驗證器註冊；首次註冊無法只靠儀表板完成。既有未強制的安裝可繼續自願註冊，開啟前請查看 `mfa.overview`、確認通道送達並測試主機救援。兩種 dashboard 設定寫入都要求目前有效的 Admin。註冊及後續憑證變更透過帳號 epoch 作廢舊 JWT；單純切換強制則讓既有 access token 自然到期，拒絕未註冊者 refresh。強制時拒絕舊共用 token WebSocket 登入。
 
-設定使用啟動時載入的記憶體快照；dashboard 寫入後更新，外部檔案每 30 秒重載。失敗時警告並保留最後有效值，僅 Enterprise 從未載入有效值才拒絕。沒有 `[auth]` 表格就是 false。Personal 忽略強制，本機自動登入不變。證明欄位、工作階段綁定及 `duduclaw ops users mfa-reset`／`mfa-enrollment-code` 主機救援見[安全防禦](../../features/zh-TW/05-security-defense.md)。金鑰輪替不在本階段範圍。
+設定使用啟動時載入的記憶體快照；dashboard 寫入後更新，外部檔案每 30 秒重載。失敗時警告並保留最後有效值，僅 Enterprise 從未載入有效值才拒絕。缺少 `[auth]` 表格或設定鍵時保留資料庫中的政策；新團隊初始化會在設定檔及帳號資料庫明確記錄 true。Personal 忽略強制，本機自動登入不變。證明欄位、工作階段綁定及 `duduclaw ops users mfa-reset`／`mfa-enrollment-code` 主機救援見[安全防禦](../../features/zh-TW/05-security-defense.md)。金鑰輪替不在本階段範圍。
 
-啟用前請從 `mfa.overview` 檢查通道綁定時間；只有早於強制啟用的已驗證綁定可作註冊證明。持有密碼者在強制前植入的綁定仍無法辨識。請將回傳的 12 字元 `challenge_ref` 讀給另一位 Admin，以 `users.mfa_enrollment_code {user_id,challenge_ref}`，或主機 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發該次註冊碼。重載失敗會在 `mfa.overview.policy` 及 `system.status.mfa_policy` 顯示；最後有效值為 false 就保持 false。兩個設定寫入路徑都在寫入鎖內重查 Admin。
+啟用前請從 `mfa.overview` 檢查通道綁定時間；只有早於強制啟用的已驗證綁定可作註冊證明。持有密碼者在強制前植入的綁定仍無法辨識。請將回傳的 12 字元 `challenge_ref` 讀給另一位 Admin，以 `users.mfa_enrollment_code {user_id,challenge_ref}`，或主機 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發該次註冊碼。重載失敗會在 `mfa.overview.policy` 及 `system.status.mfa_policy` 顯示；最後有效值為 false 就保持 false。兩個設定寫入路徑都在寫入鎖內重查 Admin。CLI 匯入也會在搬移資料前檢查目前資料庫政策；團隊匯入若包含 users.db 或其 SQLite 附屬檔，設定檔須明確保留目前的 mfa_enforced 值，避免備份中的資料庫改變強制設定。
 
 備份還原會保留還原前目前有效的 `auth.mfa_enforced`，只覆寫備份中的這個設定鍵，其餘資料照常還原。讀不到目前設定時採嚴格值（Enterprise 強制啟用）；備份值不同時儀表板會提示，還原後記錄 `backup_restore_mfa_policy_preserved` 稽核。需要變更時請使用雙因素驗證專用開關；設定匯入仍會直接拒絕變更這個值。
 
@@ -509,9 +509,9 @@ Enterprise 使用者在「設定 → 帳號」選擇「設定雙因素登入」�
 
 密碼與通道驗證碼登入保留原表單，只有 gateway 要求第二因素時才顯示驗證器代碼步驟，可切換使用單次復原碼。登入要求五分鐘內有效，最多五次嘗試。強制註冊會要求獨立的通道／管理員代碼，以及目前密碼（通道登入必填）；只把畫面上的註冊識別碼交給管理員，勿分享註冊憑證。
 
-Admin 在「使用者 → 雙因素登入管理」查看註冊狀態與通道驗證時間，使用自己的新因素重設其他帳號，或依對方這次的註冊識別碼核發一次性代碼。不能自我重設或自我核發。強制開關顯示未設定帳號數、登入受阻警告，並要求輸入畫面上的確認文字。確認開啟時固定本次動作，重新整理會清除確認；切換 RPC 必須提供 `expected_state`，設定鎖內發現狀態不同就拒絕。設定重載降級時會警告並停用開關。**強制登入仍須經審查後才能啟用**；請先保持關閉，完成獨立安全審查、真實 gateway／通道流程與救援驗證。Personal 只有已註冊帳號才顯示相關設定，本機自動登入維持原狀。
+Admin 在「使用者 → 雙因素登入管理」查看註冊狀態與通道驗證時間，使用自己的新因素重設其他帳號，或依對方這次的註冊識別碼核發一次性代碼。不能自我重設或自我核發。強制開關顯示未設定帳號數、登入受阻警告，並要求輸入畫面上的確認文字。確認開啟時固定本次動作，重新整理會清除確認；切換 RPC 必須提供 `expected_state`，設定鎖內發現狀態不同就拒絕。設定重載降級時會警告並停用開關。新團隊安裝一開始就強制驗證。既有仍關閉的安裝，請先確認註冊、通道送達與主機救援流程，再由 Admin 開啟。Personal 只有已註冊帳號才顯示相關設定，本機自動登入維持原狀。
 
-呼叫端連線會在註冊／停用的成功回應取得新權杖，並在一般送出檢查前完成身分交接；HTTP 註冊也在註冊交易提交前簽發權杖。啟用強制前仍須完成真實瀏覽器／WebSocket 驗證，包括跨過心跳後復原碼仍可見，以及另一工作階段失效；行程內 handler 與前端單元測試不能代表這些驗收通過。
+呼叫端連線會在註冊／停用的成功回應取得新權杖，並在一般送出檢查前完成身分交接；HTTP 註冊也在註冊交易提交前簽發權杖。發版驗收仍須完成真實瀏覽器／WebSocket 驗證，包括跨過心跳後復原碼仍可見，以及另一工作階段失效；行程內 handler 與前端單元測試不能代表這些驗收通過。
 
 ## 語音合成
 
