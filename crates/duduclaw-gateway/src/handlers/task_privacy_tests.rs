@@ -28,7 +28,10 @@ fn cached(user: &duduclaw_auth::User, level: AccessLevel) -> UserContext {
 pub(in crate::handlers) async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
-    std::fs::create_dir_all(home.join("agents/sales")).unwrap();
+    // Admission must recognize this as a normal employee before testing task privacy.
+    crate::trigger_route::tests::write_agent(
+        &home.join("agents"), "sales", "Sales", "@sales", "specialist", "",
+    );
     let db = UserDb::new(&home.join("users.db")).unwrap();
     let mk = |email: &str| {
         let u = db

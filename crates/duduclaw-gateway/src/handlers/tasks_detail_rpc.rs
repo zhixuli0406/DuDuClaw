@@ -376,6 +376,7 @@ impl MethodHandler {
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "valid agent_id is required");
         }
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
         // Assigning a goal: Operator on the agent, or a team grant that
         // derived Operator (a Manager handing work to a report's employee).
         if !ctx.can_assign_to(agent_id) {
@@ -665,6 +666,13 @@ impl MethodHandler {
         };
         let action_str = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
+        if matches!(action_str, "continue" | "retry") {
+            let (task, _) = match self.authorize_private_task_read(&store, ctx, task_id, AccessLevel::Operator).await {
+                Ok(row) => row,
+                Err(frame) => return frame,
+            };
+            if let Err(frame) = self.deny_main_for_non_admin(ctx, &task.assigned_to).await { return frame; }
+        }
         if action_str == "continue" {
             let message = params
                 .get("message")

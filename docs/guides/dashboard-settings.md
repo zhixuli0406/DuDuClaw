@@ -27,7 +27,9 @@ employee_tasks = false
 ```
 ## WebChat employee access
 
-Non-Admin dashboard users no longer see the employee selector above the conversation. The header, history and conversation list follow the employee resolved by the server. The `@` list still shows callable employees, excluding both the main-role employee and the gateway’s default employee. An explicit binding does not permit a non-Admin to use either as the main agent. Each message is checked again; binding changes take effect within the existing 60-second access-cache window. An old conversation with the main agent is refused with an explanation and is never silently moved to another employee. With no resolved employee, the composer is disabled. Admins, single-user Personal and legacy admin-token connections retain their existing chat behaviour.
+On every edition, non-Admin dashboard users no longer see the employee selector above the conversation. The header, history and conversation list follow the employee resolved by the server. The `@` list still shows callable employees, excluding both the main-role employee and the gateway’s default employee. An explicit binding does not permit a non-Admin to use either as the main agent. Each message is checked again; binding changes take effect within the existing 60-second access-cache window. An old conversation with the main agent is refused with an explanation and is never silently moved to another employee. With no resolved employee, the composer is disabled. Admins (including the single user on a Personal install) and legacy admin-token connections retain their existing chat behaviour. Non-Admin accounts on any edition cannot use the main agent through `agents.callable` or dashboard work RPCs, including activating the agent, deciding its approvals, and resuming or handing back its computer session.
+
+Known limitation: AI employees can still delegate work to the main agent through their delegation tools, governed by `[delegation]` policy; a later version will address this.
 
 ## Optional independent plan review
 

@@ -1,4 +1,4 @@
-//! WebChat assignment and routing: non-admins never reach main, including
+//! WebChat routing on every edition: non-admins never reach main, including
 //! bound main agents, queued commands and stored conversations.
 
 use super::*;
@@ -14,6 +14,7 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
+    crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
     let agents = dir.path().join("agents");
     write_agent(&agents, "dudu", "嘟嘟總機", "@嘟嘟總機", "main", "");
     write_agent(
@@ -365,12 +366,13 @@ async fn pending_assignment_rechecks_main_after_it_was_armed() {
 async fn broken_acl_database_denies_even_after_a_successful_lookup() {
     let f = fixture().await;
     assert!(f.state.resolve_new_agent(&f.emp).await.is_ok());
+    assert!(f.state.may_resume_into(&f.emp, "finance", "webchat:x", "webchat:u").await);
     rusqlite::Connection::open(f._dir.path().join("users.db")).unwrap()
         .execute_batch("DROP TABLE user_agent_bindings;").unwrap();
     f.state.acl_cache.lock().await.clear();
     assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("unavailable"));
     assert!(f.state.authorize_target(&f.emp, "finance", false).await.is_err());
-    assert!(!f.state.may_resume_into(&f.emp, "dudu", "webchat:x", "webchat:u").await);
+    assert!(!f.state.may_resume_into(&f.emp, "finance", "webchat:x", "webchat:u").await);
 }
 
 #[tokio::test]
@@ -418,4 +420,52 @@ async fn schedule_commands_bind_the_checked_full_id_and_refuse_missing_rows() {
         ScheduleCommand::Resume("missing".into()),
     ));
     assert_eq!(code(&f.state.authorize_command(&f.emp, &mut missing).await.unwrap_err()), Some("schedule_not_found"));
+}
+
+#[tokio::test]
+async fn schedule_commands_refuse_ambiguous_prefixes_without_rewriting_them() {
+    use crate::assign_schedule::{manage, AssignKind, AssignPayload, Creator, NewSchedule, ScheduleSpec};
+    use crate::trigger_route::assign::{AssignCommand, ScheduleCommand};
+    let f = fixture().await;
+    let store = crate::task_store::TaskStore::open(f._dir.path()).unwrap();
+    let creator = Creator::new(&f.emp, false).unwrap();
+    let mut row = manage::create(f._dir.path(), &store, &creator, NewSchedule {
+        agent_id: "finance".into(), kind: AssignKind::Goal,
+        payload: AssignPayload { description: "Report".into(), ..Default::default() },
+        spec: ScheduleSpec::Daily { hour: 9, minute: 0 },
+        timezone: Some("Asia/Taipei".into()), created_via: "dashboard".into(), source: None,
+    }, chrono::Utc::now()).await.unwrap();
+    for id in ["collision-first", "collision-second"] {
+        row.id = id.into();
+        store.insert_assign_schedule(&row, 200).await.unwrap();
+    }
+    for control in [ScheduleCommand::Pause("collisio".into()), ScheduleCommand::Resume("collisio".into()), ScheduleCommand::Remove("collisio".into())] {
+        let mut cmd = crate::chat_commands::ChatCommand::Assign(AssignCommand::Schedules(control));
+        assert_eq!(code(&f.state.authorize_command(&f.emp, &mut cmd).await.unwrap_err()), Some("schedule_not_found"));
+        assert!(matches!(cmd, crate::chat_commands::ChatCommand::Assign(AssignCommand::Schedules(
+            ScheduleCommand::Pause(id) | ScheduleCommand::Resume(id) | ScheduleCommand::Remove(id)
+        )) if id == "collisio"));
+    }
+    let mut full = crate::chat_commands::ChatCommand::Assign(AssignCommand::Schedules(ScheduleCommand::Pause("collision-first".into())));
+    f.state.authorize_command(&f.emp, &mut full).await.unwrap();
+}
+
+#[tokio::test]
+async fn personal_non_admin_cannot_use_main_default_explicit_resume_or_session_info() {
+    let f = fixture().await;
+    crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal);
+    // Edition changes do not lift the main restriction, even with a binding.
+    f.state.user_db.bind_agent(&f.emp, "dudu", AccessLevel::Operator).unwrap();
+    assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("finance"));
+    assert_eq!(route(&f, "Hello", None).await.unwrap().agent.as_deref(), Some("finance"));
+    assert_eq!(code(&route(&f, "Hello", Some("dudu")).await.unwrap_err()), Some("main_agent_admin_only"));
+    assert_eq!(code(&f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err()), Some("main_agent_admin_only"));
+    assert!(!f.state.may_resume_into(&f.emp, "dudu", "webchat:x", "webchat:u").await);
+    assert!(!f.state.agent_access_allowed(&f.emp, "dudu").await);
+    assert!(route(&f, "@嘟嘟總機 Hello", None).await.is_err());
+    let state = Arc::new(f.state);
+    let actual = crate::webchat::access::user_session_info(&state, "webchat:x", Some("dudu"), &f.emp).await;
+    let actual = serde_json::to_value(actual).unwrap();
+    assert_eq!(actual["resolved_agent"], serde_json::Value::Null);
+    assert_eq!(actual["assignment_error"]["reason"], "unavailable");
 }

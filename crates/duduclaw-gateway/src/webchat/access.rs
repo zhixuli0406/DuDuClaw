@@ -76,8 +76,10 @@ impl WebChatState {
             .map_err(|_| assignment_error("unavailable"))?;
         let rows = store.list_assign_schedules(Some(user), 200).await
             .map_err(|_| assignment_error("unavailable"))?;
-        let row = rows.iter().find(|r| r.id == *arg || duduclaw_core::truncate_chars(&r.id, 8) == *arg)
-            .ok_or_else(|| ChatMessage::error_coded("找不到這項排程，請重新查詢排程清單。", "schedule_not_found"))?;
+        let not_found = || ChatMessage::error_coded("找不到這項排程，請重新查詢排程清單。", "schedule_not_found");
+        let mut matches = rows.iter().filter(|r| r.id == *arg || duduclaw_core::truncate_chars(&r.id, 8) == *arg);
+        let row = matches.next().ok_or_else(not_found)?;
+        if matches.next().is_some() { return Err(not_found()); }
         self.authorize_target(user, &row.agent_id, false).await?;
         // Bind subsequent command execution to the checked row, never resolve
         // the short display number against a second potentially changed list.
@@ -109,7 +111,8 @@ impl WebChatState {
 pub(super) async fn user_session_info(
     state: &Arc<WebChatState>, sid: &str, agent: Option<&str>, user: &str,
 ) -> ChatMessage {
-    if is_widget_visitor(user) || matches!(state.acl_snapshot(user).await, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {
+    if is_widget_visitor(user)
+        || matches!(state.acl_snapshot(user).await, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {
         return build_session_info_frame(state, sid, agent).await;
     }
     let resolution = match agent {

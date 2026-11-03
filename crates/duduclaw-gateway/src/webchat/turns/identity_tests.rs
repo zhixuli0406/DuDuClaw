@@ -116,13 +116,16 @@ async fn delivery_checks_refuse_without_content_at_both_stages() {
             let home = tempfile::tempdir().unwrap();
             crate::trigger_route::tests::write_agent(&home.path().join("agents"), "dudu", "Main", "@dudu", "main", "");
             let state = credential_fixture(home.path()).await;
+            let input = credential_input(state.clone());
+            assert!(state.authorize_target(&input.auth_user, "dudu", false).await.is_ok(),
+                "delivery checks must reach the model before testing identity failures");
             let mut gate = crate::agent_channels::e2e_seam::arm_waiting(home.path());
             let ticket = state.turns.admit("alice", "session", Some("c".into()), "m", 3, 10).unwrap();
             let (tx, mut rx) = outbound_channel();
             let task = tokio::spawn(execute(credential_input(state.clone()),
                 TurnSink::new(tx, "session", Some("c".into()), "m"), ticket));
             let entered = tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.recv()).await.unwrap().unwrap();
-            // No credential watcher for this synthetic widget input: these are
+            // No credential watcher for this Admin input without claims: these are
             // precisely run's post-model check and send_terminal's final check.
             if final_check { state.credential_results.lock().unwrap().push_back(SocketValidity::Valid); }
             state.credential_results.lock().unwrap().push_back(validity);

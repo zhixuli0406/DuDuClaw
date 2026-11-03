@@ -215,6 +215,8 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_tasks_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("").trim();
+        if let Err(frame) = self.deny_main_for_non_admin(ctx, target).await { return frame; }
         if !ctx.is_admin() {
             let target = params.get("assigned_to").and_then(Value::as_str).unwrap_or("").trim();
             if let Err(refusal) = crate::machine_employee::check_target(
@@ -390,6 +392,13 @@ impl MethodHandler {
             if !dest.is_empty() && !ctx.can_assign_to(dest) {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }
+        }
+        // Both the existing executor and a new destination must be non-main.
+        if let Some(agent) = owner_agent.as_deref() {
+            if let Err(frame) = self.deny_main_for_non_admin(ctx, agent).await { return frame; }
+        }
+        if let Some(dest) = params.get("assigned_to").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            if let Err(frame) = self.deny_main_for_non_admin(ctx, dest).await { return frame; }
         }
         // HIGH-1 parity with the MCP layer: a depends_on rewire must reference
         // existing tasks only (fail-closed — the store validates shape+cycle,

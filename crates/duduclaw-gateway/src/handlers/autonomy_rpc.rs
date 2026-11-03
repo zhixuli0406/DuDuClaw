@@ -70,6 +70,11 @@ impl MethodHandler {
             Ok(live) => live,
             Err(_) => return WsFrame::error_response("", "permission denied"),
         };
+        if method == "autonomy.resume" {
+            if let Some(agent) = agent {
+                if let Err(frame) = self.deny_main_for_non_admin(&live, agent).await { return frame; }
+            }
+        }
         let reason = match params.get("reason") {
             None => "",
             Some(Value::String(reason)) => reason,

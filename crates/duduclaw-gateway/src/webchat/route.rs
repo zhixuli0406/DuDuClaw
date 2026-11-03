@@ -132,7 +132,7 @@ pub(super) struct WebRoute {
 /// conversation's real default employee, which may be a channel-bound or
 /// `allowed_channels` employee rather than the main one).
 ///
-/// Non-admin default selection is resolved from the account, never main.
+/// Non-admin default selection on every edition is resolved from the account, never main.
 /// The same WebChat-scoped grants filter mentions and assignment commands.
 /// `agent: None` = the default path (the main employee, nothing selected);
 /// `agent: Some(id)` = answer as `id`; `Err(frame)` = send that frame and

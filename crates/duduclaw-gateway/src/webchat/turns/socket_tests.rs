@@ -61,6 +61,7 @@ impl Fixture {
             }
         };
         let home = tempfile::tempdir().unwrap();
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
         crate::trigger_route::tests::write_agent(
             &home.path().join("agents"),
             "dudu",
@@ -833,6 +834,40 @@ async fn webchat_no_assignment_and_ambiguous_assignment_create_no_turn_or_sessio
         assert_eq!(refusal["code"], "no_assigned_agent");
         assert_eq!(refusal["reason"], reason);
         assert_eq!(fixture.session_count(), 0);
+        fixture.turn_count(0).await;
+        assert!(fixture.gate.entered.try_recv().is_err());
+        socket.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn webchat_personal_non_admin_cannot_reach_main_default_explicit_or_resume() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    for mode in ["default", "explicit", "resume"] {
+        let mut fixture = Fixture::start(true).await.unwrap();
+        crate::team_edition::record(fixture._home.path(), duduclaw_core::EditionProfile::Personal);
+        let (_, token) = fixture.employee("personal-main", &["dudu"], None).await;
+        let (mut socket, info) = fixture.connect(&token).await;
+        assert_eq!(info["resolved_agent"], Value::Null);
+        assert_eq!(info["assignment_error"]["reason"], "no_agents");
+        let sid = format!("{}#conv:personal", info["session_id"].as_str().unwrap());
+        let mut request = json!({"type":"user_message", "content":"Hello", "conv":"personal", "msg_id":mode});
+        if mode == "explicit" { request["agent"] = json!("dudu"); }
+        if mode == "resume" {
+            fixture.state.ctx.session_manager.get_or_create(&sid, "dudu").await.unwrap();
+            request["session_id"] = json!(sid);
+        }
+        send(&mut socket, request).await;
+        if mode == "default" {
+            assert_eq!(frame(&mut socket).await["type"], "session_info");
+            let refusal = frame(&mut socket).await;
+            assert_eq!(refusal["code"], "no_assigned_agent");
+            assert_eq!(refusal["reason"], "no_agents");
+        } else {
+            assert_eq!(frame(&mut socket).await["code"], "main_agent_admin_only");
+        }
+        assert_eq!(fixture.session_count(), if mode == "resume" { 1 } else { 0 });
+        assert!(fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().is_empty());
         fixture.turn_count(0).await;
         assert!(fixture.gate.entered.try_recv().is_err());
         socket.close(None).await.unwrap();

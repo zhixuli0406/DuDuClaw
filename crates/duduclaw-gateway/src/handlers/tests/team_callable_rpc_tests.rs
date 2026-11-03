@@ -317,13 +317,15 @@ async fn agents_callable_is_not_enterprise_gated() {
 #[tokio::test]
 async fn personal_edition_ignores_leftover_reporting_lines() {
     let f = fixture().await;
+    let ctx = jwt_ctx(&f.mgr, UserRole::Manager);
+    assert!(!callable(&f, &ctx).await.contains_key("main"));
     // Enterprise → Personal downgrade: the users.db rows stay behind.
     f.handler
         .set_edition_override(Some(duduclaw_core::EditionProfile::Personal))
         .await;
-    let ctx = jwt_ctx(&f.mgr, UserRole::Manager);
     let mgr = callable(&f, &ctx).await;
-    assert_eq!(names(&mgr), vec!["faq", "main"], "no team grants in personal");
+    // Personal ignores leftover team grants; main stays Admin-only.
+    assert_eq!(names(&mgr), vec!["faq"], "no team grants or non-Admin main access in Personal");
     let create = f
         .handler
         .handle("tasks.create", json!({ "title": "報價", "assigned_to": "sales" }), &ctx)
@@ -337,6 +339,18 @@ async fn personal_edition_ignores_leftover_reporting_lines() {
     // The read-only task identity follows the recorded edition too.
     let live = crate::review_evidence::audience::trusted_dashboard_principal(f._home.path(), &f.mgr).unwrap();
     assert!(live.team_access.is_empty());
+}
+
+#[tokio::test]
+async fn callable_main_stays_admin_only_across_edition_overrides() {
+    let f = fixture().await;
+    let ctx = jwt_ctx(&f.other, UserRole::Employee);
+    assert!(!callable(&f, &ctx).await.contains_key("main"));
+    f.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Personal)).await;
+    let personal = callable(&f, &ctx).await;
+    assert_eq!(names(&personal), vec!["faq", "finance"]);
+    f.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    assert!(!callable(&f, &ctx).await.contains_key("main"));
 }
 
 #[tokio::test]

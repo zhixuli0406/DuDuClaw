@@ -34,11 +34,11 @@ pub enum Sender {
 
 /// A sender, for `@` routing.
 ///
-/// Every sender may call the conversation's default employee (in WebChat the
-/// default/main employee stays reachable by every signed-in account, as
-/// before `@` routing existed) and employees opened with `[channels]
-/// public_trigger`. Calling anyone else needs a direct binding, a team grant
-/// (a Manager calling a report's employee), or Admin.
+/// Outside WebChat, every sender may call the conversation's default
+/// employee and employees opened with `[channels] public_trigger`. WebChat
+/// restricts main-role and gateway-default employees to Admin on every edition.
+/// Calling anyone else needs a direct binding, a team grant (a Manager calling
+/// a report's employee), a public trigger, or Admin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderAccess {
     pub sender: Sender,
