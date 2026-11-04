@@ -5,7 +5,7 @@
 ## 環境を準備する
 
 1. **管理 → 連携 → Google** で Google アプリを設定し、Google Workspace 連携を有効にします。個人接続は全体スイッチを変更しません。
-2. **セキュリティ → 認証情報保護** でシステムキーチェーンを使います。対応する macOS または Windows キーチェーン、または person-credentials オーバーレイで起動した Docker（[Docker ガイド](docker.md#74-個人アカウントperson-credentials-オーバーレイ)）が必要です。パスワードだけの保護、利用不能なキーチェーンや独立した鍵、読み取れない認証情報では拒否します。通常の Docker インストールとネイティブの Linux はこの個人接続に対応していません。
+2. 「セキュリティ → 認証情報の保護」を有効にします。個人接続には、対応する macOS／Windows のキーチェーン、[Docker person-credentials オーバーレイ](docker.md#74-個人アカウントperson-credentials-オーバーレイ)、または[ネイティブ Linux の保護システムサービス](linux-protected-service.md)が必要です。通常の Docker と Linux ユーザーサービスは未対応です。パスワードだけの保護、利用できないキーチェーンや独立鍵、読み取れない保存済み認証情報では利用を拒否します。
 3. **自分の接続** に表示される完全な戻り先を Google クライアントに登録します。個人用は `/api/me/google/callback`、共用接続ウィザードは `/api/mcp/oauth/callback` です。利用する経路の URL を登録します。承認済み HTTPS ダッシュボードはその URL、それ以外はローカル HTTP と戻り URL 入力欄を使います。ホスト・ポート・パスを一致させ、障害回避のためにローカル callback を公開しないでください。
 4. [設定ガイド](google-setup.md)でアカウントとアプリの制限を確認します。External + Testing は七日ごとに再認可が必要です。制限付き Gmail 権限の本番利用前に Google 検証やセキュリティ評価が必要な場合があります。
 5. Google データ利用説明と AI 提供元の条件を確認します。Workspace データを汎用モデルの訓練・改善に使うことはできません。条件を確認できない場合は適切なローカルモデルを使うか、Google を接続しません。

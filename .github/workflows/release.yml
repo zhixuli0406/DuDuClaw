@@ -70,15 +70,15 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           # Tags only restore caches written on main (protected), never PRs.
-          shared-key: release-${{ matrix.target }}
+          shared-key: release-cross-glibc231-${{ matrix.target }}
           workspaces: . -> target
           save-if: false
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
 
-      - name: Install cross (aarch64-linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install cross (Linux)
+        if: runner.os == 'Linux'
         uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b  # v2
         with:
           tool: cross
@@ -87,7 +87,7 @@ jobs:
         run: cd web && npm ci --legacy-peer-deps && npm run build
 
       - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
@@ -96,9 +96,9 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
 
-      - name: Build binary (Linux x64 — no desktop, uses L5a container mode)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
+      - name: Check Linux glibc baseline
+        if: runner.os == 'Linux'
+        run: python3 scripts/check_glibc.py target/${{ matrix.target }}/release/duduclaw
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

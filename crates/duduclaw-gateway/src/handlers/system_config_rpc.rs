@@ -253,7 +253,7 @@ impl MethodHandler {
                         "published_at": info.published_at,
                         "download_url": info.download_url,
                         "checksum_url": info.checksum_url,
-                        "install_method": info.install_method,
+                        "install_method": if crate::updater::is_native_protected_install() { crate::updater::InstallMethod::Manual } else { info.install_method },
                         "brew_formula": crate::updater::brew_formula_name(),
                         "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
                         // Non-null when the on-disk binary is already a
@@ -279,6 +279,9 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_system_apply_update(&self, _params: Value) -> WsFrame {
+        if crate::updater::is_native_protected_install() {
+            return WsFrame::error_response("", crate::updater::NATIVE_PROTECTED_UPDATE_HINT);
+        }
         // An extension-supplied provider installs through its own channel and
         // its own pinned key. Without one this is byte-for-byte the previous
         // behavior — including the `duduclaw-pro` refusal inside
@@ -482,6 +485,9 @@ pub(crate) fn restart_pending_refusal(
 ) -> Option<&'static str> {
     if containerized {
         return Some("容器內的 gateway 請以更新 image 的方式重新啟動");
+    }
+    if matches!(method, crate::updater::InstallMethod::Manual) {
+        return Some(crate::updater::NATIVE_PROTECTED_UPDATE_HINT);
     }
     if matches!(method, crate::updater::InstallMethod::Desktop) {
         return Some("桌面版的背景服務由 DuDuClaw App 管理，請從 App 重新啟動");

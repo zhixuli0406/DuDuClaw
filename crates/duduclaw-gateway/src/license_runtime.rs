@@ -29,7 +29,7 @@ use chrono::Utc;
 use duduclaw_license::{
     EMBEDDED_FEATURES_TOML, FeatureGate, License, LicenseError, LicenseTier, PublicKeyRegistry,
     crl::SignedCrl, fingerprint_candidates, fingerprint_is_hostname_only, generate_fingerprint,
-    load_default, save_default, storage,
+    save_default, storage,
 };
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -273,6 +273,31 @@ struct LicenseRuntimeInner {
 const LAST_CRL_FILENAME: &str = "license_crl_last_seen.txt";
 
 impl LicenseRuntime {
+    /// Resolve the boot edition from the same verified license as live requests,
+    /// before callers create users.db and consume the fresh-install signal.
+    /// Background tasks remain the gateway caller's responsibility.
+    pub async fn bootstrap_with_edition(
+        home_dir: PathBuf,
+        edition_override: Option<duduclaw_core::EditionProfile>,
+    ) -> (Self, duduclaw_core::EditionProfile) {
+        let _ = crate::license_seed::seed_license_if_absent(&home_dir);
+        let runtime = Self::bootstrap(home_dir, production_registry()).await;
+        let env = std::env::var("DUDUCLAW_EDITION").ok();
+        let edition = runtime.boot_edition(env.as_deref(), edition_override).await;
+        (runtime, edition)
+    }
+
+    async fn boot_edition(
+        &self,
+        env: Option<&str>,
+        edition_override: Option<duduclaw_core::EditionProfile>,
+    ) -> duduclaw_core::EditionProfile {
+        let tier = self.snapshot().await.tier;
+        duduclaw_core::EditionProfile::resolve(
+            env, edition_override.map(|e| e.as_str()), Some(tier.as_toml_key()),
+        )
+    }
+
     /// Bootstrap the runtime from `home_dir`. Always succeeds — a missing
     /// or broken license file simply yields an OpenSource runtime.
     ///
@@ -295,7 +320,7 @@ impl LicenseRuntime {
             );
             None
         } else {
-            load_and_validate(&registry, &gate).await
+            load_and_validate(&home_dir, &registry, &gate).await
         };
 
         // §10.5: resolve the control-plane URL AFTER loading the license so a
@@ -517,7 +542,8 @@ impl LicenseRuntime {
                 },
             ));
         }
-        save_default(&license).map_err(|e| format!("寫入授權檔失敗：{e}"))?;
+        storage::save_to(&license, &self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME))
+            .map_err(|e| format!("寫入授權檔失敗：{e}"))?;
 
         // A freshly-verified license supersedes a stale revocation marker
         // (re-subscription path). If this subscription is ALSO on the CRL, the
@@ -531,7 +557,7 @@ impl LicenseRuntime {
             }
         }
 
-        let validated = load_and_validate(&self.registry, &self.gate).await;
+        let validated = load_and_validate(&self.home_dir, &self.registry, &self.gate).await;
         let ok = validated.is_some();
         // A notice cached for the previous license no longer applies; the
         // next fetch brings the new subscription's.
@@ -714,8 +740,10 @@ fn count_embedded_issuer_keys() -> usize {
 
 // ── Bootstrap helpers ─────────────────────────────────────────
 
-async fn load_and_validate(registry: &PublicKeyRegistry, gate: &FeatureGate) -> Option<License> {
-    let license = match load_default() {
+async fn load_and_validate(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> Option<License> {
+    // Boot may precede DUDUCLAW_HOME initialization. Read the same explicit
+    // home that license seeding and the identity store use.
+    let license = match storage::load_from(&home_dir.join(storage::DEFAULT_LICENSE_FILENAME)) {
         Ok(l) => l,
         Err(LicenseError::FileNotFound(_)) => {
             debug!("no license file found; running in OpenSource mode");
@@ -1375,6 +1403,8 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use duduclaw_license::License;
 
+    static FINGERPRINT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn fake_license(tier: LicenseTier, fingerprint: &str) -> License {
         License::new(
             "sub_test",
@@ -1455,6 +1485,61 @@ mod tests {
         match license.validate_any(cached_candidates(), ph, gp) {
             Ok(_) => Some(license),
             Err(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mfa_bootstrap_uses_explicit_home_and_verifies_signed_license() {
+        let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let (key, public) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", public);
+        let tier = if is_self_host_deployment() { LicenseTier::Oem } else { LicenseTier::Business };
+        let mut license = fake_license(tier, strong_fingerprint());
+        sign_license(&mut license, &key);
+        storage::save_to(&license, &home.path().join("license.json")).unwrap();
+        let runtime = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
+        assert_eq!(runtime.snapshot().await.tier, tier);
+        assert!(!runtime.boot_edition(None, None).await.is_personal());
+        assert!(!home.path().join("users.db").exists());
+
+        std::fs::write(home.path().join(REVOKED_FILENAME), "revoked").unwrap();
+        let revoked = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
+        assert_eq!(revoked.snapshot().await.tier, LicenseTier::OpenSource);
+        std::fs::remove_file(home.path().join(REVOKED_FILENAME)).unwrap();
+        license.signature[0] ^= 1;
+        storage::save_to(&license, &home.path().join("license.json")).unwrap();
+        let invalid = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+        assert_eq!(invalid.snapshot().await.tier, LicenseTier::OpenSource);
+    }
+
+    #[tokio::test]
+    async fn mfa_boot_edition_uses_live_license_before_identity_creation() {
+        use duduclaw_core::EditionProfile;
+        for (tier, personal) in [
+            (LicenseTier::Business, false), (LicenseTier::Oem, false),
+            (LicenseTier::Partner, false), (LicenseTier::SelfHostPro, false),
+            (LicenseTier::PersonalProSelfHost, true), (LicenseTier::OpenSource, true),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            // Model an already-validated runtime, as the other snapshot tests do.
+            let runtime = LicenseRuntime {
+                state: Arc::new(RwLock::new(LicenseRuntimeInner {
+                    license: Some(fake_license(tier, "fp_mfa")), last_seen_crl_at: None,
+                })),
+                gate: Arc::new(FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap()),
+                registry: Arc::new(PublicKeyRegistry::new()),
+                home_dir: home.path().into(), control_url: "https://control.invalid".into(),
+            };
+            let edition = runtime.boot_edition(None, None).await;
+            assert_eq!(edition.is_personal(), personal, "{tier:?}");
+            assert!(!home.path().join("users.db").exists());
+            crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+                home.path(), "127.0.0.1:18789".parse().unwrap(), edition.is_personal(), None,
+            ).unwrap();
+            assert_eq!(crate::mfa::boot_policy(home.path(), edition.is_personal()).unwrap(), !personal);
+            assert!(runtime.boot_edition(None, Some(EditionProfile::Personal)).await.is_personal());
+            assert!(!runtime.boot_edition(Some("enterprise"), Some(EditionProfile::Personal)).await.is_personal());
         }
     }
 
@@ -1715,6 +1800,7 @@ mod tests {
 
     #[test]
     fn effective_fingerprint_defaults_to_strong_and_records_legacy_matches() {
+        let _fingerprint_guard = FINGERPRINT_TEST_LOCK.blocking_lock();
         // The effective fingerprint is what phone-home requests send.
         // It must fall back to the strong value whenever nothing matched, and
         // carry the legacy value while a legacy-bound license is active.

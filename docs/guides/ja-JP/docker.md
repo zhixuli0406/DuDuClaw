@@ -437,7 +437,7 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml ru
 docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d --force-recreate duduclaw
 ```
 
-その後カードに「保護キーが置き換えられました」と表示されます。「再度有効にする」を選ぶと、保存済みの個人接続はすべて使えなくなり、各自が接続し直します。ネイティブの Linux には同等のモードがまだありません。
+その後カードに「保護キーが置き換えられました」と表示されます。「再度有効にする」を選ぶと、保存済みの個人接続はすべて使えなくなり、各自が接続し直します。ネイティブ Linux ホストでは[保護システムサービス](linux-protected-service.md)を利用できます。
 
 ## 8. ヘルスチェックと可観測性
 

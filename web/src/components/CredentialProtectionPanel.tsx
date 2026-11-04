@@ -32,6 +32,22 @@ import { toast, formatError } from '@/lib/toast';
 const BROKEN: readonly CredentialProtectionState[] = ['missing', 'key_changed', 'invalid'];
 // Only closed startup diagnostics become locale IDs; unknown codes use a safe fallback.
 const ROOT_KEY_REFUSALS = new Set([
+  'user_namespace', 'container_environment', 'reattest_unavailable', 'key_state_poisoned',
+  'mode',
+  'not_systemd_child',
+  'cgroup_v1',
+  'cgroup_unit',
+  'exe_stat',
+  'exe_type',
+  'exe_owner',
+  'exe_writable',
+  'exe_ancestor_type',
+  'exe_ancestor_owner',
+  'exe_ancestor_writable',
+  'supplementary_groups',
+  'engine_socket_reachable',
+  'engine_socket',
+  'mount_scan_incomplete',
   'inactive',
   'fd_contract',
   'fd_stat',

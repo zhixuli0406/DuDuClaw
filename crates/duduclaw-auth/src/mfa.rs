@@ -38,7 +38,14 @@ impl FirstFactor {
     }
 }
 
-pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let conn = &*tx;
+    let policy_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE lower(name)='mfa_policy_state')",
+        [], |r| r.get(0),
+    ).map_err(|e| e.to_string())?;
     if !crate::user_row::has_column(conn, "users", "credential_epoch")? {
         conn.execute_batch("ALTER TABLE users ADD COLUMN credential_epoch INTEGER NOT NULL DEFAULT 0;")
             .map_err(|e| e.to_string())?;
@@ -84,19 +91,52 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE mfa_enrollment_codes ADD COLUMN challenge TEXT;
             DELETE FROM mfa_enrollment_codes;") .map_err(|e|e.to_string())?;
     }
-    Ok(())
+    // Released v1.79.0-v1.79.2 created this table without seeding it.
+    // Only migration may initialize that legacy empty state; readers stay strict.
+    if !policy_exists {
+        conn.execute("INSERT OR IGNORE INTO mfa_policy_state(id,enforced,enforced_at) VALUES(1,?1,?2)",
+            params![enforced, enforced.then(|| chrono::Utc::now().timestamp_micros())])
+            .map_err(|e| e.to_string())?;
+    }
+    if policy_exists && conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())? == 0
+    {
+        conn.execute("INSERT INTO mfa_policy_state(id,enforced,enforced_at) VALUES(1,0,NULL)", [])
+            .map_err(|e| e.to_string())?;
+        tracing::warn!("Legacy unseeded MFA policy row was initialized as not enforced");
+    }
+    read_enforcement(conn)?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 // Read under the same immediate transaction as the credential mutation.
 fn policy_enforced(conn: &Connection) -> Result<bool> {
-    conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0))
-        .optional().map(|v| v.unwrap_or(false)).map_err(|e| e.to_string())
+    read_enforcement(conn)
+}
+
+/// A present policy table must contain exactly one valid singleton row.
+/// Do not use SQLite's permissive integer-to-bool conversion here.
+pub fn read_enforcement(conn: &Connection) -> Result<bool> {
+    let mut statement = conn.prepare("SELECT id, enforced FROM mfa_policy_state")
+        .map_err(|e| e.to_string())?;
+    let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+    let row = rows.next().map_err(|e| e.to_string())?
+        .ok_or("MFA policy singleton missing")?;
+    let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+    let value: i64 = row.get(1).map_err(|e| e.to_string())?;
+    if id != 1 || !matches!(value, 0 | 1) || rows.next().map_err(|e| e.to_string())?.is_some() {
+        return Err("MFA policy singleton invalid or duplicated".into());
+    }
+    Ok(value == 1)
 }
 
 /// Persist the observed policy transition; timestamps are Unix microseconds.
 /// A restart/reload of true preserves the original boundary.
 pub fn record_enforcement(conn: &mut Connection, enforced: bool, now: i64) -> Result<Option<i64>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+    // Schema initialization owns seeding. A policy transition must never
+    // turn a missing or malformed singleton into a valid disabled policy.
+    read_enforcement(&tx)?;
     tx.execute("INSERT INTO mfa_policy_state(id,enforced,enforced_at) VALUES(1,?1,?2)
         ON CONFLICT(id) DO UPDATE SET enforced=excluded.enforced,
         enforced_at=CASE WHEN excluded.enforced=0 THEN NULL WHEN mfa_policy_state.enforced=1

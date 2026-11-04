@@ -423,7 +423,7 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml ru
 docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d --force-recreate duduclaw
 ```
 
-The card then shows "Protection key was replaced". Choose **Re-enable**; every saved personal connection stops working and each person connects again. Bare-metal Linux has no equivalent mode yet.
+The card then shows "Protection key was replaced". Choose **Re-enable**; every saved personal connection stops working and each person connects again. For a native host, use the [Linux protected system service](linux-protected-service.md).
 
 ## 8. Health checks and observability
 
