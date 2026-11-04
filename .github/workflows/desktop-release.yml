@@ -106,13 +106,28 @@ jobs:
           cargo install tauri-cli --version "=2.12.4" --locked
           cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 
+      # Keep the shipped CLI sidecar on the same baseline as the CLI release.
+      - name: Install cross for Linux sidecar
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b
+        with:
+          tool: cross
+
       - name: Build & stage gateway sidecar
         shell: bash
         run: |
-          cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+          SIDECAR_TARGET_DIR=target
+          if [[ "${{ runner.os }}" == Linux ]]; then
+            # Never reuse native desktop host build scripts inside the older cross image.
+            SIDECAR_TARGET_DIR=target/linux-sidecar
+            CARGO_TARGET_DIR="$SIDECAR_TARGET_DIR" PKG_CONFIG_ALLOW_CROSS=1 cross build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }} --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+            python3 scripts/check_glibc.py "$SIDECAR_TARGET_DIR/${{ matrix.target }}/release/duduclaw"
+          else
+            cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+          fi
           mkdir -p src-tauri/binaries
           EXT=""; [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"
-          cp "target/${{ matrix.target }}/release/duduclaw${EXT}" \
+          cp "$SIDECAR_TARGET_DIR/${{ matrix.target }}/release/duduclaw${EXT}" \
              "src-tauri/binaries/duduclaw-${{ matrix.target }}${EXT}"
 
       - name: Import Apple certificate
