@@ -36,7 +36,13 @@ impl<'a> AgentResolver<'a> {
     /// Before 1.76 a step 0 matched `[agent] trigger` with an unanchored,
     /// sender-blind `contains`; that let anyone reach any employee.
     pub fn resolve(&self, message: &Message) -> Option<&'a LoadedAgent> {
-        self.resolve_explicit(message).or_else(|| self.registry.main_agent())
+        let agents = self.registry.list();
+        let configs: Vec<_> = agents.iter().map(|agent| &agent.config).collect();
+        // Conversation routing historically matches bindings by session shape,
+        // including WebChat threads. History authorization stays channel-bound.
+        resolve_config(&configs, message, true)
+            .and_then(|selected| agents.iter().copied().find(|agent| agent.config.agent.name == selected.agent.name))
+            .or_else(|| self.registry.main_agent())
     }
 
     /// Resolve only administrator-configured bindings or channel permissions.
@@ -54,9 +60,16 @@ impl<'a> AgentResolver<'a> {
 pub fn resolve_explicit_config<'a>(
     configs: &[&'a duduclaw_core::types::AgentConfig], message: &Message,
 ) -> Option<&'a duduclaw_core::types::AgentConfig> {
+    resolve_config(configs, message, false)
+}
+
+fn resolve_config<'a>(
+    configs: &[&'a duduclaw_core::types::AgentConfig], message: &Message,
+    conversation_routing: bool,
+) -> Option<&'a duduclaw_core::types::AgentConfig> {
     let mut configs = configs.to_vec();
     configs.sort_by(|a, b| a.agent.name.cmp(&b.agent.name));
-    if message.channel == "discord" {
+    if conversation_routing || message.channel == "discord" {
         if let Some((kind, id)) = parse_session_binding(&message.chat_id) {
             for config in &configs {
                 if let Some(discord) = config.channels.as_ref().and_then(|channels| channels.discord.as_ref()) {
