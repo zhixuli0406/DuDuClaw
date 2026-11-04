@@ -4775,7 +4775,14 @@ effect = "forbid"
         "tasks_update",
         "terminate_branch",
         "transcribe_audio",
+        // The meeting endpoint requires a verified employee and applies its transcription egress gate.
         "meeting_transcribe",
+        // Status reads only the verified employee's own meeting job.
+        "meeting_transcribe_status",
+        // Cancellation controls only the verified employee's own meeting job.
+        "meeting_transcribe_cancel",
+        // Issues a short-lived upload capability for that employee's transcription workflow.
+        "meeting_upload_link",
         "user_code_profile",
         "user_profile_get",
         "user_profile_record",
@@ -4826,7 +4833,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            255,
+            259,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
