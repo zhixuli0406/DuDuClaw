@@ -96,7 +96,7 @@ pub(super) fn draw(
     pane.pty_area = Rect::default();
     let waiting = pane.pty.as_ref().is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).waiting());
     let title = if waiting { format!("{title} · {}", crate::strings::PTY_WAITING) } else { title.into() };
-    let inner = super::widgets::panel_focus(frame, area, &title, settings, false, focused);
+    let inner = super::widgets::section(frame, area, &title, settings, false, focused);
     if inner.is_empty() {
         return;
     }

@@ -1,5 +1,5 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
-expression: "rendered.lines().find(|line|\nline.starts_with(\"[焦點：\")).unwrap().trim_end()"
+expression: "rendered.lines().find(|line|\nline.contains(\"自主:\")).map(str::trim_end).unwrap_or(\"沒有自主暫停\")"
 ---
-[焦點：清單]
+沒有自主暫停

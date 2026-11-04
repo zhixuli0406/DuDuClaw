@@ -31,18 +31,6 @@ pub(super) fn text(
         area,
     );
 }
-pub(super) fn panel(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    settings: &Settings,
-    stale: bool,
-) -> Rect {
-    if area.width < 2 || area.height < 2 {
-        return Rect::default();
-    }
-    panel_focus(frame, area, title, settings, stale, false)
-}
 pub(super) fn panel_focus(frame: &mut Frame, area: Rect, title: &str, settings: &Settings, stale: bool, focused: bool) -> Rect {
     use ratatui::{symbols::border, widgets::BorderType};
     let set = if settings.glyphs == crate::settings::Glyphs::Unicode {
@@ -71,6 +59,9 @@ pub(super) fn panel_focus(frame: &mut Frame, area: Rect, title: &str, settings: 
         (area.x,area.bottom()-1,set.bottom_left), (area.right()-rail,area.bottom()-1,set.bottom_right)] {
         put(x, y, symbol, rail);
     }
+    if title.is_empty() {
+        return Rect::new(area.x + rail, area.y + 1, area.width - rail * 2, area.height - 2);
+    }
     let safe_title = TerminalText::new(title.into());
     let available = area.width.saturating_sub(rail * 4);
     let title_columns = super::text::columns(&safe_title.plain().replace('\n', " "), settings.ambiguous_width);
@@ -85,6 +76,25 @@ pub(super) fn panel_focus(frame: &mut Frame, area: Rect, title: &str, settings: 
         visible: false, wrap: false, scroll: 0,
         style: if focused { border_style } else { style(settings, stale) } }, title_area);
     Rect::new(area.x + rail, area.y + 1, area.width - rail * 2, area.height - 2)
+}
+
+/// A persistent content region has a title and whitespace, never another ring.
+pub(super) fn section(frame: &mut Frame, area: Rect, title: &str, settings: &Settings, stale: bool, focused: bool) -> Rect {
+    if area.is_empty() || title.is_empty() { return area; }
+    let title_style = if stale { settings.colors.muted() } else if focused {
+        settings.colors.foreground(settings.colors.secondary)
+    } else { settings.colors.muted() };
+    frame.render_widget(SafeText { text: &TerminalText::new(title.into()), width: settings.ambiguous_width,
+        visible: false, wrap: false, scroll: 0, style: title_style }, Rect::new(area.x, area.y, area.width, 1));
+    Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1))
+}
+
+pub(super) fn separator(frame: &mut Frame, area: Rect, settings: &Settings) {
+    let glyph = if settings.glyphs == crate::settings::Glyphs::Unicode { "─" } else { "-" };
+    let width = super::text::columns(glyph, settings.ambiguous_width).max(1);
+    frame.render_widget(SafeText { text: &TerminalText::new(glyph.repeat(usize::from(area.width) / width)),
+        width: settings.ambiguous_width, visible: false, wrap: false, scroll: 0,
+        style: settings.colors.border_style(false) }, area);
 }
 
 pub(super) struct Row {
@@ -128,7 +138,7 @@ pub(super) fn rows(
                 scroll: 0,
                 style: if selected {
                     let selected = settings.colors.selected();
-                    if stale { selected.fg(settings.colors.muted).remove_modifier(Modifier::BOLD) } else { selected }
+                    if stale { settings.colors.readable_style(selected.fg(settings.colors.muted).remove_modifier(Modifier::BOLD)) } else { selected }
                 } else {
                     style(settings, stale)
                 },
@@ -143,7 +153,7 @@ pub(super) fn rows(
                 glyph_style = glyph_style.fg(if stale { settings.colors.muted } else { status.color(&settings.colors) });
                 if !stale { glyph_style = glyph_style.add_modifier(Modifier::BOLD); }
                 frame.render_widget(SafeText { text: &TerminalText::new(glyph.into()), width: settings.ambiguous_width,
-                    visible: false, wrap: false, scroll: 0, style: glyph_style },
+                    visible: false, wrap: false, scroll: 0, style: settings.colors.readable_style(glyph_style) },
                     Rect::new(area.x + 2, area.y + y as u16, glyph_width, 1));
             }
         }
@@ -170,7 +180,7 @@ pub(super) fn key_hints(frame: &mut Frame, area: Rect, value: TerminalText, sett
         if g == "\n" || x + n > area.right() { x = area.x; y += 1; }
         if y >= area.bottom() { break; }
         if g != " " && (g.is_ascii() || g.chars().all(|c| "↑↓←→".contains(c))) {
-            frame.buffer_mut()[(x,y)].set_style(settings.colors.emphasis(settings.colors.accent));
+            frame.buffer_mut()[(x,y)].set_style(settings.colors.foreground(settings.colors.accent));
         }
         x += n;
     }

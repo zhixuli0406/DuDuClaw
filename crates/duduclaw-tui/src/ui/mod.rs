@@ -17,6 +17,7 @@ mod card_tests;
 mod backend;
 mod osc11;
 mod panels;
+mod shell;
 mod workspace;
 mod chat_render;
 pub mod render;
@@ -67,7 +68,8 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
     }
     let guard = terminal::TerminalGuard::enter()?;
     // Negotiate only after raw mode, using the same event reader as the loop.
-    let mut reply_filter = if settings.theme == crate::theme::ThemeMode::Auto
+    let mut reply_filter = if (matches!(settings.theme, crate::theme::ThemeMode::Auto | crate::theme::ThemeMode::Ansi)
+        || settings.background == crate::theme::Background::Terminal)
         && settings.colors.capability != crate::theme::Capability::NoColor {
         let query = osc11::query_background();
         settings.resolve_theme(query.background);

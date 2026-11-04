@@ -29,7 +29,12 @@ fn toast_and_mailbox_snapshots() {
         notice(&mut app, Kind::Done, "研究員", None, now);
         let output = screen(&model, &app, &settings(glyphs), 110, 26);
         assert!(output.contains("完成 · 研究員") && output.contains("需要你 · 阿嘟"));
-        assert!(!output.contains("PRIVATE TASK CONTENT"));
+        // The wider, borderless sidebar may show the authorized inbox context.
+        // The toast itself must never copy that content, irrespective of sidebar clipping.
+        let mut terminal = Terminal::new(TestBackend::new(110, 26)).unwrap();
+        terminal.draw(|frame| super::super::notices::toasts(frame, frame.area(), &app, &settings(glyphs), now)).unwrap();
+        let toast_text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!toast_text.contains("PRIVATE TASK CONTENT"));
         insta::assert_snapshot!(format!("round3_toasts_stacked_{glyphs:?}"), output);
         app.notices.dismiss(app.notices.items[0].id);
         insta::assert_snapshot!(format!("round3_toast_persistent_{glyphs:?}"), screen(&model, &app, &settings(glyphs), 110, 26));

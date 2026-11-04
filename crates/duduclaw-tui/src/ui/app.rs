@@ -36,9 +36,11 @@ impl EmployeeStatus {
     pub fn color(self, theme: &crate::theme::Theme) -> ratatui::style::Color {
         match self {
             Self::Awaiting => theme.warning,
-            Self::Working => theme.info,
+            Self::Working => theme.success,
             Self::Done => theme.success,
             Self::Error => theme.danger,
+            Self::Paused | Self::AutonomyPaused => theme.paused,
+            Self::Idle => theme.idle,
             _ => theme.muted,
         }
     }

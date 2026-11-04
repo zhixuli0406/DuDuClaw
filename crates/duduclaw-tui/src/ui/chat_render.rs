@@ -1,7 +1,7 @@
 use super::{
     app::App,
     text::SafeText,
-    widgets::{panel_focus, style, text},
+    widgets::{section, style, text},
 };
 use crate::{
     sanitize::TerminalText,
@@ -48,7 +48,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
 }
 
 pub(super) fn draw_pane(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str, pane_index: usize) {
-    let inside = panel_focus(frame, area, title, settings, app.chat.stale, title.starts_with("> "));
+    let inside = section(frame, area, title, settings, app.chat.stale, title.starts_with("> "));
     if inside.is_empty() {
         return;
     }

@@ -86,10 +86,10 @@ impl App {
         }
         add(KeyCode::Char('I'), none, strings::INBOX, "I", "inbox");
         add(KeyCode::Char('M'), none, "通知信箱", "M", "mailbox notifications");
-        add(KeyCode::Char('z'), none, "放大／還原區塊", "z", "zoom fullscreen");
+        add(KeyCode::Char('z'), none, "放大／還原區塊", super::shell::ZOOM_KEY, "zoom fullscreen");
         if m2::manager(model) { add(KeyCode::Char('S'), none, strings::NEXT_RUNS, "S", "schedule heartbeat cron"); }
         add(KeyCode::Tab, none, "下一個員工分頁", "Tab", "tab workspace");
-        add(KeyCode::F(1), none, strings::CMD_HELP, "F1 / ?", "help");
+        add(KeyCode::F(1), none, strings::CMD_HELP, &format!("F1 / {}", super::shell::HELP_KEY), "help");
         add(
             KeyCode::PageUp,
             none,

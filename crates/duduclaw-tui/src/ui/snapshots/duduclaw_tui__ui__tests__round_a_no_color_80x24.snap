@@ -1,0 +1,40 @@
+---
+source: crates/duduclaw-tui/src/ui/tests.rs
+expression: output
+---
+
+  ◆ DuDuClaw         ╭────────────────────────────────────────────────────────╮
+                     │ ◉ 業務助理  claude · sonnet          對話  任務  紀錄  │
+  ⌕ 搜尋員工  Ctrl-P │ ────────────────────────────────────────────────────── │
+                     │  已連線                                                │
+   需要你            │ > 你: 幫我整理本週訂單                                 │
+  ›◉ 業務助理  待審  │ > 員工: 本週共 12 筆，已整理好，請確認報價。           │
+   ✕ 財務小幫手      │                                                        │
+                     │                                                        │
+   執行中            │                                                        │
+   ● 行銷寫手        │                                                        │
+                     │                                                        │
+   閒置              │                                                        │
+   ○ 研究員          │                                                        │
+   ⏸ 系統維運 (暫停) │                                                        │
+                     │                                                        │
+                     │                                                        │
+                     │                                                        │
+  I 收件匣        1  │                                                        │
+  S 排程          1  │                                                        │
+  ────────────────── │ 自主: 已暫停（系統維運）                               │
+  ● 已連線           │ ? 快捷鍵  p 暫停員工  z 放大  q 離開           v1.77.0 │
+          今日 $0.42 ╰────────────────────────────────────────────────────────╯
+
+
+Painted cells (foreground / background / modifiers):
+◆: Reset / Reset / NONE
+⌕: Reset / Reset / NONE
+╭: Reset / Reset / NONE
+›: Reset / Reset / REVERSED
+待: Reset / Reset / REVERSED
+暫: Reset / Reset / NONE
+●: Reset / Reset / NONE
+○: Reset / Reset / NONE
+⏸: Reset / Reset / NONE
+?: Reset / Reset / NONE

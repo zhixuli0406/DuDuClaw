@@ -1,82 +1,123 @@
 use super::{
-    app::{App, Selection, employee_status},
+    app::{App, EmployeeStatus, Selection, employee_status},
     text::{SafeText, columns, middle_ellipsis},
-    widgets::{Row, panel, rows, text, title},
+    widgets::{Row, section, rows, text, title},
 };
 use crate::{auth::Role, sanitize::TerminalText, settings::{Glyphs, Settings}, state::Model, state_extra::ScheduleSource, strings};
-use ratatui::{Frame, layout::Rect, style::Style};
+use ratatui::{Frame, layout::Rect, style::{Modifier, Style}};
 
-fn line(frame: &mut Frame, area: Rect, value: String, settings: &Settings, style: Style) {
+pub(super) fn line(frame: &mut Frame, area: Rect, value: String, settings: &Settings, style: Style) {
+    let style = settings.colors.readable_style(style);
     frame.render_widget(SafeText { text: &TerminalText::new(value), width: settings.ambiguous_width,
         visible: false, wrap: false, scroll: 0, style }, area);
 }
 
-pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, settings: &Settings) {
-    let stale = model.employees.count().is_none() || model.inbox.count().is_none();
-    let inside = panel(frame, area, &title(strings::EMPLOYEES, if stale { None } else { model.employees.count() }), settings, stale);
-    if inside.is_empty() { return; }
-    let compact = frame.area().width < 100;
-    let card_height = if compact { 1 } else { 2 };
-    let footer_height = if super::m2::manager(model) { 2 } else { 1 };
-    let available = inside.height.saturating_sub(footer_height);
-    let employees = super::workspace::employees(model, &app.read);
-    let selected = employees.iter().position(|e| app.selected == Some(Selection::Employee(e.id().into())));
-    let count = usize::from(available / card_height);
-    let offset = selected.map(|i| (i + 1).saturating_sub(count)).unwrap_or(0);
-    if employees.is_empty() {
-        text(frame, Rect::new(inside.x, inside.y, inside.width, available),
-            TerminalText::new(if stale { strings::STALE } else { strings::EMPTY_EMPLOYEES }.into()), settings, stale, true);
+fn group(status: EmployeeStatus) -> &'static str {
+    match status {
+        EmployeeStatus::Awaiting | EmployeeStatus::Error => "需要你",
+        EmployeeStatus::Working => "執行中",
+        _ => "閒置",
     }
-    for (index, employee) in employees.iter().skip(offset).take(count).enumerate() {
-        let y = inside.y + index as u16 * card_height;
+}
+
+/// Grouped, borderless employee rows. Navigation order is still workspace::employees.
+pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, settings: &Settings) {
+    if area.is_empty() { return; }
+    let stale = model.employees.count().is_none() || model.inbox.count().is_none();
+    let compact = frame.area().width < 100 || area.height < 7;
+    let row_height = if compact { 1 } else { 2 };
+    let employees = super::workspace::employees(model, &app.read);
+    if employees.is_empty() {
+        text(frame, area, TerminalText::new(if stale { strings::STALE } else { strings::EMPTY_EMPLOYEES }.into()), settings, stale, true);
+        return;
+    }
+    let mut positions = Vec::new();
+    let mut headings = Vec::new();
+    let mut previous = "";
+    let mut height = 0u16;
+    for employee in &employees {
+        let label = group(employee_status(employee, model, &app.read));
+        if label != previous {
+            if !previous.is_empty() { height = height.saturating_add(1); }
+            headings.push((height, label));
+            height = height.saturating_add(1);
+            previous = label;
+        }
+        positions.push(height);
+        height = height.saturating_add(row_height);
+    }
+    let overflow = height > area.height;
+    let available = area.height.saturating_sub(u16::from(overflow));
+    let selected = employees.iter().position(|e| app.selected == Some(Selection::Employee(e.id().into())));
+    let offset = selected.or(Some(0)).map(|i| positions[i].saturating_add(row_height).saturating_sub(available)).unwrap_or(0);
+    for (y, label) in headings {
+        if y >= offset && y < offset.saturating_add(available) {
+            line(frame, Rect::new(area.x + 1, area.y + y - offset, area.width.saturating_sub(1), 1),
+                label.into(), settings, settings.colors.muted());
+        }
+    }
+    let mut visible = 0;
+    for (index, employee) in employees.iter().enumerate() {
+        let position = positions[index];
+        if position < offset || position.saturating_add(row_height) > offset.saturating_add(available) { continue; }
+        visible += 1;
+        let y = area.y + position - offset;
         let selected = app.selected == Some(Selection::Employee(employee.id().into()));
-        let base = if selected { settings.colors.selected() } else { settings.colors.base() };
-        frame.buffer_mut().set_style(Rect::new(inside.x, y, inside.width, card_height), base);
+        let focused = app.focus == crate::chat::Focus::List && !app.help && app.card.is_none()
+            && app.control_card.is_none() && app.palette.is_none() && app.mailbox.is_none() && !app.pty_focus;
+        let base = if selected { settings.colors.selection(focused) } else { settings.colors.base() };
+        frame.buffer_mut().set_style(Rect::new(area.x, y, area.width, row_height), base);
         let status = employee_status(employee, model, &app.read);
-        let unread = model.inbox.items.iter().any(|i| i.agent().is(employee.id()) && !app.read.contains(&i.key()));
-        let marker = if unread { if settings.glyphs == Glyphs::Unicode { "▎" } else { "|" } } else { " " };
-        let marker_width = columns(marker, settings.ambiguous_width) as u16;
-        line(frame, Rect::new(inside.x, y, marker_width, 1), marker.into(), settings, base.fg(settings.colors.accent));
+        let unread = model.inbox.items.iter().any(|item| item.agent().is(employee.id()) && !app.read.contains(&item.key()));
+        let pointer = if selected { if settings.glyphs == Glyphs::Unicode { "›" } else { ">" } }
+            else if unread { if settings.glyphs == Glyphs::Unicode { "✦" } else { "*" } } else { " " };
+        line(frame, Rect::new(area.x, y, 1, 1), pointer.into(), settings, base.fg(settings.colors.accent));
         let glyph = status.glyph(settings.glyphs);
         let glyph_width = columns(glyph, settings.ambiguous_width) as u16;
-        line(frame, Rect::new(inside.x + marker_width, y, glyph_width, 1), glyph.into(), settings,
+        line(frame, Rect::new(area.x + 1, y, glyph_width.min(area.width.saturating_sub(1)), 1), glyph.into(), settings,
             base.fg(if stale { settings.colors.muted } else { status.color(&settings.colors) }));
-        let name_x = inside.x + marker_width + glyph_width + 1;
-        let status_width = if compact { 0 } else { columns(status.label(), settings.ambiguous_width) as u16 + 1 };
-        let name_width = inside.right().saturating_sub(name_x + status_width);
+        let name_x = (area.x + glyph_width + 2).min(area.right());
+        let pill = matches!(status, EmployeeStatus::Awaiting | EmployeeStatus::Paused | EmployeeStatus::AutonomyPaused);
+        let label = match status {
+            EmployeeStatus::Awaiting => "待審",
+            EmployeeStatus::Paused | EmployeeStatus::AutonomyPaused => "暫停",
+            _ => status.label(),
+        };
+        // Keep the pause word even in a collapsed sidebar; color is never the only channel.
+        let meta = if compact && !pill { String::new() } else if pill && !selected {
+            format!("({label})")
+        } else { format!(" {label} ") };
+        let meta_width = (columns(&meta, settings.ambiguous_width) as u16).min(area.right().saturating_sub(name_x));
+        let name_width = area.right().saturating_sub(name_x + meta_width + u16::from(meta_width > 0));
         let name = middle_ellipsis(&super::workspace::name(employee), usize::from(name_width), settings.ambiguous_width);
-        line(frame, Rect::new(name_x, y, name_width, 1), name, settings, base);
+        let name_style = base.fg(if selected { settings.colors.text } else { settings.colors.secondary });
+        line(frame, Rect::new(name_x, y, name_width, 1), name, settings,
+            if selected { name_style.add_modifier(Modifier::BOLD) } else { name_style });
+        if meta_width > 0 {
+            let badge_style = if pill && !stale {
+                if selected && settings.colors.capability != crate::theme::Capability::NoColor {
+                    settings.colors.warning_pill(true).remove_modifier(Modifier::REVERSED)
+                } else { base.fg(settings.colors.warning) }
+            } else { base.fg(settings.colors.muted) };
+            line(frame, Rect::new(area.right() - meta_width, y, meta_width, 1), meta, settings, badge_style);
+        }
         if !compact {
-            line(frame, Rect::new(inside.right().saturating_sub(status_width), y, status_width, 1),
-                format!(" {}", status.label()), settings, base.fg(if stale { settings.colors.muted } else { status.color(&settings.colors) }));
             let context = super::workspace::context(employee, model, app);
-            line(frame, Rect::new(inside.x + marker_width + 1, y + 1, inside.width.saturating_sub(marker_width + 1), 1),
+            line(frame, Rect::new(name_x, y + 1, area.right().saturating_sub(name_x), 1),
                 context.plain(), settings, base.fg(settings.colors.muted));
         }
     }
-    let inbox_y = inside.bottom().saturating_sub(footer_height);
-    let count = model.inbox.count().map(|n| n.to_string()).unwrap_or_else(|| "?".into());
-    let arrow = if settings.glyphs == Glyphs::Unicode { "▸" } else { ">" };
-    let inbox_selected = matches!(app.selected, Some(Selection::InboxEntry | Selection::Inbox(_)));
-    let base = if inbox_selected { settings.colors.selected() } else { settings.colors.base() };
-    let color = if model.inbox.count().is_some_and(|n| n > 0) { settings.colors.accent } else { settings.colors.muted };
-    let rect = Rect::new(inside.x, inbox_y, inside.width, 1);
-    frame.buffer_mut().set_style(rect, base);
-    line(frame, rect, format!("收件匣 {count} {arrow}  I"), settings, base.fg(color));
-    if footer_height > 1 {
-        let selected = matches!(app.selected, Some(Selection::ScheduleEntry | Selection::Schedule(_)));
-        let base = if selected { settings.colors.selected() } else { settings.colors.muted() };
-        let count = model.schedules.count().map(|n| n.to_string()).unwrap_or_else(|| "?".into());
-        let rect = Rect::new(inside.x, inbox_y + 1, inside.width, 1);
-        frame.buffer_mut().set_style(rect, base);
-        line(frame, rect, format!("排程 {count} {arrow}  S"), settings, base);
+    if overflow {
+        let marker = if settings.glyphs == Glyphs::Unicode { "…" } else { "..." };
+        line(frame, Rect::new(area.x + 1, area.bottom() - 1, area.width.saturating_sub(1), 1),
+            format!("{marker} 另 {} 位 · ↑↓", employees.len() - visible), settings, settings.colors.muted());
     }
 }
 
 pub(super) fn inbox(frame: &mut Frame, area: Rect, model: &Model, app: &App, settings: &Settings) {
     let stale = model.inbox.count().is_none();
-    let inside = panel(frame, area, &format!("{}{} · Esc 返回側欄", title(strings::INBOX, model.inbox.actionable_count()),
-        model.inbox.informational_count().filter(|n| *n > 0).map(|n| format!(" · {}", strings::inbox_information(n))).unwrap_or_default()), settings, stale);
+    let inside = section(frame, area, &format!("{}{} · Esc 返回側欄", title(strings::INBOX, model.inbox.actionable_count()),
+        model.inbox.informational_count().filter(|n| *n > 0).map(|n| format!(" · {}", strings::inbox_information(n))).unwrap_or_default()), settings, stale, false);
     if model.inbox.items.is_empty() {
         text(frame, inside, TerminalText::new(if stale { strings::STALE } else { strings::EMPTY_INBOX_GUIDE }.into()), settings, stale, true);
     } else {
@@ -92,7 +133,7 @@ pub(super) fn inbox(frame: &mut Frame, area: Rect, model: &Model, app: &App, set
 pub(super) fn schedules(frame: &mut Frame, area: Rect, model: &Model, app: &App, settings: &Settings) {
     let manager = super::m2::manager(model);
     let stale = model.schedules.count().is_none();
-    let inside = panel(frame, area, &format!("{} · Esc 返回側欄", strings::NEXT_RUNS), settings, stale);
+    let inside = section(frame, area, &format!("{} · Esc 返回側欄", strings::NEXT_RUNS), settings, stale, false);
     if !manager || model.schedules.items.is_empty() {
         text(frame, inside, TerminalText::new(if !manager { strings::ADMIN_ONLY } else if stale { strings::STALE } else { strings::NO_SCHEDULE }.into()), settings, stale, true);
         return;
@@ -117,23 +158,52 @@ pub(super) fn schedules(frame: &mut Frame, area: Rect, model: &Model, app: &App,
 }
 
 pub(super) fn tabs(frame: &mut Frame, area: Rect, model: &Model, app: &App, settings: &Settings) {
-    let agent = app.blocks.panes[app.blocks.focused].agent.as_deref();
-    let name = agent.and_then(|id| model.employees.items.iter().find(|e| e.id() == id)).map(super::workspace::name)
-        .or_else(|| agent.map(|id| TerminalText::new(id.into()).plain())).unwrap_or_default();
+    if area.is_empty() { return; }
+    let pane = &app.blocks.panes[app.blocks.focused];
+    let agent = pane.agent.as_deref().or(match &app.selected { Some(Selection::Employee(id)) => Some(id.as_str()), _ => None });
+    let employee = agent.and_then(|id| model.employees.items.iter().find(|e| e.id() == id));
+    let name = employee.map(super::workspace::name)
+        .or_else(|| agent.map(|id| TerminalText::new(id.into()).plain())).unwrap_or_else(|| "控制室".into());
     let labels = ["對話", "任務", "紀錄"];
-    let arrow = if settings.glyphs == Glyphs::Unicode { "▸" } else { ">" };
-    let tab_width: usize = labels.iter().map(|label| columns(&format!("{arrow} {label}  "), settings.ambiguous_width)).sum();
-    let name_budget = usize::from(area.width).saturating_sub(tab_width + 1).min(24);
-    let name = middle_ellipsis(&name, name_budget, settings.ambiguous_width);
+    let tabs_width: u16 = labels.iter().map(|label| columns(&format!(" {label} "), settings.ambiguous_width) as u16).sum();
+    let show_tabs = area.width >= tabs_width + 8;
+    let tabs_x = area.right().saturating_sub(if show_tabs { tabs_width } else { 0 });
+    let title_width = tabs_x.saturating_sub(area.x + u16::from(show_tabs));
+    let mut x = area.x;
+    if let Some(employee) = employee {
+        let status = employee_status(employee, model, &app.read);
+        let glyph = status.glyph(settings.glyphs);
+        let width = columns(glyph, settings.ambiguous_width) as u16;
+        line(frame, Rect::new(x, area.y, width.min(title_width), 1), glyph.into(), settings,
+            settings.colors.foreground(status.color(&settings.colors)));
+        x = x.saturating_add(width + 1).min(tabs_x);
+    }
+    let name = middle_ellipsis(&name, usize::from(title_width.saturating_sub(x - area.x)).min(24), settings.ambiguous_width);
     let name_width = columns(&name, settings.ambiguous_width) as u16;
-    line(frame, Rect::new(area.x, area.y, name_width, 1), name, settings, settings.colors.muted());
-    let mut x = area.x + name_width + u16::from(name_width > 0);
-    for (index, label) in labels.iter().enumerate() {
-        let active = app.workspace_tab() == index && matches!(app.blocks.active, crate::blocks::Block::Chat | crate::blocks::Block::Task | crate::blocks::Block::Run | crate::blocks::Block::Log);
-        let value = format!("{} {label}  ", if active { arrow } else { " " });
-        let width = columns(&value, settings.ambiguous_width) as u16;
-        line(frame, Rect::new(x, area.y, width.min(area.right().saturating_sub(x)), 1), value, settings,
-            if active { settings.colors.emphasis(settings.colors.accent) } else { settings.colors.muted() });
-        x = x.saturating_add(width).min(area.right());
+    line(frame, Rect::new(x, area.y, name_width, 1), name, settings, settings.colors.base().add_modifier(Modifier::BOLD));
+    x = x.saturating_add(name_width + 2).min(tabs_x);
+    // These are configured employee metadata from the existing agents.list response,
+    // not a claim about the model actually used after a per-run fallback.
+    let runtime = employee.and_then(|e| e.runtime.as_ref()).and_then(|r| r.provider.as_ref())
+        .map(TerminalText::plain).unwrap_or_default();
+    let model_name = employee.and_then(|e| e.model.as_ref()).and_then(|m| m.preferred.as_ref())
+        .map(TerminalText::plain).unwrap_or_default();
+    let runtime = [runtime.as_str(), model_name.as_str()].into_iter().filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>().join(" · ").replace('\n', " ");
+    line(frame, Rect::new(x, area.y, tabs_x.saturating_sub(x + u16::from(show_tabs)), 1), runtime, settings, settings.colors.muted());
+    if show_tabs {
+        x = tabs_x;
+        for (index, label) in labels.iter().enumerate() {
+            let active = app.workspace_tab() == index && matches!(app.blocks.active, crate::blocks::Block::Chat | crate::blocks::Block::Task | crate::blocks::Block::Run | crate::blocks::Block::Log);
+            let value = format!(" {label} ");
+            let width = columns(&value, settings.ambiguous_width) as u16;
+            let style = if active {
+                if matches!(settings.colors.capability, crate::theme::Capability::NoColor | crate::theme::Capability::Ansi16) {
+                    settings.colors.selected()
+                } else { settings.colors.on(settings.colors.hover).base() }
+            } else { settings.colors.muted() };
+            line(frame, Rect::new(x, area.y, width, 1), value, settings, style);
+            x += width;
+        }
     }
 }

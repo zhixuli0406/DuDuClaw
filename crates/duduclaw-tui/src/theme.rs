@@ -7,6 +7,7 @@ pub enum ThemeMode {
     Auto,
     Light,
     Dark,
+    Ansi,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability { TrueColor, Ansi256, Ansi16, NoColor }
@@ -33,11 +34,27 @@ pub fn resolve(mode: ThemeMode, background: Option<(u8, u8, u8)>, colorfgbg: Opt
     ThemeMode::Dark
 }
 
+/// Whether the two large canvas regions use the theme or terminal background.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Background {
+    #[default]
+    Theme,
+    Terminal,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub capability: Capability,
+    pub source_capability: Capability,
+    pub app_shell: Color,
+    pub page_canvas: Color,
+    /// The current painting surface (page canvas by default).
     pub background: Color,
+    pub surface: Color,
+    pub surface_raised: Color,
+    pub hover: Color,
     pub text: Color,
+    pub secondary: Color,
     pub muted: Color,
     pub border: Color,
     pub border_focus: Color,
@@ -46,48 +63,152 @@ pub struct Theme {
     pub warning: Color,
     pub danger: Color,
     pub info: Color,
+    pub brand: Color,
+    pub idle: Color,
+    pub paused: Color,
     pub selection_fg: Color,
     pub selection_bg: Color,
+    pub primary_fg: Color,
+    pub primary_bg: Color,
+    pub warning_fg: Color,
+    pub warning_bg: Color,
     pub header_bg: Color,
+    terminal_rgb: (u8, u8, u8),
 }
 impl Theme {
     pub fn new(mode: ThemeMode, capability: Capability) -> Self {
-        let light = mode == ThemeMode::Light;
-        if capability == Capability::Ansi16 {
-            let (background, text, muted, accent, success, danger, info) = if light {
-                (Color::White, Color::Black, Color::Black, Color::Red, Color::Green, Color::Magenta, Color::Blue)
-            } else {
-                (Color::Black, Color::White, Color::Gray, Color::LightYellow, Color::LightGreen, Color::LightRed, Color::LightCyan)
-            };
-            return Self { capability, background, text, muted, border: muted, border_focus: accent,
-                accent, success, warning: accent, danger, info, selection_fg: text,
-                selection_bg: background, header_bg: background };
-        }
-        let (bg, text, muted, accent, success, danger, info) = if light {
-            (0xF5F4F0, 0x102B48, 0x526274, 0x8A5A10, 0x146C4A, 0xA52E4D, 0x235F98)
-        } else {
-            (0x102B48, 0xF5F4F0, 0xA9B6C4, 0xE0A54F, 0x6AD6AA, 0xFF92A5, 0x8CC8FF)
-        };
+        Self::configured(mode, capability, Background::Theme, None, None)
+    }
+    pub fn configured(mode: ThemeMode, source_capability: Capability, background: Background,
+        terminal_rgb: Option<(u8, u8, u8)>, colorfgbg: Option<&str>) -> Self {
+        let resolved = resolve(if mode == ThemeMode::Ansi { ThemeMode::Auto } else { mode }, terminal_rgb, colorfgbg);
+        let light = resolved == ThemeMode::Light;
+        let capability = if mode == ThemeMode::Ansi && source_capability != Capability::NoColor {
+            Capability::Ansi16
+        } else { source_capability };
         let map = |hex| degrade(rgb(hex), capability);
-        Self {
-            capability, background: map(bg), text: map(text), muted: map(muted),
-            border: map(muted), border_focus: map(accent), accent: map(accent),
-            success: map(success), warning: map(accent), danger: map(danger), info: map(info),
-            selection_fg: map(text), selection_bg: map(if capability == Capability::Ansi256 { bg } else if light { 0xE5E1D7 } else { 0x1B3B58 }),
-            header_bg: map(bg),
+        let terminal_layers = mode == ThemeMode::Ansi;
+        let terminal_rgb = terminal_rgb.or_else(|| colorfgbg.filter(|s| s.len() <= 64)
+            .and_then(|s| s.rsplit(';').next()).and_then(|s| s.parse::<u8>().ok()).map(xterm_rgb))
+            .unwrap_or(if light { (255,255,255) } else { (0,0,0) });
+        let mut theme = if capability == Capability::Ansi16 {
+            let (bg, text, muted, accent, success, danger, info, brand) = if light {
+                (Color::White, Color::Black, Color::Black, Color::Red, Color::Green, Color::Magenta, Color::Blue, Color::Blue)
+            } else {
+                (Color::Black, Color::White, Color::Gray, Color::LightYellow, Color::LightGreen, Color::LightRed, Color::LightCyan, Color::LightCyan)
+            };
+            Self { capability, source_capability, app_shell: bg, page_canvas: bg, background: bg,
+                surface: bg, surface_raised: bg, hover: bg, text, secondary: muted, muted,
+                border: if light { Color::Gray } else { Color::DarkGray }, border_focus: accent,
+                accent, success, warning: accent, danger, info, brand, idle: muted, paused: muted,
+                selection_fg: text, selection_bg: bg, primary_fg: bg, primary_bg: text,
+                warning_fg: bg, warning_bg: accent, header_bg: bg, terminal_rgb }
+        } else {
+            let (shell, canvas, surface, raised, hover, selected, border, text, secondary, muted,
+                success, warning, danger, info, brand, idle, paused, primary_fg, primary_bg, warning_fg, warning_bg) = if light {
+                (0xF4F4F5, 0xFBFBFB, 0xFFFFFF, 0xFFFFFF, 0xF4F4F5, 0xE4E4E7, 0xE4E4E7,
+                 0x09090B, 0x3F3F46, 0x71717A, 0x1E7F45, 0x8A5A10, 0xC8102E, 0x2563EB,
+                 0x102B48, 0x71717A, 0x71717A, 0xF5F4F0, 0x102B48, 0x8A5A10, 0xF6E7CF)
+            } else {
+                (0x0D0D10, 0x131316, 0x18181B, 0x1E1E22, 0x27272A, 0x2E2E33, 0x2A2A2E,
+                 0xFAFAFA, 0xD4D4D8, 0xA1A1AA, 0x3FD49A, 0xE0A54F, 0xF0657C, 0x5B9BF5,
+                 0xBED4EB, 0x8B8E96, 0x6E717A, 0x102B48, 0xF5F4F0, 0x11110F, 0xE0A54F)
+            };
+            Self { capability, source_capability, app_shell: map(shell), page_canvas: map(canvas), background: map(canvas),
+                surface: map(surface), surface_raised: map(raised), hover: map(hover),
+                text: map(text), secondary: map(secondary), muted: map(muted), border: map(border),
+                border_focus: map(warning), accent: map(warning), success: map(success), warning: map(warning),
+                danger: map(danger), info: map(info), brand: map(brand), idle: map(idle), paused: map(paused),
+                selection_fg: map(text), selection_bg: map(selected), primary_fg: map(primary_fg), primary_bg: map(primary_bg),
+                warning_fg: map(warning_fg), warning_bg: map(warning_bg), header_bg: map(canvas), terminal_rgb }
+        };
+        if terminal_layers || background == Background::Terminal {
+            theme.app_shell = Color::Reset;
+            theme.page_canvas = Color::Reset;
+            theme.background = Color::Reset;
+            theme.header_bg = Color::Reset;
+        }
+        if terminal_layers {
+            theme.surface = Color::Reset;
+            theme.surface_raised = Color::Reset;
+            theme.hover = Color::Reset;
+            theme.selection_bg = Color::Reset;
+        }
+        theme
+    }
+    /// Preserve the dashboard tokens; adjust only an insufficient foreground/surface pair.
+    /// ANSI checks use reference colors. A user-customized terminal palette is not measurable.
+    pub fn readable(self, foreground: Color, background: Color) -> Color {
+        let Some(fg) = color_rgb(foreground) else { return foreground; };
+        let bg = color_rgb(background).unwrap_or(self.terminal_rgb);
+        if contrast(fg, bg) >= 4.5 { return foreground; }
+        match self.capability {
+            Capability::NoColor => Color::Reset,
+            Capability::Ansi256 => Color::Indexed((16..=255).filter(|&i| contrast(xterm_rgb(i), bg) >= 4.5)
+                .min_by_key(|&i| distance(fg, xterm_rgb(i))).unwrap_or(16)),
+            Capability::Ansi16 => {
+                let index = (0..16).filter(|&i| contrast(ANSI[i], bg) >= 4.5)
+                    .min_by_key(|&i| distance(fg, ANSI[i])).unwrap_or(0);
+                degrade(ANSI[index], Capability::Ansi16)
+            }
+            Capability::TrueColor => {
+                let end = if contrast((0,0,0), bg) > contrast((255,255,255), bg) { 0 } else { 255 };
+                for amount in 1..=255 {
+                    let mix = |c: u8| ((u32::from(c) * (255 - amount) + end * amount) / 255) as u8;
+                    let candidate = (mix(fg.0), mix(fg.1), mix(fg.2));
+                    if contrast(candidate, bg) >= 4.5 { return degrade(candidate, Capability::TrueColor); }
+                }
+                foreground
+            }
         }
     }
-    pub fn base(self) -> Style { Style::default().fg(self.text).bg(self.background) }
-    pub fn muted(self) -> Style { self.base().fg(self.muted) }
-    pub fn emphasis(self, color: Color) -> Style { self.base().fg(color).add_modifier(Modifier::BOLD) }
-    pub fn selected(self) -> Style {
-        if self.capability == Capability::NoColor {
-            self.base().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else { self.base().fg(self.selection_fg).bg(self.selection_bg).add_modifier(Modifier::BOLD) }
+    pub fn readable_style(self, style: Style) -> Style {
+        match (style.fg, style.bg) {
+            (Some(fg), Some(bg)) => style.fg(self.readable(fg, bg)),
+            _ => style,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn contrast_ratio(self, foreground: Color, background: Color) -> Option<f64> {
+        color_rgb(foreground).map(|fg| contrast(fg, color_rgb(background).unwrap_or(self.terminal_rgb)))
+    }
+    pub fn on(self, background: Color) -> Self { Self { background, ..self } }
+    pub fn foreground(self, color: Color) -> Style {
+        Style::default().fg(self.readable(color, self.background)).bg(self.background)
+    }
+    pub fn base(self) -> Style { self.foreground(self.text) }
+    pub fn muted(self) -> Style { self.foreground(self.muted) }
+    pub fn emphasis(self, color: Color) -> Style { self.foreground(color).add_modifier(Modifier::BOLD) }
+    pub fn selected(self) -> Style { self.selection(true) }
+    pub fn selection(self, focused: bool) -> Style {
+        if matches!(self.capability, Capability::NoColor | Capability::Ansi16) {
+            self.base().add_modifier(if focused { Modifier::REVERSED } else { Modifier::UNDERLINED })
+        } else {
+            self.on(if focused { self.selection_bg } else { self.hover }).foreground(self.selection_fg)
+        }
+    }
+    pub fn warning_pill(self, filled: bool) -> Style {
+        if filled { self.on(self.warning_bg).foreground(self.warning_fg) }
+        else { self.foreground(self.warning) }
     }
     pub fn border_style(self, focused: bool) -> Style {
-        if focused { self.emphasis(self.border_focus) } else { self.base().fg(self.border) }
+        if focused { self.emphasis(self.border_focus) } else { Style::default().fg(self.border).bg(self.background) }
     }
+}
+
+fn color_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    Some(match color {
+        Color::Reset => return None,
+        Color::Rgb(r,g,b) => (r,g,b), Color::Indexed(i) => xterm_rgb(i),
+        Color::Black => ANSI[0], Color::Red => ANSI[1], Color::Green => ANSI[2], Color::Yellow => ANSI[3],
+        Color::Blue => ANSI[4], Color::Magenta => ANSI[5], Color::Cyan => ANSI[6], Color::Gray => ANSI[7],
+        Color::DarkGray => ANSI[8], Color::LightRed => ANSI[9], Color::LightGreen => ANSI[10], Color::LightYellow => ANSI[11],
+        Color::LightBlue => ANSI[12], Color::LightMagenta => ANSI[13], Color::LightCyan => ANSI[14], Color::White => ANSI[15],
+    })
+}
+fn contrast(a: (u8,u8,u8), b: (u8,u8,u8)) -> f64 {
+    let (a,b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 fn rgb(hex: u32) -> (u8, u8, u8) { ((hex >> 16) as u8, (hex >> 8) as u8, hex as u8) }
 const ANSI: [(u8,u8,u8); 16] = [
@@ -181,43 +302,53 @@ mod tests {
         assert_eq!(degrade((255,0,0), Capability::Ansi16), Color::LightRed);
     }
     #[test]
-    fn degraded_palette_roles_meet_aa_with_reference_terminal_colors() {
-        let channel = |color| match color {
-            Color::Indexed(i) => xterm_rgb(i),
-            Color::Black => ANSI[0], Color::Red => ANSI[1], Color::Green => ANSI[2],
-            Color::Yellow => ANSI[3], Color::Blue => ANSI[4], Color::Magenta => ANSI[5],
-            Color::Cyan => ANSI[6], Color::Gray => ANSI[7], Color::DarkGray => ANSI[8],
-            Color::LightRed => ANSI[9], Color::LightGreen => ANSI[10], Color::LightYellow => ANSI[11],
-            Color::LightBlue => ANSI[12], Color::LightMagenta => ANSI[13], Color::LightCyan => ANSI[14],
-            Color::White => ANSI[15], _ => panic!("degraded color expected"),
-        };
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            for capability in [Capability::Ansi16, Capability::Ansi256] {
+    fn all_text_roles_meet_aa_on_every_surface() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::Ansi] {
+            for capability in [Capability::TrueColor, Capability::Ansi256, Capability::Ansi16] {
                 let t = Theme::new(mode, capability);
-                for bg in [t.background, t.selection_bg] {
-                    for fg in [t.text,t.muted,t.border,t.border_focus,t.accent,t.success,t.warning,t.danger,t.info,t.selection_fg] {
-                        let (a,b) = (luminance(channel(fg)),luminance(channel(bg)));
-                        let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
-                        assert!(ratio >= 4.5, "{mode:?} {capability:?} {fg:?}/{bg:?}: {ratio}");
+                for bg in [t.app_shell, t.page_canvas, t.surface, t.surface_raised, t.hover, t.selection_bg] {
+                    for fg in [t.text, t.secondary, t.muted, t.accent, t.success, t.warning, t.danger, t.info, t.brand, t.idle, t.paused] {
+                        let actual = t.readable(fg, bg);
+                        let ratio = contrast(color_rgb(actual).unwrap(), color_rgb(bg).unwrap_or(t.terminal_rgb));
+                        assert!(ratio >= 4.5, "{mode:?} {capability:?} {actual:?}/{bg:?}: {ratio}");
                     }
                 }
-            }
-        }
-        assert_eq!(adapt(Color::Rgb(1,2,3), Capability::NoColor), Color::Reset);
-        assert_eq!(adapt(Color::Indexed(196), Capability::NoColor), Color::Reset);
-    }
-    #[test]
-    fn truecolor_roles_meet_aa_on_normal_and_selection_backgrounds() {
-        let lum = |c| if let Color::Rgb(r,g,b) = c { luminance((r,g,b)) } else { panic!("RGB expected") };
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let t = Theme::new(mode, Capability::TrueColor);
-            for bg in [t.background, t.selection_bg] {
-                for fg in [t.text,t.muted,t.border,t.border_focus,t.accent,t.success,t.warning,t.danger,t.info,t.selection_fg] {
-                    let (a,b) = (lum(fg),lum(bg));
-                    let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
-                    assert!(ratio >= 4.5, "{mode:?} {fg:?}/{bg:?}: {ratio}");
+                for (fg,bg) in [(t.primary_fg,t.primary_bg), (t.warning_fg,t.warning_bg)] {
+                    assert!(contrast(color_rgb(t.readable(fg,bg)).unwrap(), color_rgb(bg).unwrap()) >= 4.5);
                 }
             }
         }
+    }
+    #[test]
+    fn dashboard_surfaces_and_faint_ring_are_preserved() {
+        for (mode, shell, canvas, surface, raised, border) in [
+            (ThemeMode::Dark, 0x0D0D10, 0x131316, 0x18181B, 0x1E1E22, 0x2A2A2E),
+            (ThemeMode::Light, 0xF4F4F5, 0xFBFBFB, 0xFFFFFF, 0xFFFFFF, 0xE4E4E7),
+        ] {
+            let t = Theme::new(mode, Capability::TrueColor);
+            for (color, value) in [(t.app_shell,shell), (t.page_canvas,canvas), (t.surface,surface), (t.surface_raised,raised), (t.border,border)] {
+                assert_eq!(color_rgb(color), Some(rgb(value)));
+            }
+            assert!(contrast(rgb(border), rgb(canvas)) < 1.5);
+        }
+    }
+    #[test]
+    fn ansi_and_terminal_background_preserve_capability_and_contrast() {
+        for background in [(0,0,0), (255,255,255), (120,120,120)] {
+            let t = Theme::configured(ThemeMode::Ansi, Capability::TrueColor, Background::Theme, Some(background), None);
+            assert_eq!(t.capability, Capability::Ansi16);
+            assert_eq!(t.source_capability, Capability::TrueColor);
+            assert_eq!(t.page_canvas, Color::Reset);
+            assert_eq!(t.app_shell, Color::Reset);
+            assert_eq!(t.surface, Color::Reset);
+            for fg in [t.text,t.muted,t.brand,t.success,t.warning,t.danger,t.info] {
+                assert!(contrast(color_rgb(t.readable(fg, Color::Reset)).unwrap(), background) >= 4.5);
+            }
+        }
+        let t = Theme::configured(ThemeMode::Dark, Capability::TrueColor, Background::Terminal, None, None);
+        assert_eq!(t.page_canvas, Color::Reset);
+        assert_ne!(t.surface, Color::Reset);
+        assert_eq!(adapt(Color::Rgb(1,2,3), Capability::NoColor), Color::Reset);
+        assert_eq!(adapt(Color::Indexed(196), Capability::NoColor), Color::Reset);
     }
 }

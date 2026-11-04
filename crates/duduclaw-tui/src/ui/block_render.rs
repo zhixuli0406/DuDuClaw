@@ -1,7 +1,7 @@
 use super::{
     app::App,
     text::SafeText,
-    widgets::{panel_focus, style, text},
+    widgets::{section, style, text},
 };
 use crate::{
     blocks::{Block, Pane, field},
@@ -303,6 +303,7 @@ pub(super) fn draw(
             _ => String::new(),
         };
         if !detail.is_empty() { title.push_str(&format!(" · {detail}")); }
+        if kind == Block::Chat && app.blocks.panes.len() == 1 { title.clear(); }
         if kind == Block::Chat && !(app.help && index == app.blocks.focused) {
             if index == app.blocks.focused {
                 super::chat_render::draw(frame, region, app, settings, &title);
@@ -327,7 +328,7 @@ pub(super) fn draw(
         } else {
             pane.data.stale
         };
-        let inner = panel_focus(frame, region, &title, settings, stale, index == app.blocks.focused);
+        let inner = section(frame, region, &title, settings, stale, index == app.blocks.focused);
         if kind == Block::Run && !(app.help && index == app.blocks.focused) {
             super::timeline::draw_run(frame, inner, &mut app.blocks.panes[index], settings, index == app.blocks.focused);
             continue;

@@ -52,6 +52,7 @@ impl DefaultLayout {
 pub struct Settings {
     pub theme: crate::theme::ThemeMode,
     pub colors: crate::theme::Theme,
+    pub background: crate::theme::Background,
     pub glyphs: Glyphs,
     pub ambiguous_width: AmbiguousWidth,
     pub poll_interval: Duration,
@@ -62,6 +63,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: crate::theme::ThemeMode::Auto,
+            background: crate::theme::Background::Theme,
             colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::from_env()),
             glyphs: Glyphs::default(),
             ambiguous_width: AmbiguousWidth::Narrow,
@@ -76,8 +78,8 @@ pub const MAX_POLL_SECONDS: u64 = 3600;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 impl Settings {
     pub fn resolve_theme(&mut self, background: Option<(u8, u8, u8)>) {
-        let mode = crate::theme::resolve(self.theme, background, std::env::var("COLORFGBG").ok().as_deref());
-        self.colors = crate::theme::Theme::new(mode, self.colors.capability);
+        self.colors = crate::theme::Theme::configured(self.theme, self.colors.source_capability, self.background,
+            background, std::env::var("COLORFGBG").ok().as_deref());
     }
     #[cfg(test)]
     pub(crate) fn test_defaults() -> Self {
@@ -123,6 +125,12 @@ impl Settings {
                     Some("auto") => result.theme = crate::theme::ThemeMode::Auto,
                     Some("light") => result.theme = crate::theme::ThemeMode::Light,
                     Some("dark") => result.theme = crate::theme::ThemeMode::Dark,
+                    Some("ansi") => result.theme = crate::theme::ThemeMode::Ansi,
+                    _ => bad = true,
+                },
+                "background" => match value.as_str() {
+                    Some("theme") => result.background = crate::theme::Background::Theme,
+                    Some("terminal") => result.background = crate::theme::Background::Terminal,
                     _ => bad = true,
                 },
                 "glyphs" => match value.as_str() {
@@ -259,9 +267,33 @@ mod visual_tests {
         assert_eq!(Settings::parse("glyphs = 'unicode'").0.glyphs, Glyphs::Unicode);
     }
     #[test]
+    fn background_is_strict_and_ansi_retains_terminal_capability() {
+        use crate::theme::{Background, Capability, Theme, ThemeMode};
+        for (value, expected) in [("theme", Background::Theme), ("terminal", Background::Terminal)] {
+            let (s, notice) = Settings::parse(&format!("background = '{value}'"));
+            assert_eq!(s.background, expected);
+            assert!(notice.is_none());
+        }
+        for bad in ["'transparent'", "true", "7", "['terminal']"] {
+            let (s, notice) = Settings::parse(&format!("background = {bad}\ntheme = 'ansi'"));
+            assert_eq!(s.background, Background::Theme);
+            assert_eq!(s.theme, ThemeMode::Ansi);
+            assert!(notice.is_some());
+        }
+        let mut s = Settings { theme: ThemeMode::Ansi, colors: Theme::new(ThemeMode::Dark, Capability::TrueColor), ..Settings::test_defaults() };
+        s.resolve_theme(Some((255,255,255)));
+        assert_eq!(s.colors.capability, Capability::Ansi16);
+        assert_eq!(s.colors.text, ratatui::style::Color::Black);
+        s.resolve_theme(Some((0,0,0)));
+        assert_eq!(s.colors.text, ratatui::style::Color::White);
+        s.theme = ThemeMode::Dark;
+        s.resolve_theme(None);
+        assert_eq!(s.colors.capability, Capability::TrueColor);
+    }
+    #[test]
     fn theme_is_strict_and_bad_fields_keep_valid_fields() {
         use crate::theme::ThemeMode;
-        for (value, expected) in [("auto",ThemeMode::Auto),("light",ThemeMode::Light),("dark",ThemeMode::Dark)] {
+        for (value, expected) in [("auto",ThemeMode::Auto),("light",ThemeMode::Light),("dark",ThemeMode::Dark),("ansi",ThemeMode::Ansi)] {
             let (s, notice) = Settings::parse(&format!("theme = '{value}'"));
             assert_eq!(s.theme, expected); assert!(notice.is_none());
         }

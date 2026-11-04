@@ -448,8 +448,10 @@ fn configuration_and_corrupt_state_notices_reach_status_line() {
         strings::READ_STATE_NOTICE
     ));
     let output = screen(&model, &app, &Settings::test_defaults(), 100, 30);
-    assert!(output.contains(strings::SETTINGS_NOTICE));
-    assert!(output.contains(strings::READ_STATE_NOTICE));
+    // Notices now wrap inside the content canvas; join its rendered rows, not borders/sidebar.
+    let content: String = output.lines().filter_map(|line| line.split('|').nth(1)).map(str::trim).collect();
+    assert!(content.contains(strings::SETTINGS_NOTICE));
+    assert!(content.contains(strings::READ_STATE_NOTICE));
 }
 #[test]
 fn loss_discards_live_hints_and_keeps_counts_unknown() {
@@ -606,8 +608,8 @@ fn hostile_chat_physical_lines_always_have_reserved_gutter() {
         let rows: Vec<_> = output.lines().filter(|line| line.contains(needle)).collect();
         assert!(!rows.is_empty(), "missing {needle}");
         for row in rows {
-            let (before, _) = row.split_once("|> ").expect("reserved gutter");
-            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 28, "{row}");
+            let (before, _) = row.split_once("> ").expect("reserved gutter");
+            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 37, "{row}");
         }
     }
     insta::assert_snapshot!("chat_forged_card", output);
@@ -867,7 +869,7 @@ fn m3_small_height_keeps_inbox_and_employee_rows() {
         let mut app = app.clone();
         app.notice = Some(strings::SETTINGS_NOTICE.into());
         let output = screen(&model, &app, &Settings::test_defaults(), 100, height);
-        assert!(output.contains("確認資料匯出"), "inbox row missing at {height}");
+        assert!(output.contains("收件匣"), "inbox navigation missing at {height}");
         assert!(output.contains("阿嘟"), "employee row missing at {height}");
         insta::assert_snapshot!(format!("m3_small_height_{height}"), output);
     }
@@ -889,9 +891,9 @@ fn m3_long_home_keeps_tail_in_both_width_modes() {
             row.trim_end().to_string()
         }).collect::<Vec<_>>().join("\n");
         assert!(app.help_text().plain().contains(&home.plain()));
-        assert!(output.lines().next().unwrap().contains(strings::CONNECTED));
-        // The single-line header may shorten the basename on very narrow screens.
-        assert!(output.contains('…'));
+        assert!(output.contains(strings::CONNECTED));
+        // Home moved to help; it no longer competes with the brand or connection.
+        assert!(!output.contains("very-long-home"));
         insta::assert_snapshot!(format!("m3_long_home_{width:?}"), output);
     }
 }
@@ -1262,13 +1264,13 @@ fn autonomy_status_line_snapshots_and_hostile_names() {
     ] {
         let m = autonomy_model(value);
         let rendered = screen(&m, &App::default(), &Settings::test_defaults(), 120, 16);
-        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().find(|line| line.starts_with("[焦點：")).unwrap().trim_end());
+        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().find(|line| line.contains("自主:")).map(str::trim_end).unwrap_or("沒有自主暫停"));
     }
     let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause},"state_error":null}));
     m.autonomy.error = Some(crate::Error::Timeout); m.autonomy.stale = true;
-    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.starts_with("[焦點：")).unwrap().trim_end());
+    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.contains("自主:")).unwrap().trim_end());
     m.autonomy = Default::default();
-    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.starts_with("[焦點：")).unwrap().trim_end());
+    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.contains("自主:")).unwrap().trim_end());
     m.autonomy = fresh(vec![crate::autonomy::Status::parse(json!({"global":null,"agents":{"adu":pause},"state_error":null})).unwrap()]);
     m.employees.items[0].display_name = TerminalText::new("阿\u{1b}[2K\u{202e}\u{200b}嘟\nhostile".into());
     let line = crate::autonomy::status_line(&m).unwrap().plain();
@@ -1707,8 +1709,8 @@ fn round1_visual_modes() {
                 output.push_str(&format!("{symbol}: {:?} / {:?} / {:?}\n", cell.fg, cell.bg, cell.modifier));
             }
         }
-        let footer_key = buffer.content.iter().enumerate().find(|(i,c)| *i / 110 >= 34 && c.symbol() == "C").map(|(_,c)| c).unwrap();
-        output.push_str(&format!("footer Ctrl-P: {:?} / {:?}\n", footer_key.fg, footer_key.modifier));
+        let footer_key = buffer.content.iter().enumerate().find(|(i,c)| *i / 110 >= 34 && c.symbol() == "?").map(|(_,c)| c).unwrap();
+        output.push_str(&format!("footer help: {:?} / {:?}\n", footer_key.fg, footer_key.modifier));
         assert_eq!(footer_key.fg, settings.colors.accent);
         if capability == Capability::NoColor {
             assert!(buffer.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
@@ -1787,9 +1789,10 @@ fn round2_sidebar_sizes_unicode_and_ascii() {
             let mut settings = Settings::test_defaults();
             settings.glyphs = glyphs;
             let output = screen(&model, &app, &settings, width, height);
-            assert!(output.contains("收件匣 1"));
+            assert!(output.lines().any(|line| line.contains("收件匣") && line.contains('1')));
             assert!(output.contains("對話"));
-            assert!(output.lines().next().unwrap().contains("$0.42"));
+            assert!(output.contains("$0.42"));
+            assert!(!output.lines().take(4).any(|line| line.contains("$0.42")));
             assert!(!output.chars().any(crate::sanitize::forbidden));
             if width >= 100 {
                 assert!(output.contains("第 2/5 回合 · 已 3 分"));
@@ -1813,7 +1816,7 @@ fn round2_sidebar_light_no_color_and_wide_ambiguous() {
         settings.glyphs = Glyphs::Unicode;
         settings.ambiguous_width = width;
         settings.theme = theme;
-        settings.colors.capability = capability;
+        settings.colors = crate::theme::Theme::new(theme, capability);
         settings.resolve_theme(None);
         let output = screen(&model, &app, &settings, 140,40);
         insta::assert_snapshot!(format!("round2_sidebar_{name}"), output);
@@ -2113,5 +2116,150 @@ fn live_chat_projection_survives_layout_tabs_zoom_and_reconnect() {
         assert!(output.contains(strings::CONNECTED), "{output}");
         assert!(!output.contains(strings::CONNECTING));
         assert!(!output.contains(strings::STALE));
+    }
+}
+
+
+#[test]
+fn round_a_shell_snapshots_and_painted_layers() {
+    use crate::theme::{Capability, Theme, ThemeMode};
+    let (mut model, mut app) = round2_fixture();
+    for (id, name) in [("plain", "業務助理"), ("error", "財務小幫手"), ("prod", "行銷寫手"), ("writer", "研究員"), ("ops", "系統維運")] {
+        model.employees.items.iter_mut().find(|e| e.id() == id).unwrap().display_name = TerminalText::new(name.into());
+    }
+    app.selected = Some(Selection::Employee("plain".into()));
+    app.open_workspace(&model, 0);
+    let current = model.employees.items.iter_mut().find(|e| e.id() == "plain").unwrap();
+    *current = serde_json::from_value(json!({"name":"plain","display_name":"業務助理","status":"active","archived":false,
+        "runtime":{"provider":"claude"},"model":{"preferred":"sonnet","fallback":"other"}})).unwrap();
+    for (name, mode, capability) in [("dark",ThemeMode::Dark,Capability::TrueColor),
+        ("light",ThemeMode::Light,Capability::TrueColor), ("ansi",ThemeMode::Ansi,Capability::TrueColor),
+        ("no_color",ThemeMode::Dark,Capability::NoColor)] {
+        for (width,height) in [(80,24), (100,30), (140,40), (200,50)] {
+            let settings = Settings { glyphs: Glyphs::Unicode, theme: mode, colors: Theme::new(mode,capability), ..Settings::test_defaults() };
+            let mut output = screen(&model, &app, &settings, width, height);
+            assert_eq!(output.matches('╭').count(), 1, "one persistent ring");
+            for required in ["DuDuClaw", "Ctrl-P", "需要你", "執行中", "閒置", "待審", "暫停", "收件匣", "排程", "已連線", "$0.42", "v1.77.0", "q 離開"] {
+                assert!(output.contains(required), "{name} {width}x{height}: missing {required}\n{output}");
+            }
+            let mut copy = app.clone();
+            let mut terminal = Terminal::new(TestBackend::new(width,height)).unwrap();
+            crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
+                terminal.draw(|f| render::draw(f, &model, &connection(), &TerminalText::new("~/.duduclaw".into()), &mut copy, &settings)).unwrap();
+            });
+            let buffer = terminal.backend().buffer();
+            let colors = settings.colors;
+            assert_eq!(buffer[(0,0)].bg, colors.app_shell);
+            assert!(buffer.content.iter().any(|c| c.bg == colors.page_canvas));
+            let ring = buffer.content.iter().find(|c| c.symbol() == "╭").unwrap();
+            assert_eq!(ring.fg, colors.border);
+            if name == "no_color" {
+                assert!(buffer.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+                assert!(buffer.content.iter().any(|c| c.modifier.contains(Modifier::REVERSED)));
+            }
+            if name == "ansi" {
+                assert!(buffer.content.iter().all(|c| !matches!(c.fg, Color::Rgb(..) | Color::Indexed(_)) && !matches!(c.bg, Color::Rgb(..) | Color::Indexed(_))));
+                assert_eq!(buffer[(0,0)].bg, Color::Reset);
+            }
+            for cell in &buffer.content {
+                if cell.symbol().trim().is_empty() || "─│╭╮╯╰".contains(cell.symbol()) { continue; }
+                if let Some(ratio) = colors.contrast_ratio(cell.fg,cell.bg) {
+                    assert!(ratio >= 4.5, "{name} {width}x{height} {:?}: {:?}/{:?} = {ratio}", cell.symbol(),cell.fg,cell.bg);
+                }
+            }
+            output.push_str("\nPainted cells (foreground / background / modifiers):\n");
+            for symbol in ["◆", "⌕", "╭", "›", "待", "暫", "●", "○", "⏸", "?"] {
+                if let Some(cell) = buffer.content.iter().find(|c| c.symbol() == symbol) {
+                    output.push_str(&format!("{symbol}: {:?} / {:?} / {:?}\n", cell.fg, cell.bg, cell.modifier));
+                }
+            }
+            insta::assert_snapshot!(format!("round_a_{name}_{width}x{height}"), output);
+        }
+    }
+}
+
+#[test]
+fn round_a_overflow_selection_and_wide_shell_keep_physical_columns() {
+    let (mut model, mut app) = round2_fixture();
+    for index in 0..40 { model.employees.items.push(employee(&format!("extra{index:02}"), &format!("測試員工 {index:02}"), "active")); }
+    app.selected = Some(Selection::Employee("extra39".into()));
+    for glyphs in [Glyphs::Ascii, Glyphs::Unicode] {
+        for ambiguous_width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
+            let settings = Settings { glyphs, ambiguous_width, ..Settings::test_defaults() };
+            for (width,height) in [(80,24), (100,30), (140,40), (200,50)] {
+                let output = screen(&model, &app, &settings, width,height);
+                assert!(output.contains("39"));
+                assert!(output.contains("另 "));
+                assert!(output.contains("收件匣"));
+            }
+        }
+    }
+}
+
+
+#[test]
+fn round_a_stale_selected_rows_keep_text_contrast() {
+    use crate::theme::{Capability, Theme, ThemeMode};
+    let mut model = populated();
+    model.inbox.stale = true;
+    model.schedules.stale = true;
+    for selection in [Selection::Inbox(model.inbox.items[0].key()), Selection::Schedule(model.schedules.items[0].id.clone())] {
+        for capability in [Capability::TrueColor, Capability::Ansi256, Capability::Ansi16] {
+            let settings = Settings { colors: Theme::new(ThemeMode::Light,capability), ..Settings::test_defaults() };
+            let mut app = App::default();
+            app.selected = Some(selection.clone());
+            app.main_view = if matches!(selection, Selection::Inbox(_)) { super::workspace::MainView::Inbox } else { super::workspace::MainView::Schedules };
+            let mut terminal = Terminal::new(TestBackend::new(140,30)).unwrap();
+            terminal.draw(|f| render::draw(f, &model, &connection(), &TerminalText::default(), &mut app, &settings)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut selected_text = 0;
+            for y in 0..30 {
+                for x in 37..138 {
+                    let cell = &buffer[(x,y)];
+                    if cell.symbol().trim().is_empty() || "-|+".contains(cell.symbol()) { continue; }
+                    if cell.bg == settings.colors.selection_bg || cell.modifier.contains(Modifier::REVERSED) {
+                        selected_text += 1;
+                        let ratio = settings.colors.contrast_ratio(cell.fg,cell.bg).unwrap();
+                        assert!(ratio >= 4.5, "{capability:?} {:?}: {ratio}", cell.symbol());
+                    }
+                }
+            }
+            assert!(selected_text > 0);
+        }
+    }
+}
+
+#[test]
+fn round_a_header_uses_optional_agent_metadata_and_sanitizes_it() {
+    let mut model = empty();
+    model.employees = fresh(vec![serde_json::from_value(json!({"name":"adu","display_name":"阿嘟","status":"active","archived":false,
+        "runtime":{"provider":"claude\u{1b}]52;c;secret\u{07}"},"model":{"preferred":"sonnet\n第二行"}})).unwrap()]);
+    let mut app = App::default();
+    app.refresh(&model);
+    let output = screen(&model, &app, &Settings::test_defaults(), 140,30);
+    assert!(output.lines().nth(2).unwrap().contains("claude"));
+    assert!(output.lines().nth(2).unwrap().contains("sonnet 第二行"));
+    assert!(!output.chars().any(crate::sanitize::forbidden));
+    model.employees.items[0] = employee("adu","阿嘟","active");
+    let output = screen(&model, &app, &Settings::test_defaults(), 140,30);
+    assert!(!output.contains("claude") && !output.contains("sonnet"));
+}
+
+#[test]
+fn round_a_large_cost_keeps_connection_and_respects_role() {
+    let (mut model, app) = round2_fixture();
+    model.cost_millicents = Some(u64::MAX);
+    for glyphs in [Glyphs::Ascii, Glyphs::Unicode] {
+        for ambiguous_width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
+            for width in [60,80,100,140] {
+                let settings = Settings { glyphs, ambiguous_width, ..Settings::test_defaults() };
+                let output = screen(&model, &app, &settings,width,30);
+                assert!(output.contains("已連線"), "{output}");
+                assert!(output.contains('$'));
+                model.role = Some(Role::Employee);
+                assert!(!screen(&model, &app, &settings,width,30).contains('$'));
+                model.role = Some(Role::Admin);
+            }
+        }
     }
 }

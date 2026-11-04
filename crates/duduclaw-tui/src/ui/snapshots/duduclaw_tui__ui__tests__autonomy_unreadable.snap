@@ -1,5 +1,5 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
-expression: "screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line|\nline.starts_with(\"[焦點：\")).unwrap().trim_end()"
+expression: "screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line|\nline.contains(\"自主:\")).unwrap().trim_end()"
 ---
-[焦點：清單] · 自主: 狀態無法讀取，待確認
+  S 排程                        0  | 自主: 狀態無法讀取，待確認                                                       |
