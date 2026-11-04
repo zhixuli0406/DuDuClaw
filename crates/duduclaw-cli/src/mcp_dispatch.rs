@@ -4636,6 +4636,8 @@ effect = "forbid"
         "github_pr_read",
         "github_search_issues",
         "github_status",
+        // Group context is gated by explicit group binding and messaging:read scope.
+        "group_history_read",
         "gmail_create_draft",
         "gmail_read",
         "gmail_search",
