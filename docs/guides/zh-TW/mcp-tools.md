@@ -12,7 +12,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 `meeting_transcribe` 接受呼叫員工自己附件中的 `source_path`，以及選用的 `engine`、
 `language_hint`（預設 `zh-TW`）、`write_wiki`（預設 `false`），回傳
-背景工作編號與狀態。以 `meeting_transcribe_status`／`meeting_transcribe_cancel` 帶 `job_id` 查詢或取消自己的工作；`meeting_upload_link {}` 提供原對話用的一次性大檔上傳連結。範圍沿用 `transcribe_audio` 的 `messaging:send`，另須已驗證的員工身分，
+背景工作編號與狀態；音訊會送至管理員設定的服務商。以 `meeting_transcribe_status`／`meeting_transcribe_cancel` 帶 `job_id` 查詢或取消自己的工作；`meeting_upload_link {}` 提供原對話用的一次性大檔上傳連結。範圍沿用 `transcribe_audio` 的 `messaging:send`，另須已驗證的員工身分，
 並通過原有能力、核准及資料外送閘。外部 fallback 命名空間不能使用。
 效果分類是寫入保存資料並對外送出內容；選用引擎必須與管理員設定的服務一致。
 

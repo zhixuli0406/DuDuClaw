@@ -213,7 +213,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "meeting_transcribe",
-        description: "將自己的附件錄音或影片轉成臺灣繁體中文逐字稿，產生 Markdown 與 JSON 附件及預覽。音訊會傳送至設定的雲端服務商；Gemini 免費方案的內容可能用於改善產品。立即回傳工作編號；用 meeting_transcribe_status 查進度或 meeting_transcribe_cancel 取消。完成後通知原對話。跨段講者標籤可能不一致。",
+        description: "將自己的附件音訊或影片交由設定的服務商轉錄，並在背景啟動工作。",
         params: &[
             ParamDef { name: "source_path", description: "自己附件目錄內的錄音或影片路徑。", required: false },
             ParamDef { name: "drive_file_id", description: "目前不支援影音下載；請先下載並上傳至員工附件。不可與 source_path 同時使用。", required: false },

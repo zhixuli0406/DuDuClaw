@@ -16,7 +16,9 @@ without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 `meeting_transcribe` takes `source_path` from the calling employee's own attachments,
 optional `engine`, `language_hint` (default `zh-TW`) and `write_wiki` (default `false`).
-It immediately returns a job ID and state. Use `meeting_transcribe_status` and `meeting_transcribe_cancel` with `job_id` for the employee's own jobs. `meeting_upload_link {}` (also used when no usable source path exists) returns a single-upload link for the original conversation. It requires the same
+It starts a background job and immediately returns its ID and state. The audio is
+sent to the configured transcription provider. Use `meeting_transcribe_status` and
+`meeting_transcribe_cancel` with `job_id` for the employee's own jobs. `meeting_upload_link {}` (also used when no usable source path exists) returns a single-upload link for the original conversation. It requires the same
 `messaging:send` scope as `transcribe_audio`, plus an authenticated employee identity
 and the existing capability, approval and outgoing-data gates. External fallback
 namespaces cannot use it. Its effect is a stored-data change with network egress.

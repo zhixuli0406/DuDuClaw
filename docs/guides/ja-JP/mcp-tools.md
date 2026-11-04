@@ -12,7 +12,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 
 `meeting_transcribe` は呼び出す従業員自身の添付ファイルの `source_path` と、任意の
 `engine`、`language_hint`（既定 `zh-TW`）、`write_wiki`（既定 `false`）を受け取り、
-背景仕事の ID と状態を返します。`meeting_transcribe_status`／`meeting_transcribe_cancel` に `job_id` を渡して自分の仕事を確認・キャンセルできます。`meeting_upload_link {}` は元の会話用の一回限りのアップロードリンクを返します。`transcribe_audio` と同じ
+背景仕事の ID と状態を返し、音声は管理者が設定したプロバイダーに送信します。`meeting_transcribe_status`／`meeting_transcribe_cancel` に `job_id` を渡して自分の仕事を確認・キャンセルできます。`meeting_upload_link {}` は元の会話用の一回限りのアップロードリンクを返します。`transcribe_audio` と同じ
 `messaging:send` スコープに加え、検証済みの従業員 ID と既存の能力・承認・外部送信
 ゲートが必要です。外部 fallback 名前空間では使用できません。効果は保存データの
 変更とネットワーク送信です。任意のエンジンは管理者の設定と一致する必要があります。
