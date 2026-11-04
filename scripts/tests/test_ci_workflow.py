@@ -139,6 +139,18 @@ class CiWorkflowTests(unittest.TestCase):
                             if job == "dashboard" else "${{ !cancelled() }}")
                 self.assertEqual(self.jobs[job]["if"], expected)
 
+    def test_python_checks_embedded_paths_on_every_pr(self):
+        steps = self.jobs["python"]["steps"]
+        commands = (
+            "python3 -m unittest discover -s scripts/tests -p 'test_check_embedded_paths.py' -v",
+            "python3 scripts/check_embedded_paths.py . container/Dockerfile.server",
+            "python3 scripts/check_embedded_paths.py . container/Dockerfile.edition-smoke --stage builder",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                step = next(s for s in steps if command in s.get("run", "").splitlines())
+                self.assertNotIn("if", step)
+
     def test_prs_run_linux_and_main_nightly_manual_run_all_platforms(self):
         matrix = self.jobs["rust"]["strategy"]["matrix"]["os"]
         expression = re.fullmatch(

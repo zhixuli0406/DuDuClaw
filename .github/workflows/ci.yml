@@ -315,6 +315,9 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_ci*.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_check_glibc.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_check_embedded_paths.py' -v
+          python3 scripts/check_embedded_paths.py . container/Dockerfile.server
+          python3 scripts/check_embedded_paths.py . container/Dockerfile.edition-smoke --stage builder
           python3 -m unittest scripts.tests.test_server_entrypoint -v
       - name: Test distributor release tooling
         run: |
