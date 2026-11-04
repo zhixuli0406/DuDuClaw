@@ -111,8 +111,8 @@ describe('<CredentialProtectionPanel>', () => {
     );
     expect(screen.queryByRole('button', { name: 'Move to system keychain' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Turn off' })).toBeNull();
-    expect(screen.getByText(/separate-key startup mode described in the deployment guide/)).toHaveTextContent(
-      'the dashboard shows the actual gateway state',
+    expect(screen.getByText(/verify the release and install from a root-owned location/)).toHaveTextContent(
+      'check the dashboard for the gateway state',
     );
   });
 });
@@ -136,17 +136,17 @@ describe('container credential protection', () => {
       'Credential protection: Separate key (AI employees cannot read it)',
     );
     expect(screen.queryByText(/system keychain/i)).toBeNull();
-    expect(screen.getByText(/only the container’s startup step/)).toHaveTextContent(
+    expect(screen.getByText(/only the protected service’s startup step/)).toHaveTextContent(
       'read the token issued for its turn, and make DuDuClaw stop',
     );
-    expect(screen.getByText(/only the container’s startup step/)).toHaveTextContent(
-      'Anyone who controls the Docker host or the key volume can read the key',
+    expect(screen.getByText(/only the protected service’s startup step/)).toHaveTextContent(
+      'Anyone who controls the Linux host, Docker host or root-key storage can read the key',
     );
   });
 
   it.each([
     ['missing', /cannot find the protected key saved for this data folder/],
-    ['key_changed', /Losing or replacing the key volume also causes this/],
+    ['key_changed', /Losing or replacing the root key also causes this/],
   ] as const)('explains container %s without keychain instructions', async (state, text) => {
     mockProtection(status({ backend: 'container_root_key', platform_level: 'process_isolated', state }));
     renderWithProviders(<CredentialProtectionPanel />);
@@ -164,7 +164,7 @@ describe('container credential protection', () => {
       backend: 'container_root_key',
       platform_level: 'process_isolated',
       state: 'unavailable',
-      refusal_reason: 'docker_socket',
+      refusal_reason: 'engine_socket_reachable',
     }));
     renderWithProviders(
       <IntlProvider locale={locale} messages={messages}>
@@ -172,12 +172,31 @@ describe('container credential protection', () => {
       </IntlProvider>,
     );
     expect((await screen.findByTestId('credential-protection-refusal')).textContent).toBe(
-      messages['security.credentialProtection.refusal.docker_socket'],
+      messages['security.credentialProtection.refusal.engine_socket_reachable'],
     );
     expect(screen.getByTestId('credential-protection-line')).toHaveTextContent(
       messages['security.credentialProtection.state.unavailable_container'],
     );
   });
+
+  for (const [locale, messages] of [['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP]] as const) {
+    it.each(['user_namespace', 'container_environment', 'reattest_unavailable', 'key_state_poisoned'] as const)(
+      `shows the specific protection refusal %s in ${locale}`,
+      async (reason) => {
+        mockProtection(status({
+          backend: 'container_root_key', platform_level: 'process_isolated',
+          state: 'unavailable', refusal_reason: reason,
+        }));
+        renderWithProviders(
+          <IntlProvider locale={locale} messages={messages}><CredentialProtectionPanel /></IntlProvider>,
+        );
+        const refusal = await screen.findByTestId('credential-protection-refusal');
+        expect(refusal.textContent).toBe(messages[`security.credentialProtection.refusal.${reason}`]);
+        expect(refusal.textContent).not.toBe(messages['security.credentialProtection.refusal.unknown']);
+        expect(screen.queryByRole('button', { name: messages['security.credentialProtection.enable_container'] })).toBeNull();
+      },
+    );
+  }
 
   it('does not expose an unknown startup diagnostic as a locale ID or raw message', async () => {
     mockProtection(status({ backend: 'container_root_key', state: 'unavailable', refusal_reason: 'untrusted diagnostic' }));
@@ -224,7 +243,7 @@ describe('container credential protection', () => {
     renderWithProviders(<CredentialProtectionPanel />);
     await userEvent.click(await screen.findByRole('button', { name: 'Turn off' }));
     expect(screen.getByText(/The encrypted copy of the protected key will be deleted/)).toHaveTextContent(
-      'The startup key volume remains',
+      'The startup root key remains',
     );
     expect(screen.queryByText(/system keychain/i)).toBeNull();
     const buttons = screen.getAllByRole('button', { name: 'Turn off' });

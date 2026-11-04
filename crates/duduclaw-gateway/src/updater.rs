@@ -10,7 +10,7 @@
 //! - [H2] URL validation inside `apply_update` (both download + checksum URLs) [R2:NC1]
 //! - [H3] CSPRNG random temp file name + directory permission check [R2:NH1]
 //! - [H4] Cleanup `.bak` after successful update
-//! - [H5] 200 MB download + decompression size limit [R2:NC2]
+//! - [H5] Separate archive, binary and total decompression limits [R2:NC2]
 //! - [M1] release_notes truncated to 8 KB
 //! - [M3] Pre-release tag tolerance in semver comparison
 //! - [M4] All filesystem ops use `tokio::fs` (async)
@@ -35,6 +35,10 @@ const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
 /// Rotating the key requires shipping a release signed by the OLD key that
 /// contains the NEW shared `OFFICIAL_PUBLISHER_KEY` constant.
 pub(crate) const UPDATE_PUBKEY: &str = duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY;
+#[path = "updater/protected_release.rs"]
+mod protected_release;
+pub use protected_release::download_protected_release;
+
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
 /// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
 pub fn current_version() -> &'static str {
@@ -62,6 +66,7 @@ pub fn set_version_override(version: &str) {
 /// Defaults to `false`. Overridable via `[gateway].auto_update` in config.toml
 /// or `DUDUCLAW_AUTO_UPDATE` env var (`1`/`true` to enable, `0`/`false` to disable).
 pub fn auto_update_enabled(home_dir: &std::path::Path) -> bool {
+    if is_native_protected_install() { return false; }
     // 1. Env override takes priority
     if let Ok(val) = std::env::var("DUDUCLAW_AUTO_UPDATE") {
         return matches!(val.as_str(), "1" | "true" | "yes");
@@ -124,8 +129,12 @@ pub async fn on_disk_version() -> Option<String> {
     parse_cli_version_output(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
-pub const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+/// Maximum compressed release download (256 MiB).
+pub const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum extracted executable (768 MiB).
+pub const MAX_BINARY_BYTES: u64 = 768 * 1024 * 1024;
+/// Maximum decompressed archive stream, including skipped entries and metadata.
+pub const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Back-off between download retries, in seconds. Length + 1 = max attempts
 /// (2026-08-04 field report: a v1.50.0 → v1.51.0 install failed with a red
 /// error seconds after the release was published, and the very next manual
@@ -185,6 +194,8 @@ pub enum InstallMethod {
     /// deployment honestly reports "no update channel" rather than offering an
     /// install button that is guaranteed to be refused.
     Pro,
+    /// Root-owned native service; upgrades require the operator installer.
+    Manual,
     Standalone,
     Source,
     Unknown,
@@ -199,6 +210,7 @@ pub enum InstallMethod {
 ///   is true information), but nothing in this process can install one.
 /// - `"github"` — the public CE release channel.
 pub fn update_channel_label(provider_present: bool) -> &'static str {
+    if is_native_protected_install() { return "none"; }
     if provider_present {
         return "control_plane";
     }
@@ -217,6 +229,23 @@ pub fn update_channel_label(provider_present: bool) -> &'static str {
 pub fn is_containerized() -> bool {
     duduclaw_core::ns_guard::is_containerized()
 }
+
+/// This only narrows update permissions; it does not attest credential protection.
+pub fn is_native_protected_install() -> bool {
+    cfg!(target_os = "linux") && native_protected_install(
+        is_containerized(),
+        std::env::var("DUDUCLAW_PROTECTED_KEY_MODE").ok().as_deref(),
+        &duduclaw_core::platform::executable_path(),
+    )
+}
+
+fn native_protected_install(containerized: bool, mode: Option<&str>, exe: &std::path::Path) -> bool {
+    !containerized && (mode == Some("native-systemd")
+        || exe == std::path::Path::new("/opt/duduclaw/bin/duduclaw"))
+}
+
+pub const NATIVE_PROTECTED_UPDATE_HINT: &str =
+    "此服務由 root 管理。請執行 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux";
 
 /// Result of applying an update.
 #[derive(Debug, Clone, Serialize)]
@@ -404,6 +433,7 @@ fn is_pro_wrapper_exe(exe: &std::path::Path) -> bool {
 }
 
 pub fn detect_install_method() -> InstallMethod {
+    if is_native_protected_install() { return InstallMethod::Manual; }
     let exe = duduclaw_core::platform::executable_path();
     if exe.as_os_str().is_empty() {
         return InstallMethod::Unknown;
@@ -785,6 +815,7 @@ pub async fn apply_update_with_progress(
     checksum_url: &str,
     on_progress: ProgressSink<'_>,
 ) -> Result<ApplyResult, String> {
+    if is_native_protected_install() { return Err(NATIVE_PROTECTED_UPDATE_HINT.into()); }
     // [C2] Concurrency guard
     if UPDATE_IN_PROGRESS
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -935,27 +966,12 @@ async fn install_archive_bytes(
     current_exe: &std::path::Path,
     exe_dir: &std::path::Path,
 ) -> Result<ApplyResult, String> {
-    // Extract binary
-    info!("Extracting binary...");
-    let new_binary_bytes =
-        extract_binary_from_archive(archive_bytes, archive_binary_name(current_exe))?;
-
-    // [R2:NC2] Verify decompressed size
-    if new_binary_bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-        return Err(format!(
-            "Extracted binary too large: {} bytes (limit: {MAX_DOWNLOAD_BYTES})",
-            new_binary_bytes.len()
-        ));
-    }
-
-    // [H3][R2:NH1] CSPRNG random temp file name
-    let random_suffix = uuid::Uuid::new_v4();
-    let tmp_path = exe_dir.join(format!(".duduclaw-update-{random_suffix}.tmp"));
-
-    // Write temp file — all cleanup below uses helper to ensure tmp is removed on error
-    tokio::fs::write(&tmp_path, &new_binary_bytes)
-        .await
-        .map_err(|e| format!("Failed to write temp binary: {e}"))?;
+    // Stream into a private, exclusively created staging file; never buffer the binary.
+    let mut staged = tempfile::Builder::new().prefix(".duduclaw-update-")
+        .tempfile_in(exe_dir).map_err(|e| format!("Failed to stage binary: {e}"))?;
+    extract_binary_to(archive_bytes, archive_binary_name(current_exe), staged.as_file_mut())?;
+    staged.as_file().sync_all().map_err(|e| format!("Failed to sync binary: {e}"))?;
+    let tmp_path = staged.into_temp_path();
 
     // [R2:NH4] From here on, any error must clean up tmp_path
     let result = apply_update_inner(&tmp_path, current_exe, exe_dir).await;
@@ -981,6 +997,7 @@ async fn install_archive_bytes(
 ///    gate the CE path applies, so a world-writable install directory cannot be
 ///    used to land a binary.
 pub async fn install_verified_binary(archive_bytes: &[u8]) -> Result<ApplyResult, String> {
+    if is_native_protected_install() { return Err(NATIVE_PROTECTED_UPDATE_HINT.into()); }
     if is_containerized() {
         return Err(
             "容器內不執行 binary 換裝（image 不可變，換裝會在重建容器時還原）——請改用 image 更新流程"
@@ -1045,25 +1062,19 @@ pub async fn fetch_asset_bytes(
 
     // [H5] Size limit — a declared over-limit body is not worth retrying.
     if let Some(len) = resp.content_length() {
-        if len > MAX_DOWNLOAD_BYTES {
-            return Err(StageError::fatal(format!(
-                "{what} too large: {len} bytes (limit: {MAX_DOWNLOAD_BYTES})"
-            )));
+        check_size(len, MAX_DOWNLOAD_BYTES, what).map_err(StageError::fatal)?;
+    }
+
+    let mut resp = resp;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await
+        .map_err(|e| StageError::transient(format!("Failed to read {what}: {e}")))? {
+        if chunk.len() as u64 > MAX_DOWNLOAD_BYTES.saturating_sub(bytes.len() as u64) {
+            return Err(StageError::fatal(format!("{what} exceeded size limit")));
         }
+        bytes.extend_from_slice(&chunk);
     }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| StageError::transient(format!("Failed to read {what}: {e}")))?;
-
-    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-        return Err(StageError::fatal(format!(
-            "{what} exceeded size limit: {} bytes",
-            bytes.len()
-        )));
-    }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Verify a downloaded archive against its checksum sidecar and its minisign
@@ -1270,116 +1281,113 @@ impl Drop for UpdateGuard {
 // Archive extraction [C3][R2:NH3] — rejects absolute paths, symlinks, hard links
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn extract_binary_from_archive(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, String> {
-    if let Ok(result) = extract_from_tar_gz(archive_bytes, target) {
-        return Ok(result);
-    }
+    let mut output = Vec::new();
+    extract_binary_to(archive_bytes, target, &mut output)?;
+    Ok(output)
+}
 
+fn extract_binary_to(archive_bytes: &[u8], target: &str, output: &mut impl std::io::Write) -> Result<u64, String> {
+    check_size(archive_bytes.len() as u64, MAX_DOWNLOAD_BYTES, "Compressed archive")?;
     #[cfg(target_os = "windows")]
-    if let Ok(result) = extract_from_zip(archive_bytes, target) {
-        return Ok(result);
+    if archive_bytes.starts_with(b"PK") {
+        return extract_from_zip_to(archive_bytes, target, output);
     }
-
-    Err(format!("Binary '{target}' not found in archive"))
+    extract_tar_to(archive_bytes, target, output, MAX_BINARY_BYTES, MAX_ARCHIVE_BYTES)
 }
 
+#[cfg(test)]
 fn extract_from_tar_gz(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-
-    let gz = flate2::read::GzDecoder::new(archive_bytes);
-    let mut archive = tar::Archive::new(gz);
-
-    for entry in archive
-        .entries()
-        .map_err(|e| format!("Invalid tar.gz: {e}"))?
-    {
-        let mut entry = entry.map_err(|e| format!("Archive entry error: {e}"))?;
-
-        // [R2:NH3] Reject symlinks and hard links
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
-            warn!("Skipping symlink/hardlink entry in archive");
-            continue;
-        }
-
-        let path = entry
-            .path()
-            .map_err(|e| format!("Invalid path in archive: {e}"))?;
-
-        // [R2:NH3] Reject absolute paths and path traversal
-        if path.is_absolute()
-            || path.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir | std::path::Component::RootDir
-                )
-            })
-        {
-            warn!(?path, "Skipping unsafe archive entry");
-            continue;
-        }
-
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-        if file_name == target {
-            // [R2:NC2] Size-limited read
-            let mut buf = Vec::new();
-            entry
-                .take(MAX_DOWNLOAD_BYTES)
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("Failed to read binary from archive: {e}"))?;
-            if buf.len() as u64 >= MAX_DOWNLOAD_BYTES {
-                return Err("Extracted binary exceeds size limit (possible zip bomb)".into());
-            }
-            return Ok(buf);
-        }
-    }
-
-    Err(format!("'{target}' not found in tar.gz"))
+    let mut output = Vec::new();
+    extract_tar_to(archive_bytes, target, &mut output, MAX_BINARY_BYTES, MAX_ARCHIVE_BYTES)?;
+    Ok(output)
 }
 
-#[cfg(target_os = "windows")]
-fn extract_from_zip(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, String> {
-    use std::io::Read;
+fn check_size(size: u64, limit: u64, what: &str) -> Result<(), String> {
+    if size > limit { Err(format!("{what} too large: {size} bytes (limit: {limit})")) }
+    else { Ok(()) }
+}
 
-    let cursor = std::io::Cursor::new(archive_bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid zip: {e}"))?;
-
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| format!("Zip entry error: {e}"))?;
-
-        let name = file
-            .name()
-            .map_err(|e| format!("Zip entry name error: {e}"))?
-            .into_owned();
-
-        // [R2:NH3] Reject path traversal and absolute paths
-        if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
-            warn!(name, "Skipping unsafe zip entry");
-            continue;
+// Count actual decompression, including tar metadata and skipped entries.
+// One extra byte distinguishes an exact boundary from overflow.
+struct ArchiveBudget<R> { reader: R, remaining: u64 }
+impl<R: std::io::Read> std::io::Read for ArchiveBudget<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() { return Ok(0); }
+        let len = buf.len().min(self.remaining.saturating_add(1).min(usize::MAX as u64) as usize);
+        let n = self.reader.read(&mut buf[..len])?;
+        if n as u64 > self.remaining {
+            return Err(std::io::Error::other("Total decompressed archive exceeds size limit"));
         }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
 
-        let file_name = std::path::Path::new(&name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+fn copy_binary(reader: &mut impl std::io::Read, output: &mut impl std::io::Write, limit: u64) -> Result<u64, String> {
+    let mut hash = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buffer).map_err(|e| format!("Archive read failed: {e}"))?;
+        if n == 0 { break; }
+        total = total.checked_add(n as u64).ok_or("Binary size overflow")?;
+        if total > limit { return Err("Extracted binary exceeds size limit".into()); }
+        hash.update(&buffer[..n]);
+        output.write_all(&buffer[..n]).map_err(|e| format!("Staging write failed: {e}"))?;
+    }
+    info!(bytes = total, sha256 = %hex::encode(hash.finalize()), "Extracted release binary");
+    Ok(total)
+}
 
-        if file_name == target {
-            // [R2:NC2] Size-limited read
-            let mut buf = Vec::new();
-            file.take(MAX_DOWNLOAD_BYTES)
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("Failed to read binary from zip: {e}"))?;
-            if buf.len() as u64 >= MAX_DOWNLOAD_BYTES {
-                return Err("Extracted binary exceeds size limit (possible zip bomb)".into());
-            }
-            return Ok(buf);
+fn extract_tar_to(archive_bytes: &[u8], target: &str, output: &mut impl std::io::Write,
+    binary_limit: u64, archive_limit: u64) -> Result<u64, String> {
+    let gz = flate2::read::GzDecoder::new(archive_bytes);
+    let mut archive = tar::Archive::new(ArchiveBudget { reader: gz, remaining: archive_limit });
+    let mut found = None;
+    for entry in archive.entries().map_err(|e| format!("Invalid tar.gz: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("Archive entry error: {e}"))?;
+        let path = entry.path().map_err(|e| format!("Invalid archive path: {e}"))?;
+        let safe = !path.is_absolute() && !path.components().any(|c| matches!(c,
+            std::path::Component::ParentDir | std::path::Component::RootDir));
+        if safe && path.file_name().and_then(|n| n.to_str()) == Some(target)
+            && entry.header().entry_type().is_file() {
+            if found.is_some() { return Err("Duplicate release binary".into()); }
+            if entry.size() > binary_limit { return Err("Extracted binary exceeds size limit".into()); }
+            found = Some(copy_binary(&mut entry, output, binary_limit)?);
         }
     }
+    // tar stops at its end marker. Drain the decoder as well so trailing data
+    // cannot escape the global budget or gzip integrity checks.
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+        .map_err(|e| format!("Archive read failed: {e}"))?;
+    found.ok_or_else(|| format!("'{target}' not found in tar.gz"))
+}
 
-    Err(format!("'{target}' not found in zip"))
+#[cfg(any(target_os = "windows", test))]
+fn extract_from_zip_to(archive_bytes: &[u8], target: &str, output: &mut impl std::io::Write) -> Result<u64, String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(archive_bytes))
+        .map_err(|e| format!("Invalid zip: {e}"))?;
+    let mut remaining = MAX_ARCHIVE_BYTES;
+    let mut found = None;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| format!("Zip entry error: {e}"))?;
+        let name = file.name().map_err(|e| format!("Zip name error: {e}"))?.into_owned();
+        let selected = !name.contains("..") && !name.starts_with('/') && !name.starts_with('\\')
+            && std::path::Path::new(&name).file_name().and_then(|n| n.to_str()) == Some(target);
+        if selected && !file.is_file() { return Err("Release binary is not a regular file".into()); }
+        if file.size() > remaining { return Err("Total decompressed archive exceeds size limit".into()); }
+        let mut reader = ArchiveBudget { reader: &mut file, remaining };
+        if selected {
+            if found.is_some() { return Err("Duplicate release binary".into()); }
+            found = Some(copy_binary(&mut reader, output, MAX_BINARY_BYTES)?);
+        } else {
+            std::io::copy(&mut reader, &mut std::io::sink()).map_err(|e| format!("Zip read failed: {e}"))?;
+        }
+        remaining = reader.remaining;
+    }
+    found.ok_or_else(|| format!("'{target}' not found in zip"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,6 +1599,17 @@ mod tests {
     }
 
     #[test]
+    fn native_protected_update_is_manual() {
+        let native = std::path::Path::new("/opt/duduclaw/bin/duduclaw");
+        let other = std::path::Path::new("/usr/bin/duduclaw");
+        assert!(native_protected_install(false, None, native));
+        assert!(native_protected_install(false, Some("native-systemd"), other));
+        assert!(!native_protected_install(true, Some("native-systemd"), native));
+        assert!(!native_protected_install(false, Some("native-systemd-extra"), other));
+        assert_eq!(serde_json::to_string(&InstallMethod::Manual).unwrap(), "\"manual\"");
+    }
+
+    #[test]
     fn test_detect_install_method() {
         let method = detect_install_method();
         let _serialized = serde_json::to_string(&method).unwrap();
@@ -1771,6 +1790,87 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         );
         // The CE name is not in a Pro archive — the pre-fix failure.
         assert!(extract_binary_from_archive(&gz_bytes, binary_name()).is_err());
+    }
+
+    #[test]
+    fn updater_size_boundaries() {
+        use std::io::Read;
+        assert_eq!(MAX_DOWNLOAD_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MAX_BINARY_BYTES, 768 * 1024 * 1024);
+        assert_eq!(MAX_ARCHIVE_BYTES, 1024 * 1024 * 1024);
+        for limit in [MAX_DOWNLOAD_BYTES, MAX_BINARY_BYTES, MAX_ARCHIVE_BYTES] {
+            for size in [limit - 1, limit, limit + 1] {
+                assert_eq!(check_size(size, limit, "test").is_ok(), size <= limit);
+            }
+        }
+        for len in [7, 8, 9] {
+            let bytes = vec![42; len];
+            let mut output = Vec::new();
+            assert_eq!(copy_binary(&mut bytes.as_slice(), &mut output, 8).is_ok(), len <= 8);
+            let mut budget = ArchiveBudget { reader: bytes.as_slice(), remaining: 8 };
+            assert_eq!(budget.read_to_end(&mut Vec::new()).is_ok(), len <= 8);
+        }
+    }
+
+    #[test]
+    fn updater_tar_budget_walks_entries_after_binary() {
+        use std::io::Write;
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, bytes) in [("duduclaw", b"binary!".as_slice()), ("python/large.py", &[42u8; 2048][..])] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, bytes).unwrap();
+        }
+        let raw = tar.into_inner().unwrap();
+        let size = raw.len() as u64;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        for binary_limit in [6, 7, 8] {
+            assert_eq!(extract_tar_to(&compressed, "duduclaw", &mut Vec::new(), binary_limit, size).is_ok(), binary_limit >= 7);
+        }
+        for budget in [size - 1, size, size + 1] {
+            assert_eq!(extract_tar_to(&compressed, "duduclaw", &mut Vec::new(), 8, budget).is_ok(), budget >= size);
+        }
+        assert!(extract_tar_to(&compressed, "duduclaw", &mut Vec::new(), 8, 1024)
+            .unwrap_err().contains("size limit"));
+        let mut trailing = raw;
+        trailing.extend_from_slice(&[42; 1024]);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&trailing).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(extract_tar_to(&compressed, "duduclaw", &mut Vec::new(), 8, size)
+            .unwrap_err().contains("size limit"));
+    }
+
+    #[test]
+    fn test_zip_binary_requires_regular_file() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        for kind in ["file", "directory", "symlink"] {
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = SimpleFileOptions::default();
+            match kind {
+                "directory" => archive.add_directory("duduclaw.exe/", options).unwrap(),
+                "symlink" => archive.add_symlink("duduclaw.exe", "elsewhere", options).unwrap(),
+                _ => {
+                    archive.start_file("duduclaw.exe", options).unwrap();
+                    archive.write_all(b"binary").unwrap();
+                }
+            }
+            let bytes = archive.finish().unwrap().into_inner();
+            let mut output = Vec::new();
+            let result = extract_from_zip_to(&bytes, "duduclaw.exe", &mut output);
+            if kind == "file" {
+                assert_eq!(result.unwrap(), 6);
+                assert_eq!(output, b"binary");
+            } else {
+                assert!(result.is_err(), "{kind} must be refused");
+                assert!(output.is_empty());
+            }
+        }
     }
 
     #[test]

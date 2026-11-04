@@ -36,7 +36,7 @@ fn roundtrip_gate_and_rotation_preserve_app_bound_fingerprint_limit() {
     assert_ne!(reset.key_id, enabled.key_id);
     let err = cp.person_identity_gate().unwrap().unseal(&sealed).unwrap_err();
     assert_eq!(err.code, "key_changed");
-    assert!(err.message_zh.contains("金鑰磁碟區"));
+    assert!(err.message_zh.contains("儲存位置中的根金鑰"));
     assert!(!err.message_zh.contains("系統金鑰圈"));
     cp.disable().unwrap();
     assert!(!blob(&home).exists());
@@ -130,4 +130,15 @@ fn refused_startup_is_unavailable_even_without_a_marker() {
     assert_eq!(cp.enable(false).unwrap_err().code, "unavailable");
     assert!(cp.enable(true).is_err());
     assert!(RefusedRootStore("docker_socket").delete("unused").is_ok());
+}
+
+#[test]
+fn attested_store_has_no_wrapping_key_fallback() {
+    let home = TempHome::new("attested-no-key");
+    let store = ContainerRootStore::attested(home.path());
+    let account = super::marker::account_for_home(home.path());
+    // The harness has no launcher key. A production store must not retain a
+    // synthetic or stale wrapping key or write a new usable blob.
+    assert!(matches!(store.write_new(&account, &[7; 32]), Err(StoreError::Unavailable(_))));
+    assert!(!blob(&home).exists());
 }
