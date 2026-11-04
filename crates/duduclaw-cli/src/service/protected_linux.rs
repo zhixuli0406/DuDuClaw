@@ -26,7 +26,7 @@ const LAUNCHER: &str = "/usr/local/libexec/duduclaw/protected-launcher";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const UNIT_PATH: &str = "/etc/systemd/system/duduclaw-gateway.service";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const LAUNCHER_TEXT: &str = include_str!("../../../../container/native-protected-launcher.sh");
+const LAUNCHER_TEXT: &str = include_str!("../../assets/native-protected-launcher.sh");
 
 fn refused(reason: impl std::fmt::Display) -> DuDuClawError {
     DuDuClawError::Config(format!("Protected Linux service refused: {reason}"))
