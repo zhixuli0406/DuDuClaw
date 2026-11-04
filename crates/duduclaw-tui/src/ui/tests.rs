@@ -2041,3 +2041,77 @@ fn round2_removed_employee_waits_for_help_or_palette_to_close() {
 
 #[path = "round3_tests.rs"]
 mod round3;
+
+
+#[test]
+fn live_chat_projection_survives_layout_tabs_zoom_and_reconnect() {
+    use crate::{chat::{ChatRooms, Frame}, settings::DefaultLayout};
+    use tokio::sync::watch;
+    for layout in [DefaultLayout::Single, DefaultLayout::Vertical, DefaultLayout::Horizontal] {
+        let mut app = App::default();
+        app.blocks = layout.blocks();
+        let mut model = Model::default();
+        let (tx, mut rx) = watch::channel(ChatRooms::default());
+        let mut rooms = ChatRooms::default();
+        rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+        tx.send_replace(rooms.clone());
+        app.sync_chats(&rx.borrow_and_update());
+        let mut revision = app.blocks.revision;
+        // Several empty feed refreshes after the only handshake cannot lose it.
+        for _ in 0..3 {
+            app.refresh(&model);
+            super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        }
+        model.inbox = fresh(vec![]);
+        model.employees = fresh(vec![employee("adu", "阿嘟", "active")]);
+        app.refresh(&model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        assert!(app.chat.connected && !app.chat.stale);
+        assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+        // Preserve the chat as a hidden tab, then disconnect while zoomed.
+        app.input = "draft must survive".into();
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        app.key(ordinary_key('z'), &model);
+        assert!(app.zoomed);
+        assert!(app.blocks.parked.iter().any(|p| p.kind == crate::blocks::Block::Chat));
+        rooms.disconnected();
+        tx.send_replace(rooms.clone());
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        for pane in app.blocks.panes.iter().chain(&app.blocks.parked).filter(|p| p.kind == crate::blocks::Block::Chat) {
+            assert!(!pane.chat_view.state.connected && pane.chat_view.state.stale);
+        }
+        // Fresh RPC state must not pretend a disconnected WebChat is healthy.
+        app.refresh(&model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        assert!(!app.chat.connected && app.chat.stale);
+        assert_eq!(app.input, "draft must survive");
+        rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"next"}"#).unwrap());
+        tx.send_replace(rooms);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        assert!(app.chat.connected && !app.chat.stale);
+        assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+        for pane in app.blocks.panes.iter().chain(&app.blocks.parked).filter(|p| p.kind == crate::blocks::Block::Chat) {
+            assert!(pane.chat_view.state.connected && !pane.chat_view.state.stale);
+            assert_eq!(pane.chat_view.state.status.visible(), strings::CONNECTED);
+        }
+        // Inspect the actual chat renderer, excluding unrelated stale panels.
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| super::chat_render::draw(frame, frame.area(), &mut app, &Settings::test_defaults(), "對話")).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for y in 0..20 {
+            let mut x = 0;
+            while x < 100 {
+                let cell = &buffer[(x, y)];
+                output.push_str(cell.symbol());
+                x += cell.cell_width().max(1);
+            }
+        }
+        assert!(output.contains(strings::CONNECTED), "{output}");
+        assert!(!output.contains(strings::CONNECTING));
+        assert!(!output.contains(strings::STALE));
+    }
+}

@@ -73,8 +73,13 @@ impl ReplyFilter {
         }
     }
 
+    #[cfg(test)]
     fn consume(&mut self, event: Event) {
-        self.recover(Instant::now());
+        self.consume_at(event, Instant::now());
+    }
+
+    fn consume_at(&mut self, event: Event, now: Instant) {
+        self.recover(now);
         if !self.enabled {
             self.pending.push_back(event);
             return;
@@ -86,7 +91,7 @@ impl ReplyFilter {
             return;
         };
         if self.receiving {
-            self.last_activity = Some(Instant::now());
+            self.last_activity = Some(now);
             for byte in bytes {
                 if self.reply.len() < MAX_REPLY_BYTES { self.reply.push(byte); }
                 else { self.overflow = true; }
@@ -107,8 +112,8 @@ impl ReplyFilter {
         const PREFIX: &[u8] = b"\x1b]11;";
         self.prefix_bytes.extend_from_slice(&bytes);
         self.prefix.push(event);
-        self.last_activity = Some(Instant::now());
-        self.escape_started = if self.prefix_bytes == [0x1b] { Some(Instant::now()) } else { None };
+        self.last_activity = Some(now);
+        self.escape_started = if self.prefix_bytes == [0x1b] { Some(now) } else { None };
         if self.prefix_bytes == PREFIX {
             self.reply.extend_from_slice(PREFIX);
             self.prefix.clear();
@@ -120,7 +125,7 @@ impl ReplyFilter {
             if self.prefix.len() > 1 && bytes.first() == Some(&0x1b) {
                 let current = self.prefix.pop().expect("prefix contains current event");
                 self.release_prefix();
-                self.consume(current);
+                self.consume_at(current, now);
             } else { self.release_prefix(); }
         }
     }
@@ -154,11 +159,17 @@ impl ReplyFilter {
     /// Nonblocking event source for the regular loop. Up to 256 response events
     /// are discarded per call for fairness; partial replies have an idle deadline.
     pub(super) fn read(&mut self) -> io::Result<Option<Event>> {
-        self.recover(Instant::now());
+        self.read_from(|| {
+            if event::poll(Duration::ZERO)? { event::read().map(Some) } else { Ok(None) }
+        }, Instant::now)
+    }
+
+    fn read_from(&mut self, mut next: impl FnMut() -> io::Result<Option<Event>>, now: impl Fn() -> Instant) -> io::Result<Option<Event>> {
+        self.recover(now());
         if let Some(event) = self.pending.pop_front() { return Ok(Some(event)); }
         for _ in 0..256 {
-            if !event::poll(Duration::ZERO)? { break; }
-            self.consume(event::read()?);
+            let Some(event) = next()? else { break; };
+            self.consume_at(event, now());
             if let Some(event) = self.pending.pop_front() { return Ok(Some(event)); }
         }
         Ok(None)
@@ -168,17 +179,26 @@ impl ReplyFilter {
 #[cfg(any(unix, test))]
 fn negotiate(
     timeout: Duration,
-    mut next: impl FnMut(Duration) -> io::Result<Option<Event>>,
+    next: impl FnMut(Duration) -> io::Result<Option<Event>>,
 ) -> QueryResult {
-    let deadline = Instant::now() + timeout;
+    negotiate_with_clock(timeout, next, Instant::now)
+}
+
+#[cfg(any(unix, test))]
+fn negotiate_with_clock(
+    timeout: Duration,
+    mut next: impl FnMut(Duration) -> io::Result<Option<Event>>,
+    now: impl Fn() -> Instant,
+) -> QueryResult {
+    let deadline = now() + timeout;
     let mut filter = ReplyFilter::enabled();
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+    while let Some(remaining) = deadline.checked_duration_since(now()) {
         // Cap preserved startup input as well as reply storage. Any following
         // events remain in Crossterm and go through this same filter later.
         if filter.pending.len() >= 256 { break; }
         match next(remaining) {
             Ok(Some(event)) => {
-                filter.consume(event);
+                filter.consume_at(event, now());
                 if !filter.enabled { break; }
             },
             Ok(None) | Err(_) => break,
@@ -247,6 +267,75 @@ mod tests {
         events.push(if st { Event::Key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT)) }
             else { Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)) });
         events
+    }
+
+    #[test]
+    fn late_split_reply_with_startup_state_updates_keeps_chat_live() {
+        use crate::{chat::{ChatRooms, Frame}, state::Model, strings};
+        use super::super::{app::App, sync_chat_state};
+        use std::cell::Cell;
+        use tokio::sync::watch;
+
+        // Logical time and scripted reads make every ordering reproducible,
+        // independent of thread scheduling, sockets and the host terminal.
+        let mut separated = vec![Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))];
+        separated.extend("]11;rgb:1010/2b2b/4848".chars().map(key));
+        separated.push(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        separated.push(key('\\'));
+        for reply in [reply_events("11;rgb:1010/2b2b/4848", true), separated] {
+            for split in 0..=reply.len() {
+                let start = Instant::now();
+                let now = Cell::new(start);
+                let (chat_tx, mut chat_rx) = watch::channel(ChatRooms::default());
+                let (feed_tx, feed_rx) = watch::channel(Model::default());
+                let mut app = App::default();
+                let mut query = negotiate_with_clock(QUERY_TIMEOUT, |remaining| {
+                    assert_eq!(remaining, QUERY_TIMEOUT);
+                    now.set(start + Duration::from_millis(75));
+                    let mut rooms = ChatRooms::default();
+                    rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+                    chat_tx.send_replace(rooms);
+                    let mut model = Model::default();
+                    model.employees.items = vec![serde_json::from_str(
+                        r#"{"name":"adu","display_name":"阿嘟","status":"active","archived":false}"#,
+                    ).unwrap()];
+                    model.employees.stale = false;
+                    model.employees.refetch_pending = false;
+                    model.inbox.stale = false;
+                    model.inbox.refetch_pending = false;
+                    feed_tx.send_replace(model);
+                    now.set(start + QUERY_TIMEOUT);
+                    Ok(None)
+                }, || now.get());
+                assert!(query.background.is_none());
+                assert!(chat_rx.has_changed().unwrap());
+                assert!(feed_rx.has_changed().unwrap());
+                // The feed snapshot here is a stress fixture: production starts its
+                // StateFeed only after negotiation. The same initial projection and
+                // subsequent refresh/sync handoff below are used in the real loop.
+                // Production consumes the first chat snapshot before refresh has
+                // created a chat pane. No further WebChat message is needed/sent.
+                app.sync_chats(&chat_rx.borrow_and_update());
+                let mut revision = app.blocks.revision;
+                assert!(!chat_rx.has_changed().unwrap());
+                for (index, chunk) in [&reply[..split], &reply[split..]].into_iter().enumerate() {
+                    now.set(start + QUERY_TIMEOUT + Duration::from_millis(10 + index as u64 * 20));
+                    let mut events = chunk.iter().cloned();
+                    assert_eq!(query.filter.read_from(|| Ok(events.next()), || now.get()).unwrap(), None);
+                    // The regular loop continues refreshing while a reply is partial.
+                    app.refresh(&feed_rx.borrow());
+                    sync_chat_state(&mut app, &mut chat_rx, &mut revision);
+                    assert!(app.chat.connected, "split {split}, read {index}");
+                    assert!(!app.chat.stale, "fresh chat must clear its stale marker");
+                    assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+                }
+                assert_eq!(query.filter.background, Some((16, 43, 72)));
+                assert!(!chat_rx.has_changed().unwrap());
+                assert!(!feed_rx.borrow().employees.stale);
+                let mut keys = [key('q')].into_iter();
+                assert_eq!(query.filter.read_from(|| Ok(keys.next()), || now.get()).unwrap(), Some(key('q')));
+            }
+        }
     }
 
     #[test]

@@ -87,6 +87,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let chat = client.chat();
         let mut chat_state = chat.state();
         app.sync_chats(&chat_state.borrow_and_update());
+        let mut chat_revision = app.blocks.revision;
         let route = if settings.notifications { crate::notifications::route().await } else { crate::notifications::Route::Skip };
         let mut notifications = crate::notifications::Notifications::new(settings.notifications, route);
         let started = std::time::Instant::now();
@@ -159,9 +160,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             app.refresh(&model);
             app.observe_notices(&model, std::time::Instant::now());
             chat.retain(app.blocks.chat_ids());
-            if chat_state.has_changed().unwrap_or(false) {
-                app.sync_chats(&chat_state.borrow_and_update());
-            }
+            sync_chat_state(&mut app, &mut chat_state, &mut chat_revision);
             app.spinner = (started.elapsed().as_millis() / 150) as usize;
             let now = std::time::Instant::now();
             let failed = model.login_required.is_some() || matches!(info, crate::client::ConnectionState::Disconnected);
@@ -328,6 +327,17 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         output.flush().map_err(|_| Error::Output)?;
     }
     result
+}
+
+/// Synchronize the chat projection after model-driven workspace changes.
+fn sync_chat_state(app: &mut App, state: &mut tokio::sync::watch::Receiver<crate::chat::ChatRooms>, revision: &mut u64) {
+    // A handshake may already be consumed while the layout still contains only
+    // Detail panes. Re-project the latest value when refresh/navigation creates
+    // or restores panes, even if the server sends no further chat frames.
+    if state.has_changed().unwrap_or(false) || *revision != app.blocks.revision {
+        app.sync_chats(&state.borrow_and_update());
+    }
+    *revision = app.blocks.revision;
 }
 
 /// Host events are independent of child writer capacity. Keep this path shared
