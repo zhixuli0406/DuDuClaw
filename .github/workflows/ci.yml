@@ -299,6 +299,10 @@ jobs:
         run: pip install pytest==8.3.4 pytest-asyncio==0.24.0 ruff==0.8.6 pyyaml>=6.0 httpx>=0.27 anthropic>=0.40
       - name: Lint
         run: ruff check python/
+      - name: Process spawn inventory
+        run: |
+          python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v
+          python3 scripts/ci/check_spawn_inventory.py --require-migrated
       - name: Test
         run: |
           if [ -n "$(find tests/python -name 'test_*.py' 2>/dev/null)" ]; then

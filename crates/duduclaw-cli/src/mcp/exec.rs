@@ -258,28 +258,33 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
 /// to the system python3 when `uv` is not installed. `kill_on_drop` guarantees a
 /// timed-out child is reaped. Returns the script's stdout on success, or a
 /// diagnostic error with stdout+stderr on non-zero exit.
+fn office_command(program: &str, prefix: &[&str], script: &Path, args: &[String], cwd: &Path)
+    -> tokio::process::Command
+{
+    let mut command = tokio::process::Command::new(program);
+    command.current_dir(cwd).kill_on_drop(true);
+    command.args(prefix).arg(script).args(args)
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    command
+}
+
 pub(crate) async fn run_office_script(script_path: &Path, script_args: &[String], cwd: &Path) -> Value {
-    use tokio::process::Command;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
     const MAX_OUT: usize = 32_768;
 
-    let build = |program: &str, prefix: &[&str]| {
-        let mut cmd = Command::new(program);
-        cmd.current_dir(cwd).kill_on_drop(true);
-        for a in prefix {
-            cmd.arg(a);
-        }
-        cmd.arg(script_path)
-            .args(script_args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        cmd
-    };
 
     let py = duduclaw_core::platform::python3_command();
-    let (used, child) = match build("uv", &["run"]).spawn() {
+    let (used, child) = match duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Registered(
+            duduclaw_core::execution_gate::Text::new("office-script".into()).expect("constant runtime id")),
+        duduclaw_core::execution_gate::spawn(&mut office_command("uv", &["run"], script_path, script_args, cwd),
+        duduclaw_core::execution_gate::ExecutionClass::EmployeeTool)).await {
         Ok(c) => ("uv run", c),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match build(py, &[]).spawn() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Registered(
+            duduclaw_core::execution_gate::Text::new("office-script".into()).expect("constant runtime id")),
+        duduclaw_core::execution_gate::spawn(&mut office_command(py, &[], script_path, script_args, cwd),
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeTool)).await {
             Ok(c) => (py, c),
             Err(e2) => {
                 return tool_error(&format!(
@@ -368,5 +373,31 @@ mod tests {
         assert!(text.contains("Script sandbox unavailable (invalid_config)"), "{text}");
         assert!(text.contains("The script was not run"), "{text}");
         assert!(text.contains("Fix the [container.sandbox] section of config.toml"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn office_backend_command_matches_legacy_argv_env_cwd() {
+        let cwd = Path::new("workspace with spaces");
+        let script = Path::new("office.py");
+        let args = vec!["繁體中文 $HOME;\nnext".to_owned(), "".to_owned()];
+        for (program, prefix) in [("uv", vec!["run"]), ("python3", vec![])] {
+            let command = office_command(program, &prefix, script, &args, cwd);
+            let mut expected = tokio::process::Command::new(program);
+            expected.current_dir(cwd).kill_on_drop(true);
+            for arg in &prefix { expected.arg(arg); }
+            expected.arg(script).args(&args)
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            assert_eq!(command.as_std().get_program(), expected.as_std().get_program());
+            assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), expected.as_std().get_args().collect::<Vec<_>>());
+            assert_eq!(command.as_std().get_envs().collect::<Vec<_>>(), expected.as_std().get_envs().collect::<Vec<_>>());
+            assert_eq!(command.as_std().get_current_dir(), expected.as_std().get_current_dir());
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&expected));
+        }
     }
 }

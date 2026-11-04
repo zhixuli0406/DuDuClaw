@@ -153,6 +153,7 @@ pub async fn run_agent_prompt_detailed(
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
+    crate::process_group::with_class(crate::process_group::request_class(req.request_type),
     crate::autonomous_runtime::request_scope(
         req.home_dir,
         &owner,
@@ -167,8 +168,7 @@ pub async fn run_agent_prompt_detailed(
                 crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req)),
             ),
         ),
-    )
-    .await
+    )).await
 }
 
 /// Backward-compatible String view; execution/usage happens only in detailed.

@@ -101,10 +101,9 @@ pub(crate) async fn docker_output<S: AsRef<std::ffi::OsStr>>(
     limit: Duration,
     what: &str,
 ) -> Result<std::process::Output, ComputerUseError> {
-    let fut = tokio::process::Command::new(docker_program())
-        .args(args)
-        .kill_on_drop(true)
-        .output();
+    let mut command = tokio::process::Command::new(docker_program());
+    command.args(args).kill_on_drop(true);
+    let fut = duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool);
     match tokio::time::timeout(limit, fut).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(ComputerUseError::ApiError(format!("{what} failed: {e}"))),
@@ -126,13 +125,13 @@ pub(crate) async fn docker_output_with_stdin<S: AsRef<std::ffi::OsStr>>(
 ) -> Result<std::process::Output, ComputerUseError> {
     use tokio::io::AsyncWriteExt;
     let run = async {
-        let mut child = tokio::process::Command::new("docker")
-            .args(args)
+        let mut command = tokio::process::Command::new("docker");
+        command.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        let mut child = duduclaw_core::execution_gate::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(input).await?;
             stdin.shutdown().await?;
@@ -159,8 +158,8 @@ async fn profile_output(
 ) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let run = async {
-        let mut child = tokio::process::Command::new(docker_program())
-            .args([
+        let mut command = tokio::process::Command::new(docker_program());
+        command.args([
                 "exec",
                 "-i",
                 container,
@@ -171,8 +170,8 @@ async fn profile_output(
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        let mut child = duduclaw_core::execution_gate::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await?;
         let mut stdin = child
             .stdin
             .take()
@@ -604,6 +603,7 @@ impl OrchestratorControl {
 /// actions and navigation. Policy (gates, approvals, limits) lives in
 /// `computer_use_sessions`.
 pub struct ComputerUseOrchestrator {
+    launch_context: duduclaw_core::execution_gate::CapturedLaunch,
     /// Container identifier (set after start_container).
     container_id: Option<String>,
     /// Configuration.
@@ -648,21 +648,21 @@ impl Drop for ComputerUseOrchestrator {
         }
         if let Some(ref name) = self.container_id {
             let name = name.clone();
+            let launch_context = self.launch_context.clone();
             warn!(container = %name, "Orchestrator dropped with active container — force cleanup");
             // Use try_current to avoid panic if Tokio runtime is already shut down.
             // If runtime is gone, fall back to blocking std::process::Command.
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = tokio::process::Command::new("docker")
-                        .args(["rm", "-f", &name])
-                        .output()
-                        .await;
-                });
+                handle.spawn(async move { launch_context.scope(async move {
+                    let mut command = tokio::process::Command::new("docker");
+                    command.args(["rm", "-f", &name]);
+                    let _ = duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await;
+                }).await; });
             } else {
                 // Runtime already shut down — use blocking cleanup
-                let _ = std::process::Command::new("docker")
-                    .args(["rm", "-f", &name])
-                    .output();
+                let mut command = std::process::Command::new("docker");
+                command.args(["rm", "-f", &name]);
+                let _ = launch_context.sync_scope(|| duduclaw_core::execution_blocking::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool));
             }
         }
     }
@@ -671,6 +671,7 @@ impl Drop for ComputerUseOrchestrator {
 impl ComputerUseOrchestrator {
     pub fn new(agent_id: String, home_dir: PathBuf, config: ComputerUseConfig) -> Self {
         Self {
+            launch_context: duduclaw_core::execution_gate::CapturedLaunch::capture(),
             container_id: None,
             config,
             agent_id,

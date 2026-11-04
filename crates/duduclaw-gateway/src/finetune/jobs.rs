@@ -718,9 +718,8 @@ pub fn parse_remote_status(stdout: &str) -> RemoteStatus {
 async fn run(program: &str, args: &[String]) -> Result<(bool, String, String)> {
     let mut cmd = tokio::process::Command::new(program);
     duduclaw_core::ns_guard::guard_command(&mut cmd);
-    let out = cmd
-        .args(args)
-        .output()
+    cmd.args(args);
+    let out = duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool)
         .await
         .map_err(|e| FinetuneError::Backend(format!("無法執行 {program}：{e}")))?;
     Ok((

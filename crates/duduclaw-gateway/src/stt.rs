@@ -394,9 +394,10 @@ impl CommandStt {
 
         let mut cmd = tokio::process::Command::new(&prog);
         duduclaw_core::ns_guard::guard_command(&mut cmd);
+        cmd.args(&args);
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            cmd.args(&args).output(),
+            duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::ParseWorker),
         )
         .await
         .map_err(|_| "STT command timeout (120s)".to_string())?;

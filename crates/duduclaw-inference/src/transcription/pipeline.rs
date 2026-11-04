@@ -86,14 +86,14 @@ impl MediaProcessError {
 }
 
 #[cfg(unix)]
-struct MediaProcessGroup(Option<u32>);
+struct MediaProcessGroup(Option<duduclaw_core::execution_gate::RunControl>);
 #[cfg(unix)]
 impl MediaProcessGroup {
     fn kill(&self) {
-        if let Some(pid) = self.0 {
-            // Every media child starts its own process group, so cancellation
-            // and limits also stop any descendants without touching the gateway.
-            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+        if let Some(control) = &self.0 {
+            // The backend owns process-tree authority; a diagnostic PID can
+            // already have been reaped while buffered output is still draining.
+            let _ = control.start_kill();
         }
     }
 }
@@ -131,9 +131,16 @@ async fn media_output_with_rss(
     mut read_rss: impl FnMut(u32) -> std::io::Result<u64>,
 ) -> Result<std::process::Output, MediaProcessError> {
     command.process_group(0).kill_on_drop(true);
-    let child = command.spawn().map_err(MediaProcessError::Io)?;
+    let child = duduclaw_core::execution_gate::with_memory_limit(memory_bytes,
+        duduclaw_core::execution_gate::spawn(command, duduclaw_core::execution_gate::ExecutionClass::ParseWorker)).await.map_err(MediaProcessError::Io)?;
+    // Protected worker resource limits are enforced by its trusted policy;
+    // remote run handles intentionally expose no host PID for RSS inspection.
+    if duduclaw_core::execution_gate::isolation_required() {
+        return tokio::time::timeout(timeout, child.wait_with_output()).await
+            .map_err(|_| MediaProcessError::TimedOut)?.map_err(MediaProcessError::Io);
+    }
     let pid = child.id().ok_or(MediaProcessError::MemoryUnavailable)?;
-    let mut group = MediaProcessGroup(Some(pid));
+    let mut group = MediaProcessGroup(Some(child.control()));
     let output = child.wait_with_output();
     tokio::pin!(output);
     let deadline = tokio::time::sleep(timeout);
@@ -170,8 +177,8 @@ async fn media_output_with_rss(
 async fn media_output(command: &mut tokio::process::Command, timeout: Duration, memory_bytes: u64) -> Result<std::process::Output, MediaProcessError> {
     #[cfg(unix)] { media_output_with_rss(command, timeout, memory_bytes, media_rss).await }
     #[cfg(not(unix))] {
-        let _ = memory_bytes;
-        tokio::time::timeout(timeout, command.output()).await.map_err(|_| MediaProcessError::TimedOut)?.map_err(MediaProcessError::Io)
+        tokio::time::timeout(timeout, duduclaw_core::execution_gate::with_memory_limit(memory_bytes,
+            duduclaw_core::execution_gate::output(command, duduclaw_core::execution_gate::ExecutionClass::ParseWorker))).await.map_err(|_| MediaProcessError::TimedOut)?.map_err(MediaProcessError::Io)
     }
 }
 

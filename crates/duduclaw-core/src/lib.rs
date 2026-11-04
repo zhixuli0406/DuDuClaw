@@ -1474,6 +1474,8 @@ pub mod egress_guard;
 
 /// Cancellation-safe ownership of spawned process trees.
 pub mod process_tree;
+pub mod execution_gate;
+pub mod execution_blocking;
 
 pub mod mcp_tool_defs;
 

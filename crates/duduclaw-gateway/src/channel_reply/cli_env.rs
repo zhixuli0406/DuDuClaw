@@ -360,17 +360,26 @@ pub(super) async fn spawn_claude_cli_with_env(
     cmd.kill_on_drop(true);
     // Own process group: an aborted or timed-out turn kills the CLI AND the
     // processes it started (MCP servers, tool subprocesses), not just the CLI.
+    #[cfg(all(test, unix))]
+    if let Ok(capture) = thinking_tests::COMMAND_CAPTURE.try_with(Arc::clone) {
+        *capture.lock().unwrap() = Some(cmd);
+        return Err("channel command captured before backend execution".into());
+    }
     let admission = crate::autonomous_runtime::admit_current().await?;
-    let (mut child, mut group_guard) = crate::process_group::spawn_guarded(&mut cmd)
-        .map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let mut child = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Claude,
+        crate::process_group::BackendChild::spawn_class(&mut cmd, crate::process_group::execution_class(
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
+    ).await
+        .map_err(|e| crate::process_group::backend_error(e, "claude CLI spawn error"))?;
     crate::autonomous_runtime::mark_handoff();
     drop(admission);
-    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
     // Drain stderr concurrently and keep the last ~2 KiB for error diagnostics.
     // Without draining, claude CLI may block if stderr pipe fills up (>64 KiB).
-    let stderr_pipe = child.stderr.take();
+    let stderr_pipe = child.child().stderr.take();
     let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     if let Some(pipe) = stderr_pipe {
         let buf = stderr_buf.clone();
@@ -521,8 +530,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                     Ok(None) => break,
                     // Read error
                     Err(e) => {
-                        group_guard.kill_now();
-                        let _ = child.kill().await;
+                        child.kill_and_reap().await;
                         return Err(format!("claude CLI read error: {e}"));
                     }
                     // Got a line — parse stream-json event
@@ -722,8 +730,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                                             .get("result")
                                             .and_then(|r| r.as_str())
                                             .unwrap_or("Unknown stream-json error");
-                                        group_guard.kill_now();
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         // Include captured stderr tail in the error so we can
                                         // diagnose cases where Claude CLI sets is_error=true
                                         // without a meaningful `result` text (e.g. --resume
@@ -824,8 +831,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                                     // newer claude-code versions emit alongside the
                                     // synthetic assistant message on auth failure.
                                     if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
-                                        group_guard.kill_now();
-                                        let _ = child.kill().await;
+                                        child.kill_and_reap().await;
                                         return Err(format!(
                                             "claude CLI assistant error: {err}"
                                         ));
@@ -973,8 +979,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                 warn!(
                     "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process"
                 );
-                group_guard.kill_now();
-                let _ = child.kill().await;
+                child.kill_and_reap().await;
                 if result_text.is_empty() && !assistant_text.is_empty() {
                     // No authoritative `result` text (tool-use turn, or the CLI
                     // omitted it) — the accumulated assistant prose IS the reply.
@@ -998,8 +1003,8 @@ pub(super) async fn spawn_claude_cli_with_env(
     thinking.finish();
 
     // Wait for process to exit
-    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
-    group_guard.disarm();
+    let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
+    child.disarm();
 
     // Snapshot stderr tail for error diagnostics.
     let stderr_tail: String = stderr_buf

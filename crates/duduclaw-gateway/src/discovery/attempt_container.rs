@@ -307,24 +307,24 @@ fn client_env(create:&Command)->Vec<(std::ffi::OsString,std::ffi::OsString)> {
     create.get_envs().filter(|(k,_)|!k.to_str().is_some_and(super::attempt_adapter::is_secret_env))
         .filter_map(|(k,v)|v.map(|v|(k.into(),v.into()))).collect()
 }
-struct Cleanup { program:std::ffi::OsString, env:Vec<(std::ffi::OsString,std::ffi::OsString)>, name:String, home:PathBuf, run:String, role:&'static str, result:Option<Result<(),String>> }
+struct Cleanup { launch_context:duduclaw_core::execution_gate::CapturedLaunch, program:std::ffi::OsString, env:Vec<(std::ffi::OsString,std::ffi::OsString)>, name:String, home:PathBuf, run:String, role:&'static str, result:Option<Result<(),String>> }
 impl Cleanup {
     fn command(&self)->Command { let mut c=Command::new(&self.program);c.env_clear().envs(self.env.iter().cloned());c }
     fn stop(&mut self)->Result<(),String> {
         if let Some(result)=&self.result { return result.clone(); }
         let mut command=self.command();command.args(["rm","--force",&self.name]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         #[cfg(unix)] { use std::os::unix::process::CommandExt;command.process_group(0); }
-        let result:Result<(),String>=(|| {
-            let mut child=command.spawn().map_err(|_|"attempt cleanup launch failed".to_owned())?;
+        let result:Result<(),String>=self.launch_context.sync_scope(|| {
+            let mut child=duduclaw_core::execution_blocking::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::Discovery).map_err(|_|"attempt cleanup launch failed".to_owned())?;
             let until=Instant::now()+Duration::from_secs(5);
             let result=loop { match child.try_wait() {
                 Ok(Some(status))=>break if status.success(){Ok(())}else{Err("attempt cleanup failed".into())},
                 Ok(None) if Instant::now()<until=>std::thread::sleep(Duration::from_millis(10)),
                 _=>break Err("attempt cleanup unconfirmed".into()),
             }};
-            #[cfg(unix)] { let _=duduclaw_core::platform::kill_process_group(child.id()); }
+            #[cfg(unix)] { let _=child.control().start_kill(); }
             if result.is_err(){let _=child.kill();}let _=child.wait();result
-        })();
+        });
         if let Err(reason)=&result { let _=super::maintenance::record_cleanup_failure(&self.home,&self.run,self.role,reason); }
         self.result=Some(result.clone());result
     }
@@ -336,7 +336,7 @@ impl PreparedAttemptContainer {
         let timeout=timeout.min(self.deadline.saturating_duration_since(Instant::now()));
         if timeout.is_zero() {return Err(AttemptInfraError::BudgetExhausted);}
         let started=Instant::now();
-        let mut cleanup=Cleanup {program:self.create.get_program().into(),
+        let mut cleanup=Cleanup {launch_context:duduclaw_core::execution_gate::CapturedLaunch::capture(),program:self.create.get_program().into(),
             env:client_env(&self.create),
             name:self.name.clone(),home:self.home.clone(),run:self.run_id.clone(),role:self.role,result:None};
         let created=super::process::run(self.create,b"",timeout,1024, |_|true).await.map_err(failure)?;

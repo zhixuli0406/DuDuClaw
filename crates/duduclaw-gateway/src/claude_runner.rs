@@ -478,6 +478,7 @@ where
     F: std::future::Future<Output = Result<String, String>> + Send,
 {
     use crate::cost_telemetry::RequestType as RT;
+    let fut = crate::process_group::with_class(crate::process_group::request_class(request_type), fut);
     let connector_snapshot = std::sync::Arc::new(std::sync::Mutex::new(crate::egress_guard::ConnectorSnapshot::unknown()));
     let snapshot_after_run = connector_snapshot.clone();
     let fut = crate::runtime_turn::scope(agent_id, async move {
@@ -1513,7 +1514,8 @@ async fn call_claude_for_agent_impl(
 
 /// Admission refusals never trigger account, model, or provider retries.
 fn is_admission_refusal(error: &str) -> bool {
-    crate::budget::budget_refusal_message(error).is_some()
+    duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
+        || crate::budget::budget_refusal_message(error).is_some()
         || crate::autonomous_runtime::was_denied()
         || error.starts_with("AUTONOMY_PAUSED:")
 }
@@ -3709,8 +3711,12 @@ async fn call_claude_streaming(
     cmd.kill_on_drop(true);
 
     let admission = crate::autonomous_runtime::admit_current().await?;
-    let mut child = crate::process_group::ManagedChild::spawn(cmd)
-        .map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let mut child = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Claude,
+        crate::process_group::BackendChild::spawn_class(cmd, crate::process_group::execution_class(
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
+    ).await
+        .map_err(|e| crate::process_group::backend_error(e, "claude CLI spawn error"))?;
     crate::autonomous_runtime::mark_handoff();
     drop(admission);
     let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
@@ -4536,6 +4542,40 @@ mod role_cache_ttl_tests {
             .find(|(name, _)| *name == std::ffi::OsStr::new(key))
             .and_then(|(_, value)| value)
             .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn local_backend_equivalence_claude_runner() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut command, _guards) = prepare_claude_cmd(
+            "claude-fixture", "繁體中文 $HOME; next\nline", "fixture-model", "stable",
+            None, None, home.path(), None, SpawnIdentity::default(),
+        ).unwrap();
+        command.env("CLAUDE_CONFIG_DIR", "fixture account").env_remove("ANTHROPIC_API_KEY");
+        let before = duduclaw_core::execution_gate::command_snapshot(&command);
+        // Independent legacy argv/env/cwd oracle; only the generated prompt path varies.
+        let mut expected = duduclaw_core::platform::async_command_for("claude-fixture");
+        duduclaw_core::apply_agent_cli_env_allowlist(&mut expected);
+        expected.args(["-p", "繁體中文 $HOME; next\nline", "--output-format", "stream-json",
+            "--verbose", "--permission-mode", "auto", "--max-turns", "50",
+            "--model", "fixture-model", "--allowedTools",
+            "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite",
+            "--disallowedTools", "computer"]);
+        if duduclaw_core::agent_toml::resolve_minimal_context(None) {
+            expected.args(["--setting-sources", "project,local", "--tools",
+                "Bash,Edit,Glob,Grep,Read,TodoWrite,WebFetch,WebSearch,Write"]);
+        }
+        let prompt_file = _guards.prompt.as_ref().expect("system prompt fixture file");
+        assert_eq!(std::fs::read_to_string(prompt_file).unwrap(), "stable");
+        expected.arg("--system-prompt-file").arg(prompt_file);
+        expected.env_remove("CLAUDECODE")
+            .env_remove(duduclaw_core::egress_guard::ENV_TURN_ALIAS)
+            .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
+            .env_remove(crate::on_behalf_of::context::ENV_CONTEXT)
+            .env("CLAUDE_CONFIG_DIR", "fixture account")
+            .env_remove("ANTHROPIC_API_KEY");
+        assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
     }
 
     #[test]

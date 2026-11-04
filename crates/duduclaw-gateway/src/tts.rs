@@ -71,8 +71,8 @@ async fn run_tts_command(command: &str, input: &std::path::Path, output: &std::p
     for key in ["PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "SYSTEMROOT"] {
         if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
     }
-    let mut child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
-        .kill_on_drop(true).spawn().map_err(|e| format!("TTS command spawn failed: {e}"))?;
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+    let mut child = duduclaw_core::execution_gate::spawn(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::ParseWorker).await.map_err(|e| format!("TTS command spawn failed: {e}"))?;
     let stderr = child.stderr.take().ok_or("TTS command stderr unavailable")?;
     let result = tokio::time::timeout(timeout, async {
         let stderr = read_bounded(stderr, 64 * 1024).await?;
@@ -493,8 +493,7 @@ impl TtsProvider for PiperTtsProvider {
         // Use piper subprocess (cross-platform, no Rust binding needed)
         let mut cmd = tokio::process::Command::new("piper");
         duduclaw_core::ns_guard::guard_command(&mut cmd);
-        let mut child = cmd
-            .kill_on_drop(true)
+        cmd.kill_on_drop(true)
             .args([
                 "--model",
                 &self.model_path,
@@ -504,8 +503,8 @@ impl TtsProvider for PiperTtsProvider {
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+            .stderr(std::process::Stdio::piped());
+        let mut child = duduclaw_core::execution_gate::spawn(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::ParseWorker).await
             .map_err(|e| format!("Piper not found: {e}. Install: pip install piper-tts"))?;
 
         // Write text to stdin then close it (piper reads from stdin)

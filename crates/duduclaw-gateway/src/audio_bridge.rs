@@ -148,8 +148,7 @@ async fn run_wpctl_bin_with_env(
     if let Some(dir) = xdg_runtime_override {
         cmd.env("XDG_RUNTIME_DIR", dir);
     }
-    let output = cmd
-        .output()
+    let output = duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool)
         .await
         .map_err(|e| format!("failed to spawn {bin}: {e}"))?;
     if !output.status.success() {

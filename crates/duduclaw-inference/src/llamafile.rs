@@ -76,7 +76,7 @@ enum ServerState {
 pub struct LlamafileManager {
     config: LlamafileConfig,
     state: RwLock<ServerState>,
-    child: RwLock<Option<tokio::process::Child>>,
+    child: RwLock<Option<duduclaw_core::execution_gate::Child>>,
     client: reqwest::Client,
     /// L6: serializes `start()` so concurrent callers cannot each spawn a
     /// process through the check-then-set TOCTOU window.
@@ -197,7 +197,7 @@ impl LlamafileManager {
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let child = cmd.spawn().map_err(|e| {
+        let child = duduclaw_core::execution_gate::spawn(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::ParseWorker).await.map_err(|e| {
             let msg = format!("Failed to spawn llamafile: {e}");
             InferenceError::GenerationFailed(msg)
         })?;

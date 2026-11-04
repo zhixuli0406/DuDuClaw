@@ -60,10 +60,12 @@ pub async fn run_test(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
+    let mut child = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Registered(
+            duduclaw_core::execution_gate::Text::new("fork-test".into()).expect("constant runtime id")),
+        duduclaw_core::execution_gate::spawn(&mut cmd,
+        duduclaw_core::execution_gate::ExecutionClass::Fork)).await
         .map_err(|e| ForkError::Executor(format!("spawn test command: {e}")))?;
-    let pid = child.id();
 
     // Drain both pipes concurrently into bounded tail buffers so a chatty test
     // can neither deadlock on a full pipe nor grow memory without limit.
@@ -74,16 +76,13 @@ pub async fn run_test(
     let (exit_code, timed_out) = match tokio::time::timeout(dur, child.wait()).await {
         Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
         Ok(Err(e)) => {
-            kill_process_tree(pid).await;
-            let _ = child.start_kill();
+            let _ = child.kill().await;
             return Err(ForkError::Executor(format!("test command io error: {e}")));
         }
         Err(_elapsed) => {
-            // The child is still alive (not reaped), so its pid — which is also
-            // its process-group id — cannot have been reused: killing the group
-            // reaches every descendant that stayed in it (e.g. `sleep 300 &`).
-            kill_process_tree(pid).await;
-            let _ = child.start_kill();
+            // The backend owns the local process group or protected run;
+            // cancellation never derives authority from a reusable PID.
+            let _ = child.kill().await;
             let _ = child.wait().await; // reap
             (TIMEOUT_EXIT_CODE, true)
         }
@@ -146,41 +145,6 @@ async fn join_tail(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
             task.abort();
             Vec::new()
         }
-    }
-}
-
-/// Kill the test command together with everything it spawned.
-///
-/// Unix: the command runs as the leader of its own process group
-/// (`process_group(0)`), so `kill(-pgid, SIGKILL)` reaches every descendant
-/// that stayed in the group. Windows: the command gets its own process group
-/// (`CREATE_NEW_PROCESS_GROUP`) and `taskkill /T /F` kills the process tree.
-async fn kill_process_tree(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    #[cfg(unix)]
-    {
-        // The leader's pid is its pgid (`process_group(0)`). The helper
-        // refuses 0/1/out-of-range values instead of signalling them.
-        if let Err(e) = duduclaw_core::platform::kill_process_group(pid) {
-            tracing::debug!("kill test process group {pid}: {e}");
-        }
-    }
-    #[cfg(windows)]
-    {
-        let res = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        if let Err(e) = res {
-            tracing::debug!("taskkill test process tree {pid}: {e}");
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
     }
 }
 
@@ -517,5 +481,30 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+    #[tokio::test]
+    async fn fork_test_backend_command_matches_legacy_argv_env_cwd() {
+        let script = "echo '繁體中文 $HOME;'";
+        let mut command = shell_command(script);
+        command.current_dir("fork workspace").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        let mut legacy = Command::new("cmd");
+        #[cfg(not(windows))]
+        let mut legacy = Command::new("sh");
+        #[cfg(windows)]
+        legacy.args(["/C", script]).creation_flags(0x0000_0200);
+        #[cfg(not(windows))]
+        legacy.args(["-c", script]);
+        #[cfg(unix)]
+        legacy.process_group(0);
+        legacy.kill_on_drop(true).current_dir("fork workspace")
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }

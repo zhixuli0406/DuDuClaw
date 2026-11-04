@@ -95,9 +95,9 @@ pub(crate) struct DockerLiveView {
 /// `docker exec -i … duduclaw-vnc-relay`'s stdin + stdout as one stream; the
 /// child is killed when this is dropped.
 struct ChildIo {
-    _child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
+    _child: duduclaw_core::execution_gate::Child,
+    stdin: duduclaw_core::execution_gate::ChildStdin,
+    stdout: duduclaw_core::execution_gate::ChildStdout,
 }
 
 impl tokio::io::AsyncRead for ChildIo {
@@ -179,13 +179,13 @@ impl LiveViewAccess for DockerLiveView {
     }
 
     async fn open_relay(&self) -> Result<Box<dyn RelayStream>, ComputerUseError> {
-        let mut child = tokio::process::Command::new("docker")
-            .args(relay_args(&self.container))
+        let mut command = tokio::process::Command::new("docker");
+        command.args(relay_args(&self.container))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+        let mut child = duduclaw_core::execution_gate::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await
             .map_err(|e| ComputerUseError::ApiError(format!("relay spawn failed: {e}")))?;
         let stdin = child.stdin.take().ok_or_else(|| ComputerUseError::ApiError("relay stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| ComputerUseError::ApiError("relay stdout".into()))?;

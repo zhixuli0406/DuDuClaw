@@ -4718,6 +4718,18 @@ impl MemoryEngine for SqliteMemoryEngine {
 
 /// Call the `claude` CLI to produce a narrative summary of raw memory entries.
 /// Returns an empty string on any failure so callers can fall back to raw text.
+fn summary_command(claude: &str, prompt: &str, api_key: &str) -> tokio::process::Command {
+    let mut cmd = duduclaw_core::platform::async_command_for(claude);
+    cmd.args(["-p", prompt, "--model", "claude-haiku-4-5", "--output-format", "text"]);
+    cmd.env("ANTHROPIC_API_KEY", api_key);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    cmd
+}
+
 async fn call_claude_summarize(raw_memories: &str) -> String {
     let api_key = match std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()) {
         Some(k) => k,
@@ -4741,15 +4753,16 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
          <memory_entries>\n{escaped_memories}\n</memory_entries>"
     );
 
-    let mut cmd = duduclaw_core::platform::async_command_for(&claude);
-    cmd.args(["-p", &prompt, "--model", "claude-haiku-4-5", "--output-format", "text"]);
-    cmd.env("ANTHROPIC_API_KEY", &api_key);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
-    cmd.kill_on_drop(true);
+    let mut cmd = summary_command(&claude, &prompt, &api_key);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(60),
+        async {
+            duduclaw_core::execution_gate::with_runtime(
+                duduclaw_core::execution_gate::RuntimeKind::Claude,
+                duduclaw_core::execution_gate::spawn(&mut cmd,
+                duduclaw_core::execution_gate::ExecutionClass::Judge)).await?
+                .wait_with_output().await
+        }).await {
         Ok(Ok(out)) if out.status.success() => {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
@@ -7318,5 +7331,20 @@ mod tests {
 
         // Owner does see it.
         assert_eq!(engine.superseded_fact_ids(owner, &[a.clone()]).await.unwrap(), vec![a]);
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    #[tokio::test]
+    async fn memory_judge_backend_command_matches_legacy_argv_env_cwd() {
+        let command = super::summary_command("claude", "prompt $HOME;\n繁體中文", "fixture-secret");
+        let mut legacy = duduclaw_core::platform::async_command_for("claude");
+        legacy.args(["-p", "prompt $HOME;\n繁體中文", "--model", "claude-haiku-4-5", "--output-format", "text"])
+            .env("ANTHROPIC_API_KEY", "fixture-secret")
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true);
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }
