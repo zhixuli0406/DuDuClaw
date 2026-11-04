@@ -630,11 +630,41 @@ mod tests {
         import_archive(&archive, &home, false, true).unwrap();
         assert_eq!(fs::read_to_string(home.join("config.toml.lock")).unwrap(), "live");
         assert_eq!(fs::read_to_string(home.join("locks/gateway.lock")).unwrap(), "live gateway");
-        assert!(!home.join("CONFIG.TOML.LOCK. ").exists());
-        assert!(!home.join("LOCKS. ").exists());
+        let home_entries: HashSet<_> = fs::read_dir(&home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let expected_home_entries: HashSet<_> = [
+            "config.toml.lock",
+            "locks",
+            duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE,
+        ]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(home_entries, expected_home_entries);
+        let locks_entries: HashSet<_> = fs::read_dir(home.join("locks"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let expected_locks_entries: HashSet<_> = ["gateway.lock"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(locks_entries, expected_locks_entries);
         ordered_archive(&archive, &[("lockſ/gateway.lock", b"archive")]);
         import_archive(&archive, &home, false, true).unwrap();
         assert_eq!(fs::read_to_string(home.join("locks/gateway.lock")).unwrap(), "live gateway");
+        let home_entries: HashSet<_> = fs::read_dir(&home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(home_entries, expected_home_entries);
+        let locks_entries: HashSet<_> = fs::read_dir(home.join("locks"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(locks_entries, expected_locks_entries);
     }
 
     #[test]
