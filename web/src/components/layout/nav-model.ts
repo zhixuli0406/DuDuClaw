@@ -526,7 +526,6 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // 靈感畫廊 (P2-b, curated MVP, 2026-08-15) — right after 「AI 團隊」 on Personal
   // too, same pairing rationale as the Enterprise 公司 group above.
   '/gallery',
-  '/meeting-transcripts',
   '/pet-studio',
 ]);
 
@@ -555,6 +554,7 @@ export const personalAdvancedGroup: NavGroup = {
     '/runs',
     '/canvas',
     '/files',
+    '/meeting-transcripts',
     // 信箱 (Agent Mail, P2-d) — same slot as the Enterprise 工作 group (right
     // after 檔案). It follows the `/timeline` + `/reports` precedent rather
     // than the primary rail: manager-gated surfaces live in 進階 on Personal,
