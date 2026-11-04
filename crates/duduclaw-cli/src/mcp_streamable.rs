@@ -303,7 +303,9 @@ async fn call_tool(
     }
     Ok(
         match tokio::time::timeout(
-            state.call_timeout,
+            duduclaw_core::tool_catalog::builtin_mcp_call_timeout(
+                params.get("name").and_then(Value::as_str).unwrap_or(""), state.call_timeout,
+            ),
             state
                 .dispatcher
                 .dispatch_tool_call(principal, ns_ctx, params, id),
@@ -311,7 +313,7 @@ async fn call_tool(
         .await
         {
             Ok(result) => result,
-            Err(_) => jsonrpc_error(id, -32603, "Request timed out (30s limit exceeded)"),
+            Err(_) => jsonrpc_error(id, -32603, "Request timed out"),
         },
     )
 }

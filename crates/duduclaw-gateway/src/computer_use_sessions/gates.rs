@@ -84,7 +84,7 @@ async fn audit_denial(home: &Path, agent_id: &str, tool: &'static str, class: &'
 }
 
 /// `denied_tools` / `allowed_tools` and `scoped_tools` for `tool`.
-pub(super) async fn tool_gates(home: &Path, agent_id: &str, tool: &'static str) -> Result<(), OpError> {
+pub(crate) async fn tool_gates(home: &Path, agent_id: &str, tool: &'static str) -> Result<(), OpError> {
     use duduclaw_core::tool_catalog::{ToolListVerdict, tool_list_verdict};
 
     let dir = agent_dir(home, agent_id);
@@ -141,7 +141,7 @@ fn action_rule_verdict(dir: &Path, tool: &str) -> Option<duduclaw_core::ActionVe
 
 /// Whether `tool` is in any of the employee's approval lists, or an action
 /// rule asks (or blocks) it.
-pub(super) fn approval_required(home: &Path, agent_id: &str, tool: &str) -> bool {
+pub(crate) fn approval_required(home: &Path, agent_id: &str, tool: &str) -> bool {
     let dir = agent_dir(home, agent_id);
     crate::approval::tool_requires_approval(&dir, tool)
         || crate::approval::tool_is_irreversible(&dir, tool)
@@ -155,9 +155,9 @@ pub(super) fn egress_check(home: &Path, agent: &str, tool: &str, turn: Option<&s
     egress_check_with_call(home, agent, tool, turn, &uuid::Uuid::new_v4().to_string())
 }
 
-pub(super) fn egress_check_with_call(home: &Path, agent: &str, tool: &str, turn: Option<&str>, call_id: &str) -> Result<Option<serde_json::Value>, OpError> {
+pub(crate) fn egress_check_with_call(home: &Path, agent: &str, tool: &str, turn: Option<&str>, call_id: &str) -> Result<Option<serde_json::Value>, OpError> {
     use duduclaw_core::egress_guard::{effective_mode_checked, Mode};
-    if !matches!(tool, TOOL_NAVIGATE | TOOL_TYPE | TOOL_LOGIN) { return Ok(None); }
+    if !matches!(tool, TOOL_NAVIGATE | TOOL_TYPE | TOOL_LOGIN | "meeting_transcribe") { return Ok(None); }
     let mode = effective_mode_checked(home, Some(&agent_dir(home, agent))).map_err(forbidden)?;
     if mode == Mode::Off { return Ok(None); }
     let taint = crate::egress_guard::query_turn(agent, turn);
@@ -189,7 +189,7 @@ fn approval_denied(message: String) -> OpError {
 /// person's approval (`ask`, or no verdict under `enforce` — fail closed),
 /// `Err` refuses (`block` under `enforce`). Only argument keys reach the
 /// reviewer. One `tool_calls.jsonl` row per review.
-pub(super) async fn action_review(
+pub(crate) async fn action_review(
     home: &Path,
     agent_id: &str,
     tool: &'static str,
@@ -245,7 +245,7 @@ pub(super) async fn action_review(
 /// employee, tool and `args` (a gateway-built snapshot of the operation:
 /// hashes for typed text and URLs, never the raw text); on approval the
 /// binding is checked against the call and consumed once before it runs.
-pub(super) async fn obtain_approval(
+pub(crate) async fn obtain_approval(
     home: &Path,
     agent_id: &str,
     tool: &'static str,

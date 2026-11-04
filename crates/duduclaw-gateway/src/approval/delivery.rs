@@ -15,6 +15,88 @@ pub(crate) struct TrustedReplyTarget {
     user_access_policy: Option<crate::channel_reply::UserAccessPolicy>,
 }
 impl TrustedReplyTarget {
+    /// Persist only the exact transport address and a token digest. The
+    /// credential itself remains in its configured secret store.
+    pub(crate) fn notice_descriptor(&self) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        serde_json::json!({
+            "context": self.context, "chat_id": self.chat_id,
+            "thread_id": self.thread_id,
+            "token_sha256": hex::encode(Sha256::digest(self.token.as_bytes())),
+        })
+    }
+
+    /// Background notifications never switch bot accounts after restart.
+    pub(crate) async fn restore_notice(home: &std::path::Path, value: &serde_json::Value) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Stored {
+            context: DecisionContext,
+            chat_id: String,
+            thread_id: Option<String>,
+            token_sha256: String,
+        }
+        let saved: Stored = serde_json::from_value(value.clone()).map_err(|_| "通知目的地無法辨識。")?;
+        saved.context.validate()?;
+        if saved.token_sha256.len() != 64 { return Err("通知帳號無法辨識。".into()); }
+        for token in crate::config_crypto::channel_dm_token_candidates(home, &saved.context.channel).await {
+            if hex::encode(Sha256::digest(token.as_bytes())) == saved.token_sha256 {
+                return Self::new(saved.context, token, saved.chat_id, saved.thread_id);
+            }
+        }
+        Err("原對話的通知帳號已變更，請至控制台查看逐字稿。".into())
+    }
+
+    /// Attach to the same bot/chat/thread as the captured inbound turn.
+    pub(crate) async fn send_notice_document(&self, http: &reqwest::Client, data: &[u8], filename: &str) -> Result<(), String> {
+        let part = || reqwest::multipart::Part::bytes(data.to_vec())
+            .file_name(filename.to_owned()).mime_str("text/markdown")
+            .map_err(|_| "無法準備逐字稿附件。".to_string());
+        let response = match self.context.channel.as_str() {
+            "telegram" => {
+                let mut form = reqwest::multipart::Form::new().text("chat_id", self.chat_id.clone()).part("document", part()?);
+                if let Some(thread) = &self.thread_id { form = form.text("message_thread_id", thread.clone()); }
+                http.post(format!("{}/sendDocument", crate::telegram::telegram_poll_api_base(&self.token)))
+                    .multipart(form).send().await
+            }
+            "discord" => {
+                let form = reqwest::multipart::Form::new().part("files[0]", part()?)
+                    .text("payload_json", serde_json::json!({"allowed_mentions":{"parse":[]}}).to_string());
+                http.post(format!("https://discord.com/api/v10/channels/{}/messages", self.chat_id))
+                    .header("Authorization", format!("Bot {}", self.token)).multipart(form).send().await
+            }
+            "slack" => {
+                let response = http.post("https://slack.com/api/files.getUploadURLExternal")
+                    .bearer_auth(&self.token).form(&[("filename", filename.to_owned()), ("length", data.len().to_string())])
+                    .send().await.map_err(|_| "無法傳送逐字稿附件。")?;
+                if !response.status().is_success() { return Err("無法傳送逐字稿附件。".into()); }
+                let value: serde_json::Value = response.json().await.map_err(|_| "無法讀取附件傳送結果。")?;
+                if value["ok"] != true { return Err("無法傳送逐字稿附件。".into()); }
+                let url = value["upload_url"].as_str().ok_or("無法取得附件上傳位置。")?;
+                let parsed = url::Url::parse(url).map_err(|_| "附件上傳位置無效。")?;
+                if parsed.scheme() != "https" || parsed.host_str() != Some("files.slack.com")
+                    || !parsed.username().is_empty() || parsed.password().is_some() || parsed.port().is_some_and(|p| p != 443) {
+                    return Err("附件上傳位置無效。".into());
+                }
+                let id = value["file_id"].as_str().ok_or("無法取得附件編號。")?;
+                let uploaded = http.post(url).body(data.to_vec()).send().await.map_err(|_| "無法上傳逐字稿附件。")?;
+                if !uploaded.status().is_success() { return Err("無法上傳逐字稿附件。".into()); }
+                let mut body = serde_json::json!({"files":[{"id":id,"title":filename}],"channel_id":self.chat_id});
+                if let Some(thread) = &self.thread_id { body["thread_ts"] = thread.clone().into(); }
+                http.post("https://slack.com/api/files.completeUploadExternal")
+                    .bearer_auth(&self.token).json(&body).send().await
+            }
+            _ => return Err("此通道無法直接傳送逐字稿附件。".into()),
+        }.map_err(|_| "無法傳送逐字稿附件。")?;
+        if !response.status().is_success() { return Err("無法傳送逐字稿附件。".into()); }
+        if matches!(self.context.channel.as_str(), "telegram" | "slack") {
+            let value: serde_json::Value = response.json().await.map_err(|_| "無法讀取附件傳送結果。")?;
+            if value["ok"] != true { return Err("無法傳送逐字稿附件。".into()); }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         context: DecisionContext,
         token: String,
@@ -258,6 +340,20 @@ impl ChannelSender for BoundDecisionSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn meeting_notice_descriptor_has_no_credential_and_refuses_missing_original_account() {
+        let target = TrustedReplyTarget::new(DecisionContext {
+            channel:"telegram".into(), account_id:"bot-A".into(),
+            conversation_id:"chat:7".into(), principal_id:"person".into(),
+        }, "synthetic-private-token".into(), "chat".into(), Some("7".into())).unwrap();
+        let descriptor = target.notice_descriptor();
+        assert!(!descriptor.to_string().contains("synthetic-private-token"));
+        assert_eq!(descriptor["thread_id"], "7");
+        assert_eq!(descriptor["context"]["account_id"], "bot-A");
+        let home = tempfile::tempdir().unwrap();
+        assert!(TrustedReplyTarget::restore_notice(home.path(), &descriptor).await.is_err());
+    }
     #[test]
     fn browser_notice_keeps_exact_thread_and_disables_supported_previews() {
         for (channel, thread, key) in [("telegram","17","message_thread_id"),("slack","123.456","thread_ts")] {

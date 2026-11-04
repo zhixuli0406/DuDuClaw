@@ -67,6 +67,10 @@ pub(crate) const GITHUB_WORKSPACE_TOOLS: &[&str] = &[
 /// dispatch gate (`mcp_dispatch.rs`, error class `process_agent_tool`), both
 /// through [`process_agent_tool_refused`], so discoverable ⇔ callable.
 pub(crate) const PROCESS_AGENT_TOOLS: &[&str] = &[
+    "meeting_upload_link",
+    "meeting_transcribe",
+    "meeting_transcribe_status",
+    "meeting_transcribe_cancel",
     "working_state_get",
     "working_state_set",
     "working_state_clear",
@@ -515,6 +519,7 @@ pub(crate) async fn visible_tools_in_lane(
     let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
 
     tools()
+        .filter(|t| !matches!(t.name, "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "meeting_upload_link") || meeting_listed(home_dir, principal))
         .filter(|t| background_allowed || !super::creates_background_work(t.name))
         .filter(|t| {
             // C4: discoverable ⇔ callable — same predicate as the dispatch

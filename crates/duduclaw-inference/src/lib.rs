@@ -31,6 +31,7 @@ pub mod ucci;
 pub mod util;
 pub mod embedding;
 pub mod whisper;
+pub mod transcription;
 
 pub use adapter::CompatEndpoint;
 pub use backend::InferenceBackend;

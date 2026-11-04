@@ -307,6 +307,7 @@ export const navGroups: NavGroup[] = [
       { to: '/canvas', icon: Presentation, label: 'nav.canvas', desc: 'nav.canvas.desc', ownScope: true },
       // WP1.4 file panel — attachments an AI staff member received/produced.
       { to: '/files', icon: FolderOpen, label: 'nav.files', desc: 'nav.files.desc', ownScope: true },
+      { to: '/meeting-transcripts', icon: FileText, label: 'nav.meetingTranscripts', desc: 'nav.meetingTranscripts.desc', ownScope: true, newIn: '1.79.3' },
       // 信箱 (Agent Mail, P2-d, 2026-08-15) — the non-real-time channel: mail
       // arrives here, and every outgoing reply waits for a human 確認. Sits
       // next to 檔案 because both are "material an AI employee received or
@@ -525,6 +526,7 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // 靈感畫廊 (P2-b, curated MVP, 2026-08-15) — right after 「AI 團隊」 on Personal
   // too, same pairing rationale as the Enterprise 公司 group above.
   '/gallery',
+  '/meeting-transcripts',
   '/pet-studio',
 ]);
 

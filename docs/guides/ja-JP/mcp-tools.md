@@ -8,6 +8,21 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 ツールを追加する場合は先に [custom-mcp-tool.md](../custom-mcp-tool.md) を読んでください。このページは実装ではなく宣言面の話です。gateway なしで MCP サーバーだけを使う場合は [mcp-standalone.md](mcp-standalone.md) を参照してください。
 
 
+## 会議の文字起こし
+
+`meeting_transcribe` は呼び出す従業員自身の添付ファイルの `source_path` と、任意の
+`engine`、`language_hint`（既定 `zh-TW`）、`write_wiki`（既定 `false`）を受け取り、
+背景仕事の ID と状態を返します。`meeting_transcribe_status`／`meeting_transcribe_cancel` に `job_id` を渡して自分の仕事を確認・キャンセルできます。`meeting_upload_link {}` は元の会話用の一回限りのアップロードリンクを返します。`transcribe_audio` と同じ
+`messaging:send` スコープに加え、検証済みの従業員 ID と既存の能力・承認・外部送信
+ゲートが必要です。外部 fallback 名前空間では使用できません。効果は保存データの
+変更とネットワーク送信です。任意のエンジンは管理者の設定と一致する必要があります。
+
+音声は Gemini または OpenAI に送信し、結果を台湾の繁体字表記に変換します。
+RFC-23 が有効な場合は保存する文字列をマスクしますが、アップロード済みの音声は
+マスクできません。この版の `drive_file_id` と `write_wiki: true` は未対応エラーを
+返します。ゲートウェイで背景実行します。ffmpeg、サービス制限、設定、プライバシーについては
+[会議の文字起こし](../../features/ja-JP/73-meeting-transcripts.md) を参照してください。
+
 ## 社員ごとのツール一覧の整理
 
 Admin は社員の概要にある「ツール一覧の整理」でモードを選び、未使用ツールと推定節約量を確認できます。オンのときは一覧を復元できます。モード選択は既存の社員更新処理を使います。`agents.tool_pruning_status {agent_id}` と `agents.tool_pruning_restore {agent_id}` は Admin 専用です。推定値は候補ツールのシリアライズ済み定義の長さを四で割った値で、tokenizer の実測値やプロバイダーで確認した節約量ではありません。

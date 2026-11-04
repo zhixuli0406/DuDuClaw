@@ -2510,6 +2510,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // WebChat endpoint — C5: now requires JWT auth (in-band) + Origin check,
     // mirroring the main /ws gate instead of being unauthenticated.
+    let meeting_auth_state = state.clone();
     let knowledge_users = state.user_db.clone();
     let webchat_state = Arc::new(crate::webchat::WebChatState::new(
         webchat_ctx,
@@ -3007,6 +3008,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // — trust is proven by subscription_id + machine_fingerprint. Own state
     // (home_dir) + 64 KiB body cap, like the federation route above.
     app = app.merge(crate::license_serve::router(home_dir.clone()));
+
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        match crate::meeting_jobs::Manager::open(home_dir.clone()) {
+            Ok(jobs) => {
+                jobs.spawn();
+                match crate::meeting_uploads::Service::open(jobs.clone()) {
+                    Ok(uploads) => {
+                        app=app.merge(crate::meeting_uploads::router(uploads.clone(),Arc::new(move |headers|knowledge_caller(&meeting_auth_state,headers))));
+                        match crate::meeting_links::router(uploads) {Ok(router)=>app=app.merge(router),Err(error)=>tracing::error!(%error,"meeting upload links unavailable")}
+                    }
+                    Err(error)=>tracing::error!(%error,"meeting uploads unavailable"),
+                }
+                app = app.merge(crate::meeting_jobs::http::router(jobs));
+            }
+            Err(error) => tracing::error!(%error, "meeting job service unavailable"),
+        }
+    }
 
     // ── Tool-driven computer use (internal) ───────────────────────
     // Always mounted; every request must come from a loopback peer, carry

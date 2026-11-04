@@ -26,6 +26,9 @@ pub struct ModelCaps {
     pub tools: bool,
     #[serde(default)]
     pub vision: bool,
+    /// Accepts audio input for transcription or understanding.
+    #[serde(default)]
+    pub audio: bool,
     #[serde(default)]
     pub caching: bool,
     #[serde(default)]
@@ -39,6 +42,7 @@ pub struct ModelCaps {
 pub enum Feature {
     Tools,
     Vision,
+    Audio,
     Caching,
     Reasoning,
     Structured,
@@ -70,6 +74,9 @@ pub struct ModelInfo {
     pub max_output_tokens: u64,
     /// Millicents per MTok of fresh input.
     pub input_mc: u64,
+    /// Optional audio input rate per MTok; absent means the standard input rate.
+    #[serde(default)]
+    pub audio_input_mc: Option<u64>,
     /// Millicents per MTok of output (reasoning tokens bill at this rate).
     pub output_mc: u64,
     /// Millicents per MTok of cache reads. `0` = not separately priced —
@@ -242,6 +249,7 @@ impl ModelRegistry {
         match feature {
             Feature::Tools => info.caps.tools,
             Feature::Vision => info.caps.vision,
+            Feature::Audio => info.caps.audio,
             Feature::Caching => info.caps.caching,
             Feature::Reasoning => info.caps.reasoning,
             Feature::Structured => info.caps.structured,
@@ -276,9 +284,35 @@ impl ModelRegistry {
     ///   e.g. Gemini) also bill at the output rate. When the prompt crossed
     ///   the cliff, all output bills at `output_mult` × base.
     pub fn cost_millicents(&self, usage: &NormalizedUsage, info: &ModelInfo) -> u64 {
+        self.cost_at_input_rate(usage, info, info.input_mc as f64)
+    }
+
+    /// Price audio-bearing input without charging audio again as text.
+    /// `input_audio_tokens` is a subset of `usage.input_tokens`. Mixed fresh
+    /// modalities share a price-cliff excess proportionally; cached tokens
+    /// retain their existing separate rates. This is telemetry, not an invoice.
+    pub fn cost_audio_millicents(
+        &self,
+        usage: &NormalizedUsage,
+        input_audio_tokens: u64,
+        info: &ModelInfo,
+    ) -> u64 {
+        let audio = input_audio_tokens.min(usage.input_tokens);
+        let text = usage.input_tokens - audio;
+        let audio_rate = info.audio_input_mc.unwrap_or(info.input_mc);
+        let rate = if usage.input_tokens == 0 {
+            info.input_mc as f64
+        } else {
+            (text as f64 * info.input_mc as f64 + audio as f64 * audio_rate as f64)
+                / usage.input_tokens as f64
+        };
+        self.cost_at_input_rate(usage, info, rate)
+    }
+
+    fn cost_at_input_rate(&self, usage: &NormalizedUsage, info: &ModelInfo, input_rate: f64) -> u64 {
         const MTOK: f64 = 1_000_000.0;
 
-        let total_prompt = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+        let total_prompt = usage.input_tokens.saturating_add(usage.cache_read_tokens).saturating_add(usage.cache_write_tokens);
         let (input_mult, output_mult) = match info.price_cliff {
             Some(cliff) if total_prompt > cliff.threshold_tokens => {
                 (Some(cliff), cliff.output_mult)
@@ -294,13 +328,13 @@ impl ModelRegistry {
                 let below = usage.input_tokens.min(
                     cliff
                         .threshold_tokens
-                        .saturating_sub(usage.cache_read_tokens + usage.cache_write_tokens),
+                        .saturating_sub(usage.cache_read_tokens.saturating_add(usage.cache_write_tokens)),
                 );
                 let above = usage.input_tokens - below;
-                below as f64 * info.input_mc as f64 / MTOK
-                    + above as f64 * info.input_mc as f64 * cliff.input_mult / MTOK
+                below as f64 * input_rate / MTOK
+                    + above as f64 * input_rate * cliff.input_mult / MTOK
             }
-            None => usage.input_tokens as f64 * info.input_mc as f64 / MTOK,
+            None => usage.input_tokens as f64 * input_rate / MTOK,
         };
 
         let cache_read_rate = if info.cache_read_mc > 0 {
@@ -316,7 +350,7 @@ impl ModelRegistry {
         let cache_cost = usage.cache_read_tokens as f64 * cache_read_rate as f64 / MTOK
             + usage.cache_write_tokens as f64 * cache_write_rate as f64 / MTOK;
 
-        let output_tokens = usage.output_tokens + usage.reasoning_tokens;
+        let output_tokens = usage.output_tokens.saturating_add(usage.reasoning_tokens);
         let output_cost = output_tokens as f64 * info.output_mc as f64 * output_mult / MTOK;
 
         (input_cost + cache_cost + output_cost).round() as u64
@@ -366,6 +400,37 @@ mod tests {
         assert!(!reg.supports("qwen/qwen3.7-max", Feature::Reasoning));
         // Unknown model → fail closed.
         assert!(!reg.supports("unknown-model", Feature::Tools));
+    }
+
+    #[test]
+    fn transcription_audio_capability_is_explicit_and_defaults_off() {
+        let registry = ModelRegistry::vendored();
+        let audio_models: Vec<_> = registry.models().filter(|m| m.caps.audio).collect();
+        assert!(!audio_models.is_empty());
+        assert!(audio_models.iter().all(|m| m.provider == "gemini" && m.caps.structured));
+        assert!(registry.supports(&audio_models[0].qualified_id(), Feature::Audio));
+        assert!(!registry.supports("deepseek/deepseek-v3.2", Feature::Audio));
+        assert!(!registry.supports("unknown-model", Feature::Audio));
+    }
+
+    #[test]
+    fn transcription_audio_pricing_separates_modalities_and_keeps_reasoning() {
+        let registry = ModelRegistry::vendored();
+        let mut info = registry.get("gemini/gemini-3.5-flash").unwrap().clone();
+        info.input_mc = 100_000;
+        info.audio_input_mc = Some(200_000);
+        info.output_mc = 300_000;
+        let usage = NormalizedUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            reasoning_tokens: 100_000,
+            ..Default::default()
+        };
+        // 500k text + 500k audio + 200k output/reasoning = $2.10.
+        assert_eq!(registry.cost_audio_millicents(&usage, 500_000, &info), 210_000);
+        info.audio_input_mc = None;
+        assert_eq!(registry.cost_audio_millicents(&usage, 500_000, &info),
+            registry.cost_millicents(&usage, &info));
     }
 
     #[test]

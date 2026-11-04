@@ -311,7 +311,7 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "canvas_push" | "canvas_clear" => Some(Scope::WikiWrite),
         // ── Messaging / media egress ─────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "synthesize_speech"
-        | "transcribe_audio" => Some(Scope::MessagingSend),
+        | "transcribe_audio" | "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "meeting_upload_link" => Some(Scope::MessagingSend),
         // ── Agent Mail (P2-d) ────────────────────────────────────────────
         // Read and draft-send are separate grants. `mail_send` cannot
         // transmit (a human decision in `mail_worker::settle_outbox` does),

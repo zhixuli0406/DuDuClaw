@@ -124,7 +124,7 @@ pub(crate) fn oauth_dashboard_base(home: &Path, origin: &str) -> String {
     }
 }
 
-fn valid_oauth_public_base(raw: &str) -> Option<(String, String)> {
+pub(crate) fn valid_oauth_public_base(raw: &str) -> Option<(String, String)> {
     let raw = raw.trim();
     if raw.chars().any(char::is_control) || raw.contains('\\') {
         return None;

@@ -68,6 +68,16 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Default per-request timeout.
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn request_timeout_for_frame(frame: &Value, default: Duration, builtin: bool) -> Duration {
+    if builtin && frame["method"].as_str() == Some("tools/call") {
+        duduclaw_core::tool_catalog::builtin_mcp_call_timeout(
+            frame.pointer("/params/name").and_then(Value::as_str).unwrap_or(""), default,
+        )
+    } else {
+        default
+    }
+}
+
 /// A scoped operation includes queueing, preparation, handshake and its final
 /// response. Hosts may choose a shorter deadline, never an unbounded lease.
 const MAX_SCOPED_MCP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -413,9 +423,19 @@ pub struct McpClient {
     /// Server name for diagnostics (the spawned command or the URL).
     label: String,
     workflow_version: Option<u32>,
+    builtin_tool_timeouts: bool,
 }
 
 impl McpClient {
+    /// The host may opt its own DuDuClaw server into per-tool deadlines.
+    /// Server labels and third-party tool names never grant this automatically.
+    pub fn enable_builtin_tool_timeouts(&mut self) {
+        self.builtin_tool_timeouts = true;
+    }
+
+    fn request_timeout(&self, frame: &Value) -> Duration {
+        request_timeout_for_frame(frame, self.timeout, self.builtin_tool_timeouts)
+    }
     /// Spawn `command args...` and perform the `initialize` handshake.
     ///
     /// `envs` are added to the child environment. On any handshake failure the
@@ -552,6 +572,7 @@ impl McpClient {
             timeout,
             label: command.to_string(),
             workflow_version: None,
+            builtin_tool_timeouts: false,
         };
 
         if let Err(e) = client.handshake().await {
@@ -597,6 +618,7 @@ impl McpClient {
             timeout,
             label: url.to_string(),
             workflow_version: None,
+            builtin_tool_timeouts: false,
         };
         client.handshake().await?;
         Ok(client)
@@ -627,6 +649,7 @@ impl McpClient {
             timeout: recipe.operation_timeout,
             label: "scoped-http".into(),
             workflow_version: None,
+            builtin_tool_timeouts: false,
         };
         client.handshake().await?;
         Ok(client)
@@ -845,7 +868,7 @@ impl McpClient {
         if matches!(self.transport, McpTransport::Http { .. }) {
             return self.http_request(frame, expect_id, false).await;
         }
-        let timeout = self.timeout;
+        let timeout = self.request_timeout(&frame);
         let fut = async {
             self.send_line(&frame).await?;
             let McpTransport::Stdio { stdout, .. } = &mut self.transport else {
@@ -978,6 +1001,7 @@ impl McpClient {
     /// Shared POST builder for the HTTP transport: standard MCP headers +
     /// caller headers + session echo.
     async fn http_post(&mut self, frame: &Value) -> Result<reqwest::Response, McpError> {
+        let timeout = self.request_timeout(frame);
         let McpTransport::Http {
             http,
             url,
@@ -997,6 +1021,7 @@ impl McpClient {
         }
         let mut req = http
             .post(url.as_str())
+            .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(
                 reqwest::header::ACCEPT,
@@ -1879,6 +1904,15 @@ mod boundary_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcription_timeout_requires_host_identified_builtin_transport() {
+        let frame = serde_json::json!({"method":"tools/call", "params":{"name":"meeting_transcribe"}});
+        assert_eq!(request_timeout_for_frame(&frame, DEFAULT_MCP_TIMEOUT, false), DEFAULT_MCP_TIMEOUT);
+        assert_eq!(request_timeout_for_frame(&frame, DEFAULT_MCP_TIMEOUT, true), DEFAULT_MCP_TIMEOUT);
+        let handshake = serde_json::json!({"method":"initialize", "params":{"name":"meeting_transcribe"}});
+        assert_eq!(request_timeout_for_frame(&handshake, DEFAULT_MCP_TIMEOUT, true), DEFAULT_MCP_TIMEOUT);
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

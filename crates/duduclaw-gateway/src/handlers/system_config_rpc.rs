@@ -6,6 +6,10 @@ use super::*;
 impl MethodHandler {
     pub(crate) async fn handle_system_config(&self) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
+        let (transcription, transcription_error) = match duduclaw_inference::transcription::config::TranscriptionConfig::load(&self.home_dir) {
+            Ok(config) => (serde_json::to_value(config).ok(), None),
+            Err(error) => (None, Some(error)),
+        };
 
         // Current voice settings from inference.toml [voice] so the
         // dashboard Voice tab can show saved values instead of defaults.
@@ -104,6 +108,8 @@ impl MethodHandler {
                                     crate::runtime_config::global_utility_provider(&self.home_dir).as_str()
                                 },
                                 "voice": voice,
+                                "transcription": transcription,
+                                "transcription_error": transcription_error,
                                 "allowed_origins": allowed_origins,
                                 "gap_digest_enabled": gap_digest_enabled,
                                 "novelty_gate_enabled": novelty_gate_enabled,

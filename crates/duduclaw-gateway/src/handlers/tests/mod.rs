@@ -4,6 +4,7 @@
 use super::*;
 
 mod known_mcp_scopes_tests;
+mod transcription_config_tests;
 mod knowledge_dashboard_rpc_tests;
 mod knowledge_agent_tab_tests;
 mod has_api_key_configured_tests;

@@ -102,6 +102,7 @@ mod computer_workspaces_cmd; // P2-C: `duduclaw computer-workspaces` (operator-o
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
 mod tui_cmd;
+mod meeting_cmd;
 mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
@@ -439,6 +440,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 會議錄音與影片逐字稿
+    Meeting {
+        #[command(subcommand)]
+        command: meeting_cmd::MeetingCommands,
+    },
     /// Inspect or recover egress leases while the gateway is stopped.
     EgressLeases {
         #[command(subcommand)]
@@ -4345,6 +4351,7 @@ fn is_read_only_survival_command(command: &Commands) -> bool {
 
 async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
     match cli.command {
+        Commands::Meeting { command } => meeting_cmd::run(&duduclaw_home(), command).await,
         Commands::Tui { command } => tui_cmd::run(&duduclaw_home(), command).await,
         Commands::Onboard { yes } => cmd_onboard(yes).await,
         Commands::Run { yes } => cmd_run_server(yes).await,
@@ -6680,6 +6687,9 @@ fn agent_file_guard_decision(
                     bash_reserved_agent_create(command, &home, &caller)
                         .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(command, &caller, tui_cmd::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, meeting_cmd::OPERATOR_COMMANDS)
                         })
                         .or_else(|| license::bash_license_decision(command, &caller))
                         .or_else(|| {

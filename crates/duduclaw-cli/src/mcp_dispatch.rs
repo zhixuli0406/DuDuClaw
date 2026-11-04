@@ -594,7 +594,7 @@ impl McpDispatcher {
             &agent_id,
             tool_name,
             error_class,
-            detail,
+            if crate::mcp::meeting_audit_tool(tool_name) { "meeting request refused" } else { detail },
             arguments.as_ref(),
         );
     }
@@ -4773,6 +4773,7 @@ effect = "forbid"
         "tasks_update",
         "terminate_branch",
         "transcribe_audio",
+        "meeting_transcribe",
         "user_code_profile",
         "user_profile_get",
         "user_profile_record",
@@ -4823,7 +4824,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            254,
+            255,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

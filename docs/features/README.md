@@ -75,6 +75,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 68 | [Read-only team conversations](68-manager-team-history.md) | Enterprise backend (v1.76.0): live reporting-line scope, full-text report WebChat, masked external transcripts, activation boundary, mandatory audit and limits; [繁體中文](zh-TW/68-manager-team-history.md) / [日本語](ja-JP/68-manager-team-history.md) |
 | 69 | [Outgoing data guard](69-egress-guard.md) | v1.77.0: per-turn MCP private-read tracking, outgoing approval and standing-grant limits; [繁體中文](zh-TW/69-egress-guard.md) / [日本語](ja-JP/69-egress-guard.md) |
 | 70 | [Conversation credential audit](70-credential-audit.md) | credential metadata, routing-based holders, masking and Admin review; [繁體中文](zh-TW/70-credential-audit.md) / [日本語](ja-JP/70-credential-audit.md) |
+| 73 | [Meeting transcripts](73-meeting-transcripts.md) | Recordings to Taiwan Traditional Chinese with timestamps and optional speaker labels |
 
 ---
 

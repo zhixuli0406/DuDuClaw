@@ -212,6 +212,32 @@ pub(super) const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "meeting_transcribe",
+        description: "將自己的附件錄音或影片轉成臺灣繁體中文逐字稿，產生 Markdown 與 JSON 附件及預覽。音訊會傳送至設定的雲端服務商；Gemini 免費方案的內容可能用於改善產品。立即回傳工作編號；用 meeting_transcribe_status 查進度或 meeting_transcribe_cancel 取消。完成後通知原對話。跨段講者標籤可能不一致。",
+        params: &[
+            ParamDef { name: "source_path", description: "自己附件目錄內的錄音或影片路徑。", required: false },
+            ParamDef { name: "drive_file_id", description: "目前不支援影音下載；請先下載並上傳至員工附件。不可與 source_path 同時使用。", required: false },
+            ParamDef { name: "engine", description: "gemini、google_stt 或 whisper；員工只能使用管理員設定的引擎。", required: false },
+            ParamDef { name: "language_hint", description: "錄音語言提示，預設 zh-TW。輸出文字會轉成臺灣繁體。", required: false },
+            ParamDef { name: "write_wiki", description: "目前僅支援 false；請檢視附件後再透過知識庫工具存入。", required: false },
+        ],
+    },
+    ToolDef {
+        name: "meeting_upload_link",
+        description: "建立給目前對話使用者的單次會議錄音上傳連結，30 分鐘內有效；上傳完成後在原對話通知。需要管理員設定控制台公開網址。",
+        params: &[],
+    },
+    ToolDef {
+        name: "meeting_transcribe_status",
+        description: "查詢自己的會議轉錄進度、費用與逐字稿附件。",
+        params: &[ParamDef {name:"job_id",description:"會議轉錄工作編號。",required:true}],
+    },
+    ToolDef {
+        name: "meeting_transcribe_cancel",
+        description: "取消自己的會議轉錄；目前已送出的音訊段會先完成並記錄費用，之後不再開始新的段落。",
+        params: &[ParamDef {name:"job_id",description:"會議轉錄工作編號。",required:true}],
+    },
+    ToolDef {
         name: "synthesize_speech",
         description: "Convert text to speech with installed local Kokoro or Piper models. Returns base64 MP3 or WAV audio. Gateway-held paid TTS keys are unavailable here.",
         params: &[

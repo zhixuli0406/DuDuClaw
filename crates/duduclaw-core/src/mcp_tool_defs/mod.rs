@@ -156,6 +156,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("wiki_search", "min_trust", "number"),
     ("wiki_search", "expand", "boolean"),
     ("wiki_write", "update_index", "boolean"),
+    ("meeting_transcribe", "write_wiki", "boolean"),
 ];
 
 /// The JSON Schema type of one parameter (see [`PARAM_TYPES`]).

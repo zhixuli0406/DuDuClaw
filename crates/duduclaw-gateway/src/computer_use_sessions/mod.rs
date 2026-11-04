@@ -43,7 +43,7 @@ pub(crate) mod attended;
 pub(crate) mod attended_call;
 pub mod auth;
 mod backend;
-pub mod gates;
+pub(crate) mod gates;
 pub mod http;
 pub mod keepalive;
 pub(crate) mod login;

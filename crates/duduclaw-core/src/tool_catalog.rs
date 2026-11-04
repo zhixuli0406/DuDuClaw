@@ -30,6 +30,9 @@ use serde::Serialize;
 /// registration in `duduclaw-cli` (`mcp.rs`, server name "duduclaw").
 pub const MCP_SERVER_NAME: &str = "duduclaw";
 
+/// Background meeting submission uses the normal MCP transport timeout.
+pub fn builtin_mcp_call_timeout(_tool_name: &str, default: std::time::Duration) -> std::time::Duration { default }
+
 /// One entry in the built-in tool catalog surfaced to the dashboard capability
 /// editor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -275,6 +278,15 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "messaging:send",
         "channel",
     ),
+    (
+        "meeting_transcribe",
+        "Create Traditional Chinese meeting transcripts",
+        "messaging:send",
+        "channel",
+    ),
+    ("meeting_upload_link", "Create a single-use meeting upload link", "messaging:send", "channel"),
+    ("meeting_transcribe_status", "Read own meeting job", "messaging:send", "channel"),
+    ("meeting_transcribe_cancel", "Cancel own meeting job", "messaging:send", "channel"),
     // ── Memory: read (memory:read) ───────────────────────────────────────
     (
         "memory_search",
@@ -1861,6 +1873,15 @@ pub fn tool_list_verdict(tool_name: &str, denied: &[String], allowed: &[String])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcription_timeout_is_exact_and_does_not_widen_other_tools() {
+        let default = std::time::Duration::from_secs(30);
+        assert_eq!(builtin_mcp_call_timeout("meeting_transcribe", default), default);
+        for other in ["transcribe_audio", "meeting_transcribe_status", "remote_meeting_transcribe", "meeting_transcribe.evil", ""] {
+            assert_eq!(builtin_mcp_call_timeout(other, default), default);
+        }
+    }
     use std::collections::HashSet;
 
     fn strings(v: &[&str]) -> Vec<String> {

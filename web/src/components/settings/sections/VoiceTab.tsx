@@ -14,6 +14,7 @@ import {
 } from '@/components/mds';
 import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
 import { AutonomyNote } from '@/components/AutonomyNote';
+import { MeetingTranscriptionCard } from './MeetingTranscriptionCard';
 import { RowSelect, RowText, FieldBlock } from '@/pages/agent-form/form-rows';
 
 // ── Voice Settings Tab ─────────────────────────────────────────
@@ -163,6 +164,7 @@ export function VoiceTab() {
         </div>
       </SettingsSection>
 
+      <MeetingTranscriptionCard />
       <AdvancedSection storageKey="settings.voice" label={intl.formatMessage({ id: 'voice.advanced' })}>
         <SttConfigCard />
       </AdvancedSection>
