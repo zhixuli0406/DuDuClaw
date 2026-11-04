@@ -1,5 +1,7 @@
 # DuDuClaw デプロイガイド
 
+公式 Linux CLI バイナリには **glibc ≥ 2.31** が必要です。Ubuntu 20.04+、Debian 11+、RHEL/Rocky Linux 9+ をサポートします。古いシステムでは Docker を使用してください。この基準は CLI/gateway（デスクトップ版の CLI sidecar を含む）に適用され、デスクトップ GUI には別途 WebKitGTK などのシステムライブラリが必要です。
+
 > 更新日：2026-03-30 ｜ バージョン：v0.10.0
 
 ---

@@ -1905,6 +1905,7 @@ dependencies = [
  "libc",
  "minisign-verify",
  "percent-encoding",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

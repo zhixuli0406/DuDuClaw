@@ -1,11 +1,34 @@
 //! One-shot intake of the root launcher's key. No filesystem/config fallback.
 //! Call only from gateway hardening, before any employee process is started.
 
-use std::sync::OnceLock;
-use zeroize::Zeroizing;
+use std::sync::{Mutex, OnceLock};
+use zeroize::{Zeroize, Zeroizing};
 
 pub const KEY_PATH: &str = "/var/lib/duduclaw-protected/root.key";
 const FD_ENV: &str = "DUDUCLAW_ROOT_KEY_FD";
+pub const MODE_ENV: &str = "DUDUCLAW_PROTECTED_KEY_MODE";
+
+#[path = "root_key_native.rs"]
+mod native;
+#[path = "root_key_version.rs"]
+mod version;
+pub use version::check_protected_version;
+pub use native::{CgroupState, ExecutableState, NativeInputs, initial_user_namespace_map};
+#[cfg(target_os = "linux")]
+pub use native::native_host_check;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationMode { Container, NativeSystemd, Invalid }
+
+/// Container detection always wins; an environment value cannot relax its rules.
+pub fn attestation_mode(containerized: bool, mode: Option<&std::ffi::OsStr>) -> AttestationMode {
+    if containerized { AttestationMode::Container }
+    else if mode == Some(std::ffi::OsStr::new("native-systemd")) { AttestationMode::NativeSystemd }
+    else { AttestationMode::Invalid }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn offered() -> bool { std::env::var_os(FD_ENV).is_some() }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateKind { NotOffered, Held, Refused }
@@ -17,10 +40,41 @@ enum State {
     Refused(&'static str),
 }
 
-static STATE: OnceLock<State> = OnceLock::new();
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
+fn locked_state() -> Option<std::sync::MutexGuard<'static, State>> {
+    let state = STATE.get()?;
+    Some(match state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => {
+            let mut state = poisoned.into_inner();
+            revoke_state(&mut state, "key_state_poisoned");
+            state
+        }
+    })
+}
+
+fn revoke_state(state: &mut State, reason: &'static str) {
+    if let State::Held(key) = state { key.as_mut().zeroize(); }
+    *state = State::Refused(reason);
+}
+
+// Called with the state lock held: the Held check and zeroization are one transition.
+#[cfg(any(target_os = "linux", test))]
+fn revoke_if_held(state: &mut State, reason: &'static str) -> bool {
+    if !matches!(state, State::Held(_)) { return false; }
+    revoke_state(state, reason);
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn revoke(reason: &'static str) {
+    if let Some(mut state) = locked_state() { revoke_if_held(&mut state, reason); }
+    tracing::warn!(reason, "Protected root key revoked; personal accounts unavailable until restart");
+}
 
 pub fn state_kind() -> StateKind {
-    match STATE.get() {
+    match locked_state().as_deref() {
         Some(State::Held(_)) => StateKind::Held,
         Some(State::Refused(_)) => StateKind::Refused,
         _ => StateKind::NotOffered,
@@ -28,7 +82,7 @@ pub fn state_kind() -> StateKind {
 }
 
 pub fn refused_reason() -> Option<&'static str> {
-    match STATE.get() { Some(State::Refused(reason)) => Some(reason), _ => None }
+    match locked_state().as_deref() { Some(State::Refused(reason)) => Some(*reason), _ => None }
 }
 
 pub fn is_held() -> bool { state_kind() == StateKind::Held }
@@ -37,18 +91,20 @@ pub fn is_held() -> bool { state_kind() == StateKind::Held }
 #[cfg(all(feature = "test-root-key", debug_assertions))]
 #[doc(hidden)]
 pub fn test_hold_root_key() {
-    assert!(STATE.set(State::Held(Box::new(Zeroizing::new([0u8; 32])))).is_ok(),
+    assert!(STATE.set(Mutex::new(State::Held(Box::new(Zeroizing::new([0u8; 32]))))).is_ok(),
         "root-key test requires a fresh process");
 }
 
 /// Borrow the key for one operation; the storage itself is never handed out.
 pub fn with_key<T>(f: impl FnOnce(&[u8; 32]) -> T) -> Option<T> {
-    match STATE.get() { Some(State::Held(key)) => Some(f(key)), _ => None }
+    match locked_state().as_deref() { Some(State::Held(key)) => Some(f(key)), _ => None }
 }
 
 /// Facts gathered from the kernel, kept separate for cross-platform tests.
 #[derive(Debug, Clone)]
 pub struct AttestationInputs {
+    pub mode: AttestationMode,
+    pub native: NativeInputs,
     pub pid: u32,
     pub uids: Option<[u32; 3]>,
     pub gids: Option<[u32; 3]>,
@@ -63,7 +119,12 @@ pub struct AttestationInputs {
 }
 
 pub fn attest(i: &AttestationInputs) -> Result<(), &'static str> {
-    if i.pid != 1 { return Err("not_pid_one"); }
+    match i.mode {
+        AttestationMode::Container if i.pid != 1 => return Err("not_pid_one"),
+        AttestationMode::NativeSystemd => native::attest(&i.native)?,
+        AttestationMode::Invalid => return Err("mode"),
+        AttestationMode::Container => (),
+    }
     let equal_nonroot = |ids: Option<[u32; 3]>| {
         ids.is_some_and(|[real, effective, saved]| real != 0 && real == effective && real == saved)
     };
@@ -78,14 +139,38 @@ pub fn attest(i: &AttestationInputs) -> Result<(), &'static str> {
     }
     if i.dumpable != 0 { return Err("dumpable"); }
     if !i.key_path_denied { return Err("key_path_accessible"); }
-    if !i.sockets_absent { return Err("engine_socket"); }
+    if i.mode == AttestationMode::Container && !i.sockets_absent { return Err("engine_socket"); }
     if !i.docker_host_absent { return Err("docker_host"); }
     Ok(())
 }
 
 /// `hardening_failure` also closes the offered descriptor without reading it.
 pub(crate) fn intake(hardening_failure: Option<&'static str>) {
-    STATE.get_or_init(|| {
+    STATE.get_or_init(|| Mutex::new(intake_state(hardening_failure)));
+    #[cfg(target_os = "linux")]
+    if is_held() && std::env::var_os(MODE_ENV).as_deref() == Some(std::ffi::OsStr::new("native-systemd")) {
+        static MONITOR: OnceLock<()> = OnceLock::new();
+        MONITOR.get_or_init(|| {
+            let uid = unsafe { libc::getuid() };
+            if std::thread::Builder::new().name("protected-key-check".into()).spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    let Some(mut state) = locked_state() else { break; };
+                    if !matches!(*state, State::Held(_)) { break; }
+                    // Keep key borrowers out until the check and any failed
+                    // Held -> Refused transition finish in this critical section.
+                    if let Err(reason) = native::reattest(uid) {
+                        revoke_if_held(&mut state, reason);
+                        tracing::warn!(reason, "Protected root key revoked; personal accounts unavailable until restart");
+                        break;
+                    }
+                }
+            }).is_err() { revoke("reattest_unavailable"); }
+        });
+    }
+}
+
+fn intake_state(hardening_failure: Option<&'static str>) -> State {
         let Some(offered) = std::env::var_os(FD_ENV) else { return State::NotOffered; };
         #[cfg(target_os = "linux")]
         let result = linux::take(&offered, hardening_failure);
@@ -102,11 +187,10 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
                 if reason == "mount_scan_incomplete" {
                     tracing::warn!("Mount table or mount points could not be inspected");
                 }
-                tracing::warn!(reason, "Container root key refused; personal accounts remain disabled");
+                tracing::warn!(reason, "Protected root key refused; personal accounts remain disabled");
                 State::Refused(reason)
             }
         }
-    });
 }
 
 /// Mountinfo escapes whitespace and backslashes in path fields with octal codes.
@@ -257,11 +341,21 @@ mod linux {
             .is_some_and(|e| e.raw_os_error() == Some(libc::EACCES));
         let sockets_absent = ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]
             .iter().all(|p| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound));
-        check_mountinfo(
-            std::fs::read_to_string("/proc/self/mountinfo").ok().as_deref(),
-            |path| std::fs::symlink_metadata(path).map(|metadata| (metadata.file_type().is_socket(), metadata.is_dir())),
-        )?;
+        if std::env::var_os(MODE_ENV).as_deref() == Some(OsStr::new("native-systemd")) {
+            native::native_host_check()?;
+        }
+        let mode = attestation_mode(crate::ns_guard::is_containerized(),
+            std::env::var_os(MODE_ENV).as_deref());
+        if mode == AttestationMode::Container {
+            check_mountinfo(
+                std::fs::read_to_string("/proc/self/mountinfo").ok().as_deref(),
+                |path| std::fs::symlink_metadata(path).map(|metadata| (metadata.file_type().is_socket(), metadata.is_dir())),
+            )?;
+        }
+        let native = if mode == AttestationMode::NativeSystemd { native::gather(ruid) }
+            else { NativeInputs::default() };
         Ok(AttestationInputs {
+            mode, native,
             pid: unsafe { libc::getpid() } as u32,
             uids, gids,
             no_new_privs: field("NoNewPrivs", 10),

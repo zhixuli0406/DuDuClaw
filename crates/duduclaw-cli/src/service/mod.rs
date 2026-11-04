@@ -12,6 +12,8 @@
 #[allow(unused_imports)]
 use duduclaw_core::error::{DuDuClawError, Result};
 
+pub(crate) mod protected_linux;
+
 /// Actions that can be performed on the background service.
 pub enum ServiceAction {
     Install,
