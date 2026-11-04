@@ -26,6 +26,7 @@ fn install_script(home: &std::path::Path, agent: &str, skill: &str, name: &str, 
         .join(skill)
         .join("scripts");
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.parent().unwrap().join("SKILL.md"), "# Office skill").unwrap();
     std::fs::write(dir.join(format!("{name}.py")), body).unwrap();
 }
 
@@ -243,4 +244,43 @@ async fn runs_a_real_script_and_returns_stdout() {
     .await;
     assert!(!is_err(&out), "expected success, got: {}", text_of(&out));
     assert!(text_of(&out).contains("OFFICE_SCRIPT_OK"));
+}
+
+// Shared defaults must execute from the same layer that owns the skill.
+#[tokio::test]
+async fn office_script_resolves_company_then_department_then_personal() {
+    let home = TempHome::new();
+    let global = home.path().join("skills/pdf/scripts");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::write(global.join("create.py"), "company").unwrap();
+    std::fs::write(global.parent().unwrap().join("SKILL.md"), "# Company PDF").unwrap();
+    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), global.join("create.py").canonicalize().unwrap());
+    let agent = home.path().join("agents/bot");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(agent.join("agent.toml"), "[agent]\ndepartment = 'sales'\n").unwrap();
+    let dept = duduclaw_agent::skill_loader::department_skills_dir(home.path(), "sales").join("pdf/scripts");
+    std::fs::create_dir_all(&dept).unwrap();
+    std::fs::write(dept.join("create.py"), "department").unwrap();
+    std::fs::write(dept.parent().unwrap().join("SKILL.md"), "# Department PDF").unwrap();
+    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), dept.join("create.py").canonicalize().unwrap());
+    std::fs::create_dir_all(agent.join("SKILLS/pdf")).unwrap();
+    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), dept.join("create.py").canonicalize().unwrap(), "empty personal directory must not shadow department");
+    std::fs::write(agent.join("SKILLS/pdf/SKILL.md"), "# Personal PDF").unwrap();
+    assert!(resolve_office_script(home.path(), "bot", "pdf", "create").await.is_err(), "personal override without script must not fall back");
+    install_script(home.path(), "bot", "pdf", "create", "personal");
+    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), agent.join("SKILLS/pdf/scripts/create.py").canonicalize().unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn office_script_refuses_script_links_outside_the_skill() {
+    use std::os::unix::fs::symlink;
+    let home = TempHome::new();
+    let scripts = home.path().join("skills/pdf/scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.parent().unwrap().join("SKILL.md"), "# Company PDF").unwrap();
+    let outside = home.path().join("outside.py");
+    std::fs::write(&outside, "print('outside')").unwrap();
+    symlink(&outside, scripts.join("create.py")).unwrap();
+    assert!(resolve_office_script(home.path(), "bot", "pdf", "create").await.is_err());
 }

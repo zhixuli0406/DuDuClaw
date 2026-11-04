@@ -7366,6 +7366,9 @@ mod resolve_hook_caller_tests {
         let res = super::scaffold_agent_dir(home.path(), &scaffold_for("writer")).await;
         assert!(res.is_ok(), "{res:?}");
         assert!(home.path().join("agents/writer/agent.toml").exists());
+        assert_eq!(std::fs::read_dir(home.path().join("agents/writer/SKILLS")).unwrap().count(), 0);
+        assert!(home.path().join("skills/pdf/SKILL.md").exists());
+        assert!(!home.path().join("skills/code-review").exists());
     }
 }
 
@@ -8511,11 +8514,8 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             DuDuClawError::Config(format!("Failed to create directory {}: {e}", dir.display()))
         })?;
     }
-    // Seed the bundled skills. Previously only the MCP `create_agent` tool did
-    // this, so an operator who onboarded from the CLI or the dashboard ended up
-    // with an empty SKILLS/ and a blank Skills page. Best-effort — never fail
-    // onboarding over a nicety.
-    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
+    // Shared defaults are installed once; personal skills are opt-in.
+    duduclaw_gateway::builtin_skills_seed_migration::run(&home);
 
     // config.toml — encrypt API key with AES-256-GCM (M-4)
     let config_path = home.join("config.toml");
@@ -10392,6 +10392,8 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
 
     let mut checks: Vec<(String, CheckStatus, String)> = Vec::new();
 
+    println!("技能提示：新員工共用公司層的四項辦公技能。舊個人副本不會自動刪除；請逐檔比對內容雜湊（含腳本），確認相同後在技能頁移除並封存，必要時還原。");
+
     // Check 1: config.toml exists
     let config_path = home.join("config.toml");
     if config_path.exists() {
@@ -11055,14 +11057,6 @@ pub(crate) fn scaffold_agent_files(
     for filename in provider_context_filenames(*provider) {
         files.insert(filename.to_string(), context_md.as_bytes().to_vec());
     }
-    for (name, body) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
-        files.insert(format!("SKILLS/{name}/SKILL.md"), body.as_bytes().to_vec());
-    }
-    for (name, entries) in duduclaw_agent::builtin_skills::BUILTIN_SKILL_FILES {
-        for (rel, body) in *entries {
-            files.insert(format!("SKILLS/{name}/{rel}"), body.as_bytes().to_vec());
-        }
-    }
     Ok(files)
 }
 
@@ -11149,6 +11143,7 @@ mod planned_scaffold_tests {
             soul_body: Some("Approved persona".into()),
         };
         let mut files = super::scaffold_agent_files(&scaffold).unwrap();
+        assert!(!files.keys().any(|name| name.starts_with("SKILLS/")));
         for (name, content) in [("IDENTITY.md", "Approved identity"), ("USER.md", "User data"),
             ("INSTRUCTIONS.md", "Approved rules"), ("CONTRACT.toml", "[boundaries]\nmust_not = ['refund']\n")] {
             files.insert(name.into(), content.as_bytes().to_vec());
@@ -11215,8 +11210,8 @@ pub(crate) async fn scaffold_agent_dir(
             DuDuClawError::Agent(format!("Failed to create {}: {e}", dir.display()))
         })?;
     }
-    // Same seeding as the MCP `create_agent` path — see `duduclaw onboard`.
-    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
+    // Shared defaults are installed once; personal skills are opt-in.
+    duduclaw_gateway::builtin_skills_seed_migration::run(home);
 
     let AgentScaffold {
         name: agent_name,

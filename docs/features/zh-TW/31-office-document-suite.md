@@ -1,5 +1,7 @@
 # Office 文件套件
 
+四項辦公技能只在公司層 `<home>/skills/` 安裝一次，不再複製到每位新員工。既有副本會保留；程式技能選用與清理方式見[技能生命週期](15-skill-lifecycle.md)。
+
 > Agent 交到你手上的是真正的 .docx,不是一段描述它的文字:靠一套 marker 協議、一道 fail-closed 路徑圍欄,以及模型忘了 marker 那天用的安全網。
 
 ---

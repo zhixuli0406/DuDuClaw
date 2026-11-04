@@ -1,5 +1,7 @@
 # Office Document Suite
 
+The four office skills are installed once in the company-wide `<home>/skills/` layer, rather than copied into each new employee. Existing copies are preserved. See [Skill Lifecycle](15-skill-lifecycle.md) for optional programming skills and cleanup guidance.
+
 > Agents that hand you a real .docx, not a paragraph describing one — with a marker protocol, a fail-closed path fence, and a safety net for the day the model forgets the marker.
 
 ---

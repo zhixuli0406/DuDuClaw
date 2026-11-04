@@ -88,12 +88,12 @@ pub(crate) async fn handle_execute_program(args: &Value, home_dir: &Path, defaul
 // produce document files. Fail-closed on every input:
 //   - `skill` must be one of the four bundled office skills.
 //   - `script` must be a bare stem (alnum / `_` / `-`) resolving to an existing
-//     `<agent>/SKILLS/<skill>/scripts/<script>.py`.
+//     `<owning-layer>/<skill>/scripts/<script>.py`.
 //   - every path-shaped argument must resolve inside the caller's agent dir or
 //     the shared `{home}/attachments` root — the same sandbox the outbound
 //     `📎DELIVER:` validator trusts.
 // The agent id comes from the caller context (`default_agent`), never from
-// arguments, so an agent can only ever run scripts in its own directory.
+// arguments. Shared scripts run with the caller's directory as cwd.
 
 /// The four bundled office skills whose scripts `office_script` may run.
 pub(crate) const OFFICE_SCRIPT_SKILLS: &[&str] = &["docx", "xlsx", "pptx", "pdf"];
@@ -138,6 +138,39 @@ pub(crate) fn office_arg_within_sandbox(arg: &str, agent_root: &Path, attach_roo
     norm.starts_with(agent_root) || norm.starts_with(attach_root)
 }
 
+/// Resolve one owning layer before looking for its script. Missing scripts in
+/// an override must never fall through to a different version of the skill.
+/// `skill` and `stem` are validated by the handler before entering this helper.
+pub(crate) async fn resolve_office_script(
+    home: &Path, agent: &str, skill: &str, stem: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let mut layers = vec![caller_agent_dir(home, agent).join("SKILLS")];
+    if let Some(department) = resolve_agent_department(home, agent) {
+        layers.push(duduclaw_agent::skill_loader::department_skills_dir(home, &department));
+    }
+    layers.push(home.join("skills"));
+    for layer in layers {
+        // Reuse the prompt loader's definition of an installed skill. Empty
+        // directories and orphaned scripts must not shadow a shared skill.
+        let loaded = duduclaw_agent::registry::AgentRegistry::load_skills(&layer).await;
+        if !loaded.iter().any(|candidate| candidate.name == skill) { continue; }
+        let dir = layer.join(skill);
+        let metadata = std::fs::symlink_metadata(&dir)
+            .map_err(|_| "Script not found: the owning skill has no script directory".to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("Skill directory must be a regular directory".into());
+        }
+        let root = dir.canonicalize().map_err(|error| error.to_string())?;
+        let script = dir.join("scripts").join(format!("{stem}.py"));
+        let resolved = script.canonicalize().map_err(|error| format!("Script not found: {error}"))?;
+        if !resolved.starts_with(&root) || !resolved.is_file() {
+            return Err("Script must stay inside its owning skill directory".into());
+        }
+        return Ok(resolved);
+    }
+    Err(format!("Script not found: {skill}/scripts/{stem}.py"))
+}
+
 pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     // 1. skill allowlist (fail-closed).
     let skill = args
@@ -169,7 +202,7 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
         );
     }
 
-    // 3. resolve the script inside the CALLER's own agent dir (never from args).
+    // 3. resolve the script from the caller's personal/department/company layers.
     // W3-3b (a): `.ephemeral/` included — a role member's SKILLS live in its
     // own scaffold, and the bare registry path made every bundled office
     // script report "Script not found" for team members.
@@ -181,17 +214,10 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
         ));
     }
     let agent_dir = caller_agent_dir(home_dir, default_agent);
-    let script_path = agent_dir
-        .join("SKILLS")
-        .join(skill)
-        .join("scripts")
-        .join(format!("{stem}.py"));
-    if !script_path.is_file() {
-        return tool_error(&format!(
-            "Script not found: SKILLS/{skill}/scripts/{stem}.py (agent '{default_agent}'). \
-             Available office scripts: create, extract, to_pdf."
-        ));
-    }
+    let script_path = match resolve_office_script(home_dir, default_agent, skill, stem).await {
+        Ok(path) => path,
+        Err(error) => return tool_error(&error),
+    };
 
     // 4. validate every path-shaped argument stays inside the sandbox.
     let attach_root = home_dir.join("attachments");

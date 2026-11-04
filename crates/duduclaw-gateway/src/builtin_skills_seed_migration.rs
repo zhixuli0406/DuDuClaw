@@ -1,18 +1,10 @@
 //! Versioned backfills for bundled skills: WP19 for older installs, then G1
 //! for the Google setup guide. Each step keeps its own completion marker.
 //!
-//! **Why this exists.** Every new AI staffer is supposed to start with the
-//! bundled document skills (docx / xlsx / pptx / pdf). Up to v1.51.0 the
-//! seeding call was wired to exactly one of the five agent-creation paths —
-//! the MCP `create_agent` tool. Anyone who onboarded through the dashboard,
-//! `duduclaw onboard`, `duduclaw agent create`, or the industry wizard got an
-//! empty `SKILLS/`; and since nothing ever writes `<home>/skills/` either,
-//! their Skills page was blank. The customer report "the skill library shows
-//! nothing" was literally true and had nothing to do with the page's read path.
-//!
-//! Wiring the remaining four creation paths (v1.51.1) fixes agents created
-//! *from now on*. It does nothing for the staffer already sitting in a
-//! customer's `~/.duduclaw` — hence this migration.
+//! **Defaults.** Only docx / xlsx / pptx / pdf are seeded by WP19.
+//! Programming skills are optional. Employee creation uses this company-wide
+//! backfill instead of copying bundled skills into each personal SKILLS folder.
+//! Existing personal and company-wide skills are never removed.
 //!
 //! **Where it seeds.** `<home>/skills/`, the company-wide layer, not each
 //! agent's `SKILLS/`. One write instead of N, every existing and future
@@ -61,7 +53,7 @@ fn run_legacy(home_dir: &Path) -> SeedReport {
     }
 
     let skills_dir = home_dir.join("skills");
-    match duduclaw_agent::builtin_skills::install_legacy_builtin_skills(&skills_dir) {
+    match duduclaw_agent::builtin_skills::install_office_skills(&skills_dir) {
         Ok(names) => {
             report.seeded = names.iter().map(|n| n.to_string()).collect();
             if report.seeded.is_empty() {
@@ -149,7 +141,7 @@ fn run_google_setup(home_dir: &Path) -> SeedReport {
 /// what was written and why, in plain language, next to the timestamp.
 ///
 /// A failure here only risks the migration running once more on the next boot,
-/// which is harmless — `install_builtin_skills` skips every skill whose
+/// which is harmless — `install_office_skills` skips every skill whose
 /// `SKILL.md` already exists.
 fn write_marker(marker: &Path, report: &SeedReport) {
     if let Some(parent) = marker.parent()
@@ -279,13 +271,10 @@ mod tests {
 
         let skills_root = home.path().join("skills");
         let on_disk = seeded_names(&skills_root);
-        for (name, _) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
-            if !cfg!(unix) && *name == "connect-google" { continue; }
-            assert!(
-                on_disk.contains(&name.to_string()),
-                "bundled skill `{name}` must be backfilled, got {on_disk:?}"
-            );
+        for dev in ["code-review", "refactor", "test-writer", "git-workflow"] {
+            assert!(!on_disk.contains(&dev.to_string()));
         }
+        if cfg!(unix) { assert!(on_disk.contains(&"connect-google".to_string())); }
         // The multi-file office skills (docx / xlsx / pptx / pdf) are the ones
         // the customer was actually missing — "make me a spreadsheet" is the
         // request that failed. They ship a SKILL.md *plus* the scripts it calls,

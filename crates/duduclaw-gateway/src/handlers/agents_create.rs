@@ -173,7 +173,7 @@ impl MethodHandler {
             let _ = tokio::fs::remove_dir_all(&agent_dir).await;
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
-        Self::seed_builtin_skills(&skills_dir);
+        Self::seed_builtin_skills(&self.home_dir);
 
         // WP22 T1 — kept for the post-commit `org.toml` write below; the
         // `toml!` macro consumes these by value.

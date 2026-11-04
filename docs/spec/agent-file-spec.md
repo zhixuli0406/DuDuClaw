@@ -148,8 +148,8 @@ and destination paths with SHA-256 hashes. An empty tool allowlist means no extr
 allowlist restriction; the deny list still applies.
 
 The versioned confirmation digest binds this plan, including collision resolutions,
-all rendered employee files (including built-in skills and host-generated MCP
-configuration), every imported skill body and attachment, archive/wiki/hook payloads,
+all rendered employee files (including host-generated MCP configuration;
+bundled defaults are company-wide, not rendered into personal skills), every imported skill body and attachment, archive/wiki/hook payloads,
 hook disposition, destination identity, product policy and replacement scope/content.
 MCP credentials are represented by file hashes, never shown as plaintext. A separate
 confirmation invocation rebuilds the plan against the current source and destination;

@@ -1,7 +1,7 @@
 //! RFC-26 §4.3 (P6.3): built-in skill set parity with deep-agents.
 //!
-//! Nine bundled skills installed into every new agent's `SKILLS/`
-//! directory at creation: five inline skills and four multi-file office skills.
+//! Office skills are seeded once into the company-wide layer. Inline
+//! programming skills remain available as opt-in content, never creation defaults.
 //! Idempotent: existing
 //! files are never overwritten (operator edits win).
 
@@ -142,16 +142,17 @@ pub fn install_builtin_skills(skills_dir: &Path) -> std::io::Result<Vec<&'static
     install_skills(skills_dir, true)
 }
 
-/// The Google backfill owns its own no-follow writer and versioned marker.
-pub fn install_legacy_builtin_skills(skills_dir: &Path) -> std::io::Result<Vec<&'static str>> {
+/// Seed only the four office defaults. Google setup has its own backfill.
+/// Programming skills are opt-in; existing copies are left untouched.
+pub fn install_office_skills(skills_dir: &Path) -> std::io::Result<Vec<&'static str>> {
     install_skills(skills_dir, false)
 }
 
-fn install_skills(skills_dir: &Path, include_google: bool) -> std::io::Result<Vec<&'static str>> {
+fn install_skills(skills_dir: &Path, include_inline: bool) -> std::io::Result<Vec<&'static str>> {
     std::fs::create_dir_all(skills_dir)?;
     let mut written = Vec::new();
     for (name, body) in BUILTIN_SKILLS {
-        if !include_google && *name == "connect-google" {
+        if !include_inline {
             continue;
         }
         // Anthropic Skills layout: <skills>/<name>/SKILL.md
@@ -191,6 +192,26 @@ fn install_skills(skills_dir: &Path, include_google: bool) -> std::io::Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn office_defaults_exclude_programming_and_preserve_existing_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills = temp.path().join("skills");
+        let first = install_office_skills(&skills).unwrap();
+        assert_eq!(first, ["docx", "xlsx", "pptx", "pdf"]);
+        for (name, files) in BUILTIN_SKILL_FILES {
+            for (relative, body) in *files {
+                assert_eq!(std::fs::read_to_string(skills.join(name).join(relative)).unwrap(), *body);
+            }
+        }
+        for (name, _) in BUILTIN_SKILLS { assert!(!skills.join(name).exists()); }
+        std::fs::write(skills.join("docx/SKILL.md"), "Operator edit").unwrap();
+        std::fs::create_dir_all(skills.join("refactor")).unwrap();
+        std::fs::write(skills.join("refactor/SKILL.md"), "Existing optional skill").unwrap();
+        assert!(install_office_skills(&skills).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(skills.join("docx/SKILL.md")).unwrap(), "Operator edit");
+        assert_eq!(std::fs::read_to_string(skills.join("refactor/SKILL.md")).unwrap(), "Existing optional skill");
+    }
 
     #[test]
     fn google_guide_stays_under_three_kilobytes() {

@@ -207,7 +207,7 @@ impl MethodHandler {
             tokio::fs::create_dir_all(agent_dir.join("SKILLS"))
                 .await
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
-            Self::seed_builtin_skills(&agent_dir.join("SKILLS"));
+            Self::seed_builtin_skills(&self.home_dir);
             tokio::fs::write(agent_dir.join("SOUL.md"), &soul_md)
                 .await
                 .map_err(|e| format!("Failed to write SOUL.md: {e}"))?;
