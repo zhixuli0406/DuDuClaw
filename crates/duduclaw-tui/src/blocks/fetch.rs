@@ -28,6 +28,54 @@ impl Gateway for Client {
             .await
     }
 }
+// Socket selectors are shared by panes and survive discarded data fetches.
+#[derive(Default)]
+pub(crate) struct RunSubscriptions {
+    panes: std::collections::HashMap<String, (Option<String>, bool)>,
+}
+struct SharedRuns<'a, G> {
+    gateway: &'a G,
+    retained: Vec<String>,
+}
+#[async_trait]
+impl<G: Gateway> Gateway for SharedRuns<'_, G> {
+    async fn request(&self, method: &str, params: Value) -> Result<RpcReply> {
+        if method == "runs.unsubscribe" && params["run_id"].as_str().is_some_and(|id| self.retained.iter().any(|r| r == id)) {
+            return Ok(RpcReply::Accepted(json!({})));
+        }
+        self.gateway.request(method, params).await
+    }
+}
+impl RunSubscriptions {
+    pub(crate) async fn retain(&mut self, gateway: &impl Gateway, ids: &[String]) -> Result<()> {
+        let removed: Vec<_> = self.panes.iter().filter(|(id, _)| !ids.contains(id)).map(|(_, state)| state.clone()).collect();
+        let mut released = std::collections::HashSet::new();
+        for (run, subscribed) in removed {
+            if subscribed && let Some(run) = run
+                && !self.panes.iter().any(|(pane, (id, live))| ids.contains(pane) && *live && id.as_ref() == Some(&run)) && released.insert(run.clone()) {
+                gateway.request("runs.unsubscribe", json!({"run_id":run})).await?;
+            }
+        }
+        self.panes.retain(|id, _| ids.contains(id));
+        Ok(())
+    }
+    pub(crate) async fn fetch(&mut self, gateway: &impl Gateway, pane: &Pane, role: Option<crate::auth::Role>) -> Result<Data> {
+        let mut pane = pane.clone();
+        if pane.kind == Block::Run {
+            let cached = self.panes.get(&pane.id);
+            pane.data.subscription_checked = cached.is_some();
+            pane.data.subscribed_run = cached.and_then(|(id, _)| id.clone());
+            pane.data.subscribed = cached.is_some_and(|(_, live)| *live);
+        }
+        let retained = self.panes.iter().filter(|(id, (_, live))| **id != pane.id && *live)
+            .filter_map(|(_, (id, _))| id.clone()).collect();
+        let data = pane_for_role(&SharedRuns { gateway, retained }, &pane, role).await?;
+        if pane.kind == Block::Run {
+            self.panes.insert(pane.id, (data.subscribed_run.clone(), data.subscribed));
+        }
+        Ok(data)
+    }
+}
 pub async fn pane_for_role(gateway: &impl Gateway, pane: &Pane, role: Option<crate::auth::Role>) -> Result<Data> {
     use crate::auth::Role;
     let refusal = match pane.kind {
@@ -78,20 +126,6 @@ pub async fn pane(gateway: &impl Gateway, pane: &Pane, manager: bool) -> Result<
                     ),
                 ));
             }
-            if pane.data.subscription_checked {
-                data.subscribed = pane.data.subscribed;
-            } else {
-                match gateway
-                    .request("runs.subscribe", json!({"agent_id":agent}))
-                    .await?
-                {
-                    RpcReply::Accepted(_) => data.subscribed = true,
-                    RpcReply::Rejected { message, .. }
-                        if message.is("Unknown method: runs.subscribe") => {}
-                    RpcReply::Rejected { .. } => return Err(Error::RpcRejected),
-                }
-            }
-            data.subscription_checked = true;
             // Runtime is employee metadata; never infer it from missing step events.
             let agents = gateway.read("agents.list", json!({})).await?;
             data.runtime = array(&agents, "agents")?
@@ -99,6 +133,20 @@ pub async fn pane(gateway: &impl Gateway, pane: &Pane, manager: bool) -> Result<
                 .find(|r| r["name"] == agent)
                 .and_then(|r| r["runtime"]["provider"].as_str())
                 .map(|s| TerminalText::new(s.into()));
+            let selected_run = data.selected["id"].as_str();
+            data.subscribed_run = selected_run.map(str::to_owned);
+            if pane.data.subscription_checked && pane.data.subscribed_run.as_deref() == selected_run {
+                data.subscribed = pane.data.subscribed;
+            } else {
+                if pane.data.subscribed && let Some(id) = &pane.data.subscribed_run {
+                    // Refusals are optional-live failures; transport errors still propagate.
+                    gateway.request("runs.unsubscribe", json!({"run_id":id})).await?;
+                }
+                if let Some(id) = selected_run {
+                    data.subscribed = matches!(gateway.request("runs.subscribe", json!({"run_id":id})).await?, RpcReply::Accepted(_));
+                }
+            }
+            data.subscription_checked = true;
         }
         Block::Task if pane.responsibilities => {
             let agent = pane.agent.as_deref().ok_or(Error::Protocol)?;

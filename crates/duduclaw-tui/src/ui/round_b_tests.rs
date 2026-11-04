@@ -206,3 +206,23 @@ fn palette_is_the_only_foreground_overlay_and_escape_restores_help() {
     assert!(app.help);
     assert!(screen(&model,&app,&Settings::test_defaults(),140,40).contains("操作說明"));
 }
+
+#[test]
+fn run_selection_keys_preserve_subscription_cache_and_run_count() {
+    let (model, mut app) = fixture();
+    app.main_view = super::super::workspace::MainView::Workspace;
+    app.blocks.open(crate::blocks::Block::Run, Some("sales".into()));
+    let data = &mut app.blocks.panes[0].data;
+    data.total = 3;
+    data.subscription_checked = true;
+    data.subscribed = true;
+    data.subscribed_run = Some("r1".into());
+    for (key, index) in [(']', 1), (']', 2), (']', 2), ('[', 1), ('[', 0), ('[', 0)] {
+        app.m2_key(key, &model, Instant::now());
+        let pane = &app.blocks.panes[0];
+        assert_eq!(pane.index, index);
+        assert_eq!(pane.data.total, 3);
+        assert!(pane.data.subscription_checked && pane.data.subscribed && pane.data.stale);
+        assert_eq!(pane.data.subscribed_run.as_deref(), Some("r1"));
+    }
+}
