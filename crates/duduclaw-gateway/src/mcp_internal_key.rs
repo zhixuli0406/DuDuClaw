@@ -171,7 +171,7 @@ fn provision_internal_mcp_key(
         // Without an identity store, false cannot have come from an Admin toggle.
         // Persist the new default before creating users.db, so interrupted boot
         // still has a strict config from which reload can reconcile the store.
-        if fresh_team || (personal != Some(true) && enforced && auth_missing) {
+        if fresh_team || (enforced && auth_missing) {
             let auth = table.entry("auth").or_insert_with(|| toml::Value::Table(toml::Table::new()));
             auth.as_table_mut().ok_or("config.toml [auth] is not a table")?
                 .insert("mfa_enforced".into(), toml::Value::Boolean(true));
@@ -489,7 +489,7 @@ mod tests {
             let result = ensure_internal_mcp_key_for_gateway(
                 home.path(), "127.0.0.1:18789".parse().unwrap(), true, None,
             );
-            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(result.is_ok(), !corrupt, "{result:?}");
             assert_eq!(config_text(home.path()).parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
             if corrupt {
                 assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
@@ -514,12 +514,15 @@ mod tests {
             let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
             duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
             for _ in 0..2 {
+                let before = config_text(home.path());
                 provision(home.path(), edition.is_personal(), None).unwrap();
+                // Only MCP metadata may be added on first provisioning.
+                if before.contains("mcp_keys") { assert_eq!(config_text(home.path()), before); }
                 crate::mfa::reload_policy(home.path());
                 assert_eq!(config_text(home.path()).parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
                 assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
                 assert_eq!(conn.query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 123);
-                assert!(!crate::mfa::enforced(home.path(), true).unwrap());
+                assert!(crate::mfa::enforced(home.path(), true).unwrap());
             }
             provision(home.path(), false, None).unwrap();
             crate::mfa::reload_policy(home.path());
@@ -577,29 +580,31 @@ mod tests {
 
     #[test]
     fn enforced_state_is_restored_after_config_deletion() {
-        let home = tempfile::tempdir().unwrap();
-        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
-        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
-        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
-        provision(home.path(), false, None).unwrap();
-        // A surviving key must not short-circuit repair of a missing auth table.
-        let text = config_text(home.path());
-        let mut without_auth: toml::Table = text.parse().unwrap();
-        without_auth.remove("auth");
-        std::fs::write(home.path().join("config.toml"), toml::to_string(&without_auth).unwrap()).unwrap();
-        provision(home.path(), false, None).unwrap();
-        assert_eq!(config_text(home.path()).parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
-        std::fs::remove_file(home.path().join("config.toml")).unwrap();
-        provision(home.path(), false, None).unwrap();
-        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
-        assert!(audit.contains("mfa.policy_restored_from_state"));
-        assert!(!audit.contains("ddc_prod_"));
-        let table: toml::Table = config_text(home.path()).parse().unwrap();
-        assert_eq!(table["auth"]["mfa_enforced"].as_bool(), Some(true));
-        crate::mfa::reload_policy(home.path());
-        assert!(crate::mfa::enforced(home.path(), false).unwrap());
-        let since: i64 = conn.query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
-        assert_eq!(since, 123);
+        for personal in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+            let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+            provision(home.path(), personal, None).unwrap();
+            // A surviving key must not short-circuit repair of a missing auth table.
+            let text = config_text(home.path());
+            let mut without_auth: toml::Table = text.parse().unwrap();
+            without_auth.remove("auth");
+            std::fs::write(home.path().join("config.toml"), toml::to_string(&without_auth).unwrap()).unwrap();
+            provision(home.path(), personal, None).unwrap();
+            assert_eq!(config_text(home.path()).parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(true));
+            std::fs::remove_file(home.path().join("config.toml")).unwrap();
+            provision(home.path(), personal, None).unwrap();
+            let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+            assert!(audit.contains("mfa.policy_restored_from_state"));
+            assert!(!audit.contains("ddc_prod_"));
+            let table: toml::Table = config_text(home.path()).parse().unwrap();
+            assert_eq!(table["auth"]["mfa_enforced"].as_bool(), Some(true));
+            crate::mfa::reload_policy(home.path());
+            assert!(crate::mfa::enforced(home.path(), personal).unwrap());
+            let since: i64 = conn.query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
+            assert_eq!(since, 123);
+        }
     }
 
     #[test]
@@ -648,6 +653,9 @@ mod tests {
         assert!(!crate::mfa::enforced(home.path(), true).unwrap());
         assert!(!crate::mfa::boot_policy(home.path(), false).unwrap());
         assert!(!config_text(home.path()).contains("mfa_enforced"));
+        provision(home.path(), false, None).unwrap();
+        crate::mfa::reload_policy(home.path());
+        assert!(!crate::mfa::enforced(home.path(), false).unwrap());
     }
 
     #[test]
@@ -671,26 +679,38 @@ mod tests {
     fn dangling_policy_symlink_is_not_an_absent_policy() {
         let home = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(home.path().join("absent.db"), home.path().join("users.db")).unwrap();
-        assert!(provision(home.path(), false, None).is_err());
+        for personal in [false, true] {
+            assert!(provision(home.path(), personal, None).is_err());
+            assert!(crate::mfa::enforced(home.path(), personal).is_err());
+        }
         assert!(!home.path().join("config.toml").exists());
     }
 
     #[test]
-    fn unreadable_policy_directory_refuses_non_personal_boot() {
+    fn unreadable_policy_directory_refuses_every_edition_boot() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join("users.db")).unwrap();
-        assert!(provision(home.path(), false, None).is_err());
+        for personal in [false, true] {
+            assert!(provision(home.path(), personal, None).is_err());
+            assert!(crate::mfa::enforced(home.path(), personal).is_err());
+        }
         assert!(!home.path().join("config.toml").exists());
     }
 
     #[test]
-    fn unreadable_policy_refuses_non_personal_config_writes() {
+    fn unreadable_policy_refuses_every_edition_config_writes() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("users.db"), b"not a database").unwrap();
-        assert!(provision(home.path(), false, None).is_err());
+        for personal in [false, true] {
+            assert!(provision(home.path(), personal, None).is_err());
+            assert!(crate::mfa::enforced(home.path(), personal).is_err());
+        }
         assert!(!home.path().join("config.toml").exists());
         std::fs::write(home.path().join("config.toml"), "# preserve\n").unwrap();
-        assert!(provision(home.path(), false, None).is_err());
+        for personal in [false, true] {
+            assert!(provision(home.path(), personal, None).is_err());
+            assert!(crate::mfa::enforced(home.path(), personal).is_err());
+        }
         assert_eq!(config_text(home.path()), "# preserve\n");
         assert_eq!(crate::mfa::policy_status(home.path())["degraded"], true);
     }

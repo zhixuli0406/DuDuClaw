@@ -67,10 +67,11 @@ it('issues a code only against the selected user and challenge reference', async
   expect(screen.queryByText('once-only')).toBeNull();
 });
 
-it('hides administration on Personal and from non-Admins', () => {
+it('hides administration on unenforced Personal and from non-Admins', async () => {
   useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
   useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
   const { rerender } = renderWithProviders(<AdminMfa />);
+  await waitFor(() => expect(mfaApi.overview).toHaveBeenCalled());
   expect(screen.queryByText('Two-factor login management')).toBeNull();
   useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
   useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
@@ -94,4 +95,26 @@ it('clears typed confirmation on refresh before the opposite policy action', asy
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'CHANGE TWO-FACTOR POLICY' } });
   fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
   await waitFor(() => expect(update).toHaveBeenCalledWith({ 'auth.mfa_enforced': false, expected_state: true }));
+});
+
+it('lets a Personal Admin deliberately disable the stored policy with confirmation', async () => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  vi.mocked(mfaApi.overview).mockResolvedValue({ ...overview, enforced: true });
+  const update = vi.spyOn(api.system, 'updateConfig').mockResolvedValue({} as never);
+  renderWithProviders(<AdminMfa />);
+  fireEvent.click(await screen.findByRole('switch', { name: 'Stop requiring two-factor login' }));
+  expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled();
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'CHANGE TWO-FACTOR POLICY' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+  await waitFor(() => expect(update).toHaveBeenCalledWith({ 'auth.mfa_enforced': false, expected_state: true }));
+});
+
+it('does not expose enforced Personal policy controls to non-Admins', () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  vi.mocked(mfaApi.overview).mockResolvedValue({ ...overview, enforced: true });
+  renderWithProviders(<AdminMfa />);
+  expect(screen.queryByText('Two-factor login management')).toBeNull();
+  expect(mfaApi.overview).not.toHaveBeenCalled();
 });

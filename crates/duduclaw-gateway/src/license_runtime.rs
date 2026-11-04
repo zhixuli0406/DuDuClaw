@@ -1538,6 +1538,12 @@ mod tests {
                 home.path(), "127.0.0.1:18789".parse().unwrap(), edition.is_personal(), None,
             ).unwrap();
             assert_eq!(crate::mfa::boot_policy(home.path(), edition.is_personal()).unwrap(), !personal);
+            // Once enabled, even an OpenSource/Personal runtime must keep enforcing.
+            drop(duduclaw_auth::UserDb::new_with_mfa_default(&home.path().join("users.db"), true).unwrap());
+            std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            crate::mfa::reload_policy(home.path());
+            assert!(crate::mfa::boot_policy(home.path(), edition.is_personal()).unwrap());
+            assert!(crate::mfa::enforced(home.path(), edition.is_personal()).unwrap());
             assert!(runtime.boot_edition(None, Some(EditionProfile::Personal)).await.is_personal());
             assert!(!runtime.boot_edition(Some("enterprise"), Some(EditionProfile::Personal)).await.is_personal());
         }

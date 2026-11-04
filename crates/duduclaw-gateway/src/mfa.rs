@@ -85,7 +85,7 @@ fn parse_policy(text: &str) -> Result<bool, String> {
 /// Restore must preserve the live policy; an unreadable policy defaults to strict.
 pub(crate) fn restore_policy(home: &Path) -> bool {
     // No Admin could have disabled enforcement without an identity store.
-    // Personal runtime exemption never changes the persisted policy.
+    // Edition changes never weaken the persisted policy.
     if policy_store_is_absent(home) { return true; }
     crate::handlers::config_commit::read_regular_config(&home.join("config.toml"))
         .ok().and_then(|text| {
@@ -247,10 +247,8 @@ pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
     if policy_store_is_absent(home) {
         return Ok(!personal);
     }
-    let policy = if personal { read_policy_state(home) } else { read_boot_policy_state(home) };
-    match policy {
+    match read_boot_policy_state(home) {
         Ok(value) => Ok(value),
-        Err(_) if personal => Ok(false),
         Err(error) => {
             POLICY.write().unwrap_or_else(|e| e.into_inner())
                 .entry(home.to_path_buf()).or_default().degraded = true;
@@ -359,8 +357,8 @@ pub(crate) fn reload_policy(home: &Path) {
         }
     }
 }
-pub(crate) fn enforced(home: &Path, personal: bool) -> Result<bool, String> {
-    if personal { return Ok(false); }
+pub(crate) fn enforced(home: &Path, _personal: bool) -> Result<bool, String> {
+    // Edition only determines the fresh-install default, never runtime enforcement.
     POLICY.read().unwrap_or_else(|e|e.into_inner()).get(home).and_then(|s|s.value)
         .ok_or_else(|| "尚無有效的登入設定；請檢查 config.toml。".into())
 }
@@ -574,6 +572,7 @@ mod tests {
             let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
             conn.execute_batch(schema).unwrap();
             assert!(boot_policy(home.path(), false).is_err(), "{schema}");
+            assert!(boot_policy(home.path(), true).is_err(), "{schema}");
             assert_eq!(policy_status(home.path())["degraded"], true);
         }
         for bytes in [b"".as_slice(), b"not a sqlite database".as_slice()] {
@@ -581,7 +580,7 @@ mod tests {
             std::fs::write(home.path().join("users.db"), bytes).unwrap();
             assert!(boot_policy(home.path(), false).is_err());
             assert_eq!(policy_status(home.path())["degraded"], true);
-            assert!(!boot_policy(home.path(), true).unwrap());
+            assert!(boot_policy(home.path(), true).is_err());
         }
     }
 
@@ -659,7 +658,7 @@ mod tests {
         let home=tempfile::tempdir().unwrap();
         let _db=UserDb::new(&home.path().join("users.db")).unwrap();
         assert!(enforced(home.path(),false).is_err());
-        assert!(!enforced(home.path(),true).unwrap());
+        assert!(enforced(home.path(),true).is_err());
         std::fs::write(home.path().join("config.toml"),"").unwrap();
         reload_policy(home.path());
         assert!(!enforced(home.path(),false).unwrap());
@@ -667,6 +666,7 @@ mod tests {
             std::fs::write(home.path().join("config.toml"),text).unwrap();
             reload_policy(home.path());
             assert!(!enforced(home.path(),false).unwrap());
+            assert!(!enforced(home.path(),true).unwrap());
             assert_eq!(policy_status(home.path())["degraded"],true);
         }
         std::fs::write(home.path().join("config.toml"),"[auth]\nmfa_enforced=true").unwrap();
@@ -676,7 +676,7 @@ mod tests {
         let since=policy_status(home.path())["enforced_at"].clone();
         reload_policy(home.path());
         assert_eq!(policy_status(home.path())["enforced_at"],since);
-        assert!(!enforced(home.path(),true).unwrap());
+        assert!(enforced(home.path(),true).unwrap());
         std::fs::remove_file(home.path().join("config.toml")).unwrap();
         reload_policy(home.path());
         assert!(enforced(home.path(),false).unwrap());

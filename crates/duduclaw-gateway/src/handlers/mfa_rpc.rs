@@ -76,7 +76,7 @@ impl MethodHandler {
                     let token=token?;
                     db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
                     let jwt = jwt.as_ref().ok_or("登入服務無法使用。")?;
-                    db.mfa_confirm_and_issue(&id, Some(token), code, &cipher, now, personal, |user, access, codes| {
+                    db.mfa_confirm_and_issue(&id, Some(token), code, &cipher, now, |user, access, codes| {
                         crate::mfa::replacement_session(jwt, user, access, previous_epoch, codes, true)
                     })
                 }
@@ -90,7 +90,7 @@ impl MethodHandler {
                             return Err("登入憑證已失效，請重新登入。".into());
                         }
                         let jwt = jwt.as_ref().ok_or("登入服務無法使用。")?;
-                        db.mfa_change_and_issue(&id, code, true, &cipher, now, personal, |user, access, codes| {
+                        db.mfa_change_and_issue(&id, code, true, &cipher, now, |user, access, codes| {
                             crate::mfa::replacement_session(jwt, user, access, previous_epoch, codes, false)
                         })
                     } else {

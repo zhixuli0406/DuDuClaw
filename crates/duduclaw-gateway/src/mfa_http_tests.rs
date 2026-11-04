@@ -210,8 +210,8 @@ async fn mfa_password_and_channel_otp_return_no_token_in_entire_body() {
     assert!(!response.to_string().contains("token"));
 }
 #[tokio::test]
-async fn mfa_enforcement_off_preserves_login_response_and_personal_ignores_on() {
-    for (personal, enforce, n) in [(false, false, 182), (true, true, 183)] {
+async fn mfa_enforcement_off_preserves_login_response_for_every_edition() {
+    for (personal, enforce, n) in [(false, false, 182), (true, false, 183)] {
         let (_dir, state, user) = fixture(personal, enforce).await;
         let (status, response) = login(&state, n).await;
         assert_eq!(status, StatusCode::OK);
@@ -453,9 +453,13 @@ async fn mfa_old_access_refresh_revoked_but_epoch_zero_compatible() {
 }
 #[tokio::test]
 async fn mfa_legacy_token_only_refused_when_enforced() {
-    for (personal,required,allowed) in [(false,false,true),(false,true,false),(true,true,true)] {
+    for (personal,required,allowed) in [(false,false,true),(false,true,false),(true,false,true),(true,true,false)] {
         let (_dir,state,_)=fixture(personal,required).await;
         assert_eq!(legacy_token_allowed(&state).await,allowed);
+        let mut conn = crate::power_local::RpcConnInfo::from_ws(peer(213), false);
+        conn.legacy_admin_authenticated = true;
+        let response = state.handler.handle_conn("system.status", json!({}), &UserContext::admin_fallback(), conn).await;
+        assert_eq!(matches!(response, WsFrame::Response { ok: true, .. }), allowed, "{response:?}");
     }
 }
 #[tokio::test]
@@ -516,22 +520,24 @@ async fn mfa_degraded_is_visible_in_overview_and_system_status() {
 
 #[tokio::test]
 async fn mfa_channel_bind_refuses_enforced_self_but_accepts_other_admin() {
-    let (_dir,state,user)=fixture(false,true).await;
-    let headers_for=|u:&duduclaw_auth::User| {
-        let mut headers=axum::http::HeaderMap::new();
-        let token=state.jwt_config.issue_access_token(u,&[]).unwrap();
-        headers.insert("authorization",format!("Bearer {token}").parse().unwrap());
-        headers
-    };
-    let binding=||ChannelBindBody {user_id:user.id.clone(),channel:"telegram".into(),channel_user_id:"12345".into()};
-    let response=handle_channel_bind(State(state.clone()),headers_for(&user),Json(binding())).await.into_response();
-    assert_eq!(response.status(),StatusCode::CONFLICT);
-    let other=state.user_db.create_user("other@example.test","Other","password-test",UserRole::Admin).unwrap();
-    let response=handle_channel_bind(State(state.clone()),headers_for(&other),Json(binding())).await.into_response();
-    assert_eq!(response.status(),StatusCode::OK);
-    let now=chrono::Utc::now().timestamp();
-    let challenge=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,now).unwrap();
-    assert!(state.user_db.mfa_prepare_enrollment(&challenge,true,now).unwrap().is_none());
+    for personal in [false, true] {
+        let (_dir,state,user)=fixture(personal,true).await;
+        let headers_for=|u:&duduclaw_auth::User| {
+            let mut headers=axum::http::HeaderMap::new();
+            let token=state.jwt_config.issue_access_token(u,&[]).unwrap();
+            headers.insert("authorization",format!("Bearer {token}").parse().unwrap());
+            headers
+        };
+        let binding=||ChannelBindBody {user_id:user.id.clone(),channel:"telegram".into(),channel_user_id:"12345".into()};
+        let response=handle_channel_bind(State(state.clone()),headers_for(&user),Json(binding())).await.into_response();
+        assert_eq!(response.status(),StatusCode::CONFLICT);
+        let other=state.user_db.create_user("other@example.test","Other","password-test",UserRole::Admin).unwrap();
+        let response=handle_channel_bind(State(state.clone()),headers_for(&other),Json(binding())).await.into_response();
+        assert_eq!(response.status(),StatusCode::OK);
+        let now=chrono::Utc::now().timestamp();
+        let challenge=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,now).unwrap();
+        assert!(state.user_db.mfa_prepare_enrollment(&challenge,true,now).unwrap().is_none());
+    }
 }
 
 #[tokio::test]
@@ -718,7 +724,7 @@ async fn mfa_disable_password_attempts_share_enrollment_rate_limit() {
 }
 
 #[tokio::test]
-async fn mfa_personal_self_service_ignores_enterprise_enforcement() {
+async fn mfa_personal_self_service_requires_proof_and_admin_policy_disable() {
     let (_dir, state, user) = fixture(true, true).await;
     let access = state.jwt_config.issue_access_token(&user, &[]).unwrap();
     let ctx = authenticate_jwt(&state, &access).unwrap();
@@ -726,11 +732,42 @@ async fn mfa_personal_self_service_ignores_enterprise_enforcement() {
     let begin = crate::google_personal::DASHBOARD_SESSION.scope(session.clone(),
         state.handler.handle("mfa.enroll_begin", json!({"password":"correct horse battery"}), &ctx)).await;
     let WsFrame::Response { ok: true, payload: Some(begin), .. } = begin else { panic!("begin failed") };
+    assert_eq!(begin["proof_required"], true);
+    assert!(begin.get("secret").is_none());
+    let proof = state.user_db.mfa_issue_enrollment_code(None, &user.id,
+        begin["challenge_ref"].as_str().unwrap(), chrono::Utc::now().timestamp()).unwrap();
+    let retry = crate::google_personal::DASHBOARD_SESSION.scope(session.clone(),
+        state.handler.handle("mfa.enroll_begin", json!({"password":"correct horse battery",
+            "enrollment_token":begin["enrollment_token"],"proof_code":proof}), &ctx)).await;
+    let WsFrame::Response { ok: true, payload: Some(begin), .. } = retry else { panic!("proof failed: {retry:?}") };
     let confirm = crate::google_personal::DASHBOARD_SESSION.scope(session,
         state.handler.handle("mfa.enroll_confirm", json!({"enrollment_token":begin["enrollment_token"],"code":totp(begin["secret"].as_str().unwrap())}), &ctx)).await;
     let WsFrame::Response { ok: true, payload: Some(confirm), .. } = confirm else { panic!("confirm failed") };
     let ctx = authenticate_jwt(&state, confirm["access_token"].as_str().unwrap()).unwrap();
-    let response = state.handler.handle("mfa.disable", json!({"password":"correct horse battery","code":confirm["recovery_codes"][0]}), &ctx).await;
+    let disable = json!({"password":"correct horse battery","code":confirm["recovery_codes"][0]});
+    let response = state.handler.handle("mfa.disable", disable.clone(), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    assert!(state.user_db.mfa_active(&user.id).unwrap());
+    let employee = state.user_db.create_user("employee@test.invalid", "Employee", "password-test", UserRole::Employee).unwrap();
+    let mut forged = UserContext::admin_fallback();
+    forged.user_id = employee.id;
+    let policy = json!({"auth.mfa_enforced":false,"expected_state":true});
+    let response = state.handler.handle("system.update_config", policy.clone(), &forged).await;
+    assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    assert!(enforced(&state.home_dir, true).unwrap());
+    let response = state.handler.handle("system.update_config", policy, &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+    for personal in [true, true, false] {
+        crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+            &state.home_dir, "127.0.0.1:18789".parse().unwrap(), personal, None).unwrap();
+        crate::mfa::reload_policy(&state.home_dir);
+        assert!(!enforced(&state.home_dir, personal).unwrap());
+        let conn = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+        assert!(!duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+        assert_eq!(std::fs::read_to_string(state.home_dir.join("config.toml")).unwrap()
+            .parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(false));
+    }
+    let response = state.handler.handle("mfa.disable", disable, &ctx).await;
     assert!(matches!(response, WsFrame::Response { ok: true, .. }));
     assert!(!state.user_db.mfa_active(&user.id).unwrap());
 }
@@ -879,29 +916,144 @@ async fn mfa_fresh_admin_enrolls_with_host_proof_and_can_disable_enforcement() {
 }
 
 #[tokio::test]
-async fn mfa_personal_strict_restore_config_keeps_local_auto_login_personal_only() {
+async fn mfa_strict_restore_refuses_local_auto_login_in_every_edition() {
     for personal in [true, false] {
-        let (_dir, state, user) = fixture_policy(personal, None).await;
+        let (_dir, state, _user) = fixture_policy(personal, None).await;
         // An empty-home restore writes true even for Personal.
         std::fs::write(state.home_dir.join("config.toml"),
             "[auth]\nmfa_enforced=true\n[dashboard]\nlocal_auto_login=true\n").unwrap();
         crate::mfa::reload_policy(&state.home_dir);
-        assert_eq!(enforced(&state.home_dir, personal).unwrap(), !personal);
-        assert_eq!(legacy_token_allowed(&state).await, personal);
+        assert!(enforced(&state.home_dir, personal).unwrap());
+        assert!(!legacy_token_allowed(&state).await);
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-duduclaw-local", "1".parse().unwrap());
         headers.insert("origin", "http://127.0.0.1:18789".parse().unwrap());
         let local = SocketAddr::from(([127, 0, 0, 1], 12000));
         let (status, payload) = body(handle_local_session(State(state.clone()),
             ConnectInfo(local), headers.clone()).await.into_response()).await;
-        assert_eq!(status, if personal { StatusCode::OK } else { StatusCode::FORBIDDEN });
-        if personal {
-            let ctx = authenticate_jwt(&state, payload["access_token"].as_str().unwrap()).unwrap();
-            assert_eq!(ctx.user_id, user.id);
-        }
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(payload.get("access_token").is_none());
         std::fs::write(state.home_dir.join("config.toml"),
             "[auth]\nmfa_enforced=true\n[dashboard]\nlocal_auto_login=false\n").unwrap();
         assert_eq!(handle_local_session(State(state.clone()), ConnectInfo(local), headers)
             .await.into_response().status(), StatusCode::FORBIDDEN);
     }
+}
+
+#[tokio::test]
+async fn mfa_personal_policy_requires_login_enrollment_and_expires_sockets() {
+    let (_dir, state, user) = fixture(true, true).await;
+    let (status, response) = login(&state, 214).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["mfa_enrollment_required"], true);
+    assert!(response.get("access_token").is_none());
+    assert!(!refresh_allowed(&state, &user.id).await);
+    let ctx = state.user_db.live_user_context(&user.id).unwrap().unwrap();
+    assert!(socket_expired(&state, &ctx, Some(1), false).await);
+    assert!(!socket_expired(&state, &ctx, Some(u64::MAX), false).await);
+    let status = state.handler.handle("mfa.status", json!({}), &ctx).await;
+    let WsFrame::Response { ok: true, payload: Some(status), .. } = status else { panic!("{status:?}") };
+    assert_eq!(status["enforced"], true);
+    assert_eq!(status["enabled"], false);
+}
+
+#[tokio::test]
+async fn mfa_fresh_personal_policy_off_preserves_local_auto_login() {
+    let (_dir, state, user) = fixture_policy(true, None).await;
+    std::fs::write(state.home_dir.join("config.toml"), "[dashboard]\nlocal_auto_login=true\n").unwrap();
+    crate::mfa::reload_policy(&state.home_dir);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-duduclaw-local", "1".parse().unwrap());
+    headers.insert("origin", "http://127.0.0.1:18789".parse().unwrap());
+    let local = SocketAddr::from(([127, 0, 0, 1], 12000));
+    let (status, payload) = body(handle_local_session(State(state.clone()), ConnectInfo(local), headers)
+        .await.into_response()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(authenticate_jwt(&state, payload["access_token"].as_str().unwrap()).unwrap().user_id, user.id);
+}
+
+#[tokio::test]
+async fn mfa_personal_recovery_methods_keep_current_admin_authorization() {
+    let (_dir, state, admin) = fixture(true, false).await;
+    let admin_codes = enroll(&state, &admin);
+    let target = state.user_db.create_user("target@test.invalid", "Target", "correct horse battery", UserRole::Employee).unwrap();
+    enroll(&state, &target);
+    let admin = state.user_db.get_user(&admin.id).unwrap().unwrap();
+    let ctx = authenticate_jwt(&state, &state.jwt_config.issue_access_token(&admin, &[]).unwrap()).unwrap();
+    let response = state.handler.handle("system.update_config",
+        json!({"auth.mfa_enforced":true,"expected_state":false}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    let mut forged = UserContext::admin_fallback();
+    forged.user_id = target.id.clone();
+    forged.credential_epoch = state.user_db.get_user(&target.id).unwrap().unwrap().credential_epoch;
+    let reset = json!({"user_id":target.id,"code":admin_codes[0]});
+    let response = state.handler.handle("users.mfa_reset", reset.clone(), &forged).await;
+    assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    assert!(state.user_db.mfa_active(&target.id).unwrap());
+    let response = state.handler.handle("users.mfa_reset", reset, &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+    assert!(!state.user_db.mfa_active(&target.id).unwrap());
+    let now = chrono::Utc::now().timestamp();
+    let token = state.user_db.mfa_challenge(&target.id, duduclaw_auth::mfa::FirstFactor::Password, true, now).unwrap();
+    state.user_db.mfa_prepare_enrollment(&token, true, now).unwrap();
+    forged.credential_epoch = state.user_db.get_user(&target.id).unwrap().unwrap().credential_epoch;
+    let request = json!({"user_id":target.id,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&token)});
+    let response = state.handler.handle("users.mfa_enrollment_code", request.clone(), &forged).await;
+    assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+    let response = state.handler.handle("users.mfa_enrollment_code", request, &ctx).await;
+    let WsFrame::Response { ok: true, payload: Some(payload), .. } = response else { panic!("{response:?}") };
+    state.user_db.mfa_prove_enrollment(&token, payload["enrollment_code"].as_str().unwrap(), now).unwrap();
+    state.user_db.mfa_require_independent_proof(&token, now).unwrap();
+    assert!(enforced(&state.home_dir, true).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_login_policy_race_routes_to_enrollment_with_stale_cache() {
+    for first in [FirstFactor::Password, FirstFactor::ChannelOtp] {
+        let (_dir, state, user) = fixture(true, false).await;
+        assert!(after_first_factor(&state, &user, first).await.is_none());
+        let mut admin = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut admin, true, chrono::Utc::now().timestamp_micros()).unwrap();
+        // The transaction must override the earlier gate, even before cache reload.
+        assert!(!enforced(&state.home_dir, true).unwrap());
+        let called = std::cell::Cell::new(false);
+        assert!(state.user_db.mfa_issue_if_unenrolled(&user.id, || {
+            called.set(true);
+            state.jwt_config.issue_session_tokens(&user, &[])
+        }).is_err());
+        assert!(!called.get());
+        let (status, payload) = body(require_after_first_factor(&state, &user, first).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["mfa_enrollment_required"], true);
+        assert!(payload.get("access_token").is_none());
+        assert!(payload.get("refresh_token").is_none());
+    }
+}
+
+#[tokio::test]
+async fn mfa_refresh_and_local_session_refuse_durable_policy_despite_stale_cache() {
+    let (_dir, state, user) = fixture_policy(true, None).await;
+    std::fs::write(state.home_dir.join("config.toml"), "[dashboard]\nlocal_auto_login=true\n").unwrap();
+    crate::mfa::reload_policy(&state.home_dir);
+    let tokens = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
+    assert!(refresh_allowed(&state, &user.id).await);
+    assert!(legacy_token_allowed(&state).await);
+    let mut admin = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+    duduclaw_auth::mfa::record_enforcement(&mut admin, true, chrono::Utc::now().timestamp_micros()).unwrap();
+    assert!(!enforced(&state.home_dir, true).unwrap());
+    let (status, payload) = body(handle_refresh(State(state.clone()), ConnectInfo(peer(230)),
+        Json(RefreshRequest { refresh_token: tokens.1 })).await.into_response()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["error"], "請重新登入並完成雙因素驗證註冊。");
+    assert!(payload.get("access_token").is_none());
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-duduclaw-local", "1".parse().unwrap());
+    headers.insert("origin", "http://127.0.0.1:18789".parse().unwrap());
+    let local = SocketAddr::from(([127, 0, 0, 1], 12000));
+    let (status, payload) = body(handle_local_session(State(state.clone()), ConnectInfo(local), headers)
+        .await.into_response()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(payload["error"], "local auto-login unavailable");
+    assert!(payload.get("access_token").is_none());
+    assert!(payload.get("refresh_token").is_none());
 }

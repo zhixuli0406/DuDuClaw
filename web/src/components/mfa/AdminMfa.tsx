@@ -9,13 +9,14 @@ import { useSystemStore } from '@/stores/system-store';
 export function AdminMfa() {
   const user = useAuthStore(s => s.user);
   const edition = useSystemStore(s => s.status?.edition_profile);
-  if (user?.role !== 'admin' || !edition || edition === 'personal') return null;
+  if (user?.role !== 'admin' || !edition) return null;
   return <AdminMfaPanel actor={user.id} />;
 }
 
 export function AdminMfaPanel({ actor }: { actor: string }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
+  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
   const systemDegraded = useSystemStore(s => s.status?.mfa_policy?.degraded);
   const [overview, setOverview] = useState<MfaOverview | null>(null);
   const [error, setError] = useState('');
@@ -47,6 +48,8 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
   };
   const blocked = overview?.users.filter(u => !u.enabled).length ?? 0;
   const degraded = systemDegraded || overview?.policy.degraded;
+  // Keep the existing policy controls reachable after an edition downgrade.
+  if (isPersonal && !error && !degraded && (!overview || overview.enforced === false)) return null;
   return <Card className="space-y-4 p-4">
     <h2 className="font-medium">{t('mfa.admin.title')}</h2>
     {error && <p role="alert" className="text-destructive">{error}</p>}

@@ -340,8 +340,7 @@ fn challenge_user(tx: &Connection, token: &str, purpose: &str, now: i64) -> Resu
 }
 
 impl UserDb {
-    /// Serialize legacy token issuance with enrollment, so activation cannot
-    /// race the first-factor check and accidentally mint a one-factor session.
+    /// Serialize legacy token issuance with enrollment and policy changes.
     pub fn mfa_issue_if_unenrolled<T>(
         &self,
         user: &str,
@@ -359,10 +358,45 @@ impl UserDb {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        if active {
+        if policy_enforced(&tx)? || active {
             return Err(DENIED.into());
         }
         let result = issue()?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+    /// Enforced refresh requires current enrollment and a matching credential epoch.
+    pub fn mfa_issue_refresh<T>(
+        &self, user: &str, epoch: u64,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
+    ) -> Result<T> {
+        self.mfa_issue_session(user, epoch, true, issue)
+    }
+    /// Local auto-login has no second factor, even for an enrolled owner.
+    pub fn mfa_issue_local_session<T>(
+        &self, user: &str, epoch: u64,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
+    ) -> Result<T> {
+        self.mfa_issue_session(user, epoch, false, issue)
+    }
+    fn mfa_issue_session<T>(
+        &self, user: &str, epoch: u64, refresh: bool,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let required = policy_enforced(&tx)?;
+        active_user(&tx, user)?;
+        let enrolled: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=?1)",
+            [user], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if required && !(refresh && enrolled) { return Err(DENIED.into()); }
+        let result = issue_mfa_result(&tx, user, Vec::new(), |user, access, _| {
+            if !credential_epoch_matches(epoch, user.credential_epoch)
+                || (!refresh && user.must_change_password) { return Err(DENIED.into()); }
+            issue(user, access)
+        })?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
     }
@@ -462,13 +496,12 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
-        self.mfa_confirm_and_issue(user, enrollment, code, cipher, now, false, |_, _, codes| Ok(codes))
+        self.mfa_confirm_and_issue(user, enrollment, code, cipher, now, |_, _, codes| Ok(codes))
     }
 
     /// Issue the replacement session while enrollment, recovery codes and epoch
     /// are still uncommitted. An issuer error rolls back all of them.
     /// The callback must not re-enter UserDb (the connection is locked).
-    /// `policy_exempt` is only for the installation-owned Personal edition.
     #[allow(clippy::too_many_arguments)]
     pub fn mfa_confirm_and_issue<T>(
         &self,
@@ -477,7 +510,6 @@ impl UserDb {
         code: &str,
         cipher: &dyn MfaCipher,
         now: i64,
-        policy_exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
         if enrollment.is_none() { return Err(DENIED.into()); }
@@ -486,7 +518,7 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
-        if !policy_exempt && policy_enforced(&tx)? {
+        if policy_enforced(&tx)? {
             enrollment::require_independent_proof(&tx, enrollment.ok_or(DENIED)?, now)?;
         }
         if let Some(token) = enrollment {
@@ -578,12 +610,11 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
-        self.mfa_change_and_issue(user, code, disable, cipher, now, false, |_, _, codes| Ok(codes))
+        self.mfa_change_and_issue(user, code, disable, cipher, now, |_, _, codes| Ok(codes))
     }
 
     /// As with enrollment, failed session issuance rolls back a disable,
     /// including factor consumption and the credential epoch.
-    /// `policy_exempt` is only for the installation-owned Personal edition.
     #[allow(clippy::too_many_arguments)]
     pub fn mfa_change_and_issue<T>(
         &self,
@@ -592,7 +623,6 @@ impl UserDb {
         disable: bool,
         cipher: &dyn MfaCipher,
         now: i64,
-        policy_exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.conn();
@@ -600,7 +630,7 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
-        if disable && !policy_exempt && policy_enforced(&tx)? {
+        if disable && policy_enforced(&tx)? {
             return Err("管理員已要求雙因素驗證，無法停用。".into());
         }
         if check_factor(&tx, user, code, code.len() != 6, cipher, now).is_err() {
