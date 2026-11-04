@@ -1,0 +1,13 @@
+[Unit]
+Description=DuDuClaw root-only egress registration
+
+[Socket]
+ListenSequentialPacket=/run/duduclaw-egress/control.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

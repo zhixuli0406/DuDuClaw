@@ -1984,6 +1984,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-egress"
+version = "1.79.3"
+dependencies = [
+ "duduclaw-isolation",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "duduclaw-fork"
 version = "1.79.3"
 dependencies = [
