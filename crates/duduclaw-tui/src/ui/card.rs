@@ -73,6 +73,10 @@ impl Card {
         self.item.data().get("digest").and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty()).map(str::to_owned)
     }
+    /// Display-only clock state; key authorization remains inside `key`.
+    pub(super) fn clock_state(&self, now: Instant, epoch: i64) -> (bool, bool) {
+        (now.saturating_duration_since(self.opened) < Duration::from_secs(1), self.expired(epoch))
+    }
     pub fn expired(&self, epoch: i64) -> bool {
         matches!(&self.item, InboxItem::Approval(a) if a.expires_at.is_some_and(|e| epoch >= e))
     }

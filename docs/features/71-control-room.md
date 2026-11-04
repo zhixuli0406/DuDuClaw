@@ -16,6 +16,8 @@ Employees work on goals, schedules and responsibilities without anyone asking. T
 | What is running? | Employee list, run and task blocks, next scheduled runs, `duduclaw tui watch`. |
 | How do I stop it? | `p` pauses autonomous work for the selected employee, `u` resumes. Admin can pause everyone from the palette. |
 
+Conversation messages now use right-aligned user blocks and plain employee replies with a name/time header. Tool steps and round results are grouped beneath their own turn. Pending approvals and paused goals appear above the persistent input as an inline card; numbered actions are labels only, and `Enter` opens the existing guarded decision card. Permission checks, confirmation codes, version binding and no automatic retry are unchanged. Centered overlays and bottom-right toasts use raised surfaces over a muted background, with dark/light/ANSI/NO_COLOR variants. `motion = "on"` animates only active tool steps at about 80 ms; `"off"` uses static glyphs. The guide describes input focus, the preserved draft and overlay keys.
+
 ## Stopping work
 
 Three controls look alike and do different things.

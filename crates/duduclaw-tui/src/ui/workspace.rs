@@ -124,7 +124,7 @@ impl App {
             _ => {}
         }
     }
-    pub(super) fn workspace_key(&mut self, key: KeyEvent, model: &Model) -> bool {
+    pub(super) fn workspace_key(&mut self, key: KeyEvent, model: &Model, now: std::time::Instant) -> bool {
         match key.code {
             KeyCode::Char('I') => {
                 self.zoomed = false;
@@ -158,7 +158,11 @@ impl App {
                 }
             }
             KeyCode::Enter if matches!(self.selected, Some(Selection::Employee(_))) && self.blocks.active != Block::Task && self.blocks.active != Block::Detail => {
-                self.open_workspace(model, self.workspace_tab());
+                if let Some(item) = super::inline_decision::item(self, model).cloned() {
+                    self.notices.seen(&item.key());
+                    self.task_card = false;
+                    self.card = Some(super::card::Card::open(item, model, now, &mut self.codes));
+                } else { self.open_workspace(model, self.workspace_tab()); }
             }
             _ => return false,
         }

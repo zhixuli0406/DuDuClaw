@@ -526,7 +526,7 @@ impl App {
                 _ => {}
             }
         }
-        if !self.help && self.workspace_key(key, model) { return Action::None; }
+        if !self.help && self.workspace_key(key, model, now) { return Action::None; }
         if !self.help && let KeyCode::Char(c) = key.code && let Some(action) = self.m2_key(c, model, now) { return action; }
         match key.code {
             KeyCode::Char('i' | '/') if !self.help => {

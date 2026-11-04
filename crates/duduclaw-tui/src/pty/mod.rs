@@ -101,7 +101,10 @@ impl Session {
     pub fn pending_or_running(&self) -> bool {
         SUPPORTED && (!self.started || self.running())
     }
-    pub fn poll(&mut self) {
+    /// Report only a newly published screen or changed status to the renderer.
+    pub fn poll(&mut self) -> bool {
+        let previous_status = self.status.clone();
+        let previous_screen = Arc::clone(&self.screen);
         if self.input.as_ref().is_some_and(writer::InputWriter::failed) {
             self.status = strings::PTY_INPUT_FAILED.into();
         }
@@ -127,6 +130,7 @@ impl Session {
             }
             self.input = None;
         }
+        previous_status != self.status || !Arc::ptr_eq(&previous_screen, &self.screen)
     }
     pub fn size(&self) -> PtySize {
         let (rows, cols) = self.dimensions;

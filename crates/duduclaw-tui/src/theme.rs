@@ -187,8 +187,13 @@ impl Theme {
             self.on(if focused { self.selection_bg } else { self.hover }).foreground(self.selection_fg)
         }
     }
+    pub fn primary(self) -> Style {
+        if self.capability == Capability::NoColor { self.base().add_modifier(Modifier::REVERSED | Modifier::BOLD) }
+        else { self.on(self.primary_bg).foreground(self.primary_fg) }
+    }
     pub fn warning_pill(self, filled: bool) -> Style {
-        if filled { self.on(self.warning_bg).foreground(self.warning_fg) }
+        if filled && self.capability == Capability::NoColor { self.base().add_modifier(Modifier::REVERSED | Modifier::BOLD) }
+        else if filled { self.on(self.warning_bg).foreground(self.warning_fg) }
         else { self.foreground(self.warning) }
     }
     pub fn border_style(self, focused: bool) -> Style {

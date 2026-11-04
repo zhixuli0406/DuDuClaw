@@ -185,3 +185,51 @@ pub(super) fn key_hints(frame: &mut Frame, area: Rect, value: TerminalText, sett
         x += n;
     }
 }
+
+/// Render only sanitized text, including locally composed labels containing remote names.
+pub(super) fn styled(frame: &mut Frame, area: Rect, value: &str, settings: &Settings, style: Style) {
+    frame.render_widget(SafeText { text: &TerminalText::new(value.into()), width: settings.ambiguous_width,
+        visible: false, wrap: false, scroll: 0, style }, area);
+}
+pub(super) fn centered(bounds: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(bounds.width.saturating_sub(4));
+    let height = height.min(bounds.height.saturating_sub(2));
+    Rect::new(bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - height) / 2, width, height)
+}
+/// Repaint all underlying cells with the muted palette; terminals have no alpha.
+pub(super) fn dim(frame: &mut Frame, settings: &Settings) {
+    let area = frame.area();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let cell = &mut frame.buffer_mut()[(x, y)];
+            let colors = settings.colors.on(cell.bg);
+            cell.set_style(colors.muted().remove_modifier(Modifier::BOLD | Modifier::REVERSED | Modifier::UNDERLINED));
+            if colors.capability == crate::theme::Capability::NoColor { cell.modifier.insert(Modifier::DIM); }
+        }
+    }
+}
+pub(super) fn overlay_settings(settings: &Settings) -> Settings {
+    let mut overlay = settings.clone();
+    overlay.colors = settings.colors.on(settings.colors.surface_raised);
+    overlay
+}
+pub(super) fn overlay(frame: &mut Frame, area: Rect, title: &str, settings: &Settings) -> Rect {
+    // Wipe any wide glyph intersecting either edge before drawing the opaque overlay.
+    use ratatui::buffer::CellWidth;
+    let bounds = frame.area();
+    for y in area.y..area.bottom() {
+        let mut x = bounds.x;
+        while x < bounds.right() {
+            let n = frame.buffer_mut()[(x, y)].cell_width().max(1);
+            if x < area.right() && x + n > area.x && (x < area.x || x + n > area.right()) {
+                for dx in 0..n.min(bounds.right() - x) {
+                    let cell = &mut frame.buffer_mut()[(x + dx, y)];
+                    let style = cell.style(); cell.reset(); cell.set_style(style);
+                }
+            }
+            x += n;
+        }
+    }
+    frame.render_widget(ratatui::widgets::Clear, area);
+    panel_focus(frame, area, title, settings, false, false)
+}

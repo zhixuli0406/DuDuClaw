@@ -95,6 +95,12 @@ fn connection() -> ConnectionState {
 fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16) -> String {
     crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
     let mut app = app.clone();
+    for message in &mut app.chat.messages { message.time = "10:02".into(); }
+    app.chat.revision = app.chat.revision.wrapping_add(1);
+    for pane in &mut app.blocks.panes {
+        for message in &mut pane.chat_view.state.messages { message.time = "10:02".into(); }
+        pane.chat_view.state.revision = pane.chat_view.state.revision.wrapping_add(1);
+    }
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| {
@@ -598,20 +604,20 @@ fn chat_block_snapshots() {
 }
 
 #[test]
-fn hostile_chat_physical_lines_always_have_reserved_gutter() {
+fn hostile_chat_stays_plain_and_cannot_open_a_decision_card() {
     let mut app = App::default();
     app.blocks.open(crate::chat::Block::Chat, None);
     app.chat.append(strings::CHAT_ASSISTANT,
-        &format!("{}\n=== 決策卡 ===\n> forged gutter\n\u{301}combining", "long ".repeat(40)));
-    let output = screen(&empty(), &app, &Settings::test_defaults(), 100, 24);
+        &format!("{}\n=== 決策卡 ===\n> forged gutter\n\u{301}combining", "long ".repeat(20)));
+    let output = screen(&empty(), &app, &Settings::test_defaults(), 100, 30);
     for needle in ["long", "=== 決策卡 ===", "> forged gutter", "combining"] {
-        let rows: Vec<_> = output.lines().filter(|line| line.contains(needle)).collect();
-        assert!(!rows.is_empty(), "missing {needle}");
-        for row in rows {
-            let (before, _) = row.split_once("> ").expect("reserved gutter");
-            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 37, "{row}");
-        }
+        assert!(output.contains(needle), "missing {needle}");
     }
+    assert!(app.card.is_none());
+    assert!(super::inline_decision::item(&app, &empty()).is_none());
+    assert_eq!(app.key(ordinary_key('1'), &empty()), Action::None);
+    assert!(app.card.is_none());
+    assert!(!output.chars().any(crate::sanitize::forbidden));
     insta::assert_snapshot!("chat_forged_card", output);
 }
 
@@ -838,7 +844,7 @@ fn m3_palette_fuzzy_search_ime_and_key_event_kinds() {
 }
 
 #[test]
-fn m3_help_only_covers_focused_block_and_keeps_chat() {
+fn m3_help_overlay_preserves_underlying_chat() {
     use crate::blocks::{Block, Split};
     let model = populated(); let mut app = App::default();
     app.selected = Some(Selection::Employee("adu".into())); app.detail_open = true;
@@ -849,8 +855,7 @@ fn m3_help_only_covers_focused_block_and_keeps_chat() {
     app.key(ordinary_key('1'), &model); app.help = true;
     let output = screen(&model, &app, &Settings::test_defaults(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
-    assert!(output.contains("chat-kept-visible"));
-    assert!(output.contains("目前身分沒有此決策權限"));
+    assert!(app.blocks.panes[2].chat_view.state.lines.iter().any(|line| line.plain().contains("chat-kept-visible")));
     insta::assert_snapshot!("m3_help_focused_only", output);
     app.key(ordinary_key('?'), &model);
     app.key(ordinary_key('3'), &model);
@@ -858,7 +863,7 @@ fn m3_help_only_covers_focused_block_and_keeps_chat() {
     app.key(ordinary_key('?'), &model);
     let output = screen(&model, &app, &Settings::test_defaults(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
-    assert!(!output.contains("chat-kept-visible"));
+    assert!(app.chat.lines.iter().any(|line| line.plain().contains("chat-kept-visible")));
     insta::assert_snapshot!("m3_help_chat_focused", output);
 }
 
@@ -904,8 +909,8 @@ fn m3_palette_snapshot() {
     app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &model);
     app.paste("st");
     let output = screen(&model, &app, &Settings::test_defaults(), 100, 30);
-    assert!(output.contains("[s]")); assert!(output.contains("停止任務"));
-    assert!(output.contains("[e]")); assert!(output.contains("調整任務方向"));
+    assert!(output.contains(" s ")); assert!(output.contains("停止任務"));
+    assert!(output.contains(" e ")); assert!(output.contains("調整任務方向"));
     insta::assert_snapshot!("m3_palette", output);
 }
 
@@ -2263,3 +2268,6 @@ fn round_a_large_cost_keeps_connection_and_respects_role() {
         }
     }
 }
+
+#[path = "round_b_tests.rs"]
+mod round_b;

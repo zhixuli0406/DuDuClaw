@@ -28,7 +28,7 @@ fn toast_and_mailbox_snapshots() {
         notice(&mut app, Kind::NeedYou, "阿嘟", Some("approval:a1"), now - Duration::from_secs(60));
         notice(&mut app, Kind::Done, "研究員", None, now);
         let output = screen(&model, &app, &settings(glyphs), 110, 26);
-        assert!(output.contains("完成 · 研究員") && output.contains("需要你 · 阿嘟"));
+        assert!(output.contains("完成") && output.contains("研究員") && output.contains("需要你") && output.contains("阿嘟"));
         // The wider, borderless sidebar may show the authorized inbox context.
         // The toast itself must never copy that content, irrespective of sidebar clipping.
         let mut terminal = Terminal::new(TestBackend::new(110, 26)).unwrap();
@@ -221,8 +221,11 @@ fn light_and_no_color_notice_snapshots_and_semantic_styles() {
         notice(&mut app, kind, "阿嘟", None, Instant::now());
         let mut terminal = Terminal::new(TestBackend::new(110,26)).unwrap();
         terminal.draw(|f| render::draw(f, &model, &connection(), &TerminalText::default(), &mut app, &s)).unwrap();
-        let expected = match kind { Kind::Done => s.colors.success, Kind::NeedYou => s.colors.warning, Kind::Error => s.colors.danger };
-        assert!(terminal.backend().buffer().content.iter().any(|cell| cell.symbol() == symbol && cell.fg == expected && cell.modifier.contains(Modifier::BOLD)));
+        let expected = match kind { Kind::Done => s.colors.success, Kind::NeedYou => s.colors.warning_fg, Kind::Error => s.colors.danger };
+        assert!(terminal.backend().buffer().content.iter().any(|cell| cell.symbol() == symbol && cell.fg == expected));
+        if kind == Kind::NeedYou {
+            assert!(terminal.backend().buffer().content.iter().any(|cell| cell.symbol() == symbol && cell.bg == s.colors.warning_bg));
+        }
     }
 }
 

@@ -508,3 +508,10 @@ fn hostile_child_mouse_toggles_are_streaming_atomic_and_reporting_stays_required
         }
     }
 }
+
+#[test]
+fn idle_poll_does_not_request_redraw() {
+    let mut session = super::Session::default();
+    assert!(!session.poll());
+    assert!(!session.poll());
+}

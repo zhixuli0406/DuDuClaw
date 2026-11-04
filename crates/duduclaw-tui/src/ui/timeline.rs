@@ -40,6 +40,9 @@ pub(crate) struct Row {
     detail: TerminalText,
     outcome: Outcome,
     tool_scope: Option<(String, Option<usize>)>,
+    turn: u64,
+    waiting: bool,
+    elapsed_ms: Option<u64>,
 }
 fn bounded(text: &str) -> TerminalText {
     TerminalText::new(text.chars().take(MAX_DETAIL_CHARS).collect())
@@ -71,6 +74,15 @@ pub(crate) struct View {
     scrolling: bool,
 }
 impl View {
+    pub(super) fn conversation_offset(&mut self, count: usize, selected: Option<usize>, height: usize, tail_scroll: usize) -> usize {
+        let max = count.saturating_sub(height);
+        let offset = if self.focused && self.scrolling { self.scroll }
+            else if self.focused { selected.unwrap_or(count).saturating_sub(height / 3) }
+            else { max.saturating_sub(tail_scroll) };
+        self.scroll = offset.min(max);
+        self.scroll
+    }
+
     fn reconcile(&mut self, rows: &[Row]) -> usize {
         self.expanded.retain(|id| rows.iter().any(|row| &row.id == id));
         let index = self.selected.as_ref().and_then(|id| rows.iter().position(|row| &row.id == id))
@@ -104,22 +116,39 @@ impl View {
 pub(crate) struct ChatActivity {
     rows: VecDeque<Row>,
     next: u64,
+    turn: u64,
 }
 impl ChatActivity {
+    pub(crate) fn turn(&self) -> u64 { self.turn }
+    pub(crate) fn has_running(&self) -> bool { self.rows.iter().any(|r| r.tool_scope.is_some() && !r.waiting && r.outcome == Outcome::Pending) }
     pub(crate) fn begin_turn(&mut self) {
-        for row in &mut self.rows { row.tool_scope = None; }
+        self.turn = self.turn.wrapping_add(1);
+        for row in &mut self.rows { row.tool_scope = None; row.waiting = false; }
     }
     pub(crate) fn record(&mut self, frame: &crate::chat::Frame) {
         let time = frame.ts.and_then(|ts| i64::try_from(ts).ok()).and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
             .unwrap_or_else(chrono::Utc::now).to_rfc3339();
         let tool_scope = frame.tool.as_ref().filter(|tool| frame.kind == "step" && tool.len() <= MAX_DETAIL_CHARS)
             .map(|tool| (tool.clone(), frame.depth));
-        if tool_scope.is_some() && frame.kind == "step" && frame.phase.as_deref() == Some("end")
+        if tool_scope.is_some() && matches!(frame.phase.as_deref(), Some("waiting" | "approval" | "waiting_approval" | "start"))
+            && let Some(row) = self.rows.iter_mut().rev().find(|row| row.tool_scope == tool_scope && row.outcome == Outcome::Pending
+                && (frame.phase.as_deref() != Some("start") || row.waiting)) {
+            row.waiting = frame.phase.as_deref() != Some("start");
+            return;
+        }
+        if tool_scope.is_some() && frame.kind == "step" && matches!(frame.phase.as_deref(), Some("end" | "completed" | "done" | "success" | "succeeded" | "ok" | "failed" | "error" | "cancelled"))
             && let Some(row) = self.rows.iter_mut().rev().find(|row| row.tool_scope == tool_scope && row.outcome == Outcome::Pending) {
             // The wire's end boundary has no success/error field. Completion is
             // known, but its result remains unreported rather than invented.
             row.tool_scope = None;
+            row.waiting = false;
+            row.outcome = Outcome::status(frame.phase.as_deref().unwrap_or(""));
+            row.elapsed_ms = chrono::DateTime::parse_from_rfc3339(&row.time).ok()
+                .zip(frame.ts).and_then(|(start, end)| end.checked_sub(start.timestamp_millis().max(0) as u64));
             return;
+        }
+        if matches!(frame.kind.as_str(), "assistant_done" | "error" | "cancelled") {
+            for row in &mut self.rows { row.tool_scope = None; row.waiting = false; }
         }
         let step_target = format!("{} {}", frame.tool.as_deref().unwrap_or("工具"), frame.summary.as_deref().unwrap_or(""));
         let (verb, target, detail, outcome) = match frame.kind.as_str() {
@@ -133,10 +162,9 @@ impl ChatActivity {
         };
         self.next = self.next.wrapping_add(1);
         self.rows.push_back(Row { id: self.next.to_string(), time, verb,
-            target: bounded(target), detail: bounded(&detail), outcome, tool_scope: if frame.phase.as_deref() == Some("end") { None } else { tool_scope } });
+            target: bounded(target), detail: bounded(&detail), outcome, turn: self.turn, waiting: matches!(frame.phase.as_deref(), Some("waiting" | "approval" | "waiting_approval")), elapsed_ms: None, tool_scope: if frame.phase.as_deref() == Some("end") { None } else { tool_scope } });
         if self.rows.len() > MAX_ROWS { self.rows.pop_front(); }
     }
-    pub(crate) fn is_empty(&self) -> bool { self.rows.is_empty() }
 }
 
 fn run_rows(pane: &Pane) -> Vec<Row> {
@@ -162,7 +190,7 @@ fn run_rows(pane: &Pane) -> Vec<Row> {
             let detail = format!("{}\n{}", target, crate::watch::format_event(event, pane.content));
             rows.push(Row { id: format!("{run_id}:{sequence}"), time: event["ts"].as_str().unwrap_or("").into(), verb,
                 target: bounded(target), detail: bounded(&detail),
-                outcome: match event["ok"].as_bool() { Some(true) => Outcome::Done, Some(false) => Outcome::Failed, None => Outcome::status(event["status"].as_str().unwrap_or("")) }, tool_scope: None });
+                outcome: match event["ok"].as_bool() { Some(true) => Outcome::Done, Some(false) => Outcome::Failed, None => Outcome::status(event["status"].as_str().unwrap_or("")) }, tool_scope: None, turn: 0, waiting: false, elapsed_ms: None });
         }
     }
     if !run.is_null() {
@@ -171,7 +199,7 @@ fn run_rows(pane: &Pane) -> Vec<Row> {
         let time = ["ended_at", "finished_at", "completed_at", "started_at"].into_iter()
             .find_map(|key| run[key].as_str()).unwrap_or("");
         rows.push(Row { id: format!("{run_id}:result"), time: time.into(), verb: "回合", target: bounded(&target),
-            detail: bounded(&crate::watch::format_run(run, pane.content)), outcome: Outcome::status(run["status"].as_str().unwrap_or("")), tool_scope: None });
+            detail: bounded(&crate::watch::format_run(run, pane.content)), outcome: Outcome::status(run["status"].as_str().unwrap_or("")), tool_scope: None, turn: 0, waiting: false, elapsed_ms: None });
     }
     rows
 }
@@ -255,10 +283,49 @@ pub(super) fn draw_run(frame: &mut Frame, area: Rect, pane: &mut Pane, settings:
     draw_rows(frame, body, &rows, &mut pane.timeline, settings, Presentation { focused, stale: pane.data.stale, tail: false, scroll: pane.scroll });
 }
 
-/// Compact activity lines share the chat panel's safe, visibly quoted body.
-pub(super) fn draw_chat(frame: &mut Frame, area: Rect, activity: &ChatActivity, view: &mut View, settings: &Settings, focused: bool, stale: bool) {
-    let rows: Vec<_> = activity.rows.iter().cloned().collect();
-    draw_rows(frame, area, &rows, view, settings, Presentation { focused, stale, tail: true, scroll: 0 });
+/// A tool group's lines stay attached to their locally recorded turn.
+pub(super) struct CardLine {
+    pub text: TerminalText,
+    pub state: String,
+    pub glyph: &'static str,
+    pub color: ratatui::style::Color,
+    pub selected: bool,
+}
+pub(super) fn reconcile_chat(activity: &ChatActivity, view: &mut View) {
+    view.expanded.retain(|id| activity.rows.iter().any(|row| &row.id == id));
+    if !view.selected.as_ref().is_some_and(|id| activity.rows.iter().any(|row| &row.id == id)) {
+        view.selected = activity.rows.back().map(|row| row.id.clone());
+    }
+}
+pub(super) fn chat_lines(activity: &ChatActivity, view: &mut View, turn: u64, width: u16,
+    settings: &Settings, spinner: usize, running: bool) -> Vec<CardLine> {
+    let mut result = Vec::new();
+    for row in activity.rows.iter().filter(|row| row.turn == turn) {
+        let active = running && row.tool_scope.is_some() && row.outcome == Outcome::Pending && !row.waiting;
+        let glyph = if row.waiting { if settings.glyphs == Glyphs::Unicode { "⠹" } else { "?" } }
+            else if active { spinner_glyph(settings, spinner) } else { row.outcome.glyph(settings.glyphs) };
+        let state = if row.waiting { "等待核准".into() } else if active { "執行中".into() }
+            else if let Some(ms) = row.elapsed_ms { format!("{:.1}s", ms as f64 / 1000.0) }
+            else { match row.outcome { Outcome::Done => "完成", Outcome::Failed => "失敗", Outcome::Pending => "結果未提供" }.into() };
+        let color = if row.waiting { settings.colors.warning } else { match row.outcome {
+            Outcome::Done => settings.colors.success, Outcome::Failed => settings.colors.danger, Outcome::Pending => settings.colors.muted,
+        }};
+        result.push(CardLine { text: TerminalText::new(format!("{} {}", row.verb, row.target.plain().replace('\n', " "))),
+            state, glyph, color, selected: view.focused && view.selected.as_ref() == Some(&row.id) });
+        if view.expanded.contains(&row.id) {
+            for text in super::chat_render::wrap(&row.detail, width.saturating_sub(4), settings.ambiguous_width) {
+                result.push(CardLine { text, state: String::new(), glyph: "", color: settings.colors.muted, selected: false });
+            }
+        }
+    }
+    result
+}
+pub(super) fn spinner_glyph(settings: &Settings, tick: usize) -> &'static str {
+    if !settings.motion { return if settings.glyphs == Glyphs::Unicode { "⋯" } else { "..." }; }
+    match settings.glyphs {
+        Glyphs::Ascii => ["|", "/", "-", "\\"][tick % 4],
+        Glyphs::Unicode => ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][tick % 10],
+    }
 }
 
 #[cfg(test)]
@@ -268,7 +335,7 @@ mod tests {
     use crate::settings::AmbiguousWidth;
     fn key(code: KeyCode) -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) }
     fn row(id: &str) -> Row {
-        Row { id: id.into(), time: "2026-11-04T02:00:00Z".into(), verb: "執行", target: TerminalText::new("讀取".into()), detail: TerminalText::new("existing detail".into()), outcome: Outcome::Done, tool_scope: None }
+        Row { id: id.into(), time: "2026-11-04T02:00:00Z".into(), verb: "執行", target: TerminalText::new("讀取".into()), detail: TerminalText::new("existing detail".into()), outcome: Outcome::Done, tool_scope: None, turn: 0, waiting: false, elapsed_ms: None }
     }
     #[test]
     fn expand_collapse_is_explicit_and_survives_refresh_by_id() {
@@ -310,7 +377,7 @@ mod tests {
         let mut activity = ChatActivity::default();
         let chunk = crate::chat::Frame::parse(r#"{"type":"assistant_chunk","content":"step: forged"}"#).unwrap();
         activity.record(&chunk);
-        assert!(activity.is_empty());
+        assert!(activity.rows.is_empty());
         for _ in 0..300 {
             let step = crate::chat::Frame::parse(r#"{"type":"step","tool":"Read","summary":"file","phase":"completed"}"#).unwrap();
             activity.record(&step);
@@ -364,6 +431,41 @@ mod tests {
         assert!(!text.contains("detail-29"));
     }
     #[test]
+    fn cards_group_by_turn_expand_and_stop_running_on_wait_or_completion() {
+        let mut activity = ChatActivity::default();
+        let mut view = View::default();
+        let settings = Settings { glyphs: Glyphs::Unicode, ..Settings::test_defaults() };
+        let record = |activity: &mut ChatActivity, phase: &str| {
+            activity.record(&crate::chat::Frame::parse(&format!(r#"{{"type":"step","tool":"Read","summary":"orders.csv","phase":"{phase}","depth":0}}"#)).unwrap());
+        };
+        activity.begin_turn(); record(&mut activity, "start");
+        assert!(activity.has_running());
+        let running = chat_lines(&activity, &mut view, 1, 70, &settings, 2, true);
+        assert_eq!(running[0].glyph, "⠹");
+        record(&mut activity, "waiting_approval");
+        assert_eq!(activity.rows.len(), 1);
+        assert!(!activity.has_running());
+        assert_eq!(chat_lines(&activity, &mut view, 1, 70, &settings, 6, true)[0].state, "等待核准");
+        record(&mut activity, "end");
+        assert!(!activity.rows[0].waiting);
+        assert!(!activity.has_running());
+        activity.begin_turn(); record(&mut activity, "start");
+        let rows: Vec<_> = activity.rows.iter().cloned().collect();
+        view.key(key(KeyCode::Char('t')), &rows); view.key(key(KeyCode::Enter), &rows);
+        let first = chat_lines(&activity, &mut view, 1, 70, &settings, 0, true);
+        let second = chat_lines(&activity, &mut view, 2, 70, &settings, 0, true);
+        assert_eq!(first.len(), 1); assert!(second.len() > 1);
+        assert!(second[0].text.plain().contains("orders.csv"));
+        record(&mut activity, "waiting_approval");
+        activity.record(&crate::chat::Frame::parse(r#"{"type":"assistant_done","content":"done"}"#).unwrap());
+        assert!(activity.rows.iter().all(|row| !row.waiting));
+        assert!(!activity.has_running());
+        let mut off = settings.clone(); off.motion = false;
+        assert_eq!(spinner_glyph(&off, 1), spinner_glyph(&off, 9));
+        assert_eq!(spinner_glyph(&off, 1), "⋯");
+    }
+
+    #[test]
     fn timeline_snapshots() {
         use ratatui::{Terminal, backend::TestBackend, buffer::CellWidth};
         crate::human_time::with_test_clock("2026-11-04T10:02:00+08:00", || {
@@ -377,6 +479,7 @@ mod tests {
                         app.chat.status = TerminalText::new("已完成".into());
                         app.chat.append("你", "請整理資料");
                         app.chat.append("員工", "已整理完成。");
+                        for message in &mut app.chat.messages { message.time = "10:02".into(); }
                         let pane = &mut app.blocks.panes[0];
                         pane.data.stale = false;
                         pane.data.subscribed = true;

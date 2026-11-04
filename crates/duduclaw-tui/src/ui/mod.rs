@@ -20,6 +20,8 @@ mod panels;
 mod shell;
 mod workspace;
 mod chat_render;
+mod inline_decision;
+mod motion;
 pub mod render;
 pub(crate) mod terminal;
 #[cfg(test)]
@@ -84,7 +86,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let mut terminal = Terminal::new(backend::ScreenBackend(std::io::stdout()))
             .map_err(|_| Error::Terminal)?;
         terminal.clear().map_err(|_| Error::Terminal)?;
-        let connection = options.client.connection();
+        let mut connection = options.client.connection();
         let client = options.client.clone();
         let chat = client.chat();
         let mut chat_state = chat.state();
@@ -92,14 +94,16 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let mut chat_revision = app.blocks.revision;
         let route = if settings.notifications { crate::notifications::route().await } else { crate::notifications::Route::Skip };
         let mut notifications = crate::notifications::Notifications::new(settings.notifications, route);
-        let started = std::time::Instant::now();
+        let mut dirty = true;
+        let mut motion = motion::Motion::default();
+        let mut timers = motion::Timers::default();
         let mut block_events = client.events();
         let mut block_cursor = crate::blocks::EventCursor::default();
         let mut block_fetch: Option<BlockFetch> = None;
         let mut fetched_revision = u64::MAX;
         let mut block_poll = std::time::Instant::now();
         let mut block_generation = None;
-        let feed = StateFeed::start(options.client, settings.poll_interval);
+        let mut feed = StateFeed::start(options.client, settings.poll_interval);
         let mut decision: Option<futures_util::future::BoxFuture<'_, crate::decide::Outcome>> = None;
         let mut autonomy_requests = futures_util::stream::FuturesUnordered::<futures_util::future::BoxFuture<'static, crate::decide::Outcome>>::new();
         let home_text = TerminalText::new(home.to_string_lossy().into_owned());
@@ -109,10 +113,13 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             if terminal::panicked() {
                 return Err(Error::Terminal);
             }
-            let mut model = feed.receiver.borrow().clone();
+            let mut model = if feed.receiver.has_changed().unwrap_or(false) {
+                dirty = true; feed.receiver.borrow_and_update().clone()
+            } else { feed.receiver.borrow().clone() };
             model.inbox.items.retain(|item| !app.read.hidden(item, crate::snooze::epoch_now()));
-
-            let info = connection.borrow().clone();
+            let info = if connection.has_changed().unwrap_or(false) {
+                dirty = true; connection.borrow_and_update().clone()
+            } else { connection.borrow().clone() };
             let generation = match info { crate::client::ConnectionState::Connected(ref info) => Some(info.generation), _ => None };
             if generation != block_generation {
                 block_generation = generation; app.blocks.invalidate(); app.logs = crate::blocks::LogTail::default();
@@ -123,9 +130,10 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             for _ in 0..256 {
                 let event = match block_events.try_recv() {
                     Ok(e) => e,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => { app.blocks.invalidate(); app.logs.lost = true; continue; },
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => { dirty = true; app.blocks.invalidate(); app.logs.lost = true; continue; },
                     _ => break,
                 };
+                dirty = true;
                 if block_cursor.observe(&event) { app.blocks.invalidate(); app.logs.lost = true; }
                 app.notices.event(&event, &model, std::time::Instant::now());
                 match event.name.as_str() {
@@ -155,15 +163,18 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             for pane in &app.blocks.panes {
                 if let Some(pty) = &pane.pty {
                     let mut pty = pty.lock().unwrap_or_else(|e| e.into_inner());
+                    let previous_status = pty.status.clone();
                     pty.start();
-                    pty.poll();
+                    dirty |= pty.poll() || previous_status != pty.status;
                 }
             }
             app.refresh(&model);
             app.observe_notices(&model, std::time::Instant::now());
             chat.retain(app.blocks.chat_ids());
-            sync_chat_state(&mut app, &mut chat_state, &mut chat_revision);
-            app.spinner = (started.elapsed().as_millis() / 150) as usize;
+            dirty |= sync_chat_state(&mut app, &mut chat_state, &mut chat_revision);
+            let animating = motion::running(&app);
+            dirty |= motion.tick(std::time::Instant::now(), &settings, animating, &mut app.spinner);
+            dirty |= timers.tick(std::time::Instant::now(), &app);
             let now = std::time::Instant::now();
             let failed = model.login_required.is_some() || matches!(info, crate::client::ConnectionState::Disconnected);
             let sequence = notifications.connection_error(failed, now)
@@ -174,18 +185,21 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 std::io::stdout().flush().map_err(|_| Error::Output)?;
             }
             if let Some(error) = model.login_required { return Err(error); }
-            terminal
-                .draw(|frame| {
-                    render::draw(
-                        frame,
-                        &model,
-                        &connection.borrow(),
-                        &home_text,
-                        &mut app,
-                        &settings,
-                    )
-                })
-                .map_err(|_| Error::Terminal)?;
+            if dirty {
+                dirty = false;
+                terminal
+                    .draw(|frame| {
+                        render::draw(
+                            frame,
+                            &model,
+                            &connection.borrow(),
+                            &home_text,
+                            &mut app,
+                            &settings,
+                        )
+                    })
+                    .map_err(|_| Error::Terminal)?;
+            }
             // Never block a Tokio worker waiting for user input; only read ready events.
             // Bound each batch for redraw/shutdown fairness. Always read host events,
             // including escape, quit and resize, even when child input is full.
@@ -193,6 +207,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 let Some(event) = read_host_event(&mut app, || {
                     reply_filter.read().map_err(|_| Error::Terminal)
                 })? else { break; };
+                dirty = true;
                 let key = match event {
                     Event::Resize(_, _) => {
                         if let Some(card) = &mut app.card { card.invalidate_viewport(); }
@@ -237,6 +252,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                             // Later keys cannot replace an unsent request, and replies stay independent.
                             let mut pending = async move { crate::controls::send(&client, &request).await }.boxed();
                             if let Some(outcome) = pending.as_mut().now_or_never() {
+                                dirty = true;
                                 app.notice = Some(outcome.notice());
                                 feed.refetch();
                             } else {
@@ -274,16 +290,19 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             }
             tokio::select! {
                 Some(outcome) = autonomy_requests.next(), if !autonomy_requests.is_empty() => {
+                    dirty = true;
                     app.notice = Some(outcome.notice());
                     feed.refetch();
                 }
                 outcome = async { decision.as_mut().expect("guarded decision").await }, if decision.is_some() => {
+                    dirty = true;
                     decision = None;
                     app.decision_finished(outcome);
                     app.blocks.invalidate();
                     feed.refetch();
                 }
                 (revision, results) = async { block_fetch.as_mut().expect("guarded fetch").await }, if block_fetch.is_some() => {
+                    dirty = true;
                     block_fetch = None;
                     if revision == app.blocks.revision && block_generation.is_some() {
                         for (i, result) in results {
@@ -296,7 +315,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                _ = tokio::time::sleep(Duration::from_millis(if animating { 16 } else { 50 })) => {},
                 result = &mut shutdown => {
                     let mut final_model = feed.receiver.borrow().clone();
                     if !matches!(*connection.borrow(), crate::client::ConnectionState::Connected(_)) {
@@ -332,14 +351,14 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
 }
 
 /// Synchronize the chat projection after model-driven workspace changes.
-fn sync_chat_state(app: &mut App, state: &mut tokio::sync::watch::Receiver<crate::chat::ChatRooms>, revision: &mut u64) {
+fn sync_chat_state(app: &mut App, state: &mut tokio::sync::watch::Receiver<crate::chat::ChatRooms>, revision: &mut u64) -> bool {
     // A handshake may already be consumed while the layout still contains only
     // Detail panes. Re-project the latest value when refresh/navigation creates
     // or restores panes, even if the server sends no further chat frames.
-    if state.has_changed().unwrap_or(false) || *revision != app.blocks.revision {
-        app.sync_chats(&state.borrow_and_update());
-    }
+    let changed = state.has_changed().unwrap_or(false) || *revision != app.blocks.revision;
+    if changed { app.sync_chats(&state.borrow_and_update()); }
     *revision = app.blocks.revision;
+    changed
 }
 
 /// Host events are independent of child writer capacity. Keep this path shared

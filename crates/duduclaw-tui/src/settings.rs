@@ -57,6 +57,7 @@ pub struct Settings {
     pub ambiguous_width: AmbiguousWidth,
     pub poll_interval: Duration,
     pub notifications: bool,
+    pub motion: bool,
     pub default_layout: DefaultLayout,
 }
 impl Default for Settings {
@@ -69,6 +70,7 @@ impl Default for Settings {
             ambiguous_width: AmbiguousWidth::Narrow,
             poll_interval: POLL_INTERVAL,
             notifications: false,
+            motion: true,
             default_layout: DefaultLayout::Single,
         }
     }
@@ -115,6 +117,11 @@ impl Settings {
                     Some("single") => {},
                     Some("vertical") => result.default_layout = DefaultLayout::Vertical,
                     Some("horizontal") => result.default_layout = DefaultLayout::Horizontal,
+                    _ => bad = true,
+                },
+                "motion" => match value.as_str() {
+                    Some("on") => result.motion = true,
+                    Some("off") => result.motion = false,
                     _ => bad = true,
                 },
                 "notifications" => match value.as_bool() {

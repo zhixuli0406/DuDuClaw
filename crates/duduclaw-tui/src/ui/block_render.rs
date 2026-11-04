@@ -304,13 +304,14 @@ pub(super) fn draw(
         };
         if !detail.is_empty() { title.push_str(&format!(" · {detail}")); }
         if kind == Block::Chat && app.blocks.panes.len() == 1 { title.clear(); }
+        let employee_name = pane.agent.as_deref().and_then(|id| model.employees.items.iter().find(|e| e.id() == id)).map(super::workspace::name);
         if kind == Block::Chat && !(app.help && index == app.blocks.focused) {
             if index == app.blocks.focused {
-                super::chat_render::draw(frame, region, app, settings, &title);
+                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref());
             } else {
                 let current = app.chat_view();
                 app.set_chat_view(app.blocks.panes[index].chat_view.clone());
-                super::chat_render::draw_pane(frame, region, app, settings, &title, index);
+                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref());
                 app.blocks.panes[index].chat_view = app.chat_view();
                 app.set_chat_view(current);
             }

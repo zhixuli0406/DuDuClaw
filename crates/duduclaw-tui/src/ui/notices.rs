@@ -1,5 +1,5 @@
 //! Process-local notices. Remote payloads never supply notification wording.
-use super::{app::{App, Selection}, text::{SafeText, middle_ellipsis}, widgets::panel_focus};
+use super::{app::{App, Selection}, text::{SafeText, middle_ellipsis}, widgets::overlay};
 use crate::{sanitize::TerminalText, settings::Settings, state::{InboxItem, Model}};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{Frame, buffer::CellWidth, layout::Rect, widgets::Clear};
@@ -237,7 +237,7 @@ impl App {
 }
 pub(super) fn mailbox(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings) {
     let Some(mail) = &mut app.mailbox else { return; };
-    let inner = panel_focus(frame, area, "通知信箱", settings, false, true);
+    let inner = overlay(frame, area, "通知信箱", settings);
     if inner.is_empty() { return; }
     let tabs = [Filter::All, Filter::Unread, Filter::Errors].into_iter().zip(["全部", "未讀", "錯誤"])
         .map(|(filter, label)| if filter == mail.filter { format!("[{label}]") } else { label.into() }).collect::<Vec<_>>().join("  ");
@@ -245,7 +245,7 @@ pub(super) fn mailbox(frame: &mut Frame, area: Rect, app: &mut App, settings: &S
     let rows = app.notices.filtered(mail.filter);
     let selected = mail.selected.and_then(|id| rows.iter().position(|n| n.id == id)).unwrap_or(0);
     mail.selected = rows.get(selected).map(|n| n.id);
-    let height = usize::from(inner.height.saturating_sub(1));
+    let height = usize::from(inner.height.saturating_sub(2));
     let offset = (selected + 1).saturating_sub(height);
     if rows.is_empty() && inner.height > 1 {
         line(frame, Rect::new(inner.x, inner.y + 1, inner.width, 1), &TerminalText::new("目前沒有符合篩選的通知".into()), settings, settings.colors.muted());
@@ -254,19 +254,23 @@ pub(super) fn mailbox(frame: &mut Frame, area: Rect, app: &mut App, settings: &S
         let prefix = format!("{} {} {} ", if Some(n.id) == mail.selected { ">" } else { " " }, if n.unread { "*" } else { " " }, crate::human_time::format(&n.timestamp));
         let budget = usize::from(inner.width).saturating_sub(super::text::columns(&prefix, settings.ambiguous_width));
         let value = TerminalText::new(format!("{prefix}{}", n.wording(budget, settings).plain()));
-        line(frame, Rect::new(inner.x, inner.y + 1 + (index - offset) as u16, inner.width, 1), &value, settings,
-            if Some(n.id) == mail.selected { settings.colors.selected() } else { settings.colors.emphasis(n.kind.color(settings)) });
+        let area = Rect::new(inner.x, inner.y + 1 + (index - offset) as u16, inner.width, 1);
+        let style = if Some(n.id) == mail.selected { settings.colors.selected() } else { settings.colors.foreground(n.kind.color(settings)) };
+        frame.buffer_mut().set_style(area, style);
+        line(frame, area, &value, settings, style);
     }
+    super::widgets::key_hints(frame, Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1), TerminalText::new(MAIL_KEYS.into()), settings);
 }
 pub(super) fn toasts(frame: &mut Frame, area: Rect, app: &App, settings: &Settings, now: Instant) {
     // Never cover decision/review cards, a palette, or the notification mailbox.
     if app.card.is_some() || app.control_card.is_some() || app.palette.is_some() || app.mailbox.is_some()
         || app.content_warning || app.pty_confirm.is_some() || app.help { return; }
+    let settings = &super::widgets::overlay_settings(settings);
     let rows = app.notices.visible(now);
-    let count = rows.len().min(usize::from(area.height / 3));
+    let count = rows.len().min(usize::from(area.height / 4));
     let width = area.width.min(48);
     for (index, n) in rows.into_iter().take(count).enumerate() {
-        let mut rect = Rect::new(area.right() - width, area.bottom() - (count as u16 * 3) + index as u16 * 3, width, 3);
+        let mut rect = Rect::new(area.right() - width, area.bottom() - (count as u16 * 4) + index as u16 * 4, width, 4);
         // Clear the whole underlying glyph when the overlay starts on its tail.
         // Otherwise a CJK lead cell just outside Clear can corrupt terminal columns.
         let mut left = rect.x;
@@ -281,8 +285,17 @@ pub(super) fn toasts(frame: &mut Frame, area: Rect, app: &App, settings: &Settin
         rect.width += rect.x - left; rect.x = left;
         frame.render_widget(Clear, rect);
         let focused = app.toast_focus == Some(n.id);
-        let inner = panel_focus(frame, rect, if focused { "通知 · x 關閉" } else { "通知 · F8 選取" }, settings, false, focused);
-        line(frame, inner, &n.wording(usize::from(inner.width), settings), settings, settings.colors.emphasis(n.kind.color(settings)));
+        let inner = overlay(frame, rect, if focused { "通知 · x 關閉" } else { "通知 · F8 選取" }, settings);
+        let label = match n.kind {
+            Kind::NeedYou => " 需要你 ", Kind::Done if settings.glyphs == crate::settings::Glyphs::Unicode => "✓ 完成",
+            Kind::Done => "+ 完成", Kind::Error => "! 錯誤",
+        };
+        let pill_width = super::text::columns(label, settings.ambiguous_width) as u16;
+        let style = if n.kind == Kind::NeedYou { settings.colors.warning_pill(true) } else { settings.colors.foreground(n.kind.color(settings)) };
+        super::widgets::styled(frame, Rect::new(inner.x, inner.y, pill_width.min(inner.width), 1), label, settings, style);
+        if inner.height > 1 {
+            super::widgets::styled(frame, Rect::new(inner.x, inner.y + 1, inner.width, 1), &middle_ellipsis(&n.name.plain(), usize::from(inner.width), settings.ambiguous_width), settings, settings.colors.muted());
+        }
     }
 }
 fn line(frame: &mut Frame, area: Rect, value: &TerminalText, settings: &Settings, style: ratatui::style::Style) {

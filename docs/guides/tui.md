@@ -19,13 +19,26 @@ Heartbeat times appear on employee cards. `S` or the sidebar's schedule entry op
 Connection and permitted cost sit at the bottom of the sidebar, beneath inbox and schedule counts. Cost is hidden when unavailable or refused; dollars use two decimals, or four for nonzero amounts below $0.01. The content header shows the employee status/name, configured runtime/preferred model from the existing employee snapshot when available (not the model actually used after a runtime fallback), and right-aligned tabs with a hover-tone active pill. Key hints are at the bottom of the content panel, with the gateway version right-aligned. There is no global header or filter row. `?` includes the full home path. The minimum remains 24×12; snapshots cover 80×24, 100×30, 140×40 and 200×50 in dark, light, ANSI and NO_COLOR, with additional ASCII and ambiguous-width checks. These are rendering checks, not native-terminal acceptance of this redesign.
 
 
+## Conversation, inline decisions and overlays
+
+Your messages are right-aligned on a hover-tone block, with one cell of padding on each side and wrapping at about 70% of the conversation width. Employee replies have a muted name/time header and plain text. Structured tool steps and round results appear together beneath their own turn on a surface-tone card. Each row shows a result glyph, verb/target and right-aligned duration or state. Missing results remain unknown. `t`, arrows and `Enter` keep the existing selection and expand/collapse behavior.
+
+When the selected employee has a pending approval or paused goal, a raised inline card appears above the input with a badge, title, sanitized one-line summary and numbered action labels. **The numbers are labels, not decision shortcuts**; in list focus, `Enter` opens the existing decision card (leave timeline focus with `Esc` first). The full payload inspection, one-second key guard, confirmation code, permission re-check, version binding and no-retry behavior all remain in that card. Dashboard-only items remain read-only here.
+
+The surface-tone input stays visible in the conversation tab, including while unfocused. It shows `輸入訊息給<employee>…`, `/ 指令  @ 員工` when there is room, and a primary-color `Enter` chip; input focus adds the focus-color underline. `i` or `/` enters input; IME commits, paste, mentions, slash commands and `Esc` preserving the draft are unchanged.
+
+The palette, mailbox, help and confirmation dialogs are centered on the raised surface with one faint rounded border (ASCII fallback). The background is repainted with muted colors. Selection has its own row tone, palette matches use amber, and key chips use the hover tone. Bottom-right toasts use the same raised surface and faint ring: `需要你` is an amber badge and `完成` has a green check. They retain the two-toast limit, lifetime/persistence and no-focus-stealing behavior. Light, ANSI and `NO_COLOR` use the same structure with reduced-color emphasis.
+
+Only active tool steps animate. `motion = "on"` is the default; `motion = "off"` keeps a static activity glyph. Animation redraws are coalesced at about 80 ms; idle steps do not schedule animation redraws. Existing data changes, timers and input can still refresh the screen.
+
+
 ## Toasts, notification mailbox and zoom
 
 In-app toasts appear at the bottom right of the main area, at most two at a time with the newest above the older one. `完成`, `需要你` and `錯誤` use the theme's success, warning and danger colors. Their text contains fixed wording and a sanitized employee display name only; messages, tool output and task contents are excluded. Completed and failed runs come from the existing `runs.list` snapshots refreshed after events; approvals and goals use the existing inbox snapshots. Breaker toasts use Admin-only `budget.breaker_open` / `autopilot.breaker_open` events, deduplicated by event sequence. No extra RPC is added, and `agent.turn_finished` alone does not establish success or failure. On legacy events without a sequence, repeated breaker events with the same key cannot be distinguished from replay.
 
 `完成` and `錯誤` disappear after about six seconds. `需要你` stays until the related inbox item is seen, you open the mailbox, or you dismiss the toast. Toasts do not take keyboard focus and are hidden while a decision card is open. To dismiss one explicitly, press `F8` to focus toasts, use the arrows to select one, then `x`; `Esc` returns to the workspace. Outside toast focus, `x` retains its split-block action.
 
-Press `M` to open the notification mailbox in the main area. `N` remains **create autonomous goal**, so the mailbox uses the free `M` key. The mailbox retains the last 100 notifications for this process only; its history and unread flags are not written to `read_state.rs` files. `Tab` cycles `全部 / 未讀 / 錯誤`, arrows move selection, and `Enter` jumps to the related employee or inbox item without making a decision. `Esc` closes the mailbox. Opening it marks the current notifications read and dismisses their toasts; notifications arriving afterward remain unread until you press `Enter` on that notification, open its related inbox decision card or mark that inbox item read, or close and reopen the mailbox. These read flags do not resolve gateway requests or replace the inbox's existing local read marks.
+Press `M` to open the centered notification mailbox. `N` remains **create autonomous goal**, so the mailbox uses the free `M` key. The mailbox retains the last 100 notifications for this process only; its history and unread flags are not written to `read_state.rs` files. `Tab` cycles `全部 / 未讀 / 錯誤`, arrows move selection, and `Enter` jumps to the related employee or inbox item without making a decision. `Esc` closes the mailbox. Opening it marks the current notifications read and dismisses their toasts; notifications arriving afterward remain unread until you press `Enter` on that notification, open its related inbox decision card or mark that inbox item read, or close and reopen the mailbox. These read flags do not resolve gateway requests or replace the inbox's existing local read marks.
 
 Press `z` in control-room focus to enlarge the focused main-area block. The sidebar and content header are hidden; the footer shows `放大中 · z 還原`. Press `z` again to restore the split layout. Resizing uses the current terminal dimensions. Decision cards and `Ctrl-P` still work, and their keyboard guards remain unchanged. While typing a chat message, `z` is text; while a PTY has input focus, it goes to the child.
 
@@ -74,7 +87,7 @@ RPC `/ws` and WebChat `/ws/chat` send Close and allow up to one second for the p
 
 Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chinese labels or English aliases such as `stop`, `steer`, `log`); arrows select, `Enter` runs the displayed shortcut, and `Esc` returns to the previous focus with the chat draft intact. `Ctrl-K` remains reserved. The list is recalculated from the focused block, current role, employee binding and fresh data. Autonomy pause/resume sends immediately. Other controls open the same confirmation card as their shortcut; the palette never approves a card for you. Cards and content warnings own their keyboard, so the palette cannot open over them.
 
-`F1` / `?` shows help only in the focused block; other blocks stay visible. The full home path is in help. Short terminals keep employee selection and inbox/schedule navigation available. The main ring uses rounded Unicode corners or ASCII characters, with `ambiguous_width` honored. All navigation works without a mouse. Windows key-release events never execute commands.
+`F1` / `?` opens centered help over a dimmed workspace; closing it preserves all blocks. The full home path is in help. Short terminals keep employee selection and inbox/schedule navigation available. The main ring uses rounded Unicode corners or ASCII characters, with `ambiguous_width` honored. All navigation works without a mouse. Windows key-release events never execute commands.
 
 The control room offers controls that stop work or move it one step forward. It never grants standing permission; Admin can pause or resume autonomy globally. `cron run now`, `heartbeat trigger`, and task stop are one-way actions and always go through a confirmation card; controls are not necessarily reversible.
 
@@ -123,7 +136,7 @@ The status line always identifies the focus. In list focus, `1`–`4` selects a 
 
 A leading `@name ` selects the WebChat `agent` field and is removed from the message. Without it, the employee selected when input opened is the recipient. `/goal`, `/status`, and `/cost` pass unchanged to the gateway. `/pause`, `/stop`, and `/resume` show a Computer Use note: these commands do **not** pause an employee.
 
-The right area tiles up to four blocks as described below. Different chat blocks can run turns concurrently over one socket, with one in-flight turn per conversation. Each block keeps its employee, conversation, draft, history, scroll position and cancellation prompt; the gateway turn cap is reported in the affected block. Unknown or conflicting conversation frames are ignored. Thinking and tool steps collapse to one status line; an ASCII spinner also works with `glyphs = "ascii"`. `PgUp` / `PgDn` in list focus scroll chat history, capped at 2,000 lines of at most 512 characters each. New output never changes focus. Employee output passes through `TerminalText`; the client emits no OSC 8 hyperlinks.
+The right area tiles up to four blocks as described below. Different chat blocks can run turns concurrently over one socket, with one in-flight turn per conversation. Each block keeps its employee, conversation, draft, history, scroll position and cancellation prompt; the gateway turn cap is reported in the affected block. Unknown or conflicting conversation frames are ignored. Thinking remains a status line; structured tool steps appear beneath their turn. ASCII activity glyphs work with `glyphs = "ascii"`. `PgUp` / `PgDn` in list focus scroll chat history, capped at 2,000 lines of at most 512 characters each. New output never changes focus. Employee output passes through `TerminalText`; the client emits no OSC 8 hyperlinks.
 
 One `/ws/chat` connection shares the `/ws` client's in-memory token refresh and reconnects with backoff. Interrupted messages are not automatically resent; their outcome is uncertain. Completed conversations can resume on reconnect; changing employee starts a new conversation. In list focus, `X` cancels a running reply only after the gateway has sent a frame carrying `msg_id`. Otherwise the block says cancellation is unavailable. `cancel_accepted` only means the request was accepted; the cancellation completes on an `error` frame whose `code` is `cancelled`. A final response can also end the turn if delivery has already begun.
 
@@ -216,6 +229,7 @@ Approval requires a nonempty string `digest`, sent as `expected_digest`. If it i
 # ~/.duduclaw/tui.toml
 theme = "auto"                   # "light" / "dark" / "ansi"
 background = "theme"              # "terminal"
+motion = "on"                     # "off"
 # glyphs = "ascii"               # optional override: "ascii" / "unicode"
 ambiguous_width = "narrow"        # or "wide", matching your terminal
 notifications = false
@@ -229,6 +243,7 @@ Every supported top-level key is listed below. Each invalid value keeps only tha
 |---|---|---|
 | `theme` | `"auto"`, `"light"`, `"dark"`, `"ansi"` | `"auto"`; explicit palette or background detection; ANSI always uses terminal backgrounds |
 | `background` | `"theme"`, `"terminal"` | `"theme"`; `"terminal"` preserves the terminal background for shell and content canvas |
+| `motion` | `"on"`, `"off"` | `"on"`; animate only active tool steps, coalesced at about 80 ms |
 | `glyphs` | `"ascii"`, `"unicode"` | Unicode in a UTF-8 locale unless `TERM` is `linux` or `dumb`; ASCII otherwise. Explicit settings override detection; Unicode uses rounded borders |
 | `ambiguous_width` | `"narrow"`, `"wide"` | `"narrow"`; match the terminal's ambiguous-character width |
 | `poll_interval_seconds` | Integer, 5–3600 inclusive | `15`; authoritative list reconciliation; run/task/log blocks retain their five-second reconciliation |

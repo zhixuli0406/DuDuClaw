@@ -1,0 +1,53 @@
+---
+source: crates/duduclaw-tui/src/ui/round_b_tests.rs
+expression: "painted(&model,&app,&settings,width,height)"
+---
+
+  ◆ DuDuClaw                控制室 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────╮
+                                   │ ◉ 業務助理                                                                         對話  任務  紀錄  │
+  ⌕ 搜尋員工或指令 …        Ctrl-P │ ──────────────────────────────────────────────────────────────────────────────────────────────────── │
+                                   │                                                         幫我整理這週的訂單，並準備給客戶 A 的報價。  │
+   需要你                          │                                                                                                      │
+  ›◉ 業務助理                待審  │ 業務助理 · 10:02                                                                                     │
+     目標任務：整理本週訂單        │ 本週訂單已整理完成，報價單 quote-A.pdf 已備妥。                                                      │
+                                   │  ✓ 執行 Read orders/2026-11.csv                                                                0.4s  │
+                                   │  ✓ 執行 Write quote-A.pdf                                                                      2.3s  │
+                                   │  ✓ 回合 對話                                                                                   完成  │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+                                   │   暫停  整理本週訂單                                                                                 │
+                                   │  缺少客戶 A 的報價條件 請確認後再繼續                                                                │
+                                   │   1 重試   2 中止   3 檢視選項                                                                       │
+                                   │  Enter 開啟決策卡 · 數字為選項標籤                                                                   │
+                                   │                                                                                                      │
+                                   │                                                                                                      │
+  I 收件匣                      1  │  輸入訊息給業務助理…                                                        / 指令  @ 員工   Enter   │
+  S 排程                        0  │                                                                                                      │
+  ──────────────────────────────── │ ? 快捷鍵  p 暫停員工  z 放大  q 離開                                                         v1.77.0 │
+  ● 已連線                         ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+Painted roles (fg / bg / modifiers):
+success: LightGreen / Reset / NONE
+pending: Black / LightYellow / NONE
+primary: Black / White / NONE
+user: White / Reset / REVERSED
+employee: White / Reset / NONE
+selection: LightYellow / Reset / REVERSED
+overlay: DarkGray / Reset / NONE
