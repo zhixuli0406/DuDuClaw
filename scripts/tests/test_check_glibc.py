@@ -54,16 +54,40 @@ class GlibcBaselineTests(unittest.TestCase):
 
     def test_command_and_exit_status(self):
         with patch.object(sys, 'argv', ['check_glibc.py', 'binary']), \
+             patch.object(check_glibc.shutil, 'which', return_value='/usr/bin/readelf'), \
              patch.object(subprocess, 'run') as run:
             for sample, status in [('Name: GLIBC_2.31', 0), ('Name: GLIBC_2.39', 1), ('', 1)]:
                 run.return_value = subprocess.CompletedProcess([], 0, sample, '')
                 self.assertEqual(check_glibc.main(), status)
-            run.assert_called_with(['readelf', '--version-info', '--', 'binary'],
+            run.assert_called_with(['/usr/bin/readelf', '--version-info', '--', 'binary'],
                                    check=True, capture_output=True, text=True)
             run.side_effect = subprocess.CalledProcessError(1, 'readelf')
             self.assertEqual(check_glibc.main(), 1)
-            run.side_effect = FileNotFoundError('readelf')
-            self.assertEqual(check_glibc.main(), 1)
+
+    def test_readelf_override_is_used(self):
+        with patch.dict(check_glibc.os.environ, {'READELF': '/custom/readelf'}), \
+             patch.object(sys, 'argv', ['check_glibc.py', 'binary']), \
+             patch.object(subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 0, 'GLIBC_2.31', '')
+            self.assertEqual(check_glibc.main(), 0)
+            run.assert_called_once_with(['/custom/readelf', '--version-info', '--', 'binary'],
+                                        check=True, capture_output=True, text=True)
+
+    def test_python_byte_scan_fallback(self):
+        supported = b'\x7fELF synthetic GLIBC_2.17 GLIBC_2.31'
+        self.assertEqual(check_glibc.check_elf_bytes(supported), (2, 31, 0))
+        with self.assertRaisesRegex(ValueError, 'GLIBC_2.39'):
+            check_glibc.check_elf_bytes(b'\x7fELF synthetic GLIBC_2.17 GLIBC_2.39')
+        with self.assertRaisesRegex(ValueError, 'not an ELF'):
+            check_glibc.check_elf_bytes(b'not an ELF GLIBC_2.17')
+        with self.assertRaisesRegex(ValueError, 'No required GLIBC'):
+            check_glibc.check_elf_bytes(b'\x7fELF synthetic without versions')
+
+    def test_main_uses_byte_scan_when_readelf_is_unavailable(self):
+        with patch.object(check_glibc.shutil, 'which', return_value=None), \
+             patch.object(sys, 'argv', ['check_glibc.py', 'binary']), \
+             patch('builtins.open', unittest.mock.mock_open(read_data=b'\x7fELF GLIBC_2.31')):
+            self.assertEqual(check_glibc.main(), 0)
 
 
 if __name__ == '__main__':
