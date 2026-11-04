@@ -1842,6 +1842,7 @@ dependencies = [
  "duduclaw-memory",
  "duduclaw-odoo",
  "duduclaw-os",
+ "duduclaw-parse-worker",
  "duduclaw-redaction",
  "duduclaw-security",
  "duduclaw-tui",
@@ -2040,6 +2041,7 @@ dependencies = [
  "duduclaw-odoo",
  "duduclaw-onnx",
  "duduclaw-os",
+ "duduclaw-parse-worker",
  "duduclaw-redaction",
  "duduclaw-relay",
  "duduclaw-sandbox",
@@ -2171,6 +2173,7 @@ dependencies = [
  "csv",
  "duduclaw-core",
  "duduclaw-onnx",
+ "duduclaw-parse-worker",
  "ego-tree",
  "encoding_rs",
  "hex",
@@ -2329,6 +2332,30 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "duduclaw-parse-worker"
+version = "1.79.3"
+dependencies = [
+ "calamine",
+ "chrono",
+ "csv",
+ "duduclaw-isolation",
+ "ego-tree",
+ "encoding_rs",
+ "image",
+ "libc",
+ "nix 0.31.3",
+ "pdf-extract",
+ "quick-xml",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -4623,6 +4650,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases 0.2.1",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

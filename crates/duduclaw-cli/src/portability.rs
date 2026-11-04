@@ -99,6 +99,7 @@ pub fn export_home(home: &Path, out: &Path) -> Result<usize> {
 /// destroyed. The archive is then unpacked (the `tar` crate guards against
 /// `..` path traversal).
 pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) -> Result<()> {
+    require_legacy_import(duduclaw_parse_worker::client::required())?;
     if !archive.is_file() {
         return Err(io_err(
             "import",
@@ -150,6 +151,7 @@ impl ImportBudget {
 const MAX_IMPORT_METADATA_BYTES: u64 = 1024 * 1024;
 
 fn validate_import_tar_headers(snapshot: &mut File, limits: &RestoreLimits) -> Result<()> {
+    require_legacy_import(duduclaw_parse_worker::client::required())?;
     snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))?;
     let mut archive = tar::Archive::new(GzDecoder::new(&mut *snapshot));
     let mut budget = ImportBudget::default();
@@ -1355,4 +1357,23 @@ fn validate_import_policy_with_limits(
         publish_before_unpack: prepared != retained || (replaces_identity && strict),
         prepared_config: prepared,
     })
+}
+
+// Package G's importer emits bounded records for separate operator review. The
+// old tar importer may never publish archive-supplied authority in protected mode.
+fn require_legacy_import(isolation_required: bool) -> Result<()> {
+    if isolation_required {
+        Err(io_err("import isolation", "隔離模式下請使用受保護的資料匯入流程，已拒絕舊版備份解析"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parse_isolation_tests {
+    #[test]
+    fn parse_isolation_portability_import_refuses() {
+        assert!(super::require_legacy_import(true).is_err());
+        assert!(super::require_legacy_import(false).is_ok());
+    }
 }

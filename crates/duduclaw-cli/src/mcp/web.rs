@@ -118,8 +118,12 @@ pub(crate) async fn handle_web_extract(args: &Value, home_dir: &Path) -> Value {
         selector: selector.clone(),
         format,
     }];
-    match duduclaw_gateway::web_extract::extract_multiple(&fetched.body, &queries) {
-        Ok(extraction) => {
+    let body = fetched.body;
+    let extraction = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::web_extract::extract_multiple(&body, &queries)
+    }).await;
+    match extraction {
+        Ok(Ok(extraction)) => {
             let values = extraction
                 .results
                 .get("result")
@@ -138,7 +142,8 @@ pub(crate) async fn handle_web_extract(args: &Value, home_dir: &Path) -> Value {
             }
             tool_text(&text)
         }
-        Err(e) => tool_error(&format!("Extraction failed: {e}")),
+        Ok(Err(e)) => tool_error(&format!("Extraction failed: {e}")),
+        Err(_) => tool_error("網頁解析未完成，請稍後再試。"),
     }
 }
 

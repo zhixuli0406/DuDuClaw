@@ -172,6 +172,13 @@ fn write_entry(entry: &mut impl Read, dest: &Path, size: u64, path: &str) -> Res
 /// Unpack a verified bundle: only the expected regular files, each capped at
 /// its pinned size, written to a `.part` file and renamed into place.
 pub fn unpack_from(reader: impl Read, spec: &ModelSpec, home: &Path) -> Result<usize, String> {
+    unpack_from_with_isolation(reader, spec, home, duduclaw_parse_worker::client::required())
+}
+
+fn unpack_from_with_isolation(reader: impl Read, spec: &ModelSpec, home: &Path, isolation_required: bool) -> Result<usize, String> {
+    if isolation_required {
+        return Err("隔離模式下無法在主程式解開模型安裝包，已停止安裝。".into());
+    }
     let expected = expected_entries(spec, home);
     let manifest = format!("models/embedding/{}/bundle.json", spec.id);
     let mut archive = tar::Archive::new(reader);
@@ -397,5 +404,20 @@ mod tests {
                 .unwrap_err()
                 .contains("連結")
         );
+    }
+}
+
+#[cfg(test)]
+mod parse_isolation_tests {
+    #[test]
+    fn parse_isolation_bundle_refuses_before_read() {
+        struct MustNotRead;
+        impl std::io::Read for MustNotRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("read before isolation gate") }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = super::super::catalog::find(super::super::catalog::DEFAULT_MODEL).unwrap();
+        assert!(super::unpack_from_with_isolation(MustNotRead, &spec, dir.path(), true).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

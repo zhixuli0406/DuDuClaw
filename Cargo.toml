@@ -17,6 +17,7 @@ exclude = [
 members = [
     "crates/duduclaw-core",
     "crates/duduclaw-isolation",
+    "crates/duduclaw-parse-worker",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
     "crates/duduclaw-security",
@@ -129,6 +130,7 @@ mdns-sd = "0.20"
 
 # Internal crates
 duduclaw-isolation = { path = "crates/duduclaw-isolation" }
+duduclaw-parse-worker = { path = "crates/duduclaw-parse-worker" }
 duduclaw-core = { path = "crates/duduclaw-core" }
 duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
 duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }

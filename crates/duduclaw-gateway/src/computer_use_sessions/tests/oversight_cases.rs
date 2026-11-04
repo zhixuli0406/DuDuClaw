@@ -272,3 +272,28 @@ async fn a_hold_arriving_during_the_final_safety_wait_masks_the_cached_image() {
     assert_eq!(view["fully_masked"], true);
     assert_eq!(view["mask_reason"], "injection_suspected");
 }
+
+#[tokio::test]
+async fn parse_isolation_snapshot_rechecks_stop_after_async_masking() {
+    let tmp = home();
+    let state = Arc::new(FakeState::default());
+    let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+    let id = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    mgr.screenshot("alice", Some(&id)).await.unwrap();
+    let entry = mgr.entry("alice").unwrap();
+    *entry.shared.live.hold.lock().unwrap() = Some(live_view::Hold {
+        categories: vec!["fixture".into()],
+        since_unix: chrono::Utc::now().timestamp(),
+    });
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *mgr.action_boundary_pause.lock().unwrap() =
+        Some(("snapshot_mask_complete", entered.clone(), release.clone()));
+    let stop = async {
+        entered.notified().await;
+        entry.control.stopped.store(true, Ordering::Release);
+        release.notify_one();
+    };
+    let (view, ()) = tokio::join!(mgr.masked_snapshot("alice", &id), stop);
+    assert!(view.is_err(), "a revoked session must not publish a completed mask");
+}

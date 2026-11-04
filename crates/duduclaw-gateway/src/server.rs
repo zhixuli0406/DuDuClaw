@@ -15003,6 +15003,15 @@ async fn handle_files_preview(
             .into_response();
     }
 
+    // Package A must replace the legacy soffice spawn with an isolated service.
+    // Successful ZIP preflight does not make executing this parser as gateway safe.
+    if duduclaw_parse_worker::client::required() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "隔離預覽服務尚未就緒，請下載檔案開啟。" })),
+        ).into_response();
+    }
+
     // WP-4G: office documents are zip containers, and the file being previewed
     // may be an attachment a stranger sent into a channel. LibreOffice is a
     // recursive-descent OOXML parser with no resource ceiling of its own — a

@@ -184,7 +184,7 @@ fn sections(lines: Vec<Line>) -> Vec<RawSegment> {
         if let Some(level) = line.level {
             flush(&mut out, &path, &mut body);
             path.retain(|(l, _)| *l < level);
-            path.push((level, duduclaw_core::truncate_chars(&line.text, 80)));
+            path.push((level, super::truncate_chars(&line.text, 80)));
         }
         body.push(line.text);
     }

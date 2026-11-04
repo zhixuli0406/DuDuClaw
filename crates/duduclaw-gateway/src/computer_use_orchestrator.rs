@@ -668,6 +668,105 @@ impl Drop for ComputerUseOrchestrator {
     }
 }
 
+// Immutable inputs for decoding or worker IPC on Tokio's blocking pool.
+struct ScreenshotMasker {
+    fill_color: [u8; 3],
+    width: u32,
+    height: u32,
+}
+
+impl ScreenshotMasker {
+    /// Both masking rules, in order: the DOM regions (when detection ran),
+    /// then the window-title rule — always, even after regions were masked,
+    /// so a credential window or an unreadable title masks the whole
+    /// screenshot whatever the DOM said.
+    ///
+    /// HS5 fix (fail closed): a detection error masks the entire screen; the
+    /// raw screenshot is never shipped. A title that cannot be read (command
+    /// error, timeout, non-zero exit, non-UTF-8 output) also masks the whole
+    /// screenshot. An empty title that was read successfully is a readable,
+    /// non-sensitive title.
+    ///
+    /// A detection failure is reported as [`FullMaskReason::SeveralPages`]
+    /// or [`FullMaskReason::HelperFailed`] and the title is then not
+    /// consulted; otherwise a title verdict decides.
+    fn apply_masks(
+        &self,
+        b64: String,
+        regions: Option<Result<Vec<[u32; 4]>, RegionDetectFailure>>,
+        title: &Result<String, String>,
+    ) -> Result<MaskedScreenshot, ComputerUseError> {
+        let b64 = match regions {
+            Some(Ok(regions)) if !regions.is_empty() => {
+                mask_screenshot_regions(&b64, &regions, self.fill_color)?
+            }
+            Some(Ok(_)) | None => b64,
+            Some(Err(e)) => {
+                let reason = match e {
+                    RegionDetectFailure::SeveralPages => FullMaskReason::SeveralPages,
+                    RegionDetectFailure::Failed(_) => FullMaskReason::HelperFailed,
+                };
+                warn!(
+                    error = %e,
+                    reason = reason.code(),
+                    "Sensitive region detection failed — masking full screenshot (fail closed)"
+                );
+                return Ok(MaskedScreenshot {
+                    png_base64: self.mask_full_screen(&b64)?,
+                    full_mask: Some(reason),
+                });
+            }
+        };
+        self.apply_window_title_rule(b64, title)
+    }
+
+    /// The window-title half of [`ComputerUseOrchestrator::capture_masked_screenshot_detailed`]: mask the
+    /// whole screenshot when the title is sensitive or could not be read,
+    /// pass it through otherwise.
+    fn apply_window_title_rule(
+        &self,
+        b64: String,
+        title: &Result<String, String>,
+    ) -> Result<MaskedScreenshot, ComputerUseError> {
+        let reason = match title_verdict(title) {
+            TitleVerdict::Clear => {
+                return Ok(MaskedScreenshot { png_base64: b64, full_mask: None });
+            }
+            TitleVerdict::Sensitive => {
+                if let Ok(t) = title {
+                    warn!(window = %t, "Sensitive window detected — masking full screenshot");
+                }
+                FullMaskReason::TitleSensitive
+            }
+            TitleVerdict::Unreadable => {
+                if let Err(reason) = title {
+                    warn!(
+                        reason = %reason,
+                        "Active window title could not be read — masking full screenshot (fail closed)"
+                    );
+                }
+                FullMaskReason::TitleUnreadable
+            }
+        };
+        Ok(MaskedScreenshot {
+            png_base64: self.mask_full_screen(&b64)?,
+            full_mask: Some(reason),
+        })
+    }
+
+    /// Mask the entire screenshot. Used as the fail-closed safety measure when
+    /// sensitive-region detection fails or a known credential window is focused.
+    fn mask_full_screen(&self, b64: &str) -> Result<String, ComputerUseError> {
+        let regions = vec![[
+            0_u32,
+            0,
+            self.width,
+            self.height,
+        ]];
+        mask_screenshot_regions(b64, &regions, self.fill_color)
+    }
+}
+
 impl ComputerUseOrchestrator {
     pub fn new(agent_id: String, home_dir: PathBuf, config: ComputerUseConfig) -> Self {
         Self {
@@ -1159,97 +1258,27 @@ impl ComputerUseOrchestrator {
         // Check active window title for known sensitive apps (HS5): a password
         // manager / credential window masks the whole screenshot.
         let title = self.read_active_window_title().await;
-        self.apply_masks(b64, regions, &title)
+        let masker = self.screenshot_masker();
+        tokio::task::spawn_blocking(move || masker.apply_masks(b64, regions, &title))
+            .await.map_err(|_| ComputerUseError::Unavailable("螢幕截圖無法完成遮罩。".into()))?
     }
 
-    /// Both masking rules, in order: the DOM regions (when detection ran),
-    /// then the window-title rule — always, even after regions were masked,
-    /// so a credential window or an unreadable title masks the whole
-    /// screenshot whatever the DOM said.
-    ///
-    /// HS5 fix (fail closed): a detection error masks the entire screen; the
-    /// raw screenshot is never shipped. A title that cannot be read (command
-    /// error, timeout, non-zero exit, non-UTF-8 output) also masks the whole
-    /// screenshot. An empty title that was read successfully is a readable,
-    /// non-sensitive title.
-    ///
-    /// A detection failure is reported as [`FullMaskReason::SeveralPages`]
-    /// or [`FullMaskReason::HelperFailed`] and the title is then not
-    /// consulted; otherwise a title verdict decides.
-    fn apply_masks(
-        &self,
-        b64: String,
+    fn screenshot_masker(&self) -> ScreenshotMasker {
+        ScreenshotMasker { fill_color: self.masking.fill_color,
+            width: self.config.display_width, height: self.config.display_height }
+    }
+
+    #[cfg(test)]
+    fn apply_masks(&self, b64: String,
         regions: Option<Result<Vec<[u32; 4]>, RegionDetectFailure>>,
-        title: &Result<String, String>,
-    ) -> Result<MaskedScreenshot, ComputerUseError> {
-        let b64 = match regions {
-            Some(Ok(regions)) if !regions.is_empty() => {
-                mask_screenshot_regions(&b64, &regions, self.masking.fill_color)?
-            }
-            Some(Ok(_)) | None => b64,
-            Some(Err(e)) => {
-                let reason = match e {
-                    RegionDetectFailure::SeveralPages => FullMaskReason::SeveralPages,
-                    RegionDetectFailure::Failed(_) => FullMaskReason::HelperFailed,
-                };
-                warn!(
-                    error = %e,
-                    reason = reason.code(),
-                    "Sensitive region detection failed — masking full screenshot (fail closed)"
-                );
-                return Ok(MaskedScreenshot {
-                    png_base64: self.mask_full_screen(&b64)?,
-                    full_mask: Some(reason),
-                });
-            }
-        };
-        self.apply_window_title_rule(b64, title)
+        title: &Result<String, String>) -> Result<MaskedScreenshot, ComputerUseError> {
+        self.screenshot_masker().apply_masks(b64, regions, title)
     }
 
-    /// The window-title half of [`Self::capture_masked_screenshot_detailed`]: mask the
-    /// whole screenshot when the title is sensitive or could not be read,
-    /// pass it through otherwise.
-    fn apply_window_title_rule(
-        &self,
-        b64: String,
-        title: &Result<String, String>,
-    ) -> Result<MaskedScreenshot, ComputerUseError> {
-        let reason = match title_verdict(title) {
-            TitleVerdict::Clear => {
-                return Ok(MaskedScreenshot { png_base64: b64, full_mask: None });
-            }
-            TitleVerdict::Sensitive => {
-                if let Ok(t) = title {
-                    warn!(window = %t, "Sensitive window detected — masking full screenshot");
-                }
-                FullMaskReason::TitleSensitive
-            }
-            TitleVerdict::Unreadable => {
-                if let Err(reason) = title {
-                    warn!(
-                        reason = %reason,
-                        "Active window title could not be read — masking full screenshot (fail closed)"
-                    );
-                }
-                FullMaskReason::TitleUnreadable
-            }
-        };
-        Ok(MaskedScreenshot {
-            png_base64: self.mask_full_screen(&b64)?,
-            full_mask: Some(reason),
-        })
-    }
-
-    /// Mask the entire screenshot. Used as the fail-closed safety measure when
-    /// sensitive-region detection fails or a known credential window is focused.
-    fn mask_full_screen(&self, b64: &str) -> Result<String, ComputerUseError> {
-        let regions = vec![[
-            0_u32,
-            0,
-            self.config.display_width,
-            self.config.display_height,
-        ]];
-        mask_screenshot_regions(b64, &regions, self.masking.fill_color)
+    #[cfg(test)]
+    fn apply_window_title_rule(&self, b64: String, title: &Result<String, String>)
+        -> Result<MaskedScreenshot, ComputerUseError> {
+        self.screenshot_masker().apply_window_title_rule(b64, title)
     }
 
     // ── Action execution ──────────────────────────────────────

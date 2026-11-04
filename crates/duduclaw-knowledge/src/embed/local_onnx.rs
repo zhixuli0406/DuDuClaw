@@ -167,6 +167,11 @@ impl LocalOnnxEmbedder {
     }
 
     fn embed_inputs(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+        // A's local-inference worker plugs into Embedder; a cached ONNX session
+        // must not bypass required isolation after startup latches the policy.
+        if duduclaw_parse_worker::client::required() {
+            return Err(EmbedError::Unavailable("隔離模式下本機向量模型尚未就緒，已停止解析。".into()));
+        }
         let mut guard = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_none() {
             *guard = Some(self.load()?);
@@ -354,6 +359,26 @@ mod tests {
         assert!(!engine.is_loaded());
         assert_eq!(ORT_ENTRIES.load(std::sync::atomic::Ordering::SeqCst), 0,
             "neither ORT initialization nor its session builder may be reached");
+    }
+
+    #[test]
+    fn parse_isolation_onnx_refuses_before_model_load() {
+        const CHILD: &str = "DUDUCLAW_PARSE_ONNX_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "embed::local_onnx::tests::parse_isolation_onnx_refuses_before_model_load", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        duduclaw_parse_worker::client::require_isolation();
+        let home = tempfile::tempdir().unwrap();
+        let spec = super::super::catalog::find(super::super::catalog::DEFAULT_MODEL).unwrap();
+        let engine = LocalOnnxEmbedder::new(spec, home.path(), home.path().join("missing-runtime"), 1, 4);
+        assert!(matches!(engine.embed_query("query"), Err(EmbedError::Unavailable(_))));
+        assert!(!engine.is_loaded());
+        assert_eq!(ORT_ENTRIES.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

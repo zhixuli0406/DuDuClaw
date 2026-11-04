@@ -12,6 +12,7 @@ name = "duduclaw"
 path = "src/bin/duduclaw.rs"
 
 [dependencies]
+duduclaw-parse-worker = { workspace = true }
 duduclaw-core = { workspace = true }
 duduclaw-auth = { workspace = true }
 duduclaw-tui = { path = "../duduclaw-tui" }

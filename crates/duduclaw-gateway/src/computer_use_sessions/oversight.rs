@@ -105,8 +105,8 @@ impl super::ComputerUseSessions {
         if self.live_entry(agent, Some(expected)).is_none() {
             return Err(snapshot_error());
         }
-        // No await after this decision: a hold appearing during the safety
-        // read must also mask a previously clean cached frame.
+        // A hold appearing during the safety read must also mask a previously
+        // clean cached frame. If masking awaits, recheck authority afterwards.
         if entry.shared.live.hold().is_some() {
             let width = body["width"]
                 .as_u64()
@@ -117,13 +117,20 @@ impl super::ComputerUseSessions {
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(snapshot_error)?;
             body["png_base64"] = json!(
-                crate::computer_use::mask_screenshot_regions(
-                    body["png_base64"].as_str().ok_or_else(snapshot_error)?,
-                    &[[0, 0, width, height]],
+                crate::computer_use::mask_screenshot_regions_async(
+                    body["png_base64"].as_str().ok_or_else(snapshot_error)?.to_owned(),
+                    vec![[0, 0, width, height]],
                     crate::computer_use::MaskingConfig::default().fill_color,
                 )
+                .await
                 .map_err(|_| snapshot_error())?
             );
+            #[cfg(test)]
+            self.pause_action_boundary("snapshot_mask_complete").await;
+            self.snapshot_safety(agent, &entry).await?;
+            if self.live_entry(agent, Some(expected)).is_none() {
+                return Err(snapshot_error());
+            }
             body["fully_masked"] = json!(true);
             body["mask_reason"] = json!("injection_suspected");
         }

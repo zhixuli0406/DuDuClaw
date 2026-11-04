@@ -76,6 +76,16 @@ pub struct ExtractionResult {
 
 /// Extract all elements matching a single CSS `selector` from `html`.
 pub fn extract_css(html: &str, selector: &str) -> Result<Vec<ExtractedElement>, ExtractError> {
+    if duduclaw_parse_worker::client::required() {
+        use duduclaw_parse_worker::{media_adapters, worker::HtmlOutputFormat};
+        let query = media_adapters::html_query("elements", selector, HtmlOutputFormat::Element)
+            .map_err(|_| isolated_error())?;
+        return media_adapters::extract_html(html.as_bytes(), vec![query])
+            .map_err(|_| isolated_error())?.into_iter().map(|(name, value)| {
+                if name != "elements" { return Err(isolated_error()); }
+                serde_json::from_value(value).map_err(|_| isolated_error())
+            }).collect();
+    }
     let sel = Selector::parse(selector)
         .map_err(|e| ExtractError::InvalidSelector(format!("{selector}: {e}")))?;
 
@@ -110,6 +120,27 @@ pub fn extract_multiple(
     html: &str,
     selectors: &[SelectorQuery],
 ) -> Result<ExtractionResult, ExtractError> {
+    if duduclaw_parse_worker::client::required() {
+        use duduclaw_parse_worker::{media_adapters, worker::HtmlOutputFormat};
+        let mut queries = HashMap::new();
+        let mut results = HashMap::new();
+        for query in selectors {
+            let format = match query.format {
+                OutputFormat::Text => HtmlOutputFormat::Text,
+                OutputFormat::Html => HtmlOutputFormat::Html,
+                OutputFormat::Json => HtmlOutputFormat::Json,
+            };
+            queries.insert(query.name.clone(), media_adapters::html_query(&query.name, &query.selector, format)
+                .map_err(|_| isolated_error())?);
+            results.insert(query.name.clone(), Vec::new());
+        }
+        if queries.is_empty() { return Ok(ExtractionResult { results }); }
+        for (name, value) in media_adapters::extract_html(html.as_bytes(), queries.into_values().collect())
+            .map_err(|_| isolated_error())? {
+            results.get_mut(&name).ok_or_else(isolated_error)?.push(value);
+        }
+        return Ok(ExtractionResult { results });
+    }
     let document = Html::parse_document(html);
     let mut results: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
@@ -135,6 +166,10 @@ pub fn extract_multiple(
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
+
+fn isolated_error() -> ExtractError {
+    ExtractError::ParseError("網頁無法在隔離環境中完成解析。".into())
+}
 
 fn format_element(el: &scraper::ElementRef<'_>, format: OutputFormat) -> serde_json::Value {
     match format {

@@ -399,6 +399,9 @@ fn read_prefix(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
 /// `0912345678` a number or a phone?) would both mangle data and hand the
 /// redaction rules a shape that changes per file.
 pub fn handle_csv_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if duduclaw_parse_worker::client::required() {
+        return read_isolated_table(arguments, home_dir, agent_id, false);
+    }
     let raw_path = arg_str(arguments, "path");
     let path = match vet_path(raw_path, home_dir, agent_id) {
         Ok(p) => p,
@@ -537,6 +540,10 @@ fn empty_table_result(
 pub fn handle_xlsx_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
     use calamine::Reader;
 
+    if duduclaw_parse_worker::client::required() {
+        return read_isolated_table(arguments, home_dir, agent_id, true);
+    }
+
     let raw_path = arg_str(arguments, "path");
     let path = match vet_path(raw_path, home_dir, agent_id) {
         Ok(p) => p,
@@ -639,6 +646,97 @@ pub fn handle_xlsx_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> V
     files_json(&payload)
 }
 
+/// Package D authorizes the path before this adapter snapshots the file. The
+/// worker returns bounded data; normal table shaping, auditing and redaction
+/// remain in the caller just as for the non-protected reader.
+fn read_isolated_table(arguments: &Value, home_dir: &Path, agent_id: &str, spreadsheet: bool) -> Value {
+    use duduclaw_parse_worker::worker::{TableFormat, TableOptions};
+    let tool = if spreadsheet { "xlsx_read" } else { "csv_read" };
+    let raw_path = arg_str(arguments, "path");
+    let path = match vet_path(raw_path, home_dir, agent_id) {
+        Ok(path) => path,
+        Err(error) => {
+            audit_refusal(home_dir, agent_id, tool, raw_path);
+            return files_error(&error);
+        }
+    };
+    let max_bytes = if spreadsheet { XLSX_MAX_FILE_BYTES } else { CSV_MAX_FILE_BYTES };
+    let len = file_len(&path);
+    if len > max_bytes {
+        audit_refusal(home_dir, agent_id, tool, raw_path);
+        return files_error(&too_large(raw_path, len, max_bytes));
+    }
+    let delimiter = if spreadsheet { b',' } else {
+        match resolve_delimiter(arguments) {
+            Ok(delimiter) => delimiter,
+            Err(error) => return files_error(&error),
+        }
+    };
+    let Ok(offset) = u32::try_from(resolve_offset(arguments)) else {
+        return files_error("起始列超過隔離解析上限。");
+    };
+    let requested = arg_str(arguments, "sheet").trim();
+    let sheet = if spreadsheet && !requested.is_empty() {
+        match duduclaw_parse_worker::bounded::Text::new(requested.to_string()) {
+            Ok(sheet) => Some(sheet),
+            Err(_) => return files_error("工作表名稱超過隔離解析上限。"),
+        }
+    } else { None };
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match open.open(&path) {
+        Ok(file) if file.metadata().is_ok_and(|meta| meta.is_file() && meta.len() <= max_bytes) => file,
+        _ => return files_error("無法安全讀取這份檔案，已停止解析。"),
+    };
+    let result = duduclaw_parse_worker::adapters::read_table_file(&mut file, TableOptions {
+        format: if spreadsheet { TableFormat::Spreadsheet } else { TableFormat::Csv },
+        delimiter,
+        has_header: spreadsheet || arg_bool(arguments, "has_header").unwrap_or(true),
+        offset,
+        limit: resolve_limit(arguments) as u16,
+        sheet,
+    });
+    let output = match result {
+        Ok(output) => output,
+        Err(_) => {
+            audit_refusal(home_dir, agent_id, tool, raw_path);
+            return files_error("隔離解析服務無法讀取這份表格，請確認格式及大小後重試。");
+        }
+    };
+    let (columns, rows) = isolated_table_rows(&output, spreadsheet);
+    let table = table_name(&path);
+    let row_count = rows.len();
+    let mut payload = json!({ "path": path.to_string_lossy(), "table": table,
+        "columns": columns, "rows": rows, "row_count": row_count, "truncated": output.truncated });
+    if spreadsheet {
+        payload["sheet"] = json!(output.sheet.as_ref().map(|s| s.as_str()));
+        payload["sheets"] = json!(output.sheets.as_slice());
+    }
+    audit(home_dir, agent_id, tool, &path, &table, Some(row_count), true);
+    files_json(&payload)
+}
+
+fn isolated_table_rows(output: &duduclaw_parse_worker::worker::TableOutput, spreadsheet: bool) -> (Vec<String>, Vec<Value>) {
+    use duduclaw_parse_worker::worker::TableCell;
+    let columns: Vec<String> = output.columns.as_slice().iter().map(|s| s.as_str().to_owned()).collect();
+    let missing: fn() -> Value = if spreadsheet { json_null } else { empty_string };
+    let rows: Vec<Value> = output.rows.as_slice().iter().map(|row| {
+        let cells = row.as_slice().iter().map(|cell| match cell {
+            TableCell::Null => Value::Null,
+            TableCell::Bool(value) => Value::Bool(*value),
+            TableCell::Number(value) => Value::Number(value.clone()),
+            TableCell::String(value) => Value::String(value.as_str().to_owned()),
+        }).collect();
+        row_object(&columns, cells, missing)
+    }).collect();
+    (columns, rows)
+}
+
 /// §14.2 cell mapping: number → number, bool → bool, empty → null,
 /// date/time → ISO 8601 string, everything else → string.
 pub fn cell_to_json(cell: &calamine::Data) -> Value {
@@ -727,6 +825,22 @@ fn audit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_isolation_table_preserves_types_and_ragged_rows() {
+        let output = serde_json::from_value(serde_json::json!({
+            "columns": ["name", "value"],
+            "rows": [[{"kind":"string","value":"王"}, {"kind":"number","value":42}, {"kind":"bool","value":true}],
+                [{"kind":"string","value":"missing"}]],
+            "truncated": true, "sheet": null, "sheets": []
+        })).unwrap();
+        let (columns, csv) = super::isolated_table_rows(&output, false);
+        assert_eq!(columns, ["name", "value"]);
+        assert_eq!(csv[0], serde_json::json!({"name":"王", "value":42, "c3":true}));
+        assert_eq!(csv[1]["value"], "");
+        let (_, sheet) = super::isolated_table_rows(&output, true);
+        assert!(sheet[1]["value"].is_null());
+    }
+
     use super::*;
 
     fn tmp_home() -> tempfile::TempDir {
