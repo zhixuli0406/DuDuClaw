@@ -6,9 +6,10 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Glyphs {
     Ascii,
+    #[default]
     Unicode,
 }
 impl Glyphs {
@@ -16,11 +17,6 @@ impl Glyphs {
         if matches!(term, Some("linux" | "dumb")) { return Self::Ascii; }
         let locale = [lc_all, lc_ctype, lang].into_iter().flatten().find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
         if locale.contains("utf-8") || locale.contains("utf8") { Self::Unicode } else { Self::Ascii }
-    }
-}
-impl Default for Glyphs {
-    fn default() -> Self {
-        Self::detect(std::env::var("LC_ALL").ok().as_deref(), std::env::var("LC_CTYPE").ok().as_deref(), std::env::var("LANG").ok().as_deref(), std::env::var("TERM").ok().as_deref())
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,12 +56,13 @@ pub struct Settings {
     pub motion: bool,
     pub default_layout: DefaultLayout,
 }
+// Stable presentation defaults; runtime environment detection belongs to loading.
 impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: crate::theme::ThemeMode::Auto,
             background: crate::theme::Background::Theme,
-            colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::from_env()),
+            colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::TrueColor),
             glyphs: Glyphs::default(),
             ambiguous_width: AmbiguousWidth::Narrow,
             poll_interval: POLL_INTERVAL,
@@ -91,11 +88,19 @@ impl Settings {
         Self { glyphs: Glyphs::Ascii, colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::TrueColor), ..Self::default() }
     }
 
+    fn runtime_defaults() -> Self {
+        Self {
+            glyphs: Glyphs::detect(std::env::var("LC_ALL").ok().as_deref(), std::env::var("LC_CTYPE").ok().as_deref(), std::env::var("LANG").ok().as_deref(), std::env::var("TERM").ok().as_deref()),
+            colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::from_env()),
+            ..Self::default()
+        }
+    }
+
     pub fn load(home: &Path) -> (Self, Option<&'static str>) {
         let file = match crate::local_file::open_regular(&home.join("tui.toml")) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
-            Err(_) => return (Self::default(), Some(strings::SETTINGS_NOTICE)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::runtime_defaults(), None),
+            Err(_) => return (Self::runtime_defaults(), Some(strings::SETTINGS_NOTICE)),
         };
         let mut text = String::new();
         if file.take(MAX_FILE_BYTES + 1).read_to_string(&mut text).is_ok()
@@ -103,16 +108,17 @@ impl Settings {
         {
             Self::parse(&text)
         } else {
-            (Self::default(), Some(strings::SETTINGS_NOTICE))
+            (Self::runtime_defaults(), Some(strings::SETTINGS_NOTICE))
         }
     }
+    /// Parse runtime settings, detecting terminal defaults for omitted fields.
     pub fn parse(text: &str) -> (Self, Option<&'static str>) {
         let Ok(table) = text.parse::<toml::Table>() else {
-            return (Self::default(), Some(strings::SETTINGS_NOTICE));
+            return (Self::runtime_defaults(), Some(strings::SETTINGS_NOTICE));
         };
         let removed_command = table.get("pty").and_then(toml::Value::as_table)
             .is_some_and(|pty| pty.contains_key("command"));
-        let mut result = Self::default();
+        let mut result = Self::runtime_defaults();
         let mut bad = false;
         for (key, value) in table {
             match key.as_str() {
@@ -185,6 +191,60 @@ pub fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf> {
 mod tests {
     use super::*;
     #[test]
+    fn defaults_and_loading_are_isolated_from_parent_environment() {
+        for (locale, term, background, no_color) in [
+            ("C", "dumb", "15;0", true),
+            ("en_US.UTF-8", "xterm-256color", "0;15", false),
+            ("en_US.UTF-8", "dumb", "invalid", false),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "settings::tests::environment_probe", "--ignored"])
+                .env("LANG", locale).env("LC_ALL", locale).env("LC_CTYPE", locale)
+                .env("TERM", term).env("COLORFGBG", background).env("COLORTERM", "truecolor")
+                .env("TUI_EXPECTED_DEFAULTS", format!("{:?}", Settings::default()));
+            if no_color { command.env("NO_COLOR", ""); } else { command.env_remove("NO_COLOR"); }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{locale} {term}: {}{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+    }
+    #[test]
+    #[ignore = "run by the environment isolation parent test"]
+    fn environment_probe() {
+        use crate::theme::{Capability, Theme, ThemeMode};
+        let defaults = Settings::default();
+        assert_eq!(format!("{defaults:?}"), std::env::var("TUI_EXPECTED_DEFAULTS").unwrap());
+        assert_eq!(Glyphs::default(), Glyphs::Unicode);
+        assert_eq!(defaults.glyphs, Glyphs::Unicode);
+        assert_eq!(defaults.theme, ThemeMode::Auto);
+        assert_eq!(format!("{:?}", defaults.colors), format!("{:?}", Theme::new(ThemeMode::Dark, Capability::TrueColor)));
+
+        let home = tempfile::tempdir().unwrap();
+        let expected_glyphs = if std::env::var("LANG").unwrap().contains("UTF-8")
+            && std::env::var("TERM").unwrap() != "dumb" { Glyphs::Unicode } else { Glyphs::Ascii };
+        let capability = if std::env::var_os("NO_COLOR").is_some() { Capability::NoColor } else { Capability::TrueColor };
+        // Missing, oversized and malformed files keep runtime detection.
+        for text in [None, Some("broken["), Some("#"), Some("theme = 'auto'")] {
+            if let Some(text) = text { std::fs::write(home.path().join("tui.toml"), text).unwrap(); }
+            let (mut settings, notice) = Settings::load(home.path());
+            assert_eq!(notice.is_some(), text == Some("broken["));
+            assert_eq!(settings.glyphs, expected_glyphs);
+            assert_eq!(settings.colors.source_capability, capability);
+            settings.resolve_theme();
+            let mode = if std::env::var("COLORFGBG").unwrap() == "0;15" { ThemeMode::Light } else { ThemeMode::Dark };
+            assert_eq!(format!("{:?}", settings.colors), format!("{:?}", Theme::new(mode, capability)));
+        }
+        std::fs::write(home.path().join("tui.toml"), "#".repeat(MAX_FILE_BYTES as usize + 1)).unwrap();
+        let (settings, notice) = Settings::load(home.path());
+        assert!(notice.is_some());
+        assert_eq!(settings.glyphs, expected_glyphs);
+        assert_eq!(settings.colors.source_capability, capability);
+        for (value, expected) in [("ascii", Glyphs::Ascii), ("unicode", Glyphs::Unicode)] {
+            std::fs::write(home.path().join("tui.toml"), format!("glyphs = '{value}'")).unwrap();
+            assert_eq!(Settings::load(home.path()).0.glyphs, expected);
+        }
+    }
+    #[test]
     fn notifications_require_explicit_boolean_opt_in() {
         // Default false also covers SSH_CONNECTION; no environment auto-enable.
         assert!(!Settings::default().notifications);
@@ -206,7 +266,7 @@ mod tests {
         text.push('x');
         std::fs::write(home.path().join("tui.toml"), text).unwrap();
         let (settings, notice) = Settings::load(home.path());
-        assert_eq!(settings.glyphs, Glyphs::default());
+        assert_eq!(settings.glyphs, Settings::runtime_defaults().glyphs);
         assert!(notice.is_some());
     }
     #[test]
@@ -247,7 +307,7 @@ mod m3_tests {
             let (s, notice) = Settings::parse(text);
             assert!(notice.is_some(), "{text}");
             assert_eq!(s.default_layout, DefaultLayout::Single);
-            assert_eq!(s.glyphs, Glyphs::default());
+            assert_eq!(s.glyphs, Settings::runtime_defaults().glyphs);
             assert!(!s.notifications);
         }
         let (s, n) = Settings::parse("default_layout = 'vertical'\npoll_interval_seconds = -1\nnotifications = 'true'");
@@ -297,13 +357,13 @@ mod visual_tests {
         s.resolve_theme_with(Some("15;0"));
         assert_eq!(s.colors.text, ratatui::style::Color::White);
         s.theme = ThemeMode::Dark;
-        s.resolve_theme();
+        s.resolve_theme_with(None);
         assert_eq!(s.colors.capability, Capability::TrueColor);
     }
     #[test]
     fn auto_theme_uses_colorfgbg_else_dark() {
         use crate::theme::{Capability, Theme, ThemeMode};
-        let mut s = Settings::parse("theme = 'auto'").0;
+        let mut s = Settings::test_defaults();
         s.colors = Theme::new(ThemeMode::Dark, Capability::TrueColor);
         s.resolve_theme_with(None);
         assert_eq!(s.colors.page_canvas, Theme::new(ThemeMode::Dark, Capability::TrueColor).page_canvas);

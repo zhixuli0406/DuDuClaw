@@ -287,7 +287,8 @@ mod tests {
     #[ignore = "run by the environment isolation parent test"]
     fn environment_probe() {
         assert_eq!(Capability::from_env(), Capability::NoColor);
-        assert_eq!(crate::settings::Settings::default().colors.text, Color::Reset);
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(crate::settings::Settings::load(home.path()).0.colors.text, Color::Reset);
     }
     #[test]
     fn capability_order_and_no_color() {

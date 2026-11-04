@@ -359,7 +359,7 @@ mod tests {
         entry.target = TerminalText::new(format!("\x1b]52;c;bad\x07\n{}", "界·".repeat(2000)));
         for width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
             for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
-                let settings = Settings { ambiguous_width: width, glyphs, ..Settings::default() };
+                let settings = Settings { ambiguous_width: width, glyphs, ..Settings::test_defaults() };
                 for available in [8, 12, 24, 62] {
                     for outcome in [Outcome::Done, Outcome::Failed, Outcome::Pending] {
                         entry.outcome = outcome;
