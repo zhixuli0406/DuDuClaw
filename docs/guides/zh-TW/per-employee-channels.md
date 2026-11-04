@@ -9,7 +9,7 @@ Google Chat 頻道憑證授權 Chat 應用程式（`chat.bot`），不會連接 
 | | Telegram Bot | Google Chat 應用程式 |
 |---|---|---|
 | 誰可以設定 | 只有管理員（員工負責人看得到狀態） | 只有管理員（員工負責人看得到狀態） |
-| 要準備什麼 | @BotFather 給的 Token | 一個 Google Cloud 專案、一個 Chat 應用程式、服務帳戶 JSON 金鑰，以及 Google 連得到的 HTTPS 網址 |
+| 要準備什麼 | @BotFather 給的 Token | 一個 Google Cloud 專案、一個 Chat 應用程式、服務帳戶 JSON 金鑰，以及公開 HTTPS 網址 |
 | 要不要重新啟動 | 不用 | 不用 |
 | 沒設定時 | 走共用的 Telegram Bot | 走共用的 Google Chat 應用程式 |
 
@@ -34,20 +34,22 @@ Google Chat 頻道憑證授權 Chat 應用程式（`chat.bot`），不會連接 
 
 ## Google Chat
 
-每位員工要有**自己的 Google Cloud 專案**和自己的 Chat 應用程式（Google 規定一個專案一個 Chat 應用程式）。
+每位員工需要**自己的 Google Cloud 專案**與 Chat 應用程式（一個專案只能有一個 Chat app）。先依[共用設定的前提、金鑰政策與 Cloud Shell 步驟](channels-googlechat-teams.md#google-chat)，並加上 `--agent <員工代號>`：
 
-1. 替這位員工開一個 Google Cloud 專案，啟用 **Google Chat API**。記下**專案編號**（專案資訊卡上的一串數字，不是英文的專案 ID）。
-2. 在同一個專案建立**服務帳戶**，下載 **JSON 金鑰**。
-3. 到 Chat API 的**設定（Configuration）**頁建立應用程式：開啟互動功能、允許一對一訊息和聊天室，連線方式選 **HTTP 端點網址**，填員工卡片上顯示的網址：`https://<你的公開網域>/webhook/googlechat/agents/<員工代號>`。**驗證對象（Authentication Audience）**選**專案編號**。
-4. 由管理員把專案編號和整份 JSON 金鑰貼到 **專屬通道 → Google Chat**，按 **連線**。系統會用金鑰向 Google 要一次存取權杖來確認，卡片會顯示用的是哪個服務帳戶。
-5. 在 Google Chat 把應用程式加進聊天室，或直接私訊它。
+自動匯入需要正在執行的 DuDuClaw gateway 與管理員登入（有啟用 MFA 時也須完成驗證）。
 
-實際運作：
+```bash
+duduclaw channels googlechat bootstrap --agent alice --endpoint-url https://chat.example.com/webhook/googlechat/agents/alice
+```
 
-- Google 送到這個網址的每個請求，都先用**這位員工**的專案編號驗證，通過才讀內容。替別的應用程式簽的請求、驗證對象不對、沒有或偽造的權杖，一律拒絕（HTTP 401）。沒有設定應用程式的員工、或不存在的代號，也一樣回 401，網址不會透露哪些員工有應用程式。同一個來源位址每分鐘被拒絕超過 120 次後，沒有合理權杖的請求會收到 HTTP 429；驗證通過的請求不計入。
-- 回覆（以及這位員工之後轉送到聊天室的訊息）用這個應用程式的身分送出，所以應用程式必須在那個聊天室裡。
-- 只改專案編號的話，金鑰欄留空即可，原本的金鑰會保留。
-- 移除應用程式後，這個網址立刻關閉。
+`--agent` 在建置腳本影響名稱，在 CLI 匯入時指定員工，不會建立員工，請先建立該員工。每位員工仍使用自己的專案。依輸出完成 Google Chat 設定頁的名稱／頭像／說明、互動功能、一對一與聊天室、連線值與自己 email 的可見範圍，再測試私訊與聊天室回覆。Cloud Shell 使用者需安全下載金鑰，在 DuDuClaw 主機執行印出的匯入指令，保留 `--agent alice`。
+
+建議每個應用程式使用新的專用專案。**建立時請取消勾選「以 Google Workspace 外掛程式建構這個 Chat 應用程式」（Build this Chat app as a Google Workspace add-on）。**
+
+### 附錄：手動設定
+
+在「專屬通道 → Google Chat → 手動設定」填專案編號與整份 JSON 金鑰。將 `https://<公開網域>/webhook/googlechat/agents/<員工代號>` 貼到 Google 設定頁，Authentication Audience 選 **Project number**。儲存後實測訊息。只有管理員可以設定或移除憑證，儲存時會加密；金鑰欄留空會沿用既有金鑰。應用程式必須已加入要回覆的聊天室。
+
 
 ## 之後的訊息從哪裡送出
 
@@ -68,7 +70,7 @@ Telegram 用的是員工自己的 Bot；如果那個 Bot 在這期間被移除�
 ## 還沒涵蓋
 
 - 這一版之前建立的提醒仍然由共用 Bot 送出。
-- Google Chat 應用程式只支援「專案編號」驗證對象，不支援「HTTP 端點網址」。
+- Google Chat 的 HTTP 連線只支援「專案編號」驗證對象，不支援「HTTP 端點網址」。
 - Discord、Slack 的員工專屬 Bot 照舊在同一頁用「新增通道」（管理員）設定。
 
 ## 群組近期對話設定

@@ -204,6 +204,36 @@ pub(crate) async fn wait_text(fake: &Fake, bearer: &str, needle: &str) -> String
 }
 
 #[tokio::test]
+async fn googlechat_full_queue_acks_without_creating_a_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = start_fake().await;
+    let email = format!("full-{}@p0-test.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+    let sa = service_account(&fake, &email);
+    crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "sales", "", "specialist",
+        &googlechat_section(home.path(), "444444443", &sa));
+    let mut ctx = super::e2e_tests::reply_ctx(home.path()).await;
+    Arc::get_mut(&mut ctx).unwrap().googlechat_queue = crate::conversation_queue::ConversationQueue::with_caps(1, 1);
+    let group = json!(["sales", "spaces/FULL"]).to_string();
+    let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+    ctx.googlechat_queue.submit_in(&group, "occupied", async { let _ = blocked.await; }).unwrap();
+    super::e2e_seam::arm(home.path());
+    let app = crate::googlechat_agents::router(ctx.clone());
+    let mut event = message_event("spaces/FULL", "must be dropped");
+    event["message"]["name"] = json!("spaces/FULL/messages/rejected");
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("444444443")), &event).await, StatusCode::OK);
+    let notice = wait_text(&fake, &format!("Bearer tok-{email}"), "這則訊息沒有受理，請稍後再傳一次").await;
+    assert!(!notice.contains("OWN_BOT_REPLY"));
+    release.send(()).unwrap();
+    let (drained, done) = tokio::sync::oneshot::channel();
+    ctx.googlechat_queue.submit_in("barrier", "occupied", async { let _ = drained.send(()); }).unwrap();
+    done.await.unwrap();
+    let db = rusqlite::Connection::open(home.path().join("sessions.db")).unwrap();
+    let turns: i64 = db.query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0)).unwrap();
+    assert_eq!(turns, 0, "a rejected event must not create a turn");
+    assert_eq!(texts_with_bearer(&fake, &format!("Bearer tok-{email}")).len(), 1);
+}
+
+#[tokio::test]
 async fn own_app_requests_queue_in_order_while_other_apps_keep_running() {
     let home = tempfile::tempdir().unwrap();
     let agents = home.path().join("agents");
@@ -399,4 +429,29 @@ async fn removing_an_app_closes_its_endpoint() {
             .is_err(),
         "no own app and no shared app: nothing is sent"
     );
+}
+
+#[tokio::test]
+async fn googlechat_http_addon_shapes_report_actionable_channel_status() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join("agents")).unwrap();
+    let ctx = super::e2e_tests::reply_ctx(home.path()).await;
+    let raw = json!({"client_email":"addon@test-project.iam.gserviceaccount.com", "private_key":test_key().pem}).to_string();
+    let creds = Arc::new(crate::googlechat::GoogleChatCreds::candidate(&raw).unwrap());
+    for agent in [None, Some("sales".to_string())] {
+        let label = agent.as_deref().map(|id| super::label("googlechat", id)).unwrap_or_else(|| "googlechat".into());
+        let state = Arc::new(crate::googlechat::GoogleChatState { ctx: ctx.clone(), creds: creds.clone(), agent });
+        for event in [json!({"commonEventObject":{}}), json!({"chat":{"messagePayload":{"message":{"text":"hello"}}}})] {
+            ctx.channel_status.write().await.remove(&label);
+            let response = crate::googlechat::dispatch_event(state.clone(), Bytes::from(event.to_string())).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(body.as_ref(), crate::googlechat::ADDON_DIAGNOSTIC.as_bytes());
+            let statuses = ctx.channel_status.read().await;
+            let status = statuses.get(&label).expect("unsupported shape must not be silently discarded");
+            assert!(!status.connected);
+            assert_eq!(status.error.as_deref(), Some(crate::googlechat::ADDON_DIAGNOSTIC));
+            assert!(status.error.as_ref().unwrap().contains("Build this Chat app as a Google Workspace add-on"));
+        }
+    }
 }

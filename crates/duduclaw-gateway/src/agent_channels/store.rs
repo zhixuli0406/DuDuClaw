@@ -110,6 +110,10 @@ pub fn agent_has_googlechat_section(home: &Path, agent_id: &str) -> bool {
 /// be resolved — callers fail closed.
 pub async fn agent_chat_app(home: &Path, agent_id: &str) -> Option<AgentChatApp> {
     let section = googlechat_section(home, agent_id)?;
+    if let Err(error) = super::googlechat_config::validate_fields(section.keys().map(String::as_str), &["project_number", "service_account_json", "service_account_json_enc"]) {
+        tracing::warn!(agent_id, "{error}");
+        return None;
+    }
     let project_number = section
         .get("project_number")
         .and_then(|v| v.as_str())

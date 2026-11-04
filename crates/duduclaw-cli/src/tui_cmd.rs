@@ -101,7 +101,7 @@ fn tui_error(error: duduclaw_tui::Error) -> Error {
     Error::Config(error.to_string())
 }
 
-struct TerminalPrompt;
+pub(crate) struct TerminalPrompt;
 #[async_trait::async_trait]
 impl LoginPrompt for TerminalPrompt {
     fn is_interactive(&self) -> bool {

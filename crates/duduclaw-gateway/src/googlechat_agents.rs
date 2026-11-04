@@ -187,6 +187,11 @@ pub(crate) async fn handle(
         warn!(agent, "Google Chat (own app): JWT verification failed: {e}");
         return unauthorized();
     }
+    let _bind = crate::agent_channels::binding_lock().await;
+    let Some(current) = crate::agent_channels::store::agent_chat_app(&ctx.home_dir, agent).await else {
+        return unauthorized();
+    };
+    if current.project_number != app.project_number { return unauthorized(); }
     let label = crate::agent_channels::label("googlechat", agent);
     set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
     let state = Arc::new(GoogleChatState {

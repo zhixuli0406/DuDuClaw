@@ -138,17 +138,23 @@ impl MethodHandler {
             shared_tg,
             ctx.is_admin(),
         );
-        let googlechat = status::googlechat(
+        let mut googlechat = status::googlechat(
             agent_id,
             gc_configured,
             &self.channel_runtime(&gc_label).await,
-            gc_cfg
-                .map(|g| g.project_number)
+            gc_cfg.as_ref()
+                .map(|g| g.project_number.clone())
                 .filter(|p| !p.trim().is_empty()),
             gc_email,
             shared_gc,
             ctx.is_admin(),
         );
+        if ctx.is_admin() {
+            if let Some(app) = store::agent_chat_app(home, agent_id).await {
+                let key: Value = serde_json::from_str(app.service_account.expose()).unwrap_or_default();
+                googlechat["project_id"] = key.get("project_id").cloned().unwrap_or(Value::Null);
+            }
+        }
         WsFrame::ok_response(
             "",
             json!({ "agent_id": agent_id, "telegram": telegram, "googlechat": googlechat }),

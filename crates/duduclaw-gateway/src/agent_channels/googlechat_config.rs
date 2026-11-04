@@ -59,6 +59,9 @@ pub fn token_uri_allowed(uri: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(uri.trim()) else {
         return false;
     };
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() || url.path() != "/token" {
+        return false;
+    }
     if url.scheme() == "https" && url.host_str() == Some("oauth2.googleapis.com") && url.port().is_none() {
         return true;
     }
@@ -73,4 +76,36 @@ pub fn token_uri_allowed(uri: &str) -> bool {
 pub fn client_email(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     v.get("client_email")?.as_str().map(str::to_string)
+}
+
+/// Refuse unknown channel settings rather than silently accepting them.
+pub fn validate_fields<'a>(fields: impl IntoIterator<Item = &'a str>, allowed: &[&str]) -> Result<(), String> {
+    for field in fields {
+        if !allowed.contains(&field) {
+            return Err(format!("Google Chat 設定包含不支援的欄位「{field}」，請移除後再試。"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod googlechat_config_tests {
+    use super::*;
+    #[test]
+    fn token_endpoint_rejects_credentials_paths_and_query() {
+        for uri in ["https://user@oauth2.googleapis.com/token", "https://oauth2.googleapis.com/other", "https://oauth2.googleapis.com/token?redirect=evil", "https://oauth2.googleapis.com/token#fragment"] {
+            assert!(!token_uri_allowed(uri), "{uri}");
+        }
+    }
+    #[test]
+    fn agent_config_rejects_unknown_settings_in_chinese() {
+        let error = toml::from_str::<duduclaw_core::types::GoogleChatChannelConfig>("project_number = \"123456789\"\nconnection = \"http\"\n").unwrap_err();
+        assert!(error.to_string().contains("不支援的欄位「connection」"));
+        assert!(toml::from_str::<duduclaw_core::types::GoogleChatChannelConfig>("project_number = \"123456789\"").is_ok());
+    }
+    #[test]
+    fn unknown_connection_is_refused_with_actionable_error() {
+        let error = validate_fields(["project_number", "connection"], &["project_number"]).unwrap_err();
+        assert!(error.contains("不支援的欄位「connection」"));
+    }
 }

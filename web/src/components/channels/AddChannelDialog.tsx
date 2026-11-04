@@ -20,6 +20,7 @@ import {
 import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import { normalizeRestartRequired } from '@/lib/config-toml';
 import { useRestartRequiredStore } from '@/stores/restart-required-store';
+import { GoogleChatSetup } from './GoogleChatSetup';
 import { AlertTriangle } from 'lucide-react';
 
 /** Channel type picker options — value ⇒ human label (spec §4 Select). */
@@ -165,8 +166,14 @@ export function AddChannelDialog({
   const [wecomAgentId, setWecomAgentId] = useState('');
   const [wecomCallbackToken, setWecomCallbackToken] = useState('');
   const [wecomAesKey, setWecomAesKey] = useState('');
+  const [googlechatManual, setGooglechatManual] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+
+  const close = () => {
+    if (channelType === 'googlechat') onCreated('googlechat');
+    onClose();
+  };
 
   const handleSubmit = async () => {
     if (!policy.allows('channels', channelType)) return;
@@ -331,7 +338,7 @@ export function AddChannelDialog({
     : '';
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+    <Dialog open={open} onOpenChange={(o) => !o && close()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
@@ -403,7 +410,7 @@ export function AddChannelDialog({
           )}
 
           {/* Setup guide */}
-          <div className="rounded-lg bg-warning/10 p-3 text-xs text-warning">
+          {channelType === 'googlechat' ? <GoogleChatSetup projectNumber={secret.trim()} /> : <div className="rounded-lg bg-warning/10 p-3 text-xs text-warning">
             <p className="mb-1 font-medium">{intl.formatMessage({ id: 'channels.dialog.setupGuide' })}</p>
             {steps.map((step) => {
               const isWarning = step.id.toLowerCase().includes('warning');
@@ -417,8 +424,9 @@ export function AddChannelDialog({
                 </p>
               );
             })}
-          </div>
-
+          </div>}
+          {channelType === 'googlechat' && <Button variant="ghost" size="sm" aria-expanded={googlechatManual} onClick={() => setGooglechatManual(!googlechatManual)}>{intl.formatMessage({ id: 'googlechat.setup.manual' })}</Button>}
+          {(channelType !== 'googlechat' || googlechatManual) && <>
           <DialogField label={guide.tokenLabel}>
             <SecretSourceField
               value={token}
@@ -432,6 +440,8 @@ export function AddChannelDialog({
               <SecretSourceField value={secret} onChange={setSecret} placeholder={guide.secretLabel} />
             </DialogField>
           )}
+
+          </>}
 
           {/* G.6 — extra WhatsApp tokens (global) */}
           {channelType === 'whatsapp' && (
@@ -482,12 +492,12 @@ export function AddChannelDialog({
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'channels.dialog.cancel' })}
+          <Button variant="outline" onClick={close}>
+            {intl.formatMessage({ id: channelType === 'googlechat' ? 'common.close' : 'channels.dialog.cancel' })}
           </Button>
-          <Button variant="brand" onClick={() => { setAddError(null); handleSubmit(); }} disabled={!policy.allows('channels', channelType) || submitting || !token.trim()}>
+          {(channelType !== 'googlechat' || googlechatManual) && <Button variant="brand" onClick={() => { setAddError(null); handleSubmit(); }} disabled={!policy.allows('channels', channelType) || submitting || !token.trim()}>
             {submitting ? intl.formatMessage({ id: 'channels.dialog.adding' }) : intl.formatMessage({ id: 'channels.dialog.add' })}
-          </Button>
+          </Button>}
         </DialogFooter>
       </DialogContent>
     </Dialog>

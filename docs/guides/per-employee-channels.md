@@ -12,7 +12,7 @@ Where: **AI employees → (employee) → Integrations → Own channels**.
 | | Telegram bot | Google Chat app |
 |---|---|---|
 | Who can set it | admin only (the employee's owner sees the status) | admin only (the owner sees the status) |
-| What you need | a token from @BotFather | a Google Cloud project, a Chat app, a service-account JSON key, and a public HTTPS address for the gateway |
+| What you need | a token from @BotFather | a Google Cloud project, a Chat app, a service-account JSON key, and public HTTPS |
 | Restart needed | no | no |
 | Without it | the shared Telegram bot | the shared Google Chat app |
 
@@ -48,39 +48,21 @@ How it behaves:
 
 ## Google Chat
 
-Each employee needs its **own Google Cloud project** with its own Chat app
-(Google allows one Chat app per project).
+Each employee needs its **own Google Cloud project** and Chat app (one Chat app per project). Follow the [shared setup prerequisites, key-policy guidance and Cloud Shell flow](channels-googlechat-teams.md#google-chat), adding `--agent <employee-id>`:
 
-1. Create a Google Cloud project for the employee and enable the **Google
-   Chat API**. Note the **project number** (digits, shown on the project
-   dashboard; not the project ID).
-2. In the same project create a **service account** and download a **JSON
-   key**.
-3. On the Chat API **Configuration** page create the app: enable interactive
-   features, allow 1:1 messages and spaces, choose **HTTP endpoint URL** and
-   enter the address shown on the employee's card:
-   `https://<your-public-host>/webhook/googlechat/agents/<employee-id>`.
-   Set **Authentication Audience** to **Project number**.
-4. As an admin, paste the project number and the whole JSON key into **Own
-   channels → Google Chat** and press **Connect**. DuDuClaw checks the key by
-   requesting an access token; the card shows the service account it uses.
-5. In Google Chat, add the app to a space or start a chat with it.
+The automatic import requires a running DuDuClaw gateway and an administrator login (including MFA when required).
 
-How it behaves:
+```bash
+duduclaw channels googlechat bootstrap --agent alice --endpoint-url https://chat.example.com/webhook/googlechat/agents/alice
+```
 
-- Every request Google sends to that address is verified against **that**
-  employee's project number before anything is read. A request signed for
-  another app, a wrong audience, a missing or forged token are refused (HTTP
-  401). An address for an employee without an app, or an unknown id, answers
-  the same 401, so the address does not reveal which employees have an app.
-  A source address with more than 120 refused requests a minute gets HTTP 429
-  for requests without a plausible token; verified requests are never
-  counted.
-- Replies (and messages this employee forwards to a space later) are sent with
-  this app's credentials, so the app must be a member of the space.
-- To change only the project number, leave the key field empty; the stored
-  key is kept.
-- Removing the app closes the address at once.
+`--agent` affects naming in the provisioning script and selects the employee when the CLI imports. It does not create the employee; create it first. Each employee still uses its own project. Complete the printed Google Chat Configuration page: app name/avatar/description, interactive features, 1:1 and spaces, connection values, and visibility to your own email. Test a direct message and a space reply. For Cloud Shell, download the key securely and run the printed import command on the DuDuClaw host, retaining `--agent alice`.
+
+Use a dedicated new project for each app. **Uncheck “Build this Chat app as a Google Workspace add-on”** when creating the app.
+
+### Appendix: manual setup
+
+In **Own channels → Google Chat → Manual setup**, enter the project number and full JSON key. Paste `https://<public-host>/webhook/googlechat/agents/<employee-id>` in Google configuration and select **Project number** as Authentication Audience. Save and test a message. Only administrators can configure or remove credentials. Keys are encrypted; an empty key field retains the saved key. The app must be a member of the space it replies to.
 
 ## Where later messages go
 
@@ -111,7 +93,7 @@ forgotten and the next send uses another app seen there.
 
 - Reminders created before this release keep sending through the shared bot.
 - Only the "Project number" authentication audience is supported for Google
-  Chat apps (not "HTTP endpoint URL").
+  Chat HTTP apps (not "HTTP endpoint URL").
 - Discord and Slack per-employee bots are set from the same page through
   **Add channel** (admin) as before.
 

@@ -245,6 +245,7 @@ export interface AgentOwnChannels {
     project_number: string | null;
     service_account_email: string | null;
     endpoint_path: string;
+    project_id?: string | null;
     error: string | null;
     last_event: string | null;
     shared_app_configured: boolean;

@@ -3,9 +3,7 @@
 Google Chat チャネルの認証情報は Chat アプリ（`chat.bot`）用で、Gmail、Drive、Calendar は接続しません。データツールは [Google 接続](google-setup.md)で別途設定します。ダッシュボードの保存は即時反映し、設定ファイルを手編集した場合は再起動します。
 
 DuDuClawはGoogle ChatとMicrosoft Teamsを、Telegram／LINE／Discord／Slack／
-WhatsApp／Feishu／WebChatと並ぶ一級チャネルとしてサポートしています。どち
-らもwebhookベースで、gatewayが公開HTTPS経由で到達可能である必要がありま
-す。
+WhatsApp／Feishu／WebChat と並ぶチャネルとしてサポートしています。Teams と Google Chat は公開 HTTPS URL が必要です。
 
 両チャネルとも以下を備えています。
 
@@ -22,53 +20,54 @@ WhatsApp／Feishu／WebChatと並ぶ一級チャネルとしてサポートし�
 
 ## Google Chat
 
-### セットアップ
+### 前提条件
 
-1. Google Cloudプロジェクトを作成(または既存のものを再利用)し、
-   **Google Chat APIを有効化**する。**プロジェクト番号**(project
-   number、IAM & Admin → Settingsに表示)を控えておく。
-2. 同じプロジェクトに**サービスアカウント**を作成し、そのJSONキーをダウ
-   ンロードする。ドメイン全体委任(domain-wide delegation)は不要で、
-   Chat app自体がprincipal(scopeは`chat.bot`)になる。
-3. Chat APIの**Configuration**設定ページを開く。app名／アバター／説明
-   を設定し、*Interactive features*を有効化、*Receive 1:1 messages*と
-   *Join spaces and group conversations*にチェックを入れ、**HTTP
-   endpoint URL**を`https://<your-host>/webhook/googlechat`に設定する。
-4. *Authentication Audience*で**Project number**を選択する。
-5. DuDuClawを設定する(`config.toml`、またはダッシュボード → チャネル →
-   `googlechat`を追加):
+Chat が有効な Google Workspace Business／Enterprise アカウントと、Chat アプリを許可する管理者が必要です。Cloud プロジェクトの作成または直接所有、Chat API の有効化、サービスアカウントとキーの作成ができる必要があります。ローカルでは Bash、Python 3、`gcloud` と自分の `gcloud auth login` が必要です。Cloud Shell にはこれらのツールがあります。gateway は公開 HTTPS URL が必要です。公開 URL が不要な Pub/Sub モードは今後のバージョンで提供予定です。
 
-```toml
-[channels]
-googlechat_project_number = "123456789012"
-# Paste the full service-account JSON (stored encrypted as *_enc)
-googlechat_service_account_json = '{ "type": "service_account", ... }'
+### ワンステップで作成・インポート
+
+新しい専用 Google Cloud プロジェクトを推奨します（既定の動作）。DuDuClaw ホストで実行します。
+
+自動インポートには稼働中の DuDuClaw gateway と管理者ログインが必要です（MFA が必要な場合はその認証も行います）。
+
+```bash
+# HTTP: 自分の公開 gateway アドレスに置き換えます。
+duduclaw channels googlechat bootstrap --endpoint-url https://chat.example.com/webhook/googlechat
 ```
 
-6. 設定ファイルを手編集した場合は gateway を再起動します。ダッシュボードの変更は即時反映します。ログに
-   `✅ Google Chat webhook ready at /webhook/googlechat`と表示されれば
-   成功。
+プロジェクト、Chat API、サービスアカウントを準備し、最後のクラウド操作で非公開 JSON キーを作成してから設定をインポートします。`--project-id your-project-id` は直接所有する既存プロジェクトを再利用します。グループや継承による所有権は安全側で拒否します。追加オプションは `--app-name`、`--agent`、`--out`、`--dry-run`（クラウドもローカルも変更しません）です。既定 ID は `duduclaw-chat-<random6>`。キーは専用出力ディレクトリの `service-account.json` に 0600 で保存します。再実行では一致するキーを再利用します。インポートした認証情報は暗号化して保存します。作成後に後続のスクリプト処理が失敗した場合、新しいクラウドキーの取り消しとローカルファイルの削除を試みます。取り消しに失敗した場合やキー ID を読み取れない場合は、手動対応が必要であることを表示します。 スクリプト成功後に CLI のインポートが失敗した場合、CLI はキーファイルを保持して非ゼロで終了します。新しいサービスアカウントキーは引き続き有効です。エラーにはファイルパス、再インポートと手動取り消しの完全なコマンドが表示されます。CLI はキーの取り消しやキーファイルの削除を自動実行しません。
 
-### 補足
+ローカルに gcloud がない場合は [Cloud Shell を開き](https://shell.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/zhixuli0406/DuDuClaw&cloudshell_tutorial=scripts/googlechat/cloudshell-tutorial.md&show=terminal)、`bash scripts/googlechat/bootstrap.sh --endpoint-url https://chat.example.com/webhook/googlechat` を実行します。キーを安全に DuDuClaw ホストへダウンロードし、`chmod 600 /private/path/service-account.json` で権限を制限してから、ローカルパスでインポートします。Windows では通常のキーファイルを自分のユーザープロファイル内に保存してください。再解析ポイントは拒否しますが、所有者と ACL 権限は検証しません。
 
-- 受信リクエストは常にfail-closedで検証されます。`Authorization:
-  Bearer`のJWTは`chat@system.gserviceaccount.com`が署名したものであ
-  り、audienceは自分のプロジェクト番号と一致している必要があります。
-- 返信は`spaces.messages.create`経由で非同期に送信されます(同期ウィン
-  ドウはわずか30秒しかなく、agentタスクには短すぎるため)。スレッドは
-  `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`によって正しく紐づけられます。
-- スペース内の各メンバーのメッセージは届いた順に 1 件ずつ返信します（以前は
-  続けて送られた数件が同時に処理され、後の返信が前のメッセージを踏まえない
-  ことがありました）。1 人あたり最大 10 件、スペース全体で最大 40 件まで待機
-  でき、それを超えると受け付けなかったことをスペースに伝えます（同じ人へは
-  1 分に 1 回、同じスペースでは 10 秒に 1 回まで）。スペース情報のないイベント
-  は拒否します。
-- 各AI社員専用のChatアプリにも同じ順序と上限が適用され、別のWebhook
-  リクエストでも前のメッセージに続けて処理されます。同じスペースにある
-  別々のアプリは独立したキューを持ち、同時に返信できます。
-- 未公開のChat appは自分のWorkspace組織内からしか見えません。より広い
-  配布範囲が必要な場合はGoogle Workspace Marketplaceへの公開が必要で
-  す。
+```bash
+duduclaw channels googlechat import --project-number 123456789012 --key-file /private/path/service-account.json
+```
+
+### Google Chat で設定を完了
+
+表示された Chat Configuration リンクを開きます。この設定画面の API はないため、最後は手動で行います。
+
+1. **作成時に「Build this Chat app as a Google Workspace add-on」（この Chat アプリを Google Workspace アドオンとして構築する）のチェックを外してください。** アプリ名（最大 25 文字）、公開 HTTPS アバター URL、説明を入力します。スクリプトは既存の DuDuClaw アバター URL を仮定しません。
+2. **Interactive features**、1 対 1 メッセージ、スペース参加を有効にします。
+3. HTTP エンドポイントを入力し、**Authentication Audience → Project number** を選びます。
+4. **Visibility** に自分の Workspace メールを入力して保存し、アプリをスペースに追加するか直接メッセージを送り、実際の返信を確認します。
+
+リソース作成やインポート成功だけでは Chat の設定・送受信の確認にはなりません。ダッシュボードにはコピー可能なコマンド、Cloud Shell と設定値があります。従来の入力欄は「手動設定」に残ります。
+
+### キーポリシー
+
+キー作成が `FAILED_PRECONDITION` になった場合は、組織ポリシー管理者にプロジェクト例外の審査を依頼します。2024-05-03 以降に作成した組織は通常キー作成を制限します。スクリプトは次を表示して停止し、自動でポリシーを変えません。
+
+```bash
+gcloud resource-manager org-policies disable-enforce iam.disableServiceAccountKeyCreation --project=your-project-id
+gcloud resource-manager org-policies disable-enforce iam.managed.disableServiceAccountKeyCreation --project=your-project-id
+```
+
+managed constraint はインストール済み gcloud の対応を管理者が確認し、必要なら Organization Policies 画面で変更します。[Google のキーポリシーガイド](https://cloud.google.com/iam/docs/troubleshoot-org-policies)も参照してください。
+
+### 付録：手動設定
+
+プロジェクト、Chat API、サービスアカウントと JSON キーを作成し、上記の Chat 設定を行います。「チャネル → Google Chat を追加 → 手動設定」にプロジェクト番号と JSON キー全体を入力します。保存後にメッセージをテストします。HTTP は `chat@system.gserviceaccount.com` とプロジェクト番号の JWT を検証します。未対応の Workspace アドオン形式には、アドオン設定を外すよう診断を表示します。
 
 ## Microsoft Teams
 

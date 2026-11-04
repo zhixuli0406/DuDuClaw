@@ -5,6 +5,7 @@ import { Button, Input, SettingsCard, SettingsSection, Textarea } from '@/compon
 import { ConfirmDialog } from '@/components/settings/controls';
 import { api, type AgentOwnChannels, type AgentOwnChannelState } from '@/lib/api';
 import { formatError, toast } from '@/lib/toast';
+import { GoogleChatSetup } from '@/components/channels/GoogleChatSetup';
 import { cn } from '@/lib/utils';
 
 const DOCS_BASE = 'https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/guides';
@@ -222,7 +223,6 @@ function GoogleChatCard({
   const [keyJson, setKeyJson] = useState('');
   const [saving, setSaving] = useState(false);
   useEffect(() => setProject(data.project_number ?? ''), [data.project_number]);
-  const endpoint = `${window.location.origin}${data.endpoint_path}`;
 
   const save = async () => {
     if (!project.trim()) return;
@@ -273,21 +273,11 @@ function GoogleChatCard({
             {t('agentChannels.googlechat.projectShown', { project: data.project_number })}
           </p>
         )}
-        <div className="space-y-1">
-          <p className="text-xs font-medium">{t('agentChannels.googlechat.endpoint')}</p>
-          <code className="block break-all rounded-md bg-secondary px-2 py-1 text-xs">{endpoint}</code>
-          <p className="text-xs text-muted-foreground">{t('agentChannels.googlechat.endpointHint')}</p>
-        </div>
         {data.can_edit ? (
           <>
-            <Steps
-              items={[
-                t('agentChannels.googlechat.step1'),
-                t('agentChannels.googlechat.step2'),
-                t('agentChannels.googlechat.step3'),
-                t('agentChannels.googlechat.step4'),
-              ]}
-            />
+            <GoogleChatSetup agentId={agentId} projectNumber={data.project_number} projectId={data.project_id} onRefresh={onChanged} />
+            <details className="space-y-3">
+              <summary className="cursor-pointer text-sm">{t('googlechat.setup.manual')}</summary>
             <Input
               value={project}
               inputMode="numeric"
@@ -306,6 +296,7 @@ function GoogleChatCard({
             <Button onClick={() => void save()} disabled={saving || !project.trim() || (!data.configured && !keyJson.trim())}>
               {data.configured ? t('agentChannels.update') : t('agentChannels.connect')}
             </Button>
+            </details>
           </>
         ) : (
           <p className="text-xs text-muted-foreground">{t('agentChannels.googlechat.adminOnly')}</p>
