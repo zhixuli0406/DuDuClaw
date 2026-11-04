@@ -32,6 +32,8 @@
 
 ### Security
 
+- 試算表解析元件 calamine 升級到 0.38，修補畸形 Excel 舊格式檔可能造成的當機與記憶體耗盡（RUSTSEC-2026-0436）。
+
 - Linux 夜間自動升級安裝器檢查 root:root 來源、檔案與祖先權限並從私有快照安裝；API 回應限制 8 MiB、暫存於私有目錄；systemd 限制可寫入路徑並給予 1 小時下載重試與安裝時間。三語指南改用固定 commit SHA，說明 prerelease 純版本仍會安裝與版本選擇未簽章的限制。
 
 - 原生 Linux 受保護服務的金鑰交接：啟動器以 root 檢查專用帳號沒有登入 shell、特權群組、linger 與 sudo 權限，主程式與上層目錄歸 root 且不可被他人寫入，並先清掉同帳號的殘留程序；gateway 再確認由 systemd 直接啟動、在指定的 cgroup v2 服務群組、位於主機的 user namespace、沒有附加群組與任何 capability、連不到容器引擎，才接收根金鑰並禁止同帳號程序讀取它的記憶體。任一檢查失敗就維持個人帳號停用，不退回檔案金鑰。執行中每分鐘重驗引擎 socket 與附加群組，失敗即清除金鑰直到重啟；abstract socket 只有對方是 root 時才算風險。升級拒絕相同或較舊的版本，並以 root 管理的版本下限防止回退；不以 root 執行下載的程式。搬移只接受 sudo 呼叫者本人擁有的 `~/.duduclaw`。已知限制：AI 員工的 Bash／工具仍與 gateway 同一個 uid，未知名稱的 abstract socket 與其他提權途徑不在涵蓋範圍，主機不可讓 `duduclaw` 帳號存取容器引擎或其他特權服務。已在 Ubuntu 22.04（systemd 249、cgroup v2）實機驗收安裝、搬移、金鑰隔離與各項拒絕情境。

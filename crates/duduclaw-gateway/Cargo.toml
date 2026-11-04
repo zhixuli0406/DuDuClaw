@@ -237,7 +237,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # D1 composed CLI HTTP tests: dev-cycle only, no new production dependency.
 duduclaw-cli = { path = "../duduclaw-cli", default-features = false }
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks", "test-root-key"] }
-calamine = "0.36.1"
+calamine = "=0.38.0"
 # P2-B: `Provenance::test_only` exists only with this feature (never in a
 # production build).
 duduclaw-memory = { workspace = true, features = ["test-hooks"] }
