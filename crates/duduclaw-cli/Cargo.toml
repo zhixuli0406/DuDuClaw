@@ -97,6 +97,10 @@ calamine = { version = "=0.36.1", default-features = false, features = ["dates"]
 # Document knowledge base: `knowledge-extract` child, `knowledge eval`.
 duduclaw-knowledge = { workspace = true }
 tempfile = "3"
+unicode-normalization = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks"] }
