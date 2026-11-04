@@ -89,6 +89,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         let mut block_events = client.events();
         let mut block_cursor = crate::blocks::EventCursor::default();
         let mut block_fetch: Option<BlockFetch> = None;
+        let mut run_subscriptions = std::sync::Arc::new(tokio::sync::Mutex::new(crate::blocks::fetch::RunSubscriptions::default()));
         let mut fetched_revision = u64::MAX;
         let mut block_poll = std::time::Instant::now();
         let mut block_generation = None;
@@ -111,9 +112,10 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             } else { connection.borrow().clone() };
             let generation = match info { crate::client::ConnectionState::Connected(ref info) => Some(info.generation), _ => None };
             if generation != block_generation {
+                run_subscriptions = std::sync::Arc::new(tokio::sync::Mutex::new(crate::blocks::fetch::RunSubscriptions::default()));
                 block_generation = generation; app.blocks.invalidate(); app.logs = crate::blocks::LogTail::default();
                 block_cursor = crate::blocks::EventCursor::default();
-                for pane in app.blocks.panes.iter_mut().chain(&mut app.blocks.parked) { pane.data.subscription_checked = false; pane.data.subscribed = false; }
+                for pane in app.blocks.panes.iter_mut().chain(&mut app.blocks.parked) { pane.data.subscription_checked = false; pane.data.subscribed = false; pane.data.subscribed_run = None; }
             }
             if !m2::manager(&model) { app.logs = crate::blocks::LogTail::default(); }
             for _ in 0..256 {
@@ -138,11 +140,16 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 && (fetched_revision != app.blocks.revision || block_poll.elapsed() >= Duration::from_secs(5)) {
                 let revision = app.blocks.revision;
                 let panes = app.blocks.panes.clone(); let gateway = client.clone(); let role = model.role;
+                let subscriptions = run_subscriptions.clone();
+                let run_panes = app.blocks.panes.iter().chain(&app.blocks.parked)
+                    .filter(|p| p.kind == crate::blocks::Block::Run).map(|p| p.id.clone()).collect::<Vec<_>>();
                 block_fetch = Some(Box::pin(async move {
                     let mut results = Vec::new();
+                    let mut subscriptions = subscriptions.lock().await;
+                    let cleanup = subscriptions.retain(&gateway, &run_panes).await;
                     for (i, pane) in panes.iter().enumerate() {
                         if pane.kind.remote() {
-                            results.push((i, crate::blocks::fetch::pane_for_role(&gateway, pane, role).await));
+                            results.push((i, match cleanup { Err(error) if pane.kind == crate::blocks::Block::Run => Err(error), _ => subscriptions.fetch(&gateway, pane, role).await }));
                         }
                     }
                     (revision, results)

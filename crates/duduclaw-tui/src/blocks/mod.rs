@@ -315,6 +315,8 @@ pub struct Data {
     pub sections: Vec<(&'static str, Value)>,
     pub subscribed: bool,
     pub subscription_checked: bool,
+    // The run last checked for live support, including a refused subscription.
+    pub subscribed_run: Option<String>,
     pub runtime: Option<TerminalText>,
 }
 impl Default for Data {
@@ -328,6 +330,7 @@ impl Default for Data {
             sections: vec![],
             subscribed: false,
             subscription_checked: false,
+            subscribed_run: None,
             runtime: None,
         }
     }

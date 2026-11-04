@@ -238,7 +238,8 @@ impl App {
                 };
                 p.scroll = 0;
                 if p.kind != Block::Workflow { p.task_id = None; }
-                p.data = crate::blocks::Data::default();
+                if p.kind == Block::Run { p.data.stale = true; }
+                else { p.data = crate::blocks::Data::default(); }
                 self.blocks.revision += 1;
             }
             'b' if self.blocks.active == Block::Task => {
