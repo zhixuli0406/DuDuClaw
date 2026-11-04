@@ -4,7 +4,7 @@
 
 需要原生 Linux 受保護服務、systemd、GNU coreutils（含 `sort -V`）、curl、grep、sed、tr，以及既有升級流程需要的工具。固定路徑與 URL 不接受環境變數覆寫。03:30 採當地時間，最多延遲 20 分鐘；早上開機不補跑。
 
-此目錄在 v1.79.3 之後的原始碼才加入，目前尚無已發布標籤包含它；發行 tarball 也不含 `scripts/`。第一個包含此目錄的版本發布前，請從固定的完整 commit SHA（`<commit>`，合併後填入）取得並審閱，不要使用會移動的 `main`。它只呼叫既有的 `service upgrade --protected-linux --version`，可搭配 v1.79.3 受保護安裝。
+此目錄在 v1.79.3 之後的原始碼才加入，目前尚無已發布標籤包含它；發行 tarball 也不含 `scripts/`。第一個包含此目錄的版本發布前，請從固定的完整 commit SHA（下方以 `<commit>` 表示，請換成你審閱過的那一筆）取得並審閱，不要使用會移動的 `main`。它只呼叫既有的 `service upgrade --protected-linux --version`，可搭配 v1.79.3 受保護安裝。
 
 審閱 `install.sh`、`duduclaw-auto-upgrade`、`.service`、`.timer` 後，將整個目錄複製到 `/root/duduclaw-auto-upgrade` 等只有 root 可寫入的位置，並確認檔案與所有上層目錄權限。不要從使用者可寫入目錄以 root 執行腳本。檔案可能在審閱後、複製前被替換，請再核對 root 副本；安裝程式會拒絕來源目錄與四個腳本／unit 檔案的符號連結、非一般檔案、非 root:root 擁有或群組／其他人可寫入的項目，也會檢查解析後目錄至 `/` 的每一層祖先；即使有 sticky bit 的 `/tmp` 也不接受。通過後，先複製至 `/run` 下的 root 專用 0700 暫存目錄，再檢查副本為一般檔案且大小為 1 byte 至 1 MiB，最後從副本安裝並清理暫存。這些權限檢查無法證明程式碼出處；仍須核對固定 commit，改成 root 所有不代表已驗證內容。
 

@@ -85,7 +85,7 @@ sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
 
 ## 自動升級（選用）
 
-`scripts/linux-protected/auto-upgrade/` 在 v1.79.3 之後的原始碼才加入，目前尚無已發布標籤包含它。第一個包含它的版本發布前，請從固定的完整 commit SHA（`<commit>`，合併後填入）取得並審閱，不要使用會移動的 `main`（[原始碼位置](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）；Linux 發行封存檔也不含 `scripts/`。它只呼叫既有的 `service upgrade --protected-linux --version`，因此可搭配 v1.79.3 受保護安裝。
+`scripts/linux-protected/auto-upgrade/` 在 v1.79.3 之後的原始碼才加入，目前尚無已發布標籤包含它。第一個包含它的版本發布前，請從固定的完整 commit SHA（下方以 `<commit>` 表示，請換成你審閱過的那一筆）取得並審閱，不要使用會移動的 `main`（[原始碼位置](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）；Linux 發行封存檔也不含 `scripts/`。它只呼叫既有的 `service upgrade --protected-linux --version`，因此可搭配 v1.79.3 受保護安裝。
 
 排程每天當地時間 03:30 執行，最多隨機延遲 20 分鐘，早上開機不補跑。較新的官方版本經既有流程驗簽安裝後，會重啟原本執行中的 gateway，請避開工作時段。未安裝排程則維持手動升級；儀表板在 v1.80.0 前仍顯示手動指令。
 
