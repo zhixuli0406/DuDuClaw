@@ -26,7 +26,13 @@ reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 futures-util = { workspace = true }
 urlencoding = "2"
 regex-lite = "0.1"
+ferrous-opencc = { version = "=0.4.0", default-features = false, features = ["s2t-conversion"] }
+tempfile = "3"
+libc = "0.2"
 zeroize = "1"
+base64 = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
 ucci = { git = "https://github.com/varunkotte6/ucci", rev = "80cd2319cc2b41e3a5c35a64acd6b5dcbf5c217b" }
 
 # ONNX Runtime for Embedding (prediction engine semantic similarity)

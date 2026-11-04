@@ -196,6 +196,6 @@ mod tests {
     #[test]
     fn added_indices_follow_the_new_text() {
         let idx = added_line_indices("a\nb\nc\n", "a\nx\nb\nc\ny\n");
-        assert_eq!(idx, [1usize, 4].into_iter().collect());
+        assert_eq!(idx, [1usize, 4].into_iter().collect::<std::collections::HashSet<_>>());
     }
 }

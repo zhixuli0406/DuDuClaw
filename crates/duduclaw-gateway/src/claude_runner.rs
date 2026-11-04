@@ -1911,7 +1911,10 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
             &mcp_client_envs_in(agent_id, &home_dir),
             duduclaw_llm::DEFAULT_MCP_TIMEOUT,
         )
-        .await
+        .await.map(|mut client| {
+            client.enable_builtin_tool_timeouts();
+            client
+        })
     };
     let internal = match connect_internal().await {
         Ok(c) => c,

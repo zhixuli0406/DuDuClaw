@@ -27,27 +27,47 @@ struct Wrapped {
 pub struct ContainerRootStore {
     directory: PathBuf,
     account: String,
-    wrapping_key: Zeroizing<[u8; 32]>,
+    #[cfg(test)]
+    wrapping_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl ContainerRootStore {
-    /// Derive an account-specific key immediately; do not retain a root copy.
+    /// Production stores retain no root or derived wrapping key. Each operation
+    /// borrows the current root under its revocation lock.
+    pub fn attested(home: &Path) -> Self {
+        Self { directory: home.join("protected"), account: super::marker::account_for_home(home),
+            #[cfg(test)] wrapping_key: None }
+    }
+
+    #[cfg(test)]
     pub fn new(home: &Path, root: &[u8; 32]) -> Self {
-        let account = super::marker::account_for_home(home);
+        let mut store = Self::attested(home);
+        store.wrapping_key = Some(store.derive(root));
+        store
+    }
+
+    fn derive(&self, root: &[u8; 32]) -> Zeroizing<[u8; 32]> {
         let mut context = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, root));
         context.update(b"duduclaw/protected-key-wrap/v1\0");
-        context.update(account.as_bytes());
+        context.update(self.account.as_bytes());
         let tag = context.sign();
         let mut wrapping_key = Zeroizing::new([0; 32]);
         wrapping_key.copy_from_slice(tag.as_ref());
-        Self { directory: home.join("protected"), account, wrapping_key }
+        wrapping_key
+    }
+
+    fn with_wrapping<T>(&self, f: impl FnOnce(&[u8; 32]) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        #[cfg(test)]
+        if let Some(key) = &self.wrapping_key { return f(key); }
+        duduclaw_core::root_key::with_key(|root| f(&self.derive(root)))
+            .unwrap_or_else(|| Err(StoreError::Unavailable(
+                duduclaw_core::root_key::refused_reason().unwrap_or("inactive").into())))
     }
 
     fn wrap(&self, account: &str, key: &[u8]) -> Result<Vec<u8>, StoreError> {
         if account != self.account || key.len() != 32 { return Err(StoreError::Tampered); }
-        let cipher = CryptoEngine::new(&self.wrapping_key)
-            .and_then(|engine| engine.encrypt(key))
-            .map_err(|_| unavailable())?;
+        let cipher = self.with_wrapping(|wrapping_key| CryptoEngine::new(wrapping_key)
+            .and_then(|engine| engine.encrypt(key)).map_err(|_| unavailable()))?;
         serde_json::to_vec(&Wrapped { version: 1, account: account.into(), ciphertext: BASE64.encode(cipher) })
             .map_err(|_| unavailable())
     }
@@ -57,8 +77,8 @@ impl ContainerRootStore {
         let blob: Wrapped = serde_json::from_slice(bytes).map_err(|_| StoreError::Tampered)?;
         if blob.version != 1 || blob.account != account { return Err(StoreError::Tampered); }
         let cipher = BASE64.decode(blob.ciphertext).map_err(|_| StoreError::Tampered)?;
-        let key = Zeroizing::new(CryptoEngine::new(&self.wrapping_key)
-            .and_then(|engine| engine.decrypt(&cipher)).map_err(|_| StoreError::Tampered)?);
+        let key = Zeroizing::new(self.with_wrapping(|wrapping_key| CryptoEngine::new(wrapping_key)
+            .and_then(|engine| engine.decrypt(&cipher)).map_err(|_| StoreError::Tampered))?);
         if key.len() != 32 { return Err(StoreError::Tampered); }
         Ok(key)
     }
@@ -71,7 +91,13 @@ fn unavailable() -> StoreError {
 impl KeyStore for ContainerRootStore {
     fn backend(&self) -> BackendKind { BackendKind::ContainerRootKey }
     fn level(&self) -> ProtectionLevel { ProtectionLevel::ProcessIsolated }
+    fn refusal_reason(&self) -> Option<&'static str> {
+        #[cfg(test)]
+        if self.wrapping_key.is_some() { return None; }
+        duduclaw_core::root_key::refused_reason()
+    }
     fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        if let Some(reason) = self.refusal_reason() { return Err(StoreError::Unavailable(reason.into())); }
         #[cfg(unix)]
         return self.unwrap(account, &file::read(&self.directory)?);
         #[cfg(not(unix))]

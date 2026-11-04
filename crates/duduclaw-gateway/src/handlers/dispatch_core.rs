@@ -473,6 +473,26 @@ impl MethodHandler {
             // layer, two front doors. Admin-only, matching every other
             // `channels.*` method (these are security-relevant settings:
             // `admin_users` decides who can press `!STOP` in-channel).
+            "channels.group_context_list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_channels_group_context_list(params)).await
+            }
+            "channels.group_context_set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_channels_group_context_set(params, ctx)).await
+            }
+            "channels.group_context_remove" => {
+                require_admin!();
+                boxed_frame(|| self.handle_channels_group_context_remove(params, ctx)).await
+            }
+            "channels.discord_agent_choices_get" => {
+                require_admin!();
+                boxed_frame(|| self.handle_channels_discord_agent_choices_get(params)).await
+            }
+            "channels.discord_agent_choices_set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_channels_discord_agent_choices_set(params, ctx)).await
+            }
             "channels.config_get" => {
                 require_admin!();
                 boxed_frame(|| self.handle_channels_config_get(params)).await

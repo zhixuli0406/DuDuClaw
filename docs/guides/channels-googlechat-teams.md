@@ -132,3 +132,7 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 | Google Chat | Chat markup (`*bold*`, `<url\|text>`) | monospace fence | placeholder + edit-in-place |
 | MS Teams | markdown activity | monospace fence | `typing` activity every 3 s |
 | WebChat | raw markdown (dashboard renders) | native | `progress` WS events |
+
+## Group context setup
+
+To retain ordinary group discussion, an Admin must enable each group in Channels → Group settings. Telegram bots need BotFather `/setprivacy` disabled (or appropriate bot-admin delivery). Slack apps need `message.channels` / `message.groups` events and `channels:history` / `groups:history` scopes, followed by reinstalling the app and inviting it to the channel. Discord needs MESSAGE CONTENT INTENT. Google Chat and Teams may only include messages that mention the app; Teams full channel delivery requires RSC such as `ChannelMessage.Read.Group`. See [group context](../features/72-group-context.md) for retention, employee authorization and platform limitations. Real platform delivery remains unverified for this change.

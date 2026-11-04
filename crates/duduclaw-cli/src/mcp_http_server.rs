@@ -425,7 +425,9 @@ async fn call_handler(
 
         // Dispatch with timeout
         let jsonrpc = match tokio::time::timeout(
-            state.call_timeout,
+            duduclaw_core::tool_catalog::builtin_mcp_call_timeout(
+                params.get("name").and_then(Value::as_str).unwrap_or(""), state.call_timeout,
+            ),
             state
                 .dispatcher
                 .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
@@ -436,7 +438,7 @@ async fn call_handler(
             Err(_) => crate::mcp_dispatch::jsonrpc_error(
                 &id,
                 -32603,
-                "Request timed out (30s limit exceeded)",
+                "Request timed out",
             ),
         };
 
@@ -760,7 +762,9 @@ async fn stream_call_handler(
 
         // Dispatch tool call
         let jsonrpc = tokio::time::timeout(
-            state.call_timeout,
+            duduclaw_core::tool_catalog::builtin_mcp_call_timeout(
+                params.get("name").and_then(Value::as_str).unwrap_or(""), state.call_timeout,
+            ),
             state
                 .dispatcher
                 .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
@@ -770,7 +774,7 @@ async fn stream_call_handler(
             crate::mcp_dispatch::jsonrpc_error(
                 &id,
                 -32603,
-                "Request timed out (30s limit exceeded)",
+                "Request timed out",
             )
         });
 

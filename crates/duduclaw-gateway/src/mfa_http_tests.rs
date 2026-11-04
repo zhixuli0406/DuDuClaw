@@ -8,22 +8,36 @@ async fn fixture(
     personal: bool,
     enforce: bool,
 ) -> (tempfile::TempDir, Arc<AppState>, duduclaw_auth::User) {
+    fixture_policy(personal, Some(enforce)).await
+}
+
+async fn fixture_policy(
+    personal: bool,
+    policy: Option<bool>,
+) -> (tempfile::TempDir, Arc<AppState>, duduclaw_auth::User) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
-    std::fs::write(
-        home.join("config.toml"),
-        format!("[auth]\nmfa_enforced={enforce}\n"),
-    )
-    .unwrap();
+    if let Some(enforce) = policy {
+        std::fs::write(home.join("config.toml"), format!("[auth]\nmfa_enforced={enforce}\n")).unwrap();
+    } else {
+        crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+            &home, "127.0.0.1:18789".parse().unwrap(), personal, None,
+        ).unwrap();
+    }
     let db = Arc::new(UserDb::new(&home.join("users.db")).unwrap());
-    let user = db
+    let mut user = if policy.is_none() {
+        db.ensure_default_admin().unwrap().unwrap();
+        db.get_bootstrap_owner().unwrap().unwrap()
+    } else {
+        db
         .create_user(
             &format!("mfa-{}@example.test", uuid::Uuid::new_v4()),
             "MFA",
             "correct horse battery",
             UserRole::Admin,
         )
-        .unwrap();
+        .unwrap()
+    };
     let jwt = Arc::new(JwtConfig::new(b"mfa-http-test-secret-at-least-32-bytes"));
     let handler = MethodHandler::new(home.clone()).await;
     handler.set_user_db(db.clone(), jwt.clone()).await;
@@ -50,6 +64,16 @@ async fn fixture(
         )),
         home_dir: home,
     });
+    if policy.is_none() {
+        let response = handle_first_run_claim(State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12000))),
+            Json(FirstRunClaimRequest {
+                email: Some("first-admin@example.test".into()),
+                password: "correct horse battery".into(),
+            })).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        user = state.user_db.get_bootstrap_owner().unwrap().unwrap();
+    }
     (dir, state, user)
 }
 fn peer(n: u8) -> SocketAddr {
@@ -809,5 +833,75 @@ async fn mfa_policy_rpc_db_failure_obeys_commit_order() {
         } else {
             assert_eq!(disk, original);
         }
+    }
+}
+
+#[tokio::test]
+async fn mfa_fresh_admin_enrolls_with_host_proof_and_can_disable_enforcement() {
+    let (_dir, state, user) = fixture_policy(false, None).await;
+    assert!(enforced(&state.home_dir, false).unwrap());
+    assert!(!legacy_token_allowed(&state).await);
+    let (status, challenge) = body(handle_login(State(state.clone()), ConnectInfo(peer(211)),
+        Json(LoginRequest { email: user.email.clone(), password: "correct horse battery".into() }))
+        .await.into_response()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(challenge["mfa_enrollment_required"], true);
+    assert!(challenge.get("access_token").is_none());
+    let token = challenge["enrollment_token"].as_str().unwrap().to_string();
+    assert_eq!(enroll_begin(State(state.clone()), ConnectInfo(peer(211)), Json(EnrollBody {
+        enrollment_token: token.clone(), code: None, proof_code: None, password: None,
+    })).await.status(), StatusCode::UNAUTHORIZED);
+    let proof = state.user_db.mfa_issue_enrollment_code(None, &user.id,
+        challenge["challenge_ref"].as_str().unwrap(), chrono::Utc::now().timestamp()).unwrap();
+    let (status, start) = body(enroll_begin(State(state.clone()), ConnectInfo(peer(211)), Json(EnrollBody {
+        enrollment_token: token.clone(), code: None, proof_code: Some(proof), password: None,
+    })).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, done) = body(enroll_confirm(State(state.clone()), ConnectInfo(peer(211)), Json(EnrollBody {
+        enrollment_token: token, code: Some(totp(start["secret"].as_str().unwrap())), proof_code: None, password: None,
+    })).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(done["recovery_codes"].as_array().unwrap().len(), 10);
+    let ctx = authenticate_jwt(&state, done["access_token"].as_str().unwrap()).unwrap();
+    assert!(state.user_db.mfa_active(&user.id).unwrap());
+    let response = state.handler.handle("system.update_config",
+        json!({"auth.mfa_enforced":false,"expected_state":true}), &ctx).await;
+    assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+    crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+        &state.home_dir, "127.0.0.1:18789".parse().unwrap(), false, None,
+    ).unwrap();
+    crate::mfa::reload_policy(&state.home_dir);
+    assert!(!enforced(&state.home_dir, false).unwrap());
+    let conn = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+    assert!(!conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, bool>(0)).unwrap());
+    assert_eq!(std::fs::read_to_string(state.home_dir.join("config.toml")).unwrap()
+        .parse::<toml::Table>().unwrap()["auth"]["mfa_enforced"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn mfa_personal_strict_restore_config_keeps_local_auto_login_personal_only() {
+    for personal in [true, false] {
+        let (_dir, state, user) = fixture_policy(personal, None).await;
+        // An empty-home restore writes true even for Personal.
+        std::fs::write(state.home_dir.join("config.toml"),
+            "[auth]\nmfa_enforced=true\n[dashboard]\nlocal_auto_login=true\n").unwrap();
+        crate::mfa::reload_policy(&state.home_dir);
+        assert_eq!(enforced(&state.home_dir, personal).unwrap(), !personal);
+        assert_eq!(legacy_token_allowed(&state).await, personal);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-duduclaw-local", "1".parse().unwrap());
+        headers.insert("origin", "http://127.0.0.1:18789".parse().unwrap());
+        let local = SocketAddr::from(([127, 0, 0, 1], 12000));
+        let (status, payload) = body(handle_local_session(State(state.clone()),
+            ConnectInfo(local), headers.clone()).await.into_response()).await;
+        assert_eq!(status, if personal { StatusCode::OK } else { StatusCode::FORBIDDEN });
+        if personal {
+            let ctx = authenticate_jwt(&state, payload["access_token"].as_str().unwrap()).unwrap();
+            assert_eq!(ctx.user_id, user.id);
+        }
+        std::fs::write(state.home_dir.join("config.toml"),
+            "[auth]\nmfa_enforced=true\n[dashboard]\nlocal_auto_login=false\n").unwrap();
+        assert_eq!(handle_local_session(State(state.clone()), ConnectInfo(local), headers)
+            .await.into_response().status(), StatusCode::FORBIDDEN);
     }
 }

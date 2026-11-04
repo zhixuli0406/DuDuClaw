@@ -337,7 +337,7 @@ fn state_messages_describe_the_actual_backend() {
         assert!(!detail.contains("docker_socket"));
         match state {
             ProtectionState::NotEnabled => assert!(detail.contains("「安全」頁")),
-            ProtectionState::KeyChanged => assert!(detail.contains("金鑰磁碟區遺失或被更換")),
+            ProtectionState::KeyChanged => assert!(detail.contains("根金鑰遺失或被更換")),
             ProtectionState::Unavailable => assert!(detail.contains("Docker 控制介面")),
             _ => (),
         }
@@ -348,12 +348,12 @@ fn state_messages_describe_the_actual_backend() {
     }
     let (summary, detail) = messages::state_text(ProtectionState::Ready, ProtectionLevel::ProcessIsolated, BackendKind::ContainerRootKey, "");
     assert!(summary.contains("獨立金鑰（AI 員工讀不到）"));
-    for limit in ["啟動步驟（root）", "Google", "存取權杖", "停止運作", "Docker 主機", "金鑰磁碟區"] {
+    for limit in ["啟動步驟（root）", "Google", "存取權杖", "停止運作", "Docker 主機", "根金鑰儲存位置"] {
         assert!(detail.contains(limit), "missing truthful limitation: {limit}");
     }
     let (_, detail) = messages::state_text(ProtectionState::Unsupported, ProtectionLevel::File, BackendKind::None, "");
-    for text in ["一般 Docker 或 Linux", "部署指南", "原生 Linux 尚未支援", "儀表板"] {
-        assert!(detail.contains(text));
+    for text in ["一般 Docker 或 Linux", "部署指南", "先驗證發行檔", "root 管理的位置安裝", "儀表板"] {
+        assert!(detail.contains(text), "missing installation guidance: {text}");
     }
 }
 
@@ -362,7 +362,8 @@ fn every_root_refusal_has_plain_chinese_text() {
     for code in ["inactive", "fd_contract", "fd_stat", "fd_type", "fd_owner", "fd_mode",
         "fd_links", "fd_size", "fd_read", "not_pid_one", "user_ids", "group_ids", "proc_status",
         "no_new_privs", "cap_inh", "cap_prm", "cap_eff", "cap_bnd", "cap_amb", "dumpable",
-        "key_path_accessible", "docker_socket", "docker_host"] {
+        "key_path_accessible", "docker_socket", "docker_host",
+        "mode", "not_systemd_child", "cgroup_v1", "cgroup_unit", "exe_stat", "exe_type", "exe_owner", "exe_writable", "exe_ancestor_type", "exe_ancestor_owner", "exe_ancestor_writable", "supplementary_groups", "engine_socket_reachable", "engine_socket", "mount_scan_incomplete"] {
         let text = messages::refusal_text(code).unwrap();
         assert!(!text.is_ascii());
         assert!(!text.contains(code));

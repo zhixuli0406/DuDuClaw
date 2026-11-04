@@ -700,6 +700,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "bytecheck"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26333eeac754f0ad8a6bcd0eb0ac012156302e4e16b852b72ee399aea4f12c29"
+dependencies = [
+ "bytecheck_derive",
+ "ptr_meta",
+ "rancor",
+ "simdutf8",
+]
+
+[[package]]
+name = "bytecheck_derive"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46d07918caa9eeaaf06b7873925c53a61daac173539b4f7715090745e44e4e69"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "bytecount"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1740,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1765,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-auth"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1788,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1853,16 +1876,18 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
  "zip",
 ]
 
 [[package]]
 name = "duduclaw-cli-runtime"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "duduclaw-core",
  "parking_lot",
@@ -1874,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "bollard",
@@ -1889,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1903,6 +1928,7 @@ dependencies = [
  "libc",
  "minisign-verify",
  "percent-encoding",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1920,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "axum",
  "mime_guess",
@@ -1929,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-db"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "base64 0.22.1",
  "duduclaw-core",
@@ -1947,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-desktop"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1959,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-fork"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1980,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "aes",
  "ammonia",
@@ -2079,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-identity"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2095,20 +2121,25 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-inference"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "duduclaw-core",
  "duduclaw-llm",
  "duduclaw-security",
+ "ferrous-opencc",
  "futures-util",
+ "hex",
+ "libc",
  "ndarray",
  "ort",
  "regex-lite",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers",
@@ -2124,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-knowledge"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "calamine",
  "chrono",
@@ -2159,7 +2190,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-license"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2179,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-llm"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "duduclaw-core",
@@ -2200,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-maint-tools"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2211,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2241,7 +2272,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-odoo"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2260,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-onnx"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "duduclaw-core",
  "flate2",
@@ -2279,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-os"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "duduclaw-core",
  "notify-debouncer-mini",
@@ -2293,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-pets"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2312,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-redaction"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2345,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-relay"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2368,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-sandbox"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "duduclaw-core",
  "landlock",
@@ -2380,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2407,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-sysd"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2428,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-tui"
-version = "1.79.1"
+version = "1.79.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2708,6 +2739,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrous-opencc"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07be899468d0b66213a7fc459fc6ac32db79e397892792e73c8526e8863c7078"
+dependencies = [
+ "anyhow",
+ "ferrous-opencc-compiler",
+ "fst",
+ "phf 0.13.1",
+ "phf_codegen 0.13.1",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ferrous-opencc-compiler"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca6f187e97dbb37fe1e0f047cd74bc6c2f0ac316de56f1b4d691e9154686d5a2"
+dependencies = [
+ "anyhow",
+ "fst",
+ "rkyv",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2877,6 +2937,12 @@ checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "fst"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ab85b9b05e3978cc9a9cf8fea7f01b494e1a09ed3037e16ba39edc7a29eb61a"
 
 [[package]]
 name = "futf"
@@ -4441,6 +4507,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "munge"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e17401f259eba956ca16491461b6e8f72913a0a114e39736ce404410f915a0c"
+dependencies = [
+ "munge_macro",
+]
+
+[[package]]
+name = "munge_macro"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4568f25ccbd45ab5d5603dc34318c1ec56b117531781260002151b8530a9f931"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "mutate_once"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5142,7 +5228,7 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
 dependencies = [
- "phf_macros",
+ "phf_macros 0.11.3",
  "phf_shared 0.11.3",
 ]
 
@@ -5161,6 +5247,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
 dependencies = [
+ "phf_macros 0.13.1",
  "phf_shared 0.13.1",
  "serde",
 ]
@@ -5213,6 +5300,19 @@ checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
 dependencies = [
  "phf_generator 0.11.3",
  "phf_shared 0.11.3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
+dependencies = [
+ "phf_generator 0.13.1",
+ "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5549,6 +5649,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptr_meta"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743da816b98c921cdbe8628ef7381b76f25ecf4da599fc80aca90eae7ef70cc0"
+dependencies = [
+ "ptr_meta_derive",
+]
+
+[[package]]
+name = "ptr_meta_derive"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c8d9ca532f185d5d4db7a7c9d51420b452168ea1c2b913953281bd6fe1fcbd0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5652,6 +5772,15 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rancor"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b534442d0fcdb55d66f373d9cac6d33b6293a2335bc2136dbd06ce0e87d2572"
+dependencies = [
+ "ptr_meta",
+]
 
 [[package]]
 name = "rand"
@@ -5950,6 +6079,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "rend"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "663ba70707f96e871406fe10d68128412e619b06d1d47cb91c3a4c6501176240"
+dependencies = [
+ "bytecheck",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6021,6 +6159,36 @@ dependencies = [
  "crossbeam-utils",
  "portable-atomic",
  "portable-atomic-util",
+]
+
+[[package]]
+name = "rkyv"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9776093b7ca170454ab1406954f7b7d97a57c51dc6c0642957fb2ef25c2d399"
+dependencies = [
+ "bytecheck",
+ "bytes",
+ "hashbrown 0.17.0",
+ "indexmap 2.14.0",
+ "munge",
+ "ptr_meta",
+ "rancor",
+ "rend",
+ "rkyv_derive",
+ "tinyvec",
+ "uuid",
+]
+
+[[package]]
+name = "rkyv_derive"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c25ef604ac7dd839d44d64648952ea23c97866f124ff671b0ed2cf3ad9bb06e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]

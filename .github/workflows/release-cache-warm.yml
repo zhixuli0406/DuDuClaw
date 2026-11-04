@@ -76,12 +76,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
-          shared-key: release-${{ matrix.target }}
+          shared-key: release-cross-glibc231-${{ matrix.target }}
           workspaces: . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cross (aarch64-linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install cross (Linux)
+        if: runner.os == 'Linux'
         uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b  # v2
         with:
           tool: cross
@@ -90,7 +90,7 @@ jobs:
         run: cd web && npm ci --legacy-peer-deps && npm run build
 
       - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
@@ -99,9 +99,9 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
 
-      - name: Build binary (Linux x64 — no desktop, uses L5a container mode)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
+      - name: Check Linux glibc baseline
+        if: runner.os == 'Linux'
+        run: python3 scripts/check_glibc.py target/${{ matrix.target }}/release/duduclaw
 
   desktop-release:
     needs: decide
@@ -157,13 +157,28 @@ jobs:
           cargo install tauri-cli --version "=2.12.4" --locked
           cd src-tauri && cargo tauri icon icons/source/duduclaw-1024.png
 
+      # Keep the shipped CLI sidecar on the same baseline as the CLI release.
+      - name: Install cross for Linux sidecar
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b
+        with:
+          tool: cross
+
       - name: Build & stage gateway sidecar
         shell: bash
         run: |
-          cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+          SIDECAR_TARGET_DIR=target
+          if [[ "${{ runner.os }}" == Linux ]]; then
+            # Never reuse native desktop host build scripts inside the older cross image.
+            SIDECAR_TARGET_DIR=target/linux-sidecar
+            CARGO_TARGET_DIR="$SIDECAR_TARGET_DIR" PKG_CONFIG_ALLOW_CROSS=1 cross build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }} --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+            python3 scripts/check_glibc.py "$SIDECAR_TARGET_DIR/${{ matrix.target }}/release/duduclaw"
+          else
+            cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+          fi
           mkdir -p src-tauri/binaries
           EXT=""; [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"
-          cp "target/${{ matrix.target }}/release/duduclaw${EXT}" \
+          cp "$SIDECAR_TARGET_DIR/${{ matrix.target }}/release/duduclaw${EXT}" \
              "src-tauri/binaries/duduclaw-${{ matrix.target }}${EXT}"
 
       # Tauri uses the same release profile and custom-protocol feature as its

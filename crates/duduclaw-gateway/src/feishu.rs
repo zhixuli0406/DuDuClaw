@@ -350,6 +350,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     // chats with `chat_type = "group"` and lists @-mentions in `mentions`
     // (the bot's own mention is not singled out, so any mention counts).
     let is_group = message.get("chat_type").and_then(|v| v.as_str()) == Some("group");
+    let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, is_group, "feishu", "global", chat_id, None, msg_id, sender, sender, if raw_text.is_empty() { "[附件]" } else { &raw_text }).await;
     let mentioned = message
         .get("mentions")
         .and_then(|v| v.as_array())
@@ -491,14 +492,14 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         None,
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = thinking
+    let guarded = group_turn.scope(thinking
         .scope(build_guarded_reply_with_session(
             &input_text,
             &state.ctx,
             &session_id,
             crate::ccr_runtime::reply_principal_for_sender(sender),
             Some(on_progress),
-        ))
+        )))
         .await;
     let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
@@ -558,6 +559,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     // natively). Oversized or rejected cards fall back to plain text.
     // Reply to the original message so the sender gets a threaded
     // notification when possible.
+    let delivery = group_turn.delivery(&state.ctx, guarded.answered_by.as_ref(), None);
     let sent_as_card = if reply.len() <= FEISHU_CARD_BYTE_CAP {
         let card = build_feishu_card(&reply).to_string();
         if !guarded.still_valid().await {
@@ -570,9 +572,9 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
             return;
         }
         if !msg_id.is_empty() {
-            send_feishu_payload(state, FeishuTarget::Reply(msg_id), "interactive", &card).await
+            delivery.scope(send_feishu_payload(state, FeishuTarget::Reply(msg_id), "interactive", &card)).await
         } else {
-            send_feishu_payload(state, FeishuTarget::Chat(chat_id), "interactive", &card).await
+            delivery.scope(send_feishu_payload(state, FeishuTarget::Chat(chat_id), "interactive", &card)).await
         }
     } else {
         false
@@ -588,11 +590,9 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
             .await;
             return;
         }
-        if !msg_id.is_empty() {
-            reply_message(state, msg_id, &reply).await;
-        } else {
-            send_message(state, chat_id, &reply).await;
-        }
+        let target = if !msg_id.is_empty() { FeishuTarget::Reply(msg_id) } else { FeishuTarget::Chat(chat_id) };
+        let content = serde_json::json!({ "text": &reply }).to_string();
+        delivery.scope(send_feishu_payload(state, target, "text", &content)).await;
     }
 }
 
@@ -663,8 +663,13 @@ async fn send_feishu_payload(
         Ok(resp) if resp.status().is_success() => {
             // Feishu wraps errors in 200 bodies with a non-zero `code`.
             match resp.json::<serde_json::Value>().await {
-                Ok(v) => v.get("code").and_then(|c| c.as_i64()).unwrap_or(0) == 0,
-                Err(_) => true,
+                Ok(v) if v.get("code").and_then(|c| c.as_i64()) == Some(0) => {
+                    let text = serde_json::from_str::<serde_json::Value>(content).ok()
+                        .map(|value| crate::channel_reply::group_buffer::payload_text(&value)).unwrap_or_else(|| "[附件]".into());
+                    crate::channel_reply::group_buffer::delivered(&text, v.pointer("/data/message_id").and_then(|id| id.as_str())).await;
+                    true
+                }
+                _ => false,
             }
         }
         Ok(resp) => {

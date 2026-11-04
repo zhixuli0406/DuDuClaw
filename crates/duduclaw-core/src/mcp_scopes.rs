@@ -28,6 +28,7 @@ pub const MCP_SCOPE_STRINGS: &[&str] = &[
     "wiki:read",
     "wiki:write",
     "messaging:send",
+    "messaging:read",
     "identity:read",
     "odoo:read",
     "odoo:write",
@@ -69,8 +70,8 @@ mod tests {
     /// alongside the bidirectional test in `duduclaw-cli/src/mcp_auth.rs` —
     /// two independent trip-wires on the same drift.
     #[test]
-    fn scope_list_has_28_entries() {
-        assert_eq!(MCP_SCOPE_STRINGS.len(), 28);
+    fn scope_list_has_29_entries() {
+        assert_eq!(MCP_SCOPE_STRINGS.len(), 29);
     }
 
     #[test]

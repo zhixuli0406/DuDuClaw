@@ -187,6 +187,7 @@ enabled=false
                 .await
                 .unwrap();
         }
+        ctx.channel_settings.set("discord", "G1", keys::DISCORD_AGENT_CHOICES, r#"["worker"]"#).await.unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let typing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let success_reply = Arc::new(Mutex::new(None));
@@ -355,8 +356,8 @@ async fn real_normal_handler_perbot_priority_keeps_worker_for_chat_and_developme
     }
 }
 #[tokio::test(flavor = "current_thread")]
-async fn real_normal_handler_guild_empty_scope_and_dm_share_global_fallback() {
-    for mode in ["guild", "empty", "dm", "dm_scope"] {
+async fn real_normal_handler_guild_and_global_override_require_guild_choices() {
+    for mode in ["guild", "empty"] {
         for text in ["普通訊息", "直接開始開發"] {
             let f = Fixture::new().await;
             f.select(
@@ -379,8 +380,8 @@ async fn real_normal_handler_guild_empty_scope_and_dm_share_global_fallback() {
     }
 }
 #[tokio::test(flavor = "current_thread")]
-async fn real_text_model_command_uses_perbot_guild_global_and_original_channel_binding() {
-    for mode in ["bot", "guild", "global", "dm_global", "binding"] {
+async fn real_text_model_command_uses_perbot_allowed_guild_global_and_original_binding() {
+    for mode in ["bot", "guild", "global", "binding"] {
         let f = Fixture::new().await;
         if mode == "bot" {
             f.select("G1", "main").await;
@@ -420,8 +421,8 @@ async fn real_text_model_command_uses_perbot_guild_global_and_original_channel_b
     }
 }
 #[tokio::test(flavor = "current_thread")]
-async fn real_interaction_ask_preserves_bot_binding_and_guild_or_dm_global() {
-    for mode in ["bot", "guild", "global", "dm", "dm_scope"] {
+async fn real_interaction_ask_preserves_bot_binding_and_allowed_guild_override() {
+    for mode in ["bot", "guild", "global"] {
         let f = Fixture::new().await;
         f.select(
             "global",
@@ -451,8 +452,8 @@ async fn real_interaction_ask_preserves_bot_binding_and_guild_or_dm_global() {
     }
 }
 #[tokio::test(flavor = "current_thread")]
-async fn real_handlers_refuse_stale_explicit_targets_without_main_or_global_reselection() {
-    for source in ["bot", "guild", "global"] {
+async fn real_handlers_refuse_stale_perbot_targets_without_main_or_global_reselection() {
+    for source in ["bot"] {
         for entry in ["normal", "model", "ask"] {
             let f = Fixture::new().await;
             f.select(
@@ -847,4 +848,66 @@ async fn real_bound_worker_delivery_archives_and_sends_worker_multipart_never_ma
         assert_eq!(std::fs::read(&main_file).unwrap(), main_bytes);
         assert_eq!(std::fs::read(&worker_file).unwrap(), worker_bytes);
     }
+}
+
+
+#[tokio::test(flavor = "current_thread")]
+async fn discord_overrides_require_current_non_main_guild_choices() {
+    let f = Fixture::new().await;
+    f.select("G1", "worker").await;
+    assert_eq!(agent_selection::explicit_agent(&f.ctx, None, "G1").await.unwrap().as_deref(), Some("worker"));
+    // A dashboard revocation is observed despite an already populated cache.
+    let settings = crate::channel_settings::ChannelSettingsManager::from_session_db(&f.ctx.home_dir.join("sessions.db")).unwrap();
+    settings.set("discord", "G1", keys::DISCORD_AGENT_CHOICES, "[]").await.unwrap();
+    assert_eq!(agent_selection::explicit_agent(&f.ctx, None, "G1").await, Ok(None));
+    assert!(agent_selection::allowed_choices(&f.ctx, "G1").await.is_empty());
+    settings.set("discord", "G1", keys::DISCORD_AGENT_CHOICES, r#"["main","worker"]"#).await.unwrap();
+    f.select("G1", "main").await;
+    assert_eq!(agent_selection::explicit_agent(&f.ctx, None, "G1").await, Ok(None));
+    assert_eq!(agent_selection::allowed_choices(&f.ctx, "G1").await, vec!["worker"]);
+    f.select("G1", "missing").await;
+    assert_eq!(agent_selection::explicit_agent(&f.ctx, None, "G1").await, Ok(None));
+    f.select("dm", "worker").await;
+    f.select("global", "worker").await;
+    assert_eq!(agent_selection::explicit_agent(&f.ctx, None, "").await, Ok(None));
+    // Dedicated per-employee bot routing stays independent of /agent choices.
+    assert_eq!(agent_selection::explicit_agent(&f.ctx, Some("worker"), "G1").await.unwrap().as_deref(), Some("worker"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn discord_manage_guild_alone_cannot_select_any_employee() {
+    for control in ["agent", "agent_select"] {
+        let f = Fixture::new().await;
+        f.ctx.channel_settings.set("discord", "G1", keys::DISCORD_AGENT_CHOICES, "[]").await.unwrap();
+        let data = json!({"type":if control == "agent" {2} else {3},"id":"control","token":f.token,"guild_id":"G1","channel_id":"C1","member":{"user":{"id":"H1"},"permissions":"32"},"data":if control == "agent" {json!({"name":"agent","options":[{"name":"name","value":"worker"}]})} else {json!({"custom_id":"duduclaw:agent_select","values":["worker"]})}});
+        Box::pin(handle_interaction(&data, "BOT", "A1", &reqwest::Client::new(), &f.token, &f.ctx, None)).await;
+        assert_eq!(f.ctx.channel_settings.get("discord", "G1", keys::AGENT_OVERRIDE).await, None);
+        f.no_model_or_cloud();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn group_context_discord_keeps_accepted_chunk_on_later_failure() {
+    let f = Fixture::new().await;
+    crate::group_context::set(&f.ctx.home_dir, &crate::group_context::GroupConfig {
+        channel:"discord".into(), group_id:"C1".into(), scope_id:"G1".into(), max_messages:50, max_age_hours:24,
+    }).unwrap();
+    let turn = crate::channel_reply::group_buffer::GroupTurn::capture(
+        &f.ctx, true, "discord", "G1", "C1", None, "inbound", "H1", "Human", "question").await;
+    let employee = crate::trigger_route::AnsweredBy {
+        id:"worker".into(), display_name:"Actual Worker".into(), via_trigger:false, session_id:"discord:C1".into(),
+    };
+    f.provider.enqueue_response("/channels/C1/messages", json!({"id":"accepted-chunk"}));
+    f.provider.enqueue_response("/channels/C1/messages", json!({"__status":503,"message":"retry later"}));
+    let result = turn.delivery(&f.ctx, Some(&employee), None).scope(send_discord_message(
+        &reqwest::Client::new(), &f.token, "C1", json!({"content":"answer ".repeat(700)}),
+    )).await;
+    assert!(result.is_err());
+    let rows = crate::group_context::read(&f.ctx.home_dir,"discord","C1",None,50,None).unwrap();
+    let replies: Vec<_> = rows.iter().filter(|row| row.direction == "bot_reply").collect();
+    assert_eq!(replies.len(),1);
+    assert_eq!(replies[0].message_id,"accepted-chunk");
+    assert_eq!(replies[0].sender_id,"worker");
+    assert_eq!(replies[0].sender_name,"Actual Worker");
+    assert!(replies[0].text.starts_with("answer "));
 }

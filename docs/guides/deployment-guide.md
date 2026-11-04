@@ -1,5 +1,7 @@
 # DuDuClaw deployment guide
 
+Official Linux CLI binaries require **glibc ≥ 2.31**: Ubuntu 20.04+, Debian 11+, or RHEL/Rocky Linux 9+. Use Docker on older systems. This baseline applies to the CLI/gateway, including the desktop CLI sidecar; the desktop GUI also requires its own WebKitGTK/system libraries.
+
 > Updated: 2026-03-30 | Version: v0.10.0
 
 ---

@@ -52,6 +52,9 @@ pub(crate) async fn handle_tools_call(
     let is_state_changing = matches!(
         tool_name,
         "credential_declare"
+            | "meeting_transcribe"
+            | "meeting_transcribe_cancel"
+            | "meeting_upload_link"
             | "create_agent"
             | "agent_remove"
             | "agent_update"
@@ -371,6 +374,7 @@ pub(crate) async fn handle_tools_call(
                 .await
         }
         // Channel settings tools
+        "group_history_read" => group_history::handle(&arguments, home_dir, caller_client_id, default_agent).await,
         "channel_config" => handle_channel_config(&arguments, home_dir).await,
         "channel_config_list" => handle_channel_config_list(&arguments, home_dir).await,
         "channel_status" => handle_channel_status(&arguments, home_dir).await,
@@ -400,6 +404,10 @@ pub(crate) async fn handle_tools_call(
         "cost_multi_vs_single" => handle_cost_multi_vs_single(&arguments, home_dir).await,
         // Voice / ASR / TTS tools
         "transcribe_audio" => handle_transcribe_audio(&arguments).await,
+        "meeting_upload_link" => handle_meeting_upload_link(&arguments, home_dir, &ns_ctx.write_namespace).await,
+        "meeting_transcribe_status" => handle_meeting_job(&arguments, home_dir, &ns_ctx.write_namespace, false).await,
+        "meeting_transcribe_cancel" => handle_meeting_job(&arguments, home_dir, &ns_ctx.write_namespace, true).await,
+        "meeting_transcribe" => handle_meeting_transcribe(&arguments, home_dir, &ns_ctx.write_namespace).await,
         "synthesize_speech" => handle_synthesize_speech(&arguments, home_dir).await,
         // Wiki Knowledge Base tools — use wiki_agent (namespace-aware) instead of
         // default_agent so external clients stay isolated in their own namespace.
@@ -856,7 +864,7 @@ pub(crate) async fn handle_tools_call(
         {
             None
         } else {
-            extract_tool_result_text(&result)
+            audit_result_text(tool_name, &result)
         };
         // `computer_type`'s text never reaches the audit (F5): only its length.
         let audit_arguments = audit_safe_arguments(tool_name, &arguments);

@@ -136,3 +136,7 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 | Google Chat | Chat markup(`*bold*`、`<url\|text>`) | 等幅code fence | プレースホルダー + その場での編集 |
 | MS Teams | markdownアクティビティ | 等幅code fence | `typing`アクティビティを3秒ごとに送信 |
 | WebChat | 生のmarkdown(ダッシュボード側でレンダリング) | ネイティブ対応 | `progress` WSイベント |
+
+## グループ会話コンテキストの設定
+
+Admin が「チャンネル → グループ設定」でグループごとに保存を有効化します。Telegram は BotFather の `/setprivacy` を無効にするか、bot 管理者として受信します。Slack は `message.channels`／`message.groups` と `channels:history`／`groups:history` が必要で、変更後は App を再インストールしチャンネルへ招待します。Discord は MESSAGE CONTENT INTENT が必要です。Google Chat と Teams は App へのメンションのみを受信する場合があります。Teams の全チャンネル受信には `ChannelMessage.Read.Group` などの RSC が必要です。保存期間と参照権限は[グループ会話コンテキスト](../../features/ja-JP/72-group-context.md)を参照してください。本変更で実際のプラットフォーム送受信は未検証です。

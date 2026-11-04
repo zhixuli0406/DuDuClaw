@@ -72,3 +72,7 @@ Telegram 用的是員工自己的 Bot；如果那個 Bot 在這期間被移除�
 - 這一版之前建立的提醒仍然由共用 Bot 送出。
 - Google Chat 的 HTTP 連線只支援「專案編號」驗證對象，不支援「HTTP 端點網址」。
 - Discord、Slack 的員工專屬 Bot 照舊在同一頁用「新增通道」（管理員）設定。
+
+## 群組近期對話設定
+
+管理員需在「通道 → 群組設定」逐群開啟保留。Telegram 可透過 BotFather `/setprivacy` 關閉隱私模式，或依 bot 管理員身分取得較廣的收訊；Slack 需訂閱 `message.channels`／`message.groups` 並授予 `channels:history`／`groups:history`，再重新安裝 App、邀請加入頻道。Discord 需開啟 MESSAGE CONTENT INTENT。Google Chat 與 Teams 可能只包含提及 App 的訊息，Teams 完整頻道收訊另需 `ChannelMessage.Read.Group` 等 RSC 權限。保留期限、員工讀取權與平台限制見[群組近期對話](../../features/zh-TW/72-group-context.md)。本次變更尚未驗證實際平台收送。

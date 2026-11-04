@@ -21,6 +21,7 @@ fn scope_enum_matches_canonical_list() {
         Scope::WikiRead,
         Scope::WikiWrite,
         Scope::MessagingSend,
+        Scope::MessagingRead,
         Scope::IdentityRead,
         Scope::OdooRead,
         Scope::OdooWrite,

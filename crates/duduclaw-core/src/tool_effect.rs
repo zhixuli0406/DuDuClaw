@@ -152,7 +152,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
     let effect = match tool_name {
         // ── read ────────────────────────────────────────────────────────
         "activity_list" | "agent_status" | "audit_trail_query" | "autopilot_list"
-        | "belief_stats" | "channel_config_list" | "channel_status" | "check_responses"
+        | "belief_stats" | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses"
         | "code_map" | "codrive_status" | "computer_screenshot" | "computer_workspace_list"
         | "computer_workspace_read" | "cost_agents" | "cost_multi_vs_single" | "cost_recent"
         | "cost_summary" | "cost_users" | "csv_read" | "db_query" | "db_select" | "db_sources"
@@ -185,11 +185,11 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search" | "wiki_stats"
         | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get" | "xlsx_read"
         | "calendar_list_events" | "discovery_catalog" | "discovery_list" | "discovery_tree"
-        | "discovery_artifact" => Read,
+        | "discovery_artifact" | "meeting_transcribe_status" => Read,
 
         // ── draft ───────────────────────────────────────────────────────
         "gmail_create_draft" | "canvas_push" | "plan_start" | "skill_from_recording"
-        | "synthesize_speech" => Draft,
+        | "synthesize_speech" | "meeting_transcribe" | "meeting_upload_link" => Draft,
 
         // ── send ────────────────────────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "mail_send" | "send_to_agent"
@@ -211,7 +211,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "memory_invalidate_by_origin" => Delete,
 
         // ── modify ──────────────────────────────────────────────────────
-        "activity_post" | "belief_settle" | "belief_submit" | "browser_record_start"
+        "meeting_transcribe_cancel" | "activity_post" | "belief_settle" | "belief_submit" | "browser_record_start"
         | "browser_record_stop" | "canvas_clear" | "computer_click" | "computer_key"
         | "computer_navigate" | "computer_scroll" | "computer_session_start"
         | "computer_session_stop" | "computer_type" | "computer_login" | "credential_declare" | "computer_workspace_write"
@@ -251,9 +251,10 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
 /// or a public model-catalog search does not introduce private data.
 pub fn reads_private(tool_name: &str) -> Option<bool> {
     match tool_name {
+        "meeting_upload_link" => Some(false),
         "activity_list" | "agent_status" | "audit_trail_query" | "autopilot_list"
         | "belief_settle" | "belief_stats" | "calendar_list_events" | "channel_config"
-        | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
+        | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
         | "codrive_run" | "codrive_status" | "computer_screenshot" | "computer_session_start"
         | "computer_workspace_list" | "computer_workspace_read" | "cost_agents"
         | "cost_multi_vs_single" | "cost_recent" | "cost_summary" | "cost_users" | "csv_read"
@@ -287,7 +288,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "skill_from_recording" | "skill_gaps" | "skill_list" | "skill_search"
         | "skill_security_scan" | "skill_synthesis_run" | "skill_synthesis_status"
         | "slides_read" | "task_status" | "tasks_claim" | "tasks_list" | "tasks_update"
-        | "transcribe_audio" | "user_code_profile" | "user_profile_get" | "web_extract"
+        | "transcribe_audio" | "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "user_code_profile" | "user_profile_get" | "web_extract"
         | "web_fetch" | "web_fetch_cached" | "web_search" | "wiki_dedup" | "wiki_graph"
         | "wiki_lint" | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search"
         | "wiki_stats" | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get"
@@ -382,6 +383,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "synthesize_speech",
     "tasks_create",
     "transcribe_audio",
+    "meeting_transcribe",
     "update_cron_task",
     "web_extract",
     "web_fetch",
@@ -397,11 +399,13 @@ pub fn egress_capable(tool_name: &str) -> Option<bool> {
         return Some(true);
     }
     match tool_name {
+        "meeting_upload_link" => Some(false),
+        "meeting_transcribe_status" | "meeting_transcribe_cancel" => Some(false),
         "activity_list" | "activity_post" | "agent_remove" | "agent_status" | "agent_update"
         | "agent_update_soul" | "audit_trail_query" | "autopilot_list" | "belief_settle"
         | "belief_stats" | "belief_submit" | "browser_record_stop" | "cancel_reminder"
         | "canvas_clear" | "canvas_push" | "capability_request" | "channel_config"
-        | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
+        | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
         | "codrive_status" | "computer_click" | "computer_key" | "computer_screenshot"
         | "computer_scroll" | "computer_session_start" | "computer_session_stop"
         | "computer_workspace_list" | "computer_workspace_read" | "credential_declare" | "computer_workspace_write"

@@ -53,14 +53,7 @@ async fn transcribe_api(audio_data: &[u8], language: Option<&str>) -> Result<Str
         ("audio.ogg", "audio/ogg") // default fallback
     };
 
-    let part = reqwest::multipart::Part::bytes(audio_data.to_vec())
-        .file_name(file_name)
-        .mime_str(mime_type)
-        .map_err(|e| format!("Multipart: {e}"))?;
-    let form = reqwest::multipart::Form::new()
-        .text("model", "whisper-1")
-        .text("language", lang.to_string())
-        .part("file", part);
+    let form = api_form(audio_data.to_vec(), file_name, mime_type, lang)?;
     let resp = HTTP_CLIENT
         .post("https://api.openai.com/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {api_key}"))
@@ -73,6 +66,41 @@ async fn transcribe_api(audio_data: &[u8], language: Option<&str>) -> Result<Str
     let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     result.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
         .ok_or("No text".to_string())
+}
+
+fn api_form(
+    audio_data: Vec<u8>,
+    file_name: &str,
+    mime_type: &str,
+    language: &str,
+) -> Result<reqwest::multipart::Form, String> {
+    let part = reqwest::multipart::Part::bytes(audio_data)
+        .file_name(file_name.to_owned())
+        .mime_str(mime_type)
+        .map_err(|_| "Invalid audio MIME type".to_string())?;
+    let mut form = reqwest::multipart::Form::new().text("model", "whisper-1").part("file", part);
+    if !language.is_empty() {
+        form = form.text("language", language.to_owned());
+    }
+    Ok(form)
+}
+
+/// The meeting adapter uses the same Whisper API with segment-level timestamps.
+/// The caller supplies credentials so no process-wide environment mutation is needed.
+pub(crate) async fn transcribe_api_verbose(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    audio_data: Vec<u8>,
+    file_name: &str,
+    mime_type: &str,
+    language: &str,
+) -> Result<reqwest::Response, String> {
+    let form = api_form(audio_data, file_name, mime_type, language)?
+        .text("response_format", "verbose_json")
+        .text("timestamp_granularities[]", "segment");
+    client.post(endpoint).bearer_auth(api_key).multipart(form).send().await
+        .map_err(|_| "無法連線至 Whisper 轉錄服務。".to_string())
 }
 
 /// Transcribe locally via whisper.cpp.

@@ -72,3 +72,7 @@ Telegram では社員専用の Bot を使い、その間に Bot が削除され�
 - このリリース以前に作成したリマインダーは引き続き共用 Bot から送ります。
 - Google Chat HTTP 接続の認証対象は「プロジェクト番号」のみ対応です（「HTTP エンドポイント URL」は非対応）。
 - Discord と Slack の社員専用 Bot は、これまでどおり同じページの「チャンネルを追加」（管理者）で設定します。
+
+## グループ会話コンテキストの設定
+
+Admin が「チャンネル → グループ設定」でグループごとに保存を有効化します。Telegram は BotFather の `/setprivacy` を無効にするか、bot 管理者として受信します。Slack は `message.channels`／`message.groups` と `channels:history`／`groups:history` が必要で、変更後は App を再インストールしチャンネルへ招待します。Discord は MESSAGE CONTENT INTENT が必要です。Google Chat と Teams は App へのメンションのみを受信する場合があります。Teams の全チャンネル受信には `ChannelMessage.Read.Group` などの RSC が必要です。保存期間と参照権限は[グループ会話コンテキスト](../../features/ja-JP/72-group-context.md)を参照してください。本変更で実際のプラットフォーム送受信は未検証です。

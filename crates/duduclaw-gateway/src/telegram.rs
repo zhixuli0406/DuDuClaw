@@ -916,6 +916,8 @@ async fn process_telegram_message(
         .unwrap_or("someone");
     let scope_id = chat_id.to_string();
 
+    let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&ctx, is_group, "telegram", "global", &scope_id, thread_id.map(|id| id.to_string()).as_deref(), &msg.message_id.map(|id| id.to_string()).unwrap_or_default(), &msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default(), sender, msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or("[附件]")).await;
+
     // ── Mention-only filter for groups ──
     // Per-agent bots default to mention-only to prevent all bots responding
     let default_mention_only = agent_name.is_some();
@@ -1465,7 +1467,7 @@ async fn process_telegram_message(
     } else {
         duduclaw_security::circuit_breaker::SenderKind::Person
     };
-    let (reply, guarded) = crate::computer_use_sessions::attended::verified_channel_message(&session_id, &user_id, sender_kind == duduclaw_security::circuit_breaker::SenderKind::Bot, thinking.scope(crate::channel_reply::as_sender(sender_kind, crate::approval::scope_trusted_reply(target, async {
+    let (reply, guarded) = group_turn.scope(crate::computer_use_sessions::attended::verified_channel_message(&session_id, &user_id, sender_kind == duduclaw_security::circuit_breaker::SenderKind::Bot, thinking.scope(crate::channel_reply::as_sender(sender_kind, crate::approval::scope_trusted_reply(target, async {
         if let Some((ref called_agent, via_trigger)) = called {
             // Called by `@` (or the one message a tapped employee was
             // waiting for): this message only, in that employee's own
@@ -1528,7 +1530,7 @@ async fn process_telegram_message(
                 SharedRoute::Guide(msg) => (msg, None),
             }
         }
-    }))))
+    })))))
     .await;
     drop(typing_guard);
 
@@ -1614,14 +1616,16 @@ async fn process_telegram_message(
         tts_router.is_available(),
     );
 
-    if voice_enabled {
+    let delivery_thread = thread_id.map(|id| id.to_string());
+    group_turn.delivery(&ctx, guarded.as_ref().and_then(|g| g.answered_by.as_ref()), delivery_thread.as_deref()).scope(async {
+    let _ = if voice_enabled {
         let plain_reply = crate::markdown_render::to_line_plain(&reply);
         match tts_router.synthesize(&plain_reply, "").await {
             Ok(audio_bytes) => {
                 if crate::channel_reply::guard_lost(guarded.as_ref()).await {
                     return;
                 }
-                let voice_sent = send_voice(&client, &api_base, chat_id, audio_bytes).await;
+                let voice_sent = send_voice(&client, &api_base, chat_id, audio_bytes, thread_id).await;
                 if voice_sent {
                     if reply.len() > 200 {
                         if crate::channel_reply::guard_lost(guarded.as_ref()).await {
@@ -1639,6 +1643,7 @@ async fn process_telegram_message(
                         )
                         .await;
                     }
+                    true
                 } else {
                     // sendAudio failed — a short reply (≤200 chars) had NO
                     // text companion at all, so a failed voice upload used
@@ -1659,7 +1664,7 @@ async fn process_telegram_message(
                         &ctx.home_dir,
                         guarded.as_ref(),
                     )
-                    .await;
+                    .await
                 }
             }
             Err(e) => {
@@ -1682,7 +1687,7 @@ async fn process_telegram_message(
                     &ctx.home_dir,
                     guarded.as_ref(),
                 )
-                .await;
+                .await
             }
         }
     } else {
@@ -1698,8 +1703,9 @@ async fn process_telegram_message(
             &ctx.home_dir,
             guarded.as_ref(),
         )
-        .await;
-    }
+        .await
+    };
+    }).await;
 }
 
 /// The decision principal for a Telegram message: the sending person's id, or
@@ -2905,6 +2911,7 @@ async fn send_voice(
     api_base: &str,
     chat_id: i64,
     audio_data: Vec<u8>,
+    message_thread_id: Option<i64>,
 ) -> bool {
     let (filename, mime) = if audio_data.starts_with(b"RIFF") {
         ("reply.wav", "audio/wav")
@@ -2922,9 +2929,12 @@ async fn send_voice(
         }
     };
 
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .text("chat_id", chat_id.to_string())
         .part("audio", part);
+    if let Some(thread) = message_thread_id {
+        form = form.text("message_thread_id", thread.to_string());
+    }
 
     match client
         .post(format!("{api_base}/sendAudio"))
@@ -2939,6 +2949,10 @@ async fn send_voice(
                         "Telegram sendAudio failed: {}",
                         data.description.unwrap_or_default()
                     );
+                }
+                if data.ok {
+                    let id = data.result.as_ref().and_then(|r| r.get("message_id")).and_then(|id| id.as_i64()).map(|id| id.to_string());
+                    crate::channel_reply::group_buffer::delivered("[語音]", id.as_deref()).await;
                 }
                 data.ok
             }
@@ -3044,12 +3058,13 @@ async fn send_reply_markdown(
     reply_markup: Option<serde_json::Value>,
     home_dir: &Path,
     guarded: Option<&crate::channel_reply::GuardedReply>,
-) {
+) -> bool {
+    let mut delivered = true;
     let chunks = channel_format::split_text(markdown, TG_MARKDOWN_CHUNK);
     let last = chunks.len().saturating_sub(1);
     for (i, chunk) in chunks.iter().enumerate() {
         if crate::channel_reply::guard_lost(guarded).await {
-            return;
+            return false;
         }
         let html = crate::markdown_render::to_telegram_html(chunk);
         let reply_params = if i == 0 {
@@ -3077,6 +3092,7 @@ async fn send_reply_markdown(
             )
             .await;
             if !ok {
+                delivered = false;
                 record_send_failure(home_dir, chat_id, i, chunks.len(), "oversized_plain_chunk");
             }
             continue;
@@ -3095,7 +3111,7 @@ async fn send_reply_markdown(
         .await;
         if !ok {
             if crate::channel_reply::guard_lost(guarded).await {
-                return;
+                return false;
             }
             // HTML parse rejected — resend the raw chunk as plain text so
             // the reply is never silently dropped.
@@ -3112,6 +3128,7 @@ async fn send_reply_markdown(
             )
             .await;
             if !plain_ok {
+                delivered = false;
                 // Both attempts failed — this chunk (and everything after
                 // it, since the loop keeps going for the remaining chunks)
                 // never reached the user. Previously this branch discarded
@@ -3132,6 +3149,7 @@ async fn send_reply_markdown(
             }
         }
     }
+    delivered
 }
 
 /// Record a `channel_failures.jsonl` line for a Telegram send that failed
@@ -3228,6 +3246,11 @@ async fn send_message_once(
             }
         };
         if data.ok {
+            let id = data.result.as_ref().and_then(|r| r.get("message_id")).and_then(|id| id.as_i64()).map(|id| id.to_string());
+            // Telegram returns visible text without HTML markup or action URLs.
+            let visible = data.result.as_ref().and_then(|r| r.get("text")).and_then(|v| v.as_str())
+                .unwrap_or(if parse_mode.is_none() { text } else { "[文字回覆]" });
+            crate::channel_reply::group_buffer::delivered(visible, id.as_deref()).await;
             return true;
         }
         error!(
@@ -3551,9 +3574,12 @@ async fn send_reply_with_guard(
             .await
         {
             Ok(resp) => {
-                if let Ok(data) = resp.json::<TgResponse<serde_json::Value>>().await
-                    && !data.ok
-                {
+                if let Ok(data) = resp.json::<TgResponse<serde_json::Value>>().await {
+                    if data.ok {
+                        let id = data.result.as_ref().and_then(|r| r.get("message_id")).and_then(|id| id.as_i64()).map(|id| id.to_string());
+                        crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await;
+                        continue;
+                    }
                     let desc = data.description.unwrap_or_default();
                     error!("Telegram send failed: {}", duduclaw_security::credential_detect::mask(&desc));
 
@@ -3591,9 +3617,12 @@ async fn send_reply_with_guard(
                             .await
                         {
                             Ok(r2) => {
-                                if let Ok(d2) = r2.json::<TgResponse<serde_json::Value>>().await
-                                    && !d2.ok
-                                {
+                                if let Ok(d2) = r2.json::<TgResponse<serde_json::Value>>().await {
+                                    if d2.ok {
+                                        let id = d2.result.as_ref().and_then(|r| r.get("message_id")).and_then(|id| id.as_i64()).map(|id| id.to_string());
+                                        crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await;
+                                        continue;
+                                    }
                                     error!(
                                         "Telegram retry also failed: {}",
                                         duduclaw_security::credential_detect::mask(&d2.description.unwrap_or_default())

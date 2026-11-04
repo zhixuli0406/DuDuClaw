@@ -7438,6 +7438,8 @@ export const api = {
         /** Global utility provider, canonicalized; removed providers are retained for explicit repair. */
         utility_provider?: string;
         voice?: Partial<VoiceSettings> | null;
+        transcription?: { engine: 'gemini' | 'google_stt' | 'whisper'; model: string | null; max_bytes: number } | null;
+        transcription_error?: string | null;
         // Structured [gateway] allowed_origins for the remote-access allowlist UI.
         allowed_origins?: string[];
         // Structured [skills] gap_digest_enabled for the daily skill-gap digest toggle.

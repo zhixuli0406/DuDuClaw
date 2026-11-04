@@ -36,7 +36,8 @@
     "react-router": "^7.18.2",
     "remark-gfm": "4.0.1",
     "tailwind-merge": "^3.5.0",
-    "zustand": "^5.0.11"
+    "zustand": "^5.0.11",
+    "mp4box": "2.4.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.1",
