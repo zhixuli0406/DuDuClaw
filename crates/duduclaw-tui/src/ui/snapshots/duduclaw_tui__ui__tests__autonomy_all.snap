@@ -1,6 +1,5 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
-assertion_line: 1158
-expression: rendered.lines().nth(2).unwrap().trim_end()
+expression: "rendered.lines().find(|line|\nline.contains(\"自主:\")).map(str::trim_end).unwrap_or(\"沒有自主暫停\")"
 ---
-自主: 全部暫停
+  S 排程                        0  | 自主: 全部暫停                                                                   |

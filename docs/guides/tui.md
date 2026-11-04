@@ -6,6 +6,48 @@
 
 Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee status pause/resume uses the same permission checks and confirmation cards. The terminal interface currently uses Traditional Chinese.
 
+## Sidebar workspace
+
+The layout follows the dashboard: a neutral app-shell background, a borderless sidebar about 34 cells wide, and a page-canvas content panel inset by one cell with a single faint rounded ring. The sidebar starts with the brand and a search row (`Ctrl-P` opens the existing palette), followed by needs-you, working and idle groups. Paused employees belong to idle and retain the pause symbol and word. Each employee has a two-line row with a right-aligned status pill or metadata and muted context. Selection fills the row and adds `›`; unfocused selection is quieter. Unselected employees with unread inbox items carry `✦` (`*` in ASCII). Below 100 columns, or at short heights, employee rows collapse to one line. Overflow shows how many employees are hidden; arrow navigation keeps the selected row visible.
+
+The context line prefers an inbox item's kind/title, then a current goal dispatch round and elapsed minutes from an already loaded task snapshot, then the next heartbeat, then an autonomy pause reason, otherwise idle. Unknown round limits are omitted rather than guessed. Heartbeat data is available to Manager/Admin only; stale task and schedule snapshots are not used for these summaries. The bottom `I 收件匣` entry counts all visible inbox rows, including informational rows. Press `I`, or select the entry and press `Enter`, to open the list in the main area; each row keeps its employee and reason. `Esc` returns to the sidebar. Lowercase `i` still enters chat input.
+
+The main area has `對話 / 任務 / 紀錄` tabs. `Tab` and `Shift-Tab` cycle forward/backward; `[` and `]` still select previous/next records within task, run and workflow blocks. Tabs reuse the existing chat, task and run blocks; `L` opens logs. Tab switches keep drafts, running replies and scroll positions. There are at most four retained conversations, including hidden tabs; unused empty chats can be reclaimed. When all four contain work, close an unneeded conversation with `Ctrl-W`; selecting another employee can still open its task tab. `v`/`x`, `1`–`4`, PTYs, decision cards and autonomous-work blocks remain available through their shortcuts and `Ctrl-P`.
+
+Heartbeat times appear on employee cards. `S` or the sidebar's schedule entry opens the full schedule list for Manager/Admin; `Enter` shows the selected schedule's details. Cron visibility and all confirmation/authorization checks are unchanged. A schedule with no previous run displays `尚未執行`; an invalid timestamp still displays `時間不明`.
+
+Connection and permitted cost sit at the bottom of the sidebar, beneath inbox and schedule counts. Cost is hidden when unavailable or refused; dollars use two decimals, or four for nonzero amounts below $0.01. The content header shows the employee status/name, configured runtime/preferred model from the existing employee snapshot when available (not the model actually used after a runtime fallback), and right-aligned tabs with a hover-tone active pill. Key hints are at the bottom of the content panel, with the gateway version right-aligned. There is no global header or filter row. `?` includes the full home path. The minimum remains 24×12; snapshots cover 80×24, 100×30, 140×40 and 200×50 in dark, light, ANSI and NO_COLOR, with additional ASCII and ambiguous-width checks. These are rendering checks, not native-terminal acceptance of this redesign.
+
+
+## Conversation, inline decisions and overlays
+
+Your messages are right-aligned on a hover-tone block, with one cell of padding on each side and wrapping at about 70% of the conversation width. Employee replies have a muted name/time header and plain text. Structured tool steps and round results appear together beneath their own turn on a surface-tone card. Each row shows a result glyph, verb/target and right-aligned duration or state. Missing results remain unknown. `t`, arrows and `Enter` keep the existing selection and expand/collapse behavior.
+
+When the selected employee has a pending approval or paused goal, a raised inline card appears above the input with a badge, title, sanitized one-line summary and numbered action labels. **The numbers are labels, not decision shortcuts**; in list focus, `Enter` opens the existing decision card (leave timeline focus with `Esc` first). The full payload inspection, one-second key guard, confirmation code, permission re-check, version binding and no-retry behavior all remain in that card. Dashboard-only items remain read-only here.
+
+The surface-tone input stays visible in the conversation tab, including while unfocused. It shows `輸入訊息給<employee>…`, `/ 指令  @ 員工` when there is room, and a primary-color `Enter` chip; input focus adds the focus-color underline. `i` or `/` enters input; IME commits, paste, mentions, slash commands and `Esc` preserving the draft are unchanged.
+
+The palette, mailbox, help and confirmation dialogs are centered on the raised surface with one faint rounded border (ASCII fallback). The background is repainted with muted colors. Selection has its own row tone, palette matches use amber, and key chips use the hover tone. Bottom-right toasts use the same raised surface and faint ring: `需要你` is an amber badge and `完成` has a green check. They retain the two-toast limit, lifetime/persistence and no-focus-stealing behavior. Light, ANSI and `NO_COLOR` use the same structure with reduced-color emphasis.
+
+Only active tool steps animate. `motion = "on"` is the default; `motion = "off"` keeps a static activity glyph. Animation redraws are coalesced at about 80 ms; idle steps do not schedule animation redraws. Existing data changes, timers and input can still refresh the screen.
+
+
+## Toasts, notification mailbox and zoom
+
+In-app toasts appear at the bottom right of the main area, at most two at a time with the newest above the older one. `完成`, `需要你` and `錯誤` use the theme's success, warning and danger colors. Their text contains fixed wording and a sanitized employee display name only; messages, tool output and task contents are excluded. Completed and failed runs come from the existing `runs.list` snapshots refreshed after events; approvals and goals use the existing inbox snapshots. Breaker toasts use Admin-only `budget.breaker_open` / `autopilot.breaker_open` events, deduplicated by event sequence. No extra RPC is added, and `agent.turn_finished` alone does not establish success or failure. On legacy events without a sequence, repeated breaker events with the same key cannot be distinguished from replay.
+
+`完成` and `錯誤` disappear after about six seconds. `需要你` stays until the related inbox item is seen, you open the mailbox, or you dismiss the toast. Toasts do not take keyboard focus and are hidden while a decision card is open. To dismiss one explicitly, press `F8` to focus toasts, use the arrows to select one, then `x`; `Esc` returns to the workspace. Outside toast focus, `x` retains its split-block action.
+
+Press `M` to open the centered notification mailbox. `N` remains **create autonomous goal**, so the mailbox uses the free `M` key. The mailbox retains the last 100 notifications for this process only; its history and unread flags are not written to `read_state.rs` files. `Tab` cycles `全部 / 未讀 / 錯誤`, arrows move selection, and `Enter` jumps to the related employee or inbox item without making a decision. `Esc` closes the mailbox. Opening it marks the current notifications read and dismisses their toasts; notifications arriving afterward remain unread until you press `Enter` on that notification, open its related inbox decision card or mark that inbox item read, or close and reopen the mailbox. These read flags do not resolve gateway requests or replace the inbox's existing local read marks.
+
+Press `z` in control-room focus to enlarge the focused main-area block. The sidebar and content header are hidden; the footer shows `放大中 · z 還原`. Press `z` again to restore the split layout. Resizing uses the current terminal dimensions. Decision cards and `Ctrl-P` still work, and their keyboard guards remain unchanged. While typing a chat message, `z` is text; while a PTY has input focus, it goes to the child.
+
+## Activity timeline
+
+The `紀錄` tab and compact activity lines in `對話` show each available tool step and round result as one line: local human-readable time, symbol, verb, target and result (`✓ / ✕ / ⋯`, with ASCII equivalents). Targets are sanitized and truncated by display width, respecting `ambiguous_width`; an unknown result remains pending/unknown rather than being inferred from a turn ending.
+
+Press `t` to focus the timeline, use arrows to select a line, then `Enter` to expand the existing detail or collapse it again. `PgUp` / `PgDn` scroll expanded details; `Esc` leaves timeline focus. The timeline uses only already received data. Run content previews retain the existing `c` consent flow; expansion does not enable content on its own. `tui watch` keeps its plain-output behavior.
+
 ## Start
 
 Start the gateway, then run one of these commands on the same host:
@@ -45,7 +87,7 @@ RPC `/ws` and WebChat `/ws/chat` send Close and allow up to one second for the p
 
 Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chinese labels or English aliases such as `stop`, `steer`, `log`); arrows select, `Enter` runs the displayed shortcut, and `Esc` returns to the previous focus with the chat draft intact. `Ctrl-K` remains reserved. The list is recalculated from the focused block, current role, employee binding and fresh data. Autonomy pause/resume sends immediately. Other controls open the same confirmation card as their shortcut; the palette never approves a card for you. Cards and content warnings own their keyboard, so the palette cannot open over them.
 
-`F1` / `?` shows help only in the focused block; other blocks stay visible. Long home paths retain their right end with a leading ellipsis. At the minimum supported height (12 rows), inbox and employee panels each retain one content row; the schedule panel may be hidden. Borders remain ASCII in either glyph mode. All navigation works without a mouse. Windows key-release events never execute commands.
+`F1` / `?` opens centered help over a dimmed workspace; closing it preserves all blocks. The full home path is in help. Short terminals keep employee selection and inbox/schedule navigation available. The main ring uses rounded Unicode corners or ASCII characters, with `ambiguous_width` honored. All navigation works without a mouse. Windows key-release events never execute commands.
 
 The control room offers controls that stop work or move it one step forward. It never grants standing permission; Admin can pause or resume autonomy globally. `cron run now`, `heartbeat trigger`, and task stop are one-way actions and always go through a confirmation card; controls are not necessarily reversible.
 
@@ -72,7 +114,13 @@ Channel codes are requested for the entered account email and delivered through 
 | Key | Action |
 |---|---|
 | Arrows / `j` / `k` | Move selection |
-| `Enter` | Open details or a decision card |
+| `Enter` | Open the sidebar entry, details or a decision card |
+| `I` / `S` | Open inbox / schedule list; `Esc` returns to the sidebar |
+| `Tab` / `Shift-Tab` | Next / previous employee tab (`[` / `]` still switch records) |
+| `M` | Open notification mailbox; its `Tab` cycles all / unread / errors (`N` still creates a goal) |
+| `F8` | Focus toasts; arrows select, `x` dismisses, `Esc` leaves |
+| `z` | Enlarge / restore the focused main-area block |
+| `t` | Focus activity timeline; arrows select, `Enter` expands / collapses, `PgUp` / `PgDn` scroll details, `Esc` leaves |
 | `r` | Mark this item or identified completed run as read on this client |
 | `PgUp` / `PgDn` | Scroll details |
 | `?` / `F1` | Toggle help |
@@ -80,7 +128,7 @@ Channel codes are requested for the entered account email and delivered through 
 
 New items never take selection. Read marks do not dismiss pending requests at the gateway. Completion badges use recent run history, not a complete history of everything you have missed. If the selected row disappears, selection moves to the same position, or the last row; an existing selected ID stays selected through new arrivals and reordering.
 
-On disconnect, lost events, or an incomplete refetch, lists show `資料可能過期` (“data may be stale”) and counts become `?`; JSON uses `stale: true` and `count: null`. The last complete list remains visible. A refetch has a shared limit of 2,000 rows and 4 MiB of encoded response content across employees, inbox, recent runs, and schedules. Exceeding either limit stops that refetch and keeps it stale, never publishes a partial list as complete. Responses and events are limited to 256 KiB per WebSocket message/frame, with a 16-event queue. Large installations may need the dashboard.
+On disconnect, lost events, or an incomplete refetch, lists show `資料可能過期` (“data may be stale”) and panel titles omit unknown counts; JSON uses `stale: true` and `count: null`. The last complete list remains visible. A refetch has a shared limit of 2,000 rows and 4 MiB of encoded response content across employees, inbox, recent runs, and schedules. Exceeding either limit stops that refetch and keeps it stale, never publishes a partial list as complete. Responses and events are limited to 256 KiB per WebSocket message/frame, with a 16-event queue. Large installations may need the dashboard.
 
 ## Chat and input focus
 
@@ -88,7 +136,7 @@ The status line always identifies the focus. In list focus, `1`–`4` selects a 
 
 A leading `@name ` selects the WebChat `agent` field and is removed from the message. Without it, the employee selected when input opened is the recipient. `/goal`, `/status`, and `/cost` pass unchanged to the gateway. `/pause`, `/stop`, and `/resume` show a Computer Use note: these commands do **not** pause an employee.
 
-The right area tiles up to four blocks as described below. Different chat blocks can run turns concurrently over one socket, with one in-flight turn per conversation. Each block keeps its employee, conversation, draft, history, scroll position and cancellation prompt; the gateway turn cap is reported in the affected block. Unknown or conflicting conversation frames are ignored. Thinking and tool steps collapse to one status line; an ASCII spinner also works with `glyphs = "ascii"`. `PgUp` / `PgDn` in list focus scroll chat history, capped at 2,000 lines of at most 512 characters each. New output never changes focus. Employee output passes through `TerminalText`; the client emits no OSC 8 hyperlinks.
+The right area tiles up to four blocks as described below. Different chat blocks can run turns concurrently over one socket, with one in-flight turn per conversation. Each block keeps its employee, conversation, draft, history, scroll position and cancellation prompt; the gateway turn cap is reported in the affected block. Unknown or conflicting conversation frames are ignored. Thinking remains a status line; structured tool steps appear beneath their turn. ASCII activity glyphs work with `glyphs = "ascii"`. `PgUp` / `PgDn` in list focus scroll chat history, capped at 2,000 lines of at most 512 characters each. New output never changes focus. Employee output passes through `TerminalText`; the client emits no OSC 8 hyperlinks.
 
 One `/ws/chat` connection shares the `/ws` client's in-memory token refresh and reconnects with backoff. Interrupted messages are not automatically resent; their outcome is uncertain. Completed conversations can resume on reconnect; changing employee starts a new conversation. In list focus, `X` cancels a running reply only after the gateway has sent a frame carrying `msg_id`. Otherwise the block says cancellation is unavailable. `cancel_accepted` only means the request was accepted; the cancellation completes on an `error` frame whose `code` is `cancelled`. A final response can also end the turn if delivery has already begun.
 
@@ -140,7 +188,7 @@ Choose **建立自主目標** in the palette, or press `N` with an employee sele
 
 On a finished goal, `c` opens the message input directly. Type or paste a follow-up, press `Enter` to review the target task and complete message. Editing `Esc` clears the message and closes the card. Review starts a new one-second guard and a fresh two-digit code; scroll to the end, type the code and press `Enter` to send. Oversized reviews require the dashboard. The message is required. Cards retain the one-second key guard, freshness/permission checks, revision binding and no automatic retry.
 
-The header shows the number of live turns observed since connection; a reconnect or event gap loses that observation. Optional `task_id` on a turn links the employee's `T` action to its task; absence is unknown, not an error or a guessed task. Turn events carry neither outcome nor run ID, so completion/error badges still come from run history. Run titles show the gateway's source and known round, without inventing a round cap. Admin cost uses `cost.summary {since:<local midnight in RFC3339>}` and is labelled **今日** only when the gateway acknowledges that exact boundary and returns available totals. Midnight uses the local timezone at that date, including DST changes. Older gateways fall back to `hours:24` and **近 24 小時**; unavailable/refused cost is hidden. `since` takes precedence over `hours`, rejects invalid/future values, and is limited to the shorter of retention (currently 30 days) and 31 days. The list-focus footer names the selection and includes `Ctrl-P` and `q`.
+Employee working states include live turns observed since connection; a reconnect or event gap loses that observation. Optional `task_id` on a turn links the employee's `T` action to its task; absence is unknown, not an error or a guessed task. Turn events carry neither outcome nor run ID, so completion/error badges still come from run history. Run titles show the gateway's source and known round, without inventing a round cap. Admin cost uses `cost.summary {since:<local midnight in RFC3339>}` and is labelled **今日** only when the gateway acknowledges that exact boundary and returns available totals. Midnight uses the local timezone at that date, including DST changes. Older gateways fall back to `hours:24` and **近 24 小時**; unavailable/refused cost is hidden. `since` takes precedence over `hours`, rejects invalid/future values, and is limited to the shorter of retention (currently 30 days) and 31 days. The selected name is in the content header; `Ctrl-P` is shown in the sidebar search row and `q` in the content footer.
 
 A `dashboard.navigate` event is only a passive hint for an already loaded inbox item at `/inbox?item=`. It never changes the selection, focus, cards, or employee targeted by `p`/`u`. `/agents/...`, all other paths, unknown items, and hostile paths are ignored. While typing, using the PTY, viewing help, or answering a card, it does nothing.
 
@@ -154,7 +202,7 @@ By default, output contains metadata only (time, status, agent, step kind or too
 
 ## Terminal notifications
 
-Notifications are off by default, including under `SSH_CONNECTION`. Explicit `notifications = true` in `tui.toml` opts in. An increased fresh inbox count while the terminal is unfocused emits OSC 777 for VTE/rxvt-unicode terminals, otherwise OSC 9, with only `DuDuClaw：N 項需要你處理`; employee names, task titles, and tool content never enter it. Focus events are used when available; otherwise the terminal is treated as unfocused. At most one notification is emitted per minute; suppressed rises are not queued. Inside tmux, passthrough is used only if `tmux show-option -gv allow-passthrough` returns `on` or `all`; otherwise notifications are skipped. Connection errors also use fixed text, `DuDuClaw：連線中斷，請檢查控制室`, sharing the focus checks and one-minute rate limit. Actual display depends on the terminal.
+Desktop terminal notifications are separate from in-app toasts and the mailbox. They are off by default, including under `SSH_CONNECTION`. Explicit `notifications = true` in `tui.toml` opts in. An increased fresh inbox count while the terminal is unfocused emits OSC 777 for VTE/rxvt-unicode terminals, otherwise OSC 9, with only `DuDuClaw：N 項需要你處理`; employee names, task titles, and tool content never enter it. Focus events are used when available; otherwise the terminal is treated as unfocused. At most one notification is emitted per minute; suppressed rises are not queued. Inside tmux, passthrough is used only if `tmux show-option -gv allow-passthrough` returns `on` or `all`; otherwise notifications are skipped. Connection errors also use fixed text, `DuDuClaw：連線中斷，請檢查控制室`, sharing the focus checks and one-minute rate limit. Actual display depends on the terminal.
 
 ## Decision cards
 
@@ -179,7 +227,10 @@ Approval requires a nonempty string `digest`, sent as `expected_digest`. If it i
 
 ```toml
 # ~/.duduclaw/tui.toml
-glyphs = "ascii"                 # or "unicode"
+theme = "auto"                   # "light" / "dark" / "ansi"
+background = "theme"              # "terminal"
+motion = "on"                     # "off"
+# glyphs = "ascii"               # optional override: "ascii" / "unicode"
 ambiguous_width = "narrow"        # or "wide", matching your terminal
 notifications = false
 poll_interval_seconds = 15        # 5..3600
@@ -190,13 +241,24 @@ Every supported top-level key is listed below. Each invalid value keeps only tha
 
 | Key | Accepted values | Default / effect |
 |---|---|---|
-| `glyphs` | `"ascii"`, `"unicode"` | `"ascii"`; employee status glyphs; borders stay ASCII |
+| `theme` | `"auto"`, `"light"`, `"dark"`, `"ansi"` | `"auto"`; explicit palette or background detection; ANSI always uses terminal backgrounds |
+| `background` | `"theme"`, `"terminal"` | `"theme"`; `"terminal"` preserves the terminal background for shell and content canvas |
+| `motion` | `"on"`, `"off"` | `"on"`; animate only active tool steps, coalesced at about 80 ms |
+| `glyphs` | `"ascii"`, `"unicode"` | Unicode in a UTF-8 locale unless `TERM` is `linux` or `dumb`; ASCII otherwise. Explicit settings override detection; Unicode uses rounded borders |
 | `ambiguous_width` | `"narrow"`, `"wide"` | `"narrow"`; match the terminal's ambiguous-character width |
 | `poll_interval_seconds` | Integer, 5–3600 inclusive | `15`; authoritative list reconciliation; run/task/log blocks retain their five-second reconciliation |
 | `notifications` | Boolean | `false`, including SSH; explicit opt-in enables fixed-text background notifications |
 | `default_layout` | `"single"`, `"vertical"`, `"horizontal"` | `"single"`; one detail block, two side-by-side detail blocks, or two stacked detail blocks; starts with block 1 focused |
 
-Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Borders use ASCII. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
+`theme = "auto"` uses `COLORFGBG`, else dark; set `theme = "light"` explicitly for light terminals. Explicit `light` and `dark` select their respective palettes. `theme = "ansi"` uses only the 16 ANSI colors and leaves canvas/surface backgrounds to the terminal; it determines light/dark from `COLORFGBG`, else dark. `background = "terminal"` leaves the app-shell and page-canvas backgrounds to the terminal in any theme, while preserving card/selection surfaces. Color support otherwise follows `COLORTERM=truecolor` or `24bit`, then a `TERM` containing `256color`, then 16 ANSI colors. Any `NO_COLOR` value, including empty, disables colors while retaining selection and emphasis cues.
+
+The four surfaces use the dashboard’s neutral zinc palette; amber is for needs-you/paused states and keys, green for working, and brand blue for the logo. Text/surface pairs below 4.5:1 receive the smallest supported foreground adjustment; the decorative ring deliberately stays below text contrast. Tests cover reference truecolor/256/16-color pairs. Actual ANSI contrast depends on the terminal’s customized palette; terminal-background contrast uses COLORFGBG or a fallback, so an unknown background cannot be guaranteed.
+
+The 16-color contrast calculations use the reference ANSI palette; terminal-customized ANSI colors determine the actual displayed contrast.
+
+The glyph default uses the first nonempty locale value in `LC_ALL`, `LC_CTYPE`, then `LANG`. Unicode mode shows `◉` needs you, `●` working, `○` idle, `✓` done, `✕` error and `⏸` paused. Status words remain visible in both glyph modes at 100 columns or wider. Times use the local time zone and Traditional Chinese relative labels within an hour, `HH:MM` for today and `MM/DD HH:MM` otherwise; invalid timestamps show `時間不明`. Empty panels explain what will appear there, and footer keys are highlighted separately from their descriptions.
+
+Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
 
 ## Security limits
 

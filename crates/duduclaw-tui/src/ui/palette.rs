@@ -7,7 +7,7 @@ use crate::{
     blocks::Block, chat::Focus, sanitize::TerminalText, settings::Settings, state::Model, strings,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{Frame, layout::Rect, widgets::Clear};
+use ratatui::{Frame, layout::Rect};
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -84,7 +84,12 @@ impl App {
             }
             return commands;
         }
-        add(KeyCode::F(1), none, strings::CMD_HELP, "F1 / ?", "help");
+        add(KeyCode::Char('I'), none, strings::INBOX, "I", "inbox");
+        add(KeyCode::Char('M'), none, "通知信箱", "M", "mailbox notifications");
+        add(KeyCode::Char('z'), none, "放大／還原區塊", super::shell::ZOOM_KEY, "zoom fullscreen");
+        if m2::manager(model) { add(KeyCode::Char('S'), none, strings::NEXT_RUNS, "S", "schedule heartbeat cron"); }
+        add(KeyCode::Tab, none, "下一個員工分頁", "Tab", "tab workspace");
+        add(KeyCode::F(1), none, strings::CMD_HELP, &format!("F1 / {}", super::shell::HELP_KEY), "help");
         add(
             KeyCode::PageUp,
             none,
@@ -359,6 +364,9 @@ impl App {
                 let command = commands.get(palette.selected).cloned();
                 self.palette = None;
                 if let Some(command) = command {
+                    // An explicit palette command leaves the local notification surface.
+                    self.mailbox = None;
+                    self.toast_focus = None;
                     match command.control {
                         Some(crate::controls::Control::Autonomy { agent, resume }) => return self.autonomy_control(agent, resume, model),
                         Some(control @ crate::controls::Control::Employee { .. }) => {
@@ -401,46 +409,45 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, app: &App, settings: &Setti
         width,
         height,
     );
-    frame.render_widget(Clear, area);
-    let inner = super::widgets::panel(frame, area, strings::PALETTE_TITLE, settings, false);
+    let inner = super::widgets::overlay(frame, area, strings::PALETTE_TITLE, settings);
     let commands = app.palette_commands(model);
     let selected = palette.selected.min(commands.len().saturating_sub(1));
-    let visible = usize::from(inner.height.saturating_sub(2));
+    let visible = usize::from(inner.height.saturating_sub(3));
     let offset = (selected + 1).saturating_sub(visible);
-    let mut lines = vec![
-        format!("> {}_", palette.query),
-        strings::PALETTE_KEYS.into(),
-    ];
+    super::widgets::styled(frame, Rect::new(inner.x, inner.y, inner.width, 1),
+        &format!("> {}_", palette.query), settings, settings.colors.base());
+    super::widgets::styled(frame, Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        "指令", settings, settings.colors.muted());
     if commands.is_empty() {
-        lines.push(strings::PALETTE_EMPTY.into());
+        super::widgets::styled(frame, Rect::new(inner.x, inner.y + 2, inner.width, 1), strings::PALETTE_EMPTY, settings, settings.colors.muted());
     }
-    lines.extend(
-        commands
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(visible)
-            .map(|(i, c)| {
-                format!(
-                    "{} [{}] {}",
-                    if i == selected { ">" } else { " " },
-                    c.hint,
-                    c.label
-                )
-            }),
-    );
-    for (i, line) in lines
-        .into_iter()
-        .take(usize::from(inner.height))
-        .enumerate()
-    {
-        super::widgets::text(
-            frame,
-            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
-            TerminalText::new(line),
-            settings,
-            false,
-            false,
-        );
+    for (row, (index, command)) in commands.iter().enumerate().skip(offset).take(visible).enumerate() {
+        let area = Rect::new(inner.x, inner.y + 2 + row as u16, inner.width, 1);
+        let style = if index == selected { settings.colors.selected() } else { settings.colors.base() };
+        frame.buffer_mut().set_style(area, style);
+        let chip = format!(" {} ", command.hint);
+        let chip_width = super::text::columns(&chip, settings.ambiguous_width).min(usize::from(area.width / 3)) as u16;
+        let label_area = Rect::new(area.x + 2, area.y, area.width.saturating_sub(chip_width + 3), 1);
+        super::widgets::styled(frame, Rect::new(area.x, area.y, 2.min(area.width), 1),
+            if index == selected { if settings.glyphs == crate::settings::Glyphs::Unicode { "›" } else { ">" } } else { " " }, settings, style);
+        super::widgets::styled(frame, label_area, command.label, settings, style);
+        // Highlight the same subsequence used by fuzzy matching; aliases need not match the label.
+        let query = palette.query.to_lowercase();
+        let mut query = query.chars().filter(|c| !c.is_whitespace()).peekable();
+        let mut x = label_area.x;
+        for g in command.label.graphemes(true) {
+            let width = super::text::columns(g, settings.ambiguous_width) as u16;
+            if x + width > label_area.right() { break; }
+            if query.peek().is_some_and(|ch| g.to_lowercase().contains(*ch)) {
+                query.next();
+                super::widgets::styled(frame, Rect::new(x, area.y, width, 1), g, settings,
+                    settings.colors.on(style.bg.unwrap_or(settings.colors.surface_raised)).foreground(settings.colors.accent));
+            }
+            x += width;
+        }
+        super::widgets::styled(frame, Rect::new(area.right() - chip_width, area.y, chip_width, 1),
+            &chip, settings, settings.colors.on(settings.colors.hover).muted());
     }
+    super::widgets::key_hints(frame, Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        TerminalText::new("↑↓ 選取  Enter 執行  Esc 關閉".into()), settings);
 }

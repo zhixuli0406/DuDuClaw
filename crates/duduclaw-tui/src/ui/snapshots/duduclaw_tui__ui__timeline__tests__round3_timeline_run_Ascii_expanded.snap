@@ -1,0 +1,12 @@
+---
+source: crates/duduclaw-tui/src/ui/timeline.rs
+expression: output
+---
+> 1 執行紀錄 · 閘道未提供 · 回合 2
+已訂閱員工執行事件
+1/1 · [] 切換執行 · c 內容 · t 時間軸 · Enter 展開
+  1 分鐘前 > 執行 Read 訂單.csv +
+> 1 分鐘前 v 執行 Write 報表.csv x
+    Write 報表.csv
+    1 分鐘前 [tool_use]   Write 報表.csv 檔案唯讀
+  剛剛 > 回合 第 2 回合 +

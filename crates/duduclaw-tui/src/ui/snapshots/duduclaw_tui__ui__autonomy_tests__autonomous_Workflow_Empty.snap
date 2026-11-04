@@ -1,7 +1,6 @@
 ---
 source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
-assertion_line: 108
 expression: body
 ---
 [ / ] 切換執行；s 取消流程（確認卡）；完整清單請到儀表板
-此範圍沒有可見資料；不代表系統沒有異常
+此範圍沒有可見資料；不代表系統沒有異常；工作流程執行會顯示於此；Ctrl-P 查看命令

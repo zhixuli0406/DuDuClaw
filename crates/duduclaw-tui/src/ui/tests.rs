@@ -93,7 +93,14 @@ fn connection() -> ConnectionState {
     })
 }
 fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16) -> String {
+    crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
     let mut app = app.clone();
+    for message in &mut app.chat.messages { message.time = "10:02".into(); }
+    app.chat.revision = app.chat.revision.wrapping_add(1);
+    for pane in &mut app.blocks.panes {
+        for message in &mut pane.chat_view.state.messages { message.time = "10:02".into(); }
+        pane.chat_view.state.revision = pane.chat_view.state.revision.wrapping_add(1);
+    }
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| {
@@ -127,13 +134,14 @@ fn screen(model: &Model, app: &App, settings: &Settings, width: u16, height: u16
         output.push('\n');
     }
     output
+    })
 }
 #[test]
 fn empty_screen() {
     let m = empty();
     let mut a = App::default();
     a.refresh(&m);
-    insta::assert_snapshot!(screen(&m, &a, &Settings::default(), 100, 30));
+    insta::assert_snapshot!(screen(&m, &a, &Settings::test_defaults(), 100, 30));
 }
 #[test]
 fn stale_screen() {
@@ -142,7 +150,7 @@ fn stale_screen() {
     let mut a = App::default();
     a.selected = Some(Selection::Inbox("approval:a1".into()));
     a.detail_open = true;
-    insta::assert_snapshot!(screen(&m, &a, &Settings::default(), 100, 30));
+    insta::assert_snapshot!(screen(&m, &a, &Settings::test_defaults(), 100, 30));
     let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
     t.draw(|f| {
         render::draw(
@@ -151,7 +159,7 @@ fn stale_screen() {
             &connection(),
             &TerminalText::new("home".into()),
             &mut a,
-            &Settings::default(),
+            &Settings::test_defaults(),
         )
     })
     .unwrap();
@@ -161,42 +169,39 @@ fn stale_screen() {
             .content
             .iter()
             .filter(|c| c.symbol() != " ")
-            .any(|c| c.fg == Color::DarkGray)
+            .any(|c| c.fg == Settings::test_defaults().colors.muted)
     );
     assert!(m.inbox.count().is_none());
 }
 
 #[test]
-fn selected_employee_row_uses_white_bold_text() {
+fn selected_employee_row_uses_semantic_selection_tokens() {
     let mut m = empty();
     m.employees = fresh(vec![employee("adu", "阿嘟", "active")]);
     let mut a = App::default();
     a.refresh(&m);
     a.selected = Some(Selection::Employee("adu".into()));
     let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
-    t.draw(|f| render::draw(f, &m, &connection(), &TerminalText::new("home".into()), &mut a, &Settings::default())).unwrap();
+    t.draw(|f| render::draw(f, &m, &connection(), &TerminalText::new("home".into()), &mut a, &Settings::test_defaults())).unwrap();
     let buffer = t.backend().buffer();
-    let (name_y, _) = (0..buffer.area.height)
+    let (name_y, name_x) = (0..buffer.area.height)
         .find_map(|y| {
-            (0..buffer.area.width)
+            (0..28)
                 .find(|&x| buffer[(x, y)].symbol() == "阿")
                 .map(|x| (y, x))
         })
         .unwrap();
-    let marker = (1..buffer.area.width)
-        .map(|x| &buffer[(x, name_y)])
-        .find(|cell| cell.symbol() == ">")
-        .unwrap();
+    let marker = &buffer[(name_x, name_y)];
     assert_ne!(marker.fg, Color::Yellow);
-    assert_eq!(marker.fg, Color::White);
+    assert_eq!(marker.fg, Settings::test_defaults().colors.selection_fg);
     assert!(marker.modifier.contains(Modifier::BOLD));
-    assert_eq!(marker.bg, Color::DarkGray);
+    assert_eq!(marker.bg, Settings::test_defaults().colors.selection_bg);
 
     let name = (0..buffer.area.width)
         .map(|x| &buffer[(x, name_y)])
         .find(|cell| cell.symbol() == "阿")
         .unwrap();
-    assert_eq!(name.fg, Color::White);
+    assert_eq!(name.fg, Settings::test_defaults().colors.selection_fg);
     assert!(name.modifier.contains(Modifier::BOLD));
 }
 #[test]
@@ -205,7 +210,7 @@ fn populated_inbox_and_employees() {
     let mut a = App::default();
     a.refresh(&m);
     a.detail_open = true;
-    insta::assert_snapshot!(screen(&m, &a, &Settings::default(), 100, 36));
+    insta::assert_snapshot!(screen(&m, &a, &Settings::test_defaults(), 100, 36));
 }
 #[test]
 fn non_admin_screen() {
@@ -213,8 +218,8 @@ fn non_admin_screen() {
     m.role = Some(Role::Employee);
     let mut a = App::default();
     a.refresh(&m);
-    let output = screen(&m, &a, &Settings::default(), 100, 30);
-    assert!(output.contains(strings::ADMIN_ONLY));
+    let output = screen(&m, &a, &Settings::test_defaults(), 100, 30);
+    assert!(!output.contains(strings::NEXT_RUNS));
     assert!(!output.contains("11:00"));
     insta::assert_snapshot!(output);
 }
@@ -224,7 +229,7 @@ fn narrow_60_columns() {
     let mut a = App::default();
     a.refresh(&m);
     a.detail_open = true;
-    insta::assert_snapshot!(screen(&m, &a, &Settings::default(), 60, 32));
+    insta::assert_snapshot!(screen(&m, &a, &Settings::test_defaults(), 60, 32));
 }
 #[test]
 fn cjk_names() {
@@ -236,7 +241,7 @@ fn cjk_names() {
     let mut a = App::default();
     a.refresh(&m);
     a.detail_open = true;
-    insta::assert_snapshot!(screen(&m, &a, &Settings::default(), 80, 28));
+    insta::assert_snapshot!(screen(&m, &a, &Settings::test_defaults(), 80, 28));
 }
 #[test]
 fn hostile_name_visible_only_in_detail() {
@@ -248,8 +253,9 @@ fn hostile_name_visible_only_in_detail() {
     )]);
     let mut a = App::default();
     a.refresh(&m);
+    a.key(ordinary_key('D'), &m);
     a.detail_open = true;
-    let output = screen(&m, &a, &Settings::default(), 100, 28);
+    let output = screen(&m, &a, &Settings::test_defaults(), 100, 28);
     assert!(!output.contains('\x1b'));
     assert!(!output.contains('\u{202e}'));
     assert!(output.contains("U+202E"));
@@ -274,7 +280,7 @@ fn ambiguous(width: AmbiguousWidth) {
     let s = Settings {
         glyphs: Glyphs::Unicode,
         ambiguous_width: width,
-        ..Default::default()
+        ..Settings::test_defaults()
     };
     let output = screen(&m, &a, &s, 100, 36);
     match width {
@@ -287,6 +293,7 @@ fn selection_survives_refresh_and_removal_without_focus_theft() {
     let mut m = populated();
     let mut a = App::default();
     a.refresh(&m);
+    a.key(ordinary_key('I'), &m);
     a.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &m);
     let selected = a.selected.clone();
     a.detail_open = true;
@@ -299,7 +306,7 @@ fn selection_survives_refresh_and_removal_without_focus_theft() {
     assert!(a.detail_open);
     insta::assert_snapshot!(
         "selection_after_refresh",
-        screen(&m, &a, &Settings::default(), 100, 36)
+        screen(&m, &a, &Settings::test_defaults(), 100, 36)
     );
     m.inbox
         .items
@@ -310,7 +317,7 @@ fn selection_survives_refresh_and_removal_without_focus_theft() {
     let mut a = App::default();
     a.refresh(&empty());
     a.refresh(&m);
-    assert_eq!(a.selected, Selection::all(&m).into_iter().next());
+    assert_eq!(a.selected, Some(Selection::InboxEntry)); // New employees do not steal the entry selection.
 }
 #[test]
 fn badges_priority_done_receipts_and_identity_not_display_normalization() {
@@ -349,6 +356,7 @@ fn mark_read_is_local_and_keys_keep_list_focus() {
     let m = populated();
     let mut a = App::default();
     a.refresh(&m);
+    a.key(ordinary_key('I'), &m);
     assert_eq!(
         a.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &m),
         Action::Save
@@ -399,7 +407,7 @@ fn json_preserves_raw_data_while_text_is_safe() {
 #[test]
 fn narrow_and_tiny_do_not_panic() {
     for (w, h) in [(1, 1), (24, 12), (60, 12)] {
-        let _ = screen(&populated(), &App::default(), &Settings::default(), w, h);
+        let _ = screen(&populated(), &App::default(), &Settings::test_defaults(), w, h);
     }
 }
 
@@ -445,9 +453,11 @@ fn configuration_and_corrupt_state_notices_reach_status_line() {
         strings::SETTINGS_NOTICE,
         strings::READ_STATE_NOTICE
     ));
-    let output = screen(&model, &app, &Settings::default(), 100, 30);
-    assert!(output.contains(strings::SETTINGS_NOTICE));
-    assert!(output.contains(strings::READ_STATE_NOTICE));
+    let output = screen(&model, &app, &Settings::test_defaults(), 100, 30);
+    // Notices now wrap inside the content canvas; join its rendered rows, not borders/sidebar.
+    let content: String = output.lines().filter_map(|line| line.split('|').nth(1)).map(str::trim).collect();
+    assert!(content.contains(strings::SETTINGS_NOTICE));
+    assert!(content.contains(strings::READ_STATE_NOTICE));
 }
 #[test]
 fn loss_discards_live_hints_and_keeps_counts_unknown() {
@@ -514,19 +524,21 @@ fn wide_glyph_refresh_preserves_visible_columns() {
 #[test]
 fn focus_specific_footer_snapshots() {
     let m=populated(); let mut app=App::default(); app.refresh(&m); app.help=true;
-    insta::assert_snapshot!("help_footer",screen(&m,&app,&Settings::default(),100,36));
+    insta::assert_snapshot!("help_footer",screen(&m,&app,&Settings::test_defaults(),100,36));
     app.help=false;
     app.card=Some(super::card::Card::open(m.inbox.items[0].clone(),&m,std::time::Instant::now(),&mut super::card::Codes::default()));
-    insta::assert_snapshot!("card_footer",screen(&m,&app,&Settings::default(),100,36));
+    insta::assert_snapshot!("card_footer",screen(&m,&app,&Settings::test_defaults(),100,36));
 }
 #[test]
 fn selected_last_row_falls_back_after_decision_and_empty_list_recovers() {
     let mut m=empty(); m.inbox.items=vec![approval("a","adu","a","tool","approval"),approval("b","adu","b","tool","approval")];
-    let mut app=App::default(); app.refresh(&m); app.key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE),&m);
+    let mut app=App::default(); app.refresh(&m); app.key(ordinary_key('I'), &m); app.key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE),&m);
     app.decision_finished(crate::decide::Outcome::Refetch); m.inbox.items.pop(); app.refresh(&m);
     assert_eq!(app.selected,Some(Selection::Inbox("approval:a".into())));
-    m.inbox.items.clear(); app.refresh(&m); assert!(app.selected.is_none());
+    m.inbox.items.clear(); app.refresh(&m); assert_eq!(app.selected,Some(Selection::InboxEntry));
     m.inbox.items.push(approval("c","adu","c","tool","approval")); app.refresh(&m);
+    assert_eq!(app.selected,Some(Selection::InboxEntry));
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &m);
     assert_eq!(app.selected,Some(Selection::Inbox("approval:c".into())));
 }
 
@@ -552,7 +564,7 @@ fn input_focus_ime_paste_and_list_actions() {
     app.key(key(KeyCode::Esc), &model);
     assert_eq!(app.focus, Focus::List);
     app.key(key(KeyCode::Char('1')), &model);
-    assert_eq!(app.blocks.active, Block::Detail);
+    assert_eq!(app.blocks.active, Block::Chat);
     app.input.clear();
     app.key(key(KeyCode::Char('/')), &model);
     app.paste("pause");
@@ -577,35 +589,35 @@ fn chat_block_snapshots() {
     app.chat.connected = true; app.chat.stale = false; app.chat.running = true;
     app.chat.append(strings::CHAT_USER, "請幫我查看進度");
     app.chat.status = TerminalText::new(strings::CHAT_THINKING.into());
-    let progress = screen(&empty(), &app, &Settings::default(), 100, 24);
+    let progress = screen(&empty(), &app, &Settings::test_defaults(), 100, 24);
     assert!(progress.contains(strings::INPUT_FOCUS));
     assert!(!progress.contains(strings::LIST_FOCUS));
     insta::assert_snapshot!("chat_progress", progress);
-    app.chat.apply(Frame::parse(r#"{"type":"assistant_done","content":"已完成第一輪檢查。\n下一步：確認使用者回覆。","tokens_used":20}"#).unwrap());
-    insta::assert_snapshot!("chat_finished", screen(&empty(), &app, &Settings::default(), 100, 24));
+    app.chat.apply(Frame::parse(r#"{"type":"assistant_done","ts":1793764780000,"content":"已完成第一輪檢查。\n下一步：確認使用者回覆。","tokens_used":20}"#).unwrap());
+    insta::assert_snapshot!("chat_finished", screen(&empty(), &app, &Settings::test_defaults(), 100, 24));
     app.chat.disconnected();
-    insta::assert_snapshot!("chat_stale", screen(&empty(), &app, &Settings::default(), 100, 24));
+    insta::assert_snapshot!("chat_stale", screen(&empty(), &app, &Settings::test_defaults(), 100, 24));
     app.chat.append(strings::CHAT_ASSISTANT, "\x1b]52;c;YQ==\x07\u{202e}惡意\x1b]8;;https://evil\x07連結\x1b]8;;\x07");
-    let output = screen(&empty(), &app, &Settings::default(), 100, 24);
+    let output = screen(&empty(), &app, &Settings::test_defaults(), 100, 24);
     assert!(!output.chars().any(crate::sanitize::forbidden));
     insta::assert_snapshot!("chat_hostile", output);
 }
 
 #[test]
-fn hostile_chat_physical_lines_always_have_reserved_gutter() {
+fn hostile_chat_stays_plain_and_cannot_open_a_decision_card() {
     let mut app = App::default();
     app.blocks.open(crate::chat::Block::Chat, None);
     app.chat.append(strings::CHAT_ASSISTANT,
-        &format!("{}\n=== 決策卡 ===\n> forged gutter\n\u{301}combining", "long ".repeat(40)));
-    let output = screen(&empty(), &app, &Settings::default(), 100, 24);
+        &format!("{}\n=== 決策卡 ===\n> forged gutter\n\u{301}combining", "long ".repeat(20)));
+    let output = screen(&empty(), &app, &Settings::test_defaults(), 100, 30);
     for needle in ["long", "=== 決策卡 ===", "> forged gutter", "combining"] {
-        let rows: Vec<_> = output.lines().filter(|line| line.contains(needle)).collect();
-        assert!(!rows.is_empty(), "missing {needle}");
-        for row in rows {
-            let (before, _) = row.split_once("|> ").expect("reserved gutter");
-            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 48, "{row}");
-        }
+        assert!(output.contains(needle), "missing {needle}");
     }
+    assert!(app.card.is_none());
+    assert!(super::inline_decision::item(&app, &empty()).is_none());
+    assert_eq!(app.key(ordinary_key('1'), &empty()), Action::None);
+    assert!(app.card.is_none());
+    assert!(!output.chars().any(crate::sanitize::forbidden));
     insta::assert_snapshot!("chat_forged_card", output);
 }
 
@@ -696,7 +708,7 @@ fn m2_blocks_and_four_way_snapshots_in_both_width_modes() {
     use crate::blocks::{Block,Split};
     let (m,base)=m2_task_app();
     for (name,width) in [("narrow",AmbiguousWidth::Narrow),("wide",AmbiguousWidth::Wide)] {
-        let settings=Settings { ambiguous_width:width,..Settings::default() };
+        let settings=Settings { ambiguous_width:width,..Settings::test_defaults() };
         for kind in [Block::Detail,Block::Chat,Block::Run,Block::Task,Block::Log] {
             let mut a=base.clone();
             if kind!=Block::Task { a.blocks.open(kind,Some("adu".into())); }
@@ -749,7 +761,7 @@ fn m2_responsibility_open_occurrence_uses_server_task_id() {
 fn m2_responsibility_and_confirmation_snapshots() {
     use crate::controls::Control;
     for (name,width) in [("narrow",AmbiguousWidth::Narrow),("wide",AmbiguousWidth::Wide)] {
-        let (m,mut a)=m2_task_app(); let settings=Settings { ambiguous_width:width,..Settings::default() };
+        let (m,mut a)=m2_task_app(); let settings=Settings { ambiguous_width:width,..Settings::test_defaults() };
         let p=&mut a.blocks.panes[0]; p.responsibilities=true;
         p.data.selected=json!({"responsibility_id":"resp-1","objective":"每週整理週報","owner_agent_id":"adu","state":"active","control_epoch":3,"stop_at":"2026-11-30"});
         p.data.sections=vec![("summary",json!({"summary":{"next_due_at":"11:00","open_occurrence":{"task_id":"task-1"}}})),
@@ -832,7 +844,7 @@ fn m3_palette_fuzzy_search_ime_and_key_event_kinds() {
 }
 
 #[test]
-fn m3_help_only_covers_focused_block_and_keeps_chat() {
+fn m3_help_overlay_preserves_underlying_chat() {
     use crate::blocks::{Block, Split};
     let model = populated(); let mut app = App::default();
     app.selected = Some(Selection::Employee("adu".into())); app.detail_open = true;
@@ -841,18 +853,17 @@ fn m3_help_only_covers_focused_block_and_keeps_chat() {
     app.chat.append(strings::CHAT_ASSISTANT, "chat-kept-visible");
     // Use the operator path so the departing chat is saved into its pane.
     app.key(ordinary_key('1'), &model); app.help = true;
-    let output = screen(&model, &app, &Settings::default(), 180, 48);
+    let output = screen(&model, &app, &Settings::test_defaults(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
-    assert!(output.contains("chat-kept-visible"));
-    assert!(output.contains("目前身分沒有此決策權限"));
+    assert!(app.blocks.panes[2].chat_view.state.lines.iter().any(|line| line.plain().contains("chat-kept-visible")));
     insta::assert_snapshot!("m3_help_focused_only", output);
     app.key(ordinary_key('?'), &model);
     app.key(ordinary_key('3'), &model);
     assert_eq!(app.blocks.focused, 2);
     app.key(ordinary_key('?'), &model);
-    let output = screen(&model, &app, &Settings::default(), 180, 48);
+    let output = screen(&model, &app, &Settings::test_defaults(), 180, 48);
     assert_eq!(output.matches("操作說明").count(), 1);
-    assert!(!output.contains("chat-kept-visible"));
+    assert!(app.chat.lines.iter().any(|line| line.plain().contains("chat-kept-visible")));
     insta::assert_snapshot!("m3_help_chat_focused", output);
 }
 
@@ -862,8 +873,8 @@ fn m3_small_height_keeps_inbox_and_employee_rows() {
     for height in [12, 13, 14, 16] {
         let mut app = app.clone();
         app.notice = Some(strings::SETTINGS_NOTICE.into());
-        let output = screen(&model, &app, &Settings::default(), 100, height);
-        assert!(output.contains("確認資料匯出"), "inbox row missing at {height}");
+        let output = screen(&model, &app, &Settings::test_defaults(), 100, height);
+        assert!(output.contains("收件匣"), "inbox navigation missing at {height}");
         assert!(output.contains("阿嘟"), "employee row missing at {height}");
         insta::assert_snapshot!(format!("m3_small_height_{height}"), output);
     }
@@ -884,8 +895,10 @@ fn m3_long_home_keeps_tail_in_both_width_modes() {
             assert_eq!(super::text::columns(&row, width), 60);
             row.trim_end().to_string()
         }).collect::<Vec<_>>().join("\n");
-        assert!(output.lines().next().unwrap().contains("最後目錄"));
-        assert!(output.contains('…'));
+        assert!(app.help_text().plain().contains(&home.plain()));
+        assert!(output.contains(strings::CONNECTED));
+        // Home moved to help; it no longer competes with the brand or connection.
+        assert!(!output.contains("very-long-home"));
         insta::assert_snapshot!(format!("m3_long_home_{width:?}"), output);
     }
 }
@@ -895,9 +908,9 @@ fn m3_palette_snapshot() {
     let (model, mut app) = m2_task_app();
     app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &model);
     app.paste("st");
-    let output = screen(&model, &app, &Settings::default(), 100, 30);
-    assert!(output.contains("[s]")); assert!(output.contains("停止任務"));
-    assert!(output.contains("[e]")); assert!(output.contains("調整任務方向"));
+    let output = screen(&model, &app, &Settings::test_defaults(), 100, 30);
+    assert!(output.contains(" s ")); assert!(output.contains("停止任務"));
+    assert!(output.contains(" e ")); assert!(output.contains("調整任務方向"));
     insta::assert_snapshot!("m3_palette", output);
 }
 
@@ -942,7 +955,7 @@ fn m4_pty_cjk_and_combining_snapshots_in_both_width_modes() {
         pty.status=crate::strings::PTY_RUNNING.into();
     }
     for width in [AmbiguousWidth::Narrow,AmbiguousWidth::Wide] {
-        let settings=Settings { ambiguous_width:width,..Settings::default() };
+        let settings=Settings { ambiguous_width:width,..Settings::test_defaults() };
         insta::assert_snapshot!(format!("m4_pty_cjk_{width:?}"),screen(&empty(),&app,&settings,100,24));
     }
 }
@@ -967,6 +980,8 @@ fn m4_unsupported_platform_never_enters_child_input() {
 fn m4_real_crossterm_parser_probe() {
     use std::{io::Write, time::Duration};
     if std::env::var_os("TUI_RAW_PARSER_PROBE").is_none() { return; }
+    let mut settings = Settings::parse("theme = 'auto'").0;
+    settings.resolve_theme();
     crossterm::terminal::enable_raw_mode().unwrap();
     println!("PARSER_READY");
     std::io::stdout().flush().unwrap();
@@ -980,6 +995,10 @@ fn m4_real_crossterm_parser_probe() {
         };
         key
     };
+    // The first key after startup travels through the production input reader.
+    assert!(crossterm::event::poll(Duration::from_secs(5)).unwrap());
+    assert_eq!(super::read_host_event(&mut app, super::read_ready_event).unwrap(),
+        Some(Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))));
     // Raw 0x1c, CSI-u backslash, CSI-u raw control char, then F12.
     for expected in [
         KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
@@ -1035,7 +1054,7 @@ fn m4_escape_and_control_bindings_through_real_terminal_parser() {
         while !String::from_utf8_lossy(&output).contains("PARSER_READY") {
             output.extend(rx.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?);
         }
-        writer.write_all(b"\x1c\x1b[92;5u\x1b[28u\x1b[28;5u\x1b[24~\x17\x10").map_err(|e| e.to_string())?;
+        writer.write_all(b"r\x1c\x1b[92;5u\x1b[28u\x1b[28;5u\x1b[24~\x17\x10").map_err(|e| e.to_string())?;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -1110,7 +1129,7 @@ fn downstream_app(now: std::time::Instant) -> App {
     app.chat.stale = false;
     app.chat.running = true;
     app.chat.apply_at(crate::chat::Frame::parse(
-        r#"{"type":"error","code":"cancelled","downstream_running":2,"downstream_ref":"opaque-never-render"}"#
+        r#"{"type":"error","ts":1793764780000,"code":"cancelled","downstream_running":2,"downstream_ref":"opaque-never-render"}"#
     ).unwrap(), now);
     app
 }
@@ -1164,14 +1183,14 @@ fn downstream_prompt_snapshots_preserve_focus_and_hide_reference() {
     let mut app = downstream_app(now);
     app.focus = crate::chat::Focus::Input;
     assert!(app.downstream_prompt(now).is_some());
-    let output = screen(&empty(), &app, &Settings::default(), 240, 24);
+    let output = screen(&empty(), &app, &Settings::test_defaults(), 240, 24);
     assert!(output.contains(strings::DOWNSTREAM_INPUT_HINT));
     assert!(output.contains(&strings::downstream_prompt(2)));
     assert!(!output.contains("opaque-never-render"));
     assert_eq!(app.focus, crate::chat::Focus::Input);
     insta::assert_snapshot!("downstream_prompt_input", output);
     app.focus = crate::chat::Focus::List;
-    insta::assert_snapshot!("downstream_prompt_list", screen(&empty(), &app, &Settings::default(), 240, 24));
+    insta::assert_snapshot!("downstream_prompt_list", screen(&empty(), &app, &Settings::test_defaults(), 240, 24));
 }
 
 fn autonomy_model(value: serde_json::Value) -> Model {
@@ -1195,8 +1214,8 @@ fn assert_autonomy_unconfirmed(m: &Model) {
     assert!(line.contains(strings::AUTONOMY_UNKNOWN));
     assert!(!line.contains(strings::AUTONOMY_PAUSED));
     assert!(!line.contains(strings::AUTONOMY_ALL));
-    let output = screen(m, &App::default(), &Settings::default(), 180, 24);
-    assert!(output.contains(strings::AUTONOMY_ROW_UNKNOWN));
+    let output = screen(m, &App::default(), &Settings::test_defaults(), 180, 24);
+    assert!(output.contains(strings::AUTONOMY_UNKNOWN));
     assert!(!output.contains(strings::AUTONOMY_ROW_PAUSED));
 }
 
@@ -1255,14 +1274,14 @@ fn autonomy_status_line_snapshots_and_hostile_names() {
         ("state_error", json!({"global":null,"agents":{},"state_error":"unreadable"})),
     ] {
         let m = autonomy_model(value);
-        let rendered = screen(&m, &App::default(), &Settings::default(), 120, 16);
-        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().nth(2).unwrap().trim_end());
+        let rendered = screen(&m, &App::default(), &Settings::test_defaults(), 120, 16);
+        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().find(|line| line.contains("自主:")).map(str::trim_end).unwrap_or("沒有自主暫停"));
     }
     let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause},"state_error":null}));
     m.autonomy.error = Some(crate::Error::Timeout); m.autonomy.stale = true;
-    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end());
+    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.contains("自主:")).unwrap().trim_end());
     m.autonomy = Default::default();
-    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end());
+    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.contains("自主:")).unwrap().trim_end());
     m.autonomy = fresh(vec![crate::autonomy::Status::parse(json!({"global":null,"agents":{"adu":pause},"state_error":null})).unwrap()]);
     m.employees.items[0].display_name = TerminalText::new("阿\u{1b}[2K\u{202e}\u{200b}嘟\nhostile".into());
     let line = crate::autonomy::status_line(&m).unwrap().plain();
@@ -1373,7 +1392,9 @@ fn autonomy_employee_states_are_distinct() {
         assert_eq!(employee_status(&employee("adu","阿嘟",status),&m,&read), EmployeeStatus::AutonomyPaused);
     }
     m.inbox = fresh(vec![approval("pending", "adu", "review", "tool", "approval")]);
-    assert!(screen(&m,&App::default(),&Settings::default(),180,24).contains("待回覆 · 自主已暫停"));
+    let output = screen(&m,&App::default(),&Settings::test_defaults(),180,24);
+    assert!(output.contains("需要你"));
+    assert!(output.contains(strings::AUTONOMY_PAUSED));
     m.inbox = fresh(vec![]);
     assert_eq!(employee_status(&employee("adu","阿嘟","paused"),&m,&read),EmployeeStatus::Paused);
     assert_eq!(employee_status(&employee("adu","阿嘟","stopped"),&m,&read),EmployeeStatus::Ended);
@@ -1391,7 +1412,7 @@ fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
     app.blocks.panes[0].data.selected = json!({"responsibility_id":"resp1","control_epoch":4,"owner_agent_id":"adu"});
     assert_eq!(app.key(ordinary_key('p'),&m),Action::None);
     assert_eq!(app.control_card.as_ref().unwrap().control.request(),("responsibilities.pause",json!({"responsibility_id":"resp1","expected_control_epoch":4})));
-    for block in [crate::blocks::Block::Detail,crate::blocks::Block::Run,crate::blocks::Block::Log] {
+    for block in [crate::blocks::Block::Detail,crate::blocks::Block::Run,crate::blocks::Block::Log,crate::blocks::Block::Task] {
         for (source,key,enabled,method) in [
             (ScheduleSource::Cron,'p',true,"cron.pause"),
             (ScheduleSource::Cron,'p',false,"cron.resume"),
@@ -1408,6 +1429,7 @@ fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
             assert_eq!(app.input, key.to_string()); assert!(app.control_card.is_none());
             app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &m);
             app.key(ordinary_key(char::from(b'1' + original_pane as u8)), &m);
+            app.key(ordinary_key('S'), &m); // Schedule controls belong to the visible schedule view.
             assert_eq!(app.key(ordinary_key(key),&m),Action::None);
             let (actual,params) = app.control_card.as_ref().unwrap().control.request();
             assert_eq!(actual,method);
@@ -1424,13 +1446,13 @@ fn header_cost_refusal_footer_selection_and_run_round_are_visible() {
     app.blocks.open(crate::blocks::Block::Run,Some("adu".into()));
     app.blocks.panes[0].data=crate::blocks::Data { stale:false,total:1,selected:json!({"id":"dispatch:1","agent_id":"adu","channel":"goal","round":2,"status":"running"}), ..Default::default() };
     model.cost_millicents=Some(123_000);
-    let output=screen(&model,&app,&Settings::default(),140,30);
-    assert!(output.contains("$1.2300")); assert!(output.contains("近 24 小時"));
+    let output=screen(&model,&app,&Settings::test_defaults(),140,30);
+    assert!(output.contains("$1.23")); assert!(output.contains("近 24 小時"));
     assert!(output.contains("goal · 回合 2")); assert!(output.contains("阿嘟"));
     assert!(output.contains("Ctrl-P")); assert!(output.contains("q 離開"));
     insta::assert_snapshot!("autonomy_header_cost",output);
     model.cost_millicents=None;
-    let output=screen(&model,&app,&Settings::default(),140,30);
+    let output=screen(&model,&app,&Settings::test_defaults(),140,30);
     assert!(!output.contains('$'));
     insta::assert_snapshot!("autonomy_header_cost_hidden",output);
 }
@@ -1442,10 +1464,11 @@ fn heartbeat_uses_last_run_and_cron_uses_gateway_next_run_without_prediction() {
         ScheduledRun { id:"heartbeat:adu".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new("2026-11-03T01:00:00Z".into()),source:ScheduleSource::Heartbeat,detail:json!({"last_run":"2026-11-02T01:00:00Z"}) },
         ScheduledRun { id:"cron:c1".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new(strings::NOT_SCHEDULED.into()),source:ScheduleSource::Cron,detail:json!({"next_run":null,"last_status":"success"}) },
     ]);
-    let app=App::default();
-    let output=screen(&model,&app,&Settings::default(),200,40);
-    assert!(output.contains("上次執行: 2026-11-02T01:00:00Z"));
-    assert!(output.contains("2026-11-03T01:00:00Z")); assert!(output.contains(strings::NOT_SCHEDULED));
+    let mut app=App::default(); app.key(ordinary_key('S'), &model);
+    let output=screen(&model,&app,&Settings::test_defaults(),200,40);
+    assert!(output.contains("上次執行: 11/02 09:00"));
+    assert!(output.contains("11/03 09:00")); assert!(output.contains(strings::NOT_SCHEDULED));
+    assert!(!output.contains("2026-11-03T"));
     insta::assert_snapshot!("autonomy_schedule_times",output);
 }
 
@@ -1516,7 +1539,7 @@ fn concurrent_chat_real_keys_keep_drafts_scrollback_cancel_and_prompt_in_own_pan
     app.key(key('1'), &model);
     assert_eq!(app.input, "draft A"); assert_eq!(app.chat_scroll, 7);
     assert_eq!(app.key(key('X'), &model), Action::CancelChat);
-    rooms.apply(Frame::parse(&json!({"type":"error","code":"cancelled","conv":a["conv"],"msg_id":a["msg_id"],"downstream_ref":"private-reference","downstream_running":2}).to_string()).unwrap());
+    rooms.apply(Frame::parse(&json!({"type":"error","ts":1793764780000_i64,"code":"cancelled","conv":a["conv"],"msg_id":a["msg_id"],"downstream_ref":"private-reference","downstream_running":2}).to_string()).unwrap());
     app.sync_chats(&rooms);
     assert_eq!(app.blocks.focused, 0);
     assert!(app.downstream_prompt(std::time::Instant::now()).is_some());
@@ -1524,7 +1547,7 @@ fn concurrent_chat_real_keys_keep_drafts_scrollback_cancel_and_prompt_in_own_pan
     assert_eq!(app.input, "draft B"); assert!(app.chat.running);
     assert!(app.downstream_prompt(std::time::Instant::now()).is_none());
     assert_eq!(app.key(key('y'), &model), Action::None);
-    let output = screen(&model, &app, &Settings::default(), 140, 36);
+    let output = screen(&model, &app, &Settings::test_defaults(), 140, 36);
     assert!(!output.contains("private-reference"));
     insta::assert_snapshot!("two_chat_interleaved", output);
     app.key(key('1'), &model); app.key(key('i'), &model);
@@ -1602,15 +1625,15 @@ fn pty_mouse_uses_focused_viewport_and_never_focuses_another_pane() {
     { let mut session = pty.lock().unwrap(); session.set_screen_for_test(parser.screen()); session.set_writer_for_test(Capture(captured.clone())); }
     app.blocks.panes[0].pty_area = ratatui::layout::Rect::new(40, 10, 20, 4);
     let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 42, row: 11, modifiers: KeyModifiers::NONE };
-    app.mouse(click, &Settings::default());
+    app.mouse(click, &Settings::test_defaults());
     assert!(captured.lock().unwrap().is_empty());
     app.pty_focus = true;
-    app.mouse(MouseEvent { column: 39, ..click }, &Settings::default());
-    app.mouse(MouseEvent { row: 14, ..click }, &Settings::default());
+    app.mouse(MouseEvent { column: 39, ..click }, &Settings::test_defaults());
+    app.mouse(MouseEvent { row: 14, ..click }, &Settings::test_defaults());
     assert!(captured.lock().unwrap().is_empty());
-    app.mouse(click, &Settings::default());
+    app.mouse(click, &Settings::test_defaults());
     for column in [40, 41, 42] {
-        app.mouse(MouseEvent { column, row: 10, ..click }, &Settings::default());
+        app.mouse(MouseEvent { column, row: 10, ..click }, &Settings::test_defaults());
     }
     let expected = b"\x1b[<0;3;2M\x1b[<0;1;1M\x1b[<0;2;1M\x1b[<0;3;1M";
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -1622,7 +1645,7 @@ fn pty_mouse_uses_focused_viewport_and_never_focuses_another_pane() {
     assert_eq!(app.blocks.focused, 0);
     app.pty_focus = false;
     app.blocks.add(crate::blocks::Split::Vertical);
-    app.mouse(click, &Settings::default());
+    app.mouse(click, &Settings::test_defaults());
     assert_eq!(app.blocks.focused, 1);
     assert_eq!(*captured.lock().unwrap(), expected);
 }
@@ -1647,7 +1670,7 @@ fn downstream_prompt_keeps_answer_keys_and_count_in_narrow_chat() {
         let backend = ratatui::backend::TestBackend::new(width, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| {
-            super::chat_render::draw(frame, frame.area(), &mut app, &Settings::default(), strings::CHAT_ASSISTANT);
+            super::chat_render::draw(frame, frame.area(), &mut app, &Settings::test_defaults(), strings::CHAT_ASSISTANT);
         }).unwrap();
         let buffer = terminal.backend().buffer();
         let mut output = String::new();
@@ -1664,5 +1687,640 @@ fn downstream_prompt_keeps_answer_keys_and_count_in_narrow_chat() {
         assert!(output.contains("n 繼續"), "{width}: {output}");
         assert!(output.contains('2'), "{width}: {output}");
         assert!(!output.contains("opaque-never-render"));
+    }
+}
+
+#[test]
+fn round1_visual_modes() {
+    use crate::theme::{Capability, Theme, ThemeMode};
+    for (name, mode, glyphs, capability) in [
+        ("round1_dark", ThemeMode::Dark, Glyphs::Unicode, Capability::TrueColor),
+        ("round1_light", ThemeMode::Light, Glyphs::Unicode, Capability::TrueColor),
+        ("round1_ascii", ThemeMode::Dark, Glyphs::Ascii, Capability::Ansi16),
+        ("round1_no_color", ThemeMode::Dark, Glyphs::Unicode, Capability::NoColor),
+    ] {
+        let settings = Settings { glyphs, theme: mode, colors: Theme::new(mode, capability), ..Settings::test_defaults() };
+        let model = populated();
+        let mut app = App::default(); app.refresh(&model);
+        app.selected = Some(Selection::Employee("adu".into()));
+        let mut terminal = Terminal::new(TestBackend::new(110, 38)).unwrap();
+        crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
+            terminal.draw(|f| render::draw(f, &model, &connection(), &TerminalText::new("~/.duduclaw".into()), &mut app, &settings)).unwrap();
+        });
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for y in 0..38 {
+            let mut row = String::new(); let mut x = 0;
+            while x < 110 { let cell = &buffer[(x,y)]; row.push_str(cell.symbol()); x += cell.cell_width().max(1); }
+            output.push_str(row.trim_end()); output.push('\n');
+        }
+        output.push_str("\nPainted semantic cells (symbol, foreground, background, modifiers):\n");
+        for symbol in ["◉", "●", "○", "✓", "✕", "⏸", ">", "╭", "+", "C", "命"] {
+            if let Some(cell) = buffer.content.iter().find(|c| c.symbol() == symbol) {
+                output.push_str(&format!("{symbol}: {:?} / {:?} / {:?}\n", cell.fg, cell.bg, cell.modifier));
+            }
+        }
+        let footer_key = buffer.content.iter().enumerate().find(|(i,c)| *i / 110 >= 34 && c.symbol() == "?").map(|(_,c)| c).unwrap();
+        output.push_str(&format!("footer help: {:?} / {:?}\n", footer_key.fg, footer_key.modifier));
+        assert_eq!(footer_key.fg, settings.colors.accent);
+        if capability == Capability::NoColor {
+            assert!(buffer.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+            assert!(buffer.content.iter().any(|c| c.modifier.contains(Modifier::REVERSED)));
+        }
+        insta::assert_snapshot!(name, output);
+    }
+}
+
+#[test]
+fn round1_unicode_wide_cards_and_palette_preserve_physical_columns() {
+    let settings = Settings { glyphs: Glyphs::Unicode, ambiguous_width: AmbiguousWidth::Wide, ..Settings::test_defaults() };
+    let model = populated(); let mut app = App::default(); app.refresh(&model);
+    for width in [99, 100] { screen(&model, &app, &settings, width, 36); }
+    app.card = Some(super::card::Card::open(model.inbox.items[0].clone(), &model, std::time::Instant::now(), &mut app.codes));
+    for width in [99, 100] { screen(&model, &app, &settings, width, 36); }
+    app.card = None;
+    app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &model);
+    for width in [99, 100] { screen(&model, &app, &settings, width, 36); }
+}
+
+#[test]
+fn round1_header_hides_default_home_and_unknown_counts() {
+    let model = Model::default(); let mut app = App::default();
+    let mut terminal = Terminal::new(TestBackend::new(100,30)).unwrap();
+    terminal.draw(|f| render::draw(f, &model, &ConnectionState::Connecting,
+        &TerminalText::new("~/.duduclaw".into()), &mut app, &Settings::test_defaults())).unwrap();
+    let header: String = (0..3).flat_map(|y| (0..100).map(move |x| (x,y)))
+        .map(|p| terminal.backend().buffer()[p].symbol()).collect();
+    assert!(!header.contains('?')); assert!(!header.contains(".duduclaw"));
+    assert!(!header.contains("執行中"));
+}
+
+fn round2_fixture() -> (Model, App) {
+    let mut model = empty();
+    model.cost_millicents = Some(42_000);
+    model.cost_today = true;
+    model.employees = fresh(vec![
+        employee("ops", "Ops", "paused"),
+        employee("writer", "Writer 中文編輯", "active"),
+        employee("prod", "Prod-shaped", "working"),
+        employee("plain", "Plain Test Employee", "active"),
+        employee("error", "Error 檢查員", "error"),
+    ]);
+    model.inbox = fresh(vec![approval("quote", "plain", "寄出報價", "寄信", "approval")]);
+    model.schedules = fresh(vec![ScheduledRun {
+        id: "heartbeat:writer".into(), agent: TerminalText::new("writer".into()),
+        next_run: TerminalText::new("2026-11-04T04:12:00Z".into()), source: ScheduleSource::Heartbeat,
+        detail: json!({"agent_id":"writer","last_run":null,"enabled":true}),
+    }]);
+    model.autonomy.items[0].agents.insert("ops".into(), serde_json::from_value(json!({
+        "reason":"維護資料庫", "who":"u1", "at":"2026-11-04T03:00:00Z"
+    })).unwrap());
+    let mut app = App::default();
+    app.refresh(&model);
+    app.chat.connected = true;
+    app.chat.stale = false;
+    app.chat.status = TerminalText::new(strings::CONNECTED.into());
+    app.chat.append(strings::CHAT_USER, "幫我整理本週訂單");
+    app.chat.append(strings::CHAT_ASSISTANT, "本週共 12 筆，已整理好，請確認報價。");
+    let mut task = crate::blocks::Blocks::default();
+    task.open(crate::blocks::Block::Task, Some("prod".into()));
+    task.panes[0].data = crate::blocks::Data { stale: false,
+        selected: json!({"id":"goal","assigned_to":"prod","goal_mode":true,"status":"doing","iteration_cap":5}),
+        sections: vec![("iterations",json!({"iterations":[{"round":2,"dispatched_at":"2026-11-04T03:57:00Z"}]}))],
+        ..Default::default() };
+    app.blocks.parked.push(task.panes.remove(0));
+    (model, app)
+}
+
+#[test]
+fn round2_sidebar_sizes_unicode_and_ascii() {
+    let (model, app) = round2_fixture();
+    for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
+        for (width, height) in [(80,24), (100,30), (140,40), (200,50)] {
+            let mut settings = Settings::test_defaults();
+            settings.glyphs = glyphs;
+            let output = screen(&model, &app, &settings, width, height);
+            assert!(output.lines().any(|line| line.contains("收件匣") && line.contains('1')));
+            assert!(output.contains("對話"));
+            assert!(output.contains("$0.42"));
+            assert!(!output.lines().take(4).any(|line| line.contains("$0.42")));
+            assert!(!output.chars().any(crate::sanitize::forbidden));
+            if width >= 100 {
+                assert!(output.contains("第 2/5 回合 · 已 3 分"));
+                assert!(output.contains("下次心跳 12 分鐘後"));
+                assert!(output.contains("暫停：維護資料庫"));
+            } else { assert!(!output.contains("下次心跳")); }
+            insta::assert_snapshot!(format!("round2_sidebar_{width}x{height}_{glyphs:?}"), output);
+        }
+    }
+}
+
+#[test]
+fn round2_sidebar_light_no_color_and_wide_ambiguous() {
+    let (model, app) = round2_fixture();
+    for (name, theme, capability, width) in [
+        ("light", crate::theme::ThemeMode::Light, crate::theme::Capability::TrueColor, AmbiguousWidth::Narrow),
+        ("no_color", crate::theme::ThemeMode::Dark, crate::theme::Capability::NoColor, AmbiguousWidth::Narrow),
+        ("wide", crate::theme::ThemeMode::Dark, crate::theme::Capability::TrueColor, AmbiguousWidth::Wide),
+    ] {
+        let mut settings = Settings::test_defaults();
+        settings.glyphs = Glyphs::Unicode;
+        settings.ambiguous_width = width;
+        settings.theme = theme;
+        settings.colors = crate::theme::Theme::new(theme, capability);
+        settings.resolve_theme();
+        let output = screen(&model, &app, &settings, 140,40);
+        insta::assert_snapshot!(format!("round2_sidebar_{name}"), output);
+    }
+}
+
+#[test]
+fn round2_order_uses_display_name_and_actual_read_receipts() {
+    let mut model = empty();
+    model.employees = fresh(vec![employee("z", "A worker", "working"), employee("idle", "A idle", "active"),
+        employee("pause", "A pause", "paused"), employee("err", "Z error", "error"),
+        employee("b", "B needs", "awaiting"), employee("a", "A needs", "awaiting")]);
+    model.recent_activity.insert("z".into(), Activity { completed_id:Some("run:z:1".into()), ..Default::default() });
+    let mut read = ReadState::default(); read.mark("run:z:1".into());
+    let ordered: Vec<_> = super::workspace::employees(&model, &read).into_iter().map(Employee::id).collect();
+    assert_eq!(ordered, ["a", "b", "err", "z", "idle", "pause"]);
+}
+
+#[test]
+fn round2_context_precedence_freshness_and_missing_fields() {
+    let (mut model, mut app) = round2_fixture();
+    let prod = model.employees.items.iter().find(|e| e.id() == "prod").unwrap().clone();
+    crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
+        assert_eq!(super::workspace::context(&prod, &model, &app).plain(), "第 2/5 回合 · 已 3 分");
+        app.blocks.parked[0].data.selected.as_object_mut().unwrap().remove("iteration_cap");
+        assert_eq!(super::workspace::context(&prod, &model, &app).plain(), "第 2 回合 · 已 3 分");
+        model.inbox.items.push(approval("prod", "prod", "需要補件\x1b]52;bad\x07", "tool", "question"));
+        let context = super::workspace::context(&prod, &model, &app).plain();
+        assert!(context.starts_with("員工提問：需要補件"));
+        assert!(!context.contains('\x1b'));
+        model.inbox.items.pop(); app.blocks.parked[0].data.stale = true;
+        assert_eq!(super::workspace::context(&prod, &model, &app).plain(), strings::IDLE);
+        let writer = model.employees.items.iter().find(|e| e.id() == "writer").unwrap();
+        assert_eq!(super::workspace::context(writer, &model, &app).plain(), "下次心跳 12 分鐘後");
+        model.schedules.stale = true;
+        assert_eq!(super::workspace::context(writer, &model, &app).plain(), strings::IDLE);
+    });
+    assert_eq!(crate::blocks::field(&json!({}), "last_run"), "尚未執行");
+    assert_eq!(crate::blocks::field(&json!({"last_run_at":null}), "last_run_at"), "尚未執行");
+    assert_eq!(crate::blocks::field(&json!({"last_run":"bad"}), "last_run"), crate::human_time::UNKNOWN);
+}
+
+#[test]
+fn round2_tabs_keep_live_chat_draft_and_input_keys() {
+    let model = populated(); let mut app = App::default(); app.refresh(&model);
+    let id = app.blocks.panes[app.blocks.focused].id.clone();
+    app.chat.running = true; app.chat.connected = true;
+    app.input = "未送出的草稿".into(); app.chat_scroll = 4;
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    app.key(tab, &model); assert_eq!(app.blocks.active, crate::blocks::Block::Task);
+    app.key(tab, &model); assert_eq!(app.blocks.active, crate::blocks::Block::Run);
+    app.key(tab, &model); assert_eq!(app.blocks.active, crate::blocks::Block::Chat);
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, id);
+    assert!(app.chat.running); assert_eq!(app.input, "未送出的草稿"); assert_eq!(app.chat_scroll, 4);
+    app.key(ordinary_key('i'), &model);
+    app.key(ordinary_key('I'), &model); app.key(tab, &model);
+    assert_eq!(app.input, "未送出的草稿I");
+    assert_eq!(app.main_view, super::workspace::MainView::Workspace);
+    assert_eq!(app.blocks.active, crate::blocks::Block::Chat);
+}
+
+#[test]
+fn round2_lists_do_not_operate_hidden_task_chat_or_pty() {
+    use crate::blocks::Block;
+    let mut model = populated();
+    let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+    app.blocks.open(Block::Task, Some("adu".into()));
+    app.blocks.panes[0].data = crate::blocks::Data { stale:false, selected:json!({"id":"hidden","assigned_to":"adu","status":"needs_human","goal_mode":true}), ..Default::default() };
+    app.key(ordinary_key('I'), &model);
+    assert_eq!(app.key(ordinary_key('s'), &model), Action::None); // Approval is not snoozable.
+    assert!(app.control_card.is_none());
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    assert_eq!(app.card.as_ref().unwrap().item.key(), "approval:a1");
+    assert!(!app.task_card);
+    app.card = None;
+    app.blocks.open(Block::Pty, None);
+    let pty_id = app.blocks.panes[0].id.clone();
+    app.key(ordinary_key('I'), &model);
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    assert!(app.card.is_some()); assert!(!app.pty_focus);
+    app.card = None;
+    app.key(ordinary_key('P'), &model);
+    assert_eq!(app.blocks.panes[0].id, pty_id);
+    assert_eq!(app.pty_focus, crate::pty::SUPPORTED);
+    app.pty_focus = false;
+    model.schedules.items[0].detail = json!({"agent_id":"adu","cron":"0 * * * *","last_run":null});
+    app.key(ordinary_key('S'), &model);
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    assert_eq!(app.blocks.panes[0].id, pty_id); assert!(app.pty_confirm.is_none());
+    let output = screen(&model,&app,&Settings::test_defaults(),100,30);
+    assert!(output.contains("尚未執行")); assert!(output.contains("0 * * * *"));
+    app.key(ordinary_key('I'), &model);
+    app.selected = Some(Selection::Inbox(model.inbox.items[2].key()));
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    if crate::pty::SUPPORTED { assert!(app.pty_confirm.is_some()); assert_eq!(app.blocks.panes[0].id, pty_id); }
+}
+
+#[test]
+fn round2_initial_layout_and_many_employee_navigation_keep_bindings() {
+    for layout in [crate::settings::DefaultLayout::Single, crate::settings::DefaultLayout::Vertical, crate::settings::DefaultLayout::Horizontal] {
+        let mut model = empty();
+        model.employees = fresh((0..8).map(|i| employee(&format!("e{i}"),&format!("員工{i}"),"active")).collect());
+        let mut app = App::default(); app.blocks = layout.blocks(); app.blocks.invalidate(); app.refresh(&model);
+        assert_eq!(app.blocks.active, crate::blocks::Block::Chat);
+        for i in 1..8 {
+            app.key(ordinary_key('j'), &model);
+            assert_eq!(app.selected, Some(Selection::Employee(format!("e{i}"))));
+            assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some(format!("e{i}").as_str()));
+            assert!(app.blocks.chat_ids().len() <= 4);
+        }
+    }
+}
+
+#[test]
+fn round2_cost_precision_and_help_home() {
+    assert_eq!(strings::cost_today(0), "今日 $0.00");
+    assert_eq!(strings::cost_today(999), "今日 $0.0100");
+    assert_eq!(strings::cost_today(500), "今日 $0.0050");
+    assert_eq!(strings::cost_today(1000), "今日 $0.01");
+    assert_eq!(strings::cost_today(42_000), "今日 $0.42");
+    let mut app = App::default(); let mut terminal = Terminal::new(TestBackend::new(140,40)).unwrap();
+    terminal.draw(|f| render::draw(f,&empty(),&connection(),&TerminalText::new("~/.duduclaw".into()),&mut app,&Settings::test_defaults())).unwrap();
+    assert!(app.help_text().plain().contains("~/.duduclaw"));
+}
+
+#[test]
+fn round2_pane_focus_synchronizes_employee_before_tab_or_pause() {
+    let mut model = populated();
+    model.goal_operators.extend(["adu".into(), "worker".into()]);
+    let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into())); app.key(ordinary_key('C'), &model);
+    app.selected = Some(Selection::Employee("worker".into())); app.key(ordinary_key('C'), &model);
+    app.key(ordinary_key('1'), &model);
+    assert_eq!(app.selected, Some(Selection::Employee("adu".into())));
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &model);
+    assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("adu"));
+    assert!(matches!(app.key(ordinary_key('p'), &model), Action::Control(crate::controls::Control::Autonomy { agent:Some(id),resume:false }) if id == "adu"));
+}
+
+#[test]
+fn round2_same_employee_split_chats_return_to_their_own_tab() {
+    let model = populated(); let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.key(ordinary_key('C'), &model);
+    let first = app.blocks.panes[app.blocks.focused].id.clone(); app.input = "first draft".into();
+    app.key(ordinary_key('C'), &model);
+    let second = app.blocks.panes[app.blocks.focused].id.clone(); app.input = "second draft".into(); app.chat.running = true;
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    for _ in 0..3 { app.key(tab, &model); }
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, second);
+    assert_eq!(app.input, "second draft"); assert!(app.chat.running);
+    app.key(ordinary_key('1'), &model);
+    for _ in 0..3 { app.key(tab, &model); }
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, first);
+    assert_eq!(app.input, "first draft"); assert!(!app.chat.running);
+    app.key(ordinary_key('2'), &model);
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, second);
+    assert_eq!(app.input, "second draft");
+}
+
+#[test]
+fn round2_detail_then_new_chat_keeps_independent_tab_groups() {
+    let model = populated(); let mut app = App::default(); app.refresh(&model);
+    let first = app.blocks.panes[0].id.clone(); app.input = "old draft".into();
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    app.key(tab, &model); app.key(ordinary_key('D'), &model); app.key(ordinary_key('C'), &model);
+    let second = app.blocks.panes[app.blocks.focused].id.clone(); app.input = "new draft".into();
+    assert_ne!(first, second); assert_eq!(app.blocks.panes.len(), 2);
+    for _ in 0..3 { app.key(tab, &model); }
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, second); assert_eq!(app.input, "new draft");
+    app.key(ordinary_key('1'), &model);
+    app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &model);
+    app.key(tab, &model);
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, first); assert_eq!(app.input, "old draft");
+}
+
+#[test]
+fn round2_removed_employee_keeps_draft_and_defers_switch_during_input() {
+    let mut model = empty(); model.employees = fresh(vec![employee("a", "A", "active"), employee("b", "B", "active")]);
+    let mut app = App::default(); app.refresh(&model); app.key(ordinary_key('i'), &model); app.input = "draft A".into();
+    model.employees.items.remove(0); app.refresh(&model);
+    assert_eq!(app.selected, Some(Selection::Employee("a".into())));
+    assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("a"));
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &model); app.refresh(&model);
+    assert_eq!(app.selected, Some(Selection::Employee("b".into())));
+    assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("b"));
+    assert!(app.blocks.parked.iter().any(|p| p.agent.as_deref() == Some("a") && p.chat_view.input == "draft A"));
+}
+
+#[test]
+fn round2_chat_capacity_applies_to_all_openers_and_close_preserves_other_employees() {
+    let mut model = empty();
+    model.employees = fresh((0..5).map(|i| employee(&format!("e{i}"), &format!("E{i}"), "active")).collect());
+    let mut app = App::default(); app.refresh(&model);
+    for i in 0..4 {
+        app.input = format!("draft {i}");
+        app.key(ordinary_key('j'), &model);
+    }
+    assert_eq!(app.blocks.chat_ids().len(), 4);
+    assert_eq!(app.blocks.active, crate::blocks::Block::Task);
+    assert_eq!(app.selected, Some(Selection::Employee("e4".into())));
+    app.key(ordinary_key('i'), &model); assert_eq!(app.focus, crate::chat::Focus::List);
+    app.key(ordinary_key('C'), &model); assert_eq!(app.blocks.chat_ids().len(), 4);
+    app.key(ordinary_key('k'), &model);
+    app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &model);
+    assert_eq!(app.input, "draft 3");
+    app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), &model);
+    assert_eq!(app.blocks.chat_ids().len(), 3);
+    assert!(app.blocks.parked.iter().any(|p| p.chat_view.input == "draft 0"));
+}
+
+#[test]
+fn round2_removed_employee_waits_for_help_or_palette_to_close() {
+    for help in [true, false] {
+        let mut model = empty(); model.employees = fresh(vec![employee("a", "A", "active"), employee("b", "B", "active")]);
+        let mut app = App::default(); app.refresh(&model);
+        if help { app.help = true; } else { app.palette = Some(super::palette::Palette::default()); }
+        model.employees.items.remove(0); app.refresh(&model);
+        assert_eq!(app.selected, Some(Selection::Employee("a".into())));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &model); app.refresh(&model);
+        assert_eq!(app.selected, Some(Selection::Employee("b".into())));
+        assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("b"));
+    }
+}
+
+#[path = "round3_tests.rs"]
+mod round3;
+
+
+#[test]
+fn live_chat_projection_survives_layout_tabs_zoom_and_reconnect() {
+    use crate::{chat::{ChatRooms, Frame}, settings::DefaultLayout};
+    use tokio::sync::watch;
+    for layout in [DefaultLayout::Single, DefaultLayout::Vertical, DefaultLayout::Horizontal] {
+        let mut app = App::default();
+        app.blocks = layout.blocks();
+        let mut model = Model::default();
+        let (tx, mut rx) = watch::channel(ChatRooms::default());
+        let mut rooms = ChatRooms::default();
+        rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+        tx.send_replace(rooms.clone());
+        app.sync_chats(&rx.borrow_and_update());
+        let mut revision = app.blocks.revision;
+        // Several empty feed refreshes after the only handshake cannot lose it.
+        for _ in 0..3 {
+            app.refresh(&model);
+            super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        }
+        model.inbox = fresh(vec![]);
+        model.employees = fresh(vec![employee("adu", "阿嘟", "active")]);
+        app.refresh(&model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        assert!(app.chat.connected && !app.chat.stale);
+        assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+        // Preserve the chat as a hidden tab, then disconnect while zoomed.
+        app.input = "draft must survive".into();
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        app.key(ordinary_key('z'), &model);
+        assert!(app.zoomed);
+        assert!(app.blocks.parked.iter().any(|p| p.kind == crate::blocks::Block::Chat));
+        rooms.disconnected();
+        tx.send_replace(rooms.clone());
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        for pane in app.blocks.panes.iter().chain(&app.blocks.parked).filter(|p| p.kind == crate::blocks::Block::Chat) {
+            assert!(!pane.chat_view.state.connected && pane.chat_view.state.stale);
+        }
+        // Fresh RPC state must not pretend a disconnected WebChat is healthy.
+        app.refresh(&model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &model);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        assert!(!app.chat.connected && app.chat.stale);
+        assert_eq!(app.input, "draft must survive");
+        rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"next"}"#).unwrap());
+        tx.send_replace(rooms);
+        super::sync_chat_state(&mut app, &mut rx, &mut revision);
+        assert!(app.chat.connected && !app.chat.stale);
+        assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+        for pane in app.blocks.panes.iter().chain(&app.blocks.parked).filter(|p| p.kind == crate::blocks::Block::Chat) {
+            assert!(pane.chat_view.state.connected && !pane.chat_view.state.stale);
+            assert_eq!(pane.chat_view.state.status.visible(), strings::CONNECTED);
+        }
+        // Inspect the actual chat renderer, excluding unrelated stale panels.
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| super::chat_render::draw(frame, frame.area(), &mut app, &Settings::test_defaults(), "對話")).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for y in 0..20 {
+            let mut x = 0;
+            while x < 100 {
+                let cell = &buffer[(x, y)];
+                output.push_str(cell.symbol());
+                x += cell.cell_width().max(1);
+            }
+        }
+        assert!(output.contains(strings::CONNECTED), "{output}");
+        assert!(!output.contains(strings::CONNECTING));
+        assert!(!output.contains(strings::STALE));
+    }
+}
+
+
+#[test]
+fn round_a_shell_snapshots_and_painted_layers() {
+    use crate::theme::{Capability, Theme, ThemeMode};
+    let (mut model, mut app) = round2_fixture();
+    for (id, name) in [("plain", "業務助理"), ("error", "財務小幫手"), ("prod", "行銷寫手"), ("writer", "研究員"), ("ops", "系統維運")] {
+        model.employees.items.iter_mut().find(|e| e.id() == id).unwrap().display_name = TerminalText::new(name.into());
+    }
+    app.selected = Some(Selection::Employee("plain".into()));
+    app.open_workspace(&model, 0);
+    let current = model.employees.items.iter_mut().find(|e| e.id() == "plain").unwrap();
+    *current = serde_json::from_value(json!({"name":"plain","display_name":"業務助理","status":"active","archived":false,
+        "runtime":{"provider":"claude"},"model":{"preferred":"sonnet","fallback":"other"}})).unwrap();
+    for (name, mode, capability) in [("dark",ThemeMode::Dark,Capability::TrueColor),
+        ("light",ThemeMode::Light,Capability::TrueColor), ("ansi",ThemeMode::Ansi,Capability::TrueColor),
+        ("no_color",ThemeMode::Dark,Capability::NoColor)] {
+        for (width,height) in [(80,24), (100,30), (140,40), (200,50)] {
+            let settings = Settings { glyphs: Glyphs::Unicode, theme: mode, colors: Theme::new(mode,capability), ..Settings::test_defaults() };
+            let mut output = screen(&model, &app, &settings, width, height);
+            assert_eq!(output.matches('╭').count(), 1, "one persistent ring");
+            for required in ["DuDuClaw", "Ctrl-P", "需要你", "執行中", "閒置", "待審", "暫停", "收件匣", "排程", "已連線", "$0.42", "v1.77.0", "q 離開"] {
+                assert!(output.contains(required), "{name} {width}x{height}: missing {required}\n{output}");
+            }
+            let mut copy = app.clone();
+            let mut terminal = Terminal::new(TestBackend::new(width,height)).unwrap();
+            crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
+                terminal.draw(|f| render::draw(f, &model, &connection(), &TerminalText::new("~/.duduclaw".into()), &mut copy, &settings)).unwrap();
+            });
+            let buffer = terminal.backend().buffer();
+            let colors = settings.colors;
+            assert_eq!(buffer[(0,0)].bg, colors.app_shell);
+            assert!(buffer.content.iter().any(|c| c.bg == colors.page_canvas));
+            let ring = buffer.content.iter().find(|c| c.symbol() == "╭").unwrap();
+            assert_eq!(ring.fg, colors.border);
+            if name == "no_color" {
+                assert!(buffer.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+                assert!(buffer.content.iter().any(|c| c.modifier.contains(Modifier::REVERSED)));
+            }
+            if name == "ansi" {
+                assert!(buffer.content.iter().all(|c| !matches!(c.fg, Color::Rgb(..) | Color::Indexed(_)) && !matches!(c.bg, Color::Rgb(..) | Color::Indexed(_))));
+                assert_eq!(buffer[(0,0)].bg, Color::Reset);
+            }
+            for cell in &buffer.content {
+                if cell.symbol().trim().is_empty() || "─│╭╮╯╰".contains(cell.symbol()) { continue; }
+                if let Some(ratio) = colors.contrast_ratio(cell.fg,cell.bg) {
+                    assert!(ratio >= 4.5, "{name} {width}x{height} {:?}: {:?}/{:?} = {ratio}", cell.symbol(),cell.fg,cell.bg);
+                }
+            }
+            output.push_str("\nPainted cells (foreground / background / modifiers):\n");
+            for symbol in ["◆", "⌕", "╭", "›", "待", "暫", "●", "○", "⏸", "?"] {
+                if let Some(cell) = buffer.content.iter().find(|c| c.symbol() == symbol) {
+                    output.push_str(&format!("{symbol}: {:?} / {:?} / {:?}\n", cell.fg, cell.bg, cell.modifier));
+                }
+            }
+            insta::assert_snapshot!(format!("round_a_{name}_{width}x{height}"), output);
+        }
+    }
+}
+
+#[test]
+fn round_a_overflow_selection_and_wide_shell_keep_physical_columns() {
+    let (mut model, mut app) = round2_fixture();
+    for index in 0..40 { model.employees.items.push(employee(&format!("extra{index:02}"), &format!("測試員工 {index:02}"), "active")); }
+    app.selected = Some(Selection::Employee("extra39".into()));
+    for glyphs in [Glyphs::Ascii, Glyphs::Unicode] {
+        for ambiguous_width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
+            let settings = Settings { glyphs, ambiguous_width, ..Settings::test_defaults() };
+            for (width,height) in [(80,24), (100,30), (140,40), (200,50)] {
+                let output = screen(&model, &app, &settings, width,height);
+                assert!(output.contains("39"));
+                assert!(output.contains("另 "));
+                assert!(output.contains("收件匣"));
+            }
+        }
+    }
+}
+
+
+#[test]
+fn round_a_stale_selected_rows_keep_text_contrast() {
+    use crate::theme::{Capability, Theme, ThemeMode};
+    let mut model = populated();
+    model.inbox.stale = true;
+    model.schedules.stale = true;
+    for selection in [Selection::Inbox(model.inbox.items[0].key()), Selection::Schedule(model.schedules.items[0].id.clone())] {
+        for capability in [Capability::TrueColor, Capability::Ansi256, Capability::Ansi16] {
+            let settings = Settings { colors: Theme::new(ThemeMode::Light,capability), ..Settings::test_defaults() };
+            let mut app = App::default();
+            app.selected = Some(selection.clone());
+            app.main_view = if matches!(selection, Selection::Inbox(_)) { super::workspace::MainView::Inbox } else { super::workspace::MainView::Schedules };
+            let mut terminal = Terminal::new(TestBackend::new(140,30)).unwrap();
+            terminal.draw(|f| render::draw(f, &model, &connection(), &TerminalText::default(), &mut app, &settings)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut selected_text = 0;
+            for y in 0..30 {
+                for x in 37..138 {
+                    let cell = &buffer[(x,y)];
+                    if cell.symbol().trim().is_empty() || "-|+".contains(cell.symbol()) { continue; }
+                    if cell.bg == settings.colors.selection_bg || cell.modifier.contains(Modifier::REVERSED) {
+                        selected_text += 1;
+                        let ratio = settings.colors.contrast_ratio(cell.fg,cell.bg).unwrap();
+                        assert!(ratio >= 4.5, "{capability:?} {:?}: {ratio}", cell.symbol());
+                    }
+                }
+            }
+            assert!(selected_text > 0);
+        }
+    }
+}
+
+#[test]
+fn round_a_header_uses_optional_agent_metadata_and_sanitizes_it() {
+    let mut model = empty();
+    model.employees = fresh(vec![serde_json::from_value(json!({"name":"adu","display_name":"阿嘟","status":"active","archived":false,
+        "runtime":{"provider":"claude\u{1b}]52;c;secret\u{07}"},"model":{"preferred":"sonnet\n第二行"}})).unwrap()]);
+    let mut app = App::default();
+    app.refresh(&model);
+    let output = screen(&model, &app, &Settings::test_defaults(), 140,30);
+    assert!(output.lines().nth(2).unwrap().contains("claude"));
+    assert!(output.lines().nth(2).unwrap().contains("sonnet 第二行"));
+    assert!(!output.chars().any(crate::sanitize::forbidden));
+    model.employees.items[0] = employee("adu","阿嘟","active");
+    let output = screen(&model, &app, &Settings::test_defaults(), 140,30);
+    assert!(!output.contains("claude") && !output.contains("sonnet"));
+}
+
+#[test]
+fn round_a_large_cost_keeps_connection_and_respects_role() {
+    let (mut model, app) = round2_fixture();
+    model.cost_millicents = Some(u64::MAX);
+    for glyphs in [Glyphs::Ascii, Glyphs::Unicode] {
+        for ambiguous_width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
+            for width in [60,80,100,140] {
+                let settings = Settings { glyphs, ambiguous_width, ..Settings::test_defaults() };
+                let output = screen(&model, &app, &settings,width,30);
+                assert!(output.contains("已連線"), "{output}");
+                assert!(output.contains('$'));
+                model.role = Some(Role::Employee);
+                assert!(!screen(&model, &app, &settings,width,30).contains('$'));
+                model.role = Some(Role::Admin);
+            }
+        }
+    }
+}
+
+#[path = "round_b_tests.rs"]
+mod round_b;
+
+#[test]
+fn late_split_reply_with_startup_state_updates_keeps_chat_live() {
+    use crate::{chat::{ChatRooms, Frame}, state::Model};
+    use tokio::sync::watch;
+
+    let (chat_tx, mut chat_rx) = watch::channel(ChatRooms::default());
+    let (feed_tx, feed_rx) = watch::channel(Model::default());
+    let mut app = App::default();
+    let mut rooms = ChatRooms::default();
+    rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+    chat_tx.send_replace(rooms);
+    // Consume the handshake before employee data creates the chat pane.
+    app.sync_chats(&chat_rx.borrow_and_update());
+    let mut revision = app.blocks.revision;
+    assert!(!chat_rx.has_changed().unwrap());
+    let mut model = Model::default();
+    model.employees.items = vec![serde_json::from_str(
+        r#"{"name":"adu","display_name":"阿嘟","status":"active","archived":false}"#,
+    ).unwrap()];
+    model.employees.stale = false;
+    model.employees.refetch_pending = false;
+    model.inbox.stale = false;
+    model.inbox.refetch_pending = false;
+    feed_tx.send_replace(model);
+    app.refresh(&feed_rx.borrow());
+    assert!(super::sync_chat_state(&mut app, &mut chat_rx, &mut revision));
+    assert!(app.chat.connected);
+    assert!(!app.chat.stale);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+    assert!(!chat_rx.has_changed().unwrap());
+    assert!(!super::sync_chat_state(&mut app, &mut chat_rx, &mut revision));
+}
+
+#[test]
+fn key_immediately_after_startup_is_delivered_unchanged() {
+    let _settings = Settings::parse("theme = 'auto'").0;
+    let mut app = App::default();
+    for key in [
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+    ] {
+        let event = Event::Key(key);
+        assert_eq!(super::read_host_event(&mut app, || Ok(Some(event.clone()))).unwrap(), Some(event));
     }
 }

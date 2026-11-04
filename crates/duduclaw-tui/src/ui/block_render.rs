@@ -1,7 +1,7 @@
 use super::{
     app::App,
     text::SafeText,
-    widgets::{panel, style, text},
+    widgets::{section, style, text},
 };
 use crate::{
     blocks::{Block, Pane, field},
@@ -79,6 +79,10 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
         Block::Task if pane.responsibilities => {
             lines.push(strings::RESP_LIST.into());
             lines.push(strings::ROW_KEYS.into());
+            if d.selected.is_null() && !d.stale {
+                lines.push(format!("{}；{}", strings::VIEW_EMPTY, strings::EMPTY_RESPONSIBILITIES));
+                return TerminalText::new(lines.join("\n"));
+            }
             if d.section("summary")["summary"]["open_occurrence"]["task_id"]
                 .as_str()
                 .is_some()
@@ -130,7 +134,7 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
         }
         Block::Task => {
             if d.selected.is_null() && !d.stale {
-                lines.push(strings::VIEW_EMPTY.into());
+                lines.push(format!("{}；{}", strings::VIEW_EMPTY, strings::EMPTY_TASKS));
                 return TerminalText::new(lines.join("\n"));
             }
             lines.push(strings::TASK_KEYS.into());
@@ -230,6 +234,9 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
                 if logs.lost {
                     lines.push(strings::LOG_GAP.into());
                 }
+                if logs.lines.is_empty() {
+                    lines.push(strings::EMPTY_LOG.into());
+                }
                 lines.extend(logs.lines.iter().map(TerminalText::plain));
             }
         }
@@ -246,7 +253,7 @@ pub(super) fn draw(
     detail_stale: bool,
 ) {
     for pane in &mut app.blocks.panes { pane.pty_area = Rect::default(); }
-    let (regions, hidden) = app.blocks.areas(area);
+    let (regions, hidden) = if app.zoomed { (vec![(app.blocks.focused, area)], 0) } else { app.blocks.areas(area) };
     let content_area = if hidden > 0 {
         text(
             frame,
@@ -296,13 +303,15 @@ pub(super) fn draw(
             _ => String::new(),
         };
         if !detail.is_empty() { title.push_str(&format!(" · {detail}")); }
+        if kind == Block::Chat && app.blocks.panes.len() == 1 { title.clear(); }
+        let employee_name = pane.agent.as_deref().and_then(|id| model.employees.items.iter().find(|e| e.id() == id)).map(super::workspace::name);
         if kind == Block::Chat && !(app.help && index == app.blocks.focused) {
             if index == app.blocks.focused {
-                super::chat_render::draw(frame, region, app, settings, &title);
+                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref());
             } else {
                 let current = app.chat_view();
                 app.set_chat_view(app.blocks.panes[index].chat_view.clone());
-                super::chat_render::draw(frame, region, app, settings, &title);
+                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref());
                 app.blocks.panes[index].chat_view = app.chat_view();
                 app.set_chat_view(current);
             }
@@ -320,9 +329,14 @@ pub(super) fn draw(
         } else {
             pane.data.stale
         };
-        let inner = panel(frame, region, &title, settings, stale);
+        let inner = section(frame, region, &title, settings, stale, index == app.blocks.focused);
+        if kind == Block::Run && !(app.help && index == app.blocks.focused) {
+            super::timeline::draw_run(frame, inner, &mut app.blocks.panes[index], settings, index == app.blocks.focused);
+            continue;
+        }
+        let pane = &app.blocks.panes[index];
         let body = if app.help && index == app.blocks.focused {
-            TerminalText::new(strings::HELP.into())
+            app.help_text()
         } else if kind == Block::Detail {
             app.selection_detail(model)
         } else {
@@ -341,7 +355,7 @@ pub(super) fn draw(
                 } else {
                     pane.scroll
                 },
-                style: style(stale),
+                style: style(settings, stale),
             },
             inner,
         );

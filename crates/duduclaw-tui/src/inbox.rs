@@ -56,7 +56,7 @@ impl InboxItem {
         }.replace('\n', " ")
     }
     pub fn detail_text(&self) -> TerminalText {
-        crate::sanitize::visible_json(&self.data())
+        crate::sanitize::visible_json(&crate::human_time::metadata_json(&self.data()))
     }
 }
 /// One snapshot envelope per line, including empty and stale snapshots.

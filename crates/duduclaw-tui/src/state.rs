@@ -20,6 +20,16 @@ use tokio::{
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Optional display metadata already supplied by agents.list; never grants authority.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EmployeeRuntime {
+    pub provider: Option<TerminalText>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EmployeeModel {
+    pub preferred: Option<TerminalText>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Employee {
     /// Opaque RPC key, never draw this directly; use name_text().
@@ -27,6 +37,10 @@ pub struct Employee {
     pub display_name: TerminalText,
     pub status: TerminalText,
     pub archived: bool,
+    #[serde(default)]
+    pub runtime: Option<EmployeeRuntime>,
+    #[serde(default)]
+    pub model: Option<EmployeeModel>,
 }
 impl Employee {
     pub fn id(&self) -> &str {
@@ -773,7 +787,7 @@ mod tests {
         let mut model = fresh();
         model.employees.items.push(Employee {
             name: "old".into(), display_name: TerminalText::new("Old".into()),
-            status: TerminalText::new("active".into()), archived: false,
+            status: TerminalText::new("active".into()), archived: false, runtime: None, model: None,
         });
         model.inbox.items.push(InboxItem::Task(HumanTask {
             id: "previous".into(), title: TerminalText::new("Previous".into()),

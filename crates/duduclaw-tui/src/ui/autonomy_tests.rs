@@ -97,7 +97,8 @@ async fn subsystem_views_real_shapes_all_states_and_sanitized_snapshots() {
                 Ok(data) => data,
                 Err(e) => Data { error:Some(TerminalText::new(e.to_string())), ..Data::default() },
             };
-            let body = block_render::content(&app.blocks.panes[0], &model, &app.logs).plain();
+            let body = crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", ||
+                block_render::content(&app.blocks.panes[0], &model, &app.logs).plain());
             assert!(!body.chars().any(crate::sanitize::forbidden));
             if matches!(state, Fixture::Refused | Fixture::Unavailable) {
                 assert!(app.blocks.panes[0].data.stale);
@@ -298,7 +299,8 @@ async fn role_turns_failure_and_empty_criteria_keep_task_detail_and_never_infer_
         let mut fake=FakeGateway::new(state); fake.fail_at=Some("tasks.role_turns"); fake.task_present=true;
         let mut app=app(Block::Task);
         app.blocks.panes[0].data=fetch::pane(&fake,&app.blocks.panes[0],true).await.unwrap();
-        let body=block_render::content(&app.blocks.panes[0],&model(),&app.logs).plain();
+        let body=crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", ||
+            block_render::content(&app.blocks.panes[0],&model(),&app.logs).plain());
         assert!(body.contains(strings::CRITERIA)); assert!(body.contains(strings::ROLES));
         assert!(body.contains("目標"));
         if state != Fixture::Empty { assert!(app.blocks.panes[0].data.section("roles_error").is_string()); }

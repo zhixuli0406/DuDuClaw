@@ -1,0 +1,13 @@
+---
+source: crates/duduclaw-tui/src/ui/timeline.rs
+expression: output
+---
+                                                                 請整理資料
+
+worker · 10:02
+已整理完成。
+ + 執行 Read 訂單.csv                                                  完成
+ x 執行 Write 報表.csv                                                 失敗
+  Write 報表.csv
+  1 分鐘前 [tool_use]   Write 報表.csv 檔案唯讀
+ + 回合 第 2 回合                                                      完成

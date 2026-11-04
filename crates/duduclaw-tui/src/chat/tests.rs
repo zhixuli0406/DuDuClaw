@@ -397,3 +397,27 @@ fn rooms_cancel_outcome_can_use_a_server_generated_request_id() {
     assert!(!rooms.rooms["pane-a"].running);
     assert!(rooms.rooms["pane-a"].status.is(strings::CHAT_CANCELLED));
 }
+
+#[test]
+fn presentation_messages_bound_clean_bytes_and_physical_lines() {
+    let mut state = ChatState::default();
+    for _ in 0..20 { state.append("員工", &"\x1b\u{202e}".repeat(40_000)); }
+    assert!(state.messages.iter().all(|message| message.content.visible().is_empty()));
+    state.append("員工", &"\n".repeat(4_000));
+    assert!(state.message_lines <= MAX_LINES);
+    assert!(state.messages.len() <= MAX_LINES);
+    assert!(state.message_bytes <= MAX_TRANSCRIPT_BYTES);
+    state.append("員工", &"界".repeat(90_000));
+    assert!(state.message_lines <= MAX_LINES);
+    assert!(state.message_bytes <= MAX_TRANSCRIPT_BYTES);
+}
+
+#[test]
+fn oversized_four_byte_reply_keeps_tail_instead_of_evicting_itself() {
+    let mut state = ChatState::default();
+    state.append("員工", &format!("{}TAIL", "😀".repeat(65_536)));
+    assert_eq!(state.messages.len(), 1);
+    assert!(state.messages[0].content.plain().ends_with("TAIL"));
+    assert!(state.message_bytes <= MAX_TRANSCRIPT_BYTES);
+    assert!(state.message_lines <= MAX_LINES);
+}

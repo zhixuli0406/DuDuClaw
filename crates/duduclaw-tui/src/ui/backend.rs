@@ -52,6 +52,8 @@ impl<W: Write> Backend for ScreenBackend<W> {
                 style::SetBackgroundColor(color(cell.bg))
             )?;
             if cell.modifier.contains(Modifier::BOLD) { queue!(self.0, style::SetAttribute(Attribute::Bold))?; }
+            if cell.modifier.contains(Modifier::REVERSED) { queue!(self.0, style::SetAttribute(Attribute::Reverse))?; }
+            if cell.modifier.contains(Modifier::DIM) { queue!(self.0, style::SetAttribute(Attribute::Dim))?; }
             queue!(self.0,
                 style::Print(cell.symbol())
             )?;

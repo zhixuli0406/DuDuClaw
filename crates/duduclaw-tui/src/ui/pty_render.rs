@@ -57,12 +57,10 @@ pub(super) fn cells(
             if x.saturating_add(width.get()) > area.right() {
                 break;
             }
-            let (fg, bg) = if cell.inverse() {
-                (cell.bgcolor(), cell.fgcolor())
-            } else {
-                (cell.fgcolor(), cell.bgcolor())
-            };
-            let mut style = Style::default().fg(color(fg)).bg(color(bg));
+            let mut style = Style::default()
+                .fg(crate::theme::adapt(color(cell.fgcolor()), settings.colors.capability))
+                .bg(crate::theme::adapt(color(cell.bgcolor()), settings.colors.capability));
+            if cell.inverse() { style = style.add_modifier(Modifier::REVERSED); }
             if cell.bold() {
                 style = style.add_modifier(Modifier::BOLD);
             }
@@ -72,7 +70,8 @@ pub(super) fn cells(
                 && screen.scrollback() == 0
                 && screen.cursor_position() == (row, col)
             {
-                style = style.bg(Color::DarkGray);
+                style = if cell.inverse() { style.remove_modifier(Modifier::REVERSED) }
+                    else { style.add_modifier(Modifier::REVERSED) };
             }
             buffer[(x, area.y + row)]
                 .set_symbol(symbol)
@@ -80,6 +79,7 @@ pub(super) fn cells(
                 .set_diff_option(CellDiffOption::ForcedWidth(width));
             for dx in 1..width.get() {
                 buffer[(x + dx, area.y + row)].reset();
+                buffer[(x + dx, area.y + row)].set_style(style);
             }
             x += width.get();
         }
@@ -96,7 +96,7 @@ pub(super) fn draw(
     pane.pty_area = Rect::default();
     let waiting = pane.pty.as_ref().is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).waiting());
     let title = if waiting { format!("{title} · {}", crate::strings::PTY_WAITING) } else { title.into() };
-    let inner = super::widgets::panel(frame, area, &title, settings, false);
+    let inner = super::widgets::section(frame, area, &title, settings, false, focused);
     if inner.is_empty() {
         return;
     }
@@ -144,6 +144,23 @@ pub(super) fn draw(
 mod tests {
     use super::*;
     use ratatui::backend::Backend;
+    #[test]
+    fn no_color_preserves_inverse_and_cursor_without_color() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[38;2;200;30;40m\x1b[7mA\x1b[0mB");
+        let settings = Settings { colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::NoColor), ..Settings::test_defaults() };
+        let mut buffer = Buffer::empty(Rect::new(0,0,20,2));
+        cells(&crate::pty::Screen::capture(parser.screen()), buffer.area, &mut buffer, &settings, true);
+        assert!(buffer.content.iter().all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+        assert!(buffer[(0,0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(1,0)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(2,0)].modifier.contains(Modifier::REVERSED));
+        let mut backend = super::super::backend::ScreenBackend(Vec::new());
+        backend.draw(buffer.content.iter().enumerate().map(|(i,c)| ((i % 20) as u16,(i / 20) as u16,c))).unwrap();
+        let mut host = vt100::Parser::new(2,20,0); host.process(&backend.0);
+        assert!(host.screen().cell(0,0).unwrap().inverse());
+        assert!(host.screen().cell(0,2).unwrap().inverse());
+    }
     #[test]
     fn hostile_child_bytes_never_reach_host_backend() {
         let mut parser = vt100::Parser::new(4, 40, 10);

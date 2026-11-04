@@ -53,8 +53,9 @@ pub const NEXT_RUNS: &str = "下次自主執行";
 pub const DETAIL: &str = "詳情";
 pub const DETAIL_HINT: &str = "選取項目後按 Enter 查看詳情";
 pub const EMPTY_INBOX: &str = "目前沒有待處理事項";
-pub const EMPTY_EMPLOYEES: &str = "目前沒有可見員工";
-pub const NO_SCHEDULE: &str = "閘道未提供下次執行時間";
+pub const EMPTY_INBOX_GUIDE: &str = "員工需要你時會出現在這裡；? 查看說明";
+pub const EMPTY_EMPLOYEES: &str = "尚無可見員工，狀態會顯示於此；? 查看說明";
+pub const NO_SCHEDULE: &str = "等待下次排程時間；? 查看說明";
 pub const CONNECTING: &str = "連線中";
 pub const CONNECTED: &str = "已連線";
 pub const DISCONNECTED: &str = "已斷線";
@@ -82,8 +83,8 @@ pub fn autonomy_refusal(reason: &str) -> String {
     format!("自主工作操作遭拒：{explanation}（{reason}）")
 }
 pub const LIST_FOCUS: &str = "焦點：清單";
-pub const LIST_KEY_HINTS: &str = "Ctrl-P 命令  q 離開  j/k 選取  p/u 自主暫停/恢復  ? 說明";
-pub const HELP: &str = "操作說明\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任\np/u：立即暫停／恢復選取員工的自主工作\np：責任或 cron 暫停；n：cron／心跳執行（確認卡）\nCtrl-P：全部自主工作暫停／恢復（Admin）；員工狀態操作（確認卡）\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；待核准計畫須捲到底並輸入確認碼；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nW 流程；A 自動規則；E 演化；B 預算；G 摘要；N 建立目標\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
+pub const LIST_KEY_HINTS: &str = "Enter 開啟  Tab 分頁  I 收件匣  M 通知  z 放大  Ctrl-P 命令  ? 說明  q 離開";
+pub const HELP: &str = "操作說明\nTab / Shift-Tab：對話／任務／紀錄分頁\nI：收件匣；M：通知信箱；S：下次自主執行；Esc 返回側欄\n信箱 Tab：全部／未讀／錯誤；方向鍵選取；Enter 前往\nF8：選取通知；x 關閉；Esc 返回\nz：放大目前區塊／還原\nt：時間軸焦點；方向鍵選取；Enter 展開／收合；Esc 返回\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任\np/u：立即暫停／恢復選取員工的自主工作\np：責任或 cron 暫停；n：cron／心跳執行（確認卡）\nCtrl-P：全部自主工作暫停／恢復（Admin）；員工狀態操作（確認卡）\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；待核准計畫須捲到底並輸入確認碼；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nW 流程；A 自動規則；E 演化；B 預算；G 摘要；N 建立目標\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";
 pub const READ_STATE_NOTICE: &str = "已讀紀錄無法讀取，從空白紀錄開始";
 pub const SAVED: &str = "已標為已讀";
@@ -146,6 +147,7 @@ pub const INPUT_HINT: &str = "Enter 傳送  Esc 返回清單";
 pub const INPUT_NEEDS_AGENT: &str = "請選取員工，或輸入 @員工名稱 加上訊息";
 pub const COMPUTER_COMMAND_NOTE: &str = "這是電腦操作指令，不會暫停員工";
 pub const CHAT_TITLE: &str = "對話 [2]";
+pub const EMPTY_CHAT: &str = "員工回覆會顯示於此；i 輸入訊息，Enter 傳送";
 pub const CHAT_USER: &str = "你";
 pub const CHAT_ASSISTANT: &str = "員工";
 pub const CHAT_SYSTEM: &str = "系統";
@@ -261,7 +263,10 @@ pub const LAST_RESULT: &str = "上次結果";
 pub const RUN_WAIT: &str = "正在確認執行紀錄與訂閱能力";
 
 pub const RUN_LIMIT: &str = "只顯示最近 50 次執行";
-pub const EMPTY_RUNS: &str = "目前沒有可見的執行紀錄";
+pub const EMPTY_RUNS: &str = "等待員工執行，紀錄會顯示於此；選取員工後按 R 查看";
+pub const EMPTY_TASKS: &str = "任務會顯示於此；選取員工後按 T 查看";
+pub const EMPTY_RESPONSIBILITIES: &str = "持續責任會顯示於此；b 切換任務，Ctrl-P 查看命令";
+pub const EMPTY_LOG: &str = "等待閘道事件，日誌會顯示於此；Ctrl-P 查看命令";
 
 pub const CONTROL_KEY_HINTS: &str = "↑↓ / PgUp PgDn 捲動  Esc 關卡  Ctrl-C 離開；確認方式見卡片";
 
@@ -333,6 +338,11 @@ pub const EVOLUTION_BLOCK: &str = "演化與經驗";
 pub const BUDGET_BLOCK: &str = "預算事件";
 pub const DIGEST_BLOCK: &str = "最新摘要";
 pub const VIEW_EMPTY: &str = "此範圍沒有可見資料；不代表系統沒有異常";
+pub const EMPTY_WORKFLOW: &str = "工作流程執行會顯示於此；Ctrl-P 查看命令";
+pub const EMPTY_AUTOPILOT: &str = "自動規則與斷路器狀態會顯示於此；Ctrl-P 查看命令";
+pub const EMPTY_EVOLUTION: &str = "演化狀態與經驗會顯示於此；Ctrl-P 查看命令";
+pub const EMPTY_BUDGET: &str = "預算事件會顯示於此；Ctrl-P 查看命令";
+pub const EMPTY_DIGEST: &str = "最新工作摘要會顯示於此；Ctrl-P 查看命令";
 pub const VIEW_READ_ONLY: &str = "唯讀；完整內容請到儀表板查看";
 pub const VIEW_UNAVAILABLE: &str = "目前無法取得資料";
 pub const SELECT_TASK: &str = "請先在任務區塊選取任務，再開啟工作流程";
@@ -355,7 +365,7 @@ pub const BREAKER_EVENT: &str = "曾收到斷路器開啟事件；Enter 查看�
 pub fn working_runs(count: Option<usize>) -> String {
     format!("執行中 {} 次（已觀測）", count.map(|n| n.to_string()).unwrap_or_else(|| "?".into()))
 }
-pub fn cost_window(millicents: u64) -> String { format!("近 24 小時 ${:.4}", millicents as f64 / 100_000.0) }
+pub fn cost_window(millicents: u64) -> String { format!("近 24 小時 ${}", cost_amount(millicents)) }
 pub fn run_round_title(source: &str, round: i64) -> String { format!("{source} · 回合 {round}") }
 pub const GLOBAL_HINT_SUFFIX: &str = "；Ctrl-P 命令面板；q 離開";
 
@@ -367,6 +377,12 @@ pub const WORKING_TASK_UNKNOWN: &str = "此次執行的任務未知；以下是�
 pub const WATCH_RUN_HELP: &str = "追蹤指定執行紀錄；不可與員工名稱同時使用";
 pub const NOTIFY_CONNECTION_ERROR: &str = "DuDuClaw：連線中斷，請檢查控制室";
 pub const PTY_WAITING: &str = "? 等待你的輸入（僅提示）";
-pub fn cost_today(millicents: u64) -> String { format!("今日 ${:.4}", millicents as f64 / 100_000.0) }
+pub fn cost_today(millicents: u64) -> String { format!("今日 ${}", cost_amount(millicents)) }
 pub const CONTINUE_REVIEW: &str = "核對接續訊息（全文）；捲動到底後輸入確認碼，再按 Enter 送出";
 pub fn inbox_information(count: usize) -> String { format!("資訊 {count}") }
+
+fn cost_amount(millicents: u64) -> String {
+    let amount = millicents as f64 / 100_000.0;
+    if millicents > 0 && millicents < 1000 { format!("{amount:.4}") }
+    else { format!("{amount:.2}") }
+}

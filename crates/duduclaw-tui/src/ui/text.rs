@@ -25,6 +25,20 @@ pub(super) fn left_ellipsis(text: &str, budget: usize, width: AmbiguousWidth) ->
     format!("{marker}{}", tail.into_iter().rev().collect::<String>())
 }
 
+pub(super) fn middle_ellipsis(text: &str, budget: usize, width: AmbiguousWidth) -> String {
+    if columns(text, width) <= budget { return text.into(); }
+    let marker = "…";
+    let marker_width = columns(marker, width);
+    if marker_width > budget { return String::new(); }
+    let front_budget = (budget - marker_width) / 2;
+    let mut used = 0;
+    let prefix: String = text.graphemes(true).take_while(|g| {
+        used += columns(g, width); used <= front_budget
+    }).collect();
+    let suffix_budget = budget - columns(&prefix, width);
+    format!("{prefix}{}", left_ellipsis(text, suffix_budget, width))
+}
+
 /// Count using exactly the same grapheme/wrap rules as SafeText::render.
 pub(super) fn wrapped_lines(text: &TerminalText, columns: u16, width: AmbiguousWidth) -> usize {
     if columns == 0 { return 0; }
@@ -100,6 +114,7 @@ impl Widget for SafeText<'_> {
                     .set_diff_option(CellDiffOption::ForcedWidth(width));
                 for dx in 1..n {
                     buf[(x + dx, y)].reset();
+                    buf[(x + dx, y)].set_style(self.style);
                 }
             }
             x += n;

@@ -23,7 +23,7 @@ impl EmployeeStatus {
     pub fn label(self) -> &'static str {
         match self {
             Self::Working => strings::WORKING,
-            Self::Awaiting => strings::AWAITING,
+            Self::Awaiting => "需要你",
             Self::Error => strings::FAILED,
             Self::Done => strings::DONE,
             Self::Idle => strings::IDLE,
@@ -31,6 +31,17 @@ impl EmployeeStatus {
             Self::AutonomyPaused => strings::AUTONOMY_ROW_PAUSED,
             Self::AutonomyUnknown => strings::AUTONOMY_ROW_UNKNOWN,
             Self::Ended => strings::ENDED,
+        }
+    }
+    pub fn color(self, theme: &crate::theme::Theme) -> ratatui::style::Color {
+        match self {
+            Self::Awaiting => theme.warning,
+            Self::Working => theme.success,
+            Self::Done => theme.success,
+            Self::Error => theme.danger,
+            Self::Paused | Self::AutonomyPaused => theme.paused,
+            Self::Idle => theme.idle,
+            _ => theme.muted,
         }
     }
     pub fn glyph(self, glyphs: Glyphs) -> &'static str {
@@ -43,11 +54,11 @@ impl EmployeeStatus {
             (Glyphs::Ascii, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "-",
             (Glyphs::Ascii, Self::Ended) => "x",
             (Glyphs::Unicode, Self::Working) => "●",
-            (Glyphs::Unicode, Self::Awaiting) => "◇",
-            (Glyphs::Unicode, Self::Error) => "!",
+            (Glyphs::Unicode, Self::Awaiting) => "◉",
+            (Glyphs::Unicode, Self::Error) => "✕",
             (Glyphs::Unicode, Self::Done) => "✓",
-            (Glyphs::Unicode, Self::Idle) => "·",
-            (Glyphs::Unicode, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "Ⅱ",
+            (Glyphs::Unicode, Self::Idle) => "○",
+            (Glyphs::Unicode, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "⏸",
             (Glyphs::Unicode, Self::Ended) => "×",
         }
     }
@@ -109,29 +120,15 @@ pub enum Selection {
     Inbox(String),
     Employee(String),
     Schedule(String),
+    InboxEntry,
+    ScheduleEntry,
 }
 impl Selection {
-    pub fn all(model: &Model) -> Vec<Self> {
-        model
-            .inbox
-            .items
-            .iter()
-            .map(|i| Self::Inbox(i.key()))
-            .chain(
-                model
-                    .employees
-                    .items
-                    .iter()
-                    .map(|e| Self::Employee(e.id().into())),
-            )
-            .chain(
-                model
-                    .schedules
-                    .items
-                    .iter()
-                    .filter(|_| super::m2::manager(model))
-                    .map(|s| Self::Schedule(s.id.clone())),
-            )
+    pub fn all(model: &Model, read: &ReadState) -> Vec<Self> {
+        super::workspace::employees(model, read).into_iter()
+            .map(|e| Self::Employee(e.id().into()))
+            .chain(std::iter::once(Self::InboxEntry))
+            .chain(super::m2::manager(model).then_some(Self::ScheduleEntry))
             .collect()
     }
 }
@@ -146,6 +143,13 @@ pub struct ChatView {
 }
 #[derive(Default, Clone)]
 pub struct App {
+    pub home: TerminalText,
+    pub(super) zoomed: bool,
+    pub(super) notices: super::notices::Notices,
+    pub(super) mailbox: Option<super::notices::Mailbox>,
+    pub(super) toast_focus: Option<u64>,
+    pub(super) main_view: super::workspace::MainView,
+    pub(super) workspace_initialized: bool,
     pub pty_focus: bool,
     pub(super) pty_confirm: Option<KeyEvent>,
     pub selected: Option<Selection>,
@@ -218,7 +222,7 @@ impl App {
         self.chat_cache = view.cache;
     }
     pub(super) fn sync_chats(&mut self, rooms: &crate::chat::ChatRooms) {
-        for (i, pane) in self.blocks.panes.iter_mut().enumerate() {
+        for (i, pane) in self.blocks.panes.iter_mut().chain(self.blocks.parked.iter_mut()).enumerate() {
             if pane.kind != crate::blocks::Block::Chat { continue; }
             let state = rooms.rooms.get(&pane.id).cloned().unwrap_or_else(|| {
                 let mut state = pane.chat_view.state.clone();
@@ -252,6 +256,8 @@ impl App {
         else if self.pty_focus { strings::PTY_FOCUS }
         else if self.palette.is_some() { strings::PALETTE_FOCUS }
         else if self.card.is_some() || self.control_card.is_some() { strings::CARD_FOCUS }
+        else if self.mailbox.is_some() { "焦點：通知信箱" }
+        else if self.toast_focus.is_some() { "焦點：通知" }
         else if self.help { strings::HELP_FOCUS }
         else if self.focus == crate::chat::Focus::Input { strings::INPUT_FOCUS }
         else { strings::LIST_FOCUS }
@@ -284,20 +290,39 @@ impl App {
                 _ => {}
             }
         }
+        let previous_selection = self.selected.clone();
         // Keep a surviving ID through insertions/reordering. If it disappears,
         // select the row now at its previous position, or the last row.
-        let all = Selection::all(model);
+        let all = self.selections(model);
         if let Some(index) = self.selected.as_ref().and_then(|id| all.iter().position(|row| row == id)) {
             self.selected_position = index;
         } else if match &self.selected {
             Some(Selection::Inbox(_)) => model.inbox.count().is_some(),
-            Some(Selection::Employee(_)) => model.employees.count().is_some(),
+            Some(Selection::Employee(_)) => model.employees.count().is_some()
+                && self.focus != crate::chat::Focus::Input && self.card.is_none() && self.control_card.is_none()
+                && !self.help && self.palette.is_none(),
             Some(Selection::Schedule(_)) => model.schedules.count().is_some(),
+            Some(Selection::InboxEntry | Selection::ScheduleEntry) => true,
             None => model.inbox.count().is_some() && model.employees.count().is_some(),
         } {
             self.selected_position = self.selected_position.min(all.len().saturating_sub(1));
-            self.selected = all.get(self.selected_position).cloned();
+            self.selected = all.get(self.selected_position).cloned().or(match self.main_view {
+                super::workspace::MainView::Inbox => Some(Selection::InboxEntry),
+                super::workspace::MainView::Schedules => Some(Selection::ScheduleEntry),
+                _ => None,
+            });
             self.detail_scroll = 0;
+        }
+        if !self.workspace_initialized && self.blocks.panes.iter().all(|p| p.kind == crate::blocks::Block::Detail)
+            && matches!(self.selected, Some(Selection::Employee(_))) {
+            self.open_workspace(model, 0);
+        } else if previous_selection != self.selected && self.main_view == super::workspace::MainView::Workspace
+            && !self.help && self.focus == crate::chat::Focus::List
+            && self.card.is_none() && self.control_card.is_none()
+            && matches!(self.selected, Some(Selection::Employee(_)))
+            && matches!(&previous_selection, Some(Selection::Employee(id)) if self.blocks.panes[self.blocks.focused].agent.as_ref() == Some(id))
+            && !self.open_workspace(model, self.workspace_tab()) {
+            self.open_workspace(model, 1);
         }
     }
 
@@ -314,13 +339,17 @@ impl App {
         let action = self.key_at_inner(key, model, now, epoch);
         if self.blocks.panes[self.blocks.focused].id != id {
             let connected = previous.state.connected;
-            if let Some(pane) = self.blocks.panes.iter_mut().find(|p| p.id == id) { pane.chat_view = previous; }
+            if let Some(pane) = self.blocks.panes.iter_mut().chain(self.blocks.parked.iter_mut()).find(|p| p.id == id) { pane.chat_view = previous; }
             let mut view = self.blocks.panes[self.blocks.focused].chat_view.clone();
             if view.agent.is_none() { view.agent = self.blocks.panes[self.blocks.focused].agent.clone(); }
             view.state.connected = connected;
             view.state.stale = !connected;
             if key.code == KeyCode::Char('/') && self.focus == crate::chat::Focus::Input && view.input.is_empty() { view.input.push('/'); }
             self.set_chat_view(view);
+            if self.main_view == super::workspace::MainView::Workspace
+                && let Some(agent) = self.blocks.panes[self.blocks.focused].agent.clone() {
+                self.selected = Some(Selection::Employee(agent));
+            }
         }
         action
     }
@@ -434,7 +463,14 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
-        if !self.help && self.blocks.active == crate::chat::Block::Chat && key.modifiers.is_empty()
+        if self.mailbox.is_some() || self.toast_focus.is_some() {
+            self.notices_key(key, model, now);
+            return Action::None;
+        }
+        if !self.help && !self.list_view() && self.blocks.panes[self.blocks.focused].timeline.focused
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            && super::timeline::key(self, key) { return Action::None; }
+        if !self.help && !self.list_view() && self.blocks.active == crate::chat::Block::Chat && key.modifiers.is_empty()
             && let Some(reference) = self.downstream_reference(now).map(str::to_owned)
         {
             match key.code {
@@ -449,7 +485,9 @@ impl App {
                 _ => {}
             }
         }
-        let replaces = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w')
+        let opens_breaker = self.main_view == super::workspace::MainView::Inbox && key.code == KeyCode::Enter && key.modifiers.is_empty() && !self.help
+            && matches!(&self.selected, Some(Selection::Inbox(id)) if model.inbox.items.iter().any(|item| item.key() == *id && matches!(item, crate::state::InboxItem::Breaker(_))));
+        let replaces = opens_breaker || key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w')
             || !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
                 && matches!(key.code, KeyCode::Char('D' | 'C' | 'R' | 'T' | 'L' | 'W' | 'A' | 'E' | 'B' | 'G' | '/')) && !self.help;
         if replaces && self.blocks.panes[self.blocks.focused].pty.as_ref().is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).pending_or_running()) {
@@ -465,10 +503,18 @@ impl App {
         {
             return Action::None;
         }
-        if !self.help && self.blocks.active == crate::blocks::Block::Pty {
+        if !self.help && self.notices_key(key, model, now) { return Action::None; }
+        if !self.help && key.code == KeyCode::Char('z') {
+            self.zoomed = !self.zoomed;
+            self.leave_list();
+            return Action::None;
+        }
+        if !self.help && !self.list_view() && super::timeline::key(self, key) { return Action::None; }
+        if !self.help && (!self.list_view() || key.code == KeyCode::Char('P')) && self.blocks.active == crate::blocks::Block::Pty {
             match key.code {
                 KeyCode::Char('i' | 'P') | KeyCode::Enter => {
                     if !crate::pty::SUPPORTED { self.notice = Some(strings::PTY_DISABLED.into()); return Action::None; }
+                    self.main_view = super::workspace::MainView::Workspace;
                     self.pty_focus = true;
                     if let Some(pty) = &self.blocks.panes[self.blocks.focused].pty { pty.lock().unwrap_or_else(|e| e.into_inner()).reset_scroll(); }
                     return Action::None;
@@ -480,11 +526,19 @@ impl App {
                 _ => {}
             }
         }
+        if !self.help && self.workspace_key(key, model, now) { return Action::None; }
         if !self.help && let KeyCode::Char(c) = key.code && let Some(action) = self.m2_key(c, model, now) { return action; }
         match key.code {
             KeyCode::Char('i' | '/') if !self.help => {
+                if self.blocks.active == crate::blocks::Block::Chat && !self.list_view() {
+                    if let Some(agent) = self.blocks.panes[self.blocks.focused].agent.clone() {
+                        self.selected = Some(Selection::Employee(agent));
+                    }
+                } else if self.block_agent(model).is_some() {
+                    if !self.open_workspace(model, 0) { return Action::None; }
+                } else { self.blocks.chat(); }
+                self.main_view = super::workspace::MainView::Workspace;
                 self.focus = crate::chat::Focus::Input;
-                self.blocks.chat();
                 if self.blocks.active != crate::blocks::Block::Chat { self.focus = crate::chat::Focus::List; return Action::None; }
                 if self.input_agent.is_none() { self.input_agent = self.block_agent(model); }
                 if self.blocks.panes[self.blocks.focused].agent.is_none() {
@@ -492,8 +546,14 @@ impl App {
                 }
                 if key.code == KeyCode::Char('/') && self.input.is_empty() { self.input.push('/'); }
             }
-            KeyCode::Char(c @ '1'..='4') if !self.help => self.blocks.select((c as u8 - b'1') as usize),
-            KeyCode::Char('X') if !self.help && self.blocks.active == crate::chat::Block::Chat => {
+            KeyCode::Char(c @ '1'..='4') if !self.help => {
+                self.leave_list();
+                self.blocks.select((c as u8 - b'1') as usize);
+                if let Some(agent) = self.blocks.panes[self.blocks.focused].agent.clone() {
+                    self.selected = Some(Selection::Employee(agent));
+                }
+            },
+            KeyCode::Char('X') if !self.help && !self.list_view() && self.blocks.active == crate::chat::Block::Chat => {
                 if self.chat.can_cancel() { return Action::CancelChat; }
                 self.notice = Some(strings::CHAT_CANCEL_UNAVAILABLE.into());
             }
@@ -502,9 +562,10 @@ impl App {
             KeyCode::Esc => {
                 self.help = false;
                 self.detail_open = false;
+                self.leave_list();
             }
             KeyCode::Enter => {
-                if self.blocks.active == crate::blocks::Block::Task && !self.blocks.panes[self.blocks.focused].responsibilities {
+                if !self.list_view() && self.blocks.active == crate::blocks::Block::Task && !self.blocks.panes[self.blocks.focused].responsibilities {
                     if let Some(item) = self.blocks.panes[self.blocks.focused].data.task() {
                         self.card = Some(super::card::Card::open(item, model, now, &mut self.codes)); self.task_card = true;
                     }
@@ -514,9 +575,13 @@ impl App {
                     && let Some(item) = model.inbox.items.iter().find(|i| i.key() == *id)
                 {
                     if let crate::state::InboxItem::Breaker(b) = item {
-                        self.blocks.open(if b.autopilot { crate::blocks::Block::Autopilot } else { crate::blocks::Block::Budget }, None);
+                        self.main_view = super::workspace::MainView::Workspace;
+                        self.blocks.panes[self.blocks.focused].chat_view = self.chat_view();
+                        self.blocks.workspace(if b.autopilot { crate::blocks::Block::Autopilot } else { crate::blocks::Block::Budget }, String::new());
+                        self.blocks.panes[self.blocks.focused].agent = None;
                         return Action::None;
                     }
+                    self.notices.seen(&item.key());
                     self.card = Some(super::card::Card::open(item.clone(), model, now, &mut self.codes));
                     if self.read.resurfaced(item, epoch) {
                         self.card.as_mut().expect("just opened").hint = Some(strings::RESURFACED);
@@ -527,6 +592,12 @@ impl App {
                 self.detail_open = true;
                 self.help = false;
                 self.detail_scroll = 0;
+            }
+            KeyCode::PageDown | KeyCode::PageUp if self.list_view() && self.detail_open && !self.help => {
+                self.detail_scroll = if key.code == KeyCode::PageDown { self.detail_scroll.saturating_add(5) } else { self.detail_scroll.saturating_sub(5) };
+            }
+            KeyCode::PageDown | KeyCode::PageUp if self.list_view() && !self.help => {
+                for _ in 0..5 { self.move_by(model, key.code == KeyCode::PageDown); }
             }
             KeyCode::PageDown if self.help => self.help_scroll = self.help_scroll.saturating_add(5),
             KeyCode::PageUp if self.help => self.help_scroll = self.help_scroll.saturating_sub(5),
@@ -592,7 +663,7 @@ impl App {
             .map(|c| if c == '\n' { ' ' } else { c }).take(remaining));
     }
     fn move_by(&mut self, model: &Model, down: bool) {
-        let all = Selection::all(model);
+        let all = self.selections(model);
         if all.is_empty() {
             return;
         }
@@ -605,13 +676,18 @@ impl App {
             Some(i) => i.saturating_sub(1),
             None => 0,
         };
+        let previous = self.selected.clone();
         self.selected_position = next;
         self.selected = Some(all[next].clone());
         self.detail_scroll = 0;
+        if matches!(self.selected, Some(Selection::Employee(_))) && !self.open_workspace(model, self.workspace_tab()) {
+            // Keep browsing employees when all four conversations are occupied.
+            if !self.open_workspace(model, 1) { self.selected = previous; }
+        }
     }
     pub fn detail(&self, model: &Model) -> TerminalText {
         if self.help {
-            return TerminalText::new(strings::HELP.into());
+            return self.help_text();
         }
         self.selection_detail(model)
     }
@@ -642,7 +718,7 @@ impl App {
                         .iter().filter(|key| s.detail.get(**key).is_some())
                         .map(|key| format!("{}: {}", strings::field_label(key), crate::blocks::field(&s.detail, key))).collect();
                     return TerminalText::new(format!("{}\n{}: {}\n{}\n{}", s.agent.visible(), strings::NEXT_RUNS,
-                        s.next_run.visible(), fields.join("\n"),
+                        crate::human_time::schedule(&s.next_run), fields.join("\n"),
                         if matches!(s.source, crate::state_extra::ScheduleSource::Heartbeat) { strings::HEARTBEAT_KEYS } else { strings::CRON_KEYS }));
                 }
             }

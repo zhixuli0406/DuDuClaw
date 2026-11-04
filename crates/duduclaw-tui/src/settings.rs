@@ -6,11 +6,22 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Glyphs {
-    #[default]
     Ascii,
     Unicode,
+}
+impl Glyphs {
+    pub fn detect(lc_all: Option<&str>, lc_ctype: Option<&str>, lang: Option<&str>, term: Option<&str>) -> Self {
+        if matches!(term, Some("linux" | "dumb")) { return Self::Ascii; }
+        let locale = [lc_all, lc_ctype, lang].into_iter().flatten().find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
+        if locale.contains("utf-8") || locale.contains("utf8") { Self::Unicode } else { Self::Ascii }
+    }
+}
+impl Default for Glyphs {
+    fn default() -> Self {
+        Self::detect(std::env::var("LC_ALL").ok().as_deref(), std::env::var("LC_CTYPE").ok().as_deref(), std::env::var("LANG").ok().as_deref(), std::env::var("TERM").ok().as_deref())
+    }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AmbiguousWidth {
@@ -39,19 +50,27 @@ impl DefaultLayout {
 }
 #[derive(Clone, Debug)]
 pub struct Settings {
+    pub theme: crate::theme::ThemeMode,
+    pub colors: crate::theme::Theme,
+    pub background: crate::theme::Background,
     pub glyphs: Glyphs,
     pub ambiguous_width: AmbiguousWidth,
     pub poll_interval: Duration,
     pub notifications: bool,
+    pub motion: bool,
     pub default_layout: DefaultLayout,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            glyphs: Glyphs::Ascii,
+            theme: crate::theme::ThemeMode::Auto,
+            background: crate::theme::Background::Theme,
+            colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::from_env()),
+            glyphs: Glyphs::default(),
             ambiguous_width: AmbiguousWidth::Narrow,
             poll_interval: POLL_INTERVAL,
             notifications: false,
+            motion: true,
             default_layout: DefaultLayout::Single,
         }
     }
@@ -60,6 +79,18 @@ pub const MIN_POLL_SECONDS: u64 = 5;
 pub const MAX_POLL_SECONDS: u64 = 3600;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 impl Settings {
+    pub fn resolve_theme(&mut self) {
+        self.resolve_theme_with(std::env::var("COLORFGBG").ok().as_deref());
+    }
+    fn resolve_theme_with(&mut self, colorfgbg: Option<&str>) {
+        self.colors = crate::theme::Theme::configured(self.theme, self.colors.source_capability, self.background,
+            colorfgbg);
+    }
+    #[cfg(test)]
+    pub(crate) fn test_defaults() -> Self {
+        Self { glyphs: Glyphs::Ascii, colors: crate::theme::Theme::new(crate::theme::ThemeMode::Dark, crate::theme::Capability::TrueColor), ..Self::default() }
+    }
+
     pub fn load(home: &Path) -> (Self, Option<&'static str>) {
         let file = match crate::local_file::open_regular(&home.join("tui.toml")) {
             Ok(file) => file,
@@ -91,12 +122,29 @@ impl Settings {
                     Some("horizontal") => result.default_layout = DefaultLayout::Horizontal,
                     _ => bad = true,
                 },
+                "motion" => match value.as_str() {
+                    Some("on") => result.motion = true,
+                    Some("off") => result.motion = false,
+                    _ => bad = true,
+                },
                 "notifications" => match value.as_bool() {
                     Some(enabled) => result.notifications = enabled,
                     None => bad = true,
                 },
+                "theme" => match value.as_str() {
+                    Some("auto") => result.theme = crate::theme::ThemeMode::Auto,
+                    Some("light") => result.theme = crate::theme::ThemeMode::Light,
+                    Some("dark") => result.theme = crate::theme::ThemeMode::Dark,
+                    Some("ansi") => result.theme = crate::theme::ThemeMode::Ansi,
+                    _ => bad = true,
+                },
+                "background" => match value.as_str() {
+                    Some("theme") => result.background = crate::theme::Background::Theme,
+                    Some("terminal") => result.background = crate::theme::Background::Terminal,
+                    _ => bad = true,
+                },
                 "glyphs" => match value.as_str() {
-                    Some("ascii") => {}
+                    Some("ascii") => result.glyphs = Glyphs::Ascii,
                     Some("unicode") => result.glyphs = Glyphs::Unicode,
                     _ => bad = true,
                 },
@@ -114,6 +162,7 @@ impl Settings {
                 _ => bad = true,
             }
         }
+        result.resolve_theme();
         (result, if removed_command { Some(strings::PTY_COMMAND_IGNORED) } else { bad.then_some(strings::SETTINGS_NOTICE) })
     }
 }
@@ -157,7 +206,7 @@ mod tests {
         text.push('x');
         std::fs::write(home.path().join("tui.toml"), text).unwrap();
         let (settings, notice) = Settings::load(home.path());
-        assert_eq!(settings.glyphs, Glyphs::Ascii);
+        assert_eq!(settings.glyphs, Glyphs::default());
         assert!(notice.is_some());
     }
     #[test]
@@ -198,11 +247,81 @@ mod m3_tests {
             let (s, notice) = Settings::parse(text);
             assert!(notice.is_some(), "{text}");
             assert_eq!(s.default_layout, DefaultLayout::Single);
-            assert_eq!(s.glyphs, Glyphs::Ascii);
+            assert_eq!(s.glyphs, Glyphs::default());
             assert!(!s.notifications);
         }
         let (s, n) = Settings::parse("default_layout = 'vertical'\npoll_interval_seconds = -1\nnotifications = 'true'");
         assert!(n.is_some()); assert_eq!(s.default_layout, DefaultLayout::Vertical);
         assert_eq!(s.poll_interval, POLL_INTERVAL); assert!(!s.notifications);
+    }
+}
+
+#[cfg(test)]
+mod visual_tests {
+    use super::*;
+    #[test]
+    fn glyph_detection_matrix_and_explicit_override() {
+        for term in [Some("xterm-256color"), Some("screen"), None] {
+            for locale in ["zh_TW.UTF-8", "C.utf8", "ja_JP.utf-8"] {
+                assert_eq!(Glyphs::detect(None,None,Some(locale),term), Glyphs::Unicode);
+                assert_eq!(Glyphs::detect(Some("C"),None,Some(locale),term), Glyphs::Ascii);
+                assert_eq!(Glyphs::detect(Some(""),Some(locale),Some("C"),term), Glyphs::Unicode);
+                assert_eq!(Glyphs::detect(None,Some("C"),Some(locale),term), Glyphs::Ascii);
+            }
+        }
+        for term in [Some("linux"),Some("dumb")] {
+            assert_eq!(Glyphs::detect(Some("C.UTF-8"),None,None,term), Glyphs::Ascii);
+        }
+        assert_eq!(Glyphs::detect(None,None,None,None), Glyphs::Ascii);
+        assert_eq!(Settings::parse("glyphs = 'ascii'").0.glyphs, Glyphs::Ascii);
+        assert_eq!(Settings::parse("glyphs = 'unicode'").0.glyphs, Glyphs::Unicode);
+    }
+    #[test]
+    fn background_is_strict_and_ansi_retains_terminal_capability() {
+        use crate::theme::{Background, Capability, Theme, ThemeMode};
+        for (value, expected) in [("theme", Background::Theme), ("terminal", Background::Terminal)] {
+            let (s, notice) = Settings::parse(&format!("background = '{value}'"));
+            assert_eq!(s.background, expected);
+            assert!(notice.is_none());
+        }
+        for bad in ["'transparent'", "true", "7", "['terminal']"] {
+            let (s, notice) = Settings::parse(&format!("background = {bad}\ntheme = 'ansi'"));
+            assert_eq!(s.background, Background::Theme);
+            assert_eq!(s.theme, ThemeMode::Ansi);
+            assert!(notice.is_some());
+        }
+        let mut s = Settings { theme: ThemeMode::Ansi, colors: Theme::new(ThemeMode::Dark, Capability::TrueColor), ..Settings::test_defaults() };
+        s.resolve_theme_with(Some("0;15"));
+        assert_eq!(s.colors.capability, Capability::Ansi16);
+        assert_eq!(s.colors.text, ratatui::style::Color::Black);
+        s.resolve_theme_with(Some("15;0"));
+        assert_eq!(s.colors.text, ratatui::style::Color::White);
+        s.theme = ThemeMode::Dark;
+        s.resolve_theme();
+        assert_eq!(s.colors.capability, Capability::TrueColor);
+    }
+    #[test]
+    fn auto_theme_uses_colorfgbg_else_dark() {
+        use crate::theme::{Capability, Theme, ThemeMode};
+        let mut s = Settings::parse("theme = 'auto'").0;
+        s.colors = Theme::new(ThemeMode::Dark, Capability::TrueColor);
+        s.resolve_theme_with(None);
+        assert_eq!(s.colors.page_canvas, Theme::new(ThemeMode::Dark, Capability::TrueColor).page_canvas);
+        s.resolve_theme_with(Some("0;15"));
+        assert_eq!(s.colors.page_canvas, Theme::new(ThemeMode::Light, Capability::TrueColor).page_canvas);
+    }
+    #[test]
+    fn theme_is_strict_and_bad_fields_keep_valid_fields() {
+        use crate::theme::ThemeMode;
+        for (value, expected) in [("auto",ThemeMode::Auto),("light",ThemeMode::Light),("dark",ThemeMode::Dark),("ansi",ThemeMode::Ansi)] {
+            let (s, notice) = Settings::parse(&format!("theme = '{value}'"));
+            assert_eq!(s.theme, expected); assert!(notice.is_none());
+        }
+        for bad in ["'LIGHT'", "true", "4", "['light']"] {
+            let (s, notice) = Settings::parse(&format!("theme = {bad}\nglyphs = 'ascii'"));
+            assert_eq!(s.theme, ThemeMode::Auto); assert_eq!(s.glyphs, Glyphs::Ascii); assert!(notice.is_some());
+        }
+        let (s, notice) = Settings::parse("theme = 'light'\nunknown = true");
+        assert_eq!(s.theme, ThemeMode::Light); assert!(notice.is_some());
     }
 }

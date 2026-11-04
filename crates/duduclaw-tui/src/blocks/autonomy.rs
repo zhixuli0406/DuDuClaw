@@ -187,5 +187,18 @@ pub(crate) fn content(pane: &Pane) -> Vec<String> {
         }
         _ => {}
     }
+    let guide = match pane.kind {
+        Block::Workflow => strings::EMPTY_WORKFLOW,
+        Block::Autopilot => strings::EMPTY_AUTOPILOT,
+        Block::Evolution => strings::EMPTY_EVOLUTION,
+        Block::Budget => strings::EMPTY_BUDGET,
+        Block::Digest => strings::EMPTY_DIGEST,
+        _ => "",
+    };
+    for line in &mut lines {
+        if line == strings::VIEW_EMPTY && !guide.is_empty() {
+            *line = format!("{}；{guide}", strings::VIEW_EMPTY);
+        }
+    }
     lines
 }

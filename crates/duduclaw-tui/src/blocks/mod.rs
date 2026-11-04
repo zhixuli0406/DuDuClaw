@@ -62,6 +62,7 @@ pub enum Split {
 #[derive(Clone)]
 pub struct Pane {
     pub id: String,
+    pub workspace_id: String,
     pub chat_view: crate::ui::app::ChatView,
     pub pty: Option<crate::pty::Shared>,
     pub pty_area: Rect,
@@ -73,11 +74,14 @@ pub struct Pane {
     pub content: bool,
     pub responsibilities: bool,
     pub data: Data,
+    pub(crate) timeline: crate::ui::timeline::View,
 }
 impl Pane {
     fn new(kind: Block) -> Self {
+        let id = crate::chat::nonce();
         Self {
-            id: crate::chat::nonce(),
+            workspace_id: id.clone(),
+            id,
             pty_area: Rect::default(),
             chat_view: crate::ui::app::ChatView::default(),
             pty: (kind == Block::Pty).then(crate::pty::Session::shared),
@@ -89,6 +93,7 @@ impl Pane {
             content: false,
             responsibilities: false,
             data: Data::default(),
+            timeline: crate::ui::timeline::View::default(),
         }
     }
 }
@@ -96,6 +101,7 @@ impl Pane {
 pub struct Blocks {
     pub active: Block,
     pub panes: Vec<Pane>,
+    pub parked: Vec<Pane>,
     pub focused: usize,
     pub split: Split,
     pub revision: u64,
@@ -105,6 +111,7 @@ impl Default for Blocks {
         Self {
             active: Block::Detail,
             panes: vec![Pane::new(Block::Detail)],
+            parked: vec![],
             focused: 0,
             split: Split::Vertical,
             revision: 0,
@@ -118,20 +125,67 @@ impl Blocks {
             self.active = pane.kind;
         }
     }
+    fn reserve_chat(&mut self) -> bool {
+        if self.chat_ids().len() < 4 { return true; }
+        // Only discard never-used hidden chats. Drafts, transcripts and live turns stay.
+        if let Some(i) = self.parked.iter().position(Self::unused_chat) {
+            self.parked.remove(i);
+            return true;
+        }
+        false
+    }
+    fn unused_chat(pane: &Pane) -> bool {
+        pane.kind == Block::Chat && pane.chat_view.input.is_empty()
+            && pane.chat_view.state.lines.is_empty() && !pane.chat_view.state.running
+            && pane.chat_view.state.msg_id.is_none()
+    }
     pub fn open(&mut self, kind: Block, agent: Option<String>) {
+        if kind == Block::Chat && self.active != Block::Chat && !self.reserve_chat() { return; }
         let pane = &mut self.panes[self.focused];
+        let workspace_id = pane.workspace_id.clone();
         *pane = Pane::new(kind);
+        pane.workspace_id = workspace_id;
         pane.agent = agent;
         self.active = kind;
         self.revision += 1;
     }
+    /// Switch a workspace tab without discarding another tab's draft or running chat.
+    pub fn workspace(&mut self, kind: Block, agent: String) -> bool {
+        let current = &self.panes[self.focused];
+        if current.kind == kind && current.agent.as_deref() == Some(&agent) { return true; }
+        let workspace_id = current.workspace_id.clone();
+        let cached = self.parked.iter().rposition(|p| p.workspace_id == workspace_id && p.kind == kind && p.agent.as_deref() == Some(&agent));
+        if cached.is_none() && kind == Block::Chat
+            && !Self::unused_chat(&self.panes[self.focused]) && !self.reserve_chat() {
+            return false;
+        }
+        let mut next = cached.map(|i| self.parked.remove(i)).unwrap_or_else(|| Pane::new(kind));
+        next.workspace_id = workspace_id;
+        next.agent = Some(agent);
+        if next.kind.remote() { next.data.stale = true; }
+        let old = std::mem::replace(&mut self.panes[self.focused], next);
+        if matches!(old.kind, Block::Chat | Block::Task | Block::Run) && !Self::unused_chat(&old) {
+            if self.parked.len() >= 12
+                && let Some(i) = self.parked.iter().position(|p| p.kind != Block::Chat) {
+                self.parked.remove(i);
+            }
+            self.parked.push(old);
+        }
+        self.active = kind;
+        self.revision += 1;
+        true
+    }
+    pub fn chat_ids(&self) -> Vec<String> {
+        self.panes.iter().chain(&self.parked).filter(|p| p.kind == Block::Chat).map(|p| p.id.clone()).collect()
+    }
     pub fn chat(&mut self) {
         if self.active == Block::Chat { return; }
         if let Some(i) = self.panes.iter().position(|p| p.kind == Block::Chat) { self.select(i); }
-        else if self.panes.len() < 4 { self.add(Split::Vertical); self.open(Block::Chat, None); }
+        else if self.panes.len() < 4 && self.reserve_chat() { self.add(Split::Vertical); self.open(Block::Chat, None); }
     }
     pub fn new_chat(&mut self) {
-        if self.active == Block::Detail {
+        if !self.reserve_chat() { return; }
+        if self.active == Block::Detail && !self.parked.iter().any(|p| p.workspace_id == self.panes[self.focused].workspace_id && p.kind == Block::Chat) {
             self.open(Block::Chat, None);
         } else if self.panes.len() < 4 {
             self.add(Split::Vertical);
@@ -148,9 +202,13 @@ impl Blocks {
         self.revision += 1;
     }
     pub fn close(&mut self) {
+        let workspace_id = self.panes[self.focused].workspace_id.clone();
         if self.panes.len() == 1 {
+            let agent = self.panes[self.focused].agent.clone();
+            self.parked.retain(|pane| pane.workspace_id != workspace_id || pane.agent != agent);
             self.open(Block::Detail, None);
         } else {
+            self.parked.retain(|pane| pane.workspace_id != workspace_id);
             self.panes.remove(self.focused);
             self.select(self.focused.min(self.panes.len() - 1));
             self.revision += 1;
@@ -178,13 +236,13 @@ impl Blocks {
                 }
                 // Keep only the known wire fields, with the same bounded preview as history.
                 let mut event = serde_json::Map::new();
-                for key in ["kind", "ts", "agent_id", "status", "tool", "preview", "seq"] {
+                for key in ["kind", "ts", "agent_id", "status", "tool", "label", "preview", "seq", "ok"] {
                     if let Some(v) = payload.get(key) {
                         event.insert(
                             key.into(),
                             if let Some(s) = v.as_str() {
                                 Value::String(s.chars().take(2048).collect())
-                            } else if v.is_number() {
+                            } else if v.is_number() || v.is_boolean() {
                                 v.clone()
                             } else {
                                 Value::Null
@@ -201,7 +259,7 @@ impl Blocks {
     }
     pub fn invalidate(&mut self) {
         self.revision += 1;
-        for pane in &mut self.panes {
+        for pane in self.panes.iter_mut().chain(&mut self.parked) {
             pane.data.stale = true;
         }
     }
@@ -290,6 +348,9 @@ impl Data {
     }
 }
 pub fn field(v: &Value, key: &str) -> String {
+    if crate::human_time::is_time_field(key) {
+        return TerminalText::new(crate::human_time::field(key, &v[key])).plain();
+    }
     let text = match &v[key] {
         Value::String(s) => s.clone(),
         Value::Null => strings::NOT_PROVIDED.into(),
@@ -312,7 +373,7 @@ impl LogTail {
         let raw = value
             .as_str()
             .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string());
+            .unwrap_or_else(|| crate::human_time::metadata_json(value).to_string());
         self.lines
             .push_back(TerminalText::new(raw.chars().take(2048).collect()));
         if self.lines.len() > 256 {

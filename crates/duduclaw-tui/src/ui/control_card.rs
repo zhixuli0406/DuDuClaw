@@ -171,26 +171,10 @@ pub(super) fn draw(
 ) {
     use super::{
         text::{SafeText, wrapped_lines},
-        widgets::{panel, style},
+        widgets::{overlay, style},
     };
     use ratatui::layout::Rect;
-    frame.render_widget(ratatui::widgets::Clear, area);
-    let inner = panel(frame, area, strings::CARD_TITLE, settings, !fresh);
-    // Match the existing decision card's double rail, distinct from data panes.
-    if !inner.is_empty() {
-        for x in area.x..area.right() {
-            frame.buffer_mut()[(x, area.y)].set_symbol("=");
-            frame.buffer_mut()[(x, area.bottom() - 1)].set_symbol("=");
-        }
-        super::widgets::text(
-            frame,
-            Rect::new(area.x + 2, area.y, area.width.saturating_sub(4), 1),
-            TerminalText::new(strings::CARD_TITLE.into()),
-            settings,
-            !fresh,
-            false,
-        );
-    }
+    let inner = overlay(frame, area, strings::CARD_TITLE, settings);
     let height = inner.height.saturating_sub(5);
     let body = card.body();
     card.viewport(
@@ -204,7 +188,7 @@ pub(super) fn draw(
             visible: true,
             wrap: true,
             scroll: card.scroll,
-            style: style(!fresh),
+            style: style(settings, !fresh),
         },
         Rect::new(inner.x, inner.y, inner.width, height),
     );
@@ -216,7 +200,7 @@ pub(super) fn draw(
             visible: true,
             wrap: true,
             scroll: 0,
-            style: style(!fresh),
+            style: style(settings, !fresh),
         },
         Rect::new(
             inner.x,

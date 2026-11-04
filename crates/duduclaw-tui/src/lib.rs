@@ -14,6 +14,8 @@ pub mod state_extra;
 pub mod strings;
 pub mod transport;
 pub mod settings;
+pub mod theme;
+pub mod human_time;
 pub mod read_state;
 mod local_file;
 pub mod inbox;

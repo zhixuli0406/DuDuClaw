@@ -32,6 +32,8 @@ pub struct Frame {
     pub stopped: Option<serde_json::Value>,
     pub still_stopping: Option<serde_json::Value>,
     pub phase: Option<String>,
+    pub depth: Option<usize>,
+    pub ts: Option<u64>,
     pub tool: Option<String>,
     pub summary: Option<String>,
     pub line: Option<String>,
@@ -103,9 +105,23 @@ struct DownstreamOffer {
     expires: Instant,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Message {
+    pub user: bool,
+    pub label: TerminalText,
+    pub content: TerminalText,
+    pub time: String,
+    pub turn: u64,
+    physical_lines: usize,
+}
+
 #[derive(Clone)]
 pub struct ChatState {
     pub lines: VecDeque<TerminalText>,
+    pub(crate) messages: VecDeque<Message>,
+    message_bytes: usize,
+    message_lines: usize,
+    pub(crate) activity: crate::ui::timeline::ChatActivity,
     pub(crate) revision: u64,
     transcript_bytes: usize,
     pub status: TerminalText,
@@ -126,6 +142,10 @@ impl Default for ChatState {
     fn default() -> Self {
         Self {
             lines: VecDeque::new(),
+            messages: VecDeque::new(),
+            message_bytes: 0,
+            message_lines: 0,
+            activity: crate::ui::timeline::ChatActivity::default(),
             revision: 0,
             transcript_bytes: 0,
             status: TerminalText::new(strings::CONNECTING.into()),
@@ -149,6 +169,48 @@ pub(crate) fn nonce() -> String {
 }
 impl ChatState {
     pub fn append(&mut self, label: &str, content: &str) {
+        // Roles and turn ownership come from the local append call, never text markup.
+        let label_safe = TerminalText::new(TerminalText::new(label.chars().take(512).collect()).plain());
+        let budget = MAX_TRANSCRIPT_BYTES.saturating_sub(label_safe.plain().len());
+        let safe = TerminalText::new(content.into()).plain();
+        let mut start = safe.len().saturating_sub(budget);
+        while !safe.is_char_boundary(start) { start += 1; }
+        let safe = &safe[start..];
+        // Bound retained physical lines as well as bytes, including newline-only input.
+        let mut chunks = VecDeque::new();
+        for line in safe.split('\n') {
+            let chars: Vec<_> = line.chars().collect();
+            if chars.is_empty() { chunks.push_back((String::new(), true)); }
+            else {
+                for (index, part) in chars.chunks(MAX_LINE_CHARS).enumerate() {
+                    chunks.push_back((part.iter().collect::<String>(), index == 0));
+                }
+            }
+            while chunks.len() > MAX_LINES { chunks.pop_front(); }
+        }
+        let mut message_text = String::new();
+        for (index, (chunk, starts_line)) in chunks.into_iter().enumerate() {
+            if index > 0 && starts_line { message_text.push('\n'); }
+            message_text.push_str(&chunk);
+        }
+        let mut start = message_text.len().saturating_sub(budget);
+        while !message_text.is_char_boundary(start) { start += 1; }
+        message_text.drain(..start);
+        let physical_lines = message_text.split('\n').map(|line| line.chars().count().max(1).div_ceil(MAX_LINE_CHARS)).sum::<usize>();
+        let content_safe = TerminalText::new(message_text);
+        self.message_lines += physical_lines;
+        self.message_bytes += content_safe.plain().len() + label_safe.plain().len();
+        self.messages.push_back(Message {
+            user: label == strings::CHAT_USER || label.starts_with(&format!("{} @", strings::CHAT_USER)),
+            label: label_safe, content: content_safe,
+            time: chrono::Local::now().format("%H:%M").to_string(), turn: self.activity.turn(), physical_lines,
+        });
+        while self.message_lines > MAX_LINES || self.message_bytes > MAX_TRANSCRIPT_BYTES {
+            if let Some(old) = self.messages.pop_front() {
+                self.message_lines -= old.physical_lines;
+                self.message_bytes -= old.content.plain().len() + old.label.plain().len();
+            }
+        }
         // Limit both physical lines and line length, including a single huge line.
         let safe = TerminalText::new(format!("{label}: {content}")).plain();
         for line in safe.split('\n') {
@@ -197,6 +259,7 @@ impl ChatState {
         if self.running {
             return Err(crate::Error::Busy);
         }
+        self.activity.begin_turn();
         if self.agent.as_deref() != Some(&input.agent) {
             self.conv = nonce();
             self.session_id = None;
@@ -331,6 +394,7 @@ impl ChatState {
         // into a resume request for a session that does not exist yet.
         let admission_error = frame.kind == "error"
             && matches!(frame.code.as_deref(), Some("turn_limit" | "duplicate_message"));
+        self.activity.record(&frame);
         if !admission_error && let Some(sid) = frame.session_id {
             self.session_id = Some(sid);
         }
