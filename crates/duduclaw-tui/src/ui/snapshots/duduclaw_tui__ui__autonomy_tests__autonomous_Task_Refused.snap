@@ -2,7 +2,6 @@
 source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
 expression: body
 ---
-資料可能過期
 閘道拒絕此請求，請確認帳號權限
 [ / ] 切換；b 任務／責任；Enter 查看目標卡
 ?

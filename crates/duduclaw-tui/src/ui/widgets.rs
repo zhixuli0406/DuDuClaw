@@ -79,12 +79,10 @@ pub(super) fn panel_focus(frame: &mut Frame, area: Rect, title: &str, settings: 
 }
 
 /// A persistent content region has a title and whitespace, never another ring.
-pub(super) fn section(frame: &mut Frame, area: Rect, title: &str, settings: &Settings, stale: bool, focused: bool) -> Rect {
+pub(super) fn section(frame: &mut Frame, area: Rect, title: &str, settings: &Settings, _stale: bool, focused: bool) -> Rect {
     if area.is_empty() || title.is_empty() { return area; }
-    let title_style = if stale { settings.colors.muted() } else if focused {
-        settings.colors.foreground(settings.colors.secondary)
-    } else { settings.colors.muted() };
-    frame.render_widget(SafeText { text: &TerminalText::new(title.into()), width: settings.ambiguous_width,
+    let title_style = if focused { settings.colors.emphasis(settings.colors.accent) } else { settings.colors.muted() };
+    frame.render_widget(SafeText { text: &TerminalText::new(if focused { format!("{} {title}", if settings.glyphs == crate::settings::Glyphs::Unicode { "›" } else { ">" }) } else { title.into() }), width: settings.ambiguous_width,
         visible: false, wrap: false, scroll: 0, style: title_style }, Rect::new(area.x, area.y, area.width, 1));
     Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1))
 }
@@ -180,7 +178,8 @@ pub(super) fn key_hints(frame: &mut Frame, area: Rect, value: TerminalText, sett
         if g == "\n" || x + n > area.right() { x = area.x; y += 1; }
         if y >= area.bottom() { break; }
         if g != " " && (g.is_ascii() || g.chars().all(|c| "↑↓←→".contains(c))) {
-            frame.buffer_mut()[(x,y)].set_style(settings.colors.foreground(settings.colors.accent));
+            let style = settings.colors.foreground(settings.colors.accent);
+            frame.buffer_mut()[(x,y)].set_style(if settings.colors.capability == crate::theme::Capability::NoColor { style.add_modifier(Modifier::BOLD) } else { style });
         }
         x += n;
     }

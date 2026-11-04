@@ -74,9 +74,9 @@ pub fn draw(frame: &mut Frame, model: &Model, connection: &ConnectionState, home
         let title = if app.help { "快捷鍵" } else { "確認" };
         let inner = super::widgets::overlay(frame, modal, title, &raised);
         let body = if app.help { app.help_text() } else { TerminalText::new(if app.content_warning { strings::WATCH_CONTENT_WARNING } else { strings::PTY_CONFIRM }.into()) };
-        frame.render_widget(super::text::SafeText { text: &body, width: settings.ambiguous_width,
+        if app.help { super::workspace::draw_help(frame, Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1)), app, &raised); } else { frame.render_widget(super::text::SafeText { text: &body, width: settings.ambiguous_width,
             visible: true, wrap: true, scroll: if app.help { app.help_scroll } else { 0 }, style: raised.colors.base() },
-            Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1)));
+            Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1))); }
         super::widgets::key_hints(frame, Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
             TerminalText::new(if app.help { "PgUp/PgDn 捲動  Esc 關閉" } else if app.content_warning { "c 顯示內容  Esc 關閉" } else { strings::PTY_CONFIRM }.into()), &raised);
     }
@@ -167,7 +167,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, model: &Model, settings:
     let agent = app.input_agent.as_deref().or(app.blocks.panes[app.blocks.focused].agent.as_deref());
     let name = model.employees.items.iter().find(|e| Some(e.id()) == agent).map(super::workspace::name)
         .unwrap_or_else(|| TerminalText::new(agent.unwrap_or("員工").into()).plain());
-    let value = if app.input.is_empty() { format!("輸入訊息給{name}…") } else {
+    let value = if app.input.is_empty() { strings::composer_placeholder(&name) } else {
         let safe = TerminalText::new(app.input.clone()).plain();
         let mut used = usize::from(focused);
         let tail: Vec<_> = safe.graphemes(true).rev().take_while(|g| {

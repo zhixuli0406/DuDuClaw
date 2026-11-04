@@ -45,7 +45,7 @@ expression: "painted(&model,&app,&settings,140,40)"
 
 Painted roles (fg / bg / modifiers):
 success: Reset / Reset / NONE
-primary: Reset / Reset / NONE
+primary: Reset / Reset / BOLD
 user: Reset / Reset / REVERSED
 employee: Reset / Reset / NONE
 selection: Reset / Reset / UNDERLINED

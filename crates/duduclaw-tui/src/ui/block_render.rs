@@ -16,8 +16,8 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
     let d = &pane.data;
     let mut lines = Vec::new();
     if !pane.kind.autonomy() {
-        if d.stale { lines.push(strings::STALE.into()); }
         if let Some(error) = &d.error { lines.push(error.plain()); }
+        else if d.stale { lines.push(strings::STALE.into()); }
     }
     match pane.kind {
         kind if kind.autonomy() => {
@@ -30,17 +30,10 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
             else { lines.push(if kind == Block::Autopilot { strings::ADMIN_ONLY } else { strings::MANAGER_ONLY }.into()); }
         }
         Block::Run => {
-            lines.push(
-                if d.subscribed {
-                    strings::WATCH_SUBSCRIBED
-                } else if d.subscription_checked {
-                    strings::WATCH_POLLING
-                } else {
-                    strings::RUN_WAIT
-                }
-                .into(),
-            );
-            if d.runtime.as_ref().is_some_and(|r| !r.is("claude"))
+            if d.error.is_none() && !d.stale && !d.selected.is_null() {
+                lines.push(if d.subscribed { strings::WATCH_SUBSCRIBED } else if d.subscription_checked { strings::WATCH_POLLING } else { strings::RUN_WAIT }.into());
+            }
+            if !d.selected.is_null() && d.runtime.as_ref().is_some_and(|r| !r.is("claude"))
                 && !d.section("events").as_array().is_some_and(|events| {
                     events.iter().any(|e| {
                         matches!(
@@ -52,20 +45,12 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
             {
                 lines.push(strings::RUNTIME_ENDPOINTS.into());
             }
-            lines.push(strings::RUN_KEYS.into());
-            lines.push(if d.stale {
-                "?".into()
-            } else {
-                format!(
-                    "{}/{}",
-                    pane.index.min(d.total.saturating_sub(1)) + usize::from(d.total > 0),
-                    d.total
-                )
-            });
+
+            if d.total > 0 { lines.push(format!("{}/{}", pane.index.min(d.total - 1) + 1, d.total)); }
             if d.total >= 50 {
                 lines.push(strings::RUN_LIMIT.into());
             }
-            if !d.stale && d.selected.is_null() {
+            if d.selected.is_null() {
                 lines.push(strings::EMPTY_RUNS.into());
             } else {
                 lines.push(crate::watch::format_run(&d.selected, pane.content));
@@ -80,7 +65,8 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
             lines.push(strings::RESP_LIST.into());
             lines.push(strings::ROW_KEYS.into());
             if d.selected.is_null() && !d.stale {
-                lines.push(format!("{}；{}", strings::VIEW_EMPTY, strings::EMPTY_RESPONSIBILITIES));
+                lines.push(strings::EMPTY_RESPONSIBILITIES.into());
+                lines.push(strings::VIEW_EMPTY.into());
                 return TerminalText::new(lines.join("\n"));
             }
             if d.section("summary")["summary"]["open_occurrence"]["task_id"]
@@ -134,7 +120,8 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
         }
         Block::Task => {
             if d.selected.is_null() && !d.stale {
-                lines.push(format!("{}；{}", strings::VIEW_EMPTY, strings::EMPTY_TASKS));
+                lines.push("目前沒有任務，員工接到工作後會出現在這裡。".into());
+                lines.push(strings::VIEW_EMPTY.into());
                 return TerminalText::new(lines.join("\n"));
             }
             lines.push(strings::TASK_KEYS.into());
@@ -279,16 +266,7 @@ pub(super) fn draw(
     };
     for (index, region) in regions {
         let kind = app.blocks.panes[index].kind;
-        let mut title = format!(
-            "{}{} {}",
-            if index == app.blocks.focused {
-                "> "
-            } else {
-                ""
-            },
-            index + 1,
-            kind.label()
-        );
+        let mut title = format!("{} {}", index + 1, kind.label());
         let pane = &app.blocks.panes[index];
         let row = &pane.data.selected;
         let detail = match kind {
@@ -303,15 +281,15 @@ pub(super) fn draw(
             _ => String::new(),
         };
         if !detail.is_empty() { title.push_str(&format!(" · {detail}")); }
-        if kind == Block::Chat && app.blocks.panes.len() == 1 { title.clear(); }
+        if matches!(kind, Block::Chat | Block::Task | Block::Run) && app.blocks.panes.len() == 1 { title.clear(); }
         let employee_name = pane.agent.as_deref().and_then(|id| model.employees.items.iter().find(|e| e.id() == id)).map(super::workspace::name);
         if kind == Block::Chat && !(app.help && index == app.blocks.focused) {
             if index == app.blocks.focused {
-                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref());
+                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref(), index == app.blocks.focused);
             } else {
                 let current = app.chat_view();
                 app.set_chat_view(app.blocks.panes[index].chat_view.clone());
-                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref());
+                super::chat_render::draw_pane(frame, region, app, settings, &title, index, employee_name.as_deref(), index == app.blocks.focused);
                 app.blocks.panes[index].chat_view = app.chat_view();
                 app.set_chat_view(current);
             }
@@ -342,22 +320,23 @@ pub(super) fn draw(
         } else {
             content(pane, model, &app.logs)
         };
-        frame.render_widget(
-            SafeText {
-                text: &body,
-                width: settings.ambiguous_width,
-                visible: true,
-                wrap: true,
-                scroll: if app.help && index == app.blocks.focused {
-                    app.help_scroll
-                } else if kind == Block::Detail {
-                    app.detail_scroll
-                } else {
-                    pane.scroll
-                },
-                style: style(settings, stale),
-            },
-            inner,
-        );
+        if app.help && index == app.blocks.focused {
+            super::workspace::draw_help(frame, inner, app, settings);
+            continue;
+        }
+        let mut rows = Vec::new();
+        for (i, line) in body.visible().split('\n').enumerate() {
+            let muted = line == strings::VIEW_EMPTY || line == strings::EMPTY_RUNS
+                || i == 0 && (pane.data.error.is_some() || pane.data.stale);
+            for line in super::chat_render::wrap(&TerminalText::new(line.into()), inner.width, settings.ambiguous_width) {
+                rows.push((line, muted));
+            }
+        }
+        let scroll = if kind == Block::Detail { app.detail_scroll } else { pane.scroll };
+        for (i, (line, muted)) in rows.iter().skip(scroll).take(usize::from(inner.height)).enumerate() {
+            frame.render_widget(SafeText { text: line, width: settings.ambiguous_width, visible: true,
+                wrap: false, scroll: 0, style: style(settings, stale || *muted) },
+                Rect::new(inner.x, inner.y + i as u16, inner.width, 1));
+        }
     }
 }

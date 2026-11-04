@@ -56,11 +56,11 @@ fn plain(text: TerminalText, width: u16, style: Style) -> PaintLine {
 }
 #[cfg(test)]
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str) {
-    draw_pane(frame, area, app, settings, title, app.blocks.focused, None);
+    draw_pane(frame, area, app, settings, title, app.blocks.focused, None, true);
 }
 #[allow(clippy::too_many_arguments)]
-pub(super) fn draw_pane(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str, pane_index: usize, name: Option<&str>) {
-    let inside = section(frame, area, title, settings, app.chat.stale, title.starts_with("> "));
+pub(super) fn draw_pane(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str, pane_index: usize, name: Option<&str>, focused: bool) {
+    let inside = section(frame, area, title, settings, app.chat.stale, focused);
     if inside.is_empty() { return; }
     let mut lines = Vec::new();
     let base = if app.chat.stale { settings.colors.muted() } else { settings.colors.base() };

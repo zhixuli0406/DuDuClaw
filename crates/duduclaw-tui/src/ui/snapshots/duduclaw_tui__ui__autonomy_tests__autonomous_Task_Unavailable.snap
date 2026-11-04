@@ -2,7 +2,6 @@
 source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
 expression: body
 ---
-資料可能過期
 閘道連線已中斷，資料可能過期
 [ / ] 切換；b 任務／責任；Enter 查看目標卡
 ?
