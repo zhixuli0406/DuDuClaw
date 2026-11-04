@@ -517,3 +517,74 @@ fn mfa_policy_toggle_serializes_with_enrollment_and_disable() {
         assert_eq!(db.mfa_active(&id).unwrap(), !disable);
     }
 }
+
+#[test]
+fn mfa_policy_migration_seeds_atomically_and_preserves_existing_value() {
+    let (dir, db, _) = setup();
+    assert!(!read_enforcement(&db.conn()).unwrap());
+    let reopened = UserDb::new_with_mfa_default(&dir.path().join("users.db"), true).unwrap();
+    assert!(!read_enforcement(&reopened.conn()).unwrap());
+    drop(reopened);
+    {
+        let mut conn = db.conn();
+        record_enforcement(&mut conn, true, 123).unwrap();
+    }
+    drop(db);
+    let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+    assert!(read_enforcement(&db.conn()).unwrap());
+    db.conn().execute("DELETE FROM mfa_policy_state", []).unwrap();
+    assert!(read_enforcement(&db.conn()).is_err());
+    assert!(record_enforcement(&mut db.conn(), false, 124).is_err());
+    let reopened = UserDb::new_with_mfa_default(&dir.path().join("users.db"), true).unwrap();
+    assert!(!read_enforcement(&reopened.conn()).unwrap());
+    assert_eq!(db.conn().query_row("SELECT id, enforced, enforced_at FROM mfa_policy_state", [], |r|
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?))).unwrap(), (1, 0, None));
+}
+
+#[test]
+fn mfa_invalid_policy_refuses_self_disable_without_consuming_factor() {
+    for rows in ["", "(1,0),(1,0)", "(1,2)", "(1,'false')", "(1,NULL)", "(2,0)"] {
+        let (_dir, db, id) = setup();
+        let (_secret, codes) = enroll(&db, &id);
+        let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+        db.conn().execute_batch("DROP TABLE mfa_policy_state; CREATE TABLE mfa_policy_state(id, enforced);").unwrap();
+        if !rows.is_empty() {
+            db.conn().execute_batch(&format!("INSERT INTO mfa_policy_state VALUES {rows}")).unwrap();
+        }
+        assert!(policy_enforced(&db.conn()).is_err(), "{rows}");
+        assert!(record_enforcement(&mut db.conn(), false, 3030).is_err(), "{rows}");
+        if !rows.is_empty() {
+            assert!(migrate(&db.conn(), false).is_err(), "{rows}");
+        }
+        assert!(db.bind_channel_identity_authorized(&id, "line", "untrusted", true, Some(&id), true).is_err(), "{rows}");
+        assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM channel_identities WHERE user_id=?1", [&id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert!(db.mfa_change_and_issue(&id, &codes[0], true, &Cipher, 3030, false,
+            |_, _, _| Ok(())).is_err(), "{rows}");
+        assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch, epoch);
+        assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM mfa_credentials WHERE user_id=?1", [&id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id=?1", [&id], |r| r.get::<_, i64>(0)).unwrap(), 10);
+    }
+}
+
+#[test]
+fn mfa_schema_failure_rolls_back_policy_table_and_seed() {
+    let (_dir, db, _) = setup();
+    let conn = db.conn();
+    conn.execute_batch("DROP TABLE mfa_policy_state; DROP INDEX idx_mfa_challenges_user; CREATE TABLE idx_mfa_challenges_user(id);").unwrap();
+    assert!(migrate(&conn, false).is_err());
+    assert!(conn.prepare("SELECT * FROM mfa_policy_state").is_err());
+}
+
+#[test]
+fn mfa_fresh_team_schema_seeds_true_and_legacy_default_preserves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("users.db");
+    let db = UserDb::new_with_mfa_default(&path, true).unwrap();
+    assert!(read_enforcement(&db.conn()).unwrap());
+    let since: i64 = db.conn().query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).unwrap();
+    assert!(since > 0);
+    drop(db);
+    let db = UserDb::new(&path).unwrap();
+    assert!(read_enforcement(&db.conn()).unwrap());
+    assert_eq!(db.conn().query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), since);
+}

@@ -8544,6 +8544,11 @@ discord_bot_token_enc = "{discord_token_enc}"
     );
     config_plan.commit_rendered(&home, |_| Ok(config_content))
         .map_err(|e|DuDuClawError::Config(format!("Failed to write {}: {e}",config_path.display())))?;
+    let (_license, edition) = duduclaw_gateway::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home.clone(), None,
+    ).await;
+    onboard_config::provision_login(&home, edition.is_personal())
+        .map_err(DuDuClawError::Config)?;
     println!("  {} {}", style("✓").green(), config_path.display());
 
     // inference.toml (only for local / hybrid modes)
@@ -11646,7 +11651,10 @@ async fn cmd_restore(file: PathBuf, force: bool) -> duduclaw_core::error::Result
             console::style("!").yellow()
         );
     }
-    portability::import_archive(&file, &home, force)?;
+    let (_license, edition) = duduclaw_gateway::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home.clone(), None,
+    ).await;
+    portability::import_archive(&file, &home, force, edition.is_personal())?;
     println!(
         "{} Restored into {}",
         console::style("✓").green(),
@@ -12028,7 +12036,10 @@ async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Re
     println!("Importing personal-edition data...");
     println!("  Archive: {}", file.display());
     println!("  Home:    {}", home.display());
-    portability::import_archive(&file, &home, force)?;
+    let (_license, edition) = duduclaw_gateway::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home.clone(), None,
+    ).await;
+    portability::import_archive(&file, &home, force, edition.is_personal())?;
     println!(
         "{} Imported into {}. Restart with `duduclaw start`.",
         console::style("✓").green(),
