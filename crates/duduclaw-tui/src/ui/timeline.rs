@@ -264,19 +264,25 @@ pub(super) fn draw_run(frame: &mut Frame, area: Rect, pane: &mut Pane, settings:
     if area.is_empty() { return; }
     let data = &pane.data;
     let mut header = Vec::new();
-    if data.stale { header.push(strings::STALE.to_owned()); }
     if let Some(error) = &data.error { header.push(error.plain()); }
-    header.push(if data.subscribed { strings::WATCH_SUBSCRIBED } else if data.subscription_checked { strings::WATCH_POLLING } else { strings::RUN_WAIT }.into());
-    header.push(format!("{}/{} · [] 切換執行 · c 內容 · t 時間軸 · Enter 展開", pane.index.min(data.total.saturating_sub(1)) + usize::from(data.total > 0), data.total));
+    else if data.stale { header.push(strings::STALE.to_owned()); }
+    else if !data.selected.is_null() {
+        header.push(if data.subscribed { strings::WATCH_SUBSCRIBED }
+            else if data.subscription_checked { strings::WATCH_POLLING } else { strings::RUN_WAIT }.into());
+    }
+    let counter = if data.total > 0 { format!("{}/{} · ", pane.index.min(data.total - 1) + 1, data.total) } else { String::new() };
+    super::widgets::key_hints(frame, Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        TerminalText::new(format!("{counter}[] 切換執行 · c 內容 · t 時間軸 · Enter 展開")), settings);
+    let area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     if data.total >= 50 { header.push(strings::RUN_LIMIT.into()); }
-    if data.runtime.as_ref().is_some_and(|runtime| !runtime.is("claude"))
+    if !data.selected.is_null() && data.runtime.as_ref().is_some_and(|runtime| !runtime.is("claude"))
         && !data.section("events").as_array().is_some_and(|events| events.iter().any(|event| matches!(event["kind"].as_str(), Some("tool_step" | "tool_use" | "todo_update")))) {
         header.push(strings::RUNTIME_ENDPOINTS.into());
     }
-    if data.selected.is_null() && !data.stale { header.push(strings::EMPTY_RUNS.into()); }
+    if data.selected.is_null() { header.push(strings::EMPTY_RUNS.into()); }
     let count = header.len().min(usize::from(area.height));
     for (i, line) in header.into_iter().take(count).enumerate() {
-        super::widgets::text(frame, Rect::new(area.x, area.y + i as u16, area.width, 1), TerminalText::new(line), settings, data.stale, false);
+        super::widgets::text(frame, Rect::new(area.x, area.y + i as u16, area.width, 1), TerminalText::new(line), settings, true, false);
     }
     let rows = run_rows(pane);
     let body = Rect::new(area.x, area.y + count as u16, area.width, area.height.saturating_sub(count as u16));

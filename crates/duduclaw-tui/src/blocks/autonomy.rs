@@ -197,7 +197,7 @@ pub(crate) fn content(pane: &Pane) -> Vec<String> {
     };
     for line in &mut lines {
         if line == strings::VIEW_EMPTY && !guide.is_empty() {
-            *line = format!("{}；{guide}", strings::VIEW_EMPTY);
+            *line = format!("{guide}\n{}", strings::VIEW_EMPTY);
         }
     }
     lines

@@ -204,7 +204,7 @@ fn palette_is_the_only_foreground_overlay_and_escape_restores_help() {
     assert!(!output.contains("操作說明"));
     app.key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),&model);
     assert!(app.help);
-    assert!(screen(&model,&app,&Settings::test_defaults(),140,40).contains("操作說明"));
+    assert!(!screen(&model,&app,&Settings::test_defaults(),140,40).contains("操作說明"));
 }
 
 #[test]

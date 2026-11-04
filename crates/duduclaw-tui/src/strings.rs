@@ -84,7 +84,58 @@ pub fn autonomy_refusal(reason: &str) -> String {
 }
 pub const LIST_FOCUS: &str = "焦點：清單";
 pub const LIST_KEY_HINTS: &str = "Enter 開啟  Tab 分頁  I 收件匣  M 通知  z 放大  Ctrl-P 命令  ? 說明  q 離開";
-pub const HELP: &str = "操作說明\nTab / Shift-Tab：對話／任務／紀錄分頁\nI：收件匣；M：通知信箱；S：下次自主執行；Esc 返回側欄\n信箱 Tab：全部／未讀／錯誤；方向鍵選取；Enter 前往\nF8：選取通知；x 關閉；Esc 返回\nz：放大目前區塊／還原\nt：時間軸焦點；方向鍵選取；Enter 展開／收合；Esc 返回\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任\np/u：立即暫停／恢復選取員工的自主工作\np：責任或 cron 暫停；n：cron／心跳執行（確認卡）\nCtrl-P：全部自主工作暫停／恢復（Admin）；員工狀態操作（確認卡）\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；待核准計畫須捲到底並輸入確認碼；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nW 流程；A 自動規則；E 演化；B 預算；G 摘要；N 建立目標\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
+pub struct HelpEntry { pub key: &'static str, pub description: &'static str }
+pub struct HelpGroup { pub title: &'static str, pub entries: &'static [HelpEntry] }
+pub const HELP: &[HelpGroup] = &[
+    HelpGroup { title: "導覽", entries: &[
+        HelpEntry { key: "Tab / Shift-Tab", description: "對話／任務／紀錄分頁" },
+        HelpEntry { key: "I / M / S", description: "收件匣／通知信箱／下次自主執行；Esc 返回側欄" },
+        HelpEntry { key: "信箱 Tab", description: "全部／未讀／錯誤；方向鍵選取；Enter 前往" },
+        HelpEntry { key: "F8", description: "選取通知；x 關閉；Esc 返回" },
+        HelpEntry { key: "D/C/R/T/L", description: "詳情／對話／執行／任務／日誌" },
+        HelpEntry { key: "方向鍵 / j k", description: "移動選取" },
+        HelpEntry { key: "PgUp / PgDn", description: "捲動詳情" },
+        HelpEntry { key: "t", description: "時間軸焦點；方向鍵選取；Enter 展開／收合；Esc 返回" },
+    ] },
+    HelpGroup { title: "員工與工作", entries: &[
+        HelpEntry { key: "i / /", description: "輸入訊息；Esc 返回清單" },
+        HelpEntry { key: "[ / ]", description: "前後紀錄；b 切換任務／責任" },
+        HelpEntry { key: "p / u", description: "立即暫停／恢復選取員工的自主工作" },
+        HelpEntry { key: "p / n", description: "責任或 cron 暫停／cron 或心跳執行（確認卡）" },
+        HelpEntry { key: "Ctrl-P", description: "命令面板：全部自主工作暫停／恢復（Admin）、員工狀態操作（確認卡）" },
+        HelpEntry { key: "X", description: "取消回覆（需閘道支援）" },
+        HelpEntry { key: "r", description: "標為此客戶端已讀" },
+        HelpEntry { key: "s", description: "任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）" },
+        HelpEntry { key: "W/A/E/B/G/N", description: "流程／自動規則／演化／預算／摘要／建立目標" },
+    ] },
+    HelpGroup { title: "決策卡與確認", entries: &[
+        HelpEntry { key: "Enter", description: "開啟詳情或決策卡" },
+        HelpEntry { key: "防誤觸", description: "卡片開啟後一秒內忽略按鍵" },
+        HelpEntry { key: "Enter / n", description: "核准須輸入兩位確認碼後按 Enter；n 拒絕" },
+        HelpEntry { key: "高風險卡", description: "須先捲到底部" },
+        HelpEntry { key: "目標 r", description: "重試；待核准計畫須捲到底並輸入確認碼" },
+        HelpEntry { key: "目標 a/d/t", description: "中止／完成／接手須連按兩次" },
+        HelpEntry { key: "Esc", description: "關卡；新項目不會移動焦點" },
+    ] },
+    HelpGroup { title: "區塊與分割", entries: &[
+        HelpEntry { key: "1–4", description: "區塊焦點" },
+        HelpEntry { key: "v / x", description: "左右／上下分割" },
+        HelpEntry { key: "Ctrl-W", description: "關閉區塊" },
+        HelpEntry { key: "z", description: "放大目前區塊／還原" },
+    ] },
+    HelpGroup { title: "本機終端", entries: &[
+        HelpEntry { key: "P", description: "開啟本機終端" },
+        HelpEntry { key: "Enter / i", description: "輸入終端" },
+        HelpEntry { key: "Ctrl-\\ / F12", description: "返回控制室" },
+        HelpEntry { key: "PgUp / PgDn", description: "清單焦點時捲動（最多 5,000 行）" },
+        HelpEntry { key: "關閉", description: "關閉區塊或控制室會停止本機終端行程" },
+    ] },
+    HelpGroup { title: "其他", entries: &[
+        HelpEntry { key: "? / F1", description: "開關說明" },
+        HelpEntry { key: "Ctrl-P", description: "命令面板（Ctrl-K 保留）" },
+        HelpEntry { key: "q / Ctrl-C", description: "離開；關閉控制室不會停止員工" },
+    ] },
+];
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";
 pub const READ_STATE_NOTICE: &str = "已讀紀錄無法讀取，從空白紀錄開始";
 pub const SAVED: &str = "已標為已讀";
@@ -337,7 +388,7 @@ pub const AUTOPILOT_BLOCK: &str = "自動規則";
 pub const EVOLUTION_BLOCK: &str = "演化與經驗";
 pub const BUDGET_BLOCK: &str = "預算事件";
 pub const DIGEST_BLOCK: &str = "最新摘要";
-pub const VIEW_EMPTY: &str = "此範圍沒有可見資料；不代表系統沒有異常";
+pub const VIEW_EMPTY: &str = "沒有資料不代表系統沒有異常；可能是權限或篩選範圍。";
 pub const EMPTY_WORKFLOW: &str = "工作流程執行會顯示於此；Ctrl-P 查看命令";
 pub const EMPTY_AUTOPILOT: &str = "自動規則與斷路器狀態會顯示於此；Ctrl-P 查看命令";
 pub const EMPTY_EVOLUTION: &str = "演化狀態與經驗會顯示於此；Ctrl-P 查看命令";
@@ -386,3 +437,11 @@ fn cost_amount(millicents: u64) -> String {
     if millicents > 0 && millicents < 1000 { format!("{amount:.4}") }
     else { format!("{amount:.2}") }
 }
+
+/// Add spacing only at a CJK/ASCII name boundary.
+pub fn name_boundary(name: &str, before: bool) -> String {
+    let ascii = if before { name.chars().next() } else { name.chars().next_back() }
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    if !ascii { name.into() } else if before { format!(" {name}") } else { format!("{name} ") }
+}
+pub fn composer_placeholder(name: &str) -> String { format!("輸入訊息給{}…", name_boundary(name, true)) }

@@ -169,6 +169,55 @@ impl App {
         true
     }
     pub(super) fn help_text(&self) -> TerminalText {
-        TerminalText::new(format!("{}\n\nHome：{}", strings::HELP, self.home.visible()))
+        let mut lines = Vec::new();
+        for group in strings::HELP {
+            if !lines.is_empty() { lines.push(String::new()); }
+            lines.push(group.title.into());
+            lines.extend(group.entries.iter().map(|entry| format!("{}：{}", entry.key, entry.description)));
+        }
+        lines.push(format!("\nHome：{}", self.home.visible()));
+        TerminalText::new(lines.join("\n"))
+    }
+}
+
+/// Shared layout for the overlay and block help; continuation rows retain the key column.
+pub(super) fn help_rows(app: &App, width: u16, settings: &crate::settings::Settings) -> Vec<(String, String)> {
+    let widest_key = strings::HELP.iter().flat_map(|group| group.entries.iter())
+        .map(|entry| super::text::columns(entry.key, settings.ambiguous_width)).max().unwrap_or(0);
+    let key_width = widest_key.min(usize::from(width.saturating_sub(26)));
+    let description_column = key_width + 2;
+    let budget = width.saturating_sub(description_column as u16);
+    let mut rows = Vec::new();
+    for group in strings::HELP {
+        if !rows.is_empty() { rows.push((String::new(), String::new())); }
+        rows.push((String::new(), group.title.into()));
+        for entry in group.entries {
+            let entry_key_width = super::text::columns(entry.key, settings.ambiguous_width);
+            if entry_key_width > key_width {
+                rows.push((entry.key.into(), String::new()));
+                for line in super::chat_render::wrap(&TerminalText::new(entry.description.into()), budget, settings.ambiguous_width) {
+                    rows.push((" ".repeat(description_column), line.plain()));
+                }
+                continue;
+            }
+            for (i, line) in super::chat_render::wrap(&TerminalText::new(entry.description.into()), budget, settings.ambiguous_width).iter().enumerate() {
+                let key = if i == 0 { entry.key } else { "" };
+                rows.push((format!("{key}{}", " ".repeat(key_width - super::text::columns(key, settings.ambiguous_width) + 2)), line.plain()));
+            }
+        }
+    }
+    rows.push((String::new(), String::new()));
+    for (i, line) in super::chat_render::wrap(&TerminalText::new(app.home.visible()), width.saturating_sub(6), settings.ambiguous_width).iter().enumerate() {
+        rows.push((if i == 0 { "Home  " } else { "      " }.into(), line.plain()));
+    }
+    rows
+}
+pub(super) fn draw_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App, settings: &crate::settings::Settings) {
+    for (i, (key, description)) in help_rows(app, area.width, settings).iter().skip(app.help_scroll).take(usize::from(area.height)).enumerate() {
+        let row = ratatui::layout::Rect::new(area.x, area.y + i as u16, area.width, 1);
+        let n = super::text::columns(key, settings.ambiguous_width).min(usize::from(area.width)) as u16;
+        super::widgets::styled(frame, ratatui::layout::Rect::new(row.x, row.y, n, 1), key, settings, settings.colors.emphasis(settings.colors.accent));
+        super::widgets::styled(frame, ratatui::layout::Rect::new(row.x + n, row.y, row.width - n, 1), description, settings,
+            if key.is_empty() { settings.colors.muted() } else { settings.colors.foreground(settings.colors.secondary) });
     }
 }

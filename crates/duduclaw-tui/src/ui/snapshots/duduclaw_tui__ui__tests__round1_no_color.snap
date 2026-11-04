@@ -50,4 +50,4 @@ Painted semantic cells (symbol, foreground, background, modifiers):
 ⏸: Reset / Reset / NONE
 ╭: Reset / Reset / NONE
 C: Reset / Reset / NONE
-footer help: Reset / NONE
+footer help: Reset / BOLD

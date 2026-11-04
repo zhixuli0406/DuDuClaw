@@ -36,6 +36,25 @@ pub(super) struct Command {
     aliases: &'static str,
     control: Option<crate::controls::Control>,
 }
+impl Command {
+    fn group(&self) -> u8 {
+        match &self.control {
+            Some(crate::controls::Control::Autonomy { agent: None, .. }) => 1,
+            Some(_) => 0,
+            None => match self.key.code {
+                KeyCode::Char('S' | 'A' | 'E' | 'B' | 'G' | 'L') => 1,
+                KeyCode::Char('I' | 'M' | 'z' | 'v' | 'x' | 'P' | 'D' | 'C' | 'R' | 'T' | 'W' | '1'..='4')
+                    | KeyCode::Tab | KeyCode::F(_) | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Esc => 2,
+                _ if self.key.modifiers.contains(KeyModifiers::CONTROL) => 2,
+                _ => 0,
+            },
+        }
+    }
+}
+fn group_label(group: u8) -> &'static str { ["員工", "管理", "導覽"][usize::from(group)] }
+fn palette_height(results: usize, groups: usize, available: u16) -> u16 {
+    (results.max(1) + groups.max(1) + 2).clamp(6, 18).saturating_add(2).min(usize::from(available)) as u16
+}
 fn fuzzy(query: &str, text: &str) -> bool {
     let text = text.to_lowercase();
     let mut chars = text.chars();
@@ -55,7 +74,7 @@ impl App {
             commands.push(Command {
                 label,
                 key: KeyEvent::new(code, modifiers),
-                hint: hint.into(),
+                hint: if hint == "Enter" { match label { strings::CMD_SEND => "送出", strings::CMD_OPEN => "開啟", _ => "需確認" }.into() } else { hint.into() },
                 aliases,
                 control: None,
             })
@@ -316,7 +335,11 @@ impl App {
                 _ => "employee resume",
             };
             commands.push(Command { label: control.label(), key: KeyEvent::new(KeyCode::Null, none),
-                hint: "Enter".into(), aliases, control: Some(control) });
+                hint: match &control {
+                    crate::controls::Control::Autonomy { agent: None, .. } => "Admin",
+                    crate::controls::Control::Autonomy { agent: Some(_), resume } => if *resume { "u" } else if pane.kind == Block::Task && pane.responsibilities { "立即執行" } else { "p" },
+                    _ => "需確認",
+                }.into(), aliases, control: Some(control) });
         }
         commands
     }
@@ -326,10 +349,12 @@ impl App {
             .as_ref()
             .map(|p| p.query.as_str())
             .unwrap_or("");
-        self.commands(model)
+        let mut commands: Vec<_> = self.commands(model)
             .into_iter()
             .filter(|c| fuzzy(query, c.label) || fuzzy(query, c.aliases) || fuzzy(query, &c.hint))
-            .collect()
+            .collect();
+        commands.sort_by_key(Command::group);
+        commands
     }
     pub(super) fn palette_key(
         &mut self,
@@ -402,7 +427,9 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, app: &App, settings: &Setti
     };
     let bounds = frame.area();
     let width = bounds.width.saturating_sub(4).min(76);
-    let height = bounds.height.saturating_sub(2).min(20);
+    let commands = app.palette_commands(model);
+    let groups = (0..3).filter(|g| commands.iter().any(|c| c.group() == *g)).count();
+    let height = palette_height(commands.len(), groups, bounds.height.saturating_sub(2));
     let area = Rect::new(
         bounds.x + (bounds.width - width) / 2,
         bounds.y + (bounds.height - height) / 2,
@@ -410,19 +437,30 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, app: &App, settings: &Setti
         height,
     );
     let inner = super::widgets::overlay(frame, area, strings::PALETTE_TITLE, settings);
-    let commands = app.palette_commands(model);
     let selected = palette.selected.min(commands.len().saturating_sub(1));
-    let visible = usize::from(inner.height.saturating_sub(3));
-    let offset = (selected + 1).saturating_sub(visible);
+    let visible = usize::from(inner.height.saturating_sub(2));
+    // Include section rows in scrolling so selection follows the displayed order.
+    let mut rows = Vec::new();
+    let mut previous = None;
+    let mut selected_row = 0;
+    for (index, command) in commands.iter().enumerate() {
+        if previous != Some(command.group()) { rows.push((None, command.group())); previous = Some(command.group()); }
+        if index == selected { selected_row = rows.len(); }
+        rows.push((Some(index), command.group()));
+    }
+    let offset = (selected_row + 1).saturating_sub(visible);
     super::widgets::styled(frame, Rect::new(inner.x, inner.y, inner.width, 1),
         &format!("> {}_", palette.query), settings, settings.colors.base());
-    super::widgets::styled(frame, Rect::new(inner.x, inner.y + 1, inner.width, 1),
-        "指令", settings, settings.colors.muted());
-    if commands.is_empty() {
-        super::widgets::styled(frame, Rect::new(inner.x, inner.y + 2, inner.width, 1), strings::PALETTE_EMPTY, settings, settings.colors.muted());
+    if commands.is_empty() && inner.height > 2 {
+        super::widgets::styled(frame, Rect::new(inner.x, inner.y + 1, inner.width, 1), strings::PALETTE_EMPTY, settings, settings.colors.muted());
     }
-    for (row, (index, command)) in commands.iter().enumerate().skip(offset).take(visible).enumerate() {
-        let area = Rect::new(inner.x, inner.y + 2 + row as u16, inner.width, 1);
+    for (row, (index, group)) in rows.iter().skip(offset).take(visible).enumerate() {
+        let area = Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1);
+        let Some(index) = *index else {
+            super::widgets::styled(frame, area, group_label(*group), settings, settings.colors.muted());
+            continue;
+        };
+        let command = &commands[index];
         let style = if index == selected { settings.colors.selected() } else { settings.colors.base() };
         frame.buffer_mut().set_style(area, style);
         let chip = format!(" {} ", command.hint);
@@ -441,7 +479,7 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, app: &App, settings: &Setti
             if query.peek().is_some_and(|ch| g.to_lowercase().contains(*ch)) {
                 query.next();
                 super::widgets::styled(frame, Rect::new(x, area.y, width, 1), g, settings,
-                    settings.colors.on(style.bg.unwrap_or(settings.colors.surface_raised)).foreground(settings.colors.accent));
+                    settings.colors.on(style.bg.unwrap_or(settings.colors.surface_raised)).emphasis(settings.colors.accent));
             }
             x += width;
         }
@@ -450,4 +488,33 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, app: &App, settings: &Setti
     }
     super::widgets::key_hints(frame, Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
         TerminalText::new("↑↓ 選取  Enter 執行  Esc 關閉".into()), settings);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn three_results_fit_without_empty_rows() {
+        assert!(palette_height(3, 1, 40) < palette_height(20, 1, 40));
+        assert_eq!(palette_height(3, 1, 40), 8);
+        assert_eq!(palette_height(20, 3, 40), 20);
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    #[test]
+    fn selection_crosses_sections_in_display_order() {
+        let mut model = Model::default(); model.role = Some(crate::auth::Role::Admin);
+        let mut app = App::default(); app.palette = Some(Palette::default());
+        let commands = app.palette_commands(&model);
+        assert!(commands.windows(2).all(|pair| pair[0].group() <= pair[1].group()));
+        let boundary = commands.windows(2).position(|pair| pair[0].group() != pair[1].group()).unwrap();
+        app.palette.as_mut().unwrap().selected = boundary;
+        app.palette_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &model, Instant::now(), 0);
+        assert_eq!(app.palette.as_ref().unwrap().selected, boundary + 1);
+        app.palette_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &model, Instant::now(), 0);
+        assert_eq!(app.palette.as_ref().unwrap().selected, boundary);
+    }
 }

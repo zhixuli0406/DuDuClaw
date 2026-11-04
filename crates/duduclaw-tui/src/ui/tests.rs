@@ -854,7 +854,7 @@ fn m3_help_overlay_preserves_underlying_chat() {
     // Use the operator path so the departing chat is saved into its pane.
     app.key(ordinary_key('1'), &model); app.help = true;
     let output = screen(&model, &app, &Settings::test_defaults(), 180, 48);
-    assert_eq!(output.matches("操作說明").count(), 1);
+    assert!(!output.contains("操作說明"));
     assert!(app.blocks.panes[2].chat_view.state.lines.iter().any(|line| line.plain().contains("chat-kept-visible")));
     insta::assert_snapshot!("m3_help_focused_only", output);
     app.key(ordinary_key('?'), &model);
@@ -862,7 +862,7 @@ fn m3_help_overlay_preserves_underlying_chat() {
     assert_eq!(app.blocks.focused, 2);
     app.key(ordinary_key('?'), &model);
     let output = screen(&model, &app, &Settings::test_defaults(), 180, 48);
-    assert_eq!(output.matches("操作說明").count(), 1);
+    assert!(!output.contains("操作說明"));
     assert!(app.chat.lines.iter().any(|line| line.plain().contains("chat-kept-visible")));
     insta::assert_snapshot!("m3_help_chat_focused", output);
 }
@@ -1446,7 +1446,7 @@ fn header_cost_refusal_footer_selection_and_run_round_are_visible() {
     model.cost_millicents=Some(123_000);
     let output=screen(&model,&app,&Settings::test_defaults(),140,30);
     assert!(output.contains("$1.23")); assert!(output.contains("近 24 小時"));
-    assert!(output.contains("goal · 回合 2")); assert!(output.contains("阿嘟"));
+    assert!(output.contains("第 2 回合")); assert!(output.contains("阿嘟"));
     assert!(output.contains("Ctrl-P")); assert!(output.contains("q 離開"));
     insta::assert_snapshot!("autonomy_header_cost",output);
     model.cost_millicents=None;
@@ -2319,5 +2319,118 @@ fn key_immediately_after_startup_is_delivered_unchanged() {
     ] {
         let event = Event::Key(key);
         assert_eq!(super::read_host_event(&mut app, || Ok(Some(event.clone()))).unwrap(), Some(event));
+    }
+}
+
+#[test]
+fn polish_help_entries_scroll_and_align_at_80_columns() {
+    for width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
+        let mut settings = Settings::test_defaults(); settings.ambiguous_width = width;
+        let mut app = App::default(); app.help = true;
+        let rows = super::workspace::help_rows(&app, 76, &settings);
+        let mut seen = String::new();
+        for offset in (0..rows.len()).step_by(5) {
+            app.help_scroll = offset;
+            let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+            terminal.draw(|f| super::workspace::draw_help(f, ratatui::layout::Rect::new(2, 0, 76, 8), &app, &settings)).unwrap();
+            for y in 0..8 {
+                let mut x = 0;
+                while x < 80 {
+                    let cell = &terminal.backend().buffer()[(x,y)]; seen.push_str(cell.symbol());
+                    x += cell.cell_width().max(1);
+                }
+            }
+        }
+        let widest_key = strings::HELP.iter().flat_map(|group| group.entries.iter())
+            .map(|entry| super::text::columns(entry.key, width)).max().unwrap();
+        let key_width = widest_key.min(76 - 26);
+        let column = key_width + 2;
+        let mut description_columns = Vec::new();
+        for group in strings::HELP {
+            assert!(seen.contains(group.title));
+            for entry in group.entries {
+                if super::text::columns(entry.key, width) <= key_width {
+                    assert!(rows.iter().any(|(key, description)| key.trim_end() == entry.key
+                        && super::text::columns(key, width) == column && !description.is_empty()));
+                } else {
+                    let indent = " ".repeat(column);
+                    assert!(rows.iter().any(|(key, description)| key == &indent
+                        && entry.description.starts_with(description)));
+                }
+                assert!(seen.contains(entry.key), "{}", entry.key);
+                let wrapped = super::chat_render::wrap(&TerminalText::new(entry.description.into()), (76 - column) as u16, width);
+                for line in wrapped { assert!(seen.contains(&line.plain()), "{}", line.plain()); }
+            }
+        }
+        for (key, description) in &rows {
+            if !description.is_empty() && !key.trim().is_empty() && key != "Home  " && key != "      " {
+                description_columns.push(super::text::columns(key, width));
+            }
+        }
+        assert!(description_columns.iter().all(|column| *column == description_columns[0]));
+        assert!(seen.contains("Home"));
+    }
+}
+
+#[test]
+fn polish_single_pane_empty_task_and_run() {
+    use crate::blocks::{Block, Data};
+    for width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
+        let mut settings = Settings::test_defaults(); settings.ambiguous_width = width;
+        for kind in [Block::Task, Block::Run] {
+            let model = populated(); let mut app = App::default();
+            app.selected = Some(Selection::Employee("adu".into()));
+            app.blocks.open(kind, Some("adu".into()));
+            app.blocks.panes[0].data = Data { stale: false, subscription_checked: true, ..Default::default() };
+            for error in [false, true] {
+                app.blocks.panes[0].data.stale = error;
+                app.blocks.panes[0].data.error = error.then(|| TerminalText::new("test-error".into()));
+                let output = screen(&model, &app, &settings, 140, 36);
+                assert!(!output.contains("> 1")); assert!(!output.contains("› 1"));
+                if kind == Block::Run {
+                    assert!(!output.contains(strings::WATCH_POLLING));
+                    assert!(!output.contains(strings::RUN_WAIT));
+                    assert!(!output.contains("0/0"));
+                    assert_eq!(output.matches(strings::EMPTY_RUNS).count(), 1);
+                    assert!(output.matches("test-error").count() + output.matches(strings::STALE).count() <= 1);
+                } else if !error {
+                    assert!(output.contains("目前沒有任務，員工接到工作後會出現在這裡。"));
+                    assert!(output.contains(strings::VIEW_EMPTY));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn polish_palette_chips_are_shortcuts_or_confirmation_tags() {
+    let (model, mut app) = m2_task_app();
+    app.selected = Some(Selection::Employee("adu".into()));
+    for command in app.commands(&model) { assert_ne!(command.hint, "Enter"); }
+    let commands = app.commands(&model);
+    assert!(commands.iter().any(|c| c.label == strings::CMD_STOP && c.hint == "s"));
+    assert!(commands.iter().any(|c| c.hint == "Admin"));
+    assert!(commands.iter().any(|c| c.hint == "p"));
+    assert!(commands.iter().any(|c| c.hint == "u"));
+    app.blocks.panes[0].responsibilities = true;
+    let commands = app.commands(&model);
+    let pause = commands.iter().find(|c| c.label == "暫停此員工自主工作").unwrap();
+    assert_eq!(pause.hint, "立即執行");
+    app.focus = crate::chat::Focus::Input;
+    app.chat.connected = true; app.input_agent = Some("adu".into()); app.input = "你好".into();
+    assert_eq!(app.commands(&model).iter().find(|c| c.label == strings::CMD_SEND).unwrap().hint, "送出");
+}
+
+#[test]
+fn polish_composer_name_spacing() {
+    assert_eq!(strings::composer_placeholder("Plain Test Employee"), "輸入訊息給 Plain Test Employee…");
+    assert_eq!(strings::composer_placeholder("業務助理"), "輸入訊息給業務助理…");
+    assert_eq!(strings::name_boundary("Agent1", false), "Agent1 ");
+    assert_eq!(strings::name_boundary("助理", false), "助理");
+    for name in ["Plain Test Employee", "業務助理"] {
+        let mut model = empty(); model.employees = fresh(vec![employee("adu", name, "active")]);
+        let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+        app.blocks.open(crate::blocks::Block::Chat, Some("adu".into()));
+        assert!(screen(&model, &app, &Settings::test_defaults(), 140, 36).contains(&strings::composer_placeholder(name)));
     }
 }

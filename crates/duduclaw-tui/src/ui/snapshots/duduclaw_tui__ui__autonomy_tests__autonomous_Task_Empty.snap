@@ -2,4 +2,5 @@
 source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
 expression: body
 ---
-此範圍沒有可見資料；不代表系統沒有異常；任務會顯示於此；選取員工後按 T 查看
+目前沒有任務，員工接到工作後會出現在這裡。
+沒有資料不代表系統沒有異常；可能是權限或篩選範圍。

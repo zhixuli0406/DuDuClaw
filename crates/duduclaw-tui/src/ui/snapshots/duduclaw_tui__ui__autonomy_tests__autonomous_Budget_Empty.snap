@@ -3,4 +3,5 @@ source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
 expression: body
 ---
 唯讀；完整內容請到儀表板查看
-此範圍沒有可見資料；不代表系統沒有異常；預算事件會顯示於此；Ctrl-P 查看命令
+預算事件會顯示於此；Ctrl-P 查看命令
+沒有資料不代表系統沒有異常；可能是權限或篩選範圍。
