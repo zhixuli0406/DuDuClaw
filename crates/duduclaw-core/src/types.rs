@@ -3302,15 +3302,43 @@ pub struct DingTalkChannelConfig {
 /// carry a JWT issued by `chat@system.gserviceaccount.com` whose audience
 /// is the Cloud **project number**. Outbound (async) sends authenticate
 /// with a service-account key (scope `chat.bot`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "snake_case")]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct GoogleChatChannelConfig {
     /// Google Cloud project number (JWT audience for inbound verification).
     pub project_number: String,
     /// Service-account JSON key (full JSON content, encrypted at rest).
     pub service_account_json: String,
     pub service_account_json_enc: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for GoogleChatChannelConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Fields {
+            project_number: String,
+            service_account_json: String,
+            service_account_json_enc: Option<String>,
+            #[serde(flatten)]
+            unknown: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        if let Some(field) = fields.unknown.keys().next() {
+            return Err(serde::de::Error::custom(format!("Google Chat 設定包含不支援的欄位「{field}」，請移除後再試。")));
+        }
+        Ok(Self {
+            project_number: fields.project_number,
+            service_account_json: fields.service_account_json,
+            service_account_json_enc: fields.service_account_json_enc,
+        })
+    }
+}
+
+impl Default for GoogleChatChannelConfig {
+    fn default() -> Self {
+        Self { project_number: String::new(), service_account_json: String::new(), service_account_json_enc: None }
+    }
 }
 
 /// Per-agent Microsoft Teams channel settings.

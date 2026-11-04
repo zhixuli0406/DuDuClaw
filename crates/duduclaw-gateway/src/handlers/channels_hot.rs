@@ -62,6 +62,10 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "Missing 'type' parameter"),
         };
 
+        let _googlechat_bind = if channel_type.split(':').next() == Some("googlechat") {
+            Some(crate::agent_channels::binding_lock().await)
+        } else { None };
+
         // Per-agent channel: format "discord:agent_name", "telegram:agent_name", etc.
         if let Some((platform, agent_name)) = channel_type.split_once(':') {
             let channel_section = match platform {

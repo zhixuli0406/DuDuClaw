@@ -306,6 +306,11 @@ jobs:
           else
             echo "No Python tests found, skipping"
           fi
+      - name: Google Chat bootstrap checks
+        run: |
+          bash -n scripts/googlechat/bootstrap.sh
+          python3 -m unittest discover -s scripts/googlechat -p 'test_*.py' -v
+          if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/googlechat/bootstrap.sh; fi
       - name: Test CI coverage contract
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_ci*.py' -v

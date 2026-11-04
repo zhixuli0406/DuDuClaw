@@ -4,7 +4,7 @@ Google Chat channel credentials authorize the Chat application (`chat.bot`). The
 
 DuDuClaw supports Google Chat and Microsoft Teams as first-class channels
 (alongside Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat).
-Both are webhook-based: your gateway must be reachable over public HTTPS.
+Teams and Google Chat need a public HTTPS gateway.
 
 Both channels include:
 
@@ -20,50 +20,54 @@ Both channels include:
 
 ## Google Chat
 
-### Setup
+### Before you start
 
-1. Create (or reuse) a Google Cloud project and **enable the Google Chat
-   API**. Note the **project number** (IAM & Admin → Settings).
-2. Create a **service account** in the same project and download its JSON
-   key. No domain-wide delegation is needed — the Chat app itself is the
-   principal (scope `chat.bot`).
-3. Open the Chat API **Configuration** page: set the app name/avatar/
-   description, enable *Interactive features*, check *Receive 1:1 messages*
-   and *Join spaces and group conversations*, and set **HTTP endpoint URL**
-   to `https://<your-host>/webhook/googlechat`.
-4. Under *Authentication Audience* choose **Project number**.
-5. Configure DuDuClaw (`config.toml`, or dashboard → Channels → Add
-   `googlechat`):
+Use a Business or Enterprise Google Workspace account with Chat enabled and an administrator who allows Chat apps. You need permission to create or directly own a Cloud project, enable Chat API, and create a service account and key. Local setup needs Bash, Python 3, `gcloud`, your own `gcloud auth login`, and a public HTTPS gateway URL; Cloud Shell supplies the command-line tools. A Pub/Sub mode that works without a public URL is planned for a later release.
 
-```toml
-[channels]
-googlechat_project_number = "123456789012"
-# Paste the full service-account JSON (stored encrypted as *_enc)
-googlechat_service_account_json = '{ "type": "service_account", ... }'
+### One-step setup
+
+Use a dedicated new Google Cloud project (the default). Run this command on the DuDuClaw host:
+
+The automatic import requires a running DuDuClaw gateway and an administrator login (including MFA when required).
+
+```bash
+# HTTP: replace the host with your public gateway address.
+duduclaw channels googlechat bootstrap --endpoint-url https://chat.example.com/webhook/googlechat
 ```
 
-6. After a manual config edit, restart the gateway. Dashboard changes apply live. The log prints
-   `✅ Google Chat webhook ready at /webhook/googlechat`.
+The command creates a project, enables Chat API, and prepares a service account before creating its private JSON key as the last cloud step. It then imports the settings. `--project-id your-project-id` reuses a project you directly own; group or inherited ownership is conservatively refused. Optional flags: `--app-name`, `--agent`, `--out`, and `--dry-run` (no cloud or local changes). The default project ID is `duduclaw-chat-<random6>`. The private output directory stores `service-account.json` with mode 0600. A rerun reuses a matching key. Imported credentials are encrypted at rest. If a later script step fails after key creation, it attempts to revoke the new cloud key and remove the local file. Revocation failures or an unreadable key ID are reported for manual follow-up. If the script succeeds but CLI import fails, the CLI keeps the key file and exits non-zero. The new service-account key remains valid; the error includes the file path and exact commands to retry the import or revoke the key manually. The CLI never revokes keys or deletes key files automatically.
 
-### Notes
+If you do not have local gcloud, [open Cloud Shell](https://shell.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/zhixuli0406/DuDuClaw&cloudshell_tutorial=scripts/googlechat/cloudshell-tutorial.md&show=terminal) and run `bash scripts/googlechat/bootstrap.sh --endpoint-url https://chat.example.com/webhook/googlechat`. Download the key securely to your DuDuClaw host, set `chmod 600 /private/path/service-account.json`, and run the printed import command with its local path. On Windows, keep the plain regular key file inside your own user profile directory. Reparse points are refused; owner and ACL permissions are not verified.
 
-- Inbound requests are verified fail-closed: the `Authorization: Bearer`
-  JWT must be signed by `chat@system.gserviceaccount.com` with audience =
-  your project number.
-- Replies are sent asynchronously via `spaces.messages.create` (the
-  synchronous window is only 30 s — too short for agent tasks) and thread
-  correctly via `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`.
-- Each person's messages in a space are answered one at a time, in the
-  order they arrived (before, several messages sent in a row ran at the
-  same time, so a later answer could miss an earlier message). Up to 10
-  messages per person and 40 per space can wait; past that the space is
-  told the message was not accepted, at most once a minute per person and
-  once every 10 seconds per space. An event without a space is refused.
-- This ordering and its limits apply to each employee's own Chat app too.
-  The queue survives individual webhook requests; different apps in the same
-  space have independent queues and can answer in parallel.
-- Unpublished Chat apps are visible only inside your Workspace org; wider
-  distribution requires Google Workspace Marketplace publishing.
+```bash
+duduclaw channels googlechat import --project-number 123456789012 --key-file /private/path/service-account.json
+```
+
+### Finish in Google Chat
+
+Open the printed Chat Configuration link. Google does not provide a configuration API for this page, so this final step is manual:
+
+1. **Uncheck “Build this Chat app as a Google Workspace add-on” when creating the app.** Paste the app name (up to 25 characters), a public HTTPS avatar URL, and description. No hosted DuDuClaw avatar is assumed by the script.
+2. Enable **Interactive features**, 1:1 messages, and joining spaces.
+3. Paste the HTTP endpoint and set **Authentication Audience → Project number**.
+4. Set **Visibility** to your own Workspace email and save. Add the app to a space or send it a direct message, then verify an actual reply.
+
+A successful import or resource creation does not prove that Chat is configured or that a message round trip works. The dashboard offers the bootstrap command, Cloud Shell, copyable configuration values; manual fields remain under **Manual setup**.
+
+### Key policy
+
+If key creation reports `FAILED_PRECONDITION`, ask an Organization Policy Administrator to review the project exception. Organizations created on or after 2024-05-03 commonly enforce key-creation restrictions. The script prints the commands and stops; it does not change policy:
+
+```bash
+gcloud resource-manager org-policies disable-enforce iam.disableServiceAccountKeyCreation --project=your-project-id
+gcloud resource-manager org-policies disable-enforce iam.managed.disableServiceAccountKeyCreation --project=your-project-id
+```
+
+For the managed constraint, an administrator should verify support in their installed gcloud and may need the Organization Policies console. See [Google's key policy guidance](https://cloud.google.com/iam/docs/troubleshoot-org-policies).
+
+### Appendix: manual setup
+
+Create a project, enable Chat API, create a service account and JSON key, and configure the Chat page as above. In **Channels → Add Google Chat → Manual setup**, enter the project number and full JSON key. Save and test a message. HTTP verifies the inbound JWT against `chat@system.gserviceaccount.com` and your project number. Unsupported Workspace add-on payloads produce a diagnostic asking you to uncheck the add-on option.
 
 ## Microsoft Teams
 

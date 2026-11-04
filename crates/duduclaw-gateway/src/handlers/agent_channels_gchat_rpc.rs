@@ -17,6 +17,11 @@ impl MethodHandler {
         if let Err(e) = crate::product_policy::require_channel(&self.home_dir, "googlechat") {
             return WsFrame::error_response("", &e);
         }
+        if let Some(fields) = params.as_object() {
+            if let Err(error) = googlechat_config::validate_fields(fields.keys().map(String::as_str), &["agent_id", "project_number", "service_account_json"]) {
+                return WsFrame::error_response("", &error);
+            }
+        }
         let raw_project = params
             .get("project_number")
             .and_then(|v| v.as_str())
@@ -35,8 +40,13 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        // Bind lock covers the stored key snapshot, validation and final write.
+        let _bind = agent_channels::binding_lock().await;
         let sa_enc = match raw_key {
             Some(json) => {
+                if let Err(e) = crate::googlechat::verify_import_key(json).await {
+                    return WsFrame::error_response("", &e);
+                }
                 if let Err(e) = googlechat_config::validate_service_account_json(json) {
                     return WsFrame::error_response("", &e);
                 }
@@ -58,8 +68,6 @@ impl MethodHandler {
                 );
             }
         };
-        // Held across the duplicate check and the write (B11 L3).
-        let _bind = agent_channels::binding_lock().await;
         if let Some(holder) = conflicts::googlechat_project_holder(
             &self.home_dir,
             &self.registry,
@@ -77,7 +85,9 @@ impl MethodHandler {
                 GOOGLECHAT_SET,
                 Some(live),
                 Some(session),
-                move |t| store::apply_googlechat(t, &project_for_write, sa_enc.as_deref()),
+                move |t| {
+                    store::apply_googlechat(t, &project_for_write, sa_enc.as_deref())
+                },
             )
             .await
         {

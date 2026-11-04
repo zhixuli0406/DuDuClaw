@@ -67,6 +67,7 @@ pub struct GoogleChatState {
 pub(crate) enum CredSource {
     /// `config.toml [channels] googlechat_service_account_json`.
     Global,
+    Candidate,
     /// `agents/<id>/agent.toml [channels.googlechat] service_account_json`.
     Agent(String),
 }
@@ -144,6 +145,7 @@ impl GoogleChatCreds {
             // (heartbeat/cron/tick never start) with zero diagnostics.
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
         })
@@ -191,6 +193,7 @@ impl GoogleChatCreds {
     /// source. `None` when it cannot be read (or was removed).
     async fn current_service_account_json(&self) -> Option<String> {
         match &self.source {
+            CredSource::Candidate => None,
             CredSource::Global => read_config(&self.home_dir, "googlechat_service_account_json")
                 .await
                 .filter(|j| !j.trim().is_empty()),
@@ -216,8 +219,16 @@ impl GoogleChatCreds {
 
     /// Get (or refresh) the service-account access token (JWT-bearer grant).
     async fn get_token(&self) -> Result<String, String> {
+        self.get_scoped_token(CHAT_SCOPE, &self.token).await
+    }
+
+    pub(crate) fn candidate(raw: &str) -> Option<Self> {
+        Self::with_source(raw, Path::new(""), CredSource::Candidate)
+    }
+
+    async fn get_scoped_token(&self, scope: &str, cache: &RwLock<(String, std::time::Instant)>) -> Result<String, String> {
         {
-            let cached = self.token.read().await;
+            let cached = cache.read().await;
             // Tokens last 3600s; refresh 5 minutes early.
             if !cached.0.is_empty() && cached.1.elapsed().as_secs() < 3300 {
                 return Ok(cached.0.clone());
@@ -240,7 +251,7 @@ impl GoogleChatCreds {
             Some(json) => Self::parse_service_account_json(&json).ok_or_else(|| {
                 "googlechat_service_account_json is not a valid service-account key".to_string()
             })?,
-            None if self.source == CredSource::Global => (
+            None if matches!(self.source, CredSource::Global | CredSource::Candidate) => (
                 self.client_email.clone(),
                 self.private_key.clone(),
                 self.token_uri.clone(),
@@ -248,8 +259,7 @@ impl GoogleChatCreds {
             None => return Err("this AI employee's Google Chat app is no longer configured".into()),
         };
         // An employee's key may only post its assertion to Google (B11 L2).
-        if matches!(self.source, CredSource::Agent(_))
-            && !crate::agent_channels::googlechat_config::token_uri_allowed(&token_uri)
+        if !crate::agent_channels::googlechat_config::token_uri_allowed(&token_uri)
         {
             return Err("service-account token_uri is not Google's token endpoint".into());
         }
@@ -260,7 +270,7 @@ impl GoogleChatCreds {
             .as_secs();
         let claims = serde_json::json!({
             "iss": client_email,
-            "scope": CHAT_SCOPE,
+            "scope": scope,
             "aud": token_uri,
             "iat": now,
             "exp": now + 3600,
@@ -296,16 +306,27 @@ impl GoogleChatCreds {
         let token = body
             .get("access_token")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .ok_or("no access_token in response")?
             .to_string();
-        *self.token.write().await = (token.clone(), std::time::Instant::now());
+        *cache.write().await = (token.clone(), std::time::Instant::now());
         Ok(token)
     }
+}
+
+/// Verify the candidate key itself before saving; never reuse the installed key.
+pub async fn verify_import_key(raw: &str) -> Result<(), String> {
+    crate::agent_channels::googlechat_config::validate_service_account_json(raw)?;
+    let creds = GoogleChatCreds::with_source(raw, Path::new(""), CredSource::Candidate)
+        .ok_or("服務帳戶金鑰格式不正確")?;
+    creds.token().await?;
+    Ok(())
 }
 
 /// Read config and build the Google Chat webhook router. Returns `None`
 /// when the channel isn't configured.
 pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
+    if !shared_settings_valid(home_dir).await { return None; }
     let project_number = read_config(home_dir, "googlechat_project_number").await?;
     if project_number.trim().is_empty() {
         return None;
@@ -360,6 +381,19 @@ pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -
     )
 }
 
+async fn shared_settings_valid(home_dir: &Path) -> bool {
+    let Ok(raw) = tokio::fs::read_to_string(home_dir.join("config.toml")).await else { return false; };
+    let Ok(table) = raw.parse::<toml::Table>() else { return false; };
+    let Some(channels) = table.get("channels").and_then(toml::Value::as_table) else { return false; };
+    let fields = channels.keys().filter_map(|field| field.strip_prefix("googlechat_"));
+    if let Err(error) = crate::agent_channels::googlechat_config::validate_fields(fields,
+        &["project_number", "service_account_json", "service_account_json_enc"]) {
+        warn!("{error}");
+        return false;
+    }
+    true
+}
+
 async fn read_config(home_dir: &Path, field: &str) -> Option<String> {
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field).await
 }
@@ -369,6 +403,9 @@ async fn webhook_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    if !shared_settings_valid(&state.ctx.home_dir).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // ── Verify the Google-signed JWT (fail closed) ──
     let auth = headers
         .get("authorization")
@@ -390,6 +427,11 @@ async fn webhook_handler(
     if let Err(e) = verify_request(&state.creds, token, &project_number).await {
         warn!("Google Chat webhook: JWT verification failed: {e}");
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let _bind = crate::agent_channels::binding_lock().await;
+    if !shared_settings_valid(&state.ctx.home_dir).await
+        || read_config(&state.ctx.home_dir, "googlechat_project_number").await.as_deref() != Some(project_number.as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     dispatch_event(state, body).await
 }
@@ -414,6 +456,24 @@ pub(crate) async fn verify_request(
 /// Handle an already-verified Chat event (shared by the shared app and the
 /// employees' own apps).
 pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> axum::response::Response {
+    dispatch_transport_event(state, body).await
+}
+
+pub(crate) const ADDON_DIAGNOSTIC: &str = "Google Chat 應用程式使用了不支援的 Workspace 外掛程式事件格式。建立時請取消勾選『以 Google Workspace 外掛程式建構這個 Chat 應用程式』（Build this Chat app as a Google Workspace add-on），再改用 Chat API 互動事件。";
+
+pub(crate) fn is_addon_event(event: &serde_json::Value) -> bool {
+    event.get("commonEventObject").is_some() || event.pointer("/chat/messagePayload").is_some()
+}
+
+pub(crate) async fn report_addon(state: &GoogleChatState) {
+    let label = state.agent.as_deref().map(|id| crate::agent_channels::label("googlechat", id))
+        .unwrap_or_else(|| "googlechat".into());
+    warn!(channel = label, "{ADDON_DIAGNOSTIC}");
+    set_channel_connected(&state.ctx.channel_status, &label, false,
+        Some(ADDON_DIAGNOSTIC.into()), Some(&state.ctx.event_tx)).await;
+}
+
+async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> axum::response::Response {
     let event: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -422,6 +482,10 @@ pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> 
         }
     };
 
+    if is_addon_event(&event) {
+        report_addon(&state).await;
+        return (StatusCode::BAD_REQUEST, ADDON_DIAGNOSTIC).into_response();
+    }
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
     // Verified event: remember which app is in this space, so sends with no
     // explicit sender (approvals, goals, reminders) use an app that is there.
@@ -452,12 +516,13 @@ pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> 
             // two apps in one space do not block each other or share caps.
             let group = serde_json::json!([state.agent.as_deref(), &space]).to_string();
             let conversation = serde_json::json!([state.agent.as_deref(), &space, &sender]).to_string();
-            if state
-                .ctx.googlechat_queue
-                .submit_in(&group, &conversation, async move {
-                    handle_message(&st, &queued).await
-                })
-                .is_err()
+            let message_name = event.pointer("/message/name").and_then(|v| v.as_str()).filter(|name| !name.is_empty() && name.len() <= 1024);
+            let dedupe_key = message_name.map(|name| serde_json::json!([
+                state.ctx.home_dir, state.agent, state.creds.client_email(), name
+            ]).to_string());
+            let accepted = enqueue_once(dedupe_key.as_deref(), || state.ctx.googlechat_queue
+                .submit_in(&group, &conversation, async move { handle_message(&st, &queued).await }).is_ok());
+            if !accepted
             {
                 let notify = state.ctx.googlechat_full_notices.allow(&[
                     (&format!("sender:{conversation}"), std::time::Duration::from_secs(60)),
@@ -471,6 +536,8 @@ pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> 
                         create_message(&st.creds, &space, thread, QUEUE_FULL_TEXT).await;
                     });
                 }
+                // ACK and drop this event: the notice asks the user to resend.
+                return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
             }
             // ACK synchronously with an empty body — the reply arrives
             // asynchronously via the REST API.
@@ -486,16 +553,35 @@ pub(crate) async fn dispatch_event(state: Arc<GoogleChatState>, body: Bytes) -> 
                 Some(id) => crate::trigger_route::display_name(&*state.ctx.registry.read().await, id),
                 None => "DuDuClaw".to_string(),
             };
+            let welcome = format!("{product} 已加入！直接傳訊息即可對話。");
             (
                 StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "text": format!("{product} 已加入！直接傳訊息即可對話。")
-                })),
+                axum::Json(serde_json::json!({ "text": welcome })),
             )
                 .into_response()
         }
         _ => (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response(),
     }
+}
+
+/// Cache only successful admission, under the same lock as submit so a
+/// redelivery cannot race the original. Bounded, process-local, 24-hour TTL.
+fn enqueue_once(key: Option<&str>, submit: impl FnOnce() -> bool) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static ACCEPTED: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+    let Some(key) = key else { return submit(); };
+    let mut accepted = ACCEPTED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    accepted.retain(|_, at| at.elapsed().as_secs() < 86400);
+    if accepted.contains_key(key) { return true; }
+    if !submit() { return false; }
+    if accepted.len() >= 10000 {
+        if let Some(oldest) = accepted.iter().min_by_key(|(_, at)| **at).map(|(key, _)| key.clone()) {
+            accepted.remove(&oldest);
+        }
+    }
+    accepted.insert(key.to_string(), std::time::Instant::now());
+    true
 }
 
 /// The space a MESSAGE event belongs to (the queue key; same lookup as
@@ -1164,6 +1250,15 @@ pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn googlechat_dedupe_only_records_accepted_messages() {
+        let key = format!("test:{}", uuid::Uuid::new_v4());
+        assert!(!enqueue_once(Some(&key), || false));
+        assert!(enqueue_once(Some(&key), || true));
+        assert!(enqueue_once(Some(&key), || panic!("duplicate submitted twice")));
+        assert!(enqueue_once(Some("different-app-test"), || true));
+    }
+
     use serde_json::json;
 
     #[test]

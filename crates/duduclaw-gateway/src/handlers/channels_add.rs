@@ -22,6 +22,14 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let agent_name = params.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+        let normalized_project;
+        let secret = if channel_type == "googlechat" {
+            normalized_project = match crate::agent_channels::googlechat_config::validate_project_number(secret) {
+                Ok(project) => project,
+                Err(e) => return WsFrame::error_response("", &e),
+            };
+            normalized_project.as_str()
+        } else { secret };
 
         if token.is_empty() {
             return WsFrame::error_response("", "Missing 'config.token' parameter");
@@ -36,6 +44,24 @@ impl MethodHandler {
             Err(msg) => return WsFrame::error_response("", &msg),
         };
         let token = token.as_str();
+
+        if channel_type == "googlechat" {
+            if let Some(fields) = config_obj.as_object() {
+                if let Err(error) = crate::agent_channels::googlechat_config::validate_fields(fields.keys().map(String::as_str), &["token", "secret"]) {
+                    return WsFrame::error_response("", &error);
+                }
+            }
+            // Preserve external secret references: validate their resolved
+            // candidate, but persist the original encrypted reference.
+            let sm = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(&self.home_dir).await;
+            let candidate = match duduclaw_security::secret_ref::SecretRef::from_typed(None, token).resolve(&sm, &self.home_dir).await {
+                Some(key) => key,
+                None => return WsFrame::error_response("", "無法讀取 Google Chat 服務帳戶金鑰。"),
+            };
+            if let Err(e) = crate::googlechat::verify_import_key(candidate.expose()).await {
+                return WsFrame::error_response("", &e);
+            }
+        }
 
         // Cloud-tier channel cap (self-host is never capped — Apache 2.0).
         let channel_count = self.count_configured_channels().await;
@@ -205,6 +231,10 @@ impl MethodHandler {
         // Encrypt the primary token before storing (H3).
         let enc_token_key = format!("{token_key}_enc");
         let encrypted_token = crate::config_crypto::encrypt_value(token, &self.home_dir);
+
+        if channel_type == "googlechat" && encrypted_token.is_none() {
+            return WsFrame::error_response("", crate::agent_channels::store::ENCRYPTION_UNAVAILABLE);
+        }
 
         // XC.3: `whatsapp_phone_number_id` is NOT a secret — it must be stored as
         // plaintext (consistent with the per-agent `agents.update` path, which
@@ -385,5 +415,72 @@ impl MethodHandler {
                 ),
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod googlechat_import_tests {
+    use super::*;
+    use crate::agent_channels::e2e_gchat_tests;
+
+    #[tokio::test]
+    async fn googlechat_import_validates_candidate_and_commits_encrypted_key() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = e2e_gchat_tests::start_fake().await;
+        let email = format!("import-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+        let mut key: Value = serde_json::from_str(&e2e_gchat_tests::service_account(&fake, &email)).unwrap();
+        key["project_id"] = json!("test-project");
+        let raw_key = key.to_string();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let params = json!({"type":"googlechat", "config":{"token":raw_key,"secret":"123456789"}});
+        let result = handler.handle_channels_add(params.clone()).await;
+        assert!(matches!(result, WsFrame::Response { ok: true, .. }), "{result:?}");
+        let stored = tokio::fs::read_to_string(home.path().join("config.toml")).await.unwrap();
+        let table: toml::Table = stored.parse().unwrap();
+        let channels = table["channels"].as_table().unwrap();
+        assert!(channels.get("googlechat_service_account_json").is_none());
+        assert!(!stored.contains("PRIVATE KEY"));
+        let restored = crate::config_crypto::read_encrypted_config_field(home.path(), "channels", "googlechat_service_account_json").await.unwrap();
+        assert_eq!(restored, raw_key);
+        for (field, value) in [("secret", "invalid-number"), ("token", "{}"), ("connection", "invalid")] {
+            let mut bad = params.clone();
+            bad["config"][field] = json!(value);
+            let result = handler.handle_channels_add(bad).await;
+            assert!(matches!(result, WsFrame::Response { ok: false, .. }), "{field}: {result:?}");
+            assert_eq!(tokio::fs::read_to_string(home.path().join("config.toml")).await.unwrap(), stored, "invalid import must not change config");
+        }
+        // A syntactically valid but unreachable candidate must not be
+        // verified using the already installed, working key.
+        key["token_uri"] = json!("http://127.0.0.1:1/token");
+        let mut bad = params;
+        bad["config"]["token"] = json!(key.to_string());
+        assert!(matches!(handler.handle_channels_add(bad).await, WsFrame::Response { ok: false, .. }));
+        assert_eq!(tokio::fs::read_to_string(home.path().join("config.toml")).await.unwrap(), stored);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn googlechat_manual_secret_reference_is_resolved_before_validation() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let fake = e2e_gchat_tests::start_fake().await;
+        let raw = e2e_gchat_tests::service_account(&fake, &format!("reference-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple()));
+        // The production resolver confines file references to <home>/secrets
+        // (or an orchestrator secret root); a random file under home is denied.
+        let outside = home.path().join("key.json");
+        tokio::fs::write(&outside, &raw).await.unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let refused = handler.handle_channels_add(json!({"type":"googlechat","config":{"token":format!("secret://file/{}", outside.display()),"secret":"123456789"}})).await;
+        assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+        let secrets = home.path().join("secrets");
+        tokio::fs::create_dir(&secrets).await.unwrap();
+        let key_file = secrets.join("key.json");
+        tokio::fs::write(&key_file, &raw).await.unwrap();
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let reference = format!("secret://file/{}", key_file.display());
+        let result = handler.handle_channels_add(json!({"type":"googlechat","config":{"token":reference,"secret":"123456789"}})).await;
+        assert!(matches!(result, WsFrame::Response { ok: true, .. }), "{result:?}");
+        assert_eq!(crate::config_crypto::read_encrypted_config_field(home.path(), "channels", "googlechat_service_account_json").await.as_deref(), Some(raw.as_str()));
     }
 }

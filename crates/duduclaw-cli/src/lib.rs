@@ -105,6 +105,7 @@ mod tui_cmd;
 mod channel_ingress_cmd; // F2: `duduclaw channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
+mod googlechat_cmd;
 mod agent_export_cmd;
 mod agent_control_cmd; // Operator-only pause/resume/freeze/unfreeze
 mod mcp_init_cmd; // standalone MCP profile: `duduclaw mcp init`
@@ -439,6 +440,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 設定通訊頻道（需要執行中的閘道與管理員登入）
+    Channels {
+        #[command(subcommand)]
+        command: googlechat_cmd::ChannelsCommands,
+    },
     /// Inspect or recover egress leases while the gateway is stopped.
     EgressLeases {
         #[command(subcommand)]
@@ -4167,12 +4173,13 @@ pub async fn entry_point() {
         }
         return;
     }
-    if is_tui_command(&cli.command) {
+    if is_tui_command(&cli.command) || matches!(&cli.command, Commands::Channels { .. }) {
         // The TUI owns the terminal. Never initialize a subscriber, log file,
         // log facade bridge or OTLP here, regardless of RUST_LOG. In particular
-        // tungstenite TRACE payloads include the connect-frame JWT.
+        // tungstenite TRACE payloads include the connect-frame JWT. Channel
+        // imports also carry service-account keys over this same client.
         if cli.force_disable_redaction {
-            eprintln!("控制室不支援 --force-disable-redaction");
+            eprintln!("控制室與頻道設定不支援 --force-disable-redaction");
             std::process::exit(2);
         }
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -4345,6 +4352,7 @@ fn is_read_only_survival_command(command: &Commands) -> bool {
 
 async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
     match cli.command {
+        Commands::Channels { command } => googlechat_cmd::run(&duduclaw_home(), command).await,
         Commands::Tui { command } => tui_cmd::run(&duduclaw_home(), command).await,
         Commands::Onboard { yes } => cmd_onboard(yes).await,
         Commands::Run { yes } => cmd_run_server(yes).await,
@@ -6680,6 +6688,9 @@ fn agent_file_guard_decision(
                     bash_reserved_agent_create(command, &home, &caller)
                         .or_else(|| {
                             duduclaw_core::bash_operator_command_decision(command, &caller, tui_cmd::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, googlechat_cmd::OPERATOR_COMMANDS)
                         })
                         .or_else(|| license::bash_license_decision(command, &caller))
                         .or_else(|| {
