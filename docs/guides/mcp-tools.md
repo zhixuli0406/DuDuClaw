@@ -12,6 +12,24 @@ declaration surface, not the implementation. To run the server on its own,
 without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 
+## Meeting transcription
+
+`meeting_transcribe` takes `source_path` from the calling employee's own attachments,
+optional `engine`, `language_hint` (default `zh-TW`) and `write_wiki` (default `false`).
+It starts a background job and immediately returns its ID and state. The audio is
+sent to the configured transcription provider. Use `meeting_transcribe_status` and
+`meeting_transcribe_cancel` with `job_id` for the employee's own jobs. `meeting_upload_link {}` (also used when no usable source path exists) returns a single-upload link for the original conversation. It requires the same
+`messaging:send` scope as `transcribe_audio`, plus an authenticated employee identity
+and the existing capability, approval and outgoing-data gates. External fallback
+namespaces cannot use it. Its effect is a stored-data change with network egress.
+The optional engine must match the administrator's selected provider.
+
+Audio is sent to Gemini or OpenAI, and generated text uses Taiwan Traditional Chinese
+conversion. RFC-23 masks saved text when enabled; it does not mask uploaded audio.
+`drive_file_id` and `write_wiki: true` return explicit unsupported errors in this
+version. Transcription runs in the gateway background. See [Meeting transcripts](../features/73-meeting-transcripts.md)
+for ffmpeg requirements, provider limits, configuration and privacy.
+
 ## MCP credential boundaries
 
 `DUDUCLAW_` environment variables remain unchanged when MCP credentials are

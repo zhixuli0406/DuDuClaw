@@ -599,6 +599,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // Opt-in group context retention. The helper re-checks lock ownership
+    // every pass, including after this process loses the gateway lock.
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                interval.tick().await;
+                let pass_home = home.clone();
+                if let Err(error) = crate::group_context::blocking(move || crate::group_context::maintenance(&pass_home)).await {
+                    tracing::warn!(%error, "group context retention pass failed");
+                }
+            }
+        });
+    }
+
     // ── Forget by source: resume unfinished external steps (P2-B, D10) ───
     // An apply already deleted the rows and wrote the tombstones; what may
     // remain are its follow-up steps (auto wiki pages, review cards, hiding
@@ -2627,6 +2643,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // WebChat endpoint — C5: now requires JWT auth (in-band) + Origin check,
     // mirroring the main /ws gate instead of being unauthenticated.
+    let meeting_auth_state = state.clone();
     let knowledge_users = state.user_db.clone();
     let webchat_state = Arc::new(crate::webchat::WebChatState::new(
         webchat_ctx,
@@ -3124,6 +3141,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // — trust is proven by subscription_id + machine_fingerprint. Own state
     // (home_dir) + 64 KiB body cap, like the federation route above.
     app = app.merge(crate::license_serve::router(home_dir.clone()));
+
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        match crate::meeting_jobs::Manager::open(home_dir.clone()) {
+            Ok(jobs) => {
+                jobs.spawn();
+                match crate::meeting_uploads::Service::open(jobs.clone()) {
+                    Ok(uploads) => {
+                        app=app.merge(crate::meeting_uploads::router(uploads.clone(),Arc::new(move |headers|knowledge_caller(&meeting_auth_state,headers))));
+                        match crate::meeting_links::router(uploads) {Ok(router)=>app=app.merge(router),Err(error)=>tracing::error!(%error,"meeting upload links unavailable")}
+                    }
+                    Err(error)=>tracing::error!(%error,"meeting uploads unavailable"),
+                }
+                app = app.merge(crate::meeting_jobs::http::router(jobs));
+            }
+            Err(error) => tracing::error!(%error, "meeting job service unavailable"),
+        }
+    }
 
     // ── Tool-driven computer use (internal) ───────────────────────
     // Always mounted; every request must come from a loopback peer, carry

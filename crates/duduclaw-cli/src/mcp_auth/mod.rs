@@ -609,6 +609,7 @@ fn default_internal_principal() -> Principal {
         Scope::WikiRead,
         Scope::WikiWrite,
         Scope::MessagingSend,
+        Scope::MessagingRead,
         Scope::Admin,
     ]
     .into_iter()

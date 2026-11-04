@@ -31,6 +31,7 @@ fn registry() -> &'static Mutex<
             Option<crate::approval::DecisionContext>,
             Option<crate::approval::TrustedReplyTarget>,
             Option<crate::computer_use_sessions::attended::AttendedInputProof>,
+            Option<String>,
         )>,
     >,
 > {
@@ -44,6 +45,7 @@ fn registry() -> &'static Mutex<
                     Option<crate::approval::DecisionContext>,
                     Option<crate::approval::TrustedReplyTarget>,
                     Option<crate::computer_use_sessions::attended::AttendedInputProof>,
+                    Option<String>,
                 )>,
             >,
         >,
@@ -111,6 +113,7 @@ pub fn register(agent_id: &str, turn_id: &str, reply_channel: &str) -> Option<Tu
                 .ok()
                 .flatten(),
             crate::computer_use_sessions::attended::capture(agent_id, turn_id),
+            duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone).ok().flatten(),
         ));
     Some(TurnGuard { key, id,
         _watch_socket: crate::computer_watch_links::delivery::register_socket(agent_id, turn_id),
@@ -238,7 +241,7 @@ pub fn decision_context_for(
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.into(), turn_id.into()))
         .and_then(|v| v.last())
-        .and_then(|(_, _, c, _, _)| c.clone())
+        .and_then(|(_, _, c, _, _, _)| c.clone())
 }
 
 /// Never reconstruct a transport from a chat id or an employee-supplied token.
@@ -254,7 +257,7 @@ pub(crate) fn target_for(
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.into(), turn_id.into()))
         .and_then(|v| v.last())
-        .and_then(|(_, _, _, t, _)| t.clone())
+        .and_then(|(_, _, _, t, _, _)| t.clone())
 }
 
 /// A verified inbound human message is still live for this exact employee and
@@ -263,7 +266,7 @@ pub(crate) fn attended_live_for(agent_id:&str,turn_id:&str)->bool {
     if !valid_turn_id(turn_id) {return false;}
     registry().lock().unwrap_or_else(|p|p.into_inner())
         .get(&(agent_id.into(),turn_id.into())).and_then(|list|list.last())
-        .and_then(|(_,_,_,_,proof)|proof.as_ref())
+        .and_then(|(_,_,_,_,proof,_)|proof.as_ref())
         .is_some_and(|proof|proof.valid_for(agent_id,turn_id))
 }
 
@@ -334,4 +337,14 @@ mod recipient_tests {
             RequesterIdentity::ChannelUser {channel: "line".into(), chat: "real".into(), sender: "person".into(), user_id: Some("verified-user".into())}).unwrap();
         assert_eq!(source_conversation_for("forged-bot", "real-turn").as_deref(), Some("line:real"));
     }
+}
+
+/// The host session captured while this exact employee's turn was running.
+/// Model-provided session IDs never reach this table.
+pub(crate) fn session_for(agent_id: &str, turn_id: &str) -> Option<String> {
+    if !valid_turn_id(turn_id) { return None; }
+    registry().lock().unwrap_or_else(|p| p.into_inner())
+        .get(&(agent_id.into(), turn_id.into()))
+        .and_then(|list| list.last())
+        .and_then(|(_, _, _, _, _, session)| session.clone())
 }

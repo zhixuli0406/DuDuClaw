@@ -20,6 +20,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { isVisible, type Gated } from '@/lib/nav-visibility';
 import { ConfirmDialog } from '@/components/settings/controls';
 import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBanner';
+import { GroupContextSettings } from '@/components/channels/GroupContextSettings';
 import { WebChatWidgetCard } from '@/components/channels/WebChatWidgetCard';
 import { AddChannelDialog, CHANNEL_TYPES, DialogField } from '@/components/channels/AddChannelDialog';
 import {
@@ -815,7 +816,7 @@ function ChannelDetailDialog({
   const navigate = useNavigate();
   const t = (id: string) => intl.formatMessage({ id });
   const platform = channelName ? getChannelPlatform(channelName) : '';
-  const [tab, setTab] = useState<'behavior' | 'access'>('behavior');
+  const [tab, setTab] = useState<'behavior' | 'access' | 'context'>('behavior');
 
   useEffect(() => {
     if (open) setTab('behavior');
@@ -860,7 +861,7 @@ function ChannelDetailDialog({
         </div>
 
         {platform && (
-          <Tabs value={tab} onValueChange={(v) => setTab(v as 'behavior' | 'access')}>
+          <Tabs value={tab} onValueChange={(v) => setTab(v as 'behavior' | 'access' | 'context')}>
             <TabsList>
               <TabsTab value="behavior">
                 <SlidersHorizontal />
@@ -870,6 +871,9 @@ function ChannelDetailDialog({
                 <ShieldCheck />
                 {t('channels.detail.tab.access')}
               </TabsTab>
+              {role === 'admin' && ['telegram', 'discord', 'slack', 'line', 'feishu', 'dingtalk', 'teams', 'googlechat'].includes(platform) && (
+                <TabsTab value="context">{t('channels.groupContext.title')}</TabsTab>
+              )}
             </TabsList>
             <div className="max-h-[60vh] overflow-y-auto pt-4">
               <TabsPanel value="behavior">
@@ -878,6 +882,9 @@ function ChannelDetailDialog({
               <TabsPanel value="access">
                 <ChannelAccessTab platform={platform} active={open && tab === 'access'} />
               </TabsPanel>
+              {role === 'admin' && <TabsPanel value="context">
+                <GroupContextSettings platform={platform} active={open && tab === 'context'} />
+              </TabsPanel>}
             </div>
           </Tabs>
         )}

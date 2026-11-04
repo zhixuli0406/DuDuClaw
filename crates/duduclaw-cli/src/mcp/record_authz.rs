@@ -419,7 +419,8 @@ pub(crate) fn background_caller_refusal(tool: &str, info: &duduclaw_core::autono
 pub(crate) fn creates_background_work(tool: &str) -> bool {
     matches!(
         tool,
-        "send_to_agent"
+        "meeting_transcribe" | "meeting_upload_link"
+            | "send_to_agent"
             | "spawn_agent"
             | "spawn_ephemeral"
             | "tasks_create"

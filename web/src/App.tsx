@@ -45,6 +45,7 @@ const BillingShell = lazyPage(() => import('./pages/BillingShell'), 'BillingShel
 const WikiTrustPage = lazyPage(() => import('./pages/WikiTrustPage'), 'WikiTrustPage');
 const LicenseShell = lazyPage(() => import('./pages/LicenseShell'), 'LicenseShell');
 const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
+const MeetingTranscriptsPage = lazyPage(() => import('./pages/MeetingTranscriptsPage'), 'MeetingTranscriptsPage');
 // O-2 (`DESIGN-agent-os-native-apps-2026-08.md` §6.3) — the conversational
 // "operate the whole machine" scaffold; see `HomeLanding` below for how the
 // appliance image lands here by default.
@@ -238,6 +239,7 @@ export function App() {
               <Route path="inbox" element={<InboxPage />} />
               {/* v2 (T1.5): /webchat renamed to /chat; old path redirects. */}
               <Route path="chat" element={<WebChatPage />} />
+              <Route path="meeting-transcripts" element={<MeetingTranscriptsPage />} />
               <Route path="webchat" element={<Navigate to="/chat" replace />} />
               {/* Machine operation entry; the server also checks the live human role. */}
               <Route element={<RoleGuard minRole="admin" />}><Route path="console" element={<OperatorConsolePage />} /></Route>

@@ -672,7 +672,7 @@ mod tests {
                 .points
                 .iter()
                 .map(|point| abs_error(point.predicted_backlog_end, point.actual_backlog_end))
-                .sum()
+                .sum::<u128>()
         );
         assert_eq!(
             result.model_beats_all_baselines,

@@ -61,6 +61,7 @@ pub fn validate_mfa_import_policy(home: &std::path::Path, after: &str, personal:
 
 pub mod a2a_signing;
 pub mod access_control;
+pub mod group_context;
 pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;
@@ -653,3 +654,11 @@ mod egress_registry;
 pub(crate) mod live_events;
 
 pub(crate) mod user_invites;
+
+/// Gateway-owned meeting transcription execution.
+pub mod meeting_transcription;
+
+pub mod meeting_jobs;
+
+pub mod meeting_uploads;
+pub mod meeting_links;

@@ -267,15 +267,28 @@ pub(crate) fn extract_tool_result_text(result: &Value) -> Option<String> {
     }
 }
 
-/// Build a short summary of tool call parameters for audit logging.
-/// Avoids logging full payloads (which may contain sensitive data).
-/// The tool arguments as they may be written to an audit row. `computer_type`
-/// is reduced to `{"chars": n}`: the text typed inside the computer-use
-/// container (a password, say) must never reach `tool_calls.jsonl`, from
-/// where the recent-actions feed can replay it into prompts. Every other
-/// tool's arguments are returned unchanged (`computer_key` carries a key
-/// name, which is fine).
+/// Meeting results may contain live upload capabilities. Never retain their text.
+pub(crate) fn meeting_audit_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "meeting_upload_link")
+}
+
+pub(crate) fn audit_result_text(tool_name: &str, result: &Value) -> Option<String> {
+    if meeting_audit_tool(tool_name) { None } else { extract_tool_result_text(result) }
+}
+
+fn meeting_audit_arguments(args: &Value) -> Value {
+    // Parse before shortening so arbitrary text cannot be smuggled into the prefix.
+    let job = args.get("job_id").and_then(Value::as_str)
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .map(|id| id.to_string()[..8].to_string());
+    serde_json::json!({"source":"attachment", "job_prefix":job})
+}
+
+/// Arguments retained by tool_calls.jsonl and the recent-actions feed.
+/// Meeting tools retain fixed attachment metadata and a validated job prefix;
+/// typing, navigation and workspace tools apply their existing masking rules.
 pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
+    if meeting_audit_tool(tool_name) { return meeting_audit_arguments(args); }
     match tool_name {
         "credential_declare" => serde_json::json!({"redacted":true}),
         "computer_login" => serde_json::json!({"credential": args.get("credential").and_then(Value::as_str)}),
@@ -322,6 +335,7 @@ fn workspace_args_summary(args: &Value) -> (String, String, usize) {
 }
 
 pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
+    if meeting_audit_tool(tool_name) { return meeting_audit_arguments(args).to_string(); }
     match tool_name {
         "credential_declare" => "credential declaration (arguments redacted)".into(),
         "computer_workspace_write" | "computer_workspace_read" => {
@@ -454,5 +468,34 @@ mod credential_declaration_audit_tests {
         let args = serde_json::json!({"credential_id":"smuggled-id", "service":"smuggled-service", "note":"smuggled-note", "unexpected":"smuggled-extra"});
         assert_eq!(audit_safe_arguments("credential_declare", &args), serde_json::json!({"redacted":true}));
         assert_eq!(build_params_summary("credential_declare", &args), "credential declaration (arguments redacted)");
+    }
+}
+
+#[cfg(test)]
+mod meeting_audit_tests {
+    use super::*;
+    #[test]
+    fn meeting_audit_masks_arguments_and_capability_results_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"source_path":"/private/recordings/secret.wav",
+            "job_id":"12345678-1234-4123-8123-123456789abc", "upload_url":"https://upload.invalid/#live-token",
+            "error":"provider-secret", "engine":"provider-secret",
+            "name":"https://upload.invalid/#live-token", "agent_id":"/private/recordings/secret.wav"});
+        let result = serde_json::json!({"content":[{"type":"text","text":args.to_string()}]});
+        for tool in ["meeting_transcribe", "meeting_transcribe_status", "meeting_transcribe_cancel", "meeting_upload_link"] {
+            let summary = build_params_summary(tool, &args);
+            let safe = audit_safe_arguments(tool, &args);
+            assert_eq!(safe["job_prefix"], "12345678");
+            assert!(audit_result_text(tool, &result).is_none());
+            duduclaw_security::audit::append_tool_call_with_input(home.path(), "alice", tool,
+                &summary, true, Some(&safe), audit_result_text(tool, &result).as_deref());
+            duduclaw_security::audit::append_tool_call_denied(home.path(), "alice", tool,
+                "denied", "meeting request refused", Some(&safe));
+        }
+        let log = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        for secret in ["/private/", "secret.wav", "12345678-1234", "upload.invalid", "live-token", "provider-secret"] {
+            assert!(!log.contains(secret), "leaked {secret}");
+        }
+        assert_eq!(meeting_audit_arguments(&serde_json::json!({"job_id":"https://evil/#token"}))["job_prefix"], Value::Null);
     }
 }

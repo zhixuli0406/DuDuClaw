@@ -88,6 +88,8 @@ mod channels_add;
 mod channels_test;
 mod channels_bind;
 mod channels_config;
+mod channels_group_context;
+mod channels_discord_choices;
 mod channels_hot;
 mod accounts_basic;
 mod memory_rpc;

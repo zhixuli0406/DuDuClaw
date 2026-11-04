@@ -18,6 +18,10 @@ use tracing::info;
 
 /// Known setting keys (type-safe access).
 pub mod keys {
+    /// Admin-only per-group retention policy; not exposed through channel_config.
+    pub const GROUP_CONTEXT: &str = "group_context";
+    /// Admin-only per-guild choices for Discord /agent. No global inheritance.
+    pub const DISCORD_AGENT_CHOICES: &str = "discord_agent_choices";
     /// Whether the bot only responds when mentioned. Values: "true" / "false"
     pub const MENTION_ONLY: &str = "mention_only";
     /// JSON array of allowed channel/chat IDs. Empty array or missing = all allowed.
@@ -134,6 +138,13 @@ pub fn validate_scope_id(scope_id: &str) -> Result<(), String> {
 /// [`MCP_ACCESS_KEYS`] / [`DASHBOARD_ACCESS_KEYS`] first.
 pub fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
     match key {
+        keys::DISCORD_AGENT_CHOICES => {
+            let ids: Vec<String> = serde_json::from_str(value)
+                .map_err(|_| "discord_agent_choices must be an array of agent ids".to_string())?;
+            if ids.len() > 25 || ids.iter().any(|id| !duduclaw_core::is_valid_agent_id(id)) {
+                return Err("discord_agent_choices accepts at most 25 valid agent ids".into());
+            }
+        }
         keys::MENTION_ONLY | keys::AUTO_THREAD | keys::REQUIRE_PAIRING => {
             if value != "true" && value != "false" {
                 return Err(format!("{key} must be 'true' or 'false'"));
@@ -1034,6 +1045,18 @@ mod tests {
     #[test]
     fn validate_setting_value_agent_override_any_string() {
         assert!(validate_setting_value(keys::AGENT_OVERRIDE, "any-string-goes").is_ok());
+    }
+
+    #[test]
+    fn discord_choices_are_admin_only_and_validate_existing_ids() {
+        assert!(!CONFIG_KEYS.contains(&keys::DISCORD_AGENT_CHOICES));
+        assert!(!MCP_ACCESS_KEYS.contains(&keys::DISCORD_AGENT_CHOICES));
+        assert!(!CONFIG_KEYS.contains(&keys::GROUP_CONTEXT));
+        assert!(!MCP_ACCESS_KEYS.contains(&keys::GROUP_CONTEXT));
+        assert!(validate_setting_value(keys::DISCORD_AGENT_CHOICES, r#"["Worker_1"]"#).is_ok());
+        assert!(validate_setting_value(keys::DISCORD_AGENT_CHOICES, r#"["../main"]"#).is_err());
+        assert!(validate_setting_value(keys::DISCORD_AGENT_CHOICES, "null").is_err());
+        assert!(validate_setting_value(keys::DISCORD_AGENT_CHOICES, &serde_json::to_string(&vec!["worker"; 26]).unwrap()).is_err());
     }
 
     #[test]

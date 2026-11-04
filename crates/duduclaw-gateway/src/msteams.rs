@@ -675,6 +675,7 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         .pointer("/conversation/conversationType")
         .and_then(|v| v.as_str())
         != Some("personal");
+    let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, teams_context_group(activity), "teams", "global", &conversation_id, None, &activity_id, &sender_id, &sender_name, if text.is_empty() { "[附件]" } else { &text }).await;
     let target = TeamsTarget {
         service_url,
         conversation_id,
@@ -910,14 +911,14 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         })),
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = thinking
+    let guarded = group_turn.scope(thinking
         .scope(build_guarded_reply_with_session(
             &input_text,
             &state.ctx,
             &session_id,
             crate::ccr_runtime::reply_principal_for_sender(&sender_id),
             Some(on_progress),
-        ))
+        )))
         .await;
     drop(typing_guard);
 
@@ -964,7 +965,8 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     }
     // The thinking status becomes "思考了 N 秒" (+ summary) above the answer.
     let _ = thinking.finish().await;
-    deliver_reply(&state.creds, &target, &reply, Some(&guarded)).await;
+    group_turn.delivery(&state.ctx, guarded.answered_by.as_ref(), None)
+        .scope(deliver_reply(&state.creds, &target, &reply, Some(&guarded))).await;
 }
 
 /// Outbound delivery coordinates for one conversation.
@@ -999,7 +1001,7 @@ async fn deliver_reply(
     target: &TeamsTarget,
     reply_markdown: &str,
     guarded: Option<&crate::channel_reply::GuardedReply>,
-) {
+) -> bool {
     let formatted = crate::markdown_render::to_teams_markdown(reply_markdown);
     for (i, chunk) in crate::channel_format::split_text(&formatted, TEAMS_TEXT_CHUNK)
         .iter()
@@ -1012,11 +1014,13 @@ async fn deliver_reply(
                 i == 0,
             );
             send_activity(creds, target, &refusal).await;
-            return;
+            return false;
         }
         let body = message_activity(target, chunk, i == 0);
-        send_activity(creds, target, &body).await;
+        let Some(id) = send_activity(creds, target, &body).await else { return false; };
+        crate::channel_reply::group_buffer::delivered(chunk, Some(&id)).await;
     }
+    true
 }
 
 /// POST an activity; returns the created activity id.
@@ -1621,5 +1625,25 @@ mod ccr_principal_tests {
             source_acl_for_principal(AGENT, SESSION, alice).unwrap(),
             source_acl_for_principal(AGENT, SESSION, bob).unwrap()
         );
+    }
+}
+
+// Retention needs affirmative group metadata; display defaults are not proof.
+fn teams_context_group(activity: &serde_json::Value) -> bool {
+    activity.pointer("/conversation/conversationType").and_then(|v| v.as_str())
+        .is_some_and(|kind| matches!(kind, "groupChat" | "channel"))
+}
+
+#[cfg(test)]
+mod group_context_kind_tests {
+    #[test]
+    fn group_context_teams_requires_explicit_group_metadata() {
+        for kind in ["groupChat", "channel"] {
+            assert!(super::teams_context_group(&serde_json::json!({"conversation":{"conversationType":kind}})));
+        }
+        for kind in ["personal", "", "unknown"] {
+            assert!(!super::teams_context_group(&serde_json::json!({"conversation":{"conversationType":kind}})));
+        }
+        assert!(!super::teams_context_group(&serde_json::json!({"conversation":{"id":"personal-id"}})));
     }
 }

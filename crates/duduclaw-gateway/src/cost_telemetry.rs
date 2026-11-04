@@ -693,6 +693,43 @@ impl CostTelemetry {
         .await;
     }
 
+    /// Record a provider-priced media call in the existing cost ledger.
+    /// `cost_cents` uses the ledger's historical CENTS unit, despite its column
+    /// name. This skips token-model fallback pricing (e.g. Whisper is billed by
+    /// audio duration). Return persistence failures so the producer can report
+    /// an incomplete audit trail instead of claiming successful accounting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_priced(
+        &self,
+        agent_id: &str,
+        request_type: RequestType,
+        model: &str,
+        usage: &TokenUsage,
+        cost_cents: u64,
+        usage_estimated: bool,
+        episode_id: Option<&str>,
+    ) -> Result<(), String> {
+        let goal_round = crate::runtime::GOAL_ROUND_ATTRIBUTION
+            .try_with(Clone::clone).ok();
+        let episode_id = episode_id.or(goal_round.as_ref().map(|g| g.episode_id.as_str()));
+        let round = goal_round.as_ref().and_then(|g| g.round);
+        let efficiency = usage.cache_efficiency();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO token_usage
+             (agent_id, request_type, model, input_tokens, cache_read_tokens,
+              cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents,
+              cache_hit_rate, cache_savings_millicents, created_at,
+              compressed, compression_stages, episode_id, round, usage_estimated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?8, 0, ?10, 0, '', ?11, ?12, ?13)",
+            params![agent_id, request_type.as_str(), model, usage.input_tokens,
+                usage.cache_read_tokens, usage.cache_creation_tokens, usage.output_tokens,
+                efficiency, cost_cents, chrono::Utc::now().to_rfc3339(), episode_id,
+                round, usage_estimated as i64],
+        ).map_err(|e| format!("record priced media usage: {e}"))?;
+        Ok(())
+    }
+
     /// Record a single API call's token usage, attributing it to a specific end
     /// user and channel where known (WP6 — "which employee spent this?").
     /// `user_id` / `channel` are optional so non-channel callers keep working.
@@ -1837,6 +1874,32 @@ pub fn check_price_cliff(system_prompt: &str, user_prompt: &str) -> Option<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transcription_priced_usage_keeps_cents_and_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("cost.db")).unwrap();
+        telemetry.record_priced("meeting-agent", RequestType::Chat, "openai/whisper-1",
+            &TokenUsage::default(), 18, true, Some("meeting-task")).await.unwrap();
+        let summary = telemetry.summary_global(24).await.unwrap();
+        assert_eq!(summary.total_requests, 1);
+        assert_eq!(summary.total_cost_millicents, 18);
+        let conn = telemetry.conn.lock().await;
+        let values: (String, i64) = conn.query_row(
+            "SELECT episode_id, usage_estimated FROM token_usage WHERE agent_id = 'meeting-agent'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(values, ("meeting-task".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn transcription_priced_usage_reports_failed_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("cost.db")).unwrap();
+        telemetry.conn.lock().await.execute("DROP TABLE token_usage", []).unwrap();
+        assert!(telemetry.record_priced("meeting-agent", RequestType::Chat, "media",
+            &TokenUsage::default(), 1, true, None).await.is_err());
+    }
 
     #[tokio::test]
     async fn cost_since_exact_local_midnight_excludes_previous_day() {

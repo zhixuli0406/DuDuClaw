@@ -119,3 +119,7 @@ teams_tenant_id = "<tenant id>"          # empty = legacy multi-tenant bot
 | Google Chat | Chat markup（`*bold*`、`<url\|text>`） | 等寬 code fence | 佔位訊息 + 原地編輯 |
 | MS Teams | markdown activity | 等寬 code fence | `typing` activity 每 3 秒一次 |
 | WebChat | 原始 markdown（由儀表板渲染） | 原生支援 | `progress` WS 事件 |
+
+## 群組近期對話設定
+
+管理員需在「通道 → 群組設定」逐群開啟保留。Telegram 可透過 BotFather `/setprivacy` 關閉隱私模式，或依 bot 管理員身分取得較廣的收訊；Slack 需訂閱 `message.channels`／`message.groups` 並授予 `channels:history`／`groups:history`，再重新安裝 App、邀請加入頻道。Discord 需開啟 MESSAGE CONTENT INTENT。Google Chat 與 Teams 可能只包含提及 App 的訊息，Teams 完整頻道收訊另需 `ChannelMessage.Read.Group` 等 RSC 權限。保留期限、員工讀取權與平台限制見[群組近期對話](../../features/zh-TW/72-group-context.md)。本次變更尚未驗證實際平台收送。

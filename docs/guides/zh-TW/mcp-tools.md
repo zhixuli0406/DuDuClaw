@@ -8,6 +8,19 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 要新增工具請先看 [custom-mcp-tool.md](../custom-mcp-tool.md)；這頁講的是宣告面，不是實作。不裝 gateway、單獨使用 MCP server，見 [mcp-standalone.md](mcp-standalone.md)。
 
 
+## 會議逐字稿
+
+`meeting_transcribe` 接受呼叫員工自己附件中的 `source_path`，以及選用的 `engine`、
+`language_hint`（預設 `zh-TW`）、`write_wiki`（預設 `false`），回傳
+背景工作編號與狀態；音訊會送至管理員設定的服務商。以 `meeting_transcribe_status`／`meeting_transcribe_cancel` 帶 `job_id` 查詢或取消自己的工作；`meeting_upload_link {}` 提供原對話用的一次性大檔上傳連結。範圍沿用 `transcribe_audio` 的 `messaging:send`，另須已驗證的員工身分，
+並通過原有能力、核准及資料外送閘。外部 fallback 命名空間不能使用。
+效果分類是寫入保存資料並對外送出內容；選用引擎必須與管理員設定的服務一致。
+
+音訊會送到 Gemini 或 OpenAI，產出的文字轉為臺灣繁體中文。啟用 RFC-23 時會遮罩
+儲存的文字，無法遮罩已上傳的音訊。本版的 `drive_file_id`、`write_wiki: true`
+會明確回覆不支援。轉錄由閘道在背景執行；ffmpeg 需求、服務限制、設定與隱私說明見
+[會議逐字稿](../../features/zh-TW/73-meeting-transcripts.md)。
+
 ## 每位員工的工具清單精簡
 
 管理員可在員工總覽的「工具清單精簡」卡片選擇模式、展開未使用工具與查看預估節省量；啟用時可還原清單。模式選單沿用既有員工更新流程。`agents.tool_pruning_status {agent_id}` 與 `agents.tool_pruning_restore {agent_id}` 都限 Admin。估算方式是各候選工具定義序列化後的長度除以四，不是 tokenizer 的實際結果，也不代表供應商實測省下的用量。

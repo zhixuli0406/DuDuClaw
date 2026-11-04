@@ -38,6 +38,33 @@ impl MethodHandler {
             }
         };
         let mut changes: Vec<String> = Vec::new();
+        if let Some(value) = params.get("transcription") {
+            let live = match super::task_privacy::live_reader_context(&self.home_dir, ctx) {
+                Ok(live) if live.is_admin() => live,
+                _ => return WsFrame::error_response("", "只有管理員可以變更會議轉錄設定。"),
+            };
+            let _ = live;
+            let candidate = match serde_json::from_value::<duduclaw_inference::transcription::config::TranscriptionConfig>(value.clone()) {
+                Ok(candidate) => candidate,
+                Err(_) => return WsFrame::error_response("", "會議轉錄設定格式錯誤。"),
+            };
+            if let Err(message) = candidate.validate() {
+                return WsFrame::error_response("", &message);
+            }
+            if candidate.engine == duduclaw_inference::transcription::config::EngineKind::Gemini {
+                let mut registry = duduclaw_llm::ModelRegistry::vendored();
+                if registry.load_override(&self.home_dir.join("models.toml")).is_err()
+                    || duduclaw_inference::transcription::config::resolve_gemini_model(&candidate, &registry).is_err() {
+                    return WsFrame::error_response("", "請選擇登錄表中支援音訊轉錄的模型。");
+                }
+            }
+            let section = match toml::Value::try_from(&candidate) {
+                Ok(section) => section,
+                Err(_) => return WsFrame::error_response("", "無法儲存會議轉錄設定。"),
+            };
+            table.insert("transcription".into(), section);
+            changes.push("transcription".into());
+        }
         if let Some(value) = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))) {
             if let Err(e) = self.mfa_require_current_admin(ctx).await {
                 return WsFrame::error_response("", &e);

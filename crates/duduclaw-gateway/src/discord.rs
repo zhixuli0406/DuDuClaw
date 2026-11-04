@@ -1435,6 +1435,14 @@ async fn handle_message_create(
         return;
     }
 
+    let message_id = data["id"].as_str().unwrap_or("");
+    let user_id = author_id;
+    let scope_id = if guild_id.is_empty() { "dm" } else { guild_id };
+    let author_name = author
+        .and_then(|a| a["username"].as_str())
+        .unwrap_or("someone");
+    let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(ctx, current_channel.context_group.is_some(), "discord", scope_id, current_channel.context_group.as_deref().unwrap_or(""), is_thread.then_some(channel_id), message_id, user_id, author_name, if content.is_empty() { "[附件]" } else { content }).await;
+
     if decision_shaped {
         let scope = crate::decision_notify::DecisionAccessScope {
             channel_id: (!guild_id.is_empty()).then_some(channel_id),
@@ -1542,16 +1550,11 @@ async fn handle_message_create(
         return;
     }
 
-    let message_id = data["id"].as_str().unwrap_or("");
 
     // W2-7: cache channel->guild before any filtering below returns early —
     // maximizes the chance the mapping is already known by the time a
     // same-channel `/goal` command or approval fan-out needs it.
     record_channel_guild(&ctx.home_dir, channel_id, guild_id);
-    let author_name = author
-        .and_then(|a| a["username"].as_str())
-        .unwrap_or("someone");
-    let user_id = author_id;
 
     // Check if bot is mentioned
     let mentions = data["mentions"].as_array();
@@ -1569,7 +1572,6 @@ async fn handle_message_create(
         == Some(bot_id);
 
     let settings = &ctx.channel_settings;
-    let scope_id = if guild_id.is_empty() { "dm" } else { guild_id };
     if settings
         .refresh_channel_snapshot("discord", scope_id)
         .await
@@ -1577,6 +1579,7 @@ async fn handle_message_create(
     {
         return;
     }
+
 
     // ── Mention-only filter ──
     // Per-agent bots default to mention-only in guilds to prevent all bots
@@ -2000,7 +2003,7 @@ async fn handle_message_create(
                 session_id: Some(&session_id),
             })
     });
-    let guarded = crate::computer_use_sessions::attended::verified_channel_message(&session_id, user_id, false, thinking.scope(crate::approval::scope_trusted_reply(target, async {
+    let guarded = group_turn.scope(crate::computer_use_sessions::attended::verified_channel_message(&session_id, user_id, false, thinking.scope(crate::approval::scope_trusted_reply(target, async {
         if let Some(agent) = &effective_agent {
             build_guarded_reply_for_agent(
                 clean_content,
@@ -2021,7 +2024,7 @@ async fn handle_message_create(
             )
             .await
         }
-    })))
+    }))))
     .await;
     // Default routing may have selected a bound or explicitly called employee.
     // Attribute the reply to that actual selection instead of guessing main.
@@ -2141,11 +2144,12 @@ async fn handle_message_create(
     }
 
     // ── Send every message (long replies span several; nothing is dropped) ──
+    let delivery = group_turn.delivery(ctx, guarded.answered_by.as_ref(), (is_thread || created_thread).then_some(reply_channel_id.as_str()));
     for payload in payloads {
         if !guarded.still_valid().await {
             return;
         }
-        if let Err(e) = send_discord_message(http, token, &reply_channel_id, payload).await {
+        if let Err(e) = delivery.scope(send_discord_message(http, token, &reply_channel_id, payload)).await {
             warn!(
                 channel_id = %e.channel_id,
                 status = ?e.status,
@@ -2167,6 +2171,7 @@ async fn handle_message_create(
             break; // don't spam retries for the remaining chunks of one reply
         }
     }
+
 
     // ── Guide message in original channel when a new thread was created ──
     // Users may not notice the thread indicator on their message, so send a
@@ -2373,6 +2378,8 @@ async fn send_raw(
                 {
                     Ok(r2) if r2.status().is_success() => {
                         info!("Discord: retry without message_reference succeeded");
+                        let receipt = r2.json::<Value>().await.ok();
+                        crate::channel_reply::group_buffer::delivered(&crate::channel_reply::group_buffer::payload_text(&fallback), receipt.as_ref().and_then(|v| v.get("id")).and_then(|v| v.as_str())).await;
                         return Ok(());
                     }
                     Ok(r2) => {
@@ -2412,7 +2419,11 @@ async fn send_raw(
                 channel_id: channel_id.to_string(),
             })
         }
-        _ => Ok(()),
+        Ok(resp) => {
+            let receipt = resp.json::<Value>().await.ok();
+            crate::channel_reply::group_buffer::delivered(&crate::channel_reply::group_buffer::payload_text(&cleaned), receipt.as_ref().and_then(|v| v.get("id")).and_then(|v| v.as_str())).await;
+            Ok(())
+        },
     }
 }
 
@@ -2538,6 +2549,9 @@ fn discord_bound_text(text: &str) -> bool {
 struct DiscordCurrentChannel {
     session_id: String,
     is_thread: bool,
+    // A thread's verified parent is its group-context owner. A missing
+    // parent disables context capture without changing normal reply routing.
+    context_group: Option<String>,
 }
 async fn discord_verified_message_identity(
     http: &reqwest::Client,
@@ -2554,6 +2568,7 @@ async fn discord_verified_message_identity(
         return Some(DiscordCurrentChannel {
             session_id: format!("discord:{channel_id}"),
             is_thread: false,
+            context_group: None,
         });
     }
     let url = format!("{DISCORD_API}/channels/{channel_id}");
@@ -2583,7 +2598,17 @@ async fn discord_verified_message_identity(
             format!("discord:{channel_id}")
         },
         is_thread,
+        context_group: discord_context_group(&channel, channel_id, is_thread),
     })
+}
+
+fn discord_context_group(channel: &Value, channel_id: &str, is_thread: bool) -> Option<String> {
+    if is_thread {
+        channel.get("parent_id").and_then(Value::as_str)
+            .filter(|id| !id.is_empty()).map(str::to_owned)
+    } else {
+        Some(channel_id.to_owned())
+    }
 }
 
 /// Resolve only platform-provided channel metadata; missing type must never
@@ -2764,20 +2789,16 @@ async fn handle_component_interaction(
             .await;
         }
         "agent_menu" => {
-            let agents: Vec<String> = {
-                let reg = ctx.registry.read().await;
-                reg.list()
-                    .iter()
-                    .map(|a| a.config.agent.name.clone())
-                    .collect()
-            };
+            let agents = if has_manage_guild_permission(data) {
+                agent_selection::allowed_choices(ctx, guild_id).await
+            } else { vec![] };
             if agents.is_empty() {
                 send_interaction_response(
                     http,
                     interaction_id,
                     interaction_token,
                     4,
-                    Some(ephemeral("沒有可切換的 Agent".to_string())),
+                    Some(ephemeral(agent_selection::CHOICES_UNAVAILABLE.to_string())),
                 )
                 .await;
                 return;
@@ -2826,25 +2847,23 @@ async fn handle_component_interaction(
                 .await;
                 return;
             }
-            let known = {
-                let reg = ctx.registry.read().await;
-                reg.get(selected).is_some()
-            };
+            let known = agent_selection::allowed_choices(ctx, guild_id).await.iter().any(|id| id == selected);
             if !known {
                 send_interaction_response(
                     http,
                     interaction_id,
                     interaction_token,
                     4,
-                    Some(ephemeral(format!("❌ 找不到 Agent `{selected}`"))),
+                    Some(ephemeral(agent_selection::CHOICES_UNAVAILABLE.to_string())),
                 )
                 .await;
                 return;
             }
-            let _ = ctx
-                .channel_settings
-                .set("discord", guild_id, keys::AGENT_OVERRIDE, selected)
-                .await;
+            if ctx.channel_settings.set("discord", guild_id, keys::AGENT_OVERRIDE, selected).await.is_err() {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral("設定未儲存，請稍後再試。".to_string()))).await;
+                return;
+            }
             send_interaction_response(
                 http,
                 interaction_id,
@@ -3270,46 +3289,17 @@ async fn handle_slash_command(
                 .and_then(|o| o["value"].as_str())
                 .unwrap_or("");
 
-            let scope = if guild_id.is_empty() {
-                "global"
+            let allowed = agent_selection::allowed_choices(ctx, guild_id).await;
+            let msg = if allowed.iter().any(|id| id == agent_name) {
+                match ctx.channel_settings.set("discord", guild_id, keys::AGENT_OVERRIDE, agent_name).await {
+                    Ok(()) => format!("此伺服器已切換至 AI 員工：**{agent_name}**"),
+                    Err(_) => "設定未儲存，請稍後再試。".to_string(),
+                }
             } else {
-                guild_id
+                agent_selection::CHOICES_UNAVAILABLE.to_string()
             };
-            let reg = ctx.registry.read().await;
-            if reg.get(agent_name).is_some() {
-                drop(reg);
-                let _ = ctx
-                    .channel_settings
-                    .set("discord", scope, keys::AGENT_OVERRIDE, agent_name)
-                    .await;
-                let msg = format!("Switched to agent: **{agent_name}**");
-                send_interaction_response(
-                    http,
-                    interaction_id,
-                    interaction_token,
-                    4,
-                    Some(json!({"content": msg})),
-                )
-                .await;
-            } else {
-                let agents: Vec<String> = reg
-                    .list()
-                    .iter()
-                    .map(|a| a.config.agent.name.clone())
-                    .collect();
-                let msg = format!(
-                    "Agent `{agent_name}` not found.\nAvailable: {}",
-                    agents.join(", ")
-                );
-                send_interaction_response(
-                    http,
-                    interaction_id,
-                    interaction_token,
-                    4,
-                    Some(json!({"content": msg, "flags": 64})),
-                )
-                .await;
-            }
+            send_interaction_response(http, interaction_id, interaction_token, 4,
+                Some(json!({"content": msg, "flags": 64}))).await;
         }
 
         _ => {
@@ -4700,4 +4690,17 @@ mod f4_decision_route_tests;
 /// otherwise reach the customer as an empty or unintended message).
 pub(crate) fn forwards_progress(event: &crate::channel_reply::ProgressEvent) -> bool {
     event.is_channel_text()
+}
+
+#[cfg(test)]
+mod group_context_parent_tests {
+    use super::*;
+
+    #[test]
+    fn group_context_discord_parent_comes_from_verified_channel() {
+        assert_eq!(discord_context_group(&json!({"parent_id":"P1"}), "T1", true).as_deref(), Some("P1"));
+        assert_eq!(discord_context_group(&json!({"parent_id":"category"}), "C1", false).as_deref(), Some("C1"));
+        assert_eq!(discord_context_group(&json!({}), "T1", true), None);
+        assert_eq!(discord_context_group(&json!({"parent_id":""}), "T1", true), None);
+    }
 }

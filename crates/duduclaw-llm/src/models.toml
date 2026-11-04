@@ -108,7 +108,7 @@ input_mc = 200000        # $2 / MTok
 output_mc = 1200000      # $12 / MTok
 cache_read_mc = 20000    # $0.20 / MTok
 price_cliff = { threshold_tokens = 200000, input_mult = 2.0, output_mult = 1.5 }
-caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+caps = { tools = true, vision = true, audio = true, caching = true, reasoning = true, structured = true }
 
 [[models]]
 id = "gemini-3.5-flash"
@@ -118,7 +118,7 @@ max_output_tokens = 65536
 input_mc = 150000        # $1.50 / MTok
 output_mc = 900000       # $9 / MTok
 cache_read_mc = 15000    # $0.15 / MTok
-caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+caps = { tools = true, vision = true, audio = true, caching = true, reasoning = true, structured = true }
 
 [[models]]
 id = "gemini-3-flash-preview"
@@ -127,7 +127,7 @@ context_window = 1000000
 max_output_tokens = 65536
 input_mc = 50000         # $0.50 / MTok
 output_mc = 300000       # $3 / MTok
-caps = { tools = true, vision = true, caching = false, reasoning = true, structured = true }
+caps = { tools = true, vision = true, audio = true, caching = false, reasoning = true, structured = true }
 
 # ── OpenAI-compatible providers ──────────────────────────────────
 
