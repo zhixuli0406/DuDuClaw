@@ -19142,7 +19142,10 @@ mod live_events_socket_tests {
     #[tokio::test]
     async fn broker_database_bridge_reaches_ws_with_filtered_sequence_and_loss() {
         let home = tempfile::tempdir().unwrap();
+        // Model a booted home with MFA disabled before accepting a system peer.
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        assert_eq!(crate::mfa::enforced(home.path(), true), Ok(false));
         let (tx, _) = broadcast::channel(4);
         let (event_tx, _) = broadcast::channel(1024);
         handler.set_event_tx(event_tx.clone()).await;
