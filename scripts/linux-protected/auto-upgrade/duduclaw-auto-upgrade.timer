@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly protected DuDuClaw Linux gateway upgrade
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=20min
+# Do not catch up after a morning boot and restart the gateway during office hours.
+Persistent=false
+Unit=duduclaw-auto-upgrade.service
+
+[Install]
+WantedBy=timers.target
