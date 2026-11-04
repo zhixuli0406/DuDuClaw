@@ -5949,6 +5949,7 @@
   "welcome.runtime.unknown": "安裝狀態未知（沒有收到完成通知）。請按「重新偵測」確認結果，或照下面的指令自己裝一次。",
   "skills.my.col.owner": "歸屬",
   "skills.my.allAgents": "全部 AI 員工",
+  "skills.my.scopeHint": "包含全公司、部門與個人技能。全部 AI 員工檢視只列一次全公司技能；選取一位員工可查看他的完整技能清單。",
   "skills.my.scope.global": "全公司",
   "skills.my.scope.department": "部門",
   "skills.my.scope.agent": "個人",

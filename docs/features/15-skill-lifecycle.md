@@ -269,6 +269,8 @@ The marketplace is accessible through MCP:
 
 The dashboard's **Skills** page has four tabs: Market, Team Skills, My Skills and Leaderboard. The open tab is part of the address (`/skills?tab=shared`, `?tab=mySkills`, `?tab=leaderboard`), so a link or a reload lands on the same tab.
 
+**Scope.** My Skills labels each row as Company-wide, Department or Personal. The all-staff view lists each company-wide skill once, alongside the department and personal skills of employees you may view. Select an employee, or open Skills on their settings page, to see their complete composed list: personal skills override same-named department skills, which override company-wide skills. Disabled skills remain listed with their switch off. Employee rows, company-wide holder details and scanned employee paths are filtered by your current access; unreadable permissions refuse the request. The aggregate `skills.list {}` response puts company-wide rows in `global_skills`, not in each employee’s `agents[].skills`; clients must combine both fields.
+
 **Order.** Lists are sorted in the browser with the page language's collation rules: case does not matter, `step-2` comes before `step-10`, and Chinese names follow the language's usual order instead of byte order. Pick an order with the sort menu: by name, recently used, most used or recently added. The choice is remembered per browser. Rows that tie keep a fixed order. The gateway also returns employees in name order, so nothing reshuffles after a restart.
 
 **Search.** The search box on Team Skills and My Skills matches the name, the description, the tags and (on My Skills) the employee's name. Every word you type has to match somewhere.

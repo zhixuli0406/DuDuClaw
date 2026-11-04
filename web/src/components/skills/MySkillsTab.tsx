@@ -301,6 +301,9 @@ export function MySkillsTab({ filter }: { filter: string }) {
           </div>
         </div>
 
+        <p className="text-xs text-muted-foreground">
+          {intl.formatMessage({ id: 'skills.my.scopeHint' })}
+        </p>
         <SkillStateErrors states={data.states} nameOf={displayNameOf} />
         {data.usageError && (
           <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'skills.usage.unavailable' })}</p>

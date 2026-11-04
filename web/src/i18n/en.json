@@ -5949,6 +5949,7 @@
   "welcome.runtime.unknown": "Install status unknown — no completion signal came back. Press “Check again” to confirm, or run the command below yourself.",
   "skills.my.col.owner": "Belongs to",
   "skills.my.allAgents": "All AI staff",
+  "skills.my.scopeHint": "Includes company-wide, department and personal skills. Company-wide skills appear once in the all-staff view; select a staffer to see their complete list.",
   "skills.my.scope.global": "Company-wide",
   "skills.my.scope.department": "Department",
   "skills.my.scope.agent": "Personal",

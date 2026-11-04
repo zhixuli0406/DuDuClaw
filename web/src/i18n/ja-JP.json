@@ -5910,6 +5910,7 @@
   "google.cred.badge.configured": "認証情報を設定済み",
   "skills.my.col.owner": "所属",
   "skills.my.allAgents": "すべての AI スタッフ",
+  "skills.my.scopeHint": "全社・部門・個人のスキルを表示します。全 AI 社員の表示では全社スキルを1回だけ表示し、社員を選ぶとその社員の全スキルを確認できます。",
   "skills.my.scope.global": "全社",
   "skills.my.scope.department": "部門",
   "skills.my.scope.agent": "個人",

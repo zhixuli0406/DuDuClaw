@@ -280,3 +280,74 @@ async fn failed_reload_is_an_error_not_a_success() {
     ok(&f.call("skills.set_enabled", json!({ "items": [item("a1", "pdf")], "enabled": false }), &f.admin).await);
     assert!(!f.loaded("a1").await.contains(&"pdf".to_string()));
 }
+
+// B3: the aggregate contract separates global rows from per-employee rows.
+#[tokio::test]
+async fn skills_list_b3_composes_three_scopes_without_global_duplicates() {
+    let f = fixture().await;
+    let config = f.home.join("agents/a1/agent.toml");
+    let mut agent: toml::Value = toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    agent["agent"]["department"] = toml::Value::String("sales".into());
+    std::fs::write(config, toml::to_string(&agent).unwrap()).unwrap();
+    let dept = duduclaw_agent::skill_loader::department_skills_dir(&f.home, "sales");
+    std::fs::create_dir_all(&dept).unwrap();
+    std::fs::write(dept.join("sales-guide.md"), "# Sales guide\n").unwrap();
+    // A personal copy overrides the department copy, which overrides global.
+    std::fs::write(f.home.join("skills/override.md"), "# Global copy\n").unwrap();
+    std::fs::write(dept.join("override.md"), "# Department copy\n").unwrap();
+    std::fs::write(f.home.join("agents/a1/SKILLS/override.md"), "# Personal copy\n").unwrap();
+    f.h.registry.write().await.scan().await.unwrap();
+
+    let all = ok(&f.call("skills.list", json!({}), &f.admin).await);
+    let globals = all["global_skills"].as_array().unwrap();
+    assert_eq!(globals.len(), 2);
+    assert!(globals.iter().all(|s| s["scope"] == "global"));
+    assert_eq!(globals.iter().filter(|s| s["name"] == "tone").count(), 1);
+    for a in all["agents"].as_array().unwrap() {
+        assert!(a["skills"].as_array().unwrap().iter().all(|s| s["scope"] != "global"));
+    }
+    let one = ok(&f.call("skills.list", json!({"agent_id": "a1"}), &f.viewer_a).await);
+    let skills = one["skills"].as_array().unwrap();
+    assert_eq!(entry(skills, "tone")["scope"], "global");
+    assert_eq!(entry(skills, "sales-guide")["scope"], "department");
+    assert_eq!(entry(skills, "pdf")["scope"], "agent");
+    assert_eq!(skills.iter().filter(|s| s["name"] == "override").count(), 1);
+    assert_eq!(entry(skills, "override")["scope"], "agent");
+    assert_eq!(entry(skills, "override")["content"], "# Personal copy\n");
+
+    std::fs::remove_file(f.home.join("agents/a1/SKILLS/override.md")).unwrap();
+    let one = ok(&f.call("skills.list", json!({"agent_id": "a1"}), &f.viewer_a).await);
+    let skills = one["skills"].as_array().unwrap();
+    assert_eq!(entry(skills, "override")["scope"], "department");
+    assert_eq!(entry(skills, "override")["content"], "# Department copy\n");
+
+    // Hidden employees must not leak via holders, paths, or personal rows.
+    let visible = ok(&f.call("skills.list", json!({}), &f.viewer_a).await);
+    assert_eq!(visible["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(visible["agents"][0]["agent_id"], "a1");
+    for skill in visible["global_skills"].as_array().unwrap() {
+        assert!(skill["holders"].as_array().unwrap().iter().all(|h| h["agent_id"] == "a1"));
+    }
+    for diag in visible["scanned"].as_array().unwrap() {
+        assert!(!Path::new(diag["path"].as_str().unwrap()).starts_with(f.home.join("agents/b1")));
+    }
+}
+
+#[tokio::test]
+async fn skills_list_b3_rechecks_revoked_access_and_fails_closed() {
+    let f = fixture().await;
+    // Keep the stale socket context but revoke its live employee binding.
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute("DELETE FROM user_agent_bindings WHERE user_id = ?1", ["viewer-a"])
+        .unwrap();
+    let e = err(&f.call("skills.list", json!({"agent_id": "a1"}), &f.viewer_a).await);
+    assert!(e.contains("permission"), "{e}");
+    let all = ok(&f.call("skills.list", json!({}), &f.viewer_a).await);
+    assert!(all["agents"].as_array().unwrap().is_empty());
+    assert!(all["global_skills"].as_array().unwrap().iter()
+        .all(|s| s["holders"].as_array().unwrap().is_empty()));
+    std::fs::rename(f.home.join("users.db"), f.home.join("users.saved.db")).unwrap();
+    std::fs::create_dir(f.home.join("users.db")).unwrap();
+    let e = err(&f.call("skills.list", json!({}), &f.viewer_a).await);
+    assert!(e.contains("permission"), "{e}");
+}
