@@ -114,6 +114,7 @@ mod experts_generate_rpc;
 mod experts_rpc;
 mod experts_import_rpc;
 mod system_config_rpc;
+mod protected_update_rpc;
 mod audit_rpc;
 mod security_rpc;
 mod credential_audit_rpc;

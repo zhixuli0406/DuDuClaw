@@ -225,6 +225,10 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_system_apply_update(params)).await
             }
+            "system.protected_update_status" => {
+                require_admin!();
+                boxed_frame(|| self.handle_protected_update_status(params)).await
+            }
             "system.restart_pending_update" => {
                 require_admin!();
                 boxed_frame(|| self.handle_system_restart_pending_update()).await

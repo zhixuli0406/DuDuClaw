@@ -6,6 +6,8 @@
 
 Native Linux personal accounts: [Protected system service](guides/linux-protected-service.md) · [繁體中文](guides/zh-TW/linux-protected-service.md) · [日本語](guides/ja-JP/linux-protected-service.md)
 
+Developer handoff: [Native Linux isolation packages](architecture/native-linux-isolation.md) (development status and remaining acceptance gates).
+
 ## Feature Highlights
 
 Release maintainers: [Release documentation and website synchronization](guides/release-delivery-sync.md)

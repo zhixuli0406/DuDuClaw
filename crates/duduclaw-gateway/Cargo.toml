@@ -10,6 +10,8 @@ edition.workspace = true
 # transitive units.
 regex = "1"
 duduclaw-core = { workspace = true }
+duduclaw-isolation = { workspace = true }
+duduclaw-updated = { workspace = true }
 duduclaw-auth = { workspace = true }
 duduclaw-agent = { workspace = true }
 duduclaw-fork = { workspace = true }

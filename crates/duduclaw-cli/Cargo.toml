@@ -13,6 +13,8 @@ path = "src/bin/duduclaw.rs"
 
 [dependencies]
 duduclaw-core = { workspace = true }
+duduclaw-isolation = { workspace = true }
+duduclaw-updated = { workspace = true }
 duduclaw-auth = { workspace = true }
 duduclaw-tui = { path = "../duduclaw-tui" }
 zeroize.workspace = true
