@@ -59,8 +59,20 @@ fn transcription_attachment_path_rejects_traversal_and_other_employee() {
     let accepted = validate_attachment(&agent, Path::new("meeting.m4a"), 100).unwrap();
     assert_eq!(accepted, agent.join("attachments/meeting.m4a"));
     assert_eq!(validate_attachment(&agent, &accepted, 100).unwrap(), accepted);
+    // Joining onto a Windows verbatim path normalizes `..`, so preserve the raw traversal lexically.
+    let mut traversal = agent.as_os_str().to_os_string();
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("attachments");
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("..");
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("attachments");
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("meeting.m4a");
+    let traversal = PathBuf::from(traversal);
+    assert!(traversal.components().any(|component| component == Component::ParentDir));
     for path in [PathBuf::from("../attachments/meeting.m4a"),
-        agent.join("attachments/../attachments/meeting.m4a"), other.join("attachments/meeting.m4a"),
+        traversal, other.join("attachments/meeting.m4a"),
         PathBuf::from("missing.m4a"), agent.clone(), PathBuf::from(".")] {
         assert!(validate_attachment(&agent, &path, 100).is_err(), "{}", path.display());
     }
