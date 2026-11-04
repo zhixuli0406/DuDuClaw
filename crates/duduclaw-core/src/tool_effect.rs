@@ -152,7 +152,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
     let effect = match tool_name {
         // ── read ────────────────────────────────────────────────────────
         "activity_list" | "agent_status" | "audit_trail_query" | "autopilot_list"
-        | "belief_stats" | "channel_config_list" | "channel_status" | "check_responses"
+        | "belief_stats" | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses"
         | "code_map" | "codrive_status" | "computer_screenshot" | "computer_workspace_list"
         | "computer_workspace_read" | "cost_agents" | "cost_multi_vs_single" | "cost_recent"
         | "cost_summary" | "cost_users" | "csv_read" | "db_query" | "db_select" | "db_sources"
@@ -253,7 +253,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
     match tool_name {
         "activity_list" | "agent_status" | "audit_trail_query" | "autopilot_list"
         | "belief_settle" | "belief_stats" | "calendar_list_events" | "channel_config"
-        | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
+        | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
         | "codrive_run" | "codrive_status" | "computer_screenshot" | "computer_session_start"
         | "computer_workspace_list" | "computer_workspace_read" | "cost_agents"
         | "cost_multi_vs_single" | "cost_recent" | "cost_summary" | "cost_users" | "csv_read"
@@ -401,7 +401,7 @@ pub fn egress_capable(tool_name: &str) -> Option<bool> {
         | "agent_update_soul" | "audit_trail_query" | "autopilot_list" | "belief_settle"
         | "belief_stats" | "belief_submit" | "browser_record_stop" | "cancel_reminder"
         | "canvas_clear" | "canvas_push" | "capability_request" | "channel_config"
-        | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
+        | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses" | "code_map"
         | "codrive_status" | "computer_click" | "computer_key" | "computer_screenshot"
         | "computer_scroll" | "computer_session_start" | "computer_session_stop"
         | "computer_workspace_list" | "computer_workspace_read" | "credential_declare" | "computer_workspace_write"

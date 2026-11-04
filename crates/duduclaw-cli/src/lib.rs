@@ -8186,11 +8186,14 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                         style("App-Level Token").yellow()
                     );
                     println!(
-                        "    6. 在 OAuth Scopes 加入：{}, {}, {}",
+                        "    6. 在 OAuth Scopes 加入：{}, {}, {}, {}, {}",
                         style("chat:write").yellow(),
                         style("channels:read").yellow(),
-                        style("app_mentions:read").yellow()
+                        style("app_mentions:read").yellow(),
+                        style("channels:history").yellow(),
+                        style("groups:history").yellow()
                     );
+                    println!("       訂閱 Bot Events：app_mention、message.channels、message.groups");
                     println!("    ℹ Slack 使用 Socket Mode，無需公開 URL");
                     println!();
                     println!(

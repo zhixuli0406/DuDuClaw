@@ -124,6 +124,8 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("group_history_read", "limit", "integer"),
+    ("group_history_read", "before", "integer"),
     ("tasks_create", "cost_cap_cents", "integer"),
     ("tasks_update", "cost_cap_cents", "integer"),
     ("tasks_create", "timeout_secs", "integer"),
@@ -213,6 +215,11 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
                     "max_rounds":{"type":"integer","minimum":1}},
                     "required":["max_agent_calls","max_usd","max_wall_secs","max_rounds"]}
             },"required":["approved_root_id","evaluator","runtime","model","branch_count","refine_count","max_parallelism","budget"]
+        }));
+    }
+    if tool.name == "group_history_read" {
+        properties.insert("limit".into(), serde_json::json!({
+            "type":"integer", "minimum":1, "maximum":100, "default":50,
         }));
     }
     if tool.name == "discovery_list" {

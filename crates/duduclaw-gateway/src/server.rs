@@ -445,6 +445,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // Opt-in group context retention. The helper re-checks lock ownership
+    // every pass, including after this process loses the gateway lock.
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                interval.tick().await;
+                let pass_home = home.clone();
+                if let Err(error) = crate::group_context::blocking(move || crate::group_context::maintenance(&pass_home)).await {
+                    tracing::warn!(%error, "group context retention pass failed");
+                }
+            }
+        });
+    }
+
     // ── Forget by source: resume unfinished external steps (P2-B, D10) ───
     // An apply already deleted the rows and wrote the tombstones; what may
     // remain are its follow-up steps (auto wiki pages, review cards, hiding

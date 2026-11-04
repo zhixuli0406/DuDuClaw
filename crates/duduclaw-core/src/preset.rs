@@ -489,6 +489,40 @@ pub fn load_bindings(home: &Path) -> PresetBindingStore {
     parse_bindings(&content).unwrap_or_default()
 }
 
+/// Read a binding snapshot for authorization. Absence means no bindings;
+/// unreadable, malformed, or unsupported data must not change the winning route.
+pub fn load_bindings_checked(home: &Path) -> Result<PresetBindingStore, String> {
+    let content = match std::fs::read_to_string(bindings_path(home)) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(PresetBindingStore::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let table = content.parse::<toml::Table>().map_err(|error| error.to_string())?;
+    if let Some(schema) = table.get("schema") {
+        if schema.as_integer() != Some(PRESET_BINDINGS_SCHEMA) {
+            return Err("Invalid preset bindings schema".into());
+        }
+    }
+    if let Some(agents) = table.get("agents") {
+        let agents = agents.as_table().ok_or("Invalid preset bindings agents")?;
+        for (id, value) in agents {
+            if !crate::is_valid_agent_id(id) { return Err("Invalid preset binding agent".into()); }
+            let entry = value.as_table().ok_or("Invalid preset binding")?;
+            for key in ["preset_id", "version", "content_sha256"] {
+                if !entry.get(key).and_then(toml::Value::as_str).is_some_and(|value| !value.is_empty()) {
+                    return Err(format!("Invalid preset binding {key}"));
+                }
+            }
+            for key in ["bound_at", "bound_by", "reason"] {
+                if entry.get(key).is_some_and(|value| !value.is_str()) {
+                    return Err(format!("Invalid preset binding {key}"));
+                }
+            }
+        }
+    }
+    parse_bindings(&content)
+}
+
 fn parse_bindings(content: &str) -> Result<PresetBindingStore, String> {
     let table = content.parse::<toml::Table>().map_err(|e| e.to_string())?;
     let schema = table.get("schema").and_then(|v| v.as_integer()).unwrap_or(PRESET_BINDINGS_SCHEMA);
@@ -803,7 +837,17 @@ pub fn resolve_for_agent(
     agent_id: &str,
     agent_table: &toml::value::Table,
 ) -> (toml::value::Table, PresetResolution) {
-    let Some(binding) = load_bindings(home).get(agent_id).cloned() else {
+    resolve_for_agent_with_bindings(home, agent_id, agent_table, &load_bindings(home))
+}
+
+/// Resolve using one caller-owned snapshot without rereading the binding store.
+pub fn resolve_for_agent_with_bindings(
+    home: &Path,
+    agent_id: &str,
+    agent_table: &toml::value::Table,
+    bindings: &PresetBindingStore,
+) -> (toml::value::Table, PresetResolution) {
+    let Some(binding) = bindings.get(agent_id).cloned() else {
         return (agent_table.clone(), PresetResolution::Unbound);
     };
 
@@ -1496,5 +1540,39 @@ max_active_skills = 2
         }
 
         assert_eq!(converted.len(), 9, "expected exactly 9 department kits, converted: {converted:?}");
+    }
+}
+
+#[cfg(test)]
+mod checked_binding_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn group_history_checked_bindings_absence_and_snapshot_resolution() {
+        let home = tempfile::tempdir().unwrap();
+        let bindings = load_bindings_checked(home.path()).unwrap();
+        assert!(bindings.is_empty());
+        std::fs::write(bindings_path(home.path()), "[broken").unwrap();
+        assert!(load_bindings_checked(home.path()).is_err());
+        let table = "[agent]\nname='alice'".parse::<toml::Table>().unwrap();
+        let (actual, outcome) = resolve_for_agent_with_bindings(home.path(), "alice", &table, &bindings);
+        assert_eq!(actual, table);
+        assert!(matches!(outcome, PresetResolution::Unbound));
+    }
+
+    #[test]
+    fn group_history_checked_bindings_accepts_round_trip_and_rejects_invalid_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let mut bindings = PresetBindingStore::new();
+        bindings.set("alice", PresetBinding {
+            preset_id: "helper".into(), version: "1".into(), content_sha256: "hash".into(),
+            bound_at: "now".into(), bound_by: "admin".into(), reason: "test".into(),
+        });
+        std::fs::write(bindings_path(home.path()), serialize_bindings(&bindings)).unwrap();
+        assert_eq!(load_bindings_checked(home.path()).unwrap(), bindings);
+        for raw in ["schema=2", "agents=[]", "[agents]\nalice=12", "[agents.alice]\npreset_id='x'\nversion='1'\ncontent_sha256='h'\nreason=4"] {
+            std::fs::write(bindings_path(home.path()), raw).unwrap();
+            assert!(load_bindings_checked(home.path()).is_err(), "{raw}");
+        }
     }
 }

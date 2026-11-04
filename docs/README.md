@@ -82,6 +82,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/69-egress-guard.md](features/69-egress-guard.md) | per-turn outgoing data guard for platform and third-party MCP tools; [繁體中文](features/zh-TW/69-egress-guard.md) / [日本語](features/ja-JP/69-egress-guard.md) |
 | [features/70-credential-audit.md](features/70-credential-audit.md) | conversation credential metadata and masking; [繁體中文](features/zh-TW/70-credential-audit.md) / [日本語](features/ja-JP/70-credential-audit.md) |
 | [features/71-control-room.md](features/71-control-room.md) | Terminal control room — what `duduclaw tui` is for, the three ways to stop work, trust boundaries, verified terminals |
+| [features/72-group-context.md](features/72-group-context.md) | Opt-in group context and Discord employee choices ([繁體中文](features/zh-TW/72-group-context.md), [日本語](features/ja-JP/72-group-context.md)) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---

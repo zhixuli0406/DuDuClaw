@@ -719,6 +719,8 @@ async fn process_line_events(
                     continue;
                 }
 
+                let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, is_group, "line", "global", scope_id, None, msg.id.as_deref().unwrap_or(""), source.as_ref().and_then(|s| s.user_id.as_deref()).unwrap_or("unknown"), source.as_ref().and_then(|s| s.user_id.as_deref()).unwrap_or("unknown"), msg.text.as_deref().unwrap_or("[附件]")).await;
+
                 // WP1.6 (ecosystem): quoting a decision card with a bare verb
                 // (「同意」/「拒絕」…) counts as pressing its button — LINE watch
                 // and quick-reply surfaces carry `quotedMessageId` but no
@@ -1132,7 +1134,7 @@ async fn process_line_events(
                 } else {
                     session_id.clone()
                 };
-                let guarded = crate::computer_use_sessions::attended::verified_channel_message(&session_id, crate::ccr_runtime::reply_principal_for_sender(sender), false, thinking
+                let guarded = group_turn.scope(crate::computer_use_sessions::attended::verified_channel_message(&session_id, crate::ccr_runtime::reply_principal_for_sender(sender), false, thinking
                     .scope(crate::trigger_route::as_called_turn(
                         called,
                         build_guarded_reply_for_agent(
@@ -1143,7 +1145,7 @@ async fn process_line_events(
                             crate::ccr_runtime::reply_principal_for_sender(sender),
                             on_progress,
                         ),
-                    )))
+                    ))))
                     .await;
                 drop(loading_guard);
                 let thinking_footer = thinking.finish().await;
@@ -1230,7 +1232,7 @@ async fn process_line_events(
                 }
                 // The thinking footer rides only in the Reply call; delivery
                 // drops it when the answer ends up pushed.
-                let _ = ingress::deliver_with_reply_extra(
+                group_turn.delivery(&state.ctx, guarded.answered_by.as_ref(), None).scope(ingress::deliver_with_reply_extra(
                     &state.http,
                     &token,
                     reply_token,
@@ -1238,8 +1240,7 @@ async fn process_line_events(
                     thinking_footer
                         .as_ref()
                         .map(crate::thinking::channel_presenter::line_footer_message),
-                )
-                .await;
+                )).await;
             }
         }
     }

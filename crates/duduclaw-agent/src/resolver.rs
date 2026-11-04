@@ -36,60 +36,38 @@ impl<'a> AgentResolver<'a> {
     /// Before 1.76 a step 0 matched `[agent] trigger` with an unanchored,
     /// sender-blind `contains`; that let anyone reach any employee.
     pub fn resolve(&self, message: &Message) -> Option<&'a LoadedAgent> {
-        // `registry.list()` is backed by a HashMap, so its iteration order is
-        // non-deterministic. Sort by agent name so that when multiple agents
-        // match the same message, resolution is stable across runs.
-        let mut agents = self.registry.list();
-        agents.sort_by(|a, b| a.config.agent.name.cmp(&b.config.agent.name));
-
-        // 1. Channel/Thread binding (RFC-22 Decision 3-D)
-        if let Some(agent) = self.match_channel_binding(message, &agents) {
-            return Some(agent);
-        }
-
-        // 2. Coarse permission grant
-        for agent in &agents {
-            let allowed = &agent.config.permissions.allowed_channels;
-            if allowed.iter().any(|ch| ch == &message.channel) {
-                return Some(agent);
-            }
-        }
-
-        // 3. Fall back to main agent
-        self.registry.main_agent()
+        self.resolve_explicit(message).or_else(|| self.registry.main_agent())
     }
 
-    /// RFC-22 Decision 3-D: walk every agent's `[[channels.discord.bindings]]`
-    /// looking for a kind/id pair that matches the message's session shape.
-    ///
-    /// `message.chat_id` carries the full session id from `channel_reply`
-    /// (e.g. `"discord:thread:1501..."` or `"discord:1495..."`).  We extract
-    /// `(kind, id)` from it and compare to each binding.
-    ///
-    /// Returns `None` when no agent has a matching binding (caller falls
-    /// through to coarse permission / main-agent rules — backwards-compat).
-    fn match_channel_binding(
-        &self,
-        message: &Message,
-        agents: &[&'a LoadedAgent],
-    ) -> Option<&'a LoadedAgent> {
-        let (binding_kind, binding_id) = parse_session_binding(&message.chat_id)?;
+    /// Resolve only administrator-configured bindings or channel permissions.
+    /// History reads must never acquire access through the main-agent fallback.
+    pub fn resolve_explicit(&self, message: &Message) -> Option<&'a LoadedAgent> {
+        let agents = self.registry.list();
+        let configs: Vec<_> = agents.iter().map(|agent| &agent.config).collect();
+        let selected = resolve_explicit_config(&configs, message)?;
+        agents.into_iter().find(|agent| agent.config.agent.name == selected.agent.name)
+    }
+}
 
-        for agent in agents {
-            // Only Discord wiring exposed in v1.11.0; telegram/line bindings
-            // can be added when their config types gain a `bindings` field.
-            if let Some(channels) = agent.config.channels.as_ref() {
-                if let Some(discord) = channels.discord.as_ref() {
-                    for b in &discord.bindings {
-                        if binding_matches(&b.kind, &b.id, binding_kind, binding_id) {
-                            return Some(*agent);
-                        }
+/// The same explicit route over a read-only configuration snapshot. MCP reads
+/// do not load skills or materialize preset artifacts merely to authorize data.
+pub fn resolve_explicit_config<'a>(
+    configs: &[&'a duduclaw_core::types::AgentConfig], message: &Message,
+) -> Option<&'a duduclaw_core::types::AgentConfig> {
+    let mut configs = configs.to_vec();
+    configs.sort_by(|a, b| a.agent.name.cmp(&b.agent.name));
+    if message.channel == "discord" {
+        if let Some((kind, id)) = parse_session_binding(&message.chat_id) {
+            for config in &configs {
+                if let Some(discord) = config.channels.as_ref().and_then(|channels| channels.discord.as_ref()) {
+                    if discord.bindings.iter().any(|binding| binding_matches(&binding.kind, &binding.id, kind, id)) {
+                        return Some(*config);
                     }
                 }
             }
         }
-        None
     }
+    configs.into_iter().find(|config| config.permissions.allowed_channels.iter().any(|channel| channel == &message.channel))
 }
 
 /// Parse a session id string into a `(kind, id)` pair for binding lookup.

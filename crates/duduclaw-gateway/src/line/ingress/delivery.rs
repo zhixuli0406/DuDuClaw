@@ -328,6 +328,7 @@ async fn send_reply(
     {
         Ok(resp) if resp.status().is_success() => {
             note_delivered("reply", request_id(&resp));
+            record_group_messages(&messages, resp.json::<serde_json::Value>().await.ok()).await;
             ReplyResult::Delivered
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
@@ -396,12 +397,14 @@ async fn push_to_conversation(
     {
         Ok(resp) if resp.status().is_success() => {
             note_delivered("push", request_id(&resp));
+            record_group_messages(&messages, resp.json::<serde_json::Value>().await.ok()).await;
             true
         }
         // 409: this retry key was already accepted (an earlier send of the
         // same request reached LINE).
         Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
             note_delivered("push", request_id(&resp));
+            record_group_messages(&messages, resp.json::<serde_json::Value>().await.ok()).await;
             true
         }
         Ok(resp) => {
@@ -594,5 +597,16 @@ impl crate::channel_sender::ChannelSender for LineNoticeCollector {
 
     fn channel_type(&self) -> &'static str {
         "line"
+    }
+}
+
+
+/// LINE accepts the whole batch and returns one sentMessages receipt per item.
+async fn record_group_messages(messages: &[serde_json::Value], receipt: Option<serde_json::Value>) {
+    for (index, message) in messages.iter().enumerate() {
+        let id = receipt.as_ref().and_then(|v| v.get("sentMessages"))
+            .and_then(|v| v.get(index)).and_then(|v| v.get("id")).and_then(|v| v.as_str());
+        crate::channel_reply::group_buffer::delivered(
+            &crate::channel_reply::group_buffer::payload_text(message), id).await;
     }
 }

@@ -244,6 +244,7 @@ pub fn removed_name_for_call(tool_name: &str, args: &serde_json::Value) -> Optio
 /// form of the enforced `Scope`; admin-tier tools carry `admin` even when their
 /// `category` groups them elsewhere.
 const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
+    ("group_history_read", "Read retained context for an explicitly bound group", "messaging:read", "channel"),
     // ── Channel / messaging egress (messaging:send) ──────────────────────
     (
         "send_message",

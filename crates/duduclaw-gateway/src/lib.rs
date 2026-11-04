@@ -55,6 +55,7 @@ pub fn validate_mfa_config_unchanged(before: &str, after: &str) -> Result<(), St
 
 pub mod a2a_signing;
 pub mod access_control;
+pub mod group_context;
 pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;

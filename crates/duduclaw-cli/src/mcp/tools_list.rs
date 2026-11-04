@@ -417,6 +417,9 @@ pub(crate) async fn visible_tools_in_lane(
     // the call path and the gateway route check
     // (`knowledge_client::available_for`). A grant change moves the set, so
     // the watcher sends `list_changed`.
+    let allow_group_history = gated_caller
+        && !member_invalid
+        && super::group_history::available_for(home_dir, &principal.client_id, default_agent).await;
     let allow_knowledge = gated_caller
         && !member_invalid
         && super::knowledge_client::available_for(home_dir, effective_agent);
@@ -540,6 +543,7 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_computer_use || !COMPUTER_USE_TOOLS.contains(&t.name))
         .filter(|t| allow_cu_workspace || !COMPUTER_WORKSPACE_TOOLS.contains(&t.name))
         .filter(|t| allow_fork || !FORK_TOOLS.contains(&t.name))
+        .filter(|t| t.name != "group_history_read" || allow_group_history)
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))

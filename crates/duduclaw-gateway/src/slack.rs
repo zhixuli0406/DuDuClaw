@@ -671,6 +671,8 @@ async fn handle_event(
         return;
     }
 
+    let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(ctx, slack_context_group(event), "slack", "global", channel, thread_ts.as_deref(), ts, user, user, if raw_text.is_empty() { "[附件]" } else { raw_text }).await;
+
     // WP1.6 (ecosystem): a threaded reply under a decision card carrying a
     // bare verb (「同意」/「拒絕」…) is a button press — the thread parent IS
     // the card, so no @mention is required (this must run before the
@@ -966,7 +968,7 @@ async fn handle_event(
         })),
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = scope_attended_slack_message(event, &session_id, thinking.scope(crate::approval::scope_trusted_reply(target, async {
+    let guarded = group_turn.scope(scope_attended_slack_message(event, &session_id, thinking.scope(crate::approval::scope_trusted_reply(target, async {
         if let Some(agent) = agent_name {
             build_guarded_reply_for_agent(
                 &input_text,
@@ -981,7 +983,7 @@ async fn handle_event(
             build_guarded_reply_with_session(&input_text, ctx, &session_id, user, Some(on_progress))
                 .await
         }
-    })))
+    }))))
     .await;
     drop(status_guard);
 
@@ -1032,7 +1034,7 @@ async fn handle_event(
     // Split long messages (Slack limit: 4000 chars per section; the native
     // markdown block takes 12000)
     let reply_thread = thread_ts.as_deref().or(Some(ts));
-    send_markdown_message(
+    group_turn.delivery(ctx, guarded.answered_by.as_ref(), reply_thread).scope(send_markdown_message(
         http,
         bot_token,
         channel,
@@ -1041,8 +1043,7 @@ async fn handle_event(
         mention,
         Some(&session_id),
         Some(&guarded),
-    )
-    .await;
+    )).await;
 
     remove_reaction_add_done(http, bot_token, channel, ts).await;
 }
@@ -1450,7 +1451,7 @@ async fn send_markdown_message(
     mention_user: Option<&str>,
     session_id: Option<&str>,
     guarded: Option<&crate::channel_reply::GuardedReply>,
-) {
+) -> bool {
     // Cumulative cap across markdown blocks is 12000 chars — chunk into
     // separate messages under that.
     const MARKDOWN_BLOCK_CAP: usize = 11500;
@@ -1459,7 +1460,7 @@ async fn send_markdown_message(
 
     for (i, chunk) in chunks.iter().enumerate() {
         if crate::channel_reply::guard_lost(guarded).await {
-            return;
+            return false;
         }
         let mut blocks = vec![];
         if i == 0 {
@@ -1506,7 +1507,7 @@ async fn send_markdown_message(
         }
 
         if crate::channel_reply::guard_lost(guarded).await {
-            return;
+            return false;
         }
         let ok = match http
             .post(format!("{SLACK_API}/chat.postMessage"))
@@ -1515,12 +1516,13 @@ async fn send_markdown_message(
             .send()
             .await
         {
-            Ok(resp) => resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|d| d.get("ok").and_then(|v| v.as_bool()))
-                .unwrap_or(false),
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(data) if data.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
+                    crate::channel_reply::group_buffer::delivered(chunk, data.get("ts").and_then(|v| v.as_str())).await;
+                    true
+                }
+                _ => false,
+            },
             Err(e) => {
                 error!("Slack send error: {e}");
                 false
@@ -1538,12 +1540,13 @@ async fn send_markdown_message(
             };
             for piece in split_message(&plain, 3900) {
                 if crate::channel_reply::guard_lost(guarded).await {
-                    return;
+                    return false;
                 }
-                send_message(http, token, channel, piece, thread_ts).await;
+                if !send_message(http, token, channel, piece, thread_ts).await { return false; }
             }
         }
     }
+    true
 }
 
 async fn send_message(
@@ -1552,7 +1555,7 @@ async fn send_message(
     channel: &str,
     text: &str,
     thread_ts: Option<&str>,
-) {
+) -> bool {
     let body = PostMessage {
         channel: channel.to_string(),
         text: text.to_string(),
@@ -1573,13 +1576,14 @@ async fn send_message(
     };
     match request.send().await {
         Ok(resp) => {
-            if let Ok(data) = resp.json::<SlackApiResponse>().await {
-                if !data.ok {
-                    error!("Slack send failed: {}", data.error.unwrap_or_default());
-                }
-            }
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                let ok = data.get("ok").and_then(|v| v.as_bool()) == Some(true);
+                if ok { crate::channel_reply::group_buffer::delivered(text, data.get("ts").and_then(|v| v.as_str())).await; }
+                else { error!("Slack send failed: {}", data.get("error").and_then(|v| v.as_str()).unwrap_or_default()); }
+                ok
+            } else { false }
         }
-        Err(e) => error!("Slack send error: {e}"),
+        Err(e) => { error!("Slack send error: {e}"); false },
     }
 }
 
@@ -2504,3 +2508,22 @@ mod native_callback_acl_tests {
 #[cfg(test)]
 #[path = "channel_decision_route/adapter_tests/slack.rs"]
 mod f4_decision_route_tests;
+
+fn slack_context_group(event: &serde_json::Value) -> bool {
+    event.get("channel_type").and_then(|v| v.as_str())
+        .is_some_and(|kind| matches!(kind, "channel" | "group" | "mpim"))
+}
+
+#[cfg(test)]
+mod group_context_kind_tests {
+    #[test]
+    fn group_context_slack_requires_explicit_group_metadata() {
+        for kind in ["channel", "group", "mpim"] {
+            assert!(super::slack_context_group(&serde_json::json!({"channel_type":kind})));
+        }
+        for kind in ["im", "", "unknown"] {
+            assert!(!super::slack_context_group(&serde_json::json!({"channel_type":kind})));
+        }
+        assert!(!super::slack_context_group(&serde_json::json!({"channel":"C123"})));
+    }
+}

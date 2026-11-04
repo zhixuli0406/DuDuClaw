@@ -551,6 +551,8 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         .unwrap_or("unknown")
         .to_string();
 
+    let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, message.pointer("/space/type").or_else(|| event.pointer("/space/type")).and_then(|v| v.as_str()).is_some_and(|kind| matches!(kind, "ROOM" | "SPACE" | "GROUP_CHAT")), "googlechat", "global", &space, thread.as_deref(), message.get("name").and_then(|v| v.as_str()).unwrap_or(""), &sender_id, &sender, if text.is_empty() { "[附件]" } else { &text }).await;
+
     info!("📩 Google Chat [{sender}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
     // ── Inbound attachments (WP1.3 parity with the other 8 channels) ──
@@ -726,7 +728,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         None,
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = match &state.agent {
+    let guarded = group_turn.scope(async { match &state.agent {
         // Own app: deterministic routing to its employee, in the employee's
         // bucket; the access gate and takeover still run on the space.
         Some(agent) => {
@@ -754,7 +756,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                 ))
                 .await
         }
-    };
+    } }).await;
     let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
         deliver_reply(
@@ -798,15 +800,14 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     }
     let reply = crate::thinking::channel_presenter::with_footer(reply, thinking_footer.as_ref());
 
-    deliver_reply(
+    group_turn.delivery(&state.ctx, guarded.answered_by.as_ref(), thread.as_deref()).scope(deliver_reply(
         &state.creds,
         &space,
         thread.as_deref(),
         placeholder.as_deref(),
         &reply,
         Some(&guarded),
-    )
-    .await;
+    )).await;
 }
 
 /// Deliver the final reply: first chunk replaces the placeholder (PATCH),
@@ -818,7 +819,7 @@ async fn deliver_reply(
     placeholder: Option<&str>,
     reply_markdown: &str,
     guarded: Option<&crate::channel_reply::GuardedReply>,
-) {
+) -> bool {
     let formatted = crate::markdown_render::to_googlechat_text(reply_markdown);
     let chunks = crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK);
     for (index, chunk) in chunks.iter().enumerate() {
@@ -831,16 +832,19 @@ async fn deliver_reply(
             } else {
                 create_message(creds, space, thread, refusal).await;
             }
-            return;
+            return false;
         }
         if index == 0
             && let Some(name) = placeholder
         {
-            update_message(creds, name, chunk).await;
+            if !update_message(creds, name, chunk).await { return false; }
+            crate::channel_reply::group_buffer::delivered(chunk, Some(name)).await;
         } else {
-            create_message(creds, space, thread, chunk).await;
+            let Ok(id) = post_message(creds, space, thread, chunk).await else { return false; };
+            crate::channel_reply::group_buffer::delivered(chunk, id.as_deref()).await;
         }
     }
+    true
 }
 
 /// Send markdown text to a space (proactive / delegation-forwarding path).
@@ -1093,12 +1097,12 @@ async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<
 }
 
 /// spaces.messages.patch — edit a message's text in place.
-async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) {
+async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str) -> bool {
     let token = match creds.get_token().await {
         Ok(t) => t,
         Err(e) => {
             error!("Google Chat token error: {e}");
-            return;
+            return false;
         }
     };
     let url = format!("{}/{message_name}?updateMask=text", creds.api_base());
@@ -1118,9 +1122,10 @@ async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str)
                 "Google Chat update failed ({status}): {}",
                 truncate_bytes(&duduclaw_security::credential_detect::mask(&body), 200)
             );
+            false
         }
-        Err(e) => warn!("Google Chat update error: {e}"),
-        _ => {}
+        Err(e) => { warn!("Google Chat update error: {e}"); false },
+        _ => true
     }
 }
 
