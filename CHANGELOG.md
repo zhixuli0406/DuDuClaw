@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.79.3] - 2026-11-04 — 原生 Linux 我的連線、群組對話與會議逐字稿
+
 ### Added
 
 - 原生 Linux 可使用「我的連線」（個人 Google 帳號與遠端 MCP OAuth）：以 `sudo duduclaw service install --protected-linux` 安裝成 systemd 系統服務，由專用的無登入帳號執行，主程式與根金鑰歸 root 管理。可加 `--migrate-from` 從原本的使用者安裝搬移資料（搬移後每位同事要重新連結個人帳號）；升級改用 `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`，由已安裝的程式下載並驗證官方簽章後替換，儀表板改為顯示這道指令；解除安裝會保留資料與根金鑰。此模式會擋住容器引擎並隔離裝置，所以用容器的任務沙箱與電腦操作不可用。步驟見 `docs/guides/linux-protected-service.md`。
