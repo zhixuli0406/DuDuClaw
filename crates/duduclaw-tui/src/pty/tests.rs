@@ -94,7 +94,7 @@ fn old_local_command_configuration_is_ignored_with_notice() {
     ] {
         let (settings, notice) = crate::settings::Settings::parse(input);
         assert_eq!(notice, Some(strings::PTY_COMMAND_IGNORED));
-        assert_eq!(settings.glyphs, crate::settings::Glyphs::default());
+        assert_eq!(settings.glyphs, crate::settings::Settings::parse("").0.glyphs);
     }
     let (settings, notice) = crate::settings::Settings::parse("glyphs = 'unicode'\n[pty]\ncommand = ['evil']");
     assert_eq!(notice, Some(strings::PTY_COMMAND_IGNORED));

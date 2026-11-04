@@ -171,7 +171,7 @@ mod tests {
             &crate::pty::Screen::capture(parser.screen()),
             buffer.area,
             &mut buffer,
-            &Settings::default(),
+            &Settings::test_defaults(),
             false,
         );
         let mut backend = super::super::backend::ScreenBackend(Vec::new());

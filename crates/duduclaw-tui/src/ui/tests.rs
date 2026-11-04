@@ -485,7 +485,7 @@ fn wide_glyph_refresh_preserves_visible_columns() {
     let settings = Settings {
         glyphs: Glyphs::Unicode,
         ambiguous_width: AmbiguousWidth::Wide,
-        ..Default::default()
+        ..Settings::test_defaults()
     };
     let mut model = empty();
     model.employees = fresh(vec![employee("adu", "Ωα中", "working")]);
@@ -883,7 +883,7 @@ fn m3_small_height_keeps_inbox_and_employee_rows() {
 #[test]
 fn m3_long_home_keeps_tail_in_both_width_modes() {
     for width in [AmbiguousWidth::Narrow, AmbiguousWidth::Wide] {
-        let settings = Settings { ambiguous_width: width, ..Default::default() };
+        let settings = Settings { glyphs: Glyphs::Unicode, ambiguous_width: width, ..Settings::test_defaults() };
         let model = empty(); let mut app = App::default();
         let home = TerminalText::new(format!("/Users/{}/最後目錄", "very-long-home-".repeat(20)));
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
@@ -980,8 +980,6 @@ fn m4_unsupported_platform_never_enters_child_input() {
 fn m4_real_crossterm_parser_probe() {
     use std::{io::Write, time::Duration};
     if std::env::var_os("TUI_RAW_PARSER_PROBE").is_none() { return; }
-    let mut settings = Settings::parse("theme = 'auto'").0;
-    settings.resolve_theme();
     crossterm::terminal::enable_raw_mode().unwrap();
     println!("PARSER_READY");
     std::io::stdout().flush().unwrap();
@@ -1828,7 +1826,6 @@ fn round2_sidebar_light_no_color_and_wide_ambiguous() {
         settings.ambiguous_width = width;
         settings.theme = theme;
         settings.colors = crate::theme::Theme::new(theme, capability);
-        settings.resolve_theme();
         let output = screen(&model, &app, &settings, 140,40);
         insta::assert_snapshot!(format!("round2_sidebar_{name}"), output);
     }
@@ -2313,7 +2310,7 @@ fn late_split_reply_with_startup_state_updates_keeps_chat_live() {
 
 #[test]
 fn key_immediately_after_startup_is_delivered_unchanged() {
-    let _settings = Settings::parse("theme = 'auto'").0;
+    let _settings = Settings::test_defaults();
     let mut app = App::default();
     for key in [
         KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),

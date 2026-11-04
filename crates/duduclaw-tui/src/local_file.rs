@@ -33,11 +33,11 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{read_state::ReadState, settings::{Glyphs, Settings}};
+    use crate::{read_state::ReadState, settings::Settings};
 
     fn refused(home: &std::path::Path) {
         let (settings, notice) = Settings::load(home);
-        assert_eq!(settings.glyphs, Glyphs::default());
+        assert_eq!(settings.glyphs, Settings::parse("").0.glyphs);
         assert!(notice.is_some());
         let (read, notice) = ReadState::load(home);
         assert!(!read.contains("secret"));
