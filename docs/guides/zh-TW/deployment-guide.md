@@ -1,5 +1,7 @@
 # DuDuClaw 部署指南
 
+官方 Linux CLI 執行檔需要 **glibc ≥ 2.31**：Ubuntu 20.04+、Debian 11+、RHEL／Rocky Linux 9+。較舊系統請使用 Docker。此基準適用於 CLI／gateway（含桌面版的 CLI sidecar）；桌面圖形介面另需符合 WebKitGTK 等系統函式庫需求。
+
 > 更新日期：2026-03-30｜版本：v0.10.0
 
 ---

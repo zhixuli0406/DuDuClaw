@@ -441,7 +441,7 @@ docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml ru
 docker compose -f docker-compose.yml -f docker-compose.person-credentials.yml up -d --force-recreate duduclaw
 ```
 
-之後卡片會顯示「保護金鑰被更換」。按「重新啟用」，已保存的個人連線全部失效，每個人重新連結。原生 Linux 目前沒有對應的模式。
+之後卡片會顯示「保護金鑰被更換」。按「重新啟用」，已保存的個人連線全部失效，每個人重新連結。原生 Linux 主機可使用[受保護系統服務](linux-protected-service.md)。
 
 ## 8. 健康檢查與觀測
 

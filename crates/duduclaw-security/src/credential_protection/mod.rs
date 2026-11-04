@@ -24,8 +24,8 @@
 //!   callers must surface (design §6).
 //! - **Windows** (`UserStore`): Credential Manager is per user; any same-user
 //!   program can read it. Stops file reads and backups only.
-//! - **Opt-in Docker**: an attested root launcher key wraps the protected key
-//!   on disk; only the non-dumpable, unprivileged PID 1 holds the root key.
+//! - **Opt-in Docker or native systemd service**: an attested root launcher key
+//!   wraps the protected key on disk; only the non-dumpable gateway holds it.
 //! - **Other Linux installs**: no supported store; person identities refused.
 //!
 //! Only the process holding `<home>/locks/gateway.lock` may unseal
@@ -80,7 +80,7 @@ pub enum ProtectionLevel {
     File,
     /// OS per-user store without per-program access control (Windows).
     UserStore,
-    /// Root launcher key held only by the non-dumpable container PID 1.
+    /// Root launcher key held only by the attested, non-dumpable gateway.
     ProcessIsolated,
     /// OS store whose item only the `duduclaw` executable may read (macOS).
     AppBound,
@@ -202,6 +202,21 @@ impl fmt::Debug for ProtectedKey {
 }
 
 impl ProtectedKey {
+    fn with_root_guard<T>(&self, operation: impl FnOnce() -> Result<T, ProtectionError>) -> Result<T, ProtectionError> {
+        if self.backend != BackendKind::ContainerRootKey { return operation(); }
+        // Synthetic stores exist only in unit tests, without launcher intake.
+        #[cfg(test)]
+        if duduclaw_core::root_key::state_kind() == duduclaw_core::root_key::StateKind::NotOffered {
+            return operation();
+        }
+        // Hold the same lock as revocation through the complete crypto operation.
+        // Once Refused is visible, no cached ProtectedKey may start new crypto.
+        duduclaw_core::root_key::with_key(|_| operation()).unwrap_or_else(|| {
+            Err(ProtectionError::from_state(ProtectionState::Unavailable, self.backend,
+                duduclaw_core::root_key::refused_reason().unwrap_or("inactive")))
+        })
+    }
+
     /// Domain-separated HMAC for high-entropy chat credentials. The protected
     /// root key and the derived ledger key never leave this type.
     pub fn credential_fingerprint(&self, kind: &str, value: &[u8]) -> Option<String> {
@@ -227,6 +242,10 @@ impl ProtectedKey {
 
     /// Seal `plaintext` as `pk:v1:<key_id>:<base64>`.
     pub fn seal(&self, plaintext: &[u8]) -> Result<String, ProtectionError> {
+        self.with_root_guard(|| self.seal_inner(plaintext))
+    }
+
+    fn seal_inner(&self, plaintext: &[u8]) -> Result<String, ProtectionError> {
         let engine = engine_for(&self.key)?;
         let ct = engine
             .encrypt(plaintext)
@@ -237,6 +256,10 @@ impl ProtectedKey {
     /// Open a value produced by [`ProtectedKey::seal`]. A value sealed under a
     /// different key is reported as `key_changed` (design §6 item 3).
     pub fn unseal(&self, sealed: &str) -> Result<Zeroizing<Vec<u8>>, ProtectionError> {
+        self.with_root_guard(|| self.unseal_inner(sealed))
+    }
+
+    fn unseal_inner(&self, sealed: &str) -> Result<Zeroizing<Vec<u8>>, ProtectionError> {
         let (kid, body) = parse_sealed(sealed)?;
         if kid != self.key_id {
             return Err(ProtectionError::from_state(ProtectionState::KeyChanged, self.backend, ""));
@@ -304,8 +327,8 @@ pub fn platform_store(_home: &Path) -> Box<dyn KeyStore> {
     #[cfg(target_os = "linux")]
     {
         use container_root::{ContainerRootStore, RefusedRootStore};
-        if let Some(store) = duduclaw_core::root_key::with_key(|key| ContainerRootStore::new(_home, key)) {
-            return Box::new(store);
+        if duduclaw_core::root_key::is_held() {
+            return Box::new(ContainerRootStore::attested(_home));
         }
         if let Some(reason) = duduclaw_core::root_key::refused_reason() {
             return Box::new(RefusedRootStore(reason));

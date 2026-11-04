@@ -3623,7 +3623,32 @@ mod compat_feature_gate_tests {
 #[derive(Subcommand)]
 enum ServiceCommands {
     /// Install DuDuClaw as a system service
-    Install,
+    Install {
+        /// Install the root-protected native Linux system service (requires sudo)
+        #[arg(long)]
+        protected_linux: bool,
+        /// Acknowledge that this executable was verified before running sudo
+        #[arg(long, requires = "protected_linux")]
+        i_verified_this_binary: bool,
+        /// Enable and start the protected system service
+        #[arg(long, requires = "protected_linux")]
+        enable_now: bool,
+        /// Copy an existing .duduclaw data directory into the service account
+        #[arg(long, requires = "protected_linux")]
+        migrate_from: Option<std::path::PathBuf>,
+        /// Preserve the existing destination as a backup and replace it
+        #[arg(long, requires = "migrate_from")]
+        force_migrate: bool,
+    },
+
+    /// Upgrade using the already installed, root-owned protected executable
+    Upgrade {
+        #[arg(long, required = true)]
+        protected_linux: bool,
+        /// Official release version (X.Y.Z); defaults to latest
+        #[arg(long)]
+        version: Option<String>,
+    },
 
     /// Start the background service
     Start,
@@ -3645,7 +3670,11 @@ enum ServiceCommands {
     },
 
     /// Uninstall the system service
-    Uninstall,
+    Uninstall {
+        /// Remove the native Linux system service, retaining data and root key
+        #[arg(long)]
+        protected_linux: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5519,8 +5548,17 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
-            ServiceCommands::Install => {
-                service::handle_service(service::ServiceAction::Install).await
+            ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary } => {
+                if protected_linux {
+                    service::protected_linux::install(service::protected_linux::InstallOptions {
+                        enable_now, migrate_from, force_migrate, i_verified_this_binary,
+                    })
+                } else {
+                    service::handle_service(service::ServiceAction::Install).await
+                }
+            }
+            ServiceCommands::Upgrade { protected_linux: _, version } => {
+                service::protected_linux::upgrade(version.as_deref()).await
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
@@ -5531,8 +5569,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             ServiceCommands::Logs { lines } => {
                 service::handle_service(service::ServiceAction::Logs { lines }).await
             }
-            ServiceCommands::Uninstall => {
-                service::handle_service(service::ServiceAction::Uninstall).await
+            ServiceCommands::Uninstall { protected_linux } => {
+                if protected_linux { service::protected_linux::uninstall() }
+                else { service::handle_service(service::ServiceAction::Uninstall).await }
             }
         },
         // T5/O10: `duduclaw migrate [schema|from|data]`. Bare `migrate` keeps

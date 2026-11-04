@@ -19,6 +19,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 fs2 = "0.4"
+semver = "1"
 # relay_protocol.rs (WP-E2): base64-encodes/decodes HookFrame.body_b64 — the
 # wire type shared verbatim with duduclaw-relay, which already depends on
 # this exact version.

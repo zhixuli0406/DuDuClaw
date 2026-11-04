@@ -23,7 +23,7 @@ pub fn is_active() -> bool {
 /// Linux resets dumpability on exec, so ordinary child programs are unaffected.
 pub fn harden_gateway_process() -> io::Result<()> {
     #[cfg(target_os = "linux")]
-    if is_active() {
+    if is_active() || crate::root_key::offered() {
         // SAFETY: PR_SET_DUMPABLE takes an integer and no pointers.
         if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
             let error = io::Error::last_os_error();

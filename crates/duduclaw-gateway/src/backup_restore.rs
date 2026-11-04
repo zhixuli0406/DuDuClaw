@@ -209,9 +209,9 @@ pub struct RestoreExtractReport {
 }
 
 /// Extract `archive_path` (a `.tar.gz`) into `dest_dir`, enforcing
-/// [`RestoreLimits`]. `dest_dir` is created if absent. On ANY violation the
-/// whole extraction is rolled back (`dest_dir`'s contents removed) — never a
-/// partial tree left on disk.
+/// [`RestoreLimits`]. `dest_dir` must not exist; its parent must exist. On
+/// any extraction violation only this newly created directory is removed.
+/// Existing directories are refused and never changed.
 ///
 /// ### Why checking the tar header's declared size is sufficient
 ///
@@ -248,7 +248,9 @@ pub fn extract_tar_gz_safely(
     }
     drop(f);
 
-    std::fs::create_dir_all(dest_dir).map_err(|e| RestoreViolation::Io(e.to_string()))?;
+    // This function owns only a directory it created itself. Never roll
+    // back another request's published staging (even for direct callers).
+    std::fs::create_dir(dest_dir).map_err(|e| RestoreViolation::Io(e.to_string()))?;
 
     let result = extract_inner(archive_path, dest_dir, limits);
     if result.is_err() {
@@ -461,19 +463,140 @@ pub struct RestoreMarker {
     pub source_filename: String,
 }
 
+#[derive(Debug)]
+pub struct RestoreStageReport {
+    pub extraction: RestoreExtractReport,
+    pub mfa_notice: bool,
+}
+
+/// Serialize staging and boot swaps on a stable inode under the live locks/.
+fn with_restore_lock<T>(home: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
+    duduclaw_core::with_file_lock(&home.join("locks/restore"), || Ok(f()))
+}
+
+fn path_occupied(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Stage one restore without ever extracting into, or cleaning, published data.
+/// A marker, including an unreadable or malformed one, blocks all later stages.
+/// The request's private temp directory is removed on every pre-publication
+/// failure; a published directory is retained if marker publication fails.
+pub fn stage_restore(home: &Path, source: &Path) -> Result<RestoreStageReport, String> {
+    with_restore_lock(home, || stage_restore_locked(home, source))
+        .map_err(|e| format!("無法鎖定還原作業：{e}"))?
+}
+
+fn stage_restore_locked(home: &Path, source: &Path) -> Result<RestoreStageReport, String> {
+    if path_occupied(&marker_path(home)).map_err(|e| e.to_string())? {
+        return Err("已有待套用的還原，請先重新啟動閘道套用，再上傳新的還原。".into());
+    }
+    let request = tempfile::Builder::new().prefix(".restore-request-")
+        .tempdir_in(home).map_err(|e| format!("建立還原暫存目錄失敗：{e}"))?;
+    let extracted = request.path().join("data");
+    let extraction = extract_tar_gz_safely(source, &extracted, &RestoreLimits::from_home(home))
+        .map_err(|e| e.to_string())?;
+    let root = resolve_restore_root(&extracted, home);
+    let read_config = |path: &Path| -> Result<String, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("無法讀取還原設定：{e}")),
+        }
+    };
+    let restored_config = read_config(&root.join("config.toml"))?;
+    let current_config = home.join("config.toml");
+    crate::product_policy::validate_write(
+        home, &current_config, &read_config(&current_config)?, &restored_config,
+    )?;
+    let mfa_notice = crate::mfa::restore_policy_differs(home, &restored_config);
+    if mfa_notice {
+        // Validate policy preservation here; boot rechecks against the live policy.
+        crate::mfa::preserve_restore_policy(&restored_config, crate::mfa::restore_policy(home))?;
+    }
+    let staging = staging_dir(home);
+    if path_occupied(&staging).map_err(|e| e.to_string())? {
+        return Err("已有未完成的還原暫存資料，為保留資料已拒絕覆寫；請由管理員檢查。".into());
+    }
+    let marker = RestoreMarker {
+        staged_at: Utc::now(),
+        source_filename: source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+    };
+    publish_restore_with_sync(home, &extracted, &marker, &mut sync_restore_path)
+        .map_err(|e| format!("發布還原資料或標記失敗（已發布的暫存資料會保留）：{e}"))?;
+    Ok(RestoreStageReport { extraction, mfa_notice })
+}
+
+// Sync children before their parent; never follow links or accept special files.
+fn sync_restore_tree(
+    path: &Path,
+    sync: &mut impl FnMut(&Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    if kind.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            sync_restore_tree(&entry?.path(), sync)?;
+        }
+        sync(path, true)
+    } else if kind.is_file() {
+        sync(path, false)
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "restore tree contains a link or special file"))
+    }
+}
+
+fn sync_restore_path(path: &Path, directory: bool) -> std::io::Result<()> {
+    // Windows std does not support directory fsync; rely on file sync_all there.
+    #[cfg(windows)]
+    if directory {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    { std::fs::OpenOptions::new().write(true).open(path)?.sync_all() }
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+        std::fs::File::open(path)?.sync_all()
+    }
+}
+
+fn publish_restore_with_sync(
+    home: &Path,
+    extracted: &Path,
+    marker: &RestoreMarker,
+    sync: &mut impl FnMut(&Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    sync_restore_tree(extracted, sync)?;
+    std::fs::rename(extracted, staging_dir(home))?;
+    sync(home, true)?;
+    write_marker_with_sync(home, marker, sync)
+}
+
 /// Atomic (temp + rename) write. Called only after [`extract_tar_gz_safely`]
 /// has already succeeded — the marker's presence is the sole signal
 /// `perform_pending_restore_swap` acts on, so it must never be written
 /// before the staged content is actually safe to swap in.
 pub fn write_marker(home_dir: &Path, marker: &RestoreMarker) -> std::io::Result<()> {
+    write_marker_with_sync(home_dir, marker, &mut sync_restore_path)
+}
+
+fn write_marker_with_sync(
+    home_dir: &Path,
+    marker: &RestoreMarker,
+    sync: &mut impl FnMut(&Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let path = marker_path(home_dir);
     let body = serde_json::to_string_pretty(marker)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body.as_bytes())?;
-    std::fs::rename(&tmp, &path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    let mut tmp = tempfile::Builder::new().prefix(".restore-marker-").tempfile_in(home_dir)?;
+    std::io::Write::write_all(&mut tmp, body.as_bytes())?;
+    sync(tmp.path(), false)?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    sync(home_dir, true)
 }
 
 pub fn read_marker(home_dir: &Path) -> Option<RestoreMarker> {
@@ -526,7 +649,17 @@ pub enum RestoreSwapError {
     /// gateway does not retry the same broken swap forever) but nothing is
     /// touched — fail-closed, no data movement on an already-suspect state.
     StagingMissingOrEmpty,
+    GatewayRunning(String),
     Io(String),
+}
+
+// The singleton inode must stay at its original path on every platform.
+// Ignore Windows aliases too, even when this restore runs on Unix.
+fn is_gateway_lock_directory(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.split(':').next().unwrap_or(name)
+            .trim_end_matches(['.', ' ']).to_uppercase().to_lowercase() == "locks"
+    })
 }
 
 /// Detect and apply a pending restore. `Ok(None)` — the overwhelming common
@@ -539,10 +672,11 @@ pub enum RestoreSwapError {
 ///
 /// ## Ordering (why this can never destroy data)
 ///
-/// 1. Resolve the restore root; bail (marker cleared, no move) if it is
+/// 1. Acquire the gateway singleton lock before any restore mutation, then
+///    resolve the restore root; bail (marker cleared, no move) if it is
 ///    missing or has nothing in it.
 /// 2. Move every CURRENT top-level entry of `home_dir` (except the staging
-///    dir and the marker itself) into a fresh `restore-backup-<now_tag>/`
+///    dir, markers and live `locks/` directory) into a fresh `restore-backup-<now_tag>/`
 ///    subdirectory. This step ONLY ever moves data into a new, empty
 ///    directory — it cannot lose anything.
 /// 3. Only after step 2 fully succeeds: move every entry from the restore
@@ -563,11 +697,35 @@ pub fn perform_pending_restore_swap(
         return Ok(None);
     }
 
+    // Hold through policy reads, staging rewrites, the entire swap and boot.
+    // A second gateway must not complete an Admin toggle during this window.
+    if !duduclaw_core::gateway_instance::held(home_dir) {
+        duduclaw_core::gateway_instance::acquire_for_restore(home_dir).map_err(|error| {
+            RestoreSwapError::GatewayRunning(format!(
+                "無法還原：其他閘道程序正在使用此資料目錄，請先停止該程序後再重試。{error}"
+            ))
+        })?;
+    }
+
+    with_restore_lock(home_dir, || perform_pending_restore_swap_locked(home_dir, now_tag))
+        .map_err(|e| RestoreSwapError::Io(e.to_string()))?
+}
+
+fn perform_pending_restore_swap_locked(
+    home_dir: &Path,
+    now_tag: &str,
+) -> Result<Option<RestoreSwapReport>, RestoreSwapError> {
+    if read_marker(home_dir).is_none() {
+        return Ok(None);
+    }
     let staging = staging_dir(home_dir);
     let restore_root = resolve_restore_root(&staging, home_dir);
-    let has_content = std::fs::read_dir(&restore_root)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
+    let has_content = match std::fs::read_dir(&restore_root) {
+        Ok(mut entries) => entries.next().transpose()
+            .map_err(|e| RestoreSwapError::Io(e.to_string()))?.is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(RestoreSwapError::Io(e.to_string())),
+    };
     if !has_content {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = clear_marker(home_dir);
@@ -627,6 +785,7 @@ pub fn perform_pending_restore_swap(
         if name == RESTORE_STAGING_DIRNAME
             || name == RESTORE_MARKER_FILE
             || name == crate::channel_ingress::RESTORE_MARKER
+            || is_gateway_lock_directory(&name)
             || Some(&name) == preserved_name.as_ref()
         {
             continue;
@@ -640,6 +799,9 @@ pub fn perform_pending_restore_swap(
         std::fs::read_dir(&restore_root).map_err(|e| RestoreSwapError::Io(e.to_string()))?
     {
         let entry = entry.map_err(|e| RestoreSwapError::Io(e.to_string()))?;
+        if is_gateway_lock_directory(&entry.file_name()) {
+            continue;
+        }
         let dest = home_dir.join(entry.file_name());
         std::fs::rename(entry.path(), &dest).map_err(|e| RestoreSwapError::Io(e.to_string()))?;
         swapped += 1;
@@ -933,6 +1095,126 @@ mod tests {
         );
     }
 
+    fn assert_no_request_residue(home: &Path) {
+        for entry in std::fs::read_dir(home).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(!name.to_string_lossy().starts_with(".restore-request-"), "{name:?}");
+            assert!(!name.to_string_lossy().starts_with(".restore-marker-"), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn staging_second_request_refuses_pending_and_keeps_first_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let a = write_archive(tmp.path(), "a.tar.gz", &build_tar_gz(&[("kept.txt", b"A")]));
+        let b = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("new.txt", b"B")]));
+        stage_restore(&home, &a).unwrap();
+        let marker = std::fs::read(marker_path(&home)).unwrap();
+        let error = stage_restore(&home, &b).unwrap_err();
+        assert!(error.contains("已有待套用的還原"), "{error}");
+        assert_eq!(std::fs::read(staging_dir(&home).join("kept.txt")).unwrap(), b"A");
+        assert!(!staging_dir(&home).join("new.txt").exists());
+        assert_eq!(std::fs::read(marker_path(&home)).unwrap(), marker);
+        assert_no_request_residue(&home);
+    }
+
+    #[test]
+    fn staging_failure_cleans_own_partial_tree_and_preserves_existing_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "[backup]\nmax_restore_entries=1\n").unwrap();
+        let archive = write_archive(tmp.path(), "bad.tar.gz", &build_tar_gz(&[
+            ("first.txt", b"partial"), ("second.txt", b"rejected"),
+        ]));
+        // Check both a fresh stage and a previous publication without a marker.
+        for existing in [false, true] {
+            if existing {
+                std::fs::create_dir(staging_dir(&home)).unwrap();
+                std::fs::write(staging_dir(&home).join("kept.txt"), b"A").unwrap();
+            }
+            let error = stage_restore(&home, &archive).unwrap_err();
+            assert!(error.contains("超過安全上限"), "{error}");
+            assert!(!marker_path(&home).exists());
+            assert!(!staging_dir(&home).join("first.txt").exists());
+            assert_no_request_residue(&home);
+            if existing {
+                assert_eq!(std::fs::read(staging_dir(&home).join("kept.txt")).unwrap(), b"A");
+            } else {
+                assert!(!staging_dir(&home).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn staging_refuses_existing_unmarked_publication_without_overwriting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(staging_dir(&home)).unwrap();
+        std::fs::write(staging_dir(&home).join("kept.txt"), b"A").unwrap();
+        let archive = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("new.txt", b"B")]));
+        let error = stage_restore(&home, &archive).unwrap_err();
+        assert!(error.contains("拒絕覆寫"), "{error}");
+        assert_eq!(std::fs::read(staging_dir(&home).join("kept.txt")).unwrap(), b"A");
+        assert!(!staging_dir(&home).join("new.txt").exists());
+        assert!(!marker_path(&home).exists());
+        assert_no_request_residue(&home);
+    }
+
+    #[test]
+    fn staging_refuses_malformed_pending_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(marker_path(tmp.path()), b"broken marker").unwrap();
+        let error = stage_restore(tmp.path(), &tmp.path().join("unused.tar.gz")).unwrap_err();
+        assert!(error.contains("已有待套用的還原"), "{error}");
+        assert_eq!(std::fs::read(marker_path(tmp.path())).unwrap(), b"broken marker");
+        assert_no_request_residue(tmp.path());
+    }
+
+    #[test]
+    fn extraction_never_cleans_an_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("staging");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("kept.txt"), b"A").unwrap();
+        let archive = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("new.txt", b"B")]));
+        assert!(extract_tar_gz_safely(&archive, &dest, &RestoreLimits::default()).is_err());
+        assert_eq!(std::fs::read(dest.join("kept.txt")).unwrap(), b"A");
+        assert!(!dest.join("new.txt").exists());
+    }
+
+    #[test]
+    fn concurrent_staging_publishes_exactly_one_complete_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let a = write_archive(tmp.path(), "a.tar.gz", &build_tar_gz(&[("a.txt", b"A")]));
+        let b = write_archive(tmp.path(), "b.tar.gz", &build_tar_gz(&[("b.txt", b"B")]));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [a, b].into_iter().map(|source| {
+            let home = home.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                stage_restore(&home, &source)
+            })
+        }).collect();
+        let successes = handles.into_iter()
+            .map(|handle| handle.join().unwrap()).filter(Result::is_ok).count();
+        assert_eq!(successes, 1);
+        let marker = read_marker(&home).unwrap();
+        let (kept, absent, bytes) = if marker.source_filename == "a.tar.gz" {
+            ("a.txt", "b.txt", b"A")
+        } else {
+            ("b.txt", "a.txt", b"B")
+        };
+        assert_eq!(std::fs::read(staging_dir(&home).join(kept)).unwrap(), bytes);
+        assert!(!staging_dir(&home).join(absent).exists());
+        assert_no_request_residue(&home);
+    }
+
     // ── upload staging ────────────────────────────────────────────
 
     #[test]
@@ -970,6 +1252,84 @@ mod tests {
         // A non-existent path (canonicalize fails) is refused, not treated
         // as vacuously "inside".
         assert!(!is_within_upload_dir(home, &dir.join("nope.tar.gz")));
+    }
+
+    #[test]
+    fn publish_syncs_tree_then_rename_then_marker_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let extracted = home.join("request/data");
+        let nested = extracted.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("payload");
+        std::fs::write(&file, b"durable").unwrap();
+        let marker = RestoreMarker { staged_at: Utc::now(), source_filename: "test.tar.gz".into() };
+        let mut steps = Vec::new();
+        publish_restore_with_sync(home, &extracted, &marker, &mut |path, directory| {
+            match steps.len() {
+                0 => assert_eq!((path, directory), (file.as_path(), false)),
+                1 => assert_eq!((path, directory), (nested.as_path(), true)),
+                2 => assert_eq!((path, directory), (extracted.as_path(), true)),
+                3 => {
+                    assert_eq!((path, directory), (home, true));
+                    assert!(!extracted.exists());
+                    assert!(staging_dir(home).join("nested/payload").is_file());
+                    assert!(!marker_path(home).exists());
+                }
+                4 => {
+                    assert!(!directory);
+                    assert!(path.file_name().unwrap().to_string_lossy().starts_with(".restore-marker-"));
+                    assert!(!marker_path(home).exists());
+                    assert!(serde_json::from_slice::<RestoreMarker>(&std::fs::read(path)?).is_ok());
+                }
+                5 => {
+                    assert_eq!((path, directory), (home, true));
+                    assert!(read_marker(home).is_some());
+                }
+                _ => panic!("unexpected sync"),
+            }
+            steps.push(path.to_path_buf());
+            sync_restore_path(path, directory)
+        }).unwrap();
+        assert_eq!(steps.len(), 6);
+    }
+
+    #[test]
+    fn failed_publish_sync_retains_data_and_any_persisted_marker() {
+        for fail_at in 0..5 {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let extracted = home.join("data");
+            std::fs::create_dir(&extracted).unwrap();
+            std::fs::write(extracted.join("payload"), b"keep").unwrap();
+            let marker = RestoreMarker { staged_at: Utc::now(), source_filename: "test.tar.gz".into() };
+            let mut calls = 0;
+            let result = publish_restore_with_sync(home, &extracted, &marker, &mut |_, _| {
+                let current = calls;
+                calls += 1;
+                if current == fail_at { Err(std::io::Error::other("injected sync failure")) }
+                else { Ok(()) }
+            });
+            assert!(result.is_err());
+            assert_eq!(marker_path(home).exists(), fail_at == 4);
+            assert!(extracted.join("payload").exists() || staging_dir(home).join("payload").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_refuses_symlinks_without_syncing_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("data");
+        std::fs::create_dir(&extracted).unwrap();
+        std::fs::write(tmp.path().join("target"), b"keep").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("target"), extracted.join("link")).unwrap();
+        let marker = RestoreMarker { staged_at: Utc::now(), source_filename: "test.tar.gz".into() };
+        assert!(publish_restore_with_sync(tmp.path(), &extracted, &marker, &mut |_, _| {
+            panic!("must refuse the link before syncing")
+        }).is_err());
+        assert!(!staging_dir(tmp.path()).exists());
+        assert!(!marker_path(tmp.path()).exists());
     }
 
     // ── marker round-trip ────────────────────────────────────────
@@ -1021,6 +1381,101 @@ mod tests {
     }
 
     // ── perform_pending_restore_swap ────────────────────────────
+
+    #[test]
+    fn restore_refuses_a_live_gateway_without_changing_any_files() {
+        use fs2::FileExt;
+
+        fn snapshot(root: &Path, dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut files = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    files.insert(relative, None);
+                    files.extend(snapshot(root, &path));
+                } else {
+                    // Windows forbids reading the locked byte range through
+                    // another handle; the empty lock itself is never written.
+                    let content = if relative == Path::new("locks/gateway.lock") {
+                        Vec::new()
+                    } else {
+                        std::fs::read(&path).unwrap()
+                    };
+                    files.insert(relative, Some(content));
+                }
+            }
+            files
+        }
+
+        for with_staging in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            std::fs::create_dir_all(home.join("locks")).unwrap();
+            let holder = std::fs::OpenOptions::new().create(true).truncate(false)
+                .read(true).write(true)
+                .open(duduclaw_core::gateway_instance::lock_path(home)).unwrap();
+            holder.try_lock_exclusive().unwrap();
+            std::fs::write(home.join("locks/gateway.lock.holder"), "other gateway").unwrap();
+            std::fs::write(home.join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            std::fs::write(home.join("users.db"), "live identity").unwrap();
+            if with_staging {
+                let staging = staging_dir(home);
+                std::fs::create_dir(&staging).unwrap();
+                std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+                std::fs::write(staging.join("users.db"), "archived identity").unwrap();
+            }
+            write_marker(home, &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "pending.tar.gz".into(),
+            }).unwrap();
+            let before = snapshot(home, home);
+            let error = perform_pending_restore_swap(home, "blocked").unwrap_err();
+            assert!(matches!(error, RestoreSwapError::GatewayRunning(ref text)
+                if text.contains("其他閘道程序正在使用此資料目錄")));
+            assert_eq!(snapshot(home, home), before);
+            assert!(!duduclaw_core::gateway_instance::held(home));
+        }
+    }
+
+    #[test]
+    fn restore_preserves_the_singleton_inode_and_skips_archived_lock_aliases() {
+        use fs2::FileExt;
+
+        assert!(is_gateway_lock_directory(std::ffi::OsStr::new("locks::$INDEX_ALLOCATION")));
+        for archived_name in ["locks", "LOCKS", "locks.", "locks ", "lockſ", "locKs"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            duduclaw_core::gateway_instance::acquire_for_restore(home).unwrap();
+            let lock = duduclaw_core::gateway_instance::lock_path(home);
+            #[cfg(unix)]
+            let original_inode = {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(&lock).unwrap().ino()
+            };
+            let holder_before = std::fs::read(duduclaw_core::gateway_instance::holder_path(home)).unwrap();
+            std::fs::write(home.join("locks/keep"), b"live lock data").unwrap();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(staging.join(archived_name)).unwrap();
+            std::fs::write(staging.join(archived_name).join("gateway.lock"), b"archived lock").unwrap();
+            std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            write_marker(home, &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "locks.tar.gz".into(),
+            }).unwrap();
+
+            let report = perform_pending_restore_swap(home, "stable-lock").unwrap().unwrap();
+            assert!(!report.preserved_dir.join("locks").exists());
+            assert_eq!(std::fs::read(home.join("locks/keep")).unwrap(), b"live lock data");
+            assert_eq!(std::fs::read(duduclaw_core::gateway_instance::holder_path(home)).unwrap(), holder_before);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(std::fs::metadata(&lock).unwrap().ino(), original_inode);
+            }
+            let other = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+            assert!(other.try_lock_exclusive().is_err(), "a second gateway must remain excluded");
+            assert!(duduclaw_core::gateway_instance::held(home));
+        }
+    }
 
     #[test]
     fn mfa_restore_keeps_current_policy_and_restores_all_data_once() {
@@ -1177,30 +1632,34 @@ mod tests {
 
     #[test]
     fn marker_present_but_staging_empty_clears_marker_and_errors_without_touching_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        std::fs::write(home.join("config.toml"), b"[general]\n").unwrap();
-        write_marker(
-            home,
-            &RestoreMarker {
-                staged_at: Utc::now(),
-                source_filename: "x.tar.gz".into(),
-            },
-        )
-        .unwrap();
-        // No staging dir at all (interrupted upload).
+        for empty_directory in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            std::fs::write(home.join("config.toml"), b"[general]\n").unwrap();
+            write_marker(
+                home,
+                &RestoreMarker {
+                    staged_at: Utc::now(),
+                    source_filename: "x.tar.gz".into(),
+                },
+            )
+            .unwrap();
+            if empty_directory {
+                std::fs::create_dir(staging_dir(home)).unwrap();
+            }
 
-        let result = perform_pending_restore_swap(home, "20260101T000000Z");
-        assert_eq!(result, Err(RestoreSwapError::StagingMissingOrEmpty));
-        assert!(
-            read_marker(home).is_none(),
-            "marker must be cleared so boot does not loop forever"
-        );
-        assert!(
-            home.join("config.toml").is_file(),
-            "existing data must be untouched"
-        );
-        assert!(!home.join("restore-backup-20260101T000000Z").exists());
+            let result = perform_pending_restore_swap(home, "20260101T000000Z");
+            assert_eq!(result, Err(RestoreSwapError::StagingMissingOrEmpty));
+            assert!(
+                read_marker(home).is_none(),
+                "marker must be cleared so boot does not loop forever"
+            );
+            assert!(
+                home.join("config.toml").is_file(),
+                "existing data must be untouched"
+            );
+            assert!(!home.join("restore-backup-20260101T000000Z").exists());
+        }
     }
 
     #[test]
