@@ -290,6 +290,9 @@ impl Data {
     }
 }
 pub fn field(v: &Value, key: &str) -> String {
+    if crate::human_time::is_time_field(key) {
+        return TerminalText::new(crate::human_time::value(&v[key])).plain();
+    }
     let text = match &v[key] {
         Value::String(s) => s.clone(),
         Value::Null => strings::NOT_PROVIDED.into(),
@@ -312,7 +315,7 @@ impl LogTail {
         let raw = value
             .as_str()
             .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string());
+            .unwrap_or_else(|| crate::human_time::metadata_json(value).to_string());
         self.lines
             .push_back(TerminalText::new(raw.chars().take(2048).collect()));
         if self.lines.len() > 256 {

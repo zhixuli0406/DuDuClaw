@@ -45,7 +45,7 @@ RPC `/ws` and WebChat `/ws/chat` send Close and allow up to one second for the p
 
 Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chinese labels or English aliases such as `stop`, `steer`, `log`); arrows select, `Enter` runs the displayed shortcut, and `Esc` returns to the previous focus with the chat draft intact. `Ctrl-K` remains reserved. The list is recalculated from the focused block, current role, employee binding and fresh data. Autonomy pause/resume sends immediately. Other controls open the same confirmation card as their shortcut; the palette never approves a card for you. Cards and content warnings own their keyboard, so the palette cannot open over them.
 
-`F1` / `?` shows help only in the focused block; other blocks stay visible. Long home paths retain their right end with a leading ellipsis. At the minimum supported height (12 rows), inbox and employee panels each retain one content row; the schedule panel may be hidden. Borders remain ASCII in either glyph mode. All navigation works without a mouse. Windows key-release events never execute commands.
+`F1` / `?` shows help only in the focused block; other blocks stay visible. The header shows the home path only when it differs from `~/.duduclaw`, abbreviating the user home to `~` and shortening long paths in the middle. At the minimum supported height (12 rows), inbox and employee panels each retain one content row; the schedule panel may be hidden. Unicode mode uses rounded borders; ASCII mode keeps ASCII borders. All navigation works without a mouse. Windows key-release events never execute commands.
 
 The control room offers controls that stop work or move it one step forward. It never grants standing permission; Admin can pause or resume autonomy globally. `cron run now`, `heartbeat trigger`, and task stop are one-way actions and always go through a confirmation card; controls are not necessarily reversible.
 
@@ -80,7 +80,7 @@ Channel codes are requested for the entered account email and delivered through 
 
 New items never take selection. Read marks do not dismiss pending requests at the gateway. Completion badges use recent run history, not a complete history of everything you have missed. If the selected row disappears, selection moves to the same position, or the last row; an existing selected ID stays selected through new arrivals and reordering.
 
-On disconnect, lost events, or an incomplete refetch, lists show `資料可能過期` (“data may be stale”) and counts become `?`; JSON uses `stale: true` and `count: null`. The last complete list remains visible. A refetch has a shared limit of 2,000 rows and 4 MiB of encoded response content across employees, inbox, recent runs, and schedules. Exceeding either limit stops that refetch and keeps it stale, never publishes a partial list as complete. Responses and events are limited to 256 KiB per WebSocket message/frame, with a 16-event queue. Large installations may need the dashboard.
+On disconnect, lost events, or an incomplete refetch, lists show `資料可能過期` (“data may be stale”) and panel titles omit unknown counts; JSON uses `stale: true` and `count: null`. The last complete list remains visible. A refetch has a shared limit of 2,000 rows and 4 MiB of encoded response content across employees, inbox, recent runs, and schedules. Exceeding either limit stops that refetch and keeps it stale, never publishes a partial list as complete. Responses and events are limited to 256 KiB per WebSocket message/frame, with a 16-event queue. Large installations may need the dashboard.
 
 ## Chat and input focus
 
@@ -179,7 +179,8 @@ Approval requires a nonempty string `digest`, sent as `expected_digest`. If it i
 
 ```toml
 # ~/.duduclaw/tui.toml
-glyphs = "ascii"                 # or "unicode"
+theme = "auto"                   # "light" / "dark"
+# glyphs = "ascii"               # optional override: "ascii" / "unicode"
 ambiguous_width = "narrow"        # or "wide", matching your terminal
 notifications = false
 poll_interval_seconds = 15        # 5..3600
@@ -190,13 +191,22 @@ Every supported top-level key is listed below. Each invalid value keeps only tha
 
 | Key | Accepted values | Default / effect |
 |---|---|---|
-| `glyphs` | `"ascii"`, `"unicode"` | `"ascii"`; employee status glyphs; borders stay ASCII |
+| `theme` | `"auto"`, `"light"`, `"dark"` | `"auto"`; detect the terminal background at startup, or use an explicit palette |
+| `glyphs` | `"ascii"`, `"unicode"` | Unicode in a UTF-8 locale unless `TERM` is `linux` or `dumb`; ASCII otherwise. Explicit settings override detection; Unicode uses rounded borders |
 | `ambiguous_width` | `"narrow"`, `"wide"` | `"narrow"`; match the terminal's ambiguous-character width |
 | `poll_interval_seconds` | Integer, 5–3600 inclusive | `15`; authoritative list reconciliation; run/task/log blocks retain their five-second reconciliation |
 | `notifications` | Boolean | `false`, including SSH; explicit opt-in enables fixed-text background notifications |
 | `default_layout` | `"single"`, `"vertical"`, `"horizontal"` | `"single"`; one detail block, two side-by-side detail blocks, or two stacked detail blocks; starts with block 1 focused |
 
-Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Borders use ASCII. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
+With `theme = "auto"`, startup queries the terminal background using OSC 11 with a timeout of about 150 ms, then falls back to `COLORFGBG`, then dark. Explicit `light` or `dark` skips background detection. Color support follows `COLORTERM=truecolor` or `24bit`, then a `TERM` containing `256color`, then 16 ANSI colors. Setting `NO_COLOR` to any value, including an empty value, disables colors; bold and reverse video still identify emphasis and selection.
+
+On Unix, OSC 11 detection runs after raw mode is enabled, through the same crossterm reader used by the event loop; ordinary keys are retained. Native Windows consoles, non-TTY input, `TERM=linux` or `dumb`, and `NO_COLOR` skip the query and use `COLORFGBG`, then dark. The 16-color contrast calculations use the reference ANSI palette; terminal-customized ANSI colors determine the actual displayed contrast.
+
+The input recovery is bounded: an ESC introducer split by more than 50 ms, or an identified reply interrupted for more than 150 ms, cannot reliably be distinguished from ordinary keys. Arbitrarily delayed fragments are outside the verified recovery bound.
+
+The glyph default uses the first nonempty locale value in `LC_ALL`, `LC_CTYPE`, then `LANG`. Unicode mode shows `◉` needs you, `●` working, `○` idle, `✓` done, `✕` error and `⏸` paused. Status words remain visible in both glyph modes. Times use the local time zone and Traditional Chinese relative labels within an hour, `HH:MM` for today and `MM/DD HH:MM` otherwise; invalid timestamps show `時間不明`. Empty panels explain what will appear there, and footer keys are highlighted separately from their descriptions.
+
+Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
 
 ## Security limits
 

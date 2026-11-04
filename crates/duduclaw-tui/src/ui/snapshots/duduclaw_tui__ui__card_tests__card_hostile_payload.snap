@@ -8,7 +8,7 @@ expression: out
 |  "decided_in_dashboard_only": false,                                                 |
 |  "digest": "seen",                                                                   |
 |  "effect_class": "shell",                                                            |
-|  "expires_at": 2000,                                                                 |
+|  "expires_at": "01/01 08:33",                                                        |
 |  "id": "a1",                                                                         |
 |  "kind": "tool",                                                                     |
 |  "may_decide": true,                                                                 |

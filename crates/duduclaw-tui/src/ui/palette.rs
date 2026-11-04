@@ -402,7 +402,7 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, app: &App, settings: &Setti
         height,
     );
     frame.render_widget(Clear, area);
-    let inner = super::widgets::panel(frame, area, strings::PALETTE_TITLE, settings, false);
+    let inner = super::widgets::panel_focus(frame, area, strings::PALETTE_TITLE, settings, false, true);
     let commands = app.palette_commands(model);
     let selected = palette.selected.min(commands.len().saturating_sub(1));
     let visible = usize::from(inner.height.saturating_sub(2));

@@ -171,13 +171,13 @@ pub(super) fn draw(
 ) {
     use super::{
         text::{SafeText, wrapped_lines},
-        widgets::{panel, style},
+        widgets::{panel_focus, style},
     };
     use ratatui::layout::Rect;
     frame.render_widget(ratatui::widgets::Clear, area);
-    let inner = panel(frame, area, strings::CARD_TITLE, settings, !fresh);
+    let inner = panel_focus(frame, area, strings::CARD_TITLE, settings, !fresh, true);
     // Match the existing decision card's double rail, distinct from data panes.
-    if !inner.is_empty() {
+    if !inner.is_empty() && settings.glyphs == crate::settings::Glyphs::Ascii {
         for x in area.x..area.right() {
             frame.buffer_mut()[(x, area.y)].set_symbol("=");
             frame.buffer_mut()[(x, area.bottom() - 1)].set_symbol("=");
@@ -204,7 +204,7 @@ pub(super) fn draw(
             visible: true,
             wrap: true,
             scroll: card.scroll,
-            style: style(!fresh),
+            style: style(settings, !fresh),
         },
         Rect::new(inner.x, inner.y, inner.width, height),
     );
@@ -216,7 +216,7 @@ pub(super) fn draw(
             visible: true,
             wrap: true,
             scroll: 0,
-            style: style(!fresh),
+            style: style(settings, !fresh),
         },
         Rect::new(
             inner.x,

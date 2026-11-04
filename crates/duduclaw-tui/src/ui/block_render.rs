@@ -1,7 +1,7 @@
 use super::{
     app::App,
     text::SafeText,
-    widgets::{panel, style, text},
+    widgets::{panel_focus, style, text},
 };
 use crate::{
     blocks::{Block, Pane, field},
@@ -79,6 +79,10 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
         Block::Task if pane.responsibilities => {
             lines.push(strings::RESP_LIST.into());
             lines.push(strings::ROW_KEYS.into());
+            if d.selected.is_null() && !d.stale {
+                lines.push(format!("{}；{}", strings::VIEW_EMPTY, strings::EMPTY_RESPONSIBILITIES));
+                return TerminalText::new(lines.join("\n"));
+            }
             if d.section("summary")["summary"]["open_occurrence"]["task_id"]
                 .as_str()
                 .is_some()
@@ -130,7 +134,7 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
         }
         Block::Task => {
             if d.selected.is_null() && !d.stale {
-                lines.push(strings::VIEW_EMPTY.into());
+                lines.push(format!("{}；{}", strings::VIEW_EMPTY, strings::EMPTY_TASKS));
                 return TerminalText::new(lines.join("\n"));
             }
             lines.push(strings::TASK_KEYS.into());
@@ -230,6 +234,9 @@ pub(super) fn content(pane: &Pane, model: &Model, logs: &crate::blocks::LogTail)
                 if logs.lost {
                     lines.push(strings::LOG_GAP.into());
                 }
+                if logs.lines.is_empty() {
+                    lines.push(strings::EMPTY_LOG.into());
+                }
                 lines.extend(logs.lines.iter().map(TerminalText::plain));
             }
         }
@@ -320,7 +327,7 @@ pub(super) fn draw(
         } else {
             pane.data.stale
         };
-        let inner = panel(frame, region, &title, settings, stale);
+        let inner = panel_focus(frame, region, &title, settings, stale, index == app.blocks.focused);
         let body = if app.help && index == app.blocks.focused {
             TerminalText::new(strings::HELP.into())
         } else if kind == Block::Detail {
@@ -341,7 +348,7 @@ pub(super) fn draw(
                 } else {
                     pane.scroll
                 },
-                style: style(stale),
+                style: style(settings, stale),
             },
             inner,
         );

@@ -125,7 +125,7 @@ fn field(value: &Value, name: &str) -> String {
     .replace('\n', " ")
 }
 pub fn format_run(value: &Value, content: bool) -> String {
-    let metadata = format!("{} [{}] {}", field(value, "started_at"),
+    let metadata = format!("{} [{}] {}", crate::human_time::value(&value["started_at"]),
         field(value, "status"), field(value, "agent_id"));
     with_content(metadata, value, content)
 }
@@ -138,7 +138,7 @@ pub fn format_event(value: &Value, content: bool) -> String {
     if !matches!(kind.as_str(), "text" | "tool_use" | "tool_step" | "todo_update") {
         return kind;
     }
-    let metadata = format!("{} [{}] {} {} {}", field(value, "ts"), kind,
+    let metadata = format!("{} [{}] {} {} {}", crate::human_time::value(&value["ts"]), kind,
         field(value, "agent_id"), field(value, "status"), field(value, "tool"));
     with_content(metadata, value, content)
 }

@@ -19,6 +19,7 @@ pub fn draw(
     settings: &Settings,
 ) {
     let area = frame.area();
+    frame.buffer_mut().set_style(area, settings.colors.base());
     if area.width < 24 || area.height < 12 {
         if let Some(card) = &mut app.card { card.viewport(1, 0); }
         text(
@@ -40,45 +41,26 @@ pub fn draw(
             Constraint::Length(footer_height),
         ])
         .split(area);
-    let (status, version) = match connection {
-        ConnectionState::Connecting => (strings::CONNECTING, "?".into()),
-        ConnectionState::Disconnected => (strings::DISCONNECTED, "?".into()),
-        ConnectionState::LoginRequired(_) => (strings::DISCONNECTED, "?".into()),
-        ConnectionState::Connected(info) => (
-            strings::CONNECTED,
-            info.version
-                .as_ref()
-                .map(TerminalText::plain)
-                .unwrap_or_else(|| "?".into()),
-        ),
+    let (status, version, connected) = match connection {
+        ConnectionState::Connecting => (strings::CONNECTING, None, false),
+        ConnectionState::Disconnected | ConnectionState::LoginRequired(_) => (strings::DISCONNECTED, None, false),
+        ConnectionState::Connected(info) => (strings::CONNECTED, info.version.as_ref().map(TerminalText::plain), true),
     };
-    text(
-        frame,
-        Rect::new(parts[0].x, parts[0].y, parts[0].width, 1),
-        TerminalText::new(format!(
-            "{} | {}",
-            strings::TITLE,
-            super::text::left_ellipsis(&home.plain().replace('\n', " "), usize::from(area.width).saturating_sub(super::text::columns(strings::TITLE, settings.ambiguous_width) + 3), settings.ambiguous_width)
-        )),
-        settings,
-        false,
-        false,
-    );
-    text(
-        frame,
-        Rect::new(parts[0].x, parts[0].y + 1, parts[0].width, 1),
-        TerminalText::new(format!(
-            "{} {} | {} | {}{}",
-            strings::GATEWAY,
-            version.replace('\n', " "),
-            status,
-            strings::working_runs(model.observed_working()),
-            model.cost_millicents.map(|cost| format!(" | {}", if model.cost_today { strings::cost_today(cost) } else { strings::cost_window(cost) })).unwrap_or_default()
-        )),
-        settings,
-        false,
-        false,
-    );
+    let home = display_home(home, usize::from(area.width).saturating_sub(super::text::columns(strings::TITLE, settings.ambiguous_width) + 3), settings);
+    text(frame, Rect::new(parts[0].x, parts[0].y, parts[0].width, 1),
+        TerminalText::new(format!("{}{}", strings::TITLE, home.map(|s| format!(" | {s}")).unwrap_or_default())),
+        settings, false, false);
+    let dot = if settings.glyphs == crate::settings::Glyphs::Unicode { "●" } else { "*" };
+    let mut status_line = format!("{dot} {status}");
+    if let Some(version) = version.filter(|v| !v.trim().is_empty()) { status_line.push_str(&format!(" · {}", version.replace('\n', " "))); }
+    if let Some(cost) = model.cost_millicents { status_line.push_str(&format!(" · {}", if model.cost_today { strings::cost_today(cost) } else { strings::cost_window(cost) })); }
+    if let Some(count) = model.observed_working() { status_line.push_str(&format!(" · {}", strings::working_runs(Some(count)))); }
+    let status_area = Rect::new(parts[0].x, parts[0].y + 1, parts[0].width, 1);
+    text(frame, status_area, TerminalText::new(status_line), settings, false, false);
+    frame.render_widget(super::text::SafeText { text: &TerminalText::new(dot.into()), width: settings.ambiguous_width,
+        visible: false, wrap: false, scroll: 0,
+        style: settings.colors.emphasis(if connected { settings.colors.success } else { settings.colors.warning }) },
+        Rect::new(status_area.x, status_area.y, super::text::columns(dot, settings.ambiguous_width) as u16, 1));
     if let Some(autonomy) = crate::autonomy::status_line(model) {
         text(frame, Rect::new(parts[0].x, parts[0].y + 2, parts[0].width, 1),
             autonomy, settings, model.autonomy.stale || model.autonomy.refetch_pending, false);
@@ -144,13 +126,11 @@ pub fn draw(
         text(frame, Rect::new(footer.x, footer.y + 2, footer.width, 1),
             TerminalText::new(crate::chat::command_note(&app.input).unwrap_or(strings::INPUT_HINT).into()), settings, false, false);
     } else {
-    text(
+    super::widgets::key_hints(
         frame,
         Rect::new(footer.x, footer.y + 1, footer.width, footer.height.saturating_sub(if app.notice.is_some() { 3 } else { 1 }).min(2)),
         TerminalText::new((if app.pty_confirm.is_some() { strings::PTY_CONFIRM } else if app.pty_focus { strings::PTY_KEYS } else if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else if app.blocks.active == crate::blocks::Block::Pty { strings::PTY_LIST_KEYS } else { app.context_hints(model) }).to_string() + if app.card.is_none() && app.control_card.is_none() && app.palette.is_none() && !app.pty_focus && !app.help && app.context_hints(model) != strings::LIST_KEY_HINTS { strings::GLOBAL_HINT_SUFFIX } else { "" }),
         settings,
-        false,
-        true,
     );
     }
     if let Some(notice) = &app.notice {
@@ -171,4 +151,14 @@ pub fn draw(
     if let Some(card) = &mut app.control_card { super::control_card::draw(frame, columns[1], card, settings, control_fresh); }
 
     super::palette::draw(frame, model, app, settings);
+}
+
+fn display_home(home: &TerminalText, budget: usize, settings: &Settings) -> Option<String> {
+    let path = home.plain().replace('\n', " ");
+    let os_home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let default = os_home.as_ref().map(|h| std::path::PathBuf::from(h).join(".duduclaw"));
+    if path == "~/.duduclaw" || default.as_ref().is_some_and(|d| std::path::Path::new(&path) == d) { return None; }
+    let shortened = os_home.as_ref().and_then(|h| std::path::Path::new(&path).strip_prefix(h).ok())
+        .map(|p| format!("~/{}", p.display())).unwrap_or(path);
+    Some(super::text::middle_ellipsis(&shortened, budget, settings.ambiguous_width))
 }

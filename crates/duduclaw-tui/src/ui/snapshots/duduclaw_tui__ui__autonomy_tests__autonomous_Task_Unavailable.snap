@@ -1,6 +1,5 @@
 ---
 source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
-assertion_line: 108
 expression: body
 ---
 資料可能過期
@@ -11,7 +10,7 @@ expression: body
 狀態: 閘道未提供
 員工: 閘道未提供
 暫停原因: 閘道未提供
-更新時間: 閘道未提供
+更新時間: 時間不明
 目前身分沒有此決策權限，或閘道尚未提供可用權限
 驗收條件紀錄
 閘道未提供

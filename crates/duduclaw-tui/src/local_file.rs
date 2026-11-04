@@ -37,7 +37,7 @@ mod tests {
 
     fn refused(home: &std::path::Path) {
         let (settings, notice) = Settings::load(home);
-        assert_eq!(settings.glyphs, Glyphs::Ascii);
+        assert_eq!(settings.glyphs, Glyphs::default());
         assert!(notice.is_some());
         let (read, notice) = ReadState::load(home);
         assert!(!read.contains("secret"));

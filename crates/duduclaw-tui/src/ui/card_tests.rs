@@ -211,13 +211,15 @@ fn arrival_never_opens_card_or_moves_selection_and_sending_waits_for_refetch() {
 }
 
 fn snapshot(extra: Value) -> String {
+    crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
     let now = Instant::now(); let mut c = open(approval(extra), &model(), now); c.code="42".into();
     let mut terminal = Terminal::new(TestBackend::new(88,32)).unwrap();
-    terminal.draw(|f| card_render::draw_at(f,f.area(),&mut c,&Settings::default(),true,now+Duration::from_secs(1),1000)).unwrap();
+    terminal.draw(|f| card_render::draw_at(f,f.area(),&mut c,&Settings::test_defaults(),true,now+Duration::from_secs(1),1000)).unwrap();
     let mut out=String::new(); let b=terminal.backend().buffer();
     for y in 0..32 { let mut line=String::new(); let mut x=0; while x<88 {
         let cell=&b[(x,y)]; line.push_str(cell.symbol()); x+=cell.cell_width().max(1);
     } out.push_str(line.trim_end());out.push('\n'); } out
+    })
 }
 #[test] fn card_normal() { insta::assert_snapshot!(snapshot(json!({}))); }
 #[test] fn card_high_risk() { insta::assert_snapshot!(snapshot(json!({"effect_class":"admin","payload":{"command":"完整指令\n".repeat(40)}}))); }

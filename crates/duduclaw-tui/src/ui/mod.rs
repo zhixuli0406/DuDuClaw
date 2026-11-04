@@ -13,6 +13,7 @@ mod card_render;
 #[cfg(test)]
 mod card_tests;
 mod backend;
+mod osc11;
 mod panels;
 mod chat_render;
 pub mod render;
@@ -32,7 +33,7 @@ use crate::{
     strings,
 };
 use app::{Action, App};
-use crossterm::event::{self, Event};
+use crossterm::event::Event;
 use futures_util::{FutureExt, StreamExt};
 use ratatui::Terminal;
 use std::{path::PathBuf, time::Duration};
@@ -49,7 +50,7 @@ pub struct ControlRoomOptions {
 /// its feed and restores the terminal. Employees continue running in the gateway.
 pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
     let home = resolve_home(options.home)?;
-    let (settings, settings_notice) = Settings::load(&home);
+    let (mut settings, settings_notice) = Settings::load(&home);
     let (read, read_notice) = ReadState::load(&home);
     let mut app = App::default();
     app.read = read;
@@ -62,6 +63,16 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
         app.notice = Some(notices.join(" / "));
     }
     let guard = terminal::TerminalGuard::enter()?;
+    // Negotiate only after raw mode, using the same event reader as the loop.
+    let mut reply_filter = if settings.theme == crate::theme::ThemeMode::Auto
+        && settings.colors.capability != crate::theme::Capability::NoColor {
+        let query = osc11::query_background();
+        settings.resolve_theme(query.background);
+        query.filter
+    } else {
+        settings.resolve_theme(None);
+        osc11::ReplyFilter::default()
+    };
     let shutdown_client = options.client.clone();
     let mut exit_text = None;
     let result = std::panic::AssertUnwindSafe(async {
@@ -174,8 +185,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             // including escape, quit and resize, even when child input is full.
             for _ in 0..256 {
                 let Some(event) = read_host_event(&mut app, || {
-                    if !event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? { return Ok(None); }
-                    event::read().map(Some).map_err(|_| Error::Terminal)
+                    reply_filter.read().map_err(|_| Error::Terminal)
                 })? else { break; };
                 let key = match event {
                     Event::Resize(_, _) => {

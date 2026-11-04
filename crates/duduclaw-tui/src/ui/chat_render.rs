@@ -1,7 +1,7 @@
 use super::{
     app::App,
     text::SafeText,
-    widgets::{panel, style, text},
+    widgets::{panel_focus, style, text},
 };
 use crate::{
     sanitize::TerminalText,
@@ -44,7 +44,7 @@ impl TranscriptCache {
 }
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str) {
-    let inside = panel(frame, area, title, settings, app.chat.stale);
+    let inside = panel_focus(frame, area, title, settings, app.chat.stale, title.starts_with("> "));
     if inside.is_empty() {
         return;
     }
@@ -83,7 +83,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
     });
     if let Some(prompt) = downstream && prompt_rows > 0 {
         frame.render_widget(SafeText { text: &prompt, width: settings.ambiguous_width,
-            visible: false, wrap: true, scroll: 0, style: style(false) },
+            visible: false, wrap: true, scroll: 0, style: style(settings, false) },
             Rect::new(inside.x, inside.y + 1, inside.width, prompt_rows));
     }
     let body = Rect::new(
@@ -97,6 +97,11 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
     let gutter = 2.min(body.width);
     let columns = body.width.saturating_sub(gutter);
     app.chat_cache.update(&app.chat, columns, settings.ambiguous_width);
+    if app.chat.lines.is_empty() && !app.chat.running {
+        frame.render_widget(SafeText { text: &TerminalText::new(strings::EMPTY_CHAT.into()),
+            width: settings.ambiguous_width, visible: false, wrap: true, scroll: 0,
+            style: style(settings, true) }, body);
+    }
     let max_scroll = app.chat_cache.lines.len().saturating_sub(usize::from(body.height));
     app.chat_scroll = app.chat_scroll.min(max_scroll);
     for (row, line) in app.chat_cache.lines.iter()
@@ -106,7 +111,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
         text(frame, Rect::new(body.x, y, gutter, 1),
             TerminalText::new(strings::CHAT_GUTTER.into()), settings, app.chat.stale, false);
         frame.render_widget(SafeText { text: line, width: settings.ambiguous_width,
-            visible: false, wrap: false, scroll: 0, style: style(app.chat.stale) },
+            visible: false, wrap: false, scroll: 0, style: style(settings, app.chat.stale) },
             Rect::new(body.x + gutter, y, columns, 1));
     }
     if app.chat.running && inside.height > 1 {

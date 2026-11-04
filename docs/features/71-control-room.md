@@ -43,6 +43,14 @@ The embedded terminal block belongs to you and does not pass through the gateway
 
 Run the room on the gateway host, over SSH if remote. Do not forward the gateway port: that would expose its local login route to the forwarding host.
 
+## Appearance
+
+The existing panel layout uses light and dark palettes, colored status symbols and a distinct focused border. The header shows connection status, gateway version and available cost information; the default home path is hidden. Times use the local time zone and readable Traditional Chinese labels. Empty panels explain what belongs there, and footer keys stand out from their descriptions.
+
+`theme = 'auto'` is the default in `tui.toml`: startup tries OSC 11 with an approximately 150 ms timeout, then `COLORFGBG`, then dark. Choose `light` or `dark` explicitly to skip detection. Colors adapt to truecolor, 256-color or 16-color terminals. Any `NO_COLOR` value, including an empty value, disables color while keeping bold and reverse-video cues.
+
+Native Windows consoles, non-TTY input, `TERM=linux` or `dumb`, and `NO_COLOR` skip OSC 11 and use the fallback order. The [guide](../guides/tui.md#local-files) describes the bounded input recovery and reference-palette contrast.
+
 ## Terminals
 
 The list below records what has actually been run. A terminal missing from it may work; it has not been checked.
@@ -56,4 +64,4 @@ The list below records what has actually been run. A terminal missing from it ma
 | Windows 11 full screen under ConPTY | Tested on a real gateway on a native Windows machine, with a test program driving a real Pseudo Console: drawing, resize, too-small message, `p` and `u` confirmed in the gateway, CJK input, clean exit. Windows Terminal itself has not been used. |
 | Ubuntu 22.04 on real hardware, full screen under a PTY | Tested on a real gateway: drawing, resize, too-small message, `p` and `u` confirmed in the gateway, clean exit and terminal restore. A physical terminal emulator has not been used. |
 
-The room needs at least 24 columns and 12 rows, and says so when the window is smaller. Status glyphs are ASCII by default; set `glyphs = 'unicode'` in `tui.toml` if your font has them. The room handles CJK width and whole committed characters, but an input method has not been tested by hand.
+The room needs at least 24 columns and 12 rows, and says so when the window is smaller. Status glyphs default to Unicode in a UTF-8 locale unless `TERM` is `linux` or `dumb`; otherwise they use ASCII. An explicit `glyphs = 'ascii'` or `'unicode'` in `tui.toml` overrides detection. Unicode mode uses rounded borders. The room handles CJK width and whole committed characters, but an input method has not been tested by hand.

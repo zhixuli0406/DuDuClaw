@@ -33,6 +33,15 @@ impl EmployeeStatus {
             Self::Ended => strings::ENDED,
         }
     }
+    pub fn color(self, theme: &crate::theme::Theme) -> ratatui::style::Color {
+        match self {
+            Self::Awaiting => theme.warning,
+            Self::Working => theme.info,
+            Self::Done => theme.success,
+            Self::Error => theme.danger,
+            _ => theme.muted,
+        }
+    }
     pub fn glyph(self, glyphs: Glyphs) -> &'static str {
         match (glyphs, self) {
             (Glyphs::Ascii, Self::Working) => "*",
@@ -43,11 +52,11 @@ impl EmployeeStatus {
             (Glyphs::Ascii, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "-",
             (Glyphs::Ascii, Self::Ended) => "x",
             (Glyphs::Unicode, Self::Working) => "●",
-            (Glyphs::Unicode, Self::Awaiting) => "◇",
-            (Glyphs::Unicode, Self::Error) => "!",
+            (Glyphs::Unicode, Self::Awaiting) => "◉",
+            (Glyphs::Unicode, Self::Error) => "✕",
             (Glyphs::Unicode, Self::Done) => "✓",
-            (Glyphs::Unicode, Self::Idle) => "·",
-            (Glyphs::Unicode, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "Ⅱ",
+            (Glyphs::Unicode, Self::Idle) => "○",
+            (Glyphs::Unicode, Self::Paused | Self::AutonomyPaused | Self::AutonomyUnknown) => "⏸",
             (Glyphs::Unicode, Self::Ended) => "×",
         }
     }
@@ -642,7 +651,7 @@ impl App {
                         .iter().filter(|key| s.detail.get(**key).is_some())
                         .map(|key| format!("{}: {}", strings::field_label(key), crate::blocks::field(&s.detail, key))).collect();
                     return TerminalText::new(format!("{}\n{}: {}\n{}\n{}", s.agent.visible(), strings::NEXT_RUNS,
-                        s.next_run.visible(), fields.join("\n"),
+                        crate::human_time::schedule(&s.next_run), fields.join("\n"),
                         if matches!(s.source, crate::state_extra::ScheduleSource::Heartbeat) { strings::HEARTBEAT_KEYS } else { strings::CRON_KEYS }));
                 }
             }

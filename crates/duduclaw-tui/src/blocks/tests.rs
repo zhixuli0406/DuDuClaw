@@ -269,6 +269,23 @@ fn buffers_and_hostile_strings_are_bounded_and_safe() {
     assert!(!field(&v, "path").chars().any(crate::sanitize::forbidden));
     assert!(array(&json!({"tasks":vec![json!({});2001]}), "tasks").is_err());
 }
+
+#[test]
+fn metadata_times_are_human_readable_without_changing_underlying_data() {
+    crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
+        let row = json!({"updated_at":"2026-11-04T03:59:00Z", "timestamp":"invalid", "message":"unchanged"});
+        assert_eq!(field(&row, "updated_at"), "1 分鐘前");
+        assert_eq!(field(&row, "timestamp"), "時間不明");
+        assert_eq!(row["updated_at"], "2026-11-04T03:59:00Z");
+        let mut logs = LogTail::default();
+        logs.push(&row);
+        let line = logs.lines[0].plain();
+        assert!(line.contains("1 分鐘前"));
+        assert!(line.contains("時間不明"));
+        assert!(!line.contains("2026-11-04T"));
+        assert!(line.contains("unchanged"));
+    });
+}
 #[test]
 fn live_steps_require_subscription_and_exact_run_then_bound_and_deduplicate() {
     let mut b = Blocks::default();

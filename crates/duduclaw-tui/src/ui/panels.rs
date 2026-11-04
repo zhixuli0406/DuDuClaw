@@ -38,7 +38,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 if stale_inbox {
                     strings::STALE
                 } else {
-                    strings::EMPTY_INBOX
+                    strings::EMPTY_INBOX_GUIDE
                 }
                 .into(),
             ),
@@ -56,6 +56,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 .iter()
                 .map(|i| Row {
                     selection: Selection::Inbox(i.key()),
+                    status: None,
                     text: TerminalText::new(format!(
                         "[{}] {} · {}{}{}",
                         i.source_label(),
@@ -128,6 +129,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                     } else { String::new() };
                     Row {
                         selection: Selection::Employee(e.id().into()),
+                        status: Some(s),
                         text: TerminalText::new(format!(
                             "{} {} {}{}",
                             s.glyph(settings.glyphs),
@@ -191,6 +193,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                 .iter()
                 .map(|s| Row {
                     selection: Selection::Schedule(s.id.clone()),
+                    status: None,
                     text: TerminalText::new(format!(
                         "{} {} {} / {}: {}",
                         match s.source {
@@ -198,7 +201,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, model: &Model, app: &App, sett
                             ScheduleSource::Cron => strings::CRON,
                         },
                         s.agent.plain(),
-                        s.next_run.plain(), match s.source { ScheduleSource::Heartbeat => strings::field_label("last_run"), ScheduleSource::Cron => strings::LAST_RESULT },
+                        crate::human_time::schedule(&s.next_run), match s.source { ScheduleSource::Heartbeat => strings::field_label("last_run"), ScheduleSource::Cron => strings::LAST_RESULT },
                         crate::blocks::field(&s.detail, match s.source { ScheduleSource::Heartbeat => "last_run", ScheduleSource::Cron => "last_status" })
                     )),
                 })

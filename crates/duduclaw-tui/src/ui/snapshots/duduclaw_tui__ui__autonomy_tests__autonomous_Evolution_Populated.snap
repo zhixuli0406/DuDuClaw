@@ -1,6 +1,5 @@
 ---
 source: crates/duduclaw-tui/src/ui/autonomy_tests.rs
-assertion_line: 108
 expression: body
 ---
 唯讀；完整內容請到儀表板查看
@@ -12,7 +11,7 @@ expression: body
 每週報告 · true · true
 停滯訊號
 員工 · 停滯 · 摘要 · 檢查時間
-adu · true · 每週報告 · 2026-11-02T08:00:00Z
+adu · true · 每週報告 · 11/02 16:00
 經驗條目
 識別碼 · 狀態 · 類別 · 內容
 p1 · active · repair · 每週報告
