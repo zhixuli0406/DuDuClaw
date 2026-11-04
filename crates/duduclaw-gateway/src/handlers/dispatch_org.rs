@@ -571,10 +571,11 @@ impl MethodHandler {
                 check_agent_filter!(AccessLevel::Viewer);
                 boxed_frame(|| self.handle_activity_list(params, ctx)).await
             }
-            // Per-topic filtering is NOT implemented: BroadcastLayer fans out every
-            // activity event to every authenticated WS client unconditionally. This
-            // RPC exists purely as a client-intent signal and future-compat hook so
-            // callers can declare interest without guessing at server state.
+            // This RPC records no subscription filter; it is a client-intent /
+            // future-compat hook. BroadcastLayer fans out activity events internally,
+            // but server.rs::handle_socket filters each connection before delivery
+            // via handlers/push_filter.rs::PushGate::filter_prepared: activity.new
+            // follows the task visibility gate, or employee access when taskless.
             "activity.subscribe" => WsFrame::ok_response(
                 "",
                 json!({

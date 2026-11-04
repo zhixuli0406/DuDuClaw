@@ -19167,6 +19167,45 @@ mod live_events_socket_tests {
     }
 
     #[tokio::test]
+    async fn activity_subscribe_filters_per_connection_employee_access() {
+        let mut allowed = MfaSocket::new().await;
+        allowed.state.user_db.update_user(&allowed.user.id, None,
+            Some(duduclaw_auth::UserRole::Employee), None).unwrap();
+        allowed.state.user_db.bind_agent(&allowed.user.id, "sales",
+            duduclaw_auth::AccessLevel::Viewer).unwrap();
+        let user = allowed.state.user_db.create_user("unbound@example.test", "Unbound",
+            "password-test", duduclaw_auth::UserRole::Employee).unwrap();
+        let mut denied = MfaSocket::connect(allowed._home.clone(), allowed.state.clone(), user).await;
+        for connection in [&mut allowed, &mut denied] {
+            assert_eq!(connection.rpc("activity.subscribe", json!({})).await["ok"], true);
+        }
+
+        let activity = json!({"id":"activity-sales", "agent_id":"sales", "summary":"Sales activity"});
+        for frame in [
+            WsFrame::event("activity.new", activity.clone()),
+            // An ordered, universally visible marker proves the denied socket
+            // processed the activity without relying on a silence timeout.
+            WsFrame::event("system.status_changed", json!({"id":"after-activity"})),
+        ] {
+            allowed.state.event_tx.send(serde_json::to_string(&frame).unwrap()).unwrap();
+        }
+        let received = next_json(&mut allowed.client).await;
+        assert_eq!(received["event"], "activity.new");
+        assert_eq!(received["payload"], activity);
+        assert_eq!(received["seq"], 1);
+        let marker = next_json(&mut allowed.client).await;
+        assert_eq!(marker["event"], "system.status_changed");
+        assert_eq!(marker["payload"]["id"], "after-activity");
+        assert_eq!(marker["seq"], 2);
+        let marker = next_json(&mut denied.client).await;
+        assert_eq!(marker["event"], "system.status_changed");
+        assert_eq!(marker["payload"]["id"], "after-activity");
+        assert_eq!(marker["seq"], 1, "denied activity must not consume a sequence number");
+        allowed.finish().await;
+        denied.finish().await;
+    }
+
+    #[tokio::test]
     async fn broker_database_bridge_reaches_ws_with_filtered_sequence_and_loss() {
         let home = tempfile::tempdir().unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
