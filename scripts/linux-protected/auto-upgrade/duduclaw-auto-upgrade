@@ -1,0 +1,84 @@
+#!/bin/sh
+set -eu
+
+# Fixed trusted command search path; no caller-controlled path or URL overrides.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+FLOOR=/var/lib/duduclaw-protected/version-floor
+PENDING=/var/lib/duduclaw-protected/version-pending
+BINARY=/opt/duduclaw/bin/duduclaw
+API='https://api.github.com/repos/zhixuli0406/DuDuClaw/releases?per_page=30'
+
+log() { printf '%s\n' "duduclaw-auto-upgrade: $*"; }
+fail() { log "$*" >&2; exit 1; }
+valid_version() { printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; }
+
+[ "$(id -u)" = 0 ] || fail 'must run as root'
+dry_run=false
+case "$#:$*" in
+    0:) ;;
+    1:--dry-run) dry_run=true ;;
+    *) fail 'usage: duduclaw-auto-upgrade [--dry-run]' ;;
+esac
+[ ! -e "$PENDING" ] && [ ! -L "$PENDING" ] ||
+    fail 'interrupted upgrade (version-pending); manual attention required'
+[ -f "$FLOOR" ] && [ -r "$FLOOR" ] || fail 'missing or unreadable version-floor'
+# A sentinel preserves trailing newlines so malformed floors are not normalized.
+installed=$(cat "$FLOOR" && printf '#') || fail 'cannot read version-floor'
+installed=${installed%\#}
+# Reject bytes the shell cannot preserve (notably NUL).
+[ "$(wc -c < "$FLOOR")" -eq "${#installed}" ] || fail 'invalid version-floor bytes'
+valid_version "$installed" || fail 'invalid version-floor (expected X.Y.Z)'
+case "$installed" in
+    *'
+'*) fail 'invalid version-floor (unexpected newline)' ;;
+esac
+
+# /tmp is private and writable under systemd PrivateTmp; never use caller TMPDIR.
+umask 077
+api_dir=$(mktemp -d /tmp/duduclaw-auto-upgrade.XXXXXXXXXX) || fail 'cannot create private API directory'
+trap 'rm -rf -- "$api_dir"' 0
+trap 'exit 1' HUP INT TERM
+chmod 0700 "$api_dir"
+api_file=$(mktemp "$api_dir/response.XXXXXXXXXX") || fail 'cannot create API response file'
+# Older curl only enforces max-filesize with Content-Length. Check disk size too.
+curl -q --proto '=https' --tlsv1.2 -fsS \
+    --connect-timeout 15 --max-time 60 --max-filesize 8388608 \
+    -H 'User-Agent: DuDuClaw-protected-auto-upgrade' "$API" > "$api_file" || fail 'release API request failed'
+[ "$(wc -c < "$api_file")" -le 8388608 ] || fail 'release API response exceeds 8 MiB'
+response=$(cat "$api_file") || fail 'cannot read release API response'
+rm -rf -- "$api_dir"
+trap - 0 HUP INT TERM
+# Check the whole array envelope regardless of whitespace or a final newline.
+# This rejects a missing closing bracket, not every malformed JSON document.
+envelope=$(printf '%s' "$response" | tr -d '[:space:]')
+case "$envelope" in
+    \[*\]) ;;
+    *) fail 'invalid or truncated release API array' ;;
+esac
+unset envelope
+# In valid JSON, body quotes are escaped: even if a match starts at the quote
+# in \"tag_name\", the backslash before its closing quote prevents this exact
+# pattern from matching. Thus body text cannot supply a tag_name key.
+# No full JSON parser: prerelease flags are not parsed; stable-shaped tags only.
+# Flatten real line breaks so pretty JSON may also split a field across lines.
+tags=$(printf '%s' "$response" | tr '\r\n' '  ' | grep -Eo \
+    '"tag_name"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"' | sed \
+    's/^"tag_name"[[:space:]]*:[[:space:]]*"//; s/"$//')
+[ -n "$tags" ] || fail 'no valid gateway release tags in API response'
+newest=$(printf '%s\n' "$tags" | sort -V | tail -n 1)
+newest=${newest#v}
+valid_version "$newest" || fail 'invalid newest gateway version'
+highest=$(printf '%s\n%s\n' "$installed" "$newest" | sort -V | tail -n 1)
+if [ "$highest" = "$newest" ] && [ "$newest" != "$installed" ]; then
+    if [ "$dry_run" = true ]; then
+        log "dry-run: would upgrade $installed -> $newest: $BINARY service upgrade --protected-linux --version $newest"
+    else
+        log "upgrading $installed -> $newest"
+        exec "$BINARY" service upgrade --protected-linux --version "$newest"
+    fi
+else
+    log "already up to date (installed $installed; newest gateway $newest)"
+fi

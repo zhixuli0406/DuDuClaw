@@ -314,6 +314,7 @@ jobs:
       - name: Test CI coverage contract
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_ci*.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_protected_auto_upgrade.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_check_glibc.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_check_embedded_paths.py' -v
           python3 scripts/check_embedded_paths.py . container/Dockerfile.server

@@ -1,0 +1,40 @@
+[Unit]
+Description=Upgrade the protected DuDuClaw Linux gateway when a newer release exists
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/duduclaw-auto-upgrade
+# Explicit root is required for the trusted binary, version ledger and systemctl.
+User=root
+# New temporary files are accessible only to root.
+UMask=0077
+# Children cannot gain privileges through set-ID executables; root stays root.
+NoNewPrivileges=yes
+# Prevent writes to kernel tunables; /opt, /var and systemctl remain available.
+ProtectKernelTunables=yes
+# Prevent module loading without restricting ordinary upgrade file operations.
+ProtectKernelModules=yes
+# Prevent changes to kernel logs; journald stdout/stderr logging still works.
+ProtectKernelLogs=yes
+# Allow 300 s downloads with retries plus install/restart after version-pending.
+TimeoutStartSec=1h
+# Make the host filesystem read-only except the explicit upgrade paths.
+ProtectSystem=strict
+# Staging/binary replacement and the version lock/ledger need these writes.
+ReadWritePaths=/opt/duduclaw /var/lib/duduclaw-protected
+# The upgrade never needs user homes or root's home.
+ProtectHome=yes
+# Give API response files a private writable /tmp.
+PrivateTmp=yes
+# Only standard pseudo-devices are needed; hide physical devices.
+PrivateDevices=yes
+# systemctl asks PID 1 to restart; this process never writes cgroups.
+ProtectControlGroups=yes
+# The upgrade must not create or change set-ID files.
+RestrictSUIDSGID=yes
+# No process personality changes are needed.
+LockPersonality=yes
+# Restrict system calls to the host's native architecture.
+SystemCallArchitectures=native
