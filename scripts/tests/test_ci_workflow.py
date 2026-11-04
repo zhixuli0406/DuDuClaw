@@ -52,7 +52,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(smoke["on"]["pull_request"], {"paths": [
             ".github/workflows/release.yml", ".github/workflows/linux-release-smoke.yml",
             "Cross.toml", ".cargo/**", "Cargo.lock", "Cargo.toml", "crates/*/Cargo.toml",
-            "scripts/check_glibc.py", "container/native-protected-launcher.sh",
+            "scripts/check_glibc.py", "crates/duduclaw-cli/assets/native-protected-launcher.sh",
             "crates/duduclaw-cli/src/service/**", "crates/duduclaw-core/src/root_key*.rs",
         ]})
         self.assertEqual(smoke["permissions"], {"contents": "read"})

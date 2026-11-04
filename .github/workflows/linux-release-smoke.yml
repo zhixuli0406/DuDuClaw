@@ -11,7 +11,7 @@ on:
       - 'Cargo.toml'
       - 'crates/*/Cargo.toml'
       - 'scripts/check_glibc.py'
-      - 'container/native-protected-launcher.sh'
+      - 'crates/duduclaw-cli/assets/native-protected-launcher.sh'
       - 'crates/duduclaw-cli/src/service/**'
       - 'crates/duduclaw-core/src/root_key*.rs'
   workflow_dispatch:
