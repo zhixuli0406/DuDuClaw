@@ -166,6 +166,7 @@ mod cron_tasks;
 mod decision_tools;
 mod delegation;
 mod discovery;
+mod group_history;
 mod dispatch;
 mod evolution;
 mod exec;

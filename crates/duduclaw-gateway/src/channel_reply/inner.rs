@@ -1514,8 +1514,12 @@ pub(super) async fn build_reply_with_session_inner(
     }
     let full_system_prompt =
         crate::knowledge::auto_retrieve::with_rules(full_system_prompt, turn_knowledge.rules);
+    // Group history follows the same user-side reference path as retrieved
+    // passages, outside the system prompt and durable conversation history.
+    let group_context = super::group_buffer::prompt(ctx).await;
+    let group_user_part = super::group_buffer::with_context(&sanitized_text, &group_context);
     let user_part = crate::knowledge::auto_retrieve::with_passages(
-        &sanitized_text,
+        &group_user_part,
         turn_knowledge.block.as_deref(),
     );
     let effective_message = if pinned.is_empty() || !has_history {

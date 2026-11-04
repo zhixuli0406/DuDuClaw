@@ -17,8 +17,8 @@ use super::KNOWN_MCP_SCOPES;
 /// (§14.2 local data-file tools) and WP-D's `db:read` (§13.7 read-only
 /// SQL data sources).
 #[test]
-fn known_mcp_scopes_has_all_28_entries() {
-    assert_eq!(KNOWN_MCP_SCOPES.len(), 28);
+fn known_mcp_scopes_has_all_29_entries() {
+    assert_eq!(KNOWN_MCP_SCOPES.len(), 29);
     assert!(KNOWN_MCP_SCOPES.contains(&"knowledge:read"));
     assert!(KNOWN_MCP_SCOPES.contains(&"knowledge:write"));
     assert!(KNOWN_MCP_SCOPES.contains(&"discovery:execute"));

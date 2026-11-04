@@ -1,5 +1,4 @@
 //! Snapshot boundary for the long interactive onboarding/reset wizard.
-//! Test source is declared before its implementation; not compiled or run.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -83,9 +82,38 @@ impl OnboardConfigPlan {
     }
 }
 
+/// Reuse boot provisioning after the ordinary wizard commit and verified
+/// license/edition resolution, just like the gateway's first boot.
+pub(super) fn provision_login(home: &Path, personal: bool) -> Result<(), String> {
+    if !personal {
+        duduclaw_gateway::mcp_internal_key::ensure_internal_mcp_key_for_existing_config(home, personal)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_team_config_records_mfa_but_personal_config_is_unchanged() {
+        for personal in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let config = "[gateway]\nbind='127.0.0.1'\nport=18789\n";
+            OnboardConfigPlan::capture(home.path()).unwrap()
+                .commit_rendered(home.path(), |_| Ok(config.into())).unwrap();
+            provision_login(home.path(), personal).unwrap();
+            if personal {
+                assert_eq!(raw(home.path()), config);
+                assert!(!home.path().join("users.db").exists());
+            } else {
+                let table: toml::Table = raw(home.path()).parse().unwrap();
+                assert_eq!(table["auth"]["mfa_enforced"].as_bool(), Some(true));
+                let db = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+                assert!(db.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, bool>(0)).unwrap());
+            }
+        }
+    }
+
     fn raw(home: &Path) -> String {
         std::fs::read_to_string(home.join("config.toml")).unwrap()
     }

@@ -45,6 +45,73 @@ class CiWorkflowTests(unittest.TestCase):
         for job in self.jobs.values():
             self.assertNotIn("permissions", job)
 
+    def test_linux_release_smoke_trigger_and_safety_contract(self):
+        text = (ROOT / ".github/workflows/linux-release-smoke.yml").read_text()
+        smoke = yaml.load(text, Loader=yaml.BaseLoader)
+        self.assertEqual(set(smoke["on"]), {"pull_request", "workflow_dispatch"})
+        self.assertEqual(smoke["on"]["pull_request"], {"paths": [
+            ".github/workflows/release.yml", ".github/workflows/linux-release-smoke.yml",
+            "Cross.toml", ".cargo/**", "Cargo.lock", "Cargo.toml", "crates/*/Cargo.toml",
+            "scripts/check_glibc.py", "container/native-protected-launcher.sh",
+            "crates/duduclaw-cli/src/service/**", "crates/duduclaw-core/src/root_key*.rs",
+        ]})
+        self.assertEqual(smoke["permissions"], {"contents": "read"})
+        self.assertNotRegex(text, r"(?i)secrets\s*(?:\.|\[|\}\})")
+        self.assertEqual(set(smoke["jobs"]), {"build"})
+        job = smoke["jobs"]["build"]
+        self.assertNotIn("permissions", job)
+        self.assertNotIn("env", smoke)
+        self.assertNotIn("env", job)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["strategy"], {"fail-fast": "false", "matrix": {"target": [
+            "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+        ]}})
+        upload = next(s for s in job["steps"]
+                      if s.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertEqual(upload["with"], {
+            "name": "duduclaw-${{ matrix.target }}-smoke",
+            "path": "target/${{ matrix.target }}/release/duduclaw",
+            "if-no-files-found": "error", "retention-days": "3",
+        })
+        start = next(s for s in job["steps"] if s.get("name", "").startswith("Start x86_64"))
+        self.assertEqual(start["if"], "matrix.target == 'x86_64-unknown-linux-gnu'")
+        self.assertEqual(start["run"], 'docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/b:ro" ubuntu:22.04 /b/duduclaw --version')
+
+    def test_linux_release_smoke_matches_release_build_steps(self):
+        def build_job(name):
+            return yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(),
+                             Loader=yaml.BaseLoader)["jobs"]["build"]
+
+        release = build_job("release")
+        smoke = build_job("linux-release-smoke")
+        # Compare full ordered steps: action pins/options, commands, features,
+        # conditions, and environment must all follow the shipping Linux path.
+        prefixes = ("actions/setup-node@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
+        names = {"Install cross (Linux)", "Build frontend", "Check Linux glibc baseline"}
+        def linux_steps(job):
+            return [s for s in job["steps"]
+                    if s.get("uses", "").startswith(prefixes)
+                    or s.get("name") in names
+                    or s.get("run", "").startswith("cross build --release")]
+
+        expected = linux_steps(release)
+        self.assertEqual(len(expected), 7)
+        self.assertEqual(linux_steps(smoke), expected)
+        cache = next(s for s in smoke["steps"]
+                     if s.get("uses", "").startswith("Swatinem/rust-cache@"))
+        self.assertEqual(cache["with"]["save-if"], "false")
+        # An exact step allowlist also prevents publishing/signing or hidden
+        # cache writers from being introduced into this unprivileged PR build.
+        self.assertEqual(smoke["steps"][1:-2], expected)
+        for prefix in ("actions/checkout@", "actions/upload-artifact@"):
+            def action(job):
+                return next(s["uses"] for s in job["steps"]
+                            if s.get("uses", "").startswith(prefix))
+            self.assertEqual(action(smoke), action(release))
+        checkout = next(s["uses"] for s in release["steps"]
+                        if s.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(smoke["steps"][0], {"uses": checkout})
+
     def test_latest_runs_do_not_cancel_other_prs_or_main(self):
         concurrency = self.workflow["concurrency"]
         group = concurrency["group"]
@@ -155,7 +222,8 @@ class CiWorkflowTests(unittest.TestCase):
             configured = next(s for s in steps if s.get("uses") == cache)
             warmed = warm["jobs"][name]
             warm_cache = next(s for s in warmed["steps"] if s.get("uses") == cache)
-            self.assertEqual(configured["with"]["shared-key"], name + "-${{ matrix.target }}")
+            key_prefix = "release-cross-glibc231" if name == "release" else name
+            self.assertEqual(configured["with"]["shared-key"], key_prefix + "-${{ matrix.target }}")
             self.assertEqual(configured["with"]["save-if"], "false")
             self.assertNotIn("key", configured["with"])
             warm_options = dict(warm_cache["with"])
@@ -188,13 +256,15 @@ class CiWorkflowTests(unittest.TestCase):
                 if step.get("run", "").startswith(("cargo build --release", "cross build --release")):
                     self.assertIn(step, warm_steps)
             if name == "desktop-release":
+                for step_name in ("Install cross for Linux sidecar", "Build & stage gateway sidecar"):
+                    self.assertIn(next(s for s in steps if s.get("name") == step_name), warm_steps)
                 self.assertIn("src-tauri -> target", configured["with"]["workspaces"])
                 self.assertNotIn("rebuild_v1750_desktop", str(workflow))
                 shell_build = next(s for s in warm_steps if s.get("name") == "Build desktop Rust (no bundles)")
                 self.assertEqual(shell_build["working-directory"], "src-tauri")
                 self.assertEqual(shell_build["run"], "cargo tauri build --no-bundle --target ${{ matrix.target }}")
             else:
-                for step_name in ("Install cross (aarch64-linux)", "Build frontend"):
+                for step_name in ("Install cross (Linux)", "Build frontend"):
                     self.assertIn(next(s for s in steps if s.get("name") == step_name), warm_steps)
 
     def test_release_cache_warming_is_main_only_read_only_and_secretless(self):
@@ -425,7 +495,7 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertEqual(output.read_text(), "")
 
     def test_release_action_pins_and_cache_write_limits(self):
-        for name in ("release", "desktop-release", "docker-image", "computer-use-image", "release-cache-warm"):
+        for name in ("release", "desktop-release", "docker-image", "computer-use-image", "release-cache-warm", "linux-release-smoke"):
             text = (ROOT / f".github/workflows/{name}.yml").read_text()
             workflow = yaml.load(text, Loader=yaml.BaseLoader)
             for job in workflow["jobs"].values():

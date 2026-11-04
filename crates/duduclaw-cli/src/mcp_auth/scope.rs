@@ -17,6 +17,7 @@ pub enum Scope {
     WikiRead,
     WikiWrite,
     MessagingSend,
+    MessagingRead,
     /// RFC-21 §1: gates `identity_resolve` and friends. Distinct from
     /// `WikiRead` because operators may want to grant agents read access to
     /// the shared wiki *without* exposing the canonical person registry.
@@ -136,6 +137,7 @@ impl std::fmt::Display for Scope {
             Scope::WikiRead => "wiki:read",
             Scope::WikiWrite => "wiki:write",
             Scope::MessagingSend => "messaging:send",
+            Scope::MessagingRead => "messaging:read",
             Scope::IdentityRead => "identity:read",
             Scope::OdooRead => "odoo:read",
             Scope::OdooWrite => "odoo:write",
@@ -177,6 +179,7 @@ fn scope_from_str(s: &str) -> Option<Scope> {
         "wiki:read" => Scope::WikiRead,
         "wiki:write" => Scope::WikiWrite,
         "messaging:send" => Scope::MessagingSend,
+        "messaging:read" => Scope::MessagingRead,
         "identity:read" => Scope::IdentityRead,
         "odoo:read" => Scope::OdooRead,
         "odoo:write" => Scope::OdooWrite,
@@ -312,6 +315,7 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // ── Messaging / media egress ─────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "synthesize_speech"
         | "transcribe_audio" | "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "meeting_upload_link" => Some(Scope::MessagingSend),
+        "group_history_read" => Some(Scope::MessagingRead),
         // ── Agent Mail (P2-d) ────────────────────────────────────────────
         // Read and draft-send are separate grants. `mail_send` cannot
         // transmit (a human decision in `mail_worker::settle_outbox` does),

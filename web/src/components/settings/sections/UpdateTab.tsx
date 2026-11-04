@@ -246,6 +246,7 @@ export function UpdateTab() {
     }
   };
 
+  const isManual = updateInfo?.install_method === 'manual';
   const isHomebrew = updateInfo?.install_method === 'homebrew';
   const isDesktop = updateInfo?.install_method === 'desktop';
   // Containerized deployment: the image is immutable, so an in-process
@@ -269,6 +270,7 @@ export function UpdateTab() {
   const noBinary =
     updateInfo?.available &&
     !updateInfo.download_url &&
+    !isManual &&
     !isProNoChannel &&
     !usesProvider &&
     !isContainerized;
@@ -280,6 +282,7 @@ export function UpdateTab() {
     !isHomebrew &&
     !isDesktop &&
     !noBinary &&
+    !isManual &&
     !isProNoChannel &&
     !isContainerized &&
     (!!updateInfo?.download_url || usesProvider);
@@ -293,7 +296,7 @@ export function UpdateTab() {
           // Restarting is the gateway's own job; containers and the desktop
           // sidecar restart through their owner instead.
           restartPendingVersion:
-            isContainerized || isDesktop ? null : (updateInfo.restart_pending_version ?? null),
+            isContainerized || isDesktop || isManual ? null : (updateInfo.restart_pending_version ?? null),
         },
         desktop,
       )
@@ -523,6 +526,15 @@ export function UpdateTab() {
                   <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap text-xs text-muted-foreground">
                     {updateInfo.release_notes}
                   </pre>
+                </div>
+              )}
+
+              {isManual && (
+                <div className="rounded-lg bg-muted/60 p-4 ring-1 ring-inset ring-surface-border">
+                  <p className="text-sm text-muted-foreground">
+                    {intl.formatMessage({ id: 'settings.update.nativeProtectedHint' })}
+                  </p>
+                  <code className="mt-2 block break-all text-xs">sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux</code>
                 </div>
               )}
 

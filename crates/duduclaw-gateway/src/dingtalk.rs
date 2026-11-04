@@ -335,6 +335,7 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
     // (group robots are normally only called when mentioned, so absent ⇒
     // mentioned).
     let is_group = payload.get("conversationType").and_then(|v| v.as_str()) == Some("2");
+    let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, is_group, "dingtalk", "global", &conversation_id, None, payload.get("msgId").and_then(|v| v.as_str()).unwrap_or(""), &sender, payload.get("senderNick").and_then(|v| v.as_str()).unwrap_or(&sender), &text).await;
     let mentioned = payload
         .get("isInAtList")
         .and_then(|v| v.as_bool())
@@ -452,14 +453,14 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         None,
     );
     let on_progress = thinking.wrap(on_progress);
-    let guarded = thinking
+    let guarded = group_turn.scope(thinking
         .scope(build_guarded_reply_with_session(
             &text,
             &state.ctx,
             &session_id,
             crate::ccr_runtime::reply_principal_for_sender(&sender),
             Some(on_progress),
-        ))
+        )))
         .await;
     let thinking_footer = thinking.finish().await;
     if guarded.text.trim().is_empty() {
@@ -478,7 +479,8 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         guarded.text.clone(),
         thinking_footer.as_ref(),
     );
-    send_via_webhook_guarded(&state.http, &session_webhook, &reply_text, true, &guarded).await;
+    group_turn.delivery(&state.ctx, guarded.answered_by.as_ref(), None)
+        .scope(send_via_webhook_guarded(&state.http, &session_webhook, &reply_text, true, &guarded)).await;
 }
 
 async fn send_via_webhook_guarded(
@@ -487,7 +489,7 @@ async fn send_via_webhook_guarded(
     text: &str,
     try_markdown: bool,
     guarded: &crate::channel_reply::GuardedReply,
-) {
+) -> bool {
     for chunk in crate::channel_format::split_text(text, DINGTALK_TEXT_CHUNK) {
         if !guarded.still_valid().await {
             send_via_webhook(
@@ -497,7 +499,7 @@ async fn send_via_webhook_guarded(
                 false,
             )
             .await;
-            return;
+            return false;
         }
         let mut delivered = false;
         if try_markdown {
@@ -516,7 +518,7 @@ async fn send_via_webhook_guarded(
                     false,
                 )
                 .await;
-                return;
+                return false;
             }
             let body = serde_json::json!({
                 "msgtype": "text",
@@ -524,10 +526,12 @@ async fn send_via_webhook_guarded(
             });
             if !post_webhook(http, webhook, &body).await {
                 warn!("DingTalk webhook send failed — dropping remaining chunks");
-                return;
+                return false;
             }
         }
+        crate::channel_reply::group_buffer::delivered(&chunk, None).await;
     }
+    true
 }
 
 /// POST to a sessionWebhook. `try_markdown = true` sends msgtype `markdown`

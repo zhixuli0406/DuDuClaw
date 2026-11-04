@@ -3629,7 +3629,32 @@ mod compat_feature_gate_tests {
 #[derive(Subcommand)]
 enum ServiceCommands {
     /// Install DuDuClaw as a system service
-    Install,
+    Install {
+        /// Install the root-protected native Linux system service (requires sudo)
+        #[arg(long)]
+        protected_linux: bool,
+        /// Acknowledge that this executable was verified before running sudo
+        #[arg(long, requires = "protected_linux")]
+        i_verified_this_binary: bool,
+        /// Enable and start the protected system service
+        #[arg(long, requires = "protected_linux")]
+        enable_now: bool,
+        /// Copy an existing .duduclaw data directory into the service account
+        #[arg(long, requires = "protected_linux")]
+        migrate_from: Option<std::path::PathBuf>,
+        /// Preserve the existing destination as a backup and replace it
+        #[arg(long, requires = "migrate_from")]
+        force_migrate: bool,
+    },
+
+    /// Upgrade using the already installed, root-owned protected executable
+    Upgrade {
+        #[arg(long, required = true)]
+        protected_linux: bool,
+        /// Official release version (X.Y.Z); defaults to latest
+        #[arg(long)]
+        version: Option<String>,
+    },
 
     /// Start the background service
     Start,
@@ -3651,7 +3676,11 @@ enum ServiceCommands {
     },
 
     /// Uninstall the system service
-    Uninstall,
+    Uninstall {
+        /// Remove the native Linux system service, retaining data and root key
+        #[arg(long)]
+        protected_linux: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5526,8 +5555,17 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
-            ServiceCommands::Install => {
-                service::handle_service(service::ServiceAction::Install).await
+            ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary } => {
+                if protected_linux {
+                    service::protected_linux::install(service::protected_linux::InstallOptions {
+                        enable_now, migrate_from, force_migrate, i_verified_this_binary,
+                    })
+                } else {
+                    service::handle_service(service::ServiceAction::Install).await
+                }
+            }
+            ServiceCommands::Upgrade { protected_linux: _, version } => {
+                service::protected_linux::upgrade(version.as_deref()).await
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
@@ -5538,8 +5576,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             ServiceCommands::Logs { lines } => {
                 service::handle_service(service::ServiceAction::Logs { lines }).await
             }
-            ServiceCommands::Uninstall => {
-                service::handle_service(service::ServiceAction::Uninstall).await
+            ServiceCommands::Uninstall { protected_linux } => {
+                if protected_linux { service::protected_linux::uninstall() }
+                else { service::handle_service(service::ServiceAction::Uninstall).await }
             }
         },
         // T5/O10: `duduclaw migrate [schema|from|data]`. Bare `migrate` keeps
@@ -8196,11 +8235,14 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                         style("App-Level Token").yellow()
                     );
                     println!(
-                        "    6. 在 OAuth Scopes 加入：{}, {}, {}",
+                        "    6. 在 OAuth Scopes 加入：{}, {}, {}, {}, {}",
                         style("chat:write").yellow(),
                         style("channels:read").yellow(),
-                        style("app_mentions:read").yellow()
+                        style("app_mentions:read").yellow(),
+                        style("channels:history").yellow(),
+                        style("groups:history").yellow()
                     );
+                    println!("       訂閱 Bot Events：app_mention、message.channels、message.groups");
                     println!("    ℹ Slack 使用 Socket Mode，無需公開 URL");
                     println!();
                     println!(
@@ -8515,6 +8557,11 @@ discord_bot_token_enc = "{discord_token_enc}"
     );
     config_plan.commit_rendered(&home, |_| Ok(config_content))
         .map_err(|e|DuDuClawError::Config(format!("Failed to write {}: {e}",config_path.display())))?;
+    let (_license, edition) = duduclaw_gateway::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home.clone(), None,
+    ).await;
+    onboard_config::provision_login(&home, edition.is_personal())
+        .map_err(DuDuClawError::Config)?;
     println!("  {} {}", style("✓").green(), config_path.display());
 
     // inference.toml (only for local / hybrid modes)
@@ -11617,7 +11664,10 @@ async fn cmd_restore(file: PathBuf, force: bool) -> duduclaw_core::error::Result
             console::style("!").yellow()
         );
     }
-    portability::import_archive(&file, &home, force)?;
+    let (_license, edition) = duduclaw_gateway::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home.clone(), None,
+    ).await;
+    portability::import_archive(&file, &home, force, edition.is_personal())?;
     println!(
         "{} Restored into {}",
         console::style("✓").green(),
@@ -11999,7 +12049,10 @@ async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Re
     println!("Importing personal-edition data...");
     println!("  Archive: {}", file.display());
     println!("  Home:    {}", home.display());
-    portability::import_archive(&file, &home, force)?;
+    let (_license, edition) = duduclaw_gateway::license_runtime::LicenseRuntime::bootstrap_with_edition(
+        home.clone(), None,
+    ).await;
+    portability::import_archive(&file, &home, force, edition.is_personal())?;
     println!(
         "{} Imported into {}. Restart with `duduclaw start`.",
         console::style("✓").green(),

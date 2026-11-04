@@ -1,0 +1,80 @@
+name: Linux release smoke
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/linux-release-smoke.yml'
+      - 'Cross.toml'
+      - '.cargo/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'scripts/check_glibc.py'
+      - 'container/native-protected-launcher.sh'
+      - 'crates/duduclaw-cli/src/service/**'
+      - 'crates/duduclaw-core/src/root_key*.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux release smoke ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      # Keep Linux setup/build steps identical to release.yml; enforced by
+      # scripts/tests/test_ci_workflow.py. This is an advisory PR build only.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          # Restore the release cache without saving PR or manual build results.
+          shared-key: release-cross-glibc231-${{ matrix.target }}
+          workspaces: . -> target
+          save-if: false
+
+      - name: Install cross (Linux)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b  # v2
+        with:
+          tool: cross
+
+      - name: Build frontend
+        run: cd web && npm ci --legacy-peer-deps && npm run build
+
+      - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
+        if: runner.os == 'Linux'
+        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+        env:
+          PKG_CONFIG_ALLOW_CROSS: 1
+
+      - name: Check Linux glibc baseline
+        if: runner.os == 'Linux'
+        run: python3 scripts/check_glibc.py target/${{ matrix.target }}/release/duduclaw
+
+      - name: Start x86_64 binary on Ubuntu 22.04 (glibc 2.35)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/b:ro" ubuntu:22.04 /b/duduclaw --version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: duduclaw-${{ matrix.target }}-smoke
+          path: target/${{ matrix.target }}/release/duduclaw
+          if-no-files-found: error
+          retention-days: 3

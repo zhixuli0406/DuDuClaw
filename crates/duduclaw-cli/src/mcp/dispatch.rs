@@ -374,6 +374,7 @@ pub(crate) async fn handle_tools_call(
                 .await
         }
         // Channel settings tools
+        "group_history_read" => group_history::handle(&arguments, home_dir, caller_client_id, default_agent).await,
         "channel_config" => handle_channel_config(&arguments, home_dir).await,
         "channel_config_list" => handle_channel_config_list(&arguments, home_dir).await,
         "channel_status" => handle_channel_status(&arguments, home_dir).await,

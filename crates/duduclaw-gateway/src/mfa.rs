@@ -84,15 +84,14 @@ fn parse_policy(text: &str) -> Result<bool, String> {
 
 /// Restore must preserve the live policy; an unreadable policy defaults to strict.
 pub(crate) fn restore_policy(home: &Path) -> bool {
+    // No Admin could have disabled enforcement without an identity store.
+    // Personal runtime exemption never changes the persisted policy.
+    if policy_store_is_absent(home) { return true; }
     crate::handlers::config_commit::read_regular_config(&home.join("config.toml"))
         .ok().and_then(|text| {
             let table: toml::Table = text.parse().ok()?;
             if table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() {
-                if policy_store_is_absent(home) {
-                    Some(false)
-                } else {
-                    read_policy_state(home).ok()
-                }
+                read_policy_state(home).ok()
             } else { parse_policy(&text).ok() }
         }).unwrap_or(true)
 }
@@ -190,16 +189,13 @@ fn record_policy(home: &Path, value: bool) -> Result<Option<i64>, String> {
 /// Read the durable boundary without creating/migrating the identity store.
 /// This reader is strict; boot_policy separately handles a genuinely absent store.
 fn read_policy_state(home: &Path) -> Result<bool, String> {
-    use rusqlite::OptionalExtension;
     let db = rusqlite::Connection::open_with_flags(
         home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ).map_err(|e| e.to_string())?;
-    db.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0))
-        .optional().map(|v| v.unwrap_or(false)).map_err(|e| e.to_string())
+    duduclaw_auth::mfa::read_enforcement(&db)
 }
 
 fn read_boot_policy_state(home: &Path) -> Result<bool, String> {
-    use rusqlite::OptionalExtension;
     let path = home.join("users.db");
     if !std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?.file_type().is_file() {
         return Err("users.db must be a regular file".into());
@@ -207,10 +203,9 @@ fn read_boot_policy_state(home: &Path) -> Result<bool, String> {
     let db = rusqlite::Connection::open_with_flags(
         path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ).map_err(|e| e.to_string())?;
-    match db.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get(0)).optional() {
-        Ok(value) => Ok(value.unwrap_or(false)),
-        Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
-            if message == "no such table: mfa_policy_state" => {
+    match duduclaw_auth::mfa::read_enforcement(&db) {
+        Ok(value) => Ok(value),
+        Err(message) if message == "no such table: mfa_policy_state" => {
             // Only a wholly pre-MFA schema may pass without a recorded policy.
             let legacy: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND lower(name)='users')
@@ -223,11 +218,34 @@ fn read_boot_policy_state(home: &Path) -> Result<bool, String> {
     }
 }
 
+/// Boot precheck runs before UserDb migration. Accept only the released
+/// unseeded state here, without weakening readers used by config/import gates.
+pub(crate) fn precheck_boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
+    if matches!(read_boot_policy_state(home), Err(error) if error == "MFA policy singleton missing") {
+        let db = rusqlite::Connection::open_with_flags(
+            home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).map_err(|e| e.to_string())?;
+        // Project both columns so an empty but malformed table is still refused.
+        let mut statement = db.prepare("SELECT id, enforced FROM mfa_policy_state")
+            .map_err(|e| e.to_string())?;
+        let empty = statement.query([]).map_err(|e| e.to_string())?
+            .next().map_err(|e| e.to_string())?.is_none();
+        let legacy: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND lower(name)='users')
+             AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND lower(name)='mfa_policy_state')",
+            [], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if empty && legacy { return Ok(false); }
+        return Err("MFA policy state is not a legacy unseeded store".into());
+    }
+    boot_policy(home, personal)
+}
+
 pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
     // An absent directory entry needs no policy read.
     // A dangling symlink or any other existing but unreadable store must fail closed.
     if policy_store_is_absent(home) {
-        return Ok(false);
+        return Ok(!personal);
     }
     let policy = if personal { read_policy_state(home) } else { read_boot_policy_state(home) };
     match policy {
@@ -241,7 +259,7 @@ pub(crate) fn boot_policy(home: &Path, personal: bool) -> Result<bool, String> {
     }
 }
 
-fn policy_store_is_absent(home: &Path) -> bool {
+pub(crate) fn policy_store_is_absent(home: &Path) -> bool {
     matches!(std::fs::symlink_metadata(home.join("users.db")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
@@ -250,6 +268,9 @@ fn policy_store_is_absent(home: &Path) -> bool {
 /// the durable policy by adding false. Only the Admin MFA adapter may do so.
 pub(crate) fn refuse_policy_change_at(home: &Path, before: &str, after: &str) -> Result<(), String> {
     refuse_policy_change(before, after)?;
+    // Even an unchanged explicit key must not let an ordinary save repair
+    // a corrupt store via the subsequent policy reload.
+    if !policy_store_is_absent(home) { read_boot_policy_state(home)?; }
     let before_table: toml::Table = before.parse().map_err(|_| "登入設定格式不正確。")?;
     let after_table: toml::Table = after.parse().map_err(|_| "登入設定格式不正確。")?;
     if before_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none()
@@ -259,6 +280,46 @@ pub(crate) fn refuse_policy_change_at(home: &Path, before: &str, after: &str) ->
         return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更。".into());
     }
     Ok(())
+}
+
+/// Imports reject policy changes before replacing any data, including users.db.
+/// Unlike restore, the caller supplies the verified edition.
+pub(crate) fn refuse_import_policy_change(home: &Path, after: &str, personal: bool, replaces_identity: bool) -> Result<String, String> {
+    let before = match crate::handlers::config_commit::read_regular_config(&home.join("config.toml")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let configured = parse_policy(&before)?;
+    let table: toml::Table = before.parse().map_err(|_| "登入設定格式不正確。")?;
+    let absent = policy_store_is_absent(home);
+    // Always validate an existing store, even with an explicit false key.
+    let fallback = if absent { !personal } else { read_boot_policy_state(home)? };
+    let current = if (absent && !personal)
+        || table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none() { fallback }
+        else { configured || (!absent && fallback) };
+    let parsed_after = parse_policy(after)?;
+    let after_table: toml::Table = after.parse().map_err(|_| "登入設定格式不正確。")?;
+    let missing_key = after_table.get("auth").and_then(|a| a.get("mfa_enforced")).is_none();
+    if !missing_key && !parsed_after && fallback {
+        return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更（system.update_config，需 expected_state）；請保留目前設定。".into());
+    }
+    // Personal may replace identity without an explicit key, but the imported
+    // config must carry the live policy so reload cannot trust the archived DB.
+    if personal && replaces_identity && missing_key {
+        return if current || fallback { preserve_restore_policy(after, true) }
+            else { Ok(after.to_owned()) };
+    }
+    let next = if !replaces_identity && missing_key { fallback }
+        else { parsed_after };
+    if current != next {
+        return Err("auth.mfa_enforced 只能透過雙因素驗證專用開關變更（system.update_config，需 expected_state）；請保留目前設定。".into());
+    }
+    if personal && missing_key && current {
+        preserve_restore_policy(after, true)
+    } else {
+        Ok(after.to_owned())
+    }
 }
 
 pub(crate) fn audit_policy_restored(home: &Path) {
@@ -339,6 +400,96 @@ pub(crate) fn replacement_session(
 mod tests {
     use super::*;
     #[test]
+    fn mfa_import_preserves_persisted_policy_across_edition_identity_and_archive_key() {
+        let home = tempfile::tempdir().unwrap();
+        let config = "[auth]\nmfa_enforced=true\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        for personal in [true, false] {
+            for replaces_identity in [false, true] {
+                for key in [None, Some(true), Some(false)] {
+                    let after = key.map(|value| format!("[auth]\nmfa_enforced={value}\n")).unwrap_or_default();
+                    let result = refuse_import_policy_change(home.path(), &after, personal, replaces_identity);
+                    let allowed = key == Some(true) || (key.is_none() && (personal || !replaces_identity));
+                    assert_eq!(result.is_ok(), allowed, "personal={personal}, replaces_identity={replaces_identity}, key={key:?}: {result:?}");
+                    if let Ok(prepared) = result {
+                        if personal && key.is_none() {
+                            assert!(parse_policy(&prepared).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced='false'", true, true).is_err());
+        assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), config);
+        assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+    }
+
+    #[test]
+    fn mfa_keyless_agent_only_import_allows_policy_increase_only() {
+        for configured in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), format!("[auth]\nmfa_enforced={configured}\n")).unwrap();
+            drop(UserDb::new(&home.path().join("users.db")).unwrap());
+            let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            duduclaw_auth::mfa::record_enforcement(&mut conn, !configured, 123).unwrap();
+            for personal in [true, false] {
+                let result = refuse_import_policy_change(home.path(), "", personal, false);
+                if configured {
+                    assert!(result.is_err());
+                } else {
+                    let prepared = result.unwrap();
+                    if personal {
+                        assert!(parse_policy(&prepared).unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mfa_import_never_lowers_durable_true_even_with_explicit_live_false() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        for personal in [true, false] {
+            for replaces_identity in [true, false] {
+                assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=false\n", personal, replaces_identity).is_err());
+            }
+        }
+        let prepared = refuse_import_policy_change(home.path(), "", true, true).unwrap();
+        assert!(parse_policy(&prepared).unwrap());
+        assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
+    }
+
+    #[test]
+    fn mfa_import_degraded_config_false_durable_true_uses_durable_floor() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+
+        for personal in [true, false] {
+            for replaces_identity in [true, false] {
+                assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=true\n", personal, replaces_identity).is_ok());
+                assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=false\n", personal, replaces_identity).is_err());
+            }
+        }
+        // Keyless imports follow the pre-existing table: identity replacement
+        // preserves the durable policy for personal imports; other imports refuse.
+        assert!(parse_policy(&refuse_import_policy_change(home.path(), "", true, true).unwrap()).unwrap());
+        let prepared = refuse_import_policy_change(home.path(), "", true, false).unwrap();
+        assert!(parse_policy(&prepared).unwrap());
+        assert!(refuse_import_policy_change(home.path(), "", false, true).is_err());
+        assert!(refuse_import_policy_change(home.path(), "", false, false).is_ok());
+    }
+
+    #[test]
     fn boot_policy_legacy_store_allows_migration_then_reads_durable_policy() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("users.db");
@@ -351,14 +502,64 @@ mod tests {
         assert!(!boot_policy(home.path(), false).unwrap());
         assert!(read_policy_state(home.path()).is_err());
         assert!(refuse_policy_change_at(home.path(), "", "[auth]\nmfa_enforced=false").is_err());
+        crate::mcp_internal_key::ensure_internal_mcp_key_for_gateway(
+            home.path(), "127.0.0.1:18789".parse().unwrap(), false, None,
+        ).unwrap();
+        assert!(read_policy_state(home.path()).is_err());
         let _db = UserDb::new(&path).unwrap();
+        reload_policy(home.path());
         assert!(!read_policy_state(home.path()).unwrap());
+        assert!(!conn.query_row("SELECT enforced FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, bool>(0)).unwrap());
         assert!(!boot_policy(home.path(), false).unwrap());
         duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
         assert!(boot_policy(home.path(), false).unwrap());
         conn.execute_batch("DROP TABLE mfa_policy_state").unwrap();
         assert!(boot_policy(home.path(), false).is_err());
         assert_eq!(policy_status(home.path())["degraded"], true);
+    }
+
+    #[test]
+    fn mfa_explicit_false_reload_cannot_repair_missing_singleton() {
+        let home = tempfile::tempdir().unwrap();
+        drop(UserDb::new(&home.path().join("users.db")).unwrap());
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+        reload_policy(home.path());
+        assert!(enforced(home.path(), false).unwrap());
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute("DELETE FROM mfa_policy_state", []).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
+        // This is a live-store deletion after initialization, not an upgrade.
+        // Reload must not run migration or repair it, even with explicit false.
+        assert!(read_policy_state(home.path()).is_err());
+        assert!(read_boot_policy_state(home.path()).is_err());
+        assert!(refuse_policy_change_at(home.path(), "[auth]\nmfa_enforced=false", "[auth]\nmfa_enforced=false").is_err());
+        assert!(refuse_import_policy_change(home.path(), "[auth]\nmfa_enforced=false", false, true).is_err());
+        reload_policy(home.path());
+        assert!(enforced(home.path(), false).unwrap());
+        assert_eq!(policy_status(home.path())["degraded"], true);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM mfa_policy_state", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn mfa_invalid_singleton_refuses_boot_and_config_write() {
+        for rows in ["", "(1,0),(1,0)", "(1,2)", "(1,'false')", "(1,NULL)", "(2,0)"] {
+            let home = tempfile::tempdir().unwrap();
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            conn.execute_batch("CREATE TABLE users(id TEXT); CREATE TABLE mfa_policy_state(id, enforced);").unwrap();
+            if !rows.is_empty() {
+                conn.execute_batch(&format!("INSERT INTO mfa_policy_state VALUES {rows}")).unwrap();
+            }
+            if rows.is_empty() {
+                assert!(!precheck_boot_policy(home.path(), false).unwrap());
+            } else {
+                assert!(precheck_boot_policy(home.path(), false).is_err(), "{rows}");
+            }
+            assert!(read_policy_state(home.path()).is_err(), "{rows}");
+            assert!(read_boot_policy_state(home.path()).is_err(), "{rows}");
+            assert!(boot_policy(home.path(), false).is_err(), "{rows}");
+            assert_eq!(policy_status(home.path())["degraded"], true);
+            assert!(refuse_policy_change_at(home.path(), "", "[auth]\nmfa_enforced=false").is_err(), "{rows}");
+        }
     }
 
     #[test]
@@ -415,12 +616,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mfa_restore_missing_store_is_false_but_existing_unreadable_store_is_strict() {
+    fn mfa_restore_missing_or_unreadable_store_is_strict() {
         let home = tempfile::tempdir().unwrap();
         let config = "[gateway]\nport = 18789\n";
         std::fs::write(home.path().join("config.toml"), config).unwrap();
-        assert!(!restore_policy(home.path()));
-        assert!(!restore_policy_differs(home.path(), config));
+        assert!(restore_policy(home.path()));
+        assert!(restore_policy_differs(home.path(), config));
 
         let db = home.path().join("users.db");
         std::fs::write(&db, b"not a sqlite database").unwrap();

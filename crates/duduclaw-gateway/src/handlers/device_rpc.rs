@@ -464,8 +464,9 @@ impl MethodHandler {
     /// `POST /api/device/backup-upload` (`server.rs`) —
     /// `is_within_upload_dir` fail-closed rejects anything else, so a
     /// caller cannot point this at an arbitrary filesystem path. Extracts
-    /// into the restore staging dir under the shared `RestoreLimits` gate,
-    /// then writes the pending-restore marker. Nothing destructive happens
+    /// into a fresh private directory under the shared `RestoreLimits` gate,
+    /// then publishes it and the pending marker under the per-home restore lock.
+    /// An existing pending restore is refused without touching its data. Nothing destructive happens
     /// in this call — the actual swap runs once, at the next gateway boot
     /// (`crate::backup_restore::perform_pending_restore_swap`, wired into
     /// `server.rs::start_gateway`).
@@ -479,61 +480,36 @@ impl MethodHandler {
         }
 
         let home = self.home_dir().to_path_buf();
-        let staging = crate::backup_restore::staging_dir(&home);
-        let limits = crate::backup_restore::RestoreLimits::from_home(&home);
-
-        let extract_result = {
+        let result = {
             let src = src.to_path_buf();
-            let staging = staging.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::backup_restore::extract_tar_gz_safely(&src, &staging, &limits)
-            })
-            .await
+            tokio::task::spawn_blocking(move || crate::backup_restore::stage_restore(&home, &src))
+                .await
         };
-        let report = match extract_result {
+        let report = match result {
             Ok(Ok(report)) => report,
-            Ok(Err(violation)) => {
+            Ok(Err(message)) => {
                 return WsFrame::Response {
                     id: String::new(),
                     ok: false,
                     payload: None,
-                    error: Some(
-                        json!({ "code": "restore_rejected", "message": violation.to_string() }),
-                    ),
+                    error: Some(json!({ "code": "restore_rejected", "message": message })),
                 };
             }
             Err(e) => {
-                return WsFrame::error_response("", &format!("還原解壓時發生內部錯誤: {e}"));
+                return WsFrame::error_response("", &format!("還原暫存時發生內部錯誤: {e}"));
             }
         };
+        let mfa_notice = report.mfa_notice.then_some(crate::mfa::RESTORE_POLICY_NOTICE);
 
-        let source_filename = src
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let restore_root = crate::backup_restore::resolve_restore_root(&staging, &home);
-        let mfa_notice = std::fs::read_to_string(restore_root.join("config.toml"))
-            .map(|text| crate::mfa::restore_policy_differs(&home, &text))
-            .unwrap_or(true)
-            .then_some(crate::mfa::RESTORE_POLICY_NOTICE);
-        let marker = crate::backup_restore::RestoreMarker {
-            staged_at: Utc::now(),
-            source_filename,
-        };
-        if let Err(e) = crate::backup_restore::write_marker(&home, &marker) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return WsFrame::error_response("", &format!("寫入還原標記失敗: {e}"));
-        }
-
-        // Best-effort: the uploaded file's content is now safely inside
-        // `staging`; keeping the original around only wastes disk.
+        // Delete only after staged files, directories and marker are durably published.
+        // A failed publication returns above and retains the uploaded archive.
         let _ = std::fs::remove_file(src);
 
         WsFrame::ok_response(
             "",
             json!({
                 "staged": true,
-                "files_written": report.files_written,
+                "files_written": report.extraction.files_written,
                 "restart_required": true,
                 "notice": mfa_notice,
             }),

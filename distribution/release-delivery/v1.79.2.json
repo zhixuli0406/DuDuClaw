@@ -1,0 +1,44 @@
+{
+  "delta_sha256": "d59829947923462a355dac60a074c48f98978267b12959774ca1a953ed2aed62",
+  "expires_at": "2026-11-17T13:32:55.748038+00:00",
+  "issued_at": "2026-11-03T13:32:55.748038+00:00",
+  "items": {
+    "company_site": {
+      "artifact_sha256": "b01f8e819d920040dfb6b0498c0cf0d895acd7d3179b46d25b30341a62dd08a1",
+      "evidence_sha256": "4f489d469ad10e5972fe45c1c0e7c836a3cce00425a3ea080036c2bb447380f2",
+      "reason_sha256": "7471e8e5d77fa9d8cf452f22d5342aa7cef2466fe1fcfab5968f1ddc40f27055",
+      "status": "unchanged"
+    },
+    "it_manual": {
+      "artifact_sha256": "cec999dcccb11c5b4f7888843bf7e29ec7102dabc08c3770ece9d49f760aa5d3",
+      "evidence_sha256": "4f489d469ad10e5972fe45c1c0e7c836a3cce00425a3ea080036c2bb447380f2",
+      "reason_sha256": "7471e8e5d77fa9d8cf452f22d5342aa7cef2466fe1fcfab5968f1ddc40f27055",
+      "status": "unchanged"
+    },
+    "os_site": {
+      "artifact_sha256": "d54780a7133ad3d0ec0034409b5f32cadf8d292e3e3bd121da733ccca42b32b8",
+      "evidence_sha256": "4f489d469ad10e5972fe45c1c0e7c836a3cce00425a3ea080036c2bb447380f2",
+      "reason_sha256": "7471e8e5d77fa9d8cf452f22d5342aa7cef2466fe1fcfab5968f1ddc40f27055",
+      "status": "unchanged"
+    },
+    "product_site": {
+      "artifact_sha256": "35210255f07a6f5a8da5898f30aa2c786cc547d3f4fb539eec0f6474c3dfa377",
+      "evidence_sha256": "4f489d469ad10e5972fe45c1c0e7c836a3cce00425a3ea080036c2bb447380f2",
+      "reason_sha256": "7471e8e5d77fa9d8cf452f22d5342aa7cef2466fe1fcfab5968f1ddc40f27055",
+      "status": "unchanged"
+    },
+    "user_manual": {
+      "artifact_sha256": "1240bc3df200fe8365b2bea0e86e437ded6af6b4f88154b1fcbcb0d5b7582a1e",
+      "evidence_sha256": "4f489d469ad10e5972fe45c1c0e7c836a3cce00425a3ea080036c2bb447380f2",
+      "reason_sha256": "7471e8e5d77fa9d8cf452f22d5342aa7cef2466fe1fcfab5968f1ddc40f27055",
+      "status": "unchanged"
+    }
+  },
+  "lane": "hotfix",
+  "previous_tag": "v1.79.1",
+  "private_review_sha256": "68c6122b326e3ed0ba7f484dab416be61b6bc34d7ba77974366729f6fd72a4e1",
+  "review_kind": "automatic-hotfix-retention",
+  "schema": 2,
+  "source_commit": "8d45f65b8c8b9351b465aee300e5597c8504146f",
+  "version": "1.79.2"
+}
