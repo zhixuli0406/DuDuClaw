@@ -195,7 +195,7 @@ fn snooze_cap_resurface_expiry_and_local_roundtrip() {
 #[test]
 fn arrival_never_opens_card_or_moves_selection_and_sending_waits_for_refetch() {
     let mut m = model(); m.inbox.items.push(approval(json!({})));
-    let now = Instant::now(); let mut app = App::default(); app.refresh(&m);
+    let now = Instant::now(); let mut app = App::default(); app.refresh(&m); app.key(key('I'), &m);
     let selected = app.selected.clone(); m.inbox.items.insert(0,goal("needs_human")); app.refresh(&m);
     assert_eq!(app.selected,selected); assert!(app.card.is_none());
     assert_eq!(app.key_at(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&m,now,1000),Action::None);

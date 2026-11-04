@@ -1,6 +1,5 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
-assertion_line: 1158
-expression: rendered.lines().nth(2).unwrap().trim_end()
+expression: "rendered.lines().find(|line|\nline.starts_with(\"[焦點：\")).unwrap().trim_end()"
 ---
-
+[焦點：清單]

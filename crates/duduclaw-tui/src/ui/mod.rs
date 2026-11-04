@@ -15,6 +15,7 @@ mod card_tests;
 mod backend;
 mod osc11;
 mod panels;
+mod workspace;
 mod chat_render;
 pub mod render;
 pub(crate) mod terminal;
@@ -111,7 +112,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             if generation != block_generation {
                 block_generation = generation; app.blocks.invalidate(); app.logs = crate::blocks::LogTail::default();
                 block_cursor = crate::blocks::EventCursor::default();
-                for pane in &mut app.blocks.panes { pane.data.subscription_checked = false; pane.data.subscribed = false; }
+                for pane in app.blocks.panes.iter_mut().chain(&mut app.blocks.parked) { pane.data.subscription_checked = false; pane.data.subscribed = false; }
             }
             if !m2::manager(&model) { app.logs = crate::blocks::LogTail::default(); }
             for _ in 0..256 {
@@ -153,7 +154,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 }
             }
             app.refresh(&model);
-            chat.retain(app.blocks.panes.iter().filter(|p| p.kind == crate::blocks::Block::Chat).map(|p| p.id.clone()).collect());
+            chat.retain(app.blocks.chat_ids());
             if chat_state.has_changed().unwrap_or(false) {
                 app.sync_chats(&chat_state.borrow_and_update());
             }
@@ -242,7 +243,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     }
                     Action::Chat(input) => {
                         let agent = input.agent.clone();
-                        let active = app.blocks.panes.iter().filter(|p| p.kind == crate::blocks::Block::Chat).map(|p| p.id.clone()).collect();
+                        let active = app.blocks.chat_ids();
                         match chat.send(&app.blocks.panes[app.blocks.focused].id, input, active) {
                             Ok(()) => {
                                 app.input.clear(); app.chat_scroll = 0; app.notice = None; app.chat.running = true;

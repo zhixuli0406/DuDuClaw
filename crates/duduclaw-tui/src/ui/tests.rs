@@ -178,17 +178,14 @@ fn selected_employee_row_uses_semantic_selection_tokens() {
     let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
     t.draw(|f| render::draw(f, &m, &connection(), &TerminalText::new("home".into()), &mut a, &Settings::test_defaults())).unwrap();
     let buffer = t.backend().buffer();
-    let (name_y, _) = (0..buffer.area.height)
+    let (name_y, name_x) = (0..buffer.area.height)
         .find_map(|y| {
-            (0..buffer.area.width)
+            (0..28)
                 .find(|&x| buffer[(x, y)].symbol() == "阿")
                 .map(|x| (y, x))
         })
         .unwrap();
-    let marker = (1..buffer.area.width)
-        .map(|x| &buffer[(x, name_y)])
-        .find(|cell| cell.symbol() == ">")
-        .unwrap();
+    let marker = &buffer[(name_x, name_y)];
     assert_ne!(marker.fg, Color::Yellow);
     assert_eq!(marker.fg, Settings::test_defaults().colors.selection_fg);
     assert!(marker.modifier.contains(Modifier::BOLD));
@@ -216,7 +213,7 @@ fn non_admin_screen() {
     let mut a = App::default();
     a.refresh(&m);
     let output = screen(&m, &a, &Settings::test_defaults(), 100, 30);
-    assert!(output.contains(strings::ADMIN_ONLY));
+    assert!(!output.contains(strings::NEXT_RUNS));
     assert!(!output.contains("11:00"));
     insta::assert_snapshot!(output);
 }
@@ -250,6 +247,7 @@ fn hostile_name_visible_only_in_detail() {
     )]);
     let mut a = App::default();
     a.refresh(&m);
+    a.key(ordinary_key('D'), &m);
     a.detail_open = true;
     let output = screen(&m, &a, &Settings::test_defaults(), 100, 28);
     assert!(!output.contains('\x1b'));
@@ -289,6 +287,7 @@ fn selection_survives_refresh_and_removal_without_focus_theft() {
     let mut m = populated();
     let mut a = App::default();
     a.refresh(&m);
+    a.key(ordinary_key('I'), &m);
     a.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &m);
     let selected = a.selected.clone();
     a.detail_open = true;
@@ -312,7 +311,7 @@ fn selection_survives_refresh_and_removal_without_focus_theft() {
     let mut a = App::default();
     a.refresh(&empty());
     a.refresh(&m);
-    assert_eq!(a.selected, Selection::all(&m).into_iter().next());
+    assert_eq!(a.selected, Some(Selection::InboxEntry)); // New employees do not steal the entry selection.
 }
 #[test]
 fn badges_priority_done_receipts_and_identity_not_display_normalization() {
@@ -351,6 +350,7 @@ fn mark_read_is_local_and_keys_keep_list_focus() {
     let m = populated();
     let mut a = App::default();
     a.refresh(&m);
+    a.key(ordinary_key('I'), &m);
     assert_eq!(
         a.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &m),
         Action::Save
@@ -524,11 +524,13 @@ fn focus_specific_footer_snapshots() {
 #[test]
 fn selected_last_row_falls_back_after_decision_and_empty_list_recovers() {
     let mut m=empty(); m.inbox.items=vec![approval("a","adu","a","tool","approval"),approval("b","adu","b","tool","approval")];
-    let mut app=App::default(); app.refresh(&m); app.key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE),&m);
+    let mut app=App::default(); app.refresh(&m); app.key(ordinary_key('I'), &m); app.key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE),&m);
     app.decision_finished(crate::decide::Outcome::Refetch); m.inbox.items.pop(); app.refresh(&m);
     assert_eq!(app.selected,Some(Selection::Inbox("approval:a".into())));
-    m.inbox.items.clear(); app.refresh(&m); assert!(app.selected.is_none());
+    m.inbox.items.clear(); app.refresh(&m); assert_eq!(app.selected,Some(Selection::InboxEntry));
     m.inbox.items.push(approval("c","adu","c","tool","approval")); app.refresh(&m);
+    assert_eq!(app.selected,Some(Selection::InboxEntry));
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &m);
     assert_eq!(app.selected,Some(Selection::Inbox("approval:c".into())));
 }
 
@@ -554,7 +556,7 @@ fn input_focus_ime_paste_and_list_actions() {
     app.key(key(KeyCode::Esc), &model);
     assert_eq!(app.focus, Focus::List);
     app.key(key(KeyCode::Char('1')), &model);
-    assert_eq!(app.blocks.active, Block::Detail);
+    assert_eq!(app.blocks.active, Block::Chat);
     app.input.clear();
     app.key(key(KeyCode::Char('/')), &model);
     app.paste("pause");
@@ -605,7 +607,7 @@ fn hostile_chat_physical_lines_always_have_reserved_gutter() {
         assert!(!rows.is_empty(), "missing {needle}");
         for row in rows {
             let (before, _) = row.split_once("|> ").expect("reserved gutter");
-            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 48, "{row}");
+            assert_eq!(unicode_width::UnicodeWidthStr::width(before), 28, "{row}");
         }
     }
     insta::assert_snapshot!("chat_forged_card", output);
@@ -886,7 +888,9 @@ fn m3_long_home_keeps_tail_in_both_width_modes() {
             assert_eq!(super::text::columns(&row, width), 60);
             row.trim_end().to_string()
         }).collect::<Vec<_>>().join("\n");
-        assert!(output.lines().next().unwrap().contains("最後目錄"));
+        assert!(app.help_text().plain().contains(&home.plain()));
+        assert!(output.lines().next().unwrap().contains(strings::CONNECTED));
+        // The single-line header may shorten the basename on very narrow screens.
         assert!(output.contains('…'));
         insta::assert_snapshot!(format!("m3_long_home_{width:?}"), output);
     }
@@ -1198,7 +1202,7 @@ fn assert_autonomy_unconfirmed(m: &Model) {
     assert!(!line.contains(strings::AUTONOMY_PAUSED));
     assert!(!line.contains(strings::AUTONOMY_ALL));
     let output = screen(m, &App::default(), &Settings::test_defaults(), 180, 24);
-    assert!(output.contains(strings::AUTONOMY_ROW_UNKNOWN));
+    assert!(output.contains(strings::AUTONOMY_UNKNOWN));
     assert!(!output.contains(strings::AUTONOMY_ROW_PAUSED));
 }
 
@@ -1258,13 +1262,13 @@ fn autonomy_status_line_snapshots_and_hostile_names() {
     ] {
         let m = autonomy_model(value);
         let rendered = screen(&m, &App::default(), &Settings::test_defaults(), 120, 16);
-        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().nth(2).unwrap().trim_end());
+        insta::assert_snapshot!(format!("autonomy_{name}"), rendered.lines().find(|line| line.starts_with("[焦點：")).unwrap().trim_end());
     }
     let mut m = autonomy_model(json!({"global":null,"agents":{"adu":pause},"state_error":null}));
     m.autonomy.error = Some(crate::Error::Timeout); m.autonomy.stale = true;
-    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().nth(2).unwrap().trim_end());
+    insta::assert_snapshot!("autonomy_unreadable", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.starts_with("[焦點：")).unwrap().trim_end());
     m.autonomy = Default::default();
-    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().nth(2).unwrap().trim_end());
+    insta::assert_snapshot!("autonomy_unknown", screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line| line.starts_with("[焦點：")).unwrap().trim_end());
     m.autonomy = fresh(vec![crate::autonomy::Status::parse(json!({"global":null,"agents":{"adu":pause},"state_error":null})).unwrap()]);
     m.employees.items[0].display_name = TerminalText::new("阿\u{1b}[2K\u{202e}\u{200b}嘟\nhostile".into());
     let line = crate::autonomy::status_line(&m).unwrap().plain();
@@ -1375,7 +1379,9 @@ fn autonomy_employee_states_are_distinct() {
         assert_eq!(employee_status(&employee("adu","阿嘟",status),&m,&read), EmployeeStatus::AutonomyPaused);
     }
     m.inbox = fresh(vec![approval("pending", "adu", "review", "tool", "approval")]);
-    assert!(screen(&m,&App::default(),&Settings::test_defaults(),180,24).contains("待回覆 · 自主已暫停"));
+    let output = screen(&m,&App::default(),&Settings::test_defaults(),180,24);
+    assert!(output.contains("需要你"));
+    assert!(output.contains(strings::AUTONOMY_PAUSED));
     m.inbox = fresh(vec![]);
     assert_eq!(employee_status(&employee("adu","阿嘟","paused"),&m,&read),EmployeeStatus::Paused);
     assert_eq!(employee_status(&employee("adu","阿嘟","stopped"),&m,&read),EmployeeStatus::Ended);
@@ -1393,7 +1399,7 @@ fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
     app.blocks.panes[0].data.selected = json!({"responsibility_id":"resp1","control_epoch":4,"owner_agent_id":"adu"});
     assert_eq!(app.key(ordinary_key('p'),&m),Action::None);
     assert_eq!(app.control_card.as_ref().unwrap().control.request(),("responsibilities.pause",json!({"responsibility_id":"resp1","expected_control_epoch":4})));
-    for block in [crate::blocks::Block::Detail,crate::blocks::Block::Run,crate::blocks::Block::Log] {
+    for block in [crate::blocks::Block::Detail,crate::blocks::Block::Run,crate::blocks::Block::Log,crate::blocks::Block::Task] {
         for (source,key,enabled,method) in [
             (ScheduleSource::Cron,'p',true,"cron.pause"),
             (ScheduleSource::Cron,'p',false,"cron.resume"),
@@ -1410,6 +1416,7 @@ fn responsibility_cron_heartbeat_keys_use_real_handler_and_keep_cards() {
             assert_eq!(app.input, key.to_string()); assert!(app.control_card.is_none());
             app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &m);
             app.key(ordinary_key(char::from(b'1' + original_pane as u8)), &m);
+            app.key(ordinary_key('S'), &m); // Schedule controls belong to the visible schedule view.
             assert_eq!(app.key(ordinary_key(key),&m),Action::None);
             let (actual,params) = app.control_card.as_ref().unwrap().control.request();
             assert_eq!(actual,method);
@@ -1427,7 +1434,7 @@ fn header_cost_refusal_footer_selection_and_run_round_are_visible() {
     app.blocks.panes[0].data=crate::blocks::Data { stale:false,total:1,selected:json!({"id":"dispatch:1","agent_id":"adu","channel":"goal","round":2,"status":"running"}), ..Default::default() };
     model.cost_millicents=Some(123_000);
     let output=screen(&model,&app,&Settings::test_defaults(),140,30);
-    assert!(output.contains("$1.2300")); assert!(output.contains("近 24 小時"));
+    assert!(output.contains("$1.23")); assert!(output.contains("近 24 小時"));
     assert!(output.contains("goal · 回合 2")); assert!(output.contains("阿嘟"));
     assert!(output.contains("Ctrl-P")); assert!(output.contains("q 離開"));
     insta::assert_snapshot!("autonomy_header_cost",output);
@@ -1444,7 +1451,7 @@ fn heartbeat_uses_last_run_and_cron_uses_gateway_next_run_without_prediction() {
         ScheduledRun { id:"heartbeat:adu".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new("2026-11-03T01:00:00Z".into()),source:ScheduleSource::Heartbeat,detail:json!({"last_run":"2026-11-02T01:00:00Z"}) },
         ScheduledRun { id:"cron:c1".into(),agent:TerminalText::new("adu".into()),next_run:TerminalText::new(strings::NOT_SCHEDULED.into()),source:ScheduleSource::Cron,detail:json!({"next_run":null,"last_status":"success"}) },
     ]);
-    let app=App::default();
+    let mut app=App::default(); app.key(ordinary_key('S'), &model);
     let output=screen(&model,&app,&Settings::test_defaults(),200,40);
     assert!(output.contains("上次執行: 11/02 09:00"));
     assert!(output.contains("11/03 09:00")); assert!(output.contains(strings::NOT_SCHEDULED));
@@ -1733,4 +1740,301 @@ fn round1_header_hides_default_home_and_unknown_counts() {
         .map(|p| terminal.backend().buffer()[p].symbol()).collect();
     assert!(!header.contains('?')); assert!(!header.contains(".duduclaw"));
     assert!(!header.contains("執行中"));
+}
+
+fn round2_fixture() -> (Model, App) {
+    let mut model = empty();
+    model.cost_millicents = Some(42_000);
+    model.cost_today = true;
+    model.employees = fresh(vec![
+        employee("ops", "Ops", "paused"),
+        employee("writer", "Writer 中文編輯", "active"),
+        employee("prod", "Prod-shaped", "working"),
+        employee("plain", "Plain Test Employee", "active"),
+        employee("error", "Error 檢查員", "error"),
+    ]);
+    model.inbox = fresh(vec![approval("quote", "plain", "寄出報價", "寄信", "approval")]);
+    model.schedules = fresh(vec![ScheduledRun {
+        id: "heartbeat:writer".into(), agent: TerminalText::new("writer".into()),
+        next_run: TerminalText::new("2026-11-04T04:12:00Z".into()), source: ScheduleSource::Heartbeat,
+        detail: json!({"agent_id":"writer","last_run":null,"enabled":true}),
+    }]);
+    model.autonomy.items[0].agents.insert("ops".into(), serde_json::from_value(json!({
+        "reason":"維護資料庫", "who":"u1", "at":"2026-11-04T03:00:00Z"
+    })).unwrap());
+    let mut app = App::default();
+    app.refresh(&model);
+    app.chat.connected = true;
+    app.chat.stale = false;
+    app.chat.status = TerminalText::new(strings::CONNECTED.into());
+    app.chat.append(strings::CHAT_USER, "幫我整理本週訂單");
+    app.chat.append(strings::CHAT_ASSISTANT, "本週共 12 筆，已整理好，請確認報價。");
+    let mut task = crate::blocks::Blocks::default();
+    task.open(crate::blocks::Block::Task, Some("prod".into()));
+    task.panes[0].data = crate::blocks::Data { stale: false,
+        selected: json!({"id":"goal","assigned_to":"prod","goal_mode":true,"status":"doing","iteration_cap":5}),
+        sections: vec![("iterations",json!({"iterations":[{"round":2,"dispatched_at":"2026-11-04T03:57:00Z"}]}))],
+        ..Default::default() };
+    app.blocks.parked.push(task.panes.remove(0));
+    (model, app)
+}
+
+#[test]
+fn round2_sidebar_sizes_unicode_and_ascii() {
+    let (model, app) = round2_fixture();
+    for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
+        for (width, height) in [(80,24), (100,30), (140,40), (200,50)] {
+            let mut settings = Settings::test_defaults();
+            settings.glyphs = glyphs;
+            let output = screen(&model, &app, &settings, width, height);
+            assert!(output.contains("收件匣 1"));
+            assert!(output.contains("對話"));
+            assert!(output.lines().next().unwrap().contains("$0.42"));
+            assert!(!output.chars().any(crate::sanitize::forbidden));
+            if width >= 100 {
+                assert!(output.contains("第 2/5 回合 · 已 3 分"));
+                assert!(output.contains("下次心跳 12 分鐘後"));
+                assert!(output.contains("暫停：維護資料庫"));
+            } else { assert!(!output.contains("下次心跳")); }
+            insta::assert_snapshot!(format!("round2_sidebar_{width}x{height}_{glyphs:?}"), output);
+        }
+    }
+}
+
+#[test]
+fn round2_sidebar_light_no_color_and_wide_ambiguous() {
+    let (model, app) = round2_fixture();
+    for (name, theme, capability, width) in [
+        ("light", crate::theme::ThemeMode::Light, crate::theme::Capability::TrueColor, AmbiguousWidth::Narrow),
+        ("no_color", crate::theme::ThemeMode::Dark, crate::theme::Capability::NoColor, AmbiguousWidth::Narrow),
+        ("wide", crate::theme::ThemeMode::Dark, crate::theme::Capability::TrueColor, AmbiguousWidth::Wide),
+    ] {
+        let mut settings = Settings::test_defaults();
+        settings.glyphs = Glyphs::Unicode;
+        settings.ambiguous_width = width;
+        settings.theme = theme;
+        settings.colors.capability = capability;
+        settings.resolve_theme(None);
+        let output = screen(&model, &app, &settings, 140,40);
+        insta::assert_snapshot!(format!("round2_sidebar_{name}"), output);
+    }
+}
+
+#[test]
+fn round2_order_uses_display_name_and_actual_read_receipts() {
+    let mut model = empty();
+    model.employees = fresh(vec![employee("z", "A worker", "working"), employee("idle", "A idle", "active"),
+        employee("pause", "A pause", "paused"), employee("err", "Z error", "error"),
+        employee("b", "B needs", "awaiting"), employee("a", "A needs", "awaiting")]);
+    model.recent_activity.insert("z".into(), Activity { completed_id:Some("run:z:1".into()), ..Default::default() });
+    let mut read = ReadState::default(); read.mark("run:z:1".into());
+    let ordered: Vec<_> = super::workspace::employees(&model, &read).into_iter().map(Employee::id).collect();
+    assert_eq!(ordered, ["a", "b", "err", "z", "idle", "pause"]);
+}
+
+#[test]
+fn round2_context_precedence_freshness_and_missing_fields() {
+    let (mut model, mut app) = round2_fixture();
+    let prod = model.employees.items.iter().find(|e| e.id() == "prod").unwrap().clone();
+    crate::human_time::with_test_clock("2026-11-04T12:00:00+08:00", || {
+        assert_eq!(super::workspace::context(&prod, &model, &app).plain(), "第 2/5 回合 · 已 3 分");
+        app.blocks.parked[0].data.selected.as_object_mut().unwrap().remove("iteration_cap");
+        assert_eq!(super::workspace::context(&prod, &model, &app).plain(), "第 2 回合 · 已 3 分");
+        model.inbox.items.push(approval("prod", "prod", "需要補件\x1b]52;bad\x07", "tool", "question"));
+        let context = super::workspace::context(&prod, &model, &app).plain();
+        assert!(context.starts_with("員工提問：需要補件"));
+        assert!(!context.contains('\x1b'));
+        model.inbox.items.pop(); app.blocks.parked[0].data.stale = true;
+        assert_eq!(super::workspace::context(&prod, &model, &app).plain(), strings::IDLE);
+        let writer = model.employees.items.iter().find(|e| e.id() == "writer").unwrap();
+        assert_eq!(super::workspace::context(writer, &model, &app).plain(), "下次心跳 12 分鐘後");
+        model.schedules.stale = true;
+        assert_eq!(super::workspace::context(writer, &model, &app).plain(), strings::IDLE);
+    });
+    assert_eq!(crate::blocks::field(&json!({}), "last_run"), "尚未執行");
+    assert_eq!(crate::blocks::field(&json!({"last_run_at":null}), "last_run_at"), "尚未執行");
+    assert_eq!(crate::blocks::field(&json!({"last_run":"bad"}), "last_run"), crate::human_time::UNKNOWN);
+}
+
+#[test]
+fn round2_tabs_keep_live_chat_draft_and_input_keys() {
+    let model = populated(); let mut app = App::default(); app.refresh(&model);
+    let id = app.blocks.panes[app.blocks.focused].id.clone();
+    app.chat.running = true; app.chat.connected = true;
+    app.input = "未送出的草稿".into(); app.chat_scroll = 4;
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    app.key(tab, &model); assert_eq!(app.blocks.active, crate::blocks::Block::Task);
+    app.key(tab, &model); assert_eq!(app.blocks.active, crate::blocks::Block::Run);
+    app.key(tab, &model); assert_eq!(app.blocks.active, crate::blocks::Block::Chat);
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, id);
+    assert!(app.chat.running); assert_eq!(app.input, "未送出的草稿"); assert_eq!(app.chat_scroll, 4);
+    app.key(ordinary_key('i'), &model);
+    app.key(ordinary_key('I'), &model); app.key(tab, &model);
+    assert_eq!(app.input, "未送出的草稿I");
+    assert_eq!(app.main_view, super::workspace::MainView::Workspace);
+    assert_eq!(app.blocks.active, crate::blocks::Block::Chat);
+}
+
+#[test]
+fn round2_lists_do_not_operate_hidden_task_chat_or_pty() {
+    use crate::blocks::Block;
+    let mut model = populated();
+    let mut app = App::default(); app.selected = Some(Selection::Employee("adu".into()));
+    app.blocks.open(Block::Task, Some("adu".into()));
+    app.blocks.panes[0].data = crate::blocks::Data { stale:false, selected:json!({"id":"hidden","assigned_to":"adu","status":"needs_human","goal_mode":true}), ..Default::default() };
+    app.key(ordinary_key('I'), &model);
+    assert_eq!(app.key(ordinary_key('s'), &model), Action::None); // Approval is not snoozable.
+    assert!(app.control_card.is_none());
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    assert_eq!(app.card.as_ref().unwrap().item.key(), "approval:a1");
+    assert!(!app.task_card);
+    app.card = None;
+    app.blocks.open(Block::Pty, None);
+    let pty_id = app.blocks.panes[0].id.clone();
+    app.key(ordinary_key('I'), &model);
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    assert!(app.card.is_some()); assert!(!app.pty_focus);
+    app.card = None;
+    app.key(ordinary_key('P'), &model);
+    assert_eq!(app.blocks.panes[0].id, pty_id);
+    assert_eq!(app.pty_focus, crate::pty::SUPPORTED);
+    app.pty_focus = false;
+    model.schedules.items[0].detail = json!({"agent_id":"adu","cron":"0 * * * *","last_run":null});
+    app.key(ordinary_key('S'), &model);
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    assert_eq!(app.blocks.panes[0].id, pty_id); assert!(app.pty_confirm.is_none());
+    let output = screen(&model,&app,&Settings::test_defaults(),100,30);
+    assert!(output.contains("尚未執行")); assert!(output.contains("0 * * * *"));
+    app.key(ordinary_key('I'), &model);
+    app.selected = Some(Selection::Inbox(model.inbox.items[2].key()));
+    app.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE), &model);
+    if crate::pty::SUPPORTED { assert!(app.pty_confirm.is_some()); assert_eq!(app.blocks.panes[0].id, pty_id); }
+}
+
+#[test]
+fn round2_initial_layout_and_many_employee_navigation_keep_bindings() {
+    for layout in [crate::settings::DefaultLayout::Single, crate::settings::DefaultLayout::Vertical, crate::settings::DefaultLayout::Horizontal] {
+        let mut model = empty();
+        model.employees = fresh((0..8).map(|i| employee(&format!("e{i}"),&format!("員工{i}"),"active")).collect());
+        let mut app = App::default(); app.blocks = layout.blocks(); app.blocks.invalidate(); app.refresh(&model);
+        assert_eq!(app.blocks.active, crate::blocks::Block::Chat);
+        for i in 1..8 {
+            app.key(ordinary_key('j'), &model);
+            assert_eq!(app.selected, Some(Selection::Employee(format!("e{i}"))));
+            assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some(format!("e{i}").as_str()));
+            assert!(app.blocks.chat_ids().len() <= 4);
+        }
+    }
+}
+
+#[test]
+fn round2_cost_precision_and_help_home() {
+    assert_eq!(strings::cost_today(0), "今日 $0.00");
+    assert_eq!(strings::cost_today(999), "今日 $0.0100");
+    assert_eq!(strings::cost_today(500), "今日 $0.0050");
+    assert_eq!(strings::cost_today(1000), "今日 $0.01");
+    assert_eq!(strings::cost_today(42_000), "今日 $0.42");
+    let mut app = App::default(); let mut terminal = Terminal::new(TestBackend::new(140,40)).unwrap();
+    terminal.draw(|f| render::draw(f,&empty(),&connection(),&TerminalText::new("~/.duduclaw".into()),&mut app,&Settings::test_defaults())).unwrap();
+    assert!(app.help_text().plain().contains("~/.duduclaw"));
+}
+
+#[test]
+fn round2_pane_focus_synchronizes_employee_before_tab_or_pause() {
+    let mut model = populated();
+    model.goal_operators.extend(["adu".into(), "worker".into()]);
+    let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into())); app.key(ordinary_key('C'), &model);
+    app.selected = Some(Selection::Employee("worker".into())); app.key(ordinary_key('C'), &model);
+    app.key(ordinary_key('1'), &model);
+    assert_eq!(app.selected, Some(Selection::Employee("adu".into())));
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &model);
+    assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("adu"));
+    assert!(matches!(app.key(ordinary_key('p'), &model), Action::Control(crate::controls::Control::Autonomy { agent:Some(id),resume:false }) if id == "adu"));
+}
+
+#[test]
+fn round2_same_employee_split_chats_return_to_their_own_tab() {
+    let model = populated(); let mut app = App::default();
+    app.selected = Some(Selection::Employee("adu".into()));
+    app.key(ordinary_key('C'), &model);
+    let first = app.blocks.panes[app.blocks.focused].id.clone(); app.input = "first draft".into();
+    app.key(ordinary_key('C'), &model);
+    let second = app.blocks.panes[app.blocks.focused].id.clone(); app.input = "second draft".into(); app.chat.running = true;
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    for _ in 0..3 { app.key(tab, &model); }
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, second);
+    assert_eq!(app.input, "second draft"); assert!(app.chat.running);
+    app.key(ordinary_key('1'), &model);
+    for _ in 0..3 { app.key(tab, &model); }
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, first);
+    assert_eq!(app.input, "first draft"); assert!(!app.chat.running);
+    app.key(ordinary_key('2'), &model);
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, second);
+    assert_eq!(app.input, "second draft");
+}
+
+#[test]
+fn round2_detail_then_new_chat_keeps_independent_tab_groups() {
+    let model = populated(); let mut app = App::default(); app.refresh(&model);
+    let first = app.blocks.panes[0].id.clone(); app.input = "old draft".into();
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    app.key(tab, &model); app.key(ordinary_key('D'), &model); app.key(ordinary_key('C'), &model);
+    let second = app.blocks.panes[app.blocks.focused].id.clone(); app.input = "new draft".into();
+    assert_ne!(first, second); assert_eq!(app.blocks.panes.len(), 2);
+    for _ in 0..3 { app.key(tab, &model); }
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, second); assert_eq!(app.input, "new draft");
+    app.key(ordinary_key('1'), &model);
+    app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &model);
+    app.key(tab, &model);
+    assert_eq!(app.blocks.panes[app.blocks.focused].id, first); assert_eq!(app.input, "old draft");
+}
+
+#[test]
+fn round2_removed_employee_keeps_draft_and_defers_switch_during_input() {
+    let mut model = empty(); model.employees = fresh(vec![employee("a", "A", "active"), employee("b", "B", "active")]);
+    let mut app = App::default(); app.refresh(&model); app.key(ordinary_key('i'), &model); app.input = "draft A".into();
+    model.employees.items.remove(0); app.refresh(&model);
+    assert_eq!(app.selected, Some(Selection::Employee("a".into())));
+    assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("a"));
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &model); app.refresh(&model);
+    assert_eq!(app.selected, Some(Selection::Employee("b".into())));
+    assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("b"));
+    assert!(app.blocks.parked.iter().any(|p| p.agent.as_deref() == Some("a") && p.chat_view.input == "draft A"));
+}
+
+#[test]
+fn round2_chat_capacity_applies_to_all_openers_and_close_preserves_other_employees() {
+    let mut model = empty();
+    model.employees = fresh((0..5).map(|i| employee(&format!("e{i}"), &format!("E{i}"), "active")).collect());
+    let mut app = App::default(); app.refresh(&model);
+    for i in 0..4 {
+        app.input = format!("draft {i}");
+        app.key(ordinary_key('j'), &model);
+    }
+    assert_eq!(app.blocks.chat_ids().len(), 4);
+    assert_eq!(app.blocks.active, crate::blocks::Block::Task);
+    assert_eq!(app.selected, Some(Selection::Employee("e4".into())));
+    app.key(ordinary_key('i'), &model); assert_eq!(app.focus, crate::chat::Focus::List);
+    app.key(ordinary_key('C'), &model); assert_eq!(app.blocks.chat_ids().len(), 4);
+    app.key(ordinary_key('k'), &model);
+    app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &model);
+    assert_eq!(app.input, "draft 3");
+    app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), &model);
+    assert_eq!(app.blocks.chat_ids().len(), 3);
+    assert!(app.blocks.parked.iter().any(|p| p.chat_view.input == "draft 0"));
+}
+
+#[test]
+fn round2_removed_employee_waits_for_help_or_palette_to_close() {
+    for help in [true, false] {
+        let mut model = empty(); model.employees = fresh(vec![employee("a", "A", "active"), employee("b", "B", "active")]);
+        let mut app = App::default(); app.refresh(&model);
+        if help { app.help = true; } else { app.palette = Some(super::palette::Palette::default()); }
+        model.employees.items.remove(0); app.refresh(&model);
+        assert_eq!(app.selected, Some(Selection::Employee("a".into())));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &model); app.refresh(&model);
+        assert_eq!(app.selected, Some(Selection::Employee("b".into())));
+        assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("b"));
+    }
 }

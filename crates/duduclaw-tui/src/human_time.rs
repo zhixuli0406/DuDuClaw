@@ -52,13 +52,30 @@ pub(crate) fn value(value: &Value) -> String {
     }
 }
 
+/// Missing last-run metadata means no run has occurred, not an invalid clock.
+pub(crate) fn field(key: &str, value: &Value) -> String {
+    if matches!(key, "last_run" | "last_run_at")
+        && (value.is_null() || value.as_str().is_some_and(|s| s.trim().is_empty())) {
+        "尚未執行".into()
+    } else { self::value(value) }
+}
+
+pub(crate) fn elapsed_minutes(input: &str) -> Option<i64> {
+    let start = DateTime::parse_from_rfc3339(input).ok()?;
+    #[cfg(test)]
+    if let Some(now) = TEST_CLOCK.with(|clock| *clock.borrow()) {
+        return Some(now.signed_duration_since(start).num_minutes().max(0));
+    }
+    Some(Local::now().signed_duration_since(start).num_minutes().max(0))
+}
+
 /// Preserve nested request payloads verbatim for review; only top-level metadata
 /// is changed on this display-only copy. Identity and decision data are untouched.
 pub(crate) fn metadata_json(value: &Value) -> Value {
     let mut displayed = value.clone();
     if let Some(fields) = displayed.as_object_mut() {
         for (key, entry) in fields {
-            if is_time_field(key) { *entry = Value::String(self::value(entry)); }
+            if is_time_field(key) { *entry = Value::String(self::field(key, entry)); }
         }
     }
     displayed

@@ -1,6 +1,5 @@
 ---
 source: crates/duduclaw-tui/src/ui/tests.rs
-assertion_line: 1164
-expression: "screen(&m,&App::default(),&Settings::default(),120,16).lines().nth(2).unwrap().trim_end()"
+expression: "screen(&m,&App::default(),&Settings::test_defaults(),120,16).lines().find(|line|\nline.starts_with(\"[焦點：\")).unwrap().trim_end()"
 ---
-自主: 待確認
+[焦點：清單] · 自主: 待確認

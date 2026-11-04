@@ -6,6 +6,19 @@
 
 Approval and goal decision cards are available in the full control room. Chat blocks, input focus, `tui watch`, and optional notifications are available. Employee status pause/resume uses the same permission checks and confirmation cards. The terminal interface currently uses Traditional Chinese.
 
+## Sidebar workspace
+
+The left sidebar is 28–34 cells wide. Each employee has a two-line card: status symbol, display name and status, followed by the most useful available context. Cards sort by needs-you, error, working, idle (including unread completions), then paused/ended; names break ties. The accent rail means this client has unread inbox items for that employee. Selection uses a filled background. Below 100 columns, cards collapse to a symbol and short name on one line.
+
+The context line prefers an inbox item's kind/title, then a current goal dispatch round and elapsed minutes from an already loaded task snapshot, then the next heartbeat, then an autonomy pause reason, otherwise idle. Unknown round limits are omitted rather than guessed. Heartbeat data is available to Manager/Admin only; stale task and schedule snapshots are not used for these summaries. The bottom `收件匣 N ▸` entry counts all visible inbox rows, including informational rows. Press `I`, or select the entry and press `Enter`, to open the list in the main area; each row keeps its employee and reason. `Esc` returns to the sidebar. Lowercase `i` still enters chat input.
+
+The main area has `對話 / 任務 / 紀錄` tabs. `Tab` and `Shift-Tab` cycle forward/backward; `[` and `]` still select previous/next records within task, run and workflow blocks. Tabs reuse the existing chat, task and run blocks; `L` opens logs. Tab switches keep drafts, running replies and scroll positions. There are at most four retained conversations, including hidden tabs; unused empty chats can be reclaimed. When all four contain work, close an unneeded conversation with `Ctrl-W`; selecting another employee can still open its task tab. `v`/`x`, `1`–`4`, PTYs, decision cards and autonomous-work blocks remain available through their shortcuts and `Ctrl-P`.
+
+Heartbeat times appear on employee cards. `S` or the sidebar's schedule entry opens the full schedule list for Manager/Admin; `Enter` shows the selected schedule's details. Cron visibility and all confirmation/authorization checks are unchanged. A schedule with no previous run displays `尚未執行`; an invalid timestamp still displays `時間不明`.
+
+The one-line header shows connection, version and available cost. Dollars use two decimals, or four for nonzero amounts below $0.01. A custom home is shortened to fit; `?` shows the full home, including the default. The minimum remains 24×12. Snapshots cover 80×24, 100×30, 140×40 and 200×50 in Unicode and ASCII; these are rendering checks, not new native-terminal acceptance.
+
+
 ## Start
 
 Start the gateway, then run one of these commands on the same host:
@@ -45,7 +58,7 @@ RPC `/ws` and WebChat `/ws/chat` send Close and allow up to one second for the p
 
 Press `Ctrl-P` in list, help or input focus. Type a fuzzy query (Traditional Chinese labels or English aliases such as `stop`, `steer`, `log`); arrows select, `Enter` runs the displayed shortcut, and `Esc` returns to the previous focus with the chat draft intact. `Ctrl-K` remains reserved. The list is recalculated from the focused block, current role, employee binding and fresh data. Autonomy pause/resume sends immediately. Other controls open the same confirmation card as their shortcut; the palette never approves a card for you. Cards and content warnings own their keyboard, so the palette cannot open over them.
 
-`F1` / `?` shows help only in the focused block; other blocks stay visible. The header shows the home path only when it differs from `~/.duduclaw`, abbreviating the user home to `~` and shortening long paths in the middle. At the minimum supported height (12 rows), inbox and employee panels each retain one content row; the schedule panel may be hidden. Unicode mode uses rounded borders; ASCII mode keeps ASCII borders. All navigation works without a mouse. Windows key-release events never execute commands.
+`F1` / `?` shows help only in the focused block; other blocks stay visible. The header shows the home path only when it differs from `~/.duduclaw`, abbreviating the user home to `~` and shortening long paths in the middle. At the minimum supported height (12 rows), the sidebar keeps an employee card plus its inbox and schedule entries; the selected list opens in the main area. The full home path is also in help. Unicode mode uses rounded borders; ASCII mode keeps ASCII borders. All navigation works without a mouse. Windows key-release events never execute commands.
 
 The control room offers controls that stop work or move it one step forward. It never grants standing permission; Admin can pause or resume autonomy globally. `cron run now`, `heartbeat trigger`, and task stop are one-way actions and always go through a confirmation card; controls are not necessarily reversible.
 
@@ -72,7 +85,9 @@ Channel codes are requested for the entered account email and delivered through 
 | Key | Action |
 |---|---|
 | Arrows / `j` / `k` | Move selection |
-| `Enter` | Open details or a decision card |
+| `Enter` | Open the sidebar entry, details or a decision card |
+| `I` / `S` | Open inbox / schedule list; `Esc` returns to the sidebar |
+| `Tab` / `Shift-Tab` | Next / previous employee tab (`[` / `]` still switch records) |
 | `r` | Mark this item or identified completed run as read on this client |
 | `PgUp` / `PgDn` | Scroll details |
 | `?` / `F1` | Toggle help |
@@ -204,7 +219,7 @@ On Unix, OSC 11 detection runs after raw mode is enabled, through the same cross
 
 The input recovery is bounded: an ESC introducer split by more than 50 ms, or an identified reply interrupted for more than 150 ms, cannot reliably be distinguished from ordinary keys. Arbitrarily delayed fragments are outside the verified recovery bound.
 
-The glyph default uses the first nonempty locale value in `LC_ALL`, `LC_CTYPE`, then `LANG`. Unicode mode shows `◉` needs you, `●` working, `○` idle, `✓` done, `✕` error and `⏸` paused. Status words remain visible in both glyph modes. Times use the local time zone and Traditional Chinese relative labels within an hour, `HH:MM` for today and `MM/DD HH:MM` otherwise; invalid timestamps show `時間不明`. Empty panels explain what will appear there, and footer keys are highlighted separately from their descriptions.
+The glyph default uses the first nonempty locale value in `LC_ALL`, `LC_CTYPE`, then `LANG`. Unicode mode shows `◉` needs you, `●` working, `○` idle, `✓` done, `✕` error and `⏸` paused. Status words remain visible in both glyph modes at 100 columns or wider. Times use the local time zone and Traditional Chinese relative labels within an hour, `HH:MM` for today and `MM/DD HH:MM` otherwise; invalid timestamps show `時間不明`. Empty panels explain what will appear there, and footer keys are highlighted separately from their descriptions.
 
 Layout changes during a session are not written back. These settings cannot change gateway transport, authentication, authorization, confirmation or any security rule. Both files are protected from employee writes by the agent-file-guard's existing home-directory policy.
 

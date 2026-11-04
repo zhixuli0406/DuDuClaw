@@ -84,6 +84,9 @@ impl App {
             }
             return commands;
         }
+        add(KeyCode::Char('I'), none, strings::INBOX, "I", "inbox");
+        if m2::manager(model) { add(KeyCode::Char('S'), none, strings::NEXT_RUNS, "S", "schedule heartbeat cron"); }
+        add(KeyCode::Tab, none, "下一個員工分頁", "Tab", "tab workspace");
         add(KeyCode::F(1), none, strings::CMD_HELP, "F1 / ?", "help");
         add(
             KeyCode::PageUp,

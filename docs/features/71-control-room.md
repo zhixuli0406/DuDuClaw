@@ -45,7 +45,9 @@ Run the room on the gateway host, over SSH if remote. Do not forward the gateway
 
 ## Appearance
 
-The existing panel layout uses light and dark palettes, colored status symbols and a distinct focused border. The header shows connection status, gateway version and available cost information; the default home path is hidden. Times use the local time zone and readable Traditional Chinese labels. Empty panels explain what belongs there, and footer keys stand out from their descriptions.
+The room uses a sidebar workspace. Employee cards sort by needs-you, error, working, idle, then paused, and show the most useful available context: a waiting item, a goal round, the next heartbeat or a pause reason. Unread inbox items get an accent rail; the selected card gets a filled background. Below 100 columns, cards become a symbol and short name. `I` opens the sidebar inbox in the main area; Manager/Admin can open the full schedule list with `S`. Inbox counts include informational rows, which remain separate from actionable counts.
+
+The main area has chat, task and record tabs (`Tab` / `Shift-Tab`); `[` / `]` keep their record-navigation meaning. Existing splits, PTYs, decision cards and autonomous-work blocks remain available. The one-line header shows connection, version and cost (two decimals, four only for nonzero amounts below $0.01); help includes the full home path. Schedules that have never run say `尚未執行`. Light/dark palettes, status colors, focused borders and readable local times remain in use.
 
 `theme = 'auto'` is the default in `tui.toml`: startup tries OSC 11 with an approximately 150 ms timeout, then `COLORFGBG`, then dark. Choose `light` or `dark` explicitly to skip detection. Colors adapt to truecolor, 256-color or 16-color terminals. Any `NO_COLOR` value, including an empty value, disables color while keeping bold and reverse-video cues.
 

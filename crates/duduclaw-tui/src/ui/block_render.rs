@@ -329,7 +329,7 @@ pub(super) fn draw(
         };
         let inner = panel_focus(frame, region, &title, settings, stale, index == app.blocks.focused);
         let body = if app.help && index == app.blocks.focused {
-            TerminalText::new(strings::HELP.into())
+            app.help_text()
         } else if kind == Block::Detail {
             app.selection_detail(model)
         } else {

@@ -105,7 +105,7 @@ impl App {
     }
     pub(super) fn context_hints(&self, model: &Model) -> &'static str {
         let pane = &self.blocks.panes[self.blocks.focused];
-        if pane.kind == Block::Task && pane.responsibilities { return strings::RESP_KEYS; }
+        if !self.list_view() && pane.kind == Block::Task && pane.responsibilities { return strings::RESP_KEYS; }
         if let Some(Selection::Schedule(id)) = &self.selected
             && let Some(schedule) = model.schedules.items.iter().find(|s| &s.id == id) {
             return match schedule.source {
@@ -132,6 +132,14 @@ impl App {
     }
     pub(super) fn m2_key(&mut self, c: char, model: &Model, now: Instant) -> Option<Action> {
         let i = self.blocks.focused;
+        let list = self.list_view();
+        if list && !matches!(c, 'N' | 'P' | 'D' | 'C' | 'R' | 'T' | 'W' | 'A' | 'E' | 'B' | 'G' | 'L' | 'v' | 'x' | 'p' | 'u' | 'n') {
+            return None;
+        }
+        if matches!(c, 'P' | 'D' | 'C' | 'R' | 'T' | 'W' | 'A' | 'E' | 'B' | 'G' | 'L' | 'v' | 'x') {
+            self.main_view = super::workspace::MainView::Workspace;
+            self.workspace_initialized = true;
+        }
         match c {
             'N' => {
                 if let Some(agent) = self.block_agent(model).or_else(|| self.blocks.panes[i].agent.clone()) {
@@ -251,7 +259,7 @@ impl App {
                 }
             }
             'e' | 's' | 'p' | 'd'
-                if self.blocks.active == Block::Task
+                if !list && self.blocks.active == Block::Task
                     && (matches!(c, 'e' | 's') || self.blocks.panes[i].responsibilities) =>
             {
                 let p = &self.blocks.panes[i];
