@@ -5,6 +5,8 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { SecurityPage } from './SecurityPage';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAuthStore } from '@/stores/auth-store';
+import { mfaApi } from '@/lib/mfa-api';
 import { useSystemStore } from '@/stores/system-store';
 
 /** Shared response shape — satisfies security.status() / auditLog() /
@@ -283,4 +285,20 @@ describe('Egress shadow report', () => {
     expect(await screen.findByText('Could not load observations. Try again later.')).toBeInTheDocument();
     expect(screen.queryByText('No observations in this period')).not.toBeInTheDocument();
   });
+});
+
+it('keeps the existing MFA policy switch reachable on Personal for an Admin', async () => {
+  const previousUser = useAuthStore.getState().user;
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  mockWsClient.call.mockResolvedValue(SECURITY_RESPONSE);
+  const overview = vi.spyOn(mfaApi, 'overview').mockResolvedValue({ enforced: true, policy: { degraded: false }, users: [] });
+  try {
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByRole('switch', { name: 'Stop requiring two-factor login' })).toBeEnabled();
+    expect(screen.queryByText('Role permissions')).toBeNull();
+  } finally {
+    useAuthStore.setState({ user: previousUser });
+    overview.mockRestore();
+  }
 });

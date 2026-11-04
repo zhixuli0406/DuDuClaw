@@ -29,6 +29,13 @@ it('hides MFA on unenrolled Personal but displays an existing enrollment', async
   renderWithProviders(<AccountMfa />);
   expect(await screen.findByText('Enrolled')).toBeInTheDocument();
 });
+it('offers enrollment on Personal when the stored policy requires MFA', async () => {
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: false, enforced: true });
+  renderWithProviders(<AccountMfa />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Set up two-factor login' }));
+  expect(screen.getByLabelText('Current password')).toBeInTheDocument();
+});
 it('offers password enrollment for an unenrolled Enterprise account', async () => {
   vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: false, enforced: false });
   renderWithProviders(<AccountMfa />);

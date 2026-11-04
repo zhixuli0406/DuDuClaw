@@ -13,6 +13,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
 import { WebsiteCredentialsPanel } from '@/components/WebsiteCredentialsPanel';
+import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { ForgetReceiptsPanel } from '@/components/ForgetReceiptsPanel';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -179,6 +180,8 @@ export function SecurityPage() {
       <EgressGuardSection status={status} onSaved={refreshSecurityStatus} />
 
       <ForgetReceiptsPanel />
+
+      {isPersonal && <AdminMfa />}
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an

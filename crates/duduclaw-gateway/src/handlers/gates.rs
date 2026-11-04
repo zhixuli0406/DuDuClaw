@@ -89,6 +89,9 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
     // dispatch_system separately requires Admin for both RPCs.
     if matches!(method, "odoo.schema_scan" | "odoo.permission_options") { return false; }
     if method.split('.').take(2).eq(["me", "google"]) || method == "agents.primary_owner_set" { return true; }
+    // Existing MFA recovery must remain available after an edition downgrade.
+    // dispatch_org still requires a current Admin for these exact methods.
+    if matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") { return false; }
     // ── Self-service carve-outs inside an otherwise Enterprise family ──────
     // Checked first so the family rule below cannot swallow them.
     if matches!(method, "users.me" | "users.change_password" | "users.change_email" | "users.set_primary_agent") {

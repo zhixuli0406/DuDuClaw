@@ -2717,6 +2717,9 @@ mod mfa_tests {
         crate::mfa::reload_policy(home.path());
         assert!(webchat_credential_valid(home.path(),&claims,&live,claims.exp-1));
         assert!(!webchat_credential_valid(home.path(),&claims,&live,claims.exp));
+        crate::team_edition::record(home.path(),duduclaw_core::EditionProfile::Personal);
+        assert!(webchat_credential_valid(home.path(),&claims,&live,claims.exp-1));
+        assert!(!webchat_credential_valid(home.path(),&claims,&live,claims.exp));
         claims.credential_epoch+=1;
         assert!(!webchat_credential_valid(home.path(),&claims,&live,0));
         db.mfa_operator_reset(&user.email).unwrap();

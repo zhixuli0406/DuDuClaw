@@ -25,8 +25,8 @@ export function AccountMfa() {
     // Reloading the locale must not restart an enrollment.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  // Unknown edition fails closed; Personal exposes only an existing enrollment.
-  if (!edition || (edition === 'personal' && !status?.enabled)) return null;
+  // Unknown edition fails closed; Personal also exposes required enrollment.
+  if (!edition || (edition === 'personal' && !status?.enabled && !status?.enforced)) return null;
   const confirmEnrollment = async (input: EnrollmentInput) => {
     const previousRefreshToken = useAuthStore.getState().refreshToken;
     const result = await mfaApi.confirm(input);

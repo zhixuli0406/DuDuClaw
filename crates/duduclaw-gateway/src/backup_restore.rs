@@ -1519,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn mfa_empty_home_restore_preserves_dormant_policy_after_personal_provisioning() {
+    fn mfa_empty_home_restore_enforces_policy_after_personal_provisioning() {
         for personal in [true, false] {
             let tmp = tempfile::tempdir().unwrap();
             let home = tmp.path();
@@ -1541,7 +1541,7 @@ mod tests {
             crate::mfa::reload_policy(home);
             assert!(read_config());
             assert!(crate::mfa::boot_policy(home, false).unwrap());
-            assert_eq!(crate::mfa::enforced(home, personal).unwrap(), !personal);
+            assert!(crate::mfa::enforced(home, personal).unwrap());
             let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
             assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
         }
@@ -1566,11 +1566,10 @@ mod tests {
         crate::mfa::reload_policy(home);
         assert!(crate::mfa::enforced(home, false).unwrap());
         assert!(crate::mfa::boot_policy(home, false).unwrap());
-        // Restore keeps the persisted policy strict; Personal is exempt only
-        // at runtime and never lowers it during MCP provisioning.
+        // Restore keeps the persisted and runtime policy strict in every edition.
         let config: toml::Table = std::fs::read_to_string(home.join("config.toml")).unwrap().parse().unwrap();
         assert_eq!(config["auth"]["mfa_enforced"].as_bool(), Some(true));
-        assert!(!crate::mfa::enforced(home, true).unwrap());
+        assert!(crate::mfa::enforced(home, true).unwrap());
     }
 
     #[test]

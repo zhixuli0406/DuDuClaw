@@ -34,9 +34,23 @@ pub(super) async fn after_first_factor(
     first: FirstFactor,
 ) -> Option<axum::response::Response> {
     let personal = state.handler.resolve_edition_profile().await.is_personal();
+    let required = match enforced(&state.home_dir, personal) { Ok(v)=>v, Err(_)=>return Some(denied()) };
+    first_factor_response(state, user, first, required).await
+}
+
+/// The issuance transaction refused a one-factor session. Do not consult the
+/// cached policy again: another connection may have enabled the durable policy.
+pub(super) async fn require_after_first_factor(
+    state: &AppState, user: &duduclaw_auth::User, first: FirstFactor,
+) -> axum::response::Response {
+    first_factor_response(state, user, first, true).await.unwrap_or_else(denied)
+}
+
+async fn first_factor_response(
+    state: &AppState, user: &duduclaw_auth::User, first: FirstFactor, required: bool,
+) -> Option<axum::response::Response> {
     let work = state.user_db.clone();
     let user_id = user.id.clone();
-    let required = match enforced(&state.home_dir, personal) { Ok(v)=>v, Err(_)=>return Some(denied()) };
     let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
         let active = work.mfa_active(&user_id)?;
         if !active && !required { return Ok(None); }
@@ -80,10 +94,10 @@ pub(super) async fn refresh_allowed(state: &AppState, user: &str) -> bool {
     }
 }
 
-/// Do not interrupt work at the policy toggle. Enterprise JWT sockets under
+/// Do not interrupt work at the policy toggle. JWT sockets under
 /// MFA close only after their own access-token expiry (next 30-second tick).
 /// Identity read failures pause traffic and use the caller's recovery window.
-/// Unenrolled accounts with enforcement off and Personal keep their old behavior.
+/// Personal keeps its legacy expiry behavior only when enforcement is off.
 pub(super) async fn socket_validity(state: &AppState, ctx: &UserContext, expires: Option<u64>, legacy: bool, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
     use crate::handlers::live_context::SocketValidity;
     if legacy {
@@ -100,11 +114,10 @@ pub(super) async fn socket_validity(state: &AppState, ctx: &UserContext, expires
     if (chrono::Utc::now().timestamp().max(0) as u64) < expires {
         return SocketValidity::Valid;
     }
-    if state.handler.resolve_edition_profile().await.is_personal() {
-        return SocketValidity::Valid;
-    }
-    match enforced(&state.home_dir, false) {
+    let personal = state.handler.resolve_edition_profile().await.is_personal();
+    match enforced(&state.home_dir, personal) {
         Ok(true) => SocketValidity::Revoked,
+        Ok(false) if personal => SocketValidity::Valid,
         Ok(false) => match state.user_db.mfa_active(&ctx.user_id) {
             Ok(true) => SocketValidity::Revoked,
             Ok(false) => SocketValidity::Valid,
@@ -315,7 +328,6 @@ async fn enroll(
                 body.code.as_deref().unwrap_or(""),
                 &cipher,
                 now,
-                personal,
                 |user, access, codes| crate::mfa::replacement_session(
                     &work.jwt_config, user, access, epoch, codes, true,
                 ),

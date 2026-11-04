@@ -122,13 +122,13 @@ impl UserDb {
         channel_user_id: &str,
         verified: bool,
     ) -> Result<(), String> {
-        self.bind_channel_identity_authorized(user_id, channel, channel_user_id, verified, None, false)
+        self.bind_channel_identity_authorized(user_id, channel, channel_user_id, verified, None)
     }
 
     /// Host callers pass None. Dashboard callers must supply the verified actor.
     pub fn bind_channel_identity_authorized(
         &self, user_id: &str, channel: &str, channel_user_id: &str, verified: bool,
-        actor: Option<&str>, enterprise: bool,
+        actor: Option<&str>,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
@@ -142,7 +142,7 @@ impl UserDb {
             let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active')", [actor], |r|r.get(0)).map_err(|e|e.to_string())?;
             if !admin { return Err("admin required".into()); }
             let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=?1)", [user_id], |r|r.get(0)).map_err(|e|e.to_string())?;
-            let enforced = enterprise && crate::mfa::read_enforcement(&tx)?;
+            let enforced = crate::mfa::read_enforcement(&tx)?;
             if enforced && !active && actor == user_id {
                 return Err("強制雙因素驗證期間，請由另一位管理員或主機操作員核准通道綁定。".into());
             }

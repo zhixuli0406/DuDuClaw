@@ -3549,11 +3549,7 @@ async fn handle_login(
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "token generation failed"})),
-                )
-                    .into_response();
+                return server_mfa::require_after_first_factor(&state, &user, duduclaw_auth::mfa::FirstFactor::Password).await;
             }
         };
 
@@ -3710,11 +3706,7 @@ async fn handle_otp_verify(
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "token generation failed"})),
-                )
-                    .into_response();
+                return server_mfa::require_after_first_factor(&state, &user, duduclaw_auth::mfa::FirstFactor::ChannelOtp).await;
             }
         };
 
@@ -3820,7 +3812,6 @@ async fn handle_channel_bind(
         &body.channel_user_id,
         true,
         Some(&caller.id),
-        !personal,
     ) {
         Ok(()) => {
             let _ = state.user_db.log_action(
@@ -4066,25 +4057,15 @@ async fn handle_refresh(
             Json(serde_json::json!({"error": "請重新登入並完成雙因素驗證註冊。"}))).into_response();
     }
 
-    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
-    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
-        .iter()
-        .map(|b| (b.agent_name.clone(), b.access_level))
-        .collect();
-
-    let access_token = match state.jwt_config.issue_access_token_in_session(
-        &user,
-        &agent_access,
-        claims.jti.as_deref(),
+    let access_token = match state.user_db.mfa_issue_refresh(
+        &user.id, claims.credential_epoch,
+        |user, access| state.jwt_config.issue_access_token_in_session(user, access, claims.jti.as_deref()),
     ) {
         Ok(t) => t,
         Err(e) => {
-            error!("Failed to issue access token: {e}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "token generation failed"})),
-            )
-                .into_response();
+            error!("Failed to refresh access token: {e}");
+            return (axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "請重新登入並完成雙因素驗證註冊。"}))).into_response();
         }
     };
 
@@ -4792,6 +4773,7 @@ async fn handle_local_session(
             .into_response()
     }
 
+    if !server_mfa::legacy_token_allowed(&state).await { return refused(); }
     let enabled = local_session::auto_login_enabled(&state.home_dir);
     let is_personal = state.handler.resolve_edition_profile().await.is_personal();
     let origin_allowed = origin_is_allowed(&headers);
@@ -4839,22 +4821,13 @@ async fn handle_local_session(
         return refused();
     }
 
-    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
-    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
-        .iter()
-        .map(|b| (b.agent_name.clone(), b.access_level))
-        .collect();
-
     let (access_token, refresh_token) =
-        match state.jwt_config.issue_session_tokens(&user, &agent_access) {
+        match state.user_db.mfa_issue_local_session(&user.id, user.credential_epoch,
+            |user, access| state.jwt_config.issue_session_tokens(user, access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("local session: failed to issue access token: {e}");
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "token generation failed"})),
-                )
-                    .into_response();
+                return refused();
             }
         };
 

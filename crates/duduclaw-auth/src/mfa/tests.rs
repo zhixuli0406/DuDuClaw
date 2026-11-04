@@ -390,19 +390,22 @@ fn mfa_channel_binding_must_predate_enforcement_and_rebinding_resets_time() {
     assert_eq!(record_enforcement(&mut db.conn(),true,since+100).unwrap(),Some(since));
     let a=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
     assert!(db.mfa_prepare_enrollment(&a,true,3000).unwrap().is_some());
-    assert!(db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&id),true).is_err());
+    assert!(db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&id)).is_err());
     let other=db.create_user("reviewer@example.com","Reviewer","password-test",UserRole::Admin).unwrap();
-    db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&other.id),true).unwrap();
+    db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&other.id)).unwrap();
     let new=db.mfa_channel_binding_times(&id).unwrap()[0]["verified_at"].as_i64().unwrap();
     assert!(new>since);
     let b=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
     assert!(db.mfa_prepare_enrollment(&b,true,3000).unwrap().is_none());
-    // Off remains self-bind compatible. An unknown historical time is not proof.
-    db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&id),false).unwrap();
+    // An unknown historical time is not proof, even after another Admin binds it.
+    assert!(db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&id)).is_err());
+    db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&other.id)).unwrap();
     db.conn().execute("UPDATE channel_identities SET verified_at=NULL",[]).unwrap();
     let c=db.mfa_challenge(&id,FirstFactor::Password,true,3000).unwrap();
     assert!(db.mfa_prepare_enrollment(&c,true,3000).unwrap().is_none());
     record_enforcement(&mut db.conn(),false,since+200).unwrap();
+    // Policy off remains self-bind compatible in every edition.
+    db.bind_channel_identity_authorized(&id,"telegram","12345",true,Some(&id)).unwrap();
     assert_eq!(record_enforcement(&mut db.conn(),true,since+300).unwrap(),Some(since+300));
 }
 
@@ -415,7 +418,7 @@ fn mfa_enrollment_session_issue_failure_rolls_back_codes_epoch_and_challenge() {
     let code = hotp(&decode_secret(&secret).unwrap(), 100, 6);
     let generation = db.acl_generation().unwrap();
     let result: Result<()> = db.mfa_confirm_and_issue(
-        &id, Some(&token), &code, &Cipher, 3000, false, |user, _, codes| {
+        &id, Some(&token), &code, &Cipher, 3000, |user, _, codes| {
             assert_eq!(user.credential_epoch, 1);
             assert_eq!(codes.len(), 10);
             Err("injected token issuer failure".into())
@@ -429,7 +432,7 @@ fn mfa_enrollment_session_issue_failure_rolls_back_codes_epoch_and_challenge() {
     // The same pending secret, challenge and TOTP remain usable after rollback.
     let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
     let (codes, tokens) = db.mfa_confirm_and_issue(
-        &id, Some(&token), &code, &Cipher, 3000, false, |user, access, codes| {
+        &id, Some(&token), &code, &Cipher, 3000, |user, access, codes| {
             Ok((codes, jwt.issue_session_tokens(user, access)?))
         },
     ).unwrap();
@@ -445,7 +448,7 @@ fn mfa_disable_session_issue_failure_rolls_back_factor_and_epoch() {
     let (_, codes) = enroll(&db, &id);
     let generation = db.acl_generation().unwrap();
     let result: Result<()> = db.mfa_change_and_issue(
-        &id, &codes[0], true, &Cipher, 3030, false, |user, _, codes| {
+        &id, &codes[0], true, &Cipher, 3030, |user, _, codes| {
             assert_eq!(user.credential_epoch, 2);
             assert!(codes.is_empty());
             Err("injected token issuer failure".into())
@@ -458,7 +461,7 @@ fn mfa_disable_session_issue_failure_rolls_back_factor_and_epoch() {
     // A failed issuer must not consume the submitted recovery code.
     let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
     let tokens = db.mfa_change_and_issue(
-        &id, &codes[0], true, &Cipher, 3030, false,
+        &id, &codes[0], true, &Cipher, 3030,
         |user, access, _| jwt.issue_session_tokens(user, access),
     ).unwrap();
     assert!(!db.mfa_active(&id).unwrap());
@@ -556,9 +559,9 @@ fn mfa_invalid_policy_refuses_self_disable_without_consuming_factor() {
         if !rows.is_empty() {
             assert!(migrate(&db.conn(), false).is_err(), "{rows}");
         }
-        assert!(db.bind_channel_identity_authorized(&id, "line", "untrusted", true, Some(&id), true).is_err(), "{rows}");
+        assert!(db.bind_channel_identity_authorized(&id, "line", "untrusted", true, Some(&id)).is_err(), "{rows}");
         assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM channel_identities WHERE user_id=?1", [&id], |r| r.get::<_, i64>(0)).unwrap(), 0);
-        assert!(db.mfa_change_and_issue(&id, &codes[0], true, &Cipher, 3030, false,
+        assert!(db.mfa_change_and_issue(&id, &codes[0], true, &Cipher, 3030,
             |_, _, _| Ok(())).is_err(), "{rows}");
         assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch, epoch);
         assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM mfa_credentials WHERE user_id=?1", [&id], |r| r.get::<_, i64>(0)).unwrap(), 1);
@@ -587,4 +590,122 @@ fn mfa_fresh_team_schema_seeds_true_and_legacy_default_preserves_it() {
     let db = UserDb::new(&path).unwrap();
     assert!(read_enforcement(&db.conn()).unwrap());
     assert_eq!(db.conn().query_row("SELECT enforced_at FROM mfa_policy_state WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), since);
+}
+
+// The channels force the Admin commit between the request's early gate and
+// its issuance transaction on a separate connection. No scheduler timing is assumed.
+fn policy_toggle_before_issue(path: &str) {
+    let (dir, db, id) = setup();
+    let worker_db = UserDb::new(&dir.path().join("users.db")).unwrap();
+    let user = worker_db.get_user(&id).unwrap().unwrap();
+    let worker_user = user.clone();
+    let path = path.to_owned();
+    let worker_path = path.clone();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        assert!(!policy_enforced(&worker_db.conn()).unwrap());
+        observed_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+        let called = std::cell::Cell::new(false);
+        let result = issue_test_session(&worker_db, &worker_user, &worker_path, &called);
+        assert!(result.is_err());
+        assert!(!called.get());
+    });
+    observed_rx.recv().unwrap();
+    record_enforcement(&mut db.conn(), true, 3001).unwrap();
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap();
+    record_enforcement(&mut db.conn(), false, 3002).unwrap();
+    let called = std::cell::Cell::new(false);
+    let tokens = issue_test_session(&db, &user, &path, &called).unwrap();
+    assert!(called.get());
+    let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
+    assert_eq!(jwt.verify_access_token(&tokens.0).unwrap().sub, id);
+    assert_eq!(jwt.verify_refresh_token(&tokens.1).unwrap().sub, id);
+}
+
+fn issue_test_session(db: &UserDb, user: &crate::User, path: &str, called: &std::cell::Cell<bool>) -> Result<(String, String)> {
+    let jwt = crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes");
+    let issue = |user: &crate::User, access: &[(String, crate::AccessLevel)]| {
+        called.set(true);
+        jwt.issue_session_tokens(user, access)
+    };
+    match path {
+        "login" => db.mfa_issue_if_unenrolled(&user.id, || issue(user, &[])),
+        "refresh" => db.mfa_issue_refresh(&user.id, user.credential_epoch, issue),
+        "local_session" => db.mfa_issue_local_session(&user.id, user.credential_epoch, issue),
+        _ => panic!("unknown issuance path"),
+    }
+}
+
+#[test]
+fn mfa_login_policy_toggle_before_issue_refuses_jwt() { policy_toggle_before_issue("login"); }
+#[test]
+fn mfa_refresh_policy_toggle_before_issue_refuses_jwt() { policy_toggle_before_issue("refresh"); }
+#[test]
+fn mfa_local_session_policy_toggle_before_issue_refuses_jwt() { policy_toggle_before_issue("local_session"); }
+
+#[test]
+fn mfa_issuance_invalid_policy_never_calls_issuer() {
+    for rows in ["", "(1,0),(1,0)", "(1,2)", "(1,'false')", "(1,NULL)", "(2,0)"] {
+        let (_dir, db, id) = setup();
+        let user = db.get_user(&id).unwrap().unwrap();
+        db.conn().execute_batch("DROP TABLE mfa_policy_state; CREATE TABLE mfa_policy_state(id, enforced);").unwrap();
+        if !rows.is_empty() {
+            db.conn().execute_batch(&format!("INSERT INTO mfa_policy_state VALUES {rows}")).unwrap();
+        }
+        for path in ["login", "refresh", "local_session"] {
+            let called = std::cell::Cell::new(false);
+            assert!(issue_test_session(&db, &user, path, &called).is_err(), "{path}: {rows}");
+            assert!(!called.get());
+        }
+    }
+}
+
+#[test]
+fn mfa_refresh_and_local_session_recheck_epoch_status_and_enrollment() {
+    let (_dir, db, id) = setup();
+    let stale = db.get_user(&id).unwrap().unwrap();
+    enroll(&db, &id);
+    let current = db.get_user(&id).unwrap().unwrap();
+    for path in ["refresh", "local_session"] {
+        let called = std::cell::Cell::new(false);
+        assert!(issue_test_session(&db, &stale, path, &called).is_err());
+        assert!(!called.get());
+        assert!(issue_test_session(&db, &current, path, &called).is_ok());
+    }
+    record_enforcement(&mut db.conn(), true, 3001).unwrap();
+    let called = std::cell::Cell::new(false);
+    assert!(issue_test_session(&db, &current, "refresh", &called).is_ok());
+    called.set(false);
+    assert!(issue_test_session(&db, &current, "local_session", &called).is_err());
+    assert!(!called.get());
+    record_enforcement(&mut db.conn(), false, 3002).unwrap();
+    db.conn().execute("UPDATE users SET status='suspended' WHERE id=?1", [&id]).unwrap();
+    for path in ["login", "refresh", "local_session"] {
+        assert!(issue_test_session(&db, &current, path, &called).is_err());
+        assert!(!called.get());
+    }
+}
+
+#[test]
+fn mfa_issuance_holds_policy_write_lock_through_token_callback() {
+    for path in ["login", "refresh", "local_session"] {
+        let (dir, db, id) = setup();
+        let user = db.get_user(&id).unwrap().unwrap();
+        let mut admin = Connection::open(dir.path().join("users.db")).unwrap();
+        admin.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mut issue = || {
+            let error = admin.transaction_with_behavior(TransactionBehavior::Immediate).unwrap_err();
+            assert_eq!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+            crate::JwtConfig::new(b"mfa-transaction-test-secret-32-bytes").issue_session_tokens(&user, &[])
+        };
+        match path {
+            "login" => db.mfa_issue_if_unenrolled(&id, issue),
+            "refresh" => db.mfa_issue_refresh(&id, user.credential_epoch, |_, _| issue()),
+            _ => db.mfa_issue_local_session(&id, user.credential_epoch, |_, _| issue()),
+        }.unwrap();
+        record_enforcement(&mut admin, true, 3001).unwrap();
+    }
 }
