@@ -980,6 +980,8 @@ fn m4_unsupported_platform_never_enters_child_input() {
 fn m4_real_crossterm_parser_probe() {
     use std::{io::Write, time::Duration};
     if std::env::var_os("TUI_RAW_PARSER_PROBE").is_none() { return; }
+    let mut settings = Settings::parse("theme = 'auto'").0;
+    settings.resolve_theme();
     crossterm::terminal::enable_raw_mode().unwrap();
     println!("PARSER_READY");
     std::io::stdout().flush().unwrap();
@@ -993,6 +995,10 @@ fn m4_real_crossterm_parser_probe() {
         };
         key
     };
+    // The first key after startup travels through the production input reader.
+    assert!(crossterm::event::poll(Duration::from_secs(5)).unwrap());
+    assert_eq!(super::read_host_event(&mut app, super::read_ready_event).unwrap(),
+        Some(Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))));
     // Raw 0x1c, CSI-u backslash, CSI-u raw control char, then F12.
     for expected in [
         KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
@@ -1048,7 +1054,7 @@ fn m4_escape_and_control_bindings_through_real_terminal_parser() {
         while !String::from_utf8_lossy(&output).contains("PARSER_READY") {
             output.extend(rx.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?);
         }
-        writer.write_all(b"\x1c\x1b[92;5u\x1b[28u\x1b[28;5u\x1b[24~\x17\x10").map_err(|e| e.to_string())?;
+        writer.write_all(b"r\x1c\x1b[92;5u\x1b[28u\x1b[28;5u\x1b[24~\x17\x10").map_err(|e| e.to_string())?;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -1822,7 +1828,7 @@ fn round2_sidebar_light_no_color_and_wide_ambiguous() {
         settings.ambiguous_width = width;
         settings.theme = theme;
         settings.colors = crate::theme::Theme::new(theme, capability);
-        settings.resolve_theme(None);
+        settings.resolve_theme();
         let output = screen(&model, &app, &settings, 140,40);
         insta::assert_snapshot!(format!("round2_sidebar_{name}"), output);
     }
@@ -2271,3 +2277,50 @@ fn round_a_large_cost_keeps_connection_and_respects_role() {
 
 #[path = "round_b_tests.rs"]
 mod round_b;
+
+#[test]
+fn late_split_reply_with_startup_state_updates_keeps_chat_live() {
+    use crate::{chat::{ChatRooms, Frame}, state::Model};
+    use tokio::sync::watch;
+
+    let (chat_tx, mut chat_rx) = watch::channel(ChatRooms::default());
+    let (feed_tx, feed_rx) = watch::channel(Model::default());
+    let mut app = App::default();
+    let mut rooms = ChatRooms::default();
+    rooms.apply(Frame::parse(r#"{"type":"session_info","session_id":"base"}"#).unwrap());
+    chat_tx.send_replace(rooms);
+    // Consume the handshake before employee data creates the chat pane.
+    app.sync_chats(&chat_rx.borrow_and_update());
+    let mut revision = app.blocks.revision;
+    assert!(!chat_rx.has_changed().unwrap());
+    let mut model = Model::default();
+    model.employees.items = vec![serde_json::from_str(
+        r#"{"name":"adu","display_name":"阿嘟","status":"active","archived":false}"#,
+    ).unwrap()];
+    model.employees.stale = false;
+    model.employees.refetch_pending = false;
+    model.inbox.stale = false;
+    model.inbox.refetch_pending = false;
+    feed_tx.send_replace(model);
+    app.refresh(&feed_rx.borrow());
+    assert!(super::sync_chat_state(&mut app, &mut chat_rx, &mut revision));
+    assert!(app.chat.connected);
+    assert!(!app.chat.stale);
+    assert_eq!(app.chat.status.visible(), strings::CONNECTED);
+    assert!(!chat_rx.has_changed().unwrap());
+    assert!(!super::sync_chat_state(&mut app, &mut chat_rx, &mut revision));
+}
+
+#[test]
+fn key_immediately_after_startup_is_delivered_unchanged() {
+    let _settings = Settings::parse("theme = 'auto'").0;
+    let mut app = App::default();
+    for key in [
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+    ] {
+        let event = Event::Key(key);
+        assert_eq!(super::read_host_event(&mut app, || Ok(Some(event.clone()))).unwrap(), Some(event));
+    }
+}

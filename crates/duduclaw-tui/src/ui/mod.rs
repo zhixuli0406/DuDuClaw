@@ -15,7 +15,6 @@ mod card_render;
 #[cfg(test)]
 mod card_tests;
 mod backend;
-mod osc11;
 mod panels;
 mod shell;
 mod workspace;
@@ -68,18 +67,8 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
     if !notices.is_empty() {
         app.notice = Some(notices.join(" / "));
     }
+    settings.resolve_theme();
     let guard = terminal::TerminalGuard::enter()?;
-    // Negotiate only after raw mode, using the same event reader as the loop.
-    let mut reply_filter = if (matches!(settings.theme, crate::theme::ThemeMode::Auto | crate::theme::ThemeMode::Ansi)
-        || settings.background == crate::theme::Background::Terminal)
-        && settings.colors.capability != crate::theme::Capability::NoColor {
-        let query = osc11::query_background();
-        settings.resolve_theme(query.background);
-        query.filter
-    } else {
-        settings.resolve_theme(None);
-        osc11::ReplyFilter::default()
-    };
     let shutdown_client = options.client.clone();
     let mut exit_text = None;
     let result = std::panic::AssertUnwindSafe(async {
@@ -204,9 +193,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
             // Bound each batch for redraw/shutdown fairness. Always read host events,
             // including escape, quit and resize, even when child input is full.
             for _ in 0..256 {
-                let Some(event) = read_host_event(&mut app, || {
-                    reply_filter.read().map_err(|_| Error::Terminal)
-                })? else { break; };
+                let Some(event) = read_host_event(&mut app, read_ready_event)? else { break; };
                 dirty = true;
                 let key = match event {
                     Event::Resize(_, _) => {
@@ -359,6 +346,13 @@ fn sync_chat_state(app: &mut App, state: &mut tokio::sync::watch::Receiver<crate
     if changed { app.sync_chats(&state.borrow_and_update()); }
     *revision = app.blocks.revision;
     changed
+}
+
+/// Read only ready host input, without startup negotiation or input buffering.
+fn read_ready_event() -> Result<Option<Event>> {
+    if crossterm::event::poll(Duration::ZERO).map_err(|_| Error::Terminal)? {
+        crossterm::event::read().map(Some).map_err(|_| Error::Terminal)
+    } else { Ok(None) }
 }
 
 /// Host events are independent of child writer capacity. Keep this path shared

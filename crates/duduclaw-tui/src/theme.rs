@@ -23,10 +23,9 @@ impl Capability {
     }
 }
 
-/// Explicit preference, then OSC 11, then COLORFGBG, finally dark.
-pub fn resolve(mode: ThemeMode, background: Option<(u8, u8, u8)>, colorfgbg: Option<&str>) -> ThemeMode {
+/// Explicit preference, then COLORFGBG, finally dark.
+pub fn resolve(mode: ThemeMode, colorfgbg: Option<&str>) -> ThemeMode {
     if mode != ThemeMode::Auto { return mode; }
-    if let Some(rgb) = background { return if luminance(rgb) > 0.179 { ThemeMode::Light } else { ThemeMode::Dark }; }
     if let Some(index) = colorfgbg.filter(|s| s.len() <= 64)
         .and_then(|s| s.rsplit(';').next()).and_then(|s| s.parse::<u8>().ok()) {
         return if luminance(xterm_rgb(index)) > 0.179 { ThemeMode::Light } else { ThemeMode::Dark };
@@ -77,19 +76,19 @@ pub struct Theme {
 }
 impl Theme {
     pub fn new(mode: ThemeMode, capability: Capability) -> Self {
-        Self::configured(mode, capability, Background::Theme, None, None)
+        Self::configured(mode, capability, Background::Theme, None)
     }
     pub fn configured(mode: ThemeMode, source_capability: Capability, background: Background,
-        terminal_rgb: Option<(u8, u8, u8)>, colorfgbg: Option<&str>) -> Self {
-        let resolved = resolve(if mode == ThemeMode::Ansi { ThemeMode::Auto } else { mode }, terminal_rgb, colorfgbg);
+        colorfgbg: Option<&str>) -> Self {
+        let resolved = resolve(if mode == ThemeMode::Ansi { ThemeMode::Auto } else { mode }, colorfgbg);
         let light = resolved == ThemeMode::Light;
         let capability = if mode == ThemeMode::Ansi && source_capability != Capability::NoColor {
             Capability::Ansi16
         } else { source_capability };
         let map = |hex| degrade(rgb(hex), capability);
         let terminal_layers = mode == ThemeMode::Ansi;
-        let terminal_rgb = terminal_rgb.or_else(|| colorfgbg.filter(|s| s.len() <= 64)
-            .and_then(|s| s.rsplit(';').next()).and_then(|s| s.parse::<u8>().ok()).map(xterm_rgb))
+        let terminal_rgb = colorfgbg.filter(|s| s.len() <= 64)
+            .and_then(|s| s.rsplit(';').next()).and_then(|s| s.parse::<u8>().ok()).map(xterm_rgb)
             .unwrap_or(if light { (255,255,255) } else { (0,0,0) });
         let mut theme = if capability == Capability::Ansi16 {
             let (bg, text, muted, accent, success, danger, info, brand) = if light {
@@ -264,16 +263,15 @@ mod tests {
     use super::*;
     #[test]
     fn fallback_order_and_bounded_environment() {
-        assert_eq!(resolve(ThemeMode::Light, Some((0,0,0)), Some("15;0")), ThemeMode::Light);
-        assert_eq!(resolve(ThemeMode::Dark, Some((255,255,255)), Some("0;15")), ThemeMode::Dark);
-        assert_eq!(resolve(ThemeMode::Auto, Some((255,255,255)), Some("15;0")), ThemeMode::Light);
-        assert_eq!(resolve(ThemeMode::Auto, Some((0,0,0)), Some("0;15")), ThemeMode::Dark);
-        assert_eq!(resolve(ThemeMode::Auto, None, Some("0;15")), ThemeMode::Light);
-        assert_eq!(resolve(ThemeMode::Auto, None, Some("15;0")), ThemeMode::Dark);
+        assert_eq!(resolve(ThemeMode::Light, Some("15;0")), ThemeMode::Light);
+        assert_eq!(resolve(ThemeMode::Dark, Some("0;15")), ThemeMode::Dark);
+        assert_eq!(resolve(ThemeMode::Auto, None), ThemeMode::Dark);
+        assert_eq!(resolve(ThemeMode::Auto, Some("0;15")), ThemeMode::Light);
+        assert_eq!(resolve(ThemeMode::Auto, Some("15;0")), ThemeMode::Dark);
         for value in [None, Some("bad"), Some("0;999"), Some("0;"), Some("0;15\x1b")] {
-            assert_eq!(resolve(ThemeMode::Auto, None, value), ThemeMode::Dark);
+            assert_eq!(resolve(ThemeMode::Auto, value), ThemeMode::Dark);
         }
-        assert_eq!(resolve(ThemeMode::Auto, None, Some(&"0".repeat(65))), ThemeMode::Dark);
+        assert_eq!(resolve(ThemeMode::Auto, Some(&"0".repeat(65))), ThemeMode::Dark);
     }
     #[test]
     fn no_color_environment_presence_includes_empty_and_false_values() {
@@ -339,8 +337,8 @@ mod tests {
     }
     #[test]
     fn ansi_and_terminal_background_preserve_capability_and_contrast() {
-        for background in [(0,0,0), (255,255,255), (120,120,120)] {
-            let t = Theme::configured(ThemeMode::Ansi, Capability::TrueColor, Background::Theme, Some(background), None);
+        for (colorfgbg, background) in [("15;0", (0,0,0)), ("0;15", (255,255,255)), ("0;243", (118,118,118))] {
+            let t = Theme::configured(ThemeMode::Ansi, Capability::TrueColor, Background::Theme, Some(colorfgbg));
             assert_eq!(t.capability, Capability::Ansi16);
             assert_eq!(t.source_capability, Capability::TrueColor);
             assert_eq!(t.page_canvas, Color::Reset);
@@ -350,7 +348,7 @@ mod tests {
                 assert!(contrast(color_rgb(t.readable(fg, Color::Reset)).unwrap(), background) >= 4.5);
             }
         }
-        let t = Theme::configured(ThemeMode::Dark, Capability::TrueColor, Background::Terminal, None, None);
+        let t = Theme::configured(ThemeMode::Dark, Capability::TrueColor, Background::Terminal, None);
         assert_eq!(t.page_canvas, Color::Reset);
         assert_ne!(t.surface, Color::Reset);
         assert_eq!(adapt(Color::Rgb(1,2,3), Capability::NoColor), Color::Reset);

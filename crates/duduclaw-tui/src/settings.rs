@@ -79,9 +79,12 @@ pub const MIN_POLL_SECONDS: u64 = 5;
 pub const MAX_POLL_SECONDS: u64 = 3600;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 impl Settings {
-    pub fn resolve_theme(&mut self, background: Option<(u8, u8, u8)>) {
+    pub fn resolve_theme(&mut self) {
+        self.resolve_theme_with(std::env::var("COLORFGBG").ok().as_deref());
+    }
+    fn resolve_theme_with(&mut self, colorfgbg: Option<&str>) {
         self.colors = crate::theme::Theme::configured(self.theme, self.colors.source_capability, self.background,
-            background, std::env::var("COLORFGBG").ok().as_deref());
+            colorfgbg);
     }
     #[cfg(test)]
     pub(crate) fn test_defaults() -> Self {
@@ -159,7 +162,7 @@ impl Settings {
                 _ => bad = true,
             }
         }
-        result.resolve_theme(None);
+        result.resolve_theme();
         (result, if removed_command { Some(strings::PTY_COMMAND_IGNORED) } else { bad.then_some(strings::SETTINGS_NOTICE) })
     }
 }
@@ -288,14 +291,24 @@ mod visual_tests {
             assert!(notice.is_some());
         }
         let mut s = Settings { theme: ThemeMode::Ansi, colors: Theme::new(ThemeMode::Dark, Capability::TrueColor), ..Settings::test_defaults() };
-        s.resolve_theme(Some((255,255,255)));
+        s.resolve_theme_with(Some("0;15"));
         assert_eq!(s.colors.capability, Capability::Ansi16);
         assert_eq!(s.colors.text, ratatui::style::Color::Black);
-        s.resolve_theme(Some((0,0,0)));
+        s.resolve_theme_with(Some("15;0"));
         assert_eq!(s.colors.text, ratatui::style::Color::White);
         s.theme = ThemeMode::Dark;
-        s.resolve_theme(None);
+        s.resolve_theme();
         assert_eq!(s.colors.capability, Capability::TrueColor);
+    }
+    #[test]
+    fn auto_theme_uses_colorfgbg_else_dark() {
+        use crate::theme::{Capability, Theme, ThemeMode};
+        let mut s = Settings::parse("theme = 'auto'").0;
+        s.colors = Theme::new(ThemeMode::Dark, Capability::TrueColor);
+        s.resolve_theme_with(None);
+        assert_eq!(s.colors.page_canvas, Theme::new(ThemeMode::Dark, Capability::TrueColor).page_canvas);
+        s.resolve_theme_with(Some("0;15"));
+        assert_eq!(s.colors.page_canvas, Theme::new(ThemeMode::Light, Capability::TrueColor).page_canvas);
     }
     #[test]
     fn theme_is_strict_and_bad_fields_keep_valid_fields() {
