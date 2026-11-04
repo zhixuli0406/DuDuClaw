@@ -522,13 +522,58 @@ fn stage_restore_locked(home: &Path, source: &Path) -> Result<RestoreStageReport
     if path_occupied(&staging).map_err(|e| e.to_string())? {
         return Err("已有未完成的還原暫存資料，為保留資料已拒絕覆寫；請由管理員檢查。".into());
     }
-    std::fs::rename(&extracted, &staging).map_err(|e| format!("發布還原暫存資料失敗：{e}"))?;
     let marker = RestoreMarker {
         staged_at: Utc::now(),
         source_filename: source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
     };
-    write_marker(home, &marker).map_err(|e| format!("寫入還原標記失敗（已保留暫存資料）：{e}"))?;
+    publish_restore_with_sync(home, &extracted, &marker, &mut sync_restore_path)
+        .map_err(|e| format!("發布還原資料或標記失敗（已發布的暫存資料會保留）：{e}"))?;
     Ok(RestoreStageReport { extraction, mfa_notice })
+}
+
+// Sync children before their parent; never follow links or accept special files.
+fn sync_restore_tree(
+    path: &Path,
+    sync: &mut impl FnMut(&Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    if kind.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            sync_restore_tree(&entry?.path(), sync)?;
+        }
+        sync(path, true)
+    } else if kind.is_file() {
+        sync(path, false)
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "restore tree contains a link or special file"))
+    }
+}
+
+fn sync_restore_path(path: &Path, directory: bool) -> std::io::Result<()> {
+    // Windows std does not support directory fsync; rely on file sync_all there.
+    #[cfg(windows)]
+    if directory {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    { std::fs::OpenOptions::new().write(true).open(path)?.sync_all() }
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+        std::fs::File::open(path)?.sync_all()
+    }
+}
+
+fn publish_restore_with_sync(
+    home: &Path,
+    extracted: &Path,
+    marker: &RestoreMarker,
+    sync: &mut impl FnMut(&Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    sync_restore_tree(extracted, sync)?;
+    std::fs::rename(extracted, staging_dir(home))?;
+    sync(home, true)?;
+    write_marker_with_sync(home, marker, sync)
 }
 
 /// Atomic (temp + rename) write. Called only after [`extract_tar_gz_safely`]
@@ -536,14 +581,22 @@ fn stage_restore_locked(home: &Path, source: &Path) -> Result<RestoreStageReport
 /// `perform_pending_restore_swap` acts on, so it must never be written
 /// before the staged content is actually safe to swap in.
 pub fn write_marker(home_dir: &Path, marker: &RestoreMarker) -> std::io::Result<()> {
+    write_marker_with_sync(home_dir, marker, &mut sync_restore_path)
+}
+
+fn write_marker_with_sync(
+    home_dir: &Path,
+    marker: &RestoreMarker,
+    sync: &mut impl FnMut(&Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let path = marker_path(home_dir);
     let body = serde_json::to_string_pretty(marker)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut tmp = tempfile::Builder::new().prefix(".restore-marker-").tempfile_in(home_dir)?;
     std::io::Write::write_all(&mut tmp, body.as_bytes())?;
-    tmp.as_file().sync_all()?;
+    sync(tmp.path(), false)?;
     tmp.persist(&path).map_err(|e| e.error)?;
-    Ok(())
+    sync(home_dir, true)
 }
 
 pub fn read_marker(home_dir: &Path) -> Option<RestoreMarker> {
@@ -646,11 +699,13 @@ pub fn perform_pending_restore_swap(
 
     // Hold through policy reads, staging rewrites, the entire swap and boot.
     // A second gateway must not complete an Admin toggle during this window.
-    duduclaw_core::gateway_instance::acquire_for_restore(home_dir).map_err(|error| {
-        RestoreSwapError::GatewayRunning(format!(
-            "無法還原：其他閘道程序正在使用此資料目錄，請先停止該程序後再重試。{error}"
-        ))
-    })?;
+    if !duduclaw_core::gateway_instance::held(home_dir) {
+        duduclaw_core::gateway_instance::acquire_for_restore(home_dir).map_err(|error| {
+            RestoreSwapError::GatewayRunning(format!(
+                "無法還原：其他閘道程序正在使用此資料目錄，請先停止該程序後再重試。{error}"
+            ))
+        })?;
+    }
 
     with_restore_lock(home_dir, || perform_pending_restore_swap_locked(home_dir, now_tag))
         .map_err(|e| RestoreSwapError::Io(e.to_string()))?
@@ -665,9 +720,12 @@ fn perform_pending_restore_swap_locked(
     }
     let staging = staging_dir(home_dir);
     let restore_root = resolve_restore_root(&staging, home_dir);
-    let has_content = std::fs::read_dir(&restore_root)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
+    let has_content = match std::fs::read_dir(&restore_root) {
+        Ok(mut entries) => entries.next().transpose()
+            .map_err(|e| RestoreSwapError::Io(e.to_string()))?.is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(RestoreSwapError::Io(e.to_string())),
+    };
     if !has_content {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = clear_marker(home_dir);
@@ -1196,6 +1254,84 @@ mod tests {
         assert!(!is_within_upload_dir(home, &dir.join("nope.tar.gz")));
     }
 
+    #[test]
+    fn publish_syncs_tree_then_rename_then_marker_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let extracted = home.join("request/data");
+        let nested = extracted.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("payload");
+        std::fs::write(&file, b"durable").unwrap();
+        let marker = RestoreMarker { staged_at: Utc::now(), source_filename: "test.tar.gz".into() };
+        let mut steps = Vec::new();
+        publish_restore_with_sync(home, &extracted, &marker, &mut |path, directory| {
+            match steps.len() {
+                0 => assert_eq!((path, directory), (file.as_path(), false)),
+                1 => assert_eq!((path, directory), (nested.as_path(), true)),
+                2 => assert_eq!((path, directory), (extracted.as_path(), true)),
+                3 => {
+                    assert_eq!((path, directory), (home, true));
+                    assert!(!extracted.exists());
+                    assert!(staging_dir(home).join("nested/payload").is_file());
+                    assert!(!marker_path(home).exists());
+                }
+                4 => {
+                    assert!(!directory);
+                    assert!(path.file_name().unwrap().to_string_lossy().starts_with(".restore-marker-"));
+                    assert!(!marker_path(home).exists());
+                    assert!(serde_json::from_slice::<RestoreMarker>(&std::fs::read(path)?).is_ok());
+                }
+                5 => {
+                    assert_eq!((path, directory), (home, true));
+                    assert!(read_marker(home).is_some());
+                }
+                _ => panic!("unexpected sync"),
+            }
+            steps.push(path.to_path_buf());
+            sync_restore_path(path, directory)
+        }).unwrap();
+        assert_eq!(steps.len(), 6);
+    }
+
+    #[test]
+    fn failed_publish_sync_retains_data_and_any_persisted_marker() {
+        for fail_at in 0..5 {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let extracted = home.join("data");
+            std::fs::create_dir(&extracted).unwrap();
+            std::fs::write(extracted.join("payload"), b"keep").unwrap();
+            let marker = RestoreMarker { staged_at: Utc::now(), source_filename: "test.tar.gz".into() };
+            let mut calls = 0;
+            let result = publish_restore_with_sync(home, &extracted, &marker, &mut |_, _| {
+                let current = calls;
+                calls += 1;
+                if current == fail_at { Err(std::io::Error::other("injected sync failure")) }
+                else { Ok(()) }
+            });
+            assert!(result.is_err());
+            assert_eq!(marker_path(home).exists(), fail_at == 4);
+            assert!(extracted.join("payload").exists() || staging_dir(home).join("payload").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_refuses_symlinks_without_syncing_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("data");
+        std::fs::create_dir(&extracted).unwrap();
+        std::fs::write(tmp.path().join("target"), b"keep").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("target"), extracted.join("link")).unwrap();
+        let marker = RestoreMarker { staged_at: Utc::now(), source_filename: "test.tar.gz".into() };
+        assert!(publish_restore_with_sync(tmp.path(), &extracted, &marker, &mut |_, _| {
+            panic!("must refuse the link before syncing")
+        }).is_err());
+        assert!(!staging_dir(tmp.path()).exists());
+        assert!(!marker_path(tmp.path()).exists());
+    }
+
     // ── marker round-trip ────────────────────────────────────────
 
     #[test]
@@ -1496,30 +1632,34 @@ mod tests {
 
     #[test]
     fn marker_present_but_staging_empty_clears_marker_and_errors_without_touching_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        std::fs::write(home.join("config.toml"), b"[general]\n").unwrap();
-        write_marker(
-            home,
-            &RestoreMarker {
-                staged_at: Utc::now(),
-                source_filename: "x.tar.gz".into(),
-            },
-        )
-        .unwrap();
-        // No staging dir at all (interrupted upload).
+        for empty_directory in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            std::fs::write(home.join("config.toml"), b"[general]\n").unwrap();
+            write_marker(
+                home,
+                &RestoreMarker {
+                    staged_at: Utc::now(),
+                    source_filename: "x.tar.gz".into(),
+                },
+            )
+            .unwrap();
+            if empty_directory {
+                std::fs::create_dir(staging_dir(home)).unwrap();
+            }
 
-        let result = perform_pending_restore_swap(home, "20260101T000000Z");
-        assert_eq!(result, Err(RestoreSwapError::StagingMissingOrEmpty));
-        assert!(
-            read_marker(home).is_none(),
-            "marker must be cleared so boot does not loop forever"
-        );
-        assert!(
-            home.join("config.toml").is_file(),
-            "existing data must be untouched"
-        );
-        assert!(!home.join("restore-backup-20260101T000000Z").exists());
+            let result = perform_pending_restore_swap(home, "20260101T000000Z");
+            assert_eq!(result, Err(RestoreSwapError::StagingMissingOrEmpty));
+            assert!(
+                read_marker(home).is_none(),
+                "marker must be cleared so boot does not loop forever"
+            );
+            assert!(
+                home.join("config.toml").is_file(),
+                "existing data must be untouched"
+            );
+            assert!(!home.join("restore-backup-20260101T000000Z").exists());
+        }
     }
 
     #[test]

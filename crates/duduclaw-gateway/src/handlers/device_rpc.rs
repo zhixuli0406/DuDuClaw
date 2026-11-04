@@ -501,8 +501,8 @@ impl MethodHandler {
         };
         let mfa_notice = report.mfa_notice.then_some(crate::mfa::RESTORE_POLICY_NOTICE);
 
-        // Best-effort: the uploaded file's content is now safely inside
-        // `staging`; keeping the original around only wastes disk.
+        // Delete only after staged files, directories and marker are durably published.
+        // A failed publication returns above and retains the uploaded archive.
         let _ = std::fs::remove_file(src);
 
         WsFrame::ok_response(

@@ -354,88 +354,74 @@ mod identity_policy_precheck_tests {
     }
 }
 
-// Keep lock contention non-fatal, without touching a pending restore.
+// Attempt ownership exactly once, before this process reads the live home.
+// A failed attempt permanently keeps singleton-gated work disabled.
 fn backup_restore_boot_allowed(
     pending: bool,
-    acquire: impl FnOnce() -> Result<(), String>,
+    acquire: impl FnOnce(bool) -> Result<(), String>,
 ) -> bool {
-    if !pending {
-        return true;
-    }
-    match acquire() {
+    match acquire(pending) {
         Ok(()) => true,
         Err(error) => {
-            error!(
-                error = %error,
-                "pending backup restore deferred: another gateway may hold this data directory; marker and staged data are unchanged; singleton-gated work remains disabled for this process lifetime; restart after the other gateway exits to apply the pending restore"
-            );
+            error!(error = %error, "gateway singleton acquisition failed at early boot");
+            if pending {
+                error!("pending backup restore deferred: another gateway may hold this data directory; marker and staged data are unchanged; singleton-gated work remains disabled for this process lifetime; restart after the other gateway exits to apply the pending restore");
+            }
             false
         }
     }
 }
 
-fn backup_restore_error_defers(error: &crate::backup_restore::RestoreSwapError) -> bool {
-    matches!(error, crate::backup_restore::RestoreSwapError::GatewayRunning(_))
-}
-
-// Once boot has read the old home, acquiring later would strand the pending
-// restore indefinitely. Never retry ownership in this process after deferral.
-fn backup_restore_late_acquire(
-    restore_deferred: bool,
-    acquire: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    if restore_deferred {
-        return Err("pending restore deferred for this process lifetime; restart to apply the pending restore".into());
-    }
-    acquire()
-}
-
 #[cfg(test)]
 mod backup_restore_boot_tests {
-    use super::{backup_restore_boot_allowed, backup_restore_error_defers, backup_restore_late_acquire};
+    use super::backup_restore_boot_allowed;
 
     #[test]
-    fn no_pending_restore_keeps_original_boot_without_early_lock() {
-        assert!(backup_restore_boot_allowed(false, || panic!("must not acquire early")));
-    }
-
-    #[test]
-    fn deferred_restore_never_attempts_late_acquire_even_if_lock_is_now_free() {
-        let restore_deferred = !backup_restore_boot_allowed(
-            true, || Err("held during early boot".into()),
-        );
-        let result = backup_restore_late_acquire(restore_deferred, || {
-            panic!("late acquisition must not run after another gateway exits");
+    fn no_marker_early_contention_never_promotes_after_marker_and_lock_change() {
+        use std::cell::Cell;
+        let pending = Cell::new(false);
+        let lock_free = Cell::new(false);
+        let attempts = Cell::new(0);
+        let singleton_held = backup_restore_boot_allowed(pending.get(), |for_restore| {
+            attempts.set(attempts.get() + 1);
+            assert!(!for_restore);
+            assert!(!lock_free.get());
+            Err("held during early boot".into())
         });
-        assert!(result.unwrap_err().contains("restart"));
+        // The other gateway stages a restore after the second boot probe, then exits.
+        assert!(!pending.get());
+        pending.set(true);
+        lock_free.set(true);
+        let mut late_work_ran = false;
+        if singleton_held {
+            late_work_ran = true;
+        }
+        assert!(pending.get() && lock_free.get());
+        assert!(!late_work_ran);
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]
-    fn restore_staged_after_initial_probe_still_disables_late_acquire() {
-        use crate::backup_restore::RestoreSwapError;
-        let mut restore_deferred = !backup_restore_boot_allowed(
-            false, || panic!("no marker during initial probe"),
-        );
-        restore_deferred |= backup_restore_error_defers(
-            &RestoreSwapError::GatewayRunning("staged by the other gateway".into()),
-        );
-        assert!(backup_restore_late_acquire(restore_deferred, || {
-            panic!("must not acquire after deferred swap");
-        }).is_err());
-        assert!(!backup_restore_error_defers(&RestoreSwapError::Io("disk error".into())));
-        assert!(!backup_restore_error_defers(&RestoreSwapError::StagingMissingOrEmpty));
+    fn successful_early_attempt_enables_late_work_with_or_without_marker() {
+        for pending in [false, true] {
+            let singleton_held = backup_restore_boot_allowed(pending, |for_restore| {
+                assert_eq!(for_restore, pending);
+                Ok(())
+            });
+            let mut late_work_ran = false;
+            if singleton_held {
+                late_work_ran = true;
+            }
+            assert!(late_work_ran);
+        }
     }
 
     #[test]
-    fn nondeferred_boot_keeps_ordinary_late_acquire() {
-        assert!(backup_restore_late_acquire(false, || Ok(())).is_ok());
-        assert_eq!(backup_restore_late_acquire(false, || Err("busy".into())), Err("busy".into()));
-    }
-
-    #[test]
-    fn pending_restore_requires_ownership_but_contention_is_nonfatal() {
-        assert!(backup_restore_boot_allowed(true, || Ok(())));
-        assert!(!backup_restore_boot_allowed(true, || Err("held by another gateway".into())));
+    fn pending_restore_contention_is_nonfatal() {
+        assert!(!backup_restore_boot_allowed(true, |for_restore| {
+            assert!(for_restore);
+            Err("held by another gateway".into())
+        }));
     }
 }
 
@@ -479,13 +465,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .ok_or_else(|| duduclaw_core::error::DuDuClawError::Gateway("gateway bind resolved to no address".into()))?;
 
 
-    // Only a pending restore needs early ownership. Ordinary boots keep the
-    // original, non-fatal singleton acquisition and recovery ordering below.
-    let apply_pending_restore = backup_restore_boot_allowed(
+    // Never retry after reading the live home, even if a restore appears later.
+    let singleton_held = backup_restore_boot_allowed(
         crate::backup_restore::read_marker(&home_dir).is_some(),
-        || duduclaw_core::gateway_instance::acquire_for_restore(&home_dir),
+        |pending| {
+            if pending {
+                duduclaw_core::gateway_instance::acquire_for_restore(&home_dir)
+            } else {
+                duduclaw_core::gateway_instance::acquire(&home_dir)
+            }
+        },
     );
-    let mut restore_deferred = !apply_pending_restore;
 
     // ── B5 (OS security line P0): boot event ──────────────────────────────
     // One `os_boot` row per gateway process start, chained (B1) into
@@ -511,7 +501,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // a non-appliance install or an appliance box that never ran
     // `device.backup_restore`. See `backup_restore.rs`'s module doc for the
     // full ordering guarantee (old data is always preserved, never deleted).
-    if apply_pending_restore {
+    if singleton_held {
         match crate::backup_restore::perform_pending_restore_swap(
             &home_dir,
             &chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string(),
@@ -526,12 +516,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             }
             Ok(None) => {}
             Err(e) => {
-                // A marker can appear after the initial probe. If that swap
-                // loses ownership too, keep the same lifetime deferral fence.
-                restore_deferred |= backup_restore_error_defers(&e);
-                if restore_deferred {
-                    error!("pending backup restore deferred: singleton-gated work remains disabled for this process lifetime; restart after the other gateway exits to apply the pending restore");
-                }
                 crate::metrics::global_metrics().backup_restore_swap_fail();
                 tracing::error!(
                     error = ?e,
@@ -2222,18 +2206,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // R-M1: releasing run leases and re-queuing workflow messages is only safe
     // when no other gateway runs on this home. Without the lock this process
     // does no workflow reconciliation, dispatch or sweep at all.
-    match backup_restore_late_acquire(restore_deferred, || {
-        duduclaw_core::gateway_instance::acquire(&home_dir)
-    }) {
-        Ok(()) => {
-            handler.reconcile_autonomy_changes().await;
-            reconcile_workflows_on_boot(&home_dir).await;
-            spawn_workflow_sweep(home_dir.to_path_buf());
-        }
-        Err(e) => error!(
-            error = %e,
+    if singleton_held {
+        handler.reconcile_autonomy_changes().await;
+        reconcile_workflows_on_boot(&home_dir).await;
+        spawn_workflow_sweep(home_dir.to_path_buf());
+    } else {
+        error!(
             "another gateway holds this data directory: workflow boot reconciliation, dispatch and sweep are disabled in this process (see `duduclaw doctor`)"
-        ),
+        );
     }
     let resumed_paused = handler.pause_inflight_goal_tasks_on_restart().await;
     if resumed_paused > 0 {
